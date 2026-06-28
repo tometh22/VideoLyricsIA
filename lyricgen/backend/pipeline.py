@@ -2542,6 +2542,36 @@ def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
     return sorted(all_segments, key=lambda s: s["start"])
 
 
+# Collapse detection for the single-pass → VAD fallback in transcribe().
+# The single full-file Whisper call gives the best TEXT, but on some tracks it
+# degenerates: the API returns the whole song as one giant segment, which
+# renders as a single unusable karaoke line. When that happens we re-run with
+# VAD chunking. Thresholds are deliberately conservative so a normal song never
+# trips the fallback.
+_COLLAPSE_MAX_SEG_S = 45.0   # any single segment longer than this = collapse
+_COLLAPSE_MIN_SEGS = 2       # this many segments or fewer = collapse
+_COLLAPSE_MIN_TOKENS = 8     # fewer total words than this = collapse
+
+
+def _is_collapsed_transcription(segments: list[dict]) -> bool:
+    """True when a transcription looks degenerate (one giant segment / a couple
+    of segments / almost no text). Triggers the VAD chunking fallback."""
+    if not segments:
+        return True
+    if len(segments) <= _COLLAPSE_MIN_SEGS:
+        return True
+    try:
+        max_dur = max(float(s["end"]) - float(s["start"]) for s in segments)
+    except (KeyError, TypeError, ValueError):
+        return False
+    if max_dur > _COLLAPSE_MAX_SEG_S:
+        return True
+    total_tokens = sum(len((s.get("text") or "").split()) for s in segments)
+    if total_tokens < _COLLAPSE_MIN_TOKENS:
+        return True
+    return False
+
+
 def transcribe(mp3_path: str, language: str = None,
                lyrics_hint: str | None = None,
                job_id: str | None = None,
@@ -2564,16 +2594,49 @@ def transcribe(mp3_path: str, language: str = None,
     has_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
     logger.info("[transcribe] OPENAI_API_KEY=%s", 'set' if has_key else 'EMPTY')
     if has_key:
-        if os.environ.get("VAD_CHUNK_ENABLED", "1") != "0":
+        vad_disabled = os.environ.get("VAD_CHUNK_ENABLED", "1") == "0"
+        vad_first = os.environ.get("TRANSCRIBE_VAD_FIRST", "0") == "1"
+        if vad_disabled:
+            # Explicit opt-out: pure single full-file pass, no fallback.
+            segs = _transcribe_via_openai_api(
+                mp3_path, language=language, lyrics_hint=lyrics_hint,
+                job_id=job_id, return_words=return_words,
+            )
+        elif vad_first:
+            # Legacy path (pre-2026-06): VAD chunking up front. Kept behind a
+            # flag so we can A/B or revert without a deploy.
             segs = _vad_chunk_transcribe(
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
             )
         else:
+            # Default: single full-file pass first (best TEXT — avoids the
+            # chunk-boundary mishears VAD introduces), then fall back to VAD
+            # chunking ONLY if single-pass collapsed. The fallback is accepted
+            # only when it un-collapses AND adds structure, so a track where
+            # VAD ALSO fails (e.g. fast rap) stays on single-pass rather than
+            # getting worse.
             segs = _transcribe_via_openai_api(
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
             )
+            if _is_collapsed_transcription(segs):
+                _max = max((float(s["end"]) - float(s["start"]) for s in segs), default=0.0)
+                logger.warning(
+                    "[transcribe] single-pass collapsed (%d seg, max %.0fs); "
+                    "retrying with VAD chunking", len(segs), _max,
+                )
+                vad_segs = _vad_chunk_transcribe(
+                    mp3_path, language=language, lyrics_hint=lyrics_hint,
+                    job_id=job_id, return_words=return_words,
+                )
+                if not _is_collapsed_transcription(vad_segs) and len(vad_segs) > len(segs):
+                    logger.info("[transcribe] VAD fallback accepted (%d → %d seg)",
+                                len(segs), len(vad_segs))
+                    segs = vad_segs
+                else:
+                    logger.info("[transcribe] VAD fallback rejected (still collapsed / "
+                                "no structure gain); keeping single-pass")
         # Split long ad-lib blocks (uh×N, melismatic sections) and trim
         # over-extended segment ends. Same cleanup the reconcile path gets.
         # Falls back silently if post_reconcile is unavailable.

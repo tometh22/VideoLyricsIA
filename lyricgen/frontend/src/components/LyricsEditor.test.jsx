@@ -5,7 +5,9 @@
 import { render, screen, cleanup, fireEvent, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, it, expect, vi } from "vitest";
+import { useState, useCallback, useRef } from "react";
 import LyricsEditor from "./LyricsEditor";
+import { segmentsValuesEqual } from "../lib/segmentsValuesEqual";
 
 // useI18n + OnboardingTour pull in joyride / locale loading we don't
 // need for these unit tests. Mock them to noops so the editor renders
@@ -417,5 +419,157 @@ describe("LyricsEditor — Enter-to-split is word-aware (2026-06-05)", () => {
     expect(out[0].start).toBe(10.0);
     expect(out[0].end).toBe(12.9);
     expect(out[0].words).toHaveLength(3);
+  });
+});
+
+describe("LyricsEditor — durable save on page unload (refresh/close) (2026-06-24)", () => {
+  // BUG (reporte Gaby): el editor titiló a toda velocidad, refrescó la página
+  // para salir del error y perdió TODO el trabajo no persistido. El autosave
+  // es debounced 3s y el beforeunload solo AVISA — no guarda. Un F5 mata el
+  // contexto JS antes de que el debounce o el flush-on-unmount (unmount de
+  // React) terminen, y un fetch normal se cancela a mitad de vuelo.
+  //
+  // Fix: en pagehide/beforeunload re-disparamos el guardado pendiente con
+  // `keepalive: true`, que el browser entrega aunque la página se esté
+  // descargando. Este test monta el editor, edita una línea (deja un guardado
+  // pendiente en el ref) y verifica que pagehide persiste con keepalive.
+  it("flushes pending edits with keepalive on pagehide", () => {
+    const onPersistSegments = vi.fn().mockResolvedValue({ ok: true });
+    const props = baseProps({
+      segments: [{ start: 1.0, end: 2.0, text: "alpha line" }],
+      transcribeJobId: "job-1",
+      onPersistSegments,
+    });
+    render(<LyricsEditor {...props} />);
+
+    // Operadora edita una línea — queda un guardado pendiente (debounce 3s
+    // aún sin disparar; en el test no avanzamos timers).
+    const input = screen.getByDisplayValue("alpha line");
+    fireEvent.change(input, { target: { value: "alpha EDITED" } });
+
+    // Sin la corrección, refrescar pierde esta edición. Con ella, pagehide
+    // la persiste antes de que la página muera.
+    window.dispatchEvent(new Event("pagehide"));
+
+    expect(onPersistSegments).toHaveBeenCalledTimes(1);
+    const [jobId, segments, opts] = onPersistSegments.mock.calls[0];
+    expect(jobId).toBe("job-1");
+    expect(segments).toEqual([{ start: 1.0, end: 2.0, text: "alpha EDITED" }]);
+    expect(opts).toEqual({ keepalive: true });
+  });
+
+  it("does not fire a save on unload when there is nothing pending", () => {
+    const onPersistSegments = vi.fn().mockResolvedValue({ ok: true });
+    // disableAutosave → el debounce nunca arma un pendiente, así que pagehide
+    // no debe intentar guardar (no hay trabajo que perder).
+    const props = baseProps({
+      segments: [{ start: 1.0, end: 2.0, text: "alpha line" }],
+      transcribeJobId: "job-1",
+      onPersistSegments,
+      disableAutosave: true,
+    });
+    render(<LyricsEditor {...props} />);
+
+    window.dispatchEvent(new Event("pagehide"));
+    expect(onPersistSegments).not.toHaveBeenCalled();
+  });
+});
+
+describe("LyricsEditor — reseed-storm fix is end-to-end (integration proof of #724)", () => {
+  // ACTIVE PROOF of #724 that doesn't depend on real users hitting the bug.
+  // The reseed-storm / data-loss root cause: the backend sorts segments by
+  // `start` on every /save-segments write, so the writeback hands the editor a
+  // segments prop with the SAME values in a DIFFERENT order than the local
+  // out-of-order array. The OLD positional segmentsValuesEqual saw that as
+  // "new content" → reseeded `edited` from the prop → the operator's in-flight
+  // edit got clobbered (and, repeated every autosave cycle, the flicker loop).
+  //
+  // This test reproduces exactly that: edit a line locally, then push a
+  // reordered-but-equal segments prop. With #724 the guard treats it as equal
+  // and SKIPS the reseed, so the local edit survives. On the pre-#724 build
+  // this test fails — the edit is replaced by the reordered original.
+  it("a reordered-but-equal segments writeback does NOT clobber a local edit", () => {
+    const ordered = [
+      { start: 0, end: 3, text: "alpha line" },
+      { start: 3, end: 5, text: "beta line" },
+      { start: 5, end: 8, text: "gamma line" },
+    ];
+    const { rerender } = render(<LyricsEditor {...baseProps({ segments: ordered })} />);
+
+    // Operator edits the first line locally (changes `edited`, not the prop).
+    const input = screen.getByDisplayValue("alpha line");
+    fireEvent.change(input, { target: { value: "alpha EDITED" } });
+    expect(screen.getByDisplayValue("alpha EDITED")).toBeInTheDocument();
+
+    // Backend roundtrip: same values, sorted differently, fresh reference —
+    // the exact shape that used to trigger the destructive reseed.
+    const reorderedSameValues = [
+      { start: 5, end: 8, text: "gamma line" },
+      { start: 0, end: 3, text: "alpha line" },
+      { start: 3, end: 5, text: "beta line" },
+    ];
+    rerender(<LyricsEditor {...baseProps({ segments: reorderedSameValues })} />);
+
+    // The local edit must survive (guard skipped the reseed). On the buggy
+    // build, "alpha EDITED" is gone and the original "alpha line" is back.
+    expect(screen.getByDisplayValue("alpha EDITED")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("alpha line")).not.toBeInTheDocument();
+  });
+});
+
+describe("LyricsEditor — no reseed storm from the editor's own edit echo (P0 titileo)", () => {
+  // Reproduces the production storm that #724 did NOT fix (Sentry: [reseed-storm]
+  // perSec 6-7 on release 0ffa76f, which already has #724). App.jsx mirrors every
+  // local edit up to currentReview.segments (onEditedChange → mergeEditedSegments)
+  // and feeds it straight back as the `segments` prop. During editing the
+  // prop-sync effect compared that echo against a one-tick-stale ref → saw it as
+  // new content → reseeded `edited` (reassigning _id by index → rows REMOUNT) on
+  // every edit → "titila todo el editor". The fix compares the echo against the
+  // LIVE `edited`, recognises it, and skips the reseed.
+  //
+  // Detection: a reseed calls setEdited, which re-fires the onEditedChange mirror.
+  // So a single user edit that triggers a reseed produces an EXTRA mirror call
+  // (the echo of the reseed). No reseed → exactly one mirror call per edit.
+  function MirrorHarness({ onMirror }) {
+    const [segments, setSegments] = useState([
+      { start: 0, end: 2, text: "alpha" },
+      { start: 2, end: 4, text: "beta" },
+    ]);
+    // STABLE identity, exactly like App.jsx's `useCallback(..., [])` handler —
+    // otherwise an inline arrow re-fires the editor's [edited, onEditedChange]
+    // effect on every render and masks the reseed signal.
+    const onMirrorRef = useRef(onMirror);
+    onMirrorRef.current = onMirror;
+    const handleMirror = useCallback((segs) => {
+      onMirrorRef.current(segs);
+      // Faithful to App.jsx mergeEditedSegments: no-op when values are equal,
+      // else store the edited values straight back as the prop (the loop).
+      setSegments((prev) => (segmentsValuesEqual(prev, segs) ? prev : segs));
+    }, []);
+    return (
+      <LyricsEditor
+        {...baseProps({
+          segments,
+          transcribeJobId: "job-1",
+          onPersistSegments: vi.fn().mockResolvedValue({ ok: true }),
+        })}
+        onEditedChange={handleMirror}
+      />
+    );
+  }
+
+  it("a single edit triggers exactly one mirror call — no self-echo reseed", () => {
+    const onMirror = vi.fn();
+    render(<MirrorHarness onMirror={onMirror} />);
+
+    const baseline = onMirror.mock.calls.length; // mount fires the mirror once
+    const input = screen.getByDisplayValue("alpha");
+    fireEvent.change(input, { target: { value: "alpha EDITED" } });
+
+    // One user edit = one mirror call. On the buggy build the echo reseeds and
+    // setEdited re-fires the mirror → 2+ calls (the storm, one bounce per edit).
+    expect(onMirror.mock.calls.length - baseline).toBe(1);
+    // And the edit is shown (sanity).
+    expect(screen.getByDisplayValue("alpha EDITED")).toBeInTheDocument();
   });
 });

@@ -520,12 +520,16 @@ def _correct_large_gap_cluster(
             i = j
             continue
 
-        # VAD window: prev_end → c_last_start + lookahead.
-        # Intentionally NOT capped by next_start: the next segment after the
-        # cluster may itself be displaced (same whisperX compression), so
-        # capping at next_start - 2 would cut off the true lyric onsets we
-        # are trying to find.
-        vad_end = c_last_start + _LARGE_GAP_CLUSTER_LOOKAHEAD_S
+        # VAD window: prev_end → min(c_last_start + lookahead, next_seg.start - 2s)
+        if j < len(out):
+            try:
+                next_start = float(out[j].get("start", 0))
+                vad_end = min(c_last_start + _LARGE_GAP_CLUSTER_LOOKAHEAD_S,
+                              next_start - 2.0)
+            except (TypeError, ValueError):
+                vad_end = c_last_start + _LARGE_GAP_CLUSTER_LOOKAHEAD_S
+        else:
+            vad_end = c_last_start + _LARGE_GAP_CLUSTER_LOOKAHEAD_S
 
         vad_start = prev_end
         if vad_end <= vad_start + 3.0:
@@ -539,12 +543,8 @@ def _correct_large_gap_cluster(
         )
 
         regions = _detect_adlib_voice_regions(audio_path, vad_start, vad_end)
-        logger.warning(
-            "[GAP-CLUSTER] VAD %.1f-%.1fs → %d raw region(s)",
-            vad_start, vad_end, len(regions),
-        )
         if len(regions) <= 1 and (not regions or regions[0] == (vad_start, vad_end)):
-            logger.warning("[GAP-CLUSTER] VAD found no sub-regions; skipping cluster")
+            logger.info("[GAP-CLUSTER] VAD found no sub-regions; skipping cluster")
             i = j
             continue
 
@@ -554,7 +554,7 @@ def _correct_large_gap_cluster(
         for r_start, r_end in regions:
             sub = _retranscribe_slice(audio_path, r_start, r_end, language)
             if sub is None:
-                logger.warning(
+                logger.info(
                     "[GAP-CLUSTER] retranscribe %.1f-%.1fs failed; aborting cluster",
                     r_start, r_end,
                 )
@@ -562,35 +562,24 @@ def _correct_large_gap_cluster(
                 break
             combined = " ".join((s.get("text") or "").strip() for s in sub).strip()
             if _is_adlib_loop(combined):
-                logger.warning(
+                logger.info(
                     "[GAP-CLUSTER] skip adlib region %.1f-%.1fs: %r",
                     r_start, r_end, combined[:30],
                 )
                 continue
-            logger.warning(
-                "[GAP-CLUSTER] lyric region %.1f-%.1fs: %r",
-                r_start, r_end, combined[:40],
-            )
             lyric_regions.append((r_start, r_end))
 
         if not retrans_ok:
             i = j
             continue
 
-        if not lyric_regions:
-            logger.warning("[GAP-CLUSTER] no lyric regions after filtering; skipping")
+        if len(lyric_regions) < len(cluster):
+            logger.info(
+                "[GAP-CLUSTER] only %d lyric region(s) for %d cluster seg(s); skipping",
+                len(lyric_regions), len(cluster),
+            )
             i = j
             continue
-
-        if len(lyric_regions) < len(cluster):
-            # Partial correction: fix however many we can match. Remaining
-            # cluster segments keep their whisperX positions (post_reconcile
-            # handles them via stretch-trim). We do NOT skip entirely — even
-            # correcting the first segment is better than doing nothing.
-            logger.warning(
-                "[GAP-CLUSTER] partial: %d lyric region(s) for %d cluster seg(s) — fixing first %d",
-                len(lyric_regions), len(cluster), len(lyric_regions),
-            )
 
         # Safety: only correct if the first lyric onset is meaningfully later
         # than the cluster's current start. Prevents double-correction when the
@@ -602,7 +591,7 @@ def _correct_large_gap_cluster(
             continue
 
         if lyric_regions[0][0] <= c_start + _LARGE_GAP_CLUSTER_MIN_SHIFT:
-            logger.warning(
+            logger.info(
                 "[GAP-CLUSTER] cluster at %.1fs already correct (first lyric onset %.1fs); skipping",
                 c_start, lyric_regions[0][0],
             )
@@ -610,17 +599,17 @@ def _correct_large_gap_cluster(
             continue
 
         # Apply: assign each lyric region to the corresponding cluster segment.
-        # Only iterate up to len(lyric_regions) in case cluster is larger.
-        for k in range(min(len(lyric_regions), len(cluster))):
-            ci = cluster[k]
+        for k, ci in enumerate(cluster):
             r_start, r_end = lyric_regions[k]
             old_start = float(out[ci].get("start", 0))
+            old_end = float(out[ci].get("end", 0))
+            old_dur = max(old_end - old_start, 1.5)
             out[ci] = {
                 **out[ci],
                 "start": round(r_start, 3),
                 "end": round(r_end, 3),
             }
-            logger.warning(
+            logger.info(
                 "[GAP-CLUSTER] corrected %r %.1fs→%.1fs (+%.1fs)",
                 (out[ci].get("text") or "")[:30],
                 old_start, r_start, r_start - old_start,

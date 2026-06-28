@@ -441,6 +441,13 @@ export default function LyricsEditor({
   // that need to track a parent's source of truth across remounts.
   // Bug B7 from 2026-05-18 audit.
   const prevSegmentsRef = useRef(segments);
+  // Live mirror of `edited` so the prop-sync effect below can tell our OWN echo
+  // from a genuine external change. App.jsx feeds every local edit straight back
+  // as the `segments` prop (onEditedChange → mergeEditedSegments →
+  // currentReview.segments), so the effect must compare the incoming prop
+  // against what we're SHOWING right now — not a one-tick-stale ref.
+  const editedRef = useRef(edited);
+  editedRef.current = edited;
   // Operator feedback 2026-05-25 (UMG): "Debería hacerlo solo, no
   // preguntarme" — the auto-trim banner ("Recortar N líneas con texto
   // colgado · Aplicar") was friction. Detection is reliable enough to
@@ -451,6 +458,21 @@ export default function LyricsEditor({
   const _reseedStormRef = useRef({ windowStart: 0, count: 0 });
   useEffect(() => {
     if (prevSegmentsRef.current === segments) return;
+    // ROOT-CAUSE FIX (P0 UMG Chile, "titila todo el editor" — still firing on
+    // the #724 build): skip the destructive reseed when the incoming `segments`
+    // already matches what we're SHOWING (`edited`). App.jsx mirrors every local
+    // edit up to currentReview.segments (onEditedChange → mergeEditedSegments)
+    // and feeds it straight back as this prop. During a timeline drag the values
+    // change every tick, so comparing against the one-tick-stale prevSegmentsRef
+    // (below) saw each echo as "new content" and reseeded → _id reassigned by
+    // index → all rows REMOUNT 6-7×/s → reseed-storm / ui-freeze. #724 only
+    // neutralised the equal-VALUES reorder echo; this catches the live-edit echo
+    // because the prop equals our current `edited`. A genuine external change
+    // (load another song, undo) differs from `edited` and still reseeds.
+    if (segmentsValuesEqual(editedRef.current, segments)) {
+      prevSegmentsRef.current = segments;
+      return;
+    }
     // QA fix 2026-05-27 (drag-resize regression): the autosave POST
     // roundtrip (App.jsx::persistSegmentsToBackend) calls
     // setCurrentReview({...prev, segments: cleaned}) after a successful
@@ -469,10 +491,14 @@ export default function LyricsEditor({
     }
     // [reseed-storm] capture (P0 UMG Chile 2026-06-16: "las líneas cambian de
     // posición en loop"). This reseed reassigns _id by index, so rows keyed by
-    // _id REMOUNT. segmentsValuesEqual is POSITIONAL, so a writeback that hands
-    // back a REORDERED segments array (backend sorts by start #184 while local
-    // is out-of-order from a split/overlap) fails the guard above and makes
-    // this fire on every cycle → rows reposition in a loop. If it fires
+    // _id REMOUNT. The original root cause: segmentsValuesEqual was POSITIONAL,
+    // so a writeback that handed back a REORDERED segments array (backend sorts
+    // by start #184 while local is out-of-order from a split/overlap) failed the
+    // guard above and made this fire on every cycle → rows reposition in a loop.
+    // FIXED in #724: segmentsValuesEqual now sorts both sides by start before
+    // comparing, so a pure reorder no longer reseeds. This detector is KEPT as a
+    // backstop — it still catches a GENUINE rapid-content storm (not reorder),
+    // and stays until the 2026-07-01 monitoring window closes. If it fires
     // repeatedly we emit the OLD vs NEW order so we can see the swap.
     {
       const _now = typeof performance !== "undefined" && performance.now ? performance.now() : 0;
@@ -587,6 +613,38 @@ export default function LyricsEditor({
       } catch { /* best-effort */ }
     };
   }, []);
+
+  // Durable flush on page unload (refresh / tab close). The beforeunload
+  // handler above only WARNS via a native dialog — it does not persist. And
+  // the flush-on-unmount above runs on React unmount (SPA navigation), which
+  // a hard refresh (F5) skips: the browser tears down the JS context before
+  // the 3s debounce or the unmount cleanup can finish, and an ordinary fetch
+  // is canceled mid-flight. So on pagehide/beforeunload we re-fire the pending
+  // save with `keepalive: true`, which the browser is required to deliver even
+  // as the page goes away. Auth headers ride along (authFetch adds them) —
+  // navigator.sendBeacon can't set Authorization, so /save-segments would 401.
+  // (Reporte Gaby 2026-06-24: el editor titiló, refrescó para salir y perdió
+  // TODO el trabajo no persistido.)
+  useEffect(() => {
+    if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
+    const flushOnUnload = () => {
+      const p = _pendingFlushRef.current;
+      if (!p) return;
+      _pendingFlushRef.current = null;
+      try {
+        const cleaned = p.edited.map(({ _id, review, ...rest }) => rest);
+        Promise.resolve(
+          p.onPersistSegments(p.transcribeJobId, cleaned, { keepalive: true })
+        ).catch(() => {});
+      } catch { /* best-effort */ }
+    };
+    window.addEventListener("pagehide", flushOnUnload);
+    window.addEventListener("beforeunload", flushOnUnload);
+    return () => {
+      window.removeEventListener("pagehide", flushOnUnload);
+      window.removeEventListener("beforeunload", flushOnUnload);
+    };
+  }, [disableAutosave, onPersistSegments, transcribeJobId]);
 
   // Flush-save on a timeline drag (no 3 s wait) + drive the "Guardado ✓"
   // chip. Runs only when flushCounter bumps. By the time this effect fires,
