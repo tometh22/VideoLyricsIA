@@ -627,7 +627,27 @@ def _correct_large_gap_cluster(
 # Replicate inference.
 # ──────────────────────────────────────────────────────────────────────
 
-def _compute_cache_key(audio_path: str, language: str | None, lyrics_hint: str | None):
+def _vad_params() -> tuple[float, float]:
+    """Resolve (vad_onset, vad_offset) for the Replicate whisperX VAD.
+
+    The model defaults (0.5 / 0.363) gate out sustained low-energy
+    vocalisations (ad-lib "uh"/"oh" blocks): WhisperX drops those lines AND
+    pulls the next sung line's onset earlier (the "Tomás del miedo at 1:35
+    instead of 1:42" bug). Lowering the thresholds recovers those voiced
+    regions — benchmark vs Rotor (4 complete songs, via the prod wrapper):
+    recall 74%→81%, WER 0.284→0.270, no regressions. Env-overridable for
+    tuning / revert without a deploy (set to 0.5 / 0.363 for the old defaults).
+    """
+    try:
+        onset = float(os.environ.get("WHISPERX_VAD_ONSET", "0.2") or "0.2")
+        offset = float(os.environ.get("WHISPERX_VAD_OFFSET", "0.1") or "0.1")
+    except ValueError:
+        onset, offset = 0.2, 0.1
+    return onset, offset
+
+
+def _compute_cache_key(audio_path: str, language: str | None, lyrics_hint: str | None,
+                       vad_onset: float = 0.5, vad_offset: float = 0.363):
     """Return (cache_key, audio_hash, lyrics_hint_hash) — or (None, None, None)
     on read error (cache effectively disabled for this call).
 
@@ -652,7 +672,9 @@ def _compute_cache_key(audio_path: str, language: str | None, lyrics_hint: str |
     # this env var (e.g. "2") without touching the DB. Default "1" preserves
     # all pre-existing rows so changing it is a deliberate opt-in bust.
     ver = os.environ.get("WHISPERX_CACHE_VERSION", "1").strip() or "1"
-    key = f"wx:{audio_hash}:{lang}:{hint_hash}:{ver}"
+    # vad_onset/vad_offset change the output, so they MUST be part of the key —
+    # otherwise a VAD tweak silently serves stale pre-tweak cached results.
+    key = f"wx:{audio_hash}:{lang}:{hint_hash}:{ver}:vo{vad_onset}:vf{vad_offset}"
     return (key, audio_hash, hint_hash)
 
 
@@ -971,7 +993,9 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
     # ~$0.005 + 75-180 s en cualquier re-corrida (operador re-subiendo,
     # job retry, regenera tras edit). Cache miss corre normal + write.
     # Errores en cache son swallowed — el path original sigue intacto.
-    cache_key, audio_hash, hint_hash = _compute_cache_key(audio_path, language, lyrics_hint)
+    vad_onset, vad_offset = _vad_params()
+    cache_key, audio_hash, hint_hash = _compute_cache_key(
+        audio_path, language, lyrics_hint, vad_onset, vad_offset)
     if cache_key:
         cached_segs = _cache_lookup(cache_key, expected_audio_hash=audio_hash)
         if cached_segs is not None:
@@ -981,7 +1005,8 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
             )
             return cached_segs
 
-    payload: dict = {"align_output": True}
+    payload: dict = {"align_output": True,
+                     "vad_onset": vad_onset, "vad_offset": vad_offset}
     if language:
         payload["language"] = language
 
