@@ -102,3 +102,92 @@ def reconcile(wx_segs: list[dict],
         len(out), len(lines), coverage * 100,
     )
     return out
+
+
+def text_correct_segments(audio_segs: list[dict],
+                          reference_text: str,
+                          *, min_match: float = 0.60) -> list[dict]:
+    """Audio-as-truth text correction (line-level).
+
+    Keeps each audio segment's timing, order, structure and word-stamps; only
+    swaps its TEXT to the best-matching reference line. Segments whose best
+    reference match is below `min_match` (e.g. sustained ad-libs like
+    "uh uh uh" that lyric sites omit) are returned UNCHANGED.
+
+    Unlike `reconcile()` / `wordstamps_to_segments`, this does NOT flatten the
+    word stream or re-bucket it into the reference's line structure — so a
+    reference that LACKS the song's ad-lib section can never scatter the
+    surrounding chorus words across the ad-lib gap (the smearing bug). It's a
+    per-line spell-checker over whisperX's OWN segments, not a re-segmenter.
+
+    Matching: per-segment best reference line via max(token-Jaccard,
+    phonetic-ratio) — phonetic rescues mondegreens ("perro de voz" vs "espejo
+    de vos") that Jaccard misses. Assignment is a globally-optimal MONOTONIC DP
+    so a chorus repeated N times maps to its N reference occurrences in order
+    (not all to the first). Returns a NEW list; never mutates the input.
+    """
+    if not audio_segs:
+        return audio_segs
+    out_default = [dict(s) for s in audio_segs]
+    ref_lines = [ln.strip() for ln in (reference_text or "").splitlines() if ln.strip()]
+    if len(ref_lines) < 2:
+        return out_default  # nothing to correct against
+
+    from forced_align import _norm, _phonetic_ratio
+    from lyrics_cleanup_alignment import _jaccard, _tokens
+
+    seg_txt = [(s.get("text") or "") for s in audio_segs]
+    seg_jac = [_tokens(t) for t in seg_txt]
+    seg_pho = [[_norm(w) for w in t.split() if _norm(w)] for t in seg_txt]
+    ref_jac = [_tokens(l) for l in ref_lines]
+    ref_pho = [[_norm(w) for w in l.split() if _norm(w)] for l in ref_lines]
+
+    def score(i: int, j: int) -> float:
+        return max(_jaccard(seg_jac[i], ref_jac[j]),
+                   _phonetic_ratio(seg_pho[i], ref_pho[j]))
+
+    n, m = len(audio_segs), len(ref_lines)
+    EPS = 1e-6  # earliest-ref tie-break, same idea as _match_cleaned_to_synced
+    # dp[i][j] = best total match score over segs[i:] using refs[j:].
+    # actions: match seg i↔ref j | skip_ref j (never sung) | skip_seg i (ad-lib).
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    choice: list[list[str | None]] = [[None] * (m + 1) for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        for j in range(m - 1, -1, -1):
+            best, act = dp[i + 1][j], "skip_seg"          # seg i unmatched
+            if dp[i][j + 1] > best:
+                best, act = dp[i][j + 1], "skip_ref"      # ref j unused
+            sc = score(i, j)
+            if sc >= min_match:
+                mv = sc + EPS * (m - j) + dp[i + 1][j + 1]
+                if mv > best:
+                    best, act = mv, "match"
+            dp[i][j], choice[i][j] = best, act
+
+    assign: list[int | None] = [None] * n
+    i = j = 0
+    while i < n and j < m:
+        act = choice[i][j]
+        if act == "match":
+            assign[i] = j; i += 1; j += 1
+        elif act == "skip_ref":
+            j += 1
+        else:
+            i += 1
+
+    out: list[dict] = []
+    n_swapped = 0
+    for idx, s in enumerate(audio_segs):
+        seg = dict(s)
+        j = assign[idx]
+        if j is not None:
+            if seg.get("text") != ref_lines[j]:
+                n_swapped += 1
+            seg["text"] = ref_lines[j]
+        out.append(seg)
+    n_kept = len(out) - sum(1 for a in assign if a is not None)
+    logger.info(
+        "[TEXT-CORRECT] %s/%s segments corrected (%s left as-heard / ad-lib)",
+        n_swapped, len(out), n_kept,
+    )
+    return out
