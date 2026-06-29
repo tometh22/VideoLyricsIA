@@ -14,8 +14,9 @@ Para qué, para qué tus santos de papel"""
 
 
 def _seg(start, end, text):
-    return {"start": start, "end": end, "text": text,
-            "words": [{"word": text.split()[0], "start": start, "end": start + 0.3}]}
+    words = ([{"word": text.split()[0], "start": start, "end": start + 0.3}]
+             if text.split() else [])
+    return {"start": start, "end": end, "text": text, "words": words}
 
 
 def test_swaps_text_keeps_timing():
@@ -71,3 +72,30 @@ def test_low_match_segment_unchanged():
     segs = [_seg(0, 4, "esto no se parece a ninguna linea de la referencia xyz")]
     out = text_correct_segments(segs, REF)
     assert out[0]["text"] == "esto no se parece a ninguna linea de la referencia xyz"
+
+
+REF2 = ("Tomás del miedo tu don\nFrágil espejo de vos\n"
+        "Tomás del miedo tu don\nFrágil espejo de vos")
+
+
+def test_blank_segments_named_from_reference():
+    # whisperX heard a sustained melisma but produced empty text where the
+    # reference has "Frágil espejo de vos". Blank-fill names it (keeps timing).
+    segs = [_seg(102, 108, "tomas del miedo tu don"),
+            _seg(110, 116, ""),                       # blank melisma
+            _seg(118, 124, "tomas del miedo tu don"),
+            _seg(126, 132, "")]                       # blank melisma
+    out = text_correct_segments(segs, REF2)
+    assert [s["text"] for s in out] == [
+        "Tomás del miedo tu don", "Frágil espejo de vos",
+        "Tomás del miedo tu don", "Frágil espejo de vos"]
+    assert out[1].get("review") is True and out[3].get("review") is True
+    assert out[1]["start"] == 110 and out[1]["end"] == 116   # audio timing kept
+
+
+def test_blank_with_no_reference_left_is_dropped():
+    # A blank with no genuinely-skipped reference line is dropped (no phantom).
+    segs = [_seg(0, 5, "tomas del miedo tu don"), _seg(6, 8, "")]
+    out = text_correct_segments(segs, "Tomás del miedo tu don\nFrágil espejo de vos")
+    # blank could take "Frágil espejo" (skipped) → named; assert it's named, not phantom-duplicated
+    assert len(out) == 2 and out[1]["text"] == "Frágil espejo de vos"
