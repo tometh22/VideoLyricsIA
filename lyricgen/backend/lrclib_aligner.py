@@ -185,6 +185,50 @@ def _parse_lrc_to_line_times(lrc: str) -> list[tuple[float, str]]:
     return out
 
 
+def synced_offset_decision(
+    audio_dur: Optional[float],
+    lrc_dur: Optional[float],
+    first_wx_t: Optional[float],
+    first_synced_t: Optional[float],
+    *,
+    dur_tol: float = 3.0,
+    anchor_cap: float = 60.0,
+) -> tuple[float, bool]:
+    """Decide how to shift an lrclib SYNCED timeline onto THIS audio, and
+    whether the result is trustworthy enough to skip the per-line `review`
+    flag (the amber "timing aproximado" warning).
+
+    Two regimes:
+
+    1. **Durations match** (``|audio_dur - lrc_dur| <= dur_tol``): the synced
+       timeline belongs to this exact version of the song, so its absolute
+       timestamps are already correct — use ``offset = 0`` and TRUST it
+       (no review flag). This is the pre-2026-05-25 fast-path behaviour and
+       fixes the case where the first-word anchor misfires: e.g. Enanitos
+       Verdes "Mi Primer Día Sin Ti" (audio 268 s vs lrclib 269 s) has a soft
+       intro ad-lib ("Uoh-oh-oh") that whisperX doesn't detect, so its first
+       detected word is a LATER line → ``first_wx_t - first_synced_t`` came
+       out ~+36 s and shifted the whole song, with every line flagged amber.
+
+    2. **Durations differ / unknown**: fall back to anchoring whisperX's first
+       detected word to the first synced line (handles "Official Video" cuts
+       with an added intro). A wildly out-of-range anchor (> ``anchor_cap``)
+       is clamped to 0. The offset is a genuine estimate, so the caller keeps
+       the per-line review flag.
+
+    Returns ``(offset_seconds, trust)``.
+    """
+    if (audio_dur is not None and lrc_dur is not None
+            and abs(audio_dur - lrc_dur) <= dur_tol):
+        return 0.0, True
+    if first_wx_t is not None and first_synced_t is not None:
+        offset = first_wx_t - first_synced_t
+        if abs(offset) > anchor_cap:
+            return 0.0, False
+        return offset, False
+    return 0.0, False
+
+
 def align_lrclib_to_whisper(
     lrclib_plain: str,
     whisper_segments: list[dict],
