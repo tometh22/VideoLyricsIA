@@ -5099,6 +5099,24 @@ async def _run_transcription_for_job(
                     # Reconcile when we have canonical text; emit raw otherwise.
                     if _canonical:
                         import whisperx_reconcile as _wxr
+                        # Audio-as-truth (LINE_TEXT_CORRECT_ENABLED): keep
+                        # whisperX's OWN segments + timing (incl. ad-lib "uh"
+                        # lines) and only swap each line's TEXT to the best
+                        # reference line. Avoids reconcile's word-rebucketing,
+                        # which scatters chorus words across a missing ad-lib
+                        # gap. No gap-cluster needed — this path never displaces.
+                        if os.environ.get("LINE_TEXT_CORRECT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on"):
+                            _corrected = _wxr.text_correct_segments(_wx_segs, _canonical)
+                            from pipeline import _post_reconcile_cleanup as _prc
+                            _corrected = _prc(_corrected)
+                            logger.info(
+                                "[WC] line-text-correct (%d segs, canonical=%s) — audio-as-truth path",
+                                len(_corrected),
+                                "lrclib" if lyrics_source == "lrclib" else (lyrics_source or "unknown"),
+                            )
+                            return _emit_segments(
+                                _corrected, _WC_WX_REC, reference_lyrics=_canonical,
+                            )
                         _reconciled = _wxr.reconcile(_wx_segs, _canonical)
                         if _reconciled:
                             logger.info("[WC] whisperX reconciled (%d/%d lines, canonical=%s) — audio-as-truth path",
