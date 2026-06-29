@@ -104,22 +104,31 @@ def test_blank_with_no_reference_left_is_dropped():
 from whisperx_reconcile import relabel_long_adlibs
 
 
-def test_relabel_long_sustained_vocal_as_uh():
-    # 21s with 4 words = mis-heard ad-lib → relabel to "Uh" lines
-    segs = [_seg(81.0, 102.0, "¿Para qué? ¿Para qué?")]
-    out = relabel_long_adlibs(segs)
-    assert len(out) >= 2 and all(s["text"] == "Uh, uh, uh" for s in out)
-    assert all(s.get("review") for s in out)
-    assert out[0]["start"] == 81.0 and abs(out[-1]["end"] - 102.0) < 0.01
+def _seg_w(start, end, text, word_spans):
+    return {"start": start, "end": end, "text": text,
+            "words": [{"word": w, "start": ws, "end": we} for (w, ws, we) in word_spans]}
 
 
-def test_relabel_leaves_real_long_line():
-    # 16s but 12 words (1.3 s/word) = real lyric → untouched
-    segs = [_seg(8.0, 24.0, "dentro de tu piel se esconden los indicios de que nada perfecto")]
-    out = relabel_long_adlibs(segs)
+def test_relabel_wordless_tail_becomes_uh_keeps_head():
+    # words end at 70 but audio runs to 81 → 11s wordless tail → "Uh"; head kept
+    seg = _seg_w(66, 81, "¿Para qué? Tus santos de papel",
+                 [("¿Para", 66, 67), ("qué", 67, 68), ("Tus", 68, 68.5),
+                  ("santos", 68.5, 69), ("de", 69, 69.5), ("papel", 69.5, 70)])
+    out = relabel_long_adlibs([seg])
+    assert out[0]["text"] == "¿Para qué? Tus santos de papel"   # head survives (recovers chorus)
+    assert out[0]["end"] == 70.0                                 # trimmed to last word
+    assert len(out) >= 2 and all(o["text"].startswith("Uh") for o in out[1:])
+    assert abs(out[-1]["end"] - 81) < 0.01                       # uh covers the tail
+
+
+def test_relabel_leaves_real_line_when_words_span_segment():
+    # words run to the segment end → no wordless tail → untouched
+    seg = _seg_w(8, 16, "dentro de tu piel se esconden los indicios",
+                 [("dentro", 8, 9), ("indicios", 15.4, 16)])
+    out = relabel_long_adlibs([seg])
     assert len(out) == 1 and out[0]["text"].startswith("dentro")
 
 
-def test_relabel_leaves_short_segment():
-    segs = [_seg(0, 4, "para qué para qué")]
-    assert relabel_long_adlibs(segs)[0]["text"] == "para qué para qué"
+def test_relabel_skips_segments_without_words():
+    seg = {"start": 0, "end": 20, "text": "algo", "words": []}
+    assert relabel_long_adlibs([seg]) == [seg]
