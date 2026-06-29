@@ -5116,10 +5116,18 @@ async def _run_transcription_for_job(
                             # carries the single-pass + collapse-fallback hardening.
                             import pipeline as _pl
                             _base = await asyncio.to_thread(
-                                _pl.transcribe, audio_path, language=(lang or None), job_id=job_id,
+                                _pl.transcribe, audio_path, language=(lang or None),
+                                job_id=job_id, return_words=True,
                             )
+                            # ORDER MATTERS: split merged lines at musical pauses
+                            # (word-gaps) BEFORE correcting text. Whisper merges e.g.
+                            # "Tomás del miedo tu don, frágil espejo de vos" into one
+                            # segment; _post_reconcile_cleanup splits it at the internal
+                            # gap so text_correct can name BOTH lines. This is how ROTOR
+                            # separates them. (return_words=True can roughen base TEXT,
+                            # but text_correct overwrites it from the reference anyway.)
+                            _base = _pl._post_reconcile_cleanup(_base)
                             _corrected = _wxr.text_correct_segments(_base, _canonical)
-                            _corrected = _pl._post_reconcile_cleanup(_corrected)
                             logger.info(
                                 "[WC] line-text-correct on Whisper-1 base (%d segs, canonical=%s) — audio-as-truth path",
                                 len(_corrected),
