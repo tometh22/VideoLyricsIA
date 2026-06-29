@@ -5106,11 +5106,22 @@ async def _run_transcription_for_job(
                         # which scatters chorus words across a missing ad-lib
                         # gap. No gap-cluster needed — this path never displaces.
                         if os.environ.get("LINE_TEXT_CORRECT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on"):
-                            _corrected = _wxr.text_correct_segments(_wx_segs, _canonical)
-                            from pipeline import _post_reconcile_cleanup as _prc
-                            _corrected = _prc(_corrected)
+                            # Base = Whisper-1 on the RAW mix (`audio_path`), NOT WhisperX
+                            # on the stem. Measured on "No Hay Santos": Whisper-1-raw
+                            # captures sustained ad-libs as "uh"/"oh" and segments into
+                            # clean full lines; WhisperX fragments and its VAD drops the
+                            # ad-lib (recall 79% vs 74%, max-gap 13s vs 19s). text_correct
+                            # then only swaps each line's TEXT to the best reference line,
+                            # leaving ad-lib lines (no match) as-heard. pipeline.transcribe
+                            # carries the single-pass + collapse-fallback hardening.
+                            import pipeline as _pl
+                            _base = await asyncio.to_thread(
+                                _pl.transcribe, audio_path, language=(lang or None), job_id=job_id,
+                            )
+                            _corrected = _wxr.text_correct_segments(_base, _canonical)
+                            _corrected = _pl._post_reconcile_cleanup(_corrected)
                             logger.info(
-                                "[WC] line-text-correct (%d segs, canonical=%s) — audio-as-truth path",
+                                "[WC] line-text-correct on Whisper-1 base (%d segs, canonical=%s) — audio-as-truth path",
                                 len(_corrected),
                                 "lrclib" if lyrics_source == "lrclib" else (lyrics_source or "unknown"),
                             )
