@@ -5128,6 +5128,12 @@ async def _run_transcription_for_job(
                             # but text_correct overwrites it from the reference anyway.)
                             _base = _pl._post_reconcile_cleanup(_base)
                             _corrected = _wxr.text_correct_segments(_base, _canonical)
+                            # Whisper sometimes anchors the first line at 0:00 despite a
+                            # long instrumental intro (operator had to click the editor's
+                            # "corrección automática"). Relocate it to the real vocal
+                            # onset automatically. Pure segment-cadence heuristic; no-ops
+                            # when the first line is already placed sanely.
+                            _corrected, _ = _pl._fix_lrc_first_line_at_zero(_corrected)
                             logger.info(
                                 "[WC] line-text-correct on Whisper-1 base (%d segs, canonical=%s) — audio-as-truth path",
                                 len(_corrected),
