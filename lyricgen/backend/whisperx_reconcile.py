@@ -217,3 +217,50 @@ def text_correct_segments(audio_segs: list[dict],
         n_swapped, n_filled, len(out),
     )
     return out
+
+
+# Tunables for ad-lib relabeling.
+_ADLIB_MIN_DUR_S = 10.0   # only inspect sufficiently long segments
+_ADLIB_MIN_PACE_S = 2.0   # s/word above which a long segment is a sustained vocal
+_ADLIB_CHUNK_S = 3.5      # target length of each relabeled "Uh" line
+
+
+def relabel_long_adlibs(segs: list[dict],
+                        *, min_dur: float = _ADLIB_MIN_DUR_S,
+                        min_pace: float = _ADLIB_MIN_PACE_S,
+                        chunk: float = _ADLIB_CHUNK_S) -> list[dict]:
+    """Relabel sustained-vocalisation segments as "Uh".
+
+    Whisper forces WORDS onto wordless ad-libs: a 21 s "uh uh uh" block comes
+    back as e.g. "¿Para qué? ¿Para qué?" — which text-correct then matches to a
+    chorus line, so the ad-lib renders as a (wrong) lyric. Signal: a LONG
+    segment (>= `min_dur`) with very FEW words for its length (>= `min_pace`
+    s/word) is a sustained vocalisation, not a sung lyric. Real lyrics — even
+    long lines — run well under 1.5 s/word, so they're untouched. We relabel
+    such a segment to "Uh" lines split into ~`chunk`-second pieces (matching how
+    ROTOR shows the block), flagged `review`.
+
+    Run this on the raw transcription BEFORE text-correct so the relabeled "Uh"
+    lines have no reference match and survive verbatim. Returns a NEW list.
+    """
+    out: list[dict] = []
+    n_relabeled = 0
+    for s in segs:
+        text = (s.get("text") or "").strip()
+        st = float(s.get("start", 0.0))
+        en = float(s.get("end", st))
+        dur = en - st
+        nwords = len(text.split()) or 1
+        if dur >= min_dur and dur / nwords >= min_pace:
+            n = max(1, round(dur / chunk))
+            step = dur / n
+            for k in range(n):
+                out.append({"start": round(st + k * step, 3),
+                            "end": round(st + (k + 1) * step, 3),
+                            "text": "Uh, uh, uh", "review": True})
+            n_relabeled += 1
+        else:
+            out.append(dict(s))
+    if n_relabeled:
+        logger.info("[ADLIB] relabeled %s sustained-vocal segment(s) as 'Uh'", n_relabeled)
+    return out
