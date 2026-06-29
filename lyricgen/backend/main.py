@@ -5099,13 +5099,22 @@ async def _run_transcription_for_job(
                     # Reconcile when we have canonical text; emit raw otherwise.
                     if _canonical:
                         import whisperx_reconcile as _wxr
-                        # Audio-as-truth (LINE_TEXT_CORRECT_ENABLED): keep
-                        # whisperX's OWN segments + timing (incl. ad-lib "uh"
-                        # lines) and only swap each line's TEXT to the best
+                        # Audio-as-truth (LINE_TEXT_CORRECT_ENABLED): keep the
+                        # raw transcription's OWN segments + timing (incl. ad-lib
+                        # "uh") and only swap each line's TEXT to the best
                         # reference line. Avoids reconcile's word-rebucketing,
-                        # which scatters chorus words across a missing ad-lib
-                        # gap. No gap-cluster needed — this path never displaces.
-                        if os.environ.get("LINE_TEXT_CORRECT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on"):
+                        # which scatters chorus words across a missing ad-lib gap.
+                        #
+                        # GATED to lyrics_source == "gemini" — i.e. UNKNOWN songs
+                        # where lrclib + Genius both missed and reconcile would
+                        # smear the ad-lib. For KNOWN songs (lrclib/genius) the
+                        # whisperX-reconcile path is strictly better (word-level
+                        # timing + clean line structure); this Whisper-1 base
+                        # would merge lines and mistime them (regressed "La
+                        # Leyenda del Hada y el Mago", an lrclib song). So those
+                        # fall through to reconcile, exactly as in production.
+                        if (lyrics_source == "gemini"
+                                and os.environ.get("LINE_TEXT_CORRECT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")):
                             # Base = Whisper-1 on the RAW mix (`audio_path`), NOT WhisperX
                             # on the stem. Measured on "No Hay Santos": Whisper-1-raw
                             # captures sustained ad-libs as "uh"/"oh" and segments into
