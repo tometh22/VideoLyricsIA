@@ -220,47 +220,56 @@ def text_correct_segments(audio_segs: list[dict],
 
 
 # Tunables for ad-lib relabeling.
-_ADLIB_MIN_DUR_S = 10.0   # only inspect sufficiently long segments
-_ADLIB_MIN_PACE_S = 2.0   # s/word above which a long segment is a sustained vocal
-_ADLIB_CHUNK_S = 3.5      # target length of each relabeled "Uh" line
+_ADLIB_MIN_TAIL_S = 4.0   # wordless span (segment end − last word end) to treat as ad-lib
+_ADLIB_CHUNK_S = 9.0      # target length of each "Uh" line (~ROTOR's 3 lines for a 28 s block)
+
+
+def _uh_text(seconds: float) -> str:
+    """A line of "Uh, uh, uh …" with ~1 'uh' per second (cosmetic, like ROTOR)."""
+    n = max(3, min(round(seconds), 12))
+    return "Uh" + ", uh" * (n - 1)
 
 
 def relabel_long_adlibs(segs: list[dict],
-                        *, min_dur: float = _ADLIB_MIN_DUR_S,
-                        min_pace: float = _ADLIB_MIN_PACE_S,
+                        *, min_tail: float = _ADLIB_MIN_TAIL_S,
                         chunk: float = _ADLIB_CHUNK_S) -> list[dict]:
-    """Relabel sustained-vocalisation segments as "Uh".
+    """Replace WORDLESS sustained-vocal spans with "Uh".
 
-    Whisper forces WORDS onto wordless ad-libs: a 21 s "uh uh uh" block comes
-    back as e.g. "¿Para qué? ¿Para qué?" — which text-correct then matches to a
-    chorus line, so the ad-lib renders as a (wrong) lyric. Signal: a LONG
-    segment (>= `min_dur`) with very FEW words for its length (>= `min_pace`
-    s/word) is a sustained vocalisation, not a sung lyric. Real lyrics — even
-    long lines — run well under 1.5 s/word, so they're untouched. We relabel
-    such a segment to "Uh" lines split into ~`chunk`-second pieces (matching how
-    ROTOR shows the block), flagged `review`.
+    Whisper emits a few words for a long ad-lib and leaves the rest of the audio
+    WITHOUT word-stamps — e.g. a segment "¿Para qué? Tus santos de papel" whose
+    words all end by 69.8 s but whose audio runs to 81 s (an 11 s wordless "uh"
+    tail). Left alone, text-correct matches the whole thing to a chorus line and
+    the ad-lib is lost.
 
-    Run this on the raw transcription BEFORE text-correct so the relabeled "Uh"
-    lines have no reference match and survive verbatim. Returns a NEW list.
+    For each segment we KEEP the worded part (trimmed to its last word — its real
+    text survives so text-correct can name it, e.g. recovering the chorus Whisper
+    merged in front of the ad-lib) and relabel only the trailing WORDLESS span
+    (>= `min_tail`s) as "Uh" lines of ~`chunk`s. Real lyrics have words spanning
+    the whole segment → no wordless tail → untouched. Run BEFORE text-correct so
+    the "Uh" lines have no reference match and survive. Returns a NEW list.
     """
     out: list[dict] = []
     n_relabeled = 0
     for s in segs:
-        text = (s.get("text") or "").strip()
+        words = [w for w in (s.get("words") or []) if isinstance(w, dict) and "end" in w]
         st = float(s.get("start", 0.0))
         en = float(s.get("end", st))
-        dur = en - st
-        nwords = len(text.split()) or 1
-        if dur >= min_dur and dur / nwords >= min_pace:
-            n = max(1, round(dur / chunk))
-            step = dur / n
-            for k in range(n):
-                out.append({"start": round(st + k * step, 3),
-                            "end": round(st + (k + 1) * step, 3),
-                            "text": "Uh, uh, uh", "review": True})
-            n_relabeled += 1
-        else:
+        if not words:
             out.append(dict(s))
+            continue
+        last_word_end = max(float(w["end"]) for w in words)
+        if en - last_word_end < min_tail:
+            out.append(dict(s))            # words span the segment → real lyric, keep
+            continue
+        # keep the worded head (trimmed to its words), relabel the wordless tail
+        out.append({**dict(s), "end": round(last_word_end, 3)})
+        n = max(1, round((en - last_word_end) / chunk))
+        step = (en - last_word_end) / n
+        for k in range(n):
+            a = round(last_word_end + k * step, 3)
+            b = round(last_word_end + (k + 1) * step, 3)
+            out.append({"start": a, "end": b, "text": _uh_text(step)})
+        n_relabeled += 1
     if n_relabeled:
-        logger.info("[ADLIB] relabeled %s sustained-vocal segment(s) as 'Uh'", n_relabeled)
+        logger.info("[ADLIB] relabeled %s wordless ad-lib tail(s) as 'Uh'", n_relabeled)
     return out
