@@ -175,19 +175,45 @@ def text_correct_segments(audio_segs: list[dict],
         else:
             i += 1
 
+    # Build output:
+    #   - matched seg → swap text to its reference line.
+    #   - unmatched seg with real text (ad-lib "uh") → keep as-heard.
+    #   - unmatched BLANK seg (a melisma whisper heard but couldn't transcribe,
+    #     e.g. a sustained "Frágil espejo de vos") → name it from the reference
+    #     line skipped right here (timing stays the audio segment's, flagged
+    #     `review`); drop it if no reference line fits. This is SAFE: it only
+    #     names segments the audio already produced — it never fabricates a line
+    #     where there's no audio (which would spam phantom chorus repeats).
+    matched_refs = {a for a in assign if a is not None}
     out: list[dict] = []
-    n_swapped = 0
+    n_swapped = n_filled = 0
+    last_ref = -1
     for idx, s in enumerate(audio_segs):
-        seg = dict(s)
         j = assign[idx]
         if j is not None:
-            if seg.get("text") != ref_lines[j]:
+            seg = dict(s)
+            if (seg.get("text") or "").strip() != ref_lines[j]:
                 n_swapped += 1
             seg["text"] = ref_lines[j]
-        out.append(seg)
-    n_kept = len(out) - sum(1 for a in assign if a is not None)
+            out.append(seg)
+            last_ref = j
+            continue
+        if (s.get("text") or "").strip():
+            out.append(dict(s))   # ad-lib / unmatched-but-real text → keep as-heard
+            continue
+        # blank segment: name it from the next genuinely-skipped reference line
+        cand = last_ref + 1
+        if cand < m and cand not in matched_refs:
+            seg = dict(s)
+            seg["text"] = ref_lines[cand]
+            seg["review"] = True
+            out.append(seg)
+            last_ref = cand
+            n_filled += 1
+        # else: drop the empty segment
+
     logger.info(
-        "[TEXT-CORRECT] %s/%s segments corrected (%s left as-heard / ad-lib)",
-        n_swapped, len(out), n_kept,
+        "[TEXT-CORRECT] %s corrected, %s blanks named from reference, %s segs out",
+        n_swapped, n_filled, len(out),
     )
     return out
