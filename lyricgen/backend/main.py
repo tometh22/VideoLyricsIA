@@ -5119,6 +5119,11 @@ async def _run_transcription_for_job(
                                 _pl.transcribe, audio_path, language=(lang or None),
                                 job_id=job_id, return_words=True,
                             )
+                            # Sustained ad-libs ("uh uh uh") that Whisper forced into
+                            # words (e.g. a 21 s block heard as "¿Para qué? ¿Para qué?")
+                            # → relabel to "Uh" BEFORE text-correct so they don't get
+                            # matched onto a chorus line. Long-segment + few-words = ad-lib.
+                            _base = _wxr.relabel_long_adlibs(_base)
                             # ORDER MATTERS: split merged lines at musical pauses
                             # (word-gaps) BEFORE correcting text. Whisper merges e.g.
                             # "Tomás del miedo tu don, frágil espejo de vos" into one
