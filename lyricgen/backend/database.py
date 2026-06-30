@@ -831,6 +831,50 @@ class AuditLog(Base):
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
 
 
+class CreditGrant(Base):
+    """Créditos de regalo (promos como el lanzamiento de Escenas).
+
+    Un pool por CUENTA que se consume ANTES del cupo del plan, con
+    vencimiento. NO se decrementa en vivo: `auth.get_plan_usage()` calcula
+    cuánto se consumió contando los videos aprobados desde `granted_at` (con
+    el mismo peso de créditos que la cuota: normal=1, Escenas=N). Así
+    reject/un-approve revierten el consumo solos —igual que la cuota— sin
+    tocar ninguna fila acá.
+
+    Scope (igual que la cuota): si la cuenta tiene `billing_group` (ej.
+    Universal con tenants AR/CL), el grant es del grupo y lo comparten todos
+    sus tenants. Si no, es por `tenant_id`. Se setea UNO de los dos.
+
+    `create_all()` la crea en el boot (no requiere migración Alembic).
+    """
+    __tablename__ = "credit_grants"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # Scope de la cuenta: exactamente uno de los dos.
+    billing_group = Column(String(100), nullable=True, index=True)
+    tenant_id = Column(String(100), nullable=True, index=True)
+    amount = Column(Integer, nullable=False)            # créditos otorgados
+    reason = Column(String(100), nullable=False, default="escenas_launch", index=True)
+    granted_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    granted_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+    # NULL = sin vencimiento. La promo de lanzamiento setea now + TTL.
+    expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    # Kill-switch sin borrar la fila (auditable).
+    revoked = Column(Boolean, default=False, nullable=False, server_default="false")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "billing_group": self.billing_group,
+            "tenant_id": self.tenant_id,
+            "amount": self.amount,
+            "reason": self.reason,
+            "granted_at": self.granted_at.isoformat() if self.granted_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "revoked": self.revoked,
+        }
+
+
 class BackgroundAsset(Base):
     """Pre-approved background assets for video generation."""
     __tablename__ = "background_assets"

@@ -36,6 +36,8 @@ const JobDetail = lazy(() => import("./components/JobDetail"));
 const HistoryView = lazy(() => import("./components/HistoryView"));
 import BatchProgress from "./components/BatchProgress";
 import TranscribingProgress from "./components/TranscribingProgress";
+import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
+import WhatsNewBell from "./components/WhatsNew/WhatsNewBell";
 import { useAlert } from "./components/AlertProvider";
 import HelpButton from "./components/HelpCenter/HelpButton";
 import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
@@ -490,6 +492,7 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
             </button>
           </div>
           <div className="flex items-center gap-3">
+            <WhatsNewBell />
             <HelpButton />
             {/* El avatar + nombre vive en UN solo lugar: el bloque de perfil
                 del sidebar (patrón Slack/Linear). El topbar queda para
@@ -3997,6 +4000,7 @@ export default function App() {
     <>
       <RootEffects setUser={setUser} setResetToken={setResetToken} setBillingSuccess={setBillingSuccess} />
       {billingSuccess && <BillingSuccessToast onDismiss={() => setBillingSuccess(false)} />}
+      {user && <WhatsNewModal user={user} />}
       <Routes>
         <Route
           path="/"

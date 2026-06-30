@@ -64,6 +64,7 @@ from auth import (
     has_prores_access,
     has_drive_access,
     has_scenes_access,
+    scenes_credit_cost,
     telemetry_enabled,
     generate_api_key,
     is_super_admin,
@@ -74,7 +75,8 @@ from datetime import datetime, timedelta, timezone
 from database import (
     Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
     BackgroundAsset, AssetUsage, Delivery, DeliveryChangeRequest,
-    SalesLead, UserSession, LoginSession, UiEvent, scoped_db, pool_stats,
+    SalesLead, UserSession, LoginSession, UiEvent, CreditGrant,
+    scoped_db, pool_stats,
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
@@ -1157,6 +1159,7 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
             "features": {
                 "prores_export": has_prores_access(user),
                 "scenes": has_scenes_access(user),
+                "scenes_credit_cost": scenes_credit_cost(),
                 "telemetry": telemetry_enabled(),
             },
         },
@@ -1256,6 +1259,7 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
             "features": {
                 "prores_export": has_prores_access(user),
                 "scenes": has_scenes_access(user),
+                "scenes_credit_cost": scenes_credit_cost(),
                 "telemetry": telemetry_enabled(),
             },
         },
@@ -1323,6 +1327,7 @@ def me(current_user: dict = Depends(get_current_user), db: Session = Depends(get
         "features": {
             "prores_export": has_prores_access(_u),
             "scenes": has_scenes_access(_u),
+            "scenes_credit_cost": scenes_credit_cost(),
             "telemetry": telemetry_enabled(),
         },
     }
@@ -9440,6 +9445,18 @@ class RegenerateSceneRequest(BaseModel):
     allow_youtube_drift: bool = False
 
 
+def _scene_reroll_max() -> int:
+    """Cuántos re-rolls gratis por escena antes de frenar (anti-abuso).
+
+    Presupuesto PROPIO del re-roll de escena, separado del _MAX_EDITS de las
+    ediciones caras (letra/fondo). Un re-roll cuesta ~1 clip Veo (~US$0.80),
+    así que es generoso. Env SCENE_REROLL_MAX (default 5). Admin exento."""
+    try:
+        return max(1, int(os.environ.get("SCENE_REROLL_MAX", "5")))
+    except (TypeError, ValueError):
+        return 5
+
+
 @app.post("/jobs/{job_id}/scenes/{recurrence_key}/regenerate")
 async def regenerate_scene(
     job_id: str,
@@ -9450,11 +9467,12 @@ async def regenerate_scene(
 ):
     """Regenera UNA escena del fondo multi-escena y re-renderiza el video.
 
-    Cuesta ~1 clip Veo (~US$0.90) y cuenta como un edit. Sólo la escena pedida
-    toca Veo; las demás re-bajan de la caché R2. Si la escena es recurrente (un
-    coro), regenerarla cambia TODAS sus apariciones (el frontend lo confirma).
+    Cuesta ~1 clip Veo (~US$0.80) y NO consume el cupo de ediciones caras
+    (_MAX_EDITS): tiene su propio presupuesto por escena (SCENE_REROLL_MAX).
+    Sólo la escena pedida toca Veo; las demás re-bajan de la caché R2. Si la
+    escena es recurrente (un coro), regenerarla cambia TODAS sus apariciones.
     """
-    from pipeline import _MAX_EDITS
+    from pipeline import _MAX_EDITS  # sólo para reportar edits_remaining (cupo de ediciones caras); el re-roll NO lo consume
     from database import Job as JobModel, AuditLog
 
     body = body or RegenerateSceneRequest()
@@ -9500,12 +9518,31 @@ async def regenerate_scene(
             "youtube_url": yt_url,
         })
 
-    current_edit_count = job.edit_count or 0
     _is_admin = current_user.get("role") == "admin"
-    if not _is_admin and current_edit_count >= _MAX_EDITS:
+    # Re-roll de escena: presupuesto PROPIO, desacoplado del _MAX_EDITS de las
+    # ediciones caras (letra/fondo). Corregir una escena fea es barato (~1 clip
+    # Veo) y debe ser generoso. Contamos los re-rolls previos de ESTA escena en
+    # el audit log (append-only) — sin columna nueva ni clobber del scene_plan
+    # que el worker reescribe. Cap por escena, env-tunable, admin exento.
+    #
+    # `detail` es JSONB vía TypeDecorator y NO soporta `.astext` en la expresión
+    # SQL (rompía con AttributeError → 500 en CADA re-roll). Filtramos `action`
+    # en SQL (indexado) y matcheamos job_id/recurrence_key en Python: la acción
+    # es manual y poco frecuente, así que el volumen es chico.
+    _prior_rerolls = sum(
+        1
+        for (_d,) in db.query(AuditLog.detail)
+        .filter(AuditLog.action == "job.scene_regenerate")
+        .all()
+        if isinstance(_d, dict)
+        and _d.get("job_id") == job_id
+        and _d.get("recurrence_key") == recurrence_key
+    )
+    _reroll_cap = _scene_reroll_max()
+    if not _is_admin and _prior_rerolls >= _reroll_cap:
         raise HTTPException(
             status_code=400,
-            detail=f"Llegaste al máximo de ediciones ({_MAX_EDITS}). Aprobá o rechazá el job.",
+            detail=f"Llegaste al máximo de regeneraciones de esta escena ({_reroll_cap}). Editá el prompt o aprobá el job.",
         )
     if not job.input_r2_key:
         raise HTTPException(status_code=422, detail="Audio original no disponible — no se puede re-renderizar.")
@@ -9518,9 +9555,9 @@ async def regenerate_scene(
         "scene_movement": _mv if _mv in ("estatico", "sutil", "dinamico") else "",
     }
 
-    new_edit_count = current_edit_count + 1
+    # Nota: el re-roll de escena NO incrementa job.edit_count — tiene su propio
+    # cupo (SCENE_REROLL_MAX, contado vía audit log arriba).
     job.status = "editing"
-    job.edit_count = new_edit_count
     job.current_step = "scenes"
     job.progress = 0
     job.editing_started_at = datetime.now(timezone.utc)
@@ -9528,7 +9565,7 @@ async def regenerate_scene(
         user_id=current_user["id"],
         action="job.scene_regenerate",
         detail={"job_id": job_id, "recurrence_key": recurrence_key,
-                "edit_params": edit_params, "edit_count": new_edit_count},
+                "edit_params": edit_params, "reroll_index": _prior_rerolls + 1},
     ))
     db.commit()
 
@@ -9543,7 +9580,7 @@ async def regenerate_scene(
     except Exception as exc:
         logger.error("enqueue_edit (scene) failed for %s: %s", job_id, exc)
         job.status = "pending_review"
-        job.edit_count = current_edit_count
+        # el re-roll de escena no tocó edit_count → nada que revertir acá
         job.editing_started_at = None
         job.progress = 100
         job.current_step = "thumbnail"
@@ -9554,9 +9591,13 @@ async def regenerate_scene(
         "ok": True,
         "job_id": job_id,
         "recurrence_key": recurrence_key,
-        "edit_count": new_edit_count,
-        "edits_remaining": max(0, _MAX_EDITS - new_edit_count),
+        # El re-roll de escena NO consume el cupo de ediciones; edit_count va sin
+        # cambios. Reportamos el cupo general (para el editor) + el índice de
+        # re-roll de esta escena.
+        "edit_count": job.edit_count or 0,
+        "edits_remaining": max(0, _MAX_EDITS - (job.edit_count or 0)),
         "edit_limit_exempt": _is_admin,
+        "reroll_count": _prior_rerolls + 1,
     }
 
 
@@ -11589,6 +11630,140 @@ async def admin_list_change_requests(
         "items": items,
         "pending_count": pending_count,
         "resolved_count": resolved_count,
+    }
+
+
+class CreditGrantRequest(BaseModel):
+    """Body para emitir créditos de regalo (promos)."""
+    scope: str = "all"                       # "all" | "tenant" | "billing_group"
+    tenant_id: str | None = None
+    billing_group: str | None = None
+    amount: int | None = None                # scope tenant/billing_group: monto explícito
+    paid_amount: int | None = None           # scope "all": monto a planes pagos
+    free_amount: int | None = None           # scope "all": monto a plan free
+    ttl_days: int | None = None
+    reason: str = "escenas_launch"
+    dry_run: bool = False
+
+
+@app.post("/admin/credit-grants")
+async def admin_create_credit_grants(
+    body: CreditGrantRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Emitir créditos de regalo (promos como el lanzamiento de Escenas). Admin only.
+
+    - scope="all": siembra UN grant por CUENTA (billing_group si existe, si no
+      tenant) entre los usuarios activos. Monto por plan: free → free_amount,
+      resto → paid_amount. Idempotente por `reason`: no re-otorga si la cuenta
+      ya tiene un grant activo con ese reason.
+    - scope="tenant" / "billing_group": un grant puntual con `amount`.
+
+    Defaults por env: LAUNCH_CREDITS_PAID (30), LAUNCH_CREDITS_FREE (6),
+    LAUNCH_CREDITS_TTL_DAYS (30). `dry_run=true` devuelve el plan sin escribir.
+
+    El medidor (/usage) refleja el grant dentro de ~30 s (TTL del cache).
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    paid = body.paid_amount if body.paid_amount is not None else int(os.environ.get("LAUNCH_CREDITS_PAID", "30"))
+    free = body.free_amount if body.free_amount is not None else int(os.environ.get("LAUNCH_CREDITS_FREE", "6"))
+    ttl_days = body.ttl_days if body.ttl_days is not None else int(os.environ.get("LAUNCH_CREDITS_TTL_DAYS", "30"))
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=ttl_days) if ttl_days and ttl_days > 0 else None
+    reason = (body.reason or "escenas_launch").strip()
+
+    def _has_active_grant(_bg, _tn):
+        q = db.query(CreditGrant).filter(
+            CreditGrant.reason == reason,
+            CreditGrant.revoked.is_(False),
+        )
+        if _bg:
+            q = q.filter(CreditGrant.billing_group == _bg)
+        else:
+            q = q.filter(CreditGrant.tenant_id == _tn, CreditGrant.billing_group.is_(None))
+        # SQLite devuelve expires_at naive; normalizar antes de comparar con `now`.
+        return any(
+            g.expires_at is None
+            or (g.expires_at if g.expires_at.tzinfo else g.expires_at.replace(tzinfo=timezone.utc)) > now
+            for g in q.all()
+        )
+
+    created, skipped, preview = 0, 0, []
+
+    if body.scope == "all":
+        # Una CUENTA = billing_group (si existe) o tenant. Agrupamos usuarios
+        # activos por esa clave; el monto sale del plan (free vs pago).
+        users = db.query(User).filter(User.is_active == True).all()  # noqa: E712
+        accounts = {}
+        for u in users:
+            key = ("bg", u.billing_group) if u.billing_group else ("tn", u.tenant_id)
+            acc = accounts.setdefault(key, {
+                "billing_group": u.billing_group,
+                "tenant_id": None if u.billing_group else u.tenant_id,
+                "all_free": True,
+            })
+            if (u.plan_id or "").lower() != "free":
+                acc["all_free"] = False
+        for acc in accounts.values():
+            amount = free if acc["all_free"] else paid
+            if amount <= 0 or _has_active_grant(acc["billing_group"], acc["tenant_id"]):
+                skipped += 1
+                continue
+            preview.append({"billing_group": acc["billing_group"],
+                            "tenant_id": acc["tenant_id"], "amount": amount})
+            if not body.dry_run:
+                db.add(CreditGrant(
+                    billing_group=acc["billing_group"], tenant_id=acc["tenant_id"],
+                    amount=amount, reason=reason, granted_by=current_user["id"],
+                    granted_at=now, expires_at=expires_at,
+                ))
+                created += 1
+    else:
+        bg = (body.billing_group or "").strip() or None
+        tn = (body.tenant_id or "").strip() or None
+        if body.scope == "billing_group" and not bg:
+            raise HTTPException(status_code=400, detail="billing_group required")
+        if body.scope == "tenant" and not tn:
+            raise HTTPException(status_code=400, detail="tenant_id required")
+        if bg:
+            tn = None  # un grant es de billing_group XOR tenant
+        amount = body.amount if body.amount is not None else paid
+        if amount <= 0:
+            raise HTTPException(status_code=400, detail="amount must be > 0")
+        if _has_active_grant(bg, tn):
+            skipped += 1
+        else:
+            preview.append({"billing_group": bg, "tenant_id": tn, "amount": amount})
+            if not body.dry_run:
+                db.add(CreditGrant(
+                    billing_group=bg, tenant_id=tn, amount=amount, reason=reason,
+                    granted_by=current_user["id"], granted_at=now, expires_at=expires_at,
+                ))
+                created += 1
+
+    if not body.dry_run and created:
+        db.add(AuditLog(
+            user_id=current_user["id"],
+            action="admin.credit_grants",
+            detail={"reason": reason, "scope": body.scope, "created": created,
+                    "skipped": skipped,
+                    "expires_at": expires_at.isoformat() if expires_at else None},
+        ))
+        db.commit()
+
+    return {
+        "ok": True,
+        "created": created,
+        "skipped": skipped,
+        "dry_run": body.dry_run,
+        "amount_paid": paid,
+        "amount_free": free,
+        "ttl_days": ttl_days,
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "preview": preview[:50],
     }
 
 
