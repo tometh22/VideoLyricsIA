@@ -19,10 +19,13 @@ def test_auth_me_returns_features_scenes_admin(client, admin_token):
     assert "telemetry" in body["features"]
 
 
-def test_auth_me_features_scenes_false_for_plain_user(client, user_token):
+def test_auth_me_features_scenes_false_for_plain_user(client, user_token, monkeypatch):
+    # Rollback (SCENES_GLOBALLY_ENABLED=0): un user común sin allowlist NO es
+    # elegible. Con el flag en ON (default) Escenas es PÚBLICO — ver
+    # test_scenes_credits.py.
+    monkeypatch.setenv("SCENES_GLOBALLY_ENABLED", "0")
     r = client.get("/auth/me", headers={"Authorization": f"Bearer {user_token}"})
     assert r.status_code == 200
-    # Default (SCENES_ENABLED_TENANTS vacío) → un user común NO es elegible.
     assert r.json()["features"]["scenes"] is False
 
 
@@ -58,11 +61,12 @@ def _hdr(tok):
 
 def test_regen_scene_403_for_non_eligible(client, user_token, db, monkeypatch):
     import main
+    monkeypatch.setenv("SCENES_GLOBALLY_ENABLED", "0")  # rollback: gating activo
     monkeypatch.setattr(main, "enqueue_edit", lambda **k: "edit:fake")
     me = client.get("/auth/me", headers=_hdr(user_token)).json()
     jid = _make_scene_job(db, me["tenant_id"])
     r = client.post(f"/jobs/{jid}/scenes/coro_1/regenerate", headers=_hdr(user_token), json={})
-    assert r.status_code == 403  # user común no tiene has_scenes_access
+    assert r.status_code == 403  # user común no tiene has_scenes_access (modo rollback)
 
 
 def test_regen_scene_404_unknown_key(client, admin_token, db, monkeypatch):
@@ -118,7 +122,10 @@ def test_regen_scene_409_youtube_drift(client, admin_token, db, monkeypatch):
     assert r2.status_code == 200
 
 
-def test_regen_scene_happy_increments_edit_count(client, admin_token, db, monkeypatch):
+def test_regen_scene_happy_does_not_touch_edit_count(client, admin_token, db, monkeypatch):
+    """El re-roll de escena NO consume el cupo de ediciones caras (_MAX_EDITS):
+    tiene su propio cupo (SCENE_REROLL_MAX). edit_count queda igual; la respuesta
+    trae `reroll_count`."""
     from database import Job as JobModel
     import main
     captured = {}
@@ -129,12 +136,13 @@ def test_regen_scene_happy_increments_edit_count(client, admin_token, db, monkey
                     json={"hint": "más oscuro", "movement_style": "sutil"})
     assert r.status_code == 200
     body = r.json()
-    assert body["edit_count"] == 1
+    assert body["edit_count"] == 0          # NO toca el cupo de ediciones caras
+    assert body["reroll_count"] == 1        # su propio contador
     assert captured["edit_params"]["scene_hint"] == "más oscuro"
     assert captured["edit_params"]["scene_movement"] == "sutil"
     db.expire_all()
     fresh = db.query(JobModel).filter(JobModel.job_id == jid).first()
-    assert fresh.edit_count == 1 and fresh.status == "editing"
+    assert fresh.edit_count == 0 and fresh.status == "editing"
 
 
 def _make_retry_job(db, tenant_id, user_id, *, enable_scenes=True):
@@ -153,8 +161,13 @@ def _make_retry_job(db, tenant_id, user_id, *, enable_scenes=True):
 
 def test_retry_gates_enable_scenes_for_non_eligible(client, user_token, db, monkeypatch):
     """Audit A5: un user sin acceso reintenta un job multi-escena → enable_scenes
-    se fuerza a False (no debe seguir generando multi-escena ni su costo)."""
+    se fuerza a False (no debe seguir generando multi-escena ni su costo).
+
+    Modo rollback (SCENES_GLOBALLY_ENABLED=0): el gating por elegibilidad está
+    activo. Con el flag en ON (default) Escenas es público y el costo lo
+    gobiernan los créditos."""
     import main
+    monkeypatch.setenv("SCENES_GLOBALLY_ENABLED", "0")
     captured = {}
     monkeypatch.setattr(main, "enqueue_pipeline", lambda **k: captured.update(k) or "thread:fake")
     me = client.get("/auth/me", headers=_hdr(user_token)).json()
