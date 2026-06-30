@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { createPortal } from "react-dom";
 import { useI18n } from "../../i18n";
 import { useChangelog } from "./useChangelog";
 import WhatsNewPanel from "./WhatsNewPanel";
@@ -32,7 +33,10 @@ export default function WhatsNewBell() {
           </span>
         )}
       </button>
-      {open && <WhatsNewPanel onClose={() => setOpen(false)} />}
+      {/* Portal a document.body: el header tiene backdrop-blur, que crea un
+          containing block para position:fixed — sin el portal, el panel queda
+          relativo al header (corto) y sale cortado. */}
+      {open && createPortal(<WhatsNewPanel onClose={() => setOpen(false)} />, document.body)}
     </>
   );
 }
