@@ -82,7 +82,7 @@ export default function ScenesAnnounceModal({ user }) {
               onClick={() => { close(); navigate("/new"); }}
               className="text-[12px] font-semibold px-3.5 py-1.5 rounded-lg bg-brand hover:bg-brand-light text-white"
             >
-              {t("announce.scenes_cta") || "Entendido, lo pruebo"}
+              {t("announce.scenes_cta") || "Probar Escenas"}
             </button>
           </div>
         </div>
