@@ -91,6 +91,9 @@ export default function WhatsNewPanel({ onClose }) {
             })}
           </ul>
         )}
+        <p className="px-5 py-6 text-center text-[11px] text-gray-600">
+          {t("whatsnew.footer") || "Genly se actualiza seguido — volvé por más novedades ✨"}
+        </p>
       </div>
     </div>
   );

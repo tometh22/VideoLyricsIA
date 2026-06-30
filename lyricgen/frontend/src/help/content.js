@@ -31,6 +31,8 @@ export const HELP_CONTENT = {
       tags: { es: ["fondo", "background", "biblioteca", "ia"], en: ["background", "library", "ai", "generated"], pt: ["fundo", "biblioteca", "ia", "gerado"] } },
     { id: "style-settings",    category: "creating", animation: null,
       tags: { es: ["estilo", "genero", "tipografia", "animacion", "transicion"], en: ["style", "genre", "font", "animation", "transition"], pt: ["estilo", "genero", "fonte", "animacao", "transicao"] } },
+    { id: "scenes",            category: "creating", animation: null, featured: true,
+      tags: { es: ["escenas", "multi-escena", "arco", "regenerar", "creditos", "fondo"], en: ["scenes", "multi-scene", "arc", "regenerate", "credits"], pt: ["cenas", "multi-cena", "arco", "regenerar", "creditos"] } },
 
     // ─── Editor de letras ───
     { id: "editor-overview",   category: "lyrics", animation: null,
