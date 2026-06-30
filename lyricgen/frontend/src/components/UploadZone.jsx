@@ -371,6 +371,20 @@ export default function UploadZone({
   // los admin siempre califican aunque la sesión cacheada no traiga el flag.
   const scenesEligible = user?.features?.scenes === true || user?.role === "admin";
   const [showScenesUpsell, setShowScenesUpsell] = useState(false);
+  // Costo en créditos del add-on Escenas. El backend lo expone en
+  // features.scenes_credit_cost; default 3 (valor de lanzamiento) si la sesión
+  // cacheada no lo trae aún.
+  const scenesCreditCost = user?.features?.scenes_credit_cost ?? 3;
+  // Badge "Nuevo" + beacon hasta que el usuario interactúe con la card de
+  // Escenas (descubrimiento en contexto). Se persiste para no repetir; si
+  // localStorage falla, default a "ya visto" para no molestar.
+  const [scenesSeen, setScenesSeen] = useState(() => {
+    try { return localStorage.getItem("genly_scenes_seen") === "1"; } catch { return true; }
+  });
+  const markScenesSeen = () => {
+    setScenesSeen(true);
+    try { localStorage.setItem("genly_scenes_seen", "1"); } catch { /* storage bloqueado */ }
+  };
   // Escape cierra el modal de upsell (a11y — audit NIT).
   useEffect(() => {
     if (!showScenesUpsell) return undefined;
@@ -2437,6 +2451,7 @@ export default function UploadZone({
                           ? (t("upload.scenes_locked_aria") || "Multi-escena — disponible en el plan superior")
                           : (t("upload.scenes_toggle") || "Multi-escena")}
                         onClick={() => {
+                          markScenesSeen();
                           if (locked) { track("wizard.scenes_upsell"); setShowScenesUpsell(true); return; }
                           track("wizard.scenes", { enabled: !on });
                           onEnableScenesChange && onEnableScenesChange(!on);
@@ -2446,13 +2461,27 @@ export default function UploadZone({
                              : "border-brand/25 bg-gradient-to-r from-brand/[0.07] to-transparent hover:border-brand/45"
                         }`}
                       >
-                        <span className="w-9 h-9 rounded-xl grid place-items-center text-[17px] shrink-0 bg-gradient-to-br from-brand to-accent">🎬</span>
+                        <span className="relative w-9 h-9 rounded-xl grid place-items-center text-[17px] shrink-0 bg-gradient-to-br from-brand to-accent">
+                          🎬
+                          {!scenesSeen && (
+                            <span className="absolute -top-1 -right-1 flex h-3 w-3" aria-hidden="true">
+                              <span className="absolute inline-flex h-full w-full rounded-full bg-accent opacity-75 animate-ping" />
+                              <span className="relative inline-flex h-3 w-3 rounded-full bg-accent ring-2 ring-surface-2" />
+                            </span>
+                          )}
+                        </span>
                         <span className="min-w-0 flex-1">
                           <span className="flex items-center gap-2">
                             <span className={`text-[13px] font-semibold ${on ? "text-white" : "text-gray-200"}`}>{t("upload.scenes_toggle") || "Multi-escena"}</span>
+                            {!scenesSeen && (
+                              <span className="text-[9px] font-bold tracking-[0.04em] px-1.5 py-0.5 rounded bg-accent text-white">{t("upload.scenes_new_badge") || "NUEVO"}</span>
+                            )}
                             <span className="text-[9px] font-bold tracking-[0.04em] px-1.5 py-0.5 rounded bg-gradient-to-r from-brand to-accent text-white">{t("upload.premium_badge") || "PREMIUM"}</span>
                           </span>
-                          <span className="block text-[11px] text-ink-secondary mt-0.5 leading-snug">{t("upload.scenes_toggle_desc") || "Varias escenas con arco narrativo en vez de un fondo único."}</span>
+                          <span className="block text-[11px] text-ink-secondary mt-0.5 leading-snug">
+                            {t("upload.scenes_toggle_desc") || "Varias escenas con arco narrativo en vez de un fondo único."}
+                            <span className="text-brand-light font-medium"> · {(t("upload.scenes_credits") || "{n} créditos").replace("{n}", scenesCreditCost)}</span>
+                          </span>
                         </span>
                         {locked
                           ? <span className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-brand/15 text-brand-light text-[10px] font-semibold">

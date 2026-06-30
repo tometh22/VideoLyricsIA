@@ -36,6 +36,7 @@ const JobDetail = lazy(() => import("./components/JobDetail"));
 const HistoryView = lazy(() => import("./components/HistoryView"));
 import BatchProgress from "./components/BatchProgress";
 import TranscribingProgress from "./components/TranscribingProgress";
+import ScenesAnnounceModal from "./components/ScenesAnnounceModal";
 import { useAlert } from "./components/AlertProvider";
 import HelpButton from "./components/HelpCenter/HelpButton";
 import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
@@ -3997,6 +3998,7 @@ export default function App() {
     <>
       <RootEffects setUser={setUser} setResetToken={setResetToken} setBillingSuccess={setBillingSuccess} />
       {billingSuccess && <BillingSuccessToast onDismiss={() => setBillingSuccess(false)} />}
+      {user && <ScenesAnnounceModal user={user} />}
       <Routes>
         <Route
           path="/"
