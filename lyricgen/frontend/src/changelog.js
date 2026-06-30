@@ -20,7 +20,13 @@ export const CHANGELOG = [
     id: "escenas",
     date: "2026-06-30",
     titleKey: "announce.scenes_title",
+    taglineKey: "announce.scenes_tagline",
     bodyKey: "announce.scenes_body",
+    highlightKeys: [
+      "announce.scenes_hl1",
+      "announce.scenes_hl2",
+      "announce.scenes_hl3",
+    ],
     media: "/escenas_demo.mp4",
     ctaKey: "announce.scenes_cta",
     ctaTo: "/new",

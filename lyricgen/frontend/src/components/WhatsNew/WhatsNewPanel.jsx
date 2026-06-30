@@ -64,8 +64,19 @@ export default function WhatsNewPanel({ onClose }) {
                   )}
                   <div className="p-4">
                     <p className="text-[10px] uppercase tracking-wide text-ink-secondary">{fmtDate(e.date, lang)}</p>
-                    <h3 className="text-[13.5px] font-semibold text-white mt-1">{t(e.titleKey)}</h3>
-                    <p className="text-[12px] text-ink-secondary mt-1 leading-relaxed">{t(e.bodyKey)}</p>
+                    <h3 className="text-[14px] font-bold text-white mt-1 leading-tight">{t(e.titleKey)}</h3>
+                    {e.taglineKey && (
+                      <p className="text-[12px] text-brand-light font-medium mt-1 leading-snug">{t(e.taglineKey)}</p>
+                    )}
+                    {Array.isArray(e.highlightKeys) && e.highlightKeys.length > 0 ? (
+                      <ul className="mt-2 space-y-1.5">
+                        {e.highlightKeys.map((k) => (
+                          <li key={k} className="text-[12px] text-ink-secondary leading-snug">{t(k)}</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="text-[12px] text-ink-secondary mt-1 leading-relaxed">{t(e.bodyKey)}</p>
+                    )}
                     {e.ctaTo && (
                       <button
                         onClick={() => { onClose(); navigate(e.ctaTo); }}
