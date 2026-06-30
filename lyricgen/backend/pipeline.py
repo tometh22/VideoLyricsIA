@@ -6391,6 +6391,8 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     # original "exact camera movement" wording.
     _static = normalized_movement == "estatico"
     _sutil = normalized_movement == "sutil"
+    _animado = normalized_movement == "animado"
+    _foto = normalized_movement == "foto-parallax"
     _auto_movement = normalized_movement == ""
     if _static:
         # C4 (2026-05-25) + UMG-style update: repetir LOCKED 3× para reforzar
@@ -6421,18 +6423,44 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
                     "(water, fire, foliage, particles, light); the camera "
                     "itself is essentially still. NEVER push-in, NEVER zoom, "
                     "NEVER dolly forward, NEVER orbit. Just a faint breath")
+    elif _animado:
+        # 2D illustration: cámara CALMA y variada. Antes caía al `else` ("exact
+        # camera movement") → paneos en cada escena, todas iguales (bug
+        # 2026-06-30). La vida viene de la animación 2D, no de la cámara.
+        _clause2 = ("(2) framing and composition chosen for THIS scene's mood "
+                    "(vary the angle and shot size between scenes so they don't all "
+                    "look alike), with a CALM camera — at most a slow, gentle "
+                    "lateral drift; this is a stylised 2D illustration, so keep the "
+                    "camera movement minimal and let the illustrated shapes and "
+                    "elements carry the motion. NEVER push-in, zoom, dolly forward "
+                    "or orbit")
+    elif _foto:
+        # Foto fija: cámara casi inmóvil (foto), NO "exact camera movement".
+        _clause2 = ("(2) framing and composition for THIS scene (vary it between "
+                    "scenes), treated as a STILL PHOTOGRAPH — the camera is "
+                    "essentially static, at most an extremely slow parallax or "
+                    "lateral drift (no more than 5% of the frame); NEVER push-in, "
+                    "zoom, dolly or orbit; the stillness IS the style")
     elif _auto_movement:
         _clause2 = ("(2) the camera register that matches the song's energy — a "
                     "LOCKED STATIC frame for intimate/calm songs, SUBTLE minimal "
-                    "motion for most, and at most a GENTLE LATERAL track, slow "
+                    "motion for most, and at most a GENTLE, SLOW LATERAL track, slow "
                     "orbit or parallax for genuinely high-energy tracks; NEVER a "
                     "camera that travels FORWARD toward the subject (no push-in, "
                     "dolly forward, fly-through or first-person glide) because the "
                     "lyrics are overlaid and forward motion makes them nauseating "
-                    "to read; do NOT default to a constant cinematic drift — and "
-                    "the framing")
+                    "to read; do NOT default to a constant cinematic drift, keep it "
+                    "restrained, and VARY the move between scenes — and the framing")
     else:
-        _clause2 = "(2) exact camera movement and framing"
+        # estandar (cinematográfico): movimiento SUAVE, lento y variado — no
+        # "exact camera movement", que daba paneos fuertes y monótonos
+        # (feedback 2026-06-30: "demasiados paneos y todos iguales").
+        _clause2 = ("(2) a GENTLE, SLOW camera move that fits the moment — prefer a "
+                    "subtle lateral drift, slow orbit or parallax, and VARY it "
+                    "between scenes so they don't all look the same; NEVER a forward "
+                    "push-in, dolly, zoom or fly-through (the overlaid lyrics turn "
+                    "nauseating); do NOT default to a constant cinematic drift — and "
+                    "the framing")
 
     # The "no people" line is gated by `allow_people`. When the operator
     # opted into "fondo libre" (bypass_content_validation=True) OR the
