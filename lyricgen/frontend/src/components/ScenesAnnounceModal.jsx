@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { useNavigate } from "react-router-dom";
 import { useI18n } from "../i18n";
 
 // One-time announcement del add-on "Escenas". Se muestra una vez por usuario
@@ -9,6 +10,7 @@ const SEEN_KEY = "genly_scenes_announce_seen";
 
 export default function ScenesAnnounceModal({ user }) {
   const { t } = useI18n();
+  const navigate = useNavigate();
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
@@ -77,10 +79,10 @@ export default function ScenesAnnounceModal({ user }) {
               {t("announce.later") || "Más tarde"}
             </button>
             <button
-              onClick={close}
+              onClick={() => { close(); navigate("/new"); }}
               className="text-[12px] font-semibold px-3.5 py-1.5 rounded-lg bg-brand hover:bg-brand-light text-white"
             >
-              {t("announce.scenes_cta") || "Entendido, lo pruebo"}
+              {t("announce.scenes_cta") || "Probar Escenas"}
             </button>
           </div>
         </div>
