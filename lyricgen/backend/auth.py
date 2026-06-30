@@ -901,12 +901,15 @@ def get_plan_usage(db: Session, user_id: int, tenant_id: str, plan_id: str,
         )
 
     # Modelo de créditos: un video con Escenas (multi-escena) consume N
-    # créditos, no 1. `scene_plan` queda no-null sólo cuando el job se
-    # entregó con multi-escena. Cada job ya cuenta 1 en `videos`; sumamos
-    # (N-1) extra por cada Escenas. Con SCENES_CREDIT_COST=1 es no-op.
+    # créditos, no 1. Un job es Escenas si su scene_plan tiene la key `scenes`.
+    # OJO (bug fixeado): NO usar `scene_plan IS NOT NULL` — la columna JSONB
+    # serializa el None de Python como JSON `'null'` (NO SQL NULL), así que
+    # IS NOT NULL matchea TODOS los jobs → cobraría N créditos a CADA video.
+    # Filtramos por la key real `scene_plan->'scenes'` (null/ausente en videos
+    # normales). Cada job ya cuenta 1 en `videos`; sumamos (N-1) por Escenas.
     videos = _base.count()
     _cost = scenes_credit_cost()
-    escenas = _base.filter(Job.scene_plan.isnot(None)).count() if _cost > 1 else 0
+    escenas = _base.filter(Job.scene_plan["scenes"].isnot(None)).count() if _cost > 1 else 0
     used = videos + (_cost - 1) * escenas
 
     plan = PLANS.get(plan_id, PLANS["100"])
