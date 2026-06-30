@@ -9467,6 +9467,7 @@ async def regenerate_scene(
     Sólo la escena pedida toca Veo; las demás re-bajan de la caché R2. Si la
     escena es recurrente (un coro), regenerarla cambia TODAS sus apariciones.
     """
+    from pipeline import _MAX_EDITS  # sólo para reportar edits_remaining (cupo de ediciones caras); el re-roll NO lo consume
     from database import Job as JobModel, AuditLog
 
     body = body or RegenerateSceneRequest()
@@ -9565,7 +9566,7 @@ async def regenerate_scene(
     except Exception as exc:
         logger.error("enqueue_edit (scene) failed for %s: %s", job_id, exc)
         job.status = "pending_review"
-        job.edit_count = current_edit_count
+        # el re-roll de escena no tocó edit_count → nada que revertir acá
         job.editing_started_at = None
         job.progress = 100
         job.current_step = "thumbnail"
@@ -9576,9 +9577,13 @@ async def regenerate_scene(
         "ok": True,
         "job_id": job_id,
         "recurrence_key": recurrence_key,
-        "edit_count": new_edit_count,
-        "edits_remaining": max(0, _MAX_EDITS - new_edit_count),
+        # El re-roll de escena NO consume el cupo de ediciones; edit_count va sin
+        # cambios. Reportamos el cupo general (para el editor) + el índice de
+        # re-roll de esta escena.
+        "edit_count": job.edit_count or 0,
+        "edits_remaining": max(0, _MAX_EDITS - (job.edit_count or 0)),
         "edit_limit_exempt": _is_admin,
+        "reroll_count": _prior_rerolls + 1,
     }
 
 
