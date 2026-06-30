@@ -9440,6 +9440,18 @@ class RegenerateSceneRequest(BaseModel):
     allow_youtube_drift: bool = False
 
 
+def _scene_reroll_max() -> int:
+    """Cuántos re-rolls gratis por escena antes de frenar (anti-abuso).
+
+    Presupuesto PROPIO del re-roll de escena, separado del _MAX_EDITS de las
+    ediciones caras (letra/fondo). Un re-roll cuesta ~1 clip Veo (~US$0.80),
+    así que es generoso. Env SCENE_REROLL_MAX (default 5). Admin exento."""
+    try:
+        return max(1, int(os.environ.get("SCENE_REROLL_MAX", "5")))
+    except (TypeError, ValueError):
+        return 5
+
+
 @app.post("/jobs/{job_id}/scenes/{recurrence_key}/regenerate")
 async def regenerate_scene(
     job_id: str,
@@ -9450,11 +9462,12 @@ async def regenerate_scene(
 ):
     """Regenera UNA escena del fondo multi-escena y re-renderiza el video.
 
-    Cuesta ~1 clip Veo (~US$0.90) y cuenta como un edit. Sólo la escena pedida
-    toca Veo; las demás re-bajan de la caché R2. Si la escena es recurrente (un
-    coro), regenerarla cambia TODAS sus apariciones (el frontend lo confirma).
+    Cuesta ~1 clip Veo (~US$0.80) y NO consume el cupo de ediciones caras
+    (_MAX_EDITS): tiene su propio presupuesto por escena (SCENE_REROLL_MAX).
+    Sólo la escena pedida toca Veo; las demás re-bajan de la caché R2. Si la
+    escena es recurrente (un coro), regenerarla cambia TODAS sus apariciones.
     """
-    from pipeline import _MAX_EDITS
+    from pipeline import _MAX_EDITS  # sólo para reportar edits_remaining (cupo de ediciones caras); el re-roll NO lo consume
     from database import Job as JobModel, AuditLog
 
     body = body or RegenerateSceneRequest()
@@ -9500,12 +9513,22 @@ async def regenerate_scene(
             "youtube_url": yt_url,
         })
 
-    current_edit_count = job.edit_count or 0
     _is_admin = current_user.get("role") == "admin"
-    if not _is_admin and current_edit_count >= _MAX_EDITS:
+    # Re-roll de escena: presupuesto PROPIO, desacoplado del _MAX_EDITS de las
+    # ediciones caras (letra/fondo). Corregir una escena fea es barato (~1 clip
+    # Veo) y debe ser generoso. Contamos los re-rolls previos de ESTA escena en
+    # el audit log (append-only) — sin columna nueva ni clobber del scene_plan
+    # que el worker reescribe. Cap por escena, env-tunable, admin exento.
+    _prior_rerolls = db.query(AuditLog).filter(
+        AuditLog.action == "job.scene_regenerate",
+        AuditLog.detail["job_id"].astext == job_id,
+        AuditLog.detail["recurrence_key"].astext == recurrence_key,
+    ).count()
+    _reroll_cap = _scene_reroll_max()
+    if not _is_admin and _prior_rerolls >= _reroll_cap:
         raise HTTPException(
             status_code=400,
-            detail=f"Llegaste al máximo de ediciones ({_MAX_EDITS}). Aprobá o rechazá el job.",
+            detail=f"Llegaste al máximo de regeneraciones de esta escena ({_reroll_cap}). Editá el prompt o aprobá el job.",
         )
     if not job.input_r2_key:
         raise HTTPException(status_code=422, detail="Audio original no disponible — no se puede re-renderizar.")
@@ -9518,9 +9541,9 @@ async def regenerate_scene(
         "scene_movement": _mv if _mv in ("estatico", "sutil", "dinamico") else "",
     }
 
-    new_edit_count = current_edit_count + 1
+    # Nota: el re-roll de escena NO incrementa job.edit_count — tiene su propio
+    # cupo (SCENE_REROLL_MAX, contado vía audit log arriba).
     job.status = "editing"
-    job.edit_count = new_edit_count
     job.current_step = "scenes"
     job.progress = 0
     job.editing_started_at = datetime.now(timezone.utc)
@@ -9528,7 +9551,7 @@ async def regenerate_scene(
         user_id=current_user["id"],
         action="job.scene_regenerate",
         detail={"job_id": job_id, "recurrence_key": recurrence_key,
-                "edit_params": edit_params, "edit_count": new_edit_count},
+                "edit_params": edit_params, "reroll_index": _prior_rerolls + 1},
     ))
     db.commit()
 
@@ -9543,7 +9566,7 @@ async def regenerate_scene(
     except Exception as exc:
         logger.error("enqueue_edit (scene) failed for %s: %s", job_id, exc)
         job.status = "pending_review"
-        job.edit_count = current_edit_count
+        # el re-roll de escena no tocó edit_count → nada que revertir acá
         job.editing_started_at = None
         job.progress = 100
         job.current_step = "thumbnail"
@@ -9554,9 +9577,13 @@ async def regenerate_scene(
         "ok": True,
         "job_id": job_id,
         "recurrence_key": recurrence_key,
-        "edit_count": new_edit_count,
-        "edits_remaining": max(0, _MAX_EDITS - new_edit_count),
+        # El re-roll de escena NO consume el cupo de ediciones; edit_count va sin
+        # cambios. Reportamos el cupo general (para el editor) + el índice de
+        # re-roll de esta escena.
+        "edit_count": job.edit_count or 0,
+        "edits_remaining": max(0, _MAX_EDITS - (job.edit_count or 0)),
         "edit_limit_exempt": _is_admin,
+        "reroll_count": _prior_rerolls + 1,
     }
 
 
