@@ -451,16 +451,20 @@ def build_scene_plan(
     cinematografía las decide el motor por-escena desde la canción, igual que
     Auto/Inspirado (ver _bible_to_prompt_fragment).
 
-    `operator_movement`: si el operador eligió un movimiento que REDUCE la
-    cámara (estatico/sutil), se respeta en TODAS las escenas (override del
-    energy-derived). El bug 2026-06-19: el operador pedía "estático" pero las
-    escenas se movían igual porque el movimiento salía sólo de la energía de la
-    sección. Los modos de MÁS movimiento (estandar/animado/vacío) caen al
-    energy-derived, que ya da movimiento.
+    `operator_movement`: la elección del operador se respeta en TODAS las
+    escenas (override del energy-derived) cuando:
+      - REDUCE la cámara (estatico/sutil) — bug 2026-06-19: pedía "estático" y
+        las escenas se movían igual porque el movimiento salía sólo de la energía.
+      - es una ESTÉTICA: "animado" (ilustración 2D, NO fotorrealista) — bug
+        2026-06-30: el operador elegía "Animado" y salía fotorrealista con paneo
+        porque "animado" caía al energy-derived. "animado" no es un nivel de
+        cámara sino un estilo visual → debe ir en cada escena sí o sí.
+    "estandar" y "" (Auto) SÍ caen al energy-derived (varían la cámara por
+    sección, todas fotorrealistas → sin romper la intención).
     """
     bible_text = _bible_to_prompt_fragment(bible)
     _om = (operator_movement or "").strip().lower()
-    _forced_movement = _om if _om in ("estatico", "sutil") else None
+    _forced_movement = _om if _om in ("estatico", "sutil", "animado") else None
     scenes: list[dict] = []
     seen: dict[str, dict] = {}
     for sec in sections:
