@@ -70,6 +70,7 @@ const NAV = [
       { id: "compliance", label: "Compliance UMG" },
       { id: "costos", label: "Costos y márgenes" },
       { id: "facturacion", label: "Facturación" },
+      { id: "creditos", label: "Créditos de regalo" },
     ],
   },
 ];
