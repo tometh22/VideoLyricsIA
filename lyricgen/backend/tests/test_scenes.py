@@ -195,6 +195,17 @@ def test_build_scene_plan_respects_operator_animado(monkeypatch):
     assert seen and all(m == "animado" for m in seen)
 
 
+def test_build_scene_plan_respects_operator_foto(monkeypatch):
+    """Bug 2026-06-30 (gemelo de animado): 'Foto fija' (foto-parallax) caía al
+    energy-derived → salía fotorrealista con paneo. Es una estética → se fuerza
+    en TODAS las escenas (foto fija, sin sujetos en movimiento)."""
+    secs = scenes.detect_sections(_song_with_repeated_chorus(), audio_duration=100.0)
+    bible = {"world": "w", "palette": "p", "texture": "t", "camera": "c", "motif": "m"}
+    pf = lambda **k: {"style": "photo", "prompt": "x"}
+    plan = scenes.build_scene_plan(secs, bible, pf, operator_movement="foto-parallax")
+    assert all(s["movement_style"] == "foto-parallax" for s in plan["scenes"])
+
+
 def test_energy_to_movement_mapping():
     assert scenes.energy_to_movement(0.9) == "dinamico"
     assert scenes.energy_to_movement(0.5) == "sutil"

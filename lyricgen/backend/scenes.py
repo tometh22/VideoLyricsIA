@@ -455,16 +455,17 @@ def build_scene_plan(
     escenas (override del energy-derived) cuando:
       - REDUCE la cámara (estatico/sutil) — bug 2026-06-19: pedía "estático" y
         las escenas se movían igual porque el movimiento salía sólo de la energía.
-      - es una ESTÉTICA: "animado" (ilustración 2D, NO fotorrealista) — bug
-        2026-06-30: el operador elegía "Animado" y salía fotorrealista con paneo
-        porque "animado" caía al energy-derived. "animado" no es un nivel de
-        cámara sino un estilo visual → debe ir en cada escena sí o sí.
+      - es una ESTÉTICA: "animado" (ilustración 2D, NO fotorrealista) o
+        "foto-parallax" (foto fija con parallax sutil, sin sujetos en movimiento)
+        — bug 2026-06-30: el operador elegía "Animado"/"Foto fija" y salía
+        fotorrealista con paneo porque caían al energy-derived. No son niveles de
+        cámara sino estilos visuales → deben ir en cada escena sí o sí.
     "estandar" y "" (Auto) SÍ caen al energy-derived (varían la cámara por
     sección, todas fotorrealistas → sin romper la intención).
     """
     bible_text = _bible_to_prompt_fragment(bible)
     _om = (operator_movement or "").strip().lower()
-    _forced_movement = _om if _om in ("estatico", "sutil", "animado") else None
+    _forced_movement = _om if _om in ("estatico", "sutil", "animado", "foto-parallax") else None
     scenes: list[dict] = []
     seen: dict[str, dict] = {}
     for sec in sections:
