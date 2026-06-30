@@ -2480,7 +2480,7 @@ export default function UploadZone({
                           </span>
                           <span className="block text-[11px] text-ink-secondary mt-0.5 leading-snug">
                             {t("upload.scenes_toggle_desc") || "Varias escenas con arco narrativo en vez de un fondo único."}
-                            <span className="text-brand-light font-medium"> · {(t("upload.scenes_credits") || "{n} créditos").replace("{n}", scenesCreditCost)}</span>
+                            <span className="text-brand-light font-medium"> · {(t("upload.scenes_cost_hint") || "{n} créditos (un video normal usa 1)").replace("{n}", scenesCreditCost)}</span>
                           </span>
                         </span>
                         {locked
