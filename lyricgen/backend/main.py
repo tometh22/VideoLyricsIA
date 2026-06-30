@@ -11646,6 +11646,51 @@ class CreditGrantRequest(BaseModel):
     dry_run: bool = False
 
 
+@app.get("/admin/credit-grants")
+async def admin_list_credit_grants(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Lista los créditos de regalo emitidos (persistidos), para el panel admin.
+    Admin only. Devuelve los grants más recientes + un resumen de los activos."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    now = datetime.now(timezone.utc)
+
+    def _active(g):
+        if g.revoked:
+            return False
+        if g.expires_at is None:
+            return True
+        exp = g.expires_at if g.expires_at.tzinfo else g.expires_at.replace(tzinfo=timezone.utc)
+        return exp > now
+
+    rows = (
+        db.query(CreditGrant)
+        .order_by(CreditGrant.granted_at.desc())
+        .limit(200)
+        .all()
+    )
+    items, active_accounts, active_credits, by_reason = [], 0, 0, {}
+    for g in rows:
+        is_active = _active(g)
+        if is_active:
+            active_accounts += 1
+            active_credits += g.amount or 0
+            by_reason[g.reason] = by_reason.get(g.reason, 0) + 1
+        d = g.to_dict()
+        d["active"] = is_active
+        items.append(d)
+    return {
+        "items": items,
+        "summary": {
+            "active_accounts": active_accounts,
+            "active_credits": active_credits,
+            "by_reason": by_reason,
+        },
+    }
+
+
 @app.post("/admin/credit-grants")
 async def admin_create_credit_grants(
     body: CreditGrantRequest,

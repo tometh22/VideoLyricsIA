@@ -38,6 +38,7 @@ import BatchProgress from "./components/BatchProgress";
 import TranscribingProgress from "./components/TranscribingProgress";
 import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
 import WhatsNewBell from "./components/WhatsNew/WhatsNewBell";
+import GiftCreditsBanner from "./components/GiftCreditsBanner";
 import { useAlert } from "./components/AlertProvider";
 import HelpButton from "./components/HelpCenter/HelpButton";
 import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
@@ -525,6 +526,7 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
 
         {/* Content */}
         <main className="relative z-10 px-4 md:px-8 pt-6 md:pt-8 pb-20">
+          <GiftCreditsBanner user={user} />
           <Outlet />
         </main>
       </div>
