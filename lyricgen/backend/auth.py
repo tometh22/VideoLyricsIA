@@ -126,19 +126,44 @@ SCENES_ENABLED_TENANTS = {
 }
 
 
-def has_scenes_access(user) -> bool:
-    """True iff `user` puede usar el add-on premium "Escenas" (multi-escena).
+def _scenes_globally_enabled() -> bool:
+    """Kill-switch global de Escenas. Default ON: la feature es pública y se
+    gobierna por CRÉDITOS (scenes_credit_cost), no por allowlist. Poné
+    SCENES_GLOBALLY_ENABLED=0 para volver al esquema viejo (admin/allowlist)
+    como rollback sin deploy."""
+    return os.environ.get("SCENES_GLOBALLY_ENABLED", "1").strip().lower() in (
+        "1", "true", "yes", "on", "y", "t",
+    )
 
-    Admin siempre pasa. Para no-admin se chequea contra SCENES_ENABLED_TENANTS
-    (vacío por defecto = solo admin), por tenant O por billing_group — mismo
-    criterio que has_prores_access, para que mover un usuario entre tenants de
-    la misma cuenta B2B no le saque el acceso. El opt-in real (enable_scenes)
-    se decide por job; esto sólo gobierna la ELEGIBILIDAD.
+
+def scenes_credit_cost() -> int:
+    """Cuántos créditos consume un video con Escenas (multi-escena).
+
+    Env-tunable (SCENES_CREDIT_COST) para lanzar en 3 y subir a 4 sin deploy.
+    Mínimo 1 (1 = Escenas no cuesta extra, p.ej. perk para un tenant)."""
+    try:
+        return max(1, int(os.environ.get("SCENES_CREDIT_COST", "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
+def has_scenes_access(user) -> bool:
+    """True iff `user` puede usar Escenas (multi-escena).
+
+    Modelo de créditos (2026-06): Escenas es PÚBLICO — cualquier usuario
+    autenticado puede usarlo; lo que lo gobierna es el COSTO (N créditos por
+    video, ver `scenes_credit_cost`), no una allowlist. Admin siempre pasa.
+    Si SCENES_GLOBALLY_ENABLED=0, vuelve al esquema viejo (admin O
+    SCENES_ENABLED_TENANTS) como rollback sin deploy. El opt-in real
+    (enable_scenes) se sigue decidiendo por job; esto sólo gobierna la
+    ELEGIBILIDAD de ver/activar la opción.
     """
     if user is None:
         return False
     role = getattr(user, "role", None) if not isinstance(user, dict) else user.get("role")
     if role == "admin":
+        return True
+    if _scenes_globally_enabled():
         return True
     tenant_id = getattr(user, "tenant_id", None) if not isinstance(user, dict) else user.get("tenant_id")
     billing_group = getattr(user, "billing_group", None) if not isinstance(user, dict) else user.get("billing_group")
@@ -863,17 +888,26 @@ def get_plan_usage(db: Session, user_id: int, tenant_id: str, plan_id: str,
             .filter(User.billing_group == billing_group)
             .distinct()
         )
-        used = db.query(Job).filter(
+        _base = db.query(Job).filter(
             Job.tenant_id.in_(group_tenants),
             Job.status == "done",
             Job.approved_at >= month_start,
-        ).count()
+        )
     else:
-        used = db.query(Job).filter(
+        _base = db.query(Job).filter(
             Job.tenant_id == tenant_id,
             Job.status == "done",
             Job.approved_at >= month_start,
-        ).count()
+        )
+
+    # Modelo de créditos: un video con Escenas (multi-escena) consume N
+    # créditos, no 1. `scene_plan` queda no-null sólo cuando el job se
+    # entregó con multi-escena. Cada job ya cuenta 1 en `videos`; sumamos
+    # (N-1) extra por cada Escenas. Con SCENES_CREDIT_COST=1 es no-op.
+    videos = _base.count()
+    _cost = scenes_credit_cost()
+    escenas = _base.filter(Job.scene_plan.isnot(None)).count() if _cost > 1 else 0
+    used = videos + (_cost - 1) * escenas
 
     plan = PLANS.get(plan_id, PLANS["100"])
     limit = plan["limit"]
