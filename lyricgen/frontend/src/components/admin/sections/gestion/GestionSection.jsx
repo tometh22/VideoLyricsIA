@@ -12,6 +12,7 @@ import ComplianceView from "../contenido/ComplianceView";
 import useContenido from "../contenido/useContenido";
 import CostosView from "../negocio/CostosView";
 import InvoicesView from "../negocio/InvoicesView";
+import CreditsView from "../negocio/CreditsView";
 import useNegocio from "../negocio/useNegocio";
 
 function FondosTab() {
@@ -67,5 +68,6 @@ export default function GestionSection({ subTab }) {
   if (subTab === "compliance") return <ComplianceTab />;
   if (subTab === "costos") return <CostosTab />;
   if (subTab === "facturacion") return <InvoicesTab />;
+  if (subTab === "creditos") return <CreditsView />;
   return <GestionView />;
 }
