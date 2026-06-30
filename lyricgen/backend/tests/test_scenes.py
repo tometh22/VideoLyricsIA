@@ -180,6 +180,21 @@ def test_build_scene_plan_respects_operator_static(monkeypatch):
     assert movs != {"estatico"}, "sin override debe variar por energía"
 
 
+def test_build_scene_plan_respects_operator_animado(monkeypatch):
+    """Bug 2026-06-30: el operador elegía 'Animado' (ilustración 2D) y salía
+    fotorrealista con paneo, porque 'animado' caía al energy-derived. Es una
+    ESTÉTICA, no un nivel de cámara → debe forzarse en TODAS las escenas."""
+    secs = scenes.detect_sections(_song_with_repeated_chorus(), audio_duration=100.0)
+    bible = {"world": "w", "palette": "p", "texture": "t", "camera": "c", "motif": "m"}
+    seen = []
+    pf = lambda **k: seen.append(k.get("movement_style")) or {"style": "video", "prompt": "x"}
+    plan = scenes.build_scene_plan(secs, bible, pf, operator_movement="animado")
+    # Cada escena queda en "animado" (no dinamico/sutil/estatico del energy-derived).
+    assert all(s["movement_style"] == "animado" for s in plan["scenes"])
+    # Y el prompt_fn recibió "animado" → la estética 2D se hornea en el prompt.
+    assert seen and all(m == "animado" for m in seen)
+
+
 def test_energy_to_movement_mapping():
     assert scenes.energy_to_movement(0.9) == "dinamico"
     assert scenes.energy_to_movement(0.5) == "sutil"
