@@ -1,6 +1,4 @@
-import { useNavigate } from "react-router-dom";
 import { useI18n } from "../../i18n";
-import { CHANGELOG } from "../../changelog";
 
 // ─── Device mockup SVGs ─────────────────────────────────────────────
 // Inline SVGs so we keep the "no binary assets" pledge of the help center.
@@ -365,45 +363,9 @@ function FormatCard({ format, locked, onSelect, t }) {
   );
 }
 
-// ─── Novedad card ───────────────────────────────────────────────────
-// Surfacea la última novedad del changelog como una card más de la galería,
-// con el mismo look (dr-fmt-card). Click → CTA de la entrada (ej. /new). Se
-// actualiza sola: cuando agregás una entrada nueva en changelog.js, esta card
-// muestra la más reciente.
-function NovedadCard({ entry, t, onClick }) {
-  const isVideo = (entry.media || "").endsWith(".mp4");
-  const mediaStyle = {
-    width: "100%", aspectRatio: "220 / 124", objectFit: "cover",
-    display: "block", borderRadius: "0.375rem",
-  };
-  return (
-    <button type="button" onClick={onClick} className="dr-fmt-card" aria-label={t(entry.titleKey)}>
-      <div className="dr-fmt-mockup-wrap">
-        {entry.media && (isVideo
-          ? <video src={entry.media} autoPlay muted loop playsInline style={mediaStyle} />
-          : <img src={entry.media} alt="" loading="lazy" style={mediaStyle} />
-        )}
-      </div>
-      <div className="dr-fmt-body">
-        <div className="dr-fmt-title">
-          {t(entry.titleKey)}
-          <span className="dr-fmt-badge">{t("announce.scenes_badge") || "NUEVO"}</span>
-        </div>
-        <div className="dr-fmt-sub">{t(entry.bodyKey)}</div>
-        <div className="dr-fmt-cta">
-          {t(entry.ctaKey) || "Probar"}
-          <svg className="dr-fmt-cta-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M5 12h14M13 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/></svg>
-        </div>
-      </div>
-    </button>
-  );
-}
-
 // ─── Main gallery ───────────────────────────────────────────────────
 export default function FormatGallery({ user, onSelectFormat, onUpgrade }) {
   const { t } = useI18n();
-  const navigate = useNavigate();
-  const novedad = CHANGELOG.length ? CHANGELOG[0] : null;
   // Pro/Enterprise plans see ProRes unlocked. Anything else (free, trial,
   // starter, etc.) sees the lock icon and an upgrade CTA on that card.
   const plan = (user && user.plan) || "free";
@@ -450,13 +412,6 @@ export default function FormatGallery({ user, onSelectFormat, onUpgrade }) {
         </p>
       </header>
       <div className="dr-fmt-grid">
-        {novedad && (
-          <NovedadCard
-            entry={novedad}
-            t={t}
-            onClick={() => navigate(novedad.ctaTo || "/new")}
-          />
-        )}
         {formats.map((f) => (
           <FormatCard
             key={f.id}

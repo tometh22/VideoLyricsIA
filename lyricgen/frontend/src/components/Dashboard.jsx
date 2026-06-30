@@ -8,6 +8,7 @@ import ProResBadge from "./ProResBadge";
 import { SkeletonVideoCard } from "./Skeleton";
 import DashboardStepper from "./DashboardRich/Stepper";
 import FormatGallery from "./DashboardRich/FormatGallery";
+import NovedadHero from "./WhatsNew/NovedadHero";
 import "./DashboardRich/DashboardRich.css";
 
 // sessionStorage key the wizard reads on mount to pre-apply a delivery
@@ -634,6 +635,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           }}
         />
       )}
+      <NovedadHero />
       <FormatGallery
         user={user}
         onSelectFormat={handleSelectFormat}

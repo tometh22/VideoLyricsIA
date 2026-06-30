@@ -54,9 +54,20 @@ export default function WhatsNewModal({ user }) {
             </span>
           </div>
         )}
-        <div className="p-5 text-center">
-          <h3 className="text-[16px] font-bold text-white">{t(e.titleKey)}</h3>
-          <p className="text-[12.5px] text-ink-secondary mt-2 leading-relaxed">{t(e.bodyKey)}</p>
+        <div className="p-5">
+          <h3 className="text-[17px] font-extrabold text-white text-center leading-tight">{t(e.titleKey)}</h3>
+          {e.taglineKey && (
+            <p className="text-[12.5px] text-brand-light font-medium text-center mt-1.5 leading-snug">{t(e.taglineKey)}</p>
+          )}
+          {Array.isArray(e.highlightKeys) && e.highlightKeys.length > 0 ? (
+            <ul className="mt-3.5 space-y-2 text-left">
+              {e.highlightKeys.map((k) => (
+                <li key={k} className="text-[12.5px] text-ink-secondary leading-snug">{t(k)}</li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-[12.5px] text-ink-secondary mt-2 leading-relaxed text-center">{t(e.bodyKey)}</p>
+          )}
           <div className="mt-4 flex gap-2 justify-center">
             <button
               onClick={close}
