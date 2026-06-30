@@ -905,11 +905,20 @@ def get_plan_usage(db: Session, user_id: int, tenant_id: str, plan_id: str,
     # OJO (bug fixeado): NO usar `scene_plan IS NOT NULL` — la columna JSONB
     # serializa el None de Python como JSON `'null'` (NO SQL NULL), así que
     # IS NOT NULL matchea TODOS los jobs → cobraría N créditos a CADA video.
-    # Filtramos por la key real `scene_plan->'scenes'` (null/ausente en videos
-    # normales). Cada job ya cuenta 1 en `videos`; sumamos (N-1) por Escenas.
+    # El conteo va en Python (no `scene_plan['scenes'].isnot(None)` en SQL): el
+    # operador de índice JSONB se comporta distinto en Postgres vs SQLite (en
+    # SQLite matchea de más) → contar acá es idéntico en ambos dialectos y
+    # equivale a `scene_plan->'scenes' IS NOT NULL` en prod. Cada job ya cuenta
+    # 1 en `videos`; sumamos (N-1) por cada job con Escenas.
     videos = _base.count()
     _cost = scenes_credit_cost()
-    escenas = _base.filter(Job.scene_plan["scenes"].isnot(None)).count() if _cost > 1 else 0
+    escenas = 0
+    if _cost > 1:
+        escenas = sum(
+            1
+            for (_sp,) in _base.with_entities(Job.scene_plan).all()
+            if isinstance(_sp, dict) and _sp.get("scenes") is not None
+        )
     used = videos + (_cost - 1) * escenas
 
     plan = PLANS.get(plan_id, PLANS["100"])

@@ -9519,11 +9519,20 @@ async def regenerate_scene(
     # Veo) y debe ser generoso. Contamos los re-rolls previos de ESTA escena en
     # el audit log (append-only) — sin columna nueva ni clobber del scene_plan
     # que el worker reescribe. Cap por escena, env-tunable, admin exento.
-    _prior_rerolls = db.query(AuditLog).filter(
-        AuditLog.action == "job.scene_regenerate",
-        AuditLog.detail["job_id"].astext == job_id,
-        AuditLog.detail["recurrence_key"].astext == recurrence_key,
-    ).count()
+    #
+    # `detail` es JSONB vía TypeDecorator y NO soporta `.astext` en la expresión
+    # SQL (rompía con AttributeError → 500 en CADA re-roll). Filtramos `action`
+    # en SQL (indexado) y matcheamos job_id/recurrence_key en Python: la acción
+    # es manual y poco frecuente, así que el volumen es chico.
+    _prior_rerolls = sum(
+        1
+        for (_d,) in db.query(AuditLog.detail)
+        .filter(AuditLog.action == "job.scene_regenerate")
+        .all()
+        if isinstance(_d, dict)
+        and _d.get("job_id") == job_id
+        and _d.get("recurrence_key") == recurrence_key
+    )
     _reroll_cap = _scene_reroll_max()
     if not _is_admin and _prior_rerolls >= _reroll_cap:
         raise HTTPException(
