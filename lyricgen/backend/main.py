@@ -11732,9 +11732,16 @@ async def admin_create_credit_grants(
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
 
-    paid = body.paid_amount if body.paid_amount is not None else int(os.environ.get("LAUNCH_CREDITS_PAID", "30"))
-    free = body.free_amount if body.free_amount is not None else int(os.environ.get("LAUNCH_CREDITS_FREE", "6"))
-    ttl_days = body.ttl_days if body.ttl_days is not None else int(os.environ.get("LAUNCH_CREDITS_TTL_DAYS", "30"))
+    def _env_int(name, dflt):
+        # Un env mal seteado (no numérico) NO debe tumbar el endpoint con 500.
+        try:
+            return int(os.environ.get(name, str(dflt)))
+        except (TypeError, ValueError):
+            return dflt
+
+    paid = body.paid_amount if body.paid_amount is not None else _env_int("LAUNCH_CREDITS_PAID", 30)
+    free = body.free_amount if body.free_amount is not None else _env_int("LAUNCH_CREDITS_FREE", 6)
+    ttl_days = body.ttl_days if body.ttl_days is not None else _env_int("LAUNCH_CREDITS_TTL_DAYS", 30)
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(days=ttl_days) if ttl_days and ttl_days > 0 else None
     reason = (body.reason or "escenas_launch").strip()

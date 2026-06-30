@@ -8343,7 +8343,7 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                                       allow_people)
     plan = _scenes.build_scene_plan(secs, bible, prompt_fn, artist=artist,
                                     song_title=song_title, style=style_hint,
-                                    operator_movement=movement_style)
+                                    operator_movement=_normalize_movement_style(movement_style))
     clip_for_key = _generate_scene_clips(plan, job_dir, artist=artist,
                                          song_title=song_title, concept=concept,
                                          job_id=job_id, allow_people=allow_people)
