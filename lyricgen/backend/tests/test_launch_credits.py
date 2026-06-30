@@ -241,3 +241,21 @@ def test_admin_grant_billing_group_required(client, admin_token):
         "scope": "billing_group",
     })
     assert r.status_code == 400
+
+
+def test_admin_list_credit_grants(client, admin_token, db):
+    t = _tid()
+    _grant(db, tenant_id=t, amount=15, reason=f"r_{t}")
+    r = client.get("/admin/credit-grants", headers=_hdr(admin_token))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "items" in body and "summary" in body
+    mine = [i for i in body["items"] if i["tenant_id"] == t]
+    assert len(mine) == 1
+    assert mine[0]["amount"] == 15 and mine[0]["active"] is True
+    assert body["summary"]["active_credits"] >= 15
+
+
+def test_admin_list_credit_grants_requires_admin(client, user_token):
+    r = client.get("/admin/credit-grants", headers=_hdr(user_token))
+    assert r.status_code == 403
