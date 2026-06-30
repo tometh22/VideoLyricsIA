@@ -11681,6 +11681,24 @@ async def admin_list_credit_grants(
         d = g.to_dict()
         d["active"] = is_active
         items.append(d)
+
+    # Cuentas para el selector del panel: una CUENTA = billing_group (si existe)
+    # o tenant. Así el operador puede dirigir el regalo a la cuenta madre (ej.
+    # Universal) en vez de a cada usuario. El conteo es la cantidad de usuarios
+    # activos que comparten ese pool.
+    _accs = {}
+    for _tenant, _bg in (
+        db.query(User.tenant_id, User.billing_group)
+        .filter(User.is_active == True)  # noqa: E712
+        .all()
+    ):
+        key = ("billing_group", _bg) if _bg else ("tenant", _tenant)
+        _accs[key] = _accs.get(key, 0) + 1
+    accounts = [
+        {"type": _t, "id": _v, "users": _n}
+        for (_t, _v), _n in sorted(_accs.items(), key=lambda kv: -kv[1])
+    ]
+
     return {
         "items": items,
         "summary": {
@@ -11688,6 +11706,7 @@ async def admin_list_credit_grants(
             "active_credits": active_credits,
             "by_reason": by_reason,
         },
+        "accounts": accounts,
     }
 
 
