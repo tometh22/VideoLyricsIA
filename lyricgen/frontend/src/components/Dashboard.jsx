@@ -484,6 +484,38 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                 : "Cupo agotado · contactá soporte"}
             </p>
           )}
+          {/* Créditos de regalo + qué rinde (dinámico). Mismo dato que el
+              medidor de la sidebar; el costo sale del backend (scenes_credit_cost). */}
+          {!isUnlimited && (() => {
+            const bonusRemaining = usage?.bonus_remaining ?? 0;
+            const totalAvail = usage?.total_available;
+            const cost = usage?.scenes_credit_cost ?? 3;
+            const proj = usage?.projection || {};
+            const projN = proj.normal ?? totalAvail;
+            const projE = proj.escenas ?? (totalAvail != null ? Math.floor(totalAvail / (cost || 1)) : null);
+            if (totalAvail == null) return null;
+            let giftDays = null;
+            if (bonusRemaining > 0 && usage?.bonus_expires_at) {
+              const ms = new Date(usage.bonus_expires_at).getTime() - Date.now();
+              giftDays = Number.isFinite(ms) ? Math.max(0, Math.ceil(ms / 86_400_000)) : null;
+            }
+            return (
+              <div className="mt-3 pt-3 border-t border-white/[0.06] space-y-1.5">
+                {bonusRemaining > 0 && (
+                  <p className="text-[11px] text-emerald-300 font-medium">
+                    🎁 {bonusRemaining} créditos de regalo
+                    {giftDays != null ? (giftDays === 0 ? " · vencen hoy" : ` · vencen en ${giftDays} días`) : ""}
+                  </p>
+                )}
+                <p className="text-[11px] text-ink-secondary">
+                  Te alcanza para {projN} videos normales o {projE} con Escenas
+                </p>
+                <p className="text-[10px] text-gray-500">
+                  🎥 Normal: 1 crédito · 🎬 Escenas: {cost} créditos
+                </p>
+              </div>
+            );
+          })()}
         </div>
       </div>
       )}

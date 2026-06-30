@@ -23,6 +23,7 @@ export const CHANGELOG = [
     taglineKey: "announce.scenes_tagline",
     bodyKey: "announce.scenes_body",
     highlightKeys: [
+      "announce.scenes_gift",
       "announce.scenes_hl1",
       "announce.scenes_hl2",
       "announce.scenes_hl3",
