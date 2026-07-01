@@ -231,3 +231,15 @@ def test_jobs_list_includes_scene_plan(client, admin_token, db):
     assert len(mine) == 1
     sp = mine[0].get("scene_plan")
     assert sp and sp.get("scenes"), "el job de escenas debe traer scene_plan.scenes en la lista"
+
+
+def test_status_includes_scene_plan(client, admin_token, db):
+    """Al abrir un video por URL/refresh, JobDetail toma el job de /status/{id}
+    (no de la lista). Sin scene_plan acá, la tira de corrección NUNCA aparece por
+    link (bug 2026-07-01; #780 solo cubrió el camino desde la lista)."""
+    me = client.get("/auth/me", headers=_hdr(admin_token)).json()
+    jid = _make_scene_job(db, me["tenant_id"], user_id=me["id"])
+    r = client.get(f"/status/{jid}", headers=_hdr(admin_token))
+    assert r.status_code == 200, r.text
+    sp = r.json().get("scene_plan")
+    assert sp and sp.get("scenes"), "/status debe traer scene_plan.scenes en un job de escenas"

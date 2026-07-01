@@ -7262,6 +7262,11 @@ def status(
         "edits_remaining": max(0, _MAX_EDITS - edit_count),
         "edit_limit_exempt": _is_admin,
         "render_params": job.get("render_params"),
+        # Multi-escena: JobDetail dibuja la tira de corrección por escena desde
+        # `job.scene_plan`. Al abrir por URL/refresh el job viene de ACÁ (no de
+        # la lista), así que sin esto el filmstrip NUNCA aparecía por link (bug
+        # 2026-07-01; #780 solo cubrió el camino "desde la lista").
+        "scene_plan": job.get("scene_plan"),
         # EditRequestPanel reads these to drive the lyrics-edit and
         # typography-edit UIs. segments_json hydrates the inline lyrics
         # editor; bg_r2_key_cached gates the typography mode. Without
