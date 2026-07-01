@@ -6167,6 +6167,11 @@ def _normalize_movement_style(s: str) -> str:
         "locked": "estatico", "still": "estatico", "camara-fija": "estatico",
         "subtle": "sutil", "minimal": "sutil", "minimo": "sutil",
         "standard": "estandar", "default": "estandar",
+        # "dinamico" lo usan el editor de escena (SceneEditModal) y el
+        # energy-derived (scenes.energy_to_movement) para "más movimiento".
+        # No era una clave real → normalizaba a "" (Auto) y la elección se
+        # perdía. Se mapea a "estandar" (cinematográfico, ya suavizado).
+        "dinamico": "estandar", "dinámico": "estandar", "dynamic": "estandar",
         "photo": "foto-parallax", "parallax": "foto-parallax",
         "foto+parallax": "foto-parallax", "foto_parallax": "foto-parallax",
         "animated": "animado", "illustration": "animado", "cartoon": "animado",
