@@ -3116,9 +3116,15 @@ export default function LyricsEditor({
                         } else if (
                           e.key === "Backspace" &&
                           el.selectionStart === 0 &&
-                          el.selectionEnd === 0
+                          el.selectionEnd === 0 &&
+                          el.value === ""
                         ) {
-                          // Backspace at line start → merge into the previous line.
+                          // Backspace en una línea VACÍA → la une con la anterior
+                          // (= elimina la línea vacía). Antes fusionaba con
+                          // CUALQUIER Backspace en pos 0, así que al borrar la
+                          // primera palabra la línea "desaparecía" sola (confuso,
+                          // reporte 2026-07-01). Ahora borrar texto NUNCA fusiona;
+                          // sólo una línea ya vacía lo hace. Merge explícito: botón.
                           const i = edited.findIndex((s) => s._id === seg._id);
                           if (i > 0) {
                             e.preventDefault();
@@ -3317,7 +3323,7 @@ export default function LyricsEditor({
                         className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
                           hover:bg-brand/10 flex items-center justify-center text-gray-600
                           hover:text-brand-light transition-all"
-                        title="Unir con la línea siguiente — conserva el sync (combina los tiempos por palabra). Atajo: Backspace al inicio de la línea.">
+                        title="Unir con la línea siguiente — conserva el sync (combina los tiempos por palabra). Atajo: Backspace en una línea vacía la une con la anterior.">
                         <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                           <path d="M7 8l5 5 5-5M7 16l5-5 5 5" />
                         </svg>
