@@ -152,6 +152,9 @@ export default function ScenesFilmstrip({
                   )}
                   {isFailed && (
                     <span className="text-[10px] font-bold text-amber-200 bg-amber-900/70 rounded px-1 py-0.5"
+                          title={scene.error
+                            ? `${t("scenes.failed_reason") || "Falló al generar"}: ${scene.error}`
+                            : (t("scenes.failed_aria") || "escena reusada — regenerá")}
                           aria-label={t("scenes.failed_aria") || "escena reusada — regenerá"}>⚠</span>
                   )}
                 </div>

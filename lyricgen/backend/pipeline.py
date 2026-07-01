@@ -8307,6 +8307,10 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
         except Exception as e:  # noqa: BLE001
             logger.error("[SCENES] escena %s falló (%s) — se sustituye por una válida", key, e)
             scene["status"] = "failed"
+            # Guardar el motivo en la escena (persiste en scene_plan → /status,
+            # /jobs) para poder DIAGNOSTICAR por qué falló sin bucear los logs
+            # del Worker. Antes el motivo solo vivía en el log. Acotado a 300.
+            scene["error"] = f"{type(e).__name__}: {e}"[:300]
     if not first_ok:
         raise RuntimeError("ninguna escena Veo se generó — fallback a fondo único")
     # Rellenar las que fallaron con un clip válido (mantiene el timeline entero).
