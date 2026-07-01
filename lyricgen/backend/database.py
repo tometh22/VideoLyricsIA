@@ -554,6 +554,12 @@ class Job(Base):
             "archived_at": self.archived_at.timestamp() if self.archived_at else None,
             "youtube": self.youtube_data,
             "youtube_short": self.youtube_short_data,
+            # Multi-escena: la tira de corrección por escena vive en JobDetail,
+            # que recibe el job DESDE LA LISTA (prop), no vía fetch de detalle.
+            # Sin esto, `job.scene_plan` llegaba undefined y el filmstrip NUNCA
+            # aparecía aunque el video tuviera escenas (bug 2026-06-30). Solo
+            # pesa en jobs con Escenas; los normales llevan null.
+            "scene_plan": self.scene_plan,
         }
 
 
