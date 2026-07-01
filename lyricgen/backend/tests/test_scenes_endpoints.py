@@ -218,3 +218,16 @@ def test_scenes_thumbs_ownership_and_shape(client, admin_token, db):
     # job de otro tenant → 404
     other = _make_scene_job(db, "tenant_ajeno")
     assert client.get(f"/jobs/{other}/scenes/thumbs", headers=_hdr(admin_token)).status_code == 404
+
+
+def test_jobs_list_includes_scene_plan(client, admin_token, db):
+    """La lista /jobs DEBE traer scene_plan: JobDetail recibe el job desde la
+    lista (prop) y sin scene_plan la tira de corrección de escenas nunca
+    aparece (bug 2026-06-30 — to_list_dict lo omitía)."""
+    me = client.get("/auth/me", headers=_hdr(admin_token)).json()
+    jid = _make_scene_job(db, me["tenant_id"], user_id=me["id"])
+    rows = client.get("/jobs", headers=_hdr(admin_token)).json()
+    mine = [j for j in rows if j["job_id"] == jid]
+    assert len(mine) == 1
+    sp = mine[0].get("scene_plan")
+    assert sp and sp.get("scenes"), "el job de escenas debe traer scene_plan.scenes en la lista"
