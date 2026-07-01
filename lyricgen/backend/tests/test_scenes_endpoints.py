@@ -243,3 +243,28 @@ def test_status_includes_scene_plan(client, admin_token, db):
     assert r.status_code == 200, r.text
     sp = r.json().get("scene_plan")
     assert sp and sp.get("scenes"), "/status debe traer scene_plan.scenes en un job de escenas"
+
+
+def test_regen_failed_scene_not_capped(client, user_token, db, monkeypatch):
+    """Una escena AÚN fallada NO se bloquea por el cap de re-rolls: el operador
+    tiene que poder seguir intentando arreglarla. Antes: N fallos por un Veo
+    caído transitorio la lockeaban para siempre (auditoría escrita por intento)."""
+    import main
+    from database import Job as JobModel, AuditLog
+    monkeypatch.setenv("SCENE_REROLL_MAX", "2")
+    monkeypatch.setattr(main, "enqueue_edit", lambda **k: "edit:fake")
+    me = client.get("/auth/me", headers=_hdr(user_token)).json()
+    jid = _make_scene_job(db, me["tenant_id"], user_id=me["id"])
+    # La escena coro_1 quedó FALLADA (se sirve una sustituta).
+    job = db.query(JobModel).filter(JobModel.job_id == jid).first()
+    _sp = dict(job.scene_plan)
+    _sp["scenes"] = [{**s, "status": "failed"} for s in _sp["scenes"]]
+    job.scene_plan = _sp
+    db.commit()
+    # Ya hay 3 re-rolls previos (por encima del cap=2).
+    for _ in range(3):
+        db.add(AuditLog(action="job.scene_regenerate",
+                        detail={"job_id": jid, "recurrence_key": "coro_1"}))
+    db.commit()
+    r = client.post(f"/jobs/{jid}/scenes/coro_1/regenerate", headers=_hdr(user_token), json={})
+    assert r.status_code == 200, r.text  # NO bloqueado: la escena sigue fallada

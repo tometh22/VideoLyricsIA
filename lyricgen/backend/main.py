@@ -9544,7 +9544,14 @@ async def regenerate_scene(
         and _d.get("recurrence_key") == recurrence_key
     )
     _reroll_cap = _scene_reroll_max()
-    if not _is_admin and _prior_rerolls >= _reroll_cap:
+    # Si la escena AÚN está fallada (ningún clip bueno todavía, se está sirviendo
+    # una escena sustituta), NO aplicar el cap: el operador tiene que poder
+    # seguir intentando arreglarla. El cap solo frena los re-rolls "por gusto" de
+    # una escena que YA salió bien. Antes: N intentos fallidos por un Veo caído
+    # transitorio lockeaban la escena para siempre (audit escrito por intento).
+    _target = next((s for s in plan["scenes"] if s.get("recurrence_key") == recurrence_key), None)
+    _scene_succeeded = (_target or {}).get("status") != "failed"
+    if not _is_admin and _scene_succeeded and _prior_rerolls >= _reroll_cap:
         raise HTTPException(
             status_code=400,
             detail=f"Llegaste al máximo de regeneraciones de esta escena ({_reroll_cap}). Editá el prompt o aprobá el job.",
