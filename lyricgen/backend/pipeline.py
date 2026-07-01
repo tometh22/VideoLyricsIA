@@ -11669,7 +11669,14 @@ def generate_short(
             raw.get_frame(0)
             raw = _cover_resize(raw, 1080, 1920)
             if raw.duration >= short_dur:
-                bg = raw.subclip(0, short_dur)
+                # El short usa la MISMA ventana temporal que su audio/letra
+                # (el coro, start_time..end_time), no los primeros 30s. En un
+                # fondo único no cambia nada (es uniforme); en un timeline
+                # multi-escena hace que el short muestre las escenas del CORO
+                # que matchean la letra —incl. una escena corregida ahí— en vez
+                # de las de la intro. Clamp para no pasar el final del clip.
+                _bg_start = max(0.0, min(start_time, raw.duration - short_dur))
+                bg = raw.subclip(_bg_start, _bg_start + short_dur)
             else:
                 loops = math.ceil(short_dur / raw.duration) + 1
                 clips = []
