@@ -2380,7 +2380,12 @@ export default function UploadZone({
             cortaba el ring/glow redondeado de las cards seleccionadas (Inspirado,
             Multi-escena, Auto de colores) contra los bordes. El padding les da
             aire para que el borde no quede recortado. */}
-        <div className="space-y-4 min-w-0 w-full px-1.5 py-0.5 lg:h-full lg:min-h-0 lg:overflow-y-auto">
+        {/* lg:pb-24: el footer del wizard es `fixed bottom-0` (~68px de alto).
+            Sin padding inferior, el último contenido del paso (ej. "Mi prompt" +
+            Multi-escena, el modo más alto) quedaba TAPADO detrás del footer y no
+            se podía scrollear por encima ("trabado", QA 2026-07-01). El padding
+            reserva el espacio del CTA fijo. En mobile el outer ya tiene pb-28. */}
+        <div className="space-y-4 min-w-0 w-full px-1.5 py-0.5 lg:h-full lg:min-h-0 lg:overflow-y-auto lg:pb-24">
           {files.length > 1 && (
             <div className="flex items-center gap-1.5 px-1">
               <span className="inline-flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-[0.16em]">
