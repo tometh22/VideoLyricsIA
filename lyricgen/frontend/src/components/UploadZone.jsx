@@ -62,12 +62,15 @@ const TEXT_CASE_OPTS = [
   { code: "original", d: "ori", label: "Sin cambios (como está escrito)" },
 ];
 
-// Max single-file size. Mirrors backend MAX_UPLOAD_MB default (100, raised
-// from 50 to fit lossless WAV uploads — UMG sends WAV at 16/24-bit PCM,
-// which can land at 30-50 MB for a 3-minute track). We reject client-side
-// so the user gets immediate feedback instead of a 413 from the server
-// after a long upload.
-const MAX_FILE_MB = 100;
+// Max single-file size. Backend MAX_UPLOAD_MB default is 500 and the
+// audio body goes browser->R2 (presigned), so the API never sees these
+// bytes — this client-side cap only bounds what we let the operator
+// queue. Raised 100 -> 150 on 2026-07-02: UMG uploads lossless WAV
+// masters (24-bit/48 kHz stereo ≈ 17 MB/min) and a 6-min track already
+// blew past 100 (real case: 107 MB Intoxicados WAV rejected silently).
+// We reject client-side so the user gets immediate feedback instead of
+// a 413 from the server after a long upload.
+const MAX_FILE_MB = 150;
 // Accepted extensions in lower-case (with leading dot). Must stay in sync
 // with backend _AUDIO_EXTENSIONS.
 const ACCEPTED_EXTS = [".mp3", ".wav"];
@@ -880,18 +883,39 @@ export default function UploadZone({
 
   const [batchTruncated, setBatchTruncated] = useState(0);
   const [oversize, setOversize] = useState([]);
+  // Files whose extension isn't .mp3/.wav. Tracked so a wrong-type drop
+  // shows a notice instead of silently doing nothing — drag&drop bypasses
+  // the <input accept> filter, so this path is reachable in prod.
+  const [rejectedType, setRejectedType] = useState([]);
 
   const addFiles = (fileList) => {
-    const mp3s = Array.from(fileList).filter((f) => {
+    const all = Array.from(fileList);
+    const mp3s = all.filter((f) => {
       const lower = f.name.toLowerCase();
       return ACCEPTED_EXTS.some((ext) => lower.endsWith(ext));
     });
+    const wrongType = all.filter((f) => !mp3s.includes(f));
+    setRejectedType(wrongType.map((f) => f.name));
+    if (wrongType.length) {
+      // warn-level so captureConsoleIntegration ships it to Sentry,
+      // grouped under the [upload-reject] tag.
+      console.warn(
+        "[upload-reject] wrong type:",
+        wrongType.map((f) => `${f.name} (${(f.size / 1048576).toFixed(1)} MB)`).join(", "),
+      );
+    }
     if (!mp3s.length) return;
 
     const max = MAX_FILE_MB * 1024 * 1024;
     const tooBig = mp3s.filter((f) => f.size > max);
     const okSize = mp3s.filter((f) => f.size <= max);
-    if (tooBig.length) setOversize(tooBig.map((f) => f.name));
+    if (tooBig.length) {
+      setOversize(tooBig.map((f) => f.name));
+      console.warn(
+        "[upload-reject] oversize (cap " + MAX_FILE_MB + " MB):",
+        tooBig.map((f) => `${f.name} (${(f.size / 1048576).toFixed(1)} MB)`).join(", "),
+      );
+    }
     else setOversize([]);
     if (!okSize.length) return;
 
@@ -1077,6 +1101,57 @@ export default function UploadZone({
     </div>
   );
 
+  // Rejection notices (wrong type / oversize / batch full). Rendered in
+  // BOTH dropzone branches so they show even when NOTHING was accepted —
+  // i.e. the user's first/only file was too big or the wrong format.
+  // Before 2026-07-02 these only rendered inside the files.length > 0
+  // branch, so an all-rejected first drop gave zero feedback ("subo el
+  // audio y no hace nada" — 107 MB WAV, Universal).
+  const _notices = (
+    <div onClick={(e) => e.stopPropagation()}>
+      {rejectedType.length > 0 && (
+        <div className="mt-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
+          <p className="text-[11px] text-red-300">
+            {t("upload.wrong_type", {
+              count: rejectedType.length,
+              names: rejectedType.slice(0, 3).join(", ") + (rejectedType.length > 3 ? "…" : ""),
+            })}
+          </p>
+          <button
+            onClick={(e) => { e.stopPropagation(); setRejectedType([]); }}
+            className="mt-1 text-[11px] text-red-400/60 hover:text-red-300"
+          >{t("common.dismiss") || "dismiss"}</button>
+        </div>
+      )}
+      {oversize.length > 0 && (
+        <div className="mt-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
+          <p className="text-[11px] text-red-300">
+            {t("upload.oversize", {
+              dropped: oversize.length,
+              max: MAX_FILE_MB,
+              names: oversize.slice(0, 3).join(", ") + (oversize.length > 3 ? "…" : ""),
+            })}
+          </p>
+          <button
+            onClick={(e) => { e.stopPropagation(); setOversize([]); }}
+            className="mt-1 text-[11px] text-red-400/60 hover:text-red-300"
+          >{t("common.dismiss") || "dismiss"}</button>
+        </div>
+      )}
+      {batchTruncated > 0 && (
+        <div className="mt-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
+          <p className="text-[11px] text-amber-300">
+            {t("upload.batch_truncated", { dropped: batchTruncated, max: MAX_BATCH_SIZE })}
+          </p>
+          <button
+            onClick={(e) => { e.stopPropagation(); setBatchTruncated(0); }}
+            className="mt-1 text-[11px] text-amber-400/60 hover:text-amber-300"
+          >{t("common.dismiss") || "dismiss"}</button>
+        </div>
+      )}
+    </div>
+  );
+
   const _dropZone = (
       <div
         data-tour="upload-dropzone"
@@ -1113,30 +1188,7 @@ export default function UploadZone({
                 >{t("upload.add_more")}</button>
               )}
             </div>
-            {batchTruncated > 0 && (
-              <div className="mt-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
-                <p className="text-[11px] text-amber-300">
-                  {t("upload.batch_truncated", { dropped: batchTruncated, max: MAX_BATCH_SIZE })
-                    || `${batchTruncated} file(s) ignored — max ${MAX_BATCH_SIZE} per batch. Process this batch first, then upload the rest.`}
-                </p>
-                <button
-                  onClick={(e) => { e.stopPropagation(); setBatchTruncated(0); }}
-                  className="mt-1 text-[11px] text-amber-400/60 hover:text-amber-300"
-                >{t("common.dismiss") || "dismiss"}</button>
-              </div>
-            )}
-            {oversize.length > 0 && (
-              <div className="mt-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
-                <p className="text-[11px] text-red-300">
-                  {t("upload.oversize", { max: MAX_FILE_MB }) ||
-                    `${oversize.length} archivo(s) excede(n) ${MAX_FILE_MB} MB y fueron ignorados: ${oversize.slice(0,3).join(", ")}${oversize.length > 3 ? "…" : ""}`}
-                </p>
-                <button
-                  onClick={(e) => { e.stopPropagation(); setOversize([]); }}
-                  className="mt-1 text-[11px] text-red-400/60 hover:text-red-300"
-                >{t("common.dismiss") || "dismiss"}</button>
-              </div>
-            )}
+            {_notices}
           </div>
         ) : (
           <div className="py-6 md:py-8">
@@ -1150,6 +1202,7 @@ export default function UploadZone({
             <p className="text-gray-700 text-[11px]">
               {t("upload.size_hint")}
             </p>
+            {_notices}
           </div>
         )}
       </div>

@@ -127,6 +127,7 @@ async function describeFetchError(err, res, t) {
     // body was too large/slow and the edge cut the connection.
     return t("batch.error_network_or_502");
   }
+  if (res.status === 401) return t("batch.error_session_expired");
   if (res.status === 413) return t("batch.error_too_large");
   if (res.status === 408 || res.status === 504) return t("batch.error_timeout");
   if (res.status >= 500) {
@@ -2469,6 +2470,15 @@ export default function App() {
     } catch (err) {
       setTranscribing(false);
       setTranscribeProgress(null);
+      // JWT died mid-flow and the proactive refresh didn't save us (e.g.
+      // tab open >24 h with refresh also expired) → same treatment as the
+      // dashboard 401 interceptors: clean logout to the login screen
+      // instead of an ambiguous banner over a dead session.
+      const status = err?.status ?? err?.response?.status;
+      if (status === 401) {
+        handleLogout("expired");
+        return;
+      }
       // err.response carries the actual HTTP response when uploadFileToR2
       // (or apiPost inside it) threw — transcribeRes is null in that case.
       const reason = await describeFetchError(err, transcribeRes ?? err?.response ?? null, t);
@@ -3028,6 +3038,13 @@ export default function App() {
           });
           uploadJobId = result.jobId;
         } catch (err) {
+          // Expired JWT: every remaining row would 401 the same way —
+          // log out (dashboard behavior) instead of painting the whole
+          // batch red with a misleading per-row error.
+          if ((err?.status ?? err?.response?.status) === 401) {
+            handleLogout("expired");
+            return;
+          }
           const reason = await describeFetchError(err, err.response || null, t);
           setJobs((prev) => prev.map((j, idx) =>
             idx === i ? { ...j, status: "error", error: reason } : j
