@@ -7262,6 +7262,11 @@ def status(
         "edits_remaining": max(0, _MAX_EDITS - edit_count),
         "edit_limit_exempt": _is_admin,
         "render_params": job.get("render_params"),
+        # Multi-escena: JobDetail dibuja la tira de corrección por escena desde
+        # `job.scene_plan`. Al abrir por URL/refresh el job viene de ACÁ (no de
+        # la lista), así que sin esto el filmstrip NUNCA aparecía por link (bug
+        # 2026-07-01; #780 solo cubrió el camino "desde la lista").
+        "scene_plan": job.get("scene_plan"),
         # EditRequestPanel reads these to drive the lyrics-edit and
         # typography-edit UIs. segments_json hydrates the inline lyrics
         # editor; bg_r2_key_cached gates the typography mode. Without
@@ -9539,7 +9544,14 @@ async def regenerate_scene(
         and _d.get("recurrence_key") == recurrence_key
     )
     _reroll_cap = _scene_reroll_max()
-    if not _is_admin and _prior_rerolls >= _reroll_cap:
+    # Si la escena AÚN está fallada (ningún clip bueno todavía, se está sirviendo
+    # una escena sustituta), NO aplicar el cap: el operador tiene que poder
+    # seguir intentando arreglarla. El cap solo frena los re-rolls "por gusto" de
+    # una escena que YA salió bien. Antes: N intentos fallidos por un Veo caído
+    # transitorio lockeaban la escena para siempre (audit escrito por intento).
+    _target = next((s for s in plan["scenes"] if s.get("recurrence_key") == recurrence_key), None)
+    _scene_succeeded = (_target or {}).get("status") != "failed"
+    if not _is_admin and _scene_succeeded and _prior_rerolls >= _reroll_cap:
         raise HTTPException(
             status_code=400,
             detail=f"Llegaste al máximo de regeneraciones de esta escena ({_reroll_cap}). Editá el prompt o aprobá el job.",
@@ -11681,6 +11693,24 @@ async def admin_list_credit_grants(
         d = g.to_dict()
         d["active"] = is_active
         items.append(d)
+
+    # Cuentas para el selector del panel: una CUENTA = billing_group (si existe)
+    # o tenant. Así el operador puede dirigir el regalo a la cuenta madre (ej.
+    # Universal) en vez de a cada usuario. El conteo es la cantidad de usuarios
+    # activos que comparten ese pool.
+    _accs = {}
+    for _tenant, _bg in (
+        db.query(User.tenant_id, User.billing_group)
+        .filter(User.is_active == True)  # noqa: E712
+        .all()
+    ):
+        key = ("billing_group", _bg) if _bg else ("tenant", _tenant)
+        _accs[key] = _accs.get(key, 0) + 1
+    accounts = [
+        {"type": _t, "id": _v, "users": _n}
+        for (_t, _v), _n in sorted(_accs.items(), key=lambda kv: -kv[1])
+    ]
+
     return {
         "items": items,
         "summary": {
@@ -11688,6 +11718,7 @@ async def admin_list_credit_grants(
             "active_credits": active_credits,
             "by_reason": by_reason,
         },
+        "accounts": accounts,
     }
 
 
@@ -11713,9 +11744,16 @@ async def admin_create_credit_grants(
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
 
-    paid = body.paid_amount if body.paid_amount is not None else int(os.environ.get("LAUNCH_CREDITS_PAID", "30"))
-    free = body.free_amount if body.free_amount is not None else int(os.environ.get("LAUNCH_CREDITS_FREE", "6"))
-    ttl_days = body.ttl_days if body.ttl_days is not None else int(os.environ.get("LAUNCH_CREDITS_TTL_DAYS", "30"))
+    def _env_int(name, dflt):
+        # Un env mal seteado (no numérico) NO debe tumbar el endpoint con 500.
+        try:
+            return int(os.environ.get(name, str(dflt)))
+        except (TypeError, ValueError):
+            return dflt
+
+    paid = body.paid_amount if body.paid_amount is not None else _env_int("LAUNCH_CREDITS_PAID", 30)
+    free = body.free_amount if body.free_amount is not None else _env_int("LAUNCH_CREDITS_FREE", 6)
+    ttl_days = body.ttl_days if body.ttl_days is not None else _env_int("LAUNCH_CREDITS_TTL_DAYS", 30)
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(days=ttl_days) if ttl_days and ttl_days > 0 else None
     reason = (body.reason or "escenas_launch").strip()

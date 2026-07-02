@@ -85,7 +85,7 @@ export default function UsageBadge({ user }) {
   const {
     used = 0, limit = 0, percent = 0, alert_80, alert_100,
     bonus_total = 0, bonus_remaining = 0, bonus_expires_at = null,
-    total_available = 0, scenes_credit_cost = 3, projection = {},
+    total_available, scenes_credit_cost = 3, projection = {},
   } = usage;
   const isAdmin = user?.role === "admin";
 
@@ -161,17 +161,21 @@ export default function UsageBadge({ user }) {
           </div>
         ) : null}
 
-        {/* Total disponible + qué rinde (dinámico: usa el costo real del back). */}
-        <div className="pt-1 border-t border-white/[0.06]">
-          <div className="text-[11px] text-gray-300 font-medium mt-1.5">
-            {t("credits.total_available") || "Total disponible"}: {total_available}
+        {/* Total disponible + qué rinde (dinámico: usa el costo real del back).
+            Oculto si el backend aún no devuelve total_available (deploy viejo) —
+            evita mostrar "0 / 0 normales" durante un lag de deploy. */}
+        {total_available != null ? (
+          <div className="pt-1 border-t border-white/[0.06]">
+            <div className="text-[11px] text-gray-300 font-medium mt-1.5">
+              {t("credits.total_available") || "Total disponible"}: {total_available}
+            </div>
+            <div className="text-[10px] text-gray-500 leading-snug mt-0.5">
+              {(t("credits.projection") || "{normal} normales o {escenas} con Escenas")
+                .replace("{normal}", projNormal)
+                .replace("{escenas}", projScenes)}
+            </div>
           </div>
-          <div className="text-[10px] text-gray-500 leading-snug mt-0.5">
-            {(t("credits.projection") || "{normal} normales o {escenas} con Escenas")
-              .replace("{normal}", projNormal)
-              .replace("{escenas}", projScenes)}
-          </div>
-        </div>
+        ) : null}
 
         {/* Leyenda de costo — siempre visible, así queda claro qué consume cada uno. */}
         <div className="text-[10px] text-gray-500 flex items-center gap-2 pt-0.5">

@@ -218,3 +218,53 @@ def test_scenes_thumbs_ownership_and_shape(client, admin_token, db):
     # job de otro tenant → 404
     other = _make_scene_job(db, "tenant_ajeno")
     assert client.get(f"/jobs/{other}/scenes/thumbs", headers=_hdr(admin_token)).status_code == 404
+
+
+def test_jobs_list_includes_scene_plan(client, admin_token, db):
+    """La lista /jobs DEBE traer scene_plan: JobDetail recibe el job desde la
+    lista (prop) y sin scene_plan la tira de corrección de escenas nunca
+    aparece (bug 2026-06-30 — to_list_dict lo omitía)."""
+    me = client.get("/auth/me", headers=_hdr(admin_token)).json()
+    jid = _make_scene_job(db, me["tenant_id"], user_id=me["id"])
+    rows = client.get("/jobs", headers=_hdr(admin_token)).json()
+    mine = [j for j in rows if j["job_id"] == jid]
+    assert len(mine) == 1
+    sp = mine[0].get("scene_plan")
+    assert sp and sp.get("scenes"), "el job de escenas debe traer scene_plan.scenes en la lista"
+
+
+def test_status_includes_scene_plan(client, admin_token, db):
+    """Al abrir un video por URL/refresh, JobDetail toma el job de /status/{id}
+    (no de la lista). Sin scene_plan acá, la tira de corrección NUNCA aparece por
+    link (bug 2026-07-01; #780 solo cubrió el camino desde la lista)."""
+    me = client.get("/auth/me", headers=_hdr(admin_token)).json()
+    jid = _make_scene_job(db, me["tenant_id"], user_id=me["id"])
+    r = client.get(f"/status/{jid}", headers=_hdr(admin_token))
+    assert r.status_code == 200, r.text
+    sp = r.json().get("scene_plan")
+    assert sp and sp.get("scenes"), "/status debe traer scene_plan.scenes en un job de escenas"
+
+
+def test_regen_failed_scene_not_capped(client, user_token, db, monkeypatch):
+    """Una escena AÚN fallada NO se bloquea por el cap de re-rolls: el operador
+    tiene que poder seguir intentando arreglarla. Antes: N fallos por un Veo
+    caído transitorio la lockeaban para siempre (auditoría escrita por intento)."""
+    import main
+    from database import Job as JobModel, AuditLog
+    monkeypatch.setenv("SCENE_REROLL_MAX", "2")
+    monkeypatch.setattr(main, "enqueue_edit", lambda **k: "edit:fake")
+    me = client.get("/auth/me", headers=_hdr(user_token)).json()
+    jid = _make_scene_job(db, me["tenant_id"], user_id=me["id"])
+    # La escena coro_1 quedó FALLADA (se sirve una sustituta).
+    job = db.query(JobModel).filter(JobModel.job_id == jid).first()
+    _sp = dict(job.scene_plan)
+    _sp["scenes"] = [{**s, "status": "failed"} for s in _sp["scenes"]]
+    job.scene_plan = _sp
+    db.commit()
+    # Ya hay 3 re-rolls previos (por encima del cap=2).
+    for _ in range(3):
+        db.add(AuditLog(action="job.scene_regenerate",
+                        detail={"job_id": jid, "recurrence_key": "coro_1"}))
+    db.commit()
+    r = client.post(f"/jobs/{jid}/scenes/coro_1/regenerate", headers=_hdr(user_token), json={})
+    assert r.status_code == 200, r.text  # NO bloqueado: la escena sigue fallada

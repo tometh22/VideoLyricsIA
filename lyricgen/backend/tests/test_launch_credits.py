@@ -259,3 +259,25 @@ def test_admin_list_credit_grants(client, admin_token, db):
 def test_admin_list_credit_grants_requires_admin(client, user_token):
     r = client.get("/admin/credit-grants", headers=_hdr(user_token))
     assert r.status_code == 403
+
+
+def test_admin_grant_billing_group_via_endpoint(client, admin_token, db):
+    """Regalo dirigido a la cuenta madre (billing_group): UN pool compartido."""
+    bg = f"bg_{_uuid.uuid4().hex[:6]}"
+    r = client.post("/admin/credit-grants", headers=_hdr(admin_token), json={
+        "scope": "billing_group", "billing_group": bg, "amount": 30, "reason": f"r_{bg}",
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["created"] == 1
+    lst = client.get("/admin/credit-grants", headers=_hdr(admin_token)).json()
+    mine = [i for i in lst["items"] if i["billing_group"] == bg]
+    assert len(mine) == 1 and mine[0]["amount"] == 30 and mine[0]["tenant_id"] is None
+
+
+def test_admin_list_includes_accounts(client, admin_token):
+    """El GET devuelve la lista de cuentas (para el selector del panel)."""
+    lst = client.get("/admin/credit-grants", headers=_hdr(admin_token)).json()
+    assert isinstance(lst.get("accounts"), list)
+    # cada item tiene type/id/users
+    for a in lst["accounts"]:
+        assert a["type"] in ("billing_group", "tenant") and "id" in a and "users" in a

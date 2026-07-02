@@ -23,6 +23,9 @@ export default function CreditsView() {
   const [free, setFree] = useState(6);
   const [ttl, setTtl] = useState(30);
   const [reason, setReason] = useState("escenas_launch");
+  // Regalo dirigido a UNA cuenta madre (billing_group) o tenant.
+  const [targetKey, setTargetKey] = useState(""); // "billing_group:universal" | "tenant:foo"
+  const [targetAmount, setTargetAmount] = useState(30);
 
   const load = async () => {
     setLoading(true);
@@ -91,6 +94,56 @@ export default function CreditsView() {
     }
   };
 
+  const accounts = data?.accounts || [];
+
+  const doEmitTarget = async () => {
+    if (!targetKey) {
+      setError("Elegí una cuenta.");
+      return;
+    }
+    const sep = targetKey.indexOf(":");
+    const type = targetKey.slice(0, sep);
+    const id = targetKey.slice(sep + 1);
+    const amount = Number(targetAmount);
+    if (!amount || amount <= 0) {
+      setError("El monto debe ser mayor a 0.");
+      return;
+    }
+    const label = type === "billing_group" ? `la cuenta «${id}»` : `el tenant «${id}»`;
+    if (
+      !window.confirm(
+        `Vas a emitir ${amount} créditos COMPARTIDOS a ${label}.\n\n` +
+          `Es UN solo pool para toda la cuenta (lo comparten todos sus usuarios), ` +
+          `NO ${amount} por usuario. Vencen en ${ttl} días.\n\n¿Confirmás?`,
+      )
+    )
+      return;
+    setBusy(true);
+    setError(null);
+    try {
+      const reqBody = {
+        scope: type,
+        amount,
+        ttl_days: Number(ttl),
+        reason: reason.trim() || "escenas_launch",
+      };
+      if (type === "billing_group") reqBody.billing_group = id;
+      else reqBody.tenant_id = id;
+      const res = await fetchJson(`${API}/admin/credit-grants`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(reqBody),
+      });
+      setResult(res);
+      setPreview(null);
+      await load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const inputCls =
     "w-24 bg-surface-2/40 ring-1 ring-white/10 rounded-lg px-2 py-1.5 text-sm text-white focus:ring-brand outline-none";
 
@@ -126,9 +179,14 @@ export default function CreditsView() {
         </div>
       </div>
 
-      {/* Emitir */}
+      {/* Emitir a todas */}
       <div className="rounded-card glass p-5 space-y-4 max-w-2xl">
         <h3 className="font-medium">Emitir a todas las cuentas activas</h3>
+        <p className="text-caption text-gray-500 -mt-2">
+          Un regalo por <strong>cuenta</strong> (cuenta de facturación si existe, si no por
+          tenant) — un pool compartido por cuenta, <strong>no por usuario</strong>. Para dirigirlo
+          a una cuenta puntual, usá el bloque de abajo.
+        </p>
         <div className="flex flex-wrap items-end gap-4">
           <label className="text-ui text-gray-400">
             Pagos
@@ -173,6 +231,43 @@ export default function CreditsView() {
             ✓ Emitido a <strong>{result.created}</strong> cuentas ({result.skipped} ya tenían).
           </div>
         )}
+      </div>
+
+      {/* Emitir a una cuenta específica (cuenta madre) */}
+      <div className="rounded-card glass p-5 space-y-4 max-w-2xl">
+        <h3 className="font-medium">Emitir a una cuenta específica</h3>
+        <p className="text-caption text-gray-500 -mt-2">
+          Un solo pool <strong>compartido</strong> para toda la cuenta (ej. Universal y sus
+          tenants AR/CL), no por usuario.
+        </p>
+        <div className="flex flex-wrap items-end gap-4">
+          <label className="text-ui text-gray-400 flex-1 min-w-[220px]">
+            Cuenta
+            <select
+              value={targetKey}
+              onChange={(e) => setTargetKey(e.target.value)}
+              className="block mt-1 w-full bg-surface-2/40 ring-1 ring-white/10 rounded-lg px-2 py-1.5 text-sm text-white focus:ring-brand outline-none"
+            >
+              <option value="">— Elegí una cuenta —</option>
+              {accounts.map((a) => (
+                <option key={`${a.type}:${a.id}`} value={`${a.type}:${a.id}`}>
+                  {a.id} {a.type === "billing_group" ? "(facturación)" : "(tenant)"} · {a.users} usuario{a.users === 1 ? "" : "s"}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="text-ui text-gray-400">
+            Créditos
+            <input type="number" min="1" value={targetAmount} onChange={(e) => setTargetAmount(e.target.value)} className={`block mt-1 ${inputCls}`} />
+          </label>
+        </div>
+        <p className="text-caption text-gray-500">
+          {targetAmount} créditos ≈ {Math.floor(Number(targetAmount) / 3)} videos con Escenas para
+          toda la cuenta. Vence en {ttl} días (configurable arriba).
+        </p>
+        <button type="button" onClick={doEmitTarget} disabled={busy} className="px-4 py-2 rounded-xl bg-brand text-white text-ui font-medium hover:bg-brand/90 disabled:opacity-50">
+          Emitir a la cuenta
+        </button>
       </div>
 
       {/* Historial */}
