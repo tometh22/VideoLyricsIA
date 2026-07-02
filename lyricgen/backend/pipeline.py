@@ -6167,6 +6167,11 @@ def _normalize_movement_style(s: str) -> str:
         "locked": "estatico", "still": "estatico", "camara-fija": "estatico",
         "subtle": "sutil", "minimal": "sutil", "minimo": "sutil",
         "standard": "estandar", "default": "estandar",
+        # "dinamico" lo usan el editor de escena (SceneEditModal) y el
+        # energy-derived (scenes.energy_to_movement) para "más movimiento".
+        # No era una clave real → normalizaba a "" (Auto) y la elección se
+        # perdía. Se mapea a "estandar" (cinematográfico, ya suavizado).
+        "dinamico": "estandar", "dinámico": "estandar", "dynamic": "estandar",
         "photo": "foto-parallax", "parallax": "foto-parallax",
         "foto+parallax": "foto-parallax", "foto_parallax": "foto-parallax",
         "animated": "animado", "illustration": "animado", "cartoon": "animado",
@@ -6391,6 +6396,8 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     # original "exact camera movement" wording.
     _static = normalized_movement == "estatico"
     _sutil = normalized_movement == "sutil"
+    _animado = normalized_movement == "animado"
+    _foto = normalized_movement == "foto-parallax"
     _auto_movement = normalized_movement == ""
     if _static:
         # C4 (2026-05-25) + UMG-style update: repetir LOCKED 3× para reforzar
@@ -6421,18 +6428,44 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
                     "(water, fire, foliage, particles, light); the camera "
                     "itself is essentially still. NEVER push-in, NEVER zoom, "
                     "NEVER dolly forward, NEVER orbit. Just a faint breath")
+    elif _animado:
+        # 2D illustration: cámara CALMA y variada. Antes caía al `else` ("exact
+        # camera movement") → paneos en cada escena, todas iguales (bug
+        # 2026-06-30). La vida viene de la animación 2D, no de la cámara.
+        _clause2 = ("(2) framing and composition chosen for THIS scene's mood "
+                    "(vary the angle and shot size between scenes so they don't all "
+                    "look alike), with a CALM camera — at most a slow, gentle "
+                    "lateral drift; this is a stylised 2D illustration, so keep the "
+                    "camera movement minimal and let the illustrated shapes and "
+                    "elements carry the motion. NEVER push-in, zoom, dolly forward "
+                    "or orbit")
+    elif _foto:
+        # Foto fija: cámara casi inmóvil (foto), NO "exact camera movement".
+        _clause2 = ("(2) framing and composition for THIS scene (vary it between "
+                    "scenes), treated as a STILL PHOTOGRAPH — the camera is "
+                    "essentially static, at most an extremely slow parallax or "
+                    "lateral drift (no more than 5% of the frame); NEVER push-in, "
+                    "zoom, dolly or orbit; the stillness IS the style")
     elif _auto_movement:
         _clause2 = ("(2) the camera register that matches the song's energy — a "
                     "LOCKED STATIC frame for intimate/calm songs, SUBTLE minimal "
-                    "motion for most, and at most a GENTLE LATERAL track, slow "
+                    "motion for most, and at most a GENTLE, SLOW LATERAL track, slow "
                     "orbit or parallax for genuinely high-energy tracks; NEVER a "
                     "camera that travels FORWARD toward the subject (no push-in, "
                     "dolly forward, fly-through or first-person glide) because the "
                     "lyrics are overlaid and forward motion makes them nauseating "
-                    "to read; do NOT default to a constant cinematic drift — and "
-                    "the framing")
+                    "to read; do NOT default to a constant cinematic drift, keep it "
+                    "restrained, and VARY the move between scenes — and the framing")
     else:
-        _clause2 = "(2) exact camera movement and framing"
+        # estandar (cinematográfico): movimiento SUAVE, lento y variado — no
+        # "exact camera movement", que daba paneos fuertes y monótonos
+        # (feedback 2026-06-30: "demasiados paneos y todos iguales").
+        _clause2 = ("(2) a GENTLE, SLOW camera move that fits the moment — prefer a "
+                    "subtle lateral drift, slow orbit or parallax, and VARY it "
+                    "between scenes so they don't all look the same; NEVER a forward "
+                    "push-in, dolly, zoom or fly-through (the overlaid lyrics turn "
+                    "nauseating); do NOT default to a constant cinematic drift — and "
+                    "the framing")
 
     # The "no people" line is gated by `allow_people`. When the operator
     # opted into "fondo libre" (bypass_content_validation=True) OR the
@@ -8279,6 +8312,10 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
         except Exception as e:  # noqa: BLE001
             logger.error("[SCENES] escena %s falló (%s) — se sustituye por una válida", key, e)
             scene["status"] = "failed"
+            # Guardar el motivo en la escena (persiste en scene_plan → /status,
+            # /jobs) para poder DIAGNOSTICAR por qué falló sin bucear los logs
+            # del Worker. Antes el motivo solo vivía en el log. Acotado a 300.
+            scene["error"] = f"{type(e).__name__}: {e}"[:300]
     if not first_ok:
         raise RuntimeError("ninguna escena Veo se generó — fallback a fondo único")
     # Rellenar las que fallaron con un clip válido (mantiene el timeline entero).
@@ -8315,7 +8352,7 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                                       allow_people)
     plan = _scenes.build_scene_plan(secs, bible, prompt_fn, artist=artist,
                                     song_title=song_title, style=style_hint,
-                                    operator_movement=movement_style)
+                                    operator_movement=_normalize_movement_style(movement_style))
     clip_for_key = _generate_scene_clips(plan, job_dir, artist=artist,
                                          song_title=song_title, concept=concept,
                                          job_id=job_id, allow_people=allow_people)
@@ -11632,7 +11669,14 @@ def generate_short(
             raw.get_frame(0)
             raw = _cover_resize(raw, 1080, 1920)
             if raw.duration >= short_dur:
-                bg = raw.subclip(0, short_dur)
+                # El short usa la MISMA ventana temporal que su audio/letra
+                # (el coro, start_time..end_time), no los primeros 30s. En un
+                # fondo único no cambia nada (es uniforme); en un timeline
+                # multi-escena hace que el short muestre las escenas del CORO
+                # que matchean la letra —incl. una escena corregida ahí— en vez
+                # de las de la intro. Clamp para no pasar el final del clip.
+                _bg_start = max(0.0, min(start_time, raw.duration - short_dur))
+                bg = raw.subclip(_bg_start, _bg_start + short_dur)
             else:
                 loops = math.ceil(short_dur / raw.duration) + 1
                 clips = []

@@ -670,7 +670,11 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [sceneThumbs, setSceneThumbs] = useState({});
   const [sceneBusyKey, setSceneBusyKey] = useState(null);
   const [editingScene, setEditingScene] = useState(null);
-  const scenesEditable = (isPendingReview || isDone || isRejected) && !isEditing;
+  // Alineado con canPreview (done/pending_review): la tira de escenas solo se
+  // renderiza dentro del bloque de preview, y un job "rejected" muestra la
+  // pantalla "no disponible" (sin reproductor), así que incluir isRejected acá
+  // prometía una edición inalcanzable. Se saca para que ambas capas coincidan.
+  const scenesEditable = (isPendingReview || isDone) && !isEditing;
 
   // Pósters firmados (1 llamada). Recarga cuando cambia el plan (cache_token
   // distinto tras regenerar) para traer el thumb nuevo.

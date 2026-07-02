@@ -400,7 +400,10 @@ describe("LyricsEditor — Enter-to-split is word-aware (2026-06-05)", () => {
     expect(out[1].words).toEqual([{ word: "No", start: 12.5, end: 12.9 }]);
   });
 
-  it("merges a line into the previous via Backspace at line start", () => {
+  // 2026-07-01: Backspace en pos 0 solo fusiona si la línea está VACÍA. Antes
+  // fusionaba con cualquier Backspace en pos 0, así que borrar la primera palabra
+  // hacía "desaparecer" la línea (confuso). Dos casos:
+  it("does NOT merge a NON-empty line on Backspace at line start", () => {
     const onEditedChange = vi.fn();
     const segs = [
       { start: 10.0, end: 11.8, text: "tengo una mala noticia",
@@ -413,12 +416,31 @@ describe("LyricsEditor — Enter-to-split is word-aware (2026-06-05)", () => {
     input.setSelectionRange(0, 0);
     fireEvent.keyDown(input, { key: "Backspace" });
 
+    // "No" tiene texto → NO se fusiona. Siguen siendo 2 líneas.
+    const calls = onEditedChange.mock.calls;
+    const last = calls.length ? calls.at(-1)[0] : segs;
+    expect(last).toHaveLength(2);
+  });
+
+  it("merges an EMPTY line into the previous via Backspace at line start", () => {
+    const onEditedChange = vi.fn();
+    const segs = [
+      { start: 10.0, end: 11.8, text: "tengo una mala noticia",
+        words: [{ word: "tengo", start: 10.0, end: 10.4 }, { word: "noticia", start: 11.0, end: 11.8 }] },
+      { start: 12.5, end: 12.9, text: "No",
+        words: [{ word: "No", start: 12.5, end: 12.9 }] },
+    ];
+    render(<LyricsEditor {...baseProps({ segments: segs, onEditedChange })} />);
+    const input = screen.getByDisplayValue("No");
+    // Vaciar la línea primero (el operador borró todo el texto).
+    fireEvent.change(input, { target: { value: "" } });
+    input.setSelectionRange(0, 0);
+    fireEvent.keyDown(input, { key: "Backspace" });
+
+    // Línea vacía + Backspace → se une a la anterior (queda 1 línea).
     const out = onEditedChange.mock.calls.at(-1)[0];
     expect(out).toHaveLength(1);
-    expect(out[0].text).toBe("tengo una mala noticia No");
     expect(out[0].start).toBe(10.0);
-    expect(out[0].end).toBe(12.9);
-    expect(out[0].words).toHaveLength(3);
   });
 });
 
