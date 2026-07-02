@@ -3151,6 +3151,14 @@ async def upload_url(
     # otherwise escape the job dir at write time.
     body.filename = _safe_basename(body.filename)
     if body.size_bytes and body.size_bytes > MAX_UPLOAD_MB * 1024 * 1024:
+        # Log the rejection with the real size — a client-side cap bug
+        # (silent 107 MB WAV reject, 2026-07-02) took hours to diagnose
+        # because nothing anywhere recorded the attempted size.
+        logger.warning(
+            "[UPLOAD] 413 reject: %s (%.1f MB > %d MB) tenant=%s user=%s",
+            body.filename, body.size_bytes / 1048576, MAX_UPLOAD_MB,
+            current_user["tenant_id"], current_user["id"],
+        )
         raise HTTPException(
             status_code=413,
             detail=f"File too large (>{MAX_UPLOAD_MB} MB).",
@@ -3212,6 +3220,11 @@ async def upload_url(
 
     use_multipart = (
         body.size_bytes > 0 and body.size_bytes >= _MULTIPART_THRESHOLD_BYTES
+    )
+    logger.info(
+        "[UPLOAD] ticket minted: job=%s file=%s size=%.1f MB multipart=%s tenant=%s",
+        job_id, body.filename, (body.size_bytes or 0) / 1048576,
+        use_multipart, current_user["tenant_id"],
     )
     response = {
         "job_id": job_id,
