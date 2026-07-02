@@ -3070,7 +3070,7 @@ _PRESIGN_PUT_TTL_S = int(os.environ.get("PRESIGN_PUT_TTL_S", "900"))
 class _UploadUrlReq(BaseModel):
     filename: str = Field(..., max_length=500)       # DB Job.filename = VARCHAR(500)
     content_type: str = Field(default="", max_length=200)
-    size_bytes: int = 0
+    size_bytes: int = Field(default=0, ge=0)
     artist: str = Field(default="", max_length=255)  # DB Job.artist = VARCHAR(255)
     title: str = Field(default="", max_length=500)   # DB Job.song_title = VARCHAR(500)
 
@@ -3593,13 +3593,53 @@ async def upload_multipart_complete(
             raise HTTPException(status_code=400, detail="Part etag missing.")
         parts_payload.append({"PartNumber": part_no, "ETag": f'"{etag}"'})
     try:
-        storage.multipart_complete(
+        completed_key = storage.multipart_complete(
             job_row.input_r2_key, job_row.multipart_upload_id, parts_payload,
         )
     except Exception as e:
         raise HTTPException(
             status_code=502,
             detail=f"R2 multipart_complete failed: {e}",
+        )
+    if not completed_key:
+        # storage.multipart_complete swallows boto errors and returns
+        # None (already-aborted upload_id, InvalidPart, transient R2
+        # failure). Before this check we answered 200 anyway: the
+        # browser believed the upload succeeded, /transcribe-uploaded
+        # later failed far from the cause, and — worse — we cleared
+        # multipart_upload_id below, so the orphaned parts could never
+        # be aborted and accrued R2 storage forever. Keep the upload_id
+        # intact: the client's retry/abort and the reaper both still
+        # work with it.
+        logger.warning(
+            "[UPLOAD] multipart_complete returned no key: job=%s key=%s",
+            body.job_id, job_row.input_r2_key,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="R2 multipart_complete failed. Reintentá la subida.",
+        )
+    # Server-side size gate. The 413 in /upload-url trusts the CLIENT-
+    # declared size_bytes and the presigned part URLs don't constrain
+    # the body, so this HEAD is the first moment we can check what
+    # actually landed. Small tolerance: multipart overhead is zero, but
+    # don't 413 a legitimate file over a rounding artifact.
+    real_size = storage.head_object_size(job_row.input_r2_key)
+    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    if real_size is not None and real_size > max_bytes:
+        logger.warning(
+            "[UPLOAD] 413 post-complete: job=%s key=%s real=%.1f MB > %d MB "
+            "tenant=%s user=%s",
+            body.job_id, job_row.input_r2_key, real_size / 1048576,
+            MAX_UPLOAD_MB, current_user["tenant_id"], current_user["id"],
+        )
+        storage.delete_object(job_row.input_r2_key)
+        job_row.multipart_upload_id = None
+        db.commit()
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({real_size / 1048576:.1f} MB). "
+                   f"Max allowed: {MAX_UPLOAD_MB} MB.",
         )
     # Clear the upload_id so the row is recognisably "complete" but
     # input_r2_key + status still need /transcribe-uploaded.
@@ -3712,6 +3752,24 @@ async def transcribe_uploaded(
 
     if not os.path.exists(audio_path):
         import asyncio as _asyncio
+        # Size gate against the REAL stored object before pulling it to
+        # local disk. The single-PUT path never passes through
+        # /upload-multipart-complete, so a client that under-declared
+        # size_bytes in /upload-url could otherwise land an arbitrarily
+        # large object and have us download it whole (disk + Whisper).
+        _real_size = storage.head_object_size(job_row.input_r2_key)
+        if _real_size is not None and _real_size > MAX_UPLOAD_MB * 1024 * 1024:
+            logger.warning(
+                "[UPLOAD] 413 at transcribe: job=%s key=%s real=%.1f MB > %d MB "
+                "tenant=%s user=%s",
+                body.job_id, job_row.input_r2_key, _real_size / 1048576,
+                MAX_UPLOAD_MB, current_user["tenant_id"], current_user["id"],
+            )
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large ({_real_size / 1048576:.1f} MB). "
+                       f"Max allowed: {MAX_UPLOAD_MB} MB.",
+            )
         for _attempt in range(5):
             if storage.download_object(job_row.input_r2_key, audio_path):
                 break
