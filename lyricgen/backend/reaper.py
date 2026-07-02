@@ -282,6 +282,39 @@ def find_abandoned_uploads(
     )
 
 
+def upload_still_active(job: Job, ttl_min: int = _AWAITING_UPLOAD_TTL_MIN) -> bool:
+    """True when an awaiting_upload job's multipart upload shows recent
+    part activity on R2 — i.e. the browser is still PUTting.
+
+    The TTL in find_abandoned_uploads is anchored to created_at and
+    NOTHING renews it during a healthy upload (parts are batch-presigned
+    at init; the browser only talks to R2). Before this guard, a 150 MB
+    WAV on a slow uplink (>20 min wallclock) got its job deleted and its
+    multipart aborted MID-UPLOAD — the user lost the whole transfer,
+    sometimes at 100%. R2's per-part LastModified is the only liveness
+    signal available, so we ask R2 directly.
+
+    Only meaningful for in-flight multiparts. Single-PUT jobs (<16 MB,
+    minutes at worst) and completed multiparts (upload_id cleared) fall
+    through to the normal TTL, which is correct for them.
+    """
+    if not (job.multipart_upload_id and job.input_r2_key):
+        return False
+    try:
+        import storage as _storage
+        last = _storage.multipart_last_activity(
+            job.input_r2_key, job.multipart_upload_id,
+        )
+    except Exception:
+        return False
+    if last is None:
+        # No parts yet / upload gone / listing failed: no liveness
+        # evidence — let the created_at TTL decide (reap).
+        return False
+    age_s = (datetime.now(timezone.utc) - last).total_seconds()
+    return age_s < ttl_min * 60
+
+
 def find_stalled_renders(
     db: Session,
     threshold_min: int = _STALLED_RENDER_THRESHOLD_MIN,
@@ -1047,6 +1080,13 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
                 logger.warning("[REAPER] reap transcribed %s failed: %s", job.job_id, e)
         for job in abandoned_uploads:
             try:
+                if upload_still_active(job):
+                    logger.info(
+                        "[REAPER] upload %s past TTL but parts still "
+                        "landing on R2 — skipping this cycle",
+                        job.job_id,
+                    )
+                    continue
                 _delete_abandoned_upload(db, job)
                 db.commit()
                 _n_up += 1
