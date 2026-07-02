@@ -600,6 +600,67 @@ def multipart_complete(
     return key
 
 
+def multipart_last_activity(key: str, upload_id: str):
+    """Return the most recent ``LastModified`` across the parts already
+    uploaded for an in-flight multipart upload, or ``None`` when the
+    upload has no parts yet, doesn't exist anymore, or listing fails.
+
+    Used by the reaper to distinguish "abandoned upload" (no parts
+    landing for a while) from "slow but alive upload" (a 150 MB WAV on a
+    residential uplink can legitimately take longer than the awaiting-
+    upload TTL). The browser batch-presigns every part at init and PUTs
+    straight to R2, so R2 itself is the only place this activity signal
+    exists — nothing touches our API between init and complete.
+    """
+    newest = None
+    marker = 0
+    try:
+        client = _get_client()
+        if client is None:
+            return None
+        while True:
+            resp = client.list_parts(
+                Bucket=R2_BUCKET, Key=key, UploadId=upload_id,
+                MaxParts=1000, PartNumberMarker=marker,
+            )
+            for part in resp.get("Parts", []):
+                lm = part.get("LastModified")
+                if lm is not None and (newest is None or lm > newest):
+                    newest = lm
+            if not resp.get("IsTruncated"):
+                break
+            marker = resp.get("NextPartNumberMarker", 0)
+            if not marker:
+                break
+    except Exception as e:
+        # NoSuchUpload (already aborted/completed) or transient listing
+        # failure — either way there's no liveness evidence to report.
+        logger.debug(
+            "[R2] list_parts %s %s failed: %s", key, upload_id, e,
+        )
+        return None
+    return newest
+
+
+def head_object_size(key: str) -> Optional[int]:
+    """Return the stored object's ContentLength in bytes, or ``None`` if
+    R2 is disabled, the object doesn't exist, or the HEAD fails.
+
+    The upload-size gate in /upload-url trusts the CLIENT-declared
+    size_bytes; the presigned PUT itself doesn't constrain the body, so
+    this is the server-side source of truth for what actually landed.
+    """
+    try:
+        client = _get_client()
+        if client is None:
+            return None
+        resp = client.head_object(Bucket=R2_BUCKET, Key=key)
+        return int(resp.get("ContentLength", 0))
+    except Exception as e:
+        logger.debug("[R2] head_object %s failed: %s", key, e)
+        return None
+
+
 def multipart_abort(key: str, upload_id: str) -> bool:
     """Abort an in-flight multipart upload. Best-effort — returns False
     if R2 is disabled or the abort fails (the orphan still costs R2
