@@ -123,3 +123,44 @@ def test_decline_path_does_not_double_apply_lead(monkeypatch, tmp_path):
     starts_before = [s["start"] for s in result["segments"]]
     out = asyncio.run(_maybe_ctc_retime(result, "/mix/audio.wav", "j"))
     assert [s["start"] for s in out["segments"]] == starts_before
+
+
+def test_no_cached_stem_computes_it(monkeypatch, tmp_path):
+    """Regresión Amanda Pujó (03/07): transcripción cacheada → la cascada
+    nunca corre demucs → el wrapper caía directo a la mezcla y CTC
+    declinaba estructural en mezclas con voz enterrada. Ahora: sin stem
+    cacheado, computarlo (una vez; queda en el cache R2)."""
+    retimed = [{"text": "l0", "start": 9.9, "end": 10.0}] * 5
+    monkeypatch.setenv("CTC_ALIGN_ENABLED", "1")
+    stem_file = tmp_path / "stem.wav"; stem_file.write_bytes(b"x")
+    sep_calls = []
+    def fake_sep(audio, *a, cache_only=False, **kw):
+        sep_calls.append(cache_only)
+        return None if cache_only else str(stem_file)   # cache miss → compute OK
+    monkeypatch.setattr(vocal_sep, "separate_vocals", fake_sep)
+    align_calls = []
+    def fake_retime(audio, segs, job_id="", mix_path=None, max_skip_frac=None):
+        align_calls.append(audio)
+        return [dict(s) for s in retimed]
+    monkeypatch.setattr(ctc_align, "retime_segments", fake_retime)
+    out = asyncio.run(_maybe_ctc_retime(_fake_result(), "/mix/audio.wav", "j"))
+    assert sep_calls == [True, False]          # cache primero, cómputo después
+    assert align_calls == [str(stem_file)]     # alineó sobre el stem computado
+    assert out["segments"][0]["start"] == 9.9
+
+
+def test_compute_stem_flag_off_falls_to_mix(monkeypatch, tmp_path):
+    retimed = [{"text": "l0", "start": 9.9, "end": 10.0}] * 5
+    monkeypatch.setenv("CTC_ALIGN_ENABLED", "1")
+    monkeypatch.setenv("CTC_ALIGN_COMPUTE_STEM", "0")
+    sep_calls = []
+    def fake_sep(audio, *a, cache_only=False, **kw):
+        sep_calls.append(cache_only); return None
+    monkeypatch.setattr(vocal_sep, "separate_vocals", fake_sep)
+    calls = []
+    def fake_retime(audio, segs, job_id="", mix_path=None, max_skip_frac=None):
+        calls.append(audio); return [dict(s) for s in retimed]
+    monkeypatch.setattr(ctc_align, "retime_segments", fake_retime)
+    out = asyncio.run(_maybe_ctc_retime(_fake_result(), "/mix/audio.wav", "j"))
+    assert sep_calls == [True]                 # sin cómputo
+    assert calls == ["/mix/audio.wav"]         # comportamiento #802
