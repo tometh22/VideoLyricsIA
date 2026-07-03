@@ -148,6 +148,8 @@ export const translations = {
     "upload.batch_full": "Lote lleno",
     "upload.batch_truncated": "{dropped} archivo(s) ignorado(s) — máx {max} por lote.",
     "upload.bg_oversize": "{name} pesa {size} MB — el fondo custom admite hasta {max} MB. Comprimilo o recortalo.",
+    "upload.empty_file": "{count} archivo(s) vacío(s) (0 bytes) ignorados: {names}. Revisá la exportación o esperá a que el archivo termine de sincronizar.",
+    "upload.duplicate_skipped": "{count} archivo(s) duplicado(s) ya en el lote, salteados: {names}",
     "upload.wrong_type": "{count} archivo(s) con formato no soportado — solo MP3 o WAV: {names}",
     "upload.oversize": "{dropped} archivo(s) supera(n) {max} MB y fueron ignorados: {names}. Convertilo a MP3 o usá un WAV más liviano.",
     "upload.genre_label": "Género:",
@@ -1690,6 +1692,8 @@ export const translations = {
     "upload.batch_full": "Batch full",
     "upload.batch_truncated": "{dropped} file(s) ignored — max {max} per batch.",
     "upload.bg_oversize": "{name} is {size} MB — custom backgrounds allow up to {max} MB. Compress or trim it.",
+    "upload.empty_file": "{count} empty file(s) (0 bytes) ignored: {names}. Check the export or wait for the file to finish syncing.",
+    "upload.duplicate_skipped": "{count} duplicate file(s) already in the batch, skipped: {names}",
     "upload.wrong_type": "{count} file(s) with unsupported format — MP3 or WAV only: {names}",
     "upload.oversize": "{dropped} file(s) exceed {max} MB and were ignored: {names}. Convert to MP3 or use a lighter WAV.",
     "upload.genre_label": "Genre:",
@@ -2764,6 +2768,8 @@ export const translations = {
     "upload.batch_full": "Lote cheio",
     "upload.batch_truncated": "{dropped} arquivo(s) ignorado(s) — máx {max} por lote.",
     "upload.bg_oversize": "{name} tem {size} MB — o fundo personalizado admite até {max} MB. Comprima ou corte.",
+    "upload.empty_file": "{count} arquivo(s) vazio(s) (0 bytes) ignorados: {names}. Verifique a exportação ou aguarde a sincronização do arquivo.",
+    "upload.duplicate_skipped": "{count} arquivo(s) duplicado(s) já no lote, ignorados: {names}",
     "upload.wrong_type": "{count} arquivo(s) com formato não suportado — apenas MP3 ou WAV: {names}",
     "upload.oversize": "{dropped} arquivo(s) supera(m) {max} MB e foram ignorados: {names}. Converta para MP3 ou use um WAV mais leve.",
     "upload.genre_label": "Gênero:",
@@ -3630,7 +3636,12 @@ export function I18nProvider({ children }) {
     let s = translations[lang]?.[key] || translations.es?.[key] || translations.en?.[key] || key;
     if (vars) {
       for (const k of Object.keys(vars)) {
-        s = s.replace(new RegExp(`\\{${k}\\}`, "g"), String(vars[k]));
+        // Replacement FUNCTION, not string: filenames land here via
+        // {names} and String.replace interprets $&, $', $` and $$ in
+        // replacement strings — "mix $& final.wav" corrupted the
+        // message. A function return is taken literally.
+        const v = vars[k] == null ? "" : String(vars[k]);
+        s = s.replace(new RegExp(`\\{${k}\\}`, "g"), () => v);
       }
     }
     return s;

@@ -59,7 +59,12 @@ function keyPresence(key) {
 }
 
 // Extrae todas las keys "foo.bar" usadas como t("...") en src/
-const keyUsageRe = /\bt\(\s*"([a-z][a-z_]*\.[a-z][a-z_0-9]*)"\s*\)/g;
+// [,)] al final: cubre tanto t("key") como t("key", { vars }) — la
+// versión anterior exigía ")" pegado al string, así que TODA llamada
+// con parámetros de interpolación quedaba fuera de la validación
+// (exactamente las keys sin fallback "||"). (?:\.[seg])+ cubre keys
+// de más de dos segmentos.
+const keyUsageRe = /\bt\(\s*"([a-z][a-z_]*(?:\.[a-z][a-z_0-9]*)+)"\s*[,)]/g;
 const usedKeys = new Set();
 for (const f of walk(SRC)) {
   if (f === I18N_PATH) continue;

@@ -3065,6 +3065,14 @@ _MULTIPART_PART_SIZE_BYTES = int(
     os.environ.get("MULTIPART_PART_SIZE_BYTES", str(8 * 1024 * 1024))
 )
 _PRESIGN_PUT_TTL_S = int(os.environ.get("PRESIGN_PUT_TTL_S", "900"))
+# TTL de las URLs de PARTES multipart. Más largo que el single-PUT a
+# propósito: el init batch-presigna las ~19 partes de un archivo de
+# 150 MB de una sola vez, y en un uplink lento la subida completa puede
+# tardar 30-50 min — con 900 s las últimas partes expiraban a mitad de
+# camino (403) justo dentro de la ventana en que el reaper todavía no
+# liberaba el job. 1 h cubre el peor caso realista; el riesgo extra es
+# mínimo (la URL firma un solo part_number de un upload_id específico).
+_PRESIGN_PART_TTL_S = int(os.environ.get("PRESIGN_PART_TTL_S", "3600"))
 
 
 class _UploadUrlReq(BaseModel):
@@ -3318,7 +3326,7 @@ async def upload_multipart_init(
             "upload_id": job_row.multipart_upload_id,
             "key": job_row.input_r2_key,
             "part_size": _MULTIPART_PART_SIZE_BYTES,
-            "presign_ttl_s": _PRESIGN_PUT_TTL_S,
+            "presign_ttl_s": _PRESIGN_PART_TTL_S,
         }
         if body.expected_parts > 0:
             resp["presigned_parts"] = _batch_presign_parts(
@@ -3351,7 +3359,7 @@ async def upload_multipart_init(
         "upload_id": init["upload_id"],
         "key": init["key"],
         "part_size": _MULTIPART_PART_SIZE_BYTES,
-        "presign_ttl_s": _PRESIGN_PUT_TTL_S,
+        "presign_ttl_s": _PRESIGN_PART_TTL_S,
     }
     if body.expected_parts > 0:
         resp["presigned_parts"] = _batch_presign_parts(
@@ -3373,7 +3381,7 @@ def _batch_presign_parts(key: str, upload_id: str, expected_parts: int) -> list:
     for part_number in range(1, expected_parts + 1):
         try:
             url = storage.multipart_presign_part(
-                key, upload_id, part_number, expiry_seconds=_PRESIGN_PUT_TTL_S,
+                key, upload_id, part_number, expiry_seconds=_PRESIGN_PART_TTL_S,
             )
             if url:
                 out.append({"part_number": part_number, "url": url})
@@ -3414,11 +3422,11 @@ async def upload_multipart_part_url(
         )
     url = storage.multipart_presign_part(
         job_row.input_r2_key, job_row.multipart_upload_id,
-        body.part_number, expiry_seconds=_PRESIGN_PUT_TTL_S,
+        body.part_number, expiry_seconds=_PRESIGN_PART_TTL_S,
     )
     if not url:
         raise HTTPException(status_code=503, detail="Could not sign part URL.")
-    return {"url": url, "expires_in": _PRESIGN_PUT_TTL_S}
+    return {"url": url, "expires_in": _PRESIGN_PART_TTL_S}
 
 
 async def _drain_to_spooled(request: Request, max_bytes: int):

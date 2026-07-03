@@ -897,16 +897,33 @@ export default function UploadZone({
   // shows a notice instead of silently doing nothing — drag&drop bypasses
   // the <input accept> filter, so this path is reachable in prod.
   const [rejectedType, setRejectedType] = useState([]);
+  // 0-byte files (failed export, cloud placeholder not yet synced). They
+  // "upload" fine and then die opaquely in transcription — reject at the
+  // door with a reason instead.
+  const [rejectedEmpty, setRejectedEmpty] = useState([]);
+  // Duplicates skipped (same name+size already in the batch or repeated
+  // within the drop). Amber notice: benign, but silent-skip would look
+  // like "the drop did nothing" for the duplicated file.
+  const [duplicates, setDuplicates] = useState([]);
 
   const addFiles = (fileList) => {
+    // Reset EVERY notice up front. The early-returns below used to skip
+    // the resets, so a second drop could show this drop's notice next to
+    // a stale one from the previous drop (old filenames included).
+    setRejectedType([]);
+    setRejectedEmpty([]);
+    setDuplicates([]);
+    setOversize([]);
+    setBatchTruncated(0);
+
     const all = Array.from(fileList);
     const mp3s = all.filter((f) => {
       const lower = f.name.toLowerCase();
       return ACCEPTED_EXTS.some((ext) => lower.endsWith(ext));
     });
     const wrongType = all.filter((f) => !mp3s.includes(f));
-    setRejectedType(wrongType.map((f) => f.name));
     if (wrongType.length) {
+      setRejectedType(wrongType.map((f) => f.name));
       // warn-level so captureConsoleIntegration ships it to Sentry,
       // grouped under the [upload-reject] tag.
       console.warn(
@@ -916,9 +933,43 @@ export default function UploadZone({
     }
     if (!mp3s.length) return;
 
+    const empty = mp3s.filter((f) => f.size === 0);
+    const nonEmpty = mp3s.filter((f) => f.size > 0);
+    if (empty.length) {
+      setRejectedEmpty(empty.map((f) => f.name));
+      console.warn(
+        "[upload-reject] empty file:",
+        empty.map((f) => f.name).join(", "),
+      );
+    }
+    if (!nonEmpty.length) return;
+
+    // Dedup: against the current batch (same name+size) and within the
+    // drop itself. Duplicate rows shared the prefetch job downstream and
+    // produced two /generate calls over the same job_id.
+    const seen = new Set(
+      (Array.isArray(files) ? files : []).map((e) => `${e.file.name}|${e.file.size}`),
+    );
+    const unique = [];
+    const dupes = [];
+    for (const f of nonEmpty) {
+      const sig = `${f.name}|${f.size}`;
+      if (seen.has(sig)) dupes.push(f);
+      else { seen.add(sig); unique.push(f); }
+    }
+    if (dupes.length) {
+      setDuplicates(dupes.map((f) => f.name));
+      console.warn(
+        "[upload-reject] duplicate skipped:",
+        dupes.map((f) => f.name).join(", "),
+      );
+    }
+    if (!unique.length) return;
+    const okAll = unique;
+
     const max = MAX_FILE_MB * 1024 * 1024;
-    const tooBig = mp3s.filter((f) => f.size > max);
-    const okSize = mp3s.filter((f) => f.size <= max);
+    const tooBig = okAll.filter((f) => f.size > max);
+    const okSize = okAll.filter((f) => f.size <= max);
     if (tooBig.length) {
       setOversize(tooBig.map((f) => f.name));
       console.warn(
@@ -926,7 +977,6 @@ export default function UploadZone({
         tooBig.map((f) => `${f.name} (${(f.size / 1048576).toFixed(1)} MB)`).join(", "),
       );
     }
-    else setOversize([]);
     if (!okSize.length) return;
 
     // Audit 2026-05-26 (#388 wizard-duplicate-jobs): compute remaining,
@@ -1130,6 +1180,34 @@ export default function UploadZone({
           <button
             onClick={(e) => { e.stopPropagation(); setRejectedType([]); }}
             className="mt-1 text-[11px] text-red-400/60 hover:text-red-300"
+          >{t("common.dismiss") || "dismiss"}</button>
+        </div>
+      )}
+      {rejectedEmpty.length > 0 && (
+        <div className="mt-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
+          <p className="text-[11px] text-red-300">
+            {t("upload.empty_file", {
+              count: rejectedEmpty.length,
+              names: rejectedEmpty.slice(0, 3).join(", ") + (rejectedEmpty.length > 3 ? "…" : ""),
+            })}
+          </p>
+          <button
+            onClick={(e) => { e.stopPropagation(); setRejectedEmpty([]); }}
+            className="mt-1 text-[11px] text-red-400/60 hover:text-red-300"
+          >{t("common.dismiss") || "dismiss"}</button>
+        </div>
+      )}
+      {duplicates.length > 0 && (
+        <div className="mt-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
+          <p className="text-[11px] text-amber-300">
+            {t("upload.duplicate_skipped", {
+              count: duplicates.length,
+              names: duplicates.slice(0, 3).join(", ") + (duplicates.length > 3 ? "…" : ""),
+            })}
+          </p>
+          <button
+            onClick={(e) => { e.stopPropagation(); setDuplicates([]); }}
+            className="mt-1 text-[11px] text-amber-400/60 hover:text-amber-300"
           >{t("common.dismiss") || "dismiss"}</button>
         </div>
       )}
