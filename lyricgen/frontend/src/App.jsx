@@ -2229,7 +2229,7 @@ export default function App() {
     processQueueDirect(jobList);
   };
 
-  const transcribeNext = async (queue, idx) => {
+  const transcribeNext = async (queue, idx, reuseJobId = null) => {
     if (idx >= queue.length) return;
     const entry = queue[idx];
     // Cache key is the file identity (see prefetchKey), NOT the queue index,
@@ -2237,7 +2237,7 @@ export default function App() {
     const key = prefetchKey(entry.file);
 
     // Fast path: a background prefetch already finished for this file.
-    const cached = prefetchCache.current[key];
+    let cached = prefetchCache.current[key];
     if (cached?.status === "ready") {
       const { data, jobId } = cached;
       setTranscribing(false);
@@ -2273,6 +2273,32 @@ export default function App() {
       // Kick off prefetch for all remaining songs.
       prefetchRemaining(queue, idx + 1);
       return;
+    }
+
+    // Audit 2026-07-02 (doble subida): si el prefetch está SUBIENDO
+    // todavía (status="loading" sin jobId — el jobId se setea recién
+    // cuando uploadFileToR2 resuelve), esperar acá a que el upload
+    // avance en vez de caer al slow path. Antes, con subidas de varios
+    // minutos (150 MB), clickear "Revisar" en esa ventana disparaba una
+    // SEGUNDA subida del mismo archivo y supersede_sibling_drafts
+    // borraba el job del prefetch en pleno multipart (part-url 404).
+    if (cached?.status === "loading" && !cached.jobId && !reuseJobId) {
+      setTranscribing(true);
+      setTranscribeError(null);
+      setTranscribeProgress({
+        phase: "uploading", loaded: 0, total: entry.file.size,
+        fileName: entry.file?.name || "",
+      });
+      // Techo generoso (60 min > peor caso de 150 MB en uplink lento +
+      // reintentos); si el cache no progresa para entonces, algo está
+      // realmente trabado y el slow path de abajo ES el retry correcto.
+      const deadline = Date.now() + 60 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 750));
+        const cur = prefetchCache.current[key];
+        if (!cur || cur.status !== "loading" || cur.jobId) break;
+      }
+      cached = prefetchCache.current[key];
     }
 
     // BUG FIX 2026-05-25 (job duplication): si el prefetch del auto-transcribe
@@ -2336,12 +2362,15 @@ export default function App() {
     setTranscribeProgress({ phase: "uploading", loaded: 0, total: entry.file.size });
 
     let transcribeRes = null;
+    let uploadJobId = reuseJobId || null;
     try {
       // Step 1: stream the audio body straight to R2 via a presigned URL.
       // The API container never sees the bytes — that's the whole point
       // of the v2 flow. uploadFileToR2 picks single-PUT or multipart
-      // automatically based on file size.
-      const { jobId: uploadJobId } = await uploadFileToR2(entry.file, {
+      // automatically based on file size. Con reuseJobId (retry tras
+      // fallo de /transcribe-uploaded) el audio YA está en R2 — saltear
+      // la subida entera.
+      if (!uploadJobId) ({ jobId: uploadJobId } = await uploadFileToR2(entry.file, {
         meta: {
           artist: entry.artist || "",
           title: (entry.songTitle || "").trim(),
@@ -2349,7 +2378,7 @@ export default function App() {
         onProgress: (loaded, total) => {
           setTranscribeProgress({ phase: "uploading", loaded, total });
         },
-      });
+      }));
 
       // Step 2: tell the API to fetch the just-uploaded audio from R2,
       // run Whisper / lrclib, return segments. Same shape as the
@@ -2387,9 +2416,24 @@ export default function App() {
         },
       });
       if (!transcribeRes.ok) {
+        if (transcribeRes.status === 401) {
+          setTranscribing(false);
+          setTranscribeProgress(null);
+          handleLogout("expired");
+          return;
+        }
+        if (reuseJobId && (transcribeRes.status === 404 || transcribeRes.status === 409)) {
+          // El job reusado ya no está (reaper) o cambió de estado —
+          // reintento limpio con subida fresca.
+          return transcribeNext(queue, idx);
+        }
         const reason = await describeFetchError(null, transcribeRes, t);
         setTranscribing(false);
         setTranscribeProgress(null);
+        // El audio ya está en R2: el Retry reusa el job en vez de
+        // volver a subir 150 MB (antes este branch ni seteaba el ctx,
+        // así que el botón Reintentar directamente no aparecía).
+        transcribeRetryCtx.current = { queue, idx, reuseJobId: uploadJobId };
         setTranscribeError(reason);
         return;
       }
@@ -2482,7 +2526,7 @@ export default function App() {
       // err.response carries the actual HTTP response when uploadFileToR2
       // (or apiPost inside it) threw — transcribeRes is null in that case.
       const reason = await describeFetchError(err, transcribeRes ?? err?.response ?? null, t);
-      transcribeRetryCtx.current = { queue, idx };
+      transcribeRetryCtx.current = { queue, idx, reuseJobId: uploadJobId || null };
       setTranscribeError(reason);
     }
   };
@@ -3745,7 +3789,7 @@ export default function App() {
                     const ctx = transcribeRetryCtx.current;
                     setTranscribeError(null);
                     transcribeRetryCtx.current = null;
-                    transcribeNext(ctx.queue, ctx.idx);
+                    transcribeNext(ctx.queue, ctx.idx, ctx.reuseJobId || null);
                   }}
                   className="text-xs text-brand hover:text-brand-light transition-colors font-medium"
                 >
