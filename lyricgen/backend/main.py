@@ -4591,21 +4591,39 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
         import vocal_sep as _vs
         # cache_only: the cascade computed the stem seconds ago, so this
         # is an R2 download — never a second (paid, 60-180 s, hangable)
-        # demucs run. Cascade paths that skipped vocal separation have
-        # no cached stem → decline; aligning on the mix is unvalidated.
+        # demucs run.
         _stem = await asyncio.wait_for(
             asyncio.to_thread(_vs.separate_vocals, audio_path, cache_only=True),
             timeout=120,
         )
-        if not _stem:
+        # Fallback a la MEZCLA (medido en el gold set, 03/07): la
+        # declinación de CTC varía según la fuente — Grignani alineó
+        # med 0.105s/74.5%≤0.3s y PROVENZA 0.177s/76% SOBRE LA MEZCLA
+        # habiendo declinado sobre el stem (demucs sobre-separa algunas
+        # mezclas); Rata Blanca es el caso inverso (mezcla declina por
+        # score, stem alinea perfecto). La corrida completa del gold set
+        # (40 canciones, 100% sobre mezcla) dio 50.7% ≤0.3s — la mezcla
+        # como fuente está validada. Costo del retry: solo CPU local.
+        _mix_fallback = os.environ.get(
+            "CTC_ALIGN_MIX_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
+        retimed = None
+        _stem_structural = False
+        if _stem:
+            retimed = await asyncio.wait_for(
+                asyncio.to_thread(_ctc.retime_segments, _stem, segs, job_id,
+                                  audio_path),  # mix_path — M5 crowd recovery
+                timeout=420,
+            )
+            # Solo confiar en last_decline_reason (global de módulo) si
+            # ESTE call corrió — sin stem quedaría el valor del job anterior.
+            _stem_structural = (retimed is None
+                                and _ctc.last_decline_reason == "structural")
+        elif not _mix_fallback:
             logger.info("[CTC] no cached stem — skipping retime (job=%s)", job_id)
             return result
-        retimed = await asyncio.wait_for(
-            asyncio.to_thread(_ctc.retime_segments, _stem, segs, job_id,
-                              audio_path),  # mix_path — M5 crowd recovery
-            timeout=420,
-        )
-        if (retimed is None and _ctc.last_decline_reason == "structural"
+        else:
+            logger.info("[CTC] no cached stem — aligning on the MIX (job=%s)", job_id)
+        if (_stem_structural
                 and os.environ.get("CTC_ALIGN_PERF_TEXT", "0").strip().lower()
                 in ("1", "true", "yes", "on")):
             # ETAPA A — the cascade's text doesn't match what this live
@@ -4639,6 +4657,19 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
                     logger.info("[CTC] performance-libretto retime: %d líneas "
                                 "(reemplaza el texto de la cascada, job=%s)",
                                 len(retimed), job_id)
+        # Retry sobre la MEZCLA cuando el stem declinó por score (no
+        # estructural — eso ya tiene su camino perf-text arriba, y una
+        # mezcla no arregla un libreto que no matchea). También cubre el
+        # caso sin stem cacheado (retimed sigue None y nunca corrimos el
+        # primer align).
+        if retimed is None and _mix_fallback and not _stem_structural:
+            retimed = await asyncio.wait_for(
+                asyncio.to_thread(_ctc.retime_segments, audio_path, segs, job_id),
+                timeout=420,
+            )
+            if retimed:
+                logger.info("[CTC] retime sobre la MEZCLA OK (stem %s, job=%s)",
+                            "declinó" if _stem else "ausente", job_id)
         if retimed:
             result = dict(result)
             result["segments"] = retimed
