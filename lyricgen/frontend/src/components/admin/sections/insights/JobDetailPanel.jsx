@@ -39,10 +39,15 @@ export default function JobDetailPanel({ jobId, onClose }) {
           desde la derecha como en Stripe/Linear, con el contexto de fondo
           visible — chau modal flotante crudo. */}
       <div
-        className="h-full w-full max-w-xl bg-[#101016]/97 ring-1 ring-white/10 shadow-2xl p-6 space-y-4 overflow-y-auto animate-slide-in-right"
+        className="h-full w-full max-w-xl bg-[#101016]/97 ring-1 ring-white/10 shadow-2xl flex flex-col animate-slide-in-right"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-start justify-between gap-3">
+        {/* Header FIJO: antes todo el drawer era overflow-y-auto y el
+            header (con "Ver video ↗") scrolleaba fuera de pantalla en
+            cuanto la lista de llamadas IA crecía — reporte 2026-07-03:
+            "no se ve el botón violeta de ir al video, queda cortado".
+            Header fuera del scroll = botón siempre visible. */}
+        <div className="shrink-0 p-6 pb-3 border-b border-white/[0.06] flex items-start justify-between gap-3">
           <div className="min-w-0">
             <h3 className="text-lg font-bold text-white truncate">
               {detail ? `${detail.artist} — ${detail.song_title || "(sin título)"}` : `Video ${jobId}`}
@@ -73,6 +78,7 @@ export default function JobDetailPanel({ jobId, onClose }) {
           </div>
         </div>
 
+        <div className="flex-1 overflow-y-auto p-6 pt-4 space-y-4">
         {error && <p className="text-caption text-red-300">{error}</p>}
         {!detail && !error && <p className="text-caption text-gray-500">Cargando…</p>}
 
@@ -168,6 +174,7 @@ export default function JobDetailPanel({ jobId, onClose }) {
             <Row label="Perfil de entrega">{detail.delivery_profile}</Row>
           </>
         )}
+        </div>
       </div>
     </div>
   );
