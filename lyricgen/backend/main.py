@@ -4671,8 +4671,16 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
                 logger.info("[CTC] retime sobre la MEZCLA OK (stem %s, job=%s)",
                             "declinó" if _stem else "ausente", job_id)
         if retimed:
+            # Re-aplicar el lead-in: la cascada lo aplicó dentro de
+            # _emit_segments, pero el retime de CTC produce onsets
+            # acústicos frescos SIN lead — sin esta línea, justo las
+            # canciones donde CTC actúa perdían el lead-in (#801) y
+            # ambas mejoras se anulaban entre sí. No hay doble
+            # aplicación: en el camino de declive los segmentos de la
+            # cascada (ya con lead) pasan intactos.
+            import lead_in as _lead_in
             result = dict(result)
-            result["segments"] = retimed
+            result["segments"] = _lead_in.apply(retimed)
             from jobs import set_timing_source
             from timing_sources import CTC_ALIGN
             set_timing_source(job_id, CTC_ALIGN)

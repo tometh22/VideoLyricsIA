@@ -93,3 +93,33 @@ def test_stale_structural_reason_does_not_block_mix(monkeypatch, tmp_path):
     out = asyncio.run(_maybe_ctc_retime(_fake_result(), "/mix/audio.wav", "j"))
     assert calls == ["/mix/audio.wav"]
     assert out["segments"] == retimed
+
+
+def test_retimed_segments_get_lead_in(monkeypatch, tmp_path):
+    """Bug de composición #801×CTC: la cascada aplica lead_in en
+    _emit_segments, pero el retime de CTC pisa esos segmentos con onsets
+    frescos — el wrapper debe re-aplicar el lead para que ambas mejoras
+    convivan."""
+    retimed = [{"text": f"l{i}", "start": 10.0 + i * 3, "end": 11.0 + i * 3}
+               for i in range(5)]
+    calls, stem = _arm(monkeypatch, tmp_path, stem_exists=True,
+                       per_call=[[dict(s) for s in retimed]])
+    monkeypatch.setenv("LYRIC_LEAD_IN_S", "0.4")
+    out = asyncio.run(_maybe_ctc_retime(_fake_result(), "/mix/audio.wav", "j"))
+    # primer start: 10.0 − 0.4 = 9.6 (aire de sobra)
+    assert out["segments"][0]["start"] == 9.6
+    # todos adelantados respecto del onset crudo de CTC
+    assert all(o["start"] < r["start"]
+               for o, r in zip(out["segments"], retimed))
+
+
+def test_decline_path_does_not_double_apply_lead(monkeypatch, tmp_path):
+    """Si CTC declina, los segmentos de la cascada (que YA traen lead)
+    pasan intactos — sin segunda aplicación."""
+    calls, _ = _arm(monkeypatch, tmp_path, stem_exists=True, per_call=[None, None])
+    ctc_align.last_decline_reason = ""
+    monkeypatch.setenv("LYRIC_LEAD_IN_S", "0.4")
+    result = _fake_result()
+    starts_before = [s["start"] for s in result["segments"]]
+    out = asyncio.run(_maybe_ctc_retime(result, "/mix/audio.wav", "j"))
+    assert [s["start"] for s in out["segments"]] == starts_before
