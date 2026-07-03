@@ -4593,13 +4593,28 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
         if len(segs) < 3:
             return result
         import vocal_sep as _vs
-        # cache_only: the cascade computed the stem seconds ago, so this
-        # is an R2 download — never a second (paid, 60-180 s, hangable)
-        # demucs run.
+        # cache_only primero: si la cascada computó el stem hace segundos,
+        # esto es solo una descarga de R2.
         _stem = await asyncio.wait_for(
             asyncio.to_thread(_vs.separate_vocals, audio_path, cache_only=True),
             timeout=120,
         )
+        if not _stem and os.environ.get(
+                "CTC_ALIGN_COMPUTE_STEM", "1").strip().lower() in ("1", "true", "yes", "on"):
+            # Sin stem cacheado → COMPUTARLO (regresión Amanda Pujó,
+            # 03/07): cuando la transcripción viene del cache, la cascada
+            # nunca corre demucs, el wrapper caía a la mezcla, y en mezclas
+            # indie (voz enterrada) CTC declinaba estructural (13/29 skips)
+            # dejando el timing del reconcile (línea fantasma + puente
+            # 2.6s tarde). Sobre el stem la misma canción alinea 29/29.
+            # Costo: ~60-180s de Replicate + ~$0.005, UNA vez por canción
+            # (separate_vocals sube el stem al cache R2). El timeout deja
+            # margen para el peor caso de Replicate.
+            logger.info("[CTC] no cached stem — computing it (job=%s)", job_id)
+            _stem = await asyncio.wait_for(
+                asyncio.to_thread(_vs.separate_vocals, audio_path),
+                timeout=360,
+            )
         # Fallback a la MEZCLA (medido en el gold set, 03/07): la
         # declinación de CTC varía según la fuente — Grignani alineó
         # med 0.105s/74.5%≤0.3s y PROVENZA 0.177s/76% SOBRE LA MEZCLA
