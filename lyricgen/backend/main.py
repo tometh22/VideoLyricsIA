@@ -4729,14 +4729,21 @@ async def _run_transcription_for_job(
         #      (only when per-word stamps are present; no-op otherwise)
         #   2. beat_snap — snap starts to the song's beat grid (±200ms)
         #   3. mark_repetitions — tag chorus loops with repetition_group
-        # See whisperx_transcribe.py, beat_snap.py, chorus_trim.py.
+        #   4. lead_in — adelantar la aparición de la línea (karaoke lead;
+        #      LYRIC_LEAD_IN_S, default 0 = off). Va ÚLTIMO para operar
+        #      sobre los starts ya definitivos; los word-stamps no se
+        #      tocan, así el highlight sigue clavado al onset real.
+        # See whisperx_transcribe.py, beat_snap.py, chorus_trim.py, lead_in.py.
         import beat_snap as _beat_snap
         import chorus_trim as _chorus_trim
+        import lead_in as _lead_in
         from whisperx_transcribe import _split_long_segments as _split_long
         def _snap(segs):
-            return _chorus_trim.mark_repetitions(
-                _beat_snap.apply(tmp_path,
-                    _split_long(segs)
+            return _lead_in.apply(
+                _chorus_trim.mark_repetitions(
+                    _beat_snap.apply(tmp_path,
+                        _split_long(segs)
+                    )
                 )
             )
 
