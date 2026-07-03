@@ -2586,13 +2586,22 @@ def _try_send_usage_alert(db: Session, current_user: dict, usage: dict) -> None:
         logger.warning("usage alert skipped: %s", _e)
 
 
-def _enforce_plan_quota(db: Session, current_user: dict) -> None:
-    """Raise 402 if the tenant reached its monthly limit without overage allowed.
+def _enforce_plan_quota(db: Session, current_user: dict,
+                        credits_needed: int = 1) -> None:
+    """Raise 402 if the account can't cover the video about to be generated.
 
     The message is operator-facing (UMG, label teams). It avoids
     backend-y phrasing ("plan", "overage") and points at a human
     contact path so the operator knows what to do — keeping it
     blocking but not a dead-end.
+
+    `credits_needed` es el peso del video que se está por generar: 1 normal,
+    scenes_credit_cost() cuando viene con Escenas. El gate compara contra
+    `total_available` (cupo del plan + regalo vigente), el mismo número que
+    muestra el medidor — así un video de Escenas no arranca con menos
+    créditos que su costo (antes bastaba "queda al menos 1" y la cuenta
+    terminaba en overage sin aviso), y un regalo emitido a mitad de mes
+    desbloquea a una cuenta que ya había agotado el plan.
     """
     plan = current_user.get("plan", "100")
     tenant_id = current_user["tenant_id"]
@@ -2601,9 +2610,20 @@ def _enforce_plan_quota(db: Session, current_user: dict) -> None:
                            billing_group=current_user.get("billing_group"))
     if plan != "unlimited" and usage["percent"] >= 80:
         _try_send_usage_alert(db, current_user, usage)
-    if usage["remaining"] <= 0 and plan != "unlimited":
+    available = usage["total_available"]
+    if available < credits_needed and plan != "unlimited":
         if not current_user.get("allow_overage", False):
             support_email = os.environ.get("SUPPORT_EMAIL", "soporte@genly.pro")
+            if credits_needed > 1 and available > 0:
+                raise HTTPException(
+                    status_code=402,
+                    detail=(
+                        f"Un video con Escenas consume {credits_needed} créditos "
+                        f"y a tu cuenta le queda{'n' if available != 1 else ''} "
+                        f"{available}. Generalo sin Escenas, o contactá a "
+                        f"{support_email} para extender el cupo."
+                    ),
+                )
             raise HTTPException(
                 status_code=402,
                 detail=(
@@ -4270,7 +4290,10 @@ async def upload(
         if not song_title:
             song_title = parsed_title
 
-    _enforce_plan_quota(db, current_user)
+    _enforce_plan_quota(db, current_user,
+                        credits_needed=(scenes_credit_cost()
+                                        if enable_scenes and has_scenes_access(current_user)
+                                        else 1))
     _enforce_daily_volume_cap(db, current_user)
     _enforce_tenant_backlog(db, current_user)
     _enforce_disk_capacity()
@@ -7063,7 +7086,10 @@ async def generate_with_segments(
         if not song_title:
             song_title = parsed_title
 
-    _enforce_plan_quota(db, current_user)
+    _enforce_plan_quota(db, current_user,
+                        credits_needed=(scenes_credit_cost()
+                                        if enable_scenes and has_scenes_access(current_user)
+                                        else 1))
     _enforce_daily_volume_cap(db, current_user)
     _enforce_tenant_backlog(db, current_user)
     _enforce_disk_capacity()
