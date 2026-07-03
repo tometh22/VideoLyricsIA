@@ -326,3 +326,63 @@ def test_condense_extends_block_to_next_anchor():
     out = ctc_align.condense_repeated_skips(segs)
     assert out[0].get("ctc_condensed") == 2
     assert abs(out[0]["end"] - 74.9) < 0.01  # extendido hasta la próxima ancla
+
+
+# ── trim_unvoiced_edges (caso "Uh, no, no" 03/07) ───────────────────────────
+
+def _hada_line():
+    # Palabras reales del caso: "Uh," estirada sobre silencio con score
+    # basura; "no," confiable en la voz; "no" final estirada post-voz.
+    return [(7.7 - 1.68, 7.9, [("Uh,", 6.02, 7.9, 0.12),
+                               ("no,", 8.38, 8.68, 0.727),
+                               ("no", 8.84, 10.4, 0.299)])]
+
+
+def test_edge_snap_first_word_to_voice_region():
+    from ctc_align import trim_unvoiced_edges
+    regions = [(7.7, 8.9)]  # voz medida en el stem
+    out = trim_unvoiced_edges(_hada_line(), regions)
+    s, e, ws = out[0]
+    assert ws[0][1] == 7.7          # "Uh," arranca donde arranca la voz
+    assert s == 7.7                 # la línea hereda el start corregido
+    assert ws[1] == ("no,", 8.38, 8.68, 0.727)  # la confiable intacta
+    assert ws[2][2] == 8.9          # "no" final recortada al fin de la voz
+    assert e == 8.9
+
+
+def test_edge_snap_confident_words_untouched():
+    from ctc_align import trim_unvoiced_edges
+    line = [(10.0, 12.0, [("hola", 10.0, 10.5, 0.9), ("mundo", 10.6, 12.0, 0.8)])]
+    out = trim_unvoiced_edges(line, [(11.0, 13.0)])
+    assert out[0] == line[0]        # scores altos → ni se mira la región
+
+
+def test_edge_snap_no_regions_is_noop():
+    from ctc_align import trim_unvoiced_edges
+    line = _hada_line()
+    assert trim_unvoiced_edges(line, []) is line
+
+
+def test_edge_snap_env_kill_switch(monkeypatch):
+    from ctc_align import trim_unvoiced_edges
+    monkeypatch.setenv("CTC_ALIGN_EDGE_SNAP", "0")
+    line = _hada_line()
+    assert trim_unvoiced_edges(line, [(7.7, 8.9)]) is line
+
+
+def test_edge_snap_never_moves_backward_or_past_end():
+    from ctc_align import trim_unvoiced_edges
+    # región que empieza ANTES del span de la palabra: snap = max(a, ra) = a
+    line = [(5.0, 6.0, [("eh", 5.0, 6.0, 0.1)])]
+    out = trim_unvoiced_edges(line, [(4.0, 7.0)])
+    assert out[0][2][0][1] == 5.0   # nunca hacia antes
+    # región que arranca después del end de la palabra: no toca
+    line2 = [(5.0, 6.0, [("eh", 5.0, 6.0, 0.1)])]
+    out2 = trim_unvoiced_edges(line2, [(6.5, 7.0)])
+    assert out2[0][2][0][1] == 5.0
+
+
+def test_edge_snap_none_lines_pass_through():
+    from ctc_align import trim_unvoiced_edges
+    out = trim_unvoiced_edges([None, _hada_line()[0]], [(7.7, 8.9)])
+    assert out[0] is None

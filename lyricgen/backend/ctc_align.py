@@ -352,6 +352,72 @@ def _eff_dur(word: str) -> float:
     return 0.45 * max(len(norm_word(word)), 2) + 0.6
 
 
+def trim_unvoiced_edges(line_times, regions,
+                        score_floor=None):
+    """Snap low-confidence EDGE words to the measured voice regions.
+
+    Caso real (Hada y el Mago, 03/07, confirmado a oído por el operador):
+    CTC ancló la primera palabra "Uh," en 6.02→7.9 con score 0.12 — casi
+    todo sobre SILENCIO medido (la voz entra a 7.7). La línea aparecía
+    ~2s antes de que nadie cante. repair_bridge_words no lo agarra: el
+    estiramiento (1.9s) queda por debajo de BRIDGE_S=8.
+
+    Regla: si la PRIMERA palabra de una línea tiene score < floor, su
+    start se ajusta al inicio de la primera región de voz que su span
+    toca (nunca hacia antes, nunca más allá de su end). Simétrico para
+    la ÚLTIMA palabra (su end se recorta al fin de la región). Palabras
+    confiables no se tocan — el score bajo es lo que dice "acá CTC está
+    adivinando"; la energía del stem dice dónde hay canto de verdad.
+
+    Gate: CTC_ALIGN_EDGE_SNAP (default on; el retime entero ya está
+    detrás de CTC_ALIGN_ENABLED). floor: CTC_ALIGN_EDGE_SNAP_SCORE
+    (default 0.30). Sin regiones (VAD falló) → no-op. Pura."""
+    if os.environ.get("CTC_ALIGN_EDGE_SNAP", "1").strip().lower() not in _TRUE:
+        return line_times
+    if not regions:
+        return line_times
+    if score_floor is None:
+        try:
+            score_floor = float(os.environ.get("CTC_ALIGN_EDGE_SNAP_SCORE", "0.30"))
+        except (TypeError, ValueError):
+            score_floor = 0.30
+
+    out = []
+    for lt in line_times:
+        if lt is None or not lt[2]:
+            out.append(lt)
+            continue
+        _s, _e, ws = lt
+        ws = list(ws)
+        w0, a0, b0, sc0 = ws[0]
+        if sc0 < score_floor:
+            # primera región de voz que el span [a0, b0] toca
+            snap = None
+            for ra, rb in regions:
+                if rb <= a0:
+                    continue
+                if ra >= b0:
+                    break
+                snap = max(a0, ra)
+                break
+            if snap is not None and snap > a0:
+                ws[0] = (w0, round(snap, 3), b0, sc0)
+        wn, an, bn, scn = ws[-1]
+        if scn < score_floor:
+            # última región de voz que el span [an, bn] toca
+            snap = None
+            for ra, rb in regions:
+                if ra >= bn:
+                    break
+                if rb <= an:
+                    continue
+                snap = min(bn, rb)
+            if snap is not None and snap < bn:
+                ws[-1] = (wn, an, round(snap, 3), scn)
+        out.append((ws[0][1], ws[-1][2], ws))
+    return out
+
+
 def repair_bridge_words(line_times, regions=None):
     """Fix 'bridge' lines: a word stretched implausibly long (or a huge
     intra-line gap) is the CTC bridging two distinct vocal events — e.g.
@@ -896,6 +962,15 @@ def retime_segments(audio_path: str, segments: list[dict],
                       if s.get("start") is not None else None)
                      for s in segments]
         line_times = place_unaligned(line_times, originals, dur)
+
+        # Bordes low-score sobre silencio (caso "Uh, no, no" @6.0 con voz
+        # @7.7, 03/07): snap a las regiones de voz del STEM. Va DESPUÉS de
+        # M5/place_unaligned porque la línea problemática entra justamente
+        # por la recuperación sobre la mezcla (el pase principal la había
+        # salteado) — antes de este punto sus words todavía no existen.
+        # Una línea de público SIN región de stem que la toque queda
+        # intacta (el snap solo ajusta bordes que pisan una región).
+        line_times = trim_unvoiced_edges(line_times, _regions)
 
         # Per-line confidence as a LIKELIHOOD-RATIO vs the star: how much
         # better does this line explain its span than "unlabeled singing"?
