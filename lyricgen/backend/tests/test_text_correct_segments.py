@@ -132,3 +132,66 @@ def test_relabel_leaves_real_line_when_words_span_segment():
 def test_relabel_skips_segments_without_words():
     seg = {"start": 0, "end": 20, "text": "algo", "words": []}
     assert relabel_long_adlibs([seg]) == [seg]
+
+
+# ── match2: un segmento que abarca DOS líneas de referencia (Amanda Pujó, 03/07) ──
+
+REF_SANTOS = """Dentro de tu piel se esconden los indicios
+de que nada es perfecto
+iluminados por el fuego que dejaste arder
+para qué para qué tus santos de papel
+Como tantos vas buscando las respuestas
+que nada te responden
+acariciando tus ideas algo en qué creer"""
+
+
+def _w(text, start, end):
+    """Word-stamps sintéticos repartidos uniformemente (como whisper-1)."""
+    ws = text.split()
+    dur = (end - start) / len(ws)
+    return [{"word": w, "start": round(start + i * dur, 2),
+             "end": round(start + (i + 1) * dur, 2)} for i, w in enumerate(ws)]
+
+
+def test_segment_spanning_two_ref_lines_keeps_both():
+    """Caso real: whisper oyó '…los indicios de que nada es perfecto' en UN
+    segmento; la referencia lo tiene en DOS líneas. Con matching 1:1 la
+    segunda desaparecía del video (frase cantada sin subtítulo)."""
+    from whisperx_reconcile import text_correct_segments
+    txt = "Dentro de tu piel se esconden los indicios de que nada es perfecto"
+    segs = [
+        {"text": txt, "start": 8.0, "end": 15.5, "words": _w(txt, 8.0, 15.5)},
+        {"text": "iluminados por el fuego que dejaste arder", "start": 16.9, "end": 21.4},
+    ]
+    out = text_correct_segments(segs, REF_SANTOS)
+    texts = [s["text"] for s in out]
+    assert "de que nada es perfecto" in texts          # la frase YA NO se pierde
+    assert "Dentro de tu piel se esconden los indicios" in texts
+    i = texts.index("Dentro de tu piel se esconden los indicios")
+    a, b = out[i], out[i + 1]
+    assert a["end"] <= b["start"] + 0.01               # partido en orden
+    assert 10.0 < a["end"] < 14.5                      # corte adentro del segmento
+    assert b["end"] == 15.5                            # fin original conservado
+
+
+def test_second_real_case_que_nada_te_responden():
+    from whisperx_reconcile import text_correct_segments
+    txt = "que en nada te responden acariciando tus ideas, algo en que creer"
+    segs = [
+        {"text": "Como tantos vas buscando las respuestas", "start": 41.0, "end": 45.7},
+        {"text": txt, "start": 45.8, "end": 54.6, "words": _w(txt, 45.8, 54.6)},
+    ]
+    out = text_correct_segments(segs, REF_SANTOS)
+    texts = [s["text"] for s in out]
+    assert "que nada te responden" in texts
+    assert "acariciando tus ideas algo en qué creer" in texts
+
+
+def test_single_line_match_not_split_on_tie():
+    """Una línea sana que matchea 1:1 no se parte en dos por empate."""
+    from whisperx_reconcile import text_correct_segments
+    segs = [{"text": "para qué para qué tus santos de papel",
+             "start": 24.0, "end": 29.0}]
+    out = text_correct_segments(segs, REF_SANTOS)
+    assert len(out) == 1
+    assert out[0]["text"] == "para qué para qué tus santos de papel"
