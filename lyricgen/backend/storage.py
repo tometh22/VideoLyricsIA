@@ -678,6 +678,58 @@ def multipart_abort(key: str, upload_id: str) -> bool:
         return False
 
 
+def abort_stale_multipart_uploads(
+    older_than_hours: int = 24, prefix: str = "inputs/",
+) -> dict:
+    """Abort multipart uploads initiated more than `older_than_hours`
+    ago. This IS the "periodic abort sweep" that the multipart_abort
+    docstring referenced — hasta 2026-07-02 no existía, así que los
+    huérfanos (complete fallido, abort ignorado, supersede mid-upload)
+    acumulaban storage R2 para siempre.
+
+    24 h de umbral es deliberadamente conservador: la subida legítima
+    más larga (150 MB en uplink residencial + reintentos) se mide en
+    decenas de minutos, y el guard del reaper (upload_still_active) ya
+    protege a las vivas — cualquier upload_id de ayer es basura segura.
+
+    Returns {"scanned": n, "aborted": n, "failed": n}.
+    """
+    from datetime import datetime, timedelta, timezone
+    report = {"scanned": 0, "aborted": 0, "failed": 0}
+    try:
+        client = _get_client()
+        if client is None:
+            return report
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=older_than_hours)
+        paginator = client.get_paginator("list_multipart_uploads")
+        for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=prefix):
+            for up in page.get("Uploads", []):
+                report["scanned"] += 1
+                initiated = up.get("Initiated")
+                if initiated is None or initiated >= cutoff:
+                    continue
+                try:
+                    client.abort_multipart_upload(
+                        Bucket=R2_BUCKET,
+                        Key=up["Key"],
+                        UploadId=up["UploadId"],
+                    )
+                    report["aborted"] += 1
+                    logger.info(
+                        "[R2] stale multipart aborted: %s (initiated %s)",
+                        up["Key"], initiated,
+                    )
+                except Exception as e:
+                    report["failed"] += 1
+                    logger.warning(
+                        "[R2] stale multipart abort failed %s: %s",
+                        up["Key"], e,
+                    )
+    except Exception as e:
+        logger.warning("[R2] stale multipart sweep failed: %s", e)
+    return report
+
+
 def _active_input_keys() -> "set[str] | None":
     """Return the input-key prefixes of EVERY job that still has a DB row.
 
