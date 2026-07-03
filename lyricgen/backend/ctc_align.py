@@ -352,6 +352,39 @@ def _eff_dur(word: str) -> float:
     return 0.45 * max(len(norm_word(word)), 2) + 0.6
 
 
+def finalize_line(seg: dict, ls: float, le: float, wlist, lr,
+                  skipped: bool, recovered: bool) -> dict:
+    """Construye el dict final de una línea retimada. Pura, unit-testeable.
+
+    Regla del flag `review` ("timing aproximado", puesto por el camino
+    scaffold): una línea que CTC retimó tiene precisión word-level → el
+    flag heredado se limpia. Sin esto, el wizard pintaba de ámbar las 66
+    líneas de una canción perfectamente sincronizada (operador, 03/07).
+    Las líneas SALTEADAS conservan el flag: su timing viene del fallback
+    y sí es aproximado."""
+    new = dict(seg)
+    new["start"] = round(float(ls), 3)
+    new["end"] = round(float(le), 3)
+    if lr is not None:
+        new["ctc_lr"] = round(lr, 3)
+    if skipped:
+        new["ctc_skipped"] = True  # Viterbi: línea no cantada
+    else:
+        new.pop("review", None)
+    if recovered:
+        new["ctc_recovered"] = "mix"  # M5: rescatada del mix
+    if wlist:
+        new["words"] = [
+            {"word": w, "start": round(float(a), 3),
+             "end": round(float(b), 3), "score": round(float(sc), 3)}
+            for (w, a, b, sc) in wlist]
+    else:
+        # Interpolated line: the inherited word stamps belong to
+        # the OLD timing — keeping them would break karaoke.
+        new.pop("words", None)
+    return new
+
+
 def trim_unvoiced_edges(line_times, regions,
                         score_floor=None):
     """Snap low-confidence EDGE words to the measured voice regions.
@@ -999,25 +1032,8 @@ def retime_segments(audio_path: str, segments: list[dict],
 
         out = []
         for li, (seg, (ls, le, wlist), lr) in enumerate(zip(segments, line_times, lrs)):
-            new = dict(seg)
-            new["start"] = round(float(ls), 3)
-            new["end"] = round(float(le), 3)
-            if lr is not None:
-                new["ctc_lr"] = round(lr, 3)
-            if li in skipped_lines:
-                new["ctc_skipped"] = True  # Viterbi: línea no cantada
-            if li in recovered_lines:
-                new["ctc_recovered"] = "mix"  # M5: rescatada del mix
-            if wlist:
-                new["words"] = [
-                    {"word": w, "start": round(float(a), 3),
-                     "end": round(float(b), 3), "score": round(float(sc), 3)}
-                    for (w, a, b, sc) in wlist]
-            else:
-                # Interpolated line: the inherited word stamps belong to
-                # the OLD timing — keeping them would break karaoke.
-                new.pop("words", None)
-            out.append(new)
+            out.append(finalize_line(seg, ls, le, wlist, lr,
+                                     li in skipped_lines, li in recovered_lines))
         logger.info("[CTC] retimed %d lines in %.1fs (audio %.0fs, job=%s)",
                     len(out), time.time() - t0, dur, job_id)
         return out

@@ -386,3 +386,35 @@ def test_edge_snap_none_lines_pass_through():
     from ctc_align import trim_unvoiced_edges
     out = trim_unvoiced_edges([None, _hada_line()[0]], [(7.7, 8.9)])
     assert out[0] is None
+
+
+def test_finalize_line_clears_stale_review_on_retimed():
+    """El scaffold marca review=True ("timing aproximado"). Si CTC retimó
+    la línea, el flag se limpia — el wizard pintaba de ámbar 66 líneas
+    perfectamente sincronizadas (operador, 03/07)."""
+    from ctc_align import finalize_line
+    seg = {"text": "hola", "start": 1.0, "end": 2.0, "review": True,
+           "words": [{"word": "hola", "start": 1.0, "end": 2.0}]}
+    out = finalize_line(seg, 10.0, 12.0, [("hola", 10.0, 12.0, 0.9)], 0.4,
+                        skipped=False, recovered=False)
+    assert "review" not in out            # retimada → flag fuera
+    assert out["start"] == 10.0 and out["end"] == 12.0
+    assert out["words"][0]["start"] == 10.0
+    assert out["ctc_lr"] == 0.4
+
+
+def test_finalize_line_keeps_review_on_skipped():
+    from ctc_align import finalize_line
+    seg = {"text": "uh", "start": 1.0, "end": 2.0, "review": True}
+    out = finalize_line(seg, 1.0, 2.0, None, None, skipped=True, recovered=False)
+    assert out.get("review") is True      # salteada → timing sigue aproximado
+    assert out.get("ctc_skipped") is True
+    assert "words" not in out             # interpolada: sin stamps viejos
+
+
+def test_finalize_line_recovered_tags_mix():
+    from ctc_align import finalize_line
+    out = finalize_line({"text": "x"}, 5.0, 6.0,
+                        [("x", 5.0, 6.0, 0.5)], None,
+                        skipped=False, recovered=True)
+    assert out["ctc_recovered"] == "mix"
