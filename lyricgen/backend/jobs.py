@@ -553,13 +553,21 @@ def get_all_jobs(
 
     Pass user_id for self-serve callers — see get_job() for rationale.
 
+    `tenant_id=None` = SIN filtro de tenant (mismo contrato que get_job):
+    es el scope cross-tenant de los admins de plataforma. Bug 2026-07-03:
+    el scope admin pasaba kwargs vacíos y este parámetro caía en su
+    default literal "default" — los admins veían el historial del tenant
+    "default" (frizado el 02-jun) en vez del propio/global, o sea
+    "faltan los últimos videos".
+
     Excludes bg_preview ghost rows. Admin callers should use
     `get_all_jobs_admin` if they need them.
     """
     query = db.query(Job).filter(
-        Job.tenant_id == tenant_id,
         ~Job.status.in_(_BG_PREVIEW_STATUSES),
     )
+    if tenant_id is not None:
+        query = query.filter(Job.tenant_id == tenant_id)
     if user_id is not None:
         query = query.filter(Job.user_id == user_id)
     jobs = (
