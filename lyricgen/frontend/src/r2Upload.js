@@ -291,10 +291,28 @@ export async function uploadFileToR2(
   const contentType = file.type || "application/octet-stream";
 
   if (!ticket.use_multipart) {
-    // Single-PUT path: one XHR.PUT direct to the presigned URL.
-    await putToR2WithProgress(
-      ticket.upload_url, file, contentType, onProgress, signal,
-    );
+    // Single-PUT path: one XHR.PUT direct to the presigned URL, with the
+    // same retry budget the multipart parts get — a single network blip
+    // used to kill the whole flow (and the manual retry minted a NEW
+    // job). Progress is clamped monotonic so a retry from byte 0
+    // doesn't make the bar regress. The presigned URL stays valid
+    // across attempts (15-min TTL vs ≤16 MB body: the retry window is
+    // seconds, not minutes).
+    let maxLoaded = 0;
+    await withRetry(async () => {
+      await putToR2WithProgress(
+        ticket.upload_url, file, contentType,
+        onProgress
+          ? (loaded, total) => {
+              if (loaded > maxLoaded) {
+                maxLoaded = loaded;
+                onProgress(loaded, total);
+              }
+            }
+          : null,
+        signal,
+      );
+    }, { maxAttempts: 3 });
     return { jobId: ticket.job_id, key: ticket.key };
   }
 
