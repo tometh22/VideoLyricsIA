@@ -2486,7 +2486,11 @@ def _job_scope(current_user: dict) -> dict:
     # dueño de la empresa). El acceso a media queda auditado en
     # /media-token y /download vía _audit_cross_tenant_access.
     if current_user.get("role") == "admin":
-        return {}
+        # Explícito, no kwargs vacíos: get_all_jobs tiene default
+        # tenant_id="default" y con {} el admin veía SOLO ese tenant
+        # (historial frizado en jun-02). None = cross-tenant real, mismo
+        # contrato que get_job.
+        return {"tenant_id": None}
     return {"tenant_id": current_user["tenant_id"]}
 
 
@@ -9129,6 +9133,24 @@ async def request_edit(
             status_code=400,
             detail=f"edit_type must be one of {valid_edit_types}",
         )
+    # Escenas (incidente 2026-07-01, job 53b9513225b1): el edit "background"
+    # es del mundo fondo-único — para un job multi-escena generaba UN clip
+    # Veo de 8 s, PISABA bg_r2_key_cached (que era el timeline completo) y
+    # re-renderizaba video+short loopeando esa única escena. El camino
+    # correcto para estos jobs es la regeneración por escena del filmstrip
+    # (edit_type="scene" vía /edit-scene, no consume cupo de edición).
+    if body.edit_type == "background":
+        _sp = job.scene_plan if isinstance(job.scene_plan, dict) else None
+        if _sp and _sp.get("scenes"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Este video usa Escenas: el fondo es un timeline "
+                    "multi-escena. Regenerá la escena que quieras cambiar "
+                    "desde el filmstrip del video (no consume cupo de "
+                    "edición)."
+                ),
+            )
 
     # Status gate. Lyrics and metadata edits accept a wider set of
     # terminal-ish states so users can fix typos/timing on videos that
