@@ -157,6 +157,16 @@ _STALLED_RENDER_THRESHOLD_MIN = int(os.environ.get(
     "REAPER_STALLED_RENDER_THRESHOLD_MIN", "20",
 ))
 
+# Recordatorio de review pendiente. Un render con REQUIRE_REVIEW termina en
+# pending_review y es invisible hasta que el operador lo aprueba. Caso real
+# (UMG Chile, 2026-06-25): el primer video de una operadora quedó 8 días
+# esperando — para ella la app "no funcionó" y no volvió a entrar. Este
+# sweep manda UN email por job (dedupe por AuditLog) cuando lleva 48 h+
+# sin revisar. 0 = deshabilitado.
+_REVIEW_REMINDER_THRESHOLD_H = int(os.environ.get(
+    "REVIEW_REMINDER_THRESHOLD_H", "48",
+))
+
 # Ops inbox for the reaper digest. This is an INTERNAL operations alert
 # (technical: "OOM, hung ffmpeg, Veo 429-storm") — it must NOT default to
 # a real person's customer-facing address. Until 2026-05-20 it defaulted
@@ -413,6 +423,95 @@ def find_stuck_transcriptions(
         .order_by(anchor.asc())
         .all()
     )
+
+
+def remind_stale_pending_review(db: Session,
+                                threshold_h: int = _REVIEW_REMINDER_THRESHOLD_H) -> int:
+    """Email the owner of every job sitting in pending_review for 48 h+.
+
+    Una sola vez por job: el envío queda registrado en AuditLog
+    (action="job.review_reminder") y el sweep salta los ya recordados.
+    Respeta el opt-out explícito de notif_jobs (Settings); en ese caso
+    igual registra el AuditLog para no re-escanear el job cada ciclo.
+    Best-effort: cualquier excepción por job se loguea y no corta el pass.
+    Returns: cantidad de emails enviados.
+    """
+    if threshold_h <= 0:
+        return 0
+    from database import User, UserSettings
+    import emails as _emails
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=threshold_h)
+    stale = (
+        db.query(Job)
+        .filter(Job.status == "pending_review")
+        .filter(Job.created_at < cutoff)
+        .order_by(Job.created_at.asc())
+        .limit(50)
+        .all()
+    )
+    if not stale:
+        return 0
+
+    # Jobs ya recordados. El volumen es mínimo (un email por job atascado,
+    # jamás cientos), así que filtrar en Python evita depender de operadores
+    # JSON portables entre Postgres y SQLite.
+    already = set()
+    for (detail,) in (
+        db.query(AuditLog.detail)
+        .filter(AuditLog.action == "job.review_reminder")
+        .all()
+    ):
+        if isinstance(detail, dict) and detail.get("job_id"):
+            already.add(detail["job_id"])
+
+    sent = 0
+    for job in stale:
+        if job.job_id in already:
+            continue
+        try:
+            user = db.query(User).filter(User.id == job.user_id).first()
+            settings = (
+                db.query(UserSettings).filter(UserSettings.user_id == job.user_id).first()
+                if user else None
+            )
+            prefs = (settings.settings_json or {}) if settings else {}
+            wants_email = bool(user and user.email) and prefs.get("notif_jobs", True)
+
+            created = job.created_at
+            if created is not None and created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            days = max(1, (now - created).days) if created else 1
+
+            if wants_email:
+                _emails.send_review_reminder(
+                    email=user.email,
+                    username=user.username,
+                    artist=job.artist or "",
+                    song=job.song_title or job.filename or "",
+                    job_id=job.job_id,
+                    days_waiting=days,
+                )
+                sent += 1
+            db.add(AuditLog(
+                user_id=job.user_id,
+                action="job.review_reminder",
+                detail={
+                    "job_id": job.job_id,
+                    "days_waiting": days,
+                    "emailed": wants_email,
+                },
+            ))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.warning(
+                "[REAPER] review reminder %s failed: %s", job.job_id, e,
+            )
+    if sent:
+        logger.info("[REAPER] sent %d pending_review reminder(s)", sent)
+    return sent
 
 
 def _reason_for_transcription(job: Job) -> str:
@@ -1157,6 +1256,14 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
                 "[REAPER] flipped %d stuck transcription(s) to transcription_failed",
                 _n_tx,
             )
+        # Recordatorios de review pendiente. Corre acá adentro (bajo el
+        # advisory lock, una vez por ciclo) para no duplicar emails con
+        # multi-replica. Best-effort: nunca aborta el pass de reaping.
+        try:
+            remind_stale_pending_review(db)
+        except Exception as e:
+            db.rollback()
+            logger.warning("[REAPER] review reminder sweep failed: %s", e)
         if not stuck and not orphans and not stalled:
             return 0
         # reap_stuck_job returns False when its in-function race guard
