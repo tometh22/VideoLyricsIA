@@ -581,8 +581,14 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   //                                    corrections warrant re-render)
   //   - rejected       → lyrics only (recovery path instead of re-upload)
   const canEditLyrics = isPendingReview || isDone || isRejected;
+  // Jobs multi-escena: el modo "Fondo" queda afuera del panel — ese edit
+  // pertenece al mundo fondo-único (regenera UN clip y pisaba el timeline
+  // de escenas; incidente 2026-07-01). Para escenas, la regeneración va
+  // por el filmstrip (por escena, sin consumir cupo). El backend además
+  // lo rechaza con 400 por si llega igual.
+  const _hasScenes = !!(job.scene_plan && job.scene_plan.scenes && job.scene_plan.scenes.length);
   const editPanelAllowedModes = isPendingReview
-    ? ["lyrics", "background"]
+    ? (_hasScenes ? ["lyrics"] : ["lyrics", "background"])
     : ["lyrics"];
 
   // While the worker is re-rendering an edit request, poll /status every

@@ -12189,6 +12189,15 @@ def run_edit_pipeline(
                     bg_prelooped = True
 
         elif edit_type == "background":
+            # Cinturón del guard en request_edit (incidente 2026-07-01):
+            # si un background-edit llega igual a un job multi-escena, NO
+            # gastar Veo ni pisar bg_r2_key_cached (el timeline) con un
+            # clip único de 8 s.
+            if scene_plan and scene_plan.get("scenes"):
+                raise RuntimeError(
+                    "background edit no soportado en jobs multi-escena — "
+                    "regenerar escenas individuales (edit_type='scene')."
+                )
             update_job(job_id, status="editing", current_step="background", progress=22)
             lyrics_text = " ".join(seg["text"] for seg in segments)
             bg_image_path = _ensure_background(
