@@ -75,6 +75,14 @@ const MAX_FILE_MB = 150;
 // with backend _AUDIO_EXTENSIONS.
 const ACCEPTED_EXTS = [".mp3", ".wav"];
 
+// Caps del FONDO custom. A diferencia del audio (directo a R2), el fondo
+// viaja en el FormData de /generate a través del edge proxy — un MOV de
+// 300 MB muere en el timeout del edge con "Failed to fetch" opaco, o
+// sube entero para comerse un 413. Video 150 MB (coherente con el cap
+// de audio), imagen 25 MB.
+const MAX_BG_VIDEO_MB = 150;
+const MAX_BG_IMAGE_MB = 25;
+
 // WAV files above this threshold get an amber warning under the filename
 // — they upload fine for a single user, but slow connections and
 // concurrent batches can hit the API container's edge timeout / memory
@@ -245,6 +253,8 @@ export default function UploadZone({
   const [umgFps, setUmgFps] = useState(delivery?.umg_fps || 24);
   const [umgProresProfile, setUmgProresProfile] = useState(delivery?.umg_prores_profile || 3);
   const [deliveryExpanded, setDeliveryExpanded] = useState(false);
+  // Aviso de fondo custom rechazado por tamaño (nombre + límite aplicado).
+  const [bgOversize, setBgOversize] = useState(null);
   // bgMode viene de App via props (ver header) — acá sólo un alias para
   // que el resto del componente siga llamando setBgMode.
   // Audit A2: multi-escena sólo aplica a "Generar con IA" (genera clips Veo).
@@ -1821,8 +1831,22 @@ export default function UploadZone({
             accept=".mp4,.mov,.jpg,.jpeg,.png"
             className="hidden"
             onChange={(e) => {
-              if (e.target.files[0]) { onBackgroundFile?.(e.target.files[0]); onBackgroundId?.(null); }
+              const f = e.target.files[0];
               e.target.value = "";
+              if (!f) return;
+              const isVideo = /\.(mp4|mov)$/i.test(f.name);
+              const capMb = isVideo ? MAX_BG_VIDEO_MB : MAX_BG_IMAGE_MB;
+              if (f.size > capMb * 1024 * 1024) {
+                setBgOversize({ name: f.name, capMb, sizeMb: (f.size / 1048576).toFixed(0) });
+                console.warn(
+                  "[upload-reject] bg oversize (cap " + capMb + " MB):",
+                  `${f.name} (${(f.size / 1048576).toFixed(1)} MB)`,
+                );
+                return;
+              }
+              setBgOversize(null);
+              onBackgroundFile?.(f);
+              onBackgroundId?.(null);
             }}
           />
 
@@ -2053,6 +2077,21 @@ export default function UploadZone({
           {/* Custom upload mode */}
           {bgMode === "custom" && (
             <div>
+              {bgOversize && (
+                <div className="mb-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
+                  <p className="text-[11px] text-red-300">
+                    {t("upload.bg_oversize", {
+                      name: bgOversize.name,
+                      size: bgOversize.sizeMb,
+                      max: bgOversize.capMb,
+                    })}
+                  </p>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setBgOversize(null); }}
+                    className="mt-1 text-[11px] text-red-400/60 hover:text-red-300"
+                  >{t("common.dismiss") || "dismiss"}</button>
+                </div>
+              )}
               {!backgroundFile ? (
                 <button
                   onClick={() => bgInputRef.current.click()}

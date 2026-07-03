@@ -3770,8 +3770,17 @@ async def transcribe_uploaded(
                 detail=f"File too large ({_real_size / 1048576:.1f} MB). "
                        f"Max allowed: {MAX_UPLOAD_MB} MB.",
             )
+        _loop = _asyncio.get_event_loop()
         for _attempt in range(5):
-            if storage.download_object(job_row.input_r2_key, audio_path):
+            # boto3 es síncrono: correrlo inline dentro de este handler
+            # async bloqueaba el event loop de uvicorn el tiempo entero
+            # de la descarga (segundos con un WAV de 150 MB) y un batch
+            # de 5 serializaba TODA la API. Mismo patrón executor que
+            # /upload-part-proxy.
+            _ok = await _loop.run_in_executor(
+                None, storage.download_object, job_row.input_r2_key, audio_path,
+            )
+            if _ok:
                 break
             if _attempt < 4:
                 await _asyncio.sleep(0.5 * (2 ** _attempt))
