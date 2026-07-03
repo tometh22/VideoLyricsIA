@@ -71,3 +71,47 @@ def test_bad_segment_passthrough():
     out = lead_in.apply(segs, lead_s=0.4)
     assert out[0]["start"] == "x"      # intacto
     assert out[1]["start"] < 5.0       # el sano igual se adelanta
+
+
+# ── hold (LYRIC_HOLD_S) ──────────────────────────────────────────────────────
+
+def test_hold_default_off(monkeypatch):
+    monkeypatch.delenv("LYRIC_HOLD_S", raising=False)
+    segs = _segs()
+    assert lead_in.apply_hold(segs) is segs
+
+
+def test_hold_extends_into_gap_with_cap():
+    out = lead_in.apply_hold(_segs(), hold_s=0.25)
+    assert out[0]["end"] == 12.25          # aire de sobra: end+0.25
+    # línea 1 termina en 16.0 y la siguiente arranca 16.05: tope en 16.04
+    assert out[1]["end"] == 16.04
+    assert out[2]["end"] == 18.0           # última línea intacta
+    assert [s["start"] for s in out] == [10.0, 14.0, 16.05]  # starts intactos
+
+
+def test_hold_never_shortens():
+    segs = [{"start": 1.0, "end": 5.0, "text": "a"},
+            {"start": 4.0, "end": 6.0, "text": "b"}]  # ya solapadas
+    out = lead_in.apply_hold(segs, hold_s=0.25)
+    assert out[0]["end"] == 5.0            # tope (4.0-0.01) < end → no tocar
+
+
+def test_polish_composes_lead_then_hold(monkeypatch):
+    """El tope del hold usa el start YA adelantado: con lead 0.4, la línea
+    siguiente arranca antes, y el hold no puede pisarla."""
+    monkeypatch.setenv("LYRIC_LEAD_IN_S", "0.4")
+    monkeypatch.setenv("LYRIC_HOLD_S", "0.25")
+    segs = [{"start": 10.0, "end": 13.5, "text": "a"},
+            {"start": 14.0, "end": 16.0, "text": "b"}]
+    out = lead_in.polish(segs)
+    assert out[1]["start"] == 13.6         # lead aplicado (14.0-0.4)
+    assert out[0]["end"] == 13.59          # hold topeado en el start NUEVO
+    assert out[0]["end"] < out[1]["start"]
+
+
+def test_hold_env_parsing(monkeypatch):
+    monkeypatch.setenv("LYRIC_HOLD_S", "0.25")
+    assert lead_in.hold_seconds() == 0.25
+    monkeypatch.setenv("LYRIC_HOLD_S", "nope")
+    assert lead_in.hold_seconds() == 0.0

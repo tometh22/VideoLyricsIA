@@ -50,6 +50,67 @@ def lead_seconds() -> float:
         return 0.0
 
 
+def hold_seconds() -> float:
+    """Hold configurado (LYRIC_HOLD_S), saneado. 0 (default) = apagado."""
+    raw = os.environ.get("LYRIC_HOLD_S", "0")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        logger.warning("[LEAD_IN] LYRIC_HOLD_S=%r inválido — apagado", raw)
+        return 0.0
+
+
+def apply_hold(segs: list[dict], hold_s: float | None = None) -> list[dict]:
+    """Extiende el `end` de cada línea hasta `hold_s`, con tope en el inicio
+    de la línea siguiente (menos un gap mínimo).
+
+    Medido contra el gold (03/07, sweep de holds sobre 40 canciones): los
+    operadores NO empalman estilo ROTOR (78% de las transiciones aprobadas
+    dejan aire; hold sin tope da 23.8% ≤0.3s vs 37.5% de hoy) pero un hold
+    chico ayuda: +0.25s sube los finales ≤0.3s del gold de 37.5% → 42.7%.
+    Todo hold ≥0.5s EMPEORA — de ahí el valor conservador cuando se
+    prende. Nunca acorta; la última línea queda intacta (sin señal de gold
+    para el outro, y el hold infinito de ROTOR es justo lo que los
+    operadores no hacen).
+    """
+    hold = hold_seconds() if hold_s is None else max(0.0, float(hold_s))
+    if not segs or hold <= 0.0:
+        return segs
+    try:
+        out: list[dict] = []
+        moved = 0
+        for i, seg in enumerate(segs):
+            new = dict(seg)
+            try:
+                end = float(seg.get("end", 0.0))
+                if i + 1 < len(segs):
+                    nxt = float(segs[i + 1].get("start", end))
+                    target = min(end + hold, nxt - _MIN_GAP_S)
+                    if target > end:
+                        new["end"] = round(target, 3)
+                        moved += 1
+            except (TypeError, ValueError):
+                pass
+            out.append(new)
+        if moved:
+            logger.info("[LEAD_IN] %d/%d ends extendidos (hold=%.2fs)",
+                        moved, len(segs), hold)
+        return out
+    except Exception as e:  # pragma: no cover
+        logger.warning("[LEAD_IN] apply_hold falló (%s) — segmentos originales", e)
+        return segs
+
+
+def polish(segs: list[dict]) -> list[dict]:
+    """Punto de entrada único del pulido de presentación: lead + hold.
+
+    Orden importa: primero el lead (mueve starts hacia antes), después el
+    hold — así el tope del hold usa el start YA adelantado de la línea
+    siguiente y la extensión nunca pisa una línea visible.
+    """
+    return apply_hold(apply(segs))
+
+
 def apply(segs: list[dict], lead_s: float | None = None) -> list[dict]:
     """Adelanta el `start` de cada segmento hasta `lead_s`, clampeado.
 
