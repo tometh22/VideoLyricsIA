@@ -1,15 +1,43 @@
-# One job_id per line. Lines starting with `#` are ignored.
-#
-# These should be jobs in PROD that the operator approved or hand-corrected
-# to the point where job.segments_json is the "truth" for that song.
-# Both text and timing should match what UMG was happy to ship.
-#
-# How to populate:
-#   1. Go to prod admin, find 5-10 jobs you trust as ground-truth.
-#   2. Copy each job_id (12-char hex) into a line below.
-#   3. Run: python scripts/build_benchmark_dataset.py
-#
-# Example:
-# 05a6607348ff
-# 31a26d4a7955
-# 2a61cb272f68
+# Autogenerado por select_gold_jobs.py — jobs 'done' con
+# correcciones reales de operador (ground truth de timing+texto).
+# Filtro: tenant LIKE 'universal%', >= 3 saves.
+84440df94df9
+57814c54fdc9
+17d857ab24f5
+01e452783581
+2690c1d699a1
+1cfdfee59eed
+9c72bd374af1
+27bc6e2455aa
+23871b28b3cd
+0a26d9c961fd
+573afcaca060
+577757ff361a
+6a70da925814
+a3db7521fbd9
+ca46bc063dca
+8b4b54d73784
+153371be6a2c
+c82845438979
+6228e04dfca6
+a83f45ffdd6d
+19c2169d1f2e
+cca0b10dafe8
+953265aef19a
+2102307ec05f
+0ec7c96719d8
+695b90842e64
+3d37e9b24c34
+c82d07650efc
+40a04e6ff6cf
+e4d0b0bc3ea1
+c6d332ffe921
+905594c251dd
+2a49a49577ca
+2496d36fb72a
+6a893403f8ea
+bd1726340d03
+52ca16bf9f4a
+f5e536885fa1
+e990fe8df4e9
+f8ef84ac0cc0
