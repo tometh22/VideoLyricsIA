@@ -104,6 +104,11 @@ async function withRetry(fn, { maxAttempts = 6, baseMs = 1000 } = {}) {
       return await fn(attempt);
     } catch (err) {
       if (err.aborted) throw err;
+      // Fail-fast en errores no-reintentables de NUESTRA API (apiPost
+      // adjunta .status): 401 = sesión muerta (reintentar 6 veces solo
+      // demoraba ~46 s el logout), 404 = job reapeado/superseded, 403 =
+      // prohibido. Los errores de red y 5xx siguen reintentando.
+      if (err.status === 401 || err.status === 403 || err.status === 404) throw err;
       lastErr = err;
       if (attempt === maxAttempts - 1) break;
       const wait = baseMs * Math.pow(2, attempt);
