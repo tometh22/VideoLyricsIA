@@ -4684,7 +4684,7 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             # cascada (ya con lead) pasan intactos.
             import lead_in as _lead_in
             result = dict(result)
-            result["segments"] = _lead_in.apply(retimed)
+            result["segments"] = _lead_in.polish(retimed)
             from jobs import set_timing_source
             from timing_sources import CTC_ALIGN
             set_timing_source(job_id, CTC_ALIGN)
@@ -4782,7 +4782,7 @@ async def _run_transcription_for_job(
         import lead_in as _lead_in
         from whisperx_transcribe import _split_long_segments as _split_long
         def _snap(segs):
-            return _lead_in.apply(
+            return _lead_in.polish(
                 _chorus_trim.mark_repetitions(
                     _beat_snap.apply(tmp_path,
                         _split_long(segs)
