@@ -95,6 +95,16 @@ _AWAITING_UPLOAD_TTL_MIN = int(os.environ.get(
     "REAPER_AWAITING_UPLOAD_TTL_MIN", "20",
 ))
 
+# Cada cuánto correr el sweep de multiparts huérfanos en R2. El pass del
+# reaper es cada 5 min; listar multiparts en cada pass sería ruido — los
+# huérfanos se acumulan lento (complete fallido, abort ignorado,
+# supersede mid-upload) y el umbral de edad del sweep es 24 h, así que
+# 6 h de cadencia alcanza de sobra.
+_MULTIPART_SWEEP_INTERVAL_S = int(os.environ.get(
+    "REAPER_MULTIPART_SWEEP_INTERVAL_S", str(6 * 3600),
+))
+_last_multipart_sweep_ts = 0.0
+
 # Edit-request abandon threshold. The worst case is a background edit
 # which re-runs Veo (~3 min p99) plus the full video composite (~5-8 min
 # for a 4-min song). 30 min gives 2-3× headroom over the slowest healthy
@@ -1069,6 +1079,22 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
         # never reaped while the upload sweep kept logging success — a
         # batch failure swallowing the transcribed cleanup. Per-job
         # isolation + a logged reason prevents the silent pile-up.
+        # Sweep de multiparts huérfanos en R2 (throttled). Corre acá
+        # adentro porque reap_all_stuck ya coordina multi-replica con el
+        # advisory lock — sin esto, N replicas listarían/abortarían en
+        # paralelo. La operación es idempotente igual (abort de un
+        # upload ya abortado falla inofensivo), el lock solo evita ruido.
+        global _last_multipart_sweep_ts
+        if time.time() - _last_multipart_sweep_ts >= _MULTIPART_SWEEP_INTERVAL_S:
+            _last_multipart_sweep_ts = time.time()
+            try:
+                import storage as _storage_sweep
+                _rep = _storage_sweep.abort_stale_multipart_uploads()
+                if _rep.get("scanned") or _rep.get("aborted"):
+                    logger.info("[REAPER] stale multipart sweep: %s", _rep)
+            except Exception as e:
+                logger.warning("[REAPER] stale multipart sweep failed: %s", e)
+
         _n_tr = _n_up = _n_ed = 0
         for job in abandoned:
             try:
