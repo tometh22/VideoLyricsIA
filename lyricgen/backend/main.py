@@ -3899,6 +3899,7 @@ async def transcribe_uploaded(
         _result = await _maybe_ctc_retime(_result, audio_path, job_id,
                                           job_row.artist or "",
                                           job_row.song_title or "")
+        _result = await _maybe_adlib_filter(_result, audio_path, job_id)
         from lyrics_format import format_lyrics_pass as _fmt
         return await _fmt(_result, language=body.language or "es")
     finally:
@@ -4558,11 +4559,70 @@ async def transcribe_endpoint(
         filename=file.filename,
     )
     _result = await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
+    _result = await _maybe_adlib_filter(_result, audio_path, job_id)
     from lyrics_format import format_lyrics_pass as _fmt
     return await _fmt(_result, language=language or "es")
 
 
 from ctc_cascade_veto import _ctc_cascade_veto  # noqa: E402
+
+
+async def _maybe_adlib_filter(result, audio_path: str, job_id: str):
+    """Paso post-cascada (gate ADLIB_CONSENSUS_ENABLED, default off): descarta
+    líneas fantasma alucinadas en zonas de ad-lib y colapsa los 'uh'
+    fragmentados. Corre en TODOS los caminos de la cascada (whisperx,
+    reconcile, CTC, scaffold) — a diferencia del retime de CTC, que solo
+    actúa en su rama. Así el output queda limpio sin importar qué
+    segmentación produjo la cascada (que es no-determinista por la
+    variabilidad de whisperX en Replicate).
+
+    No-op verdadero en canciones sin ad-libs (cero candidatas → cero
+    regresión, verificado en 12 UMG gold). Never raises: ante cualquier
+    fallo devuelve el result intacto. Consigue el stem del cache R2 (la
+    cascada lo dejó ahí); si no está y no se puede computar, declina."""
+    if not isinstance(result, dict):
+        return result
+    if os.environ.get("ADLIB_CONSENSUS_ENABLED", "0").strip().lower() \
+            not in ("1", "true", "yes", "on"):
+        return result
+    segs = result.get("segments") or []
+    if len(segs) < 3:
+        return result
+    _stem = None
+    try:
+        import adlib_consensus as _ac
+        # Barato primero: ¿hay ad-libs? Sin ellos, ni tocamos el stem.
+        if not any(_ac.is_adlib_text(s.get("text", "")) for s in segs):
+            return result
+        import vocal_sep as _vs
+        _stem = await asyncio.wait_for(
+            asyncio.to_thread(_vs.separate_vocals, audio_path, cache_only=True),
+            timeout=120,
+        )
+        if not _stem and os.environ.get(
+                "CTC_ALIGN_COMPUTE_STEM", "1").strip().lower() in ("1", "true", "yes", "on"):
+            _stem = await asyncio.wait_for(
+                asyncio.to_thread(_vs.separate_vocals, audio_path), timeout=360)
+        if not _stem:
+            logger.info("[ADLIB] sin stem — omito el filtro (job=%s)", job_id)
+            return result
+        _tw = _make_stem_window_transcriber(_stem)
+        _before = len(segs)
+        filtered = await asyncio.to_thread(_ac.filter_and_collapse, segs, _tw)
+        if filtered != segs:
+            result = dict(result)
+            result["segments"] = filtered
+            logger.info("[ADLIB] consenso: %d → %d líneas (job=%s)",
+                        _before, len(filtered), job_id)
+    except Exception as e:
+        logger.warning("[ADLIB] filtro post-cascada declinó: %r (job=%s)", e, job_id)
+    finally:
+        if _stem:
+            try:
+                os.unlink(_stem)
+            except OSError:
+                pass
+    return result
 
 
 def _make_stem_window_transcriber(stem_path: str):
@@ -4733,27 +4793,11 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             # ambas mejoras se anulaban entre sí. No hay doble
             # aplicación: en el camino de declive los segmentos de la
             # cascada (ya con lead) pasan intactos.
+            # El filtro de ad-libs se mudó a _maybe_adlib_filter (paso
+            # post-cascada, corre en TODOS los caminos — no solo cuando CTC
+            # retima). Acá solo re-aplicamos el lead-in sobre los onsets
+            # frescos de CTC (#801).
             import lead_in as _lead_in
-            # Filtro de fantasmas por consenso acústico (Fase 2, gate
-            # ADLIB_CONSENSUS_ENABLED, default off). Solo actúa en líneas de
-            # contenido pegadas a zonas de "uh" (candidatas): descarta las
-            # que el stem de voz NO confirma y no tienen respaldo de coro.
-            # Corre ANTES del polish para que el lead/hold se apliquen sobre
-            # la lista ya limpia. Usa el _stem (voz aislada) ya en disco.
-            if (_stem and os.path.exists(_stem)
-                    and os.environ.get("ADLIB_CONSENSUS_ENABLED", "0").strip().lower()
-                    in ("1", "true", "yes", "on")):
-                try:
-                    import adlib_consensus as _ac
-                    _tw = _make_stem_window_transcriber(_stem)
-                    _before = len(retimed)
-                    retimed = await asyncio.to_thread(
-                        _ac.filter_and_collapse, retimed, _tw)
-                    if len(retimed) != _before:
-                        logger.info("[ADLIB] consenso: %d → %d líneas (job=%s)",
-                                    _before, len(retimed), job_id)
-                except Exception as _ace:
-                    logger.warning("[ADLIB] consenso declinó: %s (job=%s)", _ace, job_id)
             result = dict(result)
             result["segments"] = _lead_in.polish(retimed)
             from jobs import set_timing_source

@@ -134,8 +134,27 @@ def find_candidates(segs: list[dict]) -> list[int]:
     return out
 
 
+# Duración máxima de una línea de ad-lib fundida. Un run largo (p.ej. 38 s
+# de "uh" fragmentado en 12 líneas) se parte en bloques de a lo sumo esto —
+# un subtítulo único de 38 s es impresentable. Estilo ROTOR: la sección de
+# uh queda en 3-5 bloques, no en 1 gigante ni en 12 fragmentos.
+MAX_ADLIB_LINE_S = 9.0
+
+
+def _merge(segs: list[dict], run: list[int]) -> dict:
+    """Funde un sub-run de ad-libs en una línea. El texto es el MÁS LARGO
+    del sub-run (no un 'Uh…' hardcodeado): 'uh uh uh' queda 'uh uh uh' y un
+    'na na na' legítimo queda 'na na na' — une fragmentos, no reescribe."""
+    a, b = segs[run[0]], segs[run[-1]]
+    merged = {**a, "end": b.get("end", a.get("end"))}
+    if len(run) > 1:
+        merged["text"] = max((segs[r].get("text", "") for r in run), key=len)
+    return merged
+
+
 def _collapse_runs(segs: list[dict], drop: set) -> list[dict]:
-    """Salta las fantasmas y funde runs de ad-lib consecutivos en una línea."""
+    """Salta las fantasmas y funde runs de ad-lib consecutivos, con tope de
+    duración por línea (MAX_ADLIB_LINE_S)."""
     tags = [is_adlib_text(s.get("text", "")) for s in segs]
     kept = [i for i in range(len(segs)) if i not in drop]
     out: list[dict] = []
@@ -148,8 +167,16 @@ def _collapse_runs(segs: list[dict], drop: set) -> list[dict]:
             while j < len(kept) and tags[kept[j]]:
                 run.append(kept[j])
                 j += 1
-            a, b = segs[run[0]], segs[run[-1]]
-            out.append({**a, "end": b.get("end", a.get("end")), "text": "Uh, uh, uh…"})
+            # partir el run en sub-bloques de <= MAX_ADLIB_LINE_S, en los
+            # límites de las líneas originales.
+            sub = [run[0]]
+            for r in run[1:]:
+                if segs[r].get("end", 0) - segs[sub[0]].get("start", 0) > MAX_ADLIB_LINE_S:
+                    out.append(_merge(segs, sub))
+                    sub = [r]
+                else:
+                    sub.append(r)
+            out.append(_merge(segs, sub))
         else:
             out.append(segs[k])
             j += 1
@@ -166,11 +193,11 @@ def filter_and_collapse(segs: list[dict], transcribe_window,
     if not segs:
         return segs
     try:
-        cands = find_candidates(segs)
-        if not cands:
-            # sin ad-libs: solo colapsar (no hay nada que colapsar tampoco) y
-            # devolver tal cual — no-op garantizado.
+        # No-op verdadero SOLO si la canción no tiene NINGÚN ad-lib: sin uh no
+        # hay nada que colapsar ni candidatas que filtrar → cero regresión.
+        if not any(is_adlib_text(s.get("text", "")) for s in segs):
             return list(segs)
+        cands = find_candidates(segs)
         choruses = chorus_keys(segs)
         drop = set()
         for i in cands:
