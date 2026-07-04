@@ -99,3 +99,23 @@ def test_transcribe_error_keeps_line():
         raise RuntimeError("whisper caído")
     out = ac.filter_and_collapse(segs, boom)
     assert any(s["text"] == "línea dudosa" for s in out)
+
+
+def test_collapse_caps_long_adlib_runs():
+    """Un run de 'uh' largo (fragmentado por whisper) se parte en bloques
+    de <= MAX_ADLIB_LINE_S en vez de un subtítulo gigante."""
+    # 12 líneas de uh de 3.2s = ~38s → debe partirse en varios bloques
+    segs = [{"text": "Uh, uh, uh,", "start": round(70 + i * 3.2, 1),
+             "end": round(70 + (i + 1) * 3.2, 1)} for i in range(12)]
+    out = ac.filter_and_collapse(segs, lambda a, b: "")
+    assert all(s["end"] - s["start"] <= ac.MAX_ADLIB_LINE_S + 3.3 for s in out)
+    assert len(out) >= 4                     # no un único bloque de 38s
+    assert all(ac.is_adlib_text(s["text"]) for s in out)
+
+
+def test_collapse_preserves_adlib_text():
+    """El colapso conserva la vocalización (no la reescribe a 'Uh…')."""
+    segs = [{"text": "Na na na", "start": 0, "end": 2},
+            {"text": "Na na na", "start": 2, "end": 4}]
+    out = ac.filter_and_collapse(segs, lambda a, b: "")
+    assert len(out) == 1 and "na na na" in out[0]["text"].lower()
