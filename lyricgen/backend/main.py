@@ -4565,6 +4565,42 @@ async def transcribe_endpoint(
 from ctc_cascade_veto import _ctc_cascade_veto  # noqa: E402
 
 
+def _make_stem_window_transcriber(stem_path: str):
+    """Devuelve transcribe_window(start, end) -> str: recorta esa ventana del
+    stem de voz y la transcribe con whisper-1. Para el filtro de consenso
+    (adlib_consensus): solo se llama en líneas candidatas (pocas por canción).
+    Recorta con un pad chico y compensa el lead-in para caer sobre el onset
+    real. Devuelve '' ante cualquier problema (el filtro conserva la línea)."""
+    import subprocess
+    import tempfile
+
+    def _transcribe_window(start: float, end: float) -> str:
+        a = max(0.0, float(start) + 0.4 - 0.25)   # +0.4 deshace el lead; -0.25 pad
+        dur = max(1.8, float(end) - float(start) + 0.3)
+        fd, clip = tempfile.mkstemp(suffix=".wav", prefix="genly_adlib_")
+        os.close(fd)
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", stem_path,
+                 "-ss", str(a), "-t", str(dur), clip],
+                check=True, timeout=30,
+            )
+            from pipeline import _transcribe_via_openai_api as _wx
+            segs = _wx(clip, language="es") or []
+            return " ".join((s.get("text") or "").strip() for s in segs).strip()
+        except Exception as e:
+            logger.warning("[ADLIB] window %.1f-%.1f transcribe failed: %s",
+                           start, end, e)
+            return ""
+        finally:
+            try:
+                os.unlink(clip)
+            except OSError:
+                pass
+
+    return _transcribe_window
+
+
 async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
                             artist: str = "", title: str = ""):
     """Gated post-pass over the cascade's FINAL output (CTC_ALIGN_ENABLED,
@@ -4698,6 +4734,26 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             # aplicación: en el camino de declive los segmentos de la
             # cascada (ya con lead) pasan intactos.
             import lead_in as _lead_in
+            # Filtro de fantasmas por consenso acústico (Fase 2, gate
+            # ADLIB_CONSENSUS_ENABLED, default off). Solo actúa en líneas de
+            # contenido pegadas a zonas de "uh" (candidatas): descarta las
+            # que el stem de voz NO confirma y no tienen respaldo de coro.
+            # Corre ANTES del polish para que el lead/hold se apliquen sobre
+            # la lista ya limpia. Usa el _stem (voz aislada) ya en disco.
+            if (_stem and os.path.exists(_stem)
+                    and os.environ.get("ADLIB_CONSENSUS_ENABLED", "0").strip().lower()
+                    in ("1", "true", "yes", "on")):
+                try:
+                    import adlib_consensus as _ac
+                    _tw = _make_stem_window_transcriber(_stem)
+                    _before = len(retimed)
+                    retimed = await asyncio.to_thread(
+                        _ac.filter_and_collapse, retimed, _tw)
+                    if len(retimed) != _before:
+                        logger.info("[ADLIB] consenso: %d → %d líneas (job=%s)",
+                                    _before, len(retimed), job_id)
+                except Exception as _ace:
+                    logger.warning("[ADLIB] consenso declinó: %s (job=%s)", _ace, job_id)
             result = dict(result)
             result["segments"] = _lead_in.polish(retimed)
             from jobs import set_timing_source
