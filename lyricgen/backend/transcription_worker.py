@@ -63,7 +63,9 @@ def run_transcription_job(
     # Lazy import — main.py es pesado y el worker no debería pagarlo si
     # corre otros queues. asyncio.run abre/cierra su propio event loop por job,
     # que es lo que queremos (jobs independientes, sin event-loop leak).
-    from main import _maybe_ctc_retime, _run_transcription_for_job  # type: ignore
+    from main import (  # type: ignore
+        _maybe_ctc_retime, _maybe_adlib_filter, _run_transcription_for_job,
+    )
     from jobs import update_job, get_job
     import storage
 
@@ -106,10 +108,17 @@ def run_transcription_job(
                 None, None, job_id, audio_path,
                 language=language, artist=artist, title=title, filename=filename,
             )
-            # Gated CTC re-time post-pass (CTC_ALIGN_ENABLED, default OFF);
-            # no-op passthrough when the flag is off. Same wrapper the HTTP
-            # call sites use — keeps the three entry points in lockstep.
+            # Post-pases gateados, en lockstep con los dos endpoints HTTP
+            # (/transcribe y /transcribe-uploaded). ESTE es el camino que
+            # usa el frontend real (enqueue → ShortWorker), así que si acá
+            # falta un wrapper, el usuario NO lo recibe aunque los endpoints
+            # sí lo tengan (bug 05/07: el filtro de ad-libs estaba en los
+            # endpoints pero no acá → los 'uh' salían fragmentados en prod).
+            #   1. CTC re-time (CTC_ALIGN_ENABLED, default off)
+            #   2. filtro de fantasmas + colapso de ad-libs (ADLIB_CONSENSUS_
+            #      ENABLED, default off) — corre aunque CTC declinó.
             r = await _maybe_ctc_retime(r, audio_path, job_id, artist, title)
+            r = await _maybe_adlib_filter(r, audio_path, job_id)
             from lyrics_format import format_lyrics_pass as _fmt
             return await _fmt(r, language=language or "es")
 
