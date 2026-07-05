@@ -747,6 +747,31 @@ def _emissions(model, wav, blank_id: int, star_delta: float):
 last_decline_reason = ""
 
 
+def structural_skip_verdict(lines, skipped_lines, max_skip_frac):
+    """¿Declinar por mismatch estructural? Pura, unit-testeable.
+
+    El skip-fraction detecta letra de OTRA versión (versos/coros extra que
+    el texto no lista → el Viterbi salta líneas léxicas). Pero las líneas
+    de ad-lib ('uh uh uh') son vocalizaciones sostenidas que CTC no puede
+    anclar por diseño — su skip es ESPERADO, no un mismatch. Contarlas
+    inflaba el ratio y hacía declinar falsamente a CTC en canciones con
+    secciones grandes de uh (Amanda Pujó, 05/07: whisperX fragmentó el uh
+    en 13 líneas → 13 skips → >10% → decline falso, con la letra REAL
+    alineando perfecto). Medimos solo sobre las líneas LÉXICAS.
+
+    Returns (declinar: bool, lex_skipped, lex_total, n_adlib).
+    """
+    try:
+        from adlib_consensus import is_adlib_text as _is_adlib
+        adlib_idx = {i for i, ln in enumerate(lines) if _is_adlib(ln)}
+    except Exception:
+        adlib_idx = set()
+    lex_total = len(lines) - len(adlib_idx)
+    lex_skipped = len(set(skipped_lines) - adlib_idx)
+    declinar = lex_total > 0 and lex_skipped / lex_total > max_skip_frac
+    return declinar, lex_skipped, lex_total, len(adlib_idx)
+
+
 def retime_segments(audio_path: str, segments: list[dict],
                     job_id: str = "",
                     mix_path: Optional[str] = None,
@@ -980,11 +1005,12 @@ def retime_segments(audio_path: str, segments: list[dict],
         # (Etapa A: ASR of the actual live + reference orthography).
         if max_skip_frac is None:
             max_skip_frac = float(os.environ.get("CTC_ALIGN_MAX_SKIP_FRAC", "0.10"))
-        if len(skipped_lines) / max(len(lines), 1) > max_skip_frac:
-            logger.warning("[CTC] decline: %d/%d lines skipped (>%.0f%%) — "
-                           "structural mismatch between text and performance "
-                           "(job=%s)", len(skipped_lines), len(lines),
-                           100 * max_skip_frac, job_id)
+        _decl, _ls, _lt, _na = structural_skip_verdict(
+            lines, skipped_lines, max_skip_frac)
+        if _decl:
+            logger.warning("[CTC] decline: %d/%d líneas léxicas skipped (>%.0f%%; "
+                           "%d ad-libs excluidos) — mismatch estructural (job=%s)",
+                           _ls, _lt, 100 * max_skip_frac, _na, job_id)
             last_decline_reason = "structural"
             return None
 

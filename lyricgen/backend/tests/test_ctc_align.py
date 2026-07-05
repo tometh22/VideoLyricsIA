@@ -418,3 +418,35 @@ def test_finalize_line_recovered_tags_mix():
                         [("x", 5.0, 6.0, 0.5)], None,
                         skipped=False, recovered=True)
     assert out["ctc_recovered"] == "mix"
+
+
+# ── structural_skip_verdict: ad-libs no cuentan (Amanda Pujó, 05/07) ─────────
+
+def test_structural_verdict_ignores_adlib_skips():
+    """13 líneas de 'uh' salteadas NO deben hacer declinar: son
+    vocalizaciones que CTC no ancla por diseño, no un mismatch estructural."""
+    from ctc_align import structural_skip_verdict
+    lines = ["Verso uno", "Verso dos"] + ["Uh, uh, uh"] * 13 + ["Verso tres"]
+    skipped = set(range(2, 15))          # los 13 uh salteados
+    decl, lex_sk, lex_tot, n_ad = structural_skip_verdict(lines, skipped, 0.10)
+    assert not decl                      # 0 léxicas salteadas → NO declina
+    assert (lex_sk, lex_tot, n_ad) == (0, 3, 13)
+
+
+def test_structural_verdict_still_catches_real_mismatch():
+    """Letra de otra versión: líneas LÉXICAS salteadas → sí declina."""
+    from ctc_align import structural_skip_verdict
+    lines = [f"línea real {i}" for i in range(10)]
+    skipped = {0, 1, 2}                   # 3/10 léxicas = 30% > 10%
+    decl, lex_sk, lex_tot, _ = structural_skip_verdict(lines, skipped, 0.10)
+    assert decl and (lex_sk, lex_tot) == (3, 10)
+
+
+def test_structural_verdict_mixed():
+    """Coro de uh + una línea léxica mal: la léxica sola no supera el 10%."""
+    from ctc_align import structural_skip_verdict
+    lines = [f"línea {i}" for i in range(20)] + ["Uh, uh"] * 10
+    skipped = {5} | set(range(20, 30))   # 1 léxica + 10 uh
+    decl, lex_sk, lex_tot, n_ad = structural_skip_verdict(lines, skipped, 0.10)
+    assert not decl                      # 1/20 = 5% < 10%
+    assert (lex_sk, lex_tot, n_ad) == (1, 20, 10)
