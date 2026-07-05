@@ -6,6 +6,7 @@ import HelpTip from "./HelpCenter/HelpTip";
 import LyricsTimeline from "./LyricsTimeline";
 import LyricVideoPreview from "./LyricVideoPreview";
 import { tierForLength } from "../lib/lyricTiers";
+import { activeWordIndex } from "../lib/karaokeTiming";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
 import { segmentsValuesEqual } from "../lib/segmentsValuesEqual";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
@@ -794,7 +795,7 @@ export default function LyricsEditor({
             if (ct >= s.start) active = s;
           }
           if (active) {
-            onPlaybackTick(active.text || "", active.start, active.end, ct);
+            onPlaybackTick(active.text || "", active.start, active.end, ct, active.words);
           } else {
             onPlaybackTick("", 0, 0, ct);
           }
@@ -3154,17 +3155,14 @@ export default function LyricsEditor({
                         activo Y el operador no está editando. Las palabras
                         se renderizan como spans con scale + glow en la
                         palabra activa, dim en las futuras, neutral en las
-                        ya pasadas. La duración de cada palabra es
-                        uniforme (seg duration / N) — suficientemente
-                        cercano al avance real para que se sienta vivo. */}
+                        ya pasadas. El avance usa los word-stamps REALES
+                        (activeWordIndex) cuando existen — con el lead-in
+                        (#801) la línea aparece 0.4s antes del canto y el
+                        viejo reparto uniforme corría adelantado. */}
                     {isActive && focusedSegId !== seg._id && seg.text && (() => {
                       const words = seg.text.split(/(\s+)/);
-                      const wordsOnly = words.filter((w) => /\S/.test(w));
-                      const N = wordsOnly.length;
-                      const duration = Math.max(0.001, seg.end - seg.start);
-                      const wDur = duration / Math.max(1, N);
-                      const elapsed = Math.max(0, currentTime - seg.start);
-                      const activeWordIdx = Math.min(N - 1, Math.max(0, Math.floor(elapsed / wDur)));
+                      const activeWordIdx = activeWordIndex(
+                        seg.text, seg.words, seg.start, seg.end, currentTime);
                       let nonSpaceIdx = -1;
                       return (
                         <div
