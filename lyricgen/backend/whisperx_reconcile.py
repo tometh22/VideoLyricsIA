@@ -104,6 +104,13 @@ def reconcile(wx_segs: list[dict],
     return out
 
 
+# Umbral de recuperación de coros sub-listados: un segmento no-matcheado
+# cuyo texto suena >= esto a UNA línea de la referencia se corrige a esa
+# línea (repara misheards de repeticiones que la letra no lista). Alto
+# para no reescribir líneas únicas legítimas.
+RECOVER_PHON_MIN = 0.72
+
+
 def text_correct_segments(audio_segs: list[dict],
                           reference_text: str,
                           *, min_match: float = 0.60) -> list[dict]:
@@ -212,7 +219,7 @@ def text_correct_segments(audio_segs: list[dict],
         elif a is not None:
             matched_refs.add(a)
     out: list[dict] = []
-    n_swapped = n_filled = n_split = 0
+    n_swapped = n_filled = n_split = n_recovered = 0
     last_ref = -1
     for idx, s in enumerate(audio_segs):
         j = assign[idx]
@@ -236,6 +243,28 @@ def text_correct_segments(audio_segs: list[dict],
             last_ref = j
             continue
         if (s.get("text") or "").strip():
+            # Recuperación de coros sub-listados (Amanda Pujó, 05/07): la
+            # referencia lista el coro 2× pero la canción lo canta 3×; la
+            # 3ª ocurrencia queda sin línea de referencia libre y el DP la
+            # deja COMO-OÍDA (mishear "Frágiles vientos de vos" en vez de
+            # "frágil espejo de vos", que suena 0.81 fonético). Si el
+            # segmento suena casi idéntico a ALGUNA línea de la referencia
+            # (usada o no), corregir el TEXTO a esa línea — no fabrica
+            # nada, repara un mishear de una línea que SÍ está en la letra.
+            # Umbral alto para no pisar líneas únicas legítimas; excluye
+            # ad-libs (su fonética contra la letra es baja de por sí).
+            best_j, best_sc = None, RECOVER_PHON_MIN
+            for rj in range(m):
+                sc = _phonetic_ratio(seg_pho[idx], ref_pho[rj])
+                if sc > best_sc:
+                    best_sc, best_j = sc, rj
+            if best_j is not None:
+                seg = dict(s)
+                seg["text"] = ref_lines[best_j]
+                seg["review"] = True
+                out.append(seg)
+                n_recovered += 1
+                continue
             out.append(dict(s))   # ad-lib / unmatched-but-real text → keep as-heard
             continue
         # blank segment: name it from the next genuinely-skipped reference line
@@ -250,9 +279,9 @@ def text_correct_segments(audio_segs: list[dict],
         # else: drop the empty segment
 
     logger.info(
-        "[TEXT-CORRECT] %s corrected (%s split in two), %s blanks named "
-        "from reference, %s segs out",
-        n_swapped, n_split, n_filled, len(out),
+        "[TEXT-CORRECT] %s corrected (%s split, %s chorus-recovered), "
+        "%s blanks named, %s segs out",
+        n_swapped, n_split, n_recovered, n_filled, len(out),
     )
     return out
 

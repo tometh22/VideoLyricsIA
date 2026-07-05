@@ -195,3 +195,34 @@ def test_single_line_match_not_split_on_tie():
     out = text_correct_segments(segs, REF_SANTOS)
     assert len(out) == 1
     assert out[0]["text"] == "para qué para qué tus santos de papel"
+
+
+def test_chorus_recovery_undersLISTED_repeats():
+    """Coro sub-listado (Amanda Pujó, 05/07): la referencia lista el couplet
+    2× pero la canción lo canta 3×; la 3ª ocurrencia llega como mishear
+    ('Frágiles vientos de vos') sin línea de referencia libre → se recupera
+    a la línea que suena casi idéntica ('frágil espejo de vos')."""
+    from whisperx_reconcile import text_correct_segments
+    ref = ("Tomás del miedo tu don\nfrágil espejo de vos\n"
+           "tomás del miedo tu don\nfrágil espejo de vos\n"
+           "para qué para qué no hay santos")
+    segs = [
+        {"text": "Tomás del miedo tu don", "start": 102, "end": 106},
+        {"text": "frágil espejo de vos", "start": 110, "end": 116},
+        {"text": "Tomás del miedo tu don", "start": 118, "end": 121},
+        {"text": "Frágiles vientos de vos", "start": 128, "end": 133},  # mishear
+    ]
+    out = text_correct_segments(segs, ref)
+    texts = [s["text"].lower() for s in out]
+    assert not any("vientos" in t for t in texts)          # el mishear se fue
+    assert texts.count("frágil espejo de vos") == 2        # recuperado como coro
+
+
+def test_chorus_recovery_ignores_unrelated_lines():
+    """Una línea única que NO suena a ninguna referencia se conserva
+    como-oída (el recovery no reescribe líneas legítimas distintas)."""
+    from whisperx_reconcile import text_correct_segments
+    ref = "hola mundo cruel\nadiós para siempre amor\nque nadie te lastime"
+    segs = [{"text": "esto es totalmente distinto xyz", "start": 0, "end": 3}]
+    out = text_correct_segments(segs, ref)
+    assert out[0]["text"] == "esto es totalmente distinto xyz"
