@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import { REF_W, tierForLength, fontSizeFactor } from "../lib/lyricTiers";
+import { activeWordIndex } from "../lib/karaokeTiming";
 import { FONT_BY_CODE, applyCase } from "./fontCatalog";
 
 // Studio Console live preview. Shows a sample lyric line over the selected
@@ -329,12 +330,12 @@ export default function WizardLivePreview({
       // plain-text branch below — the line-level animation runs on the
       // wrapper instead.
       const tokens = segText.split(/(\s+)/);
-      const wordsOnly = tokens.filter((tok) => /\S/.test(tok));
-      const N = wordsOnly.length;
-      const dur = Math.max(0.001, segEnd - segStart);
-      const wDur = dur / Math.max(1, N);
-      const elapsed = Math.max(0, ct - segStart);
-      const activeWordIdx = Math.min(N - 1, Math.max(0, Math.floor(elapsed / wDur)));
+      // Word-stamps reales cuando el tick los trae (activeWordIndex valida
+      // 1:1 contra los tokens); fallback al reparto uniforme. Con el
+      // lead-in (#801) la línea aparece 0.4s antes del canto — el reparto
+      // uniforme solo corría adelantado ("karaoke a destiempo", 05/07).
+      const activeWordIdx = activeWordIndex(
+        segText, liveActive.words, segStart, segEnd, ct);
       let nonSpaceIdx = -1;
       lyricContent = tokens.map((tok, i) => {
         if (!/\S/.test(tok)) return <span key={i}>{tok}</span>;
