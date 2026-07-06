@@ -4591,24 +4591,56 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str):
     _stem = None
     try:
         import adlib_consensus as _ac
-        # Barato primero: ¿hay ad-libs? Sin ellos, ni tocamos el stem.
-        if not any(_ac.is_adlib_text(s.get("text", "")) for s in segs):
+        _has_adlib = any(_ac.is_adlib_text(s.get("text", "")) for s in segs)
+        _tail_on = os.environ.get("ADLIB_TAIL_CHECK_ENABLED", "1") \
+            .strip().lower() in ("1", "true", "yes", "on")
+        # Barato primero: sin ad-libs Y sin chequeo de cola, ni tocamos
+        # el stem.
+        if not _has_adlib and not _tail_on:
             return result
         import vocal_sep as _vs
         _stem = await asyncio.wait_for(
             asyncio.to_thread(_vs.separate_vocals, audio_path, cache_only=True),
             timeout=120,
         )
-        if not _stem and os.environ.get(
+        # Computar el stem solo si hay ad-libs (el camino histórico). Para
+        # el chequeo de cola solo, un cache miss no justifica Demucs.
+        if not _stem and _has_adlib and os.environ.get(
                 "CTC_ALIGN_COMPUTE_STEM", "1").strip().lower() in ("1", "true", "yes", "on"):
             _stem = await asyncio.wait_for(
                 asyncio.to_thread(_vs.separate_vocals, audio_path), timeout=360)
         if not _stem:
             logger.info("[ADLIB] sin stem — omito el filtro (job=%s)", job_id)
             return result
+        # Cola muda: fin del último canto según VAD de energía del stem.
+        # Caso El Riesgo (05/07): lrclib trajo la letra de otra edición con
+        # un outro cantado que este audio no tiene; el scaffold puso esas
+        # líneas sobre 76s de música instrumental. Si la cola muda es larga
+        # (>10s), las líneas que caen ahí se verifican acústicamente.
+        _tail_after = None
+        if _tail_on:
+            try:
+                from anchor_align import vocal_regions as _vr
+                _regs = await asyncio.to_thread(_vr, _stem)
+                if _regs:
+                    _last_voice = _regs[-1][1]
+                    _last_line_end = max(
+                        (float(s.get("end", 0)) for s in segs), default=0.0)
+                    if _last_line_end - _last_voice > 10.0:
+                        _tail_after = _last_voice
+                        logger.info(
+                            "[ADLIB] cola muda: voz hasta %.1fs, líneas hasta "
+                            "%.1fs — verificando la cola (job=%s)",
+                            _last_voice, _last_line_end, job_id)
+            except Exception as e:
+                logger.warning("[ADLIB] VAD de cola falló: %r — sin chequeo "
+                               "de cola (job=%s)", e, job_id)
+        if not _has_adlib and _tail_after is None:
+            return result
         _tw = _make_stem_window_transcriber(_stem)
         _before = len(segs)
-        filtered = await asyncio.to_thread(_ac.filter_and_collapse, segs, _tw)
+        filtered = await asyncio.to_thread(
+            _ac.filter_and_collapse, segs, _tw, tail_after=_tail_after)
         if filtered != segs:
             result = dict(result)
             result["segments"] = filtered
