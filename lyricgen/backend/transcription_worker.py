@@ -47,6 +47,7 @@ def run_transcription_job(
     artist: str = "",
     title: str = "",
     filename: str = "",
+    live: bool = False,
 ) -> dict:
     """RQ entry point — sync wrapper around `_run_transcription_for_job`.
 
@@ -64,7 +65,8 @@ def run_transcription_job(
     # corre otros queues. asyncio.run abre/cierra su propio event loop por job,
     # que es lo que queremos (jobs independientes, sin event-loop leak).
     from main import (  # type: ignore
-        _maybe_ctc_retime, _maybe_adlib_filter, _run_transcription_for_job,
+        _looks_live, _maybe_ctc_retime, _maybe_adlib_filter,
+        _run_transcription_for_job,
     )
     from jobs import update_job, get_job
     import storage
@@ -118,7 +120,9 @@ def run_transcription_job(
             #   2. filtro de fantasmas + colapso de ad-libs (ADLIB_CONSENSUS_
             #      ENABLED, default off) — corre aunque CTC declinó.
             r = await _maybe_ctc_retime(r, audio_path, job_id, artist, title)
-            r = await _maybe_adlib_filter(r, audio_path, job_id)
+            r = await _maybe_adlib_filter(
+                r, audio_path, job_id,
+                live_hint=live or _looks_live(title, filename))
             from lyrics_format import format_lyrics_pass as _fmt
             return await _fmt(r, language=language or "es")
 

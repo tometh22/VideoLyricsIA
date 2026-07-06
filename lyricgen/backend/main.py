@@ -3711,6 +3711,9 @@ async def upload_multipart_abort(
 class _TranscribeUploadedReq(BaseModel):
     job_id: str = Field(..., max_length=12)
     language: str = Field(default="", max_length=16)
+    # Toggle del operador: "es una versión en vivo" — arma la auditoría de
+    # sufijo aunque el título no tenga marcador live (06/07).
+    live: bool = False
     artist: str = Field(default="", max_length=255)    # DB Job.artist = VARCHAR(255)
     title: str = Field(default="", max_length=500)     # DB Job.song_title = VARCHAR(500)
 
@@ -3856,6 +3859,7 @@ async def transcribe_uploaded(
                 title=job_row.song_title or "",
                 filename=job_row.filename,
                 tenant_id=current_user.get("tenant_id", ""),
+                live=bool(body.live),
             )
         except Exception as exc:
             logger.exception("[TRANSCRIBE] enqueue failed for job=%s", job_id)
@@ -3899,7 +3903,10 @@ async def transcribe_uploaded(
         _result = await _maybe_ctc_retime(_result, audio_path, job_id,
                                           job_row.artist or "",
                                           job_row.song_title or "")
-        _result = await _maybe_adlib_filter(_result, audio_path, job_id)
+        _result = await _maybe_adlib_filter(
+            _result, audio_path, job_id,
+            live_hint=bool(getattr(body, "live", False))
+            or _looks_live(job_row.song_title, job_row.filename))
         from lyrics_format import format_lyrics_pass as _fmt
         return await _fmt(_result, language=body.language or "es")
     finally:
@@ -4559,7 +4566,8 @@ async def transcribe_endpoint(
         filename=file.filename,
     )
     _result = await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
-    _result = await _maybe_adlib_filter(_result, audio_path, job_id)
+    _result = await _maybe_adlib_filter(_result, audio_path, job_id,
+                                        live_hint=_looks_live(title, file.filename))
     from lyrics_format import format_lyrics_pass as _fmt
     return await _fmt(_result, language=language or "es")
 
@@ -4567,7 +4575,21 @@ async def transcribe_endpoint(
 from ctc_cascade_veto import _ctc_cascade_veto  # noqa: E402
 
 
-async def _maybe_adlib_filter(result, audio_path: str, job_id: str):
+_LIVE_MARKER_RE = re.compile(
+    r"\b(live|en\s+vivo|vivo|ac[uú]stic[oa]|unplugged|directo|concert|"
+    r"session(?:es)?|sesi[oó]n)\b", re.IGNORECASE)
+
+
+def _looks_live(*texts) -> bool:
+    """¿Algún texto (título/filename) sugiere una versión en vivo/alternativa?
+    Señal barata para armar la auditoría de sufijo. El catálogo etiqueta los
+    vivos en el título ('Live In Buenos Aires 2001'); para archivos sin
+    etiquetar existe el toggle del operador (body.live)."""
+    return any(t and _LIVE_MARKER_RE.search(str(t)) for t in texts)
+
+
+async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
+                              live_hint: bool = False):
     """Paso post-cascada (gate ADLIB_CONSENSUS_ENABLED, default off): descarta
     líneas fantasma alucinadas en zonas de ad-lib y colapsa los 'uh'
     fragmentados. Corre en TODOS los caminos de la cascada (whisperx,
@@ -4594,9 +4616,18 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str):
         _has_adlib = any(_ac.is_adlib_text(s.get("text", "")) for s in segs)
         _tail_on = os.environ.get("ADLIB_TAIL_CHECK_ENABLED", "1") \
             .strip().lower() in ("1", "true", "yes", "on")
-        # Barato primero: sin ad-libs Y sin chequeo de cola, ni tocamos
-        # el stem.
-        if not _has_adlib and not _tail_on:
+        # Auditoría de sufijo (Perro Amor Explota LIVE, 06/07): el final del
+        # audio es de OTRA versión (vivo↔estudio) con voz real en la cola —
+        # el VAD no lo ve. Solo se arma con live_hint (título con marcador
+        # live o toggle del operador): medido contra el gold (06/07), en
+        # canciones normales los finales quietos/en capas dan falsos
+        # positivos. Y MARCA (review), no borra — ver filter_and_collapse.
+        _audit_on = live_hint and os.environ.get(
+            "ADLIB_SUFFIX_AUDIT_ENABLED", "1") \
+            .strip().lower() in ("1", "true", "yes", "on")
+        # Barato primero: sin ad-libs y sin ningún chequeo de final, ni
+        # tocamos el stem.
+        if not _has_adlib and not _tail_on and not _audit_on:
             return result
         import vocal_sep as _vs
         _stem = await asyncio.wait_for(
@@ -4635,12 +4666,13 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str):
             except Exception as e:
                 logger.warning("[ADLIB] VAD de cola falló: %r — sin chequeo "
                                "de cola (job=%s)", e, job_id)
-        if not _has_adlib and _tail_after is None:
+        if not _has_adlib and _tail_after is None and not _audit_on:
             return result
         _tw = _make_stem_window_transcriber(_stem)
         _before = len(segs)
         filtered = await asyncio.to_thread(
-            _ac.filter_and_collapse, segs, _tw, tail_after=_tail_after)
+            _ac.filter_and_collapse, segs, _tw, tail_after=_tail_after,
+            audit_suffix=_audit_on)
         if filtered != segs:
             result = dict(result)
             result["segments"] = filtered

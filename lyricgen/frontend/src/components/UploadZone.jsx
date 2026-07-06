@@ -1725,6 +1725,27 @@ export default function UploadZone({
                   </p>
                 )}
               </div>
+              {/* Toggle "versión en vivo" (06/07): arma la auditoría
+                  acústica del final aunque el título no diga "live" —
+                  las letras publicadas suelen ser de la versión de
+                  estudio y el final del vivo difiere. Si el título ya
+                  tiene marcador live, el backend lo detecta solo. */}
+              <label className="flex items-start gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={!!entry.live}
+                  onChange={(e) => updateField(i, "live", e.target.checked)}
+                  className="mt-0.5 accent-brand"
+                />
+                <span>
+                  <span className="text-[12px] text-gray-300 font-medium">
+                    {t("upload.live_version") || "Versión en vivo"}
+                  </span>
+                  <span className="block text-[11px] text-gray-600">
+                    {t("upload.live_version_hint") || "Marcalo si es un show en vivo: revisamos el final contra el audio."}
+                  </span>
+                </span>
+              </label>
               {/* Language pills. Default 'es' is highlighted on file
                   load — operator can click another to override, or
                   click 'auto' to let Whisper detect (not recommended

@@ -2118,6 +2118,7 @@ export default function App() {
             language: entry.language || "",
             artist: entry.artist || "",
             title: (entry.songTitle || "").trim(),
+            live: !!entry.live,
           }),
           signal: controller && controller.signal,
         }, { maxRetries: 3 });
@@ -2401,6 +2402,7 @@ export default function App() {
           language: entry.language || "",
           artist: entry.artist || "",
           title: (entry.songTitle || "").trim(),
+          live: !!entry.live,
         }),
       }, {
         maxRetries: 3,

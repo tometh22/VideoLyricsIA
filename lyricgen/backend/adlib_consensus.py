@@ -213,9 +213,73 @@ def tail_candidates(segs: list[dict], tail_after: float | None) -> set:
     return out
 
 
+# Tope de la auditoría de sufijo: cuántas líneas desde el final puede
+# caminar hacia atrás. 12 cubre el peor caso visto (El Riesgo: 9) con aire;
+# un final divergente más largo que esto es un problema de otra clase.
+MAX_SUFFIX_AUDIT = 12
+
+
+def suffix_phantoms(segs: list[dict], transcribe_window, heard_cache: dict,
+                    *, phon_min: float = PHON_MIN,
+                    already_dropped: set | None = None) -> set:
+    """Auditoría del FINAL contra el audio: camina desde la última línea
+    hacia atrás verificando acústicamente; frena en la primera que el
+    audio confirma. Devuelve los índices del sufijo fantasma.
+
+    Caso real (Perro Amor Explota LIVE, 06/07): el audio es un vivo pero
+    lrclib (via variant-retry que recortó el '(Live…)') entregó la letra
+    de ESTUDIO. El cuerpo coincide, pero el final del vivo es otro (canto
+    de '¡Explota!', presentaciones de la banda) → 6 líneas de estudio
+    quedaron sobre canto/habla real. La cola CON voz hace que el chequeo
+    de cola muda (tail_candidates) no aplique — esta auditoría no depende
+    del VAD ni del título: pregunta línea por línea desde el final.
+
+    Diseño:
+    - Sana (la última línea coincide): 1-2 llamadas whisper y listo.
+    - Ad-libs: NEUTRALES (ni se verifican ni frenan la caminata) — su
+      destino lo decide la lógica de colapso/cola existente.
+    - Sin protección de coro: en el sufijo divergente la repetición no
+      es evidencia (medido: las 6 fantasma de Perro dan fonética <=0.33,
+      las reales >=0.52).
+    - `heard_cache` (idx -> heard) se comparte con el caller para no
+      transcribir dos veces la misma ventana.
+    - Error de transcripción → frenar (nunca borrar por las dudas)."""
+    dropped = already_dropped or set()
+    out = set()
+    walked = 0
+    for i in range(len(segs) - 1, -1, -1):
+        if i in dropped:
+            continue                     # ya descartada por la cola muda
+        s = segs[i]
+        if is_adlib_text(s.get("text", "")):
+            continue                     # neutral: no frena ni cae acá
+        if walked >= MAX_SUFFIX_AUDIT:
+            break
+        walked += 1
+        if i in heard_cache:
+            heard = heard_cache[i]
+        else:
+            try:
+                heard = transcribe_window(float(s.get("start", 0)),
+                                          float(s.get("end", 0)))
+            except Exception as e:  # pragma: no cover
+                logger.warning("[ADLIB] sufijo: transcribe falló en %.1fs: %s "
+                               "— freno la auditoría", s.get("start"), e)
+                break
+            heard_cache[i] = heard
+        if heard is None:
+            break
+        if is_phantom(s.get("text", ""), heard, False, phon_min=phon_min):
+            out.add(i)
+        else:
+            break                        # el audio confirma esta línea: fin
+    return out
+
+
 def filter_and_collapse(segs: list[dict], transcribe_window,
                         *, phon_min: float = PHON_MIN,
-                        tail_after: float | None = None) -> list[dict]:
+                        tail_after: float | None = None,
+                        audit_suffix: bool = False) -> list[dict]:
     """Descarta líneas fantasma (consenso acústico) y colapsa ad-libs.
 
     `transcribe_window(start, end) -> str`: transcribe esa ventana del stem
@@ -226,20 +290,29 @@ def filter_and_collapse(segs: list[dict], transcribe_window,
     stem, o None. Con un valor, las líneas de la cola muda (start >
     tail_after + TAIL_MARGIN_S) también se verifican acústicamente, SIN
     protección de coro (ver tail_candidates). None = comportamiento
-    exacto pre-cola."""
+    exacto pre-cola.
+
+    `audit_suffix`: además, auditar el FINAL caminando desde la última
+    línea hacia atrás (ver suffix_phantoms) — finales de OTRA versión
+    (vivo↔estudio) donde la cola tiene voz real y el VAD no alcanza.
+    Las sospechosas se MARCAN con review=True (amarillo en el editor),
+    nunca se borran: el caller arma esto solo con señal de versión
+    distinta (título live / toggle del operador)."""
     if not segs:
         return segs
     try:
         tail_idx = tail_candidates(segs, tail_after)
-        # No-op verdadero si la canción no tiene NINGÚN ad-lib NI cola muda:
-        # nada que colapsar ni candidatas que filtrar → cero regresión.
-        if not tail_idx and not any(is_adlib_text(s.get("text", "")) for s in segs):
+        # No-op verdadero si no hay ad-libs, NI cola muda, NI auditoría de
+        # sufijo pedida: nada que verificar → cero regresión.
+        if (not tail_idx and not audit_suffix
+                and not any(is_adlib_text(s.get("text", "")) for s in segs)):
             return list(segs)
         cands = sorted(set(find_candidates(segs)) | tail_idx)
         # La protección de coro solo se gana en la zona OÍDA: un texto que
         # se repite únicamente dentro de la cola muda no tiene respaldo.
         choruses = chorus_keys([s for i, s in enumerate(segs) if i not in tail_idx])
         drop = set()
+        heard_cache: dict = {}
         for i in cands:
             s = segs[i]
             protected = (i not in tail_idx
@@ -255,12 +328,33 @@ def filter_and_collapse(segs: list[dict], transcribe_window,
                 continue
             if heard is None:
                 continue
+            heard_cache[i] = heard
             if is_phantom(s.get("text", ""), heard, False, phon_min=phon_min):
                 drop.add(i)
                 logger.info("[ADLIB] fantasma descartado @%.1fs%s: %r (oído: %r)",
                             s.get("start"),
                             " [cola]" if i in tail_idx else "",
                             s.get("text", "")[:40], heard[:40])
+        flagged = set()
+        if audit_suffix:
+            # MARCAR, no borrar: contra el gold del operador (06/07, 37
+            # canciones) el borrado automático del sufijo falla en vivos —
+            # whisper-por-ventana pierde voces reales entre público/capas
+            # (Perro live: el operador conservó canto en 229-252s donde la
+            # ventana oyó ''), y a veces el operador QUIERE una línea
+            # hablada ("Que buen momento ¿no?", Un Pacto live). La línea
+            # sospechosa queda en amarillo (review) para que el operador
+            # mire exactamente ahí.
+            flagged = suffix_phantoms(segs, transcribe_window, heard_cache,
+                                      phon_min=phon_min, already_dropped=drop)
+            for i in sorted(flagged):
+                logger.info("[ADLIB] sufijo sospechoso @%.1fs (review): %r "
+                            "(oído: %r)", segs[i].get("start"),
+                            segs[i].get("text", "")[:40],
+                            (heard_cache.get(i) or "")[:40])
+        if flagged:
+            segs = [({**s, "review": True} if i in flagged else s)
+                    for i, s in enumerate(segs)]
         return _collapse_runs(segs, drop)
     except Exception as e:  # pragma: no cover — el filtro nunca rompe el render
         logger.warning("[ADLIB] filtro declinó (%s) — segmentos originales", e)
