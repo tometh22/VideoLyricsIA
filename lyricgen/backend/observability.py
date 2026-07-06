@@ -213,6 +213,17 @@ def health_snapshot() -> dict:
     except Exception:
         pass
 
+    # YouTube API daily quota — degrade at 80% so the operator sees it
+    # before publishes start deferring to the next Pacific-midnight reset.
+    try:
+        import youtube_quota
+        usage = youtube_quota.get_usage()
+        snap["youtube_quota"] = usage
+        if usage.get("pct", 0) >= 80:
+            _degrade("youtube_quota_high")
+    except Exception:
+        pass
+
     # External API keys — presence only (doesn't probe the API). A 1-RTT
     # probe per service would burn quota and add latency to every uptime
     # poll; "key set" is enough for "is the deployment configured?".

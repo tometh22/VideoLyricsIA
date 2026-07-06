@@ -1,9 +1,19 @@
+import { useState } from "react";
 import { useI18n } from "../../i18n";
 
 // Per-asset progress rows for background publishes, visual language
 // borrowed from BatchProgress: icon + label + progress bar.
 
 function StatusIcon({ status }) {
+  if (status === "pending_approval") {
+    return (
+      <div className="w-8 h-8 rounded-xl bg-amber-500/10 flex items-center justify-center shrink-0">
+        <svg className="w-4 h-4 text-amber-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+        </svg>
+      </div>
+    );
+  }
   if (status === "published") {
     return (
       <div className="w-8 h-8 rounded-xl bg-accent/10 flex items-center justify-center shrink-0">
@@ -13,7 +23,7 @@ function StatusIcon({ status }) {
       </div>
     );
   }
-  if (status === "failed" || status === "canceled") {
+  if (status === "failed" || status === "canceled" || status === "denied") {
     return (
       <div className="w-8 h-8 rounded-xl bg-red-500/10 flex items-center justify-center shrink-0">
         <svg className="w-4 h-4 text-red-400" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
@@ -49,11 +59,48 @@ function statusLabel(t, row) {
     case "published": return t("yt.progress.published");
     case "failed": return t("yt.progress.failed");
     case "canceled": return t("yt.progress.canceled");
+    case "pending_approval": return t("yt.approval.pending");
+    case "denied": return t("yt.approval.denied");
     default: return row.status;
   }
 }
 
-export default function PublishProgress({ rows, onRetry, onCancel }) {
+function ApprovalActions({ row, onApprove, onDeny, t }) {
+  const [denying, setDenying] = useState(false);
+  const [reason, setReason] = useState("");
+
+  if (denying) {
+    return (
+      <div className="flex items-center gap-2">
+        <input value={reason} onChange={(e) => setReason(e.target.value)}
+          placeholder={t("yt.approval.reason_placeholder")}
+          className="input-field text-xs h-8 w-44" autoFocus />
+        <button onClick={() => { onDeny(row, reason); setDenying(false); }}
+          className="text-xs text-red-400 hover:text-red-300 font-medium transition-colors">
+          {t("yt.approval.deny")}
+        </button>
+        <button onClick={() => setDenying(false)}
+          className="text-xs text-gray-500 hover:text-white transition-colors">
+          {t("detail.cancel")}
+        </button>
+      </div>
+    );
+  }
+  return (
+    <>
+      <button onClick={() => onApprove(row)}
+        className="text-xs font-semibold text-accent hover:text-white transition-colors">
+        {t("yt.approval.approve")}
+      </button>
+      <button onClick={() => setDenying(true)}
+        className="text-xs text-gray-500 hover:text-red-400 transition-colors">
+        {t("yt.approval.deny")}
+      </button>
+    </>
+  );
+}
+
+export default function PublishProgress({ rows, onRetry, onCancel, canApprove = false, onApprove, onDeny }) {
   const { t, lang } = useI18n();
 
   return (
@@ -68,10 +115,16 @@ export default function PublishProgress({ rows, onRetry, onCancel }) {
                   {row.kind === "short" ? "Short" : "Video"}
                 </span>
                 <span className="text-xs text-gray-500">{statusLabel(t, row)}</span>
-                {row.scheduled_at && (
+                {row.scheduled_at && row.status !== "published" && (
                   <span className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-amber-500/15 text-amber-400 ring-1 ring-amber-500/30">
                     {t("yt.progress.scheduled_for")}{" "}
                     {new Date(row.scheduled_at).toLocaleString(lang, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
+                  </span>
+                )}
+                {row.publish_at_youtube && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-amber-500/15 text-amber-400 ring-1 ring-amber-500/30">
+                    {t("yt.progress.scheduled_for")}{" "}
+                    {new Date(row.publish_at_youtube).toLocaleString(lang, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
                   </span>
                 )}
               </div>
@@ -84,22 +137,31 @@ export default function PublishProgress({ rows, onRetry, onCancel }) {
               {row.status === "failed" && row.error && (
                 <p className="text-xs text-red-400 mt-1">{row.error}</p>
               )}
+              {row.status === "denied" && row.denial_reason && (
+                <p className="text-xs text-red-400 mt-1">{t("yt.approval.denied_reason")}: {row.denial_reason}</p>
+              )}
+              {row.blocked_reason === "youtube_quota_exhausted" && row.status === "scheduled" && (
+                <p className="text-xs text-amber-400 mt-1">{t("yt.progress.quota_deferred")}</p>
+              )}
             </div>
 
             <div className="shrink-0 flex items-center gap-3">
+              {row.status === "pending_approval" && canApprove && onApprove && (
+                <ApprovalActions row={row} onApprove={onApprove} onDeny={onDeny} t={t} />
+              )}
               {row.status === "published" && row.video_url && (
                 <a href={row.video_url} target="_blank" rel="noopener noreferrer"
                   className="text-xs text-brand-light hover:text-white transition-colors underline">
                   {row.kind === "short" ? t("yt.progress.view_short") : t("yt.progress.view_video")}
                 </a>
               )}
-              {row.status === "failed" && onRetry && (
+              {(row.status === "failed" || row.status === "denied") && onRetry && (
                 <button onClick={() => onRetry(row)}
                   className="text-xs text-brand-light hover:text-white font-medium transition-colors">
                   {t("yt.progress.retry")}
                 </button>
               )}
-              {(row.status === "queued" || row.status === "scheduled") && onCancel && (
+              {(row.status === "queued" || row.status === "scheduled" || row.status === "pending_approval") && onCancel && (
                 <button onClick={() => onCancel(row)}
                   className="text-xs text-gray-500 hover:text-red-400 transition-colors">
                   {t("detail.cancel")}

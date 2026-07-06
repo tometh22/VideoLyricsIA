@@ -90,7 +90,16 @@ async def admin_stats(
             "currency": "usd",
         },
         "plans": {p: c for p, c in plan_dist},
+        "youtube_quota": _youtube_quota_usage(),
     }
+
+
+def _youtube_quota_usage() -> dict:
+    try:
+        import youtube_quota
+        return youtube_quota.get_usage()
+    except Exception:  # pragma: no cover — stats must never 500 on this
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +272,9 @@ class UpdateUserRequest(BaseModel):
     # B2B / overage opt-in. True = user can keep generating past plan
     # monthly limit (extra videos invoice out-of-band).
     allow_overage: Optional[bool] = None
+    # Maker-checker: may approve PUBLIC YouTube publishes when the tenant
+    # requires approval (see /admin/tenants/{id}/settings).
+    can_approve_public: Optional[bool] = None
 
 
 @router.patch("/users/{user_id}")
@@ -300,6 +312,8 @@ async def update_user_admin(
         user.max_concurrent_jobs = max(1, int(body.max_concurrent_jobs))
     if body.allow_overage is not None:
         user.allow_overage = bool(body.allow_overage)
+    if body.can_approve_public is not None:
+        user.can_approve_public = bool(body.can_approve_public)
 
     db.commit()
     db.refresh(user)
@@ -445,30 +459,162 @@ async def list_all_invoices(
 # Audit log
 # ---------------------------------------------------------------------------
 
+def _audit_query(db, action: Optional[str], user_id: Optional[int],
+                 date_from: Optional[datetime], date_to: Optional[datetime]):
+    q = db.query(AuditLog)
+    if action:
+        q = q.filter(AuditLog.action.like(f"{action}%"))
+    if user_id is not None:
+        q = q.filter(AuditLog.user_id == user_id)
+    if date_from is not None:
+        q = q.filter(AuditLog.created_at >= date_from)
+    if date_to is not None:
+        q = q.filter(AuditLog.created_at <= date_to)
+    return q
+
+
+def _audit_entry_dict(e) -> dict:
+    return {
+        "id": e.id,
+        "user_id": e.user_id,
+        "action": e.action,
+        "detail": e.detail,
+        "ip_address": e.ip_address,
+        "created_at": e.created_at.isoformat() if e.created_at else None,
+    }
+
+
 @router.get("/audit")
 async def list_audit_log(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
-    limit: int = Query(50, le=200),
+    action: Optional[str] = Query(None, description="action prefix filter"),
+    user_id: Optional[int] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = Query(50, le=500),
+    offset: int = Query(0, ge=0),
 ):
-    """View recent audit log entries."""
+    """Audit log with filters + pagination: {total, entries}."""
+    q = _audit_query(db, action, user_id, date_from, date_to)
+    total = q.count()
     entries = (
-        db.query(AuditLog)
-        .order_by(AuditLog.created_at.desc())
+        q.order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+        .offset(offset)
         .limit(limit)
         .all()
     )
-    return [
-        {
-            "id": e.id,
-            "user_id": e.user_id,
-            "action": e.action,
-            "detail": e.detail,
-            "ip_address": e.ip_address,
-            "created_at": e.created_at.isoformat() if e.created_at else None,
-        }
-        for e in entries
-    ]
+    return {"total": total, "entries": [_audit_entry_dict(e) for e in entries]}
+
+
+@router.get("/audit/export.csv")
+async def export_audit_log(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    action: Optional[str] = Query(None),
+    user_id: Optional[int] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+):
+    """Same filters as /audit, streamed as CSV (cap 50k rows). Exporting
+    the audit log is itself an auditable act."""
+    import csv
+    import io
+    import json as _json
+    from fastapi.responses import StreamingResponse
+
+    db.add(AuditLog(
+        user_id=admin["id"],
+        action="admin.audit_export",
+        detail={"action": action, "user_id": user_id,
+                "date_from": date_from.isoformat() if date_from else None,
+                "date_to": date_to.isoformat() if date_to else None},
+    ))
+    db.commit()
+
+    q = (
+        _audit_query(db, action, user_id, date_from, date_to)
+        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+        .limit(50_000)
+    )
+
+    def _rows():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["id", "created_at", "user_id", "action", "ip_address", "detail"])
+        yield buf.getvalue()
+        for e in q.yield_per(500):
+            buf.seek(0)
+            buf.truncate()
+            writer.writerow([
+                e.id,
+                e.created_at.isoformat() if e.created_at else "",
+                e.user_id or "",
+                e.action,
+                e.ip_address or "",
+                _json.dumps(e.detail, ensure_ascii=False) if e.detail else "",
+            ])
+            yield buf.getvalue()
+
+    return StreamingResponse(
+        _rows(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=audit_log.csv"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tenant settings (maker-checker toggle etc.)
+# ---------------------------------------------------------------------------
+
+@router.get("/tenants/{tenant_id}/settings")
+async def get_tenant_settings_admin(
+    tenant_id: str,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    from database import TenantSettings
+    row = db.query(TenantSettings).filter(TenantSettings.tenant_id == tenant_id).first()
+    return (row.settings_json or {}) if row else {}
+
+
+@router.put("/tenants/{tenant_id}/settings")
+async def put_tenant_settings_admin(
+    tenant_id: str,
+    body: dict,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    from database import TenantSettings
+
+    # Guard against tenant deadlock: requiring approval with zero
+    # approvers in the tenant would block every public publish (admins
+    # still bypass, but the tenant's own flow would dead-end).
+    if body.get("require_public_approval"):
+        approvers = (
+            db.query(User)
+            .filter(User.tenant_id == tenant_id, User.can_approve_public.is_(True))
+            .count()
+        )
+        if approvers == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Enable at least one approver (can_approve_public) in this tenant first.",
+            )
+
+    row = db.query(TenantSettings).filter(TenantSettings.tenant_id == tenant_id).first()
+    if row:
+        row.settings_json = body
+    else:
+        row = TenantSettings(tenant_id=tenant_id, settings_json=body)
+        db.add(row)
+    db.add(AuditLog(
+        user_id=admin["id"],
+        action="admin.update_tenant_settings",
+        detail={"tenant_id": tenant_id, "settings": body},
+    ))
+    db.commit()
+    return body
 
 
 # ---------------------------------------------------------------------------

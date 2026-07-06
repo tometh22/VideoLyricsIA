@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { useI18n } from "../i18n";
+import AuditLogTab from "./admin/AuditLogTab";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -252,6 +253,7 @@ export default function AdminPanel({ onBack }) {
     { id: "invoices", label: "Invoices" },
     { id: "backgrounds", label: "Backgrounds" },
     { id: "compliance", label: "Compliance" },
+    { id: "audit", label: "Audit" },
   ];
 
   if (loading) return (
@@ -904,6 +906,8 @@ export default function AdminPanel({ onBack }) {
           )}
         </div>
       )}
+
+      {tab === "audit" && <AuditLogTab />}
     </div>
   );
 }

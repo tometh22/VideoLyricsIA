@@ -115,6 +115,12 @@ class User(Base):
     ai_authorized_at = Column(DateTime(timezone=True), nullable=True)
     ai_authorized_by = Column(Integer, nullable=True)
 
+    # Maker-checker: may this user approve PUBLIC YouTube publishes when
+    # the tenant requires approval? Capability flag (like ai_authorized),
+    # NOT a new role — role is embedded in JWTs and checked binarily
+    # across the codebase. Admins always approve regardless of this flag.
+    can_approve_public = Column(Boolean, default=False)
+
     # Per-tenant volume cap. None = use system default DEFAULT_DAILY_CAP.
     # Catches accidental burst usage (mistake, abuse, or runaway loop).
     max_videos_per_day = Column(Integer, nullable=True)
@@ -348,6 +354,31 @@ class UserSettings(Base):
     user = relationship("User", back_populates="settings")
 
 
+class TenantSettings(Base):
+    """Tenant-wide config (there is no Tenant table — tenant_id is a free
+    string on User), mirroring UserSettings' keyed-JSON shape. Keys:
+    require_public_approval (bool)."""
+    __tablename__ = "tenant_settings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), unique=True, nullable=False, index=True)
+    settings_json = Column(JSON, default=dict)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class YouTubeApiQuota(Base):
+    """Daily YouTube Data API unit counter (quota is per Google Cloud
+    project and resets at midnight Pacific — quota_date is computed in
+    America/Los_Angeles, see youtube_quota.py)."""
+    __tablename__ = "youtube_api_quota"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    quota_date = Column(String(10), unique=True, nullable=False)  # YYYY-MM-DD (Pacific)
+    units_used = Column(Integer, nullable=False, default=0)
+    alert_sent = Column(Boolean, nullable=False, default=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class YouTubeChannel(Base):
     """A YouTube channel connected by a tenant via OAuth.
 
@@ -424,13 +455,24 @@ class PublishJob(Base):
     video_url = Column(String(255), nullable=True)
     error = Column(Text, nullable=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # Maker-checker (public publishes when the tenant requires approval).
+    approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    denial_reason = Column(Text, nullable=True)
+    # Quota deferral: set when the daily YouTube API budget ran out.
+    blocked_reason = Column(String(50), nullable=True)
+    next_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    # Content ID pre-check result (only populated when the partner
+    # integration is configured — see content_id.py).
+    content_id_check = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
     started_at = Column(DateTime(timezone=True), nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     def to_dict(self):
-        return {
+        from content_id import is_configured as _content_id_configured
+        payload = {
             "id": self.id,
             "job_id": self.job_id,
             "channel_id": self.channel_id,
@@ -444,9 +486,14 @@ class PublishJob(Base):
             "video_id": self.video_id,
             "video_url": self.video_url,
             "error": self.error,
+            "denial_reason": self.denial_reason,
+            "blocked_reason": self.blocked_reason,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
         }
+        if _content_id_configured():
+            payload["content_id_check"] = self.content_id_check
+        return payload
 
 
 class PasswordResetToken(Base):
@@ -582,10 +629,22 @@ def _migrate_user_columns():
         "ON youtube_channels (tenant_id) WHERE is_default",
         # At most one ACTIVE publish per (job, kind) — the real multi-worker
         # duplicate-publish guarantee; the API's 409 is just the friendly
-        # error on top.
+        # error on top. pending_approval counts as active (a second request
+        # while one awaits approval would double-publish on approve).
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_publish_active "
         "ON publish_jobs (job_id, kind) "
-        "WHERE status IN ('queued', 'scheduled', 'uploading')",
+        "WHERE status IN ('queued', 'scheduled', 'uploading', 'pending_approval')",
+        # Maker-checker / quota / content-id columns (post-launch adds).
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS can_approve_public BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE publish_jobs ADD COLUMN IF NOT EXISTS approved_by INTEGER",
+        "ALTER TABLE publish_jobs ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ",
+        "ALTER TABLE publish_jobs ADD COLUMN IF NOT EXISTS denial_reason TEXT",
+        "ALTER TABLE publish_jobs ADD COLUMN IF NOT EXISTS blocked_reason VARCHAR(50)",
+        "ALTER TABLE publish_jobs ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ",
+        "ALTER TABLE publish_jobs ADD COLUMN IF NOT EXISTS content_id_check JSON",
+        # Audit filters hit (action, created_at) and (user_id, created_at).
+        "CREATE INDEX IF NOT EXISTS ix_audit_action_created ON audit_log (action, created_at)",
+        "CREATE INDEX IF NOT EXISTS ix_audit_user_created ON audit_log (user_id, created_at)",
     ]
     with engine.begin() as conn:
         for sql in column_adds:

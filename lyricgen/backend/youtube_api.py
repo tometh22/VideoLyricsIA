@@ -28,8 +28,8 @@ from jose import JWTError, jwt
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from auth import get_current_user, JWT_SECRET, JWT_ALGORITHM
-from database import AuditLog, Job, PublishJob, YouTubeChannel, get_db
+from auth import get_current_user, can_approve_public, JWT_SECRET, JWT_ALGORITHM
+from database import AuditLog, Job, PublishJob, TenantSettings, YouTubeChannel, get_db
 from token_crypto import encrypt_token
 
 logger = logging.getLogger("genly.youtube")
@@ -357,7 +357,16 @@ async def disconnect_channel(
 # ---------------------------------------------------------------------------
 
 _PRIVACY_VALUES = ("public", "unlisted", "private")
-_ACTIVE_PUBLISH_STATUSES = ("queued", "scheduled", "uploading")
+_ACTIVE_PUBLISH_STATUSES = ("queued", "scheduled", "uploading", "pending_approval")
+
+
+def get_tenant_settings(db: Session, tenant_id: str) -> dict:
+    row = db.query(TenantSettings).filter(TenantSettings.tenant_id == tenant_id).first()
+    return (row.settings_json or {}) if row else {}
+
+
+def _requires_public_approval(db: Session, tenant_id: str) -> bool:
+    return bool(get_tenant_settings(db, tenant_id).get("require_public_approval"))
 
 
 class PublishRequest(BaseModel):
@@ -481,6 +490,21 @@ async def create_publish(
     if not kinds:
         raise HTTPException(status_code=409, detail="Everything requested is already published.")
 
+    # Maker-checker: a PUBLIC publish by a non-approver in a tenant with
+    # the toggle on parks in pending_approval — no upload until an
+    # approver acts. Approvers and admins go straight through.
+    needs_approval = (
+        body.privacy == "public"
+        and _requires_public_approval(db, current_user["tenant_id"])
+        and not can_approve_public(current_user)
+    )
+    if needs_approval:
+        initial_status = "pending_approval"
+    elif backend_scheduled_at:
+        initial_status = "scheduled"
+    else:
+        initial_status = "queued"
+
     rows = []
     for kind, md in kinds:
         row = PublishJob(
@@ -488,7 +512,7 @@ async def create_publish(
             tenant_id=current_user["tenant_id"],
             channel_id=channel.id if channel else None,
             kind=kind,
-            status="scheduled" if backend_scheduled_at else "queued",
+            status=initial_status,
             metadata_json=md,
             privacy=body.privacy,
             scheduled_at=body.scheduled_at,
@@ -506,6 +530,14 @@ async def create_publish(
         raise HTTPException(status_code=409, detail="A publish is already in progress for this job.")
 
     enqueue_errors = []
+    if needs_approval:
+        _audit_row(db, current_user["id"], "publish.request_approval", {
+            "job_id": job_id,
+            "kinds": [k for k, _ in kinds],
+            "publish_job_ids": [r.id for r in rows],
+        })
+        db.commit()
+        return [row.to_dict() for row in rows]
     if not backend_scheduled_at:
         # Immediate (or native-publishAt) mode: enqueue right away. Backend-
         # scheduled rows wait for the scheduler daemon.
@@ -553,6 +585,122 @@ async def publish_status(
     return [r.to_dict() for r in rows]
 
 
+@router.get("/publish-policy")
+async def publish_policy(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """What the publish UI needs to know about this tenant's rules."""
+    return {
+        "require_public_approval": _requires_public_approval(db, current_user["tenant_id"]),
+        "can_approve": can_approve_public(current_user),
+    }
+
+
+@router.get("/publish/pending/list")
+async def pending_approvals(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Tenant's publishes awaiting approval (approver dashboard list)."""
+    rows = (
+        db.query(PublishJob)
+        .filter(
+            PublishJob.tenant_id == current_user["tenant_id"],
+            PublishJob.status == "pending_approval",
+        )
+        .order_by(PublishJob.created_at.asc())
+        .all()
+    )
+    return [r.to_dict() for r in rows]
+
+
+class DenyRequest(BaseModel):
+    reason: str = ""
+
+
+def _get_pending_row(db: Session, publish_pk: int, current_user: dict) -> PublishJob:
+    if not can_approve_public(current_user):
+        raise HTTPException(status_code=403, detail="Approver permission required.")
+    row = (
+        db.query(PublishJob)
+        .filter(
+            PublishJob.id == publish_pk,
+            PublishJob.tenant_id == current_user["tenant_id"],
+        )
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Publish job not found.")
+    if row.status != "pending_approval":
+        raise HTTPException(status_code=409, detail="Not pending approval.")
+    return row
+
+
+@router.post("/publish-jobs/{publish_pk}/approve")
+async def approve_publish(
+    publish_pk: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Approve a pending public publish: queue it and enqueue the upload."""
+    import queue_jobs
+
+    row = _get_pending_row(db, publish_pk, current_user)
+    row.status = "queued"
+    row.approved_by = current_user["id"]
+    row.approved_at = datetime.now(timezone.utc)
+    _audit_row(db, current_user["id"], "publish.approve_public", {
+        "publish_job_id": row.id, "job_id": row.job_id, "kind": row.kind,
+    })
+    db.commit()
+    try:
+        queue_jobs.enqueue_publish(row.id)
+    except RuntimeError:
+        db.query(PublishJob).filter(PublishJob.id == row.id).update(
+            {PublishJob.status: "failed", PublishJob.error: "Queue unavailable."},
+            synchronize_session=False,
+        )
+        db.commit()
+        raise HTTPException(status_code=503, detail="Publish queue unavailable. Try again in a minute.")
+    return row.to_dict()
+
+
+@router.post("/publish-jobs/{publish_pk}/deny")
+async def deny_publish(
+    publish_pk: int,
+    body: DenyRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Deny a pending public publish; the requester is notified by email."""
+    row = _get_pending_row(db, publish_pk, current_user)
+    row.status = "denied"
+    row.approved_by = current_user["id"]
+    row.approved_at = datetime.now(timezone.utc)
+    row.denial_reason = body.reason or None
+    _audit_row(db, current_user["id"], "publish.deny_public", {
+        "publish_job_id": row.id, "job_id": row.job_id,
+        "kind": row.kind, "reason": body.reason,
+    })
+    db.commit()
+
+    try:
+        from database import User
+        import emails
+        requester = db.query(User).filter(User.id == row.created_by).first()
+        job = db.query(Job).filter(Job.job_id == row.job_id).first()
+        if requester and requester.email and job:
+            emails.send_publish_denied(
+                requester.email, requester.username, job.artist,
+                job.song_title or job.filename, body.reason,
+            )
+    except Exception as e:  # pragma: no cover — notification is best-effort
+        logger.warning("deny notification failed: %s", e)
+
+    return row.to_dict()
+
+
 @router.post("/publish-jobs/{publish_pk}/cancel")
 async def cancel_publish(
     publish_pk: int,
@@ -578,7 +726,7 @@ async def cancel_publish(
         db.query(PublishJob)
         .filter(
             PublishJob.id == publish_pk,
-            PublishJob.status.in_(("queued", "scheduled")),
+            PublishJob.status.in_(("queued", "scheduled", "pending_approval")),
         )
         .update({PublishJob.status: "canceled"}, synchronize_session=False)
     )

@@ -197,6 +197,37 @@ def publish_to_youtube_task(publish_job_id: int) -> dict:
         # already qualifies; the tag removes ambiguity).
         metadata = {**metadata, "title": f"{metadata['title']} #Shorts"}
 
+    # ── Daily API budget (quota is per Google project, resets Pacific
+    # midnight). Reserve BEFORE uploading; if the budget is gone, put the
+    # row back to queued with a next_attempt_at so the scheduler-side
+    # sweep retries after the reset instead of burning a quotaExceeded.
+    import youtube_quota
+    if not youtube_quota.check_and_reserve("videos.insert", extra_units=youtube_quota.UNIT_COSTS["thumbnails.set"]):
+        # Back to "scheduled" for the next Pacific-midnight reset — the
+        # scheduler daemon (youtube_scheduler) re-enqueues it then.
+        reset_at = youtube_quota.next_pacific_midnight()
+        _update_publish_job(
+            publish_job_id,
+            status="scheduled",
+            scheduled_at=reset_at,
+            blocked_reason="youtube_quota_exhausted",
+            next_attempt_at=reset_at,
+        )
+        _audit(publish_job.created_by, "youtube.quota_deferred", {
+            "publish_job_id": publish_job_id, "job_id": publish_job.job_id,
+        })
+        return {"deferred": True, "reason": "youtube_quota_exhausted"}
+
+    # Content ID pre-check — dormant unless the partner integration is
+    # configured (content_id.py). Never blocks; result is stored for the UI.
+    import content_id as content_id_mod
+    if content_id_mod.is_configured():
+        try:
+            check = content_id_mod.check_claim_status(metadata=metadata)
+            _update_publish_job(publish_job_id, content_id_check=check)
+        except Exception as e:  # pragma: no cover
+            print(f"[PUBLISH] content-id check failed: {e}")
+
     song = job_song_title(job_dict)
     artist = job_dict.get("artist", "")
 

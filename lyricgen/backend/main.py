@@ -3392,6 +3392,11 @@ async def youtube_upload(
             )
         except Exception as e:
             raise _map_upload_error(e, "privacy change")
+        try:
+            import youtube_quota
+            youtube_quota.record_usage("videos.update")
+        except Exception:
+            pass
         result = {**existing, "privacy": privacy}
         update_job(job_id, youtube=result)
         _audit(current_user["id"], "job.youtube_privacy_change", {

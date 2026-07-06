@@ -308,7 +308,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     fetch(`${API}/youtube/publish/${job.job_id}`, { headers: authHeaders() })
       .then((r) => (r.ok ? r.json() : []))
       .then((rows) => {
-        if (alive && rows.some((r) => ["queued", "scheduled", "uploading"].includes(r.status))) {
+        if (alive && rows.some((r) => ["queued", "scheduled", "uploading", "pending_approval"].includes(r.status))) {
           setShowYoutubePanel(true);
         }
       })
