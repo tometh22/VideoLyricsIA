@@ -212,7 +212,7 @@ def test_already_published_different_privacy_updates_video(client, monkeypatch):
     def _boom(*a, **kw):
         raise AssertionError("upload_to_youtube must not be called again")
 
-    def _fake_privacy(video_id, privacy):
+    def _fake_privacy(video_id, privacy, channel=None):
         calls["args"] = (video_id, privacy)
 
     monkeypatch.setattr(yt, "upload_to_youtube", _boom)
@@ -352,7 +352,7 @@ def test_publish_uses_approved_metadata_persists_and_audits(client, monkeypatch)
     calls = {}
 
     def _fake_upload(video_path, thumbnail_path, artist, song, lyrics_text,
-                     privacy, job_id, metadata=None, settings=None):
+                     privacy, job_id, metadata=None, settings=None, channel=None):
         calls["metadata"] = metadata
         calls["privacy"] = privacy
         return {"video_id": "vid42", "url": "https://youtube.com/watch?v=vid42",
@@ -408,7 +408,7 @@ def test_song_title_column_preferred_over_filename(client, monkeypatch):
     captured = {}
 
     def _fake_upload(video_path, thumbnail_path, artist, song, lyrics_text,
-                     privacy, job_id, metadata=None, settings=None):
+                     privacy, job_id, metadata=None, settings=None, channel=None):
         captured["song"] = song
         return {"video_id": "v1", "url": "u", "title": song, "privacy": privacy}
 

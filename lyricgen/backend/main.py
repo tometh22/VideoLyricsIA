@@ -72,6 +72,7 @@ from queue_jobs import enqueue_pipeline, queue_depth
 from render_spec import umg_catalog, validate_umg_config
 from billing import router as billing_router
 from admin import router as admin_router
+from youtube_api import router as youtube_router
 import emails
 
 # ---------------------------------------------------------------------------
@@ -177,6 +178,7 @@ else:
 # --- Include routers ---
 app.include_router(billing_router)
 app.include_router(admin_router)
+app.include_router(youtube_router)
 
 
 # --- Startup ---
@@ -3337,6 +3339,9 @@ class YouTubeUploadRequest(BaseModel):
     # it is published as-is instead of regenerating (what you approve is
     # what goes live).
     metadata: dict | None = None
+    # Connected channel to publish with (None → tenant default → legacy
+    # file token).
+    channel_id: int | None = None
 
 
 @app.post("/youtube/upload/{job_id}")
@@ -3363,10 +3368,20 @@ async def youtube_upload(
     import asyncio
     from functools import partial
     from youtube_upload import (
-        upload_to_youtube, update_video_privacy, YouTubeNotConfiguredError,
+        upload_to_youtube, update_video_privacy, resolve_channel,
+        YouTubeNotConfiguredError,
     )
     from googleapiclient.errors import HttpError
     from google.auth.exceptions import RefreshError
+
+    try:
+        channel = resolve_channel(
+            db, current_user["tenant_id"], body.channel_id if body else None,
+        )
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Channel not found.")
+    except YouTubeNotConfiguredError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
     def _map_upload_error(e: Exception, ctx: str) -> HTTPException:
         """Sanitized error → HTTP mapping. Full detail goes to the log only —
@@ -3397,7 +3412,7 @@ async def youtube_upload(
         try:
             await loop.run_in_executor(
                 _YOUTUBE_EXECUTOR,
-                partial(update_video_privacy, existing["video_id"], privacy),
+                partial(update_video_privacy, existing["video_id"], privacy, channel=channel),
             )
         except Exception as e:
             raise _map_upload_error(e, "privacy change")
@@ -3443,7 +3458,7 @@ async def youtube_upload(
             _YOUTUBE_EXECUTOR,
             partial(
                 upload_to_youtube, video_path, thumb_path, artist, song, "",
-                privacy, job_id, metadata=metadata, settings=settings,
+                privacy, job_id, metadata=metadata, settings=settings, channel=channel,
             ),
         )
         # Persisting the result is what releases the claim — no window where
