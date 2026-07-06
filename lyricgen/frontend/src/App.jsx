@@ -1159,9 +1159,9 @@ export default function App() {
   // al audio) SIN causar re-renders del tree de UploadZone a 60fps. El ref
   // se actualiza desde el rAF loop de LyricsEditor; WizardLivePreview lo
   // lee con su propio rAF.
-  const playbackTickRef = useRef({ activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 0 });
-  const handlePlaybackTick = useCallback((line, start, end, time) => {
-    playbackTickRef.current = { activeLine: line, activeStart: start, activeEnd: end, currentTime: time };
+  const playbackTickRef = useRef({ activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 0, words: null });
+  const handlePlaybackTick = useCallback((line, start, end, time, words) => {
+    playbackTickRef.current = { activeLine: line, activeStart: start, activeEnd: end, currentTime: time, words: words || null };
   }, []);
 
   // Phase 2 (2026-05-25): sync de typography settings cuando el operador
@@ -2118,6 +2118,7 @@ export default function App() {
             language: entry.language || "",
             artist: entry.artist || "",
             title: (entry.songTitle || "").trim(),
+            live: !!entry.live,
           }),
           signal: controller && controller.signal,
         }, { maxRetries: 3 });
@@ -2401,6 +2402,7 @@ export default function App() {
           language: entry.language || "",
           artist: entry.artist || "",
           title: (entry.songTitle || "").trim(),
+          live: !!entry.live,
         }),
       }, {
         maxRetries: 3,

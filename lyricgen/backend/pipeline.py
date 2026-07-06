@@ -1355,7 +1355,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                             _UserSettings.user_id == _usr.id
                         ).first()
                         _prefs = (_settings.settings_json or {}) if _settings else {}
-                        if _prefs.get("notif_jobs", False):
+                        # Default ON (era False): en producción NINGÚN usuario
+                        # había activado notif_jobs, así que los renders que
+                        # terminaban en pending_review quedaban invisibles
+                        # (caso UMG Chile 2026-06-25: 8 días esperando). El
+                        # opt-out explícito en Settings se sigue respetando.
+                        if _prefs.get("notif_jobs", True):
                             threading.Thread(
                                 target=_emails.send_job_completed,
                                 kwargs={
@@ -1364,6 +1369,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                                     "artist": artist or "",
                                     "filename": os.path.basename(mp3_path),
                                     "job_id": job_id,
+                                    "needs_review": final_status == "pending_review",
                                 },
                                 daemon=True,
                             ).start()

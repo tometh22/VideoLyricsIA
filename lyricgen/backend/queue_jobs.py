@@ -508,6 +508,7 @@ def enqueue_transcription(
     artist: str = "",
     title: str = "",
     filename: str = "",
+    live: bool = False,
     tenant_id: str = "",
 ) -> str:
     """Enqueue una transcripción en la queue `transcription` (alta prioridad,
@@ -552,7 +553,7 @@ def enqueue_transcription(
             args=(job_id, audio_path),
             kwargs={
                 "language": language, "artist": artist, "title": title,
-                "filename": filename,
+                "filename": filename, "live": live,
             },
             job_timeout=timeout,
             result_ttl=RESULT_TTL,

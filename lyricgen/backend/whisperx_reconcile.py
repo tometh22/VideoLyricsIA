@@ -104,6 +104,13 @@ def reconcile(wx_segs: list[dict],
     return out
 
 
+# Umbral de recuperación de coros sub-listados: un segmento no-matcheado
+# cuyo texto suena >= esto a UNA línea de la referencia se corrige a esa
+# línea (repara misheards de repeticiones que la letra no lista). Alto
+# para no reescribir líneas únicas legítimas.
+RECOVER_PHON_MIN = 0.72
+
+
 def text_correct_segments(audio_segs: list[dict],
                           reference_text: str,
                           *, min_match: float = 0.60) -> list[dict]:
@@ -146,12 +153,24 @@ def text_correct_segments(audio_segs: list[dict],
         return max(_jaccard(seg_jac[i], ref_jac[j]),
                    _phonetic_ratio(seg_pho[i], ref_pho[j]))
 
+    # Un segmento de whisper puede abarcar DOS líneas de la referencia
+    # cantadas de corrido ("…los indicios / de que nada es perfecto" en una
+    # sola frase). Con matching 1:1 la segunda línea quedaba skip_ref y sus
+    # palabras DESAPARECÍAN del output (caso Amanda Pujó, 03/07: dos frases
+    # perdidas). match2 puntúa contra la concatenación de j y j+1.
+    def score2(i: int, j: int) -> float:
+        if j + 1 >= len(ref_lines):
+            return 0.0
+        return max(_jaccard(seg_jac[i], ref_jac[j] | ref_jac[j + 1]),
+                   _phonetic_ratio(seg_pho[i], ref_pho[j] + ref_pho[j + 1]))
+
     n, m = len(audio_segs), len(ref_lines)
     EPS = 1e-6  # earliest-ref tie-break, same idea as _match_cleaned_to_synced
     # dp[i][j] = best total match score over segs[i:] using refs[j:].
-    # actions: match seg i↔ref j | skip_ref j (never sung) | skip_seg i (ad-lib).
-    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
-    choice: list[list[str | None]] = [[None] * (m + 1) for _ in range(n + 1)]
+    # actions: match 1:1 | match2 (1 seg ↔ 2 refs consecutivas) |
+    # skip_ref (nunca cantada) | skip_seg (ad-lib).
+    dp = [[0.0] * (m + 2) for _ in range(n + 1)]
+    choice: list[list[str | None]] = [[None] * (m + 2) for _ in range(n + 1)]
     for i in range(n - 1, -1, -1):
         for j in range(m - 1, -1, -1):
             best, act = dp[i + 1][j], "skip_seg"          # seg i unmatched
@@ -162,14 +181,23 @@ def text_correct_segments(audio_segs: list[dict],
                 mv = sc + EPS * (m - j) + dp[i + 1][j + 1]
                 if mv > best:
                     best, act = mv, "match"
+            sc2 = score2(i, j)
+            if sc2 >= min_match:
+                # −1e-4: ante empate real gana el match simple (no partir
+                # una línea sana en dos por un empate de Jaccard).
+                mv2 = sc2 - 1e-4 + EPS * (m - j) + dp[i + 1][j + 2]
+                if mv2 > best:
+                    best, act = mv2, "match2"
             dp[i][j], choice[i][j] = best, act
 
-    assign: list[int | None] = [None] * n
+    assign: list = [None] * n           # int (1:1) | ("pair", j) | None
     i = j = 0
     while i < n and j < m:
         act = choice[i][j]
         if act == "match":
             assign[i] = j; i += 1; j += 1
+        elif act == "match2":
+            assign[i] = ("pair", j); i += 1; j += 2
         elif act == "skip_ref":
             j += 1
         else:
@@ -184,12 +212,28 @@ def text_correct_segments(audio_segs: list[dict],
     #     `review`); drop it if no reference line fits. This is SAFE: it only
     #     names segments the audio already produced — it never fabricates a line
     #     where there's no audio (which would spam phantom chorus repeats).
-    matched_refs = {a for a in assign if a is not None}
+    matched_refs = set()
+    for a in assign:
+        if isinstance(a, tuple):
+            matched_refs.add(a[1]); matched_refs.add(a[1] + 1)
+        elif a is not None:
+            matched_refs.add(a)
     out: list[dict] = []
-    n_swapped = n_filled = 0
+    n_swapped = n_filled = n_split = n_recovered = 0
     last_ref = -1
     for idx, s in enumerate(audio_segs):
         j = assign[idx]
+        if isinstance(j, tuple):
+            # 1 segmento ↔ 2 líneas de referencia: partirlo en el límite de
+            # palabra que mejor separa ambas líneas (word-stamps si hay;
+            # proporcional por tokens si no). Las DOS líneas sobreviven.
+            ja = j[1]
+            a, b = _split_pair_segment(s, ref_lines[ja], ref_lines[ja + 1],
+                                       _jaccard, _tokens)
+            out.append(a); out.append(b)
+            n_swapped += 1; n_split += 1
+            last_ref = ja + 1
+            continue
         if j is not None:
             seg = dict(s)
             if (seg.get("text") or "").strip() != ref_lines[j]:
@@ -199,6 +243,28 @@ def text_correct_segments(audio_segs: list[dict],
             last_ref = j
             continue
         if (s.get("text") or "").strip():
+            # Recuperación de coros sub-listados (Amanda Pujó, 05/07): la
+            # referencia lista el coro 2× pero la canción lo canta 3×; la
+            # 3ª ocurrencia queda sin línea de referencia libre y el DP la
+            # deja COMO-OÍDA (mishear "Frágiles vientos de vos" en vez de
+            # "frágil espejo de vos", que suena 0.81 fonético). Si el
+            # segmento suena casi idéntico a ALGUNA línea de la referencia
+            # (usada o no), corregir el TEXTO a esa línea — no fabrica
+            # nada, repara un mishear de una línea que SÍ está en la letra.
+            # Umbral alto para no pisar líneas únicas legítimas; excluye
+            # ad-libs (su fonética contra la letra es baja de por sí).
+            best_j, best_sc = None, RECOVER_PHON_MIN
+            for rj in range(m):
+                sc = _phonetic_ratio(seg_pho[idx], ref_pho[rj])
+                if sc > best_sc:
+                    best_sc, best_j = sc, rj
+            if best_j is not None:
+                seg = dict(s)
+                seg["text"] = ref_lines[best_j]
+                seg["review"] = True
+                out.append(seg)
+                n_recovered += 1
+                continue
             out.append(dict(s))   # ad-lib / unmatched-but-real text → keep as-heard
             continue
         # blank segment: name it from the next genuinely-skipped reference line
@@ -213,8 +279,9 @@ def text_correct_segments(audio_segs: list[dict],
         # else: drop the empty segment
 
     logger.info(
-        "[TEXT-CORRECT] %s corrected, %s blanks named from reference, %s segs out",
-        n_swapped, n_filled, len(out),
+        "[TEXT-CORRECT] %s corrected (%s split, %s chorus-recovered), "
+        "%s blanks named, %s segs out",
+        n_swapped, n_split, n_recovered, n_filled, len(out),
     )
     return out
 
@@ -273,3 +340,37 @@ def relabel_long_adlibs(segs: list[dict],
     if n_relabeled:
         logger.info("[ADLIB] relabeled %s wordless ad-lib tail(s) as 'Uh'", n_relabeled)
     return out
+
+
+def _split_pair_segment(seg: dict, line_a: str, line_b: str,
+                        _jaccard, _tokens) -> tuple[dict, dict]:
+    """Parte un segmento que contiene DOS líneas de referencia cantadas de
+    corrido. Corte en el límite de palabra que maximiza el match de cada
+    mitad con su línea; sin word-stamps, proporcional por cantidad de
+    tokens. Ambas mitades conservan el resto de los keys del segmento."""
+    words = seg.get("words") or []
+    s0, e0 = float(seg.get("start", 0.0)), float(seg.get("end", 0.0))
+    ta, tb = _tokens(line_a), _tokens(line_b)
+    if len(words) >= 2:
+        best_k, best_sc = None, -1.0
+        for k in range(1, len(words)):
+            left = _tokens(" ".join(w.get("word", "") for w in words[:k]))
+            right = _tokens(" ".join(w.get("word", "") for w in words[k:]))
+            sc = _jaccard(left, ta) + _jaccard(right, tb)
+            if sc > best_sc:
+                best_sc, best_k = sc, k
+        cut_end = float(words[best_k - 1].get("end", s0))
+        cut_start = float(words[best_k].get("start", cut_end))
+        wa, wb = words[:best_k], words[best_k:]
+    else:
+        frac = len(line_a.split()) / max(1, len(line_a.split()) + len(line_b.split()))
+        cut_end = cut_start = s0 + (e0 - s0) * frac
+        wa = wb = None
+    a, b = dict(seg), dict(seg)
+    a["text"], a["end"] = line_a, round(cut_end, 3)
+    b["text"], b["start"] = line_b, round(cut_start, 3)
+    if wa is not None:
+        a["words"], b["words"] = wa, wb
+    else:
+        a.pop("words", None); b.pop("words", None)
+    return a, b

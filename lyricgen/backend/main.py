@@ -2590,13 +2590,22 @@ def _try_send_usage_alert(db: Session, current_user: dict, usage: dict) -> None:
         logger.warning("usage alert skipped: %s", _e)
 
 
-def _enforce_plan_quota(db: Session, current_user: dict) -> None:
-    """Raise 402 if the tenant reached its monthly limit without overage allowed.
+def _enforce_plan_quota(db: Session, current_user: dict,
+                        credits_needed: int = 1) -> None:
+    """Raise 402 if the account can't cover the video about to be generated.
 
     The message is operator-facing (UMG, label teams). It avoids
     backend-y phrasing ("plan", "overage") and points at a human
     contact path so the operator knows what to do — keeping it
     blocking but not a dead-end.
+
+    `credits_needed` es el peso del video que se está por generar: 1 normal,
+    scenes_credit_cost() cuando viene con Escenas. El gate compara contra
+    `total_available` (cupo del plan + regalo vigente), el mismo número que
+    muestra el medidor — así un video de Escenas no arranca con menos
+    créditos que su costo (antes bastaba "queda al menos 1" y la cuenta
+    terminaba en overage sin aviso), y un regalo emitido a mitad de mes
+    desbloquea a una cuenta que ya había agotado el plan.
     """
     plan = current_user.get("plan", "100")
     tenant_id = current_user["tenant_id"]
@@ -2605,9 +2614,20 @@ def _enforce_plan_quota(db: Session, current_user: dict) -> None:
                            billing_group=current_user.get("billing_group"))
     if plan != "unlimited" and usage["percent"] >= 80:
         _try_send_usage_alert(db, current_user, usage)
-    if usage["remaining"] <= 0 and plan != "unlimited":
+    available = usage["total_available"]
+    if available < credits_needed and plan != "unlimited":
         if not current_user.get("allow_overage", False):
             support_email = os.environ.get("SUPPORT_EMAIL", "soporte@genly.pro")
+            if credits_needed > 1 and available > 0:
+                raise HTTPException(
+                    status_code=402,
+                    detail=(
+                        f"Un video con Escenas consume {credits_needed} créditos "
+                        f"y a tu cuenta le queda{'n' if available != 1 else ''} "
+                        f"{available}. Generalo sin Escenas, o contactá a "
+                        f"{support_email} para extender el cupo."
+                    ),
+                )
             raise HTTPException(
                 status_code=402,
                 detail=(
@@ -3691,6 +3711,9 @@ async def upload_multipart_abort(
 class _TranscribeUploadedReq(BaseModel):
     job_id: str = Field(..., max_length=12)
     language: str = Field(default="", max_length=16)
+    # Toggle del operador: "es una versión en vivo" — arma la auditoría de
+    # sufijo aunque el título no tenga marcador live (06/07).
+    live: bool = False
     artist: str = Field(default="", max_length=255)    # DB Job.artist = VARCHAR(255)
     title: str = Field(default="", max_length=500)     # DB Job.song_title = VARCHAR(500)
 
@@ -3741,6 +3764,22 @@ async def transcribe_uploaded(
             detail="Job has no associated upload.",
         )
 
+    # SNAPSHOT + release (incidente agus77 06/07): la descarga de R2 de
+    # abajo tarda decenas de segundos con un WAV de 45-150 MB, y este
+    # handler mantenía la sesión de DB checked-out EN TRANSACCIÓN todo ese
+    # tiempo. Postgres la mataba por idle-in-transaction timeout
+    # ("Transient DB error on POST /transcribe-uploaded"), el pool se
+    # agotaba, TODA la API pasaba a latencias de 20-40 s y el edge cortaba
+    # los demás requests con 502 sin CORS → el wizard mostraba "Sin
+    # respuesta del servidor". Capturamos lo que necesitamos del row y
+    # soltamos la conexión ANTES del I/O largo; los flips de status de más
+    # abajo abren su propia sesión corta.
+    _r2_key = job_row.input_r2_key
+    _row_filename = job_row.filename
+    _row_artist = job_row.artist or ""
+    _row_title = job_row.song_title or ""
+    db.close()
+
     _enforce_disk_capacity()
     _enforce_memory_pressure()
 
@@ -3760,7 +3799,7 @@ async def transcribe_uploaded(
     job_id = body.job_id
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
-    audio_path = os.path.join(job_dir, job_row.filename)
+    audio_path = os.path.join(job_dir, _row_filename)
 
     if not os.path.exists(audio_path):
         import asyncio as _asyncio
@@ -3769,12 +3808,12 @@ async def transcribe_uploaded(
         # /upload-multipart-complete, so a client that under-declared
         # size_bytes in /upload-url could otherwise land an arbitrarily
         # large object and have us download it whole (disk + Whisper).
-        _real_size = storage.head_object_size(job_row.input_r2_key)
+        _real_size = storage.head_object_size(_r2_key)
         if _real_size is not None and _real_size > MAX_UPLOAD_MB * 1024 * 1024:
             logger.warning(
                 "[UPLOAD] 413 at transcribe: job=%s key=%s real=%.1f MB > %d MB "
                 "tenant=%s user=%s",
-                body.job_id, job_row.input_r2_key, _real_size / 1048576,
+                body.job_id, _r2_key, _real_size / 1048576,
                 MAX_UPLOAD_MB, current_user["tenant_id"], current_user["id"],
             )
             raise HTTPException(
@@ -3790,7 +3829,7 @@ async def transcribe_uploaded(
             # de 5 serializaba TODA la API. Mismo patrón executor que
             # /upload-part-proxy.
             _ok = await _loop.run_in_executor(
-                None, storage.download_object, job_row.input_r2_key, audio_path,
+                None, storage.download_object, _r2_key, audio_path,
             )
             if _ok:
                 break
@@ -3801,23 +3840,30 @@ async def transcribe_uploaded(
                 status_code=502,
                 detail="No pudimos leer el archivo subido. Reintentá en unos segundos.",
             )
-    _validate_audio_file_on_disk(job_row.filename, audio_path)
+    _validate_audio_file_on_disk(_row_filename, audio_path)
 
     if _async_enabled:
         # Async path — enqueue + 202 + status polling.
         # Flippeamos status a "transcribing_queued" para que /transcription-status
         # devuelva un estado coherente desde el momento del enqueue.
-        job_row.status = "transcribing_queued"
-        job_row.current_step = "transcribing"
-        # Reset the reaper clock. find_stuck_transcriptions anchors on
-        # coalesce(last_progress_at, created_at) with a 120-min threshold
-        # (reaper.py). A retried `transcription_failed` job has an OLD
-        # created_at, so without this NOW() bump the very next reaper pass
-        # would re-kill it instantly (same class of bug retry_job guards at
-        # main.py:9107). Harmless for fresh awaiting_upload jobs.
-        job_row.last_progress_at = datetime.now(timezone.utc)
-        db.commit()
-        db.close()
+        from database import SessionLocal as _SL
+        _db2 = _SL()
+        try:
+            _row2 = get_job_model(_db2, job_id)
+            if _row2 is None:
+                raise HTTPException(status_code=404, detail="Job not found.")
+            _row2.status = "transcribing_queued"
+            _row2.current_step = "transcribing"
+            # Reset the reaper clock. find_stuck_transcriptions anchors on
+            # coalesce(last_progress_at, created_at) with a 120-min threshold
+            # (reaper.py). A retried `transcription_failed` job has an OLD
+            # created_at, so without this NOW() bump the very next reaper pass
+            # would re-kill it instantly (same class of bug retry_job guards at
+            # main.py:9107). Harmless for fresh awaiting_upload jobs.
+            _row2.last_progress_at = datetime.now(timezone.utc)
+            _db2.commit()
+        finally:
+            _db2.close()
         try:
             from queue_jobs import enqueue_transcription
             # HOTFIX 2026-05-27: use the Job row as the single source of
@@ -3832,10 +3878,11 @@ async def transcribe_uploaded(
                 job_id,
                 audio_path,
                 language=body.language,
-                artist=job_row.artist or "",
-                title=job_row.song_title or "",
-                filename=job_row.filename,
+                artist=_row_artist,
+                title=_row_title,
+                filename=_row_filename,
                 tenant_id=current_user.get("tenant_id", ""),
+                live=bool(body.live),
             )
         except Exception as exc:
             logger.exception("[TRANSCRIBE] enqueue failed for job=%s", job_id)
@@ -3858,13 +3905,19 @@ async def transcribe_uploaded(
         # /transcribe handler. Keeping the implementation in one place via
         # the helper below means the lyrics-recovery / hallucination logic
         # stays in lockstep with the legacy fallback.
-        job_row.status = "transcribed_pending"
-        job_row.current_step = "editing"
-        db.commit()
-        # Release the pooled connection BEFORE the ~15-20 s transcription so
-        # it doesn't starve /usage and /jobs (dashboard freeze). The function
-        # opens its own short-lived session for the only DB touch it needs.
-        db.close()
+        # Sesión corta para el flip (la del request se soltó antes de la
+        # descarga); BEFORE the ~15-20 s transcription so it doesn't starve
+        # /usage and /jobs (dashboard freeze).
+        from database import SessionLocal as _SL
+        _db3 = _SL()
+        try:
+            _row3 = get_job_model(_db3, job_id)
+            if _row3 is not None:
+                _row3.status = "transcribed_pending"
+                _row3.current_step = "editing"
+                _db3.commit()
+        finally:
+            _db3.close()
 
         # HOTFIX 2026-05-27: same source-of-truth fix as the async path —
         # use job_row.artist / job_row.song_title (committed at /upload-url
@@ -3873,12 +3926,15 @@ async def transcribe_uploaded(
         _result = await _run_transcription_for_job(
             request, current_user, job_id, audio_path,
             language=body.language,
-            artist=job_row.artist or "",
-            title=job_row.song_title or "",
+            artist=_row_artist,
+            title=_row_title,
         )
         _result = await _maybe_ctc_retime(_result, audio_path, job_id,
-                                          job_row.artist or "",
-                                          job_row.song_title or "")
+                                          _row_artist, _row_title)
+        _result = await _maybe_adlib_filter(
+            _result, audio_path, job_id,
+            live_hint=bool(getattr(body, "live", False))
+            or _looks_live(_row_title, _row_filename))
         from lyrics_format import format_lyrics_pass as _fmt
         return await _fmt(_result, language=body.language or "es")
     finally:
@@ -4274,7 +4330,10 @@ async def upload(
         if not song_title:
             song_title = parsed_title
 
-    _enforce_plan_quota(db, current_user)
+    _enforce_plan_quota(db, current_user,
+                        credits_needed=(scenes_credit_cost()
+                                        if enable_scenes and has_scenes_access(current_user)
+                                        else 1))
     _enforce_daily_volume_cap(db, current_user)
     _enforce_tenant_backlog(db, current_user)
     _enforce_disk_capacity()
@@ -4535,11 +4594,163 @@ async def transcribe_endpoint(
         filename=file.filename,
     )
     _result = await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
+    _result = await _maybe_adlib_filter(_result, audio_path, job_id,
+                                        live_hint=_looks_live(title, file.filename))
     from lyrics_format import format_lyrics_pass as _fmt
     return await _fmt(_result, language=language or "es")
 
 
 from ctc_cascade_veto import _ctc_cascade_veto  # noqa: E402
+
+
+_LIVE_MARKER_RE = re.compile(
+    r"\b(live|en\s+vivo|vivo|ac[uú]stic[oa]|unplugged|directo|concert|"
+    r"session(?:es)?|sesi[oó]n)\b", re.IGNORECASE)
+
+
+def _looks_live(*texts) -> bool:
+    """¿Algún texto (título/filename) sugiere una versión en vivo/alternativa?
+    Señal barata para armar la auditoría de sufijo. El catálogo etiqueta los
+    vivos en el título ('Live In Buenos Aires 2001'); para archivos sin
+    etiquetar existe el toggle del operador (body.live)."""
+    return any(t and _LIVE_MARKER_RE.search(str(t)) for t in texts)
+
+
+async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
+                              live_hint: bool = False):
+    """Paso post-cascada (gate ADLIB_CONSENSUS_ENABLED, default off): descarta
+    líneas fantasma alucinadas en zonas de ad-lib y colapsa los 'uh'
+    fragmentados. Corre en TODOS los caminos de la cascada (whisperx,
+    reconcile, CTC, scaffold) — a diferencia del retime de CTC, que solo
+    actúa en su rama. Así el output queda limpio sin importar qué
+    segmentación produjo la cascada (que es no-determinista por la
+    variabilidad de whisperX en Replicate).
+
+    No-op verdadero en canciones sin ad-libs (cero candidatas → cero
+    regresión, verificado en 12 UMG gold). Never raises: ante cualquier
+    fallo devuelve el result intacto. Consigue el stem del cache R2 (la
+    cascada lo dejó ahí); si no está y no se puede computar, declina."""
+    if not isinstance(result, dict):
+        return result
+    if os.environ.get("ADLIB_CONSENSUS_ENABLED", "0").strip().lower() \
+            not in ("1", "true", "yes", "on"):
+        return result
+    segs = result.get("segments") or []
+    if len(segs) < 3:
+        return result
+    _stem = None
+    try:
+        import adlib_consensus as _ac
+        _has_adlib = any(_ac.is_adlib_text(s.get("text", "")) for s in segs)
+        _tail_on = os.environ.get("ADLIB_TAIL_CHECK_ENABLED", "1") \
+            .strip().lower() in ("1", "true", "yes", "on")
+        # Auditoría de sufijo (Perro Amor Explota LIVE, 06/07): el final del
+        # audio es de OTRA versión (vivo↔estudio) con voz real en la cola —
+        # el VAD no lo ve. Solo se arma con live_hint (título con marcador
+        # live o toggle del operador): medido contra el gold (06/07), en
+        # canciones normales los finales quietos/en capas dan falsos
+        # positivos. Y MARCA (review), no borra — ver filter_and_collapse.
+        _audit_on = live_hint and os.environ.get(
+            "ADLIB_SUFFIX_AUDIT_ENABLED", "1") \
+            .strip().lower() in ("1", "true", "yes", "on")
+        # Barato primero: sin ad-libs y sin ningún chequeo de final, ni
+        # tocamos el stem.
+        if not _has_adlib and not _tail_on and not _audit_on:
+            return result
+        import vocal_sep as _vs
+        _stem = await asyncio.wait_for(
+            asyncio.to_thread(_vs.separate_vocals, audio_path, cache_only=True),
+            timeout=120,
+        )
+        # Computar el stem solo si hay ad-libs (el camino histórico). Para
+        # el chequeo de cola solo, un cache miss no justifica Demucs.
+        if not _stem and _has_adlib and os.environ.get(
+                "CTC_ALIGN_COMPUTE_STEM", "1").strip().lower() in ("1", "true", "yes", "on"):
+            _stem = await asyncio.wait_for(
+                asyncio.to_thread(_vs.separate_vocals, audio_path), timeout=360)
+        if not _stem:
+            logger.info("[ADLIB] sin stem — omito el filtro (job=%s)", job_id)
+            return result
+        # Cola muda: fin del último canto según VAD de energía del stem.
+        # Caso El Riesgo (05/07): lrclib trajo la letra de otra edición con
+        # un outro cantado que este audio no tiene; el scaffold puso esas
+        # líneas sobre 76s de música instrumental. Si la cola muda es larga
+        # (>10s), las líneas que caen ahí se verifican acústicamente.
+        _tail_after = None
+        if _tail_on:
+            try:
+                from anchor_align import vocal_regions as _vr
+                _regs = await asyncio.to_thread(_vr, _stem)
+                if _regs:
+                    _last_voice = _regs[-1][1]
+                    _last_line_end = max(
+                        (float(s.get("end", 0)) for s in segs), default=0.0)
+                    if _last_line_end - _last_voice > 10.0:
+                        _tail_after = _last_voice
+                        logger.info(
+                            "[ADLIB] cola muda: voz hasta %.1fs, líneas hasta "
+                            "%.1fs — verificando la cola (job=%s)",
+                            _last_voice, _last_line_end, job_id)
+            except Exception as e:
+                logger.warning("[ADLIB] VAD de cola falló: %r — sin chequeo "
+                               "de cola (job=%s)", e, job_id)
+        if not _has_adlib and _tail_after is None and not _audit_on:
+            return result
+        _tw = _make_stem_window_transcriber(_stem)
+        _before = len(segs)
+        filtered = await asyncio.to_thread(
+            _ac.filter_and_collapse, segs, _tw, tail_after=_tail_after,
+            audit_suffix=_audit_on)
+        if filtered != segs:
+            result = dict(result)
+            result["segments"] = filtered
+            logger.info("[ADLIB] consenso: %d → %d líneas (job=%s)",
+                        _before, len(filtered), job_id)
+    except Exception as e:
+        logger.warning("[ADLIB] filtro post-cascada declinó: %r (job=%s)", e, job_id)
+    finally:
+        if _stem:
+            try:
+                os.unlink(_stem)
+            except OSError:
+                pass
+    return result
+
+
+def _make_stem_window_transcriber(stem_path: str):
+    """Devuelve transcribe_window(start, end) -> str: recorta esa ventana del
+    stem de voz y la transcribe con whisper-1. Para el filtro de consenso
+    (adlib_consensus): solo se llama en líneas candidatas (pocas por canción).
+    Recorta con un pad chico y compensa el lead-in para caer sobre el onset
+    real. Devuelve '' ante cualquier problema (el filtro conserva la línea)."""
+    import subprocess
+    import tempfile
+
+    def _transcribe_window(start: float, end: float) -> str:
+        a = max(0.0, float(start) + 0.4 - 0.25)   # +0.4 deshace el lead; -0.25 pad
+        dur = max(1.8, float(end) - float(start) + 0.3)
+        fd, clip = tempfile.mkstemp(suffix=".wav", prefix="genly_adlib_")
+        os.close(fd)
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", stem_path,
+                 "-ss", str(a), "-t", str(dur), clip],
+                check=True, timeout=30,
+            )
+            from pipeline import _transcribe_via_openai_api as _wx
+            segs = _wx(clip, language="es") or []
+            return " ".join((s.get("text") or "").strip() for s in segs).strip()
+        except Exception as e:
+            logger.warning("[ADLIB] window %.1f-%.1f transcribe failed: %s",
+                           start, end, e)
+            return ""
+        finally:
+            try:
+                os.unlink(clip)
+            except OSError:
+                pass
+
+    return _transcribe_window
 
 
 async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
@@ -4570,23 +4781,56 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
         if len(segs) < 3:
             return result
         import vocal_sep as _vs
-        # cache_only: the cascade computed the stem seconds ago, so this
-        # is an R2 download — never a second (paid, 60-180 s, hangable)
-        # demucs run. Cascade paths that skipped vocal separation have
-        # no cached stem → decline; aligning on the mix is unvalidated.
+        # cache_only primero: si la cascada computó el stem hace segundos,
+        # esto es solo una descarga de R2.
         _stem = await asyncio.wait_for(
             asyncio.to_thread(_vs.separate_vocals, audio_path, cache_only=True),
             timeout=120,
         )
-        if not _stem:
+        if not _stem and os.environ.get(
+                "CTC_ALIGN_COMPUTE_STEM", "1").strip().lower() in ("1", "true", "yes", "on"):
+            # Sin stem cacheado → COMPUTARLO (regresión Amanda Pujó,
+            # 03/07): cuando la transcripción viene del cache, la cascada
+            # nunca corre demucs, el wrapper caía a la mezcla, y en mezclas
+            # indie (voz enterrada) CTC declinaba estructural (13/29 skips)
+            # dejando el timing del reconcile (línea fantasma + puente
+            # 2.6s tarde). Sobre el stem la misma canción alinea 29/29.
+            # Costo: ~60-180s de Replicate + ~$0.005, UNA vez por canción
+            # (separate_vocals sube el stem al cache R2). El timeout deja
+            # margen para el peor caso de Replicate.
+            logger.info("[CTC] no cached stem — computing it (job=%s)", job_id)
+            _stem = await asyncio.wait_for(
+                asyncio.to_thread(_vs.separate_vocals, audio_path),
+                timeout=360,
+            )
+        # Fallback a la MEZCLA (medido en el gold set, 03/07): la
+        # declinación de CTC varía según la fuente — Grignani alineó
+        # med 0.105s/74.5%≤0.3s y PROVENZA 0.177s/76% SOBRE LA MEZCLA
+        # habiendo declinado sobre el stem (demucs sobre-separa algunas
+        # mezclas); Rata Blanca es el caso inverso (mezcla declina por
+        # score, stem alinea perfecto). La corrida completa del gold set
+        # (40 canciones, 100% sobre mezcla) dio 50.7% ≤0.3s — la mezcla
+        # como fuente está validada. Costo del retry: solo CPU local.
+        _mix_fallback = os.environ.get(
+            "CTC_ALIGN_MIX_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
+        retimed = None
+        _stem_structural = False
+        if _stem:
+            retimed = await asyncio.wait_for(
+                asyncio.to_thread(_ctc.retime_segments, _stem, segs, job_id,
+                                  audio_path),  # mix_path — M5 crowd recovery
+                timeout=420,
+            )
+            # Solo confiar en last_decline_reason (global de módulo) si
+            # ESTE call corrió — sin stem quedaría el valor del job anterior.
+            _stem_structural = (retimed is None
+                                and _ctc.last_decline_reason == "structural")
+        elif not _mix_fallback:
             logger.info("[CTC] no cached stem — skipping retime (job=%s)", job_id)
             return result
-        retimed = await asyncio.wait_for(
-            asyncio.to_thread(_ctc.retime_segments, _stem, segs, job_id,
-                              audio_path),  # mix_path — M5 crowd recovery
-            timeout=420,
-        )
-        if (retimed is None and _ctc.last_decline_reason == "structural"
+        else:
+            logger.info("[CTC] no cached stem — aligning on the MIX (job=%s)", job_id)
+        if (_stem_structural
                 and os.environ.get("CTC_ALIGN_PERF_TEXT", "0").strip().lower()
                 in ("1", "true", "yes", "on")):
             # ETAPA A — the cascade's text doesn't match what this live
@@ -4620,9 +4864,34 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
                     logger.info("[CTC] performance-libretto retime: %d líneas "
                                 "(reemplaza el texto de la cascada, job=%s)",
                                 len(retimed), job_id)
+        # Retry sobre la MEZCLA cuando el stem declinó por score (no
+        # estructural — eso ya tiene su camino perf-text arriba, y una
+        # mezcla no arregla un libreto que no matchea). También cubre el
+        # caso sin stem cacheado (retimed sigue None y nunca corrimos el
+        # primer align).
+        if retimed is None and _mix_fallback and not _stem_structural:
+            retimed = await asyncio.wait_for(
+                asyncio.to_thread(_ctc.retime_segments, audio_path, segs, job_id),
+                timeout=420,
+            )
+            if retimed:
+                logger.info("[CTC] retime sobre la MEZCLA OK (stem %s, job=%s)",
+                            "declinó" if _stem else "ausente", job_id)
         if retimed:
+            # Re-aplicar el lead-in: la cascada lo aplicó dentro de
+            # _emit_segments, pero el retime de CTC produce onsets
+            # acústicos frescos SIN lead — sin esta línea, justo las
+            # canciones donde CTC actúa perdían el lead-in (#801) y
+            # ambas mejoras se anulaban entre sí. No hay doble
+            # aplicación: en el camino de declive los segmentos de la
+            # cascada (ya con lead) pasan intactos.
+            # El filtro de ad-libs se mudó a _maybe_adlib_filter (paso
+            # post-cascada, corre en TODOS los caminos — no solo cuando CTC
+            # retima). Acá solo re-aplicamos el lead-in sobre los onsets
+            # frescos de CTC (#801).
+            import lead_in as _lead_in
             result = dict(result)
-            result["segments"] = retimed
+            result["segments"] = _lead_in.polish(retimed)
             from jobs import set_timing_source
             from timing_sources import CTC_ALIGN
             set_timing_source(job_id, CTC_ALIGN)
@@ -4710,14 +4979,21 @@ async def _run_transcription_for_job(
         #      (only when per-word stamps are present; no-op otherwise)
         #   2. beat_snap — snap starts to the song's beat grid (±200ms)
         #   3. mark_repetitions — tag chorus loops with repetition_group
-        # See whisperx_transcribe.py, beat_snap.py, chorus_trim.py.
+        #   4. lead_in — adelantar la aparición de la línea (karaoke lead;
+        #      LYRIC_LEAD_IN_S, default 0 = off). Va ÚLTIMO para operar
+        #      sobre los starts ya definitivos; los word-stamps no se
+        #      tocan, así el highlight sigue clavado al onset real.
+        # See whisperx_transcribe.py, beat_snap.py, chorus_trim.py, lead_in.py.
         import beat_snap as _beat_snap
         import chorus_trim as _chorus_trim
+        import lead_in as _lead_in
         from whisperx_transcribe import _split_long_segments as _split_long
         def _snap(segs):
-            return _chorus_trim.mark_repetitions(
-                _beat_snap.apply(tmp_path,
-                    _split_long(segs)
+            return _lead_in.polish(
+                _chorus_trim.mark_repetitions(
+                    _beat_snap.apply(tmp_path,
+                        _split_long(segs)
+                    )
                 )
             )
 
@@ -7067,7 +7343,10 @@ async def generate_with_segments(
         if not song_title:
             song_title = parsed_title
 
-    _enforce_plan_quota(db, current_user)
+    _enforce_plan_quota(db, current_user,
+                        credits_needed=(scenes_credit_cost()
+                                        if enable_scenes and has_scenes_access(current_user)
+                                        else 1))
     _enforce_daily_volume_cap(db, current_user)
     _enforce_tenant_backlog(db, current_user)
     _enforce_disk_capacity()
