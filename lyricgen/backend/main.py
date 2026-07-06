@@ -3200,8 +3200,7 @@ async def get_settings(
     db: Session = Depends(get_db),
 ):
     """Return app settings for the current user."""
-    settings = db.query(UserSettings).filter(UserSettings.user_id == current_user["id"]).first()
-    return settings.settings_json if settings else {}
+    return _load_user_settings(db, current_user["id"]) or {}
 
 
 @app.post("/settings")
@@ -3225,19 +3224,191 @@ async def save_settings(
 # YouTube
 # ---------------------------------------------------------------------------
 
+_YOUTUBE_PRIVACY_VALUES = ("public", "unlisted", "private")
+
+# YouTube uploads block a thread for minutes; a dedicated pool keeps them
+# from starving the default executor the transcription endpoints share.
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+_YOUTUBE_EXECUTOR = _ThreadPoolExecutor(max_workers=4, thread_name_prefix="yt-upload")
+
+# A claim older than this is considered orphaned (worker died mid-upload)
+# and may be taken over by a new request.
+_YOUTUBE_CLAIM_STALE_S = int(os.environ.get("YOUTUBE_CLAIM_STALE_S", "3600"))
+
+
+def _job_song_title(job: dict) -> str:
+    """Song title for YouTube metadata: prefer the title the user supplied
+    (or the upload-time parse) over re-deriving it from the raw filename."""
+    return job.get("song_title") or _parse_filename_artist_title(job.get("filename", ""))[1]
+
+
+def _load_user_settings(db: Session, user_id: int) -> dict | None:
+    """Per-user settings from the DB; None when the user has none saved so
+    youtube_upload can fall back to the legacy outputs/_settings.json."""
+    settings = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
+    return (settings.settings_json or None) if settings else None
+
+
+def _youtube_settings_for_job(db: Session, job_id: str, fallback_user_id: int) -> dict | None:
+    """The YouTube template to apply to a job: the job owner's settings, so a
+    teammate publishing someone else's job still gets the configured branding."""
+    owner_id = db.query(Job.user_id).filter(Job.job_id == job_id).scalar()
+    settings = _load_user_settings(db, owner_id) if owner_id else None
+    if settings is None and owner_id != fallback_user_id:
+        settings = _load_user_settings(db, fallback_user_id)
+    return settings
+
+
+def _claim_youtube_upload(db: Session, job_id: str, user_id: int) -> None:
+    """Atomically claim the right to upload this job's video.
+
+    The claim is a marker written into Job.youtube_data with a conditional
+    UPDATE (only when the column is NULL), so it is race-free across event
+    loops, uvicorn workers, and replicas — the in-DB equivalent of the Redis
+    upload-slot lease. The claim is released by overwriting youtube_data with
+    the upload result (success) or NULL (failure); a crashed worker's orphan
+    claim expires after _YOUTUBE_CLAIM_STALE_S.
+
+    Raises 409 when another upload holds a fresh claim.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    marker = {
+        "status": "uploading",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "by": user_id,
+    }
+    claimed = (
+        db.query(Job)
+        .filter(Job.job_id == job_id, Job.youtube_data.is_(None))
+        .update({Job.youtube_data: marker}, synchronize_session=False)
+    )
+    db.commit()
+    if claimed:
+        return
+
+    current = db.query(Job.youtube_data).filter(Job.job_id == job_id).scalar()
+    if current and current.get("status") == "uploading":
+        try:
+            started = datetime.fromisoformat(current.get("started_at", ""))
+        except ValueError:
+            started = None
+        now = datetime.now(timezone.utc)
+        if started and now - started > timedelta(seconds=_YOUTUBE_CLAIM_STALE_S):
+            # Orphaned claim (worker died mid-upload): take it over.
+            db.query(Job).filter(Job.job_id == job_id).update(
+                {Job.youtube_data: marker}, synchronize_session=False,
+            )
+            db.commit()
+            return
+    raise HTTPException(status_code=409, detail="Upload already in progress for this job.")
+
+
+def _release_youtube_claim(job_id: str) -> None:
+    """Clear a claim marker after a failed upload so the user can retry.
+    Only removes the marker — never a persisted upload result."""
+    from database import SessionLocal
+
+    s = SessionLocal()
+    try:
+        job = s.query(Job).filter(Job.job_id == job_id).first()
+        if job and isinstance(job.youtube_data, dict) and job.youtube_data.get("status") == "uploading":
+            job.youtube_data = None
+            s.commit()
+    finally:
+        s.close()
+
+
+def _audit(user_id: int, action: str, detail: dict) -> None:
+    """Write an AuditLog row on a fresh short-lived session (the request
+    session may have gone stale across a multi-minute upload)."""
+    from database import SessionLocal
+
+    s = SessionLocal()
+    try:
+        s.add(AuditLog(user_id=user_id, action=action, detail=detail))
+        s.commit()
+    finally:
+        s.close()
+
+
+class YouTubeUploadRequest(BaseModel):
+    # The exact metadata the user previewed/approved in the UI. When present
+    # it is published as-is instead of regenerating (what you approve is
+    # what goes live).
+    metadata: dict | None = None
+
+
 @app.post("/youtube/upload/{job_id}")
 async def youtube_upload(
     job_id: str,
     privacy: str = "unlisted",
+    body: YouTubeUploadRequest | None = None,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Upload a completed job's video to YouTube with AI-generated metadata."""
+    """Upload a completed job's video to YouTube."""
+    if privacy not in _YOUTUBE_PRIVACY_VALUES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"privacy must be one of: {', '.join(_YOUTUBE_PRIVACY_VALUES)}",
+        )
+
     job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     if job["status"] != "done":
         raise HTTPException(status_code=400, detail="Job is not done yet.")
+
+    import asyncio
+    from functools import partial
+    from youtube_upload import (
+        upload_to_youtube, update_video_privacy, YouTubeNotConfiguredError,
+    )
+    from googleapiclient.errors import HttpError
+    from google.auth.exceptions import RefreshError
+
+    def _map_upload_error(e: Exception, ctx: str) -> HTTPException:
+        """Sanitized error → HTTP mapping. Full detail goes to the log only —
+        raw exception text can carry token paths / API URLs."""
+        logger.exception("[YOUTUBE] %s failed for job %s", ctx, job_id)
+        if isinstance(e, (YouTubeNotConfiguredError, RefreshError)):
+            return HTTPException(
+                status_code=503,
+                detail="YouTube is not connected on this server. Ask an administrator to (re)authorize the channel.",
+            )
+        if isinstance(e, HttpError):
+            reason = getattr(e, "reason", None) or f"HTTP {getattr(getattr(e, 'resp', None), 'status', '?')}"
+            return HTTPException(status_code=502, detail=f"YouTube API error: {reason}")
+        return HTTPException(
+            status_code=502,
+            detail=f"YouTube {ctx} failed ({type(e).__name__}). Check server logs.",
+        )
+
+    loop = asyncio.get_running_loop()
+
+    # Idempotency: the job already has a published video — never upload a
+    # duplicate. If the caller asks for a different privacy, apply it to the
+    # existing video instead.
+    existing = job.get("youtube")
+    if existing and existing.get("video_id"):
+        if existing.get("privacy") == privacy:
+            return existing
+        try:
+            await loop.run_in_executor(
+                _YOUTUBE_EXECUTOR,
+                partial(update_video_privacy, existing["video_id"], privacy),
+            )
+        except Exception as e:
+            raise _map_upload_error(e, "privacy change")
+        result = {**existing, "privacy": privacy}
+        update_job(job_id, youtube=result)
+        _audit(current_user["id"], "job.youtube_privacy_change", {
+            "job_id": job_id,
+            "video_id": existing["video_id"],
+            "privacy": privacy,
+        })
+        return result
 
     video_path = os.path.join(OUTPUTS_DIR, job_id, "lyric_video.mp4")
     thumb_path = os.path.join(OUTPUTS_DIR, job_id, "thumbnail.jpg")
@@ -3245,23 +3416,50 @@ async def youtube_upload(
     if not os.path.exists(video_path):
         raise HTTPException(status_code=404, detail="Video file not found.")
 
-    filename = job.get("filename", "")
-    song = filename.replace(".mp3", "")
-    if " - " in song:
-        song = song.split(" - ", 1)[1]
-    for sfx in ["(Official Video)", "(Official Audio)", "(En Vivo)", "(Live)", "(Lyrics)"]:
-        song = song.replace(sfx, "").strip()
+    metadata = None
+    if body and body.metadata:
+        metadata = {
+            "title": str(body.metadata.get("title") or "").strip(),
+            "description": str(body.metadata.get("description") or ""),
+            "tags": [str(t) for t in (body.metadata.get("tags") or []) if str(t).strip()],
+            "category": str(body.metadata.get("category") or "10"),
+        }
+        if not metadata["title"]:
+            raise HTTPException(status_code=400, detail="metadata.title must not be empty.")
 
+    song = _job_song_title(job)
     artist = job.get("artist", "")
+    settings = _youtube_settings_for_job(db, job_id, current_user["id"])
 
-    import asyncio
-    from youtube_upload import upload_to_youtube
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None, upload_to_youtube, video_path, thumb_path, artist, song, "", privacy, job_id,
-    )
+    _claim_youtube_upload(db, job_id, current_user["id"])
 
-    update_job(job_id, youtube=result)
+    # The upload takes minutes; release this request's pooled connection so
+    # concurrent uploads can't exhaust the pool (get_db's close is a no-op
+    # after this). Everything below uses short-lived sessions.
+    db.close()
+
+    try:
+        result = await loop.run_in_executor(
+            _YOUTUBE_EXECUTOR,
+            partial(
+                upload_to_youtube, video_path, thumb_path, artist, song, "",
+                privacy, job_id, metadata=metadata, settings=settings,
+            ),
+        )
+        # Persisting the result is what releases the claim — no window where
+        # a retry could slip in between release and persist.
+        update_job(job_id, youtube=result)
+    except Exception as e:
+        _release_youtube_claim(job_id)
+        raise _map_upload_error(e, "upload")
+
+    _audit(current_user["id"], "job.youtube_publish", {
+        "job_id": job_id,
+        "video_id": result.get("video_id"),
+        "url": result.get("url"),
+        "privacy": privacy,
+        "title": result.get("title"),
+    })
 
     return result
 
@@ -3277,18 +3475,25 @@ async def youtube_metadata_preview(
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
 
-    filename = job.get("filename", "")
-    song = filename.replace(".mp3", "")
-    if " - " in song:
-        song = song.split(" - ", 1)[1]
-    for sfx in ["(Official Video)", "(Official Audio)", "(En Vivo)", "(Live)", "(Lyrics)"]:
-        song = song.replace(sfx, "").strip()
+    song = _job_song_title(job)
+    settings = _youtube_settings_for_job(db, job_id, current_user["id"])
 
     from youtube_upload import generate_youtube_metadata
     from functools import partial
     import asyncio
-    loop = asyncio.get_event_loop()
-    metadata = await loop.run_in_executor(
-        None, partial(generate_youtube_metadata, job.get("artist", ""), song, "", job_id=job_id),
-    )
+    loop = asyncio.get_running_loop()
+    try:
+        metadata = await loop.run_in_executor(
+            _YOUTUBE_EXECUTOR,
+            partial(
+                generate_youtube_metadata, job.get("artist", ""), song, "",
+                job_id=job_id, settings=settings,
+            ),
+        )
+    except Exception as e:
+        logger.exception("[YOUTUBE] Metadata generation failed for job %s", job_id)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Metadata generation failed ({type(e).__name__}). Check server logs.",
+        )
     return metadata
