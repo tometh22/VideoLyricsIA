@@ -119,3 +119,74 @@ def test_collapse_preserves_adlib_text():
             {"text": "Na na na", "start": 2, "end": 4}]
     out = ac.filter_and_collapse(segs, lambda a, b: "")
     assert len(out) == 1 and "na na na" in out[0]["text"].lower()
+
+
+# ── verificación de cola (El Riesgo, 05/07: letra de otra versión) ──────────
+# fixtures_adlib_riesgo.json = datos REALES del job 828a33641b42: las últimas
+# 16 líneas (7 legítimas en zona oída + 9 en la cola muda de 76s), con
+# `heard` = lo que whisper transcribió sobre el stem en cada ventana de cola
+# (todas: "Subtítulos realizados por…", la alucinación de silencio). lrclib
+# entregó la letra de OTRA edición cuyo outro cantado no existe en el audio.
+
+_RIESGO = json.loads(
+    (Path(__file__).parent / "fixtures_adlib_riesgo.json").read_text())
+_RIESGO_TAIL_AFTER = 266.3   # fin de la última región de voz (VAD del stem real)
+
+
+def _riesgo_transcriber(start, end):
+    for r in _RIESGO:
+        if abs(r["start"] - start) < 0.05:
+            return r.get("heard", "")
+    return ""
+
+
+def test_tail_candidates_are_lines_in_mute_tail():
+    segs = [{"start": r["start"], "end": r["end"], "text": r["text"]} for r in _RIESGO]
+    idx = ac.tail_candidates(segs, _RIESGO_TAIL_AFTER)
+    assert idx == set(range(7, 16))          # exactamente las 9 de la cola
+    assert ac.tail_candidates(segs, None) == set()
+
+
+def test_riesgo_tail_ghosts_all_dropped():
+    """Las 9 líneas de la cola muda (incluido el 'Oh-oh' y el canto repetido
+    'De la, de la mariposa' que la protección de coro blindaba) se van; las
+    7 legítimas de la zona oída quedan intactas."""
+    segs = [{"start": r["start"], "end": r["end"], "text": r["text"]} for r in _RIESGO]
+    out = ac.filter_and_collapse(segs, _riesgo_transcriber,
+                                 tail_after=_RIESGO_TAIL_AFTER)
+    texts = " | ".join(s["text"] for s in out).lower()
+    assert "mariposa" not in texts
+    assert "este es el plan" not in texts
+    assert "púa" not in texts
+    assert "oh-oh" not in texts
+    assert [s["start"] for s in out] == [r["start"] for r in _RIESGO[:7]]
+
+
+def test_riesgo_without_tail_keeps_old_behavior():
+    """tail_after=None = comportamiento pre-cola exacto: el canto repetido
+    queda protegido como coro (el bug que motivó esto)."""
+    segs = [{"start": r["start"], "end": r["end"], "text": r["text"]} for r in _RIESGO]
+    out = ac.filter_and_collapse(segs, _riesgo_transcriber)
+    texts = " | ".join(s["text"] for s in out).lower()
+    assert "mariposa" in texts               # sobrevive (protegido) — sin cola no lo vemos
+
+
+def test_chorus_protection_still_alive_in_heard_zone():
+    """La protección de coro sigue viva DENTRO de la zona oída: una línea
+    repetida antes de tail_after no se toca aunque el audio no la confirme."""
+    segs = [
+        {"start": 10.0, "end": 12.0, "text": "Uh, uh"},
+        {"start": 13.0, "end": 15.0, "text": "Somos el coro"},
+        {"start": 20.0, "end": 22.0, "text": "Somos el coro"},
+    ]
+    out = ac.filter_and_collapse(segs, lambda a, b: "", tail_after=100.0)
+    assert sum(1 for s in out if s["text"] == "Somos el coro") == 2
+
+
+def test_short_tail_is_noop():
+    """Una canción normal (última línea ≈ último canto) con tail_after
+    apenas anterior: nada cae en la cola → output idéntico."""
+    segs = [{"start": float(i * 10), "end": i * 10 + 3.0, "text": f"línea {i}"}
+            for i in range(5)]
+    out = ac.filter_and_collapse(segs, lambda a, b: "", tail_after=41.0)
+    assert out == segs

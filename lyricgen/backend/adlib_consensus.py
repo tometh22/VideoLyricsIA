@@ -183,26 +183,67 @@ def _collapse_runs(segs: list[dict], drop: set) -> list[dict]:
     return out
 
 
+# Margen tras el fin de la última región de voz: una línea que ARRANCA
+# después de esto está en la cola muda (el lead-in mueve starts ~0.4s hacia
+# antes; 3s lo absorbe con aire de sobra).
+TAIL_MARGIN_S = 3.0
+
+
+def tail_candidates(segs: list[dict], tail_after: float | None) -> set:
+    """Índices de líneas en la COLA MUDA: arrancan después del fin del
+    último canto detectado (VAD de energía sobre el stem) + margen.
+
+    Caso real (El Riesgo, 05/07): lrclib entregó la letra de OTRA edición
+    de la canción, cuyo outro cantado ("Este es el plan / De la, de la
+    mariposa") no existe en este audio. El scaffold sincronizado colocó
+    esas líneas sobre 76s de música instrumental — whisperX no oyó NADA
+    ahí. A diferencia de las candidatas por adyacencia (find_candidates),
+    acá se chequea TODO lo que caiga en la cola, ad-libs incluidos, y sin
+    protección de coro: el canto fantasma se repite solo DENTRO de la
+    zona muda, así que repetirse no es evidencia de nada."""
+    if tail_after is None:
+        return set()
+    out = set()
+    for i, s in enumerate(segs):
+        try:
+            if float(s.get("start", 0)) > tail_after + TAIL_MARGIN_S:
+                out.add(i)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def filter_and_collapse(segs: list[dict], transcribe_window,
-                        *, phon_min: float = PHON_MIN) -> list[dict]:
+                        *, phon_min: float = PHON_MIN,
+                        tail_after: float | None = None) -> list[dict]:
     """Descarta líneas fantasma (consenso acústico) y colapsa ad-libs.
 
     `transcribe_window(start, end) -> str`: transcribe esa ventana del stem
     de voz. Inyectada para testeo. Si devuelve None / lanza, la candidata
-    se conserva (nunca borrar por las dudas). Never raises."""
+    se conserva (nunca borrar por las dudas). Never raises.
+
+    `tail_after`: fin del último canto real (segundos) según el VAD del
+    stem, o None. Con un valor, las líneas de la cola muda (start >
+    tail_after + TAIL_MARGIN_S) también se verifican acústicamente, SIN
+    protección de coro (ver tail_candidates). None = comportamiento
+    exacto pre-cola."""
     if not segs:
         return segs
     try:
-        # No-op verdadero SOLO si la canción no tiene NINGÚN ad-lib: sin uh no
-        # hay nada que colapsar ni candidatas que filtrar → cero regresión.
-        if not any(is_adlib_text(s.get("text", "")) for s in segs):
+        tail_idx = tail_candidates(segs, tail_after)
+        # No-op verdadero si la canción no tiene NINGÚN ad-lib NI cola muda:
+        # nada que colapsar ni candidatas que filtrar → cero regresión.
+        if not tail_idx and not any(is_adlib_text(s.get("text", "")) for s in segs):
             return list(segs)
-        cands = find_candidates(segs)
-        choruses = chorus_keys(segs)
+        cands = sorted(set(find_candidates(segs)) | tail_idx)
+        # La protección de coro solo se gana en la zona OÍDA: un texto que
+        # se repite únicamente dentro de la cola muda no tiene respaldo.
+        choruses = chorus_keys([s for i, s in enumerate(segs) if i not in tail_idx])
         drop = set()
         for i in cands:
             s = segs[i]
-            protected = _norm_key(s.get("text", "")) in choruses
+            protected = (i not in tail_idx
+                         and _norm_key(s.get("text", "")) in choruses)
             if protected:
                 continue
             try:
@@ -216,8 +257,10 @@ def filter_and_collapse(segs: list[dict], transcribe_window,
                 continue
             if is_phantom(s.get("text", ""), heard, False, phon_min=phon_min):
                 drop.add(i)
-                logger.info("[ADLIB] fantasma descartado @%.1fs: %r (oído: %r)",
-                            s.get("start"), s.get("text", "")[:40], heard[:40])
+                logger.info("[ADLIB] fantasma descartado @%.1fs%s: %r (oído: %r)",
+                            s.get("start"),
+                            " [cola]" if i in tail_idx else "",
+                            s.get("text", "")[:40], heard[:40])
         return _collapse_runs(segs, drop)
     except Exception as e:  # pragma: no cover — el filtro nunca rompe el render
         logger.warning("[ADLIB] filtro declinó (%s) — segmentos originales", e)
