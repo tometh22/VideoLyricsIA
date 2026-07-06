@@ -4632,6 +4632,9 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
     cascada lo dejó ahí); si no está y no se puede computar, declina."""
     if not isinstance(result, dict):
         return result
+    # pop SIEMPRE (aunque el gate esté off): wx_raw es transporte interno,
+    # no debe persistirse ni llegar al response del endpoint legacy.
+    _wx_raw = result.pop("wx_raw", None)
     if os.environ.get("ADLIB_CONSENSUS_ENABLED", "0").strip().lower() \
             not in ("1", "true", "yes", "on"):
         return result
@@ -4701,6 +4704,15 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
         filtered = await asyncio.to_thread(
             _ac.filter_and_collapse, segs, _tw, tail_after=_tail_after,
             audit_suffix=_audit_on)
+        # MODO VIVO (Perro live, 06/07): el sufijo que la auditoría marcó
+        # se reemplaza por los segmentos crudos de whisperX de esa zona —
+        # la letra de estudio no puede representar el final de un vivo
+        # (call-response, presentaciones de la banda). Las líneas
+        # insertadas conservan review=True.
+        if (live_hint and _wx_raw
+                and os.environ.get("ADLIB_LIVE_SWAP_ENABLED", "1")
+                .strip().lower() in ("1", "true", "yes", "on")):
+            filtered = _ac.live_swap_tail(filtered, _wx_raw)
         if filtered != segs:
             result = dict(result)
             result["segments"] = filtered
@@ -5040,6 +5052,19 @@ async def _run_transcription_for_job(
             polished = _snap(_normalize_words(deduped))
             out = {"job_id": job_id, "segments": polished,
                    "reference_lyrics": reference_lyrics}
+            # Segmentos crudos de whisperX (la performance REAL): viajan en
+            # result para que el modo vivo pueda reemplazar el sufijo
+            # divergente por lo que se canta (live_swap_tail). Se hace pop
+            # en _maybe_adlib_filter — no se persisten ni llegan al cliente.
+            try:
+                if _wx_segs:
+                    out["wx_raw"] = [
+                        {"start": float(s.get("start", 0)),
+                         "end": float(s.get("end", 0)),
+                         "text": (s.get("text") or "").strip()}
+                        for s in _wx_segs if (s.get("text") or "").strip()]
+            except NameError:
+                pass  # camino que emite antes de correr whisperX
             if recovery_source:
                 out["recovery_source"] = recovery_source
             if coverage_warning:
