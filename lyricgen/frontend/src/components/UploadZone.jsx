@@ -1584,7 +1584,7 @@ export default function UploadZone({
                   ? "bg-brand/20 ring-1 ring-brand/40"
                   : "bg-surface-3/40 hover:bg-surface-3/60"
                 }`}
-              style={opt.style}
+              style={{ ...opt.style, paintOrder: "stroke fill" }}
             >A</button>
           ))}
         </div>
@@ -1900,7 +1900,7 @@ export default function UploadZone({
                               ? "bg-brand/20 ring-1 ring-brand/40"
                               : "bg-surface-3/40 hover:bg-surface-3/60"
                             }`}
-                          style={opt.style}
+                          style={{ ...opt.style, paintOrder: "stroke fill" }}
                         >A</button>
                       ))}
                     </div>
@@ -2987,7 +2987,7 @@ export default function UploadZone({
                               ? "bg-brand/20 ring-1 ring-brand/40"
                               : "bg-surface-3/40 hover:bg-surface-3/60"
                             }`}
-                          style={opt.style}
+                          style={{ ...opt.style, paintOrder: "stroke fill" }}
                         >A</button>
                       ))}
                     </div>
