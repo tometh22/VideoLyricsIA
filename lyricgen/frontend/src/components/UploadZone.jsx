@@ -53,12 +53,18 @@ function applyTextCase(text, c) {
   if (c === "upper") return text.toUpperCase();
   if (c === "title") return text.replace(/\b\w/g, (ch) => ch.toUpperCase());
   if (c === "lower") return text.toLowerCase();
+  if (c === "sentence") {
+    return text.toLowerCase().split("\n").map(
+      (ln) => ln.replace(/[a-zà-ÿ]/i, (ch) => ch.toUpperCase())
+    ).join("\n");
+  }
   return text;
 }
 const TEXT_CASE_OPTS = [
   { code: "upper",    d: "MAY", label: "Todo en MAYÚSCULAS" },
   { code: "title",    d: "Aa",  label: "Primera letra de Cada Palabra" },
   { code: "lower",    d: "min", label: "todo en minúsculas" },
+  { code: "sentence", d: "Abc", label: "Primera letra de cada Línea" },
   { code: "original", d: "ori", label: "Sin cambios (como está escrito)" },
 ];
 
