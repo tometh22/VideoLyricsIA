@@ -190,3 +190,94 @@ def test_short_tail_is_noop():
             for i in range(5)]
     out = ac.filter_and_collapse(segs, lambda a, b: "", tail_after=41.0)
     assert out == segs
+
+
+# ── auditoría de sufijo (Perro Amor Explota LIVE, 06/07) ────────────────────
+# fixtures_adlib_perro.json = datos REALES del job 133e77a34dd2: las últimas
+# 14 líneas con `heard` = whisper sobre el stem del VIVO. El audio es en vivo
+# pero lrclib (variant-retry recortó el '(Live…)') trajo la letra de ESTUDIO:
+# el cuerpo coincide (fonética >=0.52) pero las últimas 6 son de un final que
+# el vivo no tiene tal cual (<=0.33). La auditoría MARCA (review=True), no
+# borra: contra el gold del operador (06/07) el borrado falla en vivos —
+# whisper pierde voces reales entre público/capas, y a veces el operador
+# QUIERE una línea hablada ('Que buen momento ¿no?', Un Pacto live).
+
+_PERRO = json.loads(
+    (Path(__file__).parent / "fixtures_adlib_perro.json").read_text())
+
+
+def _perro_transcriber(start, end):
+    for r in _PERRO:
+        if abs(r["start"] - start) < 0.05:
+            return r.get("heard", "")
+    return ""
+
+
+def test_perro_suffix_ghosts_flagged_not_dropped():
+    segs = [{"start": r["start"], "end": r["end"], "text": r["text"]} for r in _PERRO]
+    out = ac.filter_and_collapse(segs, _perro_transcriber, audit_suffix=True)
+    assert len(out) == len(segs)                    # NADA se borra
+    flagged = {s["start"] for s in out if s.get("review")}
+    assert flagged == {229.7, 238.9, 246.6, 259.3, 260.5, 264.3}
+    # las 8 reales (incl. 'Perro que ladra no muerde' con whisper resbalando
+    # 0.81 fonético) quedan sin marca
+    assert not any(s.get("review") for s in out[:8])
+
+
+def test_suffix_walk_stops_at_first_confirmed_line():
+    """Canción sana: la última línea coincide → 1 sola llamada whisper,
+    cero marcas."""
+    calls = []
+    def tw(a, b):
+        calls.append(a)
+        return "esta línea sí se canta"
+    segs = [{"start": float(i * 10), "end": i * 10 + 3, "text": "Esta línea sí se canta"}
+            for i in range(20)]
+    out = ac.filter_and_collapse(segs, tw, audit_suffix=True)
+    assert out == segs
+    assert len(calls) == 1               # solo la última línea
+
+
+def test_suffix_audit_caps_walk():
+    """Un final divergente más largo que MAX_SUFFIX_AUDIT no marca la
+    canción entera: la caminata frena en el tope."""
+    segs = [{"start": float(i * 10), "end": i * 10 + 3, "text": f"línea {i}"}
+            for i in range(30)]
+    out = ac.filter_and_collapse(segs, lambda a, b: "", audit_suffix=True)
+    assert len(out) == 30                # nada borrado
+    assert sum(1 for s in out if s.get("review")) == ac.MAX_SUFFIX_AUDIT
+
+
+def test_suffix_adlibs_are_neutral():
+    """Un ad-lib real al final no frena la caminata ni recibe marca, y el
+    fantasma PEGADO a él cae por el camino de adyacencia (Fase 2, que sí
+    borra) — la auditoría de sufijo compone con lo existente sin pisarlo."""
+    segs = [
+        {"start": 10.0, "end": 13.0, "text": "Verso real"},
+        {"start": 20.0, "end": 23.0, "text": "Fantasma de estudio"},
+        {"start": 24.0, "end": 27.0, "text": "Oh, oh, oh"},
+    ]
+    def tw(a, b):
+        return "verso real" if a == 10.0 else ""
+    out = ac.filter_and_collapse(segs, tw, audit_suffix=True)
+    texts = [s["text"] for s in out]
+    assert "Fantasma de estudio" not in texts   # borrado por adyacencia
+    assert any(t.startswith("Oh") for t in texts)  # ad-lib neutral: sobrevive
+    assert not any(s.get("review") for s in out)   # el verso confirmó: sin marcas
+
+
+def test_suffix_transcribe_error_flags_nothing():
+    def boom(a, b):
+        raise RuntimeError("whisper caído")
+    segs = [{"start": float(i * 10), "end": i * 10 + 3, "text": f"línea {i}"}
+            for i in range(5)]
+    out = ac.filter_and_collapse(segs, boom, audit_suffix=True)
+    assert out == segs                   # nunca marcar/borrar por las dudas
+
+
+def test_suffix_off_by_default():
+    """Sin audit_suffix (canción normal sin señal live) el fixture de Perro
+    pasa intacto — la auditoría solo corre con señal de versión distinta."""
+    segs = [{"start": r["start"], "end": r["end"], "text": r["text"]} for r in _PERRO]
+    out = ac.filter_and_collapse(segs, _perro_transcriber)
+    assert not any(s.get("review") for s in out)
