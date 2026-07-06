@@ -22,6 +22,71 @@ class YouTubeNotConfiguredError(RuntimeError):
     """No usable YouTube credential (no channel connected / token broken)."""
 
 
+_TITLE_NOISE_SUFFIXES = (
+    "(Official Video)", "(Official Audio)", "(Lyric Video)",
+    "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
+    "(Live)", "(Lyrics)",
+)
+
+
+def parse_filename_artist_title(filename: str) -> tuple:
+    """Best-effort artist/title extraction from a bare filename. Handles two
+    naming conventions the operator commonly uploads under:
+
+      "Artist - Title.ext"   → ("Artist", "Title")
+      "Title_Artist.ext"     → ("Artist", "Title")   ← Suno/YouTube export form
+
+    Falls back to ("", basename) when neither separator is present so the
+    caller can decide whether to insist on a manual entry. Studio-version
+    suffixes like "(Official Video)" are stripped from the title in either
+    case so the lrclib lookup matches.
+    """
+    if not filename:
+        return "", ""
+    base = filename
+    for ext in (".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg"):
+        if base.lower().endswith(ext):
+            base = base[: -len(ext)]
+            break
+    artist, title = "", base.strip()
+    if " - " in base:
+        head, _, tail = base.partition(" - ")
+        artist, title = head.strip(), tail.strip()
+    elif "_" in base:
+        head, _, tail = base.partition("_")
+        title, artist = head.strip(), tail.strip()
+    for sfx in _TITLE_NOISE_SUFFIXES:
+        title = title.replace(sfx, "").strip()
+    return artist, title
+
+
+def job_song_title(job: dict) -> str:
+    """Song title for YouTube metadata: prefer the title the user supplied
+    (or the upload-time parse) over re-deriving it from the raw filename."""
+    return job.get("song_title") or parse_filename_artist_title(job.get("filename", ""))[1]
+
+
+def load_user_settings(db, user_id: int):
+    """Per-user settings from the DB; None when the user has none saved so
+    the legacy outputs/_settings.json fallback still applies."""
+    from database import UserSettings
+
+    settings = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
+    return (settings.settings_json or None) if settings else None
+
+
+def settings_for_job(db, job_id: str, fallback_user_id: int):
+    """The YouTube template to apply to a job: the job owner's settings, so a
+    teammate publishing someone else's job still gets the configured branding."""
+    from database import Job
+
+    owner_id = db.query(Job.user_id).filter(Job.job_id == job_id).scalar()
+    settings = load_user_settings(db, owner_id) if owner_id else None
+    if settings is None and owner_id != fallback_user_id:
+        settings = load_user_settings(db, fallback_user_id)
+    return settings
+
+
 def resolve_channel(db, tenant_id: str, channel_pk: int = None):
     """Pick the channel to publish with: explicit id → tenant default →
     None (legacy file-token fallback). Raises 404-shaped ValueError for an
@@ -322,12 +387,14 @@ def upload_to_youtube(
     metadata: dict = None,
     settings: dict = None,
     channel=None,
+    progress_callback=None,
 ) -> dict:
     """Upload video + thumbnail to YouTube.
 
     If `metadata` is given (e.g. the exact metadata the user previewed and
     approved in the UI) it is used as-is; otherwise it is AI-generated.
     `channel` is a YouTubeChannel row (None → legacy file token).
+    `progress_callback(percent)` is invoked as resumable-upload chunks land.
     Returns dict with video_id and url.
     """
     if settings is None:
@@ -372,7 +439,13 @@ def upload_to_youtube(
         # errors so a network blip mid-upload doesn't abort the whole video.
         status, response = request.next_chunk(num_retries=5)
         if status:
-            print(f"[YOUTUBE] Upload progress: {int(status.progress() * 100)}%")
+            percent = int(status.progress() * 100)
+            print(f"[YOUTUBE] Upload progress: {percent}%")
+            if progress_callback:
+                try:
+                    progress_callback(percent)
+                except Exception:
+                    pass  # progress reporting must never kill the upload
 
     video_id = response["id"]
     print(f"[YOUTUBE] Video uploaded: https://youtube.com/watch?v={video_id}")

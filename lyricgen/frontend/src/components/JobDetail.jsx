@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef } from "react";
 import { useI18n } from "../i18n";
-import { fetchWithTimeout } from "../fetchWithTimeout";
 import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
+import PublishPanel from "./youtube/PublishPanel";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -164,11 +164,9 @@ function ProvenanceTab({ jobId, t }) {
 export default function JobDetail({ job, onBack, onJobUpdate }) {
   const { t } = useI18n();
   const [activeTab, setActiveTab] = useState("video");
-  const [uploading, setUploading] = useState(false);
   // Only a real published result counts — youtube_data can also hold an
   // in-progress claim marker ({status: "uploading"}) with no video yet.
   const [youtubeResult, setYoutubeResult] = useState(job.youtube?.video_id ? job.youtube : null);
-  const [metadataPreview, setMetadataPreview] = useState(null);
   const [showYoutubePanel, setShowYoutubePanel] = useState(false);
   const [reviewNotes, setReviewNotes] = useState("");
   const [approving, setApproving] = useState(false);
@@ -302,49 +300,22 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const downloadProResShort = () =>
     fetchProResAndSave("umg_short", `${songSlug}_short.mov`);
 
-  const previewMetadata = async () => {
-    setShowYoutubePanel(true);
-    try {
-      // Gemini round-trip: cap the wait so a hung backend surfaces as an
-      // error with a retry button instead of an eternal spinner.
-      const res = await fetchWithTimeout(
-        `${API}/youtube/metadata/${job.job_id}`,
-        { method: "POST", headers: authHeaders() },
-        60_000,
-      );
-      const data = await res.json();
-      if (!res.ok) {
-        setMetadataPreview({ error: data.detail || `Error ${res.status}` });
-        return;
-      }
-      setMetadataPreview(data);
-    } catch (err) {
-      setMetadataPreview({ error: err.message });
-    }
-  };
-
-  const uploadToYoutube = async (privacy = "unlisted") => {
-    setUploading(true);
-    try {
-      // Send the previewed metadata so what the user approved is exactly
-      // what gets published (the backend regenerates otherwise).
-      const approved = metadataPreview && !metadataPreview.error ? metadataPreview : null;
-      const res = await fetch(`${API}/youtube/upload/${job.job_id}?privacy=${privacy}`, {
-        method: "POST",
-        headers: { ...authHeaders(), "Content-Type": "application/json" },
-        body: JSON.stringify({ metadata: approved }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setYoutubeResult({ error: data.detail || `Error ${res.status}` });
-      } else {
-        setYoutubeResult(data);
-      }
-    } catch (err) {
-      setYoutubeResult({ error: err.message });
-    }
-    setUploading(false);
-  };
+  // Auto-open the publish panel when this job already has publish
+  // activity (user navigated away mid-upload and came back).
+  useEffect(() => {
+    if (job.status !== "done" || youtubeResult) return;
+    let alive = true;
+    fetch(`${API}/youtube/publish/${job.job_id}`, { headers: authHeaders() })
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows) => {
+        if (alive && rows.some((r) => ["queued", "scheduled", "uploading"].includes(r.status))) {
+          setShowYoutubePanel(true);
+        }
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job.job_id]);
 
   const handleApprove = async () => {
     if (approveLockRef.current) return;
@@ -520,7 +491,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             );
           })()}
           {canDownload && !youtubeResult && (
-            <button onClick={previewMetadata} className="btn-primary text-xs h-10 px-5">
+            <button onClick={() => setShowYoutubePanel(true)} className="btn-primary text-xs h-10 px-5">
               <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
               </svg>
@@ -740,7 +711,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         </div>
       )}
 
-      {/* YouTube Panel (only for approved/done jobs) */}
+      {/* YouTube Panel (only for approved/done jobs) — background publish
+          flow lives in PublishPanel (channel select, editable metadata,
+          include-Short, per-asset progress). */}
       {canDownload && showYoutubePanel && (
         <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-6 animate-fade-in">
           <h3 className="font-semibold mb-4 flex items-center gap-2">
@@ -749,89 +722,14 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             </svg>
             {t("detail.publish_youtube")}
           </h3>
-
-          {!metadataPreview && !youtubeResult && (
-            <div className="flex items-center justify-center py-8">
-              <div className="w-6 h-6 border-2 border-brand border-t-transparent rounded-full animate-spin" />
-              <span className="ml-3 text-sm text-gray-400">{t("detail.generating_meta")}</span>
-            </div>
-          )}
-
-          {metadataPreview && !metadataPreview.error && !youtubeResult && (
-            <div className="space-y-4">
-              <div>
-                <label className="text-xs text-gray-500 uppercase tracking-wider">{t("settings.title_format").split(" ")[0]}</label>
-                <p className="text-sm text-white mt-1 glass rounded-xl px-4 py-2.5">{metadataPreview.title}</p>
-              </div>
-              <div>
-                <label className="text-xs text-gray-500 uppercase tracking-wider">{t("settings.desc_header").split(" ")[0]}</label>
-                <p className="text-sm text-gray-300 mt-1 glass rounded-xl px-4 py-2.5 whitespace-pre-line">{metadataPreview.description}</p>
-              </div>
-              <div>
-                <label className="text-xs text-gray-500 uppercase tracking-wider">Tags</label>
-                <div className="flex flex-wrap gap-1.5 mt-1">
-                  {(metadataPreview.tags || []).map((tag, i) => (
-                    <span key={i} className="px-2 py-1 rounded-lg bg-surface-3/50 text-xs text-gray-400">{tag}</span>
-                  ))}
-                </div>
-              </div>
-
-              <div className="flex gap-3 pt-2">
-                <button onClick={() => uploadToYoutube("unlisted")} disabled={uploading}
-                  className="btn-primary text-sm py-2.5 px-5 disabled:opacity-50">
-                  {uploading ? (
-                    <><div className="inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />{t("detail.uploading")}</>
-                  ) : (
-                    t("detail.upload_unlisted")
-                  )}
-                </button>
-                <button onClick={() => uploadToYoutube("public")} disabled={uploading}
-                  className="btn-secondary text-sm py-2.5 px-5 disabled:opacity-50">
-                  {t("detail.upload_public")}
-                </button>
-                <button onClick={() => setShowYoutubePanel(false)}
-                  className="text-xs text-gray-500 hover:text-white transition-colors ml-auto">
-                  {t("detail.cancel")}
-                </button>
-              </div>
-            </div>
-          )}
-
-          {youtubeResult && !youtubeResult.error && (
-            <div className="text-center py-6">
-              <div className="w-12 h-12 mx-auto mb-3 rounded-2xl bg-accent/10 flex items-center justify-center">
-                <svg className="w-6 h-6 text-accent" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                  <polyline points="20 6 9 17 4 12" />
-                </svg>
-              </div>
-              <p className="text-sm font-medium text-white mb-1">{t("detail.published")}</p>
-              <a href={youtubeResult.url} target="_blank" rel="noopener noreferrer"
-                className="text-sm text-brand hover:text-brand-light transition-colors underline">
-                {youtubeResult.url}
-              </a>
-              <p className="text-xs text-gray-500 mt-2">Estado: {youtubeResult.privacy}</p>
-            </div>
-          )}
-
-          {(metadataPreview?.error || youtubeResult?.error) && (
-            <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3 text-center">
-              <p className="text-sm text-red-400">{metadataPreview?.error || youtubeResult?.error}</p>
-              <button
-                onClick={() => {
-                  setYoutubeResult(null);
-                  // Upload failed but the approved preview is intact: just
-                  // return to it so the user retries the publish with the
-                  // same metadata. Only regenerate when the preview failed.
-                  if (!metadataPreview || metadataPreview.error) {
-                    setMetadataPreview(null);
-                    previewMetadata();
-                  }
-                }}
-                className="mt-2 text-xs text-gray-400 hover:text-white transition-colors underline">
-                {t("dash.retry")}
-              </button>
-            </div>
-          )}
+          <PublishPanel
+            job={job}
+            onJobUpdate={(updated) => {
+              if (updated.youtube?.video_id) setYoutubeResult(updated.youtube);
+              onJobUpdate?.(updated);
+            }}
+            onClose={() => setShowYoutubePanel(false)}
+          />
         </div>
       )}
     </div>

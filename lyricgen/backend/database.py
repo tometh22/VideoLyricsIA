@@ -288,6 +288,17 @@ class Job(Base):
                 bool(s3.get("umg_master")) and bool(s3.get("umg_short"))
                 if wants_umg else None
             ),
+            # Minimal YouTube summary so cards can show a "published"
+            # badge without a per-row round-trip. Only real publishes —
+            # youtube_data can also hold an in-progress claim marker.
+            "youtube": (
+                {
+                    "video_id": self.youtube_data.get("video_id"),
+                    "url": self.youtube_data.get("url"),
+                    "privacy": self.youtube_data.get("privacy"),
+                }
+                if (self.youtube_data or {}).get("video_id") else None
+            ),
             "created_at": self.created_at.timestamp() if self.created_at else None,
         }
 
@@ -377,6 +388,64 @@ class YouTubeChannel(Base):
             "is_default": self.is_default,
             "connected_by": self.connected_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class PublishJob(Base):
+    """A background YouTube publish (one row per uploaded asset: the main
+    video and, optionally, the vertical Short).
+
+    Duplicate-publish protection is the partial unique index
+    uq_publish_active (one non-terminal row per (job_id, kind)) created in
+    _migrate_user_columns; the API layer adds a friendly 409 check on top.
+    Job.youtube_data stays as a mirror of the successful "video" publish so
+    the existing JobDetail UI and /status polling keep working unchanged.
+    """
+    __tablename__ = "publish_jobs"
+    __table_args__ = (
+        Index("ix_publish_jobs_job", "job_id"),
+        Index("ix_publish_jobs_status_scheduled", "status", "scheduled_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(String(12), ForeignKey("jobs.job_id"), nullable=False)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    channel_id = Column(Integer, ForeignKey("youtube_channels.id"), nullable=True)  # NULL = legacy file token
+    kind = Column(String(10), nullable=False, default="video")   # video | short
+    status = Column(String(20), nullable=False, default="queued")
+    # queued | scheduled | uploading | published | failed | canceled
+    progress = Column(Integer, nullable=False, default=0)
+    attempts = Column(Integer, nullable=False, default=0)
+    metadata_json = Column(JSON, nullable=True)   # approved metadata, verbatim
+    privacy = Column(String(10), nullable=False, default="unlisted")
+    scheduled_at = Column(DateTime(timezone=True), nullable=True)
+    publish_at_youtube = Column(DateTime(timezone=True), nullable=True)  # native publishAt echo
+    video_id = Column(String(20), nullable=True)
+    video_url = Column(String(255), nullable=True)
+    error = Column(Text, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "job_id": self.job_id,
+            "channel_id": self.channel_id,
+            "kind": self.kind,
+            "status": self.status,
+            "progress": self.progress,
+            "privacy": self.privacy,
+            "metadata": self.metadata_json,
+            "scheduled_at": self.scheduled_at.isoformat() if self.scheduled_at else None,
+            "publish_at_youtube": self.publish_at_youtube.isoformat() if self.publish_at_youtube else None,
+            "video_id": self.video_id,
+            "video_url": self.video_url,
+            "error": self.error,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
         }
 
 
@@ -511,6 +580,12 @@ def _migrate_user_columns():
         # defaults in the same transaction as a belt-and-suspenders.
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_yt_default_per_tenant "
         "ON youtube_channels (tenant_id) WHERE is_default",
+        # At most one ACTIVE publish per (job, kind) — the real multi-worker
+        # duplicate-publish guarantee; the API's 409 is just the friendly
+        # error on top.
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_publish_active "
+        "ON publish_jobs (job_id, kind) "
+        "WHERE status IN ('queued', 'scheduled', 'uploading')",
     ]
     with engine.begin() as conn:
         for sql in column_adds:

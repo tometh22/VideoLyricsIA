@@ -25,10 +25,11 @@ import requests as _requests
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import RedirectResponse
 from jose import JWTError, jwt
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from auth import get_current_user, JWT_SECRET, JWT_ALGORITHM
-from database import AuditLog, YouTubeChannel, get_db
+from database import AuditLog, Job, PublishJob, YouTubeChannel, get_db
 from token_crypto import encrypt_token
 
 logger = logging.getLogger("genly.youtube")
@@ -347,6 +348,225 @@ async def disconnect_channel(
         "channel_id": channel.channel_id,
         "channel_title": channel.channel_title,
     })
+    db.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Background publish
+# ---------------------------------------------------------------------------
+
+_PRIVACY_VALUES = ("public", "unlisted", "private")
+_ACTIVE_PUBLISH_STATUSES = ("queued", "scheduled", "uploading")
+
+
+class PublishRequest(BaseModel):
+    channel_id: int | None = None
+    privacy: str = "unlisted"
+    # Approved metadata for the main video (published verbatim). The Short
+    # reuses it (with a #Shorts suffix) unless short_metadata is given.
+    metadata: dict | None = None
+    include_short: bool = True
+    short_metadata: dict | None = None
+    scheduled_at: datetime | None = None
+
+
+def _clean_metadata(raw: dict | None) -> dict | None:
+    if not raw:
+        return None
+    cleaned = {
+        "title": str(raw.get("title") or "").strip(),
+        "description": str(raw.get("description") or ""),
+        "tags": [str(t) for t in (raw.get("tags") or []) if str(t).strip()],
+        "category": str(raw.get("category") or "10"),
+    }
+    if not cleaned["title"]:
+        raise HTTPException(status_code=400, detail="metadata.title must not be empty.")
+    return cleaned
+
+
+@router.post("/publish/{job_id}")
+async def create_publish(
+    job_id: str,
+    body: PublishRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create background publish job(s) for a done render and enqueue them.
+
+    Returns in milliseconds; the upload happens on the publish worker.
+    """
+    from youtube_upload import resolve_channel, YouTubeNotConfiguredError
+    import queue_jobs
+
+    if body.privacy not in _PRIVACY_VALUES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"privacy must be one of: {', '.join(_PRIVACY_VALUES)}",
+        )
+    if body.scheduled_at is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Scheduled publishing is not available yet.",
+        )
+
+    job = (
+        db.query(Job)
+        .filter(Job.job_id == job_id, Job.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job.status != "done":
+        raise HTTPException(status_code=400, detail="Job is not done yet.")
+    if (job.youtube_data or {}).get("video_id"):
+        raise HTTPException(
+            status_code=409,
+            detail="This job's video is already published on YouTube.",
+        )
+
+    try:
+        channel = resolve_channel(db, current_user["tenant_id"], body.channel_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Channel not found.")
+    except YouTubeNotConfiguredError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    metadata = _clean_metadata(body.metadata)
+    short_metadata = _clean_metadata(body.short_metadata) or metadata
+
+    kinds = [("video", metadata)]
+    if body.include_short:
+        kinds.append(("short", short_metadata))
+
+    # Friendly 409 for active duplicates (the uq_publish_active partial
+    # unique index is the hard guarantee underneath).
+    active = (
+        db.query(PublishJob.kind)
+        .filter(
+            PublishJob.job_id == job_id,
+            PublishJob.status.in_(_ACTIVE_PUBLISH_STATUSES),
+        )
+        .all()
+    )
+    active_kinds = {k for (k,) in active}
+    requested_kinds = {k for k, _ in kinds}
+    if active_kinds & requested_kinds:
+        raise HTTPException(status_code=409, detail="A publish is already in progress for this job.")
+
+    # Skip kinds that already published (e.g. retry only the failed Short).
+    published_kinds = {
+        k for (k,) in (
+            db.query(PublishJob.kind)
+            .filter(PublishJob.job_id == job_id, PublishJob.status == "published")
+            .all()
+        )
+    }
+    kinds = [(k, m) for k, m in kinds if k not in published_kinds]
+    if not kinds:
+        raise HTTPException(status_code=409, detail="Everything requested is already published.")
+
+    rows = []
+    for kind, md in kinds:
+        row = PublishJob(
+            job_id=job_id,
+            tenant_id=current_user["tenant_id"],
+            channel_id=channel.id if channel else None,
+            kind=kind,
+            status="queued",
+            metadata_json=md,
+            privacy=body.privacy,
+            created_by=current_user["id"],
+        )
+        db.add(row)
+        rows.append(row)
+
+    try:
+        db.commit()
+    except Exception:
+        # The partial unique index caught a race with another request.
+        db.rollback()
+        raise HTTPException(status_code=409, detail="A publish is already in progress for this job.")
+
+    enqueue_errors = []
+    for row in rows:
+        try:
+            queue_jobs.enqueue_publish(row.id)
+        except RuntimeError as e:
+            enqueue_errors.append(str(e))
+            db.query(PublishJob).filter(PublishJob.id == row.id).update(
+                {PublishJob.status: "failed", PublishJob.error: "Queue unavailable."},
+                synchronize_session=False,
+            )
+    db.commit()
+    if enqueue_errors:
+        raise HTTPException(status_code=503, detail="Publish queue unavailable. Try again in a minute.")
+
+    _audit_row(db, current_user["id"], "job.youtube_publish_requested", {
+        "job_id": job_id,
+        "kinds": [k for k, _ in kinds],
+        "privacy": body.privacy,
+        "channel_id": channel.channel_id if channel else None,
+    })
+    db.commit()
+
+    return [row.to_dict() for row in rows]
+
+
+@router.get("/publish/{job_id}")
+async def publish_status(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """All publish jobs for a render, newest first (frontend polls this)."""
+    rows = (
+        db.query(PublishJob)
+        .filter(
+            PublishJob.job_id == job_id,
+            PublishJob.tenant_id == current_user["tenant_id"],
+        )
+        .order_by(PublishJob.created_at.desc(), PublishJob.id.desc())
+        .all()
+    )
+    return [r.to_dict() for r in rows]
+
+
+@router.post("/publish-jobs/{publish_pk}/cancel")
+async def cancel_publish(
+    publish_pk: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Cancel a publish that hasn't started uploading yet."""
+    import queue_jobs
+
+    row = (
+        db.query(PublishJob)
+        .filter(
+            PublishJob.id == publish_pk,
+            PublishJob.tenant_id == current_user["tenant_id"],
+        )
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Publish job not found.")
+
+    # Conditional UPDATE: a worker may have claimed it in the meantime.
+    canceled = (
+        db.query(PublishJob)
+        .filter(
+            PublishJob.id == publish_pk,
+            PublishJob.status.in_(("queued", "scheduled")),
+        )
+        .update({PublishJob.status: "canceled"}, synchronize_session=False)
+    )
+    db.commit()
+    if not canceled:
+        raise HTTPException(status_code=409, detail="Already uploading or finished — cannot cancel.")
+
+    queue_jobs.cancel_publish_rq_job(publish_pk)
+    _audit_row(db, current_user["id"], "job.youtube_publish_canceled", {"publish_job_id": publish_pk})
     db.commit()
     return {"ok": True}
 

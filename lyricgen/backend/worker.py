@@ -26,12 +26,26 @@ def main():
     from redis import Redis
     from rq import Queue, Worker
 
+    # Which queues this worker listens to (comma-separated, priority order).
+    # Default: the render queues. A dedicated publish worker runs with
+    # WORKER_QUEUES=publish on a small instance — publish jobs are
+    # I/O-bound, need no Whisper/ffmpeg, and must not sit behind renders.
+    queue_names = [
+        q.strip()
+        for q in os.environ.get("WORKER_QUEUES", "enterprise,default").split(",")
+        if q.strip()
+    ]
+    render_worker = any(q in ("enterprise", "default") for q in queue_names)
+
     # Warm the Whisper model so the first job does not pay the load cost.
     # SKIP this when OPENAI_API_KEY is set — transcription routes through the
     # OpenAI Whisper API and the local 1.5 GB model is just dead weight that
     # increases worker RAM and starts the container into immediate OOM
-    # territory on small instances.
-    if os.environ.get("OPENAI_API_KEY", "").strip():
+    # territory on small instances. Also skip on non-render workers
+    # (publish queue): they never transcribe.
+    if not render_worker:
+        print("[WORKER] Non-render queues only; skipping Whisper preload")
+    elif os.environ.get("OPENAI_API_KEY", "").strip():
         print("[WORKER] OPENAI_API_KEY set; skipping local Whisper preload")
     else:
         try:
@@ -42,8 +56,8 @@ def main():
             print(f"[WORKER] Whisper preload failed ({e}); will load on first job")
 
     conn = Redis.from_url(redis_url)
-    # Enterprise queue first so premium tenants get priority.
-    queues = [Queue("enterprise", connection=conn), Queue("default", connection=conn)]
+    # Priority follows the WORKER_QUEUES order (enterprise first by default).
+    queues = [Queue(name, connection=conn) for name in queue_names]
     worker = Worker(queues, connection=conn)
 
     def _graceful(signum, _frame):
@@ -73,7 +87,7 @@ def main():
     except ValueError:
         max_jobs = 10
 
-    print(f"[WORKER] Listening on: enterprise, default | max_jobs={max_jobs}")
+    print(f"[WORKER] Listening on: {', '.join(queue_names)} | max_jobs={max_jobs}")
     worker.work(with_scheduler=False, max_jobs=max_jobs)
 
 

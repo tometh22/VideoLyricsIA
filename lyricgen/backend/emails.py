@@ -194,6 +194,40 @@ def send_job_completed(email: str, username: str, artist: str, filename: str, jo
     _send_email(email, f"Video ready: {artist} — {song}", _wrap_template(content))
 
 
+def send_video_published(
+    email: str, username: str, artist: str, song: str,
+    video_url: str, privacy: str, kind: str = "video",
+):
+    """Notify the requester that a YouTube publish finished."""
+    what = "Short" if kind == "short" else "video"
+    privacy_note = {
+        "public": "It is live and public.",
+        "unlisted": "It is unlisted — only people with the link can see it.",
+        "private": "It is private.",
+    }.get(privacy, "")
+    content = f"""
+    <h2 style="color:#fff;margin:0 0 16px;">Published to YouTube</h2>
+    <p>Hi <strong>{username}</strong>,</p>
+    <p>The {what} for <strong>{artist} — {song}</strong> was published to YouTube.
+    {privacy_note}</p>
+    {_button(video_url, "View on YouTube")}
+    """
+    _send_email(email, f"Published to YouTube: {artist} — {song}", _wrap_template(content))
+
+
+def send_video_publish_failed(email: str, username: str, artist: str, song: str, error: str):
+    """Notify the requester that a YouTube publish failed (sanitized error)."""
+    content = f"""
+    <h2 style="color:#fff;margin:0 0 16px;">YouTube publish failed</h2>
+    <p>Hi <strong>{username}</strong>,</p>
+    <p>The publish of <strong>{artist} — {song}</strong> to YouTube failed:</p>
+    <p style="color:#f87171;">{error}</p>
+    <p>You can retry from the video's page in GenLy.</p>
+    {_button(FRONTEND_URL, "Open GenLy")}
+    """
+    _send_email(email, f"YouTube publish failed: {artist} — {song}", _wrap_template(content))
+
+
 def send_usage_alert(email: str, username: str, percent: int, used: int, limit: int, plan: str):
     """Send usage alert at 80% or 100%."""
     if percent >= 100:
