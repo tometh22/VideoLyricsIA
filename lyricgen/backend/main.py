@@ -3764,6 +3764,22 @@ async def transcribe_uploaded(
             detail="Job has no associated upload.",
         )
 
+    # SNAPSHOT + release (incidente agus77 06/07): la descarga de R2 de
+    # abajo tarda decenas de segundos con un WAV de 45-150 MB, y este
+    # handler mantenía la sesión de DB checked-out EN TRANSACCIÓN todo ese
+    # tiempo. Postgres la mataba por idle-in-transaction timeout
+    # ("Transient DB error on POST /transcribe-uploaded"), el pool se
+    # agotaba, TODA la API pasaba a latencias de 20-40 s y el edge cortaba
+    # los demás requests con 502 sin CORS → el wizard mostraba "Sin
+    # respuesta del servidor". Capturamos lo que necesitamos del row y
+    # soltamos la conexión ANTES del I/O largo; los flips de status de más
+    # abajo abren su propia sesión corta.
+    _r2_key = job_row.input_r2_key
+    _row_filename = job_row.filename
+    _row_artist = job_row.artist or ""
+    _row_title = job_row.song_title or ""
+    db.close()
+
     _enforce_disk_capacity()
     _enforce_memory_pressure()
 
@@ -3783,7 +3799,7 @@ async def transcribe_uploaded(
     job_id = body.job_id
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
-    audio_path = os.path.join(job_dir, job_row.filename)
+    audio_path = os.path.join(job_dir, _row_filename)
 
     if not os.path.exists(audio_path):
         import asyncio as _asyncio
@@ -3792,12 +3808,12 @@ async def transcribe_uploaded(
         # /upload-multipart-complete, so a client that under-declared
         # size_bytes in /upload-url could otherwise land an arbitrarily
         # large object and have us download it whole (disk + Whisper).
-        _real_size = storage.head_object_size(job_row.input_r2_key)
+        _real_size = storage.head_object_size(_r2_key)
         if _real_size is not None and _real_size > MAX_UPLOAD_MB * 1024 * 1024:
             logger.warning(
                 "[UPLOAD] 413 at transcribe: job=%s key=%s real=%.1f MB > %d MB "
                 "tenant=%s user=%s",
-                body.job_id, job_row.input_r2_key, _real_size / 1048576,
+                body.job_id, _r2_key, _real_size / 1048576,
                 MAX_UPLOAD_MB, current_user["tenant_id"], current_user["id"],
             )
             raise HTTPException(
@@ -3813,7 +3829,7 @@ async def transcribe_uploaded(
             # de 5 serializaba TODA la API. Mismo patrón executor que
             # /upload-part-proxy.
             _ok = await _loop.run_in_executor(
-                None, storage.download_object, job_row.input_r2_key, audio_path,
+                None, storage.download_object, _r2_key, audio_path,
             )
             if _ok:
                 break
@@ -3824,23 +3840,30 @@ async def transcribe_uploaded(
                 status_code=502,
                 detail="No pudimos leer el archivo subido. Reintentá en unos segundos.",
             )
-    _validate_audio_file_on_disk(job_row.filename, audio_path)
+    _validate_audio_file_on_disk(_row_filename, audio_path)
 
     if _async_enabled:
         # Async path — enqueue + 202 + status polling.
         # Flippeamos status a "transcribing_queued" para que /transcription-status
         # devuelva un estado coherente desde el momento del enqueue.
-        job_row.status = "transcribing_queued"
-        job_row.current_step = "transcribing"
-        # Reset the reaper clock. find_stuck_transcriptions anchors on
-        # coalesce(last_progress_at, created_at) with a 120-min threshold
-        # (reaper.py). A retried `transcription_failed` job has an OLD
-        # created_at, so without this NOW() bump the very next reaper pass
-        # would re-kill it instantly (same class of bug retry_job guards at
-        # main.py:9107). Harmless for fresh awaiting_upload jobs.
-        job_row.last_progress_at = datetime.now(timezone.utc)
-        db.commit()
-        db.close()
+        from database import SessionLocal as _SL
+        _db2 = _SL()
+        try:
+            _row2 = get_job_model(_db2, job_id)
+            if _row2 is None:
+                raise HTTPException(status_code=404, detail="Job not found.")
+            _row2.status = "transcribing_queued"
+            _row2.current_step = "transcribing"
+            # Reset the reaper clock. find_stuck_transcriptions anchors on
+            # coalesce(last_progress_at, created_at) with a 120-min threshold
+            # (reaper.py). A retried `transcription_failed` job has an OLD
+            # created_at, so without this NOW() bump the very next reaper pass
+            # would re-kill it instantly (same class of bug retry_job guards at
+            # main.py:9107). Harmless for fresh awaiting_upload jobs.
+            _row2.last_progress_at = datetime.now(timezone.utc)
+            _db2.commit()
+        finally:
+            _db2.close()
         try:
             from queue_jobs import enqueue_transcription
             # HOTFIX 2026-05-27: use the Job row as the single source of
@@ -3855,9 +3878,9 @@ async def transcribe_uploaded(
                 job_id,
                 audio_path,
                 language=body.language,
-                artist=job_row.artist or "",
-                title=job_row.song_title or "",
-                filename=job_row.filename,
+                artist=_row_artist,
+                title=_row_title,
+                filename=_row_filename,
                 tenant_id=current_user.get("tenant_id", ""),
                 live=bool(body.live),
             )
@@ -3882,13 +3905,19 @@ async def transcribe_uploaded(
         # /transcribe handler. Keeping the implementation in one place via
         # the helper below means the lyrics-recovery / hallucination logic
         # stays in lockstep with the legacy fallback.
-        job_row.status = "transcribed_pending"
-        job_row.current_step = "editing"
-        db.commit()
-        # Release the pooled connection BEFORE the ~15-20 s transcription so
-        # it doesn't starve /usage and /jobs (dashboard freeze). The function
-        # opens its own short-lived session for the only DB touch it needs.
-        db.close()
+        # Sesión corta para el flip (la del request se soltó antes de la
+        # descarga); BEFORE the ~15-20 s transcription so it doesn't starve
+        # /usage and /jobs (dashboard freeze).
+        from database import SessionLocal as _SL
+        _db3 = _SL()
+        try:
+            _row3 = get_job_model(_db3, job_id)
+            if _row3 is not None:
+                _row3.status = "transcribed_pending"
+                _row3.current_step = "editing"
+                _db3.commit()
+        finally:
+            _db3.close()
 
         # HOTFIX 2026-05-27: same source-of-truth fix as the async path —
         # use job_row.artist / job_row.song_title (committed at /upload-url
@@ -3897,16 +3926,15 @@ async def transcribe_uploaded(
         _result = await _run_transcription_for_job(
             request, current_user, job_id, audio_path,
             language=body.language,
-            artist=job_row.artist or "",
-            title=job_row.song_title or "",
+            artist=_row_artist,
+            title=_row_title,
         )
         _result = await _maybe_ctc_retime(_result, audio_path, job_id,
-                                          job_row.artist or "",
-                                          job_row.song_title or "")
+                                          _row_artist, _row_title)
         _result = await _maybe_adlib_filter(
             _result, audio_path, job_id,
             live_hint=bool(getattr(body, "live", False))
-            or _looks_live(job_row.song_title, job_row.filename))
+            or _looks_live(_row_title, _row_filename))
         from lyrics_format import format_lyrics_pass as _fmt
         return await _fmt(_result, language=body.language or "es")
     finally:
