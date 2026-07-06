@@ -27,6 +27,8 @@ export default function PublishPanel({ job, onJobUpdate, onClose }) {
   const [channelId, setChannelId] = useState(null);
   const [privacy, setPrivacy] = useState("unlisted");
   const [includeShort, setIncludeShort] = useState(true);
+  const [schedule, setSchedule] = useState(false);
+  const [scheduledAt, setScheduledAt] = useState("");
   const [metadata, setMetadata] = useState(null);  // null = generating preview
   const [metaError, setMetaError] = useState(null);
   const [submitting, setSubmitting] = useState(false);
@@ -125,6 +127,9 @@ export default function PublishPanel({ job, onJobUpdate, onClose }) {
         privacy,
         metadata,
         include_short: retryKinds ? retryKinds.includes("short") : includeShort,
+        // datetime-local gives local wall time; toISOString() makes it
+        // timezone-aware UTC, which the backend requires.
+        scheduled_at: schedule && scheduledAt ? new Date(scheduledAt).toISOString() : null,
       };
       const res = await fetch(`${API}/youtube/publish/${job.job_id}`, {
         method: "POST",
@@ -257,6 +262,31 @@ export default function PublishPanel({ job, onJobUpdate, onClose }) {
         </div>
       </div>
 
+      <div>
+        <label className="flex items-center gap-2.5 cursor-pointer select-none mb-2">
+          <input type="checkbox" checked={schedule}
+            onChange={(e) => setSchedule(e.target.checked)}
+            className="w-4 h-4 rounded accent-[#6D4AFF]" />
+          <span className="text-sm text-gray-300">{t("yt.publish.schedule")}</span>
+        </label>
+        {schedule && (
+          <div className="pl-6">
+            <input
+              type="datetime-local"
+              value={scheduledAt}
+              min={new Date(Date.now() + 15 * 60 * 1000).toISOString().slice(0, 16)}
+              onChange={(e) => setScheduledAt(e.target.value)}
+              className="input-field text-sm [color-scheme:dark]"
+            />
+            <p className="text-[10px] text-gray-600 mt-1.5 max-w-md">
+              {privacy === "public"
+                ? t("yt.publish.schedule_help_public")
+                : t("yt.publish.schedule_help_private")}
+            </p>
+          </div>
+        )}
+      </div>
+
       {submitError && (
         <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3">
           <p className="text-sm text-red-400">{submitError}</p>
@@ -264,10 +294,13 @@ export default function PublishPanel({ job, onJobUpdate, onClose }) {
       )}
 
       <div className="flex gap-3 pt-1">
-        <button onClick={() => publish()} disabled={submitting || !metadata.title}
+        <button onClick={() => publish()}
+          disabled={submitting || !metadata.title || (schedule && !scheduledAt)}
           className="btn-primary text-sm py-2.5 px-5 disabled:opacity-50">
           {submitting ? (
             <><div className="inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />{t("yt.publish.publishing")}</>
+          ) : schedule && scheduledAt ? (
+            t("yt.publish.publish_scheduled")
           ) : (
             t("yt.publish.publish")
           )}

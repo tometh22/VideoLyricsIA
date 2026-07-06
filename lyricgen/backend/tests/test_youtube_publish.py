@@ -104,10 +104,11 @@ def _fake_upload_ok(monkeypatch, video_id="vidX"):
     captured = {}
 
     def _fake(video_path, thumbnail_path, artist, song, lyrics_text, privacy,
-              job_id, metadata=None, settings=None, channel=None, progress_callback=None):
+              job_id, metadata=None, settings=None, channel=None,
+              progress_callback=None, publish_at=None):
         captured.update(dict(
             video_path=video_path, artist=artist, song=song, privacy=privacy,
-            metadata=metadata, channel=channel,
+            metadata=metadata, channel=channel, publish_at=publish_at,
         ))
         if progress_callback:
             for p in (10, 55, 100):
@@ -195,7 +196,7 @@ def test_publish_cross_tenant_is_404(client, monkeypatch):
     assert res.status_code == 404
 
 
-def test_publish_invalid_privacy_and_scheduled_rejected(client, monkeypatch):
+def test_publish_invalid_privacy_rejected(client, monkeypatch):
     _patch_enqueue(monkeypatch)
     token, user_id, tenant_id = _register(client)
     _connect_channel(user_id, tenant_id)
@@ -204,10 +205,6 @@ def test_publish_invalid_privacy_and_scheduled_rejected(client, monkeypatch):
     res = client.post(f"/youtube/publish/{job_id}", headers=auth(token),
                       json={"privacy": "everyone", "metadata": METADATA})
     assert res.status_code == 400
-
-    res = client.post(f"/youtube/publish/{job_id}", headers=auth(token),
-                      json={"metadata": METADATA, "scheduled_at": "2030-01-01T12:00:00Z"})
-    assert res.status_code == 400  # PR 3 lights this up
 
 
 # ─── Endpoint: cancel ────────────────────────────────────────────────

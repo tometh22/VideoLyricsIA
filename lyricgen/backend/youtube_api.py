@@ -404,11 +404,26 @@ async def create_publish(
             status_code=400,
             detail=f"privacy must be one of: {', '.join(_PRIVACY_VALUES)}",
         )
+
+    # Scheduling modes:
+    #  - public   → YouTube-native publishAt: upload NOW as private, YouTube
+    #               flips it public at the exact time (survives our infra).
+    #  - unlisted/private → our scheduler daemon enqueues the upload later
+    #               (YouTube can't schedule to non-public targets).
+    native_publish_at = None
+    backend_scheduled_at = None
     if body.scheduled_at is not None:
-        raise HTTPException(
-            status_code=400,
-            detail="Scheduled publishing is not available yet.",
-        )
+        if body.scheduled_at.tzinfo is None:
+            raise HTTPException(
+                status_code=400,
+                detail="scheduled_at must be timezone-aware (ISO 8601 with offset).",
+            )
+        if body.scheduled_at <= datetime.now(timezone.utc):
+            raise HTTPException(status_code=400, detail="scheduled_at must be in the future.")
+        if body.privacy == "public":
+            native_publish_at = body.scheduled_at
+        else:
+            backend_scheduled_at = body.scheduled_at
 
     job = (
         db.query(Job)
@@ -473,9 +488,11 @@ async def create_publish(
             tenant_id=current_user["tenant_id"],
             channel_id=channel.id if channel else None,
             kind=kind,
-            status="queued",
+            status="scheduled" if backend_scheduled_at else "queued",
             metadata_json=md,
             privacy=body.privacy,
+            scheduled_at=body.scheduled_at,
+            publish_at_youtube=native_publish_at,
             created_by=current_user["id"],
         )
         db.add(row)
@@ -489,16 +506,19 @@ async def create_publish(
         raise HTTPException(status_code=409, detail="A publish is already in progress for this job.")
 
     enqueue_errors = []
-    for row in rows:
-        try:
-            queue_jobs.enqueue_publish(row.id)
-        except RuntimeError as e:
-            enqueue_errors.append(str(e))
-            db.query(PublishJob).filter(PublishJob.id == row.id).update(
-                {PublishJob.status: "failed", PublishJob.error: "Queue unavailable."},
-                synchronize_session=False,
-            )
-    db.commit()
+    if not backend_scheduled_at:
+        # Immediate (or native-publishAt) mode: enqueue right away. Backend-
+        # scheduled rows wait for the scheduler daemon.
+        for row in rows:
+            try:
+                queue_jobs.enqueue_publish(row.id)
+            except RuntimeError as e:
+                enqueue_errors.append(str(e))
+                db.query(PublishJob).filter(PublishJob.id == row.id).update(
+                    {PublishJob.status: "failed", PublishJob.error: "Queue unavailable."},
+                    synchronize_session=False,
+                )
+        db.commit()
     if enqueue_errors:
         raise HTTPException(status_code=503, detail="Publish queue unavailable. Try again in a minute.")
 
@@ -507,6 +527,7 @@ async def create_publish(
         "kinds": [k for k, _ in kinds],
         "privacy": body.privacy,
         "channel_id": channel.channel_id if channel else None,
+        "scheduled_at": body.scheduled_at.isoformat() if body.scheduled_at else None,
     })
     db.commit()
 
