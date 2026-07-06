@@ -281,3 +281,48 @@ def test_suffix_off_by_default():
     segs = [{"start": r["start"], "end": r["end"], "text": r["text"]} for r in _PERRO]
     out = ac.filter_and_collapse(segs, _perro_transcriber)
     assert not any(s.get("review") for s in out)
+
+
+# ── modo vivo: swap del sufijo por lo que se canta (Perro live, 06/07) ──────
+
+def _flagged_suffix_segs():
+    return [
+        {"start": 220.0, "end": 224.0, "text": "El amor explota"},
+        {"start": 228.0, "end": 231.0, "text": "Perro amor explota", "review": True},
+        {"start": 240.0, "end": 244.0, "text": "Mata porque quiere morir", "review": True},
+        {"start": 259.0, "end": 263.0, "text": "Explota, explota", "review": True},
+    ]
+
+
+def test_live_swap_replaces_flagged_suffix_with_heard():
+    wx = [
+        {"start": 100.0, "end": 104.0, "text": "línea del cuerpo"},       # antes del corte
+        {"start": 235.2, "end": 239.6, "text": "Un fuerte aplauso para Gustavo Santolalla."},
+        {"start": 263.6, "end": 265.0, "text": "que tiene mucho que ver con esto."},
+    ]
+    out = ac.live_swap_tail(_flagged_suffix_segs(), wx)
+    texts = [s["text"] for s in out]
+    assert "Perro amor explota" not in texts          # letra de estudio fuera
+    assert "Un fuerte aplauso para Gustavo Santolalla." in texts
+    assert all(s.get("review") for s in out if float(s["start"]) > 230)  # ASR marcado
+    assert texts[0] == "El amor explota"              # cuerpo intacto
+
+
+def test_live_swap_needs_substantial_suffix():
+    segs = _flagged_suffix_segs()
+    for s in segs[1:3]:
+        s.pop("review")                                # solo 1 marcada
+    out = ac.live_swap_tail(segs, [{"start": 240.0, "end": 242.0, "text": "algo"}])
+    assert out == segs                                 # no-op: 1 marca puede ser ruido
+
+
+def test_live_swap_keeps_flags_when_wx_heard_nothing():
+    wx = [{"start": 10.0, "end": 12.0, "text": "solo cuerpo"}]  # nada en la zona
+    segs = _flagged_suffix_segs()
+    out = ac.live_swap_tail(segs, wx)
+    assert out == segs                                 # conservar marcadas
+
+
+def test_live_swap_no_flags_is_noop():
+    segs = [{"start": 10.0, "end": 12.0, "text": "línea"}]
+    assert ac.live_swap_tail(segs, [{"start": 11.0, "end": 12.0, "text": "x"}]) == segs

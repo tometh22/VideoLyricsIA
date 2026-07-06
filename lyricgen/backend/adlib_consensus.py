@@ -359,3 +359,63 @@ def filter_and_collapse(segs: list[dict], transcribe_window,
     except Exception as e:  # pragma: no cover — el filtro nunca rompe el render
         logger.warning("[ADLIB] filtro declinó (%s) — segmentos originales", e)
         return list(segs)
+
+
+def live_swap_tail(segs: list[dict], wx_raw: list[dict],
+                   *, min_flagged: int = 2) -> list[dict]:
+    """MODO VIVO: reemplaza el sufijo divergente por lo que se CANTA.
+
+    Caso real (Perro Amor Explota LIVE, 06/07): la letra de estudio no
+    puede representar el final del vivo (call-response con el público,
+    presentaciones de la banda). La auditoría de sufijo ya marcó esas
+    líneas con review=True; acá, si hay señal de vivo, se REEMPLAZAN por
+    los segmentos crudos de whisperX de esa zona — que son la performance
+    real ("Un fuerte aplauso para Gustavo Santolalla" en vez de un
+    "Perro amor explota" que nadie canta). Es lo que hace ROTOR: en un
+    vivo, la verdad es el audio, no la letra publicada.
+
+    Contrato:
+    - Solo actúa si el sufijo marcado es sustancial (>= min_flagged
+      líneas de contenido) — una sola marca puede ser ruido.
+    - Las líneas insertadas conservan review=True: el operador ve
+      exactamente qué zona vino del ASR del vivo.
+    - Si whisperX no oyó nada en la zona, se conservan las marcadas
+      (nunca dejar la cola peor que antes). Never raises.
+    """
+    try:
+        if not segs or not wx_raw:
+            return segs
+        # sufijo contiguo marcado (los ad-libs no cortan la contigüidad)
+        first = None
+        for i in range(len(segs) - 1, -1, -1):
+            s = segs[i]
+            if is_adlib_text(s.get("text", "")):
+                continue
+            if s.get("review"):
+                first = i
+            else:
+                break
+        if first is None:
+            return segs
+        flagged = [i for i in range(first, len(segs))
+                   if segs[i].get("review") and not is_adlib_text(segs[i].get("text", ""))]
+        if len(flagged) < min_flagged:
+            return segs
+        cut = float(segs[first].get("start", 0))
+        live_lines = [
+            {"start": round(float(w.get("start", 0)), 3),
+             "end": round(float(w.get("end", 0)), 3),
+             "text": (w.get("text") or "").strip(),
+             "review": True}
+            for w in wx_raw
+            if float(w.get("start", 0)) >= cut - 1.0 and (w.get("text") or "").strip()
+        ]
+        if not live_lines:
+            return segs                    # el ASR no oyó nada: conservar marcas
+        out = list(segs[:first]) + live_lines
+        logger.info("[ADLIB] modo vivo: sufijo %d líneas de letra → %d líneas "
+                    "cantadas (desde %.1fs)", len(segs) - first, len(live_lines), cut)
+        return out
+    except Exception as e:  # pragma: no cover
+        logger.warning("[ADLIB] live_swap_tail declinó (%s)", e)
+        return segs
