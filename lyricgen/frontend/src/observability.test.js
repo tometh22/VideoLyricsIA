@@ -7,7 +7,11 @@
  * descarta; el throttle por tag protege la cuota ante loops.
  */
 import { describe, expect, it } from "vitest";
-import { consoleTagOf, shouldForwardConsoleEvent } from "./observability";
+import {
+  consoleTagOf,
+  consoleTitleFromArgs,
+  shouldForwardConsoleEvent,
+} from "./observability";
 
 describe("consoleTagOf", () => {
   it("extrae el tag de los warn de diagnóstico reales", () => {
@@ -21,6 +25,46 @@ describe("consoleTagOf", () => {
     expect(consoleTagOf("Failed prop type")).toBe(null);
     expect(consoleTagOf("")).toBe(null);
     expect(consoleTagOf(undefined)).toBe(null);
+  });
+});
+
+describe("consoleTitleFromArgs", () => {
+  it("serializa el objeto que safeJoin dejaría como [object Object]", () => {
+    // Lo que captureConsoleIntegration captura para
+    // console.warn("[ui-freeze] main thread saturated", {...}):
+    const args = [
+      "[ui-freeze] main thread saturated",
+      { sustainedMs: 1450, approxFps: 12, lastAction: "drag-row" },
+    ];
+    const title = consoleTitleFromArgs(args);
+    expect(title).toBe(
+      '[ui-freeze] main thread saturated {"sustainedMs":1450,"approxFps":12,"lastAction":"drag-row"}',
+    );
+    expect(title).not.toContain("[object Object]");
+  });
+
+  it("no toca mensajes que ya son solo strings (devuelve null)", () => {
+    expect(consoleTitleFromArgs(["[stale-bundle] preloadError"])).toBe(null);
+    expect(consoleTitleFromArgs(["[a] x", "y", "z"])).toBe(null);
+  });
+
+  it("es a prueba de args ausentes / no-array (no-op seguro)", () => {
+    expect(consoleTitleFromArgs(undefined)).toBe(null);
+    expect(consoleTitleFromArgs([])).toBe(null);
+  });
+
+  it("no explota ante refs circulares — cae a un placeholder", () => {
+    const circular = { a: 1 };
+    circular.self = circular;
+    const title = consoleTitleFromArgs(["[x] boom", circular]);
+    expect(title).toBe("[x] boom [unserialisable]");
+  });
+
+  it("trunca títulos gigantes para no ensuciar la lista de issues", () => {
+    const big = { blob: "z".repeat(5000) };
+    const title = consoleTitleFromArgs(["[x] big", big], 120);
+    expect(title.length).toBe(120);
+    expect(title.endsWith("…")).toBe(true);
   });
 });
 
