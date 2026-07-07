@@ -247,6 +247,35 @@ def on_startup():
     threading.Thread(target=_yt_scheduler_loop, daemon=True, name="yt-scheduler").start()
     logger.info("yt-scheduler thread started")
 
+    # Nightly analytics sync (advisory lock ...103 — one replica runs it).
+    # Hourly wake-up; runs only when the last sync is >24h old and the UTC
+    # hour has passed ANALYTICS_SYNC_HOUR_UTC.
+    def _analytics_loop():
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        import youtube_analytics as _yta
+
+        if not _yta.SYNC_ENABLED:
+            return
+        _time.sleep(300)
+        while True:
+            try:
+                now = _dt.now(_tz.utc)
+                last = _yta.last_synced_at()
+                due = (last is None or now - last > _td(hours=24)) and now.hour >= _yta.SYNC_HOUR_UTC
+                if due:
+                    result = _yta.sync_all()
+                    logger.info("analytics sync: %s", result)
+            except Exception:  # pragma: no cover
+                try:
+                    import sentry_sdk
+                    sentry_sdk.capture_exception()
+                except Exception:
+                    pass
+            _time.sleep(3600)
+
+    threading.Thread(target=_analytics_loop, daemon=True, name="yt-analytics").start()
+    logger.info("yt-analytics thread started")
+
     # Outputs cleanup loop. Sweeps OUTPUTS_DIR every hour to keep
     # local disk bounded — deletes jobs whose deliverables are on R2
     # and retries the upload for jobs whose R2 push failed earlier.

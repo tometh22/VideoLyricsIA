@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     DateTime,
@@ -352,6 +353,34 @@ class UserSettings(Base):
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     user = relationship("User", back_populates="settings")
+
+
+class VideoStats(Base):
+    """Per-video daily YouTube metrics.
+
+    source="analytics" rows are native per-day deltas from the Analytics
+    API (SUM them for totals). source="data_api" rows are cumulative
+    snapshots from videos.list statistics (take MAX per video) — the
+    fallback when a channel lacks the yt-analytics scope. The
+    totals helper in youtube_analytics.py hides that difference.
+    """
+    __tablename__ = "video_stats"
+    __table_args__ = (
+        UniqueConstraint("video_id", "stat_date", name="uq_video_stats_day"),
+        Index("ix_video_stats_tenant_date", "tenant_id", "stat_date"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    video_id = Column(String(20), nullable=False, index=True)
+    publish_job_id = Column(Integer, ForeignKey("publish_jobs.id"), nullable=True)
+    tenant_id = Column(String(100), nullable=False)
+    stat_date = Column(String(10), nullable=False)  # YYYY-MM-DD
+    views = Column(BigInteger, nullable=False, default=0)
+    likes = Column(Integer, nullable=False, default=0)
+    comments = Column(Integer, nullable=False, default=0)
+    estimated_minutes_watched = Column(Integer, nullable=True)
+    source = Column(String(20), nullable=False, default="data_api")
+    fetched_at = Column(DateTime(timezone=True), default=utcnow)
 
 
 class TenantSettings(Base):

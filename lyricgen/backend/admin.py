@@ -563,6 +563,24 @@ async def export_audit_log(
     )
 
 
+@router.post("/analytics/sync-now")
+async def runbook_analytics_sync(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Force an immediate analytics sync pass (the daemon runs nightly)."""
+    import youtube_analytics
+
+    result = youtube_analytics.sync_all()
+    db.add(AuditLog(
+        user_id=admin["id"],
+        action="admin.runbook.analytics_sync",
+        detail=result if isinstance(result, dict) else {},
+    ))
+    db.commit()
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Tenant settings (maker-checker toggle etc.)
 # ---------------------------------------------------------------------------

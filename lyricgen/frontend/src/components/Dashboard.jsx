@@ -130,6 +130,18 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
   }, [history.length, usageRetryNonce]);
   const retryUsage = () => setUsageRetryNonce((n) => n + 1);
 
+  // YouTube analytics summary — optional card, only shown when the tenant
+  // has published videos with tracked stats.
+  const [ytSummary, setYtSummary] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API}/youtube/analytics/summary?days=28`, { headers: authHeaders() })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (!cancelled && d) setYtSummary(d); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [history.length]);
+
   // Errors banner is dismissible. We persist the count at dismiss time so
   // the banner re-surfaces only when *new* errors arrive (otherwise the
   // operator would have to dismiss it every page load until next month).
@@ -408,6 +420,26 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
       )}
 
       {/* ─── Tus últimos videos — visual scan, NOT a copy of History ── */}
+      {ytSummary && ytSummary.videos_tracked > 0 && (
+        <div className="mb-8">
+          <SectionLabel>{t("yt.analytics.dashboard_title")}</SectionLabel>
+          <div className="grid grid-cols-3 gap-3 mt-4">
+            {[
+              { value: ytSummary.totals.views, label: t("yt.analytics.views") },
+              { value: ytSummary.totals.likes, label: t("yt.analytics.likes") },
+              { value: ytSummary.totals.comments, label: t("yt.analytics.comments") },
+            ].map((s) => (
+              <div key={s.label} className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                <p className="text-2xl font-bold text-white">
+                  {new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(s.value)}
+                </p>
+                <p className="text-[11px] text-gray-500 uppercase tracking-wider mt-0.5">{s.label}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {recentDone.length > 0 && (
         <div data-tour="dashboard-recent">
           <div className="flex items-center justify-between mb-4">
