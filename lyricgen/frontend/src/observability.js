@@ -47,6 +47,43 @@ export function consoleTagOf(message) {
   return m ? m[1].toLowerCase() : null;
 }
 
+/**
+ * Rebuild a console event's title from its captured arguments, or null
+ * when there's nothing to improve. Exportado para tests.
+ *
+ * captureConsoleIntegration builds the Sentry title with `safeJoin(args,
+ * " ")`, which String()-coerces each arg — so `console.warn("[tag] …",
+ * {details})` renders as "[tag] … [object Object]", burying the payload
+ * the callsite passed (the ui-freeze report's sustainedMs / approxFps /
+ * lastAction / context, drag-persist's snapshot, etc.). Every tagged
+ * diagnostic that logs an object collapses to a "[object Object]" title
+ * in the issue list. This serialises object args as compact JSON so the
+ * title carries the actual numbers, and leaves the structured object in
+ * `extra.arguments` for drill-down.
+ *
+ * Returns null when there are no object args (nothing to fix) so the
+ * caller keeps the original message. Grouping is untouched — beforeSend
+ * fingerprints by tag, not by message, so this only rewrites the
+ * human-readable title.
+ */
+export function consoleTitleFromArgs(args, maxLen = 500) {
+  if (!Array.isArray(args) || args.length === 0) return null;
+  if (!args.some((a) => a !== null && typeof a === "object")) return null;
+  const parts = args.map((a) => {
+    if (typeof a === "string") return a;
+    if (a === null || a === undefined || typeof a !== "object") return String(a);
+    try {
+      return JSON.stringify(a);
+    } catch {
+      // Circular refs / BigInt / getters that throw — never let the
+      // title rewrite throw out of beforeSend and drop the whole event.
+      return "[unserialisable]";
+    }
+  });
+  const joined = parts.join(" ");
+  return joined.length > maxLen ? `${joined.slice(0, maxLen - 1)}…` : joined;
+}
+
 // Throttle client-side por tag: protege la cuota de Sentry si un warn
 // taggeado entra en loop (la lección del loop de re-renders: 5000
 // ciclos/100ms habrían sido 5000 eventos/seg). 1 evento por tag por
@@ -135,6 +172,19 @@ export function initSentry() {
         // the exact action sequence (P0 UMG Chile 2026-06-16). Other tagged
         // diagnostics stay `warning` (no replay, saves quota).
         event.level = _FREEZE_TAGS.has(tag) ? "error" : "warning";
+        // captureConsoleIntegration renders object args as "[object
+        // Object]" in the title (safeJoin), hiding the diagnostic
+        // payload. Rebuild the title from the captured args with real
+        // JSON. Fingerprint (above) already groups by tag, so this only
+        // affects the human-readable title — worst case it's a no-op, it
+        // can never split or merge issues.
+        const rebuilt = consoleTitleFromArgs(event.extra?.arguments);
+        if (rebuilt) {
+          event.message = rebuilt;
+          if (event.logentry) {
+            event.logentry = { ...event.logentry, message: rebuilt, formatted: rebuilt, params: undefined };
+          }
+        }
         return event;
       },
       // Don't send PII in default events. We send tenant_id and role
