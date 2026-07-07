@@ -6112,7 +6112,7 @@ _CONCEPT_SCENE_GUIDE = {
     "atmosferico":  "atmospheric mood — drifting smoke, dense fog, volumetric light rays, dust motes, soft haze, ethereal glow",
     "romantico":    "romantic mood — warm sunsets, candlelight, scattered rose petals, soft fabric textures, calm beaches at dusk, fireplace embers",
     "vintage":      "vintage / retro — Super 8 film grain, sepia tones, faded photographs, retro patterns, analog noise, old-paper textures",
-    "cinematic":    "cinematic dramatic — chiaroscuro lighting, film-noir contrast, dramatic shadows, anamorphic lens flares, moody atmosphere",
+    "cinematic":    "cinematic dramatic — chiaroscuro lighting, film-noir contrast, dramatic shadows, dramatic lens flares, moody atmosphere",
     "club":         "club / dance scene — laser beams, smoke machines, neon strips, disco balls, strobe lights, dancefloor energy (no people, no faces)",
     "lujo":         "luxury aesthetics — polished marble, gold accents, crystal facets, high-gloss surfaces, fashion textures, jewelry close-ups",
     "minimalista":  "minimalist design — clean geometric shapes, smooth gradients, solid color planes, single-subject compositions, negative space",
@@ -7207,6 +7207,16 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         " no film sprocket holes, no film perforations, no film strip, no film "
         "edge markings, no 16mm or 35mm frame, no scanned film border, no black "
         "frame border, full-bleed edge-to-edge image,"
+        # Anti-letterbox (2026-07-07, "Seguir Viviendo Sin Tu Amor"/Spinetta):
+        # cues cinematográficos ("cinema camera", el mood cinematic con
+        # "anamorphic") hacían que Veo horneara franjas negras widescreen
+        # arriba/abajo en ALGUNAS escenas (estocástico → un video sí y otro no).
+        # El "no black frame border" de arriba es marco de 4 lados; el letterbox
+        # 2.39:1 es otra cosa y necesita prohibición explícita. Llena SIEMPRE el
+        # frame 16:9 completo — sin barras cinematográficas.
+        " no letterbox, no letterboxing, no black bars, no cinematic bars, no "
+        "widescreen bars, no anamorphic bars, no top or bottom black bars, no "
+        "2.39:1 or 2.35:1 crop, fill the entire 16:9 frame edge to edge,"
     )
     # Camera-motion negatives — the LAST line of defense for static intent.
     # Veo's payload exposes no structured camera-lock field, so these words
