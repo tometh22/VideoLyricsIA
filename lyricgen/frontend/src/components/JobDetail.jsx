@@ -368,6 +368,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [editingMeta, setEditingMeta] = useState(false);
   const [editedTitle, setEditedTitle] = useState("");
   const [editedDescription, setEditedDescription] = useState("");
+  const [editedTags, setEditedTags] = useState([]);
   const [showYoutubePanel, setShowYoutubePanel] = useState(false);
   const [confirmPublicYoutube, setConfirmPublicYoutube] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(-1);
@@ -1182,6 +1183,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       setMetadataPreview(data);
       setEditedTitle(data.title || "");
       setEditedDescription(data.description || "");
+      setEditedTags(data.tags || []);
     } catch (err) {
       setMetadataPreview({ error: err.message });
     }
@@ -1219,10 +1221,14 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       const res = await fetch(`${API}/youtube/upload/${job.job_id}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
+        // Always send the previewed/edited values so what you approve is
+        // exactly what gets published (the backend would otherwise
+        // regenerate the metadata with a fresh AI call).
         body: JSON.stringify({
           privacy,
-          title: editingMeta ? editedTitle : undefined,
-          description: editingMeta ? editedDescription : undefined,
+          title: editedTitle || undefined,
+          description: editedDescription || undefined,
+          tags: editedTags,
         }),
       });
       clearInterval(pollId);
@@ -2000,14 +2006,26 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               </div>
               <div>
                 <label className="text-xs text-gray-500 uppercase tracking-wider">Tags</label>
-                <div className="flex flex-wrap gap-1.5 mt-1">
-                  {(metadataPreview.tags || []).slice(0, 12).map((tag, i) => (
-                    <span key={i} className="px-2 py-1 rounded-lg bg-surface-3/50 text-xs text-gray-400">{tag}</span>
-                  ))}
-                  {(metadataPreview.tags || []).length > 12 && (
-                    <span className="px-2 py-1 text-xs text-gray-600">+{(metadataPreview.tags || []).length - 12}</span>
-                  )}
-                </div>
+                {editingMeta ? (
+                  <>
+                    <textarea
+                      value={editedTags.join(", ")}
+                      onChange={(e) => setEditedTags(e.target.value.split(",").map((s) => s.trim()).filter(Boolean))}
+                      rows={2}
+                      className="input-field text-sm w-full resize-none mt-1"
+                      placeholder="tag1, tag2, tag3" />
+                    <p className="text-[10px] text-gray-600 mt-1">{t("detail.tags_help") || "Separados por coma."}</p>
+                  </>
+                ) : (
+                  <div className="flex flex-wrap gap-1.5 mt-1">
+                    {editedTags.slice(0, 12).map((tag, i) => (
+                      <span key={i} className="px-2 py-1 rounded-lg bg-surface-3/50 text-xs text-gray-400">{tag}</span>
+                    ))}
+                    {editedTags.length > 12 && (
+                      <span className="px-2 py-1 text-xs text-gray-600">+{editedTags.length - 12}</span>
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* Upload progress bar */}

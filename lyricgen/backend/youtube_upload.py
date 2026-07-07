@@ -158,14 +158,19 @@ _LANG_NAMES = {
 }
 
 
-def _get_language_name() -> str:
-    settings = _load_settings()
+def _get_language_name(settings: dict = None) -> str:
+    if settings is None:
+        settings = _load_settings()
     code = settings.get("metadataLanguage", "es")
     return _LANG_NAMES.get(code, "Spanish")
 
 
 def _load_settings() -> dict:
-    """Load client settings for YouTube template."""
+    """Legacy fallback: YouTube template from the pre-DB JSON file.
+
+    Settings now live per-user in the DB (UserSettings) and callers pass
+    them in explicitly; this file is only read when no settings are given.
+    """
     settings_path = os.path.join(os.path.dirname(__file__), "..", "outputs", "_settings.json")
     if os.path.exists(settings_path):
         with open(settings_path) as f:
@@ -173,11 +178,26 @@ def _load_settings() -> dict:
     return {}
 
 
-def generate_youtube_metadata(artist: str, song: str, lyrics_text: str = "", job_id: str = None) -> dict:
-    """Use Gemini to generate optimized YouTube metadata."""
+def generate_youtube_metadata(
+    artist: str,
+    song: str,
+    lyrics_text: str = "",
+    job_id: str = None,
+    settings: dict = None,
+) -> dict:
+    """Use Gemini to generate optimized YouTube metadata.
+
+    `settings` is the client's YouTube template (title format, description
+    header/footer, hashtags, mandatory tags, language) — normally the
+    user's DB-backed UserSettings. Falls back to the legacy file only when
+    the caller passes nothing.
+    """
     from pipeline import _get_genai_client
     from google import genai
     from provenance import record_ai_call
+
+    if settings is None:
+        settings = _load_settings()
 
     client = _get_genai_client()
 
@@ -185,7 +205,7 @@ def generate_youtube_metadata(artist: str, song: str, lyrics_text: str = "", job
         f"Artist: {artist}\nSong: {song}\n"
         f"Lyrics preview: {lyrics_text[:300]}\n\n"
         f"Generate YouTube video metadata for a lyric video following YouTube SEO best practices. "
-        f"Write ALL metadata in {_get_language_name()} (title, description, tags). "
+        f"Write ALL metadata in {_get_language_name(settings)} (title, description, tags). "
         f"Respond ONLY with JSON: {{\"title\":\"...\",\"description\":\"...\",\"tags\":[\"...\"]}}\n\n"
         f"TITLE rules (YouTube SEO):\n"
         f"- Format: '{artist} - {song} (Letra/Lyrics)'\n"
@@ -251,9 +271,8 @@ def generate_youtube_metadata(artist: str, song: str, lyrics_text: str = "", job
             "category": "10",
         }
 
-    # Apply client settings (template overrides)
-    settings = _load_settings()
-
+    # Apply client settings (template overrides). `settings` was resolved
+    # at the top (DB settings from the caller, or the legacy file).
     title_fmt = settings.get("titleFormat", "")
     if title_fmt:
         metadata["title"] = title_fmt.replace("{artista}", artist).replace("{cancion}", song)
@@ -279,9 +298,11 @@ def generate_youtube_metadata(artist: str, song: str, lyrics_text: str = "", job
     return metadata
 
 
-def generate_short_metadata(artist: str, song: str, lyrics_text: str = "", job_id: str = None) -> dict:
+def generate_short_metadata(
+    artist: str, song: str, lyrics_text: str = "", job_id: str = None, settings: dict = None,
+) -> dict:
     """Generate YouTube metadata optimized for Shorts (adds #Shorts signal)."""
-    metadata = generate_youtube_metadata(artist, song, lyrics_text, job_id=job_id)
+    metadata = generate_youtube_metadata(artist, song, lyrics_text, job_id=job_id, settings=settings)
     if "#Shorts" not in metadata["title"]:
         metadata["title"] = f"{metadata['title']} #Shorts"[:100]
     if "#Shorts" not in metadata["description"]:
@@ -301,14 +322,26 @@ def upload_to_youtube(
     job_id: str = None,
     title_override: str = None,
     description_override: str = None,
+    tags_override: list = None,
+    settings: dict = None,
 ) -> dict:
-    """Upload video + thumbnail to YouTube. Returns dict with video_id, url, title, privacy."""
+    """Upload video + thumbnail to YouTube. Returns dict with video_id, url, title, privacy.
+
+    `settings` = the client's YouTube template (DB-backed UserSettings).
+    title/description/tags overrides are the exact values the user
+    previewed/edited, so what they approve is what gets published.
+    """
+    if settings is None:
+        settings = _load_settings()
+
     print(f"[YOUTUBE] Generating metadata for '{artist} - {song}'...")
-    metadata = generate_youtube_metadata(artist, song, lyrics_text, job_id=job_id)
+    metadata = generate_youtube_metadata(artist, song, lyrics_text, job_id=job_id, settings=settings)
     if title_override:
         metadata["title"] = title_override
     if description_override:
         metadata["description"] = description_override
+    if tags_override is not None:
+        metadata["tags"] = [str(t).strip() for t in tags_override if str(t).strip()]
     print(f"[YOUTUBE] Title: {metadata['title']}")
 
     try:
@@ -316,13 +349,14 @@ def upload_to_youtube(
     except RuntimeError as e:
         raise RuntimeError(_map_youtube_error(e))
 
+    default_lang = settings.get("metadataLanguage", "es")
     body = {
         "snippet": {
             "title": metadata["title"],
             "description": metadata["description"],
             "tags": metadata.get("tags", []),
             "categoryId": metadata.get("category", "10"),
-            "defaultLanguage": "es",
+            "defaultLanguage": default_lang,
         },
         "status": {
             "privacyStatus": privacy,
@@ -390,14 +424,21 @@ def upload_short_to_youtube(
     job_id: str = None,
     title_override: str = None,
     description_override: str = None,
+    tags_override: list = None,
+    settings: dict = None,
 ) -> dict:
     """Upload the Short (vertical 9:16) to YouTube with Shorts-optimised metadata."""
+    if settings is None:
+        settings = _load_settings()
+
     print(f"[YOUTUBE SHORT] Generating metadata for '{artist} - {song}'...")
-    metadata = generate_short_metadata(artist, song, lyrics_text, job_id=job_id)
+    metadata = generate_short_metadata(artist, song, lyrics_text, job_id=job_id, settings=settings)
     if title_override:
         metadata["title"] = title_override
     if description_override:
         metadata["description"] = description_override
+    if tags_override is not None:
+        metadata["tags"] = [str(t).strip() for t in tags_override if str(t).strip()]
     print(f"[YOUTUBE SHORT] Title: {metadata['title']}")
 
     try:
@@ -405,13 +446,14 @@ def upload_short_to_youtube(
     except RuntimeError as e:
         raise RuntimeError(_map_youtube_error(e))
 
+    default_lang = settings.get("metadataLanguage", "es")
     body = {
         "snippet": {
             "title": metadata["title"],
             "description": metadata["description"],
             "tags": metadata.get("tags", []),
             "categoryId": metadata.get("category", "10"),
-            "defaultLanguage": "es",
+            "defaultLanguage": default_lang,
         },
         "status": {
             "privacyStatus": privacy,
