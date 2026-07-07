@@ -4285,6 +4285,7 @@ async def upload(
     effect: str = Form("", max_length=32),
     animate_image: str = Form("", max_length=8),
     text_case: str = Form("upper", max_length=16),
+    frame_format: str = Form("full", max_length=16),
     font_scale: str = Form("1.0", max_length=8),
     lyric_transition: str = Form("cut", max_length=16),
     text_motion: str = Form("none", max_length=16),
@@ -4481,6 +4482,7 @@ async def upload(
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
         song_title=song_title,
         text_case=text_case if text_case in ("upper", "title", "lower", "original", "sentence") else "upper",
+        frame_format=frame_format if frame_format in ("full", "cine") else "full",
         font_scale=_font_scale,
         # lyric_transition + text_motion: deprecados 2026-05-23 (ver run_pipeline).
         # Aceptamos los Form params por back-compat pero coerce a defaults.
@@ -7273,6 +7275,7 @@ async def generate_with_segments(
     effect: str = Form("", max_length=32),
     animate_image: str = Form("", max_length=8),
     text_case: str = Form("upper", max_length=16),
+    frame_format: str = Form("full", max_length=16),
     font_scale: str = Form("1.0", max_length=8),
     lyric_transition: str = Form("cut", max_length=16),
     text_motion: str = Form("none", max_length=16),
@@ -7576,6 +7579,7 @@ async def generate_with_segments(
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
         song_title=song_title,
         text_case=text_case if text_case in ("upper", "title", "lower", "original", "sentence") else "upper",
+        frame_format=frame_format if frame_format in ("full", "cine") else "full",
         font_scale=_font_scale_gen,
         # Deprecados 2026-05-23 (ver primer endpoint /upload).
         lyric_transition="cut",
@@ -8595,6 +8599,7 @@ class EditJobRequest(BaseModel):
     font: str | None = Field(default=None, max_length=64)
     font_scale: float | None = None
     text_case: str | None = Field(default=None, max_length=16)
+    frame_format: str | None = Field(default=None, max_length=16)
     # lyric_transition + text_motion deprecados 2026-05-23 — campos
     # eliminados del modelo. Clientes viejos que sigan mandándolos en el
     # body son ignorados por Pydantic (default: extra fields permitidos).
@@ -9602,6 +9607,8 @@ async def request_edit(
         edit_params["font_scale"] = body.font_scale
     if body.text_case is not None:
         edit_params["text_case"] = body.text_case
+    if body.frame_format is not None:
+        edit_params["frame_format"] = body.frame_format
     if body.text_contrast is not None:
         edit_params["text_contrast"] = body.text_contrast
     # Title-card customization (Full Rotor v1) — durable visual choices, same
@@ -10539,7 +10546,7 @@ async def retry_job(
     # lyric_transition + text_motion deprecados 2026-05-23 — sacados de la
     # whitelist; si están en render_params viejos quedan como dato muerto,
     # no se propagan al re-render.
-    for k in ("font", "font_scale", "text_case", "text_contrast",
+    for k in ("font", "font_scale", "text_case", "frame_format", "text_contrast",
               "movement_style", "animate_image", "genre", "match_lyrics",
               "background_hint", "concept", "bg_verbatim",
               "effect", "custom_colors",
@@ -10970,7 +10977,7 @@ async def create_variant(
     # (font, font_scale, etc) se pasan como kwargs individuales que
     # run_pipeline acepta. concept también va por kwarg.
     # lyric_transition + text_motion deprecados 2026-05-23 — fuera del whitelist.
-    for k in ("font", "font_scale", "text_case", "text_contrast",
+    for k in ("font", "font_scale", "text_case", "frame_format", "text_contrast",
               "movement_style", "animate_image", "genre", "match_lyrics",
               "bg_verbatim",
               # FX layer + lyric animation/transition (libass templates from

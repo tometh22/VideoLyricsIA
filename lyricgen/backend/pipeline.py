@@ -578,6 +578,9 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  animate_image: bool = False,
                  song_title: str = "",
                  text_case: str = "upper",
+                 # Frame format: "full" (default, 16:9) | "cine" (2.39:1 letterbox
+                 # applied to the finished YouTube master; see _apply_frame_format).
+                 frame_format: str = "full",
                  font_scale: float = 1.0,
                  lyric_transition: str = "cut",
                  text_motion: str = "none",
@@ -1009,6 +1012,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         _new_rp = {
             "font": font,
             "text_case": text_case,
+            "frame_format": frame_format,
             "font_scale": font_scale,
             "lyric_transition": lyric_transition,
             "text_motion": text_motion,
@@ -1241,7 +1245,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 RenderSpec.umg_intermediate_master(umg_spec) if wants_umg
                 else None  # generate_lyric_video defaults to youtube_default
             )
-            _, chosen_font, bg_source = generate_lyric_video(
+            _video_out, chosen_font, bg_source = generate_lyric_video(
                 mp3_path, segments, style, job_dir, artist, bg_image_path,
                 font=chosen_font, spec=intermediate_spec,
                 song_title=song_title,
@@ -1260,6 +1264,15 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 # Multi-escena: el fondo ya es un timeline del largo completo.
                 bg_prelooped=_scenes_active,
             )
+            # Cinemascope opt-in: letterbox the finished YouTube master. Skipped
+            # for UMG (that path returns a ProRes .mov — re-encoding it as h264
+            # would wreck the master) and thus for "both" as well.
+            if _video_out and not wants_umg:
+                try:
+                    if _apply_frame_format(_video_out, frame_format):
+                        logger.info("[FMT] Cinemascope 2.39:1 aplicado al master")
+                except Exception as e:
+                    logger.warning("[FMT] frame_format skip (non-fatal): %s", e)
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
 
@@ -9460,6 +9473,57 @@ def _strip_letterbox(clip_path: str) -> bool:
     return True
 
 
+# Cinemascope "Cine" format. The user opts into a deterministic 2.39:1
+# letterbox (vs the default full-frame) so the filmic look is intentional and
+# uniform — the opposite of the STOCHASTIC bars Veo used to bake in (see
+# _strip_letterbox). We crop the finished 16:9 video to 2.39:1 (a real
+# cinemascope crop — no distortion, loses a little top/bottom framing) and pad
+# clean black bars back to the frame. Applied ONLY to the 16:9 master; the
+# 9:16 short stays full-frame (2.39 bars on a vertical would swallow it).
+_CINE_ASPECT = 2.39
+
+
+def _apply_frame_format(video_path: str, frame_format: str) -> bool:
+    """Apply the chosen frame format to a finished video in place. Currently
+    only "cine" does anything (2.39:1 letterbox); "full"/anything else is a
+    no-op. Returns True iff the file was rewritten. Best-effort — a failure
+    leaves the video untouched (falls back to full-frame)."""
+    if (frame_format or "full") != "cine":
+        return False
+    dims = _video_dims(video_path)
+    if not dims:
+        return False
+    W, H = dims
+    content_h = int(round(W / _CINE_ASPECT))
+    content_h -= content_h % 2          # even height for yuv420p
+    if content_h <= 0 or content_h >= H:
+        return False                    # frame already ≥ 2.39:1 → nothing to bar
+    # H and content_h are both even → (H-content_h) is even → symmetric bars.
+    bar = (H - content_h) // 2
+    tmp = video_path + ".cine.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", video_path,
+        "-vf", (f"crop={W}:{content_h}:0:{bar},"
+                f"pad={W}:{H}:0:{bar}:black,setsar=1"),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "copy",
+        tmp,
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=1800)
+    except Exception:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return False
+    os.replace(tmp, video_path)
+    return True
+
+
 def _normalize_bg_to_spec(bg_path: str, job_dir: str,
                           target_w=1920, target_h=1080,
                           out_name: str = "bg_normalized.mp4") -> str:
@@ -12223,6 +12287,7 @@ def run_edit_pipeline(
     merged = {**base_params, **edit_params}
     font_id = merged.get("font") or ""
     text_case = merged.get("text_case") or "upper"
+    frame_format = merged.get("frame_format") or "full"
     font_scale = float(merged.get("font_scale") or 1.0)
     # text_contrast was missing here → a typography/bg edit re-render dropped
     # the operator's contrast choice on the MAIN video (2026-06-02 fix).
@@ -12482,7 +12547,7 @@ def run_edit_pipeline(
             RenderSpec.umg_intermediate_master(umg_spec) if wants_umg
             else None
         )
-        _, chosen_font, bg_source = generate_lyric_video(
+        _video_out, chosen_font, bg_source = generate_lyric_video(
             mp3_path, segments, style, job_dir, artist, bg_image_path,
             font=chosen_font, spec=intermediate_spec,
             song_title=song_title,
@@ -12501,6 +12566,13 @@ def run_edit_pipeline(
             # Multi-escena: el timeline ya cubre toda la canción → no re-loopear.
             bg_prelooped=bg_prelooped,
         )
+        # Cinemascope opt-in — mirror run_pipeline. YouTube master only.
+        if _video_out and not wants_umg:
+            try:
+                if _apply_frame_format(_video_out, frame_format):
+                    logger.info("[FMT] Cinemascope 2.39:1 aplicado (edit)")
+            except Exception as e:
+                logger.warning("[FMT] frame_format skip (non-fatal): %s", e)
         files = {"video_url": f"/download/{job_id}/video"}
         update_job(job_id, progress=55)
 
