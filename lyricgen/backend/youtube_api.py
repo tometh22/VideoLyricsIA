@@ -13,6 +13,14 @@ import os
 import secrets
 from datetime import datetime, timezone
 
+# Google's consent screen frequently returns the granted scopes in a
+# different order than requested, and with incremental auth
+# (include_granted_scopes) may add previously-granted scopes. oauthlib
+# rejects any such mismatch with "Scope has changed" by default, which
+# would surface to the user as a generic connection error even though the
+# grant is fine. Relaxing lets us validate the granted scopes ourselves.
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
 import requests as _requests
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import RedirectResponse
@@ -39,6 +47,14 @@ OAUTH_SCOPES = [
 
 _STATE_TTL_S = 600
 _GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+
+# Without these two the channel can be listed but never published to, so
+# a partial grant (user left a checkbox unticked) must be treated as a
+# failed connection, not a silent half-connection.
+_REQUIRED_SCOPES = {
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/youtube.readonly",
+}
 
 
 class YouTubeOAuthNotConfiguredError(RuntimeError):
@@ -202,13 +218,29 @@ async def oauth_callback(
         flow = _make_flow()
         flow.fetch_token(code=code)
         creds = flow.credentials
-        info = _fetch_channel_info(creds)
     except YouTubeOAuthNotConfiguredError:
         return _settings_redirect(youtube_error="not_configured")
+    except Exception:
+        logger.exception("YouTube token exchange failed (tenant %s)", tenant_id)
+        return _settings_redirect(youtube_error="exchange")
+
+    # The user can leave a permission checkbox unticked on Google's consent
+    # screen. Without upload+readonly the channel is useless, so reject the
+    # connection with a specific error instead of storing a dead channel.
+    granted = set(creds.scopes or [])
+    if not _REQUIRED_SCOPES.issubset(granted):
+        logger.warning(
+            "YouTube connect: missing required scopes (granted %s) tenant %s",
+            granted, tenant_id,
+        )
+        return _settings_redirect(youtube_error="scopes")
+
+    try:
+        info = _fetch_channel_info(creds)
     except ValueError:
         return _settings_redirect(youtube_error="no_channel")
     except Exception:
-        logger.exception("YouTube OAuth callback failed (tenant %s)", tenant_id)
+        logger.exception("YouTube channel lookup failed (tenant %s)", tenant_id)
         return _settings_redirect(youtube_error="exchange")
 
     token_blob = encrypt_token(_credentials_to_token_dict(creds))

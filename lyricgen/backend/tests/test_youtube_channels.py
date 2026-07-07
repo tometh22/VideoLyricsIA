@@ -59,7 +59,11 @@ class _FakeCreds:
     token = "fake-access-token"
     refresh_token = "fake-refresh-token"
     token_uri = "https://oauth2.googleapis.com/token"
-    scopes = ["https://www.googleapis.com/auth/youtube.upload"]
+    scopes = [
+        "https://www.googleapis.com/auth/youtube.upload",
+        "https://www.googleapis.com/auth/youtube.readonly",
+        "https://www.googleapis.com/auth/yt-analytics.readonly",
+    ]
     expiry = None
 
 
@@ -135,6 +139,39 @@ def test_callback_user_denied_redirects_with_error(client):
     )
     assert res.status_code == 302
     assert "youtube_error=access_denied" in res.headers["location"]
+
+
+def test_callback_missing_scopes_redirects_with_scopes_error(client, monkeypatch):
+    """User left a permission checkbox unticked → we must reject the
+    connection with a specific 'scopes' error, not store a dead channel."""
+    import youtube_api
+    from database import SessionLocal, YouTubeChannel
+
+    class _PartialCreds(_FakeCreds):
+        # Only "view", missing "upload" — can't publish.
+        scopes = ["https://www.googleapis.com/auth/youtube.readonly"]
+
+    class _PartialFlow(_FakeFlow):
+        def __init__(self):
+            self.credentials = _PartialCreds()
+
+    monkeypatch.setattr(youtube_api, "_make_flow", lambda: _PartialFlow())
+    # channel info must NOT be fetched when scopes are insufficient.
+    monkeypatch.setattr(youtube_api, "_fetch_channel_info",
+                        lambda creds: (_ for _ in ()).throw(AssertionError("should not fetch")))
+
+    _, user_id, tenant_id = _register(client)
+    state = youtube_api._sign_state(user_id, tenant_id)
+    res = client.get(f"/youtube/oauth/callback?state={state}&code=x", follow_redirects=False)
+    assert res.status_code == 302
+    assert "youtube_error=scopes" in res.headers["location"]
+
+    # No channel row was created.
+    s = SessionLocal()
+    try:
+        assert s.query(YouTubeChannel).filter(YouTubeChannel.tenant_id == tenant_id).count() == 0
+    finally:
+        s.close()
 
 
 def test_callback_happy_path_persists_encrypted_channel(client, monkeypatch):

@@ -123,6 +123,8 @@ export default function ChannelsCard() {
     return () => clearTimeout(timer);
   }, [flash]);
 
+  const [showHelp, setShowHelp] = useState(false);
+
   const connect = async () => {
     setBusy(true);
     try {
@@ -138,6 +140,13 @@ export default function ChannelsCard() {
       setError(t("yt.channels.error_generic"));
       setBusy(false);
     }
+  };
+
+  // Google shows two confusing screens ("app not verified" + unchecked
+  // permission boxes). Walk the user through them before we redirect.
+  const startConnect = () => {
+    setError(null);
+    setShowHelp(true);
   };
 
   const disconnect = async (channel) => {
@@ -158,9 +167,33 @@ export default function ChannelsCard() {
     setBusy(false);
   };
 
-  const errorMessage = flash.err
-    ? (flash.err === "access_denied" ? t("yt.channels.error_denied") : t("yt.channels.error_generic"))
-    : error;
+  const errorFor = (code) => {
+    if (code === "access_denied") return t("yt.channels.error_denied");
+    if (code === "scopes") return t("yt.channels.error_scopes");
+    if (code === "no_channel") return t("yt.channels.error_no_channel");
+    return t("yt.channels.error_generic");
+  };
+  const errorMessage = flash.err ? errorFor(flash.err) : error;
+
+  // Instructions modal shown before redirecting to Google.
+  const helpSteps = showHelp && (
+    <div className="mb-4 rounded-xl bg-brand/[0.06] ring-1 ring-brand/25 px-4 py-4 animate-fade-in">
+      <p className="text-sm font-medium text-white mb-2">{t("yt.channels.help_title")}</p>
+      <ol className="text-xs text-gray-300 space-y-1.5 list-decimal list-inside mb-3">
+        <li>{t("yt.channels.help_step_unverified")}</li>
+        <li className="font-medium text-brand-light">{t("yt.channels.help_step_scopes")}</li>
+        <li>{t("yt.channels.help_step_continue")}</li>
+      </ol>
+      <div className="flex gap-3">
+        <button onClick={connect} disabled={busy} className="btn-primary text-sm py-2 px-5 disabled:opacity-50">
+          {busy ? "..." : t("yt.channels.help_go")}
+        </button>
+        <button onClick={() => setShowHelp(false)} className="text-xs text-gray-500 hover:text-white transition-colors">
+          {t("detail.cancel")}
+        </button>
+      </div>
+    </div>
+  );
 
   return (
     <div>
@@ -177,6 +210,8 @@ export default function ChannelsCard() {
           <p className="text-sm text-red-400">{errorMessage}</p>
         </div>
       )}
+
+      {helpSteps}
 
       {channels === null ? (
         <div className="space-y-3 animate-pulse">
@@ -197,7 +232,7 @@ export default function ChannelsCard() {
           </div>
           <p className="text-sm font-medium text-white mb-1">{t("yt.channels.empty_title")}</p>
           <p className="text-xs text-gray-500 mb-4 max-w-sm mx-auto">{t("yt.channels.empty_sub")}</p>
-          <button onClick={connect} disabled={busy} className="btn-primary text-sm py-2.5 px-5 disabled:opacity-50">
+          <button onClick={startConnect} disabled={busy || showHelp} className="btn-primary text-sm py-2.5 px-5 disabled:opacity-50">
             {busy ? "..." : t("yt.channels.connect")}
           </button>
         </div>
@@ -209,7 +244,7 @@ export default function ChannelsCard() {
                 onDefault={makeDefault} onDisconnect={disconnect} onReconnect={connect} />
             ))}
           </div>
-          <button onClick={connect} disabled={busy}
+          <button onClick={startConnect} disabled={busy || showHelp}
             className="mt-4 text-xs text-brand-light hover:text-white transition-colors disabled:opacity-50">
             + {t("yt.channels.connect_another")}
           </button>
