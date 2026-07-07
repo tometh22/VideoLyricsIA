@@ -17,6 +17,29 @@
 // aparece en el panel/campana). Una feature grande = featured:true (modal).
 export const CHANGELOG = [
   {
+    id: "motor-v2",
+    date: "2026-07-07",
+    titleKey: "announce.motor2_title",
+    taglineKey: "announce.motor2_tagline",
+    bodyKey: "announce.motor2_body",
+    highlightKeys: [
+      "announce.motor2_hl1",
+      "announce.motor2_hl2",
+      "announce.motor2_hl3",
+      "announce.motor2_hl4",
+    ],
+    ctaKey: "announce.motor2_cta",
+    ctaTo: "/new",
+    featured: true,
+  },
+  {
+    id: "estilo-mayuscula",
+    date: "2026-07-06",
+    titleKey: "announce.typocase_title",
+    taglineKey: "announce.typocase_tagline",
+    bodyKey: "announce.typocase_body",
+  },
+  {
     id: "escenas",
     date: "2026-06-30",
     titleKey: "announce.scenes_title",
@@ -31,6 +54,7 @@ export const CHANGELOG = [
     media: "/escenas_demo.mp4",
     ctaKey: "announce.scenes_cta",
     ctaTo: "/new",
-    featured: true,
+    // ya no featured: el modal one-time es de a una a la vez (find() toma la
+    // primera featured del array); motor-v2 tomó la posta 07/07.
   },
 ];
