@@ -6112,7 +6112,7 @@ _CONCEPT_SCENE_GUIDE = {
     "atmosferico":  "atmospheric mood — drifting smoke, dense fog, volumetric light rays, dust motes, soft haze, ethereal glow",
     "romantico":    "romantic mood — warm sunsets, candlelight, scattered rose petals, soft fabric textures, calm beaches at dusk, fireplace embers",
     "vintage":      "vintage / retro — Super 8 film grain, sepia tones, faded photographs, retro patterns, analog noise, old-paper textures",
-    "cinematic":    "cinematic dramatic — chiaroscuro lighting, film-noir contrast, dramatic shadows, anamorphic lens flares, moody atmosphere",
+    "cinematic":    "cinematic dramatic — chiaroscuro lighting, film-noir contrast, dramatic shadows, dramatic lens flares, moody atmosphere",
     "club":         "club / dance scene — laser beams, smoke machines, neon strips, disco balls, strobe lights, dancefloor energy (no people, no faces)",
     "lujo":         "luxury aesthetics — polished marble, gold accents, crystal facets, high-gloss surfaces, fashion textures, jewelry close-ups",
     "minimalista":  "minimalist design — clean geometric shapes, smooth gradients, solid color planes, single-subject compositions, negative space",
@@ -7207,6 +7207,16 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         " no film sprocket holes, no film perforations, no film strip, no film "
         "edge markings, no 16mm or 35mm frame, no scanned film border, no black "
         "frame border, full-bleed edge-to-edge image,"
+        # Anti-letterbox (2026-07-07, "Seguir Viviendo Sin Tu Amor"/Spinetta):
+        # cues cinematográficos ("cinema camera", el mood cinematic con
+        # "anamorphic") hacían que Veo horneara franjas negras widescreen
+        # arriba/abajo en ALGUNAS escenas (estocástico → un video sí y otro no).
+        # El "no black frame border" de arriba es marco de 4 lados; el letterbox
+        # 2.39:1 es otra cosa y necesita prohibición explícita. Llena SIEMPRE el
+        # frame 16:9 completo — sin barras cinematográficas.
+        " no letterbox, no letterboxing, no black bars, no cinematic bars, no "
+        "widescreen bars, no anamorphic bars, no top or bottom black bars, no "
+        "2.39:1 or 2.35:1 crop, fill the entire 16:9 frame edge to edge,"
     )
     # Camera-motion negatives — the LAST line of defense for static intent.
     # Veo's payload exposes no structured camera-lock field, so these words
@@ -7680,6 +7690,17 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
 
     size_mb = os.path.getsize(output_path) / 1024 / 1024
     logger.info("[BG] Veo 3 video saved: %.1f MB (raw)", size_mb)
+
+    # Output QA: strip any letterbox Veo baked into the clip, BEFORE blur/cache
+    # so the fix persists in the cached object. Deterministic guarantee that
+    # scenes fill the frame regardless of Veo's stochastic anamorphic bars.
+    # Double-gated (geometry + pure-black) so dark footage is never cropped.
+    # Best-effort — never fail the render over it.
+    try:
+        if _strip_letterbox(output_path):
+            logger.info("[BG] Letterbox detected + stripped from Veo clip")
+    except Exception as e:
+        logger.warning("[BG] Letterbox check skipped (non-fatal): %s", e)
 
     # Apply subtle gaussian blur. Veo Fast outputs are slightly softer than
     # standard; a small blur normalises that softness, hides minor artefacts,
@@ -9284,6 +9305,159 @@ def _video_dims(path: str) -> tuple[int, int] | None:
         return int(w), int(h)
     except Exception:
         return None
+
+
+# --- Letterbox output-QA -----------------------------------------------------
+# Veo occasionally bakes a black 2.39:1 anamorphic letterbox INTO a 16:9 clip
+# (stochastic — one video shows bars, the next doesn't; see the anti-letterbox
+# note in _base_negatives). The compositing pipeline is pure "cover", so it
+# faithfully scales those baked bars up with the picture instead of removing
+# them. This output-QA layer detects + strips a baked letterbox so the cover
+# stage fills the frame — a deterministic "no involuntary bars" guarantee that
+# doesn't depend on Veo's stochastic prompt adherence.
+#
+# CONSERVATIVE BY DESIGN: a false positive would crop real content, and scene
+# footage is often VERY dark (near-black skies/ground). So a candidate is
+# stripped ONLY when it clears BOTH gates:
+#   1) geometry — a symmetric, edge-anchored band (letterbox OR pillarbox),
+#      each band within [MIN, MAX] of the dimension; and
+#   2) purity — the band regions are near-pure-black (measured YAVG ≈ 0),
+#      which distinguishes a real black bar from merely-dark picture content.
+_LB_MIN_BAR_FRAC = 0.02   # ignore bands < 2% of the dim (rounding noise)
+_LB_MAX_BAR_FRAC = 0.22   # bands > 22% each → assume real content, skip (2.39:1 ≈ 13%)
+_LB_SYMMETRY_TOL_FRAC = 0.03   # opposing bands must match within 3% of the dim
+# H.264 video is limited-range (tv), so a PURE-BLACK bar reads YAVG≈16, not 0.
+# cropdetect(limit=24) only flags rows with luma ≤ ~20 (measured: black→16,
+# rgb5→20, rgb10→25 already survives), so the ambiguous window is a narrow
+# 16–20. 18 accepts the black floor (+ a little compression margin) and rejects
+# anything lifted above it as real picture — this is the gate that keeps the
+# very dark Spinetta-type scenes from being cropped.
+_LB_BLACK_YAVG_MAX = 18.0
+
+
+def _region_yavg(clip_path: str, w: int, h: int, x: int, y: int,
+                 ss: float = 1.0, t: float = 3.0) -> "float | None":
+    """Brightest average luma (0–255) of a WxH region over a sampled window,
+    or None on failure. Used to confirm a suspected bar is truly black."""
+    if w <= 0 or h <= 0:
+        return None
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-ss", str(ss), "-t", str(t),
+             "-i", clip_path,
+             "-vf", (f"crop={w}:{h}:{x}:{y},signalstats,"
+                     "metadata=print:key=lavfi.signalstats.YAVG"),
+             "-f", "null", "-"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception:
+        return None
+    import re as _re
+    vals = [float(v) for v in _re.findall(r"YAVG=([\d.]+)", proc.stderr or "")]
+    return max(vals) if vals else None
+
+
+def _detect_letterbox_crop(clip_path: str,
+                           limit: int = 24) -> "tuple[int, int, int, int] | None":
+    """Return a (w,h,x,y) crop that removes a symmetric, edge-anchored black
+    letterbox/pillarbox, or None. Geometry gate only — purity is checked by
+    _strip_letterbox. Samples the middle of the clip to dodge start/end fades."""
+    dims = _video_dims(clip_path)
+    if not dims:
+        return None
+    W, H = dims
+    if W <= 0 or H <= 0:
+        return None
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-ss", "1.0", "-t", "5.0",
+             "-i", clip_path,
+             "-vf", f"cropdetect=limit={limit}:round=2:reset=0",
+             "-f", "null", "-"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except Exception:
+        return None
+    import re as _re
+    matches = _re.findall(r"crop=(\d+):(\d+):(-?\d+):(-?\d+)", proc.stderr or "")
+    if not matches:
+        return None
+    w, h, x, y = (int(v) for v in matches[-1])
+    if w <= 0 or h <= 0 or x < 0 or y < 0 or w + x > W or h + y > H:
+        return None
+    left, right, top, bottom = x, W - w - x, y, H - h - y
+    if max(left, right, top, bottom) <= 0:
+        return None  # nothing removed → no bars
+    min_h, max_h = _LB_MIN_BAR_FRAC * H, _LB_MAX_BAR_FRAC * H
+    min_w, max_w = _LB_MIN_BAR_FRAC * W, _LB_MAX_BAR_FRAC * W
+    h_tol = max(4.0, _LB_SYMMETRY_TOL_FRAC * H)
+    w_tol = max(4.0, _LB_SYMMETRY_TOL_FRAC * W)
+    is_letterbox = (
+        left <= 4 and right <= 4
+        and min_h <= top <= max_h and min_h <= bottom <= max_h
+        and abs(top - bottom) <= h_tol
+    )
+    is_pillarbox = (
+        top <= 4 and bottom <= 4
+        and min_w <= left <= max_w and min_w <= right <= max_w
+        and abs(left - right) <= w_tol
+    )
+    return (w, h, x, y) if (is_letterbox or is_pillarbox) else None
+
+
+def _strip_letterbox(clip_path: str) -> bool:
+    """Detect + remove a baked-in black letterbox/pillarbox, refilling the frame
+    to the original dimensions. Returns True iff the clip was rewritten.
+
+    Two gates (see module note): geometry (_detect_letterbox_crop) AND purity
+    (band YAVG ≈ 0). Best-effort — any failure leaves the clip untouched."""
+    dims = _video_dims(clip_path)
+    if not dims:
+        return False
+    W, H = dims
+    crop = _detect_letterbox_crop(clip_path)
+    if not crop:
+        return False
+    w, h, x, y = crop
+    left, right, top, bottom = x, W - w - x, y, H - h - y
+    # Purity gate: every removed band must read near-pure-black. This is what
+    # protects dark-but-real footage (a dim sky/ground is not luma≈0).
+    bands = []
+    if top > 0:
+        bands.append((W, top, 0, 0))
+    if bottom > 0:
+        bands.append((W, bottom, 0, H - bottom))
+    if left > 0:
+        bands.append((left, H, 0, 0))
+    if right > 0:
+        bands.append((right, H, W - right, 0))
+    for bw, bh, bx, by in bands:
+        yavg = _region_yavg(clip_path, bw, bh, bx, by)
+        if yavg is None or yavg > _LB_BLACK_YAVG_MAX:
+            return False  # not a pure-black bar → leave the clip alone
+    tmp = clip_path + ".unbar.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", clip_path,
+        "-vf", (
+            f"crop={w}:{h}:{x}:{y},"
+            f"scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H},setsar=1"
+        ),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+        "-pix_fmt", "yuv420p", "-an", tmp,
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+    except Exception:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return False
+    os.replace(tmp, clip_path)
+    return True
 
 
 def _normalize_bg_to_spec(bg_path: str, job_dir: str,
