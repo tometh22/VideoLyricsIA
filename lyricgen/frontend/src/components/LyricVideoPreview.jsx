@@ -41,6 +41,11 @@ function applyCase(text, code) {
   if (code === "upper") return (text || "").toUpperCase();
   if (code === "lower") return (text || "").toLowerCase();
   if (code === "title") return (text || "").replace(/\b\w/g, (c) => c.toUpperCase());
+  if (code === "sentence") {
+    return (text || "").toLowerCase().split("\n").map(
+      (ln) => ln.replace(/[a-zà-ÿ]/i, (c) => c.toUpperCase())
+    ).join("\n");
+  }
   return text || "";
 }
 

@@ -4457,7 +4457,7 @@ async def upload(
         effect=effect,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
         song_title=song_title,
-        text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
+        text_case=text_case if text_case in ("upper", "title", "lower", "original", "sentence") else "upper",
         font_scale=_font_scale,
         # lyric_transition + text_motion: deprecados 2026-05-23 (ver run_pipeline).
         # Aceptamos los Form params por back-compat pero coerce a defaults.
@@ -7552,7 +7552,7 @@ async def generate_with_segments(
         effect=effect,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
         song_title=song_title,
-        text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
+        text_case=text_case if text_case in ("upper", "title", "lower", "original", "sentence") else "upper",
         font_scale=_font_scale_gen,
         # Deprecados 2026-05-23 (ver primer endpoint /upload).
         lyric_transition="cut",
