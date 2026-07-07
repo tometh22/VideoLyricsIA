@@ -9805,6 +9805,27 @@ def _smart_lower(text: str) -> str:
     return "".join(out)
 
 
+def _sentence_case(text: str) -> str:
+    """'Sentence' aesthetic: every LINE starts with a capital, the rest keeps
+    the 'lower' look. Requested by operators who want readable lines without
+    the shouty ALL-CAPS ('upper') or the Every-Word-Capitalized ('title')
+    look — just a natural "Esta es tu letra" per line.
+
+    Built on _smart_lower so interior proper nouns survive (país/nombre:
+    "quizás llegue a Guinea" → "Quizás llegue a Guinea", not "...guinea").
+    Splits on '\\n' so wrapped/multi-line segments capitalize each visual
+    line, not only the first."""
+    out = []
+    for line in _smart_lower(text).split("\n"):
+        chars = list(line)
+        for i, ch in enumerate(chars):
+            if ch.isalpha():
+                chars[i] = ch.upper()
+                break
+        out.append("".join(chars))
+    return "\n".join(out)
+
+
 def _apply_case(text: str, case: str) -> str:
     """Apply text-case transformation matching the user's choice."""
     if case == "upper":
@@ -9813,6 +9834,8 @@ def _apply_case(text: str, case: str) -> str:
         return text.title()
     if case == "lower":
         return _smart_lower(text)
+    if case == "sentence":
+        return _sentence_case(text)
     return text  # "original" — keep as transcribed
 
 

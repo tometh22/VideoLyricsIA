@@ -35,6 +35,7 @@ const TEXT_CASES = [
   { code: "upper", label: "MAY" },
   { code: "title", label: "Aa" },
   { code: "lower", label: "min" },
+  { code: "sentence", label: "Abc" },
   { code: "original", label: "ori" },
 ];
 // TRANSITIONS (Cut/Fade fade-time) quedó deprecado 2026-05-23. Las opciones
@@ -66,6 +67,11 @@ function applyTextCase(text, code) {
   if (code === "upper") return (text || "").toUpperCase();
   if (code === "lower") return (text || "").toLowerCase();
   if (code === "title") return (text || "").replace(/\b\w/g, (c) => c.toUpperCase());
+  if (code === "sentence") {
+    return (text || "").toLowerCase().split("\n").map(
+      (ln) => ln.replace(/[a-zà-ÿ]/i, (c) => c.toUpperCase())
+    ).join("\n");
+  }
   return text || "";
 }
 
@@ -261,6 +267,13 @@ function applyCase(text, textCase) {
   if (textCase === "upper") return text.toUpperCase();
   if (textCase === "title") return text.replace(/\b\w/g, (c) => c.toUpperCase());
   if (textCase === "lower") return smartLower(text);
+  if (textCase === "sentence") {
+    // Mirror pipeline._sentence_case(): smartLower (proper nouns survive)
+    // then capitalize the first letter of each visual line.
+    return smartLower(text).split("\n").map(
+      (ln) => ln.replace(/[a-zà-ÿ]/i, (c) => c.toUpperCase())
+    ).join("\n");
+  }
   return text;
 }
 
