@@ -3634,23 +3634,46 @@ async def upload_multipart_complete(
             detail=f"R2 multipart_complete failed: {e}",
         )
     if not completed_key:
-        # storage.multipart_complete swallows boto errors and returns
-        # None (already-aborted upload_id, InvalidPart, transient R2
-        # failure). Before this check we answered 200 anyway: the
-        # browser believed the upload succeeded, /transcribe-uploaded
-        # later failed far from the cause, and — worse — we cleared
-        # multipart_upload_id below, so the orphaned parts could never
-        # be aborted and accrued R2 storage forever. Keep the upload_id
-        # intact: the client's retry/abort and the reaper both still
-        # work with it.
-        logger.warning(
-            "[UPLOAD] multipart_complete returned no key: job=%s key=%s",
-            body.job_id, job_row.input_r2_key,
+        # storage.multipart_complete swallowed a boto error and returned
+        # None. Two very different situations hide behind that None and
+        # they must NOT be handled the same way — a HEAD on the target
+        # key is the ground truth that tells them apart:
+        #
+        #   1. The object IS there. CompleteMultipartUpload is
+        #      destructive: the first call stitches the object and
+        #      consumes the upload_id, so a second, concurrent complete
+        #      (double-submit, or a client retry whose first response was
+        #      lost) gets NoSuchUpload even though the upload durably
+        #      succeeded. Answer 200 — the bytes are safe. (Prod
+        #      2026-07-06: NoSuchUpload on a UMG .wav whose 6 parts had
+        #      all landed.)
+        #
+        #   2. No object landed. The upload_id is gone for good (R2-side
+        #      abort / stale-multipart sweep) — NoSuchUpload here is
+        #      PERMANENT, retrying /upload-multipart-complete can never
+        #      succeed. Drop the dead upload_id so the row doesn't wedge
+        #      in awaiting_upload and tell the client to re-upload.
+        recovered_size = storage.head_object_size(job_row.input_r2_key)
+        if recovered_size is None:
+            logger.warning(
+                "[UPLOAD] multipart_complete failed and no object present "
+                "— dead upload_id, asking client to re-upload: job=%s key=%s",
+                body.job_id, job_row.input_r2_key,
+            )
+            job_row.multipart_upload_id = None
+            db.commit()
+            raise HTTPException(
+                status_code=409,
+                detail="La subida expiró en R2. Volvé a subir el archivo.",
+            )
+        logger.info(
+            "[UPLOAD] multipart_complete returned no key but object is "
+            "present — idempotent recovery: job=%s key=%s size=%d",
+            body.job_id, job_row.input_r2_key, recovered_size,
         )
-        raise HTTPException(
-            status_code=502,
-            detail="R2 multipart_complete failed. Reintentá la subida.",
-        )
+        # Object is durable → fall through to the shared size-gate +
+        # upload_id clear + 200 below, exactly as a first-time success.
+        completed_key = job_row.input_r2_key
     # Server-side size gate. The 413 in /upload-url trusts the CLIENT-
     # declared size_bytes and the presigned part URLs don't constrain
     # the body, so this HEAD is the first moment we can check what
