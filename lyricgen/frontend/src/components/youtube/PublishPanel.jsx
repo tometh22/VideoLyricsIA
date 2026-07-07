@@ -13,7 +13,7 @@ function authHeaders() {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
-const ACTIVE_STATUSES = ["queued", "scheduled", "uploading"];
+const ACTIVE_STATUSES = ["queued", "scheduled", "uploading", "pending_approval"];
 
 // Background publish flow. Phase is derived from server state, not
 // stored: any active/terminal PublishJob rows on mount → tracking view,
@@ -24,6 +24,7 @@ export default function PublishPanel({ job, onJobUpdate, onClose }) {
 
   const [rows, setRows] = useState(null);          // null = loading publish state
   const [channels, setChannels] = useState(null);  // null = loading channels
+  const [policy, setPolicy] = useState({ require_public_approval: false, can_approve: false });
   const [channelId, setChannelId] = useState(null);
   const [privacy, setPrivacy] = useState("unlisted");
   const [includeShort, setIncludeShort] = useState(true);
@@ -57,6 +58,10 @@ export default function PublishPanel({ job, onJobUpdate, onClose }) {
       .then((r) => (r.ok ? r.json() : []))
       .then(setChannels)
       .catch(() => setChannels([]));
+    fetch(`${API}/youtube/publish-policy`, { headers: authHeaders() })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((p) => { if (p) setPolicy(p); })
+      .catch(() => {});
   }, [fetchRows]);
 
   // Default channel pick once channels land.
@@ -118,14 +123,16 @@ export default function PublishPanel({ job, onJobUpdate, onClose }) {
   }, [rows, hasActivity]);
 
   // ── Actions ────────────────────────────────────────────────────────
-  const publish = async (retryKinds = null) => {
+  const publish = async (retryKinds = null, metadataOverride = null) => {
     setSubmitting(true);
     setSubmitError(null);
     try {
       const body = {
         channel_id: channelId,
         privacy,
-        metadata,
+        // Retries after a remount have no editor state — reuse the exact
+        // metadata stored on the failed row so nothing gets regenerated.
+        metadata: metadataOverride || metadata,
         include_short: retryKinds ? retryKinds.includes("short") : includeShort,
         // datetime-local gives local wall time; toISOString() makes it
         // timezone-aware UTC, which the backend requires.
@@ -148,12 +155,44 @@ export default function PublishPanel({ job, onJobUpdate, onClose }) {
     setSubmitting(false);
   };
 
-  const retryRow = (row) => publish([row.kind]);
+  const retryRow = (row) => publish([row.kind], row.metadata);
 
   const cancelRow = async (row) => {
     try {
       await fetch(`${API}/youtube/publish-jobs/${row.id}/cancel`, { method: "POST", headers: authHeaders() });
     } catch {}
+    fetchRows();
+  };
+
+  const approveRow = async (row) => {
+    try {
+      const res = await fetch(`${API}/youtube/publish-jobs/${row.id}/approve`, {
+        method: "POST", headers: authHeaders(),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setSubmitError(data.detail || `Error ${res.status}`);
+      }
+    } catch (err) {
+      setSubmitError(err.message);
+    }
+    fetchRows();
+  };
+
+  const denyRow = async (row, reason) => {
+    try {
+      const res = await fetch(`${API}/youtube/publish-jobs/${row.id}/deny`, {
+        method: "POST",
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: reason || "" }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setSubmitError(data.detail || `Error ${res.status}`);
+      }
+    } catch (err) {
+      setSubmitError(err.message);
+    }
     fetchRows();
   };
 
@@ -170,7 +209,14 @@ export default function PublishPanel({ job, onJobUpdate, onClose }) {
   if (hasActivity) {
     return (
       <div className="space-y-4">
-        <PublishProgress rows={visibleRows} onRetry={retryRow} onCancel={cancelRow} />
+        <PublishProgress
+          rows={visibleRows}
+          onRetry={retryRow}
+          onCancel={cancelRow}
+          canApprove={policy.can_approve}
+          onApprove={approveRow}
+          onDeny={denyRow}
+        />
         {submitError && (
           <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3">
             <p className="text-sm text-red-400">{submitError}</p>
@@ -299,6 +345,8 @@ export default function PublishPanel({ job, onJobUpdate, onClose }) {
           className="btn-primary text-sm py-2.5 px-5 disabled:opacity-50">
           {submitting ? (
             <><div className="inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />{t("yt.publish.publishing")}</>
+          ) : privacy === "public" && policy.require_public_approval && !policy.can_approve ? (
+            t("yt.approval.request_publish")
           ) : schedule && scheduledAt ? (
             t("yt.publish.publish_scheduled")
           ) : (

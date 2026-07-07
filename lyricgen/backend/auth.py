@@ -70,6 +70,23 @@ def has_prores_access(user) -> bool:
     tenant_id = getattr(user, "tenant_id", None) if not isinstance(user, dict) else user.get("tenant_id")
     return (tenant_id or "").lower() in PRORES_TENANTS
 
+
+def can_approve_public(user) -> bool:
+    """True iff `user` may approve PUBLIC YouTube publishes when the
+    tenant's maker-checker toggle is on. Admin OR the per-user
+    can_approve_public capability (granted via PATCH /admin/users/{id},
+    same pattern as ai_authorized). Accepts a User model or the
+    get_current_user dict."""
+    if user is None:
+        return False
+    if isinstance(user, dict):
+        if user.get("role") == "admin":
+            return True
+        return bool(user.get("features", {}).get("approve_public")) or bool(user.get("can_approve_public"))
+    if getattr(user, "role", None) == "admin":
+        return True
+    return bool(getattr(user, "can_approve_public", False))
+
 # Anyone who knows the default secret can forge admin tokens, so running with
 # it in production is unacceptable. Fail fast at import time.
 _ENV = os.environ.get("ENV", "dev").lower()
@@ -374,6 +391,7 @@ async def get_current_user(
         # gates later doesn't churn the client.
         "features": {
             "prores_export": has_prores_access(user),
+            "approve_public": can_approve_public(user),
         },
     }
 

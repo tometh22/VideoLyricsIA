@@ -228,6 +228,34 @@ def send_video_publish_failed(email: str, username: str, artist: str, song: str,
     _send_email(email, f"YouTube publish failed: {artist} — {song}", _wrap_template(content))
 
 
+def send_publish_denied(email: str, username: str, artist: str, song: str, reason: str):
+    """Notify the requester that an approver denied their public publish."""
+    content = f"""
+    <h2 style="color:#fff;margin:0 0 16px;">Public publish denied</h2>
+    <p>Hi <strong>{username}</strong>,</p>
+    <p>Your request to publish <strong>{artist} — {song}</strong> publicly on
+    YouTube was denied by a reviewer.</p>
+    {f'<p style="color:#f59e0b;">Reason: {reason}</p>' if reason else ''}
+    <p>You can adjust the video or metadata and request again from GenLy.</p>
+    {_button(FRONTEND_URL, "Open GenLy")}
+    """
+    _send_email(email, f"Public publish denied: {artist} — {song}", _wrap_template(content))
+
+
+def send_youtube_quota_alert(email: str, units_used: int, limit: int):
+    """Operator alert: the daily YouTube API budget is nearly exhausted."""
+    pct = int(units_used * 100 / limit) if limit else 0
+    content = f"""
+    <h2 style="color:#fff;margin:0 0 16px;">YouTube API quota at {pct}%</h2>
+    <p><strong>{units_used:,}</strong> of <strong>{limit:,}</strong> daily units used.
+    New publishes will be deferred to the next Pacific-midnight reset once the
+    budget runs out.</p>
+    <p style="color:#888;font-size:13px;">Request a quota increase via the
+    YouTube API Services compliance audit form (see docs/RUNBOOK_YOUTUBE_OAUTH.md §9).</p>
+    """
+    _send_email(email, f"YouTube API quota at {pct}%", _wrap_template(content))
+
+
 def send_usage_alert(email: str, username: str, percent: int, used: int, limit: int, plan: str):
     """Send usage alert at 80% or 100%."""
     if percent >= 100:
