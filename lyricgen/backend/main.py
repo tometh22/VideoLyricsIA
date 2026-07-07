@@ -224,6 +224,29 @@ def on_startup():
     threading.Thread(target=_reaper_loop, daemon=True, name="reaper").start()
     logger.info("reaper thread started (threshold=100min, every 5min)")
 
+    # Scheduled-publish daemon (unlisted/private targets only; public
+    # scheduling rides YouTube's native publishAt and needs no daemon).
+    # Advisory-locked like the reaper so one replica runs the pass.
+    def _yt_scheduler_loop():
+        from youtube_scheduler import run_due_publishes, SCHEDULER_INTERVAL_S
+        _time.sleep(90)
+        while True:
+            try:
+                n = run_due_publishes()
+                if n:
+                    logger.info("yt-scheduler enqueued %d due publish(es)", n)
+            except Exception:  # pragma: no cover
+                try:
+                    import sentry_sdk
+                    sentry_sdk.capture_exception()
+                except Exception:
+                    pass
+                _time.sleep(60)
+            _time.sleep(SCHEDULER_INTERVAL_S)
+
+    threading.Thread(target=_yt_scheduler_loop, daemon=True, name="yt-scheduler").start()
+    logger.info("yt-scheduler thread started")
+
     # Outputs cleanup loop. Sweeps OUTPUTS_DIR every hour to keep
     # local disk bounded — deletes jobs whose deliverables are on R2
     # and retries the upload for jobs whose R2 push failed earlier.

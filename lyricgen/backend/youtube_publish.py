@@ -185,6 +185,9 @@ def publish_to_youtube_task(publish_job_id: int) -> dict:
         metadata = publish_job.metadata_json
         privacy = publish_job.privacy
         kind = publish_job.kind
+        # Native YouTube scheduling (public target): upload now as private
+        # with status.publishAt — YouTube flips it public at fire time.
+        publish_at = publish_job.publish_at_youtube
     finally:
         s.close()
 
@@ -211,7 +214,7 @@ def publish_to_youtube_task(publish_job_id: int) -> dict:
             video_path, thumb_path, artist, song, "",
             privacy, publish_job.job_id,
             metadata=metadata, settings=settings, channel=channel,
-            progress_callback=_on_progress,
+            progress_callback=_on_progress, publish_at=publish_at,
         )
     except Exception as e:
         error = _sanitize_error(e)

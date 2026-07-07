@@ -388,6 +388,7 @@ def upload_to_youtube(
     settings: dict = None,
     channel=None,
     progress_callback=None,
+    publish_at=None,
 ) -> dict:
     """Upload video + thumbnail to YouTube.
 
@@ -395,6 +396,9 @@ def upload_to_youtube(
     approved in the UI) it is used as-is; otherwise it is AI-generated.
     `channel` is a YouTubeChannel row (None → legacy file token).
     `progress_callback(percent)` is invoked as resumable-upload chunks land.
+    `publish_at` (tz-aware datetime) uses YouTube's native scheduling: the
+    video uploads as private and YouTube flips it PUBLIC at that time —
+    publishAt requires a private upload and only targets public.
     Returns dict with video_id and url.
     """
     if settings is None:
@@ -423,6 +427,13 @@ def upload_to_youtube(
             "selfDeclaredMadeForKids": False,
         },
     }
+    if publish_at is not None:
+        from datetime import timezone as _utc_tz
+        body["status"]["privacyStatus"] = "private"
+        # RFC3339 UTC ("Z" suffix), the format the API expects.
+        body["status"]["publishAt"] = (
+            publish_at.astimezone(_utc_tz.utc).isoformat().replace("+00:00", "Z")
+        )
 
     print(f"[YOUTUBE] Uploading video ({os.path.getsize(video_path)/1024/1024:.1f} MB)...")
     media = MediaFileUpload(video_path, mimetype="video/mp4", resumable=True)
