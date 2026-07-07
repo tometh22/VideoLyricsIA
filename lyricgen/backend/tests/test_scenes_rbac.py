@@ -1,7 +1,10 @@
 """Gating del add-on premium "Escenas" (has_scenes_access).
 
-Mismo patrón canario que ProRes/Drive: default vacío → solo admin; se abre
-por env (SCENES_ENABLED_TENANTS) por tenant o billing_group.
+Modelo de créditos (2026-06): Escenas es PÚBLICO por default
+(SCENES_GLOBALLY_ENABLED=1) — lo gobierna el costo en créditos, no una allowlist.
+Estos tests del allowlist/rollback corren con SCENES_GLOBALLY_ENABLED=0 (el
+esquema viejo: admin O SCENES_ENABLED_TENANTS). El comportamiento público (flag
+ON) está cubierto en test_scenes_credits.py.
 """
 import auth
 
@@ -22,22 +25,26 @@ def test_admin_always_has_access(monkeypatch):
 
 
 def test_default_empty_denies_non_admin(monkeypatch):
+    monkeypatch.setenv("SCENES_GLOBALLY_ENABLED", "0")  # rollback: gating por allowlist
     monkeypatch.setattr(auth, "SCENES_ENABLED_TENANTS", set())
     assert auth.has_scenes_access(_stub_user(tenant_id="umg")) is False
 
 
 def test_access_via_tenant(monkeypatch):
+    monkeypatch.setenv("SCENES_GLOBALLY_ENABLED", "0")
     monkeypatch.setattr(auth, "SCENES_ENABLED_TENANTS", {"umg"})
     assert auth.has_scenes_access(_stub_user(tenant_id="umg")) is True
 
 
 def test_access_via_billing_group(monkeypatch):
+    monkeypatch.setenv("SCENES_GLOBALLY_ENABLED", "0")
     monkeypatch.setattr(auth, "SCENES_ENABLED_TENANTS", {"universal_music"})
     u = _stub_user(tenant_id="universal_argentina", billing_group="universal_music")
     assert auth.has_scenes_access(u) is True
 
 
 def test_access_dict_user(monkeypatch):
+    monkeypatch.setenv("SCENES_GLOBALLY_ENABLED", "0")
     monkeypatch.setattr(auth, "SCENES_ENABLED_TENANTS", {"umg"})
     d = {"role": "user", "tenant_id": "umg", "billing_group": None}
     assert auth.has_scenes_access(d) is True

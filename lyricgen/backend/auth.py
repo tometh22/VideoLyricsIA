@@ -126,19 +126,44 @@ SCENES_ENABLED_TENANTS = {
 }
 
 
-def has_scenes_access(user) -> bool:
-    """True iff `user` puede usar el add-on premium "Escenas" (multi-escena).
+def _scenes_globally_enabled() -> bool:
+    """Kill-switch global de Escenas. Default ON: la feature es pública y se
+    gobierna por CRÉDITOS (scenes_credit_cost), no por allowlist. Poné
+    SCENES_GLOBALLY_ENABLED=0 para volver al esquema viejo (admin/allowlist)
+    como rollback sin deploy."""
+    return os.environ.get("SCENES_GLOBALLY_ENABLED", "1").strip().lower() in (
+        "1", "true", "yes", "on", "y", "t",
+    )
 
-    Admin siempre pasa. Para no-admin se chequea contra SCENES_ENABLED_TENANTS
-    (vacío por defecto = solo admin), por tenant O por billing_group — mismo
-    criterio que has_prores_access, para que mover un usuario entre tenants de
-    la misma cuenta B2B no le saque el acceso. El opt-in real (enable_scenes)
-    se decide por job; esto sólo gobierna la ELEGIBILIDAD.
+
+def scenes_credit_cost() -> int:
+    """Cuántos créditos consume un video con Escenas (multi-escena).
+
+    Env-tunable (SCENES_CREDIT_COST) para lanzar en 3 y subir a 4 sin deploy.
+    Mínimo 1 (1 = Escenas no cuesta extra, p.ej. perk para un tenant)."""
+    try:
+        return max(1, int(os.environ.get("SCENES_CREDIT_COST", "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
+def has_scenes_access(user) -> bool:
+    """True iff `user` puede usar Escenas (multi-escena).
+
+    Modelo de créditos (2026-06): Escenas es PÚBLICO — cualquier usuario
+    autenticado puede usarlo; lo que lo gobierna es el COSTO (N créditos por
+    video, ver `scenes_credit_cost`), no una allowlist. Admin siempre pasa.
+    Si SCENES_GLOBALLY_ENABLED=0, vuelve al esquema viejo (admin O
+    SCENES_ENABLED_TENANTS) como rollback sin deploy. El opt-in real
+    (enable_scenes) se sigue decidiendo por job; esto sólo gobierna la
+    ELEGIBILIDAD de ver/activar la opción.
     """
     if user is None:
         return False
     role = getattr(user, "role", None) if not isinstance(user, dict) else user.get("role")
     if role == "admin":
+        return True
+    if _scenes_globally_enabled():
         return True
     tenant_id = getattr(user, "tenant_id", None) if not isinstance(user, dict) else user.get("tenant_id")
     billing_group = getattr(user, "billing_group", None) if not isinstance(user, dict) else user.get("billing_group")
@@ -820,6 +845,15 @@ def verify_media_token(token: str, job_id: str, file_type: str, db: Session) -> 
 # Plan usage
 # ---------------------------------------------------------------------------
 
+def _as_utc(dt):
+    """Normaliza un datetime a aware-UTC. SQLite devuelve naive en columnas
+    DateTime(timezone=True) (Postgres devuelve aware); sin esto, comparar contra
+    `datetime.now(timezone.utc)` tira TypeError offset-naive vs offset-aware."""
+    if dt is None:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
 def get_plan_usage(db: Session, user_id: int, tenant_id: str, plan_id: str,
                    billing_group: str = None) -> dict:
     """Get current month usage vs plan limit.
@@ -849,11 +883,14 @@ def get_plan_usage(db: Session, user_id: int, tenant_id: str, plan_id: str,
     aunque los equipos no se vean los videos entre sí. Sin billing_group,
     la cuota es por tenant (comportamiento histórico).
     """
-    from database import Job, User
+    from database import Job, User, CreditGrant
 
     now = datetime.now(timezone.utc)
     month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
 
+    # Scope de la CUENTA (idéntico para la cuota y para los créditos de regalo):
+    # billing_group si existe (cuenta multi-tenant tipo Universal AR/CL), si no
+    # el tenant. Un solo pool por cuenta.
     if billing_group:
         # Tenants que componen la cuenta: todos los que tengan al menos un
         # usuario en el grupo. La cantidad de usuarios es chica (decenas),
@@ -863,33 +900,110 @@ def get_plan_usage(db: Session, user_id: int, tenant_id: str, plan_id: str,
             .filter(User.billing_group == billing_group)
             .distinct()
         )
-        used = db.query(Job).filter(
-            Job.tenant_id.in_(group_tenants),
-            Job.status == "done",
-            Job.approved_at >= month_start,
-        ).count()
+        scope = Job.tenant_id.in_(group_tenants)
     else:
-        used = db.query(Job).filter(
-            Job.tenant_id == tenant_id,
+        scope = Job.tenant_id == tenant_id
+
+    _cost = scenes_credit_cost()
+
+    def _weighted(start, end):
+        """Créditos consumidos (normal=1, Escenas=_cost) por videos APROBADOS
+        en [start, end). Mismo criterio que la cuota (status="done" AND
+        approved_at). El conteo de Escenas va en Python por portabilidad del
+        índice JSONB (Postgres vs SQLite) — equivale a
+        `scene_plan->'scenes' IS NOT NULL`. Cada job cuenta 1; +(N-1) si Escenas.
+        """
+        if end <= start:
+            return 0
+        q = db.query(Job).filter(
+            scope,
             Job.status == "done",
-            Job.approved_at >= month_start,
-        ).count()
+            Job.approved_at >= start,
+            Job.approved_at < end,
+        )
+        n = q.count()
+        extra = 0
+        if _cost > 1:
+            extra = (_cost - 1) * sum(
+                1
+                for (_sp,) in q.with_entities(Job.scene_plan).all()
+                if isinstance(_sp, dict) and _sp.get("scenes") is not None
+            )
+        return n + extra
+
+    # Uso del mes (créditos consumidos este mes, antes de aplicar el regalo).
+    _now_excl = now + timedelta(seconds=1)
+    used = _weighted(month_start, _now_excl)
+
+    # ── Créditos de regalo (promos, ej. lanzamiento de Escenas) ──────────────
+    # Pool por cuenta que se consume ANTES del cupo del plan, con vencimiento.
+    # Sin estado mutable: se calcula cuánto se consumió contando los aprobados
+    # desde `granted_at` (reject/un-approve revierten solos). Si hay varios
+    # grants activos para la cuenta, se tratan como un único pool (suma de
+    # montos; ventana = desde el más viejo hasta el vto más lejano). El
+    # lanzamiento emite UNO por cuenta.
+    grant_q = db.query(CreditGrant).filter(CreditGrant.revoked.is_(False))
+    if billing_group:
+        grant_q = grant_q.filter(CreditGrant.billing_group == billing_group)
+    else:
+        grant_q = grant_q.filter(
+            CreditGrant.tenant_id == tenant_id,
+            CreditGrant.billing_group.is_(None),
+        )
+    grants = [
+        g for g in grant_q.all()
+        if g.expires_at is None or _as_utc(g.expires_at) > now
+    ]
+
+    bonus_total = sum(g.amount for g in grants)
+    bonus_used = 0
+    bonus_remaining = 0
+    bonus_expires_at = None
+    if grants:
+        g_start = min(_as_utc(g.granted_at) for g in grants)
+        _exps = [_as_utc(g.expires_at) for g in grants if g.expires_at is not None]
+        bonus_expires_at = max(_exps) if _exps else None
+        window_end = (min(now, bonus_expires_at) if bonus_expires_at else now) + timedelta(seconds=1)
+        # Consumido en meses anteriores (dentro de la ventana del grant).
+        prior = _weighted(g_start, month_start) if g_start < month_start else 0
+        avail_start = max(0, bonus_total - prior)
+        # Uso de ESTE mes elegible para el regalo (aprobado antes del vto).
+        this_month_elig = _weighted(max(month_start, g_start), window_end)
+        bonus_used = min(avail_start, this_month_elig)
+        bonus_remaining = max(0, bonus_total - prior - bonus_used)
+
+    # El regalo cubre primero → contra el plan pega sólo lo no cubierto.
+    billable_used = max(0, used - bonus_used)
 
     plan = PLANS.get(plan_id, PLANS["100"])
     limit = plan["limit"]
-    overage = max(0, used - limit)
+    overage = max(0, billable_used - limit)
     overage_cost = overage * plan["price_per_video"] * plan["overage_rate"]
+
+    plan_remaining = max(0, limit - billable_used)
+    total_available = plan_remaining + bonus_remaining
 
     return {
         "plan": plan_id,
         "limit": limit,
-        "used": used,
-        "remaining": max(0, limit - used),
+        "used": billable_used,
+        "remaining": plan_remaining,
         "overage": overage,
         "overage_cost_per_video": round(plan["price_per_video"] * plan["overage_rate"], 2),
         "overage_total": round(overage_cost, 2),
         "monthly_price": plan["monthly_price"],
-        "percent": min(100, round((used / limit) * 100)) if limit > 0 else 0,
-        "alert_80": used >= limit * 0.8,
-        "alert_100": used >= limit,
+        "percent": min(100, round((billable_used / limit) * 100)) if limit > 0 else 0,
+        "alert_80": billable_used >= limit * 0.8,
+        "alert_100": billable_used >= limit,
+        # ── Créditos: costo por tipo + regalo (alimentan el medidor dinámico) ──
+        "scenes_credit_cost": _cost,
+        "bonus_total": bonus_total,
+        "bonus_used": bonus_used,
+        "bonus_remaining": bonus_remaining,
+        "bonus_expires_at": bonus_expires_at.isoformat() if bonus_expires_at else None,
+        "total_available": total_available,
+        "projection": {
+            "normal": total_available,
+            "escenas": (total_available // _cost) if _cost > 0 else total_available,
+        },
     }

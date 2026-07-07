@@ -50,7 +50,13 @@ OUTPUTS_DIR = os.path.join(os.path.dirname(_HERE), "..", "outputs")
 
 # Status sets reused below.
 _TERMINAL_DONE = ("done", "pending_review")
-_TERMINAL_FAILED = ("error", "validation_failed", "rejected")
+# transcription_failed incluido (2026-07-02): antes caía al fondo del
+# loop sin rama y el WAV de entrada (hasta 150 MB) quedaba en disco para
+# SIEMPRE — la row existe, así que nunca es "orphan", y ningún reaper lo
+# toca (reap_stuck_transcription conserva el audio a propósito para el
+# retry inmediato). _KEEP_FAILED_MIN (24 h default) da ventana de sobra
+# para ese retry; el input sigue en R2 para recuperación posterior.
+_TERMINAL_FAILED = ("error", "validation_failed", "rejected", "transcription_failed")
 _NON_TERMINAL = ("queued", "processing")
 
 _KEEP_DONE_MIN = int(os.environ.get("CLEANUP_KEEP_DONE_MIN", "1440"))

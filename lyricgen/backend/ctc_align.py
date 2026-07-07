@@ -352,6 +352,105 @@ def _eff_dur(word: str) -> float:
     return 0.45 * max(len(norm_word(word)), 2) + 0.6
 
 
+def finalize_line(seg: dict, ls: float, le: float, wlist, lr,
+                  skipped: bool, recovered: bool) -> dict:
+    """Construye el dict final de una línea retimada. Pura, unit-testeable.
+
+    Regla del flag `review` ("timing aproximado", puesto por el camino
+    scaffold): una línea que CTC retimó tiene precisión word-level → el
+    flag heredado se limpia. Sin esto, el wizard pintaba de ámbar las 66
+    líneas de una canción perfectamente sincronizada (operador, 03/07).
+    Las líneas SALTEADAS conservan el flag: su timing viene del fallback
+    y sí es aproximado."""
+    new = dict(seg)
+    new["start"] = round(float(ls), 3)
+    new["end"] = round(float(le), 3)
+    if lr is not None:
+        new["ctc_lr"] = round(lr, 3)
+    if skipped:
+        new["ctc_skipped"] = True  # Viterbi: línea no cantada
+    else:
+        new.pop("review", None)
+    if recovered:
+        new["ctc_recovered"] = "mix"  # M5: rescatada del mix
+    if wlist:
+        new["words"] = [
+            {"word": w, "start": round(float(a), 3),
+             "end": round(float(b), 3), "score": round(float(sc), 3)}
+            for (w, a, b, sc) in wlist]
+    else:
+        # Interpolated line: the inherited word stamps belong to
+        # the OLD timing — keeping them would break karaoke.
+        new.pop("words", None)
+    return new
+
+
+def trim_unvoiced_edges(line_times, regions,
+                        score_floor=None):
+    """Snap low-confidence EDGE words to the measured voice regions.
+
+    Caso real (Hada y el Mago, 03/07, confirmado a oído por el operador):
+    CTC ancló la primera palabra "Uh," en 6.02→7.9 con score 0.12 — casi
+    todo sobre SILENCIO medido (la voz entra a 7.7). La línea aparecía
+    ~2s antes de que nadie cante. repair_bridge_words no lo agarra: el
+    estiramiento (1.9s) queda por debajo de BRIDGE_S=8.
+
+    Regla: si la PRIMERA palabra de una línea tiene score < floor, su
+    start se ajusta al inicio de la primera región de voz que su span
+    toca (nunca hacia antes, nunca más allá de su end). Simétrico para
+    la ÚLTIMA palabra (su end se recorta al fin de la región). Palabras
+    confiables no se tocan — el score bajo es lo que dice "acá CTC está
+    adivinando"; la energía del stem dice dónde hay canto de verdad.
+
+    Gate: CTC_ALIGN_EDGE_SNAP (default on; el retime entero ya está
+    detrás de CTC_ALIGN_ENABLED). floor: CTC_ALIGN_EDGE_SNAP_SCORE
+    (default 0.30). Sin regiones (VAD falló) → no-op. Pura."""
+    if os.environ.get("CTC_ALIGN_EDGE_SNAP", "1").strip().lower() not in _TRUE:
+        return line_times
+    if not regions:
+        return line_times
+    if score_floor is None:
+        try:
+            score_floor = float(os.environ.get("CTC_ALIGN_EDGE_SNAP_SCORE", "0.30"))
+        except (TypeError, ValueError):
+            score_floor = 0.30
+
+    out = []
+    for lt in line_times:
+        if lt is None or not lt[2]:
+            out.append(lt)
+            continue
+        _s, _e, ws = lt
+        ws = list(ws)
+        w0, a0, b0, sc0 = ws[0]
+        if sc0 < score_floor:
+            # primera región de voz que el span [a0, b0] toca
+            snap = None
+            for ra, rb in regions:
+                if rb <= a0:
+                    continue
+                if ra >= b0:
+                    break
+                snap = max(a0, ra)
+                break
+            if snap is not None and snap > a0:
+                ws[0] = (w0, round(snap, 3), b0, sc0)
+        wn, an, bn, scn = ws[-1]
+        if scn < score_floor:
+            # última región de voz que el span [an, bn] toca
+            snap = None
+            for ra, rb in regions:
+                if ra >= bn:
+                    break
+                if rb <= an:
+                    continue
+                snap = min(bn, rb)
+            if snap is not None and snap < bn:
+                ws[-1] = (wn, an, round(snap, 3), scn)
+        out.append((ws[0][1], ws[-1][2], ws))
+    return out
+
+
 def repair_bridge_words(line_times, regions=None):
     """Fix 'bridge' lines: a word stretched implausibly long (or a huge
     intra-line gap) is the CTC bridging two distinct vocal events — e.g.
@@ -648,6 +747,31 @@ def _emissions(model, wav, blank_id: int, star_delta: float):
 last_decline_reason = ""
 
 
+def structural_skip_verdict(lines, skipped_lines, max_skip_frac):
+    """¿Declinar por mismatch estructural? Pura, unit-testeable.
+
+    El skip-fraction detecta letra de OTRA versión (versos/coros extra que
+    el texto no lista → el Viterbi salta líneas léxicas). Pero las líneas
+    de ad-lib ('uh uh uh') son vocalizaciones sostenidas que CTC no puede
+    anclar por diseño — su skip es ESPERADO, no un mismatch. Contarlas
+    inflaba el ratio y hacía declinar falsamente a CTC en canciones con
+    secciones grandes de uh (Amanda Pujó, 05/07: whisperX fragmentó el uh
+    en 13 líneas → 13 skips → >10% → decline falso, con la letra REAL
+    alineando perfecto). Medimos solo sobre las líneas LÉXICAS.
+
+    Returns (declinar: bool, lex_skipped, lex_total, n_adlib).
+    """
+    try:
+        from adlib_consensus import is_adlib_text as _is_adlib
+        adlib_idx = {i for i, ln in enumerate(lines) if _is_adlib(ln)}
+    except Exception:
+        adlib_idx = set()
+    lex_total = len(lines) - len(adlib_idx)
+    lex_skipped = len(set(skipped_lines) - adlib_idx)
+    declinar = lex_total > 0 and lex_skipped / lex_total > max_skip_frac
+    return declinar, lex_skipped, lex_total, len(adlib_idx)
+
+
 def retime_segments(audio_path: str, segments: list[dict],
                     job_id: str = "",
                     mix_path: Optional[str] = None,
@@ -881,11 +1005,12 @@ def retime_segments(audio_path: str, segments: list[dict],
         # (Etapa A: ASR of the actual live + reference orthography).
         if max_skip_frac is None:
             max_skip_frac = float(os.environ.get("CTC_ALIGN_MAX_SKIP_FRAC", "0.10"))
-        if len(skipped_lines) / max(len(lines), 1) > max_skip_frac:
-            logger.warning("[CTC] decline: %d/%d lines skipped (>%.0f%%) — "
-                           "structural mismatch between text and performance "
-                           "(job=%s)", len(skipped_lines), len(lines),
-                           100 * max_skip_frac, job_id)
+        _decl, _ls, _lt, _na = structural_skip_verdict(
+            lines, skipped_lines, max_skip_frac)
+        if _decl:
+            logger.warning("[CTC] decline: %d/%d líneas léxicas skipped (>%.0f%%; "
+                           "%d ad-libs excluidos) — mismatch estructural (job=%s)",
+                           _ls, _lt, 100 * max_skip_frac, _na, job_id)
             last_decline_reason = "structural"
             return None
 
@@ -896,6 +1021,15 @@ def retime_segments(audio_path: str, segments: list[dict],
                       if s.get("start") is not None else None)
                      for s in segments]
         line_times = place_unaligned(line_times, originals, dur)
+
+        # Bordes low-score sobre silencio (caso "Uh, no, no" @6.0 con voz
+        # @7.7, 03/07): snap a las regiones de voz del STEM. Va DESPUÉS de
+        # M5/place_unaligned porque la línea problemática entra justamente
+        # por la recuperación sobre la mezcla (el pase principal la había
+        # salteado) — antes de este punto sus words todavía no existen.
+        # Una línea de público SIN región de stem que la toque queda
+        # intacta (el snap solo ajusta bordes que pisan una región).
+        line_times = trim_unvoiced_edges(line_times, _regions)
 
         # Per-line confidence as a LIKELIHOOD-RATIO vs the star: how much
         # better does this line explain its span than "unlabeled singing"?
@@ -924,25 +1058,8 @@ def retime_segments(audio_path: str, segments: list[dict],
 
         out = []
         for li, (seg, (ls, le, wlist), lr) in enumerate(zip(segments, line_times, lrs)):
-            new = dict(seg)
-            new["start"] = round(float(ls), 3)
-            new["end"] = round(float(le), 3)
-            if lr is not None:
-                new["ctc_lr"] = round(lr, 3)
-            if li in skipped_lines:
-                new["ctc_skipped"] = True  # Viterbi: línea no cantada
-            if li in recovered_lines:
-                new["ctc_recovered"] = "mix"  # M5: rescatada del mix
-            if wlist:
-                new["words"] = [
-                    {"word": w, "start": round(float(a), 3),
-                     "end": round(float(b), 3), "score": round(float(sc), 3)}
-                    for (w, a, b, sc) in wlist]
-            else:
-                # Interpolated line: the inherited word stamps belong to
-                # the OLD timing — keeping them would break karaoke.
-                new.pop("words", None)
-            out.append(new)
+            out.append(finalize_line(seg, ls, le, wlist, lr,
+                                     li in skipped_lines, li in recovered_lines))
         logger.info("[CTC] retimed %d lines in %.1fs (audio %.0fs, job=%s)",
                     len(out), time.time() - t0, dur, job_id)
         return out

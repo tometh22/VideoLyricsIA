@@ -105,3 +105,29 @@ def test_lower_allcaps_proper_noun_first_word():
 def test_lower_titlecased_country_stays_title_not_caps():
     # already-Title source is unchanged by the normalization
     assert pipeline._apply_case("Viva México", "lower") == "viva México"
+
+
+# --- "sentence" case: each LINE capitalized, built on _smart_lower ----------
+
+def test_sentence_capitalizes_first_word():
+    assert pipeline._apply_case("quizás llegue a Guinea", "sentence") == "Quizás llegue a Guinea"
+
+
+def test_sentence_capitalizes_each_line():
+    assert pipeline._apply_case("esta es tu letra\ny otra línea", "sentence") == "Esta es tu letra\nY otra línea"
+
+
+def test_sentence_preserves_interior_proper_noun():
+    assert pipeline._apply_case("brilla el Sol\nvamos a Buenos Aires", "sentence") == "Brilla el Sol\nVamos a Buenos Aires"
+
+
+def test_sentence_from_titlecased_source_preserves_country():
+    assert pipeline._apply_case("Te Amo Argentina", "sentence") == "Te amo Argentina"
+
+
+def test_sentence_empty_string():
+    assert pipeline._apply_case("", "sentence") == ""
+
+
+def test_sentence_blank_line_between_lines_is_noop():
+    assert pipeline._apply_case("hola\n\nchau", "sentence") == "Hola\n\nChau"

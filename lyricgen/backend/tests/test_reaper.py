@@ -986,3 +986,65 @@ def test_alert_queues_without_consumer_pages_sentry(monkeypatch):
     captured.clear()
     _alert_queues_without_consumer([])   # empty → no alert
     assert captured == {}
+
+
+# ---------------------------------------------------------------------------
+# upload_still_active — R2-side liveness guard for slow multipart uploads
+# ---------------------------------------------------------------------------
+
+
+def _upload_job(**kw):
+    """In-memory Job (no DB) — upload_still_active only reads attributes."""
+    defaults = dict(
+        job_id="up_live", status="awaiting_upload",
+        multipart_upload_id="UP", input_r2_key="inputs/t/j/a.wav",
+    )
+    defaults.update(kw)
+    return Job(**defaults)
+
+
+def test_upload_still_active_recent_parts_skips_reap(monkeypatch):
+    """Parts landed on R2 within the TTL window → the upload is alive
+    (slow 150 MB WAV on a residential uplink) and must NOT be reaped."""
+    import storage as _storage
+    monkeypatch.setattr(
+        _storage, "multipart_last_activity",
+        lambda key, upload_id: datetime.now(timezone.utc) - timedelta(minutes=2),
+    )
+    assert _reaper.upload_still_active(_upload_job()) is True
+
+
+def test_upload_still_active_stale_parts_allows_reap(monkeypatch):
+    """Last part is older than the TTL → genuinely abandoned mid-upload."""
+    import storage as _storage
+    monkeypatch.setattr(
+        _storage, "multipart_last_activity",
+        lambda key, upload_id: datetime.now(timezone.utc) - timedelta(minutes=45),
+    )
+    assert _reaper.upload_still_active(_upload_job()) is False
+
+
+def test_upload_still_active_no_parts_allows_reap(monkeypatch):
+    """No parts / upload gone / listing failed → no liveness evidence;
+    the created_at TTL decides (reap)."""
+    import storage as _storage
+    monkeypatch.setattr(
+        _storage, "multipart_last_activity", lambda key, upload_id: None,
+    )
+    assert _reaper.upload_still_active(_upload_job()) is False
+
+
+def test_upload_still_active_ignores_non_multipart(monkeypatch):
+    """Single-PUT rows (no upload_id) never consult R2 — their TTL
+    semantics are unchanged."""
+    import storage as _storage
+
+    calls = []
+    monkeypatch.setattr(
+        _storage, "multipart_last_activity",
+        lambda key, upload_id: calls.append(key),
+    )
+    assert _reaper.upload_still_active(
+        _upload_job(multipart_upload_id=None)
+    ) is False
+    assert calls == []

@@ -40,6 +40,14 @@ def test_normalize_movement_style_maps_static_aliases():
     assert pipeline._normalize_movement_style("") == ""
 
 
+def test_normalize_movement_style_dinamico_maps_to_estandar():
+    """"dinamico" lo usan el editor de escena y el energy-derived; no era una
+    clave real → normalizaba a "" (Auto) y la elección se perdía. Ahora mapea a
+    "estandar" (cinematográfico), un valor válido con regla de cámara."""
+    for alias in ("dinamico", "dinámico", "dynamic"):
+        assert pipeline._normalize_movement_style(alias) == "estandar", alias
+
+
 # ---------------------------------------------------------------------------
 # 2. static-aware camera clause in the Gemini system prompt
 # ---------------------------------------------------------------------------

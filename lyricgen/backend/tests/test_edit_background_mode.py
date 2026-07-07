@@ -166,3 +166,42 @@ def test_bg_mode_ignored_for_typography_edit(client, admin_token, db, monkeypatc
     )
     # And typography params still propagate
     assert edit_params.get("font") == "bebas-neue"
+
+
+def test_background_edit_rejected_for_scene_jobs(client, admin_token, db, monkeypatch):
+    """Incidente 2026-07-01 (job 53b9513225b1): un edit "background" sobre un
+    job multi-escena generaba UN clip Veo de 8 s, pisaba el timeline cacheado
+    (bg_r2_key_cached) y re-renderizaba video+short con una sola escena en
+    loop. El handler ahora rechaza con 400 y deriva al filmstrip; los demás
+    edit types siguen funcionando en jobs de escenas."""
+    import uuid as _uuid
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _uuid.uuid4().hex[:12]
+    db.add(JobModel(
+        job_id=job_id, user_id=user_id, tenant_id=tenant_id,
+        artist="Test", song_title="Scene Guard", filename="t.mp3",
+        status="pending_review", delivery_profile="youtube", progress=100,
+        bg_r2_key_cached="backgrounds/x/bg_cached.mp4",
+        segments_json=[{"start": 0.0, "end": 1.0, "text": "hola"}],
+        edit_count=0,
+        scene_plan={"scenes": [{"id": "intro", "status": "generated"}]},
+    ))
+    db.commit()
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "background"},
+    )
+    assert res.status_code == 400, res.text
+    assert "Escenas" in res.json()["detail"]
+    assert captured == []  # nada encolado, cero gasto Veo
+
+    res2 = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "typography"},
+    )
+    assert res2.status_code == 200, res2.text
+    assert len(captured) == 1

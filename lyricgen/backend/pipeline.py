@@ -1355,7 +1355,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                             _UserSettings.user_id == _usr.id
                         ).first()
                         _prefs = (_settings.settings_json or {}) if _settings else {}
-                        if _prefs.get("notif_jobs", False):
+                        # Default ON (era False): en producción NINGÚN usuario
+                        # había activado notif_jobs, así que los renders que
+                        # terminaban en pending_review quedaban invisibles
+                        # (caso UMG Chile 2026-06-25: 8 días esperando). El
+                        # opt-out explícito en Settings se sigue respetando.
+                        if _prefs.get("notif_jobs", True):
                             threading.Thread(
                                 target=_emails.send_job_completed,
                                 kwargs={
@@ -1364,6 +1369,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                                     "artist": artist or "",
                                     "filename": os.path.basename(mp3_path),
                                     "job_id": job_id,
+                                    "needs_review": final_status == "pending_review",
                                 },
                                 daemon=True,
                             ).start()
@@ -1691,50 +1697,6 @@ def _filter_whisper_hallucinations(segments: list[dict]) -> tuple[list[dict], in
             continue
         out.append(s)
     return out, len(segments) - len(out)
-
-
-# Tunables for _filter_lyric_loops
-_LYRIC_LOOP_MAX_PACE = 1.5   # s/tok — above this is implausibly slow for singing
-_LYRIC_LOOP_MIN_DUR  = 8.0   # s    — only inspect sufficiently long segments
-
-
-def _filter_lyric_loops(segments: list[dict]) -> tuple[list[dict], int]:
-    """Drop segments that repeat the previous segment's text AND are paced
-    implausibly slowly for sung content (> 1.5 s/token).
-
-    Whisper's 'lyric-loop' hallucination fills a sustained-vocal passage
-    (e.g. 'uh uh uh' ad-libs) by repeating a nearby chorus phrase at
-    increasingly stretched timestamps.  Example from Amanda Pujó – No Hay
-    Santos:
-        56–64s  '¿Para qué? … papel'  0.99 s/tok  ← real sung line, keep
-        64–79s  same text             1.87 s/tok  ← hallucination, drop
-        79–102s same text             2.86 s/tok  ← hallucination, drop
-
-    Conservative: BOTH conditions must hold (same text + slow pace) so that
-    a legitimate chorus refrain repeated 3× is never dropped (the second and
-    third occurrence would have normal pace ≤ 1.2 s/tok).
-    """
-    if not segments:
-        return segments, 0
-    out = [segments[0]]
-    dropped = 0
-    for seg in segments[1:]:
-        text = (seg.get("text") or "").strip().lower()
-        prev_text = (out[-1].get("text") or "").strip().lower()
-        dur = float(seg.get("end", 0)) - float(seg.get("start", 0))
-        n_tok = max(len(text.split()), 1)
-        pace = dur / n_tok
-        if (text == prev_text
-                and pace > _LYRIC_LOOP_MAX_PACE
-                and dur > _LYRIC_LOOP_MIN_DUR):
-            logger.info(
-                "[WHISPER] dropping lyric-loop dup (%.1fs, %.2fs/tok): %r",
-                dur, pace, seg.get("text", "")[:60],
-            )
-            dropped += 1
-        else:
-            out.append(seg)
-    return out, dropped
 
 
 # ── Post-reconcile cleanup ────────────────────────────────────────────────────
@@ -2310,9 +2272,6 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
     if _dropped_loops:
         logger.info("[WHISPER-API] filtered %s hallucination/loop segment(s)", _dropped_loops)
 
-    segments, _dropped_lyric_loops = _filter_lyric_loops(segments)
-    if _dropped_lyric_loops:
-        logger.info("[WHISPER-API] filtered %s lyric-loop segment(s)", _dropped_lyric_loops)
 
     logger.info("[WHISPER-API] %s segments", len(segments))
     return segments
@@ -2542,6 +2501,36 @@ def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
     return sorted(all_segments, key=lambda s: s["start"])
 
 
+# Collapse detection for the single-pass → VAD fallback in transcribe().
+# The single full-file Whisper call gives the best TEXT, but on some tracks it
+# degenerates: the API returns the whole song as one giant segment, which
+# renders as a single unusable karaoke line. When that happens we re-run with
+# VAD chunking. Thresholds are deliberately conservative so a normal song never
+# trips the fallback.
+_COLLAPSE_MAX_SEG_S = 45.0   # any single segment longer than this = collapse
+_COLLAPSE_MIN_SEGS = 2       # this many segments or fewer = collapse
+_COLLAPSE_MIN_TOKENS = 8     # fewer total words than this = collapse
+
+
+def _is_collapsed_transcription(segments: list[dict]) -> bool:
+    """True when a transcription looks degenerate (one giant segment / a couple
+    of segments / almost no text). Triggers the VAD chunking fallback."""
+    if not segments:
+        return True
+    if len(segments) <= _COLLAPSE_MIN_SEGS:
+        return True
+    try:
+        max_dur = max(float(s["end"]) - float(s["start"]) for s in segments)
+    except (KeyError, TypeError, ValueError):
+        return False
+    if max_dur > _COLLAPSE_MAX_SEG_S:
+        return True
+    total_tokens = sum(len((s.get("text") or "").split()) for s in segments)
+    if total_tokens < _COLLAPSE_MIN_TOKENS:
+        return True
+    return False
+
+
 def transcribe(mp3_path: str, language: str = None,
                lyrics_hint: str | None = None,
                job_id: str | None = None,
@@ -2564,16 +2553,49 @@ def transcribe(mp3_path: str, language: str = None,
     has_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
     logger.info("[transcribe] OPENAI_API_KEY=%s", 'set' if has_key else 'EMPTY')
     if has_key:
-        if os.environ.get("VAD_CHUNK_ENABLED", "1") != "0":
+        vad_disabled = os.environ.get("VAD_CHUNK_ENABLED", "1") == "0"
+        vad_first = os.environ.get("TRANSCRIBE_VAD_FIRST", "0") == "1"
+        if vad_disabled:
+            # Explicit opt-out: pure single full-file pass, no fallback.
+            segs = _transcribe_via_openai_api(
+                mp3_path, language=language, lyrics_hint=lyrics_hint,
+                job_id=job_id, return_words=return_words,
+            )
+        elif vad_first:
+            # Legacy path (pre-2026-06): VAD chunking up front. Kept behind a
+            # flag so we can A/B or revert without a deploy.
             segs = _vad_chunk_transcribe(
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
             )
         else:
+            # Default: single full-file pass first (best TEXT — avoids the
+            # chunk-boundary mishears VAD introduces), then fall back to VAD
+            # chunking ONLY if single-pass collapsed. The fallback is accepted
+            # only when it un-collapses AND adds structure, so a track where
+            # VAD ALSO fails (e.g. fast rap) stays on single-pass rather than
+            # getting worse.
             segs = _transcribe_via_openai_api(
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
             )
+            if _is_collapsed_transcription(segs):
+                _max = max((float(s["end"]) - float(s["start"]) for s in segs), default=0.0)
+                logger.warning(
+                    "[transcribe] single-pass collapsed (%d seg, max %.0fs); "
+                    "retrying with VAD chunking", len(segs), _max,
+                )
+                vad_segs = _vad_chunk_transcribe(
+                    mp3_path, language=language, lyrics_hint=lyrics_hint,
+                    job_id=job_id, return_words=return_words,
+                )
+                if not _is_collapsed_transcription(vad_segs) and len(vad_segs) > len(segs):
+                    logger.info("[transcribe] VAD fallback accepted (%d → %d seg)",
+                                len(segs), len(vad_segs))
+                    segs = vad_segs
+                else:
+                    logger.info("[transcribe] VAD fallback rejected (still collapsed / "
+                                "no structure gain); keeping single-pass")
         # Split long ad-lib blocks (uh×N, melismatic sections) and trim
         # over-extended segment ends. Same cleanup the reconcile path gets.
         # Falls back silently if post_reconcile is unavailable.
@@ -2716,9 +2738,6 @@ def transcribe(mp3_path: str, language: str = None,
     if _dropped_loops:
         logger.info("[WHISPER] filtered %s hallucination/loop segment(s)", _dropped_loops)
 
-    segments, _dropped_lyric_loops = _filter_lyric_loops(segments)
-    if _dropped_lyric_loops:
-        logger.info("[WHISPER] filtered %s lyric-loop segment(s)", _dropped_lyric_loops)
 
     return segments
 
@@ -6154,6 +6173,11 @@ def _normalize_movement_style(s: str) -> str:
         "locked": "estatico", "still": "estatico", "camara-fija": "estatico",
         "subtle": "sutil", "minimal": "sutil", "minimo": "sutil",
         "standard": "estandar", "default": "estandar",
+        # "dinamico" lo usan el editor de escena (SceneEditModal) y el
+        # energy-derived (scenes.energy_to_movement) para "más movimiento".
+        # No era una clave real → normalizaba a "" (Auto) y la elección se
+        # perdía. Se mapea a "estandar" (cinematográfico, ya suavizado).
+        "dinamico": "estandar", "dinámico": "estandar", "dynamic": "estandar",
         "photo": "foto-parallax", "parallax": "foto-parallax",
         "foto+parallax": "foto-parallax", "foto_parallax": "foto-parallax",
         "animated": "animado", "illustration": "animado", "cartoon": "animado",
@@ -6378,6 +6402,8 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     # original "exact camera movement" wording.
     _static = normalized_movement == "estatico"
     _sutil = normalized_movement == "sutil"
+    _animado = normalized_movement == "animado"
+    _foto = normalized_movement == "foto-parallax"
     _auto_movement = normalized_movement == ""
     if _static:
         # C4 (2026-05-25) + UMG-style update: repetir LOCKED 3× para reforzar
@@ -6408,18 +6434,44 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
                     "(water, fire, foliage, particles, light); the camera "
                     "itself is essentially still. NEVER push-in, NEVER zoom, "
                     "NEVER dolly forward, NEVER orbit. Just a faint breath")
+    elif _animado:
+        # 2D illustration: cámara CALMA y variada. Antes caía al `else` ("exact
+        # camera movement") → paneos en cada escena, todas iguales (bug
+        # 2026-06-30). La vida viene de la animación 2D, no de la cámara.
+        _clause2 = ("(2) framing and composition chosen for THIS scene's mood "
+                    "(vary the angle and shot size between scenes so they don't all "
+                    "look alike), with a CALM camera — at most a slow, gentle "
+                    "lateral drift; this is a stylised 2D illustration, so keep the "
+                    "camera movement minimal and let the illustrated shapes and "
+                    "elements carry the motion. NEVER push-in, zoom, dolly forward "
+                    "or orbit")
+    elif _foto:
+        # Foto fija: cámara casi inmóvil (foto), NO "exact camera movement".
+        _clause2 = ("(2) framing and composition for THIS scene (vary it between "
+                    "scenes), treated as a STILL PHOTOGRAPH — the camera is "
+                    "essentially static, at most an extremely slow parallax or "
+                    "lateral drift (no more than 5% of the frame); NEVER push-in, "
+                    "zoom, dolly or orbit; the stillness IS the style")
     elif _auto_movement:
         _clause2 = ("(2) the camera register that matches the song's energy — a "
                     "LOCKED STATIC frame for intimate/calm songs, SUBTLE minimal "
-                    "motion for most, and at most a GENTLE LATERAL track, slow "
+                    "motion for most, and at most a GENTLE, SLOW LATERAL track, slow "
                     "orbit or parallax for genuinely high-energy tracks; NEVER a "
                     "camera that travels FORWARD toward the subject (no push-in, "
                     "dolly forward, fly-through or first-person glide) because the "
                     "lyrics are overlaid and forward motion makes them nauseating "
-                    "to read; do NOT default to a constant cinematic drift — and "
-                    "the framing")
+                    "to read; do NOT default to a constant cinematic drift, keep it "
+                    "restrained, and VARY the move between scenes — and the framing")
     else:
-        _clause2 = "(2) exact camera movement and framing"
+        # estandar (cinematográfico): movimiento SUAVE, lento y variado — no
+        # "exact camera movement", que daba paneos fuertes y monótonos
+        # (feedback 2026-06-30: "demasiados paneos y todos iguales").
+        _clause2 = ("(2) a GENTLE, SLOW camera move that fits the moment — prefer a "
+                    "subtle lateral drift, slow orbit or parallax, and VARY it "
+                    "between scenes so they don't all look the same; NEVER a forward "
+                    "push-in, dolly, zoom or fly-through (the overlaid lyrics turn "
+                    "nauseating); do NOT default to a constant cinematic drift — and "
+                    "the framing")
 
     # The "no people" line is gated by `allow_people`. When the operator
     # opted into "fondo libre" (bypass_content_validation=True) OR the
@@ -8266,6 +8318,10 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
         except Exception as e:  # noqa: BLE001
             logger.error("[SCENES] escena %s falló (%s) — se sustituye por una válida", key, e)
             scene["status"] = "failed"
+            # Guardar el motivo en la escena (persiste en scene_plan → /status,
+            # /jobs) para poder DIAGNOSTICAR por qué falló sin bucear los logs
+            # del Worker. Antes el motivo solo vivía en el log. Acotado a 300.
+            scene["error"] = f"{type(e).__name__}: {e}"[:300]
     if not first_ok:
         raise RuntimeError("ninguna escena Veo se generó — fallback a fondo único")
     # Rellenar las que fallaron con un clip válido (mantiene el timeline entero).
@@ -8302,7 +8358,7 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                                       allow_people)
     plan = _scenes.build_scene_plan(secs, bible, prompt_fn, artist=artist,
                                     song_title=song_title, style=style_hint,
-                                    operator_movement=movement_style)
+                                    operator_movement=_normalize_movement_style(movement_style))
     clip_for_key = _generate_scene_clips(plan, job_dir, artist=artist,
                                          song_title=song_title, concept=concept,
                                          job_id=job_id, allow_people=allow_people)
@@ -9749,6 +9805,27 @@ def _smart_lower(text: str) -> str:
     return "".join(out)
 
 
+def _sentence_case(text: str) -> str:
+    """'Sentence' aesthetic: every LINE starts with a capital, the rest keeps
+    the 'lower' look. Requested by operators who want readable lines without
+    the shouty ALL-CAPS ('upper') or the Every-Word-Capitalized ('title')
+    look — just a natural "Esta es tu letra" per line.
+
+    Built on _smart_lower so interior proper nouns survive (país/nombre:
+    "quizás llegue a Guinea" → "Quizás llegue a Guinea", not "...guinea").
+    Splits on '\\n' so wrapped/multi-line segments capitalize each visual
+    line, not only the first."""
+    out = []
+    for line in _smart_lower(text).split("\n"):
+        chars = list(line)
+        for i, ch in enumerate(chars):
+            if ch.isalpha():
+                chars[i] = ch.upper()
+                break
+        out.append("".join(chars))
+    return "\n".join(out)
+
+
 def _apply_case(text: str, case: str) -> str:
     """Apply text-case transformation matching the user's choice."""
     if case == "upper":
@@ -9757,6 +9834,8 @@ def _apply_case(text: str, case: str) -> str:
         return text.title()
     if case == "lower":
         return _smart_lower(text)
+    if case == "sentence":
+        return _sentence_case(text)
     return text  # "original" — keep as transcribed
 
 
@@ -11619,7 +11698,14 @@ def generate_short(
             raw.get_frame(0)
             raw = _cover_resize(raw, 1080, 1920)
             if raw.duration >= short_dur:
-                bg = raw.subclip(0, short_dur)
+                # El short usa la MISMA ventana temporal que su audio/letra
+                # (el coro, start_time..end_time), no los primeros 30s. En un
+                # fondo único no cambia nada (es uniforme); en un timeline
+                # multi-escena hace que el short muestre las escenas del CORO
+                # que matchean la letra —incl. una escena corregida ahí— en vez
+                # de las de la intro. Clamp para no pasar el final del clip.
+                _bg_start = max(0.0, min(start_time, raw.duration - short_dur))
+                bg = raw.subclip(_bg_start, _bg_start + short_dur)
             else:
                 loops = math.ceil(short_dur / raw.duration) + 1
                 clips = []
@@ -12126,6 +12212,15 @@ def run_edit_pipeline(
                     bg_prelooped = True
 
         elif edit_type == "background":
+            # Cinturón del guard en request_edit (incidente 2026-07-01):
+            # si un background-edit llega igual a un job multi-escena, NO
+            # gastar Veo ni pisar bg_r2_key_cached (el timeline) con un
+            # clip único de 8 s.
+            if scene_plan and scene_plan.get("scenes"):
+                raise RuntimeError(
+                    "background edit no soportado en jobs multi-escena — "
+                    "regenerar escenas individuales (edit_type='scene')."
+                )
             update_job(job_id, status="editing", current_step="background", progress=22)
             lyrics_text = " ".join(seg["text"] for seg in segments)
             bg_image_path = _ensure_background(

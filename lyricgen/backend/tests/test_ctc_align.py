@@ -326,3 +326,127 @@ def test_condense_extends_block_to_next_anchor():
     out = ctc_align.condense_repeated_skips(segs)
     assert out[0].get("ctc_condensed") == 2
     assert abs(out[0]["end"] - 74.9) < 0.01  # extendido hasta la próxima ancla
+
+
+# ── trim_unvoiced_edges (caso "Uh, no, no" 03/07) ───────────────────────────
+
+def _hada_line():
+    # Palabras reales del caso: "Uh," estirada sobre silencio con score
+    # basura; "no," confiable en la voz; "no" final estirada post-voz.
+    return [(7.7 - 1.68, 7.9, [("Uh,", 6.02, 7.9, 0.12),
+                               ("no,", 8.38, 8.68, 0.727),
+                               ("no", 8.84, 10.4, 0.299)])]
+
+
+def test_edge_snap_first_word_to_voice_region():
+    from ctc_align import trim_unvoiced_edges
+    regions = [(7.7, 8.9)]  # voz medida en el stem
+    out = trim_unvoiced_edges(_hada_line(), regions)
+    s, e, ws = out[0]
+    assert ws[0][1] == 7.7          # "Uh," arranca donde arranca la voz
+    assert s == 7.7                 # la línea hereda el start corregido
+    assert ws[1] == ("no,", 8.38, 8.68, 0.727)  # la confiable intacta
+    assert ws[2][2] == 8.9          # "no" final recortada al fin de la voz
+    assert e == 8.9
+
+
+def test_edge_snap_confident_words_untouched():
+    from ctc_align import trim_unvoiced_edges
+    line = [(10.0, 12.0, [("hola", 10.0, 10.5, 0.9), ("mundo", 10.6, 12.0, 0.8)])]
+    out = trim_unvoiced_edges(line, [(11.0, 13.0)])
+    assert out[0] == line[0]        # scores altos → ni se mira la región
+
+
+def test_edge_snap_no_regions_is_noop():
+    from ctc_align import trim_unvoiced_edges
+    line = _hada_line()
+    assert trim_unvoiced_edges(line, []) is line
+
+
+def test_edge_snap_env_kill_switch(monkeypatch):
+    from ctc_align import trim_unvoiced_edges
+    monkeypatch.setenv("CTC_ALIGN_EDGE_SNAP", "0")
+    line = _hada_line()
+    assert trim_unvoiced_edges(line, [(7.7, 8.9)]) is line
+
+
+def test_edge_snap_never_moves_backward_or_past_end():
+    from ctc_align import trim_unvoiced_edges
+    # región que empieza ANTES del span de la palabra: snap = max(a, ra) = a
+    line = [(5.0, 6.0, [("eh", 5.0, 6.0, 0.1)])]
+    out = trim_unvoiced_edges(line, [(4.0, 7.0)])
+    assert out[0][2][0][1] == 5.0   # nunca hacia antes
+    # región que arranca después del end de la palabra: no toca
+    line2 = [(5.0, 6.0, [("eh", 5.0, 6.0, 0.1)])]
+    out2 = trim_unvoiced_edges(line2, [(6.5, 7.0)])
+    assert out2[0][2][0][1] == 5.0
+
+
+def test_edge_snap_none_lines_pass_through():
+    from ctc_align import trim_unvoiced_edges
+    out = trim_unvoiced_edges([None, _hada_line()[0]], [(7.7, 8.9)])
+    assert out[0] is None
+
+
+def test_finalize_line_clears_stale_review_on_retimed():
+    """El scaffold marca review=True ("timing aproximado"). Si CTC retimó
+    la línea, el flag se limpia — el wizard pintaba de ámbar 66 líneas
+    perfectamente sincronizadas (operador, 03/07)."""
+    from ctc_align import finalize_line
+    seg = {"text": "hola", "start": 1.0, "end": 2.0, "review": True,
+           "words": [{"word": "hola", "start": 1.0, "end": 2.0}]}
+    out = finalize_line(seg, 10.0, 12.0, [("hola", 10.0, 12.0, 0.9)], 0.4,
+                        skipped=False, recovered=False)
+    assert "review" not in out            # retimada → flag fuera
+    assert out["start"] == 10.0 and out["end"] == 12.0
+    assert out["words"][0]["start"] == 10.0
+    assert out["ctc_lr"] == 0.4
+
+
+def test_finalize_line_keeps_review_on_skipped():
+    from ctc_align import finalize_line
+    seg = {"text": "uh", "start": 1.0, "end": 2.0, "review": True}
+    out = finalize_line(seg, 1.0, 2.0, None, None, skipped=True, recovered=False)
+    assert out.get("review") is True      # salteada → timing sigue aproximado
+    assert out.get("ctc_skipped") is True
+    assert "words" not in out             # interpolada: sin stamps viejos
+
+
+def test_finalize_line_recovered_tags_mix():
+    from ctc_align import finalize_line
+    out = finalize_line({"text": "x"}, 5.0, 6.0,
+                        [("x", 5.0, 6.0, 0.5)], None,
+                        skipped=False, recovered=True)
+    assert out["ctc_recovered"] == "mix"
+
+
+# ── structural_skip_verdict: ad-libs no cuentan (Amanda Pujó, 05/07) ─────────
+
+def test_structural_verdict_ignores_adlib_skips():
+    """13 líneas de 'uh' salteadas NO deben hacer declinar: son
+    vocalizaciones que CTC no ancla por diseño, no un mismatch estructural."""
+    from ctc_align import structural_skip_verdict
+    lines = ["Verso uno", "Verso dos"] + ["Uh, uh, uh"] * 13 + ["Verso tres"]
+    skipped = set(range(2, 15))          # los 13 uh salteados
+    decl, lex_sk, lex_tot, n_ad = structural_skip_verdict(lines, skipped, 0.10)
+    assert not decl                      # 0 léxicas salteadas → NO declina
+    assert (lex_sk, lex_tot, n_ad) == (0, 3, 13)
+
+
+def test_structural_verdict_still_catches_real_mismatch():
+    """Letra de otra versión: líneas LÉXICAS salteadas → sí declina."""
+    from ctc_align import structural_skip_verdict
+    lines = [f"línea real {i}" for i in range(10)]
+    skipped = {0, 1, 2}                   # 3/10 léxicas = 30% > 10%
+    decl, lex_sk, lex_tot, _ = structural_skip_verdict(lines, skipped, 0.10)
+    assert decl and (lex_sk, lex_tot) == (3, 10)
+
+
+def test_structural_verdict_mixed():
+    """Coro de uh + una línea léxica mal: la léxica sola no supera el 10%."""
+    from ctc_align import structural_skip_verdict
+    lines = [f"línea {i}" for i in range(20)] + ["Uh, uh"] * 10
+    skipped = {5} | set(range(20, 30))   # 1 léxica + 10 uh
+    decl, lex_sk, lex_tot, n_ad = structural_skip_verdict(lines, skipped, 0.10)
+    assert not decl                      # 1/20 = 5% < 10%
+    assert (lex_sk, lex_tot, n_ad) == (1, 20, 10)

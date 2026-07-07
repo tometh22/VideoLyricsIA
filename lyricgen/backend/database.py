@@ -463,7 +463,17 @@ class Job(Base):
 
     # Relationships
     user = relationship("User", back_populates="jobs", foreign_keys=[user_id])
-    provenance = relationship("AIProvenance", back_populates="job", lazy="dynamic")
+    # cascade="all, delete-orphan": deleting a Job deletes its ai_provenance
+    # audit rows with it. Without this, SQLAlchemy's default is to NULL the FK
+    # on the children before deleting the parent — but ai_provenance.job_id is
+    # NOT NULL, so the `UPDATE ai_provenance SET job_id=NULL` raised
+    # IntegrityError, poisoned the session (PendingRollbackError → HTTP 500
+    # "Sin respuesta del servidor"), and left an undeleteable stale job that
+    # blocked re-uploading the same audio (incident 2026-06-26, Universal).
+    provenance = relationship(
+        "AIProvenance", back_populates="job", lazy="dynamic",
+        cascade="all, delete-orphan",
+    )
 
     def to_dict(self):
         return {
@@ -544,6 +554,12 @@ class Job(Base):
             "archived_at": self.archived_at.timestamp() if self.archived_at else None,
             "youtube": self.youtube_data,
             "youtube_short": self.youtube_short_data,
+            # Multi-escena: la tira de corrección por escena vive en JobDetail,
+            # que recibe el job DESDE LA LISTA (prop), no vía fetch de detalle.
+            # Sin esto, `job.scene_plan` llegaba undefined y el filmstrip NUNCA
+            # aparecía aunque el video tuviera escenas (bug 2026-06-30). Solo
+            # pesa en jobs con Escenas; los normales llevan null.
+            "scene_plan": self.scene_plan,
         }
 
 
@@ -819,6 +835,50 @@ class AuditLog(Base):
     detail = Column(JSONB, nullable=True)
     ip_address = Column(String(45), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class CreditGrant(Base):
+    """Créditos de regalo (promos como el lanzamiento de Escenas).
+
+    Un pool por CUENTA que se consume ANTES del cupo del plan, con
+    vencimiento. NO se decrementa en vivo: `auth.get_plan_usage()` calcula
+    cuánto se consumió contando los videos aprobados desde `granted_at` (con
+    el mismo peso de créditos que la cuota: normal=1, Escenas=N). Así
+    reject/un-approve revierten el consumo solos —igual que la cuota— sin
+    tocar ninguna fila acá.
+
+    Scope (igual que la cuota): si la cuenta tiene `billing_group` (ej.
+    Universal con tenants AR/CL), el grant es del grupo y lo comparten todos
+    sus tenants. Si no, es por `tenant_id`. Se setea UNO de los dos.
+
+    `create_all()` la crea en el boot (no requiere migración Alembic).
+    """
+    __tablename__ = "credit_grants"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # Scope de la cuenta: exactamente uno de los dos.
+    billing_group = Column(String(100), nullable=True, index=True)
+    tenant_id = Column(String(100), nullable=True, index=True)
+    amount = Column(Integer, nullable=False)            # créditos otorgados
+    reason = Column(String(100), nullable=False, default="escenas_launch", index=True)
+    granted_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    granted_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+    # NULL = sin vencimiento. La promo de lanzamiento setea now + TTL.
+    expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    # Kill-switch sin borrar la fila (auditable).
+    revoked = Column(Boolean, default=False, nullable=False, server_default="false")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "billing_group": self.billing_group,
+            "tenant_id": self.tenant_id,
+            "amount": self.amount,
+            "reason": self.reason,
+            "granted_at": self.granted_at.isoformat() if self.granted_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "revoked": self.revoked,
+        }
 
 
 class BackgroundAsset(Base):

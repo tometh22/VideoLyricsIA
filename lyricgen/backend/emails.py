@@ -205,10 +205,27 @@ def send_password_reset(email: str, username: str, token: str):
     _send_email(email, "Password reset — GenLy AI", _wrap_template(content))
 
 
-def send_job_completed(email: str, username: str, artist: str, filename: str, job_id: str):
-    """Notify user that a video has been generated."""
+def send_job_completed(email: str, username: str, artist: str, filename: str, job_id: str,
+                       needs_review: bool = False):
+    """Notify user that a video has been generated.
+
+    Con REQUIRE_REVIEW el render termina en pending_review y el video es
+    invisible hasta que el operador lo apruebe — el asunto/CTA tienen que
+    decir "revisar", no "listo". En español porque los operadores (UMG
+    AR/CL) trabajan la app en español; el resto de los emails migra después.
+    """
     song = filename.replace(".mp3", "")
     url = f"{FRONTEND_URL}/?view=detail&job={job_id}"
+    if needs_review:
+        content = f"""
+        <h2 style="color:#fff;margin:0 0 16px;">Tu video está listo para revisar</h2>
+        <p>Hola <strong>{username}</strong>,</p>
+        <p>El video de <strong>{artist} — {song}</strong> ya se generó y está esperando
+        tu revisión. Entrá para verlo, ajustar lo que haga falta y aprobarlo.</p>
+        {_button(url, "Revisar y aprobar")}
+        """
+        _send_email(email, f"Listo para revisar: {artist} — {song}", _wrap_template(content))
+        return
     content = f"""
     <h2 style="color:#fff;margin:0 0 16px;">Video ready</h2>
     <p>Hi <strong>{username}</strong>,</p>
@@ -216,6 +233,27 @@ def send_job_completed(email: str, username: str, artist: str, filename: str, jo
     {_button(url, "View Video")}
     """
     _send_email(email, f"Video ready: {artist} — {song}", _wrap_template(content))
+
+
+def send_review_reminder(email: str, username: str, artist: str, song: str,
+                         job_id: str, days_waiting: int):
+    """Remind the owner that a finished video is still sitting in review.
+
+    Caso real (2026-06-25): el primer video de una operadora de UMG Chile
+    quedó 8 días en pending_review sin que nadie lo viera — para ella la
+    app "no funcionó". Se envía una sola vez por job (dedupe por AuditLog
+    en reaper.remind_stale_pending_review)."""
+    url = f"{FRONTEND_URL}/?view=detail&job={job_id}"
+    dias = f"{days_waiting} día" + ("s" if days_waiting != 1 else "")
+    content = f"""
+    <h2 style="color:#fff;margin:0 0 16px;">Tenés un video esperando revisión</h2>
+    <p>Hola <strong>{username}</strong>,</p>
+    <p>El video de <strong>{artist} — {song}</strong> está terminado y espera tu
+    aprobación hace <strong>{dias}</strong>. Hasta que lo revises no se puede
+    descargar ni publicar.</p>
+    {_button(url, "Revisar ahora")}
+    """
+    _send_email(email, f"Video esperando revisión: {artist} — {song}", _wrap_template(content))
 
 
 def send_usage_alert(email: str, username: str, percent: int, used: int, limit: int, plan: str):

@@ -64,6 +64,7 @@ from auth import (
     has_prores_access,
     has_drive_access,
     has_scenes_access,
+    scenes_credit_cost,
     telemetry_enabled,
     generate_api_key,
     is_super_admin,
@@ -74,7 +75,8 @@ from datetime import datetime, timedelta, timezone
 from database import (
     Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
     BackgroundAsset, AssetUsage, Delivery, DeliveryChangeRequest,
-    SalesLead, UserSession, LoginSession, UiEvent, scoped_db, pool_stats,
+    SalesLead, UserSession, LoginSession, UiEvent, CreditGrant,
+    scoped_db, pool_stats,
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
@@ -1157,6 +1159,7 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
             "features": {
                 "prores_export": has_prores_access(user),
                 "scenes": has_scenes_access(user),
+                "scenes_credit_cost": scenes_credit_cost(),
                 "telemetry": telemetry_enabled(),
             },
         },
@@ -1256,6 +1259,7 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
             "features": {
                 "prores_export": has_prores_access(user),
                 "scenes": has_scenes_access(user),
+                "scenes_credit_cost": scenes_credit_cost(),
                 "telemetry": telemetry_enabled(),
             },
         },
@@ -1323,6 +1327,7 @@ def me(current_user: dict = Depends(get_current_user), db: Session = Depends(get
         "features": {
             "prores_export": has_prores_access(_u),
             "scenes": has_scenes_access(_u),
+            "scenes_credit_cost": scenes_credit_cost(),
             "telemetry": telemetry_enabled(),
         },
     }
@@ -2481,7 +2486,11 @@ def _job_scope(current_user: dict) -> dict:
     # dueño de la empresa). El acceso a media queda auditado en
     # /media-token y /download vía _audit_cross_tenant_access.
     if current_user.get("role") == "admin":
-        return {}
+        # Explícito, no kwargs vacíos: get_all_jobs tiene default
+        # tenant_id="default" y con {} el admin veía SOLO ese tenant
+        # (historial frizado en jun-02). None = cross-tenant real, mismo
+        # contrato que get_job.
+        return {"tenant_id": None}
     return {"tenant_id": current_user["tenant_id"]}
 
 
@@ -2581,13 +2590,22 @@ def _try_send_usage_alert(db: Session, current_user: dict, usage: dict) -> None:
         logger.warning("usage alert skipped: %s", _e)
 
 
-def _enforce_plan_quota(db: Session, current_user: dict) -> None:
-    """Raise 402 if the tenant reached its monthly limit without overage allowed.
+def _enforce_plan_quota(db: Session, current_user: dict,
+                        credits_needed: int = 1) -> None:
+    """Raise 402 if the account can't cover the video about to be generated.
 
     The message is operator-facing (UMG, label teams). It avoids
     backend-y phrasing ("plan", "overage") and points at a human
     contact path so the operator knows what to do — keeping it
     blocking but not a dead-end.
+
+    `credits_needed` es el peso del video que se está por generar: 1 normal,
+    scenes_credit_cost() cuando viene con Escenas. El gate compara contra
+    `total_available` (cupo del plan + regalo vigente), el mismo número que
+    muestra el medidor — así un video de Escenas no arranca con menos
+    créditos que su costo (antes bastaba "queda al menos 1" y la cuenta
+    terminaba en overage sin aviso), y un regalo emitido a mitad de mes
+    desbloquea a una cuenta que ya había agotado el plan.
     """
     plan = current_user.get("plan", "100")
     tenant_id = current_user["tenant_id"]
@@ -2596,9 +2614,20 @@ def _enforce_plan_quota(db: Session, current_user: dict) -> None:
                            billing_group=current_user.get("billing_group"))
     if plan != "unlimited" and usage["percent"] >= 80:
         _try_send_usage_alert(db, current_user, usage)
-    if usage["remaining"] <= 0 and plan != "unlimited":
+    available = usage["total_available"]
+    if available < credits_needed and plan != "unlimited":
         if not current_user.get("allow_overage", False):
             support_email = os.environ.get("SUPPORT_EMAIL", "soporte@genly.pro")
+            if credits_needed > 1 and available > 0:
+                raise HTTPException(
+                    status_code=402,
+                    detail=(
+                        f"Un video con Escenas consume {credits_needed} créditos "
+                        f"y a tu cuenta le queda{'n' if available != 1 else ''} "
+                        f"{available}. Generalo sin Escenas, o contactá a "
+                        f"{support_email} para extender el cupo."
+                    ),
+                )
             raise HTTPException(
                 status_code=402,
                 detail=(
@@ -3060,12 +3089,20 @@ _MULTIPART_PART_SIZE_BYTES = int(
     os.environ.get("MULTIPART_PART_SIZE_BYTES", str(8 * 1024 * 1024))
 )
 _PRESIGN_PUT_TTL_S = int(os.environ.get("PRESIGN_PUT_TTL_S", "900"))
+# TTL de las URLs de PARTES multipart. Más largo que el single-PUT a
+# propósito: el init batch-presigna las ~19 partes de un archivo de
+# 150 MB de una sola vez, y en un uplink lento la subida completa puede
+# tardar 30-50 min — con 900 s las últimas partes expiraban a mitad de
+# camino (403) justo dentro de la ventana en que el reaper todavía no
+# liberaba el job. 1 h cubre el peor caso realista; el riesgo extra es
+# mínimo (la URL firma un solo part_number de un upload_id específico).
+_PRESIGN_PART_TTL_S = int(os.environ.get("PRESIGN_PART_TTL_S", "3600"))
 
 
 class _UploadUrlReq(BaseModel):
     filename: str = Field(..., max_length=500)       # DB Job.filename = VARCHAR(500)
     content_type: str = Field(default="", max_length=200)
-    size_bytes: int = 0
+    size_bytes: int = Field(default=0, ge=0)
     artist: str = Field(default="", max_length=255)  # DB Job.artist = VARCHAR(255)
     title: str = Field(default="", max_length=500)   # DB Job.song_title = VARCHAR(500)
 
@@ -3146,6 +3183,14 @@ async def upload_url(
     # otherwise escape the job dir at write time.
     body.filename = _safe_basename(body.filename)
     if body.size_bytes and body.size_bytes > MAX_UPLOAD_MB * 1024 * 1024:
+        # Log the rejection with the real size — a client-side cap bug
+        # (silent 107 MB WAV reject, 2026-07-02) took hours to diagnose
+        # because nothing anywhere recorded the attempted size.
+        logger.warning(
+            "[UPLOAD] 413 reject: %s (%.1f MB > %d MB) tenant=%s user=%s",
+            body.filename, body.size_bytes / 1048576, MAX_UPLOAD_MB,
+            current_user["tenant_id"], current_user["id"],
+        )
         raise HTTPException(
             status_code=413,
             detail=f"File too large (>{MAX_UPLOAD_MB} MB).",
@@ -3207,6 +3252,11 @@ async def upload_url(
 
     use_multipart = (
         body.size_bytes > 0 and body.size_bytes >= _MULTIPART_THRESHOLD_BYTES
+    )
+    logger.info(
+        "[UPLOAD] ticket minted: job=%s file=%s size=%.1f MB multipart=%s tenant=%s",
+        job_id, body.filename, (body.size_bytes or 0) / 1048576,
+        use_multipart, current_user["tenant_id"],
     )
     response = {
         "job_id": job_id,
@@ -3300,7 +3350,7 @@ async def upload_multipart_init(
             "upload_id": job_row.multipart_upload_id,
             "key": job_row.input_r2_key,
             "part_size": _MULTIPART_PART_SIZE_BYTES,
-            "presign_ttl_s": _PRESIGN_PUT_TTL_S,
+            "presign_ttl_s": _PRESIGN_PART_TTL_S,
         }
         if body.expected_parts > 0:
             resp["presigned_parts"] = _batch_presign_parts(
@@ -3333,7 +3383,7 @@ async def upload_multipart_init(
         "upload_id": init["upload_id"],
         "key": init["key"],
         "part_size": _MULTIPART_PART_SIZE_BYTES,
-        "presign_ttl_s": _PRESIGN_PUT_TTL_S,
+        "presign_ttl_s": _PRESIGN_PART_TTL_S,
     }
     if body.expected_parts > 0:
         resp["presigned_parts"] = _batch_presign_parts(
@@ -3355,7 +3405,7 @@ def _batch_presign_parts(key: str, upload_id: str, expected_parts: int) -> list:
     for part_number in range(1, expected_parts + 1):
         try:
             url = storage.multipart_presign_part(
-                key, upload_id, part_number, expiry_seconds=_PRESIGN_PUT_TTL_S,
+                key, upload_id, part_number, expiry_seconds=_PRESIGN_PART_TTL_S,
             )
             if url:
                 out.append({"part_number": part_number, "url": url})
@@ -3396,11 +3446,11 @@ async def upload_multipart_part_url(
         )
     url = storage.multipart_presign_part(
         job_row.input_r2_key, job_row.multipart_upload_id,
-        body.part_number, expiry_seconds=_PRESIGN_PUT_TTL_S,
+        body.part_number, expiry_seconds=_PRESIGN_PART_TTL_S,
     )
     if not url:
         raise HTTPException(status_code=503, detail="Could not sign part URL.")
-    return {"url": url, "expires_in": _PRESIGN_PUT_TTL_S}
+    return {"url": url, "expires_in": _PRESIGN_PART_TTL_S}
 
 
 async def _drain_to_spooled(request: Request, max_bytes: int):
@@ -3575,13 +3625,53 @@ async def upload_multipart_complete(
             raise HTTPException(status_code=400, detail="Part etag missing.")
         parts_payload.append({"PartNumber": part_no, "ETag": f'"{etag}"'})
     try:
-        storage.multipart_complete(
+        completed_key = storage.multipart_complete(
             job_row.input_r2_key, job_row.multipart_upload_id, parts_payload,
         )
     except Exception as e:
         raise HTTPException(
             status_code=502,
             detail=f"R2 multipart_complete failed: {e}",
+        )
+    if not completed_key:
+        # storage.multipart_complete swallows boto errors and returns
+        # None (already-aborted upload_id, InvalidPart, transient R2
+        # failure). Before this check we answered 200 anyway: the
+        # browser believed the upload succeeded, /transcribe-uploaded
+        # later failed far from the cause, and — worse — we cleared
+        # multipart_upload_id below, so the orphaned parts could never
+        # be aborted and accrued R2 storage forever. Keep the upload_id
+        # intact: the client's retry/abort and the reaper both still
+        # work with it.
+        logger.warning(
+            "[UPLOAD] multipart_complete returned no key: job=%s key=%s",
+            body.job_id, job_row.input_r2_key,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="R2 multipart_complete failed. Reintentá la subida.",
+        )
+    # Server-side size gate. The 413 in /upload-url trusts the CLIENT-
+    # declared size_bytes and the presigned part URLs don't constrain
+    # the body, so this HEAD is the first moment we can check what
+    # actually landed. Small tolerance: multipart overhead is zero, but
+    # don't 413 a legitimate file over a rounding artifact.
+    real_size = storage.head_object_size(job_row.input_r2_key)
+    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    if real_size is not None and real_size > max_bytes:
+        logger.warning(
+            "[UPLOAD] 413 post-complete: job=%s key=%s real=%.1f MB > %d MB "
+            "tenant=%s user=%s",
+            body.job_id, job_row.input_r2_key, real_size / 1048576,
+            MAX_UPLOAD_MB, current_user["tenant_id"], current_user["id"],
+        )
+        storage.delete_object(job_row.input_r2_key)
+        job_row.multipart_upload_id = None
+        db.commit()
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({real_size / 1048576:.1f} MB). "
+                   f"Max allowed: {MAX_UPLOAD_MB} MB.",
         )
     # Clear the upload_id so the row is recognisably "complete" but
     # input_r2_key + status still need /transcribe-uploaded.
@@ -3621,6 +3711,9 @@ async def upload_multipart_abort(
 class _TranscribeUploadedReq(BaseModel):
     job_id: str = Field(..., max_length=12)
     language: str = Field(default="", max_length=16)
+    # Toggle del operador: "es una versión en vivo" — arma la auditoría de
+    # sufijo aunque el título no tenga marcador live (06/07).
+    live: bool = False
     artist: str = Field(default="", max_length=255)    # DB Job.artist = VARCHAR(255)
     title: str = Field(default="", max_length=500)     # DB Job.song_title = VARCHAR(500)
 
@@ -3671,6 +3764,22 @@ async def transcribe_uploaded(
             detail="Job has no associated upload.",
         )
 
+    # SNAPSHOT + release (incidente agus77 06/07): la descarga de R2 de
+    # abajo tarda decenas de segundos con un WAV de 45-150 MB, y este
+    # handler mantenía la sesión de DB checked-out EN TRANSACCIÓN todo ese
+    # tiempo. Postgres la mataba por idle-in-transaction timeout
+    # ("Transient DB error on POST /transcribe-uploaded"), el pool se
+    # agotaba, TODA la API pasaba a latencias de 20-40 s y el edge cortaba
+    # los demás requests con 502 sin CORS → el wizard mostraba "Sin
+    # respuesta del servidor". Capturamos lo que necesitamos del row y
+    # soltamos la conexión ANTES del I/O largo; los flips de status de más
+    # abajo abren su propia sesión corta.
+    _r2_key = job_row.input_r2_key
+    _row_filename = job_row.filename
+    _row_artist = job_row.artist or ""
+    _row_title = job_row.song_title or ""
+    db.close()
+
     _enforce_disk_capacity()
     _enforce_memory_pressure()
 
@@ -3690,12 +3799,39 @@ async def transcribe_uploaded(
     job_id = body.job_id
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
-    audio_path = os.path.join(job_dir, job_row.filename)
+    audio_path = os.path.join(job_dir, _row_filename)
 
     if not os.path.exists(audio_path):
         import asyncio as _asyncio
+        # Size gate against the REAL stored object before pulling it to
+        # local disk. The single-PUT path never passes through
+        # /upload-multipart-complete, so a client that under-declared
+        # size_bytes in /upload-url could otherwise land an arbitrarily
+        # large object and have us download it whole (disk + Whisper).
+        _real_size = storage.head_object_size(_r2_key)
+        if _real_size is not None and _real_size > MAX_UPLOAD_MB * 1024 * 1024:
+            logger.warning(
+                "[UPLOAD] 413 at transcribe: job=%s key=%s real=%.1f MB > %d MB "
+                "tenant=%s user=%s",
+                body.job_id, _r2_key, _real_size / 1048576,
+                MAX_UPLOAD_MB, current_user["tenant_id"], current_user["id"],
+            )
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large ({_real_size / 1048576:.1f} MB). "
+                       f"Max allowed: {MAX_UPLOAD_MB} MB.",
+            )
+        _loop = _asyncio.get_event_loop()
         for _attempt in range(5):
-            if storage.download_object(job_row.input_r2_key, audio_path):
+            # boto3 es síncrono: correrlo inline dentro de este handler
+            # async bloqueaba el event loop de uvicorn el tiempo entero
+            # de la descarga (segundos con un WAV de 150 MB) y un batch
+            # de 5 serializaba TODA la API. Mismo patrón executor que
+            # /upload-part-proxy.
+            _ok = await _loop.run_in_executor(
+                None, storage.download_object, _r2_key, audio_path,
+            )
+            if _ok:
                 break
             if _attempt < 4:
                 await _asyncio.sleep(0.5 * (2 ** _attempt))
@@ -3704,23 +3840,30 @@ async def transcribe_uploaded(
                 status_code=502,
                 detail="No pudimos leer el archivo subido. Reintentá en unos segundos.",
             )
-    _validate_audio_file_on_disk(job_row.filename, audio_path)
+    _validate_audio_file_on_disk(_row_filename, audio_path)
 
     if _async_enabled:
         # Async path — enqueue + 202 + status polling.
         # Flippeamos status a "transcribing_queued" para que /transcription-status
         # devuelva un estado coherente desde el momento del enqueue.
-        job_row.status = "transcribing_queued"
-        job_row.current_step = "transcribing"
-        # Reset the reaper clock. find_stuck_transcriptions anchors on
-        # coalesce(last_progress_at, created_at) with a 120-min threshold
-        # (reaper.py). A retried `transcription_failed` job has an OLD
-        # created_at, so without this NOW() bump the very next reaper pass
-        # would re-kill it instantly (same class of bug retry_job guards at
-        # main.py:9107). Harmless for fresh awaiting_upload jobs.
-        job_row.last_progress_at = datetime.now(timezone.utc)
-        db.commit()
-        db.close()
+        from database import SessionLocal as _SL
+        _db2 = _SL()
+        try:
+            _row2 = get_job_model(_db2, job_id)
+            if _row2 is None:
+                raise HTTPException(status_code=404, detail="Job not found.")
+            _row2.status = "transcribing_queued"
+            _row2.current_step = "transcribing"
+            # Reset the reaper clock. find_stuck_transcriptions anchors on
+            # coalesce(last_progress_at, created_at) with a 120-min threshold
+            # (reaper.py). A retried `transcription_failed` job has an OLD
+            # created_at, so without this NOW() bump the very next reaper pass
+            # would re-kill it instantly (same class of bug retry_job guards at
+            # main.py:9107). Harmless for fresh awaiting_upload jobs.
+            _row2.last_progress_at = datetime.now(timezone.utc)
+            _db2.commit()
+        finally:
+            _db2.close()
         try:
             from queue_jobs import enqueue_transcription
             # HOTFIX 2026-05-27: use the Job row as the single source of
@@ -3735,10 +3878,11 @@ async def transcribe_uploaded(
                 job_id,
                 audio_path,
                 language=body.language,
-                artist=job_row.artist or "",
-                title=job_row.song_title or "",
-                filename=job_row.filename,
+                artist=_row_artist,
+                title=_row_title,
+                filename=_row_filename,
                 tenant_id=current_user.get("tenant_id", ""),
+                live=bool(body.live),
             )
         except Exception as exc:
             logger.exception("[TRANSCRIBE] enqueue failed for job=%s", job_id)
@@ -3761,13 +3905,19 @@ async def transcribe_uploaded(
         # /transcribe handler. Keeping the implementation in one place via
         # the helper below means the lyrics-recovery / hallucination logic
         # stays in lockstep with the legacy fallback.
-        job_row.status = "transcribed_pending"
-        job_row.current_step = "editing"
-        db.commit()
-        # Release the pooled connection BEFORE the ~15-20 s transcription so
-        # it doesn't starve /usage and /jobs (dashboard freeze). The function
-        # opens its own short-lived session for the only DB touch it needs.
-        db.close()
+        # Sesión corta para el flip (la del request se soltó antes de la
+        # descarga); BEFORE the ~15-20 s transcription so it doesn't starve
+        # /usage and /jobs (dashboard freeze).
+        from database import SessionLocal as _SL
+        _db3 = _SL()
+        try:
+            _row3 = get_job_model(_db3, job_id)
+            if _row3 is not None:
+                _row3.status = "transcribed_pending"
+                _row3.current_step = "editing"
+                _db3.commit()
+        finally:
+            _db3.close()
 
         # HOTFIX 2026-05-27: same source-of-truth fix as the async path —
         # use job_row.artist / job_row.song_title (committed at /upload-url
@@ -3776,12 +3926,15 @@ async def transcribe_uploaded(
         _result = await _run_transcription_for_job(
             request, current_user, job_id, audio_path,
             language=body.language,
-            artist=job_row.artist or "",
-            title=job_row.song_title or "",
+            artist=_row_artist,
+            title=_row_title,
         )
         _result = await _maybe_ctc_retime(_result, audio_path, job_id,
-                                          job_row.artist or "",
-                                          job_row.song_title or "")
+                                          _row_artist, _row_title)
+        _result = await _maybe_adlib_filter(
+            _result, audio_path, job_id,
+            live_hint=bool(getattr(body, "live", False))
+            or _looks_live(_row_title, _row_filename))
         from lyrics_format import format_lyrics_pass as _fmt
         return await _fmt(_result, language=body.language or "es")
     finally:
@@ -4177,7 +4330,10 @@ async def upload(
         if not song_title:
             song_title = parsed_title
 
-    _enforce_plan_quota(db, current_user)
+    _enforce_plan_quota(db, current_user,
+                        credits_needed=(scenes_credit_cost()
+                                        if enable_scenes and has_scenes_access(current_user)
+                                        else 1))
     _enforce_daily_volume_cap(db, current_user)
     _enforce_tenant_backlog(db, current_user)
     _enforce_disk_capacity()
@@ -4301,7 +4457,7 @@ async def upload(
         effect=effect,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
         song_title=song_title,
-        text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
+        text_case=text_case if text_case in ("upper", "title", "lower", "original", "sentence") else "upper",
         font_scale=_font_scale,
         # lyric_transition + text_motion: deprecados 2026-05-23 (ver run_pipeline).
         # Aceptamos los Form params por back-compat pero coerce a defaults.
@@ -4438,11 +4594,175 @@ async def transcribe_endpoint(
         filename=file.filename,
     )
     _result = await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
+    _result = await _maybe_adlib_filter(_result, audio_path, job_id,
+                                        live_hint=_looks_live(title, file.filename))
     from lyrics_format import format_lyrics_pass as _fmt
     return await _fmt(_result, language=language or "es")
 
 
 from ctc_cascade_veto import _ctc_cascade_veto  # noqa: E402
+
+
+_LIVE_MARKER_RE = re.compile(
+    r"\b(live|en\s+vivo|vivo|ac[uú]stic[oa]|unplugged|directo|concert|"
+    r"session(?:es)?|sesi[oó]n)\b", re.IGNORECASE)
+
+
+def _looks_live(*texts) -> bool:
+    """¿Algún texto (título/filename) sugiere una versión en vivo/alternativa?
+    Señal barata para armar la auditoría de sufijo. El catálogo etiqueta los
+    vivos en el título ('Live In Buenos Aires 2001'); para archivos sin
+    etiquetar existe el toggle del operador (body.live)."""
+    return any(t and _LIVE_MARKER_RE.search(str(t)) for t in texts)
+
+
+async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
+                              live_hint: bool = False):
+    """Paso post-cascada (gate ADLIB_CONSENSUS_ENABLED, default off): descarta
+    líneas fantasma alucinadas en zonas de ad-lib y colapsa los 'uh'
+    fragmentados. Corre en TODOS los caminos de la cascada (whisperx,
+    reconcile, CTC, scaffold) — a diferencia del retime de CTC, que solo
+    actúa en su rama. Así el output queda limpio sin importar qué
+    segmentación produjo la cascada (que es no-determinista por la
+    variabilidad de whisperX en Replicate).
+
+    No-op verdadero en canciones sin ad-libs (cero candidatas → cero
+    regresión, verificado en 12 UMG gold). Never raises: ante cualquier
+    fallo devuelve el result intacto. Consigue el stem del cache R2 (la
+    cascada lo dejó ahí); si no está y no se puede computar, declina."""
+    if not isinstance(result, dict):
+        return result
+    # pop SIEMPRE (aunque el gate esté off): wx_raw es transporte interno,
+    # no debe persistirse ni llegar al response del endpoint legacy.
+    _wx_raw = result.pop("wx_raw", None)
+    if os.environ.get("ADLIB_CONSENSUS_ENABLED", "0").strip().lower() \
+            not in ("1", "true", "yes", "on"):
+        return result
+    segs = result.get("segments") or []
+    if len(segs) < 3:
+        return result
+    _stem = None
+    try:
+        import adlib_consensus as _ac
+        _has_adlib = any(_ac.is_adlib_text(s.get("text", "")) for s in segs)
+        _tail_on = os.environ.get("ADLIB_TAIL_CHECK_ENABLED", "1") \
+            .strip().lower() in ("1", "true", "yes", "on")
+        # Auditoría de sufijo (Perro Amor Explota LIVE, 06/07): el final del
+        # audio es de OTRA versión (vivo↔estudio) con voz real en la cola —
+        # el VAD no lo ve. Solo se arma con live_hint (título con marcador
+        # live o toggle del operador): medido contra el gold (06/07), en
+        # canciones normales los finales quietos/en capas dan falsos
+        # positivos. Y MARCA (review), no borra — ver filter_and_collapse.
+        _audit_on = live_hint and os.environ.get(
+            "ADLIB_SUFFIX_AUDIT_ENABLED", "1") \
+            .strip().lower() in ("1", "true", "yes", "on")
+        # Barato primero: sin ad-libs y sin ningún chequeo de final, ni
+        # tocamos el stem.
+        if not _has_adlib and not _tail_on and not _audit_on:
+            return result
+        import vocal_sep as _vs
+        _stem = await asyncio.wait_for(
+            asyncio.to_thread(_vs.separate_vocals, audio_path, cache_only=True),
+            timeout=120,
+        )
+        # Computar el stem solo si hay ad-libs (el camino histórico). Para
+        # el chequeo de cola solo, un cache miss no justifica Demucs.
+        if not _stem and _has_adlib and os.environ.get(
+                "CTC_ALIGN_COMPUTE_STEM", "1").strip().lower() in ("1", "true", "yes", "on"):
+            _stem = await asyncio.wait_for(
+                asyncio.to_thread(_vs.separate_vocals, audio_path), timeout=360)
+        if not _stem:
+            logger.info("[ADLIB] sin stem — omito el filtro (job=%s)", job_id)
+            return result
+        # Cola muda: fin del último canto según VAD de energía del stem.
+        # Caso El Riesgo (05/07): lrclib trajo la letra de otra edición con
+        # un outro cantado que este audio no tiene; el scaffold puso esas
+        # líneas sobre 76s de música instrumental. Si la cola muda es larga
+        # (>10s), las líneas que caen ahí se verifican acústicamente.
+        _tail_after = None
+        if _tail_on:
+            try:
+                from anchor_align import vocal_regions as _vr
+                _regs = await asyncio.to_thread(_vr, _stem)
+                if _regs:
+                    _last_voice = _regs[-1][1]
+                    _last_line_end = max(
+                        (float(s.get("end", 0)) for s in segs), default=0.0)
+                    if _last_line_end - _last_voice > 10.0:
+                        _tail_after = _last_voice
+                        logger.info(
+                            "[ADLIB] cola muda: voz hasta %.1fs, líneas hasta "
+                            "%.1fs — verificando la cola (job=%s)",
+                            _last_voice, _last_line_end, job_id)
+            except Exception as e:
+                logger.warning("[ADLIB] VAD de cola falló: %r — sin chequeo "
+                               "de cola (job=%s)", e, job_id)
+        if not _has_adlib and _tail_after is None and not _audit_on:
+            return result
+        _tw = _make_stem_window_transcriber(_stem)
+        _before = len(segs)
+        filtered = await asyncio.to_thread(
+            _ac.filter_and_collapse, segs, _tw, tail_after=_tail_after,
+            audit_suffix=_audit_on)
+        # MODO VIVO (Perro live, 06/07): el sufijo que la auditoría marcó
+        # se reemplaza por los segmentos crudos de whisperX de esa zona —
+        # la letra de estudio no puede representar el final de un vivo
+        # (call-response, presentaciones de la banda). Las líneas
+        # insertadas conservan review=True.
+        if (live_hint and _wx_raw
+                and os.environ.get("ADLIB_LIVE_SWAP_ENABLED", "1")
+                .strip().lower() in ("1", "true", "yes", "on")):
+            filtered = _ac.live_swap_tail(filtered, _wx_raw)
+        if filtered != segs:
+            result = dict(result)
+            result["segments"] = filtered
+            logger.info("[ADLIB] consenso: %d → %d líneas (job=%s)",
+                        _before, len(filtered), job_id)
+    except Exception as e:
+        logger.warning("[ADLIB] filtro post-cascada declinó: %r (job=%s)", e, job_id)
+    finally:
+        if _stem:
+            try:
+                os.unlink(_stem)
+            except OSError:
+                pass
+    return result
+
+
+def _make_stem_window_transcriber(stem_path: str):
+    """Devuelve transcribe_window(start, end) -> str: recorta esa ventana del
+    stem de voz y la transcribe con whisper-1. Para el filtro de consenso
+    (adlib_consensus): solo se llama en líneas candidatas (pocas por canción).
+    Recorta con un pad chico y compensa el lead-in para caer sobre el onset
+    real. Devuelve '' ante cualquier problema (el filtro conserva la línea)."""
+    import subprocess
+    import tempfile
+
+    def _transcribe_window(start: float, end: float) -> str:
+        a = max(0.0, float(start) + 0.4 - 0.25)   # +0.4 deshace el lead; -0.25 pad
+        dur = max(1.8, float(end) - float(start) + 0.3)
+        fd, clip = tempfile.mkstemp(suffix=".wav", prefix="genly_adlib_")
+        os.close(fd)
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", stem_path,
+                 "-ss", str(a), "-t", str(dur), clip],
+                check=True, timeout=30,
+            )
+            from pipeline import _transcribe_via_openai_api as _wx
+            segs = _wx(clip, language="es") or []
+            return " ".join((s.get("text") or "").strip() for s in segs).strip()
+        except Exception as e:
+            logger.warning("[ADLIB] window %.1f-%.1f transcribe failed: %s",
+                           start, end, e)
+            return ""
+        finally:
+            try:
+                os.unlink(clip)
+            except OSError:
+                pass
+
+    return _transcribe_window
 
 
 async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
@@ -4473,23 +4793,56 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
         if len(segs) < 3:
             return result
         import vocal_sep as _vs
-        # cache_only: the cascade computed the stem seconds ago, so this
-        # is an R2 download — never a second (paid, 60-180 s, hangable)
-        # demucs run. Cascade paths that skipped vocal separation have
-        # no cached stem → decline; aligning on the mix is unvalidated.
+        # cache_only primero: si la cascada computó el stem hace segundos,
+        # esto es solo una descarga de R2.
         _stem = await asyncio.wait_for(
             asyncio.to_thread(_vs.separate_vocals, audio_path, cache_only=True),
             timeout=120,
         )
-        if not _stem:
+        if not _stem and os.environ.get(
+                "CTC_ALIGN_COMPUTE_STEM", "1").strip().lower() in ("1", "true", "yes", "on"):
+            # Sin stem cacheado → COMPUTARLO (regresión Amanda Pujó,
+            # 03/07): cuando la transcripción viene del cache, la cascada
+            # nunca corre demucs, el wrapper caía a la mezcla, y en mezclas
+            # indie (voz enterrada) CTC declinaba estructural (13/29 skips)
+            # dejando el timing del reconcile (línea fantasma + puente
+            # 2.6s tarde). Sobre el stem la misma canción alinea 29/29.
+            # Costo: ~60-180s de Replicate + ~$0.005, UNA vez por canción
+            # (separate_vocals sube el stem al cache R2). El timeout deja
+            # margen para el peor caso de Replicate.
+            logger.info("[CTC] no cached stem — computing it (job=%s)", job_id)
+            _stem = await asyncio.wait_for(
+                asyncio.to_thread(_vs.separate_vocals, audio_path),
+                timeout=360,
+            )
+        # Fallback a la MEZCLA (medido en el gold set, 03/07): la
+        # declinación de CTC varía según la fuente — Grignani alineó
+        # med 0.105s/74.5%≤0.3s y PROVENZA 0.177s/76% SOBRE LA MEZCLA
+        # habiendo declinado sobre el stem (demucs sobre-separa algunas
+        # mezclas); Rata Blanca es el caso inverso (mezcla declina por
+        # score, stem alinea perfecto). La corrida completa del gold set
+        # (40 canciones, 100% sobre mezcla) dio 50.7% ≤0.3s — la mezcla
+        # como fuente está validada. Costo del retry: solo CPU local.
+        _mix_fallback = os.environ.get(
+            "CTC_ALIGN_MIX_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
+        retimed = None
+        _stem_structural = False
+        if _stem:
+            retimed = await asyncio.wait_for(
+                asyncio.to_thread(_ctc.retime_segments, _stem, segs, job_id,
+                                  audio_path),  # mix_path — M5 crowd recovery
+                timeout=420,
+            )
+            # Solo confiar en last_decline_reason (global de módulo) si
+            # ESTE call corrió — sin stem quedaría el valor del job anterior.
+            _stem_structural = (retimed is None
+                                and _ctc.last_decline_reason == "structural")
+        elif not _mix_fallback:
             logger.info("[CTC] no cached stem — skipping retime (job=%s)", job_id)
             return result
-        retimed = await asyncio.wait_for(
-            asyncio.to_thread(_ctc.retime_segments, _stem, segs, job_id,
-                              audio_path),  # mix_path — M5 crowd recovery
-            timeout=420,
-        )
-        if (retimed is None and _ctc.last_decline_reason == "structural"
+        else:
+            logger.info("[CTC] no cached stem — aligning on the MIX (job=%s)", job_id)
+        if (_stem_structural
                 and os.environ.get("CTC_ALIGN_PERF_TEXT", "0").strip().lower()
                 in ("1", "true", "yes", "on")):
             # ETAPA A — the cascade's text doesn't match what this live
@@ -4523,9 +4876,34 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
                     logger.info("[CTC] performance-libretto retime: %d líneas "
                                 "(reemplaza el texto de la cascada, job=%s)",
                                 len(retimed), job_id)
+        # Retry sobre la MEZCLA cuando el stem declinó por score (no
+        # estructural — eso ya tiene su camino perf-text arriba, y una
+        # mezcla no arregla un libreto que no matchea). También cubre el
+        # caso sin stem cacheado (retimed sigue None y nunca corrimos el
+        # primer align).
+        if retimed is None and _mix_fallback and not _stem_structural:
+            retimed = await asyncio.wait_for(
+                asyncio.to_thread(_ctc.retime_segments, audio_path, segs, job_id),
+                timeout=420,
+            )
+            if retimed:
+                logger.info("[CTC] retime sobre la MEZCLA OK (stem %s, job=%s)",
+                            "declinó" if _stem else "ausente", job_id)
         if retimed:
+            # Re-aplicar el lead-in: la cascada lo aplicó dentro de
+            # _emit_segments, pero el retime de CTC produce onsets
+            # acústicos frescos SIN lead — sin esta línea, justo las
+            # canciones donde CTC actúa perdían el lead-in (#801) y
+            # ambas mejoras se anulaban entre sí. No hay doble
+            # aplicación: en el camino de declive los segmentos de la
+            # cascada (ya con lead) pasan intactos.
+            # El filtro de ad-libs se mudó a _maybe_adlib_filter (paso
+            # post-cascada, corre en TODOS los caminos — no solo cuando CTC
+            # retima). Acá solo re-aplicamos el lead-in sobre los onsets
+            # frescos de CTC (#801).
+            import lead_in as _lead_in
             result = dict(result)
-            result["segments"] = retimed
+            result["segments"] = _lead_in.polish(retimed)
             from jobs import set_timing_source
             from timing_sources import CTC_ALIGN
             set_timing_source(job_id, CTC_ALIGN)
@@ -4613,14 +4991,21 @@ async def _run_transcription_for_job(
         #      (only when per-word stamps are present; no-op otherwise)
         #   2. beat_snap — snap starts to the song's beat grid (±200ms)
         #   3. mark_repetitions — tag chorus loops with repetition_group
-        # See whisperx_transcribe.py, beat_snap.py, chorus_trim.py.
+        #   4. lead_in — adelantar la aparición de la línea (karaoke lead;
+        #      LYRIC_LEAD_IN_S, default 0 = off). Va ÚLTIMO para operar
+        #      sobre los starts ya definitivos; los word-stamps no se
+        #      tocan, así el highlight sigue clavado al onset real.
+        # See whisperx_transcribe.py, beat_snap.py, chorus_trim.py, lead_in.py.
         import beat_snap as _beat_snap
         import chorus_trim as _chorus_trim
+        import lead_in as _lead_in
         from whisperx_transcribe import _split_long_segments as _split_long
         def _snap(segs):
-            return _chorus_trim.mark_repetitions(
-                _beat_snap.apply(tmp_path,
-                    _split_long(segs)
+            return _lead_in.polish(
+                _chorus_trim.mark_repetitions(
+                    _beat_snap.apply(tmp_path,
+                        _split_long(segs)
+                    )
                 )
             )
 
@@ -4667,6 +5052,19 @@ async def _run_transcription_for_job(
             polished = _snap(_normalize_words(deduped))
             out = {"job_id": job_id, "segments": polished,
                    "reference_lyrics": reference_lyrics}
+            # Segmentos crudos de whisperX (la performance REAL): viajan en
+            # result para que el modo vivo pueda reemplazar el sufijo
+            # divergente por lo que se canta (live_swap_tail). Se hace pop
+            # en _maybe_adlib_filter — no se persisten ni llegan al cliente.
+            try:
+                if _wx_segs:
+                    out["wx_raw"] = [
+                        {"start": float(s.get("start", 0)),
+                         "end": float(s.get("end", 0)),
+                         "text": (s.get("text") or "").strip()}
+                        for s in _wx_segs if (s.get("text") or "").strip()]
+            except NameError:
+                pass  # camino que emite antes de correr whisperX
             if recovery_source:
                 out["recovery_source"] = recovery_source
             if coverage_warning:
@@ -5099,6 +5497,63 @@ async def _run_transcription_for_job(
                     # Reconcile when we have canonical text; emit raw otherwise.
                     if _canonical:
                         import whisperx_reconcile as _wxr
+                        # Audio-as-truth (LINE_TEXT_CORRECT_ENABLED): keep the
+                        # raw transcription's OWN segments + timing (incl. ad-lib
+                        # "uh") and only swap each line's TEXT to the best
+                        # reference line. Avoids reconcile's word-rebucketing,
+                        # which scatters chorus words across a missing ad-lib gap.
+                        #
+                        # GATED to lyrics_source == "gemini" — i.e. UNKNOWN songs
+                        # where lrclib + Genius both missed and reconcile would
+                        # smear the ad-lib. For KNOWN songs (lrclib/genius) the
+                        # whisperX-reconcile path is strictly better (word-level
+                        # timing + clean line structure); this Whisper-1 base
+                        # would merge lines and mistime them (regressed "La
+                        # Leyenda del Hada y el Mago", an lrclib song). So those
+                        # fall through to reconcile, exactly as in production.
+                        if (lyrics_source == "gemini"
+                                and os.environ.get("LINE_TEXT_CORRECT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")):
+                            # Base = Whisper-1 on the RAW mix (`audio_path`), NOT WhisperX
+                            # on the stem. Measured on "No Hay Santos": Whisper-1-raw
+                            # captures sustained ad-libs as "uh"/"oh" and segments into
+                            # clean full lines; WhisperX fragments and its VAD drops the
+                            # ad-lib (recall 79% vs 74%, max-gap 13s vs 19s). text_correct
+                            # then only swaps each line's TEXT to the best reference line,
+                            # leaving ad-lib lines (no match) as-heard. pipeline.transcribe
+                            # carries the single-pass + collapse-fallback hardening.
+                            import pipeline as _pl
+                            _base = await asyncio.to_thread(
+                                _pl.transcribe, audio_path, language=(lang or None),
+                                job_id=job_id, return_words=True,
+                            )
+                            # Sustained ad-libs ("uh uh uh") that Whisper forced into
+                            # words (e.g. a 21 s block heard as "¿Para qué? ¿Para qué?")
+                            # → relabel to "Uh" BEFORE text-correct so they don't get
+                            # matched onto a chorus line. Long-segment + few-words = ad-lib.
+                            _base = _wxr.relabel_long_adlibs(_base)
+                            # ORDER MATTERS: split merged lines at musical pauses
+                            # (word-gaps) BEFORE correcting text. Whisper merges e.g.
+                            # "Tomás del miedo tu don, frágil espejo de vos" into one
+                            # segment; _post_reconcile_cleanup splits it at the internal
+                            # gap so text_correct can name BOTH lines. This is how ROTOR
+                            # separates them. (return_words=True can roughen base TEXT,
+                            # but text_correct overwrites it from the reference anyway.)
+                            _base = _pl._post_reconcile_cleanup(_base)
+                            _corrected = _wxr.text_correct_segments(_base, _canonical)
+                            # Whisper sometimes anchors the first line at 0:00 despite a
+                            # long instrumental intro (operator had to click the editor's
+                            # "corrección automática"). Relocate it to the real vocal
+                            # onset automatically. Pure segment-cadence heuristic; no-ops
+                            # when the first line is already placed sanely.
+                            _corrected, _ = _pl._fix_lrc_first_line_at_zero(_corrected)
+                            logger.info(
+                                "[WC] line-text-correct on Whisper-1 base (%d segs, canonical=%s) — audio-as-truth path",
+                                len(_corrected),
+                                "lrclib" if lyrics_source == "lrclib" else (lyrics_source or "unknown"),
+                            )
+                            return _emit_segments(
+                                _corrected, _WC_WX_REC, reference_lyrics=_canonical,
+                            )
                         _reconciled = _wxr.reconcile(_wx_segs, _canonical)
                         if _reconciled:
                             logger.info("[WC] whisperX reconciled (%d/%d lines, canonical=%s) — audio-as-truth path",
@@ -5106,6 +5561,24 @@ async def _run_transcription_for_job(
                                         len([l for l in _canonical.splitlines() if l.strip()]),
                                         "lrclib" if lyrics_source == "lrclib"
                                         else (lyrics_source or "unknown"))
+                            # Correct timing of segments displaced after an
+                            # invisible adlib block BEFORE stretch-trim fills
+                            # the gap (post_reconcile pass 3). The gap is
+                            # visible here (raw reconciler end-times); after
+                            # stretch-trim it closes to ~80ms.
+                            # Runs in a thread: makes blocking librosa + OpenAI
+                            # calls that would otherwise stall the event loop.
+                            logger.info(
+                                "[WC] gap-cluster: invoking on %d segs, audio=%s",
+                                len(_reconciled), _aa,
+                            )
+                            try:
+                                from whisperx_transcribe import _correct_large_gap_cluster as _clgc
+                                _reconciled = await asyncio.to_thread(
+                                    _clgc, _reconciled, _aa,
+                                )
+                            except Exception as _clgc_err:
+                                logger.warning("[WC] gap-cluster FAILED: %s", _clgc_err)
                             from pipeline import _post_reconcile_cleanup as _prc
                             _reconciled = _prc(_reconciled)
                             return _emit_segments(
@@ -5454,34 +5927,63 @@ async def _run_transcription_for_job(
                                             break
                                     if _first_wx_t is not None:
                                         break
-                                if _pairs and _first_wx_t is not None:
-                                    _offset = _first_wx_t - _pairs[0][0]
-                                    # Sanity: only trust offset if reasonable
-                                    # (<60 s); else assume no offset so we
-                                    # don't shift everything by garbage.
-                                    if abs(_offset) > 60:
-                                        logger.warning("[WC] synced offset out of range (%.1fs) — using 0", _offset)
-                                        _offset = 0.0
-                                    # Build segments: each line spans up
-                                    # to the next line's start − 50 ms.
-                                    for _i, (_t, _txt) in enumerate(_pairs):
-                                        _s_t = round(_t + _offset, 2)
-                                        if _i + 1 < len(_pairs):
-                                            _e_t = round(_pairs[_i + 1][0] + _offset - 0.05, 2)
-                                        else:
-                                            _e_t = round(_s_t + 3.0, 2)
-                                        if _e_t <= _s_t:
-                                            _e_t = _s_t + 0.5
-                                        _sync_segs.append({
-                                            "start": max(0.0, _s_t),
-                                            "end": max(_s_t + 0.1, _e_t),
-                                            "text": _txt,
-                                            "review": True,
-                                        })
-                                    logger.info(
-                                        "[WC] synced direct fallback: %d segs, offset=%+.2fs (first whisperX word @%.2fs vs synced @%.2fs)",
-                                        len(_sync_segs), _offset, _first_wx_t, _pairs[0][0],
+                                if _pairs:
+                                    # Decide offset + trust. When the audio
+                                    # duration matches lrclib's, the synced
+                                    # timeline is for THIS exact version → use
+                                    # offset 0 and TRUST it (no amber review
+                                    # spam). Otherwise anchor whisperX's first
+                                    # word to the first synced line. This fixes
+                                    # the first-word anchor misfiring when
+                                    # whisperX skips a soft intro ad-lib (its
+                                    # "first word" is then a LATER line → a huge
+                                    # bogus offset, e.g. Enanitos "Mi Primer Día
+                                    # Sin Ti": +36 s with every line amber).
+                                    _lrc_dur_val = (
+                                        (lrc or {}).get("duration")
+                                        if isinstance(lrc, dict) else None
                                     )
+                                    _offset, _trust = _lca.synced_offset_decision(
+                                        _audio_dur_for_lrc, _lrc_dur_val,
+                                        _first_wx_t, _pairs[0][0],
+                                    )
+                                    # Only ship a synced timeline when we have a
+                                    # real basis: durations match (trust) OR
+                                    # whisperX gave an anchor. Otherwise leave
+                                    # _sync_segs empty → fall through to whisperX
+                                    # raw (this audio's own word timing).
+                                    if _trust or _first_wx_t is not None:
+                                        # Build segments: each line spans up
+                                        # to the next line's start − 50 ms.
+                                        for _i, (_t, _txt) in enumerate(_pairs):
+                                            _s_t = round(_t + _offset, 2)
+                                            if _i + 1 < len(_pairs):
+                                                _e_t = round(_pairs[_i + 1][0] + _offset - 0.05, 2)
+                                            else:
+                                                _e_t = round(_s_t + 3.0, 2)
+                                            if _e_t <= _s_t:
+                                                _e_t = _s_t + 0.5
+                                            _seg = {
+                                                "start": max(0.0, _s_t),
+                                                "end": max(_s_t + 0.1, _e_t),
+                                                "text": _txt,
+                                            }
+                                            # Trusted (duration-matched) synced is
+                                            # as reliable as the old fast-path —
+                                            # don't flag every line amber. Only the
+                                            # estimated-offset case needs review.
+                                            if not _trust:
+                                                _seg["review"] = True
+                                            _sync_segs.append(_seg)
+                                        logger.info(
+                                            "[WC] synced direct fallback: %d segs, offset=%+.2fs, trust=%s "
+                                            "(audio=%.1fs lrclib=%s; first whisperX word @%s vs synced @%.2fs)",
+                                            len(_sync_segs), _offset, _trust,
+                                            _audio_dur_for_lrc if _audio_dur_for_lrc is not None else -1.0,
+                                            _lrc_dur_val,
+                                            ("%.2f" % _first_wx_t) if _first_wx_t is not None else "n/a",
+                                            _pairs[0][0],
+                                        )
                             except Exception as e:
                                 logger.warning("[WC] synced direct fallback raised: %s — emitting whisperX raw", e)
                         if _sync_segs:
@@ -6866,7 +7368,10 @@ async def generate_with_segments(
         if not song_title:
             song_title = parsed_title
 
-    _enforce_plan_quota(db, current_user)
+    _enforce_plan_quota(db, current_user,
+                        credits_needed=(scenes_credit_cost()
+                                        if enable_scenes and has_scenes_access(current_user)
+                                        else 1))
     _enforce_daily_volume_cap(db, current_user)
     _enforce_tenant_backlog(db, current_user)
     _enforce_disk_capacity()
@@ -7047,7 +7552,7 @@ async def generate_with_segments(
         effect=effect,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
         song_title=song_title,
-        text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
+        text_case=text_case if text_case in ("upper", "title", "lower", "original", "sentence") else "upper",
         font_scale=_font_scale_gen,
         # Deprecados 2026-05-23 (ver primer endpoint /upload).
         lyric_transition="cut",
@@ -7153,6 +7658,11 @@ def status(
         "edits_remaining": max(0, _MAX_EDITS - edit_count),
         "edit_limit_exempt": _is_admin,
         "render_params": job.get("render_params"),
+        # Multi-escena: JobDetail dibuja la tira de corrección por escena desde
+        # `job.scene_plan`. Al abrir por URL/refresh el job viene de ACÁ (no de
+        # la lista), así que sin esto el filmstrip NUNCA aparecía por link (bug
+        # 2026-07-01; #780 solo cubrió el camino "desde la lista").
+        "scene_plan": job.get("scene_plan"),
         # EditRequestPanel reads these to drive the lyrics-edit and
         # typography-edit UIs. segments_json hydrates the inline lyrics
         # editor; bg_r2_key_cached gates the typography mode. Without
@@ -8855,6 +9365,24 @@ async def request_edit(
             status_code=400,
             detail=f"edit_type must be one of {valid_edit_types}",
         )
+    # Escenas (incidente 2026-07-01, job 53b9513225b1): el edit "background"
+    # es del mundo fondo-único — para un job multi-escena generaba UN clip
+    # Veo de 8 s, PISABA bg_r2_key_cached (que era el timeline completo) y
+    # re-renderizaba video+short loopeando esa única escena. El camino
+    # correcto para estos jobs es la regeneración por escena del filmstrip
+    # (edit_type="scene" vía /edit-scene, no consume cupo de edición).
+    if body.edit_type == "background":
+        _sp = job.scene_plan if isinstance(job.scene_plan, dict) else None
+        if _sp and _sp.get("scenes"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Este video usa Escenas: el fondo es un timeline "
+                    "multi-escena. Regenerá la escena que quieras cambiar "
+                    "desde el filmstrip del video (no consume cupo de "
+                    "edición)."
+                ),
+            )
 
     # Status gate. Lyrics and metadata edits accept a wider set of
     # terminal-ish states so users can fix typos/timing on videos that
@@ -9336,6 +9864,18 @@ class RegenerateSceneRequest(BaseModel):
     allow_youtube_drift: bool = False
 
 
+def _scene_reroll_max() -> int:
+    """Cuántos re-rolls gratis por escena antes de frenar (anti-abuso).
+
+    Presupuesto PROPIO del re-roll de escena, separado del _MAX_EDITS de las
+    ediciones caras (letra/fondo). Un re-roll cuesta ~1 clip Veo (~US$0.80),
+    así que es generoso. Env SCENE_REROLL_MAX (default 5). Admin exento."""
+    try:
+        return max(1, int(os.environ.get("SCENE_REROLL_MAX", "5")))
+    except (TypeError, ValueError):
+        return 5
+
+
 @app.post("/jobs/{job_id}/scenes/{recurrence_key}/regenerate")
 async def regenerate_scene(
     job_id: str,
@@ -9346,11 +9886,12 @@ async def regenerate_scene(
 ):
     """Regenera UNA escena del fondo multi-escena y re-renderiza el video.
 
-    Cuesta ~1 clip Veo (~US$0.90) y cuenta como un edit. Sólo la escena pedida
-    toca Veo; las demás re-bajan de la caché R2. Si la escena es recurrente (un
-    coro), regenerarla cambia TODAS sus apariciones (el frontend lo confirma).
+    Cuesta ~1 clip Veo (~US$0.80) y NO consume el cupo de ediciones caras
+    (_MAX_EDITS): tiene su propio presupuesto por escena (SCENE_REROLL_MAX).
+    Sólo la escena pedida toca Veo; las demás re-bajan de la caché R2. Si la
+    escena es recurrente (un coro), regenerarla cambia TODAS sus apariciones.
     """
-    from pipeline import _MAX_EDITS
+    from pipeline import _MAX_EDITS  # sólo para reportar edits_remaining (cupo de ediciones caras); el re-roll NO lo consume
     from database import Job as JobModel, AuditLog
 
     body = body or RegenerateSceneRequest()
@@ -9396,12 +9937,38 @@ async def regenerate_scene(
             "youtube_url": yt_url,
         })
 
-    current_edit_count = job.edit_count or 0
     _is_admin = current_user.get("role") == "admin"
-    if not _is_admin and current_edit_count >= _MAX_EDITS:
+    # Re-roll de escena: presupuesto PROPIO, desacoplado del _MAX_EDITS de las
+    # ediciones caras (letra/fondo). Corregir una escena fea es barato (~1 clip
+    # Veo) y debe ser generoso. Contamos los re-rolls previos de ESTA escena en
+    # el audit log (append-only) — sin columna nueva ni clobber del scene_plan
+    # que el worker reescribe. Cap por escena, env-tunable, admin exento.
+    #
+    # `detail` es JSONB vía TypeDecorator y NO soporta `.astext` en la expresión
+    # SQL (rompía con AttributeError → 500 en CADA re-roll). Filtramos `action`
+    # en SQL (indexado) y matcheamos job_id/recurrence_key en Python: la acción
+    # es manual y poco frecuente, así que el volumen es chico.
+    _prior_rerolls = sum(
+        1
+        for (_d,) in db.query(AuditLog.detail)
+        .filter(AuditLog.action == "job.scene_regenerate")
+        .all()
+        if isinstance(_d, dict)
+        and _d.get("job_id") == job_id
+        and _d.get("recurrence_key") == recurrence_key
+    )
+    _reroll_cap = _scene_reroll_max()
+    # Si la escena AÚN está fallada (ningún clip bueno todavía, se está sirviendo
+    # una escena sustituta), NO aplicar el cap: el operador tiene que poder
+    # seguir intentando arreglarla. El cap solo frena los re-rolls "por gusto" de
+    # una escena que YA salió bien. Antes: N intentos fallidos por un Veo caído
+    # transitorio lockeaban la escena para siempre (audit escrito por intento).
+    _target = next((s for s in plan["scenes"] if s.get("recurrence_key") == recurrence_key), None)
+    _scene_succeeded = (_target or {}).get("status") != "failed"
+    if not _is_admin and _scene_succeeded and _prior_rerolls >= _reroll_cap:
         raise HTTPException(
             status_code=400,
-            detail=f"Llegaste al máximo de ediciones ({_MAX_EDITS}). Aprobá o rechazá el job.",
+            detail=f"Llegaste al máximo de regeneraciones de esta escena ({_reroll_cap}). Editá el prompt o aprobá el job.",
         )
     if not job.input_r2_key:
         raise HTTPException(status_code=422, detail="Audio original no disponible — no se puede re-renderizar.")
@@ -9414,9 +9981,9 @@ async def regenerate_scene(
         "scene_movement": _mv if _mv in ("estatico", "sutil", "dinamico") else "",
     }
 
-    new_edit_count = current_edit_count + 1
+    # Nota: el re-roll de escena NO incrementa job.edit_count — tiene su propio
+    # cupo (SCENE_REROLL_MAX, contado vía audit log arriba).
     job.status = "editing"
-    job.edit_count = new_edit_count
     job.current_step = "scenes"
     job.progress = 0
     job.editing_started_at = datetime.now(timezone.utc)
@@ -9424,7 +9991,7 @@ async def regenerate_scene(
         user_id=current_user["id"],
         action="job.scene_regenerate",
         detail={"job_id": job_id, "recurrence_key": recurrence_key,
-                "edit_params": edit_params, "edit_count": new_edit_count},
+                "edit_params": edit_params, "reroll_index": _prior_rerolls + 1},
     ))
     db.commit()
 
@@ -9439,7 +10006,7 @@ async def regenerate_scene(
     except Exception as exc:
         logger.error("enqueue_edit (scene) failed for %s: %s", job_id, exc)
         job.status = "pending_review"
-        job.edit_count = current_edit_count
+        # el re-roll de escena no tocó edit_count → nada que revertir acá
         job.editing_started_at = None
         job.progress = 100
         job.current_step = "thumbnail"
@@ -9450,9 +10017,13 @@ async def regenerate_scene(
         "ok": True,
         "job_id": job_id,
         "recurrence_key": recurrence_key,
-        "edit_count": new_edit_count,
-        "edits_remaining": max(0, _MAX_EDITS - new_edit_count),
+        # El re-roll de escena NO consume el cupo de ediciones; edit_count va sin
+        # cambios. Reportamos el cupo general (para el editor) + el índice de
+        # re-roll de esta escena.
+        "edit_count": job.edit_count or 0,
+        "edits_remaining": max(0, _MAX_EDITS - (job.edit_count or 0)),
         "edit_limit_exempt": _is_admin,
+        "reroll_count": _prior_rerolls + 1,
     }
 
 
@@ -11485,6 +12056,211 @@ async def admin_list_change_requests(
         "items": items,
         "pending_count": pending_count,
         "resolved_count": resolved_count,
+    }
+
+
+class CreditGrantRequest(BaseModel):
+    """Body para emitir créditos de regalo (promos)."""
+    scope: str = "all"                       # "all" | "tenant" | "billing_group"
+    tenant_id: str | None = None
+    billing_group: str | None = None
+    amount: int | None = None                # scope tenant/billing_group: monto explícito
+    paid_amount: int | None = None           # scope "all": monto a planes pagos
+    free_amount: int | None = None           # scope "all": monto a plan free
+    ttl_days: int | None = None
+    reason: str = "escenas_launch"
+    dry_run: bool = False
+
+
+@app.get("/admin/credit-grants")
+async def admin_list_credit_grants(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Lista los créditos de regalo emitidos (persistidos), para el panel admin.
+    Admin only. Devuelve los grants más recientes + un resumen de los activos."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    now = datetime.now(timezone.utc)
+
+    def _active(g):
+        if g.revoked:
+            return False
+        if g.expires_at is None:
+            return True
+        exp = g.expires_at if g.expires_at.tzinfo else g.expires_at.replace(tzinfo=timezone.utc)
+        return exp > now
+
+    rows = (
+        db.query(CreditGrant)
+        .order_by(CreditGrant.granted_at.desc())
+        .limit(200)
+        .all()
+    )
+    items, active_accounts, active_credits, by_reason = [], 0, 0, {}
+    for g in rows:
+        is_active = _active(g)
+        if is_active:
+            active_accounts += 1
+            active_credits += g.amount or 0
+            by_reason[g.reason] = by_reason.get(g.reason, 0) + 1
+        d = g.to_dict()
+        d["active"] = is_active
+        items.append(d)
+
+    # Cuentas para el selector del panel: una CUENTA = billing_group (si existe)
+    # o tenant. Así el operador puede dirigir el regalo a la cuenta madre (ej.
+    # Universal) en vez de a cada usuario. El conteo es la cantidad de usuarios
+    # activos que comparten ese pool.
+    _accs = {}
+    for _tenant, _bg in (
+        db.query(User.tenant_id, User.billing_group)
+        .filter(User.is_active == True)  # noqa: E712
+        .all()
+    ):
+        key = ("billing_group", _bg) if _bg else ("tenant", _tenant)
+        _accs[key] = _accs.get(key, 0) + 1
+    accounts = [
+        {"type": _t, "id": _v, "users": _n}
+        for (_t, _v), _n in sorted(_accs.items(), key=lambda kv: -kv[1])
+    ]
+
+    return {
+        "items": items,
+        "summary": {
+            "active_accounts": active_accounts,
+            "active_credits": active_credits,
+            "by_reason": by_reason,
+        },
+        "accounts": accounts,
+    }
+
+
+@app.post("/admin/credit-grants")
+async def admin_create_credit_grants(
+    body: CreditGrantRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Emitir créditos de regalo (promos como el lanzamiento de Escenas). Admin only.
+
+    - scope="all": siembra UN grant por CUENTA (billing_group si existe, si no
+      tenant) entre los usuarios activos. Monto por plan: free → free_amount,
+      resto → paid_amount. Idempotente por `reason`: no re-otorga si la cuenta
+      ya tiene un grant activo con ese reason.
+    - scope="tenant" / "billing_group": un grant puntual con `amount`.
+
+    Defaults por env: LAUNCH_CREDITS_PAID (30), LAUNCH_CREDITS_FREE (6),
+    LAUNCH_CREDITS_TTL_DAYS (30). `dry_run=true` devuelve el plan sin escribir.
+
+    El medidor (/usage) refleja el grant dentro de ~30 s (TTL del cache).
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    def _env_int(name, dflt):
+        # Un env mal seteado (no numérico) NO debe tumbar el endpoint con 500.
+        try:
+            return int(os.environ.get(name, str(dflt)))
+        except (TypeError, ValueError):
+            return dflt
+
+    paid = body.paid_amount if body.paid_amount is not None else _env_int("LAUNCH_CREDITS_PAID", 30)
+    free = body.free_amount if body.free_amount is not None else _env_int("LAUNCH_CREDITS_FREE", 6)
+    ttl_days = body.ttl_days if body.ttl_days is not None else _env_int("LAUNCH_CREDITS_TTL_DAYS", 30)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=ttl_days) if ttl_days and ttl_days > 0 else None
+    reason = (body.reason or "escenas_launch").strip()
+
+    def _has_active_grant(_bg, _tn):
+        q = db.query(CreditGrant).filter(
+            CreditGrant.reason == reason,
+            CreditGrant.revoked.is_(False),
+        )
+        if _bg:
+            q = q.filter(CreditGrant.billing_group == _bg)
+        else:
+            q = q.filter(CreditGrant.tenant_id == _tn, CreditGrant.billing_group.is_(None))
+        # SQLite devuelve expires_at naive; normalizar antes de comparar con `now`.
+        return any(
+            g.expires_at is None
+            or (g.expires_at if g.expires_at.tzinfo else g.expires_at.replace(tzinfo=timezone.utc)) > now
+            for g in q.all()
+        )
+
+    created, skipped, preview = 0, 0, []
+
+    if body.scope == "all":
+        # Una CUENTA = billing_group (si existe) o tenant. Agrupamos usuarios
+        # activos por esa clave; el monto sale del plan (free vs pago).
+        users = db.query(User).filter(User.is_active == True).all()  # noqa: E712
+        accounts = {}
+        for u in users:
+            key = ("bg", u.billing_group) if u.billing_group else ("tn", u.tenant_id)
+            acc = accounts.setdefault(key, {
+                "billing_group": u.billing_group,
+                "tenant_id": None if u.billing_group else u.tenant_id,
+                "all_free": True,
+            })
+            if (u.plan_id or "").lower() != "free":
+                acc["all_free"] = False
+        for acc in accounts.values():
+            amount = free if acc["all_free"] else paid
+            if amount <= 0 or _has_active_grant(acc["billing_group"], acc["tenant_id"]):
+                skipped += 1
+                continue
+            preview.append({"billing_group": acc["billing_group"],
+                            "tenant_id": acc["tenant_id"], "amount": amount})
+            if not body.dry_run:
+                db.add(CreditGrant(
+                    billing_group=acc["billing_group"], tenant_id=acc["tenant_id"],
+                    amount=amount, reason=reason, granted_by=current_user["id"],
+                    granted_at=now, expires_at=expires_at,
+                ))
+                created += 1
+    else:
+        bg = (body.billing_group or "").strip() or None
+        tn = (body.tenant_id or "").strip() or None
+        if body.scope == "billing_group" and not bg:
+            raise HTTPException(status_code=400, detail="billing_group required")
+        if body.scope == "tenant" and not tn:
+            raise HTTPException(status_code=400, detail="tenant_id required")
+        if bg:
+            tn = None  # un grant es de billing_group XOR tenant
+        amount = body.amount if body.amount is not None else paid
+        if amount <= 0:
+            raise HTTPException(status_code=400, detail="amount must be > 0")
+        if _has_active_grant(bg, tn):
+            skipped += 1
+        else:
+            preview.append({"billing_group": bg, "tenant_id": tn, "amount": amount})
+            if not body.dry_run:
+                db.add(CreditGrant(
+                    billing_group=bg, tenant_id=tn, amount=amount, reason=reason,
+                    granted_by=current_user["id"], granted_at=now, expires_at=expires_at,
+                ))
+                created += 1
+
+    if not body.dry_run and created:
+        db.add(AuditLog(
+            user_id=current_user["id"],
+            action="admin.credit_grants",
+            detail={"reason": reason, "scope": body.scope, "created": created,
+                    "skipped": skipped,
+                    "expires_at": expires_at.isoformat() if expires_at else None},
+        ))
+        db.commit()
+
+    return {
+        "ok": True,
+        "created": created,
+        "skipped": skipped,
+        "dry_run": body.dry_run,
+        "amount_paid": paid,
+        "amount_free": free,
+        "ttl_days": ttl_days,
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "preview": preview[:50],
     }
 
 

@@ -95,6 +95,16 @@ _AWAITING_UPLOAD_TTL_MIN = int(os.environ.get(
     "REAPER_AWAITING_UPLOAD_TTL_MIN", "20",
 ))
 
+# Cada cuánto correr el sweep de multiparts huérfanos en R2. El pass del
+# reaper es cada 5 min; listar multiparts en cada pass sería ruido — los
+# huérfanos se acumulan lento (complete fallido, abort ignorado,
+# supersede mid-upload) y el umbral de edad del sweep es 24 h, así que
+# 6 h de cadencia alcanza de sobra.
+_MULTIPART_SWEEP_INTERVAL_S = int(os.environ.get(
+    "REAPER_MULTIPART_SWEEP_INTERVAL_S", str(6 * 3600),
+))
+_last_multipart_sweep_ts = 0.0
+
 # Edit-request abandon threshold. The worst case is a background edit
 # which re-runs Veo (~3 min p99) plus the full video composite (~5-8 min
 # for a 4-min song). 30 min gives 2-3× headroom over the slowest healthy
@@ -145,6 +155,16 @@ _TRANSCRIPTION_STUCK_THRESHOLD_MIN = int(os.environ.get(
 # healthy phase.
 _STALLED_RENDER_THRESHOLD_MIN = int(os.environ.get(
     "REAPER_STALLED_RENDER_THRESHOLD_MIN", "20",
+))
+
+# Recordatorio de review pendiente. Un render con REQUIRE_REVIEW termina en
+# pending_review y es invisible hasta que el operador lo aprueba. Caso real
+# (UMG Chile, 2026-06-25): el primer video de una operadora quedó 8 días
+# esperando — para ella la app "no funcionó" y no volvió a entrar. Este
+# sweep manda UN email por job (dedupe por AuditLog) cuando lleva 48 h+
+# sin revisar. 0 = deshabilitado.
+_REVIEW_REMINDER_THRESHOLD_H = int(os.environ.get(
+    "REVIEW_REMINDER_THRESHOLD_H", "48",
 ))
 
 # Ops inbox for the reaper digest. This is an INTERNAL operations alert
@@ -282,6 +302,39 @@ def find_abandoned_uploads(
     )
 
 
+def upload_still_active(job: Job, ttl_min: int = _AWAITING_UPLOAD_TTL_MIN) -> bool:
+    """True when an awaiting_upload job's multipart upload shows recent
+    part activity on R2 — i.e. the browser is still PUTting.
+
+    The TTL in find_abandoned_uploads is anchored to created_at and
+    NOTHING renews it during a healthy upload (parts are batch-presigned
+    at init; the browser only talks to R2). Before this guard, a 150 MB
+    WAV on a slow uplink (>20 min wallclock) got its job deleted and its
+    multipart aborted MID-UPLOAD — the user lost the whole transfer,
+    sometimes at 100%. R2's per-part LastModified is the only liveness
+    signal available, so we ask R2 directly.
+
+    Only meaningful for in-flight multiparts. Single-PUT jobs (<16 MB,
+    minutes at worst) and completed multiparts (upload_id cleared) fall
+    through to the normal TTL, which is correct for them.
+    """
+    if not (job.multipart_upload_id and job.input_r2_key):
+        return False
+    try:
+        import storage as _storage
+        last = _storage.multipart_last_activity(
+            job.input_r2_key, job.multipart_upload_id,
+        )
+    except Exception:
+        return False
+    if last is None:
+        # No parts yet / upload gone / listing failed: no liveness
+        # evidence — let the created_at TTL decide (reap).
+        return False
+    age_s = (datetime.now(timezone.utc) - last).total_seconds()
+    return age_s < ttl_min * 60
+
+
 def find_stalled_renders(
     db: Session,
     threshold_min: int = _STALLED_RENDER_THRESHOLD_MIN,
@@ -370,6 +423,95 @@ def find_stuck_transcriptions(
         .order_by(anchor.asc())
         .all()
     )
+
+
+def remind_stale_pending_review(db: Session,
+                                threshold_h: int = _REVIEW_REMINDER_THRESHOLD_H) -> int:
+    """Email the owner of every job sitting in pending_review for 48 h+.
+
+    Una sola vez por job: el envío queda registrado en AuditLog
+    (action="job.review_reminder") y el sweep salta los ya recordados.
+    Respeta el opt-out explícito de notif_jobs (Settings); en ese caso
+    igual registra el AuditLog para no re-escanear el job cada ciclo.
+    Best-effort: cualquier excepción por job se loguea y no corta el pass.
+    Returns: cantidad de emails enviados.
+    """
+    if threshold_h <= 0:
+        return 0
+    from database import User, UserSettings
+    import emails as _emails
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=threshold_h)
+    stale = (
+        db.query(Job)
+        .filter(Job.status == "pending_review")
+        .filter(Job.created_at < cutoff)
+        .order_by(Job.created_at.asc())
+        .limit(50)
+        .all()
+    )
+    if not stale:
+        return 0
+
+    # Jobs ya recordados. El volumen es mínimo (un email por job atascado,
+    # jamás cientos), así que filtrar en Python evita depender de operadores
+    # JSON portables entre Postgres y SQLite.
+    already = set()
+    for (detail,) in (
+        db.query(AuditLog.detail)
+        .filter(AuditLog.action == "job.review_reminder")
+        .all()
+    ):
+        if isinstance(detail, dict) and detail.get("job_id"):
+            already.add(detail["job_id"])
+
+    sent = 0
+    for job in stale:
+        if job.job_id in already:
+            continue
+        try:
+            user = db.query(User).filter(User.id == job.user_id).first()
+            settings = (
+                db.query(UserSettings).filter(UserSettings.user_id == job.user_id).first()
+                if user else None
+            )
+            prefs = (settings.settings_json or {}) if settings else {}
+            wants_email = bool(user and user.email) and prefs.get("notif_jobs", True)
+
+            created = job.created_at
+            if created is not None and created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            days = max(1, (now - created).days) if created else 1
+
+            if wants_email:
+                _emails.send_review_reminder(
+                    email=user.email,
+                    username=user.username,
+                    artist=job.artist or "",
+                    song=job.song_title or job.filename or "",
+                    job_id=job.job_id,
+                    days_waiting=days,
+                )
+                sent += 1
+            db.add(AuditLog(
+                user_id=job.user_id,
+                action="job.review_reminder",
+                detail={
+                    "job_id": job.job_id,
+                    "days_waiting": days,
+                    "emailed": wants_email,
+                },
+            ))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.warning(
+                "[REAPER] review reminder %s failed: %s", job.job_id, e,
+            )
+    if sent:
+        logger.info("[REAPER] sent %d pending_review reminder(s)", sent)
+    return sent
 
 
 def _reason_for_transcription(job: Job) -> str:
@@ -1036,6 +1178,22 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
         # never reaped while the upload sweep kept logging success — a
         # batch failure swallowing the transcribed cleanup. Per-job
         # isolation + a logged reason prevents the silent pile-up.
+        # Sweep de multiparts huérfanos en R2 (throttled). Corre acá
+        # adentro porque reap_all_stuck ya coordina multi-replica con el
+        # advisory lock — sin esto, N replicas listarían/abortarían en
+        # paralelo. La operación es idempotente igual (abort de un
+        # upload ya abortado falla inofensivo), el lock solo evita ruido.
+        global _last_multipart_sweep_ts
+        if time.time() - _last_multipart_sweep_ts >= _MULTIPART_SWEEP_INTERVAL_S:
+            _last_multipart_sweep_ts = time.time()
+            try:
+                import storage as _storage_sweep
+                _rep = _storage_sweep.abort_stale_multipart_uploads()
+                if _rep.get("scanned") or _rep.get("aborted"):
+                    logger.info("[REAPER] stale multipart sweep: %s", _rep)
+            except Exception as e:
+                logger.warning("[REAPER] stale multipart sweep failed: %s", e)
+
         _n_tr = _n_up = _n_ed = 0
         for job in abandoned:
             try:
@@ -1047,6 +1205,13 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
                 logger.warning("[REAPER] reap transcribed %s failed: %s", job.job_id, e)
         for job in abandoned_uploads:
             try:
+                if upload_still_active(job):
+                    logger.info(
+                        "[REAPER] upload %s past TTL but parts still "
+                        "landing on R2 — skipping this cycle",
+                        job.job_id,
+                    )
+                    continue
                 _delete_abandoned_upload(db, job)
                 db.commit()
                 _n_up += 1
@@ -1091,6 +1256,14 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
                 "[REAPER] flipped %d stuck transcription(s) to transcription_failed",
                 _n_tx,
             )
+        # Recordatorios de review pendiente. Corre acá adentro (bajo el
+        # advisory lock, una vez por ciclo) para no duplicar emails con
+        # multi-replica. Best-effort: nunca aborta el pass de reaping.
+        try:
+            remind_stale_pending_review(db)
+        except Exception as e:
+            db.rollback()
+            logger.warning("[REAPER] review reminder sweep failed: %s", e)
         if not stuck and not orphans and not stalled:
             return 0
         # reap_stuck_job returns False when its in-function race guard

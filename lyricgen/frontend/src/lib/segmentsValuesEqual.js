@@ -20,22 +20,25 @@
 
 const EPSILON_S = 1e-3;
 
+// Sort by start time before comparing. The backend sorts segments by `start`
+// on every /save-segments write (#184), so after a split or overlap edit the
+// local array can be in a different order than the server response. A purely
+// positional comparison saw them as "different content" and reseeded on every
+// autosave cycle → [reseed-storm] / rows remounting in a loop (Sentry #7560982997).
+const _byStart = (x, y) => (Number(x.start) || 0) - (Number(y.start) || 0);
+
 export function segmentsValuesEqual(a, b) {
   if (a === b) return true;
   if (!Array.isArray(a) || !Array.isArray(b)) return false;
   if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    const sa = a[i] || {};
-    const sb = b[i] || {};
-    const startA = Number(sa.start) || 0;
-    const startB = Number(sb.start) || 0;
-    if (Math.abs(startA - startB) > EPSILON_S) return false;
-    const endA = Number(sa.end) || 0;
-    const endB = Number(sb.end) || 0;
-    if (Math.abs(endA - endB) > EPSILON_S) return false;
-    const textA = String(sa.text || "");
-    const textB = String(sb.text || "");
-    if (textA !== textB) return false;
+  const sa = [...a].sort(_byStart);
+  const sb = [...b].sort(_byStart);
+  for (let i = 0; i < sa.length; i++) {
+    const segA = sa[i] || {};
+    const segB = sb[i] || {};
+    if (Math.abs((Number(segA.start) || 0) - (Number(segB.start) || 0)) > EPSILON_S) return false;
+    if (Math.abs((Number(segA.end) || 0) - (Number(segB.end) || 0)) > EPSILON_S) return false;
+    if (String(segA.text || "") !== String(segB.text || "")) return false;
   }
   return true;
 }

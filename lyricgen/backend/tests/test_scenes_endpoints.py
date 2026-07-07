@@ -19,10 +19,13 @@ def test_auth_me_returns_features_scenes_admin(client, admin_token):
     assert "telemetry" in body["features"]
 
 
-def test_auth_me_features_scenes_false_for_plain_user(client, user_token):
+def test_auth_me_features_scenes_false_for_plain_user(client, user_token, monkeypatch):
+    # Rollback (SCENES_GLOBALLY_ENABLED=0): un user común sin allowlist NO es
+    # elegible. Con el flag en ON (default) Escenas es PÚBLICO — ver
+    # test_scenes_credits.py.
+    monkeypatch.setenv("SCENES_GLOBALLY_ENABLED", "0")
     r = client.get("/auth/me", headers={"Authorization": f"Bearer {user_token}"})
     assert r.status_code == 200
-    # Default (SCENES_ENABLED_TENANTS vacío) → un user común NO es elegible.
     assert r.json()["features"]["scenes"] is False
 
 
@@ -58,11 +61,12 @@ def _hdr(tok):
 
 def test_regen_scene_403_for_non_eligible(client, user_token, db, monkeypatch):
     import main
+    monkeypatch.setenv("SCENES_GLOBALLY_ENABLED", "0")  # rollback: gating activo
     monkeypatch.setattr(main, "enqueue_edit", lambda **k: "edit:fake")
     me = client.get("/auth/me", headers=_hdr(user_token)).json()
     jid = _make_scene_job(db, me["tenant_id"])
     r = client.post(f"/jobs/{jid}/scenes/coro_1/regenerate", headers=_hdr(user_token), json={})
-    assert r.status_code == 403  # user común no tiene has_scenes_access
+    assert r.status_code == 403  # user común no tiene has_scenes_access (modo rollback)
 
 
 def test_regen_scene_404_unknown_key(client, admin_token, db, monkeypatch):
@@ -118,7 +122,10 @@ def test_regen_scene_409_youtube_drift(client, admin_token, db, monkeypatch):
     assert r2.status_code == 200
 
 
-def test_regen_scene_happy_increments_edit_count(client, admin_token, db, monkeypatch):
+def test_regen_scene_happy_does_not_touch_edit_count(client, admin_token, db, monkeypatch):
+    """El re-roll de escena NO consume el cupo de ediciones caras (_MAX_EDITS):
+    tiene su propio cupo (SCENE_REROLL_MAX). edit_count queda igual; la respuesta
+    trae `reroll_count`."""
     from database import Job as JobModel
     import main
     captured = {}
@@ -129,12 +136,13 @@ def test_regen_scene_happy_increments_edit_count(client, admin_token, db, monkey
                     json={"hint": "más oscuro", "movement_style": "sutil"})
     assert r.status_code == 200
     body = r.json()
-    assert body["edit_count"] == 1
+    assert body["edit_count"] == 0          # NO toca el cupo de ediciones caras
+    assert body["reroll_count"] == 1        # su propio contador
     assert captured["edit_params"]["scene_hint"] == "más oscuro"
     assert captured["edit_params"]["scene_movement"] == "sutil"
     db.expire_all()
     fresh = db.query(JobModel).filter(JobModel.job_id == jid).first()
-    assert fresh.edit_count == 1 and fresh.status == "editing"
+    assert fresh.edit_count == 0 and fresh.status == "editing"
 
 
 def _make_retry_job(db, tenant_id, user_id, *, enable_scenes=True):
@@ -153,8 +161,13 @@ def _make_retry_job(db, tenant_id, user_id, *, enable_scenes=True):
 
 def test_retry_gates_enable_scenes_for_non_eligible(client, user_token, db, monkeypatch):
     """Audit A5: un user sin acceso reintenta un job multi-escena → enable_scenes
-    se fuerza a False (no debe seguir generando multi-escena ni su costo)."""
+    se fuerza a False (no debe seguir generando multi-escena ni su costo).
+
+    Modo rollback (SCENES_GLOBALLY_ENABLED=0): el gating por elegibilidad está
+    activo. Con el flag en ON (default) Escenas es público y el costo lo
+    gobiernan los créditos."""
     import main
+    monkeypatch.setenv("SCENES_GLOBALLY_ENABLED", "0")
     captured = {}
     monkeypatch.setattr(main, "enqueue_pipeline", lambda **k: captured.update(k) or "thread:fake")
     me = client.get("/auth/me", headers=_hdr(user_token)).json()
@@ -205,3 +218,53 @@ def test_scenes_thumbs_ownership_and_shape(client, admin_token, db):
     # job de otro tenant → 404
     other = _make_scene_job(db, "tenant_ajeno")
     assert client.get(f"/jobs/{other}/scenes/thumbs", headers=_hdr(admin_token)).status_code == 404
+
+
+def test_jobs_list_includes_scene_plan(client, admin_token, db):
+    """La lista /jobs DEBE traer scene_plan: JobDetail recibe el job desde la
+    lista (prop) y sin scene_plan la tira de corrección de escenas nunca
+    aparece (bug 2026-06-30 — to_list_dict lo omitía)."""
+    me = client.get("/auth/me", headers=_hdr(admin_token)).json()
+    jid = _make_scene_job(db, me["tenant_id"], user_id=me["id"])
+    rows = client.get("/jobs", headers=_hdr(admin_token)).json()
+    mine = [j for j in rows if j["job_id"] == jid]
+    assert len(mine) == 1
+    sp = mine[0].get("scene_plan")
+    assert sp and sp.get("scenes"), "el job de escenas debe traer scene_plan.scenes en la lista"
+
+
+def test_status_includes_scene_plan(client, admin_token, db):
+    """Al abrir un video por URL/refresh, JobDetail toma el job de /status/{id}
+    (no de la lista). Sin scene_plan acá, la tira de corrección NUNCA aparece por
+    link (bug 2026-07-01; #780 solo cubrió el camino desde la lista)."""
+    me = client.get("/auth/me", headers=_hdr(admin_token)).json()
+    jid = _make_scene_job(db, me["tenant_id"], user_id=me["id"])
+    r = client.get(f"/status/{jid}", headers=_hdr(admin_token))
+    assert r.status_code == 200, r.text
+    sp = r.json().get("scene_plan")
+    assert sp and sp.get("scenes"), "/status debe traer scene_plan.scenes en un job de escenas"
+
+
+def test_regen_failed_scene_not_capped(client, user_token, db, monkeypatch):
+    """Una escena AÚN fallada NO se bloquea por el cap de re-rolls: el operador
+    tiene que poder seguir intentando arreglarla. Antes: N fallos por un Veo
+    caído transitorio la lockeaban para siempre (auditoría escrita por intento)."""
+    import main
+    from database import Job as JobModel, AuditLog
+    monkeypatch.setenv("SCENE_REROLL_MAX", "2")
+    monkeypatch.setattr(main, "enqueue_edit", lambda **k: "edit:fake")
+    me = client.get("/auth/me", headers=_hdr(user_token)).json()
+    jid = _make_scene_job(db, me["tenant_id"], user_id=me["id"])
+    # La escena coro_1 quedó FALLADA (se sirve una sustituta).
+    job = db.query(JobModel).filter(JobModel.job_id == jid).first()
+    _sp = dict(job.scene_plan)
+    _sp["scenes"] = [{**s, "status": "failed"} for s in _sp["scenes"]]
+    job.scene_plan = _sp
+    db.commit()
+    # Ya hay 3 re-rolls previos (por encima del cap=2).
+    for _ in range(3):
+        db.add(AuditLog(action="job.scene_regenerate",
+                        detail={"job_id": jid, "recurrence_key": "coro_1"}))
+    db.commit()
+    r = client.post(f"/jobs/{jid}/scenes/coro_1/regenerate", headers=_hdr(user_token), json={})
+    assert r.status_code == 200, r.text  # NO bloqueado: la escena sigue fallada

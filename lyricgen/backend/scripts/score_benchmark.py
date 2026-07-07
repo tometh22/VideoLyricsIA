@@ -75,32 +75,53 @@ def _jaccard(a: str, b: str) -> float:
 
 
 def _aoo(ground: list[dict], output: list[dict]) -> tuple[float, float, int]:
-    """For each output segment, find best-match in ground by text and
-    compute absolute start-time offset. Returns (mean_offset, p95_offset, matched_count)."""
+    """Greedy ONE-TO-ONE onset match. Output segments (in time order) each
+    claim the closest-start ground-truth line whose text matches (Jaccard
+    >= 0.4) and isn't already claimed.
+
+    One-to-one matching fixes the repeated-chorus inflation of the old naive
+    matcher: a chorus sung 7x would otherwise all match GT occurrence #1,
+    manufacturing huge fake offsets (a real bug seen on "No Hay Santos" where
+    p95 read 77s). Returns (mean_offset, p95_offset, matched_count)."""
+    taken: set[int] = set()
     offsets: list[float] = []
-    for out_seg in output:
+    for out_seg in sorted(output, key=lambda s: float(s.get("start", 0) or 0)):
         out_text = (out_seg.get("text") or "").strip()
         if not out_text:
             continue
-        best_match = None
-        best_score = 0.0
-        for gt in ground:
-            score = _jaccard(out_text, gt.get("text") or "")
-            if score > best_score:
-                best_score = score
-                best_match = gt
-        if best_match is None or best_score < 0.4:
+        cand: list[tuple[float, int]] = []
+        for i, gt in enumerate(ground):
+            if i in taken:
+                continue
+            if _jaccard(out_text, gt.get("text") or "") >= 0.4:
+                try:
+                    cand.append((abs(float(out_seg["start"]) - float(gt["start"])), i))
+                except (KeyError, TypeError, ValueError):
+                    continue
+        if not cand:
             continue
-        try:
-            offset = abs(float(out_seg["start"]) - float(best_match["start"]))
-            offsets.append(offset)
-        except (KeyError, TypeError, ValueError):
-            continue
+        cand.sort()
+        off, idx = cand[0]
+        taken.add(idx)
+        offsets.append(off)
     if not offsets:
         return (0.0, 0.0, 0)
     offsets_sorted = sorted(offsets)
     p95 = offsets_sorted[max(0, int(len(offsets_sorted) * 0.95) - 1)]
     return (mean(offsets), p95, len(offsets))
+
+
+def _recall(ground: list[dict], output: list[dict]) -> float:
+    """Fraction of ground-truth lines that have a text match (Jaccard >= 0.4)
+    somewhere in the output. Catches DROPPED lines and collapse — failures
+    that WER (which compares concatenated text) can mask."""
+    if not ground:
+        return 0.0
+    hit = sum(
+        1 for gt in ground
+        if any(_jaccard(gt.get("text") or "", o.get("text") or "") >= 0.4 for o in output)
+    )
+    return hit / len(ground)
 
 
 def _composite(wer: float, aoo_mean: float) -> float:
@@ -123,6 +144,7 @@ def score_job(job_dir: Path) -> dict | None:
             "wer": b_wer,
             "aoo_mean_s": b_aoo_mean,
             "aoo_p95_s": b_aoo_p95,
+            "recall": _recall(ground, baseline),
             "segments": len(baseline),
             "matched": b_matched,
             "composite": _composite(b_wer, b_aoo_mean),
@@ -134,6 +156,7 @@ def score_job(job_dir: Path) -> dict | None:
             "wer": i_wer,
             "aoo_mean_s": i_aoo_mean,
             "aoo_p95_s": i_aoo_p95,
+            "recall": _recall(ground, improvement),
             "segments": len(improvement),
             "matched": i_matched,
             "composite": _composite(i_wer, i_aoo_mean),

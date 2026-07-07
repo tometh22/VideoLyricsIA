@@ -25,12 +25,17 @@ from tests.conftest import auth
 _T = "tenant_dedup_test"
 
 
-def _seed(db, *, job_id, status, filename, age_min, user_id=1):
+def _seed(db, *, job_id, status, filename, age_min, user_id=1, active_min_ago=None):
+    now = datetime.now(timezone.utc)
     db.add(Job(
         job_id=job_id, user_id=user_id, tenant_id=_T, artist="A",
         filename=filename, style="oscuro", status=status,
         delivery_profile="youtube",
-        created_at=datetime.now(timezone.utc) - timedelta(minutes=age_min),
+        created_at=now - timedelta(minutes=age_min),
+        # active_min_ago simulates a real lyric edit (POST /save-segments bumps
+        # last_user_activity_at); None = never touched (accidental dupe).
+        last_user_activity_at=(None if active_min_ago is None
+                               else now - timedelta(minutes=active_min_ago)),
     ))
     db.commit()
 
@@ -72,6 +77,51 @@ def test_supersede_keeps_out_of_window_sibling():
         )
         assert n == 0
         assert "oldretest" in _ids(db)
+    finally:
+        _cleanup(db); db.close()
+
+
+def test_supersede_keeps_actively_edited_sibling():
+    """A sibling the operator is actively EDITING must NOT be superseded.
+
+    Incident 2026-06-26: re-uploading the same audio deleted the in-progress
+    draft the operator was editing → wizard showed "Job not found." + the edits
+    were lost. last_user_activity_at is bumped only on /save-segments, so a
+    recent value means "they're working on this one".
+    """
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        _seed(db, job_id="keepedit", status="awaiting_upload", filename="song.mp3", age_min=1)
+        # Sibling created 3 min ago AND edited 1 min ago → the active draft.
+        _seed(db, job_id="beingedited", status="transcribed_pending",
+              filename="song.mp3", age_min=3, active_min_ago=1)
+        n = supersede_sibling_drafts(
+            db, keep_job_id="keepedit", user_id=1, tenant_id=_T, filename="song.mp3",
+        )
+        assert n == 0
+        assert "beingedited" in _ids(db)  # the edited draft survives
+    finally:
+        _cleanup(db); db.close()
+
+
+def test_supersede_still_deletes_old_untouched_sibling_with_stale_activity():
+    """The guard only protects RECENT activity — a draft last edited long ago
+    (outside active_within_min) is still a dedup-able orphan."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        _seed(db, job_id="keepstale", status="awaiting_upload", filename="song.mp3", age_min=5)
+        # Created 15 min ago, last edited 14 min ago → outside the 20-min window? no,
+        # within created-window but its activity is older than active_within_min=10.
+        _seed(db, job_id="staleorphan", status="transcribed_pending",
+              filename="song.mp3", age_min=15, active_min_ago=14)
+        n = supersede_sibling_drafts(
+            db, keep_job_id="keepstale", user_id=1, tenant_id=_T,
+            filename="song.mp3", active_within_min=10,
+        )
+        assert n == 1
+        assert _ids(db) == {"keepstale"}
     finally:
         _cleanup(db); db.close()
 

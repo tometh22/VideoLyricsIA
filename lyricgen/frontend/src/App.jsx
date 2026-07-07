@@ -36,12 +36,16 @@ const JobDetail = lazy(() => import("./components/JobDetail"));
 const HistoryView = lazy(() => import("./components/HistoryView"));
 import BatchProgress from "./components/BatchProgress";
 import TranscribingProgress from "./components/TranscribingProgress";
+import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
+import WhatsNewBell from "./components/WhatsNew/WhatsNewBell";
+import GiftCreditsBanner from "./components/GiftCreditsBanner";
 import { useAlert } from "./components/AlertProvider";
 import HelpButton from "./components/HelpCenter/HelpButton";
 import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
 import { translateBackendError } from "./lib/lyricsEditSubmit";
 import { mergeEditedSegments } from "./lib/reviewSegments";
+import { sanitizeSegmentsForSave, findSanitizedDiffs } from "./lib/sanitizeSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
 import { computeFieldDiff, buildEditPayloads } from "./lib/editWizardDiff";
 import { prefetchKey } from "./lib/prefetchKey";
@@ -123,6 +127,7 @@ async function describeFetchError(err, res, t) {
     // body was too large/slow and the edge cut the connection.
     return t("batch.error_network_or_502");
   }
+  if (res.status === 401) return t("batch.error_session_expired");
   if (res.status === 413) return t("batch.error_too_large");
   if (res.status === 408 || res.status === 504) return t("batch.error_timeout");
   if (res.status >= 500) {
@@ -489,6 +494,7 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
             </button>
           </div>
           <div className="flex items-center gap-3">
+            <WhatsNewBell />
             <HelpButton />
             {/* El avatar + nombre vive en UN solo lugar: el bloque de perfil
                 del sidebar (patrón Slack/Linear). El topbar queda para
@@ -521,6 +527,7 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
 
         {/* Content */}
         <main className="relative z-10 px-4 md:px-8 pt-6 md:pt-8 pb-20">
+          <GiftCreditsBanner user={user} />
           <Outlet />
         </main>
       </div>
@@ -1152,9 +1159,9 @@ export default function App() {
   // al audio) SIN causar re-renders del tree de UploadZone a 60fps. El ref
   // se actualiza desde el rAF loop de LyricsEditor; WizardLivePreview lo
   // lee con su propio rAF.
-  const playbackTickRef = useRef({ activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 0 });
-  const handlePlaybackTick = useCallback((line, start, end, time) => {
-    playbackTickRef.current = { activeLine: line, activeStart: start, activeEnd: end, currentTime: time };
+  const playbackTickRef = useRef({ activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 0, words: null });
+  const handlePlaybackTick = useCallback((line, start, end, time, words) => {
+    playbackTickRef.current = { activeLine: line, activeStart: start, activeEnd: end, currentTime: time, words: words || null };
   }, []);
 
   // Phase 2 (2026-05-25): sync de typography settings cuando el operador
@@ -2111,6 +2118,7 @@ export default function App() {
             language: entry.language || "",
             artist: entry.artist || "",
             title: (entry.songTitle || "").trim(),
+            live: !!entry.live,
           }),
           signal: controller && controller.signal,
         }, { maxRetries: 3 });
@@ -2222,7 +2230,7 @@ export default function App() {
     processQueueDirect(jobList);
   };
 
-  const transcribeNext = async (queue, idx) => {
+  const transcribeNext = async (queue, idx, reuseJobId = null) => {
     if (idx >= queue.length) return;
     const entry = queue[idx];
     // Cache key is the file identity (see prefetchKey), NOT the queue index,
@@ -2230,7 +2238,7 @@ export default function App() {
     const key = prefetchKey(entry.file);
 
     // Fast path: a background prefetch already finished for this file.
-    const cached = prefetchCache.current[key];
+    let cached = prefetchCache.current[key];
     if (cached?.status === "ready") {
       const { data, jobId } = cached;
       setTranscribing(false);
@@ -2266,6 +2274,32 @@ export default function App() {
       // Kick off prefetch for all remaining songs.
       prefetchRemaining(queue, idx + 1);
       return;
+    }
+
+    // Audit 2026-07-02 (doble subida): si el prefetch está SUBIENDO
+    // todavía (status="loading" sin jobId — el jobId se setea recién
+    // cuando uploadFileToR2 resuelve), esperar acá a que el upload
+    // avance en vez de caer al slow path. Antes, con subidas de varios
+    // minutos (150 MB), clickear "Revisar" en esa ventana disparaba una
+    // SEGUNDA subida del mismo archivo y supersede_sibling_drafts
+    // borraba el job del prefetch en pleno multipart (part-url 404).
+    if (cached?.status === "loading" && !cached.jobId && !reuseJobId) {
+      setTranscribing(true);
+      setTranscribeError(null);
+      setTranscribeProgress({
+        phase: "uploading", loaded: 0, total: entry.file.size,
+        fileName: entry.file?.name || "",
+      });
+      // Techo generoso (60 min > peor caso de 150 MB en uplink lento +
+      // reintentos); si el cache no progresa para entonces, algo está
+      // realmente trabado y el slow path de abajo ES el retry correcto.
+      const deadline = Date.now() + 60 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 750));
+        const cur = prefetchCache.current[key];
+        if (!cur || cur.status !== "loading" || cur.jobId) break;
+      }
+      cached = prefetchCache.current[key];
     }
 
     // BUG FIX 2026-05-25 (job duplication): si el prefetch del auto-transcribe
@@ -2329,12 +2363,15 @@ export default function App() {
     setTranscribeProgress({ phase: "uploading", loaded: 0, total: entry.file.size });
 
     let transcribeRes = null;
+    let uploadJobId = reuseJobId || null;
     try {
       // Step 1: stream the audio body straight to R2 via a presigned URL.
       // The API container never sees the bytes — that's the whole point
       // of the v2 flow. uploadFileToR2 picks single-PUT or multipart
-      // automatically based on file size.
-      const { jobId: uploadJobId } = await uploadFileToR2(entry.file, {
+      // automatically based on file size. Con reuseJobId (retry tras
+      // fallo de /transcribe-uploaded) el audio YA está en R2 — saltear
+      // la subida entera.
+      if (!uploadJobId) ({ jobId: uploadJobId } = await uploadFileToR2(entry.file, {
         meta: {
           artist: entry.artist || "",
           title: (entry.songTitle || "").trim(),
@@ -2342,7 +2379,7 @@ export default function App() {
         onProgress: (loaded, total) => {
           setTranscribeProgress({ phase: "uploading", loaded, total });
         },
-      });
+      }));
 
       // Step 2: tell the API to fetch the just-uploaded audio from R2,
       // run Whisper / lrclib, return segments. Same shape as the
@@ -2365,6 +2402,7 @@ export default function App() {
           language: entry.language || "",
           artist: entry.artist || "",
           title: (entry.songTitle || "").trim(),
+          live: !!entry.live,
         }),
       }, {
         maxRetries: 3,
@@ -2380,9 +2418,24 @@ export default function App() {
         },
       });
       if (!transcribeRes.ok) {
+        if (transcribeRes.status === 401) {
+          setTranscribing(false);
+          setTranscribeProgress(null);
+          handleLogout("expired");
+          return;
+        }
+        if (reuseJobId && (transcribeRes.status === 404 || transcribeRes.status === 409)) {
+          // El job reusado ya no está (reaper) o cambió de estado —
+          // reintento limpio con subida fresca.
+          return transcribeNext(queue, idx);
+        }
         const reason = await describeFetchError(null, transcribeRes, t);
         setTranscribing(false);
         setTranscribeProgress(null);
+        // El audio ya está en R2: el Retry reusa el job en vez de
+        // volver a subir 150 MB (antes este branch ni seteaba el ctx,
+        // así que el botón Reintentar directamente no aparecía).
+        transcribeRetryCtx.current = { queue, idx, reuseJobId: uploadJobId };
         setTranscribeError(reason);
         return;
       }
@@ -2463,10 +2516,19 @@ export default function App() {
     } catch (err) {
       setTranscribing(false);
       setTranscribeProgress(null);
+      // JWT died mid-flow and the proactive refresh didn't save us (e.g.
+      // tab open >24 h with refresh also expired) → same treatment as the
+      // dashboard 401 interceptors: clean logout to the login screen
+      // instead of an ambiguous banner over a dead session.
+      const status = err?.status ?? err?.response?.status;
+      if (status === 401) {
+        handleLogout("expired");
+        return;
+      }
       // err.response carries the actual HTTP response when uploadFileToR2
       // (or apiPost inside it) threw — transcribeRes is null in that case.
       const reason = await describeFetchError(err, transcribeRes ?? err?.response ?? null, t);
-      transcribeRetryCtx.current = { queue, idx };
+      transcribeRetryCtx.current = { queue, idx, reuseJobId: uploadJobId || null };
       setTranscribeError(reason);
     }
   };
@@ -2489,27 +2551,53 @@ export default function App() {
   // anterior al cambio. Ahora el caller (LyricsEditor) usa el
   // resultado para mover saveStatus a "error" y mostrar un banner +
   // bloquear el botón Aprobar.
-  const persistSegmentsToBackend = useCallback(async (jobId, segments) => {
+  const persistSegmentsToBackend = useCallback(async (jobId, segments, opts = {}) => {
     if (!jobId || !Array.isArray(segments) || segments.length === 0) {
       return { ok: false, reason: "no-data" };
     }
-    // [drag-persist] diagnostic logging — remove after staging confirms
-    // the value-equality fix in LyricsEditor's prop-sync resolves the
-    // regression. Captures the full autosave roundtrip so we can correlate
-    // a "snap back to original" with the exact sequence the user saw.
-    const _sample = segments.slice(0, 2).map((s) => ({
+    // [drag-persist] diagnostic — remove after 2026-07-01 if reseed-storm
+    // stays silent (fix landed in #724). Kept one extra week to confirm.
+    // Sanitise to the backend contract BEFORE the POST. A single out-of-contract
+    // segment (NaN/inverted/out-of-range from a drag or manual time edit) used to
+    // 400 the whole save → saveStatus stuck on "error" → "Aprobar" blocked for the
+    // job (incident 2026-06-26, Universal AR). We clamp so a stray bad value
+    // degrades to "saved, fixable" instead of blocking everything.
+    const safeSegments = sanitizeSegmentsForSave(segments);
+    const _fixed = findSanitizedDiffs(segments, safeSegments);
+    if (_fixed.length) {
+      // Still surface WHAT was out of contract (Sentry [autosave] tag) even
+      // though we no longer fail on it — so we can trace the source edit path.
+      console.warn("[autosave] sanitized out-of-contract segment(s) before save", {
+        jobId, count: _fixed.length, sample: _fixed.slice(0, 3),
+      });
+    }
+    const _sample = safeSegments.slice(0, 2).map((s) => ({
       start: Math.round((s.start || 0) * 1000) / 1000,
       end: Math.round((s.end || 0) * 1000) / 1000,
     }));
-    console.warn("[drag-persist] POST", { jobId, count: segments.length, sample: _sample });
+    console.warn("[drag-persist] POST", { jobId, count: safeSegments.length, sample: _sample });
     try {
       const res = await authFetch(`${API}/jobs/${jobId}/save-segments`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ segments }),
+        body: JSON.stringify({ segments: safeSegments }),
+        // keepalive lets this POST survive a page unload (refresh / tab close).
+        // The unload flush in LyricsEditor sets it so the operator's last,
+        // not-yet-debounced edits aren't canceled mid-flight by the browser
+        // (reporte Gaby 2026-06-24: refrescó para salir del titileo y perdió
+        // TODO). Body cap is 64KB — fine for a lyrics segment list.
+        keepalive: opts.keepalive === true,
       });
       if (!res.ok) {
-        if (res.status !== 404) {
+        if (res.status === 400) {
+          // Post-sanitise this should be unreachable for segment-shape errors,
+          // but if the backend rejects for a reason we don't mirror, capture the
+          // exact `detail` (e.g. "segments[7] start/end out of range") instead of
+          // a bare status — that's what we lacked on 2026-06-26.
+          let detail = "";
+          try { detail = (await res.clone().json())?.detail || ""; } catch { /* non-JSON body */ }
+          console.warn("[autosave] /save-segments rejected 400", detail);
+        } else if (res.status !== 404) {
           // 404 means the job was already reaped — nothing to save against.
           // We log it as a soft warning; the user will see the real error
           // when they click "Crear videos" and /generate returns 404.
@@ -2996,6 +3084,13 @@ export default function App() {
           });
           uploadJobId = result.jobId;
         } catch (err) {
+          // Expired JWT: every remaining row would 401 the same way —
+          // log out (dashboard behavior) instead of painting the whole
+          // batch red with a misleading per-row error.
+          if ((err?.status ?? err?.response?.status) === 401) {
+            handleLogout("expired");
+            return;
+          }
           const reason = await describeFetchError(err, err.response || null, t);
           setJobs((prev) => prev.map((j, idx) =>
             idx === i ? { ...j, status: "error", error: reason } : j
@@ -3696,7 +3791,7 @@ export default function App() {
                     const ctx = transcribeRetryCtx.current;
                     setTranscribeError(null);
                     transcribeRetryCtx.current = null;
-                    transcribeNext(ctx.queue, ctx.idx);
+                    transcribeNext(ctx.queue, ctx.idx, ctx.reuseJobId || null);
                   }}
                   className="text-xs text-brand hover:text-brand-light transition-colors font-medium"
                 >
@@ -3970,6 +4065,7 @@ export default function App() {
     <>
       <RootEffects setUser={setUser} setResetToken={setResetToken} setBillingSuccess={setBillingSuccess} />
       {billingSuccess && <BillingSuccessToast onDismiss={() => setBillingSuccess(false)} />}
+      {user && <WhatsNewModal user={user} />}
       <Routes>
         <Route
           path="/"

@@ -53,24 +53,41 @@ function applyTextCase(text, c) {
   if (c === "upper") return text.toUpperCase();
   if (c === "title") return text.replace(/\b\w/g, (ch) => ch.toUpperCase());
   if (c === "lower") return text.toLowerCase();
+  if (c === "sentence") {
+    return text.toLowerCase().split("\n").map(
+      (ln) => ln.replace(/[a-zà-ÿ]/i, (ch) => ch.toUpperCase())
+    ).join("\n");
+  }
   return text;
 }
 const TEXT_CASE_OPTS = [
   { code: "upper",    d: "MAY", label: "Todo en MAYÚSCULAS" },
   { code: "title",    d: "Aa",  label: "Primera letra de Cada Palabra" },
   { code: "lower",    d: "min", label: "todo en minúsculas" },
+  { code: "sentence", d: "Abc", label: "Primera letra de cada Línea" },
   { code: "original", d: "ori", label: "Sin cambios (como está escrito)" },
 ];
 
-// Max single-file size. Mirrors backend MAX_UPLOAD_MB default (100, raised
-// from 50 to fit lossless WAV uploads — UMG sends WAV at 16/24-bit PCM,
-// which can land at 30-50 MB for a 3-minute track). We reject client-side
-// so the user gets immediate feedback instead of a 413 from the server
-// after a long upload.
-const MAX_FILE_MB = 100;
+// Max single-file size. Backend MAX_UPLOAD_MB default is 500 and the
+// audio body goes browser->R2 (presigned), so the API never sees these
+// bytes — this client-side cap only bounds what we let the operator
+// queue. Raised 100 -> 150 on 2026-07-02: UMG uploads lossless WAV
+// masters (24-bit/48 kHz stereo ≈ 17 MB/min) and a 6-min track already
+// blew past 100 (real case: 107 MB Intoxicados WAV rejected silently).
+// We reject client-side so the user gets immediate feedback instead of
+// a 413 from the server after a long upload.
+const MAX_FILE_MB = 150;
 // Accepted extensions in lower-case (with leading dot). Must stay in sync
 // with backend _AUDIO_EXTENSIONS.
 const ACCEPTED_EXTS = [".mp3", ".wav"];
+
+// Caps del FONDO custom. A diferencia del audio (directo a R2), el fondo
+// viaja en el FormData de /generate a través del edge proxy — un MOV de
+// 300 MB muere en el timeout del edge con "Failed to fetch" opaco, o
+// sube entero para comerse un 413. Video 150 MB (coherente con el cap
+// de audio), imagen 25 MB.
+const MAX_BG_VIDEO_MB = 150;
+const MAX_BG_IMAGE_MB = 25;
 
 // WAV files above this threshold get an amber warning under the filename
 // — they upload fine for a single user, but slow connections and
@@ -242,6 +259,8 @@ export default function UploadZone({
   const [umgFps, setUmgFps] = useState(delivery?.umg_fps || 24);
   const [umgProresProfile, setUmgProresProfile] = useState(delivery?.umg_prores_profile || 3);
   const [deliveryExpanded, setDeliveryExpanded] = useState(false);
+  // Aviso de fondo custom rechazado por tamaño (nombre + límite aplicado).
+  const [bgOversize, setBgOversize] = useState(null);
   // bgMode viene de App via props (ver header) — acá sólo un alias para
   // que el resto del componente siga llamando setBgMode.
   // Audit A2: multi-escena sólo aplica a "Generar con IA" (genera clips Veo).
@@ -371,6 +390,20 @@ export default function UploadZone({
   // los admin siempre califican aunque la sesión cacheada no traiga el flag.
   const scenesEligible = user?.features?.scenes === true || user?.role === "admin";
   const [showScenesUpsell, setShowScenesUpsell] = useState(false);
+  // Costo en créditos del add-on Escenas. El backend lo expone en
+  // features.scenes_credit_cost; default 3 (valor de lanzamiento) si la sesión
+  // cacheada no lo trae aún.
+  const scenesCreditCost = user?.features?.scenes_credit_cost ?? 3;
+  // Badge "Nuevo" + beacon hasta que el usuario interactúe con la card de
+  // Escenas (descubrimiento en contexto). Se persiste para no repetir; si
+  // localStorage falla, default a "ya visto" para no molestar.
+  const [scenesSeen, setScenesSeen] = useState(() => {
+    try { return localStorage.getItem("genly_scenes_seen") === "1"; } catch { return true; }
+  });
+  const markScenesSeen = () => {
+    setScenesSeen(true);
+    try { localStorage.setItem("genly_scenes_seen", "1"); } catch { /* storage bloqueado */ }
+  };
   // Escape cierra el modal de upsell (a11y — audit NIT).
   useEffect(() => {
     if (!showScenesUpsell) return undefined;
@@ -866,19 +899,90 @@ export default function UploadZone({
 
   const [batchTruncated, setBatchTruncated] = useState(0);
   const [oversize, setOversize] = useState([]);
+  // Files whose extension isn't .mp3/.wav. Tracked so a wrong-type drop
+  // shows a notice instead of silently doing nothing — drag&drop bypasses
+  // the <input accept> filter, so this path is reachable in prod.
+  const [rejectedType, setRejectedType] = useState([]);
+  // 0-byte files (failed export, cloud placeholder not yet synced). They
+  // "upload" fine and then die opaquely in transcription — reject at the
+  // door with a reason instead.
+  const [rejectedEmpty, setRejectedEmpty] = useState([]);
+  // Duplicates skipped (same name+size already in the batch or repeated
+  // within the drop). Amber notice: benign, but silent-skip would look
+  // like "the drop did nothing" for the duplicated file.
+  const [duplicates, setDuplicates] = useState([]);
 
   const addFiles = (fileList) => {
-    const mp3s = Array.from(fileList).filter((f) => {
+    // Reset EVERY notice up front. The early-returns below used to skip
+    // the resets, so a second drop could show this drop's notice next to
+    // a stale one from the previous drop (old filenames included).
+    setRejectedType([]);
+    setRejectedEmpty([]);
+    setDuplicates([]);
+    setOversize([]);
+    setBatchTruncated(0);
+
+    const all = Array.from(fileList);
+    const mp3s = all.filter((f) => {
       const lower = f.name.toLowerCase();
       return ACCEPTED_EXTS.some((ext) => lower.endsWith(ext));
     });
+    const wrongType = all.filter((f) => !mp3s.includes(f));
+    if (wrongType.length) {
+      setRejectedType(wrongType.map((f) => f.name));
+      // warn-level so captureConsoleIntegration ships it to Sentry,
+      // grouped under the [upload-reject] tag.
+      console.warn(
+        "[upload-reject] wrong type:",
+        wrongType.map((f) => `${f.name} (${(f.size / 1048576).toFixed(1)} MB)`).join(", "),
+      );
+    }
     if (!mp3s.length) return;
 
+    const empty = mp3s.filter((f) => f.size === 0);
+    const nonEmpty = mp3s.filter((f) => f.size > 0);
+    if (empty.length) {
+      setRejectedEmpty(empty.map((f) => f.name));
+      console.warn(
+        "[upload-reject] empty file:",
+        empty.map((f) => f.name).join(", "),
+      );
+    }
+    if (!nonEmpty.length) return;
+
+    // Dedup: against the current batch (same name+size) and within the
+    // drop itself. Duplicate rows shared the prefetch job downstream and
+    // produced two /generate calls over the same job_id.
+    const seen = new Set(
+      (Array.isArray(files) ? files : []).map((e) => `${e.file.name}|${e.file.size}`),
+    );
+    const unique = [];
+    const dupes = [];
+    for (const f of nonEmpty) {
+      const sig = `${f.name}|${f.size}`;
+      if (seen.has(sig)) dupes.push(f);
+      else { seen.add(sig); unique.push(f); }
+    }
+    if (dupes.length) {
+      setDuplicates(dupes.map((f) => f.name));
+      console.warn(
+        "[upload-reject] duplicate skipped:",
+        dupes.map((f) => f.name).join(", "),
+      );
+    }
+    if (!unique.length) return;
+    const okAll = unique;
+
     const max = MAX_FILE_MB * 1024 * 1024;
-    const tooBig = mp3s.filter((f) => f.size > max);
-    const okSize = mp3s.filter((f) => f.size <= max);
-    if (tooBig.length) setOversize(tooBig.map((f) => f.name));
-    else setOversize([]);
+    const tooBig = okAll.filter((f) => f.size > max);
+    const okSize = okAll.filter((f) => f.size <= max);
+    if (tooBig.length) {
+      setOversize(tooBig.map((f) => f.name));
+      console.warn(
+        "[upload-reject] oversize (cap " + MAX_FILE_MB + " MB):",
+        tooBig.map((f) => `${f.name} (${(f.size / 1048576).toFixed(1)} MB)`).join(", "),
+      );
+    }
     if (!okSize.length) return;
 
     // Audit 2026-05-26 (#388 wizard-duplicate-jobs): compute remaining,
@@ -1063,6 +1167,85 @@ export default function UploadZone({
     </div>
   );
 
+  // Rejection notices (wrong type / oversize / batch full). Rendered in
+  // BOTH dropzone branches so they show even when NOTHING was accepted —
+  // i.e. the user's first/only file was too big or the wrong format.
+  // Before 2026-07-02 these only rendered inside the files.length > 0
+  // branch, so an all-rejected first drop gave zero feedback ("subo el
+  // audio y no hace nada" — 107 MB WAV, Universal).
+  const _notices = (
+    <div onClick={(e) => e.stopPropagation()}>
+      {rejectedType.length > 0 && (
+        <div className="mt-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
+          <p className="text-[11px] text-red-300">
+            {t("upload.wrong_type", {
+              count: rejectedType.length,
+              names: rejectedType.slice(0, 3).join(", ") + (rejectedType.length > 3 ? "…" : ""),
+            })}
+          </p>
+          <button
+            onClick={(e) => { e.stopPropagation(); setRejectedType([]); }}
+            className="mt-1 text-[11px] text-red-400/60 hover:text-red-300"
+          >{t("common.dismiss") || "dismiss"}</button>
+        </div>
+      )}
+      {rejectedEmpty.length > 0 && (
+        <div className="mt-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
+          <p className="text-[11px] text-red-300">
+            {t("upload.empty_file", {
+              count: rejectedEmpty.length,
+              names: rejectedEmpty.slice(0, 3).join(", ") + (rejectedEmpty.length > 3 ? "…" : ""),
+            })}
+          </p>
+          <button
+            onClick={(e) => { e.stopPropagation(); setRejectedEmpty([]); }}
+            className="mt-1 text-[11px] text-red-400/60 hover:text-red-300"
+          >{t("common.dismiss") || "dismiss"}</button>
+        </div>
+      )}
+      {duplicates.length > 0 && (
+        <div className="mt-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
+          <p className="text-[11px] text-amber-300">
+            {t("upload.duplicate_skipped", {
+              count: duplicates.length,
+              names: duplicates.slice(0, 3).join(", ") + (duplicates.length > 3 ? "…" : ""),
+            })}
+          </p>
+          <button
+            onClick={(e) => { e.stopPropagation(); setDuplicates([]); }}
+            className="mt-1 text-[11px] text-amber-400/60 hover:text-amber-300"
+          >{t("common.dismiss") || "dismiss"}</button>
+        </div>
+      )}
+      {oversize.length > 0 && (
+        <div className="mt-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
+          <p className="text-[11px] text-red-300">
+            {t("upload.oversize", {
+              dropped: oversize.length,
+              max: MAX_FILE_MB,
+              names: oversize.slice(0, 3).join(", ") + (oversize.length > 3 ? "…" : ""),
+            })}
+          </p>
+          <button
+            onClick={(e) => { e.stopPropagation(); setOversize([]); }}
+            className="mt-1 text-[11px] text-red-400/60 hover:text-red-300"
+          >{t("common.dismiss") || "dismiss"}</button>
+        </div>
+      )}
+      {batchTruncated > 0 && (
+        <div className="mt-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
+          <p className="text-[11px] text-amber-300">
+            {t("upload.batch_truncated", { dropped: batchTruncated, max: MAX_BATCH_SIZE })}
+          </p>
+          <button
+            onClick={(e) => { e.stopPropagation(); setBatchTruncated(0); }}
+            className="mt-1 text-[11px] text-amber-400/60 hover:text-amber-300"
+          >{t("common.dismiss") || "dismiss"}</button>
+        </div>
+      )}
+    </div>
+  );
+
   const _dropZone = (
       <div
         data-tour="upload-dropzone"
@@ -1099,30 +1282,7 @@ export default function UploadZone({
                 >{t("upload.add_more")}</button>
               )}
             </div>
-            {batchTruncated > 0 && (
-              <div className="mt-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
-                <p className="text-[11px] text-amber-300">
-                  {t("upload.batch_truncated", { dropped: batchTruncated, max: MAX_BATCH_SIZE })
-                    || `${batchTruncated} file(s) ignored — max ${MAX_BATCH_SIZE} per batch. Process this batch first, then upload the rest.`}
-                </p>
-                <button
-                  onClick={(e) => { e.stopPropagation(); setBatchTruncated(0); }}
-                  className="mt-1 text-[11px] text-amber-400/60 hover:text-amber-300"
-                >{t("common.dismiss") || "dismiss"}</button>
-              </div>
-            )}
-            {oversize.length > 0 && (
-              <div className="mt-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
-                <p className="text-[11px] text-red-300">
-                  {t("upload.oversize", { max: MAX_FILE_MB }) ||
-                    `${oversize.length} archivo(s) excede(n) ${MAX_FILE_MB} MB y fueron ignorados: ${oversize.slice(0,3).join(", ")}${oversize.length > 3 ? "…" : ""}`}
-                </p>
-                <button
-                  onClick={(e) => { e.stopPropagation(); setOversize([]); }}
-                  className="mt-1 text-[11px] text-red-400/60 hover:text-red-300"
-                >{t("common.dismiss") || "dismiss"}</button>
-              </div>
-            )}
+            {_notices}
           </div>
         ) : (
           <div className="py-6 md:py-8">
@@ -1136,6 +1296,7 @@ export default function UploadZone({
             <p className="text-gray-700 text-[11px]">
               {t("upload.size_hint")}
             </p>
+            {_notices}
           </div>
         )}
       </div>
@@ -1429,7 +1590,7 @@ export default function UploadZone({
                   ? "bg-brand/20 ring-1 ring-brand/40"
                   : "bg-surface-3/40 hover:bg-surface-3/60"
                 }`}
-              style={opt.style}
+              style={{ ...opt.style, paintOrder: "stroke fill" }}
             >A</button>
           ))}
         </div>
@@ -1570,6 +1731,27 @@ export default function UploadZone({
                   </p>
                 )}
               </div>
+              {/* Toggle "versión en vivo" (06/07): arma la auditoría
+                  acústica del final aunque el título no diga "live" —
+                  las letras publicadas suelen ser de la versión de
+                  estudio y el final del vivo difiere. Si el título ya
+                  tiene marcador live, el backend lo detecta solo. */}
+              <label className="flex items-start gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={!!entry.live}
+                  onChange={(e) => updateField(i, "live", e.target.checked)}
+                  className="mt-0.5 accent-brand"
+                />
+                <span>
+                  <span className="text-[12px] text-gray-300 font-medium">
+                    {t("upload.live_version") || "Versión en vivo"}
+                  </span>
+                  <span className="block text-[11px] text-gray-600">
+                    {t("upload.live_version_hint") || "Marcalo si es un show en vivo: revisamos el final contra el audio."}
+                  </span>
+                </span>
+              </label>
               {/* Language pills. Default 'es' is highlighted on file
                   load — operator can click another to override, or
                   click 'auto' to let Whisper detect (not recommended
@@ -1724,7 +1906,7 @@ export default function UploadZone({
                               ? "bg-brand/20 ring-1 ring-brand/40"
                               : "bg-surface-3/40 hover:bg-surface-3/60"
                             }`}
-                          style={opt.style}
+                          style={{ ...opt.style, paintOrder: "stroke fill" }}
                         >A</button>
                       ))}
                     </div>
@@ -1754,8 +1936,22 @@ export default function UploadZone({
             accept=".mp4,.mov,.jpg,.jpeg,.png"
             className="hidden"
             onChange={(e) => {
-              if (e.target.files[0]) { onBackgroundFile?.(e.target.files[0]); onBackgroundId?.(null); }
+              const f = e.target.files[0];
               e.target.value = "";
+              if (!f) return;
+              const isVideo = /\.(mp4|mov)$/i.test(f.name);
+              const capMb = isVideo ? MAX_BG_VIDEO_MB : MAX_BG_IMAGE_MB;
+              if (f.size > capMb * 1024 * 1024) {
+                setBgOversize({ name: f.name, capMb, sizeMb: (f.size / 1048576).toFixed(0) });
+                console.warn(
+                  "[upload-reject] bg oversize (cap " + capMb + " MB):",
+                  `${f.name} (${(f.size / 1048576).toFixed(1)} MB)`,
+                );
+                return;
+              }
+              setBgOversize(null);
+              onBackgroundFile?.(f);
+              onBackgroundId?.(null);
             }}
           />
 
@@ -1986,6 +2182,21 @@ export default function UploadZone({
           {/* Custom upload mode */}
           {bgMode === "custom" && (
             <div>
+              {bgOversize && (
+                <div className="mb-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
+                  <p className="text-[11px] text-red-300">
+                    {t("upload.bg_oversize", {
+                      name: bgOversize.name,
+                      size: bgOversize.sizeMb,
+                      max: bgOversize.capMb,
+                    })}
+                  </p>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setBgOversize(null); }}
+                    className="mt-1 text-[11px] text-red-400/60 hover:text-red-300"
+                  >{t("common.dismiss") || "dismiss"}</button>
+                </div>
+              )}
               {!backgroundFile ? (
                 <button
                   onClick={() => bgInputRef.current.click()}
@@ -2366,7 +2577,12 @@ export default function UploadZone({
             cortaba el ring/glow redondeado de las cards seleccionadas (Inspirado,
             Multi-escena, Auto de colores) contra los bordes. El padding les da
             aire para que el borde no quede recortado. */}
-        <div className="space-y-4 min-w-0 w-full px-1.5 py-0.5 lg:h-full lg:min-h-0 lg:overflow-y-auto">
+        {/* lg:pb-24: el footer del wizard es `fixed bottom-0` (~68px de alto).
+            Sin padding inferior, el último contenido del paso (ej. "Mi prompt" +
+            Multi-escena, el modo más alto) quedaba TAPADO detrás del footer y no
+            se podía scrollear por encima ("trabado", QA 2026-07-01). El padding
+            reserva el espacio del CTA fijo. En mobile el outer ya tiene pb-28. */}
+        <div className="space-y-4 min-w-0 w-full px-1.5 py-0.5 lg:h-full lg:min-h-0 lg:overflow-y-auto lg:pb-24">
           {files.length > 1 && (
             <div className="flex items-center gap-1.5 px-1">
               <span className="inline-flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-[0.16em]">
@@ -2437,6 +2653,7 @@ export default function UploadZone({
                           ? (t("upload.scenes_locked_aria") || "Multi-escena — disponible en el plan superior")
                           : (t("upload.scenes_toggle") || "Multi-escena")}
                         onClick={() => {
+                          markScenesSeen();
                           if (locked) { track("wizard.scenes_upsell"); setShowScenesUpsell(true); return; }
                           track("wizard.scenes", { enabled: !on });
                           onEnableScenesChange && onEnableScenesChange(!on);
@@ -2446,13 +2663,27 @@ export default function UploadZone({
                              : "border-brand/25 bg-gradient-to-r from-brand/[0.07] to-transparent hover:border-brand/45"
                         }`}
                       >
-                        <span className="w-9 h-9 rounded-xl grid place-items-center text-[17px] shrink-0 bg-gradient-to-br from-brand to-accent">🎬</span>
+                        <span className="relative w-9 h-9 rounded-xl grid place-items-center text-[17px] shrink-0 bg-gradient-to-br from-brand to-accent">
+                          🎬
+                          {!scenesSeen && (
+                            <span className="absolute -top-1 -right-1 flex h-3 w-3" aria-hidden="true">
+                              <span className="absolute inline-flex h-full w-full rounded-full bg-accent opacity-75 animate-ping" />
+                              <span className="relative inline-flex h-3 w-3 rounded-full bg-accent ring-2 ring-surface-2" />
+                            </span>
+                          )}
+                        </span>
                         <span className="min-w-0 flex-1">
                           <span className="flex items-center gap-2">
                             <span className={`text-[13px] font-semibold ${on ? "text-white" : "text-gray-200"}`}>{t("upload.scenes_toggle") || "Multi-escena"}</span>
+                            {!scenesSeen && (
+                              <span className="text-[9px] font-bold tracking-[0.04em] px-1.5 py-0.5 rounded bg-accent text-white">{t("upload.scenes_new_badge") || "NUEVO"}</span>
+                            )}
                             <span className="text-[9px] font-bold tracking-[0.04em] px-1.5 py-0.5 rounded bg-gradient-to-r from-brand to-accent text-white">{t("upload.premium_badge") || "PREMIUM"}</span>
                           </span>
-                          <span className="block text-[11px] text-ink-secondary mt-0.5 leading-snug">{t("upload.scenes_toggle_desc") || "Varias escenas con arco narrativo en vez de un fondo único."}</span>
+                          <span className="block text-[11px] text-ink-secondary mt-0.5 leading-snug">
+                            {t("upload.scenes_toggle_desc") || "Varias escenas con arco narrativo en vez de un fondo único."}
+                            <span className="text-brand-light font-medium"> · {(t("upload.scenes_cost_hint") || "{n} créditos (un video normal usa 1)").replace("{n}", scenesCreditCost)}</span>
+                          </span>
                         </span>
                         {locked
                           ? <span className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-brand/15 text-brand-light text-[10px] font-semibold">
@@ -2762,7 +2993,7 @@ export default function UploadZone({
                               ? "bg-brand/20 ring-1 ring-brand/40"
                               : "bg-surface-3/40 hover:bg-surface-3/60"
                             }`}
-                          style={opt.style}
+                          style={{ ...opt.style, paintOrder: "stroke fill" }}
                         >A</button>
                       ))}
                     </div>
