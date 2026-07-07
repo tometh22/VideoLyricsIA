@@ -14,6 +14,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     JSON,
     create_engine,
     event,
@@ -336,6 +337,49 @@ class UserSettings(Base):
     user = relationship("User", back_populates="settings")
 
 
+class YouTubeChannel(Base):
+    """A YouTube channel connected by a tenant via OAuth.
+
+    The OAuth token blob (access + refresh token) is Fernet-encrypted at
+    rest (see token_crypto.py); the OAuth client id/secret live in env,
+    never in the DB. A disconnected channel keeps its row (status
+    "revoked", token nulled) so the audit trail stays intact and a
+    reconnect revives it in place.
+    """
+    __tablename__ = "youtube_channels"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "channel_id", name="uq_yt_channel_per_tenant"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    channel_id = Column(String(64), nullable=False)      # YouTube "UC..." id
+    channel_title = Column(String(255), nullable=True)
+    thumbnail_url = Column(String(500), nullable=True)
+    token_encrypted = Column(Text, nullable=True)        # Fernet ciphertext; null after disconnect
+    scopes = Column(JSON, nullable=True)
+    connected_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    status = Column(String(20), nullable=False, default="active")  # active | revoked | error
+    is_default = Column(Boolean, nullable=False, default=False)
+    last_refresh_at = Column(DateTime(timezone=True), nullable=True)
+    last_refresh_error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    def to_dict(self):
+        """Public shape — never includes the token blob."""
+        return {
+            "id": self.id,
+            "channel_id": self.channel_id,
+            "channel_title": self.channel_title,
+            "thumbnail_url": self.thumbnail_url,
+            "status": self.status,
+            "is_default": self.is_default,
+            "connected_by": self.connected_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class PasswordResetToken(Base):
     __tablename__ = "password_reset_tokens"
 
@@ -462,6 +506,11 @@ def _migrate_user_columns():
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS song_title VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS input_r2_key VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS multipart_upload_id VARCHAR(255)",
+        # One default channel per tenant. Partial unique indexes work on
+        # both Postgres and SQLite (>= 3.8); the app also clears other
+        # defaults in the same transaction as a belt-and-suspenders.
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_yt_default_per_tenant "
+        "ON youtube_channels (tenant_id) WHERE is_default",
     ]
     with engine.begin() as conn:
         for sql in column_adds:

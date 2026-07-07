@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { useI18n } from "../i18n";
 import { startReplaySession } from "./OnboardingTour";
+import ChannelsCard from "./youtube/ChannelsCard";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -21,7 +22,6 @@ const DEFAULT_SETTINGS = {
   hashtags: "#lyrics #letra",
   metadataLanguage: "es",
   defaultPrivacy: "unlisted",
-  channelName: "",
 };
 
 const PLAN_INFO = {
@@ -395,16 +395,9 @@ export default function Settings({ onBack }) {
             </Card>
 
             <Card>
-              <SectionLabel>{t("settings.channel")}</SectionLabel>
-              <p className="text-xs text-ink-secondary mb-4 -mt-1">{t("settings.channel_sub")}</p>
-              <Field label={t("settings.channel_name")}>
-                <input type="text" value={settings.channelName}
-                  onChange={(e) => update("channelName", e.target.value)}
-                  className="input-field text-sm" placeholder={t("settings.channel_name")} />
-              </Field>
-              {settings.channelName && (
-                <p className="text-[10px] text-gray-600 mt-2">{t("settings.channel_connected")}</p>
-              )}
+              <SectionLabel>{t("yt.channels.title")}</SectionLabel>
+              <p className="text-xs text-ink-secondary mb-4 -mt-1">{t("yt.channels.subtitle")}</p>
+              <ChannelsCard />
             </Card>
 
             <div className="flex items-center justify-end gap-3 pt-2">

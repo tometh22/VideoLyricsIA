@@ -19,33 +19,142 @@ if not os.path.isabs(_TOKEN_PATH):
     _TOKEN_PATH = os.path.join(os.path.dirname(__file__), _TOKEN_PATH)
 
 class YouTubeNotConfiguredError(RuntimeError):
-    """The server has no usable YouTube OAuth token on disk."""
+    """No usable YouTube credential (no channel connected / token broken)."""
 
 
-def _get_youtube_client():
-    """Get authenticated YouTube API client."""
-    try:
-        with open(_TOKEN_PATH) as f:
-            token_data = json.load(f)
-    except FileNotFoundError:
-        raise YouTubeNotConfiguredError(
-            f"YouTube token file not found at {_TOKEN_PATH}. "
-            "Run the OAuth flow and place the token there (see YOUTUBE_TOKEN_PATH)."
+def resolve_channel(db, tenant_id: str, channel_pk: int = None):
+    """Pick the channel to publish with: explicit id → tenant default →
+    None (legacy file-token fallback). Raises 404-shaped ValueError for an
+    explicit id that isn't the tenant's or isn't active."""
+    from database import YouTubeChannel
+
+    if channel_pk is not None:
+        channel = (
+            db.query(YouTubeChannel)
+            .filter(YouTubeChannel.id == channel_pk, YouTubeChannel.tenant_id == tenant_id)
+            .first()
         )
-    except json.JSONDecodeError as e:
-        raise YouTubeNotConfiguredError(f"YouTube token file is not valid JSON: {e}")
+        if channel is None:
+            raise ValueError("Channel not found.")
+        if channel.status != "active":
+            raise YouTubeNotConfiguredError(f"Channel {channel.channel_title} needs reconnection.")
+        return channel
 
-    try:
-        creds = Credentials(
-            token=token_data["token"],
-            refresh_token=token_data["refresh_token"],
-            token_uri=token_data["token_uri"],
-            client_id=token_data["client_id"],
-            client_secret=token_data["client_secret"],
-            scopes=token_data["scopes"],
+    return (
+        db.query(YouTubeChannel)
+        .filter(
+            YouTubeChannel.tenant_id == tenant_id,
+            YouTubeChannel.status == "active",
+            YouTubeChannel.is_default.is_(True),
         )
-    except KeyError as e:
-        raise YouTubeNotConfiguredError(f"YouTube token file is missing key: {e}")
+        .first()
+    )
+
+
+def _mark_channel_error(channel_pk: int, error: str) -> None:
+    from database import SessionLocal, YouTubeChannel
+    from datetime import datetime, timezone
+
+    s = SessionLocal()
+    try:
+        row = s.query(YouTubeChannel).filter(YouTubeChannel.id == channel_pk).first()
+        if row:
+            row.status = "error"
+            row.last_refresh_error = error[:1000]
+            row.last_refresh_at = datetime.now(timezone.utc)
+            s.commit()
+    finally:
+        s.close()
+
+
+def _persist_refreshed_token(channel_pk: int, token_data: dict) -> None:
+    """Save the rotated access token after a refresh. Last-writer-wins is
+    fine: Google keeps the refresh_token stable across refreshes."""
+    from database import SessionLocal, YouTubeChannel
+    from token_crypto import encrypt_token
+    from datetime import datetime, timezone
+
+    s = SessionLocal()
+    try:
+        row = s.query(YouTubeChannel).filter(YouTubeChannel.id == channel_pk).first()
+        if row:
+            row.token_encrypted = encrypt_token(token_data)
+            row.last_refresh_at = datetime.now(timezone.utc)
+            row.last_refresh_error = None
+            s.commit()
+    finally:
+        s.close()
+
+
+def _credentials_from_channel(channel) -> Credentials:
+    from token_crypto import decrypt_token
+
+    if not channel.token_encrypted:
+        raise YouTubeNotConfiguredError("Channel has no stored token (disconnected?).")
+    token_data = decrypt_token(channel.token_encrypted)
+    return Credentials(
+        token=token_data.get("token"),
+        refresh_token=token_data.get("refresh_token"),
+        token_uri=token_data.get("token_uri", "https://oauth2.googleapis.com/token"),
+        client_id=os.environ.get("YOUTUBE_OAUTH_CLIENT_ID", ""),
+        client_secret=os.environ.get("YOUTUBE_OAUTH_CLIENT_SECRET", ""),
+        scopes=token_data.get("scopes"),
+    )
+
+
+def _get_youtube_client(channel=None):
+    """Authenticated YouTube API client.
+
+    channel=None → legacy single-token file (backward compatible with
+    deployments that predate self-service connections). channel row →
+    decrypt from DB, proactively refresh if expired, persist the rotated
+    access token.
+    """
+    if channel is None:
+        try:
+            with open(_TOKEN_PATH) as f:
+                token_data = json.load(f)
+        except FileNotFoundError:
+            raise YouTubeNotConfiguredError(
+                f"YouTube token file not found at {_TOKEN_PATH}. "
+                "Connect a channel in Settings or place a token file there."
+            )
+        except json.JSONDecodeError as e:
+            raise YouTubeNotConfiguredError(f"YouTube token file is not valid JSON: {e}")
+
+        try:
+            creds = Credentials(
+                token=token_data["token"],
+                refresh_token=token_data["refresh_token"],
+                token_uri=token_data["token_uri"],
+                client_id=token_data["client_id"],
+                client_secret=token_data["client_secret"],
+                scopes=token_data["scopes"],
+            )
+        except KeyError as e:
+            raise YouTubeNotConfiguredError(f"YouTube token file is missing key: {e}")
+
+        return build("youtube", "v3", credentials=creds)
+
+    creds = _credentials_from_channel(channel)
+    if creds.expired and creds.refresh_token:
+        from google.auth.transport.requests import Request
+        from google.auth.exceptions import RefreshError
+
+        try:
+            creds.refresh(Request())
+        except RefreshError as e:
+            _mark_channel_error(channel.id, str(e))
+            raise YouTubeNotConfiguredError(
+                f"Channel {channel.channel_title} token was revoked/expired; reconnect it."
+            )
+        _persist_refreshed_token(channel.id, {
+            "token": creds.token,
+            "refresh_token": creds.refresh_token,
+            "token_uri": creds.token_uri,
+            "scopes": list(creds.scopes or []),
+            "expiry": creds.expiry.isoformat() if getattr(creds, "expiry", None) else None,
+        })
 
     return build("youtube", "v3", credentials=creds)
 
@@ -212,11 +321,13 @@ def upload_to_youtube(
     job_id: str = None,
     metadata: dict = None,
     settings: dict = None,
+    channel=None,
 ) -> dict:
     """Upload video + thumbnail to YouTube.
 
     If `metadata` is given (e.g. the exact metadata the user previewed and
     approved in the UI) it is used as-is; otherwise it is AI-generated.
+    `channel` is a YouTubeChannel row (None → legacy file token).
     Returns dict with video_id and url.
     """
     if settings is None:
@@ -227,7 +338,7 @@ def upload_to_youtube(
         metadata = generate_youtube_metadata(artist, song, lyrics_text, job_id=job_id, settings=settings)
     print(f"[YOUTUBE] Title: {metadata['title']}")
 
-    youtube = _get_youtube_client()
+    youtube = _get_youtube_client(channel)
 
     default_lang = settings.get("metadataLanguage", "es")
 
@@ -278,17 +389,21 @@ def upload_to_youtube(
         except Exception as e:
             print(f"[YOUTUBE] Thumbnail failed (needs verified account): {e}")
 
-    return {
+    result = {
         "video_id": video_id,
         "url": f"https://youtube.com/watch?v={video_id}",
         "title": metadata["title"],
         "privacy": privacy,
     }
+    if channel is not None:
+        result["channel_id"] = channel.channel_id
+        result["channel_title"] = channel.channel_title
+    return result
 
 
-def update_video_privacy(video_id: str, privacy: str) -> None:
+def update_video_privacy(video_id: str, privacy: str, channel=None) -> None:
     """Change the privacy status of an already-published video."""
-    youtube = _get_youtube_client()
+    youtube = _get_youtube_client(channel)
     youtube.videos().update(
         part="status",
         body={

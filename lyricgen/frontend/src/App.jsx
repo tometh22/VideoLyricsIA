@@ -123,6 +123,17 @@ function RootEffects({ setUser, setResetToken }) {
       setResetToken(params.get("reset_password"));
       navigate("/login", { replace: true });
     }
+    // YouTube OAuth round-trip return (backend redirects here after the
+    // Google consent screen). Flash state travels via sessionStorage so
+    // ChannelsCard can show it after the redirect strips the params.
+    if (params.get("youtube_connected") === "1") {
+      sessionStorage.setItem("yt_connected_flash", "1");
+      navigate("/account", { replace: true });
+    }
+    if (params.get("youtube_error")) {
+      sessionStorage.setItem("yt_error_flash", params.get("youtube_error"));
+      navigate("/account", { replace: true });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   return null;
