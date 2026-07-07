@@ -81,6 +81,35 @@ def find_stuck_jobs(db: Session, threshold_min: int = _DEFAULT_THRESHOLD_MIN) ->
     )
 
 
+# A YouTube publish stuck in "uploading" past this is an orphan (the
+# publish worker died mid-upload); flip it to failed so the user can
+# retry instead of staring at a frozen progress bar.
+_PUBLISH_STALE_MIN = int(os.environ.get("PUBLISH_STALE_MIN", "60"))
+
+
+def reap_stuck_publish_jobs(db: Session, stale_min: int = _PUBLISH_STALE_MIN) -> int:
+    """Flip orphaned uploading PublishJobs to failed. Returns count."""
+    from database import PublishJob
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_min)
+    flipped = (
+        db.query(PublishJob)
+        .filter(
+            PublishJob.status == "uploading",
+            PublishJob.started_at < cutoff,
+        )
+        .update(
+            {
+                PublishJob.status: "failed",
+                PublishJob.error: "Publish worker died mid-upload (reaped). Retry the publish.",
+                PublishJob.completed_at: datetime.now(timezone.utc),
+            },
+            synchronize_session=False,
+        )
+    )
+    return flipped
+
+
 def find_abandoned_transcribed(
     db: Session,
     ttl_min: int = _TRANSCRIBED_PENDING_TTL_MIN,
@@ -338,6 +367,10 @@ def reap_all_stuck(threshold_min: int = _DEFAULT_THRESHOLD_MIN) -> int:
         stuck = find_stuck_jobs(db, threshold_min)
         abandoned = find_abandoned_transcribed(db)
         abandoned_uploads = find_abandoned_uploads(db)
+        stale_publishes = reap_stuck_publish_jobs(db)
+        if stale_publishes:
+            db.commit()
+            print(f"[REAPER] failed {stale_publishes} orphaned publish job(s)")
         # Reap abandoned transcribed_pending rows quietly: the user never
         # got a job started, so the failure isn't operator-visible. Just
         # delete the row and clean up the input file.

@@ -529,42 +529,9 @@ MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "100"))
 _MP3_MAGIC_BYTES = (b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")
 _AUDIO_EXTENSIONS = (".mp3", ".wav")
 
-_TITLE_NOISE_SUFFIXES = (
-    "(Official Video)", "(Official Audio)", "(Lyric Video)",
-    "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
-    "(Live)", "(Lyrics)",
-)
-
-
-def _parse_filename_artist_title(filename: str) -> tuple[str, str]:
-    """Best-effort artist/title extraction from a bare filename. Handles two
-    naming conventions the operator commonly uploads under:
-
-      "Artist - Title.ext"   → ("Artist", "Title")
-      "Title_Artist.ext"     → ("Artist", "Title")   ← Suno/YouTube export form
-
-    Falls back to ("", basename) when neither separator is present so the
-    caller can decide whether to insist on a manual entry. Studio-version
-    suffixes like "(Official Video)" are stripped from the title in either
-    case so the lrclib lookup matches.
-    """
-    if not filename:
-        return "", ""
-    base = filename
-    for ext in (".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg"):
-        if base.lower().endswith(ext):
-            base = base[: -len(ext)]
-            break
-    artist, title = "", base.strip()
-    if " - " in base:
-        head, _, tail = base.partition(" - ")
-        artist, title = head.strip(), tail.strip()
-    elif "_" in base:
-        head, _, tail = base.partition("_")
-        title, artist = head.strip(), tail.strip()
-    for sfx in _TITLE_NOISE_SUFFIXES:
-        title = title.replace(sfx, "").strip()
-    return artist, title
+# Shared with the publish worker path — lives in youtube_upload so RQ
+# workers can use it without importing main.
+from youtube_upload import parse_filename_artist_title as _parse_filename_artist_title
 
 
 def _validate_audio_upload(file, data: bytes) -> None:
@@ -3238,27 +3205,13 @@ _YOUTUBE_EXECUTOR = _ThreadPoolExecutor(max_workers=4, thread_name_prefix="yt-up
 _YOUTUBE_CLAIM_STALE_S = int(os.environ.get("YOUTUBE_CLAIM_STALE_S", "3600"))
 
 
-def _job_song_title(job: dict) -> str:
-    """Song title for YouTube metadata: prefer the title the user supplied
-    (or the upload-time parse) over re-deriving it from the raw filename."""
-    return job.get("song_title") or _parse_filename_artist_title(job.get("filename", ""))[1]
-
-
-def _load_user_settings(db: Session, user_id: int) -> dict | None:
-    """Per-user settings from the DB; None when the user has none saved so
-    youtube_upload can fall back to the legacy outputs/_settings.json."""
-    settings = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
-    return (settings.settings_json or None) if settings else None
-
-
-def _youtube_settings_for_job(db: Session, job_id: str, fallback_user_id: int) -> dict | None:
-    """The YouTube template to apply to a job: the job owner's settings, so a
-    teammate publishing someone else's job still gets the configured branding."""
-    owner_id = db.query(Job.user_id).filter(Job.job_id == job_id).scalar()
-    settings = _load_user_settings(db, owner_id) if owner_id else None
-    if settings is None and owner_id != fallback_user_id:
-        settings = _load_user_settings(db, fallback_user_id)
-    return settings
+# Shared with the publish worker path (youtube_publish task) — the
+# implementations live in youtube_upload so workers don't import main.
+from youtube_upload import (
+    job_song_title as _job_song_title,
+    load_user_settings as _load_user_settings,
+    settings_for_job as _youtube_settings_for_job,
+)
 
 
 def _claim_youtube_upload(db: Session, job_id: str, user_id: int) -> None:

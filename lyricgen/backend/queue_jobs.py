@@ -29,6 +29,9 @@ JOB_TIMEOUT_UMG = int(os.environ.get("JOB_TIMEOUT_UMG_SECONDS", "5400"))
 # usually finishes in 1-3 min. 15 min is plenty of headroom and still
 # bounds runaway processes.
 PRORES_PREWARM_TIMEOUT = int(os.environ.get("PRORES_PREWARM_TIMEOUT_SECONDS", "900"))
+# YouTube publish jobs are I/O-bound (R2 download + resumable upload) —
+# 30 min bounds even a multi-GB master on a slow link.
+PUBLISH_JOB_TIMEOUT = int(os.environ.get("PUBLISH_JOB_TIMEOUT_SECONDS", "1800"))
 RESULT_TTL = int(os.environ.get("JOB_RESULT_TTL_SECONDS", "86400"))  # 24 h
 FAILURE_TTL = int(os.environ.get("JOB_FAILURE_TTL_SECONDS", "604800"))  # 7 d
 _ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "production"
@@ -58,12 +61,13 @@ prewarm_enqueued_total = 0
 _redis = None
 _queue_default = None
 _queue_enterprise = None
+_queue_publish = None
 
 
 def _init_redis():
     """Lazy-init Redis + RQ queues. Returns (redis, default_q, enterprise_q) or
     (None, None, None) if Redis is not configured or unreachable."""
-    global _redis, _queue_default, _queue_enterprise
+    global _redis, _queue_default, _queue_enterprise, _queue_publish
     if _queue_default is not None:
         return _redis, _queue_default, _queue_enterprise
     if not REDIS_URL:
@@ -75,6 +79,7 @@ def _init_redis():
         _redis.ping()
         _queue_default = Queue("default", connection=_redis)
         _queue_enterprise = Queue("enterprise", connection=_redis)
+        _queue_publish = Queue("publish", connection=_redis)
         return _redis, _queue_default, _queue_enterprise
     except Exception as e:
         print(f"[QUEUE] Redis init failed ({e}); falling back to threads")
@@ -146,6 +151,60 @@ def enqueue_pipeline(
     )
     t.start()
     return f"thread:{job_id}"
+
+
+def enqueue_publish(publish_job_id: int) -> str:
+    """Enqueue a YouTube publish task on the dedicated "publish" queue.
+
+    Deterministic RQ job id (publish:<id>) makes an accidental double
+    enqueue a no-op — combined with the task's conditional claim and the
+    uq_publish_active index that's three independent duplicate guards.
+
+    Same Redis policy as enqueue_pipeline: production refuses the
+    threading fallback; dev falls back so the local loop works.
+    """
+    _init_redis()
+    q = _queue_publish
+    if q is not None:
+        rq_job = q.enqueue(
+            "youtube_publish.publish_to_youtube_task",
+            args=(publish_job_id,),
+            job_timeout=PUBLISH_JOB_TIMEOUT,
+            result_ttl=RESULT_TTL,
+            failure_ttl=FAILURE_TTL,
+            job_id=f"publish:{publish_job_id}",
+        )
+        return rq_job.id
+
+    if _ENVIRONMENT == "production":
+        logger.error(
+            "Refusing to enqueue publish %s via thread fallback: Redis is "
+            "required in production but unreachable.", publish_job_id,
+        )
+        raise RuntimeError(
+            "Publish queue unavailable: Redis is required in production. "
+            "Check REDIS_URL and the redis service health."
+        )
+
+    from youtube_publish import publish_to_youtube_task
+    t = threading.Thread(
+        target=publish_to_youtube_task, args=(publish_job_id,), daemon=True,
+    )
+    t.start()
+    return f"thread:publish:{publish_job_id}"
+
+
+def cancel_publish_rq_job(publish_job_id: int) -> None:
+    """Best-effort: cancel the RQ job for a canceled PublishJob so a
+    worker doesn't even pick it up (the task's claim check also no-ops)."""
+    redis, _, _ = _init_redis()
+    if redis is None:
+        return
+    try:
+        from rq.job import Job as RQJob
+        RQJob.fetch(f"publish:{publish_job_id}", connection=redis).cancel()
+    except Exception:
+        pass
 
 
 def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
