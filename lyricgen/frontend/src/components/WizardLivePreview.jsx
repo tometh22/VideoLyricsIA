@@ -566,6 +566,14 @@ export default function WizardLivePreview({
               fontFamily: fontInfo.css,
               fontWeight: fontInfo.weight,
               WebkitTextStroke: contrastStyle.WebkitTextStroke,
+              // paint-order 2026-07-06: pintar el stroke DEBAJO del fill. Por
+              // defecto el browser dibuja el -webkit-text-stroke ENCIMA del
+              // relleno, así que el contorno negro cruza el glifo blanco y en
+              // fuentes como Roboto/Montserrat/Jost/Outfit se ve una "A"
+              // fantasma/esqueleto. Con stroke→fill el relleno tapa la mitad
+              // interna del trazo y queda un borde limpio (libass ya lo hace
+              // así, por eso el video final nunca mostró el artefacto).
+              paintOrder: "stroke fill",
               // Paleta minimal (fondo claro): el contrastStyle.textShadow
               // (sombras oscuras) sirve igual o mejor que el highlight
               // blanco histórico para legibilidad — pero cuando el operador

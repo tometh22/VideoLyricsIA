@@ -324,6 +324,10 @@ export default function LyricVideoPreview({
               whiteSpace: "pre-line",
               overflowWrap: "break-word",
               ...(CONTRAST_STYLES[textContrast] || CONTRAST_STYLES.medium),
+              // paint-order: stroke bajo el fill, si no el -webkit-text-stroke
+              // se dibuja encima y el contorno cruza el glifo (ver
+              // WizardLivePreview). libass ya rinde el contorno por debajo.
+              paintOrder: "stroke fill",
             }}
           >
             {displayText}
