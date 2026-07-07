@@ -325,6 +325,9 @@ export default function Settings({ onBack }) {
   const [ytStatus, setYtStatus] = useState(null); // null=loading, {connected, channel_name, ...}
   const [ytStatusError, setYtStatusError] = useState(null);
   const [ytDisconnecting, setYtDisconnecting] = useState(false);
+  // Google shows two confusing screens (unverified app + unchecked
+  // permission boxes). Walk the user through them before opening the popup.
+  const [ytHelp, setYtHelp] = useState(false);
 
   const checkYtStatus = () => {
     setYtStatus(null);
@@ -348,6 +351,7 @@ export default function Settings({ onBack }) {
   }, []);
 
   const handleYtConnect = async () => {
+    setYtHelp(false);
     try {
       const res = await fetch(`${API}/youtube/auth-url`, { headers: authHeaders() });
       if (!res.ok) throw new Error("Error al obtener la URL de autenticación.");
@@ -1499,12 +1503,12 @@ export default function Settings({ onBack }) {
                 </div>
               )}
 
-              {ytStatus && !ytStatus.connected && (
+              {ytStatus && !ytStatus.connected && !ytHelp && (
                 <div className="flex items-center gap-4">
                   <div className="flex-1">
                     <p className="text-sm text-ink-secondary">{t("settings.yt_not_connected")}</p>
                   </div>
-                  <button onClick={handleYtConnect}
+                  <button onClick={() => { setYtStatusError(null); setYtHelp(true); }}
                     className="shrink-0 btn-primary text-sm py-2 px-4 flex items-center gap-2">
                     <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
                       <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/>
@@ -1512,6 +1516,26 @@ export default function Settings({ onBack }) {
                     </svg>
                     {t("settings.yt_connect")}
                   </button>
+                </div>
+              )}
+
+              {ytStatus && !ytStatus.connected && ytHelp && (
+                <div className="rounded-xl bg-brand/[0.06] ring-1 ring-brand/25 px-4 py-4">
+                  <p className="text-sm font-medium text-white mb-2">{t("settings.yt_help_title")}</p>
+                  <ol className="text-xs text-ink-secondary space-y-1.5 list-decimal list-inside mb-3">
+                    <li>{t("settings.yt_help_unverified")}</li>
+                    <li className="font-medium text-brand-light">{t("settings.yt_help_scopes")}</li>
+                    <li>{t("settings.yt_help_continue")}</li>
+                  </ol>
+                  <div className="flex gap-3">
+                    <button onClick={handleYtConnect} className="btn-primary text-sm py-2 px-5">
+                      {t("settings.yt_help_go")}
+                    </button>
+                    <button onClick={() => setYtHelp(false)}
+                      className="text-xs text-ink-secondary hover:text-white transition-colors">
+                      {t("settings.cancel") || "Cancelar"}
+                    </button>
+                  </div>
                 </div>
               )}
 
