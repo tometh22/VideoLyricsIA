@@ -82,7 +82,11 @@ def test_admin_invoices(client, admin_token):
 def test_admin_audit_log(client, admin_token):
     res = client.get("/admin/audit", headers=auth(admin_token))
     assert res.status_code == 200
-    assert isinstance(res.json(), list)
+    # Filtered/paginated shape: {total, entries}.
+    body = res.json()
+    assert isinstance(body, dict)
+    assert "total" in body
+    assert isinstance(body["entries"], list)
 
 
 def test_admin_search_users(client, admin_token):
