@@ -4,6 +4,7 @@ import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
 import PublishPanel from "./youtube/PublishPanel";
+import AnalyticsTab from "./youtube/AnalyticsTab";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -382,9 +383,11 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // lazily by /download/{id}/umg_short the first time it's clicked.
   const hasUmgShort = isUmgJob && isJobDone;
 
+  const hasPublishedVideo = !!youtubeResult?.video_id;
   const ALL_TABS = [
     ...MEDIA_TABS,
     ...(hasUmgMaster ? [PRORES_MASTER_TAB] : []),
+    ...(hasPublishedVideo ? [{ key: "analytics", label: t("yt.analytics.tab") }] : []),
     { key: "provenance", label: t("prov.title") || "Provenance" },
   ];
 
@@ -557,6 +560,13 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           </button>
         ))}
       </div>
+
+      {/* Analytics tab — only when a video is published */}
+      {activeTab === "analytics" && (
+        <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-6 mb-6">
+          <AnalyticsTab jobId={job.job_id} />
+        </div>
+      )}
 
       {/* Provenance tab */}
       {activeTab === "provenance" && (

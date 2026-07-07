@@ -740,6 +740,57 @@ async def cancel_publish(
     return {"ok": True}
 
 
+# ---------------------------------------------------------------------------
+# Analytics
+# ---------------------------------------------------------------------------
+
+@router.get("/analytics/summary")
+async def analytics_summary(
+    days: int = 30,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Tenant totals + top videos for the dashboard card."""
+    from youtube_analytics import tenant_summary
+
+    return tenant_summary(db, current_user["tenant_id"], days=min(max(days, 1), 90))
+
+
+@router.get("/analytics/{job_id}")
+async def analytics_for_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Per-video stats for a job's published assets (video + short)."""
+    from youtube_analytics import video_series
+
+    job = (
+        db.query(Job)
+        .filter(Job.job_id == job_id, Job.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    published = (
+        db.query(PublishJob)
+        .filter(
+            PublishJob.job_id == job_id,
+            PublishJob.status == "published",
+            PublishJob.video_id.isnot(None),
+        )
+        .all()
+    )
+    if not published:
+        raise HTTPException(status_code=404, detail="No published video for this job.")
+
+    return {
+        p.kind: video_series(db, current_user["tenant_id"], p.video_id)
+        for p in published
+    }
+
+
 @router.post("/channels/{channel_pk}/default")
 async def set_default_channel(
     channel_pk: int,
