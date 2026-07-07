@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, Fragment } from "react";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -145,8 +145,8 @@ export default function AuditLogTab() {
           </thead>
           <tbody>
             {entries.map((e) => (
-              <>
-                <tr key={e.id}
+              <Fragment key={e.id}>
+                <tr
                   onClick={() => setExpanded(expanded === e.id ? null : e.id)}
                   className="border-b border-white/[0.03] hover:bg-white/[0.02] cursor-pointer">
                   <td className="px-4 py-2.5 text-xs text-gray-400 whitespace-nowrap">
@@ -163,7 +163,7 @@ export default function AuditLogTab() {
                   </td>
                 </tr>
                 {expanded === e.id && (
-                  <tr key={`${e.id}-detail`} className="border-b border-white/[0.03] bg-surface-3/20">
+                  <tr className="border-b border-white/[0.03] bg-surface-3/20">
                     <td colSpan={4} className="px-4 py-3">
                       <pre className="text-[11px] text-gray-400 whitespace-pre-wrap break-all">
                         {JSON.stringify(e.detail, null, 2)}
@@ -171,7 +171,7 @@ export default function AuditLogTab() {
                     </td>
                   </tr>
                 )}
-              </>
+              </Fragment>
             ))}
             {!loading && entries.length === 0 && !error && (
               <tr><td colSpan={4} className="px-4 py-8 text-center text-sm text-gray-600">
