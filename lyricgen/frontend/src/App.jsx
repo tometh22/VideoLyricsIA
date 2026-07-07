@@ -2250,6 +2250,7 @@ export default function App() {
         concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
         backgroundHint: entry.backgroundHint || "", bgVerbatim: !!entry.bgVerbatim,
         textCase: entry.textCase || "upper",
+        frameFormat: entry.frameFormat || "full",
         fontScale: entry.fontScale || "1.0",
         textContrast: entry.textContrast || "medium",
         // Audit fix 2026-05-25: ANTES estos dos fields no se inicializaban.
@@ -2332,6 +2333,7 @@ export default function App() {
             concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
             backgroundHint: entry.backgroundHint || "", bgVerbatim: !!entry.bgVerbatim,
             textCase: entry.textCase || "upper",
+            frameFormat: entry.frameFormat || "full",
             fontScale: entry.fontScale || "1.0",
             textContrast: entry.textContrast || "medium",
             // Audit fix 2026-05-25: ver comentario en setCurrentReview de
@@ -2479,6 +2481,7 @@ export default function App() {
         concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
         backgroundHint: entry.backgroundHint || "", bgVerbatim: !!entry.bgVerbatim,
         textCase: entry.textCase || "upper",
+        frameFormat: entry.frameFormat || "full",
         fontScale: entry.fontScale || "1.0",
         textContrast: entry.textContrast || "medium",
         // Audit fix 2026-05-25: init explícito de los 2 ejes libass.
@@ -2979,6 +2982,7 @@ export default function App() {
         // Multi-escena sólo con fondo generado por IA (no Biblioteca/Subir).
         if (enableScenes && bgSelectMode === "auto") formData.append("enable_scenes", "true");
         formData.append("text_case", jobList[i].textCase || "upper");
+        formData.append("frame_format", jobList[i].frameFormat || "full");
         formData.append("font_scale", String(jobList[i].fontScale || "1.0"));
         // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
         formData.append("lyrics_animation", jobList[i].lyricsAnimation || "none");
@@ -3132,6 +3136,7 @@ export default function App() {
         // Multi-escena sólo con fondo generado por IA (no Biblioteca/Subir).
         if (enableScenes && bgSelectMode === "auto") generateBody.append("enable_scenes", "true");
         generateBody.append("text_case", jobList[i].textCase || "upper");
+        generateBody.append("frame_format", jobList[i].frameFormat || "full");
         generateBody.append("font_scale", String(jobList[i].fontScale || "1.0"));
         // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
         generateBody.append("lyrics_animation", jobList[i].lyricsAnimation || "none");

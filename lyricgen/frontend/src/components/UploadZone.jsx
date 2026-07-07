@@ -44,7 +44,7 @@ const TITLE_CARD_FIELDS = new Set([
   "titleSongBreak",
 ]);
 const LYRIC_RENDER_FIELDS = new Set([
-  "font", "textCase", "fontScale", "textContrast",
+  "font", "textCase", "fontScale", "textContrast", "frameFormat",
   "lyricsAnimation", "lineTransition", "lyricColor", "lyricSungColor",
 ]);
 
@@ -66,6 +66,13 @@ const TEXT_CASE_OPTS = [
   { code: "lower",    d: "min", label: "todo en minúsculas" },
   { code: "sentence", d: "Abc", label: "Primera letra de cada Línea" },
   { code: "original", d: "ori", label: "Sin cambios (como está escrito)" },
+];
+// Frame format: full 16:9 (default) vs cinemascope 2.39:1 letterbox. The
+// letterbox is applied deterministically in post (see pipeline._apply_frame_format)
+// — an intentional filmic look, not Veo's stochastic bars.
+const FRAME_FORMAT_OPTS = [
+  { code: "full", d: "16:9", label: "Pantalla completa (16:9)" },
+  { code: "cine", d: "2.39", label: "Cine — franjas (2.39:1)" },
 ];
 
 // Max single-file size. Backend MAX_UPLOAD_MB default is 500 and the
@@ -297,6 +304,7 @@ export default function UploadZone({
     genre: "", concept: "", movementStyle: "", effect: "", font: "",
     // lyricTransition + textMotion: deprecados 2026-05-23 (no se persisten).
     textCase: "upper", fontScale: "1.0", lyricsAnimation: "none", lineTransition: "none", textContrast: "medium",
+    frameFormat: "full",
     // Lyric color customization 2026-05-25:
     // - lyricColor: color del texto (no-cantada para karaoke; texto único para
     //   none/pop/glow/word_reveal).
@@ -1535,6 +1543,30 @@ export default function UploadZone({
         )}
       </div>
 
+      {/* Frame format: Pantalla completa (16:9) / Cine (franjas 2.39:1).
+          El letterbox se aplica determinísticamente en post — look de cine
+          intencional, opuesto a las barras estocásticas de Veo. */}
+      <div className="mb-3">
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-gray-600 shrink-0">{t("upload.frame_format_label") || "Formato:"}</span>
+          <div className="flex gap-1">
+            {FRAME_FORMAT_OPTS.map((opt) => (
+              <button
+                key={opt.code}
+                type="button"
+                title={opt.label}
+                onClick={() => updateBatchDefault("frameFormat", opt.code)}
+                className={`px-2.5 py-1 rounded-md text-[11px] font-mono font-bold transition-all
+                  ${(batchDefaults.frameFormat || "full") === opt.code
+                    ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                    : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                  }`}
+              >{opt.d}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+
       {/* Font scale — A's en tamaños crecientes.
           QA fix 2026-05-28 (UMG report): agus reportó que un operador
           UMG quiso letras más grandes pero el botón "1.3" era el
@@ -2456,6 +2488,7 @@ export default function UploadZone({
               song={titlePreviewSong}
               font={batchDefaults.font || ""}
               textCase={batchDefaults.textCase || "upper"}
+              frameFormat={batchDefaults.frameFormat || "full"}
               template={batchDefaults.titleTemplate || "auto"}
               titleSize={parseFloat(batchDefaults.titleSize) || 1.0}
               artistFont={batchDefaults.titleArtistFont || ""}
@@ -2518,6 +2551,7 @@ export default function UploadZone({
                  batchDefaults aún no fue tocado. */
               font={batchDefaults.font || ""}
               textCase={batchDefaults.textCase || "upper"}
+              frameFormat={batchDefaults.frameFormat || "full"}
               fontScale={batchDefaults.fontScale || "1.0"}
               textContrast={batchDefaults.textContrast || "medium"}
               mode={sceneMode}
