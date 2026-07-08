@@ -37,26 +37,26 @@ export default function NovedadHero() {
           ×
         </button>
 
-        <div className="grid gap-5 p-5 lg:grid-cols-[0.95fr_1.05fr] lg:p-6">
-          <div className="flex flex-col justify-center pr-6">
+        <div className="grid items-center gap-6 p-5 lg:grid-cols-[0.92fr_1fr] lg:p-7">
+          <div className="flex flex-col justify-center pr-2 lg:pr-6">
             <div className="flex items-center gap-2">
               <span className="rounded-full bg-accent/14 px-2.5 py-1 text-[10px] font-extrabold uppercase tracking-[0.12em] text-accent ring-1 ring-accent/25">
                 {t("announce.scenes_badge") || "NUEVO"}
               </span>
               <span className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("whatsnew.title")}</span>
             </div>
-            <h2 className="mt-4 text-[26px] font-extrabold leading-tight tracking-tight text-white">
+            <h2 className="mt-4 max-w-xl text-[25px] font-extrabold leading-tight tracking-tight text-white">
               {t(featured.titleKey)}
             </h2>
             {featured.taglineKey && (
-              <p className="mt-2 max-w-xl text-sm font-medium leading-relaxed text-brand-light">
+              <p className="mt-2 max-w-xl text-[14px] font-semibold leading-relaxed text-brand-light">
                 {t(featured.taglineKey)}
               </p>
             )}
             {Array.isArray(featured.highlightKeys) && featured.highlightKeys.length > 0 && (
-              <ul className="mt-4 space-y-2">
+              <ul className="mt-4 max-w-xl space-y-2">
                 {featured.highlightKeys.slice(0, 3).map((key) => (
-                  <li key={key} className="text-sm leading-snug text-ink-secondary">{t(key)}</li>
+                  <li key={key} className="text-[13px] leading-snug text-ink-secondary">{t(key)}</li>
                 ))}
               </ul>
             )}
@@ -87,13 +87,13 @@ export default function NovedadHero() {
               key={entry.id}
               type="button"
               onClick={() => navigate(entry.ctaTo || "/new")}
-              className="grid grid-cols-[104px_1fr] gap-3 rounded-2xl bg-surface-2/35 p-3 text-left ring-1 ring-white/[0.045] transition-all hover:bg-surface-2/55 hover:ring-white/[0.08]"
+              className="grid min-h-[168px] grid-cols-[190px_1fr] items-center gap-4 rounded-2xl bg-surface-2/35 p-4 text-left ring-1 ring-white/[0.045] transition-all hover:bg-surface-2/55 hover:ring-white/[0.08] max-lg:grid-cols-[160px_1fr] max-sm:grid-cols-1"
             >
               <ReleaseVisual entry={entry} compact />
-              <span className="min-w-0 self-center">
-                <span className="block text-sm font-bold leading-tight text-white">{t(entry.titleKey)}</span>
+              <span className="min-w-0">
+                <span className="block text-[15px] font-bold leading-tight text-white">{t(entry.titleKey)}</span>
                 {entry.taglineKey && (
-                  <span className="mt-1 block text-[12px] leading-snug text-ink-secondary">{t(entry.taglineKey)}</span>
+                  <span className="mt-2 block max-w-md text-[12.5px] leading-relaxed text-ink-secondary">{t(entry.taglineKey)}</span>
                 )}
               </span>
             </button>
