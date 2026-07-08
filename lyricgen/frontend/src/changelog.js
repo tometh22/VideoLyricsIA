@@ -13,10 +13,10 @@
 //                highlightKeys; el modal no lo usa).
 //   highlightKeys opcional, array de claves — bullets de detalle, SOLO
 //                visibles en el panel (WhatsNewPanel), nunca en el modal.
+//   visual       opcional: "transcription" | "textcase" | "cinema" | "media".
+//                Los tres primeros renderizan demos nativas sin assets.
 //   media        opcional, path en public/ (.mp4 = video loop; otro = imagen).
-//                Sin media, el modal arma un hero de gradiente + `icon`.
-//   icon         opcional, emoji para el hero cuando no hay `media` (default
-//                "✨").
+//                Se usa cuando visual="media" o como fallback.
 //   ctaKey       opcional, clave i18n del botón de acción.
 //   ctaTo        opcional, ruta a la que navega el CTA (ej. "/new" = Crear videos).
 //   featured     opcional, true → se muestra una vez como modal de anuncio.
@@ -37,23 +37,35 @@ export const CHANGELOG = [
     titleKey: "announce.motor2_title",
     taglineKey: "announce.motor2_tagline",
     bodyKey: "announce.motor2_body",
+    visual: "transcription",
     highlightKeys: [
       "announce.motor2_hl1",
       "announce.motor2_hl2",
       "announce.motor2_hl3",
-      "announce.motor2_hl4",
     ],
-    icon: "🎯",
     ctaKey: "announce.motor2_cta",
     ctaTo: "/new",
     featured: true,
   },
   {
-    id: "estilo-mayuscula",
+    id: "estilo-abc",
     date: "2026-07-06",
     titleKey: "announce.typocase_title",
     taglineKey: "announce.typocase_tagline",
     bodyKey: "announce.typocase_body",
+    visual: "textcase",
+    ctaKey: "announce.typocase_cta",
+    ctaTo: "/new",
+  },
+  {
+    id: "formato-cine",
+    date: "2026-07-07",
+    titleKey: "announce.cinema_title",
+    taglineKey: "announce.cinema_tagline",
+    bodyKey: "announce.cinema_body",
+    visual: "cinema",
+    ctaKey: "announce.cinema_cta",
+    ctaTo: "/new",
   },
   {
     id: "escenas",
@@ -67,6 +79,7 @@ export const CHANGELOG = [
       "announce.scenes_hl2",
       "announce.scenes_hl3",
     ],
+    visual: "media",
     media: "/escenas_demo.mp4",
     ctaKey: "announce.scenes_cta",
     ctaTo: "/new",
