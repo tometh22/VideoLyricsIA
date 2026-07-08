@@ -33,110 +33,91 @@ export default function NovedadHero() {
     setDismissed(true);
     try { localStorage.setItem(DISMISS_KEY, featured.id); } catch {}
   };
+
   const updates = secondary.slice(0, 3);
-  const releaseVersion = "v2.7";
 
   return (
-    <section className="mb-6 animate-fade-in">
-      <div className="relative overflow-hidden rounded-card bg-[#111118]/88 ring-1 ring-white/[0.07]">
-        <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-accent/70 to-transparent" />
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_76%_16%,rgba(20,200,168,0.13),transparent_34%),linear-gradient(180deg,rgba(255,255,255,0.035),transparent_42%)]" />
+    <section className="mb-5 animate-fade-in" data-tour="whatsnew-release">
+      <div className="relative overflow-hidden rounded-xl bg-[#111118]/86 ring-1 ring-white/[0.065]">
+        <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/20 to-transparent" />
         <button
           type="button"
           onClick={dismiss}
           aria-label={t("common.cancel") || "Cerrar"}
-          className="absolute right-3 top-3 z-20 grid h-7 w-7 place-items-center rounded-full bg-black/35 text-gray-500 ring-1 ring-white/[0.06] transition-colors hover:bg-black/55 hover:text-white"
+          className="absolute right-2.5 top-2.5 z-20 grid h-7 w-7 place-items-center rounded-lg text-[16px] leading-none text-gray-500 transition-colors hover:bg-white/[0.05] hover:text-white"
         >
           ×
         </button>
 
-        <div className="relative z-10 grid items-center gap-5 p-4 md:p-5 lg:grid-cols-[0.82fr_1fr]">
-          <div className="flex min-w-0 flex-col justify-center pr-2 lg:pr-6">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="rounded-full bg-accent/12 px-2.5 py-1 text-[10px] font-extrabold uppercase text-accent ring-1 ring-accent/25">
-                Release {releaseVersion}
-              </span>
+        <div className="grid min-h-[150px] gap-3 p-4 pr-11 md:grid-cols-[minmax(0,1fr)_300px] md:items-center md:gap-5 md:p-5 md:pr-12 xl:grid-cols-[minmax(0,1fr)_336px]">
+          <div className="min-w-0">
+            <div className="mb-2.5 flex flex-wrap items-center gap-2">
               <span className="rounded-full bg-white/[0.045] px-2.5 py-1 text-[10px] font-semibold uppercase text-gray-400 ring-1 ring-white/[0.06]">
+                {t("whatsnew.title") || "Novedades"}
+              </span>
+              <span className="rounded-full bg-accent/[0.08] px-2.5 py-1 text-[10px] font-semibold text-accent ring-1 ring-accent/20">
                 {releaseDate(featured.date)}
               </span>
-              <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-400/[0.08] px-2.5 py-1 text-[10px] font-semibold text-emerald-300 ring-1 ring-emerald-400/20">
-                <span className="h-1.5 w-1.5 rounded-full bg-emerald-300 shadow-[0_0_12px_rgba(110,231,183,.7)]" />
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-white/[0.035] px-2.5 py-1 text-[10px] font-medium text-gray-400 ring-1 ring-white/[0.05]">
+                <span className="h-1.5 w-1.5 rounded-full bg-accent" />
                 activo ahora
               </span>
             </div>
-            <p className="mt-4 text-[10px] font-semibold uppercase text-gray-500 tracking-[0.18em]">
-              {t("whatsnew.title")} de julio
-            </p>
-            <h2 className="mt-2 max-w-xl text-[22px] font-bold leading-[1.14] tracking-normal text-white md:text-[24px]">
+
+            <h2 className="max-w-2xl text-[18px] font-bold leading-tight text-white md:text-[20px]">
               {t(featured.titleKey)}
             </h2>
             {featured.taglineKey && (
-              <p className="mt-2 max-w-xl text-[13px] font-semibold leading-relaxed text-brand-light">
+              <p className="mt-1.5 max-w-2xl text-[12.5px] font-medium leading-relaxed text-ink-secondary">
                 {t(featured.taglineKey)}
               </p>
             )}
-            {Array.isArray(featured.highlightKeys) && featured.highlightKeys.length > 0 && (
-              <ul className="mt-3.5 grid max-w-xl gap-1.5">
-                {featured.highlightKeys.slice(0, 3).map((key) => (
-                  <li key={key} className="flex items-start gap-2 text-[12px] leading-snug text-ink-secondary">
-                    <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-accent/80" />
-                    <span>{t(key)}</span>
-                  </li>
-                ))}
-              </ul>
-            )}
-            {featured.ctaTo && (
-              <div className="mt-[18px] flex flex-wrap items-center gap-3">
+
+            <div className="mt-3 flex flex-wrap items-center gap-2.5">
+              {Array.isArray(featured.highlightKeys) && featured.highlightKeys.slice(0, 2).map((key) => (
+                <span
+                  key={key}
+                  className="inline-flex max-w-full items-center gap-1.5 rounded-full bg-white/[0.035] px-2.5 py-1 text-[11px] text-gray-300 ring-1 ring-white/[0.05]"
+                >
+                  <span className="h-1 w-1 shrink-0 rounded-full bg-accent/80" />
+                  <span className="truncate">{t(key)}</span>
+                </span>
+              ))}
+            </div>
+
+            <div className="mt-4 flex flex-wrap items-center gap-3">
+              {featured.ctaTo && (
                 <button
                   type="button"
                   onClick={() => navigate(featured.ctaTo)}
-                  className="inline-flex h-9 items-center gap-2 rounded-button bg-brand px-4 text-[13px] font-semibold text-white shadow-glow transition-colors hover:bg-brand-light"
+                  className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-brand px-3.5 text-[12px] font-semibold text-white shadow-[0_6px_18px_rgba(109,74,255,0.22)] transition-colors hover:bg-brand-light"
                 >
                   {t(featured.ctaKey)}
-                  <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.3" viewBox="0 0 24 24">
+                  <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
                     <path d="M5 12h14M13 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round" />
                   </svg>
                 </button>
-                <span className="text-[12px] text-gray-500">
-                  {updates.length + 1} mejoras publicadas esta semana
-                </span>
-              </div>
-            )}
+              )}
+              {updates.length > 0 && (
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[11px] text-gray-500">
+                  {updates.map((entry) => (
+                    <button
+                      key={entry.id}
+                      type="button"
+                      onClick={() => navigate(entry.ctaTo || "/new")}
+                      className="max-w-[190px] truncate rounded-full bg-white/[0.028] px-2.5 py-1 text-left text-gray-400 ring-1 ring-white/[0.05] transition-colors hover:bg-white/[0.05] hover:text-white"
+                      title={t(entry.titleKey)}
+                    >
+                      {t(entry.titleKey)}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
 
-          <ReleaseVisual entry={featured} />
-        </div>
-
-        <div className="relative z-10 border-t border-white/[0.06] bg-black/[0.12] px-4 py-3.5 lg:px-5">
-          <div className="mb-3 flex items-center justify-between gap-3">
-            <p className="text-[10px] font-semibold uppercase text-gray-500">También llegó</p>
-            <p className="hidden text-[11px] text-gray-500 sm:block">Historial breve de mejoras recientes</p>
-          </div>
-          <div className="grid gap-2.5 lg:grid-cols-3">
-            {updates.map((entry, idx) => (
-              <button
-                key={entry.id}
-                type="button"
-                onClick={() => navigate(entry.ctaTo || "/new")}
-                className="group grid min-h-[104px] grid-cols-[92px_1fr] items-center gap-2.5 rounded-lg bg-white/[0.032] p-2 text-left ring-1 ring-white/[0.055] transition-all hover:bg-white/[0.052] hover:ring-white/[0.10] max-sm:grid-cols-1"
-              >
-                <ReleaseVisual entry={entry} compact />
-                <span className="min-w-0">
-                  <span className="mb-1.5 flex items-center gap-1.5">
-                    <span className="grid h-[18px] w-[18px] place-items-center rounded-full bg-accent/10 text-[9px] font-bold text-accent ring-1 ring-accent/20">
-                      {idx + 1}
-                    </span>
-                    <span className="text-[9px] font-semibold uppercase text-gray-500">
-                      {releaseDate(entry.date)}
-                    </span>
-                  </span>
-                  <span className="block text-[12.5px] font-bold leading-tight text-white">{t(entry.titleKey)}</span>
-                  {entry.taglineKey && (
-                    <span className="mt-1 block text-[11px] leading-snug text-ink-secondary">{t(entry.taglineKey)}</span>
-                  )}
-                </span>
-              </button>
-            ))}
+          <div className="hidden min-w-0 md:block">
+            <ReleaseVisual entry={featured} compact />
           </div>
         </div>
       </div>

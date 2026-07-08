@@ -147,7 +147,7 @@ export default function DashboardStepper({ onPrimaryAction }) {
 
   return (
     <section
-      className="dr-stepper rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-5 md:p-6 mb-6"
+      className="dr-stepper rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] p-5 md:p-6 mb-6"
       aria-labelledby="dr-stepper-title"
     >
       <header className="flex items-center justify-between mb-4 md:mb-5">
