@@ -11062,6 +11062,15 @@ class YoutubeUploadBody(BaseModel):
     privacy: str = "unlisted"
     title: str | None = None
     description: str | None = None
+    tags: list[str] | None = None
+
+
+def _load_yt_settings(db: Session, user_id: int) -> dict:
+    """The user's YouTube template (title format, header/footer, hashtags,
+    mandatory tags, language) from UserSettings — so the template configured
+    in Settings → YouTube is actually applied at publish time."""
+    row = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
+    return (row.settings_json or {}) if row else {}
 
 
 @app.get("/youtube/connection-status")
@@ -11205,6 +11214,7 @@ async def youtube_upload(
 
     artist = job.get("artist", "")
 
+    yt_settings = _load_yt_settings(db, current_user["id"])
     import asyncio
     from functools import partial
     from youtube_upload import upload_to_youtube
@@ -11215,6 +11225,8 @@ async def youtube_upload(
             video_path, thumb_path, artist, song, "", privacy, job_id,
             body.title if body else None,
             body.description if body else None,
+            tags_override=body.tags if body else None,
+            settings=yt_settings,
         )
         result = await loop.run_in_executor(None, fn)
     except Exception as e:
@@ -11256,6 +11268,7 @@ async def youtube_upload_short(
 
     artist = job.get("artist", "")
 
+    yt_settings = _load_yt_settings(db, current_user["id"])
     import asyncio
     from functools import partial
     from youtube_upload import upload_short_to_youtube
@@ -11266,6 +11279,8 @@ async def youtube_upload_short(
             short_path, thumb_path, artist, song, "", privacy, job_id,
             body.title if body else None,
             body.description if body else None,
+            tags_override=body.tags if body else None,
+            settings=yt_settings,
         )
         result = await loop.run_in_executor(None, fn)
     except Exception as e:
@@ -11293,12 +11308,14 @@ async def youtube_short_metadata_preview(
     for sfx in ["(Official Video)", "(Official Audio)", "(En Vivo)", "(Live)", "(Lyrics)"]:
         song = song.replace(sfx, "").strip()
 
+    yt_settings = _load_yt_settings(db, current_user["id"])
     from youtube_upload import generate_short_metadata
     from functools import partial
     import asyncio
     loop = asyncio.get_event_loop()
     metadata = await loop.run_in_executor(
-        None, partial(generate_short_metadata, job.get("artist", ""), song, "", job_id=job_id),
+        None, partial(generate_short_metadata, job.get("artist", ""), song, "",
+                      job_id=job_id, settings=yt_settings),
     )
     return metadata
 
@@ -11321,12 +11338,14 @@ async def youtube_metadata_preview(
     for sfx in ["(Official Video)", "(Official Audio)", "(En Vivo)", "(Live)", "(Lyrics)"]:
         song = song.replace(sfx, "").strip()
 
+    yt_settings = _load_yt_settings(db, current_user["id"])
     from youtube_upload import generate_youtube_metadata
     from functools import partial
     import asyncio
     loop = asyncio.get_event_loop()
     metadata = await loop.run_in_executor(
-        None, partial(generate_youtube_metadata, job.get("artist", ""), song, "", job_id=job_id),
+        None, partial(generate_youtube_metadata, job.get("artist", ""), song, "",
+                      job_id=job_id, settings=yt_settings),
     )
     return metadata
 
