@@ -477,14 +477,8 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
       )}
 
       <div className={`flex-1 min-h-screen transition-all duration-300 ${sidebarOpen ? "md:ml-60" : "md:ml-0"}`}>
-        {/* Ambient */}
-        <div className="fixed inset-0 pointer-events-none">
-          <div className="absolute top-[-30%] left-[20%] w-[600px] h-[600px] bg-brand/[0.03] rounded-full blur-[120px]" />
-          <div className="absolute bottom-[-20%] right-[-5%] w-[500px] h-[500px] bg-brand-light/[0.02] rounded-full blur-[100px]" />
-        </div>
-
         {/* Top bar */}
-        <header className="sticky top-0 z-30 flex h-14 items-center justify-between px-4 md:px-6 border-b border-white/[0.055] bg-[#08090f]/95 backdrop-blur-xl" style={{boxShadow: '0 1px 10px rgba(0,0,0,0.18)'}}>
+        <header className="sticky top-0 z-30 flex h-14 items-center justify-between px-4 md:px-6 border-b border-white/[0.055] bg-[#0b0b12]" style={{boxShadow: '0 1px 10px rgba(0,0,0,0.18)'}}>
           <div className="flex items-center gap-3">
             <button
               onClick={() => setSidebarOpen(!sidebarOpen)}

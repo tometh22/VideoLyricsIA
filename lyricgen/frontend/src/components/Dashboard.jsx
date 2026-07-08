@@ -85,7 +85,7 @@ function VideoCard({ job, onSelect }) {
   return (
     <button
       onClick={() => onSelect(job.job_id, job.status)}
-      className="rounded-card overflow-hidden text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all"
+      className="overflow-hidden rounded-xl text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all"
     >
       <div className="aspect-video bg-surface-3/30 relative overflow-hidden">
         {thumbSrc && (
@@ -300,7 +300,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
       : "bg-accent shadow-[0_0_14px_rgba(20,200,168,.65)]";
 
   return (
-    <div className="w-full max-w-[1540px] animate-fade-in">
+    <div className="w-full max-w-[1360px] animate-fade-in">
       {/* ─── Command bar simplificada (header reposicionado, search vendrá en PR-2) ─── */}
       <div className="mb-5 rounded-lg bg-[linear-gradient(135deg,rgba(255,255,255,0.035),rgba(255,255,255,0.014))] px-4 py-3.5 ring-1 ring-white/[0.055] md:px-5">
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
@@ -356,8 +356,12 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               <svg className={`w-3 h-3 transition-transform ${attentionOpen ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" strokeLinecap="round" strokeLinejoin="round"/></svg>
             </button>
           )}
-          <button onClick={onNewBatch} className="btn-primary px-4" data-tour="dashboard-new-batch">
-            <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+          <button
+            onClick={onNewBatch}
+            className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg bg-brand px-3.5 text-[12px] font-semibold text-white shadow-[0_6px_18px_rgba(109,74,255,0.22)] transition-colors hover:bg-brand-light"
+            data-tour="dashboard-new-batch"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
               <path d="M12 5v14M5 12h14" strokeLinecap="round"/>
             </svg>
             {t("nav.new_batch")}
@@ -372,7 +376,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
             UX 2026-05-29: ocultas cuando todos los valores son 0 — en cuenta
             nueva el bloque ocupaba 200px diciendo "no pasa nada". ─── */}
       {(pendingReview.length > 0 || processing.length > 0 || monthlyUsed > 0) && (
-      <div className="mb-6 grid grid-cols-1 overflow-hidden rounded-card bg-[#111118]/82 ring-1 ring-white/[0.06] md:grid-cols-3 md:divide-x md:divide-white/[0.055]">
+      <div className="mb-5 grid grid-cols-1 overflow-hidden rounded-xl bg-[#111118]/82 ring-1 ring-white/[0.06] md:grid-cols-3 md:divide-x md:divide-white/[0.055]">
 
         {/* COL 1: APROBAR — north star del operador */}
         <button
@@ -581,7 +585,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           const blockMode = usage.alert_100 && !user?.allow_overage;
           return (
             <div
-              className={`w-full mb-4 flex items-center gap-3 px-5 py-4 rounded-card ring-1 ${
+              className={`w-full mb-4 flex items-center gap-3 px-5 py-4 rounded-xl ring-1 ${
                 blockMode
                   ? "bg-red-500/[0.08] ring-red-500/30"
                   : overageMode
@@ -767,7 +771,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         </div>
       )}
       {history.length === 0 && historyError && (
-        <div className="rounded-card p-10 text-center bg-amber-500/[0.06] ring-1 ring-amber-500/25">
+        <div className="rounded-xl p-10 text-center bg-amber-500/[0.06] ring-1 ring-amber-500/25">
           <div className="w-12 h-12 mx-auto mb-4 rounded-2xl bg-amber-500/15 ring-1 ring-amber-500/30 flex items-center justify-center">
             <svg className="w-6 h-6 text-amber-300" fill="none" stroke="currentColor" strokeWidth="1.6" viewBox="0 0 24 24">
               <path d="M12 9v3.5m0 3.5h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" strokeLinecap="round" strokeLinejoin="round"/>
@@ -792,7 +796,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           de fallo silencioso de /jobs) mostramos este card sutil que no
           alarma con "creá tu primer video". */}
       {isTrueEmptyState && !isFirstWeekUser && (
-        <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
+        <div className="rounded-xl p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
           <div className="w-14 h-14 mx-auto mb-5 rounded-2xl bg-brand/10 ring-1 ring-brand/20 flex items-center justify-center">
             <svg className="w-7 h-7 text-brand-light" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">
               <path d="M9 18V5l12-2v13" strokeLinecap="round" strokeLinejoin="round"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
