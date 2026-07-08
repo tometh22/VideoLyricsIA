@@ -149,9 +149,13 @@ function CinemaVisual({ compact = false }) {
             {t("release.visual.cine")}
           </span>
         </div>
-        <div className="relative aspect-video overflow-hidden rounded-md bg-gradient-to-br from-cyan-500 via-indigo-500 to-rose-400">
-          <div className="absolute inset-x-0 top-0 h-[13.4%] bg-black" />
-          <div className="absolute inset-x-0 bottom-0 h-[13.4%] bg-black" />
+        <div className="relative aspect-video overflow-hidden rounded-md bg-black ring-1 ring-white/[0.08]">
+          <div className="absolute inset-x-0 top-[22%] bottom-[22%] bg-gradient-to-br from-cyan-500 via-indigo-500 to-rose-400" />
+          <div className="absolute left-2 right-2 top-[22%] border-t border-white/20" />
+          <div className="absolute bottom-[22%] left-2 right-2 border-t border-white/15" />
+          <div className="absolute inset-0 grid place-items-center">
+            <span className="h-1 w-7 rounded-full bg-white/70" />
+          </div>
         </div>
       </div>
     );
@@ -166,9 +170,10 @@ function CinemaVisual({ compact = false }) {
           <span className="rounded-full bg-white px-2 py-1 font-bold text-black">{t("release.visual.cine")}</span>
         </div>
       </div>
-      <div className="relative aspect-video overflow-hidden rounded-xl bg-gradient-to-br from-cyan-400 via-indigo-500 to-rose-400">
-        <div className="absolute inset-x-0 top-0 h-[13.4%] bg-black" />
-        <div className="absolute inset-x-0 bottom-0 h-[13.4%] bg-black" />
+      <div className="relative aspect-video overflow-hidden rounded-xl bg-black ring-1 ring-white/[0.06]">
+        <div className="absolute inset-x-0 top-[18%] bottom-[18%] bg-gradient-to-br from-cyan-400 via-indigo-500 to-rose-400" />
+        <div className="absolute left-4 right-4 top-[18%] border-t border-white/20" />
+        <div className="absolute bottom-[18%] left-4 right-4 border-t border-white/15" />
         <div className="absolute inset-0 flex items-center justify-center">
           <p className="text-sm font-extrabold tracking-wide text-white drop-shadow">LYRIC VIDEO</p>
         </div>
