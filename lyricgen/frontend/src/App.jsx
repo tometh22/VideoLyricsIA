@@ -484,7 +484,7 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
         </div>
 
         {/* Top bar */}
-        <header className="sticky top-0 z-20 flex items-center justify-between px-4 md:px-7 py-3 border-b border-white/[0.04] bg-surface/82 backdrop-blur-xl" style={{boxShadow: '0 1px 12px rgba(0,0,0,0.16)'}}>
+        <header className="sticky top-0 z-30 flex h-14 items-center justify-between px-4 md:px-6 border-b border-white/[0.055] bg-[#08090f]/95 backdrop-blur-xl" style={{boxShadow: '0 1px 10px rgba(0,0,0,0.18)'}}>
           <div className="flex items-center gap-3">
             <button
               onClick={() => setSidebarOpen(!sidebarOpen)}
@@ -526,7 +526,7 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
         <UpgradeNudge user={user} />
 
         {/* Content */}
-        <main className="relative z-10 px-4 md:px-7 pt-5 md:pt-6 pb-20">
+        <main className="relative z-10 px-4 md:px-6 pt-5 pb-20">
           <GiftCreditsBanner user={user} />
           <Outlet />
         </main>

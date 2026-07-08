@@ -302,7 +302,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
   return (
     <div className="w-full max-w-[1540px] animate-fade-in">
       {/* ─── Command bar simplificada (header reposicionado, search vendrá en PR-2) ─── */}
-      <div className="mb-5 rounded-card bg-[linear-gradient(135deg,rgba(255,255,255,0.04),rgba(255,255,255,0.016))] px-4 py-4 ring-1 ring-white/[0.055] md:px-5">
+      <div className="mb-5 rounded-lg bg-[linear-gradient(135deg,rgba(255,255,255,0.035),rgba(255,255,255,0.014))] px-4 py-3.5 ring-1 ring-white/[0.055] md:px-5">
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div className="min-w-0">
           <div className="mb-2 flex flex-wrap items-center gap-2">
@@ -315,10 +315,10 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               {liveState}
             </span>
           </div>
-          <h1 className="text-[26px] leading-[1.12] font-bold tracking-normal text-white md:text-[28px]">
+          <h1 className="text-[24px] leading-[1.14] font-bold tracking-normal text-white md:text-[26px]">
             {heroHeadline}
           </h1>
-          <p className="mt-1.5 max-w-2xl text-[13.5px] leading-relaxed text-ink-secondary">{heroSubline}</p>
+          <p className="mt-1.5 max-w-2xl text-[13px] leading-relaxed text-ink-secondary">{heroSubline}</p>
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-2 lg:justify-end">
           {/* Search button — abre el SearchPalette (PR-2 2026-05-25).
@@ -391,7 +391,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
             </span>
           </div>
           <div className="mt-2 flex items-baseline gap-2">
-            <span className={`text-[36px] leading-none font-bold tracking-normal tabular-nums md:text-[38px]
+            <span className={`text-[34px] leading-none font-bold tracking-normal tabular-nums md:text-[36px]
               ${pendingReview.length === 0 ? "text-white/40" :
                 pendingReview.length >= 5 ? "text-red-300" :
                 "text-amber-200"}`}>
@@ -430,7 +430,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
             </span>
           </div>
           <div className="mt-2 flex items-baseline gap-2">
-            <span className={`text-[36px] leading-none font-bold tracking-normal tabular-nums md:text-[38px]
+            <span className={`text-[34px] leading-none font-bold tracking-normal tabular-nums md:text-[36px]
               ${processing.length === 0 ? "text-white/40" : "text-brand-light"}`}>
               {processing.length}
             </span>
@@ -483,12 +483,12 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           <div className="mt-2 flex items-baseline gap-2">
             {isUnlimited ? (
               <>
-                <span className="text-[36px] leading-none font-bold tracking-normal tabular-nums text-white md:text-[38px]">{monthlyUsed}</span>
+                <span className="text-[34px] leading-none font-bold tracking-normal tabular-nums text-white md:text-[36px]">{monthlyUsed}</span>
                 <span className="text-xs text-ink-secondary">sin límite</span>
               </>
             ) : monthlyLimit ? (
               <>
-                <span className={`text-[36px] leading-none font-bold tracking-normal tabular-nums md:text-[38px] ${
+                <span className={`text-[34px] leading-none font-bold tracking-normal tabular-nums md:text-[36px] ${
                   usagePercent >= 100 ? "text-red-300" :
                   usagePercent >= 80 ? "text-amber-200" :
                   "text-white"

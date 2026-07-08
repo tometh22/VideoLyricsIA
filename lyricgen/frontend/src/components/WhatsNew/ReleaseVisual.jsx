@@ -5,19 +5,19 @@ function TranscriptionVisual({ compact = false }) {
   const bars = [26, 44, 36, 58, 42, 72, 86, 64, 38, 76, 56, 34, 62, 48, 70, 44, 58, 32];
   if (compact) {
     return (
-      <div className="relative flex h-full min-h-[108px] flex-col justify-between overflow-hidden rounded-xl bg-[#080a10] p-3 ring-1 ring-white/[0.08]">
+      <div className="relative flex h-full min-h-[88px] flex-col justify-between overflow-hidden rounded-lg bg-[#080a10] p-2 ring-1 ring-white/[0.08]">
         <div className="flex items-center justify-between">
-          <p className="text-[9px] uppercase tracking-[0.16em] text-gray-500">{t("release.visual.audio")}</p>
-          <span className="rounded-full bg-accent/12 px-2 py-0.5 text-[9px] font-semibold text-accent ring-1 ring-accent/20">
+          <p className="text-[8px] uppercase tracking-[0.12em] text-gray-500">{t("release.visual.audio")}</p>
+          <span className="rounded-full bg-accent/12 px-1.5 py-0.5 text-[8px] font-semibold text-accent ring-1 ring-accent/20">
             {t("release.visual.synced")}
           </span>
         </div>
-        <div className="relative flex h-16 items-center justify-center gap-1 overflow-hidden rounded-lg bg-surface/80 px-2">
+        <div className="relative flex h-12 items-center justify-center gap-0.5 overflow-hidden rounded-md bg-surface/80 px-1.5">
           <div className="absolute bottom-1 top-1 left-[46%] w-px bg-accent/80" />
           {bars.slice(2, 15).map((h, idx) => (
             <div
               key={idx}
-              className={`min-w-[4px] max-w-[10px] flex-1 rounded-full ${idx >= 4 && idx <= 7 ? "bg-accent" : "bg-white/16"}`}
+              className={`min-w-[3px] max-w-[8px] flex-1 rounded-full ${idx >= 4 && idx <= 7 ? "bg-accent" : "bg-white/16"}`}
               style={{ height: `${Math.max(22, h)}%` }}
             />
           ))}
@@ -97,15 +97,15 @@ function TextCaseVisual({ compact = false }) {
   ];
   if (compact) {
     return (
-      <div className="flex h-full min-h-[108px] flex-col justify-between rounded-xl bg-[#0b0b12] p-3 ring-1 ring-white/[0.08]">
-        <p className="text-[9px] uppercase tracking-[0.16em] text-gray-500">{t("release.visual.typography")}</p>
-        <div className="grid grid-cols-4 gap-1.5">
+      <div className="flex h-full min-h-[88px] flex-col justify-between rounded-lg bg-[#0b0b12] p-2 ring-1 ring-white/[0.08]">
+        <p className="text-[8px] uppercase tracking-[0.12em] text-gray-500">Texto</p>
+        <div className="grid grid-cols-4 gap-1">
           {cases.map(([code]) => {
             const active = code === "Abc";
             return (
               <div
                 key={code}
-                className={`grid h-9 place-items-center rounded-lg text-[11px] font-extrabold ${
+                className={`grid h-6 place-items-center rounded-md text-[9px] font-extrabold ${
                   active ? "bg-brand/18 text-brand-light ring-1 ring-brand/40" : "bg-white/[0.045] text-gray-500"
                 }`}
               >
@@ -114,8 +114,8 @@ function TextCaseVisual({ compact = false }) {
             );
           })}
         </div>
-        <div className="rounded-lg bg-brand/10 px-3 py-2 ring-1 ring-brand/25">
-          <p className="text-[13px] font-semibold leading-tight text-white">Como el viento</p>
+        <div className="rounded-md bg-brand/10 px-2 py-1.5 ring-1 ring-brand/25">
+          <p className="text-[11px] font-semibold leading-tight text-white">Como el viento</p>
         </div>
       </div>
     );
@@ -146,18 +146,18 @@ function CinemaVisual({ compact = false }) {
   const { t } = useI18n();
   if (compact) {
     return (
-      <div className="flex h-full min-h-[108px] flex-col justify-between rounded-xl bg-[#0b0b12] p-3 ring-1 ring-white/[0.08]">
+      <div className="flex h-full min-h-[88px] flex-col justify-between rounded-lg bg-[#0b0b12] p-2 ring-1 ring-white/[0.08]">
         <div className="flex items-center justify-between gap-2">
-          <p className="text-[9px] uppercase tracking-[0.16em] text-gray-500">{t("release.visual.frame")}</p>
-          <span className="rounded-full bg-white px-2 py-0.5 text-[9px] font-bold text-black">
+          <p className="text-[8px] uppercase tracking-[0.12em] text-gray-500">Video</p>
+          <span className="rounded-full bg-white px-1.5 py-0.5 text-[8px] font-bold text-black">
             {t("release.visual.cine")}
           </span>
         </div>
-        <div className="relative aspect-video overflow-hidden rounded-lg bg-gradient-to-br from-cyan-400 via-indigo-500 to-rose-400">
+        <div className="relative aspect-video overflow-hidden rounded-md bg-gradient-to-br from-cyan-400 via-indigo-500 to-rose-400">
           <div className="absolute inset-x-0 top-0 h-[13.4%] bg-black" />
           <div className="absolute inset-x-0 bottom-0 h-[13.4%] bg-black" />
           <div className="absolute inset-0 flex items-center justify-center">
-            <p className="text-[11px] font-extrabold tracking-wide text-white drop-shadow">LYRIC VIDEO</p>
+            <p className="text-[8px] font-extrabold tracking-wide text-white drop-shadow">LYRIC VIDEO</p>
           </div>
         </div>
       </div>
@@ -189,7 +189,7 @@ function MediaVisual({ entry, compact = false }) {
   const isVideo = (entry.media || "").endsWith(".mp4");
   if (!entry.media) return <TranscriptionVisual compact={compact} />;
   return (
-    <div className={`overflow-hidden bg-black ring-1 ring-white/[0.08] ${compact ? "h-full min-h-[108px] rounded-xl" : "rounded-2xl"}`}>
+    <div className={`overflow-hidden bg-black ring-1 ring-white/[0.08] ${compact ? "h-full min-h-[88px] rounded-lg" : "rounded-2xl"}`}>
       {isVideo ? (
         <video src={entry.media} autoPlay muted loop playsInline className={compact ? "h-full w-full object-cover" : "aspect-video w-full object-cover"} />
       ) : (

@@ -50,7 +50,7 @@ export default function NovedadHero() {
           ×
         </button>
 
-        <div className="relative z-10 grid items-center gap-5 p-4 md:p-5 lg:grid-cols-[0.82fr_1fr] lg:p-6">
+        <div className="relative z-10 grid items-center gap-5 p-4 md:p-5 lg:grid-cols-[0.82fr_1fr]">
           <div className="flex min-w-0 flex-col justify-center pr-2 lg:pr-6">
             <div className="flex flex-wrap items-center gap-2">
               <span className="rounded-full bg-accent/12 px-2.5 py-1 text-[10px] font-extrabold uppercase text-accent ring-1 ring-accent/25">
@@ -67,18 +67,18 @@ export default function NovedadHero() {
             <p className="mt-4 text-[10px] font-semibold uppercase text-gray-500 tracking-[0.18em]">
               {t("whatsnew.title")} de julio
             </p>
-            <h2 className="mt-2 max-w-xl text-[24px] font-bold leading-[1.12] tracking-normal text-white md:text-[26px]">
+            <h2 className="mt-2 max-w-xl text-[22px] font-bold leading-[1.14] tracking-normal text-white md:text-[24px]">
               {t(featured.titleKey)}
             </h2>
             {featured.taglineKey && (
-              <p className="mt-2.5 max-w-xl text-[14px] font-semibold leading-relaxed text-brand-light">
+              <p className="mt-2 max-w-xl text-[13px] font-semibold leading-relaxed text-brand-light">
                 {t(featured.taglineKey)}
               </p>
             )}
             {Array.isArray(featured.highlightKeys) && featured.highlightKeys.length > 0 && (
-              <ul className="mt-4 grid max-w-xl gap-2">
+              <ul className="mt-3.5 grid max-w-xl gap-1.5">
                 {featured.highlightKeys.slice(0, 3).map((key) => (
-                  <li key={key} className="flex items-start gap-2 text-[12.5px] leading-snug text-ink-secondary">
+                  <li key={key} className="flex items-start gap-2 text-[12px] leading-snug text-ink-secondary">
                     <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-accent/80" />
                     <span>{t(key)}</span>
                   </li>
@@ -86,7 +86,7 @@ export default function NovedadHero() {
               </ul>
             )}
             {featured.ctaTo && (
-              <div className="mt-5 flex flex-wrap items-center gap-3">
+              <div className="mt-[18px] flex flex-wrap items-center gap-3">
                 <button
                   type="button"
                   onClick={() => navigate(featured.ctaTo)}
@@ -112,27 +112,27 @@ export default function NovedadHero() {
             <p className="text-[10px] font-semibold uppercase text-gray-500">También llegó</p>
             <p className="hidden text-[11px] text-gray-500 sm:block">Historial breve de mejoras recientes</p>
           </div>
-          <div className="grid gap-3 lg:grid-cols-3">
+          <div className="grid gap-2.5 lg:grid-cols-3">
             {updates.map((entry, idx) => (
               <button
                 key={entry.id}
                 type="button"
                 onClick={() => navigate(entry.ctaTo || "/new")}
-                className="group grid min-h-[120px] grid-cols-[120px_1fr] items-center gap-3 rounded-xl bg-white/[0.035] p-2.5 text-left ring-1 ring-white/[0.055] transition-all hover:bg-white/[0.055] hover:ring-white/[0.10] max-sm:grid-cols-1"
+                className="group grid min-h-[104px] grid-cols-[92px_1fr] items-center gap-2.5 rounded-lg bg-white/[0.032] p-2 text-left ring-1 ring-white/[0.055] transition-all hover:bg-white/[0.052] hover:ring-white/[0.10] max-sm:grid-cols-1"
               >
                 <ReleaseVisual entry={entry} compact />
                 <span className="min-w-0">
-                  <span className="mb-2 flex items-center gap-2">
-                    <span className="grid h-5 w-5 place-items-center rounded-full bg-accent/10 text-[10px] font-bold text-accent ring-1 ring-accent/20">
+                  <span className="mb-1.5 flex items-center gap-1.5">
+                    <span className="grid h-[18px] w-[18px] place-items-center rounded-full bg-accent/10 text-[9px] font-bold text-accent ring-1 ring-accent/20">
                       {idx + 1}
                     </span>
-                    <span className="text-[10px] font-semibold uppercase text-gray-500">
+                    <span className="text-[9px] font-semibold uppercase text-gray-500">
                       {releaseDate(entry.date)}
                     </span>
                   </span>
-                  <span className="block text-[13.5px] font-bold leading-tight text-white">{t(entry.titleKey)}</span>
+                  <span className="block text-[12.5px] font-bold leading-tight text-white">{t(entry.titleKey)}</span>
                   {entry.taglineKey && (
-                    <span className="mt-1.5 block text-[11.5px] leading-relaxed text-ink-secondary">{t(entry.taglineKey)}</span>
+                    <span className="mt-1 block text-[11px] leading-snug text-ink-secondary">{t(entry.taglineKey)}</span>
                   )}
                 </span>
               </button>
