@@ -3634,23 +3634,46 @@ async def upload_multipart_complete(
             detail=f"R2 multipart_complete failed: {e}",
         )
     if not completed_key:
-        # storage.multipart_complete swallows boto errors and returns
-        # None (already-aborted upload_id, InvalidPart, transient R2
-        # failure). Before this check we answered 200 anyway: the
-        # browser believed the upload succeeded, /transcribe-uploaded
-        # later failed far from the cause, and — worse — we cleared
-        # multipart_upload_id below, so the orphaned parts could never
-        # be aborted and accrued R2 storage forever. Keep the upload_id
-        # intact: the client's retry/abort and the reaper both still
-        # work with it.
-        logger.warning(
-            "[UPLOAD] multipart_complete returned no key: job=%s key=%s",
-            body.job_id, job_row.input_r2_key,
+        # storage.multipart_complete swallowed a boto error and returned
+        # None. Two very different situations hide behind that None and
+        # they must NOT be handled the same way — a HEAD on the target
+        # key is the ground truth that tells them apart:
+        #
+        #   1. The object IS there. CompleteMultipartUpload is
+        #      destructive: the first call stitches the object and
+        #      consumes the upload_id, so a second, concurrent complete
+        #      (double-submit, or a client retry whose first response was
+        #      lost) gets NoSuchUpload even though the upload durably
+        #      succeeded. Answer 200 — the bytes are safe. (Prod
+        #      2026-07-06: NoSuchUpload on a UMG .wav whose 6 parts had
+        #      all landed.)
+        #
+        #   2. No object landed. The upload_id is gone for good (R2-side
+        #      abort / stale-multipart sweep) — NoSuchUpload here is
+        #      PERMANENT, retrying /upload-multipart-complete can never
+        #      succeed. Drop the dead upload_id so the row doesn't wedge
+        #      in awaiting_upload and tell the client to re-upload.
+        recovered_size = storage.head_object_size(job_row.input_r2_key)
+        if recovered_size is None:
+            logger.warning(
+                "[UPLOAD] multipart_complete failed and no object present "
+                "— dead upload_id, asking client to re-upload: job=%s key=%s",
+                body.job_id, job_row.input_r2_key,
+            )
+            job_row.multipart_upload_id = None
+            db.commit()
+            raise HTTPException(
+                status_code=409,
+                detail="La subida expiró en R2. Volvé a subir el archivo.",
+            )
+        logger.info(
+            "[UPLOAD] multipart_complete returned no key but object is "
+            "present — idempotent recovery: job=%s key=%s size=%d",
+            body.job_id, job_row.input_r2_key, recovered_size,
         )
-        raise HTTPException(
-            status_code=502,
-            detail="R2 multipart_complete failed. Reintentá la subida.",
-        )
+        # Object is durable → fall through to the shared size-gate +
+        # upload_id clear + 200 below, exactly as a first-time success.
+        completed_key = job_row.input_r2_key
     # Server-side size gate. The 413 in /upload-url trusts the CLIENT-
     # declared size_bytes and the presigned part URLs don't constrain
     # the body, so this HEAD is the first moment we can check what
@@ -4262,6 +4285,7 @@ async def upload(
     effect: str = Form("", max_length=32),
     animate_image: str = Form("", max_length=8),
     text_case: str = Form("upper", max_length=16),
+    frame_format: str = Form("full", max_length=16),
     font_scale: str = Form("1.0", max_length=8),
     lyric_transition: str = Form("cut", max_length=16),
     text_motion: str = Form("none", max_length=16),
@@ -4457,7 +4481,8 @@ async def upload(
         effect=effect,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
         song_title=song_title,
-        text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
+        text_case=text_case if text_case in ("upper", "title", "lower", "original", "sentence") else "upper",
+        frame_format=frame_format if frame_format in ("full", "cine") else "full",
         font_scale=_font_scale,
         # lyric_transition + text_motion: deprecados 2026-05-23 (ver run_pipeline).
         # Aceptamos los Form params por back-compat pero coerce a defaults.
@@ -7250,6 +7275,7 @@ async def generate_with_segments(
     effect: str = Form("", max_length=32),
     animate_image: str = Form("", max_length=8),
     text_case: str = Form("upper", max_length=16),
+    frame_format: str = Form("full", max_length=16),
     font_scale: str = Form("1.0", max_length=8),
     lyric_transition: str = Form("cut", max_length=16),
     text_motion: str = Form("none", max_length=16),
@@ -7552,7 +7578,8 @@ async def generate_with_segments(
         effect=effect,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
         song_title=song_title,
-        text_case=text_case if text_case in ("upper", "title", "lower", "original") else "upper",
+        text_case=text_case if text_case in ("upper", "title", "lower", "original", "sentence") else "upper",
+        frame_format=frame_format if frame_format in ("full", "cine") else "full",
         font_scale=_font_scale_gen,
         # Deprecados 2026-05-23 (ver primer endpoint /upload).
         lyric_transition="cut",
@@ -8572,6 +8599,7 @@ class EditJobRequest(BaseModel):
     font: str | None = Field(default=None, max_length=64)
     font_scale: float | None = None
     text_case: str | None = Field(default=None, max_length=16)
+    frame_format: str | None = Field(default=None, max_length=16)
     # lyric_transition + text_motion deprecados 2026-05-23 — campos
     # eliminados del modelo. Clientes viejos que sigan mandándolos en el
     # body son ignorados por Pydantic (default: extra fields permitidos).
@@ -9579,6 +9607,8 @@ async def request_edit(
         edit_params["font_scale"] = body.font_scale
     if body.text_case is not None:
         edit_params["text_case"] = body.text_case
+    if body.frame_format is not None:
+        edit_params["frame_format"] = body.frame_format
     if body.text_contrast is not None:
         edit_params["text_contrast"] = body.text_contrast
     # Title-card customization (Full Rotor v1) — durable visual choices, same
@@ -10516,7 +10546,7 @@ async def retry_job(
     # lyric_transition + text_motion deprecados 2026-05-23 — sacados de la
     # whitelist; si están en render_params viejos quedan como dato muerto,
     # no se propagan al re-render.
-    for k in ("font", "font_scale", "text_case", "text_contrast",
+    for k in ("font", "font_scale", "text_case", "frame_format", "text_contrast",
               "movement_style", "animate_image", "genre", "match_lyrics",
               "background_hint", "concept", "bg_verbatim",
               "effect", "custom_colors",
@@ -10947,7 +10977,7 @@ async def create_variant(
     # (font, font_scale, etc) se pasan como kwargs individuales que
     # run_pipeline acepta. concept también va por kwarg.
     # lyric_transition + text_motion deprecados 2026-05-23 — fuera del whitelist.
-    for k in ("font", "font_scale", "text_case", "text_contrast",
+    for k in ("font", "font_scale", "text_case", "frame_format", "text_contrast",
               "movement_style", "animate_image", "genre", "match_lyrics",
               "bg_verbatim",
               # FX layer + lyric animation/transition (libass templates from
@@ -11032,6 +11062,15 @@ class YoutubeUploadBody(BaseModel):
     privacy: str = "unlisted"
     title: str | None = None
     description: str | None = None
+    tags: list[str] | None = None
+
+
+def _load_yt_settings(db: Session, user_id: int) -> dict:
+    """The user's YouTube template (title format, header/footer, hashtags,
+    mandatory tags, language) from UserSettings — so the template configured
+    in Settings → YouTube is actually applied at publish time."""
+    row = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
+    return (row.settings_json or {}) if row else {}
 
 
 @app.get("/youtube/connection-status")
@@ -11175,6 +11214,7 @@ async def youtube_upload(
 
     artist = job.get("artist", "")
 
+    yt_settings = _load_yt_settings(db, current_user["id"])
     import asyncio
     from functools import partial
     from youtube_upload import upload_to_youtube
@@ -11185,6 +11225,8 @@ async def youtube_upload(
             video_path, thumb_path, artist, song, "", privacy, job_id,
             body.title if body else None,
             body.description if body else None,
+            tags_override=body.tags if body else None,
+            settings=yt_settings,
         )
         result = await loop.run_in_executor(None, fn)
     except Exception as e:
@@ -11226,6 +11268,7 @@ async def youtube_upload_short(
 
     artist = job.get("artist", "")
 
+    yt_settings = _load_yt_settings(db, current_user["id"])
     import asyncio
     from functools import partial
     from youtube_upload import upload_short_to_youtube
@@ -11236,6 +11279,8 @@ async def youtube_upload_short(
             short_path, thumb_path, artist, song, "", privacy, job_id,
             body.title if body else None,
             body.description if body else None,
+            tags_override=body.tags if body else None,
+            settings=yt_settings,
         )
         result = await loop.run_in_executor(None, fn)
     except Exception as e:
@@ -11263,12 +11308,14 @@ async def youtube_short_metadata_preview(
     for sfx in ["(Official Video)", "(Official Audio)", "(En Vivo)", "(Live)", "(Lyrics)"]:
         song = song.replace(sfx, "").strip()
 
+    yt_settings = _load_yt_settings(db, current_user["id"])
     from youtube_upload import generate_short_metadata
     from functools import partial
     import asyncio
     loop = asyncio.get_event_loop()
     metadata = await loop.run_in_executor(
-        None, partial(generate_short_metadata, job.get("artist", ""), song, "", job_id=job_id),
+        None, partial(generate_short_metadata, job.get("artist", ""), song, "",
+                      job_id=job_id, settings=yt_settings),
     )
     return metadata
 
@@ -11291,12 +11338,14 @@ async def youtube_metadata_preview(
     for sfx in ["(Official Video)", "(Official Audio)", "(En Vivo)", "(Live)", "(Lyrics)"]:
         song = song.replace(sfx, "").strip()
 
+    yt_settings = _load_yt_settings(db, current_user["id"])
     from youtube_upload import generate_youtube_metadata
     from functools import partial
     import asyncio
     loop = asyncio.get_event_loop()
     metadata = await loop.run_in_executor(
-        None, partial(generate_youtube_metadata, job.get("artist", ""), song, "", job_id=job_id),
+        None, partial(generate_youtube_metadata, job.get("artist", ""), song, "",
+                      job_id=job_id, settings=yt_settings),
     )
     return metadata
 

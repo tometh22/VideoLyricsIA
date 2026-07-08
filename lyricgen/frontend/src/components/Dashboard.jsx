@@ -85,7 +85,7 @@ function VideoCard({ job, onSelect }) {
   return (
     <button
       onClick={() => onSelect(job.job_id, job.status)}
-      className="rounded-card overflow-hidden text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all"
+      className="overflow-hidden rounded-xl text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all"
     >
       <div className="aspect-video bg-surface-3/30 relative overflow-hidden">
         {thumbSrc && (
@@ -284,24 +284,43 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
     );
     return sorted[0];
   })();
+  const dashboardDate = (() => {
+    const d = new Date();
+    return DATE_HEADER_FMT.format(d) + " · " + d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
+  })();
+  const liveState = processing.length > 0
+    ? "Render activo"
+    : pendingReview.length > 0
+      ? "Revisión pendiente"
+      : "Sistema operativo";
+  const liveDotClass = processing.length > 0
+    ? "bg-brand shadow-[0_0_14px_rgba(124,92,255,.75)]"
+    : pendingReview.length > 0
+      ? "bg-amber-300 shadow-[0_0_14px_rgba(252,211,77,.65)]"
+      : "bg-accent shadow-[0_0_14px_rgba(20,200,168,.65)]";
 
   return (
-    <div className="w-full max-w-[1700px] animate-fade-in">
+    <div className="w-full max-w-[1360px] animate-fade-in">
       {/* ─── Command bar simplificada (header reposicionado, search vendrá en PR-2) ─── */}
-      <div className="flex items-center justify-between mb-7">
+      <div className="mb-5 rounded-lg bg-[linear-gradient(135deg,rgba(255,255,255,0.035),rgba(255,255,255,0.014))] px-4 py-3.5 ring-1 ring-white/[0.055] md:px-5">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div className="min-w-0">
-          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
-            {(() => {
-              const d = new Date();
-              return DATE_HEADER_FMT.format(d) + " · " + d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
-            })()}
-          </p>
-          <h1 className="text-[26px] leading-tight font-bold tracking-tight mt-1 truncate">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Centro de producción</p>
+            <span className="rounded-full bg-white/[0.045] px-2.5 py-1 text-[10px] font-semibold text-gray-400 ring-1 ring-white/[0.06]">
+              {dashboardDate}
+            </span>
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-white/[0.04] px-2.5 py-1 text-[10px] font-semibold text-gray-300 ring-1 ring-white/[0.06]">
+              <span className={`h-1.5 w-1.5 rounded-full ${liveDotClass}`} />
+              {liveState}
+            </span>
+          </div>
+          <h1 className="text-[24px] leading-[1.14] font-bold tracking-normal text-white md:text-[26px]">
             {heroHeadline}
           </h1>
-          <p className="text-sm text-ink-secondary mt-1">{heroSubline}</p>
+          <p className="mt-1.5 max-w-2xl text-[13px] leading-relaxed text-ink-secondary">{heroSubline}</p>
         </div>
-        <div className="flex items-center gap-2 shrink-0 ml-4">
+        <div className="flex shrink-0 flex-wrap items-center gap-2 lg:justify-end">
           {/* Search button — abre el SearchPalette (PR-2 2026-05-25).
               Visual: input fake con placeholder + atajo ⌘K a la derecha.
               Match patrón Linear/Vercel command bar. */}
@@ -337,12 +356,17 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               <svg className={`w-3 h-3 transition-transform ${attentionOpen ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" strokeLinecap="round" strokeLinejoin="round"/></svg>
             </button>
           )}
-          <button onClick={onNewBatch} className="btn-primary px-5" data-tour="dashboard-new-batch">
-            <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+          <button
+            onClick={onNewBatch}
+            className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg bg-brand px-3.5 text-[12px] font-semibold text-white shadow-[0_6px_18px_rgba(109,74,255,0.22)] transition-colors hover:bg-brand-light"
+            data-tour="dashboard-new-batch"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
               <path d="M12 5v14M5 12h14" strokeLinecap="round"/>
             </svg>
             {t("nav.new_batch")}
           </button>
+        </div>
         </div>
       </div>
 
@@ -352,17 +376,26 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
             UX 2026-05-29: ocultas cuando todos los valores son 0 — en cuenta
             nueva el bloque ocupaba 200px diciendo "no pasa nada". ─── */}
       {(pendingReview.length > 0 || processing.length > 0 || monthlyUsed > 0) && (
-      <div className="mb-8 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] grid grid-cols-1 md:grid-cols-3 md:divide-x md:divide-white/[0.04]">
+      <div className="mb-5 grid grid-cols-1 overflow-hidden rounded-xl bg-[#111118]/82 ring-1 ring-white/[0.06] md:grid-cols-3 md:divide-x md:divide-white/[0.055]">
 
         {/* COL 1: APROBAR — north star del operador */}
         <button
           onClick={() => pendingReview.length > 0 && onSelectJob(pendingReview[0].job_id)}
           disabled={pendingReview.length === 0}
-          className={`text-left px-6 py-6 transition-colors ${pendingReview.length > 0 ? "hover:bg-surface-2/40 cursor-pointer" : "cursor-default"}`}
+          className={`group text-left px-5 py-4 transition-colors ${pendingReview.length > 0 ? "hover:bg-white/[0.035] cursor-pointer" : "cursor-default"}`}
         >
-          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Aprobar</p>
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Aprobar</p>
+            <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ring-1 ${
+              pendingReview.length > 0
+                ? "bg-amber-400/[0.08] text-amber-200 ring-amber-400/20"
+                : "bg-white/[0.04] text-gray-500 ring-white/[0.05]"
+            }`}>
+              {pendingReview.length > 0 ? "requiere acción" : "limpio"}
+            </span>
+          </div>
           <div className="mt-2 flex items-baseline gap-2">
-            <span className={`text-[44px] leading-none font-bold tracking-tight tabular-nums
+            <span className={`text-[34px] leading-none font-bold tracking-normal tabular-nums md:text-[36px]
               ${pendingReview.length === 0 ? "text-white/40" :
                 pendingReview.length >= 5 ? "text-red-300" :
                 "text-amber-200"}`}>
@@ -389,10 +422,19 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         </button>
 
         {/* COL 2: RENDERIZANDO — sistema en vivo */}
-        <div className="px-6 py-6">
-          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Renderizando</p>
+        <div className="px-5 py-4">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Renderizando</p>
+            <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ring-1 ${
+              processing.length > 0
+                ? "bg-brand/[0.10] text-brand-light ring-brand/25"
+                : "bg-white/[0.04] text-gray-500 ring-white/[0.05]"
+            }`}>
+              {processing.length > 0 ? "en vivo" : "sin cola"}
+            </span>
+          </div>
           <div className="mt-2 flex items-baseline gap-2">
-            <span className={`text-[44px] leading-none font-bold tracking-tight tabular-nums
+            <span className={`text-[34px] leading-none font-bold tracking-normal tabular-nums md:text-[36px]
               ${processing.length === 0 ? "text-white/40" : "text-brand-light"}`}>
               {processing.length}
             </span>
@@ -427,19 +469,30 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         </div>
 
         {/* COL 3: CUOTA — Stripe pattern (número grande + barra slim + delta) */}
-        <div className="px-6 py-6">
-          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
-            Cuota {MONTH_FMT.format(new Date())}
-          </p>
+        <div className="px-5 py-4">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
+              Cuota {MONTH_FMT.format(new Date())}
+            </p>
+            <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ring-1 ${
+              isUnlimited
+                ? "bg-accent/[0.08] text-accent ring-accent/20"
+                : usagePercent >= 80
+                  ? "bg-amber-400/[0.08] text-amber-200 ring-amber-400/20"
+                  : "bg-white/[0.04] text-gray-500 ring-white/[0.05]"
+            }`}>
+              {isUnlimited ? "unlimited" : monthlyLimit ? `${Math.round(usagePercent)}% usado` : "cargando"}
+            </span>
+          </div>
           <div className="mt-2 flex items-baseline gap-2">
             {isUnlimited ? (
               <>
-                <span className="text-[44px] leading-none font-bold tracking-tight tabular-nums text-white">{monthlyUsed}</span>
+                <span className="text-[34px] leading-none font-bold tracking-normal tabular-nums text-white md:text-[36px]">{monthlyUsed}</span>
                 <span className="text-xs text-ink-secondary">sin límite</span>
               </>
             ) : monthlyLimit ? (
               <>
-                <span className={`text-[44px] leading-none font-bold tracking-tight tabular-nums ${
+                <span className={`text-[34px] leading-none font-bold tracking-normal tabular-nums md:text-[36px] ${
                   usagePercent >= 100 ? "text-red-300" :
                   usagePercent >= 80 ? "text-amber-200" :
                   "text-white"
@@ -503,7 +556,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               <div className="mt-3 pt-3 border-t border-white/[0.06] space-y-1.5">
                 {bonusRemaining > 0 && (
                   <p className="text-[11px] text-emerald-300 font-medium">
-                    🎁 {bonusRemaining} créditos de regalo
+                    Bonus activo · {bonusRemaining} créditos
                     {giftDays != null ? (giftDays === 0 ? " · vencen hoy" : ` · vencen en ${giftDays} días`) : ""}
                   </p>
                 )}
@@ -511,7 +564,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                   Te alcanza para {projN} videos normales o {projE} con Escenas
                 </p>
                 <p className="text-[10px] text-gray-500">
-                  🎥 Normal: 1 crédito · 🎬 Escenas: {cost} créditos
+                  Normal: 1 crédito · Escenas: {cost} créditos
                 </p>
               </div>
             );
@@ -532,7 +585,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           const blockMode = usage.alert_100 && !user?.allow_overage;
           return (
             <div
-              className={`w-full mb-4 flex items-center gap-3 px-5 py-4 rounded-card ring-1 ${
+              className={`w-full mb-4 flex items-center gap-3 px-5 py-4 rounded-xl ring-1 ${
                 blockMode
                   ? "bg-red-500/[0.08] ring-red-500/30"
                   : overageMode
@@ -686,7 +739,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               </svg>
             </button>
           </div>
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-[repeat(auto-fill,minmax(250px,340px))]">
             {recentDone.map((job) => (
               <VideoCard key={job.job_id} job={job} onSelect={onSelectJob} />
             ))}
@@ -718,7 +771,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         </div>
       )}
       {history.length === 0 && historyError && (
-        <div className="rounded-card p-10 text-center bg-amber-500/[0.06] ring-1 ring-amber-500/25">
+        <div className="rounded-xl p-10 text-center bg-amber-500/[0.06] ring-1 ring-amber-500/25">
           <div className="w-12 h-12 mx-auto mb-4 rounded-2xl bg-amber-500/15 ring-1 ring-amber-500/30 flex items-center justify-center">
             <svg className="w-6 h-6 text-amber-300" fill="none" stroke="currentColor" strokeWidth="1.6" viewBox="0 0 24 24">
               <path d="M12 9v3.5m0 3.5h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" strokeLinecap="round" strokeLinejoin="round"/>
@@ -743,7 +796,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           de fallo silencioso de /jobs) mostramos este card sutil que no
           alarma con "creá tu primer video". */}
       {isTrueEmptyState && !isFirstWeekUser && (
-        <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
+        <div className="rounded-xl p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
           <div className="w-14 h-14 mx-auto mb-5 rounded-2xl bg-brand/10 ring-1 ring-brand/20 flex items-center justify-center">
             <svg className="w-7 h-7 text-brand-light" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">
               <path d="M9 18V5l12-2v13" strokeLinecap="round" strokeLinejoin="round"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
