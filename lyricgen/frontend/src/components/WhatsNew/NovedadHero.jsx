@@ -37,7 +37,7 @@ export default function NovedadHero() {
   const updates = secondary.slice(0, 3);
 
   return (
-    <section className="mb-5 animate-fade-in">
+    <section className="mb-5 animate-fade-in" data-tour="whatsnew-release">
       <div className="relative overflow-hidden rounded-xl bg-[#111118]/86 ring-1 ring-white/[0.065]">
         <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/20 to-transparent" />
         <button
