@@ -3471,7 +3471,7 @@ export default function UploadZone({
           file count) lo cual es informativo aunque mínimo en edit mode. */}
       {(files.length > 0 || editMode) && wizardStep !== 6 && (
         <div
-          className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-64" : "md:left-0"}`}
+          className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-60" : "md:left-0"}`}
           data-tour="upload-cta-bar"
         >
           <div className="w-full flex flex-wrap items-center gap-3">

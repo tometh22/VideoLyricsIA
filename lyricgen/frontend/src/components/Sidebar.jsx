@@ -50,7 +50,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
   }
 
   return (
-    <aside className="fixed left-0 top-0 bottom-0 w-64 bg-surface-1/95 backdrop-blur-xl border-r border-white/[0.04] z-20 flex flex-col" style={{boxShadow: '4px 0 24px rgba(0,0,0,0.3)'}}>
+    <aside className="fixed left-0 top-0 bottom-0 w-60 bg-surface-1/95 backdrop-blur-xl border-r border-white/[0.045] z-20 flex flex-col" style={{boxShadow: '4px 0 24px rgba(0,0,0,0.22)'}}>
 
       {/* Logo — full lockup per brand kit §10 (navbar uses full lockup,
           favicon uses mark-only). The "Pro" pill lives outside the
@@ -59,7 +59,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
           and middle-click opens a new tab natively. Plain left-click
           is routed through onNav("dashboard") to preserve the
           wizard-leaving confirm logic in App.handleNav. */}
-      <div className="flex items-center justify-between px-5 py-5 border-b border-white/[0.04]">
+      <div className="flex items-center justify-between px-4 py-4 border-b border-white/[0.045]">
         <div className="flex items-center gap-2.5">
           <Link
             to="/dashboard"
@@ -95,7 +95,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
           Cmd+Click / middle-click open a new tab natively. Plain
           left-click prevents the default navigation and calls onNav
           so the App's wizard-leaving confirm fires. */}
-      <nav className="flex-1 py-4 px-3" data-tour="sidebar-nav">
+      <nav className="flex-1 py-3 px-2.5" data-tour="sidebar-nav">
         {items.map((item) => (
           <Link
             key={item.id}
@@ -105,9 +105,9 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
               e.preventDefault();
               onNav(item.id);
             }}
-            className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl mb-1 text-sm font-medium transition-all duration-200
+            className={`w-full flex items-center gap-2.5 px-3.5 py-2.5 rounded-lg mb-0.5 text-[13px] font-medium transition-all duration-200
               ${activeView === item.id
-                ? "bg-brand/10 text-white"
+                ? "bg-brand/12 text-white ring-1 ring-brand/10"
                 : "text-gray-400 hover:text-white hover:bg-surface-2/60"
               }`}
           >
@@ -119,7 +119,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
 
       {/* Plan badge */}
       {user && (
-        <div className="px-5 py-3 border-t border-white/[0.04]">
+        <div className="px-4 py-3 border-t border-white/[0.045]">
           <Link
             to="/account"
             onClick={(e) => {
@@ -127,7 +127,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
               e.preventDefault();
               onNav("settings");
             }}
-            className="w-full flex items-center gap-2 px-3 py-2 rounded-xl bg-brand/5 hover:bg-brand/10 transition-all"
+            className="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-brand/5 hover:bg-brand/10 transition-all"
           >
             <span className="text-[10px] font-bold text-brand uppercase tracking-wider">
               Plan {user.plan || "free"}
@@ -145,7 +145,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
       <UsageBadge user={user} />
 
       {/* User & logout */}
-      <div className="px-5 py-4 border-t border-white/[0.04] space-y-3">
+      <div className="px-4 py-3.5 border-t border-white/[0.045] space-y-3">
         <div className="flex items-center gap-2">
           <div className="w-2 h-2 rounded-full bg-accent animate-pulse" />
           <span className="text-[11px] text-gray-500">{t("nav.system_ok")}</span>

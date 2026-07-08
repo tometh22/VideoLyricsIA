@@ -476,7 +476,7 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
         />
       )}
 
-      <div className={`flex-1 min-h-screen transition-all duration-300 ${sidebarOpen ? "md:ml-64" : "md:ml-0"}`}>
+      <div className={`flex-1 min-h-screen transition-all duration-300 ${sidebarOpen ? "md:ml-60" : "md:ml-0"}`}>
         {/* Ambient */}
         <div className="fixed inset-0 pointer-events-none">
           <div className="absolute top-[-30%] left-[20%] w-[600px] h-[600px] bg-brand/[0.03] rounded-full blur-[120px]" />
@@ -484,7 +484,7 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
         </div>
 
         {/* Top bar */}
-        <header className="sticky top-0 z-20 flex items-center justify-between px-4 md:px-8 py-4 border-b border-white/[0.04] bg-surface/80 backdrop-blur-xl" style={{boxShadow: '0 1px 12px rgba(0,0,0,0.2)'}}>
+        <header className="sticky top-0 z-20 flex items-center justify-between px-4 md:px-7 py-3 border-b border-white/[0.04] bg-surface/82 backdrop-blur-xl" style={{boxShadow: '0 1px 12px rgba(0,0,0,0.16)'}}>
           <div className="flex items-center gap-3">
             <button
               onClick={() => setSidebarOpen(!sidebarOpen)}
@@ -526,7 +526,7 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
         <UpgradeNudge user={user} />
 
         {/* Content */}
-        <main className="relative z-10 px-4 md:px-8 pt-6 md:pt-8 pb-20">
+        <main className="relative z-10 px-4 md:px-7 pt-5 md:pt-6 pb-20">
           <GiftCreditsBanner user={user} />
           <Outlet />
         </main>
