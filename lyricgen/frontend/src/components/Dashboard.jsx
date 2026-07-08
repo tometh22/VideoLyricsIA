@@ -300,10 +300,10 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
       : "bg-accent shadow-[0_0_14px_rgba(20,200,168,.65)]";
 
   return (
-    <div className="w-full max-w-[1700px] animate-fade-in">
+    <div className="w-full max-w-[1540px] animate-fade-in">
       {/* ─── Command bar simplificada (header reposicionado, search vendrá en PR-2) ─── */}
-      <div className="mb-7 rounded-card bg-[linear-gradient(135deg,rgba(255,255,255,0.045),rgba(255,255,255,0.018))] px-5 py-5 ring-1 ring-white/[0.055]">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+      <div className="mb-5 rounded-card bg-[linear-gradient(135deg,rgba(255,255,255,0.04),rgba(255,255,255,0.016))] px-4 py-4 ring-1 ring-white/[0.055] md:px-5">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div className="min-w-0">
           <div className="mb-2 flex flex-wrap items-center gap-2">
             <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Centro de producción</p>
@@ -315,10 +315,10 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               {liveState}
             </span>
           </div>
-          <h1 className="text-[31px] leading-[1.08] font-extrabold tracking-normal text-white">
+          <h1 className="text-[26px] leading-[1.12] font-bold tracking-normal text-white md:text-[28px]">
             {heroHeadline}
           </h1>
-          <p className="mt-2 max-w-2xl text-[14px] leading-relaxed text-ink-secondary">{heroSubline}</p>
+          <p className="mt-1.5 max-w-2xl text-[13.5px] leading-relaxed text-ink-secondary">{heroSubline}</p>
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-2 lg:justify-end">
           {/* Search button — abre el SearchPalette (PR-2 2026-05-25).
@@ -356,7 +356,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               <svg className={`w-3 h-3 transition-transform ${attentionOpen ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" strokeLinecap="round" strokeLinejoin="round"/></svg>
             </button>
           )}
-          <button onClick={onNewBatch} className="btn-primary px-5" data-tour="dashboard-new-batch">
+          <button onClick={onNewBatch} className="btn-primary px-4" data-tour="dashboard-new-batch">
             <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
               <path d="M12 5v14M5 12h14" strokeLinecap="round"/>
             </svg>
@@ -372,13 +372,13 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
             UX 2026-05-29: ocultas cuando todos los valores son 0 — en cuenta
             nueva el bloque ocupaba 200px diciendo "no pasa nada". ─── */}
       {(pendingReview.length > 0 || processing.length > 0 || monthlyUsed > 0) && (
-      <div className="mb-8 grid grid-cols-1 overflow-hidden rounded-card bg-[#111118]/82 ring-1 ring-white/[0.06] md:grid-cols-3 md:divide-x md:divide-white/[0.055]">
+      <div className="mb-6 grid grid-cols-1 overflow-hidden rounded-card bg-[#111118]/82 ring-1 ring-white/[0.06] md:grid-cols-3 md:divide-x md:divide-white/[0.055]">
 
         {/* COL 1: APROBAR — north star del operador */}
         <button
           onClick={() => pendingReview.length > 0 && onSelectJob(pendingReview[0].job_id)}
           disabled={pendingReview.length === 0}
-          className={`group text-left px-6 py-5 transition-colors ${pendingReview.length > 0 ? "hover:bg-white/[0.035] cursor-pointer" : "cursor-default"}`}
+          className={`group text-left px-5 py-4 transition-colors ${pendingReview.length > 0 ? "hover:bg-white/[0.035] cursor-pointer" : "cursor-default"}`}
         >
           <div className="flex items-center justify-between gap-3">
             <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Aprobar</p>
@@ -391,7 +391,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
             </span>
           </div>
           <div className="mt-2 flex items-baseline gap-2">
-            <span className={`text-[44px] leading-none font-bold tracking-normal tabular-nums
+            <span className={`text-[36px] leading-none font-bold tracking-normal tabular-nums md:text-[38px]
               ${pendingReview.length === 0 ? "text-white/40" :
                 pendingReview.length >= 5 ? "text-red-300" :
                 "text-amber-200"}`}>
@@ -418,7 +418,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         </button>
 
         {/* COL 2: RENDERIZANDO — sistema en vivo */}
-        <div className="px-6 py-5">
+        <div className="px-5 py-4">
           <div className="flex items-center justify-between gap-3">
             <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Renderizando</p>
             <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ring-1 ${
@@ -430,7 +430,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
             </span>
           </div>
           <div className="mt-2 flex items-baseline gap-2">
-            <span className={`text-[44px] leading-none font-bold tracking-normal tabular-nums
+            <span className={`text-[36px] leading-none font-bold tracking-normal tabular-nums md:text-[38px]
               ${processing.length === 0 ? "text-white/40" : "text-brand-light"}`}>
               {processing.length}
             </span>
@@ -465,7 +465,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         </div>
 
         {/* COL 3: CUOTA — Stripe pattern (número grande + barra slim + delta) */}
-        <div className="px-6 py-5">
+        <div className="px-5 py-4">
           <div className="flex items-center justify-between gap-3">
             <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
               Cuota {MONTH_FMT.format(new Date())}
@@ -483,12 +483,12 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           <div className="mt-2 flex items-baseline gap-2">
             {isUnlimited ? (
               <>
-                <span className="text-[44px] leading-none font-bold tracking-normal tabular-nums text-white">{monthlyUsed}</span>
+                <span className="text-[36px] leading-none font-bold tracking-normal tabular-nums text-white md:text-[38px]">{monthlyUsed}</span>
                 <span className="text-xs text-ink-secondary">sin límite</span>
               </>
             ) : monthlyLimit ? (
               <>
-                <span className={`text-[44px] leading-none font-bold tracking-normal tabular-nums ${
+                <span className={`text-[36px] leading-none font-bold tracking-normal tabular-nums md:text-[38px] ${
                   usagePercent >= 100 ? "text-red-300" :
                   usagePercent >= 80 ? "text-amber-200" :
                   "text-white"
@@ -552,7 +552,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               <div className="mt-3 pt-3 border-t border-white/[0.06] space-y-1.5">
                 {bonusRemaining > 0 && (
                   <p className="text-[11px] text-emerald-300 font-medium">
-                    🎁 {bonusRemaining} créditos de regalo
+                    Bonus activo · {bonusRemaining} créditos
                     {giftDays != null ? (giftDays === 0 ? " · vencen hoy" : ` · vencen en ${giftDays} días`) : ""}
                   </p>
                 )}
@@ -560,7 +560,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                   Te alcanza para {projN} videos normales o {projE} con Escenas
                 </p>
                 <p className="text-[10px] text-gray-500">
-                  🎥 Normal: 1 crédito · 🎬 Escenas: {cost} créditos
+                  Normal: 1 crédito · Escenas: {cost} créditos
                 </p>
               </div>
             );
@@ -735,7 +735,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               </svg>
             </button>
           </div>
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-[repeat(auto-fill,minmax(250px,340px))]">
             {recentDone.map((job) => (
               <VideoCard key={job.job_id} job={job} onSelect={onSelectJob} />
             ))}

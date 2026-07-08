@@ -27,27 +27,27 @@ function TranscriptionVisual({ compact = false }) {
   }
 
   return (
-    <div className="relative overflow-hidden rounded-2xl bg-[#080a10] p-4 ring-1 ring-white/[0.08]">
+    <div className="relative overflow-hidden rounded-xl bg-[#080a10] p-3.5 ring-1 ring-white/[0.08]">
       <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-accent/60 to-transparent" />
-      <div className="mb-3 flex items-center justify-between">
+      <div className="mb-2.5 flex items-center justify-between">
         <div>
           <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
             <span>{t("release.visual.audio")}</span>
             <span aria-hidden="true"> · Timeline IA</span>
           </p>
-          <p className="mt-1 text-xs font-semibold text-white">02:18.42 · Motor v2</p>
+          <p className="mt-1 text-[11.5px] font-semibold text-white">02:18.42 · Motor v2</p>
         </div>
         <span className="rounded-full bg-accent/12 px-2 py-1 text-[10px] font-semibold text-accent ring-1 ring-accent/25">
           {t("release.visual.synced")}
         </span>
       </div>
-      <div className="relative overflow-hidden rounded-xl bg-[#0d1018] p-3 ring-1 ring-white/[0.045]">
-        <div className="mb-3 flex items-center justify-between text-[10px] text-gray-500">
+      <div className="relative overflow-hidden rounded-lg bg-[#0d1018] p-2.5 ring-1 ring-white/[0.045]">
+        <div className="mb-2.5 flex items-center justify-between text-[10px] text-gray-500">
           <span className="font-mono tabular-nums">00:41.08</span>
           <span className="rounded-full bg-white/[0.045] px-2 py-1 text-gray-400">voz detectada</span>
           <span className="font-mono tabular-nums">02:18.42</span>
         </div>
-        <div className="relative flex h-24 items-center justify-center gap-1.5 overflow-hidden rounded-lg bg-black/35 px-4">
+        <div className="relative flex h-20 items-center justify-center gap-1.5 overflow-hidden rounded-lg bg-black/35 px-4">
           <div className="absolute bottom-0 left-[48%] top-0 w-px bg-accent shadow-[0_0_18px_rgba(20,200,168,.55)]" />
           <div className="absolute left-[48%] top-2 rounded-full bg-accent px-2 py-1 text-[9px] font-bold text-black">
             activa
@@ -61,12 +61,12 @@ function TranscriptionVisual({ compact = false }) {
           ))}
         </div>
       </div>
-      <div className="mt-3 grid gap-2 sm:grid-cols-[0.84fr_1fr]">
-        <div className="rounded-xl bg-white/[0.035] p-3 ring-1 ring-white/[0.045]">
+      <div className="mt-2.5 grid gap-2 sm:grid-cols-[0.84fr_1fr]">
+        <div className="rounded-lg bg-white/[0.035] p-2.5 ring-1 ring-white/[0.045]">
           <p className="text-[10px] font-semibold uppercase text-gray-500">Antes</p>
           <p className="mt-2 text-[12px] leading-snug text-gray-400">silencios largos y líneas fuera de tiempo</p>
         </div>
-        <div className="rounded-xl bg-accent/[0.08] p-3 ring-1 ring-accent/20">
+        <div className="rounded-lg bg-accent/[0.08] p-2.5 ring-1 ring-accent/20">
           <p className="text-[10px] font-semibold uppercase text-accent">Ahora</p>
           <p className="mt-2 text-[12px] leading-snug text-white">segmentos alineados, pausas filtradas y revisión más limpia</p>
         </div>
