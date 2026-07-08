@@ -46,6 +46,10 @@ from moviepy.editor import (
     VideoFileClip,
     concatenate_videoclips,
 )
+# Make moviepy tolerant of non-UTF-8 bytes in ffmpeg's output (accented
+# filenames / metadata — "La Vida Al Revés" → 0xe9). Without this, AudioFileClip
+# / VideoFileClip crash on any accented title. Self-applies on import.
+import moviepy_utf8_patch  # noqa: F401
 from PIL import Image, ImageDraw, ImageFont
 
 from jobs import update_job, get_job_model

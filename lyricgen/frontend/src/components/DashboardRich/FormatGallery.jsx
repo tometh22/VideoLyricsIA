@@ -403,7 +403,7 @@ export default function FormatGallery({ user, onSelectFormat, onUpgrade }) {
 
   return (
     <section className="dr-fmt-gallery mb-6" aria-labelledby="dr-fmt-title">
-      <header className="flex items-baseline justify-between mb-3">
+      <header className="flex items-baseline justify-between mb-2.5">
         <h3 id="dr-fmt-title" className="text-section text-gray-500 uppercase tracking-[0.18em]">
           {t("dash.formats.title") || "Para qué usás GenLy hoy"}
         </h3>

@@ -35,7 +35,7 @@ export default function WhatsNewModal({ user }) {
         role="dialog"
         aria-modal="true"
         aria-label={t(e.titleKey) || "Novedad"}
-        className="w-full max-w-md overflow-hidden rounded-card bg-surface-2 shadow-glow-lg ring-1 ring-brand/20 animate-slide-up"
+        className="w-full max-w-md overflow-hidden rounded-xl bg-surface-2 shadow-depth-lg ring-1 ring-white/[0.08] animate-slide-up"
         onClick={(ev) => ev.stopPropagation()}
       >
         <div className="relative p-4 pb-0">
@@ -59,7 +59,7 @@ export default function WhatsNewModal({ user }) {
           {e.ctaTo && (
             <button
               onClick={() => { close(); navigate(e.ctaTo); }}
-              className="mt-5 w-full rounded-button bg-brand px-4 py-2.5 text-[13px] font-semibold text-white shadow-glow transition-colors hover:bg-brand-light"
+              className="mt-5 inline-flex h-10 w-full items-center justify-center rounded-lg bg-brand px-4 text-[13px] font-semibold text-white shadow-[0_8px_22px_rgba(109,74,255,0.22)] transition-colors hover:bg-brand-light"
             >
               {t(e.ctaKey) || "Probar"}
             </button>

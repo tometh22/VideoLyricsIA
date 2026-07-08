@@ -1512,15 +1512,19 @@ export default function UploadZone({
       </div>
 
       {/* Text case pill buttons: MAY / Aa / min / ori */}
-      <div className="mb-3">
+      <div className="mb-3" data-tour="upload-text-case">
         <div className="flex items-center gap-2">
           <span className="text-[11px] text-gray-600 shrink-0">{t("upload.text_case_label") || "Texto:"}</span>
+          <span className="rounded-full bg-accent/[0.08] px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent ring-1 ring-accent/20">
+            {t("whatsnew.new_badge") || "Nuevo"}
+          </span>
+          <HelpTip text={t("announce.typocase_tagline")} />
           <div className="flex gap-1">
             {TEXT_CASE_OPTS.map((opt) => (
               <button
                 key={opt.code}
                 type="button"
-                title={opt.label}
+                title={opt.code === "sentence" ? `${opt.label} · ${t("announce.typocase_tagline")}` : opt.label}
                 onClick={() => updateBatchDefault("textCase", opt.code)}
                 onMouseEnter={() => setHoverCaseBatch(opt.code)}
                 onMouseLeave={() => setHoverCaseBatch(null)}
@@ -1546,15 +1550,19 @@ export default function UploadZone({
       {/* Frame format: Pantalla completa (16:9) / Cine (franjas 2.39:1).
           El letterbox se aplica determinísticamente en post — look de cine
           intencional, opuesto a las barras estocásticas de Veo. */}
-      <div className="mb-3">
+      <div className="mb-3" data-tour="upload-frame-format">
         <div className="flex items-center gap-2">
           <span className="text-[11px] text-gray-600 shrink-0">{t("upload.frame_format_label") || "Formato:"}</span>
+          <span className="rounded-full bg-accent/[0.08] px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent ring-1 ring-accent/20">
+            {t("whatsnew.new_badge") || "Nuevo"}
+          </span>
+          <HelpTip text={t("announce.cinema_tagline")} />
           <div className="flex gap-1">
             {FRAME_FORMAT_OPTS.map((opt) => (
               <button
                 key={opt.code}
                 type="button"
-                title={opt.label}
+                title={opt.code === "cine" ? `${opt.label} · ${t("announce.cinema_tagline")}` : opt.label}
                 onClick={() => updateBatchDefault("frameFormat", opt.code)}
                 className={`px-2.5 py-1 rounded-md text-[11px] font-mono font-bold transition-all
                   ${(batchDefaults.frameFormat || "full") === opt.code
@@ -1874,10 +1882,14 @@ export default function UploadZone({
                   <div>
                     <div className="flex items-center gap-2">
                       <span className="text-[11px] text-gray-600 shrink-0">{t("upload.text_case_label") || "Texto:"}</span>
+                      <span className="rounded-full bg-accent/[0.08] px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent ring-1 ring-accent/20">
+                        {t("whatsnew.new_badge") || "Nuevo"}
+                      </span>
+                      <HelpTip text={t("announce.typocase_tagline")} />
                       <div className="flex gap-1">
                         {TEXT_CASE_OPTS.map((opt) => (
                           <button key={opt.code} type="button"
-                            title={opt.label}
+                            title={opt.code === "sentence" ? `${opt.label} · ${t("announce.typocase_tagline")}` : opt.label}
                             onClick={() => updateField(i, "textCase", opt.code)}
                             onMouseEnter={() => setHoverCaseRow({ idx: i, code: opt.code })}
                             onMouseLeave={() => setHoverCaseRow(null)}
@@ -2952,12 +2964,16 @@ export default function UploadZone({
                   <div>
                     <div className="flex items-center gap-2">
                       <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.text_case_label") || "Texto:"}</span>
+                      <span className="rounded-full bg-accent/[0.08] px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent ring-1 ring-accent/20">
+                        {t("whatsnew.new_badge") || "Nuevo"}
+                      </span>
+                      <HelpTip text={t("announce.typocase_tagline")} />
                       <div className="flex gap-1">
                         {TEXT_CASE_OPTS.map((opt) => (
                           <button
                             key={opt.code}
                             type="button"
-                            title={opt.label}
+                            title={opt.code === "sentence" ? `${opt.label} · ${t("announce.typocase_tagline")}` : opt.label}
                             onClick={() => updateBatchDefault("textCase", opt.code)}
                             onMouseEnter={() => setHoverCaseBatch(opt.code)}
                             onMouseLeave={() => setHoverCaseBatch(null)}
@@ -3471,7 +3487,7 @@ export default function UploadZone({
           file count) lo cual es informativo aunque mínimo en edit mode. */}
       {(files.length > 0 || editMode) && wizardStep !== 6 && (
         <div
-          className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-64" : "md:left-0"}`}
+          className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-60" : "md:left-0"}`}
           data-tour="upload-cta-bar"
         >
           <div className="w-full flex flex-wrap items-center gap-3">

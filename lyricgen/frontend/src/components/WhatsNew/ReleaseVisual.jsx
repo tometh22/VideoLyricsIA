@@ -2,53 +2,82 @@ import { useI18n } from "../../i18n";
 
 function TranscriptionVisual({ compact = false }) {
   const { t } = useI18n();
-  const bars = [32, 54, 42, 70, 38, 64, 86, 58, 40, 76, 52, 34, 66, 48, 72, 44, 60, 36];
+  const bars = [26, 44, 36, 58, 42, 72, 86, 64, 38, 76, 56, 34, 62, 48, 70, 44, 58, 32];
   if (compact) {
     return (
-      <div className="relative flex h-full min-h-[128px] flex-col justify-between overflow-hidden rounded-xl bg-[#0b0b12] p-3 ring-1 ring-white/[0.08]">
-        <div className="flex items-center justify-between">
-          <p className="text-[9px] uppercase tracking-[0.16em] text-gray-500">{t("release.visual.audio")}</p>
-          <span className="rounded-full bg-accent/12 px-2 py-0.5 text-[9px] font-semibold text-accent ring-1 ring-accent/20">
-            {t("release.visual.synced")}
-          </span>
-        </div>
-        <div className="relative flex h-16 items-center justify-center gap-1 overflow-hidden rounded-lg bg-surface/80 px-2">
-          <div className="absolute bottom-1 top-1 left-[46%] w-px bg-accent/80" />
-          {bars.slice(2, 15).map((h, idx) => (
-            <div
-              key={idx}
-              className={`min-w-[4px] max-w-[10px] flex-1 rounded-full ${idx >= 4 && idx <= 7 ? "bg-accent" : "bg-white/16"}`}
-              style={{ height: `${Math.max(22, h)}%` }}
-            />
-          ))}
+      <div className="relative flex h-[104px] items-center gap-3 overflow-hidden rounded-lg bg-[#080a10] p-3 ring-1 ring-white/[0.08]">
+        <div className="flex min-w-0 flex-1 flex-col gap-2">
+          <div className="flex items-center justify-between gap-2">
+            <p className="truncate text-[9px] uppercase tracking-[0.14em] text-gray-500">{t("release.visual.audio")}</p>
+            <span className="shrink-0 rounded-full bg-accent/10 px-2 py-0.5 text-[9px] font-semibold text-accent ring-1 ring-accent/20">
+              v2
+            </span>
+          </div>
+          <div className="relative flex h-10 items-center justify-center gap-0.5 overflow-hidden rounded-md bg-surface/80 px-2">
+            <div className="absolute bottom-1 top-1 left-[52%] w-px bg-accent/80" />
+            {bars.slice(3, 16).map((h, idx) => (
+              <div
+                key={idx}
+                className={`min-w-[3px] flex-1 rounded-full ${idx >= 4 && idx <= 7 ? "bg-accent" : "bg-white/16"}`}
+                style={{ height: `${Math.max(22, h)}%` }}
+              />
+            ))}
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="rounded-full bg-white/[0.045] px-2 py-0.5 text-[9px] text-gray-400">{t("release.visual.timing_fixed")}</span>
+            <span className="rounded-full bg-white/[0.045] px-2 py-0.5 text-[9px] text-gray-400">{t("release.visual.silence")}</span>
+          </div>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="relative overflow-hidden rounded-2xl bg-[#0b0b12] p-5 ring-1 ring-white/[0.08]">
+    <div className="relative overflow-hidden rounded-xl bg-[#080a10] p-3.5 ring-1 ring-white/[0.08]">
       <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-accent/60 to-transparent" />
-      <div className="mb-4 flex items-center justify-between">
+      <div className="mb-2.5 flex items-center justify-between">
         <div>
-          <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{t("release.visual.audio")}</p>
-          <p className="mt-1 text-xs text-white">02:18.42</p>
+          <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
+            <span>{t("release.visual.audio")}</span>
+            <span aria-hidden="true"> · Timeline IA</span>
+          </p>
+          <p className="mt-1 text-[11.5px] font-semibold text-white">02:18.42 · Motor v2</p>
         </div>
         <span className="rounded-full bg-accent/12 px-2 py-1 text-[10px] font-semibold text-accent ring-1 ring-accent/25">
           {t("release.visual.synced")}
         </span>
       </div>
-      <div className="relative flex h-24 items-center justify-center gap-1.5 overflow-hidden rounded-xl bg-surface/80 px-4">
-        <div className="absolute bottom-0 left-[42%] top-0 w-px bg-accent shadow-[0_0_18px_rgba(20,200,168,.55)]" />
-        {bars.map((h, idx) => (
-          <div
-            key={idx}
-            className={`min-w-[5px] max-w-[15px] flex-1 rounded-full ${idx >= 6 && idx <= 9 ? "bg-accent" : "bg-white/16"}`}
-            style={{ height: `${h}%` }}
-          />
-        ))}
+      <div className="relative overflow-hidden rounded-lg bg-[#0d1018] p-2.5 ring-1 ring-white/[0.045]">
+        <div className="mb-2.5 flex items-center justify-between text-[10px] text-gray-500">
+          <span className="font-mono tabular-nums">00:41.08</span>
+          <span className="rounded-full bg-white/[0.045] px-2 py-1 text-gray-400">voz detectada</span>
+          <span className="font-mono tabular-nums">02:18.42</span>
+        </div>
+        <div className="relative flex h-20 items-center justify-center gap-1.5 overflow-hidden rounded-lg bg-black/35 px-4">
+          <div className="absolute bottom-0 left-[48%] top-0 w-px bg-accent shadow-[0_0_18px_rgba(20,200,168,.55)]" />
+          <div className="absolute left-[48%] top-2 rounded-full bg-accent px-2 py-1 text-[9px] font-bold text-black">
+            activa
+          </div>
+          {bars.map((h, idx) => (
+            <div
+              key={idx}
+              className={`min-w-[5px] max-w-[15px] flex-1 rounded-full ${idx >= 6 && idx <= 10 ? "bg-accent" : "bg-white/15"}`}
+              style={{ height: `${h}%` }}
+            />
+          ))}
+        </div>
       </div>
-      <div className="mt-3 grid grid-cols-3 gap-1.5">
+      <div className="mt-2.5 grid gap-2 sm:grid-cols-[0.84fr_1fr]">
+        <div className="rounded-lg bg-white/[0.035] p-2.5 ring-1 ring-white/[0.045]">
+          <p className="text-[10px] font-semibold uppercase text-gray-500">Antes</p>
+          <p className="mt-2 text-[12px] leading-snug text-gray-400">silencios largos y líneas fuera de tiempo</p>
+        </div>
+        <div className="rounded-lg bg-accent/[0.08] p-2.5 ring-1 ring-accent/20">
+          <p className="text-[10px] font-semibold uppercase text-accent">Ahora</p>
+          <p className="mt-2 text-[12px] leading-snug text-white">segmentos alineados, pausas filtradas y revisión más limpia</p>
+        </div>
+      </div>
+      <div className="mt-2 grid grid-cols-3 gap-1.5">
         {[
           ["00:41", t("release.visual.timing_fixed"), true],
           ["01:08", t("release.visual.silence"), false],
@@ -74,25 +103,14 @@ function TextCaseVisual({ compact = false }) {
   ];
   if (compact) {
     return (
-      <div className="flex h-full min-h-[128px] flex-col justify-between rounded-xl bg-[#0b0b12] p-3 ring-1 ring-white/[0.08]">
-        <p className="text-[9px] uppercase tracking-[0.16em] text-gray-500">{t("release.visual.typography")}</p>
-        <div className="grid grid-cols-4 gap-1.5">
-          {cases.map(([code]) => {
-            const active = code === "Abc";
-            return (
-              <div
-                key={code}
-                className={`grid h-9 place-items-center rounded-lg text-[11px] font-extrabold ${
-                  active ? "bg-brand/18 text-brand-light ring-1 ring-brand/40" : "bg-white/[0.045] text-gray-500"
-                }`}
-              >
-                {code}
-              </div>
-            );
-          })}
+      <div className="grid h-[104px] grid-cols-[74px_1fr] items-center gap-3 rounded-lg bg-[#0b0b12] p-3 ring-1 ring-white/[0.08]">
+        <div className="grid h-[68px] w-[68px] place-items-center rounded-lg bg-brand/14 text-[24px] font-extrabold text-brand-light ring-1 ring-brand/30">
+          Abc
         </div>
-        <div className="rounded-lg bg-brand/10 px-3 py-2 ring-1 ring-brand/25">
-          <p className="text-[13px] font-semibold leading-tight text-white">Como el viento</p>
+        <div className="min-w-0">
+          <p className="text-[9px] uppercase tracking-[0.14em] text-gray-500">{t("release.visual.typography")}</p>
+          <p className="mt-1.5 truncate text-[13px] font-semibold leading-tight text-white">Como el viento</p>
+          <p className="mt-1 truncate text-[10px] text-gray-500">{t("announce.typocase_tagline")}</p>
         </div>
       </div>
     );
@@ -123,18 +141,20 @@ function CinemaVisual({ compact = false }) {
   const { t } = useI18n();
   if (compact) {
     return (
-      <div className="flex h-full min-h-[128px] flex-col justify-between rounded-xl bg-[#0b0b12] p-3 ring-1 ring-white/[0.08]">
-        <div className="flex items-center justify-between gap-2">
-          <p className="text-[9px] uppercase tracking-[0.16em] text-gray-500">{t("release.visual.frame")}</p>
-          <span className="rounded-full bg-white px-2 py-0.5 text-[9px] font-bold text-black">
+      <div className="grid h-[104px] grid-cols-[minmax(0,1fr)_86px] items-center gap-3 rounded-lg bg-[#0b0b12] p-3 ring-1 ring-white/[0.08]">
+        <div className="min-w-0">
+          <p className="text-[9px] uppercase tracking-[0.14em] text-gray-500">{t("release.visual.frame")}</p>
+          <p className="mt-1.5 text-[13px] font-semibold text-white">{t("release.visual.cine")}</p>
+          <span className="mt-2 inline-flex rounded-full bg-white px-2 py-0.5 text-[9px] font-bold text-black">
             {t("release.visual.cine")}
           </span>
         </div>
-        <div className="relative aspect-video overflow-hidden rounded-lg bg-gradient-to-br from-cyan-400 via-indigo-500 to-rose-400">
-          <div className="absolute inset-x-0 top-0 h-[13.4%] bg-black" />
-          <div className="absolute inset-x-0 bottom-0 h-[13.4%] bg-black" />
-          <div className="absolute inset-0 flex items-center justify-center">
-            <p className="text-[11px] font-extrabold tracking-wide text-white drop-shadow">LYRIC VIDEO</p>
+        <div className="relative aspect-video overflow-hidden rounded-md bg-black ring-1 ring-white/[0.08]">
+          <div className="absolute inset-x-0 top-[22%] bottom-[22%] bg-gradient-to-br from-cyan-500 via-indigo-500 to-rose-400" />
+          <div className="absolute left-2 right-2 top-[22%] border-t border-white/20" />
+          <div className="absolute bottom-[22%] left-2 right-2 border-t border-white/15" />
+          <div className="absolute inset-0 grid place-items-center">
+            <span className="h-1 w-7 rounded-full bg-white/70" />
           </div>
         </div>
       </div>
@@ -150,9 +170,10 @@ function CinemaVisual({ compact = false }) {
           <span className="rounded-full bg-white px-2 py-1 font-bold text-black">{t("release.visual.cine")}</span>
         </div>
       </div>
-      <div className="relative aspect-video overflow-hidden rounded-xl bg-gradient-to-br from-cyan-400 via-indigo-500 to-rose-400">
-        <div className="absolute inset-x-0 top-0 h-[13.4%] bg-black" />
-        <div className="absolute inset-x-0 bottom-0 h-[13.4%] bg-black" />
+      <div className="relative aspect-video overflow-hidden rounded-xl bg-black ring-1 ring-white/[0.06]">
+        <div className="absolute inset-x-0 top-[18%] bottom-[18%] bg-gradient-to-br from-cyan-400 via-indigo-500 to-rose-400" />
+        <div className="absolute left-4 right-4 top-[18%] border-t border-white/20" />
+        <div className="absolute bottom-[18%] left-4 right-4 border-t border-white/15" />
         <div className="absolute inset-0 flex items-center justify-center">
           <p className="text-sm font-extrabold tracking-wide text-white drop-shadow">LYRIC VIDEO</p>
         </div>
@@ -166,11 +187,11 @@ function MediaVisual({ entry, compact = false }) {
   const isVideo = (entry.media || "").endsWith(".mp4");
   if (!entry.media) return <TranscriptionVisual compact={compact} />;
   return (
-    <div className="overflow-hidden rounded-2xl bg-black ring-1 ring-white/[0.08]">
+    <div className={`overflow-hidden bg-black ring-1 ring-white/[0.08] ${compact ? "h-[104px] rounded-lg" : "rounded-2xl"}`}>
       {isVideo ? (
-        <video src={entry.media} autoPlay muted loop playsInline className="aspect-video w-full object-cover" />
+        <video src={entry.media} autoPlay muted loop playsInline className={compact ? "h-full w-full object-cover" : "aspect-video w-full object-cover"} />
       ) : (
-        <img src={entry.media} alt="" className="aspect-video w-full object-cover" />
+        <img src={entry.media} alt="" className={compact ? "h-full w-full object-cover" : "aspect-video w-full object-cover"} />
       )}
     </div>
   );
