@@ -284,24 +284,43 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
     );
     return sorted[0];
   })();
+  const dashboardDate = (() => {
+    const d = new Date();
+    return DATE_HEADER_FMT.format(d) + " · " + d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
+  })();
+  const liveState = processing.length > 0
+    ? "Render activo"
+    : pendingReview.length > 0
+      ? "Revisión pendiente"
+      : "Sistema operativo";
+  const liveDotClass = processing.length > 0
+    ? "bg-brand shadow-[0_0_14px_rgba(124,92,255,.75)]"
+    : pendingReview.length > 0
+      ? "bg-amber-300 shadow-[0_0_14px_rgba(252,211,77,.65)]"
+      : "bg-accent shadow-[0_0_14px_rgba(20,200,168,.65)]";
 
   return (
     <div className="w-full max-w-[1700px] animate-fade-in">
       {/* ─── Command bar simplificada (header reposicionado, search vendrá en PR-2) ─── */}
-      <div className="flex items-center justify-between mb-7">
+      <div className="mb-7 rounded-card bg-[linear-gradient(135deg,rgba(255,255,255,0.045),rgba(255,255,255,0.018))] px-5 py-5 ring-1 ring-white/[0.055]">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
         <div className="min-w-0">
-          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
-            {(() => {
-              const d = new Date();
-              return DATE_HEADER_FMT.format(d) + " · " + d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
-            })()}
-          </p>
-          <h1 className="text-[26px] leading-tight font-bold tracking-tight mt-1 truncate">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Centro de producción</p>
+            <span className="rounded-full bg-white/[0.045] px-2.5 py-1 text-[10px] font-semibold text-gray-400 ring-1 ring-white/[0.06]">
+              {dashboardDate}
+            </span>
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-white/[0.04] px-2.5 py-1 text-[10px] font-semibold text-gray-300 ring-1 ring-white/[0.06]">
+              <span className={`h-1.5 w-1.5 rounded-full ${liveDotClass}`} />
+              {liveState}
+            </span>
+          </div>
+          <h1 className="text-[31px] leading-[1.08] font-extrabold tracking-normal text-white">
             {heroHeadline}
           </h1>
-          <p className="text-sm text-ink-secondary mt-1">{heroSubline}</p>
+          <p className="mt-2 max-w-2xl text-[14px] leading-relaxed text-ink-secondary">{heroSubline}</p>
         </div>
-        <div className="flex items-center gap-2 shrink-0 ml-4">
+        <div className="flex shrink-0 flex-wrap items-center gap-2 lg:justify-end">
           {/* Search button — abre el SearchPalette (PR-2 2026-05-25).
               Visual: input fake con placeholder + atajo ⌘K a la derecha.
               Match patrón Linear/Vercel command bar. */}
@@ -344,6 +363,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
             {t("nav.new_batch")}
           </button>
         </div>
+        </div>
       </div>
 
       {/* ─── Hero KPI 3-up (Aprobar · Renderizando · Cuota) ───────────
@@ -352,17 +372,26 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
             UX 2026-05-29: ocultas cuando todos los valores son 0 — en cuenta
             nueva el bloque ocupaba 200px diciendo "no pasa nada". ─── */}
       {(pendingReview.length > 0 || processing.length > 0 || monthlyUsed > 0) && (
-      <div className="mb-8 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] grid grid-cols-1 md:grid-cols-3 md:divide-x md:divide-white/[0.04]">
+      <div className="mb-8 grid grid-cols-1 overflow-hidden rounded-card bg-[#111118]/82 ring-1 ring-white/[0.06] md:grid-cols-3 md:divide-x md:divide-white/[0.055]">
 
         {/* COL 1: APROBAR — north star del operador */}
         <button
           onClick={() => pendingReview.length > 0 && onSelectJob(pendingReview[0].job_id)}
           disabled={pendingReview.length === 0}
-          className={`text-left px-6 py-6 transition-colors ${pendingReview.length > 0 ? "hover:bg-surface-2/40 cursor-pointer" : "cursor-default"}`}
+          className={`group text-left px-6 py-5 transition-colors ${pendingReview.length > 0 ? "hover:bg-white/[0.035] cursor-pointer" : "cursor-default"}`}
         >
-          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Aprobar</p>
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Aprobar</p>
+            <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ring-1 ${
+              pendingReview.length > 0
+                ? "bg-amber-400/[0.08] text-amber-200 ring-amber-400/20"
+                : "bg-white/[0.04] text-gray-500 ring-white/[0.05]"
+            }`}>
+              {pendingReview.length > 0 ? "requiere acción" : "limpio"}
+            </span>
+          </div>
           <div className="mt-2 flex items-baseline gap-2">
-            <span className={`text-[44px] leading-none font-bold tracking-tight tabular-nums
+            <span className={`text-[44px] leading-none font-bold tracking-normal tabular-nums
               ${pendingReview.length === 0 ? "text-white/40" :
                 pendingReview.length >= 5 ? "text-red-300" :
                 "text-amber-200"}`}>
@@ -389,10 +418,19 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         </button>
 
         {/* COL 2: RENDERIZANDO — sistema en vivo */}
-        <div className="px-6 py-6">
-          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Renderizando</p>
+        <div className="px-6 py-5">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Renderizando</p>
+            <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ring-1 ${
+              processing.length > 0
+                ? "bg-brand/[0.10] text-brand-light ring-brand/25"
+                : "bg-white/[0.04] text-gray-500 ring-white/[0.05]"
+            }`}>
+              {processing.length > 0 ? "en vivo" : "sin cola"}
+            </span>
+          </div>
           <div className="mt-2 flex items-baseline gap-2">
-            <span className={`text-[44px] leading-none font-bold tracking-tight tabular-nums
+            <span className={`text-[44px] leading-none font-bold tracking-normal tabular-nums
               ${processing.length === 0 ? "text-white/40" : "text-brand-light"}`}>
               {processing.length}
             </span>
@@ -427,19 +465,30 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         </div>
 
         {/* COL 3: CUOTA — Stripe pattern (número grande + barra slim + delta) */}
-        <div className="px-6 py-6">
-          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
-            Cuota {MONTH_FMT.format(new Date())}
-          </p>
+        <div className="px-6 py-5">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
+              Cuota {MONTH_FMT.format(new Date())}
+            </p>
+            <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ring-1 ${
+              isUnlimited
+                ? "bg-accent/[0.08] text-accent ring-accent/20"
+                : usagePercent >= 80
+                  ? "bg-amber-400/[0.08] text-amber-200 ring-amber-400/20"
+                  : "bg-white/[0.04] text-gray-500 ring-white/[0.05]"
+            }`}>
+              {isUnlimited ? "unlimited" : monthlyLimit ? `${Math.round(usagePercent)}% usado` : "cargando"}
+            </span>
+          </div>
           <div className="mt-2 flex items-baseline gap-2">
             {isUnlimited ? (
               <>
-                <span className="text-[44px] leading-none font-bold tracking-tight tabular-nums text-white">{monthlyUsed}</span>
+                <span className="text-[44px] leading-none font-bold tracking-normal tabular-nums text-white">{monthlyUsed}</span>
                 <span className="text-xs text-ink-secondary">sin límite</span>
               </>
             ) : monthlyLimit ? (
               <>
-                <span className={`text-[44px] leading-none font-bold tracking-tight tabular-nums ${
+                <span className={`text-[44px] leading-none font-bold tracking-normal tabular-nums ${
                   usagePercent >= 100 ? "text-red-300" :
                   usagePercent >= 80 ? "text-amber-200" :
                   "text-white"
