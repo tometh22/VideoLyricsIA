@@ -295,6 +295,104 @@ def test_multipart_complete_clears_upload_id(client, monkeypatch):
         s.close()
 
 
+def test_multipart_complete_recovers_when_object_already_present(client, monkeypatch):
+    """A concurrent / duplicate complete gets NoSuchUpload from R2
+    (multipart_complete → None) but the object is durably stored: the
+    endpoint HEADs the key, sees the bytes, and answers 200 instead of a
+    spurious error. Prod 2026-07-06 (UMG .wav double-submit)."""
+    import main
+    from database import SessionLocal
+    from jobs import get_job_model
+
+    _, token, _, _ = _make_user(client)
+    monkeypatch.setattr("main.storage.is_enabled", lambda: True)
+    monkeypatch.setattr(main, "_MULTIPART_THRESHOLD_BYTES", 1)
+    monkeypatch.setattr(
+        "main.storage.multipart_init",
+        lambda *a, **k: {"upload_id": "UP", "key": "inputs/x/y/z.wav"},
+    )
+    # R2 says the multipart upload no longer exists (NoSuchUpload swallowed
+    # to None), but the stitched object IS present.
+    monkeypatch.setattr(
+        "main.storage.multipart_complete", lambda key, upload_id, parts: None,
+    )
+    monkeypatch.setattr("main.storage.head_object_size", lambda key: 42 * 1024 * 1024)
+
+    job_id = client.post(
+        "/upload-url",
+        json={"filename": "z.wav", "size_bytes": 60 * 1024 * 1024},
+        headers=auth(token),
+    ).json()["job_id"]
+    client.post(
+        "/upload-multipart-init",
+        json={"job_id": job_id, "filename": "z.wav"},
+        headers=auth(token),
+    )
+
+    res = client.post(
+        "/upload-multipart-complete",
+        json={"job_id": job_id, "parts": [{"part_number": 1, "etag": "abc123"}]},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+
+    s = SessionLocal()
+    try:
+        row = get_job_model(s, job_id)
+        assert row.multipart_upload_id is None  # handle cleared
+        assert row.input_r2_key  # durable object stays
+    finally:
+        s.close()
+
+
+def test_multipart_complete_dead_upload_clears_id_and_asks_reupload(client, monkeypatch):
+    """When multipart_complete fails AND no object landed, the upload_id is
+    permanently gone (R2 abort / stale sweep). The endpoint drops the dead
+    handle so the row doesn't wedge in awaiting_upload and returns 409 —
+    retrying complete is futile, the client must re-upload."""
+    import main
+    from database import SessionLocal
+    from jobs import get_job_model
+
+    _, token, _, _ = _make_user(client)
+    monkeypatch.setattr("main.storage.is_enabled", lambda: True)
+    monkeypatch.setattr(main, "_MULTIPART_THRESHOLD_BYTES", 1)
+    monkeypatch.setattr(
+        "main.storage.multipart_init",
+        lambda *a, **k: {"upload_id": "UP", "key": "inputs/x/y/z.wav"},
+    )
+    monkeypatch.setattr(
+        "main.storage.multipart_complete", lambda key, upload_id, parts: None,
+    )
+    # No object at the key — the multipart upload is genuinely gone.
+    monkeypatch.setattr("main.storage.head_object_size", lambda key: None)
+
+    job_id = client.post(
+        "/upload-url",
+        json={"filename": "z.wav", "size_bytes": 60 * 1024 * 1024},
+        headers=auth(token),
+    ).json()["job_id"]
+    client.post(
+        "/upload-multipart-init",
+        json={"job_id": job_id, "filename": "z.wav"},
+        headers=auth(token),
+    )
+
+    res = client.post(
+        "/upload-multipart-complete",
+        json={"job_id": job_id, "parts": [{"part_number": 1, "etag": "abc123"}]},
+        headers=auth(token),
+    )
+    assert res.status_code == 409
+
+    s = SessionLocal()
+    try:
+        row = get_job_model(s, job_id)
+        assert row.multipart_upload_id is None  # dead handle dropped
+    finally:
+        s.close()
+
+
 def test_multipart_abort_is_idempotent(client, monkeypatch):
     """Two consecutive aborts return 200 and don't error — the abort
     button should be safe to mash."""
@@ -579,35 +677,6 @@ def _mk_multipart_job(client, monkeypatch, token):
         headers=auth(token),
     )
     return job_id
-
-
-def test_multipart_complete_502_when_r2_returns_none(client, monkeypatch):
-    """storage.multipart_complete swallows boto errors and returns None.
-    The endpoint must NOT answer 200 in that case (the browser would
-    believe the upload landed), and must keep multipart_upload_id so the
-    client abort / reaper can still release the orphaned parts."""
-    from database import SessionLocal
-    from jobs import get_job_model
-
-    _, token, _, _ = _make_user(client)
-    job_id = _mk_multipart_job(client, monkeypatch, token)
-    monkeypatch.setattr(
-        "main.storage.multipart_complete", lambda key, upload_id, parts: None,
-    )
-
-    res = client.post(
-        "/upload-multipart-complete",
-        json={"job_id": job_id, "parts": [{"part_number": 1, "etag": "abc"}]},
-        headers=auth(token),
-    )
-    assert res.status_code == 502
-
-    s = SessionLocal()
-    try:
-        row = get_job_model(s, job_id)
-        assert row.multipart_upload_id == "UP"  # retained for abort/reaper
-    finally:
-        s.close()
 
 
 def test_multipart_complete_413_when_object_oversized(client, monkeypatch):

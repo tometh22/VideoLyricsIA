@@ -44,7 +44,7 @@ const TITLE_CARD_FIELDS = new Set([
   "titleSongBreak",
 ]);
 const LYRIC_RENDER_FIELDS = new Set([
-  "font", "textCase", "fontScale", "textContrast",
+  "font", "textCase", "fontScale", "textContrast", "frameFormat",
   "lyricsAnimation", "lineTransition", "lyricColor", "lyricSungColor",
 ]);
 
@@ -53,13 +53,26 @@ function applyTextCase(text, c) {
   if (c === "upper") return text.toUpperCase();
   if (c === "title") return text.replace(/\b\w/g, (ch) => ch.toUpperCase());
   if (c === "lower") return text.toLowerCase();
+  if (c === "sentence") {
+    return text.toLowerCase().split("\n").map(
+      (ln) => ln.replace(/[a-zà-ÿ]/i, (ch) => ch.toUpperCase())
+    ).join("\n");
+  }
   return text;
 }
 const TEXT_CASE_OPTS = [
   { code: "upper",    d: "MAY", label: "Todo en MAYÚSCULAS" },
   { code: "title",    d: "Aa",  label: "Primera letra de Cada Palabra" },
   { code: "lower",    d: "min", label: "todo en minúsculas" },
+  { code: "sentence", d: "Abc", label: "Primera letra de cada Línea" },
   { code: "original", d: "ori", label: "Sin cambios (como está escrito)" },
+];
+// Frame format: full 16:9 (default) vs cinemascope 2.39:1 letterbox. The
+// letterbox is applied deterministically in post (see pipeline._apply_frame_format)
+// — an intentional filmic look, not Veo's stochastic bars.
+const FRAME_FORMAT_OPTS = [
+  { code: "full", d: "16:9", label: "Pantalla completa (16:9)" },
+  { code: "cine", d: "2.39", label: "Cine — franjas (2.39:1)" },
 ];
 
 // Max single-file size. Backend MAX_UPLOAD_MB default is 500 and the
@@ -291,6 +304,7 @@ export default function UploadZone({
     genre: "", concept: "", movementStyle: "", effect: "", font: "",
     // lyricTransition + textMotion: deprecados 2026-05-23 (no se persisten).
     textCase: "upper", fontScale: "1.0", lyricsAnimation: "none", lineTransition: "none", textContrast: "medium",
+    frameFormat: "full",
     // Lyric color customization 2026-05-25:
     // - lyricColor: color del texto (no-cantada para karaoke; texto único para
     //   none/pop/glow/word_reveal).
@@ -1498,15 +1512,19 @@ export default function UploadZone({
       </div>
 
       {/* Text case pill buttons: MAY / Aa / min / ori */}
-      <div className="mb-3">
+      <div className="mb-3" data-tour="upload-text-case">
         <div className="flex items-center gap-2">
           <span className="text-[11px] text-gray-600 shrink-0">{t("upload.text_case_label") || "Texto:"}</span>
+          <span className="rounded-full bg-accent/[0.08] px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent ring-1 ring-accent/20">
+            {t("whatsnew.new_badge") || "Nuevo"}
+          </span>
+          <HelpTip text={t("announce.typocase_tagline")} />
           <div className="flex gap-1">
             {TEXT_CASE_OPTS.map((opt) => (
               <button
                 key={opt.code}
                 type="button"
-                title={opt.label}
+                title={opt.code === "sentence" ? `${opt.label} · ${t("announce.typocase_tagline")}` : opt.label}
                 onClick={() => updateBatchDefault("textCase", opt.code)}
                 onMouseEnter={() => setHoverCaseBatch(opt.code)}
                 onMouseLeave={() => setHoverCaseBatch(null)}
@@ -1527,6 +1545,34 @@ export default function UploadZone({
             <span className="text-[10px] text-gray-600">← así quedarán tus letras</span>
           </div>
         )}
+      </div>
+
+      {/* Frame format: Pantalla completa (16:9) / Cine (franjas 2.39:1).
+          El letterbox se aplica determinísticamente en post — look de cine
+          intencional, opuesto a las barras estocásticas de Veo. */}
+      <div className="mb-3" data-tour="upload-frame-format">
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-gray-600 shrink-0">{t("upload.frame_format_label") || "Formato:"}</span>
+          <span className="rounded-full bg-accent/[0.08] px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent ring-1 ring-accent/20">
+            {t("whatsnew.new_badge") || "Nuevo"}
+          </span>
+          <HelpTip text={t("announce.cinema_tagline")} />
+          <div className="flex gap-1">
+            {FRAME_FORMAT_OPTS.map((opt) => (
+              <button
+                key={opt.code}
+                type="button"
+                title={opt.code === "cine" ? `${opt.label} · ${t("announce.cinema_tagline")}` : opt.label}
+                onClick={() => updateBatchDefault("frameFormat", opt.code)}
+                className={`px-2.5 py-1 rounded-md text-[11px] font-mono font-bold transition-all
+                  ${(batchDefaults.frameFormat || "full") === opt.code
+                    ? "bg-brand/20 text-brand ring-1 ring-brand/40"
+                    : "bg-surface-3/40 text-gray-500 hover:text-gray-300"
+                  }`}
+              >{opt.d}</button>
+            ))}
+          </div>
+        </div>
       </div>
 
       {/* Font scale — A's en tamaños crecientes.
@@ -1584,7 +1630,7 @@ export default function UploadZone({
                   ? "bg-brand/20 ring-1 ring-brand/40"
                   : "bg-surface-3/40 hover:bg-surface-3/60"
                 }`}
-              style={opt.style}
+              style={{ ...opt.style, paintOrder: "stroke fill" }}
             >A</button>
           ))}
         </div>
@@ -1836,10 +1882,14 @@ export default function UploadZone({
                   <div>
                     <div className="flex items-center gap-2">
                       <span className="text-[11px] text-gray-600 shrink-0">{t("upload.text_case_label") || "Texto:"}</span>
+                      <span className="rounded-full bg-accent/[0.08] px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent ring-1 ring-accent/20">
+                        {t("whatsnew.new_badge") || "Nuevo"}
+                      </span>
+                      <HelpTip text={t("announce.typocase_tagline")} />
                       <div className="flex gap-1">
                         {TEXT_CASE_OPTS.map((opt) => (
                           <button key={opt.code} type="button"
-                            title={opt.label}
+                            title={opt.code === "sentence" ? `${opt.label} · ${t("announce.typocase_tagline")}` : opt.label}
                             onClick={() => updateField(i, "textCase", opt.code)}
                             onMouseEnter={() => setHoverCaseRow({ idx: i, code: opt.code })}
                             onMouseLeave={() => setHoverCaseRow(null)}
@@ -1900,7 +1950,7 @@ export default function UploadZone({
                               ? "bg-brand/20 ring-1 ring-brand/40"
                               : "bg-surface-3/40 hover:bg-surface-3/60"
                             }`}
-                          style={opt.style}
+                          style={{ ...opt.style, paintOrder: "stroke fill" }}
                         >A</button>
                       ))}
                     </div>
@@ -2450,6 +2500,7 @@ export default function UploadZone({
               song={titlePreviewSong}
               font={batchDefaults.font || ""}
               textCase={batchDefaults.textCase || "upper"}
+              frameFormat={batchDefaults.frameFormat || "full"}
               template={batchDefaults.titleTemplate || "auto"}
               titleSize={parseFloat(batchDefaults.titleSize) || 1.0}
               artistFont={batchDefaults.titleArtistFont || ""}
@@ -2512,6 +2563,7 @@ export default function UploadZone({
                  batchDefaults aún no fue tocado. */
               font={batchDefaults.font || ""}
               textCase={batchDefaults.textCase || "upper"}
+              frameFormat={batchDefaults.frameFormat || "full"}
               fontScale={batchDefaults.fontScale || "1.0"}
               textContrast={batchDefaults.textContrast || "medium"}
               mode={sceneMode}
@@ -2912,12 +2964,16 @@ export default function UploadZone({
                   <div>
                     <div className="flex items-center gap-2">
                       <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.text_case_label") || "Texto:"}</span>
+                      <span className="rounded-full bg-accent/[0.08] px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent ring-1 ring-accent/20">
+                        {t("whatsnew.new_badge") || "Nuevo"}
+                      </span>
+                      <HelpTip text={t("announce.typocase_tagline")} />
                       <div className="flex gap-1">
                         {TEXT_CASE_OPTS.map((opt) => (
                           <button
                             key={opt.code}
                             type="button"
-                            title={opt.label}
+                            title={opt.code === "sentence" ? `${opt.label} · ${t("announce.typocase_tagline")}` : opt.label}
                             onClick={() => updateBatchDefault("textCase", opt.code)}
                             onMouseEnter={() => setHoverCaseBatch(opt.code)}
                             onMouseLeave={() => setHoverCaseBatch(null)}
@@ -2987,7 +3043,7 @@ export default function UploadZone({
                               ? "bg-brand/20 ring-1 ring-brand/40"
                               : "bg-surface-3/40 hover:bg-surface-3/60"
                             }`}
-                          style={opt.style}
+                          style={{ ...opt.style, paintOrder: "stroke fill" }}
                         >A</button>
                       ))}
                     </div>
@@ -3431,7 +3487,7 @@ export default function UploadZone({
           file count) lo cual es informativo aunque mínimo en edit mode. */}
       {(files.length > 0 || editMode) && wizardStep !== 6 && (
         <div
-          className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-64" : "md:left-0"}`}
+          className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-60" : "md:left-0"}`}
           data-tour="upload-cta-bar"
         >
           <div className="w-full flex flex-wrap items-center gap-3">

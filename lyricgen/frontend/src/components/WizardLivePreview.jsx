@@ -91,6 +91,9 @@ export default function WizardLivePreview({
   // cuando el operador no toca nada.
   font = "",
   textCase = "upper",
+  // "full" (16:9) | "cine" (2.39:1 letterbox, simulated with CSS bars so the
+  // operator sees the framing before spending a render).
+  frameFormat = "full",
   fontScale = "1.0",
   textContrast = "medium",
   mode = "lyrics",
@@ -566,6 +569,14 @@ export default function WizardLivePreview({
               fontFamily: fontInfo.css,
               fontWeight: fontInfo.weight,
               WebkitTextStroke: contrastStyle.WebkitTextStroke,
+              // paint-order 2026-07-06: pintar el stroke DEBAJO del fill. Por
+              // defecto el browser dibuja el -webkit-text-stroke ENCIMA del
+              // relleno, así que el contorno negro cruza el glifo blanco y en
+              // fuentes como Roboto/Montserrat/Jost/Outfit se ve una "A"
+              // fantasma/esqueleto. Con stroke→fill el relleno tapa la mitad
+              // interna del trazo y queda un borde limpio (libass ya lo hace
+              // así, por eso el video final nunca mostró el artefacto).
+              paintOrder: "stroke fill",
               // Paleta minimal (fondo claro): el contrastStyle.textShadow
               // (sombras oscuras) sirve igual o mejor que el highlight
               // blanco histórico para legibilidad — pero cuando el operador
@@ -590,6 +601,15 @@ export default function WizardLivePreview({
           (muestra)" + dot ámbar estático. Mismo lenguaje visual que el
           chip de status del fondo abajo — antes los dos se contradecían
           (badge live, chip diciendo "es muestra"). */}
+      {/* Cinemascope 2.39:1 letterbox — simulated bars so the operator sees the
+          framing before rendering. The real bars are burned into the master by
+          pipeline._apply_frame_format. 2.39:1 in a 16:9 frame → 12.8% each. */}
+      {frameFormat === "cine" && (
+        <>
+          <div className="absolute inset-x-0 top-0 bg-black pointer-events-none" style={{ height: "12.8%" }} />
+          <div className="absolute inset-x-0 bottom-0 bg-black pointer-events-none" style={{ height: "12.8%" }} />
+        </>
+      )}
       <div className="absolute top-4 left-4 flex items-center gap-1.5 text-[10px] uppercase tracking-[0.18em] font-medium" style={{ color: isMinimal ? "rgba(0,0,0,.6)" : "rgba(255,255,255,.72)" }}>
         <span
           className={placeholderBg ? "w-1.5 h-1.5 rounded-full" : "w-1.5 h-1.5 rounded-full animate-pulse"}

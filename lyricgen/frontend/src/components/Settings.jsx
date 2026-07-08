@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useI18n } from "../i18n";
 import { startReplaySession } from "./OnboardingTour";
 import DriveConnectButton from "./DriveConnectButton";
@@ -230,6 +230,10 @@ export default function Settings({ onBack }) {
   const [planPreviewError, setPlanPreviewError] = useState(null);
   const [cancelLoading, setCancelLoading] = useState(false);
   const [activeSection, setActiveSection] = useState("cuenta");
+  // Mirror into a ref so the window-focus listener (registered once, empty
+  // deps) reads the current section without going stale.
+  const activeSectionRef = useRef(activeSection);
+  activeSectionRef.current = activeSection;
 
   // Change password
   const [pwCurrent, setPwCurrent] = useState("");
@@ -325,6 +329,9 @@ export default function Settings({ onBack }) {
   const [ytStatus, setYtStatus] = useState(null); // null=loading, {connected, channel_name, ...}
   const [ytStatusError, setYtStatusError] = useState(null);
   const [ytDisconnecting, setYtDisconnecting] = useState(false);
+  // Google shows two confusing screens (unverified app + unchecked
+  // permission boxes). Walk the user through them before opening the popup.
+  const [ytHelp, setYtHelp] = useState(false);
 
   const checkYtStatus = () => {
     setYtStatus(null);
@@ -335,24 +342,65 @@ export default function Settings({ onBack }) {
       .catch(() => setYtStatusError("Error al verificar la conexión."));
   };
 
+  // Quiet re-check (no loading flicker) used by the post-connect poll and
+  // the window-focus listener. Returns whether the account is connected.
+  const refreshYtStatusQuiet = async () => {
+    try {
+      const data = await fetch(`${API}/youtube/connection-status`, { headers: authHeaders() })
+        .then((r) => r.json());
+      setYtStatus(data);
+      return !!data?.connected;
+    } catch {
+      return false;
+    }
+  };
+  const ytPollRef = useRef(null);
+
   useEffect(() => {
     if (activeSection === "youtube") checkYtStatus();
   }, [activeSection]);
 
   useEffect(() => {
-    const handler = (e) => {
-      if (e.data === "yt_connected") checkYtStatus();
+    // The OAuth popup is opened with `noopener`, so its
+    // `window.opener.postMessage` never reaches us — the connection would
+    // only show after a manual refresh. Re-check whenever the user returns
+    // to this tab (i.e. after closing the popup). The message handler is a
+    // best-effort extra for browsers where the opener survives.
+    const onMessage = (e) => { if (e.data === "yt_connected") refreshYtStatusQuiet(); };
+    const onFocus = () => { if (activeSectionRef.current === "youtube") refreshYtStatusQuiet(); };
+    window.addEventListener("message", onMessage);
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onFocus);
+    return () => {
+      window.removeEventListener("message", onMessage);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onFocus);
+      if (ytPollRef.current) clearInterval(ytPollRef.current);
     };
-    window.addEventListener("message", handler);
-    return () => window.removeEventListener("message", handler);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleYtConnect = async () => {
+    setYtHelp(false);
     try {
       const res = await fetch(`${API}/youtube/auth-url`, { headers: authHeaders() });
       if (!res.ok) throw new Error("Error al obtener la URL de autenticación.");
       const data = await res.json();
-      window.open(data.auth_url, "_blank", "width=600,height=700,noopener");
+      const popup = window.open(data.auth_url, "_blank", "width=600,height=700,noopener");
+      // Poll the connection status while the popup is open — resilient to
+      // the popup's postMessage not reaching us (noopener) and to popup
+      // blockers. Stops on connect, popup close, or after 2 min.
+      if (ytPollRef.current) clearInterval(ytPollRef.current);
+      const startedAt = Date.now();
+      ytPollRef.current = setInterval(async () => {
+        const connected = await refreshYtStatusQuiet();
+        const popupClosed = popup && popup.closed;
+        if (connected || Date.now() - startedAt > 120000 || popupClosed) {
+          clearInterval(ytPollRef.current);
+          ytPollRef.current = null;
+          if (popupClosed && !connected) setTimeout(refreshYtStatusQuiet, 1500);
+        }
+      }, 2000);
     } catch (err) {
       setYtStatusError(err.message);
     }
@@ -1499,12 +1547,12 @@ export default function Settings({ onBack }) {
                 </div>
               )}
 
-              {ytStatus && !ytStatus.connected && (
+              {ytStatus && !ytStatus.connected && !ytHelp && (
                 <div className="flex items-center gap-4">
                   <div className="flex-1">
                     <p className="text-sm text-ink-secondary">{t("settings.yt_not_connected")}</p>
                   </div>
-                  <button onClick={handleYtConnect}
+                  <button onClick={() => { setYtStatusError(null); setYtHelp(true); }}
                     className="shrink-0 btn-primary text-sm py-2 px-4 flex items-center gap-2">
                     <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
                       <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/>
@@ -1512,6 +1560,26 @@ export default function Settings({ onBack }) {
                     </svg>
                     {t("settings.yt_connect")}
                   </button>
+                </div>
+              )}
+
+              {ytStatus && !ytStatus.connected && ytHelp && (
+                <div className="rounded-xl bg-brand/[0.06] ring-1 ring-brand/25 px-4 py-4">
+                  <p className="text-sm font-medium text-white mb-2">{t("settings.yt_help_title")}</p>
+                  <ol className="text-xs text-ink-secondary space-y-1.5 list-decimal list-inside mb-3">
+                    <li>{t("settings.yt_help_unverified")}</li>
+                    <li className="font-medium text-brand-light">{t("settings.yt_help_scopes")}</li>
+                    <li>{t("settings.yt_help_continue")}</li>
+                  </ol>
+                  <div className="flex gap-3">
+                    <button onClick={handleYtConnect} className="btn-primary text-sm py-2 px-5">
+                      {t("settings.yt_help_go")}
+                    </button>
+                    <button onClick={() => setYtHelp(false)}
+                      className="text-xs text-ink-secondary hover:text-white transition-colors">
+                      {t("settings.cancel") || "Cancelar"}
+                    </button>
+                  </div>
                 </div>
               )}
 

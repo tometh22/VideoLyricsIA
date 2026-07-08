@@ -161,6 +161,17 @@ def exchange_code_for_tokens(code: str) -> dict:
             "Google no devolvió refresh_token. Revocá el acceso previo en "
             "myaccount.google.com → seguridad → apps de terceros y reintentá."
         )
+    granted = set(data.get("scope", "").split())
+    # En la pantalla de consentimiento los permisos vienen como casillas
+    # SIN marcar. Si el usuario da "Continuar" sin tildar ambas, el canal
+    # "conecta" pero no puede subir videos. Rechazamos con un mensaje claro
+    # en vez de guardar un token inservible.
+    missing = [s for s in YOUTUBE_SCOPES if s not in granted]
+    if missing:
+        raise YoutubeOAuthError(
+            "Faltan permisos de YouTube. En la pantalla de Google marcá las "
+            "DOS casillas (administrar y ver tu canal) y volvé a intentar."
+        )
     return {
         "token": data["access_token"],
         "refresh_token": data["refresh_token"],

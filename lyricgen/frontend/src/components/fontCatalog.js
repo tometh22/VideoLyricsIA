@@ -31,5 +31,11 @@ export function applyCase(text, c) {
   if (c === "upper") return text.toUpperCase();
   if (c === "title") return text.replace(/\b\w/g, (ch) => ch.toUpperCase());
   if (c === "lower") return text.toLowerCase();
+  // "sentence": cada línea arranca con Mayúscula, el resto en minúscula.
+  if (c === "sentence") {
+    return text.toLowerCase().split("\n").map(
+      (ln) => ln.replace(/[a-zà-ÿ]/i, (ch) => ch.toUpperCase())
+    ).join("\n");
+  }
   return text;
 }
