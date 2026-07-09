@@ -787,6 +787,54 @@ class SystemYoutubeToken(Base):
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class YoutubeChannel(Base):
+    """Un canal de YouTube conectado POR TENANT (self-service).
+
+    Reemplaza el modelo singleton `SystemYoutubeToken` (un único canal central
+    al que subían TODOS los tenants — un leak: el canal que conectaba un tenant
+    lo veían/usaban todos, y conectar otro pisaba al anterior). Acá cada tenant
+    conecta su(s) propio(s) canal(es): universal_chile el suyo, universal_argentina
+    el suyo. El token OAuth va Fernet-encrypted at rest (mismo esquema que
+    SystemYoutubeToken / drive_oauth); se pone NULL al desconectar y la fila queda
+    para auditoría (status='revoked').
+
+    Se crea vía create_all() en el boot (mismo patrón que sales_leads — no
+    requiere migración Alembic). Requerimiento de producto: canal-por-tenant es
+    real para UMG (Chile/Argentina = cuentas separadas).
+    """
+    __tablename__ = "youtube_channels"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), nullable=False)
+    channel_id = Column(String(64), nullable=False)          # "UC..." de YouTube
+    channel_title = Column(String(255), nullable=True)
+    thumbnail_url = Column(String(500), nullable=True)
+    # NULL tras disconnect; presente = canal activo/reconectable.
+    encrypted_token_json = Column(Text, nullable=True)
+    scopes = Column(JSON, nullable=True)
+    # active | revoked | error (refresh revocado → requiere reconexión)
+    status = Column(String(20), nullable=False, default="active")
+    is_default = Column(Boolean, nullable=False, default=False)
+    connected_by_user_id = Column(Integer, nullable=True)     # auditoría
+    last_refresh_at = Column(DateTime(timezone=True), nullable=True)
+    last_refresh_error = Column(Text, nullable=True)
+    connected_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    __table_args__ = (
+        # Un mismo canal de YouTube no se conecta dos veces bajo el mismo tenant.
+        Index("uq_yt_channel_per_tenant", "tenant_id", "channel_id", unique=True),
+        # A lo sumo UN canal default por tenant. Unique PARCIAL sobre is_default
+        # (en pg Y sqlite/tests) para no forzar unicidad total del tenant.
+        Index(
+            "uq_yt_default_per_tenant", "tenant_id", unique=True,
+            postgresql_where=text("is_default"),
+            sqlite_where=text("is_default"),
+        ),
+        Index("ix_youtube_channels_tenant_status", "tenant_id", "status"),
+    )
+
+
 class DriveTransfer(Base):
     """Track de una transferencia R2 → Google Drive (uno por click de
     'Guardar en Drive'). El worker que corre rclone va updateando
