@@ -8918,6 +8918,16 @@ async def get_source_audio_url(
                 }
 
     # 4. Neither original nor any rendered MP4 — operator must re-upload.
+    # Diagnóstico (2026-07-10, "No Hay Santos"): cuando el editor muestra
+    # "Audio no disponible" necesitamos saber DESDE PROD qué candidato
+    # falló y por qué (key ausente vs sonda a R2 caída) sin reproducir.
+    logger.warning(
+        "[SOURCE-AUDIO] 404 for job %s: input_r2_key=%r s3_keys(video)=%r "
+        "s3_keys(short)=%r — every candidate missing or unprobeable",
+        job_id, job.input_r2_key,
+        (job.s3_keys or {}).get("video") if isinstance(job.s3_keys, dict) else None,
+        (job.s3_keys or {}).get("short") if isinstance(job.s3_keys, dict) else None,
+    )
     raise HTTPException(
         status_code=404,
         detail=(
@@ -9765,33 +9775,49 @@ async def request_edit(
     # consume a slot.
     new_edit_count = current_edit_count if _metadata_only else current_edit_count + 1
 
-    # Pre-flight check that the source audio is still in R2. Every edit
-    # type (background/typography/lyrics) downloads the original WAV
-    # before re-rendering. If the audio is gone (sibling variant was
-    # deleted and reclaimed the shared key, or cleanup_old_inputs ran),
-    # the worker would crash 30 s into the edit with "Could not download
-    # source audio from R2" and the operator would see "El video falló"
-    # with no actionable hint. Fail fast here with a clear re-upload
-    # instruction instead. 2026-05-19 agus.cafisi / Una Vez Más incident.
-    if job.input_r2_key:
-        try:
-            import storage as _storage
-            if _storage.is_enabled() and not _storage.object_exists(job.input_r2_key):
+    # Pre-flight check that the edit will be able to source its audio.
+    # The worker (run_edit_pipeline) resolves audio in two tiers: the
+    # original input in R2, and — when that was purged (cleanup_old_inputs,
+    # sibling delete) — extracting the track from a rendered deliverable
+    # (video/short). This gate must mirror BOTH tiers: blocking on the
+    # input alone rejected perfectly recoverable edits with "Subí el MP3
+    # de nuevo" (2026-07-10, job 53b9513225b1 "No Hay Santos" — the lyrics
+    # edit that re-stitches a damaged scene timeline was blocked even
+    # though its rendered MP4 was alive and the worker would have
+    # recovered the audio from it). Only 422 when NEITHER tier can work,
+    # which is the case the 2026-05-19 agus.cafisi incident was about.
+    try:
+        import storage as _storage
+        if _storage.is_enabled():
+            _has_input = bool(
+                job.input_r2_key and _storage.object_exists(job.input_r2_key)
+            )
+            _s3 = job.s3_keys if isinstance(job.s3_keys, dict) else {}
+            _has_deliverable = any(
+                _s3.get(_k) and _storage.object_exists(_s3[_k])
+                for _k in ("video", "short")
+            )
+            if not _has_input and not _has_deliverable:
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        "El audio original ya no está en storage. "
-                        "Probablemente fue limpiado o un job hermano lo borró. "
+                        "El audio original ya no está en storage y no hay un "
+                        "video renderizado del cual recuperarlo. "
                         "Subí el MP3 de nuevo para regenerar el video."
                     ),
                 )
-        except HTTPException:
-            raise
-        except Exception as _exc:
-            logger.warning(
-                "[EDIT] R2 pre-check failed for %s key=%r — proceeding anyway: %s",
-                job_id, job.input_r2_key, _exc,
-            )
+            if not _has_input:
+                logger.info(
+                    "[EDIT] job %s: input %r ausente en R2 — el worker recuperará "
+                    "el audio del deliverable (tier-2)", job_id, job.input_r2_key,
+                )
+    except HTTPException:
+        raise
+    except Exception as _exc:
+        logger.warning(
+            "[EDIT] R2 pre-check failed for %s key=%r — proceeding anyway: %s",
+            job_id, job.input_r2_key, _exc,
+        )
 
     # Flip to editing immediately so the UI can show progress.
     job.status = "editing"
