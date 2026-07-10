@@ -139,6 +139,45 @@ def test_scene_clips_graceful_degradation(monkeypatch, tmp_path):
     assert failed["status"] == "failed"
 
 
+def test_scene_clips_cache_only_miss_without_stored_key_degrades_silently(monkeypatch, tmp_path):
+    """Incidente 2026-07-10 (coro_3): en un edit (regen_keys=set() → todo
+    cache_only), una escena que falló en la generación original NUNCA persistió
+    clip_cache_key. Antes se llamaba a _generate_veo_video igual → RuntimeError
+    de cache_only_miss → logger.ERROR → page falso al on-call por una condición
+    ya manejada. Ahora esa escena se saltea (NO toca Veo → cero re-cobro) y
+    degrada en silencio reusando un clip válido (status 'reused', log WARNING)."""
+    import veo_breaker
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+    calls = []
+
+    def fake_veo(prompt, output_path, **kw):
+        calls.append(kw.get("cache_namespace"))
+        with open(output_path, "w") as f:
+            f.write("clip")
+        return output_path
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    plan = {"scenes": [
+        # coro_1 sí cacheó al generarse (tiene clip_cache_key).
+        {"recurrence_key": "coro_1", "prompt": "p", "movement_style": "dinamico",
+         "clip_cache_key": "cache/veo/coro1.mp4"},
+        # coro_3 falló en la generación original → sin clip_cache_key.
+        {"recurrence_key": "coro_3", "prompt": "p", "movement_style": "sutil",
+         "status": "failed"},
+    ]}
+    # regen_keys=set() → TODAS cache_only (el caso del edit de lyrics/typography).
+    clip_for_key = pipeline._generate_scene_clips(
+        plan, str(tmp_path), artist="A", song_title="S", job_id=None,
+        regen_keys=set())
+
+    # coro_3 NO gatilló una llamada a Veo (se salteó): solo coro_1 fue consultada.
+    assert all("coro_3" not in (ns or "") for ns in calls)
+    # El timeline queda entero: coro_3 reusa el clip válido de coro_1.
+    assert set(clip_for_key) == {"coro_1", "coro_3"}
+    coro3 = next(s for s in plan["scenes"] if s["recurrence_key"] == "coro_3")
+    assert coro3["status"] == "reused"
+
+
 def test_scene_clips_all_fail_raises(monkeypatch, tmp_path):
     import veo_breaker
     monkeypatch.setattr(veo_breaker, "is_open", lambda: False)

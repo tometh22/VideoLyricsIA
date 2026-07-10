@@ -8345,6 +8345,21 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
         # En un regen (regen_keys set), las escenas NO-target son cache_only:
         # se sirven de caché o se degradan, nunca pagan Veo de nuevo.
         _cache_only = regen_keys is not None and key not in regen_keys
+        # Cache_only-miss ESPERADO: una escena que en la generación original
+        # falló/degradó NUNCA persistió clip_cache_key (solo se escribe en el
+        # camino de éxito, abajo). En un edit posterior (lyrics/typography →
+        # regen_keys=set()) esa escena es cache_only y no tiene key ni hash
+        # recomputable que dé HIT — _generate_veo_video levantaría RuntimeError
+        # y el catch lo loguearía como ERROR, paginando al on-call por una
+        # condición YA manejada (se degrada reusando un clip válido). Saltamos
+        # la llamada y degradamos en silencio: cero riesgo de re-cobro (no
+        # tocamos Veo) y cero page falso. Incidente 2026-07-10, coro_3.
+        if _cache_only and not scene.get("clip_cache_key"):
+            logger.warning(
+                "[SCENES] escena %s sin clip cacheado (falló en la generación "
+                "original) — se reusa un clip válido, sin regenerar", key)
+            scene["status"] = "reused"
+            continue
         _meta = {}
         try:
             _generate_veo_video(
