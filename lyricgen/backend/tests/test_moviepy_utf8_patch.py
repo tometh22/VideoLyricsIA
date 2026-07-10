@@ -60,7 +60,7 @@ def test_happy_path_does_not_remux(monkeypatch):
     assert remuxed == []  # no work on the happy path
 
 
-def test_retries_on_unicode_error_then_cleans_up(tmp_path, monkeypatch):
+def test_retries_on_unicode_error_then_cleans_up(tmp_path, monkeypatch, caplog):
     """Accented file → original raises → retry against an ASCII copy, then the
     temp copy is deleted. The caller-visible result comes from the retry."""
     safe = tmp_path / "safe.wav"
@@ -77,11 +77,15 @@ def test_retries_on_unicode_error_then_cleans_up(tmp_path, monkeypatch):
     monkeypatch.setattr(mp, "_ORIGINAL_PARSE_INFOS", fake_original)
     monkeypatch.setattr(mp, "_ascii_metadata_free_copy", lambda src: str(safe))
 
-    out = mp._tolerant_parse_infos("/out/03-Los Tres-La Vida Al Revés.wav")
+    import logging as _logging
+    with caplog.at_level(_logging.INFO, logger="genly.moviepy_patch"):
+        out = mp._tolerant_parse_infos("/out/03-Los Tres-La Vida Al Revés.wav")
 
     assert out == {"duration": 3.0, "fn": str(safe)}
     assert seen == ["/out/03-Los Tres-La Vida Al Revés.wav", str(safe)]
     assert not safe.exists()  # temp copy cleaned up even though parse succeeded
+    # A successful recovery is observable (so prod can confirm the fallback fires).
+    assert any("recovered non-UTF-8" in r.message for r in caplog.records)
 
 
 def test_cleanup_runs_even_if_retry_also_raises(tmp_path, monkeypatch):

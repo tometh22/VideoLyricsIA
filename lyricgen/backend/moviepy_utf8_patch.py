@@ -93,15 +93,38 @@ def _ascii_metadata_free_copy(src):
     return dst
 
 
+def _record_recovery(filename, ude):
+    """Emit an INFO log + best-effort Sentry breadcrumb when the fallback
+    successfully recovers. Without this the happy fallback is silent, so in prod
+    we could not SEE that UMG's accented renders are being rescued (only that
+    they fail). The breadcrumb also correlates the recovery with any later error
+    in the same job. Never raises."""
+    logger.info(
+        "[moviepy-patch] recovered non-UTF-8 ffmpeg banner via metadata-free "
+        "remux for %r (%s)", filename, ude,
+    )
+    try:
+        import sentry_sdk
+        sentry_sdk.add_breadcrumb(
+            category="moviepy-patch", level="info",
+            message="recovered non-UTF-8 ffmpeg banner via metadata-free remux",
+            data={"filename": str(filename)},
+        )
+    except Exception:
+        pass
+
+
 def _tolerant_parse_infos(filename, *args, **kwargs):
     """Drop-in for moviepy's ffmpeg_parse_infos that survives non-UTF-8 bytes
     in ffmpeg's stderr banner (accented filename / embedded metadata)."""
     try:
         return _ORIGINAL_PARSE_INFOS(filename, *args, **kwargs)
-    except UnicodeDecodeError:
+    except UnicodeDecodeError as ude:
         safe = _ascii_metadata_free_copy(filename)
         try:
-            return _ORIGINAL_PARSE_INFOS(safe, *args, **kwargs)
+            infos = _ORIGINAL_PARSE_INFOS(safe, *args, **kwargs)
+            _record_recovery(filename, ude)
+            return infos
         finally:
             try:
                 os.remove(safe)
