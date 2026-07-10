@@ -545,8 +545,17 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
 
   // Short-lived media URLs (re-fetch when the active tab changes).
   const previewMediaType = activeTab === "thumbnail" ? "thumbnail" : activeTab;
-  const previewSrc = useMediaUrl(job.job_id, previewMediaType, "preview");
-  const downloadHref = useMediaUrl(job.job_id, previewMediaType, "download");
+  // Render-version key so the player reloads when an edit finishes. Edits
+  // overwrite the SAME R2 key, so without this the <video src> never changes
+  // and a mounted player keeps showing the pre-edit render forever (UMG
+  // "no me lo está actualizando", job eaff5c7baf50 — 4 edits OK server-side,
+  // operator kept seeing v0 and burned her 3 edits re-requesting them).
+  // Why edit_count AND status: edit_count bumps when the edit is REQUESTED
+  // (pending_review→editing), not when it completes — status flipping back
+  // to pending_review is the completion signal that must swap the URL.
+  const mediaVersion = `${job.edit_count || 0}-${job.status || ""}`;
+  const previewSrc = useMediaUrl(job.job_id, previewMediaType, "preview", mediaVersion);
+  const downloadHref = useMediaUrl(job.job_id, previewMediaType, "download", mediaVersion);
 
   // Auto-retry the <video> load. A just-finished job flips to
   // pending_review the instant the DB row updates, but the MP4 can lag a
@@ -1740,7 +1749,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             ) : (
               previewSrc ? (
                 <video
-                  key={`${activeTab}-${videoReloadKey}`}
+                  key={`${activeTab}-${videoReloadKey}-${mediaVersion}`}
                   ref={activeTab === "video" ? videoRef : undefined}
                   src={previewSrc}
                   controls

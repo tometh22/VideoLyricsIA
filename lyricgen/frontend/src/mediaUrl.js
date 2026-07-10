@@ -119,20 +119,32 @@ export function getMediaToken(jobId, fileType) {
   return inflight;
 }
 
-export async function getDownloadUrl(jobId, fileType) {
+// `version` (optional): opaque cache-buster appended as `&v=`. The backend
+// ignores unknown query params — its only job is to change the URL STRING
+// when the job's render changes. Without it, an edit that overwrites the
+// same R2 key leaves the <video src> byte-identical, so a mounted player
+// never re-fetches and the operator keeps seeing the PRE-edit render (the
+// UMG "no me lo está actualizando" incident, job eaff5c7baf50: 4 edits OK
+// server-side, stale player client-side). The media TOKEN cache stays
+// keyed by (job, fileType) only — tokens are not content-bound, so reusing
+// one across versions is correct and avoids extra /media-token requests.
+export async function getDownloadUrl(jobId, fileType, version = "") {
   const token = await getMediaToken(jobId, fileType);
-  return `${API}/download/${jobId}/${fileType}?token=${encodeURIComponent(token)}`;
+  const v = version ? `&v=${encodeURIComponent(version)}` : "";
+  return `${API}/download/${jobId}/${fileType}?token=${encodeURIComponent(token)}${v}`;
 }
 
-export async function getPreviewUrl(jobId, fileType) {
+export async function getPreviewUrl(jobId, fileType, version = "") {
   const token = await getMediaToken(jobId, fileType);
-  return `${API}/preview/${jobId}/${fileType}?token=${encodeURIComponent(token)}`;
+  const v = version ? `&v=${encodeURIComponent(version)}` : "";
+  return `${API}/preview/${jobId}/${fileType}?token=${encodeURIComponent(token)}${v}`;
 }
 
 // React hook: returns the preview URL for an <img>/<video> src. Returns
-// "" until the token is fetched. The hook re-runs if jobId or fileType
-// change.
-export function useMediaUrl(jobId, fileType, kind = "preview") {
+// "" until the token is fetched. The hook re-runs if jobId, fileType or
+// version change — `version` is what lets a mounted player pick up a NEW
+// render of the SAME job after an edit, without a page refresh.
+export function useMediaUrl(jobId, fileType, kind = "preview", version = "") {
   const [url, setUrl] = useState("");
   useEffect(() => {
     if (!jobId || !fileType) {
@@ -141,11 +153,11 @@ export function useMediaUrl(jobId, fileType, kind = "preview") {
     }
     let cancelled = false;
     const fetcher = kind === "download" ? getDownloadUrl : getPreviewUrl;
-    fetcher(jobId, fileType)
+    fetcher(jobId, fileType, version)
       .then((u) => { if (!cancelled) setUrl(u); })
       .catch(() => { if (!cancelled) setUrl(""); });
     return () => { cancelled = true; };
-  }, [jobId, fileType, kind]);
+  }, [jobId, fileType, kind, version]);
   return url;
 }
 
@@ -163,7 +175,7 @@ export function useMediaUrl(jobId, fileType, kind = "preview") {
 // enters the viewport (200 px above by default) so the token + image
 // usually finish loading before the user actually sees the card. This
 // hides the "blank thumbnail flash" you'd otherwise see during scroll.
-export function useLazyMediaUrl(jobId, fileType, kind = "preview", { rootMargin = "200px" } = {}) {
+export function useLazyMediaUrl(jobId, fileType, kind = "preview", { rootMargin = "200px", version = "" } = {}) {
   const [url, setUrl] = useState("");
   const [shouldFetch, setShouldFetch] = useState(false);
   const elementRef = useRef(null);
@@ -202,11 +214,11 @@ export function useLazyMediaUrl(jobId, fileType, kind = "preview", { rootMargin 
     }
     let cancelled = false;
     const fetcher = kind === "download" ? getDownloadUrl : getPreviewUrl;
-    fetcher(jobId, fileType)
+    fetcher(jobId, fileType, version)
       .then((u) => { if (!cancelled) setUrl(u); })
       .catch(() => { if (!cancelled) setUrl(""); });
     return () => { cancelled = true; };
-  }, [shouldFetch, jobId, fileType, kind]);
+  }, [shouldFetch, jobId, fileType, kind, version]);
 
   // ref is a callback so we can attach to any element type without
   // forwarding refs.

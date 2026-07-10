@@ -266,6 +266,9 @@ function VideoCardImpl({ job, onSelect, onDelete, selected, onToggleSelect, t })
     showThumb ? job.job_id : "",
     "thumbnail",
     "preview",
+    // version: edits overwrite the same R2 thumbnail key — bust the URL when
+    // the render changes so the card doesn't keep the pre-edit image.
+    { version: `${job.edit_count || 0}-${job.status || ""}` },
   );
   const canDelete = DELETABLE.has(job.status);
 
@@ -486,7 +489,7 @@ function ProcessingThumbnail({ status }) {
 // feedback 2026-05-25: "el historial parece backend, debería ser más
 // lindo, sumarle thumbnails". Aumentamos 3× el tamaño + agregamos
 // ring + overlay play sobre la card completa.
-function MediaThumbnail({ jobId, status }) {
+function MediaThumbnail({ jobId, status, editCount = 0 }) {
   // Solo pedir el thumbnail real para statuses que pueden tenerlo en R2.
   // Para los demás (processing/queued/etc), saltearse el /media-token
   // request y dibujar el ProcessingThumbnail directamente.
@@ -498,6 +501,8 @@ function MediaThumbnail({ jobId, status }) {
     hasMedia ? jobId : "",
     "thumbnail",
     "preview",
+    // version: bust the URL when an edit re-renders (same R2 key overwritten).
+    { version: `${editCount}-${status || ""}` },
   );
   const isReady = status === "done" || status === "pending_review";
   return (
@@ -576,7 +581,7 @@ function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) 
 
       {/* Media thumbnail (operator feedback 2026-05-25: "sumarle
           thumbnails a los videos"). 120×70 aspect-video, YouTube Studio. */}
-      <MediaThumbnail jobId={job.job_id} status={job.status} />
+      <MediaThumbnail jobId={job.job_id} status={job.status} editCount={job.edit_count || 0} />
 
       {/* Texto central — 2 líneas generosas */}
       <div className="flex-1 min-w-0 flex flex-col justify-center gap-0.5">
