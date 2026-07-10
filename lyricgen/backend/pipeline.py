@@ -12395,6 +12395,24 @@ def run_edit_pipeline(
                     "deliverable (video/short) for this job"
                 )
 
+        # Observability (2026-07-10): source_audio.mp3 is named .mp3 regardless of
+        # the real codec, so a WAV upload is PCM-in-.mp3. Log the true codec/format
+        # so the mislabel is visible in prod and we can confirm the moviepy UTF-8
+        # fallback is being exercised on UMG's accented WAVs. Best-effort; never
+        # blocks the edit.
+        try:
+            _probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=codec_name:format=format_name",
+                 "-of", "default=noprint_wrappers=1:nokey=1", mp3_path],
+                capture_output=True, text=True, timeout=15,
+            ).stdout.split()
+            logger.info("[EDIT] job %s source_audio real codec/format=%s (path suffix=%s)",
+                        job_id, "/".join(_probe) or "unknown",
+                        os.path.splitext(mp3_path)[1])
+        except Exception:
+            pass
+
         # ----------------------------------------------------------------
         # Resolve background
         # ----------------------------------------------------------------
