@@ -7152,6 +7152,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         allow_people: bool = False,
                         verbatim: bool = False,
                         cache_only: bool = False,
+                        cache_key_override: str | None = None,
                         out_meta: dict | None = None) -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
@@ -7405,18 +7406,35 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # clip no está cacheado, levantamos y el caller degrada (reusa otro clip) en
     # vez de pagar Veo. Sin esto, un cache miss en una regen re-facturaba todo.
     if cache_only:
-        if (_storage.is_enabled() and _storage.object_exists(cache_object_key)
-                and _storage.download_object(cache_object_key, output_path)):
-            size_mb = os.path.getsize(output_path) / 1024 / 1024
-            logger.info("[BG] Veo cache HIT (cache_only, %s): %.1f MB", cache_key_hash, size_mb)
-            if recorder:
-                recorder.finish(response_summary=f"cache_hit(cache_only): {size_mb:.1f}MB key={cache_key_hash}",
-                                output_artifact=output_path)
-            return output_path
+        # Buscar PRIMERO por la key persistida a la hora de generar
+        # (scene["clip_cache_key"], via cache_key_override) y recién después
+        # por el hash recomputado. El hash incluye namespace (artist|título),
+        # prompt, params de Veo (¡incluido el nombre del modelo!) y blur_sigma:
+        # cualquier deriva posterior (metadata edit, bump de modelo, env var)
+        # cambia el hash y missea TODOS los clips aunque sigan en R2 —
+        # incidente 2026-07-10, job 53b9513225b1: las 6 escenas tenían su
+        # clip_cache_key intacto en el plan pero el lookup recomputado falló
+        # 6/6 y el video degradó al fondo dañado (render negro).
+        _candidates = [k for k in (cache_key_override, cache_object_key) if k]
+        for _ck in dict.fromkeys(_candidates):  # dedup preservando orden
+            if (_storage.is_enabled() and _storage.object_exists(_ck)
+                    and _storage.download_object(_ck, output_path)):
+                size_mb = os.path.getsize(output_path) / 1024 / 1024
+                _via = "stored-key" if _ck == cache_key_override else "recomputed"
+                logger.info("[BG] Veo cache HIT (cache_only via %s, %s): %.1f MB",
+                            _via, _ck, size_mb)
+                if out_meta is not None:
+                    # La key que REALMENTE sirvió el clip — así el GC y las
+                    # próximas búsquedas apuntan al objeto vivo.
+                    out_meta["cache_object_key"] = _ck
+                if recorder:
+                    recorder.finish(response_summary=f"cache_hit(cache_only,{_via}): {size_mb:.1f}MB key={_ck}",
+                                    output_artifact=output_path)
+                return output_path
         if recorder:
-            recorder.finish(response_summary=f"cache_only_miss: key={cache_key_hash}")
+            recorder.finish(response_summary=f"cache_only_miss: keys={_candidates}")
         raise RuntimeError(
-            f"[BG] cache_only: sin clip cacheado ({cache_key_hash}) — no se genera "
+            f"[BG] cache_only: sin clip cacheado (probé {_candidates}) — no se genera "
             "para no re-cobrar Veo en una regeneración de escena")
 
     if _storage.is_enabled() and _storage.object_exists(cache_object_key):
@@ -8336,6 +8354,11 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                 normalized_concept=_normalize_concept(concept),
                 allow_people=allow_people,
                 cache_only=_cache_only,
+                # La key con la que este clip se cacheó AL GENERARSE — inmune a
+                # derivas del hash recomputado (metadata edit, bump del modelo
+                # Veo, env). Solo aplica en cache_only: un regen pago escribe
+                # una key nueva y la persiste abajo.
+                cache_key_override=scene.get("clip_cache_key") if _cache_only else None,
                 out_meta=_meta,
             )
             if not os.path.exists(clip_path):
@@ -8521,6 +8544,31 @@ def _restitch_scenes_for_edit(scene_plan: dict, segments: list[dict],
     timeline = _scenes.stitch_timeline(new_secs, clip_for_key, audio_duration,
                                        job_dir, target_w=target_w, target_h=target_h)
     return timeline, scene_plan
+
+
+def _recache_scene_timeline(job_id: str, timeline_path: str) -> None:
+    """Sube el timeline multi-escena recién armado a bg_cached y actualiza
+    bg_r2_key_cached — el mismo patrón que el branch de background-edit.
+
+    Sin esto, el re-stitch de un edit de letra y el regen de escena ("Otra
+    toma") reparaban el render ACTUAL pero dejaban el cache viejo: el próximo
+    edit de tipografía volvía al timeline stale (o, en un job dañado pre-#803,
+    al clip único de 8s → video negro). Incidente 2026-07-10, job 53b9513225b1.
+    Best-effort: un fallo acá no debe tumbar el edit (el render local ya salió).
+    """
+    if not (timeline_path and os.path.exists(timeline_path) and storage.is_enabled()):
+        return
+    try:
+        _ext = os.path.splitext(timeline_path)[1] or ".mp4"
+        new_key = storage.upload_file(
+            timeline_path, f"backgrounds/{job_id}/bg_cached{_ext}",
+        )
+        if new_key:
+            update_job(job_id, bg_r2_key_cached=new_key)
+            size_mb = os.path.getsize(timeline_path) / 1024 / 1024
+            logger.info("[SCENES] timeline re-cacheado (%.1f MB) para %s", size_mb, job_id)
+    except Exception as _e:  # noqa: BLE001
+        logger.warning("[SCENES] re-cache del timeline falló para %s: %s", job_id, _e)
 
 
 def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
@@ -12446,8 +12494,21 @@ def run_edit_pipeline(
                         bg_prelooped = True
                         update_job(job_id, scene_plan=scene_plan)
                         logger.info("[EDIT] escenas re-stitcheadas con la letra editada (job=%s)", job_id)
+                        # Re-cachear el timeline nuevo: los cortes cambiaron con
+                        # la letra — sin esto el próximo edit de tipografía
+                        # rendería con el timeline viejo (o, en un job dañado
+                        # pre-#803, con el clip único de 8s → video negro).
+                        _recache_scene_timeline(job_id, _re_tl)
                 except Exception as _e:  # noqa: BLE001
                     logger.warning("[EDIT] re-stitch de escenas falló (%s) — uso timeline cacheado", _e)
+                    # Persistir los estados/errores por escena que el intento
+                    # dejó en el plan (clip_cache_missing etc.) — sin esto el
+                    # operador ve "generated" stale en /status y el fallback es
+                    # indiagnosticable desde prod (incidente 2026-07-10).
+                    try:
+                        update_job(job_id, scene_plan=scene_plan)
+                    except Exception:
+                        pass
             # La extensión viene de la key cacheada: para fondos humanos
             # puede ser .jpg/.png (imagen fija del usuario) y de ella
             # depende el manejo de stills aguas abajo. Antes estaba
@@ -12471,6 +12532,28 @@ def run_edit_pipeline(
                 # palindromee (si no, las escenas se reproducen en reversa al final).
                 if _is_scene_job:
                     bg_prelooped = True
+                    # Guard de duración (incidente 2026-07-10, job 53b9513225b1):
+                    # en un job dañado pre-#803, bg_r2_key_cached es un clip
+                    # único de ~8s, NO el timeline full-length que este branch
+                    # asume. Con bg_prelooped=True el render lo reproduce UNA
+                    # vez → 8s de imagen + resto NEGRO. Si el cache dura
+                    # bastante menos que el audio (tolerancia 3.5s = 3s del
+                    # fast-path libass + 0.5s LAST_SCENE_SAFETY), NO es un
+                    # timeline: lo loopeamos (feo pero nunca negro) y avisamos.
+                    try:
+                        _bg_dur = _ffprobe_duration(bg_image_path)
+                        _aud_dur = scene_plan.get("audio_duration") or _audio_duration(mp3_path)
+                        if _bg_dur and _aud_dur and (_aud_dur - _bg_dur) > 3.5:
+                            logger.warning(
+                                "[SCENES] cached bg de job multi-escena NO es un "
+                                "timeline full-length (%.1fs vs audio %.1fs, job=%s) "
+                                "— se loopea para evitar render negro; regenerá las "
+                                "escenas para recuperar la variedad",
+                                _bg_dur, _aud_dur, job_id,
+                            )
+                            bg_prelooped = False
+                    except Exception as _e:  # noqa: BLE001
+                        logger.warning("[SCENES] duration guard falló (%s) — sigo con prelooped", _e)
 
         elif edit_type == "background":
             # Cinturón del guard en request_edit (incidente 2026-07-01):
@@ -12539,6 +12622,11 @@ def run_edit_pipeline(
             bg_prelooped = True
             # Persistir el plan actualizado (clip nuevo, cache_token, thumb).
             update_job(job_id, scene_plan=scene_plan, progress=35)
+            # Re-cachear el timeline re-armado — sin esto la reparación de un
+            # "Otra toma" era efímera: el próximo edit de tipografía volvía al
+            # cache viejo (incidente 2026-07-10: cache = clip único de 8s de un
+            # job dañado pre-#803 → render negro).
+            _recache_scene_timeline(job_id, bg_image_path)
 
         else:
             raise ValueError(f"Unknown edit_type {edit_type!r}")
