@@ -574,6 +574,15 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const isEditing = job.status === "editing";
   const isValidationFailed = job.status === "validation_failed";
   const isError = job.status === "error";
+  // An edit that failed AFTER a prior successful render: the deliverable in R2 is
+  // untouched (the pipeline only flips status=error, it never clears s3_keys), so
+  // the previous video is still intact. Surfaced to reassure operators who see a
+  // cryptic "Edit falló" and assume they lost the video / must re-upload.
+  const hasPriorDeliverable = !!(
+    (job.s3_keys && job.s3_keys.video) || job.video_url || job.thumbnail_url
+  );
+  const isEditFailureWithPriorVideo =
+    isError && (job.edit_count || 0) > 0 && hasPriorDeliverable;
   // Lyrics edit is allowed on done/pending_review/rejected per backend
   // validation (main.py:/edit). The panel renders for ANY of those
   // statuses with allowedModes scoped per state:
@@ -1004,6 +1013,15 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         <div className="rounded-card bg-red-500/[0.06] ring-1 ring-red-500/20 px-5 py-5">
           <p className="text-sm font-semibold text-red-300 mb-1">{t("detail.error_title") || "El video falló durante la generación"}</p>
           <p className="text-xs text-red-400/70 mb-4">{job.error || t("detail.error_unknown") || "Error desconocido"}</p>
+
+          {isEditFailureWithPriorVideo && (
+            <div className="rounded-lg bg-emerald-500/[0.07] ring-1 ring-emerald-500/20 px-3 py-2.5 mb-4">
+              <p className="text-xs text-emerald-300/90">
+                {t("detail.edit_failed_prior_safe") ||
+                  "Tu video anterior sigue intacto: el error fue solo al aplicar la edición. Podés reintentar sin volver a subir el audio."}
+              </p>
+            </div>
+          )}
 
           {showRetrySpecSelector && (
             <div className="mb-3">

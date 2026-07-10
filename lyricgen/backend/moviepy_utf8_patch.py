@@ -47,21 +47,49 @@ def _ffmpeg_binary():
         return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def _ascii_metadata_free_copy(src):
-    """Remux `src` to an ASCII-named temp file with all metadata stripped, so
-    ffmpeg's banner for it is pure ASCII.
+# Matroska accepts virtually any codec (PCM, MP3, AAC, FLAC, Opus, H.264…) via
+# `-c copy`, so remuxing into it can't fail on a container/codec mismatch. We do
+# NOT infer the container from `src`'s extension: run_edit_pipeline saves the
+# input as `source_audio.mp3` regardless of the real codec, so a WAV upload lands
+# as PCM-bytes-named-.mp3 — and `-c copy` into an .mp3 container then dies with
+# ffmpeg exit 234 (the UMG Chile edit incident, 2026-07-09). A fixed .mkv target
+# sidesteps that entirely while still stripping metadata to an ASCII-named file.
+_SAFE_COPY_CONTAINER = ".mkv"
 
-    Uses a byte-mode subprocess (stderr discarded, never decoded) so this step
-    cannot itself raise the UnicodeDecodeError we are working around.
+
+def _ascii_metadata_free_copy(src):
+    """Remux `src` to an ASCII-named, metadata-free temp file so ffmpeg's banner
+    for it is pure ASCII.
+
+    Uses a universal Matroska container (so the remux can't fail on a
+    container/codec mismatch when `src`'s extension lies about its real codec)
+    and a byte-mode subprocess (stderr captured as bytes, never strict-decoded)
+    so this step cannot itself raise the UnicodeDecodeError we are working around.
+
+    On an actual ffmpeg failure the temp file is removed and the original
+    CalledProcessError is re-raised — with ffmpeg's stderr attached — so the job
+    surfaces a real "render" error instead of a cryptic bare exit code, and the
+    error taxonomy still classifies it correctly.
     """
-    suffix = os.path.splitext(src)[1] or ".wav"
-    fd, dst = tempfile.mkstemp(suffix=suffix)
+    fd, dst = tempfile.mkstemp(suffix=_SAFE_COPY_CONTAINER)
     os.close(fd)
-    subprocess.run(
-        [_ffmpeg_binary(), "-y", "-i", src,
-         "-map_metadata", "-1", "-c", "copy", dst],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
-    )
+    try:
+        subprocess.run(
+            [_ffmpeg_binary(), "-y", "-i", src,
+             "-map_metadata", "-1", "-c", "copy", dst],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", "replace")[-800:]
+        logger.warning(
+            "[moviepy-patch] metadata-free remux of %r failed (exit %s): %s",
+            src, exc.returncode, stderr,
+        )
+        try:
+            os.remove(dst)
+        except OSError:
+            pass
+        raise
     return dst
 
 

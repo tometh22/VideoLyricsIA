@@ -1257,6 +1257,7 @@ export const translations = {
     // dispara contra un truthy string. Agregadas tras ver el bug en
     // prod cuando un cliente abrió un job en error.
     "detail.error_title": "El video falló durante la generación",
+    "detail.edit_failed_prior_safe": "Tu video anterior sigue intacto: el error fue solo al aplicar la edición. Podés reintentar sin volver a subir el audio.",
     "detail.error_unknown": "Error desconocido",
     "detail.retry": "Reintentar sin re-subir",
     "detail.retry_bypass": "Reintentar (fondo libre)",
@@ -2403,6 +2404,7 @@ export const translations = {
     // See es section comment — keys missing in all langs, app showed
     // raw keys to users for these.
     "detail.error_title": "Video failed during generation",
+    "detail.edit_failed_prior_safe": "Your previous video is still intact — the error happened only while applying the edit. You can retry without re-uploading the audio.",
     "detail.error_unknown": "Unknown error",
     "detail.retry": "Retry without re-uploading",
     "detail.retry_bypass": "Retry (allow people/hands)",
@@ -3509,6 +3511,7 @@ export const translations = {
 
     // Ver comentário na seção es — chaves faltavam em todos os idiomas.
     "detail.error_title": "O vídeo falhou durante a geração",
+    "detail.edit_failed_prior_safe": "Seu vídeo anterior continua intacto — o erro aconteceu só ao aplicar a edição. Você pode tentar de novo sem reenviar o áudio.",
     "detail.error_unknown": "Erro desconhecido",
     "detail.retry": "Tentar novamente sem reenviar",
     "detail.retry_bypass": "Tentar novamente (fundo livre)",
