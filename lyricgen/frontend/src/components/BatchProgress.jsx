@@ -284,7 +284,8 @@ function JobRow({ job, index, t, onSelectJob }) {
 // ─── Approval grid card (shown when all done, REQUIRE_REVIEW=true) ───────────
 function ApprovalCard({ job, t, onSelectJob, onApprove, approving }) {
   const name = (job.filename || "").replace(/\.(mp3|wav)$/i, "");
-  const thumbSrc = useMediaUrl(job.job_id, "thumbnail", "preview");
+  // version: bust the URL when an edit re-renders (same R2 key overwritten).
+  const thumbSrc = useMediaUrl(job.job_id, "thumbnail", "preview", `${job.edit_count || 0}-${job.status || ""}`);
   const isDone = job.status === "done";
   const isPending = job.status === "pending_review";
 

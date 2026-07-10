@@ -80,7 +80,9 @@ function VideoCard({ job, onSelect }) {
   const name = (job.filename || "").replace(/\.mp3$/i, "");
   const songName = name.includes(" - ") ? name.split(" - ").slice(1).join(" - ") : name;
   const artistName = job.artist || (name.includes(" - ") ? name.split(" - ")[0] : "");
-  const thumbSrc = useMediaUrl(job.job_id, "thumbnail", "preview");
+  // version: edits overwrite the same R2 thumbnail key — bust the URL when
+  // the render changes so the card doesn't keep showing the pre-edit image.
+  const thumbSrc = useMediaUrl(job.job_id, "thumbnail", "preview", `${job.edit_count || 0}-${job.status || ""}`);
 
   return (
     <button
