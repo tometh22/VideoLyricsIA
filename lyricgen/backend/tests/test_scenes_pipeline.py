@@ -298,3 +298,93 @@ def test_scene_clips_breaker_open_raises(monkeypatch, tmp_path):
     import pytest
     with pytest.raises(RuntimeError):
         pipeline._generate_scene_clips(plan, str(tmp_path), artist="A", song_title="S")
+
+
+# ─── Recuperación del cache por key persistida (incidente 2026-07-10) ─────────
+#
+# Job 53b9513225b1 "No Hay Santos": el hash del cache incluye namespace
+# (artist|título), prompt, params de Veo (incl. nombre del modelo) y blur_sigma.
+# Cualquier deriva posterior recomputa OTRO hash y missea todos los clips aunque
+# sigan en R2 (las 6 escenas tenían clip_cache_key intacto y el lookup falló
+# 6/6 → fallback al bg dañado → render negro). El fix: en cache_only, buscar
+# PRIMERO por la key persistida al generar (cache_key_override).
+
+def test_veo_cache_only_hits_via_stored_key_when_recomputed_misses(monkeypatch, tmp_path):
+    import storage as _storage
+    stored_key = "cache/veo/stored-original-hash.mp4"
+
+    monkeypatch.setattr(_storage, "is_enabled", lambda: True)
+    # Solo la key PERSISTIDA existe; el hash recomputado (deriva) no.
+    monkeypatch.setattr(_storage, "object_exists", lambda k, *a, **kw: k == stored_key)
+
+    def fake_download(key, path, *a, **kw):
+        assert key == stored_key
+        with open(path, "wb") as f:
+            f.write(b"clip")
+        return True
+    monkeypatch.setattr(_storage, "download_object", fake_download)
+
+    out = str(tmp_path / "clip.mp4")
+    meta = {}
+    res = pipeline._generate_veo_video(
+        "un prompt", out, job_id=None, cache_only=True,
+        cache_key_override=stored_key, out_meta=meta,
+    )
+    assert res == out and os.path.exists(out)
+    # La meta refleja la key que REALMENTE sirvió (para GC y futuras búsquedas).
+    assert meta["cache_object_key"] == stored_key
+
+
+def test_veo_cache_only_miss_reports_both_candidate_keys(monkeypatch):
+    import storage as _storage
+    import pytest
+    monkeypatch.setattr(_storage, "is_enabled", lambda: True)
+    monkeypatch.setattr(_storage, "object_exists", lambda *a, **k: False)
+    with pytest.raises(RuntimeError, match="cache_only") as exc:
+        pipeline._generate_veo_video(
+            "un prompt", "/tmp/nope.mp4", job_id=None, cache_only=True,
+            cache_key_override="cache/veo/stored.mp4",
+        )
+    # El error lista ambos candidatos → diagnósticable desde Sentry/logs.
+    assert "cache/veo/stored.mp4" in str(exc.value)
+
+
+def test_scene_clips_pass_stored_key_only_in_cache_only():
+    """_generate_scene_clips debe pasar scene['clip_cache_key'] como override
+    SOLO para escenas cache_only (un regen pago escribe key nueva)."""
+    import inspect
+    src = inspect.getsource(pipeline._generate_scene_clips)
+    assert 'cache_key_override=scene.get("clip_cache_key") if _cache_only else None' in src
+
+
+def test_restitch_and_scene_regen_recache_timeline():
+    """La reparación debe PERSISTIR: tras un re-stitch exitoso (edit de letra)
+    y tras un 'Otra toma' (edit de escena), el timeline nuevo se re-sube a
+    bg_cached — si no, el próximo edit de tipografía vuelve al cache stale
+    (o al clip único de 8s de un job dañado → render negro)."""
+    import inspect
+    src = inspect.getsource(pipeline.run_edit_pipeline)
+    assert src.count("_recache_scene_timeline(") >= 2
+    helper = inspect.getsource(pipeline._recache_scene_timeline)
+    assert "bg_r2_key_cached" in helper and "upload_file" in helper
+
+
+def test_cached_bg_duration_guard_never_renders_black():
+    """Guard de duración: si el bg cacheado de un job multi-escena dura mucho
+    menos que el audio (job dañado pre-#803), NO se puede tratar como timeline
+    prelooped (8s de imagen + resto negro) — se loopea."""
+    import inspect
+    src = inspect.getsource(pipeline.run_edit_pipeline)
+    assert "> 3.5" in src, "tolerancia = 3s fast-path libass + 0.5s LAST_SCENE_SAFETY"
+    assert "se loopea para evitar render negro" in src
+
+
+def test_restitch_failure_persists_scene_statuses():
+    """Cuando el re-stitch falla, los status/error por escena que dejó el
+    intento deben persistirse — sin esto /status muestra 'generated' stale y
+    el fallback es indiagnosticable desde prod."""
+    import inspect
+    src = inspect.getsource(pipeline.run_edit_pipeline)
+    fail_idx = src.index("re-stitch de escenas falló")
+    persist_idx = src.index("update_job(job_id, scene_plan=scene_plan)", fail_idx)
+    assert persist_idx > fail_idx
