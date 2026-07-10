@@ -8367,6 +8367,11 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
             # que filtraba el filesystem del contenedor al JSON/DB). El stitch usa
             # clip_for_key (abajo), no scene["clip_path"].
             scene["status"] = "generated"
+            # Limpiar el error de un intento anterior: sin esto, una escena que
+            # se RECUPERÓ (p.ej. vía stored-key) mostraba status=generated con
+            # el texto de error viejo al lado — confuso en /status y en el
+            # filmstrip (visto en la recuperación de 53b9513225b1, 2026-07-10).
+            scene.pop("error", None)
             if _meta.get("cache_object_key"):
                 scene["clip_cache_key"] = _meta["cache_object_key"]
             # Póster para el filmstrip (best-effort). Sólo si cambió el clip.
