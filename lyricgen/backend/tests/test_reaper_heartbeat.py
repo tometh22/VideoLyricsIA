@@ -38,6 +38,22 @@ def _reload_observability():
     return obs
 
 
+def _stub_plenty_of_disk(monkeypatch):
+    """health_snapshot()'s degrade is FIRST-WINS and the disk probe runs
+    before the reaper probe. On a GitHub runner with <10 GB free,
+    _degrade("disk_low") fires first and masks the reaper reason these
+    tests assert on (CI flake 2026-07-10, run 29113566227:
+    'disk_low' == 'reaper_never_ticked'). Pin the disk to healthy so the
+    tests only measure the reaper contract, not the runner's disk."""
+    import collections
+    import shutil as _shutil
+    Usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(
+        _shutil, "disk_usage",
+        lambda _p: Usage(500 * 1024**3, 100 * 1024**3, 400 * 1024**3),
+    )
+
+
 # ─── mark_reaper_ok contract ──────────────────────────────────────────
 
 def test_initial_state_is_none():
@@ -71,13 +87,14 @@ def test_mark_reaper_ok_idempotent_keeps_latest():
 
 # ─── health_snapshot integration ──────────────────────────────────────
 
-def test_health_cold_start_no_tick_does_not_degrade():
+def test_health_cold_start_no_tick_does_not_degrade(monkeypatch):
     """During the first 5 min after process start, NO tick is OK — the
     reaper thread sleeps 60s before its first sweep, then takes up to
     a few minutes to land its first OK depending on DB latency. We
     can't degrade /health during this window or we'd false-positive
     every deploy."""
     obs = _reload_observability()
+    _stub_plenty_of_disk(monkeypatch)
     obs._REAPER_LAST_OK_TS = None
     # Process just started → cold start window
     snap = obs.health_snapshot()
@@ -92,10 +109,11 @@ def test_health_cold_start_no_tick_does_not_degrade():
         )
 
 
-def test_health_never_ticked_after_grace_degrades():
+def test_health_never_ticked_after_grace_degrades(monkeypatch):
     """If the cold-start grace expires and the reaper still never
     ticked, the thread is dead/missing. Degrade with a clear reason."""
     obs = _reload_observability()
+    _stub_plenty_of_disk(monkeypatch)
     obs._REAPER_LAST_OK_TS = None
     # Simulate 6 min of process uptime — past the 5 min cold-start grace
     obs._PROCESS_START_TS = time.monotonic() - 360
@@ -105,8 +123,9 @@ def test_health_never_ticked_after_grace_degrades():
     assert snap.get("degraded_reason") == "reaper_never_ticked"
 
 
-def test_health_recent_tick_status_ok():
+def test_health_recent_tick_status_ok(monkeypatch):
     obs = _reload_observability()
+    _stub_plenty_of_disk(monkeypatch)
     obs.mark_reaper_ok()
     snap = obs.health_snapshot()
     reaper = snap.get("reaper")
@@ -115,10 +134,11 @@ def test_health_recent_tick_status_ok():
     assert "reaper" not in (snap.get("degraded_reason") or "")
 
 
-def test_health_stalled_tick_degrades():
+def test_health_stalled_tick_degrades(monkeypatch):
     """If the last tick was > REAPER_STALLED_AFTER_S ago, the reaper
     is silently stuck — degrade."""
     obs = _reload_observability()
+    _stub_plenty_of_disk(monkeypatch)
     # Simulate an old tick: monotonic value from 800 seconds ago
     obs._REAPER_LAST_OK_TS = time.monotonic() - 800
     snap = obs.health_snapshot()
@@ -130,10 +150,11 @@ def test_health_stalled_tick_degrades():
     assert reason.startswith("reaper_stalled_")
 
 
-def test_health_stalled_threshold_configurable():
+def test_health_stalled_threshold_configurable(monkeypatch):
     """Operators can loosen the threshold via env var without
     redeploy — useful in staging where traffic is bursty."""
     obs = _reload_observability()
+    _stub_plenty_of_disk(monkeypatch)
     obs.REAPER_STALLED_AFTER_S = 1200  # 20 min — looser
     # Tick was 800s ago — within new threshold
     obs._REAPER_LAST_OK_TS = time.monotonic() - 800
