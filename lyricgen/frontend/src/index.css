@@ -559,7 +559,7 @@ body .text-gray-600 { color: #777D90; }
 .admin-subnav { position: sticky; top: 82px; display: grid; width: 220px; gap: 4px; padding: 8px; border-radius: 16px; background: rgba(16,18,27,.55); border: 1px solid var(--border-subtle); }
 
 .wizard-command-bar { background: rgba(16,18,27,.9); border-top: 1px solid rgba(139,92,246,.14); box-shadow: 0 -20px 60px rgba(0,0,0,.24); backdrop-filter: blur(18px); }
-.wizard-preview-stage { padding: 10px; border-radius: 18px; background: radial-gradient(circle at 50% 0%, rgba(79,124,255,.08), transparent 38%), rgba(16,18,27,.36); border: 1px solid rgba(255,255,255,.045); }
+.wizard-preview-stage { align-self: start; height: fit-content; padding: 10px; border-radius: 18px; background: radial-gradient(circle at 50% 0%, rgba(79,124,255,.08), transparent 38%), rgba(16,18,27,.36); border: 1px solid rgba(255,255,255,.045); }
 .wizard-controls-panel { scrollbar-width: thin; scrollbar-color: rgba(139,92,246,.35) transparent; }
 .wizard-controls-panel > * { scroll-margin-top: 12px; }
 .editor-primary-cta { bottom: max(24px, env(safe-area-inset-bottom)); }
