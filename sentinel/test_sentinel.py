@@ -174,6 +174,29 @@ def test_run_task_deep_enables_task_tool():
     assert "max_turns=200 if deep" in src
 
 
+def test_readonly_tasks_can_query_github_but_not_mutate():
+    """El /task read-only debe poder LISTAR PRs/issues (gh pr list, etc.) y ver
+    el remoto (git ls-remote), pero NO mutar (sin gh pr create/merge/comment,
+    git push, ni gh api que puede POSTear)."""
+    import inspect, agent
+    src = inspect.getsource(agent.run_task)
+    for read in ("gh pr list:*", "git ls-remote:*", "gh pr checks:*",
+                 "gh issue list:*", "gh run view:*"):
+        assert read in src, f"falta comando de lectura {read}"
+    # NO debe HABILITAR (Bash(...)) ninguna mutación (los nombres pueden
+    # aparecer en comentarios; lo que cuenta es que no estén como tool).
+    for mutate in ("Bash(gh pr create", "Bash(gh pr merge", "Bash(gh pr comment",
+                   "Bash(git push", "Bash(gh api"):
+        assert mutate not in src, f"NO debe habilitar mutación: {mutate}"
+
+
+def test_investigate_can_query_github():
+    import inspect, agent
+    src = inspect.getsource(agent.investigate)
+    assert "gh pr list:*" in src and "gh issue list:*" in src
+    # investigación es read-only: sin herramientas de escritura
+    assert "Bash(gh pr create" not in src and "Bash(git push" not in src
+
 def test_railway_logs_supports_bearer_api_token(monkeypatch):
     import importlib, railway_logs
     monkeypatch.setenv("RAILWAY_PROJECT_TOKEN", "")

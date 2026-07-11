@@ -138,7 +138,15 @@ async def investigate(incident: dict, alert_context: str) -> dict:
             return _claude(
                 prompts.investigate_prompt(alert_context, config.PR_BASE_BRANCH),
                 cwd=wt,
-                allowed_tools="Read,Grep,Glob,Bash(git log:*),Bash(git show:*),Bash(git grep:*)",
+                allowed_tools=(
+                    "Read,Grep,Glob,Bash(git log:*),Bash(git show:*),Bash(git grep:*),"
+                    "Bash(git diff:*),Bash(git branch:*),Bash(git ls-remote:*),"
+                    # consulta read-only de GitHub: PRs/issues/runs relacionados
+                    # al incidente (¿ya hay un fix abierto? ¿regresión de un PR?).
+                    "Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr diff:*),"
+                    "Bash(gh issue list:*),Bash(gh issue view:*),"
+                    "Bash(gh run list:*),Bash(gh run view:*),Bash(gh search:*)"
+                ),
             )
         finally:
             _cleanup_worktree(wt)
@@ -221,10 +229,22 @@ async def run_task(instruction: str, resume_session: str | None = None,
     ni pushea: para eso está el flujo de incidentes con aprobación."""
     def _sync():
         ws = _ensure_taskspace()
+        # Allowlist SOLO-LECTURA: git local + remoto (ls-remote/fetch/branch) y
+        # el set de consulta de GitHub (pr/issue/run list+view, checks, status,
+        # search). NO se incluyen escrituras (gh pr create/merge/comment, git
+        # push) ni `gh api` (puede mutar con -X POST) — para mutar está el flujo
+        # de incidentes con aprobación humana. `gh pr list --json baseRefName`
+        # cubre "qué PRs hay abiertos y contra qué rama".
         tools = (
             "Read,Grep,Glob,"
             "Bash(git log:*),Bash(git show:*),Bash(git grep:*),Bash(git diff:*),"
-            "Bash(ls:*),Bash(cat:*),Bash(python3 -c:*),Bash(gh pr view:*),Bash(gh pr diff:*)"
+            "Bash(git branch:*),Bash(git ls-remote:*),Bash(git fetch:*),Bash(git rev-parse:*),"
+            "Bash(ls:*),Bash(cat:*),Bash(python3 -c:*),"
+            "Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr list:*),"
+            "Bash(gh pr checks:*),Bash(gh pr status:*),"
+            "Bash(gh issue list:*),Bash(gh issue view:*),"
+            "Bash(gh run list:*),Bash(gh run view:*),"
+            "Bash(gh search:*),Bash(gh repo view:*),Bash(gh label list:*)"
         )
         if deep:
             # Task = spawner de subagentes del Claude Code CLI. Con esto el
