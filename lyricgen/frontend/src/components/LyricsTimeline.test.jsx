@@ -49,6 +49,16 @@ it("Reset button calls onReset", () => {
   expect(props.onReset).toHaveBeenCalledTimes(1);
 });
 
+it("offers fit/detail presets and an accessible song minimap", () => {
+  setup();
+  expect(screen.getByText("32 px/s")).toBeInTheDocument();
+  fireEvent.click(screen.getByText("Ajustar"));
+  expect(screen.getByText("8 px/s")).toBeInTheDocument();
+  fireEvent.click(screen.getByText("Detalle"));
+  expect(screen.getByText("32 px/s")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /Mini-mapa de la canción/i })).toBeInTheDocument();
+});
+
 it("a click (no movement) focuses + seeks to the clicked point, no edit", () => {
   const props = setup();
   const block = screen.getByText("segunda línea").closest("div[title]");

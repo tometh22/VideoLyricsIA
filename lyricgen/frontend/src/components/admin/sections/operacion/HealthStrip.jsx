@@ -26,7 +26,11 @@ export default function HealthStrip({ health, issueCount = 0, stuckCount = 0 }) 
   }
 
   const serviceDown = health.status !== "ok" || health.db !== "up" || health.redis !== "up" || (health.workers_alive || 0) < 1;
-  const status = serviceDown ? "incident" : (issueCount > 0 || stuckCount > 0) ? "degraded" : "operational";
+  // Historical job errors are a business/result KPI, not infrastructure
+  // health. Only live service failures or currently stuck jobs may degrade
+  // this strip; otherwise one failed render would leave the system yellow
+  // for the entire month despite healthy DB/Redis/workers.
+  const status = serviceDown ? "incident" : stuckCount > 0 ? "degraded" : "operational";
   const statusLabel = status === "operational" ? "Operativo" : status === "degraded" ? "Degradado" : "Incidente";
   const dotColor = status === "operational" ? "bg-accent" : status === "degraded" ? "bg-amber-400" : "bg-red-400";
   const textColor = status === "operational" ? "text-accent" : status === "degraded" ? "text-amber-400" : "text-red-400";
@@ -45,7 +49,8 @@ export default function HealthStrip({ health, issueCount = 0, stuckCount = 0 }) 
           {health.degraded_reason && (
             <span className="text-caption text-amber-300">· {health.degraded_reason}</span>
           )}
-          {!health.degraded_reason && status === "degraded" && <span className="text-caption text-amber-300">· {issueCount} errores del período{stuckCount > 0 ? ` · ${stuckCount} atascados` : ""}</span>}
+          {!health.degraded_reason && status === "degraded" && <span className="text-caption text-amber-300">· {stuckCount} jobs atascados ahora</span>}
+          {status === "operational" && issueCount > 0 && <span className="text-caption text-gray-500">· {issueCount} errores del mes en Resultados</span>}
         </div>
         <span className="text-section text-gray-500">actualiza cada 15 s</span>
       </div>

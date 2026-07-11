@@ -198,7 +198,7 @@ export default function TranscribingProgress({
       </div>
 
       <div className="ai-run-grid">
-      <section className="ai-run-card" aria-label="Progreso de transcripción">
+      <section className="ai-run-card" aria-label={t("transcribe.progress_label")}>
 
       {/* Top progress bar. The shimmer overlay (active < 5) sits on top
           of the filled portion and travels left-to-right continuously,
@@ -297,20 +297,20 @@ export default function TranscribingProgress({
       )}
       </section>
 
-      <aside className="ai-run-intelligence" aria-label="Actividad del motor de inteligencia artificial">
+      <aside className="ai-run-intelligence" aria-label={t("transcribe.activity")}>
         <div className="ai-run-orbit" aria-hidden="true">
           <span className="ai-run-orbit__core" />
           <span className="ai-run-orbit__ring is-one" />
           <span className="ai-run-orbit__ring is-two" />
         </div>
-        <p className="ai-run-intelligence__label">Actividad actual</p>
+        <p className="ai-run-intelligence__label">{t("transcribe.activity")}</p>
         <strong>{(t && t(STAGES.find((stage) => stage.i === active)?.key)) || STAGES.find((stage) => stage.i === active)?.fallback || "Finalizando"}</strong>
         <div className="ai-run-metrics">
-          <div><span>Progreso</span><b>{pct}%</b></div>
-          <div><span>Tiempo estimado</span><b>{active < 5 ? `~${displayEta}s` : "—"}</b></div>
-          <div><span>Cola</span><b>{queueIndex}/{queueTotal}</b></div>
+          <div><span>{t("transcribe.progress_label")}</span><b>{pct}%</b></div>
+          <div><span>{t("transcribe.estimated_time")}</span><b>{active < 5 ? `~${displayEta}s` : "—"}</b></div>
+          <div><span>{t("transcribe.queue_label")}</span><b>{queueIndex}/{queueTotal}</b></div>
         </div>
-        <p className="ai-run-intelligence__note">El motor detecta voz, silencios y timing para construir la primera versión de las lyrics.</p>
+        <p className="ai-run-intelligence__note">{t("transcribe.engine_note")}</p>
       </aside>
       </div>
     </div>
