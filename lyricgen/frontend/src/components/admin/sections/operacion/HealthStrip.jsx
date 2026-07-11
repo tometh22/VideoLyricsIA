@@ -16,7 +16,7 @@ function Pill({ ok, label, value }) {
   );
 }
 
-export default function HealthStrip({ health }) {
+export default function HealthStrip({ health, issueCount = 0, stuckCount = 0 }) {
   if (!health) {
     return (
       <div className="glass rounded-card px-5 py-4 text-caption text-gray-500">
@@ -25,9 +25,11 @@ export default function HealthStrip({ health }) {
     );
   }
 
-  const status = health.status || "error";
-  const dotColor = status === "ok" ? "bg-accent" : status === "degraded" ? "bg-amber-400" : "bg-red-400";
-  const textColor = status === "ok" ? "text-accent" : status === "degraded" ? "text-amber-400" : "text-red-400";
+  const serviceDown = health.status !== "ok" || health.db !== "up" || health.redis !== "up" || (health.workers_alive || 0) < 1;
+  const status = serviceDown ? "incident" : (issueCount > 0 || stuckCount > 0) ? "degraded" : "operational";
+  const statusLabel = status === "operational" ? "Operativo" : status === "degraded" ? "Degradado" : "Incidente";
+  const dotColor = status === "operational" ? "bg-accent" : status === "degraded" ? "bg-amber-400" : "bg-red-400";
+  const textColor = status === "operational" ? "text-accent" : status === "degraded" ? "text-amber-400" : "text-red-400";
 
   const queue = health.queue_depth || {};
   const totalQueue = (queue.enterprise ?? 0) + (queue.default ?? 0);
@@ -38,18 +40,19 @@ export default function HealthStrip({ health }) {
         <div className="flex items-center gap-2">
           <span className={`w-2.5 h-2.5 rounded-full ${dotColor}`} />
           <span className={`text-section uppercase font-bold tracking-wider ${textColor}`}>
-            Sistema {status}
+            Sistema {statusLabel}
           </span>
           {health.degraded_reason && (
             <span className="text-caption text-amber-300">· {health.degraded_reason}</span>
           )}
+          {!health.degraded_reason && status === "degraded" && <span className="text-caption text-amber-300">· {issueCount} errores del período{stuckCount > 0 ? ` · ${stuckCount} atascados` : ""}</span>}
         </div>
         <span className="text-section text-gray-500">actualiza cada 15 s</span>
       </div>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-2">
         <Pill ok={health.db === "up"} label="DB" value={health.db || "?"} />
         <Pill ok={health.redis === "up"} label="Redis" value={health.redis || "?"} />
-        <Pill ok={health.r2 === "configured"} label="R2" value={health.r2 || "?"} />
+        <Pill ok={["configured", "ready", "up"].includes(health.r2)} label="R2" value={health.r2 || "?"} />
         <Pill ok={(health.workers_alive || 0) > 0} label="Workers" value={health.workers_alive ?? "?"} />
         <Pill
           ok={totalQueue < 50}

@@ -49,7 +49,7 @@ export default function NovedadHero() {
           ×
         </button>
 
-        <div className="grid min-h-[150px] gap-3 p-4 pr-11 md:grid-cols-[minmax(0,1fr)_300px] md:items-center md:gap-5 md:p-5 md:pr-12 xl:grid-cols-[minmax(0,1fr)_336px]">
+        <div className="grid min-h-[112px] gap-3 p-4 pr-11 md:grid-cols-[minmax(0,1fr)_220px] md:items-center md:gap-4 md:pr-12">
           <div className="min-w-0">
             <div className="mb-2.5 flex flex-wrap items-center gap-2">
               <span className="rounded-full bg-white/[0.045] px-2.5 py-1 text-[10px] font-semibold uppercase text-gray-400 ring-1 ring-white/[0.06]">
@@ -73,7 +73,7 @@ export default function NovedadHero() {
               </p>
             )}
 
-            <div className="mt-3 flex flex-wrap items-center gap-2.5">
+            <div className="mt-2 hidden flex-wrap items-center gap-2.5 xl:flex">
               {Array.isArray(featured.highlightKeys) && featured.highlightKeys.slice(0, 2).map((key) => (
                 <span
                   key={key}
@@ -116,7 +116,7 @@ export default function NovedadHero() {
             </div>
           </div>
 
-          <div className="hidden min-w-0 md:block">
+          <div className="hidden min-w-0 lg:block">
             <ReleaseVisual entry={featured} compact />
           </div>
         </div>

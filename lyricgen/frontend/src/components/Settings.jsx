@@ -209,6 +209,7 @@ function AlertBanner({ variant, children }) {
 export default function Settings({ onBack }) {
   const { t, lang, setLang } = useI18n();
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [savedSettings, setSavedSettings] = useState(DEFAULT_SETTINGS);
   const [saved, setSaved] = useState(false);
   const [loading, setLoading] = useState(true);
   const [user, setUser] = useState(getUser);
@@ -283,7 +284,13 @@ export default function Settings({ onBack }) {
   useEffect(() => {
     fetch(`${API}/settings`, { headers: authHeaders() })
       .then((r) => r.json())
-      .then((data) => { if (data && Object.keys(data).length) setSettings({ ...DEFAULT_SETTINGS, ...data }); })
+      .then((data) => {
+        if (data && Object.keys(data).length) {
+          const next = { ...DEFAULT_SETTINGS, ...data };
+          setSettings(next);
+          setSavedSettings(next);
+        }
+      })
       .catch(() => {})
       .finally(() => setLoading(false));
 
@@ -432,6 +439,7 @@ export default function Settings({ onBack }) {
         throw new Error(data.detail || `Error ${res.status}`);
       }
       setSaved(true);
+      setSavedSettings(settings);
       setTimeout(() => setSaved(false), 3000);
     } catch (err) {
       setSaveError(err.message || String(err));
@@ -860,6 +868,8 @@ export default function Settings({ onBack }) {
 
   const currentPlan = user?.plan || "free";
   const planInfo = PLAN_INFO[currentPlan] || PLAN_INFO.free;
+  const settingsDirty = JSON.stringify(settings) !== JSON.stringify(savedSettings);
+  const profileDirty = fullName.trim() !== (user?.full_name || "").trim();
 
   if (loading) return (
     <div className="w-full max-w-2xl animate-fade-in space-y-4">
@@ -873,7 +883,7 @@ export default function Settings({ onBack }) {
   );
 
   return (
-    <div className="w-full max-w-3xl mx-auto animate-fade-in">
+    <div className="w-full max-w-[1180px] mx-auto animate-fade-in">
       {/* ─── Header ───────────────────────────────────────────────── */}
       <div className="flex items-end gap-3 mb-8">
         <button onClick={onBack}
@@ -889,7 +899,8 @@ export default function Settings({ onBack }) {
       </div>
 
       {/* ─── Tabs ─────────────────────────────────────────────────── */}
-      <div className="flex flex-wrap gap-2 mb-6">
+      <div className="settings-layout">
+      <nav className="settings-nav" aria-label="Secciones de configuración">
         {[
           { id: "perfil",         label: "Perfil" },
           { id: "cuenta",         label: t("settings.account") || "Cuenta" },
@@ -908,9 +919,9 @@ export default function Settings({ onBack }) {
             {s.label}
           </TabPill>
         ))}
-      </div>
+      </nav>
 
-      <div className="space-y-4">
+      <div className="settings-content space-y-4">
 
         {/* ════════════════════ PERFIL ════════════════════ */}
         {activeSection === "perfil" && (
@@ -958,7 +969,7 @@ export default function Settings({ onBack }) {
                 {nameSaved && <InlineSuccess message="Nombre actualizado" />}
                 <button
                   onClick={handleSaveName}
-                  disabled={savingName}
+                  disabled={savingName || !profileDirty}
                   className="btn-primary px-5 disabled:opacity-40 disabled:cursor-not-allowed">
                   {savingName ? "…" : "Guardar"}
                 </button>
@@ -1764,12 +1775,14 @@ export default function Settings({ onBack }) {
                 {saveError || billingError}
               </div>
             )}
-            <div className="flex items-center justify-end gap-3 pt-2">
+            {settingsDirty && <div className="settings-save-bar">
               {saved && <InlineSuccess message={t("settings.saved")} />}
-              <button onClick={handleSave} className="btn-primary px-6">
+              <span className="settings-save-bar__copy">Tenés cambios sin guardar</span>
+              <button onClick={() => setSettings(savedSettings)} className="btn-secondary !h-10 px-4">Cancelar</button>
+              <button onClick={handleSave} disabled={!settingsDirty} className="btn-primary !h-10 px-5 disabled:opacity-40">
                 {t("settings.save")}
               </button>
-            </div>
+            </div>}
           </>
         )}
 
@@ -1886,6 +1899,7 @@ export default function Settings({ onBack }) {
           </Card>
         )}
 
+      </div>
       </div>
     </div>
   );
