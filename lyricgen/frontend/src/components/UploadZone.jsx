@@ -2338,7 +2338,7 @@ export default function UploadZone({
     // page-scroll. pb-28 (clear del CTA flotante "Aprobar y generar") se
     // mantiene solo en mobile — en desktop el CTA es fixed bottom-0 con
     // su propio espacio. Mobile (<lg) no se toca: pb-28 + page-scroll.
-    <div className="w-full px-2 md:px-6 pb-28 lg:pb-0 lg:h-full lg:overflow-hidden lg:flex lg:flex-col">
+    <div className="wizard-workspace w-full px-2 md:px-6 pb-28 lg:pb-0 lg:h-full lg:overflow-hidden lg:flex lg:flex-col">
       <UploadTour user={user} />
       {/* Pre-upload short-circuit: drop zone-only layout aplica solo cuando
           NO hay contenido reviewable Y NO estamos en edit-mode. Sin estas
@@ -2398,7 +2398,7 @@ export default function UploadZone({
         // lg:min-h-0 deja la grid ocupar el espacio que el flex-col
         // exterior le da. lg:overflow-hidden previene que la grid haga
         // overflow al body — el scroll vive en la columna RIGHT.
-        <div className={`flex flex-col lg:grid ${gridCols} [.editor-focus-mode_&]:lg:grid-cols-1 gap-6 items-start lg:items-stretch lg:h-full lg:min-h-0 lg:overflow-hidden lg:flex-1`}>
+        <div className={`wizard-workspace-grid flex flex-col lg:grid ${gridCols} [.editor-focus-mode_&]:lg:grid-cols-1 gap-6 items-start lg:items-stretch lg:h-full lg:min-h-0 lg:overflow-hidden lg:flex-1`}>
 
         {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile).
             Paso 6 "Lyrics" se ve siempre; está deshabilitado hasta que
@@ -2411,7 +2411,7 @@ export default function UploadZone({
             step 6 para ganar espacio. Operador reportó que no se entendía
             qué era cada paso. Volvemos a mostrar labels SIEMPRE — el
             grid arriba se ajustó a 168 px de sidebar para acomodarlas. */}
-        <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first [.editor-focus-mode_&]:hidden">
+        <nav className="wizard-step-rail flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first [.editor-focus-mode_&]:hidden">
           {WIZARD_STEPS.map((s) => {
             const isLyrics = s.id === 6;
             const lyricsDisabled = isLyrics && !hasReviewableContent;
@@ -2458,7 +2458,7 @@ export default function UploadZone({
             editando), y el max-width del contenedor se ajusta al
             grid column (260-320 px). Mantiene sticky para acompañar
             el scroll del timeline en el panel derecho. */}
-        <div className="lg:sticky lg:top-4 space-y-2 min-w-0 w-full [.editor-focus-mode_&]:hidden">
+        <div className="wizard-preview-stage lg:sticky lg:top-4 space-y-2 min-w-0 w-full [.editor-focus-mode_&]:hidden">
           {/* UI v1.1 (2026-05-30): toggle pill — "Letra / Portada". The
               central preview shows whichever face is selected; the bottom
               fan-out of states (Lyrics editor, batch progress, ready, etc.)
@@ -2628,7 +2628,7 @@ export default function UploadZone({
             Multi-escena, el modo más alto) quedaba TAPADO detrás del footer y no
             se podía scrollear por encima ("trabado", QA 2026-07-01). El padding
             reserva el espacio del CTA fijo. En mobile el outer ya tiene pb-28. */}
-        <div className="space-y-4 min-w-0 w-full px-1.5 py-0.5 lg:h-full lg:min-h-0 lg:overflow-y-auto lg:pb-24">
+        <div className="wizard-controls-panel space-y-4 min-w-0 w-full px-1.5 py-0.5 lg:h-full lg:min-h-0 lg:overflow-y-auto lg:pb-24">
           {files.length > 1 && (
             <div className="flex items-center gap-1.5 px-1">
               <span className="inline-flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-[0.16em]">
@@ -3487,7 +3487,7 @@ export default function UploadZone({
           file count) lo cual es informativo aunque mínimo en edit mode. */}
       {(files.length > 0 || editMode) && wizardStep !== 6 && (
         <div
-          className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-60" : "md:left-0"}`}
+          className={`wizard-command-bar fixed bottom-0 left-0 right-0 z-30 px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-60" : "md:left-[72px]"}`}
           data-tour="upload-cta-bar"
         >
           <div className="w-full flex flex-wrap items-center gap-3">

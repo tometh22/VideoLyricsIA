@@ -155,6 +155,9 @@ export default function SearchPalette({ isOpen, onClose, jobs, onSelectJob }) {
       <div
         className="w-full max-w-2xl rounded-2xl bg-surface-2 ring-1 ring-white/10 shadow-2xl overflow-hidden"
         onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Buscar videos y acciones"
       >
         {/* Input */}
         <div className="flex items-center gap-3 px-5 py-4 border-b border-white/[0.06]">

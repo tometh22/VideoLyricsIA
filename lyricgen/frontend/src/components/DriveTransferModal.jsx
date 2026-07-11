@@ -128,8 +128,11 @@ export default function DriveTransferModal({ jobId, fileType, onClose }) {
       <div
         className="w-full max-w-md mx-4 bg-surface-1 ring-1 ring-white/[0.08] rounded-2xl p-6 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="drive-transfer-title"
       >
-        <h3 className="text-lg font-semibold text-white mb-1">
+        <h3 id="drive-transfer-title" className="text-lg font-semibold text-white mb-1">
           {t("drive.transfer_title")}
         </h3>
         <p className="text-xs text-gray-400 mb-5">
