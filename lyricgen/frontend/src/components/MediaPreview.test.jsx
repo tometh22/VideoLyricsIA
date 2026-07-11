@@ -26,4 +26,9 @@ describe("MediaPreview", () => {
     view.rerender(<MediaPreview src="/second.jpg" alt="Preview" />);
     expect(screen.getByRole("img", { name: "Preview" }).getAttribute("src")).toBe("/second.jpg");
   });
+
+  it("supports contain without being overridden by shared cover CSS", () => {
+    render(<MediaPreview src="/thumbnail.jpg" alt="Thumbnail" imageFit="contain" />);
+    expect(screen.getByRole("img", { name: "Thumbnail" }).style.objectFit).toBe("contain");
+  });
 });

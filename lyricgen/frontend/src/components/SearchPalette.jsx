@@ -13,7 +13,7 @@
  * naive es <50 ms; >5k pasar a fuse.js (15 min de migración cuando ese
  * momento llegue).
  */
-import { useEffect, useRef, useState, useMemo } from "react";
+import { useCallback, useEffect, useRef, useState, useMemo } from "react";
 
 function timeAgo(ts) {
   if (!ts) return "";
@@ -60,6 +60,12 @@ export default function SearchPalette({ isOpen, onClose, jobs, onSelectJob }) {
   const [activeIdx, setActiveIdx] = useState(0);
   const inputRef = useRef(null);
   const listRef = useRef(null);
+
+  const selectJob = useCallback((job) => {
+    if (!job?.job_id) return;
+    const accepted = onSelectJob(job.job_id, job.status);
+    if (accepted !== false) onClose();
+  }, [onClose, onSelectJob]);
 
   // Reset al abrir/cerrar — no preservamos query entre opens (siempre
   // se entra al palette "fresh" como en Linear)
@@ -128,15 +134,14 @@ export default function SearchPalette({ isOpen, onClose, jobs, onSelectJob }) {
         e.preventDefault();
         const sel = results[activeIdx];
         if (sel && sel.job_id) {
-          onClose();
-          onSelectJob(sel.job_id);
+          selectJob(sel);
         }
         return;
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [isOpen, results, activeIdx, onClose, onSelectJob]);
+  }, [isOpen, results, activeIdx, onClose, selectJob]);
 
   // Auto-scroll del item activo cuando navega con teclado
   useEffect(() => {
@@ -207,7 +212,7 @@ export default function SearchPalette({ isOpen, onClose, jobs, onSelectJob }) {
                   <button
                     key={job.job_id}
                     data-result-idx={i}
-                    onClick={() => { onClose(); onSelectJob(job.job_id); }}
+                    onClick={() => selectJob(job)}
                     onMouseEnter={() => setActiveIdx(i)}
                     className={`w-full flex items-center gap-3 px-5 py-2.5 text-left transition-colors
                       ${isActive ? "bg-white/[0.06]" : "hover:bg-white/[0.03]"}`}

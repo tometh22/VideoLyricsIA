@@ -1738,7 +1738,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4"
           >
             {activeTab === "thumbnail" ? (
-              <MediaPreview src={previewSrc} status={job.status} alt="Thumbnail" className="w-full h-[min(500px,55vh)]" imageClassName="object-contain bg-black/40" />
+              <MediaPreview src={previewSrc} status={job.status} alt="Thumbnail" className="w-full h-[min(500px,55vh)]" imageClassName="bg-black/40" imageFit="contain" />
             ) : (
               previewSrc ? (
                 <video

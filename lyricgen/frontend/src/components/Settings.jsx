@@ -69,6 +69,7 @@ function TabPill({ active, onClick, children }) {
   return (
     <button
       onClick={onClick}
+      aria-current={active ? "page" : undefined}
       className={`h-9 px-4 rounded-full text-xs font-medium transition-all ${
         active
           ? "bg-brand/15 text-brand-light ring-1 ring-brand/40"
@@ -114,11 +115,12 @@ function UsageBar({ percent, alert80, alert100 }) {
   );
 }
 
-function Toggle({ value, onChange }) {
+function Toggle({ value, onChange, label }) {
   return (
     <button
       role="switch"
       aria-checked={value}
+      aria-label={label}
       onClick={() => onChange(!value)}
       className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
         value ? "bg-brand" : "bg-surface-3/60 ring-1 ring-white/[0.08]"
@@ -641,6 +643,9 @@ export default function Settings({ onBack }) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.detail || `Error ${res.status}`);
       }
+      setSavedSettings(next);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 3000);
     } catch (err) {
       // Revertir optimistic update: si el server rechazó, el toggle
       // local no debería quedarse mostrando el nuevo estado.
@@ -886,7 +891,7 @@ export default function Settings({ onBack }) {
     <div className="w-full max-w-[1180px] mx-auto animate-fade-in">
       {/* ─── Header ───────────────────────────────────────────────── */}
       <div className="flex items-end gap-3 mb-8">
-        <button onClick={onBack}
+        <button onClick={onBack} aria-label="Volver"
           className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors">
           <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M19 12H5M12 19l-7-7 7-7" />
@@ -898,11 +903,15 @@ export default function Settings({ onBack }) {
         </div>
       </div>
 
+      <div className="min-h-5 mb-3" role="status" aria-live="polite">
+        {saved && <InlineSuccess message={t("settings.saved") || "Cambios guardados"} />}
+      </div>
+
       {/* ─── Tabs ─────────────────────────────────────────────────── */}
       <div className="settings-layout">
       <nav className="settings-nav" aria-label="Secciones de configuración">
         {[
-          { id: "perfil",         label: "Perfil", icon: "◉" },
+          { id: "perfil",         label: t("settings.profile_tab"), icon: "◉" },
           { id: "cuenta",         label: t("settings.account") || "Cuenta", icon: "◇" },
           { id: "facturacion",    label: t("settings.billing") || "Facturación", icon: "↗" },
           // Integraciones por ahora sólo contiene Drive — escondemos
@@ -911,9 +920,9 @@ export default function Settings({ onBack }) {
             ? { id: "integraciones", label: t("settings.integrations_tab") || "Integraciones", icon: "⌁" }
             : null,
           { id: "youtube",        label: "YouTube", icon: "▶" },
-          { id: "dispositivos",   label: "Dispositivos", icon: "▣" },
+          { id: "dispositivos",   label: t("settings.devices_tab"), icon: "▣" },
           // "Mi equipo" sólo si el workspace tiene >1 miembro.
-          showTeamTab ? { id: "equipo", label: "Mi equipo", icon: "◎" } : null,
+          showTeamTab ? { id: "equipo", label: t("settings.team_tab"), icon: "◎" } : null,
         ].filter(Boolean).map((s) => (
           <TabPill key={s.id} active={activeSection === s.id} onClick={() => setActiveSection(s.id)}>
             <span className="settings-nav__icon" aria-hidden="true">{s.icon}</span>{s.label}
@@ -1019,7 +1028,7 @@ export default function Settings({ onBack }) {
                       <p className="text-sm text-white">{label}</p>
                       <p className="text-xs text-ink-secondary mt-0.5">{sub}</p>
                     </div>
-                    <Toggle value={!!settings[key]} onChange={() => toggleNotif(key)} />
+                    <Toggle value={!!settings[key]} onChange={() => toggleNotif(key)} label={label} />
                   </div>
                 ))}
               </div>
@@ -1776,9 +1785,8 @@ export default function Settings({ onBack }) {
               </div>
             )}
             {settingsDirty && <div className="settings-save-bar">
-              {saved && <InlineSuccess message={t("settings.saved")} />}
-              <span className="settings-save-bar__copy">Tenés cambios sin guardar</span>
-              <button onClick={() => setSettings(savedSettings)} className="btn-secondary !h-10 px-4">Cancelar</button>
+              <span className="settings-save-bar__copy">{t("settings.unsaved")}</span>
+              <button onClick={() => setSettings(savedSettings)} className="btn-secondary !h-10 px-4">{t("settings.cancel")}</button>
               <button onClick={handleSave} disabled={!settingsDirty} className="btn-primary !h-10 px-5 disabled:opacity-40">
                 {t("settings.save")}
               </button>

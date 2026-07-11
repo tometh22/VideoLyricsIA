@@ -419,7 +419,7 @@ function UpgradeNudge({ user }) {
   );
 }
 
-function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpenSearch }) {
+function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpenSearch, onStartNewBatch }) {
   const { t } = useI18n();
   const navigate = useNavigate();
   const { pathname } = useLocation();
@@ -429,6 +429,36 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
     pathname === "/account" ? "settings" :
     pathname === "/admin" ? "admin" :
     "dashboard";
+
+  useEffect(() => {
+    const mobile = window.matchMedia("(max-width: 767px)");
+    const closeOnMobileEntry = (event) => { if (event.matches) setSidebarOpen(false); };
+    mobile.addEventListener?.("change", closeOnMobileEntry);
+    return () => mobile.removeEventListener?.("change", closeOnMobileEntry);
+  }, [setSidebarOpen]);
+
+  useEffect(() => {
+    if (!sidebarOpen || !window.matchMedia("(max-width: 767px)").matches) return undefined;
+    const sidebar = document.querySelector(".app-sidebar");
+    const focusable = () => [...(sidebar?.querySelectorAll('a[href], button:not([disabled])') || [])];
+    requestAnimationFrame(() => focusable()[0]?.focus());
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setSidebarOpen(false);
+        requestAnimationFrame(() => document.querySelector('.global-topbar__icon')?.focus());
+      } else if (event.key === "Tab") {
+        const items = focusable();
+        if (!items.length) return;
+        const first = items[0];
+        const last = items[items.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [sidebarOpen, setSidebarOpen]);
 
   const handleNav = (id) => {
     // If the operator is in the middle of a wizard batch (uploaded /
@@ -470,8 +500,9 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
 
       {sidebarOpen && (
         <div
-          className="fixed inset-0 bg-black/50 z-10 md:hidden"
+          className="fixed inset-0 bg-black/60 z-[35] md:hidden"
           onClick={() => setSidebarOpen(false)}
+          aria-hidden="true"
         />
       )}
 
@@ -480,7 +511,8 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
           user={user}
           activeRenders={(history || []).filter((job) => ["processing", "queued", "editing", "transcribing", "transcribing_queued"].includes(job.status)).length}
           onSearch={onOpenSearch}
-          onCreate={() => handleNav("new")}
+          onCreate={onStartNewBatch}
+          onNavigate={handleNav}
           onLogout={onLogout}
           onToggleNavigation={() => setSidebarOpen(!sidebarOpen)}
           navigationOpen={sidebarOpen}
@@ -3314,6 +3346,43 @@ export default function App() {
     navigate(`/videos/${jobId}`);
   };
 
+  const handleSearchSelectJob = (jobId, status) => {
+    const onWizardRoute = ["/new", "/review", "/generating"].includes(location.pathname);
+    if (onWizardRoute && wizardPersistence.hasResumableContent(wizardPersistence.load())) {
+      const msg =
+        t("wizard.confirm_leave") ||
+        "Tenés un batch en progreso. Si te vas, podés retomarlo al volver desde el banner amarillo, pero perdés el contexto actual. ¿Continuar?";
+      if (!window.confirm(msg)) return false;
+    }
+    handleSelectJob(jobId, status);
+    return true;
+  };
+
+  const handleStartNewBatch = () => {
+    const hasState =
+      files.length > 0 ||
+      approvedJobs.length > 0 ||
+      currentReview !== null ||
+      reviewQueue.length > 0;
+    if (hasState) {
+      const msg =
+        t("wizard.confirm_discard_batch") ||
+        "Vas a empezar un batch nuevo y perdés el progreso actual (lyrics corregidas, canciones aprobadas). ¿Seguro?";
+      if (!window.confirm(msg)) return;
+    }
+    setFiles([]);
+    setApprovedJobs([]);
+    setCurrentReview(null);
+    setReviewQueue([]);
+    setBackgroundFile(null);
+    setBackgroundId(null);
+    setBgSelectMode("auto");
+    setAnimateImage(false);
+    setEnableScenes(false);
+    wizardPersistence.clear();
+    navigate("/new");
+  };
+
   const handleBulkApproveBatch = async (jobIds) => {
     if (!Array.isArray(jobIds) || jobIds.length === 0) return;
     for (const jobId of jobIds) {
@@ -4080,6 +4149,7 @@ export default function App() {
                 setSidebarOpen={setSidebarOpen}
                 onLogout={handleLogout}
                 onOpenSearch={() => setSearchOpen(true)}
+                onStartNewBatch={handleStartNewBatch}
               />
             </RequireAuth>
           }
@@ -4092,35 +4162,7 @@ export default function App() {
               historyLoaded={historyLoaded}
               onRetryHistory={fetchHistory}
               onSelectJob={handleSelectJob}
-              onNewBatch={() => {
-                // Guard the "Nuevo batch" CTA — clicking it while a
-                // batch is in progress used to silently wipe everything
-                // (setFiles([]) + navigate). Confirm first, then clear
-                // both in-memory state AND the persisted snapshot so
-                // the resume banner doesn't immediately reappear.
-                const hasState =
-                  files.length > 0 ||
-                  approvedJobs.length > 0 ||
-                  currentReview !== null ||
-                  reviewQueue.length > 0;
-                if (hasState) {
-                  const msg =
-                    t("wizard.confirm_discard_batch") ||
-                    "Vas a empezar un batch nuevo y perdés el progreso actual (lyrics corregidas, canciones aprobadas). ¿Seguro?";
-                  if (!window.confirm(msg)) return;
-                }
-                setFiles([]);
-                setApprovedJobs([]);
-                setCurrentReview(null);
-                setReviewQueue([]);
-                // Audit adversarial 2026-06-09: este CTA limpiaba el batch
-                // pero NO la selección de fondo — mismo carryover que el
-                // bug de Ana M., por otra puerta. Paridad con handleReset.
-                setBackgroundFile(null); setBackgroundId(null);
-                setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
-                wizardPersistence.clear();
-                navigate("/new");
-              }}
+              onNewBatch={handleStartNewBatch}
               onViewHistory={() => navigate("/videos")}
             />
           } />
@@ -4197,7 +4239,7 @@ export default function App() {
         isOpen={searchOpen}
         onClose={() => setSearchOpen(false)}
         jobs={history}
-        onSelectJob={handleSelectJob}
+        onSelectJob={handleSearchSelectJob}
       />
       <GlobalSearchKeybinding onOpen={() => setSearchOpen(true)} />
     </>

@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useRef, memo } from "react";
+import { useState, useMemo, useEffect, useRef, useCallback, memo } from "react";
 import { useNavigate } from "react-router-dom";
 import { useI18n } from "../i18n";
 import { useLazyMediaUrl, useMediaUrl } from "../mediaUrl";
@@ -156,6 +156,7 @@ function FilterPill({ active, count, onClick, children }) {
   return (
     <button
       onClick={onClick}
+      aria-pressed={active}
       className={`flex items-center gap-2 h-9 px-4 rounded-full text-xs font-medium transition-all ${
         active
           ? "bg-brand/15 text-brand-light ring-1 ring-brand/40"
@@ -539,18 +540,13 @@ function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) 
   return (
     <div
       className="history-media-row group relative"
-      onClick={handleRowClick}
-      role="button"
-      tabIndex={0}
-      onKeyDown={(e) => {
-        if (e.target !== e.currentTarget) return;
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          handleRowClick();
-        }
-      }}
-      aria-label={`Abrir ${artistName || "video"} — ${songName || "sin nombre"}`}
     >
+      <button
+        type="button"
+        className="history-media-row__open-hit"
+        onClick={handleRowClick}
+        aria-label={`Abrir ${artistName || "video"} — ${songName || "sin nombre"}. Estado ${job.status}. Creado ${timeAgo(job.created_at)}`}
+      />
       {/* Checkbox — flotante arriba-izq del thumb, solo visible on hover
           o si seleccionado. NO interfiere con el layout cuando no se usa. */}
       {canDelete && (
@@ -682,23 +678,59 @@ const FILTERS = [
 
 function HistoryInspector({ job, onClose, onOpen, t }) {
   const thumbSrc = useMediaUrl(job?.job_id || "", "thumbnail", "preview");
+  const closeRef = useRef(null);
+  const panelRef = useRef(null);
+  const previousFocusRef = useRef(null);
+  const [modalLayout, setModalLayout] = useState(() => typeof window !== "undefined" && window.matchMedia("(max-width: 1100px)").matches);
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 1100px)");
+    const sync = (event) => setModalLayout(event.matches);
+    media.addEventListener?.("change", sync);
+    return () => media.removeEventListener?.("change", sync);
+  }, []);
+  useEffect(() => {
+    previousFocusRef.current = document.activeElement;
+    closeRef.current?.focus();
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+      } else if (event.key === "Tab" && modalLayout) {
+        const items = [...(panelRef.current?.querySelectorAll('button:not([disabled]), a[href], input, select, textarea') || [])];
+        if (!items.length) return;
+        const first = items[0];
+        const last = items[items.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      previousFocusRef.current?.focus?.();
+    };
+  }, [onClose, modalLayout]);
   if (!job) return null;
   const title = job.song_title || (job.filename || "").replace(/\.(mp3|wav)$/i, "") || "Sin nombre";
+  const hasProRes = ["umg", "both"].includes(job.delivery_profile) || job.prores_ready;
   return (
-    <aside className="history-inspector" aria-label="Detalle del video">
+    <>
+    <button type="button" className="history-inspector-backdrop" onClick={onClose} aria-label={t("history.inspector_close")} />
+    <aside ref={panelRef} className="history-inspector" role="dialog" aria-modal={modalLayout || undefined} aria-labelledby="history-inspector-title">
       <div className="history-inspector__header">
-        <div><p className="section-eyebrow">Detalle</p><h2>{title}</h2></div>
-        <button type="button" onClick={onClose} aria-label="Cerrar detalle">×</button>
+        <div><p className="section-eyebrow">{t("history.inspector_detail")}</p><h2 id="history-inspector-title">{title}</h2></div>
+        <button ref={closeRef} type="button" onClick={onClose} aria-label={t("history.inspector_close")}>×</button>
       </div>
       <MediaPreview src={thumbSrc} status={job.status} className="history-inspector__preview" alt={`Preview de ${title}`} />
       <dl>
-        <div><dt>Artista</dt><dd>{job.artist || "—"}</dd></div>
-        <div><dt>Formato</dt><dd>{job.delivery_profile === "umg" || job.prores_ready ? "Archivo maestro ProRes" : "MP4 1080p"}</dd></div>
-        <div><dt>Estado</dt><dd><StatusBadge status={job.status} t={t} /></dd></div>
+        <div><dt>{t("history.inspector_artist")}</dt><dd>{job.artist || "—"}</dd></div>
+        <div><dt>{t("history.inspector_format")}</dt><dd>{hasProRes ? t("history.inspector_prores") : t("history.inspector_mp4")}</dd></div>
+        <div><dt>{t("history.inspector_status")}</dt><dd><StatusBadge status={job.status} t={t} /></dd></div>
         <div><dt>ID</dt><dd className="font-mono">{job.job_id}</dd></div>
       </dl>
-      <button type="button" onClick={() => onOpen(job.job_id)} className="btn-primary w-full !h-11">Abrir detalle</button>
+      <button type="button" onClick={() => onOpen(job.job_id, job.status)} className="btn-primary w-full !h-11">{t("history.inspector_open")}</button>
     </aside>
+    </>
   );
 }
 
@@ -727,6 +759,7 @@ export default function HistoryView({
   const [view, setView] = useLocalStorage("genly_history_view", "table");
   const [sortMenuOpen, setSortMenuOpen] = useState(false);
   const sortMenuRef = useRef(null);
+  const sortTriggerRef = useRef(null);
 
   // The former card layout persisted in localStorage and could hide the
   // redesigned operator table indefinitely. Migrate it once, while keeping
@@ -740,14 +773,36 @@ export default function HistoryView({
   // Click-outside cierra el sort menu
   useEffect(() => {
     if (!sortMenuOpen) return;
+    requestAnimationFrame(() => sortMenuRef.current?.querySelector('[role="menuitemradio"]')?.focus());
     const handler = (e) => {
       if (sortMenuRef.current && !sortMenuRef.current.contains(e.target)) {
         setSortMenuOpen(false);
       }
     };
+    const escape = (e) => {
+      if (e.key === "Escape") {
+        setSortMenuOpen(false);
+        sortTriggerRef.current?.focus();
+      }
+    };
     document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("mousedown", handler);
+      document.removeEventListener("keydown", escape);
+    };
   }, [sortMenuOpen]);
+
+  const handleSortMenuKeyDown = (event) => {
+    const items = [...(sortMenuRef.current?.querySelectorAll('[role="menuitemradio"]') || [])];
+    if (!items.length) return;
+    const current = items.indexOf(document.activeElement);
+    if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) event.preventDefault();
+    if (event.key === "ArrowDown") items[(current + 1 + items.length) % items.length]?.focus();
+    if (event.key === "ArrowUp") items[(current - 1 + items.length) % items.length]?.focus();
+    if (event.key === "Home") items[0]?.focus();
+    if (event.key === "End") items[items.length - 1]?.focus();
+  };
 
   // Three terminal states share the "no rows" branch: still loading the
   // first fetch, fetch failed, or the tenant genuinely has zero jobs. We
@@ -824,8 +879,12 @@ export default function HistoryView({
     }
     return sortJobs(filtered, sortKey);
   }, [realHistory, filter, query, sortKey]);
-  const focusedJob = useMemo(() => realHistory.find((job) => job.job_id === focusedId) || null, [realHistory, focusedId]);
-  const focusForInspector = (jobId) => setFocusedId(jobId);
+  const focusedJob = useMemo(() => visible.find((job) => job.job_id === focusedId) || null, [visible, focusedId]);
+  const focusForInspector = (jobId, status) => {
+    if (status === "transcribed") onSelect(jobId, status);
+    else setFocusedId(jobId);
+  };
+  const closeInspector = useCallback(() => setFocusedId(null), []);
 
   // Buckets temporales — solo para vista tabla con date groups.
   // En grid mantenemos lista plana para no quebrar el flow visual.
@@ -952,8 +1011,12 @@ export default function HistoryView({
           {/* Sort dropdown */}
           <div className="relative" ref={sortMenuRef}>
             <button
+              ref={sortTriggerRef}
               type="button"
               onClick={() => setSortMenuOpen((v) => !v)}
+              aria-label={`Ordenar historial: ${currentSortLabel}`}
+              aria-haspopup="menu"
+              aria-expanded={sortMenuOpen}
               className="flex items-center gap-1.5 h-9 px-3 rounded-lg bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] text-[12px] text-gray-300 hover:text-white transition-colors"
             >
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -965,11 +1028,13 @@ export default function HistoryView({
               </svg>
             </button>
             {sortMenuOpen && (
-              <div className="absolute right-0 top-full mt-1 w-44 rounded-lg bg-surface-2 ring-1 ring-white/10 shadow-xl py-1 z-20">
+              <div className="absolute right-0 top-full mt-1 w-44 rounded-lg bg-surface-2 ring-1 ring-white/10 shadow-xl py-1 z-20" role="menu" onKeyDown={handleSortMenuKeyDown}>
                 {SORT_OPTIONS.map((o) => (
                   <button
                     key={o.key}
                     type="button"
+                    role="menuitemradio"
+                    aria-checked={sortKey === o.key}
                     onClick={() => { setSortKey(o.key); setSortMenuOpen(false); }}
                     className={`w-full text-left px-3 py-1.5 text-[12px] transition-colors flex items-center justify-between
                       ${sortKey === o.key ? "text-brand-light bg-white/[0.04]" : "text-gray-300 hover:bg-white/[0.04] hover:text-white"}`}
@@ -991,6 +1056,7 @@ export default function HistoryView({
               onClick={() => setView("table")}
               className={`h-9 px-2.5 transition-colors ${view === "table" ? "bg-white/[0.08] text-white" : "text-gray-500 hover:text-gray-300"}`}
               aria-label="Vista tabla"
+              aria-pressed={view === "table"}
               title="Vista tabla"
             >
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -1002,6 +1068,7 @@ export default function HistoryView({
               onClick={() => setView("grid")}
               className={`h-9 px-2.5 transition-colors ${view === "grid" ? "bg-white/[0.08] text-white" : "text-gray-500 hover:text-gray-300"}`}
               aria-label="Vista cards"
+              aria-pressed={view === "grid"}
               title="Vista cards"
             >
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -1208,10 +1275,10 @@ export default function HistoryView({
         <div className={`history-results ${focusedJob ? "has-inspector" : ""}`}>
         <div className="min-w-0 history-table">
           <div className="history-table__head" aria-hidden="true">
-            <span>Video</span>
-            <span>Artista y canción</span>
-            <span>Estado</span>
-            <span>Creado</span>
+            <span>{t("history.column_video")}</span>
+            <span>{t("history.column_artist_song")}</span>
+            <span>{t("history.column_status")}</span>
+            <span>{t("history.column_created")}</span>
             <span />
           </div>
           {buckets.map((bucket) => (
@@ -1237,7 +1304,7 @@ export default function HistoryView({
             </div>
           ))}
         </div>
-        {focusedJob && <HistoryInspector job={focusedJob} onClose={() => setFocusedId(null)} onOpen={onSelect} t={t} />}
+        {focusedJob && <HistoryInspector job={focusedJob} onClose={closeInspector} onOpen={onSelect} t={t} />}
         </div>
       ) : (
         /* VISTA GRID original con date group headers */
