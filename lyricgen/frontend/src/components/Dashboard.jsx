@@ -8,7 +8,6 @@ import ProResBadge from "./ProResBadge";
 import { SkeletonVideoCard } from "./Skeleton";
 import DashboardStepper from "./DashboardRich/Stepper";
 import FormatGallery from "./DashboardRich/FormatGallery";
-import NovedadHero from "./WhatsNew/NovedadHero";
 import "./DashboardRich/DashboardRich.css";
 
 // sessionStorage key the wizard reads on mount to pre-apply a delivery
@@ -77,6 +76,7 @@ function ProcessingRow({ job, onSelect, t }) {
 }
 
 function VideoCard({ job, onSelect }) {
+  const [thumbFailed, setThumbFailed] = useState(false);
   const name = (job.filename || "").replace(/\.mp3$/i, "");
   const songName = name.includes(" - ") ? name.split(" - ").slice(1).join(" - ") : name;
   const artistName = job.artist || (name.includes(" - ") ? name.split(" - ")[0] : "");
@@ -90,15 +90,25 @@ function VideoCard({ job, onSelect }) {
       className="overflow-hidden rounded-xl text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all"
     >
       <div className="aspect-video bg-surface-3/30 relative overflow-hidden">
-        {thumbSrc && (
+        <div className="absolute inset-0 dashboard-thumb-fallback" aria-hidden="true">
+          <div className="dashboard-thumb-fallback__art">
+            <span />
+            <span />
+            <span />
+            <span />
+            <span />
+          </div>
+          <small>{thumbFailed ? "Miniatura no disponible" : "Vista previa del video"}</small>
+        </div>
+        {thumbSrc && !thumbFailed && (
           <img
             src={thumbSrc}
-            alt=""
-            className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500"
-            onError={(e) => { e.target.style.display = "none"; }}
+            alt={`Miniatura de ${songName || "video"}`}
+            className="relative z-[1] w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500"
+            onError={() => setThumbFailed(true)}
           />
         )}
-        <div className="absolute inset-0 flex items-center justify-center opacity-30 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/30">
+        <div className="absolute z-[2] inset-0 flex items-center justify-center opacity-30 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/30">
           <div className="w-10 h-10 rounded-full bg-white/15 backdrop-blur-md flex items-center justify-center ring-1 ring-white/20">
             <svg className="w-4 h-4 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
               <path d="M8 5v14l11-7z"/>
@@ -303,8 +313,8 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
 
   return (
     <div className="w-full max-w-[1360px] animate-fade-in">
-      {/* ─── Command bar simplificada (header reposicionado, search vendrá en PR-2) ─── */}
-      <div className="mb-5 rounded-lg bg-[linear-gradient(135deg,rgba(255,255,255,0.035),rgba(255,255,255,0.014))] px-4 py-3.5 ring-1 ring-white/[0.055] md:px-5">
+      {/* Page header: global search + create live in GlobalTopbar. */}
+      <div className="mb-4 px-1 py-2">
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div className="min-w-0">
           <div className="mb-2 flex flex-wrap items-center gap-2">
@@ -358,16 +368,6 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               <svg className={`w-3 h-3 transition-transform ${attentionOpen ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" strokeLinecap="round" strokeLinejoin="round"/></svg>
             </button>
           )}
-          <button
-            onClick={onNewBatch}
-            className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg bg-brand px-3.5 text-[12px] font-semibold text-white shadow-[0_6px_18px_rgba(109,74,255,0.22)] transition-colors hover:bg-brand-light"
-            data-tour="dashboard-new-batch"
-          >
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
-              <path d="M12 5v14M5 12h14" strokeLinecap="round"/>
-            </svg>
-            {t("nav.new_batch")}
-          </button>
         </div>
         </div>
       </div>
@@ -405,7 +405,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
             </span>
             <span className="text-xs text-ink-secondary">
               {pendingReview.length === 0 ? "todo aprobado" :
-                pendingReview.length === 1 ? "esperando review" : "esperando review"}
+                pendingReview.length === 1 ? "pendiente de revisión" : "pendientes de revisión"}
             </span>
           </div>
           {pendingReview.length > 0 && pendingReview[0] && (
@@ -465,7 +465,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           ) : (
             <p className="text-[11px] text-ink-secondary mt-3">
               <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent/40 mr-2 align-middle" />
-              Sistema OK · esperando tu próximo upload
+              {errors.length > 0 ? `${errors.length} errores requieren atención` : "Sin renders activos · listo para tu próxima carga"}
             </p>
           )}
         </div>
@@ -483,7 +483,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                   ? "bg-amber-400/[0.08] text-amber-200 ring-amber-400/20"
                   : "bg-white/[0.04] text-gray-500 ring-white/[0.05]"
             }`}>
-              {isUnlimited ? "unlimited" : monthlyLimit ? `${Math.round(usagePercent)}% usado` : "cargando"}
+              {isUnlimited ? "sin límite" : monthlyLimit ? `${Math.round(usagePercent)}% usado` : "cargando"}
             </span>
           </div>
           <div className="mt-2 flex items-baseline gap-2">
@@ -722,13 +722,6 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           }}
         />
       )}
-      <NovedadHero />
-      <FormatGallery
-        user={user}
-        onSelectFormat={handleSelectFormat}
-        onUpgrade={handleUpgrade}
-      />
-
       {/* ─── Tus últimos videos — visual scan, NOT a copy of History ── */}
       {recentDone.length > 0 && (
         <div data-tour="dashboard-recent">
@@ -748,6 +741,12 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           </div>
         </div>
       )}
+
+      <FormatGallery
+        user={user}
+        onSelectFormat={handleSelectFormat}
+        onUpgrade={handleUpgrade}
+      />
 
       {/* Onboarding tour — fires only on first dashboard visit for new users */}
       <DashboardTour user={user} />

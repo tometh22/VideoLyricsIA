@@ -38,9 +38,9 @@ export default function DataTable({
   if (!rows || rows.length === 0) return empty;
 
   return (
-    <div className="overflow-x-auto">
+    <div className="overflow-x-auto max-h-[68vh]">
       <table className={`w-full ${dense ? "text-label" : "text-caption"}`}>
-        <thead>
+        <thead className="sticky top-0 z-10 bg-surface-1">
           <tr className="text-gray-500 uppercase tracking-wide text-section">
             {columns.map((col) => (
               <th

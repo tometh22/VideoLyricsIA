@@ -36,7 +36,7 @@ export default function OperacionSection() {
       />
 
       {/* 2 · Salud del sistema */}
-      <HealthStrip health={op.health} />
+      <HealthStrip health={op.health} issueCount={errors} stuckCount={op.stuckJobs?.length || 0} />
 
       {/* 3 · KPIs del día */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
@@ -45,10 +45,11 @@ export default function OperacionSection() {
           label="Pendientes de revisión"
           tone="warn"
           loading={statsLoading}
+          hint="Ahora · requiere acción"
         />
-        <KpiCard value={jobsStats.processing ?? 0} label="En proceso" tone="brand" loading={statsLoading} />
-        <KpiCard value={errors} label="Errores este mes" tone={errors > 0 ? "danger" : "default"} loading={statsLoading} />
-        <KpiCard value={jobsStats.this_month ?? 0} label="Videos este mes" loading={statsLoading} />
+        <KpiCard value={jobsStats.processing ?? 0} label="En proceso" tone="brand" loading={statsLoading} hint="Cola activa ahora" />
+        <KpiCard value={errors} label="Errores" tone={errors > 0 ? "danger" : "default"} loading={statsLoading} hint="Mes actual · resultado final" />
+        <KpiCard value={jobsStats.this_month ?? 0} label="Videos" loading={statsLoading} hint="Completados este mes" />
       </div>
 
       {/* 4 · Pipeline en vivo (ancho completo) */}
