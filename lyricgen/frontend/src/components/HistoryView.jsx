@@ -2,6 +2,7 @@ import { useState, useMemo, useEffect, useRef, memo } from "react";
 import { useNavigate } from "react-router-dom";
 import { useI18n } from "../i18n";
 import { useLazyMediaUrl, useMediaUrl } from "../mediaUrl";
+import MediaPreview from "./MediaPreview";
 // Reusing the hero dropzone styles from the Dashboard's empty state so the
 // app feels consistent when you land on an empty page (Inicio vs Historial).
 import "./DashboardRich/DashboardRich.css";
@@ -295,21 +296,15 @@ function VideoCardImpl({ job, onSelect, onDelete, selected, onToggleSelect, t })
         ${selected ? "ring-2 ring-brand/60" : ""}`}
     >
       <div className="aspect-video bg-surface-3/30 relative overflow-hidden">
-        {showThumb && thumbSrc ? (
-          <>
-            <img
-              src={thumbSrc}
-              alt=""
-              className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500"
-              onError={(e) => { e.target.style.display = "none"; }}
-            />
+        {showThumb ? (
+          <MediaPreview src={thumbSrc} status={job.status} className="absolute inset-0" alt={`Preview de ${songName || "video"}`} imageClassName="group-hover:scale-[1.04] transition-transform duration-500">
             {/* Re-render in progress sobre el thumb stale (status=editing) */}
             {job.status === "editing" && (
-              <div className="absolute inset-0 flex items-center justify-center bg-black/30 backdrop-blur-[1px]">
+              <div className="absolute z-[2] inset-0 flex items-center justify-center bg-black/30 backdrop-blur-[1px]">
                 <div className="w-7 h-7 border-2 border-brand border-t-transparent rounded-full animate-spin" />
               </div>
             )}
-          </>
+          </MediaPreview>
         ) : (job.status === "error" || job.status === "validation_failed") ? (
           <div className="absolute inset-0 flex items-center justify-center bg-red-500/[0.04]">
             <svg className="w-7 h-7 text-red-400/60" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">
@@ -339,7 +334,7 @@ function VideoCardImpl({ job, onSelect, onDelete, selected, onToggleSelect, t })
                 flex items-center justify-center transition-all
                 ${selected
                   ? "bg-brand border-brand opacity-100"
-                  : "bg-black/50 border-white/40 hover:border-brand/70 opacity-0 group-hover:opacity-100"}`}
+                  : "bg-black/50 border-white/40 hover:border-brand/70 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"}`}
               title={selected ? "Deseleccionar" : "Seleccionar para eliminar"}
               aria-label="Seleccionar"
               aria-pressed={selected}
@@ -354,7 +349,7 @@ function VideoCardImpl({ job, onSelect, onDelete, selected, onToggleSelect, t })
               type="button"
               onClick={handleDelete}
               className="absolute top-2.5 left-11 w-7 h-7 rounded-lg bg-black/50 hover:bg-red-500/80 backdrop-blur-md
-                text-white/70 hover:text-white opacity-0 group-hover:opacity-100 transition-all
+                text-white/70 hover:text-white opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100 transition-all
                 flex items-center justify-center ring-1 ring-white/10 hover:ring-red-400/50"
               title={t("history.delete") || "Eliminar"}
               aria-label="Eliminar video"
@@ -506,18 +501,7 @@ function MediaThumbnail({ jobId, status, editCount = 0 }) {
   );
   const isReady = status === "done" || status === "pending_review";
   return (
-    <div ref={thumbRef} className="w-[120px] h-[70px] shrink-0 rounded-lg overflow-hidden bg-surface-3/40 ring-1 ring-white/[0.06] relative group/thumb">
-      {hasMedia && src ? (
-        <img
-          src={src}
-          alt=""
-          loading="lazy"
-          className="w-full h-full object-cover"
-          onError={(e) => { e.currentTarget.style.display = "none"; }}
-        />
-      ) : (
-        <ProcessingThumbnail status={status} />
-      )}
+    <MediaPreview ref={thumbRef} src={hasMedia ? src : ""} status={status} className="w-[120px] h-[70px] shrink-0 rounded-lg group/thumb">
       {isReady && src && (
         <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover/thumb:opacity-100 bg-black/40 transition-opacity">
           <div className="w-7 h-7 rounded-full bg-white/15 backdrop-blur-md flex items-center justify-center ring-1 ring-white/20">
@@ -527,7 +511,7 @@ function MediaThumbnail({ jobId, status, editCount = 0 }) {
           </div>
         </div>
       )}
-    </div>
+    </MediaPreview>
   );
 }
 
@@ -557,6 +541,15 @@ function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) 
       className="history-media-row group relative"
       onClick={handleRowClick}
       role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.target !== e.currentTarget) return;
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          handleRowClick();
+        }
+      }}
+      aria-label={`Abrir ${artistName || "video"} — ${songName || "sin nombre"}`}
     >
       {/* Checkbox — flotante arriba-izq del thumb, solo visible on hover
           o si seleccionado. NO interfiere con el layout cuando no se usa. */}
@@ -567,7 +560,7 @@ function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) 
           className={`absolute top-2 left-2 z-10 w-5 h-5 rounded border flex items-center justify-center backdrop-blur-md transition-all
             ${selected
               ? "bg-brand border-brand opacity-100"
-              : "bg-black/40 border-white/30 hover:border-brand/70 opacity-0 group-hover:opacity-100"
+              : "bg-black/40 border-white/30 hover:border-brand/70 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
             }`}
           aria-label={selected ? "Deseleccionar" : "Seleccionar"}
         >
@@ -632,7 +625,7 @@ function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) 
           <button
             type="button"
             onClick={handleRowClick}
-            className="flex items-center gap-1.5 px-3 h-9 rounded-lg bg-accent/15 ring-1 ring-accent/30 text-[12px] text-accent hover:bg-accent/25 transition-colors opacity-0 group-hover:opacity-100"
+            className="flex items-center gap-1.5 px-3 h-9 rounded-lg bg-accent/15 ring-1 ring-accent/30 text-[12px] text-accent hover:bg-accent/25 transition-colors opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
           >
             <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
@@ -643,7 +636,7 @@ function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) 
           <button
             type="button"
             onClick={(e) => { e.stopPropagation(); if (confirm("¿Eliminar este job fallido?")) onDelete(job.job_id); }}
-            className="flex items-center gap-1.5 px-3 h-9 rounded-lg bg-white/[0.04] ring-1 ring-white/[0.06] text-[12px] text-red-400/80 hover:bg-red-500/15 hover:text-red-300 transition-colors opacity-0 group-hover:opacity-100"
+            className="flex items-center gap-1.5 px-3 h-9 rounded-lg bg-white/[0.04] ring-1 ring-white/[0.06] text-[12px] text-red-400/80 hover:bg-red-500/15 hover:text-red-300 transition-colors opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
           >
             <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z" strokeLinecap="round" strokeLinejoin="round" />
@@ -651,7 +644,7 @@ function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) 
             Eliminar
           </button>
         ) : (
-          <span className="text-gray-500 opacity-0 group-hover:opacity-100 transition-opacity">
+          <span className="text-gray-500 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100 transition-opacity">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
@@ -697,9 +690,7 @@ function HistoryInspector({ job, onClose, onOpen, t }) {
         <div><p className="section-eyebrow">Detalle</p><h2>{title}</h2></div>
         <button type="button" onClick={onClose} aria-label="Cerrar detalle">×</button>
       </div>
-      <div className="history-inspector__preview">
-        {thumbSrc ? <img src={thumbSrc} alt="" /> : <div><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M8 5v14l11-7z"/></svg></div>}
-      </div>
+      <MediaPreview src={thumbSrc} status={job.status} className="history-inspector__preview" alt={`Preview de ${title}`} />
       <dl>
         <div><dt>Artista</dt><dd>{job.artist || "—"}</dd></div>
         <div><dt>Formato</dt><dd>{job.delivery_profile === "umg" || job.prores_ready ? "Archivo maestro ProRes" : "MP4 1080p"}</dd></div>
@@ -904,7 +895,7 @@ export default function HistoryView({
       {/* ─── Header ─────────────────────────────────────────────── */}
       <div className="flex items-end justify-between mb-8">
         <div className="flex items-center gap-3">
-          <button onClick={onBack}
+          <button onClick={onBack} aria-label="Volver"
             className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M19 12H5M12 19l-7-7 7-7" />

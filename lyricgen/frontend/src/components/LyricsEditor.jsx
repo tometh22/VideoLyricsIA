@@ -2076,7 +2076,7 @@ export default function LyricsEditor({
       <button
         onClick={handleApprove}
         data-tour="editor-approve-floating"
-        className="fixed bottom-6 right-6 z-50 inline-flex items-center gap-1.5 btn-primary text-sm h-12 px-6 shadow-2xl shadow-brand/30"
+        className="editor-primary-cta fixed bottom-6 right-6 z-50 inline-flex items-center gap-1.5 btn-primary text-sm h-12 px-6 shadow-2xl shadow-brand/30"
       >
         {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
         <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">

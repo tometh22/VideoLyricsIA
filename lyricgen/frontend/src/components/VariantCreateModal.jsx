@@ -170,9 +170,9 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
       onClick={(e) => { if (e.target === e.currentTarget && !submitting) onClose?.(); }}
     >
-      <div className="w-full max-w-lg bg-surface-2 rounded-card ring-1 ring-white/[0.08] p-6 space-y-4">
+      <div className="w-full max-w-lg bg-surface-2 rounded-card ring-1 ring-white/[0.08] p-6 space-y-4" role="dialog" aria-modal="true" aria-labelledby="variant-modal-title">
         <div>
-          <h2 className="text-lg font-semibold text-white">
+          <h2 id="variant-modal-title" className="text-lg font-semibold text-white">
             {t("variant.title") || "Crear variante"}
           </h2>
           <p className="text-xs text-ink-secondary mt-1">
