@@ -146,6 +146,7 @@ def test_model_override_precedence():
     # alias → id
     assert models.resolve("opus") == "claude-opus-4-8"
     assert models.resolve("haiku") == "claude-haiku-4-5-20251001"
+    assert models.resolve("fable") == "claude-fable-5"
     # id desconocido pasa tal cual (el CLI valida)
     assert models.resolve("claude-x-99") == "claude-x-99"
     # override del store gana al env default
