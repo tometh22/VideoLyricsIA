@@ -2382,14 +2382,12 @@ export default function UploadZone({
         const gridCols = isStep6
           ? "lg:grid-cols-[200px_minmax(360px,500px)_minmax(0,1fr)]"
           : "lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)]";
-        // 2026-05-26 — variante [.editor-focus-mode_&] colapsa este grid
-        // a 1 columna cuando el LyricsEditor prende "modo enfoque". Sin
-        // este override, el feature sólo agrandaba el max-h interno (~90px
-        // verticales) — invisible porque el operador ya tiene ~1124px de
-        // ancho en step 6. Con focus on, stepper + preview se ocultan
-        // (rules abajo) y la columna del editor toma los ~1500px de
-        // viewport. Body class emitida por LyricsEditor:367, cleanup en
-        // unmount → volver a step 4 reaparece el layout 3-col.
+        // Studio focus: when LyricsEditor emits `editor-focus-mode`, collapse
+        // the three-column wizard into a two-column editing workspace. The
+        // step rail disappears, but the live preview stays docked at a compact
+        // 320–400 px so the operator can keep watching the video while the
+        // timeline uses all remaining width. Returning to the regular mode
+        // restores the original three-column wizard automatically.
         return (
         // QA fix 2026-05-28: grid pasa a llenar el alto del padre y a ser
         // su propio scroll context en lg+. items-start mantiene la
@@ -2398,7 +2396,7 @@ export default function UploadZone({
         // lg:min-h-0 deja la grid ocupar el espacio que el flex-col
         // exterior le da. lg:overflow-hidden previene que la grid haga
         // overflow al body — el scroll vive en la columna RIGHT.
-        <div className={`wizard-workspace-grid flex flex-col lg:grid ${gridCols} [.editor-focus-mode_&]:lg:grid-cols-1 gap-6 items-start lg:items-stretch lg:h-full lg:min-h-0 lg:overflow-hidden lg:flex-1`}>
+        <div className={`wizard-workspace-grid flex flex-col lg:grid ${gridCols} [.editor-focus-mode_&]:lg:grid-cols-[clamp(320px,24vw,400px)_minmax(0,1fr)] gap-6 items-start lg:items-stretch lg:h-full lg:min-h-0 lg:overflow-hidden lg:flex-1`}>
 
         {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile).
             Paso 6 "Lyrics" se ve siempre; está deshabilitado hasta que
@@ -2458,7 +2456,7 @@ export default function UploadZone({
             editando), y el max-width del contenedor se ajusta al
             grid column (260-320 px). Mantiene sticky para acompañar
             el scroll del timeline en el panel derecho. */}
-        <div className="wizard-preview-stage lg:sticky lg:top-4 space-y-2 min-w-0 w-full [.editor-focus-mode_&]:hidden">
+        <div className="wizard-preview-stage lg:sticky lg:top-4 space-y-2 min-w-0 w-full">
           {/* UI v1.1 (2026-05-30): toggle pill — "Letra / Portada". The
               central preview shows whichever face is selected; the bottom
               fan-out of states (Lyrics editor, batch progress, ready, etc.)
