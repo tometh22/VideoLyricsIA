@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import BrandLockup from "./BrandLockup";
 
@@ -7,6 +7,29 @@ const API = import.meta.env.VITE_API_URL || "";
 export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
   const { t, lang, setLang } = useI18n();
   const [menuOpen, setMenuOpen] = useState(false);
+  const mobileNavRef = useRef(null);
+  const mobileMenuRef = useRef(null);
+  const mobileTriggerRef = useRef(null);
+
+  useEffect(() => {
+    if (!menuOpen) return undefined;
+    requestAnimationFrame(() => mobileMenuRef.current?.querySelector("a, button")?.focus());
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setMenuOpen(false);
+        mobileTriggerRef.current?.focus();
+      }
+    };
+    const onPointerDown = (event) => {
+      if (!mobileNavRef.current?.contains(event.target)) setMenuOpen(false);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("mousedown", onPointerDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("mousedown", onPointerDown);
+    };
+  }, [menuOpen]);
 
   // Lead form → POST /api/leads. Falls back to a prefilled mailto if the API fails.
   const [formState, setFormState] = useState("idle"); // idle | loading | sent | error
@@ -109,7 +132,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
       </div>
 
       {/* Sticky Nav */}
-      <nav className="sticky top-0 z-30 bg-surface/80 backdrop-blur-xl border-b border-white/[0.04]">
+      <nav ref={mobileNavRef} className="sticky top-0 z-30 bg-surface/80 backdrop-blur-xl border-b border-white/[0.04]">
         <div className="flex h-[72px] items-center justify-between px-6 max-w-[1240px] mx-auto">
           {/* §10 — full lockup in navbar / footer / auth screens.
               Brand SVG geometry is the single source of truth. */}
@@ -125,6 +148,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
                 <button
                   key={code}
                   onClick={() => setLang(code)}
+                  aria-pressed={lang === code}
                   className={`text-[10px] font-bold px-2 py-1 rounded-md transition-all uppercase
                     ${lang === code ? "text-white bg-white/10" : "text-gray-600 hover:text-gray-400"}`}
                 >
@@ -144,16 +168,16 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
               </div>
             )}
           </div>
-          <button onClick={() => setMenuOpen((value) => !value)} className="md:hidden flex h-11 w-11 items-center justify-center rounded-xl text-gray-300 hover:bg-white/[0.06]" aria-expanded={menuOpen} aria-label="Abrir menú">
+          <button ref={mobileTriggerRef} onClick={() => setMenuOpen((value) => !value)} className="md:hidden flex h-11 w-11 items-center justify-center rounded-xl text-gray-300 hover:bg-white/[0.06]" aria-expanded={menuOpen} aria-controls="landing-mobile-menu" aria-label={menuOpen ? "Cerrar menú" : "Abrir menú"}>
             <svg className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d={menuOpen ? "M6 6l12 12M18 6L6 18" : "M4 6h16M4 12h16M4 18h16"}/></svg>
           </button>
         </div>
         {menuOpen && (
-          <div className="md:hidden grid gap-2 border-t border-white/[0.05] bg-surface-1 px-5 pb-5 pt-3">
+          <div ref={mobileMenuRef} id="landing-mobile-menu" className="md:hidden grid gap-2 border-t border-white/[0.05] bg-surface-1 px-5 pb-5 pt-3">
             <a href="#features" onClick={() => setMenuOpen(false)} className="flex min-h-11 items-center rounded-xl px-3 text-sm text-gray-300">{t("landing.features")}</a>
             <a href="#pricing" onClick={() => setMenuOpen(false)} className="flex min-h-11 items-center rounded-xl px-3 text-sm text-gray-300">{t("landing.pricing")}</a>
             <a href="#faq" onClick={() => setMenuOpen(false)} className="flex min-h-11 items-center rounded-xl px-3 text-sm text-gray-300">FAQ</a>
-            <div className="flex gap-2">{["es", "en", "pt"].map((code) => <button key={code} onClick={() => setLang(code)} className={`h-11 min-w-11 rounded-xl text-xs font-bold uppercase ${lang === code ? "bg-white/10 text-white" : "text-gray-500"}`}>{code}</button>)}</div>
+            <div className="flex gap-2">{["es", "en", "pt"].map((code) => <button key={code} onClick={() => setLang(code)} aria-pressed={lang === code} className={`h-11 min-w-11 rounded-xl text-xs font-bold uppercase ${lang === code ? "bg-white/10 text-white" : "text-gray-500"}`}>{code}</button>)}</div>
             <button onClick={isLoggedIn ? onStart : onLogin} className="btn-primary w-full">{isLoggedIn ? t("nav.dashboard") : t("nav.start")}</button>
           </div>
         )}
