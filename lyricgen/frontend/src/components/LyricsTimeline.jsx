@@ -18,11 +18,11 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
-// Zoom = px per second (vertical). Operator-adjustable so dense sections
-// spread out; lower = more of the song on screen at once. Default is low
-// on purpose: at 40 px/s a 4s line was a 160px monolith and you saw ~4
-// lines of 60. At 16 px/s the same line is ~64px and ~15-20 lines fit.
-const ZOOM_DEFAULT = 16;
+// Zoom = px per second (vertical). The former 16 px/s default compressed
+// 30–40 seconds into the first viewport, making handles and short lines hard
+// to distinguish until the operator clicked + several times. 32 px/s opens
+// at a useful editing scale while the − control still provides an overview.
+const ZOOM_DEFAULT = 32;
 const ZOOM_MIN = 8;
 const ZOOM_MAX = 60;
 const ZOOM_STEP = 8;
