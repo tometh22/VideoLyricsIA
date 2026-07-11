@@ -281,8 +281,13 @@ export default function WizardLivePreview({
   const lineAnim = {
     pop: "wlp-pop .55s cubic-bezier(.2,1.4,.35,1) both",
     glow: "wlp-lyric-in .7s cubic-bezier(.2,.8,.2,1) both, wlp-glow-text 2.4s 0.7s ease-in-out infinite",
-    none: "wlp-lyric-in .7s cubic-bezier(.2,.8,.2,1) both",
-  }[lyricsAnimation] || "wlp-lyric-in .7s cubic-bezier(.2,.8,.2,1) both";
+    // `none` must really be static. The old fallback faded and translated
+    // every live line even though the operator had selected no animation.
+    // Over a moving <video>, Chrome/Safari could briefly composite the text
+    // layer as a dark rectangular tile — the flashing box reported in the
+    // editor preview. Explicit templates keep their intended animation.
+    none: undefined,
+  }[lyricsAnimation];
   const sampleWords = sample.split(/\s+/).filter(Boolean);
   // Word-level templates LOOP continuously (a constant stagger keeps the words
   // in lockstep) so the sweep/reveal is always visible — not a one-shot that

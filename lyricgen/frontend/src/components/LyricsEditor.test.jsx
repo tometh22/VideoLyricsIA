@@ -307,8 +307,8 @@ describe("LyricsEditor — modo enfoque body class broadcast", () => {
   //
   // Fix: LyricsEditor emite la clase `editor-focus-mode` en
   // document.body cuando focusMode=on. UploadZone usa una variante
-  // arbitraria de Tailwind (`[.editor-focus-mode_&]:lg:grid-cols-1`)
-  // para colapsar su grid + esconder stepper + preview central.
+  // arbitraria de Tailwind con dos columnas para esconder el stepper y
+  // mantener una preview compacta junto al editor expandido.
   //
   // Este test cubre el contrato: el body class se aplica al togglear
   // y se LIMPIA al desmontar (sin cleanup, el usuario que navega de
