@@ -88,3 +88,51 @@ def test_prompt_guardrails_pin_staging_never_main():
         assert "staging" in p
         assert "NUNCA mergees" in p
     assert "--base staging" in imp
+
+
+# ─── v1.1: merge/promote gates, sesiones, task prompt ────────────────────────
+
+def test_merge_pr_refuses_non_staging_base():
+    """El guardrail duro de /merge: código, no prompt. Un PR con base main
+    debe rechazarse SIEMPRE — producción solo va por /promote (doble confirm)."""
+    import inspect
+    import github_api
+    src = inspect.getsource(github_api.merge_pr)
+    assert "config.PR_BASE_BRANCH" in src
+    assert "/promote" in src  # el mensaje redirige al flujo correcto
+    m2m = inspect.getsource(github_api.merge_to_main)
+    # merge_to_main exige exactamente staging→main y CI verde.
+    assert '"main"' in m2m and "checks_state" in m2m
+
+
+def test_promote_requires_double_confirmation():
+    """El flujo /promote NUNCA ejecuta directo: manda botón de confirmación
+    explícita ('ESTO VA A PRODUCCIÓN') y solo el callback promote_go dispara."""
+    import inspect, app
+    on_text = inspect.getsource(app._on_text)
+    assert "ESTO VA A PRODUCCIÓN" in on_text
+    assert "promote_go" in on_text
+    # _do_promote solo se lanza desde el callback, no desde /promote directo.
+    assert "_do_promote" not in on_text.split("/promote")[1].split("/logs")[0].replace("promote_go", "")
+    on_cb = inspect.getsource(app._on_callback)
+    assert "promote_go" in on_cb and "_do_promote" in on_cb
+
+
+def test_task_sessions_roundtrip():
+    store.init_sessions()
+    store.map_tg_session(555, "sess-abc")
+    assert store.session_for_tg_message(555) == "sess-abc"
+    assert store.session_for_tg_message(556) is None
+
+
+def test_task_prompt_is_read_only_and_phone_sized():
+    p = prompts.task_prompt("auditá el reaper", "staging")
+    assert "SOLO LECTURA" in p
+    assert "NO podés editar" in p
+    assert "PROHIBIDO" in p  # guardrails de branches presentes también acá
+
+
+def test_railway_logs_disabled_gracefully(monkeypatch):
+    import railway_logs
+    monkeypatch.setattr(railway_logs, "_TOKEN", "")
+    assert not railway_logs.enabled()
