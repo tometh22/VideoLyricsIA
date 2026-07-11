@@ -139,6 +139,50 @@ def test_scene_clips_graceful_degradation(monkeypatch, tmp_path):
     assert failed["status"] == "failed"
 
 
+def test_scene_clips_cache_only_miss_without_stored_key_degrades_silently(monkeypatch, tmp_path, caplog):
+    """Incidente 2026-07-10 (coro_3): en un edit (regen_keys=set() → todo
+    cache_only), una escena que falló en la generación original NUNCA persistió
+    clip_cache_key → su miss es GARANTIZADO y ya está manejado (se reusa un
+    clip válido). Antes se logueaba como ERROR → page falso al on-call en cada
+    edit. Ahora: el intento a caché se CONSERVA (enmienda del review — el skip
+    original rompía planes sin keys), pero un miss sin key persistida degrada
+    con WARNING y status 'reused', no ERROR/'failed'."""
+    import logging as _logging
+    import veo_breaker
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+
+    def fake_veo(prompt, output_path, **kw):
+        # coro_1 (tiene key) hitea caché; coro_3 (sin key) missea como en prod.
+        if kw.get("cache_key_override"):
+            with open(output_path, "w") as f:
+                f.write("clip")
+            return output_path
+        raise RuntimeError("[BG] cache_only: sin clip cacheado (deadbeef)")
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    plan = {"scenes": [
+        # coro_1 sí cacheó al generarse (tiene clip_cache_key).
+        {"recurrence_key": "coro_1", "prompt": "p", "movement_style": "dinamico",
+         "clip_cache_key": "cache/veo/coro1.mp4"},
+        # coro_3 falló en la generación original → sin clip_cache_key.
+        {"recurrence_key": "coro_3", "prompt": "p", "movement_style": "sutil",
+         "status": "failed"},
+    ]}
+    with caplog.at_level(_logging.WARNING):
+        # regen_keys=set() → TODAS cache_only (el caso del edit de lyrics/typography).
+        clip_for_key = pipeline._generate_scene_clips(
+            plan, str(tmp_path), artist="A", song_title="S", job_id=None,
+            regen_keys=set())
+
+    # El timeline queda entero: coro_3 reusa el clip válido de coro_1.
+    assert set(clip_for_key) == {"coro_1", "coro_3"}
+    coro3 = next(s for s in plan["scenes"] if s["recurrence_key"] == "coro_3")
+    assert coro3["status"] == "reused"
+    # Degradación SILENCIOSA: warning sí, ERROR (lo que paginaba) no.
+    records = [r for r in caplog.records if "coro_3" in r.getMessage()]
+    assert records and all(r.levelno < _logging.ERROR for r in records)
+
+
 def test_scene_clips_all_fail_raises(monkeypatch, tmp_path):
     import veo_breaker
     monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
