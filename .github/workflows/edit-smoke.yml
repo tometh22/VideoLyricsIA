@@ -1,0 +1,65 @@
+# Post-deploy edit smoke — GO/NO-GO del golden path upload→render→edit.
+#
+# Por qué existe: el incidente UMG del 2026-07-09 (#853 deployó el ffmpeg-234
+# que rompía todos los edits de WAVs acentuados) estuvo 8 horas en prod hasta
+# que un cliente escribió por WhatsApp. Este workflow corre el camino exacto
+# tras cada push a staging (= deploy de Railway staging) y lo deja rojo si el
+# pipeline de render/edit se rompió. En su primera corrida real atrapó un
+# worker stale en la flota de staging (TypeError frame_format). Contra PROD
+# solo por dispatch manual — crea un job real y gasta un Veo Fast
+# (~USD 0.10-0.80 por corrida).
+#
+# Secrets requeridos:
+#   PREFLIGHT_USERNAME / PREFLIGHT_PASSWORD  (cuenta admin del entorno)
+#   STAGING_API_URL   p.ej. https://api-staging-9b82.up.railway.app
+#   PRODUCTION_API_URL (ya existe — lo usa daily-smoke)
+name: Edit smoke (post-deploy)
+
+on:
+  push:
+    branches: [staging]
+    paths:
+      - "lyricgen/backend/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Entorno a smokear"
+        type: choice
+        options: [staging, production]
+        default: staging
+
+permissions:
+  contents: read
+
+jobs:
+  edit-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (requests only — smoke es black-box HTTP)
+        run: pip install --quiet requests==2.32.3
+
+      - name: Wait for Railway deploy to settle
+        # El push que dispara este workflow también dispara el deploy de
+        # Railway; darle ventaja para que el smoke pruebe el código NUEVO.
+        run: sleep 180
+
+      - name: Run edit smoke
+        working-directory: lyricgen/backend
+        env:
+          PREFLIGHT_USERNAME: ${{ secrets.PREFLIGHT_USERNAME }}
+          PREFLIGHT_PASSWORD: ${{ secrets.PREFLIGHT_PASSWORD }}
+        run: |
+          if [ "${{ inputs.environment || 'staging' }}" = "production" ]; then
+            API="${{ secrets.PRODUCTION_API_URL }}"
+          else
+            API="${{ secrets.STAGING_API_URL }}"
+          fi
+          python3 -m scripts.preflight.edit_smoke --api-url "$API"
