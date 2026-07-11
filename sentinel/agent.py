@@ -81,23 +81,25 @@ def _cleanup_worktree(path: str):
 
 
 def _claude(prompt: str, cwd: str, allowed_tools: str,
-            resume_session: str | None = None) -> dict:
+            resume_session: str | None = None, max_turns: int | None = None) -> dict:
     """Corre `claude -p` headless. Devuelve {'text', 'json', 'session_id'}.
 
     `resume_session`: retoma una sesión previa del CLI (conversación
-    continuada desde Telegram: el operador responde a un mensaje del agente
-    y el hilo sigue con TODO el contexto anterior)."""
+    continuada desde Telegram). `max_turns`: override (modo deep)."""
+    import models
     cmd = [
         "claude", "-p", prompt,
         "--output-format", "json",
-        "--max-turns", str(config.AGENT_MAX_TURNS),
+        "--max-turns", str(max_turns or config.AGENT_MAX_TURNS),
         "--allowedTools", allowed_tools,
         "--permission-mode", "acceptEdits",
     ]
     if resume_session:
         cmd += ["--resume", resume_session]
-    if config.CLAUDE_MODEL:
-        cmd += ["--model", config.CLAUDE_MODEL]
+    # Modelo efectivo: override del store (/model) → env → default del CLI.
+    model = models.current(config.CLAUDE_MODEL)
+    if model:
+        cmd += ["--model", model]
     env = {
         "ANTHROPIC_API_KEY": config.ANTHROPIC_API_KEY,
         # gh usa GH_TOKEN; git push usa el remote del worktree (mismo header
@@ -210,22 +212,30 @@ def _ensure_taskspace() -> str:
     return path
 
 
-async def run_task(instruction: str, resume_session: str | None = None) -> dict:
-    """Tarea libre del operador (auditar, revisar, investigar, testear algo
-    puntual) — SOLO lectura sobre el código, con conversación continuable
-    (resume_session). Nunca edita ni pushea: para eso está el flujo de
-    incidentes con aprobación explícita."""
+async def run_task(instruction: str, resume_session: str | None = None,
+                   deep: bool = False) -> dict:
+    """Tarea libre del operador (auditar, revisar, investigar) — SOLO lectura,
+    con conversación continuable (resume_session). `deep=True` habilita que el
+    agente lance SUBAGENTES en paralelo (tool Task) y le da más turnos —
+    para auditorías grandes ("revisá todo X con varios agentes"). Nunca edita
+    ni pushea: para eso está el flujo de incidentes con aprobación."""
     def _sync():
         ws = _ensure_taskspace()
+        tools = (
+            "Read,Grep,Glob,"
+            "Bash(git log:*),Bash(git show:*),Bash(git grep:*),Bash(git diff:*),"
+            "Bash(ls:*),Bash(cat:*),Bash(python3 -c:*),Bash(gh pr view:*),Bash(gh pr diff:*)"
+        )
+        if deep:
+            # Task = spawner de subagentes del Claude Code CLI. Con esto el
+            # agente decide fan-out (varios subagentes read-only en paralelo).
+            tools += ",Task"
         return _claude(
-            prompts.task_prompt(instruction, config.PR_BASE_BRANCH)
+            prompts.task_prompt(instruction, config.PR_BASE_BRANCH, deep=deep)
             if not resume_session else instruction,
             cwd=ws,
-            allowed_tools=(
-                "Read,Grep,Glob,"
-                "Bash(git log:*),Bash(git show:*),Bash(git grep:*),Bash(git diff:*),"
-                "Bash(ls:*),Bash(cat:*),Bash(python3 -c:*),Bash(gh pr view:*),Bash(gh pr diff:*)"
-            ),
+            allowed_tools=tools,
             resume_session=resume_session,
+            max_turns=200 if deep else None,
         )
     return await asyncio.to_thread(_sync)

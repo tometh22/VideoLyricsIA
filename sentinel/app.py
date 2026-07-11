@@ -120,12 +120,15 @@ async def _implement(incident_id: int):
 # ---------------------------------------------------------------------------
 
 async def _run_chat_task(instruction: str, chat_id: str,
-                         resume_session: str | None = None):
-    """Tarea libre (/task o continuación por reply) — v1.1."""
-    await tg.send("🧠 Trabajando en eso…", chat_id=chat_id)
+                         resume_session: str | None = None, deep: bool = False):
+    """Tarea libre (/task, /deep o continuación por reply)."""
+    import models
+    await tg.send(f"🧠 Trabajando{' (modo profundo, varios agentes)' if deep else ''}… "
+                  f"[{tg.esc(models.label(models.current(config.CLAUDE_MODEL)))}]",
+                  chat_id=chat_id)
     async with _run_sem:
         try:
-            res = await agent.run_task(instruction, resume_session=resume_session)
+            res = await agent.run_task(instruction, resume_session=resume_session, deep=deep)
         except Exception as e:
             await tg.send(f"❌ La tarea falló: {tg.esc(str(e)[:300])}", chat_id=chat_id)
             return
@@ -216,6 +219,28 @@ async def _on_text(text: str, chat_id: str, reply_to: int | None):
         ]
         await tg.send("\n".join(lines), chat_id=chat_id)
         return
+    if t.startswith("/model"):
+        import models
+        arg = t[len("/model"):].strip()
+        if not arg:
+            cur = models.current(config.CLAUDE_MODEL)
+            await tg.send(f"🧬 Modelo actual: <b>{tg.esc(models.label(cur))}</b>\n"
+                          f"{models.options_text()}\nUso: /model opus | sonnet | haiku",
+                          chat_id=chat_id)
+            return
+        resolved = models.set_model(arg)
+        await tg.send(f"🧬 Modelo → <b>{tg.esc(models.label(resolved))}</b> "
+                      f"(<code>{tg.esc(resolved)}</code>). Aplica desde la próxima tarea/investigación.",
+                      chat_id=chat_id)
+        return
+    if t.startswith("/deep"):
+        instr = t[len("/deep"):].strip()
+        if not instr:
+            await tg.send("Uso: /deep <auditoría grande> — lanza subagentes en paralelo.",
+                          chat_id=chat_id)
+            return
+        asyncio.create_task(_run_chat_task(instr, chat_id, deep=True))
+        return
     if t.startswith("/task"):
         instr = t[len("/task"):].strip()
         if not instr:
@@ -271,6 +296,8 @@ async def _on_text(text: str, chat_id: str, reply_to: int | None):
             "Soy el Sentinel de Genly — tu terminal de guardia.\n\n"
             "🚨 Automático: alertas de Sentry → investigo → te propongo PR a staging.\n\n"
             "/task <pedido> — investigá/auditá/revisá algo (conversación continuable por reply)\n"
+            "/deep <pedido> — auditoría grande: lanza varios subagentes en paralelo\n"
+            "/model [opus|sonnet|haiku] — ver o cambiar el modelo en caliente\n"
             "/merge <PR> — mergear un PR a staging (doble confirmación, CI verde)\n"
             "/promote — promover staging→main (PRODUCCIÓN, doble confirmación)\n"
             "/logs [servicio] — cola de logs de Railway (Worker, api, ShortWorker…)\n"
@@ -363,6 +390,7 @@ async def sentry_hook(request: Request):
 async def startup():
     store.init()
     store.init_sessions()
+    store.init_settings()
     asyncio.create_task(tg.poll_updates(_on_callback, _on_text))
     logger.info("sentinel arriba — auto_investigate=%s base=%s",
                 config.AUTO_INVESTIGATE, config.PR_BASE_BRANCH)

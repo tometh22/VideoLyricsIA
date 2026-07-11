@@ -97,5 +97,9 @@ Respuesta en texto claro y conciso (es para leer EN EL TELÉFONO): resultado
 primero, evidencia después, máximo ~2500 caracteres. Sin JSON."""
 
 
-def task_prompt(instruction: str, base: str) -> str:
-    return TASK.format(instruction=instruction, guardrails=GUARDRAILS.format(base=base))
+def task_prompt(instruction: str, base: str, deep: bool = False) -> str:
+    extra = ("\n\n## Modo profundo\nEsta es una auditoría grande: LANZÁ SUBAGENTES "
+             "en paralelo (tool Task) para cubrir más terreno — uno por área/dimensión "
+             "— y sintetizá vos los hallazgos en la respuesta final." if deep else "")
+    return TASK.format(instruction=instruction + extra,
+                       guardrails=GUARDRAILS.format(base=base))

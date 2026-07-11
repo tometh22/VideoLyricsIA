@@ -136,3 +136,37 @@ def test_railway_logs_disabled_gracefully(monkeypatch):
     import railway_logs
     monkeypatch.setattr(railway_logs, "_TOKEN", "")
     assert not railway_logs.enabled()
+
+
+# ─── v1.2: modelo cambiable + deep tasks ─────────────────────────────────────
+
+def test_model_override_precedence():
+    import models
+    store.init_settings()
+    # alias → id
+    assert models.resolve("opus") == "claude-opus-4-8"
+    assert models.resolve("haiku") == "claude-haiku-4-5-20251001"
+    # id desconocido pasa tal cual (el CLI valida)
+    assert models.resolve("claude-x-99") == "claude-x-99"
+    # override del store gana al env default
+    models.set_model("sonnet")
+    assert models.current("claude-opus-4-8") == "claude-sonnet-5"
+    # sin override, cae al env default
+    store.set_setting("claude_model", "")
+    assert models.current("claude-opus-4-8") in ("claude-opus-4-8", "")
+
+
+def test_deep_task_prompt_asks_for_subagents():
+    import prompts
+    p = prompts.task_prompt("auditá todo el pipeline", "staging", deep=True)
+    assert "SUBAGENTES" in p and "Task" in p
+    shallow = prompts.task_prompt("mirá esto", "staging", deep=False)
+    assert "SUBAGENTES" not in shallow
+
+
+def test_run_task_deep_enables_task_tool():
+    import inspect, agent
+    src = inspect.getsource(agent.run_task)
+    # deep=True agrega el spawner de subagentes y sube max_turns
+    assert '",Task"' in src or '+= ",Task"' in src
+    assert "max_turns=200 if deep" in src
