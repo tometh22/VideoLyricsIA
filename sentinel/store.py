@@ -133,3 +133,29 @@ def incident_for_tg_message(message_id: int) -> int | None:
             "SELECT incident_id FROM tg_messages WHERE message_id=?", (message_id,)
         ).fetchone()
     return row["incident_id"] if row else None
+
+
+# ─── Sesiones de conversación (/task continuable) — v1.1 ────────────────────
+
+def init_sessions():
+    with _db() as db:
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS tg_sessions (
+          message_id INTEGER PRIMARY KEY,
+          session_id TEXT NOT NULL
+        );""")
+
+
+def map_tg_session(message_id: int, session_id: str):
+    if not (message_id and session_id):
+        return
+    with _db() as db:
+        db.execute("INSERT OR REPLACE INTO tg_sessions (message_id, session_id) VALUES (?,?)",
+                   (message_id, session_id))
+
+
+def session_for_tg_message(message_id: int) -> str | None:
+    with _db() as db:
+        row = db.execute("SELECT session_id FROM tg_sessions WHERE message_id=?",
+                         (message_id,)).fetchone()
+    return row["session_id"] if row else None
