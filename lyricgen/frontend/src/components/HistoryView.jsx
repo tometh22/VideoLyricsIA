@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect, useRef, memo } from "react";
 import { useNavigate } from "react-router-dom";
 import { useI18n } from "../i18n";
-import { useLazyMediaUrl } from "../mediaUrl";
+import { useLazyMediaUrl, useMediaUrl } from "../mediaUrl";
 // Reusing the hero dropzone styles from the Dashboard's empty state so the
 // app feels consistent when you land on an empty page (Inicio vs Historial).
 import "./DashboardRich/DashboardRich.css";
@@ -172,7 +172,7 @@ function FilterPill({ active, count, onClick, children }) {
 function StatusBadge({ status, t }) {
   const map = {
     done:               { label: t("history.done"),                       cls: "bg-accent/15 text-accent ring-1 ring-accent/30" },
-    pending_review:     { label: t("batch.pending_review") || "Pending",  cls: "bg-amber-500/15 text-amber-300 ring-1 ring-amber-500/30" },
+    pending_review:     { label: t("batch.pending_review") || "Pendiente de revisión",  cls: "bg-amber-500/15 text-amber-300 ring-1 ring-amber-500/30" },
     processing:         { label: t("history.processing"),                 cls: "bg-brand/15 text-brand-light ring-1 ring-brand/30" },
     queued:             { label: "En cola",                                cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06]" },
     // Borrador transcripto que aún no se generó (o subida en curso). NO es
@@ -204,8 +204,8 @@ function StatusBadge({ status, t }) {
     // Should NOT appear in the user's history normally (filter elsewhere),
     // but if one does, label honestly instead of falling through to
     // "Procesando".
-    bg_preview_queued:  { label: "Pre-render BG",                          cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06]" },
-    bg_preview_failed:  { label: "Pre-render falló",                       cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
+    bg_preview_queued:  { label: "Fondo en preparación",                   cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06]" },
+    bg_preview_failed:  { label: "Falló la preparación del fondo",         cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
   };
   // Honest fallback: instead of pretending an unknown status is
   // "Procesando", show the raw value in muted gray so the operator
@@ -554,7 +554,7 @@ function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) 
 
   return (
     <div
-      className="group relative flex items-center gap-4 py-3 px-3 rounded-xl hover:bg-surface-2/50 transition-colors cursor-pointer ring-1 ring-transparent hover:ring-white/[0.06]"
+      className="history-media-row group relative"
       onClick={handleRowClick}
       role="button"
     >
@@ -584,14 +584,14 @@ function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) 
       <MediaThumbnail jobId={job.job_id} status={job.status} editCount={job.edit_count || 0} />
 
       {/* Texto central — 2 líneas generosas */}
-      <div className="flex-1 min-w-0 flex flex-col justify-center gap-0.5">
+      <div className="history-media-row__title">
         <p className="text-[15px] font-semibold text-white truncate leading-tight" title={artistName}>
           {artistName || <span className="text-gray-600 font-normal">—</span>}
         </p>
         <p className="text-[13px] text-ink-secondary truncate leading-tight" title={songName}>
           {songName || <span className="text-gray-600">(sin nombre)</span>}
         </p>
-        <div className="flex items-center gap-2 mt-1">
+        <div className="history-media-row__mobile-meta">
           <StatusDot status={job.status} />
           <StatusBadge status={job.status} t={t} />
           <span
@@ -603,9 +603,18 @@ function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) 
         </div>
       </div>
 
+      <div className="history-media-row__status">
+        <StatusDot status={job.status} />
+        <StatusBadge status={job.status} t={t} />
+      </div>
+
+      <time className="history-media-row__date" title={absoluteTimeAR(job.created_at)}>
+        {timeAgo(job.created_at)}
+      </time>
+
       {/* Action button derecha — contextual según status */}
       <div
-        className="shrink-0 flex items-center justify-end"
+        className="history-media-row__action"
         onClick={(e) => e.stopPropagation()}
       >
         {isPending ? (
@@ -678,6 +687,30 @@ const FILTERS = [
   { id: "failed",  label: "Fallidos",  match: (j) => j.status === "error" || j.status === "validation_failed" || j.status === "transcription_failed" || j.status === "rejected" },
 ];
 
+function HistoryInspector({ job, onClose, onOpen, t }) {
+  const thumbSrc = useMediaUrl(job?.job_id || "", "thumbnail", "preview");
+  if (!job) return null;
+  const title = job.song_title || (job.filename || "").replace(/\.(mp3|wav)$/i, "") || "Sin nombre";
+  return (
+    <aside className="history-inspector" aria-label="Detalle del video">
+      <div className="history-inspector__header">
+        <div><p className="section-eyebrow">Detalle</p><h2>{title}</h2></div>
+        <button type="button" onClick={onClose} aria-label="Cerrar detalle">×</button>
+      </div>
+      <div className="history-inspector__preview">
+        {thumbSrc ? <img src={thumbSrc} alt="" /> : <div><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M8 5v14l11-7z"/></svg></div>}
+      </div>
+      <dl>
+        <div><dt>Artista</dt><dd>{job.artist || "—"}</dd></div>
+        <div><dt>Formato</dt><dd>{job.delivery_profile === "umg" || job.prores_ready ? "Archivo maestro ProRes" : "MP4 1080p"}</dd></div>
+        <div><dt>Estado</dt><dd><StatusBadge status={job.status} t={t} /></dd></div>
+        <div><dt>ID</dt><dd className="font-mono">{job.job_id}</dd></div>
+      </dl>
+      <button type="button" onClick={() => onOpen(job.job_id)} className="btn-primary w-full !h-11">Abrir detalle</button>
+    </aside>
+  );
+}
+
 export default function HistoryView({
   history,
   historyError = false,
@@ -694,6 +727,7 @@ export default function HistoryView({
   // Archivado Fase 1: ver intentos fallidos archivados (default oculto).
   const [showArchived, setShowArchived] = useState(false);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [focusedId, setFocusedId] = useState(null);
   // 2026-05-25 PR-3 — Estado nuevo: search query (inline), sort key,
   // view toggle (table|grid). View y sort persisten en localStorage para
   // que el operador no tenga que re-configurarlos en cada sesión.
@@ -702,6 +736,15 @@ export default function HistoryView({
   const [view, setView] = useLocalStorage("genly_history_view", "table");
   const [sortMenuOpen, setSortMenuOpen] = useState(false);
   const sortMenuRef = useRef(null);
+
+  // The former card layout persisted in localStorage and could hide the
+  // redesigned operator table indefinitely. Migrate it once, while keeping
+  // the toggle available afterwards as an explicit user preference.
+  useEffect(() => {
+    if (localStorage.getItem("genly_history_layout_version") === "2") return;
+    setView("table");
+    localStorage.setItem("genly_history_layout_version", "2");
+  }, [setView]);
 
   // Click-outside cierra el sort menu
   useEffect(() => {
@@ -790,6 +833,8 @@ export default function HistoryView({
     }
     return sortJobs(filtered, sortKey);
   }, [realHistory, filter, query, sortKey]);
+  const focusedJob = useMemo(() => realHistory.find((job) => job.job_id === focusedId) || null, [realHistory, focusedId]);
+  const focusForInspector = (jobId) => setFocusedId(jobId);
 
   // Buckets temporales — solo para vista tabla con date groups.
   // En grid mantenemos lista plana para no quebrar el flow visual.
@@ -1003,7 +1048,7 @@ export default function HistoryView({
       )}
 
       {/* ─── Bulk action bar — appears when ≥1 deletable rows exist ── */}
-      {visibleDeletableIds.length > 0 && (
+      {selectedCount > 0 && (
         <div className="flex items-center justify-between gap-3 mb-4 px-3 py-2 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04]">
           <div className="flex items-center gap-3 min-w-0">
             <button
@@ -1169,20 +1214,28 @@ export default function HistoryView({
         )
       ) : view === "table" ? (
         /* TABLA DENSA con sticky date group headers (PR-3 2026-05-25) */
-        <div className="space-y-2">
+        <div className={`history-results ${focusedJob ? "has-inspector" : ""}`}>
+        <div className="min-w-0 history-table">
+          <div className="history-table__head" aria-hidden="true">
+            <span>Video</span>
+            <span>Artista y canción</span>
+            <span>Estado</span>
+            <span>Creado</span>
+            <span />
+          </div>
           {buckets.map((bucket) => (
             <div key={bucket.key}>
-              <div className="sticky top-0 z-10 -mx-1 px-1 py-2 bg-surface/95 backdrop-blur-sm">
+              <div className="history-table__bucket-head">
                 <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
                   {bucket.label} <span className="text-gray-600 font-mono tabular-nums normal-case">· {bucket.jobs.length}</span>
                 </p>
               </div>
-              <div className="space-y-1">
+              <div className="history-table__body">
                 {bucket.jobs.map((job) => (
                   <MediaRow
                     key={job.job_id}
                     job={job}
-                    onSelect={onSelect}
+                    onSelect={focusForInspector}
                     onDelete={onDelete}
                     selected={selectedIds.has(job.job_id)}
                     onToggleSelect={toggleSelect}
@@ -1192,6 +1245,8 @@ export default function HistoryView({
               </div>
             </div>
           ))}
+        </div>
+        {focusedJob && <HistoryInspector job={focusedJob} onClose={() => setFocusedId(null)} onOpen={onSelect} t={t} />}
         </div>
       ) : (
         /* VISTA GRID original con date group headers */

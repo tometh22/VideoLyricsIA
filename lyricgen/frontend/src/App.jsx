@@ -12,6 +12,7 @@ import LoginPage from "./components/LoginPage";
 import Sidebar from "./components/Sidebar";
 import Dashboard from "./components/Dashboard";
 import SearchPalette from "./components/SearchPalette";
+import GlobalTopbar from "./components/GlobalTopbar";
 import UploadZone from "./components/UploadZone";
 import TitleCardPreview from "./components/TitleCardPreview";
 // 2026-05-27 Phase-2 audit: LyricsEditor (~85 KB), AdminPanel (~50 KB)
@@ -37,10 +38,8 @@ const HistoryView = lazy(() => import("./components/HistoryView"));
 import BatchProgress from "./components/BatchProgress";
 import TranscribingProgress from "./components/TranscribingProgress";
 import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
-import WhatsNewBell from "./components/WhatsNew/WhatsNewBell";
 import GiftCreditsBanner from "./components/GiftCreditsBanner";
 import { useAlert } from "./components/AlertProvider";
-import HelpButton from "./components/HelpCenter/HelpButton";
 import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
 import { translateBackendError } from "./lib/lyricsEditSubmit";
@@ -420,7 +419,7 @@ function UpgradeNudge({ user }) {
   );
 }
 
-function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
+function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpenSearch }) {
   const { t } = useI18n();
   const navigate = useNavigate();
   const { pathname } = useLocation();
@@ -476,51 +475,23 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
         />
       )}
 
-      <div className={`flex-1 min-h-screen transition-all duration-300 ${sidebarOpen ? "md:ml-60" : "md:ml-0"}`}>
-        {/* Top bar */}
-        <header className="sticky top-0 z-30 flex h-14 items-center justify-between px-4 md:px-6 border-b border-white/[0.055] bg-[#0b0b12]" style={{boxShadow: '0 1px 10px rgba(0,0,0,0.18)'}}>
-          <div className="flex items-center gap-3">
-            <button
-              onClick={() => setSidebarOpen(!sidebarOpen)}
-              className={`mr-2 text-gray-400 hover:text-white transition-colors ${sidebarOpen ? "md:hidden" : ""}`}
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
-            </button>
-          </div>
-          <div className="flex items-center gap-3">
-            <WhatsNewBell />
-            <HelpButton />
-            {/* El avatar + nombre vive en UN solo lugar: el bloque de perfil
-                del sidebar (patrón Slack/Linear). El topbar queda para
-                acciones contextuales (ayuda + logout), sin duplicar la
-                identidad. */}
-            {/* Topbar logout (audit F P0-4 2026-05-27): always reachable, even
-                when the sidebar is collapsed on mobile or when `user` is null
-                in a transient half-state. The sidebar already has a logout
-                inside its `{user && ...}` block; this one is a defense-in-
-                depth fallback so the operator is never locked in.
-                Icon mirrors Sidebar.jsx:159-161 for visual consistency. */}
-            {onLogout && (
-              <button
-                onClick={onLogout}
-                title={t("nav.logout") || "Cerrar sesión"}
-                aria-label={t("nav.logout") || "Cerrar sesión"}
-                className="text-gray-500 hover:text-red-400 transition-colors p-1.5 rounded-lg hover:bg-white/[0.04]"
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">
-                  <path d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" strokeLinecap="round" strokeLinejoin="round"/>
-                </svg>
-              </button>
-            )}
-          </div>
-        </header>
+      <div className={`flex-1 min-h-screen transition-all duration-300 ${sidebarOpen ? "md:ml-60" : "md:ml-[72px]"}`}>
+        <GlobalTopbar
+          user={user}
+          activeRenders={(history || []).filter((job) => ["processing", "queued", "editing", "transcribing", "transcribing_queued"].includes(job.status)).length}
+          onSearch={onOpenSearch}
+          onCreate={() => handleNav("new")}
+          onLogout={onLogout}
+          onToggleNavigation={() => setSidebarOpen(!sidebarOpen)}
+          navigationOpen={sidebarOpen}
+        />
 
         {/* Dunning banner — sits above content, below the top bar */}
         <PastDueBanner user={user} />
         <UpgradeNudge user={user} />
 
         {/* Content */}
-        <main className="relative z-10 px-4 md:px-6 pt-5 pb-20">
+        <main className="relative z-10 px-4 md:px-8 pt-6 pb-24">
           <GiftCreditsBanner user={user} />
           <Outlet />
         </main>
@@ -4104,9 +4075,11 @@ export default function App() {
             <RequireAuth token={token}>
               <AppShell
                 user={user}
+                history={history}
                 sidebarOpen={sidebarOpen}
                 setSidebarOpen={setSidebarOpen}
                 onLogout={handleLogout}
+                onOpenSearch={() => setSearchOpen(true)}
               />
             </RequireAuth>
           }
@@ -4119,7 +4092,6 @@ export default function App() {
               historyLoaded={historyLoaded}
               onRetryHistory={fetchHistory}
               onSelectJob={handleSelectJob}
-              onOpenSearch={() => setSearchOpen(true)}
               onNewBatch={() => {
                 // Guard the "Nuevo batch" CTA — clicking it while a
                 // batch is in progress used to silently wipe everything

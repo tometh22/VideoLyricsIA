@@ -34,6 +34,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
   const [loading, setLoading] = useState(false);
   const [retryMsg, setRetryMsg] = useState("");
   const [message, setMessage] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
 
   const handleLogin = async (e) => {
     e.preventDefault();
@@ -153,7 +154,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
   };
 
   return (
-    <div className="min-h-screen bg-surface flex items-center justify-center relative overflow-hidden">
+    <div className="auth-layout min-h-screen bg-surface relative overflow-hidden">
       <div className="fixed inset-0 pointer-events-none">
         <div className="absolute top-[-20%] left-[10%] w-[700px] h-[700px] bg-brand/[0.05] rounded-full blur-[150px]" />
         <div className="absolute bottom-[-10%] right-[5%] w-[500px] h-[500px] bg-brand-light/[0.04] rounded-full blur-[120px]" />
@@ -184,16 +185,27 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
         </div>
       </div>
 
-      <div className="relative z-10 w-full max-w-sm mx-4 sm:mx-auto animate-fade-in">
+      <section className="auth-brand-panel">
+        <div className="auth-brand-content">
+          <BrandLockup size="lg" priority />
+          <p>{t("login.platform")}</p>
+          <div className="auth-video-preview" aria-hidden="true">
+            <video autoPlay muted loop playsInline src="/samples/ex1.mp4" />
+          </div>
+        </div>
+      </section>
+
+      <section className="auth-form-panel">
+      <div className="relative z-10 w-full max-w-[440px] animate-fade-in">
         {/* Logo — full lockup per brand kit §10 (auth screens use the
             full lockup, not the mark only). */}
-        <div className="text-center mb-7">
+        <div className="auth-mobile-logo text-center mb-7">
           <BrandLockup size="lg" className="mx-auto mb-3" />
           <p className="text-xs text-ink-secondary">{t("login.platform")}</p>
         </div>
 
         {/* Card */}
-        <div className="glass rounded-2xl p-6">
+        <div className="auth-card">
           {/* Login */}
           {mode === "login" && (
             <>
@@ -208,9 +220,12 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
                 </div>
                 <div>
                   <label className="block text-xs text-gray-400 mb-1.5 ml-1">{t("login.password")}</label>
-                  <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
-                    className="input-field" placeholder={t("login.password_placeholder")}
-                    autoComplete="current-password" />
+                  <div className="relative">
+                    <input type={showPassword ? "text" : "password"} value={password} onChange={(e) => setPassword(e.target.value)}
+                      className="input-field pr-16" placeholder={t("login.password_placeholder")}
+                      autoComplete="current-password" />
+                    <button type="button" onClick={() => setShowPassword((value) => !value)} className="absolute inset-y-0 right-3 text-[11px] font-bold text-gray-500 hover:text-white" aria-label={showPassword ? "Ocultar contraseña" : "Mostrar contraseña"}>{showPassword ? "Ocultar" : "Ver"}</button>
+                  </div>
                 </div>
                 {error && (
                   <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3">
@@ -400,6 +415,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
 
         <p className="text-center text-[11px] text-gray-600 mt-8">{t("login.footer")}</p>
       </div>
+      </section>
     </div>
   );
 }

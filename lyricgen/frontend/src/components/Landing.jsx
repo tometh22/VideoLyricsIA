@@ -6,6 +6,7 @@ const API = import.meta.env.VITE_API_URL || "";
 
 export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
   const { t, lang, setLang } = useI18n();
+  const [menuOpen, setMenuOpen] = useState(false);
 
   // Lead form → POST /api/leads. Falls back to a prefilled mailto if the API fails.
   const [formState, setFormState] = useState("idle"); // idle | loading | sent | error
@@ -100,7 +101,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
   ];
 
   return (
-    <div className="min-h-screen bg-surface relative overflow-hidden">
+    <div className="min-h-screen bg-surface relative overflow-hidden creative-marketing">
       <div className="fixed inset-0 pointer-events-none">
         <div className="absolute top-[-20%] left-[10%] w-[700px] h-[700px] bg-brand/[0.05] rounded-full blur-[150px]" />
         <div className="absolute bottom-[-10%] right-[5%] w-[500px] h-[500px] bg-brand-light/[0.04] rounded-full blur-[120px]" />
@@ -109,7 +110,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
 
       {/* Sticky Nav */}
       <nav className="sticky top-0 z-30 bg-surface/80 backdrop-blur-xl border-b border-white/[0.04]">
-        <div className="flex items-center justify-between px-8 py-4 max-w-6xl mx-auto">
+        <div className="flex h-[72px] items-center justify-between px-6 max-w-[1240px] mx-auto">
           {/* §10 — full lockup in navbar / footer / auth screens.
               Brand SVG geometry is the single source of truth. */}
           <BrandLockup size="md" />
@@ -143,24 +144,36 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
               </div>
             )}
           </div>
-          <button onClick={isLoggedIn ? onStart : onLogin} className="md:hidden btn-primary text-xs py-2 px-5">{t("nav.start")}</button>
+          <button onClick={() => setMenuOpen((value) => !value)} className="md:hidden flex h-11 w-11 items-center justify-center rounded-xl text-gray-300 hover:bg-white/[0.06]" aria-expanded={menuOpen} aria-label="Abrir menú">
+            <svg className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d={menuOpen ? "M6 6l12 12M18 6L6 18" : "M4 6h16M4 12h16M4 18h16"}/></svg>
+          </button>
         </div>
+        {menuOpen && (
+          <div className="md:hidden grid gap-2 border-t border-white/[0.05] bg-surface-1 px-5 pb-5 pt-3">
+            <a href="#features" onClick={() => setMenuOpen(false)} className="flex min-h-11 items-center rounded-xl px-3 text-sm text-gray-300">{t("landing.features")}</a>
+            <a href="#pricing" onClick={() => setMenuOpen(false)} className="flex min-h-11 items-center rounded-xl px-3 text-sm text-gray-300">{t("landing.pricing")}</a>
+            <a href="#faq" onClick={() => setMenuOpen(false)} className="flex min-h-11 items-center rounded-xl px-3 text-sm text-gray-300">FAQ</a>
+            <div className="flex gap-2">{["es", "en", "pt"].map((code) => <button key={code} onClick={() => setLang(code)} className={`h-11 min-w-11 rounded-xl text-xs font-bold uppercase ${lang === code ? "bg-white/10 text-white" : "text-gray-500"}`}>{code}</button>)}</div>
+            <button onClick={isLoggedIn ? onStart : onLogin} className="btn-primary w-full">{isLoggedIn ? t("nav.dashboard") : t("nav.start")}</button>
+          </div>
+        )}
       </nav>
 
       {/* Hero */}
-      <section className="relative z-10 pt-16 pb-8 px-6 max-w-6xl mx-auto">
-        <div className="text-center max-w-4xl mx-auto">
+      <section className="relative z-10 pt-20 pb-10 px-6 max-w-[1240px] mx-auto">
+        <div className="grid grid-cols-1 items-center gap-12 lg:grid-cols-12 lg:gap-16">
+          <div className="text-left lg:col-span-5">
           <div className="inline-block px-4 py-1.5 rounded-full glass text-xs text-gray-400 mb-6 animate-fade-in">
             {t("landing.badge")}
           </div>
-          <h1 className="text-5xl sm:text-6xl font-extrabold tracking-tight mb-6 leading-[1.05] animate-fade-in">
+          <h1 className="text-[42px] sm:text-[58px] lg:text-[64px] font-bold tracking-[-0.045em] mb-6 leading-[1.01] animate-fade-in">
             <span className="bg-gradient-to-r from-white via-white to-gray-300 bg-clip-text text-transparent">{t("landing.hero1")} </span>
             <span className="bg-gradient-to-r from-brand-light to-accent bg-clip-text text-transparent">{t("landing.hero2")}</span>
           </h1>
-          <p className="text-gray-400 text-lg max-w-2xl mx-auto leading-relaxed mb-7 animate-fade-in">
+          <p className="text-gray-400 text-lg max-w-xl leading-relaxed mb-7 animate-fade-in">
             {t("landing.hero_sub")}
           </p>
-          <div className="flex flex-col sm:flex-row gap-3 justify-center animate-fade-in">
+          <div className="flex flex-col sm:flex-row gap-3 animate-fade-in">
             <button onClick={onStart} className="btn-primary text-lg py-4 px-10">
               {t("landing.cta")}
               <svg className="inline-block ml-2 w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
@@ -170,10 +183,11 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
             </a>
           </div>
           <p className="text-xs text-gray-500 mt-5 animate-fade-in">{t("landing.hero_trust")}</p>
+          </div>
 
           {/* Showcase — real lyric video (already has its own lyrics) */}
-          <div className="relative mt-12 max-w-3xl mx-auto animate-slide-up">
-            <div className="glass rounded-3xl p-3 shadow-glow-lg">
+          <div className="relative animate-slide-up lg:col-span-7">
+            <div className="glass rounded-[24px] p-3 shadow-glow-lg">
               <div className="rounded-2xl overflow-hidden aspect-video relative bg-black">
                 <video autoPlay muted loop playsInline className="w-full h-full object-cover" src="/samples/ex1.mp4" />
                 <div className="absolute top-3 left-3 flex items-center gap-1.5 bg-black/55 backdrop-blur-sm rounded-full px-3 py-1.5">
@@ -186,7 +200,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         </div>
 
         {/* Stats */}
-        <div className="flex justify-center gap-16 mt-20 pt-12 border-t border-white/[0.04]">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-8 mt-20 pt-10 border-t border-white/[0.04]">
           {[
             { value: "< 5 min", label: t("landing.per_video") },
             { value: "3", label: t("landing.outputs") },
