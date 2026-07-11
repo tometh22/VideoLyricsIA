@@ -80,8 +80,13 @@ def _cleanup_worktree(path: str):
     shutil.rmtree(path, ignore_errors=True)
 
 
-def _claude(prompt: str, cwd: str, allowed_tools: str) -> dict:
-    """Corre `claude -p` headless y devuelve {'text': <último mensaje>, 'json': <dict|None>}."""
+def _claude(prompt: str, cwd: str, allowed_tools: str,
+            resume_session: str | None = None) -> dict:
+    """Corre `claude -p` headless. Devuelve {'text', 'json', 'session_id'}.
+
+    `resume_session`: retoma una sesión previa del CLI (conversación
+    continuada desde Telegram: el operador responde a un mensaje del agente
+    y el hilo sigue con TODO el contexto anterior)."""
     cmd = [
         "claude", "-p", prompt,
         "--output-format", "json",
@@ -89,6 +94,8 @@ def _claude(prompt: str, cwd: str, allowed_tools: str) -> dict:
         "--allowedTools", allowed_tools,
         "--permission-mode", "acceptEdits",
     ]
+    if resume_session:
+        cmd += ["--resume", resume_session]
     if config.CLAUDE_MODEL:
         cmd += ["--model", config.CLAUDE_MODEL]
     env = {
@@ -101,9 +108,11 @@ def _claude(prompt: str, cwd: str, allowed_tools: str) -> dict:
     r = _run(cmd, cwd=cwd, timeout=config.AGENT_TIMEOUT_SECONDS, env=env)
     if r.returncode != 0 and not r.stdout.strip():
         raise RuntimeError(f"claude CLI falló (rc={r.returncode}): {r.stderr[-600:]}")
+    session_id = None
     try:
         out = json.loads(r.stdout)
         text = out.get("result") or ""
+        session_id = out.get("session_id")
     except (json.JSONDecodeError, AttributeError):
         text = r.stdout
     # El prompt pide que el último mensaje sea SOLO un JSON — lo extraemos
@@ -115,7 +124,7 @@ def _claude(prompt: str, cwd: str, allowed_tools: str) -> dict:
             parsed = json.loads(m.group(0))
         except json.JSONDecodeError:
             parsed = None
-    return {"text": text, "json": parsed}
+    return {"text": text, "json": parsed, "session_id": session_id}
 
 
 async def investigate(incident: dict, alert_context: str) -> dict:
@@ -171,4 +180,52 @@ async def implement(incident: dict) -> dict:
             )
         finally:
             _cleanup_worktree(wt)
+    return await asyncio.to_thread(_sync)
+
+
+# ---------------------------------------------------------------------------
+# Tareas ad-hoc desde el chat (/task) — v1.1
+# ---------------------------------------------------------------------------
+
+_TASKSPACE = None  # worktree persistente para tareas (las sesiones retomadas
+                   # necesitan el mismo cwd; se refresca a origin/main por tarea)
+
+
+def _ensure_taskspace() -> str:
+    global _TASKSPACE
+    path = os.path.join(config.WORKDIR, "wt", "taskspace")
+    if _TASKSPACE and os.path.isdir(path):
+        _run(["git", "fetch", "origin", "main", config.PR_BASE_BRANCH],
+             cwd=path, timeout=300)
+        _run(["git", "reset", "--hard", "origin/main"], cwd=path, timeout=60)
+        return path
+    ensure_repo()
+    shutil.rmtree(path, ignore_errors=True)
+    _run(["git", "worktree", "prune"], cwd=REPO_DIR, timeout=60)
+    r = _run(["git", "worktree", "add", "--force", "--detach", path, "origin/main"],
+             cwd=REPO_DIR, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f"taskspace falló: {r.stderr[-300:]}")
+    _TASKSPACE = path
+    return path
+
+
+async def run_task(instruction: str, resume_session: str | None = None) -> dict:
+    """Tarea libre del operador (auditar, revisar, investigar, testear algo
+    puntual) — SOLO lectura sobre el código, con conversación continuable
+    (resume_session). Nunca edita ni pushea: para eso está el flujo de
+    incidentes con aprobación explícita."""
+    def _sync():
+        ws = _ensure_taskspace()
+        return _claude(
+            prompts.task_prompt(instruction, config.PR_BASE_BRANCH)
+            if not resume_session else instruction,
+            cwd=ws,
+            allowed_tools=(
+                "Read,Grep,Glob,"
+                "Bash(git log:*),Bash(git show:*),Bash(git grep:*),Bash(git diff:*),"
+                "Bash(ls:*),Bash(cat:*),Bash(python3 -c:*),Bash(gh pr view:*),Bash(gh pr diff:*)"
+            ),
+            resume_session=resume_session,
+        )
     return await asyncio.to_thread(_sync)
