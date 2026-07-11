@@ -13,21 +13,38 @@ import httpx
 logger = logging.getLogger("sentinel.railway")
 
 _GQL = "https://backboard.railway.com/graphql/v2"
-_TOKEN = os.environ.get("RAILWAY_PROJECT_TOKEN", "")
+# Dos formas de auth (Railway bloquea la creación de project tokens por API,
+# así que soportamos ambas):
+#  - RAILWAY_PROJECT_TOKEN → header Project-Access-Token (scoped al proyecto; el
+#    más seguro, se crea a mano en Project Settings → Tokens).
+#  - RAILWAY_API_TOKEN → header Authorization: Bearer (token de cuenta/personal;
+#    funciona ya, pero alcanza TODOS los proyectos — reemplazar por el scoped
+#    cuando se pueda).
+_PROJECT_TOKEN = os.environ.get("RAILWAY_PROJECT_TOKEN", "")
+_API_TOKEN = os.environ.get("RAILWAY_API_TOKEN", "")
 _PROJECT = os.environ.get("RAILWAY_PROJECT_ID", "")
 _ENV = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
 
-DISABLED_MSG = "(logs de Railway no configurados — falta RAILWAY_PROJECT_TOKEN)"
+DISABLED_MSG = ("(logs de Railway no configurados — falta RAILWAY_PROJECT_TOKEN "
+                "o RAILWAY_API_TOKEN + RAILWAY_PROJECT_ID/ENVIRONMENT_ID)")
+
+
+def _auth_headers() -> dict:
+    if _PROJECT_TOKEN:
+        return {"Project-Access-Token": _PROJECT_TOKEN}
+    if _API_TOKEN:
+        return {"Authorization": f"Bearer {_API_TOKEN}"}
+    return {}
 
 
 def enabled() -> bool:
-    return bool(_TOKEN and _PROJECT and _ENV)
+    return bool((_PROJECT_TOKEN or _API_TOKEN) and _PROJECT and _ENV)
 
 
 async def _gql(query: str, variables: dict | None = None) -> dict:
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.post(_GQL, json={"query": query, "variables": variables or {}},
-                         headers={"Project-Access-Token": _TOKEN})
+                         headers=_auth_headers())
     return r.json()
 
 

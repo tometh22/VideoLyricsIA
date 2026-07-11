@@ -134,7 +134,8 @@ def test_task_prompt_is_read_only_and_phone_sized():
 
 def test_railway_logs_disabled_gracefully(monkeypatch):
     import railway_logs
-    monkeypatch.setattr(railway_logs, "_TOKEN", "")
+    monkeypatch.setattr(railway_logs, "_PROJECT_TOKEN", "")
+    monkeypatch.setattr(railway_logs, "_API_TOKEN", "")
     assert not railway_logs.enabled()
 
 
@@ -195,3 +196,17 @@ def test_investigate_can_query_github():
     assert "gh pr list:*" in src and "gh issue list:*" in src
     # investigación es read-only: sin herramientas de escritura
     assert "Bash(gh pr create" not in src and "Bash(git push" not in src
+
+def test_railway_logs_supports_bearer_api_token(monkeypatch):
+    import importlib, railway_logs
+    monkeypatch.setenv("RAILWAY_PROJECT_TOKEN", "")
+    monkeypatch.setenv("RAILWAY_API_TOKEN", "acct-xyz")
+    monkeypatch.setenv("RAILWAY_PROJECT_ID", "p")
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT_ID", "e")
+    importlib.reload(railway_logs)
+    assert railway_logs.enabled()
+    assert railway_logs._auth_headers() == {"Authorization": "Bearer acct-xyz"}
+    # el project token tiene precedencia si ambos están
+    monkeypatch.setenv("RAILWAY_PROJECT_TOKEN", "proj-abc")
+    importlib.reload(railway_logs)
+    assert railway_logs._auth_headers() == {"Project-Access-Token": "proj-abc"}
