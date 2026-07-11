@@ -9,15 +9,37 @@ export default function GlobalTopbar({ user, activeRenders = 0, onSearch, onCrea
   const navigate = useNavigate();
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef(null);
+  const menuPanelRef = useRef(null);
+  const menuTriggerRef = useRef(null);
 
   useEffect(() => {
     if (!menuOpen) return undefined;
     const close = (event) => { if (!menuRef.current?.contains(event.target)) setMenuOpen(false); };
-    const escape = (event) => { if (event.key === "Escape") setMenuOpen(false); };
+    const escape = (event) => {
+      if (event.key === "Escape") {
+        setMenuOpen(false);
+        menuTriggerRef.current?.focus();
+      }
+    };
     document.addEventListener("mousedown", close);
     document.addEventListener("keydown", escape);
     return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", escape); };
   }, [menuOpen]);
+
+  useEffect(() => {
+    if (menuOpen) requestAnimationFrame(() => menuPanelRef.current?.querySelector('[role="menuitem"]')?.focus());
+  }, [menuOpen]);
+
+  const handleMenuKeyDown = (event) => {
+    const items = [...(menuPanelRef.current?.querySelectorAll('[role="menuitem"]') || [])];
+    if (!items.length) return;
+    const current = items.indexOf(document.activeElement);
+    if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) event.preventDefault();
+    if (event.key === "ArrowDown") items[(current + 1 + items.length) % items.length]?.focus();
+    if (event.key === "ArrowUp") items[(current - 1 + items.length) % items.length]?.focus();
+    if (event.key === "Home") items[0]?.focus();
+    if (event.key === "End") items[items.length - 1]?.focus();
+  };
 
   const go = (path) => { setMenuOpen(false); navigate(path); };
 
@@ -47,16 +69,16 @@ export default function GlobalTopbar({ user, activeRenders = 0, onSearch, onCrea
         </button>
 
         <div className="relative" ref={menuRef}>
-          <button type="button" onClick={() => setMenuOpen((value) => !value)} className="user-menu-trigger" aria-haspopup="menu" aria-expanded={menuOpen}>
+          <button ref={menuTriggerRef} type="button" onClick={() => setMenuOpen((value) => !value)} className="user-menu-trigger" aria-haspopup="menu" aria-expanded={menuOpen} aria-label="Abrir menú de usuario">
             <span>{user?.full_name?.charAt(0) || user?.username?.charAt(0) || "G"}</span>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M6 9l6 6 6-6"/></svg>
           </button>
           {menuOpen && (
-            <div className="user-menu" role="menu">
+            <div ref={menuPanelRef} className="user-menu" role="menu" onKeyDown={handleMenuKeyDown}>
               <div className="user-menu__identity"><strong>{user?.full_name || user?.username}</strong><small>{user?.email || `Plan ${user?.plan || "free"}`}</small></div>
               <button role="menuitem" onClick={() => go("/account")}>{t("nav.settings") || "Configuración"}</button>
               {user?.role === "admin" && <button role="menuitem" onClick={() => go("/admin")}>Admin</button>}
-              <div className="user-menu__languages" aria-label="Idioma">{["es", "en", "pt"].map((code) => <button key={code} onClick={() => setLang(code)} className={lang === code ? "is-active" : ""}>{code.toUpperCase()}</button>)}</div>
+              <div className="user-menu__languages" aria-label="Idioma">{["es", "en", "pt"].map((code) => <button role="menuitem" key={code} onClick={() => setLang(code)} className={lang === code ? "is-active" : ""}>{code.toUpperCase()}</button>)}</div>
               <button role="menuitem" onClick={onLogout} className="is-danger">{t("nav.logout") || "Cerrar sesión"}</button>
             </div>
           )}

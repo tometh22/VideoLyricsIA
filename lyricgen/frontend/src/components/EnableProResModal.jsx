@@ -88,8 +88,11 @@ export default function EnableProResModal({ jobId, onClose, onSuccess }) {
       <div
         className="w-full max-w-md mx-4 bg-surface-1 ring-1 ring-white/[0.08] rounded-2xl p-6 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="enable-prores-title"
       >
-        <h3 className="text-lg font-semibold text-white mb-1">
+        <h3 id="enable-prores-title" className="text-lg font-semibold text-white mb-1">
           {t("prores.enable_title") || "Exportar a ProRes"}
         </h3>
         <p className="text-xs text-gray-400 mb-5">

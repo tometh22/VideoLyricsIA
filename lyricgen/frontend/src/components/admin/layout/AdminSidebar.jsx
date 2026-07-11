@@ -84,7 +84,7 @@ export function defaultSubTab(sectionId) {
 export default function AdminSidebar({ section, subTab, onNavigate, badges = {}, showInsights = false }) {
   const items = NAV.filter((item) => item.id !== "insights" || showInsights);
   return (
-    <nav className="w-52 shrink-0 space-y-1">
+    <nav className="admin-subnav" aria-label="Secciones de administración">
       {items.map((item) => {
         const isActive = section === item.id;
         return (

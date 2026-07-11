@@ -8,6 +8,7 @@ import ProResBadge from "./ProResBadge";
 import { SkeletonVideoCard } from "./Skeleton";
 import DashboardStepper from "./DashboardRich/Stepper";
 import FormatGallery from "./DashboardRich/FormatGallery";
+import MediaPreview from "./MediaPreview";
 import "./DashboardRich/DashboardRich.css";
 
 // sessionStorage key the wizard reads on mount to pre-apply a delivery
@@ -76,7 +77,6 @@ function ProcessingRow({ job, onSelect, t }) {
 }
 
 function VideoCard({ job, onSelect }) {
-  const [thumbFailed, setThumbFailed] = useState(false);
   const name = (job.filename || "").replace(/\.mp3$/i, "");
   const songName = name.includes(" - ") ? name.split(" - ").slice(1).join(" - ") : name;
   const artistName = job.artist || (name.includes(" - ") ? name.split(" - ")[0] : "");
@@ -89,25 +89,7 @@ function VideoCard({ job, onSelect }) {
       onClick={() => onSelect(job.job_id, job.status)}
       className="overflow-hidden rounded-xl text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all"
     >
-      <div className="aspect-video bg-surface-3/30 relative overflow-hidden">
-        <div className="absolute inset-0 dashboard-thumb-fallback" aria-hidden="true">
-          <div className="dashboard-thumb-fallback__art">
-            <span />
-            <span />
-            <span />
-            <span />
-            <span />
-          </div>
-          <small>{thumbFailed ? "Miniatura no disponible" : "Vista previa del video"}</small>
-        </div>
-        {thumbSrc && !thumbFailed && (
-          <img
-            src={thumbSrc}
-            alt={`Miniatura de ${songName || "video"}`}
-            className="relative z-[1] w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500"
-            onError={() => setThumbFailed(true)}
-          />
-        )}
+      <MediaPreview src={thumbSrc} status={job.status} alt={`Miniatura de ${songName || "video"}`} label="Vista previa del video" className="aspect-video" imageClassName="group-hover:scale-[1.04] transition-transform duration-500">
         <div className="absolute z-[2] inset-0 flex items-center justify-center opacity-30 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/30">
           <div className="w-10 h-10 rounded-full bg-white/15 backdrop-blur-md flex items-center justify-center ring-1 ring-white/20">
             <svg className="w-4 h-4 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
@@ -115,7 +97,7 @@ function VideoCard({ job, onSelect }) {
             </svg>
           </div>
         </div>
-      </div>
+      </MediaPreview>
       <div className="px-3.5 py-3">
         <div className="flex items-start gap-2 min-w-0">
           <p className="text-[13px] font-medium text-white truncate flex-1 min-w-0">{songName || "Sin nombre"}</p>

@@ -902,21 +902,21 @@ export default function Settings({ onBack }) {
       <div className="settings-layout">
       <nav className="settings-nav" aria-label="Secciones de configuración">
         {[
-          { id: "perfil",         label: "Perfil" },
-          { id: "cuenta",         label: t("settings.account") || "Cuenta" },
-          { id: "facturacion",    label: t("settings.billing") || "Facturación" },
+          { id: "perfil",         label: "Perfil", icon: "◉" },
+          { id: "cuenta",         label: t("settings.account") || "Cuenta", icon: "◇" },
+          { id: "facturacion",    label: t("settings.billing") || "Facturación", icon: "↗" },
           // Integraciones por ahora sólo contiene Drive — escondemos
           // toda la tab cuando el feature flag está off (canary mode).
           user?.features?.drive_export
-            ? { id: "integraciones", label: t("settings.integrations_tab") || "Integraciones" }
+            ? { id: "integraciones", label: t("settings.integrations_tab") || "Integraciones", icon: "⌁" }
             : null,
-          { id: "youtube",        label: "YouTube" },
-          { id: "dispositivos",   label: "Dispositivos" },
+          { id: "youtube",        label: "YouTube", icon: "▶" },
+          { id: "dispositivos",   label: "Dispositivos", icon: "▣" },
           // "Mi equipo" sólo si el workspace tiene >1 miembro.
-          showTeamTab ? { id: "equipo", label: "Mi equipo" } : null,
+          showTeamTab ? { id: "equipo", label: "Mi equipo", icon: "◎" } : null,
         ].filter(Boolean).map((s) => (
           <TabPill key={s.id} active={activeSection === s.id} onClick={() => setActiveSection(s.id)}>
-            {s.label}
+            <span className="settings-nav__icon" aria-hidden="true">{s.icon}</span>{s.label}
           </TabPill>
         ))}
       </nav>
