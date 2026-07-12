@@ -514,7 +514,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       }
       const res = await fetch(`${API}/retry/${job.job_id}`, fetchOpts);
       if (res.ok) {
-        const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
+        const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
+        if (!statusRes.ok) throw new Error(`Error ${statusRes.status}`);
+        const updated = await statusRes.json();
         onJobUpdate?.(updated);
         // Navigate back so the user sees the batch/history with the job now processing.
         onBack?.();
@@ -1332,7 +1334,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         body: JSON.stringify({ notes: reviewNotes }),
       });
       if (res.ok) {
-        const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
+        const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
+        if (!statusRes.ok) throw new Error(`Error ${statusRes.status}`);
+        const updated = await statusRes.json();
         onJobUpdate?.(updated);
       }
     } catch {}
@@ -1360,7 +1364,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         // intentionally can't be re-opened — better UX is to land the
         // user back on the dashboard / batch view.
         try {
-          const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
+          const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
+          if (!statusRes.ok) throw new Error(`Error ${statusRes.status}`);
+          const updated = await statusRes.json();
           onJobUpdate?.(updated);
         } catch {}
         onBack?.();

@@ -254,6 +254,7 @@ export default function Settings({ onBack }) {
 
   // Data export
   const [exportLoading, setExportLoading] = useState(false);
+  const [exportError, setExportError] = useState("");
 
   // API keys
   const [apiKeys, setApiKeys] = useState([]);
@@ -418,10 +419,14 @@ export default function Settings({ onBack }) {
   const handleYtDisconnect = async () => {
     setYtDisconnecting(true);
     try {
-      await fetch(`${API}/youtube/disconnect`, { method: "POST", headers: authHeaders() });
+      const res = await fetch(`${API}/youtube/disconnect`, { method: "POST", headers: authHeaders() });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
       checkYtStatus();
-    } catch {
-      setYtStatusError("Error al desconectar.");
+    } catch (err) {
+      setYtStatusError(err?.message || t("settings.youtube_disconnect_error"));
     } finally {
       setYtDisconnecting(false);
     }
@@ -591,8 +596,13 @@ export default function Settings({ onBack }) {
 
   const handleExportData = async () => {
     setExportLoading(true);
+    setExportError("");
     try {
       const res = await fetch(`${API}/auth/data-export`, { headers: authHeaders() });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Error ${res.status}`);
+      }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -600,7 +610,9 @@ export default function Settings({ onBack }) {
       a.download = "genly-data-export.json";
       a.click();
       URL.revokeObjectURL(url);
-    } catch {} finally {
+    } catch (err) {
+      setExportError(err?.message || t("settings.export_data_error"));
+    } finally {
       setExportLoading(false);
     }
   };
@@ -1194,6 +1206,7 @@ export default function Settings({ onBack }) {
                   {exportLoading ? "…" : (t("settings.export_data_btn") || "Exportar")}
                 </button>
               </div>
+              {exportError && <div className="mt-3"><InlineError message={exportError} /></div>}
 
               {/* Delete account */}
               <div className="pt-3">
