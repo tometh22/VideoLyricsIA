@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Falla con exit code 1 si encuentra keys t("foo.bar") en el código
-// que NO existen en los 3 idiomas (es/en/pt) de i18n.jsx.
+// Falla si una key usada no existe en los 3 idiomas o si un idioma
+// declara la misma key más de una vez.
 //
 // El bug que motivó esto: si una key no está en i18n, t() devuelve
 // la key como string (truthy), y el pattern `t("foo.bar") || "fallback"`
@@ -58,6 +58,25 @@ function keyPresence(key) {
   return LANGS.filter((l) => keyRe.test(langSections[l]));
 }
 
+function languageSection(lang) {
+  const start = i18nSource.indexOf(`  ${lang}: {`);
+  if (start < 0) return "";
+  const next = lang === "es" ? "\n  en: {" : lang === "en" ? "\n  pt: {" : "\n  },\n};";
+  const end = i18nSource.indexOf(next, start + 1);
+  return i18nSource.slice(start, end < 0 ? i18nSource.length : end);
+}
+
+const duplicates = [];
+for (const lang of LANGS) {
+  const counts = new Map();
+  for (const match of languageSection(lang).matchAll(/^\s+"([^"]+)"\s*:/gm)) {
+    counts.set(match[1], (counts.get(match[1]) || 0) + 1);
+  }
+  for (const [key, count] of counts) {
+    if (count > 1) duplicates.push({ lang, key, count });
+  }
+}
+
 // Extrae todas las keys "foo.bar" usadas como t("...") en src/
 // [,)] al final: cubre tanto t("key") como t("key", { vars }) — la
 // versión anterior exigía ")" pegado al string, así que TODA llamada
@@ -78,9 +97,8 @@ for (const f of walk(SRC)) {
 // Dos buckets:
 //   missingAll: la clave no existe en NINGÚN idioma. En prod cualquier
 //     usuario ve la key literal. Es el bug crítico → falla CI.
-//   missingSome: existe en al menos uno (típicamente es) pero no en
-//     todos. Solo afecta usuarios en idiomas sin la traducción. Es
-//     deuda técnica → warning, no falla CI.
+//   missingSome: existe en al menos uno pero no en todos. También falla CI:
+//     una interfaz multilingüe no puede aceptar cobertura parcial.
 const missingAll = [];
 const missingSome = [];
 for (const key of usedKeys) {
@@ -96,19 +114,27 @@ missingAll.sort();
 missingSome.sort((a, b) => a.key.localeCompare(b.key));
 
 if (missingSome.length > 0) {
-  console.warn(`⚠ i18n: ${missingSome.length} claves traducidas parcialmente (deuda, no bloquea):`);
+  console.error(`✗ i18n: ${missingSome.length} claves traducidas parcialmente:`);
   for (const { key, absent } of missingSome) {
-    console.warn(`    ${key}  (falta en: ${absent.join(", ")})`);
+    console.error(`    ${key}  (falta en: ${absent.join(", ")})`);
   }
-  console.warn("");
+  console.error("");
 }
 
-if (missingAll.length === 0) {
-  console.log(`✓ i18n: ${usedKeys.size} claves usadas, ninguna falta en TODOS los idiomas.`);
+if (duplicates.length > 0) {
+  console.error(`✗ i18n: ${duplicates.length} claves duplicadas:`);
+  for (const { lang, key, count } of duplicates) console.error(`    ${lang}.${key}  (${count} veces)`);
+  console.error("");
+}
+
+if (missingAll.length === 0 && missingSome.length === 0 && duplicates.length === 0) {
+  console.log(`✓ i18n: ${usedKeys.size} claves usadas · 0 parciales · 0 duplicadas.`);
   process.exit(0);
 }
 
-console.error(`✗ i18n: ${missingAll.length} claves usadas pero ausentes en TODOS los idiomas:\n`);
-for (const k of missingAll) console.error(`    ${k}`);
-console.error(`\nEsto significa que cualquier usuario ve la key literal en lugar del texto. Agregalas a src/i18n.jsx en al menos un idioma. Si la clave usa \${vars}, sumala a IGNORED_KEYS con el motivo.`);
+if (missingAll.length > 0) {
+  console.error(`✗ i18n: ${missingAll.length} claves usadas pero ausentes en TODOS los idiomas:\n`);
+  for (const k of missingAll) console.error(`    ${k}`);
+  console.error(`\nEsto significa que cualquier usuario ve la key literal en lugar del texto. Agregala a los 3 idiomas de src/i18n.jsx. Si la clave usa \${vars}, sumala a IGNORED_KEYS con el motivo.`);
+}
 process.exit(1);
