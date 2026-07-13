@@ -10,10 +10,7 @@ import { uploadFileToR2 } from "./r2Upload";
 import * as wizardPersistence from "./wizardPersistence";
 import LoginPage from "./components/LoginPage";
 import Sidebar from "./components/Sidebar";
-import Dashboard from "./components/Dashboard";
-import SearchPalette from "./components/SearchPalette";
 import GlobalTopbar from "./components/GlobalTopbar";
-import UploadZone from "./components/UploadZone";
 import TitleCardPreview from "./components/TitleCardPreview";
 // 2026-05-27 Phase-2 audit: LyricsEditor (~85 KB), AdminPanel (~50 KB)
 // and Settings (~30 KB) lazy-load so the main bundle drops below
@@ -35,6 +32,9 @@ const Settings = lazy(() => import("./components/Settings"));
 const Landing = lazy(() => import("./components/Landing"));
 const JobDetail = lazy(() => import("./components/JobDetail"));
 const HistoryView = lazy(() => import("./components/HistoryView"));
+const Dashboard = lazy(() => import("./components/Dashboard"));
+const UploadZone = lazy(() => import("./components/UploadZone"));
+const SearchPalette = lazy(() => import("./components/SearchPalette"));
 import BatchProgress from "./components/BatchProgress";
 import TranscribingProgress from "./components/TranscribingProgress";
 import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
@@ -3385,6 +3385,7 @@ export default function App() {
 
   const handleBulkApproveBatch = async (jobIds) => {
     if (!Array.isArray(jobIds) || jobIds.length === 0) return;
+    const failed = [];
     for (const jobId of jobIds) {
       try {
         const res = await authFetch(`${API}/approve/${jobId}`, {
@@ -3392,14 +3393,27 @@ export default function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ notes: "" }),
         });
-        if (res.ok) {
-          setJobs((prev) =>
-            prev.map((j) => j.job_id === jobId ? { ...j, status: "done" } : j)
-          );
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          failed.push({ jobId, reason: data.detail || `Error ${res.status}` });
+          continue;
         }
-      } catch {}
+        setJobs((prev) =>
+          prev.map((j) => j.job_id === jobId ? { ...j, status: "done" } : j)
+        );
+      } catch (err) {
+        failed.push({ jobId, reason: err?.message || t("common.network_error") });
+      }
     }
-    fetchHistory();
+    await fetchHistory();
+    if (failed.length > 0) {
+      const firstFailure = failed[0];
+      alert({
+        title: t("history.bulk_approve_partial_title"),
+        description: `${failed.length}/${jobIds.length} ${t("history.bulk_approve_partial_description")} ${firstFailure.jobId}: ${firstFailure.reason}`,
+        tone: "error",
+      });
+    }
   };
 
   const handleDeleteJob = async (jobId) => {
@@ -3717,6 +3731,7 @@ export default function App() {
       <div className="lg:shrink-0">{resumeBanner}</div>
 
       <div className="lg:flex-1 lg:min-h-0 lg:overflow-hidden lg:flex lg:flex-col">
+      <Suspense fallback={<RouteSuspenseFallback />}>
       <UploadZone
         files={files}
         onFiles={setFiles}
@@ -3810,6 +3825,7 @@ export default function App() {
         // "(muestra)" en consecuencia.
         bgStatus={bgPreview.status}
       />
+      </Suspense>
       </div>
     </div>
   );
@@ -4155,16 +4171,18 @@ export default function App() {
           }
         >
           <Route path="/dashboard" element={
-            <Dashboard
-              user={user}
-              history={history}
-              historyError={historyError}
-              historyLoaded={historyLoaded}
-              onRetryHistory={fetchHistory}
-              onSelectJob={handleSelectJob}
-              onNewBatch={handleStartNewBatch}
-              onViewHistory={() => navigate("/videos")}
-            />
+            <Suspense fallback={<RouteSuspenseFallback />}>
+              <Dashboard
+                user={user}
+                history={history}
+                historyError={historyError}
+                historyLoaded={historyLoaded}
+                onRetryHistory={fetchHistory}
+                onSelectJob={handleSelectJob}
+                onNewBatch={handleStartNewBatch}
+                onViewHistory={() => navigate("/videos")}
+              />
+            </Suspense>
           } />
           {/* Capa B 2026-05-24 — /new y /review renderizan el MISMO content
               (wizardScreen) que conmuta upload ↔ review ↔ ready_to_generate
@@ -4235,12 +4253,16 @@ export default function App() {
       {/* 2026-05-25 PR-2 — Command palette ⌘K. Renderizado fuera de
           <Routes> para que sobreviva navegación entre rutas. El listener
           de teclado global vive en el GlobalSearchKeybinding helper. */}
-      <SearchPalette
-        isOpen={searchOpen}
-        onClose={() => setSearchOpen(false)}
-        jobs={history}
-        onSelectJob={handleSearchSelectJob}
-      />
+      {searchOpen && (
+        <Suspense fallback={null}>
+          <SearchPalette
+            isOpen={searchOpen}
+            onClose={() => setSearchOpen(false)}
+            jobs={history}
+            onSelectJob={handleSearchSelectJob}
+          />
+        </Suspense>
+      )}
       <GlobalSearchKeybinding onOpen={() => setSearchOpen(true)} />
     </>
   );
