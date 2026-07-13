@@ -55,6 +55,16 @@ peaks to 80 — well under Postgres `max_connections=100`.
 Alert when utilization stays above 0.8 for 5+ minutes — that's the
 signal you're close to bottleneck #2.
 
+This alert is now **automated**: `db_pool_watchdog.py` samples the pool every
+15 s and, when saturation stays above `DB_POOL_ALERT_THRESHOLD` (default 0.85)
+for `DB_POOL_ALERT_SUSTAINED_SAMPLES` (4) samples, emits a single Sentry event
+`[DB-POOL-ALERT]` (fingerprint `db-pool-saturation`, cooldown 30 min). That
+event flows through the Sentry alert rule → Sentinel → Telegram, so you get the
+*leading* signal on your phone instead of discovering it via the *lagging*
+`QueuePool timeout` after it already 500'd a client. When this alert starts
+firing recurrently, execute bottleneck #2 below (PgBouncer) — deliberately, not
+under fire.
+
 ## 2. Postgres max_connections (next ceiling)
 
 Once `/health` shows db_pool utilization regularly hitting 0.6–0.8,

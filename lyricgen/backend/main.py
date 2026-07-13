@@ -711,6 +711,17 @@ def on_startup():
     ).start()
     logger.info("business-alerts thread started (daily)")
 
+    # Tripwire de saturación del pool de Postgres — indicador LÍDER: avisa por
+    # Sentry (→ Sentinel → Telegram) ANTES de que el pool se agote y tire el
+    # QueuePool timeout a un cliente. El pool está topeado por el
+    # max_connections del plan (ver database.py); esto es la señal para actuar
+    # (PgBouncer/plan) a tiempo, no el fix del techo.
+    try:
+        import db_pool_watchdog
+        db_pool_watchdog.start()
+    except Exception as _exc:  # nunca romper el arranque por el watchdog
+        logger.warning("db-pool-watchdog no arrancó: %s", _exc)
+
 
 # --- Background library (public, authenticated) ---
 _BACKGROUNDS_LIB = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
