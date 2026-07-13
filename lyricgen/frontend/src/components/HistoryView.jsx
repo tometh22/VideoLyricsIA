@@ -9,10 +9,10 @@ import "./DashboardRich/DashboardRich.css";
 
 const API = import.meta.env.VITE_API_URL || "";
 
-function timeAgo(ts) {
+function timeAgo(ts, t) {
   if (!ts) return "";
   const diff = Date.now() / 1000 - ts;
-  if (diff < 60) return "ahora";
+  if (diff < 60) return t("common.now");
   if (diff < 3600) return `${Math.floor(diff / 60)}m`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
   return `${Math.floor(diff / 86400)}d`;
@@ -20,10 +20,10 @@ function timeAgo(ts) {
 
 // Hora absoluta en zona AR para tooltips (cuando el operador necesita
 // fecha exacta para reportar a UMG: "el video del 22 mayo 14:30").
-function absoluteTimeAR(ts) {
+function absoluteTimeAR(ts, locale) {
   if (!ts) return "";
   const d = new Date(ts * 1000);
-  return new Intl.DateTimeFormat("es-AR", {
+  return new Intl.DateTimeFormat(locale, {
     day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit"
   }).format(d);
 }
@@ -37,16 +37,12 @@ const BUCKET_DATE_FMT_AR = new Intl.DateTimeFormat("en-CA", {
   timeZone: "America/Argentina/Buenos_Aires",
   year: "numeric", month: "2-digit", day: "2-digit",
 });
-const BUCKET_MONTH_FMT_AR = new Intl.DateTimeFormat("es-AR", {
-  timeZone: "America/Argentina/Buenos_Aires",
-  month: "long", year: "numeric",
-});
 
 // 2026-05-25 PR-3 — bucketing temporal por timezone AR (no UTC). El
 // operador piensa en bloques cronológicos ("Hoy", "Esta semana") y
 // scrolea por ahí, no por una lista plana de 200 cards. Returns lista
 // ordenada de {key, label, jobs[]} para renderizar con sticky headers.
-function bucketByDateAR(jobs) {
+function bucketByDateAR(jobs, t, locale) {
   if (!jobs?.length) return [];
   // Anclas calculadas una sola vez (no por job)
   const now = new Date();
@@ -69,11 +65,13 @@ function bucketByDateAR(jobs) {
     const d = new Date(ts * 1000);
     const dateAR = BUCKET_DATE_FMT_AR.format(d);
     let key, label;
-    if (dateAR === todayAR) { key = "0-today"; label = "Hoy"; }
-    else if (dateAR === yesterdayAR) { key = "1-yesterday"; label = "Ayer"; }
-    else if (dateAR >= startOfWeekAR) { key = "2-this-week"; label = "Esta semana"; }
+    if (dateAR === todayAR) { key = "0-today"; label = t("history.today"); }
+    else if (dateAR === yesterdayAR) { key = "1-yesterday"; label = t("history.yesterday"); }
+    else if (dateAR >= startOfWeekAR) { key = "2-this-week"; label = t("history.this_week"); }
     else {
-      const monthLabel = BUCKET_MONTH_FMT_AR.format(d);
+      const monthLabel = new Intl.DateTimeFormat(locale, {
+        timeZone: "America/Argentina/Buenos_Aires", month: "long", year: "numeric",
+      }).format(d);
       // Mes/año como key para que jobs del mismo mes caigan al mismo
       // bucket. Capitalize primera letra ("Mayo 2026").
       key = "3-" + monthLabel.replace(/\s+/g, "-").toLowerCase();
@@ -176,7 +174,7 @@ function StatusBadge({ status, t }) {
     done:               { label: t("history.done"),                       cls: "bg-accent/15 text-accent ring-1 ring-accent/30" },
     pending_review:     { label: t("batch.pending_review") || "Pendiente de revisión",  cls: "bg-amber-500/15 text-amber-300 ring-1 ring-amber-500/30" },
     processing:         { label: t("history.processing"),                 cls: "bg-brand/15 text-brand-light ring-1 ring-brand/30" },
-    queued:             { label: "En cola",                                cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06]" },
+    queued:             { label: t("status.queued"),                       cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06]" },
     // Borrador transcripto que aún no se generó (o subida en curso). NO es
     // un render colgado — antes caía al default "Procesando" y parecía
     // trabado. Estilo neutro (no spinner) para distinguirlo de un render.
@@ -193,28 +191,28 @@ function StatusBadge({ status, t }) {
     // Mismo estilo que `transcribed_pending` (dashed border, neutral)
     // pero etiqueta distinta para distinguir "subida en curso" de
     // "ya transcripto, abre y editá".
-    transcribed:        { label: "Listo p/ editar",                        cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06] border border-dashed border-white/10" },
-    transcribing:       { label: "Transcribiendo…",                        cls: "bg-brand/15 text-brand-light ring-1 ring-brand/30" },
-    transcribing_queued: { label: "En cola",                                cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06]" },
+    transcribed:        { label: t("history.ready_to_edit"),               cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06] border border-dashed border-white/10" },
+    transcribing:       { label: t("status.transcribing"),                 cls: "bg-brand/15 text-brand-light ring-1 ring-brand/30" },
+    transcribing_queued: { label: t("status.queued"),                       cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06]" },
     transcription_failed: { label: t("history.error") || "Error transcribiendo", cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
     awaiting_upload:    { label: t("history.uploading") || "Subiendo…",      cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06]" },
     editing:            { label: t("history.editing") || "Re-renderizando", cls: "bg-brand/15 text-brand-light ring-1 ring-brand/30" },
     error:              { label: t("history.error"),                      cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
     validation_failed:  { label: t("batch.validation_failed") || "Failed", cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
-    rejected:           { label: "Rechazado",                              cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
+    rejected:           { label: t("status.rejected"),                     cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
     // bg_preview ghost jobs (Capa C feature) — no audio, no video.
     // Should NOT appear in the user's history normally (filter elsewhere),
     // but if one does, label honestly instead of falling through to
     // "Procesando".
-    bg_preview_queued:  { label: "Fondo en preparación",                   cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06]" },
-    bg_preview_failed:  { label: "Falló la preparación del fondo",         cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
+    bg_preview_queued:  { label: t("status.bg_preview_queued"),             cls: "bg-surface-3/60 text-ink-secondary ring-1 ring-white/[0.06]" },
+    bg_preview_failed:  { label: t("status.bg_preview_failed"),             cls: "bg-red-500/15 text-red-300 ring-1 ring-red-500/30" },
   };
   // Honest fallback: instead of pretending an unknown status is
   // "Procesando", show the raw value in muted gray so the operator
   // can report a real string back. Caught 19/60 mislabeled jobs on
   // staging 2026-05-24.
   const cfg = map[status] || {
-    label: status || "Desconocido",
+    label: status || t("history.unknown_status"),
     cls: "bg-surface-3/40 text-ink-secondary/60 ring-1 ring-white/[0.04]",
   };
   return (
@@ -232,7 +230,7 @@ const DELETABLE = new Set([
   "editing", "transcribed_pending",
 ]);
 
-function VideoCardImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
+function VideoCardImpl({ job, onSelect, onDelete, selected, onToggleSelect, t, locale }) {
   // Prefer the structured fields the operator filled in / the backend
   // backfilled from the filename. Fall back to the legacy filename split
   // only for jobs that pre-date the song_title column.
@@ -336,8 +334,8 @@ function VideoCardImpl({ job, onSelect, onDelete, selected, onToggleSelect, t })
                 ${selected
                   ? "bg-brand border-brand opacity-100"
                   : "bg-black/50 border-white/40 hover:border-brand/70 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"}`}
-              title={selected ? "Deseleccionar" : "Seleccionar para eliminar"}
-              aria-label="Seleccionar"
+              title={selected ? t("history.deselect") : t("history.select_to_delete")}
+              aria-label={t("history.select")}
               aria-pressed={selected}
             >
               {selected && (
@@ -353,7 +351,7 @@ function VideoCardImpl({ job, onSelect, onDelete, selected, onToggleSelect, t })
                 text-white/70 hover:text-white opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100 transition-all
                 flex items-center justify-center ring-1 ring-white/10 hover:ring-red-400/50"
               title={t("history.delete") || "Eliminar"}
-              aria-label="Eliminar video"
+              aria-label={t("history.delete_video")}
             >
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <polyline points="3 6 5 6 21 6"/>
@@ -388,7 +386,7 @@ function VideoCardImpl({ job, onSelect, onDelete, selected, onToggleSelect, t })
         </div>
         <p className="text-[11px] text-gray-500 truncate mt-0.5">
           {artistName}
-          {job.created_at && <span className="ml-1.5 text-gray-600">· {timeAgo(job.created_at)}</span>}
+          {job.created_at && <span className="ml-1.5 text-gray-600">· {timeAgo(job.created_at, t)}</span>}
         </p>
       </div>
     </div>
@@ -521,7 +519,7 @@ function MediaThumbnail({ jobId, status, editCount = 0 }) {
 // texto generosas en el centro, badge + time + acción a la derecha.
 // Padding más respiratorio (~90px de altura total). Hover ring +
 // fade-in del botón acción. Click en row → JobDetail.
-function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) {
+function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t, locale }) {
   const fallbackName = (job.filename || "").replace(/\.(mp3|wav|m4a|flac|aac|ogg)$/i, "");
   let songName = (job.song_title || "").trim();
   let artistName = (job.artist || "").trim();
@@ -545,7 +543,7 @@ function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) 
         type="button"
         className="history-media-row__open-hit"
         onClick={handleRowClick}
-        aria-label={`Abrir ${artistName || "video"} — ${songName || "sin nombre"}. Estado ${job.status}. Creado ${timeAgo(job.created_at)}`}
+        aria-label={t("history.row_aria", { artist: artistName || t("common.video"), song: songName || t("common.untitled"), status: job.status, time: timeAgo(job.created_at, t) })}
       />
       {/* Checkbox — flotante arriba-izq del thumb, solo visible on hover
           o si seleccionado. NO interfiere con el layout cuando no se usa. */}
@@ -558,7 +556,7 @@ function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) 
               ? "bg-brand border-brand opacity-100"
               : "bg-black/40 border-white/30 hover:border-brand/70 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
             }`}
-          aria-label={selected ? "Deseleccionar" : "Seleccionar"}
+          aria-label={selected ? t("history.deselect") : t("history.select")}
         >
           {selected && (
             <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
@@ -578,16 +576,16 @@ function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) 
           {artistName || <span className="text-gray-600 font-normal">—</span>}
         </p>
         <p className="text-[13px] text-ink-secondary truncate leading-tight" title={songName}>
-          {songName || <span className="text-gray-600">(sin nombre)</span>}
+          {songName || <span className="text-gray-600">{t("common.untitled")}</span>}
         </p>
         <div className="history-media-row__mobile-meta">
           <StatusDot status={job.status} />
           <StatusBadge status={job.status} t={t} />
           <span
             className="text-[11px] text-gray-500 font-mono tabular-nums"
-            title={absoluteTimeAR(job.created_at)}
+            title={absoluteTimeAR(job.created_at, locale)}
           >
-            · {timeAgo(job.created_at)}
+            · {timeAgo(job.created_at, t)}
           </span>
         </div>
       </div>
@@ -597,8 +595,8 @@ function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) 
         <StatusBadge status={job.status} t={t} />
       </div>
 
-      <time className="history-media-row__date" title={absoluteTimeAR(job.created_at)}>
-        {timeAgo(job.created_at)}
+      <time className="history-media-row__date" title={absoluteTimeAR(job.created_at, locale)}>
+        {timeAgo(job.created_at, t)}
       </time>
 
       {/* Action button derecha — contextual según status */}
@@ -612,7 +610,7 @@ function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) 
             onClick={handleRowClick}
             className="flex items-center gap-1.5 px-3 h-9 rounded-lg bg-amber-500/15 ring-1 ring-amber-500/30 text-[12px] text-amber-200 hover:bg-amber-500/25 transition-colors"
           >
-            Revisar
+            {t("history.review")}
             <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
@@ -626,18 +624,18 @@ function MediaRowImpl({ job, onSelect, onDelete, selected, onToggleSelect, t }) 
             <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
             </svg>
-            Abrir
+            {t("history.open")}
           </button>
         ) : isError && canDelete && onDelete ? (
           <button
             type="button"
-            onClick={(e) => { e.stopPropagation(); if (confirm("¿Eliminar este job fallido?")) onDelete(job.job_id); }}
+            onClick={(e) => { e.stopPropagation(); if (confirm(t("history.confirm_delete_failed"))) onDelete(job.job_id); }}
             className="flex items-center gap-1.5 px-3 h-9 rounded-lg bg-white/[0.04] ring-1 ring-white/[0.06] text-[12px] text-red-400/80 hover:bg-red-500/15 hover:text-red-300 transition-colors opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
           >
             <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
-            Eliminar
+            {t("history.delete")}
           </button>
         ) : (
           <span className="text-gray-500 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100 transition-opacity">
@@ -744,7 +742,8 @@ export default function HistoryView({
   onBulkDelete,
   onBack,
 }) {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
+  const locale = lang === "en" ? "en-US" : lang === "pt" ? "pt-BR" : "es-AR";
   const navigate = useNavigate();
   const [filter, setFilter] = useState("all");
   // Archivado Fase 1: ver intentos fallidos archivados (default oculto).
@@ -888,16 +887,16 @@ export default function HistoryView({
 
   // Buckets temporales — solo para vista tabla con date groups.
   // En grid mantenemos lista plana para no quebrar el flow visual.
-  const buckets = useMemo(() => bucketByDateAR(visible), [visible]);
+  const buckets = useMemo(() => bucketByDateAR(visible, t, locale), [visible, t, locale]);
 
   // Sort options (label + key) — usados por el dropdown
   const SORT_OPTIONS = [
-    { key: "newest",        label: "Más reciente" },
-    { key: "oldest",        label: "Más antigua" },
-    { key: "artist_asc",    label: "Artista A→Z" },
-    { key: "artist_desc",   label: "Artista Z→A" },
+    { key: "newest",        label: t("history.sort_newest") },
+    { key: "oldest",        label: t("history.sort_oldest") },
+    { key: "artist_asc",    label: t("history.sort_artist_asc") },
+    { key: "artist_desc",   label: t("history.sort_artist_desc") },
   ];
-  const currentSortLabel = SORT_OPTIONS.find((o) => o.key === sortKey)?.label || "Más reciente";
+  const currentSortLabel = SORT_OPTIONS.find((o) => o.key === sortKey)?.label || t("history.sort_newest");
 
   // When the history list updates (e.g. row deleted), drop selections
   // pointing to job_ids that no longer exist.
@@ -941,7 +940,7 @@ export default function HistoryView({
   const handleBulkDelete = async () => {
     const ids = [...selectedIds];
     if (ids.length === 0) return;
-    if (!confirm(`¿Eliminar ${ids.length} ${ids.length === 1 ? "video" : "videos"}? Esta acción no se puede deshacer.`)) return;
+    if (!confirm(t(ids.length === 1 ? "history.confirm_bulk_delete_one" : "history.confirm_bulk_delete_many", { count: ids.length }))) return;
     await onBulkDelete?.(ids);
     setSelectedIds(new Set());
   };
@@ -954,7 +953,7 @@ export default function HistoryView({
       {/* ─── Header ─────────────────────────────────────────────── */}
       <div className="flex items-end justify-between mb-8">
         <div className="flex items-center gap-3">
-          <button onClick={onBack} aria-label="Volver"
+          <button onClick={onBack} aria-label={t("common.back")}
             className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M19 12H5M12 19l-7-7 7-7" />
@@ -968,8 +967,8 @@ export default function HistoryView({
                 : isLoadFailed
                 ? (t("history.load_failed_subtitle") || "No pudimos cargar tu historial")
                 : realHistory.length === 0
-                ? "Aún no hay videos"
-                : `${realHistory.length} ${realHistory.length === 1 ? "video en total" : "videos en total"}`}
+                ? t("history.none_yet")
+                : t(realHistory.length === 1 ? "history.total_one" : "history.total_many", { count: realHistory.length })}
             </p>
           </div>
         </div>
@@ -999,7 +998,7 @@ export default function HistoryView({
                 type="button"
                 onClick={() => setQuery("")}
                 className="absolute right-2.5 top-1/2 -translate-y-1/2 w-5 h-5 rounded-full bg-white/[0.06] hover:bg-white/[0.12] flex items-center justify-center text-gray-400 hover:text-white transition-colors"
-                aria-label="Limpiar búsqueda"
+                aria-label={t("history.clear_search")}
               >
                 <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
                   <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" />
@@ -1055,9 +1054,9 @@ export default function HistoryView({
               type="button"
               onClick={() => setView("table")}
               className={`h-9 px-2.5 transition-colors ${view === "table" ? "bg-white/[0.08] text-white" : "text-gray-500 hover:text-gray-300"}`}
-              aria-label="Vista tabla"
+              aria-label={t("history.table_view")}
               aria-pressed={view === "table"}
-              title="Vista tabla"
+              title={t("history.table_view")}
             >
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M3 6h18M3 12h18M3 18h18" strokeLinecap="round" />
@@ -1067,9 +1066,9 @@ export default function HistoryView({
               type="button"
               onClick={() => setView("grid")}
               className={`h-9 px-2.5 transition-colors ${view === "grid" ? "bg-white/[0.08] text-white" : "text-gray-500 hover:text-gray-300"}`}
-              aria-label="Vista cards"
+              aria-label={t("history.card_view")}
               aria-pressed={view === "grid"}
-              title="Vista cards"
+              title={t("history.card_view")}
             >
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" />
@@ -1222,14 +1221,14 @@ export default function HistoryView({
              is mid-query and a giant hero would feel jarring. */
           <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04] max-w-2xl mx-auto">
             <p className="text-sm text-ink-secondary mb-3">
-              No encontramos videos para <span className="font-mono text-white">"{query.trim()}"</span>
+              {t("history.no_results")} <span className="font-mono text-white">"{query.trim()}"</span>
             </p>
             <button
               type="button"
               onClick={() => setQuery("")}
               className="text-xs text-brand-light hover:text-white transition-colors underline-offset-2 hover:underline"
             >
-              Limpiar búsqueda
+              {t("history.clear_search")}
             </button>
           </div>
         ) : history.length === 0 ? (
@@ -1266,7 +1265,7 @@ export default function HistoryView({
              midweight card centrado. */
           <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04] max-w-2xl mx-auto">
             <p className="text-sm text-ink-secondary">
-              No hay videos en esta vista
+              {t("history.no_videos_view")}
             </p>
           </div>
         )
@@ -1298,6 +1297,7 @@ export default function HistoryView({
                     selected={selectedIds.has(job.job_id)}
                     onToggleSelect={toggleSelect}
                     t={t}
+                    locale={locale}
                   />
                 ))}
               </div>
@@ -1326,6 +1326,7 @@ export default function HistoryView({
                     selected={selectedIds.has(job.job_id)}
                     onToggleSelect={toggleSelect}
                     t={t}
+                    locale={locale}
                   />
                 ))}
               </div>

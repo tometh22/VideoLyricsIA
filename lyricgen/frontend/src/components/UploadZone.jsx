@@ -48,7 +48,6 @@ const LYRIC_RENDER_FIELDS = new Set([
   "lyricsAnimation", "lineTransition", "lyricColor", "lyricSungColor",
 ]);
 
-const SAMPLE_LYRIC = "Como el viento que se va";
 function applyTextCase(text, c) {
   if (c === "upper") return text.toUpperCase();
   if (c === "title") return text.replace(/\b\w/g, (ch) => ch.toUpperCase());
@@ -578,7 +577,7 @@ export default function UploadZone({
     if (code === "karaoke") {
       return (
         <span className={base}>
-          {["tu", "letra"].map((w, i) => (
+          {t("upload.sample_words").split(" ").map((w, i) => (
             <span key={i} style={{ animation: `acard-karaoke 2.4s ${i * 0.5}s infinite`, marginRight: i === 0 ? "0.28em" : 0, display: "inline-block" }}>{w}</span>
           ))}
         </span>
@@ -587,7 +586,7 @@ export default function UploadZone({
     if (code === "word_reveal") {
       return (
         <span className={base}>
-          {["tu", "letra"].map((w, i) => (
+          {t("upload.sample_words").split(" ").map((w, i) => (
             <span key={i} style={{ animation: `acard-word 2.6s ${i * 0.45}s infinite`, marginRight: i === 0 ? "0.28em" : 0, display: "inline-block" }}>{w}</span>
           ))}
         </span>
@@ -597,7 +596,7 @@ export default function UploadZone({
       code === "pop" ? "acard-pop 2.2s infinite" :
       code === "glow" ? "acard-glow 2.4s ease-in-out infinite" :
       "acard-word 2.8s infinite"; // none → simple fade loop
-    return <span className={base} style={{ animation: anim, display: "inline-block" }}>Letra</span>;
+    return <span className={base} style={{ animation: anim, display: "inline-block" }}>{t("upload.preview_lyric")}</span>;
   };
 
   // Looping mini-demo of a line transition (movement), shown inside its card.
@@ -611,7 +610,7 @@ export default function UploadZone({
       "acard-word 2.8s infinite"; // none → simple fade
     return (
       <span className="overflow-hidden inline-block">
-        <span className={base} style={{ animation: anim, display: "inline-block" }}>Letra</span>
+        <span className={base} style={{ animation: anim, display: "inline-block" }}>{t("upload.preview_lyric")}</span>
       </span>
     );
   };
@@ -1540,9 +1539,9 @@ export default function UploadZone({
         {hoverCaseBatch && (
           <div className="mt-1.5 px-3 py-1.5 rounded-md bg-black/40 ring-1 ring-white/[0.06] flex items-baseline gap-2 animate-fade-in">
             <span className="text-[11px] font-mono text-white/80 tracking-wide">
-              {applyTextCase(SAMPLE_LYRIC, hoverCaseBatch)}
+              {applyTextCase(t("upload.sample_lyric"), hoverCaseBatch)}
             </span>
-            <span className="text-[10px] text-gray-600">← así quedarán tus letras</span>
+            <span className="text-[10px] text-gray-600">← {t("upload.case_preview_help")}</span>
           </div>
         )}
       </div>
@@ -1682,10 +1681,10 @@ export default function UploadZone({
                   const st = transcribeStatusByFile[k];
                   if (!st) return null;
                   const label = {
-                    uploading:    { txt: "📤 Subiendo…",       cls: "text-blue-400" },
-                    queued:       { txt: "🕓 En cola",          cls: "text-gray-400" },
-                    transcribing: { txt: "🎙 Transcribiendo…", cls: "text-brand-light" },
-                    done:         { txt: "✓ Listo para revisar", cls: "text-accent" },
+                    uploading:    { txt: `📤 ${t("status.awaiting_upload")}`, cls: "text-blue-400" },
+                    queued:       { txt: `🕓 ${t("status.queued")}`, cls: "text-gray-400" },
+                    transcribing: { txt: `🎙 ${t("status.transcribing")}`, cls: "text-brand-light" },
+                    done:         { txt: `✓ ${t("upload.ready_to_review")}`, cls: "text-accent" },
                     error:        { txt: `✗ ${st.error || "Error"}`, cls: "text-red-400" },
                   }[st.status] || { txt: st.status, cls: "text-gray-500" };
                   return (
@@ -1697,8 +1696,8 @@ export default function UploadZone({
               </div>
               <button
                 onClick={(e) => removeFile(i, e)}
-                aria-label="Descartar este audio"
-                title="Descartar este audio"
+                aria-label={t("upload.discard_audio")}
+                title={t("upload.discard_audio")}
                 className="shrink-0 w-7 h-7 rounded-lg hover:bg-red-500/10 flex items-center justify-center text-gray-300 hover:text-red-400 transition-colors"
               >
                 <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -1905,9 +1904,9 @@ export default function UploadZone({
                     {hoverCaseRow?.idx === i && (
                       <div className="mt-1.5 px-3 py-1.5 rounded-md bg-black/40 ring-1 ring-white/[0.06] flex items-baseline gap-2 animate-fade-in">
                         <span className="text-[11px] font-mono text-white/80 tracking-wide">
-                          {applyTextCase(SAMPLE_LYRIC, hoverCaseRow.code)}
+                          {applyTextCase(t("upload.sample_lyric"), hoverCaseRow.code)}
                         </span>
-                        <span className="text-[10px] text-gray-600">← así quedarán tus letras</span>
+                        <span className="text-[10px] text-gray-600">← {t("upload.case_preview_help")}</span>
                       </div>
                     )}
                   </div>
@@ -2000,13 +1999,13 @@ export default function UploadZone({
           />
 
           <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
-            Fondo del video
+            {t("upload.video_background")}
             <HelpTip articleId="backgrounds" />
           </p>
           <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
-            {bgMode === "auto" ? "IA genera un fondo único por canción"
-              : bgMode === "library" ? "Fondo compartido para todo el lote"
-              : "Tu fondo personalizado"}
+            {bgMode === "auto" ? t("upload.bg_auto_summary")
+              : bgMode === "library" ? t("upload.bg_library_summary")
+              : t("upload.bg_custom_summary")}
           </p>
 
           {/* Mode selector */}
@@ -2634,7 +2633,7 @@ export default function UploadZone({
                   <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>
                   <path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
                 </svg>
-                Aplica a los {files.length} tracks
+                {t("upload.applies_to_tracks", { count: files.length })}
               </span>
             </div>
           )}
@@ -2987,9 +2986,9 @@ export default function UploadZone({
                     {hoverCaseBatch && (
                       <div className="mt-1.5 ml-[5.5rem] px-3 py-1.5 rounded-md bg-black/40 ring-1 ring-white/[0.06] flex items-baseline gap-2 animate-fade-in">
                         <span className="text-[11px] font-mono text-white/80 tracking-wide">
-                          {applyTextCase(SAMPLE_LYRIC, hoverCaseBatch)}
+                          {applyTextCase(t("upload.sample_lyric"), hoverCaseBatch)}
                         </span>
-                        <span className="text-[10px] text-gray-600">← así quedarán tus letras</span>
+                        <span className="text-[10px] text-gray-600">← {t("upload.case_preview_help")}</span>
                       </div>
                     )}
                   </div>
@@ -3049,7 +3048,7 @@ export default function UploadZone({
                 </div>
               </div>
 
-              <p className="text-[11px] text-gray-300 font-medium">{t("upload.animation_section") || "Animación"} de la letra</p>
+              <p className="text-[11px] text-gray-300 font-medium">{t("upload.animation_section_full")}</p>
               <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
                 {t("upload.anim_gallery_desc") || "Cómo aparecen las palabras sobre el video. Pasá el mouse o elegí y miralo en el preview ←"}
               </p>
