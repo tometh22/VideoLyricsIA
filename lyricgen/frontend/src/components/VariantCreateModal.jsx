@@ -1,15 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import BackgroundHintField from "./BackgroundHintField";
-import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
+import ContentValidationToggle from "./ContentValidationToggle";
 import useDialogA11y from "../hooks/useDialogA11y";
 
-function _readTenant() {
+function _readAccount() {
   try {
     const u = JSON.parse(localStorage.getItem("genly_user") || "null");
-    return u?.tenant_id || null;
+    return {
+      tenantId: u?.tenant_id || null,
+      billingGroup: u?.billing_group || null,
+    };
   } catch {
-    return null;
+    return { tenantId: null, billingGroup: null };
   }
 }
 
@@ -62,10 +65,9 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
   const [backgroundHint, setBackgroundHint] = useState(_initialHint);
   const [concept, setConcept] = useState(initialConcept);
   // Tenant-aware content-validation choice. See EditRequestPanel for
-  // the full rationale. value=true means "run validator"; default per
-  // tenant (UMG validates, others skip).
-  const _tenantId = _readTenant();
-  const _isUmg = isUmgTenant(_tenantId);
+  // the full rationale. value=true means "run validator". Universal is fixed;
+  // common accounts can explicitly choose the existing fondo-libre mode.
+  const { tenantId: _tenantId, billingGroup: _billingGroup } = _readAccount();
   const [validationEnabled, setValidationEnabled] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
@@ -218,6 +220,7 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
           value={validationEnabled}
           onChange={setValidationEnabled}
           tenantId={_tenantId}
+          billingGroup={_billingGroup}
           disabled={submitting}
         />
 

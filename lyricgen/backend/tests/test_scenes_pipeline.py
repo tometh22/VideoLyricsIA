@@ -371,7 +371,7 @@ def test_regenerate_scene_busts_only_target(monkeypatch, tmp_path):
     assert verso_call["cache_only"] is True
     assert coro["cache_token"] in coro_call["ns"]
     assert verso_call["ns"] == (
-        "A|S|verso_1|auto|background-v4:off:deny"
+        "A|S|verso_1|auto|background-v5:off:deny"
     )
     assert tl == "/tmp/timeline.mp4"
 
@@ -454,7 +454,7 @@ def test_restitch_for_edit_bails_when_structure_changed(tmp_path):
 
 
 def test_scene_cache_ns_token():
-    base = "A|S|coro_1|auto|background-v4:off:deny"
+    base = "A|S|coro_1|auto|background-v5:off:deny"
     assert pipeline._scene_cache_ns("A", "S", "coro_1") == base
     assert pipeline._scene_cache_ns("A", "S", "coro_1", "ab12") == f"{base}|ab12"
 
@@ -536,11 +536,11 @@ def test_reuse_edits_never_trust_generic_scene_timeline_identity():
 def test_scene_plan_validation_requires_matching_policy_fingerprint(monkeypatch):
     monkeypatch.setenv("BACKGROUND_SMOKE_POLICY_MODE", "enforce")
     policy = {
-        "policy_version": "background-v4",
+        "policy_version": "background-v5",
         "policy_mode": "enforce",
         "allow_atmospherics": False,
     }
-    fingerprint = "background-v4:enforce:deny|people:deny"
+    fingerprint = "background-v5:enforce:deny|people:deny"
     plan = {
         "scenes": [
             {
@@ -558,7 +558,7 @@ def test_scene_plan_validation_requires_matching_policy_fingerprint(monkeypatch)
 
     assert pipeline._scene_plan_has_current_clip_validation(plan) is True
     plan["scenes"][0]["validation"]["policy_fingerprint"] = (
-        "background-v4:shadow:deny|people:deny"
+        "background-v5:shadow:deny|people:deny"
     )
     assert pipeline._scene_plan_has_current_clip_validation(plan) is False
 
@@ -566,7 +566,7 @@ def test_scene_plan_validation_requires_matching_policy_fingerprint(monkeypatch)
 def test_shadow_scene_validation_is_stale_after_enforce_rollout(monkeypatch):
     monkeypatch.setenv("BACKGROUND_SMOKE_POLICY_MODE", "enforce")
     stored = {
-        "policy_version": "background-v4",
+        "policy_version": "background-v5",
         "policy_mode": "shadow",
         "allow_atmospherics": False,
         "explicit_atmospherics": [],
@@ -578,7 +578,7 @@ def test_shadow_scene_validation_is_stale_after_enforce_rollout(monkeypatch):
             "atmospherics_policy": stored,
             "validation": {
                 "passed": True,
-                "policy_fingerprint": "background-v4:shadow:deny|people:deny",
+                "policy_fingerprint": "background-v5:shadow:deny|people:deny",
             },
         }]
     }

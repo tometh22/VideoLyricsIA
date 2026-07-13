@@ -3,6 +3,8 @@
 import uuid
 import inspect
 
+import pytest
+
 from database import Job, User
 import pipeline
 from main import _merge_content_validation_choice
@@ -58,6 +60,9 @@ def test_negative_operator_prompt_does_not_opt_in(db):
     assert pipeline._compute_allow_people(job_id, "Cero personas") is False
     assert pipeline._compute_allow_people(job_id, "Una mujer no debe aparecer") is False
     assert pipeline._compute_allow_people(job_id, "Personas: ninguna") is False
+    assert pipeline._compute_allow_people(job_id, "a singer must not appear") is False
+    assert pipeline._compute_allow_people(job_id, "la cantante no debe aparecer") is False
+    assert pipeline._compute_allow_people(job_id, "a cantora não deve aparecer") is False
 
 
 def test_human_subject_with_unrelated_negative_constraints_still_opts_in(db):
@@ -162,6 +167,166 @@ def test_universal_tenant_ignores_explicit_people_and_bypass(db):
     assert policy["should_validate"] is True
 
 
+def test_restricted_provider_boundary_replaces_positive_human_subject():
+    original = "A singer facing camera with a crowd behind her"
+    safe = pipeline._sanitize_people_at_provider_boundary(
+        original,
+        allow_people=False,
+    )
+    assert safe != original
+    assert "singer" not in safe.lower()
+    assert "crowd" not in safe.lower()
+    assert "unoccupied" in safe.lower()
+
+
+def test_authorized_common_prompt_is_preserved_at_provider_boundary():
+    original = "A singer facing camera"
+    assert pipeline._sanitize_people_at_provider_boundary(
+        original,
+        allow_people=True,
+    ) == original
+
+
+def test_restricted_provider_boundary_uses_high_recall_human_detector():
+    prompts = (
+        "a monk meditating beside a river",
+        "a nurse walking through a corridor",
+        "a firefighter in a red-lit warehouse",
+        "a chef and waitress at night",
+        "the protagonist watches the sunrise",
+        "a queen inside a glass palace",
+        "she walks through the rain",
+        "ella bailando bajo luces azules",
+        "eles caminhando na praia",
+        "a plain silhouette dancing",
+        "a humanlike creature in the forest",
+        "no people foreground, include a distant crowd",
+        "without people nearby, a singer",
+        "no crowd except one singer",
+        "no people other than a guitarist",
+        "sin personas cerca, mostrar una fotógrafa",
+        "sem pessoas próximas, incluir um surfista",
+        "no faces visible, silhouettes dancing",
+        "a police officer running",
+        "a waitress serving",
+        "a princess dancing",
+        "a hero standing",
+        "un pintor pintando",
+        "un rey de pie",
+        "uma policial correndo",
+        "uma soldada marchando",
+        "um pintor pintando",
+        "sem pessoas na frente, mostrar uma cantora",
+        "nenhuma multidão exceto um cantor",
+        "a teacher walking through a school",
+        "a student studying",
+        "a pilot standing by an aircraft",
+        "an athlete running",
+        "an engineer working",
+        "a priest praying",
+        "a coach shouting",
+        "un profesor enseñando",
+        "un estudiante caminando",
+        "un sacerdote rezando",
+        "um ator trabalhando",
+        "um trabalhador caminhando",
+        "um garçom servindo",
+    )
+    for prompt in prompts:
+        safe = pipeline._sanitize_people_at_provider_boundary(
+            prompt, allow_people=False,
+        )
+        assert safe != prompt, prompt
+        assert "unoccupied" in safe.lower(), prompt
+
+
+def test_high_recall_detector_does_not_treat_equipment_as_a_person():
+    prompts = (
+        "mechanical arm holding a camera",
+        "robotic arm holding a light",
+        "clock hands at midnight",
+        "a chair's arms in close-up",
+        "a 3D model of an empty futuristic city",
+        "an Android phone on a table",
+        "an electric fan in an empty room",
+        "a rubber band on a white surface",
+        "no people, no faces, no silhouettes",
+        "manos de reloj a medianoche",
+        "brazos de silla en primer plano",
+        "brazo mecánico sosteniendo una cámara",
+        "modelo 3d de una ciudad vacía",
+        "mãos do relógio à meia-noite",
+        "braços da cadeira em primeiro plano",
+        "braço robótico segurando uma câmera",
+        "modelo 3d de uma cidade vazia",
+        "banda elástica sobre una mesa",
+    )
+    for prompt in prompts:
+        assert pipeline._sanitize_people_at_provider_boundary(
+            prompt, allow_people=False,
+        ) == prompt, prompt
+
+
+def test_human_shaped_figures_require_common_user_opt_in(db):
+    job_id = _job(db, render_params={"bypass_content_validation": True})
+    for prompt in (
+        "a human-shaped mannequin in a shop window",
+        "a humanoid statue in an empty plaza",
+        "un maniquí humanoide bajo una luz roja",
+    ):
+        assert pipeline._compute_allow_people(job_id, prompt) is True
+
+
+def test_visual_human_roles_require_common_user_opt_in_and_are_sanitized(db):
+    job_id = _job(db, render_params={"bypass_content_validation": True})
+    prompts = (
+        "a lone guitarist playing on stage",
+        "a drummer performing",
+        "a vocalist at a microphone",
+        "a silhouetted performer dancing",
+        "a solitary human figure walking",
+        "two friends dancing",
+        "a pedestrian",
+        "a driver",
+        "lovers embracing",
+        "an audience cheering",
+        "fans dancing",
+        "a DJ performing",
+        "a rapper performing",
+        "a band performing",
+        "a worker walking",
+        "an actor performing",
+        "a model posing",
+        "a camera operator filming",
+        "a film crew working",
+        "un guitarrista tocando en un escenario",
+        "una operadora de cámara filmando",
+        "uma baterista tocando",
+        "uma equipe de filmagem trabalhando",
+    )
+    for prompt in prompts:
+        assert pipeline._compute_allow_people(job_id, prompt) is True, prompt
+        safe = pipeline._sanitize_people_at_provider_boundary(
+            prompt,
+            allow_people=False,
+        )
+        assert safe != prompt, prompt
+        assert "unoccupied" in safe.lower(), prompt
+
+
+def test_mechanical_camera_equipment_does_not_authorize_people(db):
+    job_id = _job(db, render_params={"bypass_content_validation": True})
+    for prompt in (
+        "mechanical arm holding a camera",
+        "robotic arm holding a light",
+        "crane arm reaching across frame",
+        "boom arm holding a microphone",
+        "brazo mecánico sosteniendo una cámara",
+        "braço robótico segurando uma luz",
+    ):
+        assert pipeline._compute_allow_people(job_id, prompt) is False, prompt
+
+
 def test_universal_billing_group_is_authoritative(db):
     job_id = _job(
         db, tenant="country_team", billing_group=" Universal_Music ",
@@ -215,7 +380,7 @@ def test_scene_validation_does_not_trust_stored_people_allow_after_umg_change(db
             "operator_prompt": "A singer facing camera",
             "allow_people": True,
             "atmospherics_policy": {
-                "policy_version": "background-v4",
+                "policy_version": "background-v5",
                 "policy_mode": "off",
                 "allow_atmospherics": False,
                 "explicit_atmospherics": [],
@@ -223,7 +388,7 @@ def test_scene_validation_does_not_trust_stored_people_allow_after_umg_change(db
             },
             "validation": {
                 "passed": True,
-                "policy_fingerprint": "background-v4:off:deny|people:allow",
+                "policy_fingerprint": "background-v5:off:deny|people:allow",
             },
         }]
     }
@@ -270,3 +435,42 @@ def test_all_policy_write_paths_use_the_single_merge_helper():
 
     for handler in (main.request_edit, main.retry_job, main.create_variant):
         assert "_merge_content_validation_choice(" in inspect.getsource(handler)
+
+
+def test_scene_fallback_provenance_commits_only_with_verified_cached_asset():
+    source = inspect.getsource(pipeline.run_edit_pipeline)
+    verify_at = source.index("_verify_deliverables(job_dir, files, audio_dur)")
+    cache_commit_at = source.index(
+        '_final_state_updates["bg_r2_key_cached"] = _new_background_cache_key'
+    )
+    assert verify_at < cache_commit_at
+    assert '_final_state_updates["scene_plan"] = None' in source
+    assert "_stored_background_ai_generated" in source[cache_commit_at:]
+    assert "update_job(job_id, scene_plan=None" not in source
+
+
+def test_initial_generation_has_provider_error_fallback_without_swallowing_timeout():
+    source = inspect.getsource(pipeline.run_pipeline)
+    assert "except RQJobTimeoutException" in source
+    assert 'filename="bg_initial_policy_fallback.mp4"' in source
+    assert "_background_is_deterministic_fallback = True" in source
+    assert "_raise_if_job_timeout(_recovery_error)" in source
+
+
+def test_rq_timeout_is_never_treated_as_a_recoverable_generation_error():
+    timeout = pipeline.RQJobTimeoutException("worker deadline")
+    with pytest.raises(pipeline.RQJobTimeoutException):
+        pipeline._raise_if_job_timeout(timeout)
+    pipeline._raise_if_job_timeout(RuntimeError("ordinary provider error"))
+
+    scene_source = inspect.getsource(pipeline._generate_scene_clips)
+    edit_source = inspect.getsource(pipeline.run_edit_pipeline)
+    assert "_raise_if_job_timeout(e)" in scene_source
+    for error_name in (
+        "_background_generation_error",
+        "_scene_generation_error",
+        "_dense_error",
+        "_edit_recovery_error",
+        "exc",
+    ):
+        assert f"_raise_if_job_timeout({error_name})" in edit_source
