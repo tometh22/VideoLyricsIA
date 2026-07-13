@@ -1168,7 +1168,16 @@ export default function LyricsEditor({
     setEdited((prev) => {
       const mutated = prev.map((s, i) => {
         if (s._id === target._id) {
-          return clampSegmentToDuration(s, newStart, duration);
+          // NOT clampSegmentToDuration here: newStart is already pre-clamped
+          // to ≤ duration (see upperBound above), so this path never inverts,
+          // and we must keep start === newStart to honor the operator's tapped
+          // position (pulling it back would move the anchor + misreport the
+          // toast/log). Only the trailing-line cascade below could run past
+          // the end and needed the clamp.
+          const segDur = Math.max(0.5, s.end - s.start);
+          let newEnd = newStart + segDur;
+          if (duration && newEnd > duration) newEnd = duration;
+          return { ...s, start: newStart, end: newEnd };
         }
         // Cascade only when the operator opted in AND the delta isn't a
         // suspect mistap (handled by the confirm above). 10 ms threshold
