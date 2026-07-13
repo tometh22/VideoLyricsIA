@@ -436,6 +436,28 @@ def on_startup():
     finally:
         db.close()
     logger.info("GenLy AI started — database initialized")
+    # Deployment lockstep evidence for the background-policy rollout. Railway
+    # runs API, Worker and ShortWorker as separate services; this line makes a
+    # mixed-commit or mixed-flag fleet immediately visible in their logs.
+    from background_policy import (
+        POLICY_ENV as _bg_policy_env,
+        POLICY_VERSION as _bg_policy_version,
+        VALID_POLICY_MODES as _bg_policy_modes,
+        policy_mode as _bg_policy_mode,
+    )
+    from observability import _resolve_release as _resolve_runtime_release
+    logger.info(
+        "[BG_POLICY][STARTUP] process=api release=%s environment=%s "
+        "policy_version=%s policy_mode=%s cache_namespace=v4",
+        _resolve_runtime_release(), ENVIRONMENT,
+        _bg_policy_version, _bg_policy_mode(),
+    )
+    _raw_bg_policy_mode = os.environ.get(_bg_policy_env, "off").strip().lower()
+    if _raw_bg_policy_mode not in _bg_policy_modes:
+        logger.warning(
+            "[BG_POLICY][STARTUP] invalid %s=%r; resolved fail-safe to off",
+            _bg_policy_env, _raw_bg_policy_mode,
+        )
 
     # Background reaper. Daemon → dies with the container. Single
     # instance is enough; if the API ever scales horizontally, the

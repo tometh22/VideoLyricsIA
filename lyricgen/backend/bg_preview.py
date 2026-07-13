@@ -53,6 +53,14 @@ import os
 import tempfile
 from typing import Optional
 
+from background_policy import (
+    cache_policy_fingerprint,
+    policy_enforces,
+    resolve_atmospherics_policy,
+    resolve_creative_mode,
+    runtime_rollout_fingerprint,
+)
+
 logger = logging.getLogger("genly.bg_preview")
 
 
@@ -60,10 +68,10 @@ logger = logging.getLogger("genly.bg_preview")
 # ordenadas para que el mismo dict en distinto orden produzca el mismo key.
 # Si agregamos params futuros que afecten el background, sumarlos acá +
 # bumpear CACHE_VERSION para invalidar el cache existente.
-# v2 invalidates previews generated before the 2026-07 no-implicit-people
-# policy. A legacy cache may contain a human even when the current prompt is
-# restricted, so it must never be reused without regeneration/revalidation.
-CACHE_VERSION = "v2-no-implicit-people"
+# v4 isolates previews by the resolved internal background policy.  In
+# particular off/shadow/enforce never share a key, and an asset generated
+# under the legacy namespace cannot become an enforce-mode cache hit.
+CACHE_VERSION = "v4"
 
 
 def compute_bg_cache_key(params: dict) -> str:
@@ -79,8 +87,23 @@ def compute_bg_cache_key(params: dict) -> str:
     Returns:
         hex string de 12 chars (suficiente para uniqueness, corto para R2 key).
     """
+    # Authorization is resolved exclusively from the raw operator-authored
+    # background_hint.  Lyrics, genre, concept, visual-bible output and other
+    # derived text must never opt a job into atmospheric effects.  The
+    # creative mode is derived from the existing legacy fields so no endpoint
+    # or payload change is required.
+    raw_operator_prompt = params.get("background_hint") or ""
+    creative_mode = resolve_creative_mode(
+        match_lyrics=bool(params.get("match_lyrics", True)),
+        operator_prompt=raw_operator_prompt,
+        verbatim=bool(params.get("bg_verbatim", False)),
+    )
+    atmospheric_policy = resolve_atmospherics_policy(raw_operator_prompt)
+
     canonical = {
         "_cache_version": CACHE_VERSION,
+        "_creative_mode": creative_mode,
+        "_policy_fingerprint": cache_policy_fingerprint(atmospheric_policy),
         "artist":          (params.get("artist") or "").strip(),
         "song_title":      (params.get("song_title") or "").strip(),
         "style":           (params.get("style") or "").strip().lower(),
@@ -125,7 +148,12 @@ def cache_download(bg_cache_key: str, dest_path: str) -> bool:
     return storage.download_object(cache_r2_key(bg_cache_key), dest_path)
 
 
-def run_bg_preview_job(job_id: str, bg_cache_key: str, params: dict) -> dict:
+def run_bg_preview_job(
+    job_id: str,
+    bg_cache_key: str,
+    params: dict,
+    background_policy_fingerprint: str | None = None,
+) -> dict:
     """RQ entry point — runs ONLY the background generation step + uploads to R2.
 
     Reusa `_ensure_background` del pipeline existente. No render lyrics overlay,
@@ -140,6 +168,46 @@ def run_bg_preview_job(job_id: str, bg_cache_key: str, params: dict) -> dict:
     from observability import set_job_log_context
     set_job_log_context(job_id)
     from jobs import update_job
+
+    runtime_policy = resolve_atmospherics_policy(params.get("background_hint"))
+    runtime_fingerprint = runtime_rollout_fingerprint(
+        mode=runtime_policy.get("policy_mode")
+    )
+    expected_cache_key = compute_bg_cache_key(params)
+    lockstep_invalid = bool(
+        (background_policy_fingerprint
+         and background_policy_fingerprint != runtime_fingerprint)
+        or (policy_enforces(runtime_policy) and not background_policy_fingerprint)
+        or bg_cache_key != expected_cache_key
+    )
+    if lockstep_invalid:
+        logger.error(
+            "[BG_PREVIEW] refusing job=%s due policy/cache mismatch "
+            "queued_policy=%s runtime_policy=%s queued_key=%s expected_key=%s",
+            job_id,
+            background_policy_fingerprint or "missing",
+            runtime_fingerprint,
+            bg_cache_key,
+            expected_cache_key,
+        )
+        try:
+            update_job(
+                job_id,
+                status="bg_preview_failed",
+                current_step="background",
+                error=(
+                    "Background safety configuration changed while the preview "
+                    "was queued. Retry after deployment finishes."
+                ),
+            )
+        except Exception:
+            pass
+        return {
+            "job_id": job_id,
+            "status": "bg_preview_failed",
+            "bg_cache_key": bg_cache_key,
+            "error": "background_policy_mismatch",
+        }
 
     # Idempotency check — race window entre enqueue y worker pickup.
     if cache_check(bg_cache_key):
@@ -160,7 +228,11 @@ def run_bg_preview_job(job_id: str, bg_cache_key: str, params: dict) -> dict:
     # arrastra mucho — preferimos lazy para que el módulo bg_preview sea
     # importable en tests sin spin-up del backend entero).
     try:
-        from pipeline import _ensure_background, _compute_allow_people
+        from pipeline import (
+            _ensure_background,
+            _compute_allow_people,
+            _validate_background_asset_for_job,
+        )
 
         with tempfile.TemporaryDirectory() as job_dir:
             # _ensure_background returns path to generated bg video/image.
@@ -198,6 +270,18 @@ def run_bg_preview_job(job_id: str, bg_cache_key: str, params: dict) -> dict:
 
             if not bg_path or not os.path.exists(bg_path):
                 raise RuntimeError("background generation returned no file")
+
+            # Generation prompts are guidance, not a compliance boundary.  A
+            # model may still hallucinate prohibited content, so an asset must
+            # pass the authoritative final-background gate before it can enter
+            # the trusted v4 preview namespace.  Rejected previews never reach
+            # cache_put.
+            if not _validate_background_asset_for_job(
+                job_id,
+                bg_path,
+                params.get("background_hint"),
+            ):
+                raise RuntimeError("background preview rejected by content policy")
 
             uploaded_key = cache_put(bg_cache_key, bg_path)
             if not uploaded_key:
