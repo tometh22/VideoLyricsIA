@@ -18,6 +18,10 @@ moviepy==1.0.3
 librosa==0.10.2
 Pillow==11.1.0
 numpy<2
+# Independent, provider-free face/person gate for Universal backgrounds.
+# Gemini remains the semantic classifier; OpenCV is the second signal so a
+# single model outage or false negative cannot approve an asset by itself.
+opencv-python-headless>=4.10.0,<4.12.0
 google-genai>=1.40.0,<2.0.0
 google-api-python-client>=2.0.0,<3.0.0
 google-auth>=2.0.0,<3.0.0
