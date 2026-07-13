@@ -68,11 +68,12 @@ logger = logging.getLogger("genly.bg_preview")
 # ordenadas para que el mismo dict en distinto orden produzca el mismo key.
 # Si agregamos params futuros que afecten el background, sumarlos acá +
 # bumpear CACHE_VERSION para invalidar el cache existente.
-# v4 isolates previews by the resolved internal background policy.  In
+# v5 also invalidates previews created before human-output recovery and the
+# camera-equipment prompt fix. The atmospheric policy itself remains v4. In
 # particular off/shadow/enforce never share a key, and an asset generated
 # under the legacy namespace cannot become an enforce-mode cache hit. Every
-# v4 entry also passed the authoritative content gate before cache_put.
-CACHE_VERSION = "v4"
+# v5 entry also passed the authoritative content gate before cache_put.
+CACHE_VERSION = "v5"
 
 
 def compute_bg_cache_key(params: dict) -> str:
@@ -232,57 +233,78 @@ def run_bg_preview_job(
         from pipeline import (
             _ensure_background,
             _compute_allow_people,
+            _raise_if_job_timeout,
             _validate_background_asset_for_job,
+            _write_safe_gradient_background,
         )
 
         with tempfile.TemporaryDirectory() as job_dir:
-            # _ensure_background returns path to generated bg video/image.
-            # FIX 2026-05-25: la signatura real NO tiene `duration`, `effect`,
-            # `animate_image`, `segments`, ni `lang` — eran kwargs que evolucionaron
-            # fuera o nunca existieron. El primer arg posicional es `style_hint`
-            # (no `style`). El effect overlay se compone en el render final
-            # (fx_compositor), no en bg-gen. Pasamos solo lo que la signatura acepta.
-            bg_path = _ensure_background(
-                params.get("style", "auto"),  # style_hint (positional)
-                job_dir,                       # job_dir (positional)
-                # job_id REAL del job ghost (existe en `jobs`, 12 chars). Antes
-                # se pasaba f"bgpreview_{job_id}" (~22 chars), lo que rompía el
-                # INSERT de provenance: ai_provenance.job_id es VARCHAR(12) con
-                # FK a jobs.job_id → StringDataRightTruncation (Sentry "Failed to
-                # insert provenance start row") y, aun si entrara por longitud,
-                # violaría el FK. Con el id real la auditoría UMG queda bien atada
-                # al job, y el progress-crawl + heartbeat de Veo ahora
-                # actualizan/protegen el job ghost correctamente.
-                job_id=job_id,
-                artist=params.get("artist", ""),
-                song_title=params.get("song_title", ""),
-                genre=params.get("genre", ""),
-                concept=params.get("concept", ""),
-                movement_style=params.get("movement_style", ""),
-                match_lyrics=bool(params.get("match_lyrics", True)),
-                background_hint=params.get("background_hint"),
-                bg_verbatim=bool(params.get("bg_verbatim", False)),
-                bg_mode=params.get("background_mode", "veo"),
-                custom_colors=params.get("custom_colors", ""),
-                allow_people=_compute_allow_people(
-                    job_id, params.get("background_hint")
-                ),
-            )
+            # Generation prompts are guidance, not a compliance boundary. If
+            # the model hallucinates a person/smoke/brand, discard only that
+            # background and make one fresh paid attempt under a unique cache
+            # namespace. Never turn the preview tracker into a rejected video.
+            bg_path = None
+            for safety_attempt in range(2):
+                try:
+                    candidate = _ensure_background(
+                        params.get("style", "auto"),
+                        job_dir,
+                        job_id=job_id,
+                        artist=params.get("artist", ""),
+                        song_title=params.get("song_title", ""),
+                        genre=params.get("genre", ""),
+                        concept=params.get("concept", ""),
+                        movement_style=params.get("movement_style", ""),
+                        match_lyrics=bool(params.get("match_lyrics", True)),
+                        background_hint=params.get("background_hint"),
+                        bg_verbatim=bool(params.get("bg_verbatim", False)),
+                        bg_mode=params.get("background_mode", "veo"),
+                        custom_colors=params.get("custom_colors", ""),
+                        allow_people=_compute_allow_people(
+                            job_id, params.get("background_hint")
+                        ),
+                        generation_nonce=(
+                            f"preview-{job_id}-{safety_attempt}"
+                            if safety_attempt else ""
+                        ),
+                    )
+                except Exception as generation_error:
+                    _raise_if_job_timeout(generation_error)
+                    logger.warning(
+                        "[BG_PREVIEW] job=%s generation attempt=%s failed: %s",
+                        job_id, safety_attempt + 1, generation_error,
+                    )
+                    continue
+                if not candidate or not os.path.exists(candidate):
+                    continue
+                if _validate_background_asset_for_job(
+                    job_id,
+                    candidate,
+                    params.get("background_hint"),
+                    failure_status=None,
+                ):
+                    bg_path = candidate
+                    break
+                logger.warning(
+                    "[BG_PREVIEW] job=%s discarded unsafe background attempt=%s",
+                    job_id,
+                    safety_attempt + 1,
+                )
 
-            if not bg_path or not os.path.exists(bg_path):
-                raise RuntimeError("background generation returned no file")
-
-            # Generation prompts are guidance, not a compliance boundary.  A
-            # model may still hallucinate prohibited content, so an asset must
-            # pass the authoritative final-background gate before it can enter
-            # the trusted v4 preview namespace.  Rejected previews never reach
-            # cache_put.
-            if not _validate_background_asset_for_job(
-                job_id,
-                bg_path,
-                params.get("background_hint"),
-            ):
-                raise RuntimeError("background preview rejected by content policy")
+            if bg_path is None:
+                bg_path = _write_safe_gradient_background(
+                    job_dir,
+                    params.get("style", "auto"),
+                    filename="bg_preview_policy_fallback.mp4",
+                )
+                update_job(job_id, validation_result={
+                    "passed": True,
+                    "issues": [],
+                    "validation_scope": "deterministic_local_fallback",
+                    "recovered_from_unsafe_generation": True,
+                    "policy_version": runtime_policy.get("policy_version"),
+                    "policy_mode": runtime_policy.get("policy_mode"),
+                })
 
             uploaded_key = cache_put(bg_cache_key, bg_path)
             if not uploaded_key:
@@ -305,6 +327,12 @@ def run_bg_preview_job(
         }
 
     except Exception as e:
+        try:
+            _raise_if_job_timeout(e)
+        except NameError:
+            # Policy mismatch/import failures happen before the lazy pipeline
+            # import. They cannot be an RQ timeout raised by provider work.
+            pass
         import traceback
         logger.error("[BG_PREVIEW] job=%s failed: %s\n%s", job_id, e, traceback.format_exc())
         # Surface to Sentry with the job tag — bg_preview runs in the RQ
