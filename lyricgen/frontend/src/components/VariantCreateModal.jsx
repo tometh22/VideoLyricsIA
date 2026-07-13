@@ -113,12 +113,10 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
     // backend defaulted to UMG-validate. Real incident 2026-05-19:
     // operator picked "fondo libre", job validated and failed anyway.
     //
-    // Backend gating (pipeline.py): bypass=True forces SKIP, force=True
-    // forces VALIDATE — regardless of tenant. So sending the flag
-    // unconditionally is correct: it always matches operator intent and
-    // only "departs" from default when the operator's choice differs
-    // from their tenant's default. The flag is idempotent when it
-    // confirms the default.
+    // Backend gating (pipeline.py) remains authoritative: Universal always
+    // validates; elsewhere, bypass only permits people when this operation's
+    // prompt explicitly requests them. Sending one flag here records the
+    // current intent and prevents a stale opposite choice from surviving.
     if (!validationEnabled) {
       payload.bypass_content_validation = true;
     } else {

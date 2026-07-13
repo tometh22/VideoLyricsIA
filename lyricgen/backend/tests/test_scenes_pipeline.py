@@ -198,6 +198,40 @@ def test_scene_clips_all_fail_raises(monkeypatch, tmp_path):
         pipeline._generate_scene_clips(plan, str(tmp_path), artist="A", song_title="S")
 
 
+def test_scene_validation_receives_current_operator_prompt(monkeypatch, tmp_path):
+    """A legal non-Universal people opt-in must not be reclassified as strict
+    merely because multi-scene validation lost the prompt at the last hop."""
+    import veo_breaker
+
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+
+    def fake_veo(_prompt, output_path, **_kwargs):
+        with open(output_path, "wb") as fh:
+            fh.write(b"clip")
+        return output_path
+
+    captured = []
+
+    def fake_policy(job_id, operator_prompt=None):
+        captured.append((job_id, operator_prompt))
+        return {"should_validate": False}
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    monkeypatch.setattr(pipeline, "_background_safety_policy", fake_policy)
+    monkeypatch.setattr(pipeline, "_persist_scene_thumb", lambda *a, **kw: None)
+    plan = {"scenes": [{
+        "recurrence_key": "coro_1", "prompt": "a singer on stage",
+        "movement_style": "dynamic",
+    }]}
+
+    pipeline._generate_scene_clips(
+        plan, str(tmp_path), artist="A", song_title="S", job_id="job123",
+        allow_people=True, operator_prompt="a singer on stage",
+    )
+
+    assert captured == [("job123", "a singer on stage")]
+
+
 def _two_scene_plan():
     return {
         "bible": {"world": "w", "palette": "p", "texture": "t", "camera": "c", "motif": "m"},
