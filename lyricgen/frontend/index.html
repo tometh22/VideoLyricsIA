@@ -39,9 +39,12 @@
          render the same image as the PNG fallback (the prior hand-coded
          vector SVG was a different earlier design without the blue
          dot). -->
-    <link rel="icon" type="image/svg+xml" href="/brand/genly-icon-color.svg" />
-    <link rel="shortcut icon" href="/brand/favicon.ico" />
-    <link rel="apple-touch-icon" sizes="180x180" href="/brand/apple-touch-icon.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/favicon-192.png" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="shortcut icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <!-- Google Fonts for the lyric-video font picker preview. The 8 families
          here mirror the backend's _FONT_CATALOGUE so what the operator sees
          in the dropdown is exactly what the worker renders. -->
@@ -63,9 +66,9 @@
   </head>
   <body class="min-h-screen">
     <div id="root">
-      <div id="_loader" style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#080910;gap:16px;">
-        <div style="width:40px;height:40px;border:2px solid #7557FF;border-top-color:transparent;border-radius:50%;animation:_spin 0.8s linear infinite;"></div>
-        <p id="_loader_msg" style="color:#A7ABBA;font-family:sans-serif;font-size:13px;margin:0;"></p>
+      <div id="_loader" style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#12121A;gap:16px;">
+        <div style="width:40px;height:40px;border:2px solid #6D4AFF;border-top-color:transparent;border-radius:50%;animation:_spin 0.8s linear infinite;"></div>
+        <p id="_loader_msg" style="color:#A0A3B1;font-family:sans-serif;font-size:13px;margin:0;"></p>
       </div>
       <style>@keyframes _spin{to{transform:rotate(360deg)}}</style>
     </div>
