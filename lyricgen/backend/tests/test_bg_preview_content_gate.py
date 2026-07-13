@@ -215,7 +215,7 @@ def test_preview_policy_or_cache_mismatch_fails_before_generation(monkeypatch):
         "previewjob01",
         "stale",
         {"background_hint": ""},
-        "background-v5:shadow:deny",
+        "background-v6:shadow:deny",
     )
 
     assert result["status"] == "bg_preview_failed"

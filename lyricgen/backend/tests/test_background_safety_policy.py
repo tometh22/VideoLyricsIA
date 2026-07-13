@@ -165,6 +165,74 @@ def test_universal_tenant_ignores_explicit_people_and_bypass(db):
     assert policy["is_umg"] is True
     assert policy["allow_people"] is False
     assert policy["should_validate"] is True
+    assert policy["requires_secondary_validator"] is True
+
+
+def test_common_account_does_not_pay_for_universal_secondary_detector(db):
+    job_id = _job(db)
+    assert pipeline._background_safety_policy(job_id)[
+        "requires_secondary_validator"
+    ] is False
+
+
+def test_universal_rewrite_removes_artist_but_preserves_creative_intent(
+    db, monkeypatch,
+):
+    import provenance
+
+    job_id = _job(db, tenant="universal_argentina")
+    original = (
+        "Safety canta en un estudio de grabación de Buenos Aires de 1996, "
+        "con consola analógica, luces azules, cámara fija, lluvia en las "
+        "ventanas y movimiento ambiental lento"
+    )
+    rewritten = (
+        "Estudio de grabación vacío de Buenos Aires de 1996, con consola "
+        "analógica, luces azules, cámara fija, lluvia en las ventanas y "
+        "movimiento ambiental lento, sin personas ni rostros"
+    )
+
+    class _Recorder:
+        def finish(self, **_kwargs):
+            return None
+
+    class _Models:
+        @staticmethod
+        def generate_content(**_kwargs):
+            return type("Response", (), {"text": rewritten})()
+
+    fake_client = type("Client", (), {"models": _Models()})()
+    monkeypatch.setattr(provenance, "record_ai_call", lambda **_kwargs: _Recorder())
+    monkeypatch.setattr(pipeline, "_get_genai_client", lambda: fake_client)
+
+    safe = pipeline._sanitize_people_at_provider_boundary(
+        original,
+        allow_people=False,
+        job_id=job_id,
+    )
+
+    assert safe == rewritten
+    assert "Safety" not in safe
+    for detail in ("Buenos Aires", "1996", "consola", "luces azules", "cámara fija"):
+        assert detail in safe
+
+
+def test_static_camera_constraint_survives_safety_rewrite_failure(db, monkeypatch):
+    job_id = _job(db, tenant="universal_argentina")
+    monkeypatch.setattr(
+        pipeline,
+        "_get_genai_client",
+        lambda: (_ for _ in ()).throw(RuntimeError("rewrite unavailable")),
+    )
+
+    safe = pipeline._sanitize_people_at_provider_boundary(
+        "Una cantante en estudio, cámara fija y sin paneos",
+        allow_people=False,
+        job_id=job_id,
+    )
+
+    assert "locked-off fixed tripod camera" in safe
+    assert "no pan" in safe
 
 
 def test_restricted_provider_boundary_replaces_positive_human_subject():
@@ -380,7 +448,7 @@ def test_scene_validation_does_not_trust_stored_people_allow_after_umg_change(db
             "operator_prompt": "A singer facing camera",
             "allow_people": True,
             "atmospherics_policy": {
-                "policy_version": "background-v5",
+                "policy_version": "background-v6",
                 "policy_mode": "off",
                 "allow_atmospherics": False,
                 "explicit_atmospherics": [],
@@ -388,7 +456,7 @@ def test_scene_validation_does_not_trust_stored_people_allow_after_umg_change(db
             },
             "validation": {
                 "passed": True,
-                "policy_fingerprint": "background-v5:off:deny|people:allow",
+                "policy_fingerprint": "background-v6:off:deny|people:allow",
             },
         }]
     }
@@ -405,6 +473,18 @@ def test_all_delivery_profiles_and_edit_paths_are_wired_to_validation():
     assert "if wants_youtube or wants_umg" in initial_source
     assert "_validate_background_asset_for_job" in edit_source
     assert "_validate_scene_video" in scene_source
+
+
+def test_universal_delivery_gate_runs_before_upload_and_success_state():
+    for handler, success_marker in (
+        (pipeline.run_pipeline, "final_status ="),
+        (pipeline.run_edit_pipeline, 'status="pending_review", progress=100'),
+    ):
+        source = inspect.getsource(handler)
+        seal_at = source.index("_seal_universal_delivery(")
+        upload_at = source.index("_upload_deliverables_to_r2(")
+        success_at = source.index(success_marker)
+        assert seal_at < upload_at < success_at
 
 
 def test_policy_choice_default_is_safe_and_preserves_unrelated_params():

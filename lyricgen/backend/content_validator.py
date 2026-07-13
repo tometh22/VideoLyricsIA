@@ -7,12 +7,20 @@ Keeping detection separate from enforcement prevents an opt-in for one visual
 element from accidentally disabling the other safety gates.
 """
 
+import hashlib
 import logging
 import os
 import subprocess
 import tempfile
+import threading
+from functools import lru_cache
 
 logger = logging.getLogger("genly.validator")
+
+GEMINI_VALIDATOR_VERSION = "gemini-2.5-flash-vision-v2"
+LOCAL_VALIDATOR_VERSION = "opencv-yunet-face-v1"
+_YUNET_MODEL_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
+_LOCAL_DETECTOR_LOCK = threading.Lock()
 
 
 def _safe_ffmpeg_path(path: str) -> str:
@@ -35,7 +43,7 @@ def _safe_ffmpeg_path(path: str) -> str:
 
 def _extract_frames(
     video_path: str,
-    interval_seconds: int = 1,
+    interval_seconds: float = 1,
     max_frames: int = 48,
 ) -> tuple[list[str], str, int]:
     """Extract frames from a video at regular intervals using ffmpeg.
@@ -95,10 +103,165 @@ def _extract_frames(
     return frame_paths, tmp_dir, len(timestamps)
 
 
+def _extract_frames_with_opencv(
+    video_path: str,
+    interval_seconds: float = 0.25,
+    max_frames: int = 192,
+) -> tuple[list[str], str, int]:
+    """Extract uniformly distributed samples with one local decoder.
+
+    Spawning one ffmpeg process per dense sample made the independent
+    Universal pass unnecessarily expensive. OpenCV keeps one decoder open,
+    still covers the complete asset, and returns an explicit planned count so
+    a partial decode remains a fail-closed result.
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="genly_validate_local_")
+    try:
+        cv2, _detector = _local_detector_assets()
+        capture = cv2.VideoCapture(_safe_ffmpeg_path(video_path))
+        if not capture.isOpened():
+            return [], tmp_dir, 1
+        try:
+            fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+            frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+            duration = frame_count / fps if fps > 0 and frame_count > 0 else 0.0
+            if duration <= 0:
+                return [], tmp_dir, 1
+
+            usable_start = min(1.0, max(duration * 0.05, 0.0))
+            usable_end = max(
+                usable_start,
+                duration - min(0.5, duration * 0.02),
+            )
+            dense_count = max(
+                1,
+                int(max(usable_end - usable_start, 0.0) / interval_seconds) + 1,
+            )
+            sample_count = min(max_frames, dense_count)
+            if sample_count <= 1:
+                timestamps = [usable_start]
+            else:
+                step = (usable_end - usable_start) / (sample_count - 1)
+                timestamps = [usable_start + (step * i) for i in range(sample_count)]
+
+            paths: list[str] = []
+            for index, timestamp in enumerate(timestamps):
+                capture.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000.0)
+                ok, frame = capture.read()
+                if not ok or frame is None or not getattr(frame, "size", 0):
+                    continue
+                out_path = os.path.join(tmp_dir, f"frame_{index:03d}.jpg")
+                if cv2.imwrite(out_path, frame):
+                    paths.append(out_path)
+            return paths, tmp_dir, len(timestamps)
+        finally:
+            capture.release()
+    except LocalDetectorCheckError:
+        return [], tmp_dir, 1
+    except Exception as exc:
+        logger.warning("OpenCV frame extraction failed: %s", exc)
+        return [], tmp_dir, 1
+
+
 class ValidatorCheckError(Exception):
     """Raised when the Vision check could not produce a verdict (network,
     auth, malformed response). Distinct from "checked-and-flagged" so the
     caller can fail-closed instead of silently passing."""
+
+
+class LocalDetectorCheckError(Exception):
+    """Raised when the independent local face/person detector cannot run."""
+
+
+@lru_cache(maxsize=1)
+def _local_detector_assets():
+    """Load OpenCV's provider-free YuNet face detector once per worker.
+
+    YuNet is materially more selective than Haar/HOG on stylized backgrounds:
+    lamps, dogs and building windows produced too many false positives during
+    the retrospective Universal audit. Gemini remains the high-recall semantic
+    detector for people/figures; this independent pass is deliberately focused
+    on the client's highest-risk failure mode: a visible face.
+    """
+    try:
+        import cv2
+
+        model_path = os.path.join(
+            os.path.dirname(__file__),
+            "assets", "models", "face_detection_yunet_2023mar.onnx",
+        )
+        if not os.path.isfile(model_path):
+            raise RuntimeError("bundled YuNet face model is unavailable")
+        with open(model_path, "rb") as model_file:
+            model_sha256 = hashlib.sha256(model_file.read()).hexdigest()
+        if model_sha256 != _YUNET_MODEL_SHA256:
+            raise RuntimeError("bundled YuNet face model checksum is invalid")
+        detector = cv2.FaceDetectorYN.create(
+            model=model_path,
+            config="",
+            input_size=(320, 320),
+            # Calibrated against the complete historical Universal set:
+            # 0.80 still confused rain droplets (0.817) and a full moon
+            # (0.803) with a face; real visible faces in the same set scored
+            # 0.861+. Keep the threshold explicit and regression-tested.
+            score_threshold=0.85,
+            nms_threshold=0.3,
+            top_k=5000,
+        )
+        return cv2, detector
+    except Exception as exc:  # pragma: no cover - exact import error is platform-specific
+        raise LocalDetectorCheckError(str(exc)) from exc
+
+
+def _check_frame_with_local_detector(image_path: str) -> dict:
+    """Detect visible faces without a network/provider call."""
+    try:
+        cv2, detector = _local_detector_assets()
+        image = cv2.imread(image_path)
+        if image is None or not getattr(image, "size", 0):
+            raise RuntimeError("OpenCV could not decode sampled frame")
+
+        height, width = image.shape[:2]
+        max_width = 1280
+        if width > max_width:
+            scale = max_width / float(width)
+            image = cv2.resize(
+                image,
+                (max_width, max(1, int(round(height * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+        height, width = image.shape[:2]
+        # FaceDetectorYN mutates its configured input size; serialize calls in
+        # case an API process validates two previews concurrently.
+        with _LOCAL_DETECTOR_LOCK:
+            detector.setInputSize((width, height))
+            _status, faces = detector.detect(image)
+        face_count = 0 if faces is None else len(faces)
+        evidence: list[str] = []
+        if face_count:
+            min_score = min(float(face[-1]) for face in faces)
+            evidence.append(
+                f"visible_face:{face_count}:min_score={min_score:.3f}"
+            )
+
+        return {"people": bool(evidence), "evidence": evidence}
+    except LocalDetectorCheckError:
+        raise
+    except Exception as exc:
+        raise LocalDetectorCheckError(str(exc)) from exc
+
+
+def _cleanup_extracted_frames(frame_paths: list[str], tmp_dir: str | None) -> None:
+    for frame_path in frame_paths:
+        try:
+            os.unlink(frame_path)
+        except OSError:
+            pass
+    if tmp_dir:
+        try:
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
 
 
 def _check_frame_with_gemini(image_path: str) -> dict:
@@ -333,6 +496,7 @@ def validate_video(
     allow_atmospherics: bool = True,
     observe_atmospherics: bool = False,
     enforce_atmospherics: bool = False,
+    require_secondary: bool = False,
 ) -> dict:
     """Validate a video for prohibited content.
 
@@ -357,51 +521,104 @@ def validate_video(
     ) if job_id else None
 
     frame_paths, tmp_dir, planned_frames = _extract_frames(video_path)
+    secondary_paths: list[str] = []
+    secondary_tmp_dir: str | None = None
+    secondary_planned = 0
     all_issues = []
     check_errors = 0
     frames_checked = 0
+    secondary_errors = 0
+    secondary_frames_checked = 0
+    secondary_extraction_errors = 0
     detected = {"people": False, "atmospherics": False, "brand": False}
     observations = []
 
     try:
-        for i, frame_path in enumerate(frame_paths):
-            try:
-                result = _check_frame_with_gemini(frame_path)
-            except ValidatorCheckError as e:
-                check_errors += 1
-                logger.warning("[VALIDATION] frame %d check error: %s", i, e)
-                break
-            frames_checked += 1
-            verdict = _evaluate_frame_result(
-                result,
-                allow_people=allow_people,
-                allow_atmospherics=allow_atmospherics,
-                enforce_atmospherics=enforce_atmospherics,
+        # Universal gets a provider-independent, denser 4 fps pass first.
+        # It catches faces that appear between Gemini's semantic samples and
+        # prevents a single network model from being the sole approval signal.
+        if require_secondary:
+            secondary_paths, secondary_tmp_dir, secondary_planned = _extract_frames_with_opencv(
+                video_path, interval_seconds=0.25, max_frames=192
             )
-            for category, present in verdict["detections"].items():
-                detected[category] = detected[category] or present
-            if observe_atmospherics:
-                observations.extend(
-                    {"frame": i, "type": issue}
-                    for issue in verdict["observations"]
+            secondary_extraction_errors = max(
+                0, secondary_planned - len(secondary_paths)
+            )
+            for i, frame_path in enumerate(secondary_paths):
+                try:
+                    local_result = _check_frame_with_local_detector(frame_path)
+                except LocalDetectorCheckError as exc:
+                    secondary_errors += 1
+                    logger.warning(
+                        "[VALIDATION] local detector frame %d error: %s", i, exc
+                    )
+                    break
+                secondary_frames_checked += 1
+                if local_result.get("people") is True:
+                    detected["people"] = True
+                    evidence = ", ".join(local_result.get("evidence") or [])
+                    all_issues.append({
+                        "frame": i,
+                        "type": (
+                            "people: independent local face/person detector "
+                            f"reported visible human evidence ({evidence or 'unspecified'})"
+                        ),
+                        "validator": LOCAL_VALIDATOR_VERSION,
+                    })
+                    break
+
+            secondary_complete = bool(
+                secondary_planned > 0
+                and secondary_extraction_errors == 0
+                and secondary_frames_checked == secondary_planned
+                and secondary_errors == 0
+            )
+            if not secondary_complete and not all_issues:
+                all_issues.append({
+                    "frame": -1,
+                    "type": (
+                        "Independent local validator did not inspect every dense "
+                        f"sample ({secondary_frames_checked}/{secondary_planned} checked, "
+                        f"{secondary_extraction_errors} extraction errors, "
+                        f"{secondary_errors} detector errors). Treating as failed "
+                        "per fail-closed Universal policy."
+                    ),
+                    "validator": LOCAL_VALIDATOR_VERSION,
+                })
+        else:
+            secondary_complete = True
+
+        # A decisive/incomplete local verdict already blocks the candidate;
+        # avoid spending paid Gemini calls on an asset that cannot be approved.
+        if not all_issues:
+            for i, frame_path in enumerate(frame_paths):
+                try:
+                    result = _check_frame_with_gemini(frame_path)
+                except ValidatorCheckError as e:
+                    check_errors += 1
+                    logger.warning("[VALIDATION] frame %d check error: %s", i, e)
+                    break
+                frames_checked += 1
+                verdict = _evaluate_frame_result(
+                    result,
+                    allow_people=allow_people,
+                    allow_atmospherics=allow_atmospherics,
+                    enforce_atmospherics=enforce_atmospherics,
                 )
-            if not verdict["passed"]:
-                for issue in verdict["issues"]:
-                    all_issues.append({"frame": i, "type": issue})
-                break
+                for category, present in verdict["detections"].items():
+                    detected[category] = detected[category] or present
+                if observe_atmospherics:
+                    observations.extend(
+                        {"frame": i, "type": issue}
+                        for issue in verdict["observations"]
+                    )
+                if not verdict["passed"]:
+                    for issue in verdict["issues"]:
+                        all_issues.append({"frame": i, "type": issue})
+                    break
     finally:
-        # Clean up temp frames + dir even when _extract_frames produced
-        # zero usable frames (mkdtemp leaks otherwise).
-        for fp in frame_paths:
-            try:
-                os.unlink(fp)
-            except OSError:
-                pass
-        if tmp_dir:
-            try:
-                os.rmdir(tmp_dir)
-            except OSError:
-                pass
+        _cleanup_extracted_frames(frame_paths, tmp_dir)
+        _cleanup_extracted_frames(secondary_paths, secondary_tmp_dir)
 
     # Fail closed on ANY partial extraction/check failure. Previously one
     # successful safe frame plus nine Vision timeouts passed the asset. A
@@ -410,17 +627,21 @@ def validate_video(
     # safe, so the intentional early exit is a complete negative verdict.
     expected_frames = planned_frames
     extraction_errors = max(0, planned_frames - len(frame_paths))
-    complete_verdict = (
+    primary_complete = (
         expected_frames > 0
         and extraction_errors == 0
         and frames_checked == expected_frames
         and check_errors == 0
     )
+    complete_verdict = primary_complete and secondary_complete
     decisive_policy_failure = bool(all_issues)
     passed = complete_verdict and not decisive_policy_failure
     summary = (
         f"passed={passed}, frames_checked={frames_checked}, "
-        f"extraction_errors={extraction_errors}, check_errors={check_errors}, issues={len(all_issues)}"
+        f"extraction_errors={extraction_errors}, check_errors={check_errors}, "
+        f"secondary_frames_checked={secondary_frames_checked}, "
+        f"secondary_extraction_errors={secondary_extraction_errors}, "
+        f"secondary_errors={secondary_errors}, issues={len(all_issues)}"
     )
 
     if not complete_verdict and not decisive_policy_failure:
@@ -447,6 +668,15 @@ def validate_video(
         "frames_planned": planned_frames,
         "extraction_errors": extraction_errors,
         "check_errors": check_errors,
+        "secondary_required": bool(require_secondary),
+        "secondary_frames_checked": secondary_frames_checked,
+        "secondary_frames_planned": secondary_planned,
+        "secondary_extraction_errors": secondary_extraction_errors,
+        "secondary_errors": secondary_errors,
+        "validator_stack": [
+            GEMINI_VALIDATOR_VERSION,
+            *([LOCAL_VALIDATOR_VERSION] if require_secondary else []),
+        ],
         "detections": detected,
         "observations": observations,
         "shadow_atmospherics_detected": bool(
@@ -463,6 +693,7 @@ def validate_image(
     allow_atmospherics: bool = True,
     observe_atmospherics: bool = False,
     enforce_atmospherics: bool = False,
+    require_secondary: bool = False,
 ) -> dict:
     """Validate a single image for prohibited content."""
     from provenance import record_ai_call
@@ -481,6 +712,64 @@ def validate_image(
         input_data_types=["image"],
     ) if job_id else None
 
+    local_result = {"people": False, "evidence": []}
+    if require_secondary:
+        try:
+            local_result = _check_frame_with_local_detector(image_path)
+        except LocalDetectorCheckError as e:
+            logger.warning("[VALIDATION] local image detector error: %s", e)
+            if recorder:
+                recorder.finish(response_summary=f"passed=False, secondary_error={e}")
+            return {
+                "passed": False,
+                "issues": [{
+                    "frame": 0,
+                    "type": (
+                        "Independent local validator could not inspect the image "
+                        f"({e}). Treating as failed per fail-closed Universal policy."
+                    ),
+                    "validator": LOCAL_VALIDATOR_VERSION,
+                }],
+                "frames_checked": 0,
+                "frames_planned": 1,
+                "extraction_errors": 0,
+                "check_errors": 0,
+                "secondary_required": True,
+                "secondary_frames_checked": 0,
+                "secondary_frames_planned": 1,
+                "secondary_extraction_errors": 0,
+                "secondary_errors": 1,
+                "validator_stack": [GEMINI_VALIDATOR_VERSION, LOCAL_VALIDATOR_VERSION],
+            }
+        if local_result.get("people") is True:
+            evidence = ", ".join(local_result.get("evidence") or [])
+            if recorder:
+                recorder.finish(response_summary="passed=False, local_people=True")
+            return {
+                "passed": False,
+                "issues": [{
+                    "frame": 0,
+                    "type": (
+                        "people: independent local face/person detector reported "
+                        f"visible human evidence ({evidence or 'unspecified'})"
+                    ),
+                    "validator": LOCAL_VALIDATOR_VERSION,
+                }],
+                "frames_checked": 0,
+                "frames_planned": 1,
+                "extraction_errors": 0,
+                "check_errors": 0,
+                "secondary_required": True,
+                "secondary_frames_checked": 1,
+                "secondary_frames_planned": 1,
+                "secondary_extraction_errors": 0,
+                "secondary_errors": 0,
+                "validator_stack": [GEMINI_VALIDATOR_VERSION, LOCAL_VALIDATOR_VERSION],
+                "detections": {
+                    "people": True, "atmospherics": False, "brand": False,
+                },
+            }
+
     try:
         result = _check_frame_with_gemini(image_path)
     except ValidatorCheckError as e:
@@ -497,7 +786,18 @@ def validate_image(
                 ),
             }],
             "frames_checked": 0,
+            "frames_planned": 1,
+            "extraction_errors": 0,
             "check_errors": 1,
+            "secondary_required": bool(require_secondary),
+            "secondary_frames_checked": 1 if require_secondary else 0,
+            "secondary_frames_planned": 1 if require_secondary else 0,
+            "secondary_extraction_errors": 0,
+            "secondary_errors": 0,
+            "validator_stack": [
+                GEMINI_VALIDATOR_VERSION,
+                *([LOCAL_VALIDATOR_VERSION] if require_secondary else []),
+            ],
         }
     verdict = _evaluate_frame_result(
         result,
@@ -519,8 +819,24 @@ def validate_image(
         "passed": passed,
         "issues": issues,
         "frames_checked": 1,
+        "frames_planned": 1,
+        "extraction_errors": 0,
         "check_errors": 0,
-        "detections": verdict["detections"],
+        "secondary_required": bool(require_secondary),
+        "secondary_frames_checked": 1 if require_secondary else 0,
+        "secondary_frames_planned": 1 if require_secondary else 0,
+        "secondary_extraction_errors": 0,
+        "secondary_errors": 0,
+        "validator_stack": [
+            GEMINI_VALIDATOR_VERSION,
+            *([LOCAL_VALIDATOR_VERSION] if require_secondary else []),
+        ],
+        "detections": {
+            **verdict["detections"],
+            "people": bool(
+                verdict["detections"].get("people") or local_result.get("people")
+            ),
+        },
         "observations": observations,
         "shadow_atmospherics_detected": bool(
             observe_atmospherics
