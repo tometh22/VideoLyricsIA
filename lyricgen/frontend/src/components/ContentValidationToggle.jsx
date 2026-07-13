@@ -5,10 +5,13 @@ import { useI18n } from "../i18n";
 // add a B2B partner here, update the backend constant too. Single source
 // of truth is the backend (which actually enforces the gate); this
 // frontend list only controls UI copy + default toggle position.
-const UMG_TENANTS = new Set(["umg", "omg"]);
+const UMG_TENANTS = new Set([
+  "umg", "omg", "umusic", "universal_argentina", "universal_chile",
+]);
 
 function isUmgTenant(tenantId) {
-  return UMG_TENANTS.has(String(tenantId || "").toLowerCase());
+  const normalized = String(tenantId || "").trim().toLowerCase();
+  return UMG_TENANTS.has(normalized) || normalized.startsWith("universal_");
 }
 
 /**
@@ -53,7 +56,7 @@ export default function ContentValidationToggle({
   const isUmg = isUmgTenant(tenantId);
   // Tenant default for `value`. The parent should initialize state to
   // this; if it didn't (value is undefined), treat as the default.
-  const tenantDefault = isUmg; // UMG defaults to validate=true
+  const tenantDefault = true; // every account defaults to the safe scan
   const effectiveValue = typeof value === "boolean" ? value : tenantDefault;
   // Operator is "departing from default" when their choice doesn't match
   // the tenant default. That's when we want the amber warning visible.
@@ -86,17 +89,17 @@ export default function ContentValidationToggle({
       }
     : {
         sectionLabel: t("validation.section_label") || "¿Restringir el contenido del fondo?",
-        defaultLabel: t("validation.nonumg_default_label") || "No — fondo libre",
+        defaultLabel: t("validation.nonumg_alt_label") || "Sí — sin personas ni marcas",
         defaultRecommended: t("validation.nonumg_default_recommended") || "default",
         defaultDesc:
-          t("validation.nonumg_default_desc") ||
-          "Cualquier escena, sin restricciones.",
+          t("validation.nonumg_alt_desc") ||
+          "Bloquea personas, manos y logos detectables en el fondo.",
         // Non-UMG operators don't know what UMG is. Describe the behavior
         // in concrete terms instead of namedropping the vendor's rule set.
-        altLabel: t("validation.nonumg_alt_label") || "Sí — sin personas ni marcas",
+        altLabel: t("validation.nonumg_default_label") || "No — fondo libre",
         altDesc:
-          t("validation.nonumg_alt_desc") ||
-          "Bloquea caras, manos y logos detectables en el fondo. Útil para entrega a clientes con restricciones de imagen.",
+          t("validation.nonumg_default_desc") ||
+          "Solo permite personas cuando también las pedís explícitamente en el prompt.",
         badge: t("validation.nonumg_badge") || "MODO RESTRINGIDO",
         // brand color when departing (operator is opting INTO the stricter mode)
         departingTone: "brand",
@@ -184,7 +187,7 @@ export default function ContentValidationToggle({
           </label>
 
           {/* Alt (departure) option */}
-          <label
+          {!isUmg && <label
             className={
               "flex items-start gap-2 cursor-pointer p-2 rounded ring-1 transition-colors " +
               (altSelected
@@ -207,14 +210,14 @@ export default function ContentValidationToggle({
                 {copy.altDesc}
               </p>
             </div>
-          </label>
+          </label>}
 
           {/* Warning when "people allowed" is selected. value=false here
               means "no restriction" → AI is free to generate faces / hands.
               Veo's quality on people is uneven (deformed hands, weird
               eyes). Surface that honestly so the operator knows what
               they're committing to. */}
-          {effectiveValue === false && (
+          {!isUmg && effectiveValue === false && (
             <p className="text-[10px] text-ink-tertiary leading-relaxed px-1 pt-1 border-t border-white/[0.05]">
               ⚠ {t("validation.people_quality_warning") ||
                   "El modelo a veces genera personas con artefactos (caras deformadas, manos con dedos extras). Probá un render antes de aprobar — si vas a entregar a un cliente, revisá el resultado."}
