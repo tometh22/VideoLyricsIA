@@ -100,6 +100,46 @@ def test_validate_video_fails_closed_on_partial_check_error(tmp_path, monkeypatc
     assert result["check_errors"] == 1
 
 
+def test_decisive_policy_issue_can_stop_early_without_incomplete_error(
+    tmp_path, monkeypatch,
+):
+    tmp_dir = tempfile.mkdtemp(prefix="genly_validate_test_")
+    frames = []
+    for i in range(2):
+        frame = os.path.join(tmp_dir, f"frame_{i}.jpg")
+        open(frame, "wb").close()
+        frames.append(frame)
+    monkeypatch.setattr(
+        content_validator, "_extract_frames", lambda _p: (frames, tmp_dir, 2)
+    )
+    monkeypatch.setattr(
+        content_validator,
+        "_check_frame_with_gemini",
+        lambda _path: _classified(people=True),
+    )
+
+    result = content_validator.validate_video("fake.mp4")
+
+    assert result["passed"] is False
+    assert result["frames_checked"] == 1
+    assert result["check_errors"] == 0
+    assert len(result["issues"]) == 1
+    assert "people:" in result["issues"][0]["type"]
+    assert not any(
+        "did not produce a verdict" in issue["type"]
+        for issue in result["issues"]
+    )
+
+
+def test_classifier_prompt_distinguishes_equipment_from_people():
+    source = __import__("inspect").getsource(
+        content_validator._check_frame_with_gemini
+    ).lower()
+    assert "tripods" in source
+    assert "not people" in source
+    assert "infer a person solely" in source
+
+
 def test_extract_frames_samples_entire_long_video(tmp_path):
     fake_video = str(tmp_path / "long.mp4")
     open(fake_video, "wb").close()
@@ -147,3 +187,126 @@ def test_extract_frames_unknown_duration_fails_closed(tmp_path):
     assert frames == []
     assert planned == 1
     os.rmdir(tmp_dir)
+
+
+def _classified(*, people=False, atmospherics=False, brand=False):
+    detections = {
+        "people": people,
+        "atmospherics": atmospherics,
+        "brand": brand,
+    }
+    issues = [
+        {"category": category, "reason": f"visible {category}"}
+        for category, present in detections.items() if present
+    ]
+    return {"safe": not people and not brand, "detections": detections, "issues": issues}
+
+
+def test_people_opt_in_does_not_bypass_brand_gate(tmp_path, monkeypatch):
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"jpg")
+    monkeypatch.setattr(
+        content_validator,
+        "_check_frame_with_gemini",
+        lambda _path: _classified(people=True, brand=True),
+    )
+
+    result = content_validator.validate_image(str(image), allow_people=True)
+
+    assert result["passed"] is False
+    assert not any("people:" in issue["type"] for issue in result["issues"])
+    assert any("brand:" in issue["type"] for issue in result["issues"])
+
+
+def test_atmospherics_shadow_is_observed_without_blocking(tmp_path, monkeypatch):
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"jpg")
+    monkeypatch.setattr(
+        content_validator,
+        "_check_frame_with_gemini",
+        lambda _path: _classified(atmospherics=True),
+    )
+
+    result = content_validator.validate_image(
+        str(image),
+        allow_atmospherics=False,
+        observe_atmospherics=True,
+        enforce_atmospherics=False,
+    )
+
+    assert result["passed"] is True
+    assert result["issues"] == []
+    assert result["shadow_atmospherics_detected"] is True
+    assert result["observations"]
+
+
+def test_atmospherics_enforce_blocks_without_operator_opt_in(tmp_path, monkeypatch):
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"jpg")
+    monkeypatch.setattr(
+        content_validator,
+        "_check_frame_with_gemini",
+        lambda _path: _classified(atmospherics=True),
+    )
+
+    result = content_validator.validate_image(
+        str(image),
+        allow_atmospherics=False,
+        observe_atmospherics=False,
+        enforce_atmospherics=True,
+    )
+
+    assert result["passed"] is False
+    assert any("atmospherics:" in issue["type"] for issue in result["issues"])
+
+
+def test_atmospherics_opt_in_does_not_bypass_people_gate(tmp_path, monkeypatch):
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"jpg")
+    monkeypatch.setattr(
+        content_validator,
+        "_check_frame_with_gemini",
+        lambda _path: _classified(people=True, atmospherics=True),
+    )
+
+    result = content_validator.validate_image(
+        str(image),
+        allow_people=False,
+        allow_atmospherics=True,
+        enforce_atmospherics=False,
+    )
+
+    assert result["passed"] is False
+    assert any("people:" in issue["type"] for issue in result["issues"])
+
+
+def test_categorized_issue_promotes_contradictory_false_detection():
+    result = content_validator._evaluate_frame_result(
+        {
+            "safe": True,
+            "detections": {
+                "people": False,
+                "atmospherics": False,
+                "brand": False,
+            },
+            "issues": [{"category": "people", "reason": "visible hand"}],
+        },
+        allow_people=False,
+        allow_atmospherics=False,
+        enforce_atmospherics=True,
+    )
+
+    assert result["passed"] is False
+    assert result["detections"]["people"] is True
+    assert any("visible hand" in issue for issue in result["issues"])
+
+
+def test_legacy_safe_with_unattributed_issues_fails_closed():
+    result = content_validator._evaluate_frame_result(
+        {"safe": True, "issues": ["visible human"]},
+        allow_people=True,
+        allow_atmospherics=True,
+        enforce_atmospherics=False,
+    )
+
+    assert result["passed"] is False

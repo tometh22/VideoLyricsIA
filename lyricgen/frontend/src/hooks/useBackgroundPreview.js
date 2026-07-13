@@ -36,6 +36,23 @@ const POLL_INTERVAL_INITIAL_MS = 1500;
 const POLL_INTERVAL_MAX_MS = 5000;
 const POLL_TIMEOUT_MS = 5 * 60 * 1000;  // 5 min hard cap
 
+/**
+ * A preview cache contains one AI-generated background. It is useful only
+ * for the single-background AI path: library/custom sources already provide
+ * their own asset, while multi-scene must generate its complete scene plan.
+ */
+export function shouldEnableBackgroundPreview({
+  hasReview,
+  editMode,
+  bgSelectMode,
+  enableScenes,
+}) {
+  return !!hasReview
+    && !editMode
+    && bgSelectMode === "auto"
+    && !enableScenes;
+}
+
 function extractParams(entry) {
   // Sólo los campos del background. Si cambia alguno, el hash backend
   // difiere y se dispara un nuevo preview.

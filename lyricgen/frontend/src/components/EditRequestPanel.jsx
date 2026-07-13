@@ -1,15 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import BackgroundHintField from "./BackgroundHintField";
-import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
+import ContentValidationToggle from "./ContentValidationToggle";
 import { useAlert } from "./AlertProvider";
 
-function _readTenant() {
+function _readAccount() {
   try {
     const u = JSON.parse(localStorage.getItem("genly_user") || "null");
-    return u?.tenant_id || null;
+    return {
+      tenantId: u?.tenant_id || null,
+      billingGroup: u?.billing_group || null,
+    };
   } catch {
-    return null;
+    return { tenantId: null, billingGroup: null };
   }
 }
 
@@ -81,11 +84,9 @@ export default function EditRequestPanel({
   // Tenant-aware content-validation toggle. Boolean semantics:
   // value=true  → operator wants validator to run
   // value=false → operator wants validator skipped
-  // Default per tenant: UMG tenants validate, others skip.
-  // Mapped to bypass_content_validation OR force_content_validation in
-  // the payload depending on which direction departs from tenant default.
-  const _tenantId = _readTenant();
-  const _isUmg = isUmgTenant(_tenantId);
+  // All accounts default to validation. Universal sees a fixed policy notice;
+  // common accounts can explicitly choose the existing fondo-libre mode.
+  const { tenantId: _tenantId, billingGroup: _billingGroup } = _readAccount();
   const [validationEnabled, setValidationEnabled] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
@@ -488,6 +489,7 @@ export default function EditRequestPanel({
             value={validationEnabled}
             onChange={setValidationEnabled}
             tenantId={_tenantId}
+            billingGroup={_billingGroup}
             disabled={submitting}
           />
 

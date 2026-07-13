@@ -270,6 +270,29 @@ def main():
     init_logging()
     init_sentry()
 
+    from background_policy import (
+        POLICY_ENV as _bg_policy_env,
+        POLICY_VERSION as _bg_policy_version,
+        VALID_POLICY_MODES as _bg_policy_modes,
+        policy_mode as _bg_policy_mode,
+    )
+    from observability import _resolve_release as _resolve_runtime_release
+    logger.info(
+        "[BG_POLICY][STARTUP] process=rq-worker release=%s environment=%s "
+        "policy_version=%s policy_mode=%s cache_namespace=%s queues=%s",
+        _resolve_runtime_release(),
+        os.environ.get("ENVIRONMENT", "production").lower().strip(),
+        _bg_policy_version, _bg_policy_mode(),
+        _bg_policy_version,
+        ",".join(_resolve_queue_names()),
+    )
+    _raw_bg_policy_mode = os.environ.get(_bg_policy_env, "off").strip().lower()
+    if _raw_bg_policy_mode not in _bg_policy_modes:
+        logger.warning(
+            "[BG_POLICY][STARTUP] invalid %s=%r; resolved fail-safe to off",
+            _bg_policy_env, _raw_bg_policy_mode,
+        )
+
     _warn_if_shutdown_grace_too_short()
 
     from redis import Redis

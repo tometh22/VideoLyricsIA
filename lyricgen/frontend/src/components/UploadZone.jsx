@@ -6,6 +6,7 @@ import WizardLivePreview from "./WizardLivePreview";
 import TitleCardPreview from "./TitleCardPreview";
 import HelpTip from "./HelpCenter/HelpTip";
 import { track } from "../lib/telemetryTrack";
+import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -435,14 +436,17 @@ export default function UploadZone({
   const selectSceneMode = (m) => {
     track("wizard.scene_mode", { mode: m });
     setSceneMode(m);
+    // Keep the legacy `match_lyrics` payload deterministic. "Mi prompt"
+    // must not inherit whichever card happened to be selected before it.
+    // Public payload fields remain unchanged: Auto/Prompt=false, Lyrics=true.
+    onInspiredByLyricsChange && onInspiredByLyricsChange(
+      inspiredByLyricsForSceneMode(m),
+    );
     if (m === "auto") {
-      onInspiredByLyricsChange && onInspiredByLyricsChange(false);
       if (_hint) updateBatchDefault("backgroundHint", "");   // stale prompt must not override
     } else if (m === "lyrics") {
-      onInspiredByLyricsChange && onInspiredByLyricsChange(true);
       if (_hint) updateBatchDefault("backgroundHint", "");
     }
-    // prompt: leave inspired as-is; the textarea below drives it.
     // Nota: multi-escena (enableScenes) es ORTOGONAL — funciona con cualquiera
     // de los 3 modos; su toggle premium vive debajo de las cards.
   };
