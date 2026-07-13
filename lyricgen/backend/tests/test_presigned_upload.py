@@ -295,6 +295,98 @@ def test_multipart_complete_clears_upload_id(client, monkeypatch):
         s.close()
 
 
+def _no_such_upload_error():
+    """A boto-shaped NoSuchUpload exception without needing botocore."""
+    exc = Exception(
+        "An error occurred (NoSuchUpload) when calling the "
+        "CompleteMultipartUpload operation: The specified upload does "
+        "not exist."
+    )
+    exc.response = {"Error": {"Code": "NoSuchUpload"}}
+    return exc
+
+
+def _seed_awaiting_multipart(client, monkeypatch, token):
+    """Create an awaiting_upload job with an active multipart handle and
+    return its job_id."""
+    import main
+    monkeypatch.setattr("main.storage.is_enabled", lambda: True)
+    monkeypatch.setattr(main, "_MULTIPART_THRESHOLD_BYTES", 1)
+    monkeypatch.setattr(
+        "main.storage.multipart_init",
+        lambda *a, **k: {"upload_id": "UP", "key": "inputs/x/y/z.wav"},
+    )
+    job_id = client.post(
+        "/upload-url",
+        json={"filename": "z.wav", "size_bytes": 60 * 1024 * 1024},
+        headers=auth(token),
+    ).json()["job_id"]
+    client.post(
+        "/upload-multipart-init",
+        json={"job_id": job_id, "filename": "z.wav"},
+        headers=auth(token),
+    )
+    return job_id
+
+
+def test_multipart_complete_nosuchupload_but_object_present_is_success(
+    client, monkeypatch,
+):
+    """NoSuchUpload on complete + the object IS in R2 → treat as a
+    successful (idempotent) completion, not a 502. This is the retry /
+    already-completed path: the stitched object exists, only the handle
+    is gone."""
+    from database import SessionLocal
+    from jobs import get_job_model
+
+    _, token, _, _ = _make_user(client)
+    job_id = _seed_awaiting_multipart(client, monkeypatch, token)
+
+    def _boom(*a, **k):
+        raise _no_such_upload_error()
+
+    monkeypatch.setattr("main.storage.multipart_complete", _boom)
+    monkeypatch.setattr("main.storage.object_exists", lambda key: True)
+
+    res = client.post(
+        "/upload-multipart-complete",
+        json={"job_id": job_id, "parts": [{"part_number": 1, "etag": "abc"}]},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+
+    s = SessionLocal()
+    try:
+        row = get_job_model(s, job_id)
+        assert row.multipart_upload_id is None  # handle cleared
+        assert row.input_r2_key  # durable object still referenced
+    finally:
+        s.close()
+
+
+def test_multipart_complete_nosuchupload_and_object_gone_is_409(
+    client, monkeypatch,
+):
+    """NoSuchUpload on complete + the object is NOT in R2 → the upload was
+    genuinely aborted/expired (e.g. reaped). Return a clean 409 asking the
+    client to re-upload, not a 502 that pages Sentry."""
+    _, token, _, _ = _make_user(client)
+    job_id = _seed_awaiting_multipart(client, monkeypatch, token)
+
+    def _boom(*a, **k):
+        raise _no_such_upload_error()
+
+    monkeypatch.setattr("main.storage.multipart_complete", _boom)
+    monkeypatch.setattr("main.storage.object_exists", lambda key: False)
+
+    res = client.post(
+        "/upload-multipart-complete",
+        json={"job_id": job_id, "parts": [{"part_number": 1, "etag": "abc"}]},
+        headers=auth(token),
+    )
+    assert res.status_code == 409
+
+
 def test_multipart_abort_is_idempotent(client, monkeypatch):
     """Two consecutive aborts return 200 and don't error — the abort
     button should be safe to mash."""

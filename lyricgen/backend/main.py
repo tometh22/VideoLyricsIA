@@ -1323,6 +1323,18 @@ class _MultipartCompleteReq(BaseModel):
     parts: list  # list of {"part_number": int, "etag": str}
 
 
+def _is_no_such_upload(exc: Exception) -> bool:
+    """True when an R2/S3 error means the multipart UploadId no longer
+    exists — it was already completed, aborted by the reaper, or expired.
+    Matches the botocore ClientError code first, falling back to the
+    message so we don't depend on the exact exception type."""
+    resp = getattr(exc, "response", None)
+    if isinstance(resp, dict):
+        if str(resp.get("Error", {}).get("Code", "")) == "NoSuchUpload":
+            return True
+    return "NoSuchUpload" in str(exc)
+
+
 @app.post("/upload-multipart-complete")
 @limiter.limit("60/minute")
 async def upload_multipart_complete(
@@ -1359,6 +1371,24 @@ async def upload_multipart_complete(
             job_row.input_r2_key, job_row.multipart_upload_id, parts_payload,
         )
     except Exception as e:
+        # R2 returns NoSuchUpload when the UploadId is gone. Two real
+        # causes: (1) the reaper aborted a slow in-flight upload past the
+        # awaiting_upload TTL, (2) this is a retry of a completion that
+        # already succeeded (lost response / worker restart before the
+        # commit below / double-click). In both, the stitched object may
+        # already be present — reconcile against it instead of paging
+        # Sentry with a 502:
+        #   object present  → upload finalized; treat as success (idempotent)
+        #   object missing  → genuinely aborted/expired; ask for a re-upload
+        if _is_no_such_upload(e):
+            if storage.object_exists(job_row.input_r2_key):
+                job_row.multipart_upload_id = None
+                db.commit()
+                return {"job_id": body.job_id, "key": job_row.input_r2_key}
+            raise HTTPException(
+                status_code=409,
+                detail="Upload expired before completion. Please re-upload the file.",
+            )
         raise HTTPException(
             status_code=502,
             detail=f"R2 multipart_complete failed: {e}",

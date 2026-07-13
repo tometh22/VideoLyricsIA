@@ -59,8 +59,16 @@ _TRANSCRIBED_PENDING_TTL_MIN = int(os.environ.get(
 # R2 with a presigned URL. If the user closes the tab partway through, we
 # need to abort the multipart upload so R2 doesn't keep the parts around
 # (R2 charges for the storage either way until the abort fires).
+#
+# The TTL is keyed on created_at (there is no upload-activity heartbeat),
+# so it has to cover the *whole* upload, not just the idle gap. Multipart
+# exists precisely for large files on flaky connections — a heavy stem on
+# a slow link can legitimately take well over 20 min. Reaping too eagerly
+# aborts an upload still in flight, and the browser's later
+# /upload-multipart-complete then fails with NoSuchUpload. 60 min gives
+# real uploads room while still cleaning up abandoned tabs.
 _AWAITING_UPLOAD_TTL_MIN = int(os.environ.get(
-    "REAPER_AWAITING_UPLOAD_TTL_MIN", "20",
+    "REAPER_AWAITING_UPLOAD_TTL_MIN", "60",
 ))
 
 # Owner inbox for the digest email. Override via env in Railway.
