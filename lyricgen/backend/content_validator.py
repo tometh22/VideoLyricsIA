@@ -135,14 +135,21 @@ def _check_frame_with_gemini(image_path: str) -> dict:
         _prompt_text = (
             "You are classifying a frame from a music-video background. "
             "Report each category independently; do not decide which category "
-            "the customer is allowed to use. Be conservative when a human "
-            "presence may be visible.\n\n"
+            "the customer is allowed to use. Classify visible evidence, not "
+            "inferred activity or objects that suggest somebody may have been "
+            "nearby.\n\n"
             "Set detections.people=true if the frame contains ANY human "
             "presence, including a person, face, head, body, limb, hand, figure, "
             "silhouette, reflection, audience, crowd, statue/mannequin that "
             "looks human, or a distant/blurred/partial human shape. Human "
             "presence is forbidden regardless of size, prominence, identity, "
             "focus, realism, or whether the face is recognizable.\n\n"
+            "Do NOT set detections.people=true for inanimate equipment or other "
+            "indirect signs of activity alone: tripods, cameras, microphones, "
+            "instruments, furniture, vehicles, clothing laid on a surface, "
+            "footprints, tools, doors, paths, or recently disturbed objects are "
+            "not people. They count only when visible human anatomy or a clearly "
+            "human-shaped figure/silhouette/statue/mannequin is also present.\n\n"
             "Set detections.atmospherics=true if smoke, fog, haze, mist, "
             "steam, vapor, a smoke machine, or a smoke-like atmospheric cloud "
             "is visibly present. Ordinary clouds in the sky, rain, dust, lens "
@@ -171,7 +178,8 @@ def _check_frame_with_gemini(image_path: str) -> dict:
             "steam/vapor separately as atmospherics.)\n"
             "  - Generic pattern textures, abstract graphic "
             "elements.\n\n"
-            "When uncertain whether a shape is human, set people=true. "
+            "When a visible shape itself may be human, set people=true. Do not "
+            "infer a person solely because an object could be operated by one. "
             "Respond ONLY with JSON using exactly this schema: "
             '{"detections":{"people":true/false,"atmospherics":true/false,'
             '"brand":true/false},"issues":[{"category":"people|atmospherics|brand",'
@@ -396,7 +404,10 @@ def validate_video(
                 pass
 
     # Fail closed on ANY partial extraction/check failure. Previously one
-    # successful safe frame plus nine Vision timeouts passed the asset.
+    # successful safe frame plus nine Vision timeouts passed the asset. A
+    # decisive policy finding is different: once a sampled frame visibly
+    # contains a blocked category, checking later frames cannot turn the asset
+    # safe, so the intentional early exit is a complete negative verdict.
     expected_frames = planned_frames
     extraction_errors = max(0, planned_frames - len(frame_paths))
     complete_verdict = (
@@ -405,13 +416,14 @@ def validate_video(
         and frames_checked == expected_frames
         and check_errors == 0
     )
-    passed = complete_verdict and len(all_issues) == 0
+    decisive_policy_failure = bool(all_issues)
+    passed = complete_verdict and not decisive_policy_failure
     summary = (
         f"passed={passed}, frames_checked={frames_checked}, "
         f"extraction_errors={extraction_errors}, check_errors={check_errors}, issues={len(all_issues)}"
     )
 
-    if not complete_verdict:
+    if not complete_verdict and not decisive_policy_failure:
         # Surface a synthetic issue so the operator sees why the job was
         # blocked instead of "validation failed: 0 issues".
         all_issues.append({

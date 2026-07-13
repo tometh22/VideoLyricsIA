@@ -279,10 +279,11 @@ def main():
     from observability import _resolve_release as _resolve_runtime_release
     logger.info(
         "[BG_POLICY][STARTUP] process=rq-worker release=%s environment=%s "
-        "policy_version=%s policy_mode=%s cache_namespace=v4 queues=%s",
+        "policy_version=%s policy_mode=%s cache_namespace=%s queues=%s",
         _resolve_runtime_release(),
         os.environ.get("ENVIRONMENT", "production").lower().strip(),
         _bg_policy_version, _bg_policy_mode(),
+        _bg_policy_version,
         ",".join(_resolve_queue_names()),
     )
     _raw_bg_policy_mode = os.environ.get(_bg_policy_env, "off").strip().lower()
