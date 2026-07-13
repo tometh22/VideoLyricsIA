@@ -61,8 +61,12 @@ export function initAutoUpdate({ pollMs = 10 * 60 * 1000, env = import.meta.env 
     const last = parseInt(sessionStorage.getItem("__autoupdate_reload_at") || "0", 10);
     if (Date.now() - last < 60_000) return;
     sessionStorage.setItem("__autoupdate_reload_at", String(Date.now()));
+    // info, not warn: reloading on a new build is expected lifecycle, not a
+    // fault. captureConsoleIntegration only forwards warn+ to Sentry, so this
+    // stayed a breadcrumb for replay but stopped generating a standalone issue
+    // (231 events/mo of pure noise that drowned real signal in the feed).
     // eslint-disable-next-line no-console
-    console.warn("[auto-update] new build detected — reloading to update");
+    console.info("[auto-update] new build detected — reloading to update");
     window.location.reload();
   };
 
