@@ -66,7 +66,7 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
   // tenant (UMG validates, others skip).
   const _tenantId = _readTenant();
   const _isUmg = isUmgTenant(_tenantId);
-  const [validationEnabled, setValidationEnabled] = useState(_isUmg);
+  const [validationEnabled, setValidationEnabled] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
   // Guard sincrónico contra doble click (mismo patrón que EditRequestPanel
