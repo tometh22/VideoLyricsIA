@@ -1,7 +1,10 @@
-"""Content validation — checks AI-generated output for prohibited content.
+"""Content validation for generated background assets.
 
-Uses Gemini Vision to detect people, faces, text, logos, and other
-content that violates UMG Guidelines (Guideline 15).
+Gemini Vision is used as a classifier, not as the policy authority.  It
+reports independent detections for people, atmospheric effects and commercial
+brands; the caller then decides which dimensions are allowed for this render.
+Keeping detection separate from enforcement prevents an opt-in for one visual
+element from accidentally disabling the other safety gates.
 """
 
 import logging
@@ -99,9 +102,12 @@ class ValidatorCheckError(Exception):
 
 
 def _check_frame_with_gemini(image_path: str) -> dict:
-    """Use Gemini Vision to check a single frame for prohibited content.
+    """Classify policy-relevant content in one frame with Gemini Vision.
 
-    Returns {"safe": bool, "issues": [str]} on success.
+    Returns ``safe`` for backwards compatibility plus independent
+    ``detections`` and categorized ``issues``.  ``safe`` only reflects the
+    immutable people/brand baseline; atmospheric permission is applied by
+    :func:`_evaluate_frame_result`.
     Raises ValidatorCheckError if the verdict cannot be produced (caller
     must decide policy: pre-fix this fell through to "safe" silently,
     which let any Vision outage approve every job — Guideline 15 risk).
@@ -127,16 +133,21 @@ def _check_frame_with_gemini(image_path: str) -> dict:
         # validation_failed instead of hanging.
         from pipeline import _call_with_timeout
         _prompt_text = (
-            "You are auditing a frame from a music-video background "
-            "under a strict NO-HUMANS delivery policy. Be conservative "
-            "about safety: if a human presence may be visible, reject it.\n\n"
-            "FLAG (safe=false) if the frame contains ANY human presence, "
-            "including a person, face, head, body, limb, hand, figure, "
+            "You are classifying a frame from a music-video background. "
+            "Report each category independently; do not decide which category "
+            "the customer is allowed to use. Be conservative when a human "
+            "presence may be visible.\n\n"
+            "Set detections.people=true if the frame contains ANY human "
+            "presence, including a person, face, head, body, limb, hand, figure, "
             "silhouette, reflection, audience, crowd, statue/mannequin that "
             "looks human, or a distant/blurred/partial human shape. Human "
             "presence is forbidden regardless of size, prominence, identity, "
             "focus, realism, or whether the face is recognizable.\n\n"
-            "Also FLAG these legal/IP risks:\n"
+            "Set detections.atmospherics=true if smoke, fog, haze, mist, "
+            "steam, vapor, a smoke machine, or a smoke-like atmospheric cloud "
+            "is visibly present. Ordinary clouds in the sky, rain, dust, lens "
+            "flare, bokeh and solid objects are not atmospherics.\n\n"
+            "Set detections.brand=true for these legal/IP risks:\n"
             "    - Text matching a globally famous COMMERCIAL brand "
             "(Nike, Coca-Cola, McDonald's, Apple, Pepsi, Adidas, "
             "Starbucks, Microsoft, Google, Amazon, Disney) shown "
@@ -155,13 +166,16 @@ def _check_frame_with_gemini(image_path: str) -> dict:
             "  - Distant, small, blurred, motion-blurred, rain-"
             "distorted, or partially obscured text or logos.\n"
             "  - Invented / gibberish / stylized text strings.\n"
-            "  - Abstract glowing shapes, smoke, particles, "
-            "weather effects, lighting effects, lens flares.\n"
+            "  - Abstract glowing shapes, particles, ordinary weather effects, "
+            "lighting effects, lens flares. (Still report smoke/fog/haze/mist/"
+            "steam/vapor separately as atmospherics.)\n"
             "  - Generic pattern textures, abstract graphic "
             "elements.\n\n"
-            "When uncertain whether a shape is human, mark unsafe. "
-            "Respond ONLY with JSON: "
-            '{"safe":true/false,"issues":["specific reason"]}'
+            "When uncertain whether a shape is human, set people=true. "
+            "Respond ONLY with JSON using exactly this schema: "
+            '{"detections":{"people":true/false,"atmospherics":true/false,'
+            '"brand":true/false},"issues":[{"category":"people|atmospherics|brand",'
+            '"reason":"specific visible evidence"}]}'
         )
         response = _call_with_timeout(
             lambda: client.models.generate_content(
@@ -183,13 +197,36 @@ def _check_frame_with_gemini(image_path: str) -> dict:
         json_match = re.search(r'\{.*\}', text, re.DOTALL)
         if json_match:
             data = _json.loads(json_match.group())
-            if type(data.get("safe")) is not bool:
-                raise ValidatorCheckError("Gemini Vision 'safe' must be a JSON boolean")
+            detections = data.get("detections")
+            if not isinstance(detections, dict):
+                raise ValidatorCheckError("Gemini Vision 'detections' must be a JSON object")
+            categories = ("people", "atmospherics", "brand")
+            if any(type(detections.get(category)) is not bool for category in categories):
+                raise ValidatorCheckError(
+                    "Gemini Vision detections must contain boolean people, atmospherics and brand"
+                )
             issues = data.get("issues", [])
-            if not isinstance(issues, list) or not all(isinstance(item, str) for item in issues):
-                raise ValidatorCheckError("Gemini Vision 'issues' must be a list of strings")
+            if not isinstance(issues, list) or not all(
+                isinstance(item, dict)
+                and item.get("category") in categories
+                and isinstance(item.get("reason"), str)
+                and bool(item.get("reason", "").strip())
+                for item in issues
+            ):
+                raise ValidatorCheckError(
+                    "Gemini Vision 'issues' must contain categorized reasons"
+                )
+            # A categorized issue is positive evidence even if the model also
+            # emitted a contradictory false boolean.  Promote it here rather
+            # than trusting the more permissive half of an inconsistent LLM
+            # response.  This preserves the validator's fail-closed contract
+            # for people, brands and atmospheric effects independently.
+            for issue in issues:
+                if issue.get("reason", "").strip():
+                    detections[issue["category"]] = True
             return {
-                "safe": data["safe"],
+                "safe": not detections["people"] and not detections["brand"],
+                "detections": {category: detections[category] for category in categories},
                 "issues": issues,
             }
     except Exception as e:
@@ -199,7 +236,96 @@ def _check_frame_with_gemini(image_path: str) -> dict:
     raise ValidatorCheckError("Gemini Vision response did not contain a JSON verdict")
 
 
-def validate_video(video_path: str, job_id: str = None) -> dict:
+def _evaluate_frame_result(
+    result: dict,
+    *,
+    allow_people: bool,
+    allow_atmospherics: bool,
+    enforce_atmospherics: bool,
+) -> dict:
+    """Apply render policy to a classifier result.
+
+    Test doubles and in-flight callers may still return the legacy
+    ``{"safe": bool, "issues": [str]}`` shape.  That shape remains supported
+    fail-closed; it cannot be used to bypass an unsafe result when people are
+    allowed because it does not identify which category was detected.
+    """
+    detections = result.get("detections")
+    if not isinstance(detections, dict):
+        legacy_safe = result.get("safe") is True
+        legacy_issues = [str(item) for item in result.get("issues", [])]
+        return {
+            # Legacy responses cannot attribute an issue to an independently
+            # configurable category. Any issue therefore blocks; allowing a
+            # human must never accidentally allow a brand (or vice versa).
+            "passed": legacy_safe and not legacy_issues,
+            "issues": legacy_issues,
+            "detections": {"people": False, "atmospherics": False, "brand": False},
+            "observations": [],
+        }
+
+    normalized = {
+        "people": detections.get("people") is True,
+        "atmospherics": detections.get("atmospherics") is True,
+        "brand": detections.get("brand") is True,
+    }
+    reasons_by_category: dict[str, list[str]] = {
+        "people": [], "atmospherics": [], "brand": [],
+    }
+    for item in result.get("issues", []):
+        if isinstance(item, dict) and item.get("category") in reasons_by_category:
+            reason = str(item.get("reason") or "").strip()
+            if reason:
+                reasons_by_category[item["category"]].append(reason)
+        elif isinstance(item, str):
+            # Defensive compatibility with a partially migrated response.
+            reasons_by_category["brand"].append(item)
+
+    # Test doubles and partially migrated callers may bypass the strict JSON
+    # parser above. Apply the same contradiction rule at this boundary too.
+    for category, reasons in reasons_by_category.items():
+        if reasons:
+            normalized[category] = True
+
+    blocked_categories = []
+    if normalized["people"] and not allow_people:
+        blocked_categories.append("people")
+    if normalized["brand"]:
+        blocked_categories.append("brand")
+    if (
+        normalized["atmospherics"]
+        and not allow_atmospherics
+        and enforce_atmospherics
+    ):
+        blocked_categories.append("atmospherics")
+
+    blocked_issues = []
+    for category in blocked_categories:
+        reasons = reasons_by_category[category] or [f"Detected prohibited {category}"]
+        blocked_issues.extend(f"{category}: {reason}" for reason in reasons)
+
+    observations = []
+    if normalized["atmospherics"] and not allow_atmospherics:
+        reasons = reasons_by_category["atmospherics"] or ["Atmospheric effect detected"]
+        observations.extend(f"atmospherics: {reason}" for reason in reasons)
+
+    return {
+        "passed": not blocked_categories,
+        "issues": blocked_issues,
+        "detections": normalized,
+        "observations": observations,
+    }
+
+
+def validate_video(
+    video_path: str,
+    job_id: str = None,
+    *,
+    allow_people: bool = False,
+    allow_atmospherics: bool = True,
+    observe_atmospherics: bool = False,
+    enforce_atmospherics: bool = False,
+) -> dict:
     """Validate a video for prohibited content.
 
     Extracts frames and checks each with Gemini Vision.
@@ -213,7 +339,12 @@ def validate_video(video_path: str, job_id: str = None) -> dict:
         step="output_validation",
         tool_name="gemini-2.5-flash-vision",
         tool_provider="google_vertex",
-        prompt="Content policy validation: check frames for people, faces, text, logos",
+        prompt=(
+            "Classify frames for people, commercial brands and atmospheric effects; "
+            f"allow_people={allow_people}, allow_atmospherics={allow_atmospherics}, "
+            f"observe_atmospherics={observe_atmospherics}, "
+            f"enforce_atmospherics={enforce_atmospherics}"
+        ),
         input_data_types=["video_frames"],
     ) if job_id else None
 
@@ -221,6 +352,8 @@ def validate_video(video_path: str, job_id: str = None) -> dict:
     all_issues = []
     check_errors = 0
     frames_checked = 0
+    detected = {"people": False, "atmospherics": False, "brand": False}
+    observations = []
 
     try:
         for i, frame_path in enumerate(frame_paths):
@@ -231,8 +364,21 @@ def validate_video(video_path: str, job_id: str = None) -> dict:
                 logger.warning("[VALIDATION] frame %d check error: %s", i, e)
                 break
             frames_checked += 1
-            if not result["safe"]:
-                for issue in result["issues"]:
+            verdict = _evaluate_frame_result(
+                result,
+                allow_people=allow_people,
+                allow_atmospherics=allow_atmospherics,
+                enforce_atmospherics=enforce_atmospherics,
+            )
+            for category, present in verdict["detections"].items():
+                detected[category] = detected[category] or present
+            if observe_atmospherics:
+                observations.extend(
+                    {"frame": i, "type": issue}
+                    for issue in verdict["observations"]
+                )
+            if not verdict["passed"]:
+                for issue in verdict["issues"]:
                     all_issues.append({"frame": i, "type": issue})
                 break
     finally:
@@ -289,10 +435,23 @@ def validate_video(video_path: str, job_id: str = None) -> dict:
         "frames_planned": planned_frames,
         "extraction_errors": extraction_errors,
         "check_errors": check_errors,
+        "detections": detected,
+        "observations": observations,
+        "shadow_atmospherics_detected": bool(
+            observe_atmospherics and detected["atmospherics"] and not enforce_atmospherics
+        ),
     }
 
 
-def validate_image(image_path: str, job_id: str = None) -> dict:
+def validate_image(
+    image_path: str,
+    job_id: str = None,
+    *,
+    allow_people: bool = False,
+    allow_atmospherics: bool = True,
+    observe_atmospherics: bool = False,
+    enforce_atmospherics: bool = False,
+) -> dict:
     """Validate a single image for prohibited content."""
     from provenance import record_ai_call
 
@@ -301,7 +460,12 @@ def validate_image(image_path: str, job_id: str = None) -> dict:
         step="output_validation",
         tool_name="gemini-2.5-flash-vision",
         tool_provider="google_vertex",
-        prompt="Content policy validation: check image for people, faces, text, logos",
+        prompt=(
+            "Classify image for people, commercial brands and atmospheric effects; "
+            f"allow_people={allow_people}, allow_atmospherics={allow_atmospherics}, "
+            f"observe_atmospherics={observe_atmospherics}, "
+            f"enforce_atmospherics={enforce_atmospherics}"
+        ),
         input_data_types=["image"],
     ) if job_id else None
 
@@ -323,10 +487,32 @@ def validate_image(image_path: str, job_id: str = None) -> dict:
             "frames_checked": 0,
             "check_errors": 1,
         }
-    issues = [{"frame": 0, "type": issue} for issue in result.get("issues", [])]
-    passed = result.get("safe", True)
+    verdict = _evaluate_frame_result(
+        result,
+        allow_people=allow_people,
+        allow_atmospherics=allow_atmospherics,
+        enforce_atmospherics=enforce_atmospherics,
+    )
+    issues = [{"frame": 0, "type": issue} for issue in verdict["issues"]]
+    observations = (
+        [{"frame": 0, "type": issue} for issue in verdict["observations"]]
+        if observe_atmospherics else []
+    )
+    passed = verdict["passed"]
 
     if recorder:
         recorder.finish(response_summary=f"passed={passed}, issues={len(issues)}")
 
-    return {"passed": passed, "issues": issues, "frames_checked": 1, "check_errors": 0}
+    return {
+        "passed": passed,
+        "issues": issues,
+        "frames_checked": 1,
+        "check_errors": 0,
+        "detections": verdict["detections"],
+        "observations": observations,
+        "shadow_atmospherics_detected": bool(
+            observe_atmospherics
+            and verdict["detections"]["atmospherics"]
+            and not enforce_atmospherics
+        ),
+    }

@@ -36,9 +36,12 @@ def test_genly_auto_prompt_never_allows_people(db):
 
 def test_non_umg_explicit_operator_request_allows_people(db):
     job_id = _job(db, render_params={"bypass_content_validation": True})
-    assert pipeline._compute_allow_people(
-        job_id, "Una mujer sentada junto a una ventana"
-    ) is True
+    prompt = "Una mujer sentada junto a una ventana"
+    assert pipeline._compute_allow_people(job_id, prompt) is True
+    policy = pipeline._background_safety_policy(job_id, prompt)
+    assert policy["validate_people"] is False
+    assert policy["validate_brand"] is True
+    assert policy["should_validate"] is True
 
 
 def test_negative_operator_prompt_does_not_opt_in(db):
@@ -54,6 +57,60 @@ def test_negative_operator_prompt_does_not_opt_in(db):
     assert pipeline._compute_allow_people(job_id, "Cero personas") is False
     assert pipeline._compute_allow_people(job_id, "Una mujer no debe aparecer") is False
     assert pipeline._compute_allow_people(job_id, "Personas: ninguna") is False
+
+
+def test_human_opt_in_requires_visual_intent_not_an_ambiguous_name(db):
+    job_id = _job(db, render_params={"bypass_content_validation": True})
+    for prompt in (
+        "Man Ray inspired empty room",
+        "persona non grata neon sign",
+        "Men at Work inspired warehouse",
+        "Talking Heads inspired empty room",
+        "Faces album cover palette",
+        "Girls' Generation inspired stage",
+        "human rights mural",
+        "clock hands at midnight",
+        "arms of a chair",
+        "face of a clock",
+        "a clock with hands moving",
+        "a chair with arms in an empty room",
+        "a clock with a face glowing",
+        "an armchair with arms",
+        "a watch with hands at midnight",
+        "una silla con brazos en una habitación vacía",
+        "un reloj con manos moviéndose",
+        "um relógio com mãos em movimento",
+        "a clock featuring hands moving",
+        "show a clock's hands moving",
+        "depict a chair's arms in close-up",
+        "a chair featuring arms",
+        "mostrar un reloj cuyas manos se mueven",
+        "mostrar los brazos de una silla",
+        "a watch displaying its face",
+    ):
+        assert pipeline._compute_allow_people(job_id, prompt) is False
+
+
+def test_explicit_faces_hands_and_contrast_are_supported_for_non_umg(db):
+    job_id = _job(db, render_params={"bypass_content_validation": True})
+    assert pipeline._compute_allow_people(job_id, "hands playing guitar") is True
+    assert pipeline._compute_allow_people(job_id, "hands clapping") is True
+    assert pipeline._compute_allow_people(job_id, "close-up face") is True
+    assert pipeline._compute_allow_people(job_id, "portrait of hands") is True
+    assert pipeline._compute_allow_people(job_id, "a human face glowing") is True
+    assert pipeline._compute_allow_people(job_id, "a woman with hands waving") is True
+    assert pipeline._compute_allow_people(
+        job_id, "no people, but a woman singing"
+    ) is True
+    assert pipeline._compute_allow_people(
+        job_id, "No logos, a woman singing with no readable text"
+    ) is True
+    assert pipeline._compute_allow_people(job_id, "A free woman running") is True
+    assert pipeline._compute_allow_people(job_id, "No people, a woman singing") is False
+    assert pipeline._compute_allow_people(job_id, "a woman without readable text") is True
+    assert pipeline._compute_allow_people(job_id, "a woman, no logos") is True
+    assert pipeline._compute_allow_people(job_id, "a woman and no brands") is True
+    assert pipeline._compute_allow_people(job_id, "no people, only a woman singing") is True
 
 
 def test_prompt_alone_is_not_enough_without_free_background_opt_in(db):
@@ -106,11 +163,53 @@ def test_future_universal_country_tenant_is_protected(db):
     assert policy["should_validate"] is True
 
 
+def test_universal_exact_and_hyphenated_tenants_are_protected(db):
+    for tenant in ("universal", "universal-mexico"):
+        job_id = _job(
+            db,
+            tenant=tenant,
+            render_params={"bypass_content_validation": True},
+        )
+        policy = pipeline._background_safety_policy(job_id, "A singer on stage")
+        assert policy["is_umg"] is True
+        assert policy["allow_people"] is False
+
+
 def test_missing_job_fails_closed():
     policy = pipeline._background_safety_policy("doesnotexist", "a woman")
     assert policy["is_umg"] is True
     assert policy["allow_people"] is False
     assert policy["should_validate"] is True
+
+
+def test_scene_validation_does_not_trust_stored_people_allow_after_umg_change(db):
+    job_id = _job(
+        db,
+        tenant="universal_argentina",
+        render_params={"bypass_content_validation": True},
+    )
+    plan = {
+        "scenes": [{
+            "recurrence_key": "verse_1",
+            "operator_prompt": "A singer facing camera",
+            "allow_people": True,
+            "atmospherics_policy": {
+                "policy_version": "background-v4",
+                "policy_mode": "off",
+                "allow_atmospherics": False,
+                "explicit_atmospherics": [],
+                "authorization_source": "default_deny",
+            },
+            "validation": {
+                "passed": True,
+                "policy_fingerprint": "background-v4:off:deny|people:allow",
+            },
+        }]
+    }
+
+    assert pipeline._scene_plan_has_current_clip_validation(
+        plan, job_id=job_id
+    ) is False
 
 
 def test_all_delivery_profiles_and_edit_paths_are_wired_to_validation():
