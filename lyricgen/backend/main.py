@@ -1371,23 +1371,37 @@ async def upload_multipart_complete(
             job_row.input_r2_key, job_row.multipart_upload_id, parts_payload,
         )
     except Exception as e:
-        # R2 returns NoSuchUpload when the UploadId is gone. Two real
-        # causes: (1) the reaper aborted a slow in-flight upload past the
-        # awaiting_upload TTL, (2) this is a retry of a completion that
-        # already succeeded (lost response / worker restart before the
-        # commit below / double-click). In both, the stitched object may
-        # already be present — reconcile against it instead of paging
-        # Sentry with a 502:
-        #   object present  → upload finalized; treat as success (idempotent)
-        #   object missing  → genuinely aborted/expired; ask for a re-upload
+        # R2 returns NoSuchUpload when the UploadId is gone. Real causes:
+        #   (a) the completion already reached R2 but we crashed/restarted
+        #       before the db.commit below, so the retry re-completes a
+        #       handle R2 has already consumed — the stitched object is
+        #       present.
+        #   (b) a concurrent reaper run aborted the upload; our request read
+        #       the row before the reaper's delete committed, so we still
+        #       tried to complete an aborted handle — no object exists.
+        # (A plain double-complete after a *successful* commit is already
+        # rejected upstream by the awaiting_upload/upload_id guard, so it
+        # never reaches here.) Reconcile against the actual object instead
+        # of paging Sentry with a blanket 502:
         if _is_no_such_upload(e):
-            if storage.object_exists(job_row.input_r2_key):
+            probe = storage.object_probe(job_row.input_r2_key)
+            if probe == "present":
+                # Upload finalized; only the handle was gone. Idempotent OK.
                 job_row.multipart_upload_id = None
                 db.commit()
                 return {"job_id": body.job_id, "key": job_row.input_r2_key}
+            if probe == "absent":
+                # Genuinely aborted/expired — safe to ask for a re-upload.
+                raise HTTPException(
+                    status_code=409,
+                    detail="Upload expired before completion. Please re-upload the file.",
+                )
+            # "unknown": couldn't verify (R2 blip/disabled). Do NOT tell the
+            # user to re-upload a possibly-complete multi-GB file — surface a
+            # retryable 502 instead.
             raise HTTPException(
-                status_code=409,
-                detail="Upload expired before completion. Please re-upload the file.",
+                status_code=502,
+                detail="Could not verify upload after a storage error. Please retry.",
             )
         raise HTTPException(
             status_code=502,

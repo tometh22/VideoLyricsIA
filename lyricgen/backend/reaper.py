@@ -64,9 +64,10 @@ _TRANSCRIBED_PENDING_TTL_MIN = int(os.environ.get(
 # so it has to cover the *whole* upload, not just the idle gap. Multipart
 # exists precisely for large files on flaky connections — a heavy stem on
 # a slow link can legitimately take well over 20 min. Reaping too eagerly
-# aborts an upload still in flight, and the browser's later
-# /upload-multipart-complete then fails with NoSuchUpload. 60 min gives
-# real uploads room while still cleaning up abandoned tabs.
+# aborts an upload still in flight: the browser's later
+# /upload-multipart-complete usually then hits 404 (row already deleted),
+# or NoSuchUpload if it races the reaper's commit. 60 min gives real
+# uploads room while still cleaning up abandoned tabs.
 _AWAITING_UPLOAD_TTL_MIN = int(os.environ.get(
     "REAPER_AWAITING_UPLOAD_TTL_MIN", "60",
 ))

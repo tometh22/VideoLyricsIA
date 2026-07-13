@@ -346,7 +346,7 @@ def test_multipart_complete_nosuchupload_but_object_present_is_success(
         raise _no_such_upload_error()
 
     monkeypatch.setattr("main.storage.multipart_complete", _boom)
-    monkeypatch.setattr("main.storage.object_exists", lambda key: True)
+    monkeypatch.setattr("main.storage.object_probe", lambda key: "present")
 
     res = client.post(
         "/upload-multipart-complete",
@@ -367,9 +367,9 @@ def test_multipart_complete_nosuchupload_but_object_present_is_success(
 def test_multipart_complete_nosuchupload_and_object_gone_is_409(
     client, monkeypatch,
 ):
-    """NoSuchUpload on complete + the object is NOT in R2 → the upload was
-    genuinely aborted/expired (e.g. reaped). Return a clean 409 asking the
-    client to re-upload, not a 502 that pages Sentry."""
+    """NoSuchUpload on complete + R2 CONFIRMS the object is gone → the
+    upload was genuinely aborted/expired (reaper race). Return a clean 409
+    asking the client to re-upload, not a 502 that pages Sentry."""
     _, token, _, _ = _make_user(client)
     job_id = _seed_awaiting_multipart(client, monkeypatch, token)
 
@@ -377,7 +377,7 @@ def test_multipart_complete_nosuchupload_and_object_gone_is_409(
         raise _no_such_upload_error()
 
     monkeypatch.setattr("main.storage.multipart_complete", _boom)
-    monkeypatch.setattr("main.storage.object_exists", lambda key: False)
+    monkeypatch.setattr("main.storage.object_probe", lambda key: "absent")
 
     res = client.post(
         "/upload-multipart-complete",
@@ -385,6 +385,82 @@ def test_multipart_complete_nosuchupload_and_object_gone_is_409(
         headers=auth(token),
     )
     assert res.status_code == 409
+
+
+def test_multipart_complete_nosuchupload_but_probe_unknown_is_502_not_409(
+    client, monkeypatch,
+):
+    """NoSuchUpload on complete + the existence check itself fails (R2
+    blip) → we must NOT tell the user to re-upload a possibly-complete
+    multi-GB file. Surface a retryable 502, never a 409."""
+    _, token, _, _ = _make_user(client)
+    job_id = _seed_awaiting_multipart(client, monkeypatch, token)
+
+    def _boom(*a, **k):
+        raise _no_such_upload_error()
+
+    monkeypatch.setattr("main.storage.multipart_complete", _boom)
+    monkeypatch.setattr("main.storage.object_probe", lambda key: "unknown")
+
+    res = client.post(
+        "/upload-multipart-complete",
+        json={"job_id": job_id, "parts": [{"part_number": 1, "etag": "abc"}]},
+        headers=auth(token),
+    )
+    assert res.status_code == 502
+
+
+def test_object_probe_classifies_404_vs_transient(monkeypatch):
+    """object_probe must separate 'confirmed absent' (404/NoSuchKey) from
+    'could not check' (any other error) — the reconcile in
+    /upload-multipart-complete relies on that distinction to avoid forcing
+    a re-upload on a transient blip."""
+    import storage
+
+    class _FakeClient:
+        def __init__(self, exc):
+            self._exc = exc
+
+        def head_object(self, **kwargs):
+            if self._exc is not None:
+                raise self._exc
+            return {"ContentLength": 123}
+
+    def _err(code, status):
+        e = Exception(f"boom {code}")
+        e.response = {
+            "Error": {"Code": code},
+            "ResponseMetadata": {"HTTPStatusCode": status},
+        }
+        return e
+
+    monkeypatch.setattr(storage, "R2_BUCKET", "b")
+
+    monkeypatch.setattr(storage, "_get_client", lambda: _FakeClient(None))
+    assert storage.object_probe("k") == "present"
+
+    monkeypatch.setattr(
+        storage, "_get_client", lambda: _FakeClient(_err("404", 404)))
+    assert storage.object_probe("k") == "absent"
+
+    monkeypatch.setattr(
+        storage, "_get_client", lambda: _FakeClient(_err("NoSuchKey", 404)))
+    assert storage.object_probe("k") == "absent"
+
+    # Throttle / 5xx / network → unknown, never absent.
+    monkeypatch.setattr(
+        storage, "_get_client",
+        lambda: _FakeClient(_err("SlowDown", 503)))
+    assert storage.object_probe("k") == "unknown"
+
+    monkeypatch.setattr(
+        storage, "_get_client",
+        lambda: _FakeClient(ConnectionError("reset")))
+    assert storage.object_probe("k") == "unknown"
+
+    # R2 disabled → unknown, not a false 'absent'.
+    monkeypatch.setattr(storage, "_get_client", lambda: None)
+    assert storage.object_probe("k") == "unknown"
 
 
 def test_multipart_abort_is_idempotent(client, monkeypatch):

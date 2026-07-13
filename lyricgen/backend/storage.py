@@ -187,6 +187,40 @@ def object_exists(key: str) -> bool:
         return False
 
 
+def object_probe(key: str) -> str:
+    """Tri-state existence check for reconcile paths that must NOT confuse
+    "definitely absent" with "could not check".
+
+    Returns:
+      "present" — the object is there.
+      "absent"  — R2 confirmed a 404 / NoSuchKey (the object is really gone).
+      "unknown" — R2 disabled, or a transient error (throttle/5xx/network).
+                  The caller must treat this as retryable, NOT as proof the
+                  object is missing — otherwise a blip during reconcile would
+                  wrongly force a user to re-upload a completed multi-GB file.
+    """
+    client = _get_client()
+    if client is None:
+        return "unknown"
+    try:
+        client.head_object(Bucket=R2_BUCKET, Key=key)
+        return "present"
+    except Exception as e:
+        code = ""
+        status = 0
+        resp = getattr(e, "response", None)
+        if isinstance(resp, dict):
+            code = str(resp.get("Error", {}).get("Code", ""))
+            try:
+                status = int(resp.get("ResponseMetadata", {}).get(
+                    "HTTPStatusCode", 0) or 0)
+            except (TypeError, ValueError):
+                status = 0
+        if code in ("404", "NoSuchKey", "NotFound") or status == 404:
+            return "absent"
+        return "unknown"
+
+
 def upload_file(local_path: str, key: str) -> Optional[str]:
     """Upload a local file to an arbitrary R2 key (used for cache, etc).
     Returns the key on success, None if R2 disabled. Raises on real errors."""
