@@ -32,12 +32,12 @@ def _safe_ffmpeg_path(path: str) -> str:
 
 def _extract_frames(
     video_path: str,
-    interval_seconds: int = 3,
-    max_frames: int = 10,
-) -> tuple[list[str], str]:
+    interval_seconds: int = 1,
+    max_frames: int = 48,
+) -> tuple[list[str], str, int]:
     """Extract frames from a video at regular intervals using ffmpeg.
 
-    Returns (frame_paths, tmp_dir). The caller is responsible for cleaning
+    Returns (frame_paths, tmp_dir, planned_frames). The caller is responsible for cleaning
     up tmp_dir (and the frames inside it) regardless of whether any frames
     were successfully extracted — returning the dir explicitly here closes
     the leak where ffprobe/ffmpeg failures left mkdtemp orphans in /tmp on
@@ -57,14 +57,23 @@ def _extract_frames(
         result = subprocess.run(duration_cmd, capture_output=True, text=True, timeout=30)
         duration = float(result.stdout.strip())
     except Exception:
-        duration = 60.0
+        # Unknown duration is not a safe basis for sampling: assuming 60s used
+        # to approve only the beginning of a longer asset.
+        return [], tmp_dir, 1
 
-    # Calculate frame timestamps
-    timestamps = []
-    t = 1.0  # skip first second (often black)
-    while t < duration and len(timestamps) < max_frames:
-        timestamps.append(t)
-        t += interval_seconds
+    # Cover the WHOLE asset.  The old implementation stopped after the first
+    # 28 seconds (10 frames at 3-second intervals), so a person in a later
+    # scene of a long UMG video was invisible to the gate.  Short clips retain
+    # the dense interval; long assets are sampled uniformly end-to-end.
+    usable_start = min(1.0, max(duration * 0.05, 0.0))
+    usable_end = max(usable_start, duration - min(0.5, duration * 0.02))
+    dense_count = max(1, int(max(usable_end - usable_start, 0.0) / interval_seconds) + 1)
+    sample_count = min(max_frames, dense_count)
+    if sample_count <= 1:
+        timestamps = [usable_start]
+    else:
+        step = (usable_end - usable_start) / (sample_count - 1)
+        timestamps = [usable_start + (step * i) for i in range(sample_count)]
 
     frame_paths = []
     for i, ts in enumerate(timestamps):
@@ -80,7 +89,7 @@ def _extract_frames(
         except Exception as e:
             logger.warning(f"Frame extraction failed at {ts}s: {e}")
 
-    return frame_paths, tmp_dir
+    return frame_paths, tmp_dir, len(timestamps)
 
 
 class ValidatorCheckError(Exception):
@@ -119,31 +128,22 @@ def _check_frame_with_gemini(image_path: str) -> dict:
         from pipeline import _call_with_timeout
         _prompt_text = (
             "You are auditing a frame from a music-video background "
-            "for risks where AI image generation typically fails. "
-            "Be CONSERVATIVE — flag only flagrant, prominent "
-            "violations. Music-video backgrounds routinely include "
-            "incidental signage, urban scenery, and stylized text "
-            "as part of the aesthetic; that is acceptable.\n\n"
-            "FLAG (safe=false) ONLY if ALL of these are true at once:\n"
-            "  (a) the issue is in the foreground or central to the "
-            "frame (NOT background scenery, NOT distant signage, "
-            "NOT a small element in a wider shot),\n"
-            "  (b) the issue is clearly readable / recognizable "
-            "without effort (NOT blurred, NOT partial, NOT tiny),\n"
-            "  (c) the issue falls into one of these categories:\n"
-            "    - A LARGE, FOREGROUND, IDENTIFIABLE human face "
-            "(eyes/nose/mouth clearly visible on a recognizable "
-            "specific individual).\n"
-            "    - Visible hands or individual fingers as the "
-            "subject of the frame.\n"
+            "under a strict NO-HUMANS delivery policy. Be conservative "
+            "about safety: if a human presence may be visible, reject it.\n\n"
+            "FLAG (safe=false) if the frame contains ANY human presence, "
+            "including a person, face, head, body, limb, hand, figure, "
+            "silhouette, reflection, audience, crowd, statue/mannequin that "
+            "looks human, or a distant/blurred/partial human shape. Human "
+            "presence is forbidden regardless of size, prominence, identity, "
+            "focus, realism, or whether the face is recognizable.\n\n"
+            "Also FLAG these legal/IP risks:\n"
             "    - Text matching a globally famous COMMERCIAL brand "
             "(Nike, Coca-Cola, McDonald's, Apple, Pepsi, Adidas, "
             "Starbucks, Microsoft, Google, Amazon, Disney) shown "
             "prominently as the focus of the frame.\n"
             "    - A clearly-rendered logo of a globally famous "
             "commercial brand shown prominently.\n\n"
-            "DO NOT FLAG (safe=true) any of these — they are "
-            "acceptable in music-video backgrounds:\n"
+            "The following non-human elements are acceptable:\n"
             "  - Names of bands, artists, songs, albums, venues, "
             "stadiums, sports clubs, cities, countries, places, "
             "or events. These are NOT commercial brands for "
@@ -155,15 +155,11 @@ def _check_frame_with_gemini(image_path: str) -> dict:
             "  - Distant, small, blurred, motion-blurred, rain-"
             "distorted, or partially obscured text or logos.\n"
             "  - Invented / gibberish / stylized text strings.\n"
-            "  - Silhouettes, audiences, distant crowds — even "
-            "with small partial faces.\n"
             "  - Abstract glowing shapes, smoke, particles, "
             "weather effects, lighting effects, lens flares.\n"
             "  - Generic pattern textures, abstract graphic "
             "elements.\n\n"
-            "Rule of thumb: would a typical viewer say 'this video "
-            "is selling Nike / showing a real celebrity'? If no, "
-            "mark safe. When in doubt, mark safe. "
+            "When uncertain whether a shape is human, mark unsafe. "
             "Respond ONLY with JSON: "
             '{"safe":true/false,"issues":["specific reason"]}'
         )
@@ -187,9 +183,14 @@ def _check_frame_with_gemini(image_path: str) -> dict:
         json_match = re.search(r'\{.*\}', text, re.DOTALL)
         if json_match:
             data = _json.loads(json_match.group())
+            if type(data.get("safe")) is not bool:
+                raise ValidatorCheckError("Gemini Vision 'safe' must be a JSON boolean")
+            issues = data.get("issues", [])
+            if not isinstance(issues, list) or not all(isinstance(item, str) for item in issues):
+                raise ValidatorCheckError("Gemini Vision 'issues' must be a list of strings")
             return {
-                "safe": bool(data.get("safe", True)),
-                "issues": list(data.get("issues", [])),
+                "safe": data["safe"],
+                "issues": issues,
             }
     except Exception as e:
         logger.warning(f"Gemini Vision check failed: {e}")
@@ -216,7 +217,7 @@ def validate_video(video_path: str, job_id: str = None) -> dict:
         input_data_types=["video_frames"],
     ) if job_id else None
 
-    frame_paths, tmp_dir = _extract_frames(video_path)
+    frame_paths, tmp_dir, planned_frames = _extract_frames(video_path)
     all_issues = []
     check_errors = 0
     frames_checked = 0
@@ -228,11 +229,12 @@ def validate_video(video_path: str, job_id: str = None) -> dict:
             except ValidatorCheckError as e:
                 check_errors += 1
                 logger.warning("[VALIDATION] frame %d check error: %s", i, e)
-                continue
+                break
             frames_checked += 1
             if not result["safe"]:
                 for issue in result["issues"]:
                     all_issues.append({"frame": i, "type": issue})
+                break
     finally:
         # Clean up temp frames + dir even when _extract_frames produced
         # zero usable frames (mkdtemp leaks otherwise).
@@ -247,24 +249,31 @@ def validate_video(video_path: str, job_id: str = None) -> dict:
             except OSError:
                 pass
 
-    # Fail-closed: if no frames could be successfully checked, refuse to
-    # approve. Pre-fix this returned passed=True, letting any Vision outage
-    # silently bypass the UMG Guideline 15 gate.
-    has_verdict = frames_checked > 0
-    passed = has_verdict and len(all_issues) == 0
+    # Fail closed on ANY partial extraction/check failure. Previously one
+    # successful safe frame plus nine Vision timeouts passed the asset.
+    expected_frames = planned_frames
+    extraction_errors = max(0, planned_frames - len(frame_paths))
+    complete_verdict = (
+        expected_frames > 0
+        and extraction_errors == 0
+        and frames_checked == expected_frames
+        and check_errors == 0
+    )
+    passed = complete_verdict and len(all_issues) == 0
     summary = (
         f"passed={passed}, frames_checked={frames_checked}, "
-        f"check_errors={check_errors}, issues={len(all_issues)}"
+        f"extraction_errors={extraction_errors}, check_errors={check_errors}, issues={len(all_issues)}"
     )
 
-    if not has_verdict:
+    if not complete_verdict:
         # Surface a synthetic issue so the operator sees why the job was
         # blocked instead of "validation failed: 0 issues".
         all_issues.append({
             "frame": -1,
             "type": (
-                "Validator could not produce a verdict for any frame "
-                f"({check_errors} check errors). Treating as failed per "
+                "Validator did not produce a verdict for every sampled frame "
+                f"({frames_checked}/{expected_frames} checked, {extraction_errors} extraction errors, "
+                f"{check_errors} check errors). Treating as failed per "
                 "fail-closed policy."
             ),
         })
@@ -277,6 +286,8 @@ def validate_video(video_path: str, job_id: str = None) -> dict:
         "passed": passed,
         "issues": all_issues,
         "frames_checked": frames_checked,
+        "frames_planned": planned_frames,
+        "extraction_errors": extraction_errors,
         "check_errors": check_errors,
     }
 
