@@ -159,25 +159,25 @@ function AvatarImg({ user, size = "w-16 h-16", textSize = "text-xl", reloadKey =
 }
 
 // "hace 3 minutos" — relativo simple, sin dependencias.
-function relativeTime(iso) {
+function relativeTime(iso, t, locale) {
   if (!iso) return "—";
   const then = new Date(iso).getTime();
   if (Number.isNaN(then)) return "—";
   const diff = Math.max(0, Date.now() - then);
   const m = Math.floor(diff / 60000);
-  if (m < 1) return "hace instantes";
-  if (m < 60) return `hace ${m} min`;
+  if (m < 1) return t("settings.time_just_now");
+  if (m < 60) return t("settings.time_minutes", { count: m });
   const h = Math.floor(m / 60);
-  if (h < 24) return `hace ${h} h`;
+  if (h < 24) return t("settings.time_hours", { count: h });
   const d = Math.floor(h / 24);
-  if (d < 30) return `hace ${d} día${d > 1 ? "s" : ""}`;
-  return new Date(iso).toLocaleDateString();
+  if (d < 30) return t(d === 1 ? "settings.time_day_one" : "settings.time_days", { count: d });
+  return new Date(iso).toLocaleDateString(locale);
 }
 
 // User-agent → "Navegador en SO" con heurística simple.
-function parseUA(ua) {
-  if (!ua) return "Dispositivo desconocido";
-  let browser = "Navegador";
+function parseUA(ua, t) {
+  if (!ua) return t("settings.unknown_device");
+  let browser = t("settings.browser");
   if (/Edg/.test(ua)) browser = "Edge";
   else if (/Chrome/.test(ua) && !/Chromium/.test(ua)) browser = "Chrome";
   else if (/Firefox/.test(ua)) browser = "Firefox";
@@ -188,7 +188,7 @@ function parseUA(ua) {
   else if (/Mac OS X|Macintosh/.test(ua)) os = "macOS";
   else if (/Windows/.test(ua)) os = "Windows";
   else if (/Linux/.test(ua)) os = "Linux";
-  if (os) return `${browser} en ${os}`;
+  if (os) return t("settings.device_on_os", { browser, os });
   return ua.length > 48 ? ua.slice(0, 48) + "…" : ua;
 }
 
@@ -210,6 +210,7 @@ function AlertBanner({ variant, children }) {
 
 export default function Settings({ onBack }) {
   const { t, lang, setLang } = useI18n();
+  const locale = lang === "en" ? "en-US" : lang === "pt" ? "pt-BR" : "es-AR";
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [savedSettings, setSavedSettings] = useState(DEFAULT_SETTINGS);
   const [saved, setSaved] = useState(false);
@@ -263,6 +264,14 @@ export default function Settings({ onBack }) {
   const [newKeySecret, setNewKeySecret] = useState(null);
   const [keyCopied, setKeyCopied] = useState(false);
   const [revokingId, setRevokingId] = useState(null);
+  const [apiKeyError, setApiKeyError] = useState("");
+  const settingsRef = useRef(settings);
+  const notificationQueueRef = useRef(Promise.resolve());
+  const notificationMutationRef = useRef(0);
+  const savedSettingsRef = useRef(savedSettings);
+  const savedTimerRef = useRef(null);
+  settingsRef.current = settings;
+  savedSettingsRef.current = savedSettings;
 
   // Perfil
   const [fullName, setFullName] = useState(user?.full_name || "");
@@ -349,7 +358,7 @@ export default function Settings({ onBack }) {
     fetch(`${API}/youtube/connection-status`, { headers: authHeaders() })
       .then((r) => r.json())
       .then(setYtStatus)
-      .catch(() => setYtStatusError("Error al verificar la conexión."));
+      .catch(() => setYtStatusError(t("settings.yt_verify_error")));
   };
 
   // Quiet re-check (no loading flicker) used by the post-connect poll and
@@ -394,7 +403,7 @@ export default function Settings({ onBack }) {
     setYtHelp(false);
     try {
       const res = await fetch(`${API}/youtube/auth-url`, { headers: authHeaders() });
-      if (!res.ok) throw new Error("Error al obtener la URL de autenticación.");
+      if (!res.ok) throw new Error(t("settings.yt_auth_url_error"));
       const data = await res.json();
       const popup = window.open(data.auth_url, "_blank", "width=600,height=700,noopener");
       // Poll the connection status while the popup is open — resilient to
@@ -642,10 +651,12 @@ export default function Settings({ onBack }) {
   };
 
   const toggleNotif = async (key) => {
-    const prev = settings;
-    const next = { ...settings, [key]: !settings[key] };
+    const current = settingsRef.current;
+    const next = { ...current, [key]: !current[key] };
+    const mutationId = ++notificationMutationRef.current;
+    settingsRef.current = next;
     setSettings(next);
-    try {
+    const persist = async () => {
       const res = await fetch(`${API}/settings`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
@@ -655,20 +666,34 @@ export default function Settings({ onBack }) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.detail || `Error ${res.status}`);
       }
+      savedSettingsRef.current = next;
       setSavedSettings(next);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 3000);
+      if (mutationId === notificationMutationRef.current) {
+        setSaved(true);
+        if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
+        savedTimerRef.current = setTimeout(() => setSaved(false), 3000);
+      }
+    };
+    const request = notificationQueueRef.current.then(persist, persist);
+    notificationQueueRef.current = request.catch(() => {});
+    try {
+      await request;
     } catch (err) {
       // Revertir optimistic update: si el server rechazó, el toggle
       // local no debería quedarse mostrando el nuevo estado.
-      setSettings(prev);
-      setSaveError(`Toggle de notificación falló: ${err.message || err}`);
+      if (mutationId === notificationMutationRef.current) {
+        const lastConfirmed = savedSettingsRef.current;
+        settingsRef.current = lastConfirmed;
+        setSettings(lastConfirmed);
+      }
+      setSaveError(`${t("settings.notification_save_error")}: ${err.message || err}`);
       setTimeout(() => setSaveError(null), 6000);
     }
   };
 
   const handleCreateApiKey = async () => {
     if (!apiKeyName.trim()) return;
+    setApiKeyError("");
     setApiKeyCreating(true);
     try {
       const res = await fetch(`${API}/auth/api-keys`, {
@@ -676,25 +701,34 @@ export default function Settings({ onBack }) {
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ name: apiKeyName.trim() }),
       });
-      const data = await res.json();
-      if (!res.ok) return;
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `${t("settings.api_key_create_error")} (${res.status})`);
       setNewKeySecret(data.key);
       setApiKeys((prev) => [{ id: data.id, name: data.name, prefix: data.prefix, created_at: data.created_at, last_used_at: null }, ...prev]);
       setApiKeyName("");
-    } catch {} finally {
+    } catch (err) {
+      setApiKeyError(err?.message || t("settings.api_key_create_error"));
+    } finally {
       setApiKeyCreating(false);
     }
   };
 
   const handleRevokeApiKey = async (keyId) => {
+    setApiKeyError("");
     setRevokingId(keyId);
     try {
       const res = await fetch(`${API}/auth/api-keys/${keyId}`, {
         method: "DELETE",
         headers: authHeaders(),
       });
-      if (res.ok) setApiKeys((prev) => prev.filter((k) => k.id !== keyId));
-    } catch {} finally {
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `${t("settings.api_key_revoke_error")} (${res.status})`);
+      }
+      setApiKeys((prev) => prev.filter((k) => k.id !== keyId));
+    } catch (err) {
+      setApiKeyError(err?.message || t("settings.api_key_revoke_error"));
+    } finally {
       setRevokingId(null);
     }
   };
@@ -746,7 +780,7 @@ export default function Settings({ onBack }) {
     setAvatarError("");
     // Validación client-side espejo del backend (mejor UX que esperar el 400).
     if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
-      setAvatarError("Formato no válido. Usá JPG, PNG o WebP.");
+      setAvatarError(t("settings.avatar_format_error"));
       return;
     }
     if (file.size > 5 * 1024 * 1024) {
@@ -776,8 +810,8 @@ export default function Settings({ onBack }) {
       // algo accionable en vez del texto crudo del navegador. Los errores
       // con respuesta del backend (400/500) sí conservan su detail.
       const msg = (err instanceof TypeError)
-        ? "No se pudo subir la imagen (problema de conexión). Reintentá en unos segundos."
-        : (err.message || "No se pudo subir la imagen.");
+        ? t("settings.avatar_network_error")
+        : (err.message || t("settings.avatar_upload_error"));
       setAvatarError(msg);
     } finally {
       setAvatarUploading(false);
@@ -903,7 +937,7 @@ export default function Settings({ onBack }) {
     <div className="w-full max-w-[1180px] mx-auto animate-fade-in">
       {/* ─── Header ───────────────────────────────────────────────── */}
       <div className="flex items-end gap-3 mb-8">
-        <button onClick={onBack} aria-label="Volver"
+        <button onClick={onBack} aria-label={t("common.back")}
           className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors">
           <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M19 12H5M12 19l-7-7 7-7" />
@@ -921,7 +955,7 @@ export default function Settings({ onBack }) {
 
       {/* ─── Tabs ─────────────────────────────────────────────────── */}
       <div className="settings-layout">
-      <nav className="settings-nav" aria-label="Secciones de configuración">
+      <nav className="settings-nav" aria-label={t("settings.sections_aria")}>
         {[
           { id: "perfil",         label: t("settings.profile_tab"), icon: "◉" },
           { id: "cuenta",         label: t("settings.account") || "Cuenta", icon: "◇" },
@@ -948,15 +982,15 @@ export default function Settings({ onBack }) {
         {activeSection === "perfil" && (
           <>
             <Card>
-              <SectionLabel>Foto de perfil</SectionLabel>
+              <SectionLabel>{t("settings.profile_photo")}</SectionLabel>
               <p className="text-xs text-ink-secondary mb-4 -mt-1">
-                Se muestra en la barra lateral y junto a tu equipo.
+                {t("settings.profile_photo_sub")}
               </p>
               <div className="flex items-center gap-4">
                 <AvatarImg user={user} reloadKey={avatarKey} size="w-16 h-16" textSize="text-xl" />
                 <div>
                   <label className={`btn-secondary text-xs h-9 px-4 inline-flex items-center cursor-pointer ${avatarUploading ? "opacity-40 pointer-events-none" : ""}`}>
-                    {avatarUploading ? "Subiendo…" : "Cambiar foto"}
+                    {avatarUploading ? t("settings.avatar_uploading") : t("settings.avatar_change")}
                     <input
                       type="file"
                       accept="image/jpeg,image/png,image/webp"
@@ -965,34 +999,34 @@ export default function Settings({ onBack }) {
                       disabled={avatarUploading}
                     />
                   </label>
-                  <p className="text-[10px] text-gray-600 mt-1.5">JPG, PNG o WebP. Máx 5 MB.</p>
+                  <p className="text-[10px] text-gray-600 mt-1.5">{t("settings.avatar_help")}</p>
                 </div>
               </div>
               {avatarError && <div className="mt-3"><InlineError message={avatarError} /></div>}
             </Card>
 
             <Card>
-              <SectionLabel>Nombre</SectionLabel>
+              <SectionLabel>{t("settings.name")}</SectionLabel>
               <p className="text-xs text-ink-secondary mb-4 -mt-1">
-                Tu nombre visible para el resto del equipo.
+                {t("settings.name_sub")}
               </p>
-              <Field label="Nombre completo">
+              <Field label={t("settings.full_name")}>
                 <input
                   type="text"
                   value={fullName}
                   onChange={(e) => { setFullName(e.target.value); setNameError(""); }}
                   className="input-field text-sm"
-                  placeholder="Tu nombre"
+                  placeholder={t("settings.name_placeholder")}
                 />
               </Field>
               {nameError && <div className="mt-3"><InlineError message={nameError} /></div>}
               <div className="flex items-center justify-end gap-3 mt-4">
-                {nameSaved && <InlineSuccess message="Nombre actualizado" />}
+                {nameSaved && <InlineSuccess message={t("settings.name_saved")} />}
                 <button
                   onClick={handleSaveName}
                   disabled={savingName || !profileDirty}
                   className="btn-primary px-5 disabled:opacity-40 disabled:cursor-not-allowed">
-                  {savingName ? "…" : "Guardar"}
+                  {savingName ? "…" : t("settings.save_profile")}
                 </button>
               </div>
             </Card>
@@ -1052,6 +1086,11 @@ export default function Settings({ onBack }) {
               <p className="text-xs text-ink-secondary mb-4 -mt-1">
                 {t("settings.api_keys_sub") || "Tokens de acceso para integraciones externas."}
               </p>
+              {apiKeyError && (
+                <div role="alert" className="mb-4">
+                  <InlineError message={apiKeyError} />
+                </div>
+              )}
 
               {/* New key disclosed once */}
               {newKeySecret && (
@@ -1303,7 +1342,7 @@ export default function Settings({ onBack }) {
                     <p className="text-xs font-medium">{t("settings.usage_alert_100") || "Límite mensual alcanzado"}</p>
                     {usage.overage > 0 && (
                       <p className="text-[11px] opacity-70 mt-0.5">
-                        {usage.overage} {t("settings.usage_overage_videos") || "videos en overage"} · ${usage.overage_total?.toFixed(2)} adicionales
+                        {usage.overage} {t("settings.usage_overage_videos") || "videos en overage"} · ${usage.overage_total?.toFixed(2)} {t("settings.additional")}
                       </p>
                     )}
                   </AlertBanner>
@@ -1653,9 +1692,9 @@ export default function Settings({ onBack }) {
               <SectionLabel>{t("settings.app_lang")}</SectionLabel>
               <div className="flex flex-wrap gap-2">
                 {[
-                  { code: "es", label: "Español" },
-                  { code: "en", label: "English" },
-                  { code: "pt", label: "Português" },
+                  { code: "es", label: t("lang.es") },
+                  { code: "en", label: t("lang.en") },
+                  { code: "pt", label: t("lang.pt") },
                 ].map((l) => (
                   <button key={l.code} onClick={() => setLang(l.code)}
                     className={`h-9 px-4 rounded-full text-xs font-medium transition-all ${
@@ -1676,7 +1715,7 @@ export default function Settings({ onBack }) {
                 <Field label={t("settings.title_format")} help={t("settings.title_format_help")}>
                   <input type="text" value={settings.titleFormat}
                     onChange={(e) => update("titleFormat", e.target.value)}
-                    className="input-field text-sm" placeholder="{artista} - {cancion} (Letra/Lyrics)" />
+                    className="input-field text-sm" placeholder={t("settings.title_format_placeholder")} />
                 </Field>
                 <Field label={t("settings.desc_header")} help={t("settings.desc_header_help")}>
                   <textarea value={settings.descriptionHeader}
@@ -1693,12 +1732,12 @@ export default function Settings({ onBack }) {
                 <Field label={t("settings.mandatory_tags")} help={t("settings.mandatory_tags_help")}>
                   <input type="text" value={settings.mandatoryTags}
                     onChange={(e) => update("mandatoryTags", e.target.value)}
-                    className="input-field text-sm" placeholder="lyrics, letra, musica" />
+                    className="input-field text-sm" placeholder={t("settings.tags_placeholder")} />
                 </Field>
                 <Field label={t("settings.hashtags")} help={t("settings.hashtags_help")}>
                   <input type="text" value={settings.hashtags}
                     onChange={(e) => update("hashtags", e.target.value)}
-                    className="input-field text-sm" placeholder="#lyrics #letra #musica" />
+                    className="input-field text-sm" placeholder={t("settings.hashtags_placeholder")} />
                 </Field>
                 <div className="grid grid-cols-2 gap-3">
                   <Field label={t("settings.metadata_lang")}>
@@ -1812,16 +1851,16 @@ export default function Settings({ onBack }) {
           <Card>
             <div className="flex items-start justify-between gap-4 mb-4">
               <div>
-                <SectionLabel>Sesiones activas</SectionLabel>
+                <SectionLabel>{t("settings.active_sessions")}</SectionLabel>
                 <p className="text-xs text-ink-secondary -mt-1">
-                  Dispositivos donde tu cuenta tiene una sesión abierta.
+                  {t("settings.active_sessions_sub")}
                 </p>
               </div>
               <button
                 onClick={handleRevokeOthers}
                 disabled={revokingOthers || sessionsLoading || sessions.length <= 1}
                 className="shrink-0 text-[12px] font-medium px-4 py-2 rounded-lg bg-surface-3/40 text-ink-secondary ring-1 ring-white/[0.06] hover:text-white hover:ring-white/[0.12] transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
-                {revokingOthers ? "…" : "Cerrar todas las demás"}
+                {revokingOthers ? "…" : t("settings.close_other_sessions")}
               </button>
             </div>
 
@@ -1834,7 +1873,7 @@ export default function Settings({ onBack }) {
                 ))}
               </div>
             ) : sessions.length === 0 ? (
-              <p className="text-sm text-ink-secondary text-center py-4">Sin sesiones activas.</p>
+              <p className="text-sm text-ink-secondary text-center py-4">{t("settings.no_active_sessions")}</p>
             ) : (
               <div className="space-y-0">
                 {sessions.map((s, i) => (
@@ -1842,22 +1881,22 @@ export default function Settings({ onBack }) {
                     className={`flex items-center justify-between gap-3 py-3 ${i < sessions.length - 1 ? "border-b border-white/[0.03]" : ""}`}>
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
-                        <p className="text-sm text-white truncate">{parseUA(s.user_agent)}</p>
+                        <p className="text-sm text-white truncate">{parseUA(s.user_agent, t)}</p>
                         {s.current && (
                           <span className="shrink-0 text-[9px] bg-accent/15 text-accent px-2 py-0.5 rounded-full font-bold uppercase tracking-wider">
-                            Este dispositivo
+                            {t("settings.current_device")}
                           </span>
                         )}
                       </div>
                       <p className="text-[11px] text-gray-600 mt-0.5">
-                        {s.ip_address || "IP desconocida"} · última actividad {relativeTime(s.last_seen_at || s.created_at)}
+                        {s.ip_address || t("settings.unknown_ip")} · {t("settings.last_activity")} {relativeTime(s.last_seen_at || s.created_at, t, locale)}
                       </p>
                     </div>
                     <button
                       onClick={() => handleRevokeSession(s.id)}
                       disabled={revokingSession === s.id}
                       className="shrink-0 text-label px-3 py-1.5 rounded-lg bg-red-500/10 text-red-400 ring-1 ring-red-500/15 hover:bg-red-500/20 transition-colors disabled:opacity-40">
-                      {revokingSession === s.id ? "…" : "Cerrar sesión"}
+                      {revokingSession === s.id ? "…" : t("settings.close_session")}
                     </button>
                   </div>
                 ))}
@@ -1869,9 +1908,9 @@ export default function Settings({ onBack }) {
         {/* ════════════════════ MI EQUIPO ════════════════════ */}
         {activeSection === "equipo" && (
           <Card>
-            <SectionLabel>Mi equipo</SectionLabel>
+            <SectionLabel>{t("settings.team_tab")}</SectionLabel>
             <p className="text-xs text-ink-secondary mb-4 -mt-1">
-              Personas con acceso a este workspace ({team?.tenant_id || "—"}).
+              {t("settings.team_access")} ({team?.tenant_id || "—"}).
             </p>
             {teamLoading && !team?.members ? (
               <div className="space-y-2">
@@ -1884,9 +1923,9 @@ export default function Settings({ onBack }) {
                 {team?.members?.[0] && (
                   <AvatarImg user={team.members[0]} size="w-12 h-12" textSize="text-lg" />
                 )}
-                <p className="text-sm text-white font-medium mt-3">Por ahora sos la única persona en este workspace</p>
+                <p className="text-sm text-white font-medium mt-3">{t("settings.team_only_you")}</p>
                 <p className="text-xs text-ink-secondary mt-1 max-w-sm">
-                  Cuando se sumen más integrantes a tu cuenta van a aparecer acá y van a compartir los mismos videos del workspace.
+                  {t("settings.team_only_you_sub")}
                 </p>
               </div>
             ) : (
@@ -1900,7 +1939,7 @@ export default function Settings({ onBack }) {
                         <p className="text-sm text-white truncate">{m.full_name || m.username}</p>
                         {m.is_self && (
                           <span className="shrink-0 text-[9px] bg-brand/20 text-brand-light px-2 py-0.5 rounded-full font-bold uppercase tracking-wider">
-                            vos
+                            {t("settings.you")}
                           </span>
                         )}
                       </div>
@@ -1910,7 +1949,7 @@ export default function Settings({ onBack }) {
                     </div>
                     {m.role === "admin" && (
                       <span className="shrink-0 text-[10px] bg-accent/15 text-accent px-2.5 py-1 rounded-full font-medium">
-                        Admin
+                        {t("settings.admin")}
                       </span>
                     )}
                   </div>

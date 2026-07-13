@@ -1333,15 +1333,33 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         headers: { ...authHeaders(), "Content-Type": "application/json" },
         body: JSON.stringify({ notes: reviewNotes }),
       });
-      if (res.ok) {
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `${t("detail.approve_error_description")} (${res.status})`);
+      }
+      try {
         const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
-        if (!statusRes.ok) throw new Error(`Error ${statusRes.status}`);
+        if (!statusRes.ok) throw new Error(`${t("detail.refresh_error_description")} (${statusRes.status})`);
         const updated = await statusRes.json();
         onJobUpdate?.(updated);
+      } catch (refreshError) {
+        onJobUpdate?.({ ...job, status: "done" });
+        alert({
+          title: t("detail.refresh_warning_title"),
+          description: refreshError?.message || t("detail.refresh_error_description"),
+          tone: "warning",
+        });
       }
-    } catch {}
-    setApproving(false);
-    approveLockRef.current = false;
+    } catch (err) {
+      alert({
+        title: t("detail.approve_error_title"),
+        description: err?.message || t("detail.approve_error_description"),
+        tone: "error",
+      });
+    } finally {
+      setApproving(false);
+      approveLockRef.current = false;
+    }
   };
 
   // handleRetry está definida más arriba (~línea 175) para que esté
@@ -1357,23 +1375,39 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         headers: { ...authHeaders(), "Content-Type": "application/json" },
         body: JSON.stringify({ notes: reviewNotes }),
       });
-      if (res.ok) {
-        // Refresh the job state for any listing in the parent so the row
-        // shows "rejected", then go back. Staying on the detail screen
-        // would show "this job is not previewable" because rejected jobs
-        // intentionally can't be re-opened — better UX is to land the
-        // user back on the dashboard / batch view.
-        try {
-          const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
-          if (!statusRes.ok) throw new Error(`Error ${statusRes.status}`);
-          const updated = await statusRes.json();
-          onJobUpdate?.(updated);
-        } catch {}
-        onBack?.();
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `${t("detail.reject_error_description")} (${res.status})`);
       }
-    } catch {}
-    setApproving(false);
-    approveLockRef.current = false;
+      // Refresh the job state for any listing in the parent so the row
+      // shows "rejected", then go back. Staying on the detail screen
+      // would show "this job is not previewable" because rejected jobs
+      // intentionally can't be re-opened — better UX is to land the
+      // user back on the dashboard / batch view.
+      try {
+        const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
+        if (!statusRes.ok) throw new Error(`${t("detail.refresh_error_description")} (${statusRes.status})`);
+        const updated = await statusRes.json();
+        onJobUpdate?.(updated);
+      } catch (refreshError) {
+        onJobUpdate?.({ ...job, status: "rejected" });
+        alert({
+          title: t("detail.refresh_warning_title"),
+          description: refreshError?.message || t("detail.refresh_error_description"),
+          tone: "warning",
+        });
+      }
+      onBack?.();
+    } catch (err) {
+      alert({
+        title: t("detail.reject_error_title"),
+        description: err?.message || t("detail.reject_error_description"),
+        tone: "error",
+      });
+    } finally {
+      setApproving(false);
+      approveLockRef.current = false;
+    }
   };
 
   // ProRes button visibility — gated by delivery profile + done status,

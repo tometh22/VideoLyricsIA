@@ -1,5 +1,6 @@
-import { useState, useEffect } from "react";
+import { useRef, useState } from "react";
 import { useI18n } from "../i18n.jsx";
+import useDialogA11y from "../hooks/useDialogA11y";
 
 const _TYPE_LABEL = { intro: "Intro", verso: "Verso", pre: "Pre", coro: "Coro", puente: "Puente", outro: "Outro" };
 const _MOVES = [
@@ -21,20 +22,17 @@ export default function SceneEditModal({ scene, onClose, onSubmit }) {
   const [hint, setHint] = useState("");
   const [movement, setMovement] = useState("");
   const [showPrompt, setShowPrompt] = useState(false);
+  const textareaRef = useRef(null);
+  const dialogRef = useDialogA11y({ onClose, initialFocusRef: textareaRef });
 
   const label = _TYPE_LABEL[scene.section_type] || scene.section_type || "Escena";
   const canSubmit = hint.trim().length > 0 || (movement && movement !== "");
 
-  // Escape cierra el modal (a11y — audit M6/NIT).
-  useEffect(() => {
-    const onKey = (e) => { if (e.key === "Escape") onClose(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4" onClick={onClose}>
       <div
+        ref={dialogRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-label={(t("scenes.edit_title") || "Editar escena: {label}").replace("{label}", label)}
@@ -55,6 +53,7 @@ export default function SceneEditModal({ scene, onClose, onSubmit }) {
         </p>
 
         <textarea
+          ref={textareaRef}
           value={hint}
           onChange={(e) => setHint(e.target.value)}
           rows={3}

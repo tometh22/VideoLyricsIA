@@ -447,12 +447,12 @@ export default function LyricsTimeline({
       <div className="flex items-center justify-between px-3 py-2.5 border-b border-white/[0.05] gap-3 flex-wrap">
         <div className="flex items-center gap-2.5">
           <span className="text-[11px] uppercase tracking-wider text-ink-tertiary font-semibold">
-            Línea de tiempo
+            {t("timeline.title", "Línea de tiempo")}
           </span>
           {saveStatus === "saving" && (
             <span className="text-[10px] text-ink-tertiary flex items-center gap-1">
               <span className="w-1.5 h-1.5 rounded-full bg-ink-tertiary animate-pulse" />
-              Guardando…
+              {t("timeline.saving", "Guardando…")}
             </span>
           )}
           {saveStatus === "saved" && (
@@ -460,7 +460,7 @@ export default function LyricsTimeline({
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
                 <path d="M20 6 9 17l-5-5" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
-              Guardado
+              {t("timeline.saved", "Guardado")}
             </span>
           )}
           {saveStatus === "error" && (
@@ -471,7 +471,7 @@ export default function LyricsTimeline({
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
                 <path d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zM12 15.75h.01" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
-              Sin guardar — revisá tu conexión
+              {t("timeline.save_error", "Sin guardar — revisá tu conexión")}
             </span>
           )}
         </div>
@@ -481,7 +481,7 @@ export default function LyricsTimeline({
             onClick={toggleFollow}
             aria-pressed={followEnabled}
             className={`text-label px-2.5 py-1 rounded-md ring-1 transition-colors ${followEnabled ? "text-brand-light bg-brand/10 ring-brand/30" : "text-ink-secondary ring-white/[0.08] hover:text-white"}`}
-            title="Mantener la línea activa visible durante la reproducción"
+            title={t("timeline.follow_hint", "Mantener la línea activa visible durante la reproducción")}
           >
             {followEnabled && followSuppressed ? t("timeline.resume", "Reanudar") : t("timeline.follow", "Seguir")}
           </button>
@@ -494,27 +494,27 @@ export default function LyricsTimeline({
               onClick={() => setPxPerSec((z) => Math.max(ZOOM_MIN, z - ZOOM_STEP))}
               disabled={pxPerSec <= ZOOM_MIN}
               className="px-2 py-1 text-ink-secondary hover:text-white hover:bg-white/[0.05] disabled:opacity-30 transition-colors"
-              title="Alejar" aria-label="Alejar"
+              title={t("timeline.zoom_out", "Alejar")} aria-label={t("timeline.zoom_out", "Alejar")}
             >−</button>
             <span className="px-1.5 text-[10px] text-ink-tertiary tabular-nums select-none">{Math.round(pxPerSec)} px/s</span>
             <button
               onClick={() => setPxPerSec((z) => Math.min(ZOOM_MAX, z < ZOOM_MIN ? ZOOM_MIN : z + ZOOM_STEP))}
               disabled={pxPerSec >= ZOOM_MAX}
               className="px-2 py-1 text-ink-secondary hover:text-white hover:bg-white/[0.05] disabled:opacity-30 transition-colors"
-              title="Acercar" aria-label="Acercar"
+              title={t("timeline.zoom_in", "Acercar")} aria-label={t("timeline.zoom_in", "Acercar")}
             >+</button>
           </div>
           <button
             onClick={onReset}
             className="text-label px-2.5 py-1 rounded-md text-ink-secondary
               ring-1 ring-white/[0.08] hover:ring-white/20 hover:text-white transition-colors flex items-center gap-1.5"
-            title="Volver los timings al estado original"
+            title={t("timeline.reset_hint", "Volver los timings al estado original")}
           >
             <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M3 12a9 9 0 1 0 3-6.7L3 8" strokeLinecap="round" strokeLinejoin="round" />
               <path d="M3 3v5h5" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
-            Resetear timings
+            {t("timeline.reset", "Resetear timings")}
           </button>
         </div>
       </div>
@@ -631,7 +631,7 @@ export default function LyricsTimeline({
                   onPointerDown={(e) => onPointerDown(e, seg, "start")}
                   onPointerMove={onPointerMove}
                   onPointerUp={(e) => onPointerUp(e, seg)}
-                  title="Arrastrá: cuándo ENTRA la línea"
+                  title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea")}
                 >
                   <div className="w-7 h-[3px] rounded-full bg-white/40 group-hover/ht:bg-white/90 transition-colors" />
                 </div>
@@ -642,7 +642,7 @@ export default function LyricsTimeline({
                   onPointerDown={(e) => onPointerDown(e, seg, "end")}
                   onPointerMove={onPointerMove}
                   onPointerUp={(e) => onPointerUp(e, seg)}
-                  title="Arrastrá: cuándo SALE la línea"
+                  title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea")}
                 >
                   <div className="w-7 h-[3px] rounded-full bg-white/40 group-hover/hb:bg-white/90 transition-colors" />
                 </div>
@@ -735,11 +735,11 @@ export default function LyricsTimeline({
       </div>
 
       <p className="px-3 py-2 text-[10px] text-ink-tertiary border-t border-white/[0.05] flex flex-wrap items-center gap-x-3 gap-y-1">
-        <span><span className="text-ink-secondary">↕ bordes</span> ajustan entra/sale</span>
-        <span><span className="text-ink-secondary">cuerpo</span> mueve la línea</span>
-        <span><span className="text-ink-secondary">click</span> salta a ese punto</span>
-        <span><span className="text-ink-secondary">doble-click</span> corrige el texto</span>
-        <span className="text-ink-tertiary/70">lo que ajustás queda fijo</span>
+        <span><span className="text-ink-secondary">↕ {t("timeline.edges", "bordes")}</span> {t("timeline.edges_help", "ajustan entrada/salida")}</span>
+        <span><span className="text-ink-secondary">{t("timeline.body", "cuerpo")}</span> {t("timeline.body_help", "mueve la línea")}</span>
+        <span><span className="text-ink-secondary">click</span> {t("timeline.click_help", "salta a ese punto")}</span>
+        <span><span className="text-ink-secondary">{t("timeline.double_click", "doble-click")}</span> {t("timeline.double_click_help", "corrige el texto")}</span>
+        <span className="text-ink-tertiary/70">{t("timeline.fixed_help", "lo que ajustás queda fijo")}</span>
       </p>
     </div>
   );

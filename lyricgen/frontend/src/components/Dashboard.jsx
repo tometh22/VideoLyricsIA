@@ -22,20 +22,16 @@ const API = import.meta.env.VITE_API_URL || "";
 // IIFE doesn't `new Intl.DateTimeFormat()` on every render. Creating
 // a DateTimeFormat is ~5-10 ms in Chrome — fine once, but adds up at
 // 3-5 renders/sec while the polling loop is ticking.
-const DATE_HEADER_FMT = new Intl.DateTimeFormat("es-AR", {
-  weekday: "long", day: "numeric", month: "long",
-});
-const MONTH_FMT = new Intl.DateTimeFormat("es-AR", { month: "long" });
 
 function authHeaders() {
   const token = localStorage.getItem("genly_token");
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
-function timeAgo(ts) {
+function timeAgo(ts, t) {
   if (!ts) return "";
   const diff = Date.now() / 1000 - ts;
-  if (diff < 60) return "ahora";
+  if (diff < 60) return t("common.now");
   if (diff < 3600) return `${Math.floor(diff / 60)}m`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
   return `${Math.floor(diff / 86400)}d`;
@@ -76,7 +72,7 @@ function ProcessingRow({ job, onSelect, t }) {
   );
 }
 
-function VideoCard({ job, onSelect }) {
+function VideoCard({ job, onSelect, t }) {
   const name = (job.filename || "").replace(/\.mp3$/i, "");
   const songName = name.includes(" - ") ? name.split(" - ").slice(1).join(" - ") : name;
   const artistName = job.artist || (name.includes(" - ") ? name.split(" - ")[0] : "");
@@ -89,7 +85,7 @@ function VideoCard({ job, onSelect }) {
       onClick={() => onSelect(job.job_id, job.status)}
       className="overflow-hidden rounded-xl text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all"
     >
-      <MediaPreview src={thumbSrc} status={job.status} alt={`Miniatura de ${songName || "video"}`} label="Vista previa del video" className="aspect-video" imageClassName="group-hover:scale-[1.04] transition-transform duration-500">
+      <MediaPreview src={thumbSrc} status={job.status} alt={`${t("media.thumbnail_of")} ${songName || t("common.video")}`} label={t("media.video_preview")} className="aspect-video" imageClassName="group-hover:scale-[1.04] transition-transform duration-500">
         <div className="absolute z-[2] inset-0 flex items-center justify-center opacity-30 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/30">
           <div className="w-10 h-10 rounded-full bg-white/15 backdrop-blur-md flex items-center justify-center ring-1 ring-white/20">
             <svg className="w-4 h-4 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
@@ -100,7 +96,7 @@ function VideoCard({ job, onSelect }) {
       </MediaPreview>
       <div className="px-3.5 py-3">
         <div className="flex items-start gap-2 min-w-0">
-          <p className="text-[13px] font-medium text-white truncate flex-1 min-w-0">{songName || "Sin nombre"}</p>
+          <p className="text-[13px] font-medium text-white truncate flex-1 min-w-0">{songName || t("common.untitled")}</p>
           <ProResBadge
             deliveryProfile={job.delivery_profile}
             proresReady={job.prores_ready}
@@ -109,7 +105,7 @@ function VideoCard({ job, onSelect }) {
         </div>
         <p className="text-[11px] text-gray-500 truncate mt-0.5">
           {artistName}
-          {job.created_at && <span className="ml-1.5 text-gray-600">· {timeAgo(job.created_at)}</span>}
+          {job.created_at && <span className="ml-1.5 text-gray-600">· {timeAgo(job.created_at, t)}</span>}
         </p>
       </div>
     </button>
@@ -117,7 +113,7 @@ function VideoCard({ job, onSelect }) {
 }
 
 export default function Dashboard({ user, history, historyError, historyLoaded = true, onRetryHistory, onSelectJob, onNewBatch, onViewHistory, onOpenSearch }) {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const navigate = useNavigate();
 
   // FormatGallery handlers.
@@ -231,20 +227,6 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
     ? 0
     : (usage?.percent ?? (monthlyLimit ? Math.min(100, (monthlyUsed / monthlyLimit) * 100) : 0));
 
-  const greeting = (() => {
-    const h = new Date().getHours();
-    if (h < 12) return "Buenos días";
-    if (h < 19) return "Buenas tardes";
-    return "Buenas noches";
-  })();
-  const firstName = user?.username || "";
-
-  const monthlySubtitle = (() => {
-    if (history.length === 0) return "Subí tu primer audio para empezar";
-    if (monthlyUsed === 0) return "Aún no completaste videos este mes";
-    return `${monthlyUsed} ${monthlyUsed === 1 ? "video listo" : "videos listos"} este mes`;
-  })();
-
   // 2026-05-25 — Atención drawer state. Los banners de quota+errors
   // (antes apilados arriba compitiendo con el hero) ahora viven adentro
   // de un drawer colapsable a la derecha del hero. Solo se expande
@@ -256,16 +238,16 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
   // Header dinámico — operativo, no amable. Cambia según estado del sistema.
   // Linear/Stripe pattern: "Control room", no "Hola buenos días".
   const heroHeadline = (() => {
-    if (history.length === 0) return "Sistema listo";
-    if (pendingReview.length > 0) return `${pendingReview.length} ${pendingReview.length === 1 ? "video espera" : "videos esperan"} tu aprobación`;
-    if (processing.length > 0) return `${processing.length} ${processing.length === 1 ? "video" : "videos"} renderizando`;
-    return "Todo al día";
+    if (history.length === 0) return t("dash.hero_system_ready");
+    if (pendingReview.length > 0) return t(pendingReview.length === 1 ? "dash.hero_review_one" : "dash.hero_review_many", { count: pendingReview.length });
+    if (processing.length > 0) return t(processing.length === 1 ? "dash.hero_render_one" : "dash.hero_render_many", { count: processing.length });
+    return t("dash.hero_all_clear");
   })();
   const heroSubline = (() => {
-    if (history.length === 0) return "Subí tu primer audio para empezar.";
-    if (pendingReview.length > 0) return "Revisá y aprobá para destrabar descargas.";
-    if (processing.length > 0) return "El sistema sigue trabajando en background.";
-    return "Cero pendientes. Subí más audio cuando quieras.";
+    if (history.length === 0) return t("dash.first_audio_subtitle");
+    if (pendingReview.length > 0) return t("dash.hero_review_subline");
+    if (processing.length > 0) return t("dash.hero_render_subline");
+    return t("dash.hero_clear_subline");
   })();
 
   // El "próximo a terminar" — heurística simple: primer processing con
@@ -278,15 +260,17 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
     );
     return sorted[0];
   })();
+  const locale = lang === "en" ? "en-US" : lang === "pt" ? "pt-BR" : "es-AR";
   const dashboardDate = (() => {
     const d = new Date();
-    return DATE_HEADER_FMT.format(d) + " · " + d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
+    return new Intl.DateTimeFormat(locale, { weekday: "long", day: "numeric", month: "long" }).format(d)
+      + " · " + d.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
   })();
   const liveState = processing.length > 0
-    ? "Render activo"
+    ? t("dash.live_render")
     : pendingReview.length > 0
-      ? "Revisión pendiente"
-      : "Sistema operativo";
+      ? t("dash.live_review")
+      : t("dash.live_operational");
   const liveDotClass = processing.length > 0
     ? "bg-brand shadow-[0_0_14px_rgba(124,92,255,.75)]"
     : pendingReview.length > 0
@@ -300,7 +284,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div className="min-w-0">
           <div className="mb-2 flex flex-wrap items-center gap-2">
-            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Centro de producción</p>
+            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">{t("dash.production_center")}</p>
             <span className="rounded-full bg-white/[0.045] px-2.5 py-1 text-[10px] font-semibold text-gray-400 ring-1 ring-white/[0.06]">
               {dashboardDate}
             </span>
@@ -323,12 +307,12 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               type="button"
               onClick={onOpenSearch}
               className="hidden md:flex items-center gap-2 h-9 px-3 rounded-lg bg-surface-2/60 ring-1 ring-white/[0.06] hover:ring-white/[0.12] hover:bg-surface-2/80 text-gray-400 hover:text-gray-200 transition-colors text-xs"
-              aria-label="Buscar"
+              aria-label={t("topbar.search")}
             >
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <circle cx="11" cy="11" r="8" /><path d="M21 21l-4.35-4.35" strokeLinecap="round" />
               </svg>
-              <span>Buscar</span>
+              <span>{t("common.search")}</span>
               <kbd className="ml-2 px-1.5 h-5 inline-flex items-center rounded text-[10px] font-mono bg-white/[0.06] ring-1 ring-white/10 text-gray-500">
                 ⌘K
               </kbd>
@@ -346,7 +330,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                 }`}
             >
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg>
-              {attentionCount} {attentionCount === 1 ? "aviso" : "avisos"}
+              {attentionCount} {attentionCount === 1 ? t("dash.notice_one") : t("dash.notice_many")}
               <svg className={`w-3 h-3 transition-transform ${attentionOpen ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" strokeLinecap="round" strokeLinejoin="round"/></svg>
             </button>
           )}
@@ -369,13 +353,13 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           className={`group text-left px-5 py-4 transition-colors ${pendingReview.length > 0 ? "hover:bg-white/[0.035] cursor-pointer" : "cursor-default"}`}
         >
           <div className="flex items-center justify-between gap-3">
-            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Aprobar</p>
+            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">{t("review.approve")}</p>
             <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ring-1 ${
               pendingReview.length > 0
                 ? "bg-amber-400/[0.08] text-amber-200 ring-amber-400/20"
                 : "bg-white/[0.04] text-gray-500 ring-white/[0.05]"
             }`}>
-              {pendingReview.length > 0 ? "requiere acción" : "limpio"}
+              {pendingReview.length > 0 ? t("dash.requires_action") : t("dash.clear")}
             </span>
           </div>
           <div className="mt-2 flex items-baseline gap-2">
@@ -386,20 +370,20 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               {pendingReview.length}
             </span>
             <span className="text-xs text-ink-secondary">
-              {pendingReview.length === 0 ? "todo aprobado" :
-                pendingReview.length === 1 ? "pendiente de revisión" : "pendientes de revisión"}
+              {pendingReview.length === 0 ? t("dash.all_approved") :
+                pendingReview.length === 1 ? t("dash.review_pending_one") : t("dash.review_pending_many")}
             </span>
           </div>
           {pendingReview.length > 0 && pendingReview[0] && (
             <p className="text-[11px] text-ink-secondary mt-3 truncate">
-              <span className="font-mono tabular-nums text-gray-400">{timeAgo(pendingReview[0].created_at)}</span>
+              <span className="font-mono tabular-nums text-gray-400">{timeAgo(pendingReview[0].created_at, t)}</span>
               {" · "}
               {(pendingReview[0].filename || "").replace(/\.(mp3|wav)$/i, "")}
             </p>
           )}
           {pendingReview.length > 0 && (
             <p className="text-[11px] text-brand-light mt-2 flex items-center gap-1 group-hover:translate-x-0.5 transition-transform">
-              Revisar ahora
+              {t("dash.review_now")}
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/></svg>
             </p>
           )}
@@ -408,13 +392,13 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         {/* COL 2: RENDERIZANDO — sistema en vivo */}
         <div className="px-5 py-4">
           <div className="flex items-center justify-between gap-3">
-            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Renderizando</p>
+            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">{t("dash.rendering")}</p>
             <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ring-1 ${
               processing.length > 0
                 ? "bg-brand/[0.10] text-brand-light ring-brand/25"
                 : "bg-white/[0.04] text-gray-500 ring-white/[0.05]"
             }`}>
-              {processing.length > 0 ? "en vivo" : "sin cola"}
+              {processing.length > 0 ? t("dash.live") : t("dash.no_queue")}
             </span>
           </div>
           <div className="mt-2 flex items-baseline gap-2">
@@ -423,7 +407,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               {processing.length}
             </span>
             <span className="text-xs text-ink-secondary">
-              {processing.length === 0 ? "cola vacía" : processing.length === 1 ? "video en curso" : "jobs en curso"}
+              {processing.length === 0 ? t("dash.empty_queue") : processing.length === 1 ? t("dash.job_running_one") : t("dash.job_running_many")}
             </span>
           </div>
           {nextToFinish ? (
@@ -447,7 +431,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           ) : (
             <p className="text-[11px] text-ink-secondary mt-3">
               <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent/40 mr-2 align-middle" />
-              {errors.length > 0 ? `${errors.length} errores requieren atención` : "Sin renders activos · listo para tu próxima carga"}
+              {errors.length > 0 ? t("dash.errors_need_attention", { count: errors.length }) : t("dash.no_active_renders")}
             </p>
           )}
         </div>
@@ -456,7 +440,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         <div className="px-5 py-4">
           <div className="flex items-center justify-between gap-3">
             <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
-              Cuota {MONTH_FMT.format(new Date())}
+              {t("dash.quota")} {new Intl.DateTimeFormat(locale, { month: "long" }).format(new Date())}
             </p>
             <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ring-1 ${
               isUnlimited
@@ -465,14 +449,14 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                   ? "bg-amber-400/[0.08] text-amber-200 ring-amber-400/20"
                   : "bg-white/[0.04] text-gray-500 ring-white/[0.05]"
             }`}>
-              {isUnlimited ? "sin límite" : monthlyLimit ? `${Math.round(usagePercent)}% usado` : "cargando"}
+              {isUnlimited ? t("dash.unlimited") : monthlyLimit ? t("dash.percent_used", { percent: Math.round(usagePercent) }) : t("dash.loading")}
             </span>
           </div>
           <div className="mt-2 flex items-baseline gap-2">
             {isUnlimited ? (
               <>
                 <span className="text-[34px] leading-none font-bold tracking-normal tabular-nums text-white md:text-[36px]">{monthlyUsed}</span>
-                <span className="text-xs text-ink-secondary">sin límite</span>
+                <span className="text-xs text-ink-secondary">{t("dash.unlimited")}</span>
               </>
             ) : monthlyLimit ? (
               <>
@@ -494,10 +478,10 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               </>
             ) : usageError ? (
               <button onClick={retryUsage} className="text-xs text-brand-light hover:underline underline-offset-2">
-                Reintentar carga
+                {t("dash.retry")}
               </button>
             ) : (
-              <span className="text-xs text-ink-secondary">cargando…</span>
+              <span className="text-xs text-ink-secondary">{t("dash.loading")}</span>
             )}
           </div>
           {!isUnlimited && monthlyLimit && (
@@ -517,8 +501,8 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           {!isUnlimited && monthlyLimit && (
             <p className="text-[11px] text-ink-secondary mt-2 font-mono tabular-nums">
               {monthlyLimit - monthlyUsed > 0
-                ? `${monthlyLimit - monthlyUsed} restantes este mes`
-                : "Cupo agotado · contactá soporte"}
+                ? t("dash.remaining_month", { count: monthlyLimit - monthlyUsed })
+                : t("dash.quota_exhausted")}
             </p>
           )}
           {/* Créditos de regalo + qué rinde (dinámico). Mismo dato que el
@@ -540,15 +524,15 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               <div className="mt-3 pt-3 border-t border-white/[0.06] space-y-1.5">
                 {bonusRemaining > 0 && (
                   <p className="text-[11px] text-emerald-300 font-medium">
-                    Bonus activo · {bonusRemaining} créditos
-                    {giftDays != null ? (giftDays === 0 ? " · vencen hoy" : ` · vencen en ${giftDays} días`) : ""}
+                    {t("dash.bonus_active", { count: bonusRemaining })}
+                    {giftDays != null ? (giftDays === 0 ? ` · ${t("dash.expires_today")}` : ` · ${t("dash.expires_days", { count: giftDays })}`) : ""}
                   </p>
                 )}
                 <p className="text-[11px] text-ink-secondary">
-                  Te alcanza para {projN} videos normales o {projE} con Escenas
+                  {t("dash.projection", { normal: projN, scenes: projE })}
                 </p>
                 <p className="text-[10px] text-gray-500">
-                  Normal: 1 crédito · Escenas: {cost} créditos
+                  {t("dash.credit_cost", { cost })}
                 </p>
               </div>
             );
@@ -591,20 +575,20 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                 {overageMode ? (
                   <>
                     <p className="text-sm font-semibold text-brand-light">
-                      Pasaste el plan mensual — los extras se facturan al cierre
+                      {t("dash.overage_title")}
                     </p>
                     <p className="text-xs text-ink-secondary mt-0.5">
-                      {monthlyUsed} videos generados · {usage.overage} adicionales × ${usage.overage_cost_per_video}{" "}
-                      = <span className="font-semibold text-white">${usage.overage_total}</span> a abonar este mes.
+                      {t("dash.overage_body", { used: monthlyUsed, overage: usage.overage, cost: usage.overage_cost_per_video })}{" "}
+                      = <span className="font-semibold text-white">${usage.overage_total}</span> {t("dash.overage_due")}
                     </p>
                   </>
                 ) : blockMode ? (
                   <>
                     <p className="text-sm font-semibold text-red-200">
-                      Llegaste al límite mensual ({monthlyUsed}/{monthlyLimit})
+                      {t("dash.limit_title", { used: monthlyUsed, limit: monthlyLimit })}
                     </p>
                     <p className="text-xs text-red-300/80 mt-0.5">
-                      No vas a poder subir más videos hasta el mes que viene. Si necesitás extender el cupo, escribinos a{" "}
+                      {t("dash.limit_body")}{" "}
                       <a href="mailto:soporte@genly.pro" className="underline font-medium hover:text-red-200">
                         soporte@genly.pro
                       </a>.
@@ -613,11 +597,11 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                 ) : (
                   <>
                     <p className="text-sm font-semibold text-amber-200">
-                      Te quedan {monthlyLimit - monthlyUsed} videos este mes ({monthlyUsed}/{monthlyLimit})
+                      {t("dash.low_quota_title", { remaining: monthlyLimit - monthlyUsed, used: monthlyUsed, limit: monthlyLimit })}
                     </p>
                     <p className="text-xs text-amber-300/80 mt-0.5">
                       {user?.allow_overage
-                        ? `Pasado el tope, cada video adicional cuesta $${usage.overage_cost_per_video} y se factura al cierre.`
+                        ? t("dash.low_quota_overage", { cost: usage.overage_cost_per_video })
                         : <>{t("billing.nudge_body") || "Mejorá tu plan para no frenarte cuando llegues al tope."}{" "}
                             <button onClick={handleUpgrade} className="underline font-medium hover:text-amber-200">
                               {t("billing.nudge_cta") || "Mejorar plan"}
@@ -640,11 +624,11 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                 <circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/>
               </svg>
               <p className="text-xs text-red-300 flex-1">
-                {errors.length} {errors.length === 1 ? "video falló este mes" : "videos fallaron este mes"}
+                {t(errors.length === 1 ? "dash.failed_month_one" : "dash.failed_month_many", { count: errors.length })}
               </p>
               <button
                 onClick={dismissErrors}
-                aria-label="Descartar"
+                aria-label={t("common.dismiss")}
                 className="text-red-400/60 hover:text-red-300 transition-colors p-1 -mr-1"
               >
                 <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
@@ -708,9 +692,9 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
       {recentDone.length > 0 && (
         <div data-tour="dashboard-recent">
           <div className="flex items-center justify-between mb-4">
-            <SectionLabel>Tus últimos videos</SectionLabel>
+            <SectionLabel>{t("dash.recent_activity")}</SectionLabel>
             <button onClick={onViewHistory} className="text-[11px] text-brand hover:text-brand-light transition-colors flex items-center gap-1 -translate-y-1.5">
-              Ver historial completo
+              {t("dash.full_history")}
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/>
               </svg>
@@ -718,7 +702,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           </div>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-[repeat(auto-fill,minmax(250px,340px))]">
             {recentDone.map((job) => (
-              <VideoCard key={job.job_id} job={job} onSelect={onSelectJob} />
+              <VideoCard key={job.job_id} job={job} onSelect={onSelectJob} t={t} />
             ))}
           </div>
         </div>

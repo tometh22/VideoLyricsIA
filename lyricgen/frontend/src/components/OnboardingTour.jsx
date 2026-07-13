@@ -15,10 +15,11 @@ class TourErrorBoundary extends Component {
 // ─── Custom beacon ────────────────────────────────────────────────
 // Replaces Joyride's default blue dot with a pulsing brand-violet ring.
 function TourBeacon({ continuous, index, isLastStep, size, step, ...rest }) {
+  const { t } = useI18n();
   return (
     <button
       {...rest}
-      aria-label="Abrir tour guiado"
+      aria-label={t("tour.open")}
       className="relative flex h-5 w-5 items-center justify-center focus:outline-none"
     >
       <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-brand opacity-60" />
@@ -41,6 +42,7 @@ function TourTooltip({
   skipProps,
   tooltipProps,
 }) {
+  const { t } = useI18n();
   return (
     <div
       {...tooltipProps}
@@ -88,7 +90,7 @@ function TourTooltip({
                 {...backProps}
                 className="text-[11px] text-[#A0A3B1] transition-colors duration-240 hover:text-[#F5F7FA]"
               >
-                ← Atrás
+                ← {t("tour.back")}
               </button>
             )}
             {!isLastStep && (
@@ -96,14 +98,14 @@ function TourTooltip({
                 {...skipProps}
                 className="text-[11px] text-[#A0A3B1]/50 transition-colors duration-240 hover:text-[#A0A3B1]"
               >
-                Saltar
+                {t("tour.skip")}
               </button>
             )}
             <button
               {...primaryProps}
               className="rounded-[10px] bg-brand px-3.5 py-1.5 text-[11px] font-semibold text-white shadow-glow transition-all duration-240 hover:bg-brand-light active:scale-95"
             >
-              {isLastStep ? "Listo ✓" : "Siguiente →"}
+              {isLastStep ? `${t("tour.finish")} ✓` : `${t("tour.next")} →`}
             </button>
           </div>
         </div>

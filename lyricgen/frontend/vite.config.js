@@ -19,6 +19,22 @@ export default defineConfig({
       open: false,
     }),
   ].filter(Boolean),
+  build: {
+    rollupOptions: {
+      output: {
+        // Stable shared chunks keep the app shell small and let browsers cache
+        // large, rarely-changing catalogs/SDKs independently of product code.
+        manualChunks(id) {
+          if (id.endsWith("/src/i18n.jsx")) return "i18n";
+          if (!id.includes("node_modules")) return undefined;
+          if (id.includes("@sentry")) return "sentry-vendor";
+          if (id.includes("react-joyride") || id.includes("@floating-ui")) return "tour-vendor";
+          if (/node_modules\/(react|react-dom|react-router|react-router-dom|scheduler)\//.test(id)) return "react-vendor";
+          return undefined;
+        },
+      },
+    },
+  },
   server: {
     allowedHosts: true,
     proxy: {

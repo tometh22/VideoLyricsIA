@@ -48,8 +48,8 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
     });
   }
   const groups = [
-    { label: "Producción", items: items.filter((item) => ["dashboard", "new", "history"].includes(item.id)) },
-    { label: "Workspace", items: items.filter((item) => ["settings", "admin"].includes(item.id)) },
+    { label: t("sidebar.production"), items: items.filter((item) => ["dashboard", "new", "history"].includes(item.id)) },
+    { label: t("sidebar.workspace"), items: items.filter((item) => ["settings", "admin"].includes(item.id)) },
   ];
 
   return (
@@ -71,7 +71,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
               e.preventDefault();
               onNav("dashboard");
             }}
-            aria-label="Ir al dashboard"
+            aria-label={t("sidebar.go_dashboard")}
             className="flex items-center"
           >
             {open ? <BrandLockup size="sm" /> : <GenlyLogo variant="icon" />}
@@ -87,7 +87,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
             </span>
           ))}
         </div>
-        <button onClick={onToggle} className="app-sidebar__toggle" aria-label={open ? "Contraer navegación" : "Expandir navegación"}>
+        <button onClick={onToggle} className="app-sidebar__toggle" aria-label={open ? t("sidebar.collapse") : t("sidebar.expand")}>
           <svg className={`w-4 h-4 transition-transform ${open ? "" : "rotate-180"}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M15 18l-6-6 6-6" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
@@ -136,7 +136,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
             className="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-brand/5 hover:bg-brand/10 transition-all"
           >
             <span className="text-[10px] font-bold text-brand uppercase tracking-wider">
-              Plan {user.plan || "free"}
+              {t("settings.current_plan")} {user.plan || "free"}
             </span>
             <svg className="w-3 h-3 text-gray-500 ml-auto" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/>
