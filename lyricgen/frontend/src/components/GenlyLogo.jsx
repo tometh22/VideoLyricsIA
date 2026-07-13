@@ -15,7 +15,7 @@ export default function GenlyLogo({ variant = "color", size = "md", priority = f
       width={icon ? 30 : size === "lg" ? 200 : size === "sm" ? 116 : 132}
       height={icon ? 30 : undefined}
       loading={priority ? "eager" : "lazy"}
-      fetchPriority={priority ? "high" : "auto"}
+      fetchpriority={priority ? "high" : "auto"}
       draggable={false}
       className={`${icon ? "h-[30px] w-[30px]" : `${SIZES[size] || SIZES.md} h-auto`} object-contain object-left select-none ${className}`}
     />

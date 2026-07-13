@@ -23,6 +23,33 @@ if (typeof window !== "undefined" && typeof HTMLMediaElement !== "undefined") {
   HTMLMediaElement.prototype.load = () => {};
 }
 
+// Canvas is intentionally visual-only in unit tests (waveform + text
+// measurement). jsdom logs a noisy "not implemented" error on every render;
+// a deterministic 2D context keeps assertions focused on application code.
+if (typeof window !== "undefined" && typeof HTMLCanvasElement !== "undefined") {
+  HTMLCanvasElement.prototype.getContext = () => ({
+    setTransform: () => {},
+    clearRect: () => {},
+    fillRect: () => {},
+    measureText: (text) => ({ width: String(text || "").length * 8 }),
+    font: "",
+    fillStyle: "",
+  });
+}
+
+// Responsive charts need a non-zero observed box. jsdom has no layout engine,
+// so provide one stable viewport instead of letting Recharts warn with -1×-1.
+if (typeof window !== "undefined" && typeof globalThis.ResizeObserver === "undefined") {
+  globalThis.ResizeObserver = class ResizeObserver {
+    constructor(callback) { this.callback = callback; }
+    observe(target) {
+      this.callback([{ target, contentRect: { width: 800, height: 400 } }]);
+    }
+    unobserve() {}
+    disconnect() {}
+  };
+}
+
 // scrollIntoView — jsdom doesn't implement it. The editor calls it
 // from the sync-mode auto-scroll effect on every line change. Noop
 // stub is enough for tests; no test should depend on layout.
