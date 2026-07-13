@@ -9,6 +9,7 @@ import { tierForLength } from "../lib/lyricTiers";
 import { activeWordIndex } from "../lib/karaokeTiming";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
 import { segmentsValuesEqual } from "../lib/segmentsValuesEqual";
+import { clampSegmentToDuration } from "../lib/segmentTiming";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
 import { splitWordsAtCharOffset, firstWordStart, lastWordEnd } from "../lib/splitWords";
 import useLocalStorage from "../hooks/useLocalStorage";
@@ -1167,10 +1168,7 @@ export default function LyricsEditor({
     setEdited((prev) => {
       const mutated = prev.map((s, i) => {
         if (s._id === target._id) {
-          const segDur = Math.max(0.5, s.end - s.start);
-          let newEnd = newStart + segDur;
-          if (duration && newEnd > duration) newEnd = duration;
-          return { ...s, start: newStart, end: newEnd };
+          return clampSegmentToDuration(s, newStart, duration);
         }
         // Cascade only when the operator opted in AND the delta isn't a
         // suspect mistap (handled by the confirm above). 10 ms threshold
@@ -1178,11 +1176,7 @@ export default function LyricsEditor({
         // shift, above we apply it. See git blame for the prior 200 ms
         // dead-zone that swallowed legit user corrections.
         if (applyCascade && i > syncCursor && Math.abs(delta) >= 0.01) {
-          const segDur = Math.max(0.5, s.end - s.start);
-          const shifted = Math.max(0, s.start + delta);
-          let newEnd = shifted + segDur;
-          if (duration && newEnd > duration) newEnd = duration;
-          return { ...s, start: shifted, end: newEnd };
+          return clampSegmentToDuration(s, s.start + delta, duration);
         }
         return s;
       });
@@ -1615,13 +1609,7 @@ export default function LyricsEditor({
     if (Math.abs(delta) < 0.05) return;
     pushEditHistory();
     setEdited((prev) =>
-      prev.map((s) => {
-        const segDur = Math.max(0.5, s.end - s.start);
-        const newStart = Math.max(0, s.start + delta);
-        let newEnd = newStart + segDur;
-        if (duration && newEnd > duration) newEnd = duration;
-        return { ...s, start: newStart, end: newEnd };
-      }),
+      prev.map((s) => clampSegmentToDuration(s, s.start + delta, duration)),
     );
   }, [pushEditHistory, duration]);
 
