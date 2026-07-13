@@ -5,6 +5,7 @@ import inspect
 
 from database import Job, User
 import pipeline
+from main import _merge_content_validation_choice
 
 
 def _job(db, *, tenant="genly", billing_group=None, render_params=None):
@@ -54,6 +55,26 @@ def test_negative_operator_prompt_does_not_opt_in(db):
     assert pipeline._compute_allow_people(job_id, "Cero personas") is False
     assert pipeline._compute_allow_people(job_id, "Una mujer no debe aparecer") is False
     assert pipeline._compute_allow_people(job_id, "Personas: ninguna") is False
+
+
+def test_human_subject_with_unrelated_negative_constraints_still_opts_in(db):
+    job_id = _job(db, render_params={"bypass_content_validation": True})
+    assert pipeline._compute_allow_people(
+        job_id, "A woman by the window, no text and no logos"
+    ) is True
+    assert pipeline._compute_allow_people(
+        job_id, "Una mujer sentada, sin texto ni marcas"
+    ) is True
+    assert pipeline._compute_allow_people(
+        job_id, "Uma mulher na janela, sem texto ou logotipos"
+    ) is True
+
+
+def test_subject_first_exclusion_still_fails_closed(db):
+    job_id = _job(db, render_params={"bypass_content_validation": True})
+    assert pipeline._compute_allow_people(job_id, "A woman must not appear") is False
+    assert pipeline._compute_allow_people(job_id, "Una mujer no debe aparecer") is False
+    assert pipeline._compute_allow_people(job_id, "Uma mulher não deve aparecer") is False
 
 
 def test_prompt_alone_is_not_enough_without_free_background_opt_in(db):
@@ -120,3 +141,33 @@ def test_all_delivery_profiles_and_edit_paths_are_wired_to_validation():
     assert "if wants_youtube or wants_umg" in initial_source
     assert "_validate_background_asset_for_job" in edit_source
     assert "_validate_scene_video" in scene_source
+
+
+def test_policy_choice_default_is_safe_and_preserves_unrelated_params():
+    merged = _merge_content_validation_choice(
+        {"style": "neon", "bypass_content_validation": True},
+    )
+    assert merged == {"style": "neon", "force_content_validation": True}
+
+
+def test_policy_choice_force_wins_when_legacy_client_sends_both():
+    merged = _merge_content_validation_choice(
+        {"bypass_content_validation": True}, bypass=True, force=True,
+    )
+    assert merged["force_content_validation"] is True
+    assert "bypass_content_validation" not in merged
+
+
+def test_policy_choice_explicit_bypass_clears_stale_force():
+    merged = _merge_content_validation_choice(
+        {"force_content_validation": True}, bypass=True,
+    )
+    assert merged["bypass_content_validation"] is True
+    assert "force_content_validation" not in merged
+
+
+def test_all_policy_write_paths_use_the_single_merge_helper():
+    import main
+
+    for handler in (main.request_edit, main.retry_job, main.create_variant):
+        assert "_merge_content_validation_choice(" in inspect.getsource(handler)

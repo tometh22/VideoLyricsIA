@@ -60,10 +60,12 @@ logger = logging.getLogger("genly.bg_preview")
 # ordenadas para que el mismo dict en distinto orden produzca el mismo key.
 # Si agregamos params futuros que afecten el background, sumarlos acá +
 # bumpear CACHE_VERSION para invalidar el cache existente.
-# v2 invalidates previews generated before the 2026-07 no-implicit-people
-# policy. A legacy cache may contain a human even when the current prompt is
-# restricted, so it must never be reused without regeneration/revalidation.
-CACHE_VERSION = "v2-no-implicit-people"
+# v3 invalidates every preview written before the preview worker itself ran
+# the authoritative content gate.  v2 fixed prompt policy, but a generative
+# model can still ignore a negative prompt and hallucinate a human.  A v3
+# cache entry is therefore safe to trust on the endpoint's fast path: it was
+# validated before cache_put and cannot be a legacy/uninspected artefact.
+CACHE_VERSION = "v3-content-validated"
 
 
 def compute_bg_cache_key(params: dict) -> str:
@@ -160,7 +162,11 @@ def run_bg_preview_job(job_id: str, bg_cache_key: str, params: dict) -> dict:
     # arrastra mucho — preferimos lazy para que el módulo bg_preview sea
     # importable en tests sin spin-up del backend entero).
     try:
-        from pipeline import _ensure_background, _compute_allow_people
+        from pipeline import (
+            _ensure_background,
+            _compute_allow_people,
+            _validate_background_asset_for_job,
+        )
 
         with tempfile.TemporaryDirectory() as job_dir:
             # _ensure_background returns path to generated bg video/image.
@@ -198,6 +204,18 @@ def run_bg_preview_job(job_id: str, bg_cache_key: str, params: dict) -> dict:
 
             if not bg_path or not os.path.exists(bg_path):
                 raise RuntimeError("background generation returned no file")
+
+            # A prompt is a generation hint, not a compliance boundary. Veo
+            # can still hallucinate a human after receiving "no people". Run
+            # the same fail-closed gate used by the final render BEFORE this
+            # asset becomes a trusted cache hit. Universal can never bypass;
+            # other accounts follow the central policy as well.
+            if not _validate_background_asset_for_job(
+                job_id,
+                bg_path,
+                params.get("background_hint"),
+            ):
+                raise RuntimeError("background preview rejected by content policy")
 
             uploaded_key = cache_put(bg_cache_key, bg_path)
             if not uploaded_key:

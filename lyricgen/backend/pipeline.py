@@ -4123,23 +4123,34 @@ def _prompt_explicitly_requests_people(prompt: str | None) -> bool:
         r"silueta\s+humana|pessoas?|homem|homens|mulher|mulheres|crianças?|casal|"
         r"multid[aã]o|dançarino|figura\s+humana|silueta\s+humana"
     )
-    # Any negative instruction involving a human subject wins. This is
-    # intentionally conservative and covers free-form forms such as "no quiero
-    # gente", "evitar personas", "without any crowd" and Portuguese "não".
+    # A negative instruction that grammatically reaches a human subject wins.
+    # Keep the span punctuation-free and word-bounded: the previous arbitrary
+    # 80-character window misclassified positive prompts such as
+    # "A woman by the window, no text or logos" as a no-people instruction.
+    # This still covers free-form forms such as "no quiero que haya gente",
+    # "avoid any visible human figure" and Portuguese "não mostrar pessoas".
     if _re.search(
         rf"\b(?:no|not|without|avoid|exclude|never|sin|evitar|excluir|nunca|sem|"
-        rf"não|nao)\b[\s\S]{{0,80}}\b(?:{human_terms})\b",
+        rf"não|nao)\b(?:\s+[\w'’áéíóúüñãõç-]+){{0,5}}\s+\b(?:{human_terms})\b",
         text, _re.IGNORECASE,
     ):
         return False
+    # Subject-first negatives need an actual exclusion/visibility verb after
+    # the negation.  A bare later "no/sin" commonly modifies text, logos,
+    # camera motion, etc. and must not cancel an explicit human subject.
     if _re.search(
-        rf"\b(?:{human_terms})\b[\s\S]{{0,80}}\b(?:no|not|without|avoid|exclude|"
-        rf"never|sin|evitar|excluir|nunca|sem|não|nao|ningun[oa]s?|none|zero|cero|"
-        rf"free|libre|devoid)\b",
+        rf"\b(?:{human_terms})\b(?:\s+[\w'’áéíóúüñãõç-]+){{0,4}}\s+"
+        rf"(?:(?:must|should|can|debe[n]?|puede[n]?|deveria[m]?|pode[m]?)\s+)?"
+        rf"(?:no|not|never|nunca|não|nao)\b"
+        rf"(?:\s+[\w'’áéíóúüñãõç-]+){{0,3}}\s+"
+        rf"(?:appear|appears|shown|show|visible|included|allowed|aparecer|aparezca[n]?|"
+        rf"mostrar|mostrado|visible|incluid[oa]s?|permitid[oa]s?|aparecer|"
+        rf"mostrad[oa]s?|vis[ií]vel|inclu[ií]d[oa]s?|permitid[oa]s?)\b",
         text, _re.IGNORECASE,
     ) or _re.search(
         r"\b(?:people[- ]free|human[- ]free|libre\s+de\s+personas|devoid\s+of\s+"
-        r"people|cero\s+personas|zero\s+people|personas?\s*:\s*ninguna?s?)\b",
+        r"people|cero\s+personas|zero\s+people|ningun[oa]s?\s+personas?|"
+        r"no\s+human\s+subjects?|personas?\s*:\s*ninguna?s?)\b",
         text, _re.IGNORECASE,
     ):
         return False
@@ -8400,6 +8411,7 @@ def _persist_scene_thumb(clip_path: str, key: str, job_id: str) -> str | None:
 def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                           song_title: str, concept: str = "", job_id: str = None,
                           allow_people: bool = False,
+                          operator_prompt: str | None = None,
                           regen_keys: set | None = None) -> dict:
     """Genera un clip Veo por escena ÚNICA. Devuelve {recurrence_key: clip_path}.
 
@@ -8451,7 +8463,9 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
             # each 8s asset is still dense enough to inspect every second.
             # Validating only the stitched 3-5 minute timeline can sample
             # between scenes and miss a short human appearance.
-            if job_id and _background_safety_policy(job_id)["should_validate"]:
+            if job_id and _background_safety_policy(
+                job_id, operator_prompt
+            )["should_validate"]:
                 from content_validator import validate_video as _validate_scene_video
                 _scene_validation = _validate_scene_video(clip_path, job_id=job_id)
                 if _scene_validation.get("passed") is not True:
@@ -8540,7 +8554,8 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                                     operator_movement=_normalize_movement_style(movement_style))
     clip_for_key = _generate_scene_clips(plan, job_dir, artist=artist,
                                          song_title=song_title, concept=concept,
-                                         job_id=job_id, allow_people=allow_people)
+                                         job_id=job_id, allow_people=allow_people,
+                                         operator_prompt=background_hint)
     # Audit M3: exponer fallo parcial a nivel job. Las escenas fallidas se
     # sustituyen por un clip válido (degradación), pero el operador debe saber
     # cuántas — el filmstrip ya marca ⚠ por escena; esto da el agregado para un
@@ -8616,6 +8631,7 @@ def _regenerate_scene_background(scene_plan: dict, recurrence_key: str, job_dir:
     clip_for_key = _generate_scene_clips(scene_plan, job_dir, artist=artist,
                                          song_title=song_title, concept=concept,
                                          job_id=job_id, allow_people=allow_people,
+                                         operator_prompt=prompt_override or hint,
                                          regen_keys={recurrence_key})
     # GC del clip viejo (audit M8): sólo si la regen produjo uno NUEVO distinto.
     _new_clip_key = target.get("clip_cache_key")
@@ -8637,6 +8653,7 @@ def _restitch_scenes_for_edit(scene_plan: dict, segments: list[dict],
                               audio_duration: float, job_dir: str, *, artist: str,
                               song_title: str, concept: str = "",
                               allow_people: bool = False, job_id: str = None,
+                              operator_prompt: str | None = None,
                               target_w: int = 1920, target_h: int = 1080):
     """Re-arma el timeline multi-escena con la LETRA editada, SIN Veo.
 
@@ -8658,6 +8675,7 @@ def _restitch_scenes_for_edit(scene_plan: dict, segments: list[dict],
     clip_for_key = _generate_scene_clips(scene_plan, job_dir, artist=artist,
                                          song_title=song_title, concept=concept,
                                          job_id=job_id, allow_people=allow_people,
+                                         operator_prompt=operator_prompt,
                                          regen_keys=set())
     timeline = _scenes.stitch_timeline(new_secs, clip_for_key, audio_duration,
                                        job_dir, target_w=target_w, target_h=target_h)
@@ -12610,7 +12628,8 @@ def run_edit_pipeline(
                     _re_tl, scene_plan = _restitch_scenes_for_edit(
                         scene_plan, segments, _sc_audio, job_dir, artist=artist,
                         song_title=song_title, concept=concept,
-                        allow_people=_compute_allow_people(job_id), job_id=job_id)
+                        allow_people=_compute_allow_people(job_id, background_hint),
+                        job_id=job_id, operator_prompt=background_hint)
                     if _re_tl:
                         bg_image_path = _re_tl
                         bg_prelooped = True

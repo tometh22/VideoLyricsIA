@@ -17,23 +17,24 @@ function isUmgTenant(tenantId) {
 /**
  * Operator-facing toggle for content validation behavior. The wire
  * representation is a boolean: `value=true` means "validation runs",
- * `value=false` means "validation skipped". The parent component is
- * responsible for translating that boolean into the right backend flag
- * for the tenant:
+ * `value=false` requests a people-capable background. The parent translates
+ * that boolean into one of the existing mutually-exclusive backend flags:
  *
- *   UMG tenant (default behavior: validate):
- *     - value=true  → no payload field (matches tenant default)
- *     - value=false → send `bypass_content_validation: true`
+ *   Universal tenant:
+ *     - the UI only exposes value=true
+ *     - the backend is authoritative and always validates, even for a stale
+ *       client that attempts to send the bypass flag
  *
- *   Non-UMG tenant (default behavior: skip):
+ *   Non-Universal tenant:
  *     - value=true  → send `force_content_validation: true`
- *     - value=false → no payload field (matches tenant default)
+ *     - value=false → send `bypass_content_validation: true`; people are
+ *       permitted only when the operator prompt also asks for them explicitly
  *
  * UI copy differs per tenant so each operator sees their choice framed
  * in the way that matches the default they're departing from:
  *
- *   UMG:     "Activa (default)" vs "Asumir el riesgo" (amber warning)
- *   non-UMG: "Sin verificación (default)" vs "Activar verificación"
+ *   Universal: mandatory safe scan
+ *   non-Universal: safe scan vs explicit people-capable background
  *
  * Props:
  *   value      — boolean. true = validate, false = skip.

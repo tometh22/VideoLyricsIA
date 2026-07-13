@@ -8595,6 +8595,30 @@ class ApproveJobRequest(BaseModel):
     notes: str = Field(default="", max_length=2048)
 
 
+def _merge_content_validation_choice(
+    render_params: dict | None,
+    *,
+    bypass: bool = False,
+    force: bool = False,
+) -> dict:
+    """Persist one unambiguous content-policy choice, defaulting safe.
+
+    The three write paths (edit, retry and variant) must not preserve a stale
+    opposite flag from a prior operation.  Force wins if a malformed/legacy
+    client sends both values; when neither is present we fail closed.
+    """
+    merged = dict(render_params or {})
+    merged.pop("bypass_content_validation", None)
+    merged.pop("force_content_validation", None)
+    if force:
+        merged["force_content_validation"] = True
+    elif bypass:
+        merged["bypass_content_validation"] = True
+    else:
+        merged["force_content_validation"] = True
+    return merged
+
+
 class EditJobRequest(BaseModel):
     # edit_type values:
     #  - typography: re-render with new font/size/case/motion settings
@@ -8632,19 +8656,12 @@ class EditJobRequest(BaseModel):
     # spec granular de cámara. 300 obligaba a sacrificar negaciones que
     # son críticas para evitar bias del modelo. Costo Gemini marginal.
     background_hint: str | None = Field(default=None, max_length=2000)
-    # Operator-controlled bypass of content_validator (UMG Guideline 15
-    # check). Default False = follow tenant default. True = skip validator
-    # entirely (only has effect on UMG tenants — non-UMG already skip by
-    # default).
-    #
-    # Use case: UMG operator wants to ship a video where the flagged
-    # content IS the song's visual identity (rock guitarist hands).
-    # They accept the downstream UMG-review rejection risk knowingly.
+    # Explicit non-Universal opt-in used together with a prompt that asks for
+    # people. Universal accounts remain validation-mandatory in pipeline.py;
+    # this request field can never relax that server-side rule.
     bypass_content_validation: bool = Field(default=False)
-    # Inverse of bypass for non-UMG tenants. Default False = follow tenant
-    # default (skip validator for non-UMG). True = force validator to run
-    # even though the tenant doesn't require it. For operators of non-UMG
-    # tenants who *want* the conservative behavior anyway.
+    # Explicit safe choice. It also wins if a legacy/malformed client sends
+    # both flags. Sending neither defaults to this same fail-closed behavior.
     force_content_validation: bool = Field(default=False)
     # Background generation mode. Only meaningful when edit_type=="background".
     #
@@ -9752,19 +9769,15 @@ async def request_edit(
         # Persist the CURRENT mutually-exclusive choice. The worker resolves
         # policy from durable render_params; leaving a stale bypass there made
         # a later safe edit silently behave as unrestricted.
-        _rp_policy = dict(job.render_params or {})
-        _rp_policy.pop("bypass_content_validation", None)
-        _rp_policy.pop("force_content_validation", None)
-        if body.force_content_validation:
-            edit_params["force_content_validation"] = True
-            _rp_policy["force_content_validation"] = True
-        elif body.bypass_content_validation:
+        _rp_policy = _merge_content_validation_choice(
+            job.render_params,
+            bypass=body.bypass_content_validation,
+            force=body.force_content_validation,
+        )
+        if _rp_policy.get("bypass_content_validation"):
             edit_params["bypass_content_validation"] = True
-            _rp_policy["bypass_content_validation"] = True
         else:
-            # Safe default, including legacy clients that send neither flag.
             edit_params["force_content_validation"] = True
-            _rp_policy["force_content_validation"] = True
         job.render_params = _rp_policy
     # QA fix 2026-05-28 (edit-wizard consolidation): artist/song_title
     # mutations ungated across edit_types. Before this, the fields only
@@ -10372,12 +10385,9 @@ class RetryJobRequest(BaseModel):
     operators can downgrade a 4K render that OOMed the worker to HD on
     retry, without re-uploading the audio."""
     frame_size: str | None = Field(default=None, max_length=16)
-    # When True, set render_params["bypass_content_validation"]=True
-    # before re-enqueuing so the worker skips _validate_fn. Same semantics
-    # as EditJobRequest/VariantJobRequest. Use case: a job died in
-    # validation_failed because the prompt intentionally triggered the
-    # validator (e.g. "rock guitarist hands as subject"), and the
-    # operator wants to retry without recreating the variant manually.
+    # Explicit non-Universal people opt-in. The central pipeline still
+    # requires a matching positive prompt and never permits a Universal
+    # account to bypass validation.
     bypass_content_validation: bool = Field(default=False)
     force_content_validation: bool = Field(default=False)
 
@@ -10471,19 +10481,13 @@ async def retry_job(
             new_spec["frame_size"] = body.frame_size
             job.umg_spec = new_spec
 
-    # Operator opt-in flags forwarded to render_params before re-enqueue.
-    # When False/missing, render_params is untouched and tenant-gated
-    # defaults in pipeline.Step 1b apply.
-    _rp = dict(job.render_params or {})
-    _rp.pop("bypass_content_validation", None)
-    _rp.pop("force_content_validation", None)
-    if body and body.force_content_validation:
-        _rp["force_content_validation"] = True
-    elif body and body.bypass_content_validation:
-        _rp["bypass_content_validation"] = True
-    else:
-        _rp["force_content_validation"] = True
-    job.render_params = _rp
+    # Persist one mutually-exclusive choice; missing fields fail closed and
+    # stale choices from earlier attempts are removed.
+    job.render_params = _merge_content_validation_choice(
+        job.render_params,
+        bypass=bool(body and body.bypass_content_validation),
+        force=bool(body and body.force_content_validation),
+    )
 
     # Capturar status PREVIO antes de mutar. Sin esto el AuditLog
     # registraba siempre "processing" como previous_status (la línea de
@@ -10680,8 +10684,8 @@ class VariantJobRequest(BaseModel):
     # va al user_content de Gemini con header [OPERATOR OVERRIDE].
     # 2000 chars (bumped 2026-05-18, ver EditJobRequest para rationale).
     background_hint: str | None = Field(default=None, max_length=2000)
-    # Espejo del flag de EditJobRequest — operator override del content
-    # validator (UMG Guideline 15). Misma semántica, ver EditJobRequest.
+    # Same central policy as edit/retry: only a non-Universal account with an
+    # explicit people prompt can use this opt-in; Universal remains strict.
     bypass_content_validation: bool = Field(default=False)
     force_content_validation: bool = Field(default=False)
     # Override del concept del padre. 2000 chars igual que /generate.
@@ -10905,14 +10909,11 @@ async def create_variant(
         new_render_params["background_hint"] = body.background_hint
     if body.concept is not None:
         new_render_params["concept"] = body.concept
-    new_render_params.pop("bypass_content_validation", None)
-    new_render_params.pop("force_content_validation", None)
-    if body.force_content_validation:
-        new_render_params["force_content_validation"] = True
-    elif body.bypass_content_validation:
-        new_render_params["bypass_content_validation"] = True
-    else:
-        new_render_params["force_content_validation"] = True
+    new_render_params = _merge_content_validation_choice(
+        new_render_params,
+        bypass=body.bypass_content_validation,
+        force=body.force_content_validation,
+    )
 
     # Style: override o herencia.
     new_style = body.style if body.style is not None else (parent.style or "oscuro")

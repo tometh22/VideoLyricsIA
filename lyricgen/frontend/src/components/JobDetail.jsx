@@ -490,8 +490,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       // If the caller (or the dropdown) gave us a frame_size that
       // differs from what's currently on the job, pass it in the body.
       // Otherwise call /retry plain — backend keeps the existing spec.
-      // Tenant-aware validation flag: translate the toggle's boolean to
-      // bypass (UMG departing default) or force (non-UMG departing default).
+      // Persist the current mutually-exclusive policy choice. The backend is
+      // authoritative: Universal always validates; elsewhere a bypass also
+      // requires an explicit people prompt.
       const wantFrameOverride = fs && fs !== job.umg_spec?.frame_size;
       const bodyPayload = {};
       if (wantFrameOverride) bodyPayload.frame_size = fs;
