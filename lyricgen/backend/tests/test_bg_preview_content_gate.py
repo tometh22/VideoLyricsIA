@@ -1,4 +1,6 @@
-"""Preview-cache regressions for background policy v4."""
+"""Preview-cache regressions for background policy v5."""
+
+import pytest
 
 import bg_preview
 import jobs
@@ -25,7 +27,7 @@ def test_cache_key_isolated_by_policy_mode(monkeypatch):
         monkeypatch.setenv("BACKGROUND_SMOKE_POLICY_MODE", mode)
         keys.add(bg_preview.compute_bg_cache_key(params))
 
-    assert bg_preview.CACHE_VERSION == "v4"
+    assert bg_preview.CACHE_VERSION == "v5"
     assert len(keys) == 3
 
 
@@ -91,7 +93,7 @@ def _wire_preview(monkeypatch, events, *, validation_passes):
         events.append("generated")
         return path
 
-    def fake_validate(job_id, path, operator_prompt=None):
+    def fake_validate(job_id, path, operator_prompt=None, **_kwargs):
         assert job_id == "previewjob01"
         assert path.endswith("background.mp4")
         assert operator_prompt == "an empty neon tunnel"
@@ -102,6 +104,17 @@ def _wire_preview(monkeypatch, events, *, validation_passes):
     monkeypatch.setattr(pipeline, "_compute_allow_people", lambda *a, **kw: False)
     monkeypatch.setattr(
         pipeline, "_validate_background_asset_for_job", fake_validate,
+    )
+
+    def fake_fallback(job_dir, _style, **_kwargs):
+        path = f"{job_dir}/safe-fallback.mp4"
+        with open(path, "wb") as fh:
+            fh.write(b"fallback")
+        events.append("fallback")
+        return path
+
+    monkeypatch.setattr(
+        pipeline, "_write_safe_gradient_background", fake_fallback,
     )
 
 
@@ -124,20 +137,66 @@ def test_preview_is_validated_before_becoming_a_cache_hit(monkeypatch):
     assert events == ["generated", "validated", "cached"]
 
 
-def test_rejected_preview_never_enters_cache(monkeypatch):
+def test_rejected_preview_retries_then_caches_only_safe_local_fallback(monkeypatch):
     events = []
     _wire_preview(monkeypatch, events, validation_passes=False)
 
-    def forbidden_cache_put(*_args, **_kwargs):
-        raise AssertionError("a rejected preview must never be cached")
+    def safe_cache_put(_key, path):
+        assert path.endswith("safe-fallback.mp4")
+        events.append("cached")
+        return "bg_cache/cachekey.mp4"
 
-    monkeypatch.setattr(bg_preview, "cache_put", forbidden_cache_put)
+    monkeypatch.setattr(bg_preview, "cache_put", safe_cache_put)
     result = bg_preview.run_bg_preview_job(
         "previewjob01", "cachekey", {"background_hint": "an empty neon tunnel"},
     )
 
-    assert result["status"] == "bg_preview_failed"
-    assert events == ["generated", "validated"]
+    assert result["status"] == "bg_preview_done"
+    assert events == [
+        "generated", "validated",
+        "generated", "validated",
+        "fallback", "cached",
+    ]
+
+
+def test_provider_errors_retry_then_cache_safe_local_fallback(monkeypatch):
+    events = []
+    _wire_preview(monkeypatch, events, validation_passes=True)
+
+    def failed_generation(*_args, **_kwargs):
+        events.append("generation_error")
+        raise RuntimeError("imagen unavailable")
+
+    monkeypatch.setattr(pipeline, "_ensure_background", failed_generation)
+
+    def safe_cache_put(_key, path):
+        assert path.endswith("safe-fallback.mp4")
+        events.append("cached")
+        return "bg_cache/cachekey.mp4"
+
+    monkeypatch.setattr(bg_preview, "cache_put", safe_cache_put)
+    result = bg_preview.run_bg_preview_job(
+        "previewjob01", "cachekey", {"background_hint": "empty room"},
+    )
+
+    assert result["status"] == "bg_preview_done"
+    assert events == [
+        "generation_error", "generation_error", "fallback", "cached",
+    ]
+
+
+def test_preview_reraises_rq_death_penalty(monkeypatch):
+    events = []
+    _wire_preview(monkeypatch, events, validation_passes=True)
+
+    def timed_out(*_args, **_kwargs):
+        raise pipeline.RQJobTimeoutException("preview deadline")
+
+    monkeypatch.setattr(pipeline, "_ensure_background", timed_out)
+    with pytest.raises(pipeline.RQJobTimeoutException):
+        bg_preview.run_bg_preview_job(
+            "previewjob01", "cachekey", {"background_hint": "empty room"},
+        )
 
 
 def test_preview_policy_or_cache_mismatch_fails_before_generation(monkeypatch):
@@ -156,7 +215,7 @@ def test_preview_policy_or_cache_mismatch_fails_before_generation(monkeypatch):
         "previewjob01",
         "stale",
         {"background_hint": ""},
-        "background-v4:shadow:deny",
+        "background-v5:shadow:deny",
     )
 
     assert result["status"] == "bg_preview_failed"

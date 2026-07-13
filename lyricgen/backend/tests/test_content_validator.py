@@ -100,6 +100,46 @@ def test_validate_video_fails_closed_on_partial_check_error(tmp_path, monkeypatc
     assert result["check_errors"] == 1
 
 
+def test_decisive_policy_issue_can_stop_early_without_incomplete_error(
+    tmp_path, monkeypatch,
+):
+    tmp_dir = tempfile.mkdtemp(prefix="genly_validate_test_")
+    frames = []
+    for i in range(2):
+        frame = os.path.join(tmp_dir, f"frame_{i}.jpg")
+        open(frame, "wb").close()
+        frames.append(frame)
+    monkeypatch.setattr(
+        content_validator, "_extract_frames", lambda _p: (frames, tmp_dir, 2)
+    )
+    monkeypatch.setattr(
+        content_validator,
+        "_check_frame_with_gemini",
+        lambda _path: _classified(people=True),
+    )
+
+    result = content_validator.validate_video("fake.mp4")
+
+    assert result["passed"] is False
+    assert result["frames_checked"] == 1
+    assert result["check_errors"] == 0
+    assert len(result["issues"]) == 1
+    assert "people:" in result["issues"][0]["type"]
+    assert not any(
+        "did not produce a verdict" in issue["type"]
+        for issue in result["issues"]
+    )
+
+
+def test_classifier_prompt_distinguishes_equipment_from_people():
+    source = __import__("inspect").getsource(
+        content_validator._check_frame_with_gemini
+    ).lower()
+    assert "tripods" in source
+    assert "not people" in source
+    assert "infer a person solely" in source
+
+
 def test_extract_frames_samples_entire_long_video(tmp_path):
     fake_video = str(tmp_path / "long.mp4")
     open(fake_video, "wb").close()
