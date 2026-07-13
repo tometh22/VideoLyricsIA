@@ -147,3 +147,126 @@ def test_extract_frames_unknown_duration_fails_closed(tmp_path):
     assert frames == []
     assert planned == 1
     os.rmdir(tmp_dir)
+
+
+def _classified(*, people=False, atmospherics=False, brand=False):
+    detections = {
+        "people": people,
+        "atmospherics": atmospherics,
+        "brand": brand,
+    }
+    issues = [
+        {"category": category, "reason": f"visible {category}"}
+        for category, present in detections.items() if present
+    ]
+    return {"safe": not people and not brand, "detections": detections, "issues": issues}
+
+
+def test_people_opt_in_does_not_bypass_brand_gate(tmp_path, monkeypatch):
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"jpg")
+    monkeypatch.setattr(
+        content_validator,
+        "_check_frame_with_gemini",
+        lambda _path: _classified(people=True, brand=True),
+    )
+
+    result = content_validator.validate_image(str(image), allow_people=True)
+
+    assert result["passed"] is False
+    assert not any("people:" in issue["type"] for issue in result["issues"])
+    assert any("brand:" in issue["type"] for issue in result["issues"])
+
+
+def test_atmospherics_shadow_is_observed_without_blocking(tmp_path, monkeypatch):
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"jpg")
+    monkeypatch.setattr(
+        content_validator,
+        "_check_frame_with_gemini",
+        lambda _path: _classified(atmospherics=True),
+    )
+
+    result = content_validator.validate_image(
+        str(image),
+        allow_atmospherics=False,
+        observe_atmospherics=True,
+        enforce_atmospherics=False,
+    )
+
+    assert result["passed"] is True
+    assert result["issues"] == []
+    assert result["shadow_atmospherics_detected"] is True
+    assert result["observations"]
+
+
+def test_atmospherics_enforce_blocks_without_operator_opt_in(tmp_path, monkeypatch):
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"jpg")
+    monkeypatch.setattr(
+        content_validator,
+        "_check_frame_with_gemini",
+        lambda _path: _classified(atmospherics=True),
+    )
+
+    result = content_validator.validate_image(
+        str(image),
+        allow_atmospherics=False,
+        observe_atmospherics=False,
+        enforce_atmospherics=True,
+    )
+
+    assert result["passed"] is False
+    assert any("atmospherics:" in issue["type"] for issue in result["issues"])
+
+
+def test_atmospherics_opt_in_does_not_bypass_people_gate(tmp_path, monkeypatch):
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"jpg")
+    monkeypatch.setattr(
+        content_validator,
+        "_check_frame_with_gemini",
+        lambda _path: _classified(people=True, atmospherics=True),
+    )
+
+    result = content_validator.validate_image(
+        str(image),
+        allow_people=False,
+        allow_atmospherics=True,
+        enforce_atmospherics=False,
+    )
+
+    assert result["passed"] is False
+    assert any("people:" in issue["type"] for issue in result["issues"])
+
+
+def test_categorized_issue_promotes_contradictory_false_detection():
+    result = content_validator._evaluate_frame_result(
+        {
+            "safe": True,
+            "detections": {
+                "people": False,
+                "atmospherics": False,
+                "brand": False,
+            },
+            "issues": [{"category": "people", "reason": "visible hand"}],
+        },
+        allow_people=False,
+        allow_atmospherics=False,
+        enforce_atmospherics=True,
+    )
+
+    assert result["passed"] is False
+    assert result["detections"]["people"] is True
+    assert any("visible hand" in issue for issue in result["issues"])
+
+
+def test_legacy_safe_with_unattributed_issues_fails_closed():
+    result = content_validator._evaluate_frame_result(
+        {"safe": True, "issues": ["visible human"]},
+        allow_people=True,
+        allow_atmospherics=True,
+        enforce_atmospherics=False,
+    )
+
+    assert result["passed"] is False
