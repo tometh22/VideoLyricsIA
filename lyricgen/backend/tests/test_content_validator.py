@@ -34,9 +34,10 @@ def test_extract_frames_returns_tmp_dir_alongside_paths(tmp_path):
             return _F()
         mock_run.side_effect = _side_effect
 
-        frame_paths, tmp_dir = content_validator._extract_frames(fake_video)
+        frame_paths, tmp_dir, planned_frames = content_validator._extract_frames(fake_video)
 
     assert frame_paths == []
+    assert planned_frames > 0
     assert os.path.isdir(tmp_dir)
     # Caller is responsible for cleanup; verify it's actually removable.
     os.rmdir(tmp_dir)
@@ -74,3 +75,75 @@ def test_validate_video_cleans_tmpdir_when_no_frames_extracted(tmp_path):
     new_dirs = post - pre
     leftover = [d for d in new_dirs if d.startswith("genly_validate_")]
     assert leftover == [], f"Tmpdir leak: {leftover}"
+
+
+def test_validate_video_fails_closed_on_partial_check_error(tmp_path, monkeypatch):
+    tmp_dir = tempfile.mkdtemp(prefix="genly_validate_test_")
+    frames = []
+    for i in range(2):
+        frame = os.path.join(tmp_dir, f"frame_{i}.jpg")
+        open(frame, "wb").close()
+        frames.append(frame)
+    monkeypatch.setattr(content_validator, "_extract_frames", lambda _p: (frames, tmp_dir, 2))
+    calls = {"n": 0}
+
+    def _check(_path):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise content_validator.ValidatorCheckError("timeout")
+        return {"safe": True, "issues": []}
+
+    monkeypatch.setattr(content_validator, "_check_frame_with_gemini", _check)
+    result = content_validator.validate_video("fake.mp4")
+    assert result["passed"] is False
+    assert result["frames_checked"] == 1
+    assert result["check_errors"] == 1
+
+
+def test_extract_frames_samples_entire_long_video(tmp_path):
+    fake_video = str(tmp_path / "long.mp4")
+    open(fake_video, "wb").close()
+    timestamps = []
+
+    with patch.object(content_validator.subprocess, "run") as mock_run:
+        def _side_effect(cmd, **kwargs):
+            class _R:
+                stdout = "311.0"
+                returncode = 0
+            if cmd[0] == "ffmpeg":
+                timestamps.append(float(cmd[cmd.index("-ss") + 1]))
+            return _R()
+        mock_run.side_effect = _side_effect
+        _, tmp_dir, planned_frames = content_validator._extract_frames(fake_video)
+
+    assert len(timestamps) == 48
+    assert planned_frames == 48
+    assert timestamps[0] <= 1.0
+    assert timestamps[-1] >= 300.0
+    os.rmdir(tmp_dir)
+
+
+def test_validate_video_fails_closed_on_partial_extraction(tmp_path, monkeypatch):
+    tmp_dir = tempfile.mkdtemp(prefix="genly_validate_test_")
+    frame = os.path.join(tmp_dir, "frame_0.jpg")
+    open(frame, "wb").close()
+    monkeypatch.setattr(
+        content_validator, "_extract_frames", lambda _p: ([frame], tmp_dir, 48)
+    )
+    monkeypatch.setattr(
+        content_validator, "_check_frame_with_gemini",
+        lambda _p: {"safe": True, "issues": []},
+    )
+    result = content_validator.validate_video("fake.mp4")
+    assert result["passed"] is False
+    assert result["extraction_errors"] == 47
+
+
+def test_extract_frames_unknown_duration_fails_closed(tmp_path):
+    fake_video = str(tmp_path / "unknown.mp4")
+    open(fake_video, "wb").close()
+    with patch.object(content_validator.subprocess, "run", side_effect=TimeoutError("ffprobe")):
+        frames, tmp_dir, planned = content_validator._extract_frames(fake_video)
+    assert frames == []
+    assert planned == 1
+    os.rmdir(tmp_dir)
