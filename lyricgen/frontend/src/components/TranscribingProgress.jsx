@@ -180,10 +180,11 @@ export default function TranscribingProgress({
   }, [active]);
 
   return (
-    <div className="w-full max-w-md mx-auto mt-12 animate-fade-in">
+    <div className="ai-run-workspace animate-fade-in">
       {/* Title + queue position */}
-      <div className="text-center mb-6">
-        <h2 className="text-lg font-bold text-white">
+      <div className="ai-run-header">
+        <div className="ai-run-kicker"><span /> GENLY AI ENGINE</div>
+        <h2 className="text-2xl font-bold text-white tracking-tight">
           {t("transcribe.title") || "Transcribiendo lyrics"}
         </h2>
         {fileName && (
@@ -195,6 +196,9 @@ export default function TranscribingProgress({
           </p>
         )}
       </div>
+
+      <div className="ai-run-grid">
+      <section className="ai-run-card" aria-label={t("transcribe.progress_label")}>
 
       {/* Top progress bar. The shimmer overlay (active < 5) sits on top
           of the filled portion and travels left-to-right continuously,
@@ -291,6 +295,24 @@ export default function TranscribingProgress({
             "Esto está tomando más tiempo de lo normal. Nuestro motor de transcripción está procesando muchas canciones — refrescá en un minuto o cancelá y reintentá."}
         </p>
       )}
+      </section>
+
+      <aside className="ai-run-intelligence" aria-label={t("transcribe.activity")}>
+        <div className="ai-run-orbit" aria-hidden="true">
+          <span className="ai-run-orbit__core" />
+          <span className="ai-run-orbit__ring is-one" />
+          <span className="ai-run-orbit__ring is-two" />
+        </div>
+        <p className="ai-run-intelligence__label">{t("transcribe.activity")}</p>
+        <strong>{(t && t(STAGES.find((stage) => stage.i === active)?.key)) || STAGES.find((stage) => stage.i === active)?.fallback || "Finalizando"}</strong>
+        <div className="ai-run-metrics">
+          <div><span>{t("transcribe.progress_label")}</span><b>{pct}%</b></div>
+          <div><span>{t("transcribe.estimated_time")}</span><b>{active < 5 ? `~${displayEta}s` : "—"}</b></div>
+          <div><span>{t("transcribe.queue_label")}</span><b>{queueIndex}/{queueTotal}</b></div>
+        </div>
+        <p className="ai-run-intelligence__note">{t("transcribe.engine_note")}</p>
+      </aside>
+      </div>
     </div>
   );
 }

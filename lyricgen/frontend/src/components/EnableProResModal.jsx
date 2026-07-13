@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { useI18n } from "../i18n";
+import useDialogA11y from "../hooks/useDialogA11y";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -56,6 +57,7 @@ export default function EnableProResModal({ jobId, onClose, onSuccess }) {
   // EditRequestPanel.
   const mountedRef = useRef(true);
   useEffect(() => () => { mountedRef.current = false; }, []);
+  const dialogRef = useDialogA11y({ onClose, closeOnEscape: !submitting });
 
   const submit = async () => {
     if (submitting) return;
@@ -86,10 +88,15 @@ export default function EnableProResModal({ jobId, onClose, onSuccess }) {
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
+        tabIndex={-1}
         className="w-full max-w-md mx-4 bg-surface-1 ring-1 ring-white/[0.08] rounded-2xl p-6 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="enable-prores-title"
       >
-        <h3 className="text-lg font-semibold text-white mb-1">
+        <h3 id="enable-prores-title" className="text-lg font-semibold text-white mb-1">
           {t("prores.enable_title") || "Exportar a ProRes"}
         </h3>
         <p className="text-xs text-gray-400 mb-5">

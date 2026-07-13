@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
 import { useI18n } from "../i18n";
 import BrandLockup from "./BrandLockup";
+import GenlyLogo from "./GenlyLogo";
 import { IS_PRODUCTION, APP_ENV } from "../env";
 import UsageBadge from "./UsageBadge";
 
@@ -39,8 +40,6 @@ function _isPlainLeftClick(e) {
 export default function Sidebar({ onNav, activeView, open, onToggle, user, onLogout }) {
   const { t } = useI18n();
 
-  if (!open) return null;
-
   const items = ITEMS_BASE(t);
   if (user?.role === "admin") {
     items.push({
@@ -48,9 +47,13 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
       icon: <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" strokeLinecap="round" strokeLinejoin="round"/></svg>,
     });
   }
+  const groups = [
+    { label: t("sidebar.production"), items: items.filter((item) => ["dashboard", "new", "history"].includes(item.id)) },
+    { label: t("sidebar.workspace"), items: items.filter((item) => ["settings", "admin"].includes(item.id)) },
+  ];
 
   return (
-    <aside className="fixed left-0 top-0 bottom-0 w-60 bg-[#0b0b12]/98 backdrop-blur-xl border-r border-white/[0.055] z-30 flex flex-col">
+    <aside className={`app-sidebar ${open ? "is-open" : "is-collapsed"}`}>
 
       {/* Logo — full lockup per brand kit §10 (navbar uses full lockup,
           favicon uses mark-only). The "Pro" pill lives outside the
@@ -59,8 +62,8 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
           and middle-click opens a new tab natively. Plain left-click
           is routed through onNav("dashboard") to preserve the
           wizard-leaving confirm logic in App.handleNav. */}
-      <div className="flex h-14 items-center justify-between px-3.5 border-b border-white/[0.055]">
-        <div className="flex items-center gap-2.5">
+      <div className="app-sidebar__brand">
+        <div className="flex min-w-0 items-center gap-2.5">
           <Link
             to="/dashboard"
             onClick={(e) => {
@@ -68,12 +71,12 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
               e.preventDefault();
               onNav("dashboard");
             }}
-            aria-label="Ir al dashboard"
+            aria-label={t("sidebar.go_dashboard")}
             className="flex items-center"
           >
-            <BrandLockup size="sm" />
+            {open ? <BrandLockup size="sm" /> : <GenlyLogo variant="icon" />}
           </Link>
-          {IS_PRODUCTION ? (
+          {open && (IS_PRODUCTION ? (
             <span className="text-[8px] font-medium text-brand bg-brand/10 px-1.5 py-0.5 rounded-full uppercase tracking-widest">Pro</span>
           ) : (
             <span
@@ -82,11 +85,11 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
             >
               {APP_ENV === "development" ? "Dev" : "Staging"}
             </span>
-          )}
+          ))}
         </div>
-        <button onClick={onToggle} className="text-gray-500 hover:text-white transition-colors">
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <path d="M11 19l-7-7 7-7M18 19l-7-7 7-7" />
+        <button onClick={onToggle} className="app-sidebar__toggle" aria-label={open ? t("sidebar.collapse") : t("sidebar.expand")}>
+          <svg className={`w-4 h-4 transition-transform ${open ? "" : "rotate-180"}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M15 18l-6-6 6-6" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
         </button>
       </div>
@@ -95,31 +98,34 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
           Cmd+Click / middle-click open a new tab natively. Plain
           left-click prevents the default navigation and calls onNav
           so the App's wizard-leaving confirm fires. */}
-      <nav className="flex-1 py-3 px-2.5" data-tour="sidebar-nav">
-        {items.map((item) => (
-          <Link
-            key={item.id}
-            to={item.path}
-            onClick={(e) => {
-              if (!_isPlainLeftClick(e)) return;
-              e.preventDefault();
-              onNav(item.id);
-            }}
-            className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-md mb-0.5 text-[13px] font-medium transition-all duration-200
-              ${activeView === item.id
-                ? "bg-white/[0.045] text-white ring-1 ring-white/[0.065]"
-                : "text-gray-400 hover:text-white hover:bg-surface-2/60"
-              }`}
-          >
-            <span className={activeView === item.id ? "text-brand" : "text-gray-500"}>{item.icon}</span>
-            {item.label}
-          </Link>
+      <nav className="app-sidebar__nav" data-tour="sidebar-nav">
+        {groups.map((group) => (
+          <section key={group.label} className="app-sidebar__group">
+            {open && <p>{group.label}</p>}
+            {group.items.map((item) => (
+              <Link
+                key={item.id}
+                to={item.path}
+                title={!open ? item.label : undefined}
+                aria-current={activeView === item.id ? "page" : undefined}
+                onClick={(e) => {
+                  if (!_isPlainLeftClick(e)) return;
+                  e.preventDefault();
+                  onNav(item.id);
+                }}
+                className={`app-sidebar__link ${activeView === item.id ? "is-active" : ""}`}
+              >
+                <span className="app-sidebar__link-icon">{item.icon}</span>
+                {open && <span className="truncate">{item.label}</span>}
+              </Link>
+            ))}
+          </section>
         ))}
       </nav>
 
       {/* Plan badge */}
-      {user && (
-        <div className="px-4 py-3 border-t border-white/[0.045]">
+      {user && open && (
+        <div className="px-3 py-3 border-t border-white/[0.045]">
           <Link
             to="/account"
             onClick={(e) => {
@@ -130,7 +136,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
             className="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-brand/5 hover:bg-brand/10 transition-all"
           >
             <span className="text-[10px] font-bold text-brand uppercase tracking-wider">
-              Plan {user.plan || "free"}
+              {t("settings.current_plan")} {user.plan || "free"}
             </span>
             <svg className="w-3 h-3 text-gray-500 ml-auto" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/>
@@ -142,13 +148,13 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
       {/* Usage badge — shows monthly usage against plan limit. Hidden for
           unlimited plans + when /usage hasn't loaded yet. See
           UsageBadge for color thresholds + admin-only overage display. */}
-      <UsageBadge user={user} />
+      {open && <UsageBadge user={user} />}
 
       {/* User & logout */}
-      <div className="px-4 py-3.5 border-t border-white/[0.045] space-y-3">
-        <div className="flex items-center gap-2">
-          <div className="w-2 h-2 rounded-full bg-accent animate-pulse" />
-          <span className="text-[11px] text-gray-500">{t("nav.system_ok")}</span>
+      <div className={`app-sidebar__footer ${open ? "" : "is-compact"}`}>
+        <div className="app-sidebar__health" title={t("nav.system_ok")}>
+          <div className="w-2 h-2 rounded-full bg-accent" />
+          {open && <span>{t("nav.system_ok")}</span>}
         </div>
         {user && (
           <div className="flex items-center justify-between">
@@ -173,9 +179,9 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
               >
                 <span className="text-[10px] font-bold text-brand uppercase">{user.username?.charAt(0)}</span>
               </div>
-              <span className="text-xs text-gray-400 truncate">{user.username}</span>
+              {open && <span className="text-xs text-gray-400 truncate">{user.username}</span>}
             </div>
-            {onLogout && (
+            {onLogout && open && (
               <button
                 onClick={onLogout}
                 title={t("nav.logout")}

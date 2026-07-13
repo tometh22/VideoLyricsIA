@@ -10,9 +10,7 @@ import { uploadFileToR2 } from "./r2Upload";
 import * as wizardPersistence from "./wizardPersistence";
 import LoginPage from "./components/LoginPage";
 import Sidebar from "./components/Sidebar";
-import Dashboard from "./components/Dashboard";
-import SearchPalette from "./components/SearchPalette";
-import UploadZone from "./components/UploadZone";
+import GlobalTopbar from "./components/GlobalTopbar";
 import TitleCardPreview from "./components/TitleCardPreview";
 // 2026-05-27 Phase-2 audit: LyricsEditor (~85 KB), AdminPanel (~50 KB)
 // and Settings (~30 KB) lazy-load so the main bundle drops below
@@ -34,13 +32,14 @@ const Settings = lazy(() => import("./components/Settings"));
 const Landing = lazy(() => import("./components/Landing"));
 const JobDetail = lazy(() => import("./components/JobDetail"));
 const HistoryView = lazy(() => import("./components/HistoryView"));
+const Dashboard = lazy(() => import("./components/Dashboard"));
+const UploadZone = lazy(() => import("./components/UploadZone"));
+const SearchPalette = lazy(() => import("./components/SearchPalette"));
 import BatchProgress from "./components/BatchProgress";
 import TranscribingProgress from "./components/TranscribingProgress";
 import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
-import WhatsNewBell from "./components/WhatsNew/WhatsNewBell";
 import GiftCreditsBanner from "./components/GiftCreditsBanner";
 import { useAlert } from "./components/AlertProvider";
-import HelpButton from "./components/HelpCenter/HelpButton";
 import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
 import { translateBackendError } from "./lib/lyricsEditSubmit";
@@ -420,7 +419,7 @@ function UpgradeNudge({ user }) {
   );
 }
 
-function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
+function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpenSearch, onStartNewBatch }) {
   const { t } = useI18n();
   const navigate = useNavigate();
   const { pathname } = useLocation();
@@ -430,6 +429,36 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
     pathname === "/account" ? "settings" :
     pathname === "/admin" ? "admin" :
     "dashboard";
+
+  useEffect(() => {
+    const mobile = window.matchMedia("(max-width: 767px)");
+    const closeOnMobileEntry = (event) => { if (event.matches) setSidebarOpen(false); };
+    mobile.addEventListener?.("change", closeOnMobileEntry);
+    return () => mobile.removeEventListener?.("change", closeOnMobileEntry);
+  }, [setSidebarOpen]);
+
+  useEffect(() => {
+    if (!sidebarOpen || !window.matchMedia("(max-width: 767px)").matches) return undefined;
+    const sidebar = document.querySelector(".app-sidebar");
+    const focusable = () => [...(sidebar?.querySelectorAll('a[href], button:not([disabled])') || [])];
+    requestAnimationFrame(() => focusable()[0]?.focus());
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setSidebarOpen(false);
+        requestAnimationFrame(() => document.querySelector('.global-topbar__icon')?.focus());
+      } else if (event.key === "Tab") {
+        const items = focusable();
+        if (!items.length) return;
+        const first = items[0];
+        const last = items[items.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [sidebarOpen, setSidebarOpen]);
 
   const handleNav = (id) => {
     // If the operator is in the middle of a wizard batch (uploaded /
@@ -471,56 +500,30 @@ function AppShell({ user, sidebarOpen, setSidebarOpen, onLogout }) {
 
       {sidebarOpen && (
         <div
-          className="fixed inset-0 bg-black/50 z-10 md:hidden"
+          className="fixed inset-0 bg-black/60 z-[35] md:hidden"
           onClick={() => setSidebarOpen(false)}
+          aria-hidden="true"
         />
       )}
 
-      <div className={`flex-1 min-h-screen transition-all duration-300 ${sidebarOpen ? "md:ml-60" : "md:ml-0"}`}>
-        {/* Top bar */}
-        <header className="sticky top-0 z-30 flex h-14 items-center justify-between px-4 md:px-6 border-b border-white/[0.055] bg-[#0b0b12]" style={{boxShadow: '0 1px 10px rgba(0,0,0,0.18)'}}>
-          <div className="flex items-center gap-3">
-            <button
-              onClick={() => setSidebarOpen(!sidebarOpen)}
-              className={`mr-2 text-gray-400 hover:text-white transition-colors ${sidebarOpen ? "md:hidden" : ""}`}
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
-            </button>
-          </div>
-          <div className="flex items-center gap-3">
-            <WhatsNewBell />
-            <HelpButton />
-            {/* El avatar + nombre vive en UN solo lugar: el bloque de perfil
-                del sidebar (patrón Slack/Linear). El topbar queda para
-                acciones contextuales (ayuda + logout), sin duplicar la
-                identidad. */}
-            {/* Topbar logout (audit F P0-4 2026-05-27): always reachable, even
-                when the sidebar is collapsed on mobile or when `user` is null
-                in a transient half-state. The sidebar already has a logout
-                inside its `{user && ...}` block; this one is a defense-in-
-                depth fallback so the operator is never locked in.
-                Icon mirrors Sidebar.jsx:159-161 for visual consistency. */}
-            {onLogout && (
-              <button
-                onClick={onLogout}
-                title={t("nav.logout") || "Cerrar sesión"}
-                aria-label={t("nav.logout") || "Cerrar sesión"}
-                className="text-gray-500 hover:text-red-400 transition-colors p-1.5 rounded-lg hover:bg-white/[0.04]"
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">
-                  <path d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" strokeLinecap="round" strokeLinejoin="round"/>
-                </svg>
-              </button>
-            )}
-          </div>
-        </header>
+      <div className={`flex-1 min-h-screen transition-all duration-300 ${sidebarOpen ? "md:ml-60" : "md:ml-[72px]"}`}>
+        <GlobalTopbar
+          user={user}
+          activeRenders={(history || []).filter((job) => ["processing", "queued", "editing", "transcribing", "transcribing_queued"].includes(job.status)).length}
+          onSearch={onOpenSearch}
+          onCreate={onStartNewBatch}
+          onNavigate={handleNav}
+          onLogout={onLogout}
+          onToggleNavigation={() => setSidebarOpen(!sidebarOpen)}
+          navigationOpen={sidebarOpen}
+        />
 
         {/* Dunning banner — sits above content, below the top bar */}
         <PastDueBanner user={user} />
         <UpgradeNudge user={user} />
 
         {/* Content */}
-        <main className="relative z-10 px-4 md:px-6 pt-5 pb-20">
+        <main className="relative z-10 px-4 md:px-8 pt-6 pb-24">
           <GiftCreditsBanner user={user} />
           <Outlet />
         </main>
@@ -3343,8 +3346,46 @@ export default function App() {
     navigate(`/videos/${jobId}`);
   };
 
+  const handleSearchSelectJob = (jobId, status) => {
+    const onWizardRoute = ["/new", "/review", "/generating"].includes(location.pathname);
+    if (onWizardRoute && wizardPersistence.hasResumableContent(wizardPersistence.load())) {
+      const msg =
+        t("wizard.confirm_leave") ||
+        "Tenés un batch en progreso. Si te vas, podés retomarlo al volver desde el banner amarillo, pero perdés el contexto actual. ¿Continuar?";
+      if (!window.confirm(msg)) return false;
+    }
+    handleSelectJob(jobId, status);
+    return true;
+  };
+
+  const handleStartNewBatch = () => {
+    const hasState =
+      files.length > 0 ||
+      approvedJobs.length > 0 ||
+      currentReview !== null ||
+      reviewQueue.length > 0;
+    if (hasState) {
+      const msg =
+        t("wizard.confirm_discard_batch") ||
+        "Vas a empezar un batch nuevo y perdés el progreso actual (lyrics corregidas, canciones aprobadas). ¿Seguro?";
+      if (!window.confirm(msg)) return;
+    }
+    setFiles([]);
+    setApprovedJobs([]);
+    setCurrentReview(null);
+    setReviewQueue([]);
+    setBackgroundFile(null);
+    setBackgroundId(null);
+    setBgSelectMode("auto");
+    setAnimateImage(false);
+    setEnableScenes(false);
+    wizardPersistence.clear();
+    navigate("/new");
+  };
+
   const handleBulkApproveBatch = async (jobIds) => {
     if (!Array.isArray(jobIds) || jobIds.length === 0) return;
+    const failed = [];
     for (const jobId of jobIds) {
       try {
         const res = await authFetch(`${API}/approve/${jobId}`, {
@@ -3352,14 +3393,27 @@ export default function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ notes: "" }),
         });
-        if (res.ok) {
-          setJobs((prev) =>
-            prev.map((j) => j.job_id === jobId ? { ...j, status: "done" } : j)
-          );
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          failed.push({ jobId, reason: data.detail || `Error ${res.status}` });
+          continue;
         }
-      } catch {}
+        setJobs((prev) =>
+          prev.map((j) => j.job_id === jobId ? { ...j, status: "done" } : j)
+        );
+      } catch (err) {
+        failed.push({ jobId, reason: err?.message || t("common.network_error") });
+      }
     }
-    fetchHistory();
+    await fetchHistory();
+    if (failed.length > 0) {
+      const firstFailure = failed[0];
+      alert({
+        title: t("history.bulk_approve_partial_title"),
+        description: `${failed.length}/${jobIds.length} ${t("history.bulk_approve_partial_description")} ${firstFailure.jobId}: ${firstFailure.reason}`,
+        tone: "error",
+      });
+    }
   };
 
   const handleDeleteJob = async (jobId) => {
@@ -3677,6 +3731,7 @@ export default function App() {
       <div className="lg:shrink-0">{resumeBanner}</div>
 
       <div className="lg:flex-1 lg:min-h-0 lg:overflow-hidden lg:flex lg:flex-col">
+      <Suspense fallback={<RouteSuspenseFallback />}>
       <UploadZone
         files={files}
         onFiles={setFiles}
@@ -3770,6 +3825,7 @@ export default function App() {
         // "(muestra)" en consecuencia.
         bgStatus={bgPreview.status}
       />
+      </Suspense>
       </div>
     </div>
   );
@@ -4104,53 +4160,29 @@ export default function App() {
             <RequireAuth token={token}>
               <AppShell
                 user={user}
+                history={history}
                 sidebarOpen={sidebarOpen}
                 setSidebarOpen={setSidebarOpen}
                 onLogout={handleLogout}
+                onOpenSearch={() => setSearchOpen(true)}
+                onStartNewBatch={handleStartNewBatch}
               />
             </RequireAuth>
           }
         >
           <Route path="/dashboard" element={
-            <Dashboard
-              user={user}
-              history={history}
-              historyError={historyError}
-              historyLoaded={historyLoaded}
-              onRetryHistory={fetchHistory}
-              onSelectJob={handleSelectJob}
-              onOpenSearch={() => setSearchOpen(true)}
-              onNewBatch={() => {
-                // Guard the "Nuevo batch" CTA — clicking it while a
-                // batch is in progress used to silently wipe everything
-                // (setFiles([]) + navigate). Confirm first, then clear
-                // both in-memory state AND the persisted snapshot so
-                // the resume banner doesn't immediately reappear.
-                const hasState =
-                  files.length > 0 ||
-                  approvedJobs.length > 0 ||
-                  currentReview !== null ||
-                  reviewQueue.length > 0;
-                if (hasState) {
-                  const msg =
-                    t("wizard.confirm_discard_batch") ||
-                    "Vas a empezar un batch nuevo y perdés el progreso actual (lyrics corregidas, canciones aprobadas). ¿Seguro?";
-                  if (!window.confirm(msg)) return;
-                }
-                setFiles([]);
-                setApprovedJobs([]);
-                setCurrentReview(null);
-                setReviewQueue([]);
-                // Audit adversarial 2026-06-09: este CTA limpiaba el batch
-                // pero NO la selección de fondo — mismo carryover que el
-                // bug de Ana M., por otra puerta. Paridad con handleReset.
-                setBackgroundFile(null); setBackgroundId(null);
-                setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
-                wizardPersistence.clear();
-                navigate("/new");
-              }}
-              onViewHistory={() => navigate("/videos")}
-            />
+            <Suspense fallback={<RouteSuspenseFallback />}>
+              <Dashboard
+                user={user}
+                history={history}
+                historyError={historyError}
+                historyLoaded={historyLoaded}
+                onRetryHistory={fetchHistory}
+                onSelectJob={handleSelectJob}
+                onNewBatch={handleStartNewBatch}
+                onViewHistory={() => navigate("/videos")}
+              />
+            </Suspense>
           } />
           {/* Capa B 2026-05-24 — /new y /review renderizan el MISMO content
               (wizardScreen) que conmuta upload ↔ review ↔ ready_to_generate
@@ -4221,12 +4253,16 @@ export default function App() {
       {/* 2026-05-25 PR-2 — Command palette ⌘K. Renderizado fuera de
           <Routes> para que sobreviva navegación entre rutas. El listener
           de teclado global vive en el GlobalSearchKeybinding helper. */}
-      <SearchPalette
-        isOpen={searchOpen}
-        onClose={() => setSearchOpen(false)}
-        jobs={history}
-        onSelectJob={handleSelectJob}
-      />
+      {searchOpen && (
+        <Suspense fallback={null}>
+          <SearchPalette
+            isOpen={searchOpen}
+            onClose={() => setSearchOpen(false)}
+            jobs={history}
+            onSelectJob={handleSearchSelectJob}
+          />
+        </Suspense>
+      )}
       <GlobalSearchKeybinding onOpen={() => setSearchOpen(true)} />
     </>
   );

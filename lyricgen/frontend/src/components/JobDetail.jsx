@@ -13,6 +13,7 @@ import DriveTransferModal from "./DriveTransferModal";
 import VariantCreateModal from "./VariantCreateModal";
 import ScenesFilmstrip from "./ScenesFilmstrip";
 import SceneEditModal from "./SceneEditModal";
+import MediaPreview from "./MediaPreview";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -513,7 +514,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       }
       const res = await fetch(`${API}/retry/${job.job_id}`, fetchOpts);
       if (res.ok) {
-        const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
+        const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
+        if (!statusRes.ok) throw new Error(`Error ${statusRes.status}`);
+        const updated = await statusRes.json();
         onJobUpdate?.(updated);
         // Navigate back so the user sees the batch/history with the job now processing.
         onBack?.();
@@ -1330,13 +1333,33 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         headers: { ...authHeaders(), "Content-Type": "application/json" },
         body: JSON.stringify({ notes: reviewNotes }),
       });
-      if (res.ok) {
-        const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
-        onJobUpdate?.(updated);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `${t("detail.approve_error_description")} (${res.status})`);
       }
-    } catch {}
-    setApproving(false);
-    approveLockRef.current = false;
+      try {
+        const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
+        if (!statusRes.ok) throw new Error(`${t("detail.refresh_error_description")} (${statusRes.status})`);
+        const updated = await statusRes.json();
+        onJobUpdate?.(updated);
+      } catch (refreshError) {
+        onJobUpdate?.({ ...job, status: "done" });
+        alert({
+          title: t("detail.refresh_warning_title"),
+          description: refreshError?.message || t("detail.refresh_error_description"),
+          tone: "warning",
+        });
+      }
+    } catch (err) {
+      alert({
+        title: t("detail.approve_error_title"),
+        description: err?.message || t("detail.approve_error_description"),
+        tone: "error",
+      });
+    } finally {
+      setApproving(false);
+      approveLockRef.current = false;
+    }
   };
 
   // handleRetry está definida más arriba (~línea 175) para que esté
@@ -1352,21 +1375,39 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         headers: { ...authHeaders(), "Content-Type": "application/json" },
         body: JSON.stringify({ notes: reviewNotes }),
       });
-      if (res.ok) {
-        // Refresh the job state for any listing in the parent so the row
-        // shows "rejected", then go back. Staying on the detail screen
-        // would show "this job is not previewable" because rejected jobs
-        // intentionally can't be re-opened — better UX is to land the
-        // user back on the dashboard / batch view.
-        try {
-          const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
-          onJobUpdate?.(updated);
-        } catch {}
-        onBack?.();
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `${t("detail.reject_error_description")} (${res.status})`);
       }
-    } catch {}
-    setApproving(false);
-    approveLockRef.current = false;
+      // Refresh the job state for any listing in the parent so the row
+      // shows "rejected", then go back. Staying on the detail screen
+      // would show "this job is not previewable" because rejected jobs
+      // intentionally can't be re-opened — better UX is to land the
+      // user back on the dashboard / batch view.
+      try {
+        const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
+        if (!statusRes.ok) throw new Error(`${t("detail.refresh_error_description")} (${statusRes.status})`);
+        const updated = await statusRes.json();
+        onJobUpdate?.(updated);
+      } catch (refreshError) {
+        onJobUpdate?.({ ...job, status: "rejected" });
+        alert({
+          title: t("detail.refresh_warning_title"),
+          description: refreshError?.message || t("detail.refresh_error_description"),
+          tone: "warning",
+        });
+      }
+      onBack?.();
+    } catch (err) {
+      alert({
+        title: t("detail.reject_error_title"),
+        description: err?.message || t("detail.reject_error_description"),
+        tone: "error",
+      });
+    } finally {
+      setApproving(false);
+      approveLockRef.current = false;
+    }
   };
 
   // ProRes button visibility — gated by delivery profile + done status,
@@ -1415,7 +1456,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   ];
 
   return (
-    <div className="w-full max-w-4xl animate-fade-in">
+    <div className="job-detail-workspace w-full max-w-[1380px] mx-auto animate-fade-in">
       {/* JobDetail tour: auto-fires on the FIRST pending_review job a
           new operator opens. The tour walks through approval semantics
           + ProRes download. We read `user` from localStorage here so
@@ -1427,7 +1468,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         isPendingReview={isPendingReview}
       />
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 mb-8">
+      <div className="job-detail-command flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4 mb-6">
         <div className="flex items-center gap-3 min-w-0">
           <button onClick={onBack}
             className="w-9 h-9 shrink-0 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors">
@@ -1490,7 +1531,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             </p>
           </div>
         </div>
-        <div className="flex flex-wrap gap-2">
+        <div className="job-detail-actions flex flex-wrap gap-2">
           {canDownload && (() => {
             // All profiles (youtube, umg, both) now produce the MP4 +
             // short + thumbnail set in the pipeline, so "Descargar todo"
@@ -1737,15 +1778,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4"
           >
             {activeTab === "thumbnail" ? (
-              previewSrc ? (
-                <img
-                  src={previewSrc}
-                  alt="Thumbnail"
-                  className="w-full max-h-[500px] object-contain bg-black/40"
-                />
-              ) : (
-                <div className="w-full h-[500px] bg-black/40" />
-              )
+              <MediaPreview src={previewSrc} status={job.status} alt="Thumbnail" className="w-full h-[min(500px,55vh)]" imageClassName="bg-black/40" imageFit="contain" />
             ) : (
               previewSrc ? (
                 <video
@@ -1760,7 +1793,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                   style={activeTab === "short" ? { maxWidth: "340px", margin: "0 auto", display: "block" } : {}}
                 />
               ) : (
-                <div className="w-full h-[500px] bg-black/40" />
+                <MediaPreview status={job.status} className="w-full h-[min(500px,55vh)]" label="Preparando reproducción" />
               )
             )}
           </div>

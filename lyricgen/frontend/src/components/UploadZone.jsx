@@ -48,7 +48,6 @@ const LYRIC_RENDER_FIELDS = new Set([
   "lyricsAnimation", "lineTransition", "lyricColor", "lyricSungColor",
 ]);
 
-const SAMPLE_LYRIC = "Como el viento que se va";
 function applyTextCase(text, c) {
   if (c === "upper") return text.toUpperCase();
   if (c === "title") return text.replace(/\b\w/g, (ch) => ch.toUpperCase());
@@ -578,7 +577,7 @@ export default function UploadZone({
     if (code === "karaoke") {
       return (
         <span className={base}>
-          {["tu", "letra"].map((w, i) => (
+          {t("upload.sample_words").split(" ").map((w, i) => (
             <span key={i} style={{ animation: `acard-karaoke 2.4s ${i * 0.5}s infinite`, marginRight: i === 0 ? "0.28em" : 0, display: "inline-block" }}>{w}</span>
           ))}
         </span>
@@ -587,7 +586,7 @@ export default function UploadZone({
     if (code === "word_reveal") {
       return (
         <span className={base}>
-          {["tu", "letra"].map((w, i) => (
+          {t("upload.sample_words").split(" ").map((w, i) => (
             <span key={i} style={{ animation: `acard-word 2.6s ${i * 0.45}s infinite`, marginRight: i === 0 ? "0.28em" : 0, display: "inline-block" }}>{w}</span>
           ))}
         </span>
@@ -597,7 +596,7 @@ export default function UploadZone({
       code === "pop" ? "acard-pop 2.2s infinite" :
       code === "glow" ? "acard-glow 2.4s ease-in-out infinite" :
       "acard-word 2.8s infinite"; // none → simple fade loop
-    return <span className={base} style={{ animation: anim, display: "inline-block" }}>Letra</span>;
+    return <span className={base} style={{ animation: anim, display: "inline-block" }}>{t("upload.preview_lyric")}</span>;
   };
 
   // Looping mini-demo of a line transition (movement), shown inside its card.
@@ -611,7 +610,7 @@ export default function UploadZone({
       "acard-word 2.8s infinite"; // none → simple fade
     return (
       <span className="overflow-hidden inline-block">
-        <span className={base} style={{ animation: anim, display: "inline-block" }}>Letra</span>
+        <span className={base} style={{ animation: anim, display: "inline-block" }}>{t("upload.preview_lyric")}</span>
       </span>
     );
   };
@@ -1540,9 +1539,9 @@ export default function UploadZone({
         {hoverCaseBatch && (
           <div className="mt-1.5 px-3 py-1.5 rounded-md bg-black/40 ring-1 ring-white/[0.06] flex items-baseline gap-2 animate-fade-in">
             <span className="text-[11px] font-mono text-white/80 tracking-wide">
-              {applyTextCase(SAMPLE_LYRIC, hoverCaseBatch)}
+              {applyTextCase(t("upload.sample_lyric"), hoverCaseBatch)}
             </span>
-            <span className="text-[10px] text-gray-600">← así quedarán tus letras</span>
+            <span className="text-[10px] text-gray-600">← {t("upload.case_preview_help")}</span>
           </div>
         )}
       </div>
@@ -1682,10 +1681,10 @@ export default function UploadZone({
                   const st = transcribeStatusByFile[k];
                   if (!st) return null;
                   const label = {
-                    uploading:    { txt: "📤 Subiendo…",       cls: "text-blue-400" },
-                    queued:       { txt: "🕓 En cola",          cls: "text-gray-400" },
-                    transcribing: { txt: "🎙 Transcribiendo…", cls: "text-brand-light" },
-                    done:         { txt: "✓ Listo para revisar", cls: "text-accent" },
+                    uploading:    { txt: `📤 ${t("status.awaiting_upload")}`, cls: "text-blue-400" },
+                    queued:       { txt: `🕓 ${t("status.queued")}`, cls: "text-gray-400" },
+                    transcribing: { txt: `🎙 ${t("status.transcribing")}`, cls: "text-brand-light" },
+                    done:         { txt: `✓ ${t("upload.ready_to_review")}`, cls: "text-accent" },
                     error:        { txt: `✗ ${st.error || "Error"}`, cls: "text-red-400" },
                   }[st.status] || { txt: st.status, cls: "text-gray-500" };
                   return (
@@ -1697,8 +1696,8 @@ export default function UploadZone({
               </div>
               <button
                 onClick={(e) => removeFile(i, e)}
-                aria-label="Descartar este audio"
-                title="Descartar este audio"
+                aria-label={t("upload.discard_audio")}
+                title={t("upload.discard_audio")}
                 className="shrink-0 w-7 h-7 rounded-lg hover:bg-red-500/10 flex items-center justify-center text-gray-300 hover:text-red-400 transition-colors"
               >
                 <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -1905,9 +1904,9 @@ export default function UploadZone({
                     {hoverCaseRow?.idx === i && (
                       <div className="mt-1.5 px-3 py-1.5 rounded-md bg-black/40 ring-1 ring-white/[0.06] flex items-baseline gap-2 animate-fade-in">
                         <span className="text-[11px] font-mono text-white/80 tracking-wide">
-                          {applyTextCase(SAMPLE_LYRIC, hoverCaseRow.code)}
+                          {applyTextCase(t("upload.sample_lyric"), hoverCaseRow.code)}
                         </span>
-                        <span className="text-[10px] text-gray-600">← así quedarán tus letras</span>
+                        <span className="text-[10px] text-gray-600">← {t("upload.case_preview_help")}</span>
                       </div>
                     )}
                   </div>
@@ -2000,13 +1999,13 @@ export default function UploadZone({
           />
 
           <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
-            Fondo del video
+            {t("upload.video_background")}
             <HelpTip articleId="backgrounds" />
           </p>
           <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
-            {bgMode === "auto" ? "IA genera un fondo único por canción"
-              : bgMode === "library" ? "Fondo compartido para todo el lote"
-              : "Tu fondo personalizado"}
+            {bgMode === "auto" ? t("upload.bg_auto_summary")
+              : bgMode === "library" ? t("upload.bg_library_summary")
+              : t("upload.bg_custom_summary")}
           </p>
 
           {/* Mode selector */}
@@ -2338,7 +2337,7 @@ export default function UploadZone({
     // page-scroll. pb-28 (clear del CTA flotante "Aprobar y generar") se
     // mantiene solo en mobile — en desktop el CTA es fixed bottom-0 con
     // su propio espacio. Mobile (<lg) no se toca: pb-28 + page-scroll.
-    <div className="w-full px-2 md:px-6 pb-28 lg:pb-0 lg:h-full lg:overflow-hidden lg:flex lg:flex-col">
+    <div className="wizard-workspace w-full px-2 md:px-6 pb-28 lg:pb-0 lg:h-full lg:overflow-hidden lg:flex lg:flex-col">
       <UploadTour user={user} />
       {/* Pre-upload short-circuit: drop zone-only layout aplica solo cuando
           NO hay contenido reviewable Y NO estamos en edit-mode. Sin estas
@@ -2382,14 +2381,12 @@ export default function UploadZone({
         const gridCols = isStep6
           ? "lg:grid-cols-[200px_minmax(360px,500px)_minmax(0,1fr)]"
           : "lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)]";
-        // 2026-05-26 — variante [.editor-focus-mode_&] colapsa este grid
-        // a 1 columna cuando el LyricsEditor prende "modo enfoque". Sin
-        // este override, el feature sólo agrandaba el max-h interno (~90px
-        // verticales) — invisible porque el operador ya tiene ~1124px de
-        // ancho en step 6. Con focus on, stepper + preview se ocultan
-        // (rules abajo) y la columna del editor toma los ~1500px de
-        // viewport. Body class emitida por LyricsEditor:367, cleanup en
-        // unmount → volver a step 4 reaparece el layout 3-col.
+        // Studio focus: when LyricsEditor emits `editor-focus-mode`, collapse
+        // the three-column wizard into a two-column editing workspace. The
+        // step rail disappears, but the live preview stays docked at a compact
+        // 320–400 px so the operator can keep watching the video while the
+        // timeline uses all remaining width. Returning to the regular mode
+        // restores the original three-column wizard automatically.
         return (
         // QA fix 2026-05-28: grid pasa a llenar el alto del padre y a ser
         // su propio scroll context en lg+. items-start mantiene la
@@ -2398,7 +2395,7 @@ export default function UploadZone({
         // lg:min-h-0 deja la grid ocupar el espacio que el flex-col
         // exterior le da. lg:overflow-hidden previene que la grid haga
         // overflow al body — el scroll vive en la columna RIGHT.
-        <div className={`flex flex-col lg:grid ${gridCols} [.editor-focus-mode_&]:lg:grid-cols-1 gap-6 items-start lg:items-stretch lg:h-full lg:min-h-0 lg:overflow-hidden lg:flex-1`}>
+        <div className={`wizard-workspace-grid flex flex-col lg:grid ${gridCols} [.editor-focus-mode_&]:lg:grid-cols-[clamp(320px,24vw,400px)_minmax(0,1fr)] gap-6 items-start lg:items-stretch lg:h-full lg:min-h-0 lg:overflow-hidden lg:flex-1`}>
 
         {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile).
             Paso 6 "Lyrics" se ve siempre; está deshabilitado hasta que
@@ -2411,7 +2408,7 @@ export default function UploadZone({
             step 6 para ganar espacio. Operador reportó que no se entendía
             qué era cada paso. Volvemos a mostrar labels SIEMPRE — el
             grid arriba se ajustó a 168 px de sidebar para acomodarlas. */}
-        <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first [.editor-focus-mode_&]:hidden">
+        <nav className="wizard-step-rail flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first [.editor-focus-mode_&]:hidden">
           {WIZARD_STEPS.map((s) => {
             const isLyrics = s.id === 6;
             const lyricsDisabled = isLyrics && !hasReviewableContent;
@@ -2458,7 +2455,7 @@ export default function UploadZone({
             editando), y el max-width del contenedor se ajusta al
             grid column (260-320 px). Mantiene sticky para acompañar
             el scroll del timeline en el panel derecho. */}
-        <div className="lg:sticky lg:top-4 space-y-2 min-w-0 w-full [.editor-focus-mode_&]:hidden">
+        <div className="wizard-preview-stage lg:sticky lg:top-4 space-y-2 min-w-0 w-full">
           {/* UI v1.1 (2026-05-30): toggle pill — "Letra / Portada". The
               central preview shows whichever face is selected; the bottom
               fan-out of states (Lyrics editor, batch progress, ready, etc.)
@@ -2628,7 +2625,7 @@ export default function UploadZone({
             Multi-escena, el modo más alto) quedaba TAPADO detrás del footer y no
             se podía scrollear por encima ("trabado", QA 2026-07-01). El padding
             reserva el espacio del CTA fijo. En mobile el outer ya tiene pb-28. */}
-        <div className="space-y-4 min-w-0 w-full px-1.5 py-0.5 lg:h-full lg:min-h-0 lg:overflow-y-auto lg:pb-24">
+        <div className="wizard-controls-panel space-y-4 min-w-0 w-full px-1.5 py-0.5 lg:h-full lg:min-h-0 lg:overflow-y-auto lg:pb-24">
           {files.length > 1 && (
             <div className="flex items-center gap-1.5 px-1">
               <span className="inline-flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-[0.16em]">
@@ -2636,7 +2633,7 @@ export default function UploadZone({
                   <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>
                   <path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
                 </svg>
-                Aplica a los {files.length} tracks
+                {t("upload.applies_to_tracks", { count: files.length })}
               </span>
             </div>
           )}
@@ -2989,9 +2986,9 @@ export default function UploadZone({
                     {hoverCaseBatch && (
                       <div className="mt-1.5 ml-[5.5rem] px-3 py-1.5 rounded-md bg-black/40 ring-1 ring-white/[0.06] flex items-baseline gap-2 animate-fade-in">
                         <span className="text-[11px] font-mono text-white/80 tracking-wide">
-                          {applyTextCase(SAMPLE_LYRIC, hoverCaseBatch)}
+                          {applyTextCase(t("upload.sample_lyric"), hoverCaseBatch)}
                         </span>
-                        <span className="text-[10px] text-gray-600">← así quedarán tus letras</span>
+                        <span className="text-[10px] text-gray-600">← {t("upload.case_preview_help")}</span>
                       </div>
                     )}
                   </div>
@@ -3051,7 +3048,7 @@ export default function UploadZone({
                 </div>
               </div>
 
-              <p className="text-[11px] text-gray-300 font-medium">{t("upload.animation_section") || "Animación"} de la letra</p>
+              <p className="text-[11px] text-gray-300 font-medium">{t("upload.animation_section_full")}</p>
               <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
                 {t("upload.anim_gallery_desc") || "Cómo aparecen las palabras sobre el video. Pasá el mouse o elegí y miralo en el preview ←"}
               </p>
@@ -3487,7 +3484,7 @@ export default function UploadZone({
           file count) lo cual es informativo aunque mínimo en edit mode. */}
       {(files.length > 0 || editMode) && wizardStep !== 6 && (
         <div
-          className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-60" : "md:left-0"}`}
+          className={`wizard-command-bar fixed bottom-0 left-0 right-0 z-30 px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-60" : "md:left-[72px]"}`}
           data-tour="upload-cta-bar"
         >
           <div className="w-full flex flex-wrap items-center gap-3">

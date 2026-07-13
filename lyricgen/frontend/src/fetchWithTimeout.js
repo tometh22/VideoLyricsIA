@@ -13,6 +13,8 @@ export async function fetchWithTimeout(url, opts = {}, timeoutMs = DEFAULT_TIMEO
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
+    // Transport helper: callers own the endpoint-specific status policy.
+    // fetch-no-check-ok — deliberately return the raw Response.
     return await fetch(url, { ...opts, signal: controller.signal });
   } catch (err) {
     if (err && err.name === "AbortError") {

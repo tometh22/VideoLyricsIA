@@ -69,7 +69,7 @@ function AdminShell({ onBack, isSuperAdmin }) {
       )}
 
       {/* Sub-sidebar + contenido */}
-      <div className="flex gap-6 items-start">
+      <div className="admin-workspace-layout">
         <AdminSidebar
           section={section}
           subTab={subTab}
