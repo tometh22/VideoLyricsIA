@@ -3772,6 +3772,9 @@ class _TranscribeUploadedReq(BaseModel):
     live: bool = False
     artist: str = Field(default="", max_length=255)    # DB Job.artist = VARCHAR(255)
     title: str = Field(default="", max_length=500)     # DB Job.song_title = VARCHAR(500)
+    # Versión B (ANCHOR_LYRICS_ENABLED, default off): letra oficial pegada
+    # por el operador — se ancla con CTC en vez de usar el texto transcrito.
+    anchor_lyrics: str = Field(default="", max_length=20000)
 
 
 @app.post("/transcribe-uploaded")
@@ -3939,6 +3942,7 @@ async def transcribe_uploaded(
                 filename=_row_filename,
                 tenant_id=current_user.get("tenant_id", ""),
                 live=bool(body.live),
+                anchor_lyrics=body.anchor_lyrics or "",
             )
         except Exception as exc:
             logger.exception("[TRANSCRIBE] enqueue failed for job=%s", job_id)
@@ -3985,8 +3989,15 @@ async def transcribe_uploaded(
             artist=_row_artist,
             title=_row_title,
         )
-        _result = await _maybe_ctc_retime(_result, audio_path, job_id,
-                                          _row_artist, _row_title)
+        # Versión B: si el operador pegó la letra oficial, anclarla con CTC
+        # ANTES del retime normal; si ancló, saltear el retime (no doble).
+        if (body.anchor_lyrics or "").strip():
+            _result = await _maybe_anchor_align(_result, audio_path, job_id,
+                                                body.anchor_lyrics)
+        if not (isinstance(_result, dict)
+                and _result.get("timing_source") == "anchor_ctc"):
+            _result = await _maybe_ctc_retime(_result, audio_path, job_id,
+                                              _row_artist, _row_title)
         _result = await _maybe_adlib_filter(
             _result, audio_path, job_id,
             live_hint=bool(getattr(body, "live", False))
@@ -4967,6 +4978,99 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             set_timing_source(job_id, CTC_ALIGN)
     except Exception as e:
         logger.warning("[CTC] retime wrapper declined: %r (job=%s)", e, job_id)
+    finally:
+        if _stem:
+            try:
+                os.unlink(_stem)
+            except OSError:
+                pass
+    return result
+
+
+async def _maybe_anchor_align(result, audio_path: str, job_id: str,
+                              anchor_lyrics: str):
+    """Versión B — anclar la letra OFICIAL del operador al motor CTC
+    (ANCHOR_LYRICS_ENABLED, default OFF). En vez de retimear el texto
+    transcrito de la cascada, alinea las líneas que el operador pegó
+    (anchor lyrics) sobre el stem de voz vía `ctc_align.retime_segments`
+    — mismo motor, misma paridad Rotor (benchmark 18 gold: mediana
+    0.32s, 0 cascadas, 1 decline seguro).
+
+    Contrato idéntico a `_maybe_ctc_retime`: NUNCA rompe una
+    transcripción. Flag off / anchor vacío / <3 líneas / decline /
+    excepción → devuelve `result` sin tocar (cae a la Versión A, la
+    cascada actual). En éxito reemplaza `result["segments"]` y setea
+    `result["timing_source"] = "anchor_ctc"` para que el worker saltee
+    el retime CTC normal (no doble retime).
+
+    Gate por línea (outliers del benchmark): líneas cuya mediana de
+    word-scores queda < 0.35 se marcan `review=True` — el editor ya
+    pinta amarillo esas líneas para que el operador las revise."""
+    _stem = None
+    try:
+        if os.environ.get("ANCHOR_LYRICS_ENABLED", "0").strip().lower() not in (
+                "1", "true", "yes", "on"):
+            return result
+        if not isinstance(result, dict) or not (anchor_lyrics or "").strip():
+            return result
+        psegs = [{"text": line, "start": 0.0, "end": 0.0}
+                 for line in anchor_lyrics.splitlines() if line.strip()]
+        if len(psegs) < 3:
+            return result
+        # Todo (imports incluidos) dentro del try: un módulo roto debe
+        # degradar a "sin anchor", nunca a un 500 en cada transcripción.
+        import ctc_align as _ctc
+        import vocal_sep as _vs
+        # Mismo patrón de stem que _maybe_ctc_retime: cache_only primero
+        # (si la cascada computó el stem hace segundos es solo una
+        # descarga de R2), y si no hay, computarlo si el flag lo permite.
+        _stem = await asyncio.wait_for(
+            asyncio.to_thread(_vs.separate_vocals, audio_path, cache_only=True),
+            timeout=120,
+        )
+        if not _stem and os.environ.get(
+                "CTC_ALIGN_COMPUTE_STEM", "1").strip().lower() in ("1", "true", "yes", "on"):
+            logger.info("[ANCHOR] no cached stem — computing it (job=%s)", job_id)
+            _stem = await asyncio.wait_for(
+                asyncio.to_thread(_vs.separate_vocals, audio_path),
+                timeout=360,
+            )
+        # Sin stem → alinear sobre la MEZCLA (misma decisión que el mix
+        # fallback de _maybe_ctc_retime: la mezcla como fuente está
+        # validada en el gold set).
+        _align_src = _stem or audio_path
+        if not _stem:
+            logger.info("[ANCHOR] no stem — aligning on the MIX (job=%s)", job_id)
+        retimed = await asyncio.wait_for(
+            asyncio.to_thread(_ctc.retime_segments, _align_src, psegs,
+                              job_id, audio_path),
+            timeout=420,
+        )
+        if retimed is None:
+            # Decline seguro → Versión A intacta (la cascada ya corrió).
+            logger.info("[ANCHOR] declined (reason=%s) job=%s",
+                        _ctc.last_decline_reason or "unknown", job_id)
+            return result
+        # GATE POR LÍNEA: mediana de word-scores < 0.35 → review=True
+        # (el editor pinta amarillo). Sin scores → no marcar.
+        from statistics import median as _median
+        flagged = 0
+        anchored = []
+        for seg in retimed:
+            scores = [w.get("score") for w in (seg.get("words") or [])
+                      if isinstance(w.get("score"), (int, float))]
+            if scores and _median(scores) < 0.35:
+                seg = dict(seg)
+                seg["review"] = True
+                flagged += 1
+            anchored.append(seg)
+        result = dict(result)
+        result["segments"] = anchored
+        result["timing_source"] = "anchor_ctc"
+        logger.info("[ANCHOR] anchored %d líneas (%d en review, job=%s)",
+                    len(anchored), flagged, job_id)
+    except Exception as e:
+        logger.warning("[ANCHOR] wrapper declined: %r (job=%s)", e, job_id)
     finally:
         if _stem:
             try:
