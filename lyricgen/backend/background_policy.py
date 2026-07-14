@@ -14,7 +14,7 @@ import re
 from typing import Any
 
 
-POLICY_VERSION = "background-v6"
+POLICY_VERSION = "background-v5"
 POLICY_ENV = "BACKGROUND_SMOKE_POLICY_MODE"
 VALID_POLICY_MODES = frozenset({"off", "shadow", "enforce"})
 
@@ -77,7 +77,7 @@ _NEGATION_DIRECT_COMMAND_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Appended at the provider boundary when the v6 policy is enforced. Repeating
+# Appended at the provider boundary when the v5 policy is enforced.  Repeating
 # it at the last boundary protects literal prompts without rewriting them.
 ATMOSPHERIC_NEGATIVE_RAIL = (
     "Do not introduce smoke, fog, haze, mist, steam, vapor, stage smoke, "
@@ -180,7 +180,7 @@ def rebase_stored_atmospherics_policy(
 ) -> dict[str, Any]:
     """Move trusted persisted authorization onto the active rollout mode.
 
-    A v6 scene plan stores the *result* of resolving the raw operator prompt so
+    A v5 scene plan stores the *result* of resolving the raw operator prompt so
     later edits do not need to reinterpret generated scene text. Only that
     allow/deny decision survives; off/shadow/enforce is always read again from
     the current runtime. Legacy or malformed metadata fails closed to deny.
