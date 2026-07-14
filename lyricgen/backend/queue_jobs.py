@@ -516,6 +516,7 @@ def enqueue_transcription(
     filename: str = "",
     live: bool = False,
     tenant_id: str = "",
+    anchor_lyrics: str = "",
 ) -> str:
     """Enqueue una transcripción en la queue `transcription` (alta prioridad,
     drenada por el mismo worker container que enterprise/default).
@@ -560,6 +561,7 @@ def enqueue_transcription(
             kwargs={
                 "language": language, "artist": artist, "title": title,
                 "filename": filename, "live": live,
+                "anchor_lyrics": anchor_lyrics,
             },
             job_timeout=timeout,
             result_ttl=RESULT_TTL,
@@ -591,7 +593,8 @@ def enqueue_transcription(
         args=(job_id, audio_path),
         kwargs={
             "language": language, "artist": artist, "title": title,
-            "filename": filename,
+            "filename": filename, "live": live,
+            "anchor_lyrics": anchor_lyrics,
         },
         daemon=True,
     )
