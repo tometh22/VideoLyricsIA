@@ -22,7 +22,7 @@ def test_pipeline_rejects_api_worker_policy_mismatch_before_work(monkeypatch):
         "missing.mp3",
         "Artist",
         "auto",
-        background_policy_fingerprint="background-v6:enforce",
+        background_policy_fingerprint="background-v5:enforce",
     )
 
     assert updates[-1]["status"] == "error"
@@ -111,7 +111,7 @@ def test_edit_rejects_api_worker_policy_mismatch_before_db_work(monkeypatch):
         "lockstepedit",
         "typography",
         {},
-        background_policy_fingerprint="background-v6:enforce",
+        background_policy_fingerprint="background-v5:enforce",
     )
 
     assert updates[-1]["status"] == "error"
