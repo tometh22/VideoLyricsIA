@@ -848,41 +848,6 @@ def merge_render_params(job_id: str, new_params: dict) -> bool:
         db.close()
 
 
-def merge_validation_result(job_id: str, new_fields: dict) -> bool:
-    """Atomically add evidence to ``Job.validation_result``.
-
-    Background validation, byte attestation and delivery sealing happen at
-    different pipeline stages. A row lock prevents a late progress/update
-    writer from replacing evidence produced by an earlier stage.
-    """
-    if not new_fields:
-        return True
-    from database import SessionLocal
-    db = SessionLocal()
-    try:
-        job = (
-            db.query(Job)
-            .filter(Job.job_id == job_id)
-            .with_for_update()
-            .first()
-        )
-        if not job:
-            return False
-        current = dict(job.validation_result or {})
-        current.update(new_fields)
-        job.validation_result = current
-        db.commit()
-        return True
-    except Exception:
-        try:
-            db.rollback()
-        except Exception:
-            pass
-        return False
-    finally:
-        db.close()
-
-
 def merge_s3_keys(job_id: str, file_type: str, key: str) -> bool:
     """Atomic merge de un (file_type → key) en Job.s3_keys.
 
