@@ -1775,10 +1775,14 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         <>
           <div
             data-tour="jobdetail-preview"
-            className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4"
+            className={`job-detail-media-frame rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4 mx-auto ${
+              activeTab === "short"
+                ? "job-detail-media-frame--short"
+                : "job-detail-media-frame--landscape"
+            }`}
           >
             {activeTab === "thumbnail" ? (
-              <MediaPreview src={previewSrc} status={job.status} alt="Thumbnail" className="w-full h-[min(500px,55vh)]" imageClassName="bg-black/40" imageFit="contain" />
+              <MediaPreview src={previewSrc} status={job.status} alt="Thumbnail" className="w-full h-full" imageClassName="bg-black/40" imageFit="contain" />
             ) : (
               previewSrc ? (
                 <video
@@ -1787,13 +1791,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                   src={previewSrc}
                   controls
                   onError={handleVideoError}
-                  className={`w-full bg-black/40 ${
-                    activeTab === "short" ? "max-h-[600px] mx-auto" : "max-h-[500px]"
-                  }`}
-                  style={activeTab === "short" ? { maxWidth: "340px", margin: "0 auto", display: "block" } : {}}
+                  className="job-detail-media-video w-full h-full block object-contain bg-black/40"
                 />
               ) : (
-                <MediaPreview status={job.status} className="w-full h-[min(500px,55vh)]" label="Preparando reproducción" />
+                <MediaPreview status={job.status} className="w-full h-full" label="Preparando reproducción" />
               )
             )}
           </div>
