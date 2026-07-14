@@ -1,18 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import BackgroundHintField from "./BackgroundHintField";
-import ContentValidationToggle from "./ContentValidationToggle";
+import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
 import useDialogA11y from "../hooks/useDialogA11y";
 
-function _readAccount() {
+function _readTenant() {
   try {
     const u = JSON.parse(localStorage.getItem("genly_user") || "null");
-    return {
-      tenantId: u?.tenant_id || null,
-      billingGroup: u?.billing_group || null,
-    };
+    return u?.tenant_id || null;
   } catch {
-    return { tenantId: null, billingGroup: null };
+    return null;
   }
 }
 
@@ -65,10 +62,11 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
   const [backgroundHint, setBackgroundHint] = useState(_initialHint);
   const [concept, setConcept] = useState(initialConcept);
   // Tenant-aware content-validation choice. See EditRequestPanel for
-  // the full rationale. value=true means "run validator". Universal is fixed;
-  // common accounts can explicitly choose the existing fondo-libre mode.
-  const { tenantId: _tenantId, billingGroup: _billingGroup } = _readAccount();
-  const [validationEnabled, setValidationEnabled] = useState(true);
+  // the full rationale. value=true means "run validator"; default per
+  // tenant (UMG validates, others skip).
+  const _tenantId = _readTenant();
+  const _isUmg = isUmgTenant(_tenantId);
+  const [validationEnabled, setValidationEnabled] = useState(_isUmg);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
   // Guard sincrónico contra doble click (mismo patrón que EditRequestPanel
@@ -222,7 +220,6 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
           value={validationEnabled}
           onChange={setValidationEnabled}
           tenantId={_tenantId}
-          billingGroup={_billingGroup}
           disabled={submitting}
         />
 

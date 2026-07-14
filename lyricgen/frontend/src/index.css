@@ -472,28 +472,6 @@ body .text-gray-600 { color: #777D90; }
 .history-inspector__header button:hover { color: white; background: var(--surface-hover); }
 .history-inspector__preview { overflow: hidden; aspect-ratio: 16 / 9; margin-bottom: 18px; border-radius: 14px; background: var(--surface-3); }
 .history-inspector__preview img { width: 100%; height: 100%; object-fit: cover; }
-
-/* JobDetail keeps the wide 1380px workspace for metadata/actions, while the
-   media itself retains its native ratio. Previously w-full + max-height made
-   Chrome create a 1380x500 player with ~245px black wings on each side. */
-.job-detail-media-frame { background: #000; }
-.job-detail-media-frame--landscape {
-  width: min(100%, 888.89px, 97.78vh);
-  aspect-ratio: 16 / 9;
-}
-.job-detail-media-frame--short {
-  width: min(100%, 337.5px, 33.75vh);
-  aspect-ratio: 9 / 16;
-}
-.job-detail-media-video:fullscreen,
-.job-detail-media-video:-webkit-full-screen {
-  width: 100vw;
-  height: 100vh;
-  max-width: none;
-  max-height: none;
-  object-fit: contain;
-  background: #000;
-}
 .history-inspector__preview > div { display: grid; width: 100%; height: 100%; place-items: center; color: var(--text-muted); }
 .history-inspector__preview svg { width: 30px; height: 30px; }
 .history-inspector dl { display: grid; gap: 0; margin: 0 0 18px; }

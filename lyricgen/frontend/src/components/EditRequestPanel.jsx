@@ -1,18 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import BackgroundHintField from "./BackgroundHintField";
-import ContentValidationToggle from "./ContentValidationToggle";
+import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
 import { useAlert } from "./AlertProvider";
 
-function _readAccount() {
+function _readTenant() {
   try {
     const u = JSON.parse(localStorage.getItem("genly_user") || "null");
-    return {
-      tenantId: u?.tenant_id || null,
-      billingGroup: u?.billing_group || null,
-    };
+    return u?.tenant_id || null;
   } catch {
-    return { tenantId: null, billingGroup: null };
+    return null;
   }
 }
 
@@ -84,10 +81,12 @@ export default function EditRequestPanel({
   // Tenant-aware content-validation toggle. Boolean semantics:
   // value=true  → operator wants validator to run
   // value=false → operator wants validator skipped
-  // All accounts default to validation. Universal sees a fixed policy notice;
-  // common accounts can explicitly choose the existing fondo-libre mode.
-  const { tenantId: _tenantId, billingGroup: _billingGroup } = _readAccount();
-  const [validationEnabled, setValidationEnabled] = useState(true);
+  // Default per tenant: UMG tenants validate, others skip.
+  // Mapped to bypass_content_validation OR force_content_validation in
+  // the payload depending on which direction departs from tenant default.
+  const _tenantId = _readTenant();
+  const _isUmg = isUmgTenant(_tenantId);
+  const [validationEnabled, setValidationEnabled] = useState(_isUmg);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
   // Synchronous guard against double-click. `submitting` is async (React
@@ -489,7 +488,6 @@ export default function EditRequestPanel({
             value={validationEnabled}
             onChange={setValidationEnabled}
             tenantId={_tenantId}
-            billingGroup={_billingGroup}
             disabled={submitting}
           />
 

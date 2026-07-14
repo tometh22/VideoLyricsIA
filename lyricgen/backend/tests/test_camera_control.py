@@ -89,13 +89,12 @@ def test_generate_veo_video_has_static_branch_with_camera_negatives():
     # The static branch must append explicit camera-motion negatives.
     for neg in ("no pan", "no tilt", "no zoom", "no dolly", "no camera movement"):
         assert neg in src, f"static safe_prompt missing negative '{neg}'"
-    # Keep the register unequivocally fixed without naming physical filming
-    # equipment: Veo once drew the requested tripod into the scene and the
-    # validator then inferred human activity from that object.
-    assert "locked static view" in src.lower()
-    assert "viewpoint remains completely immobile" in src.lower()
-    for equipment in ("locked static tripod", "security camera", "no operator"):
-        assert equipment not in src.lower()
+    # And drop the motion-suggesting 'filmed with cinema camera' phrasing for
+    # static (locked tripod phrasing instead). Case-insensitive — C2 hardening
+    # uppercased the phrase ('LOCKED STATIC TRIPOD shot').
+    assert "locked static tripod" in src.lower(), (
+        "static branch must use 'locked static tripod' phrasing"
+    )
 
 
 def test_generate_veo_video_accepts_high_fidelity_and_routes_model():

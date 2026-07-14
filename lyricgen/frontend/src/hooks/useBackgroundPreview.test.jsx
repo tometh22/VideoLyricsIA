@@ -12,10 +12,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { renderHook } from "@testing-library/react";
 import { act } from "react";
-import {
-  shouldEnableBackgroundPreview,
-  useBackgroundPreview,
-} from "./useBackgroundPreview";
+import { useBackgroundPreview } from "./useBackgroundPreview";
 
 const entryBase = {
   artist: "Rata Blanca",
@@ -156,32 +153,5 @@ describe("useBackgroundPreview — stale cache key", () => {
       await vi.advanceTimersByTimeAsync(150);
     });
     expect(onCacheKey).toHaveBeenCalledWith("key-v2", { stale: false });
-  });
-});
-
-describe("background preview eligibility", () => {
-  const eligible = (overrides = {}) => shouldEnableBackgroundPreview({
-    hasReview: true,
-    editMode: false,
-    bgSelectMode: "auto",
-    enableScenes: false,
-    ...overrides,
-  });
-
-  it("habilita solamente IA con fondo único", () => {
-    expect(eligible()).toBe(true);
-  });
-
-  it.each(["library", "custom"])("no precalienta en modo %s", (bgSelectMode) => {
-    expect(eligible({ bgSelectMode })).toBe(false);
-  });
-
-  it("no precalienta un fondo único cuando multi-escena está activo", () => {
-    expect(eligible({ enableScenes: true })).toBe(false);
-  });
-
-  it("conserva los gates existentes de review y edit mode", () => {
-    expect(eligible({ hasReview: false })).toBe(false);
-    expect(eligible({ editMode: true })).toBe(false);
   });
 });
