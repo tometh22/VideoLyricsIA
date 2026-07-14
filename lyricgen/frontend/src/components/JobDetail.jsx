@@ -463,7 +463,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // for full rationale.
   const _retryTenantId = currentUser?.tenant_id || null;
   const _retryIsUmg = isUmgTenant(_retryTenantId);
-  const [retryValidationEnabled, setRetryValidationEnabled] = useState(true);
+  const [retryValidationEnabled, setRetryValidationEnabled] = useState(_retryIsUmg);
   const showRetrySpecSelector =
     (job.delivery_profile === "umg" || job.delivery_profile === "both") &&
     job.umg_spec != null;
@@ -1775,14 +1775,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         <>
           <div
             data-tour="jobdetail-preview"
-            className={`job-detail-media-frame rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4 mx-auto ${
-              activeTab === "short"
-                ? "job-detail-media-frame--short"
-                : "job-detail-media-frame--landscape"
-            }`}
+            className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4"
           >
             {activeTab === "thumbnail" ? (
-              <MediaPreview src={previewSrc} status={job.status} alt="Thumbnail" className="w-full h-full" imageClassName="bg-black/40" imageFit="contain" />
+              <MediaPreview src={previewSrc} status={job.status} alt="Thumbnail" className="w-full h-[min(500px,55vh)]" imageClassName="bg-black/40" imageFit="contain" />
             ) : (
               previewSrc ? (
                 <video
@@ -1791,10 +1787,13 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                   src={previewSrc}
                   controls
                   onError={handleVideoError}
-                  className="job-detail-media-video w-full h-full block object-contain bg-black/40"
+                  className={`w-full bg-black/40 ${
+                    activeTab === "short" ? "max-h-[600px] mx-auto" : "max-h-[500px]"
+                  }`}
+                  style={activeTab === "short" ? { maxWidth: "340px", margin: "0 auto", display: "block" } : {}}
                 />
               ) : (
-                <MediaPreview status={job.status} className="w-full h-full" label="Preparando reproducción" />
+                <MediaPreview status={job.status} className="w-full h-[min(500px,55vh)]" label="Preparando reproducción" />
               )
             )}
           </div>

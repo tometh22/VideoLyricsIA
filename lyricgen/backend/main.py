@@ -9737,24 +9737,14 @@ async def request_edit(
         _rp_v = dict(job.render_params or {})
         _rp_v["bg_verbatim"] = _bv
         job.render_params = _rp_v
-    if body.edit_type == "background":
-        # Persist the CURRENT mutually-exclusive choice. The worker resolves
-        # policy from durable render_params; leaving a stale bypass there made
-        # a later safe edit silently behave as unrestricted.
-        _rp_policy = dict(job.render_params or {})
-        _rp_policy.pop("bypass_content_validation", None)
-        _rp_policy.pop("force_content_validation", None)
-        if body.force_content_validation:
-            edit_params["force_content_validation"] = True
-            _rp_policy["force_content_validation"] = True
-        elif body.bypass_content_validation:
-            edit_params["bypass_content_validation"] = True
-            _rp_policy["bypass_content_validation"] = True
-        else:
-            # Safe default, including legacy clients that send neither flag.
-            edit_params["force_content_validation"] = True
-            _rp_policy["force_content_validation"] = True
-        job.render_params = _rp_policy
+    if body.edit_type == "background" and body.bypass_content_validation:
+        # Forward only when explicitly True; pipeline's tenant-gated
+        # default is correct when missing/False. Storing this lets the
+        # worker read render_params.get(...) and never has to distinguish
+        # "field missing" from "operator chose False".
+        edit_params["bypass_content_validation"] = True
+    if body.edit_type == "background" and body.force_content_validation:
+        edit_params["force_content_validation"] = True
     # QA fix 2026-05-28 (edit-wizard consolidation): artist/song_title
     # mutations ungated across edit_types. Before this, the fields only
     # applied on edit_type=metadata; if the frontend sent a consolidated
@@ -10463,16 +10453,13 @@ async def retry_job(
     # Operator opt-in flags forwarded to render_params before re-enqueue.
     # When False/missing, render_params is untouched and tenant-gated
     # defaults in pipeline.Step 1b apply.
-    _rp = dict(job.render_params or {})
-    _rp.pop("bypass_content_validation", None)
-    _rp.pop("force_content_validation", None)
-    if body and body.force_content_validation:
-        _rp["force_content_validation"] = True
-    elif body and body.bypass_content_validation:
-        _rp["bypass_content_validation"] = True
-    else:
-        _rp["force_content_validation"] = True
-    job.render_params = _rp
+    if body and (body.bypass_content_validation or body.force_content_validation):
+        _rp = dict(job.render_params or {})
+        if body.bypass_content_validation:
+            _rp["bypass_content_validation"] = True
+        if body.force_content_validation:
+            _rp["force_content_validation"] = True
+        job.render_params = _rp
 
     # Capturar status PREVIO antes de mutar. Sin esto el AuditLog
     # registraba siempre "processing" como previous_status (la línea de
@@ -10894,13 +10881,9 @@ async def create_variant(
         new_render_params["background_hint"] = body.background_hint
     if body.concept is not None:
         new_render_params["concept"] = body.concept
-    new_render_params.pop("bypass_content_validation", None)
-    new_render_params.pop("force_content_validation", None)
-    if body.force_content_validation:
-        new_render_params["force_content_validation"] = True
-    elif body.bypass_content_validation:
+    if body.bypass_content_validation:
         new_render_params["bypass_content_validation"] = True
-    else:
+    if body.force_content_validation:
         new_render_params["force_content_validation"] = True
 
     # Style: override o herencia.

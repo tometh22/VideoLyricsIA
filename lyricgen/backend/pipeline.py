@@ -965,7 +965,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         # biblia → multi-escena respeta auto/letra/prompt igual
                         # que el fondo único. bg_verbatim ="usá mi texto tal cual".
                         background_hint=background_hint, bg_verbatim=bg_verbatim,
-                        allow_people=_compute_allow_people(job_id, background_hint),
+                        allow_people=_compute_allow_people(job_id),
                         job_id=job_id,
                     )
                     bg_image_path = _scene_timeline
@@ -988,7 +988,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     bg_verbatim=bg_verbatim,
                     custom_colors=custom_colors,
                     effect=effect,
-                    allow_people=_compute_allow_people(job_id, background_hint),
+                    allow_people=_compute_allow_people(job_id),
                     audio_duration=_audio_dur_for_kb,
                 )
             # Image-to-video fallback: if Veo failed to produce an MP4 (None
@@ -1115,26 +1115,65 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         #     fails, mark validation_failed (we can't auto-substitute).
         #   - No bg supplied → cycle through library candidates, picking
         #     the first one that passes (up to 3 attempts).
-        if wants_youtube or wants_umg:
+        if wants_youtube:
             update_job(job_id, current_step="validation", progress=38)
 
-            # Authoritative policy is resolved from tenant + billing group.
-            # Universal is strict and cannot bypass; other accounts keep the
-            # optional post-generation scan, independently from whether an
-            # explicit operator prompt requested a human subject.
-            _safety = _background_safety_policy(job_id, background_hint)
-            _tenant_id = _safety["tenant_id"]
-            _is_umg = _safety["is_umg"]
-            _should_validate = _safety["should_validate"]
+            # Tenant-gated content validation.
+            #
+            # The validator enforces UMG Guideline 15 (no recognizable
+            # faces / hands / logos as subject). That's a *UMG* contract
+            # constraint — non-UMG tenants don't need it by default.
+            #
+            # Default behavior:
+            #   - tenant in UMG_TENANTS → validator runs.
+            #     Override OFF via render_params.bypass_content_validation=True
+            #     ("Asumir el riesgo" toggle).
+            #   - tenant NOT in UMG_TENANTS → validator skipped.
+            #     Override ON via render_params.force_content_validation=True
+            #     ("Activar verificación" toggle, opt-in).
+            #
+            # Both flags are safe to send regardless of tenant: each only
+            # has effect when it pushes against its tenant's default.
+            # UMG_TENANTS lives at module scope so _compute_allow_people()
+            # and this block share the same source of truth.
+            _tenant_id = None
+            _bypass_validation = False
+            _force_validation = False
+            try:
+                from database import SessionLocal as _SL, Job as _Job
+                with _SL() as _db:
+                    _row = _db.query(_Job).filter(_Job.job_id == job_id).first()
+                    if _row:
+                        _tenant_id = _row.tenant_id
+                        if isinstance(_row.render_params, dict):
+                            _bypass_validation = bool(
+                                _row.render_params.get("bypass_content_validation")
+                            )
+                            _force_validation = bool(
+                                _row.render_params.get("force_content_validation")
+                            )
+            except Exception as e:
+                logger.warning("[VALIDATION] could not read tenant/flags, defaulting to UMG-enforce: %s", e)
+                _tenant_id = "umg"  # conservative fallback: validate
+
+            _is_umg = _tenant_id in UMG_TENANTS
+            # XOR-like semantics: tenant default ⊕ operator override
+            _should_validate = (
+                (_is_umg and not _bypass_validation)
+                or (not _is_umg and _force_validation)
+            )
 
             if not _should_validate:
                 from datetime import datetime as _dt
-                _reason = _safety["reason"]
+                _reason = (
+                    "operator_override_via_bypass" if _is_umg and _bypass_validation
+                    else "non_umg_tenant_default"
+                )
                 logger.warning(
-                    "[VALIDATION] SKIPPED for job %s tenant=%s billing_group=%s "
-                    "is_umg=%s allow_people=%s reason=%s",
-                    job_id, _tenant_id, _safety["billing_group"], _is_umg,
-                    _safety["allow_people"], _reason,
+                    "[VALIDATION] SKIPPED for job %s tenant=%s is_umg=%s "
+                    "bypass=%s force=%s reason=%s",
+                    job_id, _tenant_id, _is_umg, _bypass_validation,
+                    _force_validation, _reason,
                 )
                 update_job(job_id, validation_result={
                     "passed": True,
@@ -1143,18 +1182,6 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     "bypassed_at": _dt.utcnow().isoformat() + "Z",
                     "bypassed_reason": _reason,
                     "tenant_id": _tenant_id,
-                })
-            elif _scenes_active:
-                # Every unique source clip was already validated densely in
-                # _generate_scene_clips; do not spend another 48 sequential
-                # Vision calls on the stitched timeline.
-                update_job(job_id, validation_result={
-                    "passed": True,
-                    "issues": [],
-                    "policy_reason": _safety["reason"],
-                    "validation_scope": "each_unique_scene_clip",
-                    "tenant_id": _tenant_id,
-                    "billing_group": _safety["billing_group"],
                 })
             elif bg_image_path:
                 from content_validator import validate_video, validate_image
@@ -4088,162 +4115,51 @@ def _env_flag(name: str) -> bool:
     return _os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
-# Universal account identifiers in production.  Universal operators live in
-# country-scoped tenants but share billing_group="universal_music".  The old
-# {"umg", "omg"} list predated that migration and silently classified every
-# current Universal account as unrestricted.
-UMG_TENANTS = {
-    "umg", "omg", "umusic", "universal_argentina", "universal_chile",
-}
-UMG_BILLING_GROUPS = {"universal_music"}
+# Tenants whose contract requires the UMG Guideline 15 content filter
+# (no faces / hands / logos in backgrounds). All other tenants render
+# freely by default and can opt in via force_content_validation. Mirror
+# of frontend ContentValidationToggle.UMG_TENANTS — keep in sync.
+UMG_TENANTS = {"umg", "omg"}
 
 
-def _normalise_account_id(value) -> str:
-    return str(value or "").strip().lower()
+def _compute_allow_people(job_id: str | None) -> bool:
+    """Should the AI be allowed to render people in the bg for this job?
 
+    Returns True when the content_validator would be SKIPPED for the job
+    (per tenant default + operator override). False when validator would
+    run. Drives the `allow_people` flag threaded into
+    `_analyze_lyrics_for_background`, `_generate_veo_video`, and
+    `_generate_imagen_image` so the no-people clauses in those system
+    prompts get dropped consistently with the post-gen check.
 
-def _prompt_explicitly_requests_people(prompt: str | None) -> bool:
-    """Conservative, payload-free opt-in for non-Universal operator prompts.
+    Pre-fix the toggle "Asumir el riesgo / fondo libre" only relaxed the
+    post-gen validator; the pre-gen prompt sanitization still stripped
+    people. The operator's prompt "woman lies upside down on armchair"
+    rendered an empty armchair (incident 2026-05-19). This helper closes
+    that gap.
 
-    Automatic lyrics/genre prompts are deliberately excluded: only the text
-    typed into background_hint/scene override is considered.  Negative phrases
-    are removed before looking for an explicit human subject, so "no people"
-    does not accidentally opt in.  False negatives are preferable to silently
-    generating a person.
+    Safe to call with `job_id=None` — returns False (conservative).
     """
-    import re as _re
-    text = _normalise_account_id(prompt)
-    if not text:
-        return False
-    human_terms = (
-        r"people|persons?|humans?|people\s+walking|man|men|woman|women|boy|girl|"
-        r"child|children|couple|crowd|singer|musician|dancer|human\s+figure|"
-        r"human\s+silhouette|persona|personas|gente|hombre|hombres|mujer|mujeres|"
-        r"niñ[oa]s?|pareja|multitud|cantante|m[uú]sico|bailar[ií]n|figura\s+humana|"
-        r"silueta\s+humana|pessoas?|homem|homens|mulher|mulheres|crianças?|casal|"
-        r"multid[aã]o|dançarino|figura\s+humana|silueta\s+humana"
-    )
-    # Any negative instruction involving a human subject wins. This is
-    # intentionally conservative and covers free-form forms such as "no quiero
-    # gente", "evitar personas", "without any crowd" and Portuguese "não".
-    if _re.search(
-        rf"\b(?:no|not|without|avoid|exclude|never|sin|evitar|excluir|nunca|sem|"
-        rf"não|nao)\b[\s\S]{{0,80}}\b(?:{human_terms})\b",
-        text, _re.IGNORECASE,
-    ):
-        return False
-    if _re.search(
-        rf"\b(?:{human_terms})\b[\s\S]{{0,80}}\b(?:no|not|without|avoid|exclude|"
-        rf"never|sin|evitar|excluir|nunca|sem|não|nao|ningun[oa]s?|none|zero|cero|"
-        rf"free|libre|devoid)\b",
-        text, _re.IGNORECASE,
-    ) or _re.search(
-        r"\b(?:people[- ]free|human[- ]free|libre\s+de\s+personas|devoid\s+of\s+"
-        r"people|cero\s+personas|zero\s+people|personas?\s*:\s*ninguna?s?)\b",
-        text, _re.IGNORECASE,
-    ):
-        return False
-    text = _re.sub(
-        r"\b(?:no|without|sin|sem)\s+(?:any\s+)?(?:people|persons?|humans?|"
-        r"personas?|gente|humanos?|pessoas?|figures?|figuras?|silhouettes?|"
-        r"siluetas?|faces?|caras?|rostros?|hands?|manos?|m[aã]os?)\b",
-        " ", text,
-    )
-    return _re.search(rf"\b(?:{human_terms})\b", text, _re.IGNORECASE) is not None
-
-
-def _background_safety_policy(job_id: str | None, operator_prompt: str | None = None) -> dict:
-    """Resolve the authoritative background policy, failing closed.
-
-    Universal is matched by tenant OR billing group and can never bypass the
-    no-human rule.  Every other account defaults to no humans; a human subject
-    is allowed only when the operator's own prompt explicitly asks for one.
-    """
-    policy = {
-        "tenant_id": None, "billing_group": None, "is_umg": True,
-        "allow_people": False, "should_validate": True, "reason": "fail_closed",
-    }
     if not job_id:
-        return policy
+        return False
     try:
-        from database import SessionLocal as _SL, Job as _Job, User as _User
+        from database import SessionLocal as _SL, Job as _Job
         with _SL() as _db:
             row = _db.query(_Job).filter(_Job.job_id == job_id).first()
             if not row:
-                return policy
-            user = _db.query(_User).filter(_User.id == row.user_id).first()
-            if user is None:
-                return policy
-            tenant = _normalise_account_id(row.tenant_id)
-            billing_group = _normalise_account_id(user.billing_group if user else None)
+                return False
+            tenant = row.tenant_id or ""
             rp = row.render_params if isinstance(row.render_params, dict) else {}
-            is_umg = (
-                tenant in UMG_TENANTS
-                or tenant.startswith("universal_")
-                or billing_group in UMG_BILLING_GROUPS
-            )
-            explicit_people = _prompt_explicitly_requests_people(operator_prompt)
-            # Two independent signals are required for a human subject:
-            # an explicit prompt AND the existing "fondo libre" opt-out.
-            # This keeps automatic/lyrics prompts and stale default flags safe.
-            force = bool(rp.get("force_content_validation"))
             bypass = bool(rp.get("bypass_content_validation"))
-            allow_people = bool(explicit_people and bypass and not force and not is_umg)
-            # Default is strict validation for every account. The only legal
-            # skip is the deliberate, non-Universal human opt-in above.
-            should_validate = not allow_people
-            return {
-                "tenant_id": tenant, "billing_group": billing_group,
-                "is_umg": is_umg, "allow_people": allow_people,
-                "should_validate": should_validate,
-                "reason": (
-                    "universal_mandatory" if is_umg else
-                    "explicit_people_request" if allow_people else
-                    "forced_validation" if should_validate else
-                    "restricted_prompt_only"
-                ),
-            }
+            force = bool(rp.get("force_content_validation"))
+            is_umg = tenant in UMG_TENANTS
+            # Allow people when validator would NOT run. Same boolean
+            # algebra as Step 1b — but inverted (allow_people = NOT validate).
+            should_validate = (is_umg and not bypass) or (not is_umg and force)
+            return not should_validate
     except Exception as e:
-        logger.warning("[BG] safety policy fallback to fail-closed for job %s: %s", job_id, e)
-        return policy
-
-
-def _compute_allow_people(job_id: str | None, operator_prompt: str | None = None) -> bool:
-    """Allow humans only for an explicit non-Universal operator prompt."""
-    return bool(_background_safety_policy(job_id, operator_prompt)["allow_people"])
-
-
-def _validate_background_asset_for_job(
-    job_id: str,
-    asset_path: str | None,
-    operator_prompt: str | None = None,
-) -> bool:
-    """Apply the same authoritative gate to initial, edit and cache paths."""
-    policy = _background_safety_policy(job_id, operator_prompt)
-    if not policy["should_validate"]:
-        return True
-    if not asset_path or not os.path.exists(asset_path):
-        update_job(
-            job_id, status="validation_failed",
-            error="Content validation could not inspect the background asset.",
-        )
+        logger.warning("[BG] _compute_allow_people fallback to False for job %s: %s", job_id, e)
         return False
-    from content_validator import validate_video, validate_image
-    ext = os.path.splitext(asset_path)[1].lower()
-    validate_fn = validate_video if ext in (".mp4", ".mov", ".webm") else validate_image
-    result = validate_fn(asset_path, job_id=job_id)
-    result["policy_reason"] = policy["reason"]
-    result["tenant_id"] = policy["tenant_id"]
-    result["billing_group"] = policy["billing_group"]
-    update_job(job_id, validation_result=result)
-    if result.get("passed") is not True:
-        update_job(
-            job_id, status="validation_failed",
-            error=f"Content policy violation detected: {result.get('issues', [])}",
-        )
-        logger.warning("[VALIDATION] FAILED for job %s: %s", job_id, result.get("issues"))
-        return False
-    return True
 
 
 def _validate_segments_against_audio(audio_path: str, segments: list[dict],
@@ -8447,18 +8363,6 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
             )
             if not os.path.exists(clip_path):
                 raise RuntimeError("clip no escrito")
-            # Universal multi-scene timelines are validated clip-by-clip while
-            # each 8s asset is still dense enough to inspect every second.
-            # Validating only the stitched 3-5 minute timeline can sample
-            # between scenes and miss a short human appearance.
-            if job_id and _background_safety_policy(job_id)["should_validate"]:
-                from content_validator import validate_video as _validate_scene_video
-                _scene_validation = _validate_scene_video(clip_path, job_id=job_id)
-                if _scene_validation.get("passed") is not True:
-                    raise RuntimeError(
-                        f"scene rejected by no-human policy: "
-                        f"{_scene_validation.get('issues', [])}"
-                    )
             # NIT: no persistimos clip_path (es un path local efímero del job_dir
             # que filtraba el filesystem del contenedor al JSON/DB). El stitch usa
             # clip_for_key (abajo), no scene["clip_path"].
@@ -12560,10 +12464,6 @@ def run_edit_pipeline(
         # ----------------------------------------------------------------
         # Resolve background
         # ----------------------------------------------------------------
-        import copy as _copy
-        _scene_plan_before_edit = _copy.deepcopy(scene_plan)
-        _pending_background_recache = False
-        _pending_scene_recache = False
         if edit_type in ("typography", "lyrics", "metadata"):
             # All three reuse the cached background — only the foreground
             # layer changes. Lyrics edit ALSO swaps the segments, and
@@ -12676,11 +12576,21 @@ def run_edit_pipeline(
                 bg_mode=background_mode,
                 bg_verbatim=bg_verbatim,
                 effect=effect,
-                allow_people=_compute_allow_people(job_id, background_hint),
+                allow_people=_compute_allow_people(job_id),
             )
             update_job(job_id, progress=35)
-            # Do not replace the last known-good cache until validation passes.
-            _pending_background_recache = True
+            # Re-cache the new background so future typography edits work.
+            if bg_image_path and os.path.exists(bg_image_path) and storage.is_enabled():
+                try:
+                    _bg_ext = os.path.splitext(bg_image_path)[1] or ".mp4"
+                    new_bg_key = storage.upload_file(
+                        bg_image_path,
+                        f"backgrounds/{job_id}/bg_cached{_bg_ext}",
+                    )
+                    if new_bg_key:
+                        update_job(job_id, bg_r2_key_cached=new_bg_key)
+                except Exception as _e:
+                    logger.warning("[EDIT] Warning: re-cache of new background failed: %s", _e)
 
         elif edit_type == "scene":
             # Regenerar UNA escena del storyboard y re-armar el timeline. Sólo
@@ -12702,10 +12612,7 @@ def run_edit_pipeline(
                 scene_plan, scene_key, job_dir,
                 artist=artist, song_title=song_title,
                 audio_duration=_scene_audio_dur,
-                concept=concept,
-                allow_people=_compute_allow_people(
-                    job_id, scene_prompt_override or scene_hint
-                ),
+                concept=concept, allow_people=_compute_allow_people(job_id),
                 job_id=job_id,
                 prompt_override=scene_prompt_override, hint=scene_hint,
                 movement_style=scene_movement,
@@ -12719,45 +12626,10 @@ def run_edit_pipeline(
             # "Otra toma" era efímera: el próximo edit de tipografía volvía al
             # cache viejo (incidente 2026-07-10: cache = clip único de 8s de un
             # job dañado pre-#803 → render negro).
-            _pending_scene_recache = True
+            _recache_scene_timeline(job_id, bg_image_path)
 
         else:
             raise ValueError(f"Unknown edit_type {edit_type!r}")
-
-        # Universal safety applies to every edit path, including cached
-        # typography/lyrics renders and single-scene regeneration.  The old
-        # pipeline only validated the initial YouTube path, so an edit could
-        # replace a compliant background with a person and still reach review.
-        _edit_operator_prompt = (
-            background_hint if edit_type == "background" else
-            (scene_prompt_override or scene_hint) if edit_type == "scene" else
-            None
-        )
-        update_job(job_id, current_step="validation", progress=38)
-        _clips_already_validated = edit_type in ("scene",) or (
-            edit_type == "lyrics" and bool(scene_plan and scene_plan.get("scenes"))
-        )
-        if not _clips_already_validated and not _validate_background_asset_for_job(
-            job_id, bg_image_path, _edit_operator_prompt
-        ):
-            if edit_type == "scene" and _scene_plan_before_edit is not None:
-                update_job(job_id, scene_plan=_scene_plan_before_edit)
-            return
-
-        # Commit new caches only after the strict policy gate. A rejected
-        # Universal regeneration must not overwrite the last compliant asset.
-        if _pending_background_recache and storage.is_enabled():
-            try:
-                _bg_ext = os.path.splitext(bg_image_path)[1] or ".mp4"
-                new_bg_key = storage.upload_file(
-                    bg_image_path, f"backgrounds/{job_id}/bg_cached{_bg_ext}",
-                )
-                if new_bg_key:
-                    update_job(job_id, bg_r2_key_cached=new_bg_key)
-            except Exception as _e:
-                logger.warning("[EDIT] Warning: re-cache of new background failed: %s", _e)
-        if _pending_scene_recache:
-            _recache_scene_timeline(job_id, bg_image_path)
 
         # ----------------------------------------------------------------
         # Resolve font — misma elección para video Y short, persistida

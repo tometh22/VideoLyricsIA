@@ -86,7 +86,7 @@ export default function EditRequestPanel({
   // the payload depending on which direction departs from tenant default.
   const _tenantId = _readTenant();
   const _isUmg = isUmgTenant(_tenantId);
-  const [validationEnabled, setValidationEnabled] = useState(true);
+  const [validationEnabled, setValidationEnabled] = useState(_isUmg);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
   // Synchronous guard against double-click. `submitting` is async (React
