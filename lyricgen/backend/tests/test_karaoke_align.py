@@ -140,3 +140,81 @@ def test_repeated_lines_map_in_order(monkeypatch):
     out = karaoke_align.enrich_segments_with_word_timings(segs, "/tmp/a.mp3")
     assert out[0]["words"][0]["end"] == 0.9
     assert out[1]["words"][0]["end"] == 1.9   # second "ay" got the SECOND match
+
+
+# --- KARAOKE_FA_RETIME_ENABLED: trust confident forced-align over a drifted
+#     whisperX window (fix for Mercedes Sosa "Hablando A Tu Corazón") ---
+
+def _fa_drifted():
+    # FA places the lines at their REAL onset, far from the (wrong) window.
+    return [
+        {"start": 5.0, "end": 7.0, "text": "hola mundo",
+         "words": [{"word": "hola", "start": 5.0, "end": 5.6, "score": 0.9},
+                   {"word": "mundo", "start": 5.7, "end": 7.0, "score": 0.85}]},
+        {"start": 8.0, "end": 9.5, "text": "segunda linea",
+         "words": [{"word": "segunda", "start": 8.0, "end": 8.8, "score": 0.88},
+                   {"word": "linea", "start": 8.9, "end": 9.5, "score": 0.8}]},
+    ]
+
+
+def test_retime_off_by_default_drops_drifted_line(monkeypatch):
+    # Flag OFF (default): correct FA disagrees with the wrong window → the guard
+    # rejects it → line stays wordless (today's behaviour, documented).
+    monkeypatch.delenv("KARAOKE_FA_RETIME_ENABLED", raising=False)
+    monkeypatch.setattr("forced_align.is_enabled", lambda: True)
+    monkeypatch.setattr("forced_align.forced_align_lyrics", lambda a, t: _fa_drifted())
+    out = karaoke_align.enrich_segments_with_word_timings(_segs(), "/tmp/a.mp3")
+    assert "words" not in out[0] and out[0]["start"] == 0.0
+
+
+def test_retime_on_overrides_drifted_window(monkeypatch):
+    # Flag ON + confident FA span → trust FA: re-time the line + attach words.
+    monkeypatch.setenv("KARAOKE_FA_RETIME_ENABLED", "1")
+    monkeypatch.setattr("forced_align.is_enabled", lambda: True)
+    monkeypatch.setattr("forced_align.forced_align_lyrics", lambda a, t: _fa_drifted())
+    out = karaoke_align.enrich_segments_with_word_timings(_segs(), "/tmp/a.mp3")
+    assert out[0].get("retimed_by_forced_align") is True
+    assert out[0]["start"] == 5.0 and out[0]["end"] == 7.0   # re-timed from FA
+    assert out[0]["words"][0]["word"] == "hola"
+    assert out[1]["start"] == 8.0 and out[1]["end"] == 9.5
+
+
+def test_retime_on_low_confidence_does_not_retime(monkeypatch):
+    # Flag ON but low FA confidence → never re-time onto shaky timing; fall
+    # through to the window guard (window matches here → words attach, start/end
+    # preserved).
+    monkeypatch.setenv("KARAOKE_FA_RETIME_ENABLED", "1")
+    low = _fa_output()
+    for ln in low:
+        for w in ln["words"]:
+            w["score"] = 0.2
+    monkeypatch.setattr("forced_align.is_enabled", lambda: True)
+    monkeypatch.setattr("forced_align.forced_align_lyrics", lambda a, t: low)
+    out = karaoke_align.enrich_segments_with_word_timings(_segs(), "/tmp/a.mp3")
+    assert "retimed_by_forced_align" not in out[0]
+    assert out[0]["start"] == 0.0 and out[0]["end"] == 2.0
+
+
+def test_retime_never_overrides_a_locked_line(monkeypatch):
+    # A line the operator manually synced (locked) must keep its timing even
+    # with a confident FA span and the flag on.
+    monkeypatch.setenv("KARAOKE_FA_RETIME_ENABLED", "1")
+    segs = [{"start": 0.0, "end": 2.0, "text": "hola mundo", "locked": True}]
+    monkeypatch.setattr("forced_align.is_enabled", lambda: True)
+    monkeypatch.setattr("forced_align.forced_align_lyrics", lambda a, t: _fa_drifted())
+    out = karaoke_align.enrich_segments_with_word_timings(segs, "/tmp/a.mp3")
+    assert "retimed_by_forced_align" not in out[0]
+    assert out[0]["start"] == 0.0 and out[0]["end"] == 2.0   # manual sync preserved
+
+
+def test_fa_span_trustworthy_guards():
+    assert karaoke_align._fa_span_trustworthy([]) is False
+    assert karaoke_align._fa_span_trustworthy(
+        [{"word": "x", "start": 1.0, "end": 1.0, "score": 0.9}]) is False   # zero span
+    assert karaoke_align._fa_span_trustworthy(
+        [{"word": "x", "start": 1.0, "end": 2.0, "score": 0.2}]) is False    # low conf
+    assert karaoke_align._fa_span_trustworthy(
+        [{"word": "x", "start": 1.0, "end": 2.0, "score": 0.9}]) is True
+    # no scores present → coherence alone gates (trusted)
+    assert karaoke_align._fa_span_trustworthy(
+        [{"word": "x", "start": 1.0, "end": 2.0}]) is True
