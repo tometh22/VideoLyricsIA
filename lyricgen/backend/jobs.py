@@ -565,11 +565,6 @@ def get_all_jobs(
     """
     query = db.query(Job).filter(
         ~Job.status.in_(_BG_PREVIEW_STATUSES),
-        # Defense in depth for preview rows that were created by an older
-        # worker and got stranded in a generic terminal state such as
-        # validation_failed. Filename identifies their tracking-only nature
-        # independently of status, so they can never leak into Historial.
-        ~Job.filename.startswith("bgpreview_"),
     )
     if tenant_id is not None:
         query = query.filter(Job.tenant_id == tenant_id)
@@ -583,10 +578,7 @@ def get_all_jobs(
     return [j.to_list_dict() for j in jobs]
 
 
-_TERMINAL_STATUSES = (
-    "done", "error", "rejected", "validation_failed",
-    "bg_preview_done", "bg_preview_failed",
-)
+_TERMINAL_STATUSES = ("done", "error", "rejected", "validation_failed")
 # Sub-partition of terminal statuses by outcome. The pipeline writes
 # done/pending_review only after deliverables actually land in R2; once
 # that ground truth is in the row, NO failure-shaped status ever
@@ -596,7 +588,7 @@ _TERMINAL_STATUSES = (
 # completing worker, edit failure that ran after the worker recovered)
 # now bounces off this guard inside update_job instead of having to
 # re-check the row in every call site.
-_SUCCESS_TERMINAL_STATUSES = ("done", "pending_review", "bg_preview_done")
+_SUCCESS_TERMINAL_STATUSES = ("done", "pending_review")
 _FAILURE_TARGET_STATUSES = (
     "error", "rejected", "validation_failed", "transcription_failed",
     "bg_preview_failed",

@@ -433,12 +433,6 @@ def enqueue_pipeline(
 ) -> str:
     """Enqueue a run_pipeline job. Returns RQ job id (or 'thread:<job_id>' in
     the Redis-less fallback path)."""
-    # Internal lockstep token: a worker running a different rollout mode must
-    # fail before generation rather than silently producing under another
-    # policy. This is RQ metadata, not a public request/payload field.
-    from background_policy import runtime_rollout_fingerprint
-    kwargs = dict(kwargs)
-    kwargs["background_policy_fingerprint"] = runtime_rollout_fingerprint()
     q = _pick_queue(plan, tenant_id=tenant_id)
     if q is not None:
         from rq import Retry
@@ -618,8 +612,6 @@ def enqueue_bg_preview(
     en orden FIFO). Si en el futuro UMG necesita priority, mover a
     `enterprise_bg_preview` o similar.
     """
-    from background_policy import runtime_rollout_fingerprint
-    _policy_fingerprint = runtime_rollout_fingerprint()
     _, q_default, _ = _init_redis()
     if q_default is not None:
         from rq import Queue, Retry
@@ -648,7 +640,7 @@ def enqueue_bg_preview(
         _evict_stale_rq_job(_redis, f"bgpreview:{job_id}")
         rq_job = q.enqueue(
             run_bg_preview_job,
-            args=(job_id, bg_cache_key, params, _policy_fingerprint),
+            args=(job_id, bg_cache_key, params),
             job_timeout=timeout,
             result_ttl=RESULT_TTL,
             failure_ttl=FAILURE_TTL,
@@ -668,7 +660,7 @@ def enqueue_bg_preview(
     from bg_preview import run_bg_preview_job
     t = threading.Thread(
         target=run_bg_preview_job,
-        args=(job_id, bg_cache_key, params, _policy_fingerprint),
+        args=(job_id, bg_cache_key, params),
         daemon=True,
     )
     t.start()
@@ -799,8 +791,6 @@ def enqueue_edit(
     too tight for long songs; we now match the main pipeline's
     YouTube-only allowance to keep the worst-case edit alive.
     """
-    from background_policy import runtime_rollout_fingerprint
-    _policy_fingerprint = runtime_rollout_fingerprint()
     q = _pick_queue(plan, tenant_id=tenant_id)
     if q is not None:
         from rq import Retry
@@ -825,7 +815,7 @@ def enqueue_edit(
         retry = Retry(max=PIPELINE_RETRY_MAX, interval=PIPELINE_RETRY_INTERVAL_S)
         rq_job = q.enqueue(
             run_edit_pipeline,
-            args=(job_id, edit_type, edit_params, _policy_fingerprint),
+            args=(job_id, edit_type, edit_params),
             # 60 min — covers worst-case long-song edits with motion enabled
             # until we land the ffmpeg-overlay rewrite.
             job_timeout=3600,
@@ -846,7 +836,7 @@ def enqueue_edit(
     from pipeline import run_edit_pipeline
     t = threading.Thread(
         target=run_edit_pipeline,
-        args=(job_id, edit_type, edit_params, _policy_fingerprint),
+        args=(job_id, edit_type, edit_params),
         daemon=True,
     )
     t.start()

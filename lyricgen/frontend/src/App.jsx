@@ -40,10 +40,7 @@ import TranscribingProgress from "./components/TranscribingProgress";
 import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
 import GiftCreditsBanner from "./components/GiftCreditsBanner";
 import { useAlert } from "./components/AlertProvider";
-import {
-  shouldEnableBackgroundPreview,
-  useBackgroundPreview,
-} from "./hooks/useBackgroundPreview";
+import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
 import { translateBackendError } from "./lib/lyricsEditSubmit";
 import { mergeEditedSegments } from "./lib/reviewSegments";
@@ -3515,12 +3512,7 @@ export default function App() {
     // Gemini gratuito). Si el operador clickea "Editar y re-renderizar"
     // con cambio de background, ese flow dispara su propio re-render
     // via /edit/{id} con edit_type=background — no necesita el preview.
-    enabled: shouldEnableBackgroundPreview({
-      hasReview: !!currentReview,
-      editMode: !!currentReview?.editMode,
-      bgSelectMode,
-      enableScenes,
-    }),
+    enabled: !!currentReview && !currentReview.editMode,
     api: API,
     authHeaders,
     onCacheKey: (key, meta) => {

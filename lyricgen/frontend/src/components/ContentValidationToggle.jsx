@@ -8,20 +8,10 @@ import { useI18n } from "../i18n";
 const UMG_TENANTS = new Set([
   "umg", "omg", "umusic", "universal_argentina", "universal_chile",
 ]);
-const UMG_BILLING_GROUPS = new Set(["universal_music"]);
 
-export function isUniversalAccount(tenantId, billingGroup) {
+function isUmgTenant(tenantId) {
   const normalized = String(tenantId || "").trim().toLowerCase();
-  const normalizedGroup = String(billingGroup || "").trim().toLowerCase();
-  return UMG_BILLING_GROUPS.has(normalizedGroup)
-    || UMG_TENANTS.has(normalized)
-    || normalized === "universal"
-    || normalized.startsWith("universal_")
-    || normalized.startsWith("universal-");
-}
-
-export function isUmgTenant(tenantId) {
-  return isUniversalAccount(tenantId, null);
+  return UMG_TENANTS.has(normalized) || normalized.startsWith("universal_");
 }
 
 /**
@@ -31,19 +21,25 @@ export function isUmgTenant(tenantId) {
  * responsible for translating that boolean into the right backend flag
  * for the tenant:
  *
- *   Universal tenant: fixed policy, no operator bypass is rendered. The
- *   backend independently enforces the same rule from tenant/billing group.
+ *   UMG tenant (default behavior: validate):
+ *     - value=true  → no payload field (matches tenant default)
+ *     - value=false → send `bypass_content_validation: true`
  *
- *   Non-Universal account (default behavior: validate):
+ *   Non-UMG tenant (default behavior: skip):
  *     - value=true  → send `force_content_validation: true`
- *     - value=false → send `bypass_content_validation: true`; people still
- *       require an explicit operator-authored prompt on the backend.
+ *     - value=false → no payload field (matches tenant default)
+ *
+ * UI copy differs per tenant so each operator sees their choice framed
+ * in the way that matches the default they're departing from:
+ *
+ *   UMG:     "Activa (default)" vs "Asumir el riesgo" (amber warning)
+ *   non-UMG: "Sin verificación (default)" vs "Activar verificación"
  *
  * Props:
  *   value      — boolean. true = validate, false = skip.
  *   onChange   — fn(newValue: boolean)
- *   tenantId / billingGroup — account identifiers used only to render the
- *                authoritative Universal fixed-policy notice.
+ *   tenantId   — string | undefined. Determines copy + default state.
+ *                Falls back to UMG semantics if missing (safer default).
  *   disabled   — boolean
  *   initialOpen — optional override; defaults to expanded when the
  *                operator's choice differs from the tenant default
@@ -53,12 +49,11 @@ export default function ContentValidationToggle({
   value,
   onChange,
   tenantId,
-  billingGroup,
   disabled = false,
   initialOpen,
 }) {
   const { t } = useI18n();
-  const isUmg = isUniversalAccount(tenantId, billingGroup);
+  const isUmg = isUmgTenant(tenantId);
   // Tenant default for `value`. The parent should initialize state to
   // this; if it didn't (value is undefined), treat as the default.
   const tenantDefault = true; // every account defaults to the safe scan
@@ -71,9 +66,11 @@ export default function ContentValidationToggle({
     typeof initialOpen === "boolean" ? initialOpen : isDeparting
   );
 
-  // Universal returns a fixed notice below. The common-account copy keeps the
-  // existing explicit restricted/free choice and describes the backend's
-  // second requirement: a human must also be requested in the raw prompt.
+  // Per-tenant copy. V3 framing: state the question, then both options as
+  // explicit "Sí / No" answers tied to "apto para UMG" vs "fondo libre"
+  // so the operator sees the tradeoff in plain language. The default
+  // (recommended) and alt sides swap per tenant, but the wording for each
+  // side stays the same — only its position changes.
   const copy = isUmg
     ? {
         sectionLabel: t("validation.section_label") || "¿Restringir el contenido del fondo?",
@@ -107,34 +104,6 @@ export default function ContentValidationToggle({
         // brand color when departing (operator is opting INTO the stricter mode)
         departingTone: "brand",
       };
-
-  if (isUmg) {
-    return (
-      <div
-        role="note"
-        className="rounded-md ring-1 ring-brand/25 bg-brand/[0.05] px-3 py-3"
-      >
-        <div className="flex items-start gap-2.5">
-          <span
-            aria-hidden="true"
-            className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-full bg-brand/15 text-[11px] text-brand-light"
-          >
-            ✓
-          </span>
-          <div>
-            <p className="text-xs font-medium text-white">
-              {t("validation.universal_fixed_title") ||
-                "Protección Universal activa"}
-            </p>
-            <p className="mt-1 text-[10px] leading-relaxed text-ink-tertiary">
-              {t("validation.universal_fixed_desc") ||
-                "Los fondos no incluyen personas, caras, manos ni figuras humanas. Si la IA las introduce, regeneramos únicamente el fondo y el video continúa."}
-            </p>
-          </div>
-        </div>
-      </div>
-    );
-  }
 
   // Tone-driven classes (amber for UMG-bypass, brand for non-UMG-enable).
   const departingRingClass =
@@ -262,4 +231,4 @@ export default function ContentValidationToggle({
 
 // Re-exported helpers so parents can share the same tenant logic
 // without duplicating the hardcoded list.
-export { UMG_TENANTS };
+export { isUmgTenant, UMG_TENANTS };

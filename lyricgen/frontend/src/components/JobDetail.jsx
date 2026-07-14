@@ -5,7 +5,7 @@ import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
 import EditRequestPanel from "./EditRequestPanel";
-import ContentValidationToggle, { isUniversalAccount } from "./ContentValidationToggle";
+import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
 import { useAlert } from "./AlertProvider";
 import HelpTip from "./HelpCenter/HelpTip";
 import EnableProResModal from "./EnableProResModal";
@@ -462,8 +462,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // bypass/force in the POST /retry body. See ContentValidationToggle.jsx
   // for full rationale.
   const _retryTenantId = currentUser?.tenant_id || null;
-  const _retryBillingGroup = currentUser?.billing_group || null;
-  const _retryIsUmg = isUniversalAccount(_retryTenantId, _retryBillingGroup);
+  const _retryIsUmg = isUmgTenant(_retryTenantId);
   const [retryValidationEnabled, setRetryValidationEnabled] = useState(true);
   const showRetrySpecSelector =
     (job.delivery_profile === "umg" || job.delivery_profile === "both") &&
@@ -1685,7 +1684,6 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               value={retryValidationEnabled}
               onChange={setRetryValidationEnabled}
               tenantId={_retryTenantId}
-              billingGroup={_retryBillingGroup}
               disabled={retrying}
               initialOpen={true}
             />
