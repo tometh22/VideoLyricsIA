@@ -1820,11 +1820,11 @@ export default function UploadZone({
                   : (t("upload.anchor_lyrics_lines") || "{n} líneas").replace("{n}", lineCount);
                 const isReady = isOfficial && lineCount > 0;
                 return (
-                  <section data-testid={`lyrics-source-${i}`} className="relative overflow-hidden rounded-2xl border border-white/[0.08] bg-[#10111b] shadow-[0_14px_32px_rgba(0,0,0,0.18)]">
-                    <div className="absolute -right-12 -top-14 h-36 w-36 rounded-full bg-brand/10 blur-3xl pointer-events-none" />
+                  <section data-testid={`lyrics-source-${i}`} className="lyrics-source relative overflow-hidden rounded-2xl border">
+                    <div className="lyrics-source__halo absolute -right-12 -top-14 h-36 w-36 rounded-full pointer-events-none" />
                     <div className="relative px-3.5 pt-3.5 pb-3">
                       <div className="flex items-start gap-2.5 mb-3">
-                        <span className="w-8 h-8 rounded-xl bg-gradient-to-br from-brand to-violet-400 flex items-center justify-center shrink-0 shadow-[0_6px_16px_rgba(124,58,237,0.35)]">
+                        <span className="lyrics-source__mark w-8 h-8 rounded-xl flex items-center justify-center shrink-0">
                           <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24" aria-hidden="true">
                             <path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3Z" strokeLinecap="round" strokeLinejoin="round" />
                             <path d="m19 16 .7 2.3L22 19l-2.3.7L19 22l-.7-2.3L16 19l2.3-.7L19 16Z" strokeLinecap="round" strokeLinejoin="round" />
@@ -1850,10 +1850,10 @@ export default function UploadZone({
                         aria-checked={!isOfficial}
                         data-testid={`lyrics-source-ai-${i}`}
                         onClick={() => updateField(i, "lyricsSource", "auto")}
-                        className={`group relative min-h-[108px] overflow-hidden rounded-xl border p-3 text-left transition-all duration-200
+                        className={`lyrics-source__choice group relative min-h-[108px] overflow-hidden rounded-xl border p-3 text-left transition-all duration-200 ${!isOfficial ? "is-active" : ""}
                           ${!isOfficial
-                            ? "border-brand/70 bg-gradient-to-br from-brand/[0.26] via-brand/[0.14] to-violet-500/[0.05] shadow-[0_10px_24px_rgba(91,33,182,0.22)]"
-                            : "border-white/[0.07] bg-black/10 hover:border-white/[0.16] hover:bg-white/[0.025]"}`}
+                            ? "border-brand/70"
+                            : "border-white/[0.07]"}`}
                       >
                         {!isOfficial && <span className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-violet-200/80 to-transparent" />}
                         <span className={`w-8 h-8 rounded-lg flex items-center justify-center ${
@@ -1884,10 +1884,10 @@ export default function UploadZone({
                         aria-checked={isOfficial}
                         data-testid={`lyrics-source-official-${i}`}
                         onClick={() => updateField(i, "lyricsSource", "official")}
-                        className={`group relative min-h-[108px] overflow-hidden rounded-xl border p-3 text-left transition-all duration-200
+                        className={`lyrics-source__choice group relative min-h-[108px] overflow-hidden rounded-xl border p-3 text-left transition-all duration-200 ${isOfficial ? "is-active" : ""}
                           ${isOfficial
-                            ? "border-brand/70 bg-gradient-to-br from-brand/[0.26] via-brand/[0.14] to-violet-500/[0.05] shadow-[0_10px_24px_rgba(91,33,182,0.22)]"
-                            : "border-white/[0.07] bg-black/10 hover:border-white/[0.16] hover:bg-white/[0.025]"}`}
+                            ? "border-brand/70"
+                            : "border-white/[0.07]"}`}
                       >
                         {isOfficial && <span className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-violet-200/80 to-transparent" />}
                         <span className={`w-8 h-8 rounded-lg flex items-center justify-center ${
