@@ -2112,10 +2112,12 @@ export default function App() {
         setRowStatus(file, "queued");
         // Versión B (letra anclada): re-leer la entry FRESCA por identidad
         // de archivo antes del POST. El prefetch arranca al drop, pero el
-        // operador pega la letra oficial DESPUÉS — la referencia `entry`
-        // capturada al armar la cola quedó vieja (updateField crea objetos
-        // nuevos). Para cuando el upload a R2 terminó y este POST sale, la
-        // versión fresca ya suele tener la letra pegada.
+        // operador elige "Tengo la letra oficial" y pega DESPUÉS — la
+        // referencia `entry` capturada al armar la cola quedó vieja
+        // (updateField crea objetos nuevos). Para cuando el upload a R2
+        // terminó y este POST sale, la versión fresca ya suele tener la
+        // selección + la letra. v2: solo viaja con lyricsSource="official"
+        // (el selector manda, no el contenido del textarea).
         const fresh = (filesRef.current || [])
           .find((e) => e?.file && prefetchKey(e.file) === key) || entry;
         const res = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
@@ -2127,7 +2129,8 @@ export default function App() {
             artist: entry.artist || "",
             title: (entry.songTitle || "").trim(),
             live: !!entry.live,
-            anchor_lyrics: fresh.anchorLyrics || "",
+            anchor_lyrics: fresh.lyricsSource === "official"
+              ? (fresh.anchorLyrics || "") : "",
           }),
           signal: controller && controller.signal,
         }, { maxRetries: 3 });
@@ -2416,7 +2419,10 @@ export default function App() {
           live: !!entry.live,
           // Versión B: letra oficial pegada en el wizard → el backend la
           // ancla al motor CTC (flag ANCHOR_LYRICS_ENABLED; vacía = no-op).
-          anchor_lyrics: entry.anchorLyrics || "",
+          // v2: gated por el selector — volver a "IA de Genly" desactiva
+          // el anclado aunque el textarea conserve texto.
+          anchor_lyrics: entry.lyricsSource === "official"
+            ? (entry.anchorLyrics || "") : "",
         }),
       }, {
         maxRetries: 3,
