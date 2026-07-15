@@ -17,7 +17,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import UploadZone from "./UploadZone";
 
 vi.mock("../i18n", () => ({
-  useI18n: () => ({ t: () => "", lang: "es" }),
+  useI18n: () => ({
+    // Mantiene el test cerca del contrato real de i18n: el componente debe
+    // entregar { n } para que nunca quede el placeholder visible en el estado listo.
+    t: (key, vars) => key === "upload.anchor_lyrics_ready"
+      ? "{n} líneas listas para sincronizar".replace("{n}", vars?.n ?? "{n}")
+      : "",
+    lang: "es",
+  }),
 }));
 vi.mock("./OnboardingTour", () => ({
   UploadTour: () => null,
@@ -86,7 +93,7 @@ describe("selector de fuente de letra (IA de Genly vs letra oficial)", () => {
     });
     // Contador: 3 líneas no vacías (fallback "{n} líneas" del componente).
     expect(screen.getAllByText("3 líneas").length).toBeGreaterThan(0);
-    expect(screen.getByText("3 líneas listos para sincronizar")).toBeTruthy();
+    expect(screen.getByText("3 líneas listas para sincronizar")).toBeTruthy();
   });
 
   it("no promete anclado exacto hasta que haya texto pegado", () => {
