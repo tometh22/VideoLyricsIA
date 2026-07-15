@@ -1792,18 +1792,23 @@ export default function UploadZone({
                   las letras publicadas suelen ser de la versión de
                   estudio y el final del vivo difiere. Si el título ya
                   tiene marcador live, el backend lo detecta solo. */}
-              <label className="flex items-start gap-2 cursor-pointer select-none">
+              <label className={`live-version-toggle flex items-start gap-2.5 rounded-xl border p-2.5 cursor-pointer select-none ${entry.live ? "is-active" : ""}`}>
                 <input
                   type="checkbox"
                   checked={!!entry.live}
                   onChange={(e) => updateField(i, "live", e.target.checked)}
-                  className="mt-0.5 accent-brand"
+                  className="sr-only"
                 />
-                <span>
-                  <span className="text-[12px] text-gray-300 font-medium">
+                <span className="live-version-toggle__check mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-md border" aria-hidden="true">
+                  <svg className={`h-2.5 w-2.5 transition-opacity ${entry.live ? "opacity-100" : "opacity-0"}`} viewBox="0 0 12 12" fill="none">
+                    <path d="m2.2 6.1 2.3 2.2L9.9 3" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-[12px] text-gray-300 font-medium">
                     {t("upload.live_version") || "Versión en vivo"}
                   </span>
-                  <span className="block text-[11px] text-gray-600">
+                  <span className="block text-[11px] leading-relaxed text-gray-500">
                     {t("upload.live_version_hint") || "Marcalo si es un show en vivo: revisamos el final contra el audio."}
                   </span>
                 </span>
@@ -1817,8 +1822,9 @@ export default function UploadZone({
                   .split("\n").filter((l) => l.trim()).length;
                 const lineBadge = lineCount === 1
                   ? (t("upload.anchor_lyrics_line") || "1 línea")
-                  : (t("upload.anchor_lyrics_lines") || "{n} líneas").replace("{n}", lineCount);
+                  : (t("upload.anchor_lyrics_lines", { n: lineCount }) || "{n} líneas").replace("{n}", lineCount);
                 const isReady = isOfficial && lineCount > 0;
+                const readyMessage = t("upload.anchor_lyrics_ready", { n: lineCount }) || `${lineBadge} listos para sincronizar`;
                 return (
                   <section data-testid={`lyrics-source-${i}`} className="lyrics-source relative overflow-hidden rounded-2xl border">
                     <div className="lyrics-source__halo absolute -right-12 -top-14 h-36 w-36 rounded-full pointer-events-none" />
@@ -1946,7 +1952,7 @@ export default function UploadZone({
                           </svg>
                           <span>
                             {isReady
-                              ? (t("upload.anchor_lyrics_ready") || `${lineBadge} listos para sincronizar`)
+                              ? readyMessage
                               : (t("upload.anchor_lyrics_required") || "Pegá al menos una línea para activar la sincronización exacta.")}
                           </span>
                         </div>
