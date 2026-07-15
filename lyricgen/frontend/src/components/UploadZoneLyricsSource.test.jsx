@@ -86,6 +86,14 @@ describe("selector de fuente de letra (IA de Genly vs letra oficial)", () => {
     });
     // Contador: 3 líneas no vacías (fallback "{n} líneas" del componente).
     expect(screen.getAllByText("3 líneas").length).toBeGreaterThan(0);
+    expect(screen.getByText("3 líneas listos para sincronizar")).toBeTruthy();
+  });
+
+  it("no promete anclado exacto hasta que haya texto pegado", () => {
+    render(<Harness user={FLAG_USER} />);
+    fireEvent.click(screen.getByTestId("lyrics-source-official-0"));
+
+    expect(screen.getByText("Pegá al menos una línea para activar la sincronización exacta.")).toBeTruthy();
   });
 
   it("volver a IA colapsa el textarea sin perder el texto pegado", () => {
