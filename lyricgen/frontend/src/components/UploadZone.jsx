@@ -1820,38 +1820,62 @@ export default function UploadZone({
                   : (t("upload.anchor_lyrics_lines") || "{n} líneas").replace("{n}", lineCount);
                 const isReady = isOfficial && lineCount > 0;
                 return (
-                  <section data-testid={`lyrics-source-${i}`} className="rounded-xl border border-white/[0.06] bg-surface-1/35 p-2.5">
-                    <span className="block text-[11px] uppercase tracking-wide font-medium text-gray-400 mb-1">
-                      {t("upload.lyrics_source_label") || "Letra"}
-                    </span>
-                    <div className="space-y-1.5" role="radiogroup"
-                      aria-label={t("upload.lyrics_source_label") || "Letra"}>
+                  <section data-testid={`lyrics-source-${i}`} className="relative overflow-hidden rounded-2xl border border-white/[0.08] bg-[#10111b] shadow-[0_14px_32px_rgba(0,0,0,0.18)]">
+                    <div className="absolute -right-12 -top-14 h-36 w-36 rounded-full bg-brand/10 blur-3xl pointer-events-none" />
+                    <div className="relative px-3.5 pt-3.5 pb-3">
+                      <div className="flex items-start gap-2.5 mb-3">
+                        <span className="w-8 h-8 rounded-xl bg-gradient-to-br from-brand to-violet-400 flex items-center justify-center shrink-0 shadow-[0_6px_16px_rgba(124,58,237,0.35)]">
+                          <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3Z" strokeLinecap="round" strokeLinejoin="round" />
+                            <path d="m19 16 .7 2.3L22 19l-2.3.7L19 22l-.7-2.3L16 19l2.3-.7L19 16Z" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </span>
+                        <span className="min-w-0">
+                          <span className="block text-[10px] uppercase tracking-[0.16em] font-semibold text-brand-light/80">
+                            {t("upload.lyrics_source_label") || "Letra"}
+                          </span>
+                          <span className="block text-[13px] leading-tight font-semibold text-white mt-0.5">
+                            {t("upload.lyrics_source_heading") || "Elegí cómo trabajar la letra"}
+                          </span>
+                          <span className="block text-[11px] leading-snug text-gray-500 mt-1">
+                            {t("upload.lyrics_source_heading_sub") || "Podés dejar que Genly la detecte o usar tu versión oficial."}
+                          </span>
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2" role="radiogroup"
+                        aria-label={t("upload.lyrics_source_label") || "Letra"}>
                       <button
                         type="button"
                         role="radio"
                         aria-checked={!isOfficial}
                         data-testid={`lyrics-source-ai-${i}`}
                         onClick={() => updateField(i, "lyricsSource", "auto")}
-                        className={`w-full flex items-center gap-2.5 text-left px-2.5 py-2 rounded-lg ring-1 transition-all
+                        className={`group relative min-h-[108px] overflow-hidden rounded-xl border p-3 text-left transition-all duration-200
                           ${!isOfficial
-                            ? "ring-brand/60 bg-brand/[0.12] shadow-[0_0_12px_rgba(124,58,237,0.12)]"
-                            : "ring-white/[0.06] bg-surface-1/60 hover:ring-white/[0.14] hover:bg-white/[0.03]"}`}
+                            ? "border-brand/70 bg-gradient-to-br from-brand/[0.26] via-brand/[0.14] to-violet-500/[0.05] shadow-[0_10px_24px_rgba(91,33,182,0.22)]"
+                            : "border-white/[0.07] bg-black/10 hover:border-white/[0.16] hover:bg-white/[0.025]"}`}
                       >
-                        <span className={`w-4 h-4 rounded-full border flex items-center justify-center shrink-0 ${
-                          !isOfficial ? "border-brand bg-brand" : "border-gray-600"
+                        {!isOfficial && <span className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-violet-200/80 to-transparent" />}
+                        <span className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+                          !isOfficial ? "bg-white/15 text-white" : "bg-white/[0.06] text-gray-400 group-hover:text-gray-200"
                         }`} aria-hidden="true">
-                          {!isOfficial && <span className="w-1.5 h-1.5 rounded-full bg-white" />}
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+                            <path d="m12 3 1.3 4.2L17.5 8.5l-4.2 1.3L12 14l-1.3-4.2-4.2-1.3 4.2-1.3L12 3Z" strokeLinecap="round" strokeLinejoin="round" />
+                            <path d="M5 15v4M3 17h4M19 16v3M17.5 17.5h3" strokeLinecap="round" />
+                          </svg>
                         </span>
-                        <span className="min-w-0 flex-1">
-                          <span className={`block text-[12px] font-semibold ${!isOfficial ? "text-brand-light" : "text-gray-300"}`}>
+                        <span className="block mt-2">
+                          <span className={`block text-[12px] font-semibold ${!isOfficial ? "text-white" : "text-gray-200"}`}>
                             {t("upload.lyrics_source_ai") || "Transcripción con IA de Genly"}
                           </span>
-                          <span className="block mt-0.5 text-[11px] leading-snug text-gray-500">
+                          <span className={`block mt-1 text-[11px] leading-snug ${!isOfficial ? "text-violet-100/65" : "text-gray-500"}`}>
                             {t("upload.lyrics_source_ai_sub") || "Detectamos y sincronizamos la letra automáticamente."}
                           </span>
                         </span>
-                        <span className="shrink-0 rounded-full bg-white/[0.05] px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-gray-500">
-                          {t("upload.lyrics_source_recommended") || "Recomendado"}
+                        <span className={`absolute right-2.5 top-2.5 flex h-4 w-4 items-center justify-center rounded-full border ${
+                          !isOfficial ? "border-white/60 bg-white text-brand" : "border-white/[0.16]"
+                        }`} aria-hidden="true">
+                          {!isOfficial && <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6" strokeLinecap="round" strokeLinejoin="round" /></svg>}
                         </span>
                       </button>
                       <button
@@ -1860,47 +1884,61 @@ export default function UploadZone({
                         aria-checked={isOfficial}
                         data-testid={`lyrics-source-official-${i}`}
                         onClick={() => updateField(i, "lyricsSource", "official")}
-                        className={`w-full flex items-center gap-2.5 text-left px-2.5 py-2 rounded-lg ring-1 transition-all
+                        className={`group relative min-h-[108px] overflow-hidden rounded-xl border p-3 text-left transition-all duration-200
                           ${isOfficial
-                            ? "ring-brand/60 bg-brand/[0.12] shadow-[0_0_12px_rgba(124,58,237,0.12)]"
-                            : "ring-white/[0.06] bg-surface-1/60 hover:ring-white/[0.14] hover:bg-white/[0.03]"}`}
+                            ? "border-brand/70 bg-gradient-to-br from-brand/[0.26] via-brand/[0.14] to-violet-500/[0.05] shadow-[0_10px_24px_rgba(91,33,182,0.22)]"
+                            : "border-white/[0.07] bg-black/10 hover:border-white/[0.16] hover:bg-white/[0.025]"}`}
                       >
-                        <span className={`w-4 h-4 rounded-full border flex items-center justify-center shrink-0 ${
-                          isOfficial ? "border-brand bg-brand" : "border-gray-600"
+                        {isOfficial && <span className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-violet-200/80 to-transparent" />}
+                        <span className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+                          isOfficial ? "bg-white/15 text-white" : "bg-white/[0.06] text-gray-400 group-hover:text-gray-200"
                         }`} aria-hidden="true">
-                          {isOfficial && <span className="w-1.5 h-1.5 rounded-full bg-white" />}
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+                            <path d="M7 3.5h7L19 8v12.5H7z" strokeLinecap="round" strokeLinejoin="round" />
+                            <path d="M14 3.5V8h5M10 12h6M10 15h6" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
                         </span>
-                        <span className="min-w-0 flex-1">
-                          <span className={`block text-[12px] font-semibold ${isOfficial ? "text-brand-light" : "text-gray-300"}`}>
+                        <span className="block mt-2">
+                          <span className={`block text-[12px] font-semibold ${isOfficial ? "text-white" : "text-gray-200"}`}>
                             {t("upload.lyrics_source_official") || "Tengo la letra oficial"}
                           </span>
-                          <span className="block mt-0.5 text-[11px] leading-snug text-gray-500">
+                          <span className={`block mt-1 text-[11px] leading-snug ${isOfficial ? "text-violet-100/65" : "text-gray-500"}`}>
                             {t("upload.lyrics_source_official_sub") || "Úsala cuando necesitás que el texto coincida exactamente."}
                           </span>
                         </span>
                         {lineCount > 0 && (
-                          <span className="shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-brand/20 text-brand-light tabular-nums">
+                          <span className="absolute bottom-2.5 left-3 text-[10px] font-semibold text-violet-200 tabular-nums">
                             {lineBadge}
                           </span>
                         )}
+                        <span className={`absolute right-2.5 top-2.5 flex h-4 w-4 items-center justify-center rounded-full border ${
+                          isOfficial ? "border-white/60 bg-white text-brand" : "border-white/[0.16]"
+                        }`} aria-hidden="true">
+                          {isOfficial && <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6" strokeLinecap="round" strokeLinejoin="round" /></svg>}
+                        </span>
                       </button>
-                    </div>
+                      </div>
                     {isOfficial && (
-                      <div className="mt-2 animate-fade-in">
-                        <label className="block text-[11px] font-medium text-gray-300 mb-1.5">
+                      <div className="mt-3 border-t border-white/[0.07] pt-3 animate-fade-in">
+                        <div className="flex items-center justify-between gap-3 mb-1.5">
+                          <label className="block text-[11px] font-medium text-gray-200">
                           {t("upload.anchor_lyrics_input_label") || "Pegá la letra oficial"}
-                        </label>
+                          </label>
+                          <span className="text-[10px] text-gray-600">
+                            {t("upload.anchor_lyrics_format_hint") || "TXT · sin tiempos"}
+                          </span>
+                        </div>
                         <textarea
                           value={entry.anchorLyrics || ""}
                           onChange={(e) => updateField(i, "anchorLyrics", e.target.value)}
                           placeholder={t("upload.anchor_lyrics_placeholder") || "Pegá la letra acá — una línea por verso, sin timestamps."}
                           rows={6}
                           maxLength={20000}
-                          className="w-full px-3 py-2 rounded-lg bg-surface-1 border border-brand/30
-                            focus:border-brand/60 focus:outline-none text-sm text-white placeholder-gray-500
+                          className="w-full px-3 py-2.5 rounded-xl bg-black/20 border border-white/[0.08]
+                            focus:border-brand/70 focus:ring-2 focus:ring-brand/10 focus:outline-none text-sm text-white placeholder-gray-600
                             transition-all resize-y leading-relaxed"
                         />
-                        <div className={`mt-1.5 flex items-center gap-1.5 text-[11px] ${isReady ? "text-emerald-300" : "text-amber-300/90"}`} aria-live="polite">
+                        <div className={`mt-2 flex items-center gap-1.5 text-[11px] ${isReady ? "text-emerald-300" : "text-amber-300/90"}`} aria-live="polite">
                           <svg className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" aria-hidden="true">
                             {isReady
                               ? <path d="m5 12 4 4L19 6" strokeLinecap="round" strokeLinejoin="round" />
@@ -1914,6 +1952,7 @@ export default function UploadZone({
                         </div>
                       </div>
                     )}
+                    </div>
                   </section>
                 );
               })()}
