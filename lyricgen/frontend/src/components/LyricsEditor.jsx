@@ -301,6 +301,11 @@ export default function LyricsEditor({
   lineTransition = "none",
   transcribeJobId = null,
   onPersistSegments = null,
+  // Versión B, parte 2 (2026-07-15): callback del padre que hace el POST
+  // /jobs/{id}/reanchor (re-anclado CTC del timing con el texto corregido).
+  // El botón "Re-sincronizar con IA" solo se muestra si el padre lo pasa Y
+  // features.anchor_lyrics está activo (flag ANCHOR_LYRICS_ENABLED).
+  onReanchor = null,
   // Synchronous per-edit callback (no debounce). Parent receives the
   // current cleaned segments on every change. Required by the /edit
   // modal so it can include the latest segments in the body of
@@ -960,6 +965,54 @@ export default function LyricsEditor({
     }));
     toast({ message: "Timings restaurados al original", tone: "info" });
   }, [pushEditHistory, toast]);
+
+  // Versión B, parte 2 — "Re-sincronizar con IA". Flujo:
+  //   1. Flush del estado local a /save-segments (el backend re-ancla lo
+  //      que hay en segments_json — sin esto, re-anclaría texto viejo si
+  //      el operador tipeó hace <3s y el autosave no corrió).
+  //   2. POST /jobs/{id}/reanchor vía el callback del padre.
+  //   3. Éxito → reemplazar `edited` con los segments re-anclados (mismo
+  //      seed que el mount; las líneas `locked` vuelven intactas del
+  //      backend) + toast "N re-sincronizadas, M para revisar".
+  //      Decline / error → toast de error, timings quedan como estaban.
+  // El snapshot pre-reanchor va al edit history, así Cmd+Z lo revierte.
+  const [reanchoring, setReanchoring] = useState(false);
+  const canReanchor = !!(onReanchor && transcribeJobId
+    && user?.features?.anchor_lyrics === true);
+  const handleReanchor = useCallback(async () => {
+    if (!onReanchor || !transcribeJobId || reanchoring) return;
+    setReanchoring(true);
+    try {
+      if (onPersistSegments) {
+        const cleaned = edited.map(({ _id, review, ...rest }) => rest);
+        await Promise.resolve(onPersistSegments(transcribeJobId, cleaned));
+      }
+      const res = await Promise.resolve(onReanchor(transcribeJobId));
+      if (res && res.ok && Array.isArray(res.segments) && res.segments.length) {
+        pushEditHistory();
+        setEdited(res.segments.map((s, i) => ({ ...s, _id: i })));
+        toast({
+          message: (t("editor.reanchor_done") || "{n} líneas re-sincronizadas, {m} para revisar")
+            .replace("{n}", String(res.count ?? res.segments.length))
+            .replace("{m}", String(res.review_count ?? 0)),
+          tone: "success",
+        });
+      } else {
+        toast({
+          message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
+          tone: "error",
+        });
+      }
+    } catch {
+      toast({
+        message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
+        tone: "error",
+      });
+    } finally {
+      setReanchoring(false);
+    }
+  }, [onReanchor, onPersistSegments, transcribeJobId, reanchoring, edited,
+      pushEditHistory, toast, t]);
 
   const focusSegment = useCallback((id) => {
     setFocusedSegId(id);
@@ -2410,6 +2463,38 @@ export default function LyricsEditor({
               </svg>
             )}
           </button>
+          {/* Versión B parte 2 — Re-sincronizar con IA. Reancla el timing
+              de TODAS las líneas (menos las `locked`) al audio usando el
+              texto ya corregido. Gate por features.anchor_lyrics. */}
+          {canReanchor && !syncMode && (
+            <button
+              type="button"
+              onClick={handleReanchor}
+              disabled={reanchoring}
+              data-testid="reanchor-btn"
+              title={t("editor.reanchor_hint") || "Vuelve a alinear el timing de cada línea con el audio usando el texto ya corregido. Las líneas que moviste a mano no se tocan."}
+              className={`hidden md:inline-flex shrink-0 items-center gap-1.5 h-8 px-2.5 rounded-md ring-1
+                text-[11px] font-medium transition-colors
+                ${reanchoring
+                  ? "ring-brand/20 text-ink-secondary cursor-wait"
+                  : "ring-brand/30 text-brand-light hover:bg-brand/10 hover:ring-brand/50"}`}
+            >
+              {reanchoring ? (
+                <>
+                  <span className="w-3 h-3 border-[1.5px] border-brand-light border-t-transparent rounded-full animate-spin" />
+                  {t("editor.reanchor_running") || "Re-sincronizando…"}
+                </>
+              ) : (
+                <>
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path d="M21 12a9 9 0 11-2.64-6.36" strokeLinecap="round" />
+                    <path d="M21 3v6h-6" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  {t("editor.reanchor") || "Re-sincronizar con IA"}
+                </>
+              )}
+            </button>
+          )}
           {/* Sync mode entry — refactor 2026-05-23: pasó de botón ruidoso
               con texto a ícono discreto al lado del switcher. Atajo Cmd+K
               añadido al keyboard handler. */}

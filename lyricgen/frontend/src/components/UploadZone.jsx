@@ -629,6 +629,21 @@ export default function UploadZone({
     });
   };
 
+  // Versión B (letra anclada): textarea colapsable por canción para pegar
+  // la letra oficial — viaja como `anchor_lyrics` en /transcribe-uploaded
+  // y el backend la ancla al motor CTC. Gate por features.anchor_lyrics
+  // (ANCHOR_LYRICS_ENABLED en el server): sin flag no se muestra, así no
+  // prometemos una sincronización que el backend va a ignorar.
+  const anchorLyricsEligible = user?.features?.anchor_lyrics === true;
+  const [expandedLyrics, setExpandedLyrics] = useState(() => new Set());
+  const toggleLyrics = (idx) => {
+    setExpandedLyrics((prev) => {
+      const next = new Set(prev);
+      if (next.has(idx)) next.delete(idx); else next.add(idx);
+      return next;
+    });
+  };
+
   useEffect(() => {
     if (!onDeliveryChange) return;
     onDeliveryChange({
@@ -1795,6 +1810,64 @@ export default function UploadZone({
                   </span>
                 </span>
               </label>
+              {/* Versión B — letra oficial (opcional). Colapsable para no
+                  ensanchar la fila del batch; si ya hay texto pegado, el
+                  contador de líneas queda visible aunque esté colapsado. */}
+              {anchorLyricsEligible && (() => {
+                const isLyricsOpen = expandedLyrics.has(i);
+                const lineCount = (entry.anchorLyrics || "")
+                  .split("\n").filter((l) => l.trim()).length;
+                return (
+                  <div>
+                    <button
+                      type="button"
+                      onClick={() => toggleLyrics(i)}
+                      className="flex items-center gap-1.5 text-[11px] text-gray-500 hover:text-gray-300 transition-colors"
+                    >
+                      <svg
+                        className={`w-3 h-3 transition-transform ${isLyricsOpen ? "rotate-180" : ""}`}
+                        fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"
+                      >
+                        <polyline points="6 9 12 15 18 9" />
+                      </svg>
+                      <span className="font-medium text-gray-300">
+                        {t("upload.anchor_lyrics_toggle") || "¿Tenés la letra oficial?"}
+                      </span>
+                      <span className="text-gray-600">
+                        {t("upload.anchor_lyrics_hint") || "Pegala y la sincronizamos exacta con el audio."}
+                      </span>
+                      {lineCount > 0 && (
+                        <span className="ml-auto shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-brand/15 text-brand-light tabular-nums">
+                          {lineCount === 1
+                            ? (t("upload.anchor_lyrics_line") || "1 línea")
+                            : (t("upload.anchor_lyrics_lines") || "{n} líneas").replace("{n}", lineCount)}
+                        </span>
+                      )}
+                    </button>
+                    {isLyricsOpen && (
+                      <div className="mt-1.5 animate-fade-in">
+                        <textarea
+                          value={entry.anchorLyrics || ""}
+                          onChange={(e) => updateField(i, "anchorLyrics", e.target.value)}
+                          placeholder={t("upload.anchor_lyrics_placeholder") || "Pegá la letra acá — una línea por verso, sin timestamps."}
+                          rows={6}
+                          maxLength={20000}
+                          className="w-full px-3 py-2 rounded-lg bg-surface-1 border border-white/[0.06]
+                            focus:border-brand/50 focus:outline-none text-sm text-white placeholder-gray-500
+                            transition-all resize-y leading-relaxed"
+                        />
+                        {lineCount > 0 && (
+                          <p className="text-[11px] text-gray-600 mt-0.5 text-right tabular-nums">
+                            {lineCount === 1
+                              ? (t("upload.anchor_lyrics_line") || "1 línea")
+                              : (t("upload.anchor_lyrics_lines") || "{n} líneas").replace("{n}", lineCount)}
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
               {/* Language pills. Default 'es' is highlighted on file
                   load — operator can click another to override, or
                   click 'auto' to let Whisper detect (not recommended

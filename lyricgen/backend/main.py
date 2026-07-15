@@ -1238,6 +1238,9 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
                 "scenes": has_scenes_access(user),
                 "scenes_credit_cost": scenes_credit_cost(),
                 "telemetry": telemetry_enabled(),
+                # Versión B (letra anclada): el frontend gatea el textarea
+                # del wizard y el botón "Re-sincronizar con IA" con esto.
+                "anchor_lyrics": _anchor_lyrics_enabled(),
             },
         },
     }
@@ -1338,6 +1341,9 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
                 "scenes": has_scenes_access(user),
                 "scenes_credit_cost": scenes_credit_cost(),
                 "telemetry": telemetry_enabled(),
+                # Versión B (letra anclada): el frontend gatea el textarea
+                # del wizard y el botón "Re-sincronizar con IA" con esto.
+                "anchor_lyrics": _anchor_lyrics_enabled(),
             },
         },
     }
@@ -1406,6 +1412,9 @@ def me(current_user: dict = Depends(get_current_user), db: Session = Depends(get
             "scenes": has_scenes_access(_u),
             "scenes_credit_cost": scenes_credit_cost(),
             "telemetry": telemetry_enabled(),
+            # Versión B (letra anclada): el frontend gatea el textarea
+            # del wizard y el botón "Re-sincronizar con IA" con esto.
+            "anchor_lyrics": _anchor_lyrics_enabled(),
         },
     }
 
@@ -5031,6 +5040,17 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
     return result
 
 
+def _anchor_lyrics_enabled() -> bool:
+    """Feature flag de la Versión B (letra anclada, default OFF).
+
+    Un solo lector del env para que /transcribe-uploaded (vía
+    `_maybe_anchor_align`), POST /jobs/{id}/reanchor y los `features`
+    de /auth/* (el frontend gatea la UI con esto) no puedan divergir
+    en el parsing del valor."""
+    return os.environ.get("ANCHOR_LYRICS_ENABLED", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                               anchor_lyrics: str):
     """Versión B — anclar la letra OFICIAL del operador al motor CTC
@@ -5052,8 +5072,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
     pinta amarillo esas líneas para que el operador las revise."""
     _stem = None
     try:
-        if os.environ.get("ANCHOR_LYRICS_ENABLED", "0").strip().lower() not in (
-                "1", "true", "yes", "on"):
+        if not _anchor_lyrics_enabled():
             return result
         if not isinstance(result, dict) or not (anchor_lyrics or "").strip():
             return result
@@ -9556,6 +9575,203 @@ async def save_segments(
         "job_id": job_id,
         "saved_at": job.last_user_activity_at.isoformat() if job.last_user_activity_at else None,
         "count": len(segs),
+    }
+
+
+# Mismos estados en los que el LyricsEditor está operativamente montado
+# (ver _SAVE_SEGMENTS_ALLOWED en save_segments): si el operador puede
+# corregir texto ahí, puede pedir el re-anclado ahí.
+_REANCHOR_ALLOWED = (
+    "transcribed_pending", "transcribed", "pending_review", "rejected", "editing", "done",
+)
+
+
+@app.post("/jobs/{job_id}/reanchor")
+@limiter.limit("6/minute")
+async def reanchor_segments(
+    request: Request,
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Versión B, parte 2 (2026-07-15): re-anclar el timing DESPUÉS de que
+    el operador corrigió el TEXTO en el editor.
+
+    Toma los segments actuales del job (`segments_json`, ya persistidos por
+    el autosave de /save-segments), usa su texto como letra ancla y corre la
+    misma `_maybe_anchor_align` del flujo de subida (motor CTC, paridad
+    Rotor). Reglas:
+
+    - Auth y status gate idénticos a /save-segments (owner + tenant, editor
+      montado).
+    - Gate por ANCHOR_LYRICS_ENABLED (mismo flag que el anclado en upload).
+    - Líneas con `locked: true` (timing arrastrado a mano por el operador)
+      NO se pisan — el ancla incluye su texto para que la alineación sea
+      monotónica, pero su timing persiste tal cual.
+    - Decline del motor / flag off a mitad de camino → 200 {ok: false} y
+      los segments quedan intactos (mismo contrato "nunca rompe" del helper).
+    - En éxito persiste el timing re-anclado en segments_json y devuelve
+      los segments mergeados para que el editor se refresque sin re-fetch.
+    """
+    from jobs import get_job_model, touch_user_activity
+
+    job = get_job_model(db, job_id)
+    if (not job
+            or job.user_id != current_user["id"]
+            or job.tenant_id != current_user["tenant_id"]):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if not _anchor_lyrics_enabled():
+        # Flag off → el server no tiene la Versión B habilitada. 409 (no
+        # 404) para no confundir con "job inexistente"; el frontend ni
+        # muestra el botón sin features.anchor_lyrics.
+        raise HTTPException(
+            status_code=409,
+            detail="El re-anclado no está habilitado en este servidor.",
+        )
+    if job.status not in _REANCHOR_ALLOWED:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"reanchor requires status in {_REANCHOR_ALLOWED} "
+                f"(current: {job.status})"
+            ),
+        )
+
+    prev_segs = [dict(s) for s in (job.segments_json or [])
+                 if isinstance(s, dict)]
+    anchor_lines = [(s.get("text") or "").strip() for s in prev_segs]
+    n_lines = sum(1 for _t in anchor_lines if _t)
+    if n_lines < 3:
+        # Mismo umbral que _maybe_anchor_align — con <3 líneas el motor
+        # declina siempre; 422 acá da un mensaje accionable en vez de un
+        # {ok: false} opaco.
+        raise HTTPException(
+            status_code=422,
+            detail="Se necesitan al menos 3 líneas con texto para re-sincronizar.",
+        )
+
+    # SNAPSHOT + release (mismo patrón que /transcribe-uploaded, incidente
+    # agus77 06/07): la descarga de R2 + el CTC pueden tardar minutos y no
+    # podemos tener la sesión checked-out todo ese tiempo.
+    _r2_key = job.input_r2_key
+    _row_filename = job.filename or ""
+    db.close()
+
+    job_dir = os.path.join(OUTPUTS_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    audio_path = os.path.join(job_dir, _row_filename) if _row_filename else ""
+    if not audio_path or (not os.path.exists(audio_path) and not _r2_key):
+        raise HTTPException(
+            status_code=409,
+            detail="El audio original ya no está disponible para este job.",
+        )
+    if not os.path.exists(audio_path):
+        import asyncio as _asyncio
+        _loop = _asyncio.get_event_loop()
+        for _attempt in range(3):
+            # boto3 es síncrono — executor para no bloquear el event loop
+            # (mismo patrón que /transcribe-uploaded).
+            _ok = await _loop.run_in_executor(
+                None, storage.download_object, _r2_key, audio_path,
+            )
+            if _ok:
+                break
+            if _attempt < 2:
+                await _asyncio.sleep(0.5 * (2 ** _attempt))
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail="No pudimos leer el audio original. Reintentá en unos segundos.",
+            )
+
+    anchor_text = "\n".join(_t for _t in anchor_lines if _t)
+    out = await _maybe_anchor_align(
+        {"segments": prev_segs}, audio_path, job_id, anchor_text,
+    )
+    anchored = out.get("segments") if isinstance(out, dict) else None
+    if (not isinstance(out, dict)
+            or out.get("timing_source") != "anchor_ctc"
+            or not isinstance(anchored, list)
+            or len(anchored) != n_lines):
+        # Decline seguro (flag/engine/mismatch de líneas) — los segments
+        # del operador quedan intactos, igual que la Versión A en upload.
+        logger.info("[REANCHOR] declined job=%s (n_lines=%d)", job_id, n_lines)
+        return {
+            "ok": False,
+            "reason": "declined",
+            "job_id": job_id,
+            "count": len(prev_segs),
+            "review_count": 0,
+            "locked_kept": 0,
+        }
+
+    # Merge: los segs re-anclados corresponden 1:1 (en orden) a los segs
+    # previos con texto no vacío. Se preservan las keys extra del original
+    # (_id, pos/scale/rot, estilo) y el timing de las líneas `locked`.
+    merged = []
+    review_count = 0
+    locked_kept = 0
+    _ai = 0
+    for seg, _text in zip(prev_segs, anchor_lines):
+        if not _text:
+            merged.append(seg)
+            continue
+        new_seg = anchored[_ai]
+        _ai += 1
+        if seg.get("locked"):
+            locked_kept += 1
+            merged.append(seg)
+            continue
+        m = dict(seg)
+        m["start"] = new_seg.get("start", seg.get("start"))
+        m["end"] = new_seg.get("end", seg.get("end"))
+        if new_seg.get("words") is not None:
+            m["words"] = new_seg["words"]
+        if new_seg.get("review"):
+            m["review"] = True
+            review_count += 1
+        else:
+            m.pop("review", None)
+        merged.append(m)
+    # Mismo contrato de orden monotónico que /save-segments.
+    merged = sorted(merged, key=lambda s: float(s.get("start", 0) or 0))
+
+    # Persistir con sesión corta (la del request se soltó antes del I/O).
+    from database import SessionLocal as _SL
+    _db2 = _SL()
+    try:
+        row = get_job_model(_db2, job_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Job not found.")
+        row.segments_json = merged
+        touch_user_activity(_db2, row)
+        try:
+            from database import AuditLog
+            _db2.add(AuditLog(
+                user_id=current_user["id"],
+                action="lyrics.reanchor",
+                detail={
+                    "job_id": job_id,
+                    "n_lines": len(merged),
+                    "review_count": review_count,
+                    "locked_kept": locked_kept,
+                },
+            ))
+        except Exception as e:  # noqa: BLE001 — audit best-effort
+            logger.warning("[REANCHOR] audit log failed: %s", e)
+        _db2.commit()
+    finally:
+        _db2.close()
+
+    logger.info("[REANCHOR] ok job=%s lines=%d review=%d locked_kept=%d",
+                job_id, len(merged), review_count, locked_kept)
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "count": len(merged),
+        "review_count": review_count,
+        "locked_kept": locked_kept,
+        "segments": merged,
     }
 
 

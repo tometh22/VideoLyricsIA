@@ -2110,6 +2110,14 @@ export default function App() {
         // el jobId y puede reusar este job en vez de crear uno nuevo.
         prefetchCache.current[key] = { status: "loading", jobId };
         setRowStatus(file, "queued");
+        // Versión B (letra anclada): re-leer la entry FRESCA por identidad
+        // de archivo antes del POST. El prefetch arranca al drop, pero el
+        // operador pega la letra oficial DESPUÉS — la referencia `entry`
+        // capturada al armar la cola quedó vieja (updateField crea objetos
+        // nuevos). Para cuando el upload a R2 terminó y este POST sale, la
+        // versión fresca ya suele tener la letra pegada.
+        const fresh = (filesRef.current || [])
+          .find((e) => e?.file && prefetchKey(e.file) === key) || entry;
         const res = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2119,6 +2127,7 @@ export default function App() {
             artist: entry.artist || "",
             title: (entry.songTitle || "").trim(),
             live: !!entry.live,
+            anchor_lyrics: fresh.anchorLyrics || "",
           }),
           signal: controller && controller.signal,
         }, { maxRetries: 3 });
@@ -2405,6 +2414,9 @@ export default function App() {
           artist: entry.artist || "",
           title: (entry.songTitle || "").trim(),
           live: !!entry.live,
+          // Versión B: letra oficial pegada en el wizard → el backend la
+          // ancla al motor CTC (flag ANCHOR_LYRICS_ENABLED; vacía = no-op).
+          anchor_lyrics: entry.anchorLyrics || "",
         }),
       }, {
         maxRetries: 3,
@@ -2631,6 +2643,32 @@ export default function App() {
     } catch (err) {
       console.warn("[autosave] /save-segments network error", err);
       // QA fix audit P0 #74: bubble network error to caller.
+      return { ok: false, reason: "network", error: String(err) };
+    }
+  }, []);
+
+  // Versión B, parte 2: re-anclar el timing con el texto YA corregido por
+  // el operador. El backend toma segments_json (el autosave de arriba lo
+  // dejó fresco), usa el texto como ancla del motor CTC y persiste el
+  // timing re-anclado respetando las líneas `locked`. Devuelve el payload
+  // del endpoint ({ok, count, review_count, segments}) para que el
+  // LyricsEditor refresque su estado y muestre el toast de resultado.
+  const reanchorSegmentsOnBackend = useCallback(async (jobId) => {
+    if (!jobId) return { ok: false, reason: "no-job" };
+    try {
+      const res = await authFetch(`${API}/jobs/${jobId}/reanchor`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      if (!res.ok) {
+        let detail = "";
+        try { detail = (await res.clone().json())?.detail || ""; } catch { /* non-JSON body */ }
+        console.warn("[reanchor] failed", res.status, detail);
+        return { ok: false, reason: `http-${res.status}`, status: res.status, detail };
+      }
+      return await res.json();
+    } catch (err) {
+      console.warn("[reanchor] network error", err);
       return { ok: false, reason: "network", error: String(err) };
     }
   }, []);
@@ -3984,6 +4022,7 @@ export default function App() {
             // en este flow es null). Orden importante: editingJobId gana.
             transcribeJobId={currentReview.editingJobId || currentReview.transcribeJobId || null}
             onPersistSegments={persistSegmentsToBackend}
+            onReanchor={reanchorSegmentsOnBackend}
             // QA fix 2026-05-28 (bug #2): synchronous mirror del estado
             // local del LyricsEditor a currentReview.segments para que el
             // WizardLivePreview central (que lee `reviewSegments`) refleje
