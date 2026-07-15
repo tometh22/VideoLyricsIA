@@ -37,8 +37,9 @@ from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import ObjectDeletedError
 
 from auth import (
     authenticate_user,
@@ -152,6 +153,49 @@ limiter = Limiter(
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# --- Graceful DB-pressure / race handlers ---
+# Two SQLAlchemy exceptions were reaching Sentry as *unhandled* 500s (and,
+# through the BaseHTTPMiddleware task group, as noisy "ExceptionGroup:
+# unhandled errors in a TaskGroup") even though each has a correct, non-500
+# HTTP semantics. Handling them here converts the crash into the right
+# status code AND stops it from being captured as an error event.
+#
+#   - pool TimeoutError: every connection in the per-process pool is checked
+#     out and the 30s checkout wait elapsed (seen in get_current_user under
+#     UMG polling bursts). This is backpressure, not a bug — 503 + Retry-After
+#     tells our own polling frontend to back off and retry instead of erroring.
+#
+#   - ObjectDeletedError: the row (typically a Job) was hard-deleted by the
+#     reaper or a concurrent bulk-delete while this request still held the ORM
+#     object and then touched a lazy attribute. The resource is simply gone,
+#     so 404 is the honest answer — same as if the id had never existed.
+async def _pool_timeout_handler(request: Request, exc: SQLAlchemyTimeoutError):
+    logger.warning(
+        "DB pool exhausted on %s %s — returning 503 (backpressure, not a crash)",
+        request.method, request.url.path,
+    )
+    return JSONResponse(
+        {"detail": "El servidor está momentáneamente saturado. Reintentá en unos segundos."},
+        status_code=503,
+        headers={"Retry-After": "3"},
+    )
+
+
+async def _object_deleted_handler(request: Request, exc: ObjectDeletedError):
+    logger.info(
+        "ObjectDeleted on %s %s — row removed mid-request (reaper/bulk-delete race), returning 404",
+        request.method, request.url.path,
+    )
+    return JSONResponse(
+        {"detail": "El recurso ya no existe."},
+        status_code=404,
+    )
+
+
+app.add_exception_handler(SQLAlchemyTimeoutError, _pool_timeout_handler)
+app.add_exception_handler(ObjectDeletedError, _object_deleted_handler)
 app.add_middleware(SlowAPIMiddleware)
 
 # Response compression. FastAPI doesn't enable this by default — a known
