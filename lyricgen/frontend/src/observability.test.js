@@ -95,4 +95,14 @@ describe("shouldForwardConsoleEvent", () => {
     expect(shouldForwardConsoleEvent("warning suelto de una lib", 3_000_000))
       .toEqual({ forward: false, tag: null });
   });
+
+  it("descarta tags benignos de ciclo de vida (auto-update) sin perder el tag", () => {
+    // "[auto-update] new build detected — reloading" es ruido puro: dispara en
+    // cada deploy que un cliente levanta. No debe aparecer como issue, pero un
+    // loop real de reload lo cubre el freeze tag `editor-reload-loop`.
+    const r = shouldForwardConsoleEvent("[auto-update] new build detected — reloading to update", 4_000_000);
+    expect(r).toEqual({ forward: false, tag: "auto-update" });
+    // Repetido tampoco forwardea (no es cuestión de throttle, es drop directo).
+    expect(shouldForwardConsoleEvent("[auto-update] otra vez", 9_000_000).forward).toBe(false);
+  });
 });
