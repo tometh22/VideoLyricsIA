@@ -111,10 +111,22 @@ const _FREEZE_TAGS = new Set([
   "ui-longtask-burst",
 ]);
 
+// Benign lifecycle chatter, not diagnostics — forwarding these only clutters
+// the Sentry issue list and buries real errors. "[auto-update] new build
+// detected — reloading" fires on every deploy a client picks up (dozens of
+// events, zero signal). A genuine reload LOOP is caught separately by the
+// `editor-reload-loop` freeze tag above, so dropping the plain lifecycle
+// event here loses no signal. Keep this set TINY and provably-benign — every
+// other tag is a diagnostic we deliberately forward.
+const _BENIGN_TAGS = new Set([
+  "auto-update",
+]);
+
 /** Decide si un mensaje de consola se forwardea. Exportado para tests. */
 export function shouldForwardConsoleEvent(message, now = Date.now()) {
   const tag = consoleTagOf(message);
   if (!tag) return { forward: false, tag: null };
+  if (_BENIGN_TAGS.has(tag)) return { forward: false, tag };
   const last = _lastSentByTag.get(tag) || 0;
   if (now - last < _TAG_THROTTLE_MS) return { forward: false, tag };
   _lastSentByTag.set(tag, now);
