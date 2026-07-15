@@ -629,20 +629,18 @@ export default function UploadZone({
     });
   };
 
-  // Versión B (letra anclada): textarea colapsable por canción para pegar
-  // la letra oficial — viaja como `anchor_lyrics` en /transcribe-uploaded
-  // y el backend la ancla al motor CTC. Gate por features.anchor_lyrics
-  // (ANCHOR_LYRICS_ENABLED en el server): sin flag no se muestra, así no
-  // prometemos una sincronización que el backend va a ignorar.
+  // Versión B (letra anclada): selector prominente de dos opciones por
+  // canción — "Transcripción con IA de Genly" (default) vs "Tengo la letra
+  // oficial" (expande el textarea; viaja como `anchor_lyrics` en
+  // /transcribe-uploaded y el backend la ancla al motor CTC). La elección
+  // vive en entry.lyricsSource ("auto" | "official") — App.jsx solo manda
+  // anchor_lyrics cuando la selección es "official", así volver a la IA
+  // desactiva el anclado sin perder el texto pegado. Gate por
+  // features.anchor_lyrics (ANCHOR_LYRICS_ENABLED en el server): sin flag
+  // no se muestra, así no prometemos una sincronización que el backend va
+  // a ignorar. Iteración #908→v2 (feedback dueño de producto 15/07): el
+  // toggle colapsado era invisible y no comunicaba la alternativa.
   const anchorLyricsEligible = user?.features?.anchor_lyrics === true;
-  const [expandedLyrics, setExpandedLyrics] = useState(() => new Set());
-  const toggleLyrics = (idx) => {
-    setExpandedLyrics((prev) => {
-      const next = new Set(prev);
-      if (next.has(idx)) next.delete(idx); else next.add(idx);
-      return next;
-    });
-  };
 
   useEffect(() => {
     if (!onDeliveryChange) return;
@@ -1810,41 +1808,72 @@ export default function UploadZone({
                   </span>
                 </span>
               </label>
-              {/* Versión B — letra oficial (opcional). Colapsable para no
-                  ensanchar la fila del batch; si ya hay texto pegado, el
-                  contador de líneas queda visible aunque esté colapsado. */}
+              {/* Versión B v2 — selector prominente "IA de Genly vs letra
+                  oficial" (feedback #908: el toggle colapsado era invisible
+                  y no comunicaba que la alternativa es la transcripción con
+                  IA). Dos cards segmentadas; la B expande el textarea. En A
+                  el card no crece: solo las dos cards compactas. */}
               {anchorLyricsEligible && (() => {
-                const isLyricsOpen = expandedLyrics.has(i);
+                const isOfficial = entry.lyricsSource === "official";
                 const lineCount = (entry.anchorLyrics || "")
                   .split("\n").filter((l) => l.trim()).length;
+                const lineBadge = lineCount === 1
+                  ? (t("upload.anchor_lyrics_line") || "1 línea")
+                  : (t("upload.anchor_lyrics_lines") || "{n} líneas").replace("{n}", lineCount);
                 return (
-                  <div>
-                    <button
-                      type="button"
-                      onClick={() => toggleLyrics(i)}
-                      className="flex items-center gap-1.5 text-[11px] text-gray-500 hover:text-gray-300 transition-colors"
-                    >
-                      <svg
-                        className={`w-3 h-3 transition-transform ${isLyricsOpen ? "rotate-180" : ""}`}
-                        fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"
+                  <div data-testid={`lyrics-source-${i}`}>
+                    <span className="block text-[11px] uppercase tracking-wide font-medium text-gray-400 mb-1">
+                      {t("upload.lyrics_source_label") || "Letra"}
+                    </span>
+                    <div className="grid grid-cols-2 gap-1.5" role="radiogroup"
+                      aria-label={t("upload.lyrics_source_label") || "Letra"}>
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={!isOfficial}
+                        data-testid={`lyrics-source-ai-${i}`}
+                        onClick={() => updateField(i, "lyricsSource", "auto")}
+                        className={`text-left px-2.5 py-2 rounded-lg ring-1 transition-all
+                          ${!isOfficial
+                            ? "ring-brand/60 bg-brand/[0.12] shadow-[0_0_12px_rgba(124,58,237,0.15)]"
+                            : "ring-white/[0.06] bg-surface-1/60 hover:ring-white/[0.14] hover:bg-white/[0.03]"}`}
                       >
-                        <polyline points="6 9 12 15 18 9" />
-                      </svg>
-                      <span className="font-medium text-gray-300">
-                        {t("upload.anchor_lyrics_toggle") || "¿Tenés la letra oficial?"}
-                      </span>
-                      <span className="text-gray-600">
-                        {t("upload.anchor_lyrics_hint") || "Pegala y la sincronizamos exacta con el audio."}
-                      </span>
-                      {lineCount > 0 && (
-                        <span className="ml-auto shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-brand/15 text-brand-light tabular-nums">
-                          {lineCount === 1
-                            ? (t("upload.anchor_lyrics_line") || "1 línea")
-                            : (t("upload.anchor_lyrics_lines") || "{n} líneas").replace("{n}", lineCount)}
+                        <span className={`flex items-center gap-1.5 text-[12px] font-semibold
+                          ${!isOfficial ? "text-brand-light" : "text-gray-300"}`}>
+                          <span aria-hidden="true">✨</span>
+                          {t("upload.lyrics_source_ai") || "Transcripción con IA de Genly"}
                         </span>
-                      )}
-                    </button>
-                    {isLyricsOpen && (
+                        <span className="block mt-0.5 text-[11px] leading-snug text-gray-500">
+                          {t("upload.lyrics_source_ai_sub") || "Detectamos y sincronizamos la letra automáticamente."}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={isOfficial}
+                        data-testid={`lyrics-source-official-${i}`}
+                        onClick={() => updateField(i, "lyricsSource", "official")}
+                        className={`text-left px-2.5 py-2 rounded-lg ring-1 transition-all
+                          ${isOfficial
+                            ? "ring-brand/60 bg-brand/[0.12] shadow-[0_0_12px_rgba(124,58,237,0.15)]"
+                            : "ring-white/[0.06] bg-surface-1/60 hover:ring-white/[0.14] hover:bg-white/[0.03]"}`}
+                      >
+                        <span className={`flex items-center gap-1.5 text-[12px] font-semibold
+                          ${isOfficial ? "text-brand-light" : "text-gray-300"}`}>
+                          <span aria-hidden="true">📝</span>
+                          {t("upload.lyrics_source_official") || "Tengo la letra oficial"}
+                          {lineCount > 0 && (
+                            <span className="ml-auto shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-brand/20 text-brand-light tabular-nums">
+                              {lineBadge}
+                            </span>
+                          )}
+                        </span>
+                        <span className="block mt-0.5 text-[11px] leading-snug text-gray-500">
+                          {t("upload.anchor_lyrics_hint") || "Pegala y la sincronizamos exacta con el audio."}
+                        </span>
+                      </button>
+                    </div>
+                    {isOfficial && (
                       <div className="mt-1.5 animate-fade-in">
                         <textarea
                           value={entry.anchorLyrics || ""}
@@ -1852,17 +1881,19 @@ export default function UploadZone({
                           placeholder={t("upload.anchor_lyrics_placeholder") || "Pegá la letra acá — una línea por verso, sin timestamps."}
                           rows={6}
                           maxLength={20000}
-                          className="w-full px-3 py-2 rounded-lg bg-surface-1 border border-white/[0.06]
-                            focus:border-brand/50 focus:outline-none text-sm text-white placeholder-gray-500
+                          autoFocus
+                          className="w-full px-3 py-2 rounded-lg bg-surface-1 border border-brand/30
+                            focus:border-brand/60 focus:outline-none text-sm text-white placeholder-gray-500
                             transition-all resize-y leading-relaxed"
                         />
-                        {lineCount > 0 && (
-                          <p className="text-[11px] text-gray-600 mt-0.5 text-right tabular-nums">
-                            {lineCount === 1
-                              ? (t("upload.anchor_lyrics_line") || "1 línea")
-                              : (t("upload.anchor_lyrics_lines") || "{n} líneas").replace("{n}", lineCount)}
+                        <div className="flex items-center justify-between mt-0.5">
+                          <p className="text-[11px] text-gray-600">
+                            {t("upload.anchor_lyrics_empty_hint") || "Si la dejás vacía, usamos la transcripción con IA."}
                           </p>
-                        )}
+                          {lineCount > 0 && (
+                            <p className="text-[11px] text-brand-light tabular-nums">{lineBadge}</p>
+                          )}
+                        </div>
                       </div>
                     )}
                   </div>
