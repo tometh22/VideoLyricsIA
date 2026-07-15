@@ -2130,7 +2130,7 @@ export default function App() {
             title: (entry.songTitle || "").trim(),
             live: !!entry.live,
             anchor_lyrics: fresh.lyricsSource === "official"
-              ? (fresh.anchorLyrics || "") : "",
+              ? (fresh.anchorLyrics || "").trim() : "",
           }),
           signal: controller && controller.signal,
         }, { maxRetries: 3 });
@@ -2422,7 +2422,7 @@ export default function App() {
           // v2: gated por el selector — volver a "IA de Genly" desactiva
           // el anclado aunque el textarea conserve texto.
           anchor_lyrics: entry.lyricsSource === "official"
-            ? (entry.anchorLyrics || "") : "",
+            ? (entry.anchorLyrics || "").trim() : "",
         }),
       }, {
         maxRetries: 3,
