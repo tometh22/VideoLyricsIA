@@ -59,42 +59,60 @@ function _setAudioCurrentTime(container, t) {
   fireEvent.timeUpdate(audio);
 }
 
-describe("LyricsEditor — review:true banner UX (2026-05-26)", () => {
-  // Cuando synced-direct fallback (PR #365) dispara, TODAS las líneas
-  // vienen con `review: true`. Mostrar 28 badges "⚠ revisar tiempo"
-  // apilados satura visualmente. Si ≥3 segments son review, debe
-  // aparecer un banner ÚNICO arriba y los badges per-línea suprimirse.
-  // Casos con <3 review siguen mostrando badge inline (info útil sin
-  // saturar).
-  it("muestra UN banner único cuando ≥3 segments son review:true", () => {
+describe("LyricsEditor — banner de confianza + señal review calma (2026-07)", () => {
+  // Rediseño: el borde/anillo ámbar completo + banner de alarma hacían
+  // parecer todo roto con 11/26 líneas review, cuando el sync salió
+  // excelente. Ahora: banner ÚNICO positivo con navegador secuencial, y
+  // señal per-línea SUTIL (barra izquierda ámbar), sin pill ni ring.
+  it("muestra un banner de confianza con contador cuando hay líneas review", () => {
     const props = baseProps({
       segments: [
         { start: 27.7, end: 33.7, text: "Tanto tiempo te esperé sentado aquí", review: true },
         { start: 33.7, end: 39.4, text: "Que ya el invierno me alcanzó sin gamulán", review: true },
         { start: 39.4, end: 42.1, text: "Será por eso que hoy estamos aquí", review: true },
-        { start: 42.1, end: 45.9, text: "No hay nadie más que vos y yo", review: true },
+        { start: 42.1, end: 45.9, text: "No hay nadie más que vos y yo", review: false },
       ],
     });
     render(<LyricsEditor {...props} />);
-    // Banner único arriba
-    expect(screen.getByText(/líneas con timing aproximado/i)).toBeInTheDocument();
-    // Per-line badge "revisar tiempo" NO debe aparecer (suprimido por banner)
+    // Mensaje positivo (no de alarma) + contador de líneas a revisar.
+    expect(screen.getByText(/Sincronizado con tu letra/i)).toBeInTheDocument();
+    expect(screen.getByText(/3 líneas para revisar/i)).toBeInTheDocument();
+    // El botón navegador "Revisar →" está presente.
+    expect(screen.getByTestId("review-next-btn")).toBeInTheDocument();
+    // La pill per-línea "revisar tiempo" quedó eliminada.
     expect(screen.queryAllByText(/^revisar tiempo$/i)).toHaveLength(0);
   });
 
-  it("NO muestra banner cuando <3 segments son review:true — fallback a badges per-línea", () => {
+  it("el banner aparece incluso con UNA sola línea review (singular)", () => {
     const props = baseProps({
       segments: [
         { start: 1.0, end: 2.0, text: "alpha", review: true },
-        { start: 2.0, end: 3.0, text: "beta", review: true },        // solo 2 review
+        { start: 2.0, end: 3.0, text: "beta", review: false },
         { start: 3.0, end: 4.0, text: "gamma", review: false },
       ],
     });
     render(<LyricsEditor {...props} />);
-    expect(screen.queryByText(/líneas con timing aproximado/i)).toBeNull();
-    // En cambio, los badges per-línea siguen apareciendo (2 review)
-    const badges = screen.getAllByText(/^revisar tiempo$/i);
-    expect(badges.length).toBe(2);
+    expect(screen.getByText(/Sincronizado con tu letra/i)).toBeInTheDocument();
+    expect(screen.getByText(/1 línea para revisar/i)).toBeInTheDocument();
+  });
+
+  it("'Revisar →' hace foco en la siguiente línea review (navegador secuencial)", () => {
+    const props = baseProps({
+      segments: [
+        { start: 1.0, end: 2.0, text: "buena", review: false },
+        { start: 2.0, end: 3.0, text: "revisar una", review: true },
+        { start: 3.0, end: 4.0, text: "revisar dos", review: true },
+      ],
+    });
+    const { container } = render(<LyricsEditor {...props} />);
+    // jsdom no implementa scrollIntoView — stubearlo para no romper.
+    window.HTMLElement.prototype.scrollIntoView = vi.fn();
+    fireEvent.click(screen.getByTestId("review-next-btn"));
+    // El input de la primera línea review recibe foco.
+    expect(document.activeElement).toBe(screen.getByDisplayValue("revisar una"));
+    // Segundo click → la siguiente review.
+    fireEvent.click(screen.getByTestId("review-next-btn"));
+    expect(document.activeElement).toBe(screen.getByDisplayValue("revisar dos"));
   });
 
   it("NO muestra banner cuando ningún segment es review", () => {
@@ -105,7 +123,8 @@ describe("LyricsEditor — review:true banner UX (2026-05-26)", () => {
       ],
     });
     render(<LyricsEditor {...props} />);
-    expect(screen.queryByText(/líneas con timing aproximado/i)).toBeNull();
+    expect(screen.queryByText(/Sincronizado con tu letra/i)).toBeNull();
+    expect(screen.queryByTestId("review-next-btn")).toBeNull();
   });
 });
 

@@ -856,6 +856,11 @@ export default function LyricsEditor({
   // confusing, see tapAnchor comments). Each id is auto-removed by a
   // 10s setTimeout scheduled at anchor time.
   const [highlightedIds, setHighlightedIds] = useState(() => new Set());
+  // Navegador secuencial de líneas "review" (banner "Revisar →"): cursor
+  // sobre el orden actual de review-ids + un flash breve al aterrizar en
+  // una fila para que el operador la ubique sin cazar colores.
+  const reviewNavIdxRef = useRef(-1);
+  const [flashReviewId, setFlashReviewId] = useState(null);
   // Toast for per-anchor confirmation feedback.
   const { toast } = useToast();
   // Global timing offset panel — UX entry point for "the whole song is
@@ -1460,6 +1465,31 @@ export default function LyricsEditor({
     if (autoplay && a.paused) a.play().catch(() => {});
   }, []);
 
+  // "Revisar →": salta a la SIGUIENTE línea marcada review, en orden.
+  // Cicla. Hace scroll a la fila, foco al input de texto, seek del audio a
+  // su inicio (para escucharla) y un flash breve. Reemplaza el "cazá las
+  // filas pintadas" por un recorrido guiado.
+  const jumpToNextReview = useCallback(() => {
+    const reviewIds = edited.filter((s) => s.review).map((s) => s._id);
+    if (!reviewIds.length) return;
+    const next = (reviewNavIdxRef.current + 1) % reviewIds.length;
+    reviewNavIdxRef.current = next;
+    const id = reviewIds[next];
+    const seg = edited.find((s) => s._id === id);
+    const el = rowRefs.current[id];
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      const input = el.querySelector('input[type="text"]');
+      if (input) input.focus();
+    }
+    if (seg) {
+      setFocusedSegId(id);
+      seekTo(Math.max(0, seg.start), false);
+    }
+    setFlashReviewId(id);
+    setTimeout(() => setFlashReviewId((cur) => (cur === id ? null : cur)), 1200);
+  }, [edited, seekTo]);
+
   // Spacebar: in sync mode, anchors the current line; otherwise toggles
   // play/pause. Cmd/Ctrl+Z (or just Z) reverts the last anchor while
   // in sync mode so the operator can recover from a mistap.
@@ -2016,7 +2046,10 @@ export default function LyricsEditor({
   // y suprimimos los badges per-línea (el banner ya transmite la info).
   // Si <3 son review, el badge per-línea queda — es info útil sin saturar.
   const reviewSegCount = edited.reduce((n, s) => n + (s.review ? 1 : 0), 0);
-  const showReviewBanner = reviewSegCount >= 3;
+  // Banner calmo con navegador secuencial: se muestra con ≥1 línea review.
+  // Antes era ≥3 (con badges per-línea abajo); ahora el banner + la barra
+  // de acento sutil cubren cualquier cantidad sin ruido.
+  const showReviewBanner = reviewSegCount >= 1;
 
   // UX 2026-05-26 (cont.): mismo problema con la warning "● ⚠ 2 líneas" + botón
   // "Dividir" que aparece cuando el render del video va a wrappar el texto a
@@ -2521,24 +2554,40 @@ export default function LyricsEditor({
         </div>
       )}
 
-      {/* UX 2026-05-26: banner agregado cuando ≥ 3 segments tienen `review:
-          true` (típicamente porque synced-direct fallback de PR #365 emitió
-          todas las líneas con timing aproximado de lrclib synced + offset).
-          Reemplaza los 28 badges per-línea — un solo cartel transmite la
-          misma info sin saturar visualmente. */}
+      {/* Banner de CONFIANZA (2026-07): antes era un cartel ámbar de alarma
+          ("N líneas con timing aproximado") que, con 11/26 líneas + filas
+          con ring ámbar completo, hacía parecer todo roto cuando el sync
+          salió excelente (0,13s mediana). Ahora: check verde + mensaje
+          positivo "Sincronizado con tu letra · N para revisar" + navegador
+          secuencial "Revisar →" que lleva a cada línea (en vez de cazarlas
+          por color). Tono calmo, no amber. */}
       {showReviewBanner && (
-        <div className="mb-3 px-3 py-2 rounded-card bg-amber-500/[0.08] ring-1 ring-amber-500/30 flex items-start gap-2.5 animate-fade-in">
-          <svg className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <path d="M12 9v4M12 17h.01" />
-            <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+        <div className="mb-3 px-3 py-2.5 rounded-card bg-emerald-500/[0.06] ring-1 ring-emerald-500/25 flex items-center gap-3 animate-fade-in">
+          <svg className="w-5 h-5 text-emerald-400 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M20 6L9 17l-5-5" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
-          <p className="text-xs text-amber-100 leading-relaxed">
-            <span className="font-semibold">
-              {(t("editor.review_banner_count") || "{n} líneas con timing aproximado").replace("{n}", reviewSegCount)}
+          <p className="flex-1 text-xs text-ink-secondary leading-relaxed min-w-0">
+            <span className="font-semibold text-white">
+              {t("editor.review_synced_title") || "Sincronizado con tu letra"}
             </span>
-            {" — "}
-            {t("editor.review_banner_hint") || "estas líneas vienen de la letra de referencia. Escuchá la canción y ajustá si alguna no entra en el momento correcto."}
+            {" · "}
+            {(reviewSegCount === 1
+              ? (t("editor.review_synced_one") || "1 línea para revisar")
+              : (t("editor.review_synced_count") || "{n} líneas para revisar").replace("{n}", reviewSegCount))}
           </p>
+          <button
+            type="button"
+            onClick={jumpToNextReview}
+            data-testid="review-next-btn"
+            title={t("editor.review_next_hint") || "Saltar a la siguiente línea para revisar"}
+            className="shrink-0 inline-flex items-center gap-1.5 text-[11px] font-semibold px-3 py-1.5 rounded-lg
+              bg-amber-500/10 ring-1 ring-amber-400/30 text-amber-200 hover:bg-amber-500/20 transition-colors"
+          >
+            {t("editor.review_next") || "Revisar"}
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24">
+              <path d="M5 12h14M12 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
         </div>
       )}
 
@@ -3127,9 +3176,15 @@ export default function LyricsEditor({
                 data-active={isActive && !isArmed ? "true" : "false"}
                 className={`group rounded-xl transition-all
                   ${isArmed ? "bg-brand/[0.18] ring-2 ring-brand shadow-glow scale-[1.01]" : ""}
-                  ${!isArmed && isActive ? "wlp-active-row bg-brand/15 border-l-4 border-brand pl-1 shadow-[0_0_24px_-8px_rgba(109,74,255,0.45)]" : "border-l-4 border-transparent"}
+                  ${!isArmed && isActive ? "wlp-active-row bg-brand/15 border-l-4 border-brand pl-1 shadow-[0_0_24px_-8px_rgba(109,74,255,0.45)]"
+                    /* Señal "review" CALMA (2026-07): antes un ring ámbar
+                       completo alrededor de la tarjeta leía como "roto" con
+                       11/26 líneas. Ahora sólo una barra de acento fina en el
+                       borde izquierdo (mismo grosor que la fila activa para
+                       no romper la grilla), en ámbar tenue. Sin fondo ni ring. */
+                    : `border-l-4 ${!isArmed && !isActive && !wasRecentlyAnchored && isReview ? "border-amber-400/50" : "border-transparent"}`}
                   ${!isArmed && !isActive && wasRecentlyAnchored ? "bg-brand/[0.05] ring-1 ring-brand/40" : ""}
-                  ${!isArmed && !isActive && !wasRecentlyAnchored && isReview ? "bg-amber-500/[0.06] ring-1 ring-amber-500/40" : ""}
+                  ${flashReviewId === seg._id ? "ring-1 ring-amber-400/50" : ""}
                   ${isAnchored ? "opacity-60" : ""}`}
               >
                 <div className="flex items-start gap-2 p-1">
@@ -3165,7 +3220,10 @@ export default function LyricsEditor({
                         onDoubleClick={() => startEditTimestamp(seg)}
                         title={t("editor.timestamp_hint") || "Click: ir al tiempo · Doble click: editar"}
                         className={`text-[11px] font-mono pt-2.5 w-14 text-right transition-colors
-                          ${isActive ? "text-brand-light font-semibold" : wasRecentlyAnchored ? "text-brand-light" : "text-gray-600 hover:text-brand-light"}`}
+                          ${isActive ? "text-brand-light font-semibold"
+                            : wasRecentlyAnchored ? "text-brand-light"
+                            : isReview ? "text-amber-400/80 hover:text-amber-300"
+                            : "text-gray-600 hover:text-brand-light"}`}
                       >
                         {/* Phase A 2026-05-25: indicador ▶ visible solo en
                             la fila activa para reforzar "esta es la que está
@@ -3246,7 +3304,7 @@ export default function LyricsEditor({
                       className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm
                         focus:border-brand/40 focus:outline-none hover:border-white/[0.08] transition-all
                         ${isActive && focusedSegId !== seg._id ? "text-transparent caret-transparent selection:text-white" : "text-white"}
-                        ${suggestion && !isApplied ? "border-amber-500/20" : isReview ? "border-amber-500/40" : "border-white/[0.04]"}`}
+                        ${suggestion && !isApplied ? "border-amber-500/20" : "border-white/[0.04]"}`}
                     />
                     {/* Phase A 2026-05-25: overlay karaoke word-jump (Apple
                         Music style). Solo visible cuando este segment es el
@@ -3292,16 +3350,10 @@ export default function LyricsEditor({
                         </div>
                       );
                     })()}
-                    {isReview && !showReviewBanner && (
-                      <span className="inline-flex items-center gap-1 mt-1 ml-1 px-2 py-0.5 rounded-full
-                        bg-amber-500/15 text-amber-300 text-[10px] font-medium">
-                        <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24">
-                          <path d="M12 9v4M12 17h.01" />
-                          <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
-                        </svg>
-                        {t("editor.review_badge") || "revisar tiempo"}
-                      </span>
-                    )}
+                    {/* Pill "revisar tiempo" per-línea ELIMINADO (2026-07):
+                        la barra de acento izquierda + el timestamp en ámbar
+                        ya señalan la línea sin saturar; el navegador
+                        secuencial del banner ("Revisar →") lleva a cada una. */}
                     {propagationPrompt && propagationPrompt.id === seg._id && (
                       <div className="flex items-center gap-2 mt-1.5 px-3 py-2 rounded-xl
                         bg-brand/10 ring-1 ring-brand/30 text-xs text-white">
