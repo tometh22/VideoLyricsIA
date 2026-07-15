@@ -58,28 +58,38 @@ if DATABASE_URL.startswith("postgres://"):
 #
 #   max_connections >= (api_workers + rq_workers) × (pool_size + max_overflow)
 #
-# Railway's default Postgres ships with max_connections=100. With
-# 4 API workers + 4 RQ workers = 8 processes, that leaves
-#   ceil((100 − 5_reserved_for_admin) / 8) ≈ 11 sockets per process.
-# So 5 + 5 = 10 is the most we can run *with the default DB plan*.
+# REALITY CHECK (measured on prod 2026-07-15, not assumed): prod Postgres
+# runs max_connections=200 (NOT the old "Railway default 100" this comment
+# used to claim — that stale assumption caused the api to be throttled far
+# below what the DB can actually give). Reserved-for-superuser = 3, so ~197
+# usable. At the time of measuring, prod sat at ~19 connections in use — i.e.
+# ~10% of capacity, with a huge margin.
 #
-# After fix/db-pool-streaming-scale: streaming endpoints (/preview,
-# /download, /backgrounds/.../preview, /jobs/.../events, /download/all)
-# release their pool slot before the file/SSE stream begins via
-# scoped_db(). That lifts the per-process concurrency ceiling from
-# "≤10 short queries + 0 streams" to "≤10 short queries, unbounded
-# concurrent streams". 6 + 4 is now a comfortable default — 6 steady
-# slots for the hot dashboard/auth/status endpoints, 4 overflow for
-# bursts (UMG batch submissions, multiple operators logging in
-# concurrently). The total is still 10 per process, fits the 100-cap.
+# Prod per-service env overrides + replica counts (railway.toml):
+#   api          5+5 → 10/proc × (2 replicas × 2 uvicorn = 4 proc) =  40 potential
+#   Worker       8+8 → 16/proc × 7 replicas                        = 112 potential
+#   ShortWorker  8+8 → 16/proc × 3 replicas                        =  48 potential
+# Paper worst-case sums to ~200, which is why api was pinned low. BUT the RQ
+# workers are single-threaded and hold ~1 connection each in practice (the ~10
+# idle conns observed = the 10 worker replicas), so real usage is a fraction
+# of the paper ceiling. The api can safely run 8+8 (64 potential) — the
+# constraint is the *measured* sum vs 200, not the paper sum.
 #
-# When (not if) you migrate to a bigger DB plan or front Postgres with
-# PgBouncer (see docs/SCALING.md), raise:
-#   - DB_POOL_SIZE      (steady-state per-process)
-#   - DB_MAX_OVERFLOW   (burst headroom per-process)
-# and confirm max_connections still bounds the product above. The fix
-# above changes the failure shape — the cap is now real concurrent
-# short queries, not concurrent downloads.
+# Formula that must hold under burst:
+#   max_connections >= (api_workers + rq_workers) × (pool_size + max_overflow)
+# ...but evaluate it against measured usage, not worst-case-everything-maxed,
+# or you'll under-provision the api like we did.
+#
+# scoped_db() already lifts streaming endpoints (/preview, /download,
+# /backgrounds/.../preview, /jobs/.../events, /download/all) out of the pool
+# before the file/SSE stream begins, so the real cap is concurrent *short
+# queries*, not concurrent downloads.
+#
+# Latent risk worth fixing: Worker/ShortWorker at 8+8 × 10 replicas is wildly
+# over-provisioned for single-threaded RQ — right-size them to ~3+3 to reclaim
+# paper budget before raising api further. And if you ever do approach 200,
+# front Postgres with PgBouncer (see docs/SCALING.md) rather than climbing the
+# per-process pool.
 _DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "6"))
 _DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "4"))
 
