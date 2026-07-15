@@ -187,10 +187,17 @@ export default function UploadZone({
   onGenerateDirect,
   user,
   sidebarOpen = true,
-  // 2026-05-23: auto-transcribe en background al drop. La función recibe los
-  // newEntries recién agregados y arranca uploads + transcripciones en
-  // segundo plano. La status map per file viene del App via filesnamekey.
-  onAutoTranscribe,
+  // Prefetch de transcripción disparado al AVANZAR del paso "Subí" (no al
+  // drop): cuando el operador deja el paso 1 hacia adelante, la fuente de
+  // letra + la letra oficial ya están elegidas por canción, así el POST
+  // /transcribe-uploaded sale con el anchor_lyrics correcto. App corre las
+  // uploads + transcripciones en background. La status map per file viene
+  // del App via filenamekey.
+  onUploadAdvance,
+  // Edge case (a): editar la fuente de letra / letra oficial de una canción
+  // tras haber avanzado invalida el prefetch de ESE archivo (App borra su
+  // entrada de cache) para forzar el re-transcribe con el estado nuevo.
+  onInvalidatePrefetch,
   transcribeStatusByFile = {},
   // Phase 2 (2026-05-25): render prop para el paso 6 ("Lyrics"). App.jsx
   // sigue siendo dueño del state machine de review (transcribing,
@@ -524,6 +531,15 @@ export default function UploadZone({
     if (_lockedSet.has(clamped)) return;
     if (clamped !== wizardStep) {
       track("wizard.step", { step_from: wizardStep, step_to: clamped, trigger: "nav" });
+    }
+    // Prefetch de transcripción al dejar el paso "Subí" hacia adelante: la
+    // fuente de letra + la letra oficial ya están elegidas por canción, así
+    // que el POST /transcribe-uploaded sale con el anchor_lyrics correcto
+    // (fix bug staging e77f84aefe33). Solo en el wizard nuevo (sin
+    // lockedSteps) y solo al AVANZAR desde el paso 1.
+    if (wizardStep === 1 && clamped > 1 && _lockedSet.size === 0
+        && typeof onUploadAdvance === "function") {
+      onUploadAdvance();
     }
     setWizardStep(clamped);
   };
@@ -1011,13 +1027,12 @@ export default function UploadZone({
 
     // Audit 2026-05-26 (#388 wizard-duplicate-jobs): compute remaining,
     // accepted, and newEntries OUTSIDE the setState callback. Side
-    // effects that fire inside a reducer (setBatchTruncated, the
-    // onAutoTranscribe Promise.resolve dance the old code did) get
+    // effects that fire inside a reducer (setBatchTruncated, y el
+    // auto-transcribe al drop que hacía el código viejo) get
     // double-invoked under React StrictMode (dev) and CAN double-invoke
-    // in production if React decides to abort+retry a render. The
-    // duplicate auto-transcribe call was creating two upload jobs +
-    // two transcription jobs per drop — visible in the admin as the
-    // "4 jobs for one audio" pile-up reported 2026-05-26.
+    // in production if React decides to abort+retry a render. El disparo
+    // de transcripción se movió al avance de paso (onUploadAdvance), pero
+    // mantener estos cálculos fuera del reducer sigue siendo correcto.
     //
     // We can do all the math here because the parent passes `files`
     // as a prop (line 117), so we know the current count without
@@ -1053,16 +1068,12 @@ export default function UploadZone({
 
     // Pure reducer — safe under StrictMode double-invoke.
     onFiles((prev) => [...prev, ...newEntries]);
-
-    // 2026-05-23: trigger auto-transcribe en el drop. Antes el upload se
-    // difería hasta "Revisar" (bloqueaba al operador ~15-20s viendo un
-    // spinner). Ahora arranca en background mientras el operador elige
-    // wizard options. Cuando llega a "Revisar" los segments están cacheados.
-    // Now fired AFTER the setState dispatch, OUTSIDE the reducer — single
-    // call per drop regardless of StrictMode / render aborts.
-    if (typeof onAutoTranscribe === "function") {
-      onAutoTranscribe(newEntries);
-    }
+    // NOTA: la transcripción NO arranca acá. Antes (2026-05-23) el trigger
+    // vivía en el drop, pero eso disparaba el prefetch cuando la fuente de
+    // letra todavía era el default "IA" y la letra oficial no estaba pegada
+    // → job sin anclar (bug staging e77f84aefe33). Ahora el prefetch se
+    // dispara al avanzar del paso "Subí" (goStep → onUploadAdvance), con la
+    // fuente de letra ya resuelta por canción.
   };
 
   const handleDrop = (e) => {
@@ -1072,6 +1083,16 @@ export default function UploadZone({
   };
 
   const updateField = (idx, field, value) => {
+    // Edge case (a): si el operador cambia la fuente de letra o edita la
+    // letra oficial de una canción que YA disparó su prefetch (volvió al
+    // paso "Subí" tras avanzar), invalidamos ese prefetch para que la
+    // transcripción se rehaga con el estado nuevo (el job cacheado salió
+    // con el anchor anterior). Solo aplica a esos dos campos.
+    if ((field === "lyricsSource" || field === "anchorLyrics")
+        && typeof onInvalidatePrefetch === "function") {
+      const entry = files[idx];
+      if (entry?.file) onInvalidatePrefetch(entry.file);
+    }
     onFiles((prev) =>
       prev.map((entry, i) => (i === idx ? { ...entry, [field]: value } : entry))
     );

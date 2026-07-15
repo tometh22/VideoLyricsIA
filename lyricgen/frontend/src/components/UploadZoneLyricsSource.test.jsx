@@ -57,7 +57,7 @@ function Harness({ user }) {
       allHaveArtist
       onStartReview={() => {}}
       onGenerateDirect={() => {}}
-      onAutoTranscribe={() => {}}
+      onUploadAdvance={() => {}}
     />
   );
 }

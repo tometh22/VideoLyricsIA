@@ -51,6 +51,7 @@ import { sanitizeSegmentsForSave, findSanitizedDiffs } from "./lib/sanitizeSegme
 import { appendBackgroundFields } from "./lib/bgPayload";
 import { computeFieldDiff, buildEditPayloads } from "./lib/editWizardDiff";
 import { prefetchKey } from "./lib/prefetchKey";
+import { anchorLyricsForEntry } from "./lib/anchorPayload";
 import { track } from "./lib/telemetryTrack";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -1131,7 +1132,7 @@ export default function App() {
   const [user, setUser] = useState(getUser());
   const [files, setFiles] = useState([]);
   // Ref que espeja `files` para que callbacks sin dependencias (ej.
-  // onAutoTranscribe en un setTimeout) lean el estado actual sin re-render
+  // handleUploadAdvance en un setTimeout) lean el estado actual sin re-render
   // loops. Sync con un useEffect debajo.
   const filesRef = useRef(files);
   const [delivery, setDelivery] = useState({
@@ -2111,13 +2112,14 @@ export default function App() {
         prefetchCache.current[key] = { status: "loading", jobId };
         setRowStatus(file, "queued");
         // Versión B (letra anclada): re-leer la entry FRESCA por identidad
-        // de archivo antes del POST. El prefetch arranca al drop, pero el
-        // operador elige "Tengo la letra oficial" y pega DESPUÉS — la
-        // referencia `entry` capturada al armar la cola quedó vieja
-        // (updateField crea objetos nuevos). Para cuando el upload a R2
-        // terminó y este POST sale, la versión fresca ya suele tener la
-        // selección + la letra. v2: solo viaja con lyricsSource="official"
-        // (el selector manda, no el contenido del textarea).
+        // de archivo antes del POST. Con el trigger movido al avance de paso
+        // el estado ya está resuelto al arrancar el prefetch, pero la subida
+        // a R2 tarda decenas de segundos; si el operador vuelve al paso
+        // "Subí" y cambia la fuente/letra DURANTE esa ventana, esta
+        // re-lectura hace que el POST use el estado vigente (y complementa la
+        // invalidación de cache de onInvalidatePrefetch para el caso ya
+        // posteado). Solo viaja con lyricsSource="official" (el selector
+        // manda, no el contenido del textarea).
         const fresh = (filesRef.current || [])
           .find((e) => e?.file && prefetchKey(e.file) === key) || entry;
         const res = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
@@ -2129,8 +2131,7 @@ export default function App() {
             artist: entry.artist || "",
             title: (entry.songTitle || "").trim(),
             live: !!entry.live,
-            anchor_lyrics: fresh.lyricsSource === "official"
-              ? (fresh.anchorLyrics || "").trim() : "",
+            anchor_lyrics: anchorLyricsForEntry(fresh),
           }),
           signal: controller && controller.signal,
         }, { maxRetries: 3 });
@@ -2167,29 +2168,40 @@ export default function App() {
     }
   }, [pollUntilTranscribed]);
 
-  // 2026-05-23: trigger de transcripción auto en el drop del archivo. Antes
-  // se difería hasta el click en "Revisar", bloqueando al usuario ~15-20s en
-  // un loader. Ahora arranca al instante en background mientras el operador
-  // elige movement/effect/font/paleta. Cuando llega a "Revisar", los segments
-  // están cacheados → editor abre instant.
-  const onAutoTranscribe = useCallback((newFiles) => {
-    // newFiles llega desde UploadZone.addFiles con el shape que ya conocemos.
-    // Lo agregamos a la cola de prefetch. prefetchRemaining respeta serial
-    // (1 a la vez) para no saturar el backend pool — para parallelismo
-    // estricto refactorear con semáforo en v2.
-    // Pasamos los files actuales + los nuevos para que prefetch use el
-    // índice global del array en files (no del slice nuevo).
+  // Prefetch de transcripción al AVANZAR del paso "Subí", no al soltar el
+  // archivo. Historia: el trigger vivía en el drop (2026-05-23) para que el
+  // editor abriera instant, pero eso disparaba la transcripción cuando la
+  // fuente de letra todavía era el default "IA de Genly" y la letra oficial
+  // no estaba pegada → el job salía con anchor vacío y, aunque el operador
+  // después eligiera "Tengo la letra oficial", servía Versión A (bug
+  // staging job e77f84aefe33). Moviendo el disparo al avance de paso, la
+  // fuente de letra + la letra oficial ya están resueltas por canción, así
+  // que el POST /transcribe-uploaded sale con el anchor_lyrics correcto de
+  // una, sin carrera ni parche. El operador igual gana el prefetch: la
+  // transcripción corre en background mientras elige Modo/Movimiento/etc.
+  const handleUploadAdvance = useCallback(() => {
+    // Defer 1 tick por si el avance coincide con un setState de files.
     setTimeout(() => {
-      // Defer 1 tick para que setFiles haya commiteado antes del prefetch.
-      const merged = filesRef.current || [];
-      const startIdx = Math.max(0, merged.length - newFiles.length);
-      prefetchRemaining(merged, startIdx);
+      const queue = filesRef.current || [];
+      if (queue.length) prefetchRemaining(queue, 0);
     }, 0);
   }, [prefetchRemaining]);
 
+  // Edge case (a): si el operador vuelve al paso "Subí" DESPUÉS de avanzar
+  // (el prefetch ya salió) y cambia la fuente de letra o edita la letra
+  // oficial de una canción, el job cacheado quedó desalineado con la nueva
+  // elección. Descartamos su entrada de cache para que transcribeNext caiga
+  // al slow path y re-transcriba con el estado actual.
+  const invalidatePrefetchForFile = useCallback((file) => {
+    if (!file) return;
+    const key = prefetchKey(file);
+    if (prefetchCache.current[key]) delete prefetchCache.current[key];
+  }, []);
+
   // --- Review flow ---
-  // 2026-05-23: NO limpia más el prefetchCache. Si onAutoTranscribe ya cargó
-  // transcripciones en background, las reusamos. El cache queda mapeado por
+  // 2026-05-23: NO limpia más el prefetchCache. Si el prefetch (disparado al
+  // avanzar del paso "Subí") ya cargó transcripciones en background, las
+  // reusamos. El cache queda mapeado por
   // índice en `files`, así que es válido siempre que `files` no haya cambiado
   // de orden — y no lo cambiamos entre upload y review.
   const handleStartReview = async () => {
@@ -2419,10 +2431,9 @@ export default function App() {
           live: !!entry.live,
           // Versión B: letra oficial pegada en el wizard → el backend la
           // ancla al motor CTC (flag ANCHOR_LYRICS_ENABLED; vacía = no-op).
-          // v2: gated por el selector — volver a "IA de Genly" desactiva
-          // el anclado aunque el textarea conserve texto.
-          anchor_lyrics: entry.lyricsSource === "official"
-            ? (entry.anchorLyrics || "").trim() : "",
+          // Gated por el selector — volver a "IA de Genly" desactiva el
+          // anclado aunque el textarea conserve texto (ver anchorPayload).
+          anchor_lyrics: anchorLyricsForEntry(entry),
         }),
       }, {
         maxRetries: 3,
@@ -3812,8 +3823,13 @@ export default function App() {
         onGenerateDirect={handleGenerateDirect}
         user={user}
         sidebarOpen={sidebarOpen}
-        // 2026-05-23: auto-transcribe en background al dropear.
-        onAutoTranscribe={onAutoTranscribe}
+        // Prefetch de transcripción al avanzar del paso "Subí" (no al drop):
+        // la fuente de letra + la letra oficial ya están resueltas por
+        // canción, así el POST sale con anchor_lyrics correcto.
+        onUploadAdvance={handleUploadAdvance}
+        // Edge case (a): editar fuente/letra tras avanzar invalida el
+        // prefetch de esa canción para que se re-transcriba.
+        onInvalidatePrefetch={invalidatePrefetchForFile}
         transcribeStatusByFile={transcribeStatusByFile}
         // Phase 2 (2026-05-25): el wizard ahora abarca la review (paso 6).
         // hasReviewableContent prende cuando arranca el transcribe o existe
