@@ -388,7 +388,38 @@ async def _disconnect_receive():
     return {"type": "http.disconnect"}
 
 
+class RejectNulPathMiddleware:
+    """Reject requests whose URL path contains a NUL byte, at the edge.
+
+    A `%00` in a path param (e.g. `/status/%00`) is decoded by the ASGI
+    server into a literal "\\x00" in `scope["path"]`. When that string reached
+    a DB lookup, psycopg2 raised `ValueError: A string literal cannot contain
+    NUL (0x00) characters`, which — not being a DBAPI Error subclass —
+    propagated unwrapped and surfaced as an *unhandled 500* (plus Sentry
+    noise) on every job_id route: `/status/{id}`, `/jobs/{id}/background-url`,
+    `DELETE /jobs/{id}`. The lookups are scattered across get_job /
+    get_job_model / delete_job / direct `query(Job)`, so there is no single
+    place to guard — but no legitimate URL path contains a NUL, so a flat 400
+    at the edge fixes every route at once, present and future.
+
+    Only NUL is rejected (the byte that actually breaks the driver); other
+    inputs keep their normal 404/422 handling.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and "\x00" in scope.get("path", ""):
+            await JSONResponse(
+                {"detail": "Malformed request path."}, status_code=400
+            )(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 app.add_middleware(DbTransientRetryMiddleware)
+app.add_middleware(RejectNulPathMiddleware)
 
 
 # --- Server-Timing header middleware ---
