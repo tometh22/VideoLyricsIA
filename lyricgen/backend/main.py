@@ -5068,7 +5068,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
     el retime CTC normal (no doble retime).
 
     Gate por línea (outliers del benchmark): líneas cuya mediana de
-    word-scores queda < ANCHOR_REVIEW_MIN_SCORE (default 0.30) se marcan
+    word-scores queda < ANCHOR_REVIEW_MIN_SCORE (default 0.25) se marcan
     `review=True` — el editor las señala para que el operador las revise."""
     _stem = None
     try:
@@ -5116,15 +5116,16 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
             return result
         # GATE POR LÍNEA: mediana de word-scores < umbral → review=True
         # (el editor la señala para revisar). Sin scores → no marcar.
-        # Umbral tuneable vía ANCHOR_REVIEW_MIN_SCORE (default 0.30). Se bajó
-        # de 0.35 → 0.30 (2026-07): con anclado Rotor-grade (mediana global
-        # ~0.13s) el 0.35 marcaba líneas perfectas — 11/26 en "Hablando"
-        # cuando solo 2-4 estaban genuinamente off. Sólo cambia CUÁNTAS se
-        # marcan; el decline global (retimed is None) no se toca.
+        # Umbral tuneable vía ANCHOR_REVIEW_MIN_SCORE (default 0.25). Se bajó
+        # 0.35 → 0.30 → 0.25 (2026-07): con anclado Rotor-grade (mediana
+        # global ~0.13s) hasta el 0.30 seguía marcando líneas perfectas —
+        # 11/26 en "Hablando" cuando solo 2-4 estaban genuinamente off. Sólo
+        # cambia CUÁNTAS se marcan; el decline global (retimed is None) no se
+        # toca.
         try:
-            _review_min = float(os.environ.get("ANCHOR_REVIEW_MIN_SCORE", "0.30"))
+            _review_min = float(os.environ.get("ANCHOR_REVIEW_MIN_SCORE", "0.25"))
         except (TypeError, ValueError):
-            _review_min = 0.30
+            _review_min = 0.25
         from statistics import median as _median
         flagged = 0
         anchored = []

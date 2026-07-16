@@ -106,7 +106,7 @@ def test_align_ok_replaces_segments_and_flags_low_conf_lines(monkeypatch):
     # Anchor lines (not the transcript) were fed to the engine, zeroed.
     assert [p["text"] for p in seen["psegs"]] == texts
     assert all(p["start"] == 0.0 and p["end"] == 0.0 for p in seen["psegs"])
-    # Per-line gate: median score 0.2 < default 0.30 → review; 0.85 → clean;
+    # Per-line gate: median score 0.2 < default 0.25 → review; 0.85 → clean;
     # no scores → not flagged.
     assert out["segments"][0].get("review") is not True
     assert out["segments"][1]["review"] is True
@@ -114,22 +114,22 @@ def test_align_ok_replaces_segments_and_flags_low_conf_lines(monkeypatch):
 
 
 def _retimed_borderline():
-    # Línea 2 con mediana 0.32: cae ENTRE el default nuevo (0.30, no marca)
-    # y el viejo (0.35, marcaba). Las otras dos son claramente buenas.
+    # Línea 2 con mediana 0.27: cae ENTRE el default nuevo (0.25, no marca)
+    # y el viejo (0.30, marcaba). Las otras dos son claramente buenas.
     return [
         {"start": 0.5, "end": 2.1, "text": "primera linea oficial",
          "words": [{"word": "a", "start": 0.5, "end": 1.0, "score": 0.9}]},
         {"start": 2.4, "end": 4.0, "text": "segunda linea oficial",
-         "words": [{"word": "a", "start": 2.4, "end": 3.0, "score": 0.32},
-                   {"word": "b", "start": 3.1, "end": 3.5, "score": 0.32}]},
+         "words": [{"word": "a", "start": 2.4, "end": 3.0, "score": 0.27},
+                   {"word": "b", "start": 3.1, "end": 3.5, "score": 0.27}]},
         {"start": 4.3, "end": 6.2, "text": "tercera linea oficial",
          "words": [{"word": "a", "start": 4.3, "end": 5.0, "score": 0.8}]},
     ]
 
 
-def test_review_threshold_default_030_marks_fewer(monkeypatch):
-    # Default (sin env): umbral 0.30 → una línea a 0.32 NO se marca. Antes
-    # (0.35) sí se marcaba. Confirma que el default marca MENOS líneas
+def test_review_threshold_default_025_marks_fewer(monkeypatch):
+    # Default (sin env): umbral 0.25 → una línea a 0.27 NO se marca. Antes
+    # (0.30) sí se marcaba. Confirma que el default marca MENOS líneas
     # (feedback dueño: 11/26 marcadas cuando el sync salió excelente).
     monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
     monkeypatch.delenv("ANCHOR_REVIEW_MIN_SCORE", raising=False)
@@ -141,9 +141,9 @@ def test_review_threshold_default_030_marks_fewer(monkeypatch):
 
 
 def test_review_threshold_is_env_tuneable(monkeypatch):
-    # Subir el umbral a 0.35 vuelve a marcar la línea borderline (0.32).
+    # Subir el umbral a 0.30 vuelve a marcar la línea borderline (0.27).
     monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
-    monkeypatch.setenv("ANCHOR_REVIEW_MIN_SCORE", "0.35")
+    monkeypatch.setenv("ANCHOR_REVIEW_MIN_SCORE", "0.30")
     _no_stem(monkeypatch)
     monkeypatch.setattr(ctc_align, "retime_segments",
                         lambda *a, **k: _retimed_borderline())
@@ -152,7 +152,7 @@ def test_review_threshold_is_env_tuneable(monkeypatch):
 
 
 def test_review_threshold_bad_env_falls_back_to_default(monkeypatch):
-    # Un valor no numérico no debe romper el anclado — cae al default 0.30.
+    # Un valor no numérico no debe romper el anclado — cae al default 0.25.
     monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
     monkeypatch.setenv("ANCHOR_REVIEW_MIN_SCORE", "not-a-number")
     _no_stem(monkeypatch)

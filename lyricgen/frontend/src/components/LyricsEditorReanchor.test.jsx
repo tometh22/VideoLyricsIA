@@ -92,6 +92,8 @@ describe("Re-sincronizar con IA", () => {
       <LyricsEditor {...baseProps({ onPersistSegments, onReanchor })} />,
     );
 
+    fireEvent.click(screen.getByTestId("editor-overflow-btn"));
+
     fireEvent.click(screen.getByTestId("reanchor-btn"));
 
     await waitFor(() => expect(onReanchor).toHaveBeenCalledWith("job-reanchor"));
@@ -116,6 +118,8 @@ describe("Re-sincronizar con IA", () => {
       })} />,
     );
 
+    fireEvent.click(screen.getByTestId("editor-overflow-btn"));
+
     fireEvent.click(screen.getByTestId("reanchor-btn"));
 
     await waitFor(() => expect(toastSpy).toHaveBeenCalled());
@@ -132,6 +136,7 @@ describe("Re-sincronizar con IA", () => {
         onReanchor,
       })} />,
     );
+    fireEvent.click(screen.getByTestId("editor-overflow-btn"));
     fireEvent.click(screen.getByTestId("reanchor-btn"));
     await waitFor(() => expect(toastSpy).toHaveBeenCalled());
     expect(toastSpy.mock.calls[0][0].tone).toBe("error");
