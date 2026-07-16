@@ -2480,12 +2480,18 @@ export default function LyricsEditor({
           pl-3 alinea su check verde con el del chip "Aplicar corrección"
           (que lo indenta su propio padding de contenedor) — sin esto los
           dos tics verdes quedaban desalineados (reporte Tomi 2026-07-16). */}
-      <div className="mb-2 pl-3 flex items-center gap-1.5 text-xs text-ink-secondary min-w-0" data-testid="editor-confidence">
-        <svg className="w-3.5 h-3.5 text-emerald-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
-          <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
-        </svg>
-        <span className="truncate">{confidenceText}</span>
-      </div>
+      {/* Se portalea al slot bajo el video (es estado del VIDEO, no de la
+          letra) cuando el wizard pasa playerSlot; así la columna de la
+          letra sube. En modal/inline queda acá. mt-2 separa del player bar
+          cuando va portaleado. */}
+      {(() => { const _conf = (
+        <div className={`${playerSlot ? "mt-2" : ""} mb-1 pl-3 flex items-center gap-1.5 text-xs text-ink-secondary min-w-0`} data-testid="editor-confidence">
+          <svg className="w-3.5 h-3.5 text-emerald-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
+            <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <span className="truncate">{confidenceText}</span>
+        </div>
+      ); return playerSlot ? createPortal(_conf, playerSlot) : _conf; })()}
 
       {/* (2) Fila de chips (máx 2). Cada chip = icono + verbo + número (no
           oraciones). Wrap en narrow. */}
@@ -2610,8 +2616,8 @@ export default function LyricsEditor({
       {/* (3) Disclosure "Ajustes del video (N) ▾" — plegado. Concerns
           informativos del render (wrap a 2 renglones, intro instrumental).
           Neutral, SIN ámbar. Filas wrap a 2 líneas en narrow. */}
-      {videoSettingsCount > 0 && (
-        <div className="mb-5" data-testid="video-settings-disclosure">
+      {videoSettingsCount > 0 && (() => { const _vset = (
+        <div className="mb-5 pl-3" data-testid="video-settings-disclosure">
           <button
             type="button"
             onClick={() => setVideoSettingsOpen((v) => !v)}
@@ -2670,7 +2676,7 @@ export default function LyricsEditor({
             </div>
           )}
         </div>
-      )}
+      ); return playerSlot ? createPortal(_vset, playerSlot) : _vset; })()}
 
       {audioUrl && syncMode && (
         <div className="mb-3 px-3 py-2 rounded-card bg-brand/[0.08] ring-1 ring-brand/40 animate-fade-in">
