@@ -240,9 +240,10 @@ def test_live_veo_with_fresh_heartbeat_is_not_false_killed():
     try:
         _cleanup(db)
         # Started 25 min ago; 1st attempt orphaned a 15-min-old NULL row;
-        # the live 2nd attempt heartbeated 1 min ago.
-        jid = _seed(db, status="processing", age_minutes=25,
-                    last_progress_minutes_ago=1)
+        # the live 2nd attempt heartbeated 1 min ago. Explicit job_id ≤12
+        # chars: the column is String(12) and _seed's auto-gen is 13.
+        jid = _seed(db, job_id="hbg_live", status="processing",
+                    age_minutes=25, last_progress_minutes_ago=1)
         _seed_provenance(db, job_id=jid, age_minutes=15, duration_ms=None)
         orphans = find_orphan_polling_jobs(db, threshold_min=10)
         assert all(j.job_id != jid for j in orphans), (
@@ -260,8 +261,8 @@ def test_dead_worker_stale_heartbeat_and_orphan_is_reaped():
     db = SessionLocal()
     try:
         _cleanup(db)
-        jid = _seed(db, status="processing", age_minutes=25,
-                    last_progress_minutes_ago=15)
+        jid = _seed(db, job_id="hbg_dead", status="processing",
+                    age_minutes=25, last_progress_minutes_ago=15)
         _seed_provenance(db, job_id=jid, age_minutes=15, duration_ms=None)
         orphans = find_orphan_polling_jobs(db, threshold_min=10)
         assert any(j.job_id == jid for j in orphans), (
