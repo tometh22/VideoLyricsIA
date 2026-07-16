@@ -245,10 +245,23 @@ def find_orphan_polling_jobs(
         .where(AIProvenance.duration_ms.is_(None))
         .where(AIProvenance.created_at < cutoff)
     )
+    # A stale NULL provenance row is NOT sufficient evidence of a dead
+    # worker. A LIVE Veo poll heartbeats Job.last_progress_at every ≤60s
+    # (pipeline._generate_veo_video → jobs.heartbeat), and a timed-out 1st
+    # attempt leaves an orphan row that is exactly ~threshold-old right when
+    # the healthy 2nd attempt starts (poll_deadline 600s == 10 min default).
+    # Reaping on the orphan row alone therefore false-killed live jobs
+    # (Sentry "Reaper killed 1 stuck job", UMG universal_argentina
+    # 2026-07-16 — the render was at 90%). Require the JOB heartbeat to ALSO
+    # be stale, so we only reap when the worker genuinely stopped touching
+    # the job. Same coalesce(last_progress_at, created_at) anchor as
+    # find_stuck_jobs; a real deploy-death staled both signals at once.
+    heartbeat_anchor = func.coalesce(Job.last_progress_at, Job.created_at)
     return (
         db.query(Job)
         .filter(Job.status == "processing")
         .filter(orphan_provenance)
+        .filter(heartbeat_anchor < cutoff)
         .order_by(Job.created_at.asc())
         .all()
     )
