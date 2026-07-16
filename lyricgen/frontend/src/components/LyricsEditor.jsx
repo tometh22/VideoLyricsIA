@@ -2161,17 +2161,29 @@ export default function LyricsEditor({
           NO es un pill propio (2026-07 rediseño): se funde en la línea de
           confianza muted debajo del player bar (ver confidenceText). */}
 
-      {/* Fixed floating primary CTA — always reachable, never cut. */}
-      <button
-        onClick={handleApprove}
-        data-tour="editor-approve-floating"
-        className="editor-primary-cta fixed bottom-6 right-6 z-50 inline-flex items-center gap-1.5 btn-primary text-sm h-12 px-6 shadow-2xl shadow-brand/30"
-      >
-        {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
-        <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-          <path d="M5 12h14M12 5l7 7-7 7" />
-        </svg>
-      </button>
+      {/* Docked primary CTA — a fixed bottom action BAR, not a bare floating
+          pill. The full-width gradient scrim means lyric lines scroll BEHIND
+          a solid edge instead of under a translucent button (kills the
+          overlap the pill had over the last rows — UX review 2026-07-16),
+          and the button still can never be cut by the app's sticky top bar
+          (the recurring "botón cortado" this fixed-position was chosen to
+          avoid). `pointer-events-none` on the scrim lets clicks reach the
+          list in the transparent upper region; the button re-enables them.
+          The container's pb-28 still reserves space so the last row clears
+          the bar when scrolled to the end. */}
+      <div className="fixed bottom-0 left-0 right-0 z-50 pointer-events-none flex justify-end
+        bg-gradient-to-t from-surface via-surface/95 to-transparent pt-10 pb-5 px-6">
+        <button
+          onClick={handleApprove}
+          data-tour="editor-approve-floating"
+          className="editor-primary-cta pointer-events-auto inline-flex items-center gap-1.5 btn-primary text-sm h-12 px-6 shadow-2xl shadow-brand/30"
+        >
+          {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M5 12h14M12 5l7 7-7 7" />
+          </svg>
+        </button>
+      </div>
 
       {coverageWarning && (
         <div className="mb-4 rounded-2xl ring-1 ring-accent/25 bg-accent/[0.06] px-4 py-3 flex items-start gap-3">
