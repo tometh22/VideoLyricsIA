@@ -74,11 +74,12 @@ describe("LyricsEditor — banner de confianza + señal review calma (2026-07)",
       ],
     });
     render(<LyricsEditor {...props} />);
-    // Mensaje positivo (no de alarma) + contador de líneas a revisar.
+    // Rediseño 2026-07: la confianza es una línea muted "Sincronizado con
+    // tu letra"; el contador vive dentro del chip primario "Revisar · •N".
     expect(screen.getByText(/Sincronizado con tu letra/i)).toBeInTheDocument();
-    expect(screen.getByText(/3 líneas para revisar/i)).toBeInTheDocument();
-    // El botón navegador "Revisar →" está presente.
+    // El chip navegador "Revisar" está presente y muestra el contador (3).
     expect(screen.getByTestId("review-next-btn")).toBeInTheDocument();
+    expect(within(screen.getByTestId("review-next-btn")).getByText("3")).toBeInTheDocument();
     // La pill per-línea "revisar tiempo" quedó eliminada.
     expect(screen.queryAllByText(/^revisar tiempo$/i)).toHaveLength(0);
   });
@@ -93,7 +94,8 @@ describe("LyricsEditor — banner de confianza + señal review calma (2026-07)",
     });
     render(<LyricsEditor {...props} />);
     expect(screen.getByText(/Sincronizado con tu letra/i)).toBeInTheDocument();
-    expect(screen.getByText(/1 línea para revisar/i)).toBeInTheDocument();
+    // El chip "Revisar" muestra el contador aun con una sola línea (1).
+    expect(within(screen.getByTestId("review-next-btn")).getByText("1")).toBeInTheDocument();
   });
 
   it("'Revisar →' hace foco en la siguiente línea review (navegador secuencial)", () => {
@@ -342,23 +344,23 @@ describe("LyricsEditor — modo enfoque body class broadcast", () => {
     document.body.classList.remove("editor-focus-mode");
   });
 
-  it("toggles the editor-focus-mode body class when the focus button is clicked", async () => {
-    // audioUrl truthy → el sticky control bar que contiene el focus
-    // toggle se monta (gated en LyricsEditor:1856 por `{audioUrl && ...}`).
+  it("toggles the editor-focus-mode body class from the overflow (⋯) menu", async () => {
+    // Rediseño 2026-07: "Expandir / Modo enfoque" dejó de ser un botón
+    // suelto en la barra — ahora vive dentro del menú ⋯ (overflow).
     const props = baseProps({ audioUrl: "blob:mock-audio" });
     render(<LyricsEditor {...props} />);
 
     // Default OFF — la clase no debe estar al montar.
     expect(document.body.classList.contains("editor-focus-mode")).toBe(false);
 
-    // Click el botón "Modo enfoque (F)" (tooltip exacto del component).
-    const focusBtn = screen.getByTitle(/^Modo enfoque \(F\)$/i);
-    await userEvent.click(focusBtn);
+    // Abrí el menú ⋯ y clic en "Expandir (modo enfoque)".
+    await userEvent.click(screen.getByTestId("editor-overflow-btn"));
+    await userEvent.click(screen.getByText(/Expandir \(modo enfoque\)/i));
     expect(document.body.classList.contains("editor-focus-mode")).toBe(true);
 
-    // Click otra vez — apaga. El tooltip ahora dice "Salir...".
-    const exitBtn = screen.getByTitle(/^Salir de modo enfoque \(F\)$/i);
-    await userEvent.click(exitBtn);
+    // Reabrí el menú — el item ahora dice "Salir de modo enfoque".
+    await userEvent.click(screen.getByTestId("editor-overflow-btn"));
+    await userEvent.click(screen.getByText(/Salir de modo enfoque/i));
     expect(document.body.classList.contains("editor-focus-mode")).toBe(false);
   });
 
@@ -366,9 +368,9 @@ describe("LyricsEditor — modo enfoque body class broadcast", () => {
     const props = baseProps({ audioUrl: "blob:mock-audio" });
     const { unmount } = render(<LyricsEditor {...props} />);
 
-    // Prendé focus mode.
-    const focusBtn = screen.getByTitle(/^Modo enfoque \(F\)$/i);
-    await userEvent.click(focusBtn);
+    // Prendé focus mode desde el menú ⋯.
+    await userEvent.click(screen.getByTestId("editor-overflow-btn"));
+    await userEvent.click(screen.getByText(/Expandir \(modo enfoque\)/i));
     expect(document.body.classList.contains("editor-focus-mode")).toBe(true);
 
     // Operador navega a otro step / cambia de pantalla — el editor
