@@ -219,6 +219,10 @@ export default function UploadZone({
   // WizardLivePreview lo lee con su propio rAF para renderizar word-jump
   // sincronizado al audio real, sin causar re-renders de UploadZone.
   playbackTickRef = null,
+  // 2026-07-16 (idea de Tomi): callback ref que recibe el <div> slot que
+  // montamos bajo el video en el paso 6. LyricsEditor portalea ahí su player
+  // bar, así la columna de la letra queda full y se scrollea menos.
+  onPlayerSlotRef = null,
   // Post-render edit mode (App.jsx EditLyricsRoute):
   // - lockedSteps: IDs de pasos no navegables (típicamente [1,2,3,5] en
   //   modo edición de un job ya renderizado — esos cambios requieren
@@ -2797,6 +2801,12 @@ export default function UploadZone({
               ? `${t("upload.preview_editing") || "Línea actual"}: ${_previewLyric}${files.length > 1 ? ` · +${files.length - 1}` : ""}`
               : (t("upload.preview_disclaimer") || "Aproximación del mood y el movimiento. El fondo final lo genera la IA.")}
           </p>
+          {/* 2026-07-16: slot para el player bar de LyricsEditor (paso 6).
+              Lo portalea acá, bajo el video, para que la columna derecha
+              quede full con la letra. Fuera del paso 6 no se monta. */}
+          {isStep6 && onPlayerSlotRef && (
+            <div ref={onPlayerSlotRef} className="mt-1" data-testid="wizard-player-slot" />
+          )}
         </div>
 
         {/* RIGHT — active step controls only (revealed one step at a time).

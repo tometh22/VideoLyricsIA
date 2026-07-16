@@ -1,4 +1,5 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
 import { EditorTour } from "./OnboardingTour";
 import { useToast } from "./ToastProvider";
@@ -369,6 +370,14 @@ export default function LyricsEditor({
   // Se llama dentro del rAF loop existente (60fps). El consumer es
   // responsable de throttle si necesario.
   onPlaybackTick = null,
+  // 2026-07-16 (idea de Tomi): en el wizard, el reproductor puede vivir
+  // ABAJO del video (columna central) en vez de arriba de la lista, para
+  // que la columna de la letra quede full y se scrollee menos. Si el padre
+  // pasa un elemento DOM acá, el player bar se portalea a ese slot (bajo el
+  // video); si es null (ej. /edit modal), se renderiza inline como siempre.
+  // El estado del audio (isPlaying/currentTime/etc.) NO se mueve — solo el
+  // DOM del control, vía React portal.
+  playerSlot = null,
 }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
@@ -2251,16 +2260,18 @@ export default function LyricsEditor({
           mano, GC de R2 después de 30 d, etc.) perdieran acceso al toggle
           de vista y al editor de texto, sólo viendo una lista plana sin
           forma de cambiar la vista. */}
-      {(
+      {(() => { const _playerBar = (
         /* Phase B 2026-05-25: sticky para que el play/pause + scrub
            siempre estén accesibles mientras el operador scrollea la
            lista de líneas. top usa stickyHeaderTop (passed by parent)
            para clear el header superior si lo hay. backdrop-blur +
            bg semi-transparente para que el contenido scrolleado abajo
-           se vea sutil debajo. z-20 sobre el contenido normal del editor. */
+           se vea sutil debajo. z-20 sobre el contenido normal del editor.
+           Cuando se portalea bajo el video (playerSlot), NO va sticky ni
+           lleva el offset del header — vive estático debajo del preview. */
         <div
-          className="mb-3 sticky z-20 backdrop-blur-md bg-surface-1/85 flex items-center gap-3 p-3 rounded-xl ring-1 ring-white/[0.04]"
-          style={{ top: stickyHeaderTop || 0 }}
+          className={`${playerSlot ? "" : "mb-3 sticky z-20"} backdrop-blur-md bg-surface-1/85 flex items-center gap-3 p-3 rounded-xl ring-1 ring-white/[0.04]`}
+          style={playerSlot ? undefined : { top: stickyHeaderTop || 0 }}
           data-tour="editor-playbar"
         >
           {/* Reproductor + scrub bar: solo si hay audio. Sin audio mostramos
@@ -2452,7 +2463,7 @@ export default function LyricsEditor({
             )}
           </div>
         </div>
-      )}
+      ); return playerSlot ? createPortal(_playerBar, playerSlot) : _playerBar; })()}
 
       {/* ─── Zona de controles — rediseño 2026-07 (spec de diseño) ───────
           Antes: 6 banners full-width apilados (bg pill, auto-fix verde,
@@ -2465,8 +2476,11 @@ export default function LyricsEditor({
           lista). Contadores capean 99+. */}
 
       {/* (1) Línea de confianza — muted, text-xs, check teal, sin caja.
-          Funde estado de sync + fondo. Trunca con ellipsis en narrow. */}
-      <div className="mb-2 flex items-center gap-1.5 text-xs text-ink-secondary min-w-0" data-testid="editor-confidence">
+          Funde estado de sync + fondo. Trunca con ellipsis en narrow.
+          pl-3 alinea su check verde con el del chip "Aplicar corrección"
+          (que lo indenta su propio padding de contenedor) — sin esto los
+          dos tics verdes quedaban desalineados (reporte Tomi 2026-07-16). */}
+      <div className="mb-2 pl-3 flex items-center gap-1.5 text-xs text-ink-secondary min-w-0" data-testid="editor-confidence">
         <svg className="w-3.5 h-3.5 text-emerald-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
           <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
         </svg>

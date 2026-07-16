@@ -1164,6 +1164,12 @@ export default function App() {
   const handlePlaybackTick = useCallback((line, start, end, time, words) => {
     playbackTickRef.current = { activeLine: line, activeStart: start, activeEnd: end, currentTime: time, words: words || null };
   }, []);
+  // 2026-07-16 (idea de Tomi): slot DOM bajo el video (col central del wizard)
+  // donde LyricsEditor portalea su player bar, para que la columna de la letra
+  // quede full. UploadZone attachea el elemento vía callback ref (setter estable
+  // de useState) → re-render → LyricsEditor recibe el elemento y portalea. En
+  // el /edit modal no se pasa nada → el player va inline como siempre.
+  const [playerSlotEl, setPlayerSlotEl] = useState(null);
 
   // Phase 2 (2026-05-25): sync de typography settings cuando el operador
   // cambia font/case/animation desde el paso 4 del wizard MIENTRAS está
@@ -3849,6 +3855,8 @@ export default function App() {
         // sincronizado al audio. Sin re-renders en App.jsx — el preview lee
         // el ref con su propio rAF loop.
         playbackTickRef={playbackTickRef}
+        // 2026-07-16: callback ref para el slot del player bar bajo el video.
+        onPlayerSlotRef={setPlayerSlotEl}
         // Post-render edit (EditLyricsRoute): el wizard se monta sobre un
         // job ya renderizado. QA fix 2026-05-27: bajamos los locks de
         // [1, 2, 3, 5] a [1, 5] — solo file upload (paso 1) y delivery
@@ -3989,6 +3997,9 @@ export default function App() {
         <div className="flex justify-center">
           <Suspense fallback={<EditorSuspenseFallback />}>
           <LyricsEditor
+            // 2026-07-16: cuando el wizard pasa un slot (bajo el video), el
+            // player bar se portalea ahí; null (modal/inline) → inline.
+            playerSlot={playerSlotEl}
             // key forces a fresh mount when stepping forward/backward
             // through the batch — LyricsEditor seeds its `edited` state
             // from props.segments only on mount, so without the key the
