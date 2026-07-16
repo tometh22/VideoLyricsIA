@@ -7635,6 +7635,14 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     _last_progress_written = 22
     while True:
         if _time.time() > poll_deadline:
+            # Close the provenance row before bailing. Every other exit of
+            # this function calls recorder.finish(); the timeout path did
+            # not, leaving duration_ms NULL forever. reaper.find_orphan_
+            # polling_jobs then read that orphan row as a "dead worker"
+            # signal and false-killed the LIVE job on the 2nd attempt
+            # (Sentry "Reaper killed 1 stuck job", UMG universal_argentina
+            # 2026-07-16). Finishing the row removes the false signal.
+            recorder.finish(response_summary="error: timed out after 10 min")
             raise TimeoutError("Veo 3 operation timed out after 10 min")
         _time.sleep(10)
         _hb_counter += 1

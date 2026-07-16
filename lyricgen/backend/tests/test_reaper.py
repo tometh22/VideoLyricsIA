@@ -229,6 +229,50 @@ def test_completed_veo_call_is_never_orphan():
         db.close()
 
 
+def test_live_veo_with_fresh_heartbeat_is_not_false_killed():
+    """Regression (Sentry "Reaper killed 1 stuck job", UMG
+    universal_argentina 2026-07-16): a LIVE Veo render whose 1st poll
+    attempt timed out at 10 min left a 15-min-old orphan provenance row,
+    but the worker is alive on the 2nd attempt and heartbeats
+    last_progress_at every ≤60s (jobs.heartbeat). The orphan row alone
+    must NOT reap it — the job heartbeat has to be stale too."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        # Started 25 min ago; 1st attempt orphaned a 15-min-old NULL row;
+        # the live 2nd attempt heartbeated 1 min ago.
+        jid = _seed(db, status="processing", age_minutes=25,
+                    last_progress_minutes_ago=1)
+        _seed_provenance(db, job_id=jid, age_minutes=15, duration_ms=None)
+        orphans = find_orphan_polling_jobs(db, threshold_min=10)
+        assert all(j.job_id != jid for j in orphans), (
+            "a live job heartbeating every 60s must not be reaped just "
+            "because a timed-out earlier attempt left an orphan row"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_dead_worker_stale_heartbeat_and_orphan_is_reaped():
+    """The genuine deploy-death still reaps: orphan NULL provenance row
+    AND no heartbeat for >threshold min. Both signals stale → reap."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="processing", age_minutes=25,
+                    last_progress_minutes_ago=15)
+        _seed_provenance(db, job_id=jid, age_minutes=15, duration_ms=None)
+        orphans = find_orphan_polling_jobs(db, threshold_min=10)
+        assert any(j.job_id == jid for j in orphans), (
+            "a truly dead worker (stale orphan row + stale heartbeat) "
+            "must still be reaped"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
 def test_orphan_in_terminal_status_is_left_alone():
     """A job that already moved on to done/error/pending_review is not a
     zombie even if a stale in-flight provenance row from an earlier
