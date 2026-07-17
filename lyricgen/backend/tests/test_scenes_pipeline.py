@@ -683,3 +683,137 @@ def test_restitch_failure_persists_scene_statuses():
     fail_idx = src.index("re-stitch de escenas falló")
     persist_idx = src.index("update_job(job_id, scene_plan=scene_plan)", fail_idx)
     assert persist_idx > fail_idx
+
+
+def test_scene_clips_generated_in_parallel(monkeypatch, tmp_path):
+    """Con SCENE_CONCURRENCY>1, las escenas únicas se generan concurrentemente:
+    todas quedan mapeadas y varios hilos Veo corren a la vez (barrera)."""
+    import threading
+    import veo_breaker
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+    monkeypatch.setenv("SCENE_CONCURRENCY", "4")
+
+    N = 4
+    barrier = threading.Barrier(N, timeout=10)
+    max_concurrent = {"n": 0}
+    lock = threading.Lock()
+    active = {"n": 0}
+
+    def fake_veo(prompt, output_path, **kw):
+        with lock:
+            active["n"] += 1
+            max_concurrent["n"] = max(max_concurrent["n"], active["n"])
+        # Si NO fueran paralelas, esta barrera haría timeout → error.
+        barrier.wait()
+        with open(output_path, "w") as f:
+            f.write("clip")
+        with lock:
+            active["n"] -= 1
+        return output_path
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    plan = {"scenes": [
+        {"recurrence_key": f"s{i}", "prompt": "p", "movement_style": "x"}
+        for i in range(N)
+    ]}
+    clip_for_key = pipeline._generate_scene_clips(
+        plan, str(tmp_path), artist="A", song_title="S", job_id=None)
+    assert set(clip_for_key) == {f"s{i}" for i in range(N)}
+    assert max_concurrent["n"] == N  # de verdad corrieron en paralelo
+
+
+def test_scene_clips_recurrence_dedup_generates_once(monkeypatch, tmp_path):
+    """Un coro que se repite (misma recurrence_key) genera UN solo clip Veo;
+    las repeticiones reusan ese clip aun en modo paralelo."""
+    import veo_breaker
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+    monkeypatch.setenv("SCENE_CONCURRENCY", "4")
+    calls = []
+
+    def fake_veo(prompt, output_path, **kw):
+        calls.append(kw.get("cache_namespace") or "")
+        with open(output_path, "w") as f:
+            f.write("clip")
+        return output_path
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    plan = {"scenes": [
+        {"recurrence_key": "coro", "prompt": "p", "movement_style": "x"},
+        {"recurrence_key": "verso", "prompt": "p", "movement_style": "x"},
+        {"recurrence_key": "coro", "prompt": "p", "movement_style": "x"},
+    ]}
+    clip_for_key = pipeline._generate_scene_clips(
+        plan, str(tmp_path), artist="A", song_title="S", job_id=None)
+    assert set(clip_for_key) == {"coro", "verso"}
+    # Solo 2 generaciones (coro + verso), no 3: la repetición reusa el clip.
+    assert len(calls) == 2
+    # El stitch usa clip_for_key[coro] para ambas apariciones del coro.
+    assert os.path.exists(clip_for_key["coro"])
+
+
+def test_scene_clips_parallel_timeout_propagates(monkeypatch, tmp_path):
+    """Un job-timeout en cualquier escena aborta el render entero (no degrada
+    en silencio) aun con generación paralela."""
+    import pytest
+    import veo_breaker
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+    monkeypatch.setenv("SCENE_CONCURRENCY", "4")
+
+    class _JobTimeout(Exception):
+        pass
+
+    def fake_veo(prompt, output_path, **kw):
+        if "s1" in (kw.get("cache_namespace") or ""):
+            raise _JobTimeout("job cancelado")
+        with open(output_path, "w") as f:
+            f.write("clip")
+        return output_path
+
+    def fake_raise_if_timeout(e):
+        if isinstance(e, _JobTimeout):
+            raise e
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    monkeypatch.setattr(pipeline, "_raise_if_job_timeout", fake_raise_if_timeout)
+    plan = {"scenes": [
+        {"recurrence_key": f"s{i}", "prompt": "p", "movement_style": "x"}
+        for i in range(4)
+    ]}
+    with pytest.raises(_JobTimeout):
+        pipeline._generate_scene_clips(
+            plan, str(tmp_path), artist="A", song_title="S", job_id=None)
+
+
+def test_scene_validation_observe_skip_avoids_vision(monkeypatch, tmp_path):
+    """Con observe + SCENE_VALIDATION_OBSERVE_SKIP=1, NO se llama a Vision por
+    clip pero el clip se conserva con veredicto passed sintetizado."""
+    import veo_breaker
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+    monkeypatch.setenv("BACKGROUND_VALIDATION_ENFORCEMENT", "observe")
+    monkeypatch.setenv("SCENE_VALIDATION_OBSERVE_SKIP", "1")
+    monkeypatch.setenv("SCENE_CONCURRENCY", "2")
+
+    def fake_veo(prompt, output_path, **kw):
+        with open(output_path, "w") as f:
+            f.write("clip")
+        return output_path
+
+    called = {"vision": 0}
+    import content_validator
+    def boom_validate(*a, **k):
+        called["vision"] += 1
+        return {"passed": False, "issues": [{"type": "people"}]}
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    monkeypatch.setattr(content_validator, "validate_video", boom_validate)
+
+    plan = {"scenes": [
+        {"recurrence_key": "a", "prompt": "p", "movement_style": "x"},
+        {"recurrence_key": "b", "prompt": "p", "movement_style": "x"},
+    ]}
+    clip_for_key = pipeline._generate_scene_clips(
+        plan, str(tmp_path), artist="A", song_title="S", job_id="job123abc")
+    assert set(clip_for_key) == {"a", "b"}
+    assert called["vision"] == 0  # skip real: cero llamadas a Vision
+    for s in plan["scenes"]:
+        assert s["validation"]["passed"] is True
+        assert s["validation"]["validation_scope"] == "observe_skipped_inline"
