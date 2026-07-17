@@ -166,6 +166,12 @@ export default function UploadZone({
   // user.features.scenes; el backend re-valida igual.
   enableScenes = false,
   onEnableScenesChange,
+  // Art track ("official audio"): tipo de video = master audio + cover, sin
+  // letra. Cuando está activo se oculta la parte de letra y el CTA genera
+  // directo (art_track=true).
+  artTrack = false,
+  onArtTrackChange,
+  onGenerateArtTrack,
   backgroundFile,
   onBackgroundFile,
   backgroundId,
@@ -521,7 +527,10 @@ export default function UploadZone({
   // lockedSteps (post-render edit): IDs no navegables. goStep bail-outs y
   // los helpers prev/next saltean los locked para que la sticky bar muestre
   // el siguiente paso navegable real, no uno que el operador no puede usar.
-  const _lockedSet = new Set(lockedSteps);
+  // Art track: la tipografía (paso 4) y la letra (paso 6) no aplican — se
+  // bloquean para que la navegación los saltee (mismo mecanismo que el edit
+  // mode). Paso 3 (Movimiento/efecto) y 5 (Entregá) sí aplican.
+  const _lockedSet = new Set([...lockedSteps, ...(artTrack ? [4, 6] : [])]);
   const _findPrevUnlocked = (n) => {
     for (let i = n - 1; i >= 1; i--) if (!_lockedSet.has(i)) return i;
     return null;
@@ -1291,6 +1300,40 @@ export default function UploadZone({
             className="mt-1 text-[11px] text-amber-400/60 hover:text-amber-300"
           >{t("common.dismiss") || "dismiss"}</button>
         </div>
+      )}
+    </div>
+  );
+
+  // Video type selector (Lyric Video vs Art Track). Shown both in the
+  // empty-state (pre-upload) and in step 1, so the operator picks the type
+  // before or right after adding audio.
+  const _videoTypeSelector = (
+    <div className="mb-5">
+      <div className="text-label text-gray-400 mb-2">
+        {t("upload.video_type") || "Tipo de video"}
+      </div>
+      <div className="flex gap-1 p-1 glass rounded-xl w-fit">
+        {[
+          { id: false, label: t("upload.video_type_lyrics") || "Lyric Video" },
+          { id: true, label: t("upload.video_type_art") || "Art Track" },
+        ].map((m) => (
+          <button
+            key={String(m.id)}
+            type="button"
+            onClick={() => onArtTrackChange?.(m.id)}
+            className={`px-4 py-1.5 rounded-lg text-label transition-all ${
+              artTrack === m.id ? "bg-brand text-white" : "text-gray-400 hover:text-white"
+            }`}
+          >
+            {m.label}
+          </button>
+        ))}
+      </div>
+      {artTrack && (
+        <p className="mt-2 text-sm text-gray-400 max-w-xl">
+          {t("upload.video_type_art_hint") ||
+            "Master audio + cover, sin letra. Subí la portada en el paso “Modo”; el video muestra el cover centrado sobre un fondo difuminado con movimiento sutil."}
+        </p>
       )}
     </div>
   );
@@ -2204,7 +2247,8 @@ export default function UploadZone({
               : t("upload.bg_custom_summary")}
           </p>
 
-          {/* Mode selector */}
+          {/* Mode selector — oculto en art track (siempre cover custom). */}
+          {!artTrack && (
           <div className="flex gap-1 p-1 glass rounded-xl w-fit mb-3" data-tour="upload-bg-tabs">
             {[
               { id: "auto", label: t("upload.bg_auto") || "Generar con IA" },
@@ -2239,6 +2283,7 @@ export default function UploadZone({
               </button>
             ))}
           </div>
+          )}
 
           {/* Auto mode */}
           {bgMode === "auto" && (
@@ -2546,6 +2591,7 @@ export default function UploadZone({
            so the dropzone doesn't feel like a 250px island floating in the
            viewport. Matches the visual weight of the Dashboard hero. */
         <div className="max-w-3xl mx-auto py-8 md:py-12 flex flex-col items-center justify-center min-h-[55vh]">
+          <div className="w-full">{_videoTypeSelector}</div>
           <div className="w-full">{_dropZone}</div>
           <p className="text-[11px] text-ink-secondary/60 mt-6 text-center max-w-md">
             {t("upload.empty_hint") || "Tip: para mejor calidad, usá audio sin clipping y con voz al frente de la mezcla."}
@@ -2843,6 +2889,7 @@ export default function UploadZone({
           {/* STEP 1 — Subí: manage files + per-track metadata */}
           {wizardStep === 1 && (
             <>
+              {_videoTypeSelector}
               {_dropZone}
               {_filesBlock}
             </>
@@ -3755,6 +3802,20 @@ export default function UploadZone({
                 );
               })()
             ) : wizardStep === 5 ? (
+              artTrack ? (
+                // Art track: un solo CTA, genera directo (sin editor de letra).
+                <button
+                  onClick={() => { track("wizard.generate", { mode: "art_track", batch_size: (files || []).length }); onGenerateArtTrack?.(); }}
+                  disabled={!allHaveArtist || !backgroundFile}
+                  className="btn-primary h-11 px-6 disabled:opacity-40 disabled:cursor-not-allowed"
+                  title={!backgroundFile ? (t("arttrack.cover_missing_desc") || "Subí el cover en el paso “Modo”") : undefined}
+                >
+                  {t("upload.generate_art_track") || "Generar Art Track"}
+                  <svg className="inline-block ml-1.5 w-4 h-4 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path d="M5 12h14M12 5l7 7-7 7" />
+                  </svg>
+                </button>
+              ) : (
               <>
                 {onGenerateDirect && (
                   <button
@@ -3778,6 +3839,7 @@ export default function UploadZone({
                   </button>
                 )}
               </>
+              )
             ) : null}
           </div>
         </div>
