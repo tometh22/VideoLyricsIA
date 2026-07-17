@@ -4155,7 +4155,14 @@ def transcription_status(
 class _GeneratePreviewReq(BaseModel):
     """Background params — TODOS los campos que entran al hash determinístico
     del cache. Cualquier campo del request /generate que NO afecte el bg NO
-    va acá (audio, lyrics, font, animation, transition...)."""
+    va acá (audio, font, animation, transition...).
+
+    NOTA COMPLIANCE: este modelo NO acepta bypass_content_validation /
+    force_content_validation a propósito — el preview genera SIEMPRE con
+    allow_people=False y valida antes de cachear. Agregar esos campos acá
+    rompería el aislamiento del cache global bg_cache/ (el key no separa
+    por people-policy). Test-guard en test_bg_cache_validation.py.
+    """
     artist: str = Field(default="", max_length=255)
     song_title: str = Field(default="", max_length=500)
     style: str = Field(default="auto", max_length=50)
@@ -4170,6 +4177,11 @@ class _GeneratePreviewReq(BaseModel):
     animate_image: bool = False
     match_lyrics: bool = True
     target_duration_s: float = Field(default=30.0, ge=5, le=600)
+    # v6 (2026-07-17): con match_lyrics el prompt del fondo depende de la
+    # LETRA — sin ella el preview generaba ciego al texto y el render podía
+    # heredar ese fondo por cache-hit. Entra al hash como fingerprint del
+    # texto normalizado (timestamps fuera: la corrección típica es timing).
+    lyrics_text: str = Field(default="", max_length=20000)
 
 
 @app.post("/generate-preview")
@@ -7758,6 +7770,36 @@ async def generate_with_segments(
     except Exception as e:
         logger.warning("[DEDUP] supersede sibling drafts failed: %s", e)
 
+    # P1 2026-07-17: si el frontend no mandó bg_cache_key (race del debounce
+    # de 10s de useBackgroundPreview — el operador aprobó dentro de la
+    # ventana), lo recomputamos server-side con la MISMA función compartida
+    # que valida el worker (bg_preview.job_bg_cache_key). Solo aplica al
+    # fondo único AI: custom/library (bg_path) y escenas tienen su propio
+    # flujo, y /variant JAMÁS hereda este fast path (quiere un fondo
+    # distinto con params iguales — por eso el recompute vive acá y no en
+    # run_pipeline, que /variant y /retry comparten). El worker re-valida
+    # el key de todos modos: un mismatch = generación fresh, nunca un
+    # fondo equivocado.
+    _bg_cache_key_norm = (bg_cache_key or "").strip() or None
+    _effective_scenes = bool(enable_scenes) and has_scenes_access(current_user)
+    if _bg_cache_key_norm is None and bg_path is None and not _effective_scenes:
+        from bg_preview import job_bg_cache_key
+        _bg_cache_key_norm = job_bg_cache_key(
+            artist=artist, song_title=song_title, style=style,
+            movement_style=movement_style, effect=effect,
+            custom_colors=(custom_colors.strip() or ""), genre=genre,
+            concept=concept, background_hint=(background_hint.strip() or None),
+            bg_verbatim=bg_verbatim, match_lyrics=match_lyrics,
+            lyrics_text=" ".join(
+                str(seg.get("text") or "") for seg in (segments or [])
+            ),
+        )
+        if _bg_cache_key_norm:
+            logger.info(
+                "[BG] bg_cache_key recomputado server-side job=%s key=%s",
+                job_id, _bg_cache_key_norm,
+            )
+
     enqueue_pipeline(
         job_id=job_id,
         mp3_path=mp3_path,
@@ -7810,12 +7852,13 @@ async def generate_with_segments(
         custom_colors=(custom_colors.strip() or ""),
         # Capa C 2026-05-24: pasa el hash del bg pre-cacheado a la pipeline.
         # Si el cache hit, _ensure_background se skip y el job ahorra
-        # ~60-180s + $0.80-3.20 de cuota Veo. Vacío = flow tradicional.
-        bg_cache_key=(bg_cache_key.strip() or None),
+        # ~60-180s + $0.80-3.20 de cuota Veo. P1 2026-07-17: si el frontend
+        # no lo mandó, viene recomputado server-side (bloque de arriba).
+        bg_cache_key=_bg_cache_key_norm,
         # Escenas (multi-escena): opt-in del operador AND elegibilidad real.
         # Si el flag llega pero el usuario no tiene acceso, se ignora (fondo
         # único) — el gate de feature vive en el backend, no en el form.
-        enable_scenes=bool(enable_scenes) and has_scenes_access(current_user),
+        enable_scenes=_effective_scenes,
         title_template=title_template if title_template in ("auto", "centered", "lower_third", "badge") else "auto",
         title_size=_clamp_title_size(title_size),
         title_artist_font=(title_artist_font.strip() or ""),

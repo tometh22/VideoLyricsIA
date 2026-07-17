@@ -1,4 +1,10 @@
-"""Preview-cache regressions for background policy v5."""
+"""Preview-cache regressions for background policy v5/v6.
+
+v6 (2026-07-17, audit adversarial): el gradiente de policy-fallback ya NO
+se cachea bajo la key real — cachearlo hacía que un render futuro con esa
+key heredara un gradiente genérico como si fuera un fondo Veo validado,
+salteando su propia generación/recovery. El preview igual termina
+bg_preview_done; el render hace cache-miss y genera fresh."""
 
 import pytest
 
@@ -27,7 +33,7 @@ def test_cache_key_isolated_by_policy_mode(monkeypatch):
         monkeypatch.setenv("BACKGROUND_SMOKE_POLICY_MODE", mode)
         keys.add(bg_preview.compute_bg_cache_key(params))
 
-    assert bg_preview.CACHE_VERSION == "v5"
+    assert bg_preview.CACHE_VERSION == "v6"
     assert len(keys) == 3
 
 
@@ -137,16 +143,18 @@ def test_preview_is_validated_before_becoming_a_cache_hit(monkeypatch):
     assert events == ["generated", "validated", "cached"]
 
 
-def test_rejected_preview_retries_then_caches_only_safe_local_fallback(monkeypatch):
+def test_rejected_preview_retries_then_falls_back_without_caching(monkeypatch):
+    """v6: agotados los 2 intentos de safety, el gradiente se usa para
+    cerrar el preview pero NUNCA se sube bajo la key real (poisoning del
+    cache content-addressed: el render heredaría un gradiente genérico
+    creyendo que reusa un Veo bueno)."""
     events = []
     _wire_preview(monkeypatch, events, validation_passes=False)
 
-    def safe_cache_put(_key, path):
-        assert path.endswith("safe-fallback.mp4")
-        events.append("cached")
-        return "bg_cache/cachekey.mp4"
+    def forbidden_cache_put(_key, _path):
+        raise AssertionError("el fallback no debe cachearse bajo la key real")
 
-    monkeypatch.setattr(bg_preview, "cache_put", safe_cache_put)
+    monkeypatch.setattr(bg_preview, "cache_put", forbidden_cache_put)
     result = bg_preview.run_bg_preview_job(
         "previewjob01", "cachekey", {"background_hint": "an empty neon tunnel"},
     )
@@ -155,11 +163,13 @@ def test_rejected_preview_retries_then_caches_only_safe_local_fallback(monkeypat
     assert events == [
         "generated", "validated",
         "generated", "validated",
-        "fallback", "cached",
+        "fallback",
     ]
 
 
-def test_provider_errors_retry_then_cache_safe_local_fallback(monkeypatch):
+def test_provider_errors_retry_then_fall_back_without_caching(monkeypatch):
+    """v6: mismo contrato para errores de proveedor — fallback local para
+    cerrar el preview, sin envenenar la key real."""
     events = []
     _wire_preview(monkeypatch, events, validation_passes=True)
 
@@ -169,19 +179,17 @@ def test_provider_errors_retry_then_cache_safe_local_fallback(monkeypatch):
 
     monkeypatch.setattr(pipeline, "_ensure_background", failed_generation)
 
-    def safe_cache_put(_key, path):
-        assert path.endswith("safe-fallback.mp4")
-        events.append("cached")
-        return "bg_cache/cachekey.mp4"
+    def forbidden_cache_put(_key, _path):
+        raise AssertionError("el fallback no debe cachearse bajo la key real")
 
-    monkeypatch.setattr(bg_preview, "cache_put", safe_cache_put)
+    monkeypatch.setattr(bg_preview, "cache_put", forbidden_cache_put)
     result = bg_preview.run_bg_preview_job(
         "previewjob01", "cachekey", {"background_hint": "empty room"},
     )
 
     assert result["status"] == "bg_preview_done"
     assert events == [
-        "generation_error", "generation_error", "fallback", "cached",
+        "generation_error", "generation_error", "fallback",
     ]
 
 
