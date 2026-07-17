@@ -4845,6 +4845,38 @@ def _mark_validation_observed(result: dict) -> dict:
     return result
 
 
+def _scene_concurrency() -> int:
+    """How many unique scene clips to generate at once.
+
+    Each scene is an independent Veo call (~90s) plus a Vision check; the
+    old loop paid them back-to-back, so an N-scene song took N×~2min. Fan
+    out and the wall-clock collapses to the slowest single scene. Bounded
+    to keep Veo/Vision quota sane. ``SCENE_CONCURRENCY=1`` restores the
+    exact sequential legacy behavior for rollback.
+    """
+    try:
+        n = int(os.getenv("SCENE_CONCURRENCY", "4"))
+    except (TypeError, ValueError):
+        n = 4
+    return max(1, min(n, 8))
+
+
+def _scene_validation_observe_skip() -> bool:
+    """Skip the inline per-clip Vision check on scene clips under observe.
+
+    Only meaningful when enforcement is already ``observe`` (the check can
+    never reject there, so it is pure latency). Off by default: with
+    parallel scene generation the validation overlaps and no longer costs
+    wall-clock, and keeping it preserves the per-scene verdicts we collect
+    to calibrate. Flip ``SCENE_VALIDATION_OBSERVE_SKIP=1`` for max speed.
+    """
+    if not _validation_observe_only():
+        return False
+    return os.getenv("SCENE_VALIDATION_OBSERVE_SKIP", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def _background_safety_policy(job_id: str | None, operator_prompt: str | None = None) -> dict:
     """Resolve the authoritative background policy, failing closed.
 
@@ -9736,17 +9768,32 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
 
     clip_for_key: dict[str, str] = {}
     successful_clips: list[dict] = []
+
+    # La primera aparición de cada recurrence_key es la escena canónica que
+    # REALMENTE generamos; las repeticiones (coros) reusan ese clip. Las
+    # escenas únicas se generan CONCURRENTEMENTE — cada una es un Veo (~90s)
+    # + validación independientes, y el loop viejo pagaba esas latencias en
+    # serie (una canción de N escenas tardaba N×~2min). La fase de ensamblado
+    # de abajo sigue siendo single-thread, así que la lógica fina de dedup y
+    # degradación no cambia; sólo la generación cara se abre en abanico.
+    canonical_scene: dict[str, dict] = {}
+    unique_scenes: list[dict] = []
     for scene in scene_plan.get("scenes", []):
         key = scene["recurrence_key"]
-        if key in clip_for_key:
-            if scene.get("validation", {}).get("passed") is not True:
-                source = next(
-                    (item for item in successful_clips if item["key"] == key),
-                    None,
-                )
-                if source is not None:
-                    scene["validation"] = dict(source.get("validation") or {})
+        if key in canonical_scene:
             continue
+        canonical_scene[key] = scene
+        unique_scenes.append(scene)
+
+    def _gen_unique(scene: dict):
+        """Genera + valida UNA escena única. Muta sólo su propio `scene`.
+
+        Devuelve la entrada de successful_clips en éxito, o None cuando la
+        escena falló de forma recuperable (la fase de relleno sustituye por
+        un clip policy-compatible). El job-timeout se propaga para abortar
+        todo el render rápido en vez de degradar en silencio.
+        """
+        key = scene["recurrence_key"]
         clip_path = os.path.join(job_dir, f"bg_scene_{key}.mp4")
         # En un regen (regen_keys set), las escenas NO-target son cache_only:
         # se sirven de caché o se degradan, nunca pagan Veo de nuevo.
@@ -9807,7 +9854,16 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
             # each 8s asset is still dense enough to inspect every second.
             # Validating only the stitched 3-5 minute timeline can sample
             # between scenes and miss a short human appearance.
-            if job_id:
+            if job_id and _scene_validation_observe_skip():
+                # Observe nunca rechaza → el chequeo inline es sólo latencia.
+                # Sintetizamos un veredicto passed con el fingerprint correcto
+                # para que la caché y la revalidación de edits sigan andando.
+                scene["validation"] = {
+                    "passed": True,
+                    "policy_fingerprint": _policy_fp,
+                    "validation_scope": "observe_skipped_inline",
+                }
+            elif job_id:
                 from content_validator import validate_video as _validate_scene_video
                 _scene_validation = _validate_scene_video(
                     clip_path,
@@ -9850,28 +9906,29 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                             f"scene rejected by no-human policy: "
                             f"{_scene_validation.get('issues', [])}"
                         )
-                if (
-                    not _cache_only
-                    and _meta.get("cache_object_key")
-                    and storage.is_enabled()
-                ):
-                    try:
-                        _stored_scene_key = storage.upload_file(
-                            clip_path,
-                            _meta["cache_object_key"],
+            if (
+                job_id
+                and not _cache_only
+                and _meta.get("cache_object_key")
+                and storage.is_enabled()
+            ):
+                try:
+                    _stored_scene_key = storage.upload_file(
+                        clip_path,
+                        _meta["cache_object_key"],
+                    )
+                    if _stored_scene_key:
+                        _meta["cache_object_key"] = _stored_scene_key
+                        _meta["cache_persisted_after_validation"] = True
+                        logger.info(
+                            "[SCENES] validated clip cached key=%s",
+                            _stored_scene_key,
                         )
-                        if _stored_scene_key:
-                            _meta["cache_object_key"] = _stored_scene_key
-                            _meta["cache_persisted_after_validation"] = True
-                            logger.info(
-                                "[SCENES] validated clip cached key=%s",
-                                _stored_scene_key,
-                            )
-                    except Exception as _cache_error:
-                        logger.warning(
-                            "[SCENES] validated clip cache upload failed: %s",
-                            _cache_error,
-                        )
+                except Exception as _cache_error:
+                    logger.warning(
+                        "[SCENES] validated clip cache upload failed: %s",
+                        _cache_error,
+                    )
             # NIT: no persistimos clip_path (es un path local efímero del job_dir
             # que filtraba el filesystem del contenedor al JSON/DB). El stitch usa
             # clip_for_key (abajo), no scene["clip_path"].
@@ -9893,8 +9950,7 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                 _tk = _persist_scene_thumb(clip_path, key, job_id)
                 if _tk:
                     scene["thumb_key"] = _tk
-            clip_for_key[key] = clip_path
-            successful_clips.append({
+            return {
                 "key": key,
                 "path": clip_path,
                 "allow_people": _scene_allow_people,
@@ -9902,7 +9958,7 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                     scene_policy.get("allow_atmospherics")
                 ),
                 "validation": dict(scene.get("validation") or {}),
-            })
+            }
         except Exception as e:  # noqa: BLE001
             _raise_if_job_timeout(e)
             # Cache_only-miss ESPERADO (review del PR del Sentinel, 2026-07-10):
@@ -9926,7 +9982,7 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                     "policy_fingerprint": _policy_fp,
                     "error": f"{type(e).__name__}: {e}"[:300],
                 }
-                continue
+                return None
             logger.error("[SCENES] escena %s falló (%s) — se sustituye por una válida", key, e)
             scene["status"] = "failed"
             # Guardar el motivo en la escena (persiste en scene_plan → /status,
@@ -9938,6 +9994,44 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                 "policy_fingerprint": _policy_fp,
                 "error": scene["error"],
             }
+            return None
+
+    # Fan-out de la generación de escenas únicas. Acotado; SCENE_CONCURRENCY=1
+    # (o ≤1 escena única) mantiene el comportamiento secuencial exacto de antes.
+    results_by_key: dict[str, dict] = {}
+    _workers = min(_scene_concurrency(), len(unique_scenes)) if unique_scenes else 1
+    if _workers <= 1:
+        for scene in unique_scenes:
+            results_by_key[scene["recurrence_key"]] = _gen_unique(scene)
+    else:
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(
+            max_workers=_workers, thread_name_prefix="scene-veo"
+        ) as _pool:
+            _futs = {
+                _pool.submit(_gen_unique, scene): scene["recurrence_key"]
+                for scene in unique_scenes
+            }
+            for _fut in _cf.as_completed(_futs):
+                # Un job-timeout (o cualquier error propagado desde _gen_unique)
+                # aborta el render entero — se re-lanza acá en vez de degradar.
+                results_by_key[_futs[_fut]] = _fut.result()
+
+    # Ensamblado single-thread: preserva el orden de escenas y el dedup de
+    # coros. La escena canónica ya viene mutada por _gen_unique; las repes
+    # heredan su veredicto.
+    for scene in scene_plan.get("scenes", []):
+        key = scene["recurrence_key"]
+        if key in clip_for_key:
+            if scene.get("validation", {}).get("passed") is not True:
+                source = canonical_scene.get(key)
+                if source is not None and source is not scene:
+                    scene["validation"] = dict(source.get("validation") or {})
+            continue
+        result = results_by_key.get(key)
+        if result is not None:
+            clip_for_key[key] = result["path"]
+            successful_clips.append(result)
     if not successful_clips:
         raise RuntimeError("ninguna escena Veo se generó — fallback a fondo único")
     # Rellenar fallos sólo con un clip cuya validación haya sido al menos tan
