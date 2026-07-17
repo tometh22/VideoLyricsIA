@@ -1047,6 +1047,13 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
     wants_youtube = delivery_profile in ("youtube", "both")
     wants_umg = delivery_profile in ("umg", "both")
 
+    # P3 2026-07-17: validación observe en paralelo con el encode. Se
+    # inicializan ANTES del try para que el join del happy-path y el join
+    # de rescate del finally puedan referenciarlos desde cualquier rama
+    # (mismo patrón que _scenes_active).
+    _bg_validation_pool = None
+    _bg_validation_future = None
+
     try:
         # Step 1 — Whisper transcription (or reuse persisted segments).
         # Precedence:
@@ -1480,12 +1487,46 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     })
                     return result
 
-                pre_validation = _validate_candidate(
-                    bg_image_path,
-                    ai_generated=_background_is_ai_generated,
-                )
-                update_job(job_id, validation_result=pre_validation)
-                if not pre_validation["passed"] and _validation_observe_only():
+                if _validation_parallel_enabled():
+                    # P3 2026-07-17: bajo observe el veredicto no puede
+                    # rechazar ni reasignar bg_image_path — correrlo inline
+                    # solo suma ~65s al camino crítico. Se despacha a un
+                    # hilo y el join vive antes de _verify_deliverables
+                    # (más el join de rescate del finally, que persiste el
+                    # veredicto aunque el encode falle). Capturas por valor:
+                    # bg_image_path no se reasigna después de este punto en
+                    # observe. copy_context preserva el tag job_id de los
+                    # logs del hilo (contextvars no se hereda solo).
+                    import concurrent.futures as _cf
+                    import contextvars as _cv
+                    _bg_validation_pool = _cf.ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="bg-validate",
+                    )
+                    _bg_validation_future = _bg_validation_pool.submit(
+                        _cv.copy_context().run,
+                        _run_observe_validation,
+                        job_id,
+                        (lambda _p=bg_image_path,
+                                _ai=_background_is_ai_generated:
+                            _validate_candidate(_p, ai_generated=_ai)),
+                    )
+                    logger.info(
+                        "[VALIDATION] observe-parallel: Vision corre en "
+                        "background mientras encodea job=%s", job_id,
+                    )
+                    # pre_validation queda como pass provisional para el
+                    # resto del flujo síncrono; el veredicto real lo
+                    # escribe el hilo en validation_result.
+                    pre_validation = {"passed": True, "deferred": True}
+                else:
+                    pre_validation = _validate_candidate(
+                        bg_image_path,
+                        ai_generated=_background_is_ai_generated,
+                    )
+                    update_job(job_id, validation_result=pre_validation)
+                if pre_validation.get("deferred"):
+                    pass
+                elif not pre_validation["passed"] and _validation_observe_only():
                     logger.warning(
                         "[VALIDATION] observe-only: keeping background "
                         "job=%s despite failed verdict issues=%s",
@@ -1622,7 +1663,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # Cache only the background that actually passed policy recovery. The
         # old ordering uploaded the first Veo result before validation, so a
         # hallucinated person could remain the reusable edit cache even when a
-        # later check rejected the job.
+        # later check rejected the job. (P3 observe-parallel: este upload
+        # puede preceder al veredicto del hilo — es seguro únicamente porque
+        # observe nunca sustituye el asset; bajo block el orden secuencial
+        # se preserva. Es el cache per-job backgrounds/{job_id}/, no el
+        # global bg_cache/.)
         bg_source = bg_image_path
         try:
             from jobs import merge_render_params as _merge_render_params
@@ -1760,6 +1805,20 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         if audio_dur_for_verify is None:
             # _audio_duration uses mutagen/wave; fall back to ffprobe for any format
             audio_dur_for_verify = _ffprobe_duration(mp3_path)
+
+        # P3: join INCONDICIONAL de la validación observe-paralela, ANTES de
+        # _verify_deliverables — o sea antes del cleanup que borra el archivo
+        # que el hilo lee y antes del status final. result() re-lanza
+        # cualquier error del hilo (patrón del fan-out de escenas): un fallo
+        # de Vision produce el mismo estado terminal 'error' que hoy en
+        # secuencial. A esta altura el hilo (~65s) casi siempre ya terminó
+        # (encode+short ~180s) → costo del join ≈ 0.
+        if _bg_validation_future is not None:
+            _bg_validation_future.result()
+            _bg_validation_pool.shutdown(wait=False)
+            _bg_validation_future = None
+            _bg_validation_pool = None
+
         _verify_deliverables(job_dir, files, audio_dur_for_verify)
 
         # Post-render upload to cloud storage. No-op if R2 env not set.
@@ -1907,6 +1966,23 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             _cleanup_job_dir_on_failure(job_dir)
         else:
             _cleanup_local_intermediates(job_dir)
+    finally:
+        # P3: join de rescate. Si el render falló entre el fork y el join
+        # del happy-path, en secuencial el veredicto ya estaba grabado antes
+        # del encode — acá lo persistimos igual (recolectar veredictos ES el
+        # objetivo de observe) y evitamos hilos huérfanos bajo
+        # SimpleWorker/tests (bajo el Worker RQ real el work-horse muere por
+        # job y se limpia solo). Best-effort: jamás pisa la excepción real.
+        if _bg_validation_future is not None:
+            try:
+                _bg_validation_future.result(timeout=90)
+            except Exception as _val_rescue_err:
+                logger.warning(
+                    "[VALIDATION] observe-parallel rescue join falló "
+                    "(no fatal): %s", _val_rescue_err,
+                )
+        if _bg_validation_pool is not None:
+            _bg_validation_pool.shutdown(wait=True)
 
 
 # ---------------------------------------------------------------------------
@@ -4996,6 +5072,45 @@ def _mark_validation_observed(result: dict) -> dict:
     result["observed_issues"] = list(result.get("issues") or [])
     result["enforcement"] = "observe"
     result["passed"] = True
+    return result
+
+
+def _validation_parallel_enabled() -> bool:
+    """Overlap del Vision check del fondo único con el encode.
+
+    Solo bajo enforcement=observe: ahí el veredicto NUNCA reasigna
+    ``bg_image_path`` (no hay recovery/gradiente), así que el hilo y el
+    encode pueden leer el mismo archivo sin carrera de path. Bajo block
+    (prod) retorna False sin siquiera leer el flag → camino secuencial
+    byte-idéntico. Flag propio (``BACKGROUND_VALIDATION_PARALLEL``, default
+    0) separado del enforcement: compliance y perf necesitan rollback
+    independiente.
+    """
+    if not _validation_observe_only():
+        return False
+    return os.getenv("BACKGROUND_VALIDATION_PARALLEL", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _run_observe_validation(job_id: str, validate_fn) -> dict:
+    """Cuerpo del hilo de validación observe-only del fondo único.
+
+    Réplica exacta de la rama inline observe de run_pipeline: registra el
+    veredicto crudo y, si falla, lo flipea a observed-pass. Ambos
+    ``update_job`` son thread-safe (SessionLocal por llamada +
+    ``with_for_update``) y solo escriben ``validation_result`` — no pisan
+    el progress/current_step que el encode actualiza desde el main thread.
+    """
+    result = validate_fn()
+    update_job(job_id, validation_result=result)
+    if not result.get("passed"):
+        logger.warning(
+            "[VALIDATION] observe-only: keeping background job=%s despite "
+            "failed verdict issues=%s", job_id, result.get("issues"),
+        )
+        result = _mark_validation_observed(result)
+        update_job(job_id, validation_result=result)
     return result
 
 
