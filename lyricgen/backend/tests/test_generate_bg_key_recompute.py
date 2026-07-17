@@ -128,6 +128,36 @@ def test_no_recompute_with_scenes_enabled(client, monkeypatch):
     assert captured["enable_scenes"] is True
 
 
+def test_no_recompute_for_library_variation(client, monkeypatch):
+    """Audit adversarial 2026-07-17: una variation de librería devuelve
+    bg_path=None con variation_source_path seteado → sin el guard explícito
+    el recompute corría igual. El guard debe EXCLUIRLA por sí mismo (no
+    depender de _animate_user_image downstream)."""
+    token, job_id, captured = _setup(client, monkeypatch)
+    monkeypatch.setattr(
+        "main._resolve_library_background",
+        lambda *a, **k: (None, None, "/tmp/seed.png", "r2/seed", 4242),
+    )
+    res = _post_generate(client, token, job_id, extra={"background_id": "77"})
+    assert res.status_code == 200, res.text
+    assert captured["bg_cache_key"] is None
+
+
+def test_malformed_segments_dont_500(client, monkeypatch):
+    """Audit adversarial: segments_json malformado (json válido pero no
+    lista de dicts) no debe tirar 500 en el recompute — se cae a fresh."""
+    token, job_id, captured = _setup(client, monkeypatch)
+    res = client.post("/generate", data={
+        "job_id": job_id, "artist": "A", "song_title": "S", "style": "oscuro",
+        "segments_json": json.dumps([None, {"no_text": 1}, "basura"]),
+        "delivery_profile": "youtube",
+    }, headers=auth(token))
+    assert res.status_code == 200, res.text
+    # No crashea; el key sale recomputado (con los segments filtrados) o None,
+    # pero nunca 500.
+    assert "bg_cache_key" in captured
+
+
 def test_variant_and_retry_never_pass_bg_cache_key():
     """Guard de regresión (hallazgo del diseño): /variant con params
     idénticos al padre QUIERE un fondo distinto — si heredara el fast
