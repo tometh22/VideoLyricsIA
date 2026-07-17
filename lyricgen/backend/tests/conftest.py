@@ -31,6 +31,21 @@ def _stub_moviepy():
 if "moviepy" not in sys.modules:
     _stub_moviepy()
 
+
+# librosa (numba/llvmlite/scipy) is a heavy transitive import of pipeline.py.
+# CI installs it for real; in a lean local test env it may be absent. Stub it
+# only when genuinely unavailable so pure-string / fallback-path tests (e.g.
+# the art-track filtergraph + energy-window fallback) can import pipeline.
+try:  # pragma: no cover - exercised only when librosa is installed
+    import librosa  # noqa: F401
+except Exception:  # pragma: no cover
+    _lb = types.ModuleType("librosa")
+    def _lb_load(*a, **k):
+        raise RuntimeError("librosa is stubbed in this test environment")
+    _lb.load = _lb_load
+    _lb.feature = types.SimpleNamespace(rms=lambda **k: [[0.0]])
+    sys.modules["librosa"] = _lb
+
 # main.py defaults ENVIRONMENT to "production", which then refuses to
 # import without an explicit CORS_ORIGINS list (security guard against
 # wildcard + credentials). Tests don't go through HTTP, so flag this
