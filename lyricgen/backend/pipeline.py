@@ -1141,7 +1141,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             bg_image_path = background_path
             logger.info("[BG] Using human-provided background: %s", background_path)
         else:
-            lyrics_text = " ".join(seg["text"] for seg in segments)
+            lyrics_text = " ".join(
+                str(seg.get("text") or "") for seg in segments
+                if isinstance(seg, dict)
+            )
             # Prefer the structured title the operator set on the job; fall
             # back to filename parsing for legacy rows / batch uploads. The
             # cache key downstream uses (artist|title) as a namespace so
@@ -1812,9 +1815,20 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # cualquier error del hilo (patrón del fan-out de escenas): un fallo
         # de Vision produce el mismo estado terminal 'error' que hoy en
         # secuencial. A esta altura el hilo (~65s) casi siempre ya terminó
-        # (encode+short ~180s) → costo del join ≈ 0.
+        # (encode+short ~180s) → costo del join ≈ 0. Timeout defensivo
+        # (audit adversarial 2026-07-17): con Vertex degradado la validación
+        # puede sumar minutos a un render EXITOSO — justo la latencia que
+        # este PR elimina, invertida. A los 180s se sigue de largo tratando
+        # el veredicto como no-concluyente (observe nunca bloquea igual).
         if _bg_validation_future is not None:
-            _bg_validation_future.result()
+            import concurrent.futures as _cf_join
+            try:
+                _bg_validation_future.result(timeout=180)
+            except _cf_join.TimeoutError:
+                logger.warning(
+                    "[VALIDATION] observe-parallel join timeout (180s) job=%s "
+                    "— sigo sin veredicto (observe no bloquea)", job_id,
+                )
             _bg_validation_pool.shutdown(wait=False)
             _bg_validation_future = None
             _bg_validation_pool = None
@@ -1982,7 +1996,14 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     "(no fatal): %s", _val_rescue_err,
                 )
         if _bg_validation_pool is not None:
-            _bg_validation_pool.shutdown(wait=True)
+            # wait=False a propósito (audit 2026-07-17): estamos en el
+            # failure path, el death-penalty ya se consumió, y un wait=True
+            # re-bloquea el work-horse hasta que el hilo Vision termine sus
+            # ~9 frames (~400s con Vertex degradado) — exactamente lo que
+            # _call_with_timeout evita. Bajo RQ real el work-horse muere por
+            # job y limpia el hilo; bajo SimpleWorker/tests el hilo non-daemon
+            # se junta al salir el intérprete.
+            _bg_validation_pool.shutdown(wait=False)
 
 
 # ---------------------------------------------------------------------------
@@ -14812,7 +14833,10 @@ def run_edit_pipeline(
                     "regenerar escenas individuales (edit_type='scene')."
                 )
             update_job(job_id, status="editing", current_step="background", progress=22)
-            lyrics_text = " ".join(seg["text"] for seg in segments)
+            lyrics_text = " ".join(
+                str(seg.get("text") or "") for seg in segments
+                if isinstance(seg, dict)
+            )
             try:
                 bg_image_path = _ensure_background(
                     style, job_dir,

@@ -7782,18 +7782,40 @@ async def generate_with_segments(
     # fondo equivocado.
     _bg_cache_key_norm = (bg_cache_key or "").strip() or None
     _effective_scenes = bool(enable_scenes) and has_scenes_access(current_user)
-    if _bg_cache_key_norm is None and bg_path is None and not _effective_scenes:
-        from bg_preview import job_bg_cache_key
-        _bg_cache_key_norm = job_bg_cache_key(
-            artist=artist, song_title=song_title, style=style,
-            movement_style=movement_style, effect=effect,
-            custom_colors=(custom_colors.strip() or ""), genre=genre,
-            concept=concept, background_hint=(background_hint.strip() or None),
-            bg_verbatim=bg_verbatim, match_lyrics=match_lyrics,
-            lyrics_text=" ".join(
-                str(seg.get("text") or "") for seg in (segments or [])
-            ),
-        )
+    # Audit adversarial 2026-07-17: excluir variation EXPLÍCITAMENTE. Una
+    # variation de librería devuelve bg_path=None (con variation_source_path
+    # seteado), así que sin este guard el recompute corría y le asignaba un
+    # key a un job de variation — justo lo que /variant NO debe heredar (un
+    # _animate_user_image downstream lo salvaba, pero el guard debe hacer lo
+    # que el comentario promete, no depender de otra rama). Y el join de la
+    # letra va DENTRO del try: segments malformados (json.loads de un cliente
+    # roto) no deben tirar 500 y bloquear el enqueue — se cae a fresh.
+    _is_variation = bool(variation_source_path or variation_source_r2_key)
+    if (
+        _bg_cache_key_norm is None and bg_path is None
+        and not _effective_scenes and not _is_variation
+    ):
+        try:
+            from bg_preview import job_bg_cache_key
+            _bg_cache_key_norm = job_bg_cache_key(
+                artist=artist, song_title=song_title, style=style,
+                movement_style=movement_style, effect=effect,
+                custom_colors=(custom_colors.strip() or ""), genre=genre,
+                concept=concept,
+                background_hint=(background_hint.strip() or None),
+                bg_verbatim=bg_verbatim, match_lyrics=match_lyrics,
+                lyrics_text=" ".join(
+                    str(seg.get("text") or "")
+                    for seg in (segments or [])
+                    if isinstance(seg, dict)
+                ),
+            )
+        except Exception as _recompute_err:
+            logger.warning(
+                "[BG] recompute server-side falló job=%s: %s — fondo fresh",
+                job_id, _recompute_err,
+            )
+            _bg_cache_key_norm = None
         if _bg_cache_key_norm:
             logger.info(
                 "[BG] bg_cache_key recomputado server-side job=%s key=%s",
