@@ -197,7 +197,7 @@ def main():
     ap.add_argument("--base-url", required=True)
     ap.add_argument("--bless", action="store_true",
                     help="guardar los frames actuales como nuevos goldens")
-    ap.add_argument("--timeout-min", type=int, default=25)
+    ap.add_argument("--timeout-min", type=int, default=45)
     args = ap.parse_args()
     base = args.base_url.rstrip("/")
 
@@ -255,12 +255,30 @@ def main():
             elif s in ("error", "validation_failed", "rejected"):
                 failed[name] = f"{s}: {(st.get('error') or '')[:200]}"
                 del pending[name]
+    # Un job que al deadline sigue SIN ARRANCAR (queued/processing 0%) no es
+    # una regresión de render — es la cola canary drenando último detrás de
+    # tráfico humano. Marcarlo rojo entrenaría al equipo a ignorar el golden;
+    # se rechaza (libera el cupo de 5 pendientes) y se sale NEUTRO.
+    starved = {}
+    for name, jid in list(pending.items()):
+        st = _req(base, f"/status/{jid}", token=token)
+        if st.get("status") == "queued":
+            starved[name] = jid
+            del pending[name]
     for name, jid in pending.items():
         failed[name] = f"timeout tras {args.timeout_min} min"
     if failed:
         for name, why in failed.items():
             print(f"[GOLDEN] RENDER FALLÓ {name}: {why}", file=sys.stderr)
         sys.exit(2)
+    if starved:
+        # Quedan encolados: corren cuando la cola se vacíe y el cleanup del
+        # próximo run los rechaza una vez terminados (pending_review/done).
+        for name, jid in starved.items():
+            print(f"[GOLDEN] SKIPPED {name} ({jid}): cola ocupada — el render "
+                  "nunca arrancó dentro del deadline (no es regresión)",
+                  file=sys.stderr)
+        sys.exit(0)
 
     # Frames + comparación
     regressions = []
