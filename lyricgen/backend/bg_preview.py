@@ -279,10 +279,17 @@ def run_bg_preview_job(
             pass
         return {"job_id": job_id, "status": "bg_preview_done", "bg_cache_key": bg_cache_key, "cached": True}
 
+    # "bg_preview_running" (≤20 chars): el nombre viejo
+    # "bg_preview_generating" (21) excedía el varchar(20) de Job.status y
+    # este update fallaba EN SILENCIO desde siempre en Postgres (el status
+    # jamás existió en la DB — 0 filas históricas; lo destapó el CI de
+    # Postgres del PR #924). El try/except queda, pero ahora loguea: un
+    # guard que traga errores esconde bugs de schema.
     try:
-        update_job(job_id, status="bg_preview_generating", current_step="background")
-    except Exception:
-        pass
+        update_job(job_id, status="bg_preview_running", current_step="background")
+    except Exception as _status_err:
+        logger.warning("[BG_PREVIEW] no pude marcar running job=%s: %s",
+                       job_id, _status_err)
 
     # Importamos pipeline solo cuando lo necesitamos (importar main/pipeline
     # arrastra mucho — preferimos lazy para que el módulo bg_preview sea

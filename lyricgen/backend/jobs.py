@@ -538,7 +538,7 @@ def bulk_delete_jobs(db: Session, job_ids: list[str], tenant_id: str) -> dict:
 # them at the user-facing read boundary. Admin paths use
 # `get_all_jobs_admin` and still see ghosts for debugging.
 _BG_PREVIEW_STATUSES = (
-    "bg_preview_queued", "bg_preview_generating",
+    "bg_preview_queued", "bg_preview_running",
     "bg_preview_done", "bg_preview_failed",
 )
 
