@@ -154,7 +154,7 @@ def _warn_if_shutdown_grace_too_short() -> None:
         )
 
 
-_DEFAULT_QUEUES = "transcription,bg_preview,enterprise,default"
+_DEFAULT_QUEUES = "transcription,bg_preview,enterprise,default,canary"
 
 
 def _resolve_queue_names() -> list:
