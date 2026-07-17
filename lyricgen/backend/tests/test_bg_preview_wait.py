@@ -6,7 +6,7 @@ vuelo (doble llamada). Con BG_PREVIEW_WAIT_S>0 el render espera (acotado)
 a que el preview cachee y lo reusa. Default 0 = inerte.
 
 Guards adversariales cubiertos:
-- solo espera previews en `bg_preview_generating` (no `queued`: un preview
+- solo espera previews en `bg_preview_running` (no `queued`: un preview
   que ShortWorker nunca levantó haría esperar el deadline en vano);
 - solo del MISMO tenant (procedencia/costos no cruzan tenants);
 - recencia de 15 min (fila zombie post-OOM no ancla la espera);
@@ -73,7 +73,7 @@ class TestFindInflight:
                 status="processing")
         _mk_job(db, u, job_id="preview00001",
                 filename="bgpreview_abc123def456.preview",
-                status="bg_preview_generating")
+                status="bg_preview_running")
         assert pipeline._find_inflight_bg_preview(
             "abc123def456", render_job_id="render000001",
         ) == "preview00001"
@@ -100,7 +100,7 @@ class TestFindInflight:
                 status="processing")
         _mk_job(db, u_b, job_id="preview00003",
                 filename="bgpreview_abc123def456.preview",
-                status="bg_preview_generating")
+                status="bg_preview_running")
         assert pipeline._find_inflight_bg_preview(
             "abc123def456", render_job_id="render000003",
         ) is None
@@ -112,7 +112,7 @@ class TestFindInflight:
                 status="processing")
         j = _mk_job(db, u, job_id="preview00004",
                     filename="bgpreview_abc123def456.preview",
-                    status="bg_preview_generating")
+                    status="bg_preview_running")
         j.created_at = datetime.now(timezone.utc) - timedelta(minutes=30)
         db.commit()
         assert pipeline._find_inflight_bg_preview(
@@ -121,7 +121,7 @@ class TestFindInflight:
 
 
 class TestAwaitInflight:
-    def _arm(self, monkeypatch, *, cache_checks, preview_status="bg_preview_generating"):
+    def _arm(self, monkeypatch, *, cache_checks, preview_status="bg_preview_running"):
         """Wiring común: sin sleeps reales, cache_check con respuestas
         secuenciales, download escribe el archivo."""
         monkeypatch.setenv("BG_PREVIEW_WAIT_S", "45")

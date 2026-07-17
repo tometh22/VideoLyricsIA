@@ -609,7 +609,7 @@ def _find_inflight_bg_preview(bg_cache_key, *, render_job_id, max_age_min=15):
     """job_id del preview EN EJECUCIÓN para este key y este tenant, o None.
 
     Filtros (revisión adversarial 2026-07-17):
-    - ``bg_preview_generating`` solamente: un preview meramente encolado que
+    - ``bg_preview_running`` solamente: un preview meramente encolado que
       ShortWorker nunca levantó haría esperar el deadline en vano.
     - Mismo tenant que el render: consumir el preview de OTRO tenant
       transfiere la procedencia Veo y la atribución de costos al tenant
@@ -629,7 +629,7 @@ def _find_inflight_bg_preview(bg_cache_key, *, render_job_id, max_age_min=15):
                 db.query(Job)
                 .filter(
                     Job.filename == f"bgpreview_{bg_cache_key}.preview",
-                    Job.status == "bg_preview_generating",
+                    Job.status == "bg_preview_running",
                     Job.tenant_id == render_row.tenant_id,
                     Job.created_at >= cutoff,
                 )
