@@ -95,6 +95,13 @@ export function useBackgroundPreview(entry, {
   const debounceRef = useRef(null);
   const pollAbortRef = useRef(null);
   const lastKeyRef = useRef(null);
+  // v6 (2026-07-17): la letra entra al hash del backend (con match_lyrics el
+  // prompt del fondo depende del texto). Se snapshotea AL DISPARAR vía ref —
+  // NUNCA entra a las deps del debounce: editar la letra no debe re-disparar
+  // previews (costo Veo); una letra editada después del disparo se invalida
+  // sola en el render (mismatch del fingerprint → generación fresh).
+  const entryRef = useRef(entry);
+  entryRef.current = entry;
 
   const startPreview = useCallback(async (params) => {
     // Staleness guard (audit adversarial 2026-06-09): el fetch no se
@@ -215,7 +222,12 @@ export function useBackgroundPreview(entry, {
     if (onCacheKey) onCacheKey(null);
 
     debounceRef.current = setTimeout(() => {
-      startPreview(params);
+      // Snapshot fresco de la letra al momento del POST (ver entryRef arriba).
+      const liveEntry = entryRef.current || entry;
+      const lyricsText = Array.isArray(liveEntry?.segments)
+        ? liveEntry.segments.map((s) => (s && s.text) || "").join(" ")
+        : "";
+      startPreview({ ...params, lyrics_text: lyricsText });
     }, debounceMs);
 
     return () => {
