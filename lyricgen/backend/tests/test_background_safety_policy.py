@@ -474,3 +474,48 @@ def test_rq_timeout_is_never_treated_as_a_recoverable_generation_error():
         "exc",
     ):
         assert f"_raise_if_job_timeout({error_name})" in edit_source
+
+
+def _fake_failed_verdict(*_a, **_k):
+    return {"passed": False, "issues": [{"type": "people", "detail": "figure"}]}
+
+
+def test_observe_only_keeps_background_and_records_verdict(db, tmp_path, monkeypatch):
+    monkeypatch.setenv("BACKGROUND_VALIDATION_ENFORCEMENT", "observe")
+    job_id = _job(db)
+    asset = tmp_path / "bg.mp4"
+    asset.write_bytes(b"x")
+    monkeypatch.setattr("content_validator.validate_video", _fake_failed_verdict)
+
+    assert pipeline._validate_background_asset_for_job(job_id, str(asset)) is True
+
+    row = db.query(Job).filter(Job.job_id == job_id).first()
+    db.refresh(row)
+    assert row.status != "validation_failed"
+    assert row.validation_result["passed"] is True
+    assert row.validation_result["observed_violation"] is True
+    assert row.validation_result["observed_issues"]
+
+
+def test_block_mode_still_fails_closed_by_default(db, tmp_path, monkeypatch):
+    monkeypatch.delenv("BACKGROUND_VALIDATION_ENFORCEMENT", raising=False)
+    job_id = _job(db)
+    asset = tmp_path / "bg.mp4"
+    asset.write_bytes(b"x")
+    monkeypatch.setattr("content_validator.validate_video", _fake_failed_verdict)
+
+    assert pipeline._validate_background_asset_for_job(job_id, str(asset)) is False
+
+    row = db.query(Job).filter(Job.job_id == job_id).first()
+    db.refresh(row)
+    assert row.status == "validation_failed"
+
+
+def test_mark_validation_observed_annotates_without_losing_issues():
+    marked = pipeline._mark_validation_observed(
+        {"passed": False, "issues": [{"type": "brand"}]}
+    )
+    assert marked["passed"] is True
+    assert marked["observed_violation"] is True
+    assert marked["observed_issues"] == [{"type": "brand"}]
+    assert marked["enforcement"] == "observe"

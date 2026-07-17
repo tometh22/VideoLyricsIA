@@ -1331,7 +1331,15 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     ai_generated=_background_is_ai_generated,
                 )
                 update_job(job_id, validation_result=pre_validation)
-                if not pre_validation["passed"]:
+                if not pre_validation["passed"] and _validation_observe_only():
+                    logger.warning(
+                        "[VALIDATION] observe-only: keeping background "
+                        "job=%s despite failed verdict issues=%s",
+                        job_id, pre_validation.get("issues"),
+                    )
+                    pre_validation = _mark_validation_observed(pre_validation)
+                    update_job(job_id, validation_result=pre_validation)
+                elif not pre_validation["passed"]:
                     # Generated model output is disposable. Universal must
                     # never reject the whole lyric video because a provider
                     # hallucinated a person (or because the classifier could
@@ -4807,6 +4815,36 @@ def _re_match_universal_tenant(tenant_id: str) -> bool:
     return bool(_re.fullmatch(r"universal(?:[_-][a-z0-9_-]+)?", tenant_id or ""))
 
 
+def _validation_observe_only() -> bool:
+    """Kill-switch for validation *enforcement*, not detection.
+
+    ``BACKGROUND_VALIDATION_ENFORCEMENT=observe`` keeps every Vision check,
+    its provenance row and the stored verdict, but never rejects, regenerates
+    or downgrades a background because of it. The default ("block") preserves
+    the fail-closed behavior, so production semantics are unchanged unless the
+    environment opts in.
+    """
+    return (
+        os.getenv("BACKGROUND_VALIDATION_ENFORCEMENT", "block").strip().lower()
+        == "observe"
+    )
+
+
+def _mark_validation_observed(result: dict) -> dict:
+    """Turn a failing verdict into an annotated pass for observe-only mode.
+
+    ``passed`` must flip to True because downstream consumers (scene-plan
+    reuse, edit revalidation, review UI) gate on it; the original verdict
+    stays inspectable under ``observed_issues``.
+    """
+    result = dict(result)
+    result["observed_violation"] = True
+    result["observed_issues"] = list(result.get("issues") or [])
+    result["enforcement"] = "observe"
+    result["passed"] = True
+    return result
+
+
 def _background_safety_policy(job_id: str | None, operator_prompt: str | None = None) -> dict:
     """Resolve the authoritative background policy, failing closed.
 
@@ -5148,6 +5186,13 @@ def _validate_background_asset_for_job(
     result["allow_atmospherics"] = policy["allow_atmospherics"]
     update_job(job_id, validation_result=result)
     if result.get("passed") is not True:
+        if _validation_observe_only():
+            logger.warning(
+                "[VALIDATION] observe-only: keeping background for job %s "
+                "despite failed verdict: %s", job_id, result.get("issues"),
+            )
+            update_job(job_id, validation_result=_mark_validation_observed(result))
+            return True
         if failure_status:
             update_job(
                 job_id, status=failure_status,
@@ -9789,10 +9834,22 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                     "policy_fingerprint": _policy_fp,
                 }
                 if _scene_validation.get("passed") is not True:
-                    raise RuntimeError(
-                        f"scene rejected by no-human policy: "
-                        f"{_scene_validation.get('issues', [])}"
-                    )
+                    if _validation_observe_only():
+                        logger.warning(
+                            "[SCENES] observe-only: keeping clip %s job=%s "
+                            "despite failed verdict issues=%s",
+                            key, job_id, _scene_validation.get("issues"),
+                        )
+                        scene["validation"]["passed"] = True
+                        scene["validation"]["observed_violation"] = True
+                        scene["validation"]["observed_issues"] = list(
+                            _scene_validation.get("issues") or []
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"scene rejected by no-human policy: "
+                            f"{_scene_validation.get('issues', [])}"
+                        )
                 if (
                     not _cache_only
                     and _meta.get("cache_object_key")
@@ -11014,6 +11071,18 @@ def _select_validated_background(
         if result.get("passed"):
             logger.info("[VALIDATION] bg accepted on attempt %s: %s",
                         attempt, os.path.basename(candidate))
+            return candidate, issues
+        if _validation_observe_only():
+            logger.warning(
+                "[VALIDATION] observe-only: accepting library bg %s "
+                "despite failed verdict issues=%s",
+                os.path.basename(candidate), result.get("issues"),
+            )
+            for it in result.get("issues") or []:
+                issues.append({
+                    "attempt": attempt, "bg": os.path.basename(candidate),
+                    "observed": True, **it,
+                })
             return candidate, issues
         logger.warning("[VALIDATION] bg rejected on attempt %s (%s): %s",
                        attempt, os.path.basename(candidate), result.get('issues'))
