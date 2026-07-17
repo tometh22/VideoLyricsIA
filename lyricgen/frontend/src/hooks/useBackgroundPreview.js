@@ -103,7 +103,7 @@ export function useBackgroundPreview(entry, {
   const entryRef = useRef(entry);
   entryRef.current = entry;
 
-  const startPreview = useCallback(async (params) => {
+  const startPreview = useCallback(async (params, extraBody = null) => {
     // Staleness guard (audit adversarial 2026-06-09): el fetch no se
     // cancela cuando el operador cambia un param — la respuesta vieja
     // llegaba DESPUÉS del onCacheKey(null) y re-envenenaba el key. Cada
@@ -111,6 +111,9 @@ export function useBackgroundPreview(entry, {
     // ya no coinciden, el key se entrega con stale=true para que el
     // consumer NO lo escriba en la review actual (sí sirve para el
     // backfill R-FRONT-2 de jobs ya aprobados con esos params).
+    // OJO: la clave de vigencia se computa SOLO sobre `params` (los del
+    // change-detection del effect) — `extraBody` (lyrics_text v6) viaja
+    // en el POST pero no participa del staleness ni del dedupe.
     const myParamsKey = paramsKey(params);
     const isCurrent = () => lastKeyRef.current === myParamsKey;
     setStatus("queued");
@@ -119,7 +122,7 @@ export function useBackgroundPreview(entry, {
       const res = await fetch(`${api}/generate-preview`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify(params),
+        body: JSON.stringify(extraBody ? { ...params, ...extraBody } : params),
       });
       if (!res.ok) {
         if (!isCurrent()) return;
@@ -227,7 +230,7 @@ export function useBackgroundPreview(entry, {
       const lyricsText = Array.isArray(liveEntry?.segments)
         ? liveEntry.segments.map((s) => (s && s.text) || "").join(" ")
         : "";
-      startPreview({ ...params, lyrics_text: lyricsText });
+      startPreview(params, { lyrics_text: lyricsText });
     }, debounceMs);
 
     return () => {
