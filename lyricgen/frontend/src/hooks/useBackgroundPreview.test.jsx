@@ -159,6 +159,51 @@ describe("useBackgroundPreview — stale cache key", () => {
   });
 });
 
+describe("lyrics_text v6", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("manda la letra en el POST sin afectar staleness ni dedupe", async () => {
+    // v6: la letra entra al hash del backend (fondo depende del texto con
+    // match_lyrics), pero NO participa del change-detection del hook —
+    // editar la letra no re-dispara previews, y la respuesta llega fresca
+    // (stale=false) aunque el body incluya lyrics_text.
+    const onCacheKey = vi.fn();
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ bg_cache_key: "key-lyr", cached: true }),
+    });
+    const entry = {
+      ...entryBase,
+      segments: [
+        { start: 0, end: 2, text: "poco a poco" },
+        { start: 2, end: 4, text: "pude notar" },
+      ],
+    };
+    renderHook(() =>
+      useBackgroundPreview(entry, {
+        api: "http://test",
+        authHeaders: () => ({}),
+        onCacheKey,
+        debounceMs: 100,
+      }),
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(global.fetch.mock.calls[0][1].body);
+    expect(body.lyrics_text).toBe("poco a poco pude notar");
+    // La respuesta NO es stale: la clave de vigencia ignora lyrics_text.
+    expect(onCacheKey).toHaveBeenCalledWith("key-lyr", { stale: false });
+  });
+});
+
 describe("background preview eligibility", () => {
   const eligible = (overrides = {}) => shouldEnableBackgroundPreview({
     hasReview: true,

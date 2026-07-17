@@ -73,7 +73,23 @@ logger = logging.getLogger("genly.bg_preview")
 # particular off/shadow/enforce never share a key, and an asset generated
 # under the legacy namespace cannot become an enforce-mode cache hit. Every
 # v5 entry also passed the authoritative content gate before cache_put.
-CACHE_VERSION = "v5"
+# v6 (2026-07-17): el hash suma `_lyrics_fp` — con match_lyrics=True el
+# prompt del fondo depende de la LETRA, pero el preview generaba ciego a
+# ella y el render podía heredar ese fondo vía cache-hit. Solo hashea el
+# TEXTO normalizado (no timestamps): la corrección típica del operador es
+# de timing (93% medido) y no debe rotar el key. v6 además deja de cachear
+# el gradiente de policy-fallback bajo la key real.
+CACHE_VERSION = "v6"
+
+
+def lyrics_fingerprint(lyrics_text) -> str:
+    """sha256-8 del texto de la letra, normalizado (lower + espacios
+    colapsados). 'nolyrics' cuando no hay letra — un preview sin letra y un
+    render con letra NUNCA deben compartir fondo si match_lyrics=True."""
+    text = " ".join(str(lyrics_text or "").lower().split())
+    if not text:
+        return "nolyrics"
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
 
 
 def compute_bg_cache_key(params: dict) -> str:
@@ -119,10 +135,52 @@ def compute_bg_cache_key(params: dict) -> str:
         "background_mode": (params.get("background_mode") or "veo").strip().lower(),
         "animate_image":   bool(params.get("animate_image", False)),
         "match_lyrics":    bool(params.get("match_lyrics", True)),
+        # Con match_lyrics el prompt depende del texto de la letra; sin él,
+        # constante para no rotar el cache por un campo irrelevante.
+        "_lyrics_fp": (
+            lyrics_fingerprint(params.get("lyrics_text"))
+            if bool(params.get("match_lyrics", True)) else "off"
+        ),
     }
     payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return digest[:12]
+
+
+def job_bg_cache_key(*, artist, song_title, style, movement_style, effect,
+                     custom_colors, genre, concept, background_hint,
+                     bg_verbatim, match_lyrics, lyrics_text=None):
+    """Key esperado para el fast-path de fondo único AI de un job /generate.
+
+    Única fuente de verdad de los hardcodes `background_mode="veo"` /
+    `animate_image=False`: el preview SIEMPRE hashea así (App.jsx
+    previewEntry los fija) y el caller excluye custom/library/escenas/
+    variation antes de llamar. La usan main.py (recompute server-side
+    cuando el frontend no mandó el key — race del debounce) y
+    pipeline._validate_bg_cache_key (validación defensiva del worker), así
+    que main y worker no pueden divergir en la normalización.
+
+    Best-effort: None si el cómputo falla (el caller genera fresh).
+    """
+    try:
+        return compute_bg_cache_key({
+            "artist": artist or "",
+            "song_title": song_title or "",
+            "style": style or "",
+            "movement_style": movement_style or "",
+            "effect": effect or "",
+            "custom_colors": custom_colors or "",
+            "genre": genre or "",
+            "concept": concept or "",
+            "background_hint": background_hint or "",
+            "bg_verbatim": bool(bg_verbatim),
+            "background_mode": "veo",
+            "animate_image": False,
+            "match_lyrics": bool(match_lyrics),
+            "lyrics_text": lyrics_text,
+        })
+    except Exception:
+        return None
 
 
 def cache_r2_key(bg_cache_key: str) -> str:
@@ -256,6 +314,10 @@ def run_bg_preview_job(
                         concept=params.get("concept", ""),
                         movement_style=params.get("movement_style", ""),
                         match_lyrics=bool(params.get("match_lyrics", True)),
+                        # v6: el preview genera CON la letra (si el frontend
+                        # la mandó) — antes generaba ciego a ella y el render
+                        # heredaba un fondo que no la reflejaba.
+                        lyrics_text=params.get("lyrics_text") or "",
                         background_hint=params.get("background_hint"),
                         bg_verbatim=bool(params.get("bg_verbatim", False)),
                         bg_mode=params.get("background_mode", "veo"),
@@ -305,15 +367,25 @@ def run_bg_preview_job(
                     "policy_version": runtime_policy.get("policy_version"),
                     "policy_mode": runtime_policy.get("policy_mode"),
                 })
+                # v6: el gradiente de fallback NO se sube bajo la key real.
+                # Cachearlo hacía que un render futuro con la misma key lo
+                # heredara como si fuera un fondo Veo bueno, salteando su
+                # propia generación y recovery (audit adversarial 2026-07-17).
+                # Sin objeto en cache → el render hace miss y genera fresh.
+                logger.warning(
+                    "[BG_PREVIEW] job=%s policy fallback (gradiente) — no se "
+                    "cachea bajo key=%s; el render regenerará fresh",
+                    job_id, bg_cache_key,
+                )
+            else:
+                uploaded_key = cache_put(bg_cache_key, bg_path)
+                if not uploaded_key:
+                    raise RuntimeError("R2 upload failed (R2 disabled?)")
 
-            uploaded_key = cache_put(bg_cache_key, bg_path)
-            if not uploaded_key:
-                raise RuntimeError("R2 upload failed (R2 disabled?)")
-
-            logger.info(
-                "[BG_PREVIEW] job=%s uploaded bg to R2 key=%s (size=%d KB)",
-                job_id, uploaded_key, os.path.getsize(bg_path) // 1024,
-            )
+                logger.info(
+                    "[BG_PREVIEW] job=%s uploaded bg to R2 key=%s (size=%d KB)",
+                    job_id, uploaded_key, os.path.getsize(bg_path) // 1024,
+                )
 
         try:
             update_job(job_id, status="bg_preview_done", current_step="cached", error=None)

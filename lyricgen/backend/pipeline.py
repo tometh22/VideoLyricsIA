@@ -521,7 +521,8 @@ def _best_effort_lyrics_hint(artist: str, song_title: str) -> str | None:
 
 def _validate_bg_cache_key(bg_cache_key, *, job_id, artist, song_title, style,
                            movement_style, effect, custom_colors, genre,
-                           concept, background_hint, bg_verbatim, match_lyrics):
+                           concept, background_hint, bg_verbatim, match_lyrics,
+                           lyrics_text=None):
     """Valida que el bg_cache_key del cliente corresponda a ESTE job.
 
     Audit adversarial 2026-06-09: el key viene del CLIENTE y se usaba sin
@@ -529,35 +530,25 @@ def _validate_bg_cache_key(bg_cache_key, *, job_id, artist, song_title, style,
     o directamente ajeno (otro tenant, request crafteado) servía CUALQUIER
     fondo de bg_cache/ como si fuera de este job. Acá el servidor recomputa
     el hash desde los params reales del job con la MISMA función que usó el
-    preview (bg_preview.compute_bg_cache_key) y descarta el key si no
-    coincide. Peor caso de un falso mismatch = generación fresh (correcta,
-    solo más lenta y ~$0.80-3.20 de Veo) — nunca un fondo equivocado.
+    preview (bg_preview.job_bg_cache_key, que centraliza los hardcodes
+    background_mode="veo"/animate_image=False compartidos con el recompute
+    de main.py) y descarta el key si no coincide. Peor caso de un falso
+    mismatch = generación fresh (correcta, solo más lenta y ~$0.80-3.20 de
+    Veo) — nunca un fondo equivocado.
 
     Returns:
         El key si coincide; None si no (o si la validación misma falla).
     """
     try:
-        from bg_preview import compute_bg_cache_key
-        expected = compute_bg_cache_key({
-            "artist": artist or "",
-            "song_title": song_title or "",
-            "style": style or "",
-            "movement_style": movement_style or "",
-            "effect": effect or "",
-            "custom_colors": custom_colors or "",
-            "genre": genre or "",
-            "concept": concept or "",
-            "background_hint": background_hint or "",
-            "bg_verbatim": bool(bg_verbatim),
-            # El preview siempre hashea con background_mode="veo"
-            # (App.jsx previewEntry lo hardcodea) y animate_image solo es
-            # true con custom file — caso que nunca llega al fast path
-            # (_animate_user_image lo excluye en el caller).
-            "background_mode": "veo",
-            "animate_image": False,
-            "match_lyrics": bool(match_lyrics),
-        })
-        if bg_cache_key != expected:
+        from bg_preview import job_bg_cache_key
+        expected = job_bg_cache_key(
+            artist=artist, song_title=song_title, style=style,
+            movement_style=movement_style, effect=effect,
+            custom_colors=custom_colors, genre=genre, concept=concept,
+            background_hint=background_hint, bg_verbatim=bg_verbatim,
+            match_lyrics=match_lyrics, lyrics_text=lyrics_text,
+        )
+        if expected is None or bg_cache_key != expected:
             logger.warning(
                 "[BG] bg_cache_key DESCARTADO job=%s: cliente=%s esperado=%s "
                 "(params del job no coinciden con los del preview) — fondo fresh",
@@ -1051,7 +1042,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     movement_style=movement_style, effect=effect,
                     custom_colors=custom_colors, genre=genre, concept=concept,
                     background_hint=background_hint, bg_verbatim=bg_verbatim,
-                    match_lyrics=match_lyrics,
+                    match_lyrics=match_lyrics, lyrics_text=lyrics_text,
                 )
             if bg_cache_key and not _animate_user_image:
                 try:
@@ -1062,6 +1053,28 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                             logger.info("[BG] cache HIT key=%s — reusando %s, skip Veo/Imagen",
                                         bg_cache_key, os.path.basename(cached_path))
                             bg_image_path = cached_path
+                            # Auditoría del reuso: la llamada Veo real quedó
+                            # registrada bajo el job del PREVIEW; sin esta
+                            # fila el job del render no tiene procedencia
+                            # del fondo. tool_name distinto de 'veo-%' para
+                            # no contar como generación en las métricas.
+                            try:
+                                from provenance import record_ai_call
+                                record_ai_call(
+                                    job_id, "video_bg", "bg-cache-reuse",
+                                    "r2-cache",
+                                    prompt=f"bg_cache/{bg_cache_key}.mp4",
+                                ).finish(
+                                    response_summary=(
+                                        f"reused cached background key={bg_cache_key} "
+                                        "(generated by a bg_preview job)"
+                                    ),
+                                )
+                            except Exception as _prov_err:
+                                logger.warning(
+                                    "[BG] provenance del cache-reuse falló "
+                                    "(no fatal): %s", _prov_err,
+                                )
                         else:
                             logger.warning("[BG] cache_check OK pero download falló key=%s — fallback",
                                            bg_cache_key)
