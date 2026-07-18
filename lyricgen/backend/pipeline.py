@@ -1627,7 +1627,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 )
                 generate_art_track_short(
                     mp3_path, bg_source, job_dir, spec=_short_spec,
-                    effect=effect, style=style, custom_colors=custom_colors,
+                    artist=artist, song_title=song_title,
                 )
             else:
                 generate_short(
@@ -11727,93 +11727,225 @@ def _static_image_to_mp4(image_path: str, output_path: str, duration: float,
     return output_path
 
 
-def _art_track_filtergraph(spec: "RenderSpec", total_frames: int) -> str:
-    """Build the ffmpeg -filter_complex for the art-track background from a
-    single still cover image. Pure string builder (no ffmpeg) so the graph
-    is unit-testable.
+def _art_track_layout(spec: "RenderSpec") -> dict:
+    """Pixel positions for the VEVO-style art-track composite, per spec dims.
 
-    The look (VEVO "official audio" art track): a blurred, frame-filling copy
-    of the cover as ambient background + the sharp cover centered at ~72% of
-    the frame, with a subtle continuous push-in so it never looks frozen.
-
-    Built at 2x supersample then downscaled by zoompan (same anti-jitter trick
-    as `_prerender_kenburns_bg`), so the sharp cover stays crisp under the 5%
-    zoom. Everything is C-level ffmpeg (bounded memory) per the OOM rule
-    ("Rata Blanca" 2026-06-02) — never a moviepy per-frame pan.
+    Landscape (16:9, UMG): blurred cover fills the frame; the sharp cover sits
+    as a shadowed card on the RIGHT; a SoundCloud-style waveform + title/artist
+    sit on the LEFT. Portrait (9:16 short): card centered on top, waveform +
+    text below. Pure arithmetic so it's unit-testable and shared by the PIL
+    overlay builder and the ffmpeg compositor.
     """
-    up_w, up_h = spec.width * 2, spec.height * 2
-    fit_w, fit_h = int(up_w * 0.72), int(up_h * 0.72)  # ~14% margin
-    zoom_end = 1.05                                     # subtler than Ken Burns' 1.15
-    zoom_step = (zoom_end - 1.0) / max(1, total_frames)
-    sigma = max(30, up_h // 36)                         # blur scales with resolution
-    return (
-        f"[0:v]split=2[bgs][fgs];"
-        f"[bgs]scale={up_w}:{up_h}:force_original_aspect_ratio=increase,"
-        f"crop={up_w}:{up_h},gblur=sigma={sigma},"
-        f"eq=brightness=-0.06:saturation=1.12[bg];"
-        f"[fgs]scale={fit_w}:{fit_h}:force_original_aspect_ratio=decrease[fg];"
-        f"[bg][fg]overlay=(W-w)/2:(H-h)/2,"
-        f"zoompan=z='min(zoom+{zoom_step:.8f},{zoom_end})':d={total_frames}:"
-        f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-        f"s={spec.width}x{spec.height}:fps={spec.fps_str}[out]"
+    W, H = spec.width, spec.height
+    portrait = H > W
+    if portrait:
+        card = int(W * 0.66)
+        card_x = (W - card) // 2
+        card_y = int(H * 0.12)
+        wave_w = int(W * 0.84)
+        wave_x = (W - wave_w) // 2
+        wave_h = int(H * 0.05)
+        wave_y = int(H * 0.60)
+        title_size = max(28, int(W * 0.055))
+        artist_size = max(18, int(W * 0.033))
+    else:
+        s = H / 1080.0
+        card = int(600 * s)
+        card_x = W - card - int(165 * s)   # right margin
+        card_y = (H - card) // 2 - int(20 * s)
+        wave_x = int(165 * s)
+        wave_w = int(960 * s)
+        wave_h = int(150 * s)
+        wave_y = int(545 * s)
+        title_size = max(28, int(64 * s))
+        artist_size = max(18, int(38 * s))
+    shadow = card + int(card * 0.06)
+    shadow_x = card_x + int(card * 0.02)
+    shadow_y = card_y + int(card * 0.035)
+    shadow_blur = max(8, int(card * 0.037))
+    title_y = wave_y + wave_h + int(wave_h * 0.12) + int(title_size * 0.10)
+    artist_y = title_y + int(title_size * 1.18)
+    return dict(
+        W=W, H=H, card=card, card_x=card_x, card_y=card_y,
+        shadow=shadow, shadow_x=shadow_x, shadow_y=shadow_y, shadow_blur=shadow_blur,
+        wave_x=wave_x, wave_y=wave_y, wave_w=wave_w, wave_h=wave_h,
+        title_size=title_size, artist_size=artist_size, text_x=wave_x,
+        title_y=title_y, artist_y=artist_y,
     )
 
 
-def _prerender_art_track_bg(cover_path: str, duration: float, job_dir: str,
-                            *, spec: "RenderSpec",
-                            out_name: str = "bg_art_track.mp4") -> str:
-    """Compose the art-track background video from a single cover image:
-    blurred frame-filling copy + centered sharp cover + subtle push-in.
-
-    Same on-disk contract as `_prerender_kenburns_bg`: a full-duration MP4 at
-    `job_dir/out_name` that the single-pass render then muxes with the master
-    audio (and optionally overlays an effect on). Spec-driven, so the UMG
-    intermediate master (4K/2K at native fps) composes for free and the lazy
-    ProRes transcode downstream stays a pure recode.
+def _art_track_waveform_bars(mp3_path: str, n: int, *, win_start: float = 0.0,
+                             win_dur: float | None = None) -> "list[float]":
+    """Normalized [0,1] amplitude envelope of the audio window, resampled to
+    `n` bars — the whole-song (or short-window) waveform for the art track.
+    Returns flat 0.25 bars on any failure so the render never breaks.
     """
-    out_path = os.path.join(job_dir, out_name)
-    total_frames = max(1, int(math.ceil(duration * float(spec.fps))))
-    base = [
+    try:
+        import numpy as _np
+        y, _sr = librosa.load(mp3_path, sr=8000, mono=True,
+                              offset=max(0.0, win_start), duration=win_dur)
+        if not len(y):
+            return [0.25] * n
+        hop = max(1, len(y) // (n * 4))
+        rms = librosa.feature.rms(y=y, frame_length=hop * 2, hop_length=hop)[0]
+        idx = _np.linspace(0, len(rms), n + 1).astype(int)
+        bars = _np.array([
+            rms[idx[i]:idx[i + 1]].mean() if idx[i + 1] > idx[i] else 0.0
+            for i in range(n)
+        ])
+        bars = _np.power(bars / (bars.max() or 1.0), 0.7)  # compress so quiet bars show
+        return [float(b) for b in bars]
+    except Exception as e:
+        logger.warning("[ART] waveform envelope failed (%s); flat bars", e)
+        return [0.25] * n
+
+
+def _build_art_track_base(cover_path: str, mp3_path: str, out_path: str, *,
+                          spec: "RenderSpec", artist: str, song_title: str,
+                          win_start: float = 0.0,
+                          win_dur: float | None = None) -> str:
+    """Build the COMPLETE static base frame with PIL (one image): blurred cover
+    fill + shadowed cover card + waveform bars + title/artist. Doing the whole
+    static composite once (not per-frame in ffmpeg) keeps the render fast — the
+    expensive Gaussian blur runs a single time. ffmpeg then just loops this
+    image and draws the moving playhead on top. Text via PIL (no drawtext/
+    libass dependency), same as generate_thumbnail.
+    """
+    from PIL import ImageFilter, ImageEnhance, ImageOps
+    L = _art_track_layout(spec)
+    W, H = L["W"], L["H"]
+
+    cover = Image.open(cover_path).convert("RGB")
+
+    # 1) Blurred, frame-filling background (cover-fit crop → blur → darken).
+    bg = ImageOps.fit(cover, (W, H), method=Image.LANCZOS)
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=max(12, H // 22)))
+    bg = ImageEnhance.Brightness(bg).enhance(0.60)
+    bg = ImageEnhance.Color(bg).enhance(1.03)
+    base = bg.convert("RGBA")
+
+    # 2) Drop shadow behind the card (soft, offset).
+    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        [L["shadow_x"], L["shadow_y"], L["shadow_x"] + L["card"],
+         L["shadow_y"] + L["card"]], radius=int(L["card"] * 0.02), fill=(0, 0, 0, 150))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(L["shadow_blur"]))
+    base = Image.alpha_composite(base, shadow)
+
+    # 3) The sharp cover card (fit to the square box), slight tilt for life.
+    card = ImageOps.contain(cover, (L["card"], L["card"]), method=Image.LANCZOS)
+    base.alpha_composite(card.convert("RGBA"), (L["card_x"], L["card_y"]))
+
+    # 4) Waveform bars (whole-song / window envelope) + title + artist.
+    d = ImageDraw.Draw(base)
+    N = 68
+    bars = _art_track_waveform_bars(mp3_path, N, win_start=win_start, win_dur=win_dur)
+    gap = max(2, int(L["wave_w"] * 0.005))
+    bw = (L["wave_w"] - (N - 1) * gap) / N
+    minh = max(3, int(L["wave_h"] * 0.04))
+    cy = L["wave_y"] + L["wave_h"] / 2
+    for i, a in enumerate(bars):
+        x0 = L["wave_x"] + i * (bw + gap)
+        bh = max(minh, a * (L["wave_h"] - 4))
+        d.rounded_rectangle([x0, cy - bh / 2, x0 + bw, cy + bh / 2],
+                            radius=max(1, int(bw * 0.25)), fill=(255, 255, 255, 220))
+
+    def _font(sz: int, extra_bold: bool = False):
+        name = "Montserrat-ExtraBold.ttf" if extra_bold else "Montserrat-Bold.ttf"
+        try:
+            return ImageFont.truetype(os.path.join(_FONTS_DIR, name), sz)
+        except Exception:
+            return ImageFont.load_default()
+
+    max_text_w = W - L["text_x"] - int(W * 0.04)
+
+    def _fit_font(txt: str, size: int, extra_bold: bool):
+        f = _font(size, extra_bold)
+        while size > 20 and d.textlength(txt, font=f) > max_text_w:
+            size = int(size * 0.92)
+            f = _font(size, extra_bold)
+        return f
+
+    def _shadow_text(x, y, txt, fnt, fill):
+        d.text((x + 2, y + 3), txt, font=fnt, fill=(0, 0, 0, 160))
+        d.text((x, y), txt, font=fnt, fill=fill)
+
+    title = (song_title or "").strip()
+    if title:
+        _shadow_text(L["text_x"], L["title_y"], title,
+                     _fit_font(title, L["title_size"], True), (255, 255, 255, 255))
+    artist = (artist or "").strip()
+    if artist:
+        _shadow_text(L["text_x"] + 2, L["artist_y"], artist,
+                     _fit_font(artist, L["artist_size"], False), (255, 255, 255, 235))
+
+    base.convert("RGB").save(out_path)
+    return out_path
+
+
+def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
+                      spec: "RenderSpec", artist: str, song_title: str,
+                      duration: float, out_name: str | None = None,
+                      win_start: float = 0.0, win_dur: float | None = None) -> str:
+    """Render the full art-track ("official audio") video: PIL builds the whole
+    static composite (blurred cover + shadowed card + waveform + title/artist)
+    once, then ffmpeg loops that base image and draws a sweeping playhead
+    (drawbox) over the waveform while muxing the master audio. No lyrics, no
+    zoom/effect movement — the sweeping playhead over the waveform IS the
+    motion, matching the VEVO template.
+
+    Cheap per-frame work (a looped still + one drawbox) → fast and bounded
+    memory at any length. Spec-driven so YouTube MP4, the 9:16 short, and the
+    UMG intermediate master (→ lazy ProRes) all come out of the same code.
+    """
+    L = _art_track_layout(spec)
+    dur = float(win_dur) if win_dur else float(duration)
+    base_name = ((out_name or "art").replace(".mp4", "").replace(".mov", "")
+                 + "_base.png")
+    base_path = os.path.join(job_dir, base_name)
+    _build_art_track_base(cover_path, mp3_path, base_path, spec=spec, artist=artist,
+                          song_title=song_title, win_start=win_start, win_dur=dur)
+
+    out_path = os.path.join(job_dir, out_name or f"lyric_video.{spec.container}")
+    playhead_w = max(2, int(spec.width * 0.0016))
+    fc = (
+        f"[0:v]drawbox=x='{L['wave_x']}+{L['wave_w']}*t/{dur:.3f}':y={L['wave_y']}:"
+        f"w={playhead_w}:h={L['wave_h']}:color=white@0.85:t=fill,"
+        f"format={spec.pix_fmt}[outv]"
+    )
+
+    if spec.codec == "libx264":
+        vargs = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                 "-pix_fmt", spec.pix_fmt]
+    elif spec.codec == "prores_ks":
+        vargs = ["-c:v", "prores_ks", "-profile:v", str(spec.prores_profile),
+                 "-pix_fmt", spec.pix_fmt, "-vendor", "apl0"]
+    else:
+        vargs = ["-c:v", spec.codec, "-pix_fmt", spec.pix_fmt]
+    if spec.audio_codec == "aac":
+        aargs = ["-c:a", "aac", "-b:a", "320k"]
+    elif spec.audio_codec == "pcm_s24le":
+        aargs = ["-c:a", "pcm_s24le", "-ar", "48000", "-ac", "2"]
+    else:
+        aargs = ["-c:a", spec.audio_codec]
+
+    cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
-        "-i", os.path.abspath(cover_path),
-        "-t", str(duration),
+        "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(base_path),
+        "-ss", str(max(0.0, win_start)), "-t", str(dur),
+        "-i", os.path.abspath(mp3_path),
+        "-filter_complex", fc, "-map", "[outv]", "-map", "1:a",
+        *vargs, *aargs, "-r", spec.fps_str,
+        "-movflags", "+faststart", "-shortest",
+        os.path.basename(out_path),
     ]
-    fc = _art_track_filtergraph(spec, total_frames)
-    result = subprocess.run(
-        base + ["-filter_complex", fc, "-map", "[out]",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-                "-pix_fmt", "yuv420p", "-an", out_path],
-        capture_output=True, text=True, timeout=900,
-    )
-    if result.returncode != 0:
-        # Fall back to a STATIC composite (blur fill + centered cover, no
-        # push-in) so the job still renders — the composable effect overlay
-        # can still supply motion. Mirrors the Ken Burns static fallback.
-        logger.warning("[BG] art-track zoompan failed (%s); using static composite",
-                       result.stderr[-200:])
-        up_w, up_h = spec.width * 2, spec.height * 2
-        fit_w, fit_h = int(up_w * 0.72), int(up_h * 0.72)
-        sigma = max(30, up_h // 36)
-        static_fc = (
-            f"[0:v]split=2[bgs][fgs];"
-            f"[bgs]scale={up_w}:{up_h}:force_original_aspect_ratio=increase,"
-            f"crop={up_w}:{up_h},gblur=sigma={sigma},"
-            f"eq=brightness=-0.06:saturation=1.12[bg];"
-            f"[fgs]scale={fit_w}:{fit_h}:force_original_aspect_ratio=decrease[fg];"
-            f"[bg][fg]overlay=(W-w)/2:(H-h)/2,"
-            f"scale={spec.width}:{spec.height},fps={spec.fps_str}[out]"
-        )
-        run_checked(
-            base + ["-filter_complex", static_fc, "-map", "[out]",
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-                    "-pix_fmt", "yuv420p", "-an", out_path],
-            label="ffmpeg-arttrack-fallback",
-            timeout=900,
-            output_path=out_path,
-        )
-
-    size_mb = os.path.getsize(out_path) / 1024 / 1024
-    logger.info("[BG] art track composite: %.0fs, %.1f MB", duration, size_mb)
+    _timeout = 1800 if (spec.codec == "prores_ks" or spec.width >= 3000) else 900
+    run_checked(cmd, label="ffmpeg-art-track", timeout=_timeout,
+                output_path=out_path, cwd=job_dir)
+    _validate_rendered_mp4(out_path, dur)
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    logger.info("[ART] art track render: %.0fs, %.1f MB (%dx%d)",
+                dur, size_mb, spec.width, spec.height)
     return out_path
 
 
@@ -13259,14 +13391,10 @@ def generate_lyric_video(
             raise RuntimeError(
                 "Art track requires a cover IMAGE (.jpg/.png), got a video bg"
             )
-        art_bg = _prerender_art_track_bg(bg_source, duration, job_dir, spec=spec)
-        logger.info("[ART] art-track render (profile=%s, effect=%s)",
-                    spec.profile, effect or "none")
-        out = _render_lyrics_ass(
-            art_bg, mp3_path, [], job_dir, duration,
-            spec=spec, font_path=font,
-            effect=effect, style=style, custom_colors=custom_colors,
-            bg_prelooped=True, render_text=False,
+        logger.info("[ART] art-track render (profile=%s)", spec.profile)
+        out = _render_art_track(
+            bg_source, mp3_path, job_dir, spec=spec,
+            artist=artist, song_title=title_song, duration=duration,
         )
         audio.close()
         return out, font, bg_source
@@ -14031,57 +14159,26 @@ def generate_art_track_short(
     job_dir: str,
     *,
     spec: "RenderSpec",
-    effect: str = "",
-    style: str = "",
-    custom_colors: str = "",
+    artist: str = "",
+    song_title: str = "",
     window_sec: float = 30.0,
 ) -> str:
-    """Render the vertical (9:16) art-track short: the cover composed the same
-    way as the master (blurred fill + centered cover + subtle push-in) over a
-    30s high-energy window of the audio, no lyrics. Writes `short.mp4` in
-    job_dir (same contract as generate_short). Self-contained single-pass
-    ffmpeg so it never clobbers the master's `lyric_video.mp4`.
+    """Render the vertical (9:16) art-track short: the same VEVO composite as
+    the master (blurred cover fill + shadowed cover card + waveform + title)
+    over a 30s high-energy window of the audio. The waveform + playhead cover
+    that window. Writes `short.mp4` in job_dir (same contract as
+    generate_short); `_render_art_track` writes its own output name so it never
+    clobbers the master's `lyric_video.mp4`.
     """
-    import fx_compositor as _fx
-    out_path = os.path.join(job_dir, "short.mp4")
     duration = _audio_duration(mp3_path) or _ffprobe_duration(mp3_path) or window_sec
     win = min(window_sec, duration)
     start = _pick_energy_window(mp3_path, duration, win)
-
-    # Vertical composite for the window length (C-level ffmpeg, bounded memory).
-    bg = _prerender_art_track_bg(
-        cover_path, win, job_dir, spec=spec, out_name="short_art_bg.mp4",
+    out_path = _render_art_track(
+        cover_path, mp3_path, job_dir, spec=spec,
+        artist=artist, song_title=song_title, duration=win,
+        out_name="short.mp4", win_start=start, win_dur=win,
     )
-    vfilter, _use_complex, _extra_in = _fx.build_video_filter(
-        ass_basename=None, font_dir="",
-        width=spec.width, height=spec.height,
-        effect=effect, style=style, custom_colors=custom_colors,
-    )
-    _filter_args = (
-        ["-filter_complex", vfilter, "-map", "[out]", "-map", "1:a"]
-        if _use_complex else
-        ["-vf", vfilter, "-map", "0:v", "-map", "1:a"]
-    )
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-i", os.path.abspath(bg),
-        # Audio window: seek + take `win` seconds of the master.
-        "-ss", str(start), "-t", str(win), "-i", os.path.abspath(mp3_path),
-        *_extra_in,
-        *_filter_args,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-pix_fmt", spec.pix_fmt,
-        "-c:a", "aac", "-b:a", "320k",
-        "-r", spec.fps_str,
-        "-movflags", "+faststart",
-        "-shortest",
-        os.path.basename(out_path),
-    ]
-    run_checked(cmd, label="ffmpeg-arttrack-short", timeout=900,
-                output_path=out_path, cwd=job_dir)
-    _validate_rendered_mp4(out_path, win)
-    logger.info("[ART] art-track short: window %.0f-%.0fs, %.1f MB",
-                start, start + win, os.path.getsize(out_path) / (1024 * 1024))
+    logger.info("[ART] art-track short window %.0f-%.0fs", start, start + win)
     return out_path
 
 

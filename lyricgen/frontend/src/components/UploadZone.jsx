@@ -527,10 +527,12 @@ export default function UploadZone({
   // lockedSteps (post-render edit): IDs no navegables. goStep bail-outs y
   // los helpers prev/next saltean los locked para que la sticky bar muestre
   // el siguiente paso navegable real, no uno que el operador no puede usar.
-  // Art track: la tipografía (paso 4) y la letra (paso 6) no aplican — se
-  // bloquean para que la navegación los saltee (mismo mecanismo que el edit
-  // mode). Paso 3 (Movimiento/efecto) y 5 (Entregá) sí aplican.
-  const _lockedSet = new Set([...lockedSteps, ...(artTrack ? [4, 6] : [])]);
+  // Art track: el movimiento (paso 3), la tipografía (paso 4) y la letra
+  // (paso 6) NO aplican — el estilo es fijo (cover blureada + cover con sombra
+  // + waveform), sin estilos de movimiento ni efectos. Se bloquean para que la
+  // navegación los saltee (mismo mecanismo que el edit mode). Quedan: 1 (Subí),
+  // 2 (Modo/cover) y 5 (Entregá).
+  const _lockedSet = new Set([...lockedSteps, ...(artTrack ? [3, 4, 6] : [])]);
   const _findPrevUnlocked = (n) => {
     for (let i = n - 1; i >= 1; i--) if (!_lockedSet.has(i)) return i;
     return null;
@@ -2750,6 +2752,31 @@ export default function UploadZone({
                   : null
               }
             />
+          ) : artTrack ? (
+            /* Art track: preview del layout real (cover blureada + cover con
+               sombra a la derecha + waveform + título), NO el mock de letra. */
+            <div className="relative w-full aspect-video rounded-xl overflow-hidden bg-black">
+              {customPreviewUrl ? (
+                <>
+                  <img src={customPreviewUrl} alt="" className="absolute inset-0 w-full h-full object-cover scale-110 blur-2xl brightness-50" />
+                  <img src={customPreviewUrl} alt="" className="absolute top-1/2 right-[8%] -translate-y-1/2 h-[62%] aspect-square object-cover rounded shadow-2xl shadow-black/70" />
+                  <div className="absolute left-[9%] top-[52%] flex items-end gap-[3px] h-[14%]">
+                    {Array.from({ length: 34 }).map((_, i) => (
+                      <span key={i} className="w-[6px] bg-white/85 rounded-sm" style={{ height: `${25 + Math.abs(Math.sin(i * 1.7)) * 70}%` }} />
+                    ))}
+                  </div>
+                  <div className="absolute left-[9%] top-[70%] text-white">
+                    <div className="font-bold text-lg md:text-2xl leading-tight drop-shadow">{titlePreviewSong || t("upload.video_type_art") || "Art Track"}</div>
+                    <div className="text-sm md:text-base text-white/85 drop-shadow">{titlePreviewArtist}</div>
+                  </div>
+                </>
+              ) : (
+                <div className="absolute inset-0 flex items-center justify-center text-center text-gray-400 text-sm px-6">
+                  {t("arttrack.cover_missing_desc") || "Subí el cover en el paso “Modo” para ver la vista previa."}
+                </div>
+              )}
+              <span className="absolute top-2 left-2 text-[10px] uppercase tracking-[0.18em] text-white/70">{t("upload.video_type_art") || "Art Track"}</span>
+            </div>
           ) : (bgMode === "auto" || bgMode === "library" || (bgMode === "custom" && customPreviewUrl)) ? (
             <WizardLivePreview
               style={style}

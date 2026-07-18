@@ -8,8 +8,6 @@ Two layers:
   - Render-dispatch invariants exercised without running ffmpeg by capturing
     the command via monkeypatch.
 """
-import math
-
 import pytest
 
 import fx_compositor as fx
@@ -62,38 +60,50 @@ def test_build_video_filter_lyric_path_unregressed():
 
 
 # --------------------------------------------------------------------------
-# _art_track_filtergraph — composite invariants
+# _art_track_layout — composite geometry invariants
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("spec", [
-    rs.RenderSpec.youtube_default(),
-    rs.RenderSpec.youtube_short(),
-    rs.RenderSpec.umg_intermediate_master({"frame_size": "UHD-4K", "fps": 24.0}),
-])
-def test_art_filtergraph_structure(spec):
-    total = max(1, int(math.ceil(200 * spec.fps)))
-    fg = pipeline._art_track_filtergraph(spec, total)
-    # Blurred, frame-filling copy of the cover.
-    assert "split=2" in fg
-    assert "gblur=sigma=" in fg
-    # Centered sharp cover fitted inside a margin box.
-    assert "force_original_aspect_ratio=decrease" in fg
-    assert "overlay=(W-w)/2:(H-h)/2" in fg
-    # Subtle push-in capped at 1.05, output at the spec's exact dims.
-    assert "min(zoom+" in fg and ",1.05)" in fg
-    assert f"s={spec.width}x{spec.height}" in fg
-    assert f"d={total}" in fg
+def test_art_track_layout_landscape_card_on_right():
+    L = pipeline._art_track_layout(rs.RenderSpec.youtube_default())
+    W, H = 1920, 1080
+    # Card sits on the right half; waveform + text on the left.
+    assert L["card_x"] > W * 0.5
+    assert L["card_x"] + L["card"] <= W
+    assert L["wave_x"] < W * 0.2
+    # Shadow sits just behind/under the card (offset down-right, larger).
+    assert L["shadow"] > L["card"]
+    assert L["shadow_x"] >= L["card_x"] and L["shadow_y"] >= L["card_y"]
+    # Title/artist land below the waveform, inside the frame.
+    assert L["title_y"] > L["wave_y"] + L["wave_h"]
+    assert L["artist_y"] > L["title_y"]
+    assert L["artist_y"] < H
 
 
-def test_art_filtergraph_zoom_step_scales_with_frames():
-    spec = rs.RenderSpec.youtube_default()
-    short = pipeline._art_track_filtergraph(spec, 240)     # 10s @24
-    long = pipeline._art_track_filtergraph(spec, 7200)     # 5min @24
-    # Longer clip → smaller per-frame zoom step (same 5% total travel).
-    import re
-    step_short = float(re.search(r"min\(zoom\+([0-9.]+),", short).group(1))
-    step_long = float(re.search(r"min\(zoom\+([0-9.]+),", long).group(1))
-    assert step_short > step_long > 0
+def test_art_track_layout_portrait_card_on_top_centered():
+    L = pipeline._art_track_layout(rs.RenderSpec.youtube_short())
+    W, H = 1080, 1920
+    # Portrait: card horizontally centered, near the top; waveform lower.
+    assert abs((L["card_x"] + L["card"] / 2) - W / 2) < 4
+    assert L["card_y"] < H * 0.3
+    assert L["wave_y"] > H * 0.5
+    assert L["wave_x"] + L["wave_w"] <= W
+
+
+def test_art_track_layout_scales_with_resolution():
+    hd = pipeline._art_track_layout(rs.RenderSpec.youtube_default())
+    uhd = pipeline._art_track_layout(
+        rs.RenderSpec.umg_intermediate_master({"frame_size": "UHD-4K", "fps": 24.0}))
+    # 4K is 2x the 1080p height → card/waveform roughly 2x bigger.
+    assert uhd["card"] > hd["card"] * 1.6
+    assert uhd["wave_w"] > hd["wave_w"] * 1.6
+
+
+def test_art_track_waveform_bars_fallback_is_flat():
+    # Bogus path → librosa fails → flat non-zero bars (render never breaks).
+    bars = pipeline._art_track_waveform_bars("/nonexistent.mp3", 68)
+    assert len(bars) == 68
+    assert all(0.0 <= b <= 1.0 for b in bars)
+    assert min(bars) > 0.0
 
 
 # --------------------------------------------------------------------------

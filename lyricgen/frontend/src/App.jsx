@@ -3278,7 +3278,6 @@ export default function App() {
     const jobList = files.map((f) => ({
       filename: f.file.name, _file: f.file, _cover: backgroundFile,
       artist: f.artist.trim(), songTitle: (f.songTitle || "").trim(),
-      effect: f.effect || "",
       status: "queued", current_step: null,
       progress: 0, job_id: null, error: null,
     }));
@@ -3310,7 +3309,6 @@ export default function App() {
           body.append("umg_fps", String(delivery.umg_fps));
           body.append("umg_prores_profile", String(delivery.umg_prores_profile));
         }
-        if (jobList[i].effect) body.append("effect", jobList[i].effect);
 
         let genRes = null;
         try {
