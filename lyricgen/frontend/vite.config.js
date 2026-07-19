@@ -50,6 +50,10 @@ export default defineConfig({
       "/status": "http://localhost:8000",
       "/download": "http://localhost:8000",
       "/preview": "http://localhost:8000",
+      // Token scoped por (job, file_type) que piden los <video>/<img> antes de
+      // cargar media desde /download|/preview. Sin proxearlo el dev server
+      // devuelve 404 → "Miniatura no disponible" / player negro en local.
+      "/media-token": "http://localhost:8000",
       "/jobs": "http://localhost:8000",
       "/youtube": "http://localhost:8000",
       "/settings": "http://localhost:8000",
