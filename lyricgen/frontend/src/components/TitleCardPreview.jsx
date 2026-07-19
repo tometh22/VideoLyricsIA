@@ -28,6 +28,12 @@ const PREVIEW_LAYOUTS = {
 };
 const MIN_RATIO = 0.62;   // mirrors fit_title_text's min_size
 
+// Intro-length threshold (seconds) that "auto" uses to pick centered hero vs
+// compact badge. This MUST stay in lockstep with the backend
+// (ass_render.title_card_lines: `START_T(0.3) + 0.5`). The parity test in
+// TitleCardPreview.test.jsx parses ass_render.py and fails CI if they drift.
+export const AUTO_INTRO_THRESHOLD_S = 0.8;
+
 const ARTIST_FONT = "'Montserrat', system-ui, sans-serif"; // ExtraBold (800)
 
 function nfc(s) {
@@ -189,7 +195,11 @@ export default function TitleCardPreview({
   // preview auto-corrects once the segments arrive. size × titleSize, clamped
   // 0.5–2.0 like the backend.
   const resolveAuto = () =>
-    firstLyricStart == null ? "centered" : firstLyricStart > 0.8 ? "centered" : "badge";
+    firstLyricStart == null
+      ? "centered"
+      : firstLyricStart > AUTO_INTRO_THRESHOLD_S
+        ? "centered"
+        : "badge";
   const tmpl = ["centered", "lower_third", "badge"].includes(template)
     ? template
     : resolveAuto();

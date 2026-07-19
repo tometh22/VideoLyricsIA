@@ -12,10 +12,12 @@
  * layout (the shrink/wrap fit is verified against real metrics in the backend
  * unit tests + the libass integration render).
  */
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, it, expect, beforeAll } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { FONT_BY_CODE } from "./fontCatalog";
-import TitleCardPreview from "./TitleCardPreview";
+import TitleCardPreview, { AUTO_INTRO_THRESHOLD_S } from "./TitleCardPreview";
 
 beforeAll(() => {
   // ResizeObserver: fire once with a fixed box width so boxW > 0.
@@ -151,5 +153,30 @@ describe("TitleCardPreview — auto template mirrors the backend intro heuristic
     const s = layoutOf(container, "BANDA");
     expect(s.justifyContent).toBe("center");
     expect(s.textAlign).toBe("center");
+  });
+});
+
+/**
+ * Guardrail against silent drift: the preview reimplements the backend's
+ * "auto" intro heuristic in JS, so the threshold lives in two languages. If
+ * someone changes START_T or the +0.5 offset in ass_render.py without touching
+ * AUTO_INTRO_THRESHOLD_S here, the preview would lie again — exactly the bug
+ * this fix closes. Parse the Python source and assert the numbers match.
+ */
+describe("TitleCardPreview — auto threshold parity with the backend", () => {
+  it("AUTO_INTRO_THRESHOLD_S equals ass_render's START_T + offset", () => {
+    // vitest runs with cwd = lyricgen/frontend; the backend is a sibling dir.
+    const src = readFileSync(
+      resolve(process.cwd(), "../backend/ass_render.py"),
+      "utf8",
+    );
+    // START_T = 0.3
+    const startT = src.match(/^\s*START_T\s*=\s*([\d.]+)/m);
+    // has_long_intro = first_lyric_start > START_T + 0.5
+    const offset = src.match(/has_long_intro\s*=\s*first_lyric_start\s*>\s*START_T\s*\+\s*([\d.]+)/);
+    expect(startT, "could not find START_T in ass_render.py").not.toBeNull();
+    expect(offset, "could not find the has_long_intro offset in ass_render.py").not.toBeNull();
+    const backendThreshold = parseFloat(startT[1]) + parseFloat(offset[1]);
+    expect(AUTO_INTRO_THRESHOLD_S).toBeCloseTo(backendThreshold, 6);
   });
 });
