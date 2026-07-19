@@ -155,38 +155,35 @@ class TestJobBgCacheKeyParity:
         }) is None
 
 
-class TestLyricsFingerprint:
-    """v6: con match_lyrics el prompt del fondo depende de la LETRA — el
-    hash la incluye como fingerprint de TEXTO (timestamps fuera: el 93% de
-    las correcciones del operador son de timing y no deben rotar el key)."""
+class TestLyricsNotInHash:
+    """v7 (2026-07-17): la LETRA NO entra al hash (revertido de v6). El
+    preview se dispara mientras el operador edita, con la letra a medio
+    hacer; el render usa la letra final. Meterla en el hash rompía el reuso
+    (keys distintas → cache-miss → doble generación). La letra igual influye
+    la GENERACIÓN del preview (run_bg_preview_job la pasa a _ensure_background),
+    solo que no rota la ETIQUETA. Guard: distinta letra = MISMA key."""
 
-    def test_misma_letra_distinto_timing_mismo_key(self):
-        a = compute_bg_cache_key(_preview_params(lyrics_text="hola  Mundo cruel"))
-        b = compute_bg_cache_key(_preview_params(lyrics_text="Hola mundo   CRUEL"))
-        assert a == b  # normalización: lower + espacios colapsados
-
-    def test_letra_distinta_key_distinto(self):
+    def test_letra_distinta_misma_key(self):
         a = compute_bg_cache_key(_preview_params(lyrics_text="una letra"))
         b = compute_bg_cache_key(_preview_params(lyrics_text="otra letra"))
-        assert a != b
+        c = compute_bg_cache_key(_preview_params())  # sin lyrics_text
+        assert a == b == c
 
-    def test_sin_letra_es_sentinel_estable(self):
-        assert compute_bg_cache_key(_preview_params()) == \
-            compute_bg_cache_key(_preview_params(lyrics_text=""))
+    def test_recompute_ignora_la_letra(self):
+        """El recompute de /generate y el preview coinciden aunque el render
+        arme la letra final y el preview haya usado otra."""
+        from bg_preview import job_bg_cache_key
+        render_side = job_bg_cache_key(**{
+            k: v for k, v in _JOB_PARAMS.items() if k != "job_id"
+        })
+        preview_side = compute_bg_cache_key(_preview_params(
+            lyrics_text="cualquier letra que el preview haya tenido"
+        ))
+        assert render_side == preview_side
 
-    def test_match_lyrics_off_ignora_la_letra(self):
-        a = compute_bg_cache_key(_preview_params(match_lyrics=False,
-                                                 lyrics_text="una letra"))
-        b = compute_bg_cache_key(_preview_params(match_lyrics=False,
-                                                 lyrics_text="otra letra"))
-        assert a == b
-
-    def test_validator_con_letra_acepta_y_stale_descarta(self):
+    def test_validator_acepta_sin_importar_la_letra(self):
         key = compute_bg_cache_key(_preview_params(lyrics_text="poco a poco"))
-        params = dict(_JOB_PARAMS, lyrics_text="Poco  a POCO")
-        assert _validate_bg_cache_key(key, **params) == key
-        edited = dict(_JOB_PARAMS, lyrics_text="letra editada despues")
-        assert _validate_bg_cache_key(key, **edited) is None
+        assert _validate_bg_cache_key(key, **_JOB_PARAMS) == key
 
 
 class TestPreviewComplianceGuards:

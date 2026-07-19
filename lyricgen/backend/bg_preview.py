@@ -73,23 +73,18 @@ logger = logging.getLogger("genly.bg_preview")
 # particular off/shadow/enforce never share a key, and an asset generated
 # under the legacy namespace cannot become an enforce-mode cache hit. Every
 # v5 entry also passed the authoritative content gate before cache_put.
-# v6 (2026-07-17): el hash suma `_lyrics_fp` — con match_lyrics=True el
-# prompt del fondo depende de la LETRA, pero el preview generaba ciego a
-# ella y el render podía heredar ese fondo vía cache-hit. Solo hashea el
-# TEXTO normalizado (no timestamps): la corrección típica del operador es
-# de timing (93% medido) y no debe rotar el key. v6 además deja de cachear
-# el gradiente de policy-fallback bajo la key real.
-CACHE_VERSION = "v6"
-
-
-def lyrics_fingerprint(lyrics_text) -> str:
-    """sha256-8 del texto de la letra, normalizado (lower + espacios
-    colapsados). 'nolyrics' cuando no hay letra — un preview sin letra y un
-    render con letra NUNCA deben compartir fondo si match_lyrics=True."""
-    text = " ".join(str(lyrics_text or "").lower().split())
-    if not text:
-        return "nolyrics"
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+# v6 (2026-07-17): metió `_lyrics_fp` en el hash — REVERTIDO en v7 (mismo
+# día). La letra en el hash rompía el reuso: el preview se dispara MIENTRAS
+# el operador edita (con la letra a medio hacer) y el render usa la letra
+# final; cualquier diferencia → keys distintas → cache-miss → se regenera
+# el fondo que ya estaba hecho. Como el operador casi siempre ajusta la
+# letra antes de crear, el hit-rate se desplomaba y el ahorro no llegaba.
+# v7: la letra ya NO entra al hash (fondos abstractos: un desfasaje de unas
+# ediciones es invisible), pero el preview SIGUE recibiendo lyrics_text para
+# generar (run_bg_preview_job → _ensure_background), así el fondo queda
+# temáticamente cerca de la canción. La letra afecta la GENERACIÓN, no la
+# ETIQUETA. v7 además deja de cachear el gradiente de policy-fallback (de v6).
+CACHE_VERSION = "v7"
 
 
 def compute_bg_cache_key(params: dict) -> str:
@@ -135,12 +130,8 @@ def compute_bg_cache_key(params: dict) -> str:
         "background_mode": (params.get("background_mode") or "veo").strip().lower(),
         "animate_image":   bool(params.get("animate_image", False)),
         "match_lyrics":    bool(params.get("match_lyrics", True)),
-        # Con match_lyrics el prompt depende del texto de la letra; sin él,
-        # constante para no rotar el cache por un campo irrelevante.
-        "_lyrics_fp": (
-            lyrics_fingerprint(params.get("lyrics_text"))
-            if bool(params.get("match_lyrics", True)) else "off"
-        ),
+        # NOTA v7: la LETRA no entra al hash a propósito (ver CACHE_VERSION).
+        # lyrics_text influye la generación del preview, no la etiqueta.
     }
     payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -149,7 +140,7 @@ def compute_bg_cache_key(params: dict) -> str:
 
 def job_bg_cache_key(*, artist, song_title, style, movement_style, effect,
                      custom_colors, genre, concept, background_hint,
-                     bg_verbatim, match_lyrics, lyrics_text=None):
+                     bg_verbatim, match_lyrics):
     """Key esperado para el fast-path de fondo único AI de un job /generate.
 
     Única fuente de verdad de los hardcodes `background_mode="veo"` /
@@ -177,7 +168,6 @@ def job_bg_cache_key(*, artist, song_title, style, movement_style, effect,
             "background_mode": "veo",
             "animate_image": False,
             "match_lyrics": bool(match_lyrics),
-            "lyrics_text": lyrics_text,
         })
     except Exception:
         return None

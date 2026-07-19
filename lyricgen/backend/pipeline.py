@@ -521,8 +521,7 @@ def _best_effort_lyrics_hint(artist: str, song_title: str) -> str | None:
 
 def _validate_bg_cache_key(bg_cache_key, *, job_id, artist, song_title, style,
                            movement_style, effect, custom_colors, genre,
-                           concept, background_hint, bg_verbatim, match_lyrics,
-                           lyrics_text=None):
+                           concept, background_hint, bg_verbatim, match_lyrics):
     """Valida que el bg_cache_key del cliente corresponda a ESTE job.
 
     Audit adversarial 2026-06-09: el key viene del CLIENTE y se usaba sin
@@ -546,7 +545,7 @@ def _validate_bg_cache_key(bg_cache_key, *, job_id, artist, song_title, style,
             movement_style=movement_style, effect=effect,
             custom_colors=custom_colors, genre=genre, concept=concept,
             background_hint=background_hint, bg_verbatim=bg_verbatim,
-            match_lyrics=match_lyrics, lyrics_text=lyrics_text,
+            match_lyrics=match_lyrics,
         )
         if expected is None or bg_cache_key != expected:
             logger.warning(
@@ -1186,7 +1185,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     movement_style=movement_style, effect=effect,
                     custom_colors=custom_colors, genre=genre, concept=concept,
                     background_hint=background_hint, bg_verbatim=bg_verbatim,
-                    match_lyrics=match_lyrics, lyrics_text=lyrics_text,
+                    match_lyrics=match_lyrics,
                 )
             if bg_cache_key and not _animate_user_image:
                 try:

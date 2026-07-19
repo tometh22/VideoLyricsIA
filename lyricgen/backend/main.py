@@ -7804,11 +7804,6 @@ async def generate_with_segments(
                 concept=concept,
                 background_hint=(background_hint.strip() or None),
                 bg_verbatim=bg_verbatim, match_lyrics=match_lyrics,
-                lyrics_text=" ".join(
-                    str(seg.get("text") or "")
-                    for seg in (segments or [])
-                    if isinstance(seg, dict)
-                ),
             )
         except Exception as _recompute_err:
             logger.warning(
