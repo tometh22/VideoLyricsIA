@@ -75,7 +75,6 @@ def test_recompute_when_frontend_omits_key(client, monkeypatch):
         movement_style="", effect="", custom_colors="", genre="",
         concept="", background_hint=None, bg_verbatim=False,
         match_lyrics=True,
-        lyrics_text=" ".join(s["text"] for s in _SEGMENTS),
     )
     assert expected is not None
     assert captured["bg_cache_key"] == expected
@@ -88,7 +87,6 @@ def test_recompute_when_frontend_omits_key(client, monkeypatch):
         song_title="No Tengo Ganas", style="oscuro", movement_style="",
         effect="", custom_colors="", genre="", concept="",
         background_hint=None, bg_verbatim=False, match_lyrics=True,
-        lyrics_text=" ".join(s["text"] for s in _SEGMENTS),
     ) == captured["bg_cache_key"]
 
 

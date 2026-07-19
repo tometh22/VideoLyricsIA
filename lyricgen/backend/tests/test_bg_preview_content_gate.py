@@ -33,7 +33,7 @@ def test_cache_key_isolated_by_policy_mode(monkeypatch):
         monkeypatch.setenv("BACKGROUND_SMOKE_POLICY_MODE", mode)
         keys.add(bg_preview.compute_bg_cache_key(params))
 
-    assert bg_preview.CACHE_VERSION == "v6"
+    assert bg_preview.CACHE_VERSION == "v7"
     assert len(keys) == 3
 
 
