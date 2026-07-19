@@ -97,3 +97,59 @@ describe("TitleCardPreview — font fidelity / backend connection", () => {
     expect(artist.textContent).not.toContain("́");
   });
 });
+
+/**
+ * The "auto" template must resolve the SAME way the backend does
+ * (ass_render.title_card_layout): a long instrumental intro (first sung line
+ * > 0.8s) → centered hero; a short intro → compact lower-left badge. This is
+ * the fix for the preview-vs-render divergence where "auto" always showed the
+ * hero while short-intro songs rendered the tiny badge. We assert on the
+ * layout container's flex/text alignment, which differs by template
+ * (centered: center/center; badge: flex-end/left) — see PREVIEW_LAYOUTS.
+ */
+describe("TitleCardPreview — auto template mirrors the backend intro heuristic", () => {
+  // The visible artist line is a <div> (the hidden measuring node is a <span>);
+  // its parent is the flex layout container carrying the per-template style.
+  function layoutOf(container, artistText) {
+    const line = [...container.querySelectorAll("div")].find(
+      (el) => el.tagName === "DIV" && el.textContent === artistText,
+    );
+    return line?.parentElement?.style;
+  }
+
+  it("auto + long intro (>0.8s) → centered hero", () => {
+    const { container } = render(
+      <TitleCardPreview artist="Banda" song="Tema" firstLyricStart={2.0} />,
+    );
+    const s = layoutOf(container, "BANDA");
+    expect(s.justifyContent).toBe("center");
+    expect(s.textAlign).toBe("center");
+  });
+
+  it("auto + short intro (≤0.8s) → compact badge", () => {
+    const { container } = render(
+      <TitleCardPreview artist="Banda" song="Tema" firstLyricStart={0.2} />,
+    );
+    const s = layoutOf(container, "BANDA");
+    expect(s.justifyContent).toBe("flex-end");
+    expect(s.alignItems).toBe("flex-start");
+    expect(s.textAlign).toBe("left");
+  });
+
+  it("auto + unknown intro (no firstLyricStart) → centered hero (self-corrects later)", () => {
+    const { container } = render(<TitleCardPreview artist="Banda" song="Tema" />);
+    const s = layoutOf(container, "BANDA");
+    expect(s.justifyContent).toBe("center");
+    expect(s.textAlign).toBe("center");
+  });
+
+  it("an explicit template overrides the intro heuristic", () => {
+    // Short intro would resolve badge under auto, but an explicit centered wins.
+    const { container } = render(
+      <TitleCardPreview artist="Banda" song="Tema" template="centered" firstLyricStart={0.2} />,
+    );
+    const s = layoutOf(container, "BANDA");
+    expect(s.justifyContent).toBe("center");
+    expect(s.textAlign).toBe("center");
+  });
+});

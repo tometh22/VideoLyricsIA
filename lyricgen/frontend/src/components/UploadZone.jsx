@@ -476,6 +476,18 @@ export default function UploadZone({
   })();
   const _previewLyric = _reviewFirstLine || (files[0]?.songTitle || files[0]?.title || "").trim();
 
+  // Start (seconds) of the first sung line, mirroring the backend's
+  // `first_lyric_start = segments[0]["start"]` (ass_render.title_card_lines).
+  // Lets TitleCardPreview resolve the "auto" title template the same way the
+  // render does (long intro → centered hero, short intro → compact badge)
+  // instead of always assuming the hero. null when transcription hasn't
+  // produced segments yet; the preview falls back to the hero and self-corrects
+  // once they arrive.
+  const _firstLyricStart =
+    Array.isArray(reviewSegments) && typeof reviewSegments[0]?.start === "number"
+      ? reviewSegments[0].start
+      : null;
+
   // ── Studio Console stepper ─────────────────────────────────────────────
   // 4 steps revealed one at a time (variant A): the left rail navigates,
   // the center stage holds the live preview, the right panel shows only the
@@ -2703,6 +2715,7 @@ export default function UploadZone({
                   ? batchDefaults.titleSongBreak.split("\n")
                   : null
               }
+              firstLyricStart={_firstLyricStart}
             />
           ) : (bgMode === "auto" || bgMode === "library" || (bgMode === "custom" && customPreviewUrl)) ? (
             <WizardLivePreview
