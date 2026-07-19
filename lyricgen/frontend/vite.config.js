@@ -42,6 +42,11 @@ export default defineConfig({
       "/upload": "http://localhost:8000",
       "/transcribe": "http://localhost:8000",
       "/generate": "http://localhost:8000",
+      // SSE de progreso del render (pollJob). Sin esto el dev server sirve
+      // index.html (text/html) en vez del stream → el EventSource falla y la
+      // barra "Armando el video" queda trabada. En prod va directo a la API
+      // (VITE_API_URL), así que este proxy es solo para dev local.
+      "/events": { target: "http://localhost:8000", changeOrigin: true },
       "/status": "http://localhost:8000",
       "/download": "http://localhost:8000",
       "/preview": "http://localhost:8000",

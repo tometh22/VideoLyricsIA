@@ -1885,9 +1885,25 @@ export default function App() {
       }
 
       if (es) {
-        const cleanup = () => { es.close(); pollingIntervals.current.delete(es); };
+        // Watchdog: an EventSource can OPEN successfully but then stay silent
+        // — a buffering proxy, or (local dev) an SSE reader that doesn't see
+        // the worker's writes. In that case neither onmessage nor onerror ever
+        // fires and the progress screen hangs forever. If no event arrives
+        // shortly after connecting, fall back to polling /status. Cleared as
+        // soon as the first event lands.
+        let sawEvent = false;
+        let silentTimer = setTimeout(() => {
+          if (!sawEvent) { cleanup(); startPolling(); }
+        }, 6000);
+        const cleanup = () => {
+          clearTimeout(silentTimer);
+          es.close();
+          pollingIntervals.current.delete(es);
+        };
         pollingIntervals.current.add(es);
         es.onmessage = (e) => {
+          sawEvent = true;
+          clearTimeout(silentTimer);
           if (!isMountedRef.current) { cleanup(); return; }
           try {
             const data = JSON.parse(e.data);
@@ -1907,7 +1923,6 @@ export default function App() {
           } catch {}
         };
         es.onerror = () => {
-          // SSE connection dropped (e.g. proxy buffering). Fall through to polling.
           cleanup();
           startPolling();
         };
@@ -1985,15 +2000,23 @@ export default function App() {
     });
   }, [fetchHistory, handleLogout]);
 
-  useEffect(() => () => {
-    // R-FRONT-5: marca unmounted ANTES de cerrar handles para que
-    // cualquier callback async en flight (SSE messages bufferadas, polls
-    // ya disparados) salga temprano vía el guard sin tocar state.
-    isMountedRef.current = false;
-    pollingIntervals.current.forEach((handle) => {
-      if (handle && typeof handle.close === "function") handle.close();
-      else clearInterval(handle);
-    });
+  useEffect(() => {
+    // Set true on (re)mount so React 18 StrictMode's dev-only
+    // setup→cleanup→setup cycle doesn't leave the ref stuck at `false` — that
+    // would make every SSE/polling guard below bail and freeze the progress
+    // screen (the "Armando el video" hang). Prod has no double-invoke, but
+    // setting it here is correct in both.
+    isMountedRef.current = true;
+    return () => {
+      // R-FRONT-5: marca unmounted ANTES de cerrar handles para que
+      // cualquier callback async en flight (SSE messages bufferadas, polls
+      // ya disparados) salga temprano vía el guard sin tocar state.
+      isMountedRef.current = false;
+      pollingIntervals.current.forEach((handle) => {
+        if (handle && typeof handle.close === "function") handle.close();
+        else clearInterval(handle);
+      });
+    };
   }, []);
 
   // Sync filesRef con files para que callbacks asincrónicos vean el state actual.
