@@ -12103,6 +12103,10 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
             "-i", os.path.abspath(mp3_path),
             "-filter_complex", fc, "-map", "[outv]", "-map", "2:a",
             *vargs, *aargs, "-r", spec.fps_str,
+            # Output-level -t: -shortest alone lets the muxer overshoot ~1s
+            # past the audio (buffered frames of the infinite base loop),
+            # leaving a frozen-silent tail. Hard-cap at the window length.
+            "-t", str(dur),
             "-movflags", "+faststart", "-shortest",
             os.path.basename(out_path),
         ]
