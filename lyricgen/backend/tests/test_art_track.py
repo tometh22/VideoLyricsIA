@@ -212,6 +212,36 @@ def test_render_art_track_dispatch_uses_reactive_strip(monkeypatch, tmp_path):
     assert not os.path.exists(calls["frames_dir"])
 
 
+def test_render_art_track_effect_adds_fx_screen_blend(monkeypatch, tmp_path):
+    import fx_compositor as fx
+    # Only exercise this if the baked loop exists (it ships in assets/fx).
+    if not fx.effect_path("bokeh"):
+        import pytest as _pytest
+        _pytest.skip("bokeh fx asset not present")
+    spec = rs.RenderSpec.youtube_default()
+    calls = _render_with_stubs(monkeypatch, tmp_path, spec,
+                               duration=10.0, effect="bokeh")
+    joined = " ".join(calls["cmd"])
+    # The fx loop is appended as a stream-looped input and screen-blended
+    # onto the base before the wave overlay.
+    assert "-stream_loop" in calls["cmd"] and "bokeh.mp4" in joined
+    assert "blend=all_mode=screen" in joined
+    # Bars still overlay LAST so they stay crisp on top of the particles.
+    assert joined.index("blend=all_mode=screen") < joined.index("overlay=")
+    # Audio mapping unchanged (fx has no audio; mp3 is still input 2).
+    assert "2:a" in calls["cmd"]
+
+
+def test_render_art_track_unknown_effect_is_noop(monkeypatch, tmp_path):
+    spec = rs.RenderSpec.youtube_default()
+    calls = _render_with_stubs(monkeypatch, tmp_path, spec,
+                               duration=10.0, effect="does-not-exist")
+    joined = " ".join(calls["cmd"])
+    # Unknown effect → no fx input, plain wave overlay (never breaks a render).
+    assert "-stream_loop" not in calls["cmd"]
+    assert "blend=all_mode=screen" not in joined
+
+
 def test_render_art_track_half_rate_wave_at_high_fps(monkeypatch, tmp_path):
     import dataclasses
     import math

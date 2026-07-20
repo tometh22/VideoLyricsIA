@@ -2782,6 +2782,13 @@ export default function UploadZone({
                 <>
                   <style>{`@keyframes atwave { 0%, 100% { transform: scaleY(0.45); } 50% { transform: scaleY(1); } }`}</style>
                   <img src={customPreviewUrl} alt="" className="absolute inset-0 w-full h-full object-cover scale-110 blur-2xl brightness-50 saturate-[.75]" />
+                  {/* Moving effect (screen-blended, matching the render). */}
+                  {(() => {
+                    const fx = EFFECTS.find((e) => e.code === (batchDefaults.effect || "") && e.sample);
+                    return fx ? (
+                      <video key={fx.code} src={fx.sample} className="absolute inset-0 w-full h-full object-cover pointer-events-none mix-blend-screen" autoPlay loop muted playsInline />
+                    ) : null;
+                  })()}
                   <div className="absolute inset-0 bg-gradient-to-r from-black/60 via-black/25 to-transparent" />
                   <div className="absolute inset-0" style={{ boxShadow: "inset 0 0 120px 40px rgba(0,0,0,0.45)" }} />
                   <img src={customPreviewUrl} alt="" className="absolute top-1/2 right-[8%] -translate-y-1/2 h-[62%] aspect-square object-cover rounded shadow-2xl shadow-black/70 ring-1 ring-white/10" />
@@ -2963,6 +2970,57 @@ export default function UploadZone({
           {wizardStep === 2 && (
             <>
               {_bgBlock}
+              {/* Art track: efecto de movimiento opcional (partículas/luz que
+                  se mueven sobre la portada). Reusa los mismos loops que los
+                  lyric videos. NO mostramos los estilos de movimiento de
+                  cámara — no aplican al formato art track. */}
+              {artTrack && (
+                <div className="mt-4 pt-3 border-t border-white/[0.05]">
+                  <p className="text-[11px] text-gray-400 font-medium">
+                    {t("upload.arttrack_effect_title") || "Efecto en movimiento (opcional)"}
+                  </p>
+                  <p className="text-[10px] text-gray-600 mt-0.5 mb-2">
+                    {t("upload.arttrack_effect_desc") || "Partículas/luz que se mueven sobre la portada, como el video de referencia. Se aplica a master y short."}
+                  </p>
+                  <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+                    {EFFECTS.map((e) => {
+                      const active = (batchDefaults.effect || "") === e.code;
+                      return (
+                        <button
+                          key={e.code || "none"}
+                          type="button"
+                          onClick={() => updateBatchDefault("effect", e.code)}
+                          aria-label={`${e.label}: ${e.desc}`}
+                          title={e.desc}
+                          className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
+                            active
+                              ? "border-transparent ring-1 ring-brand/50 shadow-glow"
+                              : "border-white/[0.06] hover:border-white/[0.20]"
+                          }`}
+                        >
+                          <div className="aspect-video bg-black relative overflow-hidden">
+                            {e.sample ? (
+                              <video src={e.sample} className="w-full h-full object-cover pointer-events-none" autoPlay loop muted playsInline />
+                            ) : (
+                              <div className="w-full h-full grid place-items-center text-gray-500 text-[10px]" style={{ background: "radial-gradient(120% 100% at 50% 0,#241a40,#0b0820)" }}>
+                                {t("upload.effect_none") || "Ninguno"}
+                              </div>
+                            )}
+                            {active && (
+                              <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand grid place-items-center shadow">
+                                <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                              </div>
+                            )}
+                          </div>
+                          <div className="px-2 py-1.5 bg-surface-1">
+                            <p className={`text-label leading-tight ${active ? "text-white" : "text-gray-200"}`}>{e.label}</p>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
               {bgMode === "auto" && (
                 <>
                   <div className="grid grid-cols-1 gap-2">

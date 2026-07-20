@@ -1635,7 +1635,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 generate_art_track_short(
                     mp3_path, bg_source, job_dir, spec=_short_spec,
                     artist=artist, song_title=song_title,
-                    label_line=label_line,
+                    label_line=label_line, effect=effect,
                 )
             else:
                 generate_short(
@@ -12018,7 +12018,7 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
                       spec: "RenderSpec", artist: str, song_title: str,
                       duration: float, out_name: str | None = None,
                       win_start: float = 0.0, win_dur: float | None = None,
-                      label_line: str = "") -> str:
+                      label_line: str = "", effect: str = "") -> str:
     """Render the full art-track ("official audio") video: PIL builds the static
     composite once (blurred cover + shadowed card + title/artist + tag/legal),
     then ffmpeg loops that base image and overlays the AUDIO-REACTIVE waveform
@@ -12083,6 +12083,14 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
     else:
         aargs = ["-c:a", spec.audio_codec]
 
+    # Optional moving effect: reuse the shared baked fx loops (snow/rain/
+    # stars/bokeh/light/aurora) that the lyric path screen-blends. Composited
+    # over the base BEFORE the wave overlay so the white bars stay crisp on
+    # top of the particles. The art-track background tone stays as-is (no
+    # color grade — the base already luminance-clamps the blur).
+    import fx_compositor as _fx
+    fx_path = _fx.effect_path(effect)
+
     try:
         pattern = art_track_wave.write_wave_frames(
             heights, frames_dir, w=L["wave_w"], h=L["wave_h"],
@@ -12090,17 +12098,35 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
         # eof_action=repeat: the strip sequence is finite while the looped
         # base is infinite — hold the last strip frame so the graph never
         # ends early; the -t audio window + -shortest bound the output.
-        fc = (
-            f"[0:v][1:v]overlay={L['wave_x']}:{L['wave_y']}:eof_action=repeat,"
-            f"format={spec.pix_fmt}[outv]"
-        )
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
+        inputs = [
             "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(base_path),
             "-framerate", wave_fps_str, "-start_number", "0",
             "-i", os.path.abspath(pattern),
             "-ss", str(max(0.0, win_start)), "-t", str(dur),
             "-i", os.path.abspath(mp3_path),
+        ]
+        if fx_path:
+            # fx = input 3 (after the mp3), looped forever; screen-blend it
+            # onto the base, then overlay the bars on the result.
+            gain = _fx.fx_gain(effect)
+            gain_step = f"{gain}," if gain else ""
+            inputs += ["-stream_loop", "-1", "-i", os.path.abspath(fx_path)]
+            fc = (
+                f"[0:v]format=gbrp[bg];"
+                f"[3:v]scale={spec.width}:{spec.height},setpts=PTS-STARTPTS,"
+                f"{gain_step}format=gbrp[fx];"
+                f"[bg][fx]blend=all_mode=screen:shortest=1,format={spec.pix_fmt}[based];"
+                f"[based][1:v]overlay={L['wave_x']}:{L['wave_y']}:eof_action=repeat,"
+                f"format={spec.pix_fmt}[outv]"
+            )
+        else:
+            fc = (
+                f"[0:v][1:v]overlay={L['wave_x']}:{L['wave_y']}:eof_action=repeat,"
+                f"format={spec.pix_fmt}[outv]"
+            )
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            *inputs,
             "-filter_complex", fc, "-map", "[outv]", "-map", "2:a",
             *vargs, *aargs, "-r", spec.fps_str,
             # Output-level -t: -shortest alone lets the muxer overshoot ~1s
@@ -12117,8 +12143,9 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
         shutil.rmtree(frames_dir, ignore_errors=True)
     _validate_rendered_mp4(out_path, dur)
     size_mb = os.path.getsize(out_path) / (1024 * 1024)
-    logger.info("[ART] art track render: %.0fs, %.1f MB (%dx%d)",
-                dur, size_mb, spec.width, spec.height)
+    logger.info("[ART] art track render: %.0fs, %.1f MB (%dx%d)%s",
+                dur, size_mb, spec.width, spec.height,
+                f" +fx:{effect}" if fx_path else "")
     return out_path
 
 
@@ -13569,7 +13596,7 @@ def generate_lyric_video(
         out = _render_art_track(
             bg_source, mp3_path, job_dir, spec=spec,
             artist=artist, song_title=title_song, duration=duration,
-            label_line=label_line,
+            label_line=label_line, effect=effect,
         )
         audio.close()
         return out, font, bg_source
@@ -14338,6 +14365,7 @@ def generate_art_track_short(
     song_title: str = "",
     window_sec: float = 30.0,
     label_line: str = "",
+    effect: str = "",
 ) -> str:
     """Render the vertical (9:16) art-track short: the same VEVO composite as
     the master (blurred cover fill + shadowed cover card + reactive waveform +
@@ -14353,7 +14381,7 @@ def generate_art_track_short(
         cover_path, mp3_path, job_dir, spec=spec,
         artist=artist, song_title=song_title, duration=win,
         out_name="short.mp4", win_start=start, win_dur=win,
-        label_line=label_line,
+        label_line=label_line, effect=effect,
     )
     logger.info("[ART] art-track short window %.0f-%.0fs", start, start + win)
     return out_path
