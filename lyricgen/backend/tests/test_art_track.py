@@ -172,11 +172,17 @@ def _render_with_stubs(monkeypatch, tmp_path, spec, **render_kwargs):
         open(out_path, "wb").write(b"png")
         return out_path
 
+    from PIL import Image as _Img
+    def fake_layer(cover, spec, **k):
+        return _Img.new("RGBA", (4, 4), (0, 0, 0, 255))
+
     monkeypatch.setattr(art_track_wave, "compute_bar_frames", fake_compute)
     monkeypatch.setattr(art_track_wave, "write_wave_frames", fake_write)
     monkeypatch.setattr(pipeline, "run_checked", fake_run)
     monkeypatch.setattr(pipeline, "_validate_rendered_mp4", lambda *a, **k: None)
     monkeypatch.setattr(pipeline, "_build_art_track_base", fake_base)
+    monkeypatch.setattr(pipeline, "_art_track_bg_layer", fake_layer)
+    monkeypatch.setattr(pipeline, "_art_track_fg_layer", fake_layer)
 
     pipeline._render_art_track(
         "cover.jpg", "song.mp3", str(tmp_path), spec=spec,
@@ -222,13 +228,15 @@ def test_render_art_track_effect_adds_fx_screen_blend(monkeypatch, tmp_path):
     calls = _render_with_stubs(monkeypatch, tmp_path, spec,
                                duration=10.0, effect="bokeh")
     joined = " ".join(calls["cmd"])
-    # The fx loop is appended as a stream-looped input and screen-blended
-    # onto the base before the wave overlay.
+    # The fx loop is a stream-looped input, plus the separate foreground layer.
     assert "-stream_loop" in calls["cmd"] and "bokeh.mp4" in joined
-    assert "blend=all_mode=screen" in joined
-    # Effect is the TOP layer: wave overlay first, then the fx screen-blend
-    # on top so particles float over the bars and cover.
-    assert joined.index("overlay=") < joined.index("blend=all_mode=screen")
+    assert "_bg.png" in joined and "_fg.png" in joined
+    # Effect is the BACKGROUND layer: screen-blend onto the bg FIRST (behind
+    # the card + wave), so the two overlays (card, wave) come after it.
+    assert joined.index("blend=all_mode=screen") < joined.index("overlay=")
+    # Subtle, not blown out: reduced opacity + desaturated + softened.
+    assert "all_opacity=0.45" in joined
+    assert "saturation=0.70" in joined and "gblur" in joined
     # Audio mapping unchanged (fx has no audio; mp3 is still input 2).
     assert "2:a" in calls["cmd"]
 

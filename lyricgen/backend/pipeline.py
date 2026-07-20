@@ -11869,18 +11869,12 @@ def _art_track_waveform_bars(mp3_path: str, n: int, *, win_start: float = 0.0,
         return [0.25] * n
 
 
-def _build_art_track_base(cover_path: str, out_path: str, *,
-                          spec: "RenderSpec", artist: str, song_title: str,
-                          label_line: str = "") -> str:
-    """Build the COMPLETE static base frame with PIL (one image): blurred cover
-    fill (luminance-clamped + scrim + vignette so ANY cover yields the same
-    tonal band and white text always reads) + wide-shadowed cover card +
-    "OFFICIAL AUDIO" tag + title/artist + optional ℗/© label line. Doing the
-    whole static composite once (not per-frame in ffmpeg) keeps the render
-    fast — the expensive Gaussian blur runs a single time. ffmpeg then loops
-    this image and overlays the reactive waveform strip. Text via PIL (no
-    drawtext/libass dependency), same as generate_thumbnail.
-    """
+def _art_track_bg_layer(cover_path: str, spec: "RenderSpec") -> "Image.Image":
+    """The blurred-cover BACKGROUND layer only (no card, no text): cover-fit
+    crop → heavy blur → desaturate → luminance-clamp → scrim + vignette. Split
+    out of the base so an optional moving effect can screen-blend HERE, in the
+    ambient background, BEHIND the card and wave (matching the wizard preview)
+    — the cover card stays clean on top. Returns an opaque RGBA image."""
     import numpy as np
     from PIL import ImageFilter, ImageEnhance, ImageOps, ImageStat
     L = _art_track_layout(spec)
@@ -11888,10 +11882,6 @@ def _build_art_track_base(cover_path: str, out_path: str, *,
     portrait = L["text_align"] == "center"
 
     cover = Image.open(cover_path).convert("RGB")
-
-    # 1) Blurred, frame-filling background: cover-fit crop → heavy blur →
-    #    desaturate → clamp mean luminance into a fixed band (~65/255) so a
-    #    whole album renders with one consistent tone regardless of cover.
     bg = ImageOps.fit(cover, (W, H), method=Image.LANCZOS)
     bg = bg.filter(ImageFilter.GaussianBlur(radius=max(16, H // 14)))
     bg = ImageEnhance.Color(bg).enhance(0.85)
@@ -11900,9 +11890,6 @@ def _build_art_track_base(cover_path: str, out_path: str, *,
         min(1.6, max(0.45, 65.0 / max(mean_luma, 1.0))))
     base = bg.convert("RGBA")
 
-    # 1b) Scrim guaranteeing text/wave contrast: left-weighted in landscape
-    #     (the text column), bottom-weighted in portrait (text sits lower).
-    #     Plus a gentle vignette so the frame doesn't end in flat murk.
     if portrait:
         ramp = np.clip((np.linspace(0, 1, H) - 0.40) / 0.60, 0, 1) * 150
         scrim_a = np.repeat(ramp[:, None], W, axis=1)
@@ -11915,17 +11902,31 @@ def _build_art_track_base(cover_path: str, out_path: str, *,
     vig_a = np.asarray(Image.fromarray(vig_small, "L").resize((W, H), Image.BILINEAR))
     dark = np.zeros((H, W, 4), dtype=np.uint8)
     dark[:, :, 3] = np.maximum(scrim_a.astype(np.uint8), vig_a)
-    base = Image.alpha_composite(base, Image.fromarray(dark, "RGBA"))
+    return Image.alpha_composite(base, Image.fromarray(dark, "RGBA"))
 
-    # 2) The sharp cover card, contained in the square box — compute its REAL
-    #    size first so non-square covers get a shadow that matches (a square
-    #    shadow under a letterboxed cover reads as a compositing bug).
+
+def _art_track_fg_layer(cover_path: str, spec: "RenderSpec", *,
+                        artist: str, song_title: str,
+                        label_line: str = "") -> "Image.Image":
+    """The FOREGROUND layer only (transparent RGBA): shadowed cover card +
+    "OFFICIAL AUDIO" tag + title/artist + optional ℗/© label line. Drawn on a
+    transparent canvas so it can overlay on top of the background+effect, which
+    keeps the card and text clean above the moving particles."""
+    from PIL import ImageFilter, ImageOps
+    L = _art_track_layout(spec)
+    W, H = L["W"], L["H"]
+    portrait = L["text_align"] == "center"
+
+    cover = Image.open(cover_path).convert("RGB")
+    base = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+    # The sharp cover card, contained in the square box — compute its REAL
+    # size first so non-square covers get a shadow that matches.
     card = ImageOps.contain(cover, (L["card"], L["card"]), method=Image.LANCZOS)
     cw, ch = card.size
     px = L["card_x"] + (L["card"] - cw) // 2
     py = L["card_y"] + (L["card"] - ch) // 2
 
-    # 2b) Wide, soft drop shadow behind the actual card rect.
     off_x, off_y = int(L["card"] * 0.01), int(L["card"] * 0.04)
     shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     ImageDraw.Draw(shadow).rounded_rectangle(
@@ -11936,13 +11937,9 @@ def _build_art_track_base(cover_path: str, out_path: str, *,
 
     base.alpha_composite(card.convert("RGBA"), (px, py))
     d = ImageDraw.Draw(base)
-    # Hairline stroke crisps the card edge against the blurred background.
     d.rectangle([px, py, px + cw - 1, py + ch - 1],
                 outline=(255, 255, 255, 20), width=1)
 
-    # 3) Text block. The waveform is NOT drawn here — it's the audio-reactive
-    #    strip sequence overlaid at render time so the bars pulse with the
-    #    music, following the rhythm.
     anchor = "ma" if portrait else "la"
 
     def _font(sz: int, extra_bold: bool = False):
@@ -12010,7 +12007,22 @@ def _build_art_track_base(cover_path: str, out_path: str, *,
             f, _ = _fit_font(legal, sz, False)
         _shadow_text(L["text_x"], L["legal_y"], legal, f, (255, 255, 255, 140))
 
-    base.convert("RGB").save(out_path)
+    return base
+
+
+def _build_art_track_base(cover_path: str, out_path: str, *,
+                          spec: "RenderSpec", artist: str, song_title: str,
+                          label_line: str = "") -> str:
+    """Build the COMPLETE static base frame (background + card + text) as one
+    flattened image. Used by the no-effect render and the thumbnail. When an
+    effect is present the render composites the two layers separately (bg →
+    effect → fg) so the particles sit in the ambient background. Doing the
+    whole static composite once (not per-frame) keeps the render fast — the
+    expensive Gaussian blur runs a single time."""
+    bg = _art_track_bg_layer(cover_path, spec)
+    fg = _art_track_fg_layer(cover_path, spec, artist=artist,
+                             song_title=song_title, label_line=label_line)
+    Image.alpha_composite(bg, fg).convert("RGB").save(out_path)
     return out_path
 
 
@@ -12038,14 +12050,29 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
     import shutil
 
     import art_track_wave
+    import fx_compositor as _fx
     from fractions import Fraction
 
     L = _art_track_layout(spec)
     dur = float(win_dur) if win_dur else float(duration)
     stem = (out_name or "art").replace(".mp4", "").replace(".mov", "")
-    base_path = os.path.join(job_dir, stem + "_base.png")
-    _build_art_track_base(cover_path, base_path, spec=spec, artist=artist,
-                          song_title=song_title, label_line=label_line)
+    fx_path = _fx.effect_path(effect)
+
+    # With an effect we split the composite into a BACKGROUND layer (blurred
+    # cover + scrim) and a FOREGROUND layer (card + text) so the moving
+    # particles screen-blend in the ambient background — BEHIND the card and
+    # the wave, subtle and soft, matching the wizard preview. Without an
+    # effect, one flat base is enough.
+    if fx_path:
+        bg_path = os.path.join(job_dir, stem + "_bg.png")
+        fg_path = os.path.join(job_dir, stem + "_fg.png")
+        _art_track_bg_layer(cover_path, spec).convert("RGB").save(bg_path)
+        _art_track_fg_layer(cover_path, spec, artist=artist,
+                            song_title=song_title, label_line=label_line).save(fg_path)
+    else:
+        base_path = os.path.join(job_dir, stem + "_base.png")
+        _build_art_track_base(cover_path, base_path, spec=spec, artist=artist,
+                              song_title=song_title, label_line=label_line)
 
     out_path = os.path.join(job_dir, out_name or f"lyric_video.{spec.container}")
 
@@ -12083,17 +12110,6 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
     else:
         aargs = ["-c:a", spec.audio_codec]
 
-    # Optional moving effect: reuse the shared baked fx loops (snow/rain/
-    # stars/bokeh/light/aurora) that the lyric path screen-blends. Composited
-    # as the TOP layer — over the wave AND the cover card — so the particles
-    # float in front of everything, matching the wizard preview and the VEVO
-    # reference. Screen-blend only lightens, so the white bars stay pure white
-    # (screen with white = white) while the bokeh glows through the dark gaps.
-    # The art-track background tone stays as-is (no color grade — the base
-    # already luminance-clamps the blur).
-    import fx_compositor as _fx
-    fx_path = _fx.effect_path(effect)
-
     try:
         pattern = art_track_wave.write_wave_frames(
             heights, frames_dir, w=L["wave_w"], h=L["wave_h"],
@@ -12101,28 +12117,42 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
         # eof_action=repeat: the strip sequence is finite while the looped
         # base is infinite — hold the last strip frame so the graph never
         # ends early; the -t audio window + -shortest bound the output.
-        inputs = [
-            "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(base_path),
-            "-framerate", wave_fps_str, "-start_number", "0",
-            "-i", os.path.abspath(pattern),
-            "-ss", str(max(0.0, win_start)), "-t", str(dur),
-            "-i", os.path.abspath(mp3_path),
-        ]
         if fx_path:
-            # fx = input 3 (after the mp3), looped forever. Overlay the bars
-            # onto the base FIRST, then screen-blend the effect on TOP so the
-            # particles float over the wave and the cover (matches the preview).
-            gain = _fx.fx_gain(effect)
-            gain_step = f"{gain}," if gain else ""
-            inputs += ["-stream_loop", "-1", "-i", os.path.abspath(fx_path)]
+            # Layered composite so the effect sits in the AMBIENT BACKGROUND,
+            # behind the card and wave (matching the preview): bg (0) → effect
+            # screen-blend → foreground card+text (4) → wave (1).
+            #   0 = blurred-cover bg   1 = wave seq   2 = mp3
+            #   3 = fx loop            4 = fg card+text (RGBA)
+            # The fx is desaturated + softened + composited at reduced opacity
+            # so it reads as a subtle glow, not the blown-out yellow orbs the
+            # raw asset + screen-blend produced over the cover.
+            inputs = [
+                "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(bg_path),
+                "-framerate", wave_fps_str, "-start_number", "0",
+                "-i", os.path.abspath(pattern),
+                "-ss", str(max(0.0, win_start)), "-t", str(dur),
+                "-i", os.path.abspath(mp3_path),
+                "-stream_loop", "-1", "-i", os.path.abspath(fx_path),
+                "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(fg_path),
+            ]
             fc = (
-                f"[0:v][1:v]overlay={L['wave_x']}:{L['wave_y']}:eof_action=repeat,"
-                f"format=gbrp[bg];"
                 f"[3:v]scale={spec.width}:{spec.height},setpts=PTS-STARTPTS,"
-                f"{gain_step}format=gbrp[fx];"
-                f"[bg][fx]blend=all_mode=screen:shortest=1,format={spec.pix_fmt}[outv]"
+                f"eq=saturation=0.70:brightness=-0.04,gblur=sigma=6,format=gbrp[fx];"
+                f"[0:v]format=gbrp[bg0];"
+                f"[bg0][fx]blend=all_mode=screen:all_opacity=0.45,"
+                f"format={spec.pix_fmt}[bgfx];"
+                f"[bgfx][4:v]overlay=0:0[withcard];"
+                f"[withcard][1:v]overlay={L['wave_x']}:{L['wave_y']}:eof_action=repeat,"
+                f"format={spec.pix_fmt}[outv]"
             )
         else:
+            inputs = [
+                "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(base_path),
+                "-framerate", wave_fps_str, "-start_number", "0",
+                "-i", os.path.abspath(pattern),
+                "-ss", str(max(0.0, win_start)), "-t", str(dur),
+                "-i", os.path.abspath(mp3_path),
+            ]
             fc = (
                 f"[0:v][1:v]overlay={L['wave_x']}:{L['wave_y']}:eof_action=repeat,"
                 f"format={spec.pix_fmt}[outv]"
