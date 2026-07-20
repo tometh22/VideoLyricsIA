@@ -2649,7 +2649,11 @@ export default function App() {
       start: Math.round((s.start || 0) * 1000) / 1000,
       end: Math.round((s.end || 0) * 1000) / 1000,
     }));
-    console.warn("[drag-persist] POST", { jobId, count: safeSegments.length, sample: _sample });
+    // Downgraded warn→info: this was a temporary reseed-storm probe (see
+    // comment above, "remove after 2026-07-01" — #724's fix has held silent
+    // since). Routine every-save POST logging doesn't belong in Sentry;
+    // info keeps the local/replay breadcrumb without a forwarded event.
+    console.info("[drag-persist] POST", { jobId, count: safeSegments.length, sample: _sample });
     try {
       const res = await authFetch(`${API}/jobs/${jobId}/save-segments`, {
         method: "POST",

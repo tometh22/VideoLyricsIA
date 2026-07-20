@@ -592,8 +592,18 @@ def multipart_complete(
             MultipartUpload={"Parts": sorted_parts},
         )
     except Exception as exc:
-        logger.error(
-            "multipart_complete failed key=%r upload_id=%r: %s",
+        # Deliberately WARNING, not ERROR: returning None here is not the
+        # end of the story. The caller (upload_multipart_complete) HEADs
+        # the key and decides the real outcome — a durable object means an
+        # idempotent 200 (a concurrent/retried double-submit consumed the
+        # UploadId), only a genuinely-missing object is a failure. Logging
+        # ERROR here fired a Sentry event on every recovered double-submit
+        # (NoSuchUpload on UMG .wav uploads), so the issue kept "regressing"
+        # even though the user's upload succeeded. Keep exc_info for the
+        # local traceback; WARNING stays below Sentry's ERROR capture.
+        logger.warning(
+            "multipart_complete failed key=%r upload_id=%r: %s "
+            "(caller reconciles via head_object_size)",
             key, upload_id, exc, exc_info=True,
         )
         return None
