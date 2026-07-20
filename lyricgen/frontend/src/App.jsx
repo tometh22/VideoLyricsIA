@@ -3326,6 +3326,9 @@ export default function App() {
         if (jobList[i].songTitle) body.append("song_title", jobList[i].songTitle);
         body.append("segments_json", "[]");
         body.append("art_track", "true");
+        if ((delivery.label_line || "").trim()) {
+          body.append("label_line", delivery.label_line.trim());
+        }
         body.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
           body.append("umg_frame_size", delivery.umg_frame_size);

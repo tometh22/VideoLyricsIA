@@ -272,6 +272,8 @@ export default function UploadZone({
   // back from /review (or any remount) preserves the operator's choice
   // of "ProRes 422 HQ" / frame size / fps, not just the file list.
   const [deliveryProfile, setDeliveryProfile] = useState(delivery?.delivery_profile || "youtube");
+  // Art track: línea legal opcional en pantalla (℗/© sello), per-batch.
+  const [labelLine, setLabelLine] = useState(delivery?.label_line || "");
   // umg_frame_size: now operator-selectable end-to-end. The pipeline
   // renders the source MP4 at the chosen UMG dims+fps (via
   // RenderSpec.umg_intermediate_master) so the lazy ProRes transcode
@@ -680,8 +682,9 @@ export default function UploadZone({
       umg_frame_size: umgFrameSize,
       umg_fps: umgFps,
       umg_prores_profile: umgProresProfile,
+      label_line: labelLine,
     });
-  }, [deliveryProfile, umgFrameSize, umgFps, umgProresProfile, onDeliveryChange]);
+  }, [deliveryProfile, umgFrameSize, umgFps, umgProresProfile, labelLine, onDeliveryChange]);
 
   useEffect(() => {
     if (bgMode === "library" && !libraryLoaded) {
@@ -1222,6 +1225,24 @@ export default function UploadZone({
               </>
             )}
           </div>
+        </div>
+      )}
+      {artTrack && (
+        <div className="mt-3 space-y-1" onClick={(e) => e.stopPropagation()}>
+          <label className="text-[10px] uppercase tracking-[0.18em] text-gray-500 block">
+            {t("upload.label_line_label") || "Línea legal / sello (opcional)"}
+          </label>
+          <input
+            type="text"
+            maxLength={120}
+            value={labelLine}
+            onChange={(e) => setLabelLine(e.target.value)}
+            placeholder={t("upload.label_line_placeholder") || "℗ 2026 Nombre del sello"}
+            className="w-full sm:w-96 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-brand/60"
+          />
+          <p className="text-[11px] text-gray-500">
+            {t("upload.label_line_hint") || "Se muestra chica abajo a la izquierda del video, en todos los formatos."}
+          </p>
         </div>
       )}
     </div>
@@ -2753,22 +2774,38 @@ export default function UploadZone({
               }
             />
           ) : artTrack ? (
-            /* Art track: preview del layout real (cover blureada + cover con
-               sombra a la derecha + waveform + título), NO el mock de letra. */
+            /* Art track: preview del layout real (cover blureada con scrim +
+               cover con sombra a la derecha + barras EQ latiendo + título en
+               zona segura), aproximación visual del render. */
             <div className="relative w-full aspect-video rounded-xl overflow-hidden bg-black">
               {customPreviewUrl ? (
                 <>
-                  <img src={customPreviewUrl} alt="" className="absolute inset-0 w-full h-full object-cover scale-110 blur-2xl brightness-50" />
-                  <img src={customPreviewUrl} alt="" className="absolute top-1/2 right-[8%] -translate-y-1/2 h-[62%] aspect-square object-cover rounded shadow-2xl shadow-black/70" />
-                  <div className="absolute left-[9%] top-[52%] flex items-end gap-[3px] h-[14%]">
-                    {Array.from({ length: 34 }).map((_, i) => (
-                      <span key={i} className="w-[6px] bg-white/85 rounded-sm" style={{ height: `${25 + Math.abs(Math.sin(i * 1.7)) * 70}%` }} />
+                  <style>{`@keyframes atwave { 0%, 100% { transform: scaleY(0.45); } 50% { transform: scaleY(1); } }`}</style>
+                  <img src={customPreviewUrl} alt="" className="absolute inset-0 w-full h-full object-cover scale-110 blur-2xl brightness-50 saturate-[.75]" />
+                  <div className="absolute inset-0 bg-gradient-to-r from-black/60 via-black/25 to-transparent" />
+                  <div className="absolute inset-0" style={{ boxShadow: "inset 0 0 120px 40px rgba(0,0,0,0.45)" }} />
+                  <img src={customPreviewUrl} alt="" className="absolute top-1/2 right-[8%] -translate-y-1/2 h-[62%] aspect-square object-cover rounded shadow-2xl shadow-black/70 ring-1 ring-white/10" />
+                  <div className="absolute left-[9%] top-[38%] text-[8px] md:text-[10px] uppercase tracking-[0.35em] text-white/60 drop-shadow">{t("arttrack.official_audio") || "Official Audio"}</div>
+                  <div className="absolute left-[9%] top-[44%] flex items-center gap-[4px] h-[16%]">
+                    {Array.from({ length: 24 }).map((_, i) => (
+                      <span
+                        key={i}
+                        className="w-[7px] bg-white/90 rounded-full"
+                        style={{
+                          height: `${30 + Math.abs(Math.sin(i * 1.7)) * 65}%`,
+                          animation: "atwave 1.1s ease-in-out infinite",
+                          animationDelay: `${(i % 7) * 90}ms`,
+                        }}
+                      />
                     ))}
                   </div>
-                  <div className="absolute left-[9%] top-[70%] text-white">
-                    <div className="font-bold text-lg md:text-2xl leading-tight drop-shadow">{titlePreviewSong || t("upload.video_type_art") || "Art Track"}</div>
+                  <div className="absolute left-[9%] top-[66%] max-w-[44%] text-white">
+                    <div className="font-bold text-lg md:text-2xl leading-tight drop-shadow line-clamp-2">{titlePreviewSong || t("upload.video_type_art") || "Art Track"}</div>
                     <div className="text-sm md:text-base text-white/85 drop-shadow">{titlePreviewArtist}</div>
                   </div>
+                  {(labelLine || "").trim() ? (
+                    <div className="absolute left-[9%] bottom-[6%] text-[9px] md:text-[11px] text-white/55 drop-shadow">{labelLine}</div>
+                  ) : null}
                 </>
               ) : (
                 <div className="absolute inset-0 flex items-center justify-center text-center text-gray-400 text-sm px-6">
