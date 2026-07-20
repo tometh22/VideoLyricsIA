@@ -46,7 +46,7 @@ def test_get_all_jobs_excludes_bg_preview_ghosts():
         _seed(db, job_id="ghost001", status="bg_preview_done", age_min=4)
         # Other ghost states the worker can leave behind.
         _seed(db, job_id="ghost002", status="bg_preview_queued", age_min=3)
-        _seed(db, job_id="ghost003", status="bg_preview_generating", age_min=3)
+        _seed(db, job_id="ghost003", status="bg_preview_running", age_min=3)
         _seed(db, job_id="ghost004", status="bg_preview_failed", age_min=3)
         # Regression from the July incident: the validator wrote a generic
         # terminal state before the preview worker could write its own state.

@@ -197,7 +197,7 @@ def main():
     ap.add_argument("--base-url", required=True)
     ap.add_argument("--bless", action="store_true",
                     help="guardar los frames actuales como nuevos goldens")
-    ap.add_argument("--timeout-min", type=int, default=25)
+    ap.add_argument("--timeout-min", type=int, default=45)
     args = ap.parse_args()
     base = args.base_url.rstrip("/")
 
@@ -244,23 +244,60 @@ def main():
     deadline = time.time() + args.timeout_min * 60
     pending = dict(jobs)
     failed = {}
+    # ¿La cola canary tiene consumidor vivo? La señal robusta (audit
+    # adversarial 2026-07-17) es: ¿ALGÚN job del bot salió alguna vez de
+    # "queued"? Si al menos uno arrancó, el Worker está drenando canary y
+    # los que quedaron en cola son contención legítima detrás de humanos.
+    # Si NINGUNO arrancó en toda la ventana, no hay consumidor (canary sin
+    # listener, o pickup roto) → eso SÍ es un problema y no debe salir
+    # verde-vacío. Sin esto, un starved→exit-0 ciega el monitor.
+    consumer_alive = False
     while pending and time.time() < deadline:
         time.sleep(20)
         for name, jid in list(pending.items()):
             st = _req(base, f"/status/{jid}", token=token)
             s = st.get("status")
+            if s and s != "queued":
+                consumer_alive = True
             if s in ("done", "pending_review"):
                 print(f"[GOLDEN] {name}: {s}")
                 del pending[name]
             elif s in ("error", "validation_failed", "rejected"):
                 failed[name] = f"{s}: {(st.get('error') or '')[:200]}"
                 del pending[name]
+    # Clasificar lo que quedó pendiente al deadline.
+    starved = {}
+    for name, jid in list(pending.items()):
+        st = _req(base, f"/status/{jid}", token=token)
+        s = st.get("status")
+        if s and s != "queued":
+            consumer_alive = True
+        if s == "queued" and consumer_alive:
+            # Arrancó al menos un hermano → hay consumidor; este quedó
+            # atrás por contención legítima (canary drena último).
+            starved[name] = jid
+            del pending[name]
+        # Si sigue queued SIN consumidor vivo, o quedó a mitad (processing),
+        # cae a `failed` abajo (regresión real / infra rota).
     for name, jid in pending.items():
-        failed[name] = f"timeout tras {args.timeout_min} min"
+        st = _req(base, f"/status/{jid}", token=token)
+        if st.get("status") == "queued":
+            failed[name] = ("nunca salió de 'queued' y NINGÚN render del bot "
+                            "arrancó — canary sin consumidor o pickup roto")
+        else:
+            failed[name] = f"timeout tras {args.timeout_min} min"
     if failed:
         for name, why in failed.items():
             print(f"[GOLDEN] RENDER FALLÓ {name}: {why}", file=sys.stderr)
         sys.exit(2)
+    if starved:
+        # Quedan encolados detrás de humanos con consumidor vivo: corren
+        # cuando la cola se vacíe y el cleanup del próximo run los rechaza.
+        for name, jid in starved.items():
+            print(f"[GOLDEN] SKIPPED {name} ({jid}): cola ocupada (consumidor "
+                  "vivo) — el render no arrancó dentro del deadline "
+                  "(no es regresión)", file=sys.stderr)
+        sys.exit(0)
 
     # Frames + comparación
     regressions = []

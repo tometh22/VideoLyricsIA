@@ -73,7 +73,18 @@ logger = logging.getLogger("genly.bg_preview")
 # particular off/shadow/enforce never share a key, and an asset generated
 # under the legacy namespace cannot become an enforce-mode cache hit. Every
 # v5 entry also passed the authoritative content gate before cache_put.
-CACHE_VERSION = "v5"
+# v6 (2026-07-17): metió `_lyrics_fp` en el hash — REVERTIDO en v7 (mismo
+# día). La letra en el hash rompía el reuso: el preview se dispara MIENTRAS
+# el operador edita (con la letra a medio hacer) y el render usa la letra
+# final; cualquier diferencia → keys distintas → cache-miss → se regenera
+# el fondo que ya estaba hecho. Como el operador casi siempre ajusta la
+# letra antes de crear, el hit-rate se desplomaba y el ahorro no llegaba.
+# v7: la letra ya NO entra al hash (fondos abstractos: un desfasaje de unas
+# ediciones es invisible), pero el preview SIGUE recibiendo lyrics_text para
+# generar (run_bg_preview_job → _ensure_background), así el fondo queda
+# temáticamente cerca de la canción. La letra afecta la GENERACIÓN, no la
+# ETIQUETA. v7 además deja de cachear el gradiente de policy-fallback (de v6).
+CACHE_VERSION = "v7"
 
 
 def compute_bg_cache_key(params: dict) -> str:
@@ -119,10 +130,47 @@ def compute_bg_cache_key(params: dict) -> str:
         "background_mode": (params.get("background_mode") or "veo").strip().lower(),
         "animate_image":   bool(params.get("animate_image", False)),
         "match_lyrics":    bool(params.get("match_lyrics", True)),
+        # NOTA v7: la LETRA no entra al hash a propósito (ver CACHE_VERSION).
+        # lyrics_text influye la generación del preview, no la etiqueta.
     }
     payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return digest[:12]
+
+
+def job_bg_cache_key(*, artist, song_title, style, movement_style, effect,
+                     custom_colors, genre, concept, background_hint,
+                     bg_verbatim, match_lyrics):
+    """Key esperado para el fast-path de fondo único AI de un job /generate.
+
+    Única fuente de verdad de los hardcodes `background_mode="veo"` /
+    `animate_image=False`: el preview SIEMPRE hashea así (App.jsx
+    previewEntry los fija) y el caller excluye custom/library/escenas/
+    variation antes de llamar. La usan main.py (recompute server-side
+    cuando el frontend no mandó el key — race del debounce) y
+    pipeline._validate_bg_cache_key (validación defensiva del worker), así
+    que main y worker no pueden divergir en la normalización.
+
+    Best-effort: None si el cómputo falla (el caller genera fresh).
+    """
+    try:
+        return compute_bg_cache_key({
+            "artist": artist or "",
+            "song_title": song_title or "",
+            "style": style or "",
+            "movement_style": movement_style or "",
+            "effect": effect or "",
+            "custom_colors": custom_colors or "",
+            "genre": genre or "",
+            "concept": concept or "",
+            "background_hint": background_hint or "",
+            "bg_verbatim": bool(bg_verbatim),
+            "background_mode": "veo",
+            "animate_image": False,
+            "match_lyrics": bool(match_lyrics),
+        })
+    except Exception:
+        return None
 
 
 def cache_r2_key(bg_cache_key: str) -> str:
@@ -221,10 +269,17 @@ def run_bg_preview_job(
             pass
         return {"job_id": job_id, "status": "bg_preview_done", "bg_cache_key": bg_cache_key, "cached": True}
 
+    # "bg_preview_running" (≤20 chars): el nombre viejo
+    # "bg_preview_generating" (21) excedía el varchar(20) de Job.status y
+    # este update fallaba EN SILENCIO desde siempre en Postgres (el status
+    # jamás existió en la DB — 0 filas históricas; lo destapó el CI de
+    # Postgres del PR #924). El try/except queda, pero ahora loguea: un
+    # guard que traga errores esconde bugs de schema.
     try:
-        update_job(job_id, status="bg_preview_generating", current_step="background")
-    except Exception:
-        pass
+        update_job(job_id, status="bg_preview_running", current_step="background")
+    except Exception as _status_err:
+        logger.warning("[BG_PREVIEW] no pude marcar running job=%s: %s",
+                       job_id, _status_err)
 
     # Importamos pipeline solo cuando lo necesitamos (importar main/pipeline
     # arrastra mucho — preferimos lazy para que el módulo bg_preview sea
@@ -256,6 +311,10 @@ def run_bg_preview_job(
                         concept=params.get("concept", ""),
                         movement_style=params.get("movement_style", ""),
                         match_lyrics=bool(params.get("match_lyrics", True)),
+                        # v6: el preview genera CON la letra (si el frontend
+                        # la mandó) — antes generaba ciego a ella y el render
+                        # heredaba un fondo que no la reflejaba.
+                        lyrics_text=params.get("lyrics_text") or "",
                         background_hint=params.get("background_hint"),
                         bg_verbatim=bool(params.get("bg_verbatim", False)),
                         bg_mode=params.get("background_mode", "veo"),
@@ -305,15 +364,25 @@ def run_bg_preview_job(
                     "policy_version": runtime_policy.get("policy_version"),
                     "policy_mode": runtime_policy.get("policy_mode"),
                 })
+                # v6: el gradiente de fallback NO se sube bajo la key real.
+                # Cachearlo hacía que un render futuro con la misma key lo
+                # heredara como si fuera un fondo Veo bueno, salteando su
+                # propia generación y recovery (audit adversarial 2026-07-17).
+                # Sin objeto en cache → el render hace miss y genera fresh.
+                logger.warning(
+                    "[BG_PREVIEW] job=%s policy fallback (gradiente) — no se "
+                    "cachea bajo key=%s; el render regenerará fresh",
+                    job_id, bg_cache_key,
+                )
+            else:
+                uploaded_key = cache_put(bg_cache_key, bg_path)
+                if not uploaded_key:
+                    raise RuntimeError("R2 upload failed (R2 disabled?)")
 
-            uploaded_key = cache_put(bg_cache_key, bg_path)
-            if not uploaded_key:
-                raise RuntimeError("R2 upload failed (R2 disabled?)")
-
-            logger.info(
-                "[BG_PREVIEW] job=%s uploaded bg to R2 key=%s (size=%d KB)",
-                job_id, uploaded_key, os.path.getsize(bg_path) // 1024,
-            )
+                logger.info(
+                    "[BG_PREVIEW] job=%s uploaded bg to R2 key=%s (size=%d KB)",
+                    job_id, uploaded_key, os.path.getsize(bg_path) // 1024,
+                )
 
         try:
             update_job(job_id, status="bg_preview_done", current_step="cached", error=None)

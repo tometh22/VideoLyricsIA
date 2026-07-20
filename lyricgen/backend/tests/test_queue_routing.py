@@ -26,10 +26,12 @@ import queue_jobs
 
 
 class _Sentinel:
-    """Stand-in for an rq.Queue. _pick_queue only returns it; it never
-    calls methods on it, so a marker object is enough."""
+    """Stand-in for an rq.Queue. _pick_queue only returns it (or reads
+    `.connection` to build the canary queue), so a marker object with a
+    dummy connection is enough."""
     def __init__(self, name: str):
         self.name = name
+        self.connection = object()
 
     def __repr__(self):  # pragma: no cover
         return f"<Q {self.name}>"
@@ -108,6 +110,37 @@ def test_enterprise_tenants_env_override(monkeypatch):
     # And the defaults are now NOT in the set
     q_default = queue_jobs._pick_queue(plan="100", tenant_id="omg")
     assert q_default is not q_enterprise
+
+
+def test_golden_render_bot_routes_to_canary(monkeypatch):
+    """El bot canario drena último: sus renders van a la cola 'canary',
+    nunca a default (donde el 2026-07-17 compitió con una operadora real
+    en pleno test)."""
+    q_default, q_enterprise = _patch_queues(monkeypatch)
+    q = queue_jobs._pick_queue(plan="free", tenant_id="golden_render_bot")
+    assert q is not q_default and q is not q_enterprise
+    assert getattr(q, "name", None) == "canary"
+
+
+def test_canary_wins_over_plan_promotion(monkeypatch):
+    """Aunque el bot algún día tenga plan enterprise, sigue en canary —
+    un monitor sintético jamás debe ganar fast lane por un cambio de plan."""
+    _patch_queues(monkeypatch)
+    q = queue_jobs._pick_queue(plan="enterprise", tenant_id="golden_render_bot")
+    assert getattr(q, "name", None) == "canary"
+
+
+def test_canary_tenants_env_override(monkeypatch):
+    """Agregar/quitar canarios es un env-var change, no código."""
+    monkeypatch.setenv("CANARY_TENANTS", "load_test_bot")
+    importlib.reload(queue_jobs)
+    q_default, _ = _patch_queues(monkeypatch)
+    assert getattr(
+        queue_jobs._pick_queue(plan="free", tenant_id="load_test_bot"),
+        "name", None,
+    ) == "canary"
+    # golden_render_bot ya no está en el set → cae a default
+    assert queue_jobs._pick_queue(plan="free", tenant_id="golden_render_bot") is q_default
 
 
 def test_redis_unavailable_returns_none(monkeypatch):

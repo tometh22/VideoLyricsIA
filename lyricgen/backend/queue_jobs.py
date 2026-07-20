@@ -123,11 +123,27 @@ _ENTERPRISE_TENANTS = frozenset(
     if t.strip()
 )
 
+# Synthetic-traffic tenants (monitors/canaries) drain LAST. The golden
+# render bot fires 3 concurrent renders on every staging push + nightly
+# cron; on 2026-07-17 that tripled the default-queue wait for a real
+# operator mid-test. Canary jobs must never compete with humans — they
+# only need to run *eventually* to keep the regression signal alive.
+# The worker must list "canary" at the END of its QUEUES env or these
+# jobs will sit unconsumed (see worker.py:_resolve_queue_names).
+_CANARY_TENANTS = frozenset(
+    t.strip().lower()
+    for t in os.environ.get("CANARY_TENANTS", "golden_render_bot").split(",")
+    if t.strip()
+)
+
 
 def _pick_queue(plan: str, tenant_id: str = ""):
     """Enterprise queue for premium plans OR B2B tenants, default otherwise.
 
     Precedence (highest first):
+      0. tenant_id matches `_CANARY_TENANTS` — synthetic monitors drain
+         last, whatever their plan says (a canary must never gain fast
+         lane by a plan change).
       1. tenant_id matches `_ENTERPRISE_TENANTS` — UMG/OMG always jump
          the default queue even on plan="100". 2026-05-15 incident:
          agus.cafisi (omg) batch of 5 songs was queuing behind tomas's
@@ -147,6 +163,9 @@ def _pick_queue(plan: str, tenant_id: str = ""):
     if q_default is None:
         return None
     tid = (tenant_id or "").strip().lower()
+    if tid and tid in _CANARY_TENANTS:
+        from rq import Queue
+        return Queue("canary", connection=q_default.connection)
     if tid and tid in _ENTERPRISE_TENANTS:
         return q_enterprise
     if plan in ("unlimited", "enterprise"):
