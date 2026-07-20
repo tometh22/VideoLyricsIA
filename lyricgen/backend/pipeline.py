@@ -11727,6 +11727,32 @@ def _static_image_to_mp4(image_path: str, output_path: str, duration: float,
     return output_path
 
 
+# Spanish short words that machine title-casing wrongly capitalizes
+# ("La Leyenda Del Hada Y El Mago" → "La Leyenda del Hada y el Mago").
+_ES_TITLE_STOPWORDS = {
+    "de", "del", "la", "las", "el", "los", "lo", "y", "e", "o", "u",
+    "un", "una", "unos", "unas", "en", "a", "al", "con", "por", "para",
+    "sin", "sobre", "tras",
+}
+
+
+def spanish_smart_title(text: str) -> str:
+    """Lowercase machine-titlecased Spanish stopwords, except the first word.
+
+    Only words in exact Titlecase are touched, so deliberate user casing
+    (ALLCAPS "DEL", already-lowercase "del", stylized "dEl") passes
+    through untouched, and English titles are unaffected (their short
+    words aren't in the stopword set).
+    """
+    words = (text or "").split(" ")
+    out = words[:1]
+    for w in words[1:]:
+        if w.istitle() and w.lower() in _ES_TITLE_STOPWORDS:
+            w = w.lower()
+        out.append(w)
+    return " ".join(out)
+
+
 def _art_track_layout(spec: "RenderSpec") -> dict:
     """Pixel positions for the VEVO-style art-track composite, per spec dims.
 
