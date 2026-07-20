@@ -734,7 +734,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # generación de fondo AI; compone el cover (blur + centrado +
                  # zoom sutil) y rinde SIN letra. delivery_profile sigue
                  # funcionando (youtube/umg/both). Default False = lyric video.
-                 art_track: bool = False):
+                 art_track: bool = False,
+                 # Línea legal opcional en pantalla (art tracks): ej.
+                 # "℗ 2026 Universal Music Chile". Vacía = no se dibuja.
+                 label_line: str = ""):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -952,7 +955,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             _persist_segments = False
             try:
                 from jobs import merge_render_params
-                merge_render_params(job_id, {"art_track": True})
+                _params = {"art_track": True}
+                if (label_line or "").strip():
+                    _params["label_line"] = label_line.strip()
+                merge_render_params(job_id, _params)
             except Exception as _e:  # non-fatal: endpoint also persists it
                 logger.warning("[ART] merge_render_params failed: %s", _e)
             logger.info("[ART] art track — skipping transcription/alignment")
@@ -1586,9 +1592,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 title_song_break=title_song_break,
                 # Multi-escena: el fondo ya es un timeline del largo completo.
                 bg_prelooped=_scenes_active,
-                # Art track: compone el cover (blur + centrado + zoom) y rinde
-                # sin letra. bg_image_path es el cover (imagen).
+                # Art track: compone el cover (blur + tarjeta + onda reactiva)
+                # y rinde sin letra. bg_image_path es el cover (imagen).
                 art_track=art_track,
+                label_line=label_line,
             )
             # Cinemascope opt-in: letterbox the finished YouTube master. Skipped
             # for UMG (that path returns a ProRes .mov — re-encoding it as h264
@@ -1628,6 +1635,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 generate_art_track_short(
                     mp3_path, bg_source, job_dir, spec=_short_spec,
                     artist=artist, song_title=song_title,
+                    label_line=label_line,
                 )
             else:
                 generate_short(
@@ -1641,12 +1649,19 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             files["short_url"] = f"/download/{job_id}/short"
             update_job(job_id, progress=85)
 
-            # Step 4 — Thumbnail (uses raw background, not lyric video)
+            # Step 4 — Thumbnail (art tracks reuse the composite look so the
+            # thumbnail matches what plays; lyric videos keep the raw bg).
             update_job(job_id, current_step="thumbnail", progress=90)
-            generate_thumbnail(
-                artist, mp3_path, job_dir, bg_source=bg_source,
-                song_title=song_title,
-            )
+            if art_track:
+                generate_art_track_thumbnail(
+                    bg_source, mp3_path, job_dir, artist=artist,
+                    song_title=song_title, label_line=label_line,
+                )
+            else:
+                generate_thumbnail(
+                    artist, mp3_path, job_dir, bg_source=bg_source,
+                    song_title=song_title,
+                )
             files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
 
         # Content validation already happened pre-render (Step 1b) so the
@@ -13467,9 +13482,10 @@ def generate_lyric_video(
     # con xfade) → no re-loopear en el render. Se propaga a _render_lyrics_ass.
     bg_prelooped: bool = False,
     # Art tracks: bg_image_path es un cover (imagen). Se compone el fondo de
-    # art track (cover blur + cover nítido centrado + zoom sutil) y se rinde
+    # art track (cover blur + tarjeta con sombra + onda reactiva) y se rinde
     # SIN letra ni title card. Requiere una imagen como bg_image_path.
     art_track: bool = False,
+    label_line: str = "",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -13549,6 +13565,7 @@ def generate_lyric_video(
         out = _render_art_track(
             bg_source, mp3_path, job_dir, spec=spec,
             artist=artist, song_title=title_song, duration=duration,
+            label_line=label_line,
         )
         audio.close()
         return out, font, bg_source
@@ -14316,11 +14333,12 @@ def generate_art_track_short(
     artist: str = "",
     song_title: str = "",
     window_sec: float = 30.0,
+    label_line: str = "",
 ) -> str:
     """Render the vertical (9:16) art-track short: the same VEVO composite as
-    the master (blurred cover fill + shadowed cover card + waveform + title)
-    over a 30s high-energy window of the audio. The waveform + playhead cover
-    that window. Writes `short.mp4` in job_dir (same contract as
+    the master (blurred cover fill + shadowed cover card + reactive waveform +
+    title) over a 30s high-energy window of the audio. The bars react to that
+    window's audio. Writes `short.mp4` in job_dir (same contract as
     generate_short); `_render_art_track` writes its own output name so it never
     clobbers the master's `lyric_video.mp4`.
     """
@@ -14331,6 +14349,7 @@ def generate_art_track_short(
         cover_path, mp3_path, job_dir, spec=spec,
         artist=artist, song_title=song_title, duration=win,
         out_name="short.mp4", win_start=start, win_dur=win,
+        label_line=label_line,
     )
     logger.info("[ART] art-track short window %.0f-%.0fs", start, start + win)
     return out_path
@@ -14556,6 +14575,48 @@ def _draw_text_with_outline(draw, xy, text, font, fill="white", outline="black",
             if ox != 0 or oy != 0:
                 draw.text((x + ox, y + oy), text, font=font, fill=outline)
     draw.text((x, y), text, font=font, fill=fill)
+
+
+def generate_art_track_thumbnail(
+    cover_path: str,
+    mp3_path: str,
+    job_dir: str,
+    *,
+    artist: str = "",
+    song_title: str = "",
+    label_line: str = "",
+) -> str:
+    """Thumbnail for art tracks: the SAME composite as the video (blurred
+    cover + shadowed card + title + a static whole-song waveform strip) at
+    1280×720, instead of the generic raw-cover crop — so the thumbnail
+    matches what plays. The static strip uses the full-track RMS envelope
+    (a "fingerprint" of the song, same visual language as the live bars).
+    """
+    import dataclasses
+
+    import art_track_wave
+
+    spec = dataclasses.replace(RenderSpec.youtube_default(),
+                               width=1280, height=720)
+    L = _art_track_layout(spec)
+    base_path = os.path.join(job_dir, "thumbnail_base.png")
+    out_path = os.path.join(job_dir, "thumbnail.jpg")
+    try:
+        _build_art_track_base(cover_path, base_path, spec=spec, artist=artist,
+                              song_title=song_title, label_line=label_line)
+        img = Image.open(base_path).convert("RGBA")
+        bars = _art_track_waveform_bars(mp3_path, L["n_bars"])
+        strip = art_track_wave.draw_wave_frame(
+            bars, L["wave_w"], L["wave_h"], pitch=L["pitch"], bar_w=L["bar_w"])
+        img.alpha_composite(strip, (L["wave_x"], L["wave_y"]))
+        img.convert("RGB").save(out_path, quality=92)
+    finally:
+        try:
+            os.unlink(base_path)
+        except OSError:
+            pass
+    logger.info("[ART] art-track thumbnail: %s", out_path)
+    return out_path
 
 
 def generate_thumbnail(

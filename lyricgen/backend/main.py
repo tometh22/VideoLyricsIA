@@ -7528,6 +7528,9 @@ async def generate_with_segments(
     # cover centered over a blurred fill + subtle motion, NO lyrics. The cover
     # comes in via background_file (image). Skips transcription + AI background.
     art_track: bool = Form(False),
+    # Línea legal opcional en pantalla para art tracks, ej.
+    # "℗ 2026 Universal Music Chile". Vacía = no se dibuja.
+    label_line: str = Form("", max_length=120),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -7712,7 +7715,10 @@ async def generate_with_segments(
     if art_track:
         try:
             from jobs import merge_render_params
-            merge_render_params(job_id, {"art_track": True})
+            _params = {"art_track": True}
+            if (label_line or "").strip():
+                _params["label_line"] = label_line.strip()
+            merge_render_params(job_id, _params)
         except Exception as _e:
             logger.warning("[ART] could not persist art_track render_param: %s", _e)
 
@@ -7864,6 +7870,7 @@ async def generate_with_segments(
         # subtle motion), no lyrics. Validated above (cover required, image
         # only). The pipeline skips transcription + AI background.
         art_track=art_track,
+        label_line=(label_line or "").strip() if art_track else "",
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -11066,7 +11073,10 @@ async def retry_job(
               # Art track: heredable — sin esto un retry de un art track se
               # re-renderiza como lyric video vacío y re-corre Whisper.
               # Persistido por pipeline/endpoint en render_params.
-              "art_track"):
+              "art_track",
+              # Línea legal del art track (℗/© sello), persistida junto al
+              # marker para que el retry la re-dibuje igual.
+              "label_line"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 
