@@ -7536,6 +7536,13 @@ async def generate_with_segments(
     # When set, contains the 2 lines joined by "\n" — capped at 200 chars
     # to match the song title's effective range.
     title_song_break: str = Form("", max_length=200),
+    # Art track ("official audio"): master audio + cover image → video with the
+    # cover centered over a blurred fill + subtle motion, NO lyrics. The cover
+    # comes in via background_file (image). Skips transcription + AI background.
+    art_track: bool = Form(False),
+    # Línea legal opcional en pantalla para art tracks, ej.
+    # "℗ 2026 Universal Music Chile". Vacía = no se dibuja.
+    label_line: str = Form("", max_length=120),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -7616,6 +7623,29 @@ async def generate_with_segments(
         if not song_title:
             song_title = parsed_title
 
+    # Art track ("official audio"): master audio + cover image → cover
+    # composited with subtle motion, no lyrics. Validate the cover and coerce
+    # incompatible options BEFORE quota/AI gates so it costs 1 credit and is
+    # not treated as an AI-background job.
+    if art_track:
+        if background_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Art tracks use an uploaded cover, not a library background.",
+            )
+        if not (background_file and background_file.filename):
+            raise HTTPException(
+                status_code=400, detail="Art track requires a cover image.",
+            )
+        if not background_file.filename.lower().endswith((".jpg", ".jpeg", ".png")):
+            raise HTTPException(
+                status_code=400,
+                detail="Art track cover must be an image (.jpg/.jpeg/.png).",
+            )
+        # No lyrics, no Escenas, no Veo image-to-video animation for art tracks.
+        enable_scenes = False
+        animate_image = ""
+
     _enforce_plan_quota(db, current_user,
                         credits_needed=(scenes_credit_cost()
                                         if enable_scenes and has_scenes_access(current_user)
@@ -7636,8 +7666,9 @@ async def generate_with_segments(
     # Check AI authorization (UMG Guideline 5). The skip applies only when
     # the operator picks a library asset AND uses it as-is — no AI invoked.
     # Variation mode still calls Veo image-to-video on a frame of the
-    # source, which IS AI generation, so the auth gate must apply.
-    _needs_ai_auth = (not background_id) or (background_mode == "variation")
+    # source, which IS AI generation, so the auth gate must apply. Art tracks
+    # invoke NO AI (deterministic ffmpeg composite), so they never need it.
+    _needs_ai_auth = (not art_track) and ((not background_id) or (background_mode == "variation"))
     if _needs_ai_auth and current_user.get("role") != "admin":
         user_model = db.query(User).filter(User.id == current_user["id"]).first()
         if user_model and not user_model.ai_authorized:
@@ -7689,6 +7720,19 @@ async def generate_with_segments(
 
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
+
+    # Persist the art_track marker into render_params now (belt-and-suspenders
+    # with the worker-side merge) so /retry re-renders as an art track even if
+    # the worker dies before Step 1.
+    if art_track:
+        try:
+            from jobs import merge_render_params
+            _params = {"art_track": True}
+            if (label_line or "").strip():
+                _params["label_line"] = label_line.strip()
+            merge_render_params(job_id, _params)
+        except Exception as _e:
+            logger.warning("[ART] could not persist art_track render_param: %s", _e)
 
     mp3_path = os.path.join(job_dir, existing_filename)
 
@@ -7882,6 +7926,11 @@ async def generate_with_segments(
         title_song_font=(title_song_font.strip() or ""),
         # UI v1.1: pass-through. Empty string preserves auto-wrap.
         title_song_break=(title_song_break or ""),
+        # Art track: master audio + cover → cover composited (blur + centered +
+        # subtle motion), no lyrics. Validated above (cover required, image
+        # only). The pipeline skips transcription + AI background.
+        art_track=art_track,
+        label_line=(label_line or "").strip() if art_track else "",
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -11080,7 +11129,14 @@ async def retry_job(
               # multi-escena vuelve a armar las escenas en vez de caer al
               # fondo único. Persistido por pipeline en render_params cuando
               # el render corre con enable_scenes=True.
-              "enable_scenes"):
+              "enable_scenes",
+              # Art track: heredable — sin esto un retry de un art track se
+              # re-renderiza como lyric video vacío y re-corre Whisper.
+              # Persistido por pipeline/endpoint en render_params.
+              "art_track",
+              # Línea legal del art track (℗/© sello), persistida junto al
+              # marker para que el retry la re-dibuje igual.
+              "label_line"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 

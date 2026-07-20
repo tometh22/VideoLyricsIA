@@ -258,7 +258,7 @@ def _escape_filter_path(p: str) -> str:
     return p.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
 
-def build_video_filter(*, ass_basename: str, font_dir: str, width: int,
+def build_video_filter(*, ass_basename: str | None, font_dir: str, width: int,
                        height: int, effect: str = "", style: str = "",
                        custom_colors: str = ""):
     """Build the video filter for the single-pass libass render.
@@ -271,17 +271,26 @@ def build_video_filter(*, ass_basename: str, font_dir: str, width: int,
 
     Input index contract: bg=0, audio=1, fx=2 (the extra_inputs are appended
     AFTER the bg and audio inputs in the ffmpeg command).
+
+    Art tracks pass `ass_basename=None` to skip the subtitle burn entirely
+    (no lyrics rendered) — the background already carries the full
+    composition (blurred cover fill + centered cover). The effect overlay
+    and color grade still compose the same way; `null` keeps the filter
+    string valid when neither subs nor grade apply.
     """
-    subs = f"subtitles={ass_basename}:fontsdir={_escape_filter_path(font_dir)}"
+    subs = (f"subtitles={ass_basename}:fontsdir={_escape_filter_path(font_dir)}"
+            if ass_basename else "")
     grade = grade_filter(style, custom_colors)
     fx = effect_path(effect)
 
     if not fx:
         # No effect: keep the original cheap -vf path (optionally graded).
-        vf = f"{grade},{subs}" if grade else subs
+        steps = [s for s in (grade, subs) if s]
+        vf = ",".join(steps) if steps else "null"
         return vf, False, []
 
     grade_step = f"{grade}," if grade else ""
+    subs_step = subs if subs else "null"
     gain = fx_gain(effect)
     gain_step = f"{gain}," if gain else ""  # before format=gbrp (eq on native YUV)
     fc = (
@@ -289,6 +298,6 @@ def build_video_filter(*, ass_basename: str, font_dir: str, width: int,
         f"[2:v]scale={width}:{height},setpts=PTS-STARTPTS,{gain_step}format=gbrp[fx];"
         f"[bg][fx]blend=all_mode=screen:shortest=1[bl];"
         f"[bl]{grade_step}format=yuv420p[gr];"
-        f"[gr]{subs}[out]"
+        f"[gr]{subs_step}[out]"
     )
     return fc, True, ["-stream_loop", "-1", "-i", fx]

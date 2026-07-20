@@ -859,7 +859,16 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  title_song_break: str = "",
                  # Internal API→worker rollout guard. Not exposed by any
                  # public endpoint or request schema.
-                 background_policy_fingerprint: str | None = None):
+                 background_policy_fingerprint: str | None = None,
+                 # Art track ("official audio"): background_path es un COVER
+                 # (imagen). El pipeline saltea transcripción, alineado y
+                 # generación de fondo AI; compone el cover (blur + centrado +
+                 # zoom sutil) y rinde SIN letra. delivery_profile sigue
+                 # funcionando (youtube/umg/both). Default False = lyric video.
+                 art_track: bool = False,
+                 # Línea legal opcional en pantalla (art tracks): ej.
+                 # "℗ 2026 Universal Music Chile". Vacía = no se dibuja.
+                 label_line: str = ""):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -1070,7 +1079,28 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         #      retry path matches its quality.
         update_job(job_id, current_step="whisper", progress=5)
         _persist_segments = True
-        if segments_override:
+        if art_track:
+            # Art track = "official audio": NO lyrics. Skip Whisper, alignment,
+            # and lyrics-hint entirely (the big cost/latency win — no ASR, no
+            # CTC). Persist the art_track marker so /retry re-renders as an art
+            # track (Escenas precedent: flag lives in render_params). Guard the
+            # cover early so a missing image fails loudly instead of at render.
+            if not background_path:
+                update_job(job_id, status="error",
+                           error="Art track requires a cover image")
+                return
+            segments = []
+            _persist_segments = False
+            try:
+                from jobs import merge_render_params
+                _params = {"art_track": True}
+                if (label_line or "").strip():
+                    _params["label_line"] = label_line.strip()
+                merge_render_params(job_id, _params)
+            except Exception as _e:  # non-fatal: endpoint also persists it
+                logger.warning("[ART] merge_render_params failed: %s", _e)
+            logger.info("[ART] art track — skipping transcription/alignment")
+        elif segments_override:
             segments = segments_override
             logger.info("[WHISPER] Using %s caller-supplied segments", len(segments))
         else:
@@ -1420,6 +1450,23 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     "bypassed_reason": _reason,
                     "tenant_id": _tenant_id,
                 })
+            elif art_track and os.environ.get(
+                    "ART_TRACK_FORCE_VALIDATION", "").strip().lower() not in ("1", "true"):
+                # Art track cover = label-approved artwork. The Guideline-15
+                # Vision validator is tuned to REJECT people/faces/text/logos
+                # in AI backgrounds — cover art routinely has all three, so
+                # running it would false-reject legitimate covers. Bypass with
+                # an explicit reason (set ART_TRACK_FORCE_VALIDATION=1 to force).
+                from datetime import datetime as _dt
+                logger.info("[VALIDATION] SKIPPED for art track cover (job %s)", job_id)
+                update_job(job_id, validation_result={
+                    "passed": True,
+                    "issues": [],
+                    "bypassed": True,
+                    "bypassed_at": _dt.utcnow().isoformat() + "Z",
+                    "bypassed_reason": "art_track_cover",
+                    "tenant_id": _tenant_id,
+                })
             elif _scenes_active:
                 # Every unique source clip was already validated densely in
                 # _generate_scene_clips; do not spend another 48 sequential
@@ -1746,6 +1793,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 title_song_break=title_song_break,
                 # Multi-escena: el fondo ya es un timeline del largo completo.
                 bg_prelooped=_scenes_active,
+                # Art track: compone el cover (blur + tarjeta + onda reactiva)
+                # y rinde sin letra. bg_image_path es el cover (imagen).
+                art_track=art_track,
+                label_line=label_line,
             )
             # Cinemascope opt-in: letterbox the finished YouTube master. Skipped
             # for UMG (that path returns a ProRes .mov — re-encoding it as h264
@@ -1774,23 +1825,44 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         if wants_youtube or wants_umg:
             update_job(job_id, current_step="short", progress=75)
             short_fps = float(umg_spec["fps"]) if wants_umg else 24
-            generate_short(
-                mp3_path, segments, job_dir, bg_source=bg_source,
-                style=style, font=chosen_font, fps=short_fps,
-                text_case=text_case, font_scale=font_scale,
-                lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
-                text_contrast=text_contrast, effect=effect, custom_colors=custom_colors,
-                lyrics_animation=lyrics_animation, line_transition=line_transition,
-            )
+            if art_track:
+                # Art track short: vertical (9:16) composite of the cover over
+                # a 30s high-energy window (no lyrics → pick the window by RMS
+                # energy, not chorus repetition). Same look as the master.
+                _short_spec = (
+                    RenderSpec.umg_intermediate_short(umg_spec) if wants_umg
+                    else RenderSpec.youtube_short()
+                )
+                generate_art_track_short(
+                    mp3_path, bg_source, job_dir, spec=_short_spec,
+                    artist=artist, song_title=song_title,
+                    label_line=label_line, effect=effect,
+                )
+            else:
+                generate_short(
+                    mp3_path, segments, job_dir, bg_source=bg_source,
+                    style=style, font=chosen_font, fps=short_fps,
+                    text_case=text_case, font_scale=font_scale,
+                    lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+                    text_contrast=text_contrast, effect=effect, custom_colors=custom_colors,
+                    lyrics_animation=lyrics_animation, line_transition=line_transition,
+                )
             files["short_url"] = f"/download/{job_id}/short"
             update_job(job_id, progress=85)
 
-            # Step 4 — Thumbnail (uses raw background, not lyric video)
+            # Step 4 — Thumbnail (art tracks reuse the composite look so the
+            # thumbnail matches what plays; lyric videos keep the raw bg).
             update_job(job_id, current_step="thumbnail", progress=90)
-            generate_thumbnail(
-                artist, mp3_path, job_dir, bg_source=bg_source,
-                song_title=song_title,
-            )
+            if art_track:
+                generate_art_track_thumbnail(
+                    bg_source, mp3_path, job_dir, artist=artist,
+                    song_title=song_title, label_line=label_line,
+                )
+            else:
+                generate_thumbnail(
+                    artist, mp3_path, job_dir, bg_source=bg_source,
+                    song_title=song_title,
+                )
             files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
 
         # Content validation already happened pre-render (Step 1b) so the
@@ -11959,6 +12031,446 @@ def _static_image_to_mp4(image_path: str, output_path: str, duration: float,
     return output_path
 
 
+# Spanish short words that machine title-casing wrongly capitalizes
+# ("La Leyenda Del Hada Y El Mago" → "La Leyenda del Hada y el Mago").
+_ES_TITLE_STOPWORDS = {
+    "de", "del", "la", "las", "el", "los", "lo", "y", "e", "o", "u",
+    "un", "una", "unos", "unas", "en", "a", "al", "con", "por", "para",
+    "sin", "sobre", "tras",
+}
+
+
+def spanish_smart_title(text: str) -> str:
+    """Lowercase machine-titlecased Spanish stopwords, except the first word.
+
+    Only words in exact Titlecase are touched, so deliberate user casing
+    (ALLCAPS "DEL", already-lowercase "del", stylized "dEl") passes
+    through untouched, and English titles are unaffected (their short
+    words aren't in the stopword set).
+    """
+    words = (text or "").split(" ")
+    out = words[:1]
+    for w in words[1:]:
+        if w.istitle() and w.lower() in _ES_TITLE_STOPWORDS:
+            w = w.lower()
+        out.append(w)
+    return " ".join(out)
+
+
+def _art_track_layout(spec: "RenderSpec") -> dict:
+    """Pixel positions for the VEVO-style art-track composite, per spec dims.
+
+    Landscape (16:9, UMG): blurred cover fills the frame; the sharp cover sits
+    as a shadowed card on the RIGHT; a SoundCloud-style waveform + title/artist
+    sit on the LEFT. Portrait (9:16 short): card centered on top, waveform +
+    text below. Pure arithmetic so it's unit-testable and shared by the PIL
+    overlay builder and the ffmpeg compositor.
+    """
+    W, H = spec.width, spec.height
+    portrait = H > W
+    if portrait:
+        # ONE centered axis (design review: the stacked-16:9 look read as a
+        # broken crop). Everything stays above 0.85*H (platform captions/
+        # actions land in the bottom 15%) and inside 0.88*W (action rail).
+        card = int(W * 0.62)
+        card_x = (W - card) // 2
+        card_y = int(H * 0.16)
+        wave_w = int(W * 0.70)
+        wave_x = (W - wave_w) // 2
+        wave_h = int(H * 0.045)
+        wave_y = int(H * 0.635)
+        title_size = max(30, int(W * 0.06))
+        artist_size = max(20, int(W * 0.036))
+        title_y = wave_y + wave_h + int(H * 0.030)
+        artist_y = title_y + int(title_size * 1.25)
+        text_align = "center"
+        text_x = W // 2
+        text_max_w = int(W * 0.84)
+        legal_y = int(H * 0.83)
+        tag_size = max(14, int(W * 0.020))
+        tag_y = wave_y - tag_size - int(H * 0.012)
+    else:
+        s = H / 1080.0
+        card = int(600 * s)
+        card_x = W - card - int(165 * s)   # right margin
+        card_y = (H - card) // 2 - int(20 * s)
+        wave_x = int(165 * s)
+        wave_w = int(960 * s)
+        wave_h = int(150 * s)
+        wave_y = int(545 * s)
+        title_size = max(28, int(64 * s))
+        artist_size = max(18, int(38 * s))
+        title_y = wave_y + wave_h + int(wave_h * 0.12) + int(title_size * 0.10)
+        artist_y = title_y + int(title_size * 1.18)
+        text_align = "left"
+        text_x = wave_x
+        # Hard safe zone: the text column ends well before the card starts
+        # (the old bound W-text_x-0.04W let long titles run under the card).
+        text_max_w = card_x - text_x - int(60 * s)
+        legal_y = int(H * 0.92)
+        tag_size = max(14, int(22 * s))
+        tag_y = wave_y - tag_size - int(12 * s)
+    # Reactive EQ bar geometry, shared by the PIL strip drawer and the
+    # ffmpeg overlay so both always agree.
+    n_bars = 48
+    pitch = max(8, wave_w // n_bars)
+    bar_w = max(3, round(pitch * 0.62))
+    # Wide, soft drop shadow (review: the old 0.037 blur read as "pasted").
+    shadow = card + int(card * 0.06)
+    shadow_x = card_x + int(card * 0.01)
+    shadow_y = card_y + int(card * 0.04)
+    shadow_blur = max(10, int(card * 0.09))
+    return dict(
+        W=W, H=H, card=card, card_x=card_x, card_y=card_y,
+        shadow=shadow, shadow_x=shadow_x, shadow_y=shadow_y, shadow_blur=shadow_blur,
+        wave_x=wave_x, wave_y=wave_y, wave_w=wave_w, wave_h=wave_h,
+        n_bars=n_bars, pitch=pitch, bar_w=bar_w,
+        title_size=title_size, artist_size=artist_size,
+        text_align=text_align, text_x=text_x, text_max_w=text_max_w,
+        title_y=title_y, artist_y=artist_y, legal_y=legal_y,
+        tag_size=tag_size, tag_y=tag_y,
+    )
+
+
+def _art_track_waveform_bars(mp3_path: str, n: int, *, win_start: float = 0.0,
+                             win_dur: float | None = None) -> "list[float]":
+    """Normalized [0,1] amplitude envelope of the audio window, resampled to
+    `n` bars — the whole-song (or short-window) waveform for the art track.
+    Returns flat 0.25 bars on any failure so the render never breaks.
+    """
+    try:
+        import numpy as _np
+        y, _sr = librosa.load(mp3_path, sr=8000, mono=True,
+                              offset=max(0.0, win_start), duration=win_dur)
+        if not len(y):
+            return [0.25] * n
+        hop = max(1, len(y) // (n * 4))
+        rms = librosa.feature.rms(y=y, frame_length=hop * 2, hop_length=hop)[0]
+        idx = _np.linspace(0, len(rms), n + 1).astype(int)
+        bars = _np.array([
+            rms[idx[i]:idx[i + 1]].mean() if idx[i + 1] > idx[i] else 0.0
+            for i in range(n)
+        ])
+        bars = _np.power(bars / (bars.max() or 1.0), 0.7)  # compress so quiet bars show
+        return [float(b) for b in bars]
+    except Exception as e:
+        logger.warning("[ART] waveform envelope failed (%s); flat bars", e)
+        return [0.25] * n
+
+
+def _art_track_bg_layer(cover_path: str, spec: "RenderSpec") -> "Image.Image":
+    """The blurred-cover BACKGROUND layer only (no card, no text): cover-fit
+    crop → heavy blur → desaturate → luminance-clamp → scrim + vignette. Split
+    out of the base so an optional moving effect can screen-blend HERE, in the
+    ambient background, BEHIND the card and wave (matching the wizard preview)
+    — the cover card stays clean on top. Returns an opaque RGBA image."""
+    import numpy as np
+    from PIL import ImageFilter, ImageEnhance, ImageOps, ImageStat
+    L = _art_track_layout(spec)
+    W, H = L["W"], L["H"]
+    portrait = L["text_align"] == "center"
+
+    cover = Image.open(cover_path).convert("RGB")
+    bg = ImageOps.fit(cover, (W, H), method=Image.LANCZOS)
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=max(16, H // 14)))
+    bg = ImageEnhance.Color(bg).enhance(0.85)
+    mean_luma = ImageStat.Stat(bg.convert("L")).mean[0]
+    bg = ImageEnhance.Brightness(bg).enhance(
+        min(1.6, max(0.45, 65.0 / max(mean_luma, 1.0))))
+    base = bg.convert("RGBA")
+
+    if portrait:
+        ramp = np.clip((np.linspace(0, 1, H) - 0.40) / 0.60, 0, 1) * 150
+        scrim_a = np.repeat(ramp[:, None], W, axis=1)
+    else:
+        ramp = np.clip(1.0 - np.linspace(0, 1, W) / 0.65, 0, 1) * 150
+        scrim_a = np.repeat(ramp[None, :], H, axis=0)
+    yy, xx = np.mgrid[0:18, 0:32]
+    r = np.hypot((xx - 15.5) / 15.5, (yy - 8.5) / 8.5)
+    vig_small = (np.clip((r - 0.55) / 0.45, 0, 1) * 90).astype(np.uint8)
+    vig_a = np.asarray(Image.fromarray(vig_small, "L").resize((W, H), Image.BILINEAR))
+    dark = np.zeros((H, W, 4), dtype=np.uint8)
+    dark[:, :, 3] = np.maximum(scrim_a.astype(np.uint8), vig_a)
+    return Image.alpha_composite(base, Image.fromarray(dark, "RGBA"))
+
+
+def _art_track_fg_layer(cover_path: str, spec: "RenderSpec", *,
+                        artist: str, song_title: str,
+                        label_line: str = "") -> "Image.Image":
+    """The FOREGROUND layer only (transparent RGBA): shadowed cover card +
+    "OFFICIAL AUDIO" tag + title/artist + optional ℗/© label line. Drawn on a
+    transparent canvas so it can overlay on top of the background+effect, which
+    keeps the card and text clean above the moving particles."""
+    from PIL import ImageFilter, ImageOps
+    L = _art_track_layout(spec)
+    W, H = L["W"], L["H"]
+    portrait = L["text_align"] == "center"
+
+    cover = Image.open(cover_path).convert("RGB")
+    base = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+    # The sharp cover card, contained in the square box — compute its REAL
+    # size first so non-square covers get a shadow that matches.
+    card = ImageOps.contain(cover, (L["card"], L["card"]), method=Image.LANCZOS)
+    cw, ch = card.size
+    px = L["card_x"] + (L["card"] - cw) // 2
+    py = L["card_y"] + (L["card"] - ch) // 2
+
+    off_x, off_y = int(L["card"] * 0.01), int(L["card"] * 0.04)
+    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        [px + off_x, py + off_y, px + off_x + cw, py + off_y + ch],
+        radius=int(L["card"] * 0.02), fill=(0, 0, 0, 150))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(L["shadow_blur"]))
+    base = Image.alpha_composite(base, shadow)
+
+    base.alpha_composite(card.convert("RGBA"), (px, py))
+    d = ImageDraw.Draw(base)
+    d.rectangle([px, py, px + cw - 1, py + ch - 1],
+                outline=(255, 255, 255, 20), width=1)
+
+    anchor = "ma" if portrait else "la"
+
+    def _font(sz: int, extra_bold: bool = False):
+        name = "Montserrat-ExtraBold.ttf" if extra_bold else "Montserrat-Bold.ttf"
+        try:
+            return ImageFont.truetype(os.path.join(_FONTS_DIR, name), sz)
+        except Exception:
+            return ImageFont.load_default()
+
+    max_text_w = L["text_max_w"]
+
+    def _fit_font(txt: str, size: int, extra_bold: bool, floor: int = 20):
+        f = _font(size, extra_bold)
+        while size > floor and d.textlength(txt, font=f) > max_text_w:
+            size = int(size * 0.92)
+            f = _font(size, extra_bold)
+        return f, size
+
+    def _shadow_text(x, y, txt, fnt, fill):
+        d.text((x + 2, y + 3), txt, font=fnt, fill=(0, 0, 0, 160), anchor=anchor)
+        d.text((x, y), txt, font=fnt, fill=fill, anchor=anchor)
+
+    tag_font = _font(L["tag_size"])
+    _shadow_text(L["text_x"], L["tag_y"], "O F F I C I A L   A U D I O",
+                 tag_font, (255, 255, 255, 140))
+
+    artist_y = L["artist_y"]
+    title = spanish_smart_title((song_title or "").strip())
+    if title:
+        floor = max(20, int(L["title_size"] * 0.55))
+        f, size = _fit_font(title, L["title_size"], True, floor=floor)
+        if d.textlength(title, font=f) > max_text_w and " " in title:
+            # Still too wide at the floor size → wrap to two lines, split at
+            # the space nearest the middle, and push the artist line down.
+            mid = len(title) // 2
+            spaces = [i for i, c in enumerate(title) if c == " "]
+            cut = min(spaces, key=lambda i: abs(i - mid))
+            lines = [title[:cut], title[cut + 1:]]
+            f, size = _fit_font(max(lines, key=len), L["title_size"], True,
+                                floor=floor)
+            line_gap = int(size * 1.12)
+            _shadow_text(L["text_x"], L["title_y"], lines[0], f, (255, 255, 255, 255))
+            _shadow_text(L["text_x"], L["title_y"] + line_gap, lines[1], f,
+                         (255, 255, 255, 255))
+            artist_y += line_gap
+        else:
+            _shadow_text(L["text_x"], L["title_y"], title, f, (255, 255, 255, 255))
+    artist = (artist or "").strip()
+    if artist:
+        f, _ = _fit_font(artist, L["artist_size"], False)
+        _shadow_text(L["text_x"], artist_y, artist, f, (255, 255, 255, 235))
+
+    legal = (label_line or "").strip()
+    if legal:
+        # Roboto, not Montserrat: the ℗ (U+2117) every label line starts with
+        # is missing from Montserrat and renders as tofu. At this size the
+        # family mismatch is imperceptible; the missing glyph is not.
+        sz = max(14, int(L["artist_size"] * 0.55))
+        try:
+            f = ImageFont.truetype(os.path.join(_FONTS_DIR, "Roboto-Bold.ttf"), sz)
+            while sz > 10 and d.textlength(legal, font=f) > max_text_w:
+                sz = int(sz * 0.92)
+                f = ImageFont.truetype(os.path.join(_FONTS_DIR, "Roboto-Bold.ttf"), sz)
+        except Exception:
+            f, _ = _fit_font(legal, sz, False)
+        _shadow_text(L["text_x"], L["legal_y"], legal, f, (255, 255, 255, 140))
+
+    return base
+
+
+def _build_art_track_base(cover_path: str, out_path: str, *,
+                          spec: "RenderSpec", artist: str, song_title: str,
+                          label_line: str = "") -> str:
+    """Build the COMPLETE static base frame (background + card + text) as one
+    flattened image. Used by the no-effect render and the thumbnail. When an
+    effect is present the render composites the two layers separately (bg →
+    effect → fg) so the particles sit in the ambient background. Doing the
+    whole static composite once (not per-frame) keeps the render fast — the
+    expensive Gaussian blur runs a single time."""
+    bg = _art_track_bg_layer(cover_path, spec)
+    fg = _art_track_fg_layer(cover_path, spec, artist=artist,
+                             song_title=song_title, label_line=label_line)
+    Image.alpha_composite(bg, fg).convert("RGB").save(out_path)
+    return out_path
+
+
+def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
+                      spec: "RenderSpec", artist: str, song_title: str,
+                      duration: float, out_name: str | None = None,
+                      win_start: float = 0.0, win_dur: float | None = None,
+                      label_line: str = "", effect: str = "") -> str:
+    """Render the full art-track ("official audio") video: PIL builds the static
+    composite once (blurred cover + shadowed card + title/artist + tag/legal),
+    then ffmpeg loops that base image and overlays the AUDIO-REACTIVE waveform
+    strip while muxing the master audio. No lyrics, no zoom/effect movement —
+    EQ bars pulsing in place with the music, following the rhythm, ARE the
+    motion, matching the VEVO template.
+
+    The waveform is a precomputed PNG strip sequence (art_track_wave: mel-band
+    energies → per-band normalization → fast-attack/slow-release envelope →
+    mirrored-center bars). Bars pulse IN PLACE — a scrolling showwaves
+    oscilloscope was rejected in design review because the eye reads the
+    horizontal translation, not the beat. Only the small strip is per-frame
+    work (the blur runs once in the PIL base) → fast and bounded memory at any
+    length. Spec-driven so YouTube MP4, the 9:16 short, and the UMG
+    intermediate master (→ lazy ProRes) share this code.
+    """
+    import shutil
+
+    import art_track_wave
+    import fx_compositor as _fx
+    from fractions import Fraction
+
+    L = _art_track_layout(spec)
+    dur = float(win_dur) if win_dur else float(duration)
+    stem = (out_name or "art").replace(".mp4", "").replace(".mov", "")
+    fx_path = _fx.effect_path(effect)
+
+    # With an effect we split the composite into a BACKGROUND layer (blurred
+    # cover + scrim) and a FOREGROUND layer (card + text) so the moving
+    # particles screen-blend in the ambient background — BEHIND the card and
+    # the wave, subtle and soft, matching the wizard preview. Without an
+    # effect, one flat base is enough.
+    if fx_path:
+        bg_path = os.path.join(job_dir, stem + "_bg.png")
+        fg_path = os.path.join(job_dir, stem + "_fg.png")
+        _art_track_bg_layer(cover_path, spec).convert("RGB").save(bg_path)
+        _art_track_fg_layer(cover_path, spec, artist=artist,
+                            song_title=song_title, label_line=label_line).save(fg_path)
+    else:
+        base_path = os.path.join(job_dir, stem + "_base.png")
+        _build_art_track_base(cover_path, base_path, spec=spec, artist=artist,
+                              song_title=song_title, label_line=label_line)
+
+    out_path = os.path.join(job_dir, out_name or f"lyric_video.{spec.container}")
+
+    # Wave strip timing. Above ~32 fps (UMG 50/59.94/60) the strip runs at
+    # half rate — overlay holds each strip frame, imperceptible at speed,
+    # and it halves the PNG count.
+    fps_frac = Fraction(spec.fps_str)
+    if float(fps_frac) > 32:
+        wave_fps_frac = fps_frac / 2
+        wave_fps_str = (str(wave_fps_frac.numerator) if wave_fps_frac.denominator == 1
+                        else f"{wave_fps_frac.numerator}/{wave_fps_frac.denominator}")
+    else:
+        wave_fps_frac, wave_fps_str = fps_frac, spec.fps_str
+    wave_n_frames = max(1, math.ceil(dur * wave_fps_frac))
+
+    # Same win_start/dur as the audio input below → bars sync by construction
+    # (the short's 30 s window analyzes ITS window, not the song start).
+    heights = art_track_wave.compute_bar_frames(
+        mp3_path, n_bars=L["n_bars"], n_frames=wave_n_frames,
+        fps=float(wave_fps_frac), win_start=win_start, win_dur=dur)
+
+    frames_dir = os.path.join(job_dir, stem + "_wave")
+    if spec.codec == "libx264":
+        vargs = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                 "-pix_fmt", spec.pix_fmt]
+    elif spec.codec == "prores_ks":
+        vargs = ["-c:v", "prores_ks", "-profile:v", str(spec.prores_profile),
+                 "-pix_fmt", spec.pix_fmt, "-vendor", "apl0"]
+    else:
+        vargs = ["-c:v", spec.codec, "-pix_fmt", spec.pix_fmt]
+    if spec.audio_codec == "aac":
+        aargs = ["-c:a", "aac", "-b:a", "320k"]
+    elif spec.audio_codec == "pcm_s24le":
+        aargs = ["-c:a", "pcm_s24le", "-ar", "48000", "-ac", "2"]
+    else:
+        aargs = ["-c:a", spec.audio_codec]
+
+    try:
+        pattern = art_track_wave.write_wave_frames(
+            heights, frames_dir, w=L["wave_w"], h=L["wave_h"],
+            pitch=L["pitch"], bar_w=L["bar_w"])
+        # eof_action=repeat: the strip sequence is finite while the looped
+        # base is infinite — hold the last strip frame so the graph never
+        # ends early; the -t audio window + -shortest bound the output.
+        if fx_path:
+            # Layered composite so the effect sits in the AMBIENT BACKGROUND,
+            # behind the card and wave (matching the preview): bg (0) → effect
+            # screen-blend → foreground card+text (4) → wave (1).
+            #   0 = blurred-cover bg   1 = wave seq   2 = mp3
+            #   3 = fx loop            4 = fg card+text (RGBA)
+            # The fx is desaturated + softened + composited at reduced opacity
+            # so it reads as a subtle glow, not the blown-out yellow orbs the
+            # raw asset + screen-blend produced over the cover.
+            inputs = [
+                "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(bg_path),
+                "-framerate", wave_fps_str, "-start_number", "0",
+                "-i", os.path.abspath(pattern),
+                "-ss", str(max(0.0, win_start)), "-t", str(dur),
+                "-i", os.path.abspath(mp3_path),
+                "-stream_loop", "-1", "-i", os.path.abspath(fx_path),
+                "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(fg_path),
+            ]
+            fc = (
+                f"[3:v]scale={spec.width}:{spec.height},setpts=PTS-STARTPTS,"
+                f"eq=saturation=0.70:brightness=-0.04,gblur=sigma=6,format=gbrp[fx];"
+                f"[0:v]format=gbrp[bg0];"
+                f"[bg0][fx]blend=all_mode=screen:all_opacity=0.45,"
+                f"format={spec.pix_fmt}[bgfx];"
+                f"[bgfx][4:v]overlay=0:0[withcard];"
+                f"[withcard][1:v]overlay={L['wave_x']}:{L['wave_y']}:eof_action=repeat,"
+                f"format={spec.pix_fmt}[outv]"
+            )
+        else:
+            inputs = [
+                "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(base_path),
+                "-framerate", wave_fps_str, "-start_number", "0",
+                "-i", os.path.abspath(pattern),
+                "-ss", str(max(0.0, win_start)), "-t", str(dur),
+                "-i", os.path.abspath(mp3_path),
+            ]
+            fc = (
+                f"[0:v][1:v]overlay={L['wave_x']}:{L['wave_y']}:eof_action=repeat,"
+                f"format={spec.pix_fmt}[outv]"
+            )
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            *inputs,
+            "-filter_complex", fc, "-map", "[outv]", "-map", "2:a",
+            *vargs, *aargs, "-r", spec.fps_str,
+            # Output-level -t: -shortest alone lets the muxer overshoot ~1s
+            # past the audio (buffered frames of the infinite base loop),
+            # leaving a frozen-silent tail. Hard-cap at the window length.
+            "-t", str(dur),
+            "-movflags", "+faststart", "-shortest",
+            os.path.basename(out_path),
+        ]
+        _timeout = 1800 if (spec.codec == "prores_ks" or spec.width >= 3000) else 900
+        run_checked(cmd, label="ffmpeg-art-track", timeout=_timeout,
+                    output_path=out_path, cwd=job_dir)
+    finally:
+        shutil.rmtree(frames_dir, ignore_errors=True)
+    _validate_rendered_mp4(out_path, dur)
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    logger.info("[ART] art track render: %.0fs, %.1f MB (%dx%d)%s",
+                dur, size_mb, spec.width, spec.height,
+                f" +fx:{effect}" if fx_path else "")
+    return out_path
+
+
 def _attach_close_chain(target_clip, owned_clips):
     """Make `target_clip.close()` also close `owned_clips`.
 
@@ -13023,6 +13535,11 @@ def _render_lyrics_ass(
     # timeline ya cubre toda la canción. Default False = camino histórico de
     # fondo único (se loopea el clip Veo corto).
     bg_prelooped: bool = False,
+    # Art tracks: render_text=False rinde SIN letra ni title card (art track
+    # clásico tipo "official audio"). Se saltea todo el armado de fuentes/ASS
+    # y no se quema ningún subtítulo — solo el fondo (compuesto del cover) +
+    # audio + overlay de efecto opcional. Default True = camino con letra.
+    render_text: bool = True,
 ) -> str:
     """Fast lyric render: burn the lyrics with libass in a single ffmpeg
     pass over the (ffmpeg-looped) background — no moviepy frame loop.
@@ -13065,91 +13582,98 @@ def _render_lyrics_ass(
             out_name="bg_looped_ass.mp4",
         )
 
-    # 2) Fonts: the lyric font + the title-card fonts. The title card can use
-    #    operator-chosen fonts per element (Full Rotor v1); defaults keep the
-    #    historical look — artist in Montserrat ExtraBold, song in the lyric
-    #    font. All live in one fontsdir so libass can \fn-switch between them
-    #    without mis-matching across the pool.
-    family, bold = _ass.font_family(font_path)
-    extrabold_font = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
-    if not os.path.exists(extrabold_font):
-        extrabold_font = font_path  # graceful fallback
-    # Per-element title fonts: resolve the chosen ids, else fall back to the
-    # historical defaults (artist = ExtraBold, song = lyric font).
-    title_artist_path = _resolve_font(title_artist_font) or extrabold_font
-    title_song_path = _resolve_font(title_song_font) or font_path
-    title_artist_family, _ = _ass.font_family(title_artist_path)
-    title_song_family, _ = _ass.font_family(title_song_path)
-    artist_family, _ = _ass.font_family(extrabold_font)
-    font_dir = _ass.multi_font_dir(
-        [font_path, extrabold_font, title_artist_path, title_song_path]
-    )
+    # 2) + 3) Fonts + ASS lines. Art tracks (render_text=False) render NO text
+    #    at all — classic "official audio" look — so the entire font resolution,
+    #    title-card build, and ASS write are skipped; the single pass below
+    #    burns no subtitles (ass_basename=None). font_dir stays "" so nothing
+    #    is created or cleaned up.
+    font_dir = ""
+    if render_text:
+        # 2) Fonts: the lyric font + the title-card fonts. The title card can use
+        #    operator-chosen fonts per element (Full Rotor v1); defaults keep the
+        #    historical look — artist in Montserrat ExtraBold, song in the lyric
+        #    font. All live in one fontsdir so libass can \fn-switch between them
+        #    without mis-matching across the pool.
+        family, bold = _ass.font_family(font_path)
+        extrabold_font = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
+        if not os.path.exists(extrabold_font):
+            extrabold_font = font_path  # graceful fallback
+        # Per-element title fonts: resolve the chosen ids, else fall back to the
+        # historical defaults (artist = ExtraBold, song = lyric font).
+        title_artist_path = _resolve_font(title_artist_font) or extrabold_font
+        title_song_path = _resolve_font(title_song_font) or font_path
+        title_artist_family, _ = _ass.font_family(title_artist_path)
+        title_song_family, _ = _ass.font_family(title_song_path)
+        artist_family, _ = _ass.font_family(extrabold_font)
+        font_dir = _ass.multi_font_dir(
+            [font_path, extrabold_font, title_artist_path, title_song_path]
+        )
 
-    # 3) Segments → ASS lines (same case/sanitise/sizing as moviepy), plus
-    #    the artist/song title card overlay (same two layouts).
-    # Per-font visual-size normalization: libass scales \fs by the font's
-    # internal vertical metrics, so the SAME \fs renders a different cap-height
-    # per family (Poppins ~14% smaller than Montserrat → "muy chiquita").
-    # Equalize to the Montserrat reference so a size setting looks consistent
-    # across fonts. Keyed by the resolved family (works for explicit picks and
-    # the random "Auto" pool alike). See ass_render.font_size_factor.
-    font_factor = _ass.font_size_factor(family)
-    lines = _ass.segments_to_lines(
-        segments,
-        text_scale=scale,
-        font_scale=font_scale,
-        font_factor=font_factor,
-        lyric_transition=lyric_transition,
-        animation=lyrics_animation,
-        transition=line_transition,
-        case_fn=lambda t: _apply_case(t, text_case),
-    )
-    # Lyric color mapping para build_ass (style line + override karaoke):
-    # karaoke → primary = sung color, secondary = un-sung. Otras animaciones
-    # usan primary = lyric_color (texto único) y secondary irrelevante.
-    if lyrics_animation == "karaoke":
-        primary_for_lines = lyric_sung_color or ""
-        secondary_for_lines = lyric_color or ""
-    else:
-        primary_for_lines = lyric_color or ""
-        secondary_for_lines = ""
-    first_lyric_start = segments[0]["start"] if segments else duration
-    lines += _ass.title_card_lines(
-        artist, song_title, first_lyric_start,
-        width=spec.width, height=spec.height,
-        text_scale=scale,
-        # Per-element fonts (operator-chosen, else historical defaults).
-        lyric_font_family=title_song_family,
-        artist_font_family=title_artist_family,
-        # Real font files so long titles/artists are shrunk (then wrapped)
-        # to the safe card width instead of overflowing the frame.
-        lyric_font_path=title_song_path,
-        artist_font_path=title_artist_path,
-        # Operator layout + size (Full Rotor v1).
-        template=title_template,
-        size_multiplier=title_size,
-        # UI v1.1 (2026-05-30): explicit line break for the song. Empty
-        # string => None (auto wrap, historical). When the operator picked
-        # their own break in the wizard, we split on the literal "\n" and
-        # title_card_lines uses those lines as-is, fitting each one
-        # individually.
-        song_lines=(title_song_break.split("\n") if title_song_break else None),
-    )
-    base_fs = _ass.lyric_fontsize(40, scale, font_scale, font_factor=font_factor)
-    # Reusamos el mapping primary/secondary computado arriba para
-    # segments_to_lines — mismo eje semántico (karaoke usa sung como
-    # PrimaryColour). Sin esto la palabra cantada se rendea con
-    # PrimaryColour blanco aunque el operador haya elegido otro color.
-    ass_doc = _ass.build_ass(
-        width=spec.width, height=spec.height,
-        font_name=family, base_fontsize=base_fs,
-        outline=outline, shadow=shadow, lines=lines, bold=bold,
-        primary_color=primary_for_lines,
-        secondary_color=secondary_for_lines,
-    )
-    ass_path = os.path.join(job_dir, "lyrics.ass")
-    with open(ass_path, "w", encoding="utf-8") as f:
-        f.write(ass_doc)
+        # 3) Segments → ASS lines (same case/sanitise/sizing as moviepy), plus
+        #    the artist/song title card overlay (same two layouts).
+        # Per-font visual-size normalization: libass scales \fs by the font's
+        # internal vertical metrics, so the SAME \fs renders a different cap-height
+        # per family (Poppins ~14% smaller than Montserrat → "muy chiquita").
+        # Equalize to the Montserrat reference so a size setting looks consistent
+        # across fonts. Keyed by the resolved family (works for explicit picks and
+        # the random "Auto" pool alike). See ass_render.font_size_factor.
+        font_factor = _ass.font_size_factor(family)
+        lines = _ass.segments_to_lines(
+            segments,
+            text_scale=scale,
+            font_scale=font_scale,
+            font_factor=font_factor,
+            lyric_transition=lyric_transition,
+            animation=lyrics_animation,
+            transition=line_transition,
+            case_fn=lambda t: _apply_case(t, text_case),
+        )
+        # Lyric color mapping para build_ass (style line + override karaoke):
+        # karaoke → primary = sung color, secondary = un-sung. Otras animaciones
+        # usan primary = lyric_color (texto único) y secondary irrelevante.
+        if lyrics_animation == "karaoke":
+            primary_for_lines = lyric_sung_color or ""
+            secondary_for_lines = lyric_color or ""
+        else:
+            primary_for_lines = lyric_color or ""
+            secondary_for_lines = ""
+        first_lyric_start = segments[0]["start"] if segments else duration
+        lines += _ass.title_card_lines(
+            artist, song_title, first_lyric_start,
+            width=spec.width, height=spec.height,
+            text_scale=scale,
+            # Per-element fonts (operator-chosen, else historical defaults).
+            lyric_font_family=title_song_family,
+            artist_font_family=title_artist_family,
+            # Real font files so long titles/artists are shrunk (then wrapped)
+            # to the safe card width instead of overflowing the frame.
+            lyric_font_path=title_song_path,
+            artist_font_path=title_artist_path,
+            # Operator layout + size (Full Rotor v1).
+            template=title_template,
+            size_multiplier=title_size,
+            # UI v1.1 (2026-05-30): explicit line break for the song. Empty
+            # string => None (auto wrap, historical). When the operator picked
+            # their own break in the wizard, we split on the literal "\n" and
+            # title_card_lines uses those lines as-is, fitting each one
+            # individually.
+            song_lines=(title_song_break.split("\n") if title_song_break else None),
+        )
+        base_fs = _ass.lyric_fontsize(40, scale, font_scale, font_factor=font_factor)
+        # Reusamos el mapping primary/secondary computado arriba para
+        # segments_to_lines — mismo eje semántico (karaoke usa sung como
+        # PrimaryColour). Sin esto la palabra cantada se rendea con
+        # PrimaryColour blanco aunque el operador haya elegido otro color.
+        ass_doc = _ass.build_ass(
+            width=spec.width, height=spec.height,
+            font_name=family, base_fontsize=base_fs,
+            outline=outline, shadow=shadow, lines=lines, bold=bold,
+            primary_color=primary_for_lines,
+            secondary_color=secondary_for_lines,
+        )
+        ass_path = os.path.join(job_dir, "lyrics.ass")
+        with open(ass_path, "w", encoding="utf-8") as f:
+            f.write(ass_doc)
 
     # 4) Single ffmpeg pass: burn ASS + mux audio. We run with cwd=job_dir
     #    so the subtitles file is referenced by basename (avoids the
@@ -13178,7 +13702,7 @@ def _render_lyrics_ass(
     # path), or a -filter_complex with the looped fx clip as input #2.
     import fx_compositor as _fx
     vfilter, _use_complex, _extra_in = _fx.build_video_filter(
-        ass_basename="lyrics.ass", font_dir=font_dir,
+        ass_basename=("lyrics.ass" if render_text else None), font_dir=font_dir,
         width=spec.width, height=spec.height,
         effect=effect, style=style, custom_colors=custom_colors,
     )
@@ -13233,8 +13757,10 @@ def _render_lyrics_ass(
             cwd=job_dir,
         )
     finally:
-        import shutil
-        shutil.rmtree(font_dir, ignore_errors=True)
+        # font_dir is "" for art tracks (no fonts built) → nothing to clean.
+        if font_dir:
+            import shutil
+            shutil.rmtree(font_dir, ignore_errors=True)
 
     # Validate the output is actually browser-playable; on failure the
     # caller (generate_lyric_video) catches and falls back to moviepy.
@@ -13308,6 +13834,11 @@ def generate_lyric_video(
     # Multi-escena: bg_image_path ya es un timeline del largo completo (escenas
     # con xfade) → no re-loopear en el render. Se propaga a _render_lyrics_ass.
     bg_prelooped: bool = False,
+    # Art tracks: bg_image_path es un cover (imagen). Se compone el fondo de
+    # art track (cover blur + tarjeta con sombra + onda reactiva) y se rinde
+    # SIN letra ni title card. Requiere una imagen como bg_image_path.
+    art_track: bool = False,
+    label_line: str = "",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -13368,6 +13899,29 @@ def generate_lyric_video(
     # Title shown on the card — resolved once and shared by both render
     # paths (libass below, moviepy further down).
     title_song = _resolve_title_song(song_title, mp3_path, artist)
+
+    # Art track path: compose the cover into the art-track background (blurred
+    # fill + centered sharp cover + subtle push-in) and render with NO lyrics /
+    # title card. Single-pass ffmpeg (same _render_lyrics_ass, render_text=
+    # False) so the effect overlay, color grade, and every spec (YouTube MP4 +
+    # UMG intermediate master → lazy ProRes) compose exactly like a normal
+    # render. bg_prelooped=True because the composite already spans the full
+    # audio duration. No moviepy fallback: there is no moviepy art-track path
+    # and per the OOM rule there must not be one — surface the error loudly.
+    if art_track:
+        if not bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
+            audio.close()
+            raise RuntimeError(
+                "Art track requires a cover IMAGE (.jpg/.png), got a video bg"
+            )
+        logger.info("[ART] art-track render (profile=%s)", spec.profile)
+        out = _render_art_track(
+            bg_source, mp3_path, job_dir, spec=spec,
+            artist=artist, song_title=title_song, duration=duration,
+            label_line=label_line, effect=effect,
+        )
+        audio.close()
+        return out, font, bg_source
 
     # Fast path: libass single-pass render (engine=ass). Covers video bg +
     # H.264 (YouTube) and the UMG intermediate master (profile
@@ -14098,6 +14652,63 @@ def _burn_short_text_ass(
         return None
 
 
+def _pick_energy_window(mp3_path: str, duration: float, window_sec: float = 30.0) -> float:
+    """Pick the start (seconds) of the highest-energy `window_sec` window of
+    the track — a lyrics-free stand-in for "the chorus" used by the art-track
+    short. Falls back to 30% into the song if librosa/RMS analysis fails.
+    """
+    if duration <= window_sec:
+        return 0.0
+    try:
+        y, sr = librosa.load(mp3_path, sr=8000, mono=True)
+        hop = 4000  # ~0.5s frames at 8kHz
+        rms = librosa.feature.rms(y=y, frame_length=hop * 2, hop_length=hop)[0]
+        frames_per_win = max(1, int(round(window_sec * sr / hop)))
+        if frames_per_win >= len(rms):
+            return 0.0
+        # Rolling-sum energy; argmax gives the loudest contiguous window.
+        csum = np.concatenate([[0.0], np.cumsum(rms)])
+        win_energy = csum[frames_per_win:] - csum[:-frames_per_win]
+        best_frame = int(np.argmax(win_energy))
+        start = best_frame * hop / sr
+        return float(max(0.0, min(start, duration - window_sec)))
+    except Exception as e:
+        logger.warning("[ART] RMS window pick failed (%s) — using 30%% offset", e)
+        return float(max(0.0, min(duration * 0.30, duration - window_sec)))
+
+
+def generate_art_track_short(
+    mp3_path: str,
+    cover_path: str,
+    job_dir: str,
+    *,
+    spec: "RenderSpec",
+    artist: str = "",
+    song_title: str = "",
+    window_sec: float = 30.0,
+    label_line: str = "",
+    effect: str = "",
+) -> str:
+    """Render the vertical (9:16) art-track short: the same VEVO composite as
+    the master (blurred cover fill + shadowed cover card + reactive waveform +
+    title) over a 30s high-energy window of the audio. The bars react to that
+    window's audio. Writes `short.mp4` in job_dir (same contract as
+    generate_short); `_render_art_track` writes its own output name so it never
+    clobbers the master's `lyric_video.mp4`.
+    """
+    duration = _audio_duration(mp3_path) or _ffprobe_duration(mp3_path) or window_sec
+    win = min(window_sec, duration)
+    start = _pick_energy_window(mp3_path, duration, win)
+    out_path = _render_art_track(
+        cover_path, mp3_path, job_dir, spec=spec,
+        artist=artist, song_title=song_title, duration=win,
+        out_name="short.mp4", win_start=start, win_dur=win,
+        label_line=label_line, effect=effect,
+    )
+    logger.info("[ART] art-track short window %.0f-%.0fs", start, start + win)
+    return out_path
+
+
 def generate_short(
     mp3_path: str,
     segments: list[dict],
@@ -14318,6 +14929,48 @@ def _draw_text_with_outline(draw, xy, text, font, fill="white", outline="black",
             if ox != 0 or oy != 0:
                 draw.text((x + ox, y + oy), text, font=font, fill=outline)
     draw.text((x, y), text, font=font, fill=fill)
+
+
+def generate_art_track_thumbnail(
+    cover_path: str,
+    mp3_path: str,
+    job_dir: str,
+    *,
+    artist: str = "",
+    song_title: str = "",
+    label_line: str = "",
+) -> str:
+    """Thumbnail for art tracks: the SAME composite as the video (blurred
+    cover + shadowed card + title + a static whole-song waveform strip) at
+    1280×720, instead of the generic raw-cover crop — so the thumbnail
+    matches what plays. The static strip uses the full-track RMS envelope
+    (a "fingerprint" of the song, same visual language as the live bars).
+    """
+    import dataclasses
+
+    import art_track_wave
+
+    spec = dataclasses.replace(RenderSpec.youtube_default(),
+                               width=1280, height=720)
+    L = _art_track_layout(spec)
+    base_path = os.path.join(job_dir, "thumbnail_base.png")
+    out_path = os.path.join(job_dir, "thumbnail.jpg")
+    try:
+        _build_art_track_base(cover_path, base_path, spec=spec, artist=artist,
+                              song_title=song_title, label_line=label_line)
+        img = Image.open(base_path).convert("RGBA")
+        bars = _art_track_waveform_bars(mp3_path, L["n_bars"])
+        strip = art_track_wave.draw_wave_frame(
+            bars, L["wave_w"], L["wave_h"], pitch=L["pitch"], bar_w=L["bar_w"])
+        img.alpha_composite(strip, (L["wave_x"], L["wave_y"]))
+        img.convert("RGB").save(out_path, quality=92)
+    finally:
+        try:
+            os.unlink(base_path)
+        except OSError:
+            pass
+    logger.info("[ART] art-track thumbnail: %s", out_path)
+    return out_path
 
 
 def generate_thumbnail(

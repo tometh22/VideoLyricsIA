@@ -1148,6 +1148,11 @@ export default function App() {
   // batch, igual que `style`. El toggle sólo se muestra a usuarios elegibles
   // (user.features.scenes); el backend re-valida has_scenes_access igual.
   const [enableScenes, setEnableScenes] = useState(false);
+  // Art track ("official audio"): tipo de video = master audio + cover, sin
+  // letra. Cuando está activo, el wizard fuerza la subida del cover, oculta
+  // los controles de letra y saltea el editor/transcripción — se genera
+  // directo con art_track=true.
+  const [artTrack, setArtTrack] = useState(false);
 
   const [reviewQueue, setReviewQueue] = useState([]);
   const [currentReview, setCurrentReview] = useState(null);
@@ -1255,6 +1260,14 @@ export default function App() {
   // video anterior mientras la UI prometía fondo IA. El envío ahora se
   // gatea por este modo: sólo se manda lo que el tab activo dice.
   const [bgSelectMode, setBgSelectMode] = useState("auto"); // auto | library | custom
+  // Art tracks ALWAYS use the uploaded cover (bgSelectMode "custom"). The
+  // wizard-restore path flips a restored "custom" back to "auto" (an
+  // uploaded File can't survive serialization), which for an art track
+  // wrongly swaps the cover uploader for the AI-background controls and
+  // hides the cover step. Self-heal: whenever art track is on, force custom.
+  useEffect(() => {
+    if (artTrack && bgSelectMode !== "custom") setBgSelectMode("custom");
+  }, [artTrack, bgSelectMode]);
   const [animateImage, setAnimateImage] = useState(false);
   // match_lyrics toggle: when ON (default), Gemini reads the lyrics and
   // builds the background around the song's primary visual subject. OFF
@@ -1880,9 +1893,25 @@ export default function App() {
       }
 
       if (es) {
-        const cleanup = () => { es.close(); pollingIntervals.current.delete(es); };
+        // Watchdog: an EventSource can OPEN successfully but then stay silent
+        // — a buffering proxy, or (local dev) an SSE reader that doesn't see
+        // the worker's writes. In that case neither onmessage nor onerror ever
+        // fires and the progress screen hangs forever. If no event arrives
+        // shortly after connecting, fall back to polling /status. Cleared as
+        // soon as the first event lands.
+        let sawEvent = false;
+        let silentTimer = setTimeout(() => {
+          if (!sawEvent) { cleanup(); startPolling(); }
+        }, 6000);
+        const cleanup = () => {
+          clearTimeout(silentTimer);
+          es.close();
+          pollingIntervals.current.delete(es);
+        };
         pollingIntervals.current.add(es);
         es.onmessage = (e) => {
+          sawEvent = true;
+          clearTimeout(silentTimer);
           if (!isMountedRef.current) { cleanup(); return; }
           try {
             const data = JSON.parse(e.data);
@@ -1902,7 +1931,6 @@ export default function App() {
           } catch {}
         };
         es.onerror = () => {
-          // SSE connection dropped (e.g. proxy buffering). Fall through to polling.
           cleanup();
           startPolling();
         };
@@ -1980,15 +2008,23 @@ export default function App() {
     });
   }, [fetchHistory, handleLogout]);
 
-  useEffect(() => () => {
-    // R-FRONT-5: marca unmounted ANTES de cerrar handles para que
-    // cualquier callback async en flight (SSE messages bufferadas, polls
-    // ya disparados) salga temprano vía el guard sin tocar state.
-    isMountedRef.current = false;
-    pollingIntervals.current.forEach((handle) => {
-      if (handle && typeof handle.close === "function") handle.close();
-      else clearInterval(handle);
-    });
+  useEffect(() => {
+    // Set true on (re)mount so React 18 StrictMode's dev-only
+    // setup→cleanup→setup cycle doesn't leave the ref stuck at `false` — that
+    // would make every SSE/polling guard below bail and freeze the progress
+    // screen (the "Armando el video" hang). Prod has no double-invoke, but
+    // setting it here is correct in both.
+    isMountedRef.current = true;
+    return () => {
+      // R-FRONT-5: marca unmounted ANTES de cerrar handles para que
+      // cualquier callback async en flight (SSE messages bufferadas, polls
+      // ya disparados) salga temprano vía el guard sin tocar state.
+      isMountedRef.current = false;
+      pollingIntervals.current.forEach((handle) => {
+        if (handle && typeof handle.close === "function") handle.close();
+        else clearInterval(handle);
+      });
+    };
   }, []);
 
   // Sync filesRef con files para que callbacks asincrónicos vean el state actual.
@@ -3254,6 +3290,96 @@ export default function App() {
     await Promise.all(Array.from({ length: Math.min(PARALLEL_WORKERS, jobList.length) }, () => worker()));
   };
 
+  // Art track submit: one multipart POST /generate per audio with the cover as
+  // background_file + art_track=true + empty segments. No lyrics editor, no R2
+  // two-step — the direct /generate path streams the audio to disk locally and
+  // uploads it to R2 in prod (so the separate worker can fetch it), same as the
+  // legacy direct create. The pipeline skips Whisper and composites the cover.
+  const handleGenerateArtTrack = () => {
+    if (!files.length || !files.every((f) => f.artist.trim())) return;
+    if (!backgroundFile || typeof backgroundFile.slice !== "function") {
+      alert({
+        title: t("arttrack.cover_missing_title") || "Falta la portada",
+        description: t("arttrack.cover_missing_desc") ||
+          "Un art track necesita el cover del tema. Subí la imagen de portada.",
+        tone: "warning",
+      });
+      return;
+    }
+    const jobList = files.map((f) => ({
+      filename: f.file.name, _file: f.file, _cover: backgroundFile,
+      artist: f.artist.trim(), songTitle: (f.songTitle || "").trim(),
+      status: "queued", current_step: null,
+      progress: 0, job_id: null, error: null,
+    }));
+    setJobs(jobList);
+    navigate("/generating");
+    setFiles([]);
+    processArtTrackQueue(jobList);
+  };
+
+  const processArtTrackQueue = async (jobList) => {
+    let nextIdx = 0;
+    const worker = async () => {
+      while (nextIdx < jobList.length) {
+        const i = nextIdx++;
+        setJobs((prev) => prev.map((j, idx) =>
+          idx === i ? { ...j, status: "processing", current_step: "uploading", progress: 0 } : j
+        ));
+        const body = new FormData();
+        body.append("file", jobList[i]._file, jobList[i].filename);
+        body.append("background_file", jobList[i]._cover,
+                    jobList[i]._cover.name || "cover.jpg");
+        body.append("artist", jobList[i].artist);
+        if (jobList[i].songTitle) body.append("song_title", jobList[i].songTitle);
+        body.append("segments_json", "[]");
+        body.append("art_track", "true");
+        if ((delivery.label_line || "").trim()) {
+          body.append("label_line", delivery.label_line.trim());
+        }
+        if ((delivery.effect || "").trim()) {
+          body.append("effect", delivery.effect.trim());
+        }
+        body.append("delivery_profile", delivery.delivery_profile);
+        if (delivery.delivery_profile !== "youtube") {
+          body.append("umg_frame_size", delivery.umg_frame_size);
+          body.append("umg_fps", String(delivery.umg_fps));
+          body.append("umg_prores_profile", String(delivery.umg_prores_profile));
+        }
+
+        let genRes = null;
+        try {
+          genRes = await authFetch(`${API}/generate`, { method: "POST", body });
+          let data;
+          try {
+            data = await genRes.json();
+          } catch {
+            const reason = await describeFetchError(null, genRes, t);
+            setJobs((prev) => prev.map((j, idx) =>
+              idx === i ? { ...j, status: "error", error: reason } : j));
+            continue;
+          }
+          if (!genRes.ok || data.detail) {
+            if ((genRes.status ?? 0) === 401) { handleLogout("expired"); return; }
+            const reason = data.detail || await describeFetchError(null, genRes, t);
+            setJobs((prev) => prev.map((j, idx) =>
+              idx === i ? { ...j, status: "error", error: reason } : j));
+            continue;
+          }
+          setJobs((prev) => prev.map((j, idx) =>
+            idx === i ? { ...j, current_step: "video", progress: 0, job_id: data.job_id } : j));
+          await pollJob(data.job_id);
+        } catch (err) {
+          if ((err?.status ?? err?.response?.status) === 401) { handleLogout("expired"); return; }
+          const reason = await describeFetchError(err, genRes, t);
+          setJobs((prev) => prev.map((j, idx) =>
+            idx === i ? { ...j, status: "error", error: reason } : j));
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(PARALLEL_WORKERS, jobList.length) }, () => worker()));
+  };
+
   const handleReset = (skipConfirm = false) => {
     // Confirm whenever there's any wizard state at risk — not only when
     // jobs are running. Without this, the user could lose an in-progress
@@ -3812,6 +3938,14 @@ export default function App() {
         onCustomColorsChange={setCustomColors}
         enableScenes={enableScenes}
         onEnableScenesChange={setEnableScenes}
+        artTrack={artTrack}
+        onArtTrackChange={(on) => {
+          setArtTrack(on);
+          // Art track = cover subido + sin Escenas. Forzar modo "custom" para
+          // que aparezca el uploader del cover; limpiar Escenas (incompatible).
+          if (on) { setBgSelectMode("custom"); setEnableScenes(false); }
+        }}
+        onGenerateArtTrack={handleGenerateArtTrack}
         backgroundFile={backgroundFile}
         onBackgroundFile={setBackgroundFile}
         backgroundId={backgroundId}

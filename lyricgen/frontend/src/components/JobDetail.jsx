@@ -604,7 +604,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   //   - done           → lyrics only (video already accepted, only typo
   //                                    corrections warrant re-render)
   //   - rejected       → lyrics only (recovery path instead of re-upload)
-  const canEditLyrics = isPendingReview || isDone || isRejected;
+  // Art track = "official audio" sin letra: no hay letra que editar.
+  const isArtTrack = !!(job.art_track ?? job.render_params?.art_track);
+  const canEditLyrics = (isPendingReview || isDone || isRejected) && !isArtTrack;
   // Jobs multi-escena: el modo "Fondo" queda afuera del panel — ese edit
   // pertenece al mundo fondo-único (regenera UN clip y pisaba el timeline
   // de escenas; incidente 2026-07-01). Para escenas, la regeneración va
@@ -1489,6 +1491,11 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               <h2 className="text-xl font-bold tracking-tight truncate">
                 {job.song_title || name}
               </h2>
+              {isArtTrack && (
+                <span className="px-2 py-0.5 rounded-full bg-fuchsia-500/15 text-fuchsia-300 ring-1 ring-fuchsia-500/30 text-[10px] font-semibold uppercase tracking-wider">
+                  {t("detail.art_track_badge") || "Art Track"}
+                </span>
+              )}
               {isPendingReview && (
                 <span
                   data-tour="jobdetail-status-badge"
