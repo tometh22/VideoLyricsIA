@@ -11836,19 +11836,10 @@ def _build_art_track_base(cover_path: str, mp3_path: str, out_path: str, *,
     card = ImageOps.contain(cover, (L["card"], L["card"]), method=Image.LANCZOS)
     base.alpha_composite(card.convert("RGBA"), (L["card_x"], L["card_y"]))
 
-    # 4) Waveform bars (whole-song / window envelope) + title + artist.
+    # 4) Title + artist. The waveform is NOT drawn here — it's an audio-reactive
+    #    ffmpeg overlay (showwaves) composited at render time so the bars bounce
+    #    with the music, following the rhythm.
     d = ImageDraw.Draw(base)
-    N = 68
-    bars = _art_track_waveform_bars(mp3_path, N, win_start=win_start, win_dur=win_dur)
-    gap = max(2, int(L["wave_w"] * 0.005))
-    bw = (L["wave_w"] - (N - 1) * gap) / N
-    minh = max(3, int(L["wave_h"] * 0.04))
-    cy = L["wave_y"] + L["wave_h"] / 2
-    for i, a in enumerate(bars):
-        x0 = L["wave_x"] + i * (bw + gap)
-        bh = max(minh, a * (L["wave_h"] - 4))
-        d.rounded_rectangle([x0, cy - bh / 2, x0 + bw, cy + bh / 2],
-                            radius=max(1, int(bw * 0.25)), fill=(255, 255, 255, 220))
 
     def _font(sz: int, extra_bold: bool = False):
         name = "Montserrat-ExtraBold.ttf" if extra_bold else "Montserrat-Bold.ttf"
@@ -11887,16 +11878,19 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
                       spec: "RenderSpec", artist: str, song_title: str,
                       duration: float, out_name: str | None = None,
                       win_start: float = 0.0, win_dur: float | None = None) -> str:
-    """Render the full art-track ("official audio") video: PIL builds the whole
-    static composite (blurred cover + shadowed card + waveform + title/artist)
-    once, then ffmpeg loops that base image and draws a sweeping playhead
-    (drawbox) over the waveform while muxing the master audio. No lyrics, no
-    zoom/effect movement — the sweeping playhead over the waveform IS the
-    motion, matching the VEVO template.
+    """Render the full art-track ("official audio") video: PIL builds the static
+    composite once (blurred cover + shadowed card + title/artist), then ffmpeg
+    loops that base image and overlays an AUDIO-REACTIVE waveform (showwaves)
+    while muxing the master audio. No lyrics, no zoom/effect movement — the
+    waveform bars bounce with the music, following the rhythm, matching the VEVO
+    template.
 
-    Cheap per-frame work (a looped still + one drawbox) → fast and bounded
-    memory at any length. Spec-driven so YouTube MP4, the 9:16 short, and the
-    UMG intermediate master (→ lazy ProRes) all come out of the same code.
+    The waveform is a `showwaves` (peak-to-peak) render downscaled to a few
+    dozen columns with nearest-neighbor and carved into separate bars with geq,
+    giving even, chunky, centered bars that react to the sound. Only the
+    waveform region is recomputed per frame (the blur runs once in the PIL base)
+    → fast and bounded memory at any length. Spec-driven so YouTube MP4, the
+    9:16 short, and the UMG intermediate master (→ lazy ProRes) share this code.
     """
     L = _art_track_layout(spec)
     dur = float(win_dur) if win_dur else float(duration)
@@ -11907,10 +11901,23 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
                           song_title=song_title, win_start=win_start, win_dur=dur)
 
     out_path = os.path.join(job_dir, out_name or f"lyric_video.{spec.container}")
-    playhead_w = max(2, int(spec.width * 0.0016))
+    # Reactive waveform geometry: ~68 bars across the waveform box, each a chunky
+    # neighbor-scaled column with a gap. showwaves reads the (windowed) audio so
+    # the bars follow the beat; volume boost lifts quiet passages so they still
+    # move. p2p = symmetric bars around the center line.
+    pitch = max(8, L["wave_w"] // 68)
+    n_bars = max(24, L["wave_w"] // pitch)
+    scaled_w = n_bars * pitch
+    bar_w = max(3, int(pitch * 0.7))
+    fps_i = max(1, int(round(float(spec.fps))))
     fc = (
-        f"[0:v]drawbox=x='{L['wave_x']}+{L['wave_w']}*t/{dur:.3f}':y={L['wave_y']}:"
-        f"w={playhead_w}:h={L['wave_h']}:color=white@0.85:t=fill,"
+        f"[1:a]aformat=channel_layouts=mono,volume=2.5,"
+        f"showwaves=s={n_bars}x{L['wave_h']}:mode=p2p:rate={fps_i}:"
+        f"colors=0xFFFFFF:draw=full[wf];"
+        f"[wf]scale={scaled_w}:{L['wave_h']}:flags=neighbor,format=rgba,"
+        f"geq=r='r(X\\,Y)':g='g(X\\,Y)':b='b(X\\,Y)':"
+        f"a='if(lt(mod(X\\,{pitch})\\,{bar_w})\\,alpha(X\\,Y)\\,0)'[wave];"
+        f"[0:v][wave]overlay={L['wave_x']}:{L['wave_y']},"
         f"format={spec.pix_fmt}[outv]"
     )
 
