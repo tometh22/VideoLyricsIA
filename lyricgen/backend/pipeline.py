@@ -11765,15 +11765,26 @@ def _art_track_layout(spec: "RenderSpec") -> dict:
     W, H = spec.width, spec.height
     portrait = H > W
     if portrait:
-        card = int(W * 0.66)
+        # ONE centered axis (design review: the stacked-16:9 look read as a
+        # broken crop). Everything stays above 0.85*H (platform captions/
+        # actions land in the bottom 15%) and inside 0.88*W (action rail).
+        card = int(W * 0.62)
         card_x = (W - card) // 2
-        card_y = int(H * 0.12)
-        wave_w = int(W * 0.84)
+        card_y = int(H * 0.16)
+        wave_w = int(W * 0.70)
         wave_x = (W - wave_w) // 2
-        wave_h = int(H * 0.05)
-        wave_y = int(H * 0.60)
-        title_size = max(28, int(W * 0.055))
-        artist_size = max(18, int(W * 0.033))
+        wave_h = int(H * 0.045)
+        wave_y = int(H * 0.635)
+        title_size = max(30, int(W * 0.06))
+        artist_size = max(20, int(W * 0.036))
+        title_y = wave_y + wave_h + int(H * 0.030)
+        artist_y = title_y + int(title_size * 1.25)
+        text_align = "center"
+        text_x = W // 2
+        text_max_w = int(W * 0.84)
+        legal_y = int(H * 0.83)
+        tag_size = max(14, int(W * 0.020))
+        tag_y = wave_y - tag_size - int(H * 0.012)
     else:
         s = H / 1080.0
         card = int(600 * s)
@@ -11785,18 +11796,35 @@ def _art_track_layout(spec: "RenderSpec") -> dict:
         wave_y = int(545 * s)
         title_size = max(28, int(64 * s))
         artist_size = max(18, int(38 * s))
+        title_y = wave_y + wave_h + int(wave_h * 0.12) + int(title_size * 0.10)
+        artist_y = title_y + int(title_size * 1.18)
+        text_align = "left"
+        text_x = wave_x
+        # Hard safe zone: the text column ends well before the card starts
+        # (the old bound W-text_x-0.04W let long titles run under the card).
+        text_max_w = card_x - text_x - int(60 * s)
+        legal_y = int(H * 0.92)
+        tag_size = max(14, int(22 * s))
+        tag_y = wave_y - tag_size - int(12 * s)
+    # Reactive EQ bar geometry, shared by the PIL strip drawer and the
+    # ffmpeg overlay so both always agree.
+    n_bars = 48
+    pitch = max(8, wave_w // n_bars)
+    bar_w = max(3, round(pitch * 0.62))
+    # Wide, soft drop shadow (review: the old 0.037 blur read as "pasted").
     shadow = card + int(card * 0.06)
-    shadow_x = card_x + int(card * 0.02)
-    shadow_y = card_y + int(card * 0.035)
-    shadow_blur = max(8, int(card * 0.037))
-    title_y = wave_y + wave_h + int(wave_h * 0.12) + int(title_size * 0.10)
-    artist_y = title_y + int(title_size * 1.18)
+    shadow_x = card_x + int(card * 0.01)
+    shadow_y = card_y + int(card * 0.04)
+    shadow_blur = max(10, int(card * 0.09))
     return dict(
         W=W, H=H, card=card, card_x=card_x, card_y=card_y,
         shadow=shadow, shadow_x=shadow_x, shadow_y=shadow_y, shadow_blur=shadow_blur,
         wave_x=wave_x, wave_y=wave_y, wave_w=wave_w, wave_h=wave_h,
-        title_size=title_size, artist_size=artist_size, text_x=wave_x,
-        title_y=title_y, artist_y=artist_y,
+        n_bars=n_bars, pitch=pitch, bar_w=bar_w,
+        title_size=title_size, artist_size=artist_size,
+        text_align=text_align, text_x=text_x, text_max_w=text_max_w,
+        title_y=title_y, artist_y=artist_y, legal_y=legal_y,
+        tag_size=tag_size, tag_y=tag_y,
     )
 
 
@@ -11826,46 +11854,81 @@ def _art_track_waveform_bars(mp3_path: str, n: int, *, win_start: float = 0.0,
         return [0.25] * n
 
 
-def _build_art_track_base(cover_path: str, mp3_path: str, out_path: str, *,
+def _build_art_track_base(cover_path: str, out_path: str, *,
                           spec: "RenderSpec", artist: str, song_title: str,
-                          win_start: float = 0.0,
-                          win_dur: float | None = None) -> str:
+                          label_line: str = "") -> str:
     """Build the COMPLETE static base frame with PIL (one image): blurred cover
-    fill + shadowed cover card + waveform bars + title/artist. Doing the whole
-    static composite once (not per-frame in ffmpeg) keeps the render fast — the
-    expensive Gaussian blur runs a single time. ffmpeg then just loops this
-    image and draws the moving playhead on top. Text via PIL (no drawtext/
-    libass dependency), same as generate_thumbnail.
+    fill (luminance-clamped + scrim + vignette so ANY cover yields the same
+    tonal band and white text always reads) + wide-shadowed cover card +
+    "OFFICIAL AUDIO" tag + title/artist + optional ℗/© label line. Doing the
+    whole static composite once (not per-frame in ffmpeg) keeps the render
+    fast — the expensive Gaussian blur runs a single time. ffmpeg then loops
+    this image and overlays the reactive waveform strip. Text via PIL (no
+    drawtext/libass dependency), same as generate_thumbnail.
     """
-    from PIL import ImageFilter, ImageEnhance, ImageOps
+    import numpy as np
+    from PIL import ImageFilter, ImageEnhance, ImageOps, ImageStat
     L = _art_track_layout(spec)
     W, H = L["W"], L["H"]
+    portrait = L["text_align"] == "center"
 
     cover = Image.open(cover_path).convert("RGB")
 
-    # 1) Blurred, frame-filling background (cover-fit crop → blur → darken).
+    # 1) Blurred, frame-filling background: cover-fit crop → heavy blur →
+    #    desaturate → clamp mean luminance into a fixed band (~65/255) so a
+    #    whole album renders with one consistent tone regardless of cover.
     bg = ImageOps.fit(cover, (W, H), method=Image.LANCZOS)
-    bg = bg.filter(ImageFilter.GaussianBlur(radius=max(12, H // 22)))
-    bg = ImageEnhance.Brightness(bg).enhance(0.60)
-    bg = ImageEnhance.Color(bg).enhance(1.03)
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=max(16, H // 14)))
+    bg = ImageEnhance.Color(bg).enhance(0.85)
+    mean_luma = ImageStat.Stat(bg.convert("L")).mean[0]
+    bg = ImageEnhance.Brightness(bg).enhance(
+        min(1.6, max(0.45, 65.0 / max(mean_luma, 1.0))))
     base = bg.convert("RGBA")
 
-    # 2) Drop shadow behind the card (soft, offset).
+    # 1b) Scrim guaranteeing text/wave contrast: left-weighted in landscape
+    #     (the text column), bottom-weighted in portrait (text sits lower).
+    #     Plus a gentle vignette so the frame doesn't end in flat murk.
+    if portrait:
+        ramp = np.clip((np.linspace(0, 1, H) - 0.40) / 0.60, 0, 1) * 150
+        scrim_a = np.repeat(ramp[:, None], W, axis=1)
+    else:
+        ramp = np.clip(1.0 - np.linspace(0, 1, W) / 0.65, 0, 1) * 150
+        scrim_a = np.repeat(ramp[None, :], H, axis=0)
+    yy, xx = np.mgrid[0:18, 0:32]
+    r = np.hypot((xx - 15.5) / 15.5, (yy - 8.5) / 8.5)
+    vig_small = (np.clip((r - 0.55) / 0.45, 0, 1) * 90).astype(np.uint8)
+    vig_a = np.asarray(Image.fromarray(vig_small, "L").resize((W, H), Image.BILINEAR))
+    dark = np.zeros((H, W, 4), dtype=np.uint8)
+    dark[:, :, 3] = np.maximum(scrim_a.astype(np.uint8), vig_a)
+    base = Image.alpha_composite(base, Image.fromarray(dark, "RGBA"))
+
+    # 2) The sharp cover card, contained in the square box — compute its REAL
+    #    size first so non-square covers get a shadow that matches (a square
+    #    shadow under a letterboxed cover reads as a compositing bug).
+    card = ImageOps.contain(cover, (L["card"], L["card"]), method=Image.LANCZOS)
+    cw, ch = card.size
+    px = L["card_x"] + (L["card"] - cw) // 2
+    py = L["card_y"] + (L["card"] - ch) // 2
+
+    # 2b) Wide, soft drop shadow behind the actual card rect.
+    off_x, off_y = int(L["card"] * 0.01), int(L["card"] * 0.04)
     shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     ImageDraw.Draw(shadow).rounded_rectangle(
-        [L["shadow_x"], L["shadow_y"], L["shadow_x"] + L["card"],
-         L["shadow_y"] + L["card"]], radius=int(L["card"] * 0.02), fill=(0, 0, 0, 150))
+        [px + off_x, py + off_y, px + off_x + cw, py + off_y + ch],
+        radius=int(L["card"] * 0.02), fill=(0, 0, 0, 150))
     shadow = shadow.filter(ImageFilter.GaussianBlur(L["shadow_blur"]))
     base = Image.alpha_composite(base, shadow)
 
-    # 3) The sharp cover card (fit to the square box), slight tilt for life.
-    card = ImageOps.contain(cover, (L["card"], L["card"]), method=Image.LANCZOS)
-    base.alpha_composite(card.convert("RGBA"), (L["card_x"], L["card_y"]))
-
-    # 4) Title + artist. The waveform is NOT drawn here — it's an audio-reactive
-    #    ffmpeg overlay (showwaves) composited at render time so the bars bounce
-    #    with the music, following the rhythm.
+    base.alpha_composite(card.convert("RGBA"), (px, py))
     d = ImageDraw.Draw(base)
+    # Hairline stroke crisps the card edge against the blurred background.
+    d.rectangle([px, py, px + cw - 1, py + ch - 1],
+                outline=(255, 255, 255, 20), width=1)
+
+    # 3) Text block. The waveform is NOT drawn here — it's the audio-reactive
+    #    strip sequence overlaid at render time so the bars pulse with the
+    #    music, following the rhythm.
+    anchor = "ma" if portrait else "la"
 
     def _font(sz: int, extra_bold: bool = False):
         name = "Montserrat-ExtraBold.ttf" if extra_bold else "Montserrat-Bold.ttf"
@@ -11874,27 +11937,63 @@ def _build_art_track_base(cover_path: str, mp3_path: str, out_path: str, *,
         except Exception:
             return ImageFont.load_default()
 
-    max_text_w = W - L["text_x"] - int(W * 0.04)
+    max_text_w = L["text_max_w"]
 
-    def _fit_font(txt: str, size: int, extra_bold: bool):
+    def _fit_font(txt: str, size: int, extra_bold: bool, floor: int = 20):
         f = _font(size, extra_bold)
-        while size > 20 and d.textlength(txt, font=f) > max_text_w:
+        while size > floor and d.textlength(txt, font=f) > max_text_w:
             size = int(size * 0.92)
             f = _font(size, extra_bold)
-        return f
+        return f, size
 
     def _shadow_text(x, y, txt, fnt, fill):
-        d.text((x + 2, y + 3), txt, font=fnt, fill=(0, 0, 0, 160))
-        d.text((x, y), txt, font=fnt, fill=fill)
+        d.text((x + 2, y + 3), txt, font=fnt, fill=(0, 0, 0, 160), anchor=anchor)
+        d.text((x, y), txt, font=fnt, fill=fill, anchor=anchor)
 
-    title = (song_title or "").strip()
+    tag_font = _font(L["tag_size"])
+    _shadow_text(L["text_x"], L["tag_y"], "O F F I C I A L   A U D I O",
+                 tag_font, (255, 255, 255, 140))
+
+    artist_y = L["artist_y"]
+    title = spanish_smart_title((song_title or "").strip())
     if title:
-        _shadow_text(L["text_x"], L["title_y"], title,
-                     _fit_font(title, L["title_size"], True), (255, 255, 255, 255))
+        floor = max(20, int(L["title_size"] * 0.55))
+        f, size = _fit_font(title, L["title_size"], True, floor=floor)
+        if d.textlength(title, font=f) > max_text_w and " " in title:
+            # Still too wide at the floor size → wrap to two lines, split at
+            # the space nearest the middle, and push the artist line down.
+            mid = len(title) // 2
+            spaces = [i for i, c in enumerate(title) if c == " "]
+            cut = min(spaces, key=lambda i: abs(i - mid))
+            lines = [title[:cut], title[cut + 1:]]
+            f, size = _fit_font(max(lines, key=len), L["title_size"], True,
+                                floor=floor)
+            line_gap = int(size * 1.12)
+            _shadow_text(L["text_x"], L["title_y"], lines[0], f, (255, 255, 255, 255))
+            _shadow_text(L["text_x"], L["title_y"] + line_gap, lines[1], f,
+                         (255, 255, 255, 255))
+            artist_y += line_gap
+        else:
+            _shadow_text(L["text_x"], L["title_y"], title, f, (255, 255, 255, 255))
     artist = (artist or "").strip()
     if artist:
-        _shadow_text(L["text_x"] + 2, L["artist_y"], artist,
-                     _fit_font(artist, L["artist_size"], False), (255, 255, 255, 235))
+        f, _ = _fit_font(artist, L["artist_size"], False)
+        _shadow_text(L["text_x"], artist_y, artist, f, (255, 255, 255, 235))
+
+    legal = (label_line or "").strip()
+    if legal:
+        # Roboto, not Montserrat: the ℗ (U+2117) every label line starts with
+        # is missing from Montserrat and renders as tofu. At this size the
+        # family mismatch is imperceptible; the missing glyph is not.
+        sz = max(14, int(L["artist_size"] * 0.55))
+        try:
+            f = ImageFont.truetype(os.path.join(_FONTS_DIR, "Roboto-Bold.ttf"), sz)
+            while sz > 10 and d.textlength(legal, font=f) > max_text_w:
+                sz = int(sz * 0.92)
+                f = ImageFont.truetype(os.path.join(_FONTS_DIR, "Roboto-Bold.ttf"), sz)
+        except Exception:
+            f, _ = _fit_font(legal, sz, False)
+        _shadow_text(L["text_x"], L["legal_y"], legal, f, (255, 255, 255, 140))
 
     base.convert("RGB").save(out_path)
     return out_path
@@ -11903,50 +12002,57 @@ def _build_art_track_base(cover_path: str, mp3_path: str, out_path: str, *,
 def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
                       spec: "RenderSpec", artist: str, song_title: str,
                       duration: float, out_name: str | None = None,
-                      win_start: float = 0.0, win_dur: float | None = None) -> str:
+                      win_start: float = 0.0, win_dur: float | None = None,
+                      label_line: str = "") -> str:
     """Render the full art-track ("official audio") video: PIL builds the static
-    composite once (blurred cover + shadowed card + title/artist), then ffmpeg
-    loops that base image and overlays an AUDIO-REACTIVE waveform (showwaves)
-    while muxing the master audio. No lyrics, no zoom/effect movement — the
-    waveform bars bounce with the music, following the rhythm, matching the VEVO
-    template.
+    composite once (blurred cover + shadowed card + title/artist + tag/legal),
+    then ffmpeg loops that base image and overlays the AUDIO-REACTIVE waveform
+    strip while muxing the master audio. No lyrics, no zoom/effect movement —
+    EQ bars pulsing in place with the music, following the rhythm, ARE the
+    motion, matching the VEVO template.
 
-    The waveform is a `showwaves` (peak-to-peak) render downscaled to a few
-    dozen columns with nearest-neighbor and carved into separate bars with geq,
-    giving even, chunky, centered bars that react to the sound. Only the
-    waveform region is recomputed per frame (the blur runs once in the PIL base)
-    → fast and bounded memory at any length. Spec-driven so YouTube MP4, the
-    9:16 short, and the UMG intermediate master (→ lazy ProRes) share this code.
+    The waveform is a precomputed PNG strip sequence (art_track_wave: mel-band
+    energies → per-band normalization → fast-attack/slow-release envelope →
+    mirrored-center bars). Bars pulse IN PLACE — a scrolling showwaves
+    oscilloscope was rejected in design review because the eye reads the
+    horizontal translation, not the beat. Only the small strip is per-frame
+    work (the blur runs once in the PIL base) → fast and bounded memory at any
+    length. Spec-driven so YouTube MP4, the 9:16 short, and the UMG
+    intermediate master (→ lazy ProRes) share this code.
     """
+    import shutil
+
+    import art_track_wave
+    from fractions import Fraction
+
     L = _art_track_layout(spec)
     dur = float(win_dur) if win_dur else float(duration)
-    base_name = ((out_name or "art").replace(".mp4", "").replace(".mov", "")
-                 + "_base.png")
-    base_path = os.path.join(job_dir, base_name)
-    _build_art_track_base(cover_path, mp3_path, base_path, spec=spec, artist=artist,
-                          song_title=song_title, win_start=win_start, win_dur=dur)
+    stem = (out_name or "art").replace(".mp4", "").replace(".mov", "")
+    base_path = os.path.join(job_dir, stem + "_base.png")
+    _build_art_track_base(cover_path, base_path, spec=spec, artist=artist,
+                          song_title=song_title, label_line=label_line)
 
     out_path = os.path.join(job_dir, out_name or f"lyric_video.{spec.container}")
-    # Reactive waveform geometry: ~68 bars across the waveform box, each a chunky
-    # neighbor-scaled column with a gap. showwaves reads the (windowed) audio so
-    # the bars follow the beat; volume boost lifts quiet passages so they still
-    # move. p2p = symmetric bars around the center line.
-    pitch = max(8, L["wave_w"] // 68)
-    n_bars = max(24, L["wave_w"] // pitch)
-    scaled_w = n_bars * pitch
-    bar_w = max(3, int(pitch * 0.7))
-    fps_i = max(1, int(round(float(spec.fps))))
-    fc = (
-        f"[1:a]aformat=channel_layouts=mono,volume=2.5,"
-        f"showwaves=s={n_bars}x{L['wave_h']}:mode=p2p:rate={fps_i}:"
-        f"colors=0xFFFFFF:draw=full[wf];"
-        f"[wf]scale={scaled_w}:{L['wave_h']}:flags=neighbor,format=rgba,"
-        f"geq=r='r(X\\,Y)':g='g(X\\,Y)':b='b(X\\,Y)':"
-        f"a='if(lt(mod(X\\,{pitch})\\,{bar_w})\\,alpha(X\\,Y)\\,0)'[wave];"
-        f"[0:v][wave]overlay={L['wave_x']}:{L['wave_y']},"
-        f"format={spec.pix_fmt}[outv]"
-    )
 
+    # Wave strip timing. Above ~32 fps (UMG 50/59.94/60) the strip runs at
+    # half rate — overlay holds each strip frame, imperceptible at speed,
+    # and it halves the PNG count.
+    fps_frac = Fraction(spec.fps_str)
+    if float(fps_frac) > 32:
+        wave_fps_frac = fps_frac / 2
+        wave_fps_str = (str(wave_fps_frac.numerator) if wave_fps_frac.denominator == 1
+                        else f"{wave_fps_frac.numerator}/{wave_fps_frac.denominator}")
+    else:
+        wave_fps_frac, wave_fps_str = fps_frac, spec.fps_str
+    wave_n_frames = max(1, math.ceil(dur * wave_fps_frac))
+
+    # Same win_start/dur as the audio input below → bars sync by construction
+    # (the short's 30 s window analyzes ITS window, not the song start).
+    heights = art_track_wave.compute_bar_frames(
+        mp3_path, n_bars=L["n_bars"], n_frames=wave_n_frames,
+        fps=float(wave_fps_frac), win_start=win_start, win_dur=dur)
+
+    frames_dir = os.path.join(job_dir, stem + "_wave")
     if spec.codec == "libx264":
         vargs = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                  "-pix_fmt", spec.pix_fmt]
@@ -11962,19 +12068,34 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
     else:
         aargs = ["-c:a", spec.audio_codec]
 
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(base_path),
-        "-ss", str(max(0.0, win_start)), "-t", str(dur),
-        "-i", os.path.abspath(mp3_path),
-        "-filter_complex", fc, "-map", "[outv]", "-map", "1:a",
-        *vargs, *aargs, "-r", spec.fps_str,
-        "-movflags", "+faststart", "-shortest",
-        os.path.basename(out_path),
-    ]
-    _timeout = 1800 if (spec.codec == "prores_ks" or spec.width >= 3000) else 900
-    run_checked(cmd, label="ffmpeg-art-track", timeout=_timeout,
-                output_path=out_path, cwd=job_dir)
+    try:
+        pattern = art_track_wave.write_wave_frames(
+            heights, frames_dir, w=L["wave_w"], h=L["wave_h"],
+            pitch=L["pitch"], bar_w=L["bar_w"])
+        # eof_action=repeat: the strip sequence is finite while the looped
+        # base is infinite — hold the last strip frame so the graph never
+        # ends early; the -t audio window + -shortest bound the output.
+        fc = (
+            f"[0:v][1:v]overlay={L['wave_x']}:{L['wave_y']}:eof_action=repeat,"
+            f"format={spec.pix_fmt}[outv]"
+        )
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(base_path),
+            "-framerate", wave_fps_str, "-start_number", "0",
+            "-i", os.path.abspath(pattern),
+            "-ss", str(max(0.0, win_start)), "-t", str(dur),
+            "-i", os.path.abspath(mp3_path),
+            "-filter_complex", fc, "-map", "[outv]", "-map", "2:a",
+            *vargs, *aargs, "-r", spec.fps_str,
+            "-movflags", "+faststart", "-shortest",
+            os.path.basename(out_path),
+        ]
+        _timeout = 1800 if (spec.codec == "prores_ks" or spec.width >= 3000) else 900
+        run_checked(cmd, label="ffmpeg-art-track", timeout=_timeout,
+                    output_path=out_path, cwd=job_dir)
+    finally:
+        shutil.rmtree(frames_dir, ignore_errors=True)
     _validate_rendered_mp4(out_path, dur)
     size_mb = os.path.getsize(out_path) / (1024 * 1024)
     logger.info("[ART] art track render: %.0fs, %.1f MB (%dx%d)",

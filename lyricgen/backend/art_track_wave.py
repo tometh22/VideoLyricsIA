@@ -46,10 +46,13 @@ _FMAX = 10000.0
 
 # Height mapping: dynamic range in dB below each band's p98 reference, and
 # a >1 gamma so quiet passages stay visibly low while choruses reach ~1.0.
-_TOP_DB = 40.0
+# Tuned on a real master (Rata Blanca): D=40/γ=1.25 compressed everything
+# into the top (intro p50≈0.74 vs chorus 0.77 — no breathing, ~2.5%
+# frame-to-frame motion). D=25/γ=1.6 doubles the height response per dB.
+_TOP_DB = 25.0
 _PCTL = 98.0
 _DEAD_BAND_GUARD_DB = 25.0
-_GAMMA = 1.25
+_GAMMA = 1.6
 
 # Attack/release time constants in SECONDS (fps-normalized in _attack_release
 # so 23.976/25/30 fps all decay at the same real-time rate).
