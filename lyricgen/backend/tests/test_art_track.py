@@ -226,8 +226,9 @@ def test_render_art_track_effect_adds_fx_screen_blend(monkeypatch, tmp_path):
     # onto the base before the wave overlay.
     assert "-stream_loop" in calls["cmd"] and "bokeh.mp4" in joined
     assert "blend=all_mode=screen" in joined
-    # Bars still overlay LAST so they stay crisp on top of the particles.
-    assert joined.index("blend=all_mode=screen") < joined.index("overlay=")
+    # Effect is the TOP layer: wave overlay first, then the fx screen-blend
+    # on top so particles float over the bars and cover.
+    assert joined.index("overlay=") < joined.index("blend=all_mode=screen")
     # Audio mapping unchanged (fx has no audio; mp3 is still input 2).
     assert "2:a" in calls["cmd"]
 

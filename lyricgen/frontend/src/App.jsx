@@ -1260,6 +1260,14 @@ export default function App() {
   // video anterior mientras la UI prometía fondo IA. El envío ahora se
   // gatea por este modo: sólo se manda lo que el tab activo dice.
   const [bgSelectMode, setBgSelectMode] = useState("auto"); // auto | library | custom
+  // Art tracks ALWAYS use the uploaded cover (bgSelectMode "custom"). The
+  // wizard-restore path flips a restored "custom" back to "auto" (an
+  // uploaded File can't survive serialization), which for an art track
+  // wrongly swaps the cover uploader for the AI-background controls and
+  // hides the cover step. Self-heal: whenever art track is on, force custom.
+  useEffect(() => {
+    if (artTrack && bgSelectMode !== "custom") setBgSelectMode("custom");
+  }, [artTrack, bgSelectMode]);
   const [animateImage, setAnimateImage] = useState(false);
   // match_lyrics toggle: when ON (default), Gemini reads the lyrics and
   // builds the background around the song's primary visual subject. OFF

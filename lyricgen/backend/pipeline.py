@@ -12085,9 +12085,12 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
 
     # Optional moving effect: reuse the shared baked fx loops (snow/rain/
     # stars/bokeh/light/aurora) that the lyric path screen-blends. Composited
-    # over the base BEFORE the wave overlay so the white bars stay crisp on
-    # top of the particles. The art-track background tone stays as-is (no
-    # color grade — the base already luminance-clamps the blur).
+    # as the TOP layer — over the wave AND the cover card — so the particles
+    # float in front of everything, matching the wizard preview and the VEVO
+    # reference. Screen-blend only lightens, so the white bars stay pure white
+    # (screen with white = white) while the bokeh glows through the dark gaps.
+    # The art-track background tone stays as-is (no color grade — the base
+    # already luminance-clamps the blur).
     import fx_compositor as _fx
     fx_path = _fx.effect_path(effect)
 
@@ -12106,18 +12109,18 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
             "-i", os.path.abspath(mp3_path),
         ]
         if fx_path:
-            # fx = input 3 (after the mp3), looped forever; screen-blend it
-            # onto the base, then overlay the bars on the result.
+            # fx = input 3 (after the mp3), looped forever. Overlay the bars
+            # onto the base FIRST, then screen-blend the effect on TOP so the
+            # particles float over the wave and the cover (matches the preview).
             gain = _fx.fx_gain(effect)
             gain_step = f"{gain}," if gain else ""
             inputs += ["-stream_loop", "-1", "-i", os.path.abspath(fx_path)]
             fc = (
-                f"[0:v]format=gbrp[bg];"
+                f"[0:v][1:v]overlay={L['wave_x']}:{L['wave_y']}:eof_action=repeat,"
+                f"format=gbrp[bg];"
                 f"[3:v]scale={spec.width}:{spec.height},setpts=PTS-STARTPTS,"
                 f"{gain_step}format=gbrp[fx];"
-                f"[bg][fx]blend=all_mode=screen:shortest=1,format={spec.pix_fmt}[based];"
-                f"[based][1:v]overlay={L['wave_x']}:{L['wave_y']}:eof_action=repeat,"
-                f"format={spec.pix_fmt}[outv]"
+                f"[bg][fx]blend=all_mode=screen:shortest=1,format={spec.pix_fmt}[outv]"
             )
         else:
             fc = (
