@@ -683,8 +683,12 @@ export default function UploadZone({
       umg_fps: umgFps,
       umg_prores_profile: umgProresProfile,
       label_line: labelLine,
+      // Art track moving effect (batch-wide). The art-track submit path
+      // builds its own FormData and reads it from here (the lyric path
+      // sends per-song effect instead).
+      effect: batchDefaults.effect || "",
     });
-  }, [deliveryProfile, umgFrameSize, umgFps, umgProresProfile, labelLine, onDeliveryChange]);
+  }, [deliveryProfile, umgFrameSize, umgFps, umgProresProfile, labelLine, batchDefaults.effect, onDeliveryChange]);
 
   useEffect(() => {
     if (bgMode === "library" && !libraryLoaded) {

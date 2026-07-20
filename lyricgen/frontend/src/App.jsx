@@ -3329,6 +3329,9 @@ export default function App() {
         if ((delivery.label_line || "").trim()) {
           body.append("label_line", delivery.label_line.trim());
         }
+        if ((delivery.effect || "").trim()) {
+          body.append("effect", delivery.effect.trim());
+        }
         body.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
           body.append("umg_frame_size", delivery.umg_frame_size);
