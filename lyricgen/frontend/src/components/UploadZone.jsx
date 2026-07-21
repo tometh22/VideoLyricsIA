@@ -1890,6 +1890,11 @@ export default function UploadZone({
                   </p>
                 )}
               </div>
+              {/* Todo lo relacionado a la LETRA (versión en vivo, fuente de
+                  letra, idioma de transcripción) NO aplica a art tracks —
+                  rinden sin letra y saltean Whisper. Solo se muestra en lyric
+                  video. */}
+              {!artTrack && (<>
               {/* Toggle "versión en vivo" (06/07): arma la auditoría
                   acústica del final aunque el título no diga "live" —
                   las letras publicadas suelen ser de la versión de
@@ -2084,6 +2089,7 @@ export default function UploadZone({
                   >{l.code || (t("lang.auto") || "auto")}</button>
                 ))}
               </div>
+              </>)}
 
               {/* Personalizar toggle — only shown in batch mode (2+ songs) */}
               {files.length > 1 && (
