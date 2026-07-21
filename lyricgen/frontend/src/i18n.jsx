@@ -278,7 +278,7 @@ export const translations = {
     "upload.anim_gallery_desc": "Cómo aparecen las palabras sobre el video. Pasá el mouse o elegí y miralo en el preview ←",
     "upload.anim_word_note": "Funcionan en toda canción — el tiempo por palabra se calcula automáticamente.",
     "upload.anim_none": "Ninguna",
-    "upload.anim_none_desc": "Fade clásico por línea.",
+    "upload.anim_none_desc": "Corte limpio entre líneas.",
     "upload.anim_karaoke": "Karaoke",
     "upload.anim_karaoke_desc": "Las palabras se colorean al ritmo que se cantan.",
     "upload.anim_reveal": "Revelado",

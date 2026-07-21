@@ -1913,14 +1913,17 @@ export default function LyricsEditor({
   };
 
   const handleApprove = () => {
-    // QA fix 2026-05-28 (audit P0 #74): bloquear si el último autosave
-    // falló — el backend tiene segments STALE, aprobar mandaría a
-    // re-renderizar con datos viejos sin que el operador se entere.
-    // El chip rojo "Sin guardar — revisá tu conexión" ya marca el
-    // estado, este alert es la confirmación interactiva.
+    // Aviso (no bloqueo) si el último autosave falló. IMPORTANTE — contrato
+    // real verificado (incidente UMG 21-jul-2026): aprobar manda los
+    // segments EN PANTALLA en el cuerpo del POST (onApprove(cleaned) acá;
+    // App los envía en segments_json / edit body y el backend pisa
+    // segments_json antes de renderizar). El autosave fallido solo afecta
+    // el RESPALDO del servidor (reanudar tras refresh / reaper), no el
+    // render. El copy anterior decía lo contrario y llevó a operadores a
+    // no aprobar trabajo que sí estaba a salvo.
     if (saveStatus === "error") {
       const proceed = window.confirm(
-        "Tu última edición no se guardó (problema de red). Si aprobás ahora se re-renderiza con la última versión guardada en el servidor, no con tus cambios pendientes. ¿Aprobar igual?"
+        "Tu última edición no se pudo respaldar en el servidor (problema de red). Podés aprobar igual: el video se genera con lo que ves en pantalla. Solo el respaldo para reanudar la sesión queda desactualizado. ¿Continuar?"
       );
       if (!proceed) return;
     }
@@ -2223,11 +2226,12 @@ export default function LyricsEditor({
           </svg>
           <div className="flex-1 min-w-0">
             <p className="text-[12px] text-red-300 font-medium">
-              No pudimos guardar tu última edición
+              No pudimos respaldar tu última edición en el servidor
             </p>
             <p className="text-[10px] text-red-300/70 mt-0.5">
-              Probablemente perdiste conexión. Volvemos a intentar
-              automáticamente cuando edites algo más.
+              Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en
+              pantalla. Reintentamos automáticamente; evitá cerrar la pestaña
+              hasta ver «Guardado».
             </p>
           </div>
           <button
