@@ -53,6 +53,11 @@ _TOP_DB = 25.0
 _PCTL = 98.0
 _DEAD_BAND_GUARD_DB = 25.0
 _GAMMA = 1.6
+# Below this loudness (dB, ref=1.0 full-scale) the whole window is treated as
+# silent → all-zero heights (draw the thin center spine). Without this, a
+# constant/silent window has S_db == its own p98, mapping every band to 1.0 —
+# a solid white block, the opposite of the intended spine.
+_SILENCE_DB = -55.0
 
 # Attack/release time constants in SECONDS (fps-normalized in _attack_release
 # so 23.976/25/30 fps all decay at the same real-time rate).
@@ -87,6 +92,9 @@ def _per_band_normalize(S_db: np.ndarray, *, top_db: float = _TOP_DB,
     low. Global (not rolling) percentile → quiet intros stay low.
     """
     ref = np.percentile(S_db, pctl, axis=1)          # (n_bars,)
+    if float(ref.max()) < _SILENCE_DB:
+        # Near-silent window → spine only (all-zero heights), never a white box.
+        return np.zeros_like(S_db, dtype=np.float32)
     ref = np.maximum(ref, ref.max() - dead_band_guard)
     lin = (S_db - (ref[:, None] - top_db)) / top_db
     lin = np.clip(lin, 0.0, 1.0)

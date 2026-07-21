@@ -14696,6 +14696,10 @@ def generate_art_track_short(
     generate_short); `_render_art_track` writes its own output name so it never
     clobbers the master's `lyric_video.mp4`.
     """
+    # Resolve the title the same way the master does (generate_lyric_video →
+    # _resolve_title_song), so a blank song_title falls back to the filename
+    # here too — otherwise the master shows a title but the short is blank.
+    song_title = _resolve_title_song(song_title, mp3_path, artist)
     duration = _audio_duration(mp3_path) or _ffprobe_duration(mp3_path) or window_sec
     win = min(window_sec, duration)
     start = _pick_energy_window(mp3_path, duration, win)
@@ -14949,6 +14953,11 @@ def generate_art_track_thumbnail(
     import dataclasses
 
     import art_track_wave
+
+    # Same title resolution as the master/short so a blank song_title falls
+    # back to the filename (otherwise the thumbnail title would be blank while
+    # the video shows one).
+    song_title = _resolve_title_song(song_title, mp3_path, artist)
 
     spec = dataclasses.replace(RenderSpec.youtube_default(),
                                width=1280, height=720)

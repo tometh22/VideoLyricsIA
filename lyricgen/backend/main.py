@@ -11441,6 +11441,16 @@ async def create_variant(
 
     # Merge: render_params del padre + overrides del body.
     parent_render_params = dict(parent.render_params or {})
+    # Las variantes intercambian el fondo (Veo) del video; un art track no
+    # tiene fondo generado, así que "variante de un art track" no aplica. Sin
+    # este corte, la variante hereda art_track=True en render_params (se
+    # etiqueta como art track en la UI) pero se re-rendería como lyric vacío —
+    # y sería una vía sin gatear de la feature. Bloquear de plano.
+    if parent_render_params.get("art_track"):
+        raise HTTPException(
+            status_code=400,
+            detail="No se pueden crear variantes de un Art Track.",
+        )
     new_render_params = dict(parent_render_params)
     if body.background_hint is not None:
         new_render_params["background_hint"] = body.background_hint

@@ -63,6 +63,25 @@ def test_none_user_denied():
     assert auth.has_art_track_access(None) is False
 
 
+def test_dict_user_default_off_denies_umg(monkeypatch):
+    # /generate y /retry pasan un DICT (no un objeto). El gate real corre con
+    # dict → cubrir esa rama explícitamente.
+    monkeypatch.setattr(auth, "ART_TRACK_ENABLED_TENANTS", set())
+    monkeypatch.setenv("ART_TRACK_GLOBALLY_ENABLED", "0")
+    umg = {"role": "user", "tenant_id": "universal_music", "billing_group": None}
+    assert auth.has_art_track_access(umg) is False
+    assert auth.has_art_track_access({"role": "admin"}) is True
+
+
+def test_dict_user_access_via_tenant(monkeypatch):
+    monkeypatch.setenv("ART_TRACK_GLOBALLY_ENABLED", "0")
+    monkeypatch.setattr(auth, "ART_TRACK_ENABLED_TENANTS", {"universal_music"})
+    assert auth.has_art_track_access(
+        {"role": "user", "tenant_id": "universal_music"}) is True
+    assert auth.has_art_track_access(
+        {"role": "user", "tenant_id": "acme"}) is False
+
+
 def test_globally_enabled_helper_default_off(monkeypatch):
     monkeypatch.delenv("ART_TRACK_GLOBALLY_ENABLED", raising=False)
     assert auth._art_track_globally_enabled() is False

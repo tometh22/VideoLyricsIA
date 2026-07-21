@@ -1507,6 +1507,7 @@ export default function App() {
         // que IA es el default correcto.
         setBackgroundFile(null); setBackgroundId(null);
         setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
+        setArtTrack(false);
         setWizardStage("review");
         // Limpiar el query param sin agregar a history (replace).
         navigate("/new", { replace: true });
@@ -1688,7 +1689,14 @@ export default function App() {
       .then((data) => {
         if (!data || !data.id) return;
         setUser((prev) => {
-          const merged = { ...(prev || {}), ...data };
+          // Deep-merge en `features`: un shallow spread reemplazaría todo el
+          // objeto, así un /auth/me que (durante un deploy) no traiga
+          // features.art_track lo borraría y ocultaría la feature a un usuario
+          // elegible. Preservar las flags previas y pisar solo las nuevas.
+          const merged = {
+            ...(prev || {}), ...data,
+            features: { ...(prev?.features || {}), ...(data.features || {}) },
+          };
           localStorage.setItem("genly_user", JSON.stringify(merged));
           return merged;
         });
@@ -3399,6 +3407,10 @@ export default function App() {
     prefetchAbortRef.current = new AbortController();
     setFiles([]); setJobs([]); setBackgroundFile(null); setBackgroundId(null);
     setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
+    // Volver a lyric video en "Descartar todo": sin esto artTrack queda true y
+    // el self-heal fuerza bgSelectMode a "custom" de nuevo, dejando el wizard
+    // en modo art track sin cover.
+    setArtTrack(false);
     setReviewQueue([]); setCurrentReview(null); setApprovedJobs([]);
     setTranscribing(false); setReadyToGenerate(false); setTranscribeError(null);
     // Capa B 2026-05-24: el wizard descartó todo → vuelve al upload state.
@@ -3943,7 +3955,14 @@ export default function App() {
           setArtTrack(on);
           // Art track = cover subido + sin Escenas. Forzar modo "custom" para
           // que aparezca el uploader del cover; limpiar Escenas (incompatible).
-          if (on) { setBgSelectMode("custom"); setEnableScenes(false); }
+          if (on) {
+            setBgSelectMode("custom"); setEnableScenes(false);
+          } else {
+            // Al volver a Lyric Video: restaurar el fondo AI por defecto y
+            // soltar el cover subido. Sin esto, bgSelectMode queda "custom" y
+            // el lyric video se rendería con el cover como fondo (regresión).
+            setBgSelectMode("auto"); setBackgroundFile(null);
+          }
         }}
         onGenerateArtTrack={handleGenerateArtTrack}
         backgroundFile={backgroundFile}
