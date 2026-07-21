@@ -700,6 +700,24 @@ export default function LyricsEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flushCounter]);
 
+  // Manual "Guardar" — botón explícito pedido por operadores UMG (Seba +
+  // Gaby, jul-2026): el autoguardado debounced a veces falla en silencio o
+  // se pierde al navegar entre pasos del wizard, así que damos un guardado
+  // on-demand con feedback claro. Reusa el MISMO camino que el flush-on-drag
+  // (persiste el `edited` vigente y dirige el chip saveStatus).
+  const saveNow = useCallback(() => {
+    if (disableAutosave || !onPersistSegments || !transcribeJobId) return;
+    _pendingFlushRef.current = null;
+    setSaveStatus("saving");
+    const cleaned = edited.map(({ _id, review, ...rest }) => rest);
+    Promise.resolve(onPersistSegments(transcribeJobId, cleaned))
+      .then((result) => {
+        if (result && result.ok === false) setSaveStatus("error");
+        else { setSaveStatus("saved"); setIsDirty(false); }
+      })
+      .catch(() => setSaveStatus("error"));
+  }, [disableAutosave, onPersistSegments, transcribeJobId, edited]);
+
   // Auto-clear the "Guardado ✓" chip a couple seconds after it shows.
   useEffect(() => {
     if (saveStatus !== "saved") return undefined;
@@ -2332,6 +2350,57 @@ export default function LyricsEditor({
                   "Audio no disponible para reproducir — podés editar el texto igual."}
               </span>
             </div>
+          )}
+          {/* Guardar manual — pedido por operadores (Seba + Gaby, jul-2026):
+              el autoguardado a veces falla/se pierde al navegar. Botón
+              siempre visible con estado claro. Sólo si el autosave está
+              cableado (mismo gate que saveNow). */}
+          {onPersistSegments && transcribeJobId && !disableAutosave && (
+            <button
+              onClick={saveNow}
+              disabled={saveStatus === "saving"}
+              title={t("editor.save_now_hint") || "Guardar los tiempos y el texto ahora en el servidor."}
+              className={`shrink-0 inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-label font-medium ring-1 transition-colors disabled:opacity-60 disabled:cursor-default ${
+                saveStatus === "error"
+                  ? "bg-red-500/15 text-red-300 ring-red-500/40 hover:bg-red-500/25"
+                  : saveStatus === "saved"
+                  ? "bg-emerald-500/15 text-emerald-300 ring-emerald-500/40"
+                  : "bg-brand/20 text-brand-light ring-brand/40 hover:bg-brand/30"
+              }`}
+            >
+              {saveStatus === "saving" ? (
+                <>
+                  <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none">
+                    <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="3" opacity="0.25" />
+                    <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                  </svg>
+                  <span>{t("editor.saving") || "Guardando…"}</span>
+                </>
+              ) : saveStatus === "saved" ? (
+                <>
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                    <path d="M20 6 9 17l-5-5" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  <span>{t("editor.saved") || "Guardado"}</span>
+                </>
+              ) : saveStatus === "error" ? (
+                <>
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path d="M12 9v4M12 17h.01" strokeLinecap="round" />
+                    <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" strokeLinejoin="round" />
+                  </svg>
+                  <span>{t("editor.save_retry") || "Reintentar"}</span>
+                </>
+              ) : (
+                <>
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" strokeLinecap="round" strokeLinejoin="round" />
+                    <path d="M17 21v-8H7v8M7 3v5h8" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  <span>{t("editor.save_now") || "Guardar"}</span>
+                </>
+              )}
+            </button>
           )}
           {/* Lista | Línea de tiempo — the timeline is a VIEW of the same
               editor (shared state), default Lista. Narrow/mobile: icon-only
