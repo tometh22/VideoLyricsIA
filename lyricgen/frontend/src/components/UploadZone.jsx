@@ -2045,6 +2045,25 @@ export default function UploadZone({
                         <textarea
                           value={entry.anchorLyrics || ""}
                           onChange={(e) => updateField(i, "anchorLyrics", e.target.value)}
+                          onPaste={(e) => {
+                            // Algunos orígenes (Word, PDF, ciertos sitios de letras)
+                            // separan versos con CRLF, CR solo o los separadores
+                            // Unicode U+2028/U+2029. El <textarea> NO dibuja esos como
+                            // salto → la letra quedaba pegada en un bloque aunque el
+                            // contador (split "\n") marcaba bien las líneas. Normalizamos
+                            // a "\n" en el pegado. Si no hay separadores raros, dejamos
+                            // el paste nativo (preserva cursor/undo).
+                            const raw = e.clipboardData?.getData("text");
+                            if (raw == null) return;
+                            const normalized = raw.replace(/\r\n?/g, "\n").replace(/[\u2028\u2029]/g, "\n");
+                            if (normalized === raw) return;
+                            e.preventDefault();
+                            const el = e.target;
+                            const start = el.selectionStart ?? el.value.length;
+                            const end = el.selectionEnd ?? el.value.length;
+                            const next = (el.value.slice(0, start) + normalized + el.value.slice(end)).slice(0, 20000);
+                            updateField(i, "anchorLyrics", next);
+                          }}
                           placeholder={t("upload.anchor_lyrics_placeholder") || "Pegá la letra acá — una línea por verso, sin timestamps."}
                           rows={6}
                           maxLength={20000}
