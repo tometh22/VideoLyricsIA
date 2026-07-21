@@ -416,6 +416,13 @@ export default function UploadZone({
   // backend manda vía features.scenes (admin OR SCENES_ENABLED_TENANTS), pero
   // los admin siempre califican aunque la sesión cacheada no traiga el flag.
   const scenesEligible = user?.features?.scenes === true || user?.role === "admin";
+  // Art Track gateado por tenant (default OFF salvo admin). Si no califica,
+  // no mostramos el selector de tipo de video (queda solo lyric, como antes
+  // de la feature) y reseteamos artTrack si vino prendido de un estado viejo.
+  const artTrackEligible = user?.features?.art_track === true || user?.role === "admin";
+  useEffect(() => {
+    if (artTrack && !artTrackEligible) onArtTrackChange?.(false);
+  }, [artTrack, artTrackEligible]);
   const [showScenesUpsell, setShowScenesUpsell] = useState(false);
   // Costo en créditos del add-on Escenas. El backend lo expone en
   // features.scenes_credit_cost; default 3 (valor de lanzamiento) si la sesión
@@ -1333,8 +1340,9 @@ export default function UploadZone({
 
   // Video type selector (Lyric Video vs Art Track). Shown both in the
   // empty-state (pre-upload) and in step 1, so the operator picks the type
-  // before or right after adding audio.
-  const _videoTypeSelector = (
+  // before or right after adding audio. Hidden entirely when Art Track isn't
+  // enabled for this account (feature gate) — then there's only one type.
+  const _videoTypeSelector = !artTrackEligible ? null : (
     <div className="mb-5">
       <div className="text-label text-gray-400 mb-2">
         {t("upload.video_type") || "Tipo de video"}

@@ -73,6 +73,14 @@ def test_per_band_normalize_dead_band_guard():
     assert h[1].max() < 0.3          # dead band stays low, not amplified
 
 
+def test_silent_window_is_spine_not_white_block():
+    # A near-silent window (every band at the -100 dB floor) must map to
+    # all-zero heights (→ spine), NOT to 1.0 (a solid white block).
+    S_db = np.full((48, 100), -100.0, dtype=np.float32)
+    h = atw._per_band_normalize(S_db)
+    assert float(h.max()) == 0.0
+
+
 def test_quiet_intro_stays_low_globally():
     # Global (not rolling) normalization: a -35 dB intro before a 0 dB
     # chorus must render clearly lower than the chorus.
