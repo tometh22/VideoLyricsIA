@@ -65,6 +65,7 @@ from auth import (
     has_prores_access,
     has_drive_access,
     has_scenes_access,
+    has_art_track_access,
     scenes_credit_cost,
     telemetry_enabled,
     generate_api_key,
@@ -1237,6 +1238,9 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
                 "prores_export": has_prores_access(user),
                 "scenes": has_scenes_access(user),
                 "scenes_credit_cost": scenes_credit_cost(),
+                # Art Track gateado por tenant (default OFF salvo admin). El
+                # front oculta la opción "Art Track" si esto es false.
+                "art_track": has_art_track_access(user),
                 "telemetry": telemetry_enabled(),
                 # Versión B (letra anclada): el frontend gatea el textarea
                 # del wizard y el botón "Re-sincronizar con IA" con esto.
@@ -1340,6 +1344,9 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
                 "prores_export": has_prores_access(user),
                 "scenes": has_scenes_access(user),
                 "scenes_credit_cost": scenes_credit_cost(),
+                # Art Track gateado por tenant (default OFF salvo admin). El
+                # front oculta la opción "Art Track" si esto es false.
+                "art_track": has_art_track_access(user),
                 "telemetry": telemetry_enabled(),
                 # Versión B (letra anclada): el frontend gatea el textarea
                 # del wizard y el botón "Re-sincronizar con IA" con esto.
@@ -1411,6 +1418,7 @@ def me(current_user: dict = Depends(get_current_user), db: Session = Depends(get
             "prores_export": has_prores_access(_u),
             "scenes": has_scenes_access(_u),
             "scenes_credit_cost": scenes_credit_cost(),
+            "art_track": has_art_track_access(_u),
             "telemetry": telemetry_enabled(),
             # Versión B (letra anclada): el frontend gatea el textarea
             # del wizard y el botón "Re-sincronizar con IA" con esto.
@@ -7628,6 +7636,14 @@ async def generate_with_segments(
     # incompatible options BEFORE quota/AI gates so it costs 1 credit and is
     # not treated as an AI-background job.
     if art_track:
+        # Feature gate (default OFF salvo admin / tenant en allowlist). Corta
+        # acá aunque el front no muestre la opción — un tenant sin acceso que
+        # pegue a la API con art_track=true no debe poder generar.
+        if not has_art_track_access(current_user):
+            raise HTTPException(
+                status_code=403,
+                detail="Art Track no está habilitado para tu cuenta.",
+            )
         if background_id:
             raise HTTPException(
                 status_code=400,
@@ -11146,6 +11162,15 @@ async def retry_job(
     # costo Veo extra— al reintentar un job viejo.
     if retry_pipeline_kwargs.get("enable_scenes"):
         retry_pipeline_kwargs["enable_scenes"] = has_scenes_access(current_user)
+
+    # Art Track: mismo re-gate. Un art track NO se puede degradar a lyric
+    # (se re-rendería vacío, sin letra), así que si el usuario perdió el
+    # acceso a la feature cortamos el retry en vez de convertirlo.
+    if retry_pipeline_kwargs.get("art_track") and not has_art_track_access(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Art Track no está habilitado para tu cuenta.",
+        )
 
     enqueue_pipeline(
         job_id=job_id,

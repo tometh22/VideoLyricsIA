@@ -170,6 +170,48 @@ def has_scenes_access(user) -> bool:
     return (tenant_id or "").lower() in SCENES_ENABLED_TENANTS or (billing_group or "").lower() in SCENES_ENABLED_TENANTS
 
 
+# Tenants/cuentas que VEN la feature "Art Track" (official audio: cover +
+# master audio → video sin letra). Mismo patrón canario que SCENES/PRORES/
+# DRIVE, pero con default OFF (kill-switch en "0"): la feature entra a prod
+# APAGADA para todos los clientes (incluido UMG) y solo la ve admin, hasta
+# abrirla por env var SIN redeploy de código:
+#   ART_TRACK_ENABLED_TENANTS=universal_music   (por tenant)
+#   ART_TRACK_GLOBALLY_ENABLED=1                 (todos)
+ART_TRACK_ENABLED_TENANTS = {
+    t.strip().lower()
+    for t in os.environ.get("ART_TRACK_ENABLED_TENANTS", "").split(",")
+    if t.strip()
+}
+
+
+def _art_track_globally_enabled() -> bool:
+    """Kill-switch global de Art Track. Default OFF: la feature se lanza
+    apagada (solo admin la ve) y se abre por tenant o global sin deploy."""
+    return os.environ.get("ART_TRACK_GLOBALLY_ENABLED", "0").strip().lower() in (
+        "1", "true", "yes", "on", "y", "t",
+    )
+
+
+def has_art_track_access(user) -> bool:
+    """True iff `user` puede ver/usar la feature Art Track (official audio).
+
+    Default OFF → solo admin. Se abre SIN deploy con ART_TRACK_GLOBALLY_ENABLED
+    (todos) o ART_TRACK_ENABLED_TENANTS=universal_music (por tenant). Gobierna
+    tanto la visibilidad de la opción en el wizard (features.art_track) como el
+    gate del backend en /generate (defensa en profundidad: un tenant sin acceso
+    que pegue a la API con art_track=true igual es rechazado)."""
+    if user is None:
+        return False
+    role = getattr(user, "role", None) if not isinstance(user, dict) else user.get("role")
+    if role == "admin":
+        return True
+    if _art_track_globally_enabled():
+        return True
+    tenant_id = getattr(user, "tenant_id", None) if not isinstance(user, dict) else user.get("tenant_id")
+    billing_group = getattr(user, "billing_group", None) if not isinstance(user, dict) else user.get("billing_group")
+    return (tenant_id or "").lower() in ART_TRACK_ENABLED_TENANTS or (billing_group or "").lower() in ART_TRACK_ENABLED_TENANTS
+
+
 def telemetry_enabled() -> bool:
     """True si la telemetría de sesiones (heartbeat de tiempo-en-app) está prendida.
 
