@@ -142,6 +142,26 @@ def main() -> int:
     except RuntimeError as e:
         return _fail(str(e))
 
+    # 2.5. Autosave del editor — el camino que los operadores reportan como
+    # frágil (issue #934). GO/NO-GO: POST /jobs/{id}/save-segments con una
+    # corrección de timing debe 200 y persistir el count. Sin esto el gate
+    # verde no decía nada sobre el guardado del editor (incidente Seba
+    # 21-jul: autosave fallando en prod con smoke verde).
+    _segs = [
+        {"start": 0.2, "end": 1.4, "text": "estrechez de corazón (smoke)"},
+        {"start": 1.5, "end": 2.0, "text": "línea dos"},
+    ]
+    r = requests.post(
+        f"{api}/jobs/{job_id}/save-segments", headers=headers,
+        json={"segments": _segs}, timeout=30,
+    )
+    if not r.ok:
+        return _fail(f"/save-segments {r.status_code}: {r.text[:300]}")
+    _saved = r.json()
+    if _saved.get("count") != len(_segs):
+        return _fail(f"/save-segments persistió {_saved.get('count')} != {len(_segs)}")
+    print(f"[edit-smoke] save-segments ok (count={_saved['count']})")
+
     # 3. Edit de metadata — recorre run_edit_pipeline completo (apertura
     # moviepy del source_audio + fallback UTF-8 + re-render) sin costo Veo.
     r = requests.post(
