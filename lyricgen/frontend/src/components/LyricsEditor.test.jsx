@@ -536,47 +536,13 @@ describe("LyricsEditor — durable save on page unload (refresh/close) (2026-06-
   });
 });
 
-describe("LyricsEditor — reseed-storm fix is end-to-end (integration proof of #724)", () => {
-  // ACTIVE PROOF of #724 that doesn't depend on real users hitting the bug.
-  // The reseed-storm / data-loss root cause: the backend sorts segments by
-  // `start` on every /save-segments write, so the writeback hands the editor a
-  // segments prop with the SAME values in a DIFFERENT order than the local
-  // out-of-order array. The OLD positional segmentsValuesEqual saw that as
-  // "new content" → reseeded `edited` from the prop → the operator's in-flight
-  // edit got clobbered (and, repeated every autosave cycle, the flicker loop).
-  //
-  // This test reproduces exactly that: edit a line locally, then push a
-  // reordered-but-equal segments prop. With #724 the guard treats it as equal
-  // and SKIPS the reseed, so the local edit survives. On the pre-#724 build
-  // this test fails — the edit is replaced by the reordered original.
-  it("a reordered-but-equal segments writeback does NOT clobber a local edit", () => {
-    const ordered = [
-      { start: 0, end: 3, text: "alpha line" },
-      { start: 3, end: 5, text: "beta line" },
-      { start: 5, end: 8, text: "gamma line" },
-    ];
-    const { rerender } = render(<LyricsEditor {...baseProps({ segments: ordered })} />);
-
-    // Operator edits the first line locally (changes `edited`, not the prop).
-    const input = screen.getByDisplayValue("alpha line");
-    fireEvent.change(input, { target: { value: "alpha EDITED" } });
-    expect(screen.getByDisplayValue("alpha EDITED")).toBeInTheDocument();
-
-    // Backend roundtrip: same values, sorted differently, fresh reference —
-    // the exact shape that used to trigger the destructive reseed.
-    const reorderedSameValues = [
-      { start: 5, end: 8, text: "gamma line" },
-      { start: 0, end: 3, text: "alpha line" },
-      { start: 3, end: 5, text: "beta line" },
-    ];
-    rerender(<LyricsEditor {...baseProps({ segments: reorderedSameValues })} />);
-
-    // The local edit must survive (guard skipped the reseed). On the buggy
-    // build, "alpha EDITED" is gone and the original "alpha line" is back.
-    expect(screen.getByDisplayValue("alpha EDITED")).toBeInTheDocument();
-    expect(screen.queryByDisplayValue("alpha line")).not.toBeInTheDocument();
-  });
-});
+// NOTE (PR E adversarial audit, 2026-07): acá vivía el describe "integration
+// proof of #724" ("a reordered-but-equal segments writeback does NOT clobber a
+// local edit"). Corría SIN transcribeJobId → useState local → el prop se
+// ignoraba → pasaba trivialmente (no probaba nada post-PR-E). Se BORRÓ: post-PR
+// E el prop `segments` es sólo seed inicial y nunca se re-lee, así que la
+// insensibilidad al reorder la cubre trivialmente el test "ecos de prop son
+// inertes" de abajo, que además usa un jobId real y afirma cero remounts.
 
 describe("LyricsEditor — los ecos de prop son inertes (P0 titileo, era post-PR E)", () => {
   // HISTORIA: el storm original nacía del loop bidireccional — App
@@ -615,5 +581,48 @@ describe("LyricsEditor — los ecos de prop son inertes (P0 titileo, era post-PR
     // "titilaba").
     expect(screen.getByDisplayValue("alpha EDITED")).toBe(editedNode);
     expect(screen.getByDisplayValue("beta")).toBe(betaNode);
+  });
+});
+
+describe("LyricsEditor — editar NO retroalimenta al padre (guard anti-loop, reemplaza reviewSegments.test.js)", () => {
+  // El incidente #6 (loop de ~5000 ciclos): el viejo espejo onEditedChange
+  // empujaba cada keystroke al padre → currentReview.segments → prop
+  // `segments` → posible reseed → otro render → ... PR E cortó el espejo:
+  // el editor escribe SOLO al segmentsStore y el padre NO se entera del edit.
+  // Este test protege esa invariante: tras un edit, ni el objeto `segments`
+  // que pasó el padre cambia (no hay mutación/writeback) ni el padre
+  // re-renderiza (no hay canal de vuelta que dispare el loop).
+  it("un edit no muta el prop `segments` ni re-renderiza al padre", () => {
+    let parentRenders = 0;
+    // Referencia ESTABLE del prop, congelada, como la pasaría App desde
+    // currentReview.segments (seed). Si algo la mutara o el padre re-render-
+    // eara por el edit, lo detectamos.
+    const parentSegments = Object.freeze([
+      Object.freeze({ start: 0, end: 2, text: "alpha" }),
+      Object.freeze({ start: 2, end: 4, text: "beta" }),
+    ]);
+    const snapshotBefore = JSON.stringify(parentSegments);
+
+    function Parent() {
+      parentRenders += 1;
+      return (
+        <LyricsEditor
+          {...baseProps({ segments: parentSegments, transcribeJobId: "job-noloop" })}
+        />
+      );
+    }
+
+    render(<Parent />);
+    expect(parentRenders).toBe(1);
+
+    const input = screen.getByDisplayValue("alpha");
+    fireEvent.change(input, { target: { value: "alpha EDITED" } });
+    fireEvent.change(input, { target: { value: "alpha EDITED 2" } });
+    expect(screen.getByDisplayValue("alpha EDITED 2")).toBeInTheDocument();
+
+    // Sin espejo: el prop del padre no fue mutado y el padre no re-renderizó
+    // (cero canal de retroalimentación → cero loop).
+    expect(JSON.stringify(parentSegments)).toBe(snapshotBefore);
+    expect(parentRenders).toBe(1);
   });
 });

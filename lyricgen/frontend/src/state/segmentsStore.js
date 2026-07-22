@@ -20,19 +20,21 @@
  * y SOBREVIVE al unmount del componente. El editor se re-engancha a la
  * entrada viva al re-montar (useSyncExternalStore); el espejo por
  * keystroke hacia App desaparece (los lectores se suscriben acá). El
- * reemplazo externo post-mount ya no viaja por props: va por
- * `segmentsStore.replace(jobId, segs)`, que preserva identidad de filas
- * vía reseedPreservingIds (invariante de PR D: un eco puro conserva
- * todos los _id → cero remounts).
+ * reemplazo externo post-mount ya no viaja por props: hay un
+ * `segmentsStore.replace(jobId, segs)` DISPONIBLE para ese caso —
+ * preserva identidad de filas vía reseedPreservingIds (invariante de PR D:
+ * un eco puro conserva todos los _id → cero remounts)— pero hoy NO tiene
+ * caller de producción (API reservada; sólo la ejercitan los tests).
  *
  * Cero dependencias nuevas — React 18 trae useSyncExternalStore.
  */
 import { useCallback, useRef, useState, useSyncExternalStore } from "react";
 import { reseedPreservingIds } from "../lib/segmentIds";
 
-// jobId → { segments, version }. Module-level a propósito: sobrevive al
-// unmount de cualquier componente. El ciclo de vida lo cierran los
-// callers de evict()/evictAll() (App: approve, discard, logout).
+// jobId → { segments, original, version }. Module-level a propósito:
+// sobrevive al unmount de cualquier componente. `original` = baseline
+// inmutable del seed (para "Resetear timings"). El ciclo de vida lo cierran
+// los callers de evict()/evictAll() (App: approve, discard, logout).
 const entries = new Map();
 // jobId → Set<listener>. Separado de entries: un evict no debe romper la
 // suscripción de un hook aún montado (su snapshot pasa a EMPTY y listo).
@@ -76,9 +78,17 @@ function bumpCanary(jobId, source) {
   }
 }
 
+// setEntry NUNCA pisa `original`: la baseline se fija UNA vez, al seed. Así
+// "Resetear timings" del editor apunta al timing verdaderamente original aun
+// después de un remount (F2): sin esto, originalSegmentsRef capturaba los
+// segments YA editados de la entrada viva y Reset restauraba filas a sí mismas.
 function setEntry(jobId, segments) {
   const prev = entries.get(jobId);
-  entries.set(jobId, { segments, version: (prev?.version ?? 0) + 1 });
+  entries.set(jobId, {
+    segments,
+    original: prev?.original,
+    version: (prev?.version ?? 0) + 1,
+  });
   notify(jobId);
 }
 
@@ -89,7 +99,18 @@ export const segmentsStore = {
   },
 
   /**
+   * Baseline ORIGINAL del job (= output del seedFn en el primer mount),
+   * inmutable a través de edits/replace/remount. La usa el editor para
+   * "Resetear timings" — apuntar al timing original real, no al ya editado.
+   */
+  getOriginal(jobId) {
+    return entries.get(jobId)?.original;
+  },
+
+  /**
    * Reemplazo EXTERNO post-mount (el sucesor del viejo "reseed por prop").
+   * DISPONIBLE para reemplazo externo del contenido — hoy sin caller de
+   * producción (API reservada; sólo la ejercitan los tests de survival).
    * Preserva el _id de las filas cuyo contenido ya está en la entrada
    * (invariante PR D): un eco puro no re-monta ninguna fila; solo el
    * contenido genuinamente nuevo recibe id fresco.
@@ -171,7 +192,11 @@ export function useJobSegments(jobId, seedFn) {
   const seededRef = useRef(false);
   if (jobId && !seededRef.current && !entries.has(jobId)) {
     bumpCanary(jobId, "seed");
-    entries.set(jobId, { segments: seedFn(), version: 1 });
+    const seed = seedFn();
+    // `original` = la baseline del seed, congelada acá para siempre (setEntry
+    // la preserva). El editor la lee vía getOriginal() para "Resetear timings"
+    // aun después de un remount que se re-engancha a la entrada ya editada.
+    entries.set(jobId, { segments: seed, original: seed, version: 1 });
   }
   seededRef.current = true;
 

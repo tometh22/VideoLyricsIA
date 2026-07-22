@@ -56,6 +56,24 @@ import { track } from "./lib/telemetryTrack";
 
 const API = import.meta.env.VITE_API_URL || "";
 
+// PR E follow-up (2026-07): identidad ESTABLE de una review para keyear el
+// segmentsStore. DECOUPLE del backend job id: el prop transcribeJobId del
+// LyricsEditor maneja el autosave (POST /save-segments) y DEBE seguir siendo
+// el job real (o null); pero el store necesita una key que exista incluso
+// cuando la review no tiene job de backend (transcribeJobId y editingJobId
+// ambos null: handleBackInReview, resume/recovery). Sin una key estable esos
+// edits caían al useState local del hook y se perdían al desmontar el editor
+// (paso 6→4 del wizard) o al refrescar. La base de unicidad espeja la del
+// React `key` del <LyricsEditor> (transcribeJobId : filename : queueIdx), así
+// que es única por review y estable a través de remounts de la MISMA review.
+function reviewStoreKey(r) {
+  return r
+    ? (r.editingJobId
+        || r.transcribeJobId
+        || ("local:" + (r.file?.name || r.filename || "resume") + ":" + (r.queueIdx ?? 0)))
+    : null;
+}
+
 // 2026-05-27 Phase-2 — fallbacks shown for the brief window between
 // "user navigated to a lazy route" and "the chunk has been parsed".
 // Pure CSS, no fetches; mirrors the surrounding glass aesthetic so the
@@ -1045,6 +1063,9 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         // PR E: al salir de /edit-lyrics/:id sin aprobar, soltar la entrada
         // del store — una re-entrada re-bootstrapea del backend (fuente de
         // verdad post-abandono), no de un array huérfano en memoria.
+        // myId == id == editingJobId de esta review, que es justo lo que
+        // reviewStoreKey() prioriza en el path /edit-lyrics/:id, así que
+        // esta es la key exacta bajo la que el editor seedeó.
         segmentsStore.evict(myId);
       }
     };
@@ -1172,9 +1193,13 @@ export default function App() {
   // wizardPersistence leen de acá en vez del viejo espejo por keystroke
   // (onEditedChange → mergeEditedSegments), que era la mitad del loop
   // bidireccional del reseed-storm.
-  const reviewJobId = currentReview
-    ? (currentReview.editingJobId || currentReview.transcribeJobId || null)
-    : null;
+  // reviewStoreKey (no editingJobId||transcribeJobId a secas): incluye el
+  // fallback `local:...` para que una review sin job de backend igual tenga
+  // entrada viva en el store — y así sus edits lleguen al snapshot de
+  // wizardPersistence vía liveReviewSegments en vez de morir en el useState
+  // local del editor. Es EXACTAMENTE la key bajo la que el editor seedea
+  // (prop storeKey), así que el lector y el escritor coinciden.
+  const reviewJobId = reviewStoreKey(currentReview);
   const liveReviewSegments = useJobSegmentsValue(reviewJobId);
 
   // Phase C 2026-05-25: ref-based playback tick para que el WizardLivePreview
@@ -2925,7 +2950,10 @@ export default function App() {
         wizardPersistence.clear();
         // PR E: el job salió del flow de review — soltar su entrada del
         // store para que una futura re-edición seedee del backend fresco.
-        segmentsStore.evict(editedJobId);
+        // reviewStoreKey(r) = la key exacta bajo la que el editor seedeó
+        // (= editedJobId en este path de editingJobId); evict con esa key o
+        // la entrada leakea. Se evicta también transcribeJobId por las dudas.
+        segmentsStore.evict(reviewStoreKey(r));
         segmentsStore.evict(r.transcribeJobId);
         navigate(`/videos/${editedJobId}`, { replace: true });
         return;
@@ -2972,7 +3000,10 @@ export default function App() {
     // vivos. Si la operadora vuelve atrás (handleBackInReview), el editor
     // re-seedea desde approvedJobs[i].segments (= editedSegments, lo último
     // que vio en pantalla), así que no se pierde nada.
-    segmentsStore.evict(r.editingJobId || r.transcribeJobId);
+    // reviewStoreKey(r): incluye el fallback local:... para que una review
+    // sin job de backend NO leakee su entrada (el viejo `editingJobId ||
+    // transcribeJobId` evictaba undefined = no-op y dejaba el array vivo).
+    segmentsStore.evict(reviewStoreKey(r));
 
     // Fire-and-forget commit of the just-approved segments to the backend.
     // Bumps last_user_activity_at and persists segments_json so the reaper
@@ -4254,7 +4285,11 @@ export default function App() {
             // Post-render edit: cuando editingJobId está set, el autosave
             // de /save-segments va al job real (no al transcribeJob, que
             // en este flow es null). Orden importante: editingJobId gana.
+            // transcribeJobId sólo gobierna el autosave/backend; el store se
+            // keyea por storeKey (abajo) — que existe incluso cuando ambos
+            // ids son null, así que los edits jobId-less no se pierden.
             transcribeJobId={currentReview.editingJobId || currentReview.transcribeJobId || null}
+            storeKey={reviewStoreKey(currentReview)}
             onPersistSegments={persistSegmentsToBackend}
             onReanchor={reanchorSegmentsOnBackend}
             // PR E (2026-07): el viejo onEditedChange (espejo sincrónico a

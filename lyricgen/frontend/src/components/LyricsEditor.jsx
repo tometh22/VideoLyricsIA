@@ -10,7 +10,7 @@ import { tierForLength } from "../lib/lyricTiers";
 import { activeWordIndex } from "../lib/karaokeTiming";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
 import { reseedPreservingIds } from "../lib/segmentIds";
-import { useJobSegments } from "../state/segmentsStore";
+import { useJobSegments, segmentsStore } from "../state/segmentsStore";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
 import { splitWordsAtCharOffset, firstWordStart, lastWordEnd } from "../lib/splitWords";
 import useLocalStorage from "../hooks/useLocalStorage";
@@ -289,10 +289,11 @@ export function normalizeLineForMatch(text) {
 
 export default function LyricsEditor({
   // PR E (2026-07): `segments` es SOLO el seed inicial del store por job
-  // (segmentsStore.useJobSegments). Post-mount, un reemplazo externo del
-  // contenido NO viaja por este prop — va por segmentsStore.replace(jobId,
-  // segs), que preserva la identidad de filas (reseedPreservingIds). El
-  // viejo effect de prop-sync + sus 4 guards de eco fueron eliminados.
+  // (segmentsStore.useJobSegments). Post-mount, este prop ya NO re-seedea: el
+  // viejo effect de prop-sync + sus 4 guards de eco fueron eliminados. Para un
+  // eventual reemplazo externo del contenido existe segmentsStore.replace(),
+  // que preserva la identidad de filas (reseedPreservingIds) — hoy sin caller
+  // de producción (reservado / lo ejercitan sólo los tests).
   segments, filename, audioFile, referenceLyrics,
   coverageWarning = false, recoverySource = "",
   onApprove, onBack, isBatch = false, batchProgress = "",
@@ -307,6 +308,14 @@ export default function LyricsEditor({
   lyricsAnimation = "none",
   lineTransition = "none",
   transcribeJobId = null,
+  // PR E follow-up (2026-07): key DEL STORE, desacoplada del backend job id.
+  // transcribeJobId gobierna el autosave/backend (POST /save-segments) y es el
+  // job real (o null). storeKey identifica la review para el segmentsStore y
+  // EXISTE incluso cuando transcribeJobId es null (reviews jobId-less: back-nav,
+  // resume), así que sus edits sobreviven al unmount y llegan a wizardPersistence.
+  // Default a transcribeJobId para que los unit tests que sólo pasan
+  // transcribeJobId sigan keyando el store correctamente.
+  storeKey = null,
   onPersistSegments = null,
   // Versión B, parte 2 (2026-07-15): callback del padre que hace el POST
   // /jobs/{id}/reanchor (re-anclado CTC del timing con el texto corregido).
@@ -392,8 +401,13 @@ export default function LyricsEditor({
   // engancha a la entrada viva; seedFn corre solo la PRIMERA vez que se ve
   // este jobId. Sin jobId (unit tests / editor standalone) degrada a
   // estado local plano.
+  // storeKey desacopla la identidad de store del backend job id: existe
+  // incluso para reviews sin job (transcribeJobId null) para que sus edits
+  // sobrevivan al unmount. Default a transcribeJobId para los unit tests que
+  // sólo pasan transcribeJobId (así siguen keyando el store correctamente).
+  const _storeKey = storeKey ?? transcribeJobId ?? null;
   const [edited, setEdited] = useJobSegments(
-    transcribeJobId,
+    _storeKey,
     () => reseedPreservingIds([], segments),
   );
   const [isDirty, setIsDirty] = useState(false);
@@ -465,11 +479,14 @@ export default function LyricsEditor({
   const [saveStatus, setSaveStatus] = useState("idle"); // idle|saving|saved|error
   const [flushCounter, setFlushCounter] = useState(0);
   // Snapshot of the timings as first handed to us — the baseline for the
-  // timeline's "Resetear timings". PR E: seeded from the store's initial
-  // value (mismos _id que `edited`), NOT from the raw prop — on a remount
-  // that re-attaches to a live store entry, the prop is stale and its
-  // by-index ids wouldn't match the surviving rows.
-  const originalSegmentsRef = useRef(edited);
+  // timeline's "Resetear timings". PR E + F2 fix: se lee del `original` del
+  // store (getOriginal), que es la baseline del PRIMER seed y NUNCA se pisa
+  // con edits/replace. En un remount, `edited` ya trae los timings EDITADOS
+  // de la entrada viva, así que sembrar el ref con `edited` hacía que Reset
+  // restaurara las filas a sí mismas (no-op). getOriginal preserva el
+  // original real; fallback a `edited` para el path jobId-less/local (donde
+  // el primer mount `original` === `edited` de todos modos).
+  const originalSegmentsRef = useRef(segmentsStore.getOriginal(_storeKey) ?? edited);
   // Operator feedback 2026-05-25 (UMG): "Debería hacerlo solo, no
   // preguntarme" — the auto-trim banner ("Recortar N líneas con texto
   // colgado · Aplicar") was friction. Detection is reliable enough to
