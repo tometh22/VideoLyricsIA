@@ -46,7 +46,7 @@ import {
 } from "./hooks/useBackgroundPreview";
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
 import { translateBackendError } from "./lib/lyricsEditSubmit";
-import { mergeEditedSegments } from "./lib/reviewSegments";
+import { segmentsStore, useJobSegmentsValue } from "./state/segmentsStore";
 import { sanitizeSegmentsForSave, findSanitizedDiffs } from "./lib/sanitizeSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
 import { computeFieldDiff, buildEditPayloads } from "./lib/editWizardDiff";
@@ -55,6 +55,24 @@ import { anchorLyricsForEntry } from "./lib/anchorPayload";
 import { track } from "./lib/telemetryTrack";
 
 const API = import.meta.env.VITE_API_URL || "";
+
+// PR E follow-up (2026-07): identidad ESTABLE de una review para keyear el
+// segmentsStore. DECOUPLE del backend job id: el prop transcribeJobId del
+// LyricsEditor maneja el autosave (POST /save-segments) y DEBE seguir siendo
+// el job real (o null); pero el store necesita una key que exista incluso
+// cuando la review no tiene job de backend (transcribeJobId y editingJobId
+// ambos null: handleBackInReview, resume/recovery). Sin una key estable esos
+// edits caían al useState local del hook y se perdían al desmontar el editor
+// (paso 6→4 del wizard) o al refrescar. La base de unicidad espeja la del
+// React `key` del <LyricsEditor> (transcribeJobId : filename : queueIdx), así
+// que es única por review y estable a través de remounts de la MISMA review.
+function reviewStoreKey(r) {
+  return r
+    ? (r.editingJobId
+        || r.transcribeJobId
+        || ("local:" + (r.file?.name || r.filename || "resume") + ":" + (r.queueIdx ?? 0)))
+    : null;
+}
 
 // 2026-05-27 Phase-2 — fallbacks shown for the brief window between
 // "user navigated to a lazy route" and "the chunk has been parsed".
@@ -1042,6 +1060,13 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
       if (didClear) {
         setWizardStage("upload");
         wizardPersistence.clear();
+        // PR E: al salir de /edit-lyrics/:id sin aprobar, soltar la entrada
+        // del store — una re-entrada re-bootstrapea del backend (fuente de
+        // verdad post-abandono), no de un array huérfano en memoria.
+        // myId == id == editingJobId de esta review, que es justo lo que
+        // reviewStoreKey() prioriza en el path /edit-lyrics/:id, así que
+        // esta es la key exacta bajo la que el editor seedeó.
+        segmentsStore.evict(myId);
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1159,6 +1184,23 @@ export default function App() {
   const [approvedJobs, setApprovedJobs] = useState([]);
   const [transcribing, setTranscribing] = useState(false);
   const [transcribeError, setTranscribeError] = useState(null);
+  // PR E (2026-07): los segments VIVOS del job en review viven en el
+  // segmentsStore (keyed por jobId, sobrevive unmounts del editor), no en
+  // currentReview.segments — que queda como seed inicial + snapshot en
+  // commit points. Misma prioridad de key que el prop transcribeJobId del
+  // LyricsEditor: editingJobId (post-render edit) gana sobre transcribeJobId.
+  // Suscripción reactiva: WizardLivePreview + el snapshot de
+  // wizardPersistence leen de acá en vez del viejo espejo por keystroke
+  // (onEditedChange → mergeEditedSegments), que era la mitad del loop
+  // bidireccional del reseed-storm.
+  // reviewStoreKey (no editingJobId||transcribeJobId a secas): incluye el
+  // fallback `local:...` para que una review sin job de backend igual tenga
+  // entrada viva en el store — y así sus edits lleguen al snapshot de
+  // wizardPersistence vía liveReviewSegments en vez de morir en el useState
+  // local del editor. Es EXACTAMENTE la key bajo la que el editor seedea
+  // (prop storeKey), así que el lector y el escritor coinciden.
+  const reviewJobId = reviewStoreKey(currentReview);
+  const liveReviewSegments = useJobSegmentsValue(reviewJobId);
 
   // Phase C 2026-05-25: ref-based playback tick para que el WizardLivePreview
   // central pueda renderizar la línea activa con word-jump real (sincronizado
@@ -1390,8 +1432,21 @@ export default function App() {
     // setTimeout fallback) so the save happens during idle frames
     // instead of blocking renders. We also cancel any pending write
     // when the effect re-runs to coalesce rapid mutations.
+    // PR E (2026-07): currentReview.segments ya NO se actualiza por
+    // keystroke (el espejo onEditedChange murió con el segmentsStore).
+    // Para que un refresh no restaure segments stale, el snapshot copia
+    // los segments VIVOS del store (sin los campos internos _id/review)
+    // al momento de persistir. `liveReviewSegments` está en las deps, así
+    // que cada edición re-agenda este save (debounced vía idle callback,
+    // igual que antes con el espejo).
+    const committedReview = currentReview && Array.isArray(liveReviewSegments)
+      ? {
+          ...currentReview,
+          segments: liveReviewSegments.map(({ _id, review, ...rest }) => rest),
+        }
+      : currentReview;
     const snapshot = {
-      files, approvedJobs, currentReview, reviewQueue, wizardStage,
+      files, approvedJobs, currentReview: committedReview, reviewQueue, wizardStage,
       style, customColors, enableScenes, delivery, backgroundId, backgroundMode,
       bgSelectMode, animateImage, inspiredByLyrics,
     };
@@ -1409,7 +1464,7 @@ export default function App() {
     files, approvedJobs, currentReview, reviewQueue, wizardStage,
     style, customColors, enableScenes, delivery, backgroundId, backgroundMode,
     bgSelectMode, animateImage, inspiredByLyrics,
-    resumableWizard,
+    resumableWizard, liveReviewSegments,
   ]);
 
   // beforeunload warning — covers closing the tab, refreshing, or
@@ -1597,6 +1652,7 @@ export default function App() {
         }
       } catch { /* Sentry path itself must not throw */ }
       wizardPersistence.clear();
+      segmentsStore.evictAll(); // PR E: resume fallido = sesión descartada
       setCurrentReview(null);
       setApprovedJobs([]);
       setReviewQueue([]);
@@ -1733,6 +1789,9 @@ export default function App() {
     // for the next batch (UploadZone.BATCH_DEFAULTS_STORAGE_KEY).
     try { wizardPersistence.clear(); } catch { /* best effort */ }
     try { localStorage.removeItem("genly:wizardBatchDefaultsV1"); } catch { /* */ }
+    // PR E: User B no debe heredar los segments editados de User A en la
+    // misma máquina — el store es a nivel módulo, no muere con el unmount.
+    try { segmentsStore.evictAll(); } catch { /* */ }
 
     // Short-lived media tokens (preview/download URLs scoped to
     // job+filetype). Without this, User B sees /preview URLs that
@@ -2695,17 +2754,10 @@ export default function App() {
       // Auditoría 2026-06-10 (reporte operadora "se mueve y pierde
       // cambios"): acá vivía el ECO del autosave — tras el 200,
       // setCurrentReview({...prev, segments}) escribía de vuelta el
-      // snapshot ENVIADO. Cuando se agregó (2026-05-26) era la única
-      // forma de mantener currentReview al día; desde que el mirror
-      // sincrónico onEditedChange (handleEditedChange) propaga CADA
-      // edición al instante, el eco solo puede ser igual o MÁS VIEJO
-      // que currentReview. Si la operadora editaba mientras el POST
-      // volaba, el eco pisaba esas ediciones y el prop-sync de
-      // LyricsEditor reseedeaba `edited` hacia atrás: snap-back visual
-      // ("empieza como a moverse"), drag en curso muerto (las _id se
-      // reasignan y React remonta el bloque) y, con POSTs fuera de
-      // orden o un unmount de por medio, pérdida real de trabajo.
-      // El eco se ELIMINA: el mirror es la única fuente de frescura.
+      // snapshot ENVIADO, pisando ediciones in-flight. El eco se
+      // ELIMINÓ entonces; desde PR E (2026-07) la fuente de frescura es
+      // el segmentsStore (el editor escribe ahí y los lectores se
+      // suscriben), así que seguimos sin escribir nada de vuelta acá.
       return { ok: true };
     } catch (err) {
       console.warn("[autosave] /save-segments network error", err);
@@ -2896,6 +2948,13 @@ export default function App() {
 
         setCurrentReview(null);
         wizardPersistence.clear();
+        // PR E: el job salió del flow de review — soltar su entrada del
+        // store para que una futura re-edición seedee del backend fresco.
+        // reviewStoreKey(r) = la key exacta bajo la que el editor seedeó
+        // (= editedJobId en este path de editingJobId); evict con esa key o
+        // la entrada leakea. Se evicta también transcribeJobId por las dudas.
+        segmentsStore.evict(reviewStoreKey(r));
+        segmentsStore.evict(r.transcribeJobId);
         navigate(`/videos/${editedJobId}`, { replace: true });
         return;
       } finally {
@@ -2936,6 +2995,15 @@ export default function App() {
     track("wizard.approve_lyrics", { segments: (editedSegments || []).length });
     setApprovedJobs(newApproved);
     setCurrentReview(null);
+    // PR E: la canción aprobada sale del review — soltar su entrada del
+    // segmentsStore para que un batch de N canciones no acumule N arrays
+    // vivos. Si la operadora vuelve atrás (handleBackInReview), el editor
+    // re-seedea desde approvedJobs[i].segments (= editedSegments, lo último
+    // que vio en pantalla), así que no se pierde nada.
+    // reviewStoreKey(r): incluye el fallback local:... para que una review
+    // sin job de backend NO leakee su entrada (el viejo `editingJobId ||
+    // transcribeJobId` evictaba undefined = no-op y dejaba el array vivo).
+    segmentsStore.evict(reviewStoreKey(r));
 
     // Fire-and-forget commit of the just-approved segments to the backend.
     // Bumps last_user_activity_at and persists segments_json so the reaper
@@ -3009,6 +3077,7 @@ export default function App() {
         tone: "warning",
       });
       wizardPersistence.clear();
+      segmentsStore.evictAll(); // PR E: sesión muerta = batch descartado
       setCurrentReview(null);
       setApprovedJobs([]);
       setReadyToGenerate(false);
@@ -3411,6 +3480,7 @@ export default function App() {
     // el self-heal fuerza bgSelectMode a "custom" de nuevo, dejando el wizard
     // en modo art track sin cover.
     setArtTrack(false);
+    segmentsStore.evictAll(); // PR E: descartar todo = soltar el store entero
     setReviewQueue([]); setCurrentReview(null); setApprovedJobs([]);
     setTranscribing(false); setReadyToGenerate(false); setTranscribeError(null);
     // Capa B 2026-05-24: el wizard descartó todo → vuelve al upload state.
@@ -3426,20 +3496,12 @@ export default function App() {
   //     so it can be re-approved.
   //   - canción 1 (no approved yet) → /new with files[] still intact.
   // Distinct from handleReset (which discards the whole batch).
-  // Mirror sincrónico editor → currentReview. Auditoría 2026-06-10: la
-  // versión anterior era un arrow INLINE en el JSX — identidad nueva en
-  // cada render de App. Como LyricsEditor lo tiene en las deps de su
-  // effect espejo, cada render re-corría el effect → setCurrentReview con
-  // objeto nuevo → otro render de App → loop perpetuo (confirmado
-  // empíricamente: ~5000 ciclos/100ms). El loop saturaba el main thread
-  // (drags y taps caían en frames perdidos — parte del "se mueve y no me
-  // deja"), ensanchaba la ventana de la race del autosave y cancelaba en
-  // cada ciclo el requestIdleCallback de wizardPersistence.save.
-  // Dos cortes: identidad estable (useCallback) + no-op cuando los
-  // valores no cambiaron (devolver el MISMO objeto corta el re-render).
-  const handleEditedChange = useCallback((segs) => {
-    setCurrentReview((r) => mergeEditedSegments(r, segs));
-  }, []);
+  // PR E (2026-07): acá vivía handleEditedChange, el espejo sincrónico
+  // editor → currentReview (onEditedChange → mergeEditedSegments). Fue la
+  // fuente de un loop perpetuo App↔editor (auditoría 2026-06-10) y la
+  // mitad del loop bidireccional del reseed-storm. Eliminado: los
+  // lectores (WizardLivePreview, snapshot de wizardPersistence) se
+  // suscriben al segmentsStore vía useJobSegmentsValue(reviewJobId).
 
   const handleBackInReview = () => {
     if (approvedJobs.length > 0) {
@@ -3484,14 +3546,26 @@ export default function App() {
     // lo sincronizado (el "tengo que volver a comenzar"). Refrescamos el
     // cache con los segments vigentes antes de soltar la review.
     try {
-      if (currentReview?.file && Array.isArray(currentReview.segments)) {
+      // PR E: los segments vigentes viven en el segmentsStore, no en
+      // currentReview.segments (que quedó como seed inicial). Caemos al
+      // campo de currentReview si el store no tiene entrada (review sin
+      // jobId). Se limpian los campos internos (_id/review) como hacía el
+      // espejo viejo.
+      const liveSegs = segmentsStore.get(reviewJobId) || currentReview?.segments;
+      if (currentReview?.file && Array.isArray(liveSegs)) {
         const k = prefetchKey(currentReview.file);
         const cached = prefetchCache.current[k];
         if (cached?.status === "ready" && cached.data) {
-          cached.data = { ...cached.data, segments: currentReview.segments };
+          cached.data = {
+            ...cached.data,
+            segments: liveSegs.map(({ _id, review, ...rest }) => rest),
+          };
         }
       }
     } catch { /* best-effort: el cache es una optimización, no la verdad */ }
+    // La review cancelada sale del flow — su entrada del store no debe
+    // sobrevivir (una re-entrada re-transcribe / usa el prefetchCache).
+    segmentsStore.evictAll();
     setCurrentReview(null);
     setReviewQueue([]);
     setTranscribing(false);
@@ -3582,6 +3656,7 @@ export default function App() {
     setAnimateImage(false);
     setEnableScenes(false);
     wizardPersistence.clear();
+    segmentsStore.evictAll(); // PR E: batch nuevo = descarte del anterior
     navigate("/new");
   };
 
@@ -4002,7 +4077,11 @@ export default function App() {
         renderStep6={() => reviewScreen}
         // Phase 3: pasar segments al WizardLivePreview central para que
         // muestre una línea real de la canción que se está revisando.
-        reviewSegments={currentReview?.segments || null}
+        // PR E (2026-07): la fuente viva son los segments del store
+        // (reflejan cada edición sin el espejo por keystroke); fallback a
+        // currentReview.segments para reviews sin jobId todavía (el store
+        // no tiene entrada hasta que el editor seedea).
+        reviewSegments={liveReviewSegments || currentReview?.segments || null}
         // Phase C 2026-05-25: ref-based tick para que el WizardLivePreview
         // central renderice la línea ACTIVA (no la primera) con word-jump
         // sincronizado al audio. Sin re-renders en App.jsx — el preview lee
@@ -4206,17 +4285,17 @@ export default function App() {
             // Post-render edit: cuando editingJobId está set, el autosave
             // de /save-segments va al job real (no al transcribeJob, que
             // en este flow es null). Orden importante: editingJobId gana.
+            // transcribeJobId sólo gobierna el autosave/backend; el store se
+            // keyea por storeKey (abajo) — que existe incluso cuando ambos
+            // ids son null, así que los edits jobId-less no se pierden.
             transcribeJobId={currentReview.editingJobId || currentReview.transcribeJobId || null}
+            storeKey={reviewStoreKey(currentReview)}
             onPersistSegments={persistSegmentsToBackend}
             onReanchor={reanchorSegmentsOnBackend}
-            // QA fix 2026-05-28 (bug #2): synchronous mirror del estado
-            // local del LyricsEditor a currentReview.segments para que el
-            // WizardLivePreview central (que lee `reviewSegments`) refleje
-            // los drag-resize de timings sin esperar al autosave de 3s +
-            // network roundtrip. Auditoría 2026-06-10: memoizado + guard de
-            // no-op — ver handleEditedChange (el arrow inline acá causaba
-            // un loop perpetuo de re-renders App↔editor).
-            onEditedChange={handleEditedChange}
+            // PR E (2026-07): el viejo onEditedChange (espejo sincrónico a
+            // currentReview.segments) desapareció — WizardLivePreview lee
+            // ahora del segmentsStore (useJobSegmentsValue) sin pasar por
+            // el state de App, así que no hay eco de vuelta al editor.
             isBatch={currentReview.queue.length > 1}
             batchProgress={currentReview.queue.length > 1
               ? `${currentReview.queueIdx + 1} ${t("editor.song_of")} ${currentReview.queue.length}`
