@@ -366,6 +366,25 @@ export default function UploadZone({
   // animation control again. The toggle pill above the preview lets
   // the operator override either way.
   const [previewFace, setPreviewFace] = useState("lyrics");
+  // Discoverability fix (incidente Clari 19-jul, "no encuentro dónde
+  // agrandar el título"): los controles de la portada (Disposición +
+  // Tamaño del título) viven AL FONDO del panel de tipografía, debajo
+  // de todos los controles de la letra — hay que scrollear para verlos.
+  // Cuando el operador mira la cara "Portada" del preview (por la
+  // pestaña o por auto-flip), llevamos su vista a esos controles y los
+  // resaltamos un instante, así el control existente (que ya es fiel y
+  // llega al render) queda a la vista.
+  const portadaControlsRef = useRef(null);
+  const [portadaControlsPulse, setPortadaControlsPulse] = useState(false);
+  useEffect(() => {
+    if (previewFace !== "title") return;
+    const el = portadaControlsRef.current;
+    if (!el) return; // controles no montados en este paso — no-op
+    el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    setPortadaControlsPulse(true);
+    const tid = setTimeout(() => setPortadaControlsPulse(false), 1800);
+    return () => clearTimeout(tid);
+  }, [previewFace]);
   // Wrap updateBatchDefault below so any field that belongs to the
   // Portada bucket flips the preview. Defined inline to capture the
   // setter without juggling refs.
@@ -3625,7 +3644,14 @@ export default function UploadZone({
                   fonts in a 2-column grid + manual song break.
                   Refactored 2026-05-30 to address the operator feedback
                   "los controles están confusos / pegados al footer". */}
-              <div className="mt-5 pt-4 border-t border-white/[0.06]">
+              <div
+                ref={portadaControlsRef}
+                className={`mt-5 pt-4 border-t border-white/[0.06] rounded-lg transition-all duration-500 ${
+                  portadaControlsPulse
+                    ? "ring-2 ring-brand/60 bg-brand/[0.05] -mx-2 px-2 shadow-[0_0_0_4px_rgba(124,77,255,0.10)]"
+                    : "ring-2 ring-transparent"
+                }`}
+              >
                 <div className="flex items-center justify-between mb-3">
                   <p className="text-caption text-gray-200 font-medium">
                     {t("upload.titlecard_section") || "Portada del intro"}
