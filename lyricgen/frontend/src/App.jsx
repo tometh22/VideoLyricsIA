@@ -47,7 +47,7 @@ import {
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
 import { translateBackendError } from "./lib/lyricsEditSubmit";
 import { segmentsStore, useJobSegmentsValue } from "./state/segmentsStore";
-import { sanitizeSegmentsForSave, findSanitizedDiffs } from "./lib/sanitizeSegments";
+import { persistSegments } from "./lib/persistSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
 import { computeFieldDiff, buildEditPayloads } from "./lib/editWizardDiff";
 import { prefetchKey } from "./lib/prefetchKey";
@@ -2692,79 +2692,12 @@ export default function App() {
   // anterior al cambio. Ahora el caller (LyricsEditor) usa el
   // resultado para mover saveStatus a "error" y mostrar un banner +
   // bloquear el botón Aprobar.
-  const persistSegmentsToBackend = useCallback(async (jobId, segments, opts = {}) => {
-    if (!jobId || !Array.isArray(segments) || segments.length === 0) {
-      return { ok: false, reason: "no-data" };
-    }
-    // [drag-persist] diagnostic — remove after 2026-07-01 if reseed-storm
-    // stays silent (fix landed in #724). Kept one extra week to confirm.
-    // Sanitise to the backend contract BEFORE the POST. A single out-of-contract
-    // segment (NaN/inverted/out-of-range from a drag or manual time edit) used to
-    // 400 the whole save → saveStatus stuck on "error" → "Aprobar" blocked for the
-    // job (incident 2026-06-26, Universal AR). We clamp so a stray bad value
-    // degrades to "saved, fixable" instead of blocking everything.
-    const safeSegments = sanitizeSegmentsForSave(segments);
-    const _fixed = findSanitizedDiffs(segments, safeSegments);
-    if (_fixed.length) {
-      // Still surface WHAT was out of contract (Sentry [autosave] tag) even
-      // though we no longer fail on it — so we can trace the source edit path.
-      console.warn("[autosave] sanitized out-of-contract segment(s) before save", {
-        jobId, count: _fixed.length, sample: _fixed.slice(0, 3),
-      });
-    }
-    const _sample = safeSegments.slice(0, 2).map((s) => ({
-      start: Math.round((s.start || 0) * 1000) / 1000,
-      end: Math.round((s.end || 0) * 1000) / 1000,
-    }));
-    console.warn("[drag-persist] POST", { jobId, count: safeSegments.length, sample: _sample });
-    try {
-      const res = await authFetch(`${API}/jobs/${jobId}/save-segments`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ segments: safeSegments }),
-        // keepalive lets this POST survive a page unload (refresh / tab close).
-        // The unload flush in LyricsEditor sets it so the operator's last,
-        // not-yet-debounced edits aren't canceled mid-flight by the browser
-        // (reporte Gaby 2026-06-24: refrescó para salir del titileo y perdió
-        // TODO). Body cap is 64KB — fine for a lyrics segment list.
-        keepalive: opts.keepalive === true,
-      });
-      if (!res.ok) {
-        if (res.status === 400) {
-          // Post-sanitise this should be unreachable for segment-shape errors,
-          // but if the backend rejects for a reason we don't mirror, capture the
-          // exact `detail` (e.g. "segments[7] start/end out of range") instead of
-          // a bare status — that's what we lacked on 2026-06-26.
-          let detail = "";
-          try { detail = (await res.clone().json())?.detail || ""; } catch { /* non-JSON body */ }
-          console.warn("[autosave] /save-segments rejected 400", detail);
-        } else if (res.status !== 404) {
-          // 404 means the job was already reaped — nothing to save against.
-          // We log it as a soft warning; the user will see the real error
-          // when they click "Crear videos" and /generate returns 404.
-          console.warn("[autosave] /save-segments failed", res.status);
-        }
-        // QA fix audit P0 #74: bubble error to caller for saveStatus chip.
-        return {
-          ok: false,
-          reason: res.status === 404 ? "job-gone" : `http-${res.status}`,
-          status: res.status,
-        };
-      }
-      // Auditoría 2026-06-10 (reporte operadora "se mueve y pierde
-      // cambios"): acá vivía el ECO del autosave — tras el 200,
-      // setCurrentReview({...prev, segments}) escribía de vuelta el
-      // snapshot ENVIADO, pisando ediciones in-flight. El eco se
-      // ELIMINÓ entonces; desde PR E (2026-07) la fuente de frescura es
-      // el segmentsStore (el editor escribe ahí y los lectores se
-      // suscriben), así que seguimos sin escribir nada de vuelta acá.
-      return { ok: true };
-    } catch (err) {
-      console.warn("[autosave] /save-segments network error", err);
-      // QA fix audit P0 #74: bubble network error to caller.
-      return { ok: false, reason: "network", error: String(err) };
-    }
-  }, []);
+  // Thin wrapper sobre lib/persistSegments (extraído en PR F para testear el
+  // contrato real, no un mirror inline stale). authFetch + API se inyectan.
+  const persistSegmentsToBackend = useCallback(
+    (jobId, segments, opts = {}) => persistSegments(authFetch, API, jobId, segments, opts),
+    [],
+  );
 
   // Versión B, parte 2: re-anclar el timing con el texto YA corregido por
   // el operador. El backend toma segments_json (el autosave de arriba lo
