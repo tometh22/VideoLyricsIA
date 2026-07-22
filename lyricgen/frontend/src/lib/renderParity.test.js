@@ -22,6 +22,8 @@ import {
   fadeSeconds,
   lyricFontPx,
 } from "./lyricTiers";
+import { CONCEPT_CODES, MOVEMENT_CODES } from "./catalogCodes";
+import { FONT_BY_CODE } from "../components/fontCatalog";
 
 describe("render parity: font sizes", () => {
   it("lyricFontPx matches ass_render.lyric_fontsize across the whole matrix", () => {
@@ -67,5 +69,20 @@ describe("render parity: fades", () => {
       expect(fadeSeconds(c.transition, c.seg_duration), `${c.transition}@${c.seg_duration}`)
         .toBeCloseTo(c.seconds, 9);
     }
+  });
+});
+
+describe("render parity: option catalogs (dropdown promises = worker delivery)", () => {
+  it("font codes match pipeline._FONT_CATALOGUE ids", () => {
+    const jsCodes = Object.keys(FONT_BY_CODE).filter((c) => c !== "").sort();
+    expect(jsCodes).toEqual(fixture.catalogs.fonts);
+  });
+
+  it("concept codes match pipeline._CONCEPT_SCENE_GUIDE keys", () => {
+    expect([...CONCEPT_CODES].sort()).toEqual(fixture.catalogs.concepts);
+  });
+
+  it("movement codes match pipeline._MOVEMENT_STYLE_RULES keys", () => {
+    expect([...MOVEMENT_CODES].sort()).toEqual(fixture.catalogs.movements);
   });
 });
