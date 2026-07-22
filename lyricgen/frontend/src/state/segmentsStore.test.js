@@ -138,6 +138,55 @@ describe("segmentsStore — API módulo", () => {
     expect(segs[1]._id).not.toBe(1); // id nuevo, no reciclado por índice
   });
 
+  it("dos mounts con la MISMA key no-nula comparten estado a través del unmount (FIX 1)", () => {
+    const first = renderHook(() =>
+      useJobSegments("local:song.mp3:0", () => SEGS.map((s, i) => ({ ...s, _id: i }))),
+    );
+    act(() => {
+      first.result.current[1]((prev) =>
+        prev.map((s) => (s._id === 0 ? { ...s, text: "editado" } : s)),
+      );
+    });
+    first.unmount();
+    // Segundo mount con la MISMA key sintética: se re-engancha a la entrada
+    // viva (no re-seedea), aunque no haya job de backend detrás.
+    const second = renderHook(() =>
+      useJobSegments("local:song.mp3:0", () => SEGS.map((s, i) => ({ ...s, _id: i }))),
+    );
+    expect(second.result.current[0][0].text).toBe("editado");
+  });
+
+  it("getOriginal preserva la baseline del seed a través de edits/replace/remount (F2)", () => {
+    const first = renderHook(() =>
+      useJobSegments("job-a", () => SEGS.map((s, i) => ({ ...s, _id: i, start: s.start }))),
+    );
+    // Baseline capturada al seed.
+    expect(segmentsStore.getOriginal("job-a")).toHaveLength(2);
+    expect(segmentsStore.getOriginal("job-a")[0].start).toBe(0);
+
+    // Un edit del timing NO debe tocar `original`.
+    act(() => {
+      first.result.current[1]((prev) =>
+        prev.map((s) => (s._id === 0 ? { ...s, start: 9 } : s)),
+      );
+    });
+    expect(segmentsStore.get("job-a")[0].start).toBe(9);
+    expect(segmentsStore.getOriginal("job-a")[0].start).toBe(0);
+
+    // Un replace() externo tampoco.
+    act(() => {
+      segmentsStore.replace("job-a", [{ start: 50, end: 60, text: "alpha" }]);
+    });
+    expect(segmentsStore.getOriginal("job-a")[0].start).toBe(0);
+
+    // Y sobrevive al remount (misma entrada viva).
+    first.unmount();
+    renderHook(() =>
+      useJobSegments("job-a", () => SEGS.map((s, i) => ({ ...s, _id: i }))),
+    );
+    expect(segmentsStore.getOriginal("job-a")[0].start).toBe(0);
+  });
+
   it("replace notifica a los suscriptores", () => {
     const view = renderHook(() => useJobSegmentsValue("job-a"));
     expect(view.result.current).toBeNull();
