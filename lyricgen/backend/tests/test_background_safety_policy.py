@@ -10,6 +10,17 @@ import pipeline
 from main import _merge_content_validation_choice
 
 
+@pytest.fixture(autouse=True)
+def _strict_nonumg_validation(monkeypatch):
+    """Este archivo testea la política ESTRICTA no-implicit-people para cuentas
+    non-UMG. Desde la promoción staging→prod (2026-07) esa política es opt-in
+    por entorno (BACKGROUND_NONUMG_VALIDATION=staging) porque prod la revirtió
+    (#900) por sobre-bloqueo. Fijamos el modo estricto acá para que las
+    regresiones existentes sigan cubriéndola. Los tests de prod-parity (default
+    permisivo) lo sobreescriben explícitamente. UMG no depende del flag."""
+    monkeypatch.setenv("BACKGROUND_NONUMG_VALIDATION", "staging")
+
+
 def _job(db, *, tenant="genly", billing_group=None, render_params=None):
     suffix = uuid.uuid4().hex[:10]
     user = User(
@@ -519,3 +530,51 @@ def test_mark_validation_observed_annotates_without_losing_issues():
     assert marked["observed_violation"] is True
     assert marked["observed_issues"] == [{"type": "brand"}]
     assert marked["enforcement"] == "observe"
+
+
+# ── Prod-parity gate (BACKGROUND_NONUMG_VALIDATION, promoción 2026-07) ──
+# Por default (=="prod") una cuenta non-UMG NO corre el validador salvo que el
+# operador lo pida explícito (force_content_validation) — igual que producción,
+# que revirtió (#900) el hardening por sobre-bloqueo. UMG nunca cambia.
+
+def test_prod_parity_default_nonumg_skips_validation(db, monkeypatch):
+    monkeypatch.setenv("BACKGROUND_NONUMG_VALIDATION", "prod")
+    job_id = _job(db)  # non-UMG, sin flags
+    policy = pipeline._background_safety_policy(job_id)
+    assert policy["is_umg"] is False
+    assert policy["should_validate"] is False  # prod: skip por default
+
+
+def test_prod_parity_nonumg_force_still_validates(db, monkeypatch):
+    monkeypatch.setenv("BACKGROUND_NONUMG_VALIDATION", "prod")
+    job_id = _job(db, render_params={"force_content_validation": True})
+    policy = pipeline._background_safety_policy(job_id)
+    assert policy["is_umg"] is False
+    assert policy["should_validate"] is True  # opt-in explícito del operador
+
+
+def test_prod_parity_umg_always_validates(db, monkeypatch):
+    monkeypatch.setenv("BACKGROUND_NONUMG_VALIDATION", "prod")
+    job_id = _job(db, tenant="universal_ar")
+    policy = pipeline._background_safety_policy(job_id)
+    assert policy["is_umg"] is True
+    assert policy["should_validate"] is True  # UMG jamás depende del flag
+
+
+def test_prod_parity_unset_defaults_to_prod(db, monkeypatch):
+    # Sin la env seteada, el default es "prod" (permisivo) — la seguridad de que
+    # prod no re-arma el validador si nadie configura nada.
+    monkeypatch.delenv("BACKGROUND_NONUMG_VALIDATION", raising=False)
+    job_id = _job(db)
+    policy = pipeline._background_safety_policy(job_id)
+    assert policy["is_umg"] is False
+    assert policy["should_validate"] is False
+
+
+def test_staging_mode_nonumg_validates_by_default(db, monkeypatch):
+    # El modo estricto de staging sigue disponible como opt-in.
+    monkeypatch.setenv("BACKGROUND_NONUMG_VALIDATION", "staging")
+    job_id = _job(db)
+    policy = pipeline._background_safety_policy(job_id)
+    assert policy["is_umg"] is False
+    assert policy["should_validate"] is True

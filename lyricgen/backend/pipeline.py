@@ -5299,7 +5299,25 @@ def _background_safety_policy(job_id: str | None, operator_prompt: str | None = 
             # non-UMG people opt-in must not disable smoke observation/gating.
             # Brand/IP classification is immutable. A valid opt-in for a human
             # subject must never bypass that independent dimension.
-            should_validate = True
+            #
+            # Prod-parity gate (promoción staging→prod 2026-07-22): producción
+            # revirtió a propósito (#900) el hardening de background para
+            # cuentas non-UMG porque sobre-bloqueaba fondos benignos. Preservamos
+            # esa postura permisiva en prod POR DEFAULT: un tenant non-UMG solo
+            # corre el validador si el operador lo pidió explícito
+            # (force_content_validation) — idéntico a la regla legacy de prod
+            # (not is_umg → validar solo si _force_validation). UMG NUNCA cambia:
+            # siempre valida (should_validate=True). El modo estricto de staging
+            # (validar people+brand por default en non-UMG) queda como opt-in por
+            # entorno: BACKGROUND_NONUMG_VALIDATION=staging. Este gate cubre
+            # people Y brand porque ambos pasan por should_validate; atmospherics
+            # ya está en prod-parity vía BACKGROUND_SMOKE_POLICY_MODE (default off).
+            if is_umg:
+                should_validate = True
+            elif os.getenv("BACKGROUND_NONUMG_VALIDATION", "prod").strip().lower() == "staging":
+                should_validate = True
+            else:
+                should_validate = bool(force)
             return {
                 "tenant_id": tenant, "billing_group": billing_group,
                 "is_umg": is_umg, "allow_people": allow_people,
