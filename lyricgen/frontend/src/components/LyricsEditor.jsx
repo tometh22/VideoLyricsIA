@@ -15,6 +15,59 @@ import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetec
 import { splitWordsAtCharOffset, firstWordStart, lastWordEnd } from "../lib/splitWords";
 import useLocalStorage from "../hooks/useLocalStorage";
 
+// Copy honesto del fallo de respaldo (autosave), por CAUSA real. El banner
+// + el confirm de "Aprobar" antes decían "problema de red" para cualquier
+// fallo (PR A). Pero persistSegmentsToBackend (App.jsx) distingue el motivo
+// via { reason, status }: un 401 = sesión vencida (el auto-retry NO lo
+// arregla — hay que reingresar), un 404 = job expirado por el reaper, etc.
+// Decir siempre "red" es deshonesto y manda a la operadora por el camino
+// equivocado. `server` es el fallback = el copy original (comportamiento sin
+// cambios cuando el motivo es desconocido). El núcleo tranquilizador
+// («Aprobar y generar» usa lo de pantalla) se mantiene en TODAS las causas —
+// eso sigue siendo verdad porque el approve manda los segments en el body.
+const _SAVE_ERROR_COPY = {
+  network: {
+    short: "No pudimos respaldar tu última edición (problema de red)",
+    detail:
+      "Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla. Reintentamos automáticamente; evitá cerrar la pestaña hasta ver «Guardado».",
+    confirm:
+      "Tu última edición no se pudo respaldar en el servidor (problema de red). Podés aprobar igual: el video se genera con lo que ves en pantalla. Solo el respaldo para reanudar la sesión queda desactualizado. ¿Continuar?",
+  },
+  session: {
+    short: "No pudimos respaldar tu última edición (tu sesión venció)",
+    detail:
+      "Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla. El reintento automático no alcanza si la sesión expiró: reingresá en otra pestaña para que el respaldo vuelva a guardarse.",
+    confirm:
+      "Tu última edición no se pudo respaldar (tu sesión venció). Podés aprobar igual: el video se genera con lo que ves en pantalla. Pero si vas a cerrar y reanudar después, reingresá primero para no perder el respaldo. ¿Continuar?",
+  },
+  "job-gone": {
+    short: "No pudimos respaldar: este trabajo ya no está en el servidor",
+    detail:
+      "Puede haber expirado por inactividad. Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla, pero al generar el servidor podría rechazarlo. Si falla, volvé a subir la canción.",
+    confirm:
+      "Este trabajo ya no está en el servidor (pudo expirar por inactividad). Tus cambios siguen en pantalla, pero al generar podría fallar. ¿Intentar aprobar igual?",
+  },
+  server: {
+    short: "No pudimos respaldar tu última edición en el servidor",
+    detail:
+      "Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla. Reintentamos automáticamente; evitá cerrar la pestaña hasta ver «Guardado».",
+    confirm:
+      "Tu última edición no se pudo respaldar en el servidor. Podés aprobar igual: el video se genera con lo que ves en pantalla. Solo el respaldo para reanudar la sesión queda desactualizado. ¿Continuar?",
+  },
+};
+
+// Deriva la categoría de copy desde el { reason, status } que retorna
+// persistSegmentsToBackend. Un throw del fetch (result undefined) = red.
+function _saveErrorCategory(result) {
+  if (!result) return "network"; // fetch tiró (catch) → sin red
+  const status = result.status;
+  const reason = result.reason || "";
+  if (reason === "network") return "network";
+  if (status === 401 || status === 403) return "session";
+  if (reason === "job-gone" || status === 404) return "job-gone";
+  return "server"; // 400/409/5xx/otros → copy genérico honesto
+}
+
 // Font options for the live in-preview switcher. Codes match the render
 // pipeline / EditRequestPanel; css families are all loaded in index.html so
 // the preview renders the real typeface. "" = Auto (pipeline picks).
@@ -477,6 +530,12 @@ export default function LyricsEditor({
   // changes. Ahora ambos autosaves actualizan saveStatus, y "error"
   // se muestra como chip rojo con botón Reintentar.
   const [saveStatus, setSaveStatus] = useState("idle"); // idle|saving|saved|error
+  // Motivo del último fallo de respaldo, para que el banner + el confirm de
+  // "Aprobar" digan la CAUSA REAL en vez de "problema de red" siempre (el
+  // copy honesto de PR A quedó hardcodeado a "red"; la causa real puede ser
+  // sesión vencida, job expirado, etc. — ver _SAVE_ERROR_COPY). null cuando
+  // no hay error. Se deriva de result.reason/status de persistSegments.
+  const [saveErrorReason, setSaveErrorReason] = useState(null);
   const [flushCounter, setFlushCounter] = useState(0);
   // Snapshot of the timings as first handed to us — the baseline for the
   // timeline's "Resetear timings". PR E + F2 fix: se lee del `original` del
@@ -550,12 +609,17 @@ export default function LyricsEditor({
         // { ok, reason } post-fix #74. Para legacy callers (sin
         // return value), result === undefined → tratamos como ok.
         if (result && result.ok === false) {
+          setSaveErrorReason(_saveErrorCategory(result));
           setSaveStatus("error");
         } else {
+          setSaveErrorReason(null);
           setSaveStatus("saved");
         }
       } catch {
-        if (!cancelled) setSaveStatus("error");
+        if (!cancelled) {
+          setSaveErrorReason("network");
+          setSaveStatus("error");
+        }
       }
     }, 3000);
     return () => { cancelled = true; clearTimeout(tid); };
@@ -627,10 +691,15 @@ export default function LyricsEditor({
       .then((result) => {
         if (cancelled) return;
         // QA fix audit P0 #74: distinguir error en lugar de idle silencioso.
-        if (result && result.ok === false) setSaveStatus("error");
-        else setSaveStatus("saved");
+        if (result && result.ok === false) {
+          setSaveErrorReason(_saveErrorCategory(result));
+          setSaveStatus("error");
+        } else {
+          setSaveErrorReason(null);
+          setSaveStatus("saved");
+        }
       })
-      .catch(() => { if (!cancelled) setSaveStatus("error"); });
+      .catch(() => { if (!cancelled) { setSaveErrorReason("network"); setSaveStatus("error"); } });
     return () => { cancelled = true; };
     // Only react to the flush trigger — `edited` is intentionally read fresh
     // but NOT a dep (we don't want every keystroke to flush).
@@ -1965,9 +2034,8 @@ export default function LyricsEditor({
     // render. El copy anterior decía lo contrario y llevó a operadores a
     // no aprobar trabajo que sí estaba a salvo.
     if (saveStatus === "error") {
-      const proceed = window.confirm(
-        "Tu última edición no se pudo respaldar en el servidor (problema de red). Podés aprobar igual: el video se genera con lo que ves en pantalla. Solo el respaldo para reanudar la sesión queda desactualizado. ¿Continuar?"
-      );
+      const _copy = _SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server;
+      const proceed = window.confirm(_copy.confirm);
       if (!proceed) return;
     }
     // Check for 3+ line segments before submitting — show a warning banner
@@ -2162,12 +2230,10 @@ export default function LyricsEditor({
           </svg>
           <div className="flex-1 min-w-0">
             <p className="text-[12px] text-red-300 font-medium">
-              No pudimos respaldar tu última edición en el servidor
+              {(_SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server).short}
             </p>
             <p className="text-[10px] text-red-300/70 mt-0.5">
-              Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en
-              pantalla. Reintentamos automáticamente; evitá cerrar la pestaña
-              hasta ver «Guardado».
+              {(_SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server).detail}
             </p>
           </div>
           <button

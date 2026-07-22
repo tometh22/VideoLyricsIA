@@ -26,3 +26,4 @@ lyricgen/backend/.pytest_cache/
 dump.rdb
 *.rdb
 .gstack/
+.vercel
