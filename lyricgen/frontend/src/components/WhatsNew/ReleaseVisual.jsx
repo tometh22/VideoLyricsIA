@@ -183,6 +183,89 @@ function CinemaVisual({ compact = false }) {
   );
 }
 
+function ControlVisual({ compact = false }) {
+  const { t } = useI18n();
+  const features = [
+    {
+      key: "lyrics",
+      label: t("release.visual.official_lyrics"),
+      icon: (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-4 w-4" aria-hidden="true">
+          <path d="M7 3.5h7l3 3V20H7z" />
+          <path d="M14 3.5V7h3M9.5 11h5M9.5 14h5M9.5 17h3" strokeLinecap="round" />
+        </svg>
+      ),
+    },
+    {
+      key: "editor",
+      label: t("release.visual.new_editor"),
+      icon: (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-4 w-4" aria-hidden="true">
+          <rect x="3.5" y="5" width="17" height="14" rx="2" />
+          <path d="M8 9h8M8 12h5M8 15h7" strokeLinecap="round" />
+        </svg>
+      ),
+    },
+    {
+      key: "library",
+      label: t("release.visual.background_library"),
+      icon: (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-4 w-4" aria-hidden="true">
+          <rect x="3.5" y="4" width="17" height="16" rx="2" />
+          <path d="m6.5 16 3.5-4 2.5 2.5 2.5-3 2.5 4.5" strokeLinecap="round" strokeLinejoin="round" />
+          <circle cx="15.5" cy="8.5" r="1.25" />
+        </svg>
+      ),
+    },
+  ];
+
+  if (compact) {
+    return (
+      <div className="relative flex h-[104px] items-center overflow-hidden rounded-lg bg-[#090b12] p-3 ring-1 ring-white/[0.08]">
+        <div className="absolute -right-8 -top-10 h-24 w-24 rounded-full bg-brand/20 blur-3xl" />
+        <div className="relative grid w-full grid-cols-3 gap-2">
+          {features.map((feature, index) => (
+            <div key={feature.key} className={`rounded-lg p-2 ring-1 ${index === 0 ? "bg-brand/12 text-brand-light ring-brand/25" : "bg-white/[0.035] text-gray-300 ring-white/[0.06]"}`}>
+              {feature.icon}
+              <p className="mt-2 text-[9px] font-semibold leading-tight">{feature.label}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative overflow-hidden rounded-xl bg-[#090b12] p-4 ring-1 ring-white/[0.08]">
+      <div className="absolute -right-10 -top-14 h-40 w-40 rounded-full bg-brand/20 blur-3xl" />
+      <div className="absolute -bottom-16 -left-12 h-36 w-36 rounded-full bg-accent/10 blur-3xl" />
+      <div className="relative">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-gray-500">
+            {t("release.visual.more_control")}
+          </p>
+          <span className="rounded-full bg-accent/10 px-2 py-1 text-[9px] font-semibold text-accent ring-1 ring-accent/20">
+            {t("release.visual.available_now")}
+          </span>
+        </div>
+        <div className="grid grid-cols-3 gap-2.5">
+          {features.map((feature, index) => (
+            <div
+              key={feature.key}
+              className={`min-h-[92px] rounded-xl p-3 ring-1 ${index === 0 ? "bg-brand/12 text-brand-light ring-brand/30" : "bg-white/[0.035] text-gray-300 ring-white/[0.06]"}`}
+            >
+              <div className={`grid h-8 w-8 place-items-center rounded-lg ${index === 0 ? "bg-brand/20" : "bg-white/[0.05]"}`}>
+                {feature.icon}
+              </div>
+              <p className="mt-3 text-[11px] font-semibold leading-tight text-white">{feature.label}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function MediaVisual({ entry, compact = false }) {
   const isVideo = (entry.media || "").endsWith(".mp4");
   if (!entry.media) return <TranscriptionVisual compact={compact} />;
@@ -198,6 +281,7 @@ function MediaVisual({ entry, compact = false }) {
 }
 
 export default function ReleaseVisual({ entry, compact = false }) {
+  if (entry?.visual === "control") return <ControlVisual compact={compact} />;
   if (entry?.visual === "textcase") return <TextCaseVisual compact={compact} />;
   if (entry?.visual === "cinema") return <CinemaVisual compact={compact} />;
   if (entry?.visual === "media") return <MediaVisual entry={entry} compact={compact} />;

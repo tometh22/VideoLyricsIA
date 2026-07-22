@@ -65,6 +65,13 @@ describe("WhatsNewModal", () => {
     expect(screen.getByText("Abc")).toBeInTheDocument();
   });
 
+  it("resume las tres novedades del release cuando visual=control", () => {
+    setup({ visual: "control" });
+    expect(screen.getByText("release.visual.official_lyrics")).toBeInTheDocument();
+    expect(screen.getByText("release.visual.new_editor")).toBeInTheDocument();
+    expect(screen.getByText("release.visual.background_library")).toBeInTheDocument();
+  });
+
   it("renderiza video si visual=media y la entrada trae mp4", () => {
     const { container } = setup({ visual: "media", media: "/escenas_demo.mp4" });
     const video = container.querySelector("video");
