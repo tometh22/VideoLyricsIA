@@ -2354,6 +2354,14 @@ export default function UploadZone({
                 </svg>
                 {t("upload.bg_auto_desc") || "AI will generate a unique background based on the song's mood and lyrics."}
               </p>
+              {/* Copy honesto de no-convergencia (incidente Gaby 2026-07-08:
+                  3 regens "a ver si sale", cada una una escena distinta).
+                  Nombrar el comportamiento acá evita descubrirlo a $0.90
+                  el intento: la IA NO refina, reinterpreta. */}
+              <p className="text-[11px] text-amber-300/80 mt-2">
+                {t("upload.bg_ai_nonconverge_hint") ||
+                  "La IA reinterpreta la canción en cada generación: sin indicaciones, cada intento puede dar una escena totalmente distinta. Para un resultado exacto usá la Biblioteca o escribí tu propio prompt."}
+              </p>
             </div>
           )}
 

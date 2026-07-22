@@ -2789,6 +2789,13 @@ export default function App() {
           backgroundMode: r.backgroundMode,
           movementStyle: r.movementStyle,
           segments: editedSegments,
+          // Pick de biblioteca en edit mode (PR #940 backend): la grilla
+          // del paso de fondo YA escribía backgroundId en App, pero el
+          // submit lo ignoraba — el operador "elegía" un fondo que nunca
+          // viajaba. Solo cuenta con el tab Library activo; volver a
+          // "IA Auto" lo anula (null → sin bucket → mantener fondo).
+          editBackgroundId:
+            (bgSelectMode === "library" && backgroundId) ? backgroundId : null,
         };
 
         const diff = computeFieldDiff(r.baseline, current);
@@ -2805,20 +2812,22 @@ export default function App() {
         }
 
         // Pick edit_type by priority — el más complejo de los presentes.
-        // background regen Veo (paid), lyrics re-renderiza con nuevos
-        // segments, metadata sólo title card, typography el último.
-        const PRIORITY = ["background", "lyrics", "metadata", "typography"];
+        // background_library (swap curado, $0, sin slot) supersede al
+        // regen IA; background regen Veo (paid), lyrics re-renderiza con
+        // nuevos segments, metadata sólo title card, typography el último.
+        const PRIORITY = ["background_library", "background", "lyrics", "metadata", "typography"];
         let chosenType = PRIORITY.find((k) => diff[k]);
 
-        // Backend gates: typography y background solo aceptan jobs en
-        // pending_review (main.py:7444). Para done/rejected:
+        // Backend gates: typography y background/background_library solo
+        // aceptan jobs en pending_review (main.py). Para done/rejected:
         //   - bg standalone: backend rechaza. Surface error claro.
         //   - typography standalone: piggyback en una lyrics edit usando
         //     los segments actuales (font/case/etc son ungated, se
         //     aplican en cualquier edit_type).
         const isPendingReview = r.jobStatus === "pending_review";
         if (!isPendingReview) {
-          if (chosenType === "background" && presentBuckets.length === 1) {
+          const _bgType = chosenType === "background" || chosenType === "background_library";
+          if (_bgType && presentBuckets.length === 1) {
             alert({
               title: t("edit.bg_locked_done_title") || "No se puede regenerar el fondo",
               description: t("edit.bg_locked_done_desc") ||
@@ -2827,9 +2836,11 @@ export default function App() {
             });
             return;
           }
-          if (chosenType === "background") {
+          if (_bgType) {
             // bg + otra cosa: bajar a la siguiente prioridad permitida.
-            chosenType = PRIORITY.slice(1).find((k) => diff[k] && k !== "background");
+            chosenType = PRIORITY.find(
+              (k) => diff[k] && k !== "background" && k !== "background_library",
+            );
           }
           if (chosenType === "typography") {
             // Convertir a lyrics edit. Necesita segments — usar el snapshot
@@ -2859,6 +2870,7 @@ export default function App() {
         if (diff.typography) Object.assign(payload, diff.typography);
         if (diff.lyrics) Object.assign(payload, diff.lyrics);
         if (diff.background) Object.assign(payload, diff.background);
+        if (diff.background_library) Object.assign(payload, diff.background_library);
 
         const doPost = async (body) => {
           const res = await authFetch(`${API}/edit/${editedJobId}`, {

@@ -293,3 +293,40 @@ describe("buildEditPayloads", () => {
     expect(payloads[0].edit_type).toBe("lyrics");
   });
 });
+
+// ── background_library (PR #940 backend) ─────────────────────────────────
+describe("computeFieldDiff — background_library", () => {
+  it("un pick de biblioteca produce el bucket con background_id", () => {
+    const base = baselineFixture();
+    const cur = { ...base, editBackgroundId: 42 };
+    const diff = computeFieldDiff(base, cur);
+    expect(diff.background_library).toEqual({ background_id: 42 });
+  });
+
+  it("es mutuamente excluyente con background: el pick supersede el hint", () => {
+    const base = baselineFixture();
+    const cur = {
+      ...base,
+      editBackgroundId: 7,
+      backgroundHint: "montaña al amanecer",
+    };
+    const diff = computeFieldDiff(base, cur);
+    expect(diff.background_library).toEqual({ background_id: 7 });
+    expect(diff.background).toBeUndefined();
+  });
+
+  it("sin pick (null/undefined) no hay bucket — mantener fondo actual", () => {
+    const base = baselineFixture();
+    expect(computeFieldDiff(base, { ...base, editBackgroundId: null }))
+      .toEqual({});
+    expect(computeFieldDiff(base, { ...base })).toEqual({});
+  });
+
+  it("solo hint sin pick sigue produciendo el bucket background normal", () => {
+    const base = baselineFixture();
+    const cur = { ...base, backgroundHint: "bosque nevado", editBackgroundId: null };
+    const diff = computeFieldDiff(base, cur);
+    expect(diff.background).toEqual({ background_hint: "bosque nevado" });
+    expect(diff.background_library).toBeUndefined();
+  });
+});
