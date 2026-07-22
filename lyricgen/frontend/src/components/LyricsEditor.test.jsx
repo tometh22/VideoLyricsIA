@@ -2,12 +2,11 @@
 // agus.cafisi / Una Vez Más audit (2026-05-18). Each test reproduces
 // one bug behaviorally; the test file MUST fail on bug code and pass
 // once the fix lands.
-import { render, screen, cleanup, fireEvent, within } from "@testing-library/react";
+import { render, screen, cleanup, fireEvent, within, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { useState, useCallback, useRef } from "react";
 import LyricsEditor from "./LyricsEditor";
-import { segmentsValuesEqual } from "../lib/segmentsValuesEqual";
+import { segmentsStore } from "../state/segmentsStore";
 
 // useI18n + OnboardingTour pull in joyride / locale loading we don't
 // need for these unit tests. Mock them to noops so the editor renders
@@ -45,7 +44,12 @@ function baseProps(overrides = {}) {
   };
 }
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  // PR E: el store por jobId es a nivel módulo — limpiar entre tests para
+  // que un test con transcribeJobId no leakee segments al siguiente.
+  segmentsStore._clearAll();
+});
 
 // jsdom does not run audio: HTMLMediaElement.currentTime is a real
 // number setter, but `timeupdate` events don't fire automatically.
@@ -162,31 +166,48 @@ describe("LyricsEditor — scrub bar click reliability (2026-05-26)", () => {
 });
 
 
-describe("LyricsEditor — prop sync (B7)", () => {
-  // BUG: the component initialises `edited` from `segments` only on
-  // mount (useState(initial) ignores subsequent prop changes). When
-  // the parent re-mounts the editor on a different job, OR passes a
-  // freshly-fetched segments array from a refresh, the editor keeps
-  // showing the stale array forever.
-  //
-  // Expected behaviour: when `segments` reference changes, `edited`
-  // resets to mirror it. Operator's in-flight edits (`isDirty`) are
-  // also reset — the contract is "new prop = new starting point".
-  it("re-syncs displayed text when segments prop changes", () => {
-    const propsA = baseProps({
+describe("LyricsEditor — reemplazo externo post-mount (ex prop-sync B7)", () => {
+  // HISTORIA: B7 (2026-05-18) era "el prop `segments` cambió → re-seed".
+  // Ese contrato creó el loop bidireccional del reseed-storm y murió en
+  // PR E: el prop es SOLO el seed inicial. El reemplazo externo legítimo
+  // (undo restore, re-fetch de segments_json, otro contenido para el
+  // mismo job) va por segmentsStore.replace(jobId, segs) y el editor —
+  // suscripto al store — lo refleja al instante.
+  it("muestra el contenido nuevo cuando el reemplazo llega por segmentsStore.replace", () => {
+    const props = baseProps({
       segments: [{ start: 1.0, end: 2.0, text: "alpha line" }],
+      transcribeJobId: "job-b7",
     });
-    const { rerender } = render(<LyricsEditor {...propsA} />);
+    render(<LyricsEditor {...props} />);
     expect(screen.getByDisplayValue("alpha line")).toBeInTheDocument();
 
-    const propsB = baseProps({
-      segments: [{ start: 1.0, end: 2.0, text: "beta line" }],
+    act(() => {
+      segmentsStore.replace("job-b7", [
+        { start: 1.0, end: 2.0, text: "beta line" },
+      ]);
     });
-    rerender(<LyricsEditor {...propsB} />);
-    // On the buggy build, the textbox still shows "alpha line"
-    // because `edited` was initialised in useState() and never re-read.
     expect(screen.getByDisplayValue("beta line")).toBeInTheDocument();
     expect(screen.queryByDisplayValue("alpha line")).not.toBeInTheDocument();
+  });
+
+  it("un cambio del prop `segments` post-mount se IGNORA (el prop es solo seed)", () => {
+    const propsA = baseProps({
+      segments: [{ start: 1.0, end: 2.0, text: "alpha line" }],
+      transcribeJobId: "job-b7",
+    });
+    const { rerender } = render(<LyricsEditor {...propsA} />);
+    rerender(
+      <LyricsEditor
+        {...baseProps({
+          segments: [{ start: 1.0, end: 2.0, text: "beta line" }],
+          transcribeJobId: "job-b7",
+        })}
+      />,
+    );
+    // El prop stale no pisa el estado vivo — esa era la mitad del bug
+    // "se borran los tiempos al navegar el wizard".
+    expect(screen.getByDisplayValue("alpha line")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("beta line")).not.toBeInTheDocument();
   });
 });
 
@@ -400,14 +421,15 @@ describe("LyricsEditor — Enter-to-split is word-aware (2026-06-05)", () => {
   };
 
   it("splits at the cursor with REAL word timing on both halves", () => {
-    const onEditedChange = vi.fn();
-    render(<LyricsEditor {...baseProps({ segments: [seg], onEditedChange })} />);
+    // PR E: onEditedChange murió — el resultado del split se observa
+    // directo en el segmentsStore (la fuente de verdad viva del editor).
+    render(<LyricsEditor {...baseProps({ segments: [seg], transcribeJobId: "job-split" })} />);
     const input = screen.getByDisplayValue("tengo una mala noticia No");
     const caret = "tengo una mala noticia ".length; // 23, right before "No"
     input.setSelectionRange(caret, caret);
     fireEvent.keyDown(input, { key: "Enter" });
 
-    const out = onEditedChange.mock.calls.at(-1)[0];
+    const out = segmentsStore.get("job-split");
     expect(out).toHaveLength(2);
     expect(out[0].text).toBe("tengo una mala noticia");
     expect(out[1].text).toBe("No");
@@ -425,33 +447,29 @@ describe("LyricsEditor — Enter-to-split is word-aware (2026-06-05)", () => {
   // fusionaba con cualquier Backspace en pos 0, así que borrar la primera palabra
   // hacía "desaparecer" la línea (confuso). Dos casos:
   it("does NOT merge a NON-empty line on Backspace at line start", () => {
-    const onEditedChange = vi.fn();
     const segs = [
       { start: 10.0, end: 11.8, text: "tengo una mala noticia",
         words: [{ word: "tengo", start: 10.0, end: 10.4 }, { word: "noticia", start: 11.0, end: 11.8 }] },
       { start: 12.5, end: 12.9, text: "No",
         words: [{ word: "No", start: 12.5, end: 12.9 }] },
     ];
-    render(<LyricsEditor {...baseProps({ segments: segs, onEditedChange })} />);
+    render(<LyricsEditor {...baseProps({ segments: segs, transcribeJobId: "job-merge" })} />);
     const input = screen.getByDisplayValue("No");
     input.setSelectionRange(0, 0);
     fireEvent.keyDown(input, { key: "Backspace" });
 
     // "No" tiene texto → NO se fusiona. Siguen siendo 2 líneas.
-    const calls = onEditedChange.mock.calls;
-    const last = calls.length ? calls.at(-1)[0] : segs;
-    expect(last).toHaveLength(2);
+    expect(segmentsStore.get("job-merge")).toHaveLength(2);
   });
 
   it("merges an EMPTY line into the previous via Backspace at line start", () => {
-    const onEditedChange = vi.fn();
     const segs = [
       { start: 10.0, end: 11.8, text: "tengo una mala noticia",
         words: [{ word: "tengo", start: 10.0, end: 10.4 }, { word: "noticia", start: 11.0, end: 11.8 }] },
       { start: 12.5, end: 12.9, text: "No",
         words: [{ word: "No", start: 12.5, end: 12.9 }] },
     ];
-    render(<LyricsEditor {...baseProps({ segments: segs, onEditedChange })} />);
+    render(<LyricsEditor {...baseProps({ segments: segs, transcribeJobId: "job-merge" })} />);
     const input = screen.getByDisplayValue("No");
     // Vaciar la línea primero (el operador borró todo el texto).
     fireEvent.change(input, { target: { value: "" } });
@@ -459,7 +477,7 @@ describe("LyricsEditor — Enter-to-split is word-aware (2026-06-05)", () => {
     fireEvent.keyDown(input, { key: "Backspace" });
 
     // Línea vacía + Backspace → se une a la anterior (queda 1 línea).
-    const out = onEditedChange.mock.calls.at(-1)[0];
+    const out = segmentsStore.get("job-merge");
     expect(out).toHaveLength(1);
     expect(out[0].start).toBe(10.0);
   });
@@ -518,101 +536,93 @@ describe("LyricsEditor — durable save on page unload (refresh/close) (2026-06-
   });
 });
 
-describe("LyricsEditor — reseed-storm fix is end-to-end (integration proof of #724)", () => {
-  // ACTIVE PROOF of #724 that doesn't depend on real users hitting the bug.
-  // The reseed-storm / data-loss root cause: the backend sorts segments by
-  // `start` on every /save-segments write, so the writeback hands the editor a
-  // segments prop with the SAME values in a DIFFERENT order than the local
-  // out-of-order array. The OLD positional segmentsValuesEqual saw that as
-  // "new content" → reseeded `edited` from the prop → the operator's in-flight
-  // edit got clobbered (and, repeated every autosave cycle, the flicker loop).
-  //
-  // This test reproduces exactly that: edit a line locally, then push a
-  // reordered-but-equal segments prop. With #724 the guard treats it as equal
-  // and SKIPS the reseed, so the local edit survives. On the pre-#724 build
-  // this test fails — the edit is replaced by the reordered original.
-  it("a reordered-but-equal segments writeback does NOT clobber a local edit", () => {
-    const ordered = [
-      { start: 0, end: 3, text: "alpha line" },
-      { start: 3, end: 5, text: "beta line" },
-      { start: 5, end: 8, text: "gamma line" },
-    ];
-    const { rerender } = render(<LyricsEditor {...baseProps({ segments: ordered })} />);
+// NOTE (PR E adversarial audit, 2026-07): acá vivía el describe "integration
+// proof of #724" ("a reordered-but-equal segments writeback does NOT clobber a
+// local edit"). Corría SIN transcribeJobId → useState local → el prop se
+// ignoraba → pasaba trivialmente (no probaba nada post-PR-E). Se BORRÓ: post-PR
+// E el prop `segments` es sólo seed inicial y nunca se re-lee, así que la
+// insensibilidad al reorder la cubre trivialmente el test "ecos de prop son
+// inertes" de abajo, que además usa un jobId real y afirma cero remounts.
 
-    // Operator edits the first line locally (changes `edited`, not the prop).
-    const input = screen.getByDisplayValue("alpha line");
+describe("LyricsEditor — los ecos de prop son inertes (P0 titileo, era post-PR E)", () => {
+  // HISTORIA: el storm original nacía del loop bidireccional — App
+  // espejaba cada edición local de vuelta como prop (onEditedChange →
+  // mergeEditedSegments → currentReview.segments) y el effect de
+  // prop-sync podía verlo como "contenido nuevo" y reseedear (remount de
+  // todas las filas, 6-7×/s). PR E elimina AMBAS mitades: no hay espejo
+  // (onEditedChange no existe) y no hay prop-sync (el prop es solo seed).
+  // Este test protege la nueva invariante: aunque un padre legacy
+  // re-pase lo editado como prop en cada render, el editor no reseedea,
+  // no re-monta filas y no pierde la edición.
+  it("re-pasar lo editado como prop no reseedea ni re-monta filas", () => {
+    const props = baseProps({
+      segments: [
+        { start: 0, end: 2, text: "alpha" },
+        { start: 2, end: 4, text: "beta" },
+      ],
+      transcribeJobId: "job-echo",
+      onPersistSegments: vi.fn().mockResolvedValue({ ok: true }),
+    });
+    const { rerender } = render(<LyricsEditor {...props} />);
+
+    const input = screen.getByDisplayValue("alpha");
     fireEvent.change(input, { target: { value: "alpha EDITED" } });
-    expect(screen.getByDisplayValue("alpha EDITED")).toBeInTheDocument();
+    const editedNode = screen.getByDisplayValue("alpha EDITED");
+    const betaNode = screen.getByDisplayValue("beta");
 
-    // Backend roundtrip: same values, sorted differently, fresh reference —
-    // the exact shape that used to trigger the destructive reseed.
-    const reorderedSameValues = [
-      { start: 5, end: 8, text: "gamma line" },
-      { start: 0, end: 3, text: "alpha line" },
-      { start: 3, end: 5, text: "beta line" },
-    ];
-    rerender(<LyricsEditor {...baseProps({ segments: reorderedSameValues })} />);
+    // El "eco" del padre legacy: lo que se muestra, de vuelta como prop
+    // (nueva referencia en cada render — el gatillo histórico del storm).
+    const echo = segmentsStore.get("job-echo").map(({ _id, review, ...rest }) => rest);
+    rerender(<LyricsEditor {...props} segments={echo} />);
+    rerender(<LyricsEditor {...props} segments={[...echo]} />);
 
-    // The local edit must survive (guard skipped the reseed). On the buggy
-    // build, "alpha EDITED" is gone and the original "alpha line" is back.
-    expect(screen.getByDisplayValue("alpha EDITED")).toBeInTheDocument();
-    expect(screen.queryByDisplayValue("alpha line")).not.toBeInTheDocument();
+    // La edición sigue en pantalla y los nodos DOM son LOS MISMOS
+    // (cero remounts — sin eso, el drag en curso moría y el editor
+    // "titilaba").
+    expect(screen.getByDisplayValue("alpha EDITED")).toBe(editedNode);
+    expect(screen.getByDisplayValue("beta")).toBe(betaNode);
   });
 });
 
-describe("LyricsEditor — no reseed storm from the editor's own edit echo (P0 titileo)", () => {
-  // Reproduces the production storm that #724 did NOT fix (Sentry: [reseed-storm]
-  // perSec 6-7 on release 0ffa76f, which already has #724). App.jsx mirrors every
-  // local edit up to currentReview.segments (onEditedChange → mergeEditedSegments)
-  // and feeds it straight back as the `segments` prop. During editing the
-  // prop-sync effect compared that echo against a one-tick-stale ref → saw it as
-  // new content → reseeded `edited` (reassigning _id by index → rows REMOUNT) on
-  // every edit → "titila todo el editor". The fix compares the echo against the
-  // LIVE `edited`, recognises it, and skips the reseed.
-  //
-  // Detection: a reseed calls setEdited, which re-fires the onEditedChange mirror.
-  // So a single user edit that triggers a reseed produces an EXTRA mirror call
-  // (the echo of the reseed). No reseed → exactly one mirror call per edit.
-  function MirrorHarness({ onMirror }) {
-    const [segments, setSegments] = useState([
-      { start: 0, end: 2, text: "alpha" },
-      { start: 2, end: 4, text: "beta" },
+describe("LyricsEditor — editar NO retroalimenta al padre (guard anti-loop, reemplaza reviewSegments.test.js)", () => {
+  // El incidente #6 (loop de ~5000 ciclos): el viejo espejo onEditedChange
+  // empujaba cada keystroke al padre → currentReview.segments → prop
+  // `segments` → posible reseed → otro render → ... PR E cortó el espejo:
+  // el editor escribe SOLO al segmentsStore y el padre NO se entera del edit.
+  // Este test protege esa invariante: tras un edit, ni el objeto `segments`
+  // que pasó el padre cambia (no hay mutación/writeback) ni el padre
+  // re-renderiza (no hay canal de vuelta que dispare el loop).
+  it("un edit no muta el prop `segments` ni re-renderiza al padre", () => {
+    let parentRenders = 0;
+    // Referencia ESTABLE del prop, congelada, como la pasaría App desde
+    // currentReview.segments (seed). Si algo la mutara o el padre re-render-
+    // eara por el edit, lo detectamos.
+    const parentSegments = Object.freeze([
+      Object.freeze({ start: 0, end: 2, text: "alpha" }),
+      Object.freeze({ start: 2, end: 4, text: "beta" }),
     ]);
-    // STABLE identity, exactly like App.jsx's `useCallback(..., [])` handler —
-    // otherwise an inline arrow re-fires the editor's [edited, onEditedChange]
-    // effect on every render and masks the reseed signal.
-    const onMirrorRef = useRef(onMirror);
-    onMirrorRef.current = onMirror;
-    const handleMirror = useCallback((segs) => {
-      onMirrorRef.current(segs);
-      // Faithful to App.jsx mergeEditedSegments: no-op when values are equal,
-      // else store the edited values straight back as the prop (the loop).
-      setSegments((prev) => (segmentsValuesEqual(prev, segs) ? prev : segs));
-    }, []);
-    return (
-      <LyricsEditor
-        {...baseProps({
-          segments,
-          transcribeJobId: "job-1",
-          onPersistSegments: vi.fn().mockResolvedValue({ ok: true }),
-        })}
-        onEditedChange={handleMirror}
-      />
-    );
-  }
+    const snapshotBefore = JSON.stringify(parentSegments);
 
-  it("a single edit triggers exactly one mirror call — no self-echo reseed", () => {
-    const onMirror = vi.fn();
-    render(<MirrorHarness onMirror={onMirror} />);
+    function Parent() {
+      parentRenders += 1;
+      return (
+        <LyricsEditor
+          {...baseProps({ segments: parentSegments, transcribeJobId: "job-noloop" })}
+        />
+      );
+    }
 
-    const baseline = onMirror.mock.calls.length; // mount fires the mirror once
+    render(<Parent />);
+    expect(parentRenders).toBe(1);
+
     const input = screen.getByDisplayValue("alpha");
     fireEvent.change(input, { target: { value: "alpha EDITED" } });
+    fireEvent.change(input, { target: { value: "alpha EDITED 2" } });
+    expect(screen.getByDisplayValue("alpha EDITED 2")).toBeInTheDocument();
 
-    // One user edit = one mirror call. On the buggy build the echo reseeds and
-    // setEdited re-fires the mirror → 2+ calls (the storm, one bounce per edit).
-    expect(onMirror.mock.calls.length - baseline).toBe(1);
-    // And the edit is shown (sanity).
-    expect(screen.getByDisplayValue("alpha EDITED")).toBeInTheDocument();
+    // Sin espejo: el prop del padre no fue mutado y el padre no re-renderizó
+    // (cero canal de retroalimentación → cero loop).
+    expect(JSON.stringify(parentSegments)).toBe(snapshotBefore);
+    expect(parentRenders).toBe(1);
   });
 });
