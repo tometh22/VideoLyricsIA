@@ -3,7 +3,7 @@ import { useI18n } from "../i18n";
 import Listbox from "./Listbox";
 import { UploadTour } from "./OnboardingTour";
 import WizardLivePreview from "./WizardLivePreview";
-import TitleCardPreview from "./TitleCardPreview";
+import TitleCardPreview, { AUTO_INTRO_THRESHOLD_S } from "./TitleCardPreview";
 import HelpTip from "./HelpCenter/HelpTip";
 import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
@@ -3701,6 +3701,32 @@ export default function UploadZone({
                         );
                       })}
                     </div>
+                    {/* Nudge de descubribilidad (incidente Clari 19-jul, "no
+                        encuentro dónde modificarlo"): cuando "Auto" va a
+                        resolver al badge chico porque el tema canta enseguida,
+                        el operador NO entiende por qué su título salió chico.
+                        Le nombramos el motivo y el camino al título grande —
+                        el override "Centro" YA existe y llega al render. */}
+                    {(batchDefaults.titleTemplate || "auto") === "auto" &&
+                      typeof _firstLyricStart === "number" &&
+                      _firstLyricStart <= AUTO_INTRO_THRESHOLD_S && (
+                      <div className="mt-2 flex items-start gap-2 rounded-lg bg-amber-500/[0.07] ring-1 ring-amber-500/25 px-3 py-2">
+                        <svg className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+                          <circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" strokeLinecap="round" />
+                        </svg>
+                        <p className="text-[11px] text-amber-200/90 leading-snug flex-1">
+                          {t("upload.titlecard_auto_badge_hint") ||
+                            "Este tema canta enseguida, así que “Auto” usa el título compacto para no pisar la letra."}{" "}
+                          <button
+                            type="button"
+                            onClick={() => updateBatchDefault("titleTemplate", "centered")}
+                            className="text-amber-100 underline decoration-amber-400/40 hover:decoration-amber-200 font-medium"
+                          >
+                            {t("upload.titlecard_use_centered") || "Usar el título grande (Centro)"}
+                          </button>
+                        </p>
+                      </div>
+                    )}
                   </div>
 
                   {/* Size — quick presets show their relative scale via the
