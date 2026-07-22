@@ -13,7 +13,7 @@
  * (onLayoutChange → setEdited) — this component owns no persistence.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { REF_W, tierForLength, clampFontScale, fontSizeFactor } from "../lib/lyricTiers";
+import { REF_W, tierForLength, lyricFontPx, FADE_SECONDS } from "../lib/lyricTiers";
 
 // Font fidelity: the render (ass_render.lyric_fontsize + pipeline wrap tiers)
 // sizes each line by CHARACTER COUNT and wraps it at a tier-specific width,
@@ -59,9 +59,8 @@ const CONTRAST_STYLES = {
   strong: { WebkitTextStroke: "1.5px #000", textShadow: "-1px -1px 0 #000, 1px 1px 0 #000, 0 2px 0 #000" },
 };
 
-// Fade duration per transition (seconds), mirroring ass_render.fade_seconds.
-// cut = hard in/out; capped to dur/3 so short lines never fade the whole time.
-const FADE_SECONDS = { cut: 0, fade: 0.15, fade_slow: 0.3 };
+// FADE_SECONDS ahora vive en lib/lyricTiers.js (compartido con el test de
+// paridad JS↔Python contra shared/renderParity.json).
 
 export default function LyricVideoPreview({
   segments,           // [{_id, start, end, text, pos?, scale?, rot?}]
@@ -229,9 +228,11 @@ export default function LyricVideoPreview({
     ? activeSegs.map((s) => applyCase(s.text, textCase)).join("\n")
     : "";
   const tier = tierForLength(displayText.length);
-  // Render size = tier × per-line scale × global font_scale (clamped like the
-  // backend), as a fraction of the 1920 frame width → cqw.
-  const fsPx = l ? `${(tier.fontPx / REF_W) * 100 * l.scale * clampFontScale(fontScale) * fontSizeFactor(font)}cqw` : undefined;
+  // Render size = lyricTiers.lyricFontPx (tier × global font_scale clampeado
+  // × factor por familia, idéntico al render y guardado por renderParity.test)
+  // × per-line scale (override del operador, fuera de lyric_fontsize), como
+  // fracción del frame de 1920 → cqw.
+  const fsPx = l ? `${(lyricFontPx(displayText.length, fontScale, font) / REF_W) * 100 * l.scale}cqw` : undefined;
   const wrapMaxCqw = `${(tier.wrapPx / REF_W) * 100}cqw`;
 
   // Fade-in/out opacity so the chosen transition is visible while scrubbing

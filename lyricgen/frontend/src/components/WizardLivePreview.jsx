@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
-import { REF_W, tierForLength, fontSizeFactor } from "../lib/lyricTiers";
+import { REF_W, lyricFontPx } from "../lib/lyricTiers";
 import { activeWordIndex } from "../lib/karaokeTiming";
 import { FONT_BY_CODE, applyCase } from "./fontCatalog";
 
@@ -236,21 +236,20 @@ export default function WizardLivePreview({
   const sample = applyCase(t("upload.preview_sample") || "esta es tu letra", textCase);
   // Typography resolved values:
   // - fontInfo: { css, weight } o defaults Auto (no override).
-  // - scaleN: clamp 0.6–1.5 (mismo rango que LyricVideoPreview).
-  // - baseFontSize: el clamp(18px,7.5cqw,68px) histórico, escalado por scaleN.
+  // - baseFontSize: lyricTiers.lyricFontPx (tier por largo × font_scale
+  //   clampeado 0.6–1.5 × factor por familia) → cqw. Idéntico al render;
+  //   guardado por lib/renderParity.test.js sobre shared/renderParity.json.
   // - contrastStyle: outline + shadow del CONTRAST_STYLES.
   const fontInfo = FONT_BY_CODE[font] || FONT_BY_CODE[""];
-  const scaleN = Math.max(0.6, Math.min(1.5, parseFloat(fontScale) || 1));
   // WYSIWYG font size (2026-06-04): mirror the render's lyric_fontsize EXACTLY
   // instead of a fixed 7.5cqw (which previewed ~1.5× too big and ignored line
-  // length). Render = tier-by-character-count (ass_render.lyric_fontsize) ×
-  // font_scale × per-font factor, in PlayResY=1080 → cqw = fontPx / REF_W × 100
-  // (fraction of the 1920-wide frame, matching LyricVideoPreview). Length comes
-  // from the actual displayed text — the live line if playing, else the sample.
+  // length). PlayResY=1080 → cqw = fontPx / REF_W × 100 (fraction of the
+  // 1920-wide frame, matching LyricVideoPreview). Length comes from the
+  // actual displayed text — the live line if playing, else the sample.
   const _dispText = (livePlaybackTick && livePlaybackTick.activeLine)
     ? applyCase(livePlaybackTick.activeLine, textCase)
     : sample;
-  const baseFontSize = `${((tierForLength(_dispText.length).fontPx / REF_W) * 100 * scaleN * fontSizeFactor(font)).toFixed(3)}cqw`;
+  const baseFontSize = `${((lyricFontPx(_dispText.length, fontScale, font) / REF_W) * 100).toFixed(3)}cqw`;
   const contrastStyle = CONTRAST_STYLES[textContrast] || CONTRAST_STYLES.medium;
   const moveLabel = {
     "": t("upload.movement_auto") || "Auto",
