@@ -439,7 +439,13 @@ export default function UploadZone({
   // Art Track gateado por tenant (default OFF salvo admin). Si no califica,
   // no mostramos el selector de tipo de video (queda solo lyric, como antes
   // de la feature) y reseteamos artTrack si vino prendido de un estado viejo.
-  const artTrackEligible = user?.features?.art_track === true || user?.role === "admin";
+  // Kill-switch de build: Art Track NO va a producción (2026-07-22). El build
+  // de prod (genly.pro) no setea VITE_ART_TRACK_ENABLED → la feature queda
+  // totalmente oculta (ni admins la ven). Se habilita por entorno para testeo
+  // (staging: VITE_ART_TRACK_ENABLED=true); ahí sigue gateada por feature/admin.
+  const ART_TRACK_ENABLED = import.meta.env.VITE_ART_TRACK_ENABLED === "true";
+  const artTrackEligible =
+    ART_TRACK_ENABLED && (user?.features?.art_track === true || user?.role === "admin");
   useEffect(() => {
     if (artTrack && !artTrackEligible) onArtTrackChange?.(false);
   }, [artTrack, artTrackEligible]);
