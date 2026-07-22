@@ -7,6 +7,7 @@ import TitleCardPreview from "./TitleCardPreview";
 import HelpTip from "./HelpCenter/HelpTip";
 import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
+import { CONCEPT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -799,13 +800,22 @@ export default function UploadZone({
   // pan lateral. Cada card lleva metadata `kind` (video|image|auto) +
   // emoji prefix (🎬 vs 🖼) en la descripción para que el operador vea
   // de un vistazo cuál es video real vs foto IA con paneo.
+  // Los CÓDIGOS viven en lib/catalogCodes.js (contrato de paridad con
+  // pipeline._MOVEMENT_STYLE_RULES, asertado por renderParity.test.js);
+  // acá solo la metadata de UI por código.
+  const MOVEMENT_META = {
+    estatico:        { kind: "video", label: t("upload.movement_estatico") || "Estático (escena viva)",     sample: "/movement_samples/estatico.mp4",  desc: t("upload.movement_estatico_desc") || "🎬 Escena real con cámara FIJA. Lo que se mueve son los elementos de la escena (gente, olas, nubes, neblina, fuego)." },
+    sutil:           { kind: "video", label: t("upload.movement_sutil") || "Sutil (cámara apenas drift)",   sample: "/movement_samples/sutil.mp4",     desc: t("upload.movement_sutil_desc") || "🎬 Escena real con drift sutil de cámara + motion in-scene. Calmo pero vivo." },
+    estandar:        { kind: "video", label: t("upload.movement_estandar") || "Estándar (cinematográfico)", sample: "/movement_samples/estandar.mp4",  desc: t("upload.movement_estandar_desc") || "🎬 Escena real con movimiento cinematográfico de cámara (zoom/drift)." },
+    "foto-parallax": { kind: "image", label: t("upload.movement_foto_parallax") || "Foto fija",             sample: "/movement_samples/foto-fija.jpg", desc: t("upload.movement_parallax_desc") || "Foto IA fija (sin movimiento de cámara). Sumale un efecto abajo —lluvia, nieve, luces— para darle vida." },
+    animado:         { kind: "video", label: t("upload.movement_animado") || "Animado (ilustración)",       sample: "/movement_samples/animado.mp4",   desc: t("upload.movement_animado_desc") || "🎬 Ilustración 2D estilizada animada, no fotorrealista." },
+  };
   const MOVEMENT_STYLES = [
-    { code: "",              kind: "auto",  label: t("upload.movement_auto") || "Auto",                                  sample: null,                                  desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
-    { code: "estatico",      kind: "video", label: t("upload.movement_estatico") || "Estático (escena viva)",            sample: "/movement_samples/estatico.mp4",       desc: t("upload.movement_estatico_desc") || "🎬 Escena real con cámara FIJA. Lo que se mueve son los elementos de la escena (gente, olas, nubes, neblina, fuego)." },
-    { code: "sutil",         kind: "video", label: t("upload.movement_sutil") || "Sutil (cámara apenas drift)",          sample: "/movement_samples/sutil.mp4",          desc: t("upload.movement_sutil_desc") || "🎬 Escena real con drift sutil de cámara + motion in-scene. Calmo pero vivo." },
-    { code: "estandar",      kind: "video", label: t("upload.movement_estandar") || "Estándar (cinematográfico)",        sample: "/movement_samples/estandar.mp4",       desc: t("upload.movement_estandar_desc") || "🎬 Escena real con movimiento cinematográfico de cámara (zoom/drift)." },
-    { code: "foto-parallax", kind: "image", label: t("upload.movement_foto_parallax") || "Foto fija",                     sample: "/movement_samples/foto-fija.jpg",      desc: t("upload.movement_parallax_desc") || "Foto IA fija (sin movimiento de cámara). Sumale un efecto abajo —lluvia, nieve, luces— para darle vida." },
-    { code: "animado",       kind: "video", label: t("upload.movement_animado") || "Animado (ilustración)",              sample: "/movement_samples/animado.mp4",       desc: t("upload.movement_animado_desc") || "🎬 Ilustración 2D estilizada animada, no fotorrealista." },
+    { code: "", kind: "auto", label: t("upload.movement_auto") || "Auto", sample: null, desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
+    ...MOVEMENT_CODES.map((code) => ({
+      code,
+      ...(MOVEMENT_META[code] || { kind: "video", label: code, sample: null, desc: "" }),
+    })),
   ];
 
   // Effect overlay — animated particles composited OVER the background (the
@@ -858,23 +868,28 @@ export default function UploadZone({
   // _CONCEPT_SCENE_GUIDE keys in pipeline.py — keep in sync. UMG asked
   // for this on top of genre because the genre alone wasn't tight enough
   // to control the visual register.
+  // Los CÓDIGOS viven en lib/catalogCodes.js (contrato de paridad con
+  // pipeline._CONCEPT_SCENE_GUIDE, asertado por renderParity.test.js).
+  const CONCEPT_LABELS = {
+    naturaleza:  t("upload.concept_naturaleza") || "Naturaleza",
+    tropical:    t("upload.concept_tropical") || "Tropical",
+    acuatico:    t("upload.concept_acuatico") || "Acuático",
+    ciudad:      t("upload.concept_ciudad") || "Ciudad",
+    urbano:      t("upload.concept_urbano") || "Urbano",
+    industrial:  t("upload.concept_industrial") || "Industrial",
+    abstracto:   t("upload.concept_abstracto") || "Abstracto",
+    cosmico:     t("upload.concept_cosmico") || "Cósmico",
+    atmosferico: t("upload.concept_atmosferico") || "Atmosférico",
+    romantico:   t("upload.concept_romantico") || "Romántico",
+    vintage:     t("upload.concept_vintage") || "Vintage",
+    cinematic:   t("upload.concept_cinematic") || "Cinematic",
+    club:        t("upload.concept_club") || "Club",
+    lujo:        t("upload.concept_lujo") || "Lujo",
+    minimalista: t("upload.concept_minimalista") || "Minimalista",
+  };
   const CONCEPTS = [
-    { code: "",             label: t("upload.concept_auto") || "Auto" },
-    { code: "naturaleza",   label: t("upload.concept_naturaleza") || "Naturaleza" },
-    { code: "tropical",     label: t("upload.concept_tropical") || "Tropical" },
-    { code: "acuatico",     label: t("upload.concept_acuatico") || "Acuático" },
-    { code: "ciudad",       label: t("upload.concept_ciudad") || "Ciudad" },
-    { code: "urbano",       label: t("upload.concept_urbano") || "Urbano" },
-    { code: "industrial",   label: t("upload.concept_industrial") || "Industrial" },
-    { code: "abstracto",    label: t("upload.concept_abstracto") || "Abstracto" },
-    { code: "cosmico",      label: t("upload.concept_cosmico") || "Cósmico" },
-    { code: "atmosferico",  label: t("upload.concept_atmosferico") || "Atmosférico" },
-    { code: "romantico",    label: t("upload.concept_romantico") || "Romántico" },
-    { code: "vintage",      label: t("upload.concept_vintage") || "Vintage" },
-    { code: "cinematic",    label: t("upload.concept_cinematic") || "Cinematic" },
-    { code: "club",         label: t("upload.concept_club") || "Club" },
-    { code: "lujo",         label: t("upload.concept_lujo") || "Lujo" },
-    { code: "minimalista",  label: t("upload.concept_minimalista") || "Minimalista" },
+    { code: "", label: t("upload.concept_auto") || "Auto" },
+    ...CONCEPT_CODES.map((code) => ({ code, label: CONCEPT_LABELS[code] || code })),
   ];
 
   const FONTS = [
