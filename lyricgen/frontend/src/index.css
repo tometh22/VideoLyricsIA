@@ -244,6 +244,15 @@
   }
 }
 
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 @keyframes slide-in-right {
   from { transform: translateX(40px); opacity: 0; }
   to { transform: translateX(0); opacity: 1; }

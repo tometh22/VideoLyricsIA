@@ -2588,12 +2588,17 @@ def _job_scope(current_user: dict) -> dict:
     return {"tenant_id": current_user["tenant_id"]}
 
 
-def _audit_cross_tenant_access(db: Session, current_user: dict, job: dict, kind: str) -> None:
-    """Deja rastro cuando un admin accede a media de OTRO tenant.
+def _audit_cross_tenant_access(db: Session, current_user: dict, job: dict, kind: str,
+                               commit: bool = True) -> None:
+    """Deja rastro cuando un admin accede a media/edición de OTRO tenant.
 
     Parte del contrato de la apertura cross-tenant: la visibilidad de
     plataforma para admins viene con trail de auditoría (compliance UMG).
-    Best-effort: un fallo acá no bloquea el acceso."""
+    Best-effort: un fallo acá no bloquea el acceso.
+
+    `commit=False` para callers que sostienen un `with_for_update()` (p.ej.
+    /edit): un commit intermedio soltaría el row-lock de quota antes de
+    tiempo. En ese caso el AuditLog se persiste con el commit final del flow."""
     try:
         if current_user.get("role") != "admin":
             return
@@ -2609,7 +2614,8 @@ def _audit_cross_tenant_access(db: Session, current_user: dict, job: dict, kind:
                 "kind": kind,
             },
         ))
-        db.commit()
+        if commit:
+            db.commit()
     except Exception as e:
         logger.warning("[AUDIT] cross-tenant access log failed: %s", e)
 
@@ -9205,14 +9211,18 @@ async def get_source_audio_url(
     Owner / same-tenant only — same auth model as /download/<job>/<file>.
     """
     from database import Job as JobModel
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    # Cross-tenant para admins de plataforma: mismo contrato que _job_scope
+    # (pedido CEO 2026-06-11) — el rol admin abre el video de cualquier
+    # cliente para resolver incidentes. Sin bypass, el editor de un tenant
+    # ajeno abría MUDO (audio no disponible) aunque el admin ya podía ver el
+    # job. Acceso auditado (compliance UMG).
+    _audio_q = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        _audio_q = _audio_q.filter(JobModel.tenant_id == current_user["tenant_id"])
+    job = _audio_q.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _audit_cross_tenant_access(db, current_user, job, "source_audio")
 
     # 1. Try the original audio first (best quality, no render artifacts).
     #
@@ -9540,10 +9550,19 @@ async def save_segments(
     from jobs import get_job_model, touch_user_activity
 
     job = get_job_model(db, job_id)
+    # Bypass cross-tenant para admins de plataforma (mismo contrato que
+    # _job_scope): un super admin corrige y GUARDA el job de cualquier
+    # usuario cuando tiene problemas. Sin esto, abrir el editor de un job
+    # ajeno dejaba el autoguardado en 404 permanente ("No pudimos guardar")
+    # y las ediciones no persistían. Para no-admins se mantiene el scope
+    # estricto por dueño + tenant. Acceso auditado (compliance UMG).
+    _is_platform_admin = current_user.get("role") == "admin"
     if (not job
-            or job.user_id != current_user["id"]
-            or job.tenant_id != current_user["tenant_id"]):
+            or (not _is_platform_admin
+                and (job.user_id != current_user["id"]
+                     or job.tenant_id != current_user["tenant_id"]))):
         raise HTTPException(status_code=404, detail="Job not found.")
+    _audit_cross_tenant_access(db, current_user, job, "save_segments")
 
     # Wizard (transcribed_pending) is the original use case; pending_review
     # / rejected enable the post-approval /edit modal's autosave so text
@@ -9958,15 +9977,18 @@ async def request_edit(
     # de 3 edits y la app cobra Veo extra (~$0.90 por background regen).
     # No-op en SQLite (igual que _lock_user_for_quota); lock real en
     # Postgres. Se libera con db.commit() al final del flow.
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .with_for_update()
-        .first()
-    )
+    # Cross-tenant para admins de plataforma: mismo contrato que _job_scope
+    # (reads) — un admin re-renderiza el fix de cualquier cliente. Sin esto
+    # el /edit de un tenant ajeno daba 404 aun para el super admin. Auditado
+    # con commit=False para no soltar el row-lock de quota antes del commit
+    # final del flow.
+    _edit_q = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        _edit_q = _edit_q.filter(JobModel.tenant_id == current_user["tenant_id"])
+    job = _edit_q.with_for_update().first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _audit_cross_tenant_access(db, current_user, job, "edit", commit=False)
     valid_edit_types = ("typography", "background", "background_library", "lyrics", "metadata")
     if body.edit_type not in valid_edit_types:
         raise HTTPException(
