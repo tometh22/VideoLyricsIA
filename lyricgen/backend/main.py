@@ -9016,6 +9016,12 @@ class EditJobRequest(BaseModel):
     # the hint goes straight to Veo without Gemini's rewrite. Only
     # meaningful for edit_type=="background".
     bg_verbatim: bool = Field(default=False)
+    # Library asset for edit_type=="background_library": swap the video's
+    # background for a curated BackgroundAsset instead of regenerating with
+    # AI. The escape hatch from the non-converging Veo loop (incidente Gaby
+    # 2026-07-08, job eaff5c7baf50: 3 regens sin control y sin salida a
+    # biblioteca). Required for that edit_type; ignored otherwise.
+    background_id: int | None = Field(default=None)
     # FX layer + lyric animations chosen in the wizard. Added 2026-05-22:
     # antes el operador no podía cambiarlos post-upload y, peor, los
     # whitelists de /retry y /variant los descartaban silenciosamente.
@@ -9946,11 +9952,16 @@ async def request_edit(
     )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    valid_edit_types = ("typography", "background", "lyrics", "metadata")
+    valid_edit_types = ("typography", "background", "background_library", "lyrics", "metadata")
     if body.edit_type not in valid_edit_types:
         raise HTTPException(
             status_code=400,
             detail=f"edit_type must be one of {valid_edit_types}",
+        )
+    if body.edit_type == "background_library" and not body.background_id:
+        raise HTTPException(
+            status_code=400,
+            detail="background_library edit requires 'background_id'.",
         )
     # Escenas (incidente 2026-07-01, job 53b9513225b1): el edit "background"
     # es del mundo fondo-único — para un job multi-escena generaba UN clip
@@ -9958,7 +9969,9 @@ async def request_edit(
     # re-renderizaba video+short loopeando esa única escena. El camino
     # correcto para estos jobs es la regeneración por escena del filmstrip
     # (edit_type="scene" vía /edit-scene, no consume cupo de edición).
-    if body.edit_type == "background":
+    # background_library comparte el guard: un asset único también pisaría
+    # el timeline multi-escena cacheado.
+    if body.edit_type in ("background", "background_library"):
         _sp = job.scene_plan if isinstance(job.scene_plan, dict) else None
         if _sp and _sp.get("scenes"):
             raise HTTPException(
@@ -10047,7 +10060,14 @@ async def request_edit(
     # the metadata edit for traceability (`metadata_only=True`).
     _is_admin = current_user.get("role") == "admin"
     _metadata_only = body.edit_type == "metadata"
-    if not _is_admin and not _metadata_only and current_edit_count >= _MAX_EDITS:
+    # background_library tampoco consume slot (mismo mecanismo que metadata):
+    # el cap de 3 existe para acotar gasto Veo (~$0.90/regen); el swap a un
+    # asset curado cuesta $0 de IA y es justamente la SALIDA de emergencia
+    # para quien ya quemó sus regens sin converger — si consumiera slot,
+    # seguiría atrapado. AuditLog registra igual (edit_type en detail).
+    _library_swap = body.edit_type == "background_library"
+    if (not _is_admin and not _metadata_only and not _library_swap
+            and current_edit_count >= _MAX_EDITS):
         raise HTTPException(
             status_code=400,
             detail=f"Maximum edit limit ({_MAX_EDITS}) reached. Please approve or reject.",
@@ -10325,10 +10345,31 @@ async def request_edit(
         job.song_title = _new_title
         edit_params["song_title"] = _new_title
 
+    if _library_swap:
+        # Resolver el asset ANTES de flipear el status: _resolve_library_
+        # background trae gratis el tenant-gate (_user_can_use_asset, 404
+        # no-revelador para assets ajenos) y el row de AssetUsage para el
+        # audit. Cualquier 404/400 acá deja el job intacto en
+        # pending_review. Solo modo as_is en v1 (variation re-entra en
+        # costo Veo — diferido a propósito).
+        _lib_job_dir = os.path.join(OUTPUTS_DIR, job_id)
+        os.makedirs(_lib_job_dir, exist_ok=True)
+        _lib_bg_path, _lib_bg_r2_key, _v1, _v2, _lib_asset_id = _resolve_library_background(
+            body.background_id, "as_is", current_user, db, _lib_job_dir, job_id,
+        )
+        edit_params["library_bg"] = {
+            "bg_path": _lib_bg_path,
+            "bg_r2_key": _lib_bg_r2_key,
+            "asset_id": _lib_asset_id,
+        }
+
     # PR C 2026-05-26: metadata edits do NOT bump edit_count (see
     # rationale at the edit-cap gate above). All other types still
     # consume a slot.
-    new_edit_count = current_edit_count if _metadata_only else current_edit_count + 1
+    new_edit_count = (
+        current_edit_count if (_metadata_only or _library_swap)
+        else current_edit_count + 1
+    )
 
     # Pre-flight check that the edit will be able to source its audio.
     # The worker (run_edit_pipeline) resolves audio in two tiers: the

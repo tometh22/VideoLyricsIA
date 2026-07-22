@@ -15129,6 +15129,10 @@ def run_edit_pipeline(
             with new font/size/case/transition settings.  Cost: ~$0.
         "background" — re-generate Veo background; keep segments and
             (optionally) render params.  Cost: ~$0.90.
+        "background_library" — swap to a curated library asset
+            (edit_params["library_bg"], resuelto + tenant-gateado por el
+            endpoint). No Veo, no consume slot. El asset se re-cachea como
+            bg_r2_key_cached (fondo durable para edits posteriores).
         "lyrics"     — keep cached background; replace segments with the
             caller-supplied list (edit_params["segments"]). Re-renders
             video/short/thumbnail.  Cost: ~$0. After success, the new
@@ -15593,6 +15597,51 @@ def run_edit_pipeline(
                 _pending_scene_plan_clear = True
                 update_job(job_id, progress=35)
 
+        elif edit_type == "background_library":
+            # Swap a un asset CURADO de biblioteca — la salida del loop no
+            # convergente de regens Veo (incidente Gaby 2026-07-08). Sin
+            # Veo, sin slot de edición (ver request_edit). El asset ya fue
+            # resuelto + tenant-gateado + auditado (AssetUsage) por el
+            # endpoint; acá solo lo materializamos y re-cacheamos.
+            #
+            # Cinturón del guard de request_edit: nunca pisar el timeline
+            # multi-escena cacheado con un asset único.
+            if scene_plan and scene_plan.get("scenes"):
+                raise RuntimeError(
+                    "background_library edit no soportado en jobs multi-escena — "
+                    "regenerar escenas individuales (edit_type='scene')."
+                )
+            update_job(job_id, status="editing", current_step="video", progress=30)
+            _lib = edit_params.get("library_bg") or {}
+            _lib_r2 = _lib.get("bg_r2_key")
+            _lib_path = _lib.get("bg_path")
+            # La extensión importa: los assets pueden ser imagen fija
+            # (.jpg/.png) y de ella depende el manejo de stills aguas
+            # abajo (mismo criterio que el cache de fondos humanos).
+            _lib_ext = os.path.splitext(_lib_r2 or _lib_path or "")[1].lower() or ".mp4"
+            bg_image_path = os.path.join(job_dir, f"bg_library_edit{_lib_ext}")
+            if not os.path.exists(bg_image_path):
+                if _lib_r2 and storage.is_enabled():
+                    if not storage.download_object(_lib_r2, bg_image_path):
+                        raise RuntimeError(
+                            f"Could not download library background {_lib_r2!r} from R2"
+                        )
+                elif _lib_path and os.path.exists(_lib_path):
+                    import shutil
+                    shutil.copyfile(_lib_path, bg_image_path)
+                else:
+                    raise RuntimeError(
+                        "background_library edit sin asset alcanzable "
+                        f"(bg_r2_key={_lib_r2!r}, bg_path={_lib_path!r})"
+                    )
+            bg_prelooped = False
+            # El asset elegido pasa a ser el fondo DURABLE del job: el
+            # recache post-render lo sube como backgrounds/{job}/bg_cached.*
+            # y actualiza bg_r2_key_cached — los edits posteriores de
+            # tipografía/lyrics lo reusan (espeja el camino human-provided).
+            _pending_background_recache = True
+            update_job(job_id, progress=35)
+
         else:
             raise ValueError(f"Unknown edit_type {edit_type!r}")
 
@@ -15609,6 +15658,10 @@ def run_edit_pipeline(
         )
         _edit_ai_generated = (
             True if edit_type in ("background", "scene") else
+            # Asset curado de biblioteca = misma clase que un fondo human-
+            # provided: NO generado por IA (cambia el short-circuit de
+            # validación Universal y la provenance del deliverable).
+            False if edit_type == "background_library" else
             bool(_stored_background_ai_generated)
         )
         _edit_safety_policy = _background_safety_policy(
