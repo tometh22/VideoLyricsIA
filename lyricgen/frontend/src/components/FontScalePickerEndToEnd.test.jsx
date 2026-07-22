@@ -131,56 +131,39 @@ describe("font-scale picker → live preview prop chain (PR #451)", () => {
 });
 
 // ---------------------------------------------------------------------
-// Math contract: mirror of WizardLivePreview.jsx:232-233 + ass_render.py
-// font_scale clamp. If the production formula changes (e.g. cap raised
-// to 1.8 to match a new backend limit), this should fail loudly so the
-// maintainer can update both sides together.
+// Math contract — against the REAL production functions.
+//
+// The previous block here tested a local copy of the retired
+// clamp(18px, 7.5cqw, 68px) formula: a tautology that kept passing while
+// the actual preview moved to the tier formula, so it could never catch
+// divergence (that stale mirror is exactly how the "preview text bigger
+// than the render" bug survived). The exhaustive numeric contract now
+// lives in lib/renderParity.test.js over the generated
+// shared/renderParity.json fixture; these are just smoke asserts that the
+// picker's option range maps through the real lyricTiers functions.
 // ---------------------------------------------------------------------
 
-function previewBaseFontSize(fontScale) {
-  const scaleN = Math.max(0.6, Math.min(1.5, parseFloat(fontScale) || 1));
-  return {
-    scaleN,
-    baseFontSize: `clamp(${Math.round(18 * scaleN)}px, ${(7.5 * scaleN).toFixed(2)}cqw, ${Math.round(68 * scaleN)}px)`,
-  };
-}
+import { clampFontScale, lyricFontPx } from "../lib/lyricTiers";
 
-describe("WizardLivePreview scaleN clamp — matches backend (ass_render.py:114)", () => {
-  it("scaleN=1.0 → baseFontSize uses 18/68 baseline", () => {
-    const r = previewBaseFontSize("1.0");
-    expect(r.scaleN).toBe(1);
-    expect(r.baseFontSize).toBe("clamp(18px, 7.50cqw, 68px)");
+describe("font-scale picker range through the real lyricTiers math", () => {
+  it("1.5 (the operator's max pick) is honored, over-cap clamps to it", () => {
+    expect(clampFontScale("1.5")).toBe(1.5);
+    expect(clampFontScale("1.7")).toBe(1.5);
+    expect(lyricFontPx(20, "1.7", "")).toBe(lyricFontPx(20, "1.5", ""));
   });
 
-  it("scaleN=1.5 (the operator's max pick) → 27/102 px", () => {
-    const r = previewBaseFontSize("1.5");
-    expect(r.scaleN).toBe(1.5);
-    expect(r.baseFontSize).toBe("clamp(27px, 11.25cqw, 102px)");
+  it("below-cap clamps to 0.6", () => {
+    expect(clampFontScale("0.4")).toBe(0.6);
+    expect(lyricFontPx(20, "0.4", "")).toBe(lyricFontPx(20, "0.6", ""));
   });
 
-  it("scaleN=1.3 → 23/88 (rounded)", () => {
-    const r = previewBaseFontSize("1.3");
-    expect(r.scaleN).toBe(1.3);
-    // 18 * 1.3 = 23.4 → round 23; 68 * 1.3 = 88.4 → round 88.
-    expect(r.baseFontSize).toBe("clamp(23px, 9.75cqw, 88px)");
+  it("garbage values default to 1.0", () => {
+    expect(clampFontScale("foo")).toBe(1);
+    expect(clampFontScale(undefined)).toBe(1);
+    expect(clampFontScale(null)).toBe(1);
   });
 
-  it("over-cap (1.7) clamps to 1.5 → same px values as the 1.5 case", () => {
-    const r = previewBaseFontSize("1.7");
-    expect(r.scaleN).toBe(1.5);
-    expect(r.baseFontSize).toBe("clamp(27px, 11.25cqw, 102px)");
-  });
-
-  it("below-cap (0.4) clamps to 0.6 → 11/41 px", () => {
-    const r = previewBaseFontSize("0.4");
-    expect(r.scaleN).toBe(0.6);
-    // 18 * 0.6 = 10.8 → round 11; 68 * 0.6 = 40.8 → round 41.
-    expect(r.baseFontSize).toBe("clamp(11px, 4.50cqw, 41px)");
-  });
-
-  it("garbage value (NaN/undefined) defaults to 1.0", () => {
-    expect(previewBaseFontSize("foo").scaleN).toBe(1);
-    expect(previewBaseFontSize(undefined).scaleN).toBe(1);
-    expect(previewBaseFontSize(null).scaleN).toBe(1);
+  it("short line at 1.0 renders the 85px tier baseline", () => {
+    expect(lyricFontPx(20, "1.0", "")).toBe(85);
   });
 });

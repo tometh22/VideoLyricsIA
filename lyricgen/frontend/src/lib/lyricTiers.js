@@ -55,3 +55,40 @@ export function fontSizeFactor(font) {
   }
   return 1.0;
 }
+
+// Python's round() is banker's rounding (half-to-even): round(52.5) = 52,
+// where JS Math.round gives 53. The render computes int px with Python
+// round(), so the preview must round the same way or e.g. 70×0.75 lands on
+// a different pixel than the video. Positive inputs only (font sizes).
+function pyRound(x) {
+  const floor = Math.floor(x);
+  const diff = x - floor;
+  if (diff > 0.5) return floor + 1;
+  if (diff < 0.5) return floor;
+  return floor % 2 === 0 ? floor : floor + 1;
+}
+
+// THE preview-side font size, in integer px at the 1920×1080 baseline —
+// numerically identical to ass_render.lyric_fontsize(text_len, scale=1,
+// font_scale, font_size_factor(font)). Previews convert to cqw via
+// lyricFontPx(...)/REF_W*100. Guarded against the render by
+// lib/renderParity.test.js over the generated shared/renderParity.json
+// fixture — change the formula on either side without the other and the
+// parity test fails in CI, not a client render weeks later.
+export function lyricFontPx(textLen, fontScale, font) {
+  const base = tierForLength(textLen).fontPx;
+  const scaled = base * clampFontScale(fontScale) * fontSizeFactor(font);
+  return Math.max(18, pyRound(scaled));
+}
+
+// Fade duration per transition (seconds) — mirrors ass_render._FADE_DURATIONS_S
+// ("cut" has no entry there; it maps to 0). Shared by LyricVideoPreview's
+// opacity ramp and the parity test.
+export const FADE_SECONDS = { cut: 0, fade: 0.15, fade_slow: 0.3 };
+
+// Mirrors ass_render.fade_seconds: capped at 1/3 of the segment so short
+// lines never spend their whole duration fading.
+export function fadeSeconds(transition, segDuration) {
+  const base = FADE_SECONDS[transition] ?? 0;
+  return Math.min(base, Math.max(0, segDuration) / 3);
+}
