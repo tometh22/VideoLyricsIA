@@ -48,8 +48,27 @@ SEGMENTS = [
     {"start": 14.5, "end": 19.0, "text": "Última línea del master dorado"},
 ]
 
+# Caso "canción larga" (plan del editor, gate WS6): 56 líneas apretadas —
+# el perfil de los incidentes UMG (Amiga Mía = 59). Ejercita el render con
+# una densidad real de segments: tiers por largo alternados, saltos de
+# línea rápidos y el camino que el smoke corto de 4 líneas nunca toca.
+# El audio del golden dura ~20s → las líneas van comprimidas en ese rango.
+LONG_SEGMENTS = [
+    {
+        "start": round(0.3 + i * 0.34, 2),
+        "end": round(0.3 + i * 0.34 + 0.30, 2),
+        "text": (
+            f"Línea {i + 1} corta"
+            if i % 3 else
+            f"Línea {i + 1} bastante más larga para caer en otra tier de tamaño"
+        ),
+    }
+    for i in range(56)
+]
+
 # Matriz: 3 combos cubren fuente redondeada/condensada, karaoke/pop/none,
-# fondo video y fondo imagen, colores custom y contraste fuerte.
+# fondo video y fondo imagen, colores custom y contraste fuerte; el 4to
+# cubre el perfil canción-larga (combo["segments"] override).
 COMBOS = [
     {
         "name": "fredoka-karaoke-libvideo",
@@ -74,6 +93,15 @@ COMBOS = [
         "params": {
             "font": "bebas-neue", "lyrics_animation": "none",
             "text_case": "upper", "text_contrast": "strong",
+        },
+    },
+    {
+        "name": "montserrat-longsong-libvideo",
+        "bg": "mp4",
+        "segments": LONG_SEGMENTS,
+        "params": {
+            "font": "montserrat-bold", "lyrics_animation": "none",
+            "text_case": "upper",
         },
     },
 ]
@@ -197,7 +225,7 @@ def main():
     ap.add_argument("--base-url", required=True)
     ap.add_argument("--bless", action="store_true",
                     help="guardar los frames actuales como nuevos goldens")
-    ap.add_argument("--timeout-min", type=int, default=25)
+    ap.add_argument("--timeout-min", type=int, default=45)
     args = ap.parse_args()
     base = args.base_url.rstrip("/")
 
@@ -217,7 +245,7 @@ def main():
         fields = {
             "artist": "Golden Render", "song_title": combo["name"],
             "language": "es",
-            "segments_json": json.dumps(SEGMENTS),
+            "segments_json": json.dumps(combo.get("segments", SEGMENTS)),
             "background_id": str(assets[combo["bg"]]),
             "background_mode": "as_is",
             **{k: str(v) for k, v in combo["params"].items()},
@@ -244,23 +272,60 @@ def main():
     deadline = time.time() + args.timeout_min * 60
     pending = dict(jobs)
     failed = {}
+    # ¿La cola canary tiene consumidor vivo? La señal robusta (audit
+    # adversarial 2026-07-17) es: ¿ALGÚN job del bot salió alguna vez de
+    # "queued"? Si al menos uno arrancó, el Worker está drenando canary y
+    # los que quedaron en cola son contención legítima detrás de humanos.
+    # Si NINGUNO arrancó en toda la ventana, no hay consumidor (canary sin
+    # listener, o pickup roto) → eso SÍ es un problema y no debe salir
+    # verde-vacío. Sin esto, un starved→exit-0 ciega el monitor.
+    consumer_alive = False
     while pending and time.time() < deadline:
         time.sleep(20)
         for name, jid in list(pending.items()):
             st = _req(base, f"/status/{jid}", token=token)
             s = st.get("status")
+            if s and s != "queued":
+                consumer_alive = True
             if s in ("done", "pending_review"):
                 print(f"[GOLDEN] {name}: {s}")
                 del pending[name]
             elif s in ("error", "validation_failed", "rejected"):
                 failed[name] = f"{s}: {(st.get('error') or '')[:200]}"
                 del pending[name]
+    # Clasificar lo que quedó pendiente al deadline.
+    starved = {}
+    for name, jid in list(pending.items()):
+        st = _req(base, f"/status/{jid}", token=token)
+        s = st.get("status")
+        if s and s != "queued":
+            consumer_alive = True
+        if s == "queued" and consumer_alive:
+            # Arrancó al menos un hermano → hay consumidor; este quedó
+            # atrás por contención legítima (canary drena último).
+            starved[name] = jid
+            del pending[name]
+        # Si sigue queued SIN consumidor vivo, o quedó a mitad (processing),
+        # cae a `failed` abajo (regresión real / infra rota).
     for name, jid in pending.items():
-        failed[name] = f"timeout tras {args.timeout_min} min"
+        st = _req(base, f"/status/{jid}", token=token)
+        if st.get("status") == "queued":
+            failed[name] = ("nunca salió de 'queued' y NINGÚN render del bot "
+                            "arrancó — canary sin consumidor o pickup roto")
+        else:
+            failed[name] = f"timeout tras {args.timeout_min} min"
     if failed:
         for name, why in failed.items():
             print(f"[GOLDEN] RENDER FALLÓ {name}: {why}", file=sys.stderr)
         sys.exit(2)
+    if starved:
+        # Quedan encolados detrás de humanos con consumidor vivo: corren
+        # cuando la cola se vacíe y el cleanup del próximo run los rechaza.
+        for name, jid in starved.items():
+            print(f"[GOLDEN] SKIPPED {name} ({jid}): cola ocupada (consumidor "
+                  "vivo) — el render no arrancó dentro del deadline "
+                  "(no es regresión)", file=sys.stderr)
+        sys.exit(0)
 
     # Frames + comparación
     regressions = []

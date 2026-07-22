@@ -1,4 +1,5 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
 import { EditorTour } from "./OnboardingTour";
 import { useToast } from "./ToastProvider";
@@ -8,10 +9,64 @@ import LyricVideoPreview from "./LyricVideoPreview";
 import { tierForLength } from "../lib/lyricTiers";
 import { activeWordIndex } from "../lib/karaokeTiming";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
-import { segmentsValuesEqual } from "../lib/segmentsValuesEqual";
+import { reseedPreservingIds } from "../lib/segmentIds";
+import { useJobSegments, segmentsStore } from "../state/segmentsStore";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
 import { splitWordsAtCharOffset, firstWordStart, lastWordEnd } from "../lib/splitWords";
 import useLocalStorage from "../hooks/useLocalStorage";
+
+// Copy honesto del fallo de respaldo (autosave), por CAUSA real. El banner
+// + el confirm de "Aprobar" antes decían "problema de red" para cualquier
+// fallo (PR A). Pero persistSegmentsToBackend (App.jsx) distingue el motivo
+// via { reason, status }: un 401 = sesión vencida (el auto-retry NO lo
+// arregla — hay que reingresar), un 404 = job expirado por el reaper, etc.
+// Decir siempre "red" es deshonesto y manda a la operadora por el camino
+// equivocado. `server` es el fallback = el copy original (comportamiento sin
+// cambios cuando el motivo es desconocido). El núcleo tranquilizador
+// («Aprobar y generar» usa lo de pantalla) se mantiene en TODAS las causas —
+// eso sigue siendo verdad porque el approve manda los segments en el body.
+const _SAVE_ERROR_COPY = {
+  network: {
+    short: "No pudimos respaldar tu última edición (problema de red)",
+    detail:
+      "Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla. Reintentamos automáticamente; evitá cerrar la pestaña hasta ver «Guardado».",
+    confirm:
+      "Tu última edición no se pudo respaldar en el servidor (problema de red). Podés aprobar igual: el video se genera con lo que ves en pantalla. Solo el respaldo para reanudar la sesión queda desactualizado. ¿Continuar?",
+  },
+  session: {
+    short: "No pudimos respaldar tu última edición (tu sesión venció)",
+    detail:
+      "Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla. El reintento automático no alcanza si la sesión expiró: reingresá en otra pestaña para que el respaldo vuelva a guardarse.",
+    confirm:
+      "Tu última edición no se pudo respaldar (tu sesión venció). Podés aprobar igual: el video se genera con lo que ves en pantalla. Pero si vas a cerrar y reanudar después, reingresá primero para no perder el respaldo. ¿Continuar?",
+  },
+  "job-gone": {
+    short: "No pudimos respaldar: este trabajo ya no está en el servidor",
+    detail:
+      "Puede haber expirado por inactividad. Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla, pero al generar el servidor podría rechazarlo. Si falla, volvé a subir la canción.",
+    confirm:
+      "Este trabajo ya no está en el servidor (pudo expirar por inactividad). Tus cambios siguen en pantalla, pero al generar podría fallar. ¿Intentar aprobar igual?",
+  },
+  server: {
+    short: "No pudimos respaldar tu última edición en el servidor",
+    detail:
+      "Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla. Reintentamos automáticamente; evitá cerrar la pestaña hasta ver «Guardado».",
+    confirm:
+      "Tu última edición no se pudo respaldar en el servidor. Podés aprobar igual: el video se genera con lo que ves en pantalla. Solo el respaldo para reanudar la sesión queda desactualizado. ¿Continuar?",
+  },
+};
+
+// Deriva la categoría de copy desde el { reason, status } que retorna
+// persistSegmentsToBackend. Un throw del fetch (result undefined) = red.
+function _saveErrorCategory(result) {
+  if (!result) return "network"; // fetch tiró (catch) → sin red
+  const status = result.status;
+  const reason = result.reason || "";
+  if (reason === "network") return "network";
+  if (status === 401 || status === 403) return "session";
+  if (reason === "job-gone" || status === 404) return "job-gone";
+  return "server"; // 400/409/5xx/otros → copy genérico honesto
+}
 
 // Font options for the live in-preview switcher. Codes match the render
 // pipeline / EditRequestPanel; css families are all loaded in index.html so
@@ -286,6 +341,12 @@ export function normalizeLineForMatch(text) {
 }
 
 export default function LyricsEditor({
+  // PR E (2026-07): `segments` es SOLO el seed inicial del store por job
+  // (segmentsStore.useJobSegments). Post-mount, este prop ya NO re-seedea: el
+  // viejo effect de prop-sync + sus 4 guards de eco fueron eliminados. Para un
+  // eventual reemplazo externo del contenido existe segmentsStore.replace(),
+  // que preserva la identidad de filas (reseedPreservingIds) — hoy sin caller
+  // de producción (reservado / lo ejercitan sólo los tests).
   segments, filename, audioFile, referenceLyrics,
   coverageWarning = false, recoverySource = "",
   onApprove, onBack, isBatch = false, batchProgress = "",
@@ -300,15 +361,26 @@ export default function LyricsEditor({
   lyricsAnimation = "none",
   lineTransition = "none",
   transcribeJobId = null,
+  // PR E follow-up (2026-07): key DEL STORE, desacoplada del backend job id.
+  // transcribeJobId gobierna el autosave/backend (POST /save-segments) y es el
+  // job real (o null). storeKey identifica la review para el segmentsStore y
+  // EXISTE incluso cuando transcribeJobId es null (reviews jobId-less: back-nav,
+  // resume), así que sus edits sobreviven al unmount y llegan a wizardPersistence.
+  // Default a transcribeJobId para que los unit tests que sólo pasan
+  // transcribeJobId sigan keyando el store correctamente.
+  storeKey = null,
   onPersistSegments = null,
-  // Synchronous per-edit callback (no debounce). Parent receives the
-  // current cleaned segments on every change. Required by the /edit
-  // modal so it can include the latest segments in the body of
-  // /edit?edit_type=background without racing the 3s autosave debounce.
-  // Without this, an operator who edits a line and clicks "Regenerar
-  // fondo" within 3 s ends up re-rendering with the pre-edit segments_json
-  // because autosave hasn't flushed yet. Incident 2026-05-15.
-  onEditedChange = null,
+  // Versión B, parte 2 (2026-07-15): callback del padre que hace el POST
+  // /jobs/{id}/reanchor (re-anclado CTC del timing con el texto corregido).
+  // El botón "Re-sincronizar con IA" solo se muestra si el padre lo pasa Y
+  // features.anchor_lyrics está activo (flag ANCHOR_LYRICS_ENABLED).
+  onReanchor = null,
+  // NOTE (PR E): el viejo `onEditedChange` (espejo sincrónico por keystroke
+  // hacia App) fue eliminado — era la mitad del loop bidireccional del
+  // reseed-storm. Los lectores externos (WizardLivePreview, snapshot de
+  // wizardPersistence) leen ahora del segmentsStore vía
+  // useJobSegmentsValue(jobId) / segmentsStore.get(jobId); el POST /edit
+  // sigue recibiendo lo de pantalla vía onApprove(editedSegments).
   // Post-approval / re-sync mode. The wizard's upload flow never sets
   // these (defaults preserve original behavior); the JobDetail /edit
   // modal mounts this same editor with audioUrl + the disable flags so
@@ -364,10 +436,32 @@ export default function LyricsEditor({
   // Se llama dentro del rAF loop existente (60fps). El consumer es
   // responsable de throttle si necesario.
   onPlaybackTick = null,
+  // 2026-07-16 (idea de Tomi): en el wizard, el reproductor puede vivir
+  // ABAJO del video (columna central) en vez de arriba de la lista, para
+  // que la columna de la letra quede full y se scrollee menos. Si el padre
+  // pasa un elemento DOM acá, el player bar se portalea a ese slot (bajo el
+  // video); si es null (ej. /edit modal), se renderiza inline como siempre.
+  // El estado del audio (isPlaying/currentTime/etc.) NO se mueve — solo el
+  // DOM del control, vía React portal.
+  playerSlot = null,
 }) {
   const { t } = useI18n();
-  const [edited, setEdited] = useState(() =>
-    segments.map((s, i) => ({ ...s, _id: i }))
+  // PR E (2026-07): `edited` vive en el segmentsStore (Map por jobId a
+  // nivel módulo), NO en un useState local. El store SOBREVIVE al unmount:
+  // navegar paso 6 → 4 → 6 en el wizard des-monta y re-monta este editor,
+  // y antes eso re-seedeaba desde un prop `segments` stale — así se
+  // "borraban los tiempos/locks" (P0 Seba+Gaby). Ahora el remount se
+  // engancha a la entrada viva; seedFn corre solo la PRIMERA vez que se ve
+  // este jobId. Sin jobId (unit tests / editor standalone) degrada a
+  // estado local plano.
+  // storeKey desacopla la identidad de store del backend job id: existe
+  // incluso para reviews sin job (transcribeJobId null) para que sus edits
+  // sobrevivan al unmount. Default a transcribeJobId para los unit tests que
+  // sólo pasan transcribeJobId (así siguen keyando el store correctamente).
+  const _storeKey = storeKey ?? transcribeJobId ?? null;
+  const [edited, setEdited] = useJobSegments(
+    _storeKey,
+    () => reseedPreservingIds([], segments),
   );
   const [isDirty, setIsDirty] = useState(false);
   // List vs visual timeline. Default "list" so the existing operator flow is
@@ -397,10 +491,9 @@ export default function LyricsEditor({
     document.body.classList.toggle("editor-focus-mode", focusMode);
     return () => document.body.classList.remove("editor-focus-mode");
   }, [focusMode]);
-  // Phase B 2026-05-25: el card de auto-fix antes ocupaba 120-180px arriba
-  // del editor. Reemplazado por un pill compacto 32px que expande detalle
-  // on demand. Default colapsado para minimizar el overhead vertical.
-  const [autoFixExpanded, setAutoFixExpanded] = useState(false);
+  // El auto-fix dejó de ser un card/pill propio (2026-07 rediseño): ahora
+  // es el chip ghost "Aplicar corrección · N" con popover en la fila de
+  // chips, así que ya no hace falta un estado de expand/collapse propio.
   // Layout edits in the preview apply to ALL lines by default (consistent
   // look across the song); "line" scopes the next edit to the selected line
   // only (for the odd tilted/repositioned line).
@@ -437,31 +530,22 @@ export default function LyricsEditor({
   // changes. Ahora ambos autosaves actualizan saveStatus, y "error"
   // se muestra como chip rojo con botón Reintentar.
   const [saveStatus, setSaveStatus] = useState("idle"); // idle|saving|saved|error
+  // Motivo del último fallo de respaldo, para que el banner + el confirm de
+  // "Aprobar" digan la CAUSA REAL en vez de "problema de red" siempre (el
+  // copy honesto de PR A quedó hardcodeado a "red"; la causa real puede ser
+  // sesión vencida, job expirado, etc. — ver _SAVE_ERROR_COPY). null cuando
+  // no hay error. Se deriva de result.reason/status de persistSegments.
+  const [saveErrorReason, setSaveErrorReason] = useState(null);
   const [flushCounter, setFlushCounter] = useState(0);
   // Snapshot of the timings as first handed to us — the baseline for the
-  // timeline's "Resetear timings". Seeded on mount + re-seeded whenever the
-  // parent swaps the `segments` prop (see the reset effect below).
-  const originalSegmentsRef = useRef(segments.map((s, i) => ({ ...s, _id: i })));
-
-  // Re-seed `edited` whenever the parent hands us a different `segments`
-  // reference. The initial useState above only runs once on mount —
-  // without this effect, a parent that re-uses the same editor across
-  // jobs (e.g. JobDetail's /edit modal swapping between two jobs in
-  // the same session, or a forced refresh that re-fetches segments_json
-  // after autosave landed) keeps showing the stale first-mount array.
-  // Compared by reference, not deep-equal: the parent owns the array
-  // identity, so a new prop reference = "you should reset". This is the
-  // standard "controlled-vs-uncontrolled" reset pattern used by inputs
-  // that need to track a parent's source of truth across remounts.
-  // Bug B7 from 2026-05-18 audit.
-  const prevSegmentsRef = useRef(segments);
-  // Live mirror of `edited` so the prop-sync effect below can tell our OWN echo
-  // from a genuine external change. App.jsx feeds every local edit straight back
-  // as the `segments` prop (onEditedChange → mergeEditedSegments →
-  // currentReview.segments), so the effect must compare the incoming prop
-  // against what we're SHOWING right now — not a one-tick-stale ref.
-  const editedRef = useRef(edited);
-  editedRef.current = edited;
+  // timeline's "Resetear timings". PR E + F2 fix: se lee del `original` del
+  // store (getOriginal), que es la baseline del PRIMER seed y NUNCA se pisa
+  // con edits/replace. En un remount, `edited` ya trae los timings EDITADOS
+  // de la entrada viva, así que sembrar el ref con `edited` hacía que Reset
+  // restaurara las filas a sí mismas (no-op). getOriginal preserva el
+  // original real; fallback a `edited` para el path jobId-less/local (donde
+  // el primer mount `original` === `edited` de todos modos).
+  const originalSegmentsRef = useRef(segmentsStore.getOriginal(_storeKey) ?? edited);
   // Operator feedback 2026-05-25 (UMG): "Debería hacerlo solo, no
   // preguntarme" — the auto-trim banner ("Recortar N líneas con texto
   // colgado · Aplicar") was friction. Detection is reliable enough to
@@ -469,88 +553,13 @@ export default function LyricsEditor({
   // application so re-seeding a new job re-triggers; routine edits
   // (typing in a line) do NOT, because they don't change the ref.
   const autoTrimAppliedRef = useRef(false);
-  const _reseedStormRef = useRef({ windowStart: 0, count: 0 });
-  useEffect(() => {
-    if (prevSegmentsRef.current === segments) return;
-    // ROOT-CAUSE FIX (P0 UMG Chile, "titila todo el editor" — still firing on
-    // the #724 build): skip the destructive reseed when the incoming `segments`
-    // already matches what we're SHOWING (`edited`). App.jsx mirrors every local
-    // edit up to currentReview.segments (onEditedChange → mergeEditedSegments)
-    // and feeds it straight back as this prop. During a timeline drag the values
-    // change every tick, so comparing against the one-tick-stale prevSegmentsRef
-    // (below) saw each echo as "new content" and reseeded → _id reassigned by
-    // index → all rows REMOUNT 6-7×/s → reseed-storm / ui-freeze. #724 only
-    // neutralised the equal-VALUES reorder echo; this catches the live-edit echo
-    // because the prop equals our current `edited`. A genuine external change
-    // (load another song, undo) differs from `edited` and still reseeds.
-    if (segmentsValuesEqual(editedRef.current, segments)) {
-      prevSegmentsRef.current = segments;
-      return;
-    }
-    // QA fix 2026-05-27 (drag-resize regression): the autosave POST
-    // roundtrip (App.jsx::persistSegmentsToBackend) calls
-    // setCurrentReview({...prev, segments: cleaned}) after a successful
-    // /save-segments. That hands LyricsEditor a NEW segments array
-    // reference holding the SAME values the operator just dragged.
-    // Pre-fix this useEffect saw the new ref and reseeded `edited` —
-    // re-assigning _ids by index, dropping `locked`/`pos`/`scale`/`rot`
-    // that the local handler had just applied, and under React's render
-    // batching also dropping an in-flight second drag in same tick.
-    // Net effect: operator drags an edge, releases, the edge snaps back
-    // to where it was before. We bump the ref so we don't re-check on
-    // every render, but skip the destructive reseed.
-    if (segmentsValuesEqual(prevSegmentsRef.current, segments)) {
-      prevSegmentsRef.current = segments;
-      return;
-    }
-    // [reseed-storm] capture (P0 UMG Chile 2026-06-16: "las líneas cambian de
-    // posición en loop"). This reseed reassigns _id by index, so rows keyed by
-    // _id REMOUNT. The original root cause: segmentsValuesEqual was POSITIONAL,
-    // so a writeback that handed back a REORDERED segments array (backend sorts
-    // by start #184 while local is out-of-order from a split/overlap) failed the
-    // guard above and made this fire on every cycle → rows reposition in a loop.
-    // FIXED in #724: segmentsValuesEqual now sorts both sides by start before
-    // comparing, so a pure reorder no longer reseeds. This detector is KEPT as a
-    // backstop — it still catches a GENUINE rapid-content storm (not reorder),
-    // and stays until the 2026-07-01 monitoring window closes. If it fires
-    // repeatedly we emit the OLD vs NEW order so we can see the swap.
-    {
-      const _now = typeof performance !== "undefined" && performance.now ? performance.now() : 0;
-      const _rs = _reseedStormRef.current;
-      if (_now - _rs.windowStart > 1000) {
-        if (_rs.count >= 6) {
-          const _ord = (arr) => (Array.isArray(arr) ? arr : []).slice(0, 5).map((s) => String(s.text || "").slice(0, 18));
-          // eslint-disable-next-line no-console
-          console.warn("[reseed-storm] rows reseeding/remounting repeatedly", {
-            perSec: _rs.count,
-            prevOrder: _ord(prevSegmentsRef.current),
-            newOrder: _ord(segments),
-            segments: Array.isArray(segments) ? segments.length : null,
-          });
-        }
-        _rs.windowStart = _now;
-        _rs.count = 0;
-      }
-      _rs.count += 1;
-    }
-    prevSegmentsRef.current = segments;
-    const seeded = segments.map((s, i) => ({ ...s, _id: i }));
-    setEdited(seeded);
-    originalSegmentsRef.current = seeded;
-    setIsDirty(false);
-    // Audit fix 2026-05-27 (drag-resize regression part 2): NO resetear
-    // autoTrimAppliedRef acá. Antes hacíamos `current = false` con la
-    // lógica "new job → eligible for auto-trim", PERO esta useEffect
-    // también dispara en el roundtrip del autosave (drag → POST →
-    // setCurrentReview → reseed). Si el operador acababa de extender un
-    // segmento más allá de su `estimateVoiceEndDuration` cap, autoTrim
-    // (useEffect en línea ~1440) ve `current=false` + `longSegCount>0`
-    // y dispara `trimAllLongSegs()` que recorta el end de vuelta al cap.
-    // Visualmente: drag se "revierte". Para el caso real de cargar un
-    // job distinto, el padre cambia la `key` del LyricsEditor (filename
-    // + queueIdx) → remount → useState inicializa `current=false` de
-    // nuevo. No hace falta el reset acá.
-  }, [segments]);
+  // PR E (2026-07): acá vivía el effect de prop-sync/reseed (Bug B7 + los
+  // guards de eco #724/live-edit + el detector [reseed-storm]). Se ELIMINÓ
+  // entero: el estado vive en segmentsStore (sobrevive unmounts, el prop
+  // `segments` es solo seed inicial) y el reemplazo externo post-mount va
+  // por segmentsStore.replace(jobId, segs), que preserva _id vía
+  // reseedPreservingIds. El canary anti-loop vive ahora en el store
+  // (mismo tag "[reseed-storm]" → Sentry vía observability.js).
 
   // Warn browser on tab-close / external navigation when there are unsaved edits.
   // disableBeforeUnload skips this for the post-approval modal — closing
@@ -600,12 +609,17 @@ export default function LyricsEditor({
         // { ok, reason } post-fix #74. Para legacy callers (sin
         // return value), result === undefined → tratamos como ok.
         if (result && result.ok === false) {
+          setSaveErrorReason(_saveErrorCategory(result));
           setSaveStatus("error");
         } else {
+          setSaveErrorReason(null);
           setSaveStatus("saved");
         }
       } catch {
-        if (!cancelled) setSaveStatus("error");
+        if (!cancelled) {
+          setSaveErrorReason("network");
+          setSaveStatus("error");
+        }
       }
     }, 3000);
     return () => { cancelled = true; clearTimeout(tid); };
@@ -677,10 +691,15 @@ export default function LyricsEditor({
       .then((result) => {
         if (cancelled) return;
         // QA fix audit P0 #74: distinguir error en lugar de idle silencioso.
-        if (result && result.ok === false) setSaveStatus("error");
-        else setSaveStatus("saved");
+        if (result && result.ok === false) {
+          setSaveErrorReason(_saveErrorCategory(result));
+          setSaveStatus("error");
+        } else {
+          setSaveErrorReason(null);
+          setSaveStatus("saved");
+        }
       })
-      .catch(() => { if (!cancelled) setSaveStatus("error"); });
+      .catch(() => { if (!cancelled) { setSaveErrorReason("network"); setSaveStatus("error"); } });
     return () => { cancelled = true; };
     // Only react to the flush trigger — `edited` is intentionally read fresh
     // but NOT a dep (we don't want every keystroke to flush).
@@ -694,16 +713,10 @@ export default function LyricsEditor({
     return () => clearTimeout(id);
   }, [saveStatus]);
 
-  // Synchronous per-edit callback: fires on every `edited` change with no
-  // debounce, so the parent can hold the latest segments in a ref and
-  // include them in the next /edit POST without racing the 3 s autosave
-  // window. No-op when the parent didn't wire the callback. Cheap enough
-  // to fire per keystroke — a single map() over the segments array.
-  useEffect(() => {
-    if (!onEditedChange || !Array.isArray(edited)) return;
-    const cleaned = edited.map(({ _id, review, ...rest }) => rest);
-    onEditedChange(cleaned);
-  }, [edited, onEditedChange]);
+  // PR E (2026-07): acá vivía el espejo sincrónico por keystroke
+  // (onEditedChange → App.setCurrentReview). Eliminado — era la mitad del
+  // loop bidireccional del reseed-storm. Los consumidores externos leen
+  // ahora directo del segmentsStore (useJobSegmentsValue / get).
 
   // NOTE: a second debounced-autosave useEffect lived here, copy-pasted
   // identically to the one above (line ~238). Removed 2026-05-18 —
@@ -851,6 +864,16 @@ export default function LyricsEditor({
   // confusing, see tapAnchor comments). Each id is auto-removed by a
   // 10s setTimeout scheduled at anchor time.
   const [highlightedIds, setHighlightedIds] = useState(() => new Set());
+  // Navegador secuencial de líneas "review" (banner "Revisar →"): cursor
+  // sobre el orden actual de review-ids + un flash breve al aterrizar en
+  // una fila para que el operador la ubique sin cazar colores.
+  const reviewNavIdxRef = useRef(-1);
+  const [flashReviewId, setFlashReviewId] = useState(null);
+  // Rediseño de controles (2026-07, spec diseño SaaS senior): 6 banners
+  // apilados → 2 filas. Estados de los nuevos affordances plegables.
+  const [videoSettingsOpen, setVideoSettingsOpen] = useState(false); // disclosure "Ajustes del video"
+  const [fixPopoverOpen, setFixPopoverOpen] = useState(false);       // popover del chip "Aplicar corrección"
+  const [overflowOpen, setOverflowOpen] = useState(false);           // menú ⋯ del player bar
   // Toast for per-anchor confirmation feedback.
   const { toast } = useToast();
   // Global timing offset panel — UX entry point for "the whole song is
@@ -960,6 +983,56 @@ export default function LyricsEditor({
     }));
     toast({ message: "Timings restaurados al original", tone: "info" });
   }, [pushEditHistory, toast]);
+
+  // Versión B, parte 2 — "Re-sincronizar con IA". Flujo:
+  //   1. Flush del estado local a /save-segments (el backend re-ancla lo
+  //      que hay en segments_json — sin esto, re-anclaría texto viejo si
+  //      el operador tipeó hace <3s y el autosave no corrió).
+  //   2. POST /jobs/{id}/reanchor vía el callback del padre.
+  //   3. Éxito → reemplazar `edited` con los segments re-anclados (mismo
+  //      seed que el mount; las líneas `locked` vuelven intactas del
+  //      backend) + toast "N re-sincronizadas, M para revisar".
+  //      Decline / error → toast de error, timings quedan como estaban.
+  // El snapshot pre-reanchor va al edit history, así Cmd+Z lo revierte.
+  const [reanchoring, setReanchoring] = useState(false);
+  const canReanchor = !!(onReanchor && transcribeJobId
+    && user?.features?.anchor_lyrics === true);
+  const handleReanchor = useCallback(async () => {
+    if (!onReanchor || !transcribeJobId || reanchoring) return;
+    setReanchoring(true);
+    try {
+      if (onPersistSegments) {
+        const cleaned = edited.map(({ _id, review, ...rest }) => rest);
+        await Promise.resolve(onPersistSegments(transcribeJobId, cleaned));
+      }
+      const res = await Promise.resolve(onReanchor(transcribeJobId));
+      if (res && res.ok && Array.isArray(res.segments) && res.segments.length) {
+        pushEditHistory();
+        // PR E: ids frescos vía el mismo helper que el seed inicial —
+        // consistencia con la identidad estable del store (PR D).
+        setEdited(reseedPreservingIds([], res.segments));
+        toast({
+          message: (t("editor.reanchor_done") || "{n} líneas re-sincronizadas, {m} para revisar")
+            .replace("{n}", String(res.count ?? res.segments.length))
+            .replace("{m}", String(res.review_count ?? 0)),
+          tone: "success",
+        });
+      } else {
+        toast({
+          message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
+          tone: "error",
+        });
+      }
+    } catch {
+      toast({
+        message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
+        tone: "error",
+      });
+    } finally {
+      setReanchoring(false);
+    }
+  }, [onReanchor, onPersistSegments, transcribeJobId, reanchoring, edited,
+      pushEditHistory, toast, t]);
 
   const focusSegment = useCallback((id) => {
     setFocusedSegId(id);
@@ -1406,6 +1479,31 @@ export default function LyricsEditor({
     setCurrentTime(t);
     if (autoplay && a.paused) a.play().catch(() => {});
   }, []);
+
+  // "Revisar →": salta a la SIGUIENTE línea marcada review, en orden.
+  // Cicla. Hace scroll a la fila, foco al input de texto, seek del audio a
+  // su inicio (para escucharla) y un flash breve. Reemplaza el "cazá las
+  // filas pintadas" por un recorrido guiado.
+  const jumpToNextReview = useCallback(() => {
+    const reviewIds = edited.filter((s) => s.review).map((s) => s._id);
+    if (!reviewIds.length) return;
+    const next = (reviewNavIdxRef.current + 1) % reviewIds.length;
+    reviewNavIdxRef.current = next;
+    const id = reviewIds[next];
+    const seg = edited.find((s) => s._id === id);
+    const el = rowRefs.current[id];
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      const input = el.querySelector('input[type="text"]');
+      if (input) input.focus();
+    }
+    if (seg) {
+      setFocusedSegId(id);
+      seekTo(Math.max(0, seg.start), false);
+    }
+    setFlashReviewId(id);
+    setTimeout(() => setFlashReviewId((cur) => (cur === id ? null : cur)), 1200);
+  }, [edited, seekTo]);
 
   // Spacebar: in sync mode, anchors the current line; otherwise toggles
   // play/pause. Cmd/Ctrl+Z (or just Z) reverts the last anchor while
@@ -1927,15 +2025,17 @@ export default function LyricsEditor({
   };
 
   const handleApprove = () => {
-    // QA fix 2026-05-28 (audit P0 #74): bloquear si el último autosave
-    // falló — el backend tiene segments STALE, aprobar mandaría a
-    // re-renderizar con datos viejos sin que el operador se entere.
-    // El chip rojo "Sin guardar — revisá tu conexión" ya marca el
-    // estado, este alert es la confirmación interactiva.
+    // Aviso (no bloqueo) si el último autosave falló. IMPORTANTE — contrato
+    // real verificado (incidente UMG 21-jul-2026): aprobar manda los
+    // segments EN PANTALLA en el cuerpo del POST (onApprove(cleaned) acá;
+    // App los envía en segments_json / edit body y el backend pisa
+    // segments_json antes de renderizar). El autosave fallido solo afecta
+    // el RESPALDO del servidor (reanudar tras refresh / reaper), no el
+    // render. El copy anterior decía lo contrario y llevó a operadores a
+    // no aprobar trabajo que sí estaba a salvo.
     if (saveStatus === "error") {
-      const proceed = window.confirm(
-        "Tu última edición no se guardó (problema de red). Si aprobás ahora se re-renderiza con la última versión guardada en el servidor, no con tus cambios pendientes. ¿Aprobar igual?"
-      );
+      const _copy = _SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server;
+      const proceed = window.confirm(_copy.confirm);
       if (!proceed) return;
     }
     // Check for 3+ line segments before submitting — show a warning banner
@@ -1963,7 +2063,10 @@ export default function LyricsEditor({
   // y suprimimos los badges per-línea (el banner ya transmite la info).
   // Si <3 son review, el badge per-línea queda — es info útil sin saturar.
   const reviewSegCount = edited.reduce((n, s) => n + (s.review ? 1 : 0), 0);
-  const showReviewBanner = reviewSegCount >= 3;
+  // Banner calmo con navegador secuencial: se muestra con ≥1 línea review.
+  // Antes era ≥3 (con badges per-línea abajo); ahora el banner + la barra
+  // de acento sutil cubren cualquier cantidad sin ruido.
+  const showReviewBanner = reviewSegCount >= 1;
 
   // UX 2026-05-26 (cont.): mismo problema con la warning "● ⚠ 2 líneas" + botón
   // "Dividir" que aparece cuando el render del video va a wrappar el texto a
@@ -1976,6 +2079,43 @@ export default function LyricsEditor({
     .map((s) => s._id);
   const wrap2Count = wrap2SegIds.length;
   const showWrap2Banner = wrap2Count >= 3;
+
+  // ─── Rediseño de controles (2026-07) — valores derivados de la nueva
+  // barra de 2 filas: un chip primario "Revisar", un chip ghost "Aplicar
+  // corrección", y un disclosure "Ajustes del video".
+  const cap99 = (n) => (n > 99 ? "99+" : String(n));
+  // Auto-fix (correcciones automáticas del sistema) — antes un banner
+  // verde; ahora un chip ghost con popover de detalle + Deshacer.
+  const splitAvailable = !disableAutoSplit && mergeableSegments.length > 0;
+  const trimAvailable = longSegCount > 0;
+  const hasAutoFix = splitAvailable || hasSuggestions || trimAvailable;
+  const fixCount = (splitAvailable ? 1 : 0) + (hasSuggestions ? 1 : 0) + (trimAvailable ? 1 : 0);
+  const hasUndo = editHistory.length > 0;
+  const applyAllFixes = () => {
+    // Orden: split (cambia el nº de segmentos), luego suggestions (texto
+    // por segmento), luego trim (end por segmento). Cada handler llama a
+    // pushEditHistory así Cmd-Z los deshace paso a paso.
+    if (splitAvailable) autoSplitAllFromReference();
+    if (hasSuggestions) applyAllSuggestions();
+    if (trimAvailable) trimAllLongSegs();
+    setFixPopoverOpen(false);
+  };
+  // "Ajustes del video" (disclosure) — concerns informativos del render:
+  // wrap a 2 renglones + intro instrumental larga. Neutral, sin ámbar.
+  const first = edited[0];
+  const introLong = !!(first && first.start > 3);
+  const videoSettingsCount = (showWrap2Banner ? 1 : 0) + (introLong ? 1 : 0);
+  // Línea de confianza (muted, sin caja): funde "Sincronizado con tu
+  // letra" (si hay líneas review del anclado) + estado del fondo. Si no
+  // hay nada que avisar → "Todo listo".
+  const confidenceParts = [];
+  if (reviewSegCount > 0) confidenceParts.push(t("editor.confidence_synced") || "Sincronizado con tu letra");
+  if (bgStatus === "done") confidenceParts.push(t("editor.confidence_bg_done") || "Fondo listo");
+  else if (bgStatus === "queued" || bgStatus === "generating") confidenceParts.push(t("editor.confidence_bg_generating") || "Generando fondo…");
+  else if (bgStatus === "error") confidenceParts.push(t("editor.confidence_bg_error") || "El fondo se genera al aprobar");
+  const confidenceText = confidenceParts.length
+    ? confidenceParts.join(" · ")
+    : (t("editor.confidence_all_ready") || "Todo listo");
 
   const handleScrub = (e) => {
     if (!duration) return;
@@ -2030,59 +2170,33 @@ export default function LyricsEditor({
         </div>
       </div>
 
-      {/* Chip de status del pre-gen del fondo — UX 2026-05-24. Operador edita
-          lyrics, Veo/Imagen está generando en background. Sin esto el pre-gen
-          era invisible y cambiar un param descartaba un preview sin aviso.
+      {/* El status del pre-gen del fondo ("Fondo listo" / "Generando…") ya
+          NO es un pill propio (2026-07 rediseño): se funde en la línea de
+          confianza muted debajo del player bar (ver confidenceText). */}
 
-          Branch "error": el pre-gen falló pero NO es una falla que el operador
-          deba accionar — el sistema reintenta cuando aprueta "Aprobar y
-          generar". Antes el chip estaba en amber + ícono `!` que leía como
-          warning y la copy decía "se generará..." en tono positivo: lenguaje
-          visual contradiciendo el copy. Ahora es brand-color + ícono `i`
-          (info), copy alineado con el CTA real ("apruebes y generes" matchea
-          "Aprobar y generar"). El amber queda reservado para errores que SÍ
-          requieren acción del operador. (UI review 2026-05-26, F4.) */}
-      {bgStatus && bgStatus !== "idle" && bgStatus !== "disabled" && (
-        <div className={`mb-3 inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-caption
-            ${bgStatus === "done"
-              ? "bg-accent/10 text-accent-light ring-1 ring-accent/30"
-              : "bg-brand/10 text-brand-light ring-1 ring-brand/30"}`}>
-          {bgStatus === "queued" || bgStatus === "generating" ? (
-            <>
-              <svg className="w-3 h-3 animate-spin" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                <path d="M21 12a9 9 0 11-6.219-8.56" strokeLinecap="round" />
-              </svg>
-              <span>{t("editor.bg_generating") || "Generando fondo en background…"}</span>
-            </>
-          ) : bgStatus === "done" ? (
-            <>
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
-                <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-              <span>{t("editor.bg_done") || "Fondo listo"}</span>
-            </>
-          ) : bgStatus === "error" ? (
-            <>
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12" y2="11" />
-              </svg>
-              <span>{t("editor.bg_preview_placeholder") || t("editor.bg_error") || "Vas a ver el fondo final cuando apruebes y generes. El preview de ahora es una muestra."}</span>
-            </>
-          ) : null}
-        </div>
-      )}
-
-      {/* Fixed floating primary CTA — always reachable, never cut. */}
-      <button
-        onClick={handleApprove}
-        data-tour="editor-approve-floating"
-        className="editor-primary-cta fixed bottom-6 right-6 z-50 inline-flex items-center gap-1.5 btn-primary text-sm h-12 px-6 shadow-2xl shadow-brand/30"
-      >
-        {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
-        <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-          <path d="M5 12h14M12 5l7 7-7 7" />
-        </svg>
-      </button>
+      {/* Docked primary CTA — a fixed bottom action BAR, not a bare floating
+          pill. The full-width gradient scrim means lyric lines scroll BEHIND
+          a solid edge instead of under a translucent button (kills the
+          overlap the pill had over the last rows — UX review 2026-07-16),
+          and the button still can never be cut by the app's sticky top bar
+          (the recurring "botón cortado" this fixed-position was chosen to
+          avoid). `pointer-events-none` on the scrim lets clicks reach the
+          list in the transparent upper region; the button re-enables them.
+          The container's pb-28 still reserves space so the last row clears
+          the bar when scrolled to the end. */}
+      <div className="fixed bottom-0 left-0 right-0 z-50 pointer-events-none flex justify-end
+        bg-gradient-to-t from-surface via-surface/95 to-transparent pt-10 pb-5 px-6">
+        <button
+          onClick={handleApprove}
+          data-tour="editor-approve-floating"
+          className="editor-primary-cta pointer-events-auto inline-flex items-center gap-1.5 btn-primary text-sm h-12 px-6 shadow-2xl shadow-brand/30"
+        >
+          {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M5 12h14M12 5l7 7-7 7" />
+          </svg>
+        </button>
+      </div>
 
       {coverageWarning && (
         <div className="mb-4 rounded-2xl ring-1 ring-accent/25 bg-accent/[0.06] px-4 py-3 flex items-start gap-3">
@@ -2096,131 +2210,10 @@ export default function LyricsEditor({
         </div>
       )}
 
-      {/* ─── Auto-fix actions consolidated panel ───────────────────────
-          Combines three independent system-detected fixes (auto-split,
-          ortographic suggestions, hanging-text trim) into one accent-
-          color panel so the operator sees ONE action instead of three
-          competing amber banners stacked vertically.
-
-          Incident 2026-05-16: with three separate banners + a "N
-          sugerencias" line, the operator reported "demasiados mensajes
-          poco jerarquizados" — couldn't tell what to do first or
-          whether the counters were related. Consolidating into a
-          single accent panel signals "system can fix N things for
-          you" instead of three competing alerts.
-
-          Color choice: accent (green) instead of amber. Amber screams
-          "warning"; the fixes are positive automations the system
-          already prepared, not problems the operator caused.
-
-          The panel also absorbs the standalone "Aplicar todas" /
-          "Deshacer" row that was below the auto-split banner. */}
-      {(() => {
-        // Auto-fix is text/structure correction — a Lista-view concern.
-        // Hide it in the timeline workspace so that view stays focused on
-        // the preview + timeline (less vertical clutter above the fold).
-        if (viewMode === "timeline") return null;
-        const splitAvailable = !disableAutoSplit && mergeableSegments.length > 0;
-        const trimAvailable = longSegCount > 0;
-        const hasAutoFix = splitAvailable || hasSuggestions || trimAvailable;
-        const hasUndo = editHistory.length > 0;
-        if (!hasAutoFix && !hasUndo) return null;
-        const fixCount = (splitAvailable ? 1 : 0) + (hasSuggestions ? 1 : 0) + (trimAvailable ? 1 : 0);
-        const applyAllFixes = () => {
-          // Order matters: split first (changes segment count), then
-          // suggestions (per-segment text), then trim (per-segment end).
-          // Each individual handler calls pushEditHistory() so Cmd-Z
-          // unwinds them step by step.
-          if (splitAvailable) autoSplitAllFromReference();
-          if (hasSuggestions) applyAllSuggestions();
-          if (trimAvailable) trimAllLongSegs();
-        };
-        /* Phase B 2026-05-25: pill compacto en vez del card grande.
-           - Default (autoFixExpanded=false): pill de 32px con icon ✓ +
-             "N correcciones · [Aplicar] [↺ Deshacer] [▾]". El operador
-             ve qué hay y aplica con 1 click sin desplegar.
-           - Click en ▾: expande con la lista de detalle (las 3 líneas
-             del card original). Click otra vez colapsa.
-           - Reduce el overhead vertical de 120-180px → 32px (default)
-             o 80px (expandido). */
-        return (
-          <div className="mb-3 rounded-xl ring-1 ring-accent/25 bg-accent/[0.05] px-3 py-2">
-            <div className="flex items-center gap-2 min-h-[28px]">
-              {hasAutoFix && (
-                <>
-                  <svg className="w-4 h-4 text-accent flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
-                    <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
-                  </svg>
-                  <p className="text-xs font-medium text-white flex-1 min-w-0 truncate">
-                    {fixCount === 1
-                      ? (t("editor.autofix_title_singular") || "1 corrección automática disponible")
-                      : (t("editor.autofix_title_plural") || "{n} correcciones automáticas disponibles").replace("{n}", fixCount)}
-                  </p>
-                  <button
-                    type="button"
-                    onClick={applyAllFixes}
-                    className="shrink-0 px-2.5 py-1 rounded-md text-[11px] font-semibold text-white bg-accent hover:bg-accent/90 transition-colors"
-                  >
-                    {fixCount === 1
-                      ? (t("editor.autofix_apply_one") || "Aplicar")
-                      : (t("editor.autofix_apply_all_short") || "Aplicar todo")}
-                  </button>
-                </>
-              )}
-              {hasUndo && (
-                <button
-                  onClick={undoEdit}
-                  title={t("editor.undo_hint") || "Cmd/Ctrl+Z"}
-                  className="shrink-0 text-[11px] font-medium text-gray-400 hover:text-white transition-colors flex items-center gap-1 px-2 py-1 rounded-md bg-white/[0.04] hover:bg-white/[0.08] ring-1 ring-white/[0.06]"
-                >
-                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                    <path d="M3 7v6h6M3 13a9 9 0 109-9" strokeLinecap="round" strokeLinejoin="round" />
-                  </svg>
-                  {t("editor.undo") || "Deshacer"}
-                </button>
-              )}
-              {hasAutoFix && fixCount > 0 && (
-                <button
-                  type="button"
-                  onClick={() => setAutoFixExpanded((v) => !v)}
-                  title={autoFixExpanded ? "Ocultar detalle" : "Ver detalle"}
-                  aria-label={autoFixExpanded ? "Ocultar detalle" : "Ver detalle"}
-                  className="shrink-0 w-6 h-6 rounded-md text-gray-400 hover:text-white hover:bg-white/[0.06] transition-colors flex items-center justify-center"
-                >
-                  <svg
-                    className={`w-3 h-3 transition-transform ${autoFixExpanded ? "rotate-180" : ""}`}
-                    fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24"
-                  >
-                    <polyline points="6 9 12 15 18 9" strokeLinecap="round" strokeLinejoin="round" />
-                  </svg>
-                </button>
-              )}
-            </div>
-            {hasAutoFix && autoFixExpanded && (
-              <ul className="mt-2 pl-6 space-y-1 animate-fade-in">
-                {splitAvailable && (
-                  <li className="text-[11px] text-ink-secondary flex items-center gap-2">
-                    <span className="text-gray-600 font-mono text-[10px]">└</span>
-                    {(t("editor.autofix_split") || "Auto-dividir {n} líneas mergeadas").replace("{n}", mergeableSegments.length)}
-                  </li>
-                )}
-                {hasSuggestions && (
-                  <li className="text-[11px] text-ink-secondary flex items-center gap-2">
-                    <span className="text-gray-600 font-mono text-[10px]">└</span>
-                    {(t("editor.autofix_suggestions") || "Aplicar {n} sugerencias ortográficas").replace("{n}", pendingSuggestions)}
-                  </li>
-                )}
-                {trimAvailable && (
-                  <li className="text-[11px] text-ink-secondary flex items-center gap-2">
-                    <span className="text-gray-600 font-mono text-[10px]">└</span>
-                    {(t("editor.autofix_trim") || "Recortar {n} líneas con texto colgado").replace("{n}", longSegCount)}
-                  </li>
-                )}
-              </ul>
-            )}
-          </div>
-        );
-      })()}
+      {/* El panel de auto-fix (correcciones automáticas) ya NO es un banner
+          verde propio (2026-07 rediseño): se volvió el chip ghost "Aplicar
+          corrección · N" de la fila de chips, con su detalle + Deshacer en
+          un popover. Ver la fila de chips más abajo. */}
 
       {/* QA fix 2026-05-28 (audit P0 #74): banner persistente del estado
           autosave. En LIST view no había feedback visible cuando una
@@ -2237,11 +2230,10 @@ export default function LyricsEditor({
           </svg>
           <div className="flex-1 min-w-0">
             <p className="text-[12px] text-red-300 font-medium">
-              No pudimos guardar tu última edición
+              {(_SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server).short}
             </p>
             <p className="text-[10px] text-red-300/70 mt-0.5">
-              Probablemente perdiste conexión. Volvemos a intentar
-              automáticamente cuando edites algo más.
+              {(_SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server).detail}
             </p>
           </div>
           <button
@@ -2271,16 +2263,18 @@ export default function LyricsEditor({
           mano, GC de R2 después de 30 d, etc.) perdieran acceso al toggle
           de vista y al editor de texto, sólo viendo una lista plana sin
           forma de cambiar la vista. */}
-      {(
+      {(() => { const _playerBar = (
         /* Phase B 2026-05-25: sticky para que el play/pause + scrub
            siempre estén accesibles mientras el operador scrollea la
            lista de líneas. top usa stickyHeaderTop (passed by parent)
            para clear el header superior si lo hay. backdrop-blur +
            bg semi-transparente para que el contenido scrolleado abajo
-           se vea sutil debajo. z-20 sobre el contenido normal del editor. */
+           se vea sutil debajo. z-20 sobre el contenido normal del editor.
+           Cuando se portalea bajo el video (playerSlot), NO va sticky ni
+           lleva el offset del header — vive estático debajo del preview. */
         <div
-          className="mb-3 sticky z-20 backdrop-blur-md bg-surface-1/85 flex items-center gap-3 px-3 py-2.5 rounded-card ring-1 ring-white/[0.05]"
-          style={{ top: stickyHeaderTop || 0 }}
+          className={`${playerSlot ? "" : "mb-3 sticky z-20"} backdrop-blur-md bg-surface-1/85 flex items-center gap-3 p-3 rounded-xl ring-1 ring-white/[0.04]`}
+          style={playerSlot ? undefined : { top: stickyHeaderTop || 0 }}
           data-tour="editor-playbar"
         >
           {/* Reproductor + scrub bar: solo si hay audio. Sin audio mostramos
@@ -2343,18 +2337,13 @@ export default function LyricsEditor({
             </div>
           )}
           {/* Lista | Línea de tiempo — the timeline is a VIEW of the same
-              editor (shared state), default Lista so the existing flow is
-              untouched. Desktop feature: hidden on narrow screens where the
-              fine drag is impractical. */}
-          <div className="hidden md:inline-flex shrink-0 rounded-md ring-1 ring-white/[0.08] overflow-hidden text-label">
-            {/* UI F9 (2026-05-26): tooltips diferenciando qué vista es
-                mejor para cada tarea. Antes el toggle presentaba ambas
-                vistas como equivalentes — pero corregir TEXTO es más
-                eficiente en Lista (input ancho por línea), y revisar
-                TIMING es mejor en Línea de tiempo (drag visual). */}
+              editor (shared state), default Lista. Narrow/mobile: icon-only
+              (labels ocultos) para que el toggle entre sin empujar el ⋯. */}
+          <div className="inline-flex shrink-0 rounded-md ring-1 ring-white/[0.08] overflow-hidden text-label">
             <button
               onClick={() => setViewMode("list")}
               title="Mejor para corregir el texto: cada línea en una fila ancha con input directo."
+              aria-label={t("editor.view_list") || "Lista"}
               className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "list" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
             >
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -2365,11 +2354,12 @@ export default function LyricsEditor({
                 <circle cx="3.5" cy="12" r="1" fill="currentColor" stroke="none" />
                 <circle cx="3.5" cy="18" r="1" fill="currentColor" stroke="none" />
               </svg>
-              Lista
+              <span className="hidden sm:inline">{t("editor.view_list") || "Lista"}</span>
             </button>
             <button
               onClick={() => setViewMode("timeline")}
               title="Mejor para revisar el timing: cada línea en su posición temporal, arrastrable."
+              aria-label={t("editor.view_timeline") || "Línea de tiempo"}
               className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "timeline" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
             >
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -2377,119 +2367,319 @@ export default function LyricsEditor({
                 <rect x="13" y="13" width="7" height="4" rx="1" />
                 <line x1="3" y1="3" x2="3" y2="21" strokeLinecap="round" opacity="0.5" />
               </svg>
-              Línea de tiempo
+              <span className="hidden sm:inline">{t("editor.view_timeline") || "Línea de tiempo"}</span>
             </button>
           </div>
-          {/* 2026-05-25 Studio Console — Modo Enfoque toggle.
-              Botón discreto al lado del view switcher. Esconde ruido
-              (auto-fix collapse) y agranda max-h de la lista + timeline.
-              Atajo F (global, no en inputs). */}
-          <button
-            type="button"
-            onClick={toggleFocusMode}
-            aria-pressed={focusMode}
-            title={focusMode
-              ? (t("editor.focus_exit") || "Salir de modo enfoque (F)")
-              : (t("editor.focus_enter") || "Modo enfoque (F)")
-            }
-            className={`hidden md:inline-flex shrink-0 w-8 h-8 rounded-md ring-1 transition-colors items-center justify-center
-              ${focusMode
-                ? "ring-brand/40 bg-brand/15 text-brand-light"
-                : "ring-white/[0.08] text-ink-secondary hover:text-brand-light hover:bg-brand/10 hover:ring-brand/30"}`}
-          >
-            {focusMode ? (
-              /* contract icon — flechas hacia adentro */
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                <path d="M9 4v6H3M21 14h-6v6" strokeLinecap="round" strokeLinejoin="round" />
-                <path d="M9 10L4 5M15 14l5 5" strokeLinecap="round" strokeLinejoin="round" />
+          {/* ⋯ Overflow — 2026-07 rediseño: absorbe los controles secundarios
+              (Expandir/Enfoque, Re-sincronizar con IA, Modo Sync) que antes
+              eran botones sueltos en la barra. Re-sincronizar es una acción
+              PESADA → no vive como botón púrpura permanente. */}
+          <div className="relative shrink-0">
+            <button
+              type="button"
+              data-testid="editor-overflow-btn"
+              onClick={() => setOverflowOpen((v) => !v)}
+              aria-haspopup="menu"
+              aria-expanded={overflowOpen}
+              title={t("editor.more_actions") || "Más acciones"}
+              aria-label={t("editor.more_actions") || "Más acciones"}
+              className={`inline-flex shrink-0 w-8 h-8 rounded-md ring-1 transition-colors items-center justify-center
+                ${overflowOpen
+                  ? "ring-brand/40 bg-brand/15 text-brand-light"
+                  : "ring-white/[0.08] text-ink-secondary hover:text-brand-light hover:bg-brand/10 hover:ring-brand/30"}`}
+            >
+              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                <circle cx="5" cy="12" r="1.6" /><circle cx="12" cy="12" r="1.6" /><circle cx="19" cy="12" r="1.6" />
               </svg>
-            ) : (
-              /* expand icon — flechas hacia afuera */
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                <path d="M4 9V4h5M20 15v5h-5M4 9l5-5M20 15l-5 5" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
+            </button>
+            {overflowOpen && (
+              <>
+                {/* backdrop para cerrar al click afuera */}
+                <button
+                  type="button"
+                  aria-hidden="true"
+                  tabIndex={-1}
+                  onClick={() => setOverflowOpen(false)}
+                  className="fixed inset-0 z-20 cursor-default"
+                />
+                <div
+                  role="menu"
+                  className="absolute right-0 top-full mt-1.5 z-30 w-56 py-1 rounded-xl bg-surface-1 ring-1 ring-white/[0.08] shadow-2xl shadow-black/40 animate-fade-in"
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => { toggleFocusMode(); setOverflowOpen(false); }}
+                    className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-gray-200 hover:bg-white/[0.05] transition-colors"
+                  >
+                    <svg className="w-3.5 h-3.5 text-ink-secondary shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                      {focusMode
+                        ? <><path d="M9 4v6H3M21 14h-6v6" strokeLinecap="round" strokeLinejoin="round" /><path d="M9 10L4 5M15 14l5 5" strokeLinecap="round" strokeLinejoin="round" /></>
+                        : <path d="M4 9V4h5M20 15v5h-5M4 9l5-5M20 15l-5 5" strokeLinecap="round" strokeLinejoin="round" />}
+                    </svg>
+                    {focusMode
+                      ? (t("editor.focus_exit") || "Salir de modo enfoque")
+                      : (t("editor.focus_enter") || "Expandir (modo enfoque)")}
+                  </button>
+                  {canReanchor && !syncMode && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      data-testid="reanchor-btn"
+                      onClick={() => { handleReanchor(); setOverflowOpen(false); }}
+                      disabled={reanchoring}
+                      title={t("editor.reanchor_hint") || "Vuelve a alinear el timing de cada línea con el audio usando el texto ya corregido. Las líneas que moviste a mano no se tocan."}
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-gray-200 hover:bg-white/[0.05] transition-colors disabled:opacity-50 disabled:cursor-wait"
+                    >
+                      {reanchoring ? (
+                        <span className="w-3.5 h-3.5 border-[1.5px] border-brand-light border-t-transparent rounded-full animate-spin shrink-0" />
+                      ) : (
+                        <svg className="w-3.5 h-3.5 text-brand-light shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                          <path d="M21 12a9 9 0 11-2.64-6.36" strokeLinecap="round" />
+                          <path d="M21 3v6h-6" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                      )}
+                      {reanchoring
+                        ? (t("editor.reanchor_running") || "Re-sincronizando…")
+                        : (t("editor.reanchor") || "Re-sincronizar con IA")}
+                    </button>
+                  )}
+                  {!syncMode && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      data-tour="editor-sync-entry"
+                      onClick={() => { enterSyncMode(); setOverflowOpen(false); }}
+                      title={t("editor.sync_cta_hint") || "Modo Sync — anclar timings por tap (⌘K / Ctrl+K)"}
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-gray-200 hover:bg-white/[0.05] transition-colors"
+                    >
+                      <svg className="w-3.5 h-3.5 text-ink-secondary shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                        <circle cx="12" cy="12" r="9" />
+                        <circle cx="12" cy="12" r="4" />
+                        <circle cx="12" cy="12" r="1" fill="currentColor" />
+                      </svg>
+                      {t("editor.sync_enter_full") || "Re-anclar por tap (Modo Sync)"}
+                    </button>
+                  )}
+                </div>
+              </>
             )}
-          </button>
-          {/* Sync mode entry — refactor 2026-05-23: pasó de botón ruidoso
-              con texto a ícono discreto al lado del switcher. Atajo Cmd+K
-              añadido al keyboard handler. */}
-          {!syncMode && (
-            <>
+          </div>
+        </div>
+      ); return playerSlot ? createPortal(_playerBar, playerSlot) : _playerBar; })()}
+
+      {/* ─── Zona de controles — rediseño 2026-07 (spec de diseño) ───────
+          Antes: 6 banners full-width apilados (bg pill, auto-fix verde,
+          review verde, wrap2 ámbar, intro) = ruido, parecía todo roto con
+          un sync excelente (0,13s mediana). Ahora, debajo del player bar:
+          (1) línea de confianza muted sin caja, (2) fila de MÁX 2 chips
+          [Aplicar corrección · N] + [Revisar · •N →], (3) disclosure
+          "Ajustes del video (N) ▾" plegado. Ningún elemento usa ámbar
+          salvo el punto del contador Revisar (match con las barritas de la
+          lista). Contadores capean 99+. */}
+
+      {/* (1) Línea de confianza — muted, text-xs, check teal, sin caja.
+          Funde estado de sync + fondo. Trunca con ellipsis en narrow.
+          pl-3 alinea su check verde con el del chip "Aplicar corrección"
+          (que lo indenta su propio padding de contenedor) — sin esto los
+          dos tics verdes quedaban desalineados (reporte Tomi 2026-07-16). */}
+      {/* Se portalea al slot bajo el video (es estado del VIDEO, no de la
+          letra) cuando el wizard pasa playerSlot; así la columna de la
+          letra sube. En modal/inline queda acá. mt-2 separa del player bar
+          cuando va portaleado. */}
+      {(() => { const _conf = (
+        <div className={`${playerSlot ? "mt-2" : ""} mb-1 pl-3 flex items-center gap-1.5 text-xs text-ink-secondary min-w-0`} data-testid="editor-confidence">
+          <svg className="w-3.5 h-3.5 text-emerald-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
+            <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <span className="truncate">{confidenceText}</span>
+        </div>
+      ); return playerSlot ? createPortal(_conf, playerSlot) : _conf; })()}
+
+      {/* (2) Fila de chips (máx 2). Cada chip = icono + verbo + número (no
+          oraciones). Wrap en narrow. */}
+      {(fixCount > 0 || showReviewBanner) && (
+        <div className="mb-3 flex flex-wrap items-center gap-2" data-testid="editor-chip-row">
+          {/* Chip ghost "Aplicar corrección · N": aplica inline; el caret ▾
+              abre popover con el detalle (ver-diff) + Deshacer. N=0 → no
+              renderiza. */}
+          {fixCount > 0 && (
+            <div className="relative inline-flex">
               <button
-                data-tour="editor-sync-entry"
-                onClick={enterSyncMode}
-                title={t("editor.sync_cta_hint") || "Modo Sync — anclar timings por tap (⌘K / Ctrl+K)"}
-                aria-label={t("editor.sync_enter_compact") || "Modo Sync"}
-                className="hidden md:inline-flex shrink-0 w-8 h-8 rounded-md ring-1 ring-white/[0.08]
-                  text-ink-secondary hover:text-brand-light hover:bg-brand/10 hover:ring-brand/30
-                  transition-colors items-center justify-center"
+                type="button"
+                onClick={applyAllFixes}
+                data-testid="apply-fix-chip"
+                title={t("editor.autofix_apply_all_short") || "Aplicar todo"}
+                className="inline-flex items-center gap-1.5 h-8 pl-3 pr-2.5 rounded-l-lg text-[12px] font-medium
+                  bg-white/[0.04] ring-1 ring-white/[0.08] text-gray-200 hover:bg-white/[0.08] hover:text-white transition-colors"
               >
-                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                  <circle cx="12" cy="12" r="9" />
-                  <circle cx="12" cy="12" r="4" />
-                  <circle cx="12" cy="12" r="1" fill="currentColor" />
+                <svg className="w-3.5 h-3.5 text-emerald-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
+                  <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                <span>{t("editor.chip_apply_fix") || "Aplicar corrección"}</span>
+                <span className="text-gray-500">·</span>
+                <span className="tabular-nums">{cap99(fixCount)}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setFixPopoverOpen((v) => !v)}
+                data-testid="apply-fix-caret"
+                aria-haspopup="menu"
+                aria-expanded={fixPopoverOpen}
+                title="Ver cambios y deshacer"
+                aria-label="Ver cambios y deshacer"
+                className="inline-flex items-center h-8 px-1.5 -ml-px rounded-r-lg
+                  bg-white/[0.04] ring-1 ring-white/[0.08] text-gray-400 hover:bg-white/[0.08] hover:text-white transition-colors"
+              >
+                <svg className={`w-3 h-3 transition-transform ${fixPopoverOpen ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
+                  <polyline points="6 9 12 15 18 9" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
               </button>
-              <HelpTip articleId="manual-sync" className="hidden md:inline-flex" />
-            </>
+              {fixPopoverOpen && (
+                <>
+                  <button
+                    type="button"
+                    aria-hidden="true"
+                    tabIndex={-1}
+                    onClick={() => setFixPopoverOpen(false)}
+                    className="fixed inset-0 z-20 cursor-default"
+                  />
+                  <div
+                    role="menu"
+                    data-testid="apply-fix-popover"
+                    className="absolute left-0 top-full mt-1.5 z-30 w-64 p-2 rounded-xl bg-surface-1 ring-1 ring-white/[0.08] shadow-2xl shadow-black/40 animate-fade-in"
+                  >
+                    <ul className="space-y-1 px-1 py-0.5">
+                      {splitAvailable && (
+                        <li className="text-[11px] text-ink-secondary flex items-center gap-2">
+                          <span className="text-gray-600 font-mono text-[10px]">└</span>
+                          {(t("editor.autofix_split") || "Auto-dividir {n} líneas mergeadas").replace("{n}", mergeableSegments.length)}
+                        </li>
+                      )}
+                      {hasSuggestions && (
+                        <li className="text-[11px] text-ink-secondary flex items-center gap-2">
+                          <span className="text-gray-600 font-mono text-[10px]">└</span>
+                          {(t("editor.autofix_suggestions") || "Aplicar {n} sugerencias ortográficas").replace("{n}", pendingSuggestions)}
+                        </li>
+                      )}
+                      {trimAvailable && (
+                        <li className="text-[11px] text-ink-secondary flex items-center gap-2">
+                          <span className="text-gray-600 font-mono text-[10px]">└</span>
+                          {(t("editor.autofix_trim") || "Recortar {n} líneas con texto colgado").replace("{n}", longSegCount)}
+                        </li>
+                      )}
+                    </ul>
+                    {hasUndo && (
+                      <div className="mt-1.5 pt-1.5 border-t border-white/[0.06]">
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => { undoEdit(); setFixPopoverOpen(false); }}
+                          title={t("editor.undo_hint") || "Cmd/Ctrl+Z"}
+                          className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-[11px] text-gray-300 hover:text-white hover:bg-white/[0.05] transition-colors"
+                        >
+                          <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                            <path d="M3 7v6h6M3 13a9 9 0 109-9" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                          {t("editor.undo") || "Deshacer"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+          {/* Chip PRIMARIO "Revisar · •N →": navegador secuencial. Punto
+              ámbar 6px en el número (único ámbar del header, match con las
+              barritas de la lista). Al llegar a 0 no renderiza (auto-oculta). */}
+          {showReviewBanner && (
+            <button
+              type="button"
+              onClick={jumpToNextReview}
+              data-testid="review-next-btn"
+              title={t("editor.review_next_hint") || "Saltar a la siguiente línea para revisar"}
+              className="inline-flex items-center gap-1.5 h-8 pl-3 pr-2.5 rounded-lg text-[12px] font-semibold
+                bg-brand/15 ring-1 ring-brand/40 text-brand-light hover:bg-brand/25 transition-colors animate-fade-in"
+            >
+              <span>{t("editor.review_next") || "Revisar"}</span>
+              <span className="inline-flex items-center gap-1">
+                <span className="text-brand-light/40">·</span>
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" aria-hidden="true" />
+                <span className="tabular-nums">{cap99(reviewSegCount)}</span>
+              </span>
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24">
+                <path d="M5 12h14M12 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
           )}
         </div>
       )}
 
-      {/* UX 2026-05-26: banner agregado cuando ≥ 3 segments tienen `review:
-          true` (típicamente porque synced-direct fallback de PR #365 emitió
-          todas las líneas con timing aproximado de lrclib synced + offset).
-          Reemplaza los 28 badges per-línea — un solo cartel transmite la
-          misma info sin saturar visualmente. */}
-      {showReviewBanner && (
-        <div className="mb-3 px-3 py-2 rounded-card bg-amber-500/[0.08] ring-1 ring-amber-500/30 flex items-start gap-2.5 animate-fade-in">
-          <svg className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <path d="M12 9v4M12 17h.01" />
-            <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
-          </svg>
-          <p className="text-xs text-amber-100 leading-relaxed">
-            <span className="font-semibold">
-              {(t("editor.review_banner_count") || "{n} líneas con timing aproximado").replace("{n}", reviewSegCount)}
-            </span>
-            {" — "}
-            {t("editor.review_banner_hint") || "estas líneas vienen de la letra de referencia. Escuchá la canción y ajustá si alguna no entra en el momento correcto."}
-          </p>
+      {/* (3) Disclosure "Ajustes del video (N) ▾" — plegado. Concerns
+          informativos del render (wrap a 2 renglones, intro instrumental).
+          Neutral, SIN ámbar. Filas wrap a 2 líneas en narrow. */}
+      {videoSettingsCount > 0 && (() => { const _vset = (
+        <div className="mb-5 pl-3" data-testid="video-settings-disclosure">
+          <button
+            type="button"
+            onClick={() => setVideoSettingsOpen((v) => !v)}
+            aria-expanded={videoSettingsOpen}
+            className="inline-flex items-center gap-1.5 text-xs text-ink-secondary hover:text-white transition-colors"
+          >
+            <span>{t("editor.video_settings") || "Ajustes del video"}</span>
+            <span className="tabular-nums text-gray-500">({cap99(videoSettingsCount)})</span>
+            <svg className={`w-3 h-3 transition-transform ${videoSettingsOpen ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
+              <polyline points="6 9 12 15 18 9" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+          {videoSettingsOpen && (
+            <div className="mt-2 space-y-2 animate-fade-in">
+              {showWrap2Banner && (
+                <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+                  <p className="text-xs text-ink-secondary flex-1 min-w-0">
+                    {(t("editor.video_wrap2") || "2 renglones en el video · {n} líneas — se ven OK").replace("{n}", wrap2Count)}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => { pushEditHistory(); wrap2SegIds.forEach((id) => splitSeg(id)); }}
+                    className="shrink-0 text-[11px] font-medium px-2.5 py-1 rounded-md bg-white/[0.06] ring-1 ring-white/[0.08] text-gray-200 hover:bg-white/[0.1] hover:text-white transition-colors"
+                  >
+                    {t("editor.wrap2_banner_split_all") || "Dividir todas"}
+                  </button>
+                </div>
+              )}
+              {introLong && (
+                <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+                  <p className="text-xs text-ink-secondary flex-1 min-w-0">
+                    {(t("editor.video_intro") || "Intro instrumental · {s}s (arranca {t})")
+                      .replace("{s}", Math.round(first.start))
+                      .replace("{t}", formatTimestamp(first.start))}
+                  </p>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => shiftAllSegments(-(first.start - 2))}
+                      title={`Mover todas las líneas hacia atrás ${(first.start - 2).toFixed(1)}s — el primer lyric arrancará a los 2 s.`}
+                      className="text-[11px] font-medium px-2.5 py-1 rounded-md bg-white/[0.06] ring-1 ring-white/[0.08] text-gray-200 hover:bg-white/[0.1] hover:text-white transition-colors"
+                    >
+                      {t("editor.intro_trim_to_2") || "Recortar a 2s"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => shiftAllSegments(-first.start)}
+                      title={`Mover todas las líneas hacia atrás ${first.start.toFixed(1)}s — el primer lyric arrancará al segundo 0.`}
+                      className="text-[11px] font-medium px-2.5 py-1 rounded-md text-gray-400 hover:text-white hover:bg-white/[0.05] transition-colors"
+                    >
+                      {t("editor.intro_trim_to_0") || "Empezar en 0s"}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
-      )}
-
-      {/* UX 2026-05-26: banner agregado cuando ≥ 3 segments tienen wrap a
-          2 renglones en el render del video. Mismo problema visual que el
-          review banner: 28 indicadores apilados "● ⚠ 2 líneas + Dividir"
-          saturan. Banner único + bulk action "Dividir todas". Los casos
-          3+ líneas (más urgentes) siguen mostrándose inline porque son
-          menos comunes y la acción es por línea. */}
-      {showWrap2Banner && (
-        <div className="mb-3 px-3 py-2 rounded-card bg-amber-500/[0.06] ring-1 ring-amber-500/20 flex items-start gap-2.5 animate-fade-in">
-          <svg className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <path d="M12 9v4M12 17h.01" />
-            <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
-          </svg>
-          <div className="flex-1 flex items-center justify-between gap-3">
-            <p className="text-xs text-amber-100 leading-relaxed">
-              <span className="font-semibold">
-                {(t("editor.wrap2_banner_count") || "{n} líneas pasarán a 2 renglones en el video").replace("{n}", wrap2Count)}
-              </span>
-              {" — "}
-              {t("editor.wrap2_banner_hint") || "se ven OK como están, pero podés dividirlas si querés líneas más cortas en el video."}
-            </p>
-            <button
-              type="button"
-              onClick={() => {
-                pushEditHistory();
-                wrap2SegIds.forEach((id) => splitSeg(id));
-              }}
-              className="text-[11px] font-medium px-2.5 py-1 rounded-lg bg-amber-500/15 ring-1 ring-amber-500/30 text-amber-200 hover:bg-amber-500/25 transition-colors whitespace-nowrap shrink-0"
-            >
-              {t("editor.wrap2_banner_split_all") || "Dividir todas"}
-            </button>
-          </div>
-        </div>
-      )}
+      ); return playerSlot ? createPortal(_vset, playerSlot) : _vset; })()}
 
       {audioUrl && syncMode && (
         <div className="mb-3 px-3 py-2 rounded-card bg-brand/[0.08] ring-1 ring-brand/40 animate-fade-in">
@@ -2584,39 +2774,10 @@ export default function LyricsEditor({
         const first = edited[0];
         const second = edited[1];
 
-        if (first.start > 3) {
-          return (
-            <div className="mb-3 px-3 py-2.5 rounded-card bg-brand/[0.06] ring-1 ring-brand/20 flex items-center gap-3 animate-fade-in">
-              <svg className="w-4 h-4 text-brand-light shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
-                <path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
-              </svg>
-              <p className="text-xs text-ink-secondary flex-1">
-                {t("editor.intro_long_title") || "Tu canción arranca a"}{" "}
-                <span className="font-mono text-brand-light">{formatTimestamp(first.start)}</span>
-                {" "}
-                <span className="text-gray-500">
-                  ({Math.round(first.start)}s {t("editor.intro_long_hint") || "de intro instrumental"})
-                </span>
-              </p>
-              <button
-                onClick={() => shiftAllSegments(-(first.start - 2))}
-                title={`Mover todas las líneas hacia atrás ${(first.start - 2).toFixed(1)}s — el primer lyric arrancará a los 2 s.`}
-                className="shrink-0 text-label px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
-                  ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
-              >
-                {t("editor.intro_trim_to_2") || "Recortar a 2s"}
-              </button>
-              <button
-                onClick={() => shiftAllSegments(-first.start)}
-                title={`Mover todas las líneas hacia atrás ${first.start.toFixed(1)}s — el primer lyric arrancará al segundo 0.`}
-                className="shrink-0 text-label px-3 py-1.5 rounded-lg bg-surface-2/60
-                  ring-1 ring-white/[0.06] text-gray-300 hover:bg-surface-2 hover:text-white transition-colors"
-              >
-                {t("editor.intro_trim_to_0") || "Empezar en 0s"}
-              </button>
-            </div>
-          );
-        }
+        // El caso "intro instrumental larga" (first.start > 3) YA no es un
+        // banner propio (2026-07 rediseño): es una fila del disclosure
+        // "Ajustes del video" (ver arriba). Acá queda sólo el patrón de
+        // lrclib "línea 1 en 0:00" que es una sugerencia distinta.
 
         // Detect lrclib's "first line at 0:00" pattern: line 1 is near
         // t=0 but line 2 is suspiciously far away — usually an LRC
@@ -3042,9 +3203,15 @@ export default function LyricsEditor({
                 data-active={isActive && !isArmed ? "true" : "false"}
                 className={`group rounded-xl transition-all
                   ${isArmed ? "bg-brand/[0.18] ring-2 ring-brand shadow-glow scale-[1.01]" : ""}
-                  ${!isArmed && isActive ? "wlp-active-row bg-brand/15 border-l-4 border-brand pl-1 shadow-[0_0_24px_-8px_rgba(109,74,255,0.45)]" : "border-l-4 border-transparent"}
+                  ${!isArmed && isActive ? "wlp-active-row bg-brand/15 border-l-4 border-brand pl-1 shadow-[0_0_24px_-8px_rgba(109,74,255,0.45)]"
+                    /* Señal "review" CALMA (2026-07): antes un ring ámbar
+                       completo alrededor de la tarjeta leía como "roto" con
+                       11/26 líneas. Ahora sólo una barra de acento fina en el
+                       borde izquierdo (mismo grosor que la fila activa para
+                       no romper la grilla), en ámbar tenue. Sin fondo ni ring. */
+                    : `border-l-4 ${!isArmed && !isActive && !wasRecentlyAnchored && isReview ? "border-amber-400/50" : "border-transparent"}`}
                   ${!isArmed && !isActive && wasRecentlyAnchored ? "bg-brand/[0.05] ring-1 ring-brand/40" : ""}
-                  ${!isArmed && !isActive && !wasRecentlyAnchored && isReview ? "bg-amber-500/[0.06] ring-1 ring-amber-500/40" : ""}
+                  ${flashReviewId === seg._id ? "ring-1 ring-amber-400/50" : ""}
                   ${isAnchored ? "opacity-60" : ""}`}
               >
                 <div className="flex items-start gap-2 p-1">
@@ -3080,7 +3247,10 @@ export default function LyricsEditor({
                         onDoubleClick={() => startEditTimestamp(seg)}
                         title={t("editor.timestamp_hint") || "Click: ir al tiempo · Doble click: editar"}
                         className={`text-[11px] font-mono pt-2.5 w-14 text-right transition-colors
-                          ${isActive ? "text-brand-light font-semibold" : wasRecentlyAnchored ? "text-brand-light" : "text-gray-600 hover:text-brand-light"}`}
+                          ${isActive ? "text-brand-light font-semibold"
+                            : wasRecentlyAnchored ? "text-brand-light"
+                            : isReview ? "text-amber-400/80 hover:text-amber-300"
+                            : "text-gray-600 hover:text-brand-light"}`}
                       >
                         {/* Phase A 2026-05-25: indicador ▶ visible solo en
                             la fila activa para reforzar "esta es la que está
@@ -3161,7 +3331,7 @@ export default function LyricsEditor({
                       className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm
                         focus:border-brand/40 focus:outline-none hover:border-white/[0.08] transition-all
                         ${isActive && focusedSegId !== seg._id ? "text-transparent caret-transparent selection:text-white" : "text-white"}
-                        ${suggestion && !isApplied ? "border-amber-500/20" : isReview ? "border-amber-500/40" : "border-white/[0.04]"}`}
+                        ${suggestion && !isApplied ? "border-amber-500/20" : "border-white/[0.04]"}`}
                     />
                     {/* Phase A 2026-05-25: overlay karaoke word-jump (Apple
                         Music style). Solo visible cuando este segment es el
@@ -3207,16 +3377,10 @@ export default function LyricsEditor({
                         </div>
                       );
                     })()}
-                    {isReview && !showReviewBanner && (
-                      <span className="inline-flex items-center gap-1 mt-1 ml-1 px-2 py-0.5 rounded-full
-                        bg-amber-500/15 text-amber-300 text-[10px] font-medium">
-                        <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24">
-                          <path d="M12 9v4M12 17h.01" />
-                          <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
-                        </svg>
-                        {t("editor.review_badge") || "revisar tiempo"}
-                      </span>
-                    )}
+                    {/* Pill "revisar tiempo" per-línea ELIMINADO (2026-07):
+                        la barra de acento izquierda + el timestamp en ámbar
+                        ya señalan la línea sin saturar; el navegador
+                        secuencial del banner ("Revisar →") lleva a cada una. */}
                     {propagationPrompt && propagationPrompt.id === seg._id && (
                       <div className="flex items-center gap-2 mt-1.5 px-3 py-2 rounded-xl
                         bg-brand/10 ring-1 ring-brand/30 text-xs text-white">

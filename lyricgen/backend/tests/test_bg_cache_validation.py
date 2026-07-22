@@ -122,3 +122,159 @@ class TestSeedImageDigest:
         k_b = _veo_cache_key("prompt", "veo-3.1", {**base, "img": _seed_image_digest(str(b))})
         k_none = _veo_cache_key("prompt", "veo-3.1", base)
         assert len({k_a, k_b, k_none}) == 3
+
+
+class TestJobBgCacheKeyParity:
+    """v6: job_bg_cache_key es la única fuente de los hardcodes que main.py
+    (recompute) y pipeline (validación defensiva) comparten."""
+
+    def test_paridad_con_el_preview(self):
+        from bg_preview import job_bg_cache_key
+        assert job_bg_cache_key(**{
+            k: v for k, v in _JOB_PARAMS.items() if k != "job_id"
+        }) == compute_bg_cache_key(_preview_params())
+
+    def test_paridad_con_espacios_y_case(self):
+        """La normalización vive SOLO en compute_bg_cache_key — inputs con
+        espacios/case distintos hashean igual en ambos lados."""
+        from bg_preview import job_bg_cache_key
+        job_side = job_bg_cache_key(
+            artist="  Rata Blanca ", song_title=_JOB_PARAMS["song_title"],
+            style="AUTO", movement_style=" Estatico ",
+            effect="", custom_colors="", genre="ROCK", concept="",
+            background_hint="", bg_verbatim=False, match_lyrics=True,
+        )
+        assert job_side == compute_bg_cache_key(_preview_params())
+
+    def test_falla_devuelve_none(self, monkeypatch):
+        import bg_preview as bp
+        monkeypatch.setattr(bp, "compute_bg_cache_key",
+                            lambda p: (_ for _ in ()).throw(RuntimeError("boom")))
+        assert bp.job_bg_cache_key(**{
+            k: v for k, v in _JOB_PARAMS.items() if k != "job_id"
+        }) is None
+
+
+class TestLyricsNotInHash:
+    """v7 (2026-07-17): la LETRA NO entra al hash (revertido de v6). El
+    preview se dispara mientras el operador edita, con la letra a medio
+    hacer; el render usa la letra final. Meterla en el hash rompía el reuso
+    (keys distintas → cache-miss → doble generación). La letra igual influye
+    la GENERACIÓN del preview (run_bg_preview_job la pasa a _ensure_background),
+    solo que no rota la ETIQUETA. Guard: distinta letra = MISMA key."""
+
+    def test_letra_distinta_misma_key(self):
+        a = compute_bg_cache_key(_preview_params(lyrics_text="una letra"))
+        b = compute_bg_cache_key(_preview_params(lyrics_text="otra letra"))
+        c = compute_bg_cache_key(_preview_params())  # sin lyrics_text
+        assert a == b == c
+
+    def test_recompute_ignora_la_letra(self):
+        """El recompute de /generate y el preview coinciden aunque el render
+        arme la letra final y el preview haya usado otra."""
+        from bg_preview import job_bg_cache_key
+        render_side = job_bg_cache_key(**{
+            k: v for k, v in _JOB_PARAMS.items() if k != "job_id"
+        })
+        preview_side = compute_bg_cache_key(_preview_params(
+            lyrics_text="cualquier letra que el preview haya tenido"
+        ))
+        assert render_side == preview_side
+
+    def test_validator_acepta_sin_importar_la_letra(self):
+        key = compute_bg_cache_key(_preview_params(lyrics_text="poco a poco"))
+        assert _validate_bg_cache_key(key, **_JOB_PARAMS) == key
+
+
+class TestPreviewComplianceGuards:
+    """Invariantes que sostienen el aislamiento del cache global bg_cache/
+    (revisión adversarial 2026-07-17): el preview JAMÁS genera con
+    personas, así que el key no necesita separar por people-policy."""
+
+    def test_preview_request_no_acepta_bypass(self):
+        from main import _GeneratePreviewReq
+        fields = set(_GeneratePreviewReq.model_fields)
+        assert "bypass_content_validation" not in fields
+        assert "force_content_validation" not in fields
+
+    def test_gradiente_de_fallback_no_se_cachea(self, monkeypatch, tmp_path):
+        """v6: si los 2 intentos fallan safety, el gradiente NO se sube bajo
+        la key real — cachearlo hacía que un render futuro lo heredara como
+        si fuera un fondo Veo bueno, salteando su propia generación."""
+        import os as _os
+        import bg_preview as bp
+        import pipeline as pl
+        import jobs as jobs_mod
+
+        calls = {"cache_put": 0}
+        monkeypatch.setattr(bp, "cache_check", lambda k: False)
+        monkeypatch.setattr(
+            bp, "cache_put",
+            lambda *a, **k: calls.__setitem__("cache_put", calls["cache_put"] + 1) or "k",
+        )
+        monkeypatch.setattr(jobs_mod, "update_job", lambda *a, **k: None)
+
+        def _fake_ensure(style, job_dir, **kw):
+            p = _os.path.join(job_dir, "cand.mp4")
+            with open(p, "w") as f:
+                f.write("x")
+            return p
+
+        def _fake_gradient(job_dir, style, filename="fallback.mp4"):
+            p = _os.path.join(job_dir, filename)
+            with open(p, "w") as f:
+                f.write("g")
+            return p
+
+        monkeypatch.setattr(pl, "_ensure_background", _fake_ensure)
+        monkeypatch.setattr(pl, "_compute_allow_people", lambda *a, **k: False)
+        monkeypatch.setattr(pl, "_raise_if_job_timeout", lambda e: None)
+        # SIEMPRE unsafe → agota los 2 intentos → gradiente
+        monkeypatch.setattr(pl, "_validate_background_asset_for_job",
+                            lambda *a, **k: False)
+        monkeypatch.setattr(pl, "_write_safe_gradient_background", _fake_gradient)
+
+        from background_policy import runtime_rollout_fingerprint
+        params = {"artist": "A", "song_title": "S"}
+        res = bp.run_bg_preview_job(
+            "job123fake99", bp.compute_bg_cache_key(params), params,
+            runtime_rollout_fingerprint(),
+        )
+        assert res["status"] == "bg_preview_done"
+        assert calls["cache_put"] == 0
+
+    def test_fondo_valido_si_se_cachea(self, monkeypatch, tmp_path):
+        """Control del test anterior: con validación OK, cache_put corre."""
+        import os as _os
+        import bg_preview as bp
+        import pipeline as pl
+        import jobs as jobs_mod
+
+        calls = {"cache_put": 0}
+        monkeypatch.setattr(bp, "cache_check", lambda k: False)
+        monkeypatch.setattr(
+            bp, "cache_put",
+            lambda *a, **k: calls.__setitem__("cache_put", calls["cache_put"] + 1) or "k",
+        )
+        monkeypatch.setattr(jobs_mod, "update_job", lambda *a, **k: None)
+
+        def _fake_ensure(style, job_dir, **kw):
+            p = _os.path.join(job_dir, "cand.mp4")
+            with open(p, "w") as f:
+                f.write("x")
+            return p
+
+        monkeypatch.setattr(pl, "_ensure_background", _fake_ensure)
+        monkeypatch.setattr(pl, "_compute_allow_people", lambda *a, **k: False)
+        monkeypatch.setattr(pl, "_raise_if_job_timeout", lambda e: None)
+        monkeypatch.setattr(pl, "_validate_background_asset_for_job",
+                            lambda *a, **k: True)
+
+        from background_policy import runtime_rollout_fingerprint
+        params = {"artist": "A", "song_title": "S"}
+        res = bp.run_bg_preview_job(
+            "job123fake98", bp.compute_bg_cache_key(params), params,
+            runtime_rollout_fingerprint(),
+        )
+        assert res["status"] == "bg_preview_done"
+        assert calls["cache_put"] == 1

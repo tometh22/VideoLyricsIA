@@ -169,6 +169,79 @@
     height: 1px;
     background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.06), transparent);
   }
+
+  /* Lyrics source selector — follows the product's core visual language:
+     stable dark surfaces, the brand gradient only for the active choice,
+     and a restrained blue/cyan ambient light borrowed from the landing. */
+  .lyrics-source {
+    border-color: var(--border-default);
+    background:
+      radial-gradient(circle at 92% -22%, rgba(79, 124, 255, .18), transparent 44%),
+      radial-gradient(circle at -8% 110%, rgba(139, 92, 246, .11), transparent 42%),
+      linear-gradient(145deg, rgba(21, 24, 36, .98), rgba(12, 14, 23, .98));
+    box-shadow: var(--shadow-md), inset 0 1px rgba(255, 255, 255, .045);
+  }
+  .lyrics-source__halo {
+    background: radial-gradient(circle, rgba(32, 212, 232, .15), transparent 68%);
+    filter: blur(20px);
+  }
+  .lyrics-source__mark {
+    color: white;
+    background: var(--gradient-brand);
+    box-shadow: 0 8px 20px rgba(117, 87, 255, .28), inset 0 1px rgba(255, 255, 255, .22);
+  }
+  .lyrics-source__choice {
+    background: rgba(5, 7, 13, .24);
+  }
+  .lyrics-source__choice:hover:not(.is-active) {
+    border-color: var(--border-strong);
+    background: rgba(255, 255, 255, .035);
+  }
+  .lyrics-source__choice.is-active {
+    border-color: rgba(139, 92, 246, .72);
+    background:
+      linear-gradient(145deg, rgba(155, 92, 255, .19), rgba(107, 99, 255, .12) 55%, rgba(32, 212, 232, .07)),
+      rgba(17, 18, 31, .94);
+    box-shadow: 0 12px 28px rgba(34, 25, 88, .3), inset 0 1px rgba(255, 255, 255, .09);
+  }
+
+  .live-version-toggle {
+    border-color: var(--border-subtle);
+    background: rgba(5, 7, 13, .22);
+    transition: border-color .18s ease, background .18s ease, box-shadow .18s ease;
+  }
+  .live-version-toggle:hover {
+    border-color: var(--border-default);
+    background: rgba(255, 255, 255, .025);
+  }
+  .live-version-toggle:focus-within {
+    border-color: rgba(139, 92, 246, .7);
+    box-shadow: 0 0 0 3px rgba(139, 92, 246, .14);
+  }
+  .live-version-toggle.is-active {
+    border-color: rgba(139, 92, 246, .5);
+    background: linear-gradient(120deg, rgba(139, 92, 246, .11), rgba(79, 124, 255, .05));
+  }
+  .live-version-toggle__check {
+    color: white;
+    border-color: var(--border-strong);
+    background: var(--surface-2);
+    transition: border-color .18s ease, background .18s ease, box-shadow .18s ease;
+  }
+  .live-version-toggle.is-active .live-version-toggle__check {
+    border-color: transparent;
+    background: var(--gradient-brand);
+    box-shadow: 0 3px 10px rgba(117, 87, 255, .32);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -37,8 +37,9 @@ from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import ObjectDeletedError
 
 from auth import (
     authenticate_user,
@@ -64,6 +65,7 @@ from auth import (
     has_prores_access,
     has_drive_access,
     has_scenes_access,
+    has_art_track_access,
     scenes_credit_cost,
     telemetry_enabled,
     generate_api_key,
@@ -152,6 +154,49 @@ limiter = Limiter(
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# --- Graceful DB-pressure / race handlers ---
+# Two SQLAlchemy exceptions were reaching Sentry as *unhandled* 500s (and,
+# through the BaseHTTPMiddleware task group, as noisy "ExceptionGroup:
+# unhandled errors in a TaskGroup") even though each has a correct, non-500
+# HTTP semantics. Handling them here converts the crash into the right
+# status code AND stops it from being captured as an error event.
+#
+#   - pool TimeoutError: every connection in the per-process pool is checked
+#     out and the 30s checkout wait elapsed (seen in get_current_user under
+#     UMG polling bursts). This is backpressure, not a bug — 503 + Retry-After
+#     tells our own polling frontend to back off and retry instead of erroring.
+#
+#   - ObjectDeletedError: the row (typically a Job) was hard-deleted by the
+#     reaper or a concurrent bulk-delete while this request still held the ORM
+#     object and then touched a lazy attribute. The resource is simply gone,
+#     so 404 is the honest answer — same as if the id had never existed.
+async def _pool_timeout_handler(request: Request, exc: SQLAlchemyTimeoutError):
+    logger.warning(
+        "DB pool exhausted on %s %s — returning 503 (backpressure, not a crash)",
+        request.method, request.url.path,
+    )
+    return JSONResponse(
+        {"detail": "El servidor está momentáneamente saturado. Reintentá en unos segundos."},
+        status_code=503,
+        headers={"Retry-After": "3"},
+    )
+
+
+async def _object_deleted_handler(request: Request, exc: ObjectDeletedError):
+    logger.info(
+        "ObjectDeleted on %s %s — row removed mid-request (reaper/bulk-delete race), returning 404",
+        request.method, request.url.path,
+    )
+    return JSONResponse(
+        {"detail": "El recurso ya no existe."},
+        status_code=404,
+    )
+
+
+app.add_exception_handler(SQLAlchemyTimeoutError, _pool_timeout_handler)
+app.add_exception_handler(ObjectDeletedError, _object_deleted_handler)
 app.add_middleware(SlowAPIMiddleware)
 
 # Response compression. FastAPI doesn't enable this by default — a known
@@ -436,6 +481,28 @@ def on_startup():
     finally:
         db.close()
     logger.info("GenLy AI started — database initialized")
+    # Deployment lockstep evidence for the background-policy rollout. Railway
+    # runs API, Worker and ShortWorker as separate services; this line makes a
+    # mixed-commit or mixed-flag fleet immediately visible in their logs.
+    from background_policy import (
+        POLICY_ENV as _bg_policy_env,
+        POLICY_VERSION as _bg_policy_version,
+        VALID_POLICY_MODES as _bg_policy_modes,
+        policy_mode as _bg_policy_mode,
+    )
+    from observability import _resolve_release as _resolve_runtime_release
+    logger.info(
+        "[BG_POLICY][STARTUP] process=api release=%s environment=%s "
+        "policy_version=%s policy_mode=%s cache_namespace=%s",
+        _resolve_runtime_release(), ENVIRONMENT,
+        _bg_policy_version, _bg_policy_mode(), _bg_policy_version,
+    )
+    _raw_bg_policy_mode = os.environ.get(_bg_policy_env, "off").strip().lower()
+    if _raw_bg_policy_mode not in _bg_policy_modes:
+        logger.warning(
+            "[BG_POLICY][STARTUP] invalid %s=%r; resolved fail-safe to off",
+            _bg_policy_env, _raw_bg_policy_mode,
+        )
 
     # Background reaper. Daemon → dies with the container. Single
     # instance is enough; if the API ever scales horizontally, the
@@ -710,6 +777,17 @@ def on_startup():
         target=_business_alerts_loop, daemon=True, name="business-alerts",
     ).start()
     logger.info("business-alerts thread started (daily)")
+
+    # Tripwire de saturación del pool de Postgres — indicador LÍDER: avisa por
+    # Sentry (→ Sentinel → Telegram) ANTES de que el pool se agote y tire el
+    # QueuePool timeout a un cliente. El pool está topeado por el
+    # max_connections del plan (ver database.py); esto es la señal para actuar
+    # (PgBouncer/plan) a tiempo, no el fix del techo.
+    try:
+        import db_pool_watchdog
+        db_pool_watchdog.start()
+    except Exception as _exc:  # nunca romper el arranque por el watchdog
+        logger.warning("db-pool-watchdog no arrancó: %s", _exc)
 
 
 # --- Background library (public, authenticated) ---
@@ -1160,7 +1238,13 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
                 "prores_export": has_prores_access(user),
                 "scenes": has_scenes_access(user),
                 "scenes_credit_cost": scenes_credit_cost(),
+                # Art Track gateado por tenant (default OFF salvo admin). El
+                # front oculta la opción "Art Track" si esto es false.
+                "art_track": has_art_track_access(user),
                 "telemetry": telemetry_enabled(),
+                # Versión B (letra anclada): el frontend gatea el textarea
+                # del wizard y el botón "Re-sincronizar con IA" con esto.
+                "anchor_lyrics": _anchor_lyrics_enabled(),
             },
         },
     }
@@ -1260,7 +1344,13 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
                 "prores_export": has_prores_access(user),
                 "scenes": has_scenes_access(user),
                 "scenes_credit_cost": scenes_credit_cost(),
+                # Art Track gateado por tenant (default OFF salvo admin). El
+                # front oculta la opción "Art Track" si esto es false.
+                "art_track": has_art_track_access(user),
                 "telemetry": telemetry_enabled(),
+                # Versión B (letra anclada): el frontend gatea el textarea
+                # del wizard y el botón "Re-sincronizar con IA" con esto.
+                "anchor_lyrics": _anchor_lyrics_enabled(),
             },
         },
     }
@@ -1328,7 +1418,11 @@ def me(current_user: dict = Depends(get_current_user), db: Session = Depends(get
             "prores_export": has_prores_access(_u),
             "scenes": has_scenes_access(_u),
             "scenes_credit_cost": scenes_credit_cost(),
+            "art_track": has_art_track_access(_u),
             "telemetry": telemetry_enabled(),
+            # Versión B (letra anclada): el frontend gatea el textarea
+            # del wizard y el botón "Re-sincronizar con IA" con esto.
+            "anchor_lyrics": _anchor_lyrics_enabled(),
         },
     }
 
@@ -3745,6 +3839,9 @@ class _TranscribeUploadedReq(BaseModel):
     live: bool = False
     artist: str = Field(default="", max_length=255)    # DB Job.artist = VARCHAR(255)
     title: str = Field(default="", max_length=500)     # DB Job.song_title = VARCHAR(500)
+    # Versión B (ANCHOR_LYRICS_ENABLED, default off): letra oficial pegada
+    # por el operador — se ancla con CTC en vez de usar el texto transcrito.
+    anchor_lyrics: str = Field(default="", max_length=20000)
 
 
 @app.post("/transcribe-uploaded")
@@ -3912,6 +4009,7 @@ async def transcribe_uploaded(
                 filename=_row_filename,
                 tenant_id=current_user.get("tenant_id", ""),
                 live=bool(body.live),
+                anchor_lyrics=body.anchor_lyrics or "",
             )
         except Exception as exc:
             logger.exception("[TRANSCRIBE] enqueue failed for job=%s", job_id)
@@ -3958,8 +4056,15 @@ async def transcribe_uploaded(
             artist=_row_artist,
             title=_row_title,
         )
-        _result = await _maybe_ctc_retime(_result, audio_path, job_id,
-                                          _row_artist, _row_title)
+        # Versión B: si el operador pegó la letra oficial, anclarla con CTC
+        # ANTES del retime normal; si ancló, saltear el retime (no doble).
+        if (body.anchor_lyrics or "").strip():
+            _result = await _maybe_anchor_align(_result, audio_path, job_id,
+                                                body.anchor_lyrics)
+        if not (isinstance(_result, dict)
+                and _result.get("timing_source") == "anchor_ctc"):
+            _result = await _maybe_ctc_retime(_result, audio_path, job_id,
+                                              _row_artist, _row_title)
         _result = await _maybe_adlib_filter(
             _result, audio_path, job_id,
             live_hint=bool(getattr(body, "live", False))
@@ -4064,7 +4169,14 @@ def transcription_status(
 class _GeneratePreviewReq(BaseModel):
     """Background params — TODOS los campos que entran al hash determinístico
     del cache. Cualquier campo del request /generate que NO afecte el bg NO
-    va acá (audio, lyrics, font, animation, transition...)."""
+    va acá (audio, font, animation, transition...).
+
+    NOTA COMPLIANCE: este modelo NO acepta bypass_content_validation /
+    force_content_validation a propósito — el preview genera SIEMPRE con
+    allow_people=False y valida antes de cachear. Agregar esos campos acá
+    rompería el aislamiento del cache global bg_cache/ (el key no separa
+    por people-policy). Test-guard en test_bg_cache_validation.py.
+    """
     artist: str = Field(default="", max_length=255)
     song_title: str = Field(default="", max_length=500)
     style: str = Field(default="auto", max_length=50)
@@ -4079,6 +4191,11 @@ class _GeneratePreviewReq(BaseModel):
     animate_image: bool = False
     match_lyrics: bool = True
     target_duration_s: float = Field(default=30.0, ge=5, le=600)
+    # v6 (2026-07-17): con match_lyrics el prompt del fondo depende de la
+    # LETRA — sin ella el preview generaba ciego al texto y el render podía
+    # heredar ese fondo por cache-hit. Entra al hash como fingerprint del
+    # texto normalizado (timestamps fuera: la corrección típica es timing).
+    lyrics_text: str = Field(default="", max_length=20000)
 
 
 @app.post("/generate-preview")
@@ -4940,6 +5057,119 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             set_timing_source(job_id, CTC_ALIGN)
     except Exception as e:
         logger.warning("[CTC] retime wrapper declined: %r (job=%s)", e, job_id)
+    finally:
+        if _stem:
+            try:
+                os.unlink(_stem)
+            except OSError:
+                pass
+    return result
+
+
+def _anchor_lyrics_enabled() -> bool:
+    """Feature flag de la Versión B (letra anclada, default OFF).
+
+    Un solo lector del env para que /transcribe-uploaded (vía
+    `_maybe_anchor_align`), POST /jobs/{id}/reanchor y los `features`
+    de /auth/* (el frontend gatea la UI con esto) no puedan divergir
+    en el parsing del valor."""
+    return os.environ.get("ANCHOR_LYRICS_ENABLED", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+async def _maybe_anchor_align(result, audio_path: str, job_id: str,
+                              anchor_lyrics: str):
+    """Versión B — anclar la letra OFICIAL del operador al motor CTC
+    (ANCHOR_LYRICS_ENABLED, default OFF). En vez de retimear el texto
+    transcrito de la cascada, alinea las líneas que el operador pegó
+    (anchor lyrics) sobre el stem de voz vía `ctc_align.retime_segments`
+    — mismo motor, misma paridad Rotor (benchmark 18 gold: mediana
+    0.32s, 0 cascadas, 1 decline seguro).
+
+    Contrato idéntico a `_maybe_ctc_retime`: NUNCA rompe una
+    transcripción. Flag off / anchor vacío / <3 líneas / decline /
+    excepción → devuelve `result` sin tocar (cae a la Versión A, la
+    cascada actual). En éxito reemplaza `result["segments"]` y setea
+    `result["timing_source"] = "anchor_ctc"` para que el worker saltee
+    el retime CTC normal (no doble retime).
+
+    Gate por línea (outliers del benchmark): líneas cuya mediana de
+    word-scores queda < ANCHOR_REVIEW_MIN_SCORE (default 0.25) se marcan
+    `review=True` — el editor las señala para que el operador las revise."""
+    _stem = None
+    try:
+        if not _anchor_lyrics_enabled():
+            return result
+        if not isinstance(result, dict) or not (anchor_lyrics or "").strip():
+            return result
+        psegs = [{"text": line, "start": 0.0, "end": 0.0}
+                 for line in anchor_lyrics.splitlines() if line.strip()]
+        if len(psegs) < 3:
+            return result
+        # Todo (imports incluidos) dentro del try: un módulo roto debe
+        # degradar a "sin anchor", nunca a un 500 en cada transcripción.
+        import ctc_align as _ctc
+        import vocal_sep as _vs
+        # Mismo patrón de stem que _maybe_ctc_retime: cache_only primero
+        # (si la cascada computó el stem hace segundos es solo una
+        # descarga de R2), y si no hay, computarlo si el flag lo permite.
+        _stem = await asyncio.wait_for(
+            asyncio.to_thread(_vs.separate_vocals, audio_path, cache_only=True),
+            timeout=120,
+        )
+        if not _stem and os.environ.get(
+                "CTC_ALIGN_COMPUTE_STEM", "1").strip().lower() in ("1", "true", "yes", "on"):
+            logger.info("[ANCHOR] no cached stem — computing it (job=%s)", job_id)
+            _stem = await asyncio.wait_for(
+                asyncio.to_thread(_vs.separate_vocals, audio_path),
+                timeout=360,
+            )
+        # Sin stem → alinear sobre la MEZCLA (misma decisión que el mix
+        # fallback de _maybe_ctc_retime: la mezcla como fuente está
+        # validada en el gold set).
+        _align_src = _stem or audio_path
+        if not _stem:
+            logger.info("[ANCHOR] no stem — aligning on the MIX (job=%s)", job_id)
+        retimed = await asyncio.wait_for(
+            asyncio.to_thread(_ctc.retime_segments, _align_src, psegs,
+                              job_id, audio_path),
+            timeout=420,
+        )
+        if retimed is None:
+            # Decline seguro → Versión A intacta (la cascada ya corrió).
+            logger.info("[ANCHOR] declined (reason=%s) job=%s",
+                        _ctc.last_decline_reason or "unknown", job_id)
+            return result
+        # GATE POR LÍNEA: mediana de word-scores < umbral → review=True
+        # (el editor la señala para revisar). Sin scores → no marcar.
+        # Umbral tuneable vía ANCHOR_REVIEW_MIN_SCORE (default 0.25). Se bajó
+        # 0.35 → 0.30 → 0.25 (2026-07): con anclado Rotor-grade (mediana
+        # global ~0.13s) hasta el 0.30 seguía marcando líneas perfectas —
+        # 11/26 en "Hablando" cuando solo 2-4 estaban genuinamente off. Sólo
+        # cambia CUÁNTAS se marcan; el decline global (retimed is None) no se
+        # toca.
+        try:
+            _review_min = float(os.environ.get("ANCHOR_REVIEW_MIN_SCORE", "0.25"))
+        except (TypeError, ValueError):
+            _review_min = 0.25
+        from statistics import median as _median
+        flagged = 0
+        anchored = []
+        for seg in retimed:
+            scores = [w.get("score") for w in (seg.get("words") or [])
+                      if isinstance(w.get("score"), (int, float))]
+            if scores and _median(scores) < _review_min:
+                seg = dict(seg)
+                seg["review"] = True
+                flagged += 1
+            anchored.append(seg)
+        result = dict(result)
+        result["segments"] = anchored
+        result["timing_source"] = "anchor_ctc"
+        logger.info("[ANCHOR] anchored %d líneas (%d en review, job=%s)",
+                    len(anchored), flagged, job_id)
+    except Exception as e:
+        logger.warning("[ANCHOR] wrapper declined: %r (job=%s)", e, job_id)
     finally:
         if _stem:
             try:
@@ -7320,6 +7550,13 @@ async def generate_with_segments(
     # When set, contains the 2 lines joined by "\n" — capped at 200 chars
     # to match the song title's effective range.
     title_song_break: str = Form("", max_length=200),
+    # Art track ("official audio"): master audio + cover image → video with the
+    # cover centered over a blurred fill + subtle motion, NO lyrics. The cover
+    # comes in via background_file (image). Skips transcription + AI background.
+    art_track: bool = Form(False),
+    # Línea legal opcional en pantalla para art tracks, ej.
+    # "℗ 2026 Universal Music Chile". Vacía = no se dibuja.
+    label_line: str = Form("", max_length=120),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -7400,6 +7637,37 @@ async def generate_with_segments(
         if not song_title:
             song_title = parsed_title
 
+    # Art track ("official audio"): master audio + cover image → cover
+    # composited with subtle motion, no lyrics. Validate the cover and coerce
+    # incompatible options BEFORE quota/AI gates so it costs 1 credit and is
+    # not treated as an AI-background job.
+    if art_track:
+        # Feature gate (default OFF salvo admin / tenant en allowlist). Corta
+        # acá aunque el front no muestre la opción — un tenant sin acceso que
+        # pegue a la API con art_track=true no debe poder generar.
+        if not has_art_track_access(current_user):
+            raise HTTPException(
+                status_code=403,
+                detail="Art Track no está habilitado para tu cuenta.",
+            )
+        if background_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Art tracks use an uploaded cover, not a library background.",
+            )
+        if not (background_file and background_file.filename):
+            raise HTTPException(
+                status_code=400, detail="Art track requires a cover image.",
+            )
+        if not background_file.filename.lower().endswith((".jpg", ".jpeg", ".png")):
+            raise HTTPException(
+                status_code=400,
+                detail="Art track cover must be an image (.jpg/.jpeg/.png).",
+            )
+        # No lyrics, no Escenas, no Veo image-to-video animation for art tracks.
+        enable_scenes = False
+        animate_image = ""
+
     _enforce_plan_quota(db, current_user,
                         credits_needed=(scenes_credit_cost()
                                         if enable_scenes and has_scenes_access(current_user)
@@ -7420,8 +7688,9 @@ async def generate_with_segments(
     # Check AI authorization (UMG Guideline 5). The skip applies only when
     # the operator picks a library asset AND uses it as-is — no AI invoked.
     # Variation mode still calls Veo image-to-video on a frame of the
-    # source, which IS AI generation, so the auth gate must apply.
-    _needs_ai_auth = (not background_id) or (background_mode == "variation")
+    # source, which IS AI generation, so the auth gate must apply. Art tracks
+    # invoke NO AI (deterministic ffmpeg composite), so they never need it.
+    _needs_ai_auth = (not art_track) and ((not background_id) or (background_mode == "variation"))
     if _needs_ai_auth and current_user.get("role") != "admin":
         user_model = db.query(User).filter(User.id == current_user["id"]).first()
         if user_model and not user_model.ai_authorized:
@@ -7473,6 +7742,19 @@ async def generate_with_segments(
 
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
+
+    # Persist the art_track marker into render_params now (belt-and-suspenders
+    # with the worker-side merge) so /retry re-renders as an art track even if
+    # the worker dies before Step 1.
+    if art_track:
+        try:
+            from jobs import merge_render_params
+            _params = {"art_track": True}
+            if (label_line or "").strip():
+                _params["label_line"] = label_line.strip()
+            merge_render_params(job_id, _params)
+        except Exception as _e:
+            logger.warning("[ART] could not persist art_track render_param: %s", _e)
 
     mp3_path = os.path.join(job_dir, existing_filename)
 
@@ -7554,6 +7836,53 @@ async def generate_with_segments(
     except Exception as e:
         logger.warning("[DEDUP] supersede sibling drafts failed: %s", e)
 
+    # P1 2026-07-17: si el frontend no mandó bg_cache_key (race del debounce
+    # de 10s de useBackgroundPreview — el operador aprobó dentro de la
+    # ventana), lo recomputamos server-side con la MISMA función compartida
+    # que valida el worker (bg_preview.job_bg_cache_key). Solo aplica al
+    # fondo único AI: custom/library (bg_path) y escenas tienen su propio
+    # flujo, y /variant JAMÁS hereda este fast path (quiere un fondo
+    # distinto con params iguales — por eso el recompute vive acá y no en
+    # run_pipeline, que /variant y /retry comparten). El worker re-valida
+    # el key de todos modos: un mismatch = generación fresh, nunca un
+    # fondo equivocado.
+    _bg_cache_key_norm = (bg_cache_key or "").strip() or None
+    _effective_scenes = bool(enable_scenes) and has_scenes_access(current_user)
+    # Audit adversarial 2026-07-17: excluir variation EXPLÍCITAMENTE. Una
+    # variation de librería devuelve bg_path=None (con variation_source_path
+    # seteado), así que sin este guard el recompute corría y le asignaba un
+    # key a un job de variation — justo lo que /variant NO debe heredar (un
+    # _animate_user_image downstream lo salvaba, pero el guard debe hacer lo
+    # que el comentario promete, no depender de otra rama). Y el join de la
+    # letra va DENTRO del try: segments malformados (json.loads de un cliente
+    # roto) no deben tirar 500 y bloquear el enqueue — se cae a fresh.
+    _is_variation = bool(variation_source_path or variation_source_r2_key)
+    if (
+        _bg_cache_key_norm is None and bg_path is None
+        and not _effective_scenes and not _is_variation
+    ):
+        try:
+            from bg_preview import job_bg_cache_key
+            _bg_cache_key_norm = job_bg_cache_key(
+                artist=artist, song_title=song_title, style=style,
+                movement_style=movement_style, effect=effect,
+                custom_colors=(custom_colors.strip() or ""), genre=genre,
+                concept=concept,
+                background_hint=(background_hint.strip() or None),
+                bg_verbatim=bg_verbatim, match_lyrics=match_lyrics,
+            )
+        except Exception as _recompute_err:
+            logger.warning(
+                "[BG] recompute server-side falló job=%s: %s — fondo fresh",
+                job_id, _recompute_err,
+            )
+            _bg_cache_key_norm = None
+        if _bg_cache_key_norm:
+            logger.info(
+                "[BG] bg_cache_key recomputado server-side job=%s key=%s",
+                job_id, _bg_cache_key_norm,
+            )
+
     enqueue_pipeline(
         job_id=job_id,
         mp3_path=mp3_path,
@@ -7606,18 +7935,24 @@ async def generate_with_segments(
         custom_colors=(custom_colors.strip() or ""),
         # Capa C 2026-05-24: pasa el hash del bg pre-cacheado a la pipeline.
         # Si el cache hit, _ensure_background se skip y el job ahorra
-        # ~60-180s + $0.80-3.20 de cuota Veo. Vacío = flow tradicional.
-        bg_cache_key=(bg_cache_key.strip() or None),
+        # ~60-180s + $0.80-3.20 de cuota Veo. P1 2026-07-17: si el frontend
+        # no lo mandó, viene recomputado server-side (bloque de arriba).
+        bg_cache_key=_bg_cache_key_norm,
         # Escenas (multi-escena): opt-in del operador AND elegibilidad real.
         # Si el flag llega pero el usuario no tiene acceso, se ignora (fondo
         # único) — el gate de feature vive en el backend, no en el form.
-        enable_scenes=bool(enable_scenes) and has_scenes_access(current_user),
+        enable_scenes=_effective_scenes,
         title_template=title_template if title_template in ("auto", "centered", "lower_third", "badge") else "auto",
         title_size=_clamp_title_size(title_size),
         title_artist_font=(title_artist_font.strip() or ""),
         title_song_font=(title_song_font.strip() or ""),
         # UI v1.1: pass-through. Empty string preserves auto-wrap.
         title_song_break=(title_song_break or ""),
+        # Art track: master audio + cover → cover composited (blur + centered +
+        # subtle motion), no lyrics. Validated above (cover required, image
+        # only). The pipeline skips transcription + AI background.
+        art_track=art_track,
+        label_line=(label_line or "").strip() if art_track else "",
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -8590,6 +8925,30 @@ class ApproveJobRequest(BaseModel):
     notes: str = Field(default="", max_length=2048)
 
 
+def _merge_content_validation_choice(
+    render_params: dict | None,
+    *,
+    bypass: bool = False,
+    force: bool = False,
+) -> dict:
+    """Persist one unambiguous content-policy choice, defaulting safe.
+
+    The three write paths (edit, retry and variant) must not preserve a stale
+    opposite flag from a prior operation.  Force wins if a malformed/legacy
+    client sends both values; when neither is present we fail closed.
+    """
+    merged = dict(render_params or {})
+    merged.pop("bypass_content_validation", None)
+    merged.pop("force_content_validation", None)
+    if force:
+        merged["force_content_validation"] = True
+    elif bypass:
+        merged["bypass_content_validation"] = True
+    else:
+        merged["force_content_validation"] = True
+    return merged
+
+
 class EditJobRequest(BaseModel):
     # edit_type values:
     #  - typography: re-render with new font/size/case/motion settings
@@ -8627,19 +8986,12 @@ class EditJobRequest(BaseModel):
     # spec granular de cámara. 300 obligaba a sacrificar negaciones que
     # son críticas para evitar bias del modelo. Costo Gemini marginal.
     background_hint: str | None = Field(default=None, max_length=2000)
-    # Operator-controlled bypass of content_validator (UMG Guideline 15
-    # check). Default False = follow tenant default. True = skip validator
-    # entirely (only has effect on UMG tenants — non-UMG already skip by
-    # default).
-    #
-    # Use case: UMG operator wants to ship a video where the flagged
-    # content IS the song's visual identity (rock guitarist hands).
-    # They accept the downstream UMG-review rejection risk knowingly.
+    # Explicit non-Universal opt-in used together with a prompt that asks for
+    # people. Universal accounts remain validation-mandatory in pipeline.py;
+    # this request field can never relax that server-side rule.
     bypass_content_validation: bool = Field(default=False)
-    # Inverse of bypass for non-UMG tenants. Default False = follow tenant
-    # default (skip validator for non-UMG). True = force validator to run
-    # even though the tenant doesn't require it. For operators of non-UMG
-    # tenants who *want* the conservative behavior anyway.
+    # Explicit safe choice. It also wins if a legacy/malformed client sends
+    # both flags. Sending neither defaults to this same fail-closed behavior.
     force_content_validation: bool = Field(default=False)
     # Background generation mode. Only meaningful when edit_type=="background".
     #
@@ -8670,6 +9022,12 @@ class EditJobRequest(BaseModel):
     # the hint goes straight to Veo without Gemini's rewrite. Only
     # meaningful for edit_type=="background".
     bg_verbatim: bool = Field(default=False)
+    # Library asset for edit_type=="background_library": swap the video's
+    # background for a curated BackgroundAsset instead of regenerating with
+    # AI. The escape hatch from the non-converging Veo loop (incidente Gaby
+    # 2026-07-08, job eaff5c7baf50: 3 regens sin control y sin salida a
+    # biblioteca). Required for that edit_type; ignored otherwise.
+    background_id: int | None = Field(default=None)
     # FX layer + lyric animations chosen in the wizard. Added 2026-05-22:
     # antes el operador no podía cambiarlos post-upload y, peor, los
     # whitelists de /retry y /variant los descartaban silenciosamente.
@@ -9232,6 +9590,13 @@ async def save_segments(
         "transcribed_pending", "transcribed", "pending_review", "rejected", "editing", "done",
     )
     if job.status not in _SAVE_SEGMENTS_ALLOWED:
+        # Outcome metric (issue #934, autosave poco confiable): el 409 por
+        # status es el bloqueo silencioso recurrente del autosave — dejarlo
+        # consultable por tenant sin depender del Sentry del browser.
+        logger.warning(
+            "[save-segments] rejected outcome=409-status job=%s tenant=%s status=%s",
+            job_id, job.tenant_id, job.status,
+        )
         raise HTTPException(
             status_code=409,
             detail=(
@@ -9372,11 +9737,216 @@ async def save_segments(
     touch_user_activity(db, job)
     db.commit()
 
+    # Outcome metric (issue #934): éxito consultable por tenant — junto con
+    # el warning del 409 de arriba permite medir la tasa real de fallas del
+    # autosave sin depender de los console.warn del browser.
+    logger.info(
+        "[save-segments] ok job=%s tenant=%s count=%d",
+        job_id, job.tenant_id, len(segs),
+    )
+
     return {
         "ok": True,
         "job_id": job_id,
         "saved_at": job.last_user_activity_at.isoformat() if job.last_user_activity_at else None,
         "count": len(segs),
+    }
+
+
+# Mismos estados en los que el LyricsEditor está operativamente montado
+# (ver _SAVE_SEGMENTS_ALLOWED en save_segments): si el operador puede
+# corregir texto ahí, puede pedir el re-anclado ahí.
+_REANCHOR_ALLOWED = (
+    "transcribed_pending", "transcribed", "pending_review", "rejected", "editing", "done",
+)
+
+
+@app.post("/jobs/{job_id}/reanchor")
+@limiter.limit("6/minute")
+async def reanchor_segments(
+    request: Request,
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Versión B, parte 2 (2026-07-15): re-anclar el timing DESPUÉS de que
+    el operador corrigió el TEXTO en el editor.
+
+    Toma los segments actuales del job (`segments_json`, ya persistidos por
+    el autosave de /save-segments), usa su texto como letra ancla y corre la
+    misma `_maybe_anchor_align` del flujo de subida (motor CTC, paridad
+    Rotor). Reglas:
+
+    - Auth y status gate idénticos a /save-segments (owner + tenant, editor
+      montado).
+    - Gate por ANCHOR_LYRICS_ENABLED (mismo flag que el anclado en upload).
+    - Líneas con `locked: true` (timing arrastrado a mano por el operador)
+      NO se pisan — el ancla incluye su texto para que la alineación sea
+      monotónica, pero su timing persiste tal cual.
+    - Decline del motor / flag off a mitad de camino → 200 {ok: false} y
+      los segments quedan intactos (mismo contrato "nunca rompe" del helper).
+    - En éxito persiste el timing re-anclado en segments_json y devuelve
+      los segments mergeados para que el editor se refresque sin re-fetch.
+    """
+    from jobs import get_job_model, touch_user_activity
+
+    job = get_job_model(db, job_id)
+    if (not job
+            or job.user_id != current_user["id"]
+            or job.tenant_id != current_user["tenant_id"]):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if not _anchor_lyrics_enabled():
+        # Flag off → el server no tiene la Versión B habilitada. 409 (no
+        # 404) para no confundir con "job inexistente"; el frontend ni
+        # muestra el botón sin features.anchor_lyrics.
+        raise HTTPException(
+            status_code=409,
+            detail="El re-anclado no está habilitado en este servidor.",
+        )
+    if job.status not in _REANCHOR_ALLOWED:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"reanchor requires status in {_REANCHOR_ALLOWED} "
+                f"(current: {job.status})"
+            ),
+        )
+
+    prev_segs = [dict(s) for s in (job.segments_json or [])
+                 if isinstance(s, dict)]
+    anchor_lines = [(s.get("text") or "").strip() for s in prev_segs]
+    n_lines = sum(1 for _t in anchor_lines if _t)
+    if n_lines < 3:
+        # Mismo umbral que _maybe_anchor_align — con <3 líneas el motor
+        # declina siempre; 422 acá da un mensaje accionable en vez de un
+        # {ok: false} opaco.
+        raise HTTPException(
+            status_code=422,
+            detail="Se necesitan al menos 3 líneas con texto para re-sincronizar.",
+        )
+
+    # SNAPSHOT + release (mismo patrón que /transcribe-uploaded, incidente
+    # agus77 06/07): la descarga de R2 + el CTC pueden tardar minutos y no
+    # podemos tener la sesión checked-out todo ese tiempo.
+    _r2_key = job.input_r2_key
+    _row_filename = job.filename or ""
+    db.close()
+
+    job_dir = os.path.join(OUTPUTS_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    audio_path = os.path.join(job_dir, _row_filename) if _row_filename else ""
+    if not audio_path or (not os.path.exists(audio_path) and not _r2_key):
+        raise HTTPException(
+            status_code=409,
+            detail="El audio original ya no está disponible para este job.",
+        )
+    if not os.path.exists(audio_path):
+        import asyncio as _asyncio
+        _loop = _asyncio.get_event_loop()
+        for _attempt in range(3):
+            # boto3 es síncrono — executor para no bloquear el event loop
+            # (mismo patrón que /transcribe-uploaded).
+            _ok = await _loop.run_in_executor(
+                None, storage.download_object, _r2_key, audio_path,
+            )
+            if _ok:
+                break
+            if _attempt < 2:
+                await _asyncio.sleep(0.5 * (2 ** _attempt))
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail="No pudimos leer el audio original. Reintentá en unos segundos.",
+            )
+
+    anchor_text = "\n".join(_t for _t in anchor_lines if _t)
+    out = await _maybe_anchor_align(
+        {"segments": prev_segs}, audio_path, job_id, anchor_text,
+    )
+    anchored = out.get("segments") if isinstance(out, dict) else None
+    if (not isinstance(out, dict)
+            or out.get("timing_source") != "anchor_ctc"
+            or not isinstance(anchored, list)
+            or len(anchored) != n_lines):
+        # Decline seguro (flag/engine/mismatch de líneas) — los segments
+        # del operador quedan intactos, igual que la Versión A en upload.
+        logger.info("[REANCHOR] declined job=%s (n_lines=%d)", job_id, n_lines)
+        return {
+            "ok": False,
+            "reason": "declined",
+            "job_id": job_id,
+            "count": len(prev_segs),
+            "review_count": 0,
+            "locked_kept": 0,
+        }
+
+    # Merge: los segs re-anclados corresponden 1:1 (en orden) a los segs
+    # previos con texto no vacío. Se preservan las keys extra del original
+    # (_id, pos/scale/rot, estilo) y el timing de las líneas `locked`.
+    merged = []
+    review_count = 0
+    locked_kept = 0
+    _ai = 0
+    for seg, _text in zip(prev_segs, anchor_lines):
+        if not _text:
+            merged.append(seg)
+            continue
+        new_seg = anchored[_ai]
+        _ai += 1
+        if seg.get("locked"):
+            locked_kept += 1
+            merged.append(seg)
+            continue
+        m = dict(seg)
+        m["start"] = new_seg.get("start", seg.get("start"))
+        m["end"] = new_seg.get("end", seg.get("end"))
+        if new_seg.get("words") is not None:
+            m["words"] = new_seg["words"]
+        if new_seg.get("review"):
+            m["review"] = True
+            review_count += 1
+        else:
+            m.pop("review", None)
+        merged.append(m)
+    # Mismo contrato de orden monotónico que /save-segments.
+    merged = sorted(merged, key=lambda s: float(s.get("start", 0) or 0))
+
+    # Persistir con sesión corta (la del request se soltó antes del I/O).
+    from database import SessionLocal as _SL
+    _db2 = _SL()
+    try:
+        row = get_job_model(_db2, job_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Job not found.")
+        row.segments_json = merged
+        touch_user_activity(_db2, row)
+        try:
+            from database import AuditLog
+            _db2.add(AuditLog(
+                user_id=current_user["id"],
+                action="lyrics.reanchor",
+                detail={
+                    "job_id": job_id,
+                    "n_lines": len(merged),
+                    "review_count": review_count,
+                    "locked_kept": locked_kept,
+                },
+            ))
+        except Exception as e:  # noqa: BLE001 — audit best-effort
+            logger.warning("[REANCHOR] audit log failed: %s", e)
+        _db2.commit()
+    finally:
+        _db2.close()
+
+    logger.info("[REANCHOR] ok job=%s lines=%d review=%d locked_kept=%d",
+                job_id, len(merged), review_count, locked_kept)
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "count": len(merged),
+        "review_count": review_count,
+        "locked_kept": locked_kept,
+        "segments": merged,
     }
 
 
@@ -9419,11 +9989,16 @@ async def request_edit(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     _audit_cross_tenant_access(db, current_user, job, "edit", commit=False)
-    valid_edit_types = ("typography", "background", "lyrics", "metadata")
+    valid_edit_types = ("typography", "background", "background_library", "lyrics", "metadata")
     if body.edit_type not in valid_edit_types:
         raise HTTPException(
             status_code=400,
             detail=f"edit_type must be one of {valid_edit_types}",
+        )
+    if body.edit_type == "background_library" and not body.background_id:
+        raise HTTPException(
+            status_code=400,
+            detail="background_library edit requires 'background_id'.",
         )
     # Escenas (incidente 2026-07-01, job 53b9513225b1): el edit "background"
     # es del mundo fondo-único — para un job multi-escena generaba UN clip
@@ -9431,7 +10006,9 @@ async def request_edit(
     # re-renderizaba video+short loopeando esa única escena. El camino
     # correcto para estos jobs es la regeneración por escena del filmstrip
     # (edit_type="scene" vía /edit-scene, no consume cupo de edición).
-    if body.edit_type == "background":
+    # background_library comparte el guard: un asset único también pisaría
+    # el timeline multi-escena cacheado.
+    if body.edit_type in ("background", "background_library"):
         _sp = job.scene_plan if isinstance(job.scene_plan, dict) else None
         if _sp and _sp.get("scenes"):
             raise HTTPException(
@@ -9520,7 +10097,14 @@ async def request_edit(
     # the metadata edit for traceability (`metadata_only=True`).
     _is_admin = current_user.get("role") == "admin"
     _metadata_only = body.edit_type == "metadata"
-    if not _is_admin and not _metadata_only and current_edit_count >= _MAX_EDITS:
+    # background_library tampoco consume slot (mismo mecanismo que metadata):
+    # el cap de 3 existe para acotar gasto Veo (~$0.90/regen); el swap a un
+    # asset curado cuesta $0 de IA y es justamente la SALIDA de emergencia
+    # para quien ya quemó sus regens sin converger — si consumiera slot,
+    # seguiría atrapado. AuditLog registra igual (edit_type en detail).
+    _library_swap = body.edit_type == "background_library"
+    if (not _is_admin and not _metadata_only and not _library_swap
+            and current_edit_count >= _MAX_EDITS):
         raise HTTPException(
             status_code=400,
             detail=f"Maximum edit limit ({_MAX_EDITS}) reached. Please approve or reject.",
@@ -9759,14 +10343,20 @@ async def request_edit(
         _rp_v = dict(job.render_params or {})
         _rp_v["bg_verbatim"] = _bv
         job.render_params = _rp_v
-    if body.edit_type == "background" and body.bypass_content_validation:
-        # Forward only when explicitly True; pipeline's tenant-gated
-        # default is correct when missing/False. Storing this lets the
-        # worker read render_params.get(...) and never has to distinguish
-        # "field missing" from "operator chose False".
-        edit_params["bypass_content_validation"] = True
-    if body.edit_type == "background" and body.force_content_validation:
-        edit_params["force_content_validation"] = True
+    if body.edit_type == "background":
+        # Persist the CURRENT mutually-exclusive choice. The worker resolves
+        # policy from durable render_params; leaving a stale bypass there made
+        # a later safe edit silently behave as unrestricted.
+        _rp_policy = _merge_content_validation_choice(
+            job.render_params,
+            bypass=body.bypass_content_validation,
+            force=body.force_content_validation,
+        )
+        if _rp_policy.get("bypass_content_validation"):
+            edit_params["bypass_content_validation"] = True
+        else:
+            edit_params["force_content_validation"] = True
+        job.render_params = _rp_policy
     # QA fix 2026-05-28 (edit-wizard consolidation): artist/song_title
     # mutations ungated across edit_types. Before this, the fields only
     # applied on edit_type=metadata; if the frontend sent a consolidated
@@ -9792,10 +10382,31 @@ async def request_edit(
         job.song_title = _new_title
         edit_params["song_title"] = _new_title
 
+    if _library_swap:
+        # Resolver el asset ANTES de flipear el status: _resolve_library_
+        # background trae gratis el tenant-gate (_user_can_use_asset, 404
+        # no-revelador para assets ajenos) y el row de AssetUsage para el
+        # audit. Cualquier 404/400 acá deja el job intacto en
+        # pending_review. Solo modo as_is en v1 (variation re-entra en
+        # costo Veo — diferido a propósito).
+        _lib_job_dir = os.path.join(OUTPUTS_DIR, job_id)
+        os.makedirs(_lib_job_dir, exist_ok=True)
+        _lib_bg_path, _lib_bg_r2_key, _v1, _v2, _lib_asset_id = _resolve_library_background(
+            body.background_id, "as_is", current_user, db, _lib_job_dir, job_id,
+        )
+        edit_params["library_bg"] = {
+            "bg_path": _lib_bg_path,
+            "bg_r2_key": _lib_bg_r2_key,
+            "asset_id": _lib_asset_id,
+        }
+
     # PR C 2026-05-26: metadata edits do NOT bump edit_count (see
     # rationale at the edit-cap gate above). All other types still
     # consume a slot.
-    new_edit_count = current_edit_count if _metadata_only else current_edit_count + 1
+    new_edit_count = (
+        current_edit_count if (_metadata_only or _library_swap)
+        else current_edit_count + 1
+    )
 
     # Pre-flight check that the edit will be able to source its audio.
     # The worker (run_edit_pipeline) resolves audio in two tiers: the
@@ -10373,12 +10984,9 @@ class RetryJobRequest(BaseModel):
     operators can downgrade a 4K render that OOMed the worker to HD on
     retry, without re-uploading the audio."""
     frame_size: str | None = Field(default=None, max_length=16)
-    # When True, set render_params["bypass_content_validation"]=True
-    # before re-enqueuing so the worker skips _validate_fn. Same semantics
-    # as EditJobRequest/VariantJobRequest. Use case: a job died in
-    # validation_failed because the prompt intentionally triggered the
-    # validator (e.g. "rock guitarist hands as subject"), and the
-    # operator wants to retry without recreating the variant manually.
+    # Explicit non-Universal people opt-in. The central pipeline still
+    # requires a matching positive prompt and never permits a Universal
+    # account to bypass validation.
     bypass_content_validation: bool = Field(default=False)
     force_content_validation: bool = Field(default=False)
 
@@ -10472,16 +11080,13 @@ async def retry_job(
             new_spec["frame_size"] = body.frame_size
             job.umg_spec = new_spec
 
-    # Operator opt-in flags forwarded to render_params before re-enqueue.
-    # When False/missing, render_params is untouched and tenant-gated
-    # defaults in pipeline.Step 1b apply.
-    if body and (body.bypass_content_validation or body.force_content_validation):
-        _rp = dict(job.render_params or {})
-        if body.bypass_content_validation:
-            _rp["bypass_content_validation"] = True
-        if body.force_content_validation:
-            _rp["force_content_validation"] = True
-        job.render_params = _rp
+    # Persist one mutually-exclusive choice; missing fields fail closed and
+    # stale choices from earlier attempts are removed.
+    job.render_params = _merge_content_validation_choice(
+        job.render_params,
+        bypass=bool(body and body.bypass_content_validation),
+        force=bool(body and body.force_content_validation),
+    )
 
     # Capturar status PREVIO antes de mutar. Sin esto el AuditLog
     # registraba siempre "processing" como previous_status (la línea de
@@ -10618,7 +11223,14 @@ async def retry_job(
               # multi-escena vuelve a armar las escenas en vez de caer al
               # fondo único. Persistido por pipeline en render_params cuando
               # el render corre con enable_scenes=True.
-              "enable_scenes"):
+              "enable_scenes",
+              # Art track: heredable — sin esto un retry de un art track se
+              # re-renderiza como lyric video vacío y re-corre Whisper.
+              # Persistido por pipeline/endpoint en render_params.
+              "art_track",
+              # Línea legal del art track (℗/© sello), persistida junto al
+              # marker para que el retry la re-dibuje igual.
+              "label_line"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 
@@ -10628,6 +11240,15 @@ async def retry_job(
     # costo Veo extra— al reintentar un job viejo.
     if retry_pipeline_kwargs.get("enable_scenes"):
         retry_pipeline_kwargs["enable_scenes"] = has_scenes_access(current_user)
+
+    # Art Track: mismo re-gate. Un art track NO se puede degradar a lyric
+    # (se re-rendería vacío, sin letra), así que si el usuario perdió el
+    # acceso a la feature cortamos el retry en vez de convertirlo.
+    if retry_pipeline_kwargs.get("art_track") and not has_art_track_access(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Art Track no está habilitado para tu cuenta.",
+        )
 
     enqueue_pipeline(
         job_id=job_id,
@@ -10678,8 +11299,8 @@ class VariantJobRequest(BaseModel):
     # va al user_content de Gemini con header [OPERATOR OVERRIDE].
     # 2000 chars (bumped 2026-05-18, ver EditJobRequest para rationale).
     background_hint: str | None = Field(default=None, max_length=2000)
-    # Espejo del flag de EditJobRequest — operator override del content
-    # validator (UMG Guideline 15). Misma semántica, ver EditJobRequest.
+    # Same central policy as edit/retry: only a non-Universal account with an
+    # explicit people prompt can use this opt-in; Universal remains strict.
     bypass_content_validation: bool = Field(default=False)
     force_content_validation: bool = Field(default=False)
     # Override del concept del padre. 2000 chars igual que /generate.
@@ -10898,15 +11519,26 @@ async def create_variant(
 
     # Merge: render_params del padre + overrides del body.
     parent_render_params = dict(parent.render_params or {})
+    # Las variantes intercambian el fondo (Veo) del video; un art track no
+    # tiene fondo generado, así que "variante de un art track" no aplica. Sin
+    # este corte, la variante hereda art_track=True en render_params (se
+    # etiqueta como art track en la UI) pero se re-rendería como lyric vacío —
+    # y sería una vía sin gatear de la feature. Bloquear de plano.
+    if parent_render_params.get("art_track"):
+        raise HTTPException(
+            status_code=400,
+            detail="No se pueden crear variantes de un Art Track.",
+        )
     new_render_params = dict(parent_render_params)
     if body.background_hint is not None:
         new_render_params["background_hint"] = body.background_hint
     if body.concept is not None:
         new_render_params["concept"] = body.concept
-    if body.bypass_content_validation:
-        new_render_params["bypass_content_validation"] = True
-    if body.force_content_validation:
-        new_render_params["force_content_validation"] = True
+    new_render_params = _merge_content_validation_choice(
+        new_render_params,
+        bypass=body.bypass_content_validation,
+        force=body.force_content_validation,
+    )
 
     # Style: override o herencia.
     new_style = body.style if body.style is not None else (parent.style or "oscuro")

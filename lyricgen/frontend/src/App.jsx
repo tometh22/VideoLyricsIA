@@ -40,17 +40,39 @@ import TranscribingProgress from "./components/TranscribingProgress";
 import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
 import GiftCreditsBanner from "./components/GiftCreditsBanner";
 import { useAlert } from "./components/AlertProvider";
-import { useBackgroundPreview } from "./hooks/useBackgroundPreview";
+import {
+  shouldEnableBackgroundPreview,
+  useBackgroundPreview,
+} from "./hooks/useBackgroundPreview";
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
 import { translateBackendError } from "./lib/lyricsEditSubmit";
-import { mergeEditedSegments } from "./lib/reviewSegments";
-import { sanitizeSegmentsForSave, findSanitizedDiffs } from "./lib/sanitizeSegments";
+import { segmentsStore, useJobSegmentsValue } from "./state/segmentsStore";
+import { persistSegments } from "./lib/persistSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
 import { computeFieldDiff, buildEditPayloads } from "./lib/editWizardDiff";
 import { prefetchKey } from "./lib/prefetchKey";
+import { anchorLyricsForEntry } from "./lib/anchorPayload";
 import { track } from "./lib/telemetryTrack";
 
 const API = import.meta.env.VITE_API_URL || "";
+
+// PR E follow-up (2026-07): identidad ESTABLE de una review para keyear el
+// segmentsStore. DECOUPLE del backend job id: el prop transcribeJobId del
+// LyricsEditor maneja el autosave (POST /save-segments) y DEBE seguir siendo
+// el job real (o null); pero el store necesita una key que exista incluso
+// cuando la review no tiene job de backend (transcribeJobId y editingJobId
+// ambos null: handleBackInReview, resume/recovery). Sin una key estable esos
+// edits caían al useState local del hook y se perdían al desmontar el editor
+// (paso 6→4 del wizard) o al refrescar. La base de unicidad espeja la del
+// React `key` del <LyricsEditor> (transcribeJobId : filename : queueIdx), así
+// que es única por review y estable a través de remounts de la MISMA review.
+function reviewStoreKey(r) {
+  return r
+    ? (r.editingJobId
+        || r.transcribeJobId
+        || ("local:" + (r.file?.name || r.filename || "resume") + ":" + (r.queueIdx ?? 0)))
+    : null;
+}
 
 // 2026-05-27 Phase-2 — fallbacks shown for the brief window between
 // "user navigated to a lazy route" and "the chunk has been parsed".
@@ -1038,6 +1060,13 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
       if (didClear) {
         setWizardStage("upload");
         wizardPersistence.clear();
+        // PR E: al salir de /edit-lyrics/:id sin aprobar, soltar la entrada
+        // del store — una re-entrada re-bootstrapea del backend (fuente de
+        // verdad post-abandono), no de un array huérfano en memoria.
+        // myId == id == editingJobId de esta review, que es justo lo que
+        // reviewStoreKey() prioriza en el path /edit-lyrics/:id, así que
+        // esta es la key exacta bajo la que el editor seedeó.
+        segmentsStore.evict(myId);
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1128,7 +1157,7 @@ export default function App() {
   const [user, setUser] = useState(getUser());
   const [files, setFiles] = useState([]);
   // Ref que espeja `files` para que callbacks sin dependencias (ej.
-  // onAutoTranscribe en un setTimeout) lean el estado actual sin re-render
+  // handleUploadAdvance en un setTimeout) lean el estado actual sin re-render
   // loops. Sync con un useEffect debajo.
   const filesRef = useRef(files);
   const [delivery, setDelivery] = useState({
@@ -1144,12 +1173,34 @@ export default function App() {
   // batch, igual que `style`. El toggle sólo se muestra a usuarios elegibles
   // (user.features.scenes); el backend re-valida has_scenes_access igual.
   const [enableScenes, setEnableScenes] = useState(false);
+  // Art track ("official audio"): tipo de video = master audio + cover, sin
+  // letra. Cuando está activo, el wizard fuerza la subida del cover, oculta
+  // los controles de letra y saltea el editor/transcripción — se genera
+  // directo con art_track=true.
+  const [artTrack, setArtTrack] = useState(false);
 
   const [reviewQueue, setReviewQueue] = useState([]);
   const [currentReview, setCurrentReview] = useState(null);
   const [approvedJobs, setApprovedJobs] = useState([]);
   const [transcribing, setTranscribing] = useState(false);
   const [transcribeError, setTranscribeError] = useState(null);
+  // PR E (2026-07): los segments VIVOS del job en review viven en el
+  // segmentsStore (keyed por jobId, sobrevive unmounts del editor), no en
+  // currentReview.segments — que queda como seed inicial + snapshot en
+  // commit points. Misma prioridad de key que el prop transcribeJobId del
+  // LyricsEditor: editingJobId (post-render edit) gana sobre transcribeJobId.
+  // Suscripción reactiva: WizardLivePreview + el snapshot de
+  // wizardPersistence leen de acá en vez del viejo espejo por keystroke
+  // (onEditedChange → mergeEditedSegments), que era la mitad del loop
+  // bidireccional del reseed-storm.
+  // reviewStoreKey (no editingJobId||transcribeJobId a secas): incluye el
+  // fallback `local:...` para que una review sin job de backend igual tenga
+  // entrada viva en el store — y así sus edits lleguen al snapshot de
+  // wizardPersistence vía liveReviewSegments en vez de morir en el useState
+  // local del editor. Es EXACTAMENTE la key bajo la que el editor seedea
+  // (prop storeKey), así que el lector y el escritor coinciden.
+  const reviewJobId = reviewStoreKey(currentReview);
+  const liveReviewSegments = useJobSegmentsValue(reviewJobId);
 
   // Phase C 2026-05-25: ref-based playback tick para que el WizardLivePreview
   // central pueda renderizar la línea activa con word-jump real (sincronizado
@@ -1160,6 +1211,12 @@ export default function App() {
   const handlePlaybackTick = useCallback((line, start, end, time, words) => {
     playbackTickRef.current = { activeLine: line, activeStart: start, activeEnd: end, currentTime: time, words: words || null };
   }, []);
+  // 2026-07-16 (idea de Tomi): slot DOM bajo el video (col central del wizard)
+  // donde LyricsEditor portalea su player bar, para que la columna de la letra
+  // quede full. UploadZone attachea el elemento vía callback ref (setter estable
+  // de useState) → re-render → LyricsEditor recibe el elemento y portalea. En
+  // el /edit modal no se pasa nada → el player va inline como siempre.
+  const [playerSlotEl, setPlayerSlotEl] = useState(null);
 
   // Phase 2 (2026-05-25): sync de typography settings cuando el operador
   // cambia font/case/animation desde el paso 4 del wizard MIENTRAS está
@@ -1245,6 +1302,14 @@ export default function App() {
   // video anterior mientras la UI prometía fondo IA. El envío ahora se
   // gatea por este modo: sólo se manda lo que el tab activo dice.
   const [bgSelectMode, setBgSelectMode] = useState("auto"); // auto | library | custom
+  // Art tracks ALWAYS use the uploaded cover (bgSelectMode "custom"). The
+  // wizard-restore path flips a restored "custom" back to "auto" (an
+  // uploaded File can't survive serialization), which for an art track
+  // wrongly swaps the cover uploader for the AI-background controls and
+  // hides the cover step. Self-heal: whenever art track is on, force custom.
+  useEffect(() => {
+    if (artTrack && bgSelectMode !== "custom") setBgSelectMode("custom");
+  }, [artTrack, bgSelectMode]);
   const [animateImage, setAnimateImage] = useState(false);
   // match_lyrics toggle: when ON (default), Gemini reads the lyrics and
   // builds the background around the song's primary visual subject. OFF
@@ -1367,8 +1432,21 @@ export default function App() {
     // setTimeout fallback) so the save happens during idle frames
     // instead of blocking renders. We also cancel any pending write
     // when the effect re-runs to coalesce rapid mutations.
+    // PR E (2026-07): currentReview.segments ya NO se actualiza por
+    // keystroke (el espejo onEditedChange murió con el segmentsStore).
+    // Para que un refresh no restaure segments stale, el snapshot copia
+    // los segments VIVOS del store (sin los campos internos _id/review)
+    // al momento de persistir. `liveReviewSegments` está en las deps, así
+    // que cada edición re-agenda este save (debounced vía idle callback,
+    // igual que antes con el espejo).
+    const committedReview = currentReview && Array.isArray(liveReviewSegments)
+      ? {
+          ...currentReview,
+          segments: liveReviewSegments.map(({ _id, review, ...rest }) => rest),
+        }
+      : currentReview;
     const snapshot = {
-      files, approvedJobs, currentReview, reviewQueue, wizardStage,
+      files, approvedJobs, currentReview: committedReview, reviewQueue, wizardStage,
       style, customColors, enableScenes, delivery, backgroundId, backgroundMode,
       bgSelectMode, animateImage, inspiredByLyrics,
     };
@@ -1386,7 +1464,7 @@ export default function App() {
     files, approvedJobs, currentReview, reviewQueue, wizardStage,
     style, customColors, enableScenes, delivery, backgroundId, backgroundMode,
     bgSelectMode, animateImage, inspiredByLyrics,
-    resumableWizard,
+    resumableWizard, liveReviewSegments,
   ]);
 
   // beforeunload warning — covers closing the tab, refreshing, or
@@ -1484,6 +1562,7 @@ export default function App() {
         // que IA es el default correcto.
         setBackgroundFile(null); setBackgroundId(null);
         setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
+        setArtTrack(false);
         setWizardStage("review");
         // Limpiar el query param sin agregar a history (replace).
         navigate("/new", { replace: true });
@@ -1573,6 +1652,7 @@ export default function App() {
         }
       } catch { /* Sentry path itself must not throw */ }
       wizardPersistence.clear();
+      segmentsStore.evictAll(); // PR E: resume fallido = sesión descartada
       setCurrentReview(null);
       setApprovedJobs([]);
       setReviewQueue([]);
@@ -1665,7 +1745,14 @@ export default function App() {
       .then((data) => {
         if (!data || !data.id) return;
         setUser((prev) => {
-          const merged = { ...(prev || {}), ...data };
+          // Deep-merge en `features`: un shallow spread reemplazaría todo el
+          // objeto, así un /auth/me que (durante un deploy) no traiga
+          // features.art_track lo borraría y ocultaría la feature a un usuario
+          // elegible. Preservar las flags previas y pisar solo las nuevas.
+          const merged = {
+            ...(prev || {}), ...data,
+            features: { ...(prev?.features || {}), ...(data.features || {}) },
+          };
           localStorage.setItem("genly_user", JSON.stringify(merged));
           return merged;
         });
@@ -1702,6 +1789,9 @@ export default function App() {
     // for the next batch (UploadZone.BATCH_DEFAULTS_STORAGE_KEY).
     try { wizardPersistence.clear(); } catch { /* best effort */ }
     try { localStorage.removeItem("genly:wizardBatchDefaultsV1"); } catch { /* */ }
+    // PR E: User B no debe heredar los segments editados de User A en la
+    // misma máquina — el store es a nivel módulo, no muere con el unmount.
+    try { segmentsStore.evictAll(); } catch { /* */ }
 
     // Short-lived media tokens (preview/download URLs scoped to
     // job+filetype). Without this, User B sees /preview URLs that
@@ -1870,9 +1960,25 @@ export default function App() {
       }
 
       if (es) {
-        const cleanup = () => { es.close(); pollingIntervals.current.delete(es); };
+        // Watchdog: an EventSource can OPEN successfully but then stay silent
+        // — a buffering proxy, or (local dev) an SSE reader that doesn't see
+        // the worker's writes. In that case neither onmessage nor onerror ever
+        // fires and the progress screen hangs forever. If no event arrives
+        // shortly after connecting, fall back to polling /status. Cleared as
+        // soon as the first event lands.
+        let sawEvent = false;
+        let silentTimer = setTimeout(() => {
+          if (!sawEvent) { cleanup(); startPolling(); }
+        }, 6000);
+        const cleanup = () => {
+          clearTimeout(silentTimer);
+          es.close();
+          pollingIntervals.current.delete(es);
+        };
         pollingIntervals.current.add(es);
         es.onmessage = (e) => {
+          sawEvent = true;
+          clearTimeout(silentTimer);
           if (!isMountedRef.current) { cleanup(); return; }
           try {
             const data = JSON.parse(e.data);
@@ -1892,7 +1998,6 @@ export default function App() {
           } catch {}
         };
         es.onerror = () => {
-          // SSE connection dropped (e.g. proxy buffering). Fall through to polling.
           cleanup();
           startPolling();
         };
@@ -1970,15 +2075,23 @@ export default function App() {
     });
   }, [fetchHistory, handleLogout]);
 
-  useEffect(() => () => {
-    // R-FRONT-5: marca unmounted ANTES de cerrar handles para que
-    // cualquier callback async en flight (SSE messages bufferadas, polls
-    // ya disparados) salga temprano vía el guard sin tocar state.
-    isMountedRef.current = false;
-    pollingIntervals.current.forEach((handle) => {
-      if (handle && typeof handle.close === "function") handle.close();
-      else clearInterval(handle);
-    });
+  useEffect(() => {
+    // Set true on (re)mount so React 18 StrictMode's dev-only
+    // setup→cleanup→setup cycle doesn't leave the ref stuck at `false` — that
+    // would make every SSE/polling guard below bail and freeze the progress
+    // screen (the "Armando el video" hang). Prod has no double-invoke, but
+    // setting it here is correct in both.
+    isMountedRef.current = true;
+    return () => {
+      // R-FRONT-5: marca unmounted ANTES de cerrar handles para que
+      // cualquier callback async en flight (SSE messages bufferadas, polls
+      // ya disparados) salga temprano vía el guard sin tocar state.
+      isMountedRef.current = false;
+      pollingIntervals.current.forEach((handle) => {
+        if (handle && typeof handle.close === "function") handle.close();
+        else clearInterval(handle);
+      });
+    };
   }, []);
 
   // Sync filesRef con files para que callbacks asincrónicos vean el state actual.
@@ -2107,6 +2220,17 @@ export default function App() {
         // el jobId y puede reusar este job en vez de crear uno nuevo.
         prefetchCache.current[key] = { status: "loading", jobId };
         setRowStatus(file, "queued");
+        // Versión B (letra anclada): re-leer la entry FRESCA por identidad
+        // de archivo antes del POST. Con el trigger movido al avance de paso
+        // el estado ya está resuelto al arrancar el prefetch, pero la subida
+        // a R2 tarda decenas de segundos; si el operador vuelve al paso
+        // "Subí" y cambia la fuente/letra DURANTE esa ventana, esta
+        // re-lectura hace que el POST use el estado vigente (y complementa la
+        // invalidación de cache de onInvalidatePrefetch para el caso ya
+        // posteado). Solo viaja con lyricsSource="official" (el selector
+        // manda, no el contenido del textarea).
+        const fresh = (filesRef.current || [])
+          .find((e) => e?.file && prefetchKey(e.file) === key) || entry;
         const res = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2116,6 +2240,7 @@ export default function App() {
             artist: entry.artist || "",
             title: (entry.songTitle || "").trim(),
             live: !!entry.live,
+            anchor_lyrics: anchorLyricsForEntry(fresh),
           }),
           signal: controller && controller.signal,
         }, { maxRetries: 3 });
@@ -2152,29 +2277,40 @@ export default function App() {
     }
   }, [pollUntilTranscribed]);
 
-  // 2026-05-23: trigger de transcripción auto en el drop del archivo. Antes
-  // se difería hasta el click en "Revisar", bloqueando al usuario ~15-20s en
-  // un loader. Ahora arranca al instante en background mientras el operador
-  // elige movement/effect/font/paleta. Cuando llega a "Revisar", los segments
-  // están cacheados → editor abre instant.
-  const onAutoTranscribe = useCallback((newFiles) => {
-    // newFiles llega desde UploadZone.addFiles con el shape que ya conocemos.
-    // Lo agregamos a la cola de prefetch. prefetchRemaining respeta serial
-    // (1 a la vez) para no saturar el backend pool — para parallelismo
-    // estricto refactorear con semáforo en v2.
-    // Pasamos los files actuales + los nuevos para que prefetch use el
-    // índice global del array en files (no del slice nuevo).
+  // Prefetch de transcripción al AVANZAR del paso "Subí", no al soltar el
+  // archivo. Historia: el trigger vivía en el drop (2026-05-23) para que el
+  // editor abriera instant, pero eso disparaba la transcripción cuando la
+  // fuente de letra todavía era el default "IA de Genly" y la letra oficial
+  // no estaba pegada → el job salía con anchor vacío y, aunque el operador
+  // después eligiera "Tengo la letra oficial", servía Versión A (bug
+  // staging job e77f84aefe33). Moviendo el disparo al avance de paso, la
+  // fuente de letra + la letra oficial ya están resueltas por canción, así
+  // que el POST /transcribe-uploaded sale con el anchor_lyrics correcto de
+  // una, sin carrera ni parche. El operador igual gana el prefetch: la
+  // transcripción corre en background mientras elige Modo/Movimiento/etc.
+  const handleUploadAdvance = useCallback(() => {
+    // Defer 1 tick por si el avance coincide con un setState de files.
     setTimeout(() => {
-      // Defer 1 tick para que setFiles haya commiteado antes del prefetch.
-      const merged = filesRef.current || [];
-      const startIdx = Math.max(0, merged.length - newFiles.length);
-      prefetchRemaining(merged, startIdx);
+      const queue = filesRef.current || [];
+      if (queue.length) prefetchRemaining(queue, 0);
     }, 0);
   }, [prefetchRemaining]);
 
+  // Edge case (a): si el operador vuelve al paso "Subí" DESPUÉS de avanzar
+  // (el prefetch ya salió) y cambia la fuente de letra o edita la letra
+  // oficial de una canción, el job cacheado quedó desalineado con la nueva
+  // elección. Descartamos su entrada de cache para que transcribeNext caiga
+  // al slow path y re-transcriba con el estado actual.
+  const invalidatePrefetchForFile = useCallback((file) => {
+    if (!file) return;
+    const key = prefetchKey(file);
+    if (prefetchCache.current[key]) delete prefetchCache.current[key];
+  }, []);
+
   // --- Review flow ---
-  // 2026-05-23: NO limpia más el prefetchCache. Si onAutoTranscribe ya cargó
-  // transcripciones en background, las reusamos. El cache queda mapeado por
+  // 2026-05-23: NO limpia más el prefetchCache. Si el prefetch (disparado al
+  // avanzar del paso "Subí") ya cargó transcripciones en background, las
+  // reusamos. El cache queda mapeado por
   // índice en `files`, así que es válido siempre que `files` no haya cambiado
   // de orden — y no lo cambiamos entre upload y review.
   const handleStartReview = async () => {
@@ -2402,6 +2538,11 @@ export default function App() {
           artist: entry.artist || "",
           title: (entry.songTitle || "").trim(),
           live: !!entry.live,
+          // Versión B: letra oficial pegada en el wizard → el backend la
+          // ancla al motor CTC (flag ANCHOR_LYRICS_ENABLED; vacía = no-op).
+          // Gated por el selector — volver a "IA de Genly" desactiva el
+          // anclado aunque el textarea conserve texto (ver anchorPayload).
+          anchor_lyrics: anchorLyricsForEntry(entry),
         }),
       }, {
         maxRetries: 3,
@@ -2551,83 +2692,35 @@ export default function App() {
   // anterior al cambio. Ahora el caller (LyricsEditor) usa el
   // resultado para mover saveStatus a "error" y mostrar un banner +
   // bloquear el botón Aprobar.
-  const persistSegmentsToBackend = useCallback(async (jobId, segments, opts = {}) => {
-    if (!jobId || !Array.isArray(segments) || segments.length === 0) {
-      return { ok: false, reason: "no-data" };
-    }
-    // [drag-persist] diagnostic — remove after 2026-07-01 if reseed-storm
-    // stays silent (fix landed in #724). Kept one extra week to confirm.
-    // Sanitise to the backend contract BEFORE the POST. A single out-of-contract
-    // segment (NaN/inverted/out-of-range from a drag or manual time edit) used to
-    // 400 the whole save → saveStatus stuck on "error" → "Aprobar" blocked for the
-    // job (incident 2026-06-26, Universal AR). We clamp so a stray bad value
-    // degrades to "saved, fixable" instead of blocking everything.
-    const safeSegments = sanitizeSegmentsForSave(segments);
-    const _fixed = findSanitizedDiffs(segments, safeSegments);
-    if (_fixed.length) {
-      // Still surface WHAT was out of contract (Sentry [autosave] tag) even
-      // though we no longer fail on it — so we can trace the source edit path.
-      console.warn("[autosave] sanitized out-of-contract segment(s) before save", {
-        jobId, count: _fixed.length, sample: _fixed.slice(0, 3),
-      });
-    }
-    const _sample = safeSegments.slice(0, 2).map((s) => ({
-      start: Math.round((s.start || 0) * 1000) / 1000,
-      end: Math.round((s.end || 0) * 1000) / 1000,
-    }));
-    console.warn("[drag-persist] POST", { jobId, count: safeSegments.length, sample: _sample });
+  // Thin wrapper sobre lib/persistSegments (extraído en PR F para testear el
+  // contrato real, no un mirror inline stale). authFetch + API se inyectan.
+  const persistSegmentsToBackend = useCallback(
+    (jobId, segments, opts = {}) => persistSegments(authFetch, API, jobId, segments, opts),
+    [],
+  );
+
+  // Versión B, parte 2: re-anclar el timing con el texto YA corregido por
+  // el operador. El backend toma segments_json (el autosave de arriba lo
+  // dejó fresco), usa el texto como ancla del motor CTC y persiste el
+  // timing re-anclado respetando las líneas `locked`. Devuelve el payload
+  // del endpoint ({ok, count, review_count, segments}) para que el
+  // LyricsEditor refresque su estado y muestre el toast de resultado.
+  const reanchorSegmentsOnBackend = useCallback(async (jobId) => {
+    if (!jobId) return { ok: false, reason: "no-job" };
     try {
-      const res = await authFetch(`${API}/jobs/${jobId}/save-segments`, {
+      const res = await authFetch(`${API}/jobs/${jobId}/reanchor`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ segments: safeSegments }),
-        // keepalive lets this POST survive a page unload (refresh / tab close).
-        // The unload flush in LyricsEditor sets it so the operator's last,
-        // not-yet-debounced edits aren't canceled mid-flight by the browser
-        // (reporte Gaby 2026-06-24: refrescó para salir del titileo y perdió
-        // TODO). Body cap is 64KB — fine for a lyrics segment list.
-        keepalive: opts.keepalive === true,
       });
       if (!res.ok) {
-        if (res.status === 400) {
-          // Post-sanitise this should be unreachable for segment-shape errors,
-          // but if the backend rejects for a reason we don't mirror, capture the
-          // exact `detail` (e.g. "segments[7] start/end out of range") instead of
-          // a bare status — that's what we lacked on 2026-06-26.
-          let detail = "";
-          try { detail = (await res.clone().json())?.detail || ""; } catch { /* non-JSON body */ }
-          console.warn("[autosave] /save-segments rejected 400", detail);
-        } else if (res.status !== 404) {
-          // 404 means the job was already reaped — nothing to save against.
-          // We log it as a soft warning; the user will see the real error
-          // when they click "Crear videos" and /generate returns 404.
-          console.warn("[autosave] /save-segments failed", res.status);
-        }
-        // QA fix audit P0 #74: bubble error to caller for saveStatus chip.
-        return {
-          ok: false,
-          reason: res.status === 404 ? "job-gone" : `http-${res.status}`,
-          status: res.status,
-        };
+        let detail = "";
+        try { detail = (await res.clone().json())?.detail || ""; } catch { /* non-JSON body */ }
+        console.warn("[reanchor] failed", res.status, detail);
+        return { ok: false, reason: `http-${res.status}`, status: res.status, detail };
       }
-      // Auditoría 2026-06-10 (reporte operadora "se mueve y pierde
-      // cambios"): acá vivía el ECO del autosave — tras el 200,
-      // setCurrentReview({...prev, segments}) escribía de vuelta el
-      // snapshot ENVIADO. Cuando se agregó (2026-05-26) era la única
-      // forma de mantener currentReview al día; desde que el mirror
-      // sincrónico onEditedChange (handleEditedChange) propaga CADA
-      // edición al instante, el eco solo puede ser igual o MÁS VIEJO
-      // que currentReview. Si la operadora editaba mientras el POST
-      // volaba, el eco pisaba esas ediciones y el prop-sync de
-      // LyricsEditor reseedeaba `edited` hacia atrás: snap-back visual
-      // ("empieza como a moverse"), drag en curso muerto (las _id se
-      // reasignan y React remonta el bloque) y, con POSTs fuera de
-      // orden o un unmount de por medio, pérdida real de trabajo.
-      // El eco se ELIMINA: el mirror es la única fuente de frescura.
-      return { ok: true };
+      return await res.json();
     } catch (err) {
-      console.warn("[autosave] /save-segments network error", err);
-      // QA fix audit P0 #74: bubble network error to caller.
+      console.warn("[reanchor] network error", err);
       return { ok: false, reason: "network", error: String(err) };
     }
   }, []);
@@ -2681,6 +2774,13 @@ export default function App() {
           backgroundMode: r.backgroundMode,
           movementStyle: r.movementStyle,
           segments: editedSegments,
+          // Pick de biblioteca en edit mode (PR #940 backend): la grilla
+          // del paso de fondo YA escribía backgroundId en App, pero el
+          // submit lo ignoraba — el operador "elegía" un fondo que nunca
+          // viajaba. Solo cuenta con el tab Library activo; volver a
+          // "IA Auto" lo anula (null → sin bucket → mantener fondo).
+          editBackgroundId:
+            (bgSelectMode === "library" && backgroundId) ? backgroundId : null,
         };
 
         const diff = computeFieldDiff(r.baseline, current);
@@ -2697,20 +2797,22 @@ export default function App() {
         }
 
         // Pick edit_type by priority — el más complejo de los presentes.
-        // background regen Veo (paid), lyrics re-renderiza con nuevos
-        // segments, metadata sólo title card, typography el último.
-        const PRIORITY = ["background", "lyrics", "metadata", "typography"];
+        // background_library (swap curado, $0, sin slot) supersede al
+        // regen IA; background regen Veo (paid), lyrics re-renderiza con
+        // nuevos segments, metadata sólo title card, typography el último.
+        const PRIORITY = ["background_library", "background", "lyrics", "metadata", "typography"];
         let chosenType = PRIORITY.find((k) => diff[k]);
 
-        // Backend gates: typography y background solo aceptan jobs en
-        // pending_review (main.py:7444). Para done/rejected:
+        // Backend gates: typography y background/background_library solo
+        // aceptan jobs en pending_review (main.py). Para done/rejected:
         //   - bg standalone: backend rechaza. Surface error claro.
         //   - typography standalone: piggyback en una lyrics edit usando
         //     los segments actuales (font/case/etc son ungated, se
         //     aplican en cualquier edit_type).
         const isPendingReview = r.jobStatus === "pending_review";
         if (!isPendingReview) {
-          if (chosenType === "background" && presentBuckets.length === 1) {
+          const _bgType = chosenType === "background" || chosenType === "background_library";
+          if (_bgType && presentBuckets.length === 1) {
             alert({
               title: t("edit.bg_locked_done_title") || "No se puede regenerar el fondo",
               description: t("edit.bg_locked_done_desc") ||
@@ -2719,9 +2821,11 @@ export default function App() {
             });
             return;
           }
-          if (chosenType === "background") {
+          if (_bgType) {
             // bg + otra cosa: bajar a la siguiente prioridad permitida.
-            chosenType = PRIORITY.slice(1).find((k) => diff[k] && k !== "background");
+            chosenType = PRIORITY.find(
+              (k) => diff[k] && k !== "background" && k !== "background_library",
+            );
           }
           if (chosenType === "typography") {
             // Convertir a lyrics edit. Necesita segments — usar el snapshot
@@ -2751,6 +2855,7 @@ export default function App() {
         if (diff.typography) Object.assign(payload, diff.typography);
         if (diff.lyrics) Object.assign(payload, diff.lyrics);
         if (diff.background) Object.assign(payload, diff.background);
+        if (diff.background_library) Object.assign(payload, diff.background_library);
 
         const doPost = async (body) => {
           const res = await authFetch(`${API}/edit/${editedJobId}`, {
@@ -2788,6 +2893,13 @@ export default function App() {
 
         setCurrentReview(null);
         wizardPersistence.clear();
+        // PR E: el job salió del flow de review — soltar su entrada del
+        // store para que una futura re-edición seedee del backend fresco.
+        // reviewStoreKey(r) = la key exacta bajo la que el editor seedeó
+        // (= editedJobId en este path de editingJobId); evict con esa key o
+        // la entrada leakea. Se evicta también transcribeJobId por las dudas.
+        segmentsStore.evict(reviewStoreKey(r));
+        segmentsStore.evict(r.transcribeJobId);
         navigate(`/videos/${editedJobId}`, { replace: true });
         return;
       } finally {
@@ -2828,6 +2940,15 @@ export default function App() {
     track("wizard.approve_lyrics", { segments: (editedSegments || []).length });
     setApprovedJobs(newApproved);
     setCurrentReview(null);
+    // PR E: la canción aprobada sale del review — soltar su entrada del
+    // segmentsStore para que un batch de N canciones no acumule N arrays
+    // vivos. Si la operadora vuelve atrás (handleBackInReview), el editor
+    // re-seedea desde approvedJobs[i].segments (= editedSegments, lo último
+    // que vio en pantalla), así que no se pierde nada.
+    // reviewStoreKey(r): incluye el fallback local:... para que una review
+    // sin job de backend NO leakee su entrada (el viejo `editingJobId ||
+    // transcribeJobId` evictaba undefined = no-op y dejaba el array vivo).
+    segmentsStore.evict(reviewStoreKey(r));
 
     // Fire-and-forget commit of the just-approved segments to the backend.
     // Bumps last_user_activity_at and persists segments_json so the reaper
@@ -2901,6 +3022,7 @@ export default function App() {
         tone: "warning",
       });
       wizardPersistence.clear();
+      segmentsStore.evictAll(); // PR E: sesión muerta = batch descartado
       setCurrentReview(null);
       setApprovedJobs([]);
       setReadyToGenerate(false);
@@ -3190,6 +3312,96 @@ export default function App() {
     await Promise.all(Array.from({ length: Math.min(PARALLEL_WORKERS, jobList.length) }, () => worker()));
   };
 
+  // Art track submit: one multipart POST /generate per audio with the cover as
+  // background_file + art_track=true + empty segments. No lyrics editor, no R2
+  // two-step — the direct /generate path streams the audio to disk locally and
+  // uploads it to R2 in prod (so the separate worker can fetch it), same as the
+  // legacy direct create. The pipeline skips Whisper and composites the cover.
+  const handleGenerateArtTrack = () => {
+    if (!files.length || !files.every((f) => f.artist.trim())) return;
+    if (!backgroundFile || typeof backgroundFile.slice !== "function") {
+      alert({
+        title: t("arttrack.cover_missing_title") || "Falta la portada",
+        description: t("arttrack.cover_missing_desc") ||
+          "Un art track necesita el cover del tema. Subí la imagen de portada.",
+        tone: "warning",
+      });
+      return;
+    }
+    const jobList = files.map((f) => ({
+      filename: f.file.name, _file: f.file, _cover: backgroundFile,
+      artist: f.artist.trim(), songTitle: (f.songTitle || "").trim(),
+      status: "queued", current_step: null,
+      progress: 0, job_id: null, error: null,
+    }));
+    setJobs(jobList);
+    navigate("/generating");
+    setFiles([]);
+    processArtTrackQueue(jobList);
+  };
+
+  const processArtTrackQueue = async (jobList) => {
+    let nextIdx = 0;
+    const worker = async () => {
+      while (nextIdx < jobList.length) {
+        const i = nextIdx++;
+        setJobs((prev) => prev.map((j, idx) =>
+          idx === i ? { ...j, status: "processing", current_step: "uploading", progress: 0 } : j
+        ));
+        const body = new FormData();
+        body.append("file", jobList[i]._file, jobList[i].filename);
+        body.append("background_file", jobList[i]._cover,
+                    jobList[i]._cover.name || "cover.jpg");
+        body.append("artist", jobList[i].artist);
+        if (jobList[i].songTitle) body.append("song_title", jobList[i].songTitle);
+        body.append("segments_json", "[]");
+        body.append("art_track", "true");
+        if ((delivery.label_line || "").trim()) {
+          body.append("label_line", delivery.label_line.trim());
+        }
+        if ((delivery.effect || "").trim()) {
+          body.append("effect", delivery.effect.trim());
+        }
+        body.append("delivery_profile", delivery.delivery_profile);
+        if (delivery.delivery_profile !== "youtube") {
+          body.append("umg_frame_size", delivery.umg_frame_size);
+          body.append("umg_fps", String(delivery.umg_fps));
+          body.append("umg_prores_profile", String(delivery.umg_prores_profile));
+        }
+
+        let genRes = null;
+        try {
+          genRes = await authFetch(`${API}/generate`, { method: "POST", body });
+          let data;
+          try {
+            data = await genRes.json();
+          } catch {
+            const reason = await describeFetchError(null, genRes, t);
+            setJobs((prev) => prev.map((j, idx) =>
+              idx === i ? { ...j, status: "error", error: reason } : j));
+            continue;
+          }
+          if (!genRes.ok || data.detail) {
+            if ((genRes.status ?? 0) === 401) { handleLogout("expired"); return; }
+            const reason = data.detail || await describeFetchError(null, genRes, t);
+            setJobs((prev) => prev.map((j, idx) =>
+              idx === i ? { ...j, status: "error", error: reason } : j));
+            continue;
+          }
+          setJobs((prev) => prev.map((j, idx) =>
+            idx === i ? { ...j, current_step: "video", progress: 0, job_id: data.job_id } : j));
+          await pollJob(data.job_id);
+        } catch (err) {
+          if ((err?.status ?? err?.response?.status) === 401) { handleLogout("expired"); return; }
+          const reason = await describeFetchError(err, genRes, t);
+          setJobs((prev) => prev.map((j, idx) =>
+            idx === i ? { ...j, status: "error", error: reason } : j));
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(PARALLEL_WORKERS, jobList.length) }, () => worker()));
+  };
+
   const handleReset = (skipConfirm = false) => {
     // Confirm whenever there's any wizard state at risk — not only when
     // jobs are running. Without this, the user could lose an in-progress
@@ -3209,6 +3421,11 @@ export default function App() {
     prefetchAbortRef.current = new AbortController();
     setFiles([]); setJobs([]); setBackgroundFile(null); setBackgroundId(null);
     setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
+    // Volver a lyric video en "Descartar todo": sin esto artTrack queda true y
+    // el self-heal fuerza bgSelectMode a "custom" de nuevo, dejando el wizard
+    // en modo art track sin cover.
+    setArtTrack(false);
+    segmentsStore.evictAll(); // PR E: descartar todo = soltar el store entero
     setReviewQueue([]); setCurrentReview(null); setApprovedJobs([]);
     setTranscribing(false); setReadyToGenerate(false); setTranscribeError(null);
     // Capa B 2026-05-24: el wizard descartó todo → vuelve al upload state.
@@ -3224,20 +3441,12 @@ export default function App() {
   //     so it can be re-approved.
   //   - canción 1 (no approved yet) → /new with files[] still intact.
   // Distinct from handleReset (which discards the whole batch).
-  // Mirror sincrónico editor → currentReview. Auditoría 2026-06-10: la
-  // versión anterior era un arrow INLINE en el JSX — identidad nueva en
-  // cada render de App. Como LyricsEditor lo tiene en las deps de su
-  // effect espejo, cada render re-corría el effect → setCurrentReview con
-  // objeto nuevo → otro render de App → loop perpetuo (confirmado
-  // empíricamente: ~5000 ciclos/100ms). El loop saturaba el main thread
-  // (drags y taps caían en frames perdidos — parte del "se mueve y no me
-  // deja"), ensanchaba la ventana de la race del autosave y cancelaba en
-  // cada ciclo el requestIdleCallback de wizardPersistence.save.
-  // Dos cortes: identidad estable (useCallback) + no-op cuando los
-  // valores no cambiaron (devolver el MISMO objeto corta el re-render).
-  const handleEditedChange = useCallback((segs) => {
-    setCurrentReview((r) => mergeEditedSegments(r, segs));
-  }, []);
+  // PR E (2026-07): acá vivía handleEditedChange, el espejo sincrónico
+  // editor → currentReview (onEditedChange → mergeEditedSegments). Fue la
+  // fuente de un loop perpetuo App↔editor (auditoría 2026-06-10) y la
+  // mitad del loop bidireccional del reseed-storm. Eliminado: los
+  // lectores (WizardLivePreview, snapshot de wizardPersistence) se
+  // suscriben al segmentsStore vía useJobSegmentsValue(reviewJobId).
 
   const handleBackInReview = () => {
     if (approvedJobs.length > 0) {
@@ -3282,14 +3491,26 @@ export default function App() {
     // lo sincronizado (el "tengo que volver a comenzar"). Refrescamos el
     // cache con los segments vigentes antes de soltar la review.
     try {
-      if (currentReview?.file && Array.isArray(currentReview.segments)) {
+      // PR E: los segments vigentes viven en el segmentsStore, no en
+      // currentReview.segments (que quedó como seed inicial). Caemos al
+      // campo de currentReview si el store no tiene entrada (review sin
+      // jobId). Se limpian los campos internos (_id/review) como hacía el
+      // espejo viejo.
+      const liveSegs = segmentsStore.get(reviewJobId) || currentReview?.segments;
+      if (currentReview?.file && Array.isArray(liveSegs)) {
         const k = prefetchKey(currentReview.file);
         const cached = prefetchCache.current[k];
         if (cached?.status === "ready" && cached.data) {
-          cached.data = { ...cached.data, segments: currentReview.segments };
+          cached.data = {
+            ...cached.data,
+            segments: liveSegs.map(({ _id, review, ...rest }) => rest),
+          };
         }
       }
     } catch { /* best-effort: el cache es una optimización, no la verdad */ }
+    // La review cancelada sale del flow — su entrada del store no debe
+    // sobrevivir (una re-entrada re-transcribe / usa el prefetchCache).
+    segmentsStore.evictAll();
     setCurrentReview(null);
     setReviewQueue([]);
     setTranscribing(false);
@@ -3380,6 +3601,7 @@ export default function App() {
     setAnimateImage(false);
     setEnableScenes(false);
     wizardPersistence.clear();
+    segmentsStore.evictAll(); // PR E: batch nuevo = descarte del anterior
     navigate("/new");
   };
 
@@ -3512,7 +3734,12 @@ export default function App() {
     // Gemini gratuito). Si el operador clickea "Editar y re-renderizar"
     // con cambio de background, ese flow dispara su propio re-render
     // via /edit/{id} con edit_type=background — no necesita el preview.
-    enabled: !!currentReview && !currentReview.editMode,
+    enabled: shouldEnableBackgroundPreview({
+      hasReview: !!currentReview,
+      editMode: !!currentReview?.editMode,
+      bgSelectMode,
+      enableScenes,
+    }),
     api: API,
     authHeaders,
     onCacheKey: (key, meta) => {
@@ -3743,6 +3970,21 @@ export default function App() {
         onCustomColorsChange={setCustomColors}
         enableScenes={enableScenes}
         onEnableScenesChange={setEnableScenes}
+        artTrack={artTrack}
+        onArtTrackChange={(on) => {
+          setArtTrack(on);
+          // Art track = cover subido + sin Escenas. Forzar modo "custom" para
+          // que aparezca el uploader del cover; limpiar Escenas (incompatible).
+          if (on) {
+            setBgSelectMode("custom"); setEnableScenes(false);
+          } else {
+            // Al volver a Lyric Video: restaurar el fondo AI por defecto y
+            // soltar el cover subido. Sin esto, bgSelectMode queda "custom" y
+            // el lyric video se rendería con el cover como fondo (regresión).
+            setBgSelectMode("auto"); setBackgroundFile(null);
+          }
+        }}
+        onGenerateArtTrack={handleGenerateArtTrack}
         backgroundFile={backgroundFile}
         onBackgroundFile={setBackgroundFile}
         backgroundId={backgroundId}
@@ -3760,8 +4002,13 @@ export default function App() {
         onGenerateDirect={handleGenerateDirect}
         user={user}
         sidebarOpen={sidebarOpen}
-        // 2026-05-23: auto-transcribe en background al dropear.
-        onAutoTranscribe={onAutoTranscribe}
+        // Prefetch de transcripción al avanzar del paso "Subí" (no al drop):
+        // la fuente de letra + la letra oficial ya están resueltas por
+        // canción, así el POST sale con anchor_lyrics correcto.
+        onUploadAdvance={handleUploadAdvance}
+        // Edge case (a): editar fuente/letra tras avanzar invalida el
+        // prefetch de esa canción para que se re-transcriba.
+        onInvalidatePrefetch={invalidatePrefetchForFile}
         transcribeStatusByFile={transcribeStatusByFile}
         // Phase 2 (2026-05-25): el wizard ahora abarca la review (paso 6).
         // hasReviewableContent prende cuando arranca el transcribe o existe
@@ -3775,12 +4022,18 @@ export default function App() {
         renderStep6={() => reviewScreen}
         // Phase 3: pasar segments al WizardLivePreview central para que
         // muestre una línea real de la canción que se está revisando.
-        reviewSegments={currentReview?.segments || null}
+        // PR E (2026-07): la fuente viva son los segments del store
+        // (reflejan cada edición sin el espejo por keystroke); fallback a
+        // currentReview.segments para reviews sin jobId todavía (el store
+        // no tiene entrada hasta que el editor seedea).
+        reviewSegments={liveReviewSegments || currentReview?.segments || null}
         // Phase C 2026-05-25: ref-based tick para que el WizardLivePreview
         // central renderice la línea ACTIVA (no la primera) con word-jump
         // sincronizado al audio. Sin re-renders en App.jsx — el preview lee
         // el ref con su propio rAF loop.
         playbackTickRef={playbackTickRef}
+        // 2026-07-16: callback ref para el slot del player bar bajo el video.
+        onPlayerSlotRef={setPlayerSlotEl}
         // Post-render edit (EditLyricsRoute): el wizard se monta sobre un
         // job ya renderizado. QA fix 2026-05-27: bajamos los locks de
         // [1, 2, 3, 5] a [1, 5] — solo file upload (paso 1) y delivery
@@ -3921,6 +4174,9 @@ export default function App() {
         <div className="flex justify-center">
           <Suspense fallback={<EditorSuspenseFallback />}>
           <LyricsEditor
+            // 2026-07-16: cuando el wizard pasa un slot (bajo el video), el
+            // player bar se portalea ahí; null (modal/inline) → inline.
+            playerSlot={playerSlotEl}
             // key forces a fresh mount when stepping forward/backward
             // through the batch — LyricsEditor seeds its `edited` state
             // from props.segments only on mount, so without the key the
@@ -3974,16 +4230,17 @@ export default function App() {
             // Post-render edit: cuando editingJobId está set, el autosave
             // de /save-segments va al job real (no al transcribeJob, que
             // en este flow es null). Orden importante: editingJobId gana.
+            // transcribeJobId sólo gobierna el autosave/backend; el store se
+            // keyea por storeKey (abajo) — que existe incluso cuando ambos
+            // ids son null, así que los edits jobId-less no se pierden.
             transcribeJobId={currentReview.editingJobId || currentReview.transcribeJobId || null}
+            storeKey={reviewStoreKey(currentReview)}
             onPersistSegments={persistSegmentsToBackend}
-            // QA fix 2026-05-28 (bug #2): synchronous mirror del estado
-            // local del LyricsEditor a currentReview.segments para que el
-            // WizardLivePreview central (que lee `reviewSegments`) refleje
-            // los drag-resize de timings sin esperar al autosave de 3s +
-            // network roundtrip. Auditoría 2026-06-10: memoizado + guard de
-            // no-op — ver handleEditedChange (el arrow inline acá causaba
-            // un loop perpetuo de re-renders App↔editor).
-            onEditedChange={handleEditedChange}
+            onReanchor={reanchorSegmentsOnBackend}
+            // PR E (2026-07): el viejo onEditedChange (espejo sincrónico a
+            // currentReview.segments) desapareció — WizardLivePreview lee
+            // ahora del segmentsStore (useJobSegmentsValue) sin pasar por
+            // el state de App, así que no hay eco de vuelta al editor.
             isBatch={currentReview.queue.length > 1}
             batchProgress={currentReview.queue.length > 1
               ? `${currentReview.queueIdx + 1} ${t("editor.song_of")} ${currentReview.queue.length}`

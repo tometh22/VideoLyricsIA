@@ -53,6 +53,14 @@ import os
 import tempfile
 from typing import Optional
 
+from background_policy import (
+    cache_policy_fingerprint,
+    policy_enforces,
+    resolve_atmospherics_policy,
+    resolve_creative_mode,
+    runtime_rollout_fingerprint,
+)
+
 logger = logging.getLogger("genly.bg_preview")
 
 
@@ -60,7 +68,23 @@ logger = logging.getLogger("genly.bg_preview")
 # ordenadas para que el mismo dict en distinto orden produzca el mismo key.
 # Si agregamos params futuros que afecten el background, sumarlos acá +
 # bumpear CACHE_VERSION para invalidar el cache existente.
-CACHE_VERSION = "v1"
+# v5 also invalidates previews created before human-output recovery and the
+# camera-equipment prompt fix. The atmospheric policy itself remains v4. In
+# particular off/shadow/enforce never share a key, and an asset generated
+# under the legacy namespace cannot become an enforce-mode cache hit. Every
+# v5 entry also passed the authoritative content gate before cache_put.
+# v6 (2026-07-17): metió `_lyrics_fp` en el hash — REVERTIDO en v7 (mismo
+# día). La letra en el hash rompía el reuso: el preview se dispara MIENTRAS
+# el operador edita (con la letra a medio hacer) y el render usa la letra
+# final; cualquier diferencia → keys distintas → cache-miss → se regenera
+# el fondo que ya estaba hecho. Como el operador casi siempre ajusta la
+# letra antes de crear, el hit-rate se desplomaba y el ahorro no llegaba.
+# v7: la letra ya NO entra al hash (fondos abstractos: un desfasaje de unas
+# ediciones es invisible), pero el preview SIGUE recibiendo lyrics_text para
+# generar (run_bg_preview_job → _ensure_background), así el fondo queda
+# temáticamente cerca de la canción. La letra afecta la GENERACIÓN, no la
+# ETIQUETA. v7 además deja de cachear el gradiente de policy-fallback (de v6).
+CACHE_VERSION = "v7"
 
 
 def compute_bg_cache_key(params: dict) -> str:
@@ -76,8 +100,23 @@ def compute_bg_cache_key(params: dict) -> str:
     Returns:
         hex string de 12 chars (suficiente para uniqueness, corto para R2 key).
     """
+    # Authorization is resolved exclusively from the raw operator-authored
+    # background_hint.  Lyrics, genre, concept, visual-bible output and other
+    # derived text must never opt a job into atmospheric effects.  The
+    # creative mode is derived from the existing legacy fields so no endpoint
+    # or payload change is required.
+    raw_operator_prompt = params.get("background_hint") or ""
+    creative_mode = resolve_creative_mode(
+        match_lyrics=bool(params.get("match_lyrics", True)),
+        operator_prompt=raw_operator_prompt,
+        verbatim=bool(params.get("bg_verbatim", False)),
+    )
+    atmospheric_policy = resolve_atmospherics_policy(raw_operator_prompt)
+
     canonical = {
         "_cache_version": CACHE_VERSION,
+        "_creative_mode": creative_mode,
+        "_policy_fingerprint": cache_policy_fingerprint(atmospheric_policy),
         "artist":          (params.get("artist") or "").strip(),
         "song_title":      (params.get("song_title") or "").strip(),
         "style":           (params.get("style") or "").strip().lower(),
@@ -91,10 +130,47 @@ def compute_bg_cache_key(params: dict) -> str:
         "background_mode": (params.get("background_mode") or "veo").strip().lower(),
         "animate_image":   bool(params.get("animate_image", False)),
         "match_lyrics":    bool(params.get("match_lyrics", True)),
+        # NOTA v7: la LETRA no entra al hash a propósito (ver CACHE_VERSION).
+        # lyrics_text influye la generación del preview, no la etiqueta.
     }
     payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return digest[:12]
+
+
+def job_bg_cache_key(*, artist, song_title, style, movement_style, effect,
+                     custom_colors, genre, concept, background_hint,
+                     bg_verbatim, match_lyrics):
+    """Key esperado para el fast-path de fondo único AI de un job /generate.
+
+    Única fuente de verdad de los hardcodes `background_mode="veo"` /
+    `animate_image=False`: el preview SIEMPRE hashea así (App.jsx
+    previewEntry los fija) y el caller excluye custom/library/escenas/
+    variation antes de llamar. La usan main.py (recompute server-side
+    cuando el frontend no mandó el key — race del debounce) y
+    pipeline._validate_bg_cache_key (validación defensiva del worker), así
+    que main y worker no pueden divergir en la normalización.
+
+    Best-effort: None si el cómputo falla (el caller genera fresh).
+    """
+    try:
+        return compute_bg_cache_key({
+            "artist": artist or "",
+            "song_title": song_title or "",
+            "style": style or "",
+            "movement_style": movement_style or "",
+            "effect": effect or "",
+            "custom_colors": custom_colors or "",
+            "genre": genre or "",
+            "concept": concept or "",
+            "background_hint": background_hint or "",
+            "bg_verbatim": bool(bg_verbatim),
+            "background_mode": "veo",
+            "animate_image": False,
+            "match_lyrics": bool(match_lyrics),
+        })
+    except Exception:
+        return None
 
 
 def cache_r2_key(bg_cache_key: str) -> str:
@@ -122,7 +198,12 @@ def cache_download(bg_cache_key: str, dest_path: str) -> bool:
     return storage.download_object(cache_r2_key(bg_cache_key), dest_path)
 
 
-def run_bg_preview_job(job_id: str, bg_cache_key: str, params: dict) -> dict:
+def run_bg_preview_job(
+    job_id: str,
+    bg_cache_key: str,
+    params: dict,
+    background_policy_fingerprint: str | None = None,
+) -> dict:
     """RQ entry point — runs ONLY the background generation step + uploads to R2.
 
     Reusa `_ensure_background` del pipeline existente. No render lyrics overlay,
@@ -138,6 +219,46 @@ def run_bg_preview_job(job_id: str, bg_cache_key: str, params: dict) -> dict:
     set_job_log_context(job_id)
     from jobs import update_job
 
+    runtime_policy = resolve_atmospherics_policy(params.get("background_hint"))
+    runtime_fingerprint = runtime_rollout_fingerprint(
+        mode=runtime_policy.get("policy_mode")
+    )
+    expected_cache_key = compute_bg_cache_key(params)
+    lockstep_invalid = bool(
+        (background_policy_fingerprint
+         and background_policy_fingerprint != runtime_fingerprint)
+        or (policy_enforces(runtime_policy) and not background_policy_fingerprint)
+        or bg_cache_key != expected_cache_key
+    )
+    if lockstep_invalid:
+        logger.error(
+            "[BG_PREVIEW] refusing job=%s due policy/cache mismatch "
+            "queued_policy=%s runtime_policy=%s queued_key=%s expected_key=%s",
+            job_id,
+            background_policy_fingerprint or "missing",
+            runtime_fingerprint,
+            bg_cache_key,
+            expected_cache_key,
+        )
+        try:
+            update_job(
+                job_id,
+                status="bg_preview_failed",
+                current_step="background",
+                error=(
+                    "Background safety configuration changed while the preview "
+                    "was queued. Retry after deployment finishes."
+                ),
+            )
+        except Exception:
+            pass
+        return {
+            "job_id": job_id,
+            "status": "bg_preview_failed",
+            "bg_cache_key": bg_cache_key,
+            "error": "background_policy_mismatch",
+        }
+
     # Idempotency check — race window entre enqueue y worker pickup.
     if cache_check(bg_cache_key):
         logger.info("[BG_PREVIEW] job=%s key=%s already cached, no-op", job_id, bg_cache_key)
@@ -148,59 +269,120 @@ def run_bg_preview_job(job_id: str, bg_cache_key: str, params: dict) -> dict:
             pass
         return {"job_id": job_id, "status": "bg_preview_done", "bg_cache_key": bg_cache_key, "cached": True}
 
+    # "bg_preview_running" (≤20 chars): el nombre viejo
+    # "bg_preview_generating" (21) excedía el varchar(20) de Job.status y
+    # este update fallaba EN SILENCIO desde siempre en Postgres (el status
+    # jamás existió en la DB — 0 filas históricas; lo destapó el CI de
+    # Postgres del PR #924). El try/except queda, pero ahora loguea: un
+    # guard que traga errores esconde bugs de schema.
     try:
-        update_job(job_id, status="bg_preview_generating", current_step="background")
-    except Exception:
-        pass
+        update_job(job_id, status="bg_preview_running", current_step="background")
+    except Exception as _status_err:
+        logger.warning("[BG_PREVIEW] no pude marcar running job=%s: %s",
+                       job_id, _status_err)
 
     # Importamos pipeline solo cuando lo necesitamos (importar main/pipeline
     # arrastra mucho — preferimos lazy para que el módulo bg_preview sea
     # importable en tests sin spin-up del backend entero).
     try:
-        from pipeline import _ensure_background
+        from pipeline import (
+            _ensure_background,
+            _compute_allow_people,
+            _raise_if_job_timeout,
+            _validate_background_asset_for_job,
+            _write_safe_gradient_background,
+        )
 
         with tempfile.TemporaryDirectory() as job_dir:
-            # _ensure_background returns path to generated bg video/image.
-            # FIX 2026-05-25: la signatura real NO tiene `duration`, `effect`,
-            # `animate_image`, `segments`, ni `lang` — eran kwargs que evolucionaron
-            # fuera o nunca existieron. El primer arg posicional es `style_hint`
-            # (no `style`). El effect overlay se compone en el render final
-            # (fx_compositor), no en bg-gen. Pasamos solo lo que la signatura acepta.
-            bg_path = _ensure_background(
-                params.get("style", "auto"),  # style_hint (positional)
-                job_dir,                       # job_dir (positional)
-                # job_id REAL del job ghost (existe en `jobs`, 12 chars). Antes
-                # se pasaba f"bgpreview_{job_id}" (~22 chars), lo que rompía el
-                # INSERT de provenance: ai_provenance.job_id es VARCHAR(12) con
-                # FK a jobs.job_id → StringDataRightTruncation (Sentry "Failed to
-                # insert provenance start row") y, aun si entrara por longitud,
-                # violaría el FK. Con el id real la auditoría UMG queda bien atada
-                # al job, y el progress-crawl + heartbeat de Veo ahora
-                # actualizan/protegen el job ghost correctamente.
-                job_id=job_id,
-                artist=params.get("artist", ""),
-                song_title=params.get("song_title", ""),
-                genre=params.get("genre", ""),
-                concept=params.get("concept", ""),
-                movement_style=params.get("movement_style", ""),
-                match_lyrics=bool(params.get("match_lyrics", True)),
-                background_hint=params.get("background_hint"),
-                bg_verbatim=bool(params.get("bg_verbatim", False)),
-                bg_mode=params.get("background_mode", "veo"),
-                custom_colors=params.get("custom_colors", ""),
-            )
+            # Generation prompts are guidance, not a compliance boundary. If
+            # the model hallucinates a person/smoke/brand, discard only that
+            # background and make one fresh paid attempt under a unique cache
+            # namespace. Never turn the preview tracker into a rejected video.
+            bg_path = None
+            for safety_attempt in range(2):
+                try:
+                    candidate = _ensure_background(
+                        params.get("style", "auto"),
+                        job_dir,
+                        job_id=job_id,
+                        artist=params.get("artist", ""),
+                        song_title=params.get("song_title", ""),
+                        genre=params.get("genre", ""),
+                        concept=params.get("concept", ""),
+                        movement_style=params.get("movement_style", ""),
+                        match_lyrics=bool(params.get("match_lyrics", True)),
+                        # v6: el preview genera CON la letra (si el frontend
+                        # la mandó) — antes generaba ciego a ella y el render
+                        # heredaba un fondo que no la reflejaba.
+                        lyrics_text=params.get("lyrics_text") or "",
+                        background_hint=params.get("background_hint"),
+                        bg_verbatim=bool(params.get("bg_verbatim", False)),
+                        bg_mode=params.get("background_mode", "veo"),
+                        custom_colors=params.get("custom_colors", ""),
+                        allow_people=_compute_allow_people(
+                            job_id, params.get("background_hint")
+                        ),
+                        generation_nonce=(
+                            f"preview-{job_id}-{safety_attempt}"
+                            if safety_attempt else ""
+                        ),
+                    )
+                except Exception as generation_error:
+                    _raise_if_job_timeout(generation_error)
+                    logger.warning(
+                        "[BG_PREVIEW] job=%s generation attempt=%s failed: %s",
+                        job_id, safety_attempt + 1, generation_error,
+                    )
+                    continue
+                if not candidate or not os.path.exists(candidate):
+                    continue
+                if _validate_background_asset_for_job(
+                    job_id,
+                    candidate,
+                    params.get("background_hint"),
+                    failure_status=None,
+                ):
+                    bg_path = candidate
+                    break
+                logger.warning(
+                    "[BG_PREVIEW] job=%s discarded unsafe background attempt=%s",
+                    job_id,
+                    safety_attempt + 1,
+                )
 
-            if not bg_path or not os.path.exists(bg_path):
-                raise RuntimeError("background generation returned no file")
+            if bg_path is None:
+                bg_path = _write_safe_gradient_background(
+                    job_dir,
+                    params.get("style", "auto"),
+                    filename="bg_preview_policy_fallback.mp4",
+                )
+                update_job(job_id, validation_result={
+                    "passed": True,
+                    "issues": [],
+                    "validation_scope": "deterministic_local_fallback",
+                    "recovered_from_unsafe_generation": True,
+                    "policy_version": runtime_policy.get("policy_version"),
+                    "policy_mode": runtime_policy.get("policy_mode"),
+                })
+                # v6: el gradiente de fallback NO se sube bajo la key real.
+                # Cachearlo hacía que un render futuro con la misma key lo
+                # heredara como si fuera un fondo Veo bueno, salteando su
+                # propia generación y recovery (audit adversarial 2026-07-17).
+                # Sin objeto en cache → el render hace miss y genera fresh.
+                logger.warning(
+                    "[BG_PREVIEW] job=%s policy fallback (gradiente) — no se "
+                    "cachea bajo key=%s; el render regenerará fresh",
+                    job_id, bg_cache_key,
+                )
+            else:
+                uploaded_key = cache_put(bg_cache_key, bg_path)
+                if not uploaded_key:
+                    raise RuntimeError("R2 upload failed (R2 disabled?)")
 
-            uploaded_key = cache_put(bg_cache_key, bg_path)
-            if not uploaded_key:
-                raise RuntimeError("R2 upload failed (R2 disabled?)")
-
-            logger.info(
-                "[BG_PREVIEW] job=%s uploaded bg to R2 key=%s (size=%d KB)",
-                job_id, uploaded_key, os.path.getsize(bg_path) // 1024,
-            )
+                logger.info(
+                    "[BG_PREVIEW] job=%s uploaded bg to R2 key=%s (size=%d KB)",
+                    job_id, uploaded_key, os.path.getsize(bg_path) // 1024,
+                )
 
         try:
             update_job(job_id, status="bg_preview_done", current_step="cached", error=None)
@@ -214,6 +396,12 @@ def run_bg_preview_job(job_id: str, bg_cache_key: str, params: dict) -> dict:
         }
 
     except Exception as e:
+        try:
+            _raise_if_job_timeout(e)
+        except NameError:
+            # Policy mismatch/import failures happen before the lazy pipeline
+            # import. They cannot be an RQ timeout raised by provider work.
+            pass
         import traceback
         logger.error("[BG_PREVIEW] job=%s failed: %s\n%s", job_id, e, traceback.format_exc())
         # Surface to Sentry with the job tag — bg_preview runs in the RQ

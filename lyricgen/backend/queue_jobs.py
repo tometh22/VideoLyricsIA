@@ -123,11 +123,27 @@ _ENTERPRISE_TENANTS = frozenset(
     if t.strip()
 )
 
+# Synthetic-traffic tenants (monitors/canaries) drain LAST. The golden
+# render bot fires 3 concurrent renders on every staging push + nightly
+# cron; on 2026-07-17 that tripled the default-queue wait for a real
+# operator mid-test. Canary jobs must never compete with humans — they
+# only need to run *eventually* to keep the regression signal alive.
+# The worker must list "canary" at the END of its QUEUES env or these
+# jobs will sit unconsumed (see worker.py:_resolve_queue_names).
+_CANARY_TENANTS = frozenset(
+    t.strip().lower()
+    for t in os.environ.get("CANARY_TENANTS", "golden_render_bot").split(",")
+    if t.strip()
+)
+
 
 def _pick_queue(plan: str, tenant_id: str = ""):
     """Enterprise queue for premium plans OR B2B tenants, default otherwise.
 
     Precedence (highest first):
+      0. tenant_id matches `_CANARY_TENANTS` — synthetic monitors drain
+         last, whatever their plan says (a canary must never gain fast
+         lane by a plan change).
       1. tenant_id matches `_ENTERPRISE_TENANTS` — UMG/OMG always jump
          the default queue even on plan="100". 2026-05-15 incident:
          agus.cafisi (omg) batch of 5 songs was queuing behind tomas's
@@ -147,6 +163,9 @@ def _pick_queue(plan: str, tenant_id: str = ""):
     if q_default is None:
         return None
     tid = (tenant_id or "").strip().lower()
+    if tid and tid in _CANARY_TENANTS:
+        from rq import Queue
+        return Queue("canary", connection=q_default.connection)
     if tid and tid in _ENTERPRISE_TENANTS:
         return q_enterprise
     if plan in ("unlimited", "enterprise"):
@@ -433,6 +452,12 @@ def enqueue_pipeline(
 ) -> str:
     """Enqueue a run_pipeline job. Returns RQ job id (or 'thread:<job_id>' in
     the Redis-less fallback path)."""
+    # Internal lockstep token: a worker running a different rollout mode must
+    # fail before generation rather than silently producing under another
+    # policy. This is RQ metadata, not a public request/payload field.
+    from background_policy import runtime_rollout_fingerprint
+    kwargs = dict(kwargs)
+    kwargs["background_policy_fingerprint"] = runtime_rollout_fingerprint()
     q = _pick_queue(plan, tenant_id=tenant_id)
     if q is not None:
         from rq import Retry
@@ -510,6 +535,7 @@ def enqueue_transcription(
     filename: str = "",
     live: bool = False,
     tenant_id: str = "",
+    anchor_lyrics: str = "",
 ) -> str:
     """Enqueue una transcripción en la queue `transcription` (alta prioridad,
     drenada por el mismo worker container que enterprise/default).
@@ -554,6 +580,7 @@ def enqueue_transcription(
             kwargs={
                 "language": language, "artist": artist, "title": title,
                 "filename": filename, "live": live,
+                "anchor_lyrics": anchor_lyrics,
             },
             job_timeout=timeout,
             result_ttl=RESULT_TTL,
@@ -585,7 +612,8 @@ def enqueue_transcription(
         args=(job_id, audio_path),
         kwargs={
             "language": language, "artist": artist, "title": title,
-            "filename": filename,
+            "filename": filename, "live": live,
+            "anchor_lyrics": anchor_lyrics,
         },
         daemon=True,
     )
@@ -612,6 +640,8 @@ def enqueue_bg_preview(
     en orden FIFO). Si en el futuro UMG necesita priority, mover a
     `enterprise_bg_preview` o similar.
     """
+    from background_policy import runtime_rollout_fingerprint
+    _policy_fingerprint = runtime_rollout_fingerprint()
     _, q_default, _ = _init_redis()
     if q_default is not None:
         from rq import Queue, Retry
@@ -640,7 +670,7 @@ def enqueue_bg_preview(
         _evict_stale_rq_job(_redis, f"bgpreview:{job_id}")
         rq_job = q.enqueue(
             run_bg_preview_job,
-            args=(job_id, bg_cache_key, params),
+            args=(job_id, bg_cache_key, params, _policy_fingerprint),
             job_timeout=timeout,
             result_ttl=RESULT_TTL,
             failure_ttl=FAILURE_TTL,
@@ -660,7 +690,7 @@ def enqueue_bg_preview(
     from bg_preview import run_bg_preview_job
     t = threading.Thread(
         target=run_bg_preview_job,
-        args=(job_id, bg_cache_key, params),
+        args=(job_id, bg_cache_key, params, _policy_fingerprint),
         daemon=True,
     )
     t.start()
@@ -791,6 +821,8 @@ def enqueue_edit(
     too tight for long songs; we now match the main pipeline's
     YouTube-only allowance to keep the worst-case edit alive.
     """
+    from background_policy import runtime_rollout_fingerprint
+    _policy_fingerprint = runtime_rollout_fingerprint()
     q = _pick_queue(plan, tenant_id=tenant_id)
     if q is not None:
         from rq import Retry
@@ -815,7 +847,7 @@ def enqueue_edit(
         retry = Retry(max=PIPELINE_RETRY_MAX, interval=PIPELINE_RETRY_INTERVAL_S)
         rq_job = q.enqueue(
             run_edit_pipeline,
-            args=(job_id, edit_type, edit_params),
+            args=(job_id, edit_type, edit_params, _policy_fingerprint),
             # 60 min — covers worst-case long-song edits with motion enabled
             # until we land the ffmpeg-overlay rewrite.
             job_timeout=3600,
@@ -836,7 +868,7 @@ def enqueue_edit(
     from pipeline import run_edit_pipeline
     t = threading.Thread(
         target=run_edit_pipeline,
-        args=(job_id, edit_type, edit_params),
+        args=(job_id, edit_type, edit_params, _policy_fingerprint),
         daemon=True,
     )
     t.start()

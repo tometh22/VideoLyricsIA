@@ -80,17 +80,26 @@ def _cleanup_worktree(path: str):
     shutil.rmtree(path, ignore_errors=True)
 
 
-def _claude(prompt: str, cwd: str, allowed_tools: str) -> dict:
-    """Corre `claude -p` headless y devuelve {'text': <último mensaje>, 'json': <dict|None>}."""
+def _claude(prompt: str, cwd: str, allowed_tools: str,
+            resume_session: str | None = None, max_turns: int | None = None) -> dict:
+    """Corre `claude -p` headless. Devuelve {'text', 'json', 'session_id'}.
+
+    `resume_session`: retoma una sesión previa del CLI (conversación
+    continuada desde Telegram). `max_turns`: override (modo deep)."""
+    import models
     cmd = [
         "claude", "-p", prompt,
         "--output-format", "json",
-        "--max-turns", str(config.AGENT_MAX_TURNS),
+        "--max-turns", str(max_turns or config.AGENT_MAX_TURNS),
         "--allowedTools", allowed_tools,
         "--permission-mode", "acceptEdits",
     ]
-    if config.CLAUDE_MODEL:
-        cmd += ["--model", config.CLAUDE_MODEL]
+    if resume_session:
+        cmd += ["--resume", resume_session]
+    # Modelo efectivo: override del store (/model) → env → default del CLI.
+    model = models.current(config.CLAUDE_MODEL)
+    if model:
+        cmd += ["--model", model]
     env = {
         "ANTHROPIC_API_KEY": config.ANTHROPIC_API_KEY,
         # gh usa GH_TOKEN; git push usa el remote del worktree (mismo header
@@ -101,9 +110,11 @@ def _claude(prompt: str, cwd: str, allowed_tools: str) -> dict:
     r = _run(cmd, cwd=cwd, timeout=config.AGENT_TIMEOUT_SECONDS, env=env)
     if r.returncode != 0 and not r.stdout.strip():
         raise RuntimeError(f"claude CLI falló (rc={r.returncode}): {r.stderr[-600:]}")
+    session_id = None
     try:
         out = json.loads(r.stdout)
         text = out.get("result") or ""
+        session_id = out.get("session_id")
     except (json.JSONDecodeError, AttributeError):
         text = r.stdout
     # El prompt pide que el último mensaje sea SOLO un JSON — lo extraemos
@@ -115,7 +126,7 @@ def _claude(prompt: str, cwd: str, allowed_tools: str) -> dict:
             parsed = json.loads(m.group(0))
         except json.JSONDecodeError:
             parsed = None
-    return {"text": text, "json": parsed}
+    return {"text": text, "json": parsed, "session_id": session_id}
 
 
 async def investigate(incident: dict, alert_context: str) -> dict:
@@ -127,7 +138,15 @@ async def investigate(incident: dict, alert_context: str) -> dict:
             return _claude(
                 prompts.investigate_prompt(alert_context, config.PR_BASE_BRANCH),
                 cwd=wt,
-                allowed_tools="Read,Grep,Glob,Bash(git log:*),Bash(git show:*),Bash(git grep:*)",
+                allowed_tools=(
+                    "Read,Grep,Glob,Bash(git log:*),Bash(git show:*),Bash(git grep:*),"
+                    "Bash(git diff:*),Bash(git branch:*),Bash(git ls-remote:*),"
+                    # consulta read-only de GitHub: PRs/issues/runs relacionados
+                    # al incidente (¿ya hay un fix abierto? ¿regresión de un PR?).
+                    "Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr diff:*),"
+                    "Bash(gh issue list:*),Bash(gh issue view:*),"
+                    "Bash(gh run list:*),Bash(gh run view:*),Bash(gh search:*)"
+                ),
             )
         finally:
             _cleanup_worktree(wt)
@@ -171,4 +190,72 @@ async def implement(incident: dict) -> dict:
             )
         finally:
             _cleanup_worktree(wt)
+    return await asyncio.to_thread(_sync)
+
+
+# ---------------------------------------------------------------------------
+# Tareas ad-hoc desde el chat (/task) — v1.1
+# ---------------------------------------------------------------------------
+
+_TASKSPACE = None  # worktree persistente para tareas (las sesiones retomadas
+                   # necesitan el mismo cwd; se refresca a origin/main por tarea)
+
+
+def _ensure_taskspace() -> str:
+    global _TASKSPACE
+    path = os.path.join(config.WORKDIR, "wt", "taskspace")
+    if _TASKSPACE and os.path.isdir(path):
+        _run(["git", "fetch", "origin", "main", config.PR_BASE_BRANCH],
+             cwd=path, timeout=300)
+        _run(["git", "reset", "--hard", "origin/main"], cwd=path, timeout=60)
+        return path
+    ensure_repo()
+    shutil.rmtree(path, ignore_errors=True)
+    _run(["git", "worktree", "prune"], cwd=REPO_DIR, timeout=60)
+    r = _run(["git", "worktree", "add", "--force", "--detach", path, "origin/main"],
+             cwd=REPO_DIR, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f"taskspace falló: {r.stderr[-300:]}")
+    _TASKSPACE = path
+    return path
+
+
+async def run_task(instruction: str, resume_session: str | None = None,
+                   deep: bool = False) -> dict:
+    """Tarea libre del operador (auditar, revisar, investigar) — SOLO lectura,
+    con conversación continuable (resume_session). `deep=True` habilita que el
+    agente lance SUBAGENTES en paralelo (tool Task) y le da más turnos —
+    para auditorías grandes ("revisá todo X con varios agentes"). Nunca edita
+    ni pushea: para eso está el flujo de incidentes con aprobación."""
+    def _sync():
+        ws = _ensure_taskspace()
+        # Allowlist SOLO-LECTURA: git local + remoto (ls-remote/fetch/branch) y
+        # el set de consulta de GitHub (pr/issue/run list+view, checks, status,
+        # search). NO se incluyen escrituras (gh pr create/merge/comment, git
+        # push) ni `gh api` (puede mutar con -X POST) — para mutar está el flujo
+        # de incidentes con aprobación humana. `gh pr list --json baseRefName`
+        # cubre "qué PRs hay abiertos y contra qué rama".
+        tools = (
+            "Read,Grep,Glob,"
+            "Bash(git log:*),Bash(git show:*),Bash(git grep:*),Bash(git diff:*),"
+            "Bash(git branch:*),Bash(git ls-remote:*),Bash(git fetch:*),Bash(git rev-parse:*),"
+            "Bash(ls:*),Bash(cat:*),Bash(python3 -c:*),"
+            "Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr list:*),"
+            "Bash(gh pr checks:*),Bash(gh pr status:*),"
+            "Bash(gh issue list:*),Bash(gh issue view:*),"
+            "Bash(gh run list:*),Bash(gh run view:*),"
+            "Bash(gh search:*),Bash(gh repo view:*),Bash(gh label list:*)"
+        )
+        if deep:
+            # Task = spawner de subagentes del Claude Code CLI. Con esto el
+            # agente decide fan-out (varios subagentes read-only en paralelo).
+            tools += ",Task"
+        return _claude(
+            prompts.task_prompt(instruction, config.PR_BASE_BRANCH, deep=deep)
+            if not resume_session else instruction,
+            cwd=ws,
+            allowed_tools=tools,
+            resume_session=resume_session,
+            max_turns=200 if deep else None,
+        )
     return await asyncio.to_thread(_sync)

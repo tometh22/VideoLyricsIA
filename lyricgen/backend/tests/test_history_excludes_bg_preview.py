@@ -17,11 +17,14 @@ from jobs import get_all_jobs
 _T = "tenant_bgpreview_history_test"
 
 
-def _seed(db, *, job_id, status, age_min, user_id=1, song_title="Hermanos De Sangre"):
+def _seed(
+    db, *, job_id, status, age_min, user_id=1,
+    song_title="Hermanos De Sangre", filename=None,
+):
     db.add(Job(
         job_id=job_id, user_id=user_id, tenant_id=_T,
         artist="Viejas Locas", song_title=song_title,
-        filename=f"{job_id}.mp3", style="rock", status=status,
+        filename=filename or f"{job_id}.mp3", style="rock", status=status,
         delivery_profile="youtube",
         created_at=datetime.now(timezone.utc) - timedelta(minutes=age_min),
     ))
@@ -43,8 +46,15 @@ def test_get_all_jobs_excludes_bg_preview_ghosts():
         _seed(db, job_id="ghost001", status="bg_preview_done", age_min=4)
         # Other ghost states the worker can leave behind.
         _seed(db, job_id="ghost002", status="bg_preview_queued", age_min=3)
-        _seed(db, job_id="ghost003", status="bg_preview_generating", age_min=3)
+        _seed(db, job_id="ghost003", status="bg_preview_running", age_min=3)
         _seed(db, job_id="ghost004", status="bg_preview_failed", age_min=3)
+        # Regression from the July incident: the validator wrote a generic
+        # terminal state before the preview worker could write its own state.
+        # Filename remains an independent tracking-row identifier.
+        _seed(
+            db, job_id="ghost005", status="validation_failed", age_min=2,
+            filename="bgpreview_deadbeef.preview",
+        )
 
         rows = get_all_jobs(db, tenant_id=_T, user_id=1)
         ids = {r["job_id"] for r in rows}

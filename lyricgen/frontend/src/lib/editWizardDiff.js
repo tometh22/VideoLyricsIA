@@ -150,6 +150,18 @@ export function computeFieldDiff(baseline, current) {
     out.background = bgDiff;
   }
 
+  // ── background_library ───────────────────────────────────────────────
+  // Swap a un asset curado de biblioteca (backend edit_type=
+  // "background_library", PR #940 — sin Veo, sin consumir slot). El
+  // baseline es siempre null ("mantener fondo actual"), así que un pick
+  // de biblioteca SIEMPRE es diff. Mutuamente excluyente con el bucket
+  // `background`: elegir un asset concreto supersede cualquier hint de
+  // regeneración IA que haya quedado en el formulario.
+  if (current.editBackgroundId) {
+    out.background_library = { background_id: current.editBackgroundId };
+    delete out.background;
+  }
+
   return out;
 }
 

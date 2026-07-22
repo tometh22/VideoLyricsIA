@@ -139,6 +139,50 @@ def test_scene_clips_graceful_degradation(monkeypatch, tmp_path):
     assert failed["status"] == "failed"
 
 
+def test_scene_clips_cache_only_miss_without_stored_key_degrades_silently(monkeypatch, tmp_path, caplog):
+    """Incidente 2026-07-10 (coro_3): en un edit (regen_keys=set() → todo
+    cache_only), una escena que falló en la generación original NUNCA persistió
+    clip_cache_key → su miss es GARANTIZADO y ya está manejado (se reusa un
+    clip válido). Antes se logueaba como ERROR → page falso al on-call en cada
+    edit. Ahora: el intento a caché se CONSERVA (enmienda del review — el skip
+    original rompía planes sin keys), pero un miss sin key persistida degrada
+    con WARNING y status 'reused', no ERROR/'failed'."""
+    import logging as _logging
+    import veo_breaker
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+
+    def fake_veo(prompt, output_path, **kw):
+        # coro_1 (tiene key) hitea caché; coro_3 (sin key) missea como en prod.
+        if kw.get("cache_key_override"):
+            with open(output_path, "w") as f:
+                f.write("clip")
+            return output_path
+        raise RuntimeError("[BG] cache_only: sin clip cacheado (deadbeef)")
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    plan = {"scenes": [
+        # coro_1 sí cacheó al generarse (tiene clip_cache_key).
+        {"recurrence_key": "coro_1", "prompt": "p", "movement_style": "dinamico",
+         "clip_cache_key": "cache/veo/coro1.mp4"},
+        # coro_3 falló en la generación original → sin clip_cache_key.
+        {"recurrence_key": "coro_3", "prompt": "p", "movement_style": "sutil",
+         "status": "failed"},
+    ]}
+    with caplog.at_level(_logging.WARNING):
+        # regen_keys=set() → TODAS cache_only (el caso del edit de lyrics/typography).
+        clip_for_key = pipeline._generate_scene_clips(
+            plan, str(tmp_path), artist="A", song_title="S", job_id=None,
+            regen_keys=set())
+
+    # El timeline queda entero: coro_3 reusa el clip válido de coro_1.
+    assert set(clip_for_key) == {"coro_1", "coro_3"}
+    coro3 = next(s for s in plan["scenes"] if s["recurrence_key"] == "coro_3")
+    assert coro3["status"] == "reused"
+    # Degradación SILENCIOSA: warning sí, ERROR (lo que paginaba) no.
+    records = [r for r in caplog.records if "coro_3" in r.getMessage()]
+    assert records and all(r.levelno < _logging.ERROR for r in records)
+
+
 def test_scene_clips_all_fail_raises(monkeypatch, tmp_path):
     import veo_breaker
     monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
@@ -152,6 +196,127 @@ def test_scene_clips_all_fail_raises(monkeypatch, tmp_path):
     import pytest
     with pytest.raises(RuntimeError):
         pipeline._generate_scene_clips(plan, str(tmp_path), artist="A", song_title="S")
+
+
+def test_scene_people_authorization_is_isolated_per_scene(monkeypatch, tmp_path):
+    import veo_breaker
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+    calls = {}
+
+    def fake_veo(prompt, output_path, **kwargs):
+        calls[prompt] = kwargs["allow_people"]
+        with open(output_path, "wb") as fh:
+            fh.write(b"clip")
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    plan = {
+        "scenes": [
+            {"recurrence_key": "empty", "prompt": "empty", "allow_people": False},
+            {"recurrence_key": "singer", "prompt": "singer", "allow_people": True},
+        ]
+    }
+
+    pipeline._generate_scene_clips(
+        plan,
+        str(tmp_path),
+        artist="A",
+        song_title="S",
+        allow_people=True,
+    )
+
+    assert calls == {"empty": False, "singer": True}
+
+
+def test_people_allowed_clip_cannot_fill_people_denied_failed_scene(
+    monkeypatch, tmp_path
+):
+    import pytest
+    import veo_breaker
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+
+    def fake_veo(prompt, output_path, **kwargs):
+        if prompt == "denied-scene":
+            raise RuntimeError("cache missing")
+        with open(output_path, "wb") as fh:
+            fh.write(b"clip")
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    plan = {
+        "scenes": [
+            {"recurrence_key": "target", "prompt": "people-scene", "allow_people": True},
+            {"recurrence_key": "strict", "prompt": "denied-scene", "allow_people": False},
+        ]
+    }
+
+    with pytest.raises(RuntimeError, match="no policy-compatible"):
+        pipeline._generate_scene_clips(
+            plan,
+            str(tmp_path),
+            artist="A",
+            song_title="S",
+            allow_people=True,
+            regen_keys={"target"},
+        )
+    failed = next(scene for scene in plan["scenes"] if scene["recurrence_key"] == "strict")
+    assert failed["validation"]["passed"] is False
+
+
+def test_stricter_clip_may_fill_more_permissive_failed_scene(monkeypatch, tmp_path):
+    import veo_breaker
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+
+    def fake_veo(prompt, output_path, **kwargs):
+        if prompt == "failed-allowed-scene":
+            raise RuntimeError("generation failed")
+        with open(output_path, "wb") as fh:
+            fh.write(b"clip")
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    plan = {
+        "scenes": [
+            {"recurrence_key": "strict", "prompt": "empty", "allow_people": False},
+            {"recurrence_key": "allowed", "prompt": "failed-allowed-scene", "allow_people": True},
+        ]
+    }
+
+    clips = pipeline._generate_scene_clips(
+        plan, str(tmp_path), artist="A", song_title="S", allow_people=True,
+    )
+
+    assert clips["allowed"] == clips["strict"]
+    allowed = next(scene for scene in plan["scenes"] if scene["recurrence_key"] == "allowed")
+    assert allowed["validation"]["passed"] is True
+    assert allowed["validation"]["substituted_from"] == "strict"
+
+
+def test_dense_revalidation_never_substitutes_a_missing_source_clip(
+    monkeypatch, tmp_path
+):
+    import pytest
+    import veo_breaker
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+
+    def fake_veo(prompt, output_path, **kwargs):
+        if prompt == "missing":
+            raise RuntimeError("cache miss")
+        with open(output_path, "wb") as fh:
+            fh.write(b"clip")
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    plan = {"scenes": [
+        {"recurrence_key": "ok", "prompt": "ok", "allow_people": False},
+        {"recurrence_key": "missing", "prompt": "missing", "allow_people": False},
+    ]}
+
+    with pytest.raises(RuntimeError, match="densely revalidated"):
+        pipeline._generate_scene_clips(
+            plan,
+            str(tmp_path),
+            artist="A",
+            song_title="S",
+            regen_keys=set(),
+            allow_policy_fallback=False,
+        )
 
 
 def _two_scene_plan():
@@ -205,7 +370,9 @@ def test_regenerate_scene_busts_only_target(monkeypatch, tmp_path):
     assert coro_call["cache_only"] is False
     assert verso_call["cache_only"] is True
     assert coro["cache_token"] in coro_call["ns"]
-    assert verso_call["ns"] == "A|S|verso_1"
+    assert verso_call["ns"] == (
+        "A|S|verso_1|auto|background-v5:off:deny"
+    )
     assert tl == "/tmp/timeline.mp4"
 
 
@@ -287,8 +454,136 @@ def test_restitch_for_edit_bails_when_structure_changed(tmp_path):
 
 
 def test_scene_cache_ns_token():
-    assert pipeline._scene_cache_ns("A", "S", "coro_1") == "A|S|coro_1"
-    assert pipeline._scene_cache_ns("A", "S", "coro_1", "ab12") == "A|S|coro_1|ab12"
+    base = "A|S|coro_1|auto|background-v5:off:deny"
+    assert pipeline._scene_cache_ns("A", "S", "coro_1") == base
+    assert pipeline._scene_cache_ns("A", "S", "coro_1", "ab12") == f"{base}|ab12"
+
+
+def test_legacy_scene_plan_never_skips_edit_validation():
+    plan = _two_scene_plan()
+
+    assert pipeline._scene_plan_has_current_clip_validation(plan) is False
+
+
+def test_dense_edit_validation_rebuilds_the_rendered_timeline(monkeypatch, tmp_path):
+    """The validated scene plan must materialize the exact asset we render.
+
+    A generic bg_cached timeline may be older than the plan after an R2 recache
+    failure or worker crash, so clip evidence alone can never authorize it.
+    """
+    import scenes
+
+    plan = {
+        "sections": [{
+            "type": "verse", "start": 0.0, "end": 8.0,
+            "energy": 0.5, "recurrence_key": "verse_1", "text": "",
+        }],
+        "scenes": [{"recurrence_key": "verse_1"}],
+    }
+    clip_map = {"verse_1": str(tmp_path / "validated-clip.mp4")}
+    captured = {}
+    def fake_generate(*args, **kwargs):
+        captured["allow_policy_fallback"] = kwargs.get(
+            "allow_policy_fallback"
+        )
+        return clip_map
+
+    monkeypatch.setattr(pipeline, "_generate_scene_clips", fake_generate)
+    monkeypatch.setattr(
+        pipeline,
+        "_scene_plan_has_current_clip_validation",
+        lambda *a, **kw: True,
+    )
+    monkeypatch.setattr(
+        scenes,
+        "stitch_timeline",
+        lambda sections, clips, duration, job_dir, **kw: (
+            captured.update(
+                sections=sections,
+                clips=clips,
+                duration=duration,
+                out_name=kw.get("out_name"),
+            )
+            or str(tmp_path / "trusted-timeline.mp4")
+        ),
+    )
+
+    rendered = pipeline._densely_revalidate_scene_plan_for_edit(
+        plan,
+        str(tmp_path),
+        artist="Artist",
+        song_title="Song",
+        concept="",
+        job_id="job-safe",
+        audio_duration=8.0,
+    )
+
+    assert rendered.endswith("trusted-timeline.mp4")
+    assert captured["clips"] is clip_map
+    assert captured["duration"] == 8.0
+    assert captured["out_name"] == "bg_scenes_validated_edit.mp4"
+    assert captured["allow_policy_fallback"] is True
+
+
+def test_reuse_edits_never_trust_generic_scene_timeline_identity():
+    import inspect
+
+    source = inspect.getsource(pipeline.run_edit_pipeline)
+    assert "or not _scene_timeline_from_current_clips" in source
+    assert "bg_image_path = _densely_revalidate_scene_plan_for_edit(" in source
+
+
+def test_scene_plan_validation_requires_matching_policy_fingerprint(monkeypatch):
+    monkeypatch.setenv("BACKGROUND_SMOKE_POLICY_MODE", "enforce")
+    policy = {
+        "policy_version": "background-v5",
+        "policy_mode": "enforce",
+        "allow_atmospherics": False,
+    }
+    fingerprint = "background-v5:enforce:deny|people:deny"
+    plan = {
+        "scenes": [
+            {
+                "recurrence_key": "verse_1",
+                "atmospherics_policy": policy,
+                "validation": {
+                    "passed": True,
+                    "policy_fingerprint": fingerprint,
+                },
+            },
+            # Repeated recurrence does not require a second provider clip.
+            {"recurrence_key": "verse_1"},
+        ]
+    }
+
+    assert pipeline._scene_plan_has_current_clip_validation(plan) is True
+    plan["scenes"][0]["validation"]["policy_fingerprint"] = (
+        "background-v5:shadow:deny|people:deny"
+    )
+    assert pipeline._scene_plan_has_current_clip_validation(plan) is False
+
+
+def test_shadow_scene_validation_is_stale_after_enforce_rollout(monkeypatch):
+    monkeypatch.setenv("BACKGROUND_SMOKE_POLICY_MODE", "enforce")
+    stored = {
+        "policy_version": "background-v5",
+        "policy_mode": "shadow",
+        "allow_atmospherics": False,
+        "explicit_atmospherics": [],
+        "authorization_source": "default_deny",
+    }
+    plan = {
+        "scenes": [{
+            "recurrence_key": "verse_1",
+            "atmospherics_policy": stored,
+            "validation": {
+                "passed": True,
+                "policy_fingerprint": "background-v5:shadow:deny|people:deny",
+            },
+        }]
+    }
+
+    assert pipeline._scene_plan_has_current_clip_validation(plan) is False
 
 
 def test_scene_clips_breaker_open_raises(monkeypatch, tmp_path):
@@ -388,3 +683,137 @@ def test_restitch_failure_persists_scene_statuses():
     fail_idx = src.index("re-stitch de escenas falló")
     persist_idx = src.index("update_job(job_id, scene_plan=scene_plan)", fail_idx)
     assert persist_idx > fail_idx
+
+
+def test_scene_clips_generated_in_parallel(monkeypatch, tmp_path):
+    """Con SCENE_CONCURRENCY>1, las escenas únicas se generan concurrentemente:
+    todas quedan mapeadas y varios hilos Veo corren a la vez (barrera)."""
+    import threading
+    import veo_breaker
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+    monkeypatch.setenv("SCENE_CONCURRENCY", "4")
+
+    N = 4
+    barrier = threading.Barrier(N, timeout=10)
+    max_concurrent = {"n": 0}
+    lock = threading.Lock()
+    active = {"n": 0}
+
+    def fake_veo(prompt, output_path, **kw):
+        with lock:
+            active["n"] += 1
+            max_concurrent["n"] = max(max_concurrent["n"], active["n"])
+        # Si NO fueran paralelas, esta barrera haría timeout → error.
+        barrier.wait()
+        with open(output_path, "w") as f:
+            f.write("clip")
+        with lock:
+            active["n"] -= 1
+        return output_path
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    plan = {"scenes": [
+        {"recurrence_key": f"s{i}", "prompt": "p", "movement_style": "x"}
+        for i in range(N)
+    ]}
+    clip_for_key = pipeline._generate_scene_clips(
+        plan, str(tmp_path), artist="A", song_title="S", job_id=None)
+    assert set(clip_for_key) == {f"s{i}" for i in range(N)}
+    assert max_concurrent["n"] == N  # de verdad corrieron en paralelo
+
+
+def test_scene_clips_recurrence_dedup_generates_once(monkeypatch, tmp_path):
+    """Un coro que se repite (misma recurrence_key) genera UN solo clip Veo;
+    las repeticiones reusan ese clip aun en modo paralelo."""
+    import veo_breaker
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+    monkeypatch.setenv("SCENE_CONCURRENCY", "4")
+    calls = []
+
+    def fake_veo(prompt, output_path, **kw):
+        calls.append(kw.get("cache_namespace") or "")
+        with open(output_path, "w") as f:
+            f.write("clip")
+        return output_path
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    plan = {"scenes": [
+        {"recurrence_key": "coro", "prompt": "p", "movement_style": "x"},
+        {"recurrence_key": "verso", "prompt": "p", "movement_style": "x"},
+        {"recurrence_key": "coro", "prompt": "p", "movement_style": "x"},
+    ]}
+    clip_for_key = pipeline._generate_scene_clips(
+        plan, str(tmp_path), artist="A", song_title="S", job_id=None)
+    assert set(clip_for_key) == {"coro", "verso"}
+    # Solo 2 generaciones (coro + verso), no 3: la repetición reusa el clip.
+    assert len(calls) == 2
+    # El stitch usa clip_for_key[coro] para ambas apariciones del coro.
+    assert os.path.exists(clip_for_key["coro"])
+
+
+def test_scene_clips_parallel_timeout_propagates(monkeypatch, tmp_path):
+    """Un job-timeout en cualquier escena aborta el render entero (no degrada
+    en silencio) aun con generación paralela."""
+    import pytest
+    import veo_breaker
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+    monkeypatch.setenv("SCENE_CONCURRENCY", "4")
+
+    class _JobTimeout(Exception):
+        pass
+
+    def fake_veo(prompt, output_path, **kw):
+        if "s1" in (kw.get("cache_namespace") or ""):
+            raise _JobTimeout("job cancelado")
+        with open(output_path, "w") as f:
+            f.write("clip")
+        return output_path
+
+    def fake_raise_if_timeout(e):
+        if isinstance(e, _JobTimeout):
+            raise e
+
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    monkeypatch.setattr(pipeline, "_raise_if_job_timeout", fake_raise_if_timeout)
+    plan = {"scenes": [
+        {"recurrence_key": f"s{i}", "prompt": "p", "movement_style": "x"}
+        for i in range(4)
+    ]}
+    with pytest.raises(_JobTimeout):
+        pipeline._generate_scene_clips(
+            plan, str(tmp_path), artist="A", song_title="S", job_id=None)
+
+
+def test_scene_validation_observe_skip_avoids_vision(monkeypatch, tmp_path):
+    """Con observe + SCENE_VALIDATION_OBSERVE_SKIP=1, NO se llama a Vision por
+    clip pero el clip se conserva con veredicto passed sintetizado."""
+    import veo_breaker
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+    monkeypatch.setenv("BACKGROUND_VALIDATION_ENFORCEMENT", "observe")
+    monkeypatch.setenv("SCENE_VALIDATION_OBSERVE_SKIP", "1")
+    monkeypatch.setenv("SCENE_CONCURRENCY", "2")
+
+    def fake_veo(prompt, output_path, **kw):
+        with open(output_path, "w") as f:
+            f.write("clip")
+        return output_path
+
+    called = {"vision": 0}
+    import content_validator
+    def boom_validate(*a, **k):
+        called["vision"] += 1
+        return {"passed": False, "issues": [{"type": "people"}]}
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+    monkeypatch.setattr(content_validator, "validate_video", boom_validate)
+
+    plan = {"scenes": [
+        {"recurrence_key": "a", "prompt": "p", "movement_style": "x"},
+        {"recurrence_key": "b", "prompt": "p", "movement_style": "x"},
+    ]}
+    clip_for_key = pipeline._generate_scene_clips(
+        plan, str(tmp_path), artist="A", song_title="S", job_id="job123abc")
+    assert set(clip_for_key) == {"a", "b"}
+    assert called["vision"] == 0  # skip real: cero llamadas a Vision
+    for s in plan["scenes"]:
+        assert s["validation"]["passed"] is True
+        assert s["validation"]["validation_scope"] == "observe_skipped_inline"

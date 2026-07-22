@@ -5,7 +5,7 @@ import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
 import EditRequestPanel from "./EditRequestPanel";
-import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
+import ContentValidationToggle, { isUniversalAccount } from "./ContentValidationToggle";
 import { useAlert } from "./AlertProvider";
 import HelpTip from "./HelpCenter/HelpTip";
 import EnableProResModal from "./EnableProResModal";
@@ -462,8 +462,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // bypass/force in the POST /retry body. See ContentValidationToggle.jsx
   // for full rationale.
   const _retryTenantId = currentUser?.tenant_id || null;
-  const _retryIsUmg = isUmgTenant(_retryTenantId);
-  const [retryValidationEnabled, setRetryValidationEnabled] = useState(_retryIsUmg);
+  const _retryBillingGroup = currentUser?.billing_group || null;
+  const _retryIsUmg = isUniversalAccount(_retryTenantId, _retryBillingGroup);
+  const [retryValidationEnabled, setRetryValidationEnabled] = useState(true);
   const showRetrySpecSelector =
     (job.delivery_profile === "umg" || job.delivery_profile === "both") &&
     job.umg_spec != null;
@@ -490,8 +491,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       // If the caller (or the dropdown) gave us a frame_size that
       // differs from what's currently on the job, pass it in the body.
       // Otherwise call /retry plain — backend keeps the existing spec.
-      // Tenant-aware validation flag: translate the toggle's boolean to
-      // bypass (UMG departing default) or force (non-UMG departing default).
+      // Persist the current mutually-exclusive policy choice. The backend is
+      // authoritative: Universal always validates; elsewhere a bypass also
+      // requires an explicit people prompt.
       const wantFrameOverride = fs && fs !== job.umg_spec?.frame_size;
       const bodyPayload = {};
       if (wantFrameOverride) bodyPayload.frame_size = fs;
@@ -602,7 +604,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   //   - done           → lyrics only (video already accepted, only typo
   //                                    corrections warrant re-render)
   //   - rejected       → lyrics only (recovery path instead of re-upload)
-  const canEditLyrics = isPendingReview || isDone || isRejected;
+  // Art track = "official audio" sin letra: no hay letra que editar.
+  const isArtTrack = !!(job.art_track ?? job.render_params?.art_track);
+  const canEditLyrics = (isPendingReview || isDone || isRejected) && !isArtTrack;
   // Jobs multi-escena: el modo "Fondo" queda afuera del panel — ese edit
   // pertenece al mundo fondo-único (regenera UN clip y pisaba el timeline
   // de escenas; incidente 2026-07-01). Para escenas, la regeneración va
@@ -1487,6 +1491,11 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               <h2 className="text-xl font-bold tracking-tight truncate">
                 {job.song_title || name}
               </h2>
+              {isArtTrack && (
+                <span className="px-2 py-0.5 rounded-full bg-fuchsia-500/15 text-fuchsia-300 ring-1 ring-fuchsia-500/30 text-[10px] font-semibold uppercase tracking-wider">
+                  {t("detail.art_track_badge") || "Art Track"}
+                </span>
+              )}
               {isPendingReview && (
                 <span
                   data-tour="jobdetail-status-badge"
@@ -1684,6 +1693,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               value={retryValidationEnabled}
               onChange={setRetryValidationEnabled}
               tenantId={_retryTenantId}
+              billingGroup={_retryBillingGroup}
               disabled={retrying}
               initialOpen={true}
             />

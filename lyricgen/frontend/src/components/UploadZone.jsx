@@ -3,9 +3,11 @@ import { useI18n } from "../i18n";
 import Listbox from "./Listbox";
 import { UploadTour } from "./OnboardingTour";
 import WizardLivePreview from "./WizardLivePreview";
-import TitleCardPreview from "./TitleCardPreview";
+import TitleCardPreview, { AUTO_INTRO_THRESHOLD_S } from "./TitleCardPreview";
 import HelpTip from "./HelpCenter/HelpTip";
 import { track } from "../lib/telemetryTrack";
+import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
+import { CONCEPT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -165,6 +167,12 @@ export default function UploadZone({
   // user.features.scenes; el backend re-valida igual.
   enableScenes = false,
   onEnableScenesChange,
+  // Art track ("official audio"): tipo de video = master audio + cover, sin
+  // letra. Cuando está activo se oculta la parte de letra y el CTA genera
+  // directo (art_track=true).
+  artTrack = false,
+  onArtTrackChange,
+  onGenerateArtTrack,
   backgroundFile,
   onBackgroundFile,
   backgroundId,
@@ -186,10 +194,17 @@ export default function UploadZone({
   onGenerateDirect,
   user,
   sidebarOpen = true,
-  // 2026-05-23: auto-transcribe en background al drop. La función recibe los
-  // newEntries recién agregados y arranca uploads + transcripciones en
-  // segundo plano. La status map per file viene del App via filesnamekey.
-  onAutoTranscribe,
+  // Prefetch de transcripción disparado al AVANZAR del paso "Subí" (no al
+  // drop): cuando el operador deja el paso 1 hacia adelante, la fuente de
+  // letra + la letra oficial ya están elegidas por canción, así el POST
+  // /transcribe-uploaded sale con el anchor_lyrics correcto. App corre las
+  // uploads + transcripciones en background. La status map per file viene
+  // del App via filenamekey.
+  onUploadAdvance,
+  // Edge case (a): editar la fuente de letra / letra oficial de una canción
+  // tras haber avanzado invalida el prefetch de ESE archivo (App borra su
+  // entrada de cache) para forzar el re-transcribe con el estado nuevo.
+  onInvalidatePrefetch,
   transcribeStatusByFile = {},
   // Phase 2 (2026-05-25): render prop para el paso 6 ("Lyrics"). App.jsx
   // sigue siendo dueño del state machine de review (transcribing,
@@ -211,6 +226,10 @@ export default function UploadZone({
   // WizardLivePreview lo lee con su propio rAF para renderizar word-jump
   // sincronizado al audio real, sin causar re-renders de UploadZone.
   playbackTickRef = null,
+  // 2026-07-16 (idea de Tomi): callback ref que recibe el <div> slot que
+  // montamos bajo el video en el paso 6. LyricsEditor portalea ahí su player
+  // bar, así la columna de la letra queda full y se scrollea menos.
+  onPlayerSlotRef = null,
   // Post-render edit mode (App.jsx EditLyricsRoute):
   // - lockedSteps: IDs de pasos no navegables (típicamente [1,2,3,5] en
   //   modo edición de un job ya renderizado — esos cambios requieren
@@ -254,6 +273,8 @@ export default function UploadZone({
   // back from /review (or any remount) preserves the operator's choice
   // of "ProRes 422 HQ" / frame size / fps, not just the file list.
   const [deliveryProfile, setDeliveryProfile] = useState(delivery?.delivery_profile || "youtube");
+  // Art track: línea legal opcional en pantalla (℗/© sello), per-batch.
+  const [labelLine, setLabelLine] = useState(delivery?.label_line || "");
   // umg_frame_size: now operator-selectable end-to-end. The pipeline
   // renders the source MP4 at the chosen UMG dims+fps (via
   // RenderSpec.umg_intermediate_master) so the lazy ProRes transcode
@@ -345,6 +366,25 @@ export default function UploadZone({
   // animation control again. The toggle pill above the preview lets
   // the operator override either way.
   const [previewFace, setPreviewFace] = useState("lyrics");
+  // Discoverability fix (incidente Clari 19-jul, "no encuentro dónde
+  // agrandar el título"): los controles de la portada (Disposición +
+  // Tamaño del título) viven AL FONDO del panel de tipografía, debajo
+  // de todos los controles de la letra — hay que scrollear para verlos.
+  // Cuando el operador mira la cara "Portada" del preview (por la
+  // pestaña o por auto-flip), llevamos su vista a esos controles y los
+  // resaltamos un instante, así el control existente (que ya es fiel y
+  // llega al render) queda a la vista.
+  const portadaControlsRef = useRef(null);
+  const [portadaControlsPulse, setPortadaControlsPulse] = useState(false);
+  useEffect(() => {
+    if (previewFace !== "title") return;
+    const el = portadaControlsRef.current;
+    if (!el) return; // controles no montados en este paso — no-op
+    el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    setPortadaControlsPulse(true);
+    const tid = setTimeout(() => setPortadaControlsPulse(false), 1800);
+    return () => clearTimeout(tid);
+  }, [previewFace]);
   // Wrap updateBatchDefault below so any field that belongs to the
   // Portada bucket flips the preview. Defined inline to capture the
   // setter without juggling refs.
@@ -396,6 +436,19 @@ export default function UploadZone({
   // backend manda vía features.scenes (admin OR SCENES_ENABLED_TENANTS), pero
   // los admin siempre califican aunque la sesión cacheada no traiga el flag.
   const scenesEligible = user?.features?.scenes === true || user?.role === "admin";
+  // Art Track gateado por tenant (default OFF salvo admin). Si no califica,
+  // no mostramos el selector de tipo de video (queda solo lyric, como antes
+  // de la feature) y reseteamos artTrack si vino prendido de un estado viejo.
+  // Kill-switch de build: Art Track NO va a producción (2026-07-22). El build
+  // de prod (genly.pro) no setea VITE_ART_TRACK_ENABLED → la feature queda
+  // totalmente oculta (ni admins la ven). Se habilita por entorno para testeo
+  // (staging: VITE_ART_TRACK_ENABLED=true); ahí sigue gateada por feature/admin.
+  const ART_TRACK_ENABLED = import.meta.env.VITE_ART_TRACK_ENABLED === "true";
+  const artTrackEligible =
+    ART_TRACK_ENABLED && (user?.features?.art_track === true || user?.role === "admin");
+  useEffect(() => {
+    if (artTrack && !artTrackEligible) onArtTrackChange?.(false);
+  }, [artTrack, artTrackEligible]);
   const [showScenesUpsell, setShowScenesUpsell] = useState(false);
   // Costo en créditos del add-on Escenas. El backend lo expone en
   // features.scenes_credit_cost; default 3 (valor de lanzamiento) si la sesión
@@ -435,14 +488,17 @@ export default function UploadZone({
   const selectSceneMode = (m) => {
     track("wizard.scene_mode", { mode: m });
     setSceneMode(m);
+    // Keep the legacy `match_lyrics` payload deterministic. "Mi prompt"
+    // must not inherit whichever card happened to be selected before it.
+    // Public payload fields remain unchanged: Auto/Prompt=false, Lyrics=true.
+    onInspiredByLyricsChange && onInspiredByLyricsChange(
+      inspiredByLyricsForSceneMode(m),
+    );
     if (m === "auto") {
-      onInspiredByLyricsChange && onInspiredByLyricsChange(false);
       if (_hint) updateBatchDefault("backgroundHint", "");   // stale prompt must not override
     } else if (m === "lyrics") {
-      onInspiredByLyricsChange && onInspiredByLyricsChange(true);
       if (_hint) updateBatchDefault("backgroundHint", "");
     }
-    // prompt: leave inspired as-is; the textarea below drives it.
     // Nota: multi-escena (enableScenes) es ORTOGONAL — funciona con cualquiera
     // de los 3 modos; su toggle premium vive debajo de las cards.
   };
@@ -460,6 +516,18 @@ export default function UploadZone({
     return "";
   })();
   const _previewLyric = _reviewFirstLine || (files[0]?.songTitle || files[0]?.title || "").trim();
+
+  // Start (seconds) of the first sung line, mirroring the backend's
+  // `first_lyric_start = segments[0]["start"]` (ass_render.title_card_lines).
+  // Lets TitleCardPreview resolve the "auto" title template the same way the
+  // render does (long intro → centered hero, short intro → compact badge)
+  // instead of always assuming the hero. null when transcription hasn't
+  // produced segments yet; the preview falls back to the hero and self-corrects
+  // once they arrive.
+  const _firstLyricStart =
+    Array.isArray(reviewSegments) && typeof reviewSegments[0]?.start === "number"
+      ? reviewSegments[0].start
+      : null;
 
   // ── Studio Console stepper ─────────────────────────────────────────────
   // 4 steps revealed one at a time (variant A): the left rail navigates,
@@ -506,7 +574,12 @@ export default function UploadZone({
   // lockedSteps (post-render edit): IDs no navegables. goStep bail-outs y
   // los helpers prev/next saltean los locked para que la sticky bar muestre
   // el siguiente paso navegable real, no uno que el operador no puede usar.
-  const _lockedSet = new Set(lockedSteps);
+  // Art track: el movimiento (paso 3), la tipografía (paso 4) y la letra
+  // (paso 6) NO aplican — el estilo es fijo (cover blureada + cover con sombra
+  // + waveform), sin estilos de movimiento ni efectos. Se bloquean para que la
+  // navegación los saltee (mismo mecanismo que el edit mode). Quedan: 1 (Subí),
+  // 2 (Modo/cover) y 5 (Entregá).
+  const _lockedSet = new Set([...lockedSteps, ...(artTrack ? [3, 4, 6] : [])]);
   const _findPrevUnlocked = (n) => {
     for (let i = n - 1; i >= 1; i--) if (!_lockedSet.has(i)) return i;
     return null;
@@ -520,6 +593,15 @@ export default function UploadZone({
     if (_lockedSet.has(clamped)) return;
     if (clamped !== wizardStep) {
       track("wizard.step", { step_from: wizardStep, step_to: clamped, trigger: "nav" });
+    }
+    // Prefetch de transcripción al dejar el paso "Subí" hacia adelante: la
+    // fuente de letra + la letra oficial ya están elegidas por canción, así
+    // que el POST /transcribe-uploaded sale con el anchor_lyrics correcto
+    // (fix bug staging e77f84aefe33). Solo en el wizard nuevo (sin
+    // lockedSteps) y solo al AVANZAR desde el paso 1.
+    if (wizardStep === 1 && clamped > 1 && _lockedSet.size === 0
+        && typeof onUploadAdvance === "function") {
+      onUploadAdvance();
     }
     setWizardStep(clamped);
   };
@@ -625,6 +707,19 @@ export default function UploadZone({
     });
   };
 
+  // Versión B (letra anclada): selector prominente de dos opciones por
+  // canción — "Transcripción con IA de Genly" (default) vs "Tengo la letra
+  // oficial" (expande el textarea; viaja como `anchor_lyrics` en
+  // /transcribe-uploaded y el backend la ancla al motor CTC). La elección
+  // vive en entry.lyricsSource ("auto" | "official") — App.jsx solo manda
+  // anchor_lyrics cuando la selección es "official", así volver a la IA
+  // desactiva el anclado sin perder el texto pegado. Gate por
+  // features.anchor_lyrics (ANCHOR_LYRICS_ENABLED en el server): sin flag
+  // no se muestra, así no prometemos una sincronización que el backend va
+  // a ignorar. Iteración #908→v2 (feedback dueño de producto 15/07): el
+  // toggle colapsado era invisible y no comunicaba la alternativa.
+  const anchorLyricsEligible = user?.features?.anchor_lyrics === true;
+
   useEffect(() => {
     if (!onDeliveryChange) return;
     onDeliveryChange({
@@ -632,8 +727,13 @@ export default function UploadZone({
       umg_frame_size: umgFrameSize,
       umg_fps: umgFps,
       umg_prores_profile: umgProresProfile,
+      label_line: labelLine,
+      // Art track moving effect (batch-wide). The art-track submit path
+      // builds its own FormData and reads it from here (the lyric path
+      // sends per-song effect instead).
+      effect: batchDefaults.effect || "",
     });
-  }, [deliveryProfile, umgFrameSize, umgFps, umgProresProfile, onDeliveryChange]);
+  }, [deliveryProfile, umgFrameSize, umgFps, umgProresProfile, labelLine, batchDefaults.effect, onDeliveryChange]);
 
   useEffect(() => {
     if (bgMode === "library" && !libraryLoaded) {
@@ -737,13 +837,22 @@ export default function UploadZone({
   // pan lateral. Cada card lleva metadata `kind` (video|image|auto) +
   // emoji prefix (🎬 vs 🖼) en la descripción para que el operador vea
   // de un vistazo cuál es video real vs foto IA con paneo.
+  // Los CÓDIGOS viven en lib/catalogCodes.js (contrato de paridad con
+  // pipeline._MOVEMENT_STYLE_RULES, asertado por renderParity.test.js);
+  // acá solo la metadata de UI por código.
+  const MOVEMENT_META = {
+    estatico:        { kind: "video", label: t("upload.movement_estatico") || "Estático (escena viva)",     sample: "/movement_samples/estatico.mp4",  desc: t("upload.movement_estatico_desc") || "🎬 Escena real con cámara FIJA. Lo que se mueve son los elementos de la escena (gente, olas, nubes, neblina, fuego)." },
+    sutil:           { kind: "video", label: t("upload.movement_sutil") || "Sutil (cámara apenas drift)",   sample: "/movement_samples/sutil.mp4",     desc: t("upload.movement_sutil_desc") || "🎬 Escena real con drift sutil de cámara + motion in-scene. Calmo pero vivo." },
+    estandar:        { kind: "video", label: t("upload.movement_estandar") || "Estándar (cinematográfico)", sample: "/movement_samples/estandar.mp4",  desc: t("upload.movement_estandar_desc") || "🎬 Escena real con movimiento cinematográfico de cámara (zoom/drift)." },
+    "foto-parallax": { kind: "image", label: t("upload.movement_foto_parallax") || "Foto fija",             sample: "/movement_samples/foto-fija.jpg", desc: t("upload.movement_parallax_desc") || "Foto IA fija (sin movimiento de cámara). Sumale un efecto abajo —lluvia, nieve, luces— para darle vida." },
+    animado:         { kind: "video", label: t("upload.movement_animado") || "Animado (ilustración)",       sample: "/movement_samples/animado.mp4",   desc: t("upload.movement_animado_desc") || "🎬 Ilustración 2D estilizada animada, no fotorrealista." },
+  };
   const MOVEMENT_STYLES = [
-    { code: "",              kind: "auto",  label: t("upload.movement_auto") || "Auto",                                  sample: null,                                  desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
-    { code: "estatico",      kind: "video", label: t("upload.movement_estatico") || "Estático (escena viva)",            sample: "/movement_samples/estatico.mp4",       desc: t("upload.movement_estatico_desc") || "🎬 Escena real con cámara FIJA. Lo que se mueve son los elementos de la escena (gente, olas, nubes, neblina, fuego)." },
-    { code: "sutil",         kind: "video", label: t("upload.movement_sutil") || "Sutil (cámara apenas drift)",          sample: "/movement_samples/sutil.mp4",          desc: t("upload.movement_sutil_desc") || "🎬 Escena real con drift sutil de cámara + motion in-scene. Calmo pero vivo." },
-    { code: "estandar",      kind: "video", label: t("upload.movement_estandar") || "Estándar (cinematográfico)",        sample: "/movement_samples/estandar.mp4",       desc: t("upload.movement_estandar_desc") || "🎬 Escena real con movimiento cinematográfico de cámara (zoom/drift)." },
-    { code: "foto-parallax", kind: "image", label: t("upload.movement_foto_parallax") || "Foto fija",                     sample: "/movement_samples/foto-fija.jpg",      desc: t("upload.movement_parallax_desc") || "Foto IA fija (sin movimiento de cámara). Sumale un efecto abajo —lluvia, nieve, luces— para darle vida." },
-    { code: "animado",       kind: "video", label: t("upload.movement_animado") || "Animado (ilustración)",              sample: "/movement_samples/animado.mp4",       desc: t("upload.movement_animado_desc") || "🎬 Ilustración 2D estilizada animada, no fotorrealista." },
+    { code: "", kind: "auto", label: t("upload.movement_auto") || "Auto", sample: null, desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
+    ...MOVEMENT_CODES.map((code) => ({
+      code,
+      ...(MOVEMENT_META[code] || { kind: "video", label: code, sample: null, desc: "" }),
+    })),
   ];
 
   // Effect overlay — animated particles composited OVER the background (the
@@ -773,7 +882,7 @@ export default function UploadZone({
   // timing, which the backend SYNTHESIZES from the line window when real word
   // data is absent, so every template works on any song.
   const LYRICS_ANIMATIONS = [
-    { code: "none",        emoji: "",   label: t("upload.anim_none") || "Ninguna",   desc: t("upload.anim_none_desc") || "Fade clásico por línea." },
+    { code: "none",        emoji: "",   label: t("upload.anim_none") || "Ninguna",   desc: t("upload.anim_none_desc") || "Corte limpio entre líneas." },
     { code: "karaoke",     emoji: "🎤", label: t("upload.anim_karaoke") || "Karaoke", desc: t("upload.anim_karaoke_desc") || "Las palabras se colorean al ritmo que se cantan." },
     { code: "word_reveal", emoji: "🎤", label: t("upload.anim_reveal") || "Revelado", desc: t("upload.anim_reveal_desc") || "Cada palabra aparece justo cuando se canta." },
     { code: "pop",         emoji: "",   label: t("upload.anim_pop") || "Pop",        desc: t("upload.anim_pop_desc") || "La línea entra con un pequeño rebote." },
@@ -796,23 +905,28 @@ export default function UploadZone({
   // _CONCEPT_SCENE_GUIDE keys in pipeline.py — keep in sync. UMG asked
   // for this on top of genre because the genre alone wasn't tight enough
   // to control the visual register.
+  // Los CÓDIGOS viven en lib/catalogCodes.js (contrato de paridad con
+  // pipeline._CONCEPT_SCENE_GUIDE, asertado por renderParity.test.js).
+  const CONCEPT_LABELS = {
+    naturaleza:  t("upload.concept_naturaleza") || "Naturaleza",
+    tropical:    t("upload.concept_tropical") || "Tropical",
+    acuatico:    t("upload.concept_acuatico") || "Acuático",
+    ciudad:      t("upload.concept_ciudad") || "Ciudad",
+    urbano:      t("upload.concept_urbano") || "Urbano",
+    industrial:  t("upload.concept_industrial") || "Industrial",
+    abstracto:   t("upload.concept_abstracto") || "Abstracto",
+    cosmico:     t("upload.concept_cosmico") || "Cósmico",
+    atmosferico: t("upload.concept_atmosferico") || "Atmosférico",
+    romantico:   t("upload.concept_romantico") || "Romántico",
+    vintage:     t("upload.concept_vintage") || "Vintage",
+    cinematic:   t("upload.concept_cinematic") || "Cinematic",
+    club:        t("upload.concept_club") || "Club",
+    lujo:        t("upload.concept_lujo") || "Lujo",
+    minimalista: t("upload.concept_minimalista") || "Minimalista",
+  };
   const CONCEPTS = [
-    { code: "",             label: t("upload.concept_auto") || "Auto" },
-    { code: "naturaleza",   label: t("upload.concept_naturaleza") || "Naturaleza" },
-    { code: "tropical",     label: t("upload.concept_tropical") || "Tropical" },
-    { code: "acuatico",     label: t("upload.concept_acuatico") || "Acuático" },
-    { code: "ciudad",       label: t("upload.concept_ciudad") || "Ciudad" },
-    { code: "urbano",       label: t("upload.concept_urbano") || "Urbano" },
-    { code: "industrial",   label: t("upload.concept_industrial") || "Industrial" },
-    { code: "abstracto",    label: t("upload.concept_abstracto") || "Abstracto" },
-    { code: "cosmico",      label: t("upload.concept_cosmico") || "Cósmico" },
-    { code: "atmosferico",  label: t("upload.concept_atmosferico") || "Atmosférico" },
-    { code: "romantico",    label: t("upload.concept_romantico") || "Romántico" },
-    { code: "vintage",      label: t("upload.concept_vintage") || "Vintage" },
-    { code: "cinematic",    label: t("upload.concept_cinematic") || "Cinematic" },
-    { code: "club",         label: t("upload.concept_club") || "Club" },
-    { code: "lujo",         label: t("upload.concept_lujo") || "Lujo" },
-    { code: "minimalista",  label: t("upload.concept_minimalista") || "Minimalista" },
+    { code: "", label: t("upload.concept_auto") || "Auto" },
+    ...CONCEPT_CODES.map((code) => ({ code, label: CONCEPT_LABELS[code] || code })),
   ];
 
   const FONTS = [
@@ -994,13 +1108,12 @@ export default function UploadZone({
 
     // Audit 2026-05-26 (#388 wizard-duplicate-jobs): compute remaining,
     // accepted, and newEntries OUTSIDE the setState callback. Side
-    // effects that fire inside a reducer (setBatchTruncated, the
-    // onAutoTranscribe Promise.resolve dance the old code did) get
+    // effects that fire inside a reducer (setBatchTruncated, y el
+    // auto-transcribe al drop que hacía el código viejo) get
     // double-invoked under React StrictMode (dev) and CAN double-invoke
-    // in production if React decides to abort+retry a render. The
-    // duplicate auto-transcribe call was creating two upload jobs +
-    // two transcription jobs per drop — visible in the admin as the
-    // "4 jobs for one audio" pile-up reported 2026-05-26.
+    // in production if React decides to abort+retry a render. El disparo
+    // de transcripción se movió al avance de paso (onUploadAdvance), pero
+    // mantener estos cálculos fuera del reducer sigue siendo correcto.
     //
     // We can do all the math here because the parent passes `files`
     // as a prop (line 117), so we know the current count without
@@ -1036,16 +1149,12 @@ export default function UploadZone({
 
     // Pure reducer — safe under StrictMode double-invoke.
     onFiles((prev) => [...prev, ...newEntries]);
-
-    // 2026-05-23: trigger auto-transcribe en el drop. Antes el upload se
-    // difería hasta "Revisar" (bloqueaba al operador ~15-20s viendo un
-    // spinner). Ahora arranca en background mientras el operador elige
-    // wizard options. Cuando llega a "Revisar" los segments están cacheados.
-    // Now fired AFTER the setState dispatch, OUTSIDE the reducer — single
-    // call per drop regardless of StrictMode / render aborts.
-    if (typeof onAutoTranscribe === "function") {
-      onAutoTranscribe(newEntries);
-    }
+    // NOTA: la transcripción NO arranca acá. Antes (2026-05-23) el trigger
+    // vivía en el drop, pero eso disparaba el prefetch cuando la fuente de
+    // letra todavía era el default "IA" y la letra oficial no estaba pegada
+    // → job sin anclar (bug staging e77f84aefe33). Ahora el prefetch se
+    // dispara al avanzar del paso "Subí" (goStep → onUploadAdvance), con la
+    // fuente de letra ya resuelta por canción.
   };
 
   const handleDrop = (e) => {
@@ -1055,6 +1164,16 @@ export default function UploadZone({
   };
 
   const updateField = (idx, field, value) => {
+    // Edge case (a): si el operador cambia la fuente de letra o edita la
+    // letra oficial de una canción que YA disparó su prefetch (volvió al
+    // paso "Subí" tras avanzar), invalidamos ese prefetch para que la
+    // transcripción se rehaga con el estado nuevo (el job cacheado salió
+    // con el anchor anterior). Solo aplica a esos dos campos.
+    if ((field === "lyricsSource" || field === "anchorLyrics")
+        && typeof onInvalidatePrefetch === "function") {
+      const entry = files[idx];
+      if (entry?.file) onInvalidatePrefetch(entry.file);
+    }
     onFiles((prev) =>
       prev.map((entry, i) => (i === idx ? { ...entry, [field]: value } : entry))
     );
@@ -1171,6 +1290,24 @@ export default function UploadZone({
           </div>
         </div>
       )}
+      {artTrack && (
+        <div className="mt-3 space-y-1" onClick={(e) => e.stopPropagation()}>
+          <label className="text-[10px] uppercase tracking-[0.18em] text-gray-500 block">
+            {t("upload.label_line_label") || "Línea legal / sello (opcional)"}
+          </label>
+          <input
+            type="text"
+            maxLength={120}
+            value={labelLine}
+            onChange={(e) => setLabelLine(e.target.value)}
+            placeholder={t("upload.label_line_placeholder") || "℗ 2026 Nombre del sello"}
+            className="w-full sm:w-96 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-brand/60"
+          />
+          <p className="text-[11px] text-gray-500">
+            {t("upload.label_line_hint") || "Se muestra chica abajo a la izquierda del video, en todos los formatos."}
+          </p>
+        </div>
+      )}
     </div>
   );
 
@@ -1249,6 +1386,41 @@ export default function UploadZone({
             className="mt-1 text-[11px] text-amber-400/60 hover:text-amber-300"
           >{t("common.dismiss") || "dismiss"}</button>
         </div>
+      )}
+    </div>
+  );
+
+  // Video type selector (Lyric Video vs Art Track). Shown both in the
+  // empty-state (pre-upload) and in step 1, so the operator picks the type
+  // before or right after adding audio. Hidden entirely when Art Track isn't
+  // enabled for this account (feature gate) — then there's only one type.
+  const _videoTypeSelector = !artTrackEligible ? null : (
+    <div className="mb-5">
+      <div className="text-label text-gray-400 mb-2">
+        {t("upload.video_type") || "Tipo de video"}
+      </div>
+      <div className="flex gap-1 p-1 glass rounded-xl w-fit">
+        {[
+          { id: false, label: t("upload.video_type_lyrics") || "Lyric Video" },
+          { id: true, label: t("upload.video_type_art") || "Art Track" },
+        ].map((m) => (
+          <button
+            key={String(m.id)}
+            type="button"
+            onClick={() => onArtTrackChange?.(m.id)}
+            className={`px-4 py-1.5 rounded-lg text-label transition-all ${
+              artTrack === m.id ? "bg-brand text-white" : "text-gray-400 hover:text-white"
+            }`}
+          >
+            {m.label}
+          </button>
+        ))}
+      </div>
+      {artTrack && (
+        <p className="mt-2 text-sm text-gray-400 max-w-xl">
+          {t("upload.video_type_art_hint") ||
+            "Master audio + cover, sin letra. Subí la portada en el paso “Modo”; el video muestra el cover centrado sobre un fondo difuminado con movimiento sutil."}
+        </p>
       )}
     </div>
   );
@@ -1770,27 +1942,205 @@ export default function UploadZone({
                   </p>
                 )}
               </div>
+              {/* Todo lo relacionado a la LETRA (versión en vivo, fuente de
+                  letra, idioma de transcripción) NO aplica a art tracks —
+                  rinden sin letra y saltean Whisper. Solo se muestra en lyric
+                  video. */}
+              {!artTrack && (<>
               {/* Toggle "versión en vivo" (06/07): arma la auditoría
                   acústica del final aunque el título no diga "live" —
                   las letras publicadas suelen ser de la versión de
                   estudio y el final del vivo difiere. Si el título ya
                   tiene marcador live, el backend lo detecta solo. */}
-              <label className="flex items-start gap-2 cursor-pointer select-none">
+              <label className={`live-version-toggle flex items-start gap-2.5 rounded-xl border p-2.5 cursor-pointer select-none ${entry.live ? "is-active" : ""}`}>
                 <input
                   type="checkbox"
                   checked={!!entry.live}
                   onChange={(e) => updateField(i, "live", e.target.checked)}
-                  className="mt-0.5 accent-brand"
+                  className="sr-only"
                 />
-                <span>
-                  <span className="text-[12px] text-gray-300 font-medium">
+                <span className="live-version-toggle__check mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-md border" aria-hidden="true">
+                  <svg className={`h-2.5 w-2.5 transition-opacity ${entry.live ? "opacity-100" : "opacity-0"}`} viewBox="0 0 12 12" fill="none">
+                    <path d="m2.2 6.1 2.3 2.2L9.9 3" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-[12px] text-gray-300 font-medium">
                     {t("upload.live_version") || "Versión en vivo"}
                   </span>
-                  <span className="block text-[11px] text-gray-600">
+                  <span className="block text-[11px] leading-relaxed text-gray-500">
                     {t("upload.live_version_hint") || "Marcalo si es un show en vivo: revisamos el final contra el audio."}
                   </span>
                 </span>
               </label>
+              {/* Source of lyrics: Genly AI is the safe default. The official
+                  lyrics path is an intentional upgrade, and only becomes
+                  "ready" once there is actual text to anchor. */}
+              {anchorLyricsEligible && (() => {
+                const isOfficial = entry.lyricsSource === "official";
+                const lineCount = (entry.anchorLyrics || "")
+                  .split("\n").filter((l) => l.trim()).length;
+                const lineBadge = lineCount === 1
+                  ? (t("upload.anchor_lyrics_line") || "1 línea")
+                  : (t("upload.anchor_lyrics_lines", { n: lineCount }) || "{n} líneas").replace("{n}", lineCount);
+                const isReady = isOfficial && lineCount > 0;
+                const readyMessage = t("upload.anchor_lyrics_ready", { n: lineCount }) || `${lineBadge} listos para sincronizar`;
+                return (
+                  <section data-testid={`lyrics-source-${i}`} className="lyrics-source relative overflow-hidden rounded-2xl border">
+                    <div className="lyrics-source__halo absolute -right-12 -top-14 h-36 w-36 rounded-full pointer-events-none" />
+                    <div className="relative px-3.5 pt-3.5 pb-3">
+                      <div className="flex items-start gap-2.5 mb-3">
+                        <span className="lyrics-source__mark w-8 h-8 rounded-xl flex items-center justify-center shrink-0">
+                          <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3Z" strokeLinecap="round" strokeLinejoin="round" />
+                            <path d="m19 16 .7 2.3L22 19l-2.3.7L19 22l-.7-2.3L16 19l2.3-.7L19 16Z" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </span>
+                        <span className="min-w-0">
+                          <span className="block text-[10px] uppercase tracking-[0.16em] font-semibold text-brand-light/80">
+                            {t("upload.lyrics_source_label") || "Letra"}
+                          </span>
+                          <span className="block text-[13px] leading-tight font-semibold text-white mt-0.5">
+                            {t("upload.lyrics_source_heading") || "Elegí cómo trabajar la letra"}
+                          </span>
+                          <span className="block text-[11px] leading-snug text-gray-500 mt-1">
+                            {t("upload.lyrics_source_heading_sub") || "Podés dejar que Genly la detecte o usar tu versión oficial."}
+                          </span>
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2" role="radiogroup"
+                        aria-label={t("upload.lyrics_source_label") || "Letra"}>
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={!isOfficial}
+                        data-testid={`lyrics-source-ai-${i}`}
+                        onClick={() => updateField(i, "lyricsSource", "auto")}
+                        className={`lyrics-source__choice group relative min-h-[108px] overflow-hidden rounded-xl border p-3 text-left transition-all duration-200 ${!isOfficial ? "is-active" : ""}
+                          ${!isOfficial
+                            ? "border-brand/70"
+                            : "border-white/[0.07]"}`}
+                      >
+                        {!isOfficial && <span className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-violet-200/80 to-transparent" />}
+                        <span className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+                          !isOfficial ? "bg-white/15 text-white" : "bg-white/[0.06] text-gray-400 group-hover:text-gray-200"
+                        }`} aria-hidden="true">
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+                            <path d="m12 3 1.3 4.2L17.5 8.5l-4.2 1.3L12 14l-1.3-4.2-4.2-1.3 4.2-1.3L12 3Z" strokeLinecap="round" strokeLinejoin="round" />
+                            <path d="M5 15v4M3 17h4M19 16v3M17.5 17.5h3" strokeLinecap="round" />
+                          </svg>
+                        </span>
+                        <span className="block mt-2">
+                          <span className={`block text-[12px] font-semibold ${!isOfficial ? "text-white" : "text-gray-200"}`}>
+                            {t("upload.lyrics_source_ai") || "Transcripción con IA de Genly"}
+                          </span>
+                          <span className={`block mt-1 text-[11px] leading-snug ${!isOfficial ? "text-violet-100/65" : "text-gray-500"}`}>
+                            {t("upload.lyrics_source_ai_sub") || "Detectamos y sincronizamos la letra automáticamente."}
+                          </span>
+                        </span>
+                        <span className={`absolute right-2.5 top-2.5 flex h-4 w-4 items-center justify-center rounded-full border ${
+                          !isOfficial ? "border-white/60 bg-white text-brand" : "border-white/[0.16]"
+                        }`} aria-hidden="true">
+                          {!isOfficial && <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6" strokeLinecap="round" strokeLinejoin="round" /></svg>}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={isOfficial}
+                        data-testid={`lyrics-source-official-${i}`}
+                        onClick={() => updateField(i, "lyricsSource", "official")}
+                        className={`lyrics-source__choice group relative min-h-[108px] overflow-hidden rounded-xl border p-3 text-left transition-all duration-200 ${isOfficial ? "is-active" : ""}
+                          ${isOfficial
+                            ? "border-brand/70"
+                            : "border-white/[0.07]"}`}
+                      >
+                        {isOfficial && <span className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-violet-200/80 to-transparent" />}
+                        <span className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+                          isOfficial ? "bg-white/15 text-white" : "bg-white/[0.06] text-gray-400 group-hover:text-gray-200"
+                        }`} aria-hidden="true">
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+                            <path d="M7 3.5h7L19 8v12.5H7z" strokeLinecap="round" strokeLinejoin="round" />
+                            <path d="M14 3.5V8h5M10 12h6M10 15h6" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </span>
+                        <span className="block mt-2">
+                          <span className={`block text-[12px] font-semibold ${isOfficial ? "text-white" : "text-gray-200"}`}>
+                            {t("upload.lyrics_source_official") || "Tengo la letra oficial"}
+                          </span>
+                          <span className={`block mt-1 text-[11px] leading-snug ${isOfficial ? "text-violet-100/65" : "text-gray-500"}`}>
+                            {t("upload.lyrics_source_official_sub") || "Úsala cuando necesitás que el texto coincida exactamente."}
+                          </span>
+                        </span>
+                        {lineCount > 0 && (
+                          <span className="absolute bottom-2.5 left-3 text-[10px] font-semibold text-violet-200 tabular-nums">
+                            {lineBadge}
+                          </span>
+                        )}
+                        <span className={`absolute right-2.5 top-2.5 flex h-4 w-4 items-center justify-center rounded-full border ${
+                          isOfficial ? "border-white/60 bg-white text-brand" : "border-white/[0.16]"
+                        }`} aria-hidden="true">
+                          {isOfficial && <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6" strokeLinecap="round" strokeLinejoin="round" /></svg>}
+                        </span>
+                      </button>
+                      </div>
+                    {isOfficial && (
+                      <div className="mt-3 border-t border-white/[0.07] pt-3 animate-fade-in">
+                        <div className="flex items-center justify-between gap-3 mb-1.5">
+                          <label className="block text-[11px] font-medium text-gray-200">
+                          {t("upload.anchor_lyrics_input_label") || "Pegá la letra oficial"}
+                          </label>
+                          <span className="text-[10px] text-gray-600">
+                            {t("upload.anchor_lyrics_format_hint") || "TXT · sin tiempos"}
+                          </span>
+                        </div>
+                        <textarea
+                          value={entry.anchorLyrics || ""}
+                          onChange={(e) => updateField(i, "anchorLyrics", e.target.value)}
+                          onPaste={(e) => {
+                            // Algunos orígenes (Word, PDF, ciertos sitios de letras)
+                            // separan versos con CRLF, CR solo o los separadores
+                            // Unicode U+2028/U+2029. El <textarea> NO dibuja esos como
+                            // salto → la letra quedaba pegada en un bloque aunque el
+                            // contador (split "\n") marcaba bien las líneas. Normalizamos
+                            // a "\n" en el pegado. Si no hay separadores raros, dejamos
+                            // el paste nativo (preserva cursor/undo).
+                            const raw = e.clipboardData?.getData("text");
+                            if (raw == null) return;
+                            const normalized = raw.replace(/\r\n?/g, "\n").replace(/[\u2028\u2029]/g, "\n");
+                            if (normalized === raw) return;
+                            e.preventDefault();
+                            const el = e.target;
+                            const start = el.selectionStart ?? el.value.length;
+                            const end = el.selectionEnd ?? el.value.length;
+                            const next = (el.value.slice(0, start) + normalized + el.value.slice(end)).slice(0, 20000);
+                            updateField(i, "anchorLyrics", next);
+                          }}
+                          placeholder={t("upload.anchor_lyrics_placeholder") || "Pegá la letra acá — una línea por verso, sin timestamps."}
+                          rows={6}
+                          maxLength={20000}
+                          className="w-full px-3 py-2.5 rounded-xl bg-black/20 border border-white/[0.08]
+                            focus:border-brand/70 focus:ring-2 focus:ring-brand/10 focus:outline-none text-sm text-white placeholder-gray-600
+                            transition-all resize-y leading-relaxed"
+                        />
+                        <div className={`mt-2 flex items-center gap-1.5 text-[11px] ${isReady ? "text-emerald-300" : "text-amber-300/90"}`} aria-live="polite">
+                          <svg className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" aria-hidden="true">
+                            {isReady
+                              ? <path d="m5 12 4 4L19 6" strokeLinecap="round" strokeLinejoin="round" />
+                              : <><path d="M12 9v4M12 17h.01" strokeLinecap="round" /><path d="M10.3 3.5 2.9 16.2A2 2 0 0 0 4.6 19h14.8a2 2 0 0 0 1.7-2.8L13.7 3.5a2 2 0 0 0-3.4 0Z" strokeLinejoin="round" /></>}
+                          </svg>
+                          <span>
+                            {isReady
+                              ? readyMessage
+                              : (t("upload.anchor_lyrics_required") || "Pegá al menos una línea para activar la sincronización exacta.")}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                    </div>
+                  </section>
+                );
+              })()}
               {/* Language pills. Default 'es' is highlighted on file
                   load — operator can click another to override, or
                   click 'auto' to let Whisper detect (not recommended
@@ -1810,6 +2160,7 @@ export default function UploadZone({
                   >{l.code || (t("lang.auto") || "auto")}</button>
                 ))}
               </div>
+              </>)}
 
               {/* Personalizar toggle — only shown in batch mode (2+ songs) */}
               {files.length > 1 && (
@@ -2008,7 +2359,8 @@ export default function UploadZone({
               : t("upload.bg_custom_summary")}
           </p>
 
-          {/* Mode selector */}
+          {/* Mode selector — oculto en art track (siempre cover custom). */}
+          {!artTrack && (
           <div className="flex gap-1 p-1 glass rounded-xl w-fit mb-3" data-tour="upload-bg-tabs">
             {[
               { id: "auto", label: t("upload.bg_auto") || "Generar con IA" },
@@ -2043,6 +2395,7 @@ export default function UploadZone({
               </button>
             ))}
           </div>
+          )}
 
           {/* Auto mode */}
           {bgMode === "auto" && (
@@ -2052,6 +2405,14 @@ export default function UploadZone({
                   <path d="M13 10V3L4 14h7v7l9-11h-7z"/>
                 </svg>
                 {t("upload.bg_auto_desc") || "AI will generate a unique background based on the song's mood and lyrics."}
+              </p>
+              {/* Copy honesto de no-convergencia (incidente Gaby 2026-07-08:
+                  3 regens "a ver si sale", cada una una escena distinta).
+                  Nombrar el comportamiento acá evita descubrirlo a $0.90
+                  el intento: la IA NO refina, reinterpreta. */}
+              <p className="text-[11px] text-amber-300/80 mt-2">
+                {t("upload.bg_ai_nonconverge_hint") ||
+                  "La IA reinterpreta la canción en cada generación: sin indicaciones, cada intento puede dar una escena totalmente distinta. Para un resultado exacto usá la Biblioteca o escribí tu propio prompt."}
               </p>
             </div>
           )}
@@ -2350,6 +2711,7 @@ export default function UploadZone({
            so the dropzone doesn't feel like a 250px island floating in the
            viewport. Matches the visual weight of the Dashboard hero. */
         <div className="max-w-3xl mx-auto py-8 md:py-12 flex flex-col items-center justify-center min-h-[55vh]">
+          <div className="w-full">{_videoTypeSelector}</div>
           <div className="w-full">{_dropZone}</div>
           <p className="text-[11px] text-ink-secondary/60 mt-6 text-center max-w-md">
             {t("upload.empty_hint") || "Tip: para mejor calidad, usá audio sin clipping y con voz al frente de la mezcla."}
@@ -2507,7 +2869,56 @@ export default function UploadZone({
                   ? batchDefaults.titleSongBreak.split("\n")
                   : null
               }
+              firstLyricStart={_firstLyricStart}
             />
+          ) : artTrack ? (
+            /* Art track: preview del layout real (cover blureada con scrim +
+               cover con sombra a la derecha + barras EQ latiendo + título en
+               zona segura), aproximación visual del render. */
+            <div className="relative w-full aspect-video rounded-xl overflow-hidden bg-black">
+              {customPreviewUrl ? (
+                <>
+                  <style>{`@keyframes atwave { 0%, 100% { transform: scaleY(0.45); } 50% { transform: scaleY(1); } }`}</style>
+                  <img src={customPreviewUrl} alt="" className="absolute inset-0 w-full h-full object-cover scale-110 blur-2xl brightness-50 saturate-[.75]" />
+                  {/* Moving effect (screen-blended, matching the render). */}
+                  {(() => {
+                    const fx = EFFECTS.find((e) => e.code === (batchDefaults.effect || "") && e.sample);
+                    return fx ? (
+                      <video key={fx.code} src={fx.sample} className="absolute inset-0 w-full h-full object-cover pointer-events-none mix-blend-screen" autoPlay loop muted playsInline />
+                    ) : null;
+                  })()}
+                  <div className="absolute inset-0 bg-gradient-to-r from-black/60 via-black/25 to-transparent" />
+                  <div className="absolute inset-0" style={{ boxShadow: "inset 0 0 120px 40px rgba(0,0,0,0.45)" }} />
+                  <img src={customPreviewUrl} alt="" className="absolute top-1/2 right-[8%] -translate-y-1/2 h-[62%] aspect-square object-cover rounded shadow-2xl shadow-black/70 ring-1 ring-white/10" />
+                  <div className="absolute left-[9%] top-[38%] text-[8px] md:text-[10px] uppercase tracking-[0.35em] text-white/60 drop-shadow">{t("arttrack.official_audio") || "Official Audio"}</div>
+                  <div className="absolute left-[9%] top-[44%] flex items-center gap-[4px] h-[16%]">
+                    {Array.from({ length: 24 }).map((_, i) => (
+                      <span
+                        key={i}
+                        className="w-[7px] bg-white/90 rounded-full"
+                        style={{
+                          height: `${30 + Math.abs(Math.sin(i * 1.7)) * 65}%`,
+                          animation: "atwave 1.1s ease-in-out infinite",
+                          animationDelay: `${(i % 7) * 90}ms`,
+                        }}
+                      />
+                    ))}
+                  </div>
+                  <div className="absolute left-[9%] top-[66%] max-w-[44%] text-white">
+                    <div className="font-bold text-lg md:text-2xl leading-tight drop-shadow line-clamp-2">{titlePreviewSong || t("upload.video_type_art") || "Art Track"}</div>
+                    <div className="text-sm md:text-base text-white/85 drop-shadow">{titlePreviewArtist}</div>
+                  </div>
+                  {(labelLine || "").trim() ? (
+                    <div className="absolute left-[9%] bottom-[6%] text-[9px] md:text-[11px] text-white/55 drop-shadow">{labelLine}</div>
+                  ) : null}
+                </>
+              ) : (
+                <div className="absolute inset-0 flex items-center justify-center text-center text-gray-400 text-sm px-6">
+                  {t("arttrack.cover_missing_desc") || "Subí el cover en el paso “Modo” para ver la vista previa."}
+                </div>
+              )}
+              <span className="absolute top-2 left-2 text-[10px] uppercase tracking-[0.18em] text-white/70">{t("upload.video_type_art") || "Art Track"}</span>
+            </div>
           ) : (bgMode === "auto" || bgMode === "library" || (bgMode === "custom" && customPreviewUrl)) ? (
             <WizardLivePreview
               style={style}
@@ -2605,6 +3016,12 @@ export default function UploadZone({
               ? `${t("upload.preview_editing") || "Línea actual"}: ${_previewLyric}${files.length > 1 ? ` · +${files.length - 1}` : ""}`
               : (t("upload.preview_disclaimer") || "Aproximación del mood y el movimiento. El fondo final lo genera la IA.")}
           </p>
+          {/* 2026-07-16: slot para el player bar de LyricsEditor (paso 6).
+              Lo portalea acá, bajo el video, para que la columna derecha
+              quede full con la letra. Fuera del paso 6 no se monta. */}
+          {isStep6 && onPlayerSlotRef && (
+            <div ref={onPlayerSlotRef} className="mt-1" data-testid="wizard-player-slot" />
+          )}
         </div>
 
         {/* RIGHT — active step controls only (revealed one step at a time).
@@ -2641,6 +3058,7 @@ export default function UploadZone({
           {/* STEP 1 — Subí: manage files + per-track metadata */}
           {wizardStep === 1 && (
             <>
+              {_videoTypeSelector}
               {_dropZone}
               {_filesBlock}
             </>
@@ -2650,6 +3068,57 @@ export default function UploadZone({
           {wizardStep === 2 && (
             <>
               {_bgBlock}
+              {/* Art track: efecto de movimiento opcional (partículas/luz que
+                  se mueven sobre la portada). Reusa los mismos loops que los
+                  lyric videos. NO mostramos los estilos de movimiento de
+                  cámara — no aplican al formato art track. */}
+              {artTrack && (
+                <div className="mt-4 pt-3 border-t border-white/[0.05]">
+                  <p className="text-[11px] text-gray-400 font-medium">
+                    {t("upload.arttrack_effect_title") || "Efecto en movimiento (opcional)"}
+                  </p>
+                  <p className="text-[10px] text-gray-600 mt-0.5 mb-2">
+                    {t("upload.arttrack_effect_desc") || "Partículas/luz que se mueven sobre la portada, como el video de referencia. Se aplica a master y short."}
+                  </p>
+                  <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+                    {EFFECTS.map((e) => {
+                      const active = (batchDefaults.effect || "") === e.code;
+                      return (
+                        <button
+                          key={e.code || "none"}
+                          type="button"
+                          onClick={() => updateBatchDefault("effect", e.code)}
+                          aria-label={`${e.label}: ${e.desc}`}
+                          title={e.desc}
+                          className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
+                            active
+                              ? "border-transparent ring-1 ring-brand/50 shadow-glow"
+                              : "border-white/[0.06] hover:border-white/[0.20]"
+                          }`}
+                        >
+                          <div className="aspect-video bg-black relative overflow-hidden">
+                            {e.sample ? (
+                              <video src={e.sample} className="w-full h-full object-cover pointer-events-none" autoPlay loop muted playsInline />
+                            ) : (
+                              <div className="w-full h-full grid place-items-center text-gray-500 text-[10px]" style={{ background: "radial-gradient(120% 100% at 50% 0,#241a40,#0b0820)" }}>
+                                {t("upload.effect_none") || "Ninguno"}
+                              </div>
+                            )}
+                            {active && (
+                              <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand grid place-items-center shadow">
+                                <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                              </div>
+                            )}
+                          </div>
+                          <div className="px-2 py-1.5 bg-surface-1">
+                            <p className={`text-label leading-tight ${active ? "text-white" : "text-gray-200"}`}>{e.label}</p>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
               {bgMode === "auto" && (
                 <>
                   <div className="grid grid-cols-1 gap-2">
@@ -3181,7 +3650,14 @@ export default function UploadZone({
                   fonts in a 2-column grid + manual song break.
                   Refactored 2026-05-30 to address the operator feedback
                   "los controles están confusos / pegados al footer". */}
-              <div className="mt-5 pt-4 border-t border-white/[0.06]">
+              <div
+                ref={portadaControlsRef}
+                className={`mt-5 pt-4 border-t border-white/[0.06] rounded-lg transition-all duration-500 ${
+                  portadaControlsPulse
+                    ? "ring-2 ring-brand/60 bg-brand/[0.05] -mx-2 px-2 shadow-[0_0_0_4px_rgba(124,77,255,0.10)]"
+                    : "ring-2 ring-transparent"
+                }`}
+              >
                 <div className="flex items-center justify-between mb-3">
                   <p className="text-caption text-gray-200 font-medium">
                     {t("upload.titlecard_section") || "Portada del intro"}
@@ -3257,6 +3733,32 @@ export default function UploadZone({
                         );
                       })}
                     </div>
+                    {/* Nudge de descubribilidad (incidente Clari 19-jul, "no
+                        encuentro dónde modificarlo"): cuando "Auto" va a
+                        resolver al badge chico porque el tema canta enseguida,
+                        el operador NO entiende por qué su título salió chico.
+                        Le nombramos el motivo y el camino al título grande —
+                        el override "Centro" YA existe y llega al render. */}
+                    {(batchDefaults.titleTemplate || "auto") === "auto" &&
+                      typeof _firstLyricStart === "number" &&
+                      _firstLyricStart <= AUTO_INTRO_THRESHOLD_S && (
+                      <div className="mt-2 flex items-start gap-2 rounded-lg bg-amber-500/[0.07] ring-1 ring-amber-500/25 px-3 py-2">
+                        <svg className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+                          <circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" strokeLinecap="round" />
+                        </svg>
+                        <p className="text-[11px] text-amber-200/90 leading-snug flex-1">
+                          {t("upload.titlecard_auto_badge_hint") ||
+                            "Este tema canta enseguida, así que “Auto” usa el título compacto para no pisar la letra."}{" "}
+                          <button
+                            type="button"
+                            onClick={() => updateBatchDefault("titleTemplate", "centered")}
+                            className="text-amber-100 underline decoration-amber-400/40 hover:decoration-amber-200 font-medium"
+                          >
+                            {t("upload.titlecard_use_centered") || "Usar el título grande (Centro)"}
+                          </button>
+                        </p>
+                      </div>
+                    )}
                   </div>
 
                   {/* Size — quick presets show their relative scale via the
@@ -3553,6 +4055,20 @@ export default function UploadZone({
                 );
               })()
             ) : wizardStep === 5 ? (
+              artTrack ? (
+                // Art track: un solo CTA, genera directo (sin editor de letra).
+                <button
+                  onClick={() => { track("wizard.generate", { mode: "art_track", batch_size: (files || []).length }); onGenerateArtTrack?.(); }}
+                  disabled={!allHaveArtist || !backgroundFile}
+                  className="btn-primary h-11 px-6 disabled:opacity-40 disabled:cursor-not-allowed"
+                  title={!backgroundFile ? (t("arttrack.cover_missing_desc") || "Subí el cover en el paso “Modo”") : undefined}
+                >
+                  {t("upload.generate_art_track") || "Generar Art Track"}
+                  <svg className="inline-block ml-1.5 w-4 h-4 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path d="M5 12h14M12 5l7 7-7 7" />
+                  </svg>
+                </button>
+              ) : (
               <>
                 {onGenerateDirect && (
                   <button
@@ -3576,6 +4092,7 @@ export default function UploadZone({
                   </button>
                 )}
               </>
+              )
             ) : null}
           </div>
         </div>

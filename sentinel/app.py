@@ -47,9 +47,18 @@ async def _investigate(incident_id: int):
     if not inc:
         return
     store.update_incident(incident_id, status="investigating")
+    # v1.1: adjuntar la cola de logs de Railway (Worker + api) al contexto —
+    # es lo primero que un humano miraría; le ahorra al agente ir a ciegas.
+    ctx = _alert_ctx.get(incident_id, inc["title"])
+    try:
+        import railway_logs
+        if railway_logs.enabled():
+            ctx = f"{ctx}\n\n{await railway_logs.context_for_investigation()}"
+    except Exception:
+        pass
     async with _run_sem:
         try:
-            res = await agent.investigate(inc, _alert_ctx.get(incident_id, inc["title"]))
+            res = await agent.investigate(inc, ctx)
         except Exception as e:
             logger.exception("investigación falló")
             store.update_incident(incident_id, status="failed")
@@ -110,10 +119,81 @@ async def _implement(incident_id: int):
 # Chat (botones + texto)
 # ---------------------------------------------------------------------------
 
+async def _run_chat_task(instruction: str, chat_id: str,
+                         resume_session: str | None = None, deep: bool = False):
+    """Tarea libre (/task, /deep o continuación por reply)."""
+    import models
+    await tg.send(f"🧠 Trabajando{' (modo profundo, varios agentes)' if deep else ''}… "
+                  f"[{tg.esc(models.label(models.current(config.CLAUDE_MODEL)))}]",
+                  chat_id=chat_id)
+    async with _run_sem:
+        try:
+            res = await agent.run_task(instruction, resume_session=resume_session, deep=deep)
+        except Exception as e:
+            await tg.send(f"❌ La tarea falló: {tg.esc(str(e)[:300])}", chat_id=chat_id)
+            return
+    text = (res.get("text") or "(sin salida)")[:3500]
+    msg_id = await tg.send(f"🧠 {tg.esc(text)}\n\n<i>Respondé a este mensaje "
+                           f"para seguir la conversación.</i>", chat_id=chat_id)
+    if msg_id and res.get("session_id"):
+        store.map_tg_session(msg_id, res["session_id"])
+
+
+async def _do_merge(pr_number: int, chat_id: str):
+    import github_api
+    ok, msg = await github_api.merge_pr(pr_number)
+    await tg.send(("✅ " if ok else "❌ ") + tg.esc(msg), chat_id=chat_id)
+
+
+async def _do_promote(chat_id: str):
+    """Crea el PR staging→main y lo mergea al verde. SOLO llega acá tras la
+    doble confirmación explícita del operador (su botón es la autorización
+    humana a producción que exige la regla de branches)."""
+    import github_api
+    commits = await github_api.compare("main", config.PR_BASE_BRANCH)
+    if not commits:
+        await tg.send("staging y main ya están iguales — nada que promover.",
+                      chat_id=chat_id)
+        return
+    num, url = await github_api.create_promotion_pr(
+        "[PROD] Promoción staging→main (vía Sentinel, confirmada por operador)",
+        "Promoción disparada desde Telegram con doble confirmación explícita.\n\n"
+        + "\n".join(f"- {c}" for c in commits[:20]),
+    )
+    if not num:
+        await tg.send(f"❌ No pude crear el PR de promoción: {tg.esc(url)}", chat_id=chat_id)
+        return
+    await tg.send(f"⏳ PR de promoción #{num} creado ({tg.esc(url)}) — mergeo "
+                  f"a PRODUCCIÓN cuando el CI esté verde…", chat_id=chat_id)
+    for _ in range(45):
+        await asyncio.sleep(40)
+        ok, msg = await github_api.merge_to_main(num)
+        if ok:
+            await tg.send(f"🚀 {tg.esc(msg)}", chat_id=chat_id)
+            return
+        if "verde" not in msg:  # error distinto a CI-pendiente → abortar
+            await tg.send(f"❌ Promoción detenida: {tg.esc(msg)}", chat_id=chat_id)
+            return
+    await tg.send(f"⏰ El CI del PR #{num} no terminó a tiempo — quedó abierto, "
+                  f"reintentá con /promote o mergealo desde GitHub.", chat_id=chat_id)
+
+
 async def _on_callback(data: str, chat_id: str):
-    action, _, raw_id = data.partition(":")
+    action, _, raw = data.partition(":")
+    if action == "promote_go":
+        asyncio.create_task(_do_promote(chat_id))
+        return
+    if action == "merge_go":
+        try:
+            asyncio.create_task(_do_merge(int(raw), chat_id))
+        except ValueError:
+            pass
+        return
+    if action == "cancel":
+        await tg.send("Cancelado.", chat_id=chat_id)
+        return
     try:
-        incident_id = int(raw_id)
+        incident_id = int(raw)
     except ValueError:
         return
     if action == "inv":
@@ -139,24 +219,110 @@ async def _on_text(text: str, chat_id: str, reply_to: int | None):
         ]
         await tg.send("\n".join(lines), chat_id=chat_id)
         return
+    if t.startswith("/model"):
+        import models
+        arg = t[len("/model"):].strip()
+        if not arg:
+            cur = models.current(config.CLAUDE_MODEL)
+            await tg.send(f"🧬 Modelo actual: <b>{tg.esc(models.label(cur))}</b>\n"
+                          f"{models.options_text()}\nUso: /model opus | sonnet | haiku",
+                          chat_id=chat_id)
+            return
+        resolved = models.set_model(arg)
+        await tg.send(f"🧬 Modelo → <b>{tg.esc(models.label(resolved))}</b> "
+                      f"(<code>{tg.esc(resolved)}</code>). Aplica desde la próxima tarea/investigación.",
+                      chat_id=chat_id)
+        return
+    if t.startswith("/deep"):
+        instr = t[len("/deep"):].strip()
+        if not instr:
+            await tg.send("Uso: /deep <auditoría grande> — lanza subagentes en paralelo.",
+                          chat_id=chat_id)
+            return
+        asyncio.create_task(_run_chat_task(instr, chat_id, deep=True))
+        return
+    if t.startswith("/task"):
+        instr = t[len("/task"):].strip()
+        if not instr:
+            await tg.send("Uso: /task <qué querés que investigue/audite/revise>",
+                          chat_id=chat_id)
+            return
+        asyncio.create_task(_run_chat_task(instr, chat_id))
+        return
+    if t.startswith("/merge"):
+        arg = t[len("/merge"):].strip().lstrip("#")
+        if not arg.isdigit():
+            await tg.send("Uso: /merge <número de PR> (solo PRs con base staging)",
+                          chat_id=chat_id)
+            return
+        import github_api
+        pr = await github_api.pr_info(int(arg))
+        if not pr:
+            await tg.send(f"PR #{arg} no existe.", chat_id=chat_id)
+            return
+        green, detail = await github_api.checks_state(pr["head"]["sha"])
+        await tg.send(
+            f"¿Mergear <b>#{arg}</b> — {tg.esc(pr.get('title',''))} → "
+            f"<code>{tg.esc(pr.get('base',{}).get('ref','?'))}</code>?\n"
+            f"CI: {tg.esc(detail)}",
+            buttons=[[{"text": "✅ Confirmar merge", "callback_data": f"merge_go:{arg}"},
+                      {"text": "Cancelar", "callback_data": "cancel:0"}]],
+            chat_id=chat_id)
+        return
+    if t.startswith("/promote"):
+        import github_api
+        commits = await github_api.compare("main", config.PR_BASE_BRANCH)
+        if not commits:
+            await tg.send("staging y main ya están iguales.", chat_id=chat_id)
+            return
+        listing = "\n".join(f"• {tg.esc(c[:70])}" for c in commits[:15])
+        await tg.send(
+            f"⚠️ <b>ESTO VA A PRODUCCIÓN</b> (genly.pro — clientes reales).\n"
+            f"Se promueve staging→main con:\n{listing}\n\n"
+            f"El merge ocurre solo con CI verde.",
+            buttons=[[{"text": "🚀 SÍ, A PRODUCCIÓN", "callback_data": "promote_go:0"},
+                      {"text": "Cancelar", "callback_data": "cancel:0"}]],
+            chat_id=chat_id)
+        return
+    if t.startswith("/logs"):
+        import railway_logs
+        svc = (t[len("/logs"):].strip() or "Worker")
+        out = await railway_logs.tail(svc, 50)
+        await tg.send(f"📜 <b>{tg.esc(svc)}</b>\n<pre>{tg.esc(out[-3000:])}</pre>",
+                      chat_id=chat_id)
+        return
     if t.startswith("/help") or t.startswith("/start"):
         await tg.send(
-            "Soy el Sentinel de Genly. Recibo alertas de Sentry, investigo y, "
-            "con tu OK, abro PRs a staging (nunca a main, nunca mergeo).\n\n"
-            "/incidents — últimos incidentes\n"
-            "Respondé (reply) a un diagnóstico para sumar instrucciones al fix.",
+            "Soy el Sentinel de Genly — tu terminal de guardia.\n\n"
+            "🚨 Automático: alertas de Sentry → investigo → te propongo PR a staging.\n\n"
+            "/task <pedido> — investigá/auditá/revisá algo (conversación continuable por reply)\n"
+            "/deep <pedido> — auditoría grande: lanza varios subagentes en paralelo\n"
+            "/model [opus|sonnet|haiku] — ver o cambiar el modelo en caliente\n"
+            "/merge <PR> — mergear un PR a staging (doble confirmación, CI verde)\n"
+            "/promote — promover staging→main (PRODUCCIÓN, doble confirmación)\n"
+            "/logs [servicio] — cola de logs de Railway (Worker, api, ShortWorker…)\n"
+            "/incidents — últimos incidentes\n\n"
+            "Reply a un diagnóstico = instrucciones para el fix.\n"
+            "Reply a una respuesta de /task = seguir esa conversación.",
             chat_id=chat_id,
         )
         return
     if reply_to:
+        session = store.session_for_tg_message(reply_to)
+        if session:
+            asyncio.create_task(_run_chat_task(t, chat_id, resume_session=session))
+            return
         incident_id = store.incident_for_tg_message(reply_to)
         if incident_id:
             store.append_operator_note(incident_id, t)
             await tg.send(f"📝 Nota agregada al #{incident_id}. Se usará al implementar.",
                           chat_id=chat_id)
             return
-    await tg.send("No entendí. /help para ver comandos; para instruir un fix, "
-                  "respondé (reply) al mensaje del diagnóstico.", chat_id=chat_id)
+    # Texto libre sin reply = tarea nueva (equivale a /task).
+    if len(t) > 12 and not t.startswith("/"):
+        asyncio.create_task(_run_chat_task(t, chat_id))
+        return
+    await tg.send("No entendí. /help para ver comandos.", chat_id=chat_id)
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +389,8 @@ async def sentry_hook(request: Request):
 @app.on_event("startup")
 async def startup():
     store.init()
+    store.init_sessions()
+    store.init_settings()
     asyncio.create_task(tg.poll_updates(_on_callback, _on_text))
     logger.info("sentinel arriba — auto_investigate=%s base=%s",
                 config.AUTO_INVESTIGATE, config.PR_BASE_BRANCH)

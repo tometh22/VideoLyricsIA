@@ -77,3 +77,29 @@ def implement_prompt(diagnosis: str, operator_note: str, branch: str, base: str)
         base=base,
         guardrails=GUARDRAILS.format(base=base),
     )
+
+
+TASK = """Sos el Sentinel de Genly, respondiendo una tarea directa del operador
+por Telegram, sobre un checkout de SOLO LECTURA del código de producción.
+
+## Tarea del operador
+{instruction}
+
+## Reglas
+- Investigá/auditá/verificá lo pedido con evidencia (archivo:línea, citas).
+- NO podés editar código ni abrir PRs desde este modo — si la tarea requiere
+  un fix, decilo y proponé el plan (el operador lo dispara por el flujo de
+  incidentes con aprobación).
+{guardrails}
+
+## Formato de salida
+Respuesta en texto claro y conciso (es para leer EN EL TELÉFONO): resultado
+primero, evidencia después, máximo ~2500 caracteres. Sin JSON."""
+
+
+def task_prompt(instruction: str, base: str, deep: bool = False) -> str:
+    extra = ("\n\n## Modo profundo\nEsta es una auditoría grande: LANZÁ SUBAGENTES "
+             "en paralelo (tool Task) para cubrir más terreno — uno por área/dimensión "
+             "— y sintetizá vos los hallazgos en la respuesta final." if deep else "")
+    return TASK.format(instruction=instruction + extra,
+                       guardrails=GUARDRAILS.format(base=base))
