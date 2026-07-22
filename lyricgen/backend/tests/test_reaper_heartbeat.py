@@ -96,6 +96,12 @@ def test_health_cold_start_no_tick_does_not_degrade(monkeypatch):
     obs = _reload_observability()
     _stub_plenty_of_disk(monkeypatch)
     obs._REAPER_LAST_OK_TS = None
+    # Flake fix: la app real arranca un thread reaper que puede tickear
+    # _REAPER_LAST_OK_TS entre el set de arriba y el snapshot → secs pasa de
+    # None a ~0.0 y health_snapshot toma la rama "ok" en vez de "cold_start"
+    # (falla intermitente en CI cuando el thread gana la carrera). Fijamos
+    # el retorno a None para probar la rama cold-start de forma determinística.
+    monkeypatch.setattr(obs, "reaper_seconds_since_last_ok", lambda: None)
     # Process just started → cold start window
     snap = obs.health_snapshot()
     # Reaper must be reported as cold_start, NOT degrade the snap
@@ -115,6 +121,9 @@ def test_health_never_ticked_after_grace_degrades(monkeypatch):
     obs = _reload_observability()
     _stub_plenty_of_disk(monkeypatch)
     obs._REAPER_LAST_OK_TS = None
+    # Mismo flake que cold_start: sin este stub, el thread reaper vivo puede
+    # tickear _REAPER_LAST_OK_TS y desviar la rama que este test verifica.
+    monkeypatch.setattr(obs, "reaper_seconds_since_last_ok", lambda: None)
     # Simulate 6 min of process uptime — past the 5 min cold-start grace
     obs._PROCESS_START_TS = time.monotonic() - 360
     snap = obs.health_snapshot()
