@@ -835,7 +835,7 @@ export default function UploadZone({
   // timing, which the backend SYNTHESIZES from the line window when real word
   // data is absent, so every template works on any song.
   const LYRICS_ANIMATIONS = [
-    { code: "none",        emoji: "",   label: t("upload.anim_none") || "Ninguna",   desc: t("upload.anim_none_desc") || "Fade clásico por línea." },
+    { code: "none",        emoji: "",   label: t("upload.anim_none") || "Ninguna",   desc: t("upload.anim_none_desc") || "Corte limpio entre líneas." },
     { code: "karaoke",     emoji: "🎤", label: t("upload.anim_karaoke") || "Karaoke", desc: t("upload.anim_karaoke_desc") || "Las palabras se colorean al ritmo que se cantan." },
     { code: "word_reveal", emoji: "🎤", label: t("upload.anim_reveal") || "Revelado", desc: t("upload.anim_reveal_desc") || "Cada palabra aparece justo cuando se canta." },
     { code: "pop",         emoji: "",   label: t("upload.anim_pop") || "Pop",        desc: t("upload.anim_pop_desc") || "La línea entra con un pequeño rebote." },
