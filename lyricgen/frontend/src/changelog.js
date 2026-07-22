@@ -13,8 +13,9 @@
 //                highlightKeys; el modal no lo usa).
 //   highlightKeys opcional, array de claves — bullets de detalle, SOLO
 //                visibles en el panel (WhatsNewPanel), nunca en el modal.
-//   visual       opcional: "transcription" | "textcase" | "cinema" | "media".
-//                Los tres primeros renderizan demos nativas sin assets.
+//   visual       opcional: "control" | "transcription" | "textcase" |
+//                "cinema" | "media". Los primeros cuatro renderizan demos
+//                nativas sin assets.
 //   media        opcional, path en public/ (.mp4 = video loop; otro = imagen).
 //                Se usa cuando visual="media" o como fallback.
 //   ctaKey       opcional, clave i18n del botón de acción.
@@ -32,6 +33,22 @@
 // dosifica dónde aparece.
 export const CHANGELOG = [
   {
+    id: "mas-control-julio",
+    date: "2026-07-22",
+    titleKey: "announce.control_title",
+    taglineKey: "announce.control_tagline",
+    bodyKey: "announce.control_body",
+    visual: "control",
+    highlightKeys: [
+      "announce.control_hl1",
+      "announce.control_hl2",
+      "announce.control_hl3",
+    ],
+    ctaKey: "announce.control_cta",
+    ctaTo: "/new",
+    featured: true,
+  },
+  {
     id: "motor-v2",
     date: "2026-07-07",
     titleKey: "announce.motor2_title",
@@ -45,7 +62,6 @@ export const CHANGELOG = [
     ],
     ctaKey: "announce.motor2_cta",
     ctaTo: "/new",
-    featured: true,
   },
   {
     id: "estilo-abc",
