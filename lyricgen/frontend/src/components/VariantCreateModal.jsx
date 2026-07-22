@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import BackgroundHintField from "./BackgroundHintField";
-import ContentValidationToggle from "./ContentValidationToggle";
+import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
 import useDialogA11y from "../hooks/useDialogA11y";
 
 function _readAccount() {

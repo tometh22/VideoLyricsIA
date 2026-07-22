@@ -304,3 +304,69 @@ def test_admin_cross_tenant_media_token_is_audited(client, admin_token, db):
         db.query(Job).filter(Job.job_id == "xtenant00003").delete(synchronize_session=False)
         db.query(AuditLog).filter(AuditLog.action == "admin.cross_tenant_access").delete(synchronize_session=False)
         db.commit()
+
+
+# ---------------------------------------------------------------------------
+# EDITOR cross-tenant para admins (soporte a clientes, jul-2026): el mismo
+# rol admin que ya LEE cualquier tenant ahora también GUARDA la corrección
+# (/jobs/{id}/save-segments). Sin esto el autoguardado del editor daba 404
+# permanente ("No pudimos guardar") sobre un job ajeno. Usuarios comunes
+# siguen aislados; el acceso queda auditado.
+# ---------------------------------------------------------------------------
+
+_SEG_BODY = {"segments": [{"start": 0.0, "end": 1.5, "text": "hola"}]}
+
+
+def test_admin_can_save_segments_cross_tenant(client, admin_token, db):
+    from tests.conftest import auth
+    from database import Job
+    _seed_foreign_job(db, "xtenant00010")
+    try:
+        r = client.post("/jobs/xtenant00010/save-segments",
+                        json=_SEG_BODY, headers=auth(admin_token))
+        assert r.status_code == 200, r.text
+        db.expire_all()
+        job = db.query(Job).filter(Job.job_id == "xtenant00010").first()
+        assert job.segments_json and job.segments_json[0]["text"] == "hola"
+    finally:
+        db.query(Job).filter(Job.job_id == "xtenant00010").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_regular_user_cannot_save_segments_cross_tenant(client, user_token, db):
+    from tests.conftest import auth
+    from database import Job
+    _seed_foreign_job(db, "xtenant00011")
+    try:
+        r = client.post("/jobs/xtenant00011/save-segments",
+                        json=_SEG_BODY, headers=auth(user_token))
+        assert r.status_code == 404, r.text
+    finally:
+        db.query(Job).filter(Job.job_id == "xtenant00011").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_admin_cross_tenant_save_segments_is_audited(client, admin_token, db):
+    from tests.conftest import auth
+    from database import AuditLog, Job
+    _seed_foreign_job(db, "xtenant00012")
+    try:
+        r = client.post("/jobs/xtenant00012/save-segments",
+                        json=_SEG_BODY, headers=auth(admin_token))
+        assert r.status_code == 200, r.text
+        rows = (
+            db.query(AuditLog)
+            .filter(AuditLog.action == "admin.cross_tenant_access")
+            .order_by(AuditLog.id.desc())
+            .limit(5)
+            .all()
+        )
+        assert any(
+            (e.detail or {}).get("job_id") == "xtenant00012"
+            and (e.detail or {}).get("kind") == "save_segments"
+            for e in rows
+        ), "falta el rastro de auditoría del save-segments cross-tenant"
+    finally:
+        db.query(Job).filter(Job.job_id == "xtenant00012").delete(synchronize_session=False)
+        db.query(AuditLog).filter(AuditLog.action == "admin.cross_tenant_access").delete(synchronize_session=False)
+        db.commit()
