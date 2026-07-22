@@ -9565,6 +9565,13 @@ async def save_segments(
         "transcribed_pending", "transcribed", "pending_review", "rejected", "editing", "done",
     )
     if job.status not in _SAVE_SEGMENTS_ALLOWED:
+        # Outcome metric (issue #934, autosave poco confiable): el 409 por
+        # status es el bloqueo silencioso recurrente del autosave — dejarlo
+        # consultable por tenant sin depender del Sentry del browser.
+        logger.warning(
+            "[save-segments] rejected outcome=409-status job=%s tenant=%s status=%s",
+            job_id, job.tenant_id, job.status,
+        )
         raise HTTPException(
             status_code=409,
             detail=(
@@ -9704,6 +9711,14 @@ async def save_segments(
     job.segments_json = segs
     touch_user_activity(db, job)
     db.commit()
+
+    # Outcome metric (issue #934): éxito consultable por tenant — junto con
+    # el warning del 409 de arriba permite medir la tasa real de fallas del
+    # autosave sin depender de los console.warn del browser.
+    logger.info(
+        "[save-segments] ok job=%s tenant=%s count=%d",
+        job_id, job.tenant_id, len(segs),
+    )
 
     return {
         "ok": True,
