@@ -1,214 +1,118 @@
 /**
- * Regression test for PR A (fix/timeline-drag-persists, 2026-05-26).
+ * Contrato de lib/persistSegments::persistSegments (PR F).
  *
- * Bug observed in production: operator drags a line edge in the lyrics
- * timeline to extend its duration, releases the mouse, and the line
- * "snaps back" to its old position. The backend save succeeds, but the
- * parent's `currentReview.segments` never updates — so any subsequent
- * re-render (drift-sync of typography, rehydrate from sessionStorage,
- * polling) passes stale segments back through the prop, the editor's
- * prop-sync useEffect (LyricsEditor.jsx:440-448) detects a new reference
- * and rewrites local `edited` with the old data.
+ * ANTES (hasta PR F): este archivo testeaba un MIRROR inline
+ * (`makePersistSegmentsToBackend`) que todavía contenía el ECO post-200
+ * (`setCurrentReview({...prev, segments})`) — comportamiento ELIMINADO en la
+ * auditoría 2026-06-10. O sea, el test verde no protegía nada de producción:
+ * afirmaba un contrato que el código real ya no implementa.
  *
- * The fix lives in App.jsx::persistSegmentsToBackend: after a successful
- * POST to /save-segments, call setCurrentReview to keep the prop in sync
- * with the backend ground truth.
- *
- * This test mirrors the callback contract (not the actual component
- * tree) — App.jsx is too big to mount for a unit test. It guards against
- * regressing the four invariants the fix establishes.
+ * AHORA: testeamos la función REAL extraída (authFetch inyectado), sin mirror.
+ * El eco no existe: un 200 retorna { ok: true } y no escribe nada de vuelta
+ * (la frescura vive en el segmentsStore desde PR E). Guardamos el contrato de
+ * retorno del que depende toda la cadena saveStatus/banner + la cola (PR F).
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { persistSegments } from "./lib/persistSegments";
 
-// Inline mirror of App.jsx's persistSegmentsToBackend. Keep this in sync
-// with the production callback — if the contract changes there, this
-// test should fail loudly and force the maintainer to think.
-//
-// 2026-05-28 (audit P0 #74): contract widened — function now returns
-// { ok, reason, status? } so callers (LyricsEditor's saveStatus state
-// machine) can branch on outcome instead of treating every void return
-// as success. Mirror updated to match. Return values:
-//   - { ok: false, reason: "no-data" } when jobId/segments invalid
-//   - { ok: false, reason: "job-gone", status: 404 } on 404
-//   - { ok: false, reason: `http-${n}`, status: n } on other 4xx/5xx
-//   - { ok: false, reason: "network", error: string } on fetch reject
-//   - { ok: true } on 2xx success
-function makePersistSegmentsToBackend({ authFetch, setCurrentReview, API = "https://api.test" }) {
-  return async function persistSegmentsToBackend(jobId, segments) {
-    if (!jobId || !Array.isArray(segments) || segments.length === 0) {
-      return { ok: false, reason: "no-data" };
-    }
-    try {
-      const res = await authFetch(`${API}/jobs/${jobId}/save-segments`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ segments }),
-      });
-      if (!res.ok) {
-        if (res.status !== 404) {
-          console.warn("[autosave] /save-segments failed", res.status);
-        }
-        return {
-          ok: false,
-          reason: res.status === 404 ? "job-gone" : `http-${res.status}`,
-          status: res.status,
-        };
-      }
-      setCurrentReview((prev) => {
-        if (!prev) return prev;
-        const matchesWizard = prev.transcribeJobId === jobId;
-        const matchesEditor = prev.editingJobId === jobId;
-        if (!matchesWizard && !matchesEditor) return prev;
-        return { ...prev, segments };
-      });
-      return { ok: true };
-    } catch (err) {
-      console.warn("[autosave] /save-segments network error", err);
-      return { ok: false, reason: "network", error: String(err) };
-    }
-  };
-}
+const API = "https://api.test";
+const SEGMENTS = [
+  { start: 0, end: 5, text: "linea 1" },
+  { start: 5, end: 10, text: "linea 2" },
+];
 
-describe("persistSegmentsToBackend — round-trip to currentReview", () => {
+describe("persistSegments — contrato real (sin eco a currentReview)", () => {
   let authFetch;
-  let setCurrentReview;
-  let prev;
-  const SEGMENTS = [{ start: 0, end: 5, text: "linea 1" }, { start: 5, end: 10, text: "linea 2" }];
+  beforeEach(() => { authFetch = vi.fn(); });
 
-  beforeEach(() => {
-    authFetch = vi.fn();
-    // setCurrentReview captures the updater functions; we exercise them
-    // with the test's `prev` value to inspect what the merge produces.
-    setCurrentReview = vi.fn();
-  });
+  const persist = (jobId, segments, opts) =>
+    persistSegments(authFetch, API, jobId, segments, opts);
 
-  it("on success: updates currentReview.segments when transcribeJobId matches", async () => {
+  it("POSTea a /jobs/{id}/save-segments y retorna { ok: true } en 2xx", async () => {
     authFetch.mockResolvedValue({ ok: true, status: 200 });
-    prev = { transcribeJobId: "abc123", segments: [{ start: 0, end: 99, text: "stale" }] };
-
-    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
-    await persist("abc123", SEGMENTS);
-
-    expect(setCurrentReview).toHaveBeenCalledTimes(1);
-    const updater = setCurrentReview.mock.calls[0][0];
-    const next = updater(prev);
-    expect(next).not.toBe(prev);  // new reference
-    expect(next.segments).toBe(SEGMENTS);  // points at the persisted array
-    expect(next.transcribeJobId).toBe("abc123");  // other fields preserved
-  });
-
-  it("on success: updates currentReview.segments when editingJobId matches", async () => {
-    authFetch.mockResolvedValue({ ok: true, status: 200 });
-    prev = { editingJobId: "edt456", segments: [{ start: 0, end: 99, text: "stale" }] };
-
-    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
-    await persist("edt456", SEGMENTS);
-
-    expect(setCurrentReview).toHaveBeenCalledTimes(1);
-    const updater = setCurrentReview.mock.calls[0][0];
-    const next = updater(prev);
-    expect(next.segments).toBe(SEGMENTS);
-    expect(next.editingJobId).toBe("edt456");
-  });
-
-  it("on success: noop on the updater when currentReview is null (already approved)", async () => {
-    authFetch.mockResolvedValue({ ok: true, status: 200 });
-
-    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
-    await persist("abc123", SEGMENTS);
-
-    expect(setCurrentReview).toHaveBeenCalledTimes(1);
-    const updater = setCurrentReview.mock.calls[0][0];
-    expect(updater(null)).toBeNull();  // no return-replacement, no crash
-  });
-
-  it("on success: noop on the updater when jobId matches no path on the current review", async () => {
-    authFetch.mockResolvedValue({ ok: true, status: 200 });
-    // currentReview is for a DIFFERENT job — autosave landing late
-    // shouldn't clobber the operator's current edit context.
-    prev = { transcribeJobId: "other-job", segments: [{ start: 0, end: 99, text: "other" }] };
-
-    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
-    await persist("abc123", SEGMENTS);
-
-    expect(setCurrentReview).toHaveBeenCalledTimes(1);
-    const updater = setCurrentReview.mock.calls[0][0];
-    expect(updater(prev)).toBe(prev);  // same reference, untouched
-  });
-
-  it("on backend rejection (500): does NOT update currentReview", async () => {
-    authFetch.mockResolvedValue({ ok: false, status: 500 });
-    prev = { transcribeJobId: "abc123", segments: [{ start: 0, end: 99, text: "stale" }] };
-
-    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
-    await persist("abc123", SEGMENTS);
-
-    expect(setCurrentReview).not.toHaveBeenCalled();
-  });
-
-  it("on 404 (job reaped): does NOT update currentReview, logs softly", async () => {
-    authFetch.mockResolvedValue({ ok: false, status: 404 });
-    prev = { transcribeJobId: "abc123", segments: [{ start: 0, end: 99, text: "stale" }] };
-
-    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
-    await persist("abc123", SEGMENTS);
-
-    expect(setCurrentReview).not.toHaveBeenCalled();
-  });
-
-  it("ignores invalid jobIds or empty segments", async () => {
-    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
-    await persist("", SEGMENTS);
-    await persist("abc", []);
-    await persist("abc", null);
-    await persist(null, SEGMENTS);
-
-    expect(authFetch).not.toHaveBeenCalled();
-    expect(setCurrentReview).not.toHaveBeenCalled();
-  });
-
-  // QA fix 2026-05-28 (audit P0 #74): explicit return-contract tests so
-  // a regression where someone deletes the `{ ok }` return value to
-  // "simplify" fails loudly. The whole error-feedback chain in
-  // LyricsEditor depends on this object existing.
-
-  it("returns { ok: true } on 2xx success", async () => {
-    authFetch.mockResolvedValue({ ok: true, status: 200 });
-    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
     const result = await persist("abc123", SEGMENTS);
+    expect(authFetch).toHaveBeenCalledTimes(1);
+    const [url, init] = authFetch.mock.calls[0];
+    expect(url).toBe(`${API}/jobs/abc123/save-segments`);
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toHaveProperty("segments");
     expect(result).toEqual({ ok: true });
   });
 
-  it("returns { ok: false, reason: 'job-gone', status: 404 } on 404", async () => {
+  it("NO escribe nada de vuelta en éxito (el eco fue removido)", async () => {
+    // Contrato clave: el retorno es SOLO { ok: true }. Nada de segments/echo.
+    authFetch.mockResolvedValue({ ok: true, status: 200 });
+    const result = await persist("abc123", SEGMENTS);
+    expect(result).toEqual({ ok: true });
+    expect(result.segments).toBeUndefined();
+  });
+
+  it("pasa keepalive al fetch cuando opts.keepalive === true", async () => {
+    authFetch.mockResolvedValue({ ok: true, status: 200 });
+    await persist("abc123", SEGMENTS, { keepalive: true });
+    expect(authFetch.mock.calls[0][1].keepalive).toBe(true);
+  });
+
+  it("keepalive es false por defecto", async () => {
+    authFetch.mockResolvedValue({ ok: true, status: 200 });
+    await persist("abc123", SEGMENTS);
+    expect(authFetch.mock.calls[0][1].keepalive).toBe(false);
+  });
+
+  it("404 (job reapeado) → { ok: false, reason: 'job-gone', status: 404 }", async () => {
     authFetch.mockResolvedValue({ ok: false, status: 404 });
-    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
-    const result = await persist("abc123", SEGMENTS);
-    expect(result).toEqual({ ok: false, reason: "job-gone", status: 404 });
+    expect(await persist("abc123", SEGMENTS)).toEqual({
+      ok: false, reason: "job-gone", status: 404,
+    });
   });
 
-  it("returns { ok: false, reason: 'http-500', status: 500 } on 5xx", async () => {
+  it("401 → { ok: false, reason: 'http-401', status: 401 } (el copy lo mapea a sesión)", async () => {
+    authFetch.mockResolvedValue({ ok: false, status: 401 });
+    expect(await persist("abc123", SEGMENTS)).toEqual({
+      ok: false, reason: "http-401", status: 401,
+    });
+  });
+
+  it("5xx → { ok: false, reason: 'http-500', status: 500 }", async () => {
     authFetch.mockResolvedValue({ ok: false, status: 500 });
-    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
-    const result = await persist("abc123", SEGMENTS);
-    expect(result).toEqual({ ok: false, reason: "http-500", status: 500 });
+    expect(await persist("abc123", SEGMENTS)).toEqual({
+      ok: false, reason: "http-500", status: 500,
+    });
   });
 
-  it("returns { ok: false, reason: 'network' } when fetch rejects", async () => {
+  it("400 captura el detail del body sin romper el contrato", async () => {
+    authFetch.mockResolvedValue({
+      ok: false, status: 400,
+      clone: () => ({ json: async () => ({ detail: "segments[7] out of range" }) }),
+    });
+    expect(await persist("abc123", SEGMENTS)).toEqual({
+      ok: false, reason: "http-400", status: 400,
+    });
+  });
+
+  it("fetch que tira → { ok: false, reason: 'network' } con el error", async () => {
     authFetch.mockRejectedValue(new Error("ECONNRESET"));
-    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
-    const result = await persist("abc123", SEGMENTS);
-    expect(result.ok).toBe(false);
-    expect(result.reason).toBe("network");
-    expect(result.error).toContain("ECONNRESET");
+    const r = await persist("abc123", SEGMENTS);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("network");
+    expect(r.error).toContain("ECONNRESET");
   });
 
-  it("returns { ok: false, reason: 'no-data' } on invalid input", async () => {
-    const persist = makePersistSegmentsToBackend({ authFetch, setCurrentReview });
-    const r1 = await persist("", SEGMENTS);
-    const r2 = await persist("abc", []);
-    const r3 = await persist(null, SEGMENTS);
-    expect(r1).toEqual({ ok: false, reason: "no-data" });
-    expect(r2).toEqual({ ok: false, reason: "no-data" });
-    expect(r3).toEqual({ ok: false, reason: "no-data" });
+  it("input inválido → { ok: false, reason: 'no-data' } sin tocar la red", async () => {
+    expect(await persist("", SEGMENTS)).toEqual({ ok: false, reason: "no-data" });
+    expect(await persist("abc", [])).toEqual({ ok: false, reason: "no-data" });
+    expect(await persist("abc", null)).toEqual({ ok: false, reason: "no-data" });
+    expect(await persist(null, SEGMENTS)).toEqual({ ok: false, reason: "no-data" });
+    expect(authFetch).not.toHaveBeenCalled();
+  });
+
+  it("sanitiza al contrato ANTES del POST: un segmento fuera de rango degrada, no rechaza", async () => {
+    // Un valor suelto (end < start) NO debe tirar todo el save — se clampea y
+    // el POST igual sale (incidente 2026-06-26, Universal AR).
+    authFetch.mockResolvedValue({ ok: true, status: 200 });
+    const bad = [{ start: 5, end: 1, text: "invertido" }];
+    const result = await persist("abc123", bad);
+    expect(authFetch).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ ok: true });
   });
 });
