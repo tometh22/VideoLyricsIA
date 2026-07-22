@@ -8,8 +8,8 @@ import LyricVideoPreview from "./LyricVideoPreview";
 import { tierForLength } from "../lib/lyricTiers";
 import { activeWordIndex } from "../lib/karaokeTiming";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
-import { segmentsValuesEqual } from "../lib/segmentsValuesEqual";
 import { reseedPreservingIds } from "../lib/segmentIds";
+import { useJobSegments } from "../state/segmentsStore";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
 import { splitWordsAtCharOffset, firstWordStart, lastWordEnd } from "../lib/splitWords";
 import useLocalStorage from "../hooks/useLocalStorage";
@@ -287,6 +287,11 @@ export function normalizeLineForMatch(text) {
 }
 
 export default function LyricsEditor({
+  // PR E (2026-07): `segments` es SOLO el seed inicial del store por job
+  // (segmentsStore.useJobSegments). Post-mount, un reemplazo externo del
+  // contenido NO viaja por este prop — va por segmentsStore.replace(jobId,
+  // segs), que preserva la identidad de filas (reseedPreservingIds). El
+  // viejo effect de prop-sync + sus 4 guards de eco fueron eliminados.
   segments, filename, audioFile, referenceLyrics,
   coverageWarning = false, recoverySource = "",
   onApprove, onBack, isBatch = false, batchProgress = "",
@@ -302,14 +307,17 @@ export default function LyricsEditor({
   lineTransition = "none",
   transcribeJobId = null,
   onPersistSegments = null,
-  // Synchronous per-edit callback (no debounce). Parent receives the
-  // current cleaned segments on every change. Required by the /edit
-  // modal so it can include the latest segments in the body of
-  // /edit?edit_type=background without racing the 3s autosave debounce.
-  // Without this, an operator who edits a line and clicks "Regenerar
-  // fondo" within 3 s ends up re-rendering with the pre-edit segments_json
-  // because autosave hasn't flushed yet. Incident 2026-05-15.
-  onEditedChange = null,
+  // Versión B, parte 2 (2026-07-15): callback del padre que hace el POST
+  // /jobs/{id}/reanchor (re-anclado CTC del timing con el texto corregido).
+  // El botón "Re-sincronizar con IA" solo se muestra si el padre lo pasa Y
+  // features.anchor_lyrics está activo (flag ANCHOR_LYRICS_ENABLED).
+  onReanchor = null,
+  // NOTE (PR E): el viejo `onEditedChange` (espejo sincrónico por keystroke
+  // hacia App) fue eliminado — era la mitad del loop bidireccional del
+  // reseed-storm. Los lectores externos (WizardLivePreview, snapshot de
+  // wizardPersistence) leen ahora del segmentsStore vía
+  // useJobSegmentsValue(jobId) / segmentsStore.get(jobId); el POST /edit
+  // sigue recibiendo lo de pantalla vía onApprove(editedSegments).
   // Post-approval / re-sync mode. The wizard's upload flow never sets
   // these (defaults preserve original behavior); the JobDetail /edit
   // modal mounts this same editor with audioUrl + the disable flags so
@@ -367,8 +375,17 @@ export default function LyricsEditor({
   onPlaybackTick = null,
 }) {
   const { t } = useI18n();
-  const [edited, setEdited] = useState(() =>
-    segments.map((s, i) => ({ ...s, _id: i }))
+  // PR E (2026-07): `edited` vive en el segmentsStore (Map por jobId a
+  // nivel módulo), NO en un useState local. El store SOBREVIVE al unmount:
+  // navegar paso 6 → 4 → 6 en el wizard des-monta y re-monta este editor,
+  // y antes eso re-seedeaba desde un prop `segments` stale — así se
+  // "borraban los tiempos/locks" (P0 Seba+Gaby). Ahora el remount se
+  // engancha a la entrada viva; seedFn corre solo la PRIMERA vez que se ve
+  // este jobId. Sin jobId (unit tests / editor standalone) degrada a
+  // estado local plano.
+  const [edited, setEdited] = useJobSegments(
+    transcribeJobId,
+    () => reseedPreservingIds([], segments),
   );
   const [isDirty, setIsDirty] = useState(false);
   // List vs visual timeline. Default "list" so the existing operator flow is
@@ -440,29 +457,11 @@ export default function LyricsEditor({
   const [saveStatus, setSaveStatus] = useState("idle"); // idle|saving|saved|error
   const [flushCounter, setFlushCounter] = useState(0);
   // Snapshot of the timings as first handed to us — the baseline for the
-  // timeline's "Resetear timings". Seeded on mount + re-seeded whenever the
-  // parent swaps the `segments` prop (see the reset effect below).
-  const originalSegmentsRef = useRef(segments.map((s, i) => ({ ...s, _id: i })));
-
-  // Re-seed `edited` whenever the parent hands us a different `segments`
-  // reference. The initial useState above only runs once on mount —
-  // without this effect, a parent that re-uses the same editor across
-  // jobs (e.g. JobDetail's /edit modal swapping between two jobs in
-  // the same session, or a forced refresh that re-fetches segments_json
-  // after autosave landed) keeps showing the stale first-mount array.
-  // Compared by reference, not deep-equal: the parent owns the array
-  // identity, so a new prop reference = "you should reset". This is the
-  // standard "controlled-vs-uncontrolled" reset pattern used by inputs
-  // that need to track a parent's source of truth across remounts.
-  // Bug B7 from 2026-05-18 audit.
-  const prevSegmentsRef = useRef(segments);
-  // Live mirror of `edited` so the prop-sync effect below can tell our OWN echo
-  // from a genuine external change. App.jsx feeds every local edit straight back
-  // as the `segments` prop (onEditedChange → mergeEditedSegments →
-  // currentReview.segments), so the effect must compare the incoming prop
-  // against what we're SHOWING right now — not a one-tick-stale ref.
-  const editedRef = useRef(edited);
-  editedRef.current = edited;
+  // timeline's "Resetear timings". PR E: seeded from the store's initial
+  // value (mismos _id que `edited`), NOT from the raw prop — on a remount
+  // that re-attaches to a live store entry, the prop is stale and its
+  // by-index ids wouldn't match the surviving rows.
+  const originalSegmentsRef = useRef(edited);
   // Operator feedback 2026-05-25 (UMG): "Debería hacerlo solo, no
   // preguntarme" — the auto-trim banner ("Recortar N líneas con texto
   // colgado · Aplicar") was friction. Detection is reliable enough to
@@ -470,95 +469,13 @@ export default function LyricsEditor({
   // application so re-seeding a new job re-triggers; routine edits
   // (typing in a line) do NOT, because they don't change the ref.
   const autoTrimAppliedRef = useRef(false);
-  const _reseedStormRef = useRef({ windowStart: 0, count: 0 });
-  useEffect(() => {
-    if (prevSegmentsRef.current === segments) return;
-    // ROOT-CAUSE FIX (P0 UMG Chile, "titila todo el editor" — still firing on
-    // the #724 build): skip the destructive reseed when the incoming `segments`
-    // already matches what we're SHOWING (`edited`). App.jsx mirrors every local
-    // edit up to currentReview.segments (onEditedChange → mergeEditedSegments)
-    // and feeds it straight back as this prop. During a timeline drag the values
-    // change every tick, so comparing against the one-tick-stale prevSegmentsRef
-    // (below) saw each echo as "new content" and reseeded → _id reassigned by
-    // index → all rows REMOUNT 6-7×/s → reseed-storm / ui-freeze. #724 only
-    // neutralised the equal-VALUES reorder echo; this catches the live-edit echo
-    // because the prop equals our current `edited`. A genuine external change
-    // (load another song, undo) differs from `edited` and still reseeds.
-    if (segmentsValuesEqual(editedRef.current, segments)) {
-      prevSegmentsRef.current = segments;
-      return;
-    }
-    // QA fix 2026-05-27 (drag-resize regression): the autosave POST
-    // roundtrip (App.jsx::persistSegmentsToBackend) calls
-    // setCurrentReview({...prev, segments: cleaned}) after a successful
-    // /save-segments. That hands LyricsEditor a NEW segments array
-    // reference holding the SAME values the operator just dragged.
-    // Pre-fix this useEffect saw the new ref and reseeded `edited` —
-    // re-assigning _ids by index, dropping `locked`/`pos`/`scale`/`rot`
-    // that the local handler had just applied, and under React's render
-    // batching also dropping an in-flight second drag in same tick.
-    // Net effect: operator drags an edge, releases, the edge snaps back
-    // to where it was before. We bump the ref so we don't re-check on
-    // every render, but skip the destructive reseed.
-    if (segmentsValuesEqual(prevSegmentsRef.current, segments)) {
-      prevSegmentsRef.current = segments;
-      return;
-    }
-    // [reseed-storm] capture (P0 UMG Chile 2026-06-16: "las líneas cambian de
-    // posición en loop"). This reseed reassigns _id by index, so rows keyed by
-    // _id REMOUNT. The original root cause: segmentsValuesEqual was POSITIONAL,
-    // so a writeback that handed back a REORDERED segments array (backend sorts
-    // by start #184 while local is out-of-order from a split/overlap) failed the
-    // guard above and made this fire on every cycle → rows reposition in a loop.
-    // FIXED in #724: segmentsValuesEqual now sorts both sides by start before
-    // comparing, so a pure reorder no longer reseeds. This detector is KEPT as a
-    // backstop — it still catches a GENUINE rapid-content storm (not reorder),
-    // and stays until the 2026-07-01 monitoring window closes. If it fires
-    // repeatedly we emit the OLD vs NEW order so we can see the swap.
-    {
-      const _now = typeof performance !== "undefined" && performance.now ? performance.now() : 0;
-      const _rs = _reseedStormRef.current;
-      if (_now - _rs.windowStart > 1000) {
-        if (_rs.count >= 6) {
-          const _ord = (arr) => (Array.isArray(arr) ? arr : []).slice(0, 5).map((s) => String(s.text || "").slice(0, 18));
-          // eslint-disable-next-line no-console
-          console.warn("[reseed-storm] rows reseeding/remounting repeatedly", {
-            perSec: _rs.count,
-            prevOrder: _ord(prevSegmentsRef.current),
-            newOrder: _ord(segments),
-            segments: Array.isArray(segments) ? segments.length : null,
-          });
-        }
-        _rs.windowStart = _now;
-        _rs.count = 0;
-      }
-      _rs.count += 1;
-    }
-    prevSegmentsRef.current = segments;
-    // Identidad ESTABLE en el reseed (P0 reseed-storm): preservar el _id de
-    // cada fila cuyo contenido (start/end/text, epsilon 1ms) ya está en
-    // `edited` — un eco puro conserva TODOS los ids y React no re-monta
-    // ninguna fila; solo el contenido genuinamente nuevo recibe id fresco.
-    // Antes: _id reasignado POR ÍNDICE → todas las keys nuevas → remount
-    // total de la lista + minimapa en cada reseed (el amplificador del
-    // freeze en canciones de 59+ líneas).
-    const seeded = reseedPreservingIds(editedRef.current, segments);
-    setEdited(seeded);
-    originalSegmentsRef.current = seeded;
-    setIsDirty(false);
-    // Audit fix 2026-05-27 (drag-resize regression part 2): NO resetear
-    // autoTrimAppliedRef acá. Antes hacíamos `current = false` con la
-    // lógica "new job → eligible for auto-trim", PERO esta useEffect
-    // también dispara en el roundtrip del autosave (drag → POST →
-    // setCurrentReview → reseed). Si el operador acababa de extender un
-    // segmento más allá de su `estimateVoiceEndDuration` cap, autoTrim
-    // (useEffect en línea ~1440) ve `current=false` + `longSegCount>0`
-    // y dispara `trimAllLongSegs()` que recorta el end de vuelta al cap.
-    // Visualmente: drag se "revierte". Para el caso real de cargar un
-    // job distinto, el padre cambia la `key` del LyricsEditor (filename
-    // + queueIdx) → remount → useState inicializa `current=false` de
-    // nuevo. No hace falta el reset acá.
-  }, [segments]);
+  // PR E (2026-07): acá vivía el effect de prop-sync/reseed (Bug B7 + los
+  // guards de eco #724/live-edit + el detector [reseed-storm]). Se ELIMINÓ
+  // entero: el estado vive en segmentsStore (sobrevive unmounts, el prop
+  // `segments` es solo seed inicial) y el reemplazo externo post-mount va
+  // por segmentsStore.replace(jobId, segs), que preserva _id vía
+  // reseedPreservingIds. El canary anti-loop vive ahora en el store
+  // (mismo tag "[reseed-storm]" → Sentry vía observability.js).
 
   // Warn browser on tab-close / external navigation when there are unsaved edits.
   // disableBeforeUnload skips this for the post-approval modal — closing
@@ -702,16 +619,10 @@ export default function LyricsEditor({
     return () => clearTimeout(id);
   }, [saveStatus]);
 
-  // Synchronous per-edit callback: fires on every `edited` change with no
-  // debounce, so the parent can hold the latest segments in a ref and
-  // include them in the next /edit POST without racing the 3 s autosave
-  // window. No-op when the parent didn't wire the callback. Cheap enough
-  // to fire per keystroke — a single map() over the segments array.
-  useEffect(() => {
-    if (!onEditedChange || !Array.isArray(edited)) return;
-    const cleaned = edited.map(({ _id, review, ...rest }) => rest);
-    onEditedChange(cleaned);
-  }, [edited, onEditedChange]);
+  // PR E (2026-07): acá vivía el espejo sincrónico por keystroke
+  // (onEditedChange → App.setCurrentReview). Eliminado — era la mitad del
+  // loop bidireccional del reseed-storm. Los consumidores externos leen
+  // ahora directo del segmentsStore (useJobSegmentsValue / get).
 
   // NOTE: a second debounced-autosave useEffect lived here, copy-pasted
   // identically to the one above (line ~238). Removed 2026-05-18 —
@@ -968,6 +879,56 @@ export default function LyricsEditor({
     }));
     toast({ message: "Timings restaurados al original", tone: "info" });
   }, [pushEditHistory, toast]);
+
+  // Versión B, parte 2 — "Re-sincronizar con IA". Flujo:
+  //   1. Flush del estado local a /save-segments (el backend re-ancla lo
+  //      que hay en segments_json — sin esto, re-anclaría texto viejo si
+  //      el operador tipeó hace <3s y el autosave no corrió).
+  //   2. POST /jobs/{id}/reanchor vía el callback del padre.
+  //   3. Éxito → reemplazar `edited` con los segments re-anclados (mismo
+  //      seed que el mount; las líneas `locked` vuelven intactas del
+  //      backend) + toast "N re-sincronizadas, M para revisar".
+  //      Decline / error → toast de error, timings quedan como estaban.
+  // El snapshot pre-reanchor va al edit history, así Cmd+Z lo revierte.
+  const [reanchoring, setReanchoring] = useState(false);
+  const canReanchor = !!(onReanchor && transcribeJobId
+    && user?.features?.anchor_lyrics === true);
+  const handleReanchor = useCallback(async () => {
+    if (!onReanchor || !transcribeJobId || reanchoring) return;
+    setReanchoring(true);
+    try {
+      if (onPersistSegments) {
+        const cleaned = edited.map(({ _id, review, ...rest }) => rest);
+        await Promise.resolve(onPersistSegments(transcribeJobId, cleaned));
+      }
+      const res = await Promise.resolve(onReanchor(transcribeJobId));
+      if (res && res.ok && Array.isArray(res.segments) && res.segments.length) {
+        pushEditHistory();
+        // PR E: ids frescos vía el mismo helper que el seed inicial —
+        // consistencia con la identidad estable del store (PR D).
+        setEdited(reseedPreservingIds([], res.segments));
+        toast({
+          message: (t("editor.reanchor_done") || "{n} líneas re-sincronizadas, {m} para revisar")
+            .replace("{n}", String(res.count ?? res.segments.length))
+            .replace("{m}", String(res.review_count ?? 0)),
+          tone: "success",
+        });
+      } else {
+        toast({
+          message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
+          tone: "error",
+        });
+      }
+    } catch {
+      toast({
+        message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
+        tone: "error",
+      });
+    } finally {
+      setReanchoring(false);
+    }
+  }, [onReanchor, onPersistSegments, transcribeJobId, reanchoring, edited,
+      pushEditHistory, toast, t]);
 
   const focusSegment = useCallback((id) => {
     setFocusedSegId(id);

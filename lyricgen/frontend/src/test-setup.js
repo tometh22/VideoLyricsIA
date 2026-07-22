@@ -70,3 +70,13 @@ if (typeof window !== "undefined" && !window.matchMedia) {
     dispatchEvent: () => false,
   });
 }
+
+// PR E (2026-07): el segmentsStore es un Map a NIVEL MÓDULO (sobrevive
+// unmounts a propósito) — sin esta limpieza, la entrada seedeada por un
+// test con transcribeJobId leakea al siguiente test que use el mismo id
+// y el editor "hereda" segments de otro test. Limpiar SIEMPRE entre tests.
+import { afterEach as _segStoreAfterEach } from "vitest";
+import { segmentsStore as _segmentsStore } from "./state/segmentsStore";
+_segStoreAfterEach(() => {
+  _segmentsStore._clearAll();
+});
