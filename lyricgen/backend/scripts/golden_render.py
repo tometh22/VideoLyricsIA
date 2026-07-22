@@ -48,8 +48,27 @@ SEGMENTS = [
     {"start": 14.5, "end": 19.0, "text": "Última línea del master dorado"},
 ]
 
+# Caso "canción larga" (plan del editor, gate WS6): 56 líneas apretadas —
+# el perfil de los incidentes UMG (Amiga Mía = 59). Ejercita el render con
+# una densidad real de segments: tiers por largo alternados, saltos de
+# línea rápidos y el camino que el smoke corto de 4 líneas nunca toca.
+# El audio del golden dura ~20s → las líneas van comprimidas en ese rango.
+LONG_SEGMENTS = [
+    {
+        "start": round(0.3 + i * 0.34, 2),
+        "end": round(0.3 + i * 0.34 + 0.30, 2),
+        "text": (
+            f"Línea {i + 1} corta"
+            if i % 3 else
+            f"Línea {i + 1} bastante más larga para caer en otra tier de tamaño"
+        ),
+    }
+    for i in range(56)
+]
+
 # Matriz: 3 combos cubren fuente redondeada/condensada, karaoke/pop/none,
-# fondo video y fondo imagen, colores custom y contraste fuerte.
+# fondo video y fondo imagen, colores custom y contraste fuerte; el 4to
+# cubre el perfil canción-larga (combo["segments"] override).
 COMBOS = [
     {
         "name": "fredoka-karaoke-libvideo",
@@ -74,6 +93,15 @@ COMBOS = [
         "params": {
             "font": "bebas-neue", "lyrics_animation": "none",
             "text_case": "upper", "text_contrast": "strong",
+        },
+    },
+    {
+        "name": "montserrat-longsong-libvideo",
+        "bg": "mp4",
+        "segments": LONG_SEGMENTS,
+        "params": {
+            "font": "montserrat-bold", "lyrics_animation": "none",
+            "text_case": "upper",
         },
     },
 ]
@@ -217,7 +245,7 @@ def main():
         fields = {
             "artist": "Golden Render", "song_title": combo["name"],
             "language": "es",
-            "segments_json": json.dumps(SEGMENTS),
+            "segments_json": json.dumps(combo.get("segments", SEGMENTS)),
             "background_id": str(assets[combo["bg"]]),
             "background_mode": "as_is",
             **{k: str(v) for k, v in combo["params"].items()},
