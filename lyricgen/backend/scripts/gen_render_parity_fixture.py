@@ -33,6 +33,11 @@ from ass_render import (  # noqa: E402
     font_size_factor,
     lyric_fontsize,
 )
+from pipeline import (  # noqa: E402
+    _CONCEPT_SCENE_GUIDE,
+    _FONT_CATALOGUE,
+    _MOVEMENT_STYLE_RULES,
+)
 
 FIXTURE_PATH = os.path.join(
     os.path.dirname(__file__), "..", "..", "frontend", "src", "shared", "renderParity.json"
@@ -97,6 +102,14 @@ def build_fixture() -> dict:
         "fade_durations_s": dict(sorted(_FADE_DURATIONS_S.items())),
         "font_sizes": font_sizes,
         "fades": fades,
+        # Hand-mirrored option catalogs (worker renders what the dropdown
+        # promised). The frontend's picker CODES must equal these — the "" /
+        # Auto option is frontend-only and excluded from the contract.
+        "catalogs": {
+            "fonts": sorted(f["id"] for f in _FONT_CATALOGUE),
+            "concepts": sorted(_CONCEPT_SCENE_GUIDE.keys()),
+            "movements": sorted(_MOVEMENT_STYLE_RULES.keys()),
+        },
     }
 
 
