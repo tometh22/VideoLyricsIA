@@ -10,6 +10,10 @@ import { tierForLength } from "../lib/lyricTiers";
 import { activeWordIndex } from "../lib/karaokeTiming";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
 import { reseedPreservingIds } from "../lib/segmentIds";
+import {
+  clampBlockShiftDelta,
+  shiftBlockWithinDuration,
+} from "../lib/segmentTiming";
 import { useJobSegments, segmentsStore } from "../state/segmentsStore";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
 import { splitWordsAtCharOffset, firstWordStart, lastWordEnd } from "../lib/splitWords";
@@ -1264,6 +1268,12 @@ export default function LyricsEditor({
       );
       if (!ok) applyCascade = false;
     }
+    const appliedDelta = applyCascade
+      ? clampBlockShiftDelta(edited.slice(syncCursor), delta, duration)
+      : delta;
+    const appliedStart = applyCascade
+      ? target.start + appliedDelta
+      : newStart;
 
     // Snapshot the future lines BEFORE mutating so undo can restore
     // every shifted timestamp, not just the anchor's. Skip when we're
@@ -1282,7 +1292,7 @@ export default function LyricsEditor({
         prevEnd: target.end,
         cursor: syncCursor,
         future: futureSnapshot,
-        delta,
+        delta: appliedDelta,
       },
     ]);
     // Compute next-chronological-line identity BEFORE we mutate, so we
@@ -1296,23 +1306,18 @@ export default function LyricsEditor({
 
     setEdited((prev) => {
       const mutated = prev.map((s, i) => {
+        if (applyCascade && i >= syncCursor && Math.abs(appliedDelta) >= 0.01) {
+          return {
+            ...s,
+            start: s.start + appliedDelta,
+            end: s.end + appliedDelta,
+          };
+        }
         if (s._id === target._id) {
           const segDur = Math.max(0.5, s.end - s.start);
-          let newEnd = newStart + segDur;
+          let newEnd = appliedStart + segDur;
           if (duration && newEnd > duration) newEnd = duration;
-          return { ...s, start: newStart, end: newEnd };
-        }
-        // Cascade only when the operator opted in AND the delta isn't a
-        // suspect mistap (handled by the confirm above). 10 ms threshold
-        // filters pure floating-point noise; below that we skip the
-        // shift, above we apply it. See git blame for the prior 200 ms
-        // dead-zone that swallowed legit user corrections.
-        if (applyCascade && i > syncCursor && Math.abs(delta) >= 0.01) {
-          const segDur = Math.max(0.5, s.end - s.start);
-          const shifted = Math.max(0, s.start + delta);
-          let newEnd = shifted + segDur;
-          if (duration && newEnd > duration) newEnd = duration;
-          return { ...s, start: shifted, end: newEnd };
+          return { ...s, start: appliedStart, end: newEnd };
         }
         return s;
       });
@@ -1334,7 +1339,7 @@ export default function LyricsEditor({
         console.info("[sync] Anchor caused multi-position reorder", {
           line_id: target._id,
           prev_start: target.start,
-          new_start: newStart,
+          new_start: appliedStart,
           prev_idx: prevIdx,
           new_idx: newIdx,
           jumps: newIdx - prevIdx,
@@ -1348,8 +1353,8 @@ export default function LyricsEditor({
     // the operator can mentally match. The toast lives in
     // ToastProvider — fire-and-forget.
     toast({
-      message: `Anclada · ${formatTimestamp(target.start)} → ${formatTimestamp(newStart)}`,
-      tone: Math.abs(delta) > 5 ? "warning" : "info",
+      message: `Anclada · ${formatTimestamp(target.start)} → ${formatTimestamp(appliedStart)}`,
+      tone: Math.abs(appliedDelta) > 5 ? "warning" : "info",
     });
 
     // Highlight the row for 10s so the eye finds the moved line + we
@@ -1769,15 +1774,7 @@ export default function LyricsEditor({
   const shiftAllSegments = useCallback((delta) => {
     if (Math.abs(delta) < 0.05) return;
     pushEditHistory();
-    setEdited((prev) =>
-      prev.map((s) => {
-        const segDur = Math.max(0.5, s.end - s.start);
-        const newStart = Math.max(0, s.start + delta);
-        let newEnd = newStart + segDur;
-        if (duration && newEnd > duration) newEnd = duration;
-        return { ...s, start: newStart, end: newEnd };
-      }),
-    );
+    setEdited((prev) => shiftBlockWithinDuration(prev, delta, duration));
   }, [pushEditHistory, duration]);
 
   const deleteSeg = (id) => {

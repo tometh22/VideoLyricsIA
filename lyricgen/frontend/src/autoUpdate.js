@@ -61,8 +61,10 @@ export function initAutoUpdate({ pollMs = 10 * 60 * 1000, env = import.meta.env 
     const last = parseInt(sessionStorage.getItem("__autoupdate_reload_at") || "0", 10);
     if (Date.now() - last < 60_000) return;
     sessionStorage.setItem("__autoupdate_reload_at", String(Date.now()));
+    // Expected lifecycle, not an alert. Keep it as a replay breadcrumb
+    // without forwarding it through the warn-level Sentry integration.
     // eslint-disable-next-line no-console
-    console.warn("[auto-update] new build detected — reloading to update");
+    console.info("[auto-update] new build detected — reloading to update");
     window.location.reload();
   };
 

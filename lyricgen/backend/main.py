@@ -444,7 +444,24 @@ async def _disconnect_receive():
     return {"type": "http.disconnect"}
 
 
+class RejectNulPathMiddleware:
+    """Reject URL paths containing a NUL before they reach DB lookups."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and "\x00" in scope.get("path", ""):
+            await JSONResponse(
+                {"detail": "Malformed request path."},
+                status_code=400,
+            )(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 app.add_middleware(DbTransientRetryMiddleware)
+app.add_middleware(RejectNulPathMiddleware)
 
 
 # --- Server-Timing header middleware ---
