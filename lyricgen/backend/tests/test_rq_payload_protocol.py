@@ -72,10 +72,33 @@ def test_release_heartbeat_exposes_sha_queues_and_protocol(monkeypatch):
 
     key, ttl, payload = writes[0]
     assert key == "genly:worker:release:render-1"
-    assert ttl >= 30
+    assert ttl == 120
     assert payload["release"] == "abc123"
     assert payload["queues"] == ["enterprise", "default"]
     assert payload["rq_payload_version"] == queue_jobs.RQ_PAYLOAD_VERSION
+
+
+def test_idle_dequeue_wakes_before_release_heartbeat_expires(monkeypatch):
+    """Idle workers must refresh release metadata before its 120s TTL."""
+    import worker
+
+    monkeypatch.setenv("WORKER_RELEASE_HEARTBEAT_TTL_SECONDS", "120")
+    fake_worker = object.__new__(worker.WarmOnlyWorker)
+    fake_worker.worker_ttl = 420
+
+    assert fake_worker.dequeue_timeout == 40
+    assert fake_worker.dequeue_timeout < worker._release_heartbeat_ttl_seconds()
+
+
+def test_invalid_release_heartbeat_ttl_is_safe(monkeypatch):
+    import worker
+
+    monkeypatch.setenv("WORKER_RELEASE_HEARTBEAT_TTL_SECONDS", "not-a-number")
+    fake_worker = object.__new__(worker.WarmOnlyWorker)
+    fake_worker.worker_ttl = 420
+
+    assert worker._release_heartbeat_ttl_seconds() == 120
+    assert fake_worker.dequeue_timeout == 40
 
 
 def test_legacy_v1_job_adapts_missing_policy_fingerprint(monkeypatch):

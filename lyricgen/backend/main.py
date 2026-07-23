@@ -62,6 +62,7 @@ from auth import (
     PLANS,
     create_media_token,
     verify_media_token,
+    MEDIA_TOKEN_EXPIRE_SECONDS,
     validate_password_strength,
     has_prores_access,
     has_drive_access,
@@ -1086,7 +1087,10 @@ async def preview_background(
         asset_file_type = asset.file_type
 
     if asset_filename.startswith("library/") and storage.is_enabled():
-        url = storage.generate_signed_url(asset_filename, expiry_seconds=900)
+        url = storage.generate_signed_url(
+            asset_filename,
+            expiry_seconds=MEDIA_TOKEN_EXPIRE_SECONDS,
+        )
         if url:
             return RedirectResponse(url, status_code=302)
         # If signing failed for any reason, fall through to local fallback.
@@ -8204,8 +8208,9 @@ async def job_events(
     token: str | None = Query(None, description="Temporary legacy query auth"),
 ):
     """Server-Sent Events stream for a single job. Emits one event whenever
-    the job's status, step, or progress changes, then closes on any terminal
-    state. New clients authenticate with an Authorization Bearer header.
+    the job's status, step, or progress changes and a keepalive comment on
+    unchanged ticks, then closes on any terminal state. New clients
+    authenticate with an Authorization Bearer header.
     Query authentication is a temporary, server-controlled compatibility path.
 
     Connection budget: this is the worst pool-hog in the codebase
@@ -8325,6 +8330,12 @@ async def job_events(
                     "step_text_es": _step_text,
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
+            else:
+                # Keep the stream observable even while a long render remains
+                # on the same step/progress value. The frontend watchdog is
+                # 6–8 s; ticks are every 2 s, so a healthy idle stream never
+                # looks frozen. SSE comments are ignored by event handlers.
+                yield ": keepalive\n\n"
             if job["status"] in TERMINAL:
                 break
             await asyncio.sleep(2)
@@ -8751,7 +8762,10 @@ async def preview(
         return FileResponse(file_path, media_type=MEDIA_TYPES[file_type])
 
     if s3_key and storage.is_enabled():
-        url = storage.generate_signed_url(s3_key, expiry_seconds=3600)
+        url = storage.generate_signed_url(
+            s3_key,
+            expiry_seconds=MEDIA_TOKEN_EXPIRE_SECONDS,
+        )
         if url:
             return RedirectResponse(url, status_code=302)
 

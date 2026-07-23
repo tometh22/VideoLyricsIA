@@ -115,6 +115,59 @@ def test_logging_formatter_redacts_exception_traceback(monkeypatch):
     assert "[REDACTED]" in stream.getvalue()
 
 
+def test_sentry_context_is_redacted_before_agent_handoff(monkeypatch):
+    secret = "railway-context-super-secret"
+    monkeypatch.setenv("RAILWAY_API_TOKEN", secret)
+    context = sentry_webhook.compact_context({
+        "exception": {"value": f"request failed with Bearer {secret}"},
+    })
+    assert secret not in context
+    assert "[REDACTED]" in context
+
+
+def test_sentry_context_redacts_before_truncating(monkeypatch):
+    import json
+
+    secret = "TOPSECRET0123456789"
+    monkeypatch.setenv("RAILWAY_API_TOKEN", secret)
+    payload = {"message": f"{'x' * 64}{secret}"}
+    raw = json.dumps(payload, ensure_ascii=False, default=str)
+    secret_start = raw.index(secret)
+    context = sentry_webhook.compact_context(
+        payload,
+        max_chars=secret_start + len(secret) - 2,
+    )
+    assert "TOPSECRET" not in context
+    assert "[REDACTED]" in context
+
+
+def test_railway_log_tail_redacts_context(monkeypatch):
+    import asyncio
+    import railway_logs
+
+    secret = "railway-log-super-secret"
+    monkeypatch.setenv("RAILWAY_API_TOKEN", secret)
+    monkeypatch.setattr(railway_logs, "enabled", lambda: True)
+
+    async def fake_latest(_service):
+        return "deployment-1"
+
+    async def fake_gql(_query, _variables):
+        return {"data": {"deploymentLogs": [{
+            "timestamp": "2026-07-23T10:00:00Z",
+            # Put the secret across the left edge of tail()'s 6000-char
+            # window. Truncating first would retain only an unredactable
+            # suffix of the credential.
+            "message": f"prefix-{secret}-{'x' * 5990}",
+        }]}}
+
+    monkeypatch.setattr(railway_logs, "_latest_deployment_id", fake_latest)
+    monkeypatch.setattr(railway_logs, "_gql", fake_gql)
+    context = asyncio.run(railway_logs.tail("api"))
+    assert secret not in context
+    assert secret[-10:] not in context
+
+
 def test_http_client_info_logging_is_disabled():
     assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
     assert logging.getLogger("httpcore").getEffectiveLevel() >= logging.WARNING

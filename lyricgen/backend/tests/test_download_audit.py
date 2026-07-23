@@ -64,13 +64,16 @@ def _audit_rows_for(job_id):
 
 def _mock_r2(monkeypatch, *, exists=True):
     import storage
+    signed_url_calls = []
+
+    def _signed_url(key, expiry_seconds=3600, download_filename=None):
+        signed_url_calls.append((key, expiry_seconds, download_filename))
+        return f"https://r2.fake/{key}?sig=ok"
+
     monkeypatch.setattr(storage, "is_enabled", lambda: True)
     monkeypatch.setattr(storage, "object_exists", lambda key: exists)
-    monkeypatch.setattr(
-        storage, "generate_signed_url",
-        lambda key, expiry_seconds=3600, download_filename=None:
-            f"https://r2.fake/{key}?sig=ok",
-    )
+    monkeypatch.setattr(storage, "generate_signed_url", _signed_url)
+    return signed_url_calls
 
 
 def _media_token(client, admin_token, job_id, file_type):
@@ -89,7 +92,7 @@ def _media_token(client, admin_token, job_id, file_type):
 def test_download_writes_audit_log(client, admin_token, db, monkeypatch):
     """Successful R2-redirect download → exactly one job.download row with
     user, tenant, and file_type recorded."""
-    _mock_r2(monkeypatch)
+    signed_url_calls = _mock_r2(monkeypatch)
     user_id, tenant_id = _admin_identity(db)
     job_id = _create_job(db, tenant_id, user_id,
                          s3_keys={"video": f"{tenant_id}/{uuid.uuid4().hex[:8]}/lyric_video.mp4"})
@@ -97,6 +100,7 @@ def test_download_writes_audit_log(client, admin_token, db, monkeypatch):
     token = _media_token(client, admin_token, job_id, "video")
     res = client.get(f"/download/{job_id}/video?token={token}", follow_redirects=False)
     assert res.status_code == 302, res.text
+    assert signed_url_calls[0][1] == 3600
 
     rows = [r for r in _audit_rows_for(job_id) if r.action == "job.download"]
     assert len(rows) == 1, f"expected exactly 1 job.download audit row, got {len(rows)}"
@@ -144,6 +148,30 @@ def test_source_audio_url_writes_audit_log(client, admin_token, db, monkeypatch)
     assert rows[0].user_id == user_id
     assert rows[0].detail["tenant_id"] == tenant_id
     assert rows[0].detail["source"] == "input"
+
+
+def test_preview_signed_url_does_not_outlive_scoped_token(
+    client, admin_token, db, monkeypatch,
+):
+    from auth import MEDIA_TOKEN_EXPIRE_SECONDS
+
+    calls = _mock_r2(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _create_job(
+        db,
+        tenant_id,
+        user_id,
+        status="pending_review",
+        s3_keys={"video": f"{tenant_id}/preview/video.mp4"},
+    )
+    token = _media_token(client, admin_token, job_id, "video")
+
+    response = client.get(
+        f"/preview/{job_id}/video?token={token}",
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+    assert calls[0][1] == MEDIA_TOKEN_EXPIRE_SECONDS
 
 
 def test_source_audio_url_404_writes_no_audit(client, admin_token, db, monkeypatch):

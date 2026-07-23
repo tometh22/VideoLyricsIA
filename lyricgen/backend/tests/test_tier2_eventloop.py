@@ -65,6 +65,15 @@ def test_sse_handler_stays_async_with_sync_tick_helper():
     )
 
 
+def test_sse_stream_emits_keepalive_below_frontend_watchdog():
+    """Unchanged render progress must still put bytes on the stream."""
+    import main
+
+    source = inspect.getsource(main.job_events)
+    assert 'yield ": keepalive\\n\\n"' in source
+    assert "await asyncio.sleep(2)" in source
+
+
 @pytest.mark.parametrize("name", _BILLING_SYNC_HANDLERS)
 def test_billing_handlers_are_sync(name):
     import billing

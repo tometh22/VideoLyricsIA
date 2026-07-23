@@ -891,7 +891,18 @@ def get_current_user(
         subject_id = int(payload.get("sub"))
     except (TypeError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid token subject")
-    user = get_user_by_id_resilient(db, subject_id)
+    try:
+        user = get_user_by_id_resilient(db, subject_id)
+    except SQLAlchemyError as exc:
+        try:
+            db.rollback()
+        except SQLAlchemyError:
+            pass
+        _record_session_rejection("session_validation_unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Session validation temporarily unavailable",
+        ) from exc
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
 

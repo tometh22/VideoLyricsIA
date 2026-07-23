@@ -298,8 +298,47 @@ def reaper_seconds_since_last_ok() -> float | None:
     return time.monotonic() - _REAPER_LAST_OK_TS
 
 
-def worker_fleet_coherence(release_rows: list[dict], api_release: str,
-                           api_protocol: int) -> dict:
+def _fleet_service_name(value: object) -> str:
+    compact = "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+    if compact == "shortworker":
+        return "short_worker"
+    if compact == "worker":
+        return "worker"
+    return compact or "unknown"
+
+
+def _fleet_readiness_config(environment: str | None = None) -> tuple[bool, dict[str, int]]:
+    """Durable readiness defaults for shared staging/production fleets."""
+    managed = (environment or ENV).strip().lower() in {
+        "staging", "stage", "prod", "production",
+    }
+    strict_default = "1" if managed else "0"
+    worker_default = "7" if managed else "0"
+    short_default = "3" if managed else "0"
+    strict = os.environ.get(
+        "FLEET_READINESS_STRICT", strict_default,
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _replicas(name: str, default: str) -> int:
+        try:
+            return max(int(os.environ.get(name, default) or default), 0)
+        except (TypeError, ValueError):
+            return int(default)
+
+    return strict, {
+        "worker": _replicas("EXPECTED_WORKER_REPLICAS", worker_default),
+        "short_worker": _replicas(
+            "EXPECTED_SHORT_WORKER_REPLICAS", short_default,
+        ),
+    }
+
+
+def worker_fleet_coherence(
+    release_rows: list[dict],
+    api_release: str,
+    api_protocol: int,
+    expected_service_counts: dict[str, int] | None = None,
+) -> dict:
     """Pure deploy-gate contract shared by health and focused tests."""
     expected = {"transcription", "bg_preview", "enterprise", "default"}
     advertised = {
@@ -312,12 +351,36 @@ def worker_fleet_coherence(release_rows: list[dict], api_release: str,
     protocol_match = bool(release_rows) and all(
         row.get("rq_payload_version") == api_protocol for row in release_rows
     )
+    service_counts: dict[str, int] = {}
+    for row in release_rows:
+        service = _fleet_service_name(row.get("service"))
+        service_counts[service] = service_counts.get(service, 0) + 1
+    normalized_expected = {
+        _fleet_service_name(service): max(int(count), 0)
+        for service, count in (expected_service_counts or {}).items()
+        if int(count) > 0
+    }
+    under_replicated = {
+        service: {
+            "expected": expected_count,
+            "actual": service_counts.get(service, 0),
+        }
+        for service, expected_count in normalized_expected.items()
+        if service_counts.get(service, 0) < expected_count
+    }
     missing = sorted(expected - advertised)
     return {
-        "coherent": bool(release_match and protocol_match and not missing),
+        "coherent": bool(
+            release_match
+            and protocol_match
+            and not missing
+            and not under_replicated
+        ),
         "missing_queues": missing,
         "release_match": release_match,
         "protocol_match": protocol_match,
+        "service_counts": service_counts,
+        "under_replicated": under_replicated,
     }
 
 
@@ -438,10 +501,8 @@ def health_snapshot() -> dict:
                     except Exception:
                         queues[qname] = -1
                 snap["queue_depth"] = queues
-                fleet_strict_default = "1" if is_prod else "0"
-                fleet_strict = os.environ.get(
-                    "FLEET_READINESS_STRICT", fleet_strict_default,
-                ).strip().lower() in {"1", "true", "yes", "on"}
+                fleet_strict, expected_service_counts = _fleet_readiness_config()
+                snap["fleet_readiness_strict"] = fleet_strict
                 try:
                     workers = Worker.all(connection=r)
                     snap["workers_alive"] = len(workers)
@@ -472,11 +533,14 @@ def health_snapshot() -> dict:
                         release_rows,
                         str(snap.get("release") or ""),
                         int(snap.get("rq_payload_version") or 0),
+                        expected_service_counts=expected_service_counts,
                     )
                     snap["fleet_coherent"] = fleet["coherent"]
                     snap["fleet_missing_queues"] = fleet["missing_queues"]
                     snap["fleet_release_match"] = fleet["release_match"]
                     snap["fleet_protocol_match"] = fleet["protocol_match"]
+                    snap["fleet_service_counts"] = fleet["service_counts"]
+                    snap["fleet_under_replicated"] = fleet["under_replicated"]
                     if not snap["fleet_coherent"]:
                         if fleet_strict:
                             _down("worker_fleet_incoherent", allow_starting=False)
@@ -552,6 +616,7 @@ def health_snapshot() -> dict:
             snap["r2"] = "ready" if storage.warmup() else "configured"
             ok, ms, err = storage.probe_r2()
             snap["r2_probe_ms"] = ms
+            snap["r2_circuit_breaker"] = storage.health_probe_state()
             if not ok:
                 snap["r2_probe_error"] = err
                 _degrade("r2_probe_failed")

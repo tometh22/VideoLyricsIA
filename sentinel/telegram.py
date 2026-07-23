@@ -42,9 +42,10 @@ async def send(text: str, buttons: list[list[dict]] | None = None,
                chat_id: str | None = None) -> int | None:
     """Manda a todos los chats del allowlist (o a uno). Devuelve el message_id
     del último envío (para mapear replies → incidente)."""
+    safe_text = redact(text)
     targets = [chat_id] if chat_id else sorted(config.TELEGRAM_ALLOWED_CHAT_IDS)
     if not targets or not config.TELEGRAM_BOT_TOKEN:
-        logger.info("telegram deshabilitado — %s", text[:120])
+        logger.info("telegram deshabilitado — %s", safe_text[:120])
         return None
     payload: dict = {"parse_mode": "HTML", "disable_web_page_preview": True}
     if buttons:
@@ -54,7 +55,7 @@ async def send(text: str, buttons: list[list[dict]] | None = None,
         for t in targets:
             try:
                 r = await client.post(_api_url("sendMessage"),
-                                      data={**payload, "chat_id": t, "text": text})
+                                      data={**payload, "chat_id": t, "text": safe_text})
                 body = r.json()
                 if body.get("ok"):
                     last_id = body["result"]["message_id"]

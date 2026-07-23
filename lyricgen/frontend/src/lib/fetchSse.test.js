@@ -13,7 +13,10 @@ function streamResponse(chunks, init = {}) {
 }
 
 describe("fetchSse", () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
 
   it("uses Bearer auth and incrementally parses message and named events", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(streamResponse([
@@ -46,6 +49,50 @@ describe("fetchSse", () => {
       token: "expired",
       maxRetries: 2,
     })).rejects.toBeInstanceOf(SseUnauthorizedError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-arms the watchdog after data and aborts a stream that later freezes", async () => {
+    vi.useFakeTimers();
+    const encoder = new TextEncoder();
+    let reads = 0;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (_url, { signal }) => ({
+        ok: true,
+        status: 200,
+        body: {
+          getReader: () => ({
+            read: () => {
+              reads += 1;
+              if (reads === 1) {
+                return Promise.resolve({
+                  value: encoder.encode('data: {"status":"processing"}\n\n'),
+                  done: false,
+                });
+              }
+              return new Promise((_resolve, reject) => {
+                signal.addEventListener("abort", () => {
+                  reject(new DOMException("Aborted", "AbortError"));
+                }, { once: true });
+              });
+            },
+          }),
+        },
+      }),
+    );
+    const messages = [];
+    const pending = fetchSse("/events/job-1", {
+      token: "access-secret",
+      onMessage: (data) => messages.push(data),
+      watchdogMs: 100,
+      maxRetries: 0,
+    });
+    const rejected = expect(pending).rejects.toMatchObject({ name: "AbortError" });
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(messages).toEqual([{ status: "processing" }]);
+    await vi.advanceTimersByTimeAsync(101);
+    await rejected;
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

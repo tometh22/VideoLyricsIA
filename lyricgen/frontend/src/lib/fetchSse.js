@@ -36,8 +36,12 @@ export async function fetchSse(url, {
     const relayAbort = () => controller.abort();
     signal?.addEventListener("abort", relayAbort, { once: true });
     let watchdog = null;
-    try {
+    const armWatchdog = () => {
+      clearTimeout(watchdog);
       watchdog = setTimeout(() => controller.abort("sse_watchdog"), watchdogMs);
+    };
+    try {
+      armWatchdog();
       const response = await fetch(url, {
         headers: {
           Accept: "text/event-stream",
@@ -63,7 +67,6 @@ export async function fetchSse(url, {
           eventName = "message";
           return;
         }
-        clearTimeout(watchdog);
         const raw = dataLines.join("\n");
         dataLines = [];
         const name = eventName || "message";
@@ -76,6 +79,7 @@ export async function fetchSse(url, {
 
       while (!signal?.aborted) {
         const { value, done } = await reader.read();
+        if (value?.length) armWatchdog();
         buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
         const lines = buffer.split(/\r?\n/);
         buffer = lines.pop() || "";
