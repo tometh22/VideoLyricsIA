@@ -26,6 +26,10 @@ def test_api_deployment_contract():
     assert cfg["deploy"]["healthcheckPath"] == "/health/ready"
     assert cfg["deploy"]["numReplicas"] == 2
     assert cfg["deploy"]["drainingSeconds"] == 1200
+    start = cfg["deploy"]["startCommand"]
+    assert start.startswith("sh -c ")
+    assert 'exec uvicorn main:app' in start
+    assert '--port "$PORT"' in start
 
 
 def test_worker_deployment_contracts_share_image_without_http_healthcheck():
