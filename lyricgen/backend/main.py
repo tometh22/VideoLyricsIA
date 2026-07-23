@@ -79,6 +79,7 @@ from auth import (
     scenes_credit_cost,
     telemetry_enabled,
     generate_api_key,
+    is_explicitly_local_environment,
     is_super_admin,
 )
 import storage
@@ -824,8 +825,9 @@ def _background_asset_is_available(asset: "BackgroundAsset") -> bool:
     filename = asset.filename or ""
     if filename.startswith("library/"):
         # Tests/dev may model R2 rows without credentials. Deployed
-        # environments must never advertise an object they cannot fetch.
-        return storage.is_enabled() or ENVIRONMENT not in ("staging", "production")
+        # or unknown environments must never advertise an object they
+        # cannot fetch. Unknown values fail closed to cover config typos.
+        return storage.is_enabled() or is_explicitly_local_environment(ENVIRONMENT)
     local_path = _legacy_background_path(filename)
     return bool(local_path and os.path.isfile(local_path))
 

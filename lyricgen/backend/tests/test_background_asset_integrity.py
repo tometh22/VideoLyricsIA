@@ -124,12 +124,17 @@ def test_tenant_admin_does_not_bypass_asset_scope():
     assert main._user_can_use_asset(other_tenant_asset, tenant_admin) is False
 
 
-def test_r2_asset_is_unavailable_when_deployed_without_storage(monkeypatch):
+@pytest.mark.parametrize(
+    "environment", ["staging", "production", "prod", "preview", "prodution"]
+)
+def test_r2_asset_is_unavailable_when_deployed_without_storage(
+    monkeypatch, environment,
+):
     import main
     import storage
     from types import SimpleNamespace
 
-    monkeypatch.setattr(main, "ENVIRONMENT", "staging")
+    monkeypatch.setattr(main, "ENVIRONMENT", environment)
     monkeypatch.setattr(storage, "is_enabled", lambda: False)
     asset = SimpleNamespace(filename="library/global/example.mp4")
     assert main._background_asset_is_available(asset) is False

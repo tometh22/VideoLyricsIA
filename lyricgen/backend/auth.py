@@ -247,6 +247,20 @@ def _super_admin_allowlist() -> set:
     return {x.strip().lower() for x in raw.split(",") if x.strip()}
 
 
+def is_explicitly_local_environment(environment: Optional[str] = None) -> bool:
+    """Return true only for a small allowlist of non-deployed environments."""
+    value = environment
+    if value is None:
+        value = (
+            os.environ.get("ENVIRONMENT")
+            or os.environ.get("ENV")
+            or "production"
+        )
+    return value.strip().lower() in {
+        "dev", "development", "test", "testing", "local"
+    }
+
+
 def is_super_admin(username, email, role) -> bool:
     """Mismo criterio que admin.require_super_admin, como predicado puro.
 
@@ -259,12 +273,7 @@ def is_super_admin(username, email, role) -> bool:
         return False
     allow = _super_admin_allowlist()
     if not allow:
-        environment = (
-            os.environ.get("ENVIRONMENT")
-            or os.environ.get("ENV")
-            or "production"
-        ).strip().lower()
-        return environment in {"dev", "development", "test", "testing", "local"}
+        return is_explicitly_local_environment()
     return (username or "").lower() in allow or (email or "").lower() in allow
 
 

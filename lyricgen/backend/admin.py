@@ -21,6 +21,7 @@ from auth import (
     pwd_context,
     telemetry_enabled,
     validate_password_strength,
+    is_explicitly_local_environment,
     is_super_admin,
 )
 from database import User, Job, Invoice, AuditLog, AIProvenance, AssetUsage, BackgroundAsset, UserSession, LoginSession, get_db
@@ -71,12 +72,7 @@ def require_super_admin(current_user: dict = Depends(get_current_user)):
 
 def _requires_durable_background_storage() -> bool:
     """Only explicitly local environments may persist catalogue files locally."""
-    environment = (
-        os.environ.get("ENVIRONMENT")
-        or os.environ.get("ENV")
-        or "production"
-    ).strip().lower()
-    return environment not in {"dev", "development", "test", "testing", "local"}
+    return not is_explicitly_local_environment()
 
 
 class SubmissionsControlRequest(BaseModel):
