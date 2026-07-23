@@ -346,7 +346,20 @@ export default function UploadZone({
       const parsed = JSON.parse(raw);
       // Merge keeps any future fields safe-defaulted when the user has an
       // older saved object missing the new key.
-      return { ...HARDCODED_BATCH_DEFAULTS, ...parsed };
+      //
+      // PERO el "Mi prompt" (backgroundHint + bgVerbatim) es POR-CANCIÓN, no
+      // un sticky de estilo: un prompt de escena que el operador escribió para
+      // una canción reaparecía en el batch SIGUIENTE (y se aplicaba a temas que
+      // no le pegan, o forzaba el modo "Mi prompt" sin querer). Persistimos los
+      // sticky de estilo (tipografía/tamaño/movimiento/case/…) pero forzamos el
+      // prompt LIMPIO en cada carga. El override va DESPUÉS del spread de
+      // `parsed`, así también limpia el localStorage ya contaminado.
+      return {
+        ...HARDCODED_BATCH_DEFAULTS,
+        ...parsed,
+        backgroundHint: HARDCODED_BATCH_DEFAULTS.backgroundHint,
+        bgVerbatim: HARDCODED_BATCH_DEFAULTS.bgVerbatim,
+      };
     } catch {
       return HARDCODED_BATCH_DEFAULTS;
     }
