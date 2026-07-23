@@ -35,13 +35,14 @@ export async function persistSegments(authFetch, API, jobId, segments, opts = {}
       jobId, count: _fixed.length, sample: _fixed.slice(0, 3),
     });
   }
-  // Canario [drag-persist] del reseed-storm (se remueve en PR G junto a la
-  // causa, NO antes — es la señal que confirma que el storm quedó silenciado).
+  // The reseed-storm is covered by the segments store canary now. This
+  // routine breadcrumb remains useful locally but must not become a Sentry
+  // warn-level issue on every save.
   const _sample = safeSegments.slice(0, 2).map((s) => ({
     start: Math.round((s.start || 0) * 1000) / 1000,
     end: Math.round((s.end || 0) * 1000) / 1000,
   }));
-  console.warn("[drag-persist] POST", { jobId, count: safeSegments.length, sample: _sample });
+  console.info("[drag-persist] POST", { jobId, count: safeSegments.length, sample: _sample });
   try {
     let baseRevision = Number.isInteger(opts.baseRevision) ? opts.baseRevision : 0;
     // A conflict overwrite is always based on a fresh server read.  Reusing

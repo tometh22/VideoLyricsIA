@@ -709,8 +709,13 @@ def multipart_complete(
             MultipartUpload={"Parts": sorted_parts},
         )
     except Exception as exc:
-        logger.error(
-            "multipart_complete failed key=%r upload_id=%r: %s",
+        # The caller reconciles this with head_object_size: a durable object
+        # means an idempotent success after a duplicate CompleteMultipart call.
+        # Keep the traceback locally without turning every recovered
+        # NoSuchUpload into a standalone Sentry issue.
+        logger.warning(
+            "multipart_complete failed key=%r upload_id=%r: %s "
+            "(caller reconciles via head_object_size)",
             key, upload_id, exc, exc_info=True,
         )
         return None

@@ -393,6 +393,36 @@ def test_multipart_complete_dead_upload_clears_id_and_asks_reupload(client, monk
         s.close()
 
 
+def test_multipart_complete_failure_logs_warning_not_error(monkeypatch, caplog):
+    """A recoverable duplicate complete stays below Sentry's ERROR capture."""
+    import logging
+    import storage
+
+    class FakeClient:
+        def complete_multipart_upload(self, **kwargs):
+            raise Exception(
+                "NoSuchUpload: the specified multipart upload does not exist"
+            )
+
+    monkeypatch.setattr(storage, "R2_BUCKET", "test-bucket")
+    monkeypatch.setattr(storage, "_get_client", lambda: FakeClient())
+
+    with caplog.at_level(logging.DEBUG, logger="genly.storage"):
+        result = storage.multipart_complete(
+            "inputs/t/j/z.wav",
+            "upload-id",
+            [{"PartNumber": 1, "ETag": '"abc"'}],
+        )
+
+    assert result is None
+    records = [
+        record for record in caplog.records
+        if "multipart_complete failed" in record.message
+    ]
+    assert records
+    assert all(record.levelno == logging.WARNING for record in records)
+
+
 def test_multipart_abort_is_idempotent(client, monkeypatch):
     """Two consecutive aborts return 200 and don't error — the abort
     button should be safe to mash."""
