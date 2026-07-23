@@ -8673,6 +8673,7 @@ async def download(
                 from queue_jobs import enqueue_prores_prewarm, SubmissionsPausedError
                 enqueue_prores_prewarm(job_id, file_type)
             except SubmissionsPausedError as exc:
+                from ops_control import get_submissions_state
                 state = get_submissions_state()
                 return JSONResponse(
                     status_code=503,

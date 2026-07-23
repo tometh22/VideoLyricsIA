@@ -704,7 +704,7 @@ def update_job(job_id: str, **kwargs) -> None:
             and int(getattr(job, "segments_revision", 0) or 0) > 0
             and kwargs["segments_json"] != job.segments_json
         ):
-            logger.warning(
+            _logger.warning(
                 "[segments-occ] ignored background overwrite job=%s revision=%s",
                 job_id, job.segments_revision,
             )
