@@ -247,19 +247,33 @@ def _super_admin_allowlist() -> set:
     return {x.strip().lower() for x in raw.split(",") if x.strip()}
 
 
+def is_explicitly_local_environment(environment: Optional[str] = None) -> bool:
+    """Return true only for a small allowlist of non-deployed environments."""
+    value = environment
+    if value is None:
+        value = (
+            os.environ.get("ENVIRONMENT")
+            or os.environ.get("ENV")
+            or "production"
+        )
+    return value.strip().lower() in {
+        "dev", "development", "test", "testing", "local"
+    }
+
+
 def is_super_admin(username, email, role) -> bool:
     """Mismo criterio que admin.require_super_admin, como predicado puro.
 
-    Sin SUPER_ADMIN_USERS seteado (dev/tests/staging) todo admin es super
-    admin — debe coincidir EXACTO con el fallback del gate del backend
-    para que el sidebar del frontend nunca muestre una sección que después
-    responde 403 (ni la esconda cuando respondería 200).
+    Only explicitly local environments preserve the convenient admin
+    fallback. Every deployed or unknown value fails closed when the
+    allowlist is missing, so a typo can never promote every tenant admin
+    to platform operator.
     """
     if role != "admin":
         return False
     allow = _super_admin_allowlist()
     if not allow:
-        return True
+        return is_explicitly_local_environment()
     return (username or "").lower() in allow or (email or "").lower() in allow
 
 
@@ -1022,7 +1036,9 @@ def verify_media_token(token: str, job_id: str, file_type: str, db: Session) -> 
     return {
         "id": user.id,
         "username": user.username,
+        "email": user.email,
         "role": user.role,
+        "is_super_admin": is_super_admin(user.username, user.email, user.role),
         "tenant_id": user.tenant_id,
         "plan": user.plan_id,
     }

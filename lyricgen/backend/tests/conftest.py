@@ -78,6 +78,24 @@ def setup_db():
         pass
 
 
+@pytest.fixture(scope="session", autouse=True)
+def isolate_background_library(tmp_path_factory):
+    """Keep admin-upload fixtures out of the tracked render-asset directory."""
+    import admin
+    import main
+
+    test_library = str(tmp_path_factory.mktemp("background-library"))
+    original_admin_dir = admin.BACKGROUNDS_DIR
+    original_main_dir = main._BACKGROUNDS_LIB
+    admin.BACKGROUNDS_DIR = test_library
+    main._BACKGROUNDS_LIB = test_library
+    try:
+        yield
+    finally:
+        admin.BACKGROUNDS_DIR = original_admin_dir
+        main._BACKGROUNDS_LIB = original_main_dir
+
+
 @pytest.fixture
 def db():
     """Yield a DB session, roll back after each test."""

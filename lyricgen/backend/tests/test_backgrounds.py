@@ -2,7 +2,36 @@
 
 import io
 import os
+import subprocess
+import pytest
 from tests.conftest import auth
+
+
+@pytest.fixture(scope="module")
+def valid_mp4_bytes(tmp_path_factory):
+    """Small real MP4: admin validation deliberately uses ffprobe."""
+    output = tmp_path_factory.mktemp("background-fixtures") / "valid.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=blue:s=16x16:r=10:d=2",
+            "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            str(output),
+        ],
+        check=True,
+        timeout=20,
+    )
+    return output.read_bytes()
+
+
+@pytest.fixture(scope="module")
+def valid_jpeg_bytes():
+    from PIL import Image
+
+    output = io.BytesIO()
+    Image.new("RGB", (16, 16), color="blue").save(output, format="JPEG")
+    return output.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -16,10 +45,10 @@ def test_list_backgrounds_empty(client, admin_token):
     assert res.json() == []
 
 
-def test_admin_upload_background(client, admin_token):
+def test_admin_upload_background(client, admin_token, valid_mp4_bytes):
     """Admin can upload a background asset."""
-    # Create a small fake MP4 file (just bytes, not a real video)
-    fake_video = io.BytesIO(b"\x00" * 1024)
+    # Minimal ISO-BMFF header accepted by the upload integrity gate.
+    fake_video = io.BytesIO(valid_mp4_bytes)
     res = client.post(
         "/admin/backgrounds",
         headers=auth(admin_token),
@@ -35,9 +64,9 @@ def test_admin_upload_background(client, admin_token):
     return data["id"]
 
 
-def test_admin_upload_background_jpg(client, admin_token):
+def test_admin_upload_background_jpg(client, admin_token, valid_jpeg_bytes):
     """Admin can upload a JPG background."""
-    fake_img = io.BytesIO(b"\xff\xd8\xff" + b"\x00" * 512)
+    fake_img = io.BytesIO(valid_jpeg_bytes)
     res = client.post(
         "/admin/backgrounds",
         headers=auth(admin_token),
@@ -58,6 +87,133 @@ def test_admin_upload_background_invalid_type(client, admin_token):
         data={"name": "Bad File", "tags": ""},
     )
     assert res.status_code == 400
+
+
+def test_admin_upload_background_rejects_corrupt_mp4(client, admin_token):
+    """An extension alone must never make malformed media selectable."""
+    res = client.post(
+        "/admin/backgrounds",
+        headers=auth(admin_token),
+        files={"file": ("corrupt.mp4", io.BytesIO(b"\x00" * 1024), "video/mp4")},
+        data={"name": "Corrupt", "tags": ""},
+    )
+    assert res.status_code == 400
+    assert "magic bytes" in res.json()["detail"]
+
+
+def test_admin_upload_background_rejects_truncated_mp4(
+    client, admin_token, valid_mp4_bytes,
+):
+    """Faststart metadata may probe cleanly while full frame decode fails."""
+    truncated = valid_mp4_bytes[: int(len(valid_mp4_bytes) * 0.70)]
+    res = client.post(
+        "/admin/backgrounds",
+        headers=auth(admin_token),
+        files={"file": ("truncated.mp4", io.BytesIO(truncated), "video/mp4")},
+        data={"name": "Truncated", "tags": ""},
+    )
+    assert res.status_code == 400
+    assert "decoded" in res.json()["detail"]
+
+
+def test_admin_upload_background_fails_closed_when_r2_upload_fails(
+    client, admin_token, monkeypatch, valid_mp4_bytes,
+):
+    """Configured object storage cannot degrade to one replica's local disk."""
+    import storage
+
+    monkeypatch.setattr(storage, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        storage,
+        "upload_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("r2 down")),
+    )
+    res = client.post(
+        "/admin/backgrounds",
+        headers=auth(admin_token),
+        files={"file": ("valid.mp4", io.BytesIO(valid_mp4_bytes), "video/mp4")},
+        data={"name": "Must not persist", "tags": ""},
+    )
+    assert res.status_code == 503
+    assert "storage" in res.json()["detail"].lower()
+
+
+def test_admin_upload_background_requires_r2_in_production(
+    client, admin_token, monkeypatch, valid_mp4_bytes, db,
+):
+    """Missing R2 config cannot create a replica-local production row."""
+    from database import BackgroundAsset
+    import storage
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("SUPER_ADMIN_USERS", "admin")
+    monkeypatch.setattr(storage, "is_enabled", lambda: False)
+    before = db.query(BackgroundAsset).filter(
+        BackgroundAsset.name == "No local production fallback"
+    ).count()
+    res = client.post(
+        "/admin/backgrounds",
+        headers=auth(admin_token),
+        files={"file": ("valid.mp4", io.BytesIO(valid_mp4_bytes), "video/mp4")},
+        data={"name": "No local production fallback", "tags": ""},
+    )
+    db.expire_all()
+    after = db.query(BackgroundAsset).filter(
+        BackgroundAsset.name == "No local production fallback"
+    ).count()
+    assert res.status_code == 503
+    assert "not configured" in res.json()["detail"]
+    assert before == after == 0
+
+
+def test_tenant_admin_cannot_manage_global_background_library(
+    client, admin_token, monkeypatch,
+):
+    """A tenant admin is not a platform library curator."""
+    monkeypatch.setenv("SUPER_ADMIN_USERS", "platform-owner@example.test")
+    res = client.get("/admin/backgrounds", headers=auth(admin_token))
+    assert res.status_code == 403
+    assert "Super admin" in res.json()["detail"]
+
+
+def test_missing_super_admin_allowlist_fails_closed_in_production(
+    client, admin_token, monkeypatch,
+):
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.delenv("SUPER_ADMIN_USERS", raising=False)
+    res = client.get("/admin/backgrounds", headers=auth(admin_token))
+    assert res.status_code == 403
+    assert "Super admin" in res.json()["detail"]
+
+
+@pytest.mark.parametrize("environment", ["prod", "preview", "prodution"])
+def test_missing_super_admin_allowlist_fails_closed_outside_explicit_local_envs(
+    client, admin_token, monkeypatch, environment,
+):
+    monkeypatch.setenv("ENVIRONMENT", environment)
+    monkeypatch.delenv("SUPER_ADMIN_USERS", raising=False)
+    res = client.get("/admin/backgrounds", headers=auth(admin_token))
+    assert res.status_code == 403
+    assert "Super admin" in res.json()["detail"]
+
+
+@pytest.mark.parametrize("environment", ["prod", "preview", "prodution"])
+def test_background_upload_requires_r2_outside_explicit_local_envs(
+    client, admin_token, monkeypatch, valid_mp4_bytes, environment,
+):
+    import storage
+
+    monkeypatch.setenv("ENVIRONMENT", environment)
+    monkeypatch.setenv("SUPER_ADMIN_USERS", "admin")
+    monkeypatch.setattr(storage, "is_enabled", lambda: False)
+    res = client.post(
+        "/admin/backgrounds",
+        headers=auth(admin_token),
+        files={"file": ("valid.mp4", io.BytesIO(valid_mp4_bytes), "video/mp4")},
+        data={"name": "Must use durable storage", "tags": ""},
+    )
+    assert res.status_code == 503
+    assert "not configured" in res.json()["detail"]
 
 
 def test_list_backgrounds_after_upload(client, admin_token):
@@ -152,14 +308,16 @@ def test_r2_background_preview_url_matches_scoped_token_ttl(
     assert calls == [(asset.filename, MEDIA_TOKEN_EXPIRE_SECONDS)]
 
 
-def test_inactive_background_is_hidden_from_regular_preview(client, admin_token, user_token):
+def test_inactive_background_is_hidden_from_regular_preview(
+    client, admin_token, user_token, valid_jpeg_bytes,
+):
     from auth import create_media_token
     from database import BackgroundAsset, SessionLocal, User
 
     uploaded = client.post(
         "/admin/backgrounds",
         headers=auth(admin_token),
-        files={"file": ("inactive.jpg", io.BytesIO(b"\xff\xd8\xff" + b"\x00" * 32), "image/jpeg")},
+        files={"file": ("inactive.jpg", io.BytesIO(valid_jpeg_bytes), "image/jpeg")},
         data={"name": "Inactive", "tags": ""},
     )
     assert uploaded.status_code == 200
@@ -190,13 +348,16 @@ def test_inactive_background_is_hidden_from_regular_preview(client, admin_token,
         "/backgrounds/preview-tokens",
         json={"asset_ids": [asset_id]}, headers=auth(admin_token),
     )
-    assert str(asset_id) in admin_issued.json()["tokens"]
+    admin_token_scoped = admin_issued.json()["tokens"][str(asset_id)]
+    assert client.get(
+        f"/backgrounds/{asset_id}/preview?token={admin_token_scoped}",
+    ).status_code == 200
 
 
-def test_delete_background(client, admin_token):
+def test_delete_background(client, admin_token, valid_mp4_bytes):
     """Admin can delete a background."""
     # Upload one to delete
-    fake = io.BytesIO(b"\x00" * 256)
+    fake = io.BytesIO(valid_mp4_bytes)
     upload_res = client.post(
         "/admin/backgrounds",
         headers=auth(admin_token),
@@ -425,10 +586,12 @@ def test_unauthorized_user_blocked_from_generate(client, unauthorized_user_token
     assert res.status_code == 403
 
 
-def test_library_background_bypasses_ai_auth(client, admin_token, unauthorized_user_token):
+def test_library_background_bypasses_ai_auth(
+    client, admin_token, unauthorized_user_token, valid_mp4_bytes,
+):
     """Using a library background skips AI auth check (no AI generation needed)."""
     # Upload a background as admin
-    fake_bg = io.BytesIO(b"\x00" * 512)
+    fake_bg = io.BytesIO(valid_mp4_bytes)
     bg_res = client.post(
         "/admin/backgrounds",
         headers=auth(admin_token),
