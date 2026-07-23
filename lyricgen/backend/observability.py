@@ -307,6 +307,32 @@ def _fleet_service_name(value: object) -> str:
     return compact or "unknown"
 
 
+def _fleet_readiness_config(environment: str | None = None) -> tuple[bool, dict[str, int]]:
+    """Durable readiness defaults for shared staging/production fleets."""
+    managed = (environment or ENV).strip().lower() in {
+        "staging", "stage", "prod", "production",
+    }
+    strict_default = "1" if managed else "0"
+    worker_default = "7" if managed else "0"
+    short_default = "3" if managed else "0"
+    strict = os.environ.get(
+        "FLEET_READINESS_STRICT", strict_default,
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _replicas(name: str, default: str) -> int:
+        try:
+            return max(int(os.environ.get(name, default) or default), 0)
+        except (TypeError, ValueError):
+            return int(default)
+
+    return strict, {
+        "worker": _replicas("EXPECTED_WORKER_REPLICAS", worker_default),
+        "short_worker": _replicas(
+            "EXPECTED_SHORT_WORKER_REPLICAS", short_default,
+        ),
+    }
+
+
 def worker_fleet_coherence(
     release_rows: list[dict],
     api_release: str,
@@ -475,10 +501,7 @@ def health_snapshot() -> dict:
                     except Exception:
                         queues[qname] = -1
                 snap["queue_depth"] = queues
-                fleet_strict_default = "1" if is_prod else "0"
-                fleet_strict = os.environ.get(
-                    "FLEET_READINESS_STRICT", fleet_strict_default,
-                ).strip().lower() in {"1", "true", "yes", "on"}
+                fleet_strict, expected_service_counts = _fleet_readiness_config()
                 snap["fleet_readiness_strict"] = fleet_strict
                 try:
                     workers = Worker.all(connection=r)
@@ -510,16 +533,7 @@ def health_snapshot() -> dict:
                         release_rows,
                         str(snap.get("release") or ""),
                         int(snap.get("rq_payload_version") or 0),
-                        expected_service_counts={
-                            "worker": int(
-                                os.environ.get("EXPECTED_WORKER_REPLICAS", "0") or 0
-                            ),
-                            "short_worker": int(
-                                os.environ.get(
-                                    "EXPECTED_SHORT_WORKER_REPLICAS", "0"
-                                ) or 0
-                            ),
-                        },
+                        expected_service_counts=expected_service_counts,
                     )
                     snap["fleet_coherent"] = fleet["coherent"]
                     snap["fleet_missing_queues"] = fleet["missing_queues"]

@@ -98,3 +98,33 @@ def test_worker_fleet_gate_enforces_expected_service_cardinality():
     assert missing_short["under_replicated"] == {
         "short_worker": {"expected": 3, "actual": 2}
     }
+
+
+def test_staging_and_production_default_to_strict_7_plus_3(monkeypatch):
+    from observability import _fleet_readiness_config
+
+    for name in (
+        "FLEET_READINESS_STRICT",
+        "EXPECTED_WORKER_REPLICAS",
+        "EXPECTED_SHORT_WORKER_REPLICAS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert _fleet_readiness_config("staging") == (
+        True, {"worker": 7, "short_worker": 3},
+    )
+    assert _fleet_readiness_config("production") == (
+        True, {"worker": 7, "short_worker": 3},
+    )
+    assert _fleet_readiness_config("test") == (
+        False, {"worker": 0, "short_worker": 0},
+    )
+
+
+def test_staging_strict_gate_can_be_disabled_only_explicitly(monkeypatch):
+    from observability import _fleet_readiness_config
+
+    monkeypatch.setenv("FLEET_READINESS_STRICT", "0")
+    strict, expected = _fleet_readiness_config("staging")
+    assert strict is False
+    assert expected == {"worker": 7, "short_worker": 3}

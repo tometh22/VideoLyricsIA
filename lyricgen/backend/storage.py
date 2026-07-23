@@ -114,6 +114,8 @@ _health_probe_failures = 0
 _health_circuit_open_until = 0.0
 _health_probe_last_result: tuple[bool, int, str | None] | None = None
 _health_probe_last_at = 0.0
+_health_probe_executor = None
+_health_probe_future = None
 
 
 def _health_breaker_failure_threshold() -> int:
@@ -144,7 +146,27 @@ def health_probe_state() -> dict:
         "state": "open" if remaining else "closed",
         "failures": _health_probe_failures,
         "retry_after_seconds": remaining,
+        "probe_inflight": bool(
+            _health_probe_future is not None
+            and not _health_probe_future.done()
+        ),
     }
+
+
+def _new_health_probe_executor():
+    from concurrent.futures import ThreadPoolExecutor
+
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="r2-probe")
+
+
+def _clear_health_probe_execution() -> None:
+    """Release a completed probe executor without waiting on its thread."""
+    global _health_probe_executor, _health_probe_future
+    executor = _health_probe_executor
+    _health_probe_executor = None
+    _health_probe_future = None
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _get_health_client():
@@ -195,6 +217,7 @@ def probe_r2() -> tuple[bool, int, str | None]:
     """
     global _health_client, _health_probe_failures, _health_circuit_open_until
     global _health_probe_last_result, _health_probe_last_at
+    global _health_probe_executor, _health_probe_future
     now = time.monotonic()
     if now < _health_circuit_open_until:
         remaining = max(1, int(_health_circuit_open_until - now))
@@ -209,22 +232,29 @@ def probe_r2() -> tuple[bool, int, str | None]:
     # will update the breaker for the next health snapshot.
     if not _health_probe_lock.acquire(blocking=False):
         return _health_probe_last_result or (False, 0, "probe_inflight")
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
+    from concurrent.futures import TimeoutError as _FutTimeout
     t0 = time.monotonic()
-    # OJO: sin context manager — `with ThreadPoolExecutor(...)` llama
-    # shutdown(wait=True) en el __exit__ y se quedaría esperando el
-    # head_bucket colgado, anulando el timeout.
-    _ex = None
+    keep_execution = False
     try:
+        # A previous hard-timeout may still be blocked inside urllib3 pool
+        # acquisition. Never start a second thread while it remains alive.
+        if _health_probe_future is not None:
+            if not _health_probe_future.done():
+                keep_execution = True
+                return _health_probe_last_result or (False, 0, "probe_inflight")
+            _clear_health_probe_execution()
+
         client = _get_health_client()
         if client is None:
             result = (False, 0, "not_configured")
             _health_probe_last_result = result
             _health_probe_last_at = time.monotonic()
             return result
-        _ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="r2-probe")
-        fut = _ex.submit(client.head_bucket, Bucket=R2_BUCKET)
-        fut.result(timeout=6)
+        _health_probe_executor = _new_health_probe_executor()
+        _health_probe_future = _health_probe_executor.submit(
+            client.head_bucket, Bucket=R2_BUCKET,
+        )
+        _health_probe_future.result(timeout=6)
         _health_probe_failures = 0
         _health_circuit_open_until = 0.0
         result = (True, int((time.monotonic() - t0) * 1000), None)
@@ -232,8 +262,12 @@ def probe_r2() -> tuple[bool, int, str | None]:
         _health_probe_last_at = time.monotonic()
         return result
     except _FutTimeout:
-        # El thread del head_bucket puede quedar vivo un rato más, pero
-        # el cliente (y su pool envenenado) se descarta acá mismo.
+        # Keep exactly one reference to the stuck execution. Later probes
+        # fail fast until it completes; they never accumulate more threads.
+        keep_execution = bool(
+            _health_probe_future is not None
+            and not _health_probe_future.done()
+        )
         _health_client = None
         _health_probe_failures += 1
         if _health_probe_failures >= _health_breaker_failure_threshold():
@@ -260,8 +294,8 @@ def probe_r2() -> tuple[bool, int, str | None]:
         _health_probe_last_at = time.monotonic()
         return result
     finally:
-        if _ex is not None:
-            _ex.shutdown(wait=False, cancel_futures=True)
+        if not keep_execution and _health_probe_future is not None:
+            _clear_health_probe_execution()
         _health_probe_lock.release()
 
 

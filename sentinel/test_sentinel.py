@@ -125,6 +125,22 @@ def test_sentry_context_is_redacted_before_agent_handoff(monkeypatch):
     assert "[REDACTED]" in context
 
 
+def test_sentry_context_redacts_before_truncating(monkeypatch):
+    import json
+
+    secret = "TOPSECRET0123456789"
+    monkeypatch.setenv("RAILWAY_API_TOKEN", secret)
+    payload = {"message": f"{'x' * 64}{secret}"}
+    raw = json.dumps(payload, ensure_ascii=False, default=str)
+    secret_start = raw.index(secret)
+    context = sentry_webhook.compact_context(
+        payload,
+        max_chars=secret_start + len(secret) - 2,
+    )
+    assert "TOPSECRET" not in context
+    assert "[REDACTED]" in context
+
+
 def test_railway_log_tail_redacts_context(monkeypatch):
     import asyncio
     import railway_logs
@@ -139,14 +155,17 @@ def test_railway_log_tail_redacts_context(monkeypatch):
     async def fake_gql(_query, _variables):
         return {"data": {"deploymentLogs": [{
             "timestamp": "2026-07-23T10:00:00Z",
-            "message": f"Authorization: Bearer {secret}",
+            # Put the secret across the left edge of tail()'s 6000-char
+            # window. Truncating first would retain only an unredactable
+            # suffix of the credential.
+            "message": f"prefix-{secret}-{'x' * 5990}",
         }]}}
 
     monkeypatch.setattr(railway_logs, "_latest_deployment_id", fake_latest)
     monkeypatch.setattr(railway_logs, "_gql", fake_gql)
     context = asyncio.run(railway_logs.tail("api"))
     assert secret not in context
-    assert "[REDACTED]" in context
+    assert secret[-10:] not in context
 
 
 def test_http_client_info_logging_is_disabled():

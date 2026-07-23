@@ -63,4 +63,4 @@ def compact_context(payload: dict, max_chars: int = 6000) -> str:
     Sentry manda stacktraces/tags adentro — es exactamente lo que el agente
     necesita para arrancar sin ir a buscar nada."""
     text = json.dumps(payload, ensure_ascii=False, default=str)
-    return redact(text[:max_chars])
+    return redact(text)[:max_chars]

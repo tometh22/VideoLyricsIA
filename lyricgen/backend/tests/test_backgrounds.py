@@ -113,6 +113,45 @@ def test_preview_background_not_found(client, admin_token):
     assert res.status_code == 404
 
 
+def test_r2_background_preview_url_matches_scoped_token_ttl(
+    client, admin_token, db, monkeypatch,
+):
+    from auth import MEDIA_TOKEN_EXPIRE_SECONDS
+    from database import BackgroundAsset
+    import storage
+
+    asset = BackgroundAsset(
+        name="R2 preview TTL",
+        filename="library/global/preview-ttl.jpg",
+        file_type="jpg",
+        is_active=True,
+    )
+    db.add(asset)
+    db.commit()
+    issued = client.post(
+        "/backgrounds/preview-tokens",
+        json={"asset_ids": [asset.id]},
+        headers=auth(admin_token),
+    )
+    token = issued.json()["tokens"][str(asset.id)]
+    calls = []
+    monkeypatch.setattr(storage, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        storage,
+        "generate_signed_url",
+        lambda key, expiry_seconds=900: calls.append(
+            (key, expiry_seconds)
+        ) or f"https://r2.fake/{key}",
+    )
+
+    response = client.get(
+        f"/backgrounds/{asset.id}/preview?token={token}",
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+    assert calls == [(asset.filename, MEDIA_TOKEN_EXPIRE_SECONDS)]
+
+
 def test_inactive_background_is_hidden_from_regular_preview(client, admin_token, user_token):
     from auth import create_media_token
     from database import BackgroundAsset, SessionLocal, User
