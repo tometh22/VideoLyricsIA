@@ -3,6 +3,7 @@
 import logging
 import os
 import shutil
+import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -1378,6 +1379,46 @@ async def upload_background(
     with open(local_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
+    # Validate bytes before the object becomes visible in the catalogue.
+    # The old endpoint trusted only the extension, which allowed the test
+    # fixtures (zero-filled ``.mp4`` files) and malformed uploads to become
+    # selectable production backgrounds.
+    from main import _validate_background_file_on_disk
+    _validate_background_file_on_disk(file.filename, local_path)
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_type",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                local_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        try:
+            os.unlink(local_path)
+        except OSError:
+            pass
+        logger.error("Background validation infrastructure failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Background validation is temporarily unavailable.",
+        ) from exc
+    if probe.returncode != 0 or "video" not in probe.stdout.split():
+        try:
+            os.unlink(local_path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=400,
+            detail="File could not be decoded as supported background media.",
+        )
+
     stored_filename = unique_basename
     if storage.is_enabled():
         r2_key = f"library/{unique_basename}"
@@ -1387,8 +1428,17 @@ async def upload_background(
             os.unlink(local_path)
         except Exception as e:
             logger.error(f"Failed to upload library asset to R2: {e}")
-            # Keep the local copy as a fallback. Filename stays as the
-            # bare basename so the read path uses the disk branch.
+            # A local fallback is not durable across Railway replicas or
+            # deploys. Fail closed and never create a DB row pointing at one
+            # container's ephemeral filesystem.
+            try:
+                os.unlink(local_path)
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=503,
+                detail="Background storage is temporarily unavailable.",
+            ) from e
 
     tenant_scope = (owner_tenant_id or "").strip() or None
     asset = BackgroundAsset(

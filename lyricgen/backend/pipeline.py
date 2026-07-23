@@ -10880,14 +10880,6 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         atmospherics_policy.get("authorization_source"),
     )
 
-    # If there are video files in backgrounds dir, use those instead
-    all_videos = []
-    if os.path.isdir(BACKGROUNDS_DIR):
-        for root, _, files in os.walk(BACKGROUNDS_DIR):
-            all_videos.extend(f for f in files if f.lower().endswith(".mp4"))
-    if all_videos:
-        return None
-
     _norm_move_bg = _normalize_movement_style(movement_style)
 
     # UMG-style fix (2026-05-25): si el operador eligió "Estático" o "Sutil"

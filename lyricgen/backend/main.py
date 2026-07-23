@@ -21,6 +21,14 @@ bootstrap_vertex_credentials()
 # mail to a real customer's inbox.
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "production"
 
+
+def _business_alerts_enabled() -> bool:
+    """Business/churn alerts are production-only unless explicitly enabled."""
+    configured = os.environ.get("BUSINESS_ALERTS_ENABLED")
+    if configured is not None:
+        return configured.strip().lower() in ("1", "true", "yes", "on")
+    return ENVIRONMENT == "production"
+
 # --- Sentry ---
 # 2026-06-01 UMG-launch hardening: the inline sentry_sdk.init() that used
 # to live here was being silently OVERRIDDEN by the second, lighter init
@@ -773,10 +781,16 @@ def on_startup():
                 _time.sleep(60)
             _time.sleep(24 * 3600)  # diario
 
-    threading.Thread(
-        target=_business_alerts_loop, daemon=True, name="business-alerts",
-    ).start()
-    logger.info("business-alerts thread started (daily)")
+    if _business_alerts_enabled():
+        threading.Thread(
+            target=_business_alerts_loop, daemon=True, name="business-alerts",
+        ).start()
+        logger.info("business-alerts thread started (daily)")
+    else:
+        logger.info(
+            "business-alerts disabled outside production "
+            "(set BUSINESS_ALERTS_ENABLED=1 to override)"
+        )
 
     # Tripwire de saturación del pool de Postgres — indicador LÍDER: avisa por
     # Sentry (→ Sentinel → Telegram) ANTES de que el pool se agote y tire el
