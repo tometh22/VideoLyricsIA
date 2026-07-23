@@ -1,5 +1,6 @@
 """Admin panel API for GenLy AI."""
 
+import asyncio
 import logging
 import os
 import shutil
@@ -67,6 +68,16 @@ def require_super_admin(current_user: dict = Depends(get_current_user)):
         if not (idents & allow):
             raise HTTPException(status_code=403, detail="Super admin access required")
     return current_user
+
+
+def _requires_durable_background_storage() -> bool:
+    """Deployed environments may never persist catalogue files locally."""
+    environment = (
+        os.environ.get("ENVIRONMENT")
+        or os.environ.get("ENV")
+        or "production"
+    ).strip().lower()
+    return environment in ("staging", "production")
 
 
 class SubmissionsControlRequest(BaseModel):
@@ -1302,7 +1313,7 @@ async def admin_activity_detail(
 @router.get("/backgrounds")
 async def list_backgrounds(
     owner_tenant_id: Optional[str] = Query(None),
-    admin: dict = Depends(require_admin),
+    admin: dict = Depends(require_super_admin),
     db: Session = Depends(get_db),
 ):
     """List all background assets.
@@ -1322,7 +1333,7 @@ async def list_backgrounds(
 
 @router.get("/background-tenants")
 async def list_background_tenants(
-    admin: dict = Depends(require_admin),
+    admin: dict = Depends(require_super_admin),
     db: Session = Depends(get_db),
 ):
     """List the tenants that have at least one user, plus the special
@@ -1342,7 +1353,7 @@ async def upload_background(
     name: str = Form(...),
     tags: str = Form(""),
     owner_tenant_id: str = Form(""),
-    admin: dict = Depends(require_admin),
+    admin: dict = Depends(require_super_admin),
     db: Session = Depends(get_db),
 ):
     """Upload a new pre-approved background asset.
@@ -1386,17 +1397,17 @@ async def upload_background(
     from main import _validate_background_file_on_disk
     _validate_background_file_on_disk(file.filename, local_path)
     try:
-        probe = subprocess.run(
+        probe = await asyncio.to_thread(
+            subprocess.run,
             [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=codec_type",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                local_path,
+                "ffmpeg", "-nostdin", "-v", "error", "-xerror",
+                "-i", local_path,
+                "-map", "0:v:0",
+                "-f", "null", "-",
             ],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=120,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -1409,7 +1420,7 @@ async def upload_background(
             status_code=503,
             detail="Background validation is temporarily unavailable.",
         ) from exc
-    if probe.returncode != 0 or "video" not in probe.stdout.split():
+    if probe.returncode != 0:
         try:
             os.unlink(local_path)
         except OSError:
@@ -1420,10 +1431,22 @@ async def upload_background(
         )
 
     stored_filename = unique_basename
-    if storage.is_enabled():
+    storage_enabled = storage.is_enabled()
+    if not storage_enabled and _requires_durable_background_storage():
+        try:
+            os.unlink(local_path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=503,
+            detail="Background storage is not configured.",
+        )
+    if storage_enabled:
         r2_key = f"library/{unique_basename}"
         try:
-            storage.upload_file(local_path, r2_key)
+            uploaded_key = storage.upload_file(local_path, r2_key)
+            if uploaded_key != r2_key:
+                raise RuntimeError("R2 upload did not confirm the object key")
             stored_filename = r2_key  # the `library/` prefix is the signal
             os.unlink(local_path)
         except Exception as e:
@@ -1471,7 +1494,7 @@ async def upload_background(
 @router.delete("/backgrounds/{asset_id}")
 async def delete_background(
     asset_id: int,
-    admin: dict = Depends(require_admin),
+    admin: dict = Depends(require_super_admin),
     db: Session = Depends(get_db),
 ):
     """Delete a background asset (DB row + the underlying object)."""
@@ -1482,12 +1505,21 @@ async def delete_background(
         raise HTTPException(status_code=404, detail="Asset not found")
 
     # Delete the underlying object — R2 if it lives there, local disk otherwise.
-    if asset.filename.startswith("library/") and storage.is_enabled():
+    if asset.filename.startswith("library/"):
+        if not storage.is_enabled():
+            raise HTTPException(
+                status_code=503,
+                detail="Background storage is not configured.",
+            )
         try:
             client = storage._get_client()
             client.delete_object(Bucket=storage.R2_BUCKET, Key=asset.filename)
         except Exception as e:
-            logger.warning(f"Failed to delete R2 object {asset.filename}: {e}")
+            logger.error(f"Failed to delete R2 object {asset.filename}: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail="Background storage is temporarily unavailable.",
+            ) from e
     else:
         file_path = os.path.join(BACKGROUNDS_DIR, asset.filename)
         if os.path.exists(file_path):

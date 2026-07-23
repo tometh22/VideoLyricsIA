@@ -808,11 +808,31 @@ def on_startup():
 _BACKGROUNDS_LIB = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
 
 
+def _legacy_background_path(filename: str) -> str | None:
+    """Resolve a legacy local asset without permitting path traversal."""
+    if not filename or os.path.basename(filename) != filename:
+        return None
+    library_root = os.path.realpath(_BACKGROUNDS_LIB)
+    candidate = os.path.realpath(os.path.join(library_root, filename))
+    if not candidate.startswith(library_root + os.sep):
+        return None
+    return candidate
+
+
+def _background_asset_is_available(asset: "BackgroundAsset") -> bool:
+    """Whether this API/worker topology can actually materialize an asset."""
+    filename = asset.filename or ""
+    if filename.startswith("library/"):
+        # Tests/dev may model R2 rows without credentials. Deployed
+        # environments must never advertise an object they cannot fetch.
+        return storage.is_enabled() or ENVIRONMENT not in ("staging", "production")
+    local_path = _legacy_background_path(filename)
+    return bool(local_path and os.path.isfile(local_path))
+
+
 def _user_can_use_asset(asset: "BackgroundAsset", current_user: dict) -> bool:
-    """Tenant gate for library assets. Admins see everything; everyone else
-    can only see assets that are global (owner_tenant_id IS NULL) or owned
-    by their own tenant. Backs the UMG exclusivity contract."""
-    if current_user.get("role") == "admin":
+    """Tenant gate: only platform super-admins bypass asset ownership."""
+    if current_user.get("is_super_admin"):
         return True
     if asset.owner_tenant_id is None:
         return True
@@ -820,10 +840,8 @@ def _user_can_use_asset(asset: "BackgroundAsset", current_user: dict) -> bool:
 
 
 def _apply_asset_tenant_filter(query, current_user: dict):
-    """Add a tenant scope to a BackgroundAsset query. Admins get the
-    unfiltered query back; everyone else gets `owner IS NULL OR owner = mine`.
-    """
-    if current_user.get("role") == "admin":
+    """Scope assets to global + caller tenant unless caller is super-admin."""
+    if current_user.get("is_super_admin"):
         return query
     from sqlalchemy import or_
     return query.filter(
@@ -847,10 +865,13 @@ def issue_background_preview_tokens(
     """Mint five-minute tokens for only the visible/authorized asset ids."""
     unique_ids = list(dict.fromkeys(body.asset_ids))
     query = db.query(BackgroundAsset).filter(BackgroundAsset.id.in_(unique_ids))
-    if current_user.get("role") != "admin":
+    if not current_user.get("is_super_admin"):
         query = query.filter(BackgroundAsset.is_active == True)
     assets = _apply_asset_tenant_filter(query, current_user).all()
-    visible = {asset.id for asset in assets}
+    visible = {
+        asset.id for asset in assets
+        if _background_asset_is_available(asset)
+    }
     user_model = db.query(User).filter(User.id == current_user["id"]).first()
     return {
         "tokens": {
@@ -870,14 +891,16 @@ def list_backgrounds(
 ):
     """List active pre-approved background assets visible to the caller.
 
-    Tenant scope: a non-admin user only sees assets either marked global
-    (owner_tenant_id IS NULL) or owned by their own tenant_id. Admins see
-    everything for moderation/audit.
+    Tenant scope: callers see global assets plus their own tenant's assets.
+    Only platform super-admins see cross-tenant inventory.
     """
     q = db.query(BackgroundAsset).filter(BackgroundAsset.is_active == True)
     q = _apply_asset_tenant_filter(q, current_user)
     assets = q.order_by(BackgroundAsset.created_at.desc()).all()
-    return [a.to_dict() for a in assets]
+    return [
+        asset.to_dict() for asset in assets
+        if _background_asset_is_available(asset)
+    ]
 
 
 @app.get("/backgrounds/{asset_id}/usage")
@@ -894,7 +917,9 @@ def background_usage(
     UI can distinguish "used as-is" from "used as variation source".
     """
     asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == asset_id).first()
-    if not asset or not _user_can_use_asset(asset, current_user):
+    if (not asset
+            or not _user_can_use_asset(asset, current_user)
+            or not _background_asset_is_available(asset)):
         raise HTTPException(status_code=404, detail="Asset not found")
 
     tenant_id = current_user["tenant_id"]
@@ -938,9 +963,12 @@ def backgrounds_usage_batch(
     int, así que FastAPI no lo captura como asset_id (path param int).
     """
     tenant_id = current_user["tenant_id"]
-    q = db.query(BackgroundAsset.id).filter(BackgroundAsset.is_active == True)  # noqa: E712
+    q = db.query(BackgroundAsset).filter(BackgroundAsset.is_active == True)  # noqa: E712
     q = _apply_asset_tenant_filter(q, current_user)
-    visible_ids = {row[0] for row in q.all()}
+    visible_ids = {
+        asset.id for asset in q.all()
+        if _background_asset_is_available(asset)
+    }
     if not visible_ids:
         return {"tenant_id": tenant_id, "usage": {}}
     rows = (
@@ -998,6 +1026,13 @@ def _resolve_library_background(
     if not _user_can_use_asset(asset, current_user):
         # Don't reveal whether the asset exists — same response as not found.
         raise HTTPException(status_code=404, detail="Background not found.")
+    if not _background_asset_is_available(asset):
+        logger.warning(
+            "background asset unavailable id=%s storage=%s",
+            asset.id,
+            "r2" if (asset.filename or "").startswith("library/") else "legacy_local",
+        )
+        raise HTTPException(status_code=404, detail="Background not found.")
 
     # Variation requires a video source — _extract_frame_from_video calls
     # ffprobe and explodes on stills. The UI hides the toggle for images,
@@ -1026,7 +1061,7 @@ def _resolve_library_background(
             bg_path = local_path
             bg_r2_key = asset.filename
     else:
-        local_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
+        local_path = _legacy_background_path(asset.filename)
         if background_mode == "variation":
             var_path = local_path
         else:
@@ -1094,23 +1129,26 @@ async def preview_background(
         asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == asset_id).first()
         if (not asset
                 or not _user_can_use_asset(asset, user)
-                or (user.get("role") != "admin" and not asset.is_active)):
+                or not _background_asset_is_available(asset)
+                or (not user.get("is_super_admin") and not asset.is_active)):
             raise HTTPException(status_code=404, detail="Asset not found")
         # Snapshot the fields we need before closing the session.
         asset_filename = asset.filename
         asset_file_type = asset.file_type
 
-    if asset_filename.startswith("library/") and storage.is_enabled():
+    if asset_filename.startswith("library/"):
+        if not storage.is_enabled():
+            raise HTTPException(status_code=503, detail="Asset storage unavailable")
         url = storage.generate_signed_url(
             asset_filename,
             expiry_seconds=MEDIA_TOKEN_EXPIRE_SECONDS,
         )
         if url:
             return RedirectResponse(url, status_code=302)
-        # If signing failed for any reason, fall through to local fallback.
+        raise HTTPException(status_code=503, detail="Asset preview unavailable")
 
-    file_path = os.path.join(_BACKGROUNDS_LIB, asset_filename)
-    if not os.path.exists(file_path):
+    file_path = _legacy_background_path(asset_filename)
+    if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
     media_type = "video/mp4" if asset_file_type == "mp4" else f"image/{asset_file_type}"
     return FileResponse(file_path, media_type=media_type)

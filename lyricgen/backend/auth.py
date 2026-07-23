@@ -1022,7 +1022,9 @@ def verify_media_token(token: str, job_id: str, file_type: str, db: Session) -> 
     return {
         "id": user.id,
         "username": user.username,
+        "email": user.email,
         "role": user.role,
+        "is_super_admin": is_super_admin(user.username, user.email, user.role),
         "tenant_id": user.tenant_id,
         "plan": user.plan_id,
     }

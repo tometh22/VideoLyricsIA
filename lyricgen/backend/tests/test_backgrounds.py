@@ -14,8 +14,9 @@ def valid_mp4_bytes(tmp_path_factory):
     subprocess.run(
         [
             "ffmpeg", "-v", "error", "-y",
-            "-f", "lavfi", "-i", "color=c=blue:s=16x16:d=0.2",
+            "-f", "lavfi", "-i", "color=c=blue:s=16x16:r=10:d=2",
             "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
             str(output),
         ],
         check=True,
@@ -100,9 +101,11 @@ def test_admin_upload_background_rejects_corrupt_mp4(client, admin_token):
     assert "magic bytes" in res.json()["detail"]
 
 
-def test_admin_upload_background_rejects_truncated_mp4(client, admin_token):
-    """A plausible ftyp header without decodable media is still invalid."""
-    truncated = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 128
+def test_admin_upload_background_rejects_truncated_mp4(
+    client, admin_token, valid_mp4_bytes,
+):
+    """Faststart metadata may probe cleanly while full frame decode fails."""
+    truncated = valid_mp4_bytes[: int(len(valid_mp4_bytes) * 0.70)]
     res = client.post(
         "/admin/backgrounds",
         headers=auth(admin_token),
@@ -133,6 +136,43 @@ def test_admin_upload_background_fails_closed_when_r2_upload_fails(
     )
     assert res.status_code == 503
     assert "storage" in res.json()["detail"].lower()
+
+
+def test_admin_upload_background_requires_r2_in_production(
+    client, admin_token, monkeypatch, valid_mp4_bytes, db,
+):
+    """Missing R2 config cannot create a replica-local production row."""
+    from database import BackgroundAsset
+    import storage
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setattr(storage, "is_enabled", lambda: False)
+    before = db.query(BackgroundAsset).filter(
+        BackgroundAsset.name == "No local production fallback"
+    ).count()
+    res = client.post(
+        "/admin/backgrounds",
+        headers=auth(admin_token),
+        files={"file": ("valid.mp4", io.BytesIO(valid_mp4_bytes), "video/mp4")},
+        data={"name": "No local production fallback", "tags": ""},
+    )
+    db.expire_all()
+    after = db.query(BackgroundAsset).filter(
+        BackgroundAsset.name == "No local production fallback"
+    ).count()
+    assert res.status_code == 503
+    assert "not configured" in res.json()["detail"]
+    assert before == after == 0
+
+
+def test_tenant_admin_cannot_manage_global_background_library(
+    client, admin_token, monkeypatch,
+):
+    """A tenant admin is not a platform library curator."""
+    monkeypatch.setenv("SUPER_ADMIN_USERS", "platform-owner@example.test")
+    res = client.get("/admin/backgrounds", headers=auth(admin_token))
+    assert res.status_code == 403
+    assert "Super admin" in res.json()["detail"]
 
 
 def test_list_backgrounds_after_upload(client, admin_token):
@@ -267,7 +307,10 @@ def test_inactive_background_is_hidden_from_regular_preview(
         "/backgrounds/preview-tokens",
         json={"asset_ids": [asset_id]}, headers=auth(admin_token),
     )
-    assert str(asset_id) in admin_issued.json()["tokens"]
+    admin_token_scoped = admin_issued.json()["tokens"][str(asset_id)]
+    assert client.get(
+        f"/backgrounds/{asset_id}/preview?token={admin_token_scoped}",
+    ).status_code == 200
 
 
 def test_delete_background(client, admin_token, valid_mp4_bytes):
