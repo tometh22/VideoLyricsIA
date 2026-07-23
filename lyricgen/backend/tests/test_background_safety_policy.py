@@ -248,7 +248,12 @@ def test_restricted_provider_boundary_uses_high_recall_human_detector():
             prompt, allow_people=False,
         )
         assert safe != prompt, prompt
-        assert "unoccupied" in safe.lower(), prompt
+        # Contrato nuevo (fix 2026-07-23): en vez de colapsar TODO a un único
+        # string genérico ("unoccupied…") —que hacía salir todos los fondos
+        # iguales— se remueve el sujeto humano preservando la escena (o, si no
+        # queda escena usable, un fallback VARIADO por-prompt). La garantía dura
+        # es que el resultado ya NO contiene un sujeto humano.
+        assert not pipeline._prompt_may_contain_human_subject(safe), (prompt, safe)
 
 
 def test_high_recall_detector_does_not_treat_equipment_as_a_person():
@@ -578,3 +583,79 @@ def test_staging_mode_nonumg_validates_by_default(db, monkeypatch):
     policy = pipeline._background_safety_policy(job_id)
     assert policy["is_umg"] is False
     assert policy["should_validate"] is True
+
+
+def test_people_free_prompt_is_not_collapsed_regression_20260723():
+    """Regresión del bug 2026-07-23 (job 3b28837a1784): un 'Mi prompt' rico y
+    SIN personas se colapsaba a un string genérico por un falso positivo del
+    detector ('...photographs appear around them' → pronombre 'them'). Ahora
+    debe volver INTACTO."""
+    user_prompt = (
+        "Locked-off top-down static camera view of a dark rustic wooden table. "
+        "A vintage glass soda siphon, a jar of dulce de leche, an old ballpoint "
+        "pen, alpargatas, and an alfajor are placed on the surface. As time "
+        "passes, old newspaper headlines and historical photographs appear "
+        "around them. The lighting shifts from warm golden sunlight to harsh "
+        "cinematic shadows, photorealistic 35mm film, perfectly still frame."
+    )
+    out = pipeline._sanitize_people_at_provider_boundary(user_prompt, allow_people=False)
+    assert out == user_prompt
+
+
+def test_human_scene_preserves_setting_not_collapsed():
+    """Un prompt CON persona pero con escena: se saca el humano y se PRESERVA
+    el escenario (no se tira todo a un string fijo)."""
+    p = (
+        "Wide shot of a rain-soaked neon alley with teal and magenta light and "
+        "wet cobblestones, where a lone singer walks toward the camera."
+    )
+    out = pipeline._sanitize_people_at_provider_boundary(p, allow_people=False).lower()
+    assert "neon" in out and "teal" in out and "cobblestone" in out
+    assert "singer" not in out and "walks" not in out
+
+
+def test_all_human_fallback_varies_per_prompt():
+    """Sin escena usable, el fallback VARÍA por prompt (no un único string que
+    hacía todos los fondos iguales)."""
+    a = pipeline._sanitize_people_at_provider_boundary(
+        "a crowd of people dancing and singing together", allow_people=False,
+        concept="celebration",
+    )
+    b = pipeline._sanitize_people_at_provider_boundary(
+        "a lone man walking alone in the rain", allow_people=False,
+        concept="melancholy",
+    )
+    assert a != b
+    old_generic = "expressing the requested emotional tone"
+    assert old_generic not in a and old_generic not in b
+    assert not pipeline._prompt_may_contain_human_subject(a)
+    assert not pipeline._prompt_may_contain_human_subject(b)
+
+
+def test_pronoun_subject_human_actions_are_caught_any_verb():
+    """Regresión del leak encontrado en review adversarial (2026-07-23): un
+    pronombre-sujeto nominativo (he/she/they) es humano SIEMPRE, sin depender
+    del verbo. Antes 'he drinks / she weeps / they gather' se filtraban a Veo."""
+    for prompt in (
+        "A quiet neon bar, rain on the window. He drinks alone at the counter.",
+        "Golden hour over rooftops. She weeps by the ledge.",
+        "A crowded plaza at dusk, they gather around a fountain.",
+        "An empty stage; he stares into the dark and screams.",
+        "Wide desert at dawn. They march toward the horizon.",
+        "A cozy kitchen, she reads a letter at the table.",
+    ):
+        safe = pipeline._sanitize_people_at_provider_boundary(prompt, allow_people=False)
+        assert not pipeline._prompt_may_contain_human_subject(safe), (prompt, safe)
+
+
+def test_object_and_possessive_pronouns_are_not_false_positives():
+    """El fix NO debe re-marcar pronombres de objeto/posesivo sobre objetos
+    (them/their), que colapsaban prompts sin personas (bug del job 3b28837a1784)."""
+    for prompt in (
+        "old photographs appear around them, on a wooden table",
+        "oak trees and their long shadows at golden hour",
+        "lanterns and the light around them",
+    ):
+        assert pipeline._sanitize_people_at_provider_boundary(
+            prompt, allow_people=False
+        ) == prompt
