@@ -695,6 +695,23 @@ def update_job(job_id: str, **kwargs) -> None:
             if not kwargs:
                 return
 
+        # Once an operator has produced a versioned editor save, worker-side
+        # transcription/post-processing must not silently replace it. Explicit
+        # editor writes use the CAS paths in main.py; background workers may
+        # only repeat the exact persisted snapshot.
+        if (
+            "segments_json" in kwargs
+            and int(getattr(job, "segments_revision", 0) or 0) > 0
+            and kwargs["segments_json"] != job.segments_json
+        ):
+            _logger.warning(
+                "[segments-occ] ignored background overwrite job=%s revision=%s",
+                job_id, job.segments_revision,
+            )
+            kwargs.pop("segments_json", None)
+            if not kwargs:
+                return
+
         for key, value in kwargs.items():
             if key == "files":
                 # Handle the legacy files dict format

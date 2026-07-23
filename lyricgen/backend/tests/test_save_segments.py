@@ -10,11 +10,32 @@ Pre-incident behavior: segments only touched the backend at POST /generate.
 A 90-min batch-edit session got reaped at 30 min and the user lost everything.
 """
 
+import json
 import uuid
 
 import pytest
+import main as main_mod
 
 from tests.conftest import auth
+
+
+def test_admin_cross_tenant_audit_does_not_commit_inside_cas_lock(
+    client, admin_token, monkeypatch,
+):
+    _, _, user_id, tenant_id = _make_user(client)
+    job_id = _seed_transcribed_pending(user_id, tenant_id)
+    calls = []
+    monkeypatch.setattr(
+        main_mod, "_audit_cross_tenant_access",
+        lambda *_args, **kwargs: calls.append(kwargs),
+    )
+    res = client.post(
+        f"/jobs/{job_id}/save-segments",
+        json={"segments": [{"start": 0, "end": 1, "text": "admin fix"}]},
+        headers=auth(admin_token),
+    )
+    assert res.status_code == 200, res.text
+    assert calls == [{"commit": False}]
 
 
 def _make_user(client):
@@ -341,3 +362,90 @@ def test_save_segments_persists_in_chronological_order(client):
         assert row.segments_json[2]["text"] == "Una vez más"
     finally:
         s.close()
+
+
+def test_save_segments_occ_apply_retry_conflict_and_legacy_upgrade(client):
+    """The server owns the revision and treats a lost-response retry as idempotent."""
+    _, token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_transcribed_pending(user_id, tenant_id)
+    first = [{"start": 0.0, "end": 1.0, "text": "v1"}]
+
+    applied = client.post(
+        f"/jobs/{job_id}/save-segments",
+        json={"segments": first, "base_revision": 0},
+        headers=auth(token),
+    )
+    assert applied.status_code == 200
+    assert applied.json()["applied"] is True
+    assert applied.json()["revision"] == 1
+
+    retry = client.post(
+        f"/jobs/{job_id}/save-segments",
+        json={"segments": first, "base_revision": 0},
+        headers=auth(token),
+    )
+    assert retry.status_code == 200
+    assert retry.json() == {
+        "ok": True, "job_id": job_id, "applied": False,
+        "revision": 1, "count": 1,
+    }
+
+    conflict = client.post(
+        f"/jobs/{job_id}/save-segments",
+        json={"segments": [{"start": 0, "end": 1, "text": "stale"}], "base_revision": 0},
+        headers=auth(token),
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["code"] == "stale_revision"
+    assert conflict.json()["current_revision"] == 1
+
+    legacy = client.post(
+        f"/jobs/{job_id}/save-segments",
+        json={"segments": first},
+        headers=auth(token),
+    )
+    assert legacy.status_code == 428
+    assert legacy.json()["code"] == "client_upgrade_required"
+
+    status = client.get(f"/status/{job_id}", headers=auth(token))
+    assert status.status_code == 200
+    assert status.json()["segments_revision"] == 1
+
+
+def test_generate_reuse_requires_and_honors_confirmed_revision(client, monkeypatch):
+    import main
+
+    _, token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_transcribed_pending(user_id, tenant_id)
+    segments = [{"start": 0.0, "end": 1.0, "text": "confirmed"}]
+    saved = client.post(
+        f"/jobs/{job_id}/save-segments",
+        json={"segments": segments, "base_revision": 0},
+        headers=auth(token),
+    )
+    assert saved.json()["revision"] == 1
+
+    common = {
+        "job_id": job_id,
+        "artist": "Artist",
+        "song_title": "Song",
+        "style": "oscuro",
+        "segments_json": json.dumps(segments),
+        "delivery_profile": "youtube",
+    }
+    stale = client.post(
+        "/generate", data={**common, "base_revision": "0"}, headers=auth(token),
+    )
+    assert stale.status_code == 409
+    legacy = client.post("/generate", data=common, headers=auth(token))
+    assert legacy.status_code == 428
+
+    enqueued = []
+    monkeypatch.setattr(main, "enqueue_pipeline", lambda **kwargs: enqueued.append(kwargs) or job_id)
+    monkeypatch.setattr(main, "_enforce_disk_capacity", lambda: None)
+    monkeypatch.setattr(main, "_enforce_memory_pressure", lambda: None)
+    accepted = client.post(
+        "/generate", data={**common, "base_revision": "1"}, headers=auth(token),
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert enqueued and enqueued[0]["segments_override"] == segments

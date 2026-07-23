@@ -24,15 +24,18 @@ explicit + correct. These tests pin the contract.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import uuid
 
-from auth import get_plan_usage
-from database import Job, SessionLocal
+from auth import create_user, get_plan_usage
+from database import Job, SessionLocal, User
 
 _T = "tenant_quota_test"
 _USER_ID = 999_001
 
 
-def _seed_job(db, *, job_id, status, approved_at, created_at=None):
+def _seed_job(
+    db, *, job_id, status, approved_at, created_at=None, user_id=_USER_ID,
+):
     """Insert a job row with the exact fields the quota filter looks at."""
     if created_at is None:
         # Default: created a few days before approval (when present),
@@ -40,7 +43,7 @@ def _seed_job(db, *, job_id, status, approved_at, created_at=None):
         created_at = approved_at - timedelta(days=2) if approved_at else datetime.now(timezone.utc)
     db.add(Job(
         job_id=job_id,
-        user_id=_USER_ID,
+        user_id=user_id,
         tenant_id=_T,
         artist="A",
         filename="t.mp3",
@@ -207,29 +210,57 @@ def test_other_tenant_isolation():
     pins that the new approved_at filter doesn't accidentally drop the
     tenant scope."""
     db = SessionLocal()
+    created_user_ids = []
+    other_tenant = f"quota_other_{uuid.uuid4().hex[:8]}"
     try:
         _cleanup(db)
+        our_user = create_user(
+            db,
+            username=f"quota_our_{uuid.uuid4().hex[:8]}",
+            password="testpass12345",
+            tenant_id=_T,
+        )
+        other_user = create_user(
+            db,
+            username=f"quota_other_{uuid.uuid4().hex[:8]}",
+            password="testpass12345",
+            tenant_id=other_tenant,
+        )
+        created_user_ids = [our_user.id, other_user.id]
         _seed_job(
             db, job_id="our_approval", status="done",
             approved_at=datetime.now(timezone.utc) - timedelta(hours=1),
+            user_id=our_user.id,
         )
         # Same shape but different tenant.
         db.add(Job(
-            job_id="other_tenant_approval",
-            user_id=42, tenant_id="some_other_tenant",
+            job_id="other_qa",
+            user_id=other_user.id, tenant_id=other_tenant,
             artist="X", filename="o.mp3", style="oscuro",
             status="done", delivery_profile="youtube",
             created_at=datetime.now(timezone.utc) - timedelta(hours=3),
             approved_at=datetime.now(timezone.utc) - timedelta(hours=1),
         ))
         db.commit()
-        usage = get_plan_usage(db, user_id=_USER_ID, tenant_id=_T, plan_id="250")
+        usage = get_plan_usage(
+            db,
+            user_id=our_user.id,
+            tenant_id=_T,
+            plan_id="250",
+        )
         assert usage["used"] == 1, (
             f"cross-tenant approval leaked into our quota "
             f"(used={usage['used']}, expected 1)"
         )
-        db.query(Job).filter(Job.tenant_id == "some_other_tenant").delete()
-        db.commit()
     finally:
+        db.rollback()
+        db.query(Job).filter(
+            Job.tenant_id.in_([_T, other_tenant])
+        ).delete(synchronize_session=False)
+        if created_user_ids:
+            db.query(User).filter(
+                User.id.in_(created_user_ids)
+            ).delete(synchronize_session=False)
+        db.commit()
         _cleanup(db)
         db.close()

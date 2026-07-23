@@ -28,7 +28,7 @@ describe("persistSegments — contrato real (sin eco a currentReview)", () => {
   const persist = (jobId, segments, opts) =>
     persistSegments(authFetch, API, jobId, segments, opts);
 
-  it("POSTea a /jobs/{id}/save-segments y retorna { ok: true } en 2xx", async () => {
+  it("POSTea a /jobs/{id}/save-segments con base_revision y retorna la revisión", async () => {
     authFetch.mockResolvedValue({ ok: true, status: 200 });
     const result = await persist("abc123", SEGMENTS);
     expect(authFetch).toHaveBeenCalledTimes(1);
@@ -36,14 +36,15 @@ describe("persistSegments — contrato real (sin eco a currentReview)", () => {
     expect(url).toBe(`${API}/jobs/abc123/save-segments`);
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body)).toHaveProperty("segments");
-    expect(result).toEqual({ ok: true });
+    expect(JSON.parse(init.body)).toHaveProperty("base_revision", 0);
+    expect(result).toEqual({ ok: true, applied: true, revision: 1 });
   });
 
   it("NO escribe nada de vuelta en éxito (el eco fue removido)", async () => {
     // Contrato clave: el retorno es SOLO { ok: true }. Nada de segments/echo.
     authFetch.mockResolvedValue({ ok: true, status: 200 });
     const result = await persist("abc123", SEGMENTS);
-    expect(result).toEqual({ ok: true });
+    expect(result).toEqual({ ok: true, applied: true, revision: 1 });
     expect(result.segments).toBeUndefined();
   });
 
@@ -113,6 +114,35 @@ describe("persistSegments — contrato real (sin eco a currentReview)", () => {
     const bad = [{ start: 5, end: 1, text: "invertido" }];
     const result = await persist("abc123", bad);
     expect(authFetch).toHaveBeenCalledTimes(1);
-    expect(result).toEqual({ ok: true });
+    expect(result).toEqual({ ok: true, applied: true, revision: 1 });
+  });
+
+  it("409 expone conflicto OCC y la revisión actual", async () => {
+    authFetch.mockResolvedValue({
+      ok: false,
+      status: 409,
+      clone: () => ({ json: async () => ({ current_revision: 4, updated_at: "2026-07-22T12:00:00Z" }) }),
+    });
+    expect(await persist("abc123", SEGMENTS, { baseRevision: 3 })).toEqual({
+      ok: false,
+      reason: "stale-revision",
+      status: 409,
+      currentRevision: 4,
+      updatedAt: "2026-07-22T12:00:00Z",
+    });
+  });
+
+  it("overwrite consulta /status de nuevo antes de guardar", async () => {
+    authFetch
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ segments_revision: 7 }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        clone: () => ({ json: async () => ({ applied: true, revision: 8 }) }),
+      });
+    const result = await persist("abc123", SEGMENTS, { baseRevision: 3, resolveConflict: true });
+    expect(authFetch.mock.calls[0][0]).toBe(`${API}/status/abc123`);
+    expect(JSON.parse(authFetch.mock.calls[1][1].body).base_revision).toBe(7);
+    expect(result.revision).toBe(8);
   });
 });

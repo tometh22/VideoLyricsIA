@@ -298,6 +298,92 @@ def reaper_seconds_since_last_ok() -> float | None:
     return time.monotonic() - _REAPER_LAST_OK_TS
 
 
+def _fleet_service_name(value: object) -> str:
+    compact = "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+    if compact == "shortworker":
+        return "short_worker"
+    if compact == "worker":
+        return "worker"
+    return compact or "unknown"
+
+
+def _fleet_readiness_config(environment: str | None = None) -> tuple[bool, dict[str, int]]:
+    """Durable readiness defaults for shared staging/production fleets."""
+    managed = (environment or ENV).strip().lower() in {
+        "staging", "stage", "prod", "production",
+    }
+    strict_default = "1" if managed else "0"
+    worker_default = "7" if managed else "0"
+    short_default = "3" if managed else "0"
+    strict = os.environ.get(
+        "FLEET_READINESS_STRICT", strict_default,
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _replicas(name: str, default: str) -> int:
+        try:
+            return max(int(os.environ.get(name, default) or default), 0)
+        except (TypeError, ValueError):
+            return int(default)
+
+    return strict, {
+        "worker": _replicas("EXPECTED_WORKER_REPLICAS", worker_default),
+        "short_worker": _replicas(
+            "EXPECTED_SHORT_WORKER_REPLICAS", short_default,
+        ),
+    }
+
+
+def worker_fleet_coherence(
+    release_rows: list[dict],
+    api_release: str,
+    api_protocol: int,
+    expected_service_counts: dict[str, int] | None = None,
+) -> dict:
+    """Pure deploy-gate contract shared by health and focused tests."""
+    expected = {"transcription", "bg_preview", "enterprise", "default"}
+    advertised = {
+        queue for row in release_rows for queue in (row.get("queues") or [])
+    }
+    release_match = bool(release_rows) and all(
+        not api_release or api_release == "unknown" or row.get("release") == api_release
+        for row in release_rows
+    )
+    protocol_match = bool(release_rows) and all(
+        row.get("rq_payload_version") == api_protocol for row in release_rows
+    )
+    service_counts: dict[str, int] = {}
+    for row in release_rows:
+        service = _fleet_service_name(row.get("service"))
+        service_counts[service] = service_counts.get(service, 0) + 1
+    normalized_expected = {
+        _fleet_service_name(service): max(int(count), 0)
+        for service, count in (expected_service_counts or {}).items()
+        if int(count) > 0
+    }
+    under_replicated = {
+        service: {
+            "expected": expected_count,
+            "actual": service_counts.get(service, 0),
+        }
+        for service, expected_count in normalized_expected.items()
+        if service_counts.get(service, 0) < expected_count
+    }
+    missing = sorted(expected - advertised)
+    return {
+        "coherent": bool(
+            release_match
+            and protocol_match
+            and not missing
+            and not under_replicated
+        ),
+        "missing_queues": missing,
+        "release_match": release_match,
+        "protocol_match": protocol_match,
+        "service_counts": service_counts,
+        "under_replicated": under_replicated,
+    }
+
+
 def health_snapshot() -> dict:
     """Lightweight report of runtime health.
 
@@ -318,7 +404,22 @@ def health_snapshot() -> dict:
         production — Redis (queue is broken) or Postgres (SELECT 1
         failed). The /health endpoint translates this to HTTP 503.
     """
-    snap = {"status": "ok", "env": ENV}
+    snap = {
+        "status": "ok",
+        "env": ENV,
+        "release": _resolve_release(),
+        "features": {
+            "anchor_lyrics": os.environ.get("ANCHOR_LYRICS_ENABLED", "0").strip().lower()
+            in ("1", "true", "yes", "on"),
+            "youtube_publish": os.environ.get("YOUTUBE_PUBLISH_ENABLED", "0").strip().lower()
+            in ("1", "true", "yes", "on"),
+        },
+    }
+    try:
+        from queue_jobs import RQ_PAYLOAD_VERSION
+        snap["rq_payload_version"] = RQ_PAYLOAD_VERSION
+    except Exception:
+        snap["rq_payload_version"] = int(os.environ.get("RQ_PAYLOAD_VERSION", "2"))
     is_prod = ENV in ("prod", "production")
     starting = _within_startup_grace()
 
@@ -329,13 +430,13 @@ def health_snapshot() -> dict:
             snap["status"] = "degraded"
             snap["degraded_reason"] = reason
 
-    def _down(reason: str) -> None:
+    def _down(reason: str, *, allow_starting: bool = True) -> None:
         # Hard failure of a required dependency. Used by /health to
         # return 503 so the load balancer pulls the instance out.
         # During the startup grace window we report "starting" instead
         # so Railway's first probe doesn't roll back the deploy on a
         # cold-cache miss.
-        if starting:
+        if starting and allow_starting:
             snap["status"] = "starting"
             snap["starting_reason"] = reason
             return
@@ -400,6 +501,8 @@ def health_snapshot() -> dict:
                     except Exception:
                         queues[qname] = -1
                 snap["queue_depth"] = queues
+                fleet_strict, expected_service_counts = _fleet_readiness_config()
+                snap["fleet_readiness_strict"] = fleet_strict
                 try:
                     workers = Worker.all(connection=r)
                     snap["workers_alive"] = len(workers)
@@ -408,6 +511,48 @@ def health_snapshot() -> dict:
                     snap["workers_alive"] = -1
                 if snap.get("workers_alive") == 0:
                     _degrade("no_workers")
+                try:
+                    release_rows = []
+                    for key in r.scan_iter(match="genly:worker:release:*", count=50):
+                        raw = r.get(key)
+                        if raw:
+                            if isinstance(raw, bytes):
+                                raw = raw.decode("utf-8", "replace")
+                            release_rows.append(json.loads(raw))
+                    snap["worker_releases"] = release_rows
+                    releases = {row.get("release") for row in release_rows if row.get("release")}
+                    protocols = {
+                        row.get("rq_payload_version") for row in release_rows
+                        if row.get("rq_payload_version") is not None
+                    }
+                    if len(releases) > 1:
+                        _degrade("mixed_worker_releases")
+                    if len(protocols) > 1:
+                        _degrade("mixed_worker_protocols")
+                    fleet = worker_fleet_coherence(
+                        release_rows,
+                        str(snap.get("release") or ""),
+                        int(snap.get("rq_payload_version") or 0),
+                        expected_service_counts=expected_service_counts,
+                    )
+                    snap["fleet_coherent"] = fleet["coherent"]
+                    snap["fleet_missing_queues"] = fleet["missing_queues"]
+                    snap["fleet_release_match"] = fleet["release_match"]
+                    snap["fleet_protocol_match"] = fleet["protocol_match"]
+                    snap["fleet_service_counts"] = fleet["service_counts"]
+                    snap["fleet_under_replicated"] = fleet["under_replicated"]
+                    if not snap["fleet_coherent"]:
+                        if fleet_strict:
+                            _down("worker_fleet_incoherent", allow_starting=False)
+                        else:
+                            _degrade("worker_fleet_incoherent")
+                except Exception:
+                    snap["worker_releases"] = []
+                    snap["fleet_coherent"] = False
+                    if fleet_strict:
+                        _down("worker_fleet_unverifiable", allow_starting=False)
+                    else:
+                        _degrade("worker_fleet_unverifiable")
                 # Tier 3 segmentation guard: with a segmented fleet (ShortWorker
                 # on transcription/bg_preview + Worker on enterprise/default), a
                 # rollout mistake (e.g. setting Worker QUEUES=enterprise,default
@@ -471,6 +616,7 @@ def health_snapshot() -> dict:
             snap["r2"] = "ready" if storage.warmup() else "configured"
             ok, ms, err = storage.probe_r2()
             snap["r2_probe_ms"] = ms
+            snap["r2_circuit_breaker"] = storage.health_probe_state()
             if not ok:
                 snap["r2_probe_error"] = err
                 _degrade("r2_probe_failed")
@@ -534,4 +680,14 @@ def health_snapshot() -> dict:
         # without sending a test event.
         "sentry": bool(SENTRY_DSN),
     }
+    try:
+        from ops_control import get_submissions_state
+        snap["submissions"] = get_submissions_state()
+    except Exception:
+        snap["submissions"] = {"paused": False, "source": "unavailable"}
+    try:
+        from ops_metrics import snapshot as ops_metrics_snapshot
+        snap["operational_metrics"] = ops_metrics_snapshot()
+    except Exception:
+        snap["operational_metrics"] = {}
     return snap
