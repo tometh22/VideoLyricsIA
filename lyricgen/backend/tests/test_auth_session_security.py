@@ -5,8 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from fastapi.security import HTTPAuthorizationCredentials
 from jose import jwt
 from sqlalchemy.exc import SQLAlchemyError
+from starlette.requests import Request
 
 import auth as auth_module
 from auth import decode_token, invalidate_user_access, start_login_session
@@ -127,6 +129,38 @@ def test_session_validation_db_failure_is_503():
     db = FailingDb()
     with pytest.raises(HTTPException) as exc:
         auth_module._validate_login_session(db, SimpleNamespace(id=1), "jti")
+    assert exc.value.status_code == 503
+    assert db.rolled_back is True
+
+
+def test_user_lookup_db_failure_is_503(monkeypatch):
+    class FailingDb:
+        rolled_back = False
+
+        def rollback(self):
+            self.rolled_back = True
+
+    db = FailingDb()
+    monkeypatch.setattr(
+        auth_module,
+        "decode_token",
+        lambda _token: {"sub": "1"},
+    )
+    monkeypatch.setattr(
+        auth_module,
+        "get_user_by_id_resilient",
+        lambda _db, _user_id: (_ for _ in ()).throw(
+            SQLAlchemyError("users unavailable")
+        ),
+    )
+    request = Request({"type": "http", "headers": []})
+    credentials = HTTPAuthorizationCredentials(
+        scheme="Bearer",
+        credentials="access-token",
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        auth_module.get_current_user(request, credentials, db)
     assert exc.value.status_code == 503
     assert db.rolled_back is True
 

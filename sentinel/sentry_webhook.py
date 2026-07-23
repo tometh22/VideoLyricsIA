@@ -15,6 +15,8 @@ import hashlib
 import hmac
 import json
 
+from logging_utils import redact
+
 
 def verify_signature(body: bytes, signature: str | None, secret: str) -> bool:
     if not secret:
@@ -61,4 +63,4 @@ def compact_context(payload: dict, max_chars: int = 6000) -> str:
     Sentry manda stacktraces/tags adentro — es exactamente lo que el agente
     necesita para arrancar sin ir a buscar nada."""
     text = json.dumps(payload, ensure_ascii=False, default=str)
-    return text[:max_chars]
+    return redact(text[:max_chars])

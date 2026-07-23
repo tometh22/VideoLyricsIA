@@ -65,3 +65,36 @@ def test_worker_fleet_gate_compares_api_sha_protocol_and_empty_queues():
     assert worker_fleet_coherence(healthy[:1], "sha-new", 2)["missing_queues"] == [
         "bg_preview", "transcription",
     ]
+
+
+def test_worker_fleet_gate_enforces_expected_service_cardinality():
+    from observability import worker_fleet_coherence
+
+    render = {
+        "service": "Worker",
+        "release": "sha-new",
+        "rq_payload_version": 2,
+        "queues": ["enterprise", "default"],
+    }
+    short = {
+        "service": "ShortWorker",
+        "release": "sha-new",
+        "rq_payload_version": 2,
+        "queues": ["transcription", "bg_preview"],
+    }
+    expected = {"worker": 7, "short_worker": 3}
+
+    healthy = worker_fleet_coherence(
+        [render] * 7 + [short] * 3, "sha-new", 2, expected
+    )
+    assert healthy["coherent"] is True
+    assert healthy["service_counts"] == {"worker": 7, "short_worker": 3}
+    assert healthy["under_replicated"] == {}
+
+    missing_short = worker_fleet_coherence(
+        [render] * 7 + [short] * 2, "sha-new", 2, expected
+    )
+    assert missing_short["coherent"] is False
+    assert missing_short["under_replicated"] == {
+        "short_worker": {"expected": 3, "actual": 2}
+    }

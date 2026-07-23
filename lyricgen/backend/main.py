@@ -62,6 +62,7 @@ from auth import (
     PLANS,
     create_media_token,
     verify_media_token,
+    MEDIA_TOKEN_EXPIRE_SECONDS,
     validate_password_strength,
     has_prores_access,
     has_drive_access,
@@ -1086,7 +1087,10 @@ async def preview_background(
         asset_file_type = asset.file_type
 
     if asset_filename.startswith("library/") and storage.is_enabled():
-        url = storage.generate_signed_url(asset_filename, expiry_seconds=900)
+        url = storage.generate_signed_url(
+            asset_filename,
+            expiry_seconds=MEDIA_TOKEN_EXPIRE_SECONDS,
+        )
         if url:
             return RedirectResponse(url, status_code=302)
         # If signing failed for any reason, fall through to local fallback.
@@ -8617,7 +8621,7 @@ async def download(
     s3_key = (job.get("s3_keys") or {}).get(file_type)
     if s3_key and storage.is_enabled():
         url = storage.generate_signed_url(
-            s3_key, expiry_seconds=3600,
+            s3_key, expiry_seconds=MEDIA_TOKEN_EXPIRE_SECONDS,
             download_filename=FILE_MAP.get(file_type),
         )
         if url:
@@ -8653,7 +8657,7 @@ async def download(
             s3_key = _s3_keys.get(file_type)
             if s3_key and storage.is_enabled():
                 url = storage.generate_signed_url(
-                    s3_key, expiry_seconds=3600,
+                    s3_key, expiry_seconds=MEDIA_TOKEN_EXPIRE_SECONDS,
                     download_filename=FILE_MAP.get(file_type),
                 )
                 if url:
@@ -8751,7 +8755,10 @@ async def preview(
         return FileResponse(file_path, media_type=MEDIA_TYPES[file_type])
 
     if s3_key and storage.is_enabled():
-        url = storage.generate_signed_url(s3_key, expiry_seconds=3600)
+        url = storage.generate_signed_url(
+            s3_key,
+            expiry_seconds=MEDIA_TOKEN_EXPIRE_SECONDS,
+        )
         if url:
             return RedirectResponse(url, status_code=302)
 

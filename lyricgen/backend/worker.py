@@ -84,6 +84,27 @@ bootstrap_vertex_credentials()
 from rq import Worker as _RQWorker
 
 
+_DEFAULT_RELEASE_HEARTBEAT_TTL_SECONDS = 120
+
+
+def _release_heartbeat_ttl_seconds() -> int:
+    """Return a safe TTL for the release/protocol metadata key."""
+    raw = os.environ.get(
+        "WORKER_RELEASE_HEARTBEAT_TTL_SECONDS",
+        str(_DEFAULT_RELEASE_HEARTBEAT_TTL_SECONDS),
+    )
+    try:
+        return max(int(raw), 30)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[WORKER] invalid WORKER_RELEASE_HEARTBEAT_TTL_SECONDS=%r; "
+            "using %ds",
+            raw,
+            _DEFAULT_RELEASE_HEARTBEAT_TTL_SECONDS,
+        )
+        return _DEFAULT_RELEASE_HEARTBEAT_TTL_SECONDS
+
+
 class WarmOnlyWorker(_RQWorker):
     """RQ Worker that NEVER cold-kills an in-flight job.
 
@@ -143,6 +164,21 @@ class WarmOnlyWorker(_RQWorker):
         validate_rq_payload_metadata(getattr(job, "meta", None))
         return super().prepare_job_execution(job, remove_from_intermediate_queue)
 
+    @property
+    def dequeue_timeout(self) -> int:
+        """Wake idle BLPOP often enough to refresh release metadata.
+
+        RQ's native timeout is ``worker_ttl - 15`` (405 seconds by default),
+        while the release/protocol key intentionally expires much sooner so a
+        dead or rolled-back worker leaves the readiness snapshot promptly.
+        Each dequeue timeout returns through RQ's maintenance loop, which calls
+        ``heartbeat()`` and republishes the custom key without adding a thread
+        to a process that later forks work horses.
+        """
+        native_timeout = super().dequeue_timeout
+        release_interval = max(_release_heartbeat_ttl_seconds() // 3, 1)
+        return min(native_timeout, release_interval)
+
     def heartbeat(self, *args, **kwargs):  # type: ignore[override]
         """Extend RQ liveness with release, queue and protocol metadata."""
         result = super().heartbeat(*args, **kwargs)
@@ -155,7 +191,7 @@ class WarmOnlyWorker(_RQWorker):
             RQ_SUPPORTED_PAYLOAD_VERSIONS,
         )
 
-        ttl = int(os.environ.get("WORKER_RELEASE_HEARTBEAT_TTL_SECONDS", "120"))
+        ttl = _release_heartbeat_ttl_seconds()
         queues = [getattr(q, "name", str(q)) for q in getattr(self, "queues", [])]
         payload = {
             "worker": getattr(self, "name", "unknown"),
@@ -177,7 +213,7 @@ class WarmOnlyWorker(_RQWorker):
         try:
             self.connection.setex(
                 f"genly:worker:release:{payload['worker']}",
-                max(ttl, 30),
+                ttl,
                 json.dumps(payload, separators=(",", ":"), sort_keys=True),
             )
         except Exception as exc:  # native RQ heartbeat remains authoritative

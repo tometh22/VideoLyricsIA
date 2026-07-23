@@ -10,6 +10,8 @@ import os
 
 import httpx
 
+from logging_utils import redact
+
 logger = logging.getLogger("sentinel.railway")
 
 _GQL = "https://backboard.railway.com/graphql/v2"
@@ -77,12 +79,12 @@ async def tail(service_name: str, lines: int = 80) -> str:
         logs = d.get("data", {}).get("deploymentLogs") or []
         if not logs:
             return f"(sin logs para {service_name})"
-        return "\n".join(
+        return redact("\n".join(
             f"{(x.get('timestamp') or '')[:19]} {x.get('message','')}" for x in logs
-        )[-6000:]
+        )[-6000:])
     except Exception as e:  # nunca tumbar una investigación por logs
-        logger.warning("railway logs falló: %s", e)
-        return f"(error leyendo logs de Railway: {e})"
+        logger.warning("railway logs falló: %s", redact(e))
+        return redact(f"(error leyendo logs de Railway: {e})")
 
 
 async def context_for_investigation() -> str:
@@ -92,4 +94,4 @@ async def context_for_investigation() -> str:
     parts = []
     for svc in ("Worker", "api"):
         parts.append(f"===== logs recientes: {svc} =====\n{await tail(svc, 60)}")
-    return "\n\n".join(parts)
+    return redact("\n\n".join(parts))
