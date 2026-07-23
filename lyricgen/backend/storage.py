@@ -709,15 +709,25 @@ def multipart_complete(
             MultipartUpload={"Parts": sorted_parts},
         )
     except Exception as exc:
-        # The caller reconciles this with head_object_size: a durable object
-        # means an idempotent success after a duplicate CompleteMultipart call.
-        # Keep the traceback locally without turning every recovered
-        # NoSuchUpload into a standalone Sentry issue.
-        logger.warning(
-            "multipart_complete failed key=%r upload_id=%r: %s "
-            "(caller reconciles via head_object_size)",
-            key, upload_id, exc, exc_info=True,
+        response = getattr(exc, "response", None)
+        error = response.get("Error", {}) if isinstance(response, dict) else {}
+        code = str(error.get("Code") or "")
+        is_no_such_upload = (
+            code == "NoSuchUpload" or "NoSuchUpload" in str(exc)
         )
+        message = (
+            "multipart_complete failed key=%r upload_id=%r: %s "
+            "(caller reconciles via head_object_size)"
+        )
+        if is_no_such_upload:
+            # Expected after a duplicate completion: the first call consumes
+            # the upload id. The caller HEADs the object and distinguishes
+            # durable idempotent success from an expired upload.
+            logger.warning(message, key, upload_id, exc, exc_info=True)
+        else:
+            # Auth, outage, 5xx and unknown storage failures remain Sentry
+            # events even though the caller still attempts reconciliation.
+            logger.error(message, key, upload_id, exc, exc_info=True)
         return None
     return key
 

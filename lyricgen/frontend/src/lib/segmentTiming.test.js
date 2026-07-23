@@ -1,63 +1,71 @@
 import { describe, expect, it } from "vitest";
-import { clampSegmentToDuration } from "./segmentTiming";
+import {
+  clampBlockShiftDelta,
+  shiftBlockWithinDuration,
+} from "./segmentTiming";
 
-describe("clampSegmentToDuration", () => {
+describe("block timeline shifts", () => {
   const duration = 100;
 
-  it("shifts within bounds without changing length", () => {
-    expect(clampSegmentToDuration({ start: 10, end: 14 }, 20, duration))
-      .toMatchObject({ start: 20, end: 24 });
-  });
-
-  it("clamps a negative start to zero", () => {
-    expect(clampSegmentToDuration({ start: 5, end: 8 }, -3, duration))
-      .toMatchObject({ start: 0, end: 3 });
-  });
-
-  it("pins a segment past the song end without inversion", () => {
-    const result = clampSegmentToDuration(
-      { start: 90, end: 94 },
-      120,
+  it("shifts a block within bounds without changing offsets", () => {
+    expect(shiftBlockWithinDuration(
+      [{ start: 10, end: 14 }, { start: 16, end: 20 }],
+      5,
       duration,
-    );
-    expect(result).toMatchObject({ start: 96, end: 100 });
-    expect(result.start).toBeLessThanOrEqual(result.end);
+    )).toEqual([{ start: 15, end: 19 }, { start: 21, end: 25 }]);
   });
 
-  it("keeps a trailing cascade in contract", () => {
-    const shifted = [
+  it("bounds a negative shift using the first start", () => {
+    expect(clampBlockShiftDelta(
+      [{ start: 5, end: 8 }, { start: 10, end: 12 }],
+      -9,
+      duration,
+    )).toBe(-5);
+  });
+
+  it("preserves order, lengths, and gaps at the song end", () => {
+    const original = [
       { start: 88, end: 91 },
       { start: 92, end: 95 },
       { start: 96, end: 99 },
-    ].map((segment) =>
-      clampSegmentToDuration(segment, segment.start + 20, duration));
+    ];
+    const shifted = [
+      ...shiftBlockWithinDuration(original, 20, duration),
+    ];
 
-    for (const segment of shifted) {
-      expect(segment.start).toBeGreaterThanOrEqual(0);
-      expect(segment.start).toBeLessThanOrEqual(segment.end);
-      expect(segment.end).toBeLessThanOrEqual(duration);
-    }
+    expect(shifted).toEqual([
+      { start: 89, end: 92 },
+      { start: 93, end: 96 },
+      { start: 97, end: 100 },
+    ]);
+    expect(shifted.map((segment) => segment.end - segment.start))
+      .toEqual(original.map((segment) => segment.end - segment.start));
+    expect(shifted.slice(1).map((segment, index) =>
+      segment.start - shifted[index].end)).toEqual([1, 1]);
   });
 
   it("has no ceiling when duration is zero", () => {
-    expect(clampSegmentToDuration({ start: 10, end: 12 }, 5000, 0))
-      .toMatchObject({ start: 5000, end: 5002 });
+    expect(shiftBlockWithinDuration(
+      [{ start: 10, end: 12 }],
+      5000,
+      0,
+    )).toEqual([{ start: 5010, end: 5012 }]);
   });
 
   it("preserves non-timing fields", () => {
-    const result = clampSegmentToDuration(
-      { start: 1, end: 2, text: "hola", _id: 7 },
-      3,
+    const [result] = shiftBlockWithinDuration(
+      [{ start: 1, end: 2, text: "hola", _id: 7 }],
+      2,
       duration,
     );
     expect(result).toMatchObject({ start: 3, end: 4, text: "hola", _id: 7 });
   });
 
-  it("uses the minimum length for non-finite input", () => {
-    expect(clampSegmentToDuration(
-      { start: Number.NaN, end: Number.NaN },
+  it("refuses to shift non-finite input", () => {
+    expect(clampBlockShiftDelta(
+      [{ start: Number.NaN, end: Number.NaN }],
       10,
       duration,
-    )).toMatchObject({ start: 10, end: 10.5 });
+    )).toBe(0);
   });
 });
