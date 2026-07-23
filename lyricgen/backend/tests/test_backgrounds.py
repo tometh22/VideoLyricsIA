@@ -146,6 +146,7 @@ def test_admin_upload_background_requires_r2_in_production(
     import storage
 
     monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("SUPER_ADMIN_USERS", "admin")
     monkeypatch.setattr(storage, "is_enabled", lambda: False)
     before = db.query(BackgroundAsset).filter(
         BackgroundAsset.name == "No local production fallback"
@@ -173,6 +174,46 @@ def test_tenant_admin_cannot_manage_global_background_library(
     res = client.get("/admin/backgrounds", headers=auth(admin_token))
     assert res.status_code == 403
     assert "Super admin" in res.json()["detail"]
+
+
+def test_missing_super_admin_allowlist_fails_closed_in_production(
+    client, admin_token, monkeypatch,
+):
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.delenv("SUPER_ADMIN_USERS", raising=False)
+    res = client.get("/admin/backgrounds", headers=auth(admin_token))
+    assert res.status_code == 403
+    assert "Super admin" in res.json()["detail"]
+
+
+@pytest.mark.parametrize("environment", ["prod", "preview", "prodution"])
+def test_missing_super_admin_allowlist_fails_closed_outside_explicit_local_envs(
+    client, admin_token, monkeypatch, environment,
+):
+    monkeypatch.setenv("ENVIRONMENT", environment)
+    monkeypatch.delenv("SUPER_ADMIN_USERS", raising=False)
+    res = client.get("/admin/backgrounds", headers=auth(admin_token))
+    assert res.status_code == 403
+    assert "Super admin" in res.json()["detail"]
+
+
+@pytest.mark.parametrize("environment", ["prod", "preview", "prodution"])
+def test_background_upload_requires_r2_outside_explicit_local_envs(
+    client, admin_token, monkeypatch, valid_mp4_bytes, environment,
+):
+    import storage
+
+    monkeypatch.setenv("ENVIRONMENT", environment)
+    monkeypatch.setenv("SUPER_ADMIN_USERS", "admin")
+    monkeypatch.setattr(storage, "is_enabled", lambda: False)
+    res = client.post(
+        "/admin/backgrounds",
+        headers=auth(admin_token),
+        files={"file": ("valid.mp4", io.BytesIO(valid_mp4_bytes), "video/mp4")},
+        data={"name": "Must use durable storage", "tags": ""},
+    )
+    assert res.status_code == 503
+    assert "not configured" in res.json()["detail"]
 
 
 def test_list_backgrounds_after_upload(client, admin_token):

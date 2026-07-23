@@ -21,7 +21,7 @@ from auth import (
     pwd_context,
     telemetry_enabled,
     validate_password_strength,
-    _super_admin_allowlist,
+    is_super_admin,
 )
 from database import User, Job, Invoice, AuditLog, AIProvenance, AssetUsage, BackgroundAsset, UserSession, LoginSession, get_db
 from error_taxonomy import classify_error
@@ -54,30 +54,29 @@ def require_super_admin(current_user: dict = Depends(get_current_user)):
     cliente: un admin local de un tenant no debería verla. Cuando
     SUPER_ADMIN_USERS está seteado (ej. en prod:
     "tomas@epical.digital,agus.cafisi"), solo esos usuarios —
-    identificados por username o email — pasan. Sin la var (dev/tests/
-    staging) alcanza con role=admin, igual que require_admin.
+    identificados por username o email — pasan. Sin la var, dev/tests
+    conservan el fallback de admin; cualquier entorno desplegado o
+    desconocido falla cerrado.
     """
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    allow = _super_admin_allowlist()
-    if allow:
-        idents = {
-            (current_user.get("username") or "").lower(),
-            (current_user.get("email") or "").lower(),
-        }
-        if not (idents & allow):
-            raise HTTPException(status_code=403, detail="Super admin access required")
+    if not is_super_admin(
+        current_user.get("username"),
+        current_user.get("email"),
+        current_user.get("role"),
+    ):
+        raise HTTPException(status_code=403, detail="Super admin access required")
     return current_user
 
 
 def _requires_durable_background_storage() -> bool:
-    """Deployed environments may never persist catalogue files locally."""
+    """Only explicitly local environments may persist catalogue files locally."""
     environment = (
         os.environ.get("ENVIRONMENT")
         or os.environ.get("ENV")
         or "production"
     ).strip().lower()
-    return environment in ("staging", "production")
+    return environment not in {"dev", "development", "test", "testing", "local"}
 
 
 class SubmissionsControlRequest(BaseModel):

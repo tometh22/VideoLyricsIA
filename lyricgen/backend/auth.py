@@ -250,16 +250,21 @@ def _super_admin_allowlist() -> set:
 def is_super_admin(username, email, role) -> bool:
     """Mismo criterio que admin.require_super_admin, como predicado puro.
 
-    Sin SUPER_ADMIN_USERS seteado (dev/tests/staging) todo admin es super
-    admin — debe coincidir EXACTO con el fallback del gate del backend
-    para que el sidebar del frontend nunca muestre una sección que después
-    responde 403 (ni la esconda cuando respondería 200).
+    Only explicitly local environments preserve the convenient admin
+    fallback. Every deployed or unknown value fails closed when the
+    allowlist is missing, so a typo can never promote every tenant admin
+    to platform operator.
     """
     if role != "admin":
         return False
     allow = _super_admin_allowlist()
     if not allow:
-        return True
+        environment = (
+            os.environ.get("ENVIRONMENT")
+            or os.environ.get("ENV")
+            or "production"
+        ).strip().lower()
+        return environment in {"dev", "development", "test", "testing", "local"}
     return (username or "").lower() in allow or (email or "").lower() in allow
 
 
