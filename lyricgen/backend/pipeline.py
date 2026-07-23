@@ -12,6 +12,7 @@ logger = logging.getLogger("genly.pipeline")
 import subprocess
 import tempfile
 import threading
+import time
 import traceback
 
 try:
@@ -104,6 +105,25 @@ _DELIVERABLE_FILENAMES = {
 _CRITICAL_DELIVERABLES = ("video", "short", "thumbnail")
 
 
+class StorageUploadError(RuntimeError):
+    """All bounded R2 upload attempts failed while local outputs still exist.
+
+    This exception is deliberately distinct from render failures: deleting the
+    job directory here would destroy the only copy that can still be uploaded
+    by this worker/container.
+    """
+
+
+def _r2_upload_attempts() -> int:
+    """Bound retry config and keep a typo from bypassing output retention."""
+    raw = os.environ.get("R2_UPLOAD_ATTEMPTS", "3")
+    try:
+        return max(1, min(int(raw), 10))
+    except (TypeError, ValueError):
+        logger.error("Invalid R2_UPLOAD_ATTEMPTS=%r; using 3", raw)
+        return 3
+
+
 def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
     """Upload each produced deliverable to R2 and delete the local copy on
     success. Returns {file_type: s3_key}.
@@ -174,10 +194,34 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
             heartbeat(job_id)
         except Exception:
             pass  # heartbeat is best-effort; never block an upload
-        try:
-            key = storage.upload_master(local, tenant_id, job_id, key_name)
-            if key:
-                out[ftype_short] = key
+        key = None
+        last_error: Exception | None = None
+        attempts = _r2_upload_attempts()
+        for attempt in range(1, attempts + 1):
+            try:
+                if attempt > 1:
+                    from ops_metrics import increment
+                    increment("r2_upload_retry")
+                    update_job(job_id, current_step="upload_retry")
+                    heartbeat(job_id)
+                    # Bounded exponential backoff with jitter. The output stays
+                    # on this worker's filesystem for every attempt.
+                    delay = min(30.0, 2.0 * (4 ** (attempt - 2)))
+                    time.sleep(delay + random.uniform(0, min(1.0, delay / 4)))
+                key = storage.upload_master(local, tenant_id, job_id, key_name)
+                if not key:
+                    raise RuntimeError("upload_master returned no key")
+                break
+            except Exception as e:
+                _raise_if_job_timeout(e)
+                last_error = e
+                logger.warning(
+                    "[R2] upload attempt %d/%d failed job=%s file=%s: %s",
+                    attempt, attempts, job_id, key_name, e,
+                )
+
+        if key:
+            try:
                 # Atomic merge into job.s3_keys so a concurrent
                 # prores.prewarm_prores writing umg_master/umg_short
                 # doesn't get clobbered when the caller eventually
@@ -186,6 +230,15 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
                     merge_s3_keys(job_id, ftype_short, key)
                 except Exception as e:
                     logger.warning("[R2] merge_s3_keys failed for %s: %s", ftype_short, e)
+                    # The blob exists, but deleting the only local copy before
+                    # its key is durable in Postgres would produce a completed
+                    # job whose download path returns 404. Preserve the file
+                    # and surface critical bookkeeping failures as storage
+                    # errors so this worker's recovery window remains useful.
+                    if ftype_short in _CRITICAL_DELIVERABLES:
+                        failed_critical.append(f"{ftype_short} (key persistence failed)")
+                    continue
+                out[ftype_short] = key
                 # Upload confirmed — delete the local copy so the disk doesn't
                 # fill up (a HD ProRes master is ~5 GB, a 240 GB NVMe fills
                 # after ~50 UMG deliveries).
@@ -193,19 +246,16 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
                     os.unlink(local)
                 except OSError as e:
                     logger.error("[R2] Could not remove local %s: %s", local, e)
-            else:
-                # upload_master returned None without raising — treat as failure.
-                logger.error("[R2] Upload returned no key for %s", key_name)
-                if ftype_short in _CRITICAL_DELIVERABLES:
-                    failed_critical.append(ftype_short)
-        except Exception as e:
-            logger.error("[R2] Upload failed for %s: %s", key_name, e)
-            if ftype_short in _CRITICAL_DELIVERABLES:
-                failed_critical.append(f"{ftype_short} ({type(e).__name__})")
+            except Exception as e:
+                _raise_if_job_timeout(e)
+                logger.error("[R2] post-upload bookkeeping failed for %s: %s", key_name, e)
+        elif ftype_short in _CRITICAL_DELIVERABLES:
+            error_name = type(last_error).__name__ if last_error else "unknown"
+            failed_critical.append(f"{ftype_short} ({error_name})")
     if failed_critical:
         # Bubble up so the pipeline's outer except marks the job `error`
         # instead of leaving it `done` with a half-uploaded set of files.
-        raise RuntimeError(
+        raise StorageUploadError(
             "R2 upload failed for critical deliverables: "
             + ", ".join(failed_critical)
         )
@@ -902,6 +952,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
     _runtime_atmospherics = resolve_atmospherics_policy(background_hint)
     _runtime_policy_fingerprint = runtime_rollout_fingerprint(
         mode=_runtime_atmospherics.get("policy_mode")
+    )
+    from background_policy import compatible_policy_fingerprint
+    background_policy_fingerprint = compatible_policy_fingerprint(
+        background_policy_fingerprint, _runtime_policy_fingerprint,
     )
     _lockstep_mismatch = bool(
         background_policy_fingerprint
@@ -2022,9 +2076,13 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         _raise_if_job_timeout(exc)
         traceback.print_exc()
         from error_taxonomy import classify_error
+        error_category = (
+            "storage_upload" if isinstance(exc, StorageUploadError)
+            else classify_error(str(exc))
+        )
         update_job(
             job_id, status="error", error=str(exc),
-            error_category=classify_error(str(exc)),
+            error_category=error_category,
         )
         # Surface render failures to Sentry. The worker runs outside
         # the FastAPI request loop so the framework's auto-capture
@@ -2047,7 +2105,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # re-renders. When it ISN'T, the input lives only locally inside job_dir,
         # so preserve it (just free the heavy bg intermediates) — else the retry
         # would fail for lack of its own input. (Adversarial-review guard.)
-        if input_r2_key:
+        if isinstance(exc, StorageUploadError):
+            logger.warning(
+                "[R2] preserving local outputs after exhausted upload retries: %s",
+                job_dir,
+            )
+        elif input_r2_key:
             _cleanup_job_dir_on_failure(job_dir)
         else:
             _cleanup_local_intermediates(job_dir)
@@ -10817,14 +10880,6 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         atmospherics_policy.get("authorization_source"),
     )
 
-    # If there are video files in backgrounds dir, use those instead
-    all_videos = []
-    if os.path.isdir(BACKGROUNDS_DIR):
-        for root, _, files in os.walk(BACKGROUNDS_DIR):
-            all_videos.extend(f for f in files if f.lower().endswith(".mp4"))
-    if all_videos:
-        return None
-
     _norm_move_bg = _normalize_movement_style(movement_style)
 
     # UMG-style fix (2026-05-25): si el operador eligió "Estático" o "Sutil"
@@ -15175,6 +15230,10 @@ def run_edit_pipeline(
     _edit_runtime_fingerprint = runtime_rollout_fingerprint(
         mode=_edit_runtime_policy.get("policy_mode")
     )
+    from background_policy import compatible_policy_fingerprint
+    background_policy_fingerprint = compatible_policy_fingerprint(
+        background_policy_fingerprint, _edit_runtime_fingerprint,
+    )
     if (
         (background_policy_fingerprint
          and background_policy_fingerprint != _edit_runtime_fingerprint)
@@ -16092,9 +16151,13 @@ def run_edit_pipeline(
         _raise_if_job_timeout(exc)
         logger.error("[EDIT] job=%s FAILED: %s", job_id, exc, exc_info=True)
         from error_taxonomy import classify_error
+        error_category = (
+            "storage_upload" if isinstance(exc, StorageUploadError)
+            else classify_error(str(exc))
+        )
         update_job(
             job_id, status="error", error=f"Edit failed: {exc}",
-            error_category=classify_error(str(exc)),
+            error_category=error_category,
         )
         _write_edit_audit(
             action="job.edit_failed",
@@ -16111,7 +16174,12 @@ def run_edit_pipeline(
         # source from input_r2_key on retry). `input_r2_key` is a local set
         # partway through, and `job_dir` may not exist yet on a very early
         # failure — locals().get + the helper's own isdir guard make this safe.
-        if locals().get("input_r2_key"):
+        if isinstance(exc, StorageUploadError):
+            logger.warning(
+                "[R2] preserving local edit outputs after exhausted upload retries: %s",
+                locals().get("job_dir"),
+            )
+        elif locals().get("input_r2_key"):
             _cleanup_job_dir_on_failure(locals().get("job_dir"))
         else:
             try:

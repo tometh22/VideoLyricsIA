@@ -225,6 +225,32 @@ def policy_observes(policy: dict[str, Any] | None) -> bool:
     return bool(policy and policy.get("policy_mode") in {"shadow", "enforce"})
 
 
+def compatible_policy_fingerprint(received: str | None, runtime: str) -> str | None:
+    """Adapt metadata-less RQ v1 jobs without weakening new payload checks.
+
+    The pre-protocol API could not attach the lockstep fingerprint. During the
+    bounded N/N-1 compatibility window, a new worker may execute those already
+    queued v1 jobs and treats the current runtime policy as their effective
+    value. A v2+ job missing the fingerprint still fails closed.
+    """
+    if received:
+        return received
+    try:
+        from rq import get_current_job
+        from queue_jobs import validate_rq_payload_metadata
+        job = get_current_job()
+        if job is not None:
+            meta = getattr(job, "meta", None) or {}
+            version = validate_rq_payload_metadata(meta)
+            if version == 1:
+                return runtime
+            fingerprint = meta.get("background_policy_fingerprint")
+            return str(fingerprint) if fingerprint else None
+    except Exception:
+        pass
+    return None
+
+
 def atmospheric_terms(text: str | None) -> list[str]:
     """Find atmospheric vocabulary in generated/internal text.
 

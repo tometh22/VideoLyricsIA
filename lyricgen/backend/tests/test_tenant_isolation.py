@@ -19,13 +19,15 @@ UMG: two users that share `tenant_id` DO see the same job list.
 import uuid
 
 from database import SessionLocal, Job
-from auth import create_user, create_token
+from auth import create_user, start_login_session
 from tests.conftest import auth
 
 
 def _seed_job(db, tenant_id: str, user_id: int, status: str = "done") -> str:
     """Drop a single Job row directly for the given tenant/user."""
-    job_id = f"isol_{uuid.uuid4().hex[:8]}"
+    # Production schema is VARCHAR(12). Keep the fixture honest so these
+    # security tests exercise Postgres in CI instead of failing at INSERT.
+    job_id = f"i{uuid.uuid4().hex[:11]}"
     db.add(Job(
         job_id=job_id,
         user_id=user_id,
@@ -50,7 +52,7 @@ def _make_user(db, tenant_id: str, username_prefix: str):
         email=None,
         tenant_id=tenant_id,
     )
-    token = create_token(user)
+    token = start_login_session(db, user)
     return user, token
 
 

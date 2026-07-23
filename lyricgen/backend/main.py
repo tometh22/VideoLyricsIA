@@ -21,6 +21,14 @@ bootstrap_vertex_credentials()
 # mail to a real customer's inbox.
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "production"
 
+
+def _business_alerts_enabled() -> bool:
+    """Business/churn alerts are production-only unless explicitly enabled."""
+    configured = os.environ.get("BUSINESS_ALERTS_ENABLED")
+    if configured is not None:
+        return configured.strip().lower() in ("1", "true", "yes", "on")
+    return ENVIRONMENT == "production"
+
 # --- Sentry ---
 # 2026-06-01 UMG-launch hardening: the inline sentry_sdk.init() that used
 # to live here was being silently OVERRIDDEN by the second, lighter init
@@ -29,7 +37,7 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "pr
 # All Sentry config now lives in observability.init_sentry() (single
 # source of truth, shared with worker.py).
 
-from fastapi import FastAPI, File, Form, Header, Query, UploadFile, HTTPException, Depends, Request, Response
+from fastapi import FastAPI, File, Form, Header, Query, UploadFile, HTTPException, Depends, Request, Response, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -45,6 +53,7 @@ from auth import (
     authenticate_user,
     create_token,
     start_login_session,
+    invalidate_user_access,
     create_user,
     create_password_reset_token,
     create_email_verification_token,
@@ -61,6 +70,7 @@ from auth import (
     PLANS,
     create_media_token,
     verify_media_token,
+    MEDIA_TOKEN_EXPIRE_SECONDS,
     validate_password_strength,
     has_prores_access,
     has_drive_access,
@@ -69,6 +79,7 @@ from auth import (
     scenes_credit_cost,
     telemetry_enabled,
     generate_api_key,
+    is_explicitly_local_environment,
     is_super_admin,
 )
 import storage
@@ -433,7 +444,24 @@ async def _disconnect_receive():
     return {"type": "http.disconnect"}
 
 
+class RejectNulPathMiddleware:
+    """Reject URL paths containing a NUL before they reach DB lookups."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and "\x00" in scope.get("path", ""):
+            await JSONResponse(
+                {"detail": "Malformed request path."},
+                status_code=400,
+            )(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 app.add_middleware(DbTransientRetryMiddleware)
+app.add_middleware(RejectNulPathMiddleware)
 
 
 # --- Server-Timing header middleware ---
@@ -460,6 +488,33 @@ async def add_response_time_header(request: Request, call_next):
     response.headers["X-Response-Time"] = f"{elapsed_ms:.1f}ms"
     response.headers["Server-Timing"] = f"app;dur={elapsed_ms:.1f}"
     return response
+
+
+@app.middleware("http")
+async def enforce_submissions_switch(request: Request, call_next):
+    """Reject new/enqueued work while allowing reads and in-flight uploads."""
+    from ops_control import get_submissions_state, is_submission_path
+
+    if is_submission_path(request.method, request.url.path):
+        state = await asyncio.to_thread(get_submissions_state)
+        if state.get("paused"):
+            from ops_metrics import increment
+            await asyncio.to_thread(increment, "submissions_blocked")
+            retry_after = str(state.get("retry_after") or 60)
+            logger.warning(
+                "[OPS] submission blocked method=%s path=%s reason=%s",
+                request.method, request.url.path, state.get("reason") or "maintenance",
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "code": "submissions_paused",
+                    "detail": state.get("reason") or "New submissions are temporarily paused.",
+                    "until": state.get("until"),
+                },
+                headers={"Retry-After": retry_after},
+            )
+    return await call_next(request)
 
 
 # --- Include routers ---
@@ -513,13 +568,12 @@ def on_startup():
 
     # CV3 (audit 2026-05-25) — Multi-replica coordination helper.
     # Wraps a callable in a Postgres advisory lock. Cuando hay 2+ replicas
-    # API, ambas ejecutan los daemon threads (bg_cache_cleanup, outputs_
-    # cleanup) — sin coordinación corren N veces por ciclo, generando
+    # API, ambas ejecutan los daemon threads (bg_cache_cleanup) — sin
+    # coordinación corren N veces por ciclo, generando
     # ruido Sentry, posibles double-deletes y emails duplicados. El
     # reaper YA tiene su propio lock interno; este helper extiende el
     # mismo patrón a los otros loops.
     _BG_PREVIEW_CLEANUP_LOCK_KEY = 9118364455199102
-    _OUTPUTS_CLEANUP_LOCK_KEY = 9118364455199103
 
     def _run_with_advisory_lock(lock_key: int, work_fn, *, name: str = "") -> bool:
         """Execute work_fn solo si conseguimos el advisory lock.
@@ -629,37 +683,9 @@ def on_startup():
     threading.Thread(target=_bg_preview_cleanup_loop, daemon=True, name="bg_preview_cleanup").start()
     logger.info("bg_preview cleanup thread started (TTL=24h, every 6h)")
 
-    # Outputs cleanup loop. Sweeps OUTPUTS_DIR every hour to keep
-    # local disk bounded — deletes jobs whose deliverables are on R2
-    # and retries the upload for jobs whose R2 push failed earlier.
-    # Without this, a transient R2 outage leaves multi-GB ProRes
-    # masters on disk forever and Railway disk fills over weeks.
-    def _outputs_cleanup_loop():
-        _time.sleep(120)  # let the API come up first
-        while True:
-            try:
-                def _do_outputs_cleanup():
-                    from scripts.cleanup_old_outputs import cleanup as _cleanup_outputs
-                    _cleanup_outputs()
-                # CV3 (audit 2026-05-25): gated por advisory lock para que
-                # con 2+ replicas API NO se borre el mismo job 2 veces.
-                _run_with_advisory_lock(
-                    _OUTPUTS_CLEANUP_LOCK_KEY, _do_outputs_cleanup,
-                    name="outputs_cleanup",
-                )
-            except Exception:  # pragma: no cover
-                try:
-                    import sentry_sdk
-                    sentry_sdk.capture_exception()
-                except Exception:
-                    pass
-                _time.sleep(60)
-            _time.sleep(3600)  # 1 h between passes
-
-    threading.Thread(
-        target=_outputs_cleanup_loop, daemon=True, name="outputs-cleanup",
-    ).start()
-    logger.info("outputs-cleanup thread started (every 1 h)")
+    # Output files live on each worker's isolated filesystem. Cleanup runs in
+    # worker.py; an API replica cannot recover or delete another container's
+    # render directory.
 
     # Retención de telemetría de sesiones. Las rows de user_sessions crecen
     # ~1 por usuario por sesión (no por heartbeat), así que el volumen es
@@ -773,10 +799,16 @@ def on_startup():
                 _time.sleep(60)
             _time.sleep(24 * 3600)  # diario
 
-    threading.Thread(
-        target=_business_alerts_loop, daemon=True, name="business-alerts",
-    ).start()
-    logger.info("business-alerts thread started (daily)")
+    if _business_alerts_enabled():
+        threading.Thread(
+            target=_business_alerts_loop, daemon=True, name="business-alerts",
+        ).start()
+        logger.info("business-alerts thread started (daily)")
+    else:
+        logger.info(
+            "business-alerts disabled outside production "
+            "(set BUSINESS_ALERTS_ENABLED=1 to override)"
+        )
 
     # Tripwire de saturación del pool de Postgres — indicador LÍDER: avisa por
     # Sentry (→ Sentinel → Telegram) ANTES de que el pool se agote y tire el
@@ -794,11 +826,32 @@ def on_startup():
 _BACKGROUNDS_LIB = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
 
 
+def _legacy_background_path(filename: str) -> str | None:
+    """Resolve a legacy local asset without permitting path traversal."""
+    if not filename or os.path.basename(filename) != filename:
+        return None
+    library_root = os.path.realpath(_BACKGROUNDS_LIB)
+    candidate = os.path.realpath(os.path.join(library_root, filename))
+    if not candidate.startswith(library_root + os.sep):
+        return None
+    return candidate
+
+
+def _background_asset_is_available(asset: "BackgroundAsset") -> bool:
+    """Whether this API/worker topology can actually materialize an asset."""
+    filename = asset.filename or ""
+    if filename.startswith("library/"):
+        # Tests/dev may model R2 rows without credentials. Deployed
+        # or unknown environments must never advertise an object they
+        # cannot fetch. Unknown values fail closed to cover config typos.
+        return storage.is_enabled() or is_explicitly_local_environment(ENVIRONMENT)
+    local_path = _legacy_background_path(filename)
+    return bool(local_path and os.path.isfile(local_path))
+
+
 def _user_can_use_asset(asset: "BackgroundAsset", current_user: dict) -> bool:
-    """Tenant gate for library assets. Admins see everything; everyone else
-    can only see assets that are global (owner_tenant_id IS NULL) or owned
-    by their own tenant. Backs the UMG exclusivity contract."""
-    if current_user.get("role") == "admin":
+    """Tenant gate: only platform super-admins bypass asset ownership."""
+    if current_user.get("is_super_admin"):
         return True
     if asset.owner_tenant_id is None:
         return True
@@ -806,10 +859,8 @@ def _user_can_use_asset(asset: "BackgroundAsset", current_user: dict) -> bool:
 
 
 def _apply_asset_tenant_filter(query, current_user: dict):
-    """Add a tenant scope to a BackgroundAsset query. Admins get the
-    unfiltered query back; everyone else gets `owner IS NULL OR owner = mine`.
-    """
-    if current_user.get("role") == "admin":
+    """Scope assets to global + caller tenant unless caller is super-admin."""
+    if current_user.get("is_super_admin"):
         return query
     from sqlalchemy import or_
     return query.filter(
@@ -820,6 +871,38 @@ def _apply_asset_tenant_filter(query, current_user: dict):
     )
 
 
+class BackgroundPreviewTokensRequest(BaseModel):
+    asset_ids: list[int] = Field(..., min_length=1, max_length=50)
+
+
+@app.post("/backgrounds/preview-tokens")
+def issue_background_preview_tokens(
+    body: BackgroundPreviewTokensRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Mint five-minute tokens for only the visible/authorized asset ids."""
+    unique_ids = list(dict.fromkeys(body.asset_ids))
+    query = db.query(BackgroundAsset).filter(BackgroundAsset.id.in_(unique_ids))
+    if not current_user.get("is_super_admin"):
+        query = query.filter(BackgroundAsset.is_active == True)
+    assets = _apply_asset_tenant_filter(query, current_user).all()
+    visible = {
+        asset.id for asset in assets
+        if _background_asset_is_available(asset)
+    }
+    user_model = db.query(User).filter(User.id == current_user["id"]).first()
+    return {
+        "tokens": {
+            str(asset_id): create_media_token(
+                user_model, f"background:{asset_id}", "preview",
+            )
+            for asset_id in unique_ids if asset_id in visible
+        },
+        "expires_in": 300,
+    }
+
+
 @app.get("/backgrounds")
 def list_backgrounds(
     current_user: dict = Depends(get_current_user),
@@ -827,14 +910,16 @@ def list_backgrounds(
 ):
     """List active pre-approved background assets visible to the caller.
 
-    Tenant scope: a non-admin user only sees assets either marked global
-    (owner_tenant_id IS NULL) or owned by their own tenant_id. Admins see
-    everything for moderation/audit.
+    Tenant scope: callers see global assets plus their own tenant's assets.
+    Only platform super-admins see cross-tenant inventory.
     """
     q = db.query(BackgroundAsset).filter(BackgroundAsset.is_active == True)
     q = _apply_asset_tenant_filter(q, current_user)
     assets = q.order_by(BackgroundAsset.created_at.desc()).all()
-    return [a.to_dict() for a in assets]
+    return [
+        asset.to_dict() for asset in assets
+        if _background_asset_is_available(asset)
+    ]
 
 
 @app.get("/backgrounds/{asset_id}/usage")
@@ -851,7 +936,9 @@ def background_usage(
     UI can distinguish "used as-is" from "used as variation source".
     """
     asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == asset_id).first()
-    if not asset or not _user_can_use_asset(asset, current_user):
+    if (not asset
+            or not _user_can_use_asset(asset, current_user)
+            or not _background_asset_is_available(asset)):
         raise HTTPException(status_code=404, detail="Asset not found")
 
     tenant_id = current_user["tenant_id"]
@@ -895,9 +982,12 @@ def backgrounds_usage_batch(
     int, así que FastAPI no lo captura como asset_id (path param int).
     """
     tenant_id = current_user["tenant_id"]
-    q = db.query(BackgroundAsset.id).filter(BackgroundAsset.is_active == True)  # noqa: E712
+    q = db.query(BackgroundAsset).filter(BackgroundAsset.is_active == True)  # noqa: E712
     q = _apply_asset_tenant_filter(q, current_user)
-    visible_ids = {row[0] for row in q.all()}
+    visible_ids = {
+        asset.id for asset in q.all()
+        if _background_asset_is_available(asset)
+    }
     if not visible_ids:
         return {"tenant_id": tenant_id, "usage": {}}
     rows = (
@@ -955,6 +1045,13 @@ def _resolve_library_background(
     if not _user_can_use_asset(asset, current_user):
         # Don't reveal whether the asset exists — same response as not found.
         raise HTTPException(status_code=404, detail="Background not found.")
+    if not _background_asset_is_available(asset):
+        logger.warning(
+            "background asset unavailable id=%s storage=%s",
+            asset.id,
+            "r2" if (asset.filename or "").startswith("library/") else "legacy_local",
+        )
+        raise HTTPException(status_code=404, detail="Background not found.")
 
     # Variation requires a video source — _extract_frame_from_video calls
     # ffprobe and explodes on stills. The UI hides the toggle for images,
@@ -983,7 +1080,7 @@ def _resolve_library_background(
             bg_path = local_path
             bg_r2_key = asset.filename
     else:
-        local_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
+        local_path = _legacy_background_path(asset.filename)
         if background_mode == "variation":
             var_path = local_path
         else:
@@ -1045,22 +1142,32 @@ async def preview_background(
     don't queue against the pool."""
     import storage
     with scoped_db() as db:
-        user = get_current_user_from_token_param(token, db)
+        user = verify_media_token(
+            token, f"background:{asset_id}", "preview", db,
+        )
         asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == asset_id).first()
-        if not asset or not _user_can_use_asset(asset, user):
+        if (not asset
+                or not _user_can_use_asset(asset, user)
+                or not _background_asset_is_available(asset)
+                or (not user.get("is_super_admin") and not asset.is_active)):
             raise HTTPException(status_code=404, detail="Asset not found")
         # Snapshot the fields we need before closing the session.
         asset_filename = asset.filename
         asset_file_type = asset.file_type
 
-    if asset_filename.startswith("library/") and storage.is_enabled():
-        url = storage.generate_signed_url(asset_filename, expiry_seconds=900)
+    if asset_filename.startswith("library/"):
+        if not storage.is_enabled():
+            raise HTTPException(status_code=503, detail="Asset storage unavailable")
+        url = storage.generate_signed_url(
+            asset_filename,
+            expiry_seconds=MEDIA_TOKEN_EXPIRE_SECONDS,
+        )
         if url:
             return RedirectResponse(url, status_code=302)
-        # If signing failed for any reason, fall through to local fallback.
+        raise HTTPException(status_code=503, detail="Asset preview unavailable")
 
-    file_path = os.path.join(_BACKGROUNDS_LIB, asset_filename)
-    if not os.path.exists(file_path):
+    file_path = _legacy_background_path(asset_filename)
+    if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
     media_type = "video/mp4" if asset_file_type == "mp4" else f"image/{asset_file_type}"
     return FileResponse(file_path, media_type=media_type)
@@ -1096,7 +1203,9 @@ async def health():
     socket, returning 503 and aborting the deploy 5/5 replicas. See
     observability.py:_within_startup_grace.
     """
-    snap = health_snapshot()
+    # DB/Redis/R2 probes are synchronous SDK calls; keep them off uvicorn's
+    # event loop so a slow object-store HEAD cannot stall unrelated requests.
+    snap = await asyncio.to_thread(health_snapshot)
     if snap.get("status") == "down":
         return JSONResponse(snap, status_code=503)
     return snap
@@ -1140,7 +1249,7 @@ async def health_ready():
     200 with status=degraded when a non-critical issue exists (low disk,
     no live workers, etc.) but service is still usable.
     """
-    snap = health_snapshot()
+    snap = await asyncio.to_thread(health_snapshot)
     if snap.get("status") == "down":
         return JSONResponse(snap, status_code=503)
     return snap
@@ -1245,6 +1354,7 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
                 # Versión B (letra anclada): el frontend gatea el textarea
                 # del wizard y el botón "Re-sincronizar con IA" con esto.
                 "anchor_lyrics": _anchor_lyrics_enabled(),
+                "youtube_publish": _youtube_publish_enabled(),
             },
         },
     }
@@ -1301,6 +1411,7 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
             password=body.password,
             email=body.email or None,
             plan="free",
+            commit=False,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1351,6 +1462,7 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
                 # Versión B (letra anclada): el frontend gatea el textarea
                 # del wizard y el botón "Re-sincronizar con IA" con esto.
                 "anchor_lyrics": _anchor_lyrics_enabled(),
+                "youtube_publish": _youtube_publish_enabled(),
             },
         },
     }
@@ -1381,11 +1493,12 @@ async def reset_password(body: ResetPasswordRequest, request: Request, db: Sessi
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    user = verify_password_reset_token(db, body.token)
+    user = verify_password_reset_token(db, body.token, commit=False)
     if not user:
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
 
     user.hashed_password = pwd_context.hash(body.password)
+    invalidate_user_access(db, user)
     db.commit()
 
     return {"ok": True, "message": "Password reset successfully"}
@@ -1423,6 +1536,7 @@ def me(current_user: dict = Depends(get_current_user), db: Session = Depends(get
             # Versión B (letra anclada): el frontend gatea el textarea
             # del wizard y el botón "Re-sincronizar con IA" con esto.
             "anchor_lyrics": _anchor_lyrics_enabled(),
+            "youtube_publish": _youtube_publish_enabled(),
         },
     }
 
@@ -1809,12 +1923,16 @@ async def change_password(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     user.hashed_password = pwd_context.hash(body.new_password)
+    invalidate_user_access(db, user, keep_jti=current_user.get("jti"))
     db.add(AuditLog(
         user_id=user.id, action="auth.change_password",
         ip_address=request.client.host if request.client else None,
     ))
     db.commit()
-    return {"ok": True}
+    # The current session row survives, but its old token has the stale
+    # auth_version. Return a replacement bound to the same device/session.
+    token = create_token(user, jti=current_user.get("jti"))
+    return {"ok": True, "token": token}
 
 
 @app.get("/auth/data-export")
@@ -7497,6 +7615,7 @@ async def generate_with_segments(
     # un video largo puede pesar varios cientos de KB. 5 MB es techo
     # generoso que rechaza payload absurdo sin restringir casos reales.
     segments_json: str = Form(..., max_length=5_000_000),
+    base_revision: str = Form("", max_length=20),
     delivery_profile: str = Form("youtube", max_length=20),  # Job.delivery_profile = VARCHAR(20)
     umg_frame_size: str = Form("", max_length=16),
     umg_fps: str = Form("", max_length=16),
@@ -7572,6 +7691,18 @@ async def generate_with_segments(
     """
     job_id = (job_id or "").strip()
     reuse = bool(job_id)
+    try:
+        segments = json.loads(segments_json)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="segments_json must be valid JSON") from exc
+    if not isinstance(segments, list):
+        raise HTTPException(status_code=400, detail="segments_json must be an array")
+    try:
+        requested_revision = int(base_revision) if str(base_revision).strip() else None
+        if requested_revision is not None and requested_revision < 0:
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="base_revision must be a non-negative integer") from exc
 
     if reuse:
         # Reuse path: verify the job belongs to caller and pull the audio
@@ -7582,8 +7713,11 @@ async def generate_with_segments(
         #   - awaiting_upload: direct-generate flow (no editor;
         #     segments_json is "[]" so the worker runs Whisper itself
         #     against the audio that already landed in R2).
-        from jobs import get_job_model
-        job_row = get_job_model(db, job_id)
+        job_row = (
+            db.query(Job)
+            .filter(Job.job_id == job_id)
+            .first()
+        )
         if (not job_row
                 or job_row.user_id != current_user["id"]
                 or job_row.tenant_id != current_user["tenant_id"]):
@@ -7598,6 +7732,26 @@ async def generate_with_segments(
             raise HTTPException(
                 status_code=409,
                 detail=f"Job is in state {job_row.status!r}, cannot generate.",
+            )
+        current_revision = int(getattr(job_row, "segments_revision", 0) or 0)
+        if requested_revision is None and current_revision > 0:
+            return JSONResponse(
+                status_code=428,
+                content={"code": "client_upgrade_required", "current_revision": current_revision},
+            )
+        if requested_revision is not None and requested_revision != current_revision:
+            from ops_metrics import increment
+            increment("segments_revision_conflict")
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "code": "stale_revision",
+                    "current_revision": current_revision,
+                    "updated_at": (
+                        job_row.last_user_activity_at.isoformat()
+                        if job_row.last_user_activity_at else None
+                    ),
+                },
             )
         if job_row.status == "awaiting_upload":
             # Direct-generate path. The R2 PUT must be finished (no
@@ -7696,7 +7850,6 @@ async def generate_with_segments(
         if user_model and not user_model.ai_authorized:
             raise HTTPException(status_code=403, detail="AI tool usage not authorized. Contact admin for approval.")
 
-    segments = json.loads(segments_json)
     umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile, current_user=current_user)
 
     # Check plan limits
@@ -7710,7 +7863,31 @@ async def generate_with_segments(
     if reuse:
         # Promote the existing transcribed_pending row in place — fill in
         # the fields the editor finalised + flip status to queued.
-        job_row = get_job_model(db, job_id)
+        job_row = (
+            db.query(Job)
+            .filter(Job.job_id == job_id)
+            .with_for_update()
+            .first()
+        )
+        current_revision = int(getattr(job_row, "segments_revision", 0) or 0)
+        if requested_revision is None and current_revision > 0:
+            return JSONResponse(
+                status_code=428,
+                content={"code": "client_upgrade_required", "current_revision": current_revision},
+            )
+        if requested_revision is not None and requested_revision != current_revision:
+            from ops_metrics import increment
+            increment("segments_revision_conflict")
+            return JSONResponse(
+                status_code=409,
+                content={"code": "stale_revision", "current_revision": current_revision},
+            )
+        # Normally the preceding autosave already persisted the exact payload.
+        # A CAS-matching direct client may still combine save+generate; in that
+        # case the server performs the segment write and owns the increment.
+        if requested_revision is not None and job_row.segments_json != segments:
+            job_row.segments_json = segments
+            job_row.segments_revision = current_revision + 1
         job_row.artist = artist
         job_row.song_title = song_title or None
         job_row.style = style
@@ -8040,6 +8217,7 @@ def status(
         # endpoint, which is the one the frontend actually polls
         # (JobDetail.jsx fetches `/status/${job_id}`, never `/jobs/{id}`).
         "segments_json": job.get("segments_json"),
+        "segments_revision": int(job.get("segments_revision") or 0),
         "bg_r2_key_cached": job.get("bg_r2_key_cached"),
         # Approval state. JobDetail uses these to render the "Aprobado"
         # badge and to gate the "Enviar a UMG" button (admin-only). Both
@@ -8081,18 +8259,14 @@ def _sse_tick(token, job_id, scope, initial_user_id, initial_tenant_id):
         transfers the user across tenants mid-stream. Security, not optional.
     ``scoped_db()`` releases the connection back to the pool in milliseconds.
     """
-    from auth import decode_token as _decode
-    try:
-        _decode(token)
-    except HTTPException:
-        return None, True, "token_expired"
-    except Exception:
-        # decode_token only raises HTTPException; treat any other JWT-lib
-        # error as an invalid token too.
-        return None, True, "token_invalid"
     with scoped_db() as db_tick:
-        fresh_user = db_tick.query(User).filter(User.id == initial_user_id).first()
-        if not fresh_user or fresh_user.tenant_id != initial_tenant_id:
+        try:
+            fresh_user = get_current_user_from_token_param(token, db_tick)
+        except HTTPException as exc:
+            reason = "session_unavailable" if exc.status_code == 503 else "token_invalid"
+            return None, True, reason
+        if (fresh_user.get("id") != initial_user_id
+                or fresh_user.get("tenant_id") != initial_tenant_id):
             return None, True, "tenant_changed"
         job = get_job(db_tick, job_id, **scope)
     return job, False, ""
@@ -8101,12 +8275,14 @@ def _sse_tick(token, job_id, scope, initial_user_id, initial_tenant_id):
 @app.get("/events/{job_id}")
 async def job_events(
     job_id: str,
-    token: str = Query(..., description="Auth token (EventSource can't send Bearer headers)"),
+    request: Request,
+    token: str | None = Query(None, description="Temporary legacy query auth"),
 ):
     """Server-Sent Events stream for a single job. Emits one event whenever
-    the job's status, step, or progress changes, then closes on any terminal
-    state. The client passes the login JWT as ?token= because EventSource
-    does not support custom request headers.
+    the job's status, step, or progress changes and a keepalive comment on
+    unchanged ticks, then closes on any terminal state. New clients
+    authenticate with an Authorization Bearer header.
+    Query authentication is a temporary, server-controlled compatibility path.
 
     Connection budget: this is the worst pool-hog in the codebase
     pre-fix because an SSE stream can live for the full render
@@ -8121,10 +8297,28 @@ async def job_events(
     # Validate auth + job access up front with a short-lived session.
     # If anything below fails the client gets a normal HTTP error
     # without ever entering the SSE generator.
+    auth_header = request.headers.get("authorization", "")
+    bearer_token = ""
+    if auth_header.lower().startswith("bearer "):
+        bearer_token = auth_header.split(" ", 1)[1].strip()
+    if bearer_token:
+        access_token = bearer_token
+    elif token and os.environ.get(
+        "SSE_LEGACY_QUERY_AUTH_ENABLED", "0"
+    ).strip().lower() in ("1", "true", "yes", "on"):
+        access_token = token
+        logger.warning("[SECURITY] legacy SSE query authentication used")
+        from ops_metrics import increment
+        await asyncio.to_thread(increment, "sse_query_access_token")
+    else:
+        raise HTTPException(status_code=401, detail="Bearer authentication required.")
+
     with scoped_db() as db:
         try:
-            current_user = get_current_user_from_token_param(token, db)
-        except HTTPException:
+            current_user = get_current_user_from_token_param(access_token, db)
+        except HTTPException as exc:
+            if exc.status_code == 503:
+                raise
             raise HTTPException(status_code=401, detail="Invalid or expired token.")
         job_check = get_job(db, job_id, **_job_scope(current_user))
         if job_check is None:
@@ -8165,7 +8359,7 @@ async def job_events(
             # corremos off-loop con asyncio.to_thread para que N dashboards
             # abiertos no inunden el event loop cada 2 s.
             job, unauthorized, unauthorized_reason = await asyncio.to_thread(
-                _sse_tick, token, job_id, scope, _initial_user_id, _initial_tenant_id,
+                _sse_tick, access_token, job_id, scope, _initial_user_id, _initial_tenant_id,
             )
             if unauthorized:
                 yield f"event: unauthorized\ndata: {json.dumps({'reason': unauthorized_reason})}\n\n"
@@ -8207,6 +8401,12 @@ async def job_events(
                     "step_text_es": _step_text,
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
+            else:
+                # Keep the stream observable even while a long render remains
+                # on the same step/progress value. The frontend watchdog is
+                # 6–8 s; ticks are every 2 s, so a healthy idle stream never
+                # looks frozen. SSE comments are ignored by event handlers.
+                yield ": keepalive\n\n"
             if job["status"] in TERMINAL:
                 break
             await asyncio.sleep(2)
@@ -8552,10 +8752,22 @@ async def download(
         elif readiness.state == ProResReadiness.NOT_STARTED:
             # Kick off a prewarm in the background, then 202.
             try:
-                from queue_jobs import enqueue_prores_prewarm
+                from queue_jobs import enqueue_prores_prewarm, SubmissionsPausedError
                 enqueue_prores_prewarm(job_id, file_type)
+            except SubmissionsPausedError as exc:
+                from ops_control import get_submissions_state
+                state = get_submissions_state()
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "code": "submissions_paused",
+                        "detail": str(exc),
+                    },
+                    headers={"Retry-After": str(state.get("retry_after", 60))},
+                )
             except Exception as e:  # pragma: no cover
                 logger.warning("[PRORES] enqueue prewarm from /download failed: %s", e)
+                raise HTTPException(status_code=503, detail="ProRes queue unavailable")
             return JSONResponse(
                 status_code=202,
                 content={
@@ -8621,7 +8833,10 @@ async def preview(
         return FileResponse(file_path, media_type=MEDIA_TYPES[file_type])
 
     if s3_key and storage.is_enabled():
-        url = storage.generate_signed_url(s3_key, expiry_seconds=3600)
+        url = storage.generate_signed_url(
+            s3_key,
+            expiry_seconds=MEDIA_TOKEN_EXPIRE_SECONDS,
+        )
         if url:
             return RedirectResponse(url, status_code=302)
 
@@ -8976,6 +9191,8 @@ class EditJobRequest(BaseModel):
     # segments_json before enqueueing. Each segment must have start (s),
     # end (s), text (str); anything else is ignored.
     segments: list[dict] | None = Field(default=None)
+    base_revision: int | None = Field(default=None, ge=0)
+    force_conflict_overwrite: bool = False
     # Optional free-form hint for edit_type=="background". The operator
     # types what they want the new background to convey ("paisaje cálido
     # al atardecer", "abstracto con ondas de luz suave", etc.) and the
@@ -9513,6 +9730,9 @@ class SaveSegmentsRequest(BaseModel):
     # form-field cap — a long video can legitimately ship a few hundred
     # KB of segments.
     segments: list[dict] = Field(..., max_length=10000)
+    # Server-owned OCC: the client sends the revision it hydrated.
+    # None is accepted only while the job is still legacy revision zero.
+    base_revision: int | None = Field(default=None, ge=0)
 
 
 @app.post("/jobs/{job_id}/save-segments")
@@ -9547,9 +9767,14 @@ async def save_segments(
 
     Validates ownership the same way as /generate's reuse path.
     """
-    from jobs import get_job_model, touch_user_activity
+    from jobs import touch_user_activity
 
-    job = get_job_model(db, job_id)
+    job = (
+        db.query(Job)
+        .filter(Job.job_id == job_id)
+        .with_for_update()
+        .first()
+    )
     # Bypass cross-tenant para admins de plataforma (mismo contrato que
     # _job_scope): un super admin corrige y GUARDA el job de cualquier
     # usuario cuando tiene problemas. Sin esto, abrir el editor de un job
@@ -9562,7 +9787,7 @@ async def save_segments(
                 and (job.user_id != current_user["id"]
                      or job.tenant_id != current_user["tenant_id"]))):
         raise HTTPException(status_code=404, detail="Job not found.")
-    _audit_cross_tenant_access(db, current_user, job, "save_segments")
+    _audit_cross_tenant_access(db, current_user, job, "save_segments", commit=False)
 
     # Wizard (transcribed_pending) is the original use case; pending_review
     # / rejected enable the post-approval /edit modal's autosave so text
@@ -9666,6 +9891,44 @@ async def save_segments(
     # Vez Más — Viejas Locas (agus.cafisi, 2026-05-18).
     segs = sorted(segs, key=lambda s: float(s.get("start", 0) or 0))
 
+    current_revision = int(getattr(job, "segments_revision", 0) or 0)
+    if body.base_revision is None and current_revision > 0:
+        return JSONResponse(
+            status_code=428,
+            content={
+                "code": "client_upgrade_required",
+                "current_revision": current_revision,
+            },
+        )
+    if body.base_revision is not None and body.base_revision != current_revision:
+        # Network retries after a committed response are idempotent when the
+        # canonical payload already matches what is stored.
+        if job.segments_json == segs:
+            return {
+                "ok": True,
+                "job_id": job_id,
+                "applied": False,
+                "revision": current_revision,
+                "count": len(segs),
+            }
+        logger.warning(
+            "[save-segments] conflict job=%s tenant=%s base=%s current=%s",
+            job_id, job.tenant_id, body.base_revision, current_revision,
+        )
+        from ops_metrics import increment
+        increment("segments_revision_conflict")
+        return JSONResponse(
+            status_code=409,
+            content={
+                "code": "stale_revision",
+                "current_revision": current_revision,
+                "updated_at": (
+                    job.last_user_activity_at.isoformat()
+                    if job.last_user_activity_at else None
+                ),
+            },
+        )
+
     # Audit log of what changed between prev and new — only when non-empty.
     # Motivation: operator (Tomas, 2026-05-19) reported "lines change places"
     # in autosync, and we had ZERO way to reconstruct what happened (only
@@ -9734,6 +9997,8 @@ async def save_segments(
         logger.warning("[save-segments] audit log failed: %s", e)
 
     job.segments_json = segs
+    if body.base_revision is not None:
+        job.segments_revision = current_revision + 1
     touch_user_activity(db, job)
     db.commit()
 
@@ -9750,6 +10015,8 @@ async def save_segments(
         "job_id": job_id,
         "saved_at": job.last_user_activity_at.isoformat() if job.last_user_activity_at else None,
         "count": len(segs),
+        "applied": True,
+        "revision": int(getattr(job, "segments_revision", 0) or 0),
     }
 
 
@@ -9761,11 +10028,16 @@ _REANCHOR_ALLOWED = (
 )
 
 
+class ReanchorSegmentsRequest(BaseModel):
+    base_revision: int | None = Field(default=None, ge=0)
+
+
 @app.post("/jobs/{job_id}/reanchor")
 @limiter.limit("6/minute")
 async def reanchor_segments(
     request: Request,
     job_id: str,
+    body: ReanchorSegmentsRequest = Body(default_factory=ReanchorSegmentsRequest),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -9791,10 +10063,13 @@ async def reanchor_segments(
     from jobs import get_job_model, touch_user_activity
 
     job = get_job_model(db, job_id)
+    is_platform_admin = current_user.get("role") == "admin"
     if (not job
-            or job.user_id != current_user["id"]
-            or job.tenant_id != current_user["tenant_id"]):
+            or (not is_platform_admin
+                and (job.user_id != current_user["id"]
+                     or job.tenant_id != current_user["tenant_id"]))):
         raise HTTPException(status_code=404, detail="Job not found.")
+    _audit_cross_tenant_access(db, current_user, job, "reanchor")
     if not _anchor_lyrics_enabled():
         # Flag off → el server no tiene la Versión B habilitada. 409 (no
         # 404) para no confundir con "job inexistente"; el frontend ni
@@ -9810,6 +10085,27 @@ async def reanchor_segments(
                 f"reanchor requires status in {_REANCHOR_ALLOWED} "
                 f"(current: {job.status})"
             ),
+        )
+
+    initial_revision = int(getattr(job, "segments_revision", 0) or 0)
+    if body.base_revision is None and initial_revision != 0:
+        return JSONResponse(
+            status_code=428,
+            content={"code": "client_upgrade_required", "current_revision": initial_revision},
+        )
+    if body.base_revision is not None and body.base_revision != initial_revision:
+        from ops_metrics import increment
+        increment("segments_revision_conflict")
+        return JSONResponse(
+            status_code=409,
+            content={
+                "code": "stale_revision",
+                "current_revision": initial_revision,
+                "updated_at": (
+                    job.last_user_activity_at.isoformat()
+                    if job.last_user_activity_at else None
+                ),
+            },
         )
 
     prev_segs = [dict(s) for s in (job.segments_json or [])
@@ -9878,6 +10174,7 @@ async def reanchor_segments(
             "count": len(prev_segs),
             "review_count": 0,
             "locked_kept": 0,
+            "revision": initial_revision,
         }
 
     # Merge: los segs re-anclados corresponden 1:1 (en orden) a los segs
@@ -9914,11 +10211,41 @@ async def reanchor_segments(
     # Persistir con sesión corta (la del request se soltó antes del I/O).
     from database import SessionLocal as _SL
     _db2 = _SL()
+    persisted_revision = initial_revision
     try:
-        row = get_job_model(_db2, job_id)
+        row = (
+            _db2.query(Job)
+            .filter(Job.job_id == job_id)
+            .with_for_update()
+            .first()
+        )
         if row is None:
             raise HTTPException(status_code=404, detail="Job not found.")
+        current_revision = int(getattr(row, "segments_revision", 0) or 0)
+        if body.base_revision is None and current_revision != 0:
+            return JSONResponse(
+                status_code=428,
+                content={"code": "client_upgrade_required", "current_revision": current_revision},
+            )
+        if body.base_revision is not None and current_revision != body.base_revision:
+            from ops_metrics import increment
+            increment("segments_revision_conflict")
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "code": "stale_revision",
+                    "current_revision": current_revision,
+                    "updated_at": (
+                        row.last_user_activity_at.isoformat()
+                        if row.last_user_activity_at else None
+                    ),
+                },
+            )
         row.segments_json = merged
+        row.segments_revision = (
+            current_revision + 1 if body.base_revision is not None else current_revision
+        )
+        persisted_revision = int(row.segments_revision or 0)
         touch_user_activity(_db2, row)
         try:
             from database import AuditLog
@@ -9930,6 +10257,8 @@ async def reanchor_segments(
                     "n_lines": len(merged),
                     "review_count": review_count,
                     "locked_kept": locked_kept,
+                    "base_revision": current_revision,
+                    "revision": int(row.segments_revision or 0),
                 },
             ))
         except Exception as e:  # noqa: BLE001 — audit best-effort
@@ -9947,6 +10276,7 @@ async def reanchor_segments(
         "review_count": review_count,
         "locked_kept": locked_kept,
         "segments": merged,
+        "revision": persisted_revision,
     }
 
 
@@ -10214,7 +10544,33 @@ async def request_edit(
         # segments persisted — the operator's "Reintentar edit" later sees
         # the new lyrics applied even though the edit was never processed.
         _pre_edit_segments = job.segments_json
+        _pre_edit_revision = int(getattr(job, "segments_revision", 0) or 0)
+        if body.base_revision is None and _pre_edit_revision > 0:
+            return JSONResponse(
+                status_code=428,
+                content={
+                    "code": "client_upgrade_required",
+                    "current_revision": _pre_edit_revision,
+                },
+            )
+        if (body.base_revision is not None
+                and body.base_revision != _pre_edit_revision):
+            from ops_metrics import increment
+            increment("segments_revision_conflict")
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "code": "stale_revision",
+                    "current_revision": _pre_edit_revision,
+                    "updated_at": (
+                        job.last_user_activity_at.isoformat()
+                        if job.last_user_activity_at else None
+                    ),
+                },
+            )
         job.segments_json = normalized_segments
+        if body.base_revision is not None:
+            job.segments_revision = _pre_edit_revision + 1
 
     edit_params: dict = {}
     if body.font is not None:
@@ -10478,6 +10834,9 @@ async def request_edit(
             # cares about every artist/title mutation; this lets ops
             # filter the log without parsing edit_params.
             "metadata_only": _metadata_only,
+            "base_revision": body.base_revision,
+            "segments_revision": int(getattr(job, "segments_revision", 0) or 0),
+            "force_conflict_overwrite": body.force_conflict_overwrite,
         },
     ))
     # HOTFIX F1 2026-05-27 (audit): the pre-edit capture moved UP to
@@ -10511,6 +10870,7 @@ async def request_edit(
         # and see edits that were never actually applied to a video.
         try:
             job.segments_json = _pre_edit_segments
+            job.segments_revision = _pre_edit_revision
         except NameError:
             # Defensive: _pre_edit_segments is only assigned when
             # body.segments was non-empty. Non-lyrics edits (typography,
@@ -10538,6 +10898,7 @@ async def request_edit(
         "edit_count": new_edit_count,
         "edits_remaining": max(0, _MAX_EDITS - new_edit_count),
         "edit_limit_exempt": _is_admin,
+        "segments_revision": int(getattr(job, "segments_revision", 0) or 0),
     }
 
 
@@ -11745,6 +12106,23 @@ class YoutubeUploadBody(BaseModel):
     tags: list[str] | None = None
 
 
+def _youtube_publish_enabled() -> bool:
+    return os.environ.get("YOUTUBE_PUBLISH_ENABLED", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _require_youtube_publish_enabled() -> None:
+    if not _youtube_publish_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "feature_disabled",
+                "message": "YouTube publishing is not enabled.",
+            },
+        )
+
+
 def _load_yt_settings(db: Session, user_id: int) -> dict:
     """The user's YouTube template (title format, header/footer, hashtags,
     mandatory tags, language) from UserSettings — so the template configured
@@ -11754,7 +12132,10 @@ def _load_yt_settings(db: Session, user_id: int) -> dict:
 
 
 @app.get("/youtube/connection-status")
-async def youtube_connection_status(current_user: dict = Depends(get_current_user)):
+async def youtube_connection_status(
+    current_user: dict = Depends(get_current_user),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
+):
     """Check if a YouTube account is connected and return channel info."""
     import asyncio
     from youtube_upload import get_connection_status
@@ -11764,7 +12145,10 @@ async def youtube_connection_status(current_user: dict = Depends(get_current_use
 
 
 @app.get("/youtube/auth-url")
-async def youtube_auth_url(current_user: dict = Depends(get_current_user)):
+async def youtube_auth_url(
+    current_user: dict = Depends(get_current_user),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
+):
     """Return the Google OAuth URL for connecting the system YouTube account.
 
     Solo admin: YouTube es una cuenta central del sistema (todos los tenants
@@ -11786,6 +12170,7 @@ async def youtube_oauth_callback(
     state: str = Query("", max_length=2048),
     error: str = Query("", max_length=200),
     db: Session = Depends(get_db),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
 ):
     """Callback de Google tras el consent. Verifica el state (HMAC),
     intercambia el code, cachea el channel y guarda el token encriptado en
@@ -11846,6 +12231,7 @@ async def youtube_oauth_callback(
 async def youtube_disconnect(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
 ):
     """Disconnect the system YouTube account (admin only)."""
     if current_user.get("role") != "admin":
@@ -11856,7 +12242,11 @@ async def youtube_disconnect(
 
 
 @app.get("/youtube/upload-progress/{job_id}")
-async def youtube_upload_progress(job_id: str, current_user: dict = Depends(get_current_user)):
+async def youtube_upload_progress(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
+):
     """Return the current upload progress (0-100) for a job, or -1 if not uploading."""
     from youtube_upload import get_upload_progress
     return {"progress": get_upload_progress(job_id), "short_progress": get_upload_progress(job_id + "_short")}
@@ -11869,6 +12259,7 @@ async def youtube_upload(
     privacy: str = "unlisted",
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
 ):
     """Upload a completed job's video to YouTube with AI-generated metadata."""
     if body:
@@ -11923,6 +12314,7 @@ async def youtube_upload_short(
     privacy: str = "unlisted",
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
 ):
     """Upload a completed job's Short (vertical 9:16) to YouTube Shorts."""
     if body:
@@ -11975,6 +12367,7 @@ async def youtube_short_metadata_preview(
     job_id: str,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
 ):
     """Preview the AI-generated YouTube Shorts metadata without uploading."""
     job = get_job(db, job_id, **_job_scope(current_user))
@@ -12005,6 +12398,7 @@ async def youtube_metadata_preview(
     job_id: str,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
 ):
     """Preview the AI-generated YouTube metadata without uploading."""
     job = get_job(db, job_id, **_job_scope(current_user))

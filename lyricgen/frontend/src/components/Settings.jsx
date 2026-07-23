@@ -216,6 +216,7 @@ export default function Settings({ onBack }) {
   const [saved, setSaved] = useState(false);
   const [loading, setLoading] = useState(true);
   const [user, setUser] = useState(getUser);
+  const youtubePublishingEnabled = user?.features?.youtube_publish === true;
   // Miembros de una cuenta B2B (billing_group, ej. operadores de Universal):
   // el contrato lo maneja la plataforma directamente con el cliente — los
   // operadores NO ven precios, ni la suscripción de Stripe, ni pueden
@@ -234,6 +235,11 @@ export default function Settings({ onBack }) {
   const [planPreviewError, setPlanPreviewError] = useState(null);
   const [cancelLoading, setCancelLoading] = useState(false);
   const [activeSection, setActiveSection] = useState("cuenta");
+  useEffect(() => {
+    if (!youtubePublishingEnabled && activeSection === "youtube") {
+      setActiveSection("perfil");
+    }
+  }, [youtubePublishingEnabled, activeSection]);
   // Mirror into a ref so the window-focus listener (registered once, empty
   // deps) reads the current section without going stale.
   const activeSectionRef = useRef(activeSection);
@@ -376,8 +382,8 @@ export default function Settings({ onBack }) {
   const ytPollRef = useRef(null);
 
   useEffect(() => {
-    if (activeSection === "youtube") checkYtStatus();
-  }, [activeSection]);
+    if (activeSection === "youtube" && youtubePublishingEnabled) checkYtStatus();
+  }, [activeSection, youtubePublishingEnabled]);
 
   useEffect(() => {
     // The OAuth popup is opened with `noopener`, so its
@@ -965,7 +971,9 @@ export default function Settings({ onBack }) {
           user?.features?.drive_export
             ? { id: "integraciones", label: t("settings.integrations_tab") || "Integraciones", icon: "⌁" }
             : null,
-          { id: "youtube",        label: "YouTube", icon: "▶" },
+          youtubePublishingEnabled
+            ? { id: "youtube", label: "YouTube", icon: "▶" }
+            : null,
           { id: "dispositivos",   label: t("settings.devices_tab"), icon: "▣" },
           // "Mi equipo" sólo si el workspace tiene >1 miembro.
           showTeamTab ? { id: "equipo", label: t("settings.team_tab"), icon: "◎" } : null,
@@ -1601,7 +1609,7 @@ export default function Settings({ onBack }) {
         )}
 
         {/* ════════════════════ YOUTUBE ════════════════════ */}
-        {activeSection === "youtube" && (
+        {youtubePublishingEnabled && activeSection === "youtube" && (
           <>
             {/* ── YouTube account connection ── */}
             <Card>

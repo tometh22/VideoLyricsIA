@@ -96,7 +96,7 @@ describe("Re-sincronizar con IA", () => {
 
     fireEvent.click(screen.getByTestId("reanchor-btn"));
 
-    await waitFor(() => expect(onReanchor).toHaveBeenCalledWith("job-reanchor"));
+    await waitFor(() => expect(onReanchor).toHaveBeenCalledWith("job-reanchor", 0));
     // El flush al backend corre ANTES del reanchor, con el texto actual.
     expect(calls[0][0]).toBe("persist");
     expect(calls[0][1]).toBe("job-reanchor");

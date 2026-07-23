@@ -9,6 +9,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { fetchSse, SseUnauthorizedError } from "../lib/fetchSse";
 
 const TERMINAL = new Set([
   "done",
@@ -30,6 +31,14 @@ export default function useJobProgress(jobId, { api, token } = {}) {
 
   useEffect(() => {
     if (!jobId || !api) return undefined;
+
+    const forceReauth = () => {
+      try {
+        localStorage.removeItem("genly_token");
+        localStorage.removeItem("genly_user");
+      } catch { /* storage unavailable */ }
+      if (import.meta.env.MODE !== "test") window.location.replace("/login");
+    };
 
     const close = () => {
       if (esRef.current?.close) {
@@ -60,6 +69,7 @@ export default function useJobProgress(jobId, { api, token } = {}) {
           const res = await fetch(`${api}/status/${jobId}`, {
             headers: token ? { Authorization: `Bearer ${token}` } : {},
           });
+          if (res.status === 401) { forceReauth(); close(); return; }
           if (!res.ok) return;
           apply(await res.json());
         } catch { /* ignore transient network */ }
@@ -68,63 +78,29 @@ export default function useJobProgress(jobId, { api, token } = {}) {
       pollRef.current = setInterval(tick, 3000);
     };
 
-    try {
-      const url = token
-        ? `${api}/events/${jobId}?token=${encodeURIComponent(token)}`
-        : `${api}/events/${jobId}`;
-      const es = new EventSource(url);
-      esRef.current = es;
-      // INCIDENT (audit 2026-05-24): the previous fallback only fired
-      // when `es.readyState === EventSource.CLOSED`. But browsers park
-      // in CONNECTING when the server returns 500 chronic — they retry
-      // forever, never reach CLOSED, and the polling fallback never
-      // ran. UI stayed at progress=0 indefinitely.
-      //
-      // Now we treat ANY onerror burst as a signal to start polling in
-      // parallel (the polling does no harm even if SSE eventually
-      // reconnects — `apply` is idempotent and both sources read the
-      // same row). Additionally, a wall-clock timeout: if we haven't
-      // received any event within 8 seconds of opening, start polling
-      // proactively so the user always sees motion.
-      let openedAt = Date.now();
-      let receivedAny = false;
-      let pollingStarted = false;
-      const startPollingOnce = () => {
-        if (pollingStarted) return;
-        pollingStarted = true;
-        startPolling();
-      };
-      const noEventTimer = setTimeout(() => {
-        if (!receivedAny) startPollingOnce();
-      }, 8000);
-      es.onmessage = (ev) => {
-        receivedAny = true;
-        try { apply(JSON.parse(ev.data)); }
-        catch { /* malformed event */ }
-      };
-      es.onerror = () => {
-        // The error fires both on a recoverable disconnect (browser
-        // will reconnect) AND on terminal 4xx/5xx. We can't distinguish
-        // reliably across browsers — so any error after a brief grace
-        // period triggers polling. If SSE recovers, both sources run
-        // and `apply` deduplicates by overwriting with the latest data.
-        const sinceOpen = Date.now() - openedAt;
-        if (es.readyState === EventSource.CLOSED || sinceOpen > 3000) {
-          startPollingOnce();
+    const controller = new AbortController();
+    esRef.current = { close: () => controller.abort() };
+    fetchSse(`${api}/events/${jobId}`, {
+      token,
+      signal: controller.signal,
+      onMessage: apply,
+      onEvent: (name, data) => {
+        if (name === "unauthorized") {
+          setState((prev) => ({ ...prev, error: data?.reason || "unauthorized" }));
+          controller.abort();
+          forceReauth();
         }
-      };
-      // Safety: if we unmount or the job closes, kill the timer too.
-      const origClose = close;
-      esRef.currentCleanup = () => {
-        try { clearTimeout(noEventTimer); } catch { /* noop */ }
-      };
-    } catch {
+      },
+    }).catch((error) => {
+      if (controller.signal.aborted) return;
+      if (error instanceof SseUnauthorizedError) {
+        setState((prev) => ({ ...prev, error: "unauthorized" }));
+        forceReauth();
+      }
       startPolling();
-    }
+    });
 
     return () => {
-      // Tear down both the timer and the existing close handler.
-      try { esRef.currentCleanup?.(); } catch { /* noop */ }
       close();
     };
   }, [jobId, api, token]);

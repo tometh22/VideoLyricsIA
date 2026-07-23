@@ -18,15 +18,19 @@ import asyncio
 import json
 import logging
 
+import config
+from logging_utils import configure_logging
+
+# Must run before importing modules that initialize httpx clients/loggers.
+configure_logging()
+
 from fastapi import FastAPI, Request, Response
 
 import agent
-import config
 import sentry_webhook
 import store
 import telegram as tg
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 logger = logging.getLogger("sentinel")
 
 app = FastAPI(title="genly-sentinel")
