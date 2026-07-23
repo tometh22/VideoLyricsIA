@@ -5444,7 +5444,18 @@ def _prompt_may_contain_human_subject(prompt: str | None) -> bool:
         r"(?:3[- ]?d|scale|data|language|render|modelo\s+3d)\s+models?|"
         r"android\s+(?:phone|device|app|operating\s+system)|"
         r"(?:circuit|software|device|motor)\s+drivers?|"
-        r"(?:mathematical|boolean|search)\s+operators?"
+        r"(?:mathematical|boolean|search)\s+operators?|"
+        # Contextos benignos de paisaje que disparaban falsos positivos y
+        # colapsaban prompts sin ninguna persona (bug 2026-07-23: "photographs
+        # appear around them" / "bodies of water" / "cliff faces" / "silhouettes
+        # of pine trees"). No son sujetos humanos; sacarlos antes del scan.
+        r"bodies\s+of\s+water|cuerpos?\s+de\s+agua|corpos?\s+de\s+[aá]gua|"
+        r"(?:cliff|rock|stone|mountain|canyon|glacier|ice|building|wall)\s+faces?|"
+        r"(?:acantilado|roca|piedra|monta[ñn]a)\s+caras?|"
+        r"silhouett\w+\s+of\s+(?:the\s+)?(?:trees?|pines?|mountains?|hills?|"
+        r"buildings?|towers?|rooftops?|skyline|forests?|foliage|branches?|"
+        r"leaves|clouds?|rocks?|ruins?|cit(?:y|yscape))|"
+        r"siluetas?\s+de\s+(?:[aá]rboles|monta[ñn]as|edificios|colinas)"
     )
     scan = _re.sub(rf"\b(?:{object_only})\b", " ", value, flags=_re.IGNORECASE)
     scan = _re.sub(
@@ -5503,7 +5514,12 @@ def _prompt_may_contain_human_subject(prompt: str | None) -> bool:
         r"photographers?|kings?|queens?|princes?|princess(?:es)?|"
         r"silhouettes?|figures?|statues?|mannequins?|faces?|heads?|bodies?|"
         r"limbs?|hands?|arms?|"
-        r"he|she|they|him|her|them|his|hers|their|"
+        # Pronombres NOMINATIVOS (sujeto) = humano SIEMPRE, sin depender del
+        # verbo (fix del leak 2026-07-23: "he drinks / she weeps / they gather"
+        # tienen que dispararse). Se sacan SOLO los de objeto/posesivo
+        # (them/their/his/her/him/hers) que causaban falsos positivos sobre
+        # objetos ("photographs appear around them", "trees and their shadows").
+        r"he|she|they|"
         r"personas?|gente|human[oa]s?|humanoides?|hombres?|mujer(?:es)?|"
         r"niñ[oa]s?|beb[eé]s?|adolescentes?|familias?|parejas?|grupos?|"
         r"multitud(?:es)?|p[uú]blico|audiencia|amig[oa]s?|amantes?|"
@@ -5521,6 +5537,7 @@ def _prompt_may_contain_human_subject(prompt: str | None) -> bool:
         r"pr[ií]ncipes?|princesas?|"
         r"siluetas?|figuras?|estatuas?|maniqu[ií](?:es)?|caras?|rostros?|"
         r"cabezas?|cuerpos?|extremidades?|manos?|brazos?|"
+        # Pronombres ES nominativos (todos son sujeto; no hay riesgo de objeto).
         r"[eé]l|ella|ellos|ellas|"
         r"pessoas?|humanos?|humanoides?|homem|homens|mulher(?:es)?|"
         r"crianças?|beb[eê]s?|adolescentes?|fam[ií]lias?|casais?|grupos?|"
@@ -5538,6 +5555,7 @@ def _prompt_may_contain_human_subject(prompt: str | None) -> bool:
         r"pintor(?:es|as)?|fot[oó]graf[oa]s?|reis?|rainhas?|pr[ií]ncipes?|princesas?|"
         r"silhuetas?|figuras?|est[aá]tuas?|manequins?|faces?|rostos?|"
         r"cabeças?|corpos?|membros?|m[aã]os?|braços?|"
+        # Pronombres PT nominativos.
         r"ele|ela|eles|elas"
     )
     negative = (
@@ -5585,31 +5603,105 @@ def _prompt_may_contain_human_subject(prompt: str | None) -> bool:
     return False
 
 
+# Pool DIVERSO de arquetipos de entorno para el fallback del sanitizador
+# cuando la remoción quirúrgica no deja escena usable. NO es un único string:
+# se elige por hash del prompt para que canciones distintas den entornos
+# distintos (bug 2026-07-23: un fallback fijo colapsaba todos los fondos a lo
+# mismo). Evita a propósito los clichés recurrentes (campo con árbol, callejón,
+# highway desolado, humo, partículas flotando).
+_UNOCCUPIED_FALLBACK_SETTINGS = (
+    "a sunlit room with worn wooden floors and tall windows",
+    "an analog recording studio with mixing consoles and warm lamplight",
+    "an old theater interior with empty velvet seats and stage lights",
+    "a rooftop terrace overlooking a dense city skyline at golden hour",
+    "a dim archive library lined with shelves, papers and shafts of light",
+    "a greenhouse full of plants under soft diffuse grey light",
+    "a neon-lit diner interior at midnight with empty booths and chrome",
+    "a harbor at dawn with moored boats and still reflective water",
+    "a grand cathedral interior with stone columns and colored light",
+    "a vintage train station concourse with iron arches at first light",
+    "a corner cafe interior with marble tables and brass fixtures",
+    "a mountain lake at dusk with mirror-still water and distant peaks",
+)
+
+
 def _sanitize_people_at_provider_boundary(
     prompt: str | None,
     *,
     allow_people: bool,
+    concept: str | None = None,
+    movement_style: str | None = None,
 ) -> str:
-    """Keep positive human requests out of restricted provider prompts.
+    """Mantener sujetos humanos fuera de los prompts restringidos SIN destruir
+    la escena del operador / del planner.
 
-    Planner instructions and negative rails reduce the probability of a human
-    subject, but they are not an authorization boundary. In particular, a
-    Universal operator can type a literal prompt that asks for a singer; that
-    text must not be forwarded verbatim and contradicted later with "no
-    people". When the authoritative policy denies people, replace any positive
-    human-shaped subject with a deterministic, unoccupied visual direction.
+    Antes (bug 2026-07-23): cualquier prompt marcado "con humano" —incluso
+    falsos positivos y el "Mi prompt" explícito del operador— se reemplazaba
+    entero por UN string genérico fijo → todos los fondos salían idénticos y no
+    se respetaba lo pedido.
+
+    Ahora: cuando la política niega personas y hay un sujeto humano, se remueven
+    QUIRÚRGICAMENTE solo las oraciones/clausulas humanas y se preserva el
+    escenario (lugar, arquitectura, objetos, luz, paleta, clima). El bloque de
+    negativos ("no people/faces/text/logos") se agrega aguas abajo, así la
+    restricción se mantiene aunque quede un fragmento. Solo si no sobra escena
+    usable se cae a un fallback VARIADO por-prompt (no un string único).
     """
+    import re as _re
+
     value = str(prompt or "").strip()
     if allow_people or not _prompt_may_contain_human_subject(value):
         return value
+
+    # 1) Remoción quirúrgica: por oración, y si la oración trae humano, por
+    #    clausula (coma). Se conservan las partes que NO son humanas.
+    sentences = _re.split(r"(?<=[.!?;])\s+", value)
+    kept: list[str] = []
+    for sent in sentences:
+        s = sent.strip()
+        if not s:
+            continue
+        if not _prompt_may_contain_human_subject(s):
+            kept.append(s)
+            continue
+        clauses = [c.strip() for c in s.split(",")]
+        good = [c for c in clauses if c and not _prompt_may_contain_human_subject(c)]
+        if good:
+            kept.append(", ".join(good))
+    preserved = " ".join(kept).strip()
+    preserved = _re.sub(r"\s+,", ",", preserved)
+    preserved = _re.sub(r",\s*,", ", ", preserved).strip(" ,")
+
+    # Defense-in-depth: re-verificar el resultado unido. Si por un borde de
+    # clausula quedó algún sujeto humano, NO lo devolvemos — caemos al fallback.
+    # Umbral bajo (24) para preservar escenas cortas pero válidas ("Neon signs
+    # above an empty street") en vez de colapsarlas al fallback.
+    if len(preserved) >= 24 and not _prompt_may_contain_human_subject(preserved):
+        logger.warning(
+            "[BG_POLICY] human subject removed; scene preserved (%d chars)",
+            len(preserved),
+        )
+        return preserved
+
+    # 2) No sobró escena usable → fallback VARIADO (no un string único): se
+    #    elige un arquetipo por hash del prompt original y se enriquece con el
+    #    concepto si está disponible, para que cada canción difiera.
+    import hashlib as _hashlib
+
+    idx = int(_hashlib.sha256(value.encode("utf-8")).hexdigest(), 16) % len(
+        _UNOCCUPIED_FALLBACK_SETTINGS
+    )
+    setting = _UNOCCUPIED_FALLBACK_SETTINGS[idx]
+    concept_bit = (
+        f", evoking {concept.strip()}" if concept and concept.strip() else ""
+    )
     logger.warning(
-        "[BG_POLICY] removed positive human subject at provider boundary"
+        "[BG_POLICY] no usable non-human scene; varied fallback #%d", idx
     )
     return (
-        "An original unoccupied cinematic environment expressing the requested "
-        "emotional tone through architecture, landscape, light, color, texture, "
-        "materials and generous negative space. Build a distinctive full-frame "
-        "composition with environmental motion and no character as the subject"
+        f"A distinctive, unoccupied cinematic environment: {setting}{concept_bit}. "
+        "Rich detail across foreground, middle ground and background; no character "
+        "as the subject; environmental motion only"
     )
 
 
@@ -7675,7 +7767,7 @@ _CONCEPT_SCENE_GUIDE = {
 # right "feel" per song. The genre + concept selectors decide WHAT the
 # scene is; this decides HOW it moves.
 _MOVEMENT_STYLE_RULES = {
-    "estatico":      "Viewpoint: LOCKED STATIC FRAME. The viewpoint does NOT move at all — no pan, no tilt, no zoom, no dolly, no push-in, no drift, no orbit, no crane, no handheld, no parallax. A single fixed composition held for the whole shot. ALL motion lives WITHIN the scene only (water ripples, firelight, shifting clouds, flickering light, swaying foliage, floating particles). The frame edges never move.",
+    "estatico":      "Viewpoint: LOCKED STATIC FRAME. The viewpoint does NOT move at all — no pan, no tilt, no zoom, no dolly, no push-in, no drift, no orbit, no crane, no handheld, no parallax. A single fixed composition held for the whole shot. ALL motion lives WITHIN the scene only — only subtle motion that genuinely belongs in the chosen scene (do not default to floating particles, swaying foliage or smoke unless the scene calls for them). The frame edges never move.",
     "sutil":         "Movement: minimal and ambient — gentle sway, slow drift, breathing motion. Subjects barely move. Easy to loop seamlessly.",
     "estandar":      "",  # no extra rule; the existing prompt template controls motion
     "foto-parallax": "Aesthetic: photographic still with subtle parallax — composition feels like a single photo, motion is restricted to slow camera moves, depth-of-field shifts, and lighting passes. No moving subjects.",
@@ -7909,7 +8001,12 @@ def _planner_match_lyrics(
 ) -> bool:
     """Preserve legacy rollout output until v4 is explicitly enforced."""
     if not policy_enforces(atmospherics_policy):
-        return True if scene_planner else bool(requested_match_lyrics)
+        # Fix 2026-07-23: antes el camino multi-escena (scene_planner=True)
+        # devolvía True SIEMPRE → "Auto" (match_lyrics=False) se comportaba
+        # idéntico a "Inspirado en la letra" en jobs con Escenas. Ahora se
+        # honra la selección real del usuario en los 3 modos también en
+        # multi-escena. (Mi prompt no pasa por acá: el operator_prompt domina.)
+        return bool(requested_match_lyrics)
     return creative_mode == "lyrics"
 
 
@@ -8065,7 +8162,13 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     # an empty armchair.
     _people_rule = (
         "" if allow_people
-        else "- Never include people, faces, hands, or readable text in the scene\n"
+        else (
+            "- NO people, faces, hands, silhouettes or human figures anywhere in "
+            "the scene, and no readable text, letters, signs, logos or brands.\n"
+            "- If the lyrics are about a person or a relationship, translate them "
+            "into their ENVIRONMENT — the empty chair, the worn stage, the two "
+            "coffee cups, the rain they walked through — never a body or face.\n"
+        )
     )
     # A2 (2026-05-25) — Anti-cliché rule. Incidente "Legalícenla - Viejas
     # Locas": Gemini identificó correctamente "marihuana" como sujeto
@@ -8244,7 +8347,7 @@ soft rock, acoustic, intimate or emotional theme, DO NOT default to
 industrial, urban, dystopian, sewer, alleyway, or neon-rain backgrounds.
 Bias toward warm interiors, golden-hour light, natural landscapes
 (sunset, ocean, mountains at dusk), or symbolic intimate imagery (a
-window, a candle, a glass catching light, hands intertwined). Industrial
+window, a candle, a glass catching light, two empty chairs by a table). Industrial
 alleys, neon streets, smoke, and rain are reserved for rock / metal /
 punk / hip-hop tracks where the genre or lyrics anchor that vocabulary
 explicitly. When in doubt, prefer warm/natural over urban/industrial."""
@@ -8277,7 +8380,7 @@ The operator has chosen the visual STYLING register: {normalized_concept.upper()
 The concept's vocabulary controls palette, texture, atmosphere, and aesthetic register:
 {concept_guide}{genre_hint}
 
-STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete setting, object, or action the song is literally about (e.g., a campfire in a forest, the ocean at night, a football match, a road trip, rain on glass, friends sharing warmth, a long goodbye at a station).
+STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete SETTING or OBJECT the song evokes (e.g., a campfire in a forest, the ocean at night, an empty stadium under floodlights, a candlelit kitchen table, rain on glass, a cluttered analog workshop, a quiet train platform at first light). Prefer places and objects over people; when the lyrics are about a person or a relationship, render their WORLD instead — the room they left, the objects they touched, the weather of the moment — not the person.
 
 STEP 1 — Build a scene where:
 - The SUBJECT comes from the lyrics' literal or strongly figurative imagery
@@ -8884,6 +8987,8 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     prompt = _sanitize_people_at_provider_boundary(
         prompt,
         allow_people=allow_people,
+        concept=normalized_concept,
+        movement_style=movement_style,
     )
     # Last-boundary finalizer. Literal operator text is preserved, generated
     # text is sanitized, and both retain the immutable negative rail when the
@@ -8971,9 +9076,15 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # atmospheric rollout flag is off/shadow. Smoke/fog are never necessary to
     # make a static shot feel alive; operator-authored opt-ins can still flow
     # through the normal creative prompt when policy permits them.
+    # Fix 2026-07-23: antes esto hardcodeaba una lista fija de motion (particles
+    # floating / foliage swaying / firelight) que se inyectaba en CASI TODOS los
+    # fondos estáticos → clichés repetidos en todas las canciones. Ahora se pide
+    # movimiento sutil PROPIO de la escena, sin prescribir cuál, para que varíe.
     _static_scene_motion = (
-        "water ripples, firelight, shifting clouds, foliage swaying, "
-        "light reflections and particles floating"
+        "subtle in-scene motion that naturally belongs to this specific "
+        "environment (there must always be some gentle, continuous motion so "
+        "the frame is never completely frozen), while the camera itself stays "
+        "perfectly still"
     )
     _norm_move = _normalize_movement_style(movement_style)
     if _norm_move == "animado":
