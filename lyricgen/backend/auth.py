@@ -12,9 +12,17 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from database import User, PasswordResetToken, EmailVerificationToken, get_db, utcnow
+from database import (
+    EmailVerificationToken,
+    LoginSession,
+    PasswordResetToken,
+    User,
+    get_db,
+    utcnow,
+)
 
 # --- Plan definitions ---
 # bg_preview_enabled — gating del pre-render del fondo (Capa C, 2026-05-24).
@@ -347,6 +355,7 @@ def verify_api_key(db: Session, full_key: str) -> Optional[dict]:
         "role": user.role,
         "is_super_admin": is_super_admin(user.username, user.email, user.role),
         "tenant_id": user.tenant_id,
+        "billing_group": getattr(user, "billing_group", None),
         "plan": user.plan_id,
         "allow_overage": getattr(user, "allow_overage", False) or False,
         "features": {
@@ -423,6 +432,7 @@ def create_user(
     plan: str = "free",
     ai_authorized: bool = True,
     enforce_reserved: bool = True,
+    commit: bool = True,
 ) -> User:
     """Create a new user. Raises ValueError if username/email exists or
     the password fails baseline strength checks.
@@ -499,8 +509,13 @@ def create_user(
         ai_authorized=ai_authorized,
     )
     db.add(user)
-    db.commit()
-    db.refresh(user)
+    if commit:
+        db.commit()
+        db.refresh(user)
+    else:
+        # Registration can flush the user and let start_login_session commit
+        # both rows atomically. A session failure then rolls back the account.
+        db.flush()
     return user
 
 
@@ -570,7 +585,9 @@ def create_password_reset_token(db: Session, user: User) -> str:
     return token
 
 
-def verify_password_reset_token(db: Session, token: str) -> Optional[User]:
+def verify_password_reset_token(
+    db: Session, token: str, *, commit: bool = True,
+) -> Optional[User]:
     """Atomically claim a password-reset token.
 
     Two callers concurrently presenting the same valid token would both
@@ -594,7 +611,10 @@ def verify_password_reset_token(db: Session, token: str) -> Optional[User]:
         .update({PasswordResetToken.used: True}, synchronize_session=False)
     )
     if rowcount == 0:
-        db.commit()
+        if commit:
+            db.commit()
+        else:
+            db.rollback()
         return None
     record = (
         db.query(PasswordResetToken)
@@ -602,7 +622,10 @@ def verify_password_reset_token(db: Session, token: str) -> Optional[User]:
         .first()
     )
     if record is None:
-        db.commit()
+        if commit:
+            db.commit()
+        else:
+            db.rollback()
         return None
     # Invalidate every other live token for this user.
     db.query(PasswordResetToken).filter(
@@ -610,7 +633,8 @@ def verify_password_reset_token(db: Session, token: str) -> Optional[User]:
         PasswordResetToken.token != token,
         PasswordResetToken.used == False,  # noqa: E712
     ).update({PasswordResetToken.used: True}, synchronize_session=False)
-    db.commit()
+    if commit:
+        db.commit()
     return get_user_by_id(db, record.user_id)
 
 
@@ -662,6 +686,17 @@ def verify_email_token(db: Session, token: str) -> Optional[User]:
 # JWT
 # ---------------------------------------------------------------------------
 
+_ACCESS_TOKEN_TYPE = "access"
+
+
+def _record_session_rejection(name: str = "session_rejected") -> None:
+    try:
+        from ops_metrics import increment
+        increment(name)
+    except Exception:
+        pass
+
+
 def create_token(user: User, jti: str = None) -> str:
     """Create a JWT token for the given user.
 
@@ -678,6 +713,8 @@ def create_token(user: User, jti: str = None) -> str:
         "tenant_id": user.tenant_id,
         "plan": user.plan_id,
         "jti": jti or uuid.uuid4().hex,
+        "tt": _ACCESS_TOKEN_TYPE,
+        "av": int(getattr(user, "auth_version", 0) or 0),
         "exp": time.time() + JWT_EXPIRE_MINUTES * 60,
         "iat": time.time(),
     }
@@ -688,23 +725,55 @@ def start_login_session(db: Session, user: User, request: Request = None) -> str
     """Crea una fila login_sessions (dispositivo) y devuelve el token JWT
     ligado a ella vía jti. Usado por login y registro.
 
-    Best-effort sobre la fila: si la escritura de la sesión falla, igual
-    devolvemos un token válido (no bloqueamos el login por la feature de
-    dispositivos) — sólo que ese token no será revocable por sesión.
+    Fail-closed: el JWT se construye antes, pero sólo se devuelve después de
+    que la fila revocable fue confirmada. Una tabla ausente o un fallo de DB
+    devuelve 503 y nunca entrega una credencial huérfana.
     """
     jti = uuid.uuid4().hex
+    ip = None
+    ua = None
+    if request is not None:
+        ip = request.client.host if request.client else None
+        ua = (request.headers.get("user-agent") or "")[:400] or None
+    token = create_token(user, jti=jti)
     try:
-        from database import LoginSession
-        ip = None
-        ua = None
-        if request is not None:
-            ip = request.client.host if request.client else None
-            ua = (request.headers.get("user-agent") or "")[:400] or None
         db.add(LoginSession(user_id=user.id, jti=jti, ip_address=ip, user_agent=ua))
         db.commit()
-    except Exception:
+    except SQLAlchemyError as exc:
         db.rollback()
-    return create_token(user, jti=jti)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to create a revocable login session",
+        ) from exc
+    return token
+
+
+def invalidate_user_access(
+    db: Session,
+    user: User,
+    *,
+    keep_jti: str | None = None,
+) -> tuple[int, int]:
+    """Invalidate existing access JWTs without committing the transaction.
+
+    Password reset callers pass no ``keep_jti`` and revoke every session.
+    Authenticated password changes may retain the current session row, then
+    mint a replacement token with the incremented auth version. The caller
+    owns the commit so the password hash, version bump and revocations remain
+    one transaction.
+    """
+    user.auth_version = int(getattr(user, "auth_version", 0) or 0) + 1
+    query = db.query(LoginSession).filter(
+        LoginSession.user_id == user.id,
+        LoginSession.revoked_at.is_(None),
+    )
+    if keep_jti:
+        query = query.filter(LoginSession.jti != keep_jti)
+    revoked = query.update(
+        {LoginSession.revoked_at: datetime.now(timezone.utc)},
+        synchronize_session=False,
+    )
+    return user.auth_version, revoked
 
 
 def decode_token(token: str) -> dict:
@@ -719,6 +788,72 @@ def decode_token(token: str) -> dict:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",
         )
+
+
+def _validate_access_claims(payload: dict, user: User) -> str:
+    """Validate access-only claims and return the session ``jti``.
+
+    Missing ``tt``/``av`` are accepted only as the pre-cutover access-token
+    shape (version zero). Missing ``jti`` is not accepted: an access token
+    that cannot be tied to a persisted, revocable session is invalid.
+    """
+    token_type = payload.get("tt")
+    if token_type not in (None, _ACCESS_TOKEN_TYPE):
+        _record_session_rejection()
+        raise HTTPException(status_code=401, detail="Wrong token type")
+
+    try:
+        token_version = int(payload.get("av", 0))
+        user_version = int(getattr(user, "auth_version", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        _record_session_rejection()
+        raise HTTPException(status_code=401, detail="Invalid token version") from exc
+    if token_version != user_version:
+        _record_session_rejection()
+        raise HTTPException(status_code=401, detail="Session credentials have changed")
+
+    jti = payload.get("jti")
+    if not isinstance(jti, str) or not jti:
+        _record_session_rejection()
+        raise HTTPException(status_code=401, detail="Login session required")
+    return jti
+
+
+def _validate_login_session(db: Session, user: User, jti: str) -> None:
+    """Require a live session row; only last_seen persistence is best-effort."""
+    try:
+        session = (
+            db.query(LoginSession)
+            .filter(LoginSession.jti == jti, LoginSession.user_id == user.id)
+            .first()
+        )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        _record_session_rejection("session_validation_unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Session validation temporarily unavailable",
+        ) from exc
+
+    if session is None or session.revoked_at is not None:
+        _record_session_rejection()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session closed. Sign in again.",
+        )
+
+    now = datetime.now(timezone.utc)
+    last_seen = session.last_seen_at
+    if last_seen is not None and last_seen.tzinfo is None:
+        last_seen = last_seen.replace(tzinfo=timezone.utc)
+    if last_seen is None or (now - last_seen).total_seconds() > 300:
+        session.last_seen_at = now
+        try:
+            db.commit()
+        except SQLAlchemyError:
+            # A heartbeat must never turn an already-validated session into
+            # an auth outage. Roll back the optional write and continue.
+            db.rollback()
 
 
 # Plain `def` (not `async def`) ON PURPOSE: this dependency runs on EVERY
@@ -752,36 +887,16 @@ def get_current_user(
     # Resilient: see get_user_by_id_resilient — auth dep runs on every
     # /upload-part-proxy request and the global middleware can't replay
     # multi-MB bodies if this throws an SSL drop.
-    user = get_user_by_id_resilient(db, int(payload["sub"]))
+    try:
+        subject_id = int(payload.get("sub"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid token subject")
+    user = get_user_by_id_resilient(db, subject_id)
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
 
-    # Validación de sesión (cierre remoto). Sólo para tokens con jti — los
-    # viejos sin jti se aceptan (grandfather, expiran solos). Si la sesión
-    # fue revocada → 401. Fail-open ante error de DB para no tirar abajo el
-    # auth de toda la app por un problema transitorio en esta tabla.
-    jti = payload.get("jti")
-    if jti:
-        try:
-            from database import LoginSession
-            sess = db.query(LoginSession).filter(LoginSession.jti == jti).first()
-            if sess is not None:
-                if sess.revoked_at is not None:
-                    raise HTTPException(status_code=401, detail="Sesión cerrada. Volvé a iniciar sesión.")
-                # last_seen throttled (≤ 1 write / 5 min por sesión activa).
-                now = datetime.now(timezone.utc)
-                last = sess.last_seen_at
-                if last is not None and last.tzinfo is None:
-                    last = last.replace(tzinfo=timezone.utc)
-                if last is None or (now - last).total_seconds() > 300:
-                    sess.last_seen_at = now
-                    db.commit()
-            # sess None = token con jti pero sin fila (sesión nunca registrada
-            # o tabla recién creada): se acepta, no bloqueamos.
-        except HTTPException:
-            raise
-        except Exception:
-            pass  # fail-open: error de DB no debe romper el auth global
+    jti = _validate_access_claims(payload, user)
+    _validate_login_session(db, user, jti)
 
     return {
         "id": user.id,
@@ -820,11 +935,21 @@ def get_current_user(
 
 
 def get_current_user_from_token_param(token: str, db: Session) -> dict:
-    """Validate a token passed as query parameter (for media URLs)."""
+    """Validate a legacy access token passed as query parameter.
+
+    This path remains only for the temporary SSE compatibility window. It
+    enforces the same auth-version and persisted-session checks as Bearer.
+    """
     payload = decode_token(token)
-    user = get_user_by_id(db, int(payload["sub"]))
+    try:
+        subject_id = int(payload.get("sub"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid token subject")
+    user = get_user_by_id(db, subject_id)
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
+    jti = _validate_access_claims(payload, user)
+    _validate_login_session(db, user, jti)
     return {
         "id": user.id,
         "username": user.username,
@@ -858,6 +983,7 @@ def create_media_token(user: User, job_id: str, file_type: str) -> str:
         "jid": job_id,
         "ft": file_type,
         "tt": _MEDIA_TOKEN_TYPE,
+        "av": int(getattr(user, "auth_version", 0) or 0),
         "exp": time.time() + MEDIA_TOKEN_EXPIRE_SECONDS,
         "iat": time.time(),
     }
@@ -871,9 +997,17 @@ def verify_media_token(token: str, job_id: str, file_type: str, db: Session) -> 
         raise HTTPException(status_code=401, detail="Wrong token type for media URL")
     if payload.get("jid") != job_id or payload.get("ft") != file_type:
         raise HTTPException(status_code=401, detail="Token scope mismatch")
-    user = get_user_by_id(db, int(payload["sub"]))
+    try:
+        subject_id = int(payload.get("sub"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid token subject")
+    user = get_user_by_id(db, subject_id)
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
+    # Pre-cutover five-minute media tokens had no av claim; treat them as v0
+    # so a rolling API deploy does not break an already-open download URL.
+    if int(payload.get("av", 0)) != int(getattr(user, "auth_version", 0) or 0):
+        raise HTTPException(status_code=401, detail="Stale media token")
     return {
         "id": user.id,
         "username": user.username,

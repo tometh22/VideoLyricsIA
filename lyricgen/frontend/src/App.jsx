@@ -53,6 +53,8 @@ import { computeFieldDiff, buildEditPayloads } from "./lib/editWizardDiff";
 import { prefetchKey } from "./lib/prefetchKey";
 import { anchorLyricsForEntry } from "./lib/anchorPayload";
 import { track } from "./lib/telemetryTrack";
+import { fetchSse, SseUnauthorizedError } from "./lib/fetchSse";
+import { createSaveQueue } from "./lib/saveQueue";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -132,7 +134,16 @@ function authHeaders() {
 }
 function authFetch(url, opts = {}) {
   const headers = { ...opts.headers, ...authHeaders() };
-  return fetch(url, { ...opts, headers });
+  return fetch(url, { ...opts, headers }).then((response) => {
+    if (response.status === 401 && typeof window !== "undefined") {
+      // A hard reload is intentional: after a global auth_version bump, an
+      // already-open legacy bundle must not keep rebuilding query-token URLs.
+      localStorage.removeItem("genly_token");
+      localStorage.removeItem("genly_user");
+      window.location.reload();
+    }
+    return response;
+  });
 }
 
 // Translates a fetch failure (network error or HTTP error response) into a
@@ -217,6 +228,25 @@ function RootEffects({ setUser, setResetToken, setBillingSuccess }) {
   const navigate = useNavigate();
   const location = useLocation();
   const ranRef = useRef(false);
+  const verifyTokenRef = useRef(null);
+  const [verifyState, setVerifyState] = useState(null); // loading|success|error
+
+  const verifyEmail = useCallback(async () => {
+    const verifyToken = verifyTokenRef.current;
+    if (!verifyToken) return;
+    setVerifyState("loading");
+    try {
+      const res = await fetch(`${API}/auth/verify-email`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: verifyToken }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setVerifyState("success");
+    } catch {
+      setVerifyState("error");
+    }
+  }, []);
 
   useEffect(() => {
     if (ranRef.current) return;
@@ -240,12 +270,13 @@ function RootEffects({ setUser, setResetToken, setBillingSuccess }) {
       navigate(tab ? `/account?tab=${tab}` : "/account", { replace: true });
     }
     if (params.get("verify_email")) {
-      fetch("/auth/verify-email", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token: params.get("verify_email") }),
-      }).catch(() => {});
-      navigate(location.pathname, { replace: true });
+      verifyTokenRef.current = params.get("verify_email");
+      // Scrub only the secret parameter immediately, before issuing the
+      // request, while preserving billing/deep-link/campaign parameters.
+      params.delete("verify_email");
+      const search = params.toString();
+      navigate(`${location.pathname}${search ? `?${search}` : ""}`, { replace: true });
+      verifyEmail();
     }
     if (params.get("reset_password")) {
       setResetToken(params.get("reset_password"));
@@ -288,7 +319,28 @@ function RootEffects({ setUser, setResetToken, setBillingSuccess }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  return null;
+  if (!verifyState) return null;
+  return (
+    <div className="fixed bottom-6 right-6 z-[220] max-w-sm rounded-2xl bg-[#171821] p-4 shadow-2xl ring-1 ring-white/10" role="status" aria-live="polite">
+      <p className={`text-sm font-semibold ${verifyState === "error" ? "text-red-300" : "text-white"}`}>
+        {verifyState === "loading"
+          ? "Verificando tu email…"
+          : verifyState === "success"
+            ? "Email verificado correctamente"
+            : "No pudimos verificar tu email"}
+      </p>
+      {verifyState === "error" && (
+        <button type="button" onClick={verifyEmail} className="mt-3 text-xs font-semibold text-brand-light hover:text-white">
+          Reintentar
+        </button>
+      )}
+      {verifyState !== "loading" && (
+        <button type="button" onClick={() => setVerifyState(null)} className="ml-4 mt-3 text-xs text-gray-500 hover:text-white">
+          Cerrar
+        </button>
+      )}
+    </div>
+  );
 }
 
 // Floating success toast for post-checkout confirmation.
@@ -947,6 +999,7 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         // job.song_title puede llegar null para jobs viejos sin metadata
         // explícito; filename queda como fallback display sólo.
         segments: segmentsFromSnap,
+        segmentsRevision: Number.isInteger(job.segments_revision) ? job.segments_revision : 0,
         openSnapshotSegments: JSON.parse(JSON.stringify(job.segments_json)),
         filename: job.filename || job.artist || "lyrics",
         file: null,
@@ -1328,6 +1381,9 @@ export default function App() {
   const [resetToken, setResetToken] = useState(null);
   const [billingSuccess, setBillingSuccess] = useState(false);
   const pollingIntervals = useRef(new Set());
+  const historyRef = useRef([]);
+  const historyPollInFlight = useRef(new Set());
+  const historyPollCursor = useRef(0);
   // R-FRONT-5 (Frontend specialist 2026-05-24): isMountedRef previene
   // setState-on-unmounted warnings + memory leaks cuando el operador
   // navega away durante un SSE/polling en curso. Cada callback async
@@ -1831,6 +1887,13 @@ export default function App() {
     setSearchOpen(false);
     setResumableWizard(null);
 
+    if (reason === "expired" && APP_ENV !== "test") {
+      // Full document navigation discards the currently executing bundle.
+      // This is required after auth_version bumps so a cached legacy bundle
+      // cannot recreate SSE URLs containing an access credential.
+      window.location.replace("/login");
+      return;
+    }
     navigate(reason === "expired" ? "/login" : "/");
   }, [navigate]);
 
@@ -1907,6 +1970,7 @@ export default function App() {
   // videos" during the initial load on slow tenants — operators with
   // hundreds of jobs thought their catalog was wiped.
   const [historyLoaded, setHistoryLoaded] = useState(false);
+  useEffect(() => { historyRef.current = history; }, [history]);
   const fetchHistory = useCallback(async () => {
     if (!getToken()) return;
     // /jobs has historically been the slow query for big tenants (no
@@ -1939,6 +2003,56 @@ export default function App() {
 
   useEffect(() => { if (token) fetchHistory(); }, [token, fetchHistory]);
 
+  // One root poller refreshes all active history rows. It is paused in hidden
+  // tabs, caps each tick at five requests, rotates fairly through large
+  // batches, and never polls the same job concurrently.
+  useEffect(() => {
+    if (!token) return undefined;
+    const ACTIVE = new Set([
+      "processing", "queued", "editing", "transcribing",
+      "transcribing_queued", "background_generating", "rendering",
+    ]);
+    let stopped = false;
+    const tick = async () => {
+      if (stopped || document.hidden || !getToken()) return;
+      const active = historyRef.current.filter(
+        (job) => job?.job_id && ACTIVE.has(job.status)
+          && !historyPollInFlight.current.has(job.job_id),
+      );
+      if (!active.length) return;
+      const start = historyPollCursor.current % active.length;
+      const selected = Array.from(
+        { length: Math.min(5, active.length) },
+        (_, offset) => active[(start + offset) % active.length],
+      );
+      historyPollCursor.current = (start + selected.length) % active.length;
+      await Promise.all(selected.map(async (job) => {
+        historyPollInFlight.current.add(job.job_id);
+        try {
+          const response = await authFetch(`${API}/status/${job.job_id}`);
+          if (!response.ok) return;
+          const fresh = await response.json();
+          if (stopped) return;
+          const merge = (row) => row.job_id === job.job_id ? { ...row, ...fresh } : row;
+          setHistory((previous) => previous.map(merge));
+          setJobs((previous) => previous.map(merge));
+        } catch { /* next root tick retries transient failures */ }
+        finally { historyPollInFlight.current.delete(job.job_id); }
+      }));
+    };
+    const interval = setInterval(tick, 10_000);
+    const onVisible = () => { if (!document.hidden) tick(); };
+    window.addEventListener("focus", onVisible);
+    document.addEventListener("visibilitychange", onVisible);
+    tick();
+    return () => {
+      stopped = true;
+      clearInterval(interval);
+      window.removeEventListener("focus", onVisible);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [token]);
+
   const pollJob = useCallback((jobId) => {
     // Use SSE when available; fall back to 3 s polling for proxies that buffer
     // text/event-stream (some corporate HTTPS interceptors).
@@ -1948,77 +2062,58 @@ export default function App() {
       const token = getToken();
       if (!token) { resolve("aborted"); return; }
 
-      // --- SSE path ---
-      let es;
-      try {
-        // Append the auth token as a query param — EventSource doesn't support
-        // custom headers; the backend's get_current_user_from_token_param dep
-        // handles token= on GET endpoints.
-        es = new EventSource(`${API}/events/${jobId}?token=${encodeURIComponent(token)}`);
-      } catch {
-        es = null;
-      }
-
-      if (es) {
-        // Watchdog: an EventSource can OPEN successfully but then stay silent
-        // — a buffering proxy, or (local dev) an SSE reader that doesn't see
-        // the worker's writes. In that case neither onmessage nor onerror ever
-        // fires and the progress screen hangs forever. If no event arrives
-        // shortly after connecting, fall back to polling /status. Cleared as
-        // soon as the first event lands.
-        let sawEvent = false;
-        let silentTimer = setTimeout(() => {
-          if (!sawEvent) { cleanup(); startPolling(); }
-        }, 6000);
-        const cleanup = () => {
-          clearTimeout(silentTimer);
-          es.close();
-          pollingIntervals.current.delete(es);
-        };
-        pollingIntervals.current.add(es);
-        es.onmessage = (e) => {
-          sawEvent = true;
-          clearTimeout(silentTimer);
-          if (!isMountedRef.current) { cleanup(); return; }
-          try {
-            const data = JSON.parse(e.data);
-            setJobs((prev) => prev.map((j) =>
-              j.job_id === jobId
-                ? { ...j, status: data.status, current_step: data.current_step,
-                    progress: data.progress, error: data.error,
-                    created_at: data.created_at ?? j.created_at,
-                    completed_at: data.completed_at ?? j.completed_at }
-                : j
-            ));
-            if (TERMINAL.has(data.status)) {
-              cleanup();
-              if (isMountedRef.current) fetchHistory();
-              resolve(data.status);
-            }
-          } catch {}
-        };
-        es.onerror = () => {
-          cleanup();
+      // --- SSE path (Bearer header; access JWT never appears in the URL) ---
+      const sseController = new AbortController();
+      const sseHandle = { close: () => sseController.abort() };
+      const cleanupSse = () => {
+        sseController.abort();
+        pollingIntervals.current.delete(sseHandle);
+      };
+      pollingIntervals.current.add(sseHandle);
+      fetchSse(`${API}/events/${jobId}`, {
+        token,
+        signal: sseController.signal,
+        watchdogMs: 6_000,
+        onMessage: (data) => {
+          if (!isMountedRef.current) { cleanupSse(); return; }
+          if (!data || typeof data !== "object") return;
+          setJobs((prev) => prev.map((j) =>
+            j.job_id === jobId
+              ? { ...j, status: data.status, current_step: data.current_step,
+                  progress: data.progress, error: data.error,
+                  created_at: data.created_at ?? j.created_at,
+                  completed_at: data.completed_at ?? j.completed_at }
+              : j
+          ));
+          if (TERMINAL.has(data.status)) {
+            cleanupSse();
+            fetchHistory();
+            resolve(data.status);
+          }
+        },
+        onEvent: (name, data) => {
+          if (name !== "unauthorized") return;
+          console.warn(`[SSE] session rejected (${data?.reason || "expired"})`);
+          cleanupSse();
+          handleLogout("expired");
+          resolve("unauthorized");
+        },
+      }).then(() => {
+        if (!sseController.signal.aborted) {
+          cleanupSse();
           startPolling();
-        };
-        // QA fix 2026-05-28 (audit P0 #73): backend emite un evento
-        // `unauthorized` named cuando detecta token expirado o tenant
-        // cambiado mid-stream. EventSource trata estos como un canal
-        // separado de `data` — sin addEventListener específico, los
-        // eventos named se ignoran silenciosamente y el SSE queda
-        // abierto colgado. Acá los capturamos, cerramos la conexión
-        // y caemos a polling autenticado — el siguiente authFetch
-        // pegará 401 y dispara el logout flow (clearToken + redirect
-        // a login).
-        es.addEventListener("unauthorized", (e) => {
-          let reason = "expired";
-          try { reason = JSON.parse(e.data || "{}").reason || reason; } catch {}
-          console.warn(`[SSE] unauthorized event from backend (${reason}) — falling back to polling`);
-          cleanup();
-          startPolling();
-        });
-        return;
-      }
+        }
+      }).catch((error) => {
+        if (sseController.signal.aborted) return;
+        cleanupSse();
+        if (error instanceof SseUnauthorizedError) {
+          handleLogout("expired");
+          resolve("unauthorized");
+          return;
+        }
+        startPolling();
+      });
+      return;
 
       // --- Polling fallback ---
       function startPolling() {
@@ -2400,6 +2495,7 @@ export default function App() {
         titleSongFont: entry.titleSongFont || "",
         titleSongBreak: entry.titleSongBreak || "",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
+        segmentsRevision: Number.isInteger(data.segments_revision) ? data.segments_revision : 0,
         coverageWarning: !!data.coverage_warning,
         recoverySource: data.recovery_source || "",
         transcribeJobId: data.job_id || jobId,
@@ -2474,6 +2570,7 @@ export default function App() {
             lyricsAnimation: entry.lyricsAnimation || "none",
             lineTransition: entry.lineTransition || "none",
             segments: data.segments, referenceLyrics: data.reference_lyrics || "",
+            segmentsRevision: Number.isInteger(data.segments_revision) ? data.segments_revision : 0,
             coverageWarning: !!data.coverage_warning,
             recoverySource: data.recovery_source || "",
             transcribeJobId: data.job_id || cached.jobId,
@@ -2632,6 +2729,7 @@ export default function App() {
         titleSongFont: entry.titleSongFont || "",
         titleSongBreak: entry.titleSongBreak || "",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
+        segmentsRevision: Number.isInteger(data.segments_revision) ? data.segments_revision : 0,
         coverageWarning: !!data.coverage_warning,
         recoverySource: data.recovery_source || "",
         transcribeJobId: data.job_id || uploadJobId,
@@ -2698,6 +2796,22 @@ export default function App() {
     (jobId, segments, opts = {}) => persistSegments(authFetch, API, jobId, segments, opts),
     [],
   );
+  // Una sola cola por App sobrevive remounts del editor (pasos 6↔4 y
+  // navegación dentro del wizard). La revisión confirmada vive acá, no en
+  // una prop de currentReview que puede quedar vieja tras un autosave.
+  const segmentsSaveQueueRef = useRef(null);
+  if (!segmentsSaveQueueRef.current) {
+    segmentsSaveQueueRef.current = createSaveQueue(
+      (jobId, segments, opts) => persistSegmentsToBackend(jobId, segments, opts),
+      { categorize: (result) => {
+        if (!result || result.reason === "network") return "network";
+        if (result.status === 401 || result.status === 403) return "session";
+        if (result.reason === "job-gone" || result.status === 404) return "job-gone";
+        if (result.reason === "stale-revision" || result.status === 409) return "conflict";
+        return "server";
+      } },
+    );
+  }
 
   // Versión B, parte 2: re-anclar el timing con el texto YA corregido por
   // el operador. El backend toma segments_json (el autosave de arriba lo
@@ -2705,12 +2819,13 @@ export default function App() {
   // timing re-anclado respetando las líneas `locked`. Devuelve el payload
   // del endpoint ({ok, count, review_count, segments}) para que el
   // LyricsEditor refresque su estado y muestre el toast de resultado.
-  const reanchorSegmentsOnBackend = useCallback(async (jobId) => {
+  const reanchorSegmentsOnBackend = useCallback(async (jobId, baseRevision) => {
     if (!jobId) return { ok: false, reason: "no-job" };
     try {
       const res = await authFetch(`${API}/jobs/${jobId}/reanchor`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ base_revision: baseRevision }),
       });
       if (!res.ok) {
         let detail = "";
@@ -2725,7 +2840,7 @@ export default function App() {
     }
   }, []);
 
-  const handleApproveLyrics = async (editedSegments) => {
+  const handleApproveLyrics = async (editedSegments, saveMeta = {}) => {
     const r = currentReview;
     if (!r) return;
 
@@ -2856,6 +2971,11 @@ export default function App() {
         if (diff.lyrics) Object.assign(payload, diff.lyrics);
         if (diff.background) Object.assign(payload, diff.background);
         if (diff.background_library) Object.assign(payload, diff.background_library);
+        if (Array.isArray(payload.segments)) {
+          payload.base_revision = Number.isInteger(saveMeta.baseRevision)
+            ? saveMeta.baseRevision
+            : (Number.isInteger(r.segmentsRevision) ? r.segmentsRevision : 0);
+        }
 
         const doPost = async (body) => {
           const res = await authFetch(`${API}/edit/${editedJobId}`, {
@@ -2931,6 +3051,9 @@ export default function App() {
       lineTransition: r.lineTransition || "none",
       textContrast: r.textContrast || "medium",
       segments: editedSegments,
+      segmentsRevision: Number.isInteger(saveMeta.baseRevision)
+        ? saveMeta.baseRevision
+        : (Number.isInteger(r.segmentsRevision) ? r.segmentsRevision : 0),
       transcribeJobId: r.transcribeJobId || null,
       // Capa C 2026-05-24: bgCacheKey viene del useBackgroundPreview hook
       // que corrió durante review. Si null = no se hizo pre-gen (free-tier
@@ -2950,13 +3073,9 @@ export default function App() {
     // transcribeJobId` evictaba undefined = no-op y dejaba el array vivo).
     segmentsStore.evict(reviewStoreKey(r));
 
-    // Fire-and-forget commit of the just-approved segments to the backend.
-    // Bumps last_user_activity_at and persists segments_json so the reaper
-    // won't barre the job before the operator hits "Crear videos" on the
-    // next song. See persistSegmentsToBackend comment for context.
-    if (r.transcribeJobId) {
-      persistSegmentsToBackend(r.transcribeJobId, editedSegments);
-    }
+    // LyricsEditor awaits its OCC queue before invoking onApprove. Do not
+    // issue a second fire-and-forget save here: it would reuse a stale base
+    // revision and manufacture a conflict after a successful flush.
 
     // HOTFIX 2026-05-29 (#473.2): wrap el switch final en try/catch.
     // startGenerationWithSegments puede crashear si el state está corrupto
@@ -3049,6 +3168,7 @@ export default function App() {
       titleSongFont: a.titleSongFont || "",
       titleSongBreak: a.titleSongBreak || "",
       segments: a.segments,
+      segmentsRevision: Number.isInteger(a.segmentsRevision) ? a.segmentsRevision : 0,
       transcribeJobId: a.transcribeJobId || null,
       status: "queued", current_step: null, progress: 0, job_id: null, error: null,
     }));
@@ -3123,6 +3243,9 @@ export default function App() {
           formData.append("bg_cache_key", jobList[i].bgCacheKey);
         }
         formData.append("segments_json", JSON.stringify(jobList[i].segments));
+        if (Number.isInteger(jobList[i].segmentsRevision)) {
+          formData.append("base_revision", String(jobList[i].segmentsRevision));
+        }
         formData.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
           formData.append("umg_frame_size", delivery.umg_frame_size);
@@ -3460,6 +3583,7 @@ export default function App() {
         // lo que la operadora retocara al volver atrás se perdía en
         // silencio. El entry de approvedJobs siempre lo trae.
         transcribeJobId: last.transcribeJobId || null,
+        segmentsRevision: Number.isInteger(last.segmentsRevision) ? last.segmentsRevision : 0,
         songTitle: last.songTitle || "",
         bgCacheKey: last.bgCacheKey || null,
         language: last.language,
@@ -4204,7 +4328,7 @@ export default function App() {
             // session. With the jobId in the key, that swap forces an
             // unmount and `edited` re-seeds from the new (empty/loading)
             // segments instead of pinning the previous song's text.
-            key={`${currentReview.transcribeJobId || "no-job"}:${currentReview.file?.name || currentReview.filename || "resume"}:${currentReview.queueIdx}`}
+            key={`${currentReview.editingJobId || currentReview.transcribeJobId || "no-job"}:${currentReview.file?.name || currentReview.filename || "resume"}:${currentReview.queueIdx}`}
             // QA fix 2026-05-28 (scroll architecture): pre-fix usaba 72 para
             // clear el top bar de App porque el editor scrolleaba con el
             // page-scroll y el sticky-top-72 ponía el audio bar JUSTO
@@ -4234,9 +4358,19 @@ export default function App() {
             // keyea por storeKey (abajo) — que existe incluso cuando ambos
             // ids son null, así que los edits jobId-less no se pierden.
             transcribeJobId={currentReview.editingJobId || currentReview.transcribeJobId || null}
+            segmentsRevision={currentReview.segmentsRevision || 0}
             storeKey={reviewStoreKey(currentReview)}
             onPersistSegments={persistSegmentsToBackend}
+            saveQueue={segmentsSaveQueueRef.current}
             onReanchor={reanchorSegmentsOnBackend}
+            onReloadServer={({ draftKey, storeKey }) => {
+              try { if (draftKey) localStorage.removeItem(draftKey); } catch { /* best effort */ }
+              try { wizardPersistence.clear(); } catch { /* best effort */ }
+              segmentsStore.evict(storeKey);
+              segmentsStore.evict(currentReview.editingJobId);
+              segmentsStore.evict(currentReview.transcribeJobId);
+              window.location.reload();
+            }}
             // PR E (2026-07): el viejo onEditedChange (espejo sincrónico a
             // currentReview.segments) desapareció — WizardLivePreview lee
             // ahora del segmentsStore (useJobSegmentsValue) sin pasar por

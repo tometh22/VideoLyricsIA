@@ -9,7 +9,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
@@ -21,7 +21,7 @@ from auth import (
     validate_password_strength,
     _super_admin_allowlist,
 )
-from database import User, Job, Invoice, AuditLog, AIProvenance, AssetUsage, BackgroundAsset, UserSession, get_db
+from database import User, Job, Invoice, AuditLog, AIProvenance, AssetUsage, BackgroundAsset, UserSession, LoginSession, get_db
 from error_taxonomy import classify_error
 
 BACKGROUNDS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
@@ -66,6 +66,93 @@ def require_super_admin(current_user: dict = Depends(get_current_user)):
         if not (idents & allow):
             raise HTTPException(status_code=403, detail="Super admin access required")
     return current_user
+
+
+class SubmissionsControlRequest(BaseModel):
+    paused: bool
+    reason: str = Field(default="", max_length=500)
+    until: Optional[datetime] = None
+    retry_after: int = Field(default=60, ge=1, le=3600)
+
+
+class GlobalLogoutRequest(BaseModel):
+    confirmation: str
+    reason: str = Field(default="security cutover", max_length=500)
+
+
+@router.get("/ops/submissions")
+def get_submissions_control(
+    admin: dict = Depends(require_super_admin),
+):
+    from ops_control import get_submissions_state
+    return get_submissions_state()
+
+
+@router.put("/ops/submissions")
+def update_submissions_control(
+    body: SubmissionsControlRequest,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from ops_control import set_submissions_state
+    try:
+        state = set_submissions_state(
+            paused=body.paused,
+            reason=body.reason,
+            until=body.until,
+            retry_after=body.retry_after,
+        )
+    except Exception as exc:
+        logger.exception("Could not update submissions control")
+        raise HTTPException(status_code=503, detail="Operations control unavailable") from exc
+    db.add(AuditLog(
+        user_id=admin.get("id"),
+        action="ops.submissions.updated",
+        detail={
+            "paused": state["paused"],
+            "reason": state["reason"],
+            "until": state.get("until"),
+            "retry_after": state["retry_after"],
+        },
+    ))
+    db.commit()
+    return state
+
+
+@router.post("/ops/logout-all")
+def logout_all_users(
+    body: GlobalLogoutRequest,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """Irreversibly invalidate every browser access token and session."""
+    if body.confirmation != "LOGOUT_ALL_USERS":
+        raise HTTPException(status_code=400, detail="Explicit confirmation required")
+    now = datetime.now(timezone.utc)
+    users_updated = db.query(User).update(
+        {User.auth_version: User.auth_version + 1},
+        synchronize_session=False,
+    )
+    sessions_revoked = (
+        db.query(LoginSession)
+        .filter(LoginSession.revoked_at.is_(None))
+        .update({LoginSession.revoked_at: now}, synchronize_session=False)
+    )
+    db.add(AuditLog(
+        user_id=admin.get("id"),
+        action="auth.global_logout",
+        detail={
+            "reason": body.reason,
+            "users_updated": users_updated,
+            "sessions_revoked": sessions_revoked,
+        },
+    ))
+    db.commit()
+    return {
+        "ok": True,
+        "users_updated": users_updated,
+        "sessions_revoked": sessions_revoked,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,8 @@ guardrails en los prompts (base staging, nunca main)."""
 import hashlib
 import hmac
 import importlib
+import io
+import logging
 import os
 import sys
 import tempfile
@@ -21,6 +23,7 @@ import sentry_webhook  # noqa: E402
 import store  # noqa: E402
 import prompts  # noqa: E402
 import telegram  # noqa: E402
+import logging_utils  # noqa: E402
 
 store.init()
 
@@ -78,6 +81,43 @@ def test_telegram_authorization_gate():
     assert telegram._authorized(111)
     assert telegram._authorized("222")
     assert not telegram._authorized(999)
+
+
+def test_logging_redacts_telegram_urls_and_auth_headers():
+    bot_token = "123456789:abcdefghijklmnopqrstuvwxyzABCDE"
+    api_token = "railway-super-secret-token"
+    raw = (
+        f"POST https://api.telegram.org/bot{bot_token}/getUpdates "
+        f"Authorization: Bearer {api_token} "
+        f"Project-Access-Token={api_token}"
+    )
+    safe = logging_utils.redact(raw, secrets=(bot_token, api_token))
+    assert bot_token not in safe
+    assert api_token not in safe
+    assert safe.count("[REDACTED]") >= 3
+
+
+def test_logging_formatter_redacts_exception_traceback(monkeypatch):
+    token = "123456789:abcdefghijklmnopqrstuvwxyzABCDE"
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", token)
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging_utils.RedactingFormatter("%(message)s"))
+    test_logger = logging.getLogger("sentinel.redaction-test")
+    test_logger.handlers = [handler]
+    test_logger.propagate = False
+    test_logger.setLevel(logging.ERROR)
+    try:
+        raise RuntimeError(f"https://api.telegram.org/bot{token}/getUpdates")
+    except RuntimeError:
+        test_logger.exception("request failed")
+    assert token not in stream.getvalue()
+    assert "[REDACTED]" in stream.getvalue()
+
+
+def test_http_client_info_logging_is_disabled():
+    assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
+    assert logging.getLogger("httpcore").getEffectiveLevel() >= logging.WARNING
 
 
 def test_prompt_guardrails_pin_staging_never_main():

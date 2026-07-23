@@ -19,7 +19,7 @@ UMG: two users that share `tenant_id` DO see the same job list.
 import uuid
 
 from database import SessionLocal, Job
-from auth import create_user, create_token
+from auth import create_user, start_login_session
 from tests.conftest import auth
 
 
@@ -50,7 +50,7 @@ def _make_user(db, tenant_id: str, username_prefix: str):
         email=None,
         tenant_id=tenant_id,
     )
-    token = create_token(user)
+    token = start_login_session(db, user)
     return user, token
 
 

@@ -223,6 +223,10 @@ def run_bg_preview_job(
     runtime_fingerprint = runtime_rollout_fingerprint(
         mode=runtime_policy.get("policy_mode")
     )
+    from background_policy import compatible_policy_fingerprint
+    background_policy_fingerprint = compatible_policy_fingerprint(
+        background_policy_fingerprint, runtime_fingerprint,
+    )
     expected_cache_key = compute_bg_cache_key(params)
     lockstep_invalid = bool(
         (background_policy_fingerprint

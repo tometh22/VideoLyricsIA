@@ -143,11 +143,19 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: email.trim() }),
       }, 15000);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 429) throw new Error(t("login.forgot_rate_limited"));
+        if (res.status >= 500) throw new Error(t("login.forgot_server_error"));
+        throw new Error(data.detail || t("login.forgot_request_error"));
+      }
       await res.json().catch(() => ({}));
       setMessage(t("login.reset_sent"));
       setMode("reset_sent");
-    } catch {
-      setError(t("login.error"));
+    } catch (err) {
+      setError(err?.name === "TimeoutError"
+        ? t("login.forgot_network_error")
+        : err?.message || t("login.forgot_network_error"));
     } finally {
       setLoading(false);
     }

@@ -70,6 +70,9 @@ def test_enqueue_pipeline_attaches_current_internal_policy_token(monkeypatch):
     assert captured["kwargs"]["background_policy_fingerprint"] == (
         runtime_rollout_fingerprint()
     )
+    assert captured["meta"]["background_policy_fingerprint"] == (
+        runtime_rollout_fingerprint()
+    )
 
 
 def test_enqueue_edit_attaches_current_internal_policy_token(monkeypatch):
@@ -100,6 +103,7 @@ def test_enqueue_edit_attaches_current_internal_policy_token(monkeypatch):
 
     assert result == "queued-edit"
     assert captured["kwargs"]["args"][3] == runtime_rollout_fingerprint()
+    assert captured["kwargs"]["meta"]["background_policy_fingerprint"] == runtime_rollout_fingerprint()
 
 
 def test_edit_rejects_api_worker_policy_mismatch_before_db_work(monkeypatch):

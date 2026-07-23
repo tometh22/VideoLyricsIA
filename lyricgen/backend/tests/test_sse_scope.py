@@ -51,7 +51,10 @@ def test_sse_emits_unauthorized_when_tenant_changes(client, user_token, db):
     fresh_user.tenant_id = "other_tenant_evil"
     db.commit()
 
-    res = client.get(f"/events/{job_id}?token={user_token}")
+    res = client.get(
+        f"/events/{job_id}",
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
     # /events puede:
     #   - 404: initial scope check cortó (job no es del nuevo tenant)
     #   - 401: token quedó inválido
@@ -65,3 +68,33 @@ def test_sse_emits_unauthorized_when_tenant_changes(client, user_token, db):
         assert res.status_code in (401, 404), (
             f"esperado 200/401/404, got {res.status_code}: {res.text[:200]}"
         )
+
+
+def test_sse_query_access_token_is_disabled_by_default(client, user_token, monkeypatch):
+    monkeypatch.delenv("SSE_LEGACY_QUERY_AUTH_ENABLED", raising=False)
+    res = client.get(f"/events/does-not-matter?token={user_token}")
+    assert res.status_code == 401
+
+
+def test_sse_accepts_bearer_without_putting_token_in_url(client, user_token, db):
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {user_token}"}).json()
+    job_id = uuid.uuid4().hex[:12]
+    db.add(JobModel(
+        job_id=job_id,
+        user_id=me["id"],
+        tenant_id=me["tenant_id"],
+        artist="Test",
+        song_title="Bearer SSE",
+        filename="test.mp3",
+        status="done",
+        delivery_profile="youtube",
+        progress=100,
+        current_step="done",
+    ))
+    db.commit()
+    res = client.get(
+        f"/events/{job_id}",
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert res.status_code == 200
+    assert '"status": "done"' in res.text

@@ -18,10 +18,17 @@ import logging
 import httpx
 
 import config
+from logging_utils import redact
 
 logger = logging.getLogger("sentinel.telegram")
+# Telegram embeds its bot token in every request URL. Avoid the normal httpx
+# INFO request line even when this module is imported outside app.py.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-_API = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}"
+
+def _api_url(method: str) -> str:
+    return f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/{method}"
 
 
 def _authorized(chat_id) -> bool:
@@ -46,15 +53,15 @@ async def send(text: str, buttons: list[list[dict]] | None = None,
     async with httpx.AsyncClient(timeout=20) as client:
         for t in targets:
             try:
-                r = await client.post(f"{_API}/sendMessage",
+                r = await client.post(_api_url("sendMessage"),
                                       data={**payload, "chat_id": t, "text": text})
                 body = r.json()
                 if body.get("ok"):
                     last_id = body["result"]["message_id"]
                 else:
-                    logger.error("telegram sendMessage error: %s", body)
+                    logger.error("telegram sendMessage error: %s", redact(body))
             except Exception as e:  # red caída no debe tirar el servicio
-                logger.error("telegram send falló: %s", e)
+                logger.error("telegram send falló: %s", redact(e))
     return last_id
 
 
@@ -72,7 +79,7 @@ async def poll_updates(handle_callback, handle_text):
     async with httpx.AsyncClient(timeout=70) as client:
         while True:
             try:
-                r = await client.get(f"{_API}/getUpdates",
+                r = await client.get(_api_url("getUpdates"),
                                      params={"timeout": 50, "offset": offset})
                 for upd in r.json().get("result", []):
                     offset = upd["update_id"] + 1
@@ -80,7 +87,7 @@ async def poll_updates(handle_callback, handle_text):
                     if cq:
                         chat_id = cq["message"]["chat"]["id"]
                         if _authorized(chat_id):
-                            await client.post(f"{_API}/answerCallbackQuery",
+                            await client.post(_api_url("answerCallbackQuery"),
                                               data={"callback_query_id": cq["id"]})
                             await handle_callback(cq.get("data", ""), str(chat_id))
                         continue
@@ -93,5 +100,5 @@ async def poll_updates(handle_callback, handle_text):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error("telegram poll error: %s", e)
+                logger.error("telegram poll error: %s", redact(e))
                 await asyncio.sleep(5)

@@ -252,6 +252,11 @@ class User(Base):
     billing_status = Column(String(20), nullable=False, default="active",
                             server_default="active")
 
+    # Monotonic credential epoch embedded in every access JWT. Incrementing
+    # it invalidates every previously-issued access token for this user
+    # without rotating the shared JWT signing secret across a mixed fleet.
+    auth_version = Column(Integer, nullable=False, default=0, server_default="0")
+
     # AI authorization (UMG compliance — Guideline 5)
     ai_authorized = Column(Boolean, default=False)
     ai_authorized_at = Column(DateTime(timezone=True), nullable=True)
@@ -405,6 +410,8 @@ class Job(Base):
     # bg_r2_key_cached — R2 key for the AI-generated background so typography-only
     #   edits can re-use it without paying for Veo again.
     segments_json = Column(JSONB, nullable=True)
+    # Server-owned optimistic concurrency version for editor writes.
+    segments_revision = Column(BigInteger, default=0, nullable=False, server_default="0")
     render_params = Column(JSONB, nullable=True)
     edit_count = Column(Integer, default=0, nullable=False, server_default="0")
     bg_r2_key_cached = Column(Text, nullable=True)
@@ -513,6 +520,7 @@ class Job(Base):
             # lyrics and lets them attempt typography edits that the backend
             # then rejects with a raw English error.
             "segments_json": self.segments_json,
+            "segments_revision": self.segments_revision or 0,
             "bg_r2_key_cached": self.bg_r2_key_cached,
             # Storyboard multi-escena (NULL en jobs de fondo único). El panel
             # de edición lo usa para mostrar las escenas y ofrecer "regenerar
@@ -1245,6 +1253,11 @@ def _migrate_user_columns():
         # full_name/avatar_url. login_sessions la crea create_all().
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(200)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(500)",
+        # Credential epoch used to revoke access JWTs without rotating the
+        # fleet-wide signing secret. Alembic remains the primary migration;
+        # this mirrors the repository's startup self-heal convention.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version INTEGER DEFAULT 0 NOT NULL",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS segments_revision BIGINT DEFAULT 0 NOT NULL",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS youtube_short_data JSONB",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
