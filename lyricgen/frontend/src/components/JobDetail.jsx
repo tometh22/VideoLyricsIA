@@ -395,6 +395,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // flipped to true the moment the POST succeeds, so the user sees the
   // "Ya en UMG" state immediately without a poll round-trip.
   const currentUser = readCurrentUser();
+  // Server-authoritative feature flag. Absence is OFF so an old cached user
+  // cannot expose mutating publish actions during a backend shutdown.
+  const youtubePublishingEnabled = currentUser?.features?.youtube_publish === true;
   const isUmgAdmin = currentUser?.role === "admin";
   const [sendingUmg, setSendingUmg] = useState(false);
   const [isInUmgPortal, setIsInUmgPortal] = useState(
@@ -586,6 +589,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const isDone = job.status === "done";
   const isRejected = job.status === "rejected";
   const isEditing = job.status === "editing";
+  const isActivelyProcessing = new Set([
+    "awaiting_upload", "queued", "processing", "editing",
+    "transcribing", "transcribing_queued", "bg_preview_queued",
+  ]).has(job.status);
   const isValidationFailed = job.status === "validation_failed";
   const isError = job.status === "error";
   // An edit that failed AFTER a prior successful render: the deliverable in R2 is
@@ -617,12 +624,11 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     ? (_hasScenes ? ["lyrics"] : ["lyrics", "background"])
     : ["lyrics"];
 
-  // While the worker is re-rendering an edit request, poll /status every
-  // 5s and propagate updates up so the rest of the screen (status badge,
-  // approve panel visibility, preview URLs) stays in sync. The interval
-  // cleans itself up the moment status leaves "editing".
+  // A detail deep-link owns local state, so the root history poller cannot
+  // advance it. Poll every active state and stop at the first terminal or
+  // user-action state.
   useEffect(() => {
-    if (!isEditing) return;
+    if (!isActivelyProcessing) return;
     let cancelled = false;
     const tick = async () => {
       try {
@@ -639,7 +645,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     tick(); // first tick immediately, no need to wait 5s
     return () => { cancelled = true; clearInterval(iv); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isEditing, job.job_id]);
+  }, [isActivelyProcessing, job.job_id]);
 
   // Hooks moved before early returns (React rules of hooks: no hooks after
   // conditional returns). These were previously declared after the
@@ -1619,7 +1625,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               {t("detail.create_variant") || "Crear variante"}
             </button>
           )}
-          {canDownload && !youtubeResult && (
+          {youtubePublishingEnabled && canDownload && !youtubeResult && (
             <button onClick={previewMetadata} className="btn-primary text-xs h-10 px-5">
               <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
@@ -1636,7 +1642,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               {t("detail.view_youtube")}
             </a>
           )}
-          {canDownload && !youtubeShortResult && (
+          {youtubePublishingEnabled && canDownload && !youtubeShortResult && (
             <button onClick={previewShortMetadata} className="btn-secondary text-xs h-10 px-5">
               <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
@@ -2033,7 +2039,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       )}
 
       {/* YouTube Panel (only for approved/done jobs) */}
-      {canDownload && showYoutubePanel && (
+      {youtubePublishingEnabled && canDownload && showYoutubePanel && (
         <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-6 animate-fade-in">
           <h3 className="font-semibold mb-4 flex items-center gap-2">
             <svg className="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24">
@@ -2192,7 +2198,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       )}
 
       {/* YouTube Shorts Panel */}
-      {canDownload && showYoutubeShortPanel && (
+      {youtubePublishingEnabled && canDownload && showYoutubeShortPanel && (
         <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-6 animate-fade-in">
           <h3 className="font-semibold mb-4 flex items-center gap-2">
             <svg className="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24">

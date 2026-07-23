@@ -8,17 +8,13 @@ import HelpTip from "./HelpCenter/HelpTip";
 import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
 import { CONCEPT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
+import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBackgroundPreviewTokens";
 
 const API = import.meta.env.VITE_API_URL || "";
 
 function authHeaders() {
   const token = localStorage.getItem("genly_token");
   return token ? { Authorization: `Bearer ${token}` } : {};
-}
-
-function tokenParam() {
-  const token = localStorage.getItem("genly_token");
-  return token ? `token=${encodeURIComponent(token)}` : "";
 }
 
 // Maximum tracks per batch. Aligned with the per-tenant backlog cap
@@ -299,6 +295,7 @@ export default function UploadZone({
     onBgMode?.(m);
   };
   const [libraryBgs, setLibraryBgs] = useState([]);
+  const libraryPreviewTokens = useBackgroundPreviewTokens(libraryBgs.map((bg) => bg.id), API);
   const [libraryLoaded, setLibraryLoaded] = useState(false);
   const [libraryFetchFailed, setLibraryFetchFailed] = useState(false);
   // Library filter chip: all | image | video_cinematic | video_simple
@@ -2500,7 +2497,7 @@ export default function UploadZone({
                             <div className="aspect-video bg-black/30 relative">
                               {bg.file_type === "mp4" ? (
                                 <video
-                                  src={`${API}/backgrounds/${bg.id}/preview?${tokenParam()}`}
+                                  src={backgroundPreviewUrl(API, bg.id, libraryPreviewTokens[String(bg.id)]) || undefined}
                                   className="w-full h-full object-cover"
                                   preload="metadata"
                                   muted loop playsInline
@@ -2509,7 +2506,7 @@ export default function UploadZone({
                                 />
                               ) : (
                                 <img
-                                  src={`${API}/backgrounds/${bg.id}/preview?${tokenParam()}`}
+                                  src={backgroundPreviewUrl(API, bg.id, libraryPreviewTokens[String(bg.id)]) || undefined}
                                   className="w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-500"
                                   alt={bg.name}
                                   /* 80 assets full-res: sin lazy, el grid
@@ -2942,7 +2939,7 @@ export default function UploadZone({
                   return customPreviewUrl;
                 }
                 if (bgMode === "library" && backgroundId) {
-                  return `${API}/backgrounds/${backgroundId}/preview?${tokenParam()}`;
+                  return backgroundPreviewUrl(API, backgroundId, libraryPreviewTokens[String(backgroundId)]);
                 }
                 return (MOVEMENT_STYLES.find((m) => m.code === (hoverMovement ?? batchDefaults.movementStyle))?.sample) || "/movement_samples/estandar.mp4";
               })()}

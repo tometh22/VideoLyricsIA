@@ -7,12 +7,7 @@ import { API } from "../../adminApi";
 import EmptyState from "../../primitives/EmptyState";
 import FilterBar from "../../primitives/FilterBar";
 import SectionHeader from "../../layout/SectionHeader";
-
-// URL de preview con token en query — el <video>/<img> no puede mandar el
-// header Authorization, así que el token viaja en la URL. CRÍTICO: misma URL
-// para mp4 e imagen; el backend valida el token.
-const previewUrl = (id) =>
-  `${API}/backgrounds/${id}/preview?token=${encodeURIComponent(localStorage.getItem("genly_token") || "")}`;
+import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../../../../hooks/useBackgroundPreviewTokens";
 
 export default function FondosView({
   backgrounds,
@@ -30,6 +25,8 @@ export default function FondosView({
   handleDeleteBg,
 }) {
   const uploadDisabled = bgUploading || !bgName.trim();
+  const previewTokens = useBackgroundPreviewTokens(backgrounds.map((bg) => bg.id), API);
+  const previewUrl = (id) => backgroundPreviewUrl(API, id, previewTokens[String(id)]);
 
   return (
     <div>

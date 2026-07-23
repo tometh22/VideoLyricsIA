@@ -516,7 +516,7 @@ describe("LyricsEditor — durable save on page unload (refresh/close) (2026-06-
     const [jobId, segments, opts] = onPersistSegments.mock.calls[0];
     expect(jobId).toBe("job-1");
     expect(segments).toEqual([{ start: 1.0, end: 2.0, text: "alpha EDITED" }]);
-    expect(opts).toEqual({ keepalive: true });
+    expect(opts).toMatchObject({ keepalive: true, baseRevision: 0 });
   });
 
   it("does not fire a save on unload when there is nothing pending", () => {

@@ -43,10 +43,24 @@ export async function persistSegments(authFetch, API, jobId, segments, opts = {}
   }));
   console.warn("[drag-persist] POST", { jobId, count: safeSegments.length, sample: _sample });
   try {
+    let baseRevision = Number.isInteger(opts.baseRevision) ? opts.baseRevision : 0;
+    // A conflict overwrite is always based on a fresh server read.  Reusing
+    // the revision returned by an earlier 409 is racy: another tab may have
+    // committed again while the operator was deciding what to do.
+    if (opts.resolveConflict === true) {
+      const statusRes = await authFetch(`${API}/status/${jobId}`);
+      if (!statusRes.ok) {
+        return { ok: false, reason: `http-${statusRes.status}`, status: statusRes.status };
+      }
+      const current = await statusRes.json();
+      baseRevision = Number.isInteger(current?.segments_revision)
+        ? current.segments_revision
+        : baseRevision;
+    }
     const res = await authFetch(`${API}/jobs/${jobId}/save-segments`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ segments: safeSegments }),
+      body: JSON.stringify({ segments: safeSegments, base_revision: baseRevision }),
       // keepalive deja que el POST sobreviva un unload (refresh / cierre de
       // tab). El flush de unload lo setea para que las últimas ediciones aún
       // no debounced no se cancelen mid-flight (reporte Gaby 2026-06-24:
@@ -66,17 +80,35 @@ export async function persistSegments(authFetch, API, jobId, segments, opts = {}
         // como warning suave; el usuario verá el error real al "Crear videos".
         console.warn("[autosave] /save-segments failed", res.status);
       }
+      let body = null;
+      try { body = await res.clone().json(); } catch { /* non-JSON */ }
       return {
         ok: false,
-        reason: res.status === 404 ? "job-gone" : `http-${res.status}`,
+        reason: res.status === 404
+          ? "job-gone"
+          : res.status === 409
+            ? "stale-revision"
+            : res.status === 428
+              ? "client-upgrade-required"
+              : `http-${res.status}`,
         status: res.status,
+        ...(Number.isInteger(body?.current_revision)
+          ? { currentRevision: body.current_revision }
+          : {}),
+        ...(body?.updated_at ? { updatedAt: body.updated_at } : {}),
       };
     }
     // El eco post-200 (setCurrentReview con el snapshot enviado, que pisaba
     // ediciones in-flight) se ELIMINÓ en la auditoría 2026-06-10; desde PR E
     // la fuente de frescura es el segmentsStore, así que no escribimos nada
     // de vuelta acá.
-    return { ok: true };
+    let body = {};
+    try { body = await res.clone().json(); } catch { /* legacy empty body */ }
+    return {
+      ok: true,
+      applied: body?.applied !== false,
+      revision: Number.isInteger(body?.revision) ? body.revision : baseRevision + 1,
+    };
   } catch (err) {
     console.warn("[autosave] /save-segments network error", err);
     return { ok: false, reason: "network", error: String(err) };

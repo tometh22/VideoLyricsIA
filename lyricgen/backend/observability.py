@@ -298,6 +298,29 @@ def reaper_seconds_since_last_ok() -> float | None:
     return time.monotonic() - _REAPER_LAST_OK_TS
 
 
+def worker_fleet_coherence(release_rows: list[dict], api_release: str,
+                           api_protocol: int) -> dict:
+    """Pure deploy-gate contract shared by health and focused tests."""
+    expected = {"transcription", "bg_preview", "enterprise", "default"}
+    advertised = {
+        queue for row in release_rows for queue in (row.get("queues") or [])
+    }
+    release_match = bool(release_rows) and all(
+        not api_release or api_release == "unknown" or row.get("release") == api_release
+        for row in release_rows
+    )
+    protocol_match = bool(release_rows) and all(
+        row.get("rq_payload_version") == api_protocol for row in release_rows
+    )
+    missing = sorted(expected - advertised)
+    return {
+        "coherent": bool(release_match and protocol_match and not missing),
+        "missing_queues": missing,
+        "release_match": release_match,
+        "protocol_match": protocol_match,
+    }
+
+
 def health_snapshot() -> dict:
     """Lightweight report of runtime health.
 
@@ -318,7 +341,22 @@ def health_snapshot() -> dict:
         production — Redis (queue is broken) or Postgres (SELECT 1
         failed). The /health endpoint translates this to HTTP 503.
     """
-    snap = {"status": "ok", "env": ENV}
+    snap = {
+        "status": "ok",
+        "env": ENV,
+        "release": _resolve_release(),
+        "features": {
+            "anchor_lyrics": os.environ.get("ANCHOR_LYRICS_ENABLED", "0").strip().lower()
+            in ("1", "true", "yes", "on"),
+            "youtube_publish": os.environ.get("YOUTUBE_PUBLISH_ENABLED", "0").strip().lower()
+            in ("1", "true", "yes", "on"),
+        },
+    }
+    try:
+        from queue_jobs import RQ_PAYLOAD_VERSION
+        snap["rq_payload_version"] = RQ_PAYLOAD_VERSION
+    except Exception:
+        snap["rq_payload_version"] = int(os.environ.get("RQ_PAYLOAD_VERSION", "2"))
     is_prod = ENV in ("prod", "production")
     starting = _within_startup_grace()
 
@@ -408,6 +446,44 @@ def health_snapshot() -> dict:
                     snap["workers_alive"] = -1
                 if snap.get("workers_alive") == 0:
                     _degrade("no_workers")
+                try:
+                    release_rows = []
+                    for key in r.scan_iter(match="genly:worker:release:*", count=50):
+                        raw = r.get(key)
+                        if raw:
+                            if isinstance(raw, bytes):
+                                raw = raw.decode("utf-8", "replace")
+                            release_rows.append(json.loads(raw))
+                    snap["worker_releases"] = release_rows
+                    releases = {row.get("release") for row in release_rows if row.get("release")}
+                    protocols = {
+                        row.get("rq_payload_version") for row in release_rows
+                        if row.get("rq_payload_version") is not None
+                    }
+                    if len(releases) > 1:
+                        _degrade("mixed_worker_releases")
+                    if len(protocols) > 1:
+                        _degrade("mixed_worker_protocols")
+                    fleet = worker_fleet_coherence(
+                        release_rows,
+                        str(snap.get("release") or ""),
+                        int(snap.get("rq_payload_version") or 0),
+                    )
+                    snap["fleet_coherent"] = fleet["coherent"]
+                    snap["fleet_missing_queues"] = fleet["missing_queues"]
+                    snap["fleet_release_match"] = fleet["release_match"]
+                    snap["fleet_protocol_match"] = fleet["protocol_match"]
+                    if not snap["fleet_coherent"]:
+                        strict_default = "1" if is_prod else "0"
+                        strict = os.environ.get(
+                            "FLEET_READINESS_STRICT", strict_default,
+                        ).strip().lower() in {"1", "true", "yes", "on"}
+                        if strict:
+                            _down("worker_fleet_incoherent")
+                        else:
+                            _degrade("worker_fleet_incoherent")
+                except Exception:
+                    snap["worker_releases"] = []
                 # Tier 3 segmentation guard: with a segmented fleet (ShortWorker
                 # on transcription/bg_preview + Worker on enterprise/default), a
                 # rollout mistake (e.g. setting Worker QUEUES=enterprise,default
@@ -534,4 +610,14 @@ def health_snapshot() -> dict:
         # without sending a test event.
         "sentry": bool(SENTRY_DSN),
     }
+    try:
+        from ops_control import get_submissions_state
+        snap["submissions"] = get_submissions_state()
+    except Exception:
+        snap["submissions"] = {"paused": False, "source": "unavailable"}
+    try:
+        from ops_metrics import snapshot as ops_metrics_snapshot
+        snap["operational_metrics"] = ops_metrics_snapshot()
+    except Exception:
+        snap["operational_metrics"] = {}
     return snap

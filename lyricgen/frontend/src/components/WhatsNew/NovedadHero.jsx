@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useI18n } from "../../i18n";
 import { CHANGELOG } from "../../changelog";
 import ReleaseVisual from "./ReleaseVisual";
+import { readScopedReceipt, scopedChangelogKey } from "./useChangelog";
 
 const DISMISS_KEY = "genly_novedad_hero_dismissed_id";
 
@@ -20,18 +21,28 @@ export default function NovedadHero() {
   const { t } = useI18n();
   const navigate = useNavigate();
   const [featured, ...secondary] = CHANGELOG;
+  const scopedDismissKey = useMemo(() => scopedChangelogKey(DISMISS_KEY), []);
   const [dismissed, setDismissed] = useState(() => {
     try {
-      return localStorage.getItem(DISMISS_KEY) === (featured ? featured.id : "");
+      return readScopedReceipt(DISMISS_KEY) === (featured ? featured.id : "");
     } catch {
       return false;
     }
   });
+  useEffect(() => {
+    const sync = (event) => {
+      if (event.key === scopedDismissKey) {
+        setDismissed(event.newValue === (featured ? featured.id : ""));
+      }
+    };
+    window.addEventListener("storage", sync);
+    return () => window.removeEventListener("storage", sync);
+  }, [featured, scopedDismissKey]);
   if (!featured || dismissed) return null;
 
   const dismiss = () => {
     setDismissed(true);
-    try { localStorage.setItem(DISMISS_KEY, featured.id); } catch {}
+    try { localStorage.setItem(scopedDismissKey, featured.id); } catch {}
   };
 
   const updates = secondary.slice(0, 3);

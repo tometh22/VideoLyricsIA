@@ -14,6 +14,7 @@ import { useJobSegments, segmentsStore } from "../state/segmentsStore";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
 import { splitWordsAtCharOffset, firstWordStart, lastWordEnd } from "../lib/splitWords";
 import useLocalStorage from "../hooks/useLocalStorage";
+import { createSaveQueue } from "../lib/saveQueue";
 
 // Copy honesto del fallo de respaldo (autosave), por CAUSA real. El banner
 // + el confirm de "Aprobar" antes decían "problema de red" para cualquier
@@ -54,6 +55,13 @@ const _SAVE_ERROR_COPY = {
     confirm:
       "Tu última edición no se pudo respaldar en el servidor. Podés aprobar igual: el video se genera con lo que ves en pantalla. Solo el respaldo para reanudar la sesión queda desactualizado. ¿Continuar?",
   },
+  conflict: {
+    short: "Conflicto: cambios no guardados",
+    detail:
+      "Otra pestaña o dispositivo guardó una versión más nueva. Tu borrador sigue a salvo en este navegador.",
+    confirm:
+      "Hay una versión más nueva en el servidor. Resolvé el conflicto antes de aprobar para evitar sobrescribir cambios de otra sesión.",
+  },
 };
 
 // Deriva la categoría de copy desde el { reason, status } que retorna
@@ -65,6 +73,7 @@ function _saveErrorCategory(result) {
   if (reason === "network") return "network";
   if (status === 401 || status === 403) return "session";
   if (reason === "job-gone" || status === 404) return "job-gone";
+  if (reason === "stale-revision" || status === 409) return "conflict";
   return "server"; // 400/409/5xx/otros → copy genérico honesto
 }
 
@@ -361,6 +370,7 @@ export default function LyricsEditor({
   lyricsAnimation = "none",
   lineTransition = "none",
   transcribeJobId = null,
+  segmentsRevision = 0,
   // PR E follow-up (2026-07): key DEL STORE, desacoplada del backend job id.
   // transcribeJobId gobierna el autosave/backend (POST /save-segments) y es el
   // job real (o null). storeKey identifica la review para el segmentsStore y
@@ -370,6 +380,10 @@ export default function LyricsEditor({
   // transcribeJobId sigan keyando el store correctamente.
   storeKey = null,
   onPersistSegments = null,
+  saveQueue = null,
+  // Descarta caches/draft locales y vuelve a hidratar la versión canónica
+  // después de un 409. El padre conoce el ciclo de vida del wizard.
+  onReloadServer = null,
   // Versión B, parte 2 (2026-07-15): callback del padre que hace el POST
   // /jobs/{id}/reanchor (re-anclado CTC del timing con el texto corregido).
   // El botón "Re-sincronizar con IA" solo se muestra si el padre lo pasa Y
@@ -537,6 +551,21 @@ export default function LyricsEditor({
   // no hay error. Se deriva de result.reason/status de persistSegments.
   const [saveErrorReason, setSaveErrorReason] = useState(null);
   const [flushCounter, setFlushCounter] = useState(0);
+  const editedRef = useRef(edited);
+  editedRef.current = edited;
+  const persistRef = useRef(onPersistSegments);
+  persistRef.current = onPersistSegments;
+  const saveQueueRef = useRef(null);
+  if (!saveQueueRef.current) {
+    saveQueueRef.current = saveQueue || createSaveQueue(
+      (jobId, value, opts) => persistRef.current?.(jobId, value, opts),
+      { categorize: _saveErrorCategory },
+    );
+  }
+  const draftOwner = user?.id || user?.username || null;
+  const draftKey = transcribeJobId && draftOwner
+    ? `genly_segments_draft:${draftOwner}:${transcribeJobId}`
+    : null;
   // Snapshot of the timings as first handed to us — the baseline for the
   // timeline's "Resetear timings". PR E + F2 fix: se lee del `original` del
   // store (getOriginal), que es la baseline del PRIMER seed y NUNCA se pisa
@@ -590,57 +619,76 @@ export default function LyricsEditor({
   // morían con él, y al volver el remount sembraba desde datos viejos.
   // `_pendingFlushRef` guarda el estado más fresco aún-no-persistido; el
   // effect de unmount (deps vacías, abajo) lo dispara fire-and-forget.
-  const _pendingFlushRef = useRef(null);
   useEffect(() => {
     if (disableAutosave) return undefined;
     if (!onPersistSegments || !transcribeJobId) return undefined;
     if (!Array.isArray(edited) || edited.length === 0) return undefined;
-    let cancelled = false;
-    _pendingFlushRef.current = { onPersistSegments, transcribeJobId, edited };
-    const tid = setTimeout(async () => {
-      if (cancelled) return;
-      _pendingFlushRef.current = null;
-      setSaveStatus("saving");
-      const cleaned = edited.map(({ _id, review, ...rest }) => rest);
-      try {
-        const result = await Promise.resolve(onPersistSegments(transcribeJobId, cleaned));
-        if (cancelled) return;
-        // El callback (App.jsx::persistSegmentsToBackend) retorna
-        // { ok, reason } post-fix #74. Para legacy callers (sin
-        // return value), result === undefined → tratamos como ok.
-        if (result && result.ok === false) {
-          setSaveErrorReason(_saveErrorCategory(result));
-          setSaveStatus("error");
-        } else {
-          setSaveErrorReason(null);
-          setSaveStatus("saved");
-        }
-      } catch {
-        if (!cancelled) {
-          setSaveErrorReason("network");
-          setSaveStatus("error");
-        }
-      }
-    }, 3000);
-    return () => { cancelled = true; clearTimeout(tid); };
-  }, [edited, transcribeJobId, onPersistSegments, disableAutosave]);
+    const queue = saveQueueRef.current;
+    queue.prime(transcribeJobId, Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
+    queue.schedule(transcribeJobId, () =>
+      editedRef.current.map(({ _id, review, ...rest }) => rest));
+    return undefined;
+  }, [edited, transcribeJobId, onPersistSegments, disableAutosave, segmentsRevision]);
 
-  // Flush-on-unmount: si el componente muere con un autosave pendiente
-  // (debounce sin disparar), persistimos el estado vigente igual. Fire-
-  // and-forget: no hay UI que actualizar — el objetivo es que el backend
-  // (y el remount posterior, que siembra desde currentReview) no pierdan
-  // los últimos segundos de trabajo de la operadora.
+  // The queue is the single status source for debounce, drag, retry and
+  // navigation flushes.  A trailing snapshot is coalesced while a request is
+  // in flight, and the returned Promise resolves only when the job drains.
   useEffect(() => {
-    return () => {
-      const p = _pendingFlushRef.current;
-      if (!p) return;
-      _pendingFlushRef.current = null;
-      try {
-        const cleaned = p.edited.map(({ _id, review, ...rest }) => rest);
-        Promise.resolve(p.onPersistSegments(p.transcribeJobId, cleaned)).catch(() => {});
-      } catch { /* best-effort */ }
-    };
-  }, []);
+    if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
+    const queue = saveQueueRef.current;
+    queue.prime(transcribeJobId, Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
+    const unsubscribe = queue.subscribe(transcribeJobId, ({ status, reason }) => {
+      setSaveStatus(status);
+      setSaveErrorReason(reason);
+      if (status === "saved" && draftKey) {
+        try { localStorage.removeItem(draftKey); } catch { /* storage blocked */ }
+      }
+    });
+    return unsubscribe;
+  }, [disableAutosave, onPersistSegments, transcribeJobId, segmentsRevision, draftKey]);
+
+  // Keep a per-user, per-job recoverable local draft.  This is independent
+  // from fetch keepalive: browsers cap keepalive request bodies and may kill
+  // the page before the network settles.
+  const draftRestoredRef = useRef(false);
+  const dirtyRef = useRef(isDirty);
+  dirtyRef.current = isDirty;
+  useEffect(() => {
+    if (!draftKey || draftRestoredRef.current) return;
+    draftRestoredRef.current = true;
+    try {
+      const saved = JSON.parse(localStorage.getItem(draftKey) || "null");
+      if (Array.isArray(saved?.segments) && saved.segments.length) {
+        setEdited(reseedPreservingIds(editedRef.current, saved.segments));
+        setIsDirty(true);
+      }
+    } catch { /* corrupt or unavailable storage */ }
+  }, [draftKey, setEdited]);
+
+  useEffect(() => {
+    if (!draftKey || !isDirty) return;
+    try {
+      const cleaned = edited.map(({ _id, review, ...rest }) => rest);
+      localStorage.setItem(draftKey, JSON.stringify({
+        segments: cleaned,
+        base_revision: saveQueueRef.current._peek(transcribeJobId)?.revision || 0,
+        updated_at: new Date().toISOString(),
+      }));
+    } catch { /* quota/storage blocked; network autosave still runs */ }
+  }, [draftKey, edited, isDirty, transcribeJobId]);
+
+  // SPA navigation unmounts React before pagehide. Flush only when a
+  // debounce/trailing snapshot is actually pending; a completed save must not
+  // be duplicated merely because isDirty remains true until approval.
+  useEffect(() => () => {
+    if (disableAutosave || !onPersistSegments || !transcribeJobId) return;
+    const queue = saveQueueRef.current;
+    const state = queue._peek(transcribeJobId);
+    if (!dirtyRef.current || (!state?.debounceTimer && !state?.pending)) return;
+    queue.flush(transcribeJobId, {
+      provider: () => editedRef.current.map(({ _id, review, ...rest }) => rest),
+    });
+  }, [disableAutosave, onPersistSegments, transcribeJobId]);
 
   // Durable flush on page unload (refresh / tab close). The beforeunload
   // handler above only WARNS via a native dialog — it does not persist. And
@@ -656,14 +704,17 @@ export default function LyricsEditor({
   useEffect(() => {
     if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
     const flushOnUnload = () => {
-      const p = _pendingFlushRef.current;
-      if (!p) return;
-      _pendingFlushRef.current = null;
       try {
-        const cleaned = p.edited.map(({ _id, review, ...rest }) => rest);
-        Promise.resolve(
-          p.onPersistSegments(p.transcribeJobId, cleaned, { keepalive: true })
-        ).catch(() => {});
+        const cleaned = editedRef.current.map(({ _id, review, ...rest }) => rest);
+        const bytes = new Blob([JSON.stringify({ segments: cleaned })]).size;
+        // Chromium/WebKit keepalive budget is about 64 KiB. Leave headroom
+        // for the OCC field and headers; large drafts remain in localStorage.
+        if (bytes <= 60 * 1024) {
+          saveQueueRef.current.flush(transcribeJobId, {
+            keepalive: true,
+            provider: () => cleaned,
+          });
+        }
       } catch { /* best-effort */ }
     };
     window.addEventListener("pagehide", flushOnUnload);
@@ -681,37 +732,24 @@ export default function LyricsEditor({
   useEffect(() => {
     if (flushCounter === 0) return undefined;
     if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
-    let cancelled = false;
-    // El flush persiste el `edited` vigente ya mismo — el flush-on-unmount
-    // no tiene nada pendiente que rescatar.
-    _pendingFlushRef.current = null;
-    setSaveStatus("saving");
-    const cleaned = edited.map(({ _id, review, ...rest }) => rest);
-    Promise.resolve(onPersistSegments(transcribeJobId, cleaned))
-      .then((result) => {
-        if (cancelled) return;
-        // QA fix audit P0 #74: distinguir error en lugar de idle silencioso.
-        if (result && result.ok === false) {
-          setSaveErrorReason(_saveErrorCategory(result));
-          setSaveStatus("error");
-        } else {
-          setSaveErrorReason(null);
-          setSaveStatus("saved");
-        }
-      })
-      .catch(() => { if (!cancelled) { setSaveErrorReason("network"); setSaveStatus("error"); } });
-    return () => { cancelled = true; };
+    saveQueueRef.current.flush(transcribeJobId, {
+      provider: () => editedRef.current.map(({ _id, review, ...rest }) => rest),
+    });
+    return undefined;
     // Only react to the flush trigger — `edited` is intentionally read fresh
     // but NOT a dep (we don't want every keystroke to flush).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flushCounter]);
 
-  // Auto-clear the "Guardado ✓" chip a couple seconds after it shows.
-  useEffect(() => {
-    if (saveStatus !== "saved") return undefined;
-    const id = setTimeout(() => setSaveStatus("idle"), 2000);
-    return () => clearTimeout(id);
-  }, [saveStatus]);
+  const flushPendingSave = useCallback((persistOpts = null, force = false) => {
+    if ((!force && disableAutosave) || !onPersistSegments || !transcribeJobId) {
+      return Promise.resolve({ ok: true, skipped: true });
+    }
+    return saveQueueRef.current.flush(transcribeJobId, {
+      provider: () => editedRef.current.map(({ _id, review, ...rest }) => rest),
+      persistOpts,
+    });
+  }, [disableAutosave, onPersistSegments, transcribeJobId]);
 
   // PR E (2026-07): acá vivía el espejo sincrónico por keystroke
   // (onEditedChange → App.setCurrentReview). Eliminado — era la mitad del
@@ -1001,12 +1039,19 @@ export default function LyricsEditor({
     if (!onReanchor || !transcribeJobId || reanchoring) return;
     setReanchoring(true);
     try {
+      let saved = null;
       if (onPersistSegments) {
-        const cleaned = edited.map(({ _id, review, ...rest }) => rest);
-        await Promise.resolve(onPersistSegments(transcribeJobId, cleaned));
+        saved = await flushPendingSave(null, true);
+        if (saved?.ok === false) throw new Error(saved.reason || "save-failed");
       }
-      const res = await Promise.resolve(onReanchor(transcribeJobId));
+      const baseRevision = Number.isInteger(saved?.revision)
+        ? saved.revision
+        : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
+      const res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision));
       if (res && res.ok && Array.isArray(res.segments) && res.segments.length) {
+        if (Number.isInteger(res.revision)) {
+          saveQueueRef.current.prime(transcribeJobId, res.revision);
+        }
         pushEditHistory();
         // PR E: ids frescos vía el mismo helper que el seed inicial —
         // consistencia con la identidad estable del store (PR D).
@@ -1031,8 +1076,8 @@ export default function LyricsEditor({
     } finally {
       setReanchoring(false);
     }
-  }, [onReanchor, onPersistSegments, transcribeJobId, reanchoring, edited,
-      pushEditHistory, toast, t]);
+  }, [onReanchor, onPersistSegments, transcribeJobId, segmentsRevision, reanchoring, edited,
+      pushEditHistory, toast, t, flushPendingSave]);
 
   const focusSegment = useCallback((id) => {
     setFocusedSegId(id);
@@ -2024,7 +2069,7 @@ export default function LyricsEditor({
     });
   };
 
-  const handleApprove = () => {
+  const handleApprove = async () => {
     // Aviso (no bloqueo) si el último autosave falló. IMPORTANTE — contrato
     // real verificado (incidente UMG 21-jul-2026): aprobar manda los
     // segments EN PANTALLA en el cuerpo del POST (onApprove(cleaned) acá;
@@ -2049,10 +2094,29 @@ export default function LyricsEditor({
       return;
     }
     setWrapWarning(null);
-    setIsDirty(false);
     const cleaned = _buildCleanedSegments();
-    onApprove(cleaned.map(({ _id, ...rest }) => rest));
+    if (disableAutosave || !onPersistSegments || !transcribeJobId) {
+      setIsDirty(false);
+      onApprove(cleaned.map(({ _id, ...rest }) => rest), {
+        baseRevision: Number.isInteger(segmentsRevision) ? segmentsRevision : 0,
+      });
+      return;
+    }
+    const saveResult = await flushPendingSave();
+    if (saveResult?.ok === false && saveResult.reason === "stale-revision") return;
+    setIsDirty(false);
+    onApprove(cleaned.map(({ _id, ...rest }) => rest), {
+      baseRevision: Number.isInteger(saveResult?.revision)
+        ? saveResult.revision
+        : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0),
+    });
   };
+
+  const handleBackSafely = useCallback(async () => {
+    const result = await flushPendingSave();
+    if (result?.ok === false && result.reason === "stale-revision") return;
+    onBack?.();
+  }, [flushPendingSave, onBack]);
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
 
@@ -2155,7 +2219,7 @@ export default function LyricsEditor({
           floating button (below) so it can never be hidden behind the
           app's own sticky top bar — the recurring "botón cortado". */}
       <div className="py-3 mb-4 flex items-center gap-3">
-        <button onClick={onBack}
+        <button onClick={handleBackSafely}
           className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors shrink-0">
           <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M19 12H5M12 19l-7-7 7-7" />
@@ -2236,14 +2300,38 @@ export default function LyricsEditor({
               {(_SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server).detail}
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() => setEdited((p) => [...p])}
-            className="text-[11px] text-red-200 hover:text-white bg-red-500/20 hover:bg-red-500/30 rounded-lg px-3 py-1.5 transition-colors shrink-0"
-            title="Forzar reintento de guardado"
-          >
-            Reintentar
-          </button>
+          <div className="flex shrink-0 gap-2">
+            {saveErrorReason === "conflict" ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (onReloadServer) onReloadServer({ draftKey, storeKey: _storeKey });
+                    else window.location.reload();
+                  }}
+                  className="text-[11px] text-red-200 hover:text-white bg-red-500/20 hover:bg-red-500/30 rounded-lg px-3 py-1.5 transition-colors"
+                >
+                  Recargar servidor
+                </button>
+                <button
+                  type="button"
+                  onClick={() => flushPendingSave({ resolveConflict: true })}
+                  className="text-[11px] text-white bg-brand hover:bg-brand-light rounded-lg px-3 py-1.5 transition-colors"
+                >
+                  Sobrescribir mi versión
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={() => flushPendingSave()}
+                className="text-[11px] text-red-200 hover:text-white bg-red-500/20 hover:bg-red-500/30 rounded-lg px-3 py-1.5 transition-colors"
+                title="Forzar reintento de guardado"
+              >
+                Reintentar
+              </button>
+            )}
+          </div>
         </div>
       )}
 
@@ -3580,8 +3668,9 @@ export default function LyricsEditor({
             <button
               onClick={() => {
                 setWrapWarning(null);
-                const cleaned = _buildCleanedSegments();
-                onApprove(cleaned.map(({ _id, ...rest }) => rest));
+                // Conserva el mismo contrato CAS que el CTA principal. Esta
+                // rama antes salteaba el flush y enviaba un edit sin revisión.
+                handleApprove();
               }}
               className="btn-secondary h-9 px-4 text-xs"
             >

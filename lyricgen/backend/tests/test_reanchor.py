@@ -168,6 +168,16 @@ def test_reanchor_other_users_job_404(client, monkeypatch):
     assert res.status_code == 404
 
 
+def test_reanchor_platform_admin_can_open_cross_tenant_job(client, admin_token, monkeypatch):
+    monkeypatch.delenv("ANCHOR_LYRICS_ENABLED", raising=False)
+    _, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS))
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(admin_token))
+    # Feature gate proves authorization passed; this used to be an opaque 404.
+    assert res.status_code == 409
+    assert "habilitado" in res.json()["detail"]
+
+
 def test_reanchor_wrong_status_409(client, monkeypatch):
     monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
     token, user_id, tenant_id = _make_user(client)
@@ -304,3 +314,26 @@ def test_reanchor_empty_text_lines_pass_through(client, monkeypatch):
     assert len(seen["anchor_lyrics"].splitlines()) == 4
     persisted = _db_segments(job_id)
     assert any(s.get("_id") == 99 for s in persisted)
+
+
+def test_reanchor_rejects_stale_revision_before_alignment(client, monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=[dict(s) for s in SEGS])
+    from database import Job, SessionLocal
+    db = SessionLocal()
+    try:
+        row = db.query(Job).filter(Job.job_id == job_id).first()
+        row.segments_revision = 3
+        db.commit()
+    finally:
+        db.close()
+
+    res = client.post(
+        f"/jobs/{job_id}/reanchor",
+        json={"base_revision": 2},
+        headers=auth(token),
+    )
+    assert res.status_code == 409
+    assert res.json()["code"] == "stale_revision"
+    assert res.json()["current_revision"] == 3

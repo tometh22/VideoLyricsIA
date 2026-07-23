@@ -84,15 +84,74 @@ def test_preview_background(client, admin_token):
     assert len(bgs) > 0
     bg_id = bgs[0]["id"]
 
-    token = admin_token
+    issued = client.post(
+        "/backgrounds/preview-tokens",
+        json={"asset_ids": [bg_id]},
+        headers=auth(admin_token),
+    )
+    assert issued.status_code == 200
+    token = issued.json()["tokens"][str(bg_id)]
     res = client.get(f"/backgrounds/{bg_id}/preview?token={token}")
     assert res.status_code == 200
+
+    # A full access credential is never accepted by a URL preview route.
+    rejected = client.get(f"/backgrounds/{bg_id}/preview?token={admin_token}")
+    assert rejected.status_code == 401
 
 
 def test_preview_background_not_found(client, admin_token):
     """Preview returns 404 for non-existent asset."""
-    res = client.get(f"/backgrounds/99999/preview?token={admin_token}")
+    from auth import create_media_token
+    from database import SessionLocal, User
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.username == "admin").first()
+        media_token = create_media_token(user, "background:99999", "preview")
+    finally:
+        db.close()
+    res = client.get(f"/backgrounds/99999/preview?token={media_token}")
     assert res.status_code == 404
+
+
+def test_inactive_background_is_hidden_from_regular_preview(client, admin_token, user_token):
+    from auth import create_media_token
+    from database import BackgroundAsset, SessionLocal, User
+
+    uploaded = client.post(
+        "/admin/backgrounds",
+        headers=auth(admin_token),
+        files={"file": ("inactive.jpg", io.BytesIO(b"\xff\xd8\xff" + b"\x00" * 32), "image/jpeg")},
+        data={"name": "Inactive", "tags": ""},
+    )
+    assert uploaded.status_code == 200
+    asset_id = uploaded.json()["id"]
+    user_id = client.get("/auth/me", headers=auth(user_token)).json()["id"]
+    db = SessionLocal()
+    try:
+        asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == asset_id).first()
+        asset.is_active = False
+        user = db.query(User).filter(User.id == user_id).first()
+        media_token = create_media_token(user, f"background:{asset_id}", "preview")
+        db.commit()
+    finally:
+        db.close()
+
+    issued = client.post(
+        "/backgrounds/preview-tokens",
+        json={"asset_ids": [asset_id]}, headers=auth(user_token),
+    )
+    assert issued.status_code == 200
+    assert str(asset_id) not in issued.json()["tokens"]
+    assert client.get(
+        f"/backgrounds/{asset_id}/preview?token={media_token}",
+    ).status_code == 404
+
+    # Moderation remains explicit: admins may inspect an inactive asset.
+    admin_issued = client.post(
+        "/backgrounds/preview-tokens",
+        json={"asset_ids": [asset_id]}, headers=auth(admin_token),
+    )
+    assert str(asset_id) in admin_issued.json()["tokens"]
 
 
 def test_delete_background(client, admin_token):

@@ -9,14 +9,35 @@ model-load cost, and installs SIGTERM/SIGINT handlers so an in-flight job
 finishes cleanly when the container is recycled.
 """
 
+import json
 import logging
 import os
 import signal
 import socket
 import sys
+import threading
 import time
 
 logger = logging.getLogger("genly.worker")
+
+
+def _start_local_outputs_cleanup() -> None:
+    """Delete stale files from this worker's own isolated filesystem."""
+
+    def _loop():
+        # Let startup/imports settle, then sweep locally once per hour.
+        time.sleep(120)
+        while True:
+            try:
+                from scripts.cleanup_old_outputs import cleanup
+                cleanup()
+            except Exception:
+                logger.exception("[WORKER] local outputs cleanup failed")
+            time.sleep(3600)
+
+    threading.Thread(
+        target=_loop, daemon=True, name="worker-outputs-cleanup",
+    ).start()
 
 
 def _redis_connect_kwargs() -> dict:
@@ -113,13 +134,62 @@ class WarmOnlyWorker(_RQWorker):
         # SystemExit. The warm-shutdown flag set by the first signal still makes
         # the worker exit cleanly once the current job completes.
 
+    def prepare_job_execution(  # type: ignore[override]
+        self, job, remove_from_intermediate_queue=False,
+    ):
+        """Reject incompatible payloads inside RQ's failure boundary."""
+        from queue_jobs import validate_rq_payload_metadata
+
+        validate_rq_payload_metadata(getattr(job, "meta", None))
+        return super().prepare_job_execution(job, remove_from_intermediate_queue)
+
+    def heartbeat(self, *args, **kwargs):  # type: ignore[override]
+        """Extend RQ liveness with release, queue and protocol metadata."""
+        result = super().heartbeat(*args, **kwargs)
+        self._publish_release_heartbeat()
+        return result
+
+    def _publish_release_heartbeat(self) -> None:
+        from queue_jobs import (
+            RQ_PAYLOAD_VERSION,
+            RQ_SUPPORTED_PAYLOAD_VERSIONS,
+        )
+
+        ttl = int(os.environ.get("WORKER_RELEASE_HEARTBEAT_TTL_SECONDS", "120"))
+        queues = [getattr(q, "name", str(q)) for q in getattr(self, "queues", [])]
+        payload = {
+            "worker": getattr(self, "name", "unknown"),
+            "service": os.environ.get("RAILWAY_SERVICE_NAME", "worker"),
+            "release": (
+                os.environ.get("RAILWAY_GIT_COMMIT_SHA")
+                or os.environ.get("SENTRY_RELEASE")
+                or os.environ.get("GIT_SHA")
+                or "unknown"
+            ),
+            "queues": queues,
+            "rq_payload_version": RQ_PAYLOAD_VERSION,
+            "rq_supported_payload_versions": sorted(RQ_SUPPORTED_PAYLOAD_VERSIONS),
+            "environment": (
+                os.environ.get("RAILWAY_ENVIRONMENT_NAME")
+                or os.environ.get("ENVIRONMENT", "production")
+            ),
+        }
+        try:
+            self.connection.setex(
+                f"genly:worker:release:{payload['worker']}",
+                max(ttl, 30),
+                json.dumps(payload, separators=(",", ":"), sort_keys=True),
+            )
+        except Exception as exc:  # native RQ heartbeat remains authoritative
+            logger.debug("[WORKER] release heartbeat publish failed: %s", exc)
+
 
 def _warn_if_shutdown_grace_too_short() -> None:
     """Loud startup warning when Railway's SIGTERM→SIGKILL grace is too
     short to let RQ drain an in-flight render. Without a 20-min grace,
     every redeploy of the Worker service kills any render mid-flight —
     operators see "El servidor se reinició mientras generábamos el
-    video" and have to manually retry. See railway.toml comment for the
+    video" and have to manually retry. See railway/worker.toml for the
     incident chain (2026-05-15 first surface, 2026-05-19 re-surfaced when
     two back-to-back PR merges killed the same UMG render twice).
 
@@ -138,7 +208,7 @@ def _warn_if_shutdown_grace_too_short() -> None:
         grace_s = int(raw) if raw else 0
     except ValueError:
         grace_s = 0
-    # 20 min = the value documented in railway.toml as required for UMG-grade
+    # 20 min = the value documented in railway/worker.toml for UMG-grade
     # renders. Anything shorter and a SIGKILL will land mid-encode.
     REQUIRED_GRACE_S = 1200
     if grace_s < REQUIRED_GRACE_S:
@@ -149,7 +219,7 @@ def _warn_if_shutdown_grace_too_short() -> None:
             "\"servidor se reinició\" to operators. Fix: Railway dashboard "
             "→ Worker service → Variables → set "
             "RAILWAY_SHUTDOWN_TIMEOUT_SECONDS=1200. (Cannot be set via "
-            "railway.toml.) See railway.toml comment for full context.",
+            "Railway Config-as-Code.) See railway/worker.toml for context.",
             raw or "<unset>", REQUIRED_GRACE_S,
         )
 
@@ -269,6 +339,7 @@ def main():
     from observability import init_logging, init_sentry
     init_logging()
     init_sentry()
+    _start_local_outputs_cleanup()
 
     from background_policy import (
         POLICY_ENV as _bg_policy_env,
@@ -279,12 +350,14 @@ def main():
     from observability import _resolve_release as _resolve_runtime_release
     logger.info(
         "[BG_POLICY][STARTUP] process=rq-worker release=%s environment=%s "
-        "policy_version=%s policy_mode=%s cache_namespace=%s queues=%s",
+        "policy_version=%s policy_mode=%s cache_namespace=%s queues=%s "
+        "rq_payload_version=%s",
         _resolve_runtime_release(),
         os.environ.get("ENVIRONMENT", "production").lower().strip(),
         _bg_policy_version, _bg_policy_mode(),
         _bg_policy_version,
         ",".join(_resolve_queue_names()),
+        os.environ.get("RQ_PAYLOAD_VERSION", "2"),
     )
     _raw_bg_policy_mode = os.environ.get(_bg_policy_env, "off").strip().lower()
     if _raw_bg_policy_mode not in _bg_policy_modes:
@@ -391,7 +464,7 @@ def main():
     # (Railway deploy). The original code let main() return in ALL three,
     # ASSUMING — see the max_jobs comment above — that "Railway's restart
     # policy spawns a replacement in ~30s". It does NOT: every worker service
-    # runs restartPolicyType=ON_FAILURE (railway.toml), so a CLEAN exit (code
+    # runs restartPolicyType=ON_FAILURE (railway/worker.toml), so a CLEAN exit (code
     # 0) is treated as success and is never restarted. After one recycle the
     # ShortWorker pool — the sole consumer of the `transcription` queue
     # (QUEUES=transcription,bg_preview) — exited and stayed dead;
