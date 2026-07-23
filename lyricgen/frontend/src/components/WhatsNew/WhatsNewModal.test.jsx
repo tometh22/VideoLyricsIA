@@ -65,6 +65,26 @@ describe("WhatsNewModal", () => {
     expect(screen.getByText("Abc")).toBeInTheDocument();
   });
 
+  it("explica las tres novedades del release cuando visual=control", () => {
+    setup({
+      visual: "control",
+      modalFeatures: [
+        { titleKey: "announce.control_f1_title", bodyKey: "announce.control_f1_body" },
+        { titleKey: "announce.control_f2_title", bodyKey: "announce.control_f2_body" },
+        { titleKey: "announce.control_f3_title", bodyKey: "announce.control_f3_body" },
+      ],
+    });
+    expect(screen.getByText("release.visual.official_lyrics")).toBeInTheDocument();
+    expect(screen.getByText("release.visual.new_editor")).toBeInTheDocument();
+    expect(screen.getByText("release.visual.background_library")).toBeInTheDocument();
+    expect(screen.getByText("announce.control_f1_title")).toBeInTheDocument();
+    expect(screen.getByText("announce.control_f1_body")).toBeInTheDocument();
+    expect(screen.getByText("announce.control_f2_title")).toBeInTheDocument();
+    expect(screen.getByText("announce.control_f2_body")).toBeInTheDocument();
+    expect(screen.getByText("announce.control_f3_title")).toBeInTheDocument();
+    expect(screen.getByText("announce.control_f3_body")).toBeInTheDocument();
+  });
+
   it("renderiza video si visual=media y la entrada trae mp4", () => {
     const { container } = setup({ visual: "media", media: "/escenas_demo.mp4" });
     const video = container.querySelector("video");
