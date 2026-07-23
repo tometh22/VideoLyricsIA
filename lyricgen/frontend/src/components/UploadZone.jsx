@@ -1486,6 +1486,37 @@ export default function UploadZone({
   // Los sub-bloques internos siguen con sus propios checks
   // (`files.length > 1` para acciones de batch) — esos correctamente
   // se ocultan si no hay archivos.
+  // Preset interno SOLO-ADMIN: la "receta UMG Argentina" derivada del análisis
+  // de los videos aprobados de Universal (may–jul 2026). Un click rellena el
+  // wizard con los settings de menor retrabajo (fuente grande, estático,
+  // mayúsculas, sin escenas, ProRes/HD). El operador puede ajustar cualquiera
+  // antes de generar. NO cambia defaults del servidor ni del tenant, y no se
+  // expone en el portal de descargas de UMG — solo rellena el formulario, igual
+  // que si se tipeara a mano. Gateado por role=admin en el JSX.
+  const applyUmgArgentinaRecipe = () => {
+    track("wizard.preset", { preset: "umg_argentina" });
+    // Fondo: Auto (AI) + inspirado en la letra; sin multi-escena.
+    onStyleChange?.("auto");
+    onBgMode?.("auto");
+    selectSceneMode("lyrics");        // match_lyrics=true, sin hint
+    onEnableScenesChange?.(false);
+    // Render (batchDefaults; el fan-out interno los aplica también por canción).
+    updateBatchDefault("movementStyle", "estatico");
+    updateBatchDefault("font", "poppins-bold");
+    updateBatchDefault("fontScale", "1.3");
+    updateBatchDefault("textCase", "upper");
+    updateBatchDefault("lyricsAnimation", "none");
+    updateBatchDefault("lineTransition", "none");
+    updateBatchDefault("effect", "");
+    updateBatchDefault("titleTemplate", "auto");
+    updateBatchDefault("frameFormat", "full");
+    // Entrega: master ProRes + YouTube, HD / 24fps / ProRes 422 HQ.
+    setDeliveryProfile("both");
+    setUmgFrameSize("HD");
+    setUmgFps(24);
+    setUmgProresProfile(3);
+  };
+
   const _batchSettingsBlock = (files.length > 0 || editMode) ? (
     <div className="mt-3 glass rounded-card px-4 py-4">
       <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-3">
@@ -1493,6 +1524,27 @@ export default function UploadZone({
           ? (t("upload.batch_settings_title") || "Configuración del lote")
           : (t("upload.single_settings_title") || "Ajustes del video")}
       </p>
+
+      {user?.role === "admin" && !editMode && (
+        <div className="mb-3 flex items-center justify-between gap-3 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-3 py-2.5">
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5">
+              <span className="rounded-full bg-accent/[0.08] px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent ring-1 ring-accent/20">{t("upload.recipe_umg_badge") || "Admin"}</span>
+              <span className="text-[11px] font-medium text-gray-200">{t("upload.recipe_umg_title") || "Receta UMG Argentina"}</span>
+            </div>
+            <p className="text-[10px] text-gray-600 mt-0.5">
+              {t("upload.recipe_umg_desc") || "Rellena los settings de menor retrabajo. Podés ajustar cualquiera antes de generar."}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={applyUmgArgentinaRecipe}
+            className="shrink-0 rounded-full bg-brand text-white text-[11px] font-medium px-3 py-1.5 hover:opacity-90 transition-opacity"
+          >
+            {t("upload.recipe_umg_apply") || "Aplicar"}
+          </button>
+        </div>
+      )}
 
       {bgMode !== "auto" && (
         <div className="mb-3 rounded-lg bg-surface-1/60 ring-1 ring-white/[0.05] px-3 py-2 text-[11px] text-gray-400">
