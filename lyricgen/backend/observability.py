@@ -367,13 +367,13 @@ def health_snapshot() -> dict:
             snap["status"] = "degraded"
             snap["degraded_reason"] = reason
 
-    def _down(reason: str) -> None:
+    def _down(reason: str, *, allow_starting: bool = True) -> None:
         # Hard failure of a required dependency. Used by /health to
         # return 503 so the load balancer pulls the instance out.
         # During the startup grace window we report "starting" instead
         # so Railway's first probe doesn't roll back the deploy on a
         # cold-cache miss.
-        if starting:
+        if starting and allow_starting:
             snap["status"] = "starting"
             snap["starting_reason"] = reason
             return
@@ -438,6 +438,10 @@ def health_snapshot() -> dict:
                     except Exception:
                         queues[qname] = -1
                 snap["queue_depth"] = queues
+                fleet_strict_default = "1" if is_prod else "0"
+                fleet_strict = os.environ.get(
+                    "FLEET_READINESS_STRICT", fleet_strict_default,
+                ).strip().lower() in {"1", "true", "yes", "on"}
                 try:
                     workers = Worker.all(connection=r)
                     snap["workers_alive"] = len(workers)
@@ -474,16 +478,17 @@ def health_snapshot() -> dict:
                     snap["fleet_release_match"] = fleet["release_match"]
                     snap["fleet_protocol_match"] = fleet["protocol_match"]
                     if not snap["fleet_coherent"]:
-                        strict_default = "1" if is_prod else "0"
-                        strict = os.environ.get(
-                            "FLEET_READINESS_STRICT", strict_default,
-                        ).strip().lower() in {"1", "true", "yes", "on"}
-                        if strict:
-                            _down("worker_fleet_incoherent")
+                        if fleet_strict:
+                            _down("worker_fleet_incoherent", allow_starting=False)
                         else:
                             _degrade("worker_fleet_incoherent")
                 except Exception:
                     snap["worker_releases"] = []
+                    snap["fleet_coherent"] = False
+                    if fleet_strict:
+                        _down("worker_fleet_unverifiable", allow_starting=False)
+                    else:
+                        _degrade("worker_fleet_unverifiable")
                 # Tier 3 segmentation guard: with a segmented fleet (ShortWorker
                 # on transcription/bg_preview + Worker on enterprise/default), a
                 # rollout mistake (e.g. setting Worker QUEUES=enterprise,default

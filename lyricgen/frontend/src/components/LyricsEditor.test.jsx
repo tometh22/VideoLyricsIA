@@ -519,6 +519,29 @@ describe("LyricsEditor — durable save on page unload (refresh/close) (2026-06-
     expect(opts).toMatchObject({ keepalive: true, baseRevision: 0 });
   });
 
+  it("still sends keepalive when localStorage is blocked or full", () => {
+    const onPersistSegments = vi.fn().mockResolvedValue({ ok: true });
+    const storageSpy = vi.spyOn(localStorage, "setItem").mockImplementation(() => {
+      throw new DOMException("quota", "QuotaExceededError");
+    });
+    try {
+      render(<LyricsEditor {...baseProps({
+        segments: [{ start: 1.0, end: 2.0, text: "alpha line" }],
+        transcribeJobId: "job-storage-blocked",
+        onPersistSegments,
+        user: { id: 7 },
+      })} />);
+      fireEvent.change(screen.getByDisplayValue("alpha line"), {
+        target: { value: "latest edit" },
+      });
+      window.dispatchEvent(new Event("pagehide"));
+      expect(onPersistSegments).toHaveBeenCalledTimes(1);
+      expect(onPersistSegments.mock.calls[0][2]).toMatchObject({ keepalive: true });
+    } finally {
+      storageSpy.mockRestore();
+    }
+  });
+
   it("does not fire a save on unload when there is nothing pending", () => {
     const onPersistSegments = vi.fn().mockResolvedValue({ ok: true });
     // disableAutosave → el debounce nunca arma un pendiente, así que pagehide

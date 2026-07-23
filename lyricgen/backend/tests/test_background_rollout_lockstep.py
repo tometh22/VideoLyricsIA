@@ -67,7 +67,9 @@ def test_enqueue_pipeline_attaches_current_internal_policy_token(monkeypatch):
     )
 
     assert result == "queued"
-    assert "background_policy_fingerprint" not in captured["kwargs"]
+    assert captured["kwargs"]["background_policy_fingerprint"] == (
+        runtime_rollout_fingerprint()
+    )
     assert captured["meta"]["background_policy_fingerprint"] == (
         runtime_rollout_fingerprint()
     )
@@ -100,7 +102,7 @@ def test_enqueue_edit_attaches_current_internal_policy_token(monkeypatch):
     )
 
     assert result == "queued-edit"
-    assert captured["kwargs"]["args"] == ("queuededit", "typography", {"font": "Inter"})
+    assert captured["kwargs"]["args"][3] == runtime_rollout_fingerprint()
     assert captured["kwargs"]["meta"]["background_policy_fingerprint"] == runtime_rollout_fingerprint()
 
 

@@ -533,6 +533,10 @@ def enqueue_pipeline(
     from background_policy import runtime_rollout_fingerprint
     kwargs = dict(kwargs)
     policy_fingerprint = runtime_rollout_fingerprint()
+    # Preserve the origin/staging invocation payload so a v1 worker can
+    # execute a v2-produced job during the bounded cutover. Metadata is the
+    # new source for v2 workers; the legacy argument remains for N-1.
+    kwargs["background_policy_fingerprint"] = policy_fingerprint
     q = _pick_queue(plan, tenant_id=tenant_id)
     if q is not None:
         from rq import Retry
@@ -751,7 +755,7 @@ def enqueue_bg_preview(
         _evict_stale_rq_job(_redis, f"bgpreview:{job_id}")
         rq_job = q.enqueue(
             run_bg_preview_job,
-            args=(job_id, bg_cache_key, params),
+            args=(job_id, bg_cache_key, params, _policy_fingerprint),
             job_timeout=timeout,
             result_ttl=RESULT_TTL,
             failure_ttl=FAILURE_TTL,
@@ -934,7 +938,7 @@ def enqueue_edit(
         retry = Retry(max=PIPELINE_RETRY_MAX, interval=PIPELINE_RETRY_INTERVAL_S)
         rq_job = q.enqueue(
             run_edit_pipeline,
-            args=(job_id, edit_type, edit_params),
+            args=(job_id, edit_type, edit_params, _policy_fingerprint),
             # 60 min — covers worst-case long-song edits with motion enabled
             # until we land the ffmpeg-overlay rewrite.
             job_timeout=3600,

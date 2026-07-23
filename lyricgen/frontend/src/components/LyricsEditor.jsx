@@ -706,6 +706,18 @@ export default function LyricsEditor({
     const flushOnUnload = () => {
       try {
         const cleaned = editedRef.current.map(({ _id, review, ...rest }) => rest);
+        // useEffect puede no alcanzar a correr entre el último keystroke y
+        // pagehide. Persistimos sincrónicamente acá antes de cualquier red;
+        // si hay un CAS en vuelo, esta es la recuperación canónica al volver.
+        if (draftKey) {
+          try {
+            localStorage.setItem(draftKey, JSON.stringify({
+              segments: cleaned,
+              base_revision: saveQueueRef.current._peek(transcribeJobId)?.revision || 0,
+              updated_at: new Date().toISOString(),
+            }));
+          } catch { /* storage blocked/quota: keepalive still must run */ }
+        }
         const bytes = new Blob([JSON.stringify({ segments: cleaned })]).size;
         // Chromium/WebKit keepalive budget is about 64 KiB. Leave headroom
         // for the OCC field and headers; large drafts remain in localStorage.

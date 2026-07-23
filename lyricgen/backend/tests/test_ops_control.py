@@ -63,6 +63,20 @@ def test_control_plane_failure_is_fail_closed_in_production(monkeypatch):
     assert state["source"] == "fail_closed"
 
 
+def test_missing_control_key_is_fail_closed_in_fresh_production_process(monkeypatch):
+    class Redis:
+        def get(self, _key):
+            return None
+
+    monkeypatch.setattr(ops_control, "_client", lambda: Redis())
+    monkeypatch.setattr(ops_control, "_LAST_VALID_STATE", None)
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.delenv("SUBMISSIONS_PAUSED", raising=False)
+    state = ops_control.get_submissions_state()
+    assert state["paused"] is True
+    assert state["source"] == "fail_closed"
+
+
 def test_missing_key_cannot_erase_last_known_pause(monkeypatch):
     class Redis:
         def get(self, _key):

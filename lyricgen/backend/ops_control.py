@@ -53,7 +53,7 @@ def get_submissions_state() -> dict:
     if not raw:
         if _LAST_VALID_STATE is not None:
             return {**_LAST_VALID_STATE, "source": "cached_missing_key"}
-        return fallback
+        return _control_failure_state(fallback, "missing_key")
     try:
         state = json.loads(raw)
     except (TypeError, ValueError):
