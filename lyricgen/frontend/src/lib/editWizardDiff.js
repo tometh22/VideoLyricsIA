@@ -149,6 +149,14 @@ export function computeFieldDiff(baseline, current) {
   if (Object.keys(bgDiff).length > 0) {
     out.background = bgDiff;
   }
+  // "Regenerar fondo (nueva versión)": intención explícita del operador de
+  // re-generar el fondo (nueva tirada) aunque no haya cambiado ningún campo.
+  // Se chequea sobre `current` (no vs baseline: es una acción, no un campo).
+  // Fuerza un bucket background vacío → edit_type=background re-renderiza con
+  // el hint actual. No aplica si eligió un asset de biblioteca (eso supersede).
+  if (current.forceBackgroundRegen && !current.editBackgroundId && !out.background) {
+    out.background = {};
+  }
 
   // ── background_library ───────────────────────────────────────────────
   // Swap a un asset curado de biblioteca (backend edit_type=

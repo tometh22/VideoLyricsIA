@@ -432,6 +432,17 @@ export default function UploadZone({
 
   const [hoverCaseBatch, setHoverCaseBatch] = useState(null);
   const [hoverCaseRow, setHoverCaseRow] = useState(null); // { idx, code }
+  // "Regenerar fondo (nueva versión)" en edición: intención explícita de re-tirar
+  // el fondo con el mismo hint. Se propaga a currentReview vía onEditFieldChange
+  // (NO updateBatchDefault: no debe persistir en localStorage — es una acción,
+  // no un sticky default). Fixea el caso "quería otra versión y decía 'No
+  // cambiaste nada'".
+  const [regenRequested, setRegenRequested] = useState(false);
+  const toggleRegenRequested = () => {
+    const next = !regenRequested;
+    setRegenRequested(next);
+    onEditFieldChange?.("forceBackgroundRegen", next);
+  };
 
   // ── Scene MODE (Studio Console redesign) ────────────────────────────────
   // The 3 modes map onto existing state (no new backend contract):
@@ -1701,6 +1712,30 @@ export default function UploadZone({
       {bgMode === "auto" && (
         <div className="mb-4 pt-3 border-t border-white/[0.05]">
           <p className="text-[11px] text-gray-400 font-medium">{t("upload.scene_meta_title") || "Escena"}</p>
+          {editMode && (
+            <div className="mt-2 mb-3 flex items-center justify-between gap-3 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-3 py-2.5">
+              <div className="min-w-0">
+                <p className="text-[11px] font-medium text-gray-200">
+                  {t("upload.regen_bg_title") || "Regenerar fondo (nueva versión)"}
+                </p>
+                <p className="text-[10px] text-gray-600 mt-0.5">
+                  {t("upload.regen_bg_desc") || "Genera otra versión del fondo con IA, aunque no cambies el texto. Mantiene letra y tiempos."}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={toggleRegenRequested}
+                aria-pressed={regenRequested}
+                className={`shrink-0 rounded-full text-[11px] font-medium px-3 py-1.5 transition-colors ${
+                  regenRequested
+                    ? "bg-brand text-white"
+                    : "bg-surface-3/60 text-gray-300 ring-1 ring-white/[0.06] hover:text-white"
+                }`}
+              >
+                {regenRequested ? (t("upload.regen_bg_on") || "Se regenerará ✓") : (t("upload.regen_bg_cta") || "Regenerar")}
+              </button>
+            </div>
+          )}
           <p className="text-[10px] text-gray-600 mt-0.5 mb-2">
             {sceneMode === "prompt"
               ? (t("upload.scene_meta_prompt_note") || "Tu prompt define la escena — género y concepto quedan como ayuda secundaria.")
