@@ -10671,11 +10671,22 @@ async def request_edit(
         # doesn't re-query the DB for segments it already received in
         # the API call.
         edit_params["segments"] = normalized_segments
-    if body.edit_type == "background" and body.background_hint and body.background_hint.strip():
+    if body.edit_type == "background" and body.background_hint is not None:
         # Operator's free-form description of what they want the new
         # background to convey. Forwarded to Gemini's user_content as a
         # high-priority override block so it pisa los defaults that
         # produced the rejected background.
+        #
+        # Contrato None-aware (2026-07-24): None = mantener el hint
+        # persistido; "" = CLEAR explícito (persiste "" en render_params);
+        # valor = set + persist. Antes se salteaba el body vacío, así que
+        # borrar el textarea no borraba el hint persistido y el prompt
+        # viejo "revivía" en el siguiente regen — lo que hacía inútil el
+        # cambio de modo de escena cableado en #979 (resolve_creative_mode
+        # ignora match_lyrics si hay operator_prompt no vacío, y
+        # run_edit_pipeline revive el persistido vía `background_hint or
+        # _persisted_operator_prompt`). El "" persistido no revive: ambos
+        # lados coercen con `or None`.
         _hint = body.background_hint.strip()
         edit_params["background_hint"] = _hint
         # ALSO persist the hint into the DURABLE render_params, not only

@@ -15539,9 +15539,10 @@ def run_edit_pipeline(
     # so background_hint is None and the regen used to re-roll the scene from
     # genre/concept/lyrics — discarding the original creative direction. Fall
     # back to the persisted operator prompt so the SAME prompt is reproduced; a
-    # freshly typed hint still wins via `or`. (Clearing the textarea does NOT
-    # clear the persisted hint — main.py skips empty background_hint — so the
-    # old prompt resurrects; accepted, matches prior reuse behavior.)
+    # freshly typed hint still wins via `or`. (2026-07-24: clearing the
+    # textarea now DOES clear the persisted hint — main.py persists "" as an
+    # explicit clear, and the `or None` coercions above turn that "" into
+    # None on both sides, so a cleared prompt does not resurrect.)
     effective_background_hint = background_hint or _persisted_operator_prompt
     # BUG-4 fix (regen flipped Auto→lyrics): the background branch never read
     # match_lyrics, so _ensure_background fell to its True default and silently
