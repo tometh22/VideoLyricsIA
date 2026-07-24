@@ -37,6 +37,16 @@ R2_SECRET_ACCESS_KEY = _env("R2_SECRET_ACCESS_KEY", "S3_SECRET_KEY", "S3_SECRET_
 R2_ENDPOINT_URL = _env("R2_ENDPOINT_URL", "S3_ENDPOINT_URL")
 R2_BUCKET = _env("R2_BUCKET", "S3_BUCKET")
 
+try:
+    # A normal retention sweep should be visible in logs, not create a
+    # Sentry issue. Alert only when the candidate count looks like an
+    # abnormal cleanup spike; operators can tune this per environment.
+    R2_CLEANUP_SPIKE_THRESHOLD = int(os.environ.get(
+        "R2_CLEANUP_SPIKE_THRESHOLD", "100",
+    ))
+except (TypeError, ValueError):
+    R2_CLEANUP_SPIKE_THRESHOLD = 100
+
 _client = None
 
 
@@ -1010,29 +1020,25 @@ def cleanup_old_inputs(retention_days: int = 365, apply: bool = False, prefix: s
                 "[R2-BULK-DELETE-KEY] key=%r size_mb=%.1f age_days=%d retention_days=%d",
                 k, sz / 1024 / 1024, (now - mod).days, retention_days,
             )
-        # SENTRY ALERT 2026-05-27: bulk delete is the SCARY path that
-        # caused the agus.cafisi incident. Fire a high-visibility Sentry
-        # event with the count + caller so the operator sees it whether
-        # or not they check Railway logs. A delete is rare; multiple in
-        # a day means something is wrong.
-        # FINGERPRINT 2026-06-10: agrupado por caller+prefix — el sweep
-        # diario de retención (bg_preview TTL) acumula eventos en UN
-        # issue en vez de crear uno por corrida. Conteo/retención van en
-        # extra; un spike de eventos sigue disparando las alert rules.
-        try:
-            import sentry_sdk
-            with sentry_sdk.push_scope() as _scope:
-                _scope.fingerprint = ["r2-bulk-delete", caller, prefix or ""]
-                _scope.set_tag("r2.caller", caller)
-                _scope.set_tag("r2.prefix", prefix or "")
-                _scope.set_extra("r2.expired_count", len(expired))
-                _scope.set_extra("r2.retention_days", retention_days)
-                sentry_sdk.capture_message(
-                    f"[R2-BULK-DELETE] cleanup_old_inputs via {caller} (prefix={prefix})",
-                    level="error",  # bulk delete is operationally significant
-                )
-        except Exception:
-            pass
+        if len(expired) >= R2_CLEANUP_SPIKE_THRESHOLD:
+            # An unusually large orphan sweep is actionable, but ordinary
+            # retention work must not create one Sentry issue per run.
+            try:
+                import sentry_sdk
+                with sentry_sdk.push_scope() as _scope:
+                    _scope.fingerprint = ["r2-bulk-delete-spike", caller, prefix or ""]
+                    _scope.set_tag("event", "r2.cleanup_spike")
+                    _scope.set_tag("r2.caller", caller)
+                    _scope.set_tag("r2.prefix", prefix or "")
+                    _scope.set_extra("r2.expired_count", len(expired))
+                    _scope.set_extra("r2.spike_threshold", R2_CLEANUP_SPIKE_THRESHOLD)
+                    _scope.set_extra("r2.retention_days", retention_days)
+                    sentry_sdk.capture_message(
+                        f"[R2-BULK-DELETE] cleanup spike via {caller} (prefix={prefix})",
+                        level="warning",
+                    )
+            except Exception:
+                pass
         for i in range(0, len(expired), 1000):
             batch = expired[i:i + 1000]
             resp = client.delete_objects(

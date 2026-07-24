@@ -5,6 +5,7 @@ crear un issue Sentry por cada input. Los fallos reales de delete_object sí
 deben seguir llegando a Sentry.
 """
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -98,3 +99,53 @@ def test_delete_failure_creates_sentry_exception():
     assert fake.exceptions == [failure]
     assert fake.scope.tags["event"] == "r2.delete_failed"
     assert fake.scope.extras["r2.key"] == "inputs/tenant-x/job123/audio.mp3"
+
+
+def _cleanup_client(count):
+    client = mock.Mock()
+    old = datetime.now(timezone.utc) - timedelta(days=3)
+    keys = [f"inputs/orphan-{i}.mp3" for i in range(count)]
+    client.get_paginator.return_value.paginate.return_value = [{
+        "Contents": [
+            {"Key": key, "Size": 10, "LastModified": old}
+            for key in keys
+        ],
+    }]
+    client.delete_objects.return_value = {
+        "Deleted": [{"Key": key} for key in keys],
+        "Errors": [],
+    }
+    return client
+
+
+def test_cleanup_normal_batch_only_logs_no_sentry_issue():
+    """Routine orphan cleanup remains operationally visible but not noisy."""
+    fake = _FakeSentry()
+    with mock.patch.dict(sys.modules, {"sentry_sdk": fake}):
+        import storage
+
+        client = _cleanup_client(1)
+        with mock.patch.object(storage, "_get_client", return_value=client), \
+             mock.patch.object(storage, "_active_input_keys", return_value=[]):
+            report = storage.cleanup_old_inputs(retention_days=1, apply=True)
+
+    assert report["deleted"] == 1
+    assert fake.messages == []
+    assert fake.exceptions == []
+
+
+def test_cleanup_spike_creates_one_operational_sentry_signal():
+    fake = _FakeSentry()
+    with mock.patch.dict(sys.modules, {"sentry_sdk": fake}):
+        import storage
+
+        count = max(1, storage.R2_CLEANUP_SPIKE_THRESHOLD)
+        client = _cleanup_client(count)
+        with mock.patch.object(storage, "_get_client", return_value=client), \
+             mock.patch.object(storage, "_active_input_keys", return_value=[]):
+            report = storage.cleanup_old_inputs(retention_days=1, apply=True)
+
+    assert report["deleted"] == count
+    assert len(fake.messages) == 1
+    assert fake.messages[0][1] == "warning"
+    assert fake.scope.tags["event"] == "r2.cleanup_spike"
