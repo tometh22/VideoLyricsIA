@@ -203,6 +203,33 @@ describe("computeFieldDiff", () => {
     expect(diff.lyrics).toBeDefined();
   });
 
+  it("E2E handshake: 'cambiar género + Generar otra versión' arma el body exacto que consume el backend", () => {
+    // Lado frontend del E2E (el backend consume este mismo body en
+    // test_edit_background_mode.py::test_e2e_regen_change_genre_keeps_prompt_and_scene).
+    // El operador cambia género → pop y tilda "Generar otra versión"
+    // (forceBackgroundRegen), sin escribir prompt nuevo.
+    const base = baselineFixture(); // genre: rock
+    const current = {
+      ...base,
+      genre: "pop",
+      forceBackgroundRegen: true,
+      bgRegenValidation: true,
+    };
+    const diff = computeFieldDiff(base, current);
+    expect(diff.background).toEqual({ genre: "pop" });
+    // App.jsx submit: { edit_type } + diff.background + backgroundRegenExtras(current).
+    const payload = {
+      edit_type: "background",
+      ...diff.background,
+      ...backgroundRegenExtras(current),
+    };
+    expect(payload).toEqual({
+      edit_type: "background",
+      genre: "pop",
+      force_content_validation: true,
+    });
+  });
+
   it("multiple buckets: metadata + typography + lyrics + background all changed", () => {
     const base = baselineFixture();
     const cur = {

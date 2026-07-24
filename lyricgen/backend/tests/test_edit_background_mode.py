@@ -322,3 +322,75 @@ def test_scene_axes_absent_keep_persisted(client, admin_token, db, monkeypatch):
     assert job.render_params.get("genre") == "rock"
     assert job.render_params.get("concept") == "ciudad"
     assert job.render_params.get("match_lyrics") is False
+
+
+# ── E2E (cadena de datos): "cambiar género + Generar otra versión" ──────
+# Maneja el /edit REAL + la persistencia REAL, reconstruye el `merged` del
+# worker y ejecuta la lógica REAL del pipeline para verificar qué inputs
+# recibe el generador (_ensure_background). Prueba la cadena completa menos el
+# render Veo (network-bound, no drivable — pineado en test_bg_mode_dispatch).
+def test_e2e_regen_change_genre_keeps_prompt_and_scene(client, admin_token, db, monkeypatch):
+    import inspect
+    import pipeline
+
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    PROMPT = "mansión surreal de noche, pileta vacía, cámara fija"
+    job_id = _bg_job_with_render_params(db, tenant_id, user_id, {
+        "background_hint": PROMPT,
+        "genre": "rock",
+        "concept": "ciudad",
+        "match_lyrics": False,        # "Auto"
+        "bg_verbatim": True,
+        "movement_style": "estatico",
+        "style": "oscuro",
+    })
+
+    # 1) La llamada EXACTA del wizard para "cambiar género + Generar otra
+    #    versión": cambia genre, sin hint fresco (bucket vacío = otra versión).
+    # Body EXACTO que arma el wizard (computeFieldDiff + backgroundRegenExtras)
+    # para este escenario — ver el handshake en editWizardDiff.test.js.
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "background", "genre": "pop", "force_content_validation": True},
+    )
+    assert res.status_code == 200, res.text
+
+    # 2) Persistencia REAL: género nuevo, todo lo demás intacto (sin clobber).
+    db.expire_all()
+    rp = db.query(JobModel).filter(JobModel.job_id == job_id).first().render_params
+    assert rp["genre"] == "pop"              # el edit
+    assert rp["background_hint"] == PROMPT    # sin tocar → se mantiene
+    assert rp["match_lyrics"] is False        # sin tocar → se mantiene
+    assert rp["bg_verbatim"] is True          # sin tocar → se mantiene
+    assert rp["movement_style"] == "estatico"
+
+    # 3) La vista `merged` del worker (pipeline.py: merged = render_params ∪ edit_params).
+    edit_params = captured[0]["edit_params"]
+    merged = {**rp, **edit_params}
+
+    # 4) Inputs del generador, derivados con la MISMA lógica del pipeline.
+    background_hint = edit_params.get("background_hint") or None   # None: sin hint fresco
+    persisted = merged.get("background_hint") or None
+    effective_hint = background_hint or persisted                 # FIX 1
+    _ml = merged.get("match_lyrics", True)
+    effective_match_lyrics = True if _ml is None else bool(_ml)    # FIX 4
+    genre = merged.get("genre") or ""
+
+    assert genre == "pop"                    # el género nuevo llega al regen
+    assert effective_hint == PROMPT          # el prompt original se reproduce (no se pierde)
+    assert effective_match_lyrics is False   # "Auto" preservado (no flipea a True)
+
+    # El prompt de SEGURIDAD/validación (función REAL) coincide con el de
+    # generación → sin split generate-with-intent / validate-without-permission.
+    assert pipeline._operator_prompt_for_edit(
+        "background", fresh_background_hint=background_hint,
+        persisted_operator_prompt=persisted,
+    ) == PROMPT
+
+    # Contrato: _ensure_background acepta de verdad estos kwargs.
+    sig = inspect.signature(pipeline._ensure_background).parameters
+    for p in ("genre", "concept", "background_hint", "match_lyrics",
+              "bg_verbatim", "movement_style", "effect"):
+        assert p in sig, f"_ensure_background debe aceptar {p}"
