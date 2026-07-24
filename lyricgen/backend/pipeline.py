@@ -375,6 +375,41 @@ def _call_with_timeout(fn, timeout_s: float, label: str = ""):
         raise
 
 
+# Backoff schedule for Gemini quota errors (429/RESOURCE_EXHAUSTED) on the
+# background-analysis call. Two retries max: quota windows are per-minute, so
+# 20s + 40s usually clears them without holding a worker slot for too long.
+_BG_429_BACKOFF_S = (20.0, 40.0)
+
+
+def _is_gemini_quota_error(e: Exception) -> bool:
+    """True for Gemini 429/RESOURCE_EXHAUSTED errors — the only failures worth
+    a blind retry. TimeoutError is explicitly excluded: it's raised by our own
+    _call_with_timeout watchdog (anti-deadlock), so retrying it would re-block
+    the worker on the exact hang the watchdog exists to escape."""
+    if isinstance(e, TimeoutError):
+        return False
+    s = str(e)
+    return "429" in s or "RESOURCE_EXHAUSTED" in s
+
+
+def _generate_content_with_quota_retry(fn, *, timeout_s, label):
+    """_call_with_timeout wrapper that retries ONLY quota errors (429 /
+    RESOURCE_EXHAUSTED) with a short backoff. Any other exception — including
+    the watchdog TimeoutError — propagates immediately so the caller's
+    fallback path runs. Exhausted retries re-raise the last quota error
+    (job 3b28837a1784: a single unretried 429 dropped the operator's custom
+    prompt into the random-scene fallback)."""
+    for i, delay in enumerate((*_BG_429_BACKOFF_S, None)):
+        try:
+            return _call_with_timeout(fn, timeout_s=timeout_s, label=label)
+        except Exception as e:
+            if delay is None or not _is_gemini_quota_error(e):
+                raise
+            logger.warning("[BG] Gemini 429/RESOURCE_EXHAUSTED — retry %s/%s in %.0fs: %s",
+                           i + 1, len(_BG_429_BACKOFF_S), delay, e)
+            time.sleep(delay)
+
+
 def _ffprobe_duration(path: str) -> float | None:
     """Return media duration in seconds, or None if ffprobe fails."""
     import subprocess
@@ -8674,7 +8709,10 @@ Hard rules:
                     if policy_enforces(atmospherics_policy) else {}
                 ),
             )
-            response = _call_with_timeout(
+            # Quota-aware wrapper (2026-07-24): a single 429/RESOURCE_EXHAUSTED
+            # used to abort the whole analysis and drop to the fallback prompt.
+            # Retries 429s with backoff; TimeoutError still propagates raw.
+            response = _generate_content_with_quota_retry(
                 lambda: client.models.generate_content(
                     model="gemini-2.5-flash",
                     contents=user_content,
@@ -8843,20 +8881,31 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
                 pass
             return result
 
+    # Operator-prompt fallback — runs in EVERY policy mode, not just enforce.
+    # A provider failure (Gemini 429/timeout/parse) must NOT replace the
+    # operator's explicit direction with a random stock scene: job 3b28837a1784
+    # (staging, 2026-07) asked for a custom prompt, Gemini hit RESOURCE_EXHAUSTED
+    # and the shadow-mode fallback shipped "northern lights aurora" from
+    # _BG_SCENES instead. sanitize_generated_text is a no-op unless the policy
+    # enforces, so enforce semantics stay bit-identical to the previous
+    # in-branch check; shadow/off now honor the hint too.
+    if creative_mode == "prompt_improved" and (background_hint or "").strip():
+        return {
+            "style": "image" if for_provider == "imagen" else "video",
+            "prompt": sanitize_generated_text(background_hint.strip(), atmospherics_policy),
+        }
+
     # V4 fallback is deliberately content-neutral.  Provider/parse failure
     # must not silently replace the selected mode with a stock scene pool.
     if policy_enforces(atmospherics_policy):
-        if creative_mode == "prompt_improved" and (background_hint or "").strip():
-            fallback_prompt = background_hint.strip()
-        else:
-            identity = ", ".join(
-                item for item in (song_title, genre, concept) if (item or "").strip()
-            ) or "the song's emotional rhythm"
-            fallback_prompt = (
-                f"Original non-figurative visual composition derived from {identity}; "
-                "use distinctive color relationships, light, texture, negative space "
-                "and rhythmic motion without stock locations, readable text or people"
-            )
+        identity = ", ".join(
+            item for item in (song_title, genre, concept) if (item or "").strip()
+        ) or "the song's emotional rhythm"
+        fallback_prompt = (
+            f"Original non-figurative visual composition derived from {identity}; "
+            "use distinctive color relationships, light, texture, negative space "
+            "and rhythmic motion without stock locations, readable text or people"
+        )
         return {
             "style": "image" if for_provider == "imagen" else "video",
             "prompt": sanitize_generated_text(fallback_prompt, atmospherics_policy),
@@ -15490,9 +15539,10 @@ def run_edit_pipeline(
     # so background_hint is None and the regen used to re-roll the scene from
     # genre/concept/lyrics — discarding the original creative direction. Fall
     # back to the persisted operator prompt so the SAME prompt is reproduced; a
-    # freshly typed hint still wins via `or`. (Clearing the textarea does NOT
-    # clear the persisted hint — main.py skips empty background_hint — so the
-    # old prompt resurrects; accepted, matches prior reuse behavior.)
+    # freshly typed hint still wins via `or`. (2026-07-24: clearing the
+    # textarea now DOES clear the persisted hint — main.py persists "" as an
+    # explicit clear, and the `or None` coercions above turn that "" into
+    # None on both sides, so a cleared prompt does not resurrect.)
     effective_background_hint = background_hint or _persisted_operator_prompt
     # BUG-4 fix (regen flipped Auto→lyrics): the background branch never read
     # match_lyrics, so _ensure_background fell to its True default and silently

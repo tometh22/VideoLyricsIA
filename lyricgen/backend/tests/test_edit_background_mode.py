@@ -324,6 +324,97 @@ def test_scene_axes_absent_keep_persisted(client, admin_token, db, monkeypatch):
     assert job.render_params.get("match_lyrics") is False
 
 
+# ── Clear explícito del hint: None = keep, "" = clear, valor = set ──────
+# 2026-07-24 (complemento del #979): sin el clear, cambiar el modo de
+# escena con un hint persistido era un no-op — resolve_creative_mode
+# prioriza operator_prompt y run_edit_pipeline revive el persistido vía
+# `background_hint or _persisted_operator_prompt`.
+
+def test_background_hint_empty_string_is_explicit_clear(client, admin_token, db, monkeypatch):
+    """background_hint:"" borra el hint persistido (render_params queda "")
+    y viaja en edit_params — el caso clave "borro el prompt y elijo
+    Inspirado" ({background_hint:"", match_lyrics:true})."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _bg_job_with_render_params(
+        db, tenant_id, user_id, {"background_hint": "castillo medieval"})
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "background", "background_hint": "", "match_lyrics": True},
+    )
+    assert res.status_code == 200, res.text
+    edit_params = captured[0]["edit_params"]
+    assert edit_params.get("background_hint") == ""
+    assert edit_params.get("match_lyrics") is True
+    db.expire_all()
+    job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+    assert job.render_params.get("background_hint") == "", (
+        "clearing the textarea must persist '' — else the old prompt "
+        "resurrects on the next regen and the mode change is a no-op"
+    )
+    assert job.render_params.get("match_lyrics") is True
+
+
+def test_background_hint_whitespace_only_is_clear_too(client, admin_token, db, monkeypatch):
+    """'   ' se normaliza a "" (strip) → mismo clear explícito."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _bg_job_with_render_params(
+        db, tenant_id, user_id, {"background_hint": "castillo medieval"})
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "background", "background_hint": "   "},
+    )
+    assert res.status_code == 200, res.text
+    assert captured[0]["edit_params"].get("background_hint") == ""
+    db.expire_all()
+    job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+    assert job.render_params.get("background_hint") == ""
+
+
+def test_background_hint_absent_keeps_persisted(client, admin_token, db, monkeypatch):
+    """Omitir background_hint NO toca el persistido (None = keep)."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _bg_job_with_render_params(
+        db, tenant_id, user_id, {"background_hint": "castillo medieval"})
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "background", "movement_style": "animado"},
+    )
+    assert res.status_code == 200, res.text
+    assert "background_hint" not in captured[0]["edit_params"]
+    db.expire_all()
+    job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+    assert job.render_params.get("background_hint") == "castillo medieval"
+
+
+def test_background_hint_ignored_for_non_background(client, admin_token, db, monkeypatch):
+    """El clear solo aplica con edit_type=background (mismo gating que
+    siempre): un edit de tipografía con background_hint:"" no borra nada."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _bg_job_with_render_params(
+        db, tenant_id, user_id, {"background_hint": "castillo medieval"})
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "typography", "font": "bebas-neue", "background_hint": ""},
+    )
+    assert res.status_code == 200, res.text
+    assert "background_hint" not in captured[0]["edit_params"]
+    db.expire_all()
+    job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+    assert job.render_params.get("background_hint") == "castillo medieval"
+
+
 # ── E2E (cadena de datos): "cambiar género + Generar otra versión" ──────
 # Maneja el /edit REAL + la persistencia REAL, reconstruye el `merged` del
 # worker y ejecuta la lógica REAL del pipeline para verificar qué inputs
