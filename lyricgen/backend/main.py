@@ -90,6 +90,7 @@ from database import (
     BackgroundAsset, AssetUsage, Delivery, DeliveryChangeRequest,
     SalesLead, UserSession, LoginSession, UiEvent, CreditGrant,
     scoped_db, pool_stats,
+    get_deliveries_db, deliveries_added_by, DELIVERIES_DATABASE_URL,
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
@@ -8157,6 +8158,7 @@ def status(
     job_id: str,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     from pipeline import _MAX_EDITS
     job = get_job(db, job_id, **_job_scope(current_user))
@@ -8231,8 +8233,14 @@ def status(
         # portal. Drives the "Enviar a UMG" button state in JobDetail.jsx
         # (hidden / available / "✓ Ya en UMG"). Single boolean is enough —
         # JobDetail doesn't need the delivery id, just the on/off state.
-        "is_in_umg_portal": (
-            db.query(Delivery.id)
+        # El flag vive en la DB de deliveries (`ddb`, posible externa de prod).
+        # Gateado por approved_at: el botón "Enviar a UMG" solo aparece en jobs
+        # aprobados, así que para el caso común (job no aprobado, polleado sin
+        # parar por JobDetail) devolvemos False sin pegarle a la DB externa —
+        # evita latencia/egress/checkout de conexión de prod en cada poll.
+        "is_in_umg_portal": bool(
+            job.get("approved_at")
+            and ddb.query(Delivery.id)
             .filter(Delivery.job_id == job_id)
             .filter(Delivery.removed_at.is_(None))
             .first()
@@ -12518,6 +12526,7 @@ async def admin_create_delivery_from_job(
     body: SendToUMGRequest | None = None,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """Publish an approved job to the UMG portal. Admin only.
 
@@ -12525,6 +12534,11 @@ async def admin_create_delivery_from_job(
     UPDATED (label refreshed, added_at bumped) instead of duplicated.
     Matches the manual workflow today — corrected re-renders replace
     the previous version rather than stack up as "Opción N".
+
+    El Job se lee de la DB local (`db`); la fila Delivery se escribe en la
+    DB de deliveries (`ddb`), que puede ser externa (portal de prod) cuando
+    DELIVERIES_DATABASE_URL está seteada — así staging publica en el mismo
+    portal que prod. Sin esa env, ddb == db y el comportamiento es idéntico.
     """
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
@@ -12556,15 +12570,20 @@ async def admin_create_delivery_from_job(
     # delivery for this song gets "Renderizado"; subsequent ones get
     # "Opción N". Matches the manual items.json conventions.
     label = (body.label if body else None) or _compute_default_delivery_label(
-        db, job.artist, job.song_title
+        ddb, job.artist, job.song_title
     )
+
+    # added_by_user_id es FK NOT NULL a users.id de la DB de deliveries. Con
+    # DB externa (prod) el id de staging no existe allí → mapear a un admin
+    # de prod vía deliveries_added_by(). Sin DB externa, es el current_user.
+    added_by = deliveries_added_by(current_user["id"])
 
     # Replace-not-duplicate: if there's already an active Delivery for
     # this job_id, update it in place. Operator clicks "Enviar a UMG"
     # again after a re-render → we refresh the label + timestamp, the
     # R2 files stay the same (worker overwrites on edit).
     existing = (
-        db.query(Delivery)
+        ddb.query(Delivery)
         .filter(Delivery.job_id == job_id)
         .filter(Delivery.removed_at.is_(None))
         .first()
@@ -12572,7 +12591,7 @@ async def admin_create_delivery_from_job(
     if existing:
         existing.label = label
         existing.file_types = _DEFAULT_DELIVERY_FILE_TYPES
-        existing.added_by_user_id = current_user["id"]
+        existing.added_by_user_id = added_by
         existing.added_at = datetime.now(timezone.utc)
         # Refresh snapshot in case the artist/title was corrected on the
         # job row between the original publish and now.
@@ -12591,11 +12610,17 @@ async def admin_create_delivery_from_job(
             song_title_snapshot=job.song_title or "",
             tenant_snapshot=job.tenant_id,
             frame_size_snapshot=(job.umg_spec or {}).get("frame_size"),
-            added_by_user_id=current_user["id"],
+            added_by_user_id=added_by,
             added_at=datetime.now(timezone.utc),
         )
-        db.add(delivery)
+        ddb.add(delivery)
         action = "delivery.create"
+
+    # Commit del delivery (DB externa) PRIMERO: si falla, el AuditLog local no
+    # se escribe y no queda fila de auditoría huérfana. El Job local solo se
+    # leyó, nunca se muta, así que un fallo acá no corrompe estado local.
+    ddb.commit()
+    ddb.refresh(delivery)
 
     db.add(AuditLog(
         user_id=current_user["id"],
@@ -12603,7 +12628,6 @@ async def admin_create_delivery_from_job(
         detail={"job_id": job_id, "label": label, "artist": job.artist, "song": job.song_title},
     ))
     db.commit()
-    db.refresh(delivery)
 
     return {
         "ok": True,
@@ -12641,19 +12665,26 @@ async def admin_delete_delivery(
     delivery_id: int,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """Soft-delete a portal entry. Admin only (JWT)."""
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
-    return _soft_delete_delivery(db, delivery_id, current_user["id"])
+    return _soft_delete_delivery(ddb, db, delivery_id, current_user["id"])
 
 
-def _soft_delete_delivery(db: Session, delivery_id: int, actor_user_id: int | None):
-    delivery = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+def _soft_delete_delivery(ddb: Session, db: Session, delivery_id: int, actor_user_id: int | None):
+    """Soft-delete: la fila Delivery vive en `ddb` (posible DB externa del
+    portal); el AuditLog en la `db` local. removed_by_user_id es FK a los
+    users de la DB de deliveries → mapear el id local a uno válido de esa DB."""
+    delivery = ddb.query(Delivery).filter(Delivery.id == delivery_id).first()
     if delivery is None or delivery.removed_at is not None:
         raise HTTPException(status_code=404, detail="Delivery not found")
     delivery.removed_at = datetime.now(timezone.utc)
-    delivery.removed_by_user_id = actor_user_id
+    delivery.removed_by_user_id = (
+        deliveries_added_by(actor_user_id) if actor_user_id is not None else None
+    )
+    ddb.commit()
     db.add(AuditLog(
         user_id=actor_user_id,
         action="delivery.delete",
@@ -12673,6 +12704,7 @@ async def portal_delete_delivery(
     delivery_id: int,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """Soft-delete from the portal itself. Auth: shared portal token."""
     _verify_portal_token(x_portal_token)
@@ -12680,7 +12712,7 @@ async def portal_delete_delivery(
     # The audit log entry records the action and which delivery; if we
     # later add per-recipient logins to the portal this will carry their
     # user id instead.
-    return _soft_delete_delivery(db, delivery_id, actor_user_id=None)
+    return _soft_delete_delivery(ddb, db, delivery_id, actor_user_id=None)
 
 
 @app.post("/api/deliveries/{delivery_id}/change-request")
@@ -12689,6 +12721,7 @@ async def portal_submit_change_request(
     body: dict,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """Portal user (UMG) submits a free-form comment asking for changes
     on a specific delivery. Operator picks it up in the GenLy admin.
@@ -12709,7 +12742,7 @@ async def portal_submit_change_request(
             detail="El comentario es demasiado largo (máximo 5000 caracteres).",
         )
     delivery = (
-        db.query(Delivery)
+        ddb.query(Delivery)
         .filter(Delivery.id == delivery_id)
         .filter(Delivery.removed_at.is_(None))
         .first()
@@ -12720,7 +12753,9 @@ async def portal_submit_change_request(
         delivery_id=delivery_id,
         comment=comment,
     )
-    db.add(cr)
+    ddb.add(cr)
+    ddb.commit()
+    ddb.refresh(cr)
     db.add(AuditLog(
         user_id=None,
         action="delivery.change_request.create",
@@ -12733,7 +12768,6 @@ async def portal_submit_change_request(
         },
     ))
     db.commit()
-    db.refresh(cr)
     return {"ok": True, "id": cr.id, "submitted_at": cr.submitted_at.isoformat()}
 
 
@@ -12742,6 +12776,7 @@ async def portal_approve_delivery(
     delivery_id: int,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """Portal user (UMG) approves a delivery via the "Aprobar" button.
 
@@ -12755,7 +12790,7 @@ async def portal_approve_delivery(
     """
     _verify_portal_token(x_portal_token)
     delivery = (
-        db.query(Delivery)
+        ddb.query(Delivery)
         .filter(Delivery.id == delivery_id)
         .filter(Delivery.removed_at.is_(None))
         .first()
@@ -12771,6 +12806,7 @@ async def portal_approve_delivery(
         }
     delivery.approved_at = datetime.now(timezone.utc)
     delivery.approved_by_label = "UMG"
+    ddb.commit()
     db.add(AuditLog(
         user_id=None,
         action="delivery.approve",
@@ -12795,6 +12831,7 @@ async def portal_unapprove_delivery(
     delivery_id: int,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """Portal user undoes a previous approval. Clears approved_at and
     approved_by_label so the row goes back to pending state on the
@@ -12802,7 +12839,7 @@ async def portal_unapprove_delivery(
     """
     _verify_portal_token(x_portal_token)
     delivery = (
-        db.query(Delivery)
+        ddb.query(Delivery)
         .filter(Delivery.id == delivery_id)
         .filter(Delivery.removed_at.is_(None))
         .first()
@@ -12813,6 +12850,7 @@ async def portal_unapprove_delivery(
         return {"ok": True, "already_pending": True}
     delivery.approved_at = None
     delivery.approved_by_label = None
+    ddb.commit()
     db.add(AuditLog(
         user_id=None,
         action="delivery.un_approve",
@@ -12851,7 +12889,7 @@ async def portal_get_meta(
 @app.get("/api/deliveries/items")
 async def portal_get_items(
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_deliveries_db),
 ):
     """Return the portal listing in the shape the frontend expects.
 
@@ -13052,12 +13090,17 @@ async def admin_list_change_requests(
     limit: int = 200,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """List change requests for the operator UI. Admin only.
 
     status: "pending" (default), "resolved", or "all".
     Returns request + delivery context (artist/song/label/frame/job_id)
     plus resolved_by username so the admin sees who acted on each one.
+
+    Las tablas del portal (DeliveryChangeRequest, Delivery, y el resolver
+    User que las resolvió) se leen de `ddb` (posible DB externa de prod). El
+    Job subyacente y su owner viven en la DB local (`db`).
     """
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
@@ -13066,7 +13109,7 @@ async def admin_list_change_requests(
     if limit < 1 or limit > 1000:
         limit = 200
 
-    q = db.query(DeliveryChangeRequest)
+    q = ddb.query(DeliveryChangeRequest)
     if status == "pending":
         q = q.filter(DeliveryChangeRequest.resolved_at.is_(None))
     elif status == "resolved":
@@ -13082,11 +13125,13 @@ async def admin_list_change_requests(
     user_ids = list({cr.resolved_by_user_id for cr in crs if cr.resolved_by_user_id})
     deliveries_by_id = {
         d.id: d
-        for d in (db.query(Delivery).filter(Delivery.id.in_(delivery_ids)).all() if delivery_ids else [])
+        for d in (ddb.query(Delivery).filter(Delivery.id.in_(delivery_ids)).all() if delivery_ids else [])
     }
+    # Resolver: resolved_by_user_id referencia los users de la DB de deliveries
+    # (prod cuando es externa) → resolver sobre ddb.
     users_by_id = {
         u.id: u
-        for u in (db.query(User).filter(User.id.in_(user_ids)).all() if user_ids else [])
+        for u in (ddb.query(User).filter(User.id.in_(user_ids)).all() if user_ids else [])
     }
 
     # Bulk-fetch the underlying jobs (NO tenant scope — this is an admin-only
@@ -13165,12 +13210,12 @@ async def admin_list_change_requests(
 
     # Totals are cheap and the admin UI shows them as headline counters.
     pending_count = (
-        db.query(DeliveryChangeRequest)
+        ddb.query(DeliveryChangeRequest)
         .filter(DeliveryChangeRequest.resolved_at.is_(None))
         .count()
     )
     resolved_count = (
-        db.query(DeliveryChangeRequest)
+        ddb.query(DeliveryChangeRequest)
         .filter(DeliveryChangeRequest.resolved_at.isnot(None))
         .count()
     )
@@ -13393,12 +13438,13 @@ async def admin_resolve_change_request(
     body: dict | None = None,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """Mark a change request resolved. Optional resolution_note (<=2000 chars)
     so the operator can leave a one-liner explaining what was done."""
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
-    cr = db.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).first()
+    cr = ddb.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).first()
     if not cr:
         raise HTTPException(status_code=404, detail="Change request not found")
     if cr.resolved_at is not None:
@@ -13409,8 +13455,10 @@ async def admin_resolve_change_request(
     if len(note) > 2000:
         raise HTTPException(status_code=400, detail="resolution_note too long (max 2000)")
     cr.resolved_at = datetime.now(timezone.utc)
-    cr.resolved_by_user_id = current_user["id"]
+    # resolved_by_user_id es FK a users de la DB de deliveries → mapear.
+    cr.resolved_by_user_id = deliveries_added_by(current_user["id"])
     cr.resolution_note = note or None
+    ddb.commit()
     db.add(AuditLog(
         user_id=current_user["id"],
         action="delivery.change_request.resolve",
@@ -13429,13 +13477,14 @@ async def admin_reopen_change_request(
     cr_id: int,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """Undo a resolution. The original submission stays — only the
     resolved_at/resolved_by/resolution_note get cleared. Audit log
     records who reopened it."""
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
-    cr = db.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).first()
+    cr = ddb.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).first()
     if not cr:
         raise HTTPException(status_code=404, detail="Change request not found")
     if cr.resolved_at is None:
@@ -13443,6 +13492,7 @@ async def admin_reopen_change_request(
     cr.resolved_at = None
     cr.resolved_by_user_id = None
     cr.resolution_note = None
+    ddb.commit()
     db.add(AuditLog(
         user_id=current_user["id"],
         action="delivery.change_request.reopen",
