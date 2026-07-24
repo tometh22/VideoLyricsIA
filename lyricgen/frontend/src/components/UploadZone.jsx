@@ -255,6 +255,13 @@ export default function UploadZone({
   // submitEdit porque batchDefaults sólo fan-out a files[] y en edit
   // mode files=[].
   onEditFieldChange = null,
+  // En edición, valores persistidos del job (de currentReview) para sembrar los
+  // controles de escena que leen batchDefaults (género/concepto/prompt) + el
+  // modo de escena. Sin esto mostraban el sticky de localStorage o el prompt
+  // vacío, no lo que el video realmente tiene. { jobId, genre, concept,
+  // backgroundHint, bgVerbatim, matchLyrics }. No toca r.* (el diff usa
+  // initialFields), sólo el display.
+  editSeed = null,
   // UI v1.1 (2026-05-30): artist/song to render inside the central
   // title-card preview. Caller (App.jsx) passes these from the
   // currentReview when in edit mode, or from the first file when in
@@ -466,6 +473,27 @@ export default function UploadZone({
   // operator can open "Mi prompt" before typing anything.
   const _hint = (batchDefaults.backgroundHint || "").trim();
   const [sceneMode, setSceneMode] = useState(_hint ? "prompt" : (inspiredByLyrics ? "lyrics" : "auto"));
+  // En edición, sembrar los controles de escena (leen batchDefaults) con los
+  // valores REALES del job — género/concepto/prompt mostraban el sticky de
+  // localStorage (o prompt vacío por el force-clear), no lo del video. Keyed en
+  // el job id: corre UNA vez por job, no pisa ediciones en curso. NO llama
+  // onEditFieldChange (r.* ya viene correcto de initialFields) → solo display.
+  useEffect(() => {
+    if (!editMode || !editSeed) return;
+    setBatchDefaults((prev) => ({
+      ...prev,
+      genre: editSeed.genre || "",
+      concept: editSeed.concept || "",
+      backgroundHint: editSeed.backgroundHint || "",
+      bgVerbatim: editSeed.bgVerbatim != null ? !!editSeed.bgVerbatim : prev.bgVerbatim,
+    }));
+    setSceneMode(
+      (editSeed.backgroundHint || "").trim()
+        ? "prompt"
+        : (editSeed.matchLyrics ? "lyrics" : "auto"),
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editMode, editSeed?.jobId]);
   // Elegibilidad del add-on premium "Escenas" (multi-escena). Robusto: el
   // backend manda vía features.scenes (admin OR SCENES_ENABLED_TENANTS), pero
   // los admin siempre califican aunque la sesión cacheada no traiga el flag.
@@ -520,20 +548,18 @@ export default function UploadZone({
     return () => URL.revokeObjectURL(url);
   }, [backgroundFile]);
   const selectSceneMode = (m) => {
-    // En edición, el modo estructural de escena (Auto / Inspirado en la letra)
-    // se fija al crear el video: no está cableado al /edit y el backend ya
-    // preserva el match_lyrics persistido en la regeneración (fix 2026-07-24),
-    // así que dejar cambiarlo sería un no-op engañoso. "Mi prompt" SÍ es
-    // editable (viaja por background_hint) → sigue habilitado.
-    if (editMode && (m === "auto" || m === "lyrics")) return;
     track("wizard.scene_mode", { mode: m });
     setSceneMode(m);
     // Keep the legacy `match_lyrics` payload deterministic. "Mi prompt"
     // must not inherit whichever card happened to be selected before it.
     // Public payload fields remain unchanged: Auto/Prompt=false, Lyrics=true.
-    onInspiredByLyricsChange && onInspiredByLyricsChange(
-      inspiredByLyricsForSceneMode(m),
-    );
+    const _ml = inspiredByLyricsForSceneMode(m);
+    onInspiredByLyricsChange && onInspiredByLyricsChange(_ml);
+    // En edición, el modo de escena (Auto/Inspirado/Mi prompt) SÍ es editable:
+    // propagamos match_lyrics a currentReview para que el diff lo mande al
+    // /edit (computeFieldDiff → bucket background). onInspiredByLyricsChange
+    // solo toca el estado top-level del flujo de creación, no currentReview.
+    if (editMode) onEditFieldChange?.("matchLyrics", _ml);
     if (m === "auto") {
       if (_hint) updateBatchDefault("backgroundHint", "");   // stale prompt must not override
     } else if (m === "lyrics") {
@@ -1787,21 +1813,11 @@ export default function UploadZone({
               ? (t("upload.scene_meta_prompt_note") || "Tu prompt define la escena — género y concepto quedan como ayuda secundaria.")
               : (t("upload.scene_meta_desc") || "Género ajusta la paleta y la atmósfera · Concepto define el tipo de escena (ciudad, naturaleza, abstracto…).")}
           </p>
-          {/* Género/Concepto son ESTRUCTURALES: se fijan al crear el video.
-              No están cableados al /edit y el pipeline ya usa los persistidos
-              en la regeneración, así que cambiarlos acá sería un no-op
-              engañoso. En edición los bloqueamos (precedente: paleta). */}
-          <div className={`relative flex flex-wrap gap-3 ${sceneMode === "prompt" ? "opacity-50" : ""} ${editMode ? "opacity-60 pointer-events-none select-none" : ""}`}>
-            {editMode && (
-              <div className="absolute -top-1 right-0 flex items-center gap-1 px-2 py-0.5 rounded-md bg-surface-1 ring-1 ring-white/[0.08] text-[10px] text-gray-500 pointer-events-auto select-text z-10">
-                <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                  <path d="M12 11v4M8 11V7a4 4 0 118 0v4M5 11h14v9a1 1 0 01-1 1H6a1 1 0 01-1-1v-9z" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-                <span title={t("upload.genre_concept_locked") || "El género y el concepto se fijan al crear el video."}>
-                  {t("editor.locked_short") || "No editable"}
-                </span>
-              </div>
-            )}
+          {/* Género/Concepto: editables también en edición (cableados al /edit
+              vía computeFieldDiff → bucket background). Cambiarlos regenera el
+              fondo con la nueva vocabulario de escena; el pipeline los lee de
+              render_params (persistidos por request_edit). */}
+          <div className={`flex flex-wrap gap-3 ${sceneMode === "prompt" ? "opacity-50" : ""}`}>
             <div className="flex items-center gap-2">
               <span className="text-[11px] text-gray-600 shrink-0" title={t("upload.genre_help") || "El estilo musical. Ajusta paleta, iluminación y atmósfera del fondo."}>{t("upload.genre_label") || "Género:"}</span>
               <Listbox
@@ -3290,21 +3306,12 @@ export default function UploadZone({
                       { code: "prompt", icon: "✍️", label: t("upload.bg_prompt_label_short") || "Mi prompt",                desc: t("upload.mode_prompt_desc") || "Vos describís el fondo, con opción usar tal cual." },
                     ].map((m) => {
                       const sel = sceneMode === m.code;
-                      // En edición, Auto / Inspirado en la letra (estructura de
-                      // escena) quedan fijos — no están cableados al /edit y el
-                      // backend preserva el match_lyrics persistido. "Mi prompt"
-                      // sigue editable (viaja por background_hint).
-                      const cardLocked = editMode && (m.code === "auto" || m.code === "lyrics");
                       return (
                         <button
                           key={m.code}
                           type="button"
                           onClick={() => selectSceneMode(m.code)}
-                          aria-disabled={cardLocked}
-                          title={cardLocked ? (t("upload.scene_mode_locked") || "El modo de escena se fija al crear el video.") : undefined}
                           className={`text-left rounded-card px-4 py-3 flex items-start gap-3 border transition-all duration-200 ${
-                            cardLocked ? "opacity-50 cursor-not-allowed " : ""
-                          }${
                             sel ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08] shadow-glow"
                                 : "border-white/[0.06] bg-surface-2/40 hover:border-white/[0.18]"
                           }`}
