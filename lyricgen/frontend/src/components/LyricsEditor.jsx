@@ -789,16 +789,11 @@ export default function LyricsEditor({
   // causes StrictMode's simulated unmount to revoke the URL while the
   // <audio> element in the DOM still references it — playback dies a few
   // seconds in once the initial buffered range is consumed.
-  const [audioUrl, setAudioUrl] = useState(null);
-  const blobUrlRef = useRef(null);
+  const [blobAudioUrl, setBlobAudioUrl] = useState(null);
 
-  // Effect A: blob URL lifecycle — only re-runs when audioFile changes.
-  // audioUrlProp is intentionally NOT in the deps: including it would cause
-  // the cleanup (which revokes the blob) to fire when Phase B sets audioUrlProp,
-  // creating an ERR_FILE_NOT_FOUND race before the R2 URL reaches the <audio>
-  // element. Effect B handles the audioUrlProp upgrade independently.
+  // Blob URL lifecycle — only re-runs when audioFile changes.
   useEffect(() => {
-    if (!audioFile) { setAudioUrl(null); return undefined; }
+    if (!audioFile) { setBlobAudioUrl(null); return undefined; }
     // HOTFIX 2026-05-29: when a wizard session is resumed from
     // sessionStorage (wizardPersistence), `audioFile` is a STUB object
     // — { name, size, type, lastModified, _restoredStub: true } — not
@@ -809,29 +804,21 @@ export default function LyricsEditor({
     const isRealBlob =
       typeof Blob !== "undefined" && audioFile instanceof Blob;
     if (!isRealBlob || audioFile._restoredStub) {
-      setAudioUrl(null);
+      setBlobAudioUrl(null);
       return undefined;
     }
     const url = URL.createObjectURL(audioFile);
-    setAudioUrl(url);
-    blobUrlRef.current = url;
+    setBlobAudioUrl(url);
     return () => {
       URL.revokeObjectURL(url);
-      blobUrlRef.current = null;
     };
-  }, [audioFile]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [audioFile]);
 
-  // Effect B: R2/signed URL upgrade (Phase B). When the parent fetches a
-  // durable server-side URL after job creation, we revoke the ephemeral blob
-  // here (not in Effect A's cleanup) so the <audio> never sees a dead URL.
-  useEffect(() => {
-    if (!audioUrlProp) return;
-    if (blobUrlRef.current) {
-      URL.revokeObjectURL(blobUrlRef.current);
-      blobUrlRef.current = null;
-    }
-    setAudioUrl(audioUrlProp);
-  }, [audioUrlProp]);
+  // The durable R2 URL is authoritative as soon as it reaches this render.
+  // Keeping it declarative avoids the prop -> effect -> local-state gap that
+  // could leave an edit session stuck in the no-audio state. The blob remains
+  // a valid fallback and is revoked only when its own lifecycle ends.
+  const audioUrl = audioUrlProp || blobAudioUrl;
 
   const audioRef = useRef(null);
   const listRef = useRef(null);
