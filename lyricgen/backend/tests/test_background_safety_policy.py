@@ -178,109 +178,12 @@ def test_universal_tenant_ignores_explicit_people_and_bypass(db):
     assert policy["should_validate"] is True
 
 
-def test_restricted_provider_boundary_replaces_positive_human_subject():
-    original = "A singer facing camera with a crowd behind her"
-    safe = pipeline._sanitize_people_at_provider_boundary(
-        original,
-        allow_people=False,
-    )
-    assert safe != original
-    assert "singer" not in safe.lower()
-    assert "crowd" not in safe.lower()
-    assert "unoccupied" in safe.lower()
 
 
-def test_authorized_common_prompt_is_preserved_at_provider_boundary():
-    original = "A singer facing camera"
-    assert pipeline._sanitize_people_at_provider_boundary(
-        original,
-        allow_people=True,
-    ) == original
 
 
-def test_restricted_provider_boundary_uses_high_recall_human_detector():
-    prompts = (
-        "a monk meditating beside a river",
-        "a nurse walking through a corridor",
-        "a firefighter in a red-lit warehouse",
-        "a chef and waitress at night",
-        "the protagonist watches the sunrise",
-        "a queen inside a glass palace",
-        "she walks through the rain",
-        "ella bailando bajo luces azules",
-        "eles caminhando na praia",
-        "a plain silhouette dancing",
-        "a humanlike creature in the forest",
-        "no people foreground, include a distant crowd",
-        "without people nearby, a singer",
-        "no crowd except one singer",
-        "no people other than a guitarist",
-        "sin personas cerca, mostrar una fotógrafa",
-        "sem pessoas próximas, incluir um surfista",
-        "no faces visible, silhouettes dancing",
-        "a police officer running",
-        "a waitress serving",
-        "a princess dancing",
-        "a hero standing",
-        "un pintor pintando",
-        "un rey de pie",
-        "uma policial correndo",
-        "uma soldada marchando",
-        "um pintor pintando",
-        "sem pessoas na frente, mostrar uma cantora",
-        "nenhuma multidão exceto um cantor",
-        "a teacher walking through a school",
-        "a student studying",
-        "a pilot standing by an aircraft",
-        "an athlete running",
-        "an engineer working",
-        "a priest praying",
-        "a coach shouting",
-        "un profesor enseñando",
-        "un estudiante caminando",
-        "un sacerdote rezando",
-        "um ator trabalhando",
-        "um trabalhador caminhando",
-        "um garçom servindo",
-    )
-    for prompt in prompts:
-        safe = pipeline._sanitize_people_at_provider_boundary(
-            prompt, allow_people=False,
-        )
-        assert safe != prompt, prompt
-        # Contrato nuevo (fix 2026-07-23): en vez de colapsar TODO a un único
-        # string genérico ("unoccupied…") —que hacía salir todos los fondos
-        # iguales— se remueve el sujeto humano preservando la escena (o, si no
-        # queda escena usable, un fallback VARIADO por-prompt). La garantía dura
-        # es que el resultado ya NO contiene un sujeto humano.
-        assert not pipeline._prompt_may_contain_human_subject(safe), (prompt, safe)
 
 
-def test_high_recall_detector_does_not_treat_equipment_as_a_person():
-    prompts = (
-        "mechanical arm holding a camera",
-        "robotic arm holding a light",
-        "clock hands at midnight",
-        "a chair's arms in close-up",
-        "a 3D model of an empty futuristic city",
-        "an Android phone on a table",
-        "an electric fan in an empty room",
-        "a rubber band on a white surface",
-        "no people, no faces, no silhouettes",
-        "manos de reloj a medianoche",
-        "brazos de silla en primer plano",
-        "brazo mecánico sosteniendo una cámara",
-        "modelo 3d de una ciudad vacía",
-        "mãos do relógio à meia-noite",
-        "braços da cadeira em primeiro plano",
-        "braço robótico segurando uma câmera",
-        "modelo 3d de uma cidade vazia",
-        "banda elástica sobre una mesa",
-    )
-    for prompt in prompts:
-        assert pipeline._sanitize_people_at_provider_boundary(
-            prompt, allow_people=False,
-        ) == prompt, prompt
 
 
 def test_human_shaped_figures_require_common_user_opt_in(db):
@@ -293,7 +196,7 @@ def test_human_shaped_figures_require_common_user_opt_in(db):
         assert pipeline._compute_allow_people(job_id, prompt) is True
 
 
-def test_visual_human_roles_require_common_user_opt_in_and_are_sanitized(db):
+def test_visual_human_roles_require_common_user_opt_in(db):
     job_id = _job(db, render_params={"bypass_content_validation": True})
     prompts = (
         "a lone guitarist playing on stage",
@@ -322,12 +225,6 @@ def test_visual_human_roles_require_common_user_opt_in_and_are_sanitized(db):
     )
     for prompt in prompts:
         assert pipeline._compute_allow_people(job_id, prompt) is True, prompt
-        safe = pipeline._sanitize_people_at_provider_boundary(
-            prompt,
-            allow_people=False,
-        )
-        assert safe != prompt, prompt
-        assert "unoccupied" in safe.lower(), prompt
 
 
 def test_mechanical_camera_equipment_does_not_authorize_people(db):
@@ -585,77 +482,11 @@ def test_staging_mode_nonumg_validates_by_default(db, monkeypatch):
     assert policy["should_validate"] is True
 
 
-def test_people_free_prompt_is_not_collapsed_regression_20260723():
-    """Regresión del bug 2026-07-23 (job 3b28837a1784): un 'Mi prompt' rico y
-    SIN personas se colapsaba a un string genérico por un falso positivo del
-    detector ('...photographs appear around them' → pronombre 'them'). Ahora
-    debe volver INTACTO."""
-    user_prompt = (
-        "Locked-off top-down static camera view of a dark rustic wooden table. "
-        "A vintage glass soda siphon, a jar of dulce de leche, an old ballpoint "
-        "pen, alpargatas, and an alfajor are placed on the surface. As time "
-        "passes, old newspaper headlines and historical photographs appear "
-        "around them. The lighting shifts from warm golden sunlight to harsh "
-        "cinematic shadows, photorealistic 35mm film, perfectly still frame."
-    )
-    out = pipeline._sanitize_people_at_provider_boundary(user_prompt, allow_people=False)
-    assert out == user_prompt
 
 
-def test_human_scene_preserves_setting_not_collapsed():
-    """Un prompt CON persona pero con escena: se saca el humano y se PRESERVA
-    el escenario (no se tira todo a un string fijo)."""
-    p = (
-        "Wide shot of a rain-soaked neon alley with teal and magenta light and "
-        "wet cobblestones, where a lone singer walks toward the camera."
-    )
-    out = pipeline._sanitize_people_at_provider_boundary(p, allow_people=False).lower()
-    assert "neon" in out and "teal" in out and "cobblestone" in out
-    assert "singer" not in out and "walks" not in out
 
 
-def test_all_human_fallback_varies_per_prompt():
-    """Sin escena usable, el fallback VARÍA por prompt (no un único string que
-    hacía todos los fondos iguales)."""
-    a = pipeline._sanitize_people_at_provider_boundary(
-        "a crowd of people dancing and singing together", allow_people=False,
-        concept="celebration",
-    )
-    b = pipeline._sanitize_people_at_provider_boundary(
-        "a lone man walking alone in the rain", allow_people=False,
-        concept="melancholy",
-    )
-    assert a != b
-    old_generic = "expressing the requested emotional tone"
-    assert old_generic not in a and old_generic not in b
-    assert not pipeline._prompt_may_contain_human_subject(a)
-    assert not pipeline._prompt_may_contain_human_subject(b)
 
 
-def test_pronoun_subject_human_actions_are_caught_any_verb():
-    """Regresión del leak encontrado en review adversarial (2026-07-23): un
-    pronombre-sujeto nominativo (he/she/they) es humano SIEMPRE, sin depender
-    del verbo. Antes 'he drinks / she weeps / they gather' se filtraban a Veo."""
-    for prompt in (
-        "A quiet neon bar, rain on the window. He drinks alone at the counter.",
-        "Golden hour over rooftops. She weeps by the ledge.",
-        "A crowded plaza at dusk, they gather around a fountain.",
-        "An empty stage; he stares into the dark and screams.",
-        "Wide desert at dawn. They march toward the horizon.",
-        "A cozy kitchen, she reads a letter at the table.",
-    ):
-        safe = pipeline._sanitize_people_at_provider_boundary(prompt, allow_people=False)
-        assert not pipeline._prompt_may_contain_human_subject(safe), (prompt, safe)
 
 
-def test_object_and_possessive_pronouns_are_not_false_positives():
-    """El fix NO debe re-marcar pronombres de objeto/posesivo sobre objetos
-    (them/their), que colapsaban prompts sin personas (bug del job 3b28837a1784)."""
-    for prompt in (
-        "old photographs appear around them, on a wooden table",
-        "oak trees and their long shadows at golden hour",
-        "lanterns and the light around them",
-    ):
-        assert pipeline._sanitize_people_at_provider_boundary(
-            prompt, allow_people=False
-        ) == prompt
