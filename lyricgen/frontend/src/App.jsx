@@ -2902,6 +2902,12 @@ export default function App() {
           // esto el operador que solo quería "otra versión del fondo" recibía
           // "No cambiaste nada". Es una intención, no un campo del baseline.
           forceBackgroundRegen: !!r.forceBackgroundRegen,
+          // Validación de contenido para el fondo regenerado (Paso 3). Se deja
+          // pasar tal cual (boolean o undefined): el diff sólo adjunta el flag
+          // al bucket background si es boolean explícito — undefined = el
+          // operador no tocó el toggle → backend valida por default (sin cambio
+          // de comportamiento respecto del path histórico del wizard).
+          editContentValidation: r.editContentValidation,
         };
 
         const diff = computeFieldDiff(r.baseline, current);

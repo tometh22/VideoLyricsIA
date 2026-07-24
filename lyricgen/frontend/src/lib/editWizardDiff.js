@@ -157,6 +157,20 @@ export function computeFieldDiff(baseline, current) {
   if (current.forceBackgroundRegen && !current.editBackgroundId && !out.background) {
     out.background = {};
   }
+  // Validación de contenido (Paso 3 — parity con la vieja tarjeta de fondo).
+  // Sólo viaja cuando (a) hay un regen de fondo real (out.background presente)
+  // y (b) el operador tocó el toggle (boolean explícito). Si el toggle nunca
+  // se renderizó/tocó, `editContentValidation` queda undefined y no adjuntamos
+  // nada → el backend valida por default, idéntico al comportamiento previo.
+  // NUNCA crea un bucket por sí solo: cambiar sólo la validación sin regen no
+  // dispara una regeneración de fondo.
+  if (out.background && typeof current.editContentValidation === "boolean") {
+    if (current.editContentValidation === false) {
+      out.background.bypass_content_validation = true;
+    } else {
+      out.background.force_content_validation = true;
+    }
+  }
 
   // ── background_library ───────────────────────────────────────────────
   // Swap a un asset curado de biblioteca (backend edit_type=

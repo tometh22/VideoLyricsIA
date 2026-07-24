@@ -9,6 +9,8 @@ import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
 import { CONCEPT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
 import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBackgroundPreviewTokens";
+import ContentValidationToggle from "./ContentValidationToggle";
+import { UNIFIED_EDIT_FLOW } from "../lib/featureFlags";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -443,6 +445,26 @@ export default function UploadZone({
     setRegenRequested(next);
     onEditFieldChange?.("forceBackgroundRegen", next);
   };
+  // Validación de contenido para el fondo regenerado (Paso 3 — parity con la
+  // vieja tarjeta "Regenerar fondo"). true = validar (default), false = fondo
+  // libre (permite personas; sólo cuentas no-UMG). Sólo se propaga cuando el
+  // operador la toca (por eso arranca sin escribir currentReview): el diff
+  // adjunta el flag al bucket background únicamente si es boolean explícito,
+  // así el path histórico del wizard no cambia de comportamiento.
+  const [editValidation, setEditValidation] = useState(true);
+  const handleEditValidation = (v) => {
+    setEditValidation(v);
+    onEditFieldChange?.("editContentValidation", v);
+  };
+  // Cuenta para el toggle de validación (UMG ve política fija, no bypass).
+  const _acct = (() => {
+    try {
+      const u = JSON.parse(localStorage.getItem("genly_user") || "null");
+      return { tenantId: u?.tenant_id || null, billingGroup: u?.billing_group || null };
+    } catch {
+      return { tenantId: null, billingGroup: null };
+    }
+  })();
 
   // ── Scene MODE (Studio Console redesign) ────────────────────────────────
   // The 3 modes map onto existing state (no new backend contract):
@@ -1721,6 +1743,11 @@ export default function UploadZone({
                 <p className="text-[10px] text-gray-600 mt-0.5">
                   {t("upload.regen_bg_desc") || "Genera otra versión del fondo con IA, aunque no cambies el texto. Mantiene letra y tiempos."}
                 </p>
+                {UNIFIED_EDIT_FLOW && (
+                  <p className="text-[10px] text-gray-500 mt-0.5">
+                    {t("upload.regen_bg_cost") || "~US$0.90 · video cinemático (o Foto fija, más barato y rápido — elegilo en Movimiento)"}
+                  </p>
+                )}
               </div>
               <button
                 type="button"
@@ -1734,6 +1761,19 @@ export default function UploadZone({
               >
                 {regenRequested ? (t("upload.regen_bg_on") || "Se regenerará ✓") : (t("upload.regen_bg_cta") || "Regenerar")}
               </button>
+            </div>
+          )}
+          {/* Validación de contenido para el fondo regenerado — sólo con el
+              flag unificado ON y cuando el operador pidió regenerar. UMG ve la
+              política fija; cuentas comunes pueden pedir fondo libre. */}
+          {UNIFIED_EDIT_FLOW && editMode && regenRequested && (
+            <div className="mb-3">
+              <ContentValidationToggle
+                value={editValidation}
+                onChange={handleEditValidation}
+                tenantId={_acct.tenantId}
+                billingGroup={_acct.billingGroup}
+              />
             </div>
           )}
           <p className="text-[10px] text-gray-600 mt-0.5 mb-2">

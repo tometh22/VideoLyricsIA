@@ -355,3 +355,51 @@ describe("forceBackgroundRegen (re-roll del fondo sin cambiar texto)", () => {
     expect(diff.background).toBeUndefined();
   });
 });
+
+describe("editContentValidation (Paso 3 — validación en el regen de fondo)", () => {
+  it("con regen de fondo + validar=true adjunta force_content_validation", () => {
+    const base = baselineFixture();
+    const current = { ...base, forceBackgroundRegen: true, editContentValidation: true };
+    const diff = computeFieldDiff(base, current);
+    expect(diff.background).toEqual({ force_content_validation: true });
+  });
+
+  it("con regen de fondo + validar=false adjunta bypass_content_validation", () => {
+    const base = baselineFixture();
+    const current = {
+      ...base,
+      backgroundHint: "ciudad de noche",
+      editContentValidation: false,
+    };
+    const diff = computeFieldDiff(base, current);
+    expect(diff.background).toEqual({
+      background_hint: "ciudad de noche",
+      bypass_content_validation: true,
+    });
+  });
+
+  it("undefined (toggle nunca tocado) NO adjunta ningún flag — comportamiento previo", () => {
+    const base = baselineFixture();
+    const current = { ...base, backgroundHint: "bosque" };
+    const diff = computeFieldDiff(base, current);
+    expect(diff.background).toEqual({ background_hint: "bosque" });
+    expect(diff.background.force_content_validation).toBeUndefined();
+    expect(diff.background.bypass_content_validation).toBeUndefined();
+  });
+
+  it("la validación NUNCA crea bucket por sí sola (sin regen no dispara fondo)", () => {
+    const base = baselineFixture();
+    // Sólo el toggle de validación cambió, sin hint/movimiento/force-regen.
+    const diff = computeFieldDiff(base, { ...base, editContentValidation: false });
+    expect(diff.background).toBeUndefined();
+    expect(diff).toEqual({});
+  });
+
+  it("no se cuela en un swap de biblioteca ($0, sin generación → sin validación)", () => {
+    const base = baselineFixture();
+    const current = { ...base, editBackgroundId: 9, editContentValidation: false };
+    const diff = computeFieldDiff(base, current);
+    expect(diff.background).toBeUndefined();
+    expect(diff.background_library).toEqual({ background_id: 9 });
+  });
+});

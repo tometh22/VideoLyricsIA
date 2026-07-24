@@ -3,6 +3,7 @@ import { useI18n } from "../i18n";
 import BackgroundHintField from "./BackgroundHintField";
 import ContentValidationToggle from "./ContentValidationToggle";
 import { useAlert } from "./AlertProvider";
+import { UNIFIED_EDIT_FLOW } from "../lib/featureFlags";
 
 function _readAccount() {
   try {
@@ -38,7 +39,15 @@ export default function EditRequestPanel({
   onLyricsClick,
 }) {
   const allowsLyrics = allowedModes.includes("lyrics");
-  const allowsBackground = allowedModes.includes("background");
+  // Paso 3 (un solo camino): con VITE_UNIFIED_EDIT_FLOW ON, la regeneración
+  // de fondo se pliega dentro del wizard (sección Fondo, editMode) y esta
+  // tarjeta desaparece. OFF = tarjeta intacta (comportamiento histórico).
+  const allowsBackground =
+    allowedModes.includes("background") && !UNIFIED_EDIT_FLOW;
+  // Cantidad de tarjetas que se van a renderizar — el grid se basa en esto,
+  // no en allowedModes, para no dejar una celda vacía cuando el flag oculta
+  // la tarjeta de fondo.
+  const visibleCards = (allowsLyrics ? 1 : 0) + (allowsBackground ? 1 : 0);
   const { t } = useI18n();
   const { alert } = useAlert();
   const editCount = job.edit_count ?? 0;
@@ -319,8 +328,8 @@ export default function EditRequestPanel({
 
       {!mode && (
         <div className={`grid gap-3 ${
-          allowedModes.length === 1 ? "" :
-          allowedModes.length === 2 ? "sm:grid-cols-2" :
+          visibleCards <= 1 ? "" :
+          visibleCards === 2 ? "sm:grid-cols-2" :
           "sm:grid-cols-3"
         }`}>
           {allowsLyrics && (
@@ -338,8 +347,11 @@ export default function EditRequestPanel({
               </span>
             </div>
             <p className="text-[11px] text-ink-secondary">
-              {t("edit.wizard_cost") ||
-                "~5-10 min · sin costo extra · título, artista, letra, tipografía, timing — todo desde el wizard"}
+              {UNIFIED_EDIT_FLOW
+                ? (t("edit.wizard_cost_unified") ||
+                    "~5-15 min · título, artista, letra, tipografía, timing y fondo — todo desde el wizard")
+                : (t("edit.wizard_cost") ||
+                    "~5-10 min · sin costo extra · título, artista, letra, tipografía, timing — todo desde el wizard")}
             </p>
           </button>
           )}
