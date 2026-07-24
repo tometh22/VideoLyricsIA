@@ -9245,8 +9245,11 @@ class EditJobRequest(BaseModel):
     movement_style: str | None = Field(default=None, max_length=64)
     # "Usar mi prompt tal cual": when True (and background_hint is set),
     # the hint goes straight to Veo without Gemini's rewrite. Only
-    # meaningful for edit_type=="background".
-    bg_verbatim: bool = Field(default=False)
+    # meaningful for edit_type=="background". None = keep persisted: the
+    # unified wizard only sends this field when the toggle CHANGED, so a
+    # `bool` default of False silently clobbered a persisted True on any
+    # background edit that didn't touch it (BUG-5). None-aware now.
+    bg_verbatim: bool | None = Field(default=None)
     # Library asset for edit_type=="background_library": swap the video's
     # background for a curated BackgroundAsset instead of regenerating with
     # AI. The escape hatch from the non-converging Veo loop (incidente Gaby
@@ -10695,13 +10698,13 @@ async def request_edit(
         _rp_mv = dict(job.render_params or {})
         _rp_mv["movement_style"] = _mv
         job.render_params = _rp_mv
-    if body.edit_type == "background":
+    if body.edit_type == "background" and body.bg_verbatim is not None:
         # "Usar mi prompt tal cual" — send background_hint straight to Veo.
-        # ALWAYS write the boolean (not only when True) so unchecking the
-        # toggle on a later background edit clears a previously-persisted
-        # True. Symmetric with movement_style above. The frontend always
-        # sends bg_verbatim for background edits. Persisted durably so a
-        # reaped /retry (whitelist includes bg_verbatim) honours it too.
+        # None = keep persisted (BUG-5): the unified wizard only sends this
+        # field when the toggle CHANGED, so writing unconditionally flipped a
+        # persisted True→False on any background edit that didn't touch it.
+        # Now symmetric with the background_mode / movement_style (None-means-
+        # keep) blocks: only persist when the caller actually sent a value.
         _bv = bool(body.bg_verbatim)
         edit_params["bg_verbatim"] = _bv
         _rp_v = dict(job.render_params or {})

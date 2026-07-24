@@ -15287,7 +15287,13 @@ def _operator_prompt_for_edit(
 ) -> str | None:
     """Resolve only raw operator-authored text for edit policy checks."""
     if edit_type == "background":
-        return fresh_background_hint or None
+        # BUG-1 parity: generation now falls back to the persisted operator
+        # prompt when this edit has no fresh hint (effective_background_hint),
+        # so the SAFETY/validation prompt must use the same fallback — else a
+        # movement-only regen would generate WITH the persisted people-prompt
+        # but validate/gate WITHOUT it (allow_people=False), hard-failing the
+        # very jobs FIX 1 means to preserve. Mirrors the `scene` arm below.
+        return fresh_background_hint or persisted_operator_prompt or None
     if edit_type in ("typography", "lyrics", "metadata"):
         return persisted_operator_prompt or None
     if edit_type == "scene":
@@ -15479,6 +15485,21 @@ def run_edit_pipeline(
     # Keep it separate from `background_hint`, which intentionally means only
     # a fresh prompt supplied by this edit's background-regeneration request.
     _persisted_operator_prompt = merged.get("background_hint") or None
+    # BUG-1 fix (regen dropped the operator prompt): a movement-only edit or
+    # "Generar otra versión" (empty background bucket) carries no fresh hint,
+    # so background_hint is None and the regen used to re-roll the scene from
+    # genre/concept/lyrics — discarding the original creative direction. Fall
+    # back to the persisted operator prompt so the SAME prompt is reproduced; a
+    # freshly typed hint still wins via `or`. (Clearing the textarea does NOT
+    # clear the persisted hint — main.py skips empty background_hint — so the
+    # old prompt resurrects; accepted, matches prior reuse behavior.)
+    effective_background_hint = background_hint or _persisted_operator_prompt
+    # BUG-4 fix (regen flipped Auto→lyrics): the background branch never read
+    # match_lyrics, so _ensure_background fell to its True default and silently
+    # converted "Auto" (match_lyrics=False) jobs to lyrics-mode on every regen.
+    # Preserve the persisted mode; coerce a legacy-absent/None value to True.
+    _ml_persisted = merged.get("match_lyrics", True)
+    effective_match_lyrics = True if _ml_persisted is None else bool(_ml_persisted)
     # Operator-chosen generation mode for background regen: "veo" (Veo 3.1
     # cinematic video) or "imagen" (Imagen-4 still + Ken Burns animation).
     # Defaults to "veo" when unset for backward compatibility — pre-2026-05-16
@@ -15696,11 +15717,12 @@ def run_edit_pipeline(
                     lyrics_text=lyrics_text, artist=artist, job_id=job_id,
                     song_title=song_title, genre=genre, concept=concept,
                     movement_style=movement_style,
-                    background_hint=background_hint,
+                    background_hint=effective_background_hint,
                     bg_mode=background_mode,
                     bg_verbatim=bg_verbatim,
                     effect=effect,
-                    allow_people=_compute_allow_people(job_id, background_hint),
+                    match_lyrics=effective_match_lyrics,
+                    allow_people=_compute_allow_people(job_id, effective_background_hint),
                 )
             except Exception as _background_generation_error:
                 _raise_if_job_timeout(_background_generation_error)
@@ -15972,10 +15994,11 @@ def run_edit_pipeline(
                             job_id=job_id, song_title=song_title,
                             genre=genre, concept=concept,
                             movement_style=movement_style,
-                            background_hint=background_hint,
+                            background_hint=effective_background_hint,
                             bg_mode=background_mode,
                             bg_verbatim=bg_verbatim,
                             effect=effect,
+                            match_lyrics=effective_match_lyrics,
                             allow_people=_edit_safety_policy["allow_people"],
                             atmospherics_policy=(
                                 _edit_safety_policy["atmospherics_policy"]
