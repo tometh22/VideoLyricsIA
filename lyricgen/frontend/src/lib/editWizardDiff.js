@@ -241,26 +241,27 @@ export function bundleTypographyIntoFirstBucket(payloads, _opts = {}) {
   return payloads;
 }
 
-// ── background regen modifiers (Veo/Imagen + content-validation) ────────
-// Estos NO son campos del baseline sino ACCIÓN del wizard de edición: el
-// operador elige motor y política de validación como modificadores de un
-// regen de fondo IA, y llegan a `current` vía onEditFieldChange (igual que
-// forceBackgroundRegen). Se aplican SOLO cuando el edit resuelto es un regen
-// IA (edit_type="background"; el swap de biblioteca no dispara Veo/Imagen).
+// ── background regen: política de content-validation (fondo-libre) ──────
+// NO es un campo del baseline sino ACCIÓN del wizard de edición: el operador
+// elige la política de validación como modificador de un regen de fondo IA, y
+// llega a `current` vía onEditFieldChange (igual que forceBackgroundRegen). Se
+// aplica SOLO cuando el edit resuelto es un regen IA (edit_type="background";
+// el swap de biblioteca no dispara Veo/Imagen).
 //
 // Paridad con la tarjeta "Regenerar fondo" que se plegó al wizard
 // (unificación #973): esa tarjeta SIEMPRE mandaba exactamente uno de
 // bypass/force_content_validation — si no se manda ninguno, el backend
 // fail-closea a force y se pierde fondo-libre (cuentas no-UMG).
 //
-//   - bgRegenEngine === "imagen"  → background_mode:"imagen" (foto animada
-//     barata, sin riesgo de caras). "veo"/undefined = default, no se manda.
 //   - bgRegenValidation === false → bypass_content_validation (fondo-libre,
 //     sólo no-UMG). Cualquier otra cosa (incl. undefined) → force (validar).
+//
+// El MOTOR (Veo/Imagen) NO viaja por acá: lo define el estilo de Movimiento
+// (movement_style: "foto-parallax"→Imagen, resto→Veo), que ya va en el bucket
+// `background` del diff. No duplicamos ese eje.
 export function backgroundRegenExtras(current) {
   const c = current || {};
   const out = {};
-  if (c.bgRegenEngine === "imagen") out.background_mode = "imagen";
   if (c.bgRegenValidation === false) {
     out.bypass_content_validation = true;
   } else {
