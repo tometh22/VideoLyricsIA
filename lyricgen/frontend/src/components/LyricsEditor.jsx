@@ -9,6 +9,7 @@ import { tierForLength } from "../lib/lyricTiers";
 import { activeWordIndex } from "../lib/karaokeTiming";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
 import { segmentsValuesEqual } from "../lib/segmentsValuesEqual";
+import { reseedPreservingIds } from "../lib/segmentIds";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
 import { splitWordsAtCharOffset, firstWordStart, lastWordEnd } from "../lib/splitWords";
 import useLocalStorage from "../hooks/useLocalStorage";
@@ -534,7 +535,14 @@ export default function LyricsEditor({
       _rs.count += 1;
     }
     prevSegmentsRef.current = segments;
-    const seeded = segments.map((s, i) => ({ ...s, _id: i }));
+    // Identidad ESTABLE en el reseed (P0 reseed-storm): preservar el _id de
+    // cada fila cuyo contenido (start/end/text, epsilon 1ms) ya está en
+    // `edited` — un eco puro conserva TODOS los ids y React no re-monta
+    // ninguna fila; solo el contenido genuinamente nuevo recibe id fresco.
+    // Antes: _id reasignado POR ÍNDICE → todas las keys nuevas → remount
+    // total de la lista + minimapa en cada reseed (el amplificador del
+    // freeze en canciones de 59+ líneas).
+    const seeded = reseedPreservingIds(editedRef.current, segments);
     setEdited(seeded);
     originalSegmentsRef.current = seeded;
     setIsDirty(false);
