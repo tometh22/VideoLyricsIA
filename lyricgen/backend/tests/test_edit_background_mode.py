@@ -205,3 +205,63 @@ def test_background_edit_rejected_for_scene_jobs(client, admin_token, db, monkey
     )
     assert res2.status_code == 200, res2.text
     assert len(captured) == 1
+
+
+# ── BUG-5: bg_verbatim None-aware (no durable clobber) ──────────────────
+# The unified wizard only sends bg_verbatim when the toggle CHANGED. The old
+# `bool = False` default silently flipped a persisted True→False on any
+# background edit that didn't touch it. bg_verbatim is now `bool | None` and
+# request_edit only persists it when the caller actually sent a value.
+
+def _bg_job_with_render_params(db, tenant_id, user_id, render_params):
+    job_id = uuid.uuid4().hex[:12]
+    db.add(JobModel(
+        job_id=job_id, user_id=user_id, tenant_id=tenant_id,
+        artist="Test", song_title="Verbatim", filename="t.mp3",
+        status="pending_review", delivery_profile="youtube", progress=100,
+        bg_r2_key_cached="backgrounds/x/bg_cached.mp4",
+        segments_json=[{"start": 0.0, "end": 1.0, "text": "hola"}],
+        edit_count=0, render_params=render_params,
+    ))
+    db.commit()
+    return job_id
+
+
+def test_bg_verbatim_absent_does_not_clobber_persisted_true(client, admin_token, db, monkeypatch):
+    """A background edit that omits bg_verbatim must NOT overwrite a persisted
+    bg_verbatim=True (the BUG-5 clobber): the write block is skipped entirely."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _bg_job_with_render_params(db, tenant_id, user_id, {"bg_verbatim": True})
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "background", "movement_style": "animado"},
+    )
+    assert res.status_code == 200, res.text
+    edit_params = captured[0]["edit_params"]
+    assert "bg_verbatim" not in edit_params, (
+        f"omitted bg_verbatim must not be written; got {edit_params!r}"
+    )
+    db.expire_all()
+    job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+    assert job.render_params.get("bg_verbatim") is True, (
+        "persisted bg_verbatim=True must survive a verbatim-untouched bg edit"
+    )
+
+
+def test_bg_verbatim_explicit_false_is_written(client, admin_token, db, monkeypatch):
+    """An explicit bg_verbatim=false IS persisted — the None-aware write still
+    honours an explicit operator choice."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _bg_job_with_render_params(db, tenant_id, user_id, {"bg_verbatim": True})
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "background", "bg_verbatim": False},
+    )
+    assert res.status_code == 200, res.text
+    assert captured[0]["edit_params"].get("bg_verbatim") is False
