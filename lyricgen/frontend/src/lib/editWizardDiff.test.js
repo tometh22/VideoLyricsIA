@@ -165,6 +165,24 @@ describe("computeFieldDiff", () => {
     });
   });
 
+  it("does NOT emit genre/concept/matchLyrics — locked in editMode, not wired to /edit", () => {
+    // Structural scene axes are LOCKED in edit mode (2026-07-24): they aren't
+    // in the submit whitelist nor inspected here, and a background regen keeps
+    // the PERSISTED values (pipeline reads them from render_params). This test
+    // pins that decision — an accidental half-wire (adding a genre/concept
+    // branch here without seeding the snapshot+baseline) would resurrect the
+    // BUG-2/3-class silent drop and must fail CI instead.
+    const base = baselineFixture();
+    const cur = {
+      ...base,
+      genre: "rock",
+      concept: "ciudad",
+      matchLyrics: false,
+      inspiredByLyrics: true,
+    };
+    expect(computeFieldDiff(base, cur)).toEqual({});
+  });
+
   it("multiple buckets: metadata + typography + lyrics + background all changed", () => {
     const base = baselineFixture();
     const cur = {

@@ -520,6 +520,12 @@ export default function UploadZone({
     return () => URL.revokeObjectURL(url);
   }, [backgroundFile]);
   const selectSceneMode = (m) => {
+    // En edición, el modo estructural de escena (Auto / Inspirado en la letra)
+    // se fija al crear el video: no está cableado al /edit y el backend ya
+    // preserva el match_lyrics persistido en la regeneración (fix 2026-07-24),
+    // así que dejar cambiarlo sería un no-op engañoso. "Mi prompt" SÍ es
+    // editable (viaja por background_hint) → sigue habilitado.
+    if (editMode && (m === "auto" || m === "lyrics")) return;
     track("wizard.scene_mode", { mode: m });
     setSceneMode(m);
     // Keep the legacy `match_lyrics` payload deterministic. "Mi prompt"
@@ -1781,7 +1787,21 @@ export default function UploadZone({
               ? (t("upload.scene_meta_prompt_note") || "Tu prompt define la escena — género y concepto quedan como ayuda secundaria.")
               : (t("upload.scene_meta_desc") || "Género ajusta la paleta y la atmósfera · Concepto define el tipo de escena (ciudad, naturaleza, abstracto…).")}
           </p>
-          <div className={`flex flex-wrap gap-3 ${sceneMode === "prompt" ? "opacity-50" : ""}`}>
+          {/* Género/Concepto son ESTRUCTURALES: se fijan al crear el video.
+              No están cableados al /edit y el pipeline ya usa los persistidos
+              en la regeneración, así que cambiarlos acá sería un no-op
+              engañoso. En edición los bloqueamos (precedente: paleta). */}
+          <div className={`relative flex flex-wrap gap-3 ${sceneMode === "prompt" ? "opacity-50" : ""} ${editMode ? "opacity-60 pointer-events-none select-none" : ""}`}>
+            {editMode && (
+              <div className="absolute -top-1 right-0 flex items-center gap-1 px-2 py-0.5 rounded-md bg-surface-1 ring-1 ring-white/[0.08] text-[10px] text-gray-500 pointer-events-auto select-text z-10">
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <path d="M12 11v4M8 11V7a4 4 0 118 0v4M5 11h14v9a1 1 0 01-1 1H6a1 1 0 01-1-1v-9z" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                <span title={t("upload.genre_concept_locked") || "El género y el concepto se fijan al crear el video."}>
+                  {t("editor.locked_short") || "No editable"}
+                </span>
+              </div>
+            )}
             <div className="flex items-center gap-2">
               <span className="text-[11px] text-gray-600 shrink-0" title={t("upload.genre_help") || "El estilo musical. Ajusta paleta, iluminación y atmósfera del fondo."}>{t("upload.genre_label") || "Género:"}</span>
               <Listbox
@@ -3270,12 +3290,21 @@ export default function UploadZone({
                       { code: "prompt", icon: "✍️", label: t("upload.bg_prompt_label_short") || "Mi prompt",                desc: t("upload.mode_prompt_desc") || "Vos describís el fondo, con opción usar tal cual." },
                     ].map((m) => {
                       const sel = sceneMode === m.code;
+                      // En edición, Auto / Inspirado en la letra (estructura de
+                      // escena) quedan fijos — no están cableados al /edit y el
+                      // backend preserva el match_lyrics persistido. "Mi prompt"
+                      // sigue editable (viaja por background_hint).
+                      const cardLocked = editMode && (m.code === "auto" || m.code === "lyrics");
                       return (
                         <button
                           key={m.code}
                           type="button"
                           onClick={() => selectSceneMode(m.code)}
+                          aria-disabled={cardLocked}
+                          title={cardLocked ? (t("upload.scene_mode_locked") || "El modo de escena se fija al crear el video.") : undefined}
                           className={`text-left rounded-card px-4 py-3 flex items-start gap-3 border transition-all duration-200 ${
+                            cardLocked ? "opacity-50 cursor-not-allowed " : ""
+                          }${
                             sel ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08] shadow-glow"
                                 : "border-white/[0.06] bg-surface-2/40 hover:border-white/[0.18]"
                           }`}
@@ -3295,8 +3324,11 @@ export default function UploadZone({
 
                   {/* Multi-escena: capa PREMIUM ortogonal a los 3 modos de arriba.
                       Funciona con cualquiera (Auto / letra / Mi prompt). Siempre
-                      visible (upsell); desbloqueada si scenesEligible. */}
-                  {(() => {
+                      visible (upsell); desbloqueada si scenesEligible.
+                      Oculto en edición: activar/desactivar Escenas es un cambio
+                      estructural que el /edit no soporta (el backend lo rechaza
+                      en jobs multi-escena), así que ofrecerlo sería engañoso. */}
+                  {!editMode && (() => {
                     const on = !!enableScenes;
                     const locked = !scenesEligible;
                     return (
