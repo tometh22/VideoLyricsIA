@@ -384,7 +384,7 @@ def worker_fleet_coherence(
     }
 
 
-def health_snapshot() -> dict:
+def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
     """Lightweight report of runtime health.
 
     Designed to be safe on a hot path (uptime probe → every N seconds):
@@ -542,14 +542,14 @@ def health_snapshot() -> dict:
                     snap["fleet_service_counts"] = fleet["service_counts"]
                     snap["fleet_under_replicated"] = fleet["under_replicated"]
                     if not snap["fleet_coherent"]:
-                        if fleet_strict:
+                        if fleet_strict and enforce_fleet_readiness:
                             _down("worker_fleet_incoherent", allow_starting=False)
                         else:
                             _degrade("worker_fleet_incoherent")
                 except Exception:
                     snap["worker_releases"] = []
                     snap["fleet_coherent"] = False
-                    if fleet_strict:
+                    if fleet_strict and enforce_fleet_readiness:
                         _down("worker_fleet_unverifiable", allow_starting=False)
                     else:
                         _degrade("worker_fleet_unverifiable")
