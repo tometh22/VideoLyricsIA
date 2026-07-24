@@ -56,6 +56,42 @@ def test_health_live_returns_fast():
     pass
 
 
+def test_health_deploy_relaxes_only_the_fleet_rollout_gate(client, monkeypatch):
+    """Railway must be able to seat the API before workers share its SHA."""
+    calls = []
+
+    def _deploy_snapshot(*, enforce_fleet_readiness=True):
+        calls.append(enforce_fleet_readiness)
+        return {
+            "status": "degraded",
+            "degraded_reason": "worker_fleet_incoherent",
+        }
+
+    import main
+    monkeypatch.setattr(main, "health_snapshot", _deploy_snapshot)
+
+    res = client.get("/health/deploy")
+    assert res.status_code == 200, res.text
+    assert res.json()["degraded_reason"] == "worker_fleet_incoherent"
+    assert calls == [False]
+
+
+def test_health_deploy_still_rejects_critical_dependency_failure(
+    client, monkeypatch,
+):
+    """The rollout exception must not hide a real DB/Redis outage."""
+    def _down_snapshot(*, enforce_fleet_readiness=True):
+        assert enforce_fleet_readiness is False
+        return {"status": "down", "down_reason": "db_down"}
+
+    import main
+    monkeypatch.setattr(main, "health_snapshot", _down_snapshot)
+
+    res = client.get("/health/deploy")
+    assert res.status_code == 503, res.text
+    assert res.json()["down_reason"] == "db_down"
+
+
 def test_health_ready_runs_full_snapshot(client, monkeypatch):
     """/health/ready MUST call health_snapshot — that's what it's for.
     Mirror of /health behaviour."""
