@@ -375,21 +375,11 @@ describe("backgroundRegenExtras — paridad tarjeta 'Regenerar fondo' (#973)", (
     expect(out.force_content_validation).toBeUndefined();
   });
 
-  it("motor Imagen: bgRegenEngine='imagen' → background_mode='imagen'", () => {
-    expect(backgroundRegenExtras({ bgRegenEngine: "imagen" }).background_mode).toBe("imagen");
-  });
-
-  it("motor Veo (default) NO manda background_mode (backend defaultea a veo)", () => {
-    expect(backgroundRegenExtras({ bgRegenEngine: "veo" }).background_mode).toBeUndefined();
+  it("NO decide el motor (Veo/Imagen lo define movement_style, no este helper)", () => {
+    // El eje motor se sacó del payload de extras (rediseño 2026-07-24): el
+    // estilo de Movimiento ("foto-parallax"→Imagen) ya lo cubre vía el bucket
+    // background del diff. Nunca debe aparecer background_mode acá.
+    expect(backgroundRegenExtras({ bgRegenEngine: "imagen" }).background_mode).toBeUndefined();
     expect(backgroundRegenExtras({}).background_mode).toBeUndefined();
-  });
-
-  it("combina motor + fondo-libre en un solo payload", () => {
-    expect(
-      backgroundRegenExtras({ bgRegenEngine: "imagen", bgRegenValidation: false }),
-    ).toEqual({
-      background_mode: "imagen",
-      bypass_content_validation: true,
-    });
   });
 });
