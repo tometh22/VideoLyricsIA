@@ -23,7 +23,7 @@ def test_api_deployment_contract():
     assert cfg["deploy"]["preDeployCommand"] == [
         "bash /app/backend/scripts/prod_migrate.sh"
     ]
-    assert cfg["deploy"]["healthcheckPath"] == "/health/ready"
+    assert cfg["deploy"]["healthcheckPath"] == "/health/deploy"
     assert cfg["deploy"]["numReplicas"] == 2
     assert cfg["deploy"]["drainingSeconds"] == 1200
     start = cfg["deploy"]["startCommand"]
