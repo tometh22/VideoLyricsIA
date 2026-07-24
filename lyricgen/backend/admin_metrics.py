@@ -342,8 +342,21 @@ def metrics_health(db: Session) -> dict:
 USAGE_DROP_THRESHOLD = -0.4   # caída WoW > 40%
 USAGE_DROP_MIN_PREV = 5       # ...con volumen previo mínimo (evita 2→1)
 REWORK_RATE_THRESHOLD = 0.5
+REWORK_RATE_MIN_JOBS = 5      # 100% sobre 1-2 jobs no significa nada (mismo
+                              # espíritu que ERROR_RATE_MIN_JOBS). El smoke de
+                              # edición (genly_edit_smoke_ci) crea ~1 job y lo
+                              # edita → 100% retrabajo por diseño → falso positivo.
 ERROR_RATE_THRESHOLD = 0.2
 ERROR_RATE_MIN_JOBS = 5
+
+
+def _is_internal_tenant(tenant_id: str | None) -> bool:
+    """Tenants sintéticos / de CI-smoke que NO deben disparar alertas de negocio.
+    El smoke de edición (`genly_edit_smoke_ci`, corrido con PREFLIGHT_USERNAME
+    post-deploy) edita el 100% de sus jobs por diseño. Ningún tenant real
+    contiene 'smoke' ni termina en '_ci'."""
+    t = (tenant_id or "").lower()
+    return "smoke" in t or t.endswith("_ci")
 
 
 def run_business_alerts(db: Session) -> list[dict]:
@@ -353,6 +366,10 @@ def run_business_alerts(db: Session) -> list[dict]:
     health = metrics_health(db)
     fired = []
     for t in health["tenants"]:
+        # Tenants internos/CI (smoke de edición) no disparan alertas: su
+        # comportamiento es sintético (100% retrabajo por diseño).
+        if _is_internal_tenant(t["tenant_id"]):
+            continue
         checks = []
         if (t["usage_delta_wow"] is not None
                 and t["jobs_prev_7d"] >= USAGE_DROP_MIN_PREV
@@ -360,7 +377,8 @@ def run_business_alerts(db: Session) -> list[dict]:
             checks.append(("usage-drop",
                            f"uso cayó {abs(t['usage_delta_wow']):.0%} WoW "
                            f"({t['jobs_prev_7d']}→{t['jobs_7d']} jobs)"))
-        if t["rework_rate"] >= REWORK_RATE_THRESHOLD:
+        if (t["rework_rate"] >= REWORK_RATE_THRESHOLD
+                and (t["jobs_7d"] + t["jobs_prev_7d"]) >= REWORK_RATE_MIN_JOBS):
             checks.append(("rework-spike",
                            f"tasa de retrabajo {t['rework_rate']:.0%}"))
         if (t["error_rate"] >= ERROR_RATE_THRESHOLD
