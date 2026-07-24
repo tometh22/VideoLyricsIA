@@ -12833,6 +12833,25 @@ async def portal_submit_change_request(
         },
     ))
     db.commit()
+
+    # Notificación en tiempo real (Paso "Cambios de UMG" — el panel del admin
+    # exige entrar a mirarlo; esto llega a la bandeja apenas UMG manda el
+    # pedido, sin esperar a que alguien abra Operación). emails._send_email ya
+    # contiene sus propios fallos de SMTP, pero el thread target igual se
+    # envuelve acá (mismo criterio que billing._send_email_async) para que
+    # NINGÚN error de este código best-effort — ni siquiera uno futuro por
+    # fuera de emails.py — se filtre como excepción no manejada del thread.
+    def _notify_umg_change_request():
+        try:
+            emails.send_umg_change_request_notification(
+                delivery.artist_snapshot, delivery.song_title_snapshot,
+                comment, delivery_id, delivery.job_id,
+            )
+        except Exception:
+            logger.warning("[CR] notificación de cambio UMG falló", exc_info=True)
+
+    threading.Thread(target=_notify_umg_change_request, daemon=True).start()
+
     return {"ok": True, "id": cr.id, "submitted_at": cr.submitted_at.isoformat()}
 
 

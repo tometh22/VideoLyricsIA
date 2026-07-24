@@ -305,4 +305,123 @@ def test_deliveries_routed_to_external_db(
     finally:
         main.app.dependency_overrides.pop(get_deliveries_db, None)
         Base.metadata.drop_all(bind=ext_engine)
-        ext_engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Change requests: UMG pide correcciones desde el portal (POST .../change-
+# request), el operador las resuelve desde el admin (GET/POST /admin/
+# change-requests). Panel re-agregado 2026-07-24 tras detectar que se había
+# sacado la UI (2026-06-02) pero el portal seguía ofreciendo el botón — los
+# pedidos se guardaban sin que nadie los viera.
+# ---------------------------------------------------------------------------
+
+def test_change_request_requires_portal_token(client, admin_token, approved_job, all_r2_files_present):
+    client.post(f"/admin/deliveries/from-job/{approved_job.job_id}",
+                headers=auth(admin_token), json={})
+    items = client.get("/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN}).json()
+    delivery_id = items["songs"][0]["versions"][0]["delivery_id"]
+
+    res = client.post(f"/api/deliveries/{delivery_id}/change-request",
+                       json={"comment": "poner la tipografía más grande"})
+    assert res.status_code == 401
+
+
+def test_change_request_empty_comment_rejected(client, admin_token, approved_job, all_r2_files_present):
+    client.post(f"/admin/deliveries/from-job/{approved_job.job_id}",
+                headers=auth(admin_token), json={})
+    items = client.get("/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN}).json()
+    delivery_id = items["songs"][0]["versions"][0]["delivery_id"]
+
+    res = client.post(
+        f"/api/deliveries/{delivery_id}/change-request",
+        headers={"X-Portal-Token": PORTAL_TOKEN},
+        json={"comment": "   "},
+    )
+    assert res.status_code == 400
+
+
+def test_change_request_submit_and_admin_lists_it(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """El pedido llega al portal, y el admin lo ve pendiente hasta resolverlo."""
+    client.post(f"/admin/deliveries/from-job/{approved_job.job_id}",
+                headers=auth(admin_token), json={})
+    items = client.get("/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN}).json()
+    delivery_id = items["songs"][0]["versions"][0]["delivery_id"]
+
+    with patch("main.emails.send_umg_change_request_notification") as mock_notify:
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": "poner la tipografía más grande"},
+        )
+        assert res.status_code == 200, res.text
+        cr_id = res.json()["id"]
+
+        # Fire-and-forget en un thread daemon — darle un instante a correr.
+        import time
+        time.sleep(0.2)
+
+    # La notificación se disparó con el contexto correcto (best-effort:
+    # nunca debe tirar la request aunque SMTP no esté configurado en test).
+    mock_notify.assert_called_once()
+    call_args = mock_notify.call_args.args
+    assert call_args[0] == "Test Artist"        # artist
+    assert call_args[2] == "poner la tipografía más grande"  # comment
+    assert call_args[3] == delivery_id          # delivery_id
+    assert call_args[4] == approved_job.job_id  # job_id
+
+    # El admin lo ve como pendiente.
+    pending = client.get("/admin/change-requests?status=pending",
+                          headers=auth(admin_token)).json()
+    assert pending["pending_count"] == 1
+    assert pending["resolved_count"] == 0
+    item = next(i for i in pending["items"] if i["id"] == cr_id)
+    assert item["comment"] == "poner la tipografía más grande"
+    assert item["delivery"]["artist"] == "Test Artist"
+    assert item["delivery"]["job_id"] == approved_job.job_id
+    assert item["resolved_at"] is None
+
+    # Resolver lo saca de "pending" y lo pasa a "resolved".
+    res = client.post(f"/admin/change-requests/{cr_id}/resolve",
+                       headers=auth(admin_token),
+                       json={"resolution_note": "re-renderizado con fuente más grande"})
+    assert res.status_code == 200
+
+    pending = client.get("/admin/change-requests?status=pending",
+                          headers=auth(admin_token)).json()
+    assert pending["pending_count"] == 0
+
+    resolved = client.get("/admin/change-requests?status=resolved",
+                           headers=auth(admin_token)).json()
+    assert resolved["resolved_count"] == 1
+    resolved_item = next(i for i in resolved["items"] if i["id"] == cr_id)
+    assert resolved_item["resolution_note"] == "re-renderizado con fuente más grande"
+
+    # Reabrir lo vuelve a poner pendiente.
+    res = client.post(f"/admin/change-requests/{cr_id}/reopen", headers=auth(admin_token))
+    assert res.status_code == 200
+    pending = client.get("/admin/change-requests?status=pending",
+                          headers=auth(admin_token)).json()
+    assert pending["pending_count"] == 1
+
+
+def test_change_request_notification_failure_does_not_break_submit(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """Si el envío de mail explota (SMTP caído, etc.) el pedido se guarda
+    igual — la notificación es best-effort, nunca debe tirar la request de
+    UMG. La excepción queda contenida en el thread daemon."""
+    client.post(f"/admin/deliveries/from-job/{approved_job.job_id}",
+                headers=auth(admin_token), json={})
+    items = client.get("/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN}).json()
+    delivery_id = items["songs"][0]["versions"][0]["delivery_id"]
+
+    with patch("main.emails.send_umg_change_request_notification",
+               side_effect=RuntimeError("smtp down")):
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": "cambiar el fondo"},
+        )
+        assert res.status_code == 200, res.text
