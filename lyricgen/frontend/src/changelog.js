@@ -7,14 +7,17 @@
 //   id           string único y estable (se usa para el tracking de "visto").
 //   date         "YYYY-MM-DD".
 //   titleKey     clave i18n del título (en src/i18n.jsx, es/en/pt).
-//   taglineKey   opcional, EL gancho de una línea — es lo único que el MODAL
-//                muestra además del título (ver nota de diseño abajo).
+//   taglineKey   opcional, EL gancho de una línea del modal y el panel.
 //   bodyKey      clave i18n del cuerpo (fallback del panel si no hay
 //                highlightKeys; el modal no lo usa).
 //   highlightKeys opcional, array de claves — bullets de detalle, SOLO
 //                visibles en el panel (WhatsNewPanel), nunca en el modal.
-//   visual       opcional: "transcription" | "textcase" | "cinema" | "media".
-//                Los tres primeros renderizan demos nativas sin assets.
+//   modalFeatures opcional, array de { titleKey, bodyKey } — beneficios
+//                explicados dentro del modal cuando un lanzamiento necesita
+//                más contexto que el teaser corto.
+//   visual       opcional: "control" | "transcription" | "textcase" |
+//                "cinema" | "media". Los primeros cuatro renderizan demos
+//                nativas sin assets.
 //   media        opcional, path en public/ (.mp4 = video loop; otro = imagen).
 //                Se usa cuando visual="media" o como fallback.
 //   ctaKey       opcional, clave i18n del botón de acción.
@@ -24,13 +27,32 @@
 // Para "tier-ear" (right-size): una feature menor = entrada SIN featured (solo
 // aparece en el panel/campana). Una feature grande = featured:true (modal).
 //
-// DISEÑO DEL MODAL (revisión 07/07, world-class ≈ Linear/Figma/Stripe): el
-// modal es el TEASER — visual + título + UNA línea de gancho + un CTA. Nada
-// de bullets ni cuerpo largo ahí (eso hacía que se leyera como términos y
-// condiciones). El detalle completo (highlightKeys/body) vive en el panel,
-// que el usuario abre cuando quiere profundizar — no se pierde nada, solo se
-// dosifica dónde aparece.
+// DISEÑO DEL MODAL: por defecto es un teaser — visual + título + una línea de
+// gancho + CTA. Un lanzamiento compuesto puede sumar `modalFeatures` para
+// explicar 2-3 beneficios concretos sin convertir el anuncio en una ficha
+// técnica. El historial largo (highlightKeys/body) sigue viviendo en el panel.
 export const CHANGELOG = [
+  {
+    id: "mas-control-julio-v2",
+    date: "2026-07-22",
+    titleKey: "announce.control_title",
+    taglineKey: "announce.control_tagline",
+    bodyKey: "announce.control_body",
+    visual: "control",
+    highlightKeys: [
+      "announce.control_hl1",
+      "announce.control_hl2",
+      "announce.control_hl3",
+    ],
+    modalFeatures: [
+      { titleKey: "announce.control_f1_title", bodyKey: "announce.control_f1_body" },
+      { titleKey: "announce.control_f2_title", bodyKey: "announce.control_f2_body" },
+      { titleKey: "announce.control_f3_title", bodyKey: "announce.control_f3_body" },
+    ],
+    ctaKey: "announce.control_cta",
+    ctaTo: "/new",
+    featured: true,
+  },
   {
     id: "motor-v2",
     date: "2026-07-07",
@@ -45,7 +67,6 @@ export const CHANGELOG = [
     ],
     ctaKey: "announce.motor2_cta",
     ctaTo: "/new",
-    featured: true,
   },
   {
     id: "estilo-abc",

@@ -38,7 +38,7 @@ export default function WhatsNewPanel({ onClose }) {
         role="dialog"
         aria-modal="true"
         aria-label={t("whatsnew.title") || "Novedades"}
-        className="h-full w-full max-w-md overflow-y-auto bg-surface-2 shadow-glow ring-1 ring-white/[0.06]"
+        className="h-full w-full max-w-md overflow-y-auto bg-surface-2 shadow-depth-lg ring-1 ring-white/[0.06]"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="sticky top-0 z-10 border-b border-white/[0.06] bg-surface-2/95 px-5 py-4 backdrop-blur-xl">
@@ -65,7 +65,7 @@ export default function WhatsNewPanel({ onClose }) {
           <p className="p-6 text-[12px] text-ink-secondary">{t("whatsnew.empty") || "No hay novedades por ahora."}</p>
         ) : (
           <div className="space-y-5 p-4">
-            <article className="overflow-hidden rounded-card bg-surface/45 ring-1 ring-white/[0.06]">
+            <article className="overflow-hidden rounded-xl bg-surface/45 ring-1 ring-white/[0.06]">
               <ReleaseVisual entry={latest} compact />
               <div className="p-4">
                 <p className="text-[10px] uppercase tracking-[0.16em] text-gray-500">{fmtDate(latest.date, lang)}</p>

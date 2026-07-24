@@ -84,7 +84,7 @@ export function defaultSubTab(sectionId) {
 export default function AdminSidebar({ section, subTab, onNavigate, badges = {}, showInsights = false }) {
   const items = NAV.filter((item) => item.id !== "insights" || showInsights);
   return (
-    <nav className="w-52 shrink-0 space-y-1">
+    <nav className="admin-subnav" aria-label="Secciones de administración">
       {items.map((item) => {
         const isActive = section === item.id;
         return (
@@ -92,6 +92,7 @@ export default function AdminSidebar({ section, subTab, onNavigate, badges = {},
             <button
               type="button"
               onClick={() => onNavigate(item.id, defaultSubTab(item.id))}
+              aria-current={isActive ? "page" : undefined}
               className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-button text-left transition-colors duration-brand ${
                 isActive
                   ? "bg-brand/15 ring-1 ring-brand/30 text-white"
@@ -119,6 +120,7 @@ export default function AdminSidebar({ section, subTab, onNavigate, badges = {},
                     key={st.id}
                     type="button"
                     onClick={() => onNavigate(item.id, st.id)}
+                    aria-pressed={subTab === st.id}
                     className={`block w-full text-left px-3 py-1.5 rounded-md text-caption transition-colors duration-brand ${
                       subTab === st.id
                         ? "text-white bg-white/[0.05]"

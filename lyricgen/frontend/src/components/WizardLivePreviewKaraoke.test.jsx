@@ -165,6 +165,14 @@ describe("WizardLivePreview — Phase C respects lyricsAnimation", () => {
     const allSpans = [...container.querySelectorAll("span")];
     const hasKaraokeColor = allSpans.some((el) => /19E0BC|25,\s*224,\s*188/i.test(el.style.color || ""));
     expect(hasKaraokeColor).toBe(false);
+    // `none` also means no line-level fade/translate. Besides matching the
+    // selected option, this prevents a composited text-layer rectangle from
+    // flashing over moving video when the active line changes.
+    const lyric = [...container.querySelectorAll("div")].find(
+      (el) => el.classList.contains("font-extrabold") && el.textContent.includes("uno dos tres"),
+    );
+    expect(lyric).toBeTruthy();
+    expect(lyric.style.animation).toBe("");
   });
 
   it("pop: line rendered plain (the line-level animation runs on the wrapper, not per word)", async () => {

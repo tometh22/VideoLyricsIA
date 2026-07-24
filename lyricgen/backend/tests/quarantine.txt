@@ -39,7 +39,6 @@ tests/test_queue_retry.py::test_callback_surfaces_real_pipeline_error_to_user
 tests/test_quota.py::test_approval_from_previous_month_does_not_count_this_month
 tests/test_quota.py::test_approved_this_month_counts
 tests/test_quota.py::test_created_last_month_approved_this_month_counts_this_month
-tests/test_quota.py::test_other_tenant_isolation
 tests/test_quota.py::test_pre_approval_does_not_count
 tests/test_quota.py::test_rejected_does_not_count_even_if_previously_approved
 tests/test_reaper.py::test_completed_veo_call_is_never_orphan
@@ -79,10 +78,3 @@ tests/test_settings_saas.py::test_revoke_others
 tests/test_settings_saas.py::test_revoke_session_blocks_token
 tests/test_settings_saas.py::test_team_members_same_tenant
 tests/test_source_audio_url.py::test_source_audio_url_returns_signed_url
-tests/test_tenant_isolation.py::test_bulk_delete_skips_other_tenants
-tests/test_tenant_isolation.py::test_delete_404_across_tenants
-tests/test_tenant_isolation.py::test_get_job_scoped_call_does_not_log_warning
-tests/test_tenant_isolation.py::test_provenance_404_across_tenants
-tests/test_tenant_isolation.py::test_status_404_across_tenants
-tests/test_tenant_isolation.py::test_two_tenants_do_not_see_each_others_jobs
-tests/test_tenant_isolation.py::test_two_users_same_tenant_share_jobs

@@ -1,15 +1,17 @@
 """Admin panel API for GenLy AI."""
 
+import asyncio
 import logging
 import os
 import shutil
+import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
@@ -19,9 +21,10 @@ from auth import (
     pwd_context,
     telemetry_enabled,
     validate_password_strength,
-    _super_admin_allowlist,
+    is_explicitly_local_environment,
+    is_super_admin,
 )
-from database import User, Job, Invoice, AuditLog, AIProvenance, AssetUsage, BackgroundAsset, UserSession, get_db
+from database import User, Job, Invoice, AuditLog, AIProvenance, AssetUsage, BackgroundAsset, UserSession, LoginSession, get_db
 from error_taxonomy import classify_error
 
 BACKGROUNDS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
@@ -52,20 +55,111 @@ def require_super_admin(current_user: dict = Depends(get_current_user)):
     cliente: un admin local de un tenant no debería verla. Cuando
     SUPER_ADMIN_USERS está seteado (ej. en prod:
     "tomas@epical.digital,agus.cafisi"), solo esos usuarios —
-    identificados por username o email — pasan. Sin la var (dev/tests/
-    staging) alcanza con role=admin, igual que require_admin.
+    identificados por username o email — pasan. Sin la var, dev/tests
+    conservan el fallback de admin; cualquier entorno desplegado o
+    desconocido falla cerrado.
     """
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    allow = _super_admin_allowlist()
-    if allow:
-        idents = {
-            (current_user.get("username") or "").lower(),
-            (current_user.get("email") or "").lower(),
-        }
-        if not (idents & allow):
-            raise HTTPException(status_code=403, detail="Super admin access required")
+    if not is_super_admin(
+        current_user.get("username"),
+        current_user.get("email"),
+        current_user.get("role"),
+    ):
+        raise HTTPException(status_code=403, detail="Super admin access required")
     return current_user
+
+
+def _requires_durable_background_storage() -> bool:
+    """Only explicitly local environments may persist catalogue files locally."""
+    return not is_explicitly_local_environment()
+
+
+class SubmissionsControlRequest(BaseModel):
+    paused: bool
+    reason: str = Field(default="", max_length=500)
+    until: Optional[datetime] = None
+    retry_after: int = Field(default=60, ge=1, le=3600)
+
+
+class GlobalLogoutRequest(BaseModel):
+    confirmation: str
+    reason: str = Field(default="security cutover", max_length=500)
+
+
+@router.get("/ops/submissions")
+def get_submissions_control(
+    admin: dict = Depends(require_super_admin),
+):
+    from ops_control import get_submissions_state
+    return get_submissions_state()
+
+
+@router.put("/ops/submissions")
+def update_submissions_control(
+    body: SubmissionsControlRequest,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from ops_control import set_submissions_state
+    try:
+        state = set_submissions_state(
+            paused=body.paused,
+            reason=body.reason,
+            until=body.until,
+            retry_after=body.retry_after,
+        )
+    except Exception as exc:
+        logger.exception("Could not update submissions control")
+        raise HTTPException(status_code=503, detail="Operations control unavailable") from exc
+    db.add(AuditLog(
+        user_id=admin.get("id"),
+        action="ops.submissions.updated",
+        detail={
+            "paused": state["paused"],
+            "reason": state["reason"],
+            "until": state.get("until"),
+            "retry_after": state["retry_after"],
+        },
+    ))
+    db.commit()
+    return state
+
+
+@router.post("/ops/logout-all")
+def logout_all_users(
+    body: GlobalLogoutRequest,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """Irreversibly invalidate every browser access token and session."""
+    if body.confirmation != "LOGOUT_ALL_USERS":
+        raise HTTPException(status_code=400, detail="Explicit confirmation required")
+    now = datetime.now(timezone.utc)
+    users_updated = db.query(User).update(
+        {User.auth_version: User.auth_version + 1},
+        synchronize_session=False,
+    )
+    sessions_revoked = (
+        db.query(LoginSession)
+        .filter(LoginSession.revoked_at.is_(None))
+        .update({LoginSession.revoked_at: now}, synchronize_session=False)
+    )
+    db.add(AuditLog(
+        user_id=admin.get("id"),
+        action="auth.global_logout",
+        detail={
+            "reason": body.reason,
+            "users_updated": users_updated,
+            "sessions_revoked": sessions_revoked,
+        },
+    ))
+    db.commit()
+    return {
+        "ok": True,
+        "users_updated": users_updated,
+        "sessions_revoked": sessions_revoked,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1214,7 +1308,7 @@ async def admin_activity_detail(
 @router.get("/backgrounds")
 async def list_backgrounds(
     owner_tenant_id: Optional[str] = Query(None),
-    admin: dict = Depends(require_admin),
+    admin: dict = Depends(require_super_admin),
     db: Session = Depends(get_db),
 ):
     """List all background assets.
@@ -1234,7 +1328,7 @@ async def list_backgrounds(
 
 @router.get("/background-tenants")
 async def list_background_tenants(
-    admin: dict = Depends(require_admin),
+    admin: dict = Depends(require_super_admin),
     db: Session = Depends(get_db),
 ):
     """List the tenants that have at least one user, plus the special
@@ -1254,7 +1348,7 @@ async def upload_background(
     name: str = Form(...),
     tags: str = Form(""),
     owner_tenant_id: str = Form(""),
-    admin: dict = Depends(require_admin),
+    admin: dict = Depends(require_super_admin),
     db: Session = Depends(get_db),
 ):
     """Upload a new pre-approved background asset.
@@ -1291,17 +1385,78 @@ async def upload_background(
     with open(local_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
+    # Validate bytes before the object becomes visible in the catalogue.
+    # The old endpoint trusted only the extension, which allowed the test
+    # fixtures (zero-filled ``.mp4`` files) and malformed uploads to become
+    # selectable production backgrounds.
+    from main import _validate_background_file_on_disk
+    _validate_background_file_on_disk(file.filename, local_path)
+    try:
+        probe = await asyncio.to_thread(
+            subprocess.run,
+            [
+                "ffmpeg", "-nostdin", "-v", "error", "-xerror",
+                "-i", local_path,
+                "-map", "0:v:0",
+                "-f", "null", "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        try:
+            os.unlink(local_path)
+        except OSError:
+            pass
+        logger.error("Background validation infrastructure failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Background validation is temporarily unavailable.",
+        ) from exc
+    if probe.returncode != 0:
+        try:
+            os.unlink(local_path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=400,
+            detail="File could not be decoded as supported background media.",
+        )
+
     stored_filename = unique_basename
-    if storage.is_enabled():
+    storage_enabled = storage.is_enabled()
+    if not storage_enabled and _requires_durable_background_storage():
+        try:
+            os.unlink(local_path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=503,
+            detail="Background storage is not configured.",
+        )
+    if storage_enabled:
         r2_key = f"library/{unique_basename}"
         try:
-            storage.upload_file(local_path, r2_key)
+            uploaded_key = storage.upload_file(local_path, r2_key)
+            if uploaded_key != r2_key:
+                raise RuntimeError("R2 upload did not confirm the object key")
             stored_filename = r2_key  # the `library/` prefix is the signal
             os.unlink(local_path)
         except Exception as e:
             logger.error(f"Failed to upload library asset to R2: {e}")
-            # Keep the local copy as a fallback. Filename stays as the
-            # bare basename so the read path uses the disk branch.
+            # A local fallback is not durable across Railway replicas or
+            # deploys. Fail closed and never create a DB row pointing at one
+            # container's ephemeral filesystem.
+            try:
+                os.unlink(local_path)
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=503,
+                detail="Background storage is temporarily unavailable.",
+            ) from e
 
     tenant_scope = (owner_tenant_id or "").strip() or None
     asset = BackgroundAsset(
@@ -1334,7 +1489,7 @@ async def upload_background(
 @router.delete("/backgrounds/{asset_id}")
 async def delete_background(
     asset_id: int,
-    admin: dict = Depends(require_admin),
+    admin: dict = Depends(require_super_admin),
     db: Session = Depends(get_db),
 ):
     """Delete a background asset (DB row + the underlying object)."""
@@ -1345,12 +1500,21 @@ async def delete_background(
         raise HTTPException(status_code=404, detail="Asset not found")
 
     # Delete the underlying object — R2 if it lives there, local disk otherwise.
-    if asset.filename.startswith("library/") and storage.is_enabled():
+    if asset.filename.startswith("library/"):
+        if not storage.is_enabled():
+            raise HTTPException(
+                status_code=503,
+                detail="Background storage is not configured.",
+            )
         try:
             client = storage._get_client()
             client.delete_object(Bucket=storage.R2_BUCKET, Key=asset.filename)
         except Exception as e:
-            logger.warning(f"Failed to delete R2 object {asset.filename}: {e}")
+            logger.error(f"Failed to delete R2 object {asset.filename}: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail="Background storage is temporarily unavailable.",
+            ) from e
     else:
         file_path = os.path.join(BACKGROUNDS_DIR, asset.filename)
         if os.path.exists(file_path):

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Falla con exit code 1 si encuentra `await fetch(...)` en frontend/src/
-// que NO chequea res.ok dentro de las ~12 líneas siguientes.
+// que NO chequea la respuesta dentro de las líneas siguientes.
 //
 // Motivación: el bug clásico en AdminPanel.jsx y JobDetail.jsx fue
 // hacer `await fetch(...)` y asumir que el server respondió 200. Si
@@ -36,8 +36,9 @@ const EXCLUDED_FILES = new Set([
   // tests/ no aplica si introducimos vitest en el futuro
 ]);
 
-// Cuántas líneas después del fetch buscamos el chequeo
-const LOOKAHEAD = 12;
+// Los payloads largos y los flujos 409 pueden separar el fetch del chequeo.
+// 40 líneas sigue siendo un alcance local, pero evita falsos positivos.
+const LOOKAHEAD = 40;
 
 // Métodos que se consideran destructivos (errores) vs no-destructivos (warnings)
 const DESTRUCTIVE_METHODS = new Set(["DELETE", "PATCH", "PUT", "POST"]);
@@ -60,8 +61,18 @@ function detectMethod(lines, startIdx) {
   return match ? match[1].toUpperCase() : "GET";
 }
 
+function responseVariable(line) {
+  return line.match(/(?:(?:const|let|var)\s+)?([A-Za-z_$][\w$]*)\s*=\s*await\s+fetch\s*\(/)?.[1] || null;
+}
+
 function isCheckedAfter(lines, fetchIdx) {
   const slice = lines.slice(fetchIdx, fetchIdx + LOOKAHEAD).join("\n");
+  const variable = responseVariable(lines[fetchIdx]);
+  if (variable) {
+    const escaped = variable.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const responseCheck = new RegExp(`\\b${escaped}\\.(?:ok|status|type)\\b`);
+    if (responseCheck.test(slice)) return true;
+  }
   // Aceptamos varios patrones de check:
   return (
     /if\s*\(\s*!res\.ok/.test(slice) ||

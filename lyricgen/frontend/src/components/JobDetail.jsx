@@ -5,7 +5,7 @@ import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
 import EditRequestPanel from "./EditRequestPanel";
-import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
+import ContentValidationToggle, { isUniversalAccount } from "./ContentValidationToggle";
 import { useAlert } from "./AlertProvider";
 import HelpTip from "./HelpCenter/HelpTip";
 import EnableProResModal from "./EnableProResModal";
@@ -13,6 +13,7 @@ import DriveTransferModal from "./DriveTransferModal";
 import VariantCreateModal from "./VariantCreateModal";
 import ScenesFilmstrip from "./ScenesFilmstrip";
 import SceneEditModal from "./SceneEditModal";
+import MediaPreview from "./MediaPreview";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -394,6 +395,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // flipped to true the moment the POST succeeds, so the user sees the
   // "Ya en UMG" state immediately without a poll round-trip.
   const currentUser = readCurrentUser();
+  // Server-authoritative feature flag. Absence is OFF so an old cached user
+  // cannot expose mutating publish actions during a backend shutdown.
+  const youtubePublishingEnabled = currentUser?.features?.youtube_publish === true;
   const isUmgAdmin = currentUser?.role === "admin";
   const [sendingUmg, setSendingUmg] = useState(false);
   const [isInUmgPortal, setIsInUmgPortal] = useState(
@@ -461,8 +465,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // bypass/force in the POST /retry body. See ContentValidationToggle.jsx
   // for full rationale.
   const _retryTenantId = currentUser?.tenant_id || null;
-  const _retryIsUmg = isUmgTenant(_retryTenantId);
-  const [retryValidationEnabled, setRetryValidationEnabled] = useState(_retryIsUmg);
+  const _retryBillingGroup = currentUser?.billing_group || null;
+  const _retryIsUmg = isUniversalAccount(_retryTenantId, _retryBillingGroup);
+  const [retryValidationEnabled, setRetryValidationEnabled] = useState(true);
   const showRetrySpecSelector =
     (job.delivery_profile === "umg" || job.delivery_profile === "both") &&
     job.umg_spec != null;
@@ -489,8 +494,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       // If the caller (or the dropdown) gave us a frame_size that
       // differs from what's currently on the job, pass it in the body.
       // Otherwise call /retry plain — backend keeps the existing spec.
-      // Tenant-aware validation flag: translate the toggle's boolean to
-      // bypass (UMG departing default) or force (non-UMG departing default).
+      // Persist the current mutually-exclusive policy choice. The backend is
+      // authoritative: Universal always validates; elsewhere a bypass also
+      // requires an explicit people prompt.
       const wantFrameOverride = fs && fs !== job.umg_spec?.frame_size;
       const bodyPayload = {};
       if (wantFrameOverride) bodyPayload.frame_size = fs;
@@ -513,7 +519,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       }
       const res = await fetch(`${API}/retry/${job.job_id}`, fetchOpts);
       if (res.ok) {
-        const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
+        const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
+        if (!statusRes.ok) throw new Error(`Error ${statusRes.status}`);
+        const updated = await statusRes.json();
         onJobUpdate?.(updated);
         // Navigate back so the user sees the batch/history with the job now processing.
         onBack?.();
@@ -545,8 +553,17 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
 
   // Short-lived media URLs (re-fetch when the active tab changes).
   const previewMediaType = activeTab === "thumbnail" ? "thumbnail" : activeTab;
-  const previewSrc = useMediaUrl(job.job_id, previewMediaType, "preview");
-  const downloadHref = useMediaUrl(job.job_id, previewMediaType, "download");
+  // Render-version key so the player reloads when an edit finishes. Edits
+  // overwrite the SAME R2 key, so without this the <video src> never changes
+  // and a mounted player keeps showing the pre-edit render forever (UMG
+  // "no me lo está actualizando", job eaff5c7baf50 — 4 edits OK server-side,
+  // operator kept seeing v0 and burned her 3 edits re-requesting them).
+  // Why edit_count AND status: edit_count bumps when the edit is REQUESTED
+  // (pending_review→editing), not when it completes — status flipping back
+  // to pending_review is the completion signal that must swap the URL.
+  const mediaVersion = `${job.edit_count || 0}-${job.status || ""}`;
+  const previewSrc = useMediaUrl(job.job_id, previewMediaType, "preview", mediaVersion);
+  const downloadHref = useMediaUrl(job.job_id, previewMediaType, "download", mediaVersion);
 
   // Auto-retry the <video> load. A just-finished job flips to
   // pending_review the instant the DB row updates, but the MP4 can lag a
@@ -572,32 +589,38 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const isDone = job.status === "done";
   const isRejected = job.status === "rejected";
   const isEditing = job.status === "editing";
+  const isActivelyProcessing = new Set([
+    "awaiting_upload", "queued", "processing", "editing",
+    "transcribing", "transcribing_queued", "bg_preview_queued",
+  ]).has(job.status);
   const isValidationFailed = job.status === "validation_failed";
   const isError = job.status === "error";
-  // Lyrics edit is allowed on done/pending_review/rejected per backend
-  // validation (main.py:/edit). The panel renders for ANY of those
-  // statuses with allowedModes scoped per state:
-  //   - pending_review → all three (operator is reviewing, full toolkit)
-  //   - done           → lyrics only (video already accepted, only typo
-  //                                    corrections warrant re-render)
-  //   - rejected       → lyrics only (recovery path instead of re-upload)
-  const canEditLyrics = isPendingReview || isDone || isRejected;
-  // Jobs multi-escena: el modo "Fondo" queda afuera del panel — ese edit
-  // pertenece al mundo fondo-único (regenera UN clip y pisaba el timeline
-  // de escenas; incidente 2026-07-01). Para escenas, la regeneración va
-  // por el filmstrip (por escena, sin consumir cupo). El backend además
-  // lo rechaza con 400 por si llega igual.
-  const _hasScenes = !!(job.scene_plan && job.scene_plan.scenes && job.scene_plan.scenes.length);
-  const editPanelAllowedModes = isPendingReview
-    ? (_hasScenes ? ["lyrics"] : ["lyrics", "background"])
-    : ["lyrics"];
+  // An edit that failed AFTER a prior successful render: the deliverable in R2 is
+  // untouched (the pipeline only flips status=error, it never clears s3_keys), so
+  // the previous video is still intact. Surfaced to reassure operators who see a
+  // cryptic "Edit falló" and assume they lost the video / must re-upload.
+  const hasPriorDeliverable = !!(
+    (job.s3_keys && job.s3_keys.video) || job.video_url || job.thumbnail_url
+  );
+  const isEditFailureWithPriorVideo =
+    isError && (job.edit_count || 0) > 0 && hasPriorDeliverable;
+  // Editar = una sola vía: el wizard. El panel muestra UN botón "Editar y
+  // re-renderizar" que abre el Studio Console (/videos/:id/edit-lyrics),
+  // donde el operador cambia lo que sea — título, artista, letra,
+  // tipografía, timing y también el FONDO (regen IA vía "Regenerar fondo
+  // (nueva versión)" o swap de biblioteca). La tarjeta separada "Regenerar
+  // fondo" se plegó al wizard (unificación 2026-07-24): dos entradas para
+  // lo mismo confundían y dejaban el fondo "trabado" fuera del wizard.
+  // Disponible en done/pending_review/rejected (el backend valida el /edit).
+  // Art track = "official audio" sin letra: no hay letra que editar.
+  const isArtTrack = !!(job.art_track ?? job.render_params?.art_track);
+  const canEditLyrics = (isPendingReview || isDone || isRejected) && !isArtTrack;
 
-  // While the worker is re-rendering an edit request, poll /status every
-  // 5s and propagate updates up so the rest of the screen (status badge,
-  // approve panel visibility, preview URLs) stays in sync. The interval
-  // cleans itself up the moment status leaves "editing".
+  // A detail deep-link owns local state, so the root history poller cannot
+  // advance it. Poll every active state and stop at the first terminal or
+  // user-action state.
   useEffect(() => {
-    if (!isEditing) return;
+    if (!isActivelyProcessing) return;
     let cancelled = false;
     const tick = async () => {
       try {
@@ -614,7 +637,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     tick(); // first tick immediately, no need to wait 5s
     return () => { cancelled = true; clearInterval(iv); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isEditing, job.job_id]);
+  }, [isActivelyProcessing, job.job_id]);
 
   // Hooks moved before early returns (React rules of hooks: no hooks after
   // conditional returns). These were previously declared after the
@@ -1005,6 +1028,15 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           <p className="text-sm font-semibold text-red-300 mb-1">{t("detail.error_title") || "El video falló durante la generación"}</p>
           <p className="text-xs text-red-400/70 mb-4">{job.error || t("detail.error_unknown") || "Error desconocido"}</p>
 
+          {isEditFailureWithPriorVideo && (
+            <div className="rounded-lg bg-emerald-500/[0.07] ring-1 ring-emerald-500/20 px-3 py-2.5 mb-4">
+              <p className="text-xs text-emerald-300/90">
+                {t("detail.edit_failed_prior_safe") ||
+                  "Tu video anterior sigue intacto: el error fue solo al aplicar la edición. Podés reintentar sin volver a subir el audio."}
+              </p>
+            </div>
+          )}
+
           {showRetrySpecSelector && (
             <div className="mb-3">
               <label className="text-[11px] text-gray-400 uppercase tracking-wider block mb-1.5">
@@ -1303,13 +1335,33 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         headers: { ...authHeaders(), "Content-Type": "application/json" },
         body: JSON.stringify({ notes: reviewNotes }),
       });
-      if (res.ok) {
-        const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
-        onJobUpdate?.(updated);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `${t("detail.approve_error_description")} (${res.status})`);
       }
-    } catch {}
-    setApproving(false);
-    approveLockRef.current = false;
+      try {
+        const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
+        if (!statusRes.ok) throw new Error(`${t("detail.refresh_error_description")} (${statusRes.status})`);
+        const updated = await statusRes.json();
+        onJobUpdate?.(updated);
+      } catch (refreshError) {
+        onJobUpdate?.({ ...job, status: "done" });
+        alert({
+          title: t("detail.refresh_warning_title"),
+          description: refreshError?.message || t("detail.refresh_error_description"),
+          tone: "warning",
+        });
+      }
+    } catch (err) {
+      alert({
+        title: t("detail.approve_error_title"),
+        description: err?.message || t("detail.approve_error_description"),
+        tone: "error",
+      });
+    } finally {
+      setApproving(false);
+      approveLockRef.current = false;
+    }
   };
 
   // handleRetry está definida más arriba (~línea 175) para que esté
@@ -1325,21 +1377,39 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         headers: { ...authHeaders(), "Content-Type": "application/json" },
         body: JSON.stringify({ notes: reviewNotes }),
       });
-      if (res.ok) {
-        // Refresh the job state for any listing in the parent so the row
-        // shows "rejected", then go back. Staying on the detail screen
-        // would show "this job is not previewable" because rejected jobs
-        // intentionally can't be re-opened — better UX is to land the
-        // user back on the dashboard / batch view.
-        try {
-          const updated = await (await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() })).json();
-          onJobUpdate?.(updated);
-        } catch {}
-        onBack?.();
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `${t("detail.reject_error_description")} (${res.status})`);
       }
-    } catch {}
-    setApproving(false);
-    approveLockRef.current = false;
+      // Refresh the job state for any listing in the parent so the row
+      // shows "rejected", then go back. Staying on the detail screen
+      // would show "this job is not previewable" because rejected jobs
+      // intentionally can't be re-opened — better UX is to land the
+      // user back on the dashboard / batch view.
+      try {
+        const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
+        if (!statusRes.ok) throw new Error(`${t("detail.refresh_error_description")} (${statusRes.status})`);
+        const updated = await statusRes.json();
+        onJobUpdate?.(updated);
+      } catch (refreshError) {
+        onJobUpdate?.({ ...job, status: "rejected" });
+        alert({
+          title: t("detail.refresh_warning_title"),
+          description: refreshError?.message || t("detail.refresh_error_description"),
+          tone: "warning",
+        });
+      }
+      onBack?.();
+    } catch (err) {
+      alert({
+        title: t("detail.reject_error_title"),
+        description: err?.message || t("detail.reject_error_description"),
+        tone: "error",
+      });
+    } finally {
+      setApproving(false);
+      approveLockRef.current = false;
+    }
   };
 
   // ProRes button visibility — gated by delivery profile + done status,
@@ -1388,7 +1458,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   ];
 
   return (
-    <div className="w-full max-w-4xl animate-fade-in">
+    <div className="job-detail-workspace w-full max-w-[1380px] mx-auto animate-fade-in">
       {/* JobDetail tour: auto-fires on the FIRST pending_review job a
           new operator opens. The tour walks through approval semantics
           + ProRes download. We read `user` from localStorage here so
@@ -1400,7 +1470,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         isPendingReview={isPendingReview}
       />
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 mb-8">
+      <div className="job-detail-command flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4 mb-6">
         <div className="flex items-center gap-3 min-w-0">
           <button onClick={onBack}
             className="w-9 h-9 shrink-0 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors">
@@ -1419,6 +1489,11 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               <h2 className="text-xl font-bold tracking-tight truncate">
                 {job.song_title || name}
               </h2>
+              {isArtTrack && (
+                <span className="px-2 py-0.5 rounded-full bg-fuchsia-500/15 text-fuchsia-300 ring-1 ring-fuchsia-500/30 text-[10px] font-semibold uppercase tracking-wider">
+                  {t("detail.art_track_badge") || "Art Track"}
+                </span>
+              )}
               {isPendingReview && (
                 <span
                   data-tour="jobdetail-status-badge"
@@ -1463,7 +1538,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             </p>
           </div>
         </div>
-        <div className="flex flex-wrap gap-2">
+        <div className="job-detail-actions flex flex-wrap gap-2">
           {canDownload && (() => {
             // All profiles (youtube, umg, both) now produce the MP4 +
             // short + thumbnail set in the pipeline, so "Descargar todo"
@@ -1542,7 +1617,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               {t("detail.create_variant") || "Crear variante"}
             </button>
           )}
-          {canDownload && !youtubeResult && (
+          {youtubePublishingEnabled && canDownload && !youtubeResult && (
             <button onClick={previewMetadata} className="btn-primary text-xs h-10 px-5">
               <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
@@ -1559,7 +1634,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               {t("detail.view_youtube")}
             </a>
           )}
-          {canDownload && !youtubeShortResult && (
+          {youtubePublishingEnabled && canDownload && !youtubeShortResult && (
             <button onClick={previewShortMetadata} className="btn-secondary text-xs h-10 px-5">
               <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
@@ -1616,6 +1691,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               value={retryValidationEnabled}
               onChange={setRetryValidationEnabled}
               tenantId={_retryTenantId}
+              billingGroup={_retryBillingGroup}
               disabled={retrying}
               initialOpen={true}
             />
@@ -1707,33 +1783,26 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         <>
           <div
             data-tour="jobdetail-preview"
-            className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4"
+            className={`job-detail-media-frame rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4 mx-auto ${
+              activeTab === "short"
+                ? "job-detail-media-frame--short"
+                : "job-detail-media-frame--landscape"
+            }`}
           >
             {activeTab === "thumbnail" ? (
-              previewSrc ? (
-                <img
-                  src={previewSrc}
-                  alt="Thumbnail"
-                  className="w-full max-h-[500px] object-contain bg-black/40"
-                />
-              ) : (
-                <div className="w-full h-[500px] bg-black/40" />
-              )
+              <MediaPreview src={previewSrc} status={job.status} alt="Thumbnail" className="w-full h-full" imageClassName="bg-black/40" imageFit="contain" />
             ) : (
               previewSrc ? (
                 <video
-                  key={`${activeTab}-${videoReloadKey}`}
+                  key={`${activeTab}-${videoReloadKey}-${mediaVersion}`}
                   ref={activeTab === "video" ? videoRef : undefined}
                   src={previewSrc}
                   controls
                   onError={handleVideoError}
-                  className={`w-full bg-black/40 ${
-                    activeTab === "short" ? "max-h-[600px] mx-auto" : "max-h-[500px]"
-                  }`}
-                  style={activeTab === "short" ? { maxWidth: "340px", margin: "0 auto", display: "block" } : {}}
+                  className="job-detail-media-video w-full h-full block object-contain bg-black/40"
                 />
               ) : (
-                <div className="w-full h-[500px] bg-black/40" />
+                <MediaPreview status={job.status} className="w-full h-full" label="Preparando reproducción" />
               )
             )}
           </div>
@@ -1791,11 +1860,8 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       {canEditLyrics && (
         <EditRequestPanel
           job={job}
-          onEditTriggered={handleEditTriggered}
-          allowedModes={editPanelAllowedModes}
-          // El click "Editar lyrics" abre el Studio Console en su ruta
-          // dedicada (mismo layout 3-col que /new) en vez del modal
-          // fullscreen interno. El background mode del panel queda intacto.
+          // Única acción: abrir el Studio Console (mismo layout 3-col que
+          // /new). Todo el editing —incluido el fondo— vive ahí ahora.
           onLyricsClick={() => navigate(`/videos/${job.job_id}/edit-lyrics`)}
         />
       )}
@@ -1962,7 +2028,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       )}
 
       {/* YouTube Panel (only for approved/done jobs) */}
-      {canDownload && showYoutubePanel && (
+      {youtubePublishingEnabled && canDownload && showYoutubePanel && (
         <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-6 animate-fade-in">
           <h3 className="font-semibold mb-4 flex items-center gap-2">
             <svg className="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24">
@@ -2121,7 +2187,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       )}
 
       {/* YouTube Shorts Panel */}
-      {canDownload && showYoutubeShortPanel && (
+      {youtubePublishingEnabled && canDownload && showYoutubeShortPanel && (
         <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] p-6 animate-fade-in">
           <h3 className="font-semibold mb-4 flex items-center gap-2">
             <svg className="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24">

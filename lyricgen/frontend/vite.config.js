@@ -19,6 +19,22 @@ export default defineConfig({
       open: false,
     }),
   ].filter(Boolean),
+  build: {
+    rollupOptions: {
+      output: {
+        // Stable shared chunks keep the app shell small and let browsers cache
+        // large, rarely-changing catalogs/SDKs independently of product code.
+        manualChunks(id) {
+          if (id.endsWith("/src/i18n.jsx")) return "i18n";
+          if (!id.includes("node_modules")) return undefined;
+          if (id.includes("@sentry")) return "sentry-vendor";
+          if (id.includes("react-joyride") || id.includes("@floating-ui")) return "tour-vendor";
+          if (/node_modules\/(react|react-dom|react-router|react-router-dom|scheduler)\//.test(id)) return "react-vendor";
+          return undefined;
+        },
+      },
+    },
+  },
   server: {
     allowedHosts: true,
     proxy: {
@@ -26,9 +42,18 @@ export default defineConfig({
       "/upload": "http://localhost:8000",
       "/transcribe": "http://localhost:8000",
       "/generate": "http://localhost:8000",
+      // SSE de progreso del render (pollJob). Sin esto el dev server sirve
+      // index.html (text/html) en vez del stream → el EventSource falla y la
+      // barra "Armando el video" queda trabada. En prod va directo a la API
+      // (VITE_API_URL), así que este proxy es solo para dev local.
+      "/events": { target: "http://localhost:8000", changeOrigin: true },
       "/status": "http://localhost:8000",
       "/download": "http://localhost:8000",
       "/preview": "http://localhost:8000",
+      // Token scoped por (job, file_type) que piden los <video>/<img> antes de
+      // cargar media desde /download|/preview. Sin proxearlo el dev server
+      // devuelve 404 → "Miniatura no disponible" / player negro en local.
+      "/media-token": "http://localhost:8000",
       "/jobs": "http://localhost:8000",
       "/youtube": "http://localhost:8000",
       "/settings": "http://localhost:8000",

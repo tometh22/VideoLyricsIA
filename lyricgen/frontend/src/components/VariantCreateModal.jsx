@@ -1,14 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import BackgroundHintField from "./BackgroundHintField";
-import ContentValidationToggle, { isUmgTenant } from "./ContentValidationToggle";
+import ContentValidationToggle from "./ContentValidationToggle";
+import useDialogA11y from "../hooks/useDialogA11y";
 
-function _readTenant() {
+function _readAccount() {
   try {
     const u = JSON.parse(localStorage.getItem("genly_user") || "null");
-    return u?.tenant_id || null;
+    return {
+      tenantId: u?.tenant_id || null,
+      billingGroup: u?.billing_group || null,
+    };
   } catch {
-    return null;
+    return { tenantId: null, billingGroup: null };
   }
 }
 
@@ -61,11 +65,10 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
   const [backgroundHint, setBackgroundHint] = useState(_initialHint);
   const [concept, setConcept] = useState(initialConcept);
   // Tenant-aware content-validation choice. See EditRequestPanel for
-  // the full rationale. value=true means "run validator"; default per
-  // tenant (UMG validates, others skip).
-  const _tenantId = _readTenant();
-  const _isUmg = isUmgTenant(_tenantId);
-  const [validationEnabled, setValidationEnabled] = useState(_isUmg);
+  // the full rationale. value=true means "run validator". Universal is fixed;
+  // common accounts can explicitly choose the existing fondo-libre mode.
+  const { tenantId: _tenantId, billingGroup: _billingGroup } = _readAccount();
+  const [validationEnabled, setValidationEnabled] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
   // Guard sincrónico contra doble click (mismo patrón que EditRequestPanel
@@ -74,6 +77,7 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
   const submitLockRef = useRef(false);
   const mountedRef = useRef(true);
   useEffect(() => () => { mountedRef.current = false; }, []);
+  const dialogRef = useDialogA11y({ onClose, closeOnEscape: !submitting });
 
   const submit = async () => {
     if (submitLockRef.current || submitting) return;
@@ -111,12 +115,10 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
     // backend defaulted to UMG-validate. Real incident 2026-05-19:
     // operator picked "fondo libre", job validated and failed anyway.
     //
-    // Backend gating (pipeline.py): bypass=True forces SKIP, force=True
-    // forces VALIDATE — regardless of tenant. So sending the flag
-    // unconditionally is correct: it always matches operator intent and
-    // only "departs" from default when the operator's choice differs
-    // from their tenant's default. The flag is idempotent when it
-    // confirms the default.
+    // Backend gating (pipeline.py) remains authoritative: Universal always
+    // validates; elsewhere, bypass only permits people when this operation's
+    // prompt explicitly requests them. Sending one flag here records the
+    // current intent and prevents a stale opposite choice from surviving.
     if (!validationEnabled) {
       payload.bypass_content_validation = true;
     } else {
@@ -170,9 +172,9 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
       onClick={(e) => { if (e.target === e.currentTarget && !submitting) onClose?.(); }}
     >
-      <div className="w-full max-w-lg bg-surface-2 rounded-card ring-1 ring-white/[0.08] p-6 space-y-4">
+      <div ref={dialogRef} tabIndex={-1} className="w-full max-w-lg bg-surface-2 rounded-card ring-1 ring-white/[0.08] p-6 space-y-4" role="dialog" aria-modal="true" aria-labelledby="variant-modal-title">
         <div>
-          <h2 className="text-lg font-semibold text-white">
+          <h2 id="variant-modal-title" className="text-lg font-semibold text-white">
             {t("variant.title") || "Crear variante"}
           </h2>
           <p className="text-xs text-ink-secondary mt-1">
@@ -218,6 +220,7 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
           value={validationEnabled}
           onChange={setValidationEnabled}
           tenantId={_tenantId}
+          billingGroup={_billingGroup}
           disabled={submitting}
         />
 

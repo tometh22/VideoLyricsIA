@@ -22,11 +22,19 @@
  * Without DSN, this module logs a one-line warning and stays inert.
  */
 import * as Sentry from "@sentry/react";
+import { APP_ENV } from "./env";
 
 const DSN = import.meta.env?.VITE_SENTRY_DSN || "";
-const ENV = import.meta.env?.VITE_SENTRY_ENV
-  || import.meta.env?.MODE
-  || "dev";
+// Environment label for Sentry. Reuse APP_ENV (env.js) — the single source of
+// truth the sidebar staging-pill and <title> stamp already use — instead of
+// trusting MODE. A prod `vite build` sets MODE=production on EVERY deploy (prod
+// AND staging), so the old `VITE_SENTRY_ENV || MODE` fell back to "production"
+// on staging and poisoned prod triage: staging events arrived tagged
+// `environment: production`, and "is this hitting prod/UMG?" is the first
+// question on any incident. APP_ENV derives from the hostname (staging.* →
+// staging), so it's self-correcting and needs no per-env Vercel config.
+// An explicit VITE_SENTRY_ENV still wins if someone sets it.
+const ENV = import.meta.env?.VITE_SENTRY_ENV || APP_ENV || "dev";
 
 let _initialized = false;
 

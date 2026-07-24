@@ -21,6 +21,14 @@ bootstrap_vertex_credentials()
 # mail to a real customer's inbox.
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "production"
 
+
+def _business_alerts_enabled() -> bool:
+    """Business/churn alerts are production-only unless explicitly enabled."""
+    configured = os.environ.get("BUSINESS_ALERTS_ENABLED")
+    if configured is not None:
+        return configured.strip().lower() in ("1", "true", "yes", "on")
+    return ENVIRONMENT == "production"
+
 # --- Sentry ---
 # 2026-06-01 UMG-launch hardening: the inline sentry_sdk.init() that used
 # to live here was being silently OVERRIDDEN by the second, lighter init
@@ -29,7 +37,7 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "pr
 # All Sentry config now lives in observability.init_sentry() (single
 # source of truth, shared with worker.py).
 
-from fastapi import FastAPI, File, Form, Header, Query, UploadFile, HTTPException, Depends, Request, Response
+from fastapi import FastAPI, File, Form, Header, Query, UploadFile, HTTPException, Depends, Request, Response, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -45,6 +53,7 @@ from auth import (
     authenticate_user,
     create_token,
     start_login_session,
+    invalidate_user_access,
     create_user,
     create_password_reset_token,
     create_email_verification_token,
@@ -61,13 +70,16 @@ from auth import (
     PLANS,
     create_media_token,
     verify_media_token,
+    MEDIA_TOKEN_EXPIRE_SECONDS,
     validate_password_strength,
     has_prores_access,
     has_drive_access,
     has_scenes_access,
+    has_art_track_access,
     scenes_credit_cost,
     telemetry_enabled,
     generate_api_key,
+    is_explicitly_local_environment,
     is_super_admin,
 )
 import storage
@@ -78,6 +90,7 @@ from database import (
     BackgroundAsset, AssetUsage, Delivery, DeliveryChangeRequest,
     SalesLead, UserSession, LoginSession, UiEvent, CreditGrant,
     scoped_db, pool_stats,
+    get_deliveries_db, deliveries_added_by, DELIVERIES_DATABASE_URL,
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
@@ -432,7 +445,24 @@ async def _disconnect_receive():
     return {"type": "http.disconnect"}
 
 
+class RejectNulPathMiddleware:
+    """Reject URL paths containing a NUL before they reach DB lookups."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and "\x00" in scope.get("path", ""):
+            await JSONResponse(
+                {"detail": "Malformed request path."},
+                status_code=400,
+            )(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 app.add_middleware(DbTransientRetryMiddleware)
+app.add_middleware(RejectNulPathMiddleware)
 
 
 # --- Server-Timing header middleware ---
@@ -461,6 +491,33 @@ async def add_response_time_header(request: Request, call_next):
     return response
 
 
+@app.middleware("http")
+async def enforce_submissions_switch(request: Request, call_next):
+    """Reject new/enqueued work while allowing reads and in-flight uploads."""
+    from ops_control import get_submissions_state, is_submission_path
+
+    if is_submission_path(request.method, request.url.path):
+        state = await asyncio.to_thread(get_submissions_state)
+        if state.get("paused"):
+            from ops_metrics import increment
+            await asyncio.to_thread(increment, "submissions_blocked")
+            retry_after = str(state.get("retry_after") or 60)
+            logger.warning(
+                "[OPS] submission blocked method=%s path=%s reason=%s",
+                request.method, request.url.path, state.get("reason") or "maintenance",
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "code": "submissions_paused",
+                    "detail": state.get("reason") or "New submissions are temporarily paused.",
+                    "until": state.get("until"),
+                },
+                headers={"Retry-After": retry_after},
+            )
+    return await call_next(request)
+
+
 # --- Include routers ---
 app.include_router(billing_router)
 app.include_router(admin_router)
@@ -480,6 +537,28 @@ def on_startup():
     finally:
         db.close()
     logger.info("GenLy AI started — database initialized")
+    # Deployment lockstep evidence for the background-policy rollout. Railway
+    # runs API, Worker and ShortWorker as separate services; this line makes a
+    # mixed-commit or mixed-flag fleet immediately visible in their logs.
+    from background_policy import (
+        POLICY_ENV as _bg_policy_env,
+        POLICY_VERSION as _bg_policy_version,
+        VALID_POLICY_MODES as _bg_policy_modes,
+        policy_mode as _bg_policy_mode,
+    )
+    from observability import _resolve_release as _resolve_runtime_release
+    logger.info(
+        "[BG_POLICY][STARTUP] process=api release=%s environment=%s "
+        "policy_version=%s policy_mode=%s cache_namespace=%s",
+        _resolve_runtime_release(), ENVIRONMENT,
+        _bg_policy_version, _bg_policy_mode(), _bg_policy_version,
+    )
+    _raw_bg_policy_mode = os.environ.get(_bg_policy_env, "off").strip().lower()
+    if _raw_bg_policy_mode not in _bg_policy_modes:
+        logger.warning(
+            "[BG_POLICY][STARTUP] invalid %s=%r; resolved fail-safe to off",
+            _bg_policy_env, _raw_bg_policy_mode,
+        )
 
     # Background reaper. Daemon → dies with the container. Single
     # instance is enough; if the API ever scales horizontally, the
@@ -490,13 +569,12 @@ def on_startup():
 
     # CV3 (audit 2026-05-25) — Multi-replica coordination helper.
     # Wraps a callable in a Postgres advisory lock. Cuando hay 2+ replicas
-    # API, ambas ejecutan los daemon threads (bg_cache_cleanup, outputs_
-    # cleanup) — sin coordinación corren N veces por ciclo, generando
+    # API, ambas ejecutan los daemon threads (bg_cache_cleanup) — sin
+    # coordinación corren N veces por ciclo, generando
     # ruido Sentry, posibles double-deletes y emails duplicados. El
     # reaper YA tiene su propio lock interno; este helper extiende el
     # mismo patrón a los otros loops.
     _BG_PREVIEW_CLEANUP_LOCK_KEY = 9118364455199102
-    _OUTPUTS_CLEANUP_LOCK_KEY = 9118364455199103
 
     def _run_with_advisory_lock(lock_key: int, work_fn, *, name: str = "") -> bool:
         """Execute work_fn solo si conseguimos el advisory lock.
@@ -606,37 +684,9 @@ def on_startup():
     threading.Thread(target=_bg_preview_cleanup_loop, daemon=True, name="bg_preview_cleanup").start()
     logger.info("bg_preview cleanup thread started (TTL=24h, every 6h)")
 
-    # Outputs cleanup loop. Sweeps OUTPUTS_DIR every hour to keep
-    # local disk bounded — deletes jobs whose deliverables are on R2
-    # and retries the upload for jobs whose R2 push failed earlier.
-    # Without this, a transient R2 outage leaves multi-GB ProRes
-    # masters on disk forever and Railway disk fills over weeks.
-    def _outputs_cleanup_loop():
-        _time.sleep(120)  # let the API come up first
-        while True:
-            try:
-                def _do_outputs_cleanup():
-                    from scripts.cleanup_old_outputs import cleanup as _cleanup_outputs
-                    _cleanup_outputs()
-                # CV3 (audit 2026-05-25): gated por advisory lock para que
-                # con 2+ replicas API NO se borre el mismo job 2 veces.
-                _run_with_advisory_lock(
-                    _OUTPUTS_CLEANUP_LOCK_KEY, _do_outputs_cleanup,
-                    name="outputs_cleanup",
-                )
-            except Exception:  # pragma: no cover
-                try:
-                    import sentry_sdk
-                    sentry_sdk.capture_exception()
-                except Exception:
-                    pass
-                _time.sleep(60)
-            _time.sleep(3600)  # 1 h between passes
-
-    threading.Thread(
-        target=_outputs_cleanup_loop, daemon=True, name="outputs-cleanup",
-    ).start()
-    logger.info("outputs-cleanup thread started (every 1 h)")
+    # Output files live on each worker's isolated filesystem. Cleanup runs in
+    # worker.py; an API replica cannot recover or delete another container's
+    # render directory.
 
     # Retención de telemetría de sesiones. Las rows de user_sessions crecen
     # ~1 por usuario por sesión (no por heartbeat), así que el volumen es
@@ -750,21 +800,59 @@ def on_startup():
                 _time.sleep(60)
             _time.sleep(24 * 3600)  # diario
 
-    threading.Thread(
-        target=_business_alerts_loop, daemon=True, name="business-alerts",
-    ).start()
-    logger.info("business-alerts thread started (daily)")
+    if _business_alerts_enabled():
+        threading.Thread(
+            target=_business_alerts_loop, daemon=True, name="business-alerts",
+        ).start()
+        logger.info("business-alerts thread started (daily)")
+    else:
+        logger.info(
+            "business-alerts disabled outside production "
+            "(set BUSINESS_ALERTS_ENABLED=1 to override)"
+        )
+
+    # Tripwire de saturación del pool de Postgres — indicador LÍDER: avisa por
+    # Sentry (→ Sentinel → Telegram) ANTES de que el pool se agote y tire el
+    # QueuePool timeout a un cliente. El pool está topeado por el
+    # max_connections del plan (ver database.py); esto es la señal para actuar
+    # (PgBouncer/plan) a tiempo, no el fix del techo.
+    try:
+        import db_pool_watchdog
+        db_pool_watchdog.start()
+    except Exception as _exc:  # nunca romper el arranque por el watchdog
+        logger.warning("db-pool-watchdog no arrancó: %s", _exc)
 
 
 # --- Background library (public, authenticated) ---
 _BACKGROUNDS_LIB = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
 
 
+def _legacy_background_path(filename: str) -> str | None:
+    """Resolve a legacy local asset without permitting path traversal."""
+    if not filename or os.path.basename(filename) != filename:
+        return None
+    library_root = os.path.realpath(_BACKGROUNDS_LIB)
+    candidate = os.path.realpath(os.path.join(library_root, filename))
+    if not candidate.startswith(library_root + os.sep):
+        return None
+    return candidate
+
+
+def _background_asset_is_available(asset: "BackgroundAsset") -> bool:
+    """Whether this API/worker topology can actually materialize an asset."""
+    filename = asset.filename or ""
+    if filename.startswith("library/"):
+        # Tests/dev may model R2 rows without credentials. Deployed
+        # or unknown environments must never advertise an object they
+        # cannot fetch. Unknown values fail closed to cover config typos.
+        return storage.is_enabled() or is_explicitly_local_environment(ENVIRONMENT)
+    local_path = _legacy_background_path(filename)
+    return bool(local_path and os.path.isfile(local_path))
+
+
 def _user_can_use_asset(asset: "BackgroundAsset", current_user: dict) -> bool:
-    """Tenant gate for library assets. Admins see everything; everyone else
-    can only see assets that are global (owner_tenant_id IS NULL) or owned
-    by their own tenant. Backs the UMG exclusivity contract."""
-    if current_user.get("role") == "admin":
+    """Tenant gate: only platform super-admins bypass asset ownership."""
+    if current_user.get("is_super_admin"):
         return True
     if asset.owner_tenant_id is None:
         return True
@@ -772,10 +860,8 @@ def _user_can_use_asset(asset: "BackgroundAsset", current_user: dict) -> bool:
 
 
 def _apply_asset_tenant_filter(query, current_user: dict):
-    """Add a tenant scope to a BackgroundAsset query. Admins get the
-    unfiltered query back; everyone else gets `owner IS NULL OR owner = mine`.
-    """
-    if current_user.get("role") == "admin":
+    """Scope assets to global + caller tenant unless caller is super-admin."""
+    if current_user.get("is_super_admin"):
         return query
     from sqlalchemy import or_
     return query.filter(
@@ -786,6 +872,38 @@ def _apply_asset_tenant_filter(query, current_user: dict):
     )
 
 
+class BackgroundPreviewTokensRequest(BaseModel):
+    asset_ids: list[int] = Field(..., min_length=1, max_length=50)
+
+
+@app.post("/backgrounds/preview-tokens")
+def issue_background_preview_tokens(
+    body: BackgroundPreviewTokensRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Mint five-minute tokens for only the visible/authorized asset ids."""
+    unique_ids = list(dict.fromkeys(body.asset_ids))
+    query = db.query(BackgroundAsset).filter(BackgroundAsset.id.in_(unique_ids))
+    if not current_user.get("is_super_admin"):
+        query = query.filter(BackgroundAsset.is_active == True)
+    assets = _apply_asset_tenant_filter(query, current_user).all()
+    visible = {
+        asset.id for asset in assets
+        if _background_asset_is_available(asset)
+    }
+    user_model = db.query(User).filter(User.id == current_user["id"]).first()
+    return {
+        "tokens": {
+            str(asset_id): create_media_token(
+                user_model, f"background:{asset_id}", "preview",
+            )
+            for asset_id in unique_ids if asset_id in visible
+        },
+        "expires_in": 300,
+    }
+
+
 @app.get("/backgrounds")
 def list_backgrounds(
     current_user: dict = Depends(get_current_user),
@@ -793,14 +911,16 @@ def list_backgrounds(
 ):
     """List active pre-approved background assets visible to the caller.
 
-    Tenant scope: a non-admin user only sees assets either marked global
-    (owner_tenant_id IS NULL) or owned by their own tenant_id. Admins see
-    everything for moderation/audit.
+    Tenant scope: callers see global assets plus their own tenant's assets.
+    Only platform super-admins see cross-tenant inventory.
     """
     q = db.query(BackgroundAsset).filter(BackgroundAsset.is_active == True)
     q = _apply_asset_tenant_filter(q, current_user)
     assets = q.order_by(BackgroundAsset.created_at.desc()).all()
-    return [a.to_dict() for a in assets]
+    return [
+        asset.to_dict() for asset in assets
+        if _background_asset_is_available(asset)
+    ]
 
 
 @app.get("/backgrounds/{asset_id}/usage")
@@ -817,7 +937,9 @@ def background_usage(
     UI can distinguish "used as-is" from "used as variation source".
     """
     asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == asset_id).first()
-    if not asset or not _user_can_use_asset(asset, current_user):
+    if (not asset
+            or not _user_can_use_asset(asset, current_user)
+            or not _background_asset_is_available(asset)):
         raise HTTPException(status_code=404, detail="Asset not found")
 
     tenant_id = current_user["tenant_id"]
@@ -861,9 +983,12 @@ def backgrounds_usage_batch(
     int, así que FastAPI no lo captura como asset_id (path param int).
     """
     tenant_id = current_user["tenant_id"]
-    q = db.query(BackgroundAsset.id).filter(BackgroundAsset.is_active == True)  # noqa: E712
+    q = db.query(BackgroundAsset).filter(BackgroundAsset.is_active == True)  # noqa: E712
     q = _apply_asset_tenant_filter(q, current_user)
-    visible_ids = {row[0] for row in q.all()}
+    visible_ids = {
+        asset.id for asset in q.all()
+        if _background_asset_is_available(asset)
+    }
     if not visible_ids:
         return {"tenant_id": tenant_id, "usage": {}}
     rows = (
@@ -921,6 +1046,13 @@ def _resolve_library_background(
     if not _user_can_use_asset(asset, current_user):
         # Don't reveal whether the asset exists — same response as not found.
         raise HTTPException(status_code=404, detail="Background not found.")
+    if not _background_asset_is_available(asset):
+        logger.warning(
+            "background asset unavailable id=%s storage=%s",
+            asset.id,
+            "r2" if (asset.filename or "").startswith("library/") else "legacy_local",
+        )
+        raise HTTPException(status_code=404, detail="Background not found.")
 
     # Variation requires a video source — _extract_frame_from_video calls
     # ffprobe and explodes on stills. The UI hides the toggle for images,
@@ -949,7 +1081,7 @@ def _resolve_library_background(
             bg_path = local_path
             bg_r2_key = asset.filename
     else:
-        local_path = os.path.join(_BACKGROUNDS_LIB, asset.filename)
+        local_path = _legacy_background_path(asset.filename)
         if background_mode == "variation":
             var_path = local_path
         else:
@@ -1011,22 +1143,32 @@ async def preview_background(
     don't queue against the pool."""
     import storage
     with scoped_db() as db:
-        user = get_current_user_from_token_param(token, db)
+        user = verify_media_token(
+            token, f"background:{asset_id}", "preview", db,
+        )
         asset = db.query(BackgroundAsset).filter(BackgroundAsset.id == asset_id).first()
-        if not asset or not _user_can_use_asset(asset, user):
+        if (not asset
+                or not _user_can_use_asset(asset, user)
+                or not _background_asset_is_available(asset)
+                or (not user.get("is_super_admin") and not asset.is_active)):
             raise HTTPException(status_code=404, detail="Asset not found")
         # Snapshot the fields we need before closing the session.
         asset_filename = asset.filename
         asset_file_type = asset.file_type
 
-    if asset_filename.startswith("library/") and storage.is_enabled():
-        url = storage.generate_signed_url(asset_filename, expiry_seconds=900)
+    if asset_filename.startswith("library/"):
+        if not storage.is_enabled():
+            raise HTTPException(status_code=503, detail="Asset storage unavailable")
+        url = storage.generate_signed_url(
+            asset_filename,
+            expiry_seconds=MEDIA_TOKEN_EXPIRE_SECONDS,
+        )
         if url:
             return RedirectResponse(url, status_code=302)
-        # If signing failed for any reason, fall through to local fallback.
+        raise HTTPException(status_code=503, detail="Asset preview unavailable")
 
-    file_path = os.path.join(_BACKGROUNDS_LIB, asset_filename)
-    if not os.path.exists(file_path):
+    file_path = _legacy_background_path(asset_filename)
+    if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
     media_type = "video/mp4" if asset_file_type == "mp4" else f"image/{asset_file_type}"
     return FileResponse(file_path, media_type=media_type)
@@ -1062,7 +1204,9 @@ async def health():
     socket, returning 503 and aborting the deploy 5/5 replicas. See
     observability.py:_within_startup_grace.
     """
-    snap = health_snapshot()
+    # DB/Redis/R2 probes are synchronous SDK calls; keep them off uvicorn's
+    # event loop so a slow object-store HEAD cannot stall unrelated requests.
+    snap = await asyncio.to_thread(health_snapshot)
     if snap.get("status") == "down":
         return JSONResponse(snap, status_code=503)
     return snap
@@ -1106,7 +1250,7 @@ async def health_ready():
     200 with status=degraded when a non-critical issue exists (low disk,
     no live workers, etc.) but service is still usable.
     """
-    snap = health_snapshot()
+    snap = await asyncio.to_thread(health_snapshot)
     if snap.get("status") == "down":
         return JSONResponse(snap, status_code=503)
     return snap
@@ -1204,7 +1348,14 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
                 "prores_export": has_prores_access(user),
                 "scenes": has_scenes_access(user),
                 "scenes_credit_cost": scenes_credit_cost(),
+                # Art Track gateado por tenant (default OFF salvo admin). El
+                # front oculta la opción "Art Track" si esto es false.
+                "art_track": has_art_track_access(user),
                 "telemetry": telemetry_enabled(),
+                # Versión B (letra anclada): el frontend gatea el textarea
+                # del wizard y el botón "Re-sincronizar con IA" con esto.
+                "anchor_lyrics": _anchor_lyrics_enabled(),
+                "youtube_publish": _youtube_publish_enabled(),
             },
         },
     }
@@ -1261,6 +1412,7 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
             password=body.password,
             email=body.email or None,
             plan="free",
+            commit=False,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1304,7 +1456,14 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
                 "prores_export": has_prores_access(user),
                 "scenes": has_scenes_access(user),
                 "scenes_credit_cost": scenes_credit_cost(),
+                # Art Track gateado por tenant (default OFF salvo admin). El
+                # front oculta la opción "Art Track" si esto es false.
+                "art_track": has_art_track_access(user),
                 "telemetry": telemetry_enabled(),
+                # Versión B (letra anclada): el frontend gatea el textarea
+                # del wizard y el botón "Re-sincronizar con IA" con esto.
+                "anchor_lyrics": _anchor_lyrics_enabled(),
+                "youtube_publish": _youtube_publish_enabled(),
             },
         },
     }
@@ -1335,11 +1494,12 @@ async def reset_password(body: ResetPasswordRequest, request: Request, db: Sessi
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    user = verify_password_reset_token(db, body.token)
+    user = verify_password_reset_token(db, body.token, commit=False)
     if not user:
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
 
     user.hashed_password = pwd_context.hash(body.password)
+    invalidate_user_access(db, user)
     db.commit()
 
     return {"ok": True, "message": "Password reset successfully"}
@@ -1372,7 +1532,12 @@ def me(current_user: dict = Depends(get_current_user), db: Session = Depends(get
             "prores_export": has_prores_access(_u),
             "scenes": has_scenes_access(_u),
             "scenes_credit_cost": scenes_credit_cost(),
+            "art_track": has_art_track_access(_u),
             "telemetry": telemetry_enabled(),
+            # Versión B (letra anclada): el frontend gatea el textarea
+            # del wizard y el botón "Re-sincronizar con IA" con esto.
+            "anchor_lyrics": _anchor_lyrics_enabled(),
+            "youtube_publish": _youtube_publish_enabled(),
         },
     }
 
@@ -1759,12 +1924,16 @@ async def change_password(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     user.hashed_password = pwd_context.hash(body.new_password)
+    invalidate_user_access(db, user, keep_jti=current_user.get("jti"))
     db.add(AuditLog(
         user_id=user.id, action="auth.change_password",
         ip_address=request.client.host if request.client else None,
     ))
     db.commit()
-    return {"ok": True}
+    # The current session row survives, but its old token has the stale
+    # auth_version. Return a replacement bound to the same device/session.
+    token = create_token(user, jti=current_user.get("jti"))
+    return {"ok": True, "token": token}
 
 
 @app.get("/auth/data-export")
@@ -2538,12 +2707,17 @@ def _job_scope(current_user: dict) -> dict:
     return {"tenant_id": current_user["tenant_id"]}
 
 
-def _audit_cross_tenant_access(db: Session, current_user: dict, job: dict, kind: str) -> None:
-    """Deja rastro cuando un admin accede a media de OTRO tenant.
+def _audit_cross_tenant_access(db: Session, current_user: dict, job: dict, kind: str,
+                               commit: bool = True) -> None:
+    """Deja rastro cuando un admin accede a media/edición de OTRO tenant.
 
     Parte del contrato de la apertura cross-tenant: la visibilidad de
     plataforma para admins viene con trail de auditoría (compliance UMG).
-    Best-effort: un fallo acá no bloquea el acceso."""
+    Best-effort: un fallo acá no bloquea el acceso.
+
+    `commit=False` para callers que sostienen un `with_for_update()` (p.ej.
+    /edit): un commit intermedio soltaría el row-lock de quota antes de
+    tiempo. En ese caso el AuditLog se persiste con el commit final del flow."""
     try:
         if current_user.get("role") != "admin":
             return
@@ -2559,7 +2733,8 @@ def _audit_cross_tenant_access(db: Session, current_user: dict, job: dict, kind:
                 "kind": kind,
             },
         ))
-        db.commit()
+        if commit:
+            db.commit()
     except Exception as e:
         logger.warning("[AUDIT] cross-tenant access log failed: %s", e)
 
@@ -3783,6 +3958,9 @@ class _TranscribeUploadedReq(BaseModel):
     live: bool = False
     artist: str = Field(default="", max_length=255)    # DB Job.artist = VARCHAR(255)
     title: str = Field(default="", max_length=500)     # DB Job.song_title = VARCHAR(500)
+    # Versión B (ANCHOR_LYRICS_ENABLED, default off): letra oficial pegada
+    # por el operador — se ancla con CTC en vez de usar el texto transcrito.
+    anchor_lyrics: str = Field(default="", max_length=20000)
 
 
 @app.post("/transcribe-uploaded")
@@ -3950,6 +4128,7 @@ async def transcribe_uploaded(
                 filename=_row_filename,
                 tenant_id=current_user.get("tenant_id", ""),
                 live=bool(body.live),
+                anchor_lyrics=body.anchor_lyrics or "",
             )
         except Exception as exc:
             logger.exception("[TRANSCRIBE] enqueue failed for job=%s", job_id)
@@ -3996,8 +4175,15 @@ async def transcribe_uploaded(
             artist=_row_artist,
             title=_row_title,
         )
-        _result = await _maybe_ctc_retime(_result, audio_path, job_id,
-                                          _row_artist, _row_title)
+        # Versión B: si el operador pegó la letra oficial, anclarla con CTC
+        # ANTES del retime normal; si ancló, saltear el retime (no doble).
+        if (body.anchor_lyrics or "").strip():
+            _result = await _maybe_anchor_align(_result, audio_path, job_id,
+                                                body.anchor_lyrics)
+        if not (isinstance(_result, dict)
+                and _result.get("timing_source") == "anchor_ctc"):
+            _result = await _maybe_ctc_retime(_result, audio_path, job_id,
+                                              _row_artist, _row_title)
         _result = await _maybe_adlib_filter(
             _result, audio_path, job_id,
             live_hint=bool(getattr(body, "live", False))
@@ -4102,7 +4288,14 @@ def transcription_status(
 class _GeneratePreviewReq(BaseModel):
     """Background params — TODOS los campos que entran al hash determinístico
     del cache. Cualquier campo del request /generate que NO afecte el bg NO
-    va acá (audio, lyrics, font, animation, transition...)."""
+    va acá (audio, font, animation, transition...).
+
+    NOTA COMPLIANCE: este modelo NO acepta bypass_content_validation /
+    force_content_validation a propósito — el preview genera SIEMPRE con
+    allow_people=False y valida antes de cachear. Agregar esos campos acá
+    rompería el aislamiento del cache global bg_cache/ (el key no separa
+    por people-policy). Test-guard en test_bg_cache_validation.py.
+    """
     artist: str = Field(default="", max_length=255)
     song_title: str = Field(default="", max_length=500)
     style: str = Field(default="auto", max_length=50)
@@ -4117,6 +4310,11 @@ class _GeneratePreviewReq(BaseModel):
     animate_image: bool = False
     match_lyrics: bool = True
     target_duration_s: float = Field(default=30.0, ge=5, le=600)
+    # v6 (2026-07-17): con match_lyrics el prompt del fondo depende de la
+    # LETRA — sin ella el preview generaba ciego al texto y el render podía
+    # heredar ese fondo por cache-hit. Entra al hash como fingerprint del
+    # texto normalizado (timestamps fuera: la corrección típica es timing).
+    lyrics_text: str = Field(default="", max_length=20000)
 
 
 @app.post("/generate-preview")
@@ -4978,6 +5176,119 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             set_timing_source(job_id, CTC_ALIGN)
     except Exception as e:
         logger.warning("[CTC] retime wrapper declined: %r (job=%s)", e, job_id)
+    finally:
+        if _stem:
+            try:
+                os.unlink(_stem)
+            except OSError:
+                pass
+    return result
+
+
+def _anchor_lyrics_enabled() -> bool:
+    """Feature flag de la Versión B (letra anclada, default OFF).
+
+    Un solo lector del env para que /transcribe-uploaded (vía
+    `_maybe_anchor_align`), POST /jobs/{id}/reanchor y los `features`
+    de /auth/* (el frontend gatea la UI con esto) no puedan divergir
+    en el parsing del valor."""
+    return os.environ.get("ANCHOR_LYRICS_ENABLED", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+async def _maybe_anchor_align(result, audio_path: str, job_id: str,
+                              anchor_lyrics: str):
+    """Versión B — anclar la letra OFICIAL del operador al motor CTC
+    (ANCHOR_LYRICS_ENABLED, default OFF). En vez de retimear el texto
+    transcrito de la cascada, alinea las líneas que el operador pegó
+    (anchor lyrics) sobre el stem de voz vía `ctc_align.retime_segments`
+    — mismo motor, misma paridad Rotor (benchmark 18 gold: mediana
+    0.32s, 0 cascadas, 1 decline seguro).
+
+    Contrato idéntico a `_maybe_ctc_retime`: NUNCA rompe una
+    transcripción. Flag off / anchor vacío / <3 líneas / decline /
+    excepción → devuelve `result` sin tocar (cae a la Versión A, la
+    cascada actual). En éxito reemplaza `result["segments"]` y setea
+    `result["timing_source"] = "anchor_ctc"` para que el worker saltee
+    el retime CTC normal (no doble retime).
+
+    Gate por línea (outliers del benchmark): líneas cuya mediana de
+    word-scores queda < ANCHOR_REVIEW_MIN_SCORE (default 0.25) se marcan
+    `review=True` — el editor las señala para que el operador las revise."""
+    _stem = None
+    try:
+        if not _anchor_lyrics_enabled():
+            return result
+        if not isinstance(result, dict) or not (anchor_lyrics or "").strip():
+            return result
+        psegs = [{"text": line, "start": 0.0, "end": 0.0}
+                 for line in anchor_lyrics.splitlines() if line.strip()]
+        if len(psegs) < 3:
+            return result
+        # Todo (imports incluidos) dentro del try: un módulo roto debe
+        # degradar a "sin anchor", nunca a un 500 en cada transcripción.
+        import ctc_align as _ctc
+        import vocal_sep as _vs
+        # Mismo patrón de stem que _maybe_ctc_retime: cache_only primero
+        # (si la cascada computó el stem hace segundos es solo una
+        # descarga de R2), y si no hay, computarlo si el flag lo permite.
+        _stem = await asyncio.wait_for(
+            asyncio.to_thread(_vs.separate_vocals, audio_path, cache_only=True),
+            timeout=120,
+        )
+        if not _stem and os.environ.get(
+                "CTC_ALIGN_COMPUTE_STEM", "1").strip().lower() in ("1", "true", "yes", "on"):
+            logger.info("[ANCHOR] no cached stem — computing it (job=%s)", job_id)
+            _stem = await asyncio.wait_for(
+                asyncio.to_thread(_vs.separate_vocals, audio_path),
+                timeout=360,
+            )
+        # Sin stem → alinear sobre la MEZCLA (misma decisión que el mix
+        # fallback de _maybe_ctc_retime: la mezcla como fuente está
+        # validada en el gold set).
+        _align_src = _stem or audio_path
+        if not _stem:
+            logger.info("[ANCHOR] no stem — aligning on the MIX (job=%s)", job_id)
+        retimed = await asyncio.wait_for(
+            asyncio.to_thread(_ctc.retime_segments, _align_src, psegs,
+                              job_id, audio_path),
+            timeout=420,
+        )
+        if retimed is None:
+            # Decline seguro → Versión A intacta (la cascada ya corrió).
+            logger.info("[ANCHOR] declined (reason=%s) job=%s",
+                        _ctc.last_decline_reason or "unknown", job_id)
+            return result
+        # GATE POR LÍNEA: mediana de word-scores < umbral → review=True
+        # (el editor la señala para revisar). Sin scores → no marcar.
+        # Umbral tuneable vía ANCHOR_REVIEW_MIN_SCORE (default 0.25). Se bajó
+        # 0.35 → 0.30 → 0.25 (2026-07): con anclado Rotor-grade (mediana
+        # global ~0.13s) hasta el 0.30 seguía marcando líneas perfectas —
+        # 11/26 en "Hablando" cuando solo 2-4 estaban genuinamente off. Sólo
+        # cambia CUÁNTAS se marcan; el decline global (retimed is None) no se
+        # toca.
+        try:
+            _review_min = float(os.environ.get("ANCHOR_REVIEW_MIN_SCORE", "0.25"))
+        except (TypeError, ValueError):
+            _review_min = 0.25
+        from statistics import median as _median
+        flagged = 0
+        anchored = []
+        for seg in retimed:
+            scores = [w.get("score") for w in (seg.get("words") or [])
+                      if isinstance(w.get("score"), (int, float))]
+            if scores and _median(scores) < _review_min:
+                seg = dict(seg)
+                seg["review"] = True
+                flagged += 1
+            anchored.append(seg)
+        result = dict(result)
+        result["segments"] = anchored
+        result["timing_source"] = "anchor_ctc"
+        logger.info("[ANCHOR] anchored %d líneas (%d en review, job=%s)",
+                    len(anchored), flagged, job_id)
+    except Exception as e:
+        logger.warning("[ANCHOR] wrapper declined: %r (job=%s)", e, job_id)
     finally:
         if _stem:
             try:
@@ -7305,6 +7616,7 @@ async def generate_with_segments(
     # un video largo puede pesar varios cientos de KB. 5 MB es techo
     # generoso que rechaza payload absurdo sin restringir casos reales.
     segments_json: str = Form(..., max_length=5_000_000),
+    base_revision: str = Form("", max_length=20),
     delivery_profile: str = Form("youtube", max_length=20),  # Job.delivery_profile = VARCHAR(20)
     umg_frame_size: str = Form("", max_length=16),
     umg_fps: str = Form("", max_length=16),
@@ -7358,6 +7670,13 @@ async def generate_with_segments(
     # When set, contains the 2 lines joined by "\n" — capped at 200 chars
     # to match the song title's effective range.
     title_song_break: str = Form("", max_length=200),
+    # Art track ("official audio"): master audio + cover image → video with the
+    # cover centered over a blurred fill + subtle motion, NO lyrics. The cover
+    # comes in via background_file (image). Skips transcription + AI background.
+    art_track: bool = Form(False),
+    # Línea legal opcional en pantalla para art tracks, ej.
+    # "℗ 2026 Universal Music Chile". Vacía = no se dibuja.
+    label_line: str = Form("", max_length=120),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -7373,6 +7692,18 @@ async def generate_with_segments(
     """
     job_id = (job_id or "").strip()
     reuse = bool(job_id)
+    try:
+        segments = json.loads(segments_json)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="segments_json must be valid JSON") from exc
+    if not isinstance(segments, list):
+        raise HTTPException(status_code=400, detail="segments_json must be an array")
+    try:
+        requested_revision = int(base_revision) if str(base_revision).strip() else None
+        if requested_revision is not None and requested_revision < 0:
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="base_revision must be a non-negative integer") from exc
 
     if reuse:
         # Reuse path: verify the job belongs to caller and pull the audio
@@ -7383,8 +7714,11 @@ async def generate_with_segments(
         #   - awaiting_upload: direct-generate flow (no editor;
         #     segments_json is "[]" so the worker runs Whisper itself
         #     against the audio that already landed in R2).
-        from jobs import get_job_model
-        job_row = get_job_model(db, job_id)
+        job_row = (
+            db.query(Job)
+            .filter(Job.job_id == job_id)
+            .first()
+        )
         if (not job_row
                 or job_row.user_id != current_user["id"]
                 or job_row.tenant_id != current_user["tenant_id"]):
@@ -7399,6 +7733,26 @@ async def generate_with_segments(
             raise HTTPException(
                 status_code=409,
                 detail=f"Job is in state {job_row.status!r}, cannot generate.",
+            )
+        current_revision = int(getattr(job_row, "segments_revision", 0) or 0)
+        if requested_revision is None and current_revision > 0:
+            return JSONResponse(
+                status_code=428,
+                content={"code": "client_upgrade_required", "current_revision": current_revision},
+            )
+        if requested_revision is not None and requested_revision != current_revision:
+            from ops_metrics import increment
+            increment("segments_revision_conflict")
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "code": "stale_revision",
+                    "current_revision": current_revision,
+                    "updated_at": (
+                        job_row.last_user_activity_at.isoformat()
+                        if job_row.last_user_activity_at else None
+                    ),
+                },
             )
         if job_row.status == "awaiting_upload":
             # Direct-generate path. The R2 PUT must be finished (no
@@ -7438,6 +7792,37 @@ async def generate_with_segments(
         if not song_title:
             song_title = parsed_title
 
+    # Art track ("official audio"): master audio + cover image → cover
+    # composited with subtle motion, no lyrics. Validate the cover and coerce
+    # incompatible options BEFORE quota/AI gates so it costs 1 credit and is
+    # not treated as an AI-background job.
+    if art_track:
+        # Feature gate (default OFF salvo admin / tenant en allowlist). Corta
+        # acá aunque el front no muestre la opción — un tenant sin acceso que
+        # pegue a la API con art_track=true no debe poder generar.
+        if not has_art_track_access(current_user):
+            raise HTTPException(
+                status_code=403,
+                detail="Art Track no está habilitado para tu cuenta.",
+            )
+        if background_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Art tracks use an uploaded cover, not a library background.",
+            )
+        if not (background_file and background_file.filename):
+            raise HTTPException(
+                status_code=400, detail="Art track requires a cover image.",
+            )
+        if not background_file.filename.lower().endswith((".jpg", ".jpeg", ".png")):
+            raise HTTPException(
+                status_code=400,
+                detail="Art track cover must be an image (.jpg/.jpeg/.png).",
+            )
+        # No lyrics, no Escenas, no Veo image-to-video animation for art tracks.
+        enable_scenes = False
+        animate_image = ""
+
     _enforce_plan_quota(db, current_user,
                         credits_needed=(scenes_credit_cost()
                                         if enable_scenes and has_scenes_access(current_user)
@@ -7458,14 +7843,14 @@ async def generate_with_segments(
     # Check AI authorization (UMG Guideline 5). The skip applies only when
     # the operator picks a library asset AND uses it as-is — no AI invoked.
     # Variation mode still calls Veo image-to-video on a frame of the
-    # source, which IS AI generation, so the auth gate must apply.
-    _needs_ai_auth = (not background_id) or (background_mode == "variation")
+    # source, which IS AI generation, so the auth gate must apply. Art tracks
+    # invoke NO AI (deterministic ffmpeg composite), so they never need it.
+    _needs_ai_auth = (not art_track) and ((not background_id) or (background_mode == "variation"))
     if _needs_ai_auth and current_user.get("role") != "admin":
         user_model = db.query(User).filter(User.id == current_user["id"]).first()
         if user_model and not user_model.ai_authorized:
             raise HTTPException(status_code=403, detail="AI tool usage not authorized. Contact admin for approval.")
 
-    segments = json.loads(segments_json)
     umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile, current_user=current_user)
 
     # Check plan limits
@@ -7479,7 +7864,31 @@ async def generate_with_segments(
     if reuse:
         # Promote the existing transcribed_pending row in place — fill in
         # the fields the editor finalised + flip status to queued.
-        job_row = get_job_model(db, job_id)
+        job_row = (
+            db.query(Job)
+            .filter(Job.job_id == job_id)
+            .with_for_update()
+            .first()
+        )
+        current_revision = int(getattr(job_row, "segments_revision", 0) or 0)
+        if requested_revision is None and current_revision > 0:
+            return JSONResponse(
+                status_code=428,
+                content={"code": "client_upgrade_required", "current_revision": current_revision},
+            )
+        if requested_revision is not None and requested_revision != current_revision:
+            from ops_metrics import increment
+            increment("segments_revision_conflict")
+            return JSONResponse(
+                status_code=409,
+                content={"code": "stale_revision", "current_revision": current_revision},
+            )
+        # Normally the preceding autosave already persisted the exact payload.
+        # A CAS-matching direct client may still combine save+generate; in that
+        # case the server performs the segment write and owns the increment.
+        if requested_revision is not None and job_row.segments_json != segments:
+            job_row.segments_json = segments
+            job_row.segments_revision = current_revision + 1
         job_row.artist = artist
         job_row.song_title = song_title or None
         job_row.style = style
@@ -7511,6 +7920,19 @@ async def generate_with_segments(
 
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
+
+    # Persist the art_track marker into render_params now (belt-and-suspenders
+    # with the worker-side merge) so /retry re-renders as an art track even if
+    # the worker dies before Step 1.
+    if art_track:
+        try:
+            from jobs import merge_render_params
+            _params = {"art_track": True}
+            if (label_line or "").strip():
+                _params["label_line"] = label_line.strip()
+            merge_render_params(job_id, _params)
+        except Exception as _e:
+            logger.warning("[ART] could not persist art_track render_param: %s", _e)
 
     mp3_path = os.path.join(job_dir, existing_filename)
 
@@ -7592,6 +8014,53 @@ async def generate_with_segments(
     except Exception as e:
         logger.warning("[DEDUP] supersede sibling drafts failed: %s", e)
 
+    # P1 2026-07-17: si el frontend no mandó bg_cache_key (race del debounce
+    # de 10s de useBackgroundPreview — el operador aprobó dentro de la
+    # ventana), lo recomputamos server-side con la MISMA función compartida
+    # que valida el worker (bg_preview.job_bg_cache_key). Solo aplica al
+    # fondo único AI: custom/library (bg_path) y escenas tienen su propio
+    # flujo, y /variant JAMÁS hereda este fast path (quiere un fondo
+    # distinto con params iguales — por eso el recompute vive acá y no en
+    # run_pipeline, que /variant y /retry comparten). El worker re-valida
+    # el key de todos modos: un mismatch = generación fresh, nunca un
+    # fondo equivocado.
+    _bg_cache_key_norm = (bg_cache_key or "").strip() or None
+    _effective_scenes = bool(enable_scenes) and has_scenes_access(current_user)
+    # Audit adversarial 2026-07-17: excluir variation EXPLÍCITAMENTE. Una
+    # variation de librería devuelve bg_path=None (con variation_source_path
+    # seteado), así que sin este guard el recompute corría y le asignaba un
+    # key a un job de variation — justo lo que /variant NO debe heredar (un
+    # _animate_user_image downstream lo salvaba, pero el guard debe hacer lo
+    # que el comentario promete, no depender de otra rama). Y el join de la
+    # letra va DENTRO del try: segments malformados (json.loads de un cliente
+    # roto) no deben tirar 500 y bloquear el enqueue — se cae a fresh.
+    _is_variation = bool(variation_source_path or variation_source_r2_key)
+    if (
+        _bg_cache_key_norm is None and bg_path is None
+        and not _effective_scenes and not _is_variation
+    ):
+        try:
+            from bg_preview import job_bg_cache_key
+            _bg_cache_key_norm = job_bg_cache_key(
+                artist=artist, song_title=song_title, style=style,
+                movement_style=movement_style, effect=effect,
+                custom_colors=(custom_colors.strip() or ""), genre=genre,
+                concept=concept,
+                background_hint=(background_hint.strip() or None),
+                bg_verbatim=bg_verbatim, match_lyrics=match_lyrics,
+            )
+        except Exception as _recompute_err:
+            logger.warning(
+                "[BG] recompute server-side falló job=%s: %s — fondo fresh",
+                job_id, _recompute_err,
+            )
+            _bg_cache_key_norm = None
+        if _bg_cache_key_norm:
+            logger.info(
+                "[BG] bg_cache_key recomputado server-side job=%s key=%s",
+                job_id, _bg_cache_key_norm,
+            )
+
     enqueue_pipeline(
         job_id=job_id,
         mp3_path=mp3_path,
@@ -7644,18 +8113,24 @@ async def generate_with_segments(
         custom_colors=(custom_colors.strip() or ""),
         # Capa C 2026-05-24: pasa el hash del bg pre-cacheado a la pipeline.
         # Si el cache hit, _ensure_background se skip y el job ahorra
-        # ~60-180s + $0.80-3.20 de cuota Veo. Vacío = flow tradicional.
-        bg_cache_key=(bg_cache_key.strip() or None),
+        # ~60-180s + $0.80-3.20 de cuota Veo. P1 2026-07-17: si el frontend
+        # no lo mandó, viene recomputado server-side (bloque de arriba).
+        bg_cache_key=_bg_cache_key_norm,
         # Escenas (multi-escena): opt-in del operador AND elegibilidad real.
         # Si el flag llega pero el usuario no tiene acceso, se ignora (fondo
         # único) — el gate de feature vive en el backend, no en el form.
-        enable_scenes=bool(enable_scenes) and has_scenes_access(current_user),
+        enable_scenes=_effective_scenes,
         title_template=title_template if title_template in ("auto", "centered", "lower_third", "badge") else "auto",
         title_size=_clamp_title_size(title_size),
         title_artist_font=(title_artist_font.strip() or ""),
         title_song_font=(title_song_font.strip() or ""),
         # UI v1.1: pass-through. Empty string preserves auto-wrap.
         title_song_break=(title_song_break or ""),
+        # Art track: master audio + cover → cover composited (blur + centered +
+        # subtle motion), no lyrics. Validated above (cover required, image
+        # only). The pipeline skips transcription + AI background.
+        art_track=art_track,
+        label_line=(label_line or "").strip() if art_track else "",
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -7683,6 +8158,7 @@ def status(
     job_id: str,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     from pipeline import _MAX_EDITS
     job = get_job(db, job_id, **_job_scope(current_user))
@@ -7743,6 +8219,7 @@ def status(
         # endpoint, which is the one the frontend actually polls
         # (JobDetail.jsx fetches `/status/${job_id}`, never `/jobs/{id}`).
         "segments_json": job.get("segments_json"),
+        "segments_revision": int(job.get("segments_revision") or 0),
         "bg_r2_key_cached": job.get("bg_r2_key_cached"),
         # Approval state. JobDetail uses these to render the "Aprobado"
         # badge and to gate the "Enviar a UMG" button (admin-only). Both
@@ -7756,8 +8233,14 @@ def status(
         # portal. Drives the "Enviar a UMG" button state in JobDetail.jsx
         # (hidden / available / "✓ Ya en UMG"). Single boolean is enough —
         # JobDetail doesn't need the delivery id, just the on/off state.
-        "is_in_umg_portal": (
-            db.query(Delivery.id)
+        # El flag vive en la DB de deliveries (`ddb`, posible externa de prod).
+        # Gateado por approved_at: el botón "Enviar a UMG" solo aparece en jobs
+        # aprobados, así que para el caso común (job no aprobado, polleado sin
+        # parar por JobDetail) devolvemos False sin pegarle a la DB externa —
+        # evita latencia/egress/checkout de conexión de prod en cada poll.
+        "is_in_umg_portal": bool(
+            job.get("approved_at")
+            and ddb.query(Delivery.id)
             .filter(Delivery.job_id == job_id)
             .filter(Delivery.removed_at.is_(None))
             .first()
@@ -7784,18 +8267,14 @@ def _sse_tick(token, job_id, scope, initial_user_id, initial_tenant_id):
         transfers the user across tenants mid-stream. Security, not optional.
     ``scoped_db()`` releases the connection back to the pool in milliseconds.
     """
-    from auth import decode_token as _decode
-    try:
-        _decode(token)
-    except HTTPException:
-        return None, True, "token_expired"
-    except Exception:
-        # decode_token only raises HTTPException; treat any other JWT-lib
-        # error as an invalid token too.
-        return None, True, "token_invalid"
     with scoped_db() as db_tick:
-        fresh_user = db_tick.query(User).filter(User.id == initial_user_id).first()
-        if not fresh_user or fresh_user.tenant_id != initial_tenant_id:
+        try:
+            fresh_user = get_current_user_from_token_param(token, db_tick)
+        except HTTPException as exc:
+            reason = "session_unavailable" if exc.status_code == 503 else "token_invalid"
+            return None, True, reason
+        if (fresh_user.get("id") != initial_user_id
+                or fresh_user.get("tenant_id") != initial_tenant_id):
             return None, True, "tenant_changed"
         job = get_job(db_tick, job_id, **scope)
     return job, False, ""
@@ -7804,12 +8283,14 @@ def _sse_tick(token, job_id, scope, initial_user_id, initial_tenant_id):
 @app.get("/events/{job_id}")
 async def job_events(
     job_id: str,
-    token: str = Query(..., description="Auth token (EventSource can't send Bearer headers)"),
+    request: Request,
+    token: str | None = Query(None, description="Temporary legacy query auth"),
 ):
     """Server-Sent Events stream for a single job. Emits one event whenever
-    the job's status, step, or progress changes, then closes on any terminal
-    state. The client passes the login JWT as ?token= because EventSource
-    does not support custom request headers.
+    the job's status, step, or progress changes and a keepalive comment on
+    unchanged ticks, then closes on any terminal state. New clients
+    authenticate with an Authorization Bearer header.
+    Query authentication is a temporary, server-controlled compatibility path.
 
     Connection budget: this is the worst pool-hog in the codebase
     pre-fix because an SSE stream can live for the full render
@@ -7824,10 +8305,28 @@ async def job_events(
     # Validate auth + job access up front with a short-lived session.
     # If anything below fails the client gets a normal HTTP error
     # without ever entering the SSE generator.
+    auth_header = request.headers.get("authorization", "")
+    bearer_token = ""
+    if auth_header.lower().startswith("bearer "):
+        bearer_token = auth_header.split(" ", 1)[1].strip()
+    if bearer_token:
+        access_token = bearer_token
+    elif token and os.environ.get(
+        "SSE_LEGACY_QUERY_AUTH_ENABLED", "0"
+    ).strip().lower() in ("1", "true", "yes", "on"):
+        access_token = token
+        logger.warning("[SECURITY] legacy SSE query authentication used")
+        from ops_metrics import increment
+        await asyncio.to_thread(increment, "sse_query_access_token")
+    else:
+        raise HTTPException(status_code=401, detail="Bearer authentication required.")
+
     with scoped_db() as db:
         try:
-            current_user = get_current_user_from_token_param(token, db)
-        except HTTPException:
+            current_user = get_current_user_from_token_param(access_token, db)
+        except HTTPException as exc:
+            if exc.status_code == 503:
+                raise
             raise HTTPException(status_code=401, detail="Invalid or expired token.")
         job_check = get_job(db, job_id, **_job_scope(current_user))
         if job_check is None:
@@ -7868,7 +8367,7 @@ async def job_events(
             # corremos off-loop con asyncio.to_thread para que N dashboards
             # abiertos no inunden el event loop cada 2 s.
             job, unauthorized, unauthorized_reason = await asyncio.to_thread(
-                _sse_tick, token, job_id, scope, _initial_user_id, _initial_tenant_id,
+                _sse_tick, access_token, job_id, scope, _initial_user_id, _initial_tenant_id,
             )
             if unauthorized:
                 yield f"event: unauthorized\ndata: {json.dumps({'reason': unauthorized_reason})}\n\n"
@@ -7910,6 +8409,12 @@ async def job_events(
                     "step_text_es": _step_text,
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
+            else:
+                # Keep the stream observable even while a long render remains
+                # on the same step/progress value. The frontend watchdog is
+                # 6–8 s; ticks are every 2 s, so a healthy idle stream never
+                # looks frozen. SSE comments are ignored by event handlers.
+                yield ": keepalive\n\n"
             if job["status"] in TERMINAL:
                 break
             await asyncio.sleep(2)
@@ -8255,10 +8760,22 @@ async def download(
         elif readiness.state == ProResReadiness.NOT_STARTED:
             # Kick off a prewarm in the background, then 202.
             try:
-                from queue_jobs import enqueue_prores_prewarm
+                from queue_jobs import enqueue_prores_prewarm, SubmissionsPausedError
                 enqueue_prores_prewarm(job_id, file_type)
+            except SubmissionsPausedError as exc:
+                from ops_control import get_submissions_state
+                state = get_submissions_state()
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "code": "submissions_paused",
+                        "detail": str(exc),
+                    },
+                    headers={"Retry-After": str(state.get("retry_after", 60))},
+                )
             except Exception as e:  # pragma: no cover
                 logger.warning("[PRORES] enqueue prewarm from /download failed: %s", e)
+                raise HTTPException(status_code=503, detail="ProRes queue unavailable")
             return JSONResponse(
                 status_code=202,
                 content={
@@ -8324,7 +8841,10 @@ async def preview(
         return FileResponse(file_path, media_type=MEDIA_TYPES[file_type])
 
     if s3_key and storage.is_enabled():
-        url = storage.generate_signed_url(s3_key, expiry_seconds=3600)
+        url = storage.generate_signed_url(
+            s3_key,
+            expiry_seconds=MEDIA_TOKEN_EXPIRE_SECONDS,
+        )
         if url:
             return RedirectResponse(url, status_code=302)
 
@@ -8628,6 +9148,30 @@ class ApproveJobRequest(BaseModel):
     notes: str = Field(default="", max_length=2048)
 
 
+def _merge_content_validation_choice(
+    render_params: dict | None,
+    *,
+    bypass: bool = False,
+    force: bool = False,
+) -> dict:
+    """Persist one unambiguous content-policy choice, defaulting safe.
+
+    The three write paths (edit, retry and variant) must not preserve a stale
+    opposite flag from a prior operation.  Force wins if a malformed/legacy
+    client sends both values; when neither is present we fail closed.
+    """
+    merged = dict(render_params or {})
+    merged.pop("bypass_content_validation", None)
+    merged.pop("force_content_validation", None)
+    if force:
+        merged["force_content_validation"] = True
+    elif bypass:
+        merged["bypass_content_validation"] = True
+    else:
+        merged["force_content_validation"] = True
+    return merged
+
+
 class EditJobRequest(BaseModel):
     # edit_type values:
     #  - typography: re-render with new font/size/case/motion settings
@@ -8655,6 +9199,8 @@ class EditJobRequest(BaseModel):
     # segments_json before enqueueing. Each segment must have start (s),
     # end (s), text (str); anything else is ignored.
     segments: list[dict] | None = Field(default=None)
+    base_revision: int | None = Field(default=None, ge=0)
+    force_conflict_overwrite: bool = False
     # Optional free-form hint for edit_type=="background". The operator
     # types what they want the new background to convey ("paisaje cálido
     # al atardecer", "abstracto con ondas de luz suave", etc.) and the
@@ -8665,19 +9211,12 @@ class EditJobRequest(BaseModel):
     # spec granular de cámara. 300 obligaba a sacrificar negaciones que
     # son críticas para evitar bias del modelo. Costo Gemini marginal.
     background_hint: str | None = Field(default=None, max_length=2000)
-    # Operator-controlled bypass of content_validator (UMG Guideline 15
-    # check). Default False = follow tenant default. True = skip validator
-    # entirely (only has effect on UMG tenants — non-UMG already skip by
-    # default).
-    #
-    # Use case: UMG operator wants to ship a video where the flagged
-    # content IS the song's visual identity (rock guitarist hands).
-    # They accept the downstream UMG-review rejection risk knowingly.
+    # Explicit non-Universal opt-in used together with a prompt that asks for
+    # people. Universal accounts remain validation-mandatory in pipeline.py;
+    # this request field can never relax that server-side rule.
     bypass_content_validation: bool = Field(default=False)
-    # Inverse of bypass for non-UMG tenants. Default False = follow tenant
-    # default (skip validator for non-UMG). True = force validator to run
-    # even though the tenant doesn't require it. For operators of non-UMG
-    # tenants who *want* the conservative behavior anyway.
+    # Explicit safe choice. It also wins if a legacy/malformed client sends
+    # both flags. Sending neither defaults to this same fail-closed behavior.
     force_content_validation: bool = Field(default=False)
     # Background generation mode. Only meaningful when edit_type=="background".
     #
@@ -8708,6 +9247,12 @@ class EditJobRequest(BaseModel):
     # the hint goes straight to Veo without Gemini's rewrite. Only
     # meaningful for edit_type=="background".
     bg_verbatim: bool = Field(default=False)
+    # Library asset for edit_type=="background_library": swap the video's
+    # background for a curated BackgroundAsset instead of regenerating with
+    # AI. The escape hatch from the non-converging Veo loop (incidente Gaby
+    # 2026-07-08, job eaff5c7baf50: 3 regens sin control y sin salida a
+    # biblioteca). Required for that edit_type; ignored otherwise.
+    background_id: int | None = Field(default=None)
     # FX layer + lyric animations chosen in the wizard. Added 2026-05-22:
     # antes el operador no podía cambiarlos post-upload y, peor, los
     # whitelists de /retry y /variant los descartaban silenciosamente.
@@ -8891,14 +9436,18 @@ async def get_source_audio_url(
     Owner / same-tenant only — same auth model as /download/<job>/<file>.
     """
     from database import Job as JobModel
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    # Cross-tenant para admins de plataforma: mismo contrato que _job_scope
+    # (pedido CEO 2026-06-11) — el rol admin abre el video de cualquier
+    # cliente para resolver incidentes. Sin bypass, el editor de un tenant
+    # ajeno abría MUDO (audio no disponible) aunque el admin ya podía ver el
+    # job. Acceso auditado (compliance UMG).
+    _audio_q = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        _audio_q = _audio_q.filter(JobModel.tenant_id == current_user["tenant_id"])
+    job = _audio_q.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _audit_cross_tenant_access(db, current_user, job, "source_audio")
 
     # 1. Try the original audio first (best quality, no render artifacts).
     #
@@ -8962,6 +9511,16 @@ async def get_source_audio_url(
                 }
 
     # 4. Neither original nor any rendered MP4 — operator must re-upload.
+    # Diagnóstico (2026-07-10, "No Hay Santos"): cuando el editor muestra
+    # "Audio no disponible" necesitamos saber DESDE PROD qué candidato
+    # falló y por qué (key ausente vs sonda a R2 caída) sin reproducir.
+    logger.warning(
+        "[SOURCE-AUDIO] 404 for job %s: input_r2_key=%r s3_keys(video)=%r "
+        "s3_keys(short)=%r — every candidate missing or unprobeable",
+        job_id, job.input_r2_key,
+        (job.s3_keys or {}).get("video") if isinstance(job.s3_keys, dict) else None,
+        (job.s3_keys or {}).get("short") if isinstance(job.s3_keys, dict) else None,
+    )
     raise HTTPException(
         status_code=404,
         detail=(
@@ -9179,6 +9738,9 @@ class SaveSegmentsRequest(BaseModel):
     # form-field cap — a long video can legitimately ship a few hundred
     # KB of segments.
     segments: list[dict] = Field(..., max_length=10000)
+    # Server-owned OCC: the client sends the revision it hydrated.
+    # None is accepted only while the job is still legacy revision zero.
+    base_revision: int | None = Field(default=None, ge=0)
 
 
 @app.post("/jobs/{job_id}/save-segments")
@@ -9213,13 +9775,27 @@ async def save_segments(
 
     Validates ownership the same way as /generate's reuse path.
     """
-    from jobs import get_job_model, touch_user_activity
+    from jobs import touch_user_activity
 
-    job = get_job_model(db, job_id)
+    job = (
+        db.query(Job)
+        .filter(Job.job_id == job_id)
+        .with_for_update()
+        .first()
+    )
+    # Bypass cross-tenant para admins de plataforma (mismo contrato que
+    # _job_scope): un super admin corrige y GUARDA el job de cualquier
+    # usuario cuando tiene problemas. Sin esto, abrir el editor de un job
+    # ajeno dejaba el autoguardado en 404 permanente ("No pudimos guardar")
+    # y las ediciones no persistían. Para no-admins se mantiene el scope
+    # estricto por dueño + tenant. Acceso auditado (compliance UMG).
+    _is_platform_admin = current_user.get("role") == "admin"
     if (not job
-            or job.user_id != current_user["id"]
-            or job.tenant_id != current_user["tenant_id"]):
+            or (not _is_platform_admin
+                and (job.user_id != current_user["id"]
+                     or job.tenant_id != current_user["tenant_id"]))):
         raise HTTPException(status_code=404, detail="Job not found.")
+    _audit_cross_tenant_access(db, current_user, job, "save_segments", commit=False)
 
     # Wizard (transcribed_pending) is the original use case; pending_review
     # / rejected enable the post-approval /edit modal's autosave so text
@@ -9323,6 +9899,44 @@ async def save_segments(
     # Vez Más — Viejas Locas (agus.cafisi, 2026-05-18).
     segs = sorted(segs, key=lambda s: float(s.get("start", 0) or 0))
 
+    current_revision = int(getattr(job, "segments_revision", 0) or 0)
+    if body.base_revision is None and current_revision > 0:
+        return JSONResponse(
+            status_code=428,
+            content={
+                "code": "client_upgrade_required",
+                "current_revision": current_revision,
+            },
+        )
+    if body.base_revision is not None and body.base_revision != current_revision:
+        # Network retries after a committed response are idempotent when the
+        # canonical payload already matches what is stored.
+        if job.segments_json == segs:
+            return {
+                "ok": True,
+                "job_id": job_id,
+                "applied": False,
+                "revision": current_revision,
+                "count": len(segs),
+            }
+        logger.warning(
+            "[save-segments] conflict job=%s tenant=%s base=%s current=%s",
+            job_id, job.tenant_id, body.base_revision, current_revision,
+        )
+        from ops_metrics import increment
+        increment("segments_revision_conflict")
+        return JSONResponse(
+            status_code=409,
+            content={
+                "code": "stale_revision",
+                "current_revision": current_revision,
+                "updated_at": (
+                    job.last_user_activity_at.isoformat()
+                    if job.last_user_activity_at else None
+                ),
+            },
+        )
+
     # Audit log of what changed between prev and new — only when non-empty.
     # Motivation: operator (Tomas, 2026-05-19) reported "lines change places"
     # in autosync, and we had ZERO way to reconstruct what happened (only
@@ -9391,6 +10005,8 @@ async def save_segments(
         logger.warning("[save-segments] audit log failed: %s", e)
 
     job.segments_json = segs
+    if body.base_revision is not None:
+        job.segments_revision = current_revision + 1
     touch_user_activity(db, job)
     db.commit()
 
@@ -9407,6 +10023,268 @@ async def save_segments(
         "job_id": job_id,
         "saved_at": job.last_user_activity_at.isoformat() if job.last_user_activity_at else None,
         "count": len(segs),
+        "applied": True,
+        "revision": int(getattr(job, "segments_revision", 0) or 0),
+    }
+
+
+# Mismos estados en los que el LyricsEditor está operativamente montado
+# (ver _SAVE_SEGMENTS_ALLOWED en save_segments): si el operador puede
+# corregir texto ahí, puede pedir el re-anclado ahí.
+_REANCHOR_ALLOWED = (
+    "transcribed_pending", "transcribed", "pending_review", "rejected", "editing", "done",
+)
+
+
+class ReanchorSegmentsRequest(BaseModel):
+    base_revision: int | None = Field(default=None, ge=0)
+
+
+@app.post("/jobs/{job_id}/reanchor")
+@limiter.limit("6/minute")
+async def reanchor_segments(
+    request: Request,
+    job_id: str,
+    body: ReanchorSegmentsRequest = Body(default_factory=ReanchorSegmentsRequest),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Versión B, parte 2 (2026-07-15): re-anclar el timing DESPUÉS de que
+    el operador corrigió el TEXTO en el editor.
+
+    Toma los segments actuales del job (`segments_json`, ya persistidos por
+    el autosave de /save-segments), usa su texto como letra ancla y corre la
+    misma `_maybe_anchor_align` del flujo de subida (motor CTC, paridad
+    Rotor). Reglas:
+
+    - Auth y status gate idénticos a /save-segments (owner + tenant, editor
+      montado).
+    - Gate por ANCHOR_LYRICS_ENABLED (mismo flag que el anclado en upload).
+    - Líneas con `locked: true` (timing arrastrado a mano por el operador)
+      NO se pisan — el ancla incluye su texto para que la alineación sea
+      monotónica, pero su timing persiste tal cual.
+    - Decline del motor / flag off a mitad de camino → 200 {ok: false} y
+      los segments quedan intactos (mismo contrato "nunca rompe" del helper).
+    - En éxito persiste el timing re-anclado en segments_json y devuelve
+      los segments mergeados para que el editor se refresque sin re-fetch.
+    """
+    from jobs import get_job_model, touch_user_activity
+
+    job = get_job_model(db, job_id)
+    is_platform_admin = current_user.get("role") == "admin"
+    if (not job
+            or (not is_platform_admin
+                and (job.user_id != current_user["id"]
+                     or job.tenant_id != current_user["tenant_id"]))):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    _audit_cross_tenant_access(db, current_user, job, "reanchor")
+    if not _anchor_lyrics_enabled():
+        # Flag off → el server no tiene la Versión B habilitada. 409 (no
+        # 404) para no confundir con "job inexistente"; el frontend ni
+        # muestra el botón sin features.anchor_lyrics.
+        raise HTTPException(
+            status_code=409,
+            detail="El re-anclado no está habilitado en este servidor.",
+        )
+    if job.status not in _REANCHOR_ALLOWED:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"reanchor requires status in {_REANCHOR_ALLOWED} "
+                f"(current: {job.status})"
+            ),
+        )
+
+    initial_revision = int(getattr(job, "segments_revision", 0) or 0)
+    if body.base_revision is None and initial_revision != 0:
+        return JSONResponse(
+            status_code=428,
+            content={"code": "client_upgrade_required", "current_revision": initial_revision},
+        )
+    if body.base_revision is not None and body.base_revision != initial_revision:
+        from ops_metrics import increment
+        increment("segments_revision_conflict")
+        return JSONResponse(
+            status_code=409,
+            content={
+                "code": "stale_revision",
+                "current_revision": initial_revision,
+                "updated_at": (
+                    job.last_user_activity_at.isoformat()
+                    if job.last_user_activity_at else None
+                ),
+            },
+        )
+
+    prev_segs = [dict(s) for s in (job.segments_json or [])
+                 if isinstance(s, dict)]
+    anchor_lines = [(s.get("text") or "").strip() for s in prev_segs]
+    n_lines = sum(1 for _t in anchor_lines if _t)
+    if n_lines < 3:
+        # Mismo umbral que _maybe_anchor_align — con <3 líneas el motor
+        # declina siempre; 422 acá da un mensaje accionable en vez de un
+        # {ok: false} opaco.
+        raise HTTPException(
+            status_code=422,
+            detail="Se necesitan al menos 3 líneas con texto para re-sincronizar.",
+        )
+
+    # SNAPSHOT + release (mismo patrón que /transcribe-uploaded, incidente
+    # agus77 06/07): la descarga de R2 + el CTC pueden tardar minutos y no
+    # podemos tener la sesión checked-out todo ese tiempo.
+    _r2_key = job.input_r2_key
+    _row_filename = job.filename or ""
+    db.close()
+
+    job_dir = os.path.join(OUTPUTS_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    audio_path = os.path.join(job_dir, _row_filename) if _row_filename else ""
+    if not audio_path or (not os.path.exists(audio_path) and not _r2_key):
+        raise HTTPException(
+            status_code=409,
+            detail="El audio original ya no está disponible para este job.",
+        )
+    if not os.path.exists(audio_path):
+        import asyncio as _asyncio
+        _loop = _asyncio.get_event_loop()
+        for _attempt in range(3):
+            # boto3 es síncrono — executor para no bloquear el event loop
+            # (mismo patrón que /transcribe-uploaded).
+            _ok = await _loop.run_in_executor(
+                None, storage.download_object, _r2_key, audio_path,
+            )
+            if _ok:
+                break
+            if _attempt < 2:
+                await _asyncio.sleep(0.5 * (2 ** _attempt))
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail="No pudimos leer el audio original. Reintentá en unos segundos.",
+            )
+
+    anchor_text = "\n".join(_t for _t in anchor_lines if _t)
+    out = await _maybe_anchor_align(
+        {"segments": prev_segs}, audio_path, job_id, anchor_text,
+    )
+    anchored = out.get("segments") if isinstance(out, dict) else None
+    if (not isinstance(out, dict)
+            or out.get("timing_source") != "anchor_ctc"
+            or not isinstance(anchored, list)
+            or len(anchored) != n_lines):
+        # Decline seguro (flag/engine/mismatch de líneas) — los segments
+        # del operador quedan intactos, igual que la Versión A en upload.
+        logger.info("[REANCHOR] declined job=%s (n_lines=%d)", job_id, n_lines)
+        return {
+            "ok": False,
+            "reason": "declined",
+            "job_id": job_id,
+            "count": len(prev_segs),
+            "review_count": 0,
+            "locked_kept": 0,
+            "revision": initial_revision,
+        }
+
+    # Merge: los segs re-anclados corresponden 1:1 (en orden) a los segs
+    # previos con texto no vacío. Se preservan las keys extra del original
+    # (_id, pos/scale/rot, estilo) y el timing de las líneas `locked`.
+    merged = []
+    review_count = 0
+    locked_kept = 0
+    _ai = 0
+    for seg, _text in zip(prev_segs, anchor_lines):
+        if not _text:
+            merged.append(seg)
+            continue
+        new_seg = anchored[_ai]
+        _ai += 1
+        if seg.get("locked"):
+            locked_kept += 1
+            merged.append(seg)
+            continue
+        m = dict(seg)
+        m["start"] = new_seg.get("start", seg.get("start"))
+        m["end"] = new_seg.get("end", seg.get("end"))
+        if new_seg.get("words") is not None:
+            m["words"] = new_seg["words"]
+        if new_seg.get("review"):
+            m["review"] = True
+            review_count += 1
+        else:
+            m.pop("review", None)
+        merged.append(m)
+    # Mismo contrato de orden monotónico que /save-segments.
+    merged = sorted(merged, key=lambda s: float(s.get("start", 0) or 0))
+
+    # Persistir con sesión corta (la del request se soltó antes del I/O).
+    from database import SessionLocal as _SL
+    _db2 = _SL()
+    persisted_revision = initial_revision
+    try:
+        row = (
+            _db2.query(Job)
+            .filter(Job.job_id == job_id)
+            .with_for_update()
+            .first()
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="Job not found.")
+        current_revision = int(getattr(row, "segments_revision", 0) or 0)
+        if body.base_revision is None and current_revision != 0:
+            return JSONResponse(
+                status_code=428,
+                content={"code": "client_upgrade_required", "current_revision": current_revision},
+            )
+        if body.base_revision is not None and current_revision != body.base_revision:
+            from ops_metrics import increment
+            increment("segments_revision_conflict")
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "code": "stale_revision",
+                    "current_revision": current_revision,
+                    "updated_at": (
+                        row.last_user_activity_at.isoformat()
+                        if row.last_user_activity_at else None
+                    ),
+                },
+            )
+        row.segments_json = merged
+        row.segments_revision = (
+            current_revision + 1 if body.base_revision is not None else current_revision
+        )
+        persisted_revision = int(row.segments_revision or 0)
+        touch_user_activity(_db2, row)
+        try:
+            from database import AuditLog
+            _db2.add(AuditLog(
+                user_id=current_user["id"],
+                action="lyrics.reanchor",
+                detail={
+                    "job_id": job_id,
+                    "n_lines": len(merged),
+                    "review_count": review_count,
+                    "locked_kept": locked_kept,
+                    "base_revision": current_revision,
+                    "revision": int(row.segments_revision or 0),
+                },
+            ))
+        except Exception as e:  # noqa: BLE001 — audit best-effort
+            logger.warning("[REANCHOR] audit log failed: %s", e)
+        _db2.commit()
+    finally:
+        _db2.close()
+
+    logger.info("[REANCHOR] ok job=%s lines=%d review=%d locked_kept=%d",
+                job_id, len(merged), review_count, locked_kept)
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "count": len(merged),
+        "review_count": review_count,
+        "locked_kept": locked_kept,
+        "segments": merged,
+        "revision": persisted_revision,
     }
 
 
@@ -9437,20 +10315,28 @@ async def request_edit(
     # de 3 edits y la app cobra Veo extra (~$0.90 por background regen).
     # No-op en SQLite (igual que _lock_user_for_quota); lock real en
     # Postgres. Se libera con db.commit() al final del flow.
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .with_for_update()
-        .first()
-    )
+    # Cross-tenant para admins de plataforma: mismo contrato que _job_scope
+    # (reads) — un admin re-renderiza el fix de cualquier cliente. Sin esto
+    # el /edit de un tenant ajeno daba 404 aun para el super admin. Auditado
+    # con commit=False para no soltar el row-lock de quota antes del commit
+    # final del flow.
+    _edit_q = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        _edit_q = _edit_q.filter(JobModel.tenant_id == current_user["tenant_id"])
+    job = _edit_q.with_for_update().first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    valid_edit_types = ("typography", "background", "lyrics", "metadata")
+    _audit_cross_tenant_access(db, current_user, job, "edit", commit=False)
+    valid_edit_types = ("typography", "background", "background_library", "lyrics", "metadata")
     if body.edit_type not in valid_edit_types:
         raise HTTPException(
             status_code=400,
             detail=f"edit_type must be one of {valid_edit_types}",
+        )
+    if body.edit_type == "background_library" and not body.background_id:
+        raise HTTPException(
+            status_code=400,
+            detail="background_library edit requires 'background_id'.",
         )
     # Escenas (incidente 2026-07-01, job 53b9513225b1): el edit "background"
     # es del mundo fondo-único — para un job multi-escena generaba UN clip
@@ -9458,7 +10344,9 @@ async def request_edit(
     # re-renderizaba video+short loopeando esa única escena. El camino
     # correcto para estos jobs es la regeneración por escena del filmstrip
     # (edit_type="scene" vía /edit-scene, no consume cupo de edición).
-    if body.edit_type == "background":
+    # background_library comparte el guard: un asset único también pisaría
+    # el timeline multi-escena cacheado.
+    if body.edit_type in ("background", "background_library"):
         _sp = job.scene_plan if isinstance(job.scene_plan, dict) else None
         if _sp and _sp.get("scenes"):
             raise HTTPException(
@@ -9547,7 +10435,14 @@ async def request_edit(
     # the metadata edit for traceability (`metadata_only=True`).
     _is_admin = current_user.get("role") == "admin"
     _metadata_only = body.edit_type == "metadata"
-    if not _is_admin and not _metadata_only and current_edit_count >= _MAX_EDITS:
+    # background_library tampoco consume slot (mismo mecanismo que metadata):
+    # el cap de 3 existe para acotar gasto Veo (~$0.90/regen); el swap a un
+    # asset curado cuesta $0 de IA y es justamente la SALIDA de emergencia
+    # para quien ya quemó sus regens sin converger — si consumiera slot,
+    # seguiría atrapado. AuditLog registra igual (edit_type en detail).
+    _library_swap = body.edit_type == "background_library"
+    if (not _is_admin and not _metadata_only and not _library_swap
+            and current_edit_count >= _MAX_EDITS):
         raise HTTPException(
             status_code=400,
             detail=f"Maximum edit limit ({_MAX_EDITS}) reached. Please approve or reject.",
@@ -9657,7 +10552,33 @@ async def request_edit(
         # segments persisted — the operator's "Reintentar edit" later sees
         # the new lyrics applied even though the edit was never processed.
         _pre_edit_segments = job.segments_json
+        _pre_edit_revision = int(getattr(job, "segments_revision", 0) or 0)
+        if body.base_revision is None and _pre_edit_revision > 0:
+            return JSONResponse(
+                status_code=428,
+                content={
+                    "code": "client_upgrade_required",
+                    "current_revision": _pre_edit_revision,
+                },
+            )
+        if (body.base_revision is not None
+                and body.base_revision != _pre_edit_revision):
+            from ops_metrics import increment
+            increment("segments_revision_conflict")
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "code": "stale_revision",
+                    "current_revision": _pre_edit_revision,
+                    "updated_at": (
+                        job.last_user_activity_at.isoformat()
+                        if job.last_user_activity_at else None
+                    ),
+                },
+            )
         job.segments_json = normalized_segments
+        if body.base_revision is not None:
+            job.segments_revision = _pre_edit_revision + 1
 
     edit_params: dict = {}
     if body.font is not None:
@@ -9786,14 +10707,20 @@ async def request_edit(
         _rp_v = dict(job.render_params or {})
         _rp_v["bg_verbatim"] = _bv
         job.render_params = _rp_v
-    if body.edit_type == "background" and body.bypass_content_validation:
-        # Forward only when explicitly True; pipeline's tenant-gated
-        # default is correct when missing/False. Storing this lets the
-        # worker read render_params.get(...) and never has to distinguish
-        # "field missing" from "operator chose False".
-        edit_params["bypass_content_validation"] = True
-    if body.edit_type == "background" and body.force_content_validation:
-        edit_params["force_content_validation"] = True
+    if body.edit_type == "background":
+        # Persist the CURRENT mutually-exclusive choice. The worker resolves
+        # policy from durable render_params; leaving a stale bypass there made
+        # a later safe edit silently behave as unrestricted.
+        _rp_policy = _merge_content_validation_choice(
+            job.render_params,
+            bypass=body.bypass_content_validation,
+            force=body.force_content_validation,
+        )
+        if _rp_policy.get("bypass_content_validation"):
+            edit_params["bypass_content_validation"] = True
+        else:
+            edit_params["force_content_validation"] = True
+        job.render_params = _rp_policy
     # QA fix 2026-05-28 (edit-wizard consolidation): artist/song_title
     # mutations ungated across edit_types. Before this, the fields only
     # applied on edit_type=metadata; if the frontend sent a consolidated
@@ -9819,38 +10746,75 @@ async def request_edit(
         job.song_title = _new_title
         edit_params["song_title"] = _new_title
 
+    if _library_swap:
+        # Resolver el asset ANTES de flipear el status: _resolve_library_
+        # background trae gratis el tenant-gate (_user_can_use_asset, 404
+        # no-revelador para assets ajenos) y el row de AssetUsage para el
+        # audit. Cualquier 404/400 acá deja el job intacto en
+        # pending_review. Solo modo as_is en v1 (variation re-entra en
+        # costo Veo — diferido a propósito).
+        _lib_job_dir = os.path.join(OUTPUTS_DIR, job_id)
+        os.makedirs(_lib_job_dir, exist_ok=True)
+        _lib_bg_path, _lib_bg_r2_key, _v1, _v2, _lib_asset_id = _resolve_library_background(
+            body.background_id, "as_is", current_user, db, _lib_job_dir, job_id,
+        )
+        edit_params["library_bg"] = {
+            "bg_path": _lib_bg_path,
+            "bg_r2_key": _lib_bg_r2_key,
+            "asset_id": _lib_asset_id,
+        }
+
     # PR C 2026-05-26: metadata edits do NOT bump edit_count (see
     # rationale at the edit-cap gate above). All other types still
     # consume a slot.
-    new_edit_count = current_edit_count if _metadata_only else current_edit_count + 1
+    new_edit_count = (
+        current_edit_count if (_metadata_only or _library_swap)
+        else current_edit_count + 1
+    )
 
-    # Pre-flight check that the source audio is still in R2. Every edit
-    # type (background/typography/lyrics) downloads the original WAV
-    # before re-rendering. If the audio is gone (sibling variant was
-    # deleted and reclaimed the shared key, or cleanup_old_inputs ran),
-    # the worker would crash 30 s into the edit with "Could not download
-    # source audio from R2" and the operator would see "El video falló"
-    # with no actionable hint. Fail fast here with a clear re-upload
-    # instruction instead. 2026-05-19 agus.cafisi / Una Vez Más incident.
-    if job.input_r2_key:
-        try:
-            import storage as _storage
-            if _storage.is_enabled() and not _storage.object_exists(job.input_r2_key):
+    # Pre-flight check that the edit will be able to source its audio.
+    # The worker (run_edit_pipeline) resolves audio in two tiers: the
+    # original input in R2, and — when that was purged (cleanup_old_inputs,
+    # sibling delete) — extracting the track from a rendered deliverable
+    # (video/short). This gate must mirror BOTH tiers: blocking on the
+    # input alone rejected perfectly recoverable edits with "Subí el MP3
+    # de nuevo" (2026-07-10, job 53b9513225b1 "No Hay Santos" — the lyrics
+    # edit that re-stitches a damaged scene timeline was blocked even
+    # though its rendered MP4 was alive and the worker would have
+    # recovered the audio from it). Only 422 when NEITHER tier can work,
+    # which is the case the 2026-05-19 agus.cafisi incident was about.
+    try:
+        import storage as _storage
+        if _storage.is_enabled():
+            _has_input = bool(
+                job.input_r2_key and _storage.object_exists(job.input_r2_key)
+            )
+            _s3 = job.s3_keys if isinstance(job.s3_keys, dict) else {}
+            _has_deliverable = any(
+                _s3.get(_k) and _storage.object_exists(_s3[_k])
+                for _k in ("video", "short")
+            )
+            if not _has_input and not _has_deliverable:
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        "El audio original ya no está en storage. "
-                        "Probablemente fue limpiado o un job hermano lo borró. "
+                        "El audio original ya no está en storage y no hay un "
+                        "video renderizado del cual recuperarlo. "
                         "Subí el MP3 de nuevo para regenerar el video."
                     ),
                 )
-        except HTTPException:
-            raise
-        except Exception as _exc:
-            logger.warning(
-                "[EDIT] R2 pre-check failed for %s key=%r — proceeding anyway: %s",
-                job_id, job.input_r2_key, _exc,
-            )
+            if not _has_input:
+                logger.info(
+                    "[EDIT] job %s: input %r ausente en R2 — el worker recuperará "
+                    "el audio del deliverable (tier-2)", job_id, job.input_r2_key,
+                )
+    except HTTPException:
+        raise
+    except Exception as _exc:
+        logger.warning(
+            "[EDIT] R2 pre-check failed for %s key=%r — proceeding anyway: %s",
+            job_id, job.input_r2_key, _exc,
+        )
 
     # Flip to editing immediately so the UI can show progress.
     job.status = "editing"
@@ -9878,6 +10842,9 @@ async def request_edit(
             # cares about every artist/title mutation; this lets ops
             # filter the log without parsing edit_params.
             "metadata_only": _metadata_only,
+            "base_revision": body.base_revision,
+            "segments_revision": int(getattr(job, "segments_revision", 0) or 0),
+            "force_conflict_overwrite": body.force_conflict_overwrite,
         },
     ))
     # HOTFIX F1 2026-05-27 (audit): the pre-edit capture moved UP to
@@ -9911,6 +10878,7 @@ async def request_edit(
         # and see edits that were never actually applied to a video.
         try:
             job.segments_json = _pre_edit_segments
+            job.segments_revision = _pre_edit_revision
         except NameError:
             # Defensive: _pre_edit_segments is only assigned when
             # body.segments was non-empty. Non-lyrics edits (typography,
@@ -9938,6 +10906,7 @@ async def request_edit(
         "edit_count": new_edit_count,
         "edits_remaining": max(0, _MAX_EDITS - new_edit_count),
         "edit_limit_exempt": _is_admin,
+        "segments_revision": int(getattr(job, "segments_revision", 0) or 0),
     }
 
 
@@ -10384,12 +11353,9 @@ class RetryJobRequest(BaseModel):
     operators can downgrade a 4K render that OOMed the worker to HD on
     retry, without re-uploading the audio."""
     frame_size: str | None = Field(default=None, max_length=16)
-    # When True, set render_params["bypass_content_validation"]=True
-    # before re-enqueuing so the worker skips _validate_fn. Same semantics
-    # as EditJobRequest/VariantJobRequest. Use case: a job died in
-    # validation_failed because the prompt intentionally triggered the
-    # validator (e.g. "rock guitarist hands as subject"), and the
-    # operator wants to retry without recreating the variant manually.
+    # Explicit non-Universal people opt-in. The central pipeline still
+    # requires a matching positive prompt and never permits a Universal
+    # account to bypass validation.
     bypass_content_validation: bool = Field(default=False)
     force_content_validation: bool = Field(default=False)
 
@@ -10483,16 +11449,13 @@ async def retry_job(
             new_spec["frame_size"] = body.frame_size
             job.umg_spec = new_spec
 
-    # Operator opt-in flags forwarded to render_params before re-enqueue.
-    # When False/missing, render_params is untouched and tenant-gated
-    # defaults in pipeline.Step 1b apply.
-    if body and (body.bypass_content_validation or body.force_content_validation):
-        _rp = dict(job.render_params or {})
-        if body.bypass_content_validation:
-            _rp["bypass_content_validation"] = True
-        if body.force_content_validation:
-            _rp["force_content_validation"] = True
-        job.render_params = _rp
+    # Persist one mutually-exclusive choice; missing fields fail closed and
+    # stale choices from earlier attempts are removed.
+    job.render_params = _merge_content_validation_choice(
+        job.render_params,
+        bypass=bool(body and body.bypass_content_validation),
+        force=bool(body and body.force_content_validation),
+    )
 
     # Capturar status PREVIO antes de mutar. Sin esto el AuditLog
     # registraba siempre "processing" como previous_status (la línea de
@@ -10629,7 +11592,14 @@ async def retry_job(
               # multi-escena vuelve a armar las escenas en vez de caer al
               # fondo único. Persistido por pipeline en render_params cuando
               # el render corre con enable_scenes=True.
-              "enable_scenes"):
+              "enable_scenes",
+              # Art track: heredable — sin esto un retry de un art track se
+              # re-renderiza como lyric video vacío y re-corre Whisper.
+              # Persistido por pipeline/endpoint en render_params.
+              "art_track",
+              # Línea legal del art track (℗/© sello), persistida junto al
+              # marker para que el retry la re-dibuje igual.
+              "label_line"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
 
@@ -10639,6 +11609,15 @@ async def retry_job(
     # costo Veo extra— al reintentar un job viejo.
     if retry_pipeline_kwargs.get("enable_scenes"):
         retry_pipeline_kwargs["enable_scenes"] = has_scenes_access(current_user)
+
+    # Art Track: mismo re-gate. Un art track NO se puede degradar a lyric
+    # (se re-rendería vacío, sin letra), así que si el usuario perdió el
+    # acceso a la feature cortamos el retry en vez de convertirlo.
+    if retry_pipeline_kwargs.get("art_track") and not has_art_track_access(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Art Track no está habilitado para tu cuenta.",
+        )
 
     enqueue_pipeline(
         job_id=job_id,
@@ -10689,8 +11668,8 @@ class VariantJobRequest(BaseModel):
     # va al user_content de Gemini con header [OPERATOR OVERRIDE].
     # 2000 chars (bumped 2026-05-18, ver EditJobRequest para rationale).
     background_hint: str | None = Field(default=None, max_length=2000)
-    # Espejo del flag de EditJobRequest — operator override del content
-    # validator (UMG Guideline 15). Misma semántica, ver EditJobRequest.
+    # Same central policy as edit/retry: only a non-Universal account with an
+    # explicit people prompt can use this opt-in; Universal remains strict.
     bypass_content_validation: bool = Field(default=False)
     force_content_validation: bool = Field(default=False)
     # Override del concept del padre. 2000 chars igual que /generate.
@@ -10909,15 +11888,26 @@ async def create_variant(
 
     # Merge: render_params del padre + overrides del body.
     parent_render_params = dict(parent.render_params or {})
+    # Las variantes intercambian el fondo (Veo) del video; un art track no
+    # tiene fondo generado, así que "variante de un art track" no aplica. Sin
+    # este corte, la variante hereda art_track=True en render_params (se
+    # etiqueta como art track en la UI) pero se re-rendería como lyric vacío —
+    # y sería una vía sin gatear de la feature. Bloquear de plano.
+    if parent_render_params.get("art_track"):
+        raise HTTPException(
+            status_code=400,
+            detail="No se pueden crear variantes de un Art Track.",
+        )
     new_render_params = dict(parent_render_params)
     if body.background_hint is not None:
         new_render_params["background_hint"] = body.background_hint
     if body.concept is not None:
         new_render_params["concept"] = body.concept
-    if body.bypass_content_validation:
-        new_render_params["bypass_content_validation"] = True
-    if body.force_content_validation:
-        new_render_params["force_content_validation"] = True
+    new_render_params = _merge_content_validation_choice(
+        new_render_params,
+        bypass=body.bypass_content_validation,
+        force=body.force_content_validation,
+    )
 
     # Style: override o herencia.
     new_style = body.style if body.style is not None else (parent.style or "oscuro")
@@ -11124,6 +12114,23 @@ class YoutubeUploadBody(BaseModel):
     tags: list[str] | None = None
 
 
+def _youtube_publish_enabled() -> bool:
+    return os.environ.get("YOUTUBE_PUBLISH_ENABLED", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _require_youtube_publish_enabled() -> None:
+    if not _youtube_publish_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "feature_disabled",
+                "message": "YouTube publishing is not enabled.",
+            },
+        )
+
+
 def _load_yt_settings(db: Session, user_id: int) -> dict:
     """The user's YouTube template (title format, header/footer, hashtags,
     mandatory tags, language) from UserSettings — so the template configured
@@ -11133,7 +12140,10 @@ def _load_yt_settings(db: Session, user_id: int) -> dict:
 
 
 @app.get("/youtube/connection-status")
-async def youtube_connection_status(current_user: dict = Depends(get_current_user)):
+async def youtube_connection_status(
+    current_user: dict = Depends(get_current_user),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
+):
     """Check if a YouTube account is connected and return channel info."""
     import asyncio
     from youtube_upload import get_connection_status
@@ -11143,7 +12153,10 @@ async def youtube_connection_status(current_user: dict = Depends(get_current_use
 
 
 @app.get("/youtube/auth-url")
-async def youtube_auth_url(current_user: dict = Depends(get_current_user)):
+async def youtube_auth_url(
+    current_user: dict = Depends(get_current_user),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
+):
     """Return the Google OAuth URL for connecting the system YouTube account.
 
     Solo admin: YouTube es una cuenta central del sistema (todos los tenants
@@ -11165,6 +12178,7 @@ async def youtube_oauth_callback(
     state: str = Query("", max_length=2048),
     error: str = Query("", max_length=200),
     db: Session = Depends(get_db),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
 ):
     """Callback de Google tras el consent. Verifica el state (HMAC),
     intercambia el code, cachea el channel y guarda el token encriptado en
@@ -11225,6 +12239,7 @@ async def youtube_oauth_callback(
 async def youtube_disconnect(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
 ):
     """Disconnect the system YouTube account (admin only)."""
     if current_user.get("role") != "admin":
@@ -11235,7 +12250,11 @@ async def youtube_disconnect(
 
 
 @app.get("/youtube/upload-progress/{job_id}")
-async def youtube_upload_progress(job_id: str, current_user: dict = Depends(get_current_user)):
+async def youtube_upload_progress(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
+):
     """Return the current upload progress (0-100) for a job, or -1 if not uploading."""
     from youtube_upload import get_upload_progress
     return {"progress": get_upload_progress(job_id), "short_progress": get_upload_progress(job_id + "_short")}
@@ -11248,6 +12267,7 @@ async def youtube_upload(
     privacy: str = "unlisted",
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
 ):
     """Upload a completed job's video to YouTube with AI-generated metadata."""
     if body:
@@ -11302,6 +12322,7 @@ async def youtube_upload_short(
     privacy: str = "unlisted",
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
 ):
     """Upload a completed job's Short (vertical 9:16) to YouTube Shorts."""
     if body:
@@ -11354,6 +12375,7 @@ async def youtube_short_metadata_preview(
     job_id: str,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
 ):
     """Preview the AI-generated YouTube Shorts metadata without uploading."""
     job = get_job(db, job_id, **_job_scope(current_user))
@@ -11384,6 +12406,7 @@ async def youtube_metadata_preview(
     job_id: str,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    _enabled: None = Depends(_require_youtube_publish_enabled),
 ):
     """Preview the AI-generated YouTube metadata without uploading."""
     job = get_job(db, job_id, **_job_scope(current_user))
@@ -11503,6 +12526,7 @@ async def admin_create_delivery_from_job(
     body: SendToUMGRequest | None = None,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """Publish an approved job to the UMG portal. Admin only.
 
@@ -11510,6 +12534,11 @@ async def admin_create_delivery_from_job(
     UPDATED (label refreshed, added_at bumped) instead of duplicated.
     Matches the manual workflow today — corrected re-renders replace
     the previous version rather than stack up as "Opción N".
+
+    El Job se lee de la DB local (`db`); la fila Delivery se escribe en la
+    DB de deliveries (`ddb`), que puede ser externa (portal de prod) cuando
+    DELIVERIES_DATABASE_URL está seteada — así staging publica en el mismo
+    portal que prod. Sin esa env, ddb == db y el comportamiento es idéntico.
     """
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
@@ -11541,15 +12570,20 @@ async def admin_create_delivery_from_job(
     # delivery for this song gets "Renderizado"; subsequent ones get
     # "Opción N". Matches the manual items.json conventions.
     label = (body.label if body else None) or _compute_default_delivery_label(
-        db, job.artist, job.song_title
+        ddb, job.artist, job.song_title
     )
+
+    # added_by_user_id es FK NOT NULL a users.id de la DB de deliveries. Con
+    # DB externa (prod) el id de staging no existe allí → mapear a un admin
+    # de prod vía deliveries_added_by(). Sin DB externa, es el current_user.
+    added_by = deliveries_added_by(current_user["id"])
 
     # Replace-not-duplicate: if there's already an active Delivery for
     # this job_id, update it in place. Operator clicks "Enviar a UMG"
     # again after a re-render → we refresh the label + timestamp, the
     # R2 files stay the same (worker overwrites on edit).
     existing = (
-        db.query(Delivery)
+        ddb.query(Delivery)
         .filter(Delivery.job_id == job_id)
         .filter(Delivery.removed_at.is_(None))
         .first()
@@ -11557,7 +12591,7 @@ async def admin_create_delivery_from_job(
     if existing:
         existing.label = label
         existing.file_types = _DEFAULT_DELIVERY_FILE_TYPES
-        existing.added_by_user_id = current_user["id"]
+        existing.added_by_user_id = added_by
         existing.added_at = datetime.now(timezone.utc)
         # Refresh snapshot in case the artist/title was corrected on the
         # job row between the original publish and now.
@@ -11576,11 +12610,17 @@ async def admin_create_delivery_from_job(
             song_title_snapshot=job.song_title or "",
             tenant_snapshot=job.tenant_id,
             frame_size_snapshot=(job.umg_spec or {}).get("frame_size"),
-            added_by_user_id=current_user["id"],
+            added_by_user_id=added_by,
             added_at=datetime.now(timezone.utc),
         )
-        db.add(delivery)
+        ddb.add(delivery)
         action = "delivery.create"
+
+    # Commit del delivery (DB externa) PRIMERO: si falla, el AuditLog local no
+    # se escribe y no queda fila de auditoría huérfana. El Job local solo se
+    # leyó, nunca se muta, así que un fallo acá no corrompe estado local.
+    ddb.commit()
+    ddb.refresh(delivery)
 
     db.add(AuditLog(
         user_id=current_user["id"],
@@ -11588,7 +12628,6 @@ async def admin_create_delivery_from_job(
         detail={"job_id": job_id, "label": label, "artist": job.artist, "song": job.song_title},
     ))
     db.commit()
-    db.refresh(delivery)
 
     return {
         "ok": True,
@@ -11626,19 +12665,26 @@ async def admin_delete_delivery(
     delivery_id: int,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """Soft-delete a portal entry. Admin only (JWT)."""
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
-    return _soft_delete_delivery(db, delivery_id, current_user["id"])
+    return _soft_delete_delivery(ddb, db, delivery_id, current_user["id"])
 
 
-def _soft_delete_delivery(db: Session, delivery_id: int, actor_user_id: int | None):
-    delivery = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+def _soft_delete_delivery(ddb: Session, db: Session, delivery_id: int, actor_user_id: int | None):
+    """Soft-delete: la fila Delivery vive en `ddb` (posible DB externa del
+    portal); el AuditLog en la `db` local. removed_by_user_id es FK a los
+    users de la DB de deliveries → mapear el id local a uno válido de esa DB."""
+    delivery = ddb.query(Delivery).filter(Delivery.id == delivery_id).first()
     if delivery is None or delivery.removed_at is not None:
         raise HTTPException(status_code=404, detail="Delivery not found")
     delivery.removed_at = datetime.now(timezone.utc)
-    delivery.removed_by_user_id = actor_user_id
+    delivery.removed_by_user_id = (
+        deliveries_added_by(actor_user_id) if actor_user_id is not None else None
+    )
+    ddb.commit()
     db.add(AuditLog(
         user_id=actor_user_id,
         action="delivery.delete",
@@ -11658,6 +12704,7 @@ async def portal_delete_delivery(
     delivery_id: int,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """Soft-delete from the portal itself. Auth: shared portal token."""
     _verify_portal_token(x_portal_token)
@@ -11665,7 +12712,7 @@ async def portal_delete_delivery(
     # The audit log entry records the action and which delivery; if we
     # later add per-recipient logins to the portal this will carry their
     # user id instead.
-    return _soft_delete_delivery(db, delivery_id, actor_user_id=None)
+    return _soft_delete_delivery(ddb, db, delivery_id, actor_user_id=None)
 
 
 @app.post("/api/deliveries/{delivery_id}/change-request")
@@ -11674,6 +12721,7 @@ async def portal_submit_change_request(
     body: dict,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """Portal user (UMG) submits a free-form comment asking for changes
     on a specific delivery. Operator picks it up in the GenLy admin.
@@ -11694,7 +12742,7 @@ async def portal_submit_change_request(
             detail="El comentario es demasiado largo (máximo 5000 caracteres).",
         )
     delivery = (
-        db.query(Delivery)
+        ddb.query(Delivery)
         .filter(Delivery.id == delivery_id)
         .filter(Delivery.removed_at.is_(None))
         .first()
@@ -11705,7 +12753,9 @@ async def portal_submit_change_request(
         delivery_id=delivery_id,
         comment=comment,
     )
-    db.add(cr)
+    ddb.add(cr)
+    ddb.commit()
+    ddb.refresh(cr)
     db.add(AuditLog(
         user_id=None,
         action="delivery.change_request.create",
@@ -11718,7 +12768,6 @@ async def portal_submit_change_request(
         },
     ))
     db.commit()
-    db.refresh(cr)
     return {"ok": True, "id": cr.id, "submitted_at": cr.submitted_at.isoformat()}
 
 
@@ -11727,6 +12776,7 @@ async def portal_approve_delivery(
     delivery_id: int,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """Portal user (UMG) approves a delivery via the "Aprobar" button.
 
@@ -11740,7 +12790,7 @@ async def portal_approve_delivery(
     """
     _verify_portal_token(x_portal_token)
     delivery = (
-        db.query(Delivery)
+        ddb.query(Delivery)
         .filter(Delivery.id == delivery_id)
         .filter(Delivery.removed_at.is_(None))
         .first()
@@ -11756,6 +12806,7 @@ async def portal_approve_delivery(
         }
     delivery.approved_at = datetime.now(timezone.utc)
     delivery.approved_by_label = "UMG"
+    ddb.commit()
     db.add(AuditLog(
         user_id=None,
         action="delivery.approve",
@@ -11780,6 +12831,7 @@ async def portal_unapprove_delivery(
     delivery_id: int,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """Portal user undoes a previous approval. Clears approved_at and
     approved_by_label so the row goes back to pending state on the
@@ -11787,7 +12839,7 @@ async def portal_unapprove_delivery(
     """
     _verify_portal_token(x_portal_token)
     delivery = (
-        db.query(Delivery)
+        ddb.query(Delivery)
         .filter(Delivery.id == delivery_id)
         .filter(Delivery.removed_at.is_(None))
         .first()
@@ -11798,6 +12850,7 @@ async def portal_unapprove_delivery(
         return {"ok": True, "already_pending": True}
     delivery.approved_at = None
     delivery.approved_by_label = None
+    ddb.commit()
     db.add(AuditLog(
         user_id=None,
         action="delivery.un_approve",
@@ -11836,7 +12889,7 @@ async def portal_get_meta(
 @app.get("/api/deliveries/items")
 async def portal_get_items(
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_deliveries_db),
 ):
     """Return the portal listing in the shape the frontend expects.
 
@@ -12037,12 +13090,17 @@ async def admin_list_change_requests(
     limit: int = 200,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """List change requests for the operator UI. Admin only.
 
     status: "pending" (default), "resolved", or "all".
     Returns request + delivery context (artist/song/label/frame/job_id)
     plus resolved_by username so the admin sees who acted on each one.
+
+    Las tablas del portal (DeliveryChangeRequest, Delivery, y el resolver
+    User que las resolvió) se leen de `ddb` (posible DB externa de prod). El
+    Job subyacente y su owner viven en la DB local (`db`).
     """
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
@@ -12051,7 +13109,7 @@ async def admin_list_change_requests(
     if limit < 1 or limit > 1000:
         limit = 200
 
-    q = db.query(DeliveryChangeRequest)
+    q = ddb.query(DeliveryChangeRequest)
     if status == "pending":
         q = q.filter(DeliveryChangeRequest.resolved_at.is_(None))
     elif status == "resolved":
@@ -12067,11 +13125,13 @@ async def admin_list_change_requests(
     user_ids = list({cr.resolved_by_user_id for cr in crs if cr.resolved_by_user_id})
     deliveries_by_id = {
         d.id: d
-        for d in (db.query(Delivery).filter(Delivery.id.in_(delivery_ids)).all() if delivery_ids else [])
+        for d in (ddb.query(Delivery).filter(Delivery.id.in_(delivery_ids)).all() if delivery_ids else [])
     }
+    # Resolver: resolved_by_user_id referencia los users de la DB de deliveries
+    # (prod cuando es externa) → resolver sobre ddb.
     users_by_id = {
         u.id: u
-        for u in (db.query(User).filter(User.id.in_(user_ids)).all() if user_ids else [])
+        for u in (ddb.query(User).filter(User.id.in_(user_ids)).all() if user_ids else [])
     }
 
     # Bulk-fetch the underlying jobs (NO tenant scope — this is an admin-only
@@ -12150,12 +13210,12 @@ async def admin_list_change_requests(
 
     # Totals are cheap and the admin UI shows them as headline counters.
     pending_count = (
-        db.query(DeliveryChangeRequest)
+        ddb.query(DeliveryChangeRequest)
         .filter(DeliveryChangeRequest.resolved_at.is_(None))
         .count()
     )
     resolved_count = (
-        db.query(DeliveryChangeRequest)
+        ddb.query(DeliveryChangeRequest)
         .filter(DeliveryChangeRequest.resolved_at.isnot(None))
         .count()
     )
@@ -12378,12 +13438,13 @@ async def admin_resolve_change_request(
     body: dict | None = None,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """Mark a change request resolved. Optional resolution_note (<=2000 chars)
     so the operator can leave a one-liner explaining what was done."""
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
-    cr = db.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).first()
+    cr = ddb.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).first()
     if not cr:
         raise HTTPException(status_code=404, detail="Change request not found")
     if cr.resolved_at is not None:
@@ -12394,8 +13455,10 @@ async def admin_resolve_change_request(
     if len(note) > 2000:
         raise HTTPException(status_code=400, detail="resolution_note too long (max 2000)")
     cr.resolved_at = datetime.now(timezone.utc)
-    cr.resolved_by_user_id = current_user["id"]
+    # resolved_by_user_id es FK a users de la DB de deliveries → mapear.
+    cr.resolved_by_user_id = deliveries_added_by(current_user["id"])
     cr.resolution_note = note or None
+    ddb.commit()
     db.add(AuditLog(
         user_id=current_user["id"],
         action="delivery.change_request.resolve",
@@ -12414,13 +13477,14 @@ async def admin_reopen_change_request(
     cr_id: int,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
 ):
     """Undo a resolution. The original submission stays — only the
     resolved_at/resolved_by/resolution_note get cleared. Audit log
     records who reopened it."""
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
-    cr = db.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).first()
+    cr = ddb.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).first()
     if not cr:
         raise HTTPException(status_code=404, detail="Change request not found")
     if cr.resolved_at is None:
@@ -12428,6 +13492,7 @@ async def admin_reopen_change_request(
     cr.resolved_at = None
     cr.resolved_by_user_id = None
     cr.resolution_note = None
+    ddb.commit()
     db.add(AuditLog(
         user_id=current_user["id"],
         action="delivery.change_request.reopen",

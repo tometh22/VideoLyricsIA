@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
+import MediaPreview from "./MediaPreview";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -284,7 +285,8 @@ function JobRow({ job, index, t, onSelectJob }) {
 // ─── Approval grid card (shown when all done, REQUIRE_REVIEW=true) ───────────
 function ApprovalCard({ job, t, onSelectJob, onApprove, approving }) {
   const name = (job.filename || "").replace(/\.(mp3|wav)$/i, "");
-  const thumbSrc = useMediaUrl(job.job_id, "thumbnail", "preview");
+  // version: bust the URL when an edit re-renders (same R2 key overwritten).
+  const thumbSrc = useMediaUrl(job.job_id, "thumbnail", "preview", `${job.edit_count || 0}-${job.status || ""}`);
   const isDone = job.status === "done";
   const isPending = job.status === "pending_review";
 
@@ -299,22 +301,14 @@ function ApprovalCard({ job, t, onSelectJob, onApprove, approving }) {
       }`}
     >
       {/* Thumbnail */}
-      <div
-        className="aspect-video bg-black/40 relative cursor-pointer group overflow-hidden"
+      <MediaPreview
+        src={thumbSrc}
+        status={job.status}
+        alt={name}
+        className="aspect-video cursor-pointer group"
+        imageClassName="group-hover:scale-[1.03] transition-transform duration-500"
         onClick={() => job.job_id && onSelectJob?.(job.job_id)}
       >
-        {thumbSrc ? (
-          <img
-            src={thumbSrc}
-            alt={name}
-            className="w-full h-full object-cover group-hover:scale-[1.03] transition-transform duration-500"
-          />
-        ) : (
-          <div className="w-full h-full flex items-center justify-center">
-            <div className="w-6 h-6 border-2 border-white/20 border-t-white/60 rounded-full animate-spin" />
-          </div>
-        )}
-
         {/* Status overlay */}
         <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-transparent" />
         <div className="absolute bottom-2 left-2 right-2 flex items-end justify-between">
@@ -340,7 +334,7 @@ function ApprovalCard({ job, t, onSelectJob, onApprove, approving }) {
             </div>
           </div>
         )}
-      </div>
+      </MediaPreview>
 
       {/* Card footer */}
       <div className="px-3 py-2.5">
@@ -618,7 +612,7 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
   // ── Celebration screen ────────────────────────────────────────────────────
   if (allApproved && !isSingle) {
     return (
-      <div className="w-full max-w-xl mt-12 animate-fade-in">
+      <div className="w-full max-w-[1080px] mx-auto mt-8 animate-fade-in">
         <CelebrationScreen
           jobs={jobs}
           total={total}
@@ -634,7 +628,7 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
   // ── Approval grid (multi-video batch, all done, some pending) ─────────────
   if (showApprovalGrid) {
     return (
-      <div className="w-full max-w-3xl mt-12 animate-fade-in">
+      <div className="w-full max-w-[1080px] mx-auto mt-8 animate-fade-in">
         {/* Header */}
         <div className="text-center mb-8">
           <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-amber-500/10 ring-1 ring-amber-500/20 flex items-center justify-center">
@@ -684,7 +678,7 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
         )}
 
         {/* Thumbnail grid — cards stagger in for a polished entrance */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-8">
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4 mb-8">
           {jobs.map((job, i) => (
             <div
               // Diferenciamos placeholder keys de keys reales así dos jobs sin
@@ -748,7 +742,7 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
   }
 
   return (
-    <div className="w-full max-w-xl mt-12 animate-fade-in">
+    <div className="w-full max-w-[960px] mx-auto mt-8 animate-fade-in ai-batch-workspace">
       {/* Header */}
       <div className="text-center mb-8">
         {allDone ? (

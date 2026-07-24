@@ -49,6 +49,16 @@ it("Reset button calls onReset", () => {
   expect(props.onReset).toHaveBeenCalledTimes(1);
 });
 
+it("offers fit/detail presets and an accessible song minimap", () => {
+  setup();
+  expect(screen.getByText("32 px/s")).toBeInTheDocument();
+  fireEvent.click(screen.getByText("Ajustar"));
+  expect(screen.getByText("8 px/s")).toBeInTheDocument();
+  fireEvent.click(screen.getByText("Detalle"));
+  expect(screen.getByText("32 px/s")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /Mini-mapa de la canción/i })).toBeInTheDocument();
+});
+
 it("a click (no movement) focuses + seeks to the clicked point, no edit", () => {
   const props = setup();
   const block = screen.getByText("segunda línea").closest("div[title]");
@@ -57,7 +67,7 @@ it("a click (no movement) focuses + seeks to the clicked point, no edit", () => 
   fireEvent.pointerUp(block, { clientY: 100, pointerId: 1 });
   expect(props.onFocus).toHaveBeenCalledWith(1);
   expect(props.onSeek).toHaveBeenCalledTimes(1);
-  expect(props.onSeek.mock.calls[0][0]).toBeCloseTo(100 / 16, 2); // ZOOM_DEFAULT=16
+  expect(props.onSeek.mock.calls[0][0]).toBeCloseTo(100 / 32, 2); // ZOOM_DEFAULT=32
   expect(props.onTimingChange).not.toHaveBeenCalled();
 });
 
@@ -209,7 +219,7 @@ it("end-edge drag can extend past an overlapping segment in another lane", () =>
   const aBlock = screen.getByText("A lane 0").closest("div[title]");
   const bottomEdge = aBlock.querySelector('[title="Arrastrá: cuándo SALE la línea"]');
   expect(bottomEdge).not.toBeNull();
-  // Drag the bottom edge DOWN by 80px = +5s @ pxPerSec=16.
+  // Drag the bottom edge DOWN by 80px = +2.5s @ pxPerSec=32.
   fireEvent.pointerDown(bottomEdge, { clientY: 20, pointerId: 1 });
   fireEvent.pointerMove(bottomEdge, { clientY: 100, pointerId: 1 });
   fireEvent.pointerUp(bottomEdge, { clientY: 100, pointerId: 1 });
@@ -231,11 +241,11 @@ it("start-edge drag can move earlier past an overlapping segment in another lane
   const cBlock = screen.getByText("C lane 0 (far)").closest("div[title]");
   const topEdge = cBlock.querySelector('[title="Arrastrá: cuándo ENTRA la línea"]');
   expect(topEdge).not.toBeNull();
-  // C en y=20*16=320. Su top edge handle vive en y≈320. Arrastrar UP por
-  // 240 px = -15s @ pxPerSec=16. Target start: 20 - 15 = 5.
-  fireEvent.pointerDown(topEdge, { clientY: 320, pointerId: 1 });
-  fireEvent.pointerMove(topEdge, { clientY: 80, pointerId: 1 });
-  fireEvent.pointerUp(topEdge, { clientY: 80, pointerId: 1 });
+  // C en y=20*32=640. Arrastrar UP 480 px = -15s @ pxPerSec=32.
+  // Target start: 20 - 15 = 5.
+  fireEvent.pointerDown(topEdge, { clientY: 640, pointerId: 1 });
+  fireEvent.pointerMove(topEdge, { clientY: 160, pointerId: 1 });
+  fireEvent.pointerUp(topEdge, { clientY: 160, pointerId: 1 });
   expect(props.onTimingChange).toHaveBeenCalledTimes(1);
   const [id, newStart, newEnd] = props.onTimingChange.mock.calls[0];
   expect(id).toBe(2);

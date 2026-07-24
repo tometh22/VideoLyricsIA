@@ -67,3 +67,30 @@ def test_edit_pipeline_checks_object_exists_before_using_input():
     object_exists must gate the input download."""
     src = inspect.getsource(pipeline.run_edit_pipeline)
     assert "storage.object_exists(input_r2_key)" in src
+
+
+def test_edit_preflight_mirrors_worker_fallback():
+    """The /edit pre-flight must mirror BOTH audio tiers of the worker
+    (2026-07-10, job 53b9513225b1 "No Hay Santos"): blocking on the input
+    alone rejected a recoverable lyrics edit with 422 "Subí el MP3 de
+    nuevo" even though the rendered MP4 was alive and run_edit_pipeline
+    would have extracted the audio from it (tier-2)."""
+    import main
+    src = inspect.getsource(main.request_edit)
+    # probes the deliverables, not only the input
+    assert '("video", "short")' in src
+    assert "_has_deliverable" in src
+    # 422 only when NEITHER tier can source audio
+    assert "not _has_input and not _has_deliverable" in src
+    # the recoverable case proceeds and is observable in prod logs
+    assert "tier-2" in src
+
+
+def test_source_audio_404_is_diagnosable_in_prod():
+    """When every audio candidate is gone, /source-audio-url must log WHICH
+    keys were probed — otherwise the editor's "Audio no disponible" banner
+    is undebuggable from prod (we can't tell dead key vs R2 probe hiccup)."""
+    import main
+    src = inspect.getsource(main.get_source_audio_url)
+    assert "[SOURCE-AUDIO] 404" in src
+    assert "input_r2_key=%r" in src

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
-import { REF_W, tierForLength, fontSizeFactor } from "../lib/lyricTiers";
+import { REF_W, lyricFontPx } from "../lib/lyricTiers";
 import { activeWordIndex } from "../lib/karaokeTiming";
 import { FONT_BY_CODE, applyCase } from "./fontCatalog";
 
@@ -236,21 +236,20 @@ export default function WizardLivePreview({
   const sample = applyCase(t("upload.preview_sample") || "esta es tu letra", textCase);
   // Typography resolved values:
   // - fontInfo: { css, weight } o defaults Auto (no override).
-  // - scaleN: clamp 0.6–1.5 (mismo rango que LyricVideoPreview).
-  // - baseFontSize: el clamp(18px,7.5cqw,68px) histórico, escalado por scaleN.
+  // - baseFontSize: lyricTiers.lyricFontPx (tier por largo × font_scale
+  //   clampeado 0.6–1.5 × factor por familia) → cqw. Idéntico al render;
+  //   guardado por lib/renderParity.test.js sobre shared/renderParity.json.
   // - contrastStyle: outline + shadow del CONTRAST_STYLES.
   const fontInfo = FONT_BY_CODE[font] || FONT_BY_CODE[""];
-  const scaleN = Math.max(0.6, Math.min(1.5, parseFloat(fontScale) || 1));
   // WYSIWYG font size (2026-06-04): mirror the render's lyric_fontsize EXACTLY
   // instead of a fixed 7.5cqw (which previewed ~1.5× too big and ignored line
-  // length). Render = tier-by-character-count (ass_render.lyric_fontsize) ×
-  // font_scale × per-font factor, in PlayResY=1080 → cqw = fontPx / REF_W × 100
-  // (fraction of the 1920-wide frame, matching LyricVideoPreview). Length comes
-  // from the actual displayed text — the live line if playing, else the sample.
+  // length). PlayResY=1080 → cqw = fontPx / REF_W × 100 (fraction of the
+  // 1920-wide frame, matching LyricVideoPreview). Length comes from the
+  // actual displayed text — the live line if playing, else the sample.
   const _dispText = (livePlaybackTick && livePlaybackTick.activeLine)
     ? applyCase(livePlaybackTick.activeLine, textCase)
     : sample;
-  const baseFontSize = `${((tierForLength(_dispText.length).fontPx / REF_W) * 100 * scaleN * fontSizeFactor(font)).toFixed(3)}cqw`;
+  const baseFontSize = `${((lyricFontPx(_dispText.length, fontScale, font) / REF_W) * 100).toFixed(3)}cqw`;
   const contrastStyle = CONTRAST_STYLES[textContrast] || CONTRAST_STYLES.medium;
   const moveLabel = {
     "": t("upload.movement_auto") || "Auto",
@@ -281,8 +280,13 @@ export default function WizardLivePreview({
   const lineAnim = {
     pop: "wlp-pop .55s cubic-bezier(.2,1.4,.35,1) both",
     glow: "wlp-lyric-in .7s cubic-bezier(.2,.8,.2,1) both, wlp-glow-text 2.4s 0.7s ease-in-out infinite",
-    none: "wlp-lyric-in .7s cubic-bezier(.2,.8,.2,1) both",
-  }[lyricsAnimation] || "wlp-lyric-in .7s cubic-bezier(.2,.8,.2,1) both";
+    // `none` must really be static. The old fallback faded and translated
+    // every live line even though the operator had selected no animation.
+    // Over a moving <video>, Chrome/Safari could briefly composite the text
+    // layer as a dark rectangular tile — the flashing box reported in the
+    // editor preview. Explicit templates keep their intended animation.
+    none: undefined,
+  }[lyricsAnimation];
   const sampleWords = sample.split(/\s+/).filter(Boolean);
   // Word-level templates LOOP continuously (a constant stagger keeps the words
   // in lockstep) so the sweep/reveal is always visible — not a one-shot that

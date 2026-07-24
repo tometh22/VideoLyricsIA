@@ -154,7 +154,11 @@ it("fontScale multiplies the tier size and is clamped to the backend max (1.5)",
   cleanup();
   setup({ segments: seg, currentTime: 2, fontScale: 2.0 }); // over the clamp
   const at20 = parseFloat(screen.getByText("corta").style.fontSize);
-  expect(at15).toBeCloseTo(base * 1.5, 3);
+  expect(base).toBeCloseTo((85 / 1920) * 100, 3);
+  // 85 × 1.5 = 127.5 → the render rounds to an INTEGER px with Python
+  // banker's rounding (128), and since the parity refactor the preview
+  // shows that exact px — not the continuous 127.5 the old formula used.
+  expect(at15).toBeCloseTo((128 / 1920) * 100, 3);
   expect(at20).toBeCloseTo(at15, 3); // clamped to 1.5, not 2.0
 });
 

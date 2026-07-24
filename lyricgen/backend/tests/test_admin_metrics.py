@@ -185,3 +185,36 @@ def test_alerta_no_dispara_con_salud_normal():
         assert [f for f in fired if f["tenant"] == _T] == []
     finally:
         _cleanup(db); db.close()
+
+
+def test_rework_alert_requiere_volumen_minimo():
+    """100% de retrabajo sobre pocos jobs (ej. el smoke) NO debe alertar;
+    con volumen suficiente sí. Regresión del falso positivo 2026-07-24."""
+    db = SessionLocal()
+    try:
+        _cleanup(db); _seed_user(db)
+        for i in range(2):  # 2 jobs editados → 100% pero volumen <5
+            _seed_job(db, f"rw-{i}", days_ago=1 + i)
+            _seed_audit(db, "job.edit_request", f"rw-{i}", days_ago=1 + i)
+        with mock.patch.dict(sys.modules, {"sentry_sdk": mock.MagicMock()}):
+            fired = run_business_alerts(db)
+        assert (_T, "rework-spike") not in {(f["tenant"], f["kind"]) for f in fired}
+        for i in range(2, 6):  # sube a 6 editados → ahora sí dispara
+            _seed_job(db, f"rw-{i}", days_ago=1 + i)
+            _seed_audit(db, "job.edit_request", f"rw-{i}", days_ago=1 + i)
+        with mock.patch.dict(sys.modules, {"sentry_sdk": mock.MagicMock()}):
+            fired2 = run_business_alerts(db)
+        assert (_T, "rework-spike") in {(f["tenant"], f["kind"]) for f in fired2}
+    finally:
+        _cleanup(db); db.close()
+
+
+def test_is_internal_tenant_excluye_ci_smoke():
+    from admin_metrics import _is_internal_tenant
+    assert _is_internal_tenant("genly_edit_smoke_ci") is True
+    assert _is_internal_tenant("algo_smoke") is True
+    assert _is_internal_tenant("foo_ci") is True
+    assert _is_internal_tenant("umusic") is False
+    assert _is_internal_tenant("universal_argentina") is False
+    assert _is_internal_tenant("") is False
+    assert _is_internal_tenant(None) is False

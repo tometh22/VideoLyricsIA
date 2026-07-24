@@ -564,7 +564,7 @@ def bulk_delete_jobs(db: Session, job_ids: list[str], tenant_id: str) -> dict:
 # them at the user-facing read boundary. Admin paths use
 # `get_all_jobs_admin` and still see ghosts for debugging.
 _BG_PREVIEW_STATUSES = (
-    "bg_preview_queued", "bg_preview_generating",
+    "bg_preview_queued", "bg_preview_running",
     "bg_preview_done", "bg_preview_failed",
 )
 
@@ -591,6 +591,11 @@ def get_all_jobs(
     """
     query = db.query(Job).filter(
         ~Job.status.in_(_BG_PREVIEW_STATUSES),
+        # Defense in depth for preview rows that were created by an older
+        # worker and got stranded in a generic terminal state such as
+        # validation_failed. Filename identifies their tracking-only nature
+        # independently of status, so they can never leak into Historial.
+        ~Job.filename.startswith("bgpreview_"),
     )
     if tenant_id is not None:
         query = query.filter(Job.tenant_id == tenant_id)
@@ -604,7 +609,10 @@ def get_all_jobs(
     return [j.to_list_dict() for j in jobs]
 
 
-_TERMINAL_STATUSES = ("done", "error", "rejected", "validation_failed")
+_TERMINAL_STATUSES = (
+    "done", "error", "rejected", "validation_failed",
+    "bg_preview_done", "bg_preview_failed",
+)
 # Sub-partition of terminal statuses by outcome. The pipeline writes
 # done/pending_review only after deliverables actually land in R2; once
 # that ground truth is in the row, NO failure-shaped status ever
@@ -614,7 +622,7 @@ _TERMINAL_STATUSES = ("done", "error", "rejected", "validation_failed")
 # completing worker, edit failure that ran after the worker recovered)
 # now bounces off this guard inside update_job instead of having to
 # re-check the row in every call site.
-_SUCCESS_TERMINAL_STATUSES = ("done", "pending_review")
+_SUCCESS_TERMINAL_STATUSES = ("done", "pending_review", "bg_preview_done")
 _FAILURE_TARGET_STATUSES = (
     "error", "rejected", "validation_failed", "transcription_failed",
     "bg_preview_failed",
@@ -710,6 +718,23 @@ def update_job(job_id: str, **kwargs) -> None:
             kwargs.pop("error_category", None)
             kwargs.pop("current_step", None)
             kwargs.pop("completed_at", None)
+            if not kwargs:
+                return
+
+        # Once an operator has produced a versioned editor save, worker-side
+        # transcription/post-processing must not silently replace it. Explicit
+        # editor writes use the CAS paths in main.py; background workers may
+        # only repeat the exact persisted snapshot.
+        if (
+            "segments_json" in kwargs
+            and int(getattr(job, "segments_revision", 0) or 0) > 0
+            and kwargs["segments_json"] != job.segments_json
+        ):
+            _logger.warning(
+                "[segments-occ] ignored background overwrite job=%s revision=%s",
+                job_id, job.segments_revision,
+            )
+            kwargs.pop("segments_json", None)
             if not kwargs:
                 return
 

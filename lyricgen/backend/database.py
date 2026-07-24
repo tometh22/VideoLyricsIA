@@ -145,6 +145,70 @@ def get_db():
         db.close()
 
 
+# ── Deliveries external DB (portal umg.genly.pro) ─────────────────────────
+# El portal es prod-backed: sus /api/deliveries/* pegan al backend de PROD →
+# tabla `deliveries` de la DB de PROD. Para que el operador pueda "Enviar a
+# UMG" indistintamente desde staging o prod y aparezca en el mismo portal,
+# las escrituras/lecturas de deliveries pueden rutearse a una DB externa
+# (la de prod) vía DELIVERIES_DATABASE_URL.
+#
+# Solo se activa si la env var está seteada (staging). Sin ella,
+# DeliveriesSessionLocal ES SessionLocal y get_deliveries_db es idéntico a
+# get_db → prod y dev quedan byte-a-byte iguales que hoy. NO se corre
+# create_all contra este engine: la DB externa (prod) es dueña de su schema.
+DELIVERIES_DATABASE_URL = os.environ.get("DELIVERIES_DATABASE_URL", "").strip()
+if DELIVERIES_DATABASE_URL.startswith("postgres://"):
+    DELIVERIES_DATABASE_URL = DELIVERIES_DATABASE_URL.replace(
+        "postgres://", "postgresql://", 1
+    )
+
+# El added_by_user_id de deliveries es FK NOT NULL a users.id de la DB
+# destino. Un user id de staging no existe en prod → al escribir en la DB
+# externa hay que mapearlo a un admin válido de prod (igual que
+# scripts/migrate_deliveries_staging_to_prod.py con DEST_ADMIN_USER_ID).
+_DELIVERIES_ADDED_BY = os.environ.get("DELIVERIES_ADDED_BY_USER_ID")
+
+if DELIVERIES_DATABASE_URL:
+    deliveries_engine = create_engine(
+        DELIVERIES_DATABASE_URL,
+        # Pool chico: es cross-project (staging→prod, conexión pública) y de
+        # bajo volumen (un puñado de clicks/día). No inflar el pool de prod.
+        pool_size=int(os.environ.get("DELIVERIES_DB_POOL_SIZE", "1")),
+        max_overflow=int(os.environ.get("DELIVERIES_DB_MAX_OVERFLOW", "2")),
+        pool_pre_ping=True,
+        pool_recycle=120,
+        pool_reset_on_return="rollback",
+        echo=os.environ.get("SQL_ECHO", "").lower() == "true",
+        connect_args=_build_pg_connect_args(),
+    )
+    DeliveriesSessionLocal = sessionmaker(
+        bind=deliveries_engine, autoflush=False, expire_on_commit=False
+    )
+else:
+    deliveries_engine = None
+    DeliveriesSessionLocal = SessionLocal  # fallback: idéntico a hoy
+
+
+def get_deliveries_db():
+    """FastAPI dependency: sesión para las tablas del portal (deliveries /
+    delivery_change_requests). Ruta a la DB externa si DELIVERIES_DATABASE_URL
+    está seteada; si no, es la sesión local de siempre."""
+    db = DeliveriesSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def deliveries_added_by(default_user_id):
+    """user id FK-válido para la DB de deliveries. Con DB externa configurada
+    usa DELIVERIES_ADDED_BY_USER_ID (un admin de prod); si no, el id local
+    que venía usándose (current_user)."""
+    if DELIVERIES_DATABASE_URL and _DELIVERIES_ADDED_BY:
+        return int(_DELIVERIES_ADDED_BY)
+    return default_user_id
+
+
 from contextlib import contextmanager  # noqa: E402 — kept next to the helper it powers
 
 
@@ -251,6 +315,11 @@ class User(Base):
     # no row shows a banner until a real failure flips it.
     billing_status = Column(String(20), nullable=False, default="active",
                             server_default="active")
+
+    # Monotonic credential epoch embedded in every access JWT. Incrementing
+    # it invalidates every previously-issued access token for this user
+    # without rotating the shared JWT signing secret across a mixed fleet.
+    auth_version = Column(Integer, nullable=False, default=0, server_default="0")
 
     # AI authorization (UMG compliance — Guideline 5)
     ai_authorized = Column(Boolean, default=False)
@@ -405,6 +474,8 @@ class Job(Base):
     # bg_r2_key_cached — R2 key for the AI-generated background so typography-only
     #   edits can re-use it without paying for Veo again.
     segments_json = Column(JSONB, nullable=True)
+    # Server-owned optimistic concurrency version for editor writes.
+    segments_revision = Column(BigInteger, default=0, nullable=False, server_default="0")
     render_params = Column(JSONB, nullable=True)
     edit_count = Column(Integer, default=0, nullable=False, server_default="0")
     bg_r2_key_cached = Column(Text, nullable=True)
@@ -513,6 +584,7 @@ class Job(Base):
             # lyrics and lets them attempt typography edits that the backend
             # then rejects with a raw English error.
             "segments_json": self.segments_json,
+            "segments_revision": self.segments_revision or 0,
             "bg_r2_key_cached": self.bg_r2_key_cached,
             # Storyboard multi-escena (NULL en jobs de fondo único). El panel
             # de edición lo usa para mostrar las escenas y ofrecer "regenerar
@@ -1245,6 +1317,11 @@ def _migrate_user_columns():
         # full_name/avatar_url. login_sessions la crea create_all().
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(200)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(500)",
+        # Credential epoch used to revoke access JWTs without rotating the
+        # fleet-wide signing secret. Alembic remains the primary migration;
+        # this mirrors the repository's startup self-heal convention.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version INTEGER DEFAULT 0 NOT NULL",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS segments_revision BIGINT DEFAULT 0 NOT NULL",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS youtube_short_data JSONB",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement

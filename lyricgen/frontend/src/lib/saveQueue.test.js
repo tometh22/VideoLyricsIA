@@ -72,23 +72,6 @@ describe("saveQueue", () => {
     expect(persist.mock.calls[1][1]).toEqual(SEG("v4"));
   });
 
-  it("flush espera al trailing más reciente y devuelve el 409 sin reintentos automáticos", async () => {
-    const d1 = deferred();
-    const persist = vi.fn()
-      .mockReturnValueOnce(d1.promise)
-      .mockResolvedValue({ ok: false, reason: "http-409", status: 409 });
-    const q = createSaveQueue(persist);
-    let segs = SEG("v1");
-    const drained = q.flush("job", { provider: () => segs });
-    segs = SEG("v2");
-    q.flush("job", { provider: () => segs });
-
-    d1.resolve({ ok: true });
-    const result = await drained;
-    expect(result).toEqual({ ok: false, reason: "http-409", status: 409 });
-    expect(persist).toHaveBeenCalledTimes(2);
-  });
-
   it("status: idle → saving → saved, y saved se desvanece a idle", async () => {
     const d = deferred();
     const persist = vi.fn().mockReturnValue(d.promise);
@@ -200,11 +183,35 @@ describe("saveQueue", () => {
     const q = createSaveQueue(persist);
     q.flush("job", { provider: () => SEG("v1") });      // normal, en vuelo
     expect(q.getStatus("job").status).toBe("saving");
-    q.flush("job", { keepalive: true, provider: () => SEG("v2") }); // keepalive bypass
-    expect(persist).toHaveBeenCalledTimes(2);
-    expect(persist.mock.calls[1][2]).toEqual({ keepalive: true });
-    // el status sigue en "saving" (el keepalive no lo tocó)
+    const unload = await q.flush("job", { keepalive: true, provider: () => SEG("v2") });
+    // CAS no permite dos snapshots con la misma base en paralelo: el draft
+    // queda local y el trailing se drena cuando A termina.
+    expect(unload).toMatchObject({ ok: false, reason: "inflight" });
+    expect(persist).toHaveBeenCalledTimes(1);
     expect(q.getStatus("job").status).toBe("saving");
+    d1.resolve({ ok: true, revision: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it("no emite saved para A si B quedó debounced durante el POST", async () => {
+    const d1 = deferred();
+    const d2 = deferred();
+    const persist = vi.fn().mockReturnValueOnce(d1.promise).mockReturnValueOnce(d2.promise);
+    const q = createSaveQueue(persist, { debounceMs: 3000 });
+    const seen = [];
+    q.subscribe("job", (state) => seen.push(state.status));
+    let value = SEG("A");
+    q.flush("job", { provider: () => value });
+    value = SEG("B");
+    q.schedule("job", () => value);
+    d1.resolve({ ok: true, revision: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(persist).toHaveBeenCalledTimes(2);
+    expect(persist.mock.calls[1][1]).toEqual(SEG("B"));
+    expect(seen).not.toContain("saved");
+    d2.resolve({ ok: true, revision: 2 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(seen.at(-1)).toBe("saved");
   });
 
   it("no dispara si no hay segmentos (o lista vacía)", async () => {
@@ -236,5 +243,40 @@ describe("saveQueue", () => {
     expect(persist).toHaveBeenCalledTimes(2);
     const jobsSaved = persist.mock.calls.map((c) => c[0]).sort();
     expect(jobsSaved).toEqual(["A", "B"]);
+  });
+
+  it("flush retorna una Promise que espera también el trailing coalescido", async () => {
+    const d1 = deferred();
+    const d2 = deferred();
+    const persist = vi.fn()
+      .mockReturnValueOnce(d1.promise)
+      .mockReturnValueOnce(d2.promise);
+    const q = createSaveQueue(persist);
+    let segs = SEG("v1");
+    const first = q.flush("job", { provider: () => segs });
+    segs = SEG("v2");
+    const second = q.flush("job", { provider: () => segs });
+    let drained = false;
+    second.then(() => { drained = true; });
+    d1.resolve({ ok: true, revision: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(drained).toBe(false);
+    expect(persist.mock.calls[1][2].baseRevision).toBe(1);
+    d2.resolve({ ok: true, revision: 2 });
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(first).resolves.toMatchObject({ ok: true, revision: 2 });
+    await expect(second).resolves.toMatchObject({ ok: true, revision: 2 });
+  });
+
+  it("flushAll drena todos los jobs y retire espera antes de descartar", async () => {
+    const persist = vi.fn().mockResolvedValue({ ok: true, revision: 1 });
+    const q = createSaveQueue(persist);
+    q.schedule("A", () => SEG("a"));
+    q.schedule("B", () => SEG("b"));
+    await q.flushAll();
+    expect(persist).toHaveBeenCalledTimes(2);
+    await expect(q.retire("A", { provider: () => SEG("final") })).resolves.toMatchObject({ ok: true });
+    expect(q._peek("A")).toBeUndefined();
+    expect(q._peek("B")).toBeDefined();
   });
 });

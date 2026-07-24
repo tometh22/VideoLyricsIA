@@ -17,12 +17,13 @@
  * onEditedChange / onApprove. This component owns NO persistence.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useI18n } from "../i18n";
 
-// Zoom = px per second (vertical). Operator-adjustable so dense sections
-// spread out; lower = more of the song on screen at once. Default is low
-// on purpose: at 40 px/s a 4s line was a 160px monolith and you saw ~4
-// lines of 60. At 16 px/s the same line is ~64px and ~15-20 lines fit.
-const ZOOM_DEFAULT = 16;
+// Zoom = px per second (vertical). The former 16 px/s default compressed
+// 30–40 seconds into the first viewport, making handles and short lines hard
+// to distinguish until the operator clicked + several times. 32 px/s opens
+// at a useful editing scale while the − control still provides an overview.
+const ZOOM_DEFAULT = 32;
 const ZOOM_MIN = 8;
 const ZOOM_MAX = 60;
 const ZOOM_STEP = 8;
@@ -68,6 +69,8 @@ export default function LyricsTimeline({
   onReset,             // () => void
   focusMode = false,   // 2026-05-25 — passed from LyricsEditor focus toggle
 }) {
+  const i18n = useI18n?.() || {};
+  const t = (key, fallback) => i18n.t?.(key) || fallback || key;
   const laneRef = useRef(null);
   const scrollRef = useRef(null);
   const canvasRef = useRef(null);
@@ -78,6 +81,11 @@ export default function LyricsTimeline({
   const [editingTextId, setEditingTextId] = useState(null); // line whose text is being fixed inline
   const [draftText, setDraftText] = useState("");
   const lastUserScrollRef = useRef(0);
+  const programmaticScrollUntilRef = useRef(0);
+  const followPauseTimerRef = useRef(null);
+  const [followEnabled, setFollowEnabled] = useState(true);
+  const [followSuppressed, setFollowSuppressed] = useState(false);
+  const [scrollState, setScrollState] = useState({ top: 0, viewport: 1 });
 
   const beginTextEdit = useCallback((seg) => {
     setEditingTextId(seg._id);
@@ -88,7 +96,16 @@ export default function LyricsTimeline({
     onTextChange?.(id, draftText);
   }, [draftText, onTextChange]);
   const cancelTextEdit = useCallback(() => setEditingTextId(null), []);
-  const markUserScroll = useCallback(() => { lastUserScrollRef.current = Date.now(); }, []);
+  const markUserScroll = useCallback(() => {
+    lastUserScrollRef.current = Date.now();
+    setFollowSuppressed(true);
+    if (followPauseTimerRef.current) clearTimeout(followPauseTimerRef.current);
+    followPauseTimerRef.current = setTimeout(() => setFollowSuppressed(false), FOLLOW_SUPPRESS_MS);
+  }, []);
+
+  useEffect(() => () => {
+    if (followPauseTimerRef.current) clearTimeout(followPauseTimerRef.current);
+  }, []);
 
   const total = Math.max(duration || 0, ...segments.map((s) => s.end), 1);
   const laneHeight = total * pxPerSec;
@@ -285,7 +302,7 @@ export default function LyricsTimeline({
   // el segmento arrastrado se commiteaba con un valor incorrecto porque
   // el viewport se movía mientras el operador soltaba.
   useEffect(() => {
-    if (!isPlaying) return;
+    if (!isPlaying || !followEnabled) return;
     if (dragRef.current) return;          // FIX 1: no follow durante drag
     if (Date.now() - lastUserScrollRef.current < FOLLOW_SUPPRESS_MS) return;
     const sc = scrollRef.current;
@@ -294,9 +311,10 @@ export default function LyricsTimeline({
     const view = sc.scrollTop;
     const h = sc.clientHeight;
     if (y < view + 40 || y > view + h - 80) {
+      programmaticScrollUntilRef.current = Date.now() + 600;
       sc.scrollTo({ top: Math.max(0, y - h * 0.4), behavior: "smooth" });
     }
-  }, [currentTime, isPlaying, pxPerSec]);
+  }, [currentTime, isPlaying, pxPerSec, followEnabled]);
 
   // Draw the waveform in the gutter (static — redraws only when the peaks
   // or the time scale change, never per playhead tick). Guarded for jsdom,
@@ -344,7 +362,10 @@ export default function LyricsTimeline({
       // rompe el clientYToTime() calc.
       if (dragRef.current) return;
       const sc = scrollRef.current;
-      if (sc) sc.scrollTop = Math.max(0, firstStart * pxPerSec - 28);
+      if (sc) {
+        programmaticScrollUntilRef.current = Date.now() + 100;
+        sc.scrollTop = Math.max(0, firstStart * pxPerSec - 28);
+      }
       didAutoScrollRef.current = true;
     });
     return () => cancelAnimationFrame(raf);
@@ -356,18 +377,82 @@ export default function LyricsTimeline({
   const ticks = [];
   for (let s = 0; s <= total; s += 5) ticks.push(s);
 
+  const fitTimeline = () => {
+    const viewport = scrollRef.current?.clientHeight || 480;
+    setPxPerSec(Math.max(1.5, Math.min(ZOOM_DEFAULT, viewport / total)));
+    requestAnimationFrame(() => {
+      if (scrollRef.current) {
+        programmaticScrollUntilRef.current = Date.now() + 100;
+        scrollRef.current.scrollTop = 0;
+      }
+    });
+  };
+
+  const showDetail = () => {
+    setPxPerSec(ZOOM_DEFAULT);
+    requestAnimationFrame(() => {
+      const sc = scrollRef.current;
+      if (sc) {
+        programmaticScrollUntilRef.current = Date.now() + 100;
+        sc.scrollTop = Math.max(0, currentTime * ZOOM_DEFAULT - sc.clientHeight * 0.4);
+      }
+    });
+  };
+
+  const handleTimelineScroll = (event) => {
+    if (Date.now() > programmaticScrollUntilRef.current) markUserScroll();
+    setScrollState({ top: event.currentTarget.scrollTop, viewport: event.currentTarget.clientHeight });
+  };
+
+  // Keep the minimap viewport accurate before the operator performs the
+  // first scroll and whenever zoom/layout changes alter the visible range.
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => {
+      const sc = scrollRef.current;
+      if (sc) setScrollState({ top: sc.scrollTop, viewport: sc.clientHeight });
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [pxPerSec, focusMode, laneHeight]);
+
+  const jumpFromMinimap = (event) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+    const time = pct * total;
+    onSeek?.(time);
+    const sc = scrollRef.current;
+    if (sc) {
+      programmaticScrollUntilRef.current = Date.now() + 100;
+      sc.scrollTop = Math.max(0, time * pxPerSec - sc.clientHeight * 0.4);
+    }
+  };
+
+  const toggleFollow = () => {
+    if (followEnabled && followSuppressed) {
+      lastUserScrollRef.current = 0;
+      setFollowSuppressed(false);
+      if (followPauseTimerRef.current) clearTimeout(followPauseTimerRef.current);
+      const sc = scrollRef.current;
+      if (sc) {
+        programmaticScrollUntilRef.current = Date.now() + 100;
+        sc.scrollTop = Math.max(0, currentTime * pxPerSec - sc.clientHeight * 0.4);
+      }
+      return;
+    }
+    setFollowEnabled((value) => !value);
+  };
+
   return (
     <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.05] overflow-hidden animate-fade-in">
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2.5 border-b border-white/[0.05] gap-3 flex-wrap">
         <div className="flex items-center gap-2.5">
           <span className="text-[11px] uppercase tracking-wider text-ink-tertiary font-semibold">
-            Línea de tiempo
+            {t("timeline.title", "Línea de tiempo")}
           </span>
           {saveStatus === "saving" && (
             <span className="text-[10px] text-ink-tertiary flex items-center gap-1">
               <span className="w-1.5 h-1.5 rounded-full bg-ink-tertiary animate-pulse" />
-              Guardando…
+              {t("timeline.saving", "Guardando…")}
             </span>
           )}
           {saveStatus === "saved" && (
@@ -375,7 +460,7 @@ export default function LyricsTimeline({
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
                 <path d="M20 6 9 17l-5-5" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
-              Guardado
+              {t("timeline.saved", "Guardado")}
             </span>
           )}
           {saveStatus === "error" && (
@@ -386,37 +471,50 @@ export default function LyricsTimeline({
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
                 <path d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zM12 15.75h.01" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
-              Sin guardar — revisá tu conexión
+              {t("timeline.save_error", "Sin guardar — revisá tu conexión")}
             </span>
           )}
         </div>
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={toggleFollow}
+            aria-pressed={followEnabled}
+            className={`text-label px-2.5 py-1 rounded-md ring-1 transition-colors ${followEnabled ? "text-brand-light bg-brand/10 ring-brand/30" : "text-ink-secondary ring-white/[0.08] hover:text-white"}`}
+            title={t("timeline.follow_hint", "Mantener la línea activa visible durante la reproducción")}
+          >
+            {followEnabled && followSuppressed ? t("timeline.resume", "Reanudar") : t("timeline.follow", "Seguir")}
+          </button>
+          <div className="inline-flex items-center rounded-md ring-1 ring-white/[0.08] overflow-hidden">
+            <button type="button" onClick={fitTimeline} className="px-2 py-1 text-[10px] text-ink-secondary hover:text-white hover:bg-white/[0.05]" title={t("timeline.fit_hint", "Ver la canción completa")}>{t("timeline.fit", "Ajustar")}</button>
+            <button type="button" onClick={showDetail} className="px-2 py-1 text-[10px] text-ink-secondary hover:text-white hover:bg-white/[0.05] border-l border-white/[0.08]" title={t("timeline.detail_hint", "Volver al zoom de edición")}>{t("timeline.detail", "Detalle")}</button>
+          </div>
           <div className="inline-flex items-center rounded-md ring-1 ring-white/[0.08] overflow-hidden">
             <button
               onClick={() => setPxPerSec((z) => Math.max(ZOOM_MIN, z - ZOOM_STEP))}
               disabled={pxPerSec <= ZOOM_MIN}
               className="px-2 py-1 text-ink-secondary hover:text-white hover:bg-white/[0.05] disabled:opacity-30 transition-colors"
-              title="Alejar" aria-label="Alejar"
+              title={t("timeline.zoom_out", "Alejar")} aria-label={t("timeline.zoom_out", "Alejar")}
             >−</button>
-            <span className="px-1.5 text-[10px] text-ink-tertiary tabular-nums select-none">zoom</span>
+            <span className="px-1.5 text-[10px] text-ink-tertiary tabular-nums select-none">{Math.round(pxPerSec)} px/s</span>
             <button
-              onClick={() => setPxPerSec((z) => Math.min(ZOOM_MAX, z + ZOOM_STEP))}
+              onClick={() => setPxPerSec((z) => Math.min(ZOOM_MAX, z < ZOOM_MIN ? ZOOM_MIN : z + ZOOM_STEP))}
               disabled={pxPerSec >= ZOOM_MAX}
               className="px-2 py-1 text-ink-secondary hover:text-white hover:bg-white/[0.05] disabled:opacity-30 transition-colors"
-              title="Acercar" aria-label="Acercar"
+              title={t("timeline.zoom_in", "Acercar")} aria-label={t("timeline.zoom_in", "Acercar")}
             >+</button>
           </div>
           <button
             onClick={onReset}
             className="text-label px-2.5 py-1 rounded-md text-ink-secondary
               ring-1 ring-white/[0.08] hover:ring-white/20 hover:text-white transition-colors flex items-center gap-1.5"
-            title="Volver los timings al estado original"
+            title={t("timeline.reset_hint", "Volver los timings al estado original")}
           >
             <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M3 12a9 9 0 1 0 3-6.7L3 8" strokeLinecap="round" strokeLinejoin="round" />
               <path d="M3 3v5h5" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
-            Resetear timings
+            {t("timeline.reset", "Resetear timings")}
           </button>
         </div>
       </div>
@@ -433,12 +531,13 @@ export default function LyricsTimeline({
           (header del timeline, controles arriba). Nested scroll
           aceptable: el inner se activa con mouse-wheel sobre el lane,
           el outer con wheel sobre el header. */}
+      <div className="relative">
       <div
         ref={scrollRef}
         className="overflow-y-auto overflow-x-hidden"
         style={{ maxHeight: focusMode ? MAX_VH_FOCUS : MAX_VH_NORMAL }}
         onPointerMove={onPointerMove}
-        onScroll={markUserScroll}
+        onScroll={handleTimelineScroll}
       >
         <div
           ref={laneRef}
@@ -532,7 +631,7 @@ export default function LyricsTimeline({
                   onPointerDown={(e) => onPointerDown(e, seg, "start")}
                   onPointerMove={onPointerMove}
                   onPointerUp={(e) => onPointerUp(e, seg)}
-                  title="Arrastrá: cuándo ENTRA la línea"
+                  title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea")}
                 >
                   <div className="w-7 h-[3px] rounded-full bg-white/40 group-hover/ht:bg-white/90 transition-colors" />
                 </div>
@@ -543,7 +642,7 @@ export default function LyricsTimeline({
                   onPointerDown={(e) => onPointerDown(e, seg, "end")}
                   onPointerMove={onPointerMove}
                   onPointerUp={(e) => onPointerUp(e, seg)}
-                  title="Arrastrá: cuándo SALE la línea"
+                  title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea")}
                 >
                   <div className="w-7 h-[3px] rounded-full bg-white/40 group-hover/hb:bg-white/90 transition-colors" />
                 </div>
@@ -611,13 +710,36 @@ export default function LyricsTimeline({
           </div>
         </div>
       </div>
+      <button
+        type="button"
+        className="absolute right-1.5 top-2 bottom-2 z-20 w-3 rounded-full bg-black/35 ring-1 ring-white/10 overflow-hidden"
+        onClick={jumpFromMinimap}
+        aria-label={t("timeline.minimap", "Mini-mapa de la canción: click para saltar en el tiempo")}
+        title={t("timeline.minimap", "Mini-mapa de la canción")}
+      >
+        {segments.map((seg) => (
+          <span
+            key={seg._id}
+            className={`absolute left-[3px] right-[3px] rounded-full ${seg._id === activeId ? "bg-brand-light" : "bg-white/25"}`}
+            style={{ top: `${(seg.start / total) * 100}%`, height: `${Math.max(0.5, ((seg.end - seg.start) / total) * 100)}%` }}
+          />
+        ))}
+        <span
+          className="absolute left-0 right-0 rounded-full ring-1 ring-brand-light/80 bg-brand/25 pointer-events-none"
+          style={{
+            top: `${Math.min(100, (scrollState.top / Math.max(laneHeight, 1)) * 100)}%`,
+            height: `${Math.min(100, Math.max(3, (scrollState.viewport / Math.max(laneHeight, 1)) * 100))}%`,
+          }}
+        />
+      </button>
+      </div>
 
       <p className="px-3 py-2 text-[10px] text-ink-tertiary border-t border-white/[0.05] flex flex-wrap items-center gap-x-3 gap-y-1">
-        <span><span className="text-ink-secondary">↕ bordes</span> ajustan entra/sale</span>
-        <span><span className="text-ink-secondary">cuerpo</span> mueve la línea</span>
-        <span><span className="text-ink-secondary">click</span> salta a ese punto</span>
-        <span><span className="text-ink-secondary">doble-click</span> corrige el texto</span>
-        <span className="text-ink-tertiary/70">lo que ajustás queda fijo</span>
+        <span><span className="text-ink-secondary">↕ {t("timeline.edges", "bordes")}</span> {t("timeline.edges_help", "ajustan entrada/salida")}</span>
+        <span><span className="text-ink-secondary">{t("timeline.body", "cuerpo")}</span> {t("timeline.body_help", "mueve la línea")}</span>
+        <span><span className="text-ink-secondary">click</span> {t("timeline.click_help", "salta a ese punto")}</span>
+        <span><span className="text-ink-secondary">{t("timeline.double_click", "doble-click")}</span> {t("timeline.double_click_help", "corrige el texto")}</span>
+        <span className="text-ink-tertiary/70">{t("timeline.fixed_help", "lo que ajustás queda fijo")}</span>
       </p>
     </div>
   );

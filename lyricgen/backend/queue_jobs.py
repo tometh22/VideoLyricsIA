@@ -20,6 +20,80 @@ import threading
 logger = logging.getLogger("genly.queue")
 
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
+
+# Versioned metadata for every RQ enqueue. Keeping the version in Job.meta
+# (instead of changing the serialized function signature) makes rolling
+# deploys safe in both directions: old workers ignore the new metadata and
+# new workers treat metadata-less jobs already in Redis as v1.
+RQ_PAYLOAD_VERSION = int(os.environ.get("RQ_PAYLOAD_VERSION", "2"))
+if RQ_PAYLOAD_VERSION < 2:
+    raise RuntimeError("RQ_PAYLOAD_VERSION must be >= 2")
+RQ_SUPPORTED_PAYLOAD_VERSIONS = frozenset(
+    (RQ_PAYLOAD_VERSION - 1, RQ_PAYLOAD_VERSION)
+)
+
+
+class UnsupportedRQPayloadVersion(RuntimeError):
+    """Raised before work starts when API and worker protocols cannot agree."""
+
+
+class SubmissionsPausedError(RuntimeError):
+    """Raised when an internal enqueue bypasses the HTTP maintenance gate."""
+
+
+def _require_submissions_open() -> None:
+    from ops_control import get_submissions_state
+    state = get_submissions_state()
+    if state.get("paused"):
+        raise SubmissionsPausedError(
+            state.get("reason") or "new submissions are temporarily paused"
+        )
+
+
+def rq_payload_metadata(kind: str, **extra) -> dict:
+    """Metadata attached to new jobs without altering their call signature."""
+    return {
+        "rq_payload_version": RQ_PAYLOAD_VERSION,
+        "rq_payload_kind": kind,
+        "producer_release": (
+            os.environ.get("RAILWAY_GIT_COMMIT_SHA")
+            or os.environ.get("SENTRY_RELEASE")
+            or os.environ.get("GIT_SHA")
+            or "unknown"
+        ),
+        **extra,
+    }
+
+
+def validate_rq_payload_metadata(meta: dict | None) -> int:
+    """Normalize the protocol version and reject incompatible jobs.
+
+    Jobs created before this protocol had no metadata and are explicitly v1.
+    Only N and N-1 are accepted so a mixed fleet cannot silently execute
+    payload semantics it does not understand.
+    """
+    raw = (meta or {}).get("rq_payload_version", 1)
+    if isinstance(raw, bool):
+        from ops_metrics import increment
+        increment("rq_payload_incompatible")
+        raise UnsupportedRQPayloadVersion("boolean RQ payload version is invalid")
+    try:
+        version = int(raw)
+    except (TypeError, ValueError) as exc:
+        from ops_metrics import increment
+        increment("rq_payload_incompatible")
+        raise UnsupportedRQPayloadVersion(
+            f"invalid RQ payload version: {raw!r}"
+        ) from exc
+    if version not in RQ_SUPPORTED_PAYLOAD_VERSIONS:
+        from ops_metrics import increment
+        increment("rq_payload_incompatible")
+        supported = ",".join(str(v) for v in sorted(RQ_SUPPORTED_PAYLOAD_VERSIONS))
+        raise UnsupportedRQPayloadVersion(
+            f"RQ payload v{version} is incompatible; worker accepts {supported}"
+        )
+    return version
+
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT_SECONDS", "2700"))  # 45 min (YouTube)
 # RQ auto-retry on worker death (Railway redeploy, OOM, hard signal).
 # RQ moves orphaned jobs from StartedJobRegistry to FailedJobRegistry
@@ -33,7 +107,7 @@ JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT_SECONDS", "2700"))  # 45 min (YouT
 # three consecutive redeploys before the failure callback gives up and
 # surfaces the user-facing "Reintentar" button. The real fix is setting
 # RAILWAY_SHUTDOWN_TIMEOUT_SECONDS=1200 on the Worker service (per
-# railway.toml note) so SIGTERM has 20 min to drain in-flight renders,
+# railway/worker.toml note) so SIGTERM has 20 min to drain in-flight renders,
 # but the retry bump is the cheap belt-and-suspenders for cases where
 # SIGKILL still hits (very long render, or env var forgotten on a new
 # environment).
@@ -123,11 +197,27 @@ _ENTERPRISE_TENANTS = frozenset(
     if t.strip()
 )
 
+# Synthetic-traffic tenants (monitors/canaries) drain LAST. The golden
+# render bot fires 3 concurrent renders on every staging push + nightly
+# cron; on 2026-07-17 that tripled the default-queue wait for a real
+# operator mid-test. Canary jobs must never compete with humans — they
+# only need to run *eventually* to keep the regression signal alive.
+# The worker must list "canary" at the END of its QUEUES env or these
+# jobs will sit unconsumed (see worker.py:_resolve_queue_names).
+_CANARY_TENANTS = frozenset(
+    t.strip().lower()
+    for t in os.environ.get("CANARY_TENANTS", "golden_render_bot").split(",")
+    if t.strip()
+)
+
 
 def _pick_queue(plan: str, tenant_id: str = ""):
     """Enterprise queue for premium plans OR B2B tenants, default otherwise.
 
     Precedence (highest first):
+      0. tenant_id matches `_CANARY_TENANTS` — synthetic monitors drain
+         last, whatever their plan says (a canary must never gain fast
+         lane by a plan change).
       1. tenant_id matches `_ENTERPRISE_TENANTS` — UMG/OMG always jump
          the default queue even on plan="100". 2026-05-15 incident:
          agus.cafisi (omg) batch of 5 songs was queuing behind tomas's
@@ -147,6 +237,9 @@ def _pick_queue(plan: str, tenant_id: str = ""):
     if q_default is None:
         return None
     tid = (tenant_id or "").strip().lower()
+    if tid and tid in _CANARY_TENANTS:
+        from rq import Queue
+        return Queue("canary", connection=q_default.connection)
     if tid and tid in _ENTERPRISE_TENANTS:
         return q_enterprise
     if plan in ("unlimited", "enterprise"):
@@ -433,6 +526,17 @@ def enqueue_pipeline(
 ) -> str:
     """Enqueue a run_pipeline job. Returns RQ job id (or 'thread:<job_id>' in
     the Redis-less fallback path)."""
+    _require_submissions_open()
+    # Internal lockstep token: a worker running a different rollout mode must
+    # fail before generation rather than silently producing under another
+    # policy. This is RQ metadata, not a public request/payload field.
+    from background_policy import runtime_rollout_fingerprint
+    kwargs = dict(kwargs)
+    policy_fingerprint = runtime_rollout_fingerprint()
+    # Preserve the origin/staging invocation payload so a v1 worker can
+    # execute a v2-produced job during the bounded cutover. Metadata is the
+    # new source for v2 workers; the legacy argument remains for N-1.
+    kwargs["background_policy_fingerprint"] = policy_fingerprint
     q = _pick_queue(plan, tenant_id=tenant_id)
     if q is not None:
         from rq import Retry
@@ -470,6 +574,9 @@ def enqueue_pipeline(
             result_ttl=RESULT_TTL,
             failure_ttl=FAILURE_TTL,
             job_id=job_id,  # map RQ id to our job_id for easy lookup
+            meta=rq_payload_metadata(
+                "pipeline", background_policy_fingerprint=policy_fingerprint,
+            ),
             retry=retry,
             on_failure=pipeline_failure_callback,
         )
@@ -510,6 +617,7 @@ def enqueue_transcription(
     filename: str = "",
     live: bool = False,
     tenant_id: str = "",
+    anchor_lyrics: str = "",
 ) -> str:
     """Enqueue una transcripción en la queue `transcription` (alta prioridad,
     drenada por el mismo worker container que enterprise/default).
@@ -525,6 +633,7 @@ def enqueue_transcription(
     aparte. Si en el futuro la cola se acumula y un tenant grande está
     bloqueado, mover la decisión de queue acá.
     """
+    _require_submissions_open()
     _, q_default, _ = _init_redis()
     if q_default is not None:
         # Acceso directo al Redis para crear la queue "transcription" sin
@@ -554,11 +663,13 @@ def enqueue_transcription(
             kwargs={
                 "language": language, "artist": artist, "title": title,
                 "filename": filename, "live": live,
+                "anchor_lyrics": anchor_lyrics,
             },
             job_timeout=timeout,
             result_ttl=RESULT_TTL,
             failure_ttl=FAILURE_TTL,
             job_id=f"transcribe:{job_id}",  # prefix evita colisión con render job_id
+            meta=rq_payload_metadata("transcription"),
             retry=retry,
             # INCIDENT 2026-05-24: when RQ killed the work-horse (timeout
             # or OOM), `transcription_worker._fail` never ran (it lives
@@ -585,7 +696,8 @@ def enqueue_transcription(
         args=(job_id, audio_path),
         kwargs={
             "language": language, "artist": artist, "title": title,
-            "filename": filename,
+            "filename": filename, "live": live,
+            "anchor_lyrics": anchor_lyrics,
         },
         daemon=True,
     )
@@ -612,6 +724,9 @@ def enqueue_bg_preview(
     en orden FIFO). Si en el futuro UMG necesita priority, mover a
     `enterprise_bg_preview` o similar.
     """
+    _require_submissions_open()
+    from background_policy import runtime_rollout_fingerprint
+    _policy_fingerprint = runtime_rollout_fingerprint()
     _, q_default, _ = _init_redis()
     if q_default is not None:
         from rq import Queue, Retry
@@ -640,11 +755,14 @@ def enqueue_bg_preview(
         _evict_stale_rq_job(_redis, f"bgpreview:{job_id}")
         rq_job = q.enqueue(
             run_bg_preview_job,
-            args=(job_id, bg_cache_key, params),
+            args=(job_id, bg_cache_key, params, _policy_fingerprint),
             job_timeout=timeout,
             result_ttl=RESULT_TTL,
             failure_ttl=FAILURE_TTL,
             job_id=f"bgpreview:{job_id}",
+            meta=rq_payload_metadata(
+                "bg_preview", background_policy_fingerprint=_policy_fingerprint,
+            ),
             retry=retry,
         )
         return rq_job.id
@@ -660,7 +778,7 @@ def enqueue_bg_preview(
     from bg_preview import run_bg_preview_job
     t = threading.Thread(
         target=run_bg_preview_job,
-        args=(job_id, bg_cache_key, params),
+        args=(job_id, bg_cache_key, params, _policy_fingerprint),
         daemon=True,
     )
     t.start()
@@ -679,6 +797,7 @@ def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
     Returns the RQ job id, or None when prewarm is disabled or Redis
     unreachable (we never raise — prewarm is best-effort by design).
     """
+    _require_submissions_open()
     global prewarm_skipped_total, prewarm_enqueued_total
     if not PRORES_PREWARM_ENABLED:
         return None
@@ -712,6 +831,7 @@ def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
         job_timeout=PRORES_PREWARM_TIMEOUT,
         result_ttl=RESULT_TTL,
         failure_ttl=FAILURE_TTL,
+        meta=rq_payload_metadata("prores_prewarm"),
         # Deterministic id: collapses concurrent double-enqueues to one
         # QUEUED entry. NOTE: RQ (1.16.2) does NOT no-op a re-enqueue of a
         # FINISHED id — enqueue overwrites the job hash and re-pushes the id,
@@ -791,6 +911,9 @@ def enqueue_edit(
     too tight for long songs; we now match the main pipeline's
     YouTube-only allowance to keep the worst-case edit alive.
     """
+    _require_submissions_open()
+    from background_policy import runtime_rollout_fingerprint
+    _policy_fingerprint = runtime_rollout_fingerprint()
     q = _pick_queue(plan, tenant_id=tenant_id)
     if q is not None:
         from rq import Retry
@@ -815,13 +938,16 @@ def enqueue_edit(
         retry = Retry(max=PIPELINE_RETRY_MAX, interval=PIPELINE_RETRY_INTERVAL_S)
         rq_job = q.enqueue(
             run_edit_pipeline,
-            args=(job_id, edit_type, edit_params),
+            args=(job_id, edit_type, edit_params, _policy_fingerprint),
             # 60 min — covers worst-case long-song edits with motion enabled
             # until we land the ffmpeg-overlay rewrite.
             job_timeout=3600,
             result_ttl=RESULT_TTL,
             failure_ttl=FAILURE_TTL,
             job_id=edit_rq_id,
+            meta=rq_payload_metadata(
+                "edit", background_policy_fingerprint=_policy_fingerprint,
+            ),
             retry=retry,
             on_failure=edit_failure_callback,
         )
@@ -836,7 +962,7 @@ def enqueue_edit(
     from pipeline import run_edit_pipeline
     t = threading.Thread(
         target=run_edit_pipeline,
-        args=(job_id, edit_type, edit_params),
+        args=(job_id, edit_type, edit_params, _policy_fingerprint),
         daemon=True,
     )
     t.start()
@@ -860,6 +986,7 @@ def enqueue_drive_delivery(transfer_id: str, plan: str = "100") -> str:
     el operador que clickea "Guardar en Drive" típicamente tiene
     delivery_profile=umg/both (UMG plan).
     """
+    _require_submissions_open()
     _, _, q_enterprise = _init_redis()
     if q_enterprise is None:
         if _ENVIRONMENT == "production":
@@ -884,6 +1011,7 @@ def enqueue_drive_delivery(transfer_id: str, plan: str = "100") -> str:
         job_timeout=3600,  # 60 min — ver docstring arriba
         result_ttl=RESULT_TTL,
         failure_ttl=FAILURE_TTL,
+        meta=rq_payload_metadata("drive_delivery"),
         # Deterministic id: un mismo transfer_id se enqueue solo una vez
         # (RQ dedupes). El operador puede crear N transfers distintos.
         job_id=f"drive:{transfer_id}",

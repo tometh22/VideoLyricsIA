@@ -12,7 +12,20 @@ logger = logging.getLogger("genly.pipeline")
 import subprocess
 import tempfile
 import threading
+import time
 import traceback
+
+try:
+    from rq.timeouts import JobTimeoutException as RQJobTimeoutException
+except Exception:  # pragma: no cover - RQ is optional in lightweight local tools
+    class RQJobTimeoutException(Exception):
+        """Local sentinel used only when RQ is not installed."""
+
+
+def _raise_if_job_timeout(exc: BaseException) -> None:
+    """Never let resilience/fallback code neutralize RQ's death penalty."""
+    if isinstance(exc, RQJobTimeoutException):
+        raise exc
 
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -46,10 +59,28 @@ from moviepy.editor import (
     VideoFileClip,
     concatenate_videoclips,
 )
+# Make moviepy tolerant of non-UTF-8 bytes in ffmpeg's output (accented
+# filenames / metadata — "La Vida Al Revés" → 0xe9). Without this, AudioFileClip
+# / VideoFileClip crash on any accented title. Self-applies on import.
+import moviepy_utf8_patch  # noqa: F401
 from PIL import Image, ImageDraw, ImageFont
 
 from jobs import update_job, get_job_model
 import storage
+from background_policy import (
+    ATMOSPHERIC_NEGATIVE_RAIL,
+    POLICY_VERSION as BACKGROUND_POLICY_VERSION,
+    atmospheric_terms,
+    cache_policy_fingerprint,
+    finalize_provider_prompt,
+    policy_enforces,
+    policy_observes,
+    rebase_stored_atmospherics_policy,
+    resolve_atmospherics_policy,
+    resolve_creative_mode,
+    runtime_rollout_fingerprint,
+    sanitize_generated_text,
+)
 from render_spec import FPS_RATIONAL, RenderSpec
 from subprocess_utils import run_checked, SubprocessExecutionError  # noqa: F401 — exported for upstream catches
 
@@ -72,6 +103,25 @@ _DELIVERABLE_FILENAMES = {
 # instead of pretending to be done. umg_master/umg_short are lazy-generated
 # on first /download, so their absence from R2 here is fine.
 _CRITICAL_DELIVERABLES = ("video", "short", "thumbnail")
+
+
+class StorageUploadError(RuntimeError):
+    """All bounded R2 upload attempts failed while local outputs still exist.
+
+    This exception is deliberately distinct from render failures: deleting the
+    job directory here would destroy the only copy that can still be uploaded
+    by this worker/container.
+    """
+
+
+def _r2_upload_attempts() -> int:
+    """Bound retry config and keep a typo from bypassing output retention."""
+    raw = os.environ.get("R2_UPLOAD_ATTEMPTS", "3")
+    try:
+        return max(1, min(int(raw), 10))
+    except (TypeError, ValueError):
+        logger.error("Invalid R2_UPLOAD_ATTEMPTS=%r; using 3", raw)
+        return 3
 
 
 def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
@@ -144,10 +194,34 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
             heartbeat(job_id)
         except Exception:
             pass  # heartbeat is best-effort; never block an upload
-        try:
-            key = storage.upload_master(local, tenant_id, job_id, key_name)
-            if key:
-                out[ftype_short] = key
+        key = None
+        last_error: Exception | None = None
+        attempts = _r2_upload_attempts()
+        for attempt in range(1, attempts + 1):
+            try:
+                if attempt > 1:
+                    from ops_metrics import increment
+                    increment("r2_upload_retry")
+                    update_job(job_id, current_step="upload_retry")
+                    heartbeat(job_id)
+                    # Bounded exponential backoff with jitter. The output stays
+                    # on this worker's filesystem for every attempt.
+                    delay = min(30.0, 2.0 * (4 ** (attempt - 2)))
+                    time.sleep(delay + random.uniform(0, min(1.0, delay / 4)))
+                key = storage.upload_master(local, tenant_id, job_id, key_name)
+                if not key:
+                    raise RuntimeError("upload_master returned no key")
+                break
+            except Exception as e:
+                _raise_if_job_timeout(e)
+                last_error = e
+                logger.warning(
+                    "[R2] upload attempt %d/%d failed job=%s file=%s: %s",
+                    attempt, attempts, job_id, key_name, e,
+                )
+
+        if key:
+            try:
                 # Atomic merge into job.s3_keys so a concurrent
                 # prores.prewarm_prores writing umg_master/umg_short
                 # doesn't get clobbered when the caller eventually
@@ -156,6 +230,15 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
                     merge_s3_keys(job_id, ftype_short, key)
                 except Exception as e:
                     logger.warning("[R2] merge_s3_keys failed for %s: %s", ftype_short, e)
+                    # The blob exists, but deleting the only local copy before
+                    # its key is durable in Postgres would produce a completed
+                    # job whose download path returns 404. Preserve the file
+                    # and surface critical bookkeeping failures as storage
+                    # errors so this worker's recovery window remains useful.
+                    if ftype_short in _CRITICAL_DELIVERABLES:
+                        failed_critical.append(f"{ftype_short} (key persistence failed)")
+                    continue
+                out[ftype_short] = key
                 # Upload confirmed — delete the local copy so the disk doesn't
                 # fill up (a HD ProRes master is ~5 GB, a 240 GB NVMe fills
                 # after ~50 UMG deliveries).
@@ -163,19 +246,16 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
                     os.unlink(local)
                 except OSError as e:
                     logger.error("[R2] Could not remove local %s: %s", local, e)
-            else:
-                # upload_master returned None without raising — treat as failure.
-                logger.error("[R2] Upload returned no key for %s", key_name)
-                if ftype_short in _CRITICAL_DELIVERABLES:
-                    failed_critical.append(ftype_short)
-        except Exception as e:
-            logger.error("[R2] Upload failed for %s: %s", key_name, e)
-            if ftype_short in _CRITICAL_DELIVERABLES:
-                failed_critical.append(f"{ftype_short} ({type(e).__name__})")
+            except Exception as e:
+                _raise_if_job_timeout(e)
+                logger.error("[R2] post-upload bookkeeping failed for %s: %s", key_name, e)
+        elif ftype_short in _CRITICAL_DELIVERABLES:
+            error_name = type(last_error).__name__ if last_error else "unknown"
+            failed_critical.append(f"{ftype_short} ({error_name})")
     if failed_critical:
         # Bubble up so the pipeline's outer except marks the job `error`
         # instead of leaving it `done` with a half-uploaded set of files.
-        raise RuntimeError(
+        raise StorageUploadError(
             "R2 upload failed for critical deliverables: "
             + ", ".join(failed_critical)
         )
@@ -499,35 +579,25 @@ def _validate_bg_cache_key(bg_cache_key, *, job_id, artist, song_title, style,
     o directamente ajeno (otro tenant, request crafteado) servía CUALQUIER
     fondo de bg_cache/ como si fuera de este job. Acá el servidor recomputa
     el hash desde los params reales del job con la MISMA función que usó el
-    preview (bg_preview.compute_bg_cache_key) y descarta el key si no
-    coincide. Peor caso de un falso mismatch = generación fresh (correcta,
-    solo más lenta y ~$0.80-3.20 de Veo) — nunca un fondo equivocado.
+    preview (bg_preview.job_bg_cache_key, que centraliza los hardcodes
+    background_mode="veo"/animate_image=False compartidos con el recompute
+    de main.py) y descarta el key si no coincide. Peor caso de un falso
+    mismatch = generación fresh (correcta, solo más lenta y ~$0.80-3.20 de
+    Veo) — nunca un fondo equivocado.
 
     Returns:
         El key si coincide; None si no (o si la validación misma falla).
     """
     try:
-        from bg_preview import compute_bg_cache_key
-        expected = compute_bg_cache_key({
-            "artist": artist or "",
-            "song_title": song_title or "",
-            "style": style or "",
-            "movement_style": movement_style or "",
-            "effect": effect or "",
-            "custom_colors": custom_colors or "",
-            "genre": genre or "",
-            "concept": concept or "",
-            "background_hint": background_hint or "",
-            "bg_verbatim": bool(bg_verbatim),
-            # El preview siempre hashea con background_mode="veo"
-            # (App.jsx previewEntry lo hardcodea) y animate_image solo es
-            # true con custom file — caso que nunca llega al fast path
-            # (_animate_user_image lo excluye en el caller).
-            "background_mode": "veo",
-            "animate_image": False,
-            "match_lyrics": bool(match_lyrics),
-        })
-        if bg_cache_key != expected:
+        from bg_preview import job_bg_cache_key
+        expected = job_bg_cache_key(
+            artist=artist, song_title=song_title, style=style,
+            movement_style=movement_style, effect=effect,
+            custom_colors=custom_colors, genre=genre, concept=concept,
+            background_hint=background_hint, bg_verbatim=bg_verbatim,
+            match_lyrics=match_lyrics,
+        )
+        if expected is None or bg_cache_key != expected:
             logger.warning(
                 "[BG] bg_cache_key DESCARTADO job=%s: cliente=%s esperado=%s "
                 "(params del job no coinciden con los del preview) — fondo fresh",
@@ -541,6 +611,147 @@ def _validate_bg_cache_key(bg_cache_key, *, job_id, artist, song_title, style,
         logger.warning("[BG] bg_cache_key validation error job=%s: %s — fondo fresh",
                        job_id, exc)
         return None
+
+
+def _record_bg_cache_reuse(job_id, bg_cache_key, *, waited_s=None):
+    """Fila de procedencia del fondo REUSADO desde bg_cache/.
+
+    La llamada Veo real quedó registrada bajo el job del PREVIEW; sin esta
+    fila el job del render no tiene procedencia del fondo (auditoría UMG).
+    tool_name distinto de 'veo-%' para no contar como generación en las
+    métricas de gasto. Best-effort: no tumba el render.
+    """
+    try:
+        from provenance import record_ai_call
+        summary = (
+            f"reused cached background key={bg_cache_key} "
+            "(generated by a bg_preview job)"
+        )
+        if waited_s is not None:
+            summary += f" after waiting {waited_s:.0f}s for the in-flight preview"
+        record_ai_call(
+            job_id, "video_bg", "bg-cache-reuse", "r2-cache",
+            prompt=f"bg_cache/{bg_cache_key}.mp4",
+        ).finish(response_summary=summary)
+    except Exception as _prov_err:
+        logger.warning(
+            "[BG] provenance del cache-reuse falló (no fatal): %s", _prov_err,
+        )
+
+
+def _bg_preview_wait_s() -> int:
+    """Máxima espera por un preview de fondo EN VUELO antes de generar fresh.
+
+    Env ``BG_PREVIEW_WAIT_S``, default 0 = deshabilitado (inerte). Clamp a
+    60s: la espera ocupa un slot del Worker, y si ShortWorker (quien corre
+    los previews) está caído es puro impuesto — historial real de
+    ShortWorker muerto (2026-06-08). Recomendado en staging: 45.
+    """
+    try:
+        n = int(os.getenv("BG_PREVIEW_WAIT_S", "0"))
+    except (TypeError, ValueError):
+        n = 0
+    return max(0, min(n, 60))
+
+
+def _find_inflight_bg_preview(bg_cache_key, *, render_job_id, max_age_min=15):
+    """job_id del preview EN EJECUCIÓN para este key y este tenant, o None.
+
+    Filtros (revisión adversarial 2026-07-17):
+    - ``bg_preview_running`` solamente: un preview meramente encolado que
+      ShortWorker nunca levantó haría esperar el deadline en vano.
+    - Mismo tenant que el render: consumir el preview de OTRO tenant
+      transfiere la procedencia Veo y la atribución de costos al tenant
+      ajeno — incompatible con la auditoría UMG.
+    - Recencia (``max_age_min``): una fila zombie post-OOM no debe anclar
+      la espera.
+    """
+    try:
+        from datetime import datetime, timedelta, timezone
+        from database import SessionLocal, Job
+        with SessionLocal() as db:
+            render_row = db.query(Job).filter(Job.job_id == render_job_id).first()
+            if render_row is None:
+                return None
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=max_age_min)
+            row = (
+                db.query(Job)
+                .filter(
+                    Job.filename == f"bgpreview_{bg_cache_key}.preview",
+                    Job.status == "bg_preview_running",
+                    Job.tenant_id == render_row.tenant_id,
+                    Job.created_at >= cutoff,
+                )
+                .order_by(Job.created_at.desc())
+                .first()
+            )
+            return row.job_id if row else None
+    except Exception as exc:
+        logger.warning("[BG] inflight-preview lookup falló (no fatal): %s", exc)
+        return None
+
+
+def _await_inflight_bg_preview(bg_cache_key, job_dir, *, job_id):
+    """Espera acotada a que un preview en vuelo termine y cachee el fondo.
+
+    Poll de ``cache_check`` cada 5s hasta ``_bg_preview_wait_s()``; corta
+    antes si el job de preview flipea a ``bg_preview_failed`` (o
+    desaparece). Devuelve el path local descargado, o None → el caller
+    genera fresh (comportamiento de siempre). Corre en el main thread: el
+    death-penalty de RQ interrumpe el sleep y propaga como cualquier paso.
+    """
+    import time as _time
+    deadline_s = _bg_preview_wait_s()
+    if deadline_s <= 0:
+        return None
+    preview_job_id = _find_inflight_bg_preview(
+        bg_cache_key, render_job_id=job_id,
+    )
+    if not preview_job_id:
+        return None
+    logger.info(
+        "[BG] preview en vuelo detectado job=%s preview_job=%s key=%s — "
+        "esperando (max %ss)", job_id, preview_job_id, bg_cache_key, deadline_s,
+    )
+    from bg_preview import cache_check, cache_download
+    started = _time.time()
+    while _time.time() - started < deadline_s:
+        _time.sleep(5)
+        try:
+            if cache_check(bg_cache_key):
+                cached_path = os.path.join(
+                    job_dir, f"bg_cached_{bg_cache_key}.mp4",
+                )
+                if cache_download(bg_cache_key, cached_path):
+                    waited = _time.time() - started
+                    logger.info(
+                        "[BG] cache HIT tras espera de %.0fs key=%s job=%s",
+                        waited, bg_cache_key, job_id,
+                    )
+                    return cached_path
+            from database import SessionLocal as _SL, Job as _Job
+            with _SL() as _db:
+                preview_row = (
+                    _db.query(_Job)
+                    .filter(_Job.job_id == preview_job_id)
+                    .first()
+                )
+            if preview_row is None or preview_row.status == "bg_preview_failed":
+                logger.info(
+                    "[BG] preview %s falló/desapareció — fondo fresh job=%s",
+                    preview_job_id, job_id,
+                )
+                return None
+        except RQJobTimeoutException:
+            raise
+        except Exception as exc:
+            logger.warning("[BG] poll del preview en vuelo falló: %s", exc)
+            return None
+    logger.info(
+        "[BG] espera del preview agotada (%ss) — fondo fresh job=%s",
+        deadline_s, job_id,
+    )
+    return None
 
 
 def _seed_image_digest(image_path, job_id=None):
@@ -560,6 +771,59 @@ def _seed_image_digest(image_path, job_id=None):
             return _ih.sha256(_imf.read()).hexdigest()[:16]
     except OSError:
         return f"unreadable:{job_id or 'nojob'}"
+
+
+def _background_source_is_ai(
+    background_path: str | None,
+    bg_r2_key: str | None,
+    *,
+    animate_image: bool,
+    variation_source_path: str | None,
+    library_asset_id: int | None = None,
+) -> bool:
+    """Classify internal background provenance without changing API payloads."""
+    if variation_source_path or (background_path and animate_image):
+        return True
+    if library_asset_id is not None:
+        return False
+    if not background_path:
+        return True
+    key = (bg_r2_key or "").lower()
+    name = os.path.basename(background_path).lower()
+    if key.startswith("library/") or name.startswith("bg_library"):
+        return False
+    if "bg_custom" in key or name.startswith("bg_custom"):
+        return False
+    # Preserved AI caches are named bg_cached*. Legacy/unknown preserved
+    # assets default to AI so enforcement fails closed.
+    return True
+
+
+def _legacy_background_source_is_ai(
+    *,
+    asset_usage_mode: str | None,
+    cached_key: str | None,
+) -> bool:
+    """Recover old-job provenance from authoritative persisted evidence."""
+    mode = (asset_usage_mode or "").strip().lower()
+    key = (cached_key or "").lower()
+    # A variation always produces model output, even when its source key lives
+    # under library/.  Conversely, the *current* cache key must win over an old
+    # as_is usage row: a later background edit can preserve that row while
+    # replacing the rendered asset with backgrounds/.../bg_cached.mp4.
+    if mode == "variation":
+        return True
+    if (
+        mode in {"", "as_is"}
+        and (key.startswith("library/") or "bg_custom" in key)
+    ):
+        return False
+    if key:
+        return True
+    if mode == "as_is":
+        return False
+    # bg_cached and unknown keys may be model output. Fail closed.
+    return True
 
 
 def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
@@ -642,7 +906,19 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # historical). When set, contains the operator-chosen line
                  # break(s) joined with "\n" — e.g. "Donde Estan\nCorazón".
                  # Threaded into title_card_lines via song_lines kwarg.
-                 title_song_break: str = ""):
+                 title_song_break: str = "",
+                 # Internal API→worker rollout guard. Not exposed by any
+                 # public endpoint or request schema.
+                 background_policy_fingerprint: str | None = None,
+                 # Art track ("official audio"): background_path es un COVER
+                 # (imagen). El pipeline saltea transcripción, alineado y
+                 # generación de fondo AI; compone el cover (blur + centrado +
+                 # zoom sutil) y rinde SIN letra. delivery_profile sigue
+                 # funcionando (youtube/umg/both). Default False = lyric video.
+                 art_track: bool = False,
+                 # Línea legal opcional en pantalla (art tracks): ej.
+                 # "℗ 2026 Universal Music Chile". Vacía = no se dibuja.
+                 label_line: str = ""):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -673,6 +949,39 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
     # Observability 2026-06-10: toda línea de log de este job lleva job_id.
     from observability import set_job_log_context
     set_job_log_context(job_id)
+    _runtime_atmospherics = resolve_atmospherics_policy(background_hint)
+    _runtime_policy_fingerprint = runtime_rollout_fingerprint(
+        mode=_runtime_atmospherics.get("policy_mode")
+    )
+    from background_policy import compatible_policy_fingerprint
+    background_policy_fingerprint = compatible_policy_fingerprint(
+        background_policy_fingerprint, _runtime_policy_fingerprint,
+    )
+    _lockstep_mismatch = bool(
+        background_policy_fingerprint
+        and background_policy_fingerprint != _runtime_policy_fingerprint
+    )
+    _lockstep_missing_in_enforce = bool(
+        policy_enforces(_runtime_atmospherics)
+        and not background_policy_fingerprint
+    )
+    if _lockstep_mismatch or _lockstep_missing_in_enforce:
+        logger.error(
+            "[BG_POLICY] refusing job=%s due API/worker policy mismatch "
+            "queued=%s runtime=%s",
+            job_id,
+            background_policy_fingerprint or "missing",
+            _runtime_policy_fingerprint,
+        )
+        update_job(
+            job_id,
+            status="error",
+            error=(
+                "Background safety configuration changed while the job was "
+                "queued. Retry after the deployment finishes."
+            ),
+        )
+        return
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
@@ -800,6 +1109,13 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
     wants_youtube = delivery_profile in ("youtube", "both")
     wants_umg = delivery_profile in ("umg", "both")
 
+    # P3 2026-07-17: validación observe en paralelo con el encode. Se
+    # inicializan ANTES del try para que el join del happy-path y el join
+    # de rescate del finally puedan referenciarlos desde cualquier rama
+    # (mismo patrón que _scenes_active).
+    _bg_validation_pool = None
+    _bg_validation_future = None
+
     try:
         # Step 1 — Whisper transcription (or reuse persisted segments).
         # Precedence:
@@ -817,7 +1133,28 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         #      retry path matches its quality.
         update_job(job_id, current_step="whisper", progress=5)
         _persist_segments = True
-        if segments_override:
+        if art_track:
+            # Art track = "official audio": NO lyrics. Skip Whisper, alignment,
+            # and lyrics-hint entirely (the big cost/latency win — no ASR, no
+            # CTC). Persist the art_track marker so /retry re-renders as an art
+            # track (Escenas precedent: flag lives in render_params). Guard the
+            # cover early so a missing image fails loudly instead of at render.
+            if not background_path:
+                update_job(job_id, status="error",
+                           error="Art track requires a cover image")
+                return
+            segments = []
+            _persist_segments = False
+            try:
+                from jobs import merge_render_params
+                _params = {"art_track": True}
+                if (label_line or "").strip():
+                    _params["label_line"] = label_line.strip()
+                merge_render_params(job_id, _params)
+            except Exception as _e:  # non-fatal: endpoint also persists it
+                logger.warning("[ART] merge_render_params failed: %s", _e)
+            logger.info("[ART] art track — skipping transcription/alignment")
+        elif segments_override:
             segments = segments_override
             logger.info("[WHISPER] Using %s caller-supplied segments", len(segments))
         else:
@@ -853,6 +1190,14 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         _is_still = (background_path and
                      background_path.lower().endswith((".jpg", ".jpeg", ".png")))
         _animate_user_image = bool(animate_image and _is_still)
+        _background_is_ai_generated = _background_source_is_ai(
+            background_path,
+            bg_r2_key,
+            animate_image=_animate_user_image,
+            variation_source_path=variation_source_path,
+            library_asset_id=variation_parent_asset_id,
+        )
+        _background_is_deterministic_fallback = False
 
         # P0 fix 2026-06-19: _scenes_active se usa SIEMPRE en el render
         # (bg_prelooped=_scenes_active) pero antes sólo se inicializaba dentro de
@@ -879,7 +1224,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             bg_image_path = background_path
             logger.info("[BG] Using human-provided background: %s", background_path)
         else:
-            lyrics_text = " ".join(seg["text"] for seg in segments)
+            lyrics_text = " ".join(
+                str(seg.get("text") or "") for seg in segments
+                if isinstance(seg, dict)
+            )
             # Prefer the structured title the operator set on the job; fall
             # back to filename parsing for legacy rows / batch uploads. The
             # cache key downstream uses (artist|title) as a namespace so
@@ -909,6 +1257,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # opciones después del preview, o el preview falló, o el TTL
             # de 24h del cache lo limpió), seguimos con el flow normal.
             bg_image_path = None
+            # Multi-scene owns its own per-clip cache. A stale single-background
+            # preview key must never short-circuit the scenes branch.
+            if enable_scenes and bg_cache_key:
+                logger.info("[SCENES] ignoring single-background preview cache key")
+                bg_cache_key = None
             if bg_cache_key and not _animate_user_image:
                 bg_cache_key = _validate_bg_cache_key(
                     bg_cache_key, job_id=job_id, artist=artist,
@@ -927,9 +1280,31 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                             logger.info("[BG] cache HIT key=%s — reusando %s, skip Veo/Imagen",
                                         bg_cache_key, os.path.basename(cached_path))
                             bg_image_path = cached_path
+                            _record_bg_cache_reuse(job_id, bg_cache_key)
                         else:
                             logger.warning("[BG] cache_check OK pero download falló key=%s — fallback",
                                            bg_cache_key)
+                    elif _bg_preview_wait_s() > 0:
+                        # P1-B 2026-07-17: miss pero puede haber un preview
+                        # EN VUELO generando exactamente este fondo (el
+                        # operador aprobó mientras Veo corría). Esperar el
+                        # resto del preview (~40-70s) es casi siempre más
+                        # barato que regenerar (1 Veo en vez de 2). Default
+                        # OFF (BG_PREVIEW_WAIT_S=0); deadline duro + corte
+                        # si el preview falla → nunca peor que fresh.
+                        import time as _time_wait
+                        _wait_started = _time_wait.time()
+                        _wait_path = _await_inflight_bg_preview(
+                            bg_cache_key, job_dir, job_id=job_id,
+                        )
+                        if _wait_path:
+                            bg_image_path = _wait_path
+                            _record_bg_cache_reuse(
+                                job_id, bg_cache_key,
+                                waited_s=_time_wait.time() - _wait_started,
+                            )
+                except RQJobTimeoutException:
+                    raise
                 except Exception as e:
                     logger.warning("[BG] cache lookup error key=%s: %s — fallback", bg_cache_key, e)
 
@@ -961,7 +1336,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         # biblia → multi-escena respeta auto/letra/prompt igual
                         # que el fondo único. bg_verbatim ="usá mi texto tal cual".
                         background_hint=background_hint, bg_verbatim=bg_verbatim,
-                        allow_people=_compute_allow_people(job_id),
+                        match_lyrics=match_lyrics,
+                        allow_people=_compute_allow_people(job_id, background_hint),
                         job_id=job_id,
                     )
                     bg_image_path = _scene_timeline
@@ -969,24 +1345,42 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     update_job(job_id, scene_plan=_scene_plan)
                     logger.info("[SCENES] timeline multi-escena listo para job=%s", job_id)
                 except Exception as e:  # noqa: BLE001
+                    _raise_if_job_timeout(e)
                     logger.error("[SCENES] multi-escena falló para job=%s (%s) — "
                                  "fallback a fondo único", job_id, e)
                     _scenes_active = False
             if bg_image_path is None:
-                bg_image_path = _ensure_background(
-                    style, job_dir,
-                    lyrics_text=lyrics_text, artist=artist, job_id=job_id,
-                    song_title=_song_title, genre=genre, concept=concept,
-                    movement_style=movement_style,
-                    image_to_video_path=(background_path if _animate_user_image else None),
-                    match_lyrics=match_lyrics,
-                    background_hint=background_hint,
-                    bg_verbatim=bg_verbatim,
-                    custom_colors=custom_colors,
-                    effect=effect,
-                    allow_people=_compute_allow_people(job_id),
-                    audio_duration=_audio_dur_for_kb,
-                )
+                try:
+                    bg_image_path = _ensure_background(
+                        style, job_dir,
+                        lyrics_text=lyrics_text, artist=artist, job_id=job_id,
+                        song_title=_song_title, genre=genre, concept=concept,
+                        movement_style=movement_style,
+                        image_to_video_path=(background_path if _animate_user_image else None),
+                        match_lyrics=match_lyrics,
+                        background_hint=background_hint,
+                        bg_verbatim=bg_verbatim,
+                        custom_colors=custom_colors,
+                        effect=effect,
+                        allow_people=_compute_allow_people(job_id, background_hint),
+                        audio_duration=_audio_dur_for_kb,
+                    )
+                except RQJobTimeoutException:
+                    raise
+                except Exception as _initial_background_error:
+                    # Imagen/provider failures can happen before an asset exists.
+                    # Continue with a provider-free visual rather than turning a
+                    # Universal/common AI job into an infrastructure rejection.
+                    logger.error(
+                        "[BG] initial background generation failed job=%s; "
+                        "using deterministic fallback: %s",
+                        job_id, _initial_background_error,
+                    )
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style, filename="bg_initial_policy_fallback.mp4",
+                    )
+                    _background_is_ai_generated = False
+                    _background_is_deterministic_fallback = True
             # Image-to-video fallback: if Veo failed to produce an MP4 (None
             # or non-existent path) AND the operator wanted to animate their
             # image, fall back to using the still image with Ken Burns.
@@ -994,6 +1388,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 logger.warning("[BG] image-to-video failed, falling back to Ken Burns on %s",
                                background_path)
                 bg_image_path = background_path
+            if bg_image_path is None:
+                _background_is_ai_generated = False
         update_job(job_id, progress=40)
 
         # Persist render params so edit/variant re-renders + reaper-recovery
@@ -1024,6 +1420,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "movement_style": movement_style,
             "effect": effect,
             "match_lyrics": match_lyrics,
+            "background_ai_generated": _background_is_ai_generated,
             # Title-card customization (Full Rotor v1). Safe defaults, always
             # persisted so future edits/retries inherit the operator's choice.
             "title_template": title_template,
@@ -1061,39 +1458,6 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         except Exception as _rp_exc:
             logger.warning("[BG] merge_render_params failed: %s", _rp_exc)
 
-        # Cache the FINAL background to R2 so a typography/lyrics/metadata
-        # edit can re-use it without another Veo call ($0.80 saved per edit)
-        # and /retry can preserve it.
-        #
-        # Audit 2026-06-11: antes la condición era `not background_path`
-        # ("los fondos humanos ya tienen su key en bg_r2_key") — pero esa
-        # key nunca llegaba a bg_r2_key_cached, así que los jobs con fondo
-        # subido por el usuario tenían los edits rápidos bloqueados con 400
-        # y el retry les pisaba la imagen. Ahora:
-        #   - Fondo humano usado tal cual (bg_image_path == background_path):
-        #     reutilizamos bg_r2_key como cached (sin re-subir nada).
-        #   - Cualquier otro caso (Veo, Imagen, imagen del usuario ANIMADA
-        #     con i2v): subimos el resultado final — así un edit sobre una
-        #     imagen animada reusa el clip animado, no la foto fija.
-        if bg_image_path and os.path.exists(bg_image_path):
-            import storage as _storage
-            if background_path and bg_image_path == background_path:
-                if bg_r2_key:
-                    update_job(job_id, bg_r2_key_cached=bg_r2_key)
-                    logger.info("[EDIT] Cached human-provided background key: %s", bg_r2_key)
-            elif _storage.is_enabled():
-                try:
-                    _bg_ext = os.path.splitext(bg_image_path)[1] or ".mp4"
-                    _bg_cache_key = _storage.upload_file(
-                        bg_image_path,
-                        f"backgrounds/{job_id}/bg_cached{_bg_ext}",
-                    )
-                    if _bg_cache_key:
-                        update_job(job_id, bg_r2_key_cached=_bg_cache_key)
-                        logger.info("[EDIT] Cached background to R2: %s", _bg_cache_key)
-                except Exception as _e:
-                    logger.warning("[EDIT] Warning: background cache upload failed: %s", _e)
-
         files = {}
         # La elección de tipografía se hace UNA vez acá (operador o pick
         # del pool) y fluye a video + short + persiste para re-renders.
@@ -1111,65 +1475,26 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         #     fails, mark validation_failed (we can't auto-substitute).
         #   - No bg supplied → cycle through library candidates, picking
         #     the first one that passes (up to 3 attempts).
-        if wants_youtube:
+        if wants_youtube or wants_umg:
             update_job(job_id, current_step="validation", progress=38)
 
-            # Tenant-gated content validation.
-            #
-            # The validator enforces UMG Guideline 15 (no recognizable
-            # faces / hands / logos as subject). That's a *UMG* contract
-            # constraint — non-UMG tenants don't need it by default.
-            #
-            # Default behavior:
-            #   - tenant in UMG_TENANTS → validator runs.
-            #     Override OFF via render_params.bypass_content_validation=True
-            #     ("Asumir el riesgo" toggle).
-            #   - tenant NOT in UMG_TENANTS → validator skipped.
-            #     Override ON via render_params.force_content_validation=True
-            #     ("Activar verificación" toggle, opt-in).
-            #
-            # Both flags are safe to send regardless of tenant: each only
-            # has effect when it pushes against its tenant's default.
-            # UMG_TENANTS lives at module scope so _compute_allow_people()
-            # and this block share the same source of truth.
-            _tenant_id = None
-            _bypass_validation = False
-            _force_validation = False
-            try:
-                from database import SessionLocal as _SL, Job as _Job
-                with _SL() as _db:
-                    _row = _db.query(_Job).filter(_Job.job_id == job_id).first()
-                    if _row:
-                        _tenant_id = _row.tenant_id
-                        if isinstance(_row.render_params, dict):
-                            _bypass_validation = bool(
-                                _row.render_params.get("bypass_content_validation")
-                            )
-                            _force_validation = bool(
-                                _row.render_params.get("force_content_validation")
-                            )
-            except Exception as e:
-                logger.warning("[VALIDATION] could not read tenant/flags, defaulting to UMG-enforce: %s", e)
-                _tenant_id = "umg"  # conservative fallback: validate
-
-            _is_umg = _tenant_id in UMG_TENANTS
-            # XOR-like semantics: tenant default ⊕ operator override
-            _should_validate = (
-                (_is_umg and not _bypass_validation)
-                or (not _is_umg and _force_validation)
-            )
+            # Authoritative policy is resolved from tenant + billing group.
+            # Universal is strict and cannot bypass; other accounts keep the
+            # optional post-generation scan, independently from whether an
+            # explicit operator prompt requested a human subject.
+            _safety = _background_safety_policy(job_id, background_hint)
+            _tenant_id = _safety["tenant_id"]
+            _is_umg = _safety["is_umg"]
+            _should_validate = _safety["should_validate"]
 
             if not _should_validate:
                 from datetime import datetime as _dt
-                _reason = (
-                    "operator_override_via_bypass" if _is_umg and _bypass_validation
-                    else "non_umg_tenant_default"
-                )
+                _reason = _safety["reason"]
                 logger.warning(
-                    "[VALIDATION] SKIPPED for job %s tenant=%s is_umg=%s "
-                    "bypass=%s force=%s reason=%s",
-                    job_id, _tenant_id, _is_umg, _bypass_validation,
-                    _force_validation, _reason,
+                    "[VALIDATION] SKIPPED for job %s tenant=%s billing_group=%s "
+                    "is_umg=%s allow_people=%s reason=%s",
+                    job_id, _tenant_id, _safety["billing_group"], _is_umg,
+                    _safety["allow_people"], _reason,
                 )
                 update_job(job_id, validation_result={
                     "passed": True,
@@ -1179,25 +1504,249 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     "bypassed_reason": _reason,
                     "tenant_id": _tenant_id,
                 })
+            elif art_track and os.environ.get(
+                    "ART_TRACK_FORCE_VALIDATION", "").strip().lower() not in ("1", "true"):
+                # Art track cover = label-approved artwork. The Guideline-15
+                # Vision validator is tuned to REJECT people/faces/text/logos
+                # in AI backgrounds — cover art routinely has all three, so
+                # running it would false-reject legitimate covers. Bypass with
+                # an explicit reason (set ART_TRACK_FORCE_VALIDATION=1 to force).
+                from datetime import datetime as _dt
+                logger.info("[VALIDATION] SKIPPED for art track cover (job %s)", job_id)
+                update_job(job_id, validation_result={
+                    "passed": True,
+                    "issues": [],
+                    "bypassed": True,
+                    "bypassed_at": _dt.utcnow().isoformat() + "Z",
+                    "bypassed_reason": "art_track_cover",
+                    "tenant_id": _tenant_id,
+                })
+            elif _scenes_active:
+                # Every unique source clip was already validated densely in
+                # _generate_scene_clips; do not spend another 48 sequential
+                # Vision calls on the stitched timeline.
+                update_job(job_id, validation_result={
+                    "passed": True,
+                    "issues": [],
+                    "policy_reason": _safety["reason"],
+                    "validation_scope": "each_unique_scene_clip",
+                    "tenant_id": _tenant_id,
+                    "billing_group": _safety["billing_group"],
+                    "policy_version": _safety["policy_version"],
+                    "policy_mode": _safety["policy_mode"],
+                    "allow_people": _safety["allow_people"],
+                    "allow_atmospherics": _safety["allow_atmospherics"],
+                    "shadow_atmospherics_detected": any(
+                        bool(scene.get("validation", {}).get(
+                            "shadow_atmospherics_detected"
+                        ))
+                        for scene in (_scene_plan or {}).get("scenes", [])
+                    ),
+                })
+            elif bg_image_path and _background_is_deterministic_fallback:
+                update_job(job_id, validation_result={
+                    "passed": True,
+                    "issues": [],
+                    "policy_reason": _safety["reason"],
+                    "tenant_id": _tenant_id,
+                    "billing_group": _safety["billing_group"],
+                    "policy_version": _safety["policy_version"],
+                    "policy_mode": _safety["policy_mode"],
+                    "allow_people": _safety["allow_people"],
+                    "allow_atmospherics": _safety["allow_atmospherics"],
+                    "background_ai_generated": False,
+                    "validation_scope": "deterministic_local_fallback",
+                    "recovered_from_generation_error": True,
+                })
             elif bg_image_path:
                 from content_validator import validate_video, validate_image
-                ext = os.path.splitext(bg_image_path)[1].lower()
-                _validate_fn = (
-                    validate_video if ext in (".mp4", ".mov", ".webm")
-                    else validate_image
-                )
-                pre_validation = _validate_fn(bg_image_path, job_id=job_id)
-                update_job(job_id, validation_result=pre_validation)
-                if not pre_validation["passed"]:
-                    update_job(
-                        job_id,
-                        status="validation_failed",
-                        error=f"Content policy violation detected: {pre_validation['issues']}",
+                def _validate_candidate(_path, *, ai_generated):
+                    ext = os.path.splitext(_path)[1].lower()
+                    _validate_fn = (
+                        validate_video if ext in (".mp4", ".mov", ".webm")
+                        else validate_image
                     )
-                    logger.warning("[VALIDATION] FAILED for job %s: %s", job_id, pre_validation['issues'])
-                    return
+                    result = _validate_fn(
+                        _path,
+                        job_id=job_id,
+                        allow_people=_safety["allow_people"],
+                        allow_atmospherics=_safety["allow_atmospherics"],
+                        observe_atmospherics=(
+                            _safety["observe_atmospherics"] and ai_generated
+                        ),
+                        enforce_atmospherics=(
+                            _safety["validate_atmospherics"] and ai_generated
+                        ),
+                    )
+                    result.update({
+                        "policy_reason": _safety["reason"],
+                        "tenant_id": _tenant_id,
+                        "billing_group": _safety["billing_group"],
+                        "policy_version": _safety["policy_version"],
+                        "policy_mode": _safety["policy_mode"],
+                        "allow_people": _safety["allow_people"],
+                        "allow_atmospherics": _safety["allow_atmospherics"],
+                        "background_ai_generated": bool(ai_generated),
+                    })
+                    return result
+
+                if _validation_parallel_enabled():
+                    # P3 2026-07-17: bajo observe el veredicto no puede
+                    # rechazar ni reasignar bg_image_path — correrlo inline
+                    # solo suma ~65s al camino crítico. Se despacha a un
+                    # hilo y el join vive antes de _verify_deliverables
+                    # (más el join de rescate del finally, que persiste el
+                    # veredicto aunque el encode falle). Capturas por valor:
+                    # bg_image_path no se reasigna después de este punto en
+                    # observe. copy_context preserva el tag job_id de los
+                    # logs del hilo (contextvars no se hereda solo).
+                    import concurrent.futures as _cf
+                    import contextvars as _cv
+                    _bg_validation_pool = _cf.ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="bg-validate",
+                    )
+                    _bg_validation_future = _bg_validation_pool.submit(
+                        _cv.copy_context().run,
+                        _run_observe_validation,
+                        job_id,
+                        (lambda _p=bg_image_path,
+                                _ai=_background_is_ai_generated:
+                            _validate_candidate(_p, ai_generated=_ai)),
+                    )
+                    logger.info(
+                        "[VALIDATION] observe-parallel: Vision corre en "
+                        "background mientras encodea job=%s", job_id,
+                    )
+                    # pre_validation queda como pass provisional para el
+                    # resto del flujo síncrono; el veredicto real lo
+                    # escribe el hilo en validation_result.
+                    pre_validation = {"passed": True, "deferred": True}
+                else:
+                    pre_validation = _validate_candidate(
+                        bg_image_path,
+                        ai_generated=_background_is_ai_generated,
+                    )
+                    update_job(job_id, validation_result=pre_validation)
+                if pre_validation.get("deferred"):
+                    pass
+                elif not pre_validation["passed"] and _validation_observe_only():
+                    logger.warning(
+                        "[VALIDATION] observe-only: keeping background "
+                        "job=%s despite failed verdict issues=%s",
+                        job_id, pre_validation.get("issues"),
+                    )
+                    pre_validation = _mark_validation_observed(pre_validation)
+                    update_job(job_id, validation_result=pre_validation)
+                elif not pre_validation["passed"]:
+                    # Generated model output is disposable. Universal must
+                    # never reject the whole lyric video because a provider
+                    # hallucinated a person (or because the classifier could
+                    # not establish a complete verdict). Discard the asset,
+                    # retry once under a fresh provider-cache namespace, then
+                    # use a deterministic local background if it is still not
+                    # safe. Non-Universal AI output gets the same recovery;
+                    # intentionally uploaded common-user assets keep the
+                    # explicit validation failure behavior.
+                    _recover_background = bool(
+                        _is_umg or _background_is_ai_generated
+                    )
+                    logger.warning(
+                        "[VALIDATION] unsafe background job=%s recover=%s issues=%s",
+                        job_id, _recover_background, pre_validation["issues"],
+                    )
+                    _recovered_validation = None
+                    if _recover_background and _background_is_ai_generated:
+                        try:
+                            try:
+                                _recovery_audio_duration = _audio_dur_for_kb
+                            except NameError:
+                                _recovery_audio_duration = _audio_duration(mp3_path)
+                            _recovery_path = _ensure_background(
+                                style, job_dir,
+                                lyrics_text=lyrics_text, artist=artist,
+                                job_id=job_id, song_title=_song_title,
+                                genre=genre, concept=concept,
+                                movement_style=movement_style,
+                                image_to_video_path=(
+                                    background_path if _animate_user_image else None
+                                ),
+                                match_lyrics=match_lyrics,
+                                background_hint=background_hint,
+                                bg_verbatim=bg_verbatim,
+                                custom_colors=custom_colors,
+                                effect=effect,
+                                allow_people=_safety["allow_people"],
+                                atmospherics_policy=_safety["atmospherics_policy"],
+                                audio_duration=_recovery_audio_duration,
+                                generation_nonce=f"policy-recovery-{job_id}",
+                            )
+                            if _recovery_path and os.path.exists(_recovery_path):
+                                _recovered_validation = _validate_candidate(
+                                    _recovery_path,
+                                    ai_generated=True,
+                                )
+                                if _recovered_validation.get("passed") is True:
+                                    bg_image_path = _recovery_path
+                                    pre_validation = _recovered_validation
+                        except Exception as _recovery_error:
+                            _raise_if_job_timeout(_recovery_error)
+                            logger.warning(
+                                "[VALIDATION] background regeneration failed job=%s: %s",
+                                job_id, _recovery_error,
+                            )
+
+                    if (
+                        _recover_background
+                        and pre_validation.get("passed") is not True
+                    ):
+                        bg_image_path = _write_safe_gradient_background(
+                            job_dir,
+                            style,
+                        )
+                        _background_is_ai_generated = False
+                        pre_validation = {
+                            "passed": True,
+                            "issues": [],
+                            "policy_reason": _safety["reason"],
+                            "tenant_id": _tenant_id,
+                            "billing_group": _safety["billing_group"],
+                            "policy_version": _safety["policy_version"],
+                            "policy_mode": _safety["policy_mode"],
+                            "allow_people": _safety["allow_people"],
+                            "allow_atmospherics": _safety["allow_atmospherics"],
+                            "background_ai_generated": False,
+                            "validation_scope": "deterministic_local_fallback",
+                            "recovered_from_unsafe_generation": True,
+                            "rejected_attempts": [
+                                pre_validation,
+                                *([_recovered_validation] if _recovered_validation else []),
+                            ],
+                        }
+
+                    update_job(job_id, validation_result=pre_validation)
+                    if pre_validation.get("passed") is not True:
+                        update_job(
+                            job_id,
+                            status="validation_failed",
+                            error=(
+                                "Content policy violation detected: "
+                                f"{pre_validation['issues']}"
+                            ),
+                        )
+                        return
             else:
-                clean_bg, rejection_log = _select_validated_background(job_id)
+                # A local library candidate is curated/non-AI provenance. Keep
+                # people and brand validation, but do not apply the AI-only
+                # atmospheric default-deny dimension.
+                _background_is_ai_generated = False
+                _safety = {
+                    **_safety,
+                    "observe_atmospherics": False,
+                    "validate_atmospherics": False,
+                }
+                clean_bg, rejection_log = _select_validated_background(
+                    job_id, validation_policy=_safety,
+                )
                 if not clean_bg:
                     update_job(
                         job_id,
@@ -1213,6 +1762,41 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 update_job(job_id, validation_result={
                     "passed": True, "issues": [], "rejections": rejection_log,
                 })
+
+        # Cache only the background that actually passed policy recovery. The
+        # old ordering uploaded the first Veo result before validation, so a
+        # hallucinated person could remain the reusable edit cache even when a
+        # later check rejected the job. (P3 observe-parallel: este upload
+        # puede preceder al veredicto del hilo — es seguro únicamente porque
+        # observe nunca sustituye el asset; bajo block el orden secuencial
+        # se preserva. Es el cache per-job backgrounds/{job_id}/, no el
+        # global bg_cache/.)
+        bg_source = bg_image_path
+        try:
+            from jobs import merge_render_params as _merge_render_params
+            _merge_render_params(job_id, {
+                "background_ai_generated": bool(_background_is_ai_generated),
+            })
+        except Exception as _rp_exc:
+            logger.warning("[BG] final provenance persistence failed: %s", _rp_exc)
+        if bg_image_path and os.path.exists(bg_image_path):
+            import storage as _storage
+            if background_path and bg_image_path == background_path:
+                if bg_r2_key:
+                    update_job(job_id, bg_r2_key_cached=bg_r2_key)
+                    logger.info("[EDIT] Cached human-provided background key: %s", bg_r2_key)
+            elif _storage.is_enabled():
+                try:
+                    _bg_ext = os.path.splitext(bg_image_path)[1] or ".mp4"
+                    _bg_cache_key = _storage.upload_file(
+                        bg_image_path,
+                        f"backgrounds/{job_id}/bg_cached{_bg_ext}",
+                    )
+                    if _bg_cache_key:
+                        update_job(job_id, bg_r2_key_cached=_bg_cache_key)
+                        logger.info("[EDIT] Cached validated background to R2: %s", _bg_cache_key)
+                except Exception as _e:
+                    logger.warning("[EDIT] Warning: background cache upload failed: %s", _e)
 
         # Step 2 — Render the source MP4 (H.264 yuv420p aac mp4).
         # Always rendered when ANY delivery profile is requested. The UMG
@@ -1263,6 +1847,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 title_song_break=title_song_break,
                 # Multi-escena: el fondo ya es un timeline del largo completo.
                 bg_prelooped=_scenes_active,
+                # Art track: compone el cover (blur + tarjeta + onda reactiva)
+                # y rinde sin letra. bg_image_path es el cover (imagen).
+                art_track=art_track,
+                label_line=label_line,
             )
             # Cinemascope opt-in: letterbox the finished YouTube master. Skipped
             # for UMG (that path returns a ProRes .mov — re-encoding it as h264
@@ -1291,23 +1879,44 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         if wants_youtube or wants_umg:
             update_job(job_id, current_step="short", progress=75)
             short_fps = float(umg_spec["fps"]) if wants_umg else 24
-            generate_short(
-                mp3_path, segments, job_dir, bg_source=bg_source,
-                style=style, font=chosen_font, fps=short_fps,
-                text_case=text_case, font_scale=font_scale,
-                lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
-                text_contrast=text_contrast, effect=effect, custom_colors=custom_colors,
-                lyrics_animation=lyrics_animation, line_transition=line_transition,
-            )
+            if art_track:
+                # Art track short: vertical (9:16) composite of the cover over
+                # a 30s high-energy window (no lyrics → pick the window by RMS
+                # energy, not chorus repetition). Same look as the master.
+                _short_spec = (
+                    RenderSpec.umg_intermediate_short(umg_spec) if wants_umg
+                    else RenderSpec.youtube_short()
+                )
+                generate_art_track_short(
+                    mp3_path, bg_source, job_dir, spec=_short_spec,
+                    artist=artist, song_title=song_title,
+                    label_line=label_line, effect=effect,
+                )
+            else:
+                generate_short(
+                    mp3_path, segments, job_dir, bg_source=bg_source,
+                    style=style, font=chosen_font, fps=short_fps,
+                    text_case=text_case, font_scale=font_scale,
+                    lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+                    text_contrast=text_contrast, effect=effect, custom_colors=custom_colors,
+                    lyrics_animation=lyrics_animation, line_transition=line_transition,
+                )
             files["short_url"] = f"/download/{job_id}/short"
             update_job(job_id, progress=85)
 
-            # Step 4 — Thumbnail (uses raw background, not lyric video)
+            # Step 4 — Thumbnail (art tracks reuse the composite look so the
+            # thumbnail matches what plays; lyric videos keep the raw bg).
             update_job(job_id, current_step="thumbnail", progress=90)
-            generate_thumbnail(
-                artist, mp3_path, job_dir, bg_source=bg_source,
-                song_title=song_title,
-            )
+            if art_track:
+                generate_art_track_thumbnail(
+                    bg_source, mp3_path, job_dir, artist=artist,
+                    song_title=song_title, label_line=label_line,
+                )
+            else:
+                generate_thumbnail(
+                    artist, mp3_path, job_dir, bg_source=bg_source,
+                    song_title=song_title,
+                )
             files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
 
         # Content validation already happened pre-render (Step 1b) so the
@@ -1324,6 +1933,31 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         if audio_dur_for_verify is None:
             # _audio_duration uses mutagen/wave; fall back to ffprobe for any format
             audio_dur_for_verify = _ffprobe_duration(mp3_path)
+
+        # P3: join INCONDICIONAL de la validación observe-paralela, ANTES de
+        # _verify_deliverables — o sea antes del cleanup que borra el archivo
+        # que el hilo lee y antes del status final. result() re-lanza
+        # cualquier error del hilo (patrón del fan-out de escenas): un fallo
+        # de Vision produce el mismo estado terminal 'error' que hoy en
+        # secuencial. A esta altura el hilo (~65s) casi siempre ya terminó
+        # (encode+short ~180s) → costo del join ≈ 0. Timeout defensivo
+        # (audit adversarial 2026-07-17): con Vertex degradado la validación
+        # puede sumar minutos a un render EXITOSO — justo la latencia que
+        # este PR elimina, invertida. A los 180s se sigue de largo tratando
+        # el veredicto como no-concluyente (observe nunca bloquea igual).
+        if _bg_validation_future is not None:
+            import concurrent.futures as _cf_join
+            try:
+                _bg_validation_future.result(timeout=180)
+            except _cf_join.TimeoutError:
+                logger.warning(
+                    "[VALIDATION] observe-parallel join timeout (180s) job=%s "
+                    "— sigo sin veredicto (observe no bloquea)", job_id,
+                )
+            _bg_validation_pool.shutdown(wait=False)
+            _bg_validation_future = None
+            _bg_validation_pool = None
+
         _verify_deliverables(job_dir, files, audio_dur_for_verify)
 
         # Post-render upload to cloud storage. No-op if R2 env not set.
@@ -1436,13 +2070,19 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                             job_id,
                         )
             except Exception as e:  # pragma: no cover
+                _raise_if_job_timeout(e)
                 logger.warning("[WAVEFORM] precompute skipped for %s: %s", job_id, e)
     except Exception as exc:
+        _raise_if_job_timeout(exc)
         traceback.print_exc()
         from error_taxonomy import classify_error
+        error_category = (
+            "storage_upload" if isinstance(exc, StorageUploadError)
+            else classify_error(str(exc))
+        )
         update_job(
             job_id, status="error", error=str(exc),
-            error_category=classify_error(str(exc)),
+            error_category=error_category,
         )
         # Surface render failures to Sentry. The worker runs outside
         # the FastAPI request loop so the framework's auto-capture
@@ -1465,10 +2105,39 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # re-renders. When it ISN'T, the input lives only locally inside job_dir,
         # so preserve it (just free the heavy bg intermediates) — else the retry
         # would fail for lack of its own input. (Adversarial-review guard.)
-        if input_r2_key:
+        if isinstance(exc, StorageUploadError):
+            logger.warning(
+                "[R2] preserving local outputs after exhausted upload retries: %s",
+                job_dir,
+            )
+        elif input_r2_key:
             _cleanup_job_dir_on_failure(job_dir)
         else:
             _cleanup_local_intermediates(job_dir)
+    finally:
+        # P3: join de rescate. Si el render falló entre el fork y el join
+        # del happy-path, en secuencial el veredicto ya estaba grabado antes
+        # del encode — acá lo persistimos igual (recolectar veredictos ES el
+        # objetivo de observe) y evitamos hilos huérfanos bajo
+        # SimpleWorker/tests (bajo el Worker RQ real el work-horse muere por
+        # job y se limpia solo). Best-effort: jamás pisa la excepción real.
+        if _bg_validation_future is not None:
+            try:
+                _bg_validation_future.result(timeout=90)
+            except Exception as _val_rescue_err:
+                logger.warning(
+                    "[VALIDATION] observe-parallel rescue join falló "
+                    "(no fatal): %s", _val_rescue_err,
+                )
+        if _bg_validation_pool is not None:
+            # wait=False a propósito (audit 2026-07-17): estamos en el
+            # failure path, el death-penalty ya se consumió, y un wait=True
+            # re-bloquea el work-horse hasta que el hilo Vision termine sus
+            # ~9 frames (~400s con Vertex degradado) — exactamente lo que
+            # _call_with_timeout evita. Bajo RQ real el work-horse muere por
+            # job y limpia el hilo; bajo SimpleWorker/tests el hilo non-daemon
+            # se junta al salir el intérprete.
+            _bg_validation_pool.shutdown(wait=False)
 
 
 # ---------------------------------------------------------------------------
@@ -4111,51 +4780,993 @@ def _env_flag(name: str) -> bool:
     return _os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
-# Tenants whose contract requires the UMG Guideline 15 content filter
-# (no faces / hands / logos in backgrounds). All other tenants render
-# freely by default and can opt in via force_content_validation. Mirror
-# of frontend ContentValidationToggle.UMG_TENANTS — keep in sync.
-UMG_TENANTS = {"umg", "omg"}
+# Universal account identifiers in production.  Universal operators live in
+# country-scoped tenants but share billing_group="universal_music".  The old
+# {"umg", "omg"} list predated that migration and silently classified every
+# current Universal account as unrestricted.
+UMG_TENANTS = {
+    "umg", "omg", "umusic", "universal_argentina", "universal_chile",
+}
+UMG_BILLING_GROUPS = {"universal_music"}
 
 
-def _compute_allow_people(job_id: str | None) -> bool:
-    """Should the AI be allowed to render people in the bg for this job?
+def _normalise_account_id(value) -> str:
+    return str(value or "").strip().lower()
 
-    Returns True when the content_validator would be SKIPPED for the job
-    (per tenant default + operator override). False when validator would
-    run. Drives the `allow_people` flag threaded into
-    `_analyze_lyrics_for_background`, `_generate_veo_video`, and
-    `_generate_imagen_image` so the no-people clauses in those system
-    prompts get dropped consistently with the post-gen check.
 
-    Pre-fix the toggle "Asumir el riesgo / fondo libre" only relaxed the
-    post-gen validator; the pre-gen prompt sanitization still stripped
-    people. The operator's prompt "woman lies upside down on armchair"
-    rendered an empty armchair (incident 2026-05-19). This helper closes
-    that gap.
+def _prompt_explicitly_requests_people(prompt: str | None) -> bool:
+    """Conservative, payload-free opt-in for non-Universal operator prompts.
 
-    Safe to call with `job_id=None` — returns False (conservative).
+    Automatic lyrics/genre prompts are deliberately excluded: only the text
+    typed into background_hint/scene override is considered.  Negative phrases
+    are removed before looking for an explicit human subject, so "no people"
+    does not accidentally opt in.  False negatives are preferable to silently
+    generating a person.
     """
-    if not job_id:
+    import re as _re
+    text = _normalise_account_id(prompt)
+    if not text:
         return False
+    human_terms = (
+        r"human\s+(?:figures?|silhouettes?|subjects?|forms?)|"
+        r"people|persons?|humans?|man|men|woman|women|boys?|girls?|child|children|"
+        r"couple|crowd|audience|friends?|lovers?|pedestrians?|drivers?|fans?|"
+        r"singers?|musicians?|dancers?|guitarists?|drummers?|vocalists?|"
+        r"performers?|djs?|rappers?|bands?|workers?|actors?|models?|"
+        r"operators?|crews?|characters?|travelers?|teenagers?|brides?|grooms?|"
+        r"cyclists?|tourists?|figures?|players?|humanoids?|androids?|statues?|mannequins?|"
+        r"faces?|heads?|bodies?|limbs?|arms?|hands?|"
+        r"figuras?\s+humanas?|siluetas?\s+humanas?|"
+        r"personas?|gente|hombres?|mujer(?:es)?|niñ[oa]s?|parejas?|multitud|"
+        r"audiencia|p[uú]blico|amig[oa]s?|amantes?|peatones?|conductores?|fans?|"
+        r"cantantes?|m[uú]sicos?|bailar(?:ines|ina|inas|[ií]n)|guitarristas?|"
+        r"bateristas?|vocalistas?|int[eé]rpretes?|djs?|raperos?|bandas?|"
+        r"trabajadores?|actores?|modelos?|operador(?:es|as?)?|equipos?\s+de\s+filmaci[oó]n|"
+        r"personajes?|viajer[oa]s?|adolescentes?|novi[oa]s?|ciclistas?|turistas?|"
+        r"figuras?|jugador(?:es|as?)?|humanoides?|androides?|estatuas?|maniqu[ií](?:es)?|"
+        r"caras?|rostros?|cabezas?|cuerpos?|brazos?|manos?|"
+        r"figuras?\s+humanas?|silhuetas?\s+humanas?|"
+        r"pessoas?|homem|homens|mulher|mulheres|crianças?|casais?|multid[aã]o|"
+        r"plateia|p[uú]blico|amigos?|amantes?|pedestres?|motoristas?|f[aã]s?|"
+        r"cantores?|m[uú]sicos?|dançarinos?|guitarristas?|bateristas?|vocalistas?|"
+        r"artistas?|djs?|rappers?|bandas?|trabalhadores?|atores?|modelos?|"
+        r"operadores?|equipes?\s+de\s+filmagem|personagens?|"
+        r"viajantes?|adolescentes?|noiv[oa]s?|ciclistas?|turistas?|figuras?|"
+        r"jogador(?:es|as?)?|humanoides?|androides?|est[aá]tuas?|manequins?|"
+        r"faces?|rostos?|cabeças?|corpos?|braços?|m[aã]os?"
+    )
+    negative = (
+        r"no|not|without|avoid|exclude|never|none|zero|free\s+of|devoid\s+of|"
+        r"sin|evitar|excluir|nunca|ning[uú]n(?:a|o|as|os)?|cero|libre\s+de|"
+        r"sem|n[aã]o|evite|exclua|nenhum(?:a|as|os)?"
+    )
+    contrast = _re.compile(
+        r"\b(?:but|however|instead|only|except|apart\s+from|other\s+than|"
+        r"pero|sino|solamente|solo|excepto|salvo|s[oó]|por[eé]m|mas|apenas|"
+        r"exceto)\b",
+        _re.IGNORECASE,
+    )
+    negative_human_end = None
+    for match in _re.finditer(rf"\b(?:{human_terms})\b", text, _re.IGNORECASE):
+        hard_before = _re.split(r"[\n.!?;]", text[:match.start()])[-1]
+        contrast_parts = contrast.split(hard_before)
+        before = contrast_parts[-1].rsplit(",", 1)[-1]
+        hard_after = _re.split(r"[\n.!?;]", text[match.end():], maxsplit=1)[0]
+        after = contrast.split(hard_after, maxsplit=1)[0]
+        inherited_negative = False
+        if negative_human_end is not None:
+            between = text[negative_human_end:match.start()]
+            inherited_negative = bool(
+                _re.fullmatch(
+                    r"\s*(?:(?:,|/|&|\b(?:and|or|y|e|o|ou)\b)\s*)*"
+                    r"(?:(?:a|an|the|un|una|el|la|um|uma|o)\s+)?",
+                    between,
+                )
+            )
+        if (
+            inherited_negative
+            or _re.search(rf"\b(?:{negative})\b[\s\S]{{0,80}}$", before)
+        ):
+            negative_human_end = match.end()
+            continue
+        if _re.search(
+            rf"^\s*(?:[:,;\-]\s*)?(?:(?:is|are|must\s+be|should\s+be|"
+            rf"es|son|debe\s+ser|est[aá]n|[eé]|s[aã]o|deve\s+ser)\s+)?"
+            rf"(?:none|zero|cero|ning[uú]n(?:a|o|as|os)?|"
+            rf"nenhum(?:a|as|os)?|free|must\s+not|should\s+not|no\s+debe|"
+            rf"n[aã]o\s+deve|forbidden|prohibited|absent|not\s+allowed)\b",
+            after,
+        ):
+            negative_human_end = match.end()
+            continue
+        if _re.search(
+            r"^\s*(?:(?:must|should|can|could|may|do|does)\s+not|cannot|"
+            r"can't)\s+(?:appear|be\s+(?:shown|visible|included|depicted))\b|"
+            r"^\s*(?:no\s+)?(?:debe|deber[ií]a|puede)\s+no?\s*"
+            r"(?:aparecer|mostrarse|verse|incluirse)\b|"
+            r"^\s*no\s+(?:debe|deber[ií]a|puede)?\s*"
+            r"(?:aparecer|mostrarse|verse|incluirse)\b|"
+            r"^\s*n[aã]o\s+(?:deve|deveria|pode)?\s*"
+            r"(?:aparecer|ser\s+(?:mostrad[oa]|vis[ií]vel|inclu[ií]d[oa]))\b",
+            after,
+            _re.IGNORECASE,
+        ):
+            negative_human_end = match.end()
+            continue
+
+        term = match.group(0).lower()
+        local_before = text[max(0, match.start() - 50):match.start()]
+        local_after = text[match.end():min(len(text), match.end() + 70)]
+        # Human-shaped artificial subjects pose the same malformed-face/body
+        # risk as people for Universal. Unlike anatomy words ("clock hands"),
+        # these terms are not ordinary object parts; a positive mention is an
+        # explicit visual request once the negation checks above have passed.
+        if term in {
+            "humanoid", "humanoids", "statue", "statues",
+            "mannequin", "mannequins", "humanoide", "humanoides",
+            "estatua", "estatuas", "maniquí", "maniquíes",
+            "estátua", "estátuas", "manequim", "manequins",
+        }:
+            return True
+        # Reject non-visual names, idioms and object anatomy without trying to
+        # enumerate every band/artist. The positive path below requires visual
+        # grammar, so these contextual exclusions are a final conservative
+        # belt for phrases such as "Talking Heads inspired" and "clock hands".
+        nominal_after = _re.search(
+            r"^\s*(?:['’]s?\s*)?(?:inspired|album|band|palette|style|"
+            r"generation|rights?|resources?|non\s+grata|logo|typography|"
+            r"[- ]made|[- ]centered)\b",
+            local_after,
+        ) or _re.search(
+            r"\b(?:inspired|album\s+cover\s+palette|color\s+palette|"
+            r"typography|diagram|icon|concept|mural)\b",
+            local_after,
+        )
+        object_before = (
+            term in {"hand", "hands", "arm", "arms", "face", "faces", "head", "heads", "body", "bodies"}
+            and _re.search(
+                r"\b(?:clock|watch|chair|sofa|armchair|table|building|mountain)\s+$",
+                local_before,
+            )
+        )
+        # Object anatomy is common prompt language and must not unlock the
+        # people bypass: "clock with hands", "silla con brazos", "relógio
+        # com mãos". Keep this multilingual and conservative; a false
+        # negative merely retains validation, while a false positive would
+        # remove the people gate.
+        object_anatomy_terms = {
+            "hand", "hands", "arm", "arms", "face", "faces", "head",
+            "heads", "body", "bodies", "mano", "manos", "brazo",
+            "brazos", "cara", "caras", "rostro", "rostros", "cabeza",
+            "cabezas", "cuerpo", "cuerpos", "mão", "mãos", "braço",
+            "braços", "rosto", "rostos", "cabeça", "cabeças", "corpo",
+            "corpos",
+        }
+        object_before = object_before or bool(
+            term in object_anatomy_terms
+            and _re.search(
+                r"\b(?:clock|watch|chair|sofa|armchair|table|building|mountain|"
+                r"reloj|silla|sof[aá]|sill[oó]n|mesa|edificio|monta[nñ]a|"
+                r"rel[oó]gio|cadeira|poltrona|edif[ií]cio|montanha)\b\s+"
+                r"(?:(?:with|con|com)\s+)?"
+                r"(?:(?:a|an|the|its|un|una|el|la|los|las|su|sus|um|uma|"
+                r"o|os|as|seu|sua|seus|suas)\s+)?$",
+                local_before,
+            )
+        )
+        object_before = object_before or bool(
+            term in {
+                "arm", "arms", "brazo", "brazos", "braço", "braços",
+                "hand", "hands", "mano", "manos", "mão", "mãos",
+            }
+            and _re.search(
+                r"\b(?:mechanical|robotic|crane|boom|industrial|articulated|"
+                r"mec[aá]nic[oa]|rob[oó]tic[oa]|gr[uú]a|industrial|articulad[oa]|"
+                r"mec[aâ]nic[oa]|rob[oô]tic[oa]|guindaste)\s+$",
+                local_before,
+            )
+        )
+        object_after = (
+            term in {"hand", "hands", "arm", "arms", "face", "faces", "head", "heads", "body", "bodies"}
+            and _re.search(
+                r"^\s+of\s+(?:a\s+|the\s+)?(?:clock|watch|chair|sofa|"
+                r"armchair|table|building|mountain|water|department|time|"
+                r"law|state|value)\b",
+                local_after,
+            )
+        ) or bool(
+            term in {"hand", "hands"}
+            and _re.search(r"^\s+on\s+deck\b", local_after)
+        )
+        if nominal_after or object_before or object_after:
+            continue
+
+        # These words have common non-human meanings. They authorize people
+        # only with a human-specific modifier/action/context; this prevents
+        # "rubber band", "electric fan", "3D model", "Android phone",
+        # circuit-board drivers and mathematical operators from unlocking the
+        # people gate while preserving "live band performing", "fans
+        # cheering", "fashion model posing" and "camera operator filming".
+        _ambiguous_term = term.rstrip("s")
+        if term in {"operators", "operador", "operadora", "operadores", "operadoras"}:
+            _ambiguous_term = "operador" if term != "operators" else "operator"
+        elif term in {"driver", "drivers", "conductor", "conductores"}:
+            _ambiguous_term = "driver" if term.startswith("driver") else "conductor"
+        elif term in {"figure", "figures", "figura", "figuras"}:
+            _ambiguous_term = "figure"
+        elif term in {
+            "player", "players", "jugador", "jugadora", "jugadores", "jugadoras",
+            "jogador", "jogadora", "jogadores", "jogadoras",
+        }:
+            _ambiguous_term = "player"
+        if _ambiguous_term in {
+            "band", "fan", "model", "android", "driver", "operator",
+            "banda", "modelo", "androide", "conductor", "operador",
+            "motorista", "figure", "player",
+        }:
+            _ambiguous_context = {
+                "band": r"\b(?:live|music|musical|rock|performing|playing|singing)\b",
+                "banda": r"\b(?:vivo|musical|m[uú]sica|rock|tocando|cantando|ao\s+vivo)\b",
+                "fan": r"\b(?:music|sports?|concert|cheering|waving|dancing|person)\b",
+                "model": r"\b(?:fashion|runway|human|person|posing|walking)\b",
+                "modelo": r"\b(?:moda|pasarela|passarela|humano|pessoa|posando|caminando|caminhando)\b",
+                "android": r"\b(?:humanoid|human-shaped|walking|standing|performing)\b",
+                "androide": r"\b(?:humanoide|forma\s+humana|caminando|caminhando|de\s+p[eé])\b",
+                "driver": r"\b(?:car|vehicle|race|racing|driving|behind\s+(?:the\s+)?wheel|human)\b",
+                "conductor": r"\b(?:auto|coche|veh[ií]culo|carrera|conduciendo|volante|humano)\b",
+                "motorista": r"\b(?:carro|ve[ií]culo|corrida|dirigindo|volante|humano)\b",
+                "operator": r"\b(?:camera|boom|film|human|filming|working)\b",
+                "operador": r"\b(?:c[aá]mara|boom|film|humano|filmando|trabajando|trabalhando)\b",
+                "figure": r"\b(?:human|human-shaped|solitary|lone|humana?|"
+                           r"walking|standing|dancing|running|caminando|parada?|"
+                           r"bailando|corriendo|caminhando|dançando|correndo)\b",
+                "player": r"\b(?:football|soccer|basketball|tennis|sport|athlete|"
+                           r"running|playing|f[uú]tbol|b[aá]squet|deporte|atleta|"
+                           r"corriendo|jogando|futebol|esporte|correndo)\b",
+            }.get(_ambiguous_term, r"$^")
+            _ambiguous_window = f"{local_before} {term} {local_after}"
+            _subject_alone = bool(_re.fullmatch(
+                rf"\s*(?:a|an|the|un|una|el|la|um|uma|o|a)\s+{_re.escape(term)}\s*",
+                text,
+            ))
+            _has_human_context = bool(_re.search(
+                _ambiguous_context, _ambiguous_window
+            ))
+            if _has_human_context or (
+                _subject_alone
+                and _ambiguous_term in {
+                    "driver", "conductor", "motorista", "operator", "operador",
+                }
+            ):
+                return True
+            if not _has_human_context:
+                continue
+
+        unambiguous_human_roles = {
+            "person", "persons", "people", "human", "humans", "man", "men",
+            "woman", "women", "boy", "boys", "girl", "girls", "child",
+            "children", "couple", "crowd", "audience", "friend", "friends",
+            "lover", "lovers", "pedestrian", "pedestrians", "worker", "workers",
+            "singer", "singers", "musician", "musicians", "dancer", "dancers",
+            "guitarist", "guitarists", "drummer", "drummers", "vocalist",
+            "vocalists", "performer", "performers", "rapper", "rappers", "actor",
+            "actors", "traveler", "travelers", "teenager", "teenagers", "bride",
+            "brides", "groom", "grooms", "cyclist", "cyclists", "tourist", "tourists",
+            "persona", "personas", "gente", "hombre", "hombres",
+            "mujer", "mujeres", "niño", "niña", "niños", "niñas", "pareja",
+            "parejas", "multitud", "audiencia", "público", "amigo", "amiga",
+            "amigos", "amigas", "amante", "amantes", "peatón", "peatones",
+            "trabajador", "trabajadores", "actor", "actores", "cantante",
+            "cantantes", "guitarrista", "guitarristas", "baterista", "bateristas",
+            "vocalista", "vocalistas", "intérprete", "intérpretes", "rapero",
+            "raperos", "viajero", "viajera", "viajeros", "viajeras", "adolescente",
+            "adolescentes", "novio", "novia", "novios", "novias", "ciclista",
+            "ciclistas", "turista", "turistas", "pessoa", "pessoas", "homem", "homens", "mulher",
+            "mulheres", "criança", "crianças", "casal", "casais", "multidão",
+            "plateia", "amigo", "amigos", "pedestre", "pedestres", "trabalhador",
+            "trabalhadores", "ator", "atores", "cantor", "cantores", "dançarino",
+            "dançarinos", "viajante", "viajantes", "adolescente", "adolescentes",
+            "noivo", "noiva", "noivos", "noivas", "ciclista", "ciclistas",
+            "turista", "turistas",
+        }
+        if term in unambiguous_human_roles:
+            return True
+
+        visual_before = _re.search(
+            r"(?:^|\b)(?:show|include|depict|feature|featuring|with|portrait\s+of|"
+            r"close[- ]up(?:\s+of)?|mostrar|incluir|con|retrato\s+de|com)"
+            r"(?:\s+[\wÀ-ɏ'-]+){0,4}\s+$",
+            local_before,
+        )
+        visual_after = _re.search(
+            r"^\s+(?:sitting|standing|walking|singing|playing|dancing|running|"
+            r"looking|facing|wearing|holding|carrying|performing|filming|working|"
+            r"posing|crossing|embracing|waving|cheering|riding|skating|"
+            r"taking\s+(?:photos?|pictures?)|behind\b|"
+            r"lying|seated|"
+            r"sentad[oa]s?|parad[oa]s?|caminando|cantando|tocando|bailando|"
+            r"corriendo|mirando|sosteniendo|cargando|abrazando|saludando|"
+            r"animando|filmando|trabajando|posando|cruzando|"
+            r"deitado|sentado|em\s+p[eé]|"
+            r"caminhando|cantando|tocando|dançando|correndo|olhando|"
+            r"filmando|trabalhando|posando|carregando|abraçando|acenando|"
+            r"torcendo|atravessando|"
+            r"in\b|on\b|at\b|by\b|beside\b|inside\b|outside\b|en\b|"
+            r"sobre\b|junto\b|dentro\b|em\b|ao\b|na\b|no\b|nas\b|nos\b)",
+            local_after,
+        )
+        subject_only_prompt = _re.fullmatch(
+            rf"\s*(?:(?:a|an|the|un|una|el|la|los|las|um|uma|o|os|as)\s+)?"
+            rf"(?:[\wÀ-ɏ'-]+\s+){{0,3}}{_re.escape(term)}\s*",
+            text,
+        )
+        explicit_subject_with_nonhuman_exclusion = bool(
+            _re.search(
+                r"\b(?:a|an|the|un|una|el|la|um|uma)\s+"
+                r"(?:[\wÀ-ɏ'-]+\s+){0,3}$",
+                local_before,
+            )
+            and _re.search(
+                r"^\s*(?:(?:,|and|y|e)\s*)?(?:without|no|sin|sem)\s+"
+                r"(?:any\s+|readable\s+)?(?:text|logos?|brands?|letters?|"
+                r"texto|marcas?|letras?)\b",
+                local_after,
+            )
+        )
+        if term in object_anatomy_terms:
+            # Anatomy words are inherently ambiguous (clock hands, chair arms,
+            # watch face). Generic visual verbs such as show/feature/depict or
+            # with/con/com therefore cannot authorize people on their own.
+            # Require evidence that is specifically human: a nearby
+            # unambiguous subject, human framing/modifier, or an action that a
+            # body part performs. This avoids an endless object/connector
+            # blacklist while preserving explicit prompts such as "close-up
+            # face", "hands playing guitar" and "a human face glowing".
+            hard_human_before = _re.split(
+                r"[\n.!?;]", text[:match.start()]
+            )[-1]
+            unambiguous_human_before = _re.search(
+                r"\b(?:people|persons?|humans?|man|men|woman|women|boys?|"
+                r"girls?|child|children|couple|crowd|singers?|musicians?|"
+                r"dancers?|personas?|gente|hombres?|mujer(?:es)?|niñ[oa]s?|"
+                r"pareja|multitud|cantantes?|m[uú]sicos?|bailar(?:ines|ina|"
+                r"inas|[ií]n)|pessoas?|homem|homens|mulher|mulheres|"
+                r"crianças?|casal|multid[aã]o|cantores?|dançarinos?)\b"
+                r"[^\n.!?;]{0,70}$",
+                hard_human_before,
+            )
+            human_modifier_before = _re.search(
+                r"(?:\b(?:human|humano|humana|humano|humana)\s+|"
+                r"\b(?:person|human|man|woman|boy|girl|child|singer|dancer|"
+                r"persona|hombre|mujer|niñ[oa]|cantante|bailar[ií]n|"
+                r"pessoa|homem|mulher|criança|cantor|dançarino)['’]s\s*)$",
+                local_before,
+            )
+            human_framing_before = _re.search(
+                r"(?:^|\b)(?:close[- ]up(?:\s+of)?|portrait\s+of|"
+                r"primer\s+plano(?:\s+de)?|retrato\s+de|"
+                r"plano\s+fechado(?:\s+de)?|retrato\s+de)\s+$",
+                local_before,
+            )
+            human_action_after = _re.search(
+                r"^\s+(?:playing|holding|clapping|waving|reaching|touching|"
+                r"grasping|pointing|smiling|blinking|turning|nodding|"
+                r"tocando|sosteniendo|aplaudiendo|saludando|alcanzando|"
+                r"señalando|sonriendo|parpadeando|girando|asintiendo|"
+                r"segurando|aplaudindo|acenando|alcançando|apontando|"
+                r"sorrindo|piscando|virando)\b",
+                local_after,
+            )
+            direct_anatomy_subject = _re.fullmatch(
+                rf"\s*(?:(?:a|an|the|un|una|el|la|los|las|um|uma|o|os|as)\s+)?"
+                rf"(?:(?:human|humano|humana)\s+)?{_re.escape(term)}"
+                rf"\s*(?:(?:,|and|y|e)\s*(?:without|no|sin|sem)\s+"
+                rf"(?:any\s+|readable\s+)?(?:text|logos?|brands?|letters?|"
+                rf"texto|marcas?|letras?))?\s*",
+                text,
+            )
+            if (
+                unambiguous_human_before
+                or human_modifier_before
+                or human_framing_before
+                or human_action_after
+                or direct_anatomy_subject
+            ):
+                return True
+            continue
+        if (
+            visual_before
+            or visual_after
+            or subject_only_prompt
+            or explicit_subject_with_nonhuman_exclusion
+        ):
+            return True
+    return False
+
+
+def _is_universal_account(tenant: str | None, billing_group: str | None) -> bool:
+    """Recognize current and future Universal account identifiers."""
+    tenant_id = _normalise_account_id(tenant)
+    group_id = _normalise_account_id(billing_group)
+    return bool(
+        tenant_id in UMG_TENANTS
+        or _re_match_universal_tenant(tenant_id)
+        or group_id in UMG_BILLING_GROUPS
+    )
+
+
+def _re_match_universal_tenant(tenant_id: str) -> bool:
+    import re as _re
+    return bool(_re.fullmatch(r"universal(?:[_-][a-z0-9_-]+)?", tenant_id or ""))
+
+
+def _validation_observe_only() -> bool:
+    """Kill-switch for validation *enforcement*, not detection.
+
+    ``BACKGROUND_VALIDATION_ENFORCEMENT=observe`` keeps every Vision check,
+    its provenance row and the stored verdict, but never rejects, regenerates
+    or downgrades a background because of it. The default ("block") preserves
+    the fail-closed behavior, so production semantics are unchanged unless the
+    environment opts in.
+    """
+    return (
+        os.getenv("BACKGROUND_VALIDATION_ENFORCEMENT", "block").strip().lower()
+        == "observe"
+    )
+
+
+def _mark_validation_observed(result: dict) -> dict:
+    """Turn a failing verdict into an annotated pass for observe-only mode.
+
+    ``passed`` must flip to True because downstream consumers (scene-plan
+    reuse, edit revalidation, review UI) gate on it; the original verdict
+    stays inspectable under ``observed_issues``.
+    """
+    result = dict(result)
+    result["observed_violation"] = True
+    result["observed_issues"] = list(result.get("issues") or [])
+    result["enforcement"] = "observe"
+    result["passed"] = True
+    return result
+
+
+def _validation_parallel_enabled() -> bool:
+    """Overlap del Vision check del fondo único con el encode.
+
+    Solo bajo enforcement=observe: ahí el veredicto NUNCA reasigna
+    ``bg_image_path`` (no hay recovery/gradiente), así que el hilo y el
+    encode pueden leer el mismo archivo sin carrera de path. Bajo block
+    (prod) retorna False sin siquiera leer el flag → camino secuencial
+    byte-idéntico. Flag propio (``BACKGROUND_VALIDATION_PARALLEL``, default
+    0) separado del enforcement: compliance y perf necesitan rollback
+    independiente.
+    """
+    if not _validation_observe_only():
+        return False
+    return os.getenv("BACKGROUND_VALIDATION_PARALLEL", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _run_observe_validation(job_id: str, validate_fn) -> dict:
+    """Cuerpo del hilo de validación observe-only del fondo único.
+
+    Réplica exacta de la rama inline observe de run_pipeline: registra el
+    veredicto crudo y, si falla, lo flipea a observed-pass. Ambos
+    ``update_job`` son thread-safe (SessionLocal por llamada +
+    ``with_for_update``) y solo escriben ``validation_result`` — no pisan
+    el progress/current_step que el encode actualiza desde el main thread.
+    """
+    result = validate_fn()
+    update_job(job_id, validation_result=result)
+    if not result.get("passed"):
+        logger.warning(
+            "[VALIDATION] observe-only: keeping background job=%s despite "
+            "failed verdict issues=%s", job_id, result.get("issues"),
+        )
+        result = _mark_validation_observed(result)
+        update_job(job_id, validation_result=result)
+    return result
+
+
+def _scene_concurrency() -> int:
+    """How many unique scene clips to generate at once.
+
+    Each scene is an independent Veo call (~90s) plus a Vision check; the
+    old loop paid them back-to-back, so an N-scene song took N×~2min. Fan
+    out and the wall-clock collapses to the slowest single scene. Bounded
+    to keep Veo/Vision quota sane. ``SCENE_CONCURRENCY=1`` restores the
+    exact sequential legacy behavior for rollback.
+    """
     try:
-        from database import SessionLocal as _SL, Job as _Job
+        n = int(os.getenv("SCENE_CONCURRENCY", "4"))
+    except (TypeError, ValueError):
+        n = 4
+    return max(1, min(n, 8))
+
+
+def _scene_validation_observe_skip() -> bool:
+    """Skip the inline per-clip Vision check on scene clips under observe.
+
+    Only meaningful when enforcement is already ``observe`` (the check can
+    never reject there, so it is pure latency). Off by default: with
+    parallel scene generation the validation overlaps and no longer costs
+    wall-clock, and keeping it preserves the per-scene verdicts we collect
+    to calibrate. Flip ``SCENE_VALIDATION_OBSERVE_SKIP=1`` for max speed.
+    """
+    if not _validation_observe_only():
+        return False
+    return os.getenv("SCENE_VALIDATION_OBSERVE_SKIP", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _background_safety_policy(job_id: str | None, operator_prompt: str | None = None) -> dict:
+    """Resolve the authoritative background policy, failing closed.
+
+    Universal is matched by tenant OR billing group and can never bypass the
+    no-human rule.  Every other account defaults to no humans; a human subject
+    is allowed only when the operator's own prompt explicitly asks for one.
+    """
+    _atmospherics = resolve_atmospherics_policy(operator_prompt)
+    policy = {
+        "tenant_id": None, "billing_group": None, "is_umg": True,
+        "allow_people": False, "validate_people": True,
+        "validate_brand": True,
+        "allow_atmospherics": _atmospherics["allow_atmospherics"],
+        "validate_atmospherics": (
+            policy_enforces(_atmospherics)
+            and not _atmospherics["allow_atmospherics"]
+        ),
+        "observe_atmospherics": (
+            _atmospherics.get("policy_mode") == "shadow"
+            and not _atmospherics["allow_atmospherics"]
+        ),
+        "atmospherics_policy": _atmospherics,
+        "policy_version": BACKGROUND_POLICY_VERSION,
+        "policy_mode": _atmospherics.get("policy_mode", "off"),
+        "should_validate": True, "reason": "fail_closed",
+    }
+    if not job_id:
+        return policy
+    try:
+        from database import SessionLocal as _SL, Job as _Job, User as _User
         with _SL() as _db:
             row = _db.query(_Job).filter(_Job.job_id == job_id).first()
             if not row:
-                return False
-            tenant = row.tenant_id or ""
+                return policy
+            user = _db.query(_User).filter(_User.id == row.user_id).first()
+            if user is None:
+                return policy
+            tenant = _normalise_account_id(row.tenant_id)
+            billing_group = _normalise_account_id(user.billing_group if user else None)
             rp = row.render_params if isinstance(row.render_params, dict) else {}
-            bypass = bool(rp.get("bypass_content_validation"))
+            is_umg = _is_universal_account(tenant, billing_group)
+            explicit_people = _prompt_explicitly_requests_people(operator_prompt)
+            # Two independent signals are required for a human subject:
+            # an explicit prompt AND the existing "fondo libre" opt-out.
+            # This keeps automatic/lyrics prompts and stale default flags safe.
             force = bool(rp.get("force_content_validation"))
-            is_umg = tenant in UMG_TENANTS
-            # Allow people when validator would NOT run. Same boolean
-            # algebra as Step 1b — but inverted (allow_people = NOT validate).
-            should_validate = (is_umg and not bypass) or (not is_umg and force)
-            return not should_validate
+            bypass = bool(rp.get("bypass_content_validation"))
+            allow_people = bool(explicit_people and bypass and not force and not is_umg)
+            validate_people = not allow_people
+            validate_atmospherics = (
+                policy_enforces(_atmospherics)
+                and not _atmospherics["allow_atmospherics"]
+            )
+            observe_atmospherics = (
+                _atmospherics.get("policy_mode") == "shadow"
+                and not _atmospherics["allow_atmospherics"]
+            )
+            # People and atmospherics are independent dimensions. A valid
+            # non-UMG people opt-in must not disable smoke observation/gating.
+            # Brand/IP classification is immutable. A valid opt-in for a human
+            # subject must never bypass that independent dimension.
+            #
+            # Prod-parity gate (promoción staging→prod 2026-07-22): producción
+            # revirtió a propósito (#900) el hardening de background para
+            # cuentas non-UMG porque sobre-bloqueaba fondos benignos. Preservamos
+            # esa postura permisiva en prod POR DEFAULT: un tenant non-UMG solo
+            # corre el validador si el operador lo pidió explícito
+            # (force_content_validation) — idéntico a la regla legacy de prod
+            # (not is_umg → validar solo si _force_validation). UMG NUNCA cambia:
+            # siempre valida (should_validate=True). El modo estricto de staging
+            # (validar people+brand por default en non-UMG) queda como opt-in por
+            # entorno: BACKGROUND_NONUMG_VALIDATION=staging. Este gate cubre
+            # people Y brand porque ambos pasan por should_validate; atmospherics
+            # ya está en prod-parity vía BACKGROUND_SMOKE_POLICY_MODE (default off).
+            if is_umg:
+                should_validate = True
+            elif os.getenv("BACKGROUND_NONUMG_VALIDATION", "prod").strip().lower() == "staging":
+                should_validate = True
+            else:
+                should_validate = bool(force)
+            return {
+                "tenant_id": tenant, "billing_group": billing_group,
+                "is_umg": is_umg, "allow_people": allow_people,
+                "validate_people": validate_people,
+                "validate_brand": True,
+                "allow_atmospherics": _atmospherics["allow_atmospherics"],
+                "validate_atmospherics": validate_atmospherics,
+                "observe_atmospherics": observe_atmospherics,
+                "atmospherics_policy": _atmospherics,
+                "policy_version": BACKGROUND_POLICY_VERSION,
+                "policy_mode": _atmospherics.get("policy_mode", "off"),
+                "should_validate": should_validate,
+                "reason": (
+                    "universal_mandatory" if is_umg else
+                    "explicit_people_request" if allow_people else
+                    "forced_validation" if force else
+                    "restricted_prompt_only"
+                ),
+            }
     except Exception as e:
-        logger.warning("[BG] _compute_allow_people fallback to False for job %s: %s", job_id, e)
+        logger.warning("[BG] safety policy fallback to fail-closed for job %s: %s", job_id, e)
+        return policy
+
+
+def _compute_allow_people(job_id: str | None, operator_prompt: str | None = None) -> bool:
+    """Allow humans only for an explicit non-Universal operator prompt."""
+    return bool(_background_safety_policy(job_id, operator_prompt)["allow_people"])
+
+
+def _prompt_may_contain_human_subject(prompt: str | None) -> bool:
+    """High-recall detector used only at the restricted provider boundary.
+
+    This is deliberately separate from :func:`_prompt_explicitly_requests_people`.
+    That function grants an operator permission and therefore favours precision;
+    this function removes potentially unsafe text and therefore favours recall.
+    A false positive here only replaces a restricted prompt with a safe visual
+    direction.  It can never enable people.
+    """
+    import re as _re
+
+    value = _normalise_account_id(prompt)
+    if not value:
         return False
+    if _prompt_explicitly_requests_people(value):
+        return True
+
+    # Remove common non-human uses before the intentionally broad scan.  These
+    # substitutions protect useful object prompts (clock hands, chair arms,
+    # robotic equipment, 3-D models) without weakening the authorization gate.
+    object_only = (
+        r"(?:clock|watch|reloj|rel[oó]gio)(?:['’]s)?\s+"
+        r"(?:hands?|faces?|manos?|caras?|rostros?|m[aã]os?|faces?|rostos?)|"
+        r"(?:chair|sofa|armchair|silla|sof[aá]|sill[oó]n|cadeira|poltrona)"
+        r"(?:['’]s)?\s+(?:arms?|brazos?|braços?)|"
+        r"(?:mechanical|robotic|crane|boom|industrial|articulated|"
+        r"mec[aáâ]nic[oa]|rob[oóô]tic[oa]|gr[uú]a|guindaste|articulad[oa])"
+        r"\s+(?:arms?|hands?|brazos?|manos?|braços?|m[aã]os?)|"
+        r"(?:rubber|elastic|goma|el[aá]stic[oa])\s+bands?|"
+        r"bandas?\s+el[aá]sticas?|faixas?\s+el[aá]sticas?|"
+        r"(?:electric|ceiling|desk|ventilation|el[eé]ctric[oa]|techo|teto)\s+fans?|"
+        r"(?:3[- ]?d|scale|data|language|render|modelo\s+3d)\s+models?|"
+        r"android\s+(?:phone|device|app|operating\s+system)|"
+        r"(?:circuit|software|device|motor)\s+drivers?|"
+        r"(?:mathematical|boolean|search)\s+operators?|"
+        # Contextos benignos de paisaje que disparaban falsos positivos y
+        # colapsaban prompts sin ninguna persona (bug 2026-07-23: "photographs
+        # appear around them" / "bodies of water" / "cliff faces" / "silhouettes
+        # of pine trees"). No son sujetos humanos; sacarlos antes del scan.
+        r"bodies\s+of\s+water|cuerpos?\s+de\s+agua|corpos?\s+de\s+[aá]gua|"
+        r"(?:cliff|rock|stone|mountain|canyon|glacier|ice|building|wall)\s+faces?|"
+        r"(?:acantilado|roca|piedra|monta[ñn]a)\s+caras?|"
+        r"silhouett\w+\s+of\s+(?:the\s+)?(?:trees?|pines?|mountains?|hills?|"
+        r"buildings?|towers?|rooftops?|skyline|forests?|foliage|branches?|"
+        r"leaves|clouds?|rocks?|ruins?|cit(?:y|yscape))|"
+        r"siluetas?\s+de\s+(?:[aá]rboles|monta[ñn]as|edificios|colinas)"
+    )
+    scan = _re.sub(rf"\b(?:{object_only})\b", " ", value, flags=_re.IGNORECASE)
+    scan = _re.sub(
+        r"\b(?:hands?|arms?|faces?|manos?|brazos?|caras?|rostros?|"
+        r"m[aã]os?|braços?|faces?|rostos?)\s+(?:of|de|do|da|del)\s+"
+        r"(?:a\s+|the\s+|un\s+|una\s+|um\s+|uma\s+|el\s+|la\s+|"
+        r"o\s+|a\s+)?(?:clock|watch|chair|sofa|armchair|reloj|silla|"
+        r"sof[aá]|sill[oó]n|rel[oó]gio|cadeira|poltrona)\b|"
+        r"\b(?:arms?|hands?|brazos?|manos?|braços?|m[aã]os?)\s+"
+        r"(?:mechanical|robotic|industrial|articulated|mec[aáâ]nic[oa]|"
+        r"rob[oóô]tic[oa]|industrial|articulad[oa])\b|"
+        r"\b(?:models?|modelos?)\s+(?:3[- ]?d|de\s+escala)\b",
+        " ",
+        scan,
+        flags=_re.IGNORECASE,
+    )
+
+    # Catch roles we have not enumerated when the grammar itself describes a
+    # human action. This detector only *removes* restricted prompts, so an
+    # occasional environmental false positive is safer than forwarding an
+    # unknown profession (cashier, lifeguard, conductor, etc.) to Universal.
+    if _re.search(
+        r"\b(?:a|an|the|un|una|el|la|um|uma|o)\s+"
+        r"(?:[\wÀ-ɏ'-]+\s+){0,2}[\wÀ-ɏ'-]+\s+"
+        r"(?:walking|running|standing|sitting|dancing|singing|serving|praying|"
+        r"teaching|studying|driving|speaking|smiling|wearing|holding|carrying|"
+        r"working|painting|photographing|marching|meditating|posing|swimming|"
+        r"skating|surfing|caminando|corriendo|de\s+pie|sentad[oa]|bailando|"
+        r"cantando|sirviendo|rezando|enseñando|estudiando|conduciendo|"
+        r"hablando|sonriendo|vistiendo|sosteniendo|cargando|trabajando|"
+        r"pintando|fotografiando|marchando|meditando|posando|nadando|"
+        r"caminhando|correndo|em\s+p[eé]|sentad[oa]|dançando|cantando|"
+        r"servindo|rezando|ensinando|estudando|dirigindo|falando|sorrindo|"
+        r"vestindo|segurando|carregando|trabalhando|pintando|fotografando|"
+        r"marchando|meditando|posando|nadando)\b",
+        scan,
+        _re.IGNORECASE,
+    ):
+        return True
+
+    broad_human = (
+        r"people|persons?|humans?|humanlike|human[- ]shaped|humanoid(?:s)?|"
+        r"men|man|women|woman|male\s+subject|female\s+subject|boys?|girls?|"
+        r"children?|kids?|bab(?:y|ies)|teens?|teenagers?|"
+        r"famil(?:y|ies)|couples?|pairs?|groups?|crowds?|audiences?|friends?|"
+        r"lovers?|pedestrians?|travelers?|tourists?|cyclists?|skaters?|surfers?|"
+        r"protagonists?|hero(?:es)?|heroine(?:s)?|characters?|"
+        r"singers?|musicians?|dancers?|guitarists?|drummers?|vocalists?|"
+        r"performers?|rappers?|djs?|bands?|actors?|models?|workers?|"
+        r"monks?|nuns?|nurses?|doctors?|teachers?|students?|pilots?|officers?|"
+        r"athletes?|coach(?:es)?|mechanics?|engineers?|scientists?|priests?|rabbis?|"
+        r"imams?|police\s+officers?|"
+        r"police(?:man|woman|men|women)|firefighters?|soldiers?|chefs?|"
+        r"waiters?|waitress(?:es)?|farmers?|"
+        r"business(?:man|woman|men|women|people)|puppeteers?|painters?|"
+        r"photographers?|kings?|queens?|princes?|princess(?:es)?|"
+        r"silhouettes?|figures?|statues?|mannequins?|faces?|heads?|bodies?|"
+        r"limbs?|hands?|arms?|"
+        # Pronombres NOMINATIVOS (sujeto) = humano SIEMPRE, sin depender del
+        # verbo (fix del leak 2026-07-23: "he drinks / she weeps / they gather"
+        # tienen que dispararse). Se sacan SOLO los de objeto/posesivo
+        # (them/their/his/her/him/hers) que causaban falsos positivos sobre
+        # objetos ("photographs appear around them", "trees and their shadows").
+        r"he|she|they|"
+        r"personas?|gente|human[oa]s?|humanoides?|hombres?|mujer(?:es)?|"
+        r"niñ[oa]s?|beb[eé]s?|adolescentes?|familias?|parejas?|grupos?|"
+        r"multitud(?:es)?|p[uú]blico|audiencia|amig[oa]s?|amantes?|"
+        r"peatones?|viajer[oa]s?|turistas?|ciclistas?|patinadores?|surfistas?|"
+        r"protagonistas?|h[eé]roes?|hero[ií]nas?|personajes?|"
+        r"cantantes?|m[uú]sicos?|bailar(?:ines|ina|inas|[ií]n)|guitarristas?|"
+        r"bateristas?|vocalistas?|int[eé]rpretes?|raperos?|djs?|bandas?|"
+        r"actor(?:es|as)?|modelos?|trabajador(?:es|as)?|monjes?|monjas?|enfermer[oa]s?|"
+        r"m[eé]dicos?|polic[ií]as?|bomberos?|soldados?|chefs?|cociner[oa]s?|"
+        r"camarer[oa]s?|granjer[oa]s?|empresari[oa]s?|titiriter[oa]s?|"
+        r"profesor(?:a|es|as)?|estudiantes?|pilotos?|atletas?|"
+        r"entrenador(?:a|es|as)?|mec[aá]nic[oa]s?|ingenier[oa]s?|"
+        r"cient[ií]fic[oa]s?|sacerdotes?|rabinos?|imanes?|"
+        r"pintor(?:es)?|pintoras?|fot[oó]graf[oa]s?|re(?:y|yes)|reinas?|"
+        r"pr[ií]ncipes?|princesas?|"
+        r"siluetas?|figuras?|estatuas?|maniqu[ií](?:es)?|caras?|rostros?|"
+        r"cabezas?|cuerpos?|extremidades?|manos?|brazos?|"
+        # Pronombres ES nominativos (todos son sujeto; no hay riesgo de objeto).
+        r"[eé]l|ella|ellos|ellas|"
+        r"pessoas?|humanos?|humanoides?|homem|homens|mulher(?:es)?|"
+        r"crianças?|beb[eê]s?|adolescentes?|fam[ií]lias?|casais?|grupos?|"
+        r"multid[oõã]es?|plateia|p[uú]blico|amigos?|amantes?|pedestres?|"
+        r"viajantes?|turistas?|ciclistas?|skatistas?|surfistas?|"
+        r"protagonistas?|her[oó]is?|hero[ií]nas?|personagens?|"
+        r"cantor(?:a|es|as)?|m[uú]sicos?|dançarinos?|guitarristas?|bateristas?|"
+        r"vocalistas?|artistas?|rappers?|djs?|bandas?|ator(?:es|as)?|modelos?|"
+        r"trabalhador(?:es|as)?|monges?|freiras?|enfermeir[oa]s?|m[eé]dicos?|"
+        r"policial|policiais|bombeiros?|soldad[oa]s?|cozinheir[oa]s?|garçons?|"
+        r"garçom|garçons|garçonetes?|fazendeir[oa]s?|empres[aá]ri[oa]s?|marionetistas?|"
+        r"professor(?:a|es|as)?|estudantes?|pilotos?|atletas?|"
+        r"treinador(?:a|es|as)?|mec[aâ]nic[oa]s?|engenheir[oa]s?|"
+        r"cientistas?|padres?|rabinos?|imames?|"
+        r"pintor(?:es|as)?|fot[oó]graf[oa]s?|reis?|rainhas?|pr[ií]ncipes?|princesas?|"
+        r"silhuetas?|figuras?|est[aá]tuas?|manequins?|faces?|rostos?|"
+        r"cabeças?|corpos?|membros?|m[aã]os?|braços?|"
+        # Pronombres PT nominativos.
+        r"ele|ela|eles|elas"
+    )
+    negative = (
+        r"no|not|without|avoid|exclude|never|none|zero|free\s+of|devoid\s+of|"
+        r"sin|evitar|excluir|nunca|ning[uú]n(?:a|o|as|os)?|cero|libre\s+de|"
+        r"sem|n[aã]o|evite|exclua|nenhum(?:a|as|os)?"
+    )
+    contrast = _re.compile(
+        r"\b(?:but|however|instead|except|apart\s+from|other\s+than|include|"
+        r"show|feature|featuring|pero|sino|excepto|salvo|incluir|incluye|"
+        r"mostrar|muestra|por[eé]m|mas|exceto|incluir|mostrar)\b",
+        _re.IGNORECASE,
+    )
+    for match in _re.finditer(rf"\b(?:{broad_human})\b", scan, _re.IGNORECASE):
+        hard_before = _re.split(r"[\n.!?;]", scan[:match.start()])[-1]
+        # A comma starts a new visual item for this high-recall boundary.  This
+        # intentionally catches "without people nearby, a singer".  Explicit
+        # negative lists may be over-sanitized, which is safe and does not
+        # change authorization.
+        before = contrast.split(hard_before)[-1].rsplit(",", 1)[-1]
+        hard_after = _re.split(r"[\n.!?;]", scan[match.end():], maxsplit=1)[0]
+        after = contrast.split(hard_after, maxsplit=1)[0]
+        if _re.search(rf"\b(?:{negative})\b[\s\S]{{0,80}}$", before):
+            continue
+        if _re.search(
+            rf"^\s*(?:[:,;\-]\s*)?(?:(?:is|are|must\s+be|should\s+be|"
+            rf"es|son|debe\s+ser|[eé]|s[aã]o|deve\s+ser)\s+)?"
+            rf"(?:none|zero|cero|ning[uú]n(?:a|o|as|os)?|"
+            rf"nenhum(?:a|as|os)?|absent|forbidden|prohibited|not\s+allowed)\b",
+            after,
+        ):
+            continue
+        if _re.search(
+            r"^\s*(?:(?:must|should|can|could|may|do|does)\s+not|cannot|"
+            r"can't)\s+(?:appear|be\s+(?:shown|visible|included|depicted))\b|"
+            r"^\s*no\s+(?:debe|deber[ií]a|puede)?\s*"
+            r"(?:aparecer|mostrarse|verse|incluirse)\b|"
+            r"^\s*n[aã]o\s+(?:deve|deveria|pode)?\s*"
+            r"(?:aparecer|ser\s+(?:mostrad[oa]|vis[ií]vel|inclu[ií]d[oa]))\b",
+            after,
+            _re.IGNORECASE,
+        ):
+            continue
+        return True
+    return False
+
+
+# Pool DIVERSO de arquetipos de entorno para el fallback del sanitizador
+# cuando la remoción quirúrgica no deja escena usable. NO es un único string:
+# se elige por hash del prompt para que canciones distintas den entornos
+# distintos (bug 2026-07-23: un fallback fijo colapsaba todos los fondos a lo
+# mismo). Evita a propósito los clichés recurrentes (campo con árbol, callejón,
+# highway desolado, humo, partículas flotando).
+_UNOCCUPIED_FALLBACK_SETTINGS = (
+    "a sunlit room with worn wooden floors and tall windows",
+    "an analog recording studio with mixing consoles and warm lamplight",
+    "an old theater interior with empty velvet seats and stage lights",
+    "a rooftop terrace overlooking a dense city skyline at golden hour",
+    "a dim archive library lined with shelves, papers and shafts of light",
+    "a greenhouse full of plants under soft diffuse grey light",
+    "a neon-lit diner interior at midnight with empty booths and chrome",
+    "a harbor at dawn with moored boats and still reflective water",
+    "a grand cathedral interior with stone columns and colored light",
+    "a vintage train station concourse with iron arches at first light",
+    "a corner cafe interior with marble tables and brass fixtures",
+    "a mountain lake at dusk with mirror-still water and distant peaks",
+)
+
+
+def _sanitize_people_at_provider_boundary(
+    prompt: str | None,
+    *,
+    allow_people: bool,
+    concept: str | None = None,
+    movement_style: str | None = None,
+) -> str:
+    """Mantener sujetos humanos fuera de los prompts restringidos SIN destruir
+    la escena del operador / del planner.
+
+    Antes (bug 2026-07-23): cualquier prompt marcado "con humano" —incluso
+    falsos positivos y el "Mi prompt" explícito del operador— se reemplazaba
+    entero por UN string genérico fijo → todos los fondos salían idénticos y no
+    se respetaba lo pedido.
+
+    Ahora: cuando la política niega personas y hay un sujeto humano, se remueven
+    QUIRÚRGICAMENTE solo las oraciones/clausulas humanas y se preserva el
+    escenario (lugar, arquitectura, objetos, luz, paleta, clima). El bloque de
+    negativos ("no people/faces/text/logos") se agrega aguas abajo, así la
+    restricción se mantiene aunque quede un fragmento. Solo si no sobra escena
+    usable se cae a un fallback VARIADO por-prompt (no un string único).
+    """
+    import re as _re
+
+    value = str(prompt or "").strip()
+    if allow_people or not _prompt_may_contain_human_subject(value):
+        return value
+
+    # 1) Remoción quirúrgica: por oración, y si la oración trae humano, por
+    #    clausula (coma). Se conservan las partes que NO son humanas.
+    sentences = _re.split(r"(?<=[.!?;])\s+", value)
+    kept: list[str] = []
+    for sent in sentences:
+        s = sent.strip()
+        if not s:
+            continue
+        if not _prompt_may_contain_human_subject(s):
+            kept.append(s)
+            continue
+        clauses = [c.strip() for c in s.split(",")]
+        good = [c for c in clauses if c and not _prompt_may_contain_human_subject(c)]
+        if good:
+            kept.append(", ".join(good))
+    preserved = " ".join(kept).strip()
+    preserved = _re.sub(r"\s+,", ",", preserved)
+    preserved = _re.sub(r",\s*,", ", ", preserved).strip(" ,")
+
+    # Defense-in-depth: re-verificar el resultado unido. Si por un borde de
+    # clausula quedó algún sujeto humano, NO lo devolvemos — caemos al fallback.
+    # Umbral bajo (24) para preservar escenas cortas pero válidas ("Neon signs
+    # above an empty street") en vez de colapsarlas al fallback.
+    if len(preserved) >= 24 and not _prompt_may_contain_human_subject(preserved):
+        logger.warning(
+            "[BG_POLICY] human subject removed; scene preserved (%d chars)",
+            len(preserved),
+        )
+        return preserved
+
+    # 2) No sobró escena usable → fallback VARIADO (no un string único): se
+    #    elige un arquetipo por hash del prompt original y se enriquece con el
+    #    concepto si está disponible, para que cada canción difiera.
+    import hashlib as _hashlib
+
+    idx = int(_hashlib.sha256(value.encode("utf-8")).hexdigest(), 16) % len(
+        _UNOCCUPIED_FALLBACK_SETTINGS
+    )
+    setting = _UNOCCUPIED_FALLBACK_SETTINGS[idx]
+    concept_bit = (
+        f", evoking {concept.strip()}" if concept and concept.strip() else ""
+    )
+    logger.warning(
+        "[BG_POLICY] no usable non-human scene; varied fallback #%d", idx
+    )
+    return (
+        f"A distinctive, unoccupied cinematic environment: {setting}{concept_bit}. "
+        "Rich detail across foreground, middle ground and background; no character "
+        "as the subject; environmental motion only"
+    )
+
+
+def _validate_background_asset_for_job(
+    job_id: str,
+    asset_path: str | None,
+    operator_prompt: str | None = None,
+    *,
+    ai_generated: bool = True,
+    failure_status: str | None = "validation_failed",
+) -> bool:
+    """Apply the same authoritative gate to initial, edit and cache paths."""
+    policy = _background_safety_policy(job_id, operator_prompt)
+    if not policy["should_validate"]:
+        return True
+    if not asset_path or not os.path.exists(asset_path):
+        if failure_status:
+            update_job(
+                job_id, status=failure_status,
+                error="Content validation could not inspect the background asset.",
+            )
+        return False
+    from content_validator import validate_video, validate_image
+    ext = os.path.splitext(asset_path)[1].lower()
+    validate_fn = validate_video if ext in (".mp4", ".mov", ".webm") else validate_image
+    result = validate_fn(
+        asset_path,
+        job_id=job_id,
+        allow_people=policy["allow_people"],
+        allow_atmospherics=policy["allow_atmospherics"],
+        # Atmospheric default-deny governs model output. A user-uploaded or
+        # library asset is still scanned for people/brand, but its intentional
+        # fog/smoke must not be reinterpreted as an AI hallucination.
+        observe_atmospherics=(
+            policy["observe_atmospherics"] and ai_generated
+        ),
+        enforce_atmospherics=(
+            policy["validate_atmospherics"] and ai_generated
+        ),
+    )
+    result["policy_reason"] = policy["reason"]
+    result["tenant_id"] = policy["tenant_id"]
+    result["billing_group"] = policy["billing_group"]
+    result["background_ai_generated"] = bool(ai_generated)
+    result["policy_version"] = policy["policy_version"]
+    result["policy_mode"] = policy["policy_mode"]
+    result["allow_people"] = policy["allow_people"]
+    result["allow_atmospherics"] = policy["allow_atmospherics"]
+    update_job(job_id, validation_result=result)
+    if result.get("passed") is not True:
+        if _validation_observe_only():
+            logger.warning(
+                "[VALIDATION] observe-only: keeping background for job %s "
+                "despite failed verdict: %s", job_id, result.get("issues"),
+            )
+            update_job(job_id, validation_result=_mark_validation_observed(result))
+            return True
+        if failure_status:
+            update_job(
+                job_id, status=failure_status,
+                error=f"Content policy violation detected: {result.get('issues', [])}",
+            )
+        logger.warning("[VALIDATION] FAILED for job %s: %s", job_id, result.get("issues"))
+        return False
+    return True
 
 
 def _validate_segments_against_audio(audio_path: str, segments: list[dict],
@@ -6002,8 +7613,8 @@ _BG_CAMERAS_MOTION = [
     "slow arc around the subject",
 ]
 _BG_CAMERAS_STATIC = [
-    "locked static wide shot on a tripod, no camera movement",
-    "fixed tripod composition, the camera does not move",
+    "locked static wide view, the frame never moves",
+    "fixed composition from an immobile viewpoint",
     "held static frame, motion only within the scene",
 ]
 # Back-compat alias: anything still reading _BG_CAMERAS gets the full pool.
@@ -6081,6 +7692,24 @@ _GENRE_SCENE_GUIDE = {
     ),
 }
 
+# Policy-v4 genre direction deliberately contains no concrete scene objects.
+# Genre may style a scene; it must not make the same smoke/stage/alley/ocean
+# motif recur across unrelated songs.  Auto and lyrics modes use this map when
+# BACKGROUND_SMOKE_POLICY_MODE=enforce; the legacy scene catalog remains
+# available behind off/shadow for a reversible rollout.
+_GENRE_STYLE_GUIDE_V4 = {
+    "rock": "raw, high-contrast, energetic lighting, tactile textures and dramatic tonal range",
+    "pop": "vibrant, polished, playful color relationships and clean contemporary lighting",
+    "ballad": "intimate, restrained, warm-to-cool emotional lighting and generous negative space",
+    "latin": "rhythmic, warm, saturated color and lively natural light without stock tropical clichés",
+    "reggaeton": "bold, nocturnal, graphic color contrast and controlled rhythmic light",
+    "hiphop": "confident, sculptural, high-contrast lighting with rich material depth",
+    "electronic": "precise, kinetic, synthetic color relationships and evolving abstract rhythm",
+    "indie": "textural, understated, imperfect and observational with a distinctive authored palette",
+    "folk": "organic, tactile, grounded and naturally lit with quiet material detail",
+    "metal": "intense, dark, monumental and sharply lit with dense material contrast",
+}
+
 
 def _normalize_genre(g: str) -> str:
     """Map free-text or UI selection to a key in _GENRE_SCENE_GUIDE."""
@@ -6138,7 +7767,7 @@ _CONCEPT_SCENE_GUIDE = {
 # right "feel" per song. The genre + concept selectors decide WHAT the
 # scene is; this decides HOW it moves.
 _MOVEMENT_STYLE_RULES = {
-    "estatico":      "Camera: LOCKED STATIC TRIPOD. The camera does NOT move at all — no pan, no tilt, no zoom, no dolly, no push-in, no drift, no orbit, no crane, no handheld, no parallax. A single fixed frame held for the whole shot, like a photograph on a tripod. ALL motion lives WITHIN the scene only (water ripples, fire, drifting clouds, smoke, flickering light, swaying foliage, floating particles). The frame edges never move.",
+    "estatico":      "Viewpoint: LOCKED STATIC FRAME. The viewpoint does NOT move at all — no pan, no tilt, no zoom, no dolly, no push-in, no drift, no orbit, no crane, no handheld, no parallax. A single fixed composition held for the whole shot. ALL motion lives WITHIN the scene only — only subtle motion that genuinely belongs in the chosen scene (do not default to floating particles, swaying foliage or smoke unless the scene calls for them). The frame edges never move.",
     "sutil":         "Movement: minimal and ambient — gentle sway, slow drift, breathing motion. Subjects barely move. Easy to loop seamlessly.",
     "estandar":      "",  # no extra rule; the existing prompt template controls motion
     "foto-parallax": "Aesthetic: photographic still with subtle parallax — composition feels like a single photo, motion is restricted to slow camera moves, depth-of-field shifts, and lighting passes. No moving subjects.",
@@ -6363,23 +7992,45 @@ def _parse_gemini_bg_response(text: str) -> dict | None:
     return None
 
 
+def _planner_match_lyrics(
+    requested_match_lyrics: bool,
+    creative_mode: str,
+    atmospherics_policy: dict | None,
+    *,
+    scene_planner: bool = False,
+) -> bool:
+    """Preserve legacy rollout output until v4 is explicitly enforced."""
+    if not policy_enforces(atmospherics_policy):
+        # Fix 2026-07-23: antes el camino multi-escena (scene_planner=True)
+        # devolvía True SIEMPRE → "Auto" (match_lyrics=False) se comportaba
+        # idéntico a "Inspirado en la letra" en jobs con Escenas. Ahora se
+        # honra la selección real del usuario en los 3 modos también en
+        # multi-escena. (Mi prompt no pasa por acá: el operator_prompt domina.)
+        return bool(requested_match_lyrics)
+    return creative_mode == "lyrics"
+
+
 def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = None,
                                     song_title: str = "", genre: str = "",
                                     concept: str = "",
                                     movement_style: str = "",
                                     match_lyrics: bool = True,
                                     background_hint: str | None = None,
+                                    scene_context: str | None = None,
                                     for_provider: str = "veo",
                                     style: str = "",
                                     custom_colors: str = "",
-                                    allow_people: bool = False) -> dict:
+                                    allow_people: bool = False,
+                                    creative_mode: str | None = None,
+                                    atmospherics_policy: dict | None = None) -> dict:
     """Use Gemini to analyze lyrics and choose visual style + prompt.
 
     match_lyrics=True  ("Inspirado en la letra"): lyrics anchor or infuse the scene.
     match_lyrics=False: concept/genre vocabulary only, lyrics are ignored.
-    background_hint: optional free-form text from the operator (set by /edit)
-      describing what they want the new background to convey. Overrides
-      Gemini's default interpretation when present.
+    background_hint is always the raw operator-authored text. scene_context is
+      internal visual-bible/section context and is never an authorization
+      source. Keeping them separate prevents multi-scene prompts from granting
+      their own smoke/fog opt-in.
     for_provider: "veo" (default) or "imagen". Adjusts the system prompt
       addendum so Gemini emits the right kind of prompt:
         - veo  → keep camera-movement / motion descriptors (text-to-video)
@@ -6396,6 +8047,21 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     from provenance import record_ai_call
 
     client = _get_genai_client()
+
+    creative_mode = creative_mode or resolve_creative_mode(
+        match_lyrics=match_lyrics,
+        operator_prompt=background_hint,
+        verbatim=False,
+    )
+    atmospherics_policy = atmospherics_policy or resolve_atmospherics_policy(
+        background_hint
+    )
+    # During off/shadow the rollout must be output-neutral: preserve the
+    # caller's legacy match_lyrics value. Canonical v4 mode semantics only
+    # become authoritative when enforcement is deliberately enabled.
+    match_lyrics = _planner_match_lyrics(
+        match_lyrics, creative_mode, atmospherics_policy
+    )
 
     normalized_genre = _normalize_genre(genre)
     normalized_concept = _normalize_concept(concept)
@@ -6424,14 +8090,14 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
         # NUNCA debe recibir foto 100% quieta. La escena MUST tener motion
         # rica in-scene (al menos 3 fuentes distintas) — references UMG
         # siempre tienen lluvia/nieve/humo/olas/nubes en movimiento.
-        _clause2 = ("(2) framing only — wide/medium/close and angle — the camera "
-                    "is LOCKED and STATIC, the camera is BOLTED in place, "
+        _clause2 = ("(2) framing only — wide/medium/close and angle — the viewpoint "
+                    "is LOCKED and STATIC and remains immobile, "
                     "explicitly NO camera movement of any kind; the frame is "
                     "FIXED. CRITICAL: motion lives WITHIN the scene and MUST "
                     "be RICH — describe AT LEAST 3 distinct motion sources, "
-                    "e.g.: drifting smoke + flickering candle + dust motes; "
+                    "e.g.: moving reflections + flickering candle + dust motes; "
                     "or rolling waves + shifting clouds + falling petals; "
-                    "or rain on glass + neon reflection + steam rising. "
+                    "or rain on glass + neon reflection + curtain movement. "
                     "A scene with zero movement (e.g. \"empty room, no wind, "
                     "no light shift\") is INVALID — always include moving "
                     "elements")
@@ -6486,18 +8152,23 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
                     "nauseating); do NOT default to a constant cinematic drift — and "
                     "the framing")
 
-    # The "no people" line is gated by `allow_people`. When the operator
-    # opted into "fondo libre" (bypass_content_validation=True) OR the
-    # tenant is non-UMG and didn't force validation, this restriction is
-    # lifted at PROMPT level — Gemini will let people / faces / hands
-    # through. The Veo safe_prompt suffix is gated by the same flag (see
+    # The "no people" line is gated by `allow_people`. It is lifted only
+    # when a non-Universal operator both chose "fondo libre" and explicitly
+    # requested a human subject. Universal can never reach this state. The
+    # Veo safe_prompt suffix is gated by the same authoritative flag (see
     # `_generate_veo_video`). Pre-fix the toggle promised "fondo libre"
     # but the AI silently stripped people regardless — incident 2026-05-19
     # where art-rock prompt "woman lies upside down on armchair" rendered
     # an empty armchair.
     _people_rule = (
         "" if allow_people
-        else "- Never include people, faces, hands, or readable text in the scene\n"
+        else (
+            "- NO people, faces, hands, silhouettes or human figures anywhere in "
+            "the scene, and no readable text, letters, signs, logos or brands.\n"
+            "- If the lyrics are about a person or a relationship, translate them "
+            "into their ENVIRONMENT — the empty chair, the worn stage, the two "
+            "coffee cups, the rain they walked through — never a body or face.\n"
+        )
     )
     # A2 (2026-05-25) — Anti-cliché rule. Incidente "Legalícenla - Viejas
     # Locas": Gemini identificó correctamente "marihuana" como sujeto
@@ -6511,7 +8182,15 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     # hint es la voz explícita del operador; si quiere literal, debemos
     # respetarlo (con o sin verbatim). Solo auto/inspirado-en-letra
     # (sin hint) siguen recibiendo la regla.
-    _has_operator_hint = bool(background_hint and background_hint.strip())
+    _legacy_scene_hint = (
+        scene_context
+        if not policy_enforces(atmospherics_policy) and not background_hint
+        else None
+    )
+    _effective_creative_hint = background_hint or _legacy_scene_hint
+    _has_operator_hint = bool(
+        _effective_creative_hint and _effective_creative_hint.strip()
+    )
     #
     # A3 (2026-05-25) — Editorial-photography rule, solo gated por
     # for_provider="imagen". Veo tiene sus propios equivalentes (lens,
@@ -6533,26 +8212,20 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
         "smoothing, no HDR halos, no oversharpening artifacts, no watermark."
         if _is_imagen else ""
     )
-    _PROMPT_RULES = (
-        "- \"style\" must always be \"video\"\n"
-        "- \"prompt\" is 80-120 words. Describe: (1) specific scene subject and setting "
-        f"in detail, {_clause2}, (3) color palette and dominant "
-        "tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one "
-        "specific texture or material detail. Be precise and cinematic — avoid vague "
-        "adjectives like \"beautiful\" or \"amazing\".\n"
-        "- Pick a DIFFERENT specific scene each time (don't repeat across songs)\n"
-        f"{_people_rule}"
-        "- When a concept and lyrics are both present, the LYRICS dictate the "
-        "subject of the scene and the CONCEPT dictates its visual styling "
-        "(palette, texture, atmosphere, register). Concept never replaces or "
-        "contradicts the literal subject of the lyrics unless match_lyrics is "
-        "explicitly disabled.\n"
-        # Anti-cliché block — gated por _has_operator_hint. Cuando el operador
-        # escribió un hint (modo "Mi prompt"), su voz explícita gana y la regla
-        # se desactiva. Modos auto/inspirado-en-letra (sin hint) la reciben.
-        + (
-            ""
-            if _has_operator_hint else
+    if _has_operator_hint:
+        _anti_cliche_rule = ""
+    elif policy_enforces(atmospherics_policy):
+        # V4 keeps the editorial principle but removes literal worked examples:
+        # examples were being copied as recurring smoke/alley/bed motifs.
+        _anti_cliche_rule = (
+            "- ANTI-CLICHÉ / METAPHOR-OVER-LITERAL RULE: for sensitive, "
+            "political or taboo lyrics, derive an original symbolic scene from "
+            "the emotional energy. Do not depict drugs, sex, weapons, suicide, "
+            "gang violence or political figures literally, and do not replace "
+            "them with a stock atmospheric cliché.\n"
+        )
+    else:
+        _anti_cliche_rule = (
             "- ANTI-CLICHÉ / METAPHOR-OVER-LITERAL RULE: if the lyrics' literal subject "
             "is a SENSITIVE / POLITICAL / TABOO topic (drugs, sex, weapons, religion, "
             "politics, suicide, alcohol abuse, gang violence), DO NOT depict the subject "
@@ -6576,6 +8249,21 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
             "the scene — without instantly clocking 'this is a [drugs/protest/violence] "
             "song'. The lyric video ACCOMPANIES the song; it does NOT narrate it."
         )
+    _PROMPT_RULES = (
+        "- \"style\" must always be \"video\"\n"
+        "- \"prompt\" is 80-120 words. Describe: (1) specific scene subject and setting "
+        f"in detail, {_clause2}, (3) color palette and dominant "
+        "tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one "
+        "specific texture or material detail. Be precise and cinematic — avoid vague "
+        "adjectives like \"beautiful\" or \"amazing\".\n"
+        "- Pick a DIFFERENT specific scene each time (don't repeat across songs)\n"
+        f"{_people_rule}"
+        "- When a concept and lyrics are both present, the LYRICS dictate the "
+        "subject of the scene and the CONCEPT dictates its visual styling "
+        "(palette, texture, atmosphere, register). Concept never replaces or "
+        "contradicts the literal subject of the lyrics unless match_lyrics is "
+        "explicitly disabled.\n"
+        + _anti_cliche_rule
         + _imagen_quality_line
     )
     # Contrastive few-shot examples + a "do not copy verbatim" disclaimer.
@@ -6591,13 +8279,13 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     # Rata Blanca "Mujer Amante", 2026-05-12). Genre-tone guard rail shared.
     if _static:
         _EXAMPLES_BLOCK = """Example for rock / energetic / dramatic track:
-{"style":"video","prompt":"Locked static wide shot of a stormy desert highway at dusk, the camera fixed on a tripod and never moving, lightning fracturing the distant clouds, heat haze shimmering above the asphalt, a vintage road sign trembling in the wind, dust drifting across the still frame, dramatic and raw, cinematic 4k"}
+{"style":"video","prompt":"Locked static wide shot of a stormy desert highway at dusk, the viewpoint completely immobile, lightning fracturing the distant clouds, heat shimmer above the asphalt, a vintage road sign trembling in the wind, dust drifting across the still frame, dramatic and raw, cinematic 4k"}
 
 Example for romantic ballad / love song:
 {"style":"video","prompt":"Fixed static frame of a sunlit room at golden hour, the camera never moves, gauze curtains billowing gently, dust motes floating through the warm beam, a glass on the table catching slow glints of light, intimate and calm, cinematic 4k"}
 
 Example for introspective acoustic / folk track:
-{"style":"video","prompt":"Held static shot of a misty mountain valley at dawn on a locked tripod, layered blue and pink sky perfectly still, silhouetted pine trees motionless, low fog rolling slowly between them, a single bird crossing the far distance, contemplative and vast, cinematic 4k"}"""
+{"style":"video","prompt":"Held static shot of a mountain valley at dawn from a fixed viewpoint, layered blue and pink sky perfectly still, silhouetted pine trees motionless, light shifting slowly between them, a single bird crossing the far distance, contemplative and vast, cinematic 4k"}"""
     elif _sutil:
         # C4 (2026-05-25): ejemplos sutil — camera BARELY breathing, motion
         # rica in-scene. Para que Veo no confunda con estandar (movimiento
@@ -6631,7 +8319,22 @@ Example for romantic ballad / love song:
 Example for introspective acoustic / folk track:
 {"style":"video","prompt":"Slow aerial pull-back over a misty mountain valley at dawn, layers of soft blue and pink sky, distant silhouettes of pine trees, gentle wind moving low fog, contemplative and vast, cinematic 4k"}"""
 
-    _BASE_INSTRUCTIONS = f"""Respond ONLY with a JSON object, no other text.
+    if policy_enforces(atmospherics_policy):
+        # JSON MIME mode below makes literal few-shot scenes unnecessary.  A
+        # content-free schema avoids prompt bleed (smoke, alley, sunset, etc.).
+        _BASE_INSTRUCTIONS = f"""Respond ONLY with a JSON object, no other text.
+
+Required JSON shape:
+{{"style":"video","prompt":"an original 80 to 120 word production prompt"}}
+
+Do not reuse a stock scene or recurring motif. Derive a distinctive visual
+direction from the selected creative mode and the supplied song/operator
+signals. Genre may influence palette, light, texture and energy, but must not
+select a prefabricated subject. Keep the subject appropriate to the emotional
+tone and avoid generic alleys, sunsets, oceans, stages and neon-city defaults.
+{ATMOSPHERIC_NEGATIVE_RAIL}"""
+    else:
+        _BASE_INSTRUCTIONS = f"""Respond ONLY with a JSON object, no other text.
 
 Output JSON shape — do NOT copy any of these example scenes verbatim;
 they show only the format and the breadth of valid visual registers:
@@ -6644,7 +8347,7 @@ soft rock, acoustic, intimate or emotional theme, DO NOT default to
 industrial, urban, dystopian, sewer, alleyway, or neon-rain backgrounds.
 Bias toward warm interiors, golden-hour light, natural landscapes
 (sunset, ocean, mountains at dusk), or symbolic intimate imagery (a
-window, a candle, a glass catching light, hands intertwined). Industrial
+window, a candle, a glass catching light, two empty chairs by a table). Industrial
 alleys, neon streets, smoke, and rain are reserved for rock / metal /
 punk / hip-hop tracks where the genre or lyrics anchor that vocabulary
 explicitly. When in doubt, prefer warm/natural over urban/industrial."""
@@ -6677,7 +8380,7 @@ The operator has chosen the visual STYLING register: {normalized_concept.upper()
 The concept's vocabulary controls palette, texture, atmosphere, and aesthetic register:
 {concept_guide}{genre_hint}
 
-STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete setting, object, or action the song is literally about (e.g., a campfire in a forest, the ocean at night, a football match, a road trip, rain on glass, friends sharing warmth, a long goodbye at a station).
+STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete SETTING or OBJECT the song evokes (e.g., a campfire in a forest, the ocean at night, an empty stadium under floodlights, a candlelit kitchen table, rain on glass, a cluttered analog workshop, a quiet train platform at first light). Prefer places and objects over people; when the lyrics are about a person or a relationship, render their WORLD instead — the room they left, the objects they touched, the weather of the moment — not the person.
 
 STEP 1 — Build a scene where:
 - The SUBJECT comes from the lyrics' literal or strongly figurative imagery
@@ -6712,7 +8415,20 @@ Hard rules:
 - The concept choice is binding — do NOT drift to a different visual category{movement_extra_line}"""
 
     elif normalized_genre:
-        scene_guide = _GENRE_SCENE_GUIDE[normalized_genre]
+        if policy_enforces(atmospherics_policy):
+            scene_guide = _GENRE_STYLE_GUIDE_V4[normalized_genre]
+            abstract_fallback_instruction = (
+                "derive an original symbolic subject from that emotion and "
+                "apply this genre styling"
+            )
+            genre_scene_instruction = (
+                "Derive an original scene for this song and apply this "
+                "genre's styling register"
+            )
+        else:
+            scene_guide = _GENRE_SCENE_GUIDE[normalized_genre]
+            abstract_fallback_instruction = "fall back to this genre's visual vocabulary"
+            genre_scene_instruction = "You MUST pick a scene from this genre's visual vocabulary"
 
         if match_lyrics:
             # "Inspirado en la letra": lyrics anchor the scene, genre styles it.
@@ -6724,7 +8440,7 @@ STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete
 
 STEP 1 — Choose the scene:
 - If the lyrics have a CLEAR visual subject → build the scene around that subject. Apply the {normalized_genre.upper()} genre's color palette, lighting, and atmosphere to STYLE it — but the SCENE must reflect what the song is literally about.
-- If the lyrics are abstract or purely emotional with no specific visual subject → fall back to this genre's visual vocabulary:
+- If the lyrics are abstract or purely emotional with no specific visual subject → {abstract_fallback_instruction}:
 {scene_guide}
 
 Hard rules:
@@ -6737,7 +8453,7 @@ Hard rules:
 
 The song genre is: {normalized_genre.upper()}
 
-You MUST pick a scene from this genre's visual vocabulary:
+{genre_scene_instruction}:
 {scene_guide}
 
 Hard rules:
@@ -6745,16 +8461,16 @@ Hard rules:
 - Do NOT default to "calm ocean at sunset" unless this song is BALLAD{movement_extra_line}"""
 
     else:
-        if match_lyrics:
-            # "Inspirado en la letra" + auto: lyrics anchor the scene,
-            # genre classification controls color/mood only.
-            system_prompt = f"""{_EXAMPLE}
-
-STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete setting, object, or action the song is literally about (e.g., a football/soccer match, the ocean, a city at night, a road trip, a dance floor, rain, a forest). This is your FIRST input for scene choice.
-
-STEP 1 — Choose the scene:
-- If the lyrics have a CLEAR visual subject → build the scene around that subject. Then classify genre (rock/pop/ballad/latin/reggaeton/hiphop/electronic/indie/folk/metal) to determine the COLOR PALETTE, LIGHTING, and ATMOSPHERE only — not the scene itself.
-- If the lyrics are abstract or purely emotional with no specific visual subject → classify genre, then pick from the genre's vocabulary:
+        if policy_enforces(atmospherics_policy):
+            auto_classification_sources = "artist and title"
+            auto_genre_direction = """Classify the genre as rock, pop, ballad, latin,
+reggaeton, hiphop, electronic, indie, folk or metal. Use that classification
+ONLY to determine palette, lighting, texture and energy. Derive an original
+subject from the song's emotion or metadata; genre must not supply a stock
+setting, object or atmospheric effect."""
+        else:
+            auto_classification_sources = "artist, title, and lyrics"
+            auto_genre_direction = """Classify genre, then use this visual vocabulary:
   - rock     → varied dramatic settings: concert stage smoke, stormy highways, mountain storms, vintage amps in close-up, empty arena tunnels, raw plains (alleys allowed but NOT the default)
   - pop      → vibrant neon, disco reflections, geometric light patterns, glossy gradient skies
   - ballad   → soft sunset, calm ocean, drifting clouds, warm golden light, candlelight
@@ -6764,7 +8480,17 @@ STEP 1 — Choose the scene:
   - electronic → abstract geometry, particle storms, fractal liquid metal, laser grids
   - indie    → misty forests, vintage interiors, autumn roads, lone lighthouses, dreamy lakes
   - folk     → mountain vistas, dusty roads, wheat fields, riverside campfires
-  - metal    → volcanic lava streams, dark cathedrals, stormy lightning, cracked obsidian
+  - metal    → volcanic lava streams, dark cathedrals, stormy lightning, cracked obsidian"""
+        if match_lyrics:
+            # "Inspirado en la letra" + auto: lyrics anchor the scene,
+            # genre classification controls color/mood only.
+            system_prompt = f"""{_EXAMPLE}
+
+STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete setting, object, or action the song is literally about (e.g., a football/soccer match, the ocean, a city at night, a road trip, a dance floor, rain, a forest). This is your FIRST input for scene choice.
+
+STEP 1 — Choose the scene:
+- If the lyrics have a CLEAR visual subject → build the scene around that subject. Then classify genre (rock/pop/ballad/latin/reggaeton/hiphop/electronic/indie/folk/metal) to determine the COLOR PALETTE, LIGHTING, and ATMOSPHERE only — not the scene itself.
+- If the lyrics are abstract or purely emotional with no specific visual subject → {auto_genre_direction}
 
 STEP 2 — Output JSON with an 80-120 word prompt. Describe: (1) specific scene subject and setting in detail, {_clause2}, (3) color palette and dominant tones, (4) lighting type and direction, (5) atmosphere, mood, and at least one specific texture or material detail. Be precise and cinematic — avoid vague adjectives like "beautiful" or "amazing".
 
@@ -6778,20 +8504,10 @@ Hard rules:
             # Strict auto mode: classify genre, pick vocabulary, no lyrics.
             system_prompt = f"""{_EXAMPLE}
 
-Step 1: Classify the song's genre using the artist, title, and lyrics. Pick ONE of:
+Step 1: Classify the song's genre using the {auto_classification_sources}. Pick ONE of:
   rock, pop, ballad, latin, reggaeton, hiphop, electronic, indie, folk, metal
 
-Step 2: Pick a scene from the matching genre's visual vocabulary:
-- rock     → varied dramatic settings: concert stage smoke, stormy highways, mountain storms, vintage amps in close-up, empty arena tunnels, raw plains (alleys allowed but NOT the default)
-- pop      → vibrant neon, disco reflections, geometric light patterns, glossy gradient skies
-- ballad   → soft sunset, calm ocean, drifting clouds, warm golden light, candlelight
-- latin    → tropical beaches, palm trees, vibrant flowers, festive lanterns, sunlit caribbean water
-- reggaeton → night cityscape with red/pink neon, abstract color bursts, club laser patterns
-- hiphop   → city skyline at night with gold, marble luxury textures, smoke-filled spotlights
-- electronic → abstract geometry, particle storms, fractal liquid metal, laser grids
-- indie    → misty forests, vintage interiors, autumn roads, lone lighthouses, dreamy lakes
-- folk     → mountain vistas, dusty roads, wheat fields, riverside campfires
-- metal    → volcanic lava streams, dark cathedrals, stormy lightning, cracked obsidian
+Step 2: {auto_genre_direction}
 
 Step 3: Output JSON with the chosen scene as an 80-120 word prompt.
 
@@ -6808,7 +8524,15 @@ Hard rules:
     # Gemini no veía el chorus → fallback al genre vocab (callejón). UMG
     # 2026-05-14: rock arg con letras claras igual rendía callejones porque
     # el sample no llegaba al subject visual real.
-    lyrics_sample = lyrics_text[:1800] if lyrics_text else ""
+    # V4 makes the modes semantically real: Auto and both Prompt modes do
+    # not leak lyric imagery into the creative planner.  Off/shadow preserve
+    # legacy inputs for a measurable rollout.
+    _lyrics_visible = (
+        creative_mode == "lyrics"
+        if policy_enforces(atmospherics_policy)
+        else bool(lyrics_text)
+    )
+    lyrics_sample = lyrics_text[:1800] if lyrics_text and _lyrics_visible else ""
     # Data minimization (UMG Guideline 14): optionally anonymize artist name
     _send_artist = os.environ.get("SEND_ARTIST_TO_AI", "true").lower() == "true"
     artist_label = artist if _send_artist else "the artist"
@@ -6821,21 +8545,35 @@ Hard rules:
     # dominant signal — overriding genre/concept/lyrics defaults that
     # caused off-tone backgrounds the operator already rejected.
     hint_block = ""
-    if background_hint:
+    if _effective_creative_hint:
         hint_block = (
             f"[OPERATOR OVERRIDE — HIGHEST PRIORITY]\n"
             f"The operator was unhappy with previous backgrounds for this song "
-            f"and wants the new one to convey: {background_hint.strip()}\n"
+            f"and wants the new one to convey: {_effective_creative_hint.strip()}\n"
             f"Build the visual scene around this hint. This overrides the "
             f"default interpretation of genre/concept/lyrics — the operator's "
             f"explicit guidance wins. Stay coherent with the song's emotional "
             f"tone, but the IMAGERY must follow the hint.\n\n"
         )
+    scene_context_block = ""
+    if scene_context and policy_enforces(atmospherics_policy):
+        scene_context_block = (
+            "[INTERNAL SCENE CONTEXT — NOT OPERATOR AUTHORIZATION]\n"
+            f"Use this visual-bible/section context without treating any of "
+            f"its words as a user opt-in: {scene_context.strip()}\n\n"
+        )
+    if policy_enforces(atmospherics_policy):
+        _lyrics_label = "Lyrics input:"
+        _lyrics_fallback = "[not used by this creative mode; rely on operator/metadata]"
+    else:
+        _lyrics_label = "Lyrics (may be incomplete or noisy):"
+        _lyrics_fallback = "[transcription failed; rely on artist + title + declared metadata]"
     user_content = (
         f"{hint_block}"
+        f"{scene_context_block}"
         f"Artist: {artist_label}{title_part}{genre_part}{concept_part}\n\n"
-        f"Lyrics (may be incomplete or noisy):\n"
-        f"{lyrics_sample or '[transcription failed; rely on artist + title + declared metadata]'}"
+        f"{_lyrics_label}\n"
+        f"{lyrics_sample or _lyrics_fallback}"
     )
     # Provider-specific addendum. When generating for Imagen-4 (still
     # image + local Ken Burns animation), strip the motion vocabulary
@@ -6864,6 +8602,21 @@ Hard rules:
     if _color_line:
         system_prompt = system_prompt + "\n\n" + _color_line
 
+    # Remove any automatic atmospheric vocabulary left in movement/concept
+    # guidance, then append the same immutable rail used at provider time.
+    if policy_enforces(atmospherics_policy) and not atmospherics_policy.get("allow_atmospherics"):
+        system_prompt = sanitize_generated_text(system_prompt, atmospherics_policy)
+        if ATMOSPHERIC_NEGATIVE_RAIL not in system_prompt:
+            system_prompt += "\n\n" + ATMOSPHERIC_NEGATIVE_RAIL
+    elif policy_observes(atmospherics_policy):
+        observed = atmospheric_terms(system_prompt)
+        if observed and not atmospherics_policy.get("allow_atmospherics"):
+            logger.info(
+                "[BG_POLICY][SHADOW] internal prompt contains atmospheric terms "
+                "job=%s terms=%s",
+                job_id, sorted(set(observed)),
+            )
+
     full_prompt = f"system:{system_prompt}\nuser:{user_content}"
 
     recorder = record_ai_call(
@@ -6888,7 +8641,7 @@ Hard rules:
         # Re-roll is gated to the case where it's actually unwanted: the
         # operator gave no background_hint AND didn't explicitly ask for
         # the "urbano" concept. An explicit alley request must be honored.
-        _reroll_eligible = (not background_hint and normalized_concept != "urbano")
+        _reroll_eligible = (not _has_operator_hint and normalized_concept != "urbano")
         _max_attempts = 2 if _reroll_eligible else 1
         text = ""
         response = None
@@ -6905,26 +8658,27 @@ Hard rules:
             # whole worker pool deadlocks at progress=22, current_step=background.
             # 60s is generous (p99 ~15s) but bounds the worst case so the
             # caller can fall through to the genre-based fallback below.
+            # Keep the legacy constructor shape in off/shadow. Enforce adds
+            # JSON MIME determinism without mutating the observation cohorts.
+            _generation_config = genai.types.GenerateContentConfig(
+                system_instruction=_sys_instr,
+                temperature=_temp,
+                # max_output_tokens=1500 (was 500): the expanded prompt and
+                # lyrics-anchor instructions need headroom for valid JSON.
+                max_output_tokens=1500,
+                thinking_config=genai.types.ThinkingConfig(
+                    thinking_budget=512
+                ),
+                **(
+                    {"response_mime_type": "application/json"}
+                    if policy_enforces(atmospherics_policy) else {}
+                ),
+            )
             response = _call_with_timeout(
                 lambda: client.models.generate_content(
                     model="gemini-2.5-flash",
                     contents=user_content,
-                    config=genai.types.GenerateContentConfig(
-                        system_instruction=_sys_instr,
-                        temperature=_temp,
-                        # max_output_tokens=1500 (was 500): the concept+match_lyrics=True
-                        # branch in #152 expanded the system_prompt with 6 worked examples
-                        # and lyrics-anchor instructions. Gemini's output got more verbose
-                        # and started truncating at 500 tokens (prod 2026-05-15), parse
-                        # failed, combinatorial fallback fired 100% of jobs. 1500 covers a
-                        # 120-word prompt + JSON envelope + preamble, ~3× headroom.
-                        max_output_tokens=1500,
-                        # thinking_budget=512: short chain-of-thought to extract the
-                        # visual subject from lyrics before committing to a scene.
-                        # Without it Gemini skipped STEP 0 and fell to the genre
-                        # fallback (UMG 2026-05-14: 80% rock → callejón).
-                        thinking_config=genai.types.ThinkingConfig(thinking_budget=512),
-                    ),
+                    config=_generation_config,
                 ),
                 timeout_s=60.0,
                 label="BG-ANALYZE",
@@ -6943,6 +8697,15 @@ Hard rules:
                 if style not in ("video", "photo", "illustration"):
                     style = "video"
                 if prompt and len(prompt) > 15:
+                    generated_terms = atmospheric_terms(prompt)
+                    if generated_terms and not atmospherics_policy.get("allow_atmospherics"):
+                        logger.info(
+                            "[BG_POLICY][%s] generated prompt terms job=%s terms=%s",
+                            atmospherics_policy.get("policy_mode", "off").upper(),
+                            job_id, sorted(set(generated_terms)),
+                        )
+                    if policy_enforces(atmospherics_policy):
+                        prompt = sanitize_generated_text(prompt, atmospherics_policy)
                     if _looks_like_alley(prompt) and _reroll_eligible:
                         if _attempt < _max_attempts:
                             logger.warning(
@@ -6988,10 +8751,13 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
                        song_title: str = "", genre: str = "", concept: str = "",
                        movement_style: str = "", match_lyrics: bool = True,
                        background_hint: str | None = None,
+                       scene_context: str | None = None,
                        for_provider: str = "veo",
                        bg_verbatim: bool = False,
                        palette_style: str = "", custom_colors: str = "",
-                       allow_people: bool = False) -> dict:
+                       allow_people: bool = False,
+                       creative_mode: str | None = None,
+                       atmospherics_policy: dict | None = None) -> dict:
     """Get a unique style+prompt combination. Returns {style, prompt}.
 
     `for_provider` ("veo" default | "imagen") nudges the prompt towards
@@ -7016,13 +8782,22 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
     includes artist+title so even a duplicated Gemini prompt produces a
     fresh background per song (see `_generate_veo_video`).
     """
+    creative_mode = creative_mode or resolve_creative_mode(
+        match_lyrics=match_lyrics,
+        operator_prompt=background_hint,
+        verbatim=bg_verbatim,
+    )
+    atmospherics_policy = atmospherics_policy or resolve_atmospherics_policy(
+        background_hint
+    )
+
     # Verbatim mode: the operator chose "usar mi prompt tal cual". Skip the
     # Gemini rewrite entirely and send their exact text to the generator. The
     # safety + (when static) camera-motion negatives are still appended in
     # _generate_veo_video, so verbatim is "respect my words" — not "no rails".
     # This is the fix for the power-user case where a hand-written "Static
     # tripod, no camera motion…" prompt was paraphrased away by Gemini.
-    if bg_verbatim and background_hint and background_hint.strip():
+    if creative_mode == "prompt_literal" and background_hint and background_hint.strip():
         logger.info("[BG] verbatim mode — bypassing Gemini, using operator prompt as-is")
         return {
             "style": "image" if for_provider == "imagen" else "video",
@@ -7044,13 +8819,20 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
 
     # Gemini analysis
     if lyrics_text or song_title:
+        planner_lyrics = (
+            lyrics_text
+            if not policy_enforces(atmospherics_policy) or creative_mode == "lyrics"
+            else ""
+        )
         result = _analyze_lyrics_for_background(
-            lyrics_text or "", artist, job_id=job_id, song_title=song_title,
+            planner_lyrics or "", artist, job_id=job_id, song_title=song_title,
             genre=genre, concept=concept, movement_style=movement_style,
             match_lyrics=match_lyrics, background_hint=background_hint,
+            scene_context=scene_context,
             for_provider=for_provider,
             style=palette_style, custom_colors=custom_colors,
-            allow_people=allow_people,
+            allow_people=allow_people, creative_mode=creative_mode,
+            atmospherics_policy=atmospherics_policy,
         )
         if result["prompt"] and result["prompt"] not in used:
             used.append(result["prompt"])
@@ -7061,7 +8843,26 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
                 pass
             return result
 
-    # Fallback: combinatorial prompt. For Imagen, drop the camera move
+    # V4 fallback is deliberately content-neutral.  Provider/parse failure
+    # must not silently replace the selected mode with a stock scene pool.
+    if policy_enforces(atmospherics_policy):
+        if creative_mode == "prompt_improved" and (background_hint or "").strip():
+            fallback_prompt = background_hint.strip()
+        else:
+            identity = ", ".join(
+                item for item in (song_title, genre, concept) if (item or "").strip()
+            ) or "the song's emotional rhythm"
+            fallback_prompt = (
+                f"Original non-figurative visual composition derived from {identity}; "
+                "use distinctive color relationships, light, texture, negative space "
+                "and rhythmic motion without stock locations, readable text or people"
+            )
+        return {
+            "style": "image" if for_provider == "imagen" else "video",
+            "prompt": sanitize_generated_text(fallback_prompt, atmospherics_policy),
+        }
+
+    # Legacy fallback: combinatorial prompt. For Imagen, drop the camera move
     # descriptor (it adds motion words like "tracking shot" that confuse
     # a still-image generator) and substitute a composition descriptor.
     composition_terms = (
@@ -7146,8 +8947,11 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         normalized_concept: str = "",
                         high_fidelity: bool = False,
                         allow_people: bool = False,
+                        atmospherics_policy: dict | None = None,
                         verbatim: bool = False,
                         cache_only: bool = False,
+                        cache_key_override: str | None = None,
+                        cache_override_policy_fingerprint: str | None = None,
                         out_meta: dict | None = None) -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
@@ -7159,7 +8963,9 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
 
     Endpoint: predictLongRunning -> poll operation -> download mp4.
     Rate-limit aware (5 attempts with exponential backoff).
-    R2-cached by prompt hash so identical retries do not bill twice.
+    A prompt-hash cache key is exposed to the caller. Fresh output is not
+    published here because this function runs before content validation;
+    storyboard callers publish only after the dense policy gate passes.
 
     `image_path`: optional path to a JPG/PNG. When provided, the request is
     sent in image-to-video mode (Veo 3.1 supports a base64-encoded `image`
@@ -7177,6 +8983,22 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     import requests as _req
     global _last_veo_request
 
+    atmospherics_policy = atmospherics_policy or resolve_atmospherics_policy(None)
+    prompt = _sanitize_people_at_provider_boundary(
+        prompt,
+        allow_people=allow_people,
+        concept=normalized_concept,
+        movement_style=movement_style,
+    )
+    # Last-boundary finalizer. Literal operator text is preserved, generated
+    # text is sanitized, and both retain the immutable negative rail when the
+    # operator did not explicitly request an atmospheric effect.
+    prompt = finalize_provider_prompt(
+        prompt,
+        atmospherics_policy,
+        generated=not verbatim,
+    )
+
     # Bias-buster: cuando el operador NO eligió concept=urbano explícito,
     # prohibimos callejón/alley como subject. UMG 2026-05-14: con genre=rock
     # y concept vacío, Gemini elegía alley ~80% del tiempo aún con guard-
@@ -7192,13 +9014,11 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         "back-street as the primary subject unless the lyrics demand it. "
     )
 
-    # When `allow_people` is True the operator opted into "fondo libre"
-    # for an UMG tenant, OR the tenant is non-UMG (their default). Drop
-    # the "no people / no faces / no hands" clauses so Veo can render
-    # subjects the operator's prompt requests (woman in armchair, hands
-    # playing guitar, etc.). The logo / brand / readable-text negatives
-    # stay regardless because those are legal/IP concerns separate from
-    # the people question.
+    # ``allow_people`` can only be true for a non-Universal account with both
+    # an explicit human request and the existing fondo-libre opt-in. Universal
+    # is resolved authoritatively by tenant/billing group and never reaches
+    # this branch with people enabled. Logo/brand/readable-text negatives stay
+    # regardless because those are independent legal/IP concerns.
     _people_clause = "" if allow_people else " no people, no faces, no hands,"
     # Shared IP / content negatives (text, logos, optionally people) — present
     # in every register.
@@ -7252,6 +9072,20 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         "fly-through, no first-person glide forward, no zoom toward the "
         "subject, no drone advancing toward the camera."
     )
+    # Keep the fixed-camera preset clear-air by construction even while the
+    # atmospheric rollout flag is off/shadow. Smoke/fog are never necessary to
+    # make a static shot feel alive; operator-authored opt-ins can still flow
+    # through the normal creative prompt when policy permits them.
+    # Fix 2026-07-23: antes esto hardcodeaba una lista fija de motion (particles
+    # floating / foliage swaying / firelight) que se inyectaba en CASI TODOS los
+    # fondos estáticos → clichés repetidos en todas las canciones. Ahora se pide
+    # movimiento sutil PROPIO de la escena, sin prescribir cuál, para que varíe.
+    _static_scene_motion = (
+        "subtle in-scene motion that naturally belongs to this specific "
+        "environment (there must always be some gentle, continuous motion so "
+        "the frame is never completely frozen), while the camera itself stays "
+        "perfectly still"
+    )
     _norm_move = _normalize_movement_style(movement_style)
     if _norm_move == "animado":
         # Cartoon / 2D illustration aesthetic — keep all safety clauses
@@ -7271,21 +9105,18 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         #   1) Repetición: las constraints aparecen 3× (al inicio, en el
         #      medio, y al final). Veo responde a repetición.
         #   2) Afirmativos a la par de negativos: no solo "no pan/zoom"
-        #      sino "BOLTED tripod, FIXED frame, single static shot".
+        #      sino "IMMOBILE viewpoint, FIXED frame, single static shot".
         #   3) Anti-Ken-Burns: explícitamente "no slow zoom despite
         #      locked appearance" para evitar el "frozen frame + zoom"
         #      que Veo aplica como compromiso cuando no puede decidir.
-        #   4) "Filmed on a security camera" — phrasing que Veo ASOCIA
-        #      con motion-locked (a diferencia de "cinema camera" que
-        #      sugiere drift).
+        # Equipment nouns were deliberately removed after Veo rendered a
+        # visible tripod and the validator inferred human activity from it.
         safe_prompt = (
             f"{prompt}. "
             # Affirmative — repeated phrasing for Veo's prior.
-            "LOCKED STATIC TRIPOD shot. The camera is BOLTED in place. "
+            "LOCKED STATIC VIEW. The viewpoint remains completely IMMOBILE. "
             "Single FIXED frame held for the entire duration. "
-            "Filmed on a security camera — NO operator, NO movement of the lens. "
-            "All motion lives WITHIN the scene only (water ripples, fire, "
-            "drifting clouds, smoke, foliage swaying, particles floating). "
+            f"All motion lives WITHIN the scene only ({_static_scene_motion}). "
             "The frame edges NEVER shift. "
             f"{no_alley}"
             f"{_base_negatives}"
@@ -7303,12 +9134,12 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         #
         # Sutil = cámara casi estática pero respira sutilmente. Distinguible
         # de estatico (clavada) y de estandar (se mueve). El affirmative
-        # "near-static tripod, micro-drift only" + negativos de zoom/dolly/
+        # "near-static viewpoint, micro-drift only" + negativos de zoom/dolly/
         # push-in son el lever para que Veo entregue la escena viva con
         # micro-movimiento.
         safe_prompt = (
             f"{prompt}. "
-            "Near-static tripod shot. The camera barely breathes — micro-drift "
+            "Near-static viewpoint. The frame barely breathes — micro-drift "
             "ONLY — the lens shifts no more than 5% of the frame width over "
             "the whole shot. Treat as a fixed photograph that just breathes. "
             "Motion is rich WITHIN the scene (water, fire, foliage, "
@@ -7375,7 +9206,13 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # sunset" template — still generate independent Veo backgrounds.
     # Without this, all problem-songs ended up sharing one cached video
     # because the cache key was prompt-only.
-    cache_params = {**veo_params, "blur_sigma": blur_sigma, "ns": cache_namespace or ""}
+    _policy_fingerprint = cache_policy_fingerprint(atmospherics_policy)
+    cache_params = {
+        **veo_params,
+        "blur_sigma": blur_sigma,
+        "ns": cache_namespace or "",
+        "background_policy": _policy_fingerprint,
+    }
     # Image-to-video: la imagen semilla entra al hash vía digest del
     # contenido — ver _seed_image_digest para el porqué (audit 2026-06-09).
     if image_path:
@@ -7386,6 +9223,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # viejo cuando una escena se regenera (evita huérfanos en cache/veo/).
     if out_meta is not None:
         out_meta["cache_object_key"] = cache_object_key
+        out_meta["policy_fingerprint"] = _policy_fingerprint
 
     recorder = record_ai_call(
         job_id=job_id or "unknown",
@@ -7401,54 +9239,51 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # clip no está cacheado, levantamos y el caller degrada (reusa otro clip) en
     # vez de pagar Veo. Sin esto, un cache miss en una regen re-facturaba todo.
     if cache_only:
-        if (_storage.is_enabled() and _storage.object_exists(cache_object_key)
-                and _storage.download_object(cache_object_key, output_path)):
-            size_mb = os.path.getsize(output_path) / 1024 / 1024
-            logger.info("[BG] Veo cache HIT (cache_only, %s): %.1f MB", cache_key_hash, size_mb)
-            if recorder:
-                recorder.finish(response_summary=f"cache_hit(cache_only): {size_mb:.1f}MB key={cache_key_hash}",
-                                output_artifact=output_path)
-            return output_path
+        if (
+            cache_key_override
+            and policy_enforces(atmospherics_policy)
+            and cache_override_policy_fingerprint != _policy_fingerprint
+        ):
+            logger.warning(
+                "[BG_POLICY] legacy/incompatible scene cache will be downloaded "
+                "and densely revalidated under current policy job=%s stored=%s current=%s",
+                job_id, cache_override_policy_fingerprint, _policy_fingerprint,
+            )
+        # Buscar PRIMERO por la key persistida a la hora de generar
+        # (scene["clip_cache_key"], via cache_key_override) y recién después
+        # por el hash recomputado. El hash incluye namespace (artist|título),
+        # prompt, params de Veo (¡incluido el nombre del modelo!) y blur_sigma:
+        # cualquier deriva posterior (metadata edit, bump de modelo, env var)
+        # cambia el hash y missea TODOS los clips aunque sigan en R2 —
+        # incidente 2026-07-10, job 53b9513225b1: las 6 escenas tenían su
+        # clip_cache_key intacto en el plan pero el lookup recomputado falló
+        # 6/6 y el video degradó al fondo dañado (render negro).
+        _candidates = [k for k in (cache_key_override, cache_object_key) if k]
+        for _ck in dict.fromkeys(_candidates):  # dedup preservando orden
+            if (_storage.is_enabled() and _storage.object_exists(_ck)
+                    and _storage.download_object(_ck, output_path)):
+                size_mb = os.path.getsize(output_path) / 1024 / 1024
+                _via = "stored-key" if _ck == cache_key_override else "recomputed"
+                logger.info("[BG] Veo cache HIT (cache_only via %s, %s): %.1f MB",
+                            _via, _ck, size_mb)
+                if out_meta is not None:
+                    # La key que REALMENTE sirvió el clip — así el GC y las
+                    # próximas búsquedas apuntan al objeto vivo.
+                    out_meta["cache_object_key"] = _ck
+                if recorder:
+                    recorder.finish(response_summary=f"cache_hit(cache_only,{_via}): {size_mb:.1f}MB key={_ck}",
+                                    output_artifact=output_path)
+                return output_path
         if recorder:
-            recorder.finish(response_summary=f"cache_only_miss: key={cache_key_hash}")
+            recorder.finish(response_summary=f"cache_only_miss: keys={_candidates}")
         raise RuntimeError(
-            f"[BG] cache_only: sin clip cacheado ({cache_key_hash}) — no se genera "
+            f"[BG] cache_only: sin clip cacheado (probé {_candidates}) — no se genera "
             "para no re-cobrar Veo en una regeneración de escena")
 
-    if _storage.is_enabled() and _storage.object_exists(cache_object_key):
-        if _storage.download_object(cache_object_key, output_path):
-            size_mb = os.path.getsize(output_path) / 1024 / 1024
-            logger.info("[BG] Veo cache HIT (%s): %.1f MB - skipped paid generation", cache_key_hash, size_mb)
-            if recorder:
-                recorder.finish(
-                    response_summary=f"cache_hit: {size_mb:.1f}MB key={cache_key_hash}",
-                    output_artifact=output_path,
-                )
-            return output_path
-        # U6 (audit 2026-05-25) — cache existe pero download FALLÓ.
-        # Sin este fix, el recorder quedaba "in-flight" mientras el Veo
-        # call subsiguiente arrancaba; si el worker moría antes del
-        # finish() de la Veo call, el reaper marcaba el row "orphan poll"
-        # y el job entero como "error". Fix: cerramos el recorder actual
-        # con summary descriptivo, recreamos uno nuevo para el Veo call.
-        logger.warning(
-            "[BG] Veo cache HIT pero download FALLÓ para %s — recorder "
-            "cerrado como cache_hit_download_failed, arrancando Veo fresh.",
-            cache_object_key,
-        )
-        if recorder:
-            recorder.finish(
-                response_summary=f"cache_hit_download_failed: key={cache_key_hash}",
-            )
-        # Re-crear recorder limpio para la Veo call que sigue.
-        recorder = record_ai_call(
-            job_id=job_id or "unknown",
-            step="video_bg",
-            tool_name=model,
-            tool_provider="google_vertex",
-            prompt=safe_prompt,
-            input_data_types=["generated_prompt"],
-        ) if job_id else None
+    # Fresh provider output is intentionally not read from the shared raw
+    # cache here. This function runs before content validation, so a normal
+    # hit could reuse a hallucinated person. ``cache_only`` above is retained
+    # exclusively for storyboard keys published after dense validation.
 
     elapsed = _time.time() - _last_veo_request
     if elapsed < _VEO_COOLDOWN and _last_veo_request > 0:
@@ -7566,6 +9401,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         except RuntimeError:
             raise
         except Exception as e:
+            _raise_if_job_timeout(e)
             last_error = f"network/transient: {e}"
             logger.error("[BG] Veo 3 attempt %s request error: %s", attempt + 1, e)
             base = min(MAX_BACKOFF_S, 15 * (2 ** attempt))
@@ -7613,6 +9449,14 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     _last_progress_written = 22
     while True:
         if _time.time() > poll_deadline:
+            # Close the provenance row before bailing. Every other exit of
+            # this function calls recorder.finish(); the timeout path did
+            # not, leaving duration_ms NULL forever. reaper.find_orphan_
+            # polling_jobs then read that orphan row as a "dead worker"
+            # signal and false-killed the LIVE job on the 2nd attempt
+            # (Sentry "Reaper killed 1 stuck job", UMG universal_argentina
+            # 2026-07-16). Finishing the row removes the false signal.
+            recorder.finish(response_summary="error: timed out after 10 min")
             raise TimeoutError("Veo 3 operation timed out after 10 min")
         _time.sleep(10)
         _hb_counter += 1
@@ -7626,7 +9470,8 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                     from jobs import update_job as _uj
                     _uj(job_id, progress=_sub_progress)
                     _last_progress_written = _sub_progress
-                except Exception:  # pragma: no cover
+                except Exception as _heartbeat_error:  # pragma: no cover
+                    _raise_if_job_timeout(_heartbeat_error)
                     pass  # liveness is best-effort; never block Veo on it.
             elif _hb_counter % 6 == 0:
                 # No new progress tick (already at cap 38) — keep the
@@ -7634,7 +9479,8 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                 try:
                     from jobs import heartbeat as _heartbeat
                     _heartbeat(job_id)
-                except Exception:  # pragma: no cover
+                except Exception as _heartbeat_error:  # pragma: no cover
+                    _raise_if_job_timeout(_heartbeat_error)
                     pass
         token = _veo_access_token()
         # Vertex's long-running publisher operations need the
@@ -7704,8 +9550,8 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     size_mb = os.path.getsize(output_path) / 1024 / 1024
     logger.info("[BG] Veo 3 video saved: %.1f MB (raw)", size_mb)
 
-    # Output QA: strip any letterbox Veo baked into the clip, BEFORE blur/cache
-    # so the fix persists in the cached object. Deterministic guarantee that
+    # Output QA: strip any letterbox Veo baked into the clip before blur and
+    # before a validated caller may publish it. Deterministic guarantee that
     # scenes fill the frame regardless of Veo's stochastic anamorphic bars.
     # Double-gated (geometry + pure-black) so dark footage is never cropped.
     # Best-effort — never fail the render over it.
@@ -7713,6 +9559,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         if _strip_letterbox(output_path):
             logger.info("[BG] Letterbox detected + stripped from Veo clip")
     except Exception as e:
+        _raise_if_job_timeout(e)
         logger.warning("[BG] Letterbox check skipped (non-fatal): %s", e)
 
     # Apply subtle gaussian blur. Veo Fast outputs are slightly softer than
@@ -7736,19 +9583,13 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         size_mb = os.path.getsize(output_path) / 1024 / 1024
         logger.info("[BG] Blur applied (sigma=%s): %.1f MB", blur_sigma, size_mb)
     except Exception as e:
+        _raise_if_job_timeout(e)
         logger.warning("[BG] Blur skipped (non-fatal): %s", e)
         if os.path.exists(blurred):
             try:
                 os.unlink(blurred)
             except OSError:
                 pass
-
-    if _storage.is_enabled():
-        try:
-            _storage.upload_file(output_path, cache_object_key)
-            logger.info("[BG] Veo cache STORED: %s", cache_object_key)
-        except Exception as e:
-            logger.warning("[BG] Veo cache upload failed (non-fatal): %s", e)
 
     if recorder:
         recorder.finish(
@@ -7760,7 +9601,9 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
 
 def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
                             job_id: str = None, model: str | None = None,
-                            allow_people: bool = False) -> str:
+                            allow_people: bool = False,
+                            atmospherics_policy: dict | None = None,
+                            verbatim: bool = False) -> str:
     """Generate an image with Google Imagen 4. Auto-retries on rate limit.
 
     `model` lets the caller override the default. Library generation can
@@ -7777,6 +9620,17 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
     import time as _time
 
     client = _get_genai_client()
+
+    atmospherics_policy = atmospherics_policy or resolve_atmospherics_policy(None)
+    prompt = _sanitize_people_at_provider_boundary(
+        prompt,
+        allow_people=allow_people,
+    )
+    prompt = finalize_provider_prompt(
+        prompt,
+        atmospherics_policy,
+        generated=not verbatim,
+    )
 
     chosen_model = (model
                     or os.environ.get("IMAGEN_MODEL")
@@ -7969,6 +9823,7 @@ def _bg_scene_discontinuity(video_path: str) -> float:
                 pass
         return _frame_pair_discontinuity(first, last)
     except Exception as e:
+        _raise_if_job_timeout(e)
         logger.warning("[BG][SCENE-CUT] check failed (fail-open): %s", e)
         return 0.0
 
@@ -8024,6 +9879,7 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
         score = int(m.group()) if m else 5
         return max(1, min(10, score))
     except Exception as e:
+        _raise_if_job_timeout(e)
         logger.warning("[BG] Relevance score error (fail-open): %s", e)
         return 8
     finally:
@@ -8080,7 +9936,11 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
                         genre: str = "", concept: str = "", style: str = "",
                         custom_colors: str = "", job_id: str = None,
                         background_hint: str | None = None,
-                        bg_verbatim: bool = False) -> dict:
+                        bg_verbatim: bool = False,
+                        match_lyrics: bool = True,
+                        creative_mode: str | None = None,
+                        atmospherics_policy: dict | None = None,
+                        allow_people: bool = False) -> dict:
     """Una sola llamada Gemini que fija el "look book" del video.
 
     Devuelve {world, palette, texture, camera, motif} — el ADN visual que TODA
@@ -8088,17 +9948,45 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
     film). Best-effort: si Gemini falla, cae a una biblia determinista derivada
     de style/genre/concept para que el feature nunca tumbe el job.
     """
+    creative_mode = creative_mode or resolve_creative_mode(
+        match_lyrics=match_lyrics,
+        operator_prompt=background_hint,
+        verbatim=bg_verbatim,
+    )
+    atmospherics_policy = atmospherics_policy or resolve_atmospherics_policy(
+        background_hint
+    )
+    _v4_semantics = policy_enforces(atmospherics_policy)
     fallback = {
-        "world": (concept or genre or "cinematic scene grounded in the song's mood"),
+        "world": (
+            background_hint
+            if _v4_semantics
+            and creative_mode in {"prompt_literal", "prompt_improved"}
+            and background_hint
+            else concept or genre or (
+                "original visual world grounded in the selected creative mode"
+                if _v4_semantics else
+                "cinematic scene grounded in the song's mood"
+            )
+        ),
         "palette": (custom_colors or _BIBLE_FALLBACK_PALETTE.get(style, "cohesive cinematic palette")),
         "texture": "clean modern digital grade, fine subtle grain, soft cinematic depth of field",
         "camera": "slow, deliberate camera language",
         "motif": "a single recurring light source tying the scenes together",
     }
+    if _v4_semantics and creative_mode == "prompt_literal":
+        # Literal means no Gemini rewrite. The same raw direction is used for
+        # each take; scenes may differ stochastically but the text stays exact.
+        return fallback
     try:
         from google import genai
         from provenance import record_ai_call
         client = _get_genai_client()
+        _people_bible_rule = (
+            "People may appear only as explicitly directed by the operator. "
+            if allow_people else
+            "No people, faces, hands or human silhouettes. "
+        )
         sys_instr = (
             "You are an art director defining the SHARED visual world for a "
             "premium lyric video so its scenes feel like ONE film instead of "
@@ -8109,8 +9997,8 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
             "keys: world (the setting/environment family), palette (colors + "
             "lighting), texture (a light grade/mood note, kept neutral), camera "
             "(a light note on the camera language), motif (one recurring visual "
-            "element). Keep each value under 25 words. No people's faces, no "
-            "text/letters/logos in the described world. "
+            "element). Keep each value under 25 words. No text/letters/logos "
+            "in the described world. "
             # Prohibición factual (no es un patrón — evita un bug): nombrar un
             # formato/calibre de film hace que Veo dibuje el fotograma físico
             # (incidente 2026-06-19, "16mm film grain" → sprockets + marco negro).
@@ -8123,7 +10011,10 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
             "format makes the AI render a literal film frame — sprocket holes, "
             "edge markings, a black border and fake recording chrome — over the "
             "scene."
+            f" {_people_bible_rule}"
         )
+        if policy_enforces(atmospherics_policy) and not atmospherics_policy.get("allow_atmospherics"):
+            sys_instr += " " + ATMOSPHERIC_NEGATIVE_RAIL
         # Dirección del operador ("Mi prompt"): moldea TODA la biblia → multi-
         # escena respeta auto/letra/prompt igual que el fondo único. Verbatim =
         # "usá mi visión tal cual" (manda sobre género/letra).
@@ -8134,9 +10025,18 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
                 f"\nOPERATOR DIRECTION (this is the world the operator wants — "
                 f"{'use it as the definitive vision, it OVERRIDES genre/lyrics inference' if bg_verbatim else 'honor it strongly while staying coherent with the song'}): {_hint[:600]}"
             )
+        _bible_lyrics = (
+            lyrics_text
+            if not _v4_semantics or creative_mode == "lyrics"
+            else ""
+        )
+        _bible_lyrics_label = (
+            "Lyrics (excerpt; used only in Lyrics mode):"
+            if _v4_semantics else "Lyrics (excerpt):"
+        )
         user = (f"Artist: {artist}\nTitle: {song_title}\nGenre: {genre}\n"
                 f"Concept: {concept}\nPalette hint: {style} {custom_colors}{_direction}\n"
-                f"Lyrics (excerpt):\n{(lyrics_text or '')[:600]}")
+                f"{_bible_lyrics_label}\n{(_bible_lyrics or '')[:600]}")
         recorder = record_ai_call(
             job_id=job_id or "unknown", step="visual_bible",
             tool_name="gemini-2.5-flash", tool_provider="google_vertex",
@@ -8177,10 +10077,28 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
             # calibre (16mm/35mm/Super8/VHS…) hace que Veo dibuje el fotograma
             # físico —sprockets, marcas de borde, marco negro, UI falsa— (incidente
             # 2026-06-19, "Intoxicados": texture="16mm film grain" → marco de film).
-            return _sanitize_bible_film_formats(merged)
+            merged = _sanitize_bible_film_formats(merged)
+            if policy_enforces(atmospherics_policy):
+                merged = {
+                    key: sanitize_generated_text(value, atmospherics_policy)
+                    for key, value in merged.items()
+                }
+            elif policy_observes(atmospherics_policy):
+                observed = atmospheric_terms(" ".join(merged.values()))
+                if observed and not atmospherics_policy.get("allow_atmospherics"):
+                    logger.info(
+                        "[BG_POLICY][SHADOW] visual bible terms job=%s terms=%s",
+                        job_id, sorted(set(observed)),
+                    )
+            return merged
         logger.warning("[SCENES] biblia: parse falló, uso fallback. raw=%s", text[:200])
     except Exception as e:  # noqa: BLE001
         logger.warning("[SCENES] biblia visual falló (%s) — uso fallback determinista", e)
+    if policy_enforces(atmospherics_policy):
+        fallback = {
+            key: sanitize_generated_text(value, atmospherics_policy)
+            for key, value in fallback.items()
+        }
     return fallback
 
 
@@ -8242,34 +10160,111 @@ def _parse_json_object(text: str) -> dict | None:
 
 
 def _make_scene_prompt_fn(lyrics_text, artist, song_title, genre, concept,
-                          style, custom_colors, job_id, allow_people):
+                          style, custom_colors, job_id, allow_people,
+                          *, match_lyrics=True, operator_prompt=None,
+                          bg_verbatim=False, creative_mode=None,
+                          atmospherics_policy=None):
     """Fabrica la callable que scenes.build_scene_plan usa por escena.
 
-    Reusa _get_unique_prompt (toda la maquinaria de seguridad/de-bias de Gemini)
-    pasando la biblia + el beat de la sección como background_hint NO-verbatim,
-    así Gemini ancla por sección pero hereda el ADN visual de la biblia.
+    ``operator_prompt`` is the only user-authored value. The callable argument
+    named ``background_hint`` is legacy scenes.py API and is INTERNAL context
+    (visual bible + beat); it is passed as scene_context, never as permission.
     """
+    creative_mode = creative_mode or resolve_creative_mode(
+        match_lyrics=match_lyrics,
+        operator_prompt=operator_prompt,
+        verbatim=bg_verbatim,
+    )
+    atmospherics_policy = atmospherics_policy or resolve_atmospherics_policy(
+        operator_prompt
+    )
+    _scene_match_lyrics = _planner_match_lyrics(
+        match_lyrics,
+        creative_mode,
+        atmospherics_policy,
+        scene_planner=True,
+    )
+
     def prompt_fn(background_hint="", movement_style="", section_type="", energy=0.0):
         return _get_unique_prompt(
             lyrics_text=lyrics_text, artist=artist, job_id=job_id,
             song_title=song_title, genre=genre, concept=concept,
-            movement_style=movement_style, match_lyrics=True,
-            background_hint=background_hint, bg_verbatim=False,
+            movement_style=movement_style, match_lyrics=_scene_match_lyrics,
+            background_hint=operator_prompt,
+            scene_context=background_hint,
+            bg_verbatim=bg_verbatim,
             palette_style=style, custom_colors=custom_colors,
-            allow_people=allow_people,
+            allow_people=allow_people, creative_mode=creative_mode,
+            atmospherics_policy=atmospherics_policy,
         )
     return prompt_fn
 
 
-def _scene_cache_ns(artist: str, song_title: str, key: str, token: str = "") -> str:
+def _scene_cache_ns(artist: str, song_title: str, key: str, token: str = "",
+                    *, creative_mode: str = "auto",
+                    atmospherics_policy: dict | None = None) -> str:
     """Namespace de caché R2 por escena. El `cache_token` (vacío en la
     generación inicial) cambia cuando el operador regenera UNA escena: así su
     clip se cachea bajo una key NUEVA (cache miss → Veo fresco) mientras las
     demás escenas siguen pegando su caché original (re-stitch sin costo). Al
     persistirse el token en scene_plan, un edit posterior re-baja la versión
     regenerada, no la vieja."""
-    base = f"{artist}|{song_title}|{key}"
+    base = (
+        f"{artist}|{song_title}|{key}|{creative_mode}|"
+        f"{cache_policy_fingerprint(atmospherics_policy)}"
+    )
     return f"{base}|{token}" if token else base
+
+
+def _scene_validation_policy_fingerprint(
+    atmospherics_policy: dict | None,
+    allow_people: bool,
+) -> str:
+    """Fingerprint every independent dimension trusted by scene edit skips."""
+    people = "allow" if allow_people else "deny"
+    return f"{cache_policy_fingerprint(atmospherics_policy)}|people:{people}"
+
+
+def _scene_plan_has_current_clip_validation(
+    scene_plan: dict | None,
+    *,
+    job_id: str | None = None,
+) -> bool:
+    """Return true only when every unique scene has trustworthy v5 evidence.
+
+    Legacy plans have no per-clip validation metadata. They must never inherit
+    the old edit-path shortcut that assumed all scene clips were safe; edits of
+    those jobs validate the resulting timeline again. A fingerprint mismatch
+    likewise forces revalidation instead of trusting an asset produced under a
+    different off/shadow/enforce or opt-in policy.
+    """
+    if not isinstance(scene_plan, dict):
+        return False
+    seen: set[str] = set()
+    found = False
+    for scene in scene_plan.get("scenes", []):
+        key = str(scene.get("recurrence_key") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        found = True
+        validation = scene.get("validation")
+        if not isinstance(validation, dict) or validation.get("passed") is not True:
+            return False
+        expected_allow_people = bool(scene.get("allow_people", False))
+        if job_id:
+            raw_operator_prompt = str(scene.get("operator_prompt") or "").strip()
+            expected_allow_people = bool(
+                raw_operator_prompt
+                and _compute_allow_people(job_id, raw_operator_prompt)
+            )
+        expected = _scene_validation_policy_fingerprint(
+            rebase_stored_atmospherics_policy(scene.get("atmospherics_policy")),
+            expected_allow_people,
+        )
+        if validation.get("policy_fingerprint") != expected:
+            return False
+    return found
 
 
 def _persist_scene_thumb(clip_path: str, key: str, job_id: str) -> str | None:
@@ -8294,7 +10289,10 @@ def _persist_scene_thumb(clip_path: str, key: str, job_id: str) -> str | None:
 def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                           song_title: str, concept: str = "", job_id: str = None,
                           allow_people: bool = False,
-                          regen_keys: set | None = None) -> dict:
+                          creative_mode: str | None = None,
+                          atmospherics_policy: dict | None = None,
+                          regen_keys: set | None = None,
+                          allow_policy_fallback: bool = True) -> dict:
     """Genera un clip Veo por escena ÚNICA. Devuelve {recurrence_key: clip_path}.
 
     - cache_namespace incluye la recurrence_key + el cache_token de la escena →
@@ -8305,62 +10303,333 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
       el resto va `cache_only=True` → se sirven de la caché R2 o se degradan,
       pero NUNCA re-cobran. Garantía de costo del regen: regenerar 1 escena no
       puede facturar las otras N aunque la caché falle (antes sí podía).
-    - Degradación elegante: si una escena falla (incl. cache_only miss), reusa el
-      primer clip exitoso en vez de tumbar el video. Si NINGUNA generó, levanta
-      para que el caller caiga al fondo único.
+    - Degradación elegante: si una escena falla (incl. cache_only miss), sólo
+      puede reutilizar un clip validado bajo una policy igual o más estricta.
+      Si no existe uno compatible, falla cerrado.
     """
     import veo_breaker
     if veo_breaker.is_open():
         raise RuntimeError("veo breaker OPEN — multi-escena no puede generar clips")
 
+    plan_policy = scene_plan.get("generation_policy") or {}
+    creative_mode = creative_mode or plan_policy.get("creative_mode") or "auto"
+    atmospherics_policy = (
+        atmospherics_policy
+        if atmospherics_policy is not None
+        else rebase_stored_atmospherics_policy(plan_policy.get("atmospherics"))
+    )
+
     clip_for_key: dict[str, str] = {}
-    first_ok = None
+    successful_clips: list[dict] = []
+
+    # La primera aparición de cada recurrence_key es la escena canónica que
+    # REALMENTE generamos; las repeticiones (coros) reusan ese clip. Las
+    # escenas únicas se generan CONCURRENTEMENTE — cada una es un Veo (~90s)
+    # + validación independientes, y el loop viejo pagaba esas latencias en
+    # serie (una canción de N escenas tardaba N×~2min). La fase de ensamblado
+    # de abajo sigue siendo single-thread, así que la lógica fina de dedup y
+    # degradación no cambia; sólo la generación cara se abre en abanico.
+    canonical_scene: dict[str, dict] = {}
+    unique_scenes: list[dict] = []
     for scene in scene_plan.get("scenes", []):
         key = scene["recurrence_key"]
-        if key in clip_for_key:
+        if key in canonical_scene:
             continue
+        canonical_scene[key] = scene
+        unique_scenes.append(scene)
+
+    def _gen_unique(scene: dict):
+        """Genera + valida UNA escena única. Muta sólo su propio `scene`.
+
+        Devuelve la entrada de successful_clips en éxito, o None cuando la
+        escena falló de forma recuperable (la fase de relleno sustituye por
+        un clip policy-compatible). El job-timeout se propaga para abortar
+        todo el render rápido en vez de degradar en silencio.
+        """
+        key = scene["recurrence_key"]
         clip_path = os.path.join(job_dir, f"bg_scene_{key}.mp4")
         # En un regen (regen_keys set), las escenas NO-target son cache_only:
         # se sirven de caché o se degradan, nunca pagan Veo de nuevo.
         _cache_only = regen_keys is not None and key not in regen_keys
         _meta = {}
+        scene_policy = (
+            rebase_stored_atmospherics_policy(scene.get("atmospherics_policy"))
+            if scene.get("atmospherics_policy") is not None
+            else atmospherics_policy
+        )
+        scene["atmospherics_policy"] = scene_policy
+        scene_mode = scene.get("creative_mode") or creative_mode
+        _scene_allow_people = (
+            bool(scene.get("allow_people"))
+            if "allow_people" in scene else
+            bool(allow_people and (regen_keys is None or key in regen_keys))
+        )
+        _stored_operator_prompt = str(scene.get("operator_prompt") or "").strip()
+        if job_id:
+            # The stored boolean is never an authorization source. Recompute
+            # from current tenant/bypass/force state plus the persisted raw
+            # operator prompt; missing raw evidence fails closed.
+            _scene_allow_people = bool(
+                _stored_operator_prompt
+                and _compute_allow_people(job_id, _stored_operator_prompt)
+            )
+        scene["allow_people"] = _scene_allow_people
+        _policy_fp = _scene_validation_policy_fingerprint(
+            scene_policy, _scene_allow_people
+        )
         try:
             _generate_veo_video(
                 scene["prompt"], clip_path, job_id=job_id,
-                cache_namespace=_scene_cache_ns(artist, song_title, key, scene.get("cache_token", "")),
+                cache_namespace=_scene_cache_ns(
+                    artist, song_title, key, scene.get("cache_token", ""),
+                    creative_mode=scene_mode,
+                    atmospherics_policy=scene_policy,
+                ),
                 movement_style=scene.get("movement_style", ""),
                 normalized_concept=_normalize_concept(concept),
-                allow_people=allow_people,
+                allow_people=_scene_allow_people,
+                atmospherics_policy=scene_policy,
+                verbatim=scene_mode == "prompt_literal",
                 cache_only=_cache_only,
+                # La key con la que este clip se cacheó AL GENERARSE — inmune a
+                # derivas del hash recomputado (metadata edit, bump del modelo
+                # Veo, env). Solo aplica en cache_only: un regen pago escribe
+                # una key nueva y la persiste abajo.
+                cache_key_override=scene.get("clip_cache_key") if _cache_only else None,
+                cache_override_policy_fingerprint=(
+                    scene.get("policy_fingerprint") if _cache_only else None
+                ),
                 out_meta=_meta,
             )
             if not os.path.exists(clip_path):
                 raise RuntimeError("clip no escrito")
+            # Universal multi-scene timelines are validated clip-by-clip while
+            # each 8s asset is still dense enough to inspect every second.
+            # Validating only the stitched 3-5 minute timeline can sample
+            # between scenes and miss a short human appearance.
+            if job_id and _scene_validation_observe_skip():
+                # Observe nunca rechaza → el chequeo inline es sólo latencia.
+                # Sintetizamos un veredicto passed con el fingerprint correcto
+                # para que la caché y la revalidación de edits sigan andando.
+                scene["validation"] = {
+                    "passed": True,
+                    "policy_fingerprint": _policy_fp,
+                    "validation_scope": "observe_skipped_inline",
+                }
+            elif job_id:
+                from content_validator import validate_video as _validate_scene_video
+                _scene_validation = _validate_scene_video(
+                    clip_path,
+                    job_id=job_id,
+                    allow_people=_scene_allow_people,
+                    allow_atmospherics=bool(
+                        scene_policy.get("allow_atmospherics")
+                    ),
+                    observe_atmospherics=(
+                        scene_policy.get("policy_mode") == "shadow"
+                        and not scene_policy.get("allow_atmospherics")
+                    ),
+                    enforce_atmospherics=(
+                        scene_policy.get("policy_mode") == "enforce"
+                        and not scene_policy.get("allow_atmospherics")
+                    ),
+                )
+                scene["validation"] = {
+                    "passed": _scene_validation.get("passed") is True,
+                    "detections": _scene_validation.get("detections", {}),
+                    "shadow_atmospherics_detected": bool(
+                        _scene_validation.get("shadow_atmospherics_detected")
+                    ),
+                    "policy_fingerprint": _policy_fp,
+                }
+                if _scene_validation.get("passed") is not True:
+                    if _validation_observe_only():
+                        logger.warning(
+                            "[SCENES] observe-only: keeping clip %s job=%s "
+                            "despite failed verdict issues=%s",
+                            key, job_id, _scene_validation.get("issues"),
+                        )
+                        scene["validation"]["passed"] = True
+                        scene["validation"]["observed_violation"] = True
+                        scene["validation"]["observed_issues"] = list(
+                            _scene_validation.get("issues") or []
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"scene rejected by no-human policy: "
+                            f"{_scene_validation.get('issues', [])}"
+                        )
+            if (
+                job_id
+                and not _cache_only
+                and _meta.get("cache_object_key")
+                and storage.is_enabled()
+            ):
+                try:
+                    _stored_scene_key = storage.upload_file(
+                        clip_path,
+                        _meta["cache_object_key"],
+                    )
+                    if _stored_scene_key:
+                        _meta["cache_object_key"] = _stored_scene_key
+                        _meta["cache_persisted_after_validation"] = True
+                        logger.info(
+                            "[SCENES] validated clip cached key=%s",
+                            _stored_scene_key,
+                        )
+                except Exception as _cache_error:
+                    logger.warning(
+                        "[SCENES] validated clip cache upload failed: %s",
+                        _cache_error,
+                    )
             # NIT: no persistimos clip_path (es un path local efímero del job_dir
             # que filtraba el filesystem del contenedor al JSON/DB). El stitch usa
             # clip_for_key (abajo), no scene["clip_path"].
             scene["status"] = "generated"
-            if _meta.get("cache_object_key"):
+            # Limpiar el error de un intento anterior: sin esto, una escena que
+            # se RECUPERÓ (p.ej. vía stored-key) mostraba status=generated con
+            # el texto de error viejo al lado — confuso en /status y en el
+            # filmstrip (visto en la recuperación de 53b9513225b1, 2026-07-10).
+            scene.pop("error", None)
+            if (
+                _cache_only
+                or _meta.get("cache_persisted_after_validation")
+            ) and _meta.get("cache_object_key"):
                 scene["clip_cache_key"] = _meta["cache_object_key"]
+                scene["policy_fingerprint"] = _meta.get("policy_fingerprint") or _policy_fp
+                scene["creative_mode"] = scene_mode
             # Póster para el filmstrip (best-effort). Sólo si cambió el clip.
             if regen_keys is None or key in regen_keys or not scene.get("thumb_key"):
                 _tk = _persist_scene_thumb(clip_path, key, job_id)
                 if _tk:
                     scene["thumb_key"] = _tk
-            clip_for_key[key] = clip_path
-            first_ok = first_ok or clip_path
+            return {
+                "key": key,
+                "path": clip_path,
+                "allow_people": _scene_allow_people,
+                "allow_atmospherics": bool(
+                    scene_policy.get("allow_atmospherics")
+                ),
+                "validation": dict(scene.get("validation") or {}),
+            }
         except Exception as e:  # noqa: BLE001
+            _raise_if_job_timeout(e)
+            # Cache_only-miss ESPERADO (review del PR del Sentinel, 2026-07-10):
+            # una escena que en la generación original falló/degradó NUNCA
+            # persistió clip_cache_key (solo se escribe en el camino de éxito,
+            # arriba) — en un edit posterior (regen_keys=set() → cache_only) su
+            # miss es GARANTIZADO y ya está manejado (se degrada reusando un
+            # clip válido). Loguearlo como ERROR paginaba al on-call en cada
+            # edit del job por una no-novedad. Se degrada con WARNING y status
+            # "reused". El intento a Veo/caché se CONSERVA (a diferencia del
+            # skip original del PR, que rompía los planes sin keys de los
+            # fixtures y cualquier flujo donde el recomputado pudiera hittear).
+            if _cache_only and not scene.get("clip_cache_key"):
+                logger.warning(
+                    "[SCENES] escena %s sin clip cacheado persistido (falló en "
+                    "la generación original) — se reusa un clip válido, sin "
+                    "regenerar (%s)", key, e)
+                scene["status"] = "reused"
+                scene["validation"] = {
+                    "passed": False,
+                    "policy_fingerprint": _policy_fp,
+                    "error": f"{type(e).__name__}: {e}"[:300],
+                }
+                return None
             logger.error("[SCENES] escena %s falló (%s) — se sustituye por una válida", key, e)
             scene["status"] = "failed"
             # Guardar el motivo en la escena (persiste en scene_plan → /status,
             # /jobs) para poder DIAGNOSTICAR por qué falló sin bucear los logs
             # del Worker. Antes el motivo solo vivía en el log. Acotado a 300.
             scene["error"] = f"{type(e).__name__}: {e}"[:300]
-    if not first_ok:
-        raise RuntimeError("ninguna escena Veo se generó — fallback a fondo único")
-    # Rellenar las que fallaron con un clip válido (mantiene el timeline entero).
+            scene["validation"] = {
+                "passed": False,
+                "policy_fingerprint": _policy_fp,
+                "error": scene["error"],
+            }
+            return None
+
+    # Fan-out de la generación de escenas únicas. Acotado; SCENE_CONCURRENCY=1
+    # (o ≤1 escena única) mantiene el comportamiento secuencial exacto de antes.
+    results_by_key: dict[str, dict] = {}
+    _workers = min(_scene_concurrency(), len(unique_scenes)) if unique_scenes else 1
+    if _workers <= 1:
+        for scene in unique_scenes:
+            results_by_key[scene["recurrence_key"]] = _gen_unique(scene)
+    else:
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(
+            max_workers=_workers, thread_name_prefix="scene-veo"
+        ) as _pool:
+            _futs = {
+                _pool.submit(_gen_unique, scene): scene["recurrence_key"]
+                for scene in unique_scenes
+            }
+            for _fut in _cf.as_completed(_futs):
+                # Un job-timeout (o cualquier error propagado desde _gen_unique)
+                # aborta el render entero — se re-lanza acá en vez de degradar.
+                results_by_key[_futs[_fut]] = _fut.result()
+
+    # Ensamblado single-thread: preserva el orden de escenas y el dedup de
+    # coros. La escena canónica ya viene mutada por _gen_unique; las repes
+    # heredan su veredicto.
     for scene in scene_plan.get("scenes", []):
-        clip_for_key.setdefault(scene["recurrence_key"], first_ok)
+        key = scene["recurrence_key"]
+        if key in clip_for_key:
+            if scene.get("validation", {}).get("passed") is not True:
+                source = canonical_scene.get(key)
+                if source is not None and source is not scene:
+                    scene["validation"] = dict(source.get("validation") or {})
+            continue
+        result = results_by_key.get(key)
+        if result is not None:
+            clip_for_key[key] = result["path"]
+            successful_clips.append(result)
+    if not successful_clips:
+        raise RuntimeError("ninguna escena Veo se generó — fallback a fondo único")
+    # Rellenar fallos sólo con un clip cuya validación haya sido al menos tan
+    # estricta como la policy de destino. Nunca usar un target que autorizó
+    # personas/humo para rellenar una escena que los prohíbe.
+    for scene in scene_plan.get("scenes", []):
+        key = scene["recurrence_key"]
+        if key in clip_for_key:
+            continue
+        if not allow_policy_fallback:
+            raise RuntimeError(
+                f"scene {key} could not be densely revalidated from its own cache"
+            )
+        desired_allow_people = bool(scene.get("allow_people", False))
+        desired_policy = rebase_stored_atmospherics_policy(
+            scene.get("atmospherics_policy")
+        )
+        desired_allow_atmospherics = bool(
+            desired_policy.get("allow_atmospherics")
+        )
+        compatible = next((
+            candidate for candidate in successful_clips
+            if (not candidate["allow_people"] or desired_allow_people)
+            and (
+                not candidate["allow_atmospherics"]
+                or desired_allow_atmospherics
+            )
+        ), None)
+        if compatible is None:
+            raise RuntimeError(
+                f"scene {key} has no policy-compatible validated fallback"
+            )
+        clip_for_key[key] = compatible["path"]
+        source_validation = compatible.get("validation") or {}
+        scene["validation"] = {
+            "passed": True,
+            "detections": source_validation.get("detections", {}),
+            "shadow_atmospherics_detected": bool(
+                source_validation.get("shadow_atmospherics_detected")
+            ),
+            "policy_fingerprint": _scene_validation_policy_fingerprint(
+                desired_policy, desired_allow_people
+            ),
+            "substituted_from": compatible["key"],
+        }
     return clip_for_key
 
 
@@ -8369,7 +10638,9 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                               artist: str, song_title: str = "", genre: str = "",
                               concept: str = "", movement_style: str = "",
                               custom_colors: str = "", background_hint: str | None = None,
-                              bg_verbatim: bool = False, allow_people: bool = False,
+                              bg_verbatim: bool = False, match_lyrics: bool = True,
+                              allow_people: bool = False,
+                              atmospherics_policy: dict | None = None,
                               job_id: str = None, target_w: int = 1920,
                               target_h: int = 1080) -> tuple[str, dict]:
     """Orquesta el fondo multi-escena. Devuelve (timeline_path, scene_plan).
@@ -8380,22 +10651,52 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
     camino de fondo único (cero regresión).
     """
     import scenes as _scenes
+    creative_mode = resolve_creative_mode(
+        match_lyrics=match_lyrics,
+        operator_prompt=background_hint,
+        verbatim=bg_verbatim,
+    )
+    atmospherics_policy = atmospherics_policy or resolve_atmospherics_policy(
+        background_hint
+    )
     secs = _scenes.detect_sections(segments, audio_duration)
     n_unique = len({s.recurrence_key for s in secs})
     logger.info("[SCENES] %d secciones, %d escenas únicas (canción %.0fs)",
                 len(secs), n_unique, audio_duration or 0.0)
     bible = _build_visual_bible(lyrics_text, artist, song_title, genre, concept,
                                 style_hint, custom_colors, job_id,
-                                background_hint=background_hint, bg_verbatim=bg_verbatim)
+                                background_hint=background_hint, bg_verbatim=bg_verbatim,
+                                match_lyrics=match_lyrics,
+                                creative_mode=creative_mode,
+                                atmospherics_policy=atmospherics_policy,
+                                allow_people=allow_people)
     prompt_fn = _make_scene_prompt_fn(lyrics_text, artist, song_title, genre,
                                       concept, style_hint, custom_colors, job_id,
-                                      allow_people)
+                                      allow_people, match_lyrics=match_lyrics,
+                                      operator_prompt=background_hint,
+                                      bg_verbatim=bg_verbatim,
+                                      creative_mode=creative_mode,
+                                      atmospherics_policy=atmospherics_policy)
     plan = _scenes.build_scene_plan(secs, bible, prompt_fn, artist=artist,
                                     song_title=song_title, style=style_hint,
                                     operator_movement=_normalize_movement_style(movement_style))
+    plan["generation_policy"] = {
+        "policy_version": BACKGROUND_POLICY_VERSION,
+        "creative_mode": creative_mode,
+        "atmospherics": atmospherics_policy,
+        "policy_fingerprint": cache_policy_fingerprint(atmospherics_policy),
+        "allow_people": bool(allow_people),
+    }
+    for scene in plan.get("scenes", []):
+        scene["creative_mode"] = creative_mode
+        scene["atmospherics_policy"] = atmospherics_policy
+        scene["allow_people"] = bool(allow_people)
+        scene["operator_prompt"] = (background_hint or "").strip()
     clip_for_key = _generate_scene_clips(plan, job_dir, artist=artist,
                                          song_title=song_title, concept=concept,
-                                         job_id=job_id, allow_people=allow_people)
+                                         job_id=job_id, allow_people=allow_people,
+                                         creative_mode=creative_mode,
+                                         atmospherics_policy=atmospherics_policy)
     # Audit M3: exponer fallo parcial a nivel job. Las escenas fallidas se
     # sustituyen por un clip válido (degradación), pero el operador debe saber
     # cuántas — el filmstrip ya marca ⚠ por escena; esto da el agregado para un
@@ -8441,6 +10742,29 @@ def _regenerate_scene_background(scene_plan: dict, recurrence_key: str, job_dir:
     if target is None:
         raise ValueError(f"escena {recurrence_key!r} no existe en el plan")
 
+    _raw_scene_prompt = (prompt_override or hint or "").strip()
+    _plan_policy = scene_plan.get("generation_policy") or {}
+    _scene_atmospherics = (
+        resolve_atmospherics_policy(_raw_scene_prompt)
+        if _raw_scene_prompt else
+        rebase_stored_atmospherics_policy(
+            target.get("atmospherics_policy")
+            or _plan_policy.get("atmospherics")
+        )
+    )
+    _scene_mode = (
+        "prompt_literal" if (prompt_override or "").strip() else
+        "prompt_improved" if (hint or "").strip() else
+        target.get("creative_mode")
+        or _plan_policy.get("creative_mode")
+        or "auto"
+    )
+    _people_operator_prompt = (
+        _raw_scene_prompt or str(target.get("operator_prompt") or "").strip()
+    )
+    if _people_operator_prompt and job_id:
+        allow_people = _compute_allow_people(job_id, _people_operator_prompt)
+
     if movement_style:
         target["movement_style"] = movement_style
     if (prompt_override or "").strip():
@@ -8449,7 +10773,11 @@ def _regenerate_scene_background(scene_plan: dict, recurrence_key: str, job_dir:
         # Re-derivar el prompt con el hint, heredando la biblia (coherencia).
         prompt_fn = _make_scene_prompt_fn(lyrics_text, artist, song_title, genre,
                                           concept, style_hint, custom_colors, job_id,
-                                          allow_people)
+                                          allow_people, match_lyrics=False,
+                                          operator_prompt=hint.strip(),
+                                          bg_verbatim=False,
+                                          creative_mode="prompt_improved",
+                                          atmospherics_policy=_scene_atmospherics)
         bible_text = _scenes._bible_to_prompt_fragment(scene_plan.get("bible") or {})
         base_hint = ". ".join(x for x in (bible_text, hint.strip()) if x)
         try:
@@ -8461,6 +10789,12 @@ def _regenerate_scene_background(scene_plan: dict, recurrence_key: str, job_dir:
         except Exception as e:  # noqa: BLE001
             logger.warning("[SCENES] regen prompt_fn falló (%s); mantengo prompt", e)
 
+    target["creative_mode"] = _scene_mode
+    target["atmospherics_policy"] = _scene_atmospherics
+    target["allow_people"] = bool(allow_people)
+    if _raw_scene_prompt:
+        target["operator_prompt"] = _raw_scene_prompt
+
     # Bust de caché → Veo fresco SÓLO para esta escena. Guardamos la key vieja
     # para GC tras generar la nueva (audit M8: sin esto cada "otra toma" deja un
     # clip pago huérfano en cache/veo/ para siempre).
@@ -8471,6 +10805,14 @@ def _regenerate_scene_background(scene_plan: dict, recurrence_key: str, job_dir:
     clip_for_key = _generate_scene_clips(scene_plan, job_dir, artist=artist,
                                          song_title=song_title, concept=concept,
                                          job_id=job_id, allow_people=allow_people,
+                                         creative_mode=(
+                                             _plan_policy.get("creative_mode") or "auto"
+                                         ),
+                                         atmospherics_policy=(
+                                             rebase_stored_atmospherics_policy(
+                                                 _plan_policy.get("atmospherics")
+                                             )
+                                         ),
                                          regen_keys={recurrence_key})
     # GC del clip viejo (audit M8): sólo si la regen produjo uno NUEVO distinto.
     _new_clip_key = target.get("clip_cache_key")
@@ -8519,6 +10861,86 @@ def _restitch_scenes_for_edit(scene_plan: dict, segments: list[dict],
     return timeline, scene_plan
 
 
+def _densely_revalidate_scene_plan_for_edit(
+    scene_plan: dict,
+    job_dir: str,
+    *,
+    artist: str,
+    song_title: str,
+    concept: str,
+    job_id: str,
+    audio_duration: float,
+) -> str:
+    """Refresh every clip's evidence and rebuild the exact rendered timeline.
+
+    Legacy/off/shadow metadata cannot authorize an edit shortcut after a policy
+    change. Each persisted source clip must be downloaded and densely scanned;
+    a missing/rejected clip fails closed instead of trusting sparse samples of
+    a several-minute stitched timeline.  The returned timeline is assembled
+    from those exact validated clips. This identity binding is essential:
+    ``bg_r2_key_cached`` can lag behind ``scene_plan`` after a failed recache or
+    worker crash, so validating the plan and then rendering that generic cache
+    would be a fail-open.
+    """
+    import scenes as _scenes
+
+    clip_for_key = _generate_scene_clips(
+        scene_plan,
+        job_dir,
+        artist=artist,
+        song_title=song_title,
+        concept=concept,
+        job_id=job_id,
+        regen_keys=set(),
+        # A plan may legitimately persist a strict validated substitute after
+        # a scene cache miss. Reusing that equal-or-more-restrictive clip is
+        # safe because the exact returned mapping is what we stitch below;
+        # incompatible fallbacks are still rejected by _generate_scene_clips.
+        allow_policy_fallback=True,
+    )
+    if not _scene_plan_has_current_clip_validation(
+        scene_plan, job_id=job_id
+    ):
+        raise RuntimeError("scene clip validation evidence is incomplete")
+    sections = _scenes.sections_from_plan(scene_plan)
+    if not sections:
+        raise RuntimeError("scene plan has no persisted sections to rebuild")
+    if not audio_duration or audio_duration <= 0:
+        raise RuntimeError("scene plan has no valid audio duration to rebuild")
+    return _scenes.stitch_timeline(
+        sections,
+        clip_for_key,
+        audio_duration,
+        job_dir,
+        out_name="bg_scenes_validated_edit.mp4",
+    )
+
+
+def _recache_scene_timeline(job_id: str, timeline_path: str) -> None:
+    """Sube el timeline multi-escena recién armado a bg_cached y actualiza
+    bg_r2_key_cached — el mismo patrón que el branch de background-edit.
+
+    Sin esto, el re-stitch de un edit de letra y el regen de escena ("Otra
+    toma") reparaban el render ACTUAL pero dejaban el cache viejo: el próximo
+    edit de tipografía volvía al timeline stale (o, en un job dañado pre-#803,
+    al clip único de 8s → video negro). Incidente 2026-07-10, job 53b9513225b1.
+    Best-effort: un fallo acá no debe tumbar el edit (el render local ya salió).
+    """
+    if not (timeline_path and os.path.exists(timeline_path) and storage.is_enabled()):
+        return
+    try:
+        _ext = os.path.splitext(timeline_path)[1] or ".mp4"
+        new_key = storage.upload_file(
+            timeline_path, f"backgrounds/{job_id}/bg_cached{_ext}",
+        )
+        if new_key:
+            update_job(job_id, bg_r2_key_cached=new_key)
+            size_mb = os.path.getsize(timeline_path) / 1024 / 1024
+            logger.info("[SCENES] timeline re-cacheado (%.1f MB) para %s", size_mb, job_id)
+    except Exception as _e:  # noqa: BLE001
+        logger.warning("[SCENES] re-cache del timeline falló para %s: %s", job_id, _e)
+
+
 def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        artist: str = "", job_id: str = None,
                        song_title: str = "", genre: str = "",
@@ -8532,7 +10954,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        custom_colors: str = "",
                        effect: str = "",
                        allow_people: bool = False,
-                       audio_duration: float | None = None) -> str:
+                       atmospherics_policy: dict | None = None,
+                       audio_duration: float | None = None,
+                       generation_nonce: str = "") -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     background_hint: optional free-form operator description, set via /edit
@@ -8550,13 +10974,22 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
 
     Returns path to .mp4 (video style) or .jpg/.png (photo/illustration style).
     """
-    # If there are video files in backgrounds dir, use those instead
-    all_videos = []
-    if os.path.isdir(BACKGROUNDS_DIR):
-        for root, _, files in os.walk(BACKGROUNDS_DIR):
-            all_videos.extend(f for f in files if f.lower().endswith(".mp4"))
-    if all_videos:
-        return None
+    creative_mode = resolve_creative_mode(
+        match_lyrics=match_lyrics,
+        operator_prompt=background_hint,
+        verbatim=bg_verbatim,
+    )
+    atmospherics_policy = atmospherics_policy or resolve_atmospherics_policy(
+        background_hint
+    )
+    logger.info(
+        "[BG_POLICY] job=%s version=%s mode=%s creative_mode=%s "
+        "allow_people=%s allow_atmospherics=%s source=%s",
+        job_id, BACKGROUND_POLICY_VERSION,
+        atmospherics_policy.get("policy_mode"), creative_mode,
+        allow_people, atmospherics_policy.get("allow_atmospherics"),
+        atmospherics_policy.get("authorization_source"),
+    )
 
     _norm_move_bg = _normalize_movement_style(movement_style)
 
@@ -8638,7 +11071,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             for_provider="imagen",
             bg_verbatim=bg_verbatim,
             palette_style=style_hint, custom_colors=custom_colors,
-            allow_people=allow_people,
+            allow_people=allow_people, creative_mode=creative_mode,
+            atmospherics_policy=atmospherics_policy,
         )
         # Foto fija + efectos (2026-06-03; review-fixed same day): if the
         # operator picked a luminous particle effect, bias the still toward a
@@ -8670,7 +11104,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         # try/except which falls back to the gradient.
         _generate_imagen_image(prompt, image_path, job_id=job_id,
                                 model=_parallax_model,
-                                allow_people=allow_people)
+                                allow_people=allow_people,
+                                atmospherics_policy=atmospherics_policy,
+                                verbatim=_verbatim_bg)
         # Ken Burns produces a 60s sample that downstream palindrome-loops
         # to match the audio duration. Same contract as the Veo path.
         #   - "Estático"        → hold the frame (no zoom/pan).
@@ -8715,23 +11151,15 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         background_hint=background_hint,
         bg_verbatim=bg_verbatim,
         palette_style=style_hint, custom_colors=custom_colors,
-        allow_people=allow_people,
+        allow_people=allow_people, creative_mode=creative_mode,
+        atmospherics_policy=atmospherics_policy,
     )
     prompt = result["prompt"]
 
     bg_path = os.path.join(job_dir, "bg_generated.mp4")
     import time as _time_bg
-    # RQ's job_timeout (BG_PREVIEW_JOB_TIMEOUT, 900s) fires as a SIGALRM that
-    # raises JobTimeoutException — which subclasses Exception, so the generic
-    # `except Exception` below would swallow it and mask a real timeout as a
-    # "successful" gradient job, deleting the exact telemetry we want in Sentry.
-    # Catch it specifically and re-raise so the job is marked failed + stays
-    # visible. Empty-tuple fallback keeps the clause a harmless no-op if rq
-    # isn't importable (local/CI), where the death penalty never fires anyway.
-    try:
-        from rq.timeouts import JobTimeoutException as _JobTimeoutException
-    except Exception:
-        _JobTimeoutException = ()
+    # RQ's death penalty subclasses Exception; catch it before the recovery
+    # branch so a real worker timeout can never masquerade as a safe fallback.
     quality_retry_used = False
     # Tier 3b: if the cross-worker Veo breaker is OPEN (project-wide quota
     # event), skip Veo entirely and fall straight to the gradient fallback
@@ -8755,12 +11183,17 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         try:
             _generate_veo_video(
                 prompt, bg_path, job_id=job_id,
-                cache_namespace=f"{artist}|{song_title}",
+                cache_namespace=(
+                    f"{artist}|{song_title}|{creative_mode}|"
+                    f"{cache_policy_fingerprint(atmospherics_policy)}"
+                    + (f"|safety:{generation_nonce}" if generation_nonce else "")
+                ),
                 image_path=image_to_video_path,
                 movement_style=movement_style,
                 normalized_concept=_normalize_concept(concept),
                 high_fidelity=bg_verbatim,
                 allow_people=allow_people,
+                atmospherics_policy=atmospherics_policy,
                 verbatim=_is_verbatim,
             )
             # Semantic relevance check — always score, but cap retries at one
@@ -8804,7 +11237,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                     background_hint=background_hint,
                     bg_verbatim=bg_verbatim,
                     palette_style=style_hint, custom_colors=custom_colors,
-                    allow_people=allow_people,
+                    allow_people=allow_people, creative_mode=creative_mode,
+                    atmospherics_policy=atmospherics_policy,
                 )
                 prompt = result["prompt"]
                 continue
@@ -8834,7 +11268,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 except Exception:
                     pass
             return bg_path
-        except _JobTimeoutException:
+        except RQJobTimeoutException:
             # Real RQ death-penalty timeout — propagate (don't degrade to
             # gradient + swallow). Keeps the JobTimeoutException visible.
             raise
@@ -8855,6 +11289,29 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     gradient.write_videofile(fallback_path, fps=24, logger=None)
     gradient.close()
     return fallback_path
+
+
+def _write_safe_gradient_background(
+    job_dir: str,
+    style_hint: str,
+    *,
+    filename: str = "bg_policy_safe_fallback.mp4",
+) -> str:
+    """Create a deterministic provider-free background after unsafe output.
+
+    Unlike an AI asset, this clip is constructed entirely from color fields in
+    our renderer, so it cannot contain a person, brand or atmospheric object.
+    It is the final recovery rail: Universal jobs continue rendering instead
+    of becoming ``validation_failed`` when every paid generation is unsafe or
+    the classifier cannot establish a complete verdict.
+    """
+    output_path = os.path.join(job_dir, filename)
+    gradient = _make_gradient_clip(30.0, style_hint)
+    try:
+        gradient.write_videofile(output_path, fps=24, logger=None)
+    finally:
+        gradient.close()
+    return output_path
 
 
 def _ken_burns_image_to_mp4(
@@ -9216,7 +11673,12 @@ def _find_background_video(exclude: list[str] | None = None) -> str | None:
     return pick
 
 
-def _select_validated_background(job_id: str, max_attempts: int = 3) -> tuple[str | None, list[dict]]:
+def _select_validated_background(
+    job_id: str,
+    max_attempts: int = 3,
+    *,
+    validation_policy: dict | None = None,
+) -> tuple[str | None, list[dict]]:
     """Pick a library background and validate it against UMG Guideline 15
     BEFORE the expensive render kicks in. If validation rejects, pick a
     different background and try again, up to `max_attempts`.
@@ -9236,10 +11698,30 @@ def _select_validated_background(job_id: str, max_attempts: int = 3) -> tuple[st
         validate_fn = (
             validate_video if ext in (".mp4", ".mov", ".webm") else validate_image
         )
-        result = validate_fn(candidate, job_id=job_id)
+        policy = validation_policy or _background_safety_policy(job_id)
+        result = validate_fn(
+            candidate,
+            job_id=job_id,
+            allow_people=policy["allow_people"],
+            allow_atmospherics=policy["allow_atmospherics"],
+            observe_atmospherics=policy["observe_atmospherics"],
+            enforce_atmospherics=policy["validate_atmospherics"],
+        )
         if result.get("passed"):
             logger.info("[VALIDATION] bg accepted on attempt %s: %s",
                         attempt, os.path.basename(candidate))
+            return candidate, issues
+        if _validation_observe_only():
+            logger.warning(
+                "[VALIDATION] observe-only: accepting library bg %s "
+                "despite failed verdict issues=%s",
+                os.path.basename(candidate), result.get("issues"),
+            )
+            for it in result.get("issues") or []:
+                issues.append({
+                    "attempt": attempt, "bg": os.path.basename(candidate),
+                    "observed": True, **it,
+                })
             return candidate, issues
         logger.warning("[VALIDATION] bg rejected on attempt %s (%s): %s",
                        attempt, os.path.basename(candidate), result.get('issues'))
@@ -9731,6 +12213,446 @@ def _static_image_to_mp4(image_path: str, output_path: str, duration: float,
     size_mb = os.path.getsize(output_path) / 1024 / 1024
     logger.info("[BG] static image render: %.0fs, %.1f MB", duration, size_mb)
     return output_path
+
+
+# Spanish short words that machine title-casing wrongly capitalizes
+# ("La Leyenda Del Hada Y El Mago" → "La Leyenda del Hada y el Mago").
+_ES_TITLE_STOPWORDS = {
+    "de", "del", "la", "las", "el", "los", "lo", "y", "e", "o", "u",
+    "un", "una", "unos", "unas", "en", "a", "al", "con", "por", "para",
+    "sin", "sobre", "tras",
+}
+
+
+def spanish_smart_title(text: str) -> str:
+    """Lowercase machine-titlecased Spanish stopwords, except the first word.
+
+    Only words in exact Titlecase are touched, so deliberate user casing
+    (ALLCAPS "DEL", already-lowercase "del", stylized "dEl") passes
+    through untouched, and English titles are unaffected (their short
+    words aren't in the stopword set).
+    """
+    words = (text or "").split(" ")
+    out = words[:1]
+    for w in words[1:]:
+        if w.istitle() and w.lower() in _ES_TITLE_STOPWORDS:
+            w = w.lower()
+        out.append(w)
+    return " ".join(out)
+
+
+def _art_track_layout(spec: "RenderSpec") -> dict:
+    """Pixel positions for the VEVO-style art-track composite, per spec dims.
+
+    Landscape (16:9, UMG): blurred cover fills the frame; the sharp cover sits
+    as a shadowed card on the RIGHT; a SoundCloud-style waveform + title/artist
+    sit on the LEFT. Portrait (9:16 short): card centered on top, waveform +
+    text below. Pure arithmetic so it's unit-testable and shared by the PIL
+    overlay builder and the ffmpeg compositor.
+    """
+    W, H = spec.width, spec.height
+    portrait = H > W
+    if portrait:
+        # ONE centered axis (design review: the stacked-16:9 look read as a
+        # broken crop). Everything stays above 0.85*H (platform captions/
+        # actions land in the bottom 15%) and inside 0.88*W (action rail).
+        card = int(W * 0.62)
+        card_x = (W - card) // 2
+        card_y = int(H * 0.16)
+        wave_w = int(W * 0.70)
+        wave_x = (W - wave_w) // 2
+        wave_h = int(H * 0.045)
+        wave_y = int(H * 0.635)
+        title_size = max(30, int(W * 0.06))
+        artist_size = max(20, int(W * 0.036))
+        title_y = wave_y + wave_h + int(H * 0.030)
+        artist_y = title_y + int(title_size * 1.25)
+        text_align = "center"
+        text_x = W // 2
+        text_max_w = int(W * 0.84)
+        legal_y = int(H * 0.83)
+        tag_size = max(14, int(W * 0.020))
+        tag_y = wave_y - tag_size - int(H * 0.012)
+    else:
+        s = H / 1080.0
+        card = int(600 * s)
+        card_x = W - card - int(165 * s)   # right margin
+        card_y = (H - card) // 2 - int(20 * s)
+        wave_x = int(165 * s)
+        wave_w = int(960 * s)
+        wave_h = int(150 * s)
+        wave_y = int(545 * s)
+        title_size = max(28, int(64 * s))
+        artist_size = max(18, int(38 * s))
+        title_y = wave_y + wave_h + int(wave_h * 0.12) + int(title_size * 0.10)
+        artist_y = title_y + int(title_size * 1.18)
+        text_align = "left"
+        text_x = wave_x
+        # Hard safe zone: the text column ends well before the card starts
+        # (the old bound W-text_x-0.04W let long titles run under the card).
+        text_max_w = card_x - text_x - int(60 * s)
+        legal_y = int(H * 0.92)
+        tag_size = max(14, int(22 * s))
+        tag_y = wave_y - tag_size - int(12 * s)
+    # Reactive EQ bar geometry, shared by the PIL strip drawer and the
+    # ffmpeg overlay so both always agree.
+    n_bars = 48
+    pitch = max(8, wave_w // n_bars)
+    bar_w = max(3, round(pitch * 0.62))
+    # Wide, soft drop shadow (review: the old 0.037 blur read as "pasted").
+    shadow = card + int(card * 0.06)
+    shadow_x = card_x + int(card * 0.01)
+    shadow_y = card_y + int(card * 0.04)
+    shadow_blur = max(10, int(card * 0.09))
+    return dict(
+        W=W, H=H, card=card, card_x=card_x, card_y=card_y,
+        shadow=shadow, shadow_x=shadow_x, shadow_y=shadow_y, shadow_blur=shadow_blur,
+        wave_x=wave_x, wave_y=wave_y, wave_w=wave_w, wave_h=wave_h,
+        n_bars=n_bars, pitch=pitch, bar_w=bar_w,
+        title_size=title_size, artist_size=artist_size,
+        text_align=text_align, text_x=text_x, text_max_w=text_max_w,
+        title_y=title_y, artist_y=artist_y, legal_y=legal_y,
+        tag_size=tag_size, tag_y=tag_y,
+    )
+
+
+def _art_track_waveform_bars(mp3_path: str, n: int, *, win_start: float = 0.0,
+                             win_dur: float | None = None) -> "list[float]":
+    """Normalized [0,1] amplitude envelope of the audio window, resampled to
+    `n` bars — the whole-song (or short-window) waveform for the art track.
+    Returns flat 0.25 bars on any failure so the render never breaks.
+    """
+    try:
+        import numpy as _np
+        y, _sr = librosa.load(mp3_path, sr=8000, mono=True,
+                              offset=max(0.0, win_start), duration=win_dur)
+        if not len(y):
+            return [0.25] * n
+        hop = max(1, len(y) // (n * 4))
+        rms = librosa.feature.rms(y=y, frame_length=hop * 2, hop_length=hop)[0]
+        idx = _np.linspace(0, len(rms), n + 1).astype(int)
+        bars = _np.array([
+            rms[idx[i]:idx[i + 1]].mean() if idx[i + 1] > idx[i] else 0.0
+            for i in range(n)
+        ])
+        bars = _np.power(bars / (bars.max() or 1.0), 0.7)  # compress so quiet bars show
+        return [float(b) for b in bars]
+    except Exception as e:
+        logger.warning("[ART] waveform envelope failed (%s); flat bars", e)
+        return [0.25] * n
+
+
+def _art_track_bg_layer(cover_path: str, spec: "RenderSpec") -> "Image.Image":
+    """The blurred-cover BACKGROUND layer only (no card, no text): cover-fit
+    crop → heavy blur → desaturate → luminance-clamp → scrim + vignette. Split
+    out of the base so an optional moving effect can screen-blend HERE, in the
+    ambient background, BEHIND the card and wave (matching the wizard preview)
+    — the cover card stays clean on top. Returns an opaque RGBA image."""
+    import numpy as np
+    from PIL import ImageFilter, ImageEnhance, ImageOps, ImageStat
+    L = _art_track_layout(spec)
+    W, H = L["W"], L["H"]
+    portrait = L["text_align"] == "center"
+
+    cover = Image.open(cover_path).convert("RGB")
+    bg = ImageOps.fit(cover, (W, H), method=Image.LANCZOS)
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=max(16, H // 14)))
+    bg = ImageEnhance.Color(bg).enhance(0.85)
+    mean_luma = ImageStat.Stat(bg.convert("L")).mean[0]
+    bg = ImageEnhance.Brightness(bg).enhance(
+        min(1.6, max(0.45, 65.0 / max(mean_luma, 1.0))))
+    base = bg.convert("RGBA")
+
+    if portrait:
+        ramp = np.clip((np.linspace(0, 1, H) - 0.40) / 0.60, 0, 1) * 150
+        scrim_a = np.repeat(ramp[:, None], W, axis=1)
+    else:
+        ramp = np.clip(1.0 - np.linspace(0, 1, W) / 0.65, 0, 1) * 150
+        scrim_a = np.repeat(ramp[None, :], H, axis=0)
+    yy, xx = np.mgrid[0:18, 0:32]
+    r = np.hypot((xx - 15.5) / 15.5, (yy - 8.5) / 8.5)
+    vig_small = (np.clip((r - 0.55) / 0.45, 0, 1) * 90).astype(np.uint8)
+    vig_a = np.asarray(Image.fromarray(vig_small, "L").resize((W, H), Image.BILINEAR))
+    dark = np.zeros((H, W, 4), dtype=np.uint8)
+    dark[:, :, 3] = np.maximum(scrim_a.astype(np.uint8), vig_a)
+    return Image.alpha_composite(base, Image.fromarray(dark, "RGBA"))
+
+
+def _art_track_fg_layer(cover_path: str, spec: "RenderSpec", *,
+                        artist: str, song_title: str,
+                        label_line: str = "") -> "Image.Image":
+    """The FOREGROUND layer only (transparent RGBA): shadowed cover card +
+    "OFFICIAL AUDIO" tag + title/artist + optional ℗/© label line. Drawn on a
+    transparent canvas so it can overlay on top of the background+effect, which
+    keeps the card and text clean above the moving particles."""
+    from PIL import ImageFilter, ImageOps
+    L = _art_track_layout(spec)
+    W, H = L["W"], L["H"]
+    portrait = L["text_align"] == "center"
+
+    cover = Image.open(cover_path).convert("RGB")
+    base = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+    # The sharp cover card, contained in the square box — compute its REAL
+    # size first so non-square covers get a shadow that matches.
+    card = ImageOps.contain(cover, (L["card"], L["card"]), method=Image.LANCZOS)
+    cw, ch = card.size
+    px = L["card_x"] + (L["card"] - cw) // 2
+    py = L["card_y"] + (L["card"] - ch) // 2
+
+    off_x, off_y = int(L["card"] * 0.01), int(L["card"] * 0.04)
+    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        [px + off_x, py + off_y, px + off_x + cw, py + off_y + ch],
+        radius=int(L["card"] * 0.02), fill=(0, 0, 0, 150))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(L["shadow_blur"]))
+    base = Image.alpha_composite(base, shadow)
+
+    base.alpha_composite(card.convert("RGBA"), (px, py))
+    d = ImageDraw.Draw(base)
+    d.rectangle([px, py, px + cw - 1, py + ch - 1],
+                outline=(255, 255, 255, 20), width=1)
+
+    anchor = "ma" if portrait else "la"
+
+    def _font(sz: int, extra_bold: bool = False):
+        name = "Montserrat-ExtraBold.ttf" if extra_bold else "Montserrat-Bold.ttf"
+        try:
+            return ImageFont.truetype(os.path.join(_FONTS_DIR, name), sz)
+        except Exception:
+            return ImageFont.load_default()
+
+    max_text_w = L["text_max_w"]
+
+    def _fit_font(txt: str, size: int, extra_bold: bool, floor: int = 20):
+        f = _font(size, extra_bold)
+        while size > floor and d.textlength(txt, font=f) > max_text_w:
+            size = int(size * 0.92)
+            f = _font(size, extra_bold)
+        return f, size
+
+    def _shadow_text(x, y, txt, fnt, fill):
+        d.text((x + 2, y + 3), txt, font=fnt, fill=(0, 0, 0, 160), anchor=anchor)
+        d.text((x, y), txt, font=fnt, fill=fill, anchor=anchor)
+
+    tag_font = _font(L["tag_size"])
+    _shadow_text(L["text_x"], L["tag_y"], "O F F I C I A L   A U D I O",
+                 tag_font, (255, 255, 255, 140))
+
+    artist_y = L["artist_y"]
+    title = spanish_smart_title((song_title or "").strip())
+    if title:
+        floor = max(20, int(L["title_size"] * 0.55))
+        f, size = _fit_font(title, L["title_size"], True, floor=floor)
+        if d.textlength(title, font=f) > max_text_w and " " in title:
+            # Still too wide at the floor size → wrap to two lines, split at
+            # the space nearest the middle, and push the artist line down.
+            mid = len(title) // 2
+            spaces = [i for i, c in enumerate(title) if c == " "]
+            cut = min(spaces, key=lambda i: abs(i - mid))
+            lines = [title[:cut], title[cut + 1:]]
+            f, size = _fit_font(max(lines, key=len), L["title_size"], True,
+                                floor=floor)
+            line_gap = int(size * 1.12)
+            _shadow_text(L["text_x"], L["title_y"], lines[0], f, (255, 255, 255, 255))
+            _shadow_text(L["text_x"], L["title_y"] + line_gap, lines[1], f,
+                         (255, 255, 255, 255))
+            artist_y += line_gap
+        else:
+            _shadow_text(L["text_x"], L["title_y"], title, f, (255, 255, 255, 255))
+    artist = (artist or "").strip()
+    if artist:
+        f, _ = _fit_font(artist, L["artist_size"], False)
+        _shadow_text(L["text_x"], artist_y, artist, f, (255, 255, 255, 235))
+
+    legal = (label_line or "").strip()
+    if legal:
+        # Roboto, not Montserrat: the ℗ (U+2117) every label line starts with
+        # is missing from Montserrat and renders as tofu. At this size the
+        # family mismatch is imperceptible; the missing glyph is not.
+        sz = max(14, int(L["artist_size"] * 0.55))
+        try:
+            f = ImageFont.truetype(os.path.join(_FONTS_DIR, "Roboto-Bold.ttf"), sz)
+            while sz > 10 and d.textlength(legal, font=f) > max_text_w:
+                sz = int(sz * 0.92)
+                f = ImageFont.truetype(os.path.join(_FONTS_DIR, "Roboto-Bold.ttf"), sz)
+        except Exception:
+            f, _ = _fit_font(legal, sz, False)
+        _shadow_text(L["text_x"], L["legal_y"], legal, f, (255, 255, 255, 140))
+
+    return base
+
+
+def _build_art_track_base(cover_path: str, out_path: str, *,
+                          spec: "RenderSpec", artist: str, song_title: str,
+                          label_line: str = "") -> str:
+    """Build the COMPLETE static base frame (background + card + text) as one
+    flattened image. Used by the no-effect render and the thumbnail. When an
+    effect is present the render composites the two layers separately (bg →
+    effect → fg) so the particles sit in the ambient background. Doing the
+    whole static composite once (not per-frame) keeps the render fast — the
+    expensive Gaussian blur runs a single time."""
+    bg = _art_track_bg_layer(cover_path, spec)
+    fg = _art_track_fg_layer(cover_path, spec, artist=artist,
+                             song_title=song_title, label_line=label_line)
+    Image.alpha_composite(bg, fg).convert("RGB").save(out_path)
+    return out_path
+
+
+def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
+                      spec: "RenderSpec", artist: str, song_title: str,
+                      duration: float, out_name: str | None = None,
+                      win_start: float = 0.0, win_dur: float | None = None,
+                      label_line: str = "", effect: str = "") -> str:
+    """Render the full art-track ("official audio") video: PIL builds the static
+    composite once (blurred cover + shadowed card + title/artist + tag/legal),
+    then ffmpeg loops that base image and overlays the AUDIO-REACTIVE waveform
+    strip while muxing the master audio. No lyrics, no zoom/effect movement —
+    EQ bars pulsing in place with the music, following the rhythm, ARE the
+    motion, matching the VEVO template.
+
+    The waveform is a precomputed PNG strip sequence (art_track_wave: mel-band
+    energies → per-band normalization → fast-attack/slow-release envelope →
+    mirrored-center bars). Bars pulse IN PLACE — a scrolling showwaves
+    oscilloscope was rejected in design review because the eye reads the
+    horizontal translation, not the beat. Only the small strip is per-frame
+    work (the blur runs once in the PIL base) → fast and bounded memory at any
+    length. Spec-driven so YouTube MP4, the 9:16 short, and the UMG
+    intermediate master (→ lazy ProRes) share this code.
+    """
+    import shutil
+
+    import art_track_wave
+    import fx_compositor as _fx
+    from fractions import Fraction
+
+    L = _art_track_layout(spec)
+    dur = float(win_dur) if win_dur else float(duration)
+    stem = (out_name or "art").replace(".mp4", "").replace(".mov", "")
+    fx_path = _fx.effect_path(effect)
+
+    # With an effect we split the composite into a BACKGROUND layer (blurred
+    # cover + scrim) and a FOREGROUND layer (card + text) so the moving
+    # particles screen-blend in the ambient background — BEHIND the card and
+    # the wave, subtle and soft, matching the wizard preview. Without an
+    # effect, one flat base is enough.
+    if fx_path:
+        bg_path = os.path.join(job_dir, stem + "_bg.png")
+        fg_path = os.path.join(job_dir, stem + "_fg.png")
+        _art_track_bg_layer(cover_path, spec).convert("RGB").save(bg_path)
+        _art_track_fg_layer(cover_path, spec, artist=artist,
+                            song_title=song_title, label_line=label_line).save(fg_path)
+    else:
+        base_path = os.path.join(job_dir, stem + "_base.png")
+        _build_art_track_base(cover_path, base_path, spec=spec, artist=artist,
+                              song_title=song_title, label_line=label_line)
+
+    out_path = os.path.join(job_dir, out_name or f"lyric_video.{spec.container}")
+
+    # Wave strip timing. Above ~32 fps (UMG 50/59.94/60) the strip runs at
+    # half rate — overlay holds each strip frame, imperceptible at speed,
+    # and it halves the PNG count.
+    fps_frac = Fraction(spec.fps_str)
+    if float(fps_frac) > 32:
+        wave_fps_frac = fps_frac / 2
+        wave_fps_str = (str(wave_fps_frac.numerator) if wave_fps_frac.denominator == 1
+                        else f"{wave_fps_frac.numerator}/{wave_fps_frac.denominator}")
+    else:
+        wave_fps_frac, wave_fps_str = fps_frac, spec.fps_str
+    wave_n_frames = max(1, math.ceil(dur * wave_fps_frac))
+
+    # Same win_start/dur as the audio input below → bars sync by construction
+    # (the short's 30 s window analyzes ITS window, not the song start).
+    heights = art_track_wave.compute_bar_frames(
+        mp3_path, n_bars=L["n_bars"], n_frames=wave_n_frames,
+        fps=float(wave_fps_frac), win_start=win_start, win_dur=dur)
+
+    frames_dir = os.path.join(job_dir, stem + "_wave")
+    if spec.codec == "libx264":
+        vargs = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                 "-pix_fmt", spec.pix_fmt]
+    elif spec.codec == "prores_ks":
+        vargs = ["-c:v", "prores_ks", "-profile:v", str(spec.prores_profile),
+                 "-pix_fmt", spec.pix_fmt, "-vendor", "apl0"]
+    else:
+        vargs = ["-c:v", spec.codec, "-pix_fmt", spec.pix_fmt]
+    if spec.audio_codec == "aac":
+        aargs = ["-c:a", "aac", "-b:a", "320k"]
+    elif spec.audio_codec == "pcm_s24le":
+        aargs = ["-c:a", "pcm_s24le", "-ar", "48000", "-ac", "2"]
+    else:
+        aargs = ["-c:a", spec.audio_codec]
+
+    try:
+        pattern = art_track_wave.write_wave_frames(
+            heights, frames_dir, w=L["wave_w"], h=L["wave_h"],
+            pitch=L["pitch"], bar_w=L["bar_w"])
+        # eof_action=repeat: the strip sequence is finite while the looped
+        # base is infinite — hold the last strip frame so the graph never
+        # ends early; the -t audio window + -shortest bound the output.
+        if fx_path:
+            # Layered composite so the effect sits in the AMBIENT BACKGROUND,
+            # behind the card and wave (matching the preview): bg (0) → effect
+            # screen-blend → foreground card+text (4) → wave (1).
+            #   0 = blurred-cover bg   1 = wave seq   2 = mp3
+            #   3 = fx loop            4 = fg card+text (RGBA)
+            # The fx is desaturated + softened + composited at reduced opacity
+            # so it reads as a subtle glow, not the blown-out yellow orbs the
+            # raw asset + screen-blend produced over the cover.
+            inputs = [
+                "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(bg_path),
+                "-framerate", wave_fps_str, "-start_number", "0",
+                "-i", os.path.abspath(pattern),
+                "-ss", str(max(0.0, win_start)), "-t", str(dur),
+                "-i", os.path.abspath(mp3_path),
+                "-stream_loop", "-1", "-i", os.path.abspath(fx_path),
+                "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(fg_path),
+            ]
+            fc = (
+                f"[3:v]scale={spec.width}:{spec.height},setpts=PTS-STARTPTS,"
+                f"eq=saturation=0.70:brightness=-0.04,gblur=sigma=6,format=gbrp[fx];"
+                f"[0:v]format=gbrp[bg0];"
+                f"[bg0][fx]blend=all_mode=screen:all_opacity=0.45,"
+                f"format={spec.pix_fmt}[bgfx];"
+                f"[bgfx][4:v]overlay=0:0[withcard];"
+                f"[withcard][1:v]overlay={L['wave_x']}:{L['wave_y']}:eof_action=repeat,"
+                f"format={spec.pix_fmt}[outv]"
+            )
+        else:
+            inputs = [
+                "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(base_path),
+                "-framerate", wave_fps_str, "-start_number", "0",
+                "-i", os.path.abspath(pattern),
+                "-ss", str(max(0.0, win_start)), "-t", str(dur),
+                "-i", os.path.abspath(mp3_path),
+            ]
+            fc = (
+                f"[0:v][1:v]overlay={L['wave_x']}:{L['wave_y']}:eof_action=repeat,"
+                f"format={spec.pix_fmt}[outv]"
+            )
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            *inputs,
+            "-filter_complex", fc, "-map", "[outv]", "-map", "2:a",
+            *vargs, *aargs, "-r", spec.fps_str,
+            # Output-level -t: -shortest alone lets the muxer overshoot ~1s
+            # past the audio (buffered frames of the infinite base loop),
+            # leaving a frozen-silent tail. Hard-cap at the window length.
+            "-t", str(dur),
+            "-movflags", "+faststart", "-shortest",
+            os.path.basename(out_path),
+        ]
+        _timeout = 1800 if (spec.codec == "prores_ks" or spec.width >= 3000) else 900
+        run_checked(cmd, label="ffmpeg-art-track", timeout=_timeout,
+                    output_path=out_path, cwd=job_dir)
+    finally:
+        shutil.rmtree(frames_dir, ignore_errors=True)
+    _validate_rendered_mp4(out_path, dur)
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    logger.info("[ART] art track render: %.0fs, %.1f MB (%dx%d)%s",
+                dur, size_mb, spec.width, spec.height,
+                f" +fx:{effect}" if fx_path else "")
+    return out_path
 
 
 def _attach_close_chain(target_clip, owned_clips):
@@ -10797,6 +13719,11 @@ def _render_lyrics_ass(
     # timeline ya cubre toda la canción. Default False = camino histórico de
     # fondo único (se loopea el clip Veo corto).
     bg_prelooped: bool = False,
+    # Art tracks: render_text=False rinde SIN letra ni title card (art track
+    # clásico tipo "official audio"). Se saltea todo el armado de fuentes/ASS
+    # y no se quema ningún subtítulo — solo el fondo (compuesto del cover) +
+    # audio + overlay de efecto opcional. Default True = camino con letra.
+    render_text: bool = True,
 ) -> str:
     """Fast lyric render: burn the lyrics with libass in a single ffmpeg
     pass over the (ffmpeg-looped) background — no moviepy frame loop.
@@ -10839,91 +13766,98 @@ def _render_lyrics_ass(
             out_name="bg_looped_ass.mp4",
         )
 
-    # 2) Fonts: the lyric font + the title-card fonts. The title card can use
-    #    operator-chosen fonts per element (Full Rotor v1); defaults keep the
-    #    historical look — artist in Montserrat ExtraBold, song in the lyric
-    #    font. All live in one fontsdir so libass can \fn-switch between them
-    #    without mis-matching across the pool.
-    family, bold = _ass.font_family(font_path)
-    extrabold_font = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
-    if not os.path.exists(extrabold_font):
-        extrabold_font = font_path  # graceful fallback
-    # Per-element title fonts: resolve the chosen ids, else fall back to the
-    # historical defaults (artist = ExtraBold, song = lyric font).
-    title_artist_path = _resolve_font(title_artist_font) or extrabold_font
-    title_song_path = _resolve_font(title_song_font) or font_path
-    title_artist_family, _ = _ass.font_family(title_artist_path)
-    title_song_family, _ = _ass.font_family(title_song_path)
-    artist_family, _ = _ass.font_family(extrabold_font)
-    font_dir = _ass.multi_font_dir(
-        [font_path, extrabold_font, title_artist_path, title_song_path]
-    )
+    # 2) + 3) Fonts + ASS lines. Art tracks (render_text=False) render NO text
+    #    at all — classic "official audio" look — so the entire font resolution,
+    #    title-card build, and ASS write are skipped; the single pass below
+    #    burns no subtitles (ass_basename=None). font_dir stays "" so nothing
+    #    is created or cleaned up.
+    font_dir = ""
+    if render_text:
+        # 2) Fonts: the lyric font + the title-card fonts. The title card can use
+        #    operator-chosen fonts per element (Full Rotor v1); defaults keep the
+        #    historical look — artist in Montserrat ExtraBold, song in the lyric
+        #    font. All live in one fontsdir so libass can \fn-switch between them
+        #    without mis-matching across the pool.
+        family, bold = _ass.font_family(font_path)
+        extrabold_font = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
+        if not os.path.exists(extrabold_font):
+            extrabold_font = font_path  # graceful fallback
+        # Per-element title fonts: resolve the chosen ids, else fall back to the
+        # historical defaults (artist = ExtraBold, song = lyric font).
+        title_artist_path = _resolve_font(title_artist_font) or extrabold_font
+        title_song_path = _resolve_font(title_song_font) or font_path
+        title_artist_family, _ = _ass.font_family(title_artist_path)
+        title_song_family, _ = _ass.font_family(title_song_path)
+        artist_family, _ = _ass.font_family(extrabold_font)
+        font_dir = _ass.multi_font_dir(
+            [font_path, extrabold_font, title_artist_path, title_song_path]
+        )
 
-    # 3) Segments → ASS lines (same case/sanitise/sizing as moviepy), plus
-    #    the artist/song title card overlay (same two layouts).
-    # Per-font visual-size normalization: libass scales \fs by the font's
-    # internal vertical metrics, so the SAME \fs renders a different cap-height
-    # per family (Poppins ~14% smaller than Montserrat → "muy chiquita").
-    # Equalize to the Montserrat reference so a size setting looks consistent
-    # across fonts. Keyed by the resolved family (works for explicit picks and
-    # the random "Auto" pool alike). See ass_render.font_size_factor.
-    font_factor = _ass.font_size_factor(family)
-    lines = _ass.segments_to_lines(
-        segments,
-        text_scale=scale,
-        font_scale=font_scale,
-        font_factor=font_factor,
-        lyric_transition=lyric_transition,
-        animation=lyrics_animation,
-        transition=line_transition,
-        case_fn=lambda t: _apply_case(t, text_case),
-    )
-    # Lyric color mapping para build_ass (style line + override karaoke):
-    # karaoke → primary = sung color, secondary = un-sung. Otras animaciones
-    # usan primary = lyric_color (texto único) y secondary irrelevante.
-    if lyrics_animation == "karaoke":
-        primary_for_lines = lyric_sung_color or ""
-        secondary_for_lines = lyric_color or ""
-    else:
-        primary_for_lines = lyric_color or ""
-        secondary_for_lines = ""
-    first_lyric_start = segments[0]["start"] if segments else duration
-    lines += _ass.title_card_lines(
-        artist, song_title, first_lyric_start,
-        width=spec.width, height=spec.height,
-        text_scale=scale,
-        # Per-element fonts (operator-chosen, else historical defaults).
-        lyric_font_family=title_song_family,
-        artist_font_family=title_artist_family,
-        # Real font files so long titles/artists are shrunk (then wrapped)
-        # to the safe card width instead of overflowing the frame.
-        lyric_font_path=title_song_path,
-        artist_font_path=title_artist_path,
-        # Operator layout + size (Full Rotor v1).
-        template=title_template,
-        size_multiplier=title_size,
-        # UI v1.1 (2026-05-30): explicit line break for the song. Empty
-        # string => None (auto wrap, historical). When the operator picked
-        # their own break in the wizard, we split on the literal "\n" and
-        # title_card_lines uses those lines as-is, fitting each one
-        # individually.
-        song_lines=(title_song_break.split("\n") if title_song_break else None),
-    )
-    base_fs = _ass.lyric_fontsize(40, scale, font_scale, font_factor=font_factor)
-    # Reusamos el mapping primary/secondary computado arriba para
-    # segments_to_lines — mismo eje semántico (karaoke usa sung como
-    # PrimaryColour). Sin esto la palabra cantada se rendea con
-    # PrimaryColour blanco aunque el operador haya elegido otro color.
-    ass_doc = _ass.build_ass(
-        width=spec.width, height=spec.height,
-        font_name=family, base_fontsize=base_fs,
-        outline=outline, shadow=shadow, lines=lines, bold=bold,
-        primary_color=primary_for_lines,
-        secondary_color=secondary_for_lines,
-    )
-    ass_path = os.path.join(job_dir, "lyrics.ass")
-    with open(ass_path, "w", encoding="utf-8") as f:
-        f.write(ass_doc)
+        # 3) Segments → ASS lines (same case/sanitise/sizing as moviepy), plus
+        #    the artist/song title card overlay (same two layouts).
+        # Per-font visual-size normalization: libass scales \fs by the font's
+        # internal vertical metrics, so the SAME \fs renders a different cap-height
+        # per family (Poppins ~14% smaller than Montserrat → "muy chiquita").
+        # Equalize to the Montserrat reference so a size setting looks consistent
+        # across fonts. Keyed by the resolved family (works for explicit picks and
+        # the random "Auto" pool alike). See ass_render.font_size_factor.
+        font_factor = _ass.font_size_factor(family)
+        lines = _ass.segments_to_lines(
+            segments,
+            text_scale=scale,
+            font_scale=font_scale,
+            font_factor=font_factor,
+            lyric_transition=lyric_transition,
+            animation=lyrics_animation,
+            transition=line_transition,
+            case_fn=lambda t: _apply_case(t, text_case),
+        )
+        # Lyric color mapping para build_ass (style line + override karaoke):
+        # karaoke → primary = sung color, secondary = un-sung. Otras animaciones
+        # usan primary = lyric_color (texto único) y secondary irrelevante.
+        if lyrics_animation == "karaoke":
+            primary_for_lines = lyric_sung_color or ""
+            secondary_for_lines = lyric_color or ""
+        else:
+            primary_for_lines = lyric_color or ""
+            secondary_for_lines = ""
+        first_lyric_start = segments[0]["start"] if segments else duration
+        lines += _ass.title_card_lines(
+            artist, song_title, first_lyric_start,
+            width=spec.width, height=spec.height,
+            text_scale=scale,
+            # Per-element fonts (operator-chosen, else historical defaults).
+            lyric_font_family=title_song_family,
+            artist_font_family=title_artist_family,
+            # Real font files so long titles/artists are shrunk (then wrapped)
+            # to the safe card width instead of overflowing the frame.
+            lyric_font_path=title_song_path,
+            artist_font_path=title_artist_path,
+            # Operator layout + size (Full Rotor v1).
+            template=title_template,
+            size_multiplier=title_size,
+            # UI v1.1 (2026-05-30): explicit line break for the song. Empty
+            # string => None (auto wrap, historical). When the operator picked
+            # their own break in the wizard, we split on the literal "\n" and
+            # title_card_lines uses those lines as-is, fitting each one
+            # individually.
+            song_lines=(title_song_break.split("\n") if title_song_break else None),
+        )
+        base_fs = _ass.lyric_fontsize(40, scale, font_scale, font_factor=font_factor)
+        # Reusamos el mapping primary/secondary computado arriba para
+        # segments_to_lines — mismo eje semántico (karaoke usa sung como
+        # PrimaryColour). Sin esto la palabra cantada se rendea con
+        # PrimaryColour blanco aunque el operador haya elegido otro color.
+        ass_doc = _ass.build_ass(
+            width=spec.width, height=spec.height,
+            font_name=family, base_fontsize=base_fs,
+            outline=outline, shadow=shadow, lines=lines, bold=bold,
+            primary_color=primary_for_lines,
+            secondary_color=secondary_for_lines,
+        )
+        ass_path = os.path.join(job_dir, "lyrics.ass")
+        with open(ass_path, "w", encoding="utf-8") as f:
+            f.write(ass_doc)
 
     # 4) Single ffmpeg pass: burn ASS + mux audio. We run with cwd=job_dir
     #    so the subtitles file is referenced by basename (avoids the
@@ -10952,7 +13886,7 @@ def _render_lyrics_ass(
     # path), or a -filter_complex with the looped fx clip as input #2.
     import fx_compositor as _fx
     vfilter, _use_complex, _extra_in = _fx.build_video_filter(
-        ass_basename="lyrics.ass", font_dir=font_dir,
+        ass_basename=("lyrics.ass" if render_text else None), font_dir=font_dir,
         width=spec.width, height=spec.height,
         effect=effect, style=style, custom_colors=custom_colors,
     )
@@ -11007,8 +13941,10 @@ def _render_lyrics_ass(
             cwd=job_dir,
         )
     finally:
-        import shutil
-        shutil.rmtree(font_dir, ignore_errors=True)
+        # font_dir is "" for art tracks (no fonts built) → nothing to clean.
+        if font_dir:
+            import shutil
+            shutil.rmtree(font_dir, ignore_errors=True)
 
     # Validate the output is actually browser-playable; on failure the
     # caller (generate_lyric_video) catches and falls back to moviepy.
@@ -11082,6 +14018,11 @@ def generate_lyric_video(
     # Multi-escena: bg_image_path ya es un timeline del largo completo (escenas
     # con xfade) → no re-loopear en el render. Se propaga a _render_lyrics_ass.
     bg_prelooped: bool = False,
+    # Art tracks: bg_image_path es un cover (imagen). Se compone el fondo de
+    # art track (cover blur + tarjeta con sombra + onda reactiva) y se rinde
+    # SIN letra ni title card. Requiere una imagen como bg_image_path.
+    art_track: bool = False,
+    label_line: str = "",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -11142,6 +14083,29 @@ def generate_lyric_video(
     # Title shown on the card — resolved once and shared by both render
     # paths (libass below, moviepy further down).
     title_song = _resolve_title_song(song_title, mp3_path, artist)
+
+    # Art track path: compose the cover into the art-track background (blurred
+    # fill + centered sharp cover + subtle push-in) and render with NO lyrics /
+    # title card. Single-pass ffmpeg (same _render_lyrics_ass, render_text=
+    # False) so the effect overlay, color grade, and every spec (YouTube MP4 +
+    # UMG intermediate master → lazy ProRes) compose exactly like a normal
+    # render. bg_prelooped=True because the composite already spans the full
+    # audio duration. No moviepy fallback: there is no moviepy art-track path
+    # and per the OOM rule there must not be one — surface the error loudly.
+    if art_track:
+        if not bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
+            audio.close()
+            raise RuntimeError(
+                "Art track requires a cover IMAGE (.jpg/.png), got a video bg"
+            )
+        logger.info("[ART] art-track render (profile=%s)", spec.profile)
+        out = _render_art_track(
+            bg_source, mp3_path, job_dir, spec=spec,
+            artist=artist, song_title=title_song, duration=duration,
+            label_line=label_line, effect=effect,
+        )
+        audio.close()
+        return out, font, bg_source
 
     # Fast path: libass single-pass render (engine=ass). Covers video bg +
     # H.264 (YouTube) and the UMG intermediate master (profile
@@ -11872,6 +14836,67 @@ def _burn_short_text_ass(
         return None
 
 
+def _pick_energy_window(mp3_path: str, duration: float, window_sec: float = 30.0) -> float:
+    """Pick the start (seconds) of the highest-energy `window_sec` window of
+    the track — a lyrics-free stand-in for "the chorus" used by the art-track
+    short. Falls back to 30% into the song if librosa/RMS analysis fails.
+    """
+    if duration <= window_sec:
+        return 0.0
+    try:
+        y, sr = librosa.load(mp3_path, sr=8000, mono=True)
+        hop = 4000  # ~0.5s frames at 8kHz
+        rms = librosa.feature.rms(y=y, frame_length=hop * 2, hop_length=hop)[0]
+        frames_per_win = max(1, int(round(window_sec * sr / hop)))
+        if frames_per_win >= len(rms):
+            return 0.0
+        # Rolling-sum energy; argmax gives the loudest contiguous window.
+        csum = np.concatenate([[0.0], np.cumsum(rms)])
+        win_energy = csum[frames_per_win:] - csum[:-frames_per_win]
+        best_frame = int(np.argmax(win_energy))
+        start = best_frame * hop / sr
+        return float(max(0.0, min(start, duration - window_sec)))
+    except Exception as e:
+        logger.warning("[ART] RMS window pick failed (%s) — using 30%% offset", e)
+        return float(max(0.0, min(duration * 0.30, duration - window_sec)))
+
+
+def generate_art_track_short(
+    mp3_path: str,
+    cover_path: str,
+    job_dir: str,
+    *,
+    spec: "RenderSpec",
+    artist: str = "",
+    song_title: str = "",
+    window_sec: float = 30.0,
+    label_line: str = "",
+    effect: str = "",
+) -> str:
+    """Render the vertical (9:16) art-track short: the same VEVO composite as
+    the master (blurred cover fill + shadowed cover card + reactive waveform +
+    title) over a 30s high-energy window of the audio. The bars react to that
+    window's audio. Writes `short.mp4` in job_dir (same contract as
+    generate_short); `_render_art_track` writes its own output name so it never
+    clobbers the master's `lyric_video.mp4`.
+    """
+    # Resolve the title the same way the master does (generate_lyric_video →
+    # _resolve_title_song), so a blank song_title falls back to the filename
+    # here too — otherwise the master shows a title but the short is blank.
+    song_title = _resolve_title_song(song_title, mp3_path, artist)
+    duration = _audio_duration(mp3_path) or _ffprobe_duration(mp3_path) or window_sec
+    win = min(window_sec, duration)
+    start = _pick_energy_window(mp3_path, duration, win)
+    out_path = _render_art_track(
+        cover_path, mp3_path, job_dir, spec=spec,
+        artist=artist, song_title=song_title, duration=win,
+        out_name="short.mp4", win_start=start, win_dur=win,
+        label_line=label_line, effect=effect,
+    )
+    logger.info("[ART] art-track short window %.0f-%.0fs", start, start + win)
+    return out_path
+
+
 def generate_short(
     mp3_path: str,
     segments: list[dict],
@@ -12094,6 +15119,53 @@ def _draw_text_with_outline(draw, xy, text, font, fill="white", outline="black",
     draw.text((x, y), text, font=font, fill=fill)
 
 
+def generate_art_track_thumbnail(
+    cover_path: str,
+    mp3_path: str,
+    job_dir: str,
+    *,
+    artist: str = "",
+    song_title: str = "",
+    label_line: str = "",
+) -> str:
+    """Thumbnail for art tracks: the SAME composite as the video (blurred
+    cover + shadowed card + title + a static whole-song waveform strip) at
+    1280×720, instead of the generic raw-cover crop — so the thumbnail
+    matches what plays. The static strip uses the full-track RMS envelope
+    (a "fingerprint" of the song, same visual language as the live bars).
+    """
+    import dataclasses
+
+    import art_track_wave
+
+    # Same title resolution as the master/short so a blank song_title falls
+    # back to the filename (otherwise the thumbnail title would be blank while
+    # the video shows one).
+    song_title = _resolve_title_song(song_title, mp3_path, artist)
+
+    spec = dataclasses.replace(RenderSpec.youtube_default(),
+                               width=1280, height=720)
+    L = _art_track_layout(spec)
+    base_path = os.path.join(job_dir, "thumbnail_base.png")
+    out_path = os.path.join(job_dir, "thumbnail.jpg")
+    try:
+        _build_art_track_base(cover_path, base_path, spec=spec, artist=artist,
+                              song_title=song_title, label_line=label_line)
+        img = Image.open(base_path).convert("RGBA")
+        bars = _art_track_waveform_bars(mp3_path, L["n_bars"])
+        strip = art_track_wave.draw_wave_frame(
+            bars, L["wave_w"], L["wave_h"], pitch=L["pitch"], bar_w=L["bar_w"])
+        img.alpha_composite(strip, (L["wave_x"], L["wave_y"]))
+        img.convert("RGB").save(out_path, quality=92)
+    finally:
+        try:
+            os.unlink(base_path)
+        except OSError:
+            pass
+    logger.info("[ART] art-track thumbnail: %s", out_path)
+    return out_path
+
+
 def generate_thumbnail(
     artist: str,
     mp3_path: str,
@@ -12205,10 +15277,34 @@ def generate_thumbnail(
 _MAX_EDITS = 3
 
 
+def _operator_prompt_for_edit(
+    edit_type: str,
+    *,
+    fresh_background_hint: str | None,
+    persisted_operator_prompt: str | None,
+    scene_prompt_override: str | None = None,
+    scene_hint: str | None = None,
+) -> str | None:
+    """Resolve only raw operator-authored text for edit policy checks."""
+    if edit_type == "background":
+        return fresh_background_hint or None
+    if edit_type in ("typography", "lyrics", "metadata"):
+        return persisted_operator_prompt or None
+    if edit_type == "scene":
+        return (
+            scene_prompt_override
+            or scene_hint
+            or persisted_operator_prompt
+            or None
+        )
+    return None
+
+
 def run_edit_pipeline(
     job_id: str,
     edit_type: str,
     edit_params: dict,
+    background_policy_fingerprint: str | None = None,
 ) -> None:
     """Partial re-render triggered from POST /edit/{job_id}.
 
@@ -12217,6 +15313,10 @@ def run_edit_pipeline(
             with new font/size/case/transition settings.  Cost: ~$0.
         "background" — re-generate Veo background; keep segments and
             (optionally) render params.  Cost: ~$0.90.
+        "background_library" — swap to a curated library asset
+            (edit_params["library_bg"], resuelto + tenant-gateado por el
+            endpoint). No Veo, no consume slot. El asset se re-cachea como
+            bg_r2_key_cached (fondo durable para edits posteriores).
         "lyrics"     — keep cached background; replace segments with the
             caller-supplied list (edit_params["segments"]). Re-renders
             video/short/thumbnail.  Cost: ~$0. After success, the new
@@ -12237,8 +15337,42 @@ def run_edit_pipeline(
     # Observability 2026-06-10: toda línea de log de este job lleva job_id.
     from observability import set_job_log_context
     set_job_log_context(job_id)
+    _edit_runtime_policy = resolve_atmospherics_policy(None)
+    _edit_runtime_fingerprint = runtime_rollout_fingerprint(
+        mode=_edit_runtime_policy.get("policy_mode")
+    )
+    from background_policy import compatible_policy_fingerprint
+    background_policy_fingerprint = compatible_policy_fingerprint(
+        background_policy_fingerprint, _edit_runtime_fingerprint,
+    )
+    if (
+        (background_policy_fingerprint
+         and background_policy_fingerprint != _edit_runtime_fingerprint)
+        or (policy_enforces(_edit_runtime_policy)
+            and not background_policy_fingerprint)
+    ):
+        logger.error(
+            "[BG_POLICY] refusing edit job=%s due API/worker policy mismatch "
+            "queued=%s runtime=%s",
+            job_id,
+            background_policy_fingerprint or "missing",
+            _edit_runtime_fingerprint,
+        )
+        update_job(
+            job_id,
+            status="error",
+            error=(
+                "Background safety configuration changed while the edit was "
+                "queued. Retry after the deployment finishes."
+            ),
+        )
+        return
     import time as _time
-    from database import SessionLocal, Job as JobModel
+    from database import (
+        AssetUsage as AssetUsageModel,
+        Job as JobModel,
+        SessionLocal,
+    )
 
     started_at = _time.monotonic()
     db = SessionLocal()
@@ -12280,6 +15414,26 @@ def run_edit_pipeline(
         # Multi-escena: para edit_type=="scene" reconstruimos el timeline desde
         # el storyboard persistido (regenerando sólo la escena pedida).
         scene_plan = dict(job_row.scene_plan) if job_row.scene_plan else None
+        _stored_background_ai_generated = base_params.get(
+            "background_ai_generated"
+        )
+        if not isinstance(_stored_background_ai_generated, bool):
+            # Legacy jobs predate the explicit provenance bit. Recover it from
+            # existing audit tables: library as_is is human/curated, library
+            # variation is AI, and custom uploads recorded background_human.
+            # Unknown legacy state defaults to AI (fail closed).
+            _asset_usage = (
+                db.query(AssetUsageModel)
+                .filter(AssetUsageModel.job_id == job_id)
+                .order_by(AssetUsageModel.used_at.desc())
+                .first()
+            )
+            _stored_background_ai_generated = _legacy_background_source_is_ai(
+                asset_usage_mode=(
+                    _asset_usage.mode if _asset_usage is not None else None
+                ),
+                cached_key=bg_r2_key_cached,
+            )
     finally:
         db.close()
 
@@ -12321,6 +15475,10 @@ def run_edit_pipeline(
     # user typed in the "Aclarar tipo de fondo" textarea). None if absent;
     # propagates only into the `background` branch below.
     background_hint = edit_params.get("background_hint") or None
+    # Reuse edits need the original RAW operator prompt for policy resolution.
+    # Keep it separate from `background_hint`, which intentionally means only
+    # a fresh prompt supplied by this edit's background-regeneration request.
+    _persisted_operator_prompt = merged.get("background_hint") or None
     # Operator-chosen generation mode for background regen: "veo" (Veo 3.1
     # cinematic video) or "imagen" (Imagen-4 still + Ken Burns animation).
     # Defaults to "veo" when unset for backward compatibility — pre-2026-05-16
@@ -12391,9 +15549,39 @@ def run_edit_pipeline(
                     "deliverable (video/short) for this job"
                 )
 
+        # Observability (2026-07-10): source_audio.mp3 is named .mp3 regardless of
+        # the real codec, so a WAV upload is PCM-in-.mp3. Log the true codec/format
+        # so the mislabel is visible in prod and we can confirm the moviepy UTF-8
+        # fallback is being exercised on UMG's accented WAVs. Best-effort; never
+        # blocks the edit.
+        try:
+            _probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=codec_name:format=format_name",
+                 "-of", "default=noprint_wrappers=1:nokey=1", mp3_path],
+                capture_output=True, text=True, timeout=15,
+            ).stdout.split()
+            logger.info("[EDIT] job %s source_audio real codec/format=%s (path suffix=%s)",
+                        job_id, "/".join(_probe) or "unknown",
+                        os.path.splitext(mp3_path)[1])
+        except Exception:
+            pass
+
         # ----------------------------------------------------------------
         # Resolve background
         # ----------------------------------------------------------------
+        import copy as _copy
+        _scene_plan_before_edit = _copy.deepcopy(scene_plan)
+        _pending_background_recache = False
+        _pending_scene_recache = False
+        _pending_scene_plan_clear = False
+        _force_policy_fallback = False
+        _policy_fallback_reason = None
+        # True only when bg_image_path was assembled in this worker from the
+        # exact clips represented by the current scene_plan. A generic cached
+        # timeline is never identity-bound to that plan and cannot inherit its
+        # validation shortcut.
+        _scene_timeline_from_current_clips = False
         if edit_type in ("typography", "lyrics", "metadata"):
             # All three reuse the cached background — only the foreground
             # layer changes. Lyrics edit ALSO swaps the segments, and
@@ -12418,14 +15606,29 @@ def run_edit_pipeline(
                     _re_tl, scene_plan = _restitch_scenes_for_edit(
                         scene_plan, segments, _sc_audio, job_dir, artist=artist,
                         song_title=song_title, concept=concept,
-                        allow_people=_compute_allow_people(job_id), job_id=job_id)
+                        allow_people=_compute_allow_people(job_id, background_hint),
+                        job_id=job_id)
                     if _re_tl:
                         bg_image_path = _re_tl
                         bg_prelooped = True
+                        _scene_timeline_from_current_clips = True
                         update_job(job_id, scene_plan=scene_plan)
                         logger.info("[EDIT] escenas re-stitcheadas con la letra editada (job=%s)", job_id)
+                        # Re-cachear el timeline nuevo: los cortes cambiaron con
+                        # la letra — sin esto el próximo edit de tipografía
+                        # rendería con el timeline viejo (o, en un job dañado
+                        # pre-#803, con el clip único de 8s → video negro).
+                        _recache_scene_timeline(job_id, _re_tl)
                 except Exception as _e:  # noqa: BLE001
                     logger.warning("[EDIT] re-stitch de escenas falló (%s) — uso timeline cacheado", _e)
+                    # Persistir los estados/errores por escena que el intento
+                    # dejó en el plan (clip_cache_missing etc.) — sin esto el
+                    # operador ve "generated" stale en /status y el fallback es
+                    # indiagnosticable desde prod (incidente 2026-07-10).
+                    try:
+                        update_job(job_id, scene_plan=scene_plan)
+                    except Exception:
+                        pass
             # La extensión viene de la key cacheada: para fondos humanos
             # puede ser .jpg/.png (imagen fija del usuario) y de ella
             # depende el manejo de stills aguas abajo. Antes estaba
@@ -12449,6 +15652,28 @@ def run_edit_pipeline(
                 # palindromee (si no, las escenas se reproducen en reversa al final).
                 if _is_scene_job:
                     bg_prelooped = True
+                    # Guard de duración (incidente 2026-07-10, job 53b9513225b1):
+                    # en un job dañado pre-#803, bg_r2_key_cached es un clip
+                    # único de ~8s, NO el timeline full-length que este branch
+                    # asume. Con bg_prelooped=True el render lo reproduce UNA
+                    # vez → 8s de imagen + resto NEGRO. Si el cache dura
+                    # bastante menos que el audio (tolerancia 3.5s = 3s del
+                    # fast-path libass + 0.5s LAST_SCENE_SAFETY), NO es un
+                    # timeline: lo loopeamos (feo pero nunca negro) y avisamos.
+                    try:
+                        _bg_dur = _ffprobe_duration(bg_image_path)
+                        _aud_dur = scene_plan.get("audio_duration") or _audio_duration(mp3_path)
+                        if _bg_dur and _aud_dur and (_aud_dur - _bg_dur) > 3.5:
+                            logger.warning(
+                                "[SCENES] cached bg de job multi-escena NO es un "
+                                "timeline full-length (%.1fs vs audio %.1fs, job=%s) "
+                                "— se loopea para evitar render negro; regenerá las "
+                                "escenas para recuperar la variedad",
+                                _bg_dur, _aud_dur, job_id,
+                            )
+                            bg_prelooped = False
+                    except Exception as _e:  # noqa: BLE001
+                        logger.warning("[SCENES] duration guard falló (%s) — sigo con prelooped", _e)
 
         elif edit_type == "background":
             # Cinturón del guard en request_edit (incidente 2026-07-01):
@@ -12461,31 +15686,40 @@ def run_edit_pipeline(
                     "regenerar escenas individuales (edit_type='scene')."
                 )
             update_job(job_id, status="editing", current_step="background", progress=22)
-            lyrics_text = " ".join(seg["text"] for seg in segments)
-            bg_image_path = _ensure_background(
-                style, job_dir,
-                lyrics_text=lyrics_text, artist=artist, job_id=job_id,
-                song_title=song_title, genre=genre, concept=concept,
-                movement_style=movement_style,
-                background_hint=background_hint,
-                bg_mode=background_mode,
-                bg_verbatim=bg_verbatim,
-                effect=effect,
-                allow_people=_compute_allow_people(job_id),
+            lyrics_text = " ".join(
+                str(seg.get("text") or "") for seg in segments
+                if isinstance(seg, dict)
             )
+            try:
+                bg_image_path = _ensure_background(
+                    style, job_dir,
+                    lyrics_text=lyrics_text, artist=artist, job_id=job_id,
+                    song_title=song_title, genre=genre, concept=concept,
+                    movement_style=movement_style,
+                    background_hint=background_hint,
+                    bg_mode=background_mode,
+                    bg_verbatim=bg_verbatim,
+                    effect=effect,
+                    allow_people=_compute_allow_people(job_id, background_hint),
+                )
+            except Exception as _background_generation_error:
+                _raise_if_job_timeout(_background_generation_error)
+                # Imagen can raise before returning an asset (Veo normally
+                # degrades internally).  A provider failure must not strand a
+                # Universal/common AI edit in ``error`` or ``validation_failed``.
+                logger.error(
+                    "[EDIT] background generation failed job=%s; using safe "
+                    "local fallback: %s",
+                    job_id, _background_generation_error,
+                )
+                bg_image_path = _write_safe_gradient_background(
+                    job_dir, style, filename="bg_edit_policy_fallback.mp4",
+                )
+                _force_policy_fallback = True
+                _policy_fallback_reason = "background_generation_error"
             update_job(job_id, progress=35)
-            # Re-cache the new background so future typography edits work.
-            if bg_image_path and os.path.exists(bg_image_path) and storage.is_enabled():
-                try:
-                    _bg_ext = os.path.splitext(bg_image_path)[1] or ".mp4"
-                    new_bg_key = storage.upload_file(
-                        bg_image_path,
-                        f"backgrounds/{job_id}/bg_cached{_bg_ext}",
-                    )
-                    if new_bg_key:
-                        update_job(job_id, bg_r2_key_cached=new_bg_key)
-                except Exception as _e:
-                    logger.warning("[EDIT] Warning: re-cache of new background failed: %s", _e)
+            # Do not replace the last known-good cache until validation passes.
+            _pending_background_recache = True
 
         elif edit_type == "scene":
             # Regenerar UNA escena del storyboard y re-armar el timeline. Sólo
@@ -12503,23 +15737,300 @@ def run_edit_pipeline(
                     _scene_audio_dur = _audio_duration(mp3_path)
                 except Exception:
                     _scene_audio_dur = _ffprobe_duration(mp3_path)
-            bg_image_path, scene_plan = _regenerate_scene_background(
-                scene_plan, scene_key, job_dir,
-                artist=artist, song_title=song_title,
-                audio_duration=_scene_audio_dur,
-                concept=concept, allow_people=_compute_allow_people(job_id),
-                job_id=job_id,
-                prompt_override=scene_prompt_override, hint=scene_hint,
-                movement_style=scene_movement,
-                lyrics_text=lyrics_text, genre=genre,
-                style_hint=style, custom_colors=custom_colors,
-            )
-            bg_prelooped = True
-            # Persistir el plan actualizado (clip nuevo, cache_token, thumb).
-            update_job(job_id, scene_plan=scene_plan, progress=35)
+            try:
+                bg_image_path, scene_plan = _regenerate_scene_background(
+                    scene_plan, scene_key, job_dir,
+                    artist=artist, song_title=song_title,
+                    audio_duration=_scene_audio_dur,
+                    concept=concept,
+                    allow_people=_compute_allow_people(
+                        job_id,
+                        scene_prompt_override or scene_hint or _persisted_operator_prompt,
+                    ),
+                    job_id=job_id,
+                    prompt_override=scene_prompt_override, hint=scene_hint,
+                    movement_style=scene_movement,
+                    lyrics_text=lyrics_text, genre=genre,
+                    style_hint=style, custom_colors=custom_colors,
+                )
+                bg_prelooped = True
+                _scene_timeline_from_current_clips = True
+                # Persistir el plan actualizado (clip nuevo, cache_token, thumb).
+                update_job(job_id, scene_plan=scene_plan, progress=35)
+                # Re-cachear el timeline re-armado — sin esto la reparación de un
+                # "Otra toma" era efímera: el próximo edit de tipografía volvía al
+                # cache viejo (incidente 2026-07-10: cache = clip único de 8s de un
+                # job dañado pre-#803 → render negro).
+                _pending_scene_recache = True
+            except Exception as _scene_generation_error:
+                _raise_if_job_timeout(_scene_generation_error)
+                logger.error(
+                    "[EDIT] scene regeneration failed job=%s scene=%s; using "
+                    "safe local fallback: %s",
+                    job_id, scene_key, _scene_generation_error,
+                )
+                bg_image_path = _write_safe_gradient_background(
+                    job_dir, style, filename="bg_edit_policy_fallback.mp4",
+                )
+                bg_prelooped = False
+                _scene_timeline_from_current_clips = False
+                _pending_scene_recache = False
+                _pending_background_recache = True
+                _force_policy_fallback = True
+                _policy_fallback_reason = "scene_generation_error"
+                # The cached background is now a single deterministic asset,
+                # not the storyboard represented by the old plan.  Persisting
+                # that plan would make the next edit trust false provenance.
+                scene_plan = None
+                _pending_scene_plan_clear = True
+                update_job(job_id, progress=35)
+
+        elif edit_type == "background_library":
+            # Swap a un asset CURADO de biblioteca — la salida del loop no
+            # convergente de regens Veo (incidente Gaby 2026-07-08). Sin
+            # Veo, sin slot de edición (ver request_edit). El asset ya fue
+            # resuelto + tenant-gateado + auditado (AssetUsage) por el
+            # endpoint; acá solo lo materializamos y re-cacheamos.
+            #
+            # Cinturón del guard de request_edit: nunca pisar el timeline
+            # multi-escena cacheado con un asset único.
+            if scene_plan and scene_plan.get("scenes"):
+                raise RuntimeError(
+                    "background_library edit no soportado en jobs multi-escena — "
+                    "regenerar escenas individuales (edit_type='scene')."
+                )
+            update_job(job_id, status="editing", current_step="video", progress=30)
+            _lib = edit_params.get("library_bg") or {}
+            _lib_r2 = _lib.get("bg_r2_key")
+            _lib_path = _lib.get("bg_path")
+            # La extensión importa: los assets pueden ser imagen fija
+            # (.jpg/.png) y de ella depende el manejo de stills aguas
+            # abajo (mismo criterio que el cache de fondos humanos).
+            _lib_ext = os.path.splitext(_lib_r2 or _lib_path or "")[1].lower() or ".mp4"
+            bg_image_path = os.path.join(job_dir, f"bg_library_edit{_lib_ext}")
+            if not os.path.exists(bg_image_path):
+                if _lib_r2 and storage.is_enabled():
+                    if not storage.download_object(_lib_r2, bg_image_path):
+                        raise RuntimeError(
+                            f"Could not download library background {_lib_r2!r} from R2"
+                        )
+                elif _lib_path and os.path.exists(_lib_path):
+                    import shutil
+                    shutil.copyfile(_lib_path, bg_image_path)
+                else:
+                    raise RuntimeError(
+                        "background_library edit sin asset alcanzable "
+                        f"(bg_r2_key={_lib_r2!r}, bg_path={_lib_path!r})"
+                    )
+            bg_prelooped = False
+            # El asset elegido pasa a ser el fondo DURABLE del job: el
+            # recache post-render lo sube como backgrounds/{job}/bg_cached.*
+            # y actualiza bg_r2_key_cached — los edits posteriores de
+            # tipografía/lyrics lo reusan (espeja el camino human-provided).
+            _pending_background_recache = True
+            update_job(job_id, progress=35)
 
         else:
             raise ValueError(f"Unknown edit_type {edit_type!r}")
+
+        # Universal safety applies to every edit path, including cached
+        # typography/lyrics renders and single-scene regeneration.  The old
+        # pipeline only validated the initial YouTube path, so an edit could
+        # replace a compliant background with a person and still reach review.
+        _edit_operator_prompt = _operator_prompt_for_edit(
+            edit_type,
+            fresh_background_hint=background_hint,
+            persisted_operator_prompt=_persisted_operator_prompt,
+            scene_prompt_override=scene_prompt_override,
+            scene_hint=scene_hint,
+        )
+        _edit_ai_generated = (
+            True if edit_type in ("background", "scene") else
+            # Asset curado de biblioteca = misma clase que un fondo human-
+            # provided: NO generado por IA (cambia el short-circuit de
+            # validación Universal y la provenance del deliverable).
+            False if edit_type == "background_library" else
+            bool(_stored_background_ai_generated)
+        )
+        _edit_safety_policy = _background_safety_policy(
+            job_id, _edit_operator_prompt
+        )
+        if _force_policy_fallback:
+            _edit_ai_generated = False
+        merged["background_ai_generated"] = _edit_ai_generated
+        update_job(job_id, current_step="validation", progress=38)
+        _clips_already_validated = bool(
+            _force_policy_fallback
+            or (
+                scene_plan
+                and _scene_plan_has_current_clip_validation(
+                    scene_plan, job_id=job_id
+                )
+            )
+        )
+        if _force_policy_fallback:
+            update_job(job_id, validation_result={
+                "passed": True,
+                "issues": [],
+                "policy_reason": _edit_safety_policy["reason"],
+                "policy_version": _edit_safety_policy["policy_version"],
+                "policy_mode": _edit_safety_policy["policy_mode"],
+                "validation_scope": "deterministic_local_fallback",
+                "recovered_from_generation_error": True,
+                "recovery_reason": _policy_fallback_reason,
+            })
+        if scene_plan and (
+            not _clips_already_validated
+            or not _scene_timeline_from_current_clips
+        ):
+            try:
+                _dense_audio_duration = scene_plan.get("audio_duration")
+                if not _dense_audio_duration:
+                    try:
+                        _dense_audio_duration = _audio_duration(mp3_path)
+                    except Exception:
+                        _dense_audio_duration = _ffprobe_duration(mp3_path)
+                bg_image_path = _densely_revalidate_scene_plan_for_edit(
+                    scene_plan,
+                    job_dir,
+                    artist=artist,
+                    song_title=song_title,
+                    concept=concept,
+                    job_id=job_id,
+                    audio_duration=_dense_audio_duration,
+                )
+                bg_prelooped = True
+                _scene_timeline_from_current_clips = True
+                _clips_already_validated = True
+                # The current render is already safe even if recache later
+                # fails. Mark it for best-effort recache; every future reuse
+                # edit rebuilds again and therefore cannot trust a stale key.
+                _pending_scene_recache = True
+                update_job(job_id, scene_plan=scene_plan)
+            except Exception as _dense_error:
+                _raise_if_job_timeout(_dense_error)
+                logger.error(
+                    "[SCENES] dense edit revalidation failed job=%s: %s",
+                    job_id, _dense_error,
+                )
+                if _edit_safety_policy["is_umg"] or _edit_ai_generated:
+                    # Preserve the storyboard diagnostics, but render this
+                    # revision over a deterministic clean background. A bad or
+                    # unverifiable scene clip must never reject the whole
+                    # Universal video.
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style, filename="bg_edit_policy_fallback.mp4",
+                    )
+                    bg_prelooped = False
+                    _scene_timeline_from_current_clips = False
+                    _clips_already_validated = True
+                    _edit_ai_generated = False
+                    merged["background_ai_generated"] = False
+                    _pending_scene_recache = False
+                    _pending_background_recache = True
+                    scene_plan = None
+                    _pending_scene_plan_clear = True
+                    update_job(job_id, validation_result={
+                        "passed": True,
+                        "issues": [],
+                        "policy_reason": _edit_safety_policy["reason"],
+                        "policy_version": _edit_safety_policy["policy_version"],
+                        "policy_mode": _edit_safety_policy["policy_mode"],
+                        "validation_scope": "deterministic_local_fallback",
+                        "recovered_from_scene_validation_error": True,
+                    })
+                else:
+                    if edit_type == "scene" and _scene_plan_before_edit is not None:
+                        update_job(job_id, scene_plan=_scene_plan_before_edit)
+                    update_job(
+                        job_id,
+                        status="validation_failed",
+                        error=(
+                            "Could not densely validate every storyboard clip under "
+                            "the current background policy. Regenerate the affected "
+                            "scene and retry."
+                        ),
+                    )
+                    return
+        if not _clips_already_validated:
+            _edit_validation_ok = _validate_background_asset_for_job(
+                job_id,
+                bg_image_path,
+                _edit_operator_prompt,
+                ai_generated=_edit_ai_generated,
+                failure_status=None,
+            )
+            if not _edit_validation_ok:
+                _recover_edit_background = bool(
+                    _edit_safety_policy["is_umg"] or _edit_ai_generated
+                )
+                if _recover_edit_background and edit_type == "background":
+                    try:
+                        _retry_path = _ensure_background(
+                            style, job_dir,
+                            lyrics_text=lyrics_text, artist=artist,
+                            job_id=job_id, song_title=song_title,
+                            genre=genre, concept=concept,
+                            movement_style=movement_style,
+                            background_hint=background_hint,
+                            bg_mode=background_mode,
+                            bg_verbatim=bg_verbatim,
+                            effect=effect,
+                            allow_people=_edit_safety_policy["allow_people"],
+                            atmospherics_policy=(
+                                _edit_safety_policy["atmospherics_policy"]
+                            ),
+                            generation_nonce=f"edit-policy-recovery-{job_id}",
+                        )
+                        if _retry_path and os.path.exists(_retry_path):
+                            _edit_validation_ok = _validate_background_asset_for_job(
+                                job_id,
+                                _retry_path,
+                                _edit_operator_prompt,
+                                ai_generated=True,
+                                failure_status=None,
+                            )
+                            if _edit_validation_ok:
+                                bg_image_path = _retry_path
+                    except Exception as _edit_recovery_error:
+                        _raise_if_job_timeout(_edit_recovery_error)
+                        logger.warning(
+                            "[VALIDATION] edit background recovery failed job=%s: %s",
+                            job_id, _edit_recovery_error,
+                        )
+
+                if _recover_edit_background and not _edit_validation_ok:
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style, filename="bg_edit_policy_fallback.mp4",
+                    )
+                    bg_prelooped = False
+                    _edit_ai_generated = False
+                    merged["background_ai_generated"] = False
+                    _pending_scene_recache = False
+                    _pending_background_recache = True
+                    if scene_plan is not None:
+                        scene_plan = None
+                        _pending_scene_plan_clear = True
+                    _edit_validation_ok = True
+                    update_job(job_id, validation_result={
+                        "passed": True,
+                        "issues": [],
+                        "policy_reason": _edit_safety_policy["reason"],
+                        "policy_version": _edit_safety_policy["policy_version"],
+                        "policy_mode": _edit_safety_policy["policy_mode"],
+                        "validation_scope": "deterministic_local_fallback",
+                        "recovered_from_unsafe_generation": True,
+                    })
+
+                if not _edit_validation_ok:
+                    if edit_type == "scene" and _scene_plan_before_edit is not None:
+                        update_job(job_id, scene_plan=_scene_plan_before_edit)
+                    update_job(
+                        job_id,
+                        status="validation_failed",
+                        error="Content policy violation detected in background asset.",
+                    )
+                    return
 
         # ----------------------------------------------------------------
         # Resolve font — misma elección para video Y short, persistida
@@ -12610,6 +16121,27 @@ def run_edit_pipeline(
             audio_dur = _ffprobe_duration(mp3_path)
         _verify_deliverables(job_dir, files, audio_dur)
 
+        # Stage the new background cache only after the complete edit rendered
+        # and verified successfully. The DB commit is deferred until the
+        # render_params write below so cache key, scene plan and provenance land
+        # atomically. A failed/disabled R2 upload keeps every old value paired.
+        _new_background_cache_key = None
+        if _pending_background_recache and storage.is_enabled():
+            try:
+                _bg_ext = os.path.splitext(bg_image_path)[1] or ".mp4"
+                _new_background_cache_key = storage.upload_file(
+                    bg_image_path, f"backgrounds/{job_id}/bg_cached{_bg_ext}",
+                )
+            except Exception as _e:
+                _raise_if_job_timeout(_e)
+                _new_background_cache_key = None
+                logger.warning(
+                    "[EDIT] Warning: post-render background re-cache failed: %s",
+                    _e,
+                )
+        if _pending_scene_recache:
+            _recache_scene_timeline(job_id, bg_image_path)
+
         # Archive previous deliverables to {key}.vN before the upload
         # overwrites them. Non-fatal — if storage.copy_object errors out
         # for some keys we still want the new render to land. The
@@ -12681,8 +16213,22 @@ def run_edit_pipeline(
 
         _cleanup_local_intermediates(job_dir)
 
-        # Persist the merged render params so the next edit sees them.
-        update_job(job_id, render_params=merged)
+        # Persist the merged render params so the next edit sees them. When a
+        # new background cache is involved, commit cache key + optional scene
+        # clear + provenance in this same update. If the cache upload failed,
+        # retain the old provenance because the old cache/plan remain active.
+        _final_state_updates = {"render_params": merged}
+        if _pending_background_recache:
+            if _new_background_cache_key:
+                merged["background_ai_generated"] = _edit_ai_generated
+                _final_state_updates["bg_r2_key_cached"] = _new_background_cache_key
+                if _pending_scene_plan_clear:
+                    _final_state_updates["scene_plan"] = None
+            else:
+                merged["background_ai_generated"] = bool(
+                    _stored_background_ai_generated
+                )
+        update_job(job_id, **_final_state_updates)
 
         # For lyrics edits, also persist the new segments so subsequent
         # actions (another edit, a retry) see the corrected version.
@@ -12713,11 +16259,16 @@ def run_edit_pipeline(
         )
 
     except Exception as exc:
+        _raise_if_job_timeout(exc)
         logger.error("[EDIT] job=%s FAILED: %s", job_id, exc, exc_info=True)
         from error_taxonomy import classify_error
+        error_category = (
+            "storage_upload" if isinstance(exc, StorageUploadError)
+            else classify_error(str(exc))
+        )
         update_job(
             job_id, status="error", error=f"Edit failed: {exc}",
-            error_category=classify_error(str(exc)),
+            error_category=error_category,
         )
         _write_edit_audit(
             action="job.edit_failed",
@@ -12734,7 +16285,12 @@ def run_edit_pipeline(
         # source from input_r2_key on retry). `input_r2_key` is a local set
         # partway through, and `job_dir` may not exist yet on a very early
         # failure — locals().get + the helper's own isdir guard make this safe.
-        if locals().get("input_r2_key"):
+        if isinstance(exc, StorageUploadError):
+            logger.warning(
+                "[R2] preserving local edit outputs after exhausted upload retries: %s",
+                locals().get("job_dir"),
+            )
+        elif locals().get("input_r2_key"):
             _cleanup_job_dir_on_failure(locals().get("job_dir"))
         else:
             try:

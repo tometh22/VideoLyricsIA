@@ -207,6 +207,8 @@ def test_enqueue_pipeline_attaches_retry_metadata():
                 f"expected retries_left={queue_jobs.PIPELINE_RETRY_MAX}, "
                 f"got {rq_job.retries_left}"
             )
+            assert rq_job.meta["rq_payload_version"] == queue_jobs.RQ_PAYLOAD_VERSION
+            assert rq_job.meta["rq_payload_kind"] == "pipeline"
             # on_failure callback wiring is harder to inspect across RQ
             # versions (sometimes stored as failure_callback, sometimes
             # as _failure_callback_name). Settle for: the attribute

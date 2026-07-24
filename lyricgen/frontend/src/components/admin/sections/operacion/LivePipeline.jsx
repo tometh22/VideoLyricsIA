@@ -64,6 +64,9 @@ function JobStatus({ job }) {
           </span>
         </div>
       )}
+      {(job.status === "rejected" || job.status === "validation_failed") && typeof job.progress === "number" && (
+        <p className="mt-1.5 text-label text-gray-500">Progreso técnico: {job.progress}% · Resultado: {job.status === "rejected" ? "rechazado" : "falló validación"}</p>
+      )}
     </div>
   );
 }

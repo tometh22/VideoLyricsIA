@@ -3,20 +3,19 @@ import { useI18n } from "../i18n";
 import Listbox from "./Listbox";
 import { UploadTour } from "./OnboardingTour";
 import WizardLivePreview from "./WizardLivePreview";
-import TitleCardPreview from "./TitleCardPreview";
+import TitleCardPreview, { AUTO_INTRO_THRESHOLD_S } from "./TitleCardPreview";
 import HelpTip from "./HelpCenter/HelpTip";
+import ContentValidationToggle from "./ContentValidationToggle";
 import { track } from "../lib/telemetryTrack";
+import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
+import { CONCEPT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
+import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBackgroundPreviewTokens";
 
 const API = import.meta.env.VITE_API_URL || "";
 
 function authHeaders() {
   const token = localStorage.getItem("genly_token");
   return token ? { Authorization: `Bearer ${token}` } : {};
-}
-
-function tokenParam() {
-  const token = localStorage.getItem("genly_token");
-  return token ? `token=${encodeURIComponent(token)}` : "";
 }
 
 // Maximum tracks per batch. Aligned with the per-tenant backlog cap
@@ -48,7 +47,6 @@ const LYRIC_RENDER_FIELDS = new Set([
   "lyricsAnimation", "lineTransition", "lyricColor", "lyricSungColor",
 ]);
 
-const SAMPLE_LYRIC = "Como el viento que se va";
 function applyTextCase(text, c) {
   if (c === "upper") return text.toUpperCase();
   if (c === "title") return text.replace(/\b\w/g, (ch) => ch.toUpperCase());
@@ -166,6 +164,12 @@ export default function UploadZone({
   // user.features.scenes; el backend re-valida igual.
   enableScenes = false,
   onEnableScenesChange,
+  // Art track ("official audio"): tipo de video = master audio + cover, sin
+  // letra. Cuando está activo se oculta la parte de letra y el CTA genera
+  // directo (art_track=true).
+  artTrack = false,
+  onArtTrackChange,
+  onGenerateArtTrack,
   backgroundFile,
   onBackgroundFile,
   backgroundId,
@@ -187,10 +191,17 @@ export default function UploadZone({
   onGenerateDirect,
   user,
   sidebarOpen = true,
-  // 2026-05-23: auto-transcribe en background al drop. La función recibe los
-  // newEntries recién agregados y arranca uploads + transcripciones en
-  // segundo plano. La status map per file viene del App via filesnamekey.
-  onAutoTranscribe,
+  // Prefetch de transcripción disparado al AVANZAR del paso "Subí" (no al
+  // drop): cuando el operador deja el paso 1 hacia adelante, la fuente de
+  // letra + la letra oficial ya están elegidas por canción, así el POST
+  // /transcribe-uploaded sale con el anchor_lyrics correcto. App corre las
+  // uploads + transcripciones en background. La status map per file viene
+  // del App via filenamekey.
+  onUploadAdvance,
+  // Edge case (a): editar la fuente de letra / letra oficial de una canción
+  // tras haber avanzado invalida el prefetch de ESE archivo (App borra su
+  // entrada de cache) para forzar el re-transcribe con el estado nuevo.
+  onInvalidatePrefetch,
   transcribeStatusByFile = {},
   // Phase 2 (2026-05-25): render prop para el paso 6 ("Lyrics"). App.jsx
   // sigue siendo dueño del state machine de review (transcribing,
@@ -212,6 +223,10 @@ export default function UploadZone({
   // WizardLivePreview lo lee con su propio rAF para renderizar word-jump
   // sincronizado al audio real, sin causar re-renders de UploadZone.
   playbackTickRef = null,
+  // 2026-07-16 (idea de Tomi): callback ref que recibe el <div> slot que
+  // montamos bajo el video en el paso 6. LyricsEditor portalea ahí su player
+  // bar, así la columna de la letra queda full y se scrollea menos.
+  onPlayerSlotRef = null,
   // Post-render edit mode (App.jsx EditLyricsRoute):
   // - lockedSteps: IDs de pasos no navegables (típicamente [1,2,3,5] en
   //   modo edición de un job ya renderizado — esos cambios requieren
@@ -255,6 +270,8 @@ export default function UploadZone({
   // back from /review (or any remount) preserves the operator's choice
   // of "ProRes 422 HQ" / frame size / fps, not just the file list.
   const [deliveryProfile, setDeliveryProfile] = useState(delivery?.delivery_profile || "youtube");
+  // Art track: línea legal opcional en pantalla (℗/© sello), per-batch.
+  const [labelLine, setLabelLine] = useState(delivery?.label_line || "");
   // umg_frame_size: now operator-selectable end-to-end. The pipeline
   // renders the source MP4 at the chosen UMG dims+fps (via
   // RenderSpec.umg_intermediate_master) so the lazy ProRes transcode
@@ -279,6 +296,7 @@ export default function UploadZone({
     onBgMode?.(m);
   };
   const [libraryBgs, setLibraryBgs] = useState([]);
+  const libraryPreviewTokens = useBackgroundPreviewTokens(libraryBgs.map((bg) => bg.id), API);
   const [libraryLoaded, setLibraryLoaded] = useState(false);
   const [libraryFetchFailed, setLibraryFetchFailed] = useState(false);
   // Library filter chip: all | image | video_cinematic | video_simple
@@ -329,7 +347,20 @@ export default function UploadZone({
       const parsed = JSON.parse(raw);
       // Merge keeps any future fields safe-defaulted when the user has an
       // older saved object missing the new key.
-      return { ...HARDCODED_BATCH_DEFAULTS, ...parsed };
+      //
+      // PERO el "Mi prompt" (backgroundHint + bgVerbatim) es POR-CANCIÓN, no
+      // un sticky de estilo: un prompt de escena que el operador escribió para
+      // una canción reaparecía en el batch SIGUIENTE (y se aplicaba a temas que
+      // no le pegan, o forzaba el modo "Mi prompt" sin querer). Persistimos los
+      // sticky de estilo (tipografía/tamaño/movimiento/case/…) pero forzamos el
+      // prompt LIMPIO en cada carga. El override va DESPUÉS del spread de
+      // `parsed`, así también limpia el localStorage ya contaminado.
+      return {
+        ...HARDCODED_BATCH_DEFAULTS,
+        ...parsed,
+        backgroundHint: HARDCODED_BATCH_DEFAULTS.backgroundHint,
+        bgVerbatim: HARDCODED_BATCH_DEFAULTS.bgVerbatim,
+      };
     } catch {
       return HARDCODED_BATCH_DEFAULTS;
     }
@@ -346,6 +377,25 @@ export default function UploadZone({
   // animation control again. The toggle pill above the preview lets
   // the operator override either way.
   const [previewFace, setPreviewFace] = useState("lyrics");
+  // Discoverability fix (incidente Clari 19-jul, "no encuentro dónde
+  // agrandar el título"): los controles de la portada (Disposición +
+  // Tamaño del título) viven AL FONDO del panel de tipografía, debajo
+  // de todos los controles de la letra — hay que scrollear para verlos.
+  // Cuando el operador mira la cara "Portada" del preview (por la
+  // pestaña o por auto-flip), llevamos su vista a esos controles y los
+  // resaltamos un instante, así el control existente (que ya es fiel y
+  // llega al render) queda a la vista.
+  const portadaControlsRef = useRef(null);
+  const [portadaControlsPulse, setPortadaControlsPulse] = useState(false);
+  useEffect(() => {
+    if (previewFace !== "title") return;
+    const el = portadaControlsRef.current;
+    if (!el) return; // controles no montados en este paso — no-op
+    el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    setPortadaControlsPulse(true);
+    const tid = setTimeout(() => setPortadaControlsPulse(false), 1800);
+    return () => clearTimeout(tid);
+  }, [previewFace]);
   // Wrap updateBatchDefault below so any field that belongs to the
   // Portada bucket flips the preview. Defined inline to capture the
   // setter without juggling refs.
@@ -383,6 +433,36 @@ export default function UploadZone({
 
   const [hoverCaseBatch, setHoverCaseBatch] = useState(null);
   const [hoverCaseRow, setHoverCaseRow] = useState(null); // { idx, code }
+  // "Regenerar fondo (nueva versión)" en edición: intención explícita de re-tirar
+  // el fondo con el mismo hint. Se propaga a currentReview vía onEditFieldChange
+  // (NO updateBatchDefault: no debe persistir en localStorage — es una acción,
+  // no un sticky default). Fixea el caso "quería otra versión y decía 'No
+  // cambiaste nada'".
+  const [regenRequested, setRegenRequested] = useState(false);
+  const toggleRegenRequested = () => {
+    const next = !regenRequested;
+    setRegenRequested(next);
+    onEditFieldChange?.("forceBackgroundRegen", next);
+  };
+  // Modificadores del regen de fondo IA — paridad con la tarjeta "Regenerar
+  // fondo" que se plegó al wizard (unificación #973). Como forceBackgroundRegen,
+  // son ACCIÓN (no sticky default): se propagan a currentReview vía
+  // onEditFieldChange y App los inyecta en el payload sólo si el edit es un
+  // regen IA (edit_type="background").
+  //   - regenEngine: "veo" (default, cinemático ~US$0.90) | "imagen" (foto
+  //     animada ~US$0.03, sin riesgo de caras humanas).
+  //   - regenValidation: true = validar (default); false = fondo-libre (bypass,
+  //     sólo cuentas no-UMG; el toggle esconde el bypass para UMG).
+  const [regenEngine, setRegenEngine] = useState("veo");
+  const chooseRegenEngine = (m) => {
+    setRegenEngine(m);
+    onEditFieldChange?.("bgRegenEngine", m);
+  };
+  const [regenValidation, setRegenValidation] = useState(true);
+  const setRegenValidationChoice = (v) => {
+    setRegenValidation(v);
+    onEditFieldChange?.("bgRegenValidation", v);
+  };
 
   // ── Scene MODE (Studio Console redesign) ────────────────────────────────
   // The 3 modes map onto existing state (no new backend contract):
@@ -397,6 +477,19 @@ export default function UploadZone({
   // backend manda vía features.scenes (admin OR SCENES_ENABLED_TENANTS), pero
   // los admin siempre califican aunque la sesión cacheada no traiga el flag.
   const scenesEligible = user?.features?.scenes === true || user?.role === "admin";
+  // Art Track gateado por tenant (default OFF salvo admin). Si no califica,
+  // no mostramos el selector de tipo de video (queda solo lyric, como antes
+  // de la feature) y reseteamos artTrack si vino prendido de un estado viejo.
+  // Kill-switch de build: Art Track NO va a producción (2026-07-22). El build
+  // de prod (genly.pro) no setea VITE_ART_TRACK_ENABLED → la feature queda
+  // totalmente oculta (ni admins la ven). Se habilita por entorno para testeo
+  // (staging: VITE_ART_TRACK_ENABLED=true); ahí sigue gateada por feature/admin.
+  const ART_TRACK_ENABLED = import.meta.env.VITE_ART_TRACK_ENABLED === "true";
+  const artTrackEligible =
+    ART_TRACK_ENABLED && (user?.features?.art_track === true || user?.role === "admin");
+  useEffect(() => {
+    if (artTrack && !artTrackEligible) onArtTrackChange?.(false);
+  }, [artTrack, artTrackEligible]);
   const [showScenesUpsell, setShowScenesUpsell] = useState(false);
   // Costo en créditos del add-on Escenas. El backend lo expone en
   // features.scenes_credit_cost; default 3 (valor de lanzamiento) si la sesión
@@ -436,14 +529,17 @@ export default function UploadZone({
   const selectSceneMode = (m) => {
     track("wizard.scene_mode", { mode: m });
     setSceneMode(m);
+    // Keep the legacy `match_lyrics` payload deterministic. "Mi prompt"
+    // must not inherit whichever card happened to be selected before it.
+    // Public payload fields remain unchanged: Auto/Prompt=false, Lyrics=true.
+    onInspiredByLyricsChange && onInspiredByLyricsChange(
+      inspiredByLyricsForSceneMode(m),
+    );
     if (m === "auto") {
-      onInspiredByLyricsChange && onInspiredByLyricsChange(false);
       if (_hint) updateBatchDefault("backgroundHint", "");   // stale prompt must not override
     } else if (m === "lyrics") {
-      onInspiredByLyricsChange && onInspiredByLyricsChange(true);
       if (_hint) updateBatchDefault("backgroundHint", "");
     }
-    // prompt: leave inspired as-is; the textarea below drives it.
     // Nota: multi-escena (enableScenes) es ORTOGONAL — funciona con cualquiera
     // de los 3 modos; su toggle premium vive debajo de las cards.
   };
@@ -461,6 +557,18 @@ export default function UploadZone({
     return "";
   })();
   const _previewLyric = _reviewFirstLine || (files[0]?.songTitle || files[0]?.title || "").trim();
+
+  // Start (seconds) of the first sung line, mirroring the backend's
+  // `first_lyric_start = segments[0]["start"]` (ass_render.title_card_lines).
+  // Lets TitleCardPreview resolve the "auto" title template the same way the
+  // render does (long intro → centered hero, short intro → compact badge)
+  // instead of always assuming the hero. null when transcription hasn't
+  // produced segments yet; the preview falls back to the hero and self-corrects
+  // once they arrive.
+  const _firstLyricStart =
+    Array.isArray(reviewSegments) && typeof reviewSegments[0]?.start === "number"
+      ? reviewSegments[0].start
+      : null;
 
   // ── Studio Console stepper ─────────────────────────────────────────────
   // 4 steps revealed one at a time (variant A): the left rail navigates,
@@ -507,7 +615,12 @@ export default function UploadZone({
   // lockedSteps (post-render edit): IDs no navegables. goStep bail-outs y
   // los helpers prev/next saltean los locked para que la sticky bar muestre
   // el siguiente paso navegable real, no uno que el operador no puede usar.
-  const _lockedSet = new Set(lockedSteps);
+  // Art track: el movimiento (paso 3), la tipografía (paso 4) y la letra
+  // (paso 6) NO aplican — el estilo es fijo (cover blureada + cover con sombra
+  // + waveform), sin estilos de movimiento ni efectos. Se bloquean para que la
+  // navegación los saltee (mismo mecanismo que el edit mode). Quedan: 1 (Subí),
+  // 2 (Modo/cover) y 5 (Entregá).
+  const _lockedSet = new Set([...lockedSteps, ...(artTrack ? [3, 4, 6] : [])]);
   const _findPrevUnlocked = (n) => {
     for (let i = n - 1; i >= 1; i--) if (!_lockedSet.has(i)) return i;
     return null;
@@ -521,6 +634,15 @@ export default function UploadZone({
     if (_lockedSet.has(clamped)) return;
     if (clamped !== wizardStep) {
       track("wizard.step", { step_from: wizardStep, step_to: clamped, trigger: "nav" });
+    }
+    // Prefetch de transcripción al dejar el paso "Subí" hacia adelante: la
+    // fuente de letra + la letra oficial ya están elegidas por canción, así
+    // que el POST /transcribe-uploaded sale con el anchor_lyrics correcto
+    // (fix bug staging e77f84aefe33). Solo en el wizard nuevo (sin
+    // lockedSteps) y solo al AVANZAR desde el paso 1.
+    if (wizardStep === 1 && clamped > 1 && _lockedSet.size === 0
+        && typeof onUploadAdvance === "function") {
+      onUploadAdvance();
     }
     setWizardStep(clamped);
   };
@@ -578,7 +700,7 @@ export default function UploadZone({
     if (code === "karaoke") {
       return (
         <span className={base}>
-          {["tu", "letra"].map((w, i) => (
+          {t("upload.sample_words").split(" ").map((w, i) => (
             <span key={i} style={{ animation: `acard-karaoke 2.4s ${i * 0.5}s infinite`, marginRight: i === 0 ? "0.28em" : 0, display: "inline-block" }}>{w}</span>
           ))}
         </span>
@@ -587,7 +709,7 @@ export default function UploadZone({
     if (code === "word_reveal") {
       return (
         <span className={base}>
-          {["tu", "letra"].map((w, i) => (
+          {t("upload.sample_words").split(" ").map((w, i) => (
             <span key={i} style={{ animation: `acard-word 2.6s ${i * 0.45}s infinite`, marginRight: i === 0 ? "0.28em" : 0, display: "inline-block" }}>{w}</span>
           ))}
         </span>
@@ -597,7 +719,7 @@ export default function UploadZone({
       code === "pop" ? "acard-pop 2.2s infinite" :
       code === "glow" ? "acard-glow 2.4s ease-in-out infinite" :
       "acard-word 2.8s infinite"; // none → simple fade loop
-    return <span className={base} style={{ animation: anim, display: "inline-block" }}>Letra</span>;
+    return <span className={base} style={{ animation: anim, display: "inline-block" }}>{t("upload.preview_lyric")}</span>;
   };
 
   // Looping mini-demo of a line transition (movement), shown inside its card.
@@ -611,7 +733,7 @@ export default function UploadZone({
       "acard-word 2.8s infinite"; // none → simple fade
     return (
       <span className="overflow-hidden inline-block">
-        <span className={base} style={{ animation: anim, display: "inline-block" }}>Letra</span>
+        <span className={base} style={{ animation: anim, display: "inline-block" }}>{t("upload.preview_lyric")}</span>
       </span>
     );
   };
@@ -626,6 +748,19 @@ export default function UploadZone({
     });
   };
 
+  // Versión B (letra anclada): selector prominente de dos opciones por
+  // canción — "Transcripción con IA de Genly" (default) vs "Tengo la letra
+  // oficial" (expande el textarea; viaja como `anchor_lyrics` en
+  // /transcribe-uploaded y el backend la ancla al motor CTC). La elección
+  // vive en entry.lyricsSource ("auto" | "official") — App.jsx solo manda
+  // anchor_lyrics cuando la selección es "official", así volver a la IA
+  // desactiva el anclado sin perder el texto pegado. Gate por
+  // features.anchor_lyrics (ANCHOR_LYRICS_ENABLED en el server): sin flag
+  // no se muestra, así no prometemos una sincronización que el backend va
+  // a ignorar. Iteración #908→v2 (feedback dueño de producto 15/07): el
+  // toggle colapsado era invisible y no comunicaba la alternativa.
+  const anchorLyricsEligible = user?.features?.anchor_lyrics === true;
+
   useEffect(() => {
     if (!onDeliveryChange) return;
     onDeliveryChange({
@@ -633,8 +768,13 @@ export default function UploadZone({
       umg_frame_size: umgFrameSize,
       umg_fps: umgFps,
       umg_prores_profile: umgProresProfile,
+      label_line: labelLine,
+      // Art track moving effect (batch-wide). The art-track submit path
+      // builds its own FormData and reads it from here (the lyric path
+      // sends per-song effect instead).
+      effect: batchDefaults.effect || "",
     });
-  }, [deliveryProfile, umgFrameSize, umgFps, umgProresProfile, onDeliveryChange]);
+  }, [deliveryProfile, umgFrameSize, umgFps, umgProresProfile, labelLine, batchDefaults.effect, onDeliveryChange]);
 
   useEffect(() => {
     if (bgMode === "library" && !libraryLoaded) {
@@ -738,13 +878,22 @@ export default function UploadZone({
   // pan lateral. Cada card lleva metadata `kind` (video|image|auto) +
   // emoji prefix (🎬 vs 🖼) en la descripción para que el operador vea
   // de un vistazo cuál es video real vs foto IA con paneo.
+  // Los CÓDIGOS viven en lib/catalogCodes.js (contrato de paridad con
+  // pipeline._MOVEMENT_STYLE_RULES, asertado por renderParity.test.js);
+  // acá solo la metadata de UI por código.
+  const MOVEMENT_META = {
+    estatico:        { kind: "video", label: t("upload.movement_estatico") || "Estático (escena viva)",     sample: "/movement_samples/estatico.mp4",  desc: t("upload.movement_estatico_desc") || "🎬 Escena real con cámara FIJA. Lo que se mueve son los elementos de la escena (gente, olas, nubes, neblina, fuego)." },
+    sutil:           { kind: "video", label: t("upload.movement_sutil") || "Sutil (cámara apenas drift)",   sample: "/movement_samples/sutil.mp4",     desc: t("upload.movement_sutil_desc") || "🎬 Escena real con drift sutil de cámara + motion in-scene. Calmo pero vivo." },
+    estandar:        { kind: "video", label: t("upload.movement_estandar") || "Estándar (cinematográfico)", sample: "/movement_samples/estandar.mp4",  desc: t("upload.movement_estandar_desc") || "🎬 Escena real con movimiento cinematográfico de cámara (zoom/drift)." },
+    "foto-parallax": { kind: "image", label: t("upload.movement_foto_parallax") || "Foto fija",             sample: "/movement_samples/foto-fija.jpg", desc: t("upload.movement_parallax_desc") || "Foto IA fija (sin movimiento de cámara). Sumale un efecto abajo —lluvia, nieve, luces— para darle vida." },
+    animado:         { kind: "video", label: t("upload.movement_animado") || "Animado (ilustración)",       sample: "/movement_samples/animado.mp4",   desc: t("upload.movement_animado_desc") || "🎬 Ilustración 2D estilizada animada, no fotorrealista." },
+  };
   const MOVEMENT_STYLES = [
-    { code: "",              kind: "auto",  label: t("upload.movement_auto") || "Auto",                                  sample: null,                                  desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
-    { code: "estatico",      kind: "video", label: t("upload.movement_estatico") || "Estático (escena viva)",            sample: "/movement_samples/estatico.mp4",       desc: t("upload.movement_estatico_desc") || "🎬 Escena real con cámara FIJA. Lo que se mueve son los elementos de la escena (gente, olas, nubes, neblina, fuego)." },
-    { code: "sutil",         kind: "video", label: t("upload.movement_sutil") || "Sutil (cámara apenas drift)",          sample: "/movement_samples/sutil.mp4",          desc: t("upload.movement_sutil_desc") || "🎬 Escena real con drift sutil de cámara + motion in-scene. Calmo pero vivo." },
-    { code: "estandar",      kind: "video", label: t("upload.movement_estandar") || "Estándar (cinematográfico)",        sample: "/movement_samples/estandar.mp4",       desc: t("upload.movement_estandar_desc") || "🎬 Escena real con movimiento cinematográfico de cámara (zoom/drift)." },
-    { code: "foto-parallax", kind: "image", label: t("upload.movement_foto_parallax") || "Foto fija",                     sample: "/movement_samples/foto-fija.jpg",      desc: t("upload.movement_parallax_desc") || "Foto IA fija (sin movimiento de cámara). Sumale un efecto abajo —lluvia, nieve, luces— para darle vida." },
-    { code: "animado",       kind: "video", label: t("upload.movement_animado") || "Animado (ilustración)",              sample: "/movement_samples/animado.mp4",       desc: t("upload.movement_animado_desc") || "🎬 Ilustración 2D estilizada animada, no fotorrealista." },
+    { code: "", kind: "auto", label: t("upload.movement_auto") || "Auto", sample: null, desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
+    ...MOVEMENT_CODES.map((code) => ({
+      code,
+      ...(MOVEMENT_META[code] || { kind: "video", label: code, sample: null, desc: "" }),
+    })),
   ];
 
   // Effect overlay — animated particles composited OVER the background (the
@@ -797,23 +946,28 @@ export default function UploadZone({
   // _CONCEPT_SCENE_GUIDE keys in pipeline.py — keep in sync. UMG asked
   // for this on top of genre because the genre alone wasn't tight enough
   // to control the visual register.
+  // Los CÓDIGOS viven en lib/catalogCodes.js (contrato de paridad con
+  // pipeline._CONCEPT_SCENE_GUIDE, asertado por renderParity.test.js).
+  const CONCEPT_LABELS = {
+    naturaleza:  t("upload.concept_naturaleza") || "Naturaleza",
+    tropical:    t("upload.concept_tropical") || "Tropical",
+    acuatico:    t("upload.concept_acuatico") || "Acuático",
+    ciudad:      t("upload.concept_ciudad") || "Ciudad",
+    urbano:      t("upload.concept_urbano") || "Urbano",
+    industrial:  t("upload.concept_industrial") || "Industrial",
+    abstracto:   t("upload.concept_abstracto") || "Abstracto",
+    cosmico:     t("upload.concept_cosmico") || "Cósmico",
+    atmosferico: t("upload.concept_atmosferico") || "Atmosférico",
+    romantico:   t("upload.concept_romantico") || "Romántico",
+    vintage:     t("upload.concept_vintage") || "Vintage",
+    cinematic:   t("upload.concept_cinematic") || "Cinematic",
+    club:        t("upload.concept_club") || "Club",
+    lujo:        t("upload.concept_lujo") || "Lujo",
+    minimalista: t("upload.concept_minimalista") || "Minimalista",
+  };
   const CONCEPTS = [
-    { code: "",             label: t("upload.concept_auto") || "Auto" },
-    { code: "naturaleza",   label: t("upload.concept_naturaleza") || "Naturaleza" },
-    { code: "tropical",     label: t("upload.concept_tropical") || "Tropical" },
-    { code: "acuatico",     label: t("upload.concept_acuatico") || "Acuático" },
-    { code: "ciudad",       label: t("upload.concept_ciudad") || "Ciudad" },
-    { code: "urbano",       label: t("upload.concept_urbano") || "Urbano" },
-    { code: "industrial",   label: t("upload.concept_industrial") || "Industrial" },
-    { code: "abstracto",    label: t("upload.concept_abstracto") || "Abstracto" },
-    { code: "cosmico",      label: t("upload.concept_cosmico") || "Cósmico" },
-    { code: "atmosferico",  label: t("upload.concept_atmosferico") || "Atmosférico" },
-    { code: "romantico",    label: t("upload.concept_romantico") || "Romántico" },
-    { code: "vintage",      label: t("upload.concept_vintage") || "Vintage" },
-    { code: "cinematic",    label: t("upload.concept_cinematic") || "Cinematic" },
-    { code: "club",         label: t("upload.concept_club") || "Club" },
-    { code: "lujo",         label: t("upload.concept_lujo") || "Lujo" },
-    { code: "minimalista",  label: t("upload.concept_minimalista") || "Minimalista" },
+    { code: "", label: t("upload.concept_auto") || "Auto" },
+    ...CONCEPT_CODES.map((code) => ({ code, label: CONCEPT_LABELS[code] || code })),
   ];
 
   const FONTS = [
@@ -995,13 +1149,12 @@ export default function UploadZone({
 
     // Audit 2026-05-26 (#388 wizard-duplicate-jobs): compute remaining,
     // accepted, and newEntries OUTSIDE the setState callback. Side
-    // effects that fire inside a reducer (setBatchTruncated, the
-    // onAutoTranscribe Promise.resolve dance the old code did) get
+    // effects that fire inside a reducer (setBatchTruncated, y el
+    // auto-transcribe al drop que hacía el código viejo) get
     // double-invoked under React StrictMode (dev) and CAN double-invoke
-    // in production if React decides to abort+retry a render. The
-    // duplicate auto-transcribe call was creating two upload jobs +
-    // two transcription jobs per drop — visible in the admin as the
-    // "4 jobs for one audio" pile-up reported 2026-05-26.
+    // in production if React decides to abort+retry a render. El disparo
+    // de transcripción se movió al avance de paso (onUploadAdvance), pero
+    // mantener estos cálculos fuera del reducer sigue siendo correcto.
     //
     // We can do all the math here because the parent passes `files`
     // as a prop (line 117), so we know the current count without
@@ -1037,16 +1190,12 @@ export default function UploadZone({
 
     // Pure reducer — safe under StrictMode double-invoke.
     onFiles((prev) => [...prev, ...newEntries]);
-
-    // 2026-05-23: trigger auto-transcribe en el drop. Antes el upload se
-    // difería hasta "Revisar" (bloqueaba al operador ~15-20s viendo un
-    // spinner). Ahora arranca en background mientras el operador elige
-    // wizard options. Cuando llega a "Revisar" los segments están cacheados.
-    // Now fired AFTER the setState dispatch, OUTSIDE the reducer — single
-    // call per drop regardless of StrictMode / render aborts.
-    if (typeof onAutoTranscribe === "function") {
-      onAutoTranscribe(newEntries);
-    }
+    // NOTA: la transcripción NO arranca acá. Antes (2026-05-23) el trigger
+    // vivía en el drop, pero eso disparaba el prefetch cuando la fuente de
+    // letra todavía era el default "IA" y la letra oficial no estaba pegada
+    // → job sin anclar (bug staging e77f84aefe33). Ahora el prefetch se
+    // dispara al avanzar del paso "Subí" (goStep → onUploadAdvance), con la
+    // fuente de letra ya resuelta por canción.
   };
 
   const handleDrop = (e) => {
@@ -1056,6 +1205,16 @@ export default function UploadZone({
   };
 
   const updateField = (idx, field, value) => {
+    // Edge case (a): si el operador cambia la fuente de letra o edita la
+    // letra oficial de una canción que YA disparó su prefetch (volvió al
+    // paso "Subí" tras avanzar), invalidamos ese prefetch para que la
+    // transcripción se rehaga con el estado nuevo (el job cacheado salió
+    // con el anchor anterior). Solo aplica a esos dos campos.
+    if ((field === "lyricsSource" || field === "anchorLyrics")
+        && typeof onInvalidatePrefetch === "function") {
+      const entry = files[idx];
+      if (entry?.file) onInvalidatePrefetch(entry.file);
+    }
     onFiles((prev) =>
       prev.map((entry, i) => (i === idx ? { ...entry, [field]: value } : entry))
     );
@@ -1172,6 +1331,24 @@ export default function UploadZone({
           </div>
         </div>
       )}
+      {artTrack && (
+        <div className="mt-3 space-y-1" onClick={(e) => e.stopPropagation()}>
+          <label className="text-[10px] uppercase tracking-[0.18em] text-gray-500 block">
+            {t("upload.label_line_label") || "Línea legal / sello (opcional)"}
+          </label>
+          <input
+            type="text"
+            maxLength={120}
+            value={labelLine}
+            onChange={(e) => setLabelLine(e.target.value)}
+            placeholder={t("upload.label_line_placeholder") || "℗ 2026 Nombre del sello"}
+            className="w-full sm:w-96 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-brand/60"
+          />
+          <p className="text-[11px] text-gray-500">
+            {t("upload.label_line_hint") || "Se muestra chica abajo a la izquierda del video, en todos los formatos."}
+          </p>
+        </div>
+      )}
     </div>
   );
 
@@ -1254,6 +1431,41 @@ export default function UploadZone({
     </div>
   );
 
+  // Video type selector (Lyric Video vs Art Track). Shown both in the
+  // empty-state (pre-upload) and in step 1, so the operator picks the type
+  // before or right after adding audio. Hidden entirely when Art Track isn't
+  // enabled for this account (feature gate) — then there's only one type.
+  const _videoTypeSelector = !artTrackEligible ? null : (
+    <div className="mb-5">
+      <div className="text-label text-gray-400 mb-2">
+        {t("upload.video_type") || "Tipo de video"}
+      </div>
+      <div className="flex gap-1 p-1 glass rounded-xl w-fit">
+        {[
+          { id: false, label: t("upload.video_type_lyrics") || "Lyric Video" },
+          { id: true, label: t("upload.video_type_art") || "Art Track" },
+        ].map((m) => (
+          <button
+            key={String(m.id)}
+            type="button"
+            onClick={() => onArtTrackChange?.(m.id)}
+            className={`px-4 py-1.5 rounded-lg text-label transition-all ${
+              artTrack === m.id ? "bg-brand text-white" : "text-gray-400 hover:text-white"
+            }`}
+          >
+            {m.label}
+          </button>
+        ))}
+      </div>
+      {artTrack && (
+        <p className="mt-2 text-sm text-gray-400 max-w-xl">
+          {t("upload.video_type_art_hint") ||
+            "Master audio + cover, sin letra. Subí la portada en el paso “Modo”; el video muestra el cover centrado sobre un fondo difuminado con movimiento sutil."}
+        </p>
+      )}
+    </div>
+  );
+
   const _dropZone = (
       <div
         data-tour="upload-dropzone"
@@ -1318,6 +1530,37 @@ export default function UploadZone({
   // Los sub-bloques internos siguen con sus propios checks
   // (`files.length > 1` para acciones de batch) — esos correctamente
   // se ocultan si no hay archivos.
+  // Preset interno SOLO-ADMIN: la "receta UMG Argentina" derivada del análisis
+  // de los videos aprobados de Universal (may–jul 2026). Un click rellena el
+  // wizard con los settings de menor retrabajo (fuente grande, estático,
+  // mayúsculas, sin escenas, ProRes/HD). El operador puede ajustar cualquiera
+  // antes de generar. NO cambia defaults del servidor ni del tenant, y no se
+  // expone en el portal de descargas de UMG — solo rellena el formulario, igual
+  // que si se tipeara a mano. Gateado por role=admin en el JSX.
+  const applyUmgArgentinaRecipe = () => {
+    track("wizard.preset", { preset: "umg_argentina" });
+    // Fondo: Auto (AI) + inspirado en la letra; sin multi-escena.
+    onStyleChange?.("auto");
+    onBgMode?.("auto");
+    selectSceneMode("lyrics");        // match_lyrics=true, sin hint
+    onEnableScenesChange?.(false);
+    // Render (batchDefaults; el fan-out interno los aplica también por canción).
+    updateBatchDefault("movementStyle", "estatico");
+    updateBatchDefault("font", "poppins-bold");
+    updateBatchDefault("fontScale", "1.3");
+    updateBatchDefault("textCase", "upper");
+    updateBatchDefault("lyricsAnimation", "none");
+    updateBatchDefault("lineTransition", "none");
+    updateBatchDefault("effect", "");
+    updateBatchDefault("titleTemplate", "auto");
+    updateBatchDefault("frameFormat", "full");
+    // Entrega: master ProRes + YouTube, HD / 24fps / ProRes 422 HQ.
+    setDeliveryProfile("both");
+    setUmgFrameSize("HD");
+    setUmgFps(24);
+    setUmgProresProfile(3);
+  };
+
   const _batchSettingsBlock = (files.length > 0 || editMode) ? (
     <div className="mt-3 glass rounded-card px-4 py-4">
       <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-3">
@@ -1325,6 +1568,27 @@ export default function UploadZone({
           ? (t("upload.batch_settings_title") || "Configuración del lote")
           : (t("upload.single_settings_title") || "Ajustes del video")}
       </p>
+
+      {user?.role === "admin" && !editMode && (
+        <div className="mb-3 flex items-center justify-between gap-3 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-3 py-2.5">
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5">
+              <span className="rounded-full bg-accent/[0.08] px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent ring-1 ring-accent/20">{t("upload.recipe_umg_badge") || "Admin"}</span>
+              <span className="text-[11px] font-medium text-gray-200">{t("upload.recipe_umg_title") || "Receta UMG Argentina"}</span>
+            </div>
+            <p className="text-[10px] text-gray-600 mt-0.5">
+              {t("upload.recipe_umg_desc") || "Rellena los settings de menor retrabajo. Podés ajustar cualquiera antes de generar."}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={applyUmgArgentinaRecipe}
+            className="shrink-0 rounded-full bg-brand text-white text-[11px] font-medium px-3 py-1.5 hover:opacity-90 transition-opacity"
+          >
+            {t("upload.recipe_umg_apply") || "Aplicar"}
+          </button>
+        </div>
+      )}
 
       {bgMode !== "auto" && (
         <div className="mb-3 rounded-lg bg-surface-1/60 ring-1 ring-white/[0.05] px-3 py-2 text-[11px] text-gray-400">
@@ -1468,6 +1732,68 @@ export default function UploadZone({
       {bgMode === "auto" && (
         <div className="mb-4 pt-3 border-t border-white/[0.05]">
           <p className="text-[11px] text-gray-400 font-medium">{t("upload.scene_meta_title") || "Escena"}</p>
+          {editMode && (
+            <div className="mt-2 mb-3 flex items-center justify-between gap-3 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-3 py-2.5">
+              <div className="min-w-0">
+                <p className="text-[11px] font-medium text-gray-200">
+                  {t("upload.regen_bg_title") || "Regenerar fondo (nueva versión)"}
+                </p>
+                <p className="text-[10px] text-gray-600 mt-0.5">
+                  {t("upload.regen_bg_desc") || "Genera otra versión del fondo con IA, aunque no cambies el texto. Mantiene letra y tiempos."}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={toggleRegenRequested}
+                aria-pressed={regenRequested}
+                className={`shrink-0 rounded-full text-[11px] font-medium px-3 py-1.5 transition-colors ${
+                  regenRequested
+                    ? "bg-brand text-white"
+                    : "bg-surface-3/60 text-gray-300 ring-1 ring-white/[0.06] hover:text-white"
+                }`}
+              >
+                {regenRequested ? (t("upload.regen_bg_on") || "Se regenerará ✓") : (t("upload.regen_bg_cta") || "Regenerar")}
+              </button>
+            </div>
+          )}
+          {/* Modificadores del regen de fondo IA (unificación #973): motor
+              Veo/Imagen + política de validación. Paridad con la tarjeta
+              "Regenerar fondo" removida. Sólo en edición. */}
+          {editMode && (
+            <div className="mb-3 space-y-2">
+              <div>
+                <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-1.5">
+                  {t("upload.regen_engine_label") || "Motor del fondo"}
+                </p>
+                <div className="rounded-xl bg-surface-2/40 ring-1 ring-white/[0.05] p-1 flex gap-1">
+                  {[
+                    { id: "veo", label: t("edit.bg_mode_veo") || "Video cinematográfico", hint: t("edit.bg_mode_veo_hint") || "~15 min · cámaras y motion" },
+                    { id: "imagen", label: t("edit.bg_mode_imagen") || "Foto animada", hint: t("edit.bg_mode_imagen_hint") || "~30s · zoom suave" },
+                  ].map((m) => (
+                    <button
+                      key={m.id}
+                      type="button"
+                      onClick={() => chooseRegenEngine(m.id)}
+                      className={`flex-1 px-3 py-2 rounded-lg text-label transition-colors flex flex-col items-center gap-0.5 ${
+                        regenEngine === m.id
+                          ? "bg-brand/20 text-brand-light ring-1 ring-brand/30"
+                          : "text-gray-400 hover:text-white hover:bg-white/[0.04]"
+                      }`}
+                    >
+                      <span>{m.label}</span>
+                      <span className="text-[9px] opacity-70">{m.hint}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <ContentValidationToggle
+                value={regenValidation}
+                onChange={setRegenValidationChoice}
+                tenantId={user?.tenant_id}
+                billingGroup={user?.billing_group}
+              />
+            </div>
+          )}
           <p className="text-[10px] text-gray-600 mt-0.5 mb-2">
             {sceneMode === "prompt"
               ? (t("upload.scene_meta_prompt_note") || "Tu prompt define la escena — género y concepto quedan como ayuda secundaria.")
@@ -1512,15 +1838,19 @@ export default function UploadZone({
       </div>
 
       {/* Text case pill buttons: MAY / Aa / min / ori */}
-      <div className="mb-3">
+      <div className="mb-3" data-tour="upload-text-case">
         <div className="flex items-center gap-2">
           <span className="text-[11px] text-gray-600 shrink-0">{t("upload.text_case_label") || "Texto:"}</span>
+          <span className="rounded-full bg-accent/[0.08] px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent ring-1 ring-accent/20">
+            {t("whatsnew.new_badge") || "Nuevo"}
+          </span>
+          <HelpTip text={t("announce.typocase_tagline")} />
           <div className="flex gap-1">
             {TEXT_CASE_OPTS.map((opt) => (
               <button
                 key={opt.code}
                 type="button"
-                title={opt.label}
+                title={opt.code === "sentence" ? `${opt.label} · ${t("announce.typocase_tagline")}` : opt.label}
                 onClick={() => updateBatchDefault("textCase", opt.code)}
                 onMouseEnter={() => setHoverCaseBatch(opt.code)}
                 onMouseLeave={() => setHoverCaseBatch(null)}
@@ -1536,9 +1866,9 @@ export default function UploadZone({
         {hoverCaseBatch && (
           <div className="mt-1.5 px-3 py-1.5 rounded-md bg-black/40 ring-1 ring-white/[0.06] flex items-baseline gap-2 animate-fade-in">
             <span className="text-[11px] font-mono text-white/80 tracking-wide">
-              {applyTextCase(SAMPLE_LYRIC, hoverCaseBatch)}
+              {applyTextCase(t("upload.sample_lyric"), hoverCaseBatch)}
             </span>
-            <span className="text-[10px] text-gray-600">← así quedarán tus letras</span>
+            <span className="text-[10px] text-gray-600">← {t("upload.case_preview_help")}</span>
           </div>
         )}
       </div>
@@ -1546,15 +1876,19 @@ export default function UploadZone({
       {/* Frame format: Pantalla completa (16:9) / Cine (franjas 2.39:1).
           El letterbox se aplica determinísticamente en post — look de cine
           intencional, opuesto a las barras estocásticas de Veo. */}
-      <div className="mb-3">
+      <div className="mb-3" data-tour="upload-frame-format">
         <div className="flex items-center gap-2">
           <span className="text-[11px] text-gray-600 shrink-0">{t("upload.frame_format_label") || "Formato:"}</span>
+          <span className="rounded-full bg-accent/[0.08] px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent ring-1 ring-accent/20">
+            {t("whatsnew.new_badge") || "Nuevo"}
+          </span>
+          <HelpTip text={t("announce.cinema_tagline")} />
           <div className="flex gap-1">
             {FRAME_FORMAT_OPTS.map((opt) => (
               <button
                 key={opt.code}
                 type="button"
-                title={opt.label}
+                title={opt.code === "cine" ? `${opt.label} · ${t("announce.cinema_tagline")}` : opt.label}
                 onClick={() => updateBatchDefault("frameFormat", opt.code)}
                 className={`px-2.5 py-1 rounded-md text-[11px] font-mono font-bold transition-all
                   ${(batchDefaults.frameFormat || "full") === opt.code
@@ -1674,10 +2008,10 @@ export default function UploadZone({
                   const st = transcribeStatusByFile[k];
                   if (!st) return null;
                   const label = {
-                    uploading:    { txt: "📤 Subiendo…",       cls: "text-blue-400" },
-                    queued:       { txt: "🕓 En cola",          cls: "text-gray-400" },
-                    transcribing: { txt: "🎙 Transcribiendo…", cls: "text-brand-light" },
-                    done:         { txt: "✓ Listo para revisar", cls: "text-accent" },
+                    uploading:    { txt: `📤 ${t("status.awaiting_upload")}`, cls: "text-blue-400" },
+                    queued:       { txt: `🕓 ${t("status.queued")}`, cls: "text-gray-400" },
+                    transcribing: { txt: `🎙 ${t("status.transcribing")}`, cls: "text-brand-light" },
+                    done:         { txt: `✓ ${t("upload.ready_to_review")}`, cls: "text-accent" },
                     error:        { txt: `✗ ${st.error || "Error"}`, cls: "text-red-400" },
                   }[st.status] || { txt: st.status, cls: "text-gray-500" };
                   return (
@@ -1689,8 +2023,8 @@ export default function UploadZone({
               </div>
               <button
                 onClick={(e) => removeFile(i, e)}
-                aria-label="Descartar este audio"
-                title="Descartar este audio"
+                aria-label={t("upload.discard_audio")}
+                title={t("upload.discard_audio")}
                 className="shrink-0 w-7 h-7 rounded-lg hover:bg-red-500/10 flex items-center justify-center text-gray-300 hover:text-red-400 transition-colors"
               >
                 <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -1763,27 +2097,205 @@ export default function UploadZone({
                   </p>
                 )}
               </div>
+              {/* Todo lo relacionado a la LETRA (versión en vivo, fuente de
+                  letra, idioma de transcripción) NO aplica a art tracks —
+                  rinden sin letra y saltean Whisper. Solo se muestra en lyric
+                  video. */}
+              {!artTrack && (<>
               {/* Toggle "versión en vivo" (06/07): arma la auditoría
                   acústica del final aunque el título no diga "live" —
                   las letras publicadas suelen ser de la versión de
                   estudio y el final del vivo difiere. Si el título ya
                   tiene marcador live, el backend lo detecta solo. */}
-              <label className="flex items-start gap-2 cursor-pointer select-none">
+              <label className={`live-version-toggle flex items-start gap-2.5 rounded-xl border p-2.5 cursor-pointer select-none ${entry.live ? "is-active" : ""}`}>
                 <input
                   type="checkbox"
                   checked={!!entry.live}
                   onChange={(e) => updateField(i, "live", e.target.checked)}
-                  className="mt-0.5 accent-brand"
+                  className="sr-only"
                 />
-                <span>
-                  <span className="text-[12px] text-gray-300 font-medium">
+                <span className="live-version-toggle__check mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-md border" aria-hidden="true">
+                  <svg className={`h-2.5 w-2.5 transition-opacity ${entry.live ? "opacity-100" : "opacity-0"}`} viewBox="0 0 12 12" fill="none">
+                    <path d="m2.2 6.1 2.3 2.2L9.9 3" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-[12px] text-gray-300 font-medium">
                     {t("upload.live_version") || "Versión en vivo"}
                   </span>
-                  <span className="block text-[11px] text-gray-600">
+                  <span className="block text-[11px] leading-relaxed text-gray-500">
                     {t("upload.live_version_hint") || "Marcalo si es un show en vivo: revisamos el final contra el audio."}
                   </span>
                 </span>
               </label>
+              {/* Source of lyrics: Genly AI is the safe default. The official
+                  lyrics path is an intentional upgrade, and only becomes
+                  "ready" once there is actual text to anchor. */}
+              {anchorLyricsEligible && (() => {
+                const isOfficial = entry.lyricsSource === "official";
+                const lineCount = (entry.anchorLyrics || "")
+                  .split("\n").filter((l) => l.trim()).length;
+                const lineBadge = lineCount === 1
+                  ? (t("upload.anchor_lyrics_line") || "1 línea")
+                  : (t("upload.anchor_lyrics_lines", { n: lineCount }) || "{n} líneas").replace("{n}", lineCount);
+                const isReady = isOfficial && lineCount > 0;
+                const readyMessage = t("upload.anchor_lyrics_ready", { n: lineCount }) || `${lineBadge} listos para sincronizar`;
+                return (
+                  <section data-testid={`lyrics-source-${i}`} className="lyrics-source relative overflow-hidden rounded-2xl border">
+                    <div className="lyrics-source__halo absolute -right-12 -top-14 h-36 w-36 rounded-full pointer-events-none" />
+                    <div className="relative px-3.5 pt-3.5 pb-3">
+                      <div className="flex items-start gap-2.5 mb-3">
+                        <span className="lyrics-source__mark w-8 h-8 rounded-xl flex items-center justify-center shrink-0">
+                          <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3Z" strokeLinecap="round" strokeLinejoin="round" />
+                            <path d="m19 16 .7 2.3L22 19l-2.3.7L19 22l-.7-2.3L16 19l2.3-.7L19 16Z" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </span>
+                        <span className="min-w-0">
+                          <span className="block text-[10px] uppercase tracking-[0.16em] font-semibold text-brand-light/80">
+                            {t("upload.lyrics_source_label") || "Letra"}
+                          </span>
+                          <span className="block text-[13px] leading-tight font-semibold text-white mt-0.5">
+                            {t("upload.lyrics_source_heading") || "Elegí cómo trabajar la letra"}
+                          </span>
+                          <span className="block text-[11px] leading-snug text-gray-500 mt-1">
+                            {t("upload.lyrics_source_heading_sub") || "Podés dejar que Genly la detecte o usar tu versión oficial."}
+                          </span>
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2" role="radiogroup"
+                        aria-label={t("upload.lyrics_source_label") || "Letra"}>
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={!isOfficial}
+                        data-testid={`lyrics-source-ai-${i}`}
+                        onClick={() => updateField(i, "lyricsSource", "auto")}
+                        className={`lyrics-source__choice group relative min-h-[108px] overflow-hidden rounded-xl border p-3 text-left transition-all duration-200 ${!isOfficial ? "is-active" : ""}
+                          ${!isOfficial
+                            ? "border-brand/70"
+                            : "border-white/[0.07]"}`}
+                      >
+                        {!isOfficial && <span className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-violet-200/80 to-transparent" />}
+                        <span className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+                          !isOfficial ? "bg-white/15 text-white" : "bg-white/[0.06] text-gray-400 group-hover:text-gray-200"
+                        }`} aria-hidden="true">
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+                            <path d="m12 3 1.3 4.2L17.5 8.5l-4.2 1.3L12 14l-1.3-4.2-4.2-1.3 4.2-1.3L12 3Z" strokeLinecap="round" strokeLinejoin="round" />
+                            <path d="M5 15v4M3 17h4M19 16v3M17.5 17.5h3" strokeLinecap="round" />
+                          </svg>
+                        </span>
+                        <span className="block mt-2">
+                          <span className={`block text-[12px] font-semibold ${!isOfficial ? "text-white" : "text-gray-200"}`}>
+                            {t("upload.lyrics_source_ai") || "Transcripción con IA de Genly"}
+                          </span>
+                          <span className={`block mt-1 text-[11px] leading-snug ${!isOfficial ? "text-violet-100/65" : "text-gray-500"}`}>
+                            {t("upload.lyrics_source_ai_sub") || "Detectamos y sincronizamos la letra automáticamente."}
+                          </span>
+                        </span>
+                        <span className={`absolute right-2.5 top-2.5 flex h-4 w-4 items-center justify-center rounded-full border ${
+                          !isOfficial ? "border-white/60 bg-white text-brand" : "border-white/[0.16]"
+                        }`} aria-hidden="true">
+                          {!isOfficial && <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6" strokeLinecap="round" strokeLinejoin="round" /></svg>}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={isOfficial}
+                        data-testid={`lyrics-source-official-${i}`}
+                        onClick={() => updateField(i, "lyricsSource", "official")}
+                        className={`lyrics-source__choice group relative min-h-[108px] overflow-hidden rounded-xl border p-3 text-left transition-all duration-200 ${isOfficial ? "is-active" : ""}
+                          ${isOfficial
+                            ? "border-brand/70"
+                            : "border-white/[0.07]"}`}
+                      >
+                        {isOfficial && <span className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-violet-200/80 to-transparent" />}
+                        <span className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+                          isOfficial ? "bg-white/15 text-white" : "bg-white/[0.06] text-gray-400 group-hover:text-gray-200"
+                        }`} aria-hidden="true">
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+                            <path d="M7 3.5h7L19 8v12.5H7z" strokeLinecap="round" strokeLinejoin="round" />
+                            <path d="M14 3.5V8h5M10 12h6M10 15h6" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </span>
+                        <span className="block mt-2">
+                          <span className={`block text-[12px] font-semibold ${isOfficial ? "text-white" : "text-gray-200"}`}>
+                            {t("upload.lyrics_source_official") || "Tengo la letra oficial"}
+                          </span>
+                          <span className={`block mt-1 text-[11px] leading-snug ${isOfficial ? "text-violet-100/65" : "text-gray-500"}`}>
+                            {t("upload.lyrics_source_official_sub") || "Úsala cuando necesitás que el texto coincida exactamente."}
+                          </span>
+                        </span>
+                        {lineCount > 0 && (
+                          <span className="absolute bottom-2.5 left-3 text-[10px] font-semibold text-violet-200 tabular-nums">
+                            {lineBadge}
+                          </span>
+                        )}
+                        <span className={`absolute right-2.5 top-2.5 flex h-4 w-4 items-center justify-center rounded-full border ${
+                          isOfficial ? "border-white/60 bg-white text-brand" : "border-white/[0.16]"
+                        }`} aria-hidden="true">
+                          {isOfficial && <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6" strokeLinecap="round" strokeLinejoin="round" /></svg>}
+                        </span>
+                      </button>
+                      </div>
+                    {isOfficial && (
+                      <div className="mt-3 border-t border-white/[0.07] pt-3 animate-fade-in">
+                        <div className="flex items-center justify-between gap-3 mb-1.5">
+                          <label className="block text-[11px] font-medium text-gray-200">
+                          {t("upload.anchor_lyrics_input_label") || "Pegá la letra oficial"}
+                          </label>
+                          <span className="text-[10px] text-gray-600">
+                            {t("upload.anchor_lyrics_format_hint") || "TXT · sin tiempos"}
+                          </span>
+                        </div>
+                        <textarea
+                          value={entry.anchorLyrics || ""}
+                          onChange={(e) => updateField(i, "anchorLyrics", e.target.value)}
+                          onPaste={(e) => {
+                            // Algunos orígenes (Word, PDF, ciertos sitios de letras)
+                            // separan versos con CRLF, CR solo o los separadores
+                            // Unicode U+2028/U+2029. El <textarea> NO dibuja esos como
+                            // salto → la letra quedaba pegada en un bloque aunque el
+                            // contador (split "\n") marcaba bien las líneas. Normalizamos
+                            // a "\n" en el pegado. Si no hay separadores raros, dejamos
+                            // el paste nativo (preserva cursor/undo).
+                            const raw = e.clipboardData?.getData("text");
+                            if (raw == null) return;
+                            const normalized = raw.replace(/\r\n?/g, "\n").replace(/[\u2028\u2029]/g, "\n");
+                            if (normalized === raw) return;
+                            e.preventDefault();
+                            const el = e.target;
+                            const start = el.selectionStart ?? el.value.length;
+                            const end = el.selectionEnd ?? el.value.length;
+                            const next = (el.value.slice(0, start) + normalized + el.value.slice(end)).slice(0, 20000);
+                            updateField(i, "anchorLyrics", next);
+                          }}
+                          placeholder={t("upload.anchor_lyrics_placeholder") || "Pegá la letra acá — una línea por verso, sin timestamps."}
+                          rows={6}
+                          maxLength={20000}
+                          className="w-full px-3 py-2.5 rounded-xl bg-black/20 border border-white/[0.08]
+                            focus:border-brand/70 focus:ring-2 focus:ring-brand/10 focus:outline-none text-sm text-white placeholder-gray-600
+                            transition-all resize-y leading-relaxed"
+                        />
+                        <div className={`mt-2 flex items-center gap-1.5 text-[11px] ${isReady ? "text-emerald-300" : "text-amber-300/90"}`} aria-live="polite">
+                          <svg className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" aria-hidden="true">
+                            {isReady
+                              ? <path d="m5 12 4 4L19 6" strokeLinecap="round" strokeLinejoin="round" />
+                              : <><path d="M12 9v4M12 17h.01" strokeLinecap="round" /><path d="M10.3 3.5 2.9 16.2A2 2 0 0 0 4.6 19h14.8a2 2 0 0 0 1.7-2.8L13.7 3.5a2 2 0 0 0-3.4 0Z" strokeLinejoin="round" /></>}
+                          </svg>
+                          <span>
+                            {isReady
+                              ? readyMessage
+                              : (t("upload.anchor_lyrics_required") || "Pegá al menos una línea para activar la sincronización exacta.")}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                    </div>
+                  </section>
+                );
+              })()}
               {/* Language pills. Default 'es' is highlighted on file
                   load — operator can click another to override, or
                   click 'auto' to let Whisper detect (not recommended
@@ -1803,6 +2315,7 @@ export default function UploadZone({
                   >{l.code || (t("lang.auto") || "auto")}</button>
                 ))}
               </div>
+              </>)}
 
               {/* Personalizar toggle — only shown in batch mode (2+ songs) */}
               {files.length > 1 && (
@@ -1874,10 +2387,14 @@ export default function UploadZone({
                   <div>
                     <div className="flex items-center gap-2">
                       <span className="text-[11px] text-gray-600 shrink-0">{t("upload.text_case_label") || "Texto:"}</span>
+                      <span className="rounded-full bg-accent/[0.08] px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent ring-1 ring-accent/20">
+                        {t("whatsnew.new_badge") || "Nuevo"}
+                      </span>
+                      <HelpTip text={t("announce.typocase_tagline")} />
                       <div className="flex gap-1">
                         {TEXT_CASE_OPTS.map((opt) => (
                           <button key={opt.code} type="button"
-                            title={opt.label}
+                            title={opt.code === "sentence" ? `${opt.label} · ${t("announce.typocase_tagline")}` : opt.label}
                             onClick={() => updateField(i, "textCase", opt.code)}
                             onMouseEnter={() => setHoverCaseRow({ idx: i, code: opt.code })}
                             onMouseLeave={() => setHoverCaseRow(null)}
@@ -1893,9 +2410,9 @@ export default function UploadZone({
                     {hoverCaseRow?.idx === i && (
                       <div className="mt-1.5 px-3 py-1.5 rounded-md bg-black/40 ring-1 ring-white/[0.06] flex items-baseline gap-2 animate-fade-in">
                         <span className="text-[11px] font-mono text-white/80 tracking-wide">
-                          {applyTextCase(SAMPLE_LYRIC, hoverCaseRow.code)}
+                          {applyTextCase(t("upload.sample_lyric"), hoverCaseRow.code)}
                         </span>
-                        <span className="text-[10px] text-gray-600">← así quedarán tus letras</span>
+                        <span className="text-[10px] text-gray-600">← {t("upload.case_preview_help")}</span>
                       </div>
                     )}
                   </div>
@@ -1988,21 +2505,27 @@ export default function UploadZone({
           />
 
           <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
-            Fondo del video
+            {t("upload.video_background")}
             <HelpTip articleId="backgrounds" />
           </p>
           <p className="text-[11px] text-gray-600 mb-2 mt-0.5">
-            {bgMode === "auto" ? "IA genera un fondo único por canción"
-              : bgMode === "library" ? "Fondo compartido para todo el lote"
-              : "Tu fondo personalizado"}
+            {bgMode === "auto" ? t("upload.bg_auto_summary")
+              : bgMode === "library" ? t("upload.bg_library_summary")
+              : t("upload.bg_custom_summary")}
           </p>
 
-          {/* Mode selector */}
+          {/* Mode selector — oculto en art track (siempre cover custom). */}
+          {!artTrack && (
           <div className="flex gap-1 p-1 glass rounded-xl w-fit mb-3" data-tour="upload-bg-tabs">
             {[
               { id: "auto", label: t("upload.bg_auto") || "Generar con IA" },
               { id: "library", label: t("upload.bg_library") || "Library" },
-              { id: "custom", label: t("upload.bg_custom_tab") || "Upload" },
+              // "Subir el mío" (portada custom) NO se ofrece en edición: el
+              // backend /edit no tiene edit_type "custom" (valid_edit_types sin
+              // custom), así que elegirlo daba un no-op silencioso — el operador
+              // "cambiaba el fondo" y el botón de aprobar decía "No cambiaste
+              // nada". Fuera del wizard de edición sigue disponible al crear.
+              ...(editMode ? [] : [{ id: "custom", label: t("upload.bg_custom_tab") || "Upload" }]),
             ].map((m) => (
               <button
                 key={m.id}
@@ -2032,6 +2555,7 @@ export default function UploadZone({
               </button>
             ))}
           </div>
+          )}
 
           {/* Auto mode */}
           {bgMode === "auto" && (
@@ -2041,6 +2565,14 @@ export default function UploadZone({
                   <path d="M13 10V3L4 14h7v7l9-11h-7z"/>
                 </svg>
                 {t("upload.bg_auto_desc") || "AI will generate a unique background based on the song's mood and lyrics."}
+              </p>
+              {/* Copy honesto de no-convergencia (incidente Gaby 2026-07-08:
+                  3 regens "a ver si sale", cada una una escena distinta).
+                  Nombrar el comportamiento acá evita descubrirlo a $0.90
+                  el intento: la IA NO refina, reinterpreta. */}
+              <p className="text-[11px] text-amber-300/80 mt-2">
+                {t("upload.bg_ai_nonconverge_hint") ||
+                  "La IA reinterpreta la canción en cada generación: sin indicaciones, cada intento puede dar una escena totalmente distinta. Para un resultado exacto usá la Biblioteca o escribí tu propio prompt."}
               </p>
             </div>
           )}
@@ -2128,7 +2660,7 @@ export default function UploadZone({
                             <div className="aspect-video bg-black/30 relative">
                               {bg.file_type === "mp4" ? (
                                 <video
-                                  src={`${API}/backgrounds/${bg.id}/preview?${tokenParam()}`}
+                                  src={backgroundPreviewUrl(API, bg.id, libraryPreviewTokens[String(bg.id)]) || undefined}
                                   className="w-full h-full object-cover"
                                   preload="metadata"
                                   muted loop playsInline
@@ -2137,7 +2669,7 @@ export default function UploadZone({
                                 />
                               ) : (
                                 <img
-                                  src={`${API}/backgrounds/${bg.id}/preview?${tokenParam()}`}
+                                  src={backgroundPreviewUrl(API, bg.id, libraryPreviewTokens[String(bg.id)]) || undefined}
                                   className="w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-500"
                                   alt={bg.name}
                                   /* 80 assets full-res: sin lazy, el grid
@@ -2326,7 +2858,7 @@ export default function UploadZone({
     // page-scroll. pb-28 (clear del CTA flotante "Aprobar y generar") se
     // mantiene solo en mobile — en desktop el CTA es fixed bottom-0 con
     // su propio espacio. Mobile (<lg) no se toca: pb-28 + page-scroll.
-    <div className="w-full px-2 md:px-6 pb-28 lg:pb-0 lg:h-full lg:overflow-hidden lg:flex lg:flex-col">
+    <div className="wizard-workspace w-full px-2 md:px-6 pb-28 lg:pb-0 lg:h-full lg:overflow-hidden lg:flex lg:flex-col">
       <UploadTour user={user} />
       {/* Pre-upload short-circuit: drop zone-only layout aplica solo cuando
           NO hay contenido reviewable Y NO estamos en edit-mode. Sin estas
@@ -2339,6 +2871,7 @@ export default function UploadZone({
            so the dropzone doesn't feel like a 250px island floating in the
            viewport. Matches the visual weight of the Dashboard hero. */
         <div className="max-w-3xl mx-auto py-8 md:py-12 flex flex-col items-center justify-center min-h-[55vh]">
+          <div className="w-full">{_videoTypeSelector}</div>
           <div className="w-full">{_dropZone}</div>
           <p className="text-[11px] text-ink-secondary/60 mt-6 text-center max-w-md">
             {t("upload.empty_hint") || "Tip: para mejor calidad, usá audio sin clipping y con voz al frente de la mezcla."}
@@ -2370,14 +2903,12 @@ export default function UploadZone({
         const gridCols = isStep6
           ? "lg:grid-cols-[200px_minmax(360px,500px)_minmax(0,1fr)]"
           : "lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)]";
-        // 2026-05-26 — variante [.editor-focus-mode_&] colapsa este grid
-        // a 1 columna cuando el LyricsEditor prende "modo enfoque". Sin
-        // este override, el feature sólo agrandaba el max-h interno (~90px
-        // verticales) — invisible porque el operador ya tiene ~1124px de
-        // ancho en step 6. Con focus on, stepper + preview se ocultan
-        // (rules abajo) y la columna del editor toma los ~1500px de
-        // viewport. Body class emitida por LyricsEditor:367, cleanup en
-        // unmount → volver a step 4 reaparece el layout 3-col.
+        // Studio focus: when LyricsEditor emits `editor-focus-mode`, collapse
+        // the three-column wizard into a two-column editing workspace. The
+        // step rail disappears, but the live preview stays docked at a compact
+        // 320–400 px so the operator can keep watching the video while the
+        // timeline uses all remaining width. Returning to the regular mode
+        // restores the original three-column wizard automatically.
         return (
         // QA fix 2026-05-28: grid pasa a llenar el alto del padre y a ser
         // su propio scroll context en lg+. items-start mantiene la
@@ -2386,7 +2917,7 @@ export default function UploadZone({
         // lg:min-h-0 deja la grid ocupar el espacio que el flex-col
         // exterior le da. lg:overflow-hidden previene que la grid haga
         // overflow al body — el scroll vive en la columna RIGHT.
-        <div className={`flex flex-col lg:grid ${gridCols} [.editor-focus-mode_&]:lg:grid-cols-1 gap-6 items-start lg:items-stretch lg:h-full lg:min-h-0 lg:overflow-hidden lg:flex-1`}>
+        <div className={`wizard-workspace-grid flex flex-col lg:grid ${gridCols} [.editor-focus-mode_&]:lg:grid-cols-[clamp(320px,24vw,400px)_minmax(0,1fr)] gap-6 items-start lg:items-stretch lg:h-full lg:min-h-0 lg:overflow-hidden lg:flex-1`}>
 
         {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile).
             Paso 6 "Lyrics" se ve siempre; está deshabilitado hasta que
@@ -2399,7 +2930,7 @@ export default function UploadZone({
             step 6 para ganar espacio. Operador reportó que no se entendía
             qué era cada paso. Volvemos a mostrar labels SIEMPRE — el
             grid arriba se ajustó a 168 px de sidebar para acomodarlas. */}
-        <nav className="flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first [.editor-focus-mode_&]:hidden">
+        <nav className="wizard-step-rail flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first [.editor-focus-mode_&]:hidden">
           {WIZARD_STEPS.map((s) => {
             const isLyrics = s.id === 6;
             const lyricsDisabled = isLyrics && !hasReviewableContent;
@@ -2446,7 +2977,7 @@ export default function UploadZone({
             editando), y el max-width del contenedor se ajusta al
             grid column (260-320 px). Mantiene sticky para acompañar
             el scroll del timeline en el panel derecho. */}
-        <div className="lg:sticky lg:top-4 space-y-2 min-w-0 w-full [.editor-focus-mode_&]:hidden">
+        <div className="wizard-preview-stage lg:sticky lg:top-4 space-y-2 min-w-0 w-full">
           {/* UI v1.1 (2026-05-30): toggle pill — "Letra / Portada". The
               central preview shows whichever face is selected; the bottom
               fan-out of states (Lyrics editor, batch progress, ready, etc.)
@@ -2498,7 +3029,56 @@ export default function UploadZone({
                   ? batchDefaults.titleSongBreak.split("\n")
                   : null
               }
+              firstLyricStart={_firstLyricStart}
             />
+          ) : artTrack ? (
+            /* Art track: preview del layout real (cover blureada con scrim +
+               cover con sombra a la derecha + barras EQ latiendo + título en
+               zona segura), aproximación visual del render. */
+            <div className="relative w-full aspect-video rounded-xl overflow-hidden bg-black">
+              {customPreviewUrl ? (
+                <>
+                  <style>{`@keyframes atwave { 0%, 100% { transform: scaleY(0.45); } 50% { transform: scaleY(1); } }`}</style>
+                  <img src={customPreviewUrl} alt="" className="absolute inset-0 w-full h-full object-cover scale-110 blur-2xl brightness-50 saturate-[.75]" />
+                  {/* Moving effect (screen-blended, matching the render). */}
+                  {(() => {
+                    const fx = EFFECTS.find((e) => e.code === (batchDefaults.effect || "") && e.sample);
+                    return fx ? (
+                      <video key={fx.code} src={fx.sample} className="absolute inset-0 w-full h-full object-cover pointer-events-none mix-blend-screen" autoPlay loop muted playsInline />
+                    ) : null;
+                  })()}
+                  <div className="absolute inset-0 bg-gradient-to-r from-black/60 via-black/25 to-transparent" />
+                  <div className="absolute inset-0" style={{ boxShadow: "inset 0 0 120px 40px rgba(0,0,0,0.45)" }} />
+                  <img src={customPreviewUrl} alt="" className="absolute top-1/2 right-[8%] -translate-y-1/2 h-[62%] aspect-square object-cover rounded shadow-2xl shadow-black/70 ring-1 ring-white/10" />
+                  <div className="absolute left-[9%] top-[38%] text-[8px] md:text-[10px] uppercase tracking-[0.35em] text-white/60 drop-shadow">{t("arttrack.official_audio") || "Official Audio"}</div>
+                  <div className="absolute left-[9%] top-[44%] flex items-center gap-[4px] h-[16%]">
+                    {Array.from({ length: 24 }).map((_, i) => (
+                      <span
+                        key={i}
+                        className="w-[7px] bg-white/90 rounded-full"
+                        style={{
+                          height: `${30 + Math.abs(Math.sin(i * 1.7)) * 65}%`,
+                          animation: "atwave 1.1s ease-in-out infinite",
+                          animationDelay: `${(i % 7) * 90}ms`,
+                        }}
+                      />
+                    ))}
+                  </div>
+                  <div className="absolute left-[9%] top-[66%] max-w-[44%] text-white">
+                    <div className="font-bold text-lg md:text-2xl leading-tight drop-shadow line-clamp-2">{titlePreviewSong || t("upload.video_type_art") || "Art Track"}</div>
+                    <div className="text-sm md:text-base text-white/85 drop-shadow">{titlePreviewArtist}</div>
+                  </div>
+                  {(labelLine || "").trim() ? (
+                    <div className="absolute left-[9%] bottom-[6%] text-[9px] md:text-[11px] text-white/55 drop-shadow">{labelLine}</div>
+                  ) : null}
+                </>
+              ) : (
+                <div className="absolute inset-0 flex items-center justify-center text-center text-gray-400 text-sm px-6">
+                  {t("arttrack.cover_missing_desc") || "Subí el cover en el paso “Modo” para ver la vista previa."}
+                </div>
+              )}
+              <span className="absolute top-2 left-2 text-[10px] uppercase tracking-[0.18em] text-white/70">{t("upload.video_type_art") || "Art Track"}</span>
+            </div>
           ) : (bgMode === "auto" || bgMode === "library" || (bgMode === "custom" && customPreviewUrl)) ? (
             <WizardLivePreview
               style={style}
@@ -2522,7 +3102,7 @@ export default function UploadZone({
                   return customPreviewUrl;
                 }
                 if (bgMode === "library" && backgroundId) {
-                  return `${API}/backgrounds/${backgroundId}/preview?${tokenParam()}`;
+                  return backgroundPreviewUrl(API, backgroundId, libraryPreviewTokens[String(backgroundId)]);
                 }
                 return (MOVEMENT_STYLES.find((m) => m.code === (hoverMovement ?? batchDefaults.movementStyle))?.sample) || "/movement_samples/estandar.mp4";
               })()}
@@ -2596,6 +3176,12 @@ export default function UploadZone({
               ? `${t("upload.preview_editing") || "Línea actual"}: ${_previewLyric}${files.length > 1 ? ` · +${files.length - 1}` : ""}`
               : (t("upload.preview_disclaimer") || "Aproximación del mood y el movimiento. El fondo final lo genera la IA.")}
           </p>
+          {/* 2026-07-16: slot para el player bar de LyricsEditor (paso 6).
+              Lo portalea acá, bajo el video, para que la columna derecha
+              quede full con la letra. Fuera del paso 6 no se monta. */}
+          {isStep6 && onPlayerSlotRef && (
+            <div ref={onPlayerSlotRef} className="mt-1" data-testid="wizard-player-slot" />
+          )}
         </div>
 
         {/* RIGHT — active step controls only (revealed one step at a time).
@@ -2616,7 +3202,7 @@ export default function UploadZone({
             Multi-escena, el modo más alto) quedaba TAPADO detrás del footer y no
             se podía scrollear por encima ("trabado", QA 2026-07-01). El padding
             reserva el espacio del CTA fijo. En mobile el outer ya tiene pb-28. */}
-        <div className="space-y-4 min-w-0 w-full px-1.5 py-0.5 lg:h-full lg:min-h-0 lg:overflow-y-auto lg:pb-24">
+        <div className="wizard-controls-panel space-y-4 min-w-0 w-full px-1.5 py-0.5 lg:h-full lg:min-h-0 lg:overflow-y-auto lg:pb-24">
           {files.length > 1 && (
             <div className="flex items-center gap-1.5 px-1">
               <span className="inline-flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-[0.16em]">
@@ -2624,7 +3210,7 @@ export default function UploadZone({
                   <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>
                   <path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
                 </svg>
-                Aplica a los {files.length} tracks
+                {t("upload.applies_to_tracks", { count: files.length })}
               </span>
             </div>
           )}
@@ -2632,6 +3218,7 @@ export default function UploadZone({
           {/* STEP 1 — Subí: manage files + per-track metadata */}
           {wizardStep === 1 && (
             <>
+              {_videoTypeSelector}
               {_dropZone}
               {_filesBlock}
             </>
@@ -2641,6 +3228,57 @@ export default function UploadZone({
           {wizardStep === 2 && (
             <>
               {_bgBlock}
+              {/* Art track: efecto de movimiento opcional (partículas/luz que
+                  se mueven sobre la portada). Reusa los mismos loops que los
+                  lyric videos. NO mostramos los estilos de movimiento de
+                  cámara — no aplican al formato art track. */}
+              {artTrack && (
+                <div className="mt-4 pt-3 border-t border-white/[0.05]">
+                  <p className="text-[11px] text-gray-400 font-medium">
+                    {t("upload.arttrack_effect_title") || "Efecto en movimiento (opcional)"}
+                  </p>
+                  <p className="text-[10px] text-gray-600 mt-0.5 mb-2">
+                    {t("upload.arttrack_effect_desc") || "Partículas/luz que se mueven sobre la portada, como el video de referencia. Se aplica a master y short."}
+                  </p>
+                  <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+                    {EFFECTS.map((e) => {
+                      const active = (batchDefaults.effect || "") === e.code;
+                      return (
+                        <button
+                          key={e.code || "none"}
+                          type="button"
+                          onClick={() => updateBatchDefault("effect", e.code)}
+                          aria-label={`${e.label}: ${e.desc}`}
+                          title={e.desc}
+                          className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
+                            active
+                              ? "border-transparent ring-1 ring-brand/50 shadow-glow"
+                              : "border-white/[0.06] hover:border-white/[0.20]"
+                          }`}
+                        >
+                          <div className="aspect-video bg-black relative overflow-hidden">
+                            {e.sample ? (
+                              <video src={e.sample} className="w-full h-full object-cover pointer-events-none" autoPlay loop muted playsInline />
+                            ) : (
+                              <div className="w-full h-full grid place-items-center text-gray-500 text-[10px]" style={{ background: "radial-gradient(120% 100% at 50% 0,#241a40,#0b0820)" }}>
+                                {t("upload.effect_none") || "Ninguno"}
+                              </div>
+                            )}
+                            {active && (
+                              <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand grid place-items-center shadow">
+                                <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                              </div>
+                            )}
+                          </div>
+                          <div className="px-2 py-1.5 bg-surface-1">
+                            <p className={`text-label leading-tight ${active ? "text-white" : "text-gray-200"}`}>{e.label}</p>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
               {bgMode === "auto" && (
                 <>
                   <div className="grid grid-cols-1 gap-2">
@@ -2952,12 +3590,16 @@ export default function UploadZone({
                   <div>
                     <div className="flex items-center gap-2">
                       <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.text_case_label") || "Texto:"}</span>
+                      <span className="rounded-full bg-accent/[0.08] px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent ring-1 ring-accent/20">
+                        {t("whatsnew.new_badge") || "Nuevo"}
+                      </span>
+                      <HelpTip text={t("announce.typocase_tagline")} />
                       <div className="flex gap-1">
                         {TEXT_CASE_OPTS.map((opt) => (
                           <button
                             key={opt.code}
                             type="button"
-                            title={opt.label}
+                            title={opt.code === "sentence" ? `${opt.label} · ${t("announce.typocase_tagline")}` : opt.label}
                             onClick={() => updateBatchDefault("textCase", opt.code)}
                             onMouseEnter={() => setHoverCaseBatch(opt.code)}
                             onMouseLeave={() => setHoverCaseBatch(null)}
@@ -2973,9 +3615,9 @@ export default function UploadZone({
                     {hoverCaseBatch && (
                       <div className="mt-1.5 ml-[5.5rem] px-3 py-1.5 rounded-md bg-black/40 ring-1 ring-white/[0.06] flex items-baseline gap-2 animate-fade-in">
                         <span className="text-[11px] font-mono text-white/80 tracking-wide">
-                          {applyTextCase(SAMPLE_LYRIC, hoverCaseBatch)}
+                          {applyTextCase(t("upload.sample_lyric"), hoverCaseBatch)}
                         </span>
-                        <span className="text-[10px] text-gray-600">← así quedarán tus letras</span>
+                        <span className="text-[10px] text-gray-600">← {t("upload.case_preview_help")}</span>
                       </div>
                     )}
                   </div>
@@ -3035,7 +3677,7 @@ export default function UploadZone({
                 </div>
               </div>
 
-              <p className="text-[11px] text-gray-300 font-medium">{t("upload.animation_section") || "Animación"} de la letra</p>
+              <p className="text-[11px] text-gray-300 font-medium">{t("upload.animation_section_full")}</p>
               <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
                 {t("upload.anim_gallery_desc") || "Cómo aparecen las palabras sobre el video. Pasá el mouse o elegí y miralo en el preview ←"}
               </p>
@@ -3168,7 +3810,14 @@ export default function UploadZone({
                   fonts in a 2-column grid + manual song break.
                   Refactored 2026-05-30 to address the operator feedback
                   "los controles están confusos / pegados al footer". */}
-              <div className="mt-5 pt-4 border-t border-white/[0.06]">
+              <div
+                ref={portadaControlsRef}
+                className={`mt-5 pt-4 border-t border-white/[0.06] rounded-lg transition-all duration-500 ${
+                  portadaControlsPulse
+                    ? "ring-2 ring-brand/60 bg-brand/[0.05] -mx-2 px-2 shadow-[0_0_0_4px_rgba(124,77,255,0.10)]"
+                    : "ring-2 ring-transparent"
+                }`}
+              >
                 <div className="flex items-center justify-between mb-3">
                   <p className="text-caption text-gray-200 font-medium">
                     {t("upload.titlecard_section") || "Portada del intro"}
@@ -3244,6 +3893,32 @@ export default function UploadZone({
                         );
                       })}
                     </div>
+                    {/* Nudge de descubribilidad (incidente Clari 19-jul, "no
+                        encuentro dónde modificarlo"): cuando "Auto" va a
+                        resolver al badge chico porque el tema canta enseguida,
+                        el operador NO entiende por qué su título salió chico.
+                        Le nombramos el motivo y el camino al título grande —
+                        el override "Centro" YA existe y llega al render. */}
+                    {(batchDefaults.titleTemplate || "auto") === "auto" &&
+                      typeof _firstLyricStart === "number" &&
+                      _firstLyricStart <= AUTO_INTRO_THRESHOLD_S && (
+                      <div className="mt-2 flex items-start gap-2 rounded-lg bg-amber-500/[0.07] ring-1 ring-amber-500/25 px-3 py-2">
+                        <svg className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+                          <circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" strokeLinecap="round" />
+                        </svg>
+                        <p className="text-[11px] text-amber-200/90 leading-snug flex-1">
+                          {t("upload.titlecard_auto_badge_hint") ||
+                            "Este tema canta enseguida, así que “Auto” usa el título compacto para no pisar la letra."}{" "}
+                          <button
+                            type="button"
+                            onClick={() => updateBatchDefault("titleTemplate", "centered")}
+                            className="text-amber-100 underline decoration-amber-400/40 hover:decoration-amber-200 font-medium"
+                          >
+                            {t("upload.titlecard_use_centered") || "Usar el título grande (Centro)"}
+                          </button>
+                        </p>
+                      </div>
+                    )}
                   </div>
 
                   {/* Size — quick presets show their relative scale via the
@@ -3471,7 +4146,7 @@ export default function UploadZone({
           file count) lo cual es informativo aunque mínimo en edit mode. */}
       {(files.length > 0 || editMode) && wizardStep !== 6 && (
         <div
-          className={`fixed bottom-0 left-0 right-0 z-30 bg-surface-1/85 backdrop-blur-xl border-t border-white/[0.06] px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-64" : "md:left-0"}`}
+          className={`wizard-command-bar fixed bottom-0 left-0 right-0 z-30 px-4 md:px-8 py-4 transition-all duration-300 ${sidebarOpen ? "md:left-60" : "md:left-[72px]"}`}
           data-tour="upload-cta-bar"
         >
           <div className="w-full flex flex-wrap items-center gap-3">
@@ -3540,6 +4215,20 @@ export default function UploadZone({
                 );
               })()
             ) : wizardStep === 5 ? (
+              artTrack ? (
+                // Art track: un solo CTA, genera directo (sin editor de letra).
+                <button
+                  onClick={() => { track("wizard.generate", { mode: "art_track", batch_size: (files || []).length }); onGenerateArtTrack?.(); }}
+                  disabled={!allHaveArtist || !backgroundFile}
+                  className="btn-primary h-11 px-6 disabled:opacity-40 disabled:cursor-not-allowed"
+                  title={!backgroundFile ? (t("arttrack.cover_missing_desc") || "Subí el cover en el paso “Modo”") : undefined}
+                >
+                  {t("upload.generate_art_track") || "Generar Art Track"}
+                  <svg className="inline-block ml-1.5 w-4 h-4 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path d="M5 12h14M12 5l7 7-7 7" />
+                  </svg>
+                </button>
+              ) : (
               <>
                 {onGenerateDirect && (
                   <button
@@ -3563,6 +4252,7 @@ export default function UploadZone({
                   </button>
                 )}
               </>
+              )
             ) : null}
           </div>
         </div>

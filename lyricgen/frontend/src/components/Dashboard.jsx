@@ -8,7 +8,7 @@ import ProResBadge from "./ProResBadge";
 import { SkeletonVideoCard } from "./Skeleton";
 import DashboardStepper from "./DashboardRich/Stepper";
 import FormatGallery from "./DashboardRich/FormatGallery";
-import NovedadHero from "./WhatsNew/NovedadHero";
+import MediaPreview from "./MediaPreview";
 import "./DashboardRich/DashboardRich.css";
 
 // sessionStorage key the wizard reads on mount to pre-apply a delivery
@@ -22,20 +22,16 @@ const API = import.meta.env.VITE_API_URL || "";
 // IIFE doesn't `new Intl.DateTimeFormat()` on every render. Creating
 // a DateTimeFormat is ~5-10 ms in Chrome — fine once, but adds up at
 // 3-5 renders/sec while the polling loop is ticking.
-const DATE_HEADER_FMT = new Intl.DateTimeFormat("es-AR", {
-  weekday: "long", day: "numeric", month: "long",
-});
-const MONTH_FMT = new Intl.DateTimeFormat("es-AR", { month: "long" });
 
 function authHeaders() {
   const token = localStorage.getItem("genly_token");
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
-function timeAgo(ts) {
+function timeAgo(ts, t) {
   if (!ts) return "";
   const diff = Date.now() / 1000 - ts;
-  if (diff < 60) return "ahora";
+  if (diff < 60) return t("common.now");
   if (diff < 3600) return `${Math.floor(diff / 60)}m`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
   return `${Math.floor(diff / 86400)}d`;
@@ -76,37 +72,31 @@ function ProcessingRow({ job, onSelect, t }) {
   );
 }
 
-function VideoCard({ job, onSelect }) {
+function VideoCard({ job, onSelect, t }) {
   const name = (job.filename || "").replace(/\.mp3$/i, "");
   const songName = name.includes(" - ") ? name.split(" - ").slice(1).join(" - ") : name;
   const artistName = job.artist || (name.includes(" - ") ? name.split(" - ")[0] : "");
-  const thumbSrc = useMediaUrl(job.job_id, "thumbnail", "preview");
+  // version: edits overwrite the same R2 thumbnail key — bust the URL when
+  // the render changes so the card doesn't keep showing the pre-edit image.
+  const thumbSrc = useMediaUrl(job.job_id, "thumbnail", "preview", `${job.edit_count || 0}-${job.status || ""}`);
 
   return (
     <button
       onClick={() => onSelect(job.job_id, job.status)}
-      className="rounded-card overflow-hidden text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all"
+      className="overflow-hidden rounded-xl text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all"
     >
-      <div className="aspect-video bg-surface-3/30 relative overflow-hidden">
-        {thumbSrc && (
-          <img
-            src={thumbSrc}
-            alt=""
-            className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500"
-            onError={(e) => { e.target.style.display = "none"; }}
-          />
-        )}
-        <div className="absolute inset-0 flex items-center justify-center opacity-30 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/30">
+      <MediaPreview src={thumbSrc} status={job.status} alt={`${t("media.thumbnail_of")} ${songName || t("common.video")}`} label={t("media.video_preview")} className="aspect-video" imageClassName="group-hover:scale-[1.04] transition-transform duration-500">
+        <div className="absolute z-[2] inset-0 flex items-center justify-center opacity-30 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/30">
           <div className="w-10 h-10 rounded-full bg-white/15 backdrop-blur-md flex items-center justify-center ring-1 ring-white/20">
             <svg className="w-4 h-4 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
               <path d="M8 5v14l11-7z"/>
             </svg>
           </div>
         </div>
-      </div>
+      </MediaPreview>
       <div className="px-3.5 py-3">
         <div className="flex items-start gap-2 min-w-0">
-          <p className="text-[13px] font-medium text-white truncate flex-1 min-w-0">{songName || "Sin nombre"}</p>
+          <p className="text-[13px] font-medium text-white truncate flex-1 min-w-0">{songName || t("common.untitled")}</p>
           <ProResBadge
             deliveryProfile={job.delivery_profile}
             proresReady={job.prores_ready}
@@ -115,7 +105,7 @@ function VideoCard({ job, onSelect }) {
         </div>
         <p className="text-[11px] text-gray-500 truncate mt-0.5">
           {artistName}
-          {job.created_at && <span className="ml-1.5 text-gray-600">· {timeAgo(job.created_at)}</span>}
+          {job.created_at && <span className="ml-1.5 text-gray-600">· {timeAgo(job.created_at, t)}</span>}
         </p>
       </div>
     </button>
@@ -123,7 +113,7 @@ function VideoCard({ job, onSelect }) {
 }
 
 export default function Dashboard({ user, history, historyError, historyLoaded = true, onRetryHistory, onSelectJob, onNewBatch, onViewHistory, onOpenSearch }) {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const navigate = useNavigate();
 
   // FormatGallery handlers.
@@ -237,20 +227,6 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
     ? 0
     : (usage?.percent ?? (monthlyLimit ? Math.min(100, (monthlyUsed / monthlyLimit) * 100) : 0));
 
-  const greeting = (() => {
-    const h = new Date().getHours();
-    if (h < 12) return "Buenos días";
-    if (h < 19) return "Buenas tardes";
-    return "Buenas noches";
-  })();
-  const firstName = user?.username || "";
-
-  const monthlySubtitle = (() => {
-    if (history.length === 0) return "Subí tu primer audio para empezar";
-    if (monthlyUsed === 0) return "Aún no completaste videos este mes";
-    return `${monthlyUsed} ${monthlyUsed === 1 ? "video listo" : "videos listos"} este mes`;
-  })();
-
   // 2026-05-25 — Atención drawer state. Los banners de quota+errors
   // (antes apilados arriba compitiendo con el hero) ahora viven adentro
   // de un drawer colapsable a la derecha del hero. Solo se expande
@@ -262,16 +238,16 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
   // Header dinámico — operativo, no amable. Cambia según estado del sistema.
   // Linear/Stripe pattern: "Control room", no "Hola buenos días".
   const heroHeadline = (() => {
-    if (history.length === 0) return "Sistema listo";
-    if (pendingReview.length > 0) return `${pendingReview.length} ${pendingReview.length === 1 ? "video espera" : "videos esperan"} tu aprobación`;
-    if (processing.length > 0) return `${processing.length} ${processing.length === 1 ? "video" : "videos"} renderizando`;
-    return "Todo al día";
+    if (history.length === 0) return t("dash.hero_system_ready");
+    if (pendingReview.length > 0) return t(pendingReview.length === 1 ? "dash.hero_review_one" : "dash.hero_review_many", { count: pendingReview.length });
+    if (processing.length > 0) return t(processing.length === 1 ? "dash.hero_render_one" : "dash.hero_render_many", { count: processing.length });
+    return t("dash.hero_all_clear");
   })();
   const heroSubline = (() => {
-    if (history.length === 0) return "Subí tu primer audio para empezar.";
-    if (pendingReview.length > 0) return "Revisá y aprobá para destrabar descargas.";
-    if (processing.length > 0) return "El sistema sigue trabajando en background.";
-    return "Cero pendientes. Subí más audio cuando quieras.";
+    if (history.length === 0) return t("dash.first_audio_subtitle");
+    if (pendingReview.length > 0) return t("dash.hero_review_subline");
+    if (processing.length > 0) return t("dash.hero_render_subline");
+    return t("dash.hero_clear_subline");
   })();
 
   // El "próximo a terminar" — heurística simple: primer processing con
@@ -284,24 +260,45 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
     );
     return sorted[0];
   })();
+  const locale = lang === "en" ? "en-US" : lang === "pt" ? "pt-BR" : "es-AR";
+  const dashboardDate = (() => {
+    const d = new Date();
+    return new Intl.DateTimeFormat(locale, { weekday: "long", day: "numeric", month: "long" }).format(d)
+      + " · " + d.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
+  })();
+  const liveState = processing.length > 0
+    ? t("dash.live_render")
+    : pendingReview.length > 0
+      ? t("dash.live_review")
+      : t("dash.live_operational");
+  const liveDotClass = processing.length > 0
+    ? "bg-brand shadow-[0_0_14px_rgba(124,92,255,.75)]"
+    : pendingReview.length > 0
+      ? "bg-amber-300 shadow-[0_0_14px_rgba(252,211,77,.65)]"
+      : "bg-accent shadow-[0_0_14px_rgba(20,200,168,.65)]";
 
   return (
-    <div className="w-full max-w-[1700px] animate-fade-in">
-      {/* ─── Command bar simplificada (header reposicionado, search vendrá en PR-2) ─── */}
-      <div className="flex items-center justify-between mb-7">
+    <div className="w-full max-w-[1360px] animate-fade-in">
+      {/* Page header: global search + create live in GlobalTopbar. */}
+      <div className="mb-4 px-1 py-2">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div className="min-w-0">
-          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
-            {(() => {
-              const d = new Date();
-              return DATE_HEADER_FMT.format(d) + " · " + d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
-            })()}
-          </p>
-          <h1 className="text-[26px] leading-tight font-bold tracking-tight mt-1 truncate">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">{t("dash.production_center")}</p>
+            <span className="rounded-full bg-white/[0.045] px-2.5 py-1 text-[10px] font-semibold text-gray-400 ring-1 ring-white/[0.06]">
+              {dashboardDate}
+            </span>
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-white/[0.04] px-2.5 py-1 text-[10px] font-semibold text-gray-300 ring-1 ring-white/[0.06]">
+              <span className={`h-1.5 w-1.5 rounded-full ${liveDotClass}`} />
+              {liveState}
+            </span>
+          </div>
+          <h1 className="text-[24px] leading-[1.14] font-bold tracking-normal text-white md:text-[26px]">
             {heroHeadline}
           </h1>
-          <p className="text-sm text-ink-secondary mt-1">{heroSubline}</p>
+          <p className="mt-1.5 max-w-2xl text-[13px] leading-relaxed text-ink-secondary">{heroSubline}</p>
         </div>
-        <div className="flex items-center gap-2 shrink-0 ml-4">
+        <div className="flex shrink-0 flex-wrap items-center gap-2 lg:justify-end">
           {/* Search button — abre el SearchPalette (PR-2 2026-05-25).
               Visual: input fake con placeholder + atajo ⌘K a la derecha.
               Match patrón Linear/Vercel command bar. */}
@@ -310,12 +307,12 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               type="button"
               onClick={onOpenSearch}
               className="hidden md:flex items-center gap-2 h-9 px-3 rounded-lg bg-surface-2/60 ring-1 ring-white/[0.06] hover:ring-white/[0.12] hover:bg-surface-2/80 text-gray-400 hover:text-gray-200 transition-colors text-xs"
-              aria-label="Buscar"
+              aria-label={t("topbar.search")}
             >
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <circle cx="11" cy="11" r="8" /><path d="M21 21l-4.35-4.35" strokeLinecap="round" />
               </svg>
-              <span>Buscar</span>
+              <span>{t("common.search")}</span>
               <kbd className="ml-2 px-1.5 h-5 inline-flex items-center rounded text-[10px] font-mono bg-white/[0.06] ring-1 ring-white/10 text-gray-500">
                 ⌘K
               </kbd>
@@ -333,16 +330,11 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                 }`}
             >
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg>
-              {attentionCount} {attentionCount === 1 ? "aviso" : "avisos"}
+              {attentionCount} {attentionCount === 1 ? t("dash.notice_one") : t("dash.notice_many")}
               <svg className={`w-3 h-3 transition-transform ${attentionOpen ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" strokeLinecap="round" strokeLinejoin="round"/></svg>
             </button>
           )}
-          <button onClick={onNewBatch} className="btn-primary px-5" data-tour="dashboard-new-batch">
-            <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-              <path d="M12 5v14M5 12h14" strokeLinecap="round"/>
-            </svg>
-            {t("nav.new_batch")}
-          </button>
+        </div>
         </div>
       </div>
 
@@ -352,52 +344,70 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
             UX 2026-05-29: ocultas cuando todos los valores son 0 — en cuenta
             nueva el bloque ocupaba 200px diciendo "no pasa nada". ─── */}
       {(pendingReview.length > 0 || processing.length > 0 || monthlyUsed > 0) && (
-      <div className="mb-8 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] grid grid-cols-1 md:grid-cols-3 md:divide-x md:divide-white/[0.04]">
+      <div className="mb-5 grid grid-cols-1 overflow-hidden rounded-xl bg-[#111118]/82 ring-1 ring-white/[0.06] md:grid-cols-3 md:divide-x md:divide-white/[0.055]">
 
         {/* COL 1: APROBAR — north star del operador */}
         <button
           onClick={() => pendingReview.length > 0 && onSelectJob(pendingReview[0].job_id)}
           disabled={pendingReview.length === 0}
-          className={`text-left px-6 py-6 transition-colors ${pendingReview.length > 0 ? "hover:bg-surface-2/40 cursor-pointer" : "cursor-default"}`}
+          className={`group text-left px-5 py-4 transition-colors ${pendingReview.length > 0 ? "hover:bg-white/[0.035] cursor-pointer" : "cursor-default"}`}
         >
-          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Aprobar</p>
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">{t("review.approve")}</p>
+            <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ring-1 ${
+              pendingReview.length > 0
+                ? "bg-amber-400/[0.08] text-amber-200 ring-amber-400/20"
+                : "bg-white/[0.04] text-gray-500 ring-white/[0.05]"
+            }`}>
+              {pendingReview.length > 0 ? t("dash.requires_action") : t("dash.clear")}
+            </span>
+          </div>
           <div className="mt-2 flex items-baseline gap-2">
-            <span className={`text-[44px] leading-none font-bold tracking-tight tabular-nums
+            <span className={`text-[34px] leading-none font-bold tracking-normal tabular-nums md:text-[36px]
               ${pendingReview.length === 0 ? "text-white/40" :
                 pendingReview.length >= 5 ? "text-red-300" :
                 "text-amber-200"}`}>
               {pendingReview.length}
             </span>
             <span className="text-xs text-ink-secondary">
-              {pendingReview.length === 0 ? "todo aprobado" :
-                pendingReview.length === 1 ? "esperando review" : "esperando review"}
+              {pendingReview.length === 0 ? t("dash.all_approved") :
+                pendingReview.length === 1 ? t("dash.review_pending_one") : t("dash.review_pending_many")}
             </span>
           </div>
           {pendingReview.length > 0 && pendingReview[0] && (
             <p className="text-[11px] text-ink-secondary mt-3 truncate">
-              <span className="font-mono tabular-nums text-gray-400">{timeAgo(pendingReview[0].created_at)}</span>
+              <span className="font-mono tabular-nums text-gray-400">{timeAgo(pendingReview[0].created_at, t)}</span>
               {" · "}
               {(pendingReview[0].filename || "").replace(/\.(mp3|wav)$/i, "")}
             </p>
           )}
           {pendingReview.length > 0 && (
             <p className="text-[11px] text-brand-light mt-2 flex items-center gap-1 group-hover:translate-x-0.5 transition-transform">
-              Revisar ahora
+              {t("dash.review_now")}
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/></svg>
             </p>
           )}
         </button>
 
         {/* COL 2: RENDERIZANDO — sistema en vivo */}
-        <div className="px-6 py-6">
-          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Renderizando</p>
+        <div className="px-5 py-4">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">{t("dash.rendering")}</p>
+            <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ring-1 ${
+              processing.length > 0
+                ? "bg-brand/[0.10] text-brand-light ring-brand/25"
+                : "bg-white/[0.04] text-gray-500 ring-white/[0.05]"
+            }`}>
+              {processing.length > 0 ? t("dash.live") : t("dash.no_queue")}
+            </span>
+          </div>
           <div className="mt-2 flex items-baseline gap-2">
-            <span className={`text-[44px] leading-none font-bold tracking-tight tabular-nums
+            <span className={`text-[34px] leading-none font-bold tracking-normal tabular-nums md:text-[36px]
               ${processing.length === 0 ? "text-white/40" : "text-brand-light"}`}>
               {processing.length}
             </span>
             <span className="text-xs text-ink-secondary">
-              {processing.length === 0 ? "cola vacía" : processing.length === 1 ? "video en curso" : "jobs en curso"}
+              {processing.length === 0 ? t("dash.empty_queue") : processing.length === 1 ? t("dash.job_running_one") : t("dash.job_running_many")}
             </span>
           </div>
           {nextToFinish ? (
@@ -421,25 +431,36 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           ) : (
             <p className="text-[11px] text-ink-secondary mt-3">
               <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent/40 mr-2 align-middle" />
-              Sistema OK · esperando tu próximo upload
+              {errors.length > 0 ? t("dash.errors_need_attention", { count: errors.length }) : t("dash.no_active_renders")}
             </p>
           )}
         </div>
 
         {/* COL 3: CUOTA — Stripe pattern (número grande + barra slim + delta) */}
-        <div className="px-6 py-6">
-          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
-            Cuota {MONTH_FMT.format(new Date())}
-          </p>
+        <div className="px-5 py-4">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
+              {t("dash.quota")} {new Intl.DateTimeFormat(locale, { month: "long" }).format(new Date())}
+            </p>
+            <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ring-1 ${
+              isUnlimited
+                ? "bg-accent/[0.08] text-accent ring-accent/20"
+                : usagePercent >= 80
+                  ? "bg-amber-400/[0.08] text-amber-200 ring-amber-400/20"
+                  : "bg-white/[0.04] text-gray-500 ring-white/[0.05]"
+            }`}>
+              {isUnlimited ? t("dash.unlimited") : monthlyLimit ? t("dash.percent_used", { percent: Math.round(usagePercent) }) : t("dash.loading")}
+            </span>
+          </div>
           <div className="mt-2 flex items-baseline gap-2">
             {isUnlimited ? (
               <>
-                <span className="text-[44px] leading-none font-bold tracking-tight tabular-nums text-white">{monthlyUsed}</span>
-                <span className="text-xs text-ink-secondary">sin límite</span>
+                <span className="text-[34px] leading-none font-bold tracking-normal tabular-nums text-white md:text-[36px]">{monthlyUsed}</span>
+                <span className="text-xs text-ink-secondary">{t("dash.unlimited")}</span>
               </>
             ) : monthlyLimit ? (
               <>
-                <span className={`text-[44px] leading-none font-bold tracking-tight tabular-nums ${
+                <span className={`text-[34px] leading-none font-bold tracking-normal tabular-nums md:text-[36px] ${
                   usagePercent >= 100 ? "text-red-300" :
                   usagePercent >= 80 ? "text-amber-200" :
                   "text-white"
@@ -457,10 +478,10 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               </>
             ) : usageError ? (
               <button onClick={retryUsage} className="text-xs text-brand-light hover:underline underline-offset-2">
-                Reintentar carga
+                {t("dash.retry")}
               </button>
             ) : (
-              <span className="text-xs text-ink-secondary">cargando…</span>
+              <span className="text-xs text-ink-secondary">{t("dash.loading")}</span>
             )}
           </div>
           {!isUnlimited && monthlyLimit && (
@@ -480,8 +501,8 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           {!isUnlimited && monthlyLimit && (
             <p className="text-[11px] text-ink-secondary mt-2 font-mono tabular-nums">
               {monthlyLimit - monthlyUsed > 0
-                ? `${monthlyLimit - monthlyUsed} restantes este mes`
-                : "Cupo agotado · contactá soporte"}
+                ? t("dash.remaining_month", { count: monthlyLimit - monthlyUsed })
+                : t("dash.quota_exhausted")}
             </p>
           )}
           {/* Créditos de regalo + qué rinde (dinámico). Mismo dato que el
@@ -503,15 +524,15 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
               <div className="mt-3 pt-3 border-t border-white/[0.06] space-y-1.5">
                 {bonusRemaining > 0 && (
                   <p className="text-[11px] text-emerald-300 font-medium">
-                    🎁 {bonusRemaining} créditos de regalo
-                    {giftDays != null ? (giftDays === 0 ? " · vencen hoy" : ` · vencen en ${giftDays} días`) : ""}
+                    {t("dash.bonus_active", { count: bonusRemaining })}
+                    {giftDays != null ? (giftDays === 0 ? ` · ${t("dash.expires_today")}` : ` · ${t("dash.expires_days", { count: giftDays })}`) : ""}
                   </p>
                 )}
                 <p className="text-[11px] text-ink-secondary">
-                  Te alcanza para {projN} videos normales o {projE} con Escenas
+                  {t("dash.projection", { normal: projN, scenes: projE })}
                 </p>
                 <p className="text-[10px] text-gray-500">
-                  🎥 Normal: 1 crédito · 🎬 Escenas: {cost} créditos
+                  {t("dash.credit_cost", { cost })}
                 </p>
               </div>
             );
@@ -532,7 +553,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           const blockMode = usage.alert_100 && !user?.allow_overage;
           return (
             <div
-              className={`w-full mb-4 flex items-center gap-3 px-5 py-4 rounded-card ring-1 ${
+              className={`w-full mb-4 flex items-center gap-3 px-5 py-4 rounded-xl ring-1 ${
                 blockMode
                   ? "bg-red-500/[0.08] ring-red-500/30"
                   : overageMode
@@ -554,20 +575,20 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                 {overageMode ? (
                   <>
                     <p className="text-sm font-semibold text-brand-light">
-                      Pasaste el plan mensual — los extras se facturan al cierre
+                      {t("dash.overage_title")}
                     </p>
                     <p className="text-xs text-ink-secondary mt-0.5">
-                      {monthlyUsed} videos generados · {usage.overage} adicionales × ${usage.overage_cost_per_video}{" "}
-                      = <span className="font-semibold text-white">${usage.overage_total}</span> a abonar este mes.
+                      {t("dash.overage_body", { used: monthlyUsed, overage: usage.overage, cost: usage.overage_cost_per_video })}{" "}
+                      = <span className="font-semibold text-white">${usage.overage_total}</span> {t("dash.overage_due")}
                     </p>
                   </>
                 ) : blockMode ? (
                   <>
                     <p className="text-sm font-semibold text-red-200">
-                      Llegaste al límite mensual ({monthlyUsed}/{monthlyLimit})
+                      {t("dash.limit_title", { used: monthlyUsed, limit: monthlyLimit })}
                     </p>
                     <p className="text-xs text-red-300/80 mt-0.5">
-                      No vas a poder subir más videos hasta el mes que viene. Si necesitás extender el cupo, escribinos a{" "}
+                      {t("dash.limit_body")}{" "}
                       <a href="mailto:soporte@genly.pro" className="underline font-medium hover:text-red-200">
                         soporte@genly.pro
                       </a>.
@@ -576,11 +597,11 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                 ) : (
                   <>
                     <p className="text-sm font-semibold text-amber-200">
-                      Te quedan {monthlyLimit - monthlyUsed} videos este mes ({monthlyUsed}/{monthlyLimit})
+                      {t("dash.low_quota_title", { remaining: monthlyLimit - monthlyUsed, used: monthlyUsed, limit: monthlyLimit })}
                     </p>
                     <p className="text-xs text-amber-300/80 mt-0.5">
                       {user?.allow_overage
-                        ? `Pasado el tope, cada video adicional cuesta $${usage.overage_cost_per_video} y se factura al cierre.`
+                        ? t("dash.low_quota_overage", { cost: usage.overage_cost_per_video })
                         : <>{t("billing.nudge_body") || "Mejorá tu plan para no frenarte cuando llegues al tope."}{" "}
                             <button onClick={handleUpgrade} className="underline font-medium hover:text-amber-200">
                               {t("billing.nudge_cta") || "Mejorar plan"}
@@ -603,11 +624,11 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                 <circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/>
               </svg>
               <p className="text-xs text-red-300 flex-1">
-                {errors.length} {errors.length === 1 ? "video falló este mes" : "videos fallaron este mes"}
+                {t(errors.length === 1 ? "dash.failed_month_one" : "dash.failed_month_many", { count: errors.length })}
               </p>
               <button
                 onClick={dismissErrors}
-                aria-label="Descartar"
+                aria-label={t("common.dismiss")}
                 className="text-red-400/60 hover:text-red-300 transition-colors p-1 -mr-1"
               >
                 <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
@@ -667,32 +688,31 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           }}
         />
       )}
-      <NovedadHero />
-      <FormatGallery
-        user={user}
-        onSelectFormat={handleSelectFormat}
-        onUpgrade={handleUpgrade}
-      />
-
       {/* ─── Tus últimos videos — visual scan, NOT a copy of History ── */}
       {recentDone.length > 0 && (
         <div data-tour="dashboard-recent">
           <div className="flex items-center justify-between mb-4">
-            <SectionLabel>Tus últimos videos</SectionLabel>
+            <SectionLabel>{t("dash.recent_activity")}</SectionLabel>
             <button onClick={onViewHistory} className="text-[11px] text-brand hover:text-brand-light transition-colors flex items-center gap-1 -translate-y-1.5">
-              Ver historial completo
+              {t("dash.full_history")}
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/>
               </svg>
             </button>
           </div>
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-[repeat(auto-fill,minmax(250px,340px))]">
             {recentDone.map((job) => (
-              <VideoCard key={job.job_id} job={job} onSelect={onSelectJob} />
+              <VideoCard key={job.job_id} job={job} onSelect={onSelectJob} t={t} />
             ))}
           </div>
         </div>
       )}
+
+      <FormatGallery
+        user={user}
+        onSelectFormat={handleSelectFormat}
+        onUpgrade={handleUpgrade}
+      />
 
       {/* Onboarding tour — fires only on first dashboard visit for new users */}
       <DashboardTour user={user} />
@@ -718,7 +738,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         </div>
       )}
       {history.length === 0 && historyError && (
-        <div className="rounded-card p-10 text-center bg-amber-500/[0.06] ring-1 ring-amber-500/25">
+        <div className="rounded-xl p-10 text-center bg-amber-500/[0.06] ring-1 ring-amber-500/25">
           <div className="w-12 h-12 mx-auto mb-4 rounded-2xl bg-amber-500/15 ring-1 ring-amber-500/30 flex items-center justify-center">
             <svg className="w-6 h-6 text-amber-300" fill="none" stroke="currentColor" strokeWidth="1.6" viewBox="0 0 24 24">
               <path d="M12 9v3.5m0 3.5h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" strokeLinecap="round" strokeLinejoin="round"/>
@@ -743,7 +763,7 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           de fallo silencioso de /jobs) mostramos este card sutil que no
           alarma con "creá tu primer video". */}
       {isTrueEmptyState && !isFirstWeekUser && (
-        <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
+        <div className="rounded-xl p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
           <div className="w-14 h-14 mx-auto mb-5 rounded-2xl bg-brand/10 ring-1 ring-brand/20 flex items-center justify-center">
             <svg className="w-7 h-7 text-brand-light" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">
               <path d="M9 18V5l12-2v13" strokeLinecap="round" strokeLinejoin="round"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>

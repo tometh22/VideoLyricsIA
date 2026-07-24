@@ -12,6 +12,9 @@ const LANGS = Object.keys(translations);
 function keysOf(entry) {
   const keys = [entry.titleKey, entry.taglineKey, entry.bodyKey, entry.ctaKey];
   if (Array.isArray(entry.highlightKeys)) keys.push(...entry.highlightKeys);
+  if (Array.isArray(entry.modalFeatures)) {
+    for (const feature of entry.modalFeatures) keys.push(feature.titleKey, feature.bodyKey);
+  }
   return keys.filter(Boolean);
 }
 

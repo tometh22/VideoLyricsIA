@@ -15,10 +15,11 @@ class TourErrorBoundary extends Component {
 // ─── Custom beacon ────────────────────────────────────────────────
 // Replaces Joyride's default blue dot with a pulsing brand-violet ring.
 function TourBeacon({ continuous, index, isLastStep, size, step, ...rest }) {
+  const { t } = useI18n();
   return (
     <button
       {...rest}
-      aria-label="Abrir tour guiado"
+      aria-label={t("tour.open")}
       className="relative flex h-5 w-5 items-center justify-center focus:outline-none"
     >
       <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-brand opacity-60" />
@@ -41,6 +42,7 @@ function TourTooltip({
   skipProps,
   tooltipProps,
 }) {
+  const { t } = useI18n();
   return (
     <div
       {...tooltipProps}
@@ -88,7 +90,7 @@ function TourTooltip({
                 {...backProps}
                 className="text-[11px] text-[#A0A3B1] transition-colors duration-240 hover:text-[#F5F7FA]"
               >
-                ← Atrás
+                ← {t("tour.back")}
               </button>
             )}
             {!isLastStep && (
@@ -96,14 +98,14 @@ function TourTooltip({
                 {...skipProps}
                 className="text-[11px] text-[#A0A3B1]/50 transition-colors duration-240 hover:text-[#A0A3B1]"
               >
-                Saltar
+                {t("tour.skip")}
               </button>
             )}
             <button
               {...primaryProps}
               className="rounded-[10px] bg-brand px-3.5 py-1.5 text-[11px] font-semibold text-white shadow-glow transition-all duration-240 hover:bg-brand-light active:scale-95"
             >
-              {isLastStep ? "Listo ✓" : "Siguiente →"}
+              {isLastStep ? `${t("tour.finish")} ✓` : `${t("tour.next")} →`}
             </button>
           </div>
         </div>
@@ -272,6 +274,20 @@ export function DashboardTour({ user, forceRun = false, onDone }) {
         "Empezás generando un lyric video desde acá. Subís un MP3 y elegís el fondo.",
     },
     {
+      target: '[data-tour="whatsnew-release"]',
+      title: t("tour.dashboard_whatsnew_title") || "Novedades del producto",
+      content: t("tour.dashboard_whatsnew_body") ||
+        "Cuando GenLy suma mejoras importantes, las vas a ver acá con una demo corta y acceso directo para probarlas.",
+      placement: "top",
+    },
+    {
+      target: '[data-tour="whatsnew-bell"]',
+      title: t("tour.dashboard_whatsnew_bell_title") || "Avisos de actualización",
+      content: t("tour.dashboard_whatsnew_bell_body") ||
+        "El indicador de Novedades se prende cuando hay cambios nuevos. Al abrirlo, queda marcado como visto.",
+      placement: "bottom-end",
+    },
+    {
       target: '[data-tour="dashboard-recent"]',
       title: t("tour.dashboard_recent_title") || "Tus últimos videos",
       content: t("tour.dashboard_recent_body") ||
@@ -319,6 +335,18 @@ export function UploadTour({ user, forceRun = false, onDone }) {
       title: t("tour.upload_bg_title") || "Fondo del video",
       content: t("tour.upload_bg_body") ||
         "La IA lo genera, lo elegís de la biblioteca de fondos pre-aprobados, o subís uno tuyo.",
+    },
+    {
+      target: '[data-tour="upload-text-case"]',
+      title: t("tour.upload_textcase_title") || "Nuevo estilo Abc",
+      content: t("tour.upload_textcase_body") ||
+        "Abc pone en mayúscula la primera letra de cada línea y deja el resto como oración. Ideal para una lectura más editorial.",
+    },
+    {
+      target: '[data-tour="upload-frame-format"]',
+      title: t("tour.upload_cinema_title") || "Formato Cine",
+      content: t("tour.upload_cinema_body") ||
+        "Cine agrega franjas negras a videos horizontales para un look 2.39:1. Funciona aunque el audio que subas sea MP3 o WAV.",
     },
     {
       target: '[data-tour="upload-delivery"]',

@@ -149,6 +149,26 @@ export function computeFieldDiff(baseline, current) {
   if (Object.keys(bgDiff).length > 0) {
     out.background = bgDiff;
   }
+  // "Regenerar fondo (nueva versión)": intención explícita del operador de
+  // re-generar el fondo (nueva tirada) aunque no haya cambiado ningún campo.
+  // Se chequea sobre `current` (no vs baseline: es una acción, no un campo).
+  // Fuerza un bucket background vacío → edit_type=background re-renderiza con
+  // el hint actual. No aplica si eligió un asset de biblioteca (eso supersede).
+  if (current.forceBackgroundRegen && !current.editBackgroundId && !out.background) {
+    out.background = {};
+  }
+
+  // ── background_library ───────────────────────────────────────────────
+  // Swap a un asset curado de biblioteca (backend edit_type=
+  // "background_library", PR #940 — sin Veo, sin consumir slot). El
+  // baseline es siempre null ("mantener fondo actual"), así que un pick
+  // de biblioteca SIEMPRE es diff. Mutuamente excluyente con el bucket
+  // `background`: elegir un asset concreto supersede cualquier hint de
+  // regeneración IA que haya quedado en el formulario.
+  if (current.editBackgroundId) {
+    out.background_library = { background_id: current.editBackgroundId };
+    delete out.background;
+  }
 
   return out;
 }
@@ -219,4 +239,32 @@ export function bundleTypographyIntoFirstBucket(payloads, _opts = {}) {
   // pending_review status). Caller can detect this case and convert to
   // a lyrics-with-current-segments edit if the job is done/rejected.
   return payloads;
+}
+
+// ── background regen modifiers (Veo/Imagen + content-validation) ────────
+// Estos NO son campos del baseline sino ACCIÓN del wizard de edición: el
+// operador elige motor y política de validación como modificadores de un
+// regen de fondo IA, y llegan a `current` vía onEditFieldChange (igual que
+// forceBackgroundRegen). Se aplican SOLO cuando el edit resuelto es un regen
+// IA (edit_type="background"; el swap de biblioteca no dispara Veo/Imagen).
+//
+// Paridad con la tarjeta "Regenerar fondo" que se plegó al wizard
+// (unificación #973): esa tarjeta SIEMPRE mandaba exactamente uno de
+// bypass/force_content_validation — si no se manda ninguno, el backend
+// fail-closea a force y se pierde fondo-libre (cuentas no-UMG).
+//
+//   - bgRegenEngine === "imagen"  → background_mode:"imagen" (foto animada
+//     barata, sin riesgo de caras). "veo"/undefined = default, no se manda.
+//   - bgRegenValidation === false → bypass_content_validation (fondo-libre,
+//     sólo no-UMG). Cualquier otra cosa (incl. undefined) → force (validar).
+export function backgroundRegenExtras(current) {
+  const c = current || {};
+  const out = {};
+  if (c.bgRegenEngine === "imagen") out.background_mode = "imagen";
+  if (c.bgRegenValidation === false) {
+    out.bypass_content_validation = true;
+  } else {
+    out.force_content_validation = true;
+  }
+  return out;
 }

@@ -63,42 +63,62 @@ function _setAudioCurrentTime(container, t) {
   fireEvent.timeUpdate(audio);
 }
 
-describe("LyricsEditor — review:true banner UX (2026-05-26)", () => {
-  // Cuando synced-direct fallback (PR #365) dispara, TODAS las líneas
-  // vienen con `review: true`. Mostrar 28 badges "⚠ revisar tiempo"
-  // apilados satura visualmente. Si ≥3 segments son review, debe
-  // aparecer un banner ÚNICO arriba y los badges per-línea suprimirse.
-  // Casos con <3 review siguen mostrando badge inline (info útil sin
-  // saturar).
-  it("muestra UN banner único cuando ≥3 segments son review:true", () => {
+describe("LyricsEditor — banner de confianza + señal review calma (2026-07)", () => {
+  // Rediseño: el borde/anillo ámbar completo + banner de alarma hacían
+  // parecer todo roto con 11/26 líneas review, cuando el sync salió
+  // excelente. Ahora: banner ÚNICO positivo con navegador secuencial, y
+  // señal per-línea SUTIL (barra izquierda ámbar), sin pill ni ring.
+  it("muestra un banner de confianza con contador cuando hay líneas review", () => {
     const props = baseProps({
       segments: [
         { start: 27.7, end: 33.7, text: "Tanto tiempo te esperé sentado aquí", review: true },
         { start: 33.7, end: 39.4, text: "Que ya el invierno me alcanzó sin gamulán", review: true },
         { start: 39.4, end: 42.1, text: "Será por eso que hoy estamos aquí", review: true },
-        { start: 42.1, end: 45.9, text: "No hay nadie más que vos y yo", review: true },
+        { start: 42.1, end: 45.9, text: "No hay nadie más que vos y yo", review: false },
       ],
     });
     render(<LyricsEditor {...props} />);
-    // Banner único arriba
-    expect(screen.getByText(/líneas con timing aproximado/i)).toBeInTheDocument();
-    // Per-line badge "revisar tiempo" NO debe aparecer (suprimido por banner)
+    // Rediseño 2026-07: la confianza es una línea muted "Sincronizado con
+    // tu letra"; el contador vive dentro del chip primario "Revisar · •N".
+    expect(screen.getByText(/Sincronizado con tu letra/i)).toBeInTheDocument();
+    // El chip navegador "Revisar" está presente y muestra el contador (3).
+    expect(screen.getByTestId("review-next-btn")).toBeInTheDocument();
+    expect(within(screen.getByTestId("review-next-btn")).getByText("3")).toBeInTheDocument();
+    // La pill per-línea "revisar tiempo" quedó eliminada.
     expect(screen.queryAllByText(/^revisar tiempo$/i)).toHaveLength(0);
   });
 
-  it("NO muestra banner cuando <3 segments son review:true — fallback a badges per-línea", () => {
+  it("el banner aparece incluso con UNA sola línea review (singular)", () => {
     const props = baseProps({
       segments: [
         { start: 1.0, end: 2.0, text: "alpha", review: true },
-        { start: 2.0, end: 3.0, text: "beta", review: true },        // solo 2 review
+        { start: 2.0, end: 3.0, text: "beta", review: false },
         { start: 3.0, end: 4.0, text: "gamma", review: false },
       ],
     });
     render(<LyricsEditor {...props} />);
-    expect(screen.queryByText(/líneas con timing aproximado/i)).toBeNull();
-    // En cambio, los badges per-línea siguen apareciendo (2 review)
-    const badges = screen.getAllByText(/^revisar tiempo$/i);
-    expect(badges.length).toBe(2);
+    expect(screen.getByText(/Sincronizado con tu letra/i)).toBeInTheDocument();
+    // El chip "Revisar" muestra el contador aun con una sola línea (1).
+    expect(within(screen.getByTestId("review-next-btn")).getByText("1")).toBeInTheDocument();
+  });
+
+  it("'Revisar →' hace foco en la siguiente línea review (navegador secuencial)", () => {
+    const props = baseProps({
+      segments: [
+        { start: 1.0, end: 2.0, text: "buena", review: false },
+        { start: 2.0, end: 3.0, text: "revisar una", review: true },
+        { start: 3.0, end: 4.0, text: "revisar dos", review: true },
+      ],
+    });
+    const { container } = render(<LyricsEditor {...props} />);
+    // jsdom no implementa scrollIntoView — stubearlo para no romper.
+    window.HTMLElement.prototype.scrollIntoView = vi.fn();
+    fireEvent.click(screen.getByTestId("review-next-btn"));
+    // El input de la primera línea review recibe foco.
+    expect(document.activeElement).toBe(screen.getByDisplayValue("revisar una"));
+    // Segundo click → la siguiente review.
+    fireEvent.click(screen.getByTestId("review-next-btn"));
+    expect(document.activeElement).toBe(screen.getByDisplayValue("revisar dos"));
   });
 
   it("NO muestra banner cuando ningún segment es review", () => {
@@ -109,7 +129,8 @@ describe("LyricsEditor — review:true banner UX (2026-05-26)", () => {
       ],
     });
     render(<LyricsEditor {...props} />);
-    expect(screen.queryByText(/líneas con timing aproximado/i)).toBeNull();
+    expect(screen.queryByText(/Sincronizado con tu letra/i)).toBeNull();
+    expect(screen.queryByTestId("review-next-btn")).toBeNull();
   });
 });
 
@@ -328,8 +349,8 @@ describe("LyricsEditor — modo enfoque body class broadcast", () => {
   //
   // Fix: LyricsEditor emite la clase `editor-focus-mode` en
   // document.body cuando focusMode=on. UploadZone usa una variante
-  // arbitraria de Tailwind (`[.editor-focus-mode_&]:lg:grid-cols-1`)
-  // para colapsar su grid + esconder stepper + preview central.
+  // arbitraria de Tailwind con dos columnas para esconder el stepper y
+  // mantener una preview compacta junto al editor expandido.
   //
   // Este test cubre el contrato: el body class se aplica al togglear
   // y se LIMPIA al desmontar (sin cleanup, el usuario que navega de
@@ -344,23 +365,23 @@ describe("LyricsEditor — modo enfoque body class broadcast", () => {
     document.body.classList.remove("editor-focus-mode");
   });
 
-  it("toggles the editor-focus-mode body class when the focus button is clicked", async () => {
-    // audioUrl truthy → el sticky control bar que contiene el focus
-    // toggle se monta (gated en LyricsEditor:1856 por `{audioUrl && ...}`).
+  it("toggles the editor-focus-mode body class from the overflow (⋯) menu", async () => {
+    // Rediseño 2026-07: "Expandir / Modo enfoque" dejó de ser un botón
+    // suelto en la barra — ahora vive dentro del menú ⋯ (overflow).
     const props = baseProps({ audioUrl: "blob:mock-audio" });
     render(<LyricsEditor {...props} />);
 
     // Default OFF — la clase no debe estar al montar.
     expect(document.body.classList.contains("editor-focus-mode")).toBe(false);
 
-    // Click el botón "Modo enfoque (F)" (tooltip exacto del component).
-    const focusBtn = screen.getByTitle(/^Modo enfoque \(F\)$/i);
-    await userEvent.click(focusBtn);
+    // Abrí el menú ⋯ y clic en "Expandir (modo enfoque)".
+    await userEvent.click(screen.getByTestId("editor-overflow-btn"));
+    await userEvent.click(screen.getByText(/Expandir \(modo enfoque\)/i));
     expect(document.body.classList.contains("editor-focus-mode")).toBe(true);
 
-    // Click otra vez — apaga. El tooltip ahora dice "Salir...".
-    const exitBtn = screen.getByTitle(/^Salir de modo enfoque \(F\)$/i);
-    await userEvent.click(exitBtn);
+    // Reabrí el menú — el item ahora dice "Salir de modo enfoque".
+    await userEvent.click(screen.getByTestId("editor-overflow-btn"));
+    await userEvent.click(screen.getByText(/Salir de modo enfoque/i));
     expect(document.body.classList.contains("editor-focus-mode")).toBe(false);
   });
 
@@ -368,9 +389,9 @@ describe("LyricsEditor — modo enfoque body class broadcast", () => {
     const props = baseProps({ audioUrl: "blob:mock-audio" });
     const { unmount } = render(<LyricsEditor {...props} />);
 
-    // Prendé focus mode.
-    const focusBtn = screen.getByTitle(/^Modo enfoque \(F\)$/i);
-    await userEvent.click(focusBtn);
+    // Prendé focus mode desde el menú ⋯.
+    await userEvent.click(screen.getByTestId("editor-overflow-btn"));
+    await userEvent.click(screen.getByText(/Expandir \(modo enfoque\)/i));
     expect(document.body.classList.contains("editor-focus-mode")).toBe(true);
 
     // Operador navega a otro step / cambia de pantalla — el editor
@@ -495,7 +516,30 @@ describe("LyricsEditor — durable save on page unload (refresh/close) (2026-06-
     const [jobId, segments, opts] = onPersistSegments.mock.calls[0];
     expect(jobId).toBe("job-1");
     expect(segments).toEqual([{ start: 1.0, end: 2.0, text: "alpha EDITED" }]);
-    expect(opts).toEqual({ keepalive: true });
+    expect(opts).toMatchObject({ keepalive: true, baseRevision: 0 });
+  });
+
+  it("still sends keepalive when localStorage is blocked or full", () => {
+    const onPersistSegments = vi.fn().mockResolvedValue({ ok: true });
+    const storageSpy = vi.spyOn(localStorage, "setItem").mockImplementation(() => {
+      throw new DOMException("quota", "QuotaExceededError");
+    });
+    try {
+      render(<LyricsEditor {...baseProps({
+        segments: [{ start: 1.0, end: 2.0, text: "alpha line" }],
+        transcribeJobId: "job-storage-blocked",
+        onPersistSegments,
+        user: { id: 7 },
+      })} />);
+      fireEvent.change(screen.getByDisplayValue("alpha line"), {
+        target: { value: "latest edit" },
+      });
+      window.dispatchEvent(new Event("pagehide"));
+      expect(onPersistSegments).toHaveBeenCalledTimes(1);
+      expect(onPersistSegments.mock.calls[0][2]).toMatchObject({ keepalive: true });
+    } finally {
+      storageSpy.mockRestore();
+    }
   });
 
   it("does not fire a save on unload when there is nothing pending", () => {

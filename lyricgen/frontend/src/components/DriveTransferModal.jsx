@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
+import useDialogA11y from "../hooks/useDialogA11y";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -114,6 +115,7 @@ export default function DriveTransferModal({ jobId, fileType, onClose }) {
   const isError = status?.status === "error" || !!submitError;
   const errorMessage = submitError || status?.error;
   const progress = status?.progress_pct ?? 0;
+  const dialogRef = useDialogA11y({ onClose, closeOnEscape: isDone || isError });
 
   return (
     <div
@@ -126,10 +128,15 @@ export default function DriveTransferModal({ jobId, fileType, onClose }) {
       }}
     >
       <div
+        ref={dialogRef}
+        tabIndex={-1}
         className="w-full max-w-md mx-4 bg-surface-1 ring-1 ring-white/[0.08] rounded-2xl p-6 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="drive-transfer-title"
       >
-        <h3 className="text-lg font-semibold text-white mb-1">
+        <h3 id="drive-transfer-title" className="text-lg font-semibold text-white mb-1">
           {t("drive.transfer_title")}
         </h3>
         <p className="text-xs text-gray-400 mb-5">

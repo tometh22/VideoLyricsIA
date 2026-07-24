@@ -48,6 +48,7 @@ def run_transcription_job(
     title: str = "",
     filename: str = "",
     live: bool = False,
+    anchor_lyrics: str = "",
 ) -> dict:
     """RQ entry point — sync wrapper around `_run_transcription_for_job`.
 
@@ -65,8 +66,8 @@ def run_transcription_job(
     # corre otros queues. asyncio.run abre/cierra su propio event loop por job,
     # que es lo que queremos (jobs independientes, sin event-loop leak).
     from main import (  # type: ignore
-        _looks_live, _maybe_ctc_retime, _maybe_adlib_filter,
-        _run_transcription_for_job,
+        _looks_live, _maybe_anchor_align, _maybe_ctc_retime,
+        _maybe_adlib_filter, _run_transcription_for_job,
     )
     from jobs import update_job, get_job
     import storage
@@ -119,7 +120,19 @@ def run_transcription_job(
             #   1. CTC re-time (CTC_ALIGN_ENABLED, default off)
             #   2. filtro de fantasmas + colapso de ad-libs (ADLIB_CONSENSUS_
             #      ENABLED, default off) — corre aunque CTC declinó.
-            r = await _maybe_ctc_retime(r, audio_path, job_id, artist, title)
+            # Versión B (ANCHOR_LYRICS_ENABLED, default off): si el operador
+            # pegó la letra oficial, anclarla con CTC ANTES del retime normal.
+            # Si ancló (timing_source == "anchor_ctc"), saltear el retime CTC
+            # de la cascada — los segments YA salieron del motor CTC con la
+            # letra oficial, un segundo retime sería doble trabajo sobre otro
+            # texto. En decline/excepción el helper devuelve r intacto y este
+            # if no matchea → cae a la Versión A tal cual hoy.
+            if (anchor_lyrics or "").strip():
+                r = await _maybe_anchor_align(r, audio_path, job_id,
+                                              anchor_lyrics)
+            if not (isinstance(r, dict)
+                    and r.get("timing_source") == "anchor_ctc"):
+                r = await _maybe_ctc_retime(r, audio_path, job_id, artist, title)
             r = await _maybe_adlib_filter(
                 r, audio_path, job_id,
                 live_hint=live or _looks_live(title, filename))

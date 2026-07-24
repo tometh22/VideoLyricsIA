@@ -28,6 +28,12 @@ const PREVIEW_LAYOUTS = {
 };
 const MIN_RATIO = 0.62;   // mirrors fit_title_text's min_size
 
+// Intro-length threshold (seconds) that "auto" uses to pick centered hero vs
+// compact badge. This MUST stay in lockstep with the backend
+// (ass_render.title_card_lines: `START_T(0.3) + 0.5`). The parity test in
+// TitleCardPreview.test.jsx parses ass_render.py and fails CI if they drift.
+export const AUTO_INTRO_THRESHOLD_S = 0.8;
+
 const ARTIST_FONT = "'Montserrat', system-ui, sans-serif"; // ExtraBold (800)
 
 function nfc(s) {
@@ -128,6 +134,12 @@ export default function TitleCardPreview({
   // previous render so no existing job is affected by this prop being
   // threaded everywhere.
   songLines = null,
+  // First sung line's start, in seconds. Lets the "auto" template resolve the
+  // SAME way the backend does (long instrumental intro → centered hero, else
+  // the compact badge) so the preview stops lying about short-intro songs.
+  // null/undefined = intro length not known yet (transcription still running);
+  // we assume the centered hero and the preview auto-corrects once it arrives.
+  firstLyricStart = null,
   label,
 }) {
   const boxRef = useRef(null);
@@ -175,10 +187,22 @@ export default function TitleCardPreview({
   const songFamily = songResolved.css || ARTIST_FONT;
   const songWeight = songResolved.weight || 700;
 
-  // Layout geometry mirrors ass_render._TITLE_LAYOUTS. "auto" → centered hero
-  // (the preview has no intro length, so it shows the common case). size ×
-  // titleSize, clamped 0.5–2.0 like the backend.
-  const tmpl = ["centered", "lower_third", "badge"].includes(template) ? template : "centered";
+  // Layout geometry mirrors ass_render._TITLE_LAYOUTS. "auto" resolves EXACTLY
+  // like the backend (ass_render.title_card_lines): a long instrumental intro
+  // (first sung line > 0.8s) renders the centered hero, otherwise the compact
+  // lower-left badge. When the intro length is unknown (firstLyricStart null,
+  // transcription not finished) we assume the hero — the common case — and the
+  // preview auto-corrects once the segments arrive. size × titleSize, clamped
+  // 0.5–2.0 like the backend.
+  const resolveAuto = () =>
+    firstLyricStart == null
+      ? "centered"
+      : firstLyricStart > AUTO_INTRO_THRESHOLD_S
+        ? "centered"
+        : "badge";
+  const tmpl = ["centered", "lower_third", "badge"].includes(template)
+    ? template
+    : resolveAuto();
   const L = PREVIEW_LAYOUTS[tmpl];
   const sizeN = Math.max(0.5, Math.min(2.0, parseFloat(titleSize) || 1));
   const maxWidth = boxW * L.safe;

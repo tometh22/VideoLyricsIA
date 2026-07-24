@@ -13,7 +13,9 @@
  * naive es <50 ms; >5k pasar a fuse.js (15 min de migración cuando ese
  * momento llegue).
  */
-import { useEffect, useRef, useState, useMemo } from "react";
+import { useCallback, useEffect, useRef, useState, useMemo } from "react";
+import useDialogA11y from "../hooks/useDialogA11y";
+import { useI18n } from "../i18n";
 
 function timeAgo(ts) {
   if (!ts) return "";
@@ -28,22 +30,22 @@ function timeAgo(ts) {
 // HistoryView/StatusBadge pero condensado para una tabla densa de
 // resultados (no necesitamos el badge pill, sí un mini icono).
 const STATUS_DOT = {
-  done:                { color: "bg-accent",   label: "Listo" },
-  pending_review:      { color: "bg-amber-400",label: "Pendiente" },
-  processing:          { color: "bg-brand animate-pulse", label: "Procesando" },
-  queued:              { color: "bg-gray-500", label: "En cola" },
-  editing:             { color: "bg-brand animate-pulse", label: "Re-render" },
-  transcribed:         { color: "bg-gray-400", label: "Sin generar" },
-  transcribed_pending: { color: "bg-gray-400", label: "Sin generar" },
-  transcribing:        { color: "bg-brand animate-pulse", label: "Transcribiendo" },
-  transcribing_queued: { color: "bg-gray-500", label: "En cola" },
-  awaiting_upload:     { color: "bg-gray-500", label: "Subiendo" },
-  transcription_failed:{ color: "bg-red-400",  label: "Error transcr" },
-  error:               { color: "bg-red-400",  label: "Error" },
-  validation_failed:   { color: "bg-red-400",  label: "Validación falló" },
-  rejected:            { color: "bg-red-400",  label: "Rechazado" },
-  bg_preview_queued:   { color: "bg-gray-500", label: "Pre-render BG" },
-  bg_preview_failed:   { color: "bg-red-400",  label: "Pre-render falló" },
+  done:                { color: "bg-accent", labelKey: "status.done" },
+  pending_review:      { color: "bg-amber-400", labelKey: "status.pending_review" },
+  processing:          { color: "bg-brand animate-pulse", labelKey: "status.processing" },
+  queued:              { color: "bg-gray-500", labelKey: "status.queued" },
+  editing:             { color: "bg-brand animate-pulse", labelKey: "status.editing" },
+  transcribed:         { color: "bg-gray-400", labelKey: "status.transcribed" },
+  transcribed_pending: { color: "bg-gray-400", labelKey: "status.transcribed" },
+  transcribing:        { color: "bg-brand animate-pulse", labelKey: "status.transcribing" },
+  transcribing_queued: { color: "bg-gray-500", labelKey: "status.queued" },
+  awaiting_upload:     { color: "bg-gray-500", labelKey: "status.awaiting_upload" },
+  transcription_failed:{ color: "bg-red-400", labelKey: "status.transcription_failed" },
+  error:               { color: "bg-red-400", labelKey: "status.error" },
+  validation_failed:   { color: "bg-red-400", labelKey: "status.validation_failed" },
+  rejected:            { color: "bg-red-400", labelKey: "status.rejected" },
+  bg_preview_queued:   { color: "bg-gray-500", labelKey: "status.bg_preview_queued" },
+  bg_preview_failed:   { color: "bg-red-400", labelKey: "status.bg_preview_failed" },
 };
 
 function parseName(filename) {
@@ -56,10 +58,18 @@ function parseName(filename) {
 }
 
 export default function SearchPalette({ isOpen, onClose, jobs, onSelectJob }) {
+  const { t } = useI18n();
   const [query, setQuery] = useState("");
   const [activeIdx, setActiveIdx] = useState(0);
   const inputRef = useRef(null);
   const listRef = useRef(null);
+  const dialogRef = useDialogA11y({ open: isOpen, onClose, initialFocusRef: inputRef });
+
+  const selectJob = useCallback((job) => {
+    if (!job?.job_id) return;
+    const accepted = onSelectJob(job.job_id, job.status);
+    if (accepted !== false) onClose();
+  }, [onClose, onSelectJob]);
 
   // Reset al abrir/cerrar — no preservamos query entre opens (siempre
   // se entra al palette "fresh" como en Linear)
@@ -67,8 +77,6 @@ export default function SearchPalette({ isOpen, onClose, jobs, onSelectJob }) {
     if (isOpen) {
       setQuery("");
       setActiveIdx(0);
-      // Pequeño delay para que el ref esté montado tras la transición
-      setTimeout(() => inputRef.current?.focus(), 50);
     }
   }, [isOpen]);
 
@@ -109,11 +117,6 @@ export default function SearchPalette({ isOpen, onClose, jobs, onSelectJob }) {
   useEffect(() => {
     if (!isOpen) return;
     const handler = (e) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        onClose();
-        return;
-      }
       if (e.key === "ArrowDown") {
         e.preventDefault();
         setActiveIdx((i) => Math.min(i + 1, Math.max(results.length - 1, 0)));
@@ -128,15 +131,14 @@ export default function SearchPalette({ isOpen, onClose, jobs, onSelectJob }) {
         e.preventDefault();
         const sel = results[activeIdx];
         if (sel && sel.job_id) {
-          onClose();
-          onSelectJob(sel.job_id);
+          selectJob(sel);
         }
         return;
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [isOpen, results, activeIdx, onClose, onSelectJob]);
+  }, [isOpen, results, activeIdx, onClose, selectJob]);
 
   // Auto-scroll del item activo cuando navega con teclado
   useEffect(() => {
@@ -153,8 +155,13 @@ export default function SearchPalette({ isOpen, onClose, jobs, onSelectJob }) {
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
+        tabIndex={-1}
         className="w-full max-w-2xl rounded-2xl bg-surface-2 ring-1 ring-white/10 shadow-2xl overflow-hidden"
         onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label={t("search.aria_label")}
       >
         {/* Input */}
         <div className="flex items-center gap-3 px-5 py-4 border-b border-white/[0.06]">
@@ -165,7 +172,7 @@ export default function SearchPalette({ isOpen, onClose, jobs, onSelectJob }) {
             ref={inputRef}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Buscar artista, canción o ID…"
+            placeholder={t("search.placeholder")}
             className="flex-1 bg-transparent outline-none text-[15px] text-white placeholder:text-gray-500"
             spellCheck={false}
             autoComplete="off"
@@ -181,8 +188,8 @@ export default function SearchPalette({ isOpen, onClose, jobs, onSelectJob }) {
             <div className="px-5 py-10 text-center">
               <p className="text-sm text-gray-400">
                 {query.trim()
-                  ? <>No encontramos videos para <span className="font-mono text-white">"{query.trim()}"</span></>
-                  : "Subí tu primer audio para arrancar"}
+                  ? <>{t("search.no_results")} <span className="font-mono text-white">"{query.trim()}"</span></>
+                  : t("search.empty")}
               </p>
             </div>
           ) : (
@@ -190,21 +197,21 @@ export default function SearchPalette({ isOpen, onClose, jobs, onSelectJob }) {
               {!query.trim() && (
                 <div className="px-5 pt-2 pb-1">
                   <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 font-semibold">
-                    Recientes
+                    {t("search.recent")}
                   </p>
                 </div>
               )}
               {results.map((job, i) => {
                 const { artist, song } = parseName(job.filename);
                 const displayArtist = job.artist || artist || "—";
-                const displaySong = job.song_title || song || "(sin nombre)";
-                const status = STATUS_DOT[job.status] || { color: "bg-gray-500", label: job.status };
+                const displaySong = job.song_title || song || t("search.untitled");
+                const status = STATUS_DOT[job.status] || { color: "bg-gray-500" };
                 const isActive = i === activeIdx;
                 return (
                   <button
                     key={job.job_id}
                     data-result-idx={i}
-                    onClick={() => { onClose(); onSelectJob(job.job_id); }}
+                    onClick={() => selectJob(job)}
                     onMouseEnter={() => setActiveIdx(i)}
                     className={`w-full flex items-center gap-3 px-5 py-2.5 text-left transition-colors
                       ${isActive ? "bg-white/[0.06]" : "hover:bg-white/[0.03]"}`}
@@ -223,7 +230,7 @@ export default function SearchPalette({ isOpen, onClose, jobs, onSelectJob }) {
                       {timeAgo(job.created_at)}
                     </span>
                     <span className="text-[10px] text-gray-500 shrink-0 w-[80px] text-right">
-                      {status.label}
+                      {status.labelKey ? t(status.labelKey) : job.status}
                     </span>
                   </button>
                 );
@@ -237,19 +244,19 @@ export default function SearchPalette({ isOpen, onClose, jobs, onSelectJob }) {
           <div className="flex items-center gap-3 text-[10px] text-gray-500">
             <span className="flex items-center gap-1">
               <kbd className="px-1.5 h-4 inline-flex items-center rounded font-mono bg-white/[0.06] ring-1 ring-white/10">↑↓</kbd>
-              navegar
+              {t("search.navigate")}
             </span>
             <span className="flex items-center gap-1">
               <kbd className="px-1.5 h-4 inline-flex items-center rounded font-mono bg-white/[0.06] ring-1 ring-white/10">↵</kbd>
-              abrir
+              {t("search.open")}
             </span>
             <span className="flex items-center gap-1">
               <kbd className="px-1.5 h-4 inline-flex items-center rounded font-mono bg-white/[0.06] ring-1 ring-white/10">esc</kbd>
-              cerrar
+              {t("search.close")}
             </span>
           </div>
           <span className="text-[10px] text-gray-500 font-mono tabular-nums">
-            {results.length} {results.length === 1 ? "resultado" : "resultados"}
+            {results.length} {results.length === 1 ? t("search.result") : t("search.results")}
           </span>
         </div>
       </div>
