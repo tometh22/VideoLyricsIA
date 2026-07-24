@@ -1236,6 +1236,25 @@ async def health_live():
     return {"status": "alive"}
 
 
+@app.get("/health/deploy")
+async def health_deploy():
+    """Railway deploy gate — critical dependencies, rollout-safe fleet check.
+
+    Exact API/worker release equality cannot be a deploy precondition: during
+    a rolling release the new API necessarily starts while the old worker
+    fleet is still serving. Keep reporting that mismatch as degraded, while
+    DB/Redis failures remain hard 503s. `/health/ready` stays strict for the
+    post-deploy operational gate.
+    """
+    snap = await asyncio.to_thread(
+        health_snapshot,
+        enforce_fleet_readiness=False,
+    )
+    if snap.get("status") == "down":
+        return JSONResponse(snap, status_code=503)
+    return snap
+
+
 @app.get("/health/ready")
 async def health_ready():
     """Readiness probe — returns 200 if all dependencies are reachable.
