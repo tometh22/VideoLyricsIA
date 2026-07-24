@@ -9262,6 +9262,15 @@ class EditJobRequest(BaseModel):
     # job's persisted movement_style. Validated as free-text; normalized
     # downstream by _normalize_movement_style.
     movement_style: str | None = Field(default=None, max_length=64)
+    # Scene axes editable in the wizard for a background regen. None = keep
+    # persisted (only sent when the operator CHANGED them — same None-means-
+    # keep contract as movement_style/background_mode). The pipeline already
+    # reads all three from merged render_params (pipeline.py ~15459); mirrors
+    # the /generate limits. genre/concept steer the AI scene vocabulary;
+    # match_lyrics = "Inspirado en la letra" (True) vs "Auto/Mi prompt" (False).
+    genre: str | None = Field(default=None, max_length=64)
+    concept: str | None = Field(default=None, max_length=2000)
+    match_lyrics: bool | None = Field(default=None)
     # "Usar mi prompt tal cual": when True (and background_hint is set),
     # the hint goes straight to Veo without Gemini's rewrite. Only
     # meaningful for edit_type=="background". None = keep persisted: the
@@ -10717,6 +10726,29 @@ async def request_edit(
         _rp_mv = dict(job.render_params or {})
         _rp_mv["movement_style"] = _mv
         job.render_params = _rp_mv
+    # Scene axes (genre / concept / match_lyrics) — editable in the wizard for
+    # a regen. None = keep persisted (only sent when CHANGED). Mirror the
+    # movement_style block: forward through edit_params AND persist durably so
+    # a later "Regenerar fondo" / reaped retry reproduces the operator's pick.
+    # The pipeline reads all three from merged render_params (pipeline.py).
+    if body.edit_type == "background" and body.genre is not None:
+        _g = (body.genre or "").strip()
+        edit_params["genre"] = _g
+        _rp_g = dict(job.render_params or {})
+        _rp_g["genre"] = _g
+        job.render_params = _rp_g
+    if body.edit_type == "background" and body.concept is not None:
+        _c = (body.concept or "").strip()
+        edit_params["concept"] = _c
+        _rp_c = dict(job.render_params or {})
+        _rp_c["concept"] = _c
+        job.render_params = _rp_c
+    if body.edit_type == "background" and body.match_lyrics is not None:
+        _ml = bool(body.match_lyrics)
+        edit_params["match_lyrics"] = _ml
+        _rp_ml = dict(job.render_params or {})
+        _rp_ml["match_lyrics"] = _ml
+        job.render_params = _rp_ml
     if body.edit_type == "background" and body.bg_verbatim is not None:
         # "Usar mi prompt tal cual" — send background_hint straight to Veo.
         # None = keep persisted (BUG-5): the unified wizard only sends this

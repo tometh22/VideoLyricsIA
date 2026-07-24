@@ -265,3 +265,60 @@ def test_bg_verbatim_explicit_false_is_written(client, admin_token, db, monkeypa
     )
     assert res.status_code == 200, res.text
     assert captured[0]["edit_params"].get("bg_verbatim") is False
+
+
+# ── Scene axes editable en un regen: genre / concept / match_lyrics ─────
+# Cableados 2026-07-24. None = keep persisted (solo se mandan si cambiaron);
+# el pipeline los lee de merged render_params.
+
+def test_scene_axes_forwarded_and_persisted(client, admin_token, db, monkeypatch):
+    """genre/concept/match_lyrics enviados → edit_params + render_params."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _bg_job_with_render_params(
+        db, tenant_id, user_id,
+        {"genre": "rock", "concept": "ciudad", "match_lyrics": True},
+    )
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={
+            "edit_type": "background",
+            "genre": "pop",
+            "concept": "naturaleza",
+            "match_lyrics": False,
+        },
+    )
+    assert res.status_code == 200, res.text
+    ep = captured[0]["edit_params"]
+    assert ep.get("genre") == "pop"
+    assert ep.get("concept") == "naturaleza"
+    assert ep.get("match_lyrics") is False
+    db.expire_all()
+    job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+    assert job.render_params.get("genre") == "pop"
+    assert job.render_params.get("concept") == "naturaleza"
+    assert job.render_params.get("match_lyrics") is False
+
+
+def test_scene_axes_absent_keep_persisted(client, admin_token, db, monkeypatch):
+    """Un edit que no toca género/concepto/modo no los pisa (None-aware)."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _bg_job_with_render_params(
+        db, tenant_id, user_id,
+        {"genre": "rock", "concept": "ciudad", "match_lyrics": False},
+    )
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "background", "movement_style": "animado"},
+    )
+    assert res.status_code == 200, res.text
+    ep = captured[0]["edit_params"]
+    assert "genre" not in ep and "concept" not in ep and "match_lyrics" not in ep
+    db.expire_all()
+    job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+    assert job.render_params.get("genre") == "rock"
+    assert job.render_params.get("concept") == "ciudad"
+    assert job.render_params.get("match_lyrics") is False

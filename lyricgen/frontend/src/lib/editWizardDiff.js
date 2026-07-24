@@ -146,6 +146,21 @@ export function computeFieldDiff(baseline, current) {
   if (!strEq(baseline.movementStyle, current.movementStyle)) {
     bgDiff.movement_style = current.movementStyle || "";
   }
+  // Scene axes editable in edit mode (2026-07-24): género/concepto steer the AI
+  // scene vocabulary; matchLyrics = "Inspirado en la letra" (true) vs
+  // Auto/"Mi prompt" (false). Backend persists them for edit_type=background
+  // and the pipeline reads them from render_params → they regenerate the scene.
+  // baseline and current are both seeded from the job's render_params so an
+  // untouched value never spuriously diffs (no BUG-5-class clobber).
+  if (!strEq(baseline.genre, current.genre)) {
+    bgDiff.genre = current.genre || "";
+  }
+  if (!strEq(baseline.concept, current.concept)) {
+    bgDiff.concept = current.concept || "";
+  }
+  if (!!baseline.matchLyrics !== !!current.matchLyrics) {
+    bgDiff.match_lyrics = !!current.matchLyrics;
+  }
   if (Object.keys(bgDiff).length > 0) {
     out.background = bgDiff;
   }
