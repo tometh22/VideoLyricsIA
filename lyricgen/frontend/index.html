@@ -3,22 +3,91 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>GenLy</title>
+    <!-- Defense-in-depth cache-busting. Vercel ya emite Cache-Control:
+         no-cache, no-store, must-revalidate para este HTML (ver
+         vercel.json), pero algunos browsers honran solo a medias el
+         header HTTP cuando el documento viene de una rewrite. Estos
+         meta tags duplican la intención al nivel del documento.
+         CRÍTICO: si los browsers cachean este HTML, siguen apuntando al
+         hash de JS viejo después de un deploy y el user ve UI rota
+         hasta hacer hard-refresh. Bug observado el 2026-05-13 con un
+         user que veía un index-CV152LX6.js cacheado mientras el server
+         servía index-KHXUzRn0.js. -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <title>GenLy AI — Lyric videos con IA a escala de catálogo</title>
+    <meta name="description" content="Generá lyric videos Full HD con fondos cinematográficos únicos por IA. 100% tuyos, sin riesgo de ContentID. Producción a escala para sellos y artistas." />
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="GenLy AI" />
+    <meta property="og:title" content="GenLy AI — Lyric videos con IA a escala de catálogo" />
+    <meta property="og:description" content="Fondos cinematográficos únicos por IA, full HD, 100% tuyos y sin riesgo de ContentID. De MP3 a lyric video en minutos." />
+    <meta property="og:image" content="/samples/sample-reef.png" />
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="GenLy AI — Lyric videos con IA a escala de catálogo" />
+    <meta name="twitter:description" content="Fondos cinematográficos únicos por IA, full HD, 100% tuyos y sin riesgo de ContentID." />
+    <meta name="twitter:image" content="/samples/sample-reef.png" />
     <!-- §10 Logo implementation — single source of truth. The favicon
          uses the G mark only (per the brand kit rules); the navbar /
-         footer / auth screens use the full lockup. -->
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+         footer / auth screens use the full lockup. PNG variants cover
+         every browser/device; .ico catches naive GET /favicon.ico hits
+         (avoids the SPA fallback returning index.html as a "favicon");
+         apple-touch-icon is what iOS Safari uses for "Add to Home
+         Screen". SVG is a base64-wrapped PNG so SVG-preferring browsers
+         render the same image as the PNG fallback (the prior hand-coded
+         vector SVG was a different earlier design without the blue
+         dot). -->
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
     <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/favicon-192.png" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="shortcut icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <!-- Google Fonts for the lyric-video font picker preview. The 8 families
          here mirror the backend's _FONT_CATALOGUE so what the operator sees
          in the dropdown is exactly what the worker renders. -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Anton&family=Bebas+Neue&family=Jost:wght@700&family=Montserrat:wght@700;800&family=Outfit:wght@700&family=Oswald:wght@700&family=Poppins:wght@700&family=Roboto:wght@700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Anton&family=Bebas+Neue&family=Fredoka:wght@600&family=Jost:wght@700&family=Montserrat:wght@700;800&family=Nunito:wght@800&family=Outfit:wght@700&family=Oswald:wght@700&family=Poppins:wght@700&family=Quicksand:wght@700&family=Roboto:wght@700&display=swap" rel="stylesheet">
+    <!-- 2026-05-30 perf: pre-warm the TCP/TLS connection to the backend
+         BEFORE the React bundle finishes parsing. The first real API
+         call (/auth/me, /usage, /jobs) then skips ~120-300 ms of
+         DNS + TCP + TLS handshake — the browser already has an open
+         connection waiting. Listed for prod + staging hostnames; both
+         are harmless when not in use (the connection is opened
+         optimistically and dropped if no request follows). dns-prefetch
+         is the fallback for browsers that ignore preconnect. -->
+    <link rel="preconnect" href="https://api.genly.pro" crossorigin>
+    <link rel="dns-prefetch" href="https://api.genly.pro">
+    <link rel="preconnect" href="https://api-staging-9b82.up.railway.app" crossorigin>
+    <link rel="dns-prefetch" href="https://api-staging-9b82.up.railway.app">
   </head>
   <body class="min-h-screen">
-    <div id="root"></div>
+    <div id="root">
+      <div id="_loader" style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#12121A;gap:16px;">
+        <div style="width:40px;height:40px;border:2px solid #6D4AFF;border-top-color:transparent;border-radius:50%;animation:_spin 0.8s linear infinite;"></div>
+        <p id="_loader_msg" style="color:#A0A3B1;font-family:sans-serif;font-size:13px;margin:0;"></p>
+      </div>
+      <style>@keyframes _spin{to{transform:rotate(360deg)}}</style>
+    </div>
+    <script>
+      // If React hasn't mounted after 12s, show the JS error visibly
+      var _t = setTimeout(function() {
+        var el = document.getElementById('_loader_msg');
+        if (el) el.textContent = 'Error al cargar la app. Recargá la página.';
+      }, 12000);
+      window.addEventListener('error', function(e) {
+        clearTimeout(_t);
+        var el = document.getElementById('_loader_msg');
+        if (el) el.textContent = 'JS Error: ' + (e.message || 'desconocido') + ' — ' + (e.filename || '');
+      });
+      window.addEventListener('unhandledrejection', function(e) {
+        var el = document.getElementById('_loader_msg');
+        if (el && !el.textContent) el.textContent = 'Promise error: ' + String(e.reason);
+      });
+    </script>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

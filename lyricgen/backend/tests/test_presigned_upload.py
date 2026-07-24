@@ -295,6 +295,104 @@ def test_multipart_complete_clears_upload_id(client, monkeypatch):
         s.close()
 
 
+def test_multipart_complete_recovers_when_object_already_present(client, monkeypatch):
+    """A concurrent / duplicate complete gets NoSuchUpload from R2
+    (multipart_complete → None) but the object is durably stored: the
+    endpoint HEADs the key, sees the bytes, and answers 200 instead of a
+    spurious error. Prod 2026-07-06 (UMG .wav double-submit)."""
+    import main
+    from database import SessionLocal
+    from jobs import get_job_model
+
+    _, token, _, _ = _make_user(client)
+    monkeypatch.setattr("main.storage.is_enabled", lambda: True)
+    monkeypatch.setattr(main, "_MULTIPART_THRESHOLD_BYTES", 1)
+    monkeypatch.setattr(
+        "main.storage.multipart_init",
+        lambda *a, **k: {"upload_id": "UP", "key": "inputs/x/y/z.wav"},
+    )
+    # R2 says the multipart upload no longer exists (NoSuchUpload swallowed
+    # to None), but the stitched object IS present.
+    monkeypatch.setattr(
+        "main.storage.multipart_complete", lambda key, upload_id, parts: None,
+    )
+    monkeypatch.setattr("main.storage.head_object_size", lambda key: 42 * 1024 * 1024)
+
+    job_id = client.post(
+        "/upload-url",
+        json={"filename": "z.wav", "size_bytes": 60 * 1024 * 1024},
+        headers=auth(token),
+    ).json()["job_id"]
+    client.post(
+        "/upload-multipart-init",
+        json={"job_id": job_id, "filename": "z.wav"},
+        headers=auth(token),
+    )
+
+    res = client.post(
+        "/upload-multipart-complete",
+        json={"job_id": job_id, "parts": [{"part_number": 1, "etag": "abc123"}]},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+
+    s = SessionLocal()
+    try:
+        row = get_job_model(s, job_id)
+        assert row.multipart_upload_id is None  # handle cleared
+        assert row.input_r2_key  # durable object stays
+    finally:
+        s.close()
+
+
+def test_multipart_complete_dead_upload_clears_id_and_asks_reupload(client, monkeypatch):
+    """When multipart_complete fails AND no object landed, the upload_id is
+    permanently gone (R2 abort / stale sweep). The endpoint drops the dead
+    handle so the row doesn't wedge in awaiting_upload and returns 409 —
+    retrying complete is futile, the client must re-upload."""
+    import main
+    from database import SessionLocal
+    from jobs import get_job_model
+
+    _, token, _, _ = _make_user(client)
+    monkeypatch.setattr("main.storage.is_enabled", lambda: True)
+    monkeypatch.setattr(main, "_MULTIPART_THRESHOLD_BYTES", 1)
+    monkeypatch.setattr(
+        "main.storage.multipart_init",
+        lambda *a, **k: {"upload_id": "UP", "key": "inputs/x/y/z.wav"},
+    )
+    monkeypatch.setattr(
+        "main.storage.multipart_complete", lambda key, upload_id, parts: None,
+    )
+    # No object at the key — the multipart upload is genuinely gone.
+    monkeypatch.setattr("main.storage.head_object_size", lambda key: None)
+
+    job_id = client.post(
+        "/upload-url",
+        json={"filename": "z.wav", "size_bytes": 60 * 1024 * 1024},
+        headers=auth(token),
+    ).json()["job_id"]
+    client.post(
+        "/upload-multipart-init",
+        json={"job_id": job_id, "filename": "z.wav"},
+        headers=auth(token),
+    )
+
+    res = client.post(
+        "/upload-multipart-complete",
+        json={"job_id": job_id, "parts": [{"part_number": 1, "etag": "abc123"}]},
+        headers=auth(token),
+    )
+    assert res.status_code == 409
+
+    s = SessionLocal()
+    try:
+        row = get_job_model(s, job_id)
+        assert row.multipart_upload_id is None  # dead handle dropped
+    finally:
+        s.close()
+
+
 def test_multipart_abort_is_idempotent(client, monkeypatch):
     """Two consecutive aborts return 200 and don't error — the abort
     button should be safe to mash."""
@@ -552,3 +650,137 @@ def test_legacy_upload_emits_deprecation_headers(client, monkeypatch):
     assert res.headers.get("Deprecation") == "true"
     assert "Sunset" in res.headers
     assert "successor-version" in res.headers.get("Link", "")
+
+
+# ---------------------------------------------------------------------------
+# Hardening post-150MB (2026-07-02): complete que miente, tamaño real, ge=0
+# ---------------------------------------------------------------------------
+
+
+def _mk_multipart_job(client, monkeypatch, token):
+    """upload-url (declared small) + init with multipart forced on."""
+    import main
+    monkeypatch.setattr("main.storage.is_enabled", lambda: True)
+    monkeypatch.setattr(main, "_MULTIPART_THRESHOLD_BYTES", 1)
+    monkeypatch.setattr(
+        "main.storage.multipart_init",
+        lambda *a, **k: {"upload_id": "UP", "key": "inputs/x/y/z.wav"},
+    )
+    job_id = client.post(
+        "/upload-url",
+        json={"filename": "z.wav", "size_bytes": 2048},
+        headers=auth(token),
+    ).json()["job_id"]
+    client.post(
+        "/upload-multipart-init",
+        json={"job_id": job_id, "filename": "z.wav"},
+        headers=auth(token),
+    )
+    return job_id
+
+
+def test_multipart_complete_413_when_object_oversized(client, monkeypatch):
+    """The 413 in /upload-url trusts the declared size; the presigned
+    parts don't constrain the body. After complete, HEAD the real object
+    and reject + delete anything over MAX_UPLOAD_MB."""
+    import main
+    from database import SessionLocal
+    from jobs import get_job_model
+
+    _, token, _, _ = _make_user(client)
+    job_id = _mk_multipart_job(client, monkeypatch, token)
+    monkeypatch.setattr(
+        "main.storage.multipart_complete", lambda key, upload_id, parts: key,
+    )
+    monkeypatch.setattr(main, "MAX_UPLOAD_MB", 1)
+    monkeypatch.setattr(
+        "main.storage.head_object_size", lambda key: 2 * 1024 * 1024,
+    )
+    deleted = []
+    monkeypatch.setattr(
+        "main.storage.delete_object", lambda key: deleted.append(key),
+    )
+
+    res = client.post(
+        "/upload-multipart-complete",
+        json={"job_id": job_id, "parts": [{"part_number": 1, "etag": "abc"}]},
+        headers=auth(token),
+    )
+    assert res.status_code == 413
+    assert deleted == ["inputs/x/y/z.wav"]
+
+    s = SessionLocal()
+    try:
+        # upload handle cleared: nothing left in-flight to abort.
+        assert get_job_model(s, job_id).multipart_upload_id is None
+    finally:
+        s.close()
+
+
+def test_multipart_complete_head_unavailable_still_succeeds(client, monkeypatch):
+    """HEAD failing (None) must not block a legit upload — the size gate
+    is defense-in-depth, not a new hard dependency on R2 HEAD."""
+    _, token, _, _ = _make_user(client)
+    job_id = _mk_multipart_job(client, monkeypatch, token)
+    monkeypatch.setattr(
+        "main.storage.multipart_complete", lambda key, upload_id, parts: key,
+    )
+    monkeypatch.setattr("main.storage.head_object_size", lambda key: None)
+
+    res = client.post(
+        "/upload-multipart-complete",
+        json={"job_id": job_id, "parts": [{"part_number": 1, "etag": "abc"}]},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+
+
+def test_transcribe_uploaded_413_when_object_oversized(client, monkeypatch):
+    """Single-PUT never passes through /upload-multipart-complete, so the
+    real-size gate must also run before downloading in /transcribe-uploaded
+    (a client that under-declared size_bytes could otherwise make the API
+    materialize an arbitrarily large object on local disk)."""
+    import main
+
+    _, token, _, _ = _make_user(client)
+    monkeypatch.setattr("main.storage.is_enabled", lambda: True)
+    monkeypatch.setattr(
+        "main.storage.presign_put_url",
+        lambda *a, **k: {"url": "https://x", "key": "inputs/x/y/big.wav", "expires_in": 900},
+    )
+    job_id = client.post(
+        "/upload-url",
+        json={"filename": "big.wav", "size_bytes": 1024},
+        headers=auth(token),
+    ).json()["job_id"]
+
+    monkeypatch.setattr(main, "MAX_UPLOAD_MB", 1)
+    monkeypatch.setattr(
+        "main.storage.head_object_size", lambda key: 2 * 1024 * 1024,
+    )
+    downloads = []
+    monkeypatch.setattr(
+        "main.storage.download_object",
+        lambda key, dest: downloads.append(key) or False,
+    )
+
+    res = client.post(
+        "/transcribe-uploaded",
+        json={"job_id": job_id},
+        headers=auth(token),
+    )
+    assert res.status_code == 413
+    assert downloads == []  # rejected before pulling a single byte
+
+
+def test_upload_url_422_when_negative_size(client, monkeypatch):
+    """size_bytes is client-declared; negative values used to sail through
+    every gate (and log '-0.5 MB'). Pydantic ge=0 rejects at the edge."""
+    _, token, _, _ = _make_user(client)
+    monkeypatch.setattr("main.storage.is_enabled", lambda: True)
+    res = client.post(
+        "/upload-url",
+        json={"filename": "z.wav", "size_bytes": -1},
+        headers=auth(token),
+    )
+    assert res.status_code == 422

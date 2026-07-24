@@ -1,8 +1,27 @@
 import { useState } from "react";
 import { useI18n } from "../i18n";
 import BrandLockup from "./BrandLockup";
+import { fetchWithTimeout } from "../fetchWithTimeout";
 
 const API = import.meta.env.VITE_API_URL || "";
+
+// Retries on timeout (backend cold start / slow mobile network).
+// Fails immediately on any server response (4xx/5xx) to avoid
+// locking accounts with repeated bad-credential attempts.
+// onRetry(attempt) lets the UI show progress while retrying.
+async function fetchWithRetry(url, opts, { timeout = 30000, maxAttempts = 3, onRetry } = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (attempt > 1) onRetry?.(attempt);
+    try {
+      return await fetchWithTimeout(url, opts, timeout);
+    } catch (err) {
+      lastErr = err;
+      if (err.name !== "TimeoutError") throw err;
+    }
+  }
+  throw lastErr;
+}
 
 export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete }) {
   const { t, lang, setLang } = useI18n();
@@ -13,6 +32,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
   const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [retryMsg, setRetryMsg] = useState("");
   const [message, setMessage] = useState("");
 
   const handleLogin = async (e) => {
@@ -20,12 +40,13 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     if (!username.trim() || !password.trim()) return;
     setLoading(true);
     setError("");
+    setRetryMsg("");
     try {
-      const res = await fetch(`${API}/auth/login`, {
+      const res = await fetchWithRetry(`${API}/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim(), password }),
-      });
+      }, { onRetry: (n) => setRetryMsg(`Servidor arrancando, reintentando (${n}/3)...`) });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.detail || t("login.error"));
@@ -33,9 +54,12 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
       const data = await res.json();
       onLogin(data.token, data.user);
     } catch (err) {
-      setError(err.message);
+      setError(err.name === "TimeoutError"
+        ? "El servidor no responde. Verificá tu conexión e intentá de nuevo."
+        : err.message);
     } finally {
       setLoading(false);
+      setRetryMsg("");
     }
   };
 
@@ -53,7 +77,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(`${API}/auth/register`, {
+      const res = await fetchWithRetry(`${API}/auth/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim(), password, email: email.trim() }),
@@ -65,7 +89,9 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
       const data = await res.json();
       onLogin(data.token, data.user);
     } catch (err) {
-      setError(err.message);
+      setError(err.name === "TimeoutError"
+        ? "El servidor no responde. Verificá tu conexión e intentá de nuevo."
+        : err.message);
     } finally {
       setLoading(false);
     }
@@ -85,11 +111,11 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(`${API}/auth/reset-password`, {
+      const res = await fetchWithTimeout(`${API}/auth/reset-password`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: resetToken, password }),
-      });
+      }, 15000);
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.detail || t("login.reset_invalid"));
@@ -111,11 +137,11 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(`${API}/auth/forgot-password`, {
+      const res = await fetchWithTimeout(`${API}/auth/forgot-password`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: email.trim() }),
-      });
+      }, 15000);
       await res.json().catch(() => ({}));
       setMessage(t("login.reset_sent"));
       setMode("reset_sent");
@@ -158,7 +184,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
         </div>
       </div>
 
-      <div className="relative z-10 w-full max-w-sm mx-4 animate-fade-in">
+      <div className="relative z-10 w-full max-w-sm mx-4 sm:mx-auto animate-fade-in">
         {/* Logo — full lockup per brand kit §10 (auth screens use the
             full lockup, not the mark only). */}
         <div className="text-center mb-7">

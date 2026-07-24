@@ -1,6 +1,10 @@
 FROM python:3.11-slim
 
 # System deps: ffmpeg for rendering, imagemagick for text layers, fonts, libsndfile for librosa.
+# rclone para el worker que sube ProRes (16 GB) directamente desde R2 a
+# Google Drive del usuario (server-to-server, ~30x más rápido que el
+# flow descargar-y-resubir desde la máquina del operador). Ver
+# drive_uploader.py:upload_via_rclone.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     imagemagick \
@@ -8,7 +12,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-dejavu-core \
     ca-certificates \
     curl \
- && rm -rf /var/lib/apt/lists/*
+    unzip \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL https://rclone.org/install.sh | bash \
+ && rclone version
 
 # ImageMagick's default policy blocks @file read which breaks moviepy's TextClip.
 # We only use it for short lyric text — safe to relax. Debian 12+ ships
@@ -34,4 +41,4 @@ ENV PYTHONUNBUFFERED=1 \
 EXPOSE 8000
 
 # Default command runs the API; override with `python worker.py` for workers.
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 2"]

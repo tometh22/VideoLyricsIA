@@ -5,9 +5,13 @@ https://genly-ai.up.railway.app) and verifies every subsystem the pipeline
 depends on is reachable:
 
   - HTTP 200 within a reasonable timeout
-  - env reported as "prod" (not "dev" — wrong service deployed?)
+  - env reported as one of {prod, production} (not "dev" — wrong service
+    deployed?). Railway uses "production" as ENV; the older deploys used
+    "prod". Both are accepted.
   - redis: "up" (worker queue would be a black hole otherwise)
-  - r2: "configured" (uploads would 500)
+  - r2: "ready" or "configured" (both mean uploads will work — "ready"
+    is post-warmup, "configured" is pre-warmup; "not_configured" and
+    "error" both fail the check).
   - disk_free_gb above a floor (running out of disk silently kills jobs
     mid-render with cryptic ffmpeg errors)
 
@@ -26,6 +30,14 @@ from ._base import Check, CheckResult
 
 DEFAULT_PROD_URL = "https://genly-ai.up.railway.app"
 MIN_DISK_FREE_GB = 5.0
+
+# Acceptable values from /health for an "in-rotation production deploy".
+# observability.health_snapshot already treats both env strings as prod
+# (is_prod = ENV in ("prod", "production")), and reports r2 as "ready"
+# after the post-warmup probe succeeds — "configured" remains for the
+# brief window before warmup, also healthy.
+_OK_ENVS = {"prod", "production"}
+_OK_R2 = {"ready", "configured"}
 
 
 class ProductionHealthCheck(Check):
@@ -68,9 +80,9 @@ class ProductionHealthCheck(Check):
 
         if payload.get("status") != "ok":
             problems.append(f"status is {payload.get('status')!r}, expected 'ok'")
-        if payload.get("env") != "prod":
+        if payload.get("env") not in _OK_ENVS:
             problems.append(
-                f"env is {payload.get('env')!r}, expected 'prod' "
+                f"env is {payload.get('env')!r}, expected one of {sorted(_OK_ENVS)} "
                 "— wrong service deployed?"
             )
         if payload.get("redis") != "up":
@@ -78,9 +90,9 @@ class ProductionHealthCheck(Check):
                 f"redis is {payload.get('redis')!r}, expected 'up' "
                 "— worker queue is broken"
             )
-        if payload.get("r2") != "configured":
+        if payload.get("r2") not in _OK_R2:
             problems.append(
-                f"r2 is {payload.get('r2')!r}, expected 'configured' "
+                f"r2 is {payload.get('r2')!r}, expected one of {sorted(_OK_R2)} "
                 "— uploads will 500"
             )
         disk_free = payload.get("disk_free_gb", 0)
@@ -98,8 +110,8 @@ class ProductionHealthCheck(Check):
             )
 
         return self._passed(
-            f"production /health OK (redis up, r2 configured, "
-            f"{disk_free} GB free)",
+            f"production /health OK (env={payload.get('env')!r}, redis up, "
+            f"r2={payload.get('r2')!r}, {disk_free} GB free)",
             url=url,
             health=payload,
         )

@@ -1,0 +1,45 @@
+name: Uptime monitor
+
+# High-frequency external uptime check for prod. Runs on GitHub's infra so
+# it survives the Railway outages it's meant to catch. On 3 consecutive
+# /health failures it emails ALERT_EMAIL (via Resend) and the run goes red
+# (GitHub then emails the repo owner as a backup channel).
+#
+# Why 5 min: GitHub Actions' minimum schedule interval. For sub-minute,
+# multi-region checks, also wire up BetterStack (see docs/STATUS_PAGE_SETUP.md)
+# — this workflow is the zero-setup baseline that needs no third-party account.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# Don't pile up runs if one is slow; the latest scheduled tick is what matters.
+concurrency:
+  group: uptime
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # No pip install: uptime_ping.py uses only the Python stdlib (urllib).
+
+      - name: Ping prod /health
+        working-directory: lyricgen/backend
+        env:
+          PRODUCTION_API_URL: ${{ secrets.PRODUCTION_API_URL }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: python -m scripts.preflight.uptime_ping

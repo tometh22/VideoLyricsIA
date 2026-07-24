@@ -37,9 +37,25 @@ def _seed_jobs(db, *, tenant_id: str, count: int, hours_ago: float = 0):
     db.flush()
 
 
-def test_cap_default_is_50():
-    """Sanity check on the system default — premise #5 of the design doc."""
-    assert DEFAULT_DAILY_CAP == 50
+def test_cap_default_value():
+    """Sanity check on the system default — 2026-05-24 bumped 50 → 500 con
+    env override DAILY_VOLUME_CAP. El default histórico (50/day) se saturaba
+    en smoke tests del operador. 500 sigue siendo un techo razonable: 100
+    videos × ~$1.5 Veo = $150/día max."""
+    assert DEFAULT_DAILY_CAP >= 50  # nunca por debajo del piso histórico
+    # En el branch principal sin env override, default es 500.
+    import os
+    if not os.environ.get("DAILY_VOLUME_CAP"):
+        assert DEFAULT_DAILY_CAP == 500
+
+
+def test_unlimited_plan_bypasses_cap(db):
+    """Plan='unlimited' no tiene cap diario por definición. Seedeamos MUCHOS
+    jobs (10× el default) y verificamos que el guard no levanta 429."""
+    _seed_jobs(db, tenant_id="cap-unlimited", count=DEFAULT_DAILY_CAP * 10)
+    user = {"id": 999, "tenant_id": "cap-unlimited", "plan": "unlimited"}
+    # Should NOT raise — unlimited bypassea
+    _enforce_daily_volume_cap(db, user)
 
 
 def test_under_cap_does_not_raise(db):

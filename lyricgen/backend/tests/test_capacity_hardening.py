@@ -285,7 +285,7 @@ def test_cleanup_deletes_done_job_with_all_keys_present(tmp_path, monkeypatch):
         "files": {"video_url": "/x", "short_url": "/y", "thumbnail_url": "/z"},
         "s3_keys": {"video": "k1", "short": "k2", "thumbnail": "k3"},
     }
-    monkeypatch.setattr("jobs.get_job_model", lambda jid: fake_model)
+    monkeypatch.setattr("jobs.get_job_model", lambda db, jid: fake_model)
 
     summary = co.cleanup()
     assert summary["deleted"] == 1
@@ -310,7 +310,7 @@ def test_cleanup_keeps_running_job(tmp_path, monkeypatch):
         "files": {},
         "s3_keys": {},
     }
-    monkeypatch.setattr("jobs.get_job_model", lambda jid: fake_model)
+    monkeypatch.setattr("jobs.get_job_model", lambda db, jid: fake_model)
 
     co.cleanup()
     assert job_dir.exists(), "running jobs must not be cleaned up"
@@ -328,7 +328,7 @@ def test_cleanup_deletes_orphan_dir(tmp_path, monkeypatch):
     orphan.mkdir()
     (orphan / "lyric_video.mp4").write_bytes(b"x" * 100)
 
-    monkeypatch.setattr("jobs.get_job_model", lambda jid: None)
+    monkeypatch.setattr("jobs.get_job_model", lambda db, jid: None)
 
     summary = co.cleanup()
     assert summary["deleted"] == 1

@@ -1,8 +1,49 @@
+import { useState } from "react";
 import { useI18n } from "../i18n";
 import BrandLockup from "./BrandLockup";
 
+const API = import.meta.env.VITE_API_URL || "";
+
 export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
   const { t, lang, setLang } = useI18n();
+
+  // Lead form → POST /api/leads. Falls back to a prefilled mailto if the API fails.
+  const [formState, setFormState] = useState("idle"); // idle | loading | sent | error
+  const handleSalesSubmit = async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const payload = {
+      name: f.name.value.trim(),
+      company: f.company.value.trim(),
+      email: f.email.value.trim(),
+      volume: f.volume.value,
+      message: f.message.value.trim(),
+    };
+    setFormState("loading");
+    try {
+      const res = await fetch(`${API}/api/leads`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setFormState("sent");
+      f.reset();
+    } catch {
+      setFormState("error");
+      // Fallback: open a prefilled email so the lead is never lost.
+      const subject = `GenLy AI — Consulta de ventas${payload.company ? ` (${payload.company})` : ""}`;
+      const body = [
+        `Nombre: ${payload.name}`,
+        `Sello/empresa: ${payload.company}`,
+        `Email: ${payload.email}`,
+        `Volumen estimado: ${payload.volume}`,
+        "",
+        payload.message,
+      ].join("\n");
+      window.location.href = `mailto:tomas@epical.digital?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    }
+  };
 
   const FEATURES = [
     {
@@ -44,11 +85,9 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
   ];
 
   const PLANS = [
-    { name: "Free", videos: "5", price: "0", perVideo: "0", popular: false, free: true },
-    { name: "100", videos: "100", price: "900", perVideo: "9.00", popular: false },
-    { name: "250", videos: "250", price: "2,000", perVideo: "8.00", popular: true },
-    { name: "500", videos: "500", price: "3,500", perVideo: "7.00", popular: false },
-    { name: "1,000", videos: "1,000", price: "6,000", perVideo: "6.00", popular: false },
+    { kind: "free", name: t("landing.plan_free"), desc: t("landing.plan_free_desc"), price: "0" },
+    { kind: "indie", name: t("landing.plan_indie"), desc: t("landing.plan_indie_desc"), price: t("landing.plan_indie_price"), popular: true },
+    { kind: "label", name: t("landing.plan_label"), desc: t("landing.plan_label_desc"), price: t("landing.plan_label_price"), contact: true },
   ];
 
   const FAQS = [
@@ -110,49 +149,37 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
 
       {/* Hero */}
       <section className="relative z-10 pt-16 pb-8 px-6 max-w-6xl mx-auto">
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-12 items-center">
-          <div>
-            <div className="inline-block px-4 py-1.5 rounded-full glass text-xs text-gray-400 mb-6 animate-fade-in">
-              {t("landing.badge")}
-            </div>
-            <h1 className="text-5xl sm:text-6xl font-extrabold tracking-tight mb-6 leading-[1.1] animate-fade-in">
-              <span className="bg-gradient-to-r from-white via-white to-gray-400 bg-clip-text text-transparent">{t("landing.hero1")}</span><br />
-              <span className="bg-gradient-to-r from-brand to-brand-light bg-clip-text text-transparent">{t("landing.hero2")}</span><br />
-              <span className="bg-gradient-to-r from-white via-white to-gray-400 bg-clip-text text-transparent">{t("landing.hero3")}</span>
-            </h1>
-            <p className="text-gray-400 text-lg max-w-lg leading-relaxed mb-8 animate-fade-in">
-              {t("landing.hero_sub")}
-            </p>
-            <button onClick={onStart} className="btn-primary text-lg py-4 px-10 animate-fade-in">
+        <div className="text-center max-w-4xl mx-auto">
+          <div className="inline-block px-4 py-1.5 rounded-full glass text-xs text-gray-400 mb-6 animate-fade-in">
+            {t("landing.badge")}
+          </div>
+          <h1 className="text-5xl sm:text-6xl font-extrabold tracking-tight mb-6 leading-[1.05] animate-fade-in">
+            <span className="bg-gradient-to-r from-white via-white to-gray-300 bg-clip-text text-transparent">{t("landing.hero1")} </span>
+            <span className="bg-gradient-to-r from-brand-light to-accent bg-clip-text text-transparent">{t("landing.hero2")}</span>
+          </h1>
+          <p className="text-gray-400 text-lg max-w-2xl mx-auto leading-relaxed mb-7 animate-fade-in">
+            {t("landing.hero_sub")}
+          </p>
+          <div className="flex flex-col sm:flex-row gap-3 justify-center animate-fade-in">
+            <button onClick={onStart} className="btn-primary text-lg py-4 px-10">
               {t("landing.cta")}
               <svg className="inline-block ml-2 w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
             </button>
+            <a href="#contact" className="btn-secondary text-lg py-4 px-8 inline-flex items-center justify-center">
+              {t("landing.cta_demo")}
+            </a>
           </div>
+          <p className="text-xs text-gray-500 mt-5 animate-fade-in">{t("landing.hero_trust")}</p>
 
-          {/* Real video mockup */}
-          <div className="relative animate-slide-up hidden lg:block">
+          {/* Showcase — real lyric video (already has its own lyrics) */}
+          <div className="relative mt-12 max-w-3xl mx-auto animate-slide-up">
             <div className="glass rounded-3xl p-3 shadow-glow-lg">
               <div className="rounded-2xl overflow-hidden aspect-video relative bg-black">
-                <video autoPlay muted loop playsInline className="w-full h-full object-cover" src="/demo.mp4" />
-                <div className="absolute bottom-3 left-3 right-3 flex items-center gap-2 bg-black/30 backdrop-blur-sm rounded-lg px-3 py-1.5">
-                  <svg className="w-3.5 h-3.5 text-white/70" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
-                  <div className="h-1 flex-1 bg-white/20 rounded-full overflow-hidden"><div className="h-full w-1/2 bg-brand rounded-full"/></div>
-                  <span className="text-[10px] text-white/50">HD</span>
+                <video autoPlay muted loop playsInline className="w-full h-full object-cover" src="/samples/ex1.mp4" />
+                <div className="absolute top-3 left-3 flex items-center gap-1.5 bg-black/55 backdrop-blur-sm rounded-full px-3 py-1.5">
+                  <svg className="w-3 h-3 text-white/80" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                  <span className="text-[10px] font-semibold text-white/80">Generado con GenLy</span>
                 </div>
-              </div>
-            </div>
-            {/* Floating Short */}
-            <div className="absolute -bottom-6 -left-8 glass rounded-card p-2 shadow-glow w-28 animate-pulse-slow">
-              <div className="rounded-xl bg-gradient-to-b from-pink-500/20 to-brand/20 aspect-[9/16] flex items-center justify-center">
-                <p className="text-[8px] font-bold text-white/70 uppercase">YouTube Short</p>
-              </div>
-            </div>
-            {/* Floating YouTube badge */}
-            <div className="absolute -top-4 -right-6 glass rounded-card px-4 py-3 shadow-glow flex items-center gap-2">
-              <svg className="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24"><path d="M22.54 6.42a2.78 2.78 0 00-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 00-1.94 2A29 29 0 001 11.75a29 29 0 00.46 5.33A2.78 2.78 0 003.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 001.94-2A29 29 0 0023 11.75a29 29 0 00-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02" fill="white"/></svg>
-              <div>
-                <p className="text-[9px] font-bold text-white/80">{t("feat.youtube").split(" ").slice(0, 2).join(" ")}</p>
-                <p className="text-[7px] text-white/40">SEO</p>
               </div>
             </div>
           </div>
@@ -218,16 +245,68 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         <p className="text-gray-500 text-center mb-16 max-w-md mx-auto">{t("landing.outputs_sub")}</p>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-6">
           {[
-            { title: "Lyric Video", res: "1920 x 1080", desc: "Full HD", gradient: "from-brand/30 to-brand-dark/30", aspect: "aspect-video" },
-            { title: "YouTube Short", res: "1080 x 1920", desc: "Vertical 30s", gradient: "from-pink-500/20 to-rose-600/30", aspect: "aspect-[9/16] max-h-52" },
-            { title: "Thumbnail", res: "1280 x 720", desc: "1280x720", gradient: "from-amber-500/20 to-orange-600/30", aspect: "aspect-video" },
+            { title: "Lyric Video", res: "1920 x 1080", desc: "Full HD", gradient: "from-brand/30 to-brand-dark/30", aspect: "aspect-video", img: "/samples/sample-reef.png" },
+            { title: "YouTube Short", res: "1080 x 1920", desc: "Vertical 30s", gradient: "from-pink-500/20 to-rose-600/30", aspect: "aspect-[9/16] max-h-52", img: null },
+            { title: "Thumbnail", res: "1280 x 720", desc: "1280x720", gradient: "from-amber-500/20 to-orange-600/30", aspect: "aspect-video", img: "/samples/sample-forest.png" },
           ].map((item) => (
             <div key={item.title} className="glass rounded-3xl p-5 text-center glass-hover">
-              <div className={`rounded-2xl bg-gradient-to-br ${item.gradient} ${item.aspect} mx-auto mb-4 flex items-center justify-center`}>
-                <p className="text-xs font-bold text-white/60">{item.res}</p>
+              <div className={`rounded-2xl overflow-hidden bg-gradient-to-br ${item.gradient} ${item.aspect} mx-auto mb-4 flex items-center justify-center`}>
+                {item.img ? (
+                  <img src={item.img} alt={item.title} className="w-full h-full object-cover" />
+                ) : (
+                  <p className="text-xs font-bold text-white/60">{item.res}</p>
+                )}
               </div>
               <h3 className="font-semibold mb-1">{item.title}</h3>
               <p className="text-xs text-gray-500">{item.desc}</p>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* Examples — real generated clips */}
+      <section className="relative z-10 py-20 px-6 max-w-5xl mx-auto">
+        <h2 className="text-3xl font-bold text-center mb-4">{t("landing.examples_title")}</h2>
+        <p className="text-gray-500 text-center mb-12 max-w-md mx-auto">{t("landing.examples_sub")}</p>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
+          {["/samples/ex1.mp4", "/samples/ex2.mp4", "/samples/ex3.mp4"].map((src) => (
+            <div key={src} className="glass rounded-2xl p-2 glass-hover">
+              <div className="rounded-xl overflow-hidden aspect-video bg-black">
+                <video autoPlay muted loop playsInline className="w-full h-full object-cover" src={src} />
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* Why GenLy — differentiation */}
+      <section className="relative z-10 py-20 px-6 max-w-5xl mx-auto">
+        <h2 className="text-3xl font-bold text-center mb-4">{t("landing.why_title")}</h2>
+        <p className="text-gray-500 text-center mb-14 max-w-md mx-auto">{t("landing.why_sub")}</p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
+          {[
+            { t: t("landing.why1_t"), d: t("landing.why1_d") },
+            { t: t("landing.why2_t"), d: t("landing.why2_d") },
+            { t: t("landing.why3_t"), d: t("landing.why3_d") },
+            { t: t("landing.why4_t"), d: t("landing.why4_d") },
+          ].map((item) => (
+            <div key={item.t} className="glass rounded-card p-6 flex gap-4 items-start glass-hover">
+              <div className="w-9 h-9 shrink-0 rounded-lg bg-brand/15 flex items-center justify-center text-brand">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5" /></svg>
+              </div>
+              <div>
+                <h3 className="font-semibold mb-1.5">{item.t}</h3>
+                <p className="text-sm text-gray-400 leading-relaxed">{item.d}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+        {/* Trust strip */}
+        <div className="flex flex-wrap justify-center gap-x-8 gap-y-3 mt-12 pt-8 border-t border-white/[0.04]">
+          {[t("landing.trust_sla"), t("landing.trust_owned"), t("landing.trust_isolation"), t("landing.trust_noroyalty")].map((label) => (
+            <div key={label} className="flex items-center gap-2 text-xs text-gray-400">
+              <svg className="w-4 h-4 text-accent" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M9 12l2 2 4-4" /><circle cx="12" cy="12" r="10" /></svg>
+              {label}
             </div>
           ))}
         </div>
@@ -248,33 +327,55 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         </div>
       </section>
 
+      {/* Ownership / rights — the closer */}
+      <section className="relative z-10 py-16 px-6 max-w-4xl mx-auto">
+        <div className="glass rounded-3xl p-10 border border-accent/20 shadow-glow text-center">
+          <h2 className="text-2xl sm:text-3xl font-bold mb-3">{t("landing.own_title")}</h2>
+          <p className="text-gray-400 mb-8 max-w-lg mx-auto">{t("landing.own_sub")}</p>
+          <div className="space-y-4 max-w-2xl mx-auto text-left">
+            {[t("landing.own1"), t("landing.own2"), t("landing.own3")].map((line) => (
+              <div key={line} className="flex gap-3 items-start">
+                <svg className="w-5 h-5 shrink-0 text-accent mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M9 12l2 2 4-4" /><circle cx="12" cy="12" r="10" /></svg>
+                <p className="text-sm text-gray-300 leading-relaxed">{line}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
       {/* Pricing */}
       <section id="pricing" className="relative z-10 py-24 px-6 max-w-5xl mx-auto scroll-mt-20">
         <h2 className="text-3xl font-bold text-center mb-4">{t("landing.pricing")}</h2>
-        <p className="text-gray-500 text-center mb-16 max-w-md mx-auto">{t("landing.pricing_sub")}</p>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+        <p className="text-gray-500 text-center mb-4 max-w-md mx-auto">{t("landing.pricing_sub")}</p>
+        <p className="text-center text-sm text-accent font-medium mb-12 max-w-xl mx-auto">{t("landing.pricing_scale")}</p>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-5 max-w-4xl mx-auto">
           {PLANS.map((plan) => (
-            <div key={plan.name} className={`glass rounded-3xl p-6 text-center relative ${plan.popular ? "border-brand/30 shadow-glow" : ""}`}>
+            <div key={plan.kind} className={`glass rounded-3xl p-7 text-center relative flex flex-col ${plan.popular ? "border-brand/30 shadow-glow" : ""}`}>
               {plan.popular && <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-0.5 rounded-full bg-brand text-[10px] font-bold uppercase tracking-wider">{t("landing.popular")}</div>}
-              <p className="text-sm text-gray-400 mb-1">{plan.videos} {t("landing.videos_month")}</p>
-              <p className="text-3xl font-bold my-3">
-                {plan.free ? (
+              <h3 className="text-base font-semibold mb-2">{plan.name}</h3>
+              <p className="text-3xl font-bold my-2">
+                {plan.kind === "free" ? (
                   <span className="text-accent">Free</span>
+                ) : plan.contact ? (
+                  <span className="text-2xl">{plan.price}</span>
                 ) : (
-                  <><span className="text-lg text-gray-500">USD</span> {plan.price}</>
+                  <>{plan.price}<span className="text-sm text-gray-500"> / {t("landing.per_video")}</span></>
                 )}
               </p>
-              <p className="text-xs text-gray-500 mb-5">
-                {plan.free ? t("landing.free_trial") || "Start for free" : `$${plan.perVideo} ${t("landing.per_video")}`}
-              </p>
-              <button onClick={onLogin || onStart} className={`w-full py-2.5 rounded-xl text-sm font-medium transition-all ${plan.popular ? "btn-primary" : plan.free ? "btn-primary !from-accent !to-accent" : "btn-secondary"}`}>
-                {plan.free ? (t("login.register_submit") || "Sign up") : t("nav.start")}
-              </button>
+              <p className="text-xs text-gray-400 leading-relaxed mb-6 flex-1">{plan.desc}</p>
+              {plan.contact ? (
+                <a href="#contact" className="btn-secondary w-full py-2.5 rounded-xl text-sm font-medium inline-flex items-center justify-center">
+                  {t("landing.plan_contact_cta")}
+                </a>
+              ) : (
+                <button onClick={onLogin || onStart} className={`w-full py-2.5 rounded-xl text-sm font-medium transition-all ${plan.popular ? "btn-primary" : "btn-primary !from-accent !to-accent"}`}>
+                  {plan.kind === "free" ? (t("login.register_submit") || "Sign up") : t("nav.start")}
+                </button>
+              )}
             </div>
           ))}
         </div>
-        <p className="text-center text-xs text-gray-500 mt-6">{t("landing.overage")}</p>
-        <p className="text-center text-xs text-gray-600 mt-2">{t("landing.yt_addon")}</p>
+        <p className="text-center text-xs text-gray-600 mt-8">{t("landing.yt_addon")}</p>
       </section>
 
       {/* FAQ */}
@@ -303,6 +404,40 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
             <svg className="inline-block ml-2 w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
           </button>
         </div>
+      </section>
+
+      {/* Contact / sales lead form */}
+      <section id="contact" className="relative z-10 py-24 px-6 max-w-2xl mx-auto scroll-mt-20">
+        <h2 className="text-3xl font-bold text-center mb-3">{t("landing.contact_title")}</h2>
+        <p className="text-gray-400 text-center mb-4">{t("landing.contact_sub")}</p>
+        <p className="text-center text-sm text-accent font-medium mb-10 max-w-lg mx-auto">{t("landing.contact_magnet")}</p>
+        <form onSubmit={handleSalesSubmit} className="glass rounded-3xl p-8 space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <input name="name" required placeholder={t("landing.form_name")} className="bg-surface-1/60 border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-brand/50" />
+            <input name="company" placeholder={t("landing.form_company")} className="bg-surface-1/60 border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-brand/50" />
+          </div>
+          <input name="email" type="email" required placeholder={t("landing.form_email")} className="w-full bg-surface-1/60 border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-brand/50" />
+          <div>
+            <label className="block text-xs text-gray-500 mb-2">{t("landing.form_volume_label")}</label>
+            <select name="volume" defaultValue={t("landing.form_volume_opt1")} className="w-full bg-surface-1/60 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand/50">
+              <option>{t("landing.form_volume_opt1")}</option>
+              <option>{t("landing.form_volume_opt2")}</option>
+              <option>{t("landing.form_volume_opt3")}</option>
+            </select>
+          </div>
+          <textarea name="message" rows="3" placeholder={t("landing.form_message")} className="w-full bg-surface-1/60 border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-brand/50 resize-none" />
+          <button type="submit" disabled={formState === "loading" || formState === "sent"} className="btn-primary w-full py-3 disabled:opacity-60">
+            {formState === "loading" ? t("landing.form_sending") : t("landing.form_submit")}
+          </button>
+          {formState === "sent" && (
+            <p className="text-center text-sm text-accent font-medium pt-1">{t("landing.form_sent")}</p>
+          )}
+          {formState === "error" && (
+            <p className="text-center text-sm text-red-400 pt-1">{t("landing.form_error")}</p>
+          )}
+        </form>
+        {/* TODO(ventas): cuando exista backend, postear a /api/leads en vez de mailto.
+            Drop-in de prueba social real (logos/testimonios de sellos) iría arriba de este form. */}
       </section>
 
       {/* Footer */}

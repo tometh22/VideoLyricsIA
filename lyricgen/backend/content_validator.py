@@ -108,66 +108,80 @@ def _check_frame_with_gemini(image_path: str) -> dict:
         image_bytes = f.read()
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                genai.types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                (
-                    "You are auditing a frame from a music-video background "
-                    "for risks where AI image generation typically fails. "
-                    "Be CONSERVATIVE — flag only flagrant, prominent "
-                    "violations. Music-video backgrounds routinely include "
-                    "incidental signage, urban scenery, and stylized text "
-                    "as part of the aesthetic; that is acceptable.\n\n"
-                    "FLAG (safe=false) ONLY if ALL of these are true at once:\n"
-                    "  (a) the issue is in the foreground or central to the "
-                    "frame (NOT background scenery, NOT distant signage, "
-                    "NOT a small element in a wider shot),\n"
-                    "  (b) the issue is clearly readable / recognizable "
-                    "without effort (NOT blurred, NOT partial, NOT tiny),\n"
-                    "  (c) the issue falls into one of these categories:\n"
-                    "    - A LARGE, FOREGROUND, IDENTIFIABLE human face "
-                    "(eyes/nose/mouth clearly visible on a recognizable "
-                    "specific individual).\n"
-                    "    - Visible hands or individual fingers as the "
-                    "subject of the frame.\n"
-                    "    - Text matching a globally famous COMMERCIAL brand "
-                    "(Nike, Coca-Cola, McDonald's, Apple, Pepsi, Adidas, "
-                    "Starbucks, Microsoft, Google, Amazon, Disney) shown "
-                    "prominently as the focus of the frame.\n"
-                    "    - A clearly-rendered logo of a globally famous "
-                    "commercial brand shown prominently.\n\n"
-                    "DO NOT FLAG (safe=true) any of these — they are "
-                    "acceptable in music-video backgrounds:\n"
-                    "  - Names of bands, artists, songs, albums, venues, "
-                    "stadiums, sports clubs, cities, countries, places, "
-                    "or events. These are NOT commercial brands for "
-                    "this purpose.\n"
-                    "  - Generic words on signage (BAR, HOTEL, CAFE, OPEN, "
-                    "SALE, etc.) even if real-looking.\n"
-                    "  - Background signage, billboards, marquees, neon "
-                    "signs that are part of the urban/scenic backdrop.\n"
-                    "  - Distant, small, blurred, motion-blurred, rain-"
-                    "distorted, or partially obscured text or logos.\n"
-                    "  - Invented / gibberish / stylized text strings.\n"
-                    "  - Silhouettes, audiences, distant crowds — even "
-                    "with small partial faces.\n"
-                    "  - Abstract glowing shapes, smoke, particles, "
-                    "weather effects, lighting effects, lens flares.\n"
-                    "  - Generic pattern textures, abstract graphic "
-                    "elements.\n\n"
-                    "Rule of thumb: would a typical viewer say 'this video "
-                    "is selling Nike / showing a real celebrity'? If no, "
-                    "mark safe. When in doubt, mark safe. "
-                    "Respond ONLY with JSON: "
-                    '{"safe":true/false,"issues":["specific reason"]}'
+        # Audit 2026-05-26: timeout wrapper. Validator runs Gemini Vision
+        # per frame (~5 frames per UMG render); a Vertex hang here would
+        # block the validation step indefinitely. find_orphan_polling_jobs
+        # wouldn't catch it for 10 min because Vision doesn't record an
+        # AIProvenance row at call start. 45s is generous (single-image
+        # Vision call p99 ~5s) but bounds the worst case so the validator
+        # can fall through to its outer except → raise → pipeline marks
+        # validation_failed instead of hanging.
+        from pipeline import _call_with_timeout
+        _prompt_text = (
+            "You are auditing a frame from a music-video background "
+            "for risks where AI image generation typically fails. "
+            "Be CONSERVATIVE — flag only flagrant, prominent "
+            "violations. Music-video backgrounds routinely include "
+            "incidental signage, urban scenery, and stylized text "
+            "as part of the aesthetic; that is acceptable.\n\n"
+            "FLAG (safe=false) ONLY if ALL of these are true at once:\n"
+            "  (a) the issue is in the foreground or central to the "
+            "frame (NOT background scenery, NOT distant signage, "
+            "NOT a small element in a wider shot),\n"
+            "  (b) the issue is clearly readable / recognizable "
+            "without effort (NOT blurred, NOT partial, NOT tiny),\n"
+            "  (c) the issue falls into one of these categories:\n"
+            "    - A LARGE, FOREGROUND, IDENTIFIABLE human face "
+            "(eyes/nose/mouth clearly visible on a recognizable "
+            "specific individual).\n"
+            "    - Visible hands or individual fingers as the "
+            "subject of the frame.\n"
+            "    - Text matching a globally famous COMMERCIAL brand "
+            "(Nike, Coca-Cola, McDonald's, Apple, Pepsi, Adidas, "
+            "Starbucks, Microsoft, Google, Amazon, Disney) shown "
+            "prominently as the focus of the frame.\n"
+            "    - A clearly-rendered logo of a globally famous "
+            "commercial brand shown prominently.\n\n"
+            "DO NOT FLAG (safe=true) any of these — they are "
+            "acceptable in music-video backgrounds:\n"
+            "  - Names of bands, artists, songs, albums, venues, "
+            "stadiums, sports clubs, cities, countries, places, "
+            "or events. These are NOT commercial brands for "
+            "this purpose.\n"
+            "  - Generic words on signage (BAR, HOTEL, CAFE, OPEN, "
+            "SALE, etc.) even if real-looking.\n"
+            "  - Background signage, billboards, marquees, neon "
+            "signs that are part of the urban/scenic backdrop.\n"
+            "  - Distant, small, blurred, motion-blurred, rain-"
+            "distorted, or partially obscured text or logos.\n"
+            "  - Invented / gibberish / stylized text strings.\n"
+            "  - Silhouettes, audiences, distant crowds — even "
+            "with small partial faces.\n"
+            "  - Abstract glowing shapes, smoke, particles, "
+            "weather effects, lighting effects, lens flares.\n"
+            "  - Generic pattern textures, abstract graphic "
+            "elements.\n\n"
+            "Rule of thumb: would a typical viewer say 'this video "
+            "is selling Nike / showing a real celebrity'? If no, "
+            "mark safe. When in doubt, mark safe. "
+            "Respond ONLY with JSON: "
+            '{"safe":true/false,"issues":["specific reason"]}'
+        )
+        response = _call_with_timeout(
+            lambda: client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    genai.types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                    _prompt_text,
+                ],
+                config=genai.types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=300,
+                    thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
                 ),
-            ],
-            config=genai.types.GenerateContentConfig(
-                temperature=0.1,
-                max_output_tokens=300,
-                thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
             ),
+            timeout_s=45.0,
+            label="VALIDATOR",
         )
         text = response.text.strip()
         json_match = re.search(r'\{.*\}', text, re.DOTALL)

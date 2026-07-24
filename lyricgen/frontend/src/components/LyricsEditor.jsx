@@ -1,6 +1,82 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useI18n } from "../i18n";
 import { EditorTour } from "./OnboardingTour";
+import { useToast } from "./ToastProvider";
+import HelpTip from "./HelpCenter/HelpTip";
+import LyricsTimeline from "./LyricsTimeline";
+import LyricVideoPreview from "./LyricVideoPreview";
+import { tierForLength } from "../lib/lyricTiers";
+import { activeWordIndex } from "../lib/karaokeTiming";
+import { prettifySongTitle } from "../lib/prettifySongTitle";
+import { segmentsValuesEqual } from "../lib/segmentsValuesEqual";
+import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
+import { splitWordsAtCharOffset, firstWordStart, lastWordEnd } from "../lib/splitWords";
+import useLocalStorage from "../hooks/useLocalStorage";
+
+// Font options for the live in-preview switcher. Codes match the render
+// pipeline / EditRequestPanel; css families are all loaded in index.html so
+// the preview renders the real typeface. "" = Auto (pipeline picks).
+const EDITOR_FONTS = [
+  { code: "", label: "Auto", css: "'Montserrat', sans-serif" },
+  { code: "anton", label: "Anton", css: "'Anton', sans-serif" },
+  { code: "bebas-neue", label: "Bebas Neue", css: "'Bebas Neue', sans-serif" },
+  { code: "oswald-bold", label: "Oswald", css: "'Oswald', sans-serif" },
+  { code: "montserrat-bold", label: "Montserrat", css: "'Montserrat', sans-serif" },
+  { code: "poppins-bold", label: "Poppins", css: "'Poppins', sans-serif" },
+  { code: "outfit-bold", label: "Outfit", css: "'Outfit', sans-serif" },
+  { code: "roboto-bold", label: "Roboto", css: "'Roboto', sans-serif" },
+  { code: "jost-bold", label: "Jost", css: "'Jost', sans-serif" },
+];
+const FONT_CSS_BY_CODE = Object.fromEntries(EDITOR_FONTS.map((f) => [f.code, f.css]));
+
+// Typography options for the live preview controls. Codes match the render
+// pipeline (pipeline.py / ass_render / UploadZone).
+const TEXT_CASES = [
+  { code: "upper", label: "MAY" },
+  { code: "title", label: "Aa" },
+  { code: "lower", label: "min" },
+  { code: "sentence", label: "Abc" },
+  { code: "original", label: "ori" },
+];
+// TRANSITIONS (Cut/Fade fade-time) quedó deprecado 2026-05-23. Las opciones
+// ricas viven en LINE_TRANSITIONS (slide/wipe/dissolve_blur) que se aplican
+// vía libass (lugar único, sin override silencioso de moviepy).
+const CONTRASTS = [
+  { code: "subtle", label: "Suave" },
+  { code: "medium", label: "Medio" },
+  { code: "strong", label: "Fuerte" },
+];
+// Animación de letra — libass templates (mirror del wizard, ass_render.py).
+const LYRICS_ANIMATIONS = [
+  { code: "none",        label: "Ninguna" },
+  { code: "karaoke",     label: "Karaoke" },
+  { code: "word_reveal", label: "Reveal" },
+  { code: "pop",         label: "Pop" },
+  { code: "glow",        label: "Glow" },
+];
+// Transición de línea — entrada (y salida en dissolve_blur) por libass.
+const LINE_TRANSITIONS = [
+  { code: "none",          label: "Ninguna" },
+  { code: "slide_up",      label: "Sube" },
+  { code: "slide_side",    label: "Lateral" },
+  { code: "wipe",          label: "Cortina" },
+  { code: "dissolve_blur", label: "Desvanecer" },
+];
+
+function applyTextCase(text, code) {
+  if (code === "upper") return (text || "").toUpperCase();
+  if (code === "lower") return (text || "").toLowerCase();
+  if (code === "title") return (text || "").replace(/\b\w/g, (c) => c.toUpperCase());
+  if (code === "sentence") {
+    return (text || "").toLowerCase().split("\n").map(
+      (ln) => ln.replace(/[a-zà-ÿ]/i, (c) => c.toUpperCase())
+    ).join("\n");
+  }
+  return text || "";
+}
+
+// SHOW_MOTION_PICKER (legacy text_motion) eliminado 2026-05-23 —
+// reemplazado por lyrics_animation + line_transition (libass).
 
 function formatTime(seconds) {
   if (!isFinite(seconds) || seconds < 0) return "0:00";
@@ -75,32 +151,693 @@ function findSuggestion(whisperText, refLines, startIdx) {
   return null;
 }
 
-export default function LyricsEditor({ segments, filename, audioFile, referenceLyrics, coverageWarning = false, recoverySource = "", onApprove, onBack, isBatch = false, batchProgress = "", user = null }) {
+// Find two consecutive lines in `refLines` whose concatenation matches
+// `segText`. Used by the auto-split banner: when a Whisper segment
+// captures 2 lyric lines mergeadas en uno solo, lrclib plain (passed as
+// referenceLyrics) has them como 2 entries. Si el match es lo
+// suficientemente fuerte (>0.5), devolvemos el [lineA, lineB] que el
+// caller usa para crear 2 segments separados.
+//
+// Threshold 0.5 — más permisivo que findSuggestion (0.3) porque acá
+// estamos comparando contra la CONCATENACIÓN de 2 líneas vs 1 segment,
+// el set de words es más grande y el match esperado es más alto.
+function findReferenceSplitLines(segText, refLines) {
+  if (!refLines || refLines.length < 2) return null;
+  const normalize = (s) =>
+    s.toLowerCase().replace(/[^a-záéíóúüñ\s]/g, "").replace(/\s+/g, " ").trim();
+  const segNorm = normalize(segText);
+  if (!segNorm) return null;
+  const segWords = segNorm.split(/\s+/);
+  if (segWords.length < 4) return null; // demasiado corto para split fiable
+
+  let bestScore = 0;
+  let bestPair = null;
+  for (let i = 0; i < refLines.length - 1; i++) {
+    const a = refLines[i];
+    const b = refLines[i + 1];
+    if (!a || !b) continue;
+    const cNorm = normalize(a + " " + b);
+    if (!cNorm) continue;
+    const cWords = cNorm.split(/\s+/);
+    let matches = 0;
+    for (const w of segWords) {
+      if (cWords.includes(w)) matches++;
+    }
+    const score = matches / Math.max(segWords.length, cWords.length);
+    if (score > bestScore) {
+      bestScore = score;
+      bestPair = [a, b];
+    }
+  }
+  if (bestScore > 0.5) return bestPair;
+  return null;
+}
+
+// ─── Font-code → CSS map (mirrors UploadZone FONTS) ────────────────────────
+const FONT_CSS_MAP = {
+  "jost-bold":       "'Jost', sans-serif",
+  "montserrat-bold": "'Montserrat', sans-serif",
+  "poppins-bold":    "'Poppins', sans-serif",
+  "outfit-bold":     "'Outfit', sans-serif",
+  "roboto-bold":     "'Roboto', sans-serif",
+  "bebas-neue":      "'Bebas Neue', sans-serif",
+  "oswald-bold":     "'Oswald', sans-serif",
+  "anton":           "'Anton', sans-serif",
+  "":                "'Montserrat', sans-serif",
+};
+
+// Backend tier params come from the shared source of truth (lib/lyricTiers,
+// also used by LyricVideoPreview). Adapter keeps this file's sizePx/maxWidthPx
+// naming so the existing wrap-estimation code is untouched.
+function getTier(text) {
+  const tier = tierForLength((text || "").length);
+  return { sizePx: tier.fontPx, maxWidthPx: tier.wrapPx };
+}
+
+// Simulate moviepy's word-wrap with canvas.measureText.
+// Returns the number of visual lines the segment will occupy in the video.
+function estimateWrappedLines(text, fontCss, sizePx, maxWidthPx) {
+  try {
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    ctx.font = `bold ${sizePx}px ${fontCss}`;
+    const spaceW = ctx.measureText(" ").width;
+    const words = text.split(" ");
+    let lines = 1;
+    let lineW = 0;
+    for (const word of words) {
+      const ww = ctx.measureText(word).width;
+      if (lineW > 0 && lineW + spaceW + ww > maxWidthPx) {
+        lines++;
+        lineW = ww;
+      } else {
+        lineW = lineW > 0 ? lineW + spaceW + ww : ww;
+      }
+    }
+    return lines;
+  } catch {
+    return 1;
+  }
+}
+
+// Mirror of the backend pipeline._smart_lower(): for the all-lowercase
+// aesthetic we lowercase only the FIRST word of the line (sentence-initial
+// capital is grammar, not intent) and keep every later word exactly as the
+// operator typed it, so proper nouns like "Guinea" survive. Must stay in
+// sync with pipeline.py:_smart_lower so the editor preview matches the
+// rendered video (otherwise the editor shows "guinea" but the render shows
+// "Guinea"). Origin: agus.cafisi / Babasónicos 2026-05-20.
+export function smartLower(text) {
+  let seenWord = false;
+  return (text || "")
+    .split(/(\s+)/)
+    .map((tok) => {
+      if (!tok || /^\s+$/.test(tok)) return tok;
+      if (!seenWord) {
+        seenWord = true;
+        return tok.toLowerCase();
+      }
+      return tok; // interior word: keep operator's casing as typed
+    })
+    .join("");
+}
+
+// Apply the same case transform as the backend _apply_case().
+function applyCase(text, textCase) {
+  if (textCase === "upper") return text.toUpperCase();
+  if (textCase === "title") return text.replace(/\b\w/g, (c) => c.toUpperCase());
+  if (textCase === "lower") return smartLower(text);
+  if (textCase === "sentence") {
+    // Mirror pipeline._sentence_case(): smartLower (proper nouns survive)
+    // then capitalize the first letter of each visual line.
+    return smartLower(text).split("\n").map(
+      (ln) => ln.replace(/[a-zà-ÿ]/i, (c) => c.toUpperCase())
+    ).join("\n");
+  }
+  return text;
+}
+
+// Normalize a lyric line for repeat-detection: trim ends and collapse
+// internal whitespace runs. Case- and accent-SENSITIVE on purpose, so we
+// only ever group lines the operator typed identically and never touch a
+// line they meant to be different.
+export function normalizeLineForMatch(text) {
+  return (text || "").trim().replace(/\s+/g, " ");
+}
+
+export default function LyricsEditor({
+  segments, filename, audioFile, referenceLyrics,
+  coverageWarning = false, recoverySource = "",
+  onApprove, onBack, isBatch = false, batchProgress = "",
+  user = null,
+  font = "",
+  textCase = "upper",
+  fontScale = 1.0,
+  textContrast = "medium",
+  // 2026-05-23: reemplazan a `lyricTransition` (Corte/Fade) y `textMotion`
+  // (Sutil drift) que quedaron deprecados — éstos cubren mejor el mismo
+  // espacio y NO apagan silenciosamente al ASS path.
+  lyricsAnimation = "none",
+  lineTransition = "none",
+  transcribeJobId = null,
+  onPersistSegments = null,
+  // Synchronous per-edit callback (no debounce). Parent receives the
+  // current cleaned segments on every change. Required by the /edit
+  // modal so it can include the latest segments in the body of
+  // /edit?edit_type=background without racing the 3s autosave debounce.
+  // Without this, an operator who edits a line and clicks "Regenerar
+  // fondo" within 3 s ends up re-rendering with the pre-edit segments_json
+  // because autosave hasn't flushed yet. Incident 2026-05-15.
+  onEditedChange = null,
+  // Post-approval / re-sync mode. The wizard's upload flow never sets
+  // these (defaults preserve original behavior); the JobDetail /edit
+  // modal mounts this same editor with audioUrl + the disable flags so
+  // the operator can fix sync on an already-approved job without
+  // pulling in features that no longer apply.
+  audioUrl: audioUrlProp = null,
+  disableAutoSplit = false,
+  disableBeforeUnload = false,
+  disableAutosave = false,
+  submitLabel = null,
+  // Optional audio peak envelope for the timeline waveform, fetched by the
+  // parent (the post-render /edit modal has a job in R2; the wizard doesn't).
+  // null → timeline renders without a waveform (graceful).
+  waveform = null,
+  // Live preview: signed URL of the cached background video (post-render
+  // modal). null → preview uses a style-tinted template gradient (wizard).
+  previewBgUrl = null,
+  // Background style name → template gradient for the wizard preview.
+  backgroundStyle = "default",
+  // px offset for the sticky header so it clears any sticky app header
+  // above it. 0 in the modal (fixed overlay, no app chrome); the wizard
+  // passes the app header height so the editor's CTA isn't cut off.
+  stickyHeaderTop = 0,
+  // Called when the operator picks a font in the live preview switcher.
+  // Parent threads it into the render (render_params.font / edit_params).
+  onFontChange = null,
+  // Same idea for the rest of the typography, set live in the preview.
+  onCaseChange = null,
+  onContrastChange = null,
+  // 2026-05-23: callbacks de los nuevos ejes (libass). Reemplazan al
+  // onTransitionChange (que controlaba el legacy lyric_transition).
+  onAnimationChange = null,
+  onLineTransitionChange = null,
+  // UX specialist 2026-05-24: status del pre-gen del fondo (useBackgroundPreview).
+  // Valores: "idle" | "queued" | "generating" | "done" | "error" | "disabled".
+  // null/undefined → no se renderiza el chip (modo /edit modal post-render).
+  bgStatus = null,
+  // Phase 2 (2026-05-25): cuando el editor se renderiza dentro del nuevo
+  // paso 6 del wizard, los controles tipográficos (font/case/contrast/
+  // animation/transition) ya están visibles en el paso 4 ("Animación")
+  // del stepper — esconder la columna izquierda y el preview interno
+  // para no duplicarlos. El preview central del wizard
+  // (WizardLivePreview) sigue mostrando los cambios live. En modo /edit
+  // (legacy) o uso standalone, el default es renderizar todo igual que
+  // siempre.
+  hideTypographyControls = false,
+  hideInternalPreview = false,
+  // Phase C 2026-05-25: callback que publica el tick de playback hacia
+  // el padre (App.jsx). El padre típicamente escribe en un ref para
+  // que el WizardLivePreview central pueda leerlo sin pasar por
+  // setState (evita re-renders a 60fps del tree de UploadZone).
+  // Firma: (activeLineText, activeStart, activeEnd, currentTime).
+  // Se llama dentro del rAF loop existente (60fps). El consumer es
+  // responsable de throttle si necesario.
+  onPlaybackTick = null,
+}) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
     segments.map((s, i) => ({ ...s, _id: i }))
   );
+  const [isDirty, setIsDirty] = useState(false);
+  // List vs visual timeline. Default "list" so the existing operator flow is
+  // untouched; the timeline is opt-in via the toolbar toggle.
+  const [viewMode, setViewMode] = useState("list"); // "list" | "timeline"
+  // 2026-05-25 Studio Console — Modo enfoque. Toggle persistente que
+  // agranda max-h de la lista + MAX_VH del timeline. Operador con 30-50
+  // segments por video estaba scrolleando constante. localStorage usa
+  // string "1"/"0" (el hook es string-only).
+  const [focusModeRaw, setFocusModeRaw] = useLocalStorage("genly_editor_focus", "0");
+  const focusMode = focusModeRaw === "1";
+  const toggleFocusMode = useCallback(
+    () => setFocusModeRaw((v) => (v === "1" ? "0" : "1")),
+    [setFocusModeRaw],
+  );
+  // 2026-05-26 — fix #357 follow-up. Cuando el editor se mueve dentro del
+  // wizard de 3 columnas (UploadZone:1861), el max-h interno apenas crece
+  // ~90px adentro de una columna capada a 460px de ancho — el "enfoque" era
+  // imperceptible. Ahora emitimos una clase global en <body> para que
+  // UploadZone pueda colapsar el grid a 1-col y esconder stepper + preview
+  // central via variantes arbitrarias de Tailwind. Lifting el state hacia
+  // UploadZone vía render prop era más invasivo (reviewScreen es una IIFE
+  // que recrearía en cada toggle); body class es 1-way data flow simple y
+  // se limpia solo en unmount cuando el operador navega a otro paso.
+  useEffect(() => {
+    if (typeof document === "undefined") return undefined;
+    document.body.classList.toggle("editor-focus-mode", focusMode);
+    return () => document.body.classList.remove("editor-focus-mode");
+  }, [focusMode]);
+  // Phase B 2026-05-25: el card de auto-fix antes ocupaba 120-180px arriba
+  // del editor. Reemplazado por un pill compacto 32px que expande detalle
+  // on demand. Default colapsado para minimizar el overhead vertical.
+  const [autoFixExpanded, setAutoFixExpanded] = useState(false);
+  // Layout edits in the preview apply to ALL lines by default (consistent
+  // look across the song); "line" scopes the next edit to the selected line
+  // only (for the odd tilted/repositioned line).
+  const [layoutScope, setLayoutScope] = useState("all"); // "all" | "line"
+  // Live font selection (preview re-renders instantly; emitted to parent
+  // for the actual render). Seeded from the job's current font.
+  const [selectedFont, setSelectedFont] = useState(font || "");
+  const [selectedCase, setSelectedCase] = useState(textCase || "upper");
+  const [selectedContrast, setSelectedContrast] = useState(textContrast || "medium");
+  // 2026-05-23: nuevos ejes (paridad con el wizard, ver header del archivo).
+  const [selectedAnimation, setSelectedAnimation] = useState(lyricsAnimation || "none");
+  const [selectedLineTransition, setSelectedLineTransition] = useState(lineTransition || "none");
+  // Phase 2 (2026-05-25): sync props → state cuando el wizard controla los
+  // typography settings desde el paso 4. Sin esto, el editor montado en paso 6
+  // se queda con el seed inicial y no refleja los cambios que el operador
+  // hace en el stepper. Solo activo en modo wizard para no romper el flow
+  // standalone donde el editor ES la fuente de verdad.
+  useEffect(() => {
+    if (!hideTypographyControls) return;
+    setSelectedFont(font || "");
+    setSelectedCase(textCase || "upper");
+    setSelectedContrast(textContrast || "medium");
+    setSelectedAnimation(lyricsAnimation || "none");
+    setSelectedLineTransition(lineTransition || "none");
+  }, [hideTypographyControls, font, textCase, textContrast, lyricsAnimation, lineTransition]);
+  // Autosave confidence for the timeline view. saveStatus drives the
+  // "Guardando…/Guardado ✓" chip; flushCounter triggers an immediate save
+  // on a timeline drag (instead of waiting for the 3 s debounce).
+  // QA fix 2026-05-28 (audit P0 #74): extendido con "error". Antes el
+  // debounced autosave NO actualizaba saveStatus (solo el flush-on-drag
+  // lo hacía), y errores de red caían silencioso. Operador veía
+  // "Guardado ✓" del último drag aunque el debounced autosave de un
+  // text-edit posterior haya fallado → al apretar Aprobar perdía
+  // changes. Ahora ambos autosaves actualizan saveStatus, y "error"
+  // se muestra como chip rojo con botón Reintentar.
+  const [saveStatus, setSaveStatus] = useState("idle"); // idle|saving|saved|error
+  const [flushCounter, setFlushCounter] = useState(0);
+  // Snapshot of the timings as first handed to us — the baseline for the
+  // timeline's "Resetear timings". Seeded on mount + re-seeded whenever the
+  // parent swaps the `segments` prop (see the reset effect below).
+  const originalSegmentsRef = useRef(segments.map((s, i) => ({ ...s, _id: i })));
+
+  // Re-seed `edited` whenever the parent hands us a different `segments`
+  // reference. The initial useState above only runs once on mount —
+  // without this effect, a parent that re-uses the same editor across
+  // jobs (e.g. JobDetail's /edit modal swapping between two jobs in
+  // the same session, or a forced refresh that re-fetches segments_json
+  // after autosave landed) keeps showing the stale first-mount array.
+  // Compared by reference, not deep-equal: the parent owns the array
+  // identity, so a new prop reference = "you should reset". This is the
+  // standard "controlled-vs-uncontrolled" reset pattern used by inputs
+  // that need to track a parent's source of truth across remounts.
+  // Bug B7 from 2026-05-18 audit.
+  const prevSegmentsRef = useRef(segments);
+  // Live mirror of `edited` so the prop-sync effect below can tell our OWN echo
+  // from a genuine external change. App.jsx feeds every local edit straight back
+  // as the `segments` prop (onEditedChange → mergeEditedSegments →
+  // currentReview.segments), so the effect must compare the incoming prop
+  // against what we're SHOWING right now — not a one-tick-stale ref.
+  const editedRef = useRef(edited);
+  editedRef.current = edited;
+  // Operator feedback 2026-05-25 (UMG): "Debería hacerlo solo, no
+  // preguntarme" — the auto-trim banner ("Recortar N líneas con texto
+  // colgado · Aplicar") was friction. Detection is reliable enough to
+  // apply silently on initial load. The ref tracks per-segments-prop
+  // application so re-seeding a new job re-triggers; routine edits
+  // (typing in a line) do NOT, because they don't change the ref.
+  const autoTrimAppliedRef = useRef(false);
+  const _reseedStormRef = useRef({ windowStart: 0, count: 0 });
+  useEffect(() => {
+    if (prevSegmentsRef.current === segments) return;
+    // ROOT-CAUSE FIX (P0 UMG Chile, "titila todo el editor" — still firing on
+    // the #724 build): skip the destructive reseed when the incoming `segments`
+    // already matches what we're SHOWING (`edited`). App.jsx mirrors every local
+    // edit up to currentReview.segments (onEditedChange → mergeEditedSegments)
+    // and feeds it straight back as this prop. During a timeline drag the values
+    // change every tick, so comparing against the one-tick-stale prevSegmentsRef
+    // (below) saw each echo as "new content" and reseeded → _id reassigned by
+    // index → all rows REMOUNT 6-7×/s → reseed-storm / ui-freeze. #724 only
+    // neutralised the equal-VALUES reorder echo; this catches the live-edit echo
+    // because the prop equals our current `edited`. A genuine external change
+    // (load another song, undo) differs from `edited` and still reseeds.
+    if (segmentsValuesEqual(editedRef.current, segments)) {
+      prevSegmentsRef.current = segments;
+      return;
+    }
+    // QA fix 2026-05-27 (drag-resize regression): the autosave POST
+    // roundtrip (App.jsx::persistSegmentsToBackend) calls
+    // setCurrentReview({...prev, segments: cleaned}) after a successful
+    // /save-segments. That hands LyricsEditor a NEW segments array
+    // reference holding the SAME values the operator just dragged.
+    // Pre-fix this useEffect saw the new ref and reseeded `edited` —
+    // re-assigning _ids by index, dropping `locked`/`pos`/`scale`/`rot`
+    // that the local handler had just applied, and under React's render
+    // batching also dropping an in-flight second drag in same tick.
+    // Net effect: operator drags an edge, releases, the edge snaps back
+    // to where it was before. We bump the ref so we don't re-check on
+    // every render, but skip the destructive reseed.
+    if (segmentsValuesEqual(prevSegmentsRef.current, segments)) {
+      prevSegmentsRef.current = segments;
+      return;
+    }
+    // [reseed-storm] capture (P0 UMG Chile 2026-06-16: "las líneas cambian de
+    // posición en loop"). This reseed reassigns _id by index, so rows keyed by
+    // _id REMOUNT. The original root cause: segmentsValuesEqual was POSITIONAL,
+    // so a writeback that handed back a REORDERED segments array (backend sorts
+    // by start #184 while local is out-of-order from a split/overlap) failed the
+    // guard above and made this fire on every cycle → rows reposition in a loop.
+    // FIXED in #724: segmentsValuesEqual now sorts both sides by start before
+    // comparing, so a pure reorder no longer reseeds. This detector is KEPT as a
+    // backstop — it still catches a GENUINE rapid-content storm (not reorder),
+    // and stays until the 2026-07-01 monitoring window closes. If it fires
+    // repeatedly we emit the OLD vs NEW order so we can see the swap.
+    {
+      const _now = typeof performance !== "undefined" && performance.now ? performance.now() : 0;
+      const _rs = _reseedStormRef.current;
+      if (_now - _rs.windowStart > 1000) {
+        if (_rs.count >= 6) {
+          const _ord = (arr) => (Array.isArray(arr) ? arr : []).slice(0, 5).map((s) => String(s.text || "").slice(0, 18));
+          // eslint-disable-next-line no-console
+          console.warn("[reseed-storm] rows reseeding/remounting repeatedly", {
+            perSec: _rs.count,
+            prevOrder: _ord(prevSegmentsRef.current),
+            newOrder: _ord(segments),
+            segments: Array.isArray(segments) ? segments.length : null,
+          });
+        }
+        _rs.windowStart = _now;
+        _rs.count = 0;
+      }
+      _rs.count += 1;
+    }
+    prevSegmentsRef.current = segments;
+    const seeded = segments.map((s, i) => ({ ...s, _id: i }));
+    setEdited(seeded);
+    originalSegmentsRef.current = seeded;
+    setIsDirty(false);
+    // Audit fix 2026-05-27 (drag-resize regression part 2): NO resetear
+    // autoTrimAppliedRef acá. Antes hacíamos `current = false` con la
+    // lógica "new job → eligible for auto-trim", PERO esta useEffect
+    // también dispara en el roundtrip del autosave (drag → POST →
+    // setCurrentReview → reseed). Si el operador acababa de extender un
+    // segmento más allá de su `estimateVoiceEndDuration` cap, autoTrim
+    // (useEffect en línea ~1440) ve `current=false` + `longSegCount>0`
+    // y dispara `trimAllLongSegs()` que recorta el end de vuelta al cap.
+    // Visualmente: drag se "revierte". Para el caso real de cargar un
+    // job distinto, el padre cambia la `key` del LyricsEditor (filename
+    // + queueIdx) → remount → useState inicializa `current=false` de
+    // nuevo. No hace falta el reset acá.
+  }, [segments]);
+
+  // Warn browser on tab-close / external navigation when there are unsaved edits.
+  // disableBeforeUnload skips this for the post-approval modal — closing
+  // the modal already IS the explicit "discard" gesture, a native confirm
+  // on top is noise.
+  useEffect(() => {
+    if (disableBeforeUnload || !isDirty) return;
+    const handler = (e) => { e.preventDefault(); e.returnValue = ""; };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [isDirty, disableBeforeUnload]);
+
+  // Debounced autosave to backend: every 3s after the last edit, persist
+  // the current segments to /jobs/{id}/save-segments. This bumps the
+  // reaper's last_user_activity_at anchor so long edit sessions don't get
+  // barre at the 30-min TTL (incident 2026-05-14 — Agus batch-edited 5
+  // lyrics for 90 min and all 5 jobs got reaped before "Crear videos").
+  // No-op when the parent didn't wire the callback (e.g. unit tests).
+  //
+  // QA fix 2026-05-28 (audit P0 #74): await el resultado de
+  // onPersistSegments y actualizá saveStatus. Antes el debounced fire-
+  // and-forget tragaba errores. Ahora si la red cae o el backend
+  // rechaza, saveStatus pasa a "error" y el chip rojo + bloqueo del
+  // botón Aprobar se activan.
+  // Auditoría 2026-06-10 ("hay partes que no se graban"): el cleanup del
+  // debounce cancelaba el guardado pendiente SIN flush. Salir del step 6
+  // del wizard DESMONTA este componente — los últimos <3s de anclas/drags
+  // morían con él, y al volver el remount sembraba desde datos viejos.
+  // `_pendingFlushRef` guarda el estado más fresco aún-no-persistido; el
+  // effect de unmount (deps vacías, abajo) lo dispara fire-and-forget.
+  const _pendingFlushRef = useRef(null);
+  useEffect(() => {
+    if (disableAutosave) return undefined;
+    if (!onPersistSegments || !transcribeJobId) return undefined;
+    if (!Array.isArray(edited) || edited.length === 0) return undefined;
+    let cancelled = false;
+    _pendingFlushRef.current = { onPersistSegments, transcribeJobId, edited };
+    const tid = setTimeout(async () => {
+      if (cancelled) return;
+      _pendingFlushRef.current = null;
+      setSaveStatus("saving");
+      const cleaned = edited.map(({ _id, review, ...rest }) => rest);
+      try {
+        const result = await Promise.resolve(onPersistSegments(transcribeJobId, cleaned));
+        if (cancelled) return;
+        // El callback (App.jsx::persistSegmentsToBackend) retorna
+        // { ok, reason } post-fix #74. Para legacy callers (sin
+        // return value), result === undefined → tratamos como ok.
+        if (result && result.ok === false) {
+          setSaveStatus("error");
+        } else {
+          setSaveStatus("saved");
+        }
+      } catch {
+        if (!cancelled) setSaveStatus("error");
+      }
+    }, 3000);
+    return () => { cancelled = true; clearTimeout(tid); };
+  }, [edited, transcribeJobId, onPersistSegments, disableAutosave]);
+
+  // Flush-on-unmount: si el componente muere con un autosave pendiente
+  // (debounce sin disparar), persistimos el estado vigente igual. Fire-
+  // and-forget: no hay UI que actualizar — el objetivo es que el backend
+  // (y el remount posterior, que siembra desde currentReview) no pierdan
+  // los últimos segundos de trabajo de la operadora.
+  useEffect(() => {
+    return () => {
+      const p = _pendingFlushRef.current;
+      if (!p) return;
+      _pendingFlushRef.current = null;
+      try {
+        const cleaned = p.edited.map(({ _id, review, ...rest }) => rest);
+        Promise.resolve(p.onPersistSegments(p.transcribeJobId, cleaned)).catch(() => {});
+      } catch { /* best-effort */ }
+    };
+  }, []);
+
+  // Durable flush on page unload (refresh / tab close). The beforeunload
+  // handler above only WARNS via a native dialog — it does not persist. And
+  // the flush-on-unmount above runs on React unmount (SPA navigation), which
+  // a hard refresh (F5) skips: the browser tears down the JS context before
+  // the 3s debounce or the unmount cleanup can finish, and an ordinary fetch
+  // is canceled mid-flight. So on pagehide/beforeunload we re-fire the pending
+  // save with `keepalive: true`, which the browser is required to deliver even
+  // as the page goes away. Auth headers ride along (authFetch adds them) —
+  // navigator.sendBeacon can't set Authorization, so /save-segments would 401.
+  // (Reporte Gaby 2026-06-24: el editor titiló, refrescó para salir y perdió
+  // TODO el trabajo no persistido.)
+  useEffect(() => {
+    if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
+    const flushOnUnload = () => {
+      const p = _pendingFlushRef.current;
+      if (!p) return;
+      _pendingFlushRef.current = null;
+      try {
+        const cleaned = p.edited.map(({ _id, review, ...rest }) => rest);
+        Promise.resolve(
+          p.onPersistSegments(p.transcribeJobId, cleaned, { keepalive: true })
+        ).catch(() => {});
+      } catch { /* best-effort */ }
+    };
+    window.addEventListener("pagehide", flushOnUnload);
+    window.addEventListener("beforeunload", flushOnUnload);
+    return () => {
+      window.removeEventListener("pagehide", flushOnUnload);
+      window.removeEventListener("beforeunload", flushOnUnload);
+    };
+  }, [disableAutosave, onPersistSegments, transcribeJobId]);
+
+  // Flush-save on a timeline drag (no 3 s wait) + drive the "Guardado ✓"
+  // chip. Runs only when flushCounter bumps. By the time this effect fires,
+  // setEdited from the same handler has already applied, so `edited` is the
+  // post-drag value. Idempotent vs the debounced autosave above.
+  useEffect(() => {
+    if (flushCounter === 0) return undefined;
+    if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
+    let cancelled = false;
+    // El flush persiste el `edited` vigente ya mismo — el flush-on-unmount
+    // no tiene nada pendiente que rescatar.
+    _pendingFlushRef.current = null;
+    setSaveStatus("saving");
+    const cleaned = edited.map(({ _id, review, ...rest }) => rest);
+    Promise.resolve(onPersistSegments(transcribeJobId, cleaned))
+      .then((result) => {
+        if (cancelled) return;
+        // QA fix audit P0 #74: distinguir error en lugar de idle silencioso.
+        if (result && result.ok === false) setSaveStatus("error");
+        else setSaveStatus("saved");
+      })
+      .catch(() => { if (!cancelled) setSaveStatus("error"); });
+    return () => { cancelled = true; };
+    // Only react to the flush trigger — `edited` is intentionally read fresh
+    // but NOT a dep (we don't want every keystroke to flush).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flushCounter]);
+
+  // Auto-clear the "Guardado ✓" chip a couple seconds after it shows.
+  useEffect(() => {
+    if (saveStatus !== "saved") return undefined;
+    const id = setTimeout(() => setSaveStatus("idle"), 2000);
+    return () => clearTimeout(id);
+  }, [saveStatus]);
+
+  // Synchronous per-edit callback: fires on every `edited` change with no
+  // debounce, so the parent can hold the latest segments in a ref and
+  // include them in the next /edit POST without racing the 3 s autosave
+  // window. No-op when the parent didn't wire the callback. Cheap enough
+  // to fire per keystroke — a single map() over the segments array.
+  useEffect(() => {
+    if (!onEditedChange || !Array.isArray(edited)) return;
+    const cleaned = edited.map(({ _id, review, ...rest }) => rest);
+    onEditedChange(cleaned);
+  }, [edited, onEditedChange]);
+
+  // NOTE: a second debounced-autosave useEffect lived here, copy-pasted
+  // identically to the one above (line ~238). Removed 2026-05-18 —
+  // the duplicate (a) did not respect `disableAutosave`, and (b) raced
+  // its partner on every `edited` change, firing two POSTs in parallel
+  // every 3 s. If two edits landed inside the same debounce window the
+  // second response could overwrite the first with a stale payload.
+  // Agus reported edits not persisting after SPACE anchors; the race
+  // was the likely culprit. Keep the single autosave above.
 
   // ─── Audio sync ─────────────────────────────────────────────────────
-  const audioUrl = useMemo(
-    () => (audioFile ? URL.createObjectURL(audioFile) : null),
-    [audioFile],
-  );
-  useEffect(() => () => { if (audioUrl) URL.revokeObjectURL(audioUrl); }, [audioUrl]);
+  // Blob URL lifecycle must live in useEffect, not useMemo. useMemo is
+  // not a lifecycle hook and React 18 StrictMode double-invokes its
+  // callback in dev, leaking one URL per mount. More importantly, pairing
+  // a useMemo-created URL with a useEffect cleanup keyed on [audioUrl]
+  // causes StrictMode's simulated unmount to revoke the URL while the
+  // <audio> element in the DOM still references it — playback dies a few
+  // seconds in once the initial buffered range is consumed.
+  const [audioUrl, setAudioUrl] = useState(null);
+  const blobUrlRef = useRef(null);
+
+  // Effect A: blob URL lifecycle — only re-runs when audioFile changes.
+  // audioUrlProp is intentionally NOT in the deps: including it would cause
+  // the cleanup (which revokes the blob) to fire when Phase B sets audioUrlProp,
+  // creating an ERR_FILE_NOT_FOUND race before the R2 URL reaches the <audio>
+  // element. Effect B handles the audioUrlProp upgrade independently.
+  useEffect(() => {
+    if (!audioFile) { setAudioUrl(null); return undefined; }
+    // HOTFIX 2026-05-29: when a wizard session is resumed from
+    // sessionStorage (wizardPersistence), `audioFile` is a STUB object
+    // — { name, size, type, lastModified, _restoredStub: true } — not
+    // a real Blob/File. URL.createObjectURL on a non-Blob throws
+    // "Failed to execute 'createObjectURL' on 'URL': Overload
+    // resolution failed". Detect the stub and silently skip; segment
+    // editing still works, audio playback is disabled until re-upload.
+    const isRealBlob =
+      typeof Blob !== "undefined" && audioFile instanceof Blob;
+    if (!isRealBlob || audioFile._restoredStub) {
+      setAudioUrl(null);
+      return undefined;
+    }
+    const url = URL.createObjectURL(audioFile);
+    setAudioUrl(url);
+    blobUrlRef.current = url;
+    return () => {
+      URL.revokeObjectURL(url);
+      blobUrlRef.current = null;
+    };
+  }, [audioFile]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Effect B: R2/signed URL upgrade (Phase B). When the parent fetches a
+  // durable server-side URL after job creation, we revoke the ephemeral blob
+  // here (not in Effect A's cleanup) so the <audio> never sees a dead URL.
+  useEffect(() => {
+    if (!audioUrlProp) return;
+    if (blobUrlRef.current) {
+      URL.revokeObjectURL(blobUrlRef.current);
+      blobUrlRef.current = null;
+    }
+    setAudioUrl(audioUrlProp);
+  }, [audioUrlProp]);
 
   const audioRef = useRef(null);
   const listRef = useRef(null);
   const rowRefs = useRef({});
+  const rafRef = useRef(null);
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+
+  // INCIDENT (mobile 2026-05-24): the audio element's `onTimeUpdate`
+  // event fires every ~250 ms on most browsers (sometimes slower on
+  // mobile in background tabs). Lines shorter than that — short
+  // interjections ("oh!", "yeah"), rapid-fire hip-hop / reggaetón
+  // syllables, or any sub-250ms segment from forced alignment — were
+  // SKIPPED in the preview: `currentTime` jumped from before the line's
+  // start straight past its end, and `segments.find(s => t >= s.start
+  // && t < s.end)` returned null for the whole duration.
+  //
+  // Fix: while playing, drive `currentTime` from `requestAnimationFrame`
+  // (~60 fps, 16 ms granularity). Any line ≥ 1 frame appears at least
+  // once. Stop the rAF loop on pause/end to avoid burning a CPU core.
+  // `onTimeUpdate` is still wired as a fallback for seeks and the
+  // initial idle state (before the user hits play).
+  useEffect(() => {
+    if (!isPlaying) return undefined;
+    const tick = () => {
+      const a = audioRef.current;
+      if (a && !a.paused) {
+        const ct = a.currentTime;
+        setCurrentTime(ct);
+        // Phase C 2026-05-25: publish playback tick al padre. Buscar el
+        // segment activo aquí (no usar activeId del scope porque cambia
+        // con setState async). Si el padre pasó onPlaybackTick, le
+        // notificamos el segmento activo + currentTime para que el
+        // WizardLivePreview central pueda hacer word-jump real.
+        if (onPlaybackTick) {
+          let active = null;
+          for (const s of edited) {
+            if (ct >= s.start && ct < s.end) { active = s; break; }
+            if (ct >= s.start) active = s;
+          }
+          if (active) {
+            onPlaybackTick(active.text || "", active.start, active.end, ct, active.words);
+          } else {
+            onPlaybackTick("", 0, 0, ct);
+          }
+        }
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying, edited, onPlaybackTick]);
+  const [wrapWarning, setWrapWarning] = useState(null); // {ids: [...]} for 3+ line segs
+  const [focusedSegId, setFocusedSegId] = useState(null); // for preview panel
 
   // Inline timestamp edit state. Only one row can be in edit mode at a
   // time; clicking a different row's timestamp swaps the active editor.
   // Single-click on a timestamp seeks; double-click switches to edit.
   const [editingId, setEditingId] = useState(null);
   const [editValue, setEditValue] = useState("");
+  // Repeat-line propagation. `textEditStart` snapshots {id, text} when the
+  // operator focuses a line's text input, so on blur we can compare against
+  // the pre-edit text and find other lines that were identical to it.
+  // `propagationPrompt` holds {id, newText, matchIds, prevText} while we ask
+  // "apply this change to the N other identical lines?".
+  const [textEditStart, setTextEditStart] = useState(null);
+  const [propagationPrompt, setPropagationPrompt] = useState(null);
 
   // Tap-to-sync mode — operator hits Space (or button) while audio
   // plays to anchor each line at the current playback time. Solves
@@ -108,6 +845,35 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   // offset arbitrarily — listening + tapping is ground truth.
   const [syncMode, setSyncMode] = useState(false);
   const [syncCursor, setSyncCursor] = useState(0);
+  // Set of segment _ids that were anchored in the last 10s — used to
+  // render a "recently moved" ring + per-row undo button so the operator
+  // can see what just moved (the chronological re-sort can be visually
+  // confusing, see tapAnchor comments). Each id is auto-removed by a
+  // 10s setTimeout scheduled at anchor time.
+  const [highlightedIds, setHighlightedIds] = useState(() => new Set());
+  // Toast for per-anchor confirmation feedback.
+  const { toast } = useToast();
+  // Global timing offset panel — UX entry point for "the whole song is
+  // shifted by N ms" cases. Different from Sync Mode (which anchors a
+  // line + propagates) and the "intro is too long" banner (which only
+  // appears when first.start > 3 s). This panel is always available
+  // and lets the operator nudge every line by ±1 s with a slider or
+  // ±125/250/500 ms presets. Collapsed by default to keep the editor
+  // tidy.
+  const [shiftPanelOpen, setShiftPanelOpen] = useState(false);
+  const [shiftDraftMs, setShiftDraftMs] = useState(0); // -1000..+1000
+  // After applying a shift the slider resets to 0 so the next draft
+  // starts clean. Without a confirmation chip the operator can't tell
+  // whether the click landed — they see the preset highlight clear and
+  // assume nothing happened, then re-apply, doubling the shift.
+  // appliedShiftMs holds the last applied delta for ~2.5s purely as
+  // visual receipt.
+  const [appliedShiftMs, setAppliedShiftMs] = useState(null);
+  useEffect(() => {
+    if (appliedShiftMs == null) return undefined;
+    const id = setTimeout(() => setAppliedShiftMs(null), 2500);
+    return () => clearTimeout(id);
+  }, [appliedShiftMs]);
   // When false (default), each Sync-Mode tap anchors ONLY the current
   // line — leaves every following timestamp alone. When true, the same
   // delta propagates to every line after the cursor (the previous-only
@@ -127,6 +893,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   // state. Cmd/Ctrl+Z pops one and replays it onto setEdited.
   const [editHistory, setEditHistory] = useState([]);
   const pushEditHistory = useCallback(() => {
+    setIsDirty(true);
     setEditHistory((prev) => {
       const next = [...prev, edited];
       return next.length > 50 ? next.slice(next.length - 50) : next;
@@ -139,6 +906,63 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       setEdited(snapshot);
       return prev.slice(0, -1);
     });
+  }, []);
+
+  // ─── Visual timeline (Timings view) handlers ────────────────────────
+  // A drag commits here. We stamp `locked: true` so the render
+  // (pipeline._apply_display_timing) respects this manual end instead of
+  // auto-extending it (hold-until-next). The undo snapshot is pushed by the
+  // timeline on pointerdown (onDragStart), so this only mutates `edited`.
+  const handleTimelineTimingChange = useCallback((id, newStart, newEnd) => {
+    setIsDirty(true);
+    setEdited((prev) => prev.map((s) =>
+      s._id === id ? { ...s, start: newStart, end: newEnd, locked: true } : s
+    ));
+    setHighlightedIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+    setTimeout(() => setHighlightedIds((prev) => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    }), 10000);
+    // Flush-save immediately (don't wait for the 3 s autosave debounce) so
+    // the operator sees "Guardado" right after dropping a block — the
+    // flush effect below reads the just-updated `edited` and persists.
+    setFlushCounter((c) => c + 1);
+  }, []);
+
+  // Per-line layout (position / size / rotation) committed from the live
+  // preview. Same flush-on-commit as the timeline so "Guardado" shows fast.
+  const handleLayoutChange = useCallback((id, layout) => {
+    setIsDirty(true);
+    setEdited((prev) => prev.map((s) =>
+      (layoutScope === "all" || s._id === id)
+        ? { ...s, pos: layout.pos, scale: layout.scale, rot: layout.rot }
+        : s
+    ));
+    setFlushCounter((c) => c + 1);
+  }, [layoutScope]);
+
+  // Restore every line's timing to the original snapshot + drop all `locked`
+  // flags, so the render goes back to auto hold-until-next.
+  const resetTimings = useCallback(() => {
+    pushEditHistory();
+    const byId = new Map((originalSegmentsRef.current || []).map((s) => [s._id, s]));
+    setEdited((prev) => prev.map((s) => {
+      const o = byId.get(s._id);
+      if (!o) return s;
+      // eslint-disable-next-line no-unused-vars
+      const { locked, ...rest } = s;
+      return { ...rest, start: o.start, end: o.end };
+    }));
+    toast({ message: "Timings restaurados al original", tone: "info" });
+  }, [pushEditHistory, toast]);
+
+  const focusSegment = useCallback((id) => {
+    setFocusedSegId(id);
   }, []);
 
   const startEditTimestamp = (seg) => {
@@ -211,24 +1035,111 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     return (containing || lastStarted)?._id ?? null;
   }, [edited, currentTime]);
 
+  // UI freeze / render-storm capture (P0 UMG Chile 2026-06-16). Cause-agnostic
+  // safety net: if the main thread saturates (the "se queda pegado" + flicker),
+  // emit a Sentry-forwarded report with the segment shape + last action so we
+  // can finally diagnose the real trigger. getContext is read at report time.
+  useUiStormDetector({
+    active: true,
+    getContext: () => {
+      const segs = Array.isArray(edited) ? edited : [];
+      const sorted = [...segs].sort((a, b) => a.start - b.start);
+      let overlaps = 0;
+      let maxOverlapDepth = 0;
+      for (let i = 0; i < sorted.length - 1; i++) {
+        if (sorted[i].end > sorted[i + 1].start + 0.001) {
+          overlaps += 1;
+          let depth = 0;
+          for (let j = i + 1; j < sorted.length && sorted[j].start < sorted[i].end; j++) depth += 1;
+          if (depth > maxOverlapDepth) maxOverlapDepth = depth;
+        }
+      }
+      return {
+        segments: segs.length,
+        overlapping_pairs: overlaps,
+        max_overlap_depth: maxOverlapDepth,
+        is_playing: isPlaying,
+        sync_mode: syncMode,
+        duration: Math.round((duration || 0) * 10) / 10,
+      };
+    },
+  });
+
   // Tap handler: anchor the line at syncCursor to currentTime, then
   // propagate the same delta to every line AFTER it (the unanchored
   // ones). If the offset was constant the next line is already roughly
   // right and the operator only needs to confirm. Already-anchored
   // lines (idx < syncCursor) are ground truth and stay put.
+  // Empirical compensation for the gap between `audio.currentTime` (the
+  // *decoded* position, what the API reports) and what the operator
+  // actually hears coming out of the speakers. Browsers buffer ~30-100 ms
+  // of decoded audio before it's audible — when the operator hits Space
+  // synced with their ear, currentTime has already advanced past the
+  // moment they meant to anchor. 80 ms is the empirical mid-point of
+  // observed latency on Chrome/Firefox/Safari with non-Bluetooth output.
+  // Operators using BT headsets may need more compensation; expose later
+  // as a calibration setting if reports persist.
+  const AUDIO_LATENCY_COMPENSATION_S = 0.08;
+  // Floor between adjacent segments so an anchor can't push a line into
+  // (or before) its neighbor. 50 ms is below human flicker perception
+  // but enough to keep moviepy's transitions clean.
+  const MIN_GAP_S = 0.05;
+  // Cascade safety net: if a single anchor would propagate a > 1.5 s
+  // shift to every line after it, that's almost certainly a mistap (the
+  // operator was paused, scrolled, or got distracted) — confirm before
+  // walking the rest of the song into the wrong place.
+  const CASCADE_DELTA_CONFIRM_S = 1.5;
+
   const tapAnchor = useCallback(() => {
     if (!syncMode) return;
     if (syncCursor < 0 || syncCursor >= edited.length) return;
     const target = edited[syncCursor];
     if (!target) return;
-    const newStart = Math.max(0, currentTime);
+
+    // Compensate audio latency so the anchor matches what the operator
+    // *heard* at press time, not what was decoded by then. See the
+    // AUDIO_LATENCY_COMPENSATION_S comment above.
+    const rawStart = Math.max(0, currentTime - AUDIO_LATENCY_COMPENSATION_S);
+
+    // Honor the operator's intent: anchor at currentTime regardless of
+    // where this line currently sits in the array. The previous version
+    // clamped to `prevSeg.end + MIN_GAP_S` (where prevSeg was the line
+    // at array position syncCursor-1). For the typical "fill in missing
+    // chorus repetition" workflow — add line at end of array, then
+    // SPACE-anchor it to mid-song — that clamp pinned the new line at
+    // the END of the song instead of where the operator wanted it.
+    // (Una Vez Más — Viejas Locas, agus.cafisi 2026-05-18, bug B4.)
+    //
+    // Trade-off: timeline can momentarily be non-monotonic between
+    // tapAnchor and the post-mutation sort below. Render iterates
+    // `edited` (which gets sorted right after this setEdited), so the
+    // operator sees the line move to its new chronological slot.
+    // syncCursor advances by _id, not array index, so the next SPACE
+    // press lands on the line that was visually next BEFORE the move.
+    const upperBound = duration && duration > 0 ? duration : Infinity;
+    const newStart = Math.max(0, Math.min(rawStart, upperBound));
+
     const delta = newStart - target.start;
+
+    // Cascade safety: huge delta = probable mistap. Ask before walking
+    // every subsequent line by the same amount. Bail if operator cancels —
+    // the current line gets the anchor but the cascade is skipped.
+    let applyCascade = syncCascade;
+    if (applyCascade && Math.abs(delta) > CASCADE_DELTA_CONFIRM_S) {
+      const tail = edited.length - syncCursor - 1;
+      const ok = window.confirm(
+        `Detectamos un salto de ${delta.toFixed(2)}s en este anchor. ` +
+        `¿Aplicar a las ${tail} líneas siguientes? ` +
+        `(Cancelar = solo anclar la línea actual.)`
+      );
+      if (!ok) applyCascade = false;
+    }
+
     // Snapshot the future lines BEFORE mutating so undo can restore
-    // every shifted timestamp, not just the anchor's.
-    // Snapshot the future ONLY when we're going to touch it. Without
-    // syncCascade the future array stays empty and Deshacer reverts a
-    // single line — matching the user's mental model.
-    const futureSnapshot = syncCascade
+    // every shifted timestamp, not just the anchor's. Skip when we're
+    // not going to touch the future — keeps the undo behaviour matching
+    // the user's mental model (single line revert).
+    const futureSnapshot = applyCascade
       ? edited
           .slice(syncCursor + 1)
           .map((s) => ({ id: s._id, prevStart: s.start, prevEnd: s.end }))
@@ -244,21 +1155,29 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
         delta,
       },
     ]);
-    setEdited((prev) =>
-      prev.map((s, i) => {
+    // Compute next-chronological-line identity BEFORE we mutate, so we
+    // can advance syncCursor to the same line the operator was about
+    // to anchor next, even if the mutation re-sorts the array. Falls
+    // back to "stay on the current line if it ended up last" — sync
+    // mode auto-exits at array end.
+    const nextLineId = (syncCursor + 1 < edited.length)
+      ? edited[syncCursor + 1]._id
+      : null;
+
+    setEdited((prev) => {
+      const mutated = prev.map((s, i) => {
         if (s._id === target._id) {
           const segDur = Math.max(0.5, s.end - s.start);
           let newEnd = newStart + segDur;
           if (duration && newEnd > duration) newEnd = duration;
           return { ...s, start: newStart, end: newEnd };
         }
-        // Cascade only when the operator opted in. Skip when delta is
-        // tiny to avoid jittering on micro-adjustments. The previous
-        // unconditional cascade was overwriting already-correct future
-        // timestamps when the operator just wanted to fix the FIRST
-        // line of a song whose lrclib data put line 1 at 0:00 (instead
-        // of the real ~15 s where vocals start).
-        if (syncCascade && i > syncCursor && Math.abs(delta) >= 0.2) {
+        // Cascade only when the operator opted in AND the delta isn't a
+        // suspect mistap (handled by the confirm above). 10 ms threshold
+        // filters pure floating-point noise; below that we skip the
+        // shift, above we apply it. See git blame for the prior 200 ms
+        // dead-zone that swallowed legit user corrections.
+        if (applyCascade && i > syncCursor && Math.abs(delta) >= 0.01) {
           const segDur = Math.max(0.5, s.end - s.start);
           const shifted = Math.max(0, s.start + delta);
           let newEnd = shifted + segDur;
@@ -266,15 +1185,99 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
           return { ...s, start: shifted, end: newEnd };
         }
         return s;
-      }),
-    );
-    // Advance to the next line; auto-exit when past the last one.
-    if (syncCursor + 1 >= edited.length) {
+      });
+      // Sort by start so the array — and thus syncCursor's positional
+      // index, the render order, and the next neighbour lookup — all
+      // stay consistent with the new chronological reality.
+      const sorted = mutated.sort((a, b) => a.start - b.start);
+
+      // Diagnostic trace: when the focused row's new chronological
+      // position differs from its prior position by more than 2 slots,
+      // log a structured event so a curious operator with DevTools open
+      // can see what just happened. Helped diagnose the 2026-05-19
+      // "lines change places" complaint where the reorder was correct
+      // but the visual jump was confusing.
+      const prevIdx = prev.findIndex((s) => s._id === target._id);
+      const newIdx = sorted.findIndex((s) => s._id === target._id);
+      if (Math.abs(newIdx - prevIdx) > 2) {
+        // eslint-disable-next-line no-console
+        console.info("[sync] Anchor caused multi-position reorder", {
+          line_id: target._id,
+          prev_start: target.start,
+          new_start: newStart,
+          prev_idx: prevIdx,
+          new_idx: newIdx,
+          jumps: newIdx - prevIdx,
+        });
+      }
+      return sorted;
+    });
+
+    // Per-anchor toast: short visual confirmation of "what I just did",
+    // dismissed after 2s. Format mirrors the row timestamp display so
+    // the operator can mentally match. The toast lives in
+    // ToastProvider — fire-and-forget.
+    toast({
+      message: `Anclada · ${formatTimestamp(target.start)} → ${formatTimestamp(newStart)}`,
+      tone: Math.abs(delta) > 5 ? "warning" : "info",
+    });
+
+    // Highlight the row for 10s so the eye finds the moved line + we
+    // can render a per-row undo button while the ring is up. Cleanup
+    // timer removes the id after 10s — if a new anchor fires on the
+    // same id, the timer chain restarts (we don't bother dedupe-ing).
+    setHighlightedIds((prev) => {
+      const next = new Set(prev);
+      next.add(target._id);
+      return next;
+    });
+    setTimeout(() => {
+      setHighlightedIds((prev) => {
+        if (!prev.has(target._id)) return prev;
+        const next = new Set(prev);
+        next.delete(target._id);
+        return next;
+      });
+    }, 10000);
+
+    // Advance to the line that was visually next BEFORE the mutation.
+    // Located by _id so the sort can't drift us onto the wrong line.
+    // If that line no longer exists (shouldn't happen for tapAnchor)
+    // or there was no "next", exit sync mode.
+    if (nextLineId == null) {
       setSyncMode(false);
     } else {
-      setSyncCursor(syncCursor + 1);
+      // We don't know the post-sort position until the next render, so
+      // schedule the cursor move in a microtask after setEdited applies.
+      // React batches this with the setEdited update — same render.
+      queueMicrotask(() => {
+        setEdited((current) => {
+          const newPos = current.findIndex((s) => s._id === nextLineId);
+          if (newPos >= 0) {
+            setSyncCursor(newPos);
+          } else {
+            setSyncMode(false);
+          }
+          return current; // no mutation, just reading
+        });
+      });
     }
   }, [syncMode, syncCursor, edited, currentTime, duration, syncCascade]);
+
+  // Keep syncCursor inside the bounds of `edited` after split/delete
+  // operations performed mid-sync. Without this, deleting line 8 while
+  // the cursor is on line 5 leaves the UI showing line 5 but the next
+  // tapAnchor reads from an array that may have shifted under the hood.
+  useEffect(() => {
+    if (!syncMode) return;
+    if (edited.length === 0) {
+      setSyncMode(false);
+      return;
+    }
+    if (syncCursor >= edited.length) {
+      setSyncCursor(edited.length - 1);
+    }
+  }, [edited.length, syncMode, syncCursor]);
 
   const undoLastAnchor = useCallback(() => {
     setSyncHistory((prev) => {
@@ -290,7 +1293,52 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
         }),
       );
       setSyncCursor(last.cursor);
+      // Clear the highlight for the undone row — its anchor was reverted,
+      // so the "recently moved" indicator is misleading.
+      setHighlightedIds((hl) => {
+        if (!hl.has(last.id)) return hl;
+        const next = new Set(hl);
+        next.delete(last.id);
+        return next;
+      });
       return prev.slice(0, -1);
+    });
+  }, []);
+
+  // Per-row undo: revert the MOST RECENT anchor that touched this _id.
+  // Different from undoLastAnchor (which is strictly LIFO regardless of
+  // which line). Lets the operator click ↻ on row X to undo only that
+  // anchor, even if several others happened on different lines after.
+  const undoAnchorFor = useCallback((id) => {
+    setSyncHistory((prev) => {
+      const lastIdx = (() => {
+        for (let i = prev.length - 1; i >= 0; i--) {
+          if (prev[i].id === id) return i;
+        }
+        return -1;
+      })();
+      if (lastIdx < 0) return prev;
+      const entry = prev[lastIdx];
+      const futureMap = new Map((entry.future || []).map((f) => [f.id, f]));
+      setEdited((segs) =>
+        segs
+          .map((s) => {
+            if (s._id === entry.id) return { ...s, start: entry.prevStart, end: entry.prevEnd };
+            const f = futureMap.get(s._id);
+            if (f) return { ...s, start: f.prevStart, end: f.prevEnd };
+            return s;
+          })
+          .sort((a, b) => a.start - b.start),
+      );
+      setHighlightedIds((hl) => {
+        if (!hl.has(id)) return hl;
+        const next = new Set(hl);
+        next.delete(id);
+        return next;
+      });
+      // Splice out the reverted entry — preserves any later entries on
+      // other lines so undoLastAnchor (Z key) keeps a sensible stack.
+      return prev.filter((_, i) => i !== lastIdx);
     });
   }, []);
 
@@ -328,6 +1376,14 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     }
     if (!isPlaying || activeId === null) return;
     if (lastScrolledIdRef.current === activeId) return;
+    // Auditoría 2026-06-10 ("se mueve y no me deja hacer cambios"): este
+    // auto-centrado corre durante playback SIN ninguna supresión — si la
+    // operadora está escribiendo o ajustando una línea, el panel entero
+    // se le va al centro de la fila activa cada 2-5s. Suprimimos cuando
+    // hay un input/textarea con foco (está editando texto) — el timeline
+    // ya tiene su propia supresión por interacción (FOLLOW_SUPPRESS_MS).
+    const ae = typeof document !== "undefined" ? document.activeElement : null;
+    if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA")) return;
     lastScrolledIdRef.current = activeId;
     const el = rowRefs.current[activeId];
     if (el) el.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -343,7 +1399,11 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   const seekTo = useCallback((seconds, autoplay = true) => {
     const a = audioRef.current;
     if (!a) return;
-    a.currentTime = Math.max(0, seconds);
+    const t = Math.max(0, seconds);
+    a.currentTime = t;
+    // Refleja en el mismo frame del click. Sin esto hay que esperar al
+    // próximo rAF tick (~16ms) y el playhead "se desliza" en vez de saltar.
+    setCurrentTime(t);
     if (autoplay && a.paused) a.play().catch(() => {});
   }, []);
 
@@ -356,6 +1416,11 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       const editing = tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable;
       if (editing) return;
       if (e.code === "Space") {
+        // Ignore keyboard autorepeat / sustained press so the operator
+        // doesn't anchor 3 lines from one apparent tap. Native autorepeat
+        // fires keydown ~20 times per second on most OSes — one anchor
+        // is the operator's intent, the rest are noise.
+        if (e.repeat) { e.preventDefault(); return; }
         e.preventDefault();
         if (syncMode) tapAnchor();
         else togglePlay();
@@ -372,11 +1437,26 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       } else if (syncMode && e.key === "Escape") {
         e.preventDefault();
         exitSyncMode();
+      } else if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
+        // Cmd/Ctrl+K — toggle Sync mode (refactor 2026-05-23: el botón visual
+        // se compactó a ícono discreto, este shortcut es la forma rápida
+        // desde teclado). Funciona en ambos sentidos: si ya está activo, sale.
+        if (!audioUrl) return;  // no sync sin audio
+        e.preventDefault();
+        if (syncMode) exitSyncMode();
+        else enterSyncMode();
+      } else if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === "f" || e.key === "F")) {
+        // 2026-05-25 — F toggle "Modo Enfoque". Guard `editing` arriba
+        // ya nos protege de capturarlo cuando el operador está tipeando
+        // en un input/textarea (la mayoría de las veces). Sin modifier
+        // keys para que no choque con Cmd+F (buscar nativo del browser).
+        e.preventDefault();
+        toggleFocusMode();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor, undoEdit]);
+  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor, undoEdit, audioUrl, enterSyncMode, exitSyncMode, toggleFocusMode]);
 
   // ─── Reference lyrics suggestions (unchanged) ───────────────────────
   const refLines = useMemo(() => {
@@ -400,10 +1480,117 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     return map;
   }, [segments, refLines]);
 
+  // Detección de segments mergeados (2 lyric lines en 1 segment) usando
+  // lrclib plain como oracle. Caso real motivador: Whisper agrupa
+  // 2 versos consecutivos en un solo segment ("Siento el calor de toda
+  // tu piel en mi cuerpo otra vez") cuando lrclib los tiene como
+  // entries separadas. El banner banner-prominent al tope del editor
+  // ofrece auto-dividir TODO el lote con 1 click.
+  const mergeableSegments = useMemo(() => {
+    if (refLines.length < 2) return [];
+    const out = [];
+    edited.forEach((seg) => {
+      if (!seg.text || !seg.text.trim()) return;
+      const pair = findReferenceSplitLines(seg.text, refLines);
+      if (pair) out.push({ _id: seg._id, splitLines: pair });
+    });
+    return out;
+  }, [edited, refLines]);
+
+  // Auto-dividir TODOS los segments mergeados usando reference como
+  // oracle. Para cada uno: timestamp split proporcional al char-count
+  // de cada línea (lineA más larga = más tiempo). Reverse-order para
+  // no romper índices durante la mutación.
+  const autoSplitAllFromReference = () => {
+    if (mergeableSegments.length === 0) return;
+    pushEditHistory();
+    setEdited((prev) => {
+      // Map id → splitLines para lookup rápido
+      const byId = new Map(
+        mergeableSegments.map((m) => [m._id, m.splitLines]),
+      );
+      const result = [];
+      let nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
+      for (const seg of prev) {
+        const splitLines = byId.get(seg._id);
+        if (!splitLines) {
+          result.push(seg);
+          continue;
+        }
+        const [lineA, lineB] = splitLines;
+        const totalChars = lineA.length + lineB.length;
+        if (totalChars === 0) {
+          result.push(seg);
+          continue;
+        }
+        const ratio = lineA.length / totalChars;
+        const dur = Math.max(0.6, seg.end - seg.start);
+        const midTime = seg.start + dur * ratio;
+        const gap = 0.05;
+        result.push({
+          ...seg,
+          _id: nextId++,
+          text: lineA,
+          end: Math.max(seg.start + 0.3, midTime - gap),
+        });
+        result.push({
+          ...seg,
+          _id: nextId++,
+          text: lineB,
+          start: Math.min(seg.end - 0.3, midTime),
+          end: seg.end,
+        });
+      }
+      return result;
+    });
+  };
+
   const updateText = (id, text) => {
     pushEditHistory();
     setEdited((prev) => prev.map((seg) => (seg._id === id ? { ...seg, text } : seg)));
   };
+
+  // Called on blur of a line's text input. If the operator changed a line
+  // that was identical to other lines (a repeated chorus), offer to apply
+  // the same new text to those other occurrences. Match is against the
+  // PRE-edit text (textEditStart), so lines the operator already diverged by
+  // hand never match and are never touched. Newly-typed text is compared
+  // exact (trim + collapsed whitespace), case/accent sensitive.
+  const handleTextBlur = (id, newText) => {
+    const start = textEditStart;
+    setTextEditStart(null);
+    if (!start || start.id !== id) return;
+    const prevNorm = normalizeLineForMatch(start.text);
+    const newNorm = normalizeLineForMatch(newText);
+    // Only prompt when the text actually changed and the pre-edit line had
+    // real content (don't propagate blanks).
+    if (!prevNorm || prevNorm === newNorm) return;
+    const matchIds = edited
+      .filter((s) => s._id !== id && normalizeLineForMatch(s.text) === prevNorm)
+      .map((s) => s._id);
+    if (matchIds.length > 0) {
+      setPropagationPrompt({ id, newText, matchIds, prevText: start.text });
+    }
+  };
+
+  const applyPropagation = () => {
+    if (!propagationPrompt) return;
+    const { newText, matchIds } = propagationPrompt;
+    pushEditHistory();
+    const idset = new Set(matchIds);
+    setEdited((prev) => prev.map((s) => (idset.has(s._id) ? { ...s, text: newText } : s)));
+    setPropagationPrompt(null);
+    // Flush-save immediately so the propagated lines persist without waiting
+    // for the 3 s autosave debounce.
+    setFlushCounter((c) => c + 1);
+    toast({
+      message: (t("editor.repeat_applied") || "Cambio aplicado a {n} líneas repetidas")
+        .replace("{n}", matchIds.length),
+      tone: "info",
+    });
+  };
+
+  const dismissPropagation = () => setPropagationPrompt(null);
 
   const applySuggestion = (id) => {
     const suggestion = suggestionsById[id];
@@ -439,7 +1626,168 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   }, [pushEditHistory, duration]);
 
   const deleteSeg = (id) => {
+    recordEditorAction("delete", { id });
     setEdited((prev) => prev.filter((seg) => seg._id !== id));
+  };
+
+  // Text-length-based cap. Used by the per-row ✂ button + bulk-trim
+  // action in this editor. There is NO automatic application — the
+  // operator chooses when (and per-segment whether) to apply.
+  const TRIM_FLOOR_S = 3.5;
+  const TRIM_PER_CHAR_S = 0.10;
+  const TRIM_MARGIN_S = 1.0;
+  const estimateVoiceEndDuration = (text) =>
+    Math.max(TRIM_FLOOR_S, (text || "").length * TRIM_PER_CHAR_S + TRIM_MARGIN_S);
+
+  /** Bulk: trim every segment whose duration exceeds the cap. Each
+   * segment is trimmed independently — only its own `end` is modified
+   * based on its own text length and start. No cross-segment effect. */
+  const trimAllLongSegs = () => {
+    pushEditHistory();
+    setEdited((prev) =>
+      prev.map((seg) => {
+        const dur = seg.end - seg.start;
+        const cap = estimateVoiceEndDuration(seg.text);
+        if (dur <= cap) return seg;
+        return { ...seg, end: seg.start + cap };
+      }),
+    );
+  };
+
+  const longSegCount = edited.filter((seg) => {
+    const dur = seg.end - seg.start;
+    return dur > estimateVoiceEndDuration(seg.text);
+  }).length;
+
+  // Auto-trim on initial load: if the just-loaded segments have hanging
+  // text (lrclib/genius lines that ran into instrumental outros, or
+  // duplicated chorus blocks at the end), apply the same fix the
+  // operator would have applied manually via the autofix banner. The
+  // `autoTrimAppliedRef` (declared up by the segments re-seed effect)
+  // guards against re-running on every text-edit keystroke. Cmd-Z still
+  // works because trimAllLongSegs calls pushEditHistory.
+  useEffect(() => {
+    if (autoTrimAppliedRef.current) return;
+    if (!edited || edited.length === 0) return;
+    if (longSegCount > 0) {
+      trimAllLongSegs();
+    }
+    autoTrimAppliedRef.current = true;
+  }, [edited, longSegCount]);
+
+  // Compute how many visual lines a segment will occupy in the video.
+  const linesForSeg = useCallback((text) => {
+    const displayText = applyCase(text || "", textCase);
+    const tier = getTier(displayText);
+    const fontCss = FONT_CSS_MAP[font] || FONT_CSS_MAP[""];
+    const sizePx = Math.round(tier.sizePx * Math.max(0.6, Math.min(1.5, fontScale)));
+    return estimateWrappedLines(displayText, fontCss, sizePx, tier.maxWidthPx);
+  }, [font, textCase, fontScale]);
+
+  // Split a segment into two. When `charOffset` is given (operator pressed Enter
+  // at the cursor) AND the segment carries per-word timing, the split is
+  // WORD-AWARE: each half inherits the REAL start/end of its words — no re-sync.
+  // Otherwise (the "✂ Dividir" button, which has no cursor, or a segment with no
+  // word timing) we fall back to the canvas wrap-boundary + char-ratio timing
+  // and DROP the now-meaningless `words` array from both halves (keeping the
+  // parent's full `words` on each child was the old bug → wrong per-word timing).
+  const splitSegAt = (id, charOffset) => {
+    pushEditHistory();
+    setEdited((prev) => {
+      const idx = prev.findIndex((s) => s._id === id);
+      if (idx === -1) return prev;
+      const seg = prev[idx];
+      const nextId1 = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
+      const nextId2 = nextId1 + 1;
+
+      // ── WORD-ACCURATE PATH (Enter at cursor, segment has word timing) ──
+      if (charOffset != null && Array.isArray(seg.words) && seg.words.length > 1) {
+        const r = splitWordsAtCharOffset(seg.text, seg.words, charOffset);
+        if (r) {
+          const aStart = firstWordStart(r.wordsA);
+          const aEnd = lastWordEnd(r.wordsA);
+          const bStart = firstWordStart(r.wordsB);
+          const bEnd = lastWordEnd(r.wordsB);
+          const s1 = {
+            ...seg, _id: nextId1, text: r.textA, words: r.wordsA,
+            start: aStart != null ? aStart : seg.start,
+            end: aEnd != null ? aEnd : seg.end,
+          };
+          const s2 = {
+            ...seg, _id: nextId2, text: r.textB, words: r.wordsB,
+            start: bStart != null ? bStart : s1.end + 0.05,
+            end: bEnd != null ? bEnd : seg.end,
+          };
+          if (!(s2.start > s1.end)) s2.start = s1.end + 0.02; // monotonic safety
+          return [...prev.slice(0, idx), s1, s2, ...prev.slice(idx + 1)];
+        }
+        // r === null (degenerate / text edited so tokens≠words) → char-ratio below
+      }
+
+      // ── FALLBACK: char-ratio (no word timing, or unaligned text) ──
+      const fullText = seg.text || "";
+      let cut = charOffset; // cursor split point when present
+      if (cut == null) {
+        // Button path: keep the old behaviour — split at the canvas wrap boundary.
+        const displayText = applyCase(fullText, textCase);
+        const tier = getTier(displayText);
+        const fontCss = FONT_CSS_MAP[font] || FONT_CSS_MAP[""];
+        const sizePx = Math.round(tier.sizePx * Math.max(0.6, Math.min(1.5, fontScale)));
+        const wlist = fullText.split(" ");
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d");
+        ctx.font = `bold ${sizePx}px ${fontCss}`;
+        const spaceW = ctx.measureText(" ").width;
+        let lineW = 0;
+        let splitIdx = Math.floor(wlist.length / 2);
+        for (let wi = 0; wi < wlist.length - 1; wi++) {
+          const ww = ctx.measureText(applyCase(wlist[wi], textCase)).width;
+          lineW = lineW > 0 ? lineW + spaceW + ww : ww;
+          if (lineW > tier.maxWidthPx) { splitIdx = wi > 0 ? wi : 1; break; }
+          splitIdx = wi + 1;
+        }
+        cut = wlist.slice(0, splitIdx).join(" ").length + 1; // +1 for the space
+      }
+      const part1 = fullText.slice(0, cut).trim();
+      const part2 = fullText.slice(cut).trim();
+      if (!part1 || !part2) return prev; // never create an empty line
+      // Char ratio (long words take longer to sing → matches the vocal pause
+      // better than word-count). Drop the stale `words` array from both halves.
+      const ratio = part1.length / Math.max(1, part1.length + part2.length);
+      const midTime = seg.start + (seg.end - seg.start) * ratio;
+      const gap = 0.05;
+      const { words: _dropWords, ...segNoWords } = seg;
+      const s1 = { ...segNoWords, _id: nextId1, text: part1, end: Math.max(seg.start + 0.3, midTime - gap) };
+      const s2 = { ...segNoWords, _id: nextId2, text: part2, start: Math.min(seg.end - 0.3, midTime), end: seg.end };
+      return [...prev.slice(0, idx), s1, s2, ...prev.slice(idx + 1)];
+    });
+  };
+  // Back-compat: the "✂ Dividir" button + bulk callers split with no cursor.
+  const splitSeg = (id) => splitSegAt(id, null);
+
+  // Merge a line with the NEXT line: concatenate text + per-word timing,
+  // start = first.start, end = second.end. If only one side has `words` we
+  // can't fabricate timing for the gap → drop words (karaoke falls back to
+  // uniform distribution, consistent with the split fallback).
+  const mergeSeg = (id) => {
+    recordEditorAction("merge", { id });
+    pushEditHistory();
+    setEdited((prev) => {
+      const idx = prev.findIndex((s) => s._id === id);
+      if (idx === -1 || idx >= prev.length - 1) return prev;
+      const a = prev[idx];
+      const b = prev[idx + 1];
+      const text = `${(a.text || "").trim()} ${(b.text || "").trim()}`.trim();
+      const aw = Array.isArray(a.words) ? a.words : null;
+      const bw = Array.isArray(b.words) ? b.words : null;
+      const mergedWords = aw && bw ? [...aw, ...bw] : null;
+      const { words: _awDrop, ...aNoWords } = a;
+      const merged = {
+        ...aNoWords, text, start: a.start, end: b.end,
+        ...(mergedWords ? { words: mergedWords } : {}),
+      };
+      return [...prev.slice(0, idx), merged, ...prev.slice(idx + 2)];
+    });
   };
 
   // Insert a duplicate of `seg` immediately after it. Same text, same
@@ -448,6 +1796,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   // Sync mode tap or manual edit. Useful when Whisper missed a chorus
   // repeat — duplicate the chorus block, then tap-sync the copies.
   const duplicateSeg = (id) => {
+    recordEditorAction("duplicate", { id, segments: Array.isArray(edited) ? edited.length : null });
     setEdited((prev) => {
       const idx = prev.findIndex((s) => s._id === id);
       if (idx === -1) return prev;
@@ -464,16 +1813,96 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   // Append a blank line at the end of the list. Operator types the
   // missing lyrics into the text input, then tap-syncs it.
   const addBlankLine = () => {
+    recordEditorAction("addLine", { segments: Array.isArray(edited) ? edited.length : null });
     setEdited((prev) => {
+      // Insert the new line at the audio playhead — that's where the
+      // operator is listening when they realise something's missing
+      // (typical case: a chorus repetition the pipeline collapsed,
+      // or a verse Whisper skipped). The previous behaviour pinned
+      // every new line to `last.end + 0.5`, so click "Agregar línea"
+      // at 1:23 of a song and the row appeared at the END of the
+      // editor with the wrong timestamp. SPACE then clamped it to
+      // an already-wrong neighbour bound.
+      //
+      // Fallback when currentTime is 0 (audio not playing yet) or out
+      // of the song's range: drop the new line after the last existing
+      // one, same as before. That way the wizard's first "add line"
+      // on a fresh job (before pressing play) doesn't land at 0:00
+      // pegado al primer segment.
+      // Note: we do NOT subtract AUDIO_LATENCY_COMPENSATION_S here.
+      // tapAnchor compensates because the operator is reacting to
+      // *heard* audio while the playhead has decoded ~80 ms ahead. But
+      // "Add line at playhead" is an explicit click — they want the
+      // segment to start where the cursor is, not 80 ms before.
+      const playhead = currentTime > 0 ? Math.max(0, currentTime) : 0;
       const last = prev[prev.length - 1];
-      const baseStart = last ? Math.min(duration || last.end + 2, last.end + 0.5) : 0;
-      const baseEnd = Math.min(duration || baseStart + 3, baseStart + 3);
+      const lastEnd = last ? last.end : 0;
+      const baseStart = playhead > 0
+        ? Math.min(playhead, duration ? duration - 0.5 : playhead)
+        : Math.min(duration || lastEnd + 2, lastEnd + 0.5);
+      const segDur = 3;
+      const baseEnd = Math.min(
+        duration || baseStart + segDur,
+        baseStart + segDur,
+      );
       const nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
-      return [...prev, { _id: nextId, start: baseStart, end: baseEnd, text: "" }];
+      const inserted = { _id: nextId, start: baseStart, end: baseEnd, text: "" };
+      // Keep `edited` sorted by start so syncCursor / neighbour clamp /
+      // /save-segments autosave all see a monotonic timeline. The
+      // backend also sorts (#184) but doing it here keeps the UI's
+      // immediate render consistent without waiting for a round-trip.
+      return [...prev, inserted].sort((a, b) => a.start - b.start);
     });
   };
 
-  const name = filename.replace(/\.(mp3|wav)$/i, "");
+  // Insert a blank line right AFTER the row at display index `idx`, timing
+  // interpolated into the gap to the next line. This is the "add a line in
+  // the MIDDLE of the song" affordance — the bottom "Agregar línea" button
+  // forced the operator to scroll away from where they were working.
+  const insertLineAfter = (idx) => {
+    recordEditorAction("insertLine", { idx });
+    setEdited((prev) => {
+      const cur = prev[idx];
+      const nxt = prev[idx + 1];
+      const gapStart = cur ? cur.end : (prev[0] ? prev[0].start : 0);
+      const gapEnd = nxt ? nxt.start : (duration || gapStart + 3);
+      const gap = Math.max(0, gapEnd - gapStart);
+      let s = gapStart + (gap > 0.6 ? gap / 3 : 0.1);
+      let e = s + (gap > 0.6 ? gap / 3 : 1.0);
+      if (!(e > s) || e > gapEnd) {
+        s = gapStart + 0.1;
+        e = Math.min(gapEnd > s ? gapEnd - 0.05 : s + 1.0, s + 1.0);
+        if (e <= s) e = s + 0.5;
+      }
+      const nextId = prev.reduce((m, x) => Math.max(m, x._id), -1) + 1;
+      const inserted = { _id: nextId, start: s, end: e, text: "" };
+      return [...prev, inserted].sort((a, b) => a.start - b.start);
+    });
+  };
+
+  // Smart "Agregar línea": when the operator has a row selected/focused,
+  // insert the new line RIGHT BELOW it (gap-interpolated, sync-preserving via
+  // insertLineAfter) — that's where they expect it to land. Only fall back to
+  // the playhead/end behaviour (addBlankLine) when nothing is focused yet
+  // (fresh job, before touching any row). focusedSegId persists as the
+  // last-focused row, so clicking the bottom button doesn't lose the target.
+  const addLineSmart = () => {
+    if (focusedSegId != null) {
+      const selIdx = edited.findIndex((s) => s._id === focusedSegId);
+      if (selIdx !== -1) {
+        insertLineAfter(selIdx);
+        return;
+      }
+    }
+    addBlankLine();
+  };
+
+  // Operator-friendly title: strip extension + collapse underscores/dashes
+  // to em-dashes + title-case respecting Spanish/PT lowercase stop-words.
+  // Pre-fix the header showed the raw filename ("El Arbol De La Vida _ Voy
+  // A Dejarte - Viejas Locas"); now it reads "El Arbol de la Vida — Voy a
+  // Dejarte — Viejas Locas". See lib/prettifySongTitle.js. (UI F7.)
+  const name = prettifySongTitle(filename);
   const pendingSuggestions = edited.filter((seg) => {
     const s = suggestionsById[seg._id];
     return s && s !== seg.text;
@@ -481,15 +1910,11 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   const hasSuggestions = pendingSuggestions > 0;
   const blankCount = edited.filter((seg) => !(seg.text || "").trim()).length;
 
-  const handleApprove = () => {
-    // Drop empty / whitespace-only rows BEFORE clamping. Operator can
-    // leave blanks from "Agregar línea" if they didn't type lyrics —
-    // sending those to the worker triggers an ImageMagick "label
-    // expected" crash that aborts the whole render.
+  const _buildCleanedSegments = () => {
     const sorted = [...edited]
       .filter((seg) => (seg.text || "").trim())
       .sort((a, b) => a.start - b.start);
-    const cleaned = sorted.map((seg, i) => {
+    return sorted.map((seg, i) => {
       let end = seg.end;
       if (i + 1 < sorted.length) {
         const nextStart = sorted[i + 1].start;
@@ -499,10 +1924,58 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       }
       return { ...seg, end };
     });
+  };
+
+  const handleApprove = () => {
+    // QA fix 2026-05-28 (audit P0 #74): bloquear si el último autosave
+    // falló — el backend tiene segments STALE, aprobar mandaría a
+    // re-renderizar con datos viejos sin que el operador se entere.
+    // El chip rojo "Sin guardar — revisá tu conexión" ya marca el
+    // estado, este alert es la confirmación interactiva.
+    if (saveStatus === "error") {
+      const proceed = window.confirm(
+        "Tu última edición no se guardó (problema de red). Si aprobás ahora se re-renderiza con la última versión guardada en el servidor, no con tus cambios pendientes. ¿Aprobar igual?"
+      );
+      if (!proceed) return;
+    }
+    // Check for 3+ line segments before submitting — show a warning banner
+    // so the operator can auto-split them rather than discover the issue
+    // after waiting for the full video render.
+    const problematic = edited.filter(
+      (seg) => (seg.text || "").trim() && linesForSeg(seg.text) >= 3
+    );
+    if (problematic.length > 0 && !wrapWarning) {
+      setWrapWarning({ ids: problematic.map((s) => s._id) });
+      return;
+    }
+    setWrapWarning(null);
+    setIsDirty(false);
+    const cleaned = _buildCleanedSegments();
     onApprove(cleaned.map(({ _id, ...rest }) => rest));
   };
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
+
+  // UX 2026-05-26: cuando synced-direct fallback (PR #365) dispara, TODAS
+  // las líneas vienen con `review: true`. Marcar cada una individualmente
+  // con badge "⚠ revisar tiempo" satura visualmente (28 badges apilados).
+  // Heurística: si ≥3 líneas son review, mostramos un BANNER único arriba
+  // y suprimimos los badges per-línea (el banner ya transmite la info).
+  // Si <3 son review, el badge per-línea queda — es info útil sin saturar.
+  const reviewSegCount = edited.reduce((n, s) => n + (s.review ? 1 : 0), 0);
+  const showReviewBanner = reviewSegCount >= 3;
+
+  // UX 2026-05-26 (cont.): mismo problema con la warning "● ⚠ 2 líneas" + botón
+  // "Dividir" que aparece cuando el render del video va a wrappar el texto a
+  // 2 renglones. Con líneas tipo "Será por eso que hoy estamos aquí" o
+  // "No hay nadie más que vos y yo" en upper-case + bold (~28 chars), el
+  // wrap se dispara y 28 lineas seguidas con "2 líneas + Dividir" son ruido.
+  // Mismo enfoque: si ≥3 segments hit, banner único arriba + bulk action.
+  const wrap2SegIds = edited
+    .filter((s) => (s.text || "").trim() && linesForSeg(s.text) === 2)
+    .map((s) => s._id);
+  const wrap2Count = wrap2SegIds.length;
+  const showWrap2Banner = wrap2Count >= 3;
 
   const handleScrub = (e) => {
     if (!duration) return;
@@ -511,8 +1984,20 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     seekTo(pct * duration, false);
   };
 
+  // INCIDENT 2026-05-24: the list view used `max-w-3xl` (~768 px). With
+  // the 2-col grid (preview / lines) that left the preview ~360 px wide —
+  // "TENDRÉ QUE DEJARTE..." felt cramped — and the line inputs only had
+  // ~280 px so anything longer than 30 chars visually cut off ("Nuestra
+  // relación no es pa…"). Bumped to a generous 1400 px so both columns
+  // breathe: preview ~680 px wide (≈ 2× before), lines fit ≈ 60 chars per
+  // row before scrolling. Timeline view stays at max-w-6xl (already wide
+  // enough).
   return (
-    <div className="w-full max-w-3xl animate-fade-in">
+    // UI F10 (2026-05-26): pb-28 (7 rem ≈ 112 px) garantiza safe-area
+    // bajo el botón flotante "Aprobar y generar" (h-12 = 48 px + bottom-6
+    // = 24 px + sombra). Sin esto la última card del timeline o de la
+    // lista quedaba tapada cuando el operador scrolleaba hasta el final.
+    <div className={`w-full animate-fade-in mx-auto pb-28 ${viewMode === "timeline" ? "max-w-6xl" : "max-w-[1400px]"}`}>
       {/* Hidden audio element drives playback. */}
       {audioUrl && (
         <audio
@@ -526,29 +2011,78 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
         />
       )}
 
-      <div className="flex items-center justify-between mb-6">
-        <div className="flex items-center gap-3">
-          <button onClick={onBack}
-            className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors">
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <path d="M19 12H5M12 19l-7-7 7-7" />
-            </svg>
-          </button>
-          <div>
-            <h2 className="text-lg font-bold tracking-tight">{t("editor.title")}</h2>
-            <p className="text-sm text-ink-secondary">
-              {name}
-              {batchProgress && <span className="ml-2 text-brand-light text-xs">({batchProgress})</span>}
-            </p>
-          </div>
-        </div>
-        <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5">
-          {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
-          <svg className="inline-block ml-1.5 w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <path d="M5 12h14M12 5l7 7-7 7" />
+      {/* Header: back + title (non-sticky). The primary CTA is a FIXED
+          floating button (below) so it can never be hidden behind the
+          app's own sticky top bar — the recurring "botón cortado". */}
+      <div className="py-3 mb-4 flex items-center gap-3">
+        <button onClick={onBack}
+          className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors shrink-0">
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M19 12H5M12 19l-7-7 7-7" />
           </svg>
         </button>
+        <div className="min-w-0">
+          <h2 className="text-lg font-bold tracking-tight">{t("editor.title")}</h2>
+          <p className="text-sm text-ink-secondary truncate">
+            {name}
+            {batchProgress && <span className="ml-2 text-brand-light text-xs">({batchProgress})</span>}
+          </p>
+        </div>
       </div>
+
+      {/* Chip de status del pre-gen del fondo — UX 2026-05-24. Operador edita
+          lyrics, Veo/Imagen está generando en background. Sin esto el pre-gen
+          era invisible y cambiar un param descartaba un preview sin aviso.
+
+          Branch "error": el pre-gen falló pero NO es una falla que el operador
+          deba accionar — el sistema reintenta cuando aprueta "Aprobar y
+          generar". Antes el chip estaba en amber + ícono `!` que leía como
+          warning y la copy decía "se generará..." en tono positivo: lenguaje
+          visual contradiciendo el copy. Ahora es brand-color + ícono `i`
+          (info), copy alineado con el CTA real ("apruebes y generes" matchea
+          "Aprobar y generar"). El amber queda reservado para errores que SÍ
+          requieren acción del operador. (UI review 2026-05-26, F4.) */}
+      {bgStatus && bgStatus !== "idle" && bgStatus !== "disabled" && (
+        <div className={`mb-3 inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-caption
+            ${bgStatus === "done"
+              ? "bg-accent/10 text-accent-light ring-1 ring-accent/30"
+              : "bg-brand/10 text-brand-light ring-1 ring-brand/30"}`}>
+          {bgStatus === "queued" || bgStatus === "generating" ? (
+            <>
+              <svg className="w-3 h-3 animate-spin" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                <path d="M21 12a9 9 0 11-6.219-8.56" strokeLinecap="round" />
+              </svg>
+              <span>{t("editor.bg_generating") || "Generando fondo en background…"}</span>
+            </>
+          ) : bgStatus === "done" ? (
+            <>
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
+                <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              <span>{t("editor.bg_done") || "Fondo listo"}</span>
+            </>
+          ) : bgStatus === "error" ? (
+            <>
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12" y2="11" />
+              </svg>
+              <span>{t("editor.bg_preview_placeholder") || t("editor.bg_error") || "Vas a ver el fondo final cuando apruebes y generes. El preview de ahora es una muestra."}</span>
+            </>
+          ) : null}
+        </div>
+      )}
+
+      {/* Fixed floating primary CTA — always reachable, never cut. */}
+      <button
+        onClick={handleApprove}
+        data-tour="editor-approve-floating"
+        className="fixed bottom-6 right-6 z-50 inline-flex items-center gap-1.5 btn-primary text-sm h-12 px-6 shadow-2xl shadow-brand/30"
+      >
+        {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
+        <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+          <path d="M5 12h14M12 5l7 7-7 7" />
+        </svg>
+      </button>
 
       {coverageWarning && (
         <div className="mb-4 rounded-2xl ring-1 ring-accent/25 bg-accent/[0.06] px-4 py-3 flex items-start gap-3">
@@ -562,38 +2096,197 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
         </div>
       )}
 
-      {(hasSuggestions || editHistory.length > 0) && (
-        <div className="flex items-center justify-between mb-4 gap-3">
-          <p className="text-xs text-gray-500 truncate">
-            {hasSuggestions
-              ? `${pendingSuggestions} ${t("editor.suggestions")}.`
-              : ""}
-          </p>
-          <div className="flex items-center gap-2 shrink-0">
-            {editHistory.length > 0 && (
-              <button onClick={undoEdit}
-                title={t("editor.undo_hint") || "Cmd/Ctrl+Z"}
-                className="text-xs font-medium text-gray-400 hover:text-white transition-colors flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] ring-1 ring-white/[0.06]">
-                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                  <path d="M3 7v6h6M3 13a9 9 0 109-9" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-                {t("editor.undo") || "Deshacer"}
-              </button>
-            )}
-            {hasSuggestions && (
-              <button onClick={applyAllSuggestions}
-                className="text-xs font-medium text-accent hover:text-accent/80 transition-colors flex items-center gap-1 px-3 py-1.5 rounded-lg bg-accent/5 hover:bg-accent/10">
-                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
-                {t("editor.apply_all")}
-              </button>
+      {/* ─── Auto-fix actions consolidated panel ───────────────────────
+          Combines three independent system-detected fixes (auto-split,
+          ortographic suggestions, hanging-text trim) into one accent-
+          color panel so the operator sees ONE action instead of three
+          competing amber banners stacked vertically.
+
+          Incident 2026-05-16: with three separate banners + a "N
+          sugerencias" line, the operator reported "demasiados mensajes
+          poco jerarquizados" — couldn't tell what to do first or
+          whether the counters were related. Consolidating into a
+          single accent panel signals "system can fix N things for
+          you" instead of three competing alerts.
+
+          Color choice: accent (green) instead of amber. Amber screams
+          "warning"; the fixes are positive automations the system
+          already prepared, not problems the operator caused.
+
+          The panel also absorbs the standalone "Aplicar todas" /
+          "Deshacer" row that was below the auto-split banner. */}
+      {(() => {
+        // Auto-fix is text/structure correction — a Lista-view concern.
+        // Hide it in the timeline workspace so that view stays focused on
+        // the preview + timeline (less vertical clutter above the fold).
+        if (viewMode === "timeline") return null;
+        const splitAvailable = !disableAutoSplit && mergeableSegments.length > 0;
+        const trimAvailable = longSegCount > 0;
+        const hasAutoFix = splitAvailable || hasSuggestions || trimAvailable;
+        const hasUndo = editHistory.length > 0;
+        if (!hasAutoFix && !hasUndo) return null;
+        const fixCount = (splitAvailable ? 1 : 0) + (hasSuggestions ? 1 : 0) + (trimAvailable ? 1 : 0);
+        const applyAllFixes = () => {
+          // Order matters: split first (changes segment count), then
+          // suggestions (per-segment text), then trim (per-segment end).
+          // Each individual handler calls pushEditHistory() so Cmd-Z
+          // unwinds them step by step.
+          if (splitAvailable) autoSplitAllFromReference();
+          if (hasSuggestions) applyAllSuggestions();
+          if (trimAvailable) trimAllLongSegs();
+        };
+        /* Phase B 2026-05-25: pill compacto en vez del card grande.
+           - Default (autoFixExpanded=false): pill de 32px con icon ✓ +
+             "N correcciones · [Aplicar] [↺ Deshacer] [▾]". El operador
+             ve qué hay y aplica con 1 click sin desplegar.
+           - Click en ▾: expande con la lista de detalle (las 3 líneas
+             del card original). Click otra vez colapsa.
+           - Reduce el overhead vertical de 120-180px → 32px (default)
+             o 80px (expandido). */
+        return (
+          <div className="mb-3 rounded-xl ring-1 ring-accent/25 bg-accent/[0.05] px-3 py-2">
+            <div className="flex items-center gap-2 min-h-[28px]">
+              {hasAutoFix && (
+                <>
+                  <svg className="w-4 h-4 text-accent flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
+                    <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  <p className="text-xs font-medium text-white flex-1 min-w-0 truncate">
+                    {fixCount === 1
+                      ? (t("editor.autofix_title_singular") || "1 corrección automática disponible")
+                      : (t("editor.autofix_title_plural") || "{n} correcciones automáticas disponibles").replace("{n}", fixCount)}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={applyAllFixes}
+                    className="shrink-0 px-2.5 py-1 rounded-md text-[11px] font-semibold text-white bg-accent hover:bg-accent/90 transition-colors"
+                  >
+                    {fixCount === 1
+                      ? (t("editor.autofix_apply_one") || "Aplicar")
+                      : (t("editor.autofix_apply_all_short") || "Aplicar todo")}
+                  </button>
+                </>
+              )}
+              {hasUndo && (
+                <button
+                  onClick={undoEdit}
+                  title={t("editor.undo_hint") || "Cmd/Ctrl+Z"}
+                  className="shrink-0 text-[11px] font-medium text-gray-400 hover:text-white transition-colors flex items-center gap-1 px-2 py-1 rounded-md bg-white/[0.04] hover:bg-white/[0.08] ring-1 ring-white/[0.06]"
+                >
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path d="M3 7v6h6M3 13a9 9 0 109-9" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  {t("editor.undo") || "Deshacer"}
+                </button>
+              )}
+              {hasAutoFix && fixCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setAutoFixExpanded((v) => !v)}
+                  title={autoFixExpanded ? "Ocultar detalle" : "Ver detalle"}
+                  aria-label={autoFixExpanded ? "Ocultar detalle" : "Ver detalle"}
+                  className="shrink-0 w-6 h-6 rounded-md text-gray-400 hover:text-white hover:bg-white/[0.06] transition-colors flex items-center justify-center"
+                >
+                  <svg
+                    className={`w-3 h-3 transition-transform ${autoFixExpanded ? "rotate-180" : ""}`}
+                    fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24"
+                  >
+                    <polyline points="6 9 12 15 18 9" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </button>
+              )}
+            </div>
+            {hasAutoFix && autoFixExpanded && (
+              <ul className="mt-2 pl-6 space-y-1 animate-fade-in">
+                {splitAvailable && (
+                  <li className="text-[11px] text-ink-secondary flex items-center gap-2">
+                    <span className="text-gray-600 font-mono text-[10px]">└</span>
+                    {(t("editor.autofix_split") || "Auto-dividir {n} líneas mergeadas").replace("{n}", mergeableSegments.length)}
+                  </li>
+                )}
+                {hasSuggestions && (
+                  <li className="text-[11px] text-ink-secondary flex items-center gap-2">
+                    <span className="text-gray-600 font-mono text-[10px]">└</span>
+                    {(t("editor.autofix_suggestions") || "Aplicar {n} sugerencias ortográficas").replace("{n}", pendingSuggestions)}
+                  </li>
+                )}
+                {trimAvailable && (
+                  <li className="text-[11px] text-ink-secondary flex items-center gap-2">
+                    <span className="text-gray-600 font-mono text-[10px]">└</span>
+                    {(t("editor.autofix_trim") || "Recortar {n} líneas con texto colgado").replace("{n}", longSegCount)}
+                  </li>
+                )}
+              </ul>
             )}
           </div>
+        );
+      })()}
+
+      {/* QA fix 2026-05-28 (audit P0 #74): banner persistente del estado
+          autosave. En LIST view no había feedback visible cuando una
+          edición de texto fallaba — operador veía "Guardado" del último
+          drag del timeline y asumía que todo estaba ok, pero el último
+          keystroke de texto había fallado silente. Banner rojo encima
+          del audio bar lo hace imposible de perder.
+          (Timeline view ya tiene el chip embedded en su header,
+          LyricsTimeline.jsx:354+) */}
+      {saveStatus === "error" && (
+        <div className="mb-3 rounded-card bg-red-500/10 ring-1 ring-red-500/30 px-4 py-3 flex items-center gap-3 animate-fade-in">
+          <svg className="w-4 h-4 text-red-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zM12 15.75h.01" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <div className="flex-1 min-w-0">
+            <p className="text-[12px] text-red-300 font-medium">
+              No pudimos guardar tu última edición
+            </p>
+            <p className="text-[10px] text-red-300/70 mt-0.5">
+              Probablemente perdiste conexión. Volvemos a intentar
+              automáticamente cuando edites algo más.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setEdited((p) => [...p])}
+            className="text-[11px] text-red-200 hover:text-white bg-red-500/20 hover:bg-red-500/30 rounded-lg px-3 py-1.5 transition-colors shrink-0"
+            title="Forzar reintento de guardado"
+          >
+            Reintentar
+          </button>
         </div>
       )}
 
-      {/* ─── Audio control bar — sticky-ish above the lyrics list ─── */}
-      {audioUrl && (
-        <div className="mb-4 flex items-center gap-3 px-3 py-2.5 rounded-card bg-surface-2/60 ring-1 ring-white/[0.05]" data-tour="editor-playbar">
+      {/* ─── Audio control bar — sticky-ish above the lyrics list ───
+          The "Activar modo Sync" entry used to live as its own banner
+          below this player (2026-05-16 removed). Sync is a tool for
+          adjusting timing, not an alert — putting it inline with the
+          play controls groups it with what it modifies (the timeline)
+          AND frees the primary purple CTA so "Aprobar y generar" in
+          the parent header has no visual competitor. */}
+      {/* Audio bar SIEMPRE visible — incluso si audioUrl no cargó. La parte
+          de reproductor (play + scrub + timer) se condiciona internamente;
+          el resto (toggle Lista/Timeline, Modo Enfoque, Modo Sync, HelpTip)
+          tiene que estar visible siempre porque permite EDITAR TEXTO sin
+          necesidad de audio. Hotfix 2026-05-30 — antes envolver todo en
+          {audioUrl && ...} hacía que jobs con input_r2_key=null (migrados a
+          mano, GC de R2 después de 30 d, etc.) perdieran acceso al toggle
+          de vista y al editor de texto, sólo viendo una lista plana sin
+          forma de cambiar la vista. */}
+      {(
+        /* Phase B 2026-05-25: sticky para que el play/pause + scrub
+           siempre estén accesibles mientras el operador scrollea la
+           lista de líneas. top usa stickyHeaderTop (passed by parent)
+           para clear el header superior si lo hay. backdrop-blur +
+           bg semi-transparente para que el contenido scrolleado abajo
+           se vea sutil debajo. z-20 sobre el contenido normal del editor. */
+        <div
+          className="mb-3 sticky z-20 backdrop-blur-md bg-surface-1/85 flex items-center gap-3 px-3 py-2.5 rounded-card ring-1 ring-white/[0.05]"
+          style={{ top: stickyHeaderTop || 0 }}
+          data-tour="editor-playbar"
+        >
+          {/* Reproductor + scrub bar: solo si hay audio. Sin audio mostramos
+              un mensaje compacto avisando que el play/scrub no están y
+              dejando los controles de vista intactos a la derecha. */}
+          {audioUrl ? (<>
           <button
             onClick={togglePlay}
             className="w-10 h-10 rounded-full bg-brand hover:bg-brand-light text-white flex items-center justify-center transition-colors shrink-0"
@@ -614,47 +2307,187 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
             {formatTime(currentTime)}
           </span>
           <button
+            type="button"
             onClick={handleScrub}
             className="flex-1 h-1.5 bg-surface-3/60 rounded-full overflow-hidden cursor-pointer relative"
             aria-label="Buscar"
           >
+            {/* `pointer-events-none` para que clicks siempre atraviesen al
+                botón parent (sin esto, el div fill podía absorberlos durante
+                el frame de transición). `transform: scaleX()` en vez de
+                width animado: composited en GPU, no dispara reflow ni pelea
+                contra el rAF loop que actualiza `currentTime` cada ~16 ms.
+                Mismo pattern que el playhead fix de PR #348. */}
             <div
-              className="h-full bg-gradient-to-r from-brand to-brand-light transition-[width] duration-100 ease-linear"
-              style={{ width: `${Math.min(100, Math.max(0, progressPct))}%` }}
+              className="h-full bg-gradient-to-r from-brand to-brand-light pointer-events-none origin-left"
+              style={{ transform: `scaleX(${Math.min(1, Math.max(0, progressPct / 100))})` , width: "100%" }}
             />
           </button>
           <span className="text-xs text-gray-500 tabular-nums shrink-0 w-10">
             {formatTime(duration)}
           </span>
-          <span className="hidden sm:inline text-[10px] text-gray-600 ml-1 shrink-0">
-            <kbd className="px-1.5 py-0.5 rounded bg-surface-3/60 ring-1 ring-white/[0.05]">space</kbd>
-          </span>
+          </>) : (
+            /* Sin audio: ocupar el mismo espacio horizontal que el
+               reproductor para que la fila no colapse y los controles de
+               vista (a la derecha) queden en la misma posición que cuando
+               hay audio. Esto preserva la memoria muscular del operador. */
+            <div className="flex-1 flex items-center gap-2 text-[11px] text-amber-300/90">
+              <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M12 9v4M12 17h.01" />
+                <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+              </svg>
+              <span className="truncate">
+                {t("editor.audio_unavailable") ||
+                  "Audio no disponible para reproducir — podés editar el texto igual."}
+              </span>
+            </div>
+          )}
+          {/* Lista | Línea de tiempo — the timeline is a VIEW of the same
+              editor (shared state), default Lista so the existing flow is
+              untouched. Desktop feature: hidden on narrow screens where the
+              fine drag is impractical. */}
+          <div className="hidden md:inline-flex shrink-0 rounded-md ring-1 ring-white/[0.08] overflow-hidden text-label">
+            {/* UI F9 (2026-05-26): tooltips diferenciando qué vista es
+                mejor para cada tarea. Antes el toggle presentaba ambas
+                vistas como equivalentes — pero corregir TEXTO es más
+                eficiente en Lista (input ancho por línea), y revisar
+                TIMING es mejor en Línea de tiempo (drag visual). */}
+            <button
+              onClick={() => setViewMode("list")}
+              title="Mejor para corregir el texto: cada línea en una fila ancha con input directo."
+              className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "list" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <line x1="8" y1="6" x2="21" y2="6" strokeLinecap="round" />
+                <line x1="8" y1="12" x2="21" y2="12" strokeLinecap="round" />
+                <line x1="8" y1="18" x2="21" y2="18" strokeLinecap="round" />
+                <circle cx="3.5" cy="6" r="1" fill="currentColor" stroke="none" />
+                <circle cx="3.5" cy="12" r="1" fill="currentColor" stroke="none" />
+                <circle cx="3.5" cy="18" r="1" fill="currentColor" stroke="none" />
+              </svg>
+              Lista
+            </button>
+            <button
+              onClick={() => setViewMode("timeline")}
+              title="Mejor para revisar el timing: cada línea en su posición temporal, arrastrable."
+              className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "timeline" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <rect x="3" y="7" width="8" height="4" rx="1" />
+                <rect x="13" y="13" width="7" height="4" rx="1" />
+                <line x1="3" y1="3" x2="3" y2="21" strokeLinecap="round" opacity="0.5" />
+              </svg>
+              Línea de tiempo
+            </button>
+          </div>
+          {/* 2026-05-25 Studio Console — Modo Enfoque toggle.
+              Botón discreto al lado del view switcher. Esconde ruido
+              (auto-fix collapse) y agranda max-h de la lista + timeline.
+              Atajo F (global, no en inputs). */}
+          <button
+            type="button"
+            onClick={toggleFocusMode}
+            aria-pressed={focusMode}
+            title={focusMode
+              ? (t("editor.focus_exit") || "Salir de modo enfoque (F)")
+              : (t("editor.focus_enter") || "Modo enfoque (F)")
+            }
+            className={`hidden md:inline-flex shrink-0 w-8 h-8 rounded-md ring-1 transition-colors items-center justify-center
+              ${focusMode
+                ? "ring-brand/40 bg-brand/15 text-brand-light"
+                : "ring-white/[0.08] text-ink-secondary hover:text-brand-light hover:bg-brand/10 hover:ring-brand/30"}`}
+          >
+            {focusMode ? (
+              /* contract icon — flechas hacia adentro */
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M9 4v6H3M21 14h-6v6" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="M9 10L4 5M15 14l5 5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            ) : (
+              /* expand icon — flechas hacia afuera */
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M4 9V4h5M20 15v5h-5M4 9l5-5M20 15l-5 5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            )}
+          </button>
+          {/* Sync mode entry — refactor 2026-05-23: pasó de botón ruidoso
+              con texto a ícono discreto al lado del switcher. Atajo Cmd+K
+              añadido al keyboard handler. */}
+          {!syncMode && (
+            <>
+              <button
+                data-tour="editor-sync-entry"
+                onClick={enterSyncMode}
+                title={t("editor.sync_cta_hint") || "Modo Sync — anclar timings por tap (⌘K / Ctrl+K)"}
+                aria-label={t("editor.sync_enter_compact") || "Modo Sync"}
+                className="hidden md:inline-flex shrink-0 w-8 h-8 rounded-md ring-1 ring-white/[0.08]
+                  text-ink-secondary hover:text-brand-light hover:bg-brand/10 hover:ring-brand/30
+                  transition-colors items-center justify-center"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <circle cx="12" cy="12" r="9" />
+                  <circle cx="12" cy="12" r="4" />
+                  <circle cx="12" cy="12" r="1" fill="currentColor" />
+                </svg>
+              </button>
+              <HelpTip articleId="manual-sync" className="hidden md:inline-flex" />
+            </>
+          )}
         </div>
       )}
 
-      {/* ─── Tap-to-sync entry / active panel ────────────────────── */}
-      {audioUrl && !syncMode && (
-        <div className="mb-3 px-3 py-2.5 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] flex items-center gap-3">
-          <svg className="w-4 h-4 text-ink-secondary shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
-            <circle cx="12" cy="12" r="9" />
-            <path d="M12 7v5l3 2" strokeLinecap="round" />
+      {/* UX 2026-05-26: banner agregado cuando ≥ 3 segments tienen `review:
+          true` (típicamente porque synced-direct fallback de PR #365 emitió
+          todas las líneas con timing aproximado de lrclib synced + offset).
+          Reemplaza los 28 badges per-línea — un solo cartel transmite la
+          misma info sin saturar visualmente. */}
+      {showReviewBanner && (
+        <div className="mb-3 px-3 py-2 rounded-card bg-amber-500/[0.08] ring-1 ring-amber-500/30 flex items-start gap-2.5 animate-fade-in">
+          <svg className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M12 9v4M12 17h.01" />
+            <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
           </svg>
-          <div className="flex-1 min-w-0">
-            <p className="text-[12px] text-white font-medium leading-tight">
-              {t("editor.sync_cta_title") || "¿Necesitás ajustar los tiempos?"}
+          <p className="text-xs text-amber-100 leading-relaxed">
+            <span className="font-semibold">
+              {(t("editor.review_banner_count") || "{n} líneas con timing aproximado").replace("{n}", reviewSegCount)}
+            </span>
+            {" — "}
+            {t("editor.review_banner_hint") || "estas líneas vienen de la letra de referencia. Escuchá la canción y ajustá si alguna no entra en el momento correcto."}
+          </p>
+        </div>
+      )}
+
+      {/* UX 2026-05-26: banner agregado cuando ≥ 3 segments tienen wrap a
+          2 renglones en el render del video. Mismo problema visual que el
+          review banner: 28 indicadores apilados "● ⚠ 2 líneas + Dividir"
+          saturan. Banner único + bulk action "Dividir todas". Los casos
+          3+ líneas (más urgentes) siguen mostrándose inline porque son
+          menos comunes y la acción es por línea. */}
+      {showWrap2Banner && (
+        <div className="mb-3 px-3 py-2 rounded-card bg-amber-500/[0.06] ring-1 ring-amber-500/20 flex items-start gap-2.5 animate-fade-in">
+          <svg className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M12 9v4M12 17h.01" />
+            <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+          </svg>
+          <div className="flex-1 flex items-center justify-between gap-3">
+            <p className="text-xs text-amber-100 leading-relaxed">
+              <span className="font-semibold">
+                {(t("editor.wrap2_banner_count") || "{n} líneas pasarán a 2 renglones en el video").replace("{n}", wrap2Count)}
+              </span>
+              {" — "}
+              {t("editor.wrap2_banner_hint") || "se ven OK como están, pero podés dividirlas si querés líneas más cortas en el video."}
             </p>
-            <p className="text-[10px] text-gray-500 leading-tight mt-0.5">
-              {t("editor.sync_cta_hint") || "Activá modo Sync y apretá Espacio cuando arranque cada línea"}
-            </p>
+            <button
+              type="button"
+              onClick={() => {
+                pushEditHistory();
+                wrap2SegIds.forEach((id) => splitSeg(id));
+              }}
+              className="text-[11px] font-medium px-2.5 py-1 rounded-lg bg-amber-500/15 ring-1 ring-amber-500/30 text-amber-200 hover:bg-amber-500/25 transition-colors whitespace-nowrap shrink-0"
+            >
+              {t("editor.wrap2_banner_split_all") || "Dividir todas"}
+            </button>
           </div>
-          <button
-            data-tour="editor-sync-entry"
-            onClick={enterSyncMode}
-            className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
-              ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
-          >
-            {t("editor.sync_enter") || "Activar modo Sync"}
-          </button>
         </div>
       )}
 
@@ -706,7 +2539,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
             </span>
             <button
               onClick={tapAnchor}
-              className="shrink-0 h-8 px-3 rounded-lg bg-brand hover:bg-brand-light text-white text-[12px]
+              className="shrink-0 h-8 px-3 rounded-lg bg-brand hover:bg-brand-light text-white text-caption
                 font-semibold transition-colors flex items-center gap-1.5"
             >
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
@@ -767,14 +2600,16 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
               </p>
               <button
                 onClick={() => shiftAllSegments(-(first.start - 2))}
-                className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
+                title={`Mover todas las líneas hacia atrás ${(first.start - 2).toFixed(1)}s — el primer lyric arrancará a los 2 s.`}
+                className="shrink-0 text-label px-3 py-1.5 rounded-lg bg-brand/15 text-brand-light
                   ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
               >
                 {t("editor.intro_trim_to_2") || "Recortar a 2s"}
               </button>
               <button
                 onClick={() => shiftAllSegments(-first.start)}
-                className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-surface-2/60
+                title={`Mover todas las líneas hacia atrás ${first.start.toFixed(1)}s — el primer lyric arrancará al segundo 0.`}
+                className="shrink-0 text-label px-3 py-1.5 rounded-lg bg-surface-2/60
                   ring-1 ring-white/[0.06] text-gray-300 hover:bg-surface-2 hover:text-white transition-colors"
               >
                 {t("editor.intro_trim_to_0") || "Empezar en 0s"}
@@ -814,24 +2649,26 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
                 }),
               );
             };
+            // Stripe variant (2026-05-16): demoted from full amber fill
+            // to a left-border accent + small text. The cause requires
+            // operator decision but isn't a critical alert — it's one
+            // suggestion among others. Reducing the visual weight stops
+            // it from competing with the consolidated auto-fix panel
+            // above.
             return (
-              <div className="mb-3 px-3 py-2.5 rounded-card bg-amber-500/[0.07] ring-1 ring-amber-500/25 flex items-center gap-3 animate-fade-in">
-                <svg className="w-4 h-4 text-amber-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
-                  <circle cx="12" cy="12" r="10" />
-                  <path d="M12 8v4M12 16h.01" strokeLinecap="round" />
-                </svg>
-                <p className="text-xs text-ink-secondary flex-1">
+              <div className="mb-2 pl-3 pr-3 py-1.5 border-l-2 border-amber-500/60 flex items-center gap-2 animate-fade-in">
+                <p className="text-[11px] text-ink-secondary flex-1 leading-relaxed">
                   {t("editor.first_line_misaligned") ||
                     "La primera línea parece estar en 0:00 pero la canción arranca más tarde."}{" "}
                   <span className="text-gray-500">
                     {t("editor.first_line_misaligned_hint") || "¿Moverla a"}{" "}
-                    <span className="font-mono text-amber-300">{formatTimestamp(suggested)}</span>?
+                    <span className="font-mono text-amber-300/90">{formatTimestamp(suggested)}</span>?
                   </span>
                 </p>
                 <button
                   onClick={fixFirstOnly}
-                  className="shrink-0 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-amber-500/15 text-amber-300
-                    ring-1 ring-amber-500/30 hover:bg-amber-500/25 transition-colors"
+                  className="shrink-0 text-[10px] font-medium px-2 py-0.5 rounded text-amber-300 hover:text-amber-200
+                    hover:bg-amber-500/10 transition-colors"
                 >
                   {t("editor.first_line_fix") || "Mover sólo línea 1"}
                 </button>
@@ -843,28 +2680,371 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
         return null;
       })()}
 
-      {/* ─── Lyrics list ──────────────────────────────────────────── */}
-      <p className="text-[11px] text-gray-600 mb-2 px-1">
-        {t("editor.list_hint") || "Click en un tiempo para reproducir desde ahí · doble click para editarlo"}
-      </p>
-      <div className="relative">
-        <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-surface to-transparent pointer-events-none z-10 rounded-b-2xl" />
-        <div ref={listRef} className="space-y-1 max-h-[55vh] overflow-y-auto pr-1 pb-8">
+      {/* ─── Global timing offset ───────────────────────────────────
+          Always-available panel for the common "the whole song is ±N ms
+          off" case. Whisper's per-segment timestamps can drift by 200-
+          800 ms (codec lag, intro silence, etc.); rather than nudging
+          every line manually, the operator shifts the entire timeline.
+          Collapsed by default — opens when user clicks the toggle.
+
+          The bulk-trim button that used to live in this wrapper was
+          moved (2026-05-16) into the consolidated auto-fix panel near
+          the top of the editor so the operator sees ONE "system can
+          fix N things" action instead of a standalone amber alert. */}
+      {/* "Ajustes avanzados de timing" (global shift) ocultado: el ajuste
+          fino por línea se resuelve en la timeline; el shift global casi no
+          se usa y ensuciaba el flujo. */}
+      <div className="hidden">
+        <button
+          onClick={() => setShiftPanelOpen((v) => !v)}
+          className="w-full flex items-center justify-between px-3 py-2 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] text-xs text-gray-300 hover:text-white transition-colors"
+        >
+          <span className="flex items-center gap-2">
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M8 7h12M8 12h12M8 17h12M4 7h.01M4 12h.01M4 17h.01" />
+            </svg>
+            {t("editor.shift_panel_title") || "Ajustes avanzados de timing"}
+          </span>
+          <svg
+            className={`w-3.5 h-3.5 transition-transform ${shiftPanelOpen ? "rotate-180" : ""}`}
+            fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"
+          ><path d="M19 9l-7 7-7-7" /></svg>
+        </button>
+
+        {shiftPanelOpen && (
+          <div className="mt-2 px-3 py-3 rounded-card bg-surface-1/40 ring-1 ring-white/[0.04] space-y-3 animate-fade-in">
+            <p className="text-[11px] text-gray-500 leading-relaxed">
+              {t("editor.shift_panel_hint") ||
+                "Aplica un offset uniforme a todas las líneas. Si la letra aparece tarde, usá valores negativos (anticipar). Si aparece antes de tiempo, positivos (atrasar). Drift típico de lyrics curadas: 100-200ms."}
+            </p>
+
+            {/* Slider continuo */}
+            <div className="flex items-center gap-3">
+              <span className="text-[10px] font-mono text-gray-500 w-12 text-right">-1000ms</span>
+              <input
+                type="range"
+                min={-1000}
+                max={1000}
+                step={10}
+                value={shiftDraftMs}
+                onChange={(e) => setShiftDraftMs(parseInt(e.target.value, 10))}
+                className="flex-1 accent-brand"
+              />
+              <span className="text-[10px] font-mono text-gray-500 w-12">+1000ms</span>
+            </div>
+
+            {/* Presets + valor actual + input custom. Granularidad fina
+                para drift típico de lrclib synced (100-200ms) + presets
+                más gruesos para mismatches mayores. */}
+            <div className="flex flex-wrap items-center gap-2">
+              {[-250, -150, -100, -50, 0, 50, 100, 150, 250].map((preset) => (
+                <button
+                  key={preset}
+                  onClick={() => setShiftDraftMs(preset)}
+                  className={`text-[11px] font-mono px-2.5 py-1 rounded ring-1 transition-colors ${
+                    shiftDraftMs === preset
+                      ? "bg-brand/20 ring-brand/40 text-brand-light"
+                      : "bg-surface-2/40 ring-white/[0.05] text-gray-300 hover:text-white"
+                  }`}
+                >
+                  {preset > 0 ? "+" : ""}{preset}ms
+                </button>
+              ))}
+              <span className="text-[10px] text-gray-500">{t("editor.shift_or_custom") || "o"}</span>
+              <input
+                type="number"
+                step={10}
+                value={shiftDraftMs}
+                onChange={(e) => {
+                  const v = parseInt(e.target.value || "0", 10);
+                  if (!Number.isNaN(v)) {
+                    // clamp to slider range; users can still apply by
+                    // calling repeatedly if they need bigger shifts.
+                    setShiftDraftMs(Math.max(-1000, Math.min(1000, v)));
+                  }
+                }}
+                className="w-20 text-[11px] font-mono px-2 py-1 rounded bg-surface-2/40 ring-1 ring-white/[0.05] text-white"
+              />
+              <span className="text-[10px] text-gray-500">ms</span>
+              <button
+                onClick={() => {
+                  if (shiftDraftMs === 0) return;
+                  const applied = shiftDraftMs;
+                  shiftAllSegments(applied / 1000);  // ms → seconds
+                  setAppliedShiftMs(applied);
+                  setShiftDraftMs(0);
+                }}
+                disabled={shiftDraftMs === 0}
+                className="ml-auto text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-brand/20 ring-1 ring-brand/40 text-brand-light hover:bg-brand/30 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                {t("editor.shift_apply") || "Aplicar"}
+              </button>
+            </div>
+
+            {/* Inline confirmation chip — clears after 2.5s. Without it
+                the operator can't distinguish "applied" from "didn't
+                register" because the slider returns to 0 on success. */}
+            {appliedShiftMs != null && (
+              <div className="flex items-center gap-2 text-[11px] text-emerald-300 animate-fade-in">
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                  <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                <span className="font-mono">
+                  {(t("editor.shift_applied") || "Aplicado: {n}ms")
+                    .replace("{n}", appliedShiftMs > 0 ? `+${appliedShiftMs}` : appliedShiftMs)}
+                </span>
+                <span className="text-gray-500">·</span>
+                <span className="text-gray-400">{t("editor.shift_applied_undo") || "Cmd/Ctrl+Z para revertir"}</span>
+              </div>
+            )}
+
+            <p className="text-[10px] text-gray-600 leading-relaxed">
+              {t("editor.shift_undo_hint") || "Deshacer con Cmd/Ctrl+Z o el botón de deshacer."}
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* ─── Workspace UNIFICADO 2-col (2026-05-23 refactor world-class) ──
+             Antes había dos workspaces enteros que se renderizaban según
+             viewMode (timeline → grid; list → full-width). Ahora SIEMPRE
+             es grid: izq sticky con controles+preview, der con lista o
+             timeline según viewMode. Preview siempre visible, controles
+             siempre en el mismo lugar.
+
+             Phase 2 (2026-05-25): cuando el editor se monta dentro del
+             paso 6 del wizard (hideTypographyControls=true), la columna
+             izquierda no renderiza — los controles ya están en el paso
+             4 del stepper y el preview central del wizard refleja los
+             cambios. El grid colapsa a 1 columna full-width. */}
+      <div className={`grid gap-4 mb-4 items-start ${hideTypographyControls ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2"}`}>
+          {/* COLUMNA IZQUIERDA — sticky en desktop. Controles tipográficos
+              + LyricVideoPreview (editable) + scope toggle.
+              Phase 2: oculta si hideTypographyControls=true (modo wizard). */}
+          {!hideTypographyControls && (
+          <div className="space-y-2 lg:sticky lg:top-2 lg:self-start">
+            {/* Live font switcher — preview re-renders in the chosen
+                typeface instantly; applied to the render on re-render. */}
+            <div className="flex items-center gap-2 px-1">
+              <span className="text-[11px] text-ink-tertiary shrink-0">Tipografía</span>
+              <select
+                value={selectedFont}
+                onChange={(e) => { setSelectedFont(e.target.value); onFontChange?.(e.target.value); }}
+                className="flex-1 bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-2 py-1.5 text-xs text-white focus:ring-brand outline-none cursor-pointer"
+                style={{ fontFamily: FONT_CSS_BY_CODE[selectedFont] }}
+                title="Probar otra tipografía — se ve en el preview al instante"
+              >
+                {EDITOR_FONTS.map((f) => (
+                  <option key={f.code} value={f.code} style={{ fontFamily: f.css }}>{f.label}</option>
+                ))}
+              </select>
+            </div>
+            {/* Live text style: case + contrast + transition. Preview reflects
+                case/contrast instantly; all three apply on re-render. */}
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-1 text-[11px]">
+              <div className="flex items-center gap-1.5">
+                <span className="text-ink-tertiary">Estilo</span>
+                <div className="inline-flex rounded-md ring-1 ring-white/[0.08] overflow-hidden font-semibold">
+                  {TEXT_CASES.map((o) => (
+                    <button key={o.code} type="button"
+                      onClick={() => { setSelectedCase(o.code); onCaseChange?.(o.code); }}
+                      className={`px-2 py-1 transition-colors ${selectedCase === o.code ? "bg-brand text-white" : "text-ink-secondary hover:text-white"}`}>{o.label}</button>
+                  ))}
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-ink-tertiary">Contraste</span>
+                <div className="inline-flex rounded-md ring-1 ring-white/[0.08] overflow-hidden font-semibold">
+                  {CONTRASTS.map((o) => (
+                    <button key={o.code} type="button"
+                      onClick={() => { setSelectedContrast(o.code); onContrastChange?.(o.code); }}
+                      className={`px-2 py-1 transition-colors ${selectedContrast === o.code ? "bg-brand text-white" : "text-ink-secondary hover:text-white"}`}>{o.label}</button>
+                  ))}
+                </div>
+              </div>
+              {/* Animación de letra (lyrics_animation) — libass templates. */}
+              <div className="flex items-center gap-1.5">
+                <span className="text-ink-tertiary">Animación</span>
+                <select value={selectedAnimation}
+                  onChange={(e) => { setSelectedAnimation(e.target.value); onAnimationChange?.(e.target.value); }}
+                  className="bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-1.5 py-1 text-white focus:ring-brand outline-none cursor-pointer">
+                  {LYRICS_ANIMATIONS.map((o) => (<option key={o.code} value={o.code}>{o.label}</option>))}
+                </select>
+              </div>
+              {/* Transición de línea (line_transition) — entrada slide/wipe/blur. */}
+              <div className="flex items-center gap-1.5">
+                <span className="text-ink-tertiary">Transición</span>
+                <select value={selectedLineTransition}
+                  onChange={(e) => { setSelectedLineTransition(e.target.value); onLineTransitionChange?.(e.target.value); }}
+                  className="bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-1.5 py-1 text-white focus:ring-brand outline-none cursor-pointer">
+                  {LINE_TRANSITIONS.map((o) => (<option key={o.code} value={o.code}>{o.label}</option>))}
+                </select>
+              </div>
+            </div>
+            <div className="flex items-center justify-between px-1 gap-2 flex-wrap">
+              <span className="text-[11px] text-ink-tertiary">Mover · escalar · rotar aplica a</span>
+              <div className="inline-flex rounded-md ring-1 ring-white/[0.08] overflow-hidden text-[11px] font-semibold">
+                <button type="button" onClick={() => setLayoutScope("all")}
+                  className={`px-2.5 py-1 transition-colors ${layoutScope === "all" ? "bg-brand text-white" : "text-ink-secondary hover:text-white"}`}>
+                  Todas las líneas
+                </button>
+                <button type="button" onClick={() => setLayoutScope("line")}
+                  className={`px-2.5 py-1 transition-colors ${layoutScope === "line" ? "bg-brand text-white" : "text-ink-secondary hover:text-white"}`}>
+                  Solo esta
+                </button>
+              </div>
+            </div>
+            <LyricVideoPreview
+              t={t}
+              segments={edited}
+              currentTime={currentTime}
+              backgroundUrl={previewBgUrl || null}
+              backgroundStyle={backgroundStyle || "default"}
+              font={FONT_CSS_BY_CODE[selectedFont] || undefined}
+              textCase={selectedCase}
+              textContrast={selectedContrast}
+              // 2026-05-23: la prop `transition` (Corte/Fade) salió con el
+              // deprecation de lyric_transition. Cuando el preview soporte
+              // las animaciones libass nuevas se pasa por acá:
+              //   lyricsAnimation={selectedAnimation}
+              //   lineTransition={selectedLineTransition}
+              fontScale={fontScale}
+              onSelect={(id) => {
+                focusSegment(id);
+                const seg = edited.find((s) => s._id === id);
+                if (seg) seekTo(Math.max(0, seg.start), false);
+              }}
+              onLayoutChange={handleLayoutChange}
+              onDragStart={pushEditHistory}
+            />
+          </div>
+          )}
+          {/* COLUMNA DERECHA — scrollea independiente. Lista o timeline
+              según viewMode. min-w-0 evita que rows muy largas rompan el grid.
+              Phase E 2026-05-25: relative + el mini-map vertical se posiciona
+              absolute a la derecha cuando hay >20 segments. */}
+          <div className="min-w-0 space-y-2 relative">
+            {viewMode === "timeline" && audioUrl ? (
+              <LyricsTimeline
+                segments={edited}
+                duration={duration}
+                currentTime={currentTime}
+                isPlaying={isPlaying}
+                saveStatus={saveStatus}
+                activeId={activeId}
+                focusedSegId={focusedSegId}
+                highlightedIds={highlightedIds}
+                waveform={waveform}
+                gapS={MIN_GAP_S}
+                focusMode={focusMode}
+                onSeek={(s) => seekTo(s, false)}
+                onDragStart={pushEditHistory}
+                onTimingChange={handleTimelineTimingChange}
+                onTextChange={updateText}
+                onFocus={focusSegment}
+                onReset={resetTimings}
+              />
+            ) : (
+              <>
+                <p className="text-[11px] text-gray-600 mb-2 px-1">
+                  {t("editor.list_hint") || "Click en un tiempo para reproducir desde ahí · doble click para editarlo"}
+                </p>
+                <div className="relative">
+                  <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-surface to-transparent pointer-events-none z-10 rounded-b-2xl" />
+                  {/* Phase E 2026-05-25: mini-map vertical en el borde derecho.
+                      Cada segment se renderiza como un dot proporcional a su
+                      duración. El activo brilla. Playhead horizontal según
+                      currentTime. Click → seek a ese punto. Solo se renderiza
+                      cuando hay >20 segments (canciones cortas no lo necesitan).
+                      Sin esto, una canción de 80 líneas requiere scroll bruto
+                      para localizar dónde está el operador. */}
+                  {duration > 0 && edited.length > 20 && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        const pct = (e.clientY - rect.top) / rect.height;
+                        const seekT = Math.max(0, Math.min(duration, pct * duration));
+                        seekTo(seekT, false);
+                      }}
+                      title={t("editor.minimap_hint") || "Mini-mapa: click para saltar al tiempo"}
+                      aria-label={t("editor.minimap_hint") || "Mini-mapa"}
+                      className="absolute right-0 top-0 bottom-0 w-2 z-20 group/mini cursor-pointer"
+                      style={{ touchAction: "none" }}
+                    >
+                      {edited.map((seg) => {
+                        const top = (seg.start / duration) * 100;
+                        const height = Math.max(0.4, ((seg.end - seg.start) / duration) * 100);
+                        const isActive = seg._id === activeId;
+                        return (
+                          <span
+                            key={seg._id}
+                            className={`absolute left-0 right-0 rounded-sm pointer-events-none transition-colors ${
+                              isActive
+                                ? "bg-brand shadow-[0_0_6px_rgba(109,74,255,0.7)]"
+                                : "bg-white/10 group-hover/mini:bg-white/25"
+                            }`}
+                            style={{ top: `${top}%`, height: `${height}%` }}
+                          />
+                        );
+                      })}
+                      {duration > 0 && (
+                        <span
+                          className="absolute left-[-3px] right-[-3px] h-0.5 bg-brand-light pointer-events-none transition-[top] duration-150 ease-linear shadow-[0_0_8px_rgba(179,157,255,0.8)]"
+                          style={{ top: `${Math.min(100, Math.max(0, (currentTime / duration) * 100))}%` }}
+                        />
+                      )}
+                    </button>
+                  )}
+                  {/* Phase D 2026-05-25: gap entre rows reducido de 4px (space-y-1)
+                      a 2px (space-y-0.5). En canciones largas de 60+ líneas
+                      esto ahorra ~120px de scroll total. Y como el Phase B
+                      compactó el header (auto-fix pill 32px), max-h ahora
+                      puede crecer (100vh-200 vs 100vh-280 antes). */}
+                  {/* QA fix 2026-05-28: el max-h vh-based servía cuando el
+                      editor scrolleaba ADENTRO de su panel y el page-scroll
+                      cubría todo. Con el nuevo wizard layout (PR
+                      fix/wizard-scroll-viewport), el scroll context del
+                      panel derecho vive en UploadZone (~línea 2147,
+                      lg:overflow-y-auto h-full). Si dejamos el max-h acá
+                      sobre lg, el operador ve DOBLE scroll: el inner cap
+                      (acá) PLUS el outer (UploadZone). Resultado: scrollear
+                      al final del inner deja contenido del outer abajo,
+                      pero el mouse-wheel no transfiere → scroll trapped.
+                      Mobile mantiene el cap original (no hay outer
+                      overflow ahí, el page scroll cubre todo). */}
+                  <div ref={listRef} className={`space-y-0.5 overflow-y-auto pr-1 pb-8 ${focusMode ? "max-h-[calc(100vh-110px)]" : "max-h-[calc(100vh-200px)]"} lg:max-h-none lg:overflow-visible`}>
           {edited.map((seg, idx) => {
             const suggestion = suggestionsById[seg._id];
             const isApplied = suggestion && seg.text === suggestion;
             const isActive = seg._id === activeId;
             const isArmed = syncMode && idx === syncCursor;
             const isAnchored = syncMode && idx < syncCursor;
+            // Recently anchored: ring highlights the row + per-row undo
+            // button appears next to the timestamp. Auto-clears 10s after
+            // the anchor (timer in tapAnchor's setHighlightedIds).
+            const wasRecentlyAnchored = highlightedIds.has(seg._id);
+            // Line the aligner inserted (Whisper missed it): timing is
+            // interpolated, so flag it amber for the operator to verify.
+            const isReview = !!seg.review;
 
             return (
               <div
                 key={seg._id}
                 ref={(el) => { rowRefs.current[seg._id] = el; }}
                 {...(idx === 0 ? { "data-tour": "editor-list-row" } : {})}
+                /* Phase A 2026-05-25: highlight prominente cuando es activo.
+                   Antes: bg-brand/[0.07] ring-1 ring-brand/25 (invisible al
+                   operador, ~7% opacity). Ahora: bg-brand/15 + left-bar
+                   border-l-4 brand + glow shadow + key con activeId
+                   dispara el pulse de la animación wlp-row-pulse al
+                   transicionar a este row. */
+                data-active={isActive && !isArmed ? "true" : "false"}
                 className={`group rounded-xl transition-all
                   ${isArmed ? "bg-brand/[0.18] ring-2 ring-brand shadow-glow scale-[1.01]" : ""}
-                  ${!isArmed && isActive ? "bg-brand/[0.07] ring-1 ring-brand/25" : ""}
+                  ${!isArmed && isActive ? "wlp-active-row bg-brand/15 border-l-4 border-brand pl-1 shadow-[0_0_24px_-8px_rgba(109,74,255,0.45)]" : "border-l-4 border-transparent"}
+                  ${!isArmed && !isActive && wasRecentlyAnchored ? "bg-brand/[0.05] ring-1 ring-brand/40" : ""}
+                  ${!isArmed && !isActive && !wasRecentlyAnchored && isReview ? "bg-amber-500/[0.06] ring-1 ring-amber-500/40" : ""}
                   ${isAnchored ? "opacity-60" : ""}`}
               >
                 <div className="flex items-start gap-2 p-1">
@@ -884,26 +3064,235 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
                         text-brand-light"
                     />
                   ) : (
-                    <button
-                      onClick={() => seekTo(Math.max(0, seg.start), true)}
-                      onDoubleClick={() => startEditTimestamp(seg)}
-                      title={t("editor.timestamp_hint") || "Click: ir al tiempo · Doble click: editar"}
-                      className={`text-[11px] font-mono pt-2.5 w-14 shrink-0 text-right transition-colors
-                        ${isActive ? "text-brand-light" : "text-gray-600 hover:text-brand-light"}`}
-                    >
-                      {formatTimestamp(seg.start)}
-                    </button>
+                    <div className="flex items-center gap-1 shrink-0">
+                      {/* sr-only hook so tests can enter sync mode at a specific row
+                          without requiring hover state (jsdom has no hover). */}
+                      <button
+                        type="button"
+                        data-testid={`sync-dot-${idx}`}
+                        title="Activar Sync desde esta línea"
+                        onClick={() => enterSyncModeAt(idx)}
+                        className="sr-only"
+                        aria-label="Activar Sync desde esta línea"
+                      />
+                      <button
+                        onClick={() => seekTo(Math.max(0, seg.start), true)}
+                        onDoubleClick={() => startEditTimestamp(seg)}
+                        title={t("editor.timestamp_hint") || "Click: ir al tiempo · Doble click: editar"}
+                        className={`text-[11px] font-mono pt-2.5 w-14 text-right transition-colors
+                          ${isActive ? "text-brand-light font-semibold" : wasRecentlyAnchored ? "text-brand-light" : "text-gray-600 hover:text-brand-light"}`}
+                      >
+                        {/* Phase A 2026-05-25: indicador ▶ visible solo en
+                            la fila activa para reforzar "esta es la que está
+                            sonando ahora". El símbolo es half-width para no
+                            empujar el timestamp ni romper la grilla. */}
+                        {isActive && <span className="text-brand-light mr-0.5" aria-hidden="true">▶</span>}
+                        {formatTimestamp(seg.start)}
+                      </button>
+                      {wasRecentlyAnchored && (
+                        <button
+                          type="button"
+                          onClick={() => undoAnchorFor(seg._id)}
+                          title={t("editor.undo_anchor_hint") || "Deshacer este anchor"}
+                          className="mt-2 w-5 h-5 rounded-md text-[10px] text-ink-tertiary
+                            hover:text-brand-light hover:bg-brand/10 transition-colors
+                            flex items-center justify-center"
+                          aria-label="Deshacer anchor"
+                        >
+                          {/* Counter-clockwise undo arrow */}
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                               strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"
+                               className="w-3 h-3">
+                            <path d="M3 7v6h6" />
+                            <path d="M3 13a9 9 0 1 0 3-7" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
                   )}
-                  <div className="flex-1 min-w-0">
+                  <div className="flex-1 min-w-0 relative">
                     <input
                       type="text"
                       value={seg.text}
                       onChange={(e) => updateText(seg._id, e.target.value)}
-                      onFocus={() => seekTo(seg.start, false)}
-                      className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm text-white
+                      onKeyDown={(e) => {
+                        const el = e.currentTarget;
+                        if (e.key === "Enter") {
+                          // Split THIS line at the cursor, word-aware (keeps timing).
+                          e.preventDefault();
+                          const caret = el.selectionStart ?? el.value.length;
+                          if (!el.value.slice(0, caret).trim() || !el.value.slice(caret).trim()) {
+                            el.blur();
+                            return;
+                          }
+                          splitSegAt(seg._id, caret);
+                          el.blur();
+                        } else if (
+                          e.key === "Backspace" &&
+                          el.selectionStart === 0 &&
+                          el.selectionEnd === 0 &&
+                          el.value === ""
+                        ) {
+                          // Backspace en una línea VACÍA → la une con la anterior
+                          // (= elimina la línea vacía). Antes fusionaba con
+                          // CUALQUIER Backspace en pos 0, así que al borrar la
+                          // primera palabra la línea "desaparecía" sola (confuso,
+                          // reporte 2026-07-01). Ahora borrar texto NUNCA fusiona;
+                          // sólo una línea ya vacía lo hace. Merge explícito: botón.
+                          const i = edited.findIndex((s) => s._id === seg._id);
+                          if (i > 0) {
+                            e.preventDefault();
+                            mergeSeg(edited[i - 1]._id);
+                          }
+                        }
+                      }}
+                      onFocus={() => {
+                        seekTo(seg.start, false);
+                        setFocusedSegId(seg._id);
+                        setTextEditStart({ id: seg._id, text: seg.text });
+                      }}
+                      onBlur={(e) => handleTextBlur(seg._id, e.target.value)}
+                      /* Phase A 2026-05-25: cuando es active y no focused,
+                         escondemos el texto del input (text-transparent +
+                         caret-transparent) para que el overlay de karaoke
+                         word-jump abajo sea el único texto visible. Al
+                         clickear el input para editar, focusedSegId cambia
+                         y el texto vuelve. */
+                      className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm
                         focus:border-brand/40 focus:outline-none hover:border-white/[0.08] transition-all
-                        ${suggestion && !isApplied ? "border-amber-500/20" : "border-white/[0.04]"}`}
+                        ${isActive && focusedSegId !== seg._id ? "text-transparent caret-transparent selection:text-white" : "text-white"}
+                        ${suggestion && !isApplied ? "border-amber-500/20" : isReview ? "border-amber-500/40" : "border-white/[0.04]"}`}
                     />
+                    {/* Phase A 2026-05-25: overlay karaoke word-jump (Apple
+                        Music style). Solo visible cuando este segment es el
+                        activo Y el operador no está editando. Las palabras
+                        se renderizan como spans con scale + glow en la
+                        palabra activa, dim en las futuras, neutral en las
+                        ya pasadas. El avance usa los word-stamps REALES
+                        (activeWordIndex) cuando existen — con el lead-in
+                        (#801) la línea aparece 0.4s antes del canto y el
+                        viejo reparto uniforme corría adelantado. */}
+                    {isActive && focusedSegId !== seg._id && seg.text && (() => {
+                      const words = seg.text.split(/(\s+)/);
+                      const activeWordIdx = activeWordIndex(
+                        seg.text, seg.words, seg.start, seg.end, currentTime);
+                      let nonSpaceIdx = -1;
+                      return (
+                        <div
+                          className="absolute inset-0 px-3 py-2 text-sm pointer-events-none whitespace-pre-wrap leading-[1.4]"
+                          aria-hidden="true"
+                          style={{ fontFeatureSettings: "normal" }}
+                        >
+                          {words.map((tok, i) => {
+                            if (!/\S/.test(tok)) return <span key={i}>{tok}</span>;
+                            nonSpaceIdx += 1;
+                            const wActive = nonSpaceIdx === activeWordIdx;
+                            const wPast = nonSpaceIdx < activeWordIdx;
+                            return (
+                              <span
+                                key={i}
+                                style={{
+                                  display: "inline-block",
+                                  transform: wActive ? "scale(1.08)" : "scale(1)",
+                                  transformOrigin: "center bottom",
+                                  color: wActive ? "#b39dff" : wPast ? "rgba(255,255,255,0.92)" : "rgba(255,255,255,0.55)",
+                                  textShadow: wActive ? "0 0 14px rgba(109,74,255,0.65)" : "none",
+                                  transition: "transform 140ms cubic-bezier(.2,1.4,.35,1), color 200ms ease, text-shadow 200ms ease",
+                                }}
+                              >
+                                {tok}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      );
+                    })()}
+                    {isReview && !showReviewBanner && (
+                      <span className="inline-flex items-center gap-1 mt-1 ml-1 px-2 py-0.5 rounded-full
+                        bg-amber-500/15 text-amber-300 text-[10px] font-medium">
+                        <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24">
+                          <path d="M12 9v4M12 17h.01" />
+                          <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+                        </svg>
+                        {t("editor.review_badge") || "revisar tiempo"}
+                      </span>
+                    )}
+                    {propagationPrompt && propagationPrompt.id === seg._id && (
+                      <div className="flex items-center gap-2 mt-1.5 px-3 py-2 rounded-xl
+                        bg-brand/10 ring-1 ring-brand/30 text-xs text-white">
+                        <span className="flex-1">
+                          {(t("editor.repeat_prompt") || "Esta línea se repite en otras {n}. ¿Aplicar el cambio a todas?")
+                            .replace("{n}", propagationPrompt.matchIds.length)}
+                        </span>
+                        <button
+                          type="button"
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={applyPropagation}
+                          className="px-2.5 py-1 rounded-lg bg-brand text-white font-medium hover:bg-brand/80 transition-colors whitespace-nowrap"
+                        >
+                          {(t("editor.repeat_apply_all") || "Aplicar a todas ({n})")
+                            .replace("{n}", propagationPrompt.matchIds.length)}
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="repeat-only-this-btn"
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={dismissPropagation}
+                          className="px-2.5 py-1 rounded-lg bg-surface-2 text-white/70 hover:text-white transition-colors whitespace-nowrap"
+                        >
+                          {t("editor.repeat_only_this") || "Solo esta"}
+                        </button>
+                      </div>
+                    )}
+                    {/* Wrap indicator + split action. Suprimido per-line
+                        cuando ≥3 segments tienen wrap a 2 líneas — en ese
+                        caso un banner único arriba transmite la info y
+                        ofrece bulk action. Los casos 3+ líneas (más
+                        urgentes) siempre se muestran inline. */}
+                    {(() => {
+                      if (!(seg.text || "").trim()) return null;
+                      const lines = linesForSeg(seg.text);
+                      // Surface the split affordance on long SINGLE lines too: a
+                      // 1-visual-line seg can still be too long to read/karaoke
+                      // comfortably (operator-reported). ~34 chars ≈ where a
+                      // lyric line gets unwieldy.
+                      const longSingle = lines <= 1 && (seg.text || "").trim().length > 34;
+                      if (lines <= 1 && !longSingle) return null;
+                      if (lines === 2 && showWrap2Banner) return null;
+                      return (
+                        <div className="flex items-center gap-2 mt-1 ml-1">
+                          {longSingle ? (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full
+                              bg-amber-500/10 text-amber-300 ring-1 ring-amber-500/25 text-[10px] font-medium">
+                              ↔ línea larga
+                            </span>
+                          ) : lines === 2 ? (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full
+                              bg-amber-500/10 text-amber-300 ring-1 ring-amber-500/25 text-[10px] font-medium">
+                              <span className="relative flex h-1.5 w-1.5">
+                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-60"/>
+                                <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-amber-400"/>
+                              </span>
+                              ⚠ 2 líneas
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full
+                              bg-red-500/10 text-red-300 ring-1 ring-red-500/25 text-[10px] font-medium">
+                              ✗ {lines} líneas
+                            </span>
+                          )}
+                          <button
+                            onClick={() => splitSeg(seg._id)}
+                            title="Divide en dos en el wrap (reparte el tiempo proporcionalmente). Tip: apretá Enter en el cursor para partir exactamente ahí conservando el timing por palabra."
+                            className="text-[10px] text-brand hover:text-brand-light transition-colors
+                              flex items-center gap-0.5 px-2 py-0.5 rounded-lg
+                              bg-brand/5 hover:bg-brand/15 ring-1 ring-brand/20"
+                          >
+                            ✂ Dividir
+                          </button>
+                        </div>
+                      );
+                    })()}
                     {suggestion && !isApplied && (
                       <button onClick={() => applySuggestion(seg._id)}
                         className="flex items-center gap-1.5 mt-1 ml-1 px-2 py-1 rounded-lg
@@ -919,20 +3308,8 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
                     )}
                   </div>
                   <div className="shrink-0 flex items-center gap-0.5 mt-0.5">
-                    {!syncMode && (
-                      <button onClick={() => enterSyncModeAt(idx)}
-                        {...(idx === 0 ? { "data-tour": "editor-row-sync" } : {})}
-                        className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
-                          hover:bg-brand/15 flex items-center justify-center text-gray-600
-                          hover:text-brand-light transition-all"
-                        title={t("editor.sync_from_here") || "Activar Sync desde esta línea"}>
-                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                          <circle cx="12" cy="12" r="9" />
-                          <circle cx="12" cy="12" r="4" />
-                          <circle cx="12" cy="12" r="1" fill="currentColor" />
-                        </svg>
-                      </button>
-                    )}
+                    {/* Sync-entry per row ELIMINADO 2026-05-23 — único entry
+                        point pasa a ser el botón global del playbar + Cmd+K. */}
                     <button onClick={() => duplicateSeg(seg._id)}
                       className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
                         hover:bg-brand/10 flex items-center justify-center text-gray-600
@@ -943,6 +3320,29 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
                         <path d="M5 15V5a1 1 0 011-1h10" />
                       </svg>
                     </button>
+                    <button onClick={() => insertLineAfter(idx)}
+                      className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
+                        hover:bg-brand/10 flex items-center justify-center text-gray-600
+                        hover:text-brand-light transition-all"
+                      title={t("editor.insert_line_below") || "Insertar línea acá (en el medio de la canción)"}>
+                      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                        <path d="M12 5v14M5 12h14" />
+                      </svg>
+                    </button>
+                    {idx < edited.length - 1 && (
+                      <button onClick={() => mergeSeg(seg._id)}
+                        className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
+                          hover:bg-brand/10 flex items-center justify-center text-gray-600
+                          hover:text-brand-light transition-all"
+                        title="Unir con la línea siguiente — conserva el sync (combina los tiempos por palabra). Atajo: Backspace en una línea vacía la une con la anterior.">
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                          <path d="M7 8l5 5 5-5M7 16l5-5 5 5" />
+                        </svg>
+                      </button>
+                    )}
+                    {/* Per-row ✂ trim removed: redundant with the bulk
+                        "Recortar N líneas con texto colgado · Aplicar" auto-fix
+                        at the top, and timing is now handled in the timeline. */}
                     <button onClick={() => deleteSeg(seg._id)}
                       className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
                         hover:bg-red-500/10 flex items-center justify-center text-gray-600
@@ -959,35 +3359,78 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
           })}
           <button
             data-tour="editor-add-line"
-            onClick={addBlankLine}
+            onClick={addLineSmart}
             className="w-full mt-2 py-2.5 rounded-xl border border-dashed border-white/[0.08]
               hover:border-brand/40 hover:bg-brand/[0.04] text-gray-500 hover:text-brand-light
-              text-[12px] transition-all flex items-center justify-center gap-1.5"
+              text-caption transition-all flex items-center justify-center gap-1.5"
           >
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M12 5v14M5 12h14" />
             </svg>
             {t("editor.add_line") || "Agregar línea"}
           </button>
-        </div>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
       </div>
 
-      <div className="mt-4 flex justify-between items-center gap-3">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="text-xs text-gray-600 shrink-0">
-            {edited.length} {t("editor.lines")}
+      {/* Line-count + blank-line note. The primary CTA lives in the sticky
+          header now (always reachable) — no duplicate button here. */}
+      <div className="mt-4 flex items-center gap-2 min-w-0" data-tour="editor-approve">
+        <span className="text-xs text-gray-600 shrink-0">
+          {edited.length} {t("editor.lines")}
+        </span>
+        {blankCount > 0 && (
+          <span className="text-[11px] text-amber-400 truncate">
+            · {blankCount} {blankCount === 1 ? t("editor.blank_singular") || "línea en blanco" : t("editor.blank_plural") || "líneas en blanco"} —{" "}
+            {t("editor.blanks_dropped") || "se omitirán"}
           </span>
-          {blankCount > 0 && (
-            <span className="text-[11px] text-amber-400 truncate">
-              · {blankCount} {blankCount === 1 ? t("editor.blank_singular") || "línea en blanco" : t("editor.blank_plural") || "líneas en blanco"} —{" "}
-              {t("editor.blanks_dropped") || "se omitirán"}
-            </span>
-          )}
-        </div>
-        <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5 shrink-0" data-tour="editor-approve">
-          {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
-        </button>
+        )}
       </div>
+
+      {/* ── 3+ line wrap warning banner ────────────────────────────── */}
+      {wrapWarning && (
+        <div className="mt-3 rounded-card bg-red-500/[0.06] ring-1 ring-red-500/20 px-5 py-4 animate-fade-in">
+          <p className="text-sm font-semibold text-red-300 mb-1">
+            {wrapWarning.ids.length === 1
+              ? "1 línea ocupará 3+ renglones en el video"
+              : `${wrapWarning.ids.length} líneas ocuparán 3+ renglones en el video`}
+          </p>
+          <p className="text-xs text-red-400/70 mb-3">
+            Las líneas marcadas en rojo quedarán muy largas. Podés dividirlas ahora o continuar igual.
+          </p>
+          <div className="flex gap-3">
+            <button
+              onClick={() => {
+                // Auto-split all problematic segments
+                wrapWarning.ids.forEach((id) => splitSeg(id));
+                setWrapWarning(null);
+              }}
+              className="inline-flex items-center gap-1.5 h-9 px-4 rounded-button text-xs font-semibold
+                text-white bg-brand hover:bg-brand/90 transition-colors"
+            >
+              ✂ Auto-dividir todo
+            </button>
+            <button
+              onClick={() => {
+                setWrapWarning(null);
+                const cleaned = _buildCleanedSegments();
+                onApprove(cleaned.map(({ _id, ...rest }) => rest));
+              }}
+              className="btn-secondary h-9 px-4 text-xs"
+            >
+              Continuar igual
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Inline preview list-only ELIMINADO 2026-05-23 — el refactor world-class
+          deja el LyricVideoPreview siempre visible en la columna izquierda,
+          en ambas vistas. Este bloque (que sólo aparecía en list mode cuando
+          una fila tenía foco) era redundante y a veces divergía visualmente. */}
 
       <EditorTour user={user} />
     </div>

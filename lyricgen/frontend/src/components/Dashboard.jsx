@@ -1,11 +1,31 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
+import { useNavigate } from "react-router-dom";
 import { useI18n } from "../i18n";
 import { useMediaUrl } from "../mediaUrl";
 import { fetchWithTimeout } from "../fetchWithTimeout";
 import { DashboardTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
+import { SkeletonVideoCard } from "./Skeleton";
+import DashboardStepper from "./DashboardRich/Stepper";
+import FormatGallery from "./DashboardRich/FormatGallery";
+import NovedadHero from "./WhatsNew/NovedadHero";
+import "./DashboardRich/DashboardRich.css";
+
+// sessionStorage key the wizard reads on mount to pre-apply a delivery
+// profile / short flag picked from the FormatGallery on home. Keeps the
+// coupling loose: UploadZone consumes if present, ignores if not.
+export const FORMAT_PRESET_KEY = "genly_format_preset";
 
 const API = import.meta.env.VITE_API_URL || "";
+
+// 2026-05-27 perf audit: module-level formatters so the date header's
+// IIFE doesn't `new Intl.DateTimeFormat()` on every render. Creating
+// a DateTimeFormat is ~5-10 ms in Chrome — fine once, but adds up at
+// 3-5 renders/sec while the polling loop is ticking.
+const DATE_HEADER_FMT = new Intl.DateTimeFormat("es-AR", {
+  weekday: "long", day: "numeric", month: "long",
+});
+const MONTH_FMT = new Intl.DateTimeFormat("es-AR", { month: "long" });
 
 function authHeaders() {
   const token = localStorage.getItem("genly_token");
@@ -22,9 +42,11 @@ function timeAgo(ts) {
 }
 
 // Tiny uppercase label used to introduce sections — Linear / Vercel style.
+// `text-section` token (tailwind.config) ya incluye fontWeight 600 +
+// letter-spacing 0.18em + size 10px. Antes era arbitrary; el token lo unifica.
 function SectionLabel({ children }) {
   return (
-    <p className="text-[10px] font-medium text-gray-500 uppercase tracking-[0.18em] mb-3">
+    <p className="text-section text-gray-500 uppercase mb-3">
       {children}
     </p>
   );
@@ -44,7 +66,11 @@ function ProcessingRow({ job, onSelect, t }) {
         {(job.filename || "").replace(/\.mp3$/i, "")}
       </span>
       <span className="text-[11px] text-gray-500 shrink-0">
-        {job.status === "queued" ? (t("dash.queued") || "En cola") : t("dash.processing")}
+        {job.status === "queued"
+          ? (t("dash.queued") || "En cola")
+          : job.status === "editing"
+            ? (t("dash.editing") || "Re-renderizando")
+            : t("dash.processing")}
       </span>
     </button>
   );
@@ -58,7 +84,7 @@ function VideoCard({ job, onSelect }) {
 
   return (
     <button
-      onClick={() => onSelect(job.job_id)}
+      onClick={() => onSelect(job.job_id, job.status)}
       className="rounded-card overflow-hidden text-left group bg-surface-2/40 hover:bg-surface-2/70 ring-1 ring-white/[0.04] hover:ring-white/[0.10] transition-all"
     >
       <div className="aspect-video bg-surface-3/30 relative overflow-hidden">
@@ -70,7 +96,7 @@ function VideoCard({ job, onSelect }) {
             onError={(e) => { e.target.style.display = "none"; }}
           />
         )}
-        <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/30">
+        <div className="absolute inset-0 flex items-center justify-center opacity-30 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/30">
           <div className="w-10 h-10 rounded-full bg-white/15 backdrop-blur-md flex items-center justify-center ring-1 ring-white/20">
             <svg className="w-4 h-4 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
               <path d="M8 5v14l11-7z"/>
@@ -96,13 +122,78 @@ function VideoCard({ job, onSelect }) {
   );
 }
 
-export default function Dashboard({ user, history, historyError, historyLoaded = true, onRetryHistory, onSelectJob, onNewBatch, onViewHistory }) {
+export default function Dashboard({ user, history, historyError, historyLoaded = true, onRetryHistory, onSelectJob, onNewBatch, onViewHistory, onOpenSearch }) {
   const { t } = useI18n();
+  const navigate = useNavigate();
 
-  const pendingReview = history.filter((h) => h.status === "pending_review");
-  const processing = history.filter((h) => h.status === "processing" || h.status === "queued");
-  const recentDone = history.filter((h) => h.status === "done").slice(0, 6);
-  const errors = history.filter((h) => h.status === "error" || h.status === "validation_failed");
+  // FormatGallery handlers.
+  // - "youtube"/"prores"/"thumbnail" cards: stash the preset in sessionStorage
+  //   so UploadZone (or whoever consumes /new next) can read it once on mount
+  //   and clear it. Then trigger the regular new-batch navigation.
+  // - "short" today is not a separate delivery profile — every job already
+  //   produces an MP4 + short bundle. We still pre-fill the preset so the
+  //   wizard can later decide to highlight short-related options.
+  // - Locked ProRes (free plan) routes to billing instead.
+  const handleSelectFormat = (fmt) => {
+    try {
+      const preset = { id: fmt.id, profile: fmt.profile, subType: fmt.subType || null };
+      sessionStorage.setItem(FORMAT_PRESET_KEY, JSON.stringify(preset));
+    } catch {}
+    if (typeof onNewBatch === "function") onNewBatch();
+    else navigate("/new");
+  };
+  const handleUpgrade = () => {
+    navigate("/account?tab=facturacion");
+  };
+
+  // 2026-05-27 perf audit (UMG micro-freezes): four `history.filter()`
+  // calls re-ran on EVERY render — including every SSE poll tick (every
+  // 3-5 s during a generation). For a tenant with 200 jobs that's
+  // 4 × 200 = 800 string comparisons per poll × 5 = 4000/sec just for
+  // re-bucketing. Memoizing on `history` reduces this to one pass per
+  // actual change (when a job status mutates), saving ~50-60 ms of
+  // main-thread work per poll tick.
+  const pendingReview = useMemo(
+    () => history.filter((h) => h.status === "pending_review"),
+    [history],
+  );
+  // "editing" jobs are mid edit-request re-render — UX-wise they're the
+  // same as the initial processing state (worker is rendering, user can't
+  // approve yet), so we bucket them together with processing/queued.
+  const processing = useMemo(
+    () => history.filter(
+      (h) => h.status === "processing" || h.status === "queued" || h.status === "editing"
+    ),
+    [history],
+  );
+  const recentDone = useMemo(
+    () => history.filter((h) => h.status === "done").slice(0, 6),
+    [history],
+  );
+  const errors = useMemo(
+    () => history.filter((h) => h.status === "error" || h.status === "validation_failed"),
+    [history],
+  );
+
+  // First-week user gate (matches the onboarding-tour age gate).
+  const isFirstWeekUser = (() => {
+    if (!user || !user.created_at) return false;
+    const t = Date.parse(user.created_at);
+    if (Number.isNaN(t)) return false;
+    return (Date.now() - t) / 86400000 < 14;
+  })();
+  // Hotfix 2026-05-29: agus.cafisi reportó ver el hero gigante "creá tu
+  // primer video" con history=[] aunque tiene historial real. Causa
+  // probable: /jobs falló silenciosamente (CORS / 5xx caché / cold start)
+  // y volvió un array vacío sin setear historyError. Para no asustar a
+  // un veterano con "todo borrado", restringimos el hero al combo
+  // user nuevo (<14 días) + 0 history + carga OK. Para users veteranos
+  // con history=[] (raro pero posible: cuenta nueva en un sello viejo,
+  // backend hiccup) mostramos el empty state pequeño tradicional que
+  // dice "Empezá tu primer lote" pero NO sustituye toda la home.
+  const isTrueEmptyState = history.length === 0 && historyLoaded && !historyError;
+  const isEmptyState = isTrueEmptyState && isFirstWeekUser;
+  const showStepper = isEmptyState || isFirstWeekUser;
 
   // Real plan usage from API. We surface load failures so the operator
   // doesn't sit on "cargando..." forever when /usage hangs (CORS,
@@ -160,32 +251,281 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
     return `${monthlyUsed} ${monthlyUsed === 1 ? "video listo" : "videos listos"} este mes`;
   })();
 
+  // 2026-05-25 — Atención drawer state. Los banners de quota+errors
+  // (antes apilados arriba compitiendo con el hero) ahora viven adentro
+  // de un drawer colapsable a la derecha del hero. Solo se expande
+  // cuando hay algo que mostrar Y el operador lo abre.
+  const [attentionOpen, setAttentionOpen] = useState(false);
+  const quotaAlert = !isUnlimited && monthlyLimit && (usage?.alert_100 || usage?.alert_80);
+  const attentionCount = (quotaAlert ? 1 : 0) + (errorsBannerVisible ? 1 : 0);
+
+  // Header dinámico — operativo, no amable. Cambia según estado del sistema.
+  // Linear/Stripe pattern: "Control room", no "Hola buenos días".
+  const heroHeadline = (() => {
+    if (history.length === 0) return "Sistema listo";
+    if (pendingReview.length > 0) return `${pendingReview.length} ${pendingReview.length === 1 ? "video espera" : "videos esperan"} tu aprobación`;
+    if (processing.length > 0) return `${processing.length} ${processing.length === 1 ? "video" : "videos"} renderizando`;
+    return "Todo al día";
+  })();
+  const heroSubline = (() => {
+    if (history.length === 0) return "Subí tu primer audio para empezar.";
+    if (pendingReview.length > 0) return "Revisá y aprobá para destrabar descargas.";
+    if (processing.length > 0) return "El sistema sigue trabajando en background.";
+    return "Cero pendientes. Subí más audio cuando quieras.";
+  })();
+
+  // El "próximo a terminar" — heurística simple: primer processing con
+  // mayor `progress`. Si no hay progress confiable, el más viejo en cola.
+  const nextToFinish = (() => {
+    if (processing.length === 0) return null;
+    const sorted = [...processing].sort((a, b) =>
+      (b.progress || 0) - (a.progress || 0)
+        || (a.created_at || 0) - (b.created_at || 0)
+    );
+    return sorted[0];
+  })();
+
   return (
-    <div className="w-full max-w-4xl animate-fade-in">
-      {/* ─── Header ─────────────────────────────────────────────────── */}
-      <div className="flex items-end justify-between mb-10">
-        <div>
-          <h1 className="text-[28px] leading-tight font-bold tracking-tight">
-            {greeting}{firstName && <span className="text-ink-secondary font-normal">, {firstName}</span>}
+    <div className="w-full max-w-[1700px] animate-fade-in">
+      {/* ─── Command bar simplificada (header reposicionado, search vendrá en PR-2) ─── */}
+      <div className="flex items-center justify-between mb-7">
+        <div className="min-w-0">
+          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
+            {(() => {
+              const d = new Date();
+              return DATE_HEADER_FMT.format(d) + " · " + d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
+            })()}
+          </p>
+          <h1 className="text-[26px] leading-tight font-bold tracking-tight mt-1 truncate">
+            {heroHeadline}
           </h1>
-          <p className="text-sm text-ink-secondary mt-1.5">{monthlySubtitle}</p>
+          <p className="text-sm text-ink-secondary mt-1">{heroSubline}</p>
         </div>
-        <button onClick={onNewBatch} className="btn-primary px-6" data-tour="dashboard-new-batch">
-          <svg className="inline-block w-4 h-4 mr-2 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-            <path d="M12 5v14M5 12h14" strokeLinecap="round"/>
-          </svg>
-          {t("nav.new_batch")}
-        </button>
+        <div className="flex items-center gap-2 shrink-0 ml-4">
+          {/* Search button — abre el SearchPalette (PR-2 2026-05-25).
+              Visual: input fake con placeholder + atajo ⌘K a la derecha.
+              Match patrón Linear/Vercel command bar. */}
+          {onOpenSearch && (
+            <button
+              type="button"
+              onClick={onOpenSearch}
+              className="hidden md:flex items-center gap-2 h-9 px-3 rounded-lg bg-surface-2/60 ring-1 ring-white/[0.06] hover:ring-white/[0.12] hover:bg-surface-2/80 text-gray-400 hover:text-gray-200 transition-colors text-xs"
+              aria-label="Buscar"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <circle cx="11" cy="11" r="8" /><path d="M21 21l-4.35-4.35" strokeLinecap="round" />
+              </svg>
+              <span>Buscar</span>
+              <kbd className="ml-2 px-1.5 h-5 inline-flex items-center rounded text-[10px] font-mono bg-white/[0.06] ring-1 ring-white/10 text-gray-500">
+                ⌘K
+              </kbd>
+            </button>
+          )}
+          {attentionCount > 0 && (
+            <button
+              type="button"
+              onClick={() => setAttentionOpen((v) => !v)}
+              aria-expanded={attentionOpen}
+              className={`flex items-center gap-1.5 px-3 h-9 rounded-lg text-xs font-medium transition-colors ring-1
+                ${attentionOpen
+                  ? "bg-amber-500/15 text-amber-200 ring-amber-500/30"
+                  : "bg-amber-500/[0.06] text-amber-300/80 ring-amber-500/20 hover:bg-amber-500/[0.10] hover:text-amber-200"
+                }`}
+            >
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg>
+              {attentionCount} {attentionCount === 1 ? "aviso" : "avisos"}
+              <svg className={`w-3 h-3 transition-transform ${attentionOpen ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" strokeLinecap="round" strokeLinejoin="round"/></svg>
+            </button>
+          )}
+          <button onClick={onNewBatch} className="btn-primary px-5" data-tour="dashboard-new-batch">
+            <svg className="inline-block w-4 h-4 mr-1.5 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+              <path d="M12 5v14M5 12h14" strokeLinecap="round"/>
+            </svg>
+            {t("nav.new_batch")}
+          </button>
+        </div>
       </div>
 
-      {/* ─── Plan-quota proximity warning ─────────────────────────────
-            Three modes:
-              1. user.allow_overage + alert_100 → "you're billing extra,
-                 here's the running total" (no block).
-              2. plain user + alert_100 → "no more uploads, contact
-                 support" (hard wall — /generate returns 402).
-              3. anyone + alert_80 → "heads-up, X videos left, contact
-                 if you'll need more". */}
+      {/* ─── Hero KPI 3-up (Aprobar · Renderizando · Cuota) ───────────
+            Una sola tarjeta con divide-x — leído como una unidad horizontal
+            no como tres cards separadas. Stripe Dashboard pattern.
+            UX 2026-05-29: ocultas cuando todos los valores son 0 — en cuenta
+            nueva el bloque ocupaba 200px diciendo "no pasa nada". ─── */}
+      {(pendingReview.length > 0 || processing.length > 0 || monthlyUsed > 0) && (
+      <div className="mb-8 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] grid grid-cols-1 md:grid-cols-3 md:divide-x md:divide-white/[0.04]">
+
+        {/* COL 1: APROBAR — north star del operador */}
+        <button
+          onClick={() => pendingReview.length > 0 && onSelectJob(pendingReview[0].job_id)}
+          disabled={pendingReview.length === 0}
+          className={`text-left px-6 py-6 transition-colors ${pendingReview.length > 0 ? "hover:bg-surface-2/40 cursor-pointer" : "cursor-default"}`}
+        >
+          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Aprobar</p>
+          <div className="mt-2 flex items-baseline gap-2">
+            <span className={`text-[44px] leading-none font-bold tracking-tight tabular-nums
+              ${pendingReview.length === 0 ? "text-white/40" :
+                pendingReview.length >= 5 ? "text-red-300" :
+                "text-amber-200"}`}>
+              {pendingReview.length}
+            </span>
+            <span className="text-xs text-ink-secondary">
+              {pendingReview.length === 0 ? "todo aprobado" :
+                pendingReview.length === 1 ? "esperando review" : "esperando review"}
+            </span>
+          </div>
+          {pendingReview.length > 0 && pendingReview[0] && (
+            <p className="text-[11px] text-ink-secondary mt-3 truncate">
+              <span className="font-mono tabular-nums text-gray-400">{timeAgo(pendingReview[0].created_at)}</span>
+              {" · "}
+              {(pendingReview[0].filename || "").replace(/\.(mp3|wav)$/i, "")}
+            </p>
+          )}
+          {pendingReview.length > 0 && (
+            <p className="text-[11px] text-brand-light mt-2 flex items-center gap-1 group-hover:translate-x-0.5 transition-transform">
+              Revisar ahora
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/></svg>
+            </p>
+          )}
+        </button>
+
+        {/* COL 2: RENDERIZANDO — sistema en vivo */}
+        <div className="px-6 py-6">
+          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">Renderizando</p>
+          <div className="mt-2 flex items-baseline gap-2">
+            <span className={`text-[44px] leading-none font-bold tracking-tight tabular-nums
+              ${processing.length === 0 ? "text-white/40" : "text-brand-light"}`}>
+              {processing.length}
+            </span>
+            <span className="text-xs text-ink-secondary">
+              {processing.length === 0 ? "cola vacía" : processing.length === 1 ? "video en curso" : "jobs en curso"}
+            </span>
+          </div>
+          {nextToFinish ? (
+            <button
+              onClick={() => onSelectJob(nextToFinish.job_id)}
+              className="mt-3 w-full text-left flex items-center gap-2 group"
+            >
+              <span className="relative w-1.5 h-1.5 shrink-0">
+                <span className="absolute inset-0 rounded-full bg-brand animate-ping opacity-60" />
+                <span className="relative block w-1.5 h-1.5 rounded-full bg-brand" />
+              </span>
+              <span className="text-[11px] text-white truncate group-hover:text-brand-light transition-colors">
+                {(nextToFinish.filename || "").replace(/\.(mp3|wav)$/i, "")}
+              </span>
+              {nextToFinish.progress !== undefined && nextToFinish.progress > 0 && (
+                <span className="text-[10px] text-gray-500 font-mono tabular-nums shrink-0">
+                  {Math.round(nextToFinish.progress)}%
+                </span>
+              )}
+            </button>
+          ) : (
+            <p className="text-[11px] text-ink-secondary mt-3">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent/40 mr-2 align-middle" />
+              Sistema OK · esperando tu próximo upload
+            </p>
+          )}
+        </div>
+
+        {/* COL 3: CUOTA — Stripe pattern (número grande + barra slim + delta) */}
+        <div className="px-6 py-6">
+          <p className="text-section text-gray-500 uppercase tracking-[0.18em]">
+            Cuota {MONTH_FMT.format(new Date())}
+          </p>
+          <div className="mt-2 flex items-baseline gap-2">
+            {isUnlimited ? (
+              <>
+                <span className="text-[44px] leading-none font-bold tracking-tight tabular-nums text-white">{monthlyUsed}</span>
+                <span className="text-xs text-ink-secondary">sin límite</span>
+              </>
+            ) : monthlyLimit ? (
+              <>
+                <span className={`text-[44px] leading-none font-bold tracking-tight tabular-nums ${
+                  usagePercent >= 100 ? "text-red-300" :
+                  usagePercent >= 80 ? "text-amber-200" :
+                  "text-white"
+                }`}>
+                  {monthlyUsed}
+                </span>
+                <span className="text-xs text-ink-secondary font-mono tabular-nums">/ {monthlyLimit}</span>
+                <span className={`text-xs ml-auto ${
+                  usagePercent >= 100 ? "text-red-300/80" :
+                  usagePercent >= 80 ? "text-amber-300/80" :
+                  "text-ink-secondary"
+                }`}>
+                  {Math.round(usagePercent)}%
+                </span>
+              </>
+            ) : usageError ? (
+              <button onClick={retryUsage} className="text-xs text-brand-light hover:underline underline-offset-2">
+                Reintentar carga
+              </button>
+            ) : (
+              <span className="text-xs text-ink-secondary">cargando…</span>
+            )}
+          </div>
+          {!isUnlimited && monthlyLimit && (
+            <div className="mt-3 w-full h-1 bg-surface-3/60 rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-700 ease-out ${
+                  usagePercent >= 100
+                    ? "bg-gradient-to-r from-amber-500 to-red-500"
+                    : usagePercent >= 80
+                      ? "bg-gradient-to-r from-brand to-amber-400"
+                      : "bg-gradient-to-r from-brand to-accent"
+                }`}
+                style={{ width: `${Math.max(2, Math.min(100, usagePercent))}%` }}
+              />
+            </div>
+          )}
+          {!isUnlimited && monthlyLimit && (
+            <p className="text-[11px] text-ink-secondary mt-2 font-mono tabular-nums">
+              {monthlyLimit - monthlyUsed > 0
+                ? `${monthlyLimit - monthlyUsed} restantes este mes`
+                : "Cupo agotado · contactá soporte"}
+            </p>
+          )}
+          {/* Créditos de regalo + qué rinde (dinámico). Mismo dato que el
+              medidor de la sidebar; el costo sale del backend (scenes_credit_cost). */}
+          {!isUnlimited && (() => {
+            const bonusRemaining = usage?.bonus_remaining ?? 0;
+            const totalAvail = usage?.total_available;
+            const cost = usage?.scenes_credit_cost ?? 3;
+            const proj = usage?.projection || {};
+            const projN = proj.normal ?? totalAvail;
+            const projE = proj.escenas ?? (totalAvail != null ? Math.floor(totalAvail / (cost || 1)) : null);
+            if (totalAvail == null) return null;
+            let giftDays = null;
+            if (bonusRemaining > 0 && usage?.bonus_expires_at) {
+              const ms = new Date(usage.bonus_expires_at).getTime() - Date.now();
+              giftDays = Number.isFinite(ms) ? Math.max(0, Math.ceil(ms / 86_400_000)) : null;
+            }
+            return (
+              <div className="mt-3 pt-3 border-t border-white/[0.06] space-y-1.5">
+                {bonusRemaining > 0 && (
+                  <p className="text-[11px] text-emerald-300 font-medium">
+                    🎁 {bonusRemaining} créditos de regalo
+                    {giftDays != null ? (giftDays === 0 ? " · vencen hoy" : ` · vencen en ${giftDays} días`) : ""}
+                  </p>
+                )}
+                <p className="text-[11px] text-ink-secondary">
+                  Te alcanza para {projN} videos normales o {projE} con Escenas
+                </p>
+                <p className="text-[10px] text-gray-500">
+                  🎥 Normal: 1 crédito · 🎬 Escenas: {cost} créditos
+                </p>
+              </div>
+            );
+          })()}
+        </div>
+      </div>
+      )}
+
+      {/* ─── Atención drawer — colapsable, solo se renderiza si hay avisos
+            Y el operador lo abrió. Los banners viejos vivían apilados
+            arriba compitiendo con el hero; ahora viven acá. ─── */}
+      {attentionOpen && attentionCount > 0 && (
+        <div className="mb-8 space-y-3 animate-fade-in">
+
       {!isUnlimited && monthlyLimit && (usage?.alert_100 || usage?.alert_80) && (
         (() => {
           const overageMode = usage.alert_100 && user?.allow_overage;
@@ -241,10 +581,10 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
                     <p className="text-xs text-amber-300/80 mt-0.5">
                       {user?.allow_overage
                         ? `Pasado el tope, cada video adicional cuesta $${usage.overage_cost_per_video} y se factura al cierre.`
-                        : <>Si vas a necesitar más, contactanos antes de llegar al tope:{" "}
-                            <a href="mailto:soporte@genly.pro" className="underline font-medium hover:text-amber-200">
-                              soporte@genly.pro
-                            </a>.</>
+                        : <>{t("billing.nudge_body") || "Mejorá tu plan para no frenarte cuando llegues al tope."}{" "}
+                            <button onClick={handleUpgrade} className="underline font-medium hover:text-amber-200">
+                              {t("billing.nudge_cta") || "Mejorar plan"}
+                            </button></>
                       }
                     </p>
                   </>
@@ -255,149 +595,84 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         })()
       )}
 
-      {/* ─── Pending review CTA — brand violet because it's a positive
-            "do this next", not a danger warning ───────────────────── */}
-      {pendingReview.length > 0 && (
+          {/* Pending review CTA + monthly usage card + En proceso section eliminados:
+              ahora viven dentro del hero 3-up arriba (cols Aprobar / Renderizando / Cuota). */}
+          {errorsBannerVisible && (
+            <div className="w-full flex items-center gap-3 px-4 py-3 rounded-xl bg-red-500/[0.06] ring-1 ring-red-500/20">
+              <svg className="w-4 h-4 text-red-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/>
+              </svg>
+              <p className="text-xs text-red-300 flex-1">
+                {errors.length} {errors.length === 1 ? "video falló este mes" : "videos fallaron este mes"}
+              </p>
+              <button
+                onClick={dismissErrors}
+                aria-label="Descartar"
+                className="text-red-400/60 hover:text-red-300 transition-colors p-1 -mr-1"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                  <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round"/>
+                </svg>
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ─── Hero dropzone — empty state focal point.
+            UX 2026-05-29: reemplaza el "Empezá tu primer lote" chico que
+            estaba al final. Para una cuenta sin historial, esto pasa a ser
+            el protagonista visual claro (patrón Notion/Loom empty state). ─── */}
+      {isEmptyState && (
         <button
-          onClick={() => onSelectJob(pendingReview[0].job_id)}
-          className="w-full mb-4 flex items-center gap-4 px-5 py-4 rounded-card text-left group transition-all
-                     bg-gradient-to-r from-brand/[0.10] via-brand/[0.06] to-transparent
-                     ring-1 ring-brand/20 hover:ring-brand/40
-                     hover:from-brand/[0.14] hover:via-brand/[0.08]"
+          type="button"
+          onClick={onNewBatch}
+          className="dr-hero-drop w-full mb-6 group"
+          aria-label={t("dash.hero.cta") || "Subir audio para empezar"}
         >
-          <div className="w-10 h-10 rounded-xl bg-brand/15 flex items-center justify-center shrink-0 ring-1 ring-brand/30">
-            <svg className="w-5 h-5 text-brand-light" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <path d="M9 11l3 3L22 4M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11" strokeLinecap="round" strokeLinejoin="round"/>
-            </svg>
-          </div>
-          <div className="flex-1 min-w-0">
-            <p className="text-sm font-semibold text-white">
-              {pendingReview.length === 1
-                ? "1 video esperando tu aprobación"
-                : `${pendingReview.length} videos esperando tu aprobación`}
+          <div className="dr-hero-drop-inner">
+            <div className="dr-hero-drop-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 5v14M5 12l7-7 7 7"/>
+              </svg>
+            </div>
+            <h2 className="dr-hero-drop-title">
+              {t("dash.hero.title") || "Arrastrá tu MP3 para empezar"}
+            </h2>
+            <p className="dr-hero-drop-sub">
+              {t("dash.hero.sub") || "O cliqueá para elegir. MP3 o WAV, hasta 5 archivos a la vez, 100 MB cada uno."}
             </p>
-            <p className="text-xs text-ink-secondary mt-0.5">
-              Revisá la transcripción y aprobá para destrabar la descarga
-            </p>
+            <span className="dr-hero-drop-cta">
+              {t("dash.hero.cta") || "Subir audio"}
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M5 12h14M13 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/></svg>
+            </span>
           </div>
-          <svg className="w-5 h-5 text-brand-light/70 group-hover:translate-x-0.5 transition-transform shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round"/>
-          </svg>
         </button>
       )}
 
-      {/* ─── Errors banner (rare, secondary tone, dismissible) ────── */}
-      {errorsBannerVisible && (
-        <div className="w-full mb-4 flex items-center gap-3 px-4 py-3 rounded-xl bg-red-500/[0.06] ring-1 ring-red-500/20">
-          <svg className="w-4 h-4 text-red-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/>
-          </svg>
-          <p className="text-xs text-red-300 flex-1">
-            {errors.length} {errors.length === 1 ? "video falló este mes" : "videos fallaron este mes"}
-          </p>
-          <button
-            onClick={dismissErrors}
-            aria-label="Descartar"
-            className="text-red-400/60 hover:text-red-300 transition-colors p-1 -mr-1"
-          >
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-              <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round"/>
-            </svg>
-          </button>
-        </div>
+      {/* ─── DashboardRich: Stepper + FormatGallery (PR #465) ─────────
+            Educan flujo + venden formatos. UX 2026-05-29: el Stepper se
+            muestra solo a users del primer mes o en empty state. Para
+            veteranos activos no aporta y ocupa fold. ─── */}
+      {showStepper && (
+        <DashboardStepper
+          onPrimaryAction={(stepIdx) => {
+            // Step 1 (Subir) + Step 4 (Renderizar) → arrancan upload.
+            // Steps 2/3 → no-op (decorativos por ahora; futuros enlaces al
+            // help center cuando llegue a main).
+            if (stepIdx === 0 || stepIdx === 3) {
+              if (typeof onNewBatch === "function") onNewBatch();
+              else navigate("/new");
+            }
+          }}
+        />
       )}
-
-      {/* ─── Plan usage — Stripe-style hero number, bar as secondary ── */}
-      <div className="rounded-card p-7 mb-10 bg-surface-2/40 ring-1 ring-white/[0.04]" data-tour="dashboard-usage">
-        <div className="flex items-end justify-between mb-5">
-          <div>
-            <SectionLabel>{t("dash.monthly_usage")}</SectionLabel>
-            <div className="flex items-baseline gap-2">
-              {isUnlimited ? (
-                <>
-                  <span className="text-4xl font-bold tracking-tight text-white">{monthlyUsed}</span>
-                  <span className="text-sm text-ink-secondary">videos · sin límite</span>
-                </>
-              ) : monthlyLimit ? (
-                <>
-                  <span className="text-4xl font-bold tracking-tight text-white">{monthlyUsed}</span>
-                  <span className="text-sm text-ink-secondary">/ {monthlyLimit}</span>
-                </>
-              ) : usageError ? (
-                <div className="flex items-center gap-3">
-                  <span className="text-sm text-amber-300">
-                    {t("dash.usage_error") || "No se pudo cargar el uso."}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={retryUsage}
-                    className="text-xs font-medium text-brand hover:text-brand-light underline-offset-2 hover:underline"
-                  >
-                    {t("dash.retry") || "Reintentar"}
-                  </button>
-                </div>
-              ) : (
-                <span className="text-sm text-ink-secondary">{t("dash.loading") || "cargando…"}</span>
-              )}
-            </div>
-            {usage?.plan && !isUnlimited && (
-              <p className="text-xs text-ink-secondary mt-1.5">
-                Plan <span className="text-brand font-medium">{usage.plan}</span> · {monthlyLimit} videos/mes incluidos
-              </p>
-            )}
-          </div>
-          {!isUnlimited && monthlyLimit && (
-            <span className={`text-2xl font-bold tracking-tight ${
-              usagePercent >= 100 ? "text-red-400" :
-              usagePercent >= 80 ? "text-amber-400" :
-              "text-brand-light"
-            }`}>
-              {Math.round(usagePercent)}%
-            </span>
-          )}
-        </div>
-        {!isUnlimited && monthlyLimit && (
-          <div className="w-full h-2 bg-surface-3/60 rounded-full overflow-hidden">
-            <div
-              className={`h-full rounded-full transition-all duration-700 ease-out ${
-                usagePercent >= 100
-                  ? "bg-gradient-to-r from-amber-500 to-red-500"
-                  : usagePercent >= 80
-                    ? "bg-gradient-to-r from-brand to-amber-400"
-                    : "bg-gradient-to-r from-brand to-brand-light"
-              }`}
-              style={{ width: `${Math.max(2, Math.min(100, usagePercent))}%` }}
-            />
-          </div>
-        )}
-        {usage?.overage > 0 && (
-          <div className="mt-4 flex items-center gap-2.5 px-3.5 py-2.5 rounded-xl bg-amber-500/10 ring-1 ring-amber-500/20">
-            <svg className="w-4 h-4 text-amber-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="10"/>
-            </svg>
-            <span className="text-xs text-amber-200">
-              {usage.overage} excedentes × ${usage.overage_cost_per_video} = <span className="font-semibold">${usage.overage_total}</span>
-            </span>
-          </div>
-        )}
-      </div>
-
-      {/* ─── En proceso ahora — only when there's live work ─────── */}
-      {processing.length > 0 && (
-        <div className="mb-10">
-          <div className="flex items-center justify-between mb-3">
-            <SectionLabel>En proceso</SectionLabel>
-            <span className="text-[10px] text-gray-500 uppercase tracking-[0.18em]">
-              {processing.length} {processing.length === 1 ? "video" : "videos"}
-            </span>
-          </div>
-          <div className="rounded-card p-2 bg-surface-2/30 ring-1 ring-white/[0.03]">
-            {processing.slice(0, 5).map((job) => (
-              <ProcessingRow key={job.job_id} job={job} onSelect={onSelectJob} t={t} />
-            ))}
-          </div>
-        </div>
-      )}
+      <NovedadHero />
+      <FormatGallery
+        user={user}
+        onSelectFormat={handleSelectFormat}
+        onUpgrade={handleUpgrade}
+      />
 
       {/* ─── Tus últimos videos — visual scan, NOT a copy of History ── */}
       {recentDone.length > 0 && (
@@ -428,11 +703,18 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           100 videos in their library never sees "Empezá tu primer
           lote" during the initial fetch. ─── */}
       {history.length === 0 && !historyLoaded && !historyError && (
-        <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
-          <div className="w-10 h-10 mx-auto mb-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
-          <p className="text-sm text-ink-secondary">
-            {t("history.loading") || "Cargando historial…"}
-          </p>
+        /* Skeleton screen — UI specialist 2026-05-24: reemplazó el spinner
+           genérico. El operador YA ve la estructura del Dashboard (6 cards
+           en grid) antes de que llegue /jobs; el swap no tiene reflow. */
+        <div>
+          <div className="mb-4">
+            <div className="h-3 w-32 rounded bg-surface-2/60 animate-pulse mb-3" />
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            {Array.from({ length: 6 }).map((_, i) => (
+              <SkeletonVideoCard key={i} />
+            ))}
+          </div>
         </div>
       )}
       {history.length === 0 && historyError && (
@@ -453,18 +735,39 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           </button>
         </div>
       )}
-      {history.length === 0 && historyLoaded && !historyError && (
+      {/* Empty state pequeño — vuelve para users veteranos con history=[].
+          Hotfix 2026-05-29: agus.cafisi (user con historial real) reportó
+          ver el hero "creá tu primer video" tras un fetch de /jobs que
+          volvió silenciosamente vacío. El hero ahora solo aparece para
+          users <14 días; para el resto con history=[] (incluyendo el caso
+          de fallo silencioso de /jobs) mostramos este card sutil que no
+          alarma con "creá tu primer video". */}
+      {isTrueEmptyState && !isFirstWeekUser && (
         <div className="rounded-card p-14 text-center bg-surface-2/30 ring-1 ring-white/[0.04]">
           <div className="w-14 h-14 mx-auto mb-5 rounded-2xl bg-brand/10 ring-1 ring-brand/20 flex items-center justify-center">
             <svg className="w-7 h-7 text-brand-light" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">
               <path d="M9 18V5l12-2v13" strokeLinecap="round" strokeLinejoin="round"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
             </svg>
           </div>
-          <h3 className="text-lg font-bold text-white mb-1.5 tracking-tight">Empezá tu primer lote</h3>
-          <p className="text-sm text-ink-secondary mb-6">Subí un audio (.mp3 o .wav). Generamos el lyric video automáticamente.</p>
-          <button onClick={onNewBatch} className="btn-primary px-6">
-            {t("nav.new_batch")}
-          </button>
+          <h3 className="text-lg font-bold text-white mb-1.5 tracking-tight">
+            {t("dash.no_recent_title") || "Nada por revisar ahora"}
+          </h3>
+          <p className="text-sm text-ink-secondary mb-6">
+            {t("dash.no_recent_sub") || "Si esperabas ver tu historial y no aparece, probá recargar la página."}
+          </p>
+          <div className="flex items-center justify-center gap-2">
+            <button onClick={onNewBatch} className="btn-primary px-6">
+              {t("nav.new_batch")}
+            </button>
+            {onRetryHistory && (
+              <button
+                onClick={onRetryHistory}
+                className="px-5 py-3 rounded-lg text-sm text-ink-secondary hover:text-white hover:bg-surface-2/60 transition-colors"
+              >
+                {t("dash.retry") || "Reintentar"}
+              </button>
+            )}
+          </div>
         </div>
       )}
     </div>
