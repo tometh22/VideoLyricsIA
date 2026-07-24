@@ -950,35 +950,22 @@ def delete_object(key: str) -> None:
             "[R2-DELETE] input key=%r called_from=%s", key, caller,
             extra={"event": "r2_input_deleted", "key": key, "caller": caller},
         )
-        # SENTRY ALERT 2026-05-27: also fire a Sentry message so the
-        # operator gets a notification (email / Slack / wherever Sentry
-        # is wired) the moment ANY input audio is deleted. Cheap signal
-        # — these deletes should be rare, and a flood here means the
-        # incident is recurring. Idempotent: if sentry_sdk isn't init
-        # or the DSN isn't set, it's a no-op.
-        #
-        # FINGERPRINT 2026-06-10: el título original incluía la key única
-        # → cada borrado creaba un issue NUEVO en el feed (6 issues por
-        # una corrida del reaper) y enterraba errores reales. Fingerprint
-        # estable por caller: UN issue por code path, contador de eventos
-        # acumulando — el spike sigue visible (que era el punto del
-        # tripwire) y la key queda en extra para la forensia.
-        try:
-            import sentry_sdk
-            with sentry_sdk.push_scope() as _scope:
-                _scope.fingerprint = ["r2-delete-input", caller]
-                _scope.set_tag("r2.caller", caller)
-                _scope.set_extra("r2.key", key)
-                sentry_sdk.capture_message(
-                    f"[R2-DELETE-INPUT] via {caller}",
-                    level="warning",
-                )
-        except Exception:
-            pass
     try:
         client.delete_object(Bucket=R2_BUCKET, Key=key)
     except Exception as exc:
         logger.error("delete_object failed for key=%r: %s", key, exc, exc_info=True)
+        # A failed delete is actionable: keep it visible in Sentry while
+        # avoiding an issue for every normal reaper cleanup.
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as _scope:
+                _scope.set_tag("event", "r2.delete_failed")
+                _scope.set_extra("r2.key", key)
+                sentry_sdk.capture_exception(exc)
+        except Exception:
+            # Observability must never turn a storage failure into a second
+            # failure or hide the original exception from the caller.
+            pass
         raise
 
 

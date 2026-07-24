@@ -40,6 +40,7 @@ export function createSaveQueue(persist, opts = {}) {
         fadeTimer: null,     // timer del "saved" → "idle"
         inflight: false,     // hay un POST normal en vuelo
         pending: false,      // se pidió un save mientras había uno en vuelo
+        waiters: [],         // flush callers waiting for the queue to drain
         status: "idle",      // idle|saving|saved|error
         reason: null,        // categoría de error o null
         listeners: new Set(),
@@ -74,17 +75,20 @@ export function createSaveQueue(persist, opts = {}) {
     const j = ensure(jobId);
     if (j.debounceTimer) { clearTimeout(j.debounceTimer); j.debounceTimer = null; }
     const segments = typeof j.provider === "function" ? j.provider() : null;
-    if (!Array.isArray(segments) || segments.length === 0) return;
+    if (!Array.isArray(segments) || segments.length === 0) {
+      return Promise.resolve({ ok: false, reason: "no-data" });
+    }
 
     // keepalive (pagehide/unload) es best-effort y NO sigue la serialización
     // ni toca el status: la página se está yendo, disparamos y listo.
     if (keepalive) {
       try { Promise.resolve(persist(jobId, segments, { keepalive: true })).catch(() => {}); }
       catch { /* best-effort */ }
-      return;
+      return Promise.resolve({ ok: true, keepalive: true });
     }
 
-    if (j.inflight) { j.pending = true; return; } // coalesce
+    const drained = new Promise((resolve) => j.waiters.push(resolve));
+    if (j.inflight) { j.pending = true; return drained; } // coalesce
 
     j.inflight = true;
     setStatus(j, "saving");
@@ -96,6 +100,7 @@ export function createSaveQueue(persist, opts = {}) {
     Promise.resolve(persist(jobId, segments, { keepalive: false }))
       .then((result) => settle(j, jobId, result))
       .catch((err) => settle(j, jobId, { ok: false, reason: "network", error: String(err) }));
+    return drained;
   }
 
   function settle(j, jobId, result) {
@@ -110,7 +115,11 @@ export function createSaveQueue(persist, opts = {}) {
     else setStatus(j, "saved", null);
     // Trailing coalescido: se pidieron más saves mientras este estaba en
     // vuelo → disparamos uno solo con los segmentos más frescos.
-    if (j.pending) { j.pending = false; run(jobId, { keepalive: false }); }
+    if (j.pending) { j.pending = false; run(jobId, { keepalive: false }); return; }
+    const waiters = j.waiters.splice(0);
+    for (const resolve of waiters) resolve(result && result.ok === false
+      ? result
+      : { ok: true });
   }
 
   return {
@@ -129,7 +138,7 @@ export function createSaveQueue(persist, opts = {}) {
       if (!jobId) return;
       const j = ensure(jobId);
       if (typeof provider === "function") j.provider = provider;
-      run(jobId, { keepalive });
+      return run(jobId, { keepalive });
     },
     getStatus(jobId) {
       const j = jobs.get(jobId);
@@ -146,6 +155,9 @@ export function createSaveQueue(persist, opts = {}) {
       if (!j) return;
       if (j.debounceTimer) clearTimeout(j.debounceTimer);
       if (j.fadeTimer) clearTimeout(j.fadeTimer);
+      for (const resolve of j.waiters.splice(0)) {
+        resolve({ ok: false, reason: "evicted" });
+      }
       jobs.delete(jobId);
     },
     // Solo para tests.

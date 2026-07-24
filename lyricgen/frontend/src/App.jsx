@@ -3983,7 +3983,6 @@ export default function App() {
             transcribeJobId={currentReview.editingJobId || currentReview.transcribeJobId || null}
             storeKey={reviewStoreKey(currentReview)}
             onPersistSegments={persistSegmentsToBackend}
-            onReanchor={reanchorSegmentsOnBackend}
             // PR E (2026-07): el viejo onEditedChange (espejo sincrónico a
             // currentReview.segments) desapareció — WizardLivePreview lee
             // ahora del segmentsStore (useJobSegmentsValue) sin pasar por

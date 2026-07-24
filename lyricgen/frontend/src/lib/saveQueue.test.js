@@ -72,6 +72,23 @@ describe("saveQueue", () => {
     expect(persist.mock.calls[1][1]).toEqual(SEG("v4"));
   });
 
+  it("flush espera al trailing más reciente y devuelve el 409 sin reintentos automáticos", async () => {
+    const d1 = deferred();
+    const persist = vi.fn()
+      .mockReturnValueOnce(d1.promise)
+      .mockResolvedValue({ ok: false, reason: "http-409", status: 409 });
+    const q = createSaveQueue(persist);
+    let segs = SEG("v1");
+    const drained = q.flush("job", { provider: () => segs });
+    segs = SEG("v2");
+    q.flush("job", { provider: () => segs });
+
+    d1.resolve({ ok: true });
+    const result = await drained;
+    expect(result).toEqual({ ok: false, reason: "http-409", status: 409 });
+    expect(persist).toHaveBeenCalledTimes(2);
+  });
+
   it("status: idle → saving → saved, y saved se desvanece a idle", async () => {
     const d = deferred();
     const persist = vi.fn().mockReturnValue(d.promise);

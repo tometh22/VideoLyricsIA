@@ -13,6 +13,7 @@ import { useJobSegments, segmentsStore } from "../state/segmentsStore";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
 import { splitWordsAtCharOffset, firstWordStart, lastWordEnd } from "../lib/splitWords";
 import useLocalStorage from "../hooks/useLocalStorage";
+import { createSaveQueue } from "../lib/saveQueue";
 
 // Font options for the live in-preview switcher. Codes match the render
 // pipeline / EditRequestPanel; css families are all loaded in index.html so
@@ -316,11 +317,7 @@ export default function LyricsEditor({
   // transcribeJobId sigan keyando el store correctamente.
   storeKey = null,
   onPersistSegments = null,
-  // Versión B, parte 2 (2026-07-15): callback del padre que hace el POST
-  // /jobs/{id}/reanchor (re-anclado CTC del timing con el texto corregido).
-  // El botón "Re-sincronizar con IA" solo se muestra si el padre lo pasa Y
-  // features.anchor_lyrics está activo (flag ANCHOR_LYRICS_ENABLED).
-  onReanchor = null,
+  saveQueue = null,
   // NOTE (PR E): el viejo `onEditedChange` (espejo sincrónico por keystroke
   // hacia App) fue eliminado — era la mitad del loop bidireccional del
   // reseed-storm. Los lectores externos (WizardLivePreview, snapshot de
@@ -469,7 +466,32 @@ export default function LyricsEditor({
   // changes. Ahora ambos autosaves actualizan saveStatus, y "error"
   // se muestra como chip rojo con botón Reintentar.
   const [saveStatus, setSaveStatus] = useState("idle"); // idle|saving|saved|error
+  const [saveErrorReason, setSaveErrorReason] = useState(null);
   const [flushCounter, setFlushCounter] = useState(0);
+  const editedRef = useRef(edited);
+  editedRef.current = edited;
+  const persistRef = useRef(onPersistSegments);
+  persistRef.current = onPersistSegments;
+  const saveQueueRef = useRef(null);
+  if (!saveQueueRef.current) {
+    saveQueueRef.current = saveQueue || createSaveQueue(
+      (jobId, value, opts) => persistRef.current?.(jobId, value, opts),
+      { categorize: (result) => {
+        if (result?.reason === "job-gone" || result?.status === 404) return "job-gone";
+        if (result?.status === 401 || result?.status === 403) return "session";
+        if (result?.status === 409) return "conflict";
+        return result?.reason || "server";
+      } },
+    );
+  }
+  const previousAutosaveJobRef = useRef(null);
+  useEffect(() => {
+    const previousJobId = previousAutosaveJobRef.current;
+    if (previousJobId && previousJobId !== transcribeJobId) {
+      saveQueueRef.current.evict(previousJobId);
+    }
+    previousAutosaveJobRef.current = transcribeJobId;
+  }, [transcribeJobId]);
   // Snapshot of the timings as first handed to us — the baseline for the
   // timeline's "Resetear timings". PR E + F2 fix: se lee del `original` del
   // store (getOriginal), que es la baseline del PRIMER seed y NUNCA se pisa
@@ -523,52 +545,37 @@ export default function LyricsEditor({
   // morían con él, y al volver el remount sembraba desde datos viejos.
   // `_pendingFlushRef` guarda el estado más fresco aún-no-persistido; el
   // effect de unmount (deps vacías, abajo) lo dispara fire-and-forget.
-  const _pendingFlushRef = useRef(null);
   useEffect(() => {
     if (disableAutosave) return undefined;
     if (!onPersistSegments || !transcribeJobId) return undefined;
     if (!Array.isArray(edited) || edited.length === 0) return undefined;
-    let cancelled = false;
-    _pendingFlushRef.current = { onPersistSegments, transcribeJobId, edited };
-    const tid = setTimeout(async () => {
-      if (cancelled) return;
-      _pendingFlushRef.current = null;
-      setSaveStatus("saving");
-      const cleaned = edited.map(({ _id, review, ...rest }) => rest);
-      try {
-        const result = await Promise.resolve(onPersistSegments(transcribeJobId, cleaned));
-        if (cancelled) return;
-        // El callback (App.jsx::persistSegmentsToBackend) retorna
-        // { ok, reason } post-fix #74. Para legacy callers (sin
-        // return value), result === undefined → tratamos como ok.
-        if (result && result.ok === false) {
-          setSaveStatus("error");
-        } else {
-          setSaveStatus("saved");
-        }
-      } catch {
-        if (!cancelled) setSaveStatus("error");
-      }
-    }, 3000);
-    return () => { cancelled = true; clearTimeout(tid); };
+    const queue = saveQueueRef.current;
+    queue.schedule(transcribeJobId, () =>
+      editedRef.current.map(({ _id, review, ...rest }) => rest));
+    return undefined;
   }, [edited, transcribeJobId, onPersistSegments, disableAutosave]);
 
-  // Flush-on-unmount: si el componente muere con un autosave pendiente
-  // (debounce sin disparar), persistimos el estado vigente igual. Fire-
-  // and-forget: no hay UI que actualizar — el objetivo es que el backend
-  // (y el remount posterior, que siembra desde currentReview) no pierdan
-  // los últimos segundos de trabajo de la operadora.
+  // Una sola fuente de status para debounce, drag, retry y navegación.
   useEffect(() => {
-    return () => {
-      const p = _pendingFlushRef.current;
-      if (!p) return;
-      _pendingFlushRef.current = null;
-      try {
-        const cleaned = p.edited.map(({ _id, review, ...rest }) => rest);
-        Promise.resolve(p.onPersistSegments(p.transcribeJobId, cleaned)).catch(() => {});
-      } catch { /* best-effort */ }
-    };
-  }, []);
+    if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
+    const unsubscribe = saveQueueRef.current.subscribe(transcribeJobId, ({ status, reason }) => {
+      setSaveStatus(status);
+      setSaveErrorReason(reason);
+    });
+    return unsubscribe;
+  }, [disableAutosave, onPersistSegments, transcribeJobId]);
+
+  // SPA navigation flushes a pending debounce; evict() is handled by App when
+  // approving, cancelling, logging out, or switching jobs.
+  useEffect(() => () => {
+    if (disableAutosave || !onPersistSegments || !transcribeJobId) return;
+    const state = saveQueueRef.current._peek(transcribeJobId);
+    if (state?.debounceTimer || state?.pending) {
+      saveQueueRef.current.flush(transcribeJobId, {
+        provider: () => editedRef.current.map(({ _id, review, ...rest }) => rest),
+      });
+    }
+  }, [disableAutosave, onPersistSegments, transcribeJobId]);
 
   // Durable flush on page unload (refresh / tab close). The beforeunload
   // handler above only WARNS via a native dialog — it does not persist. And
@@ -584,14 +591,12 @@ export default function LyricsEditor({
   useEffect(() => {
     if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
     const flushOnUnload = () => {
-      const p = _pendingFlushRef.current;
-      if (!p) return;
-      _pendingFlushRef.current = null;
       try {
-        const cleaned = p.edited.map(({ _id, review, ...rest }) => rest);
-        Promise.resolve(
-          p.onPersistSegments(p.transcribeJobId, cleaned, { keepalive: true })
-        ).catch(() => {});
+        const cleaned = editedRef.current.map(({ _id, review, ...rest }) => rest);
+        saveQueueRef.current.flush(transcribeJobId, {
+          keepalive: true,
+          provider: () => cleaned,
+        });
       } catch { /* best-effort */ }
     };
     window.addEventListener("pagehide", flushOnUnload);
@@ -609,32 +614,21 @@ export default function LyricsEditor({
   useEffect(() => {
     if (flushCounter === 0) return undefined;
     if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
-    let cancelled = false;
-    // El flush persiste el `edited` vigente ya mismo — el flush-on-unmount
-    // no tiene nada pendiente que rescatar.
-    _pendingFlushRef.current = null;
-    setSaveStatus("saving");
-    const cleaned = edited.map(({ _id, review, ...rest }) => rest);
-    Promise.resolve(onPersistSegments(transcribeJobId, cleaned))
-      .then((result) => {
-        if (cancelled) return;
-        // QA fix audit P0 #74: distinguir error en lugar de idle silencioso.
-        if (result && result.ok === false) setSaveStatus("error");
-        else setSaveStatus("saved");
-      })
-      .catch(() => { if (!cancelled) setSaveStatus("error"); });
-    return () => { cancelled = true; };
+    saveQueueRef.current.flush(transcribeJobId, {
+      provider: () => editedRef.current.map(({ _id, review, ...rest }) => rest),
+    });
+    return undefined;
     // Only react to the flush trigger — `edited` is intentionally read fresh
     // but NOT a dep (we don't want every keystroke to flush).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flushCounter]);
 
-  // Auto-clear the "Guardado ✓" chip a couple seconds after it shows.
-  useEffect(() => {
-    if (saveStatus !== "saved") return undefined;
-    const id = setTimeout(() => setSaveStatus("idle"), 2000);
-    return () => clearTimeout(id);
-  }, [saveStatus]);
+  const retrySave = useCallback(() => {
+    if (!transcribeJobId || !onPersistSegments) return;
+    saveQueueRef.current.flush(transcribeJobId, {
+      provider: () => editedRef.current.map(({ _id, review, ...rest }) => rest),
+    });
+  }, [transcribeJobId, onPersistSegments]);
 
   // PR E (2026-07): acá vivía el espejo sincrónico por keystroke
   // (onEditedChange → App.setCurrentReview). Eliminado — era la mitad del
@@ -896,56 +890,6 @@ export default function LyricsEditor({
     }));
     toast({ message: "Timings restaurados al original", tone: "info" });
   }, [pushEditHistory, toast]);
-
-  // Versión B, parte 2 — "Re-sincronizar con IA". Flujo:
-  //   1. Flush del estado local a /save-segments (el backend re-ancla lo
-  //      que hay en segments_json — sin esto, re-anclaría texto viejo si
-  //      el operador tipeó hace <3s y el autosave no corrió).
-  //   2. POST /jobs/{id}/reanchor vía el callback del padre.
-  //   3. Éxito → reemplazar `edited` con los segments re-anclados (mismo
-  //      seed que el mount; las líneas `locked` vuelven intactas del
-  //      backend) + toast "N re-sincronizadas, M para revisar".
-  //      Decline / error → toast de error, timings quedan como estaban.
-  // El snapshot pre-reanchor va al edit history, así Cmd+Z lo revierte.
-  const [reanchoring, setReanchoring] = useState(false);
-  const canReanchor = !!(onReanchor && transcribeJobId
-    && user?.features?.anchor_lyrics === true);
-  const handleReanchor = useCallback(async () => {
-    if (!onReanchor || !transcribeJobId || reanchoring) return;
-    setReanchoring(true);
-    try {
-      if (onPersistSegments) {
-        const cleaned = edited.map(({ _id, review, ...rest }) => rest);
-        await Promise.resolve(onPersistSegments(transcribeJobId, cleaned));
-      }
-      const res = await Promise.resolve(onReanchor(transcribeJobId));
-      if (res && res.ok && Array.isArray(res.segments) && res.segments.length) {
-        pushEditHistory();
-        // PR E: ids frescos vía el mismo helper que el seed inicial —
-        // consistencia con la identidad estable del store (PR D).
-        setEdited(reseedPreservingIds([], res.segments));
-        toast({
-          message: (t("editor.reanchor_done") || "{n} líneas re-sincronizadas, {m} para revisar")
-            .replace("{n}", String(res.count ?? res.segments.length))
-            .replace("{m}", String(res.review_count ?? 0)),
-          tone: "success",
-        });
-      } else {
-        toast({
-          message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
-          tone: "error",
-        });
-      }
-    } catch {
-      toast({
-        message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
-        tone: "error",
-      });
-    } finally {
-      setReanchoring(false);
-    }
-  }, [onReanchor, onPersistSegments, transcribeJobId, reanchoring, edited,
-      pushEditHistory, toast, t]);
 
   const focusSegment = useCallback((id) => {
     setFocusedSegId(id);
@@ -1912,7 +1856,7 @@ export default function LyricsEditor({
     });
   };
 
-  const handleApprove = () => {
+  const handleApprove = async () => {
     // Aviso (no bloqueo) si el último autosave falló. IMPORTANTE — contrato
     // real verificado (incidente UMG 21-jul-2026): aprobar manda los
     // segments EN PANTALLA en el cuerpo del POST (onApprove(cleaned) acá;
@@ -1938,9 +1882,22 @@ export default function LyricsEditor({
       return;
     }
     setWrapWarning(null);
+    // Ensure approval follows the freshest on-screen snapshot. A 409 here is
+    // actionable in the banner, but never blocks approval: onApprove carries
+    // the same snapshot directly into the generation/edit request.
+    if (!disableAutosave && onPersistSegments && transcribeJobId) {
+      const result = await saveQueueRef.current.flush(transcribeJobId, {
+        provider: () => editedRef.current.map(({ _id, review, ...rest }) => rest),
+      });
+      if (result?.ok === false) {
+        setSaveStatus("error");
+        setSaveErrorReason(result.reason || "server");
+      }
+    }
     setIsDirty(false);
     const cleaned = _buildCleanedSegments();
     onApprove(cleaned.map(({ _id, ...rest }) => rest));
+    if (transcribeJobId) saveQueueRef.current.evict(transcribeJobId);
   };
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
@@ -2229,14 +2186,14 @@ export default function LyricsEditor({
               No pudimos respaldar tu última edición en el servidor
             </p>
             <p className="text-[10px] text-red-300/70 mt-0.5">
-              Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en
-              pantalla. Reintentamos automáticamente; evitá cerrar la pestaña
-              hasta ver «Guardado».
+              {saveErrorReason === "conflict"
+                ? "Otra sesión guardó una versión más nueva. Reintentá para volver a guardar este borrador. «Aprobar y generar» sigue usando lo que ves en pantalla."
+                : "Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla. Reintentamos automáticamente; evitá cerrar la pestaña hasta ver «Guardado»."}
             </p>
           </div>
           <button
             type="button"
-            onClick={() => setEdited((p) => [...p])}
+            onClick={retrySave}
             className="text-[11px] text-red-200 hover:text-white bg-red-500/20 hover:bg-red-500/30 rounded-lg px-3 py-1.5 transition-colors shrink-0"
             title="Forzar reintento de guardado"
           >
@@ -2359,6 +2316,7 @@ export default function LyricsEditor({
             </button>
             <button
               onClick={() => setViewMode("timeline")}
+              aria-label="Línea de tiempo"
               title="Mejor para revisar el timing: cada línea en su posición temporal, arrastrable."
               className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "timeline" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
             >
