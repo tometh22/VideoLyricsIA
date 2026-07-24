@@ -213,6 +213,12 @@ export function createSaveQueue(persist, opts = {}) {
       if (!j) return;
       if (j.debounceTimer) clearTimeout(j.debounceTimer);
       if (j.fadeTimer) clearTimeout(j.fadeTimer);
+      // Descartar un job no debe dejar Promises de flush() pendientes para
+      // siempre cuando la aprobación, cancelación, logout o cambio de job
+      // corta el ciclo de vida del editor.
+      for (const resolve of j.waiters.splice(0)) {
+        resolve({ ok: false, reason: "evicted" });
+      }
       jobs.delete(jobId);
     },
     // Solo para tests.

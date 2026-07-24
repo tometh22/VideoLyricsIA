@@ -14,6 +14,35 @@ from database import Job, get_db
 
 _logger = logging.getLogger("genly.jobs")
 
+
+def _report_shared_input_delete_attempt(job: Job, caller: str) -> None:
+    """Record a guarded input-delete attempt without alerting on normal deletes."""
+    _logger.warning(
+        "[R2-DELETE-INPUT] skipped shared key=%r job=%s caller=%s",
+        job.input_r2_key, job.job_id, caller,
+        extra={
+            "event": "r2_input_delete_skipped_shared",
+            "key": job.input_r2_key,
+            "job_id": job.job_id,
+            "caller": caller,
+        },
+    )
+    try:
+        import sentry_sdk
+        with sentry_sdk.push_scope() as scope:
+            scope.fingerprint = ["r2-delete-input-shared", caller]
+            scope.set_tag("event", "r2.input_delete_shared")
+            scope.set_tag("r2.caller", caller)
+            scope.set_extra("r2.key", job.input_r2_key)
+            scope.set_extra("job_id", job.job_id)
+            sentry_sdk.capture_message(
+                f"[R2-DELETE-INPUT] skipped: shared reference via {caller}",
+                level="warning",
+            )
+    except Exception:
+        # A guard/alert failure must never block deletion of the DB row.
+        pass
+
 # Postgres on Railway occasionally drops idle connections in ways that
 # pool_pre_ping + TCP keepalives don't fully prevent — the drop happens
 # AFTER the pre-ping and BEFORE the actual query, a narrow race we can
@@ -416,10 +445,7 @@ def _delete_r2_objects(db: Session, job: Job) -> None:
         if not input_audio_is_shared(db, job):
             keys.append(job.input_r2_key)
         else:
-            _logger.info(
-                "Skipping R2 input delete for %s — sibling job(s) still reference %s",
-                job.job_id, job.input_r2_key,
-            )
+            _report_shared_input_delete_attempt(job, "jobs._delete_r2_objects")
     s3 = job.s3_keys or {}
     if isinstance(s3, dict):
         keys.extend(v for v in s3.values() if isinstance(v, str) and v)

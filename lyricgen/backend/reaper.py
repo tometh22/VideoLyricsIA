@@ -778,10 +778,8 @@ def _delete_abandoned_transcribed(db: Session, job: Job) -> None:
                 import storage as _storage
                 _storage.delete_object(job.input_r2_key)
             else:
-                logger.info(
-                    "reaper: keeping R2 input for %s — sibling job(s) still reference %s",
-                    job_id, job.input_r2_key,
-                )
+                from jobs import _report_shared_input_delete_attempt
+                _report_shared_input_delete_attempt(job, "reaper._delete_abandoned_transcribed")
         except Exception as e:  # pragma: no cover
             logger.debug("reaper: R2 delete failed for %s: %s", job_id, e)
     # AIProvenance has a NOT NULL FK to jobs.job_id without ON DELETE CASCADE,
@@ -823,9 +821,9 @@ def _delete_abandoned_upload(db: Session, job: Job) -> None:
                 if not input_audio_is_shared(db, job):
                     _storage.delete_object(job.input_r2_key)
                 else:
-                    logger.info(
-                        "reaper: keeping abandoned-upload input — sibling refs %s",
-                        job.input_r2_key,
+                    from jobs import _report_shared_input_delete_attempt
+                    _report_shared_input_delete_attempt(
+                        job, "reaper._delete_abandoned_upload",
                     )
             except Exception:
                 pass
