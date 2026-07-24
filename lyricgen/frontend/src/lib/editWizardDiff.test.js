@@ -10,6 +10,7 @@ import {
   computeFieldDiff,
   buildEditPayloads,
   bundleTypographyIntoFirstBucket,
+  backgroundRegenExtras,
 } from "./editWizardDiff";
 
 const baselineFixture = () => ({
@@ -353,5 +354,42 @@ describe("forceBackgroundRegen (re-roll del fondo sin cambiar texto)", () => {
     const base = baselineFixture();
     const diff = computeFieldDiff(base, { ...base });
     expect(diff.background).toBeUndefined();
+  });
+});
+
+describe("backgroundRegenExtras — paridad tarjeta 'Regenerar fondo' (#973)", () => {
+  it("SIEMPRE manda un flag de validación: default (sin elección) = force", () => {
+    // Regresión clave del review adversarial: si no se manda ningún flag, el
+    // backend fail-closea a force igual, pero mandarlo explícito hace el
+    // contrato inequívoco y matchea la tarjeta removida.
+    expect(backgroundRegenExtras({})).toEqual({ force_content_validation: true });
+    expect(backgroundRegenExtras(null)).toEqual({ force_content_validation: true });
+    expect(backgroundRegenExtras({ bgRegenValidation: true })).toEqual({
+      force_content_validation: true,
+    });
+  });
+
+  it("fondo-libre: bgRegenValidation=false → bypass_content_validation (no force)", () => {
+    const out = backgroundRegenExtras({ bgRegenValidation: false });
+    expect(out.bypass_content_validation).toBe(true);
+    expect(out.force_content_validation).toBeUndefined();
+  });
+
+  it("motor Imagen: bgRegenEngine='imagen' → background_mode='imagen'", () => {
+    expect(backgroundRegenExtras({ bgRegenEngine: "imagen" }).background_mode).toBe("imagen");
+  });
+
+  it("motor Veo (default) NO manda background_mode (backend defaultea a veo)", () => {
+    expect(backgroundRegenExtras({ bgRegenEngine: "veo" }).background_mode).toBeUndefined();
+    expect(backgroundRegenExtras({}).background_mode).toBeUndefined();
+  });
+
+  it("combina motor + fondo-libre en un solo payload", () => {
+    expect(
+      backgroundRegenExtras({ bgRegenEngine: "imagen", bgRegenValidation: false }),
+    ).toEqual({
+      background_mode: "imagen",
+      bypass_content_validation: true,
+    });
   });
 });

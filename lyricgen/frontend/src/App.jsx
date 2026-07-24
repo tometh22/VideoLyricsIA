@@ -49,7 +49,7 @@ import { translateBackendError } from "./lib/lyricsEditSubmit";
 import { segmentsStore, useJobSegmentsValue } from "./state/segmentsStore";
 import { persistSegments } from "./lib/persistSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
-import { computeFieldDiff, buildEditPayloads } from "./lib/editWizardDiff";
+import { computeFieldDiff, buildEditPayloads, backgroundRegenExtras } from "./lib/editWizardDiff";
 import { prefetchKey } from "./lib/prefetchKey";
 import { anchorLyricsForEntry } from "./lib/anchorPayload";
 import { track } from "./lib/telemetryTrack";
@@ -2977,6 +2977,15 @@ export default function App() {
         if (diff.lyrics) Object.assign(payload, diff.lyrics);
         if (diff.background) Object.assign(payload, diff.background);
         if (diff.background_library) Object.assign(payload, diff.background_library);
+        // Regen de fondo IA (Veo/Imagen + validación): paridad con la tarjeta
+        // "Regenerar fondo" que se plegó al wizard (unificación #973). Motor y
+        // política de validación son MODIFICADORES de un regen, no campos del
+        // baseline — llegan por onEditFieldChange (como forceBackgroundRegen).
+        // Sólo aplican si el edit es un regen IA (edit_type="background"; el
+        // swap de biblioteca no dispara Veo). Ver backgroundRegenExtras.
+        if (chosenType === "background") {
+          Object.assign(payload, backgroundRegenExtras(r));
+        }
         if (Array.isArray(payload.segments)) {
           payload.base_revision = Number.isInteger(saveMeta.baseRevision)
             ? saveMeta.baseRevision
