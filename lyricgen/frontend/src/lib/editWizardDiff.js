@@ -240,3 +240,31 @@ export function bundleTypographyIntoFirstBucket(payloads, _opts = {}) {
   // a lyrics-with-current-segments edit if the job is done/rejected.
   return payloads;
 }
+
+// ── background regen modifiers (Veo/Imagen + content-validation) ────────
+// Estos NO son campos del baseline sino ACCIÓN del wizard de edición: el
+// operador elige motor y política de validación como modificadores de un
+// regen de fondo IA, y llegan a `current` vía onEditFieldChange (igual que
+// forceBackgroundRegen). Se aplican SOLO cuando el edit resuelto es un regen
+// IA (edit_type="background"; el swap de biblioteca no dispara Veo/Imagen).
+//
+// Paridad con la tarjeta "Regenerar fondo" que se plegó al wizard
+// (unificación #973): esa tarjeta SIEMPRE mandaba exactamente uno de
+// bypass/force_content_validation — si no se manda ninguno, el backend
+// fail-closea a force y se pierde fondo-libre (cuentas no-UMG).
+//
+//   - bgRegenEngine === "imagen"  → background_mode:"imagen" (foto animada
+//     barata, sin riesgo de caras). "veo"/undefined = default, no se manda.
+//   - bgRegenValidation === false → bypass_content_validation (fondo-libre,
+//     sólo no-UMG). Cualquier otra cosa (incl. undefined) → force (validar).
+export function backgroundRegenExtras(current) {
+  const c = current || {};
+  const out = {};
+  if (c.bgRegenEngine === "imagen") out.background_mode = "imagen";
+  if (c.bgRegenValidation === false) {
+    out.bypass_content_validation = true;
+  } else {
+    out.force_content_validation = true;
+  }
+  return out;
+}

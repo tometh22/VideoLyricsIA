@@ -5,6 +5,7 @@ import { UploadTour } from "./OnboardingTour";
 import WizardLivePreview from "./WizardLivePreview";
 import TitleCardPreview, { AUTO_INTRO_THRESHOLD_S } from "./TitleCardPreview";
 import HelpTip from "./HelpCenter/HelpTip";
+import ContentValidationToggle from "./ContentValidationToggle";
 import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
 import { CONCEPT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
@@ -442,6 +443,25 @@ export default function UploadZone({
     const next = !regenRequested;
     setRegenRequested(next);
     onEditFieldChange?.("forceBackgroundRegen", next);
+  };
+  // Modificadores del regen de fondo IA — paridad con la tarjeta "Regenerar
+  // fondo" que se plegó al wizard (unificación #973). Como forceBackgroundRegen,
+  // son ACCIÓN (no sticky default): se propagan a currentReview vía
+  // onEditFieldChange y App los inyecta en el payload sólo si el edit es un
+  // regen IA (edit_type="background").
+  //   - regenEngine: "veo" (default, cinemático ~US$0.90) | "imagen" (foto
+  //     animada ~US$0.03, sin riesgo de caras humanas).
+  //   - regenValidation: true = validar (default); false = fondo-libre (bypass,
+  //     sólo cuentas no-UMG; el toggle esconde el bypass para UMG).
+  const [regenEngine, setRegenEngine] = useState("veo");
+  const chooseRegenEngine = (m) => {
+    setRegenEngine(m);
+    onEditFieldChange?.("bgRegenEngine", m);
+  };
+  const [regenValidation, setRegenValidation] = useState(true);
+  const setRegenValidationChoice = (v) => {
+    setRegenValidation(v);
+    onEditFieldChange?.("bgRegenValidation", v);
   };
 
   // ── Scene MODE (Studio Console redesign) ────────────────────────────────
@@ -1734,6 +1754,44 @@ export default function UploadZone({
               >
                 {regenRequested ? (t("upload.regen_bg_on") || "Se regenerará ✓") : (t("upload.regen_bg_cta") || "Regenerar")}
               </button>
+            </div>
+          )}
+          {/* Modificadores del regen de fondo IA (unificación #973): motor
+              Veo/Imagen + política de validación. Paridad con la tarjeta
+              "Regenerar fondo" removida. Sólo en edición. */}
+          {editMode && (
+            <div className="mb-3 space-y-2">
+              <div>
+                <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-1.5">
+                  {t("upload.regen_engine_label") || "Motor del fondo"}
+                </p>
+                <div className="rounded-xl bg-surface-2/40 ring-1 ring-white/[0.05] p-1 flex gap-1">
+                  {[
+                    { id: "veo", label: t("edit.bg_mode_veo") || "Video cinematográfico", hint: t("edit.bg_mode_veo_hint") || "~15 min · cámaras y motion" },
+                    { id: "imagen", label: t("edit.bg_mode_imagen") || "Foto animada", hint: t("edit.bg_mode_imagen_hint") || "~30s · zoom suave" },
+                  ].map((m) => (
+                    <button
+                      key={m.id}
+                      type="button"
+                      onClick={() => chooseRegenEngine(m.id)}
+                      className={`flex-1 px-3 py-2 rounded-lg text-label transition-colors flex flex-col items-center gap-0.5 ${
+                        regenEngine === m.id
+                          ? "bg-brand/20 text-brand-light ring-1 ring-brand/30"
+                          : "text-gray-400 hover:text-white hover:bg-white/[0.04]"
+                      }`}
+                    >
+                      <span>{m.label}</span>
+                      <span className="text-[9px] opacity-70">{m.hint}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <ContentValidationToggle
+                value={regenValidation}
+                onChange={setRegenValidationChoice}
+                tenantId={user?.tenant_id}
+                billingGroup={user?.billing_group}
+              />
             </div>
           )}
           <p className="text-[10px] text-gray-600 mt-0.5 mb-2">
