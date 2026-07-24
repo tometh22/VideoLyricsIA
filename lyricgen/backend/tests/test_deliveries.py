@@ -237,3 +237,72 @@ def test_status_endpoint_includes_is_in_umg_portal(
     )
     after = client.get(f"/status/{approved_job.job_id}", headers=auth(admin_token)).json()
     assert after.get("is_in_umg_portal") is True
+
+
+def test_deliveries_routed_to_external_db(
+    client, admin_token, approved_job, all_r2_files_present, db, tmp_path, monkeypatch,
+):
+    """Cross-env: cuando get_deliveries_db apunta a otra DB (simula staging
+    publicando en el portal de prod), la fila Delivery se escribe en esa DB
+    EXTERNA —no en la local—, con added_by_user_id mapeado a un admin de esa
+    DB. El Job se lee de la local; is_in_umg_portal lee de la externa."""
+    import main
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from database import Base, Delivery, User, get_deliveries_db
+
+    ext_engine = create_engine(
+        f"sqlite:///{tmp_path}/external.db",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=ext_engine)
+    ExtSession = sessionmaker(bind=ext_engine, autoflush=False, expire_on_commit=False)
+
+    # "Admin de prod" en la DB externa; las escrituras de deliveries mapean a él.
+    ext = ExtSession()
+    ext_admin = User(username="prod_admin_ext", hashed_password="x", role="admin")
+    ext.add(ext_admin)
+    ext.commit()
+    ext_admin_id = ext_admin.id
+    ext.close()
+
+    def _override_ddb():
+        s = ExtSession()
+        try:
+            yield s
+        finally:
+            s.close()
+
+    main.app.dependency_overrides[get_deliveries_db] = _override_ddb
+    monkeypatch.setattr(main, "deliveries_added_by", lambda _local_id: ext_admin_id)
+    try:
+        res = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token), json={},
+        )
+        assert res.status_code == 200, res.text
+
+        # La fila vive en la DB EXTERNA, con el added_by mapeado (no el local).
+        ext = ExtSession()
+        rows = ext.query(Delivery).filter(Delivery.job_id == approved_job.job_id).all()
+        assert len(rows) == 1
+        assert rows[0].added_by_user_id == ext_admin_id
+        ext.close()
+
+        # ...y NO en la DB local.
+        local_count = db.query(Delivery).filter(Delivery.job_id == approved_job.job_id).count()
+        assert local_count == 0
+
+        # is_in_umg_portal lo lee de la externa (job aprobado → sí consulta).
+        st = client.get(f"/status/{approved_job.job_id}", headers=auth(admin_token)).json()
+        assert st.get("is_in_umg_portal") is True
+
+        # El listado del portal (también ruteado a la externa) lo muestra.
+        items = client.get(
+            "/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN}
+        ).json()
+        assert any(s["artist"] == "Test Artist" for s in items["songs"])
+    finally:
+        main.app.dependency_overrides.pop(get_deliveries_db, None)
+        Base.metadata.drop_all(bind=ext_engine)
+        ext_engine.dispose()
