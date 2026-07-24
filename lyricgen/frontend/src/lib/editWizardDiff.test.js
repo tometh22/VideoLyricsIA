@@ -27,6 +27,9 @@ const baselineFixture = () => ({
   bgVerbatim: false,
   backgroundMode: "",
   movementStyle: "",
+  genre: "rock",
+  concept: "ciudad",
+  matchLyrics: true,
   segments: [
     { start: 0, end: 2, text: "Línea uno" },
     { start: 2, end: 4, text: "Línea dos" },
@@ -165,22 +168,39 @@ describe("computeFieldDiff", () => {
     });
   });
 
-  it("does NOT emit genre/concept/matchLyrics — locked in editMode, not wired to /edit", () => {
-    // Structural scene axes are LOCKED in edit mode (2026-07-24): they aren't
-    // in the submit whitelist nor inspected here, and a background regen keeps
-    // the PERSISTED values (pipeline reads them from render_params). This test
-    // pins that decision — an accidental half-wire (adding a genre/concept
-    // branch here without seeding the snapshot+baseline) would resurrect the
-    // BUG-2/3-class silent drop and must fail CI instead.
+  it("background bucket: genre change (scene axis, editable in edit mode)", () => {
+    const base = baselineFixture();
+    const cur = { ...base, genre: "pop" };
+    expect(computeFieldDiff(base, cur)).toEqual({ background: { genre: "pop" } });
+  });
+
+  it("background bucket: concept change", () => {
+    const base = baselineFixture();
+    const cur = { ...base, concept: "naturaleza" };
+    expect(computeFieldDiff(base, cur)).toEqual({ background: { concept: "naturaleza" } });
+  });
+
+  it("background bucket: match_lyrics change (Auto/Inspirado) travels as boolean", () => {
+    const base = baselineFixture(); // matchLyrics: true
+    const cur = { ...base, matchLyrics: false };
+    expect(computeFieldDiff(base, cur)).toEqual({ background: { match_lyrics: false } });
+  });
+
+  it("genre/concept/match_lyrics UNCHANGED do not diff (baseline seeded from persisted → no clobber)", () => {
+    // The clobber guard: baseline and current are both seeded from the job's
+    // render_params, so an untouched scene axis must NEVER spuriously fire a
+    // regen. An unrelated edit (only a lyrics fix) must not carry genre/concept.
     const base = baselineFixture();
     const cur = {
       ...base,
-      genre: "rock",
-      concept: "ciudad",
-      matchLyrics: false,
-      inspiredByLyrics: true,
+      segments: [
+        { start: 0, end: 2, text: "Línea uno corregida" },
+        { start: 2, end: 4, text: "Línea dos" },
+      ],
     };
-    expect(computeFieldDiff(base, cur)).toEqual({});
+    const diff = computeFieldDiff(base, cur);
+    expect(diff.background).toBeUndefined();
+    expect(diff.lyrics).toBeDefined();
   });
 
   it("multiple buckets: metadata + typography + lyrics + background all changed", () => {

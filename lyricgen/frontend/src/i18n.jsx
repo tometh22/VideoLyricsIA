@@ -405,8 +405,7 @@ export const translations = {
     "upload.regen_bg_cta": "Generar otra versión",
     "upload.regen_bg_on": "Se generará ✓",
     "upload.bg_advanced": "Opciones avanzadas",
-    "upload.genre_concept_locked": "El género y el concepto se fijan al crear el video.",
-    "upload.scene_mode_locked": "El modo de escena se fija al crear el video.",
+
     "upload.scene_meta_desc": "Género ajusta la paleta y la atmósfera · Concepto define el tipo de escena (ciudad, naturaleza, abstracto…).",
     "upload.scene_meta_prompt_note": "Tu prompt define la escena — género y concepto quedan como ayuda secundaria.",
     "upload.genre_help": "El estilo musical. Ajusta paleta, iluminación y atmósfera del fondo.",
@@ -3535,8 +3534,7 @@ export const translations = {
     "upload.regen_bg_cta": "Generate another version",
     "upload.regen_bg_on": "Will generate ✓",
     "upload.bg_advanced": "Advanced options",
-    "upload.genre_concept_locked": "Genre and concept are set when the video is created.",
-    "upload.scene_mode_locked": "The scene mode is set when the video is created.",
+
     "upload.settings_custom_note": "You use a background uploaded by you — the movement and scene are defined by your file.",
     "upload.settings_library_note": "You use a Library background — the movement and scene are defined by that clip.",
     "upload.song_title_short": "Title",
@@ -5313,8 +5311,7 @@ export const translations = {
     "upload.regen_bg_cta": "Gerar outra versão",
     "upload.regen_bg_on": "Vai gerar ✓",
     "upload.bg_advanced": "Opções avançadas",
-    "upload.genre_concept_locked": "O gênero e o conceito são definidos ao criar o vídeo.",
-    "upload.scene_mode_locked": "O modo de cena é definido ao criar o vídeo.",
+
     "upload.settings_custom_note": "Você usa um plano de fundo enviado por você – o movimento e a cena são definidos pelo seu arquivo.",
     "upload.settings_library_note": "Você usa um plano de fundo da Biblioteca — o movimento e a cena são definidos por esse clipe.",
     "upload.song_title_short": "Título",

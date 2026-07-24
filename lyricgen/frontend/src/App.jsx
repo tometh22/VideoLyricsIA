@@ -933,6 +933,11 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         lyricColor: pickSnapOr("lyricColor", params.lyric_color || "#FFFFFF"),
         lyricSungColor: pickSnapOr("lyricSungColor", params.lyric_sung_color || "#FFFFFF"),
         movementStyle: pickSnapOr("movementStyle", params.movement_style || ""),
+        // Ejes de escena editables en edición. matchLyrics: default true cuando
+        // el render_params no lo trae (paridad con el backend match_lyrics=True).
+        genre: pickSnapOr("genre", params.genre || ""),
+        concept: pickSnapOr("concept", params.concept || ""),
+        matchLyrics: snapR?.matchLyrics != null ? !!snapR.matchLyrics : (params.match_lyrics !== false),
         effect: pickSnapOr("effect", params.effect || ""),
         backgroundHint: pickSnapOr("backgroundHint", params.background_hint || ""),
         bgVerbatim: snapR?.bgVerbatim != null ? !!snapR.bgVerbatim : !!params.bg_verbatim,
@@ -963,6 +968,9 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         lyricColor: params.lyric_color || "#FFFFFF",
         lyricSungColor: params.lyric_sung_color || "#FFFFFF",
         movementStyle: params.movement_style || "",
+        genre: params.genre || "",
+        concept: params.concept || "",
+        matchLyrics: params.match_lyrics !== false,
         effect: params.effect || "",
         backgroundHint: params.background_hint || "",
         bgVerbatim: !!params.bg_verbatim,
@@ -2888,6 +2896,13 @@ export default function App() {
           bgVerbatim: r.bgVerbatim,
           backgroundMode: r.backgroundMode,
           movementStyle: r.movementStyle,
+          // Ejes de escena editables en edición (cableados 2026-07-24). Llegan a
+          // r.* vía onEditFieldChange (genre/concept por updateBatchDefault;
+          // matchLyrics por selectSceneMode). baseline los siembra del mismo
+          // render_params → un valor sin tocar no difea.
+          genre: r.genre,
+          concept: r.concept,
+          matchLyrics: r.matchLyrics,
           segments: editedSegments,
           // Pick de biblioteca en edit mode (PR #940 backend): la grilla
           // del paso de fondo YA escribía backgroundId en App, pero el
@@ -4198,6 +4213,17 @@ export default function App() {
         onEditFieldChange={(field, value) =>
           setCurrentReview((r) => (r ? { ...r, [field]: value } : r))
         }
+        // Semilla de los controles de escena en edición (género/concepto/prompt
+        // + modo) con los valores persistidos del job. Keyed en el job id dentro
+        // de UploadZone → corre una vez por job, no pisa ediciones en curso.
+        editSeed={currentReview?.editMode ? {
+          jobId: currentReview.editingJobId,
+          genre: currentReview.genre,
+          concept: currentReview.concept,
+          backgroundHint: currentReview.backgroundHint,
+          bgVerbatim: currentReview.bgVerbatim,
+          matchLyrics: currentReview.matchLyrics,
+        } : null}
         // UI v1.1 (2026-05-30): feed the central title-card preview with the
         // currently-active artist/song. In edit mode the canonical source is
         // currentReview (the operator can edit them in the banner inputs
