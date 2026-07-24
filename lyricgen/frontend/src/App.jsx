@@ -2896,6 +2896,12 @@ export default function App() {
           // "IA Auto" lo anula (null → sin bucket → mantener fondo).
           editBackgroundId:
             (bgSelectMode === "library" && backgroundId) ? backgroundId : null,
+          // "Regenerar fondo (nueva versión)": acción explícita del wizard en
+          // edición para forzar un re-render del fondo con el MISMO hint (nueva
+          // tirada de Veo/Imagen) aunque no se haya cambiado ningún campo — sin
+          // esto el operador que solo quería "otra versión del fondo" recibía
+          // "No cambiaste nada". Es una intención, no un campo del baseline.
+          forceBackgroundRegen: !!r.forceBackgroundRegen,
         };
 
         const diff = computeFieldDiff(r.baseline, current);

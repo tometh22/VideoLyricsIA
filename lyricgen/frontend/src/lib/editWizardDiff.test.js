@@ -330,3 +330,28 @@ describe("computeFieldDiff — background_library", () => {
     expect(diff.background_library).toBeUndefined();
   });
 });
+
+describe("forceBackgroundRegen (re-roll del fondo sin cambiar texto)", () => {
+  it("fuerza un bucket background vacío cuando no cambió ningún campo", () => {
+    const base = baselineFixture();
+    const current = { ...base, forceBackgroundRegen: true };
+    const diff = computeFieldDiff(base, current);
+    expect(diff.background).toEqual({});
+    const payloads = buildEditPayloads(diff);
+    expect(payloads).toContainEqual({ edit_type: "background" });
+  });
+
+  it("NO aplica si el operador eligió un asset de biblioteca (eso supersede)", () => {
+    const base = baselineFixture();
+    const current = { ...base, forceBackgroundRegen: true, editBackgroundId: 42 };
+    const diff = computeFieldDiff(base, current);
+    expect(diff.background).toBeUndefined();
+    expect(diff.background_library).toEqual({ background_id: 42 });
+  });
+
+  it("sin la intención, un job sin cambios NO produce bucket background", () => {
+    const base = baselineFixture();
+    const diff = computeFieldDiff(base, { ...base });
+    expect(diff.background).toBeUndefined();
+  });
+});
