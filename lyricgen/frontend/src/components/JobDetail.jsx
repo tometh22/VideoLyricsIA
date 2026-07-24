@@ -604,25 +604,17 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   );
   const isEditFailureWithPriorVideo =
     isError && (job.edit_count || 0) > 0 && hasPriorDeliverable;
-  // Lyrics edit is allowed on done/pending_review/rejected per backend
-  // validation (main.py:/edit). The panel renders for ANY of those
-  // statuses with allowedModes scoped per state:
-  //   - pending_review → all three (operator is reviewing, full toolkit)
-  //   - done           → lyrics only (video already accepted, only typo
-  //                                    corrections warrant re-render)
-  //   - rejected       → lyrics only (recovery path instead of re-upload)
+  // Editar = una sola vía: el wizard. El panel muestra UN botón "Editar y
+  // re-renderizar" que abre el Studio Console (/videos/:id/edit-lyrics),
+  // donde el operador cambia lo que sea — título, artista, letra,
+  // tipografía, timing y también el FONDO (regen IA vía "Regenerar fondo
+  // (nueva versión)" o swap de biblioteca). La tarjeta separada "Regenerar
+  // fondo" se plegó al wizard (unificación 2026-07-24): dos entradas para
+  // lo mismo confundían y dejaban el fondo "trabado" fuera del wizard.
+  // Disponible en done/pending_review/rejected (el backend valida el /edit).
   // Art track = "official audio" sin letra: no hay letra que editar.
   const isArtTrack = !!(job.art_track ?? job.render_params?.art_track);
   const canEditLyrics = (isPendingReview || isDone || isRejected) && !isArtTrack;
-  // Jobs multi-escena: el modo "Fondo" queda afuera del panel — ese edit
-  // pertenece al mundo fondo-único (regenera UN clip y pisaba el timeline
-  // de escenas; incidente 2026-07-01). Para escenas, la regeneración va
-  // por el filmstrip (por escena, sin consumir cupo). El backend además
-  // lo rechaza con 400 por si llega igual.
-  const _hasScenes = !!(job.scene_plan && job.scene_plan.scenes && job.scene_plan.scenes.length);
-  const editPanelAllowedModes = isPendingReview
-    ? (_hasScenes ? ["lyrics"] : ["lyrics", "background"])
-    : ["lyrics"];
 
   // A detail deep-link owns local state, so the root history poller cannot
   // advance it. Poll every active state and stop at the first terminal or
@@ -1868,11 +1860,8 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       {canEditLyrics && (
         <EditRequestPanel
           job={job}
-          onEditTriggered={handleEditTriggered}
-          allowedModes={editPanelAllowedModes}
-          // El click "Editar lyrics" abre el Studio Console en su ruta
-          // dedicada (mismo layout 3-col que /new) en vez del modal
-          // fullscreen interno. El background mode del panel queda intacto.
+          // Única acción: abrir el Studio Console (mismo layout 3-col que
+          // /new). Todo el editing —incluido el fondo— vive ahí ahora.
           onLyricsClick={() => navigate(`/videos/${job.job_id}/edit-lyrics`)}
         />
       )}
