@@ -283,3 +283,72 @@ def test_transcode_falls_back_to_legacy_when_dims_mismatch(fake_outputs, monkeyp
     assert "scale=3840:2160" in vf
     assert "fps=60" in vf
     assert "-r" in argv  # legacy pins explicit timebase
+
+
+# ───────────────────────────────────────────────────
+# Race: parallel prewarm of umg_master + umg_short
+# ───────────────────────────────────────────────────
+
+
+def test_parallel_prewarm_does_not_overwrite_other_key(fake_outputs, monkeypatch):
+    """Reproduces the prod bug fixed 2026-05-12 / hardened 2026-05-25:
+    two prewarm_prores invocations en paralelo (umg_master + umg_short).
+
+    Histórico (2026-05-12): el read-modify-write usaba get_job_model + un
+    second update_job en otra tx. La fix original solo re-leía la DB
+    antes de merge — pero la race window persistía entre tx A (read) y
+    tx B (write con setattr). Si los 2 workers re-leían entre los writes
+    de los otros, el second write pisaba.
+
+    Hardening (2026-05-25, audit U1): jobs.merge_s3_keys() hace SELECT
+    FOR UPDATE + read + write en UNA sola tx. Postgres serializa el
+    second writer en el lock — no hay race window posible.
+
+    Este test verifica el NUEVO contrato: que ensure_prores_exists llame
+    a merge_s3_keys con los args correctos. La atomicidad de la helper
+    en sí está cubierta por el row-lock de Postgres (out of unit-test
+    scope; tested via integration en staging).
+    """
+    import storage
+    import jobs as jobs_module
+
+    job_id = "racejob"
+    _seed_source_mp4(fake_outputs, job_id, "lyric_video.mp4")
+
+    stale_job = {"umg_spec": {"frame_size": "HD", "fps": 24.0, "prores_profile": 3},
+                 "s3_keys": {}}
+
+    # Capture llamadas a merge_s3_keys — el nuevo path atomic.
+    merge_calls: list[tuple[str, str, str]] = []
+
+    def fake_merge_s3_keys(jid, ftype, key):
+        merge_calls.append((jid, ftype, key))
+        return True
+
+    monkeypatch.setattr(jobs_module, "merge_s3_keys", fake_merge_s3_keys)
+    monkeypatch.setattr(
+        storage, "upload_master",
+        lambda *_a, **_k: "tenant/racejob/umg_master.mov",
+    )
+    monkeypatch.setattr(storage, "is_enabled", lambda: True)
+
+    def fake_transcode(src, dst, spec):
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "wb") as f:
+            f.write(b"fake-prores")
+
+    import pipeline as _pipeline
+    monkeypatch.setattr(_pipeline, "_transcode_to_prores", fake_transcode)
+
+    prores.ensure_prores_exists(job_id, "umg_master", stale_job, tenant_id="tenant")
+
+    # Contrato nuevo: ensure_prores_exists llama merge_s3_keys con
+    # (job_id, file_type, key). El merge atómico interno (SELECT FOR
+    # UPDATE) garantiza no-pisa al sibling — eso lo cubre el row lock
+    # de Postgres, no este test.
+    assert len(merge_calls) == 1, (
+        f"merge_s3_keys should be called exactly once; got {merge_calls}"
+    )
+    assert merge_calls[0] == (job_id, "umg_master", "tenant/racejob/umg_master.mov"), (
+        f"merge_s3_keys called with wrong args: {merge_calls[0]}"
+    )

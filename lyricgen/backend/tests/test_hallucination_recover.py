@@ -14,10 +14,13 @@ from unittest.mock import patch, MagicMock
 
 from pipeline import (
     _align_whisper_to_plain,
+    _collapse_consecutive_duplicates,
     _detect_hallucination,
     _fetch_lrclib,
     _fill_gaps_with_reference,
+    _filter_whisper_hallucinations,
     _has_fuzzy_intra_loop,
+    _is_whisper_hallucination,
     _synthesize_segments_from_plain,
 )
 
@@ -118,6 +121,41 @@ def test_detect_implausible_long_segment_returns_true():
     is_hall, reason = _detect_hallucination(segments, audio_duration=240.0)
     assert is_hall is True
     assert "implausible" in reason or "fuzzy" in reason or "low count" in reason
+
+
+def test_detect_sparse_mega_segment_returns_true():
+    # Incident "El Arbol": Whisper mapped the whole song to ONE 346 s segment
+    # reading "Música de presentación" (3 words) instead of transcribing.
+    # Called per-segment with audio_duration=None (as _fill_gaps_with_reference
+    # does), so Signal 1 is OFF; only 3 words so Signal 2 (>40 words) is OFF.
+    # The sparse-and-long signal must catch it: 3 words / 346 s = 0.009 w/s.
+    seg = _seg(0.0, 346.0, "Música de presentación")
+    is_hall, reason = _detect_hallucination([seg], audio_duration=None)
+    assert is_hall is True
+    assert "sparse" in reason
+
+
+def test_detect_sparse_signal_does_not_flag_normal_slow_line():
+    # A legitimately slow sung line — 30 distinct words over 60 s = 0.5 w/s,
+    # the documented floor for slow speech — must NOT trip the sparse signal.
+    # Distinct words avoid the fuzzy-loop signal; audio_duration=None isolates
+    # the per-segment signals (no count check).
+    distinct = ("uno dos tres cuatro cinco seis siete ocho nueve diez once "
+                "doce trece catorce quince dieciseis diecisiete dieciocho "
+                "diecinueve veinte sol luna mar cielo flor noche dia viento "
+                "fuego agua")
+    assert len(distinct.split()) == 30
+    seg = _seg(0.0, 60.0, distinct)
+    is_hall, _ = _detect_hallucination([seg], audio_duration=None)
+    assert is_hall is False
+
+
+def test_detect_short_sparse_segment_not_flagged():
+    # The sparse signal only applies to LONG segments (> 30 s). A short
+    # 2-word line held 8 s (0.25 w/s) is normal phrasing, not a bail-out.
+    seg = _seg(0.0, 8.0, "hola amigo")
+    is_hall, _ = _detect_hallucination([seg], audio_duration=None)
+    assert is_hall is False
 
 
 def test_detect_synonym_intra_loop_returns_true():
@@ -560,6 +598,183 @@ def test_fill_gaps_clamps_start_to_audio_duration():
     # interleave (in this shape they don't, but assert the invariant).
     starts = [s["start"] for s in out]
     assert starts == sorted(starts)
+
+
+# ─── _collapse_consecutive_duplicates ─────────────────────────────────────
+# Bug B1 from the 2026-05-18 audit (agus.cafisi / Una Vez Más — Viejas
+# Locas): the original code collapsed ALL consecutive duplicate-text
+# segments into a single span, which was correct for Whisper's "¡Karol!"
+# hallucination loops (174 false repetitions) but destroyed legitimate
+# chorus repetitions ("Una vez más, una vez más, una vez más..." in the
+# outro fadeout). The fix needs to keep both: detect the hallucination
+# pattern (very many reps and/or very short text) and collapse, but
+# leave a normal chorus pattern (a handful of repetitions of a normal-
+# length line) untouched so the operator sees N entries in the editor.
+
+def test_collapse_preserves_legitimate_chorus_repetitions():
+    """A chorus that repeats 4 times in the outro must remain 4 segments
+    so the renderer shows the line appearing 4 times — once per audio
+    repetition — rather than one long subtitle pinned to the screen
+    while the singer chants. The Una Vez Más outro is the canonical
+    case: 'una vez más' (11 chars) × 4 repetitions at ~2s spacing."""
+    segs = [
+        {"start": 180.0, "end": 182.0, "text": "una vez más"},
+        {"start": 182.5, "end": 184.5, "text": "una vez más"},
+        {"start": 185.0, "end": 187.0, "text": "una vez más"},
+        {"start": 187.5, "end": 189.5, "text": "una vez más"},
+    ]
+    out = _collapse_consecutive_duplicates(segs)
+    assert len(out) == 4, (
+        f"chorus repetitions must stay separate, got {len(out)} segments"
+    )
+    # Timestamps preserved exactly.
+    assert [(s["start"], s["end"]) for s in out] == [
+        (180.0, 182.0), (182.5, 184.5), (185.0, 187.0), (187.5, 189.5),
+    ]
+
+
+def test_collapse_kills_karol_hallucination_loop():
+    """Whisper's known failure mode: an instrumental passage triggers
+    the model to emit the same short word 100+ times in a row. The
+    'Karol G — Si Antes Te Hubiera Conocido' case (2026-04) had 174
+    consecutive '¡Karol!' segments where the actual audio was the
+    audience chanting that name. Output must collapse to a single
+    span covering the whole chant window — letting 174 micro-segments
+    through breaks the renderer's per-line transitions."""
+    segs = [
+        {"start": 60 + i * 0.1, "end": 60 + i * 0.1 + 0.3, "text": "¡Karol!"}
+        for i in range(12)
+    ]
+    out = _collapse_consecutive_duplicates(segs)
+    assert len(out) == 1, (
+        f"Karol hallucination must collapse to 1 segment, got {len(out)}"
+    )
+    # End of the merged span covers the entire streak (last seg's end).
+    assert out[0]["start"] == segs[0]["start"]
+    assert out[0]["end"] == segs[-1]["end"]
+
+
+def test_collapse_leaves_non_duplicate_segments_untouched():
+    """Sanity: distinct text segments shouldn't merge regardless of
+    length or proximity."""
+    segs = [
+        {"start": 0.0, "end": 2.0, "text": "primera línea"},
+        {"start": 2.5, "end": 4.5, "text": "segunda línea"},
+        {"start": 5.0, "end": 7.0, "text": "tercera línea"},
+    ]
+    out = _collapse_consecutive_duplicates(segs)
+    assert len(out) == 3
+    assert [s["text"] for s in out] == ["primera línea", "segunda línea", "tercera línea"]
+
+
+def test_collapse_handles_mixed_chorus_and_hallucination():
+    """A normal chorus burst (2 repetitions of a long line) followed
+    later by a hallucination burst (12 repetitions of a short word)
+    should leave the chorus intact AND collapse the hallucination."""
+    segs = [
+        {"start": 10.0, "end": 12.0, "text": "esto es el estribillo"},
+        {"start": 12.5, "end": 14.5, "text": "esto es el estribillo"},
+        {"start": 30.0, "end": 32.0, "text": "verso distinto"},
+    ] + [
+        {"start": 60 + i * 0.1, "end": 60 + i * 0.1 + 0.2, "text": "no"}
+        for i in range(15)
+    ]
+    out = _collapse_consecutive_duplicates(segs)
+    # Chorus kept as 2, verse kept as 1, hallucination collapsed to 1.
+    assert len(out) == 4, [s["text"] for s in out]
+    assert [s["text"] for s in out[:3]] == [
+        "esto es el estribillo", "esto es el estribillo", "verso distinto",
+    ]
+    assert out[3]["text"] == "no"
+
+
+def test_collapse_normalizes_text_when_comparing():
+    """Whisper sometimes emits the same line with different
+    capitalisation or stray whitespace across consecutive segments
+    (Karol G captures had a real example: '¡KAROL!' alternating with
+    '¡Karol!'). The collapse / preservation heuristic must compare
+    normalised text so it doesn't accidentally keep a hallucination
+    just because Whisper varied the case."""
+    segs = [
+        {"start": 60 + i * 0.1, "end": 60 + i * 0.1 + 0.3,
+         "text": "¡Karol!" if i % 2 == 0 else "¡KAROL!  "}
+        for i in range(12)
+    ]
+    out = _collapse_consecutive_duplicates(segs)
+    assert len(out) == 1
+
+
+# ----- _is_whisper_hallucination (Amara.org credits) ----------------------
+#
+# Regression: "Lamento Boliviano — Enanitos Verdes" (2026-06-01). Whisper
+# transcribed the training-data credit WITHOUT the dot ("…comunidad de
+# Amara org") during the instrumental outro at 3:41, and the old literal
+# "amara.org" needles never matched, so the line reached the operator's
+# editor and the rendered video. Matching must be punctuation-insensitive.
+
+def test_amara_credit_with_dot_is_hallucination():
+    assert _is_whisper_hallucination(
+        "Subtítulos realizados por la comunidad de Amara.org")
+
+
+def test_amara_credit_without_dot_is_hallucination():
+    # The exact Lamento Boliviano regression text.
+    assert _is_whisper_hallucination(
+        "Subtítulos realizados por la comunidad de Amara org")
+
+
+def test_amara_credit_with_dot_space_is_hallucination():
+    assert _is_whisper_hallucination(
+        "Subtítulos realizados por la comunidad de Amara. org")
+
+
+def test_amara_credit_truncated_is_hallucination():
+    # Whisper sometimes drops the site name entirely.
+    assert _is_whisper_hallucination(
+        "Subtítulos realizados por la comunidad")
+
+
+def test_amara_credit_english_variants_are_hallucinations():
+    assert _is_whisper_hallucination("Subtitled by the Amara.org community")
+    assert _is_whisper_hallucination("Subtitled by the Amara org community")
+    assert _is_whisper_hallucination("Visit www.amara.org")
+
+
+def test_real_lyrics_with_amara_verb_not_flagged():
+    # "amara" is a real Spanish word (subjunctive of amar) — bare "amara"
+    # must never be a needle, only "amara org".
+    assert not _is_whisper_hallucination("Si ella me amara otra vez")
+    assert not _is_whisper_hallucination("Como si nadie nunca amara así")
+
+
+def test_real_lyrics_with_word_music_not_flagged():
+    # Folding "[music]" → "music" would flag every lyric containing the
+    # word; the bracket patterns must stay literal.
+    assert not _is_whisper_hallucination("I love music and dancing all night")
+    assert not _is_whisper_hallucination("La música suena fuerte")
+
+
+def test_bracket_music_tags_are_hallucinations():
+    assert _is_whisper_hallucination("[music]")
+    assert _is_whisper_hallucination("[ Music ]")
+    assert _is_whisper_hallucination("♪ music ♪")
+
+
+def test_filter_drops_amara_segment_keeps_lyrics():
+    """End-to-end through _filter_whisper_hallucinations: the outro credit
+    segment is dropped, the real lyrics keep their timing."""
+    segs = [
+        _seg(213.5, 215.0, "Y yo te amaré"),
+        _seg(216.5, 219.0, "Que los viajantes se van a atrasar"),
+        _seg(221.6, 222.0,
+             "Subtítulos realizados por la comunidad de Amara org"),
+    ]
+    out, dropped = _filter_whisper_hallucinations(segs)
+    assert dropped == 1
+    assert [s["text"] for s in out] == [
+        "Y yo te amaré",
+        "Que los viajantes se van a atrasar",
+    ]
 
 
 def test_fetch_lrclib_strips_complex_lrc_timestamps():
