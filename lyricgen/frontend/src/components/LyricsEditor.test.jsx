@@ -165,6 +165,52 @@ describe("LyricsEditor — scrub bar click reliability (2026-05-26)", () => {
   });
 });
 
+describe("LyricsEditor — recuperación de audio remoto post-mount", () => {
+  it("habilita el reproductor cuando la URL firmada llega después del primer render", () => {
+    const props = baseProps({ audioUrl: null });
+    const { container, rerender } = render(<LyricsEditor {...props} />);
+
+    expect(container.querySelector("audio")).toBeNull();
+    expect(screen.getByText(/Audio no disponible para reproducir/i)).toBeInTheDocument();
+
+    const signedUrl = "https://media.example.test/source.wav?signature=fresh";
+    rerender(<LyricsEditor {...props} audioUrl={signedUrl} />);
+
+    expect(screen.queryByText(/Audio no disponible para reproducir/i)).toBeNull();
+    expect(container.querySelector("audio")).toHaveAttribute("src", signedUrl);
+    expect(screen.getByRole("button", { name: "Reproducir" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Buscar" })).toBeInTheDocument();
+  });
+
+  it("mantiene el blob válido como fallback durante el upgrade a la URL firmada", () => {
+    const createObjectUrlSpy = vi
+      .spyOn(URL, "createObjectURL")
+      .mockReturnValue("blob:http://localhost/upload");
+    const revokeObjectUrlSpy = vi
+      .spyOn(URL, "revokeObjectURL")
+      .mockImplementation(() => {});
+    const audioFile = new File(["audio"], "song.wav", { type: "audio/wav" });
+    const props = baseProps({ audioFile, audioUrl: null });
+    const { container, rerender, unmount } = render(<LyricsEditor {...props} />);
+
+    expect(createObjectUrlSpy).toHaveBeenCalledWith(audioFile);
+    expect(container.querySelector("audio")).toHaveAttribute(
+      "src",
+      "blob:http://localhost/upload",
+    );
+
+    const signedUrl = "https://media.example.test/source.wav?signature=fresh";
+    rerender(<LyricsEditor {...props} audioUrl={signedUrl} />);
+
+    expect(container.querySelector("audio")).toHaveAttribute("src", signedUrl);
+    expect(revokeObjectUrlSpy).not.toHaveBeenCalled();
+
+    unmount();
+    expect(revokeObjectUrlSpy).toHaveBeenCalledOnce();
+    expect(revokeObjectUrlSpy).toHaveBeenCalledWith("blob:http://localhost/upload");
+  });
+});
+
 
 describe("LyricsEditor — reemplazo externo post-mount (ex prop-sync B7)", () => {
   // HISTORIA: B7 (2026-05-18) era "el prop `segments` cambió → re-seed".
