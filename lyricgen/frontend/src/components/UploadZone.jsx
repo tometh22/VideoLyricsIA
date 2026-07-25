@@ -3776,7 +3776,18 @@ export default function UploadZone({
 
               {/* Lyric text color — color picker(s). El segundo solo aplica a
                   karaoke (color de la palabra cantada). Para none/pop/glow/
-                  word_reveal alcanza con un solo color para todo el texto. */}
+                  word_reveal alcanza con un solo color para todo el texto.
+
+                  OCULTO en edición y variante (2026-07-25): `lyric_color` /
+                  `lyric_sung_color` NO existen en computeFieldDiff, ni en
+                  EditJobRequest, ni en _VARIANT_OVERRIDABLE_FIELDS — el valor
+                  no sale del browser. Era un control editable-e-ignorado, y el
+                  principio del #977 prohíbe exactamente eso. Además pintaba el
+                  sticky de localStorage, así que mentía dos veces. Sigue
+                  disponible en la CREACIÓN, donde /generate sí lo acepta.
+                  Para cablearlo hacen falta 3 cambios (diff + EditJobRequest +
+                  _VARIANT_OVERRIDABLE_FIELDS); /retry ya lo hereda. */}
+              {!editMode && (
               <div className="mt-4 pt-3 border-t border-white/[0.05]">
                 <p className="text-[11px] text-gray-300 font-medium">{t("upload.lyric_color_title") || "Color del texto"}</p>
                 <p className="text-[10px] text-gray-600 mt-0.5 mb-2">
@@ -3816,6 +3827,7 @@ export default function UploadZone({
                   )}
                 </div>
               </div>
+              )}
 
               {/* Transición entre líneas — eje aparte, compone con la animación */}
               <div className="mt-4 pt-3 border-t border-white/[0.05]">

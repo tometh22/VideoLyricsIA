@@ -813,7 +813,20 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
 // dentro del Studio Console en vez de un modal separado con UX distinta.
 // Pasos 1, 2, 3, 5 quedan lockeados desde App (vía currentReview.
 // editingJobId) y el preview central muestra el MP4 ya renderizado.
-function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) {
+function EditLyricsRoute({
+  setCurrentReview,
+  setWizardStage,
+  // bgSelectMode/backgroundId son state de la RAÍZ de App: sobreviven a las
+  // navegaciones dentro de la SPA y se restauran del snapshot. Sin resetearlos
+  // al entrar a editar, un `backgroundId` viejo de un batch anterior con el tab
+  // en "Biblioteca" convierte la edición en un swap de asset —
+  // editWizardDiff hace `delete out.background` — y BORRA todos los cambios de
+  // fondo IA que el operador acaba de hacer. VariantWizardRoute ya lo reseteaba.
+  setBgSelectMode,
+  setBackgroundId,
+  wizardScreen,
+  t,
+}) {
   const { id } = useParams();
   const navigate = useNavigate();
   // status: "loading" | "ready" | "no_segments" | "not_editable" |
@@ -929,6 +942,13 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
       // fondo degradados a edición de letra en silencio).
       const snapR = reusableSnap ? snap.currentReview : null;
       const { initialFields, baseline } = buildEditReview(job, snapR);
+
+      // Reset del pick de fondo residual: sin esto un `backgroundId` viejo con
+      // el tab en "Biblioteca" (state de la raíz de App, sobrevive a la
+      // navegación) convierte esta edición en un swap de asset y borra los
+      // cambios de fondo IA. Mismo reset que VariantWizardRoute ya hacía.
+      setBgSelectMode?.("auto");
+      setBackgroundId?.(null);
 
       // Mount the editor NOW with audio/waveform/bg as null. The LyricsEditor
       // handles these as optional — timeline renders without waveform fill,
@@ -4994,6 +5014,8 @@ export default function App() {
             <EditLyricsRoute
               setCurrentReview={setCurrentReview}
               setWizardStage={setWizardStage}
+              setBgSelectMode={setBgSelectMode}
+              setBackgroundId={setBackgroundId}
               wizardScreen={wizardScreen}
               t={t}
             />

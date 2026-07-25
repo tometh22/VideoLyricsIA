@@ -16,6 +16,7 @@
 
 import { computeFieldDiff } from "./editWizardDiff.js";
 import { normalizeSegmentsForEdit } from "./lyricsEditSubmit.js";
+import { normalizeMovementCode } from "./catalogCodes.js";
 
 // Prioridad de edit_type: el más complejo de los presentes gana.
 // background_library (swap curado, $0, sin slot) supersede al regen IA;
@@ -66,7 +67,11 @@ export function buildEditReview(job, snapReview = null) {
     lineTransition: pickSnapOr("lineTransition", params.line_transition || "none"),
     lyricColor: pickSnapOr("lyricColor", params.lyric_color || "#FFFFFF"),
     lyricSungColor: pickSnapOr("lyricSungColor", params.lyric_sung_color || "#FFFFFF"),
-    movementStyle: pickSnapOr("movementStyle", params.movement_style || ""),
+    // Normalizado en LOS DOS lados (acá y en baseline): el backend persiste el
+    // valor crudo, así que un job con "dinamico"/"static"/"fija" no matchearía
+    // ninguna tarjeta del catálogo. Normalizar sólo un lado produciría un diff
+    // espurio ("dinamico" vs "estandar") = un render Veo pago que no cambia nada.
+    movementStyle: normalizeMovementCode(pickSnapOr("movementStyle", params.movement_style || "")),
     // Ejes de escena editables en edición. matchLyrics: default true cuando
     // el render_params no lo trae (paridad con el backend match_lyrics=True).
     genre: pickSnapOr("genre", params.genre || ""),
@@ -100,7 +105,7 @@ export function buildEditReview(job, snapReview = null) {
     lineTransition: params.line_transition || "none",
     lyricColor: params.lyric_color || "#FFFFFF",
     lyricSungColor: params.lyric_sung_color || "#FFFFFF",
-    movementStyle: params.movement_style || "",
+    movementStyle: normalizeMovementCode(params.movement_style || ""),
     genre: params.genre || "",
     concept: params.concept || "",
     matchLyrics: params.match_lyrics !== false,
