@@ -47,16 +47,20 @@ export const EFFECT_LABELS = (t) => ({
  * El test tampoco lo vio porque codificaba los mismos códigos inventados.
  */
 export const AXIS_VALUE_LABELS = (t) => ({
+  // Localizados: el picker del wizard los tiene hardcodeados en español
+  // (const TEXT_CASE_OPTS / FRAME_FORMAT_OPTS, fuera del componente y sin
+  // acceso a `t`), pero la ficha sí puede traducirlos — un operador en en/pt
+  // no tiene por qué leer "todo en minúsculas".
   text_case: {
-    upper: "Todo en MAYÚSCULAS",
-    title: "Primera letra de Cada Palabra",
-    lower: "todo en minúsculas",
-    sentence: "Primera letra de cada Línea",
-    original: "Sin cambios",
+    upper: t("detail.case_upper") || "Todo en MAYÚSCULAS",
+    title: t("detail.case_title") || "Primera letra de Cada Palabra",
+    lower: t("detail.case_lower") || "todo en minúsculas",
+    sentence: t("detail.case_sentence") || "Primera letra de cada línea",
+    original: t("detail.case_original") || "Sin cambios",
   },
   frame_format: {
-    full: "Pantalla completa (16:9)",
-    cine: "Cine — franjas (2.39:1)",
+    full: t("detail.frame_full") || "Pantalla completa (16:9)",
+    cine: t("detail.frame_cine") || "Cine — franjas (2.39:1)",
   },
   text_contrast: {
     subtle: t("upload.contrast_subtle") || "Suave",

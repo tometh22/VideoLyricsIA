@@ -51,10 +51,17 @@ const BACKGROUND_TYPES = ["background", "background_library"];
 export function buildEditReview(job, snapReview = null) {
   const params = (job && job.render_params) || {};
   const snapR = snapReview || null;
+  // `!= null` a secas: el `!== ""` que había acá trataba la cadena vacía como
+  // "no seteado", así que un campo que el operador VACIÓ a propósito volvía al
+  // valor del job al refrescar. Vaciar es una intención tan válida como
+  // escribir — y desde #982/#997 "sacar el prompt" es una acción de primera
+  // clase, así que el caso pasó de raro a rutinario: borrás el prompt,
+  // refrescás antes de aprobar, y el wizard reabre en modo "Mi prompt" con el
+  // texto viejo puesto. Lo mismo pasaba con effect, movimiento→Auto,
+  // font→Auto y titleSongBreak.
+  // `undefined`/`null` siguen cayendo al valor del job: eso sí es "no seteado".
   const pickSnapOr = (snapKey, fallback) =>
-    (snapR && snapR[snapKey] != null && snapR[snapKey] !== "")
-      ? snapR[snapKey]
-      : fallback;
+    (snapR && snapR[snapKey] != null) ? snapR[snapKey] : fallback;
 
   const initialFields = {
     artist: pickSnapOr("artist", job.artist || ""),

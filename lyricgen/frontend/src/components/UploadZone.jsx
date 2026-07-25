@@ -563,7 +563,10 @@ export default function UploadZone({
     if (!editMode || !editBaseline) return false;
     return String(editBaseline[field] ?? "") === String(code ?? "");
   };
-  const AnchorChip = () => (
+  // Elemento, no COMPONENTE: declarar un componente dentro del cuerpo de
+  // render crea un tipo nuevo en cada pasada, así que React desmontaba y
+  // remontaba el chip en cada hover de las 12 tarjetas de las galerías.
+  const anchorChip = (
     <span
       className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wide bg-amber-500/20 text-amber-300 ring-1 ring-amber-500/40 backdrop-blur-sm"
       title={t("upload.anchor_in_video_hint") || "Es lo que este video tiene ahora"}
@@ -1796,7 +1799,7 @@ export default function UploadZone({
                       <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
                     </div>
                   )}
-                  {inVideo && <AnchorChip />}
+                  {inVideo && anchorChip}
                 </div>
                 <div className="px-2.5 py-2 bg-surface-1">
                   <p className={`text-[12px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>
@@ -1870,6 +1873,14 @@ export default function UploadZone({
           {EFFECTS.map((e) => {
             const active = (batchDefaults.effect || "") === e.code;
             const inVideo = isAnchor("effect", e.code);
+            // Con Foto fija, "Sin efecto" deja de ser un default neutro: es la
+            // decisión de que el fondo quede quieto. El texto ACCESIBLE tiene
+            // que decir lo mismo que el visible — antes el aria-label seguía
+            // diciendo "Ninguno: fondo limpio, sin efecto", o sea que un lector
+            // de pantalla recibía justo el encuadre que este bloque corrige.
+            const _stillNote = (!e.code && batchDefaults.movementStyle === "foto-parallax")
+              ? (t("upload.effect_none_still") || "Sin efecto — imagen quieta")
+              : null;
             return (
               <button
                 key={e.code || "none"}
@@ -1880,8 +1891,8 @@ export default function UploadZone({
                 aria-pressed={active}
                 data-effect={e.code || "none"}
                 data-in-video={inVideo ? "true" : undefined}
-                aria-label={`${e.label}: ${e.desc}${inVideo ? ` — ${ANCHOR_LABEL}` : ""}`}
-                title={e.desc}
+                aria-label={`${_stillNote ? _stillNote : `${e.label}: ${e.desc}`}${inVideo ? ` — ${ANCHOR_LABEL}` : ""}`}
+                title={_stillNote || e.desc}
                 className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
                   active
                     ? "border-transparent ring-1 ring-brand/50 shadow-glow"
@@ -1901,15 +1912,13 @@ export default function UploadZone({
                       <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
                     </div>
                   )}
-                  {inVideo && <AnchorChip />}
+                  {inVideo && anchorChip}
                 </div>
                 <div className="px-2 py-1.5 bg-surface-1">
                   {/* Con Foto fija, "Sin efecto" deja de ser un default neutro:
                       es la decisión de que el fondo quede quieto. Que lo diga. */}
                   <p className={`text-label leading-tight ${active ? "text-white" : "text-gray-200"}`}>
-                    {(!e.code && batchDefaults.movementStyle === "foto-parallax")
-                      ? (t("upload.effect_none_still") || "Sin efecto — imagen quieta")
-                      : e.label}
+                    {_stillNote || e.label}
                   </p>
                 </div>
               </button>
@@ -3657,7 +3666,16 @@ export default function UploadZone({
                       </p>
                       <textarea
                         value={batchDefaults.backgroundHint || ""}
-                        onChange={(e) => updateBatchDefault("backgroundHint", e.target.value.slice(0, 2000))}
+                        onChange={(e) => {
+                          const v = e.target.value.slice(0, 2000);
+                          updateBatchDefault("backgroundHint", v);
+                          // Sincronizar el "guardado" con lo que el operador
+                          // escribe. Sin esto, borrar el texto A MANO dejaba el
+                          // savedPrompt viejo intacto, y al cambiar de tarjeta
+                          // la app le ofrecía de vuelta el prompt que acababa de
+                          // borrar — el opuesto exacto del bug que arreglamos.
+                          setSavedPrompt(v.trim());
+                        }}
                         rows={3}
                         maxLength={2000}
                         placeholder={t("upload.bg_prompt_placeholder") || "Ej: mansión surreal de noche, pileta vacía, cámara fija, sólo se mueve el reflejo del agua…"}

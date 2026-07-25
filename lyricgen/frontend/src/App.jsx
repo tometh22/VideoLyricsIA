@@ -3277,6 +3277,21 @@ export default function App() {
         // aplicar y `dropped` los que la degradación por status descarta. Antes
         // se reportaba `presentBuckets` entero DESPUÉS de degradar, así que un
         // cambio de fondo descartado igual figuraba como enviado.
+        // `payload` es nullable por contrato: resolveEditSubmission devuelve
+        // null si, tras descartar buckets por status/escenas, no queda ningún
+        // edit_type válido. Hoy ese camino es inalcanzable (todo bucket que el
+        // diff emite está en EDIT_TYPE_PRIORITY), pero sin guard sería un
+        // TypeError con el botón muerto y sin aviso. El refactor introdujo el
+        // contrato nullable; se respeta acá en vez de asumir.
+        if (!submission.payload) {
+          alert({
+            title: t("edit.no_changes_title") || "No cambiaste nada",
+            description: t("edit.no_changes_subtitle") ||
+              "No detectamos diferencias contra el video actual. Modificá algún campo y volvé a intentar.",
+            tone: "warning",
+          });
+          return;
+        }
         track("edit.submitted", {
           job_id: editedJobId,
           fields: Object.keys(submission.willApply),
