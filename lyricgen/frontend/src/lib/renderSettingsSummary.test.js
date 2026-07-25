@@ -15,12 +15,19 @@ import {
   buildSettingsSummary,
   describeSceneSource,
 } from "./renderSettingsSummary.js";
+// Los resolvers salen del catálogo REAL, no de una copia en el test: una copia
+// a mano es exactamente lo que dejó pasar los códigos inventados de contraste
+// (`low`/`high`, que no existen — son `subtle`/`strong`), con el test en verde.
+import { AXIS_VALUE_LABELS, dynamicAxisLabel } from "./optionLabels.js";
 
 const deps = {
   t: (_k, fb) => fb,
   movementLabel: (c) => ({ animado: "Animado (ilustración)", estatico: "Estático (cámara fija)" }[c]),
   effectLabel: (c) => ({ snow: "Nieve", rain: "Lluvia" }[c]),
   fontLabel: (c) => ({ "poppins-bold": "Poppins Bold", anton: "Anton" }[c]),
+  valueLabel: (axisKey, code) =>
+    AXIS_VALUE_LABELS((_k, fb) => fb)[axisKey]?.[String(code).trim().toLowerCase()]
+    || dynamicAxisLabel((k) => k, axisKey, code),
 };
 
 const flat = (groups) => groups.flatMap((g) => g.chips.map((c) => `${c.label}: ${c.value}`));
@@ -136,5 +143,56 @@ describe("el catálogo de ejes no se desincroniza del backend", () => {
   it("no hay ejes duplicados entre grupos", () => {
     const keys = SETTINGS_GROUPS.flatMap((g) => g.axes.map((a) => a.key));
     expect(new Set(keys).size).toBe(keys.length);
+  });
+});
+
+describe("no se le muestran códigos internos ni defaults al operador", () => {
+  // Forma REAL de un render_params de staging (job 5faa4b3f810b, el del
+  // reclamo). La primera versión de esta ficha mostraba con estos datos
+  // `Formato: full` (un default, en inglés) y `Mayúsculas: lower` (código
+  // interno) — encontrado corriendo la ficha contra la DB, no con un fixture.
+  const REAL = {
+    font: "poppins-bold", genre: "rock", style: "auto", effect: "",
+    concept: "", font_scale: 1.15, text_case: "lower", frame_format: "full",
+    match_lyrics: true, movement_style: "animado", title_size: 1.0,
+    line_transition: "none", lyrics_animation: "none", title_template: "auto",
+    background_hint: "", bg_verbatim: true,
+  };
+
+  it("los defaults por eje no generan chips", () => {
+    const keys = buildSettingsSummary(REAL, deps).flatMap((g) => g.chips.map((c) => c.key));
+    expect(keys).not.toContain("frame_format");   // "full" es el default
+    expect(keys).not.toContain("text_contrast");  // "medium" es el default
+    expect(keys).not.toContain("title_size");     // 1.0 es el default
+  });
+
+  it("pero un valor NO default sí se muestra, con etiqueta legible", () => {
+    const chips = flat(buildSettingsSummary(REAL, deps));
+    expect(chips).toContain("Mayúsculas: todo en minúsculas");
+    expect(chips.join(" ")).not.toMatch(/\blower\b|\bfull\b|\bmedium\b/);
+  });
+
+  it("cine SÍ se muestra (no es el default)", () => {
+    const chips = flat(buildSettingsSummary({ ...REAL, frame_format: "cine" }, deps));
+    expect(chips).toContain("Formato: Cine — franjas (2.39:1)");
+  });
+
+  it("todos los ejes enum tienen etiqueta para todos sus códigos", () => {
+    const cases = {
+      text_case: ["upper", "title", "lower", "sentence", "original"],
+      frame_format: ["full", "cine"],
+      text_contrast: ["subtle", "medium", "strong"],
+      lyrics_animation: ["none", "karaoke", "word_reveal", "pop", "glow"],
+      line_transition: ["none", "slide_up", "slide_side", "wipe", "dissolve_blur"],
+      title_template: ["auto", "centered", "lower_third", "badge"],
+    };
+    for (const [key, codes] of Object.entries(cases)) {
+      for (const code of codes) {
+        const chips = buildSettingsSummary({ [key]: code }, deps).flatMap((g) => g.chips);
+        const chip = chips.find((c) => c.key === key);
+        if (!chip) continue;  // default u "empty": omitido a propósito
+        expect(chip.value, `${key}=${code} muestra el código crudo`).not.toBe(code);
+      }
+    }
   });
 });

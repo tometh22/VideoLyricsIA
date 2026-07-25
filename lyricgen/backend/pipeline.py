@@ -9656,6 +9656,20 @@ def _estimate_shift(prev, cur, window) -> tuple[float, float]:
     """
     import numpy as _np
 
+    # Guard de patch UNIFORME. Sin esto la función devuelve el desplazamiento
+    # MÁXIMO posible en vez de cero: con varianza nula el cross-power queda todo
+    # en cero, `argmax` sobre un array plano cae en el índice 0 —la esquina—
+    # y tras el fftshift el origen es el CENTRO, así que un frame negro contra
+    # sí mismo reportaba (-w/2, -h/2) = 57% del ancho.
+    # No es un caso de laboratorio: un clip que abre desde negro deja el frame
+    # de referencia uniforme (y entonces TODA la serie es degenerada), y una
+    # banda de letterbox o un cielo plano dejan uniformes 2 de las 4 franjas de
+    # borde, sesgando la mediana. Justo los clips oscuros que más se querían
+    # medir. Fail-safe hacia "no se movió": esta métrica sólo debe acusar
+    # movimiento que puede demostrar.
+    if prev.std() == 0 or cur.std() == 0:
+        return 0.0, 0.0
+
     a = (prev - prev.mean()) * window
     b = (cur - cur.mean()) * window
     fa = _np.fft.fft2(a)
@@ -9664,6 +9678,10 @@ def _estimate_shift(prev, cur, window) -> tuple[float, float]:
     mag = _np.abs(cross)
     mag[mag == 0] = 1.0
     corr = _np.fft.fftshift(_np.fft.ifft2(cross / mag).real)
+    # Correlación plana (ventaneo que anula todo, patch casi uniforme): mismo
+    # razonamiento que arriba — sin pico no hay evidencia de desplazamiento.
+    if not _np.isfinite(corr).all() or corr.max() == corr.min():
+        return 0.0, 0.0
     h, w = prev.shape
     iy, ix = _np.unravel_index(_np.argmax(corr), corr.shape)
 
@@ -9679,7 +9697,7 @@ def _estimate_shift(prev, cur, window) -> tuple[float, float]:
     return float(dx), float(dy)
 
 
-def _measure_camera_drift(video_path: str, samples: int = 12) -> dict | None:
+def _measure_camera_drift(video_path: str, samples: int = 30) -> dict | None:
     """Mide cuánto se MOVIÓ LA CÁMARA en un clip, como % del ancho del frame.
 
     Para qué: medición propia sobre los fondos `movement_style=estatico` de
@@ -9728,6 +9746,14 @@ def _measure_camera_drift(video_path: str, samples: int = 12) -> dict | None:
         # fps bajo + escala chica: alcanza para traslación global y deja el costo
         # en decenas de ms. Mismo patrón de extracción que
         # _bg_scene_discontinuity (ffmpeg subprocess, no moviepy).
+        #
+        # `samples` tiene que cubrir el clip ENTERO: los clips de Veo son de 8s
+        # y a 3 fps eso son 24 frames. Con el tope en 12 se medían sólo los
+        # primeros 4s, así que un paneo lento reportaba la mitad de su
+        # excursión y uno que ocurría en la segunda mitad reportaba ~0 — sobre
+        # una métrica cuyo contrato es "excursión acumulada máxima" del clip.
+        # 30 deja margen si algún día el clip es más largo; ffmpeg emite menos
+        # frames si el clip es más corto y el guard de abajo lo cubre.
         run_checked(
             ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path,
              "-vf", "fps=3,scale=320:180", "-frames:v", str(samples), pattern],
@@ -11207,10 +11233,16 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                     # quiere correlacionar: veo-3.1-fast tiene un drift prior
                     # más fuerte que el standard, y VEO_MODEL_STATIC (hoy sin
                     # setear) es la mitigación a evaluar con estos datos.
+                    # `attempt` va en la línea porque este bloque corre DENTRO
+                    # del loop de reintentos: si hay un re-roll por calidad o
+                    # por corte de escena, se mide también el clip descartado.
+                    # Sin el índice, el dataset mezcla clips entregados con
+                    # clips que nunca llegaron al operador — y este PR existe
+                    # justamente para medir la tasa real de los entregados.
                     logger.info(
-                        "[BG][DRIFT] job=%s movement=estatico model=%s "
+                        "[BG][DRIFT] job=%s attempt=%s movement=estatico model=%s "
                         "drift_pct=%.2f drift_pct_borders=%.2f peak_px=%.1f frames=%s",
-                        job_id,
+                        job_id, attempt,
                         (os.environ.get("VEO_MODEL_STATIC", "").strip()
                          or os.environ.get("VEO_MODEL", "veo-3.1-fast-generate-001").strip()),
                         _drift["pct_width"], _drift["pct_width_borders"],
