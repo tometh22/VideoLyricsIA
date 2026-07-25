@@ -2098,8 +2098,33 @@ export default function LyricsEditor({
       });
       return;
     }
-    const saveResult = await flushPendingSave();
-    if (saveResult?.ok === false && saveResult.reason === "stale-revision") return;
+    let saveResult = await flushPendingSave();
+    // Stale-revision (409): el backup del servidor quedó adelante de nuestra
+    // base_revision (un autosave previo la subió, otra pestaña, o el reaper).
+    // ANTES esto hacía `return` en silencio → el operador clickeaba "Aprobar
+    // y generar" una y otra vez sin que pasara NADA hasta que el polling de
+    // fondo re-sincronizaba la revisión (reporte UMG 2026-07-24: "tuve que
+    // clickearlo muchas veces"). El botón no está deshabilitado, así que el
+    // no-op silencioso se lee como "no anda".
+    //
+    // Al aprobar, los segments EN PANTALLA son la fuente de verdad (ver el
+    // contrato de render arriba: onApprove manda `cleaned`, no el backup), así
+    // que un conflicto del backup NO debe bloquear. Auto-resolvemos una vez
+    // re-leyendo la revisión fresca del servidor (mismo path que el botón
+    // "Resolver conflicto") y seguimos. Si aún así falla, avisamos con un
+    // toast en vez de morir en silencio.
+    if (saveResult?.ok === false && saveResult.reason === "stale-revision") {
+      saveResult = await flushPendingSave({ resolveConflict: true }, true);
+      if (saveResult?.ok === false) {
+        toast({
+          message:
+            t("editor.approve_conflict") ||
+            "No pudimos sincronizar los cambios con el servidor. Reintentá en unos segundos.",
+          tone: "error",
+        });
+        return;
+      }
+    }
     setIsDirty(false);
     onApprove(cleaned.map(({ _id, ...rest }) => rest), {
       baseRevision: Number.isInteger(saveResult?.revision)
