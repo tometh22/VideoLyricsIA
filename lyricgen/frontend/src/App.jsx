@@ -1017,6 +1017,8 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         filename: job.filename || job.artist || "lyrics",
         file: null,
         audioUrl: null,           // populated by Phase B
+        audioLoading: true,       // Phase B en vuelo → el editor muestra
+                                  // "Cargando audio…" en vez de "no disponible"
         waveform: null,           // populated by Phase B
         bgUrl: null,              // populated by Phase B
         ...initialFields,
@@ -1079,7 +1081,18 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         // Exhausted: leave the field unset; text editing still works and the
         // operator can reopen the editor to retry the audio fetch.
       };
-      enhanceField(`${API}/jobs/${id}/source-audio-url`, "audioUrl", (d) => d?.url || null, { retries: 3 });
+      // El audio es esencial para el timing: mientras su fetch está en vuelo
+      // el editor muestra "Cargando audio…". Al resolver (éxito O reintentos
+      // agotados) bajamos audioLoading para que, si de verdad no hay audio,
+      // recién ahí aparezca "Audio no disponible".
+      enhanceField(`${API}/jobs/${id}/source-audio-url`, "audioUrl", (d) => d?.url || null, { retries: 3 })
+        .finally(() => {
+          if (!alive) return;
+          setCurrentReview((prev) => {
+            if (!prev || prev.editingJobId !== id) return prev;
+            return { ...prev, audioLoading: false };
+          });
+        });
       enhanceField(`${API}/jobs/${id}/waveform`, "waveform", (d) => d);
       enhanceField(`${API}/jobs/${id}/background-url`, "bgUrl", (d) => d?.url || null);
     })();
@@ -4840,6 +4853,7 @@ export default function App() {
             filename={currentReview.file?.name || currentReview.filename || ""}
             audioFile={currentReview.file}
             audioUrl={currentReview.audioUrl || null}
+            audioLoading={!!currentReview.audioLoading}
             referenceLyrics={currentReview.referenceLyrics || ""}
             coverageWarning={currentReview.coverageWarning}
             recoverySource={currentReview.recoverySource}
