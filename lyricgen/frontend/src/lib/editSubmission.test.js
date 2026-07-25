@@ -28,6 +28,7 @@ import {
   EDIT_TYPE_PRIORITY,
 } from "./editSubmission.js";
 import { computeFieldDiff } from "./editWizardDiff.js";
+import { MOVEMENT_CODES } from "./catalogCodes.js";
 
 /** Job "completo": todos los ejes en valores NO-default, para que cualquier
  *  campo que se pierda en el viaje job → baseline/current aparezca como diff. */
@@ -309,5 +310,56 @@ describe("frameFormat: sembrado del job, no fabricado", () => {
 
   it("un job sin frame_format cae a full", () => {
     expect(buildEditReview(JOB_BARE, null).baseline.frameFormat).toBe("full");
+  });
+});
+
+describe("movement_style: el backend lo persiste CRUDO, el wizard lo normaliza", () => {
+  // Sin normalizar, un job con "dinamico" no resalta NINGUNA tarjeta (ningún
+  // m.code matchea) y "corregirlo" a Cinematográfico emite un diff
+  // semánticamente idéntico → un render Veo pago que no cambia nada.
+  const withMovement = (raw) => ({
+    ...JOB_BARE,
+    render_params: { ...JOB_BARE.render_params, movement_style: raw },
+  });
+
+  it.each([
+    ["dinamico", "estandar"],
+    ["dinámico", "estandar"],
+    ["dynamic", "estandar"],
+    ["static", "estatico"],
+    ["fija", "estatico"],
+    ["locked", "estatico"],
+    ["camara-fija", "estatico"],
+    ["Estática", "estatico"],   // case-insensitive, como el backend
+    // Fidelidad al backend: _normalize_movement_style aliasea "estatica" y
+    // "estática" (femenino) pero NO "estático" (masculino con acento) — sólo
+    // matchea "estatico" sin acento por ser clave del catálogo. El espejo
+    // reproduce ese hueco a propósito: divergir acá haría que el wizard
+    // resalte una tarjeta que el render no va a respetar.
+    ["estático", ""],
+    ["subtle", "sutil"],
+    ["parallax", "foto-parallax"],
+    ["animated", "animado"],
+    ["estatico", "estatico"],
+    ["", ""],
+    ["cualquier-cosa", ""],
+  ])("%s → %s en initialFields Y en baseline", (raw, expected) => {
+    const { initialFields, baseline } = buildEditReview(withMovement(raw), null);
+    expect(initialFields.movementStyle).toBe(expected);
+    expect(baseline.movementStyle).toBe(expected);
+  });
+
+  it("un alias no produce diff espurio (los dos lados normalizados)", () => {
+    const job = withMovement("dinamico");
+    const { baseline } = buildEditReview(job, null);
+    expect(computeFieldDiff(baseline, currentFrom(job))).toEqual({});
+  });
+
+  it("todo código normalizado es un código del catálogo o vacío", () => {
+    for (const raw of ["dinamico", "static", "parallax", "animated", "basura"]) {
+      const { baseline } = buildEditReview(withMovement(raw), null);
+      const code = baseline.movementStyle;
+      expect(code === "" || MOVEMENT_CODES.includes(code)).toBe(true);
+    }
   });
 });

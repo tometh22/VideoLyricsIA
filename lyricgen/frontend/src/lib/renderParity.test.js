@@ -22,7 +22,7 @@ import {
   fadeSeconds,
   lyricFontPx,
 } from "./lyricTiers";
-import { CONCEPT_CODES, MOVEMENT_CODES } from "./catalogCodes";
+import { CONCEPT_CODES, MOVEMENT_CODES, normalizeMovementCode } from "./catalogCodes";
 import { FONT_BY_CODE } from "../components/fontCatalog";
 
 describe("render parity: font sizes", () => {
@@ -84,5 +84,34 @@ describe("render parity: option catalogs (dropdown promises = worker delivery)",
 
   it("movement codes match pipeline._MOVEMENT_STYLE_RULES keys", () => {
     expect([...MOVEMENT_CODES].sort()).toEqual(fixture.catalogs.movements);
+  });
+});
+
+describe("render parity: normalización de movement_style", () => {
+  // `movement_style` viaja como TEXTO LIBRE y se persiste CRUDO en
+  // render_params: el que normaliza es el pipeline, al renderizar. El wizard
+  // necesita el mismo mapeo para saber qué tarjeta resaltar al sembrar un job.
+  // Si el espejo divergiera, el wizard marcaría una opción que el render no va
+  // a respetar — o ninguna, que es lo que pasaba con "dinamico".
+  //
+  // Evalúa la función REAL del frontend sobre la tabla generada desde
+  // _normalize_movement_style, igual que el resto de este archivo. Si falla:
+  // o divergió el espejo (catalogCodes.js) o el backend cambió y el fixture
+  // está viejo (regenerar con scripts/gen_render_parity_fixture.py).
+  const table = Object.entries(fixture.movement_normalization);
+
+  it("la tabla de sondeo no está vacía", () => {
+    expect(table.length).toBeGreaterThan(30);
+  });
+
+  it.each(table)("normalizeMovementCode(%j) === %j", (raw, expected) => {
+    expect(normalizeMovementCode(raw)).toBe(expected);
+  });
+
+  it("nunca devuelve algo fuera del catálogo", () => {
+    for (const [raw] of table) {
+      const out = normalizeMovementCode(raw);
+      expect(out === "" || MOVEMENT_CODES.includes(out)).toBe(true);
+    }
   });
 });
