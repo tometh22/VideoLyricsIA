@@ -4,10 +4,12 @@ import { useI18n } from "../i18n";
  * Textarea + label + char counter + helper text para el campo
  * `background_hint` que se manda a Gemini con header `[OPERATOR OVERRIDE]`.
  *
- * Lo usan dos call sites para que la copia + max length + visual estén
- * sincronizados:
- *  - EditRequestPanel.jsx, mode "background" (PR #116)
- *  - VariantCreateModal.jsx (variantes de jobs aprobados)
+ * Lo usa EditRequestPanel.jsx, mode "background" (PR #116), para que la
+ * copia + max length + visual queden sincronizados con el resto.
+ *
+ * (2026-07-24: VariantCreateModal.jsx era el otro call site. Se borró —
+ * "Crear variante" abre el wizard completo, que usa el textarea de "Mi
+ * prompt" del paso de fondo como cualquier otro flujo.)
  *
  * Props:
  *   value      — string (controlled)

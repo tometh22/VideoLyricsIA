@@ -16,6 +16,10 @@ Cobertura:
 - concept override mergea con render_params del padre
 - Variante de variante (chain de 2) permitida
 - AuditLog entry creado con metadata correcta
+- Contrato espejado con /edit (2026-07-24): cada eje del wizard (fondo,
+  escena, FX, tipografía, portada) overridea y llega al render; None
+  hereda del padre sin pisar; background_hint "" = clear explícito;
+  background_id resuelve la Biblioteca con el resolver de /generate
 """
 from __future__ import annotations
 
@@ -585,3 +589,396 @@ def test_variant_cap_case_insensitive_song_match(client, user_token, db, monkeyp
         f"weren't recognised as siblings (response: {r.text})"
     )
     assert r.json()["detail"]["code"] == "variant_overage_unconfirmed"
+
+
+# ───────────────────────────────────────────────────────────────────
+# Contrato espejado con /edit (2026-07-24, "Crear variante abre el
+# wizard completo"). El wizard de variante muestra fondo + tipografía +
+# portada + Biblioteca; nada de eso puede mostrarse editable si el
+# backend lo ignora (principio de honestidad del PR #977). Estos tests
+# fijan que CADA eje viaja de punta a punta.
+# ───────────────────────────────────────────────────────────────────
+
+# Estado ABSOLUTO que manda el wizard (no un diff): un valor por cada eje
+# overridable, todos distintos de los del padre para que un "no llegó" sea
+# inequívoco.
+_ALL_AXES_BODY = {
+    "background_hint": "  catedral abandonada al amanecer  ",  # se trimea
+    "concept": "ruinas y niebla",
+    "genre": "post-rock",
+    "match_lyrics": False,
+    "bg_verbatim": True,
+    "movement_style": "estatico",
+    "effect": "snow",
+    "lyrics_animation": "karaoke",
+    "line_transition": "slide_up",
+    "font": "bebas-neue",
+    "font_scale": 1.25,
+    "text_case": "title",
+    "text_contrast": "strong",
+    "frame_format": "cine",
+    "custom_colors": "#101820,#F2AA4C",
+    "title_template": "lower_third",
+    "title_size": 1.4,
+    "title_artist_font": "montserrat-bold",
+    "title_song_font": "playfair",
+    "title_song_break": "Donde Estan\nCorazón",
+}
+
+# Lo que esperamos ver en render_params Y en los kwargs de run_pipeline.
+_ALL_AXES_EXPECTED = {**_ALL_AXES_BODY, "background_hint": "catedral abandonada al amanecer"}
+
+
+def test_variant_overrides_every_wizard_axis(client, user_token, db, monkeypatch):
+    """Cada campo nuevo del body pisa el del padre, se persiste en
+    render_params y llega a los kwargs de run_pipeline. Si un eje se cae
+    en el camino, el wizard estaría mostrando un control que el backend
+    ignora."""
+    me = _decode_user(client, user_token)
+    parent_id = _seed_done_job(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        render_params={
+            "background_hint": "callejón neón",
+            "concept": "ciudad",
+            "genre": "trap",
+            "match_lyrics": True,
+            "bg_verbatim": False,
+            "movement_style": "animado",
+            "effect": "",
+            "lyrics_animation": "none",
+            "line_transition": "none",
+            "font": "montserrat-bold",
+            "font_scale": 1.0,
+            "text_case": "upper",
+            "text_contrast": "medium",
+            "frame_format": "full",
+            "custom_colors": "",
+            "title_template": "auto",
+            "title_size": 1.0,
+            "title_artist_font": "",
+            "title_song_font": "",
+            "title_song_break": "",
+        },
+    )
+
+    captured = {}
+    monkeypatch.setattr(
+        "main.enqueue_pipeline",
+        lambda **kw: captured.update(kw) or "fake_rq_id",
+    )
+
+    r = client.post(
+        f"/jobs/{parent_id}/variant",
+        json=dict(_ALL_AXES_BODY),
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert r.status_code == 200, r.text
+
+    db.expire_all()
+    new_job = db.query(Job).filter(Job.job_id == r.json()["job_id"]).first()
+    for field, expected in _ALL_AXES_EXPECTED.items():
+        assert new_job.render_params[field] == expected, (
+            f"render_params[{field!r}] no recibió el override del wizard"
+        )
+        assert captured.get(field) == expected, (
+            f"{field!r} no llegó a run_pipeline — el control sería "
+            f"editable-e-ignorado"
+        )
+
+    # El audit deja rastro de qué ejes pisó el operador.
+    log = db.query(AuditLog).filter(AuditLog.action == "job.variant_created").first()
+    assert set(log.detail["overridden_fields"]) == set(_ALL_AXES_BODY.keys())
+
+
+def test_variant_none_inherits_parent_axes_without_clobber(client, user_token, db, monkeypatch):
+    """None = heredar. Un body vacío no puede pisar con defaults ninguno
+    de los ejes persistidos del padre (el BUG-5 que /edit ya cerró para
+    bg_verbatim: un `bool` default False borraba un True persistido)."""
+    me = _decode_user(client, user_token)
+    parent_params = {
+        "background_hint": "catedral gótica en penumbra",
+        "concept": "ruinas",
+        "genre": "post-rock",
+        "match_lyrics": False,
+        "bg_verbatim": True,
+        "movement_style": "estatico",
+        "effect": "rain",
+        "lyrics_animation": "word_reveal",
+        "line_transition": "wipe",
+        "font": "bebas-neue",
+        "font_scale": 1.2,
+        "text_case": "title",
+        "text_contrast": "strong",
+        "frame_format": "cine",
+        "custom_colors": "#101820",
+        "title_template": "badge",
+        "title_size": 1.3,
+        "title_artist_font": "montserrat-bold",
+        "title_song_font": "playfair",
+        "title_song_break": "Una\nDos",
+        # Sólo heredables (el wizard de variante no los expone): igual
+        # tienen que sobrevivir al salto padre→variante.
+        "lyric_color": "#FF0055",
+        "lyric_sung_color": "#FFFFFF",
+    }
+    parent_id = _seed_done_job(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        render_params=dict(parent_params),
+    )
+
+    captured = {}
+    monkeypatch.setattr(
+        "main.enqueue_pipeline",
+        lambda **kw: captured.update(kw) or "fake_rq_id",
+    )
+
+    r = client.post(
+        f"/jobs/{parent_id}/variant",
+        json={},
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert r.status_code == 200, r.text
+
+    db.expire_all()
+    new_job = db.query(Job).filter(Job.job_id == r.json()["job_id"]).first()
+    for field, expected in parent_params.items():
+        assert new_job.render_params[field] == expected, (
+            f"render_params[{field!r}] se perdió al heredar del padre"
+        )
+        assert captured.get(field) == expected, (
+            f"{field!r} no llegó a run_pipeline al heredar del padre"
+        )
+
+    # Nada se marcó como overrideado: fue herencia pura.
+    log = db.query(AuditLog).filter(AuditLog.action == "job.variant_created").first()
+    assert log.detail["overridden_fields"] == []
+
+
+def test_variant_background_hint_empty_string_is_explicit_clear(client, user_token, db, monkeypatch):
+    """`background_hint: ""` = borrar el prompt del operador (mismo
+    contrato que /edit). El "" se PERSISTE en render_params — así el
+    prompt viejo no revive en un retry — y NO viaja a run_pipeline, que
+    vuelve al flow default de Gemini."""
+    me = _decode_user(client, user_token)
+    parent_id = _seed_done_job(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        render_params={"background_hint": "callejón con grafitis de noche"},
+    )
+
+    captured = {}
+    monkeypatch.setattr(
+        "main.enqueue_pipeline",
+        lambda **kw: captured.update(kw) or "fake_rq_id",
+    )
+
+    r = client.post(
+        f"/jobs/{parent_id}/variant",
+        json={"background_hint": ""},
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert r.status_code == 200, r.text
+
+    db.expire_all()
+    new_job = db.query(Job).filter(Job.job_id == r.json()["job_id"]).first()
+    assert new_job.render_params["background_hint"] == "", (
+        "el clear explícito tiene que persistir como \"\" (no revivir el viejo)"
+    )
+    assert not captured.get("background_hint"), (
+        "un hint vacío no puede viajar a run_pipeline como texto"
+    )
+
+
+def test_variant_inherits_parent_background_hint_when_not_sent(client, user_token, db, monkeypatch):
+    """None ≠ "" — si el body no trae hint, el del padre se hereda Y se
+    usa en el render. Antes se persistía en render_params pero NUNCA
+    llegaba a run_pipeline: la row decía una cosa y el video mostraba
+    otra."""
+    me = _decode_user(client, user_token)
+    parent_id = _seed_done_job(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        render_params={"background_hint": "faro en la tormenta"},
+    )
+
+    captured = {}
+    monkeypatch.setattr(
+        "main.enqueue_pipeline",
+        lambda **kw: captured.update(kw) or "fake_rq_id",
+    )
+
+    r = client.post(
+        f"/jobs/{parent_id}/variant",
+        json={},
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert r.status_code == 200, r.text
+    assert captured.get("background_hint") == "faro en la tormenta"
+
+
+# ─── Biblioteca de fondos ───────────────────────────────────────────
+
+def test_variant_with_library_background_passes_bg_keys(client, user_token, db, monkeypatch):
+    """`background_id` resuelve la Biblioteca con el MISMO resolver que
+    /generate y pasa bg_path/bg_r2_key a enqueue_pipeline — ese camino
+    reemplaza la generación IA."""
+    me = _decode_user(client, user_token)
+    parent_id = _seed_done_job(db, owner_id=me["id"], tenant_id=me["tenant_id"])
+
+    resolver_calls = []
+
+    def _fake_resolver(background_id, background_mode, current_user, db_, job_dir, job_id):
+        resolver_calls.append({
+            "background_id": background_id,
+            "background_mode": background_mode,
+            "job_id": job_id,
+            "job_dir": job_dir,
+        })
+        return (f"{job_dir}/bg_library.mp4", "library/abc.mp4", None, None, background_id)
+
+    monkeypatch.setattr("main._resolve_library_background", _fake_resolver)
+    captured = {}
+    monkeypatch.setattr(
+        "main.enqueue_pipeline",
+        lambda **kw: captured.update(kw) or "fake_rq_id",
+    )
+
+    r = client.post(
+        f"/jobs/{parent_id}/variant",
+        json={"background_id": 42, "background_mode": "as_is"},
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert r.status_code == 200, r.text
+    new_id = r.json()["job_id"]
+
+    assert len(resolver_calls) == 1
+    call = resolver_calls[0]
+    assert call["background_id"] == 42
+    assert call["background_mode"] == "as_is"
+    # El uso del asset se registra contra el job NUEVO, no el padre.
+    assert call["job_id"] == new_id
+    assert new_id in call["job_dir"]
+
+    assert captured.get("background_path") == f"{call['job_dir']}/bg_library.mp4"
+    assert captured.get("bg_r2_key") == "library/abc.mp4"
+    assert captured.get("variation_parent_asset_id") == 42
+
+
+def test_variant_library_variation_mode_forwards_variation_source(client, user_token, db, monkeypatch):
+    """En modo `variation` el asset viaja como fuente image-to-video
+    (variation_source_*) y bg_path queda None — mismo shape que
+    /generate."""
+    me = _decode_user(client, user_token)
+    parent_id = _seed_done_job(db, owner_id=me["id"], tenant_id=me["tenant_id"])
+
+    monkeypatch.setattr(
+        "main._resolve_library_background",
+        lambda bid, mode, u, d, job_dir, jid: (None, None, f"{job_dir}/src.mp4", "library/src.mp4", bid),
+    )
+    captured = {}
+    monkeypatch.setattr(
+        "main.enqueue_pipeline",
+        lambda **kw: captured.update(kw) or "fake_rq_id",
+    )
+
+    r = client.post(
+        f"/jobs/{parent_id}/variant",
+        json={"background_id": 7, "background_mode": "variation"},
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert r.status_code == 200, r.text
+    assert captured.get("background_path") is None
+    assert captured.get("variation_source_r2_key") == "library/src.mp4"
+    assert captured.get("variation_parent_asset_id") == 7
+
+
+def test_variant_without_library_sends_no_background_path(client, user_token, db, monkeypatch):
+    """Sin `background_id` el fondo se genera con IA: nada de bg_path ni
+    variation_source_* (que harían saltear la generación)."""
+    me = _decode_user(client, user_token)
+    parent_id = _seed_done_job(db, owner_id=me["id"], tenant_id=me["tenant_id"])
+
+    captured = {}
+    monkeypatch.setattr(
+        "main.enqueue_pipeline",
+        lambda **kw: captured.update(kw) or "fake_rq_id",
+    )
+
+    r = client.post(
+        f"/jobs/{parent_id}/variant",
+        json={},
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert r.status_code == 200
+    assert captured.get("background_path") is None
+    assert captured.get("bg_r2_key") is None
+    assert captured.get("variation_source_path") is None
+    assert captured.get("variation_source_r2_key") is None
+
+
+def test_variant_background_mode_rejects_engine_values(client, user_token, db, monkeypatch):
+    """`background_mode` en /variant es el modo de BIBLIOTECA
+    (as_is|variation), NO el motor Veo/Imagen de /edit. Mandar "veo"
+    tiene que ser un 422, no un silencioso no-op: el motor lo deriva
+    movement_style."""
+    me = _decode_user(client, user_token)
+    parent_id = _seed_done_job(db, owner_id=me["id"], tenant_id=me["tenant_id"])
+    monkeypatch.setattr("main.enqueue_pipeline", lambda **kw: "fake")
+
+    r = client.post(
+        f"/jobs/{parent_id}/variant",
+        json={"background_mode": "veo"},
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert r.status_code == 422
+
+
+# ─── Art track ──────────────────────────────────────────────────────
+
+def test_variant_of_art_track_rejected(client, user_token, db, monkeypatch):
+    """Un art track no tiene fondo generado — "variante de art track" no
+    aplica. 400 explícito en vez de heredar art_track=True y renderear
+    un lyric vacío."""
+    me = _decode_user(client, user_token)
+    parent_id = _seed_done_job(
+        db, owner_id=me["id"], tenant_id=me["tenant_id"],
+        render_params={"art_track": True},
+    )
+    monkeypatch.setattr("main.enqueue_pipeline", lambda **kw: "fake")
+
+    r = client.post(
+        f"/jobs/{parent_id}/variant",
+        json={},
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert r.status_code == 400
+    assert "Art Track" in r.json()["detail"]
+
+
+# ─── Guardrail del contrato ─────────────────────────────────────────
+
+def test_every_overridable_field_exists_in_run_pipeline(client):
+    """Cada campo overridable tiene que existir como kwarg de
+    run_pipeline. Si alguien agrega uno que la firma no acepta, el
+    enqueue explota en runtime (TypeError) en vez de fallar acá."""
+    import inspect as _inspect
+
+    import main
+    import pipeline
+
+    sig = _inspect.signature(pipeline.run_pipeline).parameters
+    missing = [f for f in main._VARIANT_OVERRIDABLE_FIELDS if f not in sig]
+    assert not missing, (
+        f"campos overridables que run_pipeline no acepta: {missing}"
+    )
+
+
+def test_every_overridable_field_exists_in_request_model(client):
+    """Y al revés: la tupla no puede nombrar un campo que el body no
+    declara (sería un override muerto que nunca se puede mandar)."""
+    import main
+
+    fields = set(main.VariantJobRequest.model_fields)
+    missing = [f for f in main._VARIANT_OVERRIDABLE_FIELDS if f not in fields]
+    assert not missing, (
+        f"campos en _VARIANT_OVERRIDABLE_FIELDS que VariantJobRequest no "
+        f"declara: {missing}"
+    )

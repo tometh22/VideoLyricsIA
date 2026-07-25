@@ -10,7 +10,6 @@ import { useAlert } from "./AlertProvider";
 import HelpTip from "./HelpCenter/HelpTip";
 import EnableProResModal from "./EnableProResModal";
 import DriveTransferModal from "./DriveTransferModal";
-import VariantCreateModal from "./VariantCreateModal";
 import ScenesFilmstrip from "./ScenesFilmstrip";
 import SceneEditModal from "./SceneEditModal";
 import MediaPreview from "./MediaPreview";
@@ -503,8 +502,8 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       // Always send one of the two flags based on operator intent.
       // The tenant-conditional version silently dropped BOTH flags when
       // frontend tenant detection failed (stale localStorage, old login)
-      // and the backend defaulted to UMG-validate. See VariantCreateModal
-      // comment for the full incident write-up (2026-05-19).
+      // and the backend defaulted to UMG-validate (incidente 2026-05-19:
+      // el operador eligió "fondo libre" y el job validó igual).
       if (!retryValidationEnabled) {
         bodyPayload.bypass_content_validation = true;
       } else {
@@ -653,7 +652,6 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [proResToast, setProResToast] = useState(null);
   const [driveConnected, setDriveConnected] = useState(false);
   const [showDriveModal, setShowDriveModal] = useState(false);
-  const [showVariantModal, setShowVariantModal] = useState(false);
   const user = (() => {
     try { return JSON.parse(localStorage.getItem("genly_user") || "null"); } catch { return null; }
   })();
@@ -1439,7 +1437,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // y dispara el transcoding. Una vez hecho, isUmgJob flipea a true en
   // el próximo /status poll y aparece el tab de ProRes Master.
   // user / driveFeatureEnabled / showProResModal / proResToast /
-  // driveConnected / showDriveModal / showVariantModal / Drive useEffect
+  // driveConnected / showDriveModal / Drive useEffect
   // are all declared before the early returns above (hooks rules).
   const canEnableProRes =
     isJobDone && !isUmgJob && user?.features?.prores_export === true;
@@ -1602,11 +1600,14 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               </>
             );
           })()}
-          {/* Variantes: visible cuando el job está done. Crea un job
-              nuevo (mismo audio + lyrics) con otro background Veo. */}
+          {/* Variantes: visible cuando el job está done. Abre el wizard
+              completo (/videos/:id/variant) — antes era un modal de 3
+              campos porque el endpoint sólo aceptaba 3 campos; hoy su
+              contrato espeja el de /edit (fondo + Biblioteca + tipografía
+              + portada). Crea un job NUEVO con las mismas lyrics. */}
           {canDownload && (
             <button
-              onClick={() => setShowVariantModal(true)}
+              onClick={() => navigate(`/videos/${job.job_id}/variant`)}
               className="btn-secondary text-xs h-10 px-4"
               title={t("detail.variant_tooltip") ||
                 "Crear otro video con las mismas lyrics aprobadas (cuesta 1 video del plan)"}
@@ -2011,19 +2012,6 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           jobId={job.job_id}
           fileType={driveFileType}
           onClose={() => setShowDriveModal(false)}
-        />
-      )}
-
-      {showVariantModal && (
-        <VariantCreateModal
-          job={job}
-          onClose={() => setShowVariantModal(false)}
-          onCreated={(newJobId) => {
-            setShowVariantModal(false);
-            // El caller (Dashboard / parent) decide cómo navegar. Por
-            // simplicidad, redirigimos al detalle del nuevo job.
-            window.location.href = `/job/${newJobId}`;
-          }}
         />
       )}
 
