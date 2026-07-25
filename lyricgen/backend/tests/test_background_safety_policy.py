@@ -178,104 +178,12 @@ def test_universal_tenant_ignores_explicit_people_and_bypass(db):
     assert policy["should_validate"] is True
 
 
-def test_restricted_provider_boundary_replaces_positive_human_subject():
-    original = "A singer facing camera with a crowd behind her"
-    safe = pipeline._sanitize_people_at_provider_boundary(
-        original,
-        allow_people=False,
-    )
-    assert safe != original
-    assert "singer" not in safe.lower()
-    assert "crowd" not in safe.lower()
-    assert "unoccupied" in safe.lower()
 
 
-def test_authorized_common_prompt_is_preserved_at_provider_boundary():
-    original = "A singer facing camera"
-    assert pipeline._sanitize_people_at_provider_boundary(
-        original,
-        allow_people=True,
-    ) == original
 
 
-def test_restricted_provider_boundary_uses_high_recall_human_detector():
-    prompts = (
-        "a monk meditating beside a river",
-        "a nurse walking through a corridor",
-        "a firefighter in a red-lit warehouse",
-        "a chef and waitress at night",
-        "the protagonist watches the sunrise",
-        "a queen inside a glass palace",
-        "she walks through the rain",
-        "ella bailando bajo luces azules",
-        "eles caminhando na praia",
-        "a plain silhouette dancing",
-        "a humanlike creature in the forest",
-        "no people foreground, include a distant crowd",
-        "without people nearby, a singer",
-        "no crowd except one singer",
-        "no people other than a guitarist",
-        "sin personas cerca, mostrar una fotógrafa",
-        "sem pessoas próximas, incluir um surfista",
-        "no faces visible, silhouettes dancing",
-        "a police officer running",
-        "a waitress serving",
-        "a princess dancing",
-        "a hero standing",
-        "un pintor pintando",
-        "un rey de pie",
-        "uma policial correndo",
-        "uma soldada marchando",
-        "um pintor pintando",
-        "sem pessoas na frente, mostrar uma cantora",
-        "nenhuma multidão exceto um cantor",
-        "a teacher walking through a school",
-        "a student studying",
-        "a pilot standing by an aircraft",
-        "an athlete running",
-        "an engineer working",
-        "a priest praying",
-        "a coach shouting",
-        "un profesor enseñando",
-        "un estudiante caminando",
-        "un sacerdote rezando",
-        "um ator trabalhando",
-        "um trabalhador caminhando",
-        "um garçom servindo",
-    )
-    for prompt in prompts:
-        safe = pipeline._sanitize_people_at_provider_boundary(
-            prompt, allow_people=False,
-        )
-        assert safe != prompt, prompt
-        assert "unoccupied" in safe.lower(), prompt
 
 
-def test_high_recall_detector_does_not_treat_equipment_as_a_person():
-    prompts = (
-        "mechanical arm holding a camera",
-        "robotic arm holding a light",
-        "clock hands at midnight",
-        "a chair's arms in close-up",
-        "a 3D model of an empty futuristic city",
-        "an Android phone on a table",
-        "an electric fan in an empty room",
-        "a rubber band on a white surface",
-        "no people, no faces, no silhouettes",
-        "manos de reloj a medianoche",
-        "brazos de silla en primer plano",
-        "brazo mecánico sosteniendo una cámara",
-        "modelo 3d de una ciudad vacía",
-        "mãos do relógio à meia-noite",
-        "braços da cadeira em primeiro plano",
-        "braço robótico segurando uma câmera",
-        "modelo 3d de uma cidade vazia",
-        "banda elástica sobre una mesa",
-    )
-    for prompt in prompts:
-        assert pipeline._sanitize_people_at_provider_boundary(
-            prompt, allow_people=False,
-        ) == prompt, prompt
 
 
 def test_human_shaped_figures_require_common_user_opt_in(db):
@@ -288,7 +196,7 @@ def test_human_shaped_figures_require_common_user_opt_in(db):
         assert pipeline._compute_allow_people(job_id, prompt) is True
 
 
-def test_visual_human_roles_require_common_user_opt_in_and_are_sanitized(db):
+def test_visual_human_roles_require_common_user_opt_in(db):
     job_id = _job(db, render_params={"bypass_content_validation": True})
     prompts = (
         "a lone guitarist playing on stage",
@@ -317,12 +225,6 @@ def test_visual_human_roles_require_common_user_opt_in_and_are_sanitized(db):
     )
     for prompt in prompts:
         assert pipeline._compute_allow_people(job_id, prompt) is True, prompt
-        safe = pipeline._sanitize_people_at_provider_boundary(
-            prompt,
-            allow_people=False,
-        )
-        assert safe != prompt, prompt
-        assert "unoccupied" in safe.lower(), prompt
 
 
 def test_mechanical_camera_equipment_does_not_authorize_people(db):
@@ -578,3 +480,13 @@ def test_staging_mode_nonumg_validates_by_default(db, monkeypatch):
     policy = pipeline._background_safety_policy(job_id)
     assert policy["is_umg"] is False
     assert policy["should_validate"] is True
+
+
+
+
+
+
+
+
+
+

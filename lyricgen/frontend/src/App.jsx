@@ -49,7 +49,7 @@ import { translateBackendError } from "./lib/lyricsEditSubmit";
 import { segmentsStore, useJobSegmentsValue } from "./state/segmentsStore";
 import { persistSegments } from "./lib/persistSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
-import { computeFieldDiff, buildEditPayloads } from "./lib/editWizardDiff";
+import { computeFieldDiff, buildEditPayloads, backgroundRegenExtras } from "./lib/editWizardDiff";
 import { prefetchKey } from "./lib/prefetchKey";
 import { anchorLyricsForEntry } from "./lib/anchorPayload";
 import { track } from "./lib/telemetryTrack";
@@ -933,6 +933,11 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         lyricColor: pickSnapOr("lyricColor", params.lyric_color || "#FFFFFF"),
         lyricSungColor: pickSnapOr("lyricSungColor", params.lyric_sung_color || "#FFFFFF"),
         movementStyle: pickSnapOr("movementStyle", params.movement_style || ""),
+        // Ejes de escena editables en edición. matchLyrics: default true cuando
+        // el render_params no lo trae (paridad con el backend match_lyrics=True).
+        genre: pickSnapOr("genre", params.genre || ""),
+        concept: pickSnapOr("concept", params.concept || ""),
+        matchLyrics: snapR?.matchLyrics != null ? !!snapR.matchLyrics : (params.match_lyrics !== false),
         effect: pickSnapOr("effect", params.effect || ""),
         backgroundHint: pickSnapOr("backgroundHint", params.background_hint || ""),
         bgVerbatim: snapR?.bgVerbatim != null ? !!snapR.bgVerbatim : !!params.bg_verbatim,
@@ -963,6 +968,9 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         lyricColor: params.lyric_color || "#FFFFFF",
         lyricSungColor: params.lyric_sung_color || "#FFFFFF",
         movementStyle: params.movement_style || "",
+        genre: params.genre || "",
+        concept: params.concept || "",
+        matchLyrics: params.match_lyrics !== false,
         effect: params.effect || "",
         backgroundHint: params.background_hint || "",
         bgVerbatim: !!params.bg_verbatim,
@@ -2888,6 +2896,13 @@ export default function App() {
           bgVerbatim: r.bgVerbatim,
           backgroundMode: r.backgroundMode,
           movementStyle: r.movementStyle,
+          // Ejes de escena editables en edición (cableados 2026-07-24). Llegan a
+          // r.* vía onEditFieldChange (genre/concept por updateBatchDefault;
+          // matchLyrics por selectSceneMode). baseline los siembra del mismo
+          // render_params → un valor sin tocar no difea.
+          genre: r.genre,
+          concept: r.concept,
+          matchLyrics: r.matchLyrics,
           segments: editedSegments,
           // Pick de biblioteca en edit mode (PR #940 backend): la grilla
           // del paso de fondo YA escribía backgroundId en App, pero el
@@ -2896,6 +2911,12 @@ export default function App() {
           // "IA Auto" lo anula (null → sin bucket → mantener fondo).
           editBackgroundId:
             (bgSelectMode === "library" && backgroundId) ? backgroundId : null,
+          // "Regenerar fondo (nueva versión)": acción explícita del wizard en
+          // edición para forzar un re-render del fondo con el MISMO hint (nueva
+          // tirada de Veo/Imagen) aunque no se haya cambiado ningún campo — sin
+          // esto el operador que solo quería "otra versión del fondo" recibía
+          // "No cambiaste nada". Es una intención, no un campo del baseline.
+          forceBackgroundRegen: !!r.forceBackgroundRegen,
         };
 
         const diff = computeFieldDiff(r.baseline, current);
@@ -2971,6 +2992,15 @@ export default function App() {
         if (diff.lyrics) Object.assign(payload, diff.lyrics);
         if (diff.background) Object.assign(payload, diff.background);
         if (diff.background_library) Object.assign(payload, diff.background_library);
+        // Regen de fondo IA (Veo/Imagen + validación): paridad con la tarjeta
+        // "Regenerar fondo" que se plegó al wizard (unificación #973). Motor y
+        // política de validación son MODIFICADORES de un regen, no campos del
+        // baseline — llegan por onEditFieldChange (como forceBackgroundRegen).
+        // Sólo aplican si el edit es un regen IA (edit_type="background"; el
+        // swap de biblioteca no dispara Veo). Ver backgroundRegenExtras.
+        if (chosenType === "background") {
+          Object.assign(payload, backgroundRegenExtras(r));
+        }
         if (Array.isArray(payload.segments)) {
           payload.base_revision = Number.isInteger(saveMeta.baseRevision)
             ? saveMeta.baseRevision
@@ -4183,6 +4213,17 @@ export default function App() {
         onEditFieldChange={(field, value) =>
           setCurrentReview((r) => (r ? { ...r, [field]: value } : r))
         }
+        // Semilla de los controles de escena en edición (género/concepto/prompt
+        // + modo) con los valores persistidos del job. Keyed en el job id dentro
+        // de UploadZone → corre una vez por job, no pisa ediciones en curso.
+        editSeed={currentReview?.editMode ? {
+          jobId: currentReview.editingJobId,
+          genre: currentReview.genre,
+          concept: currentReview.concept,
+          backgroundHint: currentReview.backgroundHint,
+          bgVerbatim: currentReview.bgVerbatim,
+          matchLyrics: currentReview.matchLyrics,
+        } : null}
         // UI v1.1 (2026-05-30): feed the central title-card preview with the
         // currently-active artist/song. In edit mode the canonical source is
         // currentReview (the operator can edit them in the banner inputs

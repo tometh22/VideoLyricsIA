@@ -10,6 +10,7 @@ import {
   computeFieldDiff,
   buildEditPayloads,
   bundleTypographyIntoFirstBucket,
+  backgroundRegenExtras,
 } from "./editWizardDiff";
 
 const baselineFixture = () => ({
@@ -26,6 +27,9 @@ const baselineFixture = () => ({
   bgVerbatim: false,
   backgroundMode: "",
   movementStyle: "",
+  genre: "rock",
+  concept: "ciudad",
+  matchLyrics: true,
   segments: [
     { start: 0, end: 2, text: "Línea uno" },
     { start: 2, end: 4, text: "Línea dos" },
@@ -161,6 +165,68 @@ describe("computeFieldDiff", () => {
     const cur2 = { ...base, backgroundMode: "imagen" };
     expect(computeFieldDiff(base, cur2)).toEqual({
       background: { background_mode: "imagen" },
+    });
+  });
+
+  it("background bucket: genre change (scene axis, editable in edit mode)", () => {
+    const base = baselineFixture();
+    const cur = { ...base, genre: "pop" };
+    expect(computeFieldDiff(base, cur)).toEqual({ background: { genre: "pop" } });
+  });
+
+  it("background bucket: concept change", () => {
+    const base = baselineFixture();
+    const cur = { ...base, concept: "naturaleza" };
+    expect(computeFieldDiff(base, cur)).toEqual({ background: { concept: "naturaleza" } });
+  });
+
+  it("background bucket: match_lyrics change (Auto/Inspirado) travels as boolean", () => {
+    const base = baselineFixture(); // matchLyrics: true
+    const cur = { ...base, matchLyrics: false };
+    expect(computeFieldDiff(base, cur)).toEqual({ background: { match_lyrics: false } });
+  });
+
+  it("genre/concept/match_lyrics UNCHANGED do not diff (baseline seeded from persisted → no clobber)", () => {
+    // The clobber guard: baseline and current are both seeded from the job's
+    // render_params, so an untouched scene axis must NEVER spuriously fire a
+    // regen. An unrelated edit (only a lyrics fix) must not carry genre/concept.
+    const base = baselineFixture();
+    const cur = {
+      ...base,
+      segments: [
+        { start: 0, end: 2, text: "Línea uno corregida" },
+        { start: 2, end: 4, text: "Línea dos" },
+      ],
+    };
+    const diff = computeFieldDiff(base, cur);
+    expect(diff.background).toBeUndefined();
+    expect(diff.lyrics).toBeDefined();
+  });
+
+  it("E2E handshake: 'cambiar género + Generar otra versión' arma el body exacto que consume el backend", () => {
+    // Lado frontend del E2E (el backend consume este mismo body en
+    // test_edit_background_mode.py::test_e2e_regen_change_genre_keeps_prompt_and_scene).
+    // El operador cambia género → pop y tilda "Generar otra versión"
+    // (forceBackgroundRegen), sin escribir prompt nuevo.
+    const base = baselineFixture(); // genre: rock
+    const current = {
+      ...base,
+      genre: "pop",
+      forceBackgroundRegen: true,
+      bgRegenValidation: true,
+    };
+    const diff = computeFieldDiff(base, current);
+    expect(diff.background).toEqual({ genre: "pop" });
+    // App.jsx submit: { edit_type } + diff.background + backgroundRegenExtras(current).
+    const payload = {
+      edit_type: "background",
+      ...diff.background,
+      ...backgroundRegenExtras(current),
+    };
+    expect(payload).toEqual({
+      edit_type: "background",
+      genre: "pop",
+      force_content_validation: true,
     });
   });
 
@@ -328,5 +394,57 @@ describe("computeFieldDiff — background_library", () => {
     const diff = computeFieldDiff(base, cur);
     expect(diff.background).toEqual({ background_hint: "bosque nevado" });
     expect(diff.background_library).toBeUndefined();
+  });
+});
+
+describe("forceBackgroundRegen (re-roll del fondo sin cambiar texto)", () => {
+  it("fuerza un bucket background vacío cuando no cambió ningún campo", () => {
+    const base = baselineFixture();
+    const current = { ...base, forceBackgroundRegen: true };
+    const diff = computeFieldDiff(base, current);
+    expect(diff.background).toEqual({});
+    const payloads = buildEditPayloads(diff);
+    expect(payloads).toContainEqual({ edit_type: "background" });
+  });
+
+  it("NO aplica si el operador eligió un asset de biblioteca (eso supersede)", () => {
+    const base = baselineFixture();
+    const current = { ...base, forceBackgroundRegen: true, editBackgroundId: 42 };
+    const diff = computeFieldDiff(base, current);
+    expect(diff.background).toBeUndefined();
+    expect(diff.background_library).toEqual({ background_id: 42 });
+  });
+
+  it("sin la intención, un job sin cambios NO produce bucket background", () => {
+    const base = baselineFixture();
+    const diff = computeFieldDiff(base, { ...base });
+    expect(diff.background).toBeUndefined();
+  });
+});
+
+describe("backgroundRegenExtras — paridad tarjeta 'Regenerar fondo' (#973)", () => {
+  it("SIEMPRE manda un flag de validación: default (sin elección) = force", () => {
+    // Regresión clave del review adversarial: si no se manda ningún flag, el
+    // backend fail-closea a force igual, pero mandarlo explícito hace el
+    // contrato inequívoco y matchea la tarjeta removida.
+    expect(backgroundRegenExtras({})).toEqual({ force_content_validation: true });
+    expect(backgroundRegenExtras(null)).toEqual({ force_content_validation: true });
+    expect(backgroundRegenExtras({ bgRegenValidation: true })).toEqual({
+      force_content_validation: true,
+    });
+  });
+
+  it("fondo-libre: bgRegenValidation=false → bypass_content_validation (no force)", () => {
+    const out = backgroundRegenExtras({ bgRegenValidation: false });
+    expect(out.bypass_content_validation).toBe(true);
+    expect(out.force_content_validation).toBeUndefined();
+  });
+
+  it("NO decide el motor (Veo/Imagen lo define movement_style, no este helper)", () => {
+    // El eje motor se sacó del payload de extras (rediseño 2026-07-24): el
+    // estilo de Movimiento ("foto-parallax"→Imagen) ya lo cubre vía el bucket
+    // background del diff. Nunca debe aparecer background_mode acá.
+    expect(backgroundRegenExtras({ bgRegenEngine: "imagen" }).background_mode).toBeUndefined();
+    expect(backgroundRegenExtras({}).background_mode).toBeUndefined();
   });
 });

@@ -375,6 +375,41 @@ def _call_with_timeout(fn, timeout_s: float, label: str = ""):
         raise
 
 
+# Backoff schedule for Gemini quota errors (429/RESOURCE_EXHAUSTED) on the
+# background-analysis call. Two retries max: quota windows are per-minute, so
+# 20s + 40s usually clears them without holding a worker slot for too long.
+_BG_429_BACKOFF_S = (20.0, 40.0)
+
+
+def _is_gemini_quota_error(e: Exception) -> bool:
+    """True for Gemini 429/RESOURCE_EXHAUSTED errors — the only failures worth
+    a blind retry. TimeoutError is explicitly excluded: it's raised by our own
+    _call_with_timeout watchdog (anti-deadlock), so retrying it would re-block
+    the worker on the exact hang the watchdog exists to escape."""
+    if isinstance(e, TimeoutError):
+        return False
+    s = str(e)
+    return "429" in s or "RESOURCE_EXHAUSTED" in s
+
+
+def _generate_content_with_quota_retry(fn, *, timeout_s, label):
+    """_call_with_timeout wrapper that retries ONLY quota errors (429 /
+    RESOURCE_EXHAUSTED) with a short backoff. Any other exception — including
+    the watchdog TimeoutError — propagates immediately so the caller's
+    fallback path runs. Exhausted retries re-raise the last quota error
+    (job 3b28837a1784: a single unretried 429 dropped the operator's custom
+    prompt into the random-scene fallback)."""
+    for i, delay in enumerate((*_BG_429_BACKOFF_S, None)):
+        try:
+            return _call_with_timeout(fn, timeout_s=timeout_s, label=label)
+        except Exception as e:
+            if delay is None or not _is_gemini_quota_error(e):
+                raise
+            logger.warning("[BG] Gemini 429/RESOURCE_EXHAUSTED — retry %s/%s in %.0fs: %s",
+                           i + 1, len(_BG_429_BACKOFF_S), delay, e)
+            time.sleep(delay)
+
+
 def _ffprobe_duration(path: str) -> float | None:
     """Return media duration in seconds, or None if ffprobe fails."""
     import subprocess
@@ -5410,207 +5445,47 @@ def _compute_allow_people(job_id: str | None, operator_prompt: str | None = None
     return bool(_background_safety_policy(job_id, operator_prompt)["allow_people"])
 
 
-def _prompt_may_contain_human_subject(prompt: str | None) -> bool:
-    """High-recall detector used only at the restricted provider boundary.
-
-    This is deliberately separate from :func:`_prompt_explicitly_requests_people`.
-    That function grants an operator permission and therefore favours precision;
-    this function removes potentially unsafe text and therefore favours recall.
-    A false positive here only replaces a restricted prompt with a safe visual
-    direction.  It can never enable people.
-    """
-    import re as _re
-
-    value = _normalise_account_id(prompt)
-    if not value:
-        return False
-    if _prompt_explicitly_requests_people(value):
-        return True
-
-    # Remove common non-human uses before the intentionally broad scan.  These
-    # substitutions protect useful object prompts (clock hands, chair arms,
-    # robotic equipment, 3-D models) without weakening the authorization gate.
-    object_only = (
-        r"(?:clock|watch|reloj|rel[oó]gio)(?:['’]s)?\s+"
-        r"(?:hands?|faces?|manos?|caras?|rostros?|m[aã]os?|faces?|rostos?)|"
-        r"(?:chair|sofa|armchair|silla|sof[aá]|sill[oó]n|cadeira|poltrona)"
-        r"(?:['’]s)?\s+(?:arms?|brazos?|braços?)|"
-        r"(?:mechanical|robotic|crane|boom|industrial|articulated|"
-        r"mec[aáâ]nic[oa]|rob[oóô]tic[oa]|gr[uú]a|guindaste|articulad[oa])"
-        r"\s+(?:arms?|hands?|brazos?|manos?|braços?|m[aã]os?)|"
-        r"(?:rubber|elastic|goma|el[aá]stic[oa])\s+bands?|"
-        r"bandas?\s+el[aá]sticas?|faixas?\s+el[aá]sticas?|"
-        r"(?:electric|ceiling|desk|ventilation|el[eé]ctric[oa]|techo|teto)\s+fans?|"
-        r"(?:3[- ]?d|scale|data|language|render|modelo\s+3d)\s+models?|"
-        r"android\s+(?:phone|device|app|operating\s+system)|"
-        r"(?:circuit|software|device|motor)\s+drivers?|"
-        r"(?:mathematical|boolean|search)\s+operators?"
-    )
-    scan = _re.sub(rf"\b(?:{object_only})\b", " ", value, flags=_re.IGNORECASE)
-    scan = _re.sub(
-        r"\b(?:hands?|arms?|faces?|manos?|brazos?|caras?|rostros?|"
-        r"m[aã]os?|braços?|faces?|rostos?)\s+(?:of|de|do|da|del)\s+"
-        r"(?:a\s+|the\s+|un\s+|una\s+|um\s+|uma\s+|el\s+|la\s+|"
-        r"o\s+|a\s+)?(?:clock|watch|chair|sofa|armchair|reloj|silla|"
-        r"sof[aá]|sill[oó]n|rel[oó]gio|cadeira|poltrona)\b|"
-        r"\b(?:arms?|hands?|brazos?|manos?|braços?|m[aã]os?)\s+"
-        r"(?:mechanical|robotic|industrial|articulated|mec[aáâ]nic[oa]|"
-        r"rob[oóô]tic[oa]|industrial|articulad[oa])\b|"
-        r"\b(?:models?|modelos?)\s+(?:3[- ]?d|de\s+escala)\b",
-        " ",
-        scan,
-        flags=_re.IGNORECASE,
-    )
-
-    # Catch roles we have not enumerated when the grammar itself describes a
-    # human action. This detector only *removes* restricted prompts, so an
-    # occasional environmental false positive is safer than forwarding an
-    # unknown profession (cashier, lifeguard, conductor, etc.) to Universal.
-    if _re.search(
-        r"\b(?:a|an|the|un|una|el|la|um|uma|o)\s+"
-        r"(?:[\wÀ-ɏ'-]+\s+){0,2}[\wÀ-ɏ'-]+\s+"
-        r"(?:walking|running|standing|sitting|dancing|singing|serving|praying|"
-        r"teaching|studying|driving|speaking|smiling|wearing|holding|carrying|"
-        r"working|painting|photographing|marching|meditating|posing|swimming|"
-        r"skating|surfing|caminando|corriendo|de\s+pie|sentad[oa]|bailando|"
-        r"cantando|sirviendo|rezando|enseñando|estudiando|conduciendo|"
-        r"hablando|sonriendo|vistiendo|sosteniendo|cargando|trabajando|"
-        r"pintando|fotografiando|marchando|meditando|posando|nadando|"
-        r"caminhando|correndo|em\s+p[eé]|sentad[oa]|dançando|cantando|"
-        r"servindo|rezando|ensinando|estudando|dirigindo|falando|sorrindo|"
-        r"vestindo|segurando|carregando|trabalhando|pintando|fotografando|"
-        r"marchando|meditando|posando|nadando)\b",
-        scan,
-        _re.IGNORECASE,
-    ):
-        return True
-
-    broad_human = (
-        r"people|persons?|humans?|humanlike|human[- ]shaped|humanoid(?:s)?|"
-        r"men|man|women|woman|male\s+subject|female\s+subject|boys?|girls?|"
-        r"children?|kids?|bab(?:y|ies)|teens?|teenagers?|"
-        r"famil(?:y|ies)|couples?|pairs?|groups?|crowds?|audiences?|friends?|"
-        r"lovers?|pedestrians?|travelers?|tourists?|cyclists?|skaters?|surfers?|"
-        r"protagonists?|hero(?:es)?|heroine(?:s)?|characters?|"
-        r"singers?|musicians?|dancers?|guitarists?|drummers?|vocalists?|"
-        r"performers?|rappers?|djs?|bands?|actors?|models?|workers?|"
-        r"monks?|nuns?|nurses?|doctors?|teachers?|students?|pilots?|officers?|"
-        r"athletes?|coach(?:es)?|mechanics?|engineers?|scientists?|priests?|rabbis?|"
-        r"imams?|police\s+officers?|"
-        r"police(?:man|woman|men|women)|firefighters?|soldiers?|chefs?|"
-        r"waiters?|waitress(?:es)?|farmers?|"
-        r"business(?:man|woman|men|women|people)|puppeteers?|painters?|"
-        r"photographers?|kings?|queens?|princes?|princess(?:es)?|"
-        r"silhouettes?|figures?|statues?|mannequins?|faces?|heads?|bodies?|"
-        r"limbs?|hands?|arms?|"
-        r"he|she|they|him|her|them|his|hers|their|"
-        r"personas?|gente|human[oa]s?|humanoides?|hombres?|mujer(?:es)?|"
-        r"niñ[oa]s?|beb[eé]s?|adolescentes?|familias?|parejas?|grupos?|"
-        r"multitud(?:es)?|p[uú]blico|audiencia|amig[oa]s?|amantes?|"
-        r"peatones?|viajer[oa]s?|turistas?|ciclistas?|patinadores?|surfistas?|"
-        r"protagonistas?|h[eé]roes?|hero[ií]nas?|personajes?|"
-        r"cantantes?|m[uú]sicos?|bailar(?:ines|ina|inas|[ií]n)|guitarristas?|"
-        r"bateristas?|vocalistas?|int[eé]rpretes?|raperos?|djs?|bandas?|"
-        r"actor(?:es|as)?|modelos?|trabajador(?:es|as)?|monjes?|monjas?|enfermer[oa]s?|"
-        r"m[eé]dicos?|polic[ií]as?|bomberos?|soldados?|chefs?|cociner[oa]s?|"
-        r"camarer[oa]s?|granjer[oa]s?|empresari[oa]s?|titiriter[oa]s?|"
-        r"profesor(?:a|es|as)?|estudiantes?|pilotos?|atletas?|"
-        r"entrenador(?:a|es|as)?|mec[aá]nic[oa]s?|ingenier[oa]s?|"
-        r"cient[ií]fic[oa]s?|sacerdotes?|rabinos?|imanes?|"
-        r"pintor(?:es)?|pintoras?|fot[oó]graf[oa]s?|re(?:y|yes)|reinas?|"
-        r"pr[ií]ncipes?|princesas?|"
-        r"siluetas?|figuras?|estatuas?|maniqu[ií](?:es)?|caras?|rostros?|"
-        r"cabezas?|cuerpos?|extremidades?|manos?|brazos?|"
-        r"[eé]l|ella|ellos|ellas|"
-        r"pessoas?|humanos?|humanoides?|homem|homens|mulher(?:es)?|"
-        r"crianças?|beb[eê]s?|adolescentes?|fam[ií]lias?|casais?|grupos?|"
-        r"multid[oõã]es?|plateia|p[uú]blico|amigos?|amantes?|pedestres?|"
-        r"viajantes?|turistas?|ciclistas?|skatistas?|surfistas?|"
-        r"protagonistas?|her[oó]is?|hero[ií]nas?|personagens?|"
-        r"cantor(?:a|es|as)?|m[uú]sicos?|dançarinos?|guitarristas?|bateristas?|"
-        r"vocalistas?|artistas?|rappers?|djs?|bandas?|ator(?:es|as)?|modelos?|"
-        r"trabalhador(?:es|as)?|monges?|freiras?|enfermeir[oa]s?|m[eé]dicos?|"
-        r"policial|policiais|bombeiros?|soldad[oa]s?|cozinheir[oa]s?|garçons?|"
-        r"garçom|garçons|garçonetes?|fazendeir[oa]s?|empres[aá]ri[oa]s?|marionetistas?|"
-        r"professor(?:a|es|as)?|estudantes?|pilotos?|atletas?|"
-        r"treinador(?:a|es|as)?|mec[aâ]nic[oa]s?|engenheir[oa]s?|"
-        r"cientistas?|padres?|rabinos?|imames?|"
-        r"pintor(?:es|as)?|fot[oó]graf[oa]s?|reis?|rainhas?|pr[ií]ncipes?|princesas?|"
-        r"silhuetas?|figuras?|est[aá]tuas?|manequins?|faces?|rostos?|"
-        r"cabeças?|corpos?|membros?|m[aã]os?|braços?|"
-        r"ele|ela|eles|elas"
-    )
-    negative = (
-        r"no|not|without|avoid|exclude|never|none|zero|free\s+of|devoid\s+of|"
-        r"sin|evitar|excluir|nunca|ning[uú]n(?:a|o|as|os)?|cero|libre\s+de|"
-        r"sem|n[aã]o|evite|exclua|nenhum(?:a|as|os)?"
-    )
-    contrast = _re.compile(
-        r"\b(?:but|however|instead|except|apart\s+from|other\s+than|include|"
-        r"show|feature|featuring|pero|sino|excepto|salvo|incluir|incluye|"
-        r"mostrar|muestra|por[eé]m|mas|exceto|incluir|mostrar)\b",
-        _re.IGNORECASE,
-    )
-    for match in _re.finditer(rf"\b(?:{broad_human})\b", scan, _re.IGNORECASE):
-        hard_before = _re.split(r"[\n.!?;]", scan[:match.start()])[-1]
-        # A comma starts a new visual item for this high-recall boundary.  This
-        # intentionally catches "without people nearby, a singer".  Explicit
-        # negative lists may be over-sanitized, which is safe and does not
-        # change authorization.
-        before = contrast.split(hard_before)[-1].rsplit(",", 1)[-1]
-        hard_after = _re.split(r"[\n.!?;]", scan[match.end():], maxsplit=1)[0]
-        after = contrast.split(hard_after, maxsplit=1)[0]
-        if _re.search(rf"\b(?:{negative})\b[\s\S]{{0,80}}$", before):
-            continue
-        if _re.search(
-            rf"^\s*(?:[:,;\-]\s*)?(?:(?:is|are|must\s+be|should\s+be|"
-            rf"es|son|debe\s+ser|[eé]|s[aã]o|deve\s+ser)\s+)?"
-            rf"(?:none|zero|cero|ning[uú]n(?:a|o|as|os)?|"
-            rf"nenhum(?:a|as|os)?|absent|forbidden|prohibited|not\s+allowed)\b",
-            after,
-        ):
-            continue
-        if _re.search(
-            r"^\s*(?:(?:must|should|can|could|may|do|does)\s+not|cannot|"
-            r"can't)\s+(?:appear|be\s+(?:shown|visible|included|depicted))\b|"
-            r"^\s*no\s+(?:debe|deber[ií]a|puede)?\s*"
-            r"(?:aparecer|mostrarse|verse|incluirse)\b|"
-            r"^\s*n[aã]o\s+(?:deve|deveria|pode)?\s*"
-            r"(?:aparecer|ser\s+(?:mostrad[oa]|vis[ií]vel|inclu[ií]d[oa]))\b",
-            after,
-            _re.IGNORECASE,
-        ):
-            continue
-        return True
-    return False
-
-
-def _sanitize_people_at_provider_boundary(
+def _note_people_policy_at_provider_boundary(
     prompt: str | None,
     *,
     allow_people: bool,
-) -> str:
-    """Keep positive human requests out of restricted provider prompts.
+    job_id: str | None = None,
+) -> None:
+    """Observabilidad en el borde del proveedor. NUNCA muta el prompt.
 
-    Planner instructions and negative rails reduce the probability of a human
-    subject, but they are not an authorization boundary. In particular, a
-    Universal operator can type a literal prompt that asks for a singer; that
-    text must not be forwarded verbatim and contradicted later with "no
-    people". When the authoritative policy denies people, replace any positive
-    human-shaped subject with a deterministic, unoccupied visual direction.
+    Hasta 2026-07-24 acá vivía ``_sanitize_people_at_provider_boundary``: un
+    detector de alta recall reescribía el prompt del operador cuando "parecía"
+    tener una persona. Se eliminó por decisión de producto — el texto del
+    operador es intocable — y porque el detector era irrecuperablemente
+    impreciso sobre texto libre en español: la lista de pronombres incluía
+    ``[eé]l``, que matchea el ARTÍCULO "el" además del pronombre "él". Medido:
+    6 de cada 10 prompts realistas en español daban falso positivo, y el
+    reemplazo era un arquetipo elegido por hash (job d34cef371408 pidió "la
+    avenida 9 de julio y el obelisco" y recibió una catedral). Prod tenía la
+    variante peor: un único string fijo para todos.
+
+    Las personas se siguen evitando donde importa —en la IMAGEN, no en el
+    texto— con dos capas que no dependen de esta función:
+      1. El riel negativo del prompt ("no people, no faces, no hands"), que se
+         agrega aguas abajo siempre que ``allow_people`` es falso.
+      2. La validación Vision de los frames de salida
+         (``_validate_background_asset_for_job``), autoritativa y obligatoria
+         para Universal.
     """
-    value = str(prompt or "").strip()
-    if allow_people or not _prompt_may_contain_human_subject(value):
-        return value
-    logger.warning(
-        "[BG_POLICY] removed positive human subject at provider boundary"
-    )
-    return (
-        "An original unoccupied cinematic environment expressing the requested "
-        "emotional tone through architecture, landscape, light, color, texture, "
-        "materials and generous negative space. Build a distinctive full-frame "
-        "composition with environmental motion and no character as the subject"
-    )
+    if allow_people:
+        return
+    if _prompt_explicitly_requests_people(prompt):
+        # Detector de PRECISIÓN (el mismo que otorga el permiso), no el de
+        # recall: solo avisa cuando el operador pidió personas de forma
+        # explícita y su cuenta no las permite. El prompt viaja igual; el
+        # riel negativo y la validación de salida son las que deciden.
+        logger.warning(
+            "[BG_POLICY] job=%s: el prompt del operador pide personas y la "
+            "cuenta no las permite; el prompt se preserva intacto — el riel "
+            "negativo y la validación Vision resuelven la salida",
+            job_id,
+        )
+
 
 
 def _validate_background_asset_for_job(
@@ -7675,7 +7550,7 @@ _CONCEPT_SCENE_GUIDE = {
 # right "feel" per song. The genre + concept selectors decide WHAT the
 # scene is; this decides HOW it moves.
 _MOVEMENT_STYLE_RULES = {
-    "estatico":      "Viewpoint: LOCKED STATIC FRAME. The viewpoint does NOT move at all — no pan, no tilt, no zoom, no dolly, no push-in, no drift, no orbit, no crane, no handheld, no parallax. A single fixed composition held for the whole shot. ALL motion lives WITHIN the scene only (water ripples, firelight, shifting clouds, flickering light, swaying foliage, floating particles). The frame edges never move.",
+    "estatico":      "Viewpoint: LOCKED STATIC FRAME. The viewpoint does NOT move at all — no pan, no tilt, no zoom, no dolly, no push-in, no drift, no orbit, no crane, no handheld, no parallax. A single fixed composition held for the whole shot. ALL motion lives WITHIN the scene only — only subtle motion that genuinely belongs in the chosen scene (do not default to floating particles, swaying foliage or smoke unless the scene calls for them). The frame edges never move.",
     "sutil":         "Movement: minimal and ambient — gentle sway, slow drift, breathing motion. Subjects barely move. Easy to loop seamlessly.",
     "estandar":      "",  # no extra rule; the existing prompt template controls motion
     "foto-parallax": "Aesthetic: photographic still with subtle parallax — composition feels like a single photo, motion is restricted to slow camera moves, depth-of-field shifts, and lighting passes. No moving subjects.",
@@ -7909,7 +7784,12 @@ def _planner_match_lyrics(
 ) -> bool:
     """Preserve legacy rollout output until v4 is explicitly enforced."""
     if not policy_enforces(atmospherics_policy):
-        return True if scene_planner else bool(requested_match_lyrics)
+        # Fix 2026-07-23: antes el camino multi-escena (scene_planner=True)
+        # devolvía True SIEMPRE → "Auto" (match_lyrics=False) se comportaba
+        # idéntico a "Inspirado en la letra" en jobs con Escenas. Ahora se
+        # honra la selección real del usuario en los 3 modos también en
+        # multi-escena. (Mi prompt no pasa por acá: el operator_prompt domina.)
+        return bool(requested_match_lyrics)
     return creative_mode == "lyrics"
 
 
@@ -8065,7 +7945,13 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     # an empty armchair.
     _people_rule = (
         "" if allow_people
-        else "- Never include people, faces, hands, or readable text in the scene\n"
+        else (
+            "- NO people, faces, hands, silhouettes or human figures anywhere in "
+            "the scene, and no readable text, letters, signs, logos or brands.\n"
+            "- If the lyrics are about a person or a relationship, translate them "
+            "into their ENVIRONMENT — the empty chair, the worn stage, the two "
+            "coffee cups, the rain they walked through — never a body or face.\n"
+        )
     )
     # A2 (2026-05-25) — Anti-cliché rule. Incidente "Legalícenla - Viejas
     # Locas": Gemini identificó correctamente "marihuana" como sujeto
@@ -8244,7 +8130,7 @@ soft rock, acoustic, intimate or emotional theme, DO NOT default to
 industrial, urban, dystopian, sewer, alleyway, or neon-rain backgrounds.
 Bias toward warm interiors, golden-hour light, natural landscapes
 (sunset, ocean, mountains at dusk), or symbolic intimate imagery (a
-window, a candle, a glass catching light, hands intertwined). Industrial
+window, a candle, a glass catching light, two empty chairs by a table). Industrial
 alleys, neon streets, smoke, and rain are reserved for rock / metal /
 punk / hip-hop tracks where the genre or lyrics anchor that vocabulary
 explicitly. When in doubt, prefer warm/natural over urban/industrial."""
@@ -8277,7 +8163,7 @@ The operator has chosen the visual STYLING register: {normalized_concept.upper()
 The concept's vocabulary controls palette, texture, atmosphere, and aesthetic register:
 {concept_guide}{genre_hint}
 
-STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete setting, object, or action the song is literally about (e.g., a campfire in a forest, the ocean at night, a football match, a road trip, rain on glass, friends sharing warmth, a long goodbye at a station).
+STEP 0 — Read the lyrics and identify the PRIMARY VISUAL SUBJECT: the concrete SETTING or OBJECT the song evokes (e.g., a campfire in a forest, the ocean at night, an empty stadium under floodlights, a candlelit kitchen table, rain on glass, a cluttered analog workshop, a quiet train platform at first light). Prefer places and objects over people; when the lyrics are about a person or a relationship, render their WORLD instead — the room they left, the objects they touched, the weather of the moment — not the person.
 
 STEP 1 — Build a scene where:
 - The SUBJECT comes from the lyrics' literal or strongly figurative imagery
@@ -8396,7 +8282,7 @@ Hard rules:
 - Pick a DIFFERENT specific scene each time (don't repeat across songs)
 - If lyrics reference a sport (football, basketball, etc.) → use field/pitch/arena/equipment, NOT cars or generic cityscapes
 - Do NOT default to "calm ocean at sunset" unless the song is genuinely BALLAD
-""" + ("" if allow_people else "- Never include people, faces, hands, or readable text in the scene")
+""" + ("" if allow_people else "- Never make a person the subject: no close-ups of people, no recognizable faces, no portraits. Small, distant, incidental figures in a wide or aerial view are fine\n- Never include readable text in the scene")
         else:
             # Strict auto mode: classify genre, pick vocabulary, no lyrics.
             system_prompt = f"""{_EXAMPLE}
@@ -8412,7 +8298,7 @@ Hard rules:
 - "style" must always be "video"
 - Pick a DIFFERENT specific scene each time (don't repeat across songs)
 - Do NOT default to "calm ocean at sunset" unless the song is genuinely BALLAD
-""" + ("" if allow_people else "- Never include people, faces, hands, or readable text in the scene")
+""" + ("" if allow_people else "- Never make a person the subject: no close-ups of people, no recognizable faces, no portraits. Small, distant, incidental figures in a wide or aerial view are fine\n- Never include readable text in the scene")
         if movement_rule:
             system_prompt = system_prompt + "\n- " + movement_rule
 
@@ -8571,7 +8457,10 @@ Hard rules:
                     if policy_enforces(atmospherics_policy) else {}
                 ),
             )
-            response = _call_with_timeout(
+            # Quota-aware wrapper (2026-07-24): a single 429/RESOURCE_EXHAUSTED
+            # used to abort the whole analysis and drop to the fallback prompt.
+            # Retries 429s with backoff; TimeoutError still propagates raw.
+            response = _generate_content_with_quota_retry(
                 lambda: client.models.generate_content(
                     model="gemini-2.5-flash",
                     contents=user_content,
@@ -8740,20 +8629,31 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
                 pass
             return result
 
+    # Operator-prompt fallback — runs in EVERY policy mode, not just enforce.
+    # A provider failure (Gemini 429/timeout/parse) must NOT replace the
+    # operator's explicit direction with a random stock scene: job 3b28837a1784
+    # (staging, 2026-07) asked for a custom prompt, Gemini hit RESOURCE_EXHAUSTED
+    # and the shadow-mode fallback shipped "northern lights aurora" from
+    # _BG_SCENES instead. sanitize_generated_text is a no-op unless the policy
+    # enforces, so enforce semantics stay bit-identical to the previous
+    # in-branch check; shadow/off now honor the hint too.
+    if creative_mode == "prompt_improved" and (background_hint or "").strip():
+        return {
+            "style": "image" if for_provider == "imagen" else "video",
+            "prompt": sanitize_generated_text(background_hint.strip(), atmospherics_policy),
+        }
+
     # V4 fallback is deliberately content-neutral.  Provider/parse failure
     # must not silently replace the selected mode with a stock scene pool.
     if policy_enforces(atmospherics_policy):
-        if creative_mode == "prompt_improved" and (background_hint or "").strip():
-            fallback_prompt = background_hint.strip()
-        else:
-            identity = ", ".join(
-                item for item in (song_title, genre, concept) if (item or "").strip()
-            ) or "the song's emotional rhythm"
-            fallback_prompt = (
-                f"Original non-figurative visual composition derived from {identity}; "
-                "use distinctive color relationships, light, texture, negative space "
-                "and rhythmic motion without stock locations, readable text or people"
-            )
+        identity = ", ".join(
+            item for item in (song_title, genre, concept) if (item or "").strip()
+        ) or "the song's emotional rhythm"
+        fallback_prompt = (
+            f"Original non-figurative visual composition derived from {identity}; "
+            "use distinctive color relationships, light, texture, negative space "
+            "and rhythmic motion without stock locations, readable text or people"
+        )
         return {
             "style": "image" if for_provider == "imagen" else "video",
             "prompt": sanitize_generated_text(fallback_prompt, atmospherics_policy),
@@ -8881,9 +8781,12 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     global _last_veo_request
 
     atmospherics_policy = atmospherics_policy or resolve_atmospherics_policy(None)
-    prompt = _sanitize_people_at_provider_boundary(
-        prompt,
-        allow_people=allow_people,
+    # El prompt del operador NO se reescribe (2026-07-24): solo se registra
+    # cuando pide personas y la cuenta no las permite. El riel negativo de
+    # abajo y la validación Vision de la salida son las capas que evitan
+    # caras/personas en el video.
+    _note_people_policy_at_provider_boundary(
+        prompt, allow_people=allow_people, job_id=job_id,
     )
     # Last-boundary finalizer. Literal operator text is preserved, generated
     # text is sanitized, and both retain the immutable negative rail when the
@@ -8910,11 +8813,21 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     )
 
     # ``allow_people`` can only be true for a non-Universal account with both
-    # an explicit human request and the existing fondo-libre opt-in. Universal
+    # an explicit human request and the existing fondo-libre opt-out. Universal
     # is resolved authoritatively by tenant/billing group and never reaches
     # this branch with people enabled. Logo/brand/readable-text negatives stay
     # regardless because those are independent legal/IP concerns.
-    _people_clause = "" if allow_people else " no people, no faces, no hands,"
+    #
+    # 2026-07-24: el riel dejó de ser "no people". La regla real del sello es
+    # que no se vean CARAS RECONOCIBLES ni una persona como sujeto del plano;
+    # figuras chiquitas y lejanas de un plano general son aceptables. El "no
+    # people" viejo hacía imposible cualquier plano urbano honesto (una cenital
+    # de la Avenida 9 de Julio con autos y gente diminuta se pedía VACÍA), y
+    # contradecía el prompt del operador en vez de acompañarlo.
+    _people_clause = "" if allow_people else (
+        " no close-up of a person, no recognizable faces, no identifiable "
+        "individual, no portrait, no person as the subject of the shot,"
+    )
     # Shared IP / content negatives (text, logos, optionally people) — present
     # in every register.
     _base_negatives = (
@@ -8971,9 +8884,15 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # atmospheric rollout flag is off/shadow. Smoke/fog are never necessary to
     # make a static shot feel alive; operator-authored opt-ins can still flow
     # through the normal creative prompt when policy permits them.
+    # Fix 2026-07-23: antes esto hardcodeaba una lista fija de motion (particles
+    # floating / foliage swaying / firelight) que se inyectaba en CASI TODOS los
+    # fondos estáticos → clichés repetidos en todas las canciones. Ahora se pide
+    # movimiento sutil PROPIO de la escena, sin prescribir cuál, para que varíe.
     _static_scene_motion = (
-        "water ripples, firelight, shifting clouds, foliage swaying, "
-        "light reflections and particles floating"
+        "subtle in-scene motion that naturally belongs to this specific "
+        "environment (there must always be some gentle, continuous motion so "
+        "the frame is never completely frozen), while the camera itself stays "
+        "perfectly still"
     )
     _norm_move = _normalize_movement_style(movement_style)
     if _norm_move == "animado":
@@ -9511,9 +9430,10 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
     client = _get_genai_client()
 
     atmospherics_policy = atmospherics_policy or resolve_atmospherics_policy(None)
-    prompt = _sanitize_people_at_provider_boundary(
-        prompt,
-        allow_people=allow_people,
+    # Mismo criterio que en el borde de Veo: el prompt del operador viaja
+    # intacto; personas se evitan por riel negativo + validación de salida.
+    _note_people_policy_at_provider_boundary(
+        prompt, allow_people=allow_people, job_id=job_id,
     )
     prompt = finalize_provider_prompt(
         prompt,
@@ -9525,7 +9445,13 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
                     or os.environ.get("IMAGEN_MODEL")
                     or "imagen-4.0-generate-001").strip()
 
-    _people_suffix = "" if allow_people else " no people, no faces, no hands,"
+    # Mismo criterio que en el borde de Veo (2026-07-24): caras reconocibles y
+    # personas protagónicas, no la presencia humana incidental de un plano
+    # general.
+    _people_suffix = "" if allow_people else (
+        " no close-up of a person, no recognizable faces, no identifiable "
+        "individual, no portrait, no person as the subject of the shot,"
+    )
     safe_prompt = f"{prompt}. No text, no words, no letters,{_people_suffix} no logos, no readable signage."
 
     recorder = record_ai_call(
@@ -15176,7 +15102,13 @@ def _operator_prompt_for_edit(
 ) -> str | None:
     """Resolve only raw operator-authored text for edit policy checks."""
     if edit_type == "background":
-        return fresh_background_hint or None
+        # BUG-1 parity: generation now falls back to the persisted operator
+        # prompt when this edit has no fresh hint (effective_background_hint),
+        # so the SAFETY/validation prompt must use the same fallback — else a
+        # movement-only regen would generate WITH the persisted people-prompt
+        # but validate/gate WITHOUT it (allow_people=False), hard-failing the
+        # very jobs FIX 1 means to preserve. Mirrors the `scene` arm below.
+        return fresh_background_hint or persisted_operator_prompt or None
     if edit_type in ("typography", "lyrics", "metadata"):
         return persisted_operator_prompt or None
     if edit_type == "scene":
@@ -15368,6 +15300,22 @@ def run_edit_pipeline(
     # Keep it separate from `background_hint`, which intentionally means only
     # a fresh prompt supplied by this edit's background-regeneration request.
     _persisted_operator_prompt = merged.get("background_hint") or None
+    # BUG-1 fix (regen dropped the operator prompt): a movement-only edit or
+    # "Generar otra versión" (empty background bucket) carries no fresh hint,
+    # so background_hint is None and the regen used to re-roll the scene from
+    # genre/concept/lyrics — discarding the original creative direction. Fall
+    # back to the persisted operator prompt so the SAME prompt is reproduced; a
+    # freshly typed hint still wins via `or`. (2026-07-24: clearing the
+    # textarea now DOES clear the persisted hint — main.py persists "" as an
+    # explicit clear, and the `or None` coercions above turn that "" into
+    # None on both sides, so a cleared prompt does not resurrect.)
+    effective_background_hint = background_hint or _persisted_operator_prompt
+    # BUG-4 fix (regen flipped Auto→lyrics): the background branch never read
+    # match_lyrics, so _ensure_background fell to its True default and silently
+    # converted "Auto" (match_lyrics=False) jobs to lyrics-mode on every regen.
+    # Preserve the persisted mode; coerce a legacy-absent/None value to True.
+    _ml_persisted = merged.get("match_lyrics", True)
+    effective_match_lyrics = True if _ml_persisted is None else bool(_ml_persisted)
     # Operator-chosen generation mode for background regen: "veo" (Veo 3.1
     # cinematic video) or "imagen" (Imagen-4 still + Ken Burns animation).
     # Defaults to "veo" when unset for backward compatibility — pre-2026-05-16
@@ -15585,11 +15533,12 @@ def run_edit_pipeline(
                     lyrics_text=lyrics_text, artist=artist, job_id=job_id,
                     song_title=song_title, genre=genre, concept=concept,
                     movement_style=movement_style,
-                    background_hint=background_hint,
+                    background_hint=effective_background_hint,
                     bg_mode=background_mode,
                     bg_verbatim=bg_verbatim,
                     effect=effect,
-                    allow_people=_compute_allow_people(job_id, background_hint),
+                    match_lyrics=effective_match_lyrics,
+                    allow_people=_compute_allow_people(job_id, effective_background_hint),
                 )
             except Exception as _background_generation_error:
                 _raise_if_job_timeout(_background_generation_error)
@@ -15861,10 +15810,11 @@ def run_edit_pipeline(
                             job_id=job_id, song_title=song_title,
                             genre=genre, concept=concept,
                             movement_style=movement_style,
-                            background_hint=background_hint,
+                            background_hint=effective_background_hint,
                             bg_mode=background_mode,
                             bg_verbatim=bg_verbatim,
                             effect=effect,
+                            match_lyrics=effective_match_lyrics,
                             allow_people=_edit_safety_policy["allow_people"],
                             atmospherics_policy=(
                                 _edit_safety_policy["atmospherics_policy"]

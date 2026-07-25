@@ -5,6 +5,7 @@ import { UploadTour } from "./OnboardingTour";
 import WizardLivePreview from "./WizardLivePreview";
 import TitleCardPreview, { AUTO_INTRO_THRESHOLD_S } from "./TitleCardPreview";
 import HelpTip from "./HelpCenter/HelpTip";
+import ContentValidationToggle, { isUniversalAccount } from "./ContentValidationToggle";
 import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
 import { CONCEPT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
@@ -254,6 +255,13 @@ export default function UploadZone({
   // submitEdit porque batchDefaults sólo fan-out a files[] y en edit
   // mode files=[].
   onEditFieldChange = null,
+  // En edición, valores persistidos del job (de currentReview) para sembrar los
+  // controles de escena que leen batchDefaults (género/concepto/prompt) + el
+  // modo de escena. Sin esto mostraban el sticky de localStorage o el prompt
+  // vacío, no lo que el video realmente tiene. { jobId, genre, concept,
+  // backgroundHint, bgVerbatim, matchLyrics }. No toca r.* (el diff usa
+  // initialFields), sólo el display.
+  editSeed = null,
   // UI v1.1 (2026-05-30): artist/song to render inside the central
   // title-card preview. Caller (App.jsx) passes these from the
   // currentReview when in edit mode, or from the first file when in
@@ -346,7 +354,20 @@ export default function UploadZone({
       const parsed = JSON.parse(raw);
       // Merge keeps any future fields safe-defaulted when the user has an
       // older saved object missing the new key.
-      return { ...HARDCODED_BATCH_DEFAULTS, ...parsed };
+      //
+      // PERO el "Mi prompt" (backgroundHint + bgVerbatim) es POR-CANCIÓN, no
+      // un sticky de estilo: un prompt de escena que el operador escribió para
+      // una canción reaparecía en el batch SIGUIENTE (y se aplicaba a temas que
+      // no le pegan, o forzaba el modo "Mi prompt" sin querer). Persistimos los
+      // sticky de estilo (tipografía/tamaño/movimiento/case/…) pero forzamos el
+      // prompt LIMPIO en cada carga. El override va DESPUÉS del spread de
+      // `parsed`, así también limpia el localStorage ya contaminado.
+      return {
+        ...HARDCODED_BATCH_DEFAULTS,
+        ...parsed,
+        backgroundHint: HARDCODED_BATCH_DEFAULTS.backgroundHint,
+        bgVerbatim: HARDCODED_BATCH_DEFAULTS.bgVerbatim,
+      };
     } catch {
       return HARDCODED_BATCH_DEFAULTS;
     }
@@ -419,6 +440,29 @@ export default function UploadZone({
 
   const [hoverCaseBatch, setHoverCaseBatch] = useState(null);
   const [hoverCaseRow, setHoverCaseRow] = useState(null); // { idx, code }
+  // "Regenerar fondo (nueva versión)" en edición: intención explícita de re-tirar
+  // el fondo con el mismo hint. Se propaga a currentReview vía onEditFieldChange
+  // (NO updateBatchDefault: no debe persistir en localStorage — es una acción,
+  // no un sticky default). Fixea el caso "quería otra versión y decía 'No
+  // cambiaste nada'".
+  const [regenRequested, setRegenRequested] = useState(false);
+  const toggleRegenRequested = () => {
+    const next = !regenRequested;
+    setRegenRequested(next);
+    onEditFieldChange?.("forceBackgroundRegen", next);
+  };
+  // Fondo-libre (bypass del validador de contenido) en la edición del fondo.
+  // Como forceBackgroundRegen es ACCIÓN (no sticky default): se propaga a
+  // currentReview vía onEditFieldChange y App lo inyecta en el payload sólo si
+  // el edit es un regen IA (edit_type="background"). true = validar (default);
+  // false = fondo-libre (bypass, sólo cuentas no-UMG; UMG tiene política fija).
+  // El MOTOR (Veo/Imagen) NO se elige acá: lo define el estilo de Movimiento
+  // ("Foto fija"→Imagen, resto→Veo), así que no duplicamos el control.
+  const [regenValidation, setRegenValidation] = useState(true);
+  const setRegenValidationChoice = (v) => {
+    setRegenValidation(v);
+    onEditFieldChange?.("bgRegenValidation", v);
+  };
 
   // ── Scene MODE (Studio Console redesign) ────────────────────────────────
   // The 3 modes map onto existing state (no new backend contract):
@@ -429,6 +473,27 @@ export default function UploadZone({
   // operator can open "Mi prompt" before typing anything.
   const _hint = (batchDefaults.backgroundHint || "").trim();
   const [sceneMode, setSceneMode] = useState(_hint ? "prompt" : (inspiredByLyrics ? "lyrics" : "auto"));
+  // En edición, sembrar los controles de escena (leen batchDefaults) con los
+  // valores REALES del job — género/concepto/prompt mostraban el sticky de
+  // localStorage (o prompt vacío por el force-clear), no lo del video. Keyed en
+  // el job id: corre UNA vez por job, no pisa ediciones en curso. NO llama
+  // onEditFieldChange (r.* ya viene correcto de initialFields) → solo display.
+  useEffect(() => {
+    if (!editMode || !editSeed) return;
+    setBatchDefaults((prev) => ({
+      ...prev,
+      genre: editSeed.genre || "",
+      concept: editSeed.concept || "",
+      backgroundHint: editSeed.backgroundHint || "",
+      bgVerbatim: editSeed.bgVerbatim != null ? !!editSeed.bgVerbatim : prev.bgVerbatim,
+    }));
+    setSceneMode(
+      (editSeed.backgroundHint || "").trim()
+        ? "prompt"
+        : (editSeed.matchLyrics ? "lyrics" : "auto"),
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editMode, editSeed?.jobId]);
   // Elegibilidad del add-on premium "Escenas" (multi-escena). Robusto: el
   // backend manda vía features.scenes (admin OR SCENES_ENABLED_TENANTS), pero
   // los admin siempre califican aunque la sesión cacheada no traiga el flag.
@@ -488,9 +553,13 @@ export default function UploadZone({
     // Keep the legacy `match_lyrics` payload deterministic. "Mi prompt"
     // must not inherit whichever card happened to be selected before it.
     // Public payload fields remain unchanged: Auto/Prompt=false, Lyrics=true.
-    onInspiredByLyricsChange && onInspiredByLyricsChange(
-      inspiredByLyricsForSceneMode(m),
-    );
+    const _ml = inspiredByLyricsForSceneMode(m);
+    onInspiredByLyricsChange && onInspiredByLyricsChange(_ml);
+    // En edición, el modo de escena (Auto/Inspirado/Mi prompt) SÍ es editable:
+    // propagamos match_lyrics a currentReview para que el diff lo mande al
+    // /edit (computeFieldDiff → bucket background). onInspiredByLyricsChange
+    // solo toca el estado top-level del flujo de creación, no currentReview.
+    if (editMode) onEditFieldChange?.("matchLyrics", _ml);
     if (m === "auto") {
       if (_hint) updateBatchDefault("backgroundHint", "");   // stale prompt must not override
     } else if (m === "lyrics") {
@@ -1688,11 +1757,66 @@ export default function UploadZone({
       {bgMode === "auto" && (
         <div className="mb-4 pt-3 border-t border-white/[0.05]">
           <p className="text-[11px] text-gray-400 font-medium">{t("upload.scene_meta_title") || "Escena"}</p>
+          {/* Edición del fondo = el editor de siempre (Movimiento/Efecto/hint
+              define el look Y el motor: "Foto fija"→Imagen, resto→Veo). Encima,
+              un badge honesto del modelo real (cupo de 3 ediciones, no cobro por
+              regen) + un botón para "otra tirada" sin cambiar nada (si no, el
+              diff queda vacío y sale "No cambiaste nada"). Rediseño 2026-07-24:
+              se sacó el selector "Motor del fondo" (redundante con Movimiento) y
+              el toggle de validación se plegó en "Opciones avanzadas". */}
+          {editMode && (
+            <div className="mt-2 mb-3 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-3 py-2.5">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-[11px] font-medium text-gray-200">
+                    {t("upload.regen_bg_title") || "Regeneración de fondo incluida"}
+                  </p>
+                  <p className="text-[10px] text-gray-600 mt-0.5">
+                    {t("upload.regen_bg_desc") || "Editás el fondo como siempre (movimiento, efecto, look). Al aprobar se genera una versión nueva con IA y usa 1 de tus 3 ediciones. Cambiar a un fondo de Biblioteca es gratis."}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={toggleRegenRequested}
+                  aria-pressed={regenRequested}
+                  className={`shrink-0 rounded-full text-[11px] font-medium px-3 py-1.5 transition-colors ${
+                    regenRequested
+                      ? "bg-brand text-white"
+                      : "bg-surface-3/60 text-gray-300 ring-1 ring-white/[0.06] hover:text-white"
+                  }`}
+                >
+                  {regenRequested ? (t("upload.regen_bg_on") || "Se generará ✓") : (t("upload.regen_bg_cta") || "Generar otra versión")}
+                </button>
+              </div>
+              {/* Fondo-libre (bypass del validador) — sólo cuentas no-UMG, y
+                  plegado para no ensuciar el editor. UMG tiene política fija
+                  (el backend la fuerza igual) → ni mostramos el disclosure. */}
+              {!isUniversalAccount(user?.tenant_id, user?.billing_group) && (
+                <details className="mt-2">
+                  <summary className="text-[10px] text-gray-500 hover:text-gray-300 cursor-pointer select-none">
+                    {t("upload.bg_advanced") || "Opciones avanzadas"}
+                  </summary>
+                  <div className="mt-2">
+                    <ContentValidationToggle
+                      value={regenValidation}
+                      onChange={setRegenValidationChoice}
+                      tenantId={user?.tenant_id}
+                      billingGroup={user?.billing_group}
+                    />
+                  </div>
+                </details>
+              )}
+            </div>
+          )}
           <p className="text-[10px] text-gray-600 mt-0.5 mb-2">
             {sceneMode === "prompt"
               ? (t("upload.scene_meta_prompt_note") || "Tu prompt define la escena — género y concepto quedan como ayuda secundaria.")
               : (t("upload.scene_meta_desc") || "Género ajusta la paleta y la atmósfera · Concepto define el tipo de escena (ciudad, naturaleza, abstracto…).")}
           </p>
+          {/* Género/Concepto: editables también en edición (cableados al /edit
+              vía computeFieldDiff → bucket background). Cambiarlos regenera el
+              fondo con la nueva vocabulario de escena; el pipeline los lee de
+              render_params (persistidos por request_edit). */}
           <div className={`flex flex-wrap gap-3 ${sceneMode === "prompt" ? "opacity-50" : ""}`}>
             <div className="flex items-center gap-2">
               <span className="text-[11px] text-gray-600 shrink-0" title={t("upload.genre_help") || "El estilo musical. Ajusta paleta, iluminación y atmósfera del fondo."}>{t("upload.genre_label") || "Género:"}</span>
@@ -2414,7 +2538,12 @@ export default function UploadZone({
             {[
               { id: "auto", label: t("upload.bg_auto") || "Generar con IA" },
               { id: "library", label: t("upload.bg_library") || "Library" },
-              { id: "custom", label: t("upload.bg_custom_tab") || "Upload" },
+              // "Subir el mío" (portada custom) NO se ofrece en edición: el
+              // backend /edit no tiene edit_type "custom" (valid_edit_types sin
+              // custom), así que elegirlo daba un no-op silencioso — el operador
+              // "cambiaba el fondo" y el botón de aprobar decía "No cambiaste
+              // nada". Fuera del wizard de edición sigue disponible al crear.
+              ...(editMode ? [] : [{ id: "custom", label: t("upload.bg_custom_tab") || "Upload" }]),
             ].map((m) => (
               <button
                 key={m.id}
@@ -3202,8 +3331,11 @@ export default function UploadZone({
 
                   {/* Multi-escena: capa PREMIUM ortogonal a los 3 modos de arriba.
                       Funciona con cualquiera (Auto / letra / Mi prompt). Siempre
-                      visible (upsell); desbloqueada si scenesEligible. */}
-                  {(() => {
+                      visible (upsell); desbloqueada si scenesEligible.
+                      Oculto en edición: activar/desactivar Escenas es un cambio
+                      estructural que el /edit no soporta (el backend lo rechaza
+                      en jobs multi-escena), así que ofrecerlo sería engañoso. */}
+                  {!editMode && (() => {
                     const on = !!enableScenes;
                     const locked = !scenesEligible;
                     return (

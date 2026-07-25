@@ -146,8 +146,31 @@ export function computeFieldDiff(baseline, current) {
   if (!strEq(baseline.movementStyle, current.movementStyle)) {
     bgDiff.movement_style = current.movementStyle || "";
   }
+  // Scene axes editable in edit mode (2026-07-24): género/concepto steer the AI
+  // scene vocabulary; matchLyrics = "Inspirado en la letra" (true) vs
+  // Auto/"Mi prompt" (false). Backend persists them for edit_type=background
+  // and the pipeline reads them from render_params → they regenerate the scene.
+  // baseline and current are both seeded from the job's render_params so an
+  // untouched value never spuriously diffs (no BUG-5-class clobber).
+  if (!strEq(baseline.genre, current.genre)) {
+    bgDiff.genre = current.genre || "";
+  }
+  if (!strEq(baseline.concept, current.concept)) {
+    bgDiff.concept = current.concept || "";
+  }
+  if (!!baseline.matchLyrics !== !!current.matchLyrics) {
+    bgDiff.match_lyrics = !!current.matchLyrics;
+  }
   if (Object.keys(bgDiff).length > 0) {
     out.background = bgDiff;
+  }
+  // "Regenerar fondo (nueva versión)": intención explícita del operador de
+  // re-generar el fondo (nueva tirada) aunque no haya cambiado ningún campo.
+  // Se chequea sobre `current` (no vs baseline: es una acción, no un campo).
+  // Fuerza un bucket background vacío → edit_type=background re-renderiza con
+  // el hint actual. No aplica si eligió un asset de biblioteca (eso supersede).
+  if (current.forceBackgroundRegen && !current.editBackgroundId && !out.background) {
+    out.background = {};
   }
 
   // ── background_library ───────────────────────────────────────────────
@@ -231,4 +254,33 @@ export function bundleTypographyIntoFirstBucket(payloads, _opts = {}) {
   // pending_review status). Caller can detect this case and convert to
   // a lyrics-with-current-segments edit if the job is done/rejected.
   return payloads;
+}
+
+// ── background regen: política de content-validation (fondo-libre) ──────
+// NO es un campo del baseline sino ACCIÓN del wizard de edición: el operador
+// elige la política de validación como modificador de un regen de fondo IA, y
+// llega a `current` vía onEditFieldChange (igual que forceBackgroundRegen). Se
+// aplica SOLO cuando el edit resuelto es un regen IA (edit_type="background";
+// el swap de biblioteca no dispara Veo/Imagen).
+//
+// Paridad con la tarjeta "Regenerar fondo" que se plegó al wizard
+// (unificación #973): esa tarjeta SIEMPRE mandaba exactamente uno de
+// bypass/force_content_validation — si no se manda ninguno, el backend
+// fail-closea a force y se pierde fondo-libre (cuentas no-UMG).
+//
+//   - bgRegenValidation === false → bypass_content_validation (fondo-libre,
+//     sólo no-UMG). Cualquier otra cosa (incl. undefined) → force (validar).
+//
+// El MOTOR (Veo/Imagen) NO viaja por acá: lo define el estilo de Movimiento
+// (movement_style: "foto-parallax"→Imagen, resto→Veo), que ya va en el bucket
+// `background` del diff. No duplicamos ese eje.
+export function backgroundRegenExtras(current) {
+  const c = current || {};
+  const out = {};
+  if (c.bgRegenValidation === false) {
+    out.bypass_content_validation = true;
+  } else {
+    out.force_content_validation = true;
+  }
+  return out;
 }

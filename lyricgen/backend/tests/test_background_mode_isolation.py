@@ -107,12 +107,22 @@ def test_literal_mode_bypasses_planner_and_preserves_operator_text(monkeypatch):
 
 
 @pytest.mark.parametrize("mode", ["off", "shadow"])
-def test_off_and_shadow_preserve_legacy_match_lyrics_semantics(mode):
+def test_off_and_shadow_honor_requested_match_lyrics(mode):
+    # Fix 2026-07-23: antes el camino multi-escena (scene_planner=True) forzaba
+    # match_lyrics=True SIEMPRE en off/shadow → "Auto" (match_lyrics=False) se
+    # comportaba idéntico a "Inspirado en la letra". Ahora se honra la selección
+    # real del usuario en los 3 modos, también en multi-escena.
     policy = resolve_atmospherics_policy("", mode=mode)
 
+    # "Auto" (requested False) → False, incluso con scene_planner (antes True).
     assert pipeline._planner_match_lyrics(False, "lyrics", policy) is False
     assert pipeline._planner_match_lyrics(
         False, "auto", policy, scene_planner=True
+    ) is False
+    # "Inspirado en la letra" (requested True) → True, single y multi-escena.
+    assert pipeline._planner_match_lyrics(True, "lyrics", policy) is True
+    assert pipeline._planner_match_lyrics(
+        True, "lyrics", policy, scene_planner=True
     ) is True
 
 

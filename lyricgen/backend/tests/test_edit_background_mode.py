@@ -205,3 +205,283 @@ def test_background_edit_rejected_for_scene_jobs(client, admin_token, db, monkey
     )
     assert res2.status_code == 200, res2.text
     assert len(captured) == 1
+
+
+# ── BUG-5: bg_verbatim None-aware (no durable clobber) ──────────────────
+# The unified wizard only sends bg_verbatim when the toggle CHANGED. The old
+# `bool = False` default silently flipped a persisted True→False on any
+# background edit that didn't touch it. bg_verbatim is now `bool | None` and
+# request_edit only persists it when the caller actually sent a value.
+
+def _bg_job_with_render_params(db, tenant_id, user_id, render_params):
+    job_id = uuid.uuid4().hex[:12]
+    db.add(JobModel(
+        job_id=job_id, user_id=user_id, tenant_id=tenant_id,
+        artist="Test", song_title="Verbatim", filename="t.mp3",
+        status="pending_review", delivery_profile="youtube", progress=100,
+        bg_r2_key_cached="backgrounds/x/bg_cached.mp4",
+        segments_json=[{"start": 0.0, "end": 1.0, "text": "hola"}],
+        edit_count=0, render_params=render_params,
+    ))
+    db.commit()
+    return job_id
+
+
+def test_bg_verbatim_absent_does_not_clobber_persisted_true(client, admin_token, db, monkeypatch):
+    """A background edit that omits bg_verbatim must NOT overwrite a persisted
+    bg_verbatim=True (the BUG-5 clobber): the write block is skipped entirely."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _bg_job_with_render_params(db, tenant_id, user_id, {"bg_verbatim": True})
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "background", "movement_style": "animado"},
+    )
+    assert res.status_code == 200, res.text
+    edit_params = captured[0]["edit_params"]
+    assert "bg_verbatim" not in edit_params, (
+        f"omitted bg_verbatim must not be written; got {edit_params!r}"
+    )
+    db.expire_all()
+    job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+    assert job.render_params.get("bg_verbatim") is True, (
+        "persisted bg_verbatim=True must survive a verbatim-untouched bg edit"
+    )
+
+
+def test_bg_verbatim_explicit_false_is_written(client, admin_token, db, monkeypatch):
+    """An explicit bg_verbatim=false IS persisted — the None-aware write still
+    honours an explicit operator choice."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _bg_job_with_render_params(db, tenant_id, user_id, {"bg_verbatim": True})
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "background", "bg_verbatim": False},
+    )
+    assert res.status_code == 200, res.text
+    assert captured[0]["edit_params"].get("bg_verbatim") is False
+
+
+# ── Scene axes editable en un regen: genre / concept / match_lyrics ─────
+# Cableados 2026-07-24. None = keep persisted (solo se mandan si cambiaron);
+# el pipeline los lee de merged render_params.
+
+def test_scene_axes_forwarded_and_persisted(client, admin_token, db, monkeypatch):
+    """genre/concept/match_lyrics enviados → edit_params + render_params."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _bg_job_with_render_params(
+        db, tenant_id, user_id,
+        {"genre": "rock", "concept": "ciudad", "match_lyrics": True},
+    )
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={
+            "edit_type": "background",
+            "genre": "pop",
+            "concept": "naturaleza",
+            "match_lyrics": False,
+        },
+    )
+    assert res.status_code == 200, res.text
+    ep = captured[0]["edit_params"]
+    assert ep.get("genre") == "pop"
+    assert ep.get("concept") == "naturaleza"
+    assert ep.get("match_lyrics") is False
+    db.expire_all()
+    job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+    assert job.render_params.get("genre") == "pop"
+    assert job.render_params.get("concept") == "naturaleza"
+    assert job.render_params.get("match_lyrics") is False
+
+
+def test_scene_axes_absent_keep_persisted(client, admin_token, db, monkeypatch):
+    """Un edit que no toca género/concepto/modo no los pisa (None-aware)."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _bg_job_with_render_params(
+        db, tenant_id, user_id,
+        {"genre": "rock", "concept": "ciudad", "match_lyrics": False},
+    )
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "background", "movement_style": "animado"},
+    )
+    assert res.status_code == 200, res.text
+    ep = captured[0]["edit_params"]
+    assert "genre" not in ep and "concept" not in ep and "match_lyrics" not in ep
+    db.expire_all()
+    job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+    assert job.render_params.get("genre") == "rock"
+    assert job.render_params.get("concept") == "ciudad"
+    assert job.render_params.get("match_lyrics") is False
+
+
+# ── Clear explícito del hint: None = keep, "" = clear, valor = set ──────
+# 2026-07-24 (complemento del #979): sin el clear, cambiar el modo de
+# escena con un hint persistido era un no-op — resolve_creative_mode
+# prioriza operator_prompt y run_edit_pipeline revive el persistido vía
+# `background_hint or _persisted_operator_prompt`.
+
+def test_background_hint_empty_string_is_explicit_clear(client, admin_token, db, monkeypatch):
+    """background_hint:"" borra el hint persistido (render_params queda "")
+    y viaja en edit_params — el caso clave "borro el prompt y elijo
+    Inspirado" ({background_hint:"", match_lyrics:true})."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _bg_job_with_render_params(
+        db, tenant_id, user_id, {"background_hint": "castillo medieval"})
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "background", "background_hint": "", "match_lyrics": True},
+    )
+    assert res.status_code == 200, res.text
+    edit_params = captured[0]["edit_params"]
+    assert edit_params.get("background_hint") == ""
+    assert edit_params.get("match_lyrics") is True
+    db.expire_all()
+    job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+    assert job.render_params.get("background_hint") == "", (
+        "clearing the textarea must persist '' — else the old prompt "
+        "resurrects on the next regen and the mode change is a no-op"
+    )
+    assert job.render_params.get("match_lyrics") is True
+
+
+def test_background_hint_whitespace_only_is_clear_too(client, admin_token, db, monkeypatch):
+    """'   ' se normaliza a "" (strip) → mismo clear explícito."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _bg_job_with_render_params(
+        db, tenant_id, user_id, {"background_hint": "castillo medieval"})
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "background", "background_hint": "   "},
+    )
+    assert res.status_code == 200, res.text
+    assert captured[0]["edit_params"].get("background_hint") == ""
+    db.expire_all()
+    job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+    assert job.render_params.get("background_hint") == ""
+
+
+def test_background_hint_absent_keeps_persisted(client, admin_token, db, monkeypatch):
+    """Omitir background_hint NO toca el persistido (None = keep)."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _bg_job_with_render_params(
+        db, tenant_id, user_id, {"background_hint": "castillo medieval"})
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "background", "movement_style": "animado"},
+    )
+    assert res.status_code == 200, res.text
+    assert "background_hint" not in captured[0]["edit_params"]
+    db.expire_all()
+    job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+    assert job.render_params.get("background_hint") == "castillo medieval"
+
+
+def test_background_hint_ignored_for_non_background(client, admin_token, db, monkeypatch):
+    """El clear solo aplica con edit_type=background (mismo gating que
+    siempre): un edit de tipografía con background_hint:"" no borra nada."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _bg_job_with_render_params(
+        db, tenant_id, user_id, {"background_hint": "castillo medieval"})
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "typography", "font": "bebas-neue", "background_hint": ""},
+    )
+    assert res.status_code == 200, res.text
+    assert "background_hint" not in captured[0]["edit_params"]
+    db.expire_all()
+    job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+    assert job.render_params.get("background_hint") == "castillo medieval"
+
+
+# ── E2E (cadena de datos): "cambiar género + Generar otra versión" ──────
+# Maneja el /edit REAL + la persistencia REAL, reconstruye el `merged` del
+# worker y ejecuta la lógica REAL del pipeline para verificar qué inputs
+# recibe el generador (_ensure_background). Prueba la cadena completa menos el
+# render Veo (network-bound, no drivable — pineado en test_bg_mode_dispatch).
+def test_e2e_regen_change_genre_keeps_prompt_and_scene(client, admin_token, db, monkeypatch):
+    import inspect
+    import pipeline
+
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    PROMPT = "mansión surreal de noche, pileta vacía, cámara fija"
+    job_id = _bg_job_with_render_params(db, tenant_id, user_id, {
+        "background_hint": PROMPT,
+        "genre": "rock",
+        "concept": "ciudad",
+        "match_lyrics": False,        # "Auto"
+        "bg_verbatim": True,
+        "movement_style": "estatico",
+        "style": "oscuro",
+    })
+
+    # 1) La llamada EXACTA del wizard para "cambiar género + Generar otra
+    #    versión": cambia genre, sin hint fresco (bucket vacío = otra versión).
+    # Body EXACTO que arma el wizard (computeFieldDiff + backgroundRegenExtras)
+    # para este escenario — ver el handshake en editWizardDiff.test.js.
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "background", "genre": "pop", "force_content_validation": True},
+    )
+    assert res.status_code == 200, res.text
+
+    # 2) Persistencia REAL: género nuevo, todo lo demás intacto (sin clobber).
+    db.expire_all()
+    rp = db.query(JobModel).filter(JobModel.job_id == job_id).first().render_params
+    assert rp["genre"] == "pop"              # el edit
+    assert rp["background_hint"] == PROMPT    # sin tocar → se mantiene
+    assert rp["match_lyrics"] is False        # sin tocar → se mantiene
+    assert rp["bg_verbatim"] is True          # sin tocar → se mantiene
+    assert rp["movement_style"] == "estatico"
+
+    # 3) La vista `merged` del worker (pipeline.py: merged = render_params ∪ edit_params).
+    edit_params = captured[0]["edit_params"]
+    merged = {**rp, **edit_params}
+
+    # 4) Inputs del generador, derivados con la MISMA lógica del pipeline.
+    background_hint = edit_params.get("background_hint") or None   # None: sin hint fresco
+    persisted = merged.get("background_hint") or None
+    effective_hint = background_hint or persisted                 # FIX 1
+    _ml = merged.get("match_lyrics", True)
+    effective_match_lyrics = True if _ml is None else bool(_ml)    # FIX 4
+    genre = merged.get("genre") or ""
+
+    assert genre == "pop"                    # el género nuevo llega al regen
+    assert effective_hint == PROMPT          # el prompt original se reproduce (no se pierde)
+    assert effective_match_lyrics is False   # "Auto" preservado (no flipea a True)
+
+    # El prompt de SEGURIDAD/validación (función REAL) coincide con el de
+    # generación → sin split generate-with-intent / validate-without-permission.
+    assert pipeline._operator_prompt_for_edit(
+        "background", fresh_background_hint=background_hint,
+        persisted_operator_prompt=persisted,
+    ) == PROMPT
+
+    # Contrato: _ensure_background acepta de verdad estos kwargs.
+    sig = inspect.signature(pipeline._ensure_background).parameters
+    for p in ("genre", "concept", "background_hint", "match_lyrics",
+              "bg_verbatim", "movement_style", "effect"):
+        assert p in sig, f"_ensure_background debe aceptar {p}"
