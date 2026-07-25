@@ -10808,31 +10808,25 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
 
     _norm_move_bg = _normalize_movement_style(movement_style)
 
-    # UMG-style fix (2026-05-25): si el operador eligió "Estático" o "Sutil"
-    # SIN effect overlay, default a "light" (el más sutil de los 5). Las
-    # references UMG NUNCA tienen 100% quieto — siempre hay particles
-    # overlay o motion in-scene. Combined con subtle Ken Burns drift, esto
-    # garantiza que el video parezca vivo.
-    # Operator override: si seteó effect="" pero tildó algún otro motion
-    # (no estatico/sutil), respetamos su elección (no forzamos light).
-    # Foto fija / estático / sutil SIN effect → default a "light" (el más sutil)
-    # para que el fondo nunca quede 100% muerto. La "Foto fija" (ex foto-parallax)
-    # ya no panea — la vida/movimiento la da el efecto componible (lluvia/nieve/
-    # luces/estrellas/bokeh vía fx_compositor). El operador elige el efecto en el
-    # wizard; este default sólo cubre el caso sin elección.
-    # The operator's ACTUAL effect choice, captured BEFORE the anti-dead-frame
-    # "light" default below — used to gate background darkening so we darken for
-    # the effect the operator really picked (and no-op when they picked none),
-    # not for the forced default. (Review fix 2026-06-03: `effect` was never
-    # forwarded here, so darkening fired off the forced "light" for every still.)
+    # La elección REAL de efecto del operador. Se usa para gatear el darkening
+    # del prompt (oscurecer sólo cuando de verdad va a haber partículas encima).
+    #
+    # BORRADO 2026-07-25 — el default anti-frame-muerto que vivía acá:
+    #     if _norm_move_bg in ("estatico","sutil","foto-parallax") and not effect:
+    #         effect = "light"
+    # era un NO-OP. Reasignaba el parámetro LOCAL de _ensure_background, que sólo
+    # retorna un path; el overlay real se compone del `effect` de run_pipeline
+    # (ver fx_compositor.build_video_filter), que nunca vio este valor. O sea:
+    # "Foto fija" sin efecto rendereaba una imagen 100% congelada — exactamente
+    # lo que el bloque decía prevenir — y el log afirmaba que había aplicado el
+    # default. Un log que miente es peor que no tenerlo.
+    #
+    # En vez de "arreglarlo" (inyectar un efecto que el operador no pidió), la
+    # decisión vuelve al operador: el wizard ahora avisa de forma persistente que
+    # Foto fija sin efecto queda inmóvil, ofrece saltar al selector de Efecto, y
+    # renombra la card a "Sin efecto — imagen quieta" en esa combinación. Elegir
+    # que quede quieto es válido; que sea una decisión y no un accidente.
     _operator_effect = (effect or "").strip().lower()
-    if _norm_move_bg in ("estatico", "sutil", "foto-parallax") and not (effect or "").strip():
-        logger.info(
-            "[BG] movement=%s + no effect selected — defaulting effect=light "
-            "para evitar foto 100%% quieta (UMG-style guideline 2026-05-25)",
-            _norm_move_bg,
-        )
-        effect = "light"
 
     # Animado is a Veo-only aesthetic (the 2D-illustration safe_prompt lives in
     # _generate_veo_video). Imagen renders stills, so an animado+imagen combo
@@ -10892,8 +10886,10 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         # Foto fija + efectos (2026-06-03; review-fixed same day): if the
         # operator picked a luminous particle effect, bias the still toward a
         # dark/low-key canvas so the screen-blended particles read. Gated on the
-        # operator's ACTUAL pick (_operator_effect), NOT the forced "light"
-        # default, so it no-ops when no effect was chosen. AND never applied to
+        # operator's ACTUAL pick (_operator_effect) → no-op cuando no eligió
+        # ninguno. (Hasta 2026-07-25 este gate existía para no dispararse con el
+        # default forzado a "light"; ese default se borró por ser un no-op.)
+        # AND never applied to
         # a verbatim operator prompt — "usá mi prompt tal cual" must not get
         # dark grading bolted on (the imagen branch returns before the Veo
         # path's _is_verbatim is computed, so we check it inline here).
