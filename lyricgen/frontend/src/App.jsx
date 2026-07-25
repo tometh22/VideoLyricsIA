@@ -35,6 +35,10 @@ const HistoryView = lazy(() => import("./components/HistoryView"));
 const Dashboard = lazy(() => import("./components/Dashboard"));
 const UploadZone = lazy(() => import("./components/UploadZone"));
 const SearchPalette = lazy(() => import("./components/SearchPalette"));
+// Paso final del wizard de variante: la letra en modo LECTURA (el POST
+// /variant no lleva segments y el autosave del editor le escribiría al
+// job padre). Ver components/VariantLyricsSummary.jsx.
+const VariantLyricsSummary = lazy(() => import("./components/VariantLyricsSummary"));
 import BatchProgress from "./components/BatchProgress";
 import TranscribingProgress from "./components/TranscribingProgress";
 import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
@@ -49,7 +53,9 @@ import { translateBackendError } from "./lib/lyricsEditSubmit";
 import { segmentsStore, useJobSegmentsValue } from "./state/segmentsStore";
 import { persistSegments } from "./lib/persistSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
-import { computeFieldDiff, buildEditPayloads, backgroundRegenExtras } from "./lib/editWizardDiff";
+import { backgroundRegenExtras } from "./lib/editWizardDiff";
+import { buildEditReview, buildEditCurrent, resolveEditSubmission } from "./lib/editSubmission";
+import { buildVariantPayload } from "./lib/variantPayload";
 import { prefetchKey } from "./lib/prefetchKey";
 import { anchorLyricsForEntry } from "./lib/anchorPayload";
 import { track } from "./lib/telemetryTrack";
@@ -807,7 +813,20 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
 // dentro del Studio Console en vez de un modal separado con UX distinta.
 // Pasos 1, 2, 3, 5 quedan lockeados desde App (vía currentReview.
 // editingJobId) y el preview central muestra el MP4 ya renderizado.
-function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) {
+function EditLyricsRoute({
+  setCurrentReview,
+  setWizardStage,
+  // bgSelectMode/backgroundId son state de la RAÍZ de App: sobreviven a las
+  // navegaciones dentro de la SPA y se restauran del snapshot. Sin resetearlos
+  // al entrar a editar, un `backgroundId` viejo de un batch anterior con el tab
+  // en "Biblioteca" convierte la edición en un swap de asset —
+  // editWizardDiff hace `delete out.background` — y BORRA todos los cambios de
+  // fondo IA que el operador acaba de hacer. VariantWizardRoute ya lo reseteaba.
+  setBgSelectMode,
+  setBackgroundId,
+  wizardScreen,
+  t,
+}) {
   const { id } = useParams();
   const navigate = useNavigate();
   // status: "loading" | "ready" | "no_segments" | "not_editable" |
@@ -910,80 +929,26 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
       // pre-llenamos TODOS los campos editables del wizard desde la row del
       // Job para que el operador pueda corregir cualquier cosa post-render
       // (no solo lyrics). La baseline congela el snapshot a la entrada del
-      // edit; el submit calcula el diff contra la baseline y emite N POSTs
-      // /edit (uno por edit_type: metadata / typography / lyrics / background).
+      // edit; el submit calcula el diff contra la baseline y emite UN POST
+      // /edit consolidado (resolveEditSubmission elige el edit_type).
       //
       // Resilience: si el snap tiene fields editados in-flight (el operador
       // refrescó mid-edit), esos ganan. Si no, los valores actuales del job.
+      // Siembra de campos + baseline: lib/editSubmission.buildEditReview.
+      // Estaba inline acá, así que el test del invariante tenía que copiar la
+      // construcción a mano — y una copia a mano es cómo se colaron los 5
+      // `title_*` que faltaban en `current` (bucket typography emitido en el
+      // 100% de las ediciones → guarda "No cambiaste nada" muerta y cambios de
+      // fondo degradados a edición de letra en silencio).
       const snapR = reusableSnap ? snap.currentReview : null;
-      const pickSnapOr = (snapKey, fallback) =>
-        (snapR && snapR[snapKey] != null && snapR[snapKey] !== "")
-          ? snapR[snapKey]
-          : fallback;
+      const { initialFields, baseline } = buildEditReview(job, snapR);
 
-      const initialFields = {
-        artist: pickSnapOr("artist", job.artist || ""),
-        songTitle: pickSnapOr("songTitle", job.song_title || ""),
-        font: pickSnapOr("font", params.font || ""),
-        textCase: pickSnapOr("textCase", params.text_case || "upper"),
-        textContrast: pickSnapOr("textContrast", params.text_contrast || "medium"),
-        fontScale: String(pickSnapOr("fontScale", params.font_scale || "1.0")),
-        lyricsAnimation: pickSnapOr("lyricsAnimation", params.lyrics_animation || "none"),
-        lineTransition: pickSnapOr("lineTransition", params.line_transition || "none"),
-        lyricColor: pickSnapOr("lyricColor", params.lyric_color || "#FFFFFF"),
-        lyricSungColor: pickSnapOr("lyricSungColor", params.lyric_sung_color || "#FFFFFF"),
-        movementStyle: pickSnapOr("movementStyle", params.movement_style || ""),
-        // Ejes de escena editables en edición. matchLyrics: default true cuando
-        // el render_params no lo trae (paridad con el backend match_lyrics=True).
-        genre: pickSnapOr("genre", params.genre || ""),
-        concept: pickSnapOr("concept", params.concept || ""),
-        matchLyrics: snapR?.matchLyrics != null ? !!snapR.matchLyrics : (params.match_lyrics !== false),
-        effect: pickSnapOr("effect", params.effect || ""),
-        backgroundHint: pickSnapOr("backgroundHint", params.background_hint || ""),
-        bgVerbatim: snapR?.bgVerbatim != null ? !!snapR.bgVerbatim : !!params.bg_verbatim,
-        backgroundMode: pickSnapOr("backgroundMode", params.background_mode || ""),
-        // Title card customization (Full Rotor v1).
-        titleTemplate: pickSnapOr("titleTemplate", params.title_template || "auto"),
-        titleSize: String(pickSnapOr("titleSize", params.title_size || "1.0")),
-        titleArtistFont: pickSnapOr("titleArtistFont", params.title_artist_font || ""),
-        titleSongFont: pickSnapOr("titleSongFont", params.title_song_font || ""),
-        // UI v1.1 (2026-05-30): manual song-title line break — "" = auto.
-        titleSongBreak: pickSnapOr("titleSongBreak", params.title_song_break || ""),
-      };
-
-      // Baseline: snapshot inmutable de cómo está RENDERIZADO el video
-      // ahora — el diff del submit compara contra esto, NO contra el snap
-      // del autosave. Si el operador edita y vuelve atrás un campo al valor
-      // original, el diff lo descarta (no manda al backend, no cuesta un
-      // re-render por nada).
-      const baseline = {
-        artist: job.artist || "",
-        songTitle: job.song_title || "",
-        font: params.font || "",
-        textCase: params.text_case || "upper",
-        textContrast: params.text_contrast || "medium",
-        fontScale: String(params.font_scale || "1.0"),
-        lyricsAnimation: params.lyrics_animation || "none",
-        lineTransition: params.line_transition || "none",
-        lyricColor: params.lyric_color || "#FFFFFF",
-        lyricSungColor: params.lyric_sung_color || "#FFFFFF",
-        movementStyle: params.movement_style || "",
-        genre: params.genre || "",
-        concept: params.concept || "",
-        matchLyrics: params.match_lyrics !== false,
-        effect: params.effect || "",
-        backgroundHint: params.background_hint || "",
-        bgVerbatim: !!params.bg_verbatim,
-        backgroundMode: params.background_mode || "",
-        // Title card customization (Full Rotor v1) — baseline for the diff.
-        titleTemplate: params.title_template || "auto",
-        titleSize: String(params.title_size || "1.0"),
-        titleArtistFont: params.title_artist_font || "",
-        titleSongFont: params.title_song_font || "",
-        // UI v1.1: baseline for the manual break.
-        titleSongBreak: params.title_song_break || "",
-        segments: JSON.parse(JSON.stringify(job.segments_json || [])),
-      };
+      // Reset del pick de fondo residual: sin esto un `backgroundId` viejo con
+      // el tab en "Biblioteca" (state de la raíz de App, sobrevive a la
+      // navegación) convierte esta edición en un swap de asset y borra los
+      // cambios de fondo IA. Mismo reset que VariantWizardRoute ya hacía.
+      setBgSelectMode?.("auto");
+      setBackgroundId?.(null);
 
       // Mount the editor NOW with audio/waveform/bg as null. The LyricsEditor
       // handles these as optional — timeline renders without waveform fill,
@@ -1012,6 +977,8 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         filename: job.filename || job.artist || "lyrics",
         file: null,
         audioUrl: null,           // populated by Phase B
+        audioLoading: true,       // Phase B en vuelo → el editor muestra
+                                  // "Cargando audio…" en vez de "no disponible"
         waveform: null,           // populated by Phase B
         bgUrl: null,              // populated by Phase B
         ...initialFields,
@@ -1074,7 +1041,18 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         // Exhausted: leave the field unset; text editing still works and the
         // operator can reopen the editor to retry the audio fetch.
       };
-      enhanceField(`${API}/jobs/${id}/source-audio-url`, "audioUrl", (d) => d?.url || null, { retries: 3 });
+      // El audio es esencial para el timing: mientras su fetch está en vuelo
+      // el editor muestra "Cargando audio…". Al resolver (éxito O reintentos
+      // agotados) bajamos audioLoading para que, si de verdad no hay audio,
+      // recién ahí aparezca "Audio no disponible".
+      enhanceField(`${API}/jobs/${id}/source-audio-url`, "audioUrl", (d) => d?.url || null, { retries: 3 })
+        .finally(() => {
+          if (!alive) return;
+          setCurrentReview((prev) => {
+            if (!prev || prev.editingJobId !== id) return prev;
+            return { ...prev, audioLoading: false };
+          });
+        });
       enhanceField(`${API}/jobs/${id}/waveform`, "waveform", (d) => d);
       enhanceField(`${API}/jobs/${id}/background-url`, "bgUrl", (d) => d?.url || null);
     })();
@@ -1194,6 +1172,256 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         <p className="text-gray-500 mb-4">{t("detail.load_error") || "No pudimos cargar el video."}</p>
         <button onClick={() => navigate(`/videos/${id}`)} className="btn-secondary">
           {t("detail.back") || "Volver"}
+        </button>
+      </div>
+    );
+  }
+  return wizardScreen;
+}
+
+// Deep-link adapter para /videos/:id/variant — "Crear variante" abre el
+// MISMO wizard que la edición (antes era un modal de 3 campos, porque el
+// endpoint /variant sólo aceptaba 3 campos; ahora su contrato está
+// espejado con el de /edit).
+//
+// Diferencias contra EditLyricsRoute:
+//   - Guarda de entrada: el padre tiene que estar `done` (lo exige el
+//     backend) y tener segments_json. Cualquier otra cosa = panel de
+//     error explícito, no un redirect silencioso.
+//   - Marca `variantMode` + `parentJobId` en vez de editMode/editingJobId:
+//     el submit crea un job NUEVO, no parchea el padre. Nada de este
+//     wizard puede escribirle al padre (por eso tampoco montamos el
+//     LyricsEditor, que autosavearía sus segments — ver reviewScreen).
+//   - Siembra `style`/`customColors` (state top-level de App) además de
+//     los campos de la review: en variante la paleta SÍ es editable.
+function VariantWizardRoute({
+  setCurrentReview,
+  setWizardStage,
+  setStyle,
+  setCustomColors,
+  setBgSelectMode,
+  setBackgroundId,
+  wizardScreen,
+  t,
+}) {
+  const { id } = useParams();
+  const navigate = useNavigate();
+  // status: "loading" | "ready" | "no_segments" | "not_done" |
+  //         "not_found" | "art_track" | "error"
+  const [state, setState] = useState({ status: "loading" });
+
+  useEffect(() => {
+    let alive = true;
+    setState({ status: "loading" });
+    track("variant.entered", { job_id: id });
+
+    (async () => {
+      // Fase A (bloqueante) — /status. Mismo two-phase bootstrap que la
+      // ruta de edición: el wizard monta apenas sabemos el shape del job
+      // y las URLs firmadas (audio/waveform/fondo) lo enriquecen después.
+      let statusRes;
+      try {
+        statusRes = await authFetchWithTimeout(`${API}/status/${id}`, {}, 10_000);
+      } catch {
+        if (alive) setState({ status: "error" });
+        return;
+      }
+      if (!alive) return;
+      if (statusRes.status === 404) { setState({ status: "not_found" }); return; }
+      if (!statusRes.ok) { setState({ status: "error" }); return; }
+
+      let job;
+      try {
+        job = await statusRes.json();
+      } catch {
+        if (alive) setState({ status: "error" });
+        return;
+      }
+
+      // El backend sólo crea variantes de jobs aprobados (400 en cualquier
+      // otro status). Cortamos acá para no montar un wizard entero que
+      // termina en un error del server al aprobar.
+      if (job.status !== "done") {
+        setState({ status: "not_done", jobStatus: job.status });
+        return;
+      }
+      if (!Array.isArray(job.segments_json) || job.segments_json.length === 0) {
+        setState({ status: "no_segments" });
+        return;
+      }
+      const params = job.render_params || {};
+      // Un art track no tiene fondo generado — el backend lo rechaza con
+      // 400. Mismo criterio acá para no ofrecer el wizard.
+      if (params.art_track) {
+        setState({ status: "art_track" });
+        return;
+      }
+
+      // Semilla de los ejes overridables desde el render_params del padre.
+      // MISMO set que initialFields de la edición + frame_format (que en
+      // /variant sí viaja) — el payload del submit es ABSOLUTO, así que
+      // cada campo tiene que arrancar reflejando lo que el padre tiene.
+      const initialFields = {
+        font: params.font || "",
+        textCase: params.text_case || "upper",
+        textContrast: params.text_contrast || "medium",
+        fontScale: String(params.font_scale || "1.0"),
+        frameFormat: params.frame_format || "full",
+        lyricsAnimation: params.lyrics_animation || "none",
+        lineTransition: params.line_transition || "none",
+        movementStyle: params.movement_style || "",
+        genre: params.genre || "",
+        concept: params.concept || "",
+        matchLyrics: params.match_lyrics !== false,
+        effect: params.effect || "",
+        backgroundHint: params.background_hint || "",
+        bgVerbatim: !!params.bg_verbatim,
+        titleTemplate: params.title_template || "auto",
+        titleSize: String(params.title_size || "1.0"),
+        titleArtistFont: params.title_artist_font || "",
+        titleSongFont: params.title_song_font || "",
+        titleSongBreak: params.title_song_break || "",
+      };
+
+      // Paleta: vive en el state top-level de App (no en la review), así
+      // que la sembramos ahí. Sin esto el picker mostraría la paleta del
+      // último batch y el payload absoluto se la mandaría al backend.
+      setStyle(job.style || "auto");
+      setCustomColors(params.custom_colors || "");
+      // El fondo de una variante SIEMPRE se genera de cero salvo que el
+      // operador elija un asset de Biblioteca en este wizard. Arrancamos
+      // en "IA" y sin asset residual de un batch anterior.
+      setBgSelectMode("auto");
+      setBackgroundId(null);
+
+      setCurrentReview({
+        variantMode: true,
+        parentJobId: id,
+        // Sin editingJobId: nada de este flujo escribe al job padre.
+        // handleApproveLyrics ramifica por variantMode ANTES del bloque
+        // de edición, que se gatilla con editMode || editingJobId.
+        jobStatus: job.status,
+        deliveryProfile: job.delivery_profile || "youtube",
+        style: job.style || "",
+        artist: job.artist || "",
+        songTitle: job.song_title || "",
+        // Las lyrics aprobadas del padre viajan como contexto de sólo
+        // lectura: el POST /variant no lleva segments (el backend reusa
+        // segments_json del padre tal cual).
+        segments: job.segments_json,
+        segmentsRevision: Number.isInteger(job.segments_revision) ? job.segments_revision : 0,
+        filename: job.filename || job.artist || "lyrics",
+        file: null,
+        audioUrl: null,           // Fase B
+        waveform: null,           // Fase B
+        bgUrl: null,              // Fase B
+        ...initialFields,
+        queue: [],
+        queueIdx: 0,
+        transcribeJobId: null,
+        referenceLyrics: "",
+      });
+      setWizardStage("review");
+      setState({ status: "ready" });
+
+      // Fase B — enhancements best-effort (mismo contrato que la ruta de
+      // edición: si fallan, el wizard sigue usable en modo degradado).
+      const enhanceField = async (url, key, extractor) => {
+        try {
+          const res = await authFetchWithTimeout(url, {}, 15_000);
+          if (!alive || !res.ok) return;
+          const data = await res.json();
+          if (!alive) return;
+          const value = extractor(data);
+          setCurrentReview((prev) => {
+            if (!prev || prev.parentJobId !== id) return prev;
+            return { ...prev, [key]: value };
+          });
+        } catch {
+          // Timeout / network — campo queda null, el wizard funciona igual.
+        }
+      };
+      enhanceField(`${API}/jobs/${id}/source-audio-url`, "audioUrl", (d) => d?.url || null);
+      enhanceField(`${API}/jobs/${id}/waveform`, "waveform", (d) => d);
+      enhanceField(`${API}/jobs/${id}/background-url`, "bgUrl", (d) => d?.url || null);
+    })();
+
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+
+  // Cleanup al salir sin crear: mismo race-guard que la ruta de edición
+  // (sólo limpiamos si el currentReview sigue siendo EL NUESTRO).
+  useEffect(() => {
+    const myId = id;
+    return () => {
+      let didClear = false;
+      setCurrentReview((r) => {
+        if (!r) return r;
+        if (r.parentJobId !== myId || !r.variantMode) return r;
+        didClear = true;
+        return null;
+      });
+      if (didClear) {
+        setWizardStage("upload");
+        wizardPersistence.clear();
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+
+  if (state.status === "loading") {
+    return (
+      <div className="flex items-center justify-center min-h-[50vh]">
+        <div className="w-12 h-12 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+  if (state.status === "not_found") {
+    return (
+      <div className="text-center mt-16">
+        <p className="text-gray-500 mb-4">{t("detail.not_found") || "No se encontró el video."}</p>
+        <button onClick={() => navigate("/dashboard")} className="btn-secondary">
+          {t("detail.back") || "Volver"}
+        </button>
+      </div>
+    );
+  }
+  if (state.status !== "ready") {
+    const COPY = {
+      not_done: {
+        title: t("variant.blocked_not_done_title") || "Este video todavía no está aprobado",
+        desc: t("variant.blocked_not_done_desc") ||
+          "Sólo se pueden crear variantes de videos aprobados: la variante reusa sus lyrics aprobadas tal cual. Aprobá este video y volvé a intentar.",
+      },
+      no_segments: {
+        title: t("variant.blocked_no_segments_title") || "Este video no tiene letras guardadas",
+        desc: t("variant.blocked_no_segments_desc") ||
+          "La variante reusa las lyrics aprobadas del video original, y este job no las tiene guardadas. Subí la canción de nuevo para generar otra versión.",
+      },
+      art_track: {
+        title: t("variant.blocked_art_track_title") || "Los Art Tracks no tienen variantes",
+        desc: t("variant.blocked_art_track_desc") ||
+          "Un Art Track usa la portada como fondo, así que no hay un fondo generado para volver a tirar. Generá un Art Track nuevo si querés otra versión.",
+      },
+      error: {
+        title: t("detail.load_error") || "No pudimos cargar el video.",
+        desc: "",
+      },
+    };
+    const copy = COPY[state.status] || COPY.error;
+    return (
+      <div className="text-center mt-16 max-w-md mx-auto px-4">
+        <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-amber-500/10 flex items-center justify-center">
+          <svg className="w-7 h-7 text-amber-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="10" />
+            <path d="M12 8v4M12 16h.01" strokeLinecap="round" />
+          </svg>
+        </div>
+        <h2 className="text-xl font-bold mb-2">{copy.title}</h2>
+        {copy.desc && <p className="text-sm text-gray-500 mb-6">{copy.desc}</p>}
+        <button onClick={() => navigate(`/videos/${id}`)} className="btn-secondary">
+          {t("detail.back") || "Volver al video"}
         </button>
       </div>
     );
@@ -1418,6 +1646,11 @@ export default function App() {
   // exitoso, así que React-state-based guards no atrapan el caso. Ref
   // sincrónico (set ANTES del primer await) lo cierra.
   const editSubmitLockRef = useRef(false);
+  // Espejo en state del lock, sólo para el wizard de variante: el ref
+  // sincrónico es el que previene el doble-POST, pero un ref no
+  // re-renderiza, así que el CTA "Crear variante" necesita este flag para
+  // deshabilitarse y mostrar "Creando…" mientras el POST vuela.
+  const [variantSubmitting, setVariantSubmitting] = useState(false);
   // 2 concurrent workers: enough to keep the queue fed without spiking
   // the API with 5 simultaneous upload-url+generate calls from one user.
   const PARALLEL_WORKERS = 2;
@@ -2852,6 +3085,101 @@ export default function App() {
     const r = currentReview;
     if (!r) return;
 
+    // Variant-wizard mode (2026-07-24): "Crear variante" abre el mismo
+    // wizard, pero el submit crea un JOB NUEVO en vez de parchear el
+    // padre. Va ANTES de la rama de edición: una variante nunca puede
+    // caer en el POST /edit (le escribiría al job original).
+    //
+    // Payload ABSOLUTO (no un diff): el wizard viene sembrado del
+    // render_params del padre, así que mandar el estado completo produce
+    // el mismo resultado que "diff + herencia" sin depender de que la
+    // semilla y el baseline coincidan — y sin el "No cambiaste nada",
+    // que en variante no tiene sentido (una variante SIEMPRE re-genera
+    // el fondo, aunque no toques ningún campo).
+    if (r.variantMode) {
+      const parentJobId = r.parentJobId;
+      if (editSubmitLockRef.current) return;
+      editSubmitLockRef.current = true;
+      setVariantSubmitting(true);
+
+      try {
+        const payload = buildVariantPayload({
+          review: r,
+          style,
+          customColors,
+          bgSelectMode,
+          backgroundId,
+          backgroundMode,
+        });
+        track("variant.submitted", { job_id: parentJobId });
+
+        const doPost = async (body) => {
+          const res = await authFetch(`${API}/jobs/${parentJobId}/variant`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          let data = {};
+          try { data = await res.json(); } catch { /* empty body */ }
+          return { res, data };
+        };
+
+        let { res, data } = await doPost(payload);
+
+        // Cap de versiones por canción: el plan incluye N renders del
+        // mismo tema; a partir del siguiente se factura extra. El backend
+        // responde 402 estructurado en vez de cobrar de prepo — mostramos
+        // el costo exacto y sólo re-posteamos si el operador confirma.
+        if (
+          res.status === 402 &&
+          data?.detail && typeof data.detail === "object" &&
+          data.detail.code === "variant_overage_unconfirmed"
+        ) {
+          const d = data.detail;
+          const cost = typeof d.cost_extra_usd === "number"
+            ? d.cost_extra_usd.toFixed(2)
+            : (d.cost_extra_usd ?? "—");
+          const msg = (t("variant.overage_desc") ||
+            "Esta canción ya tiene {existing} versiones (incluida la original). El plan incluye {included} por canción; a partir de la próxima se factura ${cost} adicional al cierre del mes.")
+            .replace("{existing}", d.existing_renders ?? "—")
+            .replace("{included}", d.included_per_song ?? "—")
+            .replace("{cost}", cost)
+            + "\n\n"
+            + (t("variant.overage_confirm_question") || "¿Crear la variante igual?");
+          track("variant.overage_prompted", { job_id: parentJobId });
+          if (!window.confirm(msg)) return;
+          ({ res, data } = await doPost({
+            ...payload,
+            acknowledge_variant_overage: true,
+          }));
+        }
+
+        if (!res.ok) {
+          const friendly = translateBackendError(data?.detail, t) || `Error ${res.status}`;
+          alert({
+            title: t("variant.error_title") || "No pudimos crear la variante",
+            description: friendly,
+            tone: "error",
+          });
+          console.warn("[variant-wizard] POST /variant failed", { status: res.status, detail: data });
+          return;
+        }
+
+        const newJobId = data?.job_id;
+        setCurrentReview(null);
+        wizardPersistence.clear();
+        segmentsStore.evict(reviewStoreKey(r));
+        // La variante arranca en processing — el detalle del job NUEVO es
+        // donde el operador ve el progreso (la ruta real es /videos/:id;
+        // el modal viejo navegaba a /job/:id, que no existe).
+        navigate(newJobId ? `/videos/${newJobId}` : `/videos/${parentJobId}`, { replace: true });
+        return;
+      } finally {
+        editSubmitLockRef.current = false;
+        setVariantSubmitting(false);
+      }
+    }
+
     // Edit-wizard mode (PR feat/edit-wizard-mode, 2026-05-27):
     // diff cualquier campo editable del wizard contra el baseline congelado
     // en EditLyricsRoute y firea UN ÚNICO POST /edit consolidando todos los
@@ -2882,47 +3210,24 @@ export default function App() {
         // Snapshot del estado actual del wizard. editedSegments viene del
         // LyricsEditor con el último drag aplicado — gana sobre r.segments
         // por si el autosave todavía no lo persistió.
-        const current = {
-          artist: r.artist,
-          songTitle: r.songTitle,
-          font: r.font,
-          fontScale: r.fontScale,
-          textCase: r.textCase,
-          textContrast: r.textContrast,
-          lyricsAnimation: r.lyricsAnimation,
-          lineTransition: r.lineTransition,
-          effect: r.effect,
-          backgroundHint: r.backgroundHint,
-          bgVerbatim: r.bgVerbatim,
-          backgroundMode: r.backgroundMode,
-          movementStyle: r.movementStyle,
-          // Ejes de escena editables en edición (cableados 2026-07-24). Llegan a
-          // r.* vía onEditFieldChange (genre/concept por updateBatchDefault;
-          // matchLyrics por selectSceneMode). baseline los siembra del mismo
-          // render_params → un valor sin tocar no difea.
-          genre: r.genre,
-          concept: r.concept,
-          matchLyrics: r.matchLyrics,
-          segments: editedSegments,
-          // Pick de biblioteca en edit mode (PR #940 backend): la grilla
-          // del paso de fondo YA escribía backgroundId en App, pero el
-          // submit lo ignoraba — el operador "elegía" un fondo que nunca
-          // viajaba. Solo cuenta con el tab Library activo; volver a
-          // "IA Auto" lo anula (null → sin bucket → mantener fondo).
-          editBackgroundId:
-            (bgSelectMode === "library" && backgroundId) ? backgroundId : null,
-          // "Regenerar fondo (nueva versión)": acción explícita del wizard en
-          // edición para forzar un re-render del fondo con el MISMO hint (nueva
-          // tirada de Veo/Imagen) aunque no se haya cambiado ningún campo — sin
-          // esto el operador que solo quería "otra versión del fondo" recibía
-          // "No cambiaste nada". Es una intención, no un campo del baseline.
-          forceBackgroundRegen: !!r.forceBackgroundRegen,
-        };
+        // El snapshot del wizard y la resolución del edit_type viven en
+        // lib/editSubmission.js como funciones PURAS. Antes estaban inline acá,
+        // así que ningún test podía verlas: el mirror hand-copiado
+        // (EditWizardSubmit.test.jsx) testeaba N POSTs mientras esto hacía uno
+        // consolidado, y pasaba en verde. Ahora la UI puede leer la MISMA
+        // función para mostrar qué se va a aplicar y qué se descarta.
+        const current = buildEditCurrent(r, {
+          editedSegments,
+          bgSelectMode,
+          backgroundId,
+        });
+        const submission = resolveEditSubmission({
+          baseline: r.baseline,
+          current,
+          jobStatus: r.jobStatus,
+        });
 
-        const diff = computeFieldDiff(r.baseline, current);
-        const presentBuckets = Object.keys(diff);
-
-        if (presentBuckets.length === 0) {
+        if (submission.presentBuckets.length === 0) {
           alert({
             title: t("edit.no_changes_title") || "No cambiaste nada",
             description: t("edit.no_changes_subtitle") ||
@@ -2932,73 +3237,33 @@ export default function App() {
           return;
         }
 
-        // Pick edit_type by priority — el más complejo de los presentes.
-        // background_library (swap curado, $0, sin slot) supersede al
-        // regen IA; background regen Veo (paid), lyrics re-renderiza con
-        // nuevos segments, metadata sólo title card, typography el último.
-        const PRIORITY = ["background_library", "background", "lyrics", "metadata", "typography"];
-        let chosenType = PRIORITY.find((k) => diff[k]);
-
-        // Backend gates: typography y background/background_library solo
-        // aceptan jobs en pending_review (main.py). Para done/rejected:
-        //   - bg standalone: backend rechaza. Surface error claro.
-        //   - typography standalone: piggyback en una lyrics edit usando
-        //     los segments actuales (font/case/etc son ungated, se
-        //     aplican en cualquier edit_type).
-        const isPendingReview = r.jobStatus === "pending_review";
-        if (!isPendingReview) {
-          const _bgType = chosenType === "background" || chosenType === "background_library";
-          if (_bgType && presentBuckets.length === 1) {
-            alert({
-              title: t("edit.bg_locked_done_title") || "No se puede regenerar el fondo",
-              description: t("edit.bg_locked_done_desc") ||
-                "El fondo de un video ya aprobado no se puede regenerar — para cambiarlo, generá un video nuevo.",
-              tone: "warning",
-            });
-            return;
-          }
-          if (_bgType) {
-            // bg + otra cosa: bajar a la siguiente prioridad permitida.
-            chosenType = PRIORITY.find(
-              (k) => diff[k] && k !== "background" && k !== "background_library",
-            );
-          }
-          if (chosenType === "typography") {
-            // Convertir a lyrics edit. Necesita segments — usar el snapshot
-            // actual (editedSegments) aunque no haya cambiado, para que el
-            // backend acepte el payload.
-            chosenType = "lyrics";
-            const normalized = (editedSegments || []).map((s) => ({
-              start: Number(s.start) || 0,
-              end: Number(s.end) || 0,
-              text: String(s.text || ""),
-              ...(s.locked ? { locked: true } : {}),
-              ...(s.pos && typeof s.pos.x === "number" ? { pos: { x: s.pos.x, y: s.pos.y } } : {}),
-              ...(typeof s.scale === "number" && s.scale !== 1 ? { scale: s.scale } : {}),
-              ...(typeof s.rot === "number" && s.rot !== 0 ? { rot: s.rot } : {}),
-            }));
-            diff.lyrics = diff.lyrics || { segments: normalized };
-          }
+        if (submission.blocked) {
+          alert({
+            title: t("edit.bg_locked_done_title") || "No se puede regenerar el fondo",
+            description: t("edit.bg_locked_done_desc") ||
+              "El fondo de un video ya aprobado no se puede regenerar — para cambiarlo, generá un video nuevo.",
+            tone: "warning",
+          });
+          return;
         }
 
-        // Construir UN único payload con todos los campos cambiados.
-        // Backend aplica los ungated en cualquier edit_type; los gated
-        // (background_*, segments para lyrics) sólo se aplican si el
-        // edit_type matchea.
-        track("edit.submitted", { job_id: editedJobId, fields: presentBuckets });
-        const payload = { edit_type: chosenType };
-        if (diff.metadata) Object.assign(payload, diff.metadata);
-        if (diff.typography) Object.assign(payload, diff.typography);
-        if (diff.lyrics) Object.assign(payload, diff.lyrics);
-        if (diff.background) Object.assign(payload, diff.background);
-        if (diff.background_library) Object.assign(payload, diff.background_library);
+        // Telemetría honesta: `applied` son los buckets que el backend VA a
+        // aplicar y `dropped` los que la degradación por status descarta. Antes
+        // se reportaba `presentBuckets` entero DESPUÉS de degradar, así que un
+        // cambio de fondo descartado igual figuraba como enviado.
+        track("edit.submitted", {
+          job_id: editedJobId,
+          fields: Object.keys(submission.willApply),
+          dropped: submission.willDrop,
+        });
+        const payload = submission.payload;
         // Regen de fondo IA (Veo/Imagen + validación): paridad con la tarjeta
         // "Regenerar fondo" que se plegó al wizard (unificación #973). Motor y
         // política de validación son MODIFICADORES de un regen, no campos del
         // baseline — llegan por onEditFieldChange (como forceBackgroundRegen).
         // Sólo aplican si el edit es un regen IA (edit_type="background"; el
         // swap de biblioteca no dispara Veo). Ver backgroundRegenExtras.
-        if (chosenType === "background") {
+        if (submission.editType === "background") {
           Object.assign(payload, backgroundRegenExtras(r));
         }
         if (Array.isArray(payload.segments)) {
@@ -3890,7 +4155,10 @@ export default function App() {
     // via /edit/{id} con edit_type=background — no necesita el preview.
     enabled: shouldEnableBackgroundPreview({
       hasReview: !!currentReview,
-      editMode: !!currentReview?.editMode,
+      // Variante: el pre-gen tampoco sirve. El job nuevo lo crea el
+      // backend con su propio pipeline y no le pasamos bgCacheKey, así
+      // que pre-generar sería pura quema de cuota Gemini/Veo.
+      editMode: !!currentReview?.editMode || !!currentReview?.variantMode,
       bgSelectMode,
       enableScenes,
     }),
@@ -3941,7 +4209,15 @@ export default function App() {
   // de la primera respuesta — el preview cae a su modo legacy hasta que
   // la URL aterriza.
   const _editingJobId = currentReview?.editingJobId || null;
-  const editingRenderedVideoUrl = useMediaUrl(_editingJobId, "video", "preview");
+  // En modo variante el MP4 de referencia es el del job PADRE (el
+  // operador está mirando "de qué video estoy haciendo otra versión").
+  const _wizardBaseJobId = _editingJobId || (currentReview?.variantMode ? currentReview.parentJobId : null);
+  const editingRenderedVideoUrl = useMediaUrl(_wizardBaseJobId, "video", "preview");
+  // "Modo no-creación" del wizard: edición post-render O creación de
+  // variante. Los dos montan el wizard sobre un job existente (pasos 1 y
+  // 5 lockeados, campos sembrados, preview del MP4 real). Lo que cambia
+  // entre ambos vive detrás del prop `variantMode` de UploadZone.
+  const _wizardOnExistingJob = !!currentReview?.editMode || !!currentReview?.variantMode;
 
   // Resume banner shown on /new and /review when sessionStorage has a
   // pending batch from a prior visit. Lets the operator restore their
@@ -4005,6 +4281,35 @@ export default function App() {
   // sube a tamaño 14 con un wrapper pill que da identidad visual sin
   // gritar. Reducimos altura total a ~88 px → +60 px para preview en
   // viewport.
+  //
+  // En modo VARIANTE el banner es de sólo lectura: artist/song_title se
+  // heredan del padre y /variant no los acepta, así que mostrarlos como
+  // inputs sería un control editable que el backend ignora.
+  const variantHeaderBanner = currentReview?.variantMode ? (
+    <div className="rounded-card bg-accent/[0.06] ring-1 ring-accent/30 px-4 py-3 mb-4 animate-fade-in">
+      <div className="flex items-center gap-3 flex-wrap">
+        <span className="w-6 h-6 rounded-lg bg-accent/15 ring-1 ring-accent/30 flex items-center justify-center shrink-0">
+          <svg className="w-3.5 h-3.5 text-accent" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M12 5v14M5 12h14" strokeLinecap="round" />
+          </svg>
+        </span>
+        <div className="flex flex-col leading-tight min-w-0">
+          <span className="text-[11px] uppercase tracking-[0.18em] text-accent font-medium">
+            {t("variant.source_label") || "Variante de:"}
+          </span>
+          <span className="text-sm text-white truncate">
+            {currentReview.artist}
+            {currentReview.songTitle ? ` — ${currentReview.songTitle}` : ""}
+          </span>
+        </div>
+        <p className="text-[11px] text-ink-secondary flex-1 min-w-[220px]">
+          {t("variant.banner_hint") ||
+            "Artista y título se heredan del video original. Las lyrics aprobadas se mantienen idénticas."}
+        </p>
+      </div>
+    </div>
+  ) : null;
+
   const editingHeaderBanner = currentReview?.editMode ? (
     <div className="rounded-card bg-brand/[0.06] ring-1 ring-brand/30 px-4 py-3 mb-4 animate-fade-in">
       <div className="flex items-start gap-3 flex-wrap">
@@ -4094,18 +4399,25 @@ export default function App() {
         </button>
         <div>
           <h1 className="text-2xl font-bold">
-            {currentReview?.editMode
-              ? (t("editor.editing_wizard_title") || "Editar y re-renderizar")
-              : t("upload.new_batch")}
+            {currentReview?.variantMode
+              ? (t("variant.wizard_title") || "Crear variante")
+              : currentReview?.editMode
+                ? (t("editor.editing_wizard_title") || "Editar y re-renderizar")
+                : t("upload.new_batch")}
           </h1>
           <p className="text-sm text-gray-500">
-            {currentReview?.editMode
-              ? (t("editor.editing_wizard_sub") ||
-                  "Corregí cualquier campo y re-renderizá. Lo que no cambies queda igual.")
-              : t("upload.new_batch_sub")}
+            {currentReview?.variantMode
+              ? (t("variant.wizard_sub") ||
+                  "Otro video de la misma canción: mismas lyrics aprobadas, fondo nuevo. Cuesta 1 video de tu plan.")
+              : currentReview?.editMode
+                ? (t("editor.editing_wizard_sub") ||
+                    "Corregí cualquier campo y re-renderizá. Lo que no cambies queda igual.")
+                : t("upload.new_batch_sub")}
           </p>
         </div>
       </div>
+
+      <div className="lg:shrink-0">{variantHeaderBanner}</div>
 
       <div className="lg:shrink-0">{editingHeaderBanner}</div>
 
@@ -4198,8 +4510,14 @@ export default function App() {
         // effect. El style picker (paleta) dentro de step 2 queda
         // lockeado a nivel control via `editMode` + overlay — no a nivel
         // step, así el resto de step 2 sí es interactivo.
-        lockedSteps={currentReview?.editMode ? [1, 5] : []}
-        editMode={!!currentReview?.editMode}
+        //
+        // La variante monta el MISMO wizard sobre un job existente, así
+        // que reusa los mismos locks: `editMode` sigue siendo el flag de
+        // "modo no-creación" y `variantMode` sólo cambia lo que difiere
+        // (costo, paleta editable, sin toggle de "otra versión").
+        lockedSteps={_wizardOnExistingJob ? [1, 5] : []}
+        editMode={_wizardOnExistingJob}
+        variantMode={!!currentReview?.variantMode}
         // QA fix 2026-05-27: en edit mode los controles del wizard
         // (step 2 background_hint/bg_verbatim, step 3 movement/effect,
         // step 4 typography) escriben a batchDefaults + files via
@@ -4213,17 +4531,52 @@ export default function App() {
         onEditFieldChange={(field, value) =>
           setCurrentReview((r) => (r ? { ...r, [field]: value } : r))
         }
-        // Semilla de los controles de escena en edición (género/concepto/prompt
-        // + modo) con los valores persistidos del job. Keyed en el job id dentro
-        // de UploadZone → corre una vez por job, no pisa ediciones en curso.
-        editSeed={currentReview?.editMode ? {
-          jobId: currentReview.editingJobId,
+        // Semilla de los controles del wizard con los valores persistidos del
+        // job. Keyed en el job id dentro de UploadZone → corre una vez por job,
+        // no pisa ediciones en curso.
+        //
+        // `wizardFields` va SIEMPRE (2026-07-25). Antes se mandaba sólo en
+        // VARIANTE, con el razonamiento de que en edición el submit es un diff
+        // y "un campo sin tocar no viaja" — cierto para el cable, falso para el
+        // OPERADOR: los controles pintan de `batchDefaults`, que en edición
+        // arranca del sticky de localStorage. El operador abría "editar fondo",
+        // veía "Estático" ya resaltado (su último batch, no este video), no
+        // clickeaba, y el render salía con el valor viejo. Siete veces, en el
+        // reclamo que originó esto.
+        //
+        // Es seguro: el seed effect sólo llama setBatchDefaults (display) y
+        // nunca onEditFieldChange, y `baseline` sigue saliendo de
+        // render_params → la semántica del diff no cambia. Auditado contra los
+        // 60 consumidores de batchDefaults: no hay camino a un POST sin click
+        // explícito del operador.
+        editSeed={_wizardOnExistingJob ? {
+          jobId: currentReview.editingJobId || currentReview.parentJobId,
           genre: currentReview.genre,
           concept: currentReview.concept,
           backgroundHint: currentReview.backgroundHint,
           bgVerbatim: currentReview.bgVerbatim,
           matchLyrics: currentReview.matchLyrics,
+          wizardFields: {
+            font: currentReview.font || "",
+            textCase: currentReview.textCase || "upper",
+            fontScale: String(currentReview.fontScale || "1.0"),
+            textContrast: currentReview.textContrast || "medium",
+            frameFormat: currentReview.frameFormat || "full",
+            lyricsAnimation: currentReview.lyricsAnimation || "none",
+            lineTransition: currentReview.lineTransition || "none",
+            movementStyle: currentReview.movementStyle || "",
+            effect: currentReview.effect || "",
+            titleTemplate: currentReview.titleTemplate || "auto",
+            titleSize: String(currentReview.titleSize || "1.0"),
+            titleArtistFont: currentReview.titleArtistFont || "",
+            titleSongFont: currentReview.titleSongFont || "",
+            titleSongBreak: currentReview.titleSongBreak || "",
+          },
         } : null}
+        // baseline: para el chip "EN EL VIDEO" — la galería necesita saber qué
+        // tiene el video HOY, aparte de qué eligió el operador. Sin esto el
+        // anillo violeta es la única señal, y es la que engañó al operador.
+        editBaseline={_wizardOnExistingJob ? currentReview.baseline : null}
         // UI v1.1 (2026-05-30): feed the central title-card preview with the
         // currently-active artist/song. In edit mode the canonical source is
         // currentReview (the operator can edit them in the banner inputs
@@ -4334,6 +4687,27 @@ export default function App() {
         />
       );
     }
+    // Variante: la letra NO es editable. El POST /variant no lleva
+    // segments — el backend reusa segments_json del padre tal cual — y
+    // montar el LyricsEditor acá sería peor que inútil: su autosave
+    // (POST /save-segments con transcribeJobId) le escribiría los
+    // cambios AL JOB PADRE, que es un video ya aprobado y entregado.
+    // Mostramos las lyrics aprobadas en modo lectura + el CTA de crear.
+    if (currentReview?.variantMode) {
+      return (
+        <Suspense fallback={<EditorSuspenseFallback />}>
+          <VariantLyricsSummary
+            segments={currentReview.segments || []}
+            artist={currentReview.artist}
+            songTitle={currentReview.songTitle}
+            submitting={variantSubmitting}
+            onCreate={() => handleApproveLyrics(currentReview.segments || [])}
+            onBack={() => navigate(`/videos/${currentReview.parentJobId}`)}
+            t={t}
+          />
+        </Suspense>
+      );
+    }
     if (currentReview) {
       return (
         <div className="flex justify-center">
@@ -4387,6 +4761,7 @@ export default function App() {
             filename={currentReview.file?.name || currentReview.filename || ""}
             audioFile={currentReview.file}
             audioUrl={currentReview.audioUrl || null}
+            audioLoading={!!currentReview.audioLoading}
             referenceLyrics={currentReview.referenceLyrics || ""}
             coverageWarning={currentReview.coverageWarning}
             recoverySource={currentReview.recoverySource}
@@ -4650,6 +5025,24 @@ export default function App() {
             <EditLyricsRoute
               setCurrentReview={setCurrentReview}
               setWizardStage={setWizardStage}
+              setBgSelectMode={setBgSelectMode}
+              setBackgroundId={setBackgroundId}
+              wizardScreen={wizardScreen}
+              t={t}
+            />
+          } />
+          {/* Crear variante: MISMO wizard, pero el submit crea un job
+              NUEVO (POST /jobs/:id/variant) en vez de parchear el padre.
+              Antes esto era un modal de 3 campos porque el endpoint sólo
+              aceptaba 3 campos; su contrato ahora espeja el de /edit. */}
+          <Route path="/videos/:id/variant" element={
+            <VariantWizardRoute
+              setCurrentReview={setCurrentReview}
+              setWizardStage={setWizardStage}
+              setStyle={setStyle}
+              setCustomColors={setCustomColors}
+              setBgSelectMode={setBgSelectMode}
+              setBackgroundId={setBackgroundId}
               wizardScreen={wizardScreen}
               t={t}
             />

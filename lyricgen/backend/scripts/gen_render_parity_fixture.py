@@ -37,6 +37,7 @@ from pipeline import (  # noqa: E402
     _CONCEPT_SCENE_GUIDE,
     _FONT_CATALOGUE,
     _MOVEMENT_STYLE_RULES,
+    _normalize_movement_style,
 )
 
 FIXTURE_PATH = os.path.join(
@@ -47,6 +48,25 @@ FIXTURE_PATH = os.path.join(
 # and extreme values; font_scales covering both clamp edges (0.4/1.7 are
 # out-of-range on purpose) and the 0.75 case whose product lands on an
 # exact .5 (banker's-rounding trap: Python round(52.5)=52, JS Math.round=53).
+# Entradas con las que se sondea _normalize_movement_style: los 5 códigos
+# canónicos, TODOS los alias que la función acepta, los valores que el editor
+# de escena y el derivado por energía emiten ("dinamico"), variantes de
+# capitalización/acento, y basura. El espejo JS (catalogCodes.normalizeMovementCode)
+# tiene que coincidir en las tres columnas.
+_MOVEMENT_NORMALIZATION_PROBES = [
+    "", "  ",
+    "estatico", "sutil", "estandar", "foto-parallax", "animado",
+    "static", "estatica", "estática", "estático", "fija", "fixed", "tripod",
+    "locked", "still", "camara-fija", "camara fija",
+    "subtle", "minimal", "minimo",
+    "standard", "default",
+    "dinamico", "dinámico", "dynamic",
+    "photo", "parallax", "foto+parallax", "foto_parallax", "foto fija",
+    "animated", "illustration", "cartoon",
+    "ESTATICO", "Dinamico", "  Estatica  ",
+    "basura", "photo-parallax",
+]
+
 TEXT_LENGTHS = [1, 30, 50, 51, 80, 81, 120, 200]
 FONT_SCALES = [0.4, 0.6, 0.75, 0.9, 1.0, 1.15, 1.3, 1.5, 1.7]
 FAMILIES = sorted(_FONT_SIZE_NORM.keys()) + ["unknown"]
@@ -109,6 +129,17 @@ def build_fixture() -> dict:
             "fonts": sorted(f["id"] for f in _FONT_CATALOGUE),
             "concepts": sorted(_CONCEPT_SCENE_GUIDE.keys()),
             "movements": sorted(_MOVEMENT_STYLE_RULES.keys()),
+        },
+        # Tabla de verdad de _normalize_movement_style. `movement_style` viaja
+        # como TEXTO LIBRE y se persiste CRUDO en render_params, así que el
+        # wizard tiene que normalizarlo para saber qué tarjeta resaltar — y si
+        # el espejo JS divergiera, el wizard marcaría una opción que el render
+        # no va a respetar (o ninguna). Se genera en vez de mantenerse a mano
+        # porque un mapa hand-copiado es exactamente lo que este fixture existe
+        # para prevenir.
+        "movement_normalization": {
+            raw: _normalize_movement_style(raw)
+            for raw in sorted(_MOVEMENT_NORMALIZATION_PROBES)
         },
     }
 

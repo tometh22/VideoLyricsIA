@@ -5445,299 +5445,47 @@ def _compute_allow_people(job_id: str | None, operator_prompt: str | None = None
     return bool(_background_safety_policy(job_id, operator_prompt)["allow_people"])
 
 
-def _prompt_may_contain_human_subject(prompt: str | None) -> bool:
-    """High-recall detector used only at the restricted provider boundary.
-
-    This is deliberately separate from :func:`_prompt_explicitly_requests_people`.
-    That function grants an operator permission and therefore favours precision;
-    this function removes potentially unsafe text and therefore favours recall.
-    A false positive here only replaces a restricted prompt with a safe visual
-    direction.  It can never enable people.
-    """
-    import re as _re
-
-    value = _normalise_account_id(prompt)
-    if not value:
-        return False
-    if _prompt_explicitly_requests_people(value):
-        return True
-
-    # Remove common non-human uses before the intentionally broad scan.  These
-    # substitutions protect useful object prompts (clock hands, chair arms,
-    # robotic equipment, 3-D models) without weakening the authorization gate.
-    object_only = (
-        r"(?:clock|watch|reloj|rel[oó]gio)(?:['’]s)?\s+"
-        r"(?:hands?|faces?|manos?|caras?|rostros?|m[aã]os?|faces?|rostos?)|"
-        r"(?:chair|sofa|armchair|silla|sof[aá]|sill[oó]n|cadeira|poltrona)"
-        r"(?:['’]s)?\s+(?:arms?|brazos?|braços?)|"
-        r"(?:mechanical|robotic|crane|boom|industrial|articulated|"
-        r"mec[aáâ]nic[oa]|rob[oóô]tic[oa]|gr[uú]a|guindaste|articulad[oa])"
-        r"\s+(?:arms?|hands?|brazos?|manos?|braços?|m[aã]os?)|"
-        r"(?:rubber|elastic|goma|el[aá]stic[oa])\s+bands?|"
-        r"bandas?\s+el[aá]sticas?|faixas?\s+el[aá]sticas?|"
-        r"(?:electric|ceiling|desk|ventilation|el[eé]ctric[oa]|techo|teto)\s+fans?|"
-        r"(?:3[- ]?d|scale|data|language|render|modelo\s+3d)\s+models?|"
-        r"android\s+(?:phone|device|app|operating\s+system)|"
-        r"(?:circuit|software|device|motor)\s+drivers?|"
-        r"(?:mathematical|boolean|search)\s+operators?|"
-        # Contextos benignos de paisaje que disparaban falsos positivos y
-        # colapsaban prompts sin ninguna persona (bug 2026-07-23: "photographs
-        # appear around them" / "bodies of water" / "cliff faces" / "silhouettes
-        # of pine trees"). No son sujetos humanos; sacarlos antes del scan.
-        r"bodies\s+of\s+water|cuerpos?\s+de\s+agua|corpos?\s+de\s+[aá]gua|"
-        r"(?:cliff|rock|stone|mountain|canyon|glacier|ice|building|wall)\s+faces?|"
-        r"(?:acantilado|roca|piedra|monta[ñn]a)\s+caras?|"
-        r"silhouett\w+\s+of\s+(?:the\s+)?(?:trees?|pines?|mountains?|hills?|"
-        r"buildings?|towers?|rooftops?|skyline|forests?|foliage|branches?|"
-        r"leaves|clouds?|rocks?|ruins?|cit(?:y|yscape))|"
-        r"siluetas?\s+de\s+(?:[aá]rboles|monta[ñn]as|edificios|colinas)"
-    )
-    scan = _re.sub(rf"\b(?:{object_only})\b", " ", value, flags=_re.IGNORECASE)
-    scan = _re.sub(
-        r"\b(?:hands?|arms?|faces?|manos?|brazos?|caras?|rostros?|"
-        r"m[aã]os?|braços?|faces?|rostos?)\s+(?:of|de|do|da|del)\s+"
-        r"(?:a\s+|the\s+|un\s+|una\s+|um\s+|uma\s+|el\s+|la\s+|"
-        r"o\s+|a\s+)?(?:clock|watch|chair|sofa|armchair|reloj|silla|"
-        r"sof[aá]|sill[oó]n|rel[oó]gio|cadeira|poltrona)\b|"
-        r"\b(?:arms?|hands?|brazos?|manos?|braços?|m[aã]os?)\s+"
-        r"(?:mechanical|robotic|industrial|articulated|mec[aáâ]nic[oa]|"
-        r"rob[oóô]tic[oa]|industrial|articulad[oa])\b|"
-        r"\b(?:models?|modelos?)\s+(?:3[- ]?d|de\s+escala)\b",
-        " ",
-        scan,
-        flags=_re.IGNORECASE,
-    )
-
-    # Catch roles we have not enumerated when the grammar itself describes a
-    # human action. This detector only *removes* restricted prompts, so an
-    # occasional environmental false positive is safer than forwarding an
-    # unknown profession (cashier, lifeguard, conductor, etc.) to Universal.
-    if _re.search(
-        r"\b(?:a|an|the|un|una|el|la|um|uma|o)\s+"
-        r"(?:[\wÀ-ɏ'-]+\s+){0,2}[\wÀ-ɏ'-]+\s+"
-        r"(?:walking|running|standing|sitting|dancing|singing|serving|praying|"
-        r"teaching|studying|driving|speaking|smiling|wearing|holding|carrying|"
-        r"working|painting|photographing|marching|meditating|posing|swimming|"
-        r"skating|surfing|caminando|corriendo|de\s+pie|sentad[oa]|bailando|"
-        r"cantando|sirviendo|rezando|enseñando|estudiando|conduciendo|"
-        r"hablando|sonriendo|vistiendo|sosteniendo|cargando|trabajando|"
-        r"pintando|fotografiando|marchando|meditando|posando|nadando|"
-        r"caminhando|correndo|em\s+p[eé]|sentad[oa]|dançando|cantando|"
-        r"servindo|rezando|ensinando|estudando|dirigindo|falando|sorrindo|"
-        r"vestindo|segurando|carregando|trabalhando|pintando|fotografando|"
-        r"marchando|meditando|posando|nadando)\b",
-        scan,
-        _re.IGNORECASE,
-    ):
-        return True
-
-    broad_human = (
-        r"people|persons?|humans?|humanlike|human[- ]shaped|humanoid(?:s)?|"
-        r"men|man|women|woman|male\s+subject|female\s+subject|boys?|girls?|"
-        r"children?|kids?|bab(?:y|ies)|teens?|teenagers?|"
-        r"famil(?:y|ies)|couples?|pairs?|groups?|crowds?|audiences?|friends?|"
-        r"lovers?|pedestrians?|travelers?|tourists?|cyclists?|skaters?|surfers?|"
-        r"protagonists?|hero(?:es)?|heroine(?:s)?|characters?|"
-        r"singers?|musicians?|dancers?|guitarists?|drummers?|vocalists?|"
-        r"performers?|rappers?|djs?|bands?|actors?|models?|workers?|"
-        r"monks?|nuns?|nurses?|doctors?|teachers?|students?|pilots?|officers?|"
-        r"athletes?|coach(?:es)?|mechanics?|engineers?|scientists?|priests?|rabbis?|"
-        r"imams?|police\s+officers?|"
-        r"police(?:man|woman|men|women)|firefighters?|soldiers?|chefs?|"
-        r"waiters?|waitress(?:es)?|farmers?|"
-        r"business(?:man|woman|men|women|people)|puppeteers?|painters?|"
-        r"photographers?|kings?|queens?|princes?|princess(?:es)?|"
-        r"silhouettes?|figures?|statues?|mannequins?|faces?|heads?|bodies?|"
-        r"limbs?|hands?|arms?|"
-        # Pronombres NOMINATIVOS (sujeto) = humano SIEMPRE, sin depender del
-        # verbo (fix del leak 2026-07-23: "he drinks / she weeps / they gather"
-        # tienen que dispararse). Se sacan SOLO los de objeto/posesivo
-        # (them/their/his/her/him/hers) que causaban falsos positivos sobre
-        # objetos ("photographs appear around them", "trees and their shadows").
-        r"he|she|they|"
-        r"personas?|gente|human[oa]s?|humanoides?|hombres?|mujer(?:es)?|"
-        r"niñ[oa]s?|beb[eé]s?|adolescentes?|familias?|parejas?|grupos?|"
-        r"multitud(?:es)?|p[uú]blico|audiencia|amig[oa]s?|amantes?|"
-        r"peatones?|viajer[oa]s?|turistas?|ciclistas?|patinadores?|surfistas?|"
-        r"protagonistas?|h[eé]roes?|hero[ií]nas?|personajes?|"
-        r"cantantes?|m[uú]sicos?|bailar(?:ines|ina|inas|[ií]n)|guitarristas?|"
-        r"bateristas?|vocalistas?|int[eé]rpretes?|raperos?|djs?|bandas?|"
-        r"actor(?:es|as)?|modelos?|trabajador(?:es|as)?|monjes?|monjas?|enfermer[oa]s?|"
-        r"m[eé]dicos?|polic[ií]as?|bomberos?|soldados?|chefs?|cociner[oa]s?|"
-        r"camarer[oa]s?|granjer[oa]s?|empresari[oa]s?|titiriter[oa]s?|"
-        r"profesor(?:a|es|as)?|estudiantes?|pilotos?|atletas?|"
-        r"entrenador(?:a|es|as)?|mec[aá]nic[oa]s?|ingenier[oa]s?|"
-        r"cient[ií]fic[oa]s?|sacerdotes?|rabinos?|imanes?|"
-        r"pintor(?:es)?|pintoras?|fot[oó]graf[oa]s?|re(?:y|yes)|reinas?|"
-        r"pr[ií]ncipes?|princesas?|"
-        r"siluetas?|figuras?|estatuas?|maniqu[ií](?:es)?|caras?|rostros?|"
-        r"cabezas?|cuerpos?|extremidades?|manos?|brazos?|"
-        # Pronombres ES nominativos (todos son sujeto; no hay riesgo de objeto).
-        r"[eé]l|ella|ellos|ellas|"
-        r"pessoas?|humanos?|humanoides?|homem|homens|mulher(?:es)?|"
-        r"crianças?|beb[eê]s?|adolescentes?|fam[ií]lias?|casais?|grupos?|"
-        r"multid[oõã]es?|plateia|p[uú]blico|amigos?|amantes?|pedestres?|"
-        r"viajantes?|turistas?|ciclistas?|skatistas?|surfistas?|"
-        r"protagonistas?|her[oó]is?|hero[ií]nas?|personagens?|"
-        r"cantor(?:a|es|as)?|m[uú]sicos?|dançarinos?|guitarristas?|bateristas?|"
-        r"vocalistas?|artistas?|rappers?|djs?|bandas?|ator(?:es|as)?|modelos?|"
-        r"trabalhador(?:es|as)?|monges?|freiras?|enfermeir[oa]s?|m[eé]dicos?|"
-        r"policial|policiais|bombeiros?|soldad[oa]s?|cozinheir[oa]s?|garçons?|"
-        r"garçom|garçons|garçonetes?|fazendeir[oa]s?|empres[aá]ri[oa]s?|marionetistas?|"
-        r"professor(?:a|es|as)?|estudantes?|pilotos?|atletas?|"
-        r"treinador(?:a|es|as)?|mec[aâ]nic[oa]s?|engenheir[oa]s?|"
-        r"cientistas?|padres?|rabinos?|imames?|"
-        r"pintor(?:es|as)?|fot[oó]graf[oa]s?|reis?|rainhas?|pr[ií]ncipes?|princesas?|"
-        r"silhuetas?|figuras?|est[aá]tuas?|manequins?|faces?|rostos?|"
-        r"cabeças?|corpos?|membros?|m[aã]os?|braços?|"
-        # Pronombres PT nominativos.
-        r"ele|ela|eles|elas"
-    )
-    negative = (
-        r"no|not|without|avoid|exclude|never|none|zero|free\s+of|devoid\s+of|"
-        r"sin|evitar|excluir|nunca|ning[uú]n(?:a|o|as|os)?|cero|libre\s+de|"
-        r"sem|n[aã]o|evite|exclua|nenhum(?:a|as|os)?"
-    )
-    contrast = _re.compile(
-        r"\b(?:but|however|instead|except|apart\s+from|other\s+than|include|"
-        r"show|feature|featuring|pero|sino|excepto|salvo|incluir|incluye|"
-        r"mostrar|muestra|por[eé]m|mas|exceto|incluir|mostrar)\b",
-        _re.IGNORECASE,
-    )
-    for match in _re.finditer(rf"\b(?:{broad_human})\b", scan, _re.IGNORECASE):
-        hard_before = _re.split(r"[\n.!?;]", scan[:match.start()])[-1]
-        # A comma starts a new visual item for this high-recall boundary.  This
-        # intentionally catches "without people nearby, a singer".  Explicit
-        # negative lists may be over-sanitized, which is safe and does not
-        # change authorization.
-        before = contrast.split(hard_before)[-1].rsplit(",", 1)[-1]
-        hard_after = _re.split(r"[\n.!?;]", scan[match.end():], maxsplit=1)[0]
-        after = contrast.split(hard_after, maxsplit=1)[0]
-        if _re.search(rf"\b(?:{negative})\b[\s\S]{{0,80}}$", before):
-            continue
-        if _re.search(
-            rf"^\s*(?:[:,;\-]\s*)?(?:(?:is|are|must\s+be|should\s+be|"
-            rf"es|son|debe\s+ser|[eé]|s[aã]o|deve\s+ser)\s+)?"
-            rf"(?:none|zero|cero|ning[uú]n(?:a|o|as|os)?|"
-            rf"nenhum(?:a|as|os)?|absent|forbidden|prohibited|not\s+allowed)\b",
-            after,
-        ):
-            continue
-        if _re.search(
-            r"^\s*(?:(?:must|should|can|could|may|do|does)\s+not|cannot|"
-            r"can't)\s+(?:appear|be\s+(?:shown|visible|included|depicted))\b|"
-            r"^\s*no\s+(?:debe|deber[ií]a|puede)?\s*"
-            r"(?:aparecer|mostrarse|verse|incluirse)\b|"
-            r"^\s*n[aã]o\s+(?:deve|deveria|pode)?\s*"
-            r"(?:aparecer|ser\s+(?:mostrad[oa]|vis[ií]vel|inclu[ií]d[oa]))\b",
-            after,
-            _re.IGNORECASE,
-        ):
-            continue
-        return True
-    return False
-
-
-# Pool DIVERSO de arquetipos de entorno para el fallback del sanitizador
-# cuando la remoción quirúrgica no deja escena usable. NO es un único string:
-# se elige por hash del prompt para que canciones distintas den entornos
-# distintos (bug 2026-07-23: un fallback fijo colapsaba todos los fondos a lo
-# mismo). Evita a propósito los clichés recurrentes (campo con árbol, callejón,
-# highway desolado, humo, partículas flotando).
-_UNOCCUPIED_FALLBACK_SETTINGS = (
-    "a sunlit room with worn wooden floors and tall windows",
-    "an analog recording studio with mixing consoles and warm lamplight",
-    "an old theater interior with empty velvet seats and stage lights",
-    "a rooftop terrace overlooking a dense city skyline at golden hour",
-    "a dim archive library lined with shelves, papers and shafts of light",
-    "a greenhouse full of plants under soft diffuse grey light",
-    "a neon-lit diner interior at midnight with empty booths and chrome",
-    "a harbor at dawn with moored boats and still reflective water",
-    "a grand cathedral interior with stone columns and colored light",
-    "a vintage train station concourse with iron arches at first light",
-    "a corner cafe interior with marble tables and brass fixtures",
-    "a mountain lake at dusk with mirror-still water and distant peaks",
-)
-
-
-def _sanitize_people_at_provider_boundary(
+def _note_people_policy_at_provider_boundary(
     prompt: str | None,
     *,
     allow_people: bool,
-    concept: str | None = None,
-    movement_style: str | None = None,
-) -> str:
-    """Mantener sujetos humanos fuera de los prompts restringidos SIN destruir
-    la escena del operador / del planner.
+    job_id: str | None = None,
+) -> None:
+    """Observabilidad en el borde del proveedor. NUNCA muta el prompt.
 
-    Antes (bug 2026-07-23): cualquier prompt marcado "con humano" —incluso
-    falsos positivos y el "Mi prompt" explícito del operador— se reemplazaba
-    entero por UN string genérico fijo → todos los fondos salían idénticos y no
-    se respetaba lo pedido.
+    Hasta 2026-07-24 acá vivía ``_sanitize_people_at_provider_boundary``: un
+    detector de alta recall reescribía el prompt del operador cuando "parecía"
+    tener una persona. Se eliminó por decisión de producto — el texto del
+    operador es intocable — y porque el detector era irrecuperablemente
+    impreciso sobre texto libre en español: la lista de pronombres incluía
+    ``[eé]l``, que matchea el ARTÍCULO "el" además del pronombre "él". Medido:
+    6 de cada 10 prompts realistas en español daban falso positivo, y el
+    reemplazo era un arquetipo elegido por hash (job d34cef371408 pidió "la
+    avenida 9 de julio y el obelisco" y recibió una catedral). Prod tenía la
+    variante peor: un único string fijo para todos.
 
-    Ahora: cuando la política niega personas y hay un sujeto humano, se remueven
-    QUIRÚRGICAMENTE solo las oraciones/clausulas humanas y se preserva el
-    escenario (lugar, arquitectura, objetos, luz, paleta, clima). El bloque de
-    negativos ("no people/faces/text/logos") se agrega aguas abajo, así la
-    restricción se mantiene aunque quede un fragmento. Solo si no sobra escena
-    usable se cae a un fallback VARIADO por-prompt (no un string único).
+    Las personas se siguen evitando donde importa —en la IMAGEN, no en el
+    texto— con dos capas que no dependen de esta función:
+      1. El riel negativo del prompt ("no people, no faces, no hands"), que se
+         agrega aguas abajo siempre que ``allow_people`` es falso.
+      2. La validación Vision de los frames de salida
+         (``_validate_background_asset_for_job``), autoritativa y obligatoria
+         para Universal.
     """
-    import re as _re
-
-    value = str(prompt or "").strip()
-    if allow_people or not _prompt_may_contain_human_subject(value):
-        return value
-
-    # 1) Remoción quirúrgica: por oración, y si la oración trae humano, por
-    #    clausula (coma). Se conservan las partes que NO son humanas.
-    sentences = _re.split(r"(?<=[.!?;])\s+", value)
-    kept: list[str] = []
-    for sent in sentences:
-        s = sent.strip()
-        if not s:
-            continue
-        if not _prompt_may_contain_human_subject(s):
-            kept.append(s)
-            continue
-        clauses = [c.strip() for c in s.split(",")]
-        good = [c for c in clauses if c and not _prompt_may_contain_human_subject(c)]
-        if good:
-            kept.append(", ".join(good))
-    preserved = " ".join(kept).strip()
-    preserved = _re.sub(r"\s+,", ",", preserved)
-    preserved = _re.sub(r",\s*,", ", ", preserved).strip(" ,")
-
-    # Defense-in-depth: re-verificar el resultado unido. Si por un borde de
-    # clausula quedó algún sujeto humano, NO lo devolvemos — caemos al fallback.
-    # Umbral bajo (24) para preservar escenas cortas pero válidas ("Neon signs
-    # above an empty street") en vez de colapsarlas al fallback.
-    if len(preserved) >= 24 and not _prompt_may_contain_human_subject(preserved):
+    if allow_people:
+        return
+    if _prompt_explicitly_requests_people(prompt):
+        # Detector de PRECISIÓN (el mismo que otorga el permiso), no el de
+        # recall: solo avisa cuando el operador pidió personas de forma
+        # explícita y su cuenta no las permite. El prompt viaja igual; el
+        # riel negativo y la validación de salida son las que deciden.
         logger.warning(
-            "[BG_POLICY] human subject removed; scene preserved (%d chars)",
-            len(preserved),
+            "[BG_POLICY] job=%s: el prompt del operador pide personas y la "
+            "cuenta no las permite; el prompt se preserva intacto — el riel "
+            "negativo y la validación Vision resuelven la salida",
+            job_id,
         )
-        return preserved
 
-    # 2) No sobró escena usable → fallback VARIADO (no un string único): se
-    #    elige un arquetipo por hash del prompt original y se enriquece con el
-    #    concepto si está disponible, para que cada canción difiera.
-    import hashlib as _hashlib
-
-    idx = int(_hashlib.sha256(value.encode("utf-8")).hexdigest(), 16) % len(
-        _UNOCCUPIED_FALLBACK_SETTINGS
-    )
-    setting = _UNOCCUPIED_FALLBACK_SETTINGS[idx]
-    concept_bit = (
-        f", evoking {concept.strip()}" if concept and concept.strip() else ""
-    )
-    logger.warning(
-        "[BG_POLICY] no usable non-human scene; varied fallback #%d", idx
-    )
-    return (
-        f"A distinctive, unoccupied cinematic environment: {setting}{concept_bit}. "
-        "Rich detail across foreground, middle ground and background; no character "
-        "as the subject; environmental motion only"
-    )
 
 
 def _validate_background_asset_for_job(
@@ -8534,7 +8282,7 @@ Hard rules:
 - Pick a DIFFERENT specific scene each time (don't repeat across songs)
 - If lyrics reference a sport (football, basketball, etc.) → use field/pitch/arena/equipment, NOT cars or generic cityscapes
 - Do NOT default to "calm ocean at sunset" unless the song is genuinely BALLAD
-""" + ("" if allow_people else "- Never include people, faces, hands, or readable text in the scene")
+""" + ("" if allow_people else "- Never make a person the subject: no close-ups of people, no recognizable faces, no portraits. Small, distant, incidental figures in a wide or aerial view are fine\n- Never include readable text in the scene")
         else:
             # Strict auto mode: classify genre, pick vocabulary, no lyrics.
             system_prompt = f"""{_EXAMPLE}
@@ -8550,7 +8298,7 @@ Hard rules:
 - "style" must always be "video"
 - Pick a DIFFERENT specific scene each time (don't repeat across songs)
 - Do NOT default to "calm ocean at sunset" unless the song is genuinely BALLAD
-""" + ("" if allow_people else "- Never include people, faces, hands, or readable text in the scene")
+""" + ("" if allow_people else "- Never make a person the subject: no close-ups of people, no recognizable faces, no portraits. Small, distant, incidental figures in a wide or aerial view are fine\n- Never include readable text in the scene")
         if movement_rule:
             system_prompt = system_prompt + "\n- " + movement_rule
 
@@ -9033,11 +8781,12 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     global _last_veo_request
 
     atmospherics_policy = atmospherics_policy or resolve_atmospherics_policy(None)
-    prompt = _sanitize_people_at_provider_boundary(
-        prompt,
-        allow_people=allow_people,
-        concept=normalized_concept,
-        movement_style=movement_style,
+    # El prompt del operador NO se reescribe (2026-07-24): solo se registra
+    # cuando pide personas y la cuenta no las permite. El riel negativo de
+    # abajo y la validación Vision de la salida son las capas que evitan
+    # caras/personas en el video.
+    _note_people_policy_at_provider_boundary(
+        prompt, allow_people=allow_people, job_id=job_id,
     )
     # Last-boundary finalizer. Literal operator text is preserved, generated
     # text is sanitized, and both retain the immutable negative rail when the
@@ -9064,11 +8813,21 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     )
 
     # ``allow_people`` can only be true for a non-Universal account with both
-    # an explicit human request and the existing fondo-libre opt-in. Universal
+    # an explicit human request and the existing fondo-libre opt-out. Universal
     # is resolved authoritatively by tenant/billing group and never reaches
     # this branch with people enabled. Logo/brand/readable-text negatives stay
     # regardless because those are independent legal/IP concerns.
-    _people_clause = "" if allow_people else " no people, no faces, no hands,"
+    #
+    # 2026-07-24: el riel dejó de ser "no people". La regla real del sello es
+    # que no se vean CARAS RECONOCIBLES ni una persona como sujeto del plano;
+    # figuras chiquitas y lejanas de un plano general son aceptables. El "no
+    # people" viejo hacía imposible cualquier plano urbano honesto (una cenital
+    # de la Avenida 9 de Julio con autos y gente diminuta se pedía VACÍA), y
+    # contradecía el prompt del operador en vez de acompañarlo.
+    _people_clause = "" if allow_people else (
+        " no close-up of a person, no recognizable faces, no identifiable "
+        "individual, no portrait, no person as the subject of the shot,"
+    )
     # Shared IP / content negatives (text, logos, optionally people) — present
     # in every register.
     _base_negatives = (
@@ -9671,9 +9430,10 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
     client = _get_genai_client()
 
     atmospherics_policy = atmospherics_policy or resolve_atmospherics_policy(None)
-    prompt = _sanitize_people_at_provider_boundary(
-        prompt,
-        allow_people=allow_people,
+    # Mismo criterio que en el borde de Veo: el prompt del operador viaja
+    # intacto; personas se evitan por riel negativo + validación de salida.
+    _note_people_policy_at_provider_boundary(
+        prompt, allow_people=allow_people, job_id=job_id,
     )
     prompt = finalize_provider_prompt(
         prompt,
@@ -9685,7 +9445,13 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
                     or os.environ.get("IMAGEN_MODEL")
                     or "imagen-4.0-generate-001").strip()
 
-    _people_suffix = "" if allow_people else " no people, no faces, no hands,"
+    # Mismo criterio que en el borde de Veo (2026-07-24): caras reconocibles y
+    # personas protagónicas, no la presencia humana incidental de un plano
+    # general.
+    _people_suffix = "" if allow_people else (
+        " no close-up of a person, no recognizable faces, no identifiable "
+        "individual, no portrait, no person as the subject of the shot,"
+    )
     safe_prompt = f"{prompt}. No text, no words, no letters,{_people_suffix} no logos, no readable signage."
 
     recorder = record_ai_call(
@@ -9875,6 +9641,161 @@ def _bg_scene_discontinuity(video_path: str) -> float:
         _raise_if_job_timeout(e)
         logger.warning("[BG][SCENE-CUT] check failed (fail-open): %s", e)
         return 0.0
+
+
+def _estimate_shift(prev, cur, window) -> tuple[float, float]:
+    """Traslación (dx, dy) en px entre dos frames, por correlación de fase.
+
+    numpy puro (FFT), sin opencv. Dos detalles que NO son opcionales — sin
+    ellos la medición da cero para paneos reales (verificado):
+
+    - VENTANA de Hanning + resta de la media: sin ventanear, la fuga espectral
+      de los bordes domina la correlación y el pico queda en el origen.
+    - SUB-PÍXEL por interpolación parabólica: a 320 px de ancho un drift lento
+      es sub-píxel entre frames, y el pico entero lo redondea a 0.
+    """
+    import numpy as _np
+
+    a = (prev - prev.mean()) * window
+    b = (cur - cur.mean()) * window
+    fa = _np.fft.fft2(a)
+    fb = _np.fft.fft2(b)
+    cross = fa * _np.conj(fb)
+    mag = _np.abs(cross)
+    mag[mag == 0] = 1.0
+    corr = _np.fft.fftshift(_np.fft.ifft2(cross / mag).real)
+    h, w = prev.shape
+    iy, ix = _np.unravel_index(_np.argmax(corr), corr.shape)
+
+    def _sub(line, i, n):
+        if i <= 0 or i >= n - 1:
+            return 0.0
+        left, mid, right = line[i - 1], line[i], line[i + 1]
+        denom = left - 2 * mid + right
+        return 0.0 if denom == 0 else 0.5 * (left - right) / denom
+
+    dy = (iy - h // 2) + _sub(corr[:, ix], iy, h)
+    dx = (ix - w // 2) + _sub(corr[iy, :], ix, w)
+    return float(dx), float(dy)
+
+
+def _measure_camera_drift(video_path: str, samples: int = 12) -> dict | None:
+    """Mide cuánto se MOVIÓ LA CÁMARA en un clip, como % del ancho del frame.
+
+    Para qué: medición propia sobre los fondos `movement_style=estatico` de
+    staging (25-jul-2026) dio 4 de 7 realmente clavados (≤0,14% del ancho) y
+    3 con paneo real — 6,1%, 26,8% y 29,7%, uno de ellos un push-in frontal,
+    que es justo lo que el prompt prohíbe por legibilidad de la letra. Veo
+    ignora el "locked camera" seguido y no hay campo estructurado para forzarlo,
+    así que lo único posible es MEDIRLO. Esta función sólo mide y loguea: la
+    decisión de re-rollear necesita datos primero (y un presupuesto de retry
+    propio, ver el comentario al final).
+
+    Tres decisiones que importan y que una implementación naive erra:
+
+    1) BORDES, no el frame completo. `estatico` está DISEÑADO para tener
+       movimiento dentro de la escena ("gente caminando, olas, nubes, neblina,
+       fuego" — ver el routing de estatico/sutil). Una correlación global sobre
+       una cascada o una multitud que llena el cuadro mide al SUJETO y reporta
+       paneo donde no hay. Las franjas de borde son lo más cercano a un ancla
+       estática que tiene un plano fijo.
+
+    2) EXCURSIÓN ACUMULADA MÁXIMA, no el desplazamiento neto. Un vaivén vuelve
+       al origen: el neto da ~0 y el paneo es igual de visible.
+
+    3) El clip PRE-LOOP. El fondo final está palindromizado (A + reverse(A)),
+       así que cualquier corrimiento neto se cancela por construcción. Hay que
+       medir la salida cruda de Veo.
+
+    Devuelve {"pct_width", "pct_width_borders", "peak_px", "frames"} o None.
+    Fail-open por diseño: esto NUNCA debe bloquear un fondo.
+
+    Validado contra los 7 fondos `estatico` de staging (con inspección visual de
+    los casos en disputa): los 6 de cámara fija dan ≤0,03% y el único push-in
+    real da 5,9%. Se emiten las DOS variantes (frame completo y mediana de
+    franjas de borde) porque todavía no hay datos para elegir umbral: la de
+    bordes es más robusta a un sujeto que llena el cuadro, la global es más
+    limpia cuando el fondo tiene textura estable.
+    """
+    tmpdir = None
+    try:
+        import numpy as _np
+        import tempfile as _tf
+        from PIL import Image as _Img
+
+        tmpdir = _tf.mkdtemp(prefix="drift_")
+        pattern = os.path.join(tmpdir, "f_%03d.png")
+        # fps bajo + escala chica: alcanza para traslación global y deja el costo
+        # en decenas de ms. Mismo patrón de extracción que
+        # _bg_scene_discontinuity (ffmpeg subprocess, no moviepy).
+        run_checked(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path,
+             "-vf", "fps=3,scale=320:180", "-frames:v", str(samples), pattern],
+            label="ffmpeg-drift-frames",
+            timeout=120,
+        )
+        files = sorted(f for f in os.listdir(tmpdir) if f.endswith(".png"))
+        if len(files) < 3:
+            return None
+
+        frames = []
+        for name in files:
+            with _Img.open(os.path.join(tmpdir, name)) as im:
+                frames.append(_np.asarray(im.convert("L"), dtype=_np.float64))
+
+        h, w = frames[0].shape
+        band = max(24, h // 4)
+        side = max(24, w // 4)
+
+        def _patches(a):
+            # Cuatro franjas de borde, cada una medida POR SEPARADO (apilarlas
+            # en un solo array destruye la continuidad espacial que la
+            # correlación necesita — daba 0 para paneos reales).
+            return [a[:band, :], a[-band:, :], a[:, :side], a[:, -side:]]
+
+        def _hann(shape):
+            return _np.outer(_np.hanning(shape[0]), _np.hanning(shape[1]))
+
+        patch_windows = [_hann(p.shape) for p in _patches(frames[0])]
+        full_window = _hann((h, w))
+
+        # Contra el PRIMER frame, no contra el anterior: la excursión respecto
+        # del inicio es lo que se percibe como "la cámara se movió", y acumular
+        # pasos consecutivos pierde los drifts lentos por cuantización.
+        peak_full = 0.0
+        peak_borders = 0.0
+        base_patches = _patches(frames[0])
+        for i in range(1, len(frames)):
+            est = [
+                _estimate_shift(pa, pb, win)
+                for pa, pb, win in zip(base_patches, _patches(frames[i]), patch_windows)
+            ]
+            # Mediana por componente: robusta a que UNA franja esté dominada por
+            # movimiento de la escena (nubes, niebla, agua) en vez de la cámara.
+            bdx = float(_np.median([e[0] for e in est]))
+            bdy = float(_np.median([e[1] for e in est]))
+            peak_borders = max(peak_borders, (bdx ** 2 + bdy ** 2) ** 0.5)
+
+            fdx, fdy = _estimate_shift(frames[0], frames[i], full_window)
+            peak_full = max(peak_full, (fdx ** 2 + fdy ** 2) ** 0.5)
+
+        return {
+            "pct_width": round(100.0 * peak_full / float(w), 2),
+            "pct_width_borders": round(100.0 * peak_borders / float(w), 2),
+            "peak_px": round(peak_full, 1),
+            "frames": len(frames),
+        }
+    except Exception as e:
+        _raise_if_job_timeout(e)
+        logger.warning("[BG][DRIFT] medición falló (fail-open): %s", e)
+        return None
+    finally:
+        if tmpdir:
+            try:
+                import shutil as _sh
+                _sh.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 def _score_video_relevance(video_path: str, prompt: str) -> int:
@@ -11042,31 +10963,25 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
 
     _norm_move_bg = _normalize_movement_style(movement_style)
 
-    # UMG-style fix (2026-05-25): si el operador eligió "Estático" o "Sutil"
-    # SIN effect overlay, default a "light" (el más sutil de los 5). Las
-    # references UMG NUNCA tienen 100% quieto — siempre hay particles
-    # overlay o motion in-scene. Combined con subtle Ken Burns drift, esto
-    # garantiza que el video parezca vivo.
-    # Operator override: si seteó effect="" pero tildó algún otro motion
-    # (no estatico/sutil), respetamos su elección (no forzamos light).
-    # Foto fija / estático / sutil SIN effect → default a "light" (el más sutil)
-    # para que el fondo nunca quede 100% muerto. La "Foto fija" (ex foto-parallax)
-    # ya no panea — la vida/movimiento la da el efecto componible (lluvia/nieve/
-    # luces/estrellas/bokeh vía fx_compositor). El operador elige el efecto en el
-    # wizard; este default sólo cubre el caso sin elección.
-    # The operator's ACTUAL effect choice, captured BEFORE the anti-dead-frame
-    # "light" default below — used to gate background darkening so we darken for
-    # the effect the operator really picked (and no-op when they picked none),
-    # not for the forced default. (Review fix 2026-06-03: `effect` was never
-    # forwarded here, so darkening fired off the forced "light" for every still.)
+    # La elección REAL de efecto del operador. Se usa para gatear el darkening
+    # del prompt (oscurecer sólo cuando de verdad va a haber partículas encima).
+    #
+    # BORRADO 2026-07-25 — el default anti-frame-muerto que vivía acá:
+    #     if _norm_move_bg in ("estatico","sutil","foto-parallax") and not effect:
+    #         effect = "light"
+    # era un NO-OP. Reasignaba el parámetro LOCAL de _ensure_background, que sólo
+    # retorna un path; el overlay real se compone del `effect` de run_pipeline
+    # (ver fx_compositor.build_video_filter), que nunca vio este valor. O sea:
+    # "Foto fija" sin efecto rendereaba una imagen 100% congelada — exactamente
+    # lo que el bloque decía prevenir — y el log afirmaba que había aplicado el
+    # default. Un log que miente es peor que no tenerlo.
+    #
+    # En vez de "arreglarlo" (inyectar un efecto que el operador no pidió), la
+    # decisión vuelve al operador: el wizard ahora avisa de forma persistente que
+    # Foto fija sin efecto queda inmóvil, ofrece saltar al selector de Efecto, y
+    # renombra la card a "Sin efecto — imagen quieta" en esa combinación. Elegir
+    # que quede quieto es válido; que sea una decisión y no un accidente.
     _operator_effect = (effect or "").strip().lower()
-    if _norm_move_bg in ("estatico", "sutil", "foto-parallax") and not (effect or "").strip():
-        logger.info(
-            "[BG] movement=%s + no effect selected — defaulting effect=light "
-            "para evitar foto 100%% quieta (UMG-style guideline 2026-05-25)",
-            _norm_move_bg,
-        )
-        effect = "light"
 
     # Animado is a Veo-only aesthetic (the 2D-illustration safe_prompt lives in
     # _generate_veo_video). Imagen renders stills, so an animado+imagen combo
@@ -11126,8 +11041,10 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         # Foto fija + efectos (2026-06-03; review-fixed same day): if the
         # operator picked a luminous particle effect, bias the still toward a
         # dark/low-key canvas so the screen-blended particles read. Gated on the
-        # operator's ACTUAL pick (_operator_effect), NOT the forced "light"
-        # default, so it no-ops when no effect was chosen. AND never applied to
+        # operator's ACTUAL pick (_operator_effect) → no-op cuando no eligió
+        # ninguno. (Hasta 2026-07-25 este gate existía para no dispararse con el
+        # default forzado a "light"; ese default se borró por ser un no-op.)
+        # AND never applied to
         # a verbatim operator prompt — "usá mi prompt tal cual" must not get
         # dark grading bolted on (the imagen branch returns before the Veo
         # path's _is_verbatim is computed, so we check it inline here).
@@ -11263,6 +11180,42 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                     discont, _BG_SCENE_CUT_THRESHOLD,
                     os.path.basename(bg_path), job_id,
                 )
+            # Cumplimiento de "Estático": SOLO MEDIR Y LOGUEAR (2026-07-25).
+            #
+            # Veo ignora el locked-camera bastante seguido y no expone un campo
+            # estructurado para forzarlo: los negativos del prompt son el único
+            # lever. Medición propia sobre los 7 fondos `estatico` de staging: 4
+            # clavados (≤0,14% del ancho) y 3 con paneo real (6,1 / 26,8 /
+            # 29,7%), uno un push-in frontal. Antes de re-rollear hace falta
+            # saber la tasa real, así que esto emite la métrica en cada render
+            # estático y no toca el resultado.
+            #
+            # Por qué NO se re-rollea todavía (y por qué no puede colgarse de
+            # `quality_retry_used`): ese retry RE-DERIVA el prompt, o sea que
+            # cambiaría la escena en vez de corregir la cámara — "me cambió
+            # todo", que es una queja peor. Además comparte el único slot con el
+            # detector de cortes, y si el reintento pega un 429 el except de más
+            # abajo cae al gradiente y tira el clip bueno. Un re-roll de drift
+            # necesita: mismo prompt + generation_nonce fresco (si no, cache HIT
+            # → clip idéntico), quedarse con el MEJOR de los dos candidatos,
+            # presupuesto propio, y no-op duro si veo_breaker está abierto o
+            # bg_verbatim. Va en un PR aparte, con los datos en la mano.
+            if _norm_move_bg == "estatico":
+                _drift = _measure_camera_drift(bg_path)
+                if _drift:
+                    # El modelo va en la línea porque es la variable que se
+                    # quiere correlacionar: veo-3.1-fast tiene un drift prior
+                    # más fuerte que el standard, y VEO_MODEL_STATIC (hoy sin
+                    # setear) es la mitigación a evaluar con estos datos.
+                    logger.info(
+                        "[BG][DRIFT] job=%s movement=estatico model=%s "
+                        "drift_pct=%.2f drift_pct_borders=%.2f peak_px=%.1f frames=%s",
+                        job_id,
+                        (os.environ.get("VEO_MODEL_STATIC", "").strip()
+                         or os.environ.get("VEO_MODEL", "veo-3.1-fast-generate-001").strip()),
+                        _drift["pct_width"], _drift["pct_width_borders"],
+                        _drift["peak_px"], _drift["frames"],
+                    )
             # Verbatim: never re-roll. A re-roll re-runs _get_unique_prompt
             # which short-circuits to the SAME verbatim text → identical
             # safe_prompt → Veo cache HIT → same clip, wasting a scoring pass

@@ -11728,6 +11728,16 @@ class VariantJobRequest(BaseModel):
     valores del padre. La única forma "barata" de crear variante es no
     mandar nada y dejar que Gemini re-elija el prompt con el system prompt
     desbiaseado (PR #116).
+
+    Contrato espejado con /edit (2026-07-24, "Crear variante abre el wizard
+    completo"): TODOS los ejes que el wizard de edición deja tocar viajan
+    también acá, con la misma semántica None-aware:
+        None  → heredar del padre (no pisa render_params)
+        valor → override
+        ""    → clear explícito para los campos de texto (mismo contrato
+                que /edit para background_hint; ver request_edit).
+    Sin esto el wizard mostraba controles editables que el backend tiraba a
+    la basura — exactamente lo que el PR #977 ("honestidad") prohíbe.
     """
     # Mismo formato y max_length que EditJobRequest.background_hint —
     # va al user_content de Gemini con header [OPERATOR OVERRIDE].
@@ -11742,6 +11752,48 @@ class VariantJobRequest(BaseModel):
     concept: str | None = Field(default=None, max_length=2000)
     # Override del style preset (gradient palette + visual register).
     style: str | None = Field(default=None, max_length=50)
+    # ── Ejes de escena (espejo exacto de EditJobRequest) ─────────────────
+    # genre/concept orientan el vocabulario de la escena IA; match_lyrics =
+    # "Inspirado en la letra" (True) vs "Auto/Mi prompt" (False).
+    genre: str | None = Field(default=None, max_length=64)
+    match_lyrics: bool | None = Field(default=None)
+    # "Usar mi prompt tal cual": el hint va directo a Veo sin reescritura
+    # de Gemini. None = heredar (mismo BUG-5 que cerró /edit).
+    bg_verbatim: bool | None = Field(default=None)
+    # Registro de cámara/movimiento. También decide el MOTOR aguas abajo
+    # ("foto-parallax" → Imagen, resto → Veo, pipeline.py) — por eso NO hay
+    # un campo "motor" separado en este body.
+    movement_style: str | None = Field(default=None, max_length=64)
+    # ── Capa FX + animaciones de letra (espejo de EditJobRequest) ────────
+    effect: str | None = Field(default=None, max_length=32)
+    lyrics_animation: str | None = Field(default=None, max_length=16)
+    line_transition: str | None = Field(default=None, max_length=16)
+    # ── Tipografía (espejo de EditJobRequest) ────────────────────────────
+    font: str | None = Field(default=None, max_length=64)
+    font_scale: float | None = None
+    text_case: str | None = Field(default=None, max_length=16)
+    text_contrast: str | None = Field(default=None, max_length=16)
+    frame_format: str | None = Field(default=None, max_length=16)
+    # Paleta custom (hex/nombres coma-separados) usada cuando style=="custom".
+    custom_colors: str | None = Field(default=None, max_length=200)
+    # ── Portada / title card (espejo de EditJobRequest) ──────────────────
+    title_template: str | None = Field(default=None, max_length=16)
+    title_size: float | None = None
+    title_artist_font: str | None = Field(default=None, max_length=64)
+    title_song_font: str | None = Field(default=None, max_length=64)
+    title_song_break: str | None = Field(default=None, max_length=200)
+    # ── Biblioteca de fondos ─────────────────────────────────────────────
+    # Una variante ES un job nuevo, así que reusa el mismo resolver que
+    # /generate y /upload (_resolve_library_background) — no el edit_type
+    # "background_library" de /edit. Cuando viene background_id, ese camino
+    # REEMPLAZA la generación IA (mismo orden de precedencia que /generate).
+    # background_mode acá es el modo de la BIBLIOTECA (as_is | variation),
+    # NO un motor Veo/Imagen: el motor lo deriva movement_style.
+    background_id: int | None = Field(default=None)
+    background_mode: str | None = Field(
+        default=None,
+        pattern="^(as_is|variation)$",
+    )
     # 2026-05-29 — Variant cap policy: each plan includes 3 renders of
     # the same song (original + 2 variants). The 4th onward costs
     # VARIANT_OVERAGE_COST_USD passthrough (Veo background generation
@@ -11752,6 +11804,45 @@ class VariantJobRequest(BaseModel):
     # month-close billing surfaces the line items per tenant.
     acknowledge_variant_overage: bool = Field(default=False)
 
+
+# Campos de VariantJobRequest que pisan render_params del padre 1:1 (el
+# nombre del campo del body ES la key de render_params). Explícito y a
+# nivel módulo para que el contrato sea grepeable y testeable sin leer el
+# handler — y para que agregar un control al wizard sea una sola línea acá
+# en vez de un `if` suelto más.
+#
+# Excluidos a propósito:
+#   - style              → columna de la DB (Job.style), no render_params.
+#   - background_id/mode → resuelven la Biblioteca, no son render params.
+#   - bypass/force_content_validation → los mergea
+#     _merge_content_validation_choice (mutuamente excluyentes).
+#   - acknowledge_variant_overage → flag de billing, no de render.
+_VARIANT_OVERRIDABLE_FIELDS = (
+    # Escena / fondo
+    "background_hint",
+    "concept",
+    "genre",
+    "match_lyrics",
+    "bg_verbatim",
+    "movement_style",
+    # FX + animaciones de letra
+    "effect",
+    "lyrics_animation",
+    "line_transition",
+    # Tipografía
+    "font",
+    "font_scale",
+    "text_case",
+    "text_contrast",
+    "frame_format",
+    "custom_colors",
+    # Portada / title card
+    "title_template",
+    "title_size",
+    "title_artist_font",
+    "title_song_font",
+    "title_song_break",
+)
 
 # Variant-overage policy constants. Module-level so tests can monkey-
 # patch them and operators can grep for the magic numbers from the FAQ
@@ -11964,10 +12055,19 @@ async def create_variant(
             detail="No se pueden crear variantes de un Art Track.",
         )
     new_render_params = dict(parent_render_params)
-    if body.background_hint is not None:
-        new_render_params["background_hint"] = body.background_hint
-    if body.concept is not None:
-        new_render_params["concept"] = body.concept
+    # Contrato None-aware espejado con /edit: None = heredar (no tocamos la
+    # key del padre), valor = override, "" = clear explícito (persiste ""
+    # en render_params y NO revive el valor viejo — mismo comportamiento
+    # que el guard de background_hint en request_edit).
+    _overridden_fields = []
+    for _field in _VARIANT_OVERRIDABLE_FIELDS:
+        _value = getattr(body, _field, None)
+        if _value is None:
+            continue
+        if isinstance(_value, str):
+            _value = _value.strip()
+        new_render_params[_field] = _value
+        _overridden_fields.append(_field)
     new_render_params = _merge_content_validation_choice(
         new_render_params,
         bypass=body.bypass_content_validation,
@@ -12033,6 +12133,37 @@ async def create_variant(
             parent.job_id, parent.input_r2_key, _exc,
         )
 
+    # Biblioteca de fondos. Una variante es un job NUEVO, así que reusa el
+    # mismo resolver que /generate y /upload (no el edit_type
+    # "background_library" de /edit, que parchea un job existente). Se
+    # resuelve ANTES de insertar la row: _resolve_library_background trae
+    # gratis el tenant-gate (404 no-revelador) y cualquier 404/400 acá
+    # aborta sin dejar un job huérfano en "processing" que nadie encola.
+    # AssetUsage.job_id no tiene FK, así que registrar el uso con el
+    # job_id que estamos por crear es seguro.
+    variant_bg_path = None
+    variant_bg_r2_key = None
+    variant_variation_source_path = None
+    variant_variation_source_r2_key = None
+    variant_variation_parent_id = None
+    if body.background_id:
+        _variant_job_dir = os.path.join(OUTPUTS_DIR, new_job_id)
+        os.makedirs(_variant_job_dir, exist_ok=True)
+        (
+            variant_bg_path,
+            variant_bg_r2_key,
+            variant_variation_source_path,
+            variant_variation_source_r2_key,
+            variant_variation_parent_id,
+        ) = _resolve_library_background(
+            body.background_id,
+            body.background_mode or "as_is",
+            current_user,
+            db,
+            _variant_job_dir,
+            new_job_id,
+        )
+
     new_job = JobModel(
         job_id=new_job_id,
         user_id=current_user["id"],
@@ -12062,6 +12193,12 @@ async def create_variant(
             "background_hint": body.background_hint,
             "concept_overridden": body.concept is not None,
             "style_overridden": body.style is not None,
+            # Qué ejes pisó el operador en el wizard (vs heredar del padre).
+            # Sin esto, un "por qué salió distinto al padre" post-mortem
+            # obligaba a diffear render_params a mano entre las dos rows.
+            "overridden_fields": list(_overridden_fields),
+            "background_id": body.background_id,
+            "background_mode": body.background_mode if body.background_id else None,
             "variant_owns_input": variant_owns_input,
             "bypass_content_validation": bool(body.bypass_content_validation),
             "force_content_validation": bool(body.force_content_validation),
@@ -12087,37 +12224,37 @@ async def create_variant(
         "umg_spec": parent.umg_spec or {},
         "segments_override": parent.segments_json,
     }
-    # render_params del padre + overrides — los param de typography
-    # (font, font_scale, etc) se pasan como kwargs individuales que
-    # run_pipeline acepta. concept también va por kwarg.
+    # render_params (padre + overrides) → kwargs individuales de
+    # run_pipeline. Cada nombre acá EXISTE en la firma de run_pipeline
+    # (pipeline.py ~864); mandar uno que no exista revienta el enqueue.
     # lyric_transition + text_motion deprecados 2026-05-23 — fuera del whitelist.
-    for k in ("font", "font_scale", "text_case", "frame_format", "text_contrast",
-              "movement_style", "animate_image", "genre", "match_lyrics",
-              "bg_verbatim",
-              # FX layer + lyric animation/transition (libass templates from
-              # the wizard). Added 2026-05-22: variantes heredaban tipografía
-              # y movimiento del padre pero perdían el efecto encima (nieve/
-              # lluvia/etc.) y las animaciones de letra (karaoke/reveal/...)
-              # porque no estaban en este whitelist cuando se cableó (#51946bf
-              # + #357a1a5). custom_colors va con effect porque su flow es el
-              # mismo (paleta opcional para el grade).
-              "effect", "custom_colors",
-              "lyrics_animation", "line_transition",
-              # Title-card customization (Full Rotor v1) — variantes heredan.
-              "title_template", "title_size",
-              "title_artist_font", "title_song_font"):
+    #
+    # La whitelist es _VARIANT_OVERRIDABLE_FIELDS (todo lo que el wizard
+    # deja tocar y por lo tanto tiene que llegar al render) + los ejes que
+    # sólo se heredan del padre (animate_image, lyric_color, …). Antes se
+    # mantenía a mano y se olvidaba de campos nuevos: title_song_break
+    # (portada partida en 2 líneas) y los colores de letra se persistían en
+    # render_params y NUNCA llegaban al render de la variante.
+    for k in (
+        *_VARIANT_OVERRIDABLE_FIELDS,
+        # Sólo heredables (el wizard de variante no los expone hoy, pero el
+        # padre puede tenerlos y perderlos sería una regresión visual).
+        "animate_image",
+        "lyric_color", "lyric_sung_color",
+    ):
+        # background_hint se trata aparte abajo ("" = sin hint, no "").
+        if k == "background_hint":
+            continue
         if k in new_render_params:
             pipeline_kwargs[k] = new_render_params[k]
-    if body.concept is not None:
-        pipeline_kwargs["concept"] = body.concept
-    elif parent_render_params.get("concept"):
-        pipeline_kwargs["concept"] = parent_render_params["concept"]
-    # background_hint llega solo si el operador escribió algo en el
-    # textarea del modal. Si está vacío, run_pipeline lo recibe como
-    # None y _ensure_background sigue el flow default (PR #116
-    # system prompt desbiaseado).
-    if body.background_hint is not None:
-        pipeline_kwargs["background_hint"] = body.background_hint
+    # background_hint: None/"" (nunca seteado, o clear explícito del
+    # operador) → run_pipeline lo recibe como None y _ensure_background
+    # sigue el flow default (PR #116, system prompt desbiaseado). Un ""
+    # persistido en render_params NO revive el hint viejo — mismo contrato
+    # que /edit (ambos lados coercen con `or None`).
+    _variant_hint = new_render_params.get("background_hint")
+    if _variant_hint:
+        pipeline_kwargs["background_hint"] = _variant_hint
 
     enqueue_pipeline(
         job_id=new_job_id,
@@ -12126,6 +12263,15 @@ async def create_variant(
         style=new_style,
         plan=plan,
         tenant_id=current_user.get("tenant_id", ""),
+        # Biblioteca de fondos: mismo shape que /generate. Cuando hay
+        # background_path/bg_r2_key el pipeline saltea la generación IA;
+        # en modo "variation" van los variation_source_* y Veo deriva un
+        # clip nuevo del asset.
+        background_path=variant_bg_path,
+        bg_r2_key=variant_bg_r2_key,
+        variation_source_path=variant_variation_source_path,
+        variation_source_r2_key=variant_variation_source_r2_key,
+        variation_parent_asset_id=variant_variation_parent_id,
         **pipeline_kwargs,
     )
 
