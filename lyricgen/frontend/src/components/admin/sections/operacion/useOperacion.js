@@ -3,6 +3,7 @@
 // Acá viven los tres flujos de triaje del operador:
 //   - health + stuck-jobs (refresh 15 s, pausado si la pestaña está oculta)
 //   - jobs en vivo (refresh 5 s cuando auto-refresh está on)
+//   - change requests de UMG (sin auto-refresh, recarga manual / al cambiar filtro)
 //
 // Todo lo de red pasa por fetchJson (un solo lugar con auth + res.ok). Las
 // mutaciones reportan error vía useAdmin().flashError, igual que el admin viejo.
@@ -115,6 +116,78 @@ export default function useOperacion() {
     return () => clearInterval(iv);
   }, [jobsAutoRefresh, loadJobs]);
 
+  // --- Change requests de UMG ----------------------------------------------
+  const [changeRequests, setChangeRequests] = useState([]);
+  const [crStatusFilter, setCrStatusFilter] = useState("pending");
+  const [crPendingCount, setCrPendingCount] = useState(0);
+  const [crResolvedCount, setCrResolvedCount] = useState(0);
+  const [crLoading, setCrLoading] = useState(true);
+  const [crResolvingId, setCrResolvingId] = useState(null);
+
+  const crStatusRef = useRef(crStatusFilter);
+  crStatusRef.current = crStatusFilter;
+
+  const loadChangeRequests = useCallback(async () => {
+    setCrLoading(true);
+    try {
+      const data = await fetchJson(
+        `${API}/admin/change-requests?status=${crStatusRef.current}&limit=200`,
+      );
+      setChangeRequests(data.items || []);
+      setCrPendingCount(data.pending_count || 0);
+      setCrResolvedCount(data.resolved_count || 0);
+    } catch (err) {
+      flashError(`No pude cargar los cambios: ${err.message || err}`);
+    } finally {
+      setCrLoading(false);
+    }
+  }, [flashError]);
+
+  useEffect(() => {
+    loadChangeRequests();
+  }, [crStatusFilter, loadChangeRequests]);
+
+  // Polling liviano (30 s) sólo del contador de pendientes — así el badge
+  // en el tab/KPI se actualiza sin que el operador tenga que entrar a la
+  // sección. La lista completa sigue siendo carga manual / al cambiar filtro.
+  useEffect(() => {
+    const iv = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      fetchJson(`${API}/admin/change-requests?status=pending&limit=1`)
+        .then((data) => setCrPendingCount(data.pending_count || 0))
+        .catch(() => {});
+    }, 30000);
+    return () => clearInterval(iv);
+  }, []);
+
+  const resolveChangeRequest = useCallback(async (id, note) => {
+    setCrResolvingId(id);
+    try {
+      await fetchJson(`${API}/admin/change-requests/${id}/resolve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resolution_note: (note || "").trim() }),
+      });
+      await loadChangeRequests();
+    } catch (err) {
+      flashError(`No pude marcar como resuelto: ${err.message || err}`);
+    } finally {
+      setCrResolvingId(null);
+    }
+  }, [flashError, loadChangeRequests]);
+
+  const reopenChangeRequest = useCallback(async (id) => {
+    setCrResolvingId(id);
+    try {
+      await fetchJson(`${API}/admin/change-requests/${id}/reopen`, { method: "POST" });
+      await loadChangeRequests();
+    } catch (err) {
+      flashError(`No pude reabrir: ${err.message || err}`);
+    } finally {
+      setCrResolvingId(null);
+    }
+  }, [flashError, loadChangeRequests]);
+
   return {
     // health + reaper
     health,
@@ -133,5 +206,15 @@ export default function useOperacion() {
     setJobsTenantFilter,
     jobsAutoRefresh,
     setJobsAutoRefresh,
+    // change requests
+    changeRequests,
+    crStatusFilter,
+    setCrStatusFilter,
+    crPendingCount,
+    crResolvedCount,
+    crLoading,
+    crResolvingId,
+    resolveChangeRequest,
+    reopenChangeRequest,
   };
 }
