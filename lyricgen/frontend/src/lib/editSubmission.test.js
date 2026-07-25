@@ -363,3 +363,69 @@ describe("movement_style: el backend lo persiste CRUDO, el wizard lo normaliza",
     }
   });
 });
+
+describe("el gate de multi-escena está CONECTADO, no sólo escrito", () => {
+  // La primera versión de este gate era código muerto: `scenePlan` nunca se
+  // pasaba desde App.jsx, así que la rama era inalcanzable — y los tests de
+  // arriba pasaban describiendo un contrato que la app no ejecutaba. Es
+  // exactamente el patrón por el que se borró EditWizardSubmit.test.jsx.
+  // Estos casos fijan el contrato del PARÁMETRO; el cableado se testea abajo.
+  it("buildEditReview LLEVA el scene_plan del job (el cableado, no sólo el parámetro)", () => {
+    // App hace `...initialFields` al armar currentReview y el submit lee
+    // `r.scenePlan`, así que con esto el dato llega solo. Antes se cableaba a
+    // mano en el componente y quedó sin cablear: el gate era inalcanzable.
+    const scenes = { scenes: [{ recurrence_key: "coro" }] };
+    expect(buildEditReview({ ...JOB_FULL, scene_plan: scenes }, null).initialFields.scenePlan)
+      .toEqual(scenes);
+    expect(buildEditReview(JOB_FULL, null).initialFields.scenePlan).toBeNull();
+  });
+
+  it("scenePlan vacío no bloquea (jobs normales siguen igual)", () => {
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    for (const sp of [null, undefined, {}, { scenes: [] }]) {
+      const out = resolveEditSubmission({
+        baseline, current: currentFrom(JOB_FULL, { movementStyle: "animado" }),
+        jobStatus: "pending_review", scenePlan: sp,
+      });
+      expect(out.blocked, `scenePlan=${JSON.stringify(sp)}`).toBeNull();
+      expect(out.editType).toBe("background");
+    }
+  });
+
+  it("el motivo del bloqueo se distingue del de status", () => {
+    // App.jsx ramifica el mensaje por `reason`: decirle "el video ya está
+    // aprobado, generá uno nuevo" a un job multi-escena en pending_review son
+    // dos mentiras, y lo manda a gastar un video entero al pedo.
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    const scenes = resolveEditSubmission({
+      baseline, current: currentFrom(JOB_FULL, { movementStyle: "animado" }),
+      jobStatus: "pending_review", scenePlan: { scenes: [{ recurrence_key: "coro" }] },
+    });
+    const status = resolveEditSubmission({
+      baseline, current: currentFrom(JOB_FULL, { movementStyle: "animado" }),
+      jobStatus: "done",
+    });
+    expect(scenes.blocked.reason).toBe("scenes");
+    expect(status.blocked.reason).toBe("status");
+  });
+});
+
+describe("movement_style: la normalización no puede tragarse un valor con sentido", () => {
+  it("un código canónico sobrevive intacto", () => {
+    for (const code of ["estatico", "sutil", "estandar", "foto-parallax", "animado"]) {
+      const job = { ...JOB_BARE, render_params: { movement_style: code } };
+      expect(buildEditReview(job, null).baseline.movementStyle).toBe(code);
+    }
+  });
+
+  it("no devuelve nunca algo del prototipo de Object", () => {
+    // `MOVEMENT_ALIASES[s]` resolvía "constructor"/"__proto__" contra
+    // Object.prototype y devolvía una FUNCIÓN, que terminaba en el payload.
+    for (const junk of ["constructor", "__proto__", "toString", "valueOf"]) {
+      const job = { ...JOB_BARE, render_params: { movement_style: junk } };
+      const v = buildEditReview(job, null).baseline.movementStyle;
+      expect(typeof v).toBe("string");
+      expect(v).toBe("");
+    }
+  });
+});

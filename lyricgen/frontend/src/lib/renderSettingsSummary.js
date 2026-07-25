@@ -65,7 +65,11 @@ export const SETTINGS_GROUPS = [
 
 // Valores que significan "sin elección explícita": no se muestran como chip,
 // porque un chip `Concepto: —` es ruido, no información.
-const EMPTY_VALUES = new Set(["", "auto", "none", "ninguno"]);
+// OJO: no incluir "none"/"auto" acá. Se hizo en la primera versión y escondía
+// valores con significado propio en cualquier eje donde "none" es una elección
+// real, además de volver inalcanzables las etiquetas escritas para ellos. Lo
+// que es "el default" va en AXIS_DEFAULTS, por eje y explícito.
+const EMPTY_VALUES = new Set(["", "ninguno"]);
 
 // Defaults POR EJE que tampoco se muestran. Van aparte de EMPTY_VALUES porque
 // no son "vacío": son valores reales que el pipeline usa cuando el operador no
@@ -75,34 +79,13 @@ const AXIS_DEFAULTS = {
   frame_format: "full",
   text_case: "upper",
   text_contrast: "medium",
-};
-
-// Etiquetas de los ejes enum que no tienen un catálogo compartido propio.
-// Son las MISMAS que muestran los pickers del wizard (TEXT_CASE_OPTS,
-// FRAME_FORMAT_OPTS y las listas de animación/transición de UploadZone): sin
-// esto la ficha le mostraba "lower", "full" o "medium" —códigos internos en
-// inglés— a un operador que trabaja en español.
-const VALUE_LABELS = {
-  text_case: {
-    upper: "Todo en MAYÚSCULAS",
-    title: "Primera letra de Cada Palabra",
-    lower: "todo en minúsculas",
-    sentence: "Primera letra de cada Línea",
-    original: "Sin cambios",
-  },
-  frame_format: {
-    full: "Pantalla completa (16:9)",
-    cine: "Cine — franjas (2.39:1)",
-  },
-  text_contrast: { low: "Bajo", medium: "Medio", high: "Alto" },
-  lyrics_animation: {
-    none: "Ninguna", karaoke: "Karaoke", word_reveal: "Revelado",
-    pop: "Pop", glow: "Glow",
-  },
-  line_transition: {
-    none: "Corte", slide_up: "Slide ↑", slide_side: "Slide →",
-    wipe: "Wipe", dissolve_blur: "Disolvencia",
-  },
+  title_template: "auto",
+  lyrics_animation: "none",
+  line_transition: "none",
+  genre: "auto",
+  concept: "auto",
+  movement_style: "auto",
+  effect: "none",
 };
 
 function isEmptyish(value, axisKey) {
@@ -137,13 +120,19 @@ export function buildSettingsSummary(params, deps = {}) {
       if (isEmptyish(raw, axis.key)) continue;
 
       let value;
-      if (VALUE_LABELS[axis.key]) {
-        // Ejes enum con etiqueta propia: nunca mostrar el código interno.
-        value = VALUE_LABELS[axis.key][String(raw).trim().toLowerCase()] || String(raw);
+      // Un eje enum NUNCA debe mostrar su código interno. `valueLabel` lo
+      // resuelve con los mismos catálogos que usan los pickers del wizard.
+      const enumLabel = deps.valueLabel && deps.valueLabel(axis.key, raw);
+      if (enumLabel) {
+        value = enumLabel;
       } else if (axis.kind === "scale") {
         // 1.15 → "1.15×". Un 1.0 es el default y no se muestra: no pasa por
         // EMPTY_VALUES (es numérico), así que se filtra explícitamente acá.
-        const n = parseFloat(raw);
+        // `.replace(",", ".")`: font_scale/title_size viajan como STRING desde
+        // el form, y un job viejo puede tener "1,15". parseFloat lo cortaba en
+        // 1 → se filtraba como default y la ficha decía "tamaño normal" sobre
+        // un video que no lo estaba.
+        const n = parseFloat(String(raw).replace(",", "."));
         if (!Number.isFinite(n) || Math.abs(n - 1) < 1e-6) continue;
         value = `${n}×`;
       } else if (axis.kind === "prompt") {

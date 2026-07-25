@@ -15,7 +15,10 @@
 import { useState } from "react";
 import { useI18n } from "../i18n";
 import { buildSettingsSummary, describeSceneSource } from "../lib/renderSettingsSummary";
-import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS } from "../lib/optionLabels";
+import {
+  MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS,
+  AXIS_VALUE_LABELS, dynamicAxisLabel,
+} from "../lib/optionLabels";
 
 export default function JobSettingsCard({ renderParams, provenanceHref }) {
   const { t } = useI18n();
@@ -29,6 +32,13 @@ export default function JobSettingsCard({ renderParams, provenanceHref }) {
     movementLabel: (code) => MOVEMENT_LABELS(t)[code],
     effectLabel: (code) => EFFECT_LABELS(t)[code],
     fontLabel: (code) => FONT_LABELS(t)[code],
+    // Ejes enum sin catálogo propio (case, contraste, formato, animación,
+    // transición, portada) + los que se etiquetan por key derivada del código
+    // (género, concepto). Sin esto la ficha mostraba "strong", "lower_third" o
+    // "atmosferico" — códigos internos, varios en inglés.
+    valueLabel: (axisKey, code) =>
+      AXIS_VALUE_LABELS(t)[axisKey]?.[String(code).trim().toLowerCase()]
+      || dynamicAxisLabel(t, axisKey, code),
   });
   const scene = describeSceneSource(params, t);
   const prompt = String(params.background_hint || "").trim();
@@ -63,13 +73,19 @@ export default function JobSettingsCard({ renderParams, provenanceHref }) {
 
       {open && (
         <div className="px-4 pb-3.5 space-y-3" data-testid="job-settings-body">
-          {groups.map((group) => (
+          {/* El prompt se renderiza aparte (abajo), así que un grupo cuyo único
+              chip sea el prompt quedaba como un título "FONDO" sobre un
+              contenedor vacío. Se filtra ANTES de decidir si el grupo existe. */}
+          {groups
+            .map((g) => ({ ...g, chips: g.chips.filter((c) => !c.isPrompt) }))
+            .filter((g) => g.chips.length > 0)
+            .map((group) => (
             <div key={group.id}>
               <p className="text-[10px] uppercase tracking-wide text-gray-600 mb-1.5">
                 {group.label}
               </p>
               <div className="flex flex-wrap gap-1.5">
-                {group.chips.filter((c) => !c.isPrompt).map((chip) => (
+                {group.chips.map((chip) => (
                   <span
                     key={chip.key}
                     data-setting={chip.key}

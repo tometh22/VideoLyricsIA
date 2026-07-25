@@ -160,3 +160,71 @@ def test_video_invalido_no_explota(measure, tmp_path):
     bad = tmp_path / "no-es-un-video.mp4"
     bad.write_bytes(b"nope")
     assert measure(str(bad)) is None
+
+
+def _fade_in_from_black(n=24, h=360, w=640):
+    """Cámara CLAVADA pero el clip abre desde negro — muy común en Veo."""
+    tex = _texture(h, w, seed=11)
+    out = []
+    for i in range(n):
+        k = min(1.0, i / 6.0)   # negro puro en el primer frame
+        out.append((tex * k).astype(np.uint8))
+    return out
+
+
+def _letterboxed(total_shift_px=0, n=24, h=360, w=640):
+    """Cámara clavada con franjas negras arriba y abajo (matte/letterbox)."""
+    frames = _pan_clip(total_shift_px, n=n, h=h, w=w) if total_shift_px else [_texture(h, w)] * n
+    band = h // 5
+    out = []
+    for fr in frames:
+        f = fr.copy()
+        f[:band, :] = 0
+        f[-band:, :] = 0
+        out.append(f)
+    return out
+
+
+def test_clip_que_abre_desde_negro_no_reporta_paneo(measure, tmp_path):
+    """Un frame uniforme devolvía el desplazamiento MÁXIMO posible, no cero.
+
+    El frame de referencia es el primero; si es negro puro, la varianza es 0,
+    el cross-power queda todo en cero y `argmax` sobre un array plano cae en la
+    esquina — que tras el fftshift está a media pantalla del origen. Una cámara
+    perfectamente clavada se logueaba como ~57% del ancho.
+
+    Es el caso que más importa: son justo los clips oscuros/desvanecidos los que
+    la métrica iba a marcar, y el dataset entero se habría envenenado con ellos.
+    """
+    out = _measure_frames(measure, _fade_in_from_black(), tmp_path, "fade")
+    assert out["pct_width"] < 2.0, out
+    assert out["pct_width_borders"] < 2.0, out
+
+
+def test_letterbox_no_inventa_paneo(measure, tmp_path):
+    """Las franjas negras dejan uniformes 2 de las 4 franjas de borde."""
+    out = _measure_frames(measure, _letterboxed(), tmp_path, "matte")
+    assert out["pct_width_borders"] < 2.0, out
+
+
+def test_letterbox_no_esconde_un_paneo_real(measure, tmp_path):
+    """Y el guard no puede volverse ciego: con franjas Y paneo, se detecta."""
+    out = _measure_frames(measure, _letterboxed(total_shift_px=80), tmp_path, "matte_pan")
+    assert out["pct_width"] > 4.0, out
+
+
+def test_se_mide_el_clip_ENTERO_no_solo_el_arranque(measure, tmp_path):
+    """El paneo ocurre en la segunda mitad del clip.
+
+    Con el tope viejo (12 frames a 3 fps = 4s de un clip de 8s) esto reportaba
+    ~0: la métrica declaraba "excursión acumulada máxima" pero sólo miraba el
+    arranque.
+    """
+    h, w, n = 360, 640, 36
+    canvas = _texture(h, w + 96)
+    frames = []
+    for i in range(n):
+        off = 0 if i < n // 2 else int(round(88 * (i - n // 2) / (n // 2 - 1)))
+        frames.append(canvas[:, off:off + w].copy())
+    out = _measure_frames(measure, frames, tmp_path, "late_pan")
+    assert out["pct_width"] > 5.0, out

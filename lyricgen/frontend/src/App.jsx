@@ -55,6 +55,7 @@ import { persistSegments } from "./lib/persistSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
 import { backgroundRegenExtras } from "./lib/editWizardDiff";
 import { buildEditReview, buildEditCurrent, resolveEditSubmission } from "./lib/editSubmission";
+import { normalizeMovementCode } from "./lib/catalogCodes";
 import { buildVariantPayload } from "./lib/variantPayload";
 import { prefetchKey } from "./lib/prefetchKey";
 import { anchorLyricsForEntry } from "./lib/anchorPayload";
@@ -917,7 +918,6 @@ function EditLyricsRoute({
         return;
       }
 
-      const params = job.render_params || {};
       // Reuso del snapshot: si el operador refrescó con edits in-flight,
       // los segments del snapshot ganan sobre job.segments_json (que es
       // lo último que el autosave guardó pero podría no incluir el
@@ -1269,13 +1269,20 @@ function VariantWizardRoute({
         frameFormat: params.frame_format || "full",
         lyricsAnimation: params.lyrics_animation || "none",
         lineTransition: params.line_transition || "none",
-        movementStyle: params.movement_style || "",
+        // Normalizado igual que en edición: el backend persiste el valor CRUDO
+        // y un padre con "dinamico" (lo emiten SceneEditModal y el derivado por
+        // energía) no matchea ninguna tarjeta → la galería quedaba sin nada
+        // resaltado. Y acá pesa más que en edición, porque el submit de la
+        // variante manda el estado ABSOLUTO: lo que se muestra es lo que viaja.
+        movementStyle: normalizeMovementCode(params.movement_style || ""),
         genre: params.genre || "",
         concept: params.concept || "",
         matchLyrics: params.match_lyrics !== false,
         effect: params.effect || "",
         backgroundHint: params.background_hint || "",
         bgVerbatim: !!params.bg_verbatim,
+        lyricColor: params.lyric_color || "#FFFFFF",
+        lyricSungColor: params.lyric_sung_color || "#FFFFFF",
         titleTemplate: params.title_template || "auto",
         titleSize: String(params.title_size || "1.0"),
         titleArtistFont: params.title_artist_font || "",
@@ -1300,6 +1307,13 @@ function VariantWizardRoute({
         // Sin editingJobId: nada de este flujo escribe al job padre.
         // handleApproveLyrics ramifica por variantMode ANTES del bloque
         // de edición, que se gatilla con editMode || editingJobId.
+        //
+        // baseline = los ajustes DEL PADRE. La variante no lo usa para un diff
+        // (su submit manda el estado ABSOLUTO), pero alimenta el chip
+        // "EN EL VIDEO" de las galerías. Sin esto el chip no aparecía en toda
+        // la mitad variante del flujo — y ahí importa MÁS, precisamente porque
+        // un control sin tocar manda lo que muestra.
+        baseline: { ...initialFields },
         jobStatus: job.status,
         deliveryProfile: job.delivery_profile || "youtube",
         style: job.style || "",
@@ -3225,6 +3239,7 @@ export default function App() {
           baseline: r.baseline,
           current,
           jobStatus: r.jobStatus,
+          scenePlan: r.scenePlan,
         });
 
         if (submission.presentBuckets.length === 0) {
@@ -3238,10 +3253,21 @@ export default function App() {
         }
 
         if (submission.blocked) {
+          // El motivo importa: en un job multi-escena el fondo es un TIMELINE y
+          // la salida es regenerar la escena desde el filmstrip (que además no
+          // consume cupo de edición). Mostrar ahí "el video ya está aprobado —
+          // generá uno nuevo" son dos mentiras en una frase, y manda al
+          // operador a gastar un video entero al pedo.
+          const _isScenes = submission.blocked.reason === "scenes";
           alert({
-            title: t("edit.bg_locked_done_title") || "No se puede regenerar el fondo",
-            description: t("edit.bg_locked_done_desc") ||
-              "El fondo de un video ya aprobado no se puede regenerar — para cambiarlo, generá un video nuevo.",
+            title: _isScenes
+              ? (t("edit.bg_locked_scenes_title") || "Este video usa Escenas")
+              : (t("edit.bg_locked_done_title") || "No se puede regenerar el fondo"),
+            description: _isScenes
+              ? (t("edit.bg_locked_scenes_desc") ||
+                 "El fondo es un timeline multi-escena. Regenerá la escena que quieras cambiar desde el filmstrip del video — no consume cupo de edición.")
+              : (t("edit.bg_locked_done_desc") ||
+                 "El fondo de un video ya aprobado no se puede regenerar — para cambiarlo, generá un video nuevo."),
             tone: "warning",
           });
           return;
@@ -4566,6 +4592,15 @@ export default function App() {
             lineTransition: currentReview.lineTransition || "none",
             movementStyle: currentReview.movementStyle || "",
             effect: currentReview.effect || "",
+            // Los colores de letra TAMBIÉN se siembran, aunque su picker esté
+            // oculto en edición: el preview central los consume de
+            // batchDefaults, así que sin sembrarlos pintaba la letra con el
+            // color del batch ANTERIOR y el operador ya no tenía forma de verlo
+            // ni de resetearlo. Es la misma falla que este trabajo vino a
+            // matar, en el único eje que había quedado afuera.
+            // Es display-only: computeFieldDiff no tiene rama para ellos.
+            lyricColor: currentReview.lyricColor || "#FFFFFF",
+            lyricSungColor: currentReview.lyricSungColor || "#FFFFFF",
             titleTemplate: currentReview.titleTemplate || "auto",
             titleSize: String(currentReview.titleSize || "1.0"),
             titleArtistFont: currentReview.titleArtistFont || "",

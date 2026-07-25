@@ -37,6 +37,69 @@ export const EFFECT_LABELS = (t) => ({
 });
 
 /**
+ * axisKey → (code → etiqueta), para los ejes enum que no tienen catálogo propio.
+ *
+ * Los CÓDIGOS acá son contrato con el backend, no invención: `text_contrast` es
+ * `subtle|medium|strong` (main.py lo valida contra esa tupla y
+ * pipeline._CONTRAST_SETTINGS tiene esas keys). Una primera versión de la ficha
+ * escribió `low|medium|high` — `low`/`high` no existen y `medium` es el default
+ * filtrado, así que los ÚNICOS dos valores que podían aparecer salían crudos.
+ * El test tampoco lo vio porque codificaba los mismos códigos inventados.
+ */
+export const AXIS_VALUE_LABELS = (t) => ({
+  text_case: {
+    upper: "Todo en MAYÚSCULAS",
+    title: "Primera letra de Cada Palabra",
+    lower: "todo en minúsculas",
+    sentence: "Primera letra de cada Línea",
+    original: "Sin cambios",
+  },
+  frame_format: {
+    full: "Pantalla completa (16:9)",
+    cine: "Cine — franjas (2.39:1)",
+  },
+  text_contrast: {
+    subtle: t("upload.contrast_subtle") || "Suave",
+    medium: t("upload.contrast_medium") || "Medio",
+    strong: t("upload.contrast_strong") || "Fuerte",
+  },
+  lyrics_animation: {
+    none: t("upload.anim_none") || "Ninguna",
+    karaoke: t("upload.anim_karaoke") || "Karaoke",
+    word_reveal: t("upload.anim_reveal") || "Revelado",
+    pop: t("upload.anim_pop") || "Pop",
+    glow: t("upload.anim_glow") || "Glow",
+  },
+  line_transition: {
+    none: t("upload.trans_none") || "Corte",
+    slide_up: t("upload.trans_slide_up") || "Slide ↑",
+    slide_side: t("upload.trans_slide_side") || "Slide →",
+    wipe: t("upload.trans_wipe") || "Wipe",
+    dissolve_blur: t("upload.trans_blur") || "Disolvencia",
+  },
+  title_template: {
+    auto: t("upload.titlecard_auto") || "Auto",
+    centered: t("upload.titlecard_centered") || "Centrada",
+    lower_third: t("upload.titlecard_lower_third") || "Tercio inferior",
+    badge: t("upload.titlecard_badge") || "Badge",
+  },
+});
+
+/**
+ * Género y concepto: los pickers los etiquetan por i18n con la key derivada del
+ * código, así que la ficha hace lo mismo en vez de mostrar "hiphop" o
+ * "atmosferico" crudos. Si la key no existe, `t` devuelve la key misma → se
+ * detecta y se cae al código, que sigue siendo mejor que un string con puntos.
+ */
+export const dynamicAxisLabel = (t, axisKey, code) => {
+  const prefix = { genre: "upload.genre_", concept: "upload.concept_" }[axisKey];
+  if (!prefix) return null;
+  const key = `${prefix}${String(code).trim().toLowerCase()}`;
+  const label = t(key);
+  return !label || label === key ? null : label;
+};
+
+/**
  * code → nombre de la tipografía.
  *
  * No van por i18n (salvo "Auto"): son nombres de marca y no se traducen.

@@ -15,12 +15,19 @@ import {
   buildSettingsSummary,
   describeSceneSource,
 } from "./renderSettingsSummary.js";
+// Los resolvers salen del catálogo REAL, no de una copia en el test: una copia
+// a mano es exactamente lo que dejó pasar los códigos inventados de contraste
+// (`low`/`high`, que no existen — son `subtle`/`strong`), con el test en verde.
+import { AXIS_VALUE_LABELS, dynamicAxisLabel } from "./optionLabels.js";
 
 const deps = {
   t: (_k, fb) => fb,
   movementLabel: (c) => ({ animado: "Animado (ilustración)", estatico: "Estático (cámara fija)" }[c]),
   effectLabel: (c) => ({ snow: "Nieve", rain: "Lluvia" }[c]),
   fontLabel: (c) => ({ "poppins-bold": "Poppins Bold", anton: "Anton" }[c]),
+  valueLabel: (axisKey, code) =>
+    AXIS_VALUE_LABELS((_k, fb) => fb)[axisKey]?.[String(code).trim().toLowerCase()]
+    || dynamicAxisLabel((k) => k, axisKey, code),
 };
 
 const flat = (groups) => groups.flatMap((g) => g.chips.map((c) => `${c.label}: ${c.value}`));
@@ -174,9 +181,10 @@ describe("no se le muestran códigos internos ni defaults al operador", () => {
     const cases = {
       text_case: ["upper", "title", "lower", "sentence", "original"],
       frame_format: ["full", "cine"],
-      text_contrast: ["low", "medium", "high"],
+      text_contrast: ["subtle", "medium", "strong"],
       lyrics_animation: ["none", "karaoke", "word_reveal", "pop", "glow"],
       line_transition: ["none", "slide_up", "slide_side", "wipe", "dissolve_blur"],
+      title_template: ["auto", "centered", "lower_third", "badge"],
     };
     for (const [key, codes] of Object.entries(cases)) {
       for (const code of codes) {
