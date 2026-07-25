@@ -1,4 +1,4 @@
-// Unit tests for computeFieldDiff + buildEditPayloads. These cover the
+// Unit tests for computeFieldDiff. These cover the
 // edit-wizard's "compute the minimum POST set" logic so a refactor of the
 // wizard's field map can't silently change which buckets get fired.
 //
@@ -8,8 +8,6 @@
 import { describe, expect, it } from "vitest";
 import {
   computeFieldDiff,
-  buildEditPayloads,
-  bundleTypographyIntoFirstBucket,
   backgroundRegenExtras,
 } from "./editWizardDiff";
 
@@ -264,102 +262,6 @@ describe("computeFieldDiff", () => {
   });
 });
 
-describe("buildEditPayloads", () => {
-  it("with no typography to bundle, emits stable order: metadata → lyrics → background", () => {
-    const diff = {
-      background: { background_hint: "bg" },
-      lyrics: { segments: [{ start: 0, end: 1, text: "x" }] },
-      metadata: { artist: "y" },
-    };
-    const payloads = buildEditPayloads(diff);
-    expect(payloads.map((p) => p.edit_type)).toEqual([
-      "metadata",
-      "lyrics",
-      "background",
-    ]);
-  });
-
-  it("bundles typography fields into the first non-typography bucket (metadata wins)", () => {
-    const diff = {
-      metadata: { artist: "Soda" },
-      typography: { font: "lobster", font_scale: 1.5 },
-      lyrics: { segments: [{ start: 0, end: 1, text: "x" }] },
-    };
-    const payloads = buildEditPayloads(diff);
-    // typography slot disappears, its fields land on metadata payload
-    expect(payloads.map((p) => p.edit_type)).toEqual(["metadata", "lyrics"]);
-    expect(payloads[0]).toEqual({
-      edit_type: "metadata",
-      artist: "Soda",
-      font: "lobster",
-      font_scale: 1.5,
-    });
-  });
-
-  it("bundles typography into lyrics when metadata is absent", () => {
-    const diff = {
-      typography: { font: "lobster" },
-      lyrics: { segments: [{ start: 0, end: 1, text: "x" }] },
-    };
-    const payloads = buildEditPayloads(diff);
-    expect(payloads.map((p) => p.edit_type)).toEqual(["lyrics"]);
-    expect(payloads[0]).toEqual({
-      edit_type: "lyrics",
-      segments: [{ start: 0, end: 1, text: "x" }],
-      font: "lobster",
-    });
-  });
-
-  it("bundles typography into background when no metadata/lyrics", () => {
-    const diff = {
-      typography: { font: "lobster" },
-      background: { background_hint: "bg" },
-    };
-    const payloads = buildEditPayloads(diff);
-    expect(payloads.map((p) => p.edit_type)).toEqual(["background"]);
-    expect(payloads[0]).toEqual({
-      edit_type: "background",
-      background_hint: "bg",
-      font: "lobster",
-    });
-  });
-
-  it("typography stays standalone when there's no other bucket to bundle into", () => {
-    const diff = {
-      typography: { font: "lobster", font_scale: 1.2 },
-    };
-    const payloads = buildEditPayloads(diff);
-    expect(payloads.map((p) => p.edit_type)).toEqual(["typography"]);
-    expect(payloads[0]).toEqual({
-      edit_type: "typography",
-      font: "lobster",
-      font_scale: 1.2,
-    });
-  });
-
-  it("each payload has edit_type set + bucket fields flattened", () => {
-    const diff = {
-      metadata: { artist: "Soda", song_title: "Crimen" },
-    };
-    expect(buildEditPayloads(diff)).toEqual([
-      { edit_type: "metadata", artist: "Soda", song_title: "Crimen" },
-    ]);
-  });
-
-  it("returns [] for empty diff", () => {
-    expect(buildEditPayloads({})).toEqual([]);
-  });
-
-  it("omits buckets that aren't present", () => {
-    const diff = {
-      lyrics: { segments: [{ start: 0, end: 1, text: "x" }] },
-    };
-    const payloads = buildEditPayloads(diff);
-    expect(payloads).toHaveLength(1);
-    expect(payloads[0].edit_type).toBe("lyrics");
-  });
-});
-
 // ── background_library (PR #940 backend) ─────────────────────────────────
 describe("computeFieldDiff — background_library", () => {
   it("un pick de biblioteca produce el bucket con background_id", () => {
@@ -403,8 +305,9 @@ describe("forceBackgroundRegen (re-roll del fondo sin cambiar texto)", () => {
     const current = { ...base, forceBackgroundRegen: true };
     const diff = computeFieldDiff(base, current);
     expect(diff.background).toEqual({});
-    const payloads = buildEditPayloads(diff);
-    expect(payloads).toContainEqual({ edit_type: "background" });
+    // Que ese bucket vacío se traduzca en edit_type="background" lo asserta
+    // editSubmission.test.js contra resolveEditSubmission, la función que la
+    // app llama de verdad.
   });
 
   it("NO aplica si el operador eligió un asset de biblioteca (eso supersede)", () => {
