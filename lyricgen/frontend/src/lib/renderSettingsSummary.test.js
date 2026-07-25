@@ -138,3 +138,53 @@ describe("el catálogo de ejes no se desincroniza del backend", () => {
     expect(new Set(keys).size).toBe(keys.length);
   });
 });
+
+describe("no se le muestran códigos internos ni defaults al operador", () => {
+  // Forma REAL de un render_params de staging (job 5faa4b3f810b, el del
+  // reclamo). La primera versión de esta ficha mostraba con estos datos
+  // `Formato: full` (un default, en inglés) y `Mayúsculas: lower` (código
+  // interno) — encontrado corriendo la ficha contra la DB, no con un fixture.
+  const REAL = {
+    font: "poppins-bold", genre: "rock", style: "auto", effect: "",
+    concept: "", font_scale: 1.15, text_case: "lower", frame_format: "full",
+    match_lyrics: true, movement_style: "animado", title_size: 1.0,
+    line_transition: "none", lyrics_animation: "none", title_template: "auto",
+    background_hint: "", bg_verbatim: true,
+  };
+
+  it("los defaults por eje no generan chips", () => {
+    const keys = buildSettingsSummary(REAL, deps).flatMap((g) => g.chips.map((c) => c.key));
+    expect(keys).not.toContain("frame_format");   // "full" es el default
+    expect(keys).not.toContain("text_contrast");  // "medium" es el default
+    expect(keys).not.toContain("title_size");     // 1.0 es el default
+  });
+
+  it("pero un valor NO default sí se muestra, con etiqueta legible", () => {
+    const chips = flat(buildSettingsSummary(REAL, deps));
+    expect(chips).toContain("Mayúsculas: todo en minúsculas");
+    expect(chips.join(" ")).not.toMatch(/\blower\b|\bfull\b|\bmedium\b/);
+  });
+
+  it("cine SÍ se muestra (no es el default)", () => {
+    const chips = flat(buildSettingsSummary({ ...REAL, frame_format: "cine" }, deps));
+    expect(chips).toContain("Formato: Cine — franjas (2.39:1)");
+  });
+
+  it("todos los ejes enum tienen etiqueta para todos sus códigos", () => {
+    const cases = {
+      text_case: ["upper", "title", "lower", "sentence", "original"],
+      frame_format: ["full", "cine"],
+      text_contrast: ["low", "medium", "high"],
+      lyrics_animation: ["none", "karaoke", "word_reveal", "pop", "glow"],
+      line_transition: ["none", "slide_up", "slide_side", "wipe", "dissolve_blur"],
+    };
+    for (const [key, codes] of Object.entries(cases)) {
+      for (const code of codes) {
+        const chips = buildSettingsSummary({ [key]: code }, deps).flatMap((g) => g.chips);
+        const chip = chips.find((c) => c.key === key);
+        if (!chip) continue;  // default u "empty": omitido a propósito
+        expect(chip.value, `${key}=${code} muestra el código crudo`).not.toBe(code);
+      }
+    }
+  });
+});

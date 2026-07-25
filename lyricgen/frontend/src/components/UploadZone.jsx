@@ -420,11 +420,17 @@ export default function UploadZone({
   // 19-jul, "no encuentro dónde agrandar el título").
   const effectControlsRef = useRef(null);
   const [effectControlsPulse, setEffectControlsPulse] = useState(false);
+  // El timer vive en un ref y se limpia al desmontar: sin eso un click seguido
+  // de navegar fuera del wizard deja un setState pendiente sobre un componente
+  // muerto. Mismo cuidado que el pulse de la portada, que ya limpiaba el suyo.
+  const effectPulseTimerRef = useRef(null);
+  useEffect(() => () => clearTimeout(effectPulseTimerRef.current), []);
   const jumpToEffects = () => {
     const el = effectControlsRef.current;
     if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
     setEffectControlsPulse(true);
-    setTimeout(() => setEffectControlsPulse(false), 1800);
+    clearTimeout(effectPulseTimerRef.current);
+    effectPulseTimerRef.current = setTimeout(() => setEffectControlsPulse(false), 1800);
   };
   useEffect(() => {
     if (previewFace !== "title") return;

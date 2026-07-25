@@ -67,10 +67,49 @@ export const SETTINGS_GROUPS = [
 // porque un chip `Concepto: —` es ruido, no información.
 const EMPTY_VALUES = new Set(["", "auto", "none", "ninguno"]);
 
-function isEmptyish(value) {
+// Defaults POR EJE que tampoco se muestran. Van aparte de EMPTY_VALUES porque
+// no son "vacío": son valores reales que el pipeline usa cuando el operador no
+// eligió nada. Sin esto la ficha mostraba `Formato: full` y `Contraste: medium`
+// en casi todos los videos — ruido, y encima con el código interno a la vista.
+const AXIS_DEFAULTS = {
+  frame_format: "full",
+  text_case: "upper",
+  text_contrast: "medium",
+};
+
+// Etiquetas de los ejes enum que no tienen un catálogo compartido propio.
+// Son las MISMAS que muestran los pickers del wizard (TEXT_CASE_OPTS,
+// FRAME_FORMAT_OPTS y las listas de animación/transición de UploadZone): sin
+// esto la ficha le mostraba "lower", "full" o "medium" —códigos internos en
+// inglés— a un operador que trabaja en español.
+const VALUE_LABELS = {
+  text_case: {
+    upper: "Todo en MAYÚSCULAS",
+    title: "Primera letra de Cada Palabra",
+    lower: "todo en minúsculas",
+    sentence: "Primera letra de cada Línea",
+    original: "Sin cambios",
+  },
+  frame_format: {
+    full: "Pantalla completa (16:9)",
+    cine: "Cine — franjas (2.39:1)",
+  },
+  text_contrast: { low: "Bajo", medium: "Medio", high: "Alto" },
+  lyrics_animation: {
+    none: "Ninguna", karaoke: "Karaoke", word_reveal: "Revelado",
+    pop: "Pop", glow: "Glow",
+  },
+  line_transition: {
+    none: "Corte", slide_up: "Slide ↑", slide_side: "Slide →",
+    wipe: "Wipe", dissolve_blur: "Disolvencia",
+  },
+};
+
+function isEmptyish(value, axisKey) {
   if (value == null) return true;
   const s = String(value).trim().toLowerCase();
-  return s === "" || EMPTY_VALUES.has(s);
+  if (s === "" || EMPTY_VALUES.has(s)) return true;
+  return axisKey != null && AXIS_DEFAULTS[axisKey] === s;
 }
 
 /**
@@ -95,10 +134,13 @@ export function buildSettingsSummary(params, deps = {}) {
     const chips = [];
     for (const axis of group.axes) {
       const raw = p[axis.key];
-      if (isEmptyish(raw)) continue;
+      if (isEmptyish(raw, axis.key)) continue;
 
       let value;
-      if (axis.kind === "scale") {
+      if (VALUE_LABELS[axis.key]) {
+        // Ejes enum con etiqueta propia: nunca mostrar el código interno.
+        value = VALUE_LABELS[axis.key][String(raw).trim().toLowerCase()] || String(raw);
+      } else if (axis.kind === "scale") {
         // 1.15 → "1.15×". Un 1.0 es el default y no se muestra: no pasa por
         // EMPTY_VALUES (es numérico), así que se filtra explícitamente acá.
         const n = parseFloat(raw);
