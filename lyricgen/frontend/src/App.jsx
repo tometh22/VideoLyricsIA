@@ -53,7 +53,8 @@ import { translateBackendError } from "./lib/lyricsEditSubmit";
 import { segmentsStore, useJobSegmentsValue } from "./state/segmentsStore";
 import { persistSegments } from "./lib/persistSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
-import { computeFieldDiff, buildEditPayloads, backgroundRegenExtras } from "./lib/editWizardDiff";
+import { backgroundRegenExtras } from "./lib/editWizardDiff";
+import { buildEditReview, buildEditCurrent, resolveEditSubmission } from "./lib/editSubmission";
 import { buildVariantPayload } from "./lib/variantPayload";
 import { prefetchKey } from "./lib/prefetchKey";
 import { anchorLyricsForEntry } from "./lib/anchorPayload";
@@ -915,80 +916,19 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
       // pre-llenamos TODOS los campos editables del wizard desde la row del
       // Job para que el operador pueda corregir cualquier cosa post-render
       // (no solo lyrics). La baseline congela el snapshot a la entrada del
-      // edit; el submit calcula el diff contra la baseline y emite N POSTs
-      // /edit (uno por edit_type: metadata / typography / lyrics / background).
+      // edit; el submit calcula el diff contra la baseline y emite UN POST
+      // /edit consolidado (resolveEditSubmission elige el edit_type).
       //
       // Resilience: si el snap tiene fields editados in-flight (el operador
       // refrescó mid-edit), esos ganan. Si no, los valores actuales del job.
+      // Siembra de campos + baseline: lib/editSubmission.buildEditReview.
+      // Estaba inline acá, así que el test del invariante tenía que copiar la
+      // construcción a mano — y una copia a mano es cómo se colaron los 5
+      // `title_*` que faltaban en `current` (bucket typography emitido en el
+      // 100% de las ediciones → guarda "No cambiaste nada" muerta y cambios de
+      // fondo degradados a edición de letra en silencio).
       const snapR = reusableSnap ? snap.currentReview : null;
-      const pickSnapOr = (snapKey, fallback) =>
-        (snapR && snapR[snapKey] != null && snapR[snapKey] !== "")
-          ? snapR[snapKey]
-          : fallback;
-
-      const initialFields = {
-        artist: pickSnapOr("artist", job.artist || ""),
-        songTitle: pickSnapOr("songTitle", job.song_title || ""),
-        font: pickSnapOr("font", params.font || ""),
-        textCase: pickSnapOr("textCase", params.text_case || "upper"),
-        textContrast: pickSnapOr("textContrast", params.text_contrast || "medium"),
-        fontScale: String(pickSnapOr("fontScale", params.font_scale || "1.0")),
-        lyricsAnimation: pickSnapOr("lyricsAnimation", params.lyrics_animation || "none"),
-        lineTransition: pickSnapOr("lineTransition", params.line_transition || "none"),
-        lyricColor: pickSnapOr("lyricColor", params.lyric_color || "#FFFFFF"),
-        lyricSungColor: pickSnapOr("lyricSungColor", params.lyric_sung_color || "#FFFFFF"),
-        movementStyle: pickSnapOr("movementStyle", params.movement_style || ""),
-        // Ejes de escena editables en edición. matchLyrics: default true cuando
-        // el render_params no lo trae (paridad con el backend match_lyrics=True).
-        genre: pickSnapOr("genre", params.genre || ""),
-        concept: pickSnapOr("concept", params.concept || ""),
-        matchLyrics: snapR?.matchLyrics != null ? !!snapR.matchLyrics : (params.match_lyrics !== false),
-        effect: pickSnapOr("effect", params.effect || ""),
-        backgroundHint: pickSnapOr("backgroundHint", params.background_hint || ""),
-        bgVerbatim: snapR?.bgVerbatim != null ? !!snapR.bgVerbatim : !!params.bg_verbatim,
-        backgroundMode: pickSnapOr("backgroundMode", params.background_mode || ""),
-        // Title card customization (Full Rotor v1).
-        titleTemplate: pickSnapOr("titleTemplate", params.title_template || "auto"),
-        titleSize: String(pickSnapOr("titleSize", params.title_size || "1.0")),
-        titleArtistFont: pickSnapOr("titleArtistFont", params.title_artist_font || ""),
-        titleSongFont: pickSnapOr("titleSongFont", params.title_song_font || ""),
-        // UI v1.1 (2026-05-30): manual song-title line break — "" = auto.
-        titleSongBreak: pickSnapOr("titleSongBreak", params.title_song_break || ""),
-      };
-
-      // Baseline: snapshot inmutable de cómo está RENDERIZADO el video
-      // ahora — el diff del submit compara contra esto, NO contra el snap
-      // del autosave. Si el operador edita y vuelve atrás un campo al valor
-      // original, el diff lo descarta (no manda al backend, no cuesta un
-      // re-render por nada).
-      const baseline = {
-        artist: job.artist || "",
-        songTitle: job.song_title || "",
-        font: params.font || "",
-        textCase: params.text_case || "upper",
-        textContrast: params.text_contrast || "medium",
-        fontScale: String(params.font_scale || "1.0"),
-        lyricsAnimation: params.lyrics_animation || "none",
-        lineTransition: params.line_transition || "none",
-        lyricColor: params.lyric_color || "#FFFFFF",
-        lyricSungColor: params.lyric_sung_color || "#FFFFFF",
-        movementStyle: params.movement_style || "",
-        genre: params.genre || "",
-        concept: params.concept || "",
-        matchLyrics: params.match_lyrics !== false,
-        effect: params.effect || "",
-        backgroundHint: params.background_hint || "",
-        bgVerbatim: !!params.bg_verbatim,
-        backgroundMode: params.background_mode || "",
-        // Title card customization (Full Rotor v1) — baseline for the diff.
-        titleTemplate: params.title_template || "auto",
-        titleSize: String(params.title_size || "1.0"),
-        titleArtistFont: params.title_artist_font || "",
-        titleSongFont: params.title_song_font || "",
-        // UI v1.1: baseline for the manual break.
-        titleSongBreak: params.title_song_break || "",
-        segments: JSON.parse(JSON.stringify(job.segments_json || [])),
-      };
+      const { initialFields, baseline } = buildEditReview(job, snapR);
 
       // Mount the editor NOW with audio/waveform/bg as null. The LyricsEditor
       // handles these as optional — timeline renders without waveform fill,
@@ -3250,47 +3190,24 @@ export default function App() {
         // Snapshot del estado actual del wizard. editedSegments viene del
         // LyricsEditor con el último drag aplicado — gana sobre r.segments
         // por si el autosave todavía no lo persistió.
-        const current = {
-          artist: r.artist,
-          songTitle: r.songTitle,
-          font: r.font,
-          fontScale: r.fontScale,
-          textCase: r.textCase,
-          textContrast: r.textContrast,
-          lyricsAnimation: r.lyricsAnimation,
-          lineTransition: r.lineTransition,
-          effect: r.effect,
-          backgroundHint: r.backgroundHint,
-          bgVerbatim: r.bgVerbatim,
-          backgroundMode: r.backgroundMode,
-          movementStyle: r.movementStyle,
-          // Ejes de escena editables en edición (cableados 2026-07-24). Llegan a
-          // r.* vía onEditFieldChange (genre/concept por updateBatchDefault;
-          // matchLyrics por selectSceneMode). baseline los siembra del mismo
-          // render_params → un valor sin tocar no difea.
-          genre: r.genre,
-          concept: r.concept,
-          matchLyrics: r.matchLyrics,
-          segments: editedSegments,
-          // Pick de biblioteca en edit mode (PR #940 backend): la grilla
-          // del paso de fondo YA escribía backgroundId en App, pero el
-          // submit lo ignoraba — el operador "elegía" un fondo que nunca
-          // viajaba. Solo cuenta con el tab Library activo; volver a
-          // "IA Auto" lo anula (null → sin bucket → mantener fondo).
-          editBackgroundId:
-            (bgSelectMode === "library" && backgroundId) ? backgroundId : null,
-          // "Regenerar fondo (nueva versión)": acción explícita del wizard en
-          // edición para forzar un re-render del fondo con el MISMO hint (nueva
-          // tirada de Veo/Imagen) aunque no se haya cambiado ningún campo — sin
-          // esto el operador que solo quería "otra versión del fondo" recibía
-          // "No cambiaste nada". Es una intención, no un campo del baseline.
-          forceBackgroundRegen: !!r.forceBackgroundRegen,
-        };
+        // El snapshot del wizard y la resolución del edit_type viven en
+        // lib/editSubmission.js como funciones PURAS. Antes estaban inline acá,
+        // así que ningún test podía verlas: el mirror hand-copiado
+        // (EditWizardSubmit.test.jsx) testeaba N POSTs mientras esto hacía uno
+        // consolidado, y pasaba en verde. Ahora la UI puede leer la MISMA
+        // función para mostrar qué se va a aplicar y qué se descarta.
+        const current = buildEditCurrent(r, {
+          editedSegments,
+          bgSelectMode,
+          backgroundId,
+        });
+        const submission = resolveEditSubmission({
+          baseline: r.baseline,
+          current,
+          jobStatus: r.jobStatus,
+        });
 
-        const diff = computeFieldDiff(r.baseline, current);
-        const presentBuckets = Object.keys(diff);
-
-        if (presentBuckets.length === 0) {
+        if (submission.presentBuckets.length === 0) {
           alert({
             title: t("edit.no_changes_title") || "No cambiaste nada",
             description: t("edit.no_changes_subtitle") ||
@@ -3300,73 +3217,33 @@ export default function App() {
           return;
         }
 
-        // Pick edit_type by priority — el más complejo de los presentes.
-        // background_library (swap curado, $0, sin slot) supersede al
-        // regen IA; background regen Veo (paid), lyrics re-renderiza con
-        // nuevos segments, metadata sólo title card, typography el último.
-        const PRIORITY = ["background_library", "background", "lyrics", "metadata", "typography"];
-        let chosenType = PRIORITY.find((k) => diff[k]);
-
-        // Backend gates: typography y background/background_library solo
-        // aceptan jobs en pending_review (main.py). Para done/rejected:
-        //   - bg standalone: backend rechaza. Surface error claro.
-        //   - typography standalone: piggyback en una lyrics edit usando
-        //     los segments actuales (font/case/etc son ungated, se
-        //     aplican en cualquier edit_type).
-        const isPendingReview = r.jobStatus === "pending_review";
-        if (!isPendingReview) {
-          const _bgType = chosenType === "background" || chosenType === "background_library";
-          if (_bgType && presentBuckets.length === 1) {
-            alert({
-              title: t("edit.bg_locked_done_title") || "No se puede regenerar el fondo",
-              description: t("edit.bg_locked_done_desc") ||
-                "El fondo de un video ya aprobado no se puede regenerar — para cambiarlo, generá un video nuevo.",
-              tone: "warning",
-            });
-            return;
-          }
-          if (_bgType) {
-            // bg + otra cosa: bajar a la siguiente prioridad permitida.
-            chosenType = PRIORITY.find(
-              (k) => diff[k] && k !== "background" && k !== "background_library",
-            );
-          }
-          if (chosenType === "typography") {
-            // Convertir a lyrics edit. Necesita segments — usar el snapshot
-            // actual (editedSegments) aunque no haya cambiado, para que el
-            // backend acepte el payload.
-            chosenType = "lyrics";
-            const normalized = (editedSegments || []).map((s) => ({
-              start: Number(s.start) || 0,
-              end: Number(s.end) || 0,
-              text: String(s.text || ""),
-              ...(s.locked ? { locked: true } : {}),
-              ...(s.pos && typeof s.pos.x === "number" ? { pos: { x: s.pos.x, y: s.pos.y } } : {}),
-              ...(typeof s.scale === "number" && s.scale !== 1 ? { scale: s.scale } : {}),
-              ...(typeof s.rot === "number" && s.rot !== 0 ? { rot: s.rot } : {}),
-            }));
-            diff.lyrics = diff.lyrics || { segments: normalized };
-          }
+        if (submission.blocked) {
+          alert({
+            title: t("edit.bg_locked_done_title") || "No se puede regenerar el fondo",
+            description: t("edit.bg_locked_done_desc") ||
+              "El fondo de un video ya aprobado no se puede regenerar — para cambiarlo, generá un video nuevo.",
+            tone: "warning",
+          });
+          return;
         }
 
-        // Construir UN único payload con todos los campos cambiados.
-        // Backend aplica los ungated en cualquier edit_type; los gated
-        // (background_*, segments para lyrics) sólo se aplican si el
-        // edit_type matchea.
-        track("edit.submitted", { job_id: editedJobId, fields: presentBuckets });
-        const payload = { edit_type: chosenType };
-        if (diff.metadata) Object.assign(payload, diff.metadata);
-        if (diff.typography) Object.assign(payload, diff.typography);
-        if (diff.lyrics) Object.assign(payload, diff.lyrics);
-        if (diff.background) Object.assign(payload, diff.background);
-        if (diff.background_library) Object.assign(payload, diff.background_library);
+        // Telemetría honesta: `applied` son los buckets que el backend VA a
+        // aplicar y `dropped` los que la degradación por status descarta. Antes
+        // se reportaba `presentBuckets` entero DESPUÉS de degradar, así que un
+        // cambio de fondo descartado igual figuraba como enviado.
+        track("edit.submitted", {
+          job_id: editedJobId,
+          fields: Object.keys(submission.willApply),
+          dropped: submission.willDrop,
+        });
+        const payload = submission.payload;
         // Regen de fondo IA (Veo/Imagen + validación): paridad con la tarjeta
         // "Regenerar fondo" que se plegó al wizard (unificación #973). Motor y
         // política de validación son MODIFICADORES de un regen, no campos del
         // baseline — llegan por onEditFieldChange (como forceBackgroundRegen).
         // Sólo aplican si el edit es un regen IA (edit_type="background"; el
         // swap de biblioteca no dispara Veo). Ver backgroundRegenExtras.
-        if (chosenType === "background") {
+        if (submission.editType === "background") {
           Object.assign(payload, backgroundRegenExtras(r));
         }
         if (Array.isArray(payload.segments)) {
