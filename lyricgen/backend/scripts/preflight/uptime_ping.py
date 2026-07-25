@@ -39,6 +39,10 @@ from datetime import datetime, timezone
 _ATTEMPTS = 3
 _GAP_S = 10
 _TIMEOUT_S = 8
+# Tope de lectura del cuerpo de /health. Es una guarda contra una respuesta
+# anómala, NO un presupuesto: tiene que quedar MUY por encima del payload real
+# (~3,7 KB al 2026-07-25) para que nunca vuelva a truncar el JSON.
+_MAX_BODY_BYTES = 256 * 1024
 
 
 def _probe(url: str) -> tuple[bool, str]:
@@ -47,13 +51,24 @@ def _probe(url: str) -> tuple[bool, str]:
         req = urllib.request.Request(f"{url}/health", method="GET")
         with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
             code = resp.getcode()
-            body = resp.read(2048).decode("utf-8", "replace")
+            # Leer el cuerpo COMPLETO (con un tope generoso solo como guarda
+            # anti-respuesta-gigante). Antes se leían 2048 bytes fijos: el
+            # payload de /health fue creciendo (fleet_*, worker_releases, r2,
+            # reaper, submissions…) hasta pasar ese corte, y el JSON truncado
+            # hacía fallar json.loads → el monitor reportaba "prod caído" con
+            # producción perfecta. Ese falso positivo no era inofensivo:
+            # ensuciaba el check suite de main y Railway, que espera el check
+            # suite, salteaba los deploys de producción (2026-07-25).
+            body = resp.read(_MAX_BODY_BYTES).decode("utf-8", "replace")
         if code != 200:
             return False, f"HTTP {code}"
         try:
             data = json.loads(body)
         except ValueError:
-            return False, f"200 but non-JSON body: {body[:120]}"
+            return False, (
+                f"200 but non-JSON body ({len(body)}B leídos, tope "
+                f"{_MAX_BODY_BYTES}B): {body[:120]}"
+            )
         status = data.get("status")
         if status != "ok":
             # Surface which subsystem is down (db/redis/r2) for the alert.
