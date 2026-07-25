@@ -9643,6 +9643,161 @@ def _bg_scene_discontinuity(video_path: str) -> float:
         return 0.0
 
 
+def _estimate_shift(prev, cur, window) -> tuple[float, float]:
+    """Traslación (dx, dy) en px entre dos frames, por correlación de fase.
+
+    numpy puro (FFT), sin opencv. Dos detalles que NO son opcionales — sin
+    ellos la medición da cero para paneos reales (verificado):
+
+    - VENTANA de Hanning + resta de la media: sin ventanear, la fuga espectral
+      de los bordes domina la correlación y el pico queda en el origen.
+    - SUB-PÍXEL por interpolación parabólica: a 320 px de ancho un drift lento
+      es sub-píxel entre frames, y el pico entero lo redondea a 0.
+    """
+    import numpy as _np
+
+    a = (prev - prev.mean()) * window
+    b = (cur - cur.mean()) * window
+    fa = _np.fft.fft2(a)
+    fb = _np.fft.fft2(b)
+    cross = fa * _np.conj(fb)
+    mag = _np.abs(cross)
+    mag[mag == 0] = 1.0
+    corr = _np.fft.fftshift(_np.fft.ifft2(cross / mag).real)
+    h, w = prev.shape
+    iy, ix = _np.unravel_index(_np.argmax(corr), corr.shape)
+
+    def _sub(line, i, n):
+        if i <= 0 or i >= n - 1:
+            return 0.0
+        left, mid, right = line[i - 1], line[i], line[i + 1]
+        denom = left - 2 * mid + right
+        return 0.0 if denom == 0 else 0.5 * (left - right) / denom
+
+    dy = (iy - h // 2) + _sub(corr[:, ix], iy, h)
+    dx = (ix - w // 2) + _sub(corr[iy, :], ix, w)
+    return float(dx), float(dy)
+
+
+def _measure_camera_drift(video_path: str, samples: int = 12) -> dict | None:
+    """Mide cuánto se MOVIÓ LA CÁMARA en un clip, como % del ancho del frame.
+
+    Para qué: medición propia sobre los fondos `movement_style=estatico` de
+    staging (25-jul-2026) dio 4 de 7 realmente clavados (≤0,14% del ancho) y
+    3 con paneo real — 6,1%, 26,8% y 29,7%, uno de ellos un push-in frontal,
+    que es justo lo que el prompt prohíbe por legibilidad de la letra. Veo
+    ignora el "locked camera" seguido y no hay campo estructurado para forzarlo,
+    así que lo único posible es MEDIRLO. Esta función sólo mide y loguea: la
+    decisión de re-rollear necesita datos primero (y un presupuesto de retry
+    propio, ver el comentario al final).
+
+    Tres decisiones que importan y que una implementación naive erra:
+
+    1) BORDES, no el frame completo. `estatico` está DISEÑADO para tener
+       movimiento dentro de la escena ("gente caminando, olas, nubes, neblina,
+       fuego" — ver el routing de estatico/sutil). Una correlación global sobre
+       una cascada o una multitud que llena el cuadro mide al SUJETO y reporta
+       paneo donde no hay. Las franjas de borde son lo más cercano a un ancla
+       estática que tiene un plano fijo.
+
+    2) EXCURSIÓN ACUMULADA MÁXIMA, no el desplazamiento neto. Un vaivén vuelve
+       al origen: el neto da ~0 y el paneo es igual de visible.
+
+    3) El clip PRE-LOOP. El fondo final está palindromizado (A + reverse(A)),
+       así que cualquier corrimiento neto se cancela por construcción. Hay que
+       medir la salida cruda de Veo.
+
+    Devuelve {"pct_width", "pct_width_borders", "peak_px", "frames"} o None.
+    Fail-open por diseño: esto NUNCA debe bloquear un fondo.
+
+    Validado contra los 7 fondos `estatico` de staging (con inspección visual de
+    los casos en disputa): los 6 de cámara fija dan ≤0,03% y el único push-in
+    real da 5,9%. Se emiten las DOS variantes (frame completo y mediana de
+    franjas de borde) porque todavía no hay datos para elegir umbral: la de
+    bordes es más robusta a un sujeto que llena el cuadro, la global es más
+    limpia cuando el fondo tiene textura estable.
+    """
+    tmpdir = None
+    try:
+        import numpy as _np
+        import tempfile as _tf
+        from PIL import Image as _Img
+
+        tmpdir = _tf.mkdtemp(prefix="drift_")
+        pattern = os.path.join(tmpdir, "f_%03d.png")
+        # fps bajo + escala chica: alcanza para traslación global y deja el costo
+        # en decenas de ms. Mismo patrón de extracción que
+        # _bg_scene_discontinuity (ffmpeg subprocess, no moviepy).
+        run_checked(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path,
+             "-vf", "fps=3,scale=320:180", "-frames:v", str(samples), pattern],
+            label="ffmpeg-drift-frames",
+            timeout=120,
+        )
+        files = sorted(f for f in os.listdir(tmpdir) if f.endswith(".png"))
+        if len(files) < 3:
+            return None
+
+        frames = []
+        for name in files:
+            with _Img.open(os.path.join(tmpdir, name)) as im:
+                frames.append(_np.asarray(im.convert("L"), dtype=_np.float64))
+
+        h, w = frames[0].shape
+        band = max(24, h // 4)
+        side = max(24, w // 4)
+
+        def _patches(a):
+            # Cuatro franjas de borde, cada una medida POR SEPARADO (apilarlas
+            # en un solo array destruye la continuidad espacial que la
+            # correlación necesita — daba 0 para paneos reales).
+            return [a[:band, :], a[-band:, :], a[:, :side], a[:, -side:]]
+
+        def _hann(shape):
+            return _np.outer(_np.hanning(shape[0]), _np.hanning(shape[1]))
+
+        patch_windows = [_hann(p.shape) for p in _patches(frames[0])]
+        full_window = _hann((h, w))
+
+        # Contra el PRIMER frame, no contra el anterior: la excursión respecto
+        # del inicio es lo que se percibe como "la cámara se movió", y acumular
+        # pasos consecutivos pierde los drifts lentos por cuantización.
+        peak_full = 0.0
+        peak_borders = 0.0
+        base_patches = _patches(frames[0])
+        for i in range(1, len(frames)):
+            est = [
+                _estimate_shift(pa, pb, win)
+                for pa, pb, win in zip(base_patches, _patches(frames[i]), patch_windows)
+            ]
+            # Mediana por componente: robusta a que UNA franja esté dominada por
+            # movimiento de la escena (nubes, niebla, agua) en vez de la cámara.
+            bdx = float(_np.median([e[0] for e in est]))
+            bdy = float(_np.median([e[1] for e in est]))
+            peak_borders = max(peak_borders, (bdx ** 2 + bdy ** 2) ** 0.5)
+
+            fdx, fdy = _estimate_shift(frames[0], frames[i], full_window)
+            peak_full = max(peak_full, (fdx ** 2 + fdy ** 2) ** 0.5)
+
+        return {
+            "pct_width": round(100.0 * peak_full / float(w), 2),
+            "pct_width_borders": round(100.0 * peak_borders / float(w), 2),
+            "peak_px": round(peak_full, 1),
+            "frames": len(frames),
+        }
+    except Exception as e:
+        _raise_if_job_timeout(e)
+        logger.warning("[BG][DRIFT] medición falló (fail-open): %s", e)
+        return None
+    finally:
+        if tmpdir:
+            try:
+                import shutil as _sh
+                _sh.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+
+
 def _score_video_relevance(video_path: str, prompt: str) -> int:
     """Ask Gemini Vision whether the video matches the intended scene prompt.
 
@@ -11025,6 +11180,42 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                     discont, _BG_SCENE_CUT_THRESHOLD,
                     os.path.basename(bg_path), job_id,
                 )
+            # Cumplimiento de "Estático": SOLO MEDIR Y LOGUEAR (2026-07-25).
+            #
+            # Veo ignora el locked-camera bastante seguido y no expone un campo
+            # estructurado para forzarlo: los negativos del prompt son el único
+            # lever. Medición propia sobre los 7 fondos `estatico` de staging: 4
+            # clavados (≤0,14% del ancho) y 3 con paneo real (6,1 / 26,8 /
+            # 29,7%), uno un push-in frontal. Antes de re-rollear hace falta
+            # saber la tasa real, así que esto emite la métrica en cada render
+            # estático y no toca el resultado.
+            #
+            # Por qué NO se re-rollea todavía (y por qué no puede colgarse de
+            # `quality_retry_used`): ese retry RE-DERIVA el prompt, o sea que
+            # cambiaría la escena en vez de corregir la cámara — "me cambió
+            # todo", que es una queja peor. Además comparte el único slot con el
+            # detector de cortes, y si el reintento pega un 429 el except de más
+            # abajo cae al gradiente y tira el clip bueno. Un re-roll de drift
+            # necesita: mismo prompt + generation_nonce fresco (si no, cache HIT
+            # → clip idéntico), quedarse con el MEJOR de los dos candidatos,
+            # presupuesto propio, y no-op duro si veo_breaker está abierto o
+            # bg_verbatim. Va en un PR aparte, con los datos en la mano.
+            if _norm_move_bg == "estatico":
+                _drift = _measure_camera_drift(bg_path)
+                if _drift:
+                    # El modelo va en la línea porque es la variable que se
+                    # quiere correlacionar: veo-3.1-fast tiene un drift prior
+                    # más fuerte que el standard, y VEO_MODEL_STATIC (hoy sin
+                    # setear) es la mitigación a evaluar con estos datos.
+                    logger.info(
+                        "[BG][DRIFT] job=%s movement=estatico model=%s "
+                        "drift_pct=%.2f drift_pct_borders=%.2f peak_px=%.1f frames=%s",
+                        job_id,
+                        (os.environ.get("VEO_MODEL_STATIC", "").strip()
+                         or os.environ.get("VEO_MODEL", "veo-3.1-fast-generate-001").strip()),
+                        _drift["pct_width"], _drift["pct_width_borders"],
+                        _drift["peak_px"], _drift["frames"],
+                    )
             # Verbatim: never re-roll. A re-roll re-runs _get_unique_prompt
             # which short-circuits to the SAME verbatim text → identical
             # safe_prompt → Veo cache HIT → same clip, wasting a scoring pass
