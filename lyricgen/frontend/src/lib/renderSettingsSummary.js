@@ -65,12 +65,34 @@ export const SETTINGS_GROUPS = [
 
 // Valores que significan "sin elección explícita": no se muestran como chip,
 // porque un chip `Concepto: —` es ruido, no información.
-const EMPTY_VALUES = new Set(["", "auto", "none", "ninguno"]);
+// OJO: no incluir "none"/"auto" acá. Se hizo en la primera versión y escondía
+// valores con significado propio en cualquier eje donde "none" es una elección
+// real, además de volver inalcanzables las etiquetas escritas para ellos. Lo
+// que es "el default" va en AXIS_DEFAULTS, por eje y explícito.
+const EMPTY_VALUES = new Set(["", "ninguno"]);
 
-function isEmptyish(value) {
+// Defaults POR EJE que tampoco se muestran. Van aparte de EMPTY_VALUES porque
+// no son "vacío": son valores reales que el pipeline usa cuando el operador no
+// eligió nada. Sin esto la ficha mostraba `Formato: full` y `Contraste: medium`
+// en casi todos los videos — ruido, y encima con el código interno a la vista.
+const AXIS_DEFAULTS = {
+  frame_format: "full",
+  text_case: "upper",
+  text_contrast: "medium",
+  title_template: "auto",
+  lyrics_animation: "none",
+  line_transition: "none",
+  genre: "auto",
+  concept: "auto",
+  movement_style: "auto",
+  effect: "none",
+};
+
+function isEmptyish(value, axisKey) {
   if (value == null) return true;
   const s = String(value).trim().toLowerCase();
-  return s === "" || EMPTY_VALUES.has(s);
+  if (s === "" || EMPTY_VALUES.has(s)) return true;
+  return axisKey != null && AXIS_DEFAULTS[axisKey] === s;
 }
 
 /**
@@ -95,13 +117,22 @@ export function buildSettingsSummary(params, deps = {}) {
     const chips = [];
     for (const axis of group.axes) {
       const raw = p[axis.key];
-      if (isEmptyish(raw)) continue;
+      if (isEmptyish(raw, axis.key)) continue;
 
       let value;
-      if (axis.kind === "scale") {
+      // Un eje enum NUNCA debe mostrar su código interno. `valueLabel` lo
+      // resuelve con los mismos catálogos que usan los pickers del wizard.
+      const enumLabel = deps.valueLabel && deps.valueLabel(axis.key, raw);
+      if (enumLabel) {
+        value = enumLabel;
+      } else if (axis.kind === "scale") {
         // 1.15 → "1.15×". Un 1.0 es el default y no se muestra: no pasa por
         // EMPTY_VALUES (es numérico), así que se filtra explícitamente acá.
-        const n = parseFloat(raw);
+        // `.replace(",", ".")`: font_scale/title_size viajan como STRING desde
+        // el form, y un job viejo puede tener "1,15". parseFloat lo cortaba en
+        // 1 → se filtraba como default y la ficha decía "tamaño normal" sobre
+        // un video que no lo estaba.
+        const n = parseFloat(String(raw).replace(",", "."));
         if (!Number.isFinite(n) || Math.abs(n - 1) < 1e-6) continue;
         value = `${n}×`;
       } else if (axis.kind === "prompt") {

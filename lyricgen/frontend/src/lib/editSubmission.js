@@ -92,6 +92,12 @@ export function buildEditReview(job, snapReview = null) {
     titleSongFont: pickSnapOr("titleSongFont", params.title_song_font || ""),
     // UI v1.1 (2026-05-30): manual song-title line break — "" = auto.
     titleSongBreak: pickSnapOr("titleSongBreak", params.title_song_break || ""),
+    // scene_plan viaja con los campos sembrados (App hace ...initialFields al
+    // armar currentReview) en vez de cablearse a mano en el componente: así el
+    // dato que alimenta el gate de multi-escena queda DENTRO de la función que
+    // los tests ejercitan. La primera versión lo pasaba por afuera y el gate
+    // terminó siendo código muerto con tests en verde.
+    scenePlan: (job && job.scene_plan) || null,
   };
 
   const baseline = {

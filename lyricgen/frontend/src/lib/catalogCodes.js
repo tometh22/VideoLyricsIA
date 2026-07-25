@@ -85,7 +85,10 @@ const MOVEMENT_ALIASES = {
 export function normalizeMovementCode(value) {
   const s = String(value == null ? "" : value).trim().toLowerCase();
   if (!s) return "";
-  if (MOVEMENT_ALIASES[s]) return MOVEMENT_ALIASES[s];
+  // hasOwnProperty y no `MOVEMENT_ALIASES[s]`: un input como "constructor" o
+  // "__proto__" resolvía contra Object.prototype y devolvía una FUNCIÓN, que
+  // terminaba en el payload del edit. El backend devuelve "" para esos.
+  if (Object.prototype.hasOwnProperty.call(MOVEMENT_ALIASES, s)) return MOVEMENT_ALIASES[s];
   if (MOVEMENT_CODES.includes(s)) return s;
   return "";
 }
