@@ -69,8 +69,20 @@ def approved_job(db, admin_token, client):
     db.commit()
     db.refresh(job)
     yield job
-    # Cleanup: remove the job + any deliveries we created against it
-    from database import Delivery
+    # Cleanup: remove the job + any deliveries we created against it.
+    # Change requests reference deliveries via a FK (delivery_change_requests
+    # _delivery_id_fkey) — Postgres enforces it even though the local SQLite
+    # test DB silently ignores it, so deleting the CRs first is required or
+    # this teardown 500s and leaves testjob12345 behind, breaking every
+    # subsequent test that reuses this fixture's hardcoded job_id.
+    from database import Delivery, DeliveryChangeRequest
+    delivery_ids = [
+        d.id for d in db.query(Delivery).filter(Delivery.job_id == "testjob12345").all()
+    ]
+    if delivery_ids:
+        db.query(DeliveryChangeRequest).filter(
+            DeliveryChangeRequest.delivery_id.in_(delivery_ids)
+        ).delete(synchronize_session=False)
     db.query(Delivery).filter(Delivery.job_id == "testjob12345").delete()
     db.query(Job).filter(Job.id == job.id).delete()
     db.commit()
