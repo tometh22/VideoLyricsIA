@@ -405,6 +405,13 @@ export default function LyricsEditor({
   // the operator can fix sync on an already-approved job without
   // pulling in features that no longer apply.
   audioUrl: audioUrlProp = null,
+  // El padre (App) trae el audio del /source-audio-url en segundo plano
+  // (fire-and-forget con reintentos). Mientras ese fetch está EN VUELO,
+  // audioUrl es null pero el audio SÍ existe — mostrar "Audio no disponible"
+  // ahí es un falso alarma (reporte 2026-07-25: el banner aparecía ~30s y
+  // recién después se podía escuchar). Este flag distingue "cargando" de
+  // "no existe / se agotaron los reintentos".
+  audioLoading = false,
   disableAutoSplit = false,
   disableBeforeUnload = false,
   disableAutosave = false,
@@ -2429,11 +2436,25 @@ export default function LyricsEditor({
           <span className="text-xs text-gray-500 tabular-nums shrink-0 w-10">
             {formatTime(duration)}
           </span>
-          </>) : (
-            /* Sin audio: ocupar el mismo espacio horizontal que el
-               reproductor para que la fila no colapse y los controles de
-               vista (a la derecha) queden en la misma posición que cuando
-               hay audio. Esto preserva la memoria muscular del operador. */
+          </>) : audioLoading ? (
+            /* Cargando: el padre todavía está trayendo la URL del audio.
+               NO mostrar "no disponible" acá — es un falso alarma mientras
+               el fetch (con reintentos) está en vuelo. Mismo ancho que el
+               reproductor para no colapsar la fila. */
+            <div className="flex-1 flex items-center gap-2 text-[11px] text-ink-secondary">
+              <svg className="w-3.5 h-3.5 flex-shrink-0 animate-spin" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M21 12a9 9 0 1 1-6.219-8.56" strokeLinecap="round" />
+              </svg>
+              <span className="truncate">
+                {t("editor.audio_loading") || "Cargando audio…"}
+              </span>
+            </div>
+          ) : (
+            /* Sin audio (reintentos agotados / job sin input): ocupar el
+               mismo espacio horizontal que el reproductor para que la fila
+               no colapse y los controles de vista (a la derecha) queden en
+               la misma posición que cuando hay audio. Esto preserva la
+               memoria muscular del operador. */
             <div className="flex-1 flex items-center gap-2 text-[11px] text-amber-300/90">
               <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M12 9v4M12 17h.01" />
