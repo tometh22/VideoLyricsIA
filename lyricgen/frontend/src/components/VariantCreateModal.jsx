@@ -71,6 +71,13 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
   const [validationEnabled, setValidationEnabled] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
+  // Overage confirmation gate. The backend replies 402
+  // `variant_overage_unconfirmed` when this song already has
+  // VARIANT_INCLUDED_PER_SONG (3) rendered versions — the 4th+ costs
+  // extra. Instead of dumping the raw JSON error, we stash the detail
+  // here and render an explicit confirm step; confirming re-submits with
+  // `acknowledge_variant_overage: true`. See backend main.py create_variant.
+  const [overage, setOverage] = useState(null);
   // Guard sincrónico contra doble click (mismo patrón que EditRequestPanel
   // que aprendimos en PR #106 — sin esto un click rápido crea 2 variantes
   // y quema 2 videos del plan).
@@ -79,13 +86,19 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
   useEffect(() => () => { mountedRef.current = false; }, []);
   const dialogRef = useDialogA11y({ onClose, closeOnEscape: !submitting });
 
-  const submit = async () => {
+  // opts.acknowledgeOverage — set true when the operator confirms the
+  // paid-overage step, so we re-send with the ack flag the backend wants.
+  const submit = async (opts = {}) => {
     if (submitLockRef.current || submitting) return;
     submitLockRef.current = true;
     setError(null);
+    setOverage(null);
     setSubmitting(true);
 
     const payload = {};
+    if (opts.acknowledgeOverage) {
+      payload.acknowledge_variant_overage = true;
+    }
     const hint = backgroundHint.trim();
     if (hint) payload.background_hint = hint;
     // Stash the hint as the operator submits so it survives a failed
@@ -133,17 +146,36 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
+        let detail = body.detail;
+        // Paid-overage gate: the song already has the plan's included
+        // versions, so the 4th+ costs extra. This is NOT a hard error —
+        // surface an explicit confirm step (rendered below) instead of the
+        // red error box, and let the operator proceed. On confirm we
+        // re-submit with acknowledge_variant_overage: true.
+        if (
+          res.status === 402 &&
+          detail && typeof detail === "object" &&
+          detail.code === "variant_overage_unconfirmed"
+        ) {
+          if (mountedRef.current) {
+            setOverage(detail);
+            submitLockRef.current = false;
+            setSubmitting(false);
+          }
+          return;
+        }
         // Pydantic v2 422 returns `detail` as an array of error objects
         // ([{type, loc, msg, input}, ...]). String-coercing that array
-        // gives "[object Object]" — render the msg(s) instead. Other
-        // shapes (string, plain object, missing) fall through.
-        let detail = body.detail;
+        // gives "[object Object]" — render the msg(s) instead. Structured
+        // dict errors carry human text under `message` (FastAPI) or `msg`;
+        // prefer those over dumping the whole JSON blob. Other shapes
+        // (string, missing) fall through.
         if (Array.isArray(detail)) {
           detail = detail
             .map((e) => (e && typeof e === "object" && e.msg) ? e.msg : String(e))
             .join("; ");
         } else if (detail && typeof detail === "object") {
-          detail = detail.msg || JSON.stringify(detail);
+          detail = detail.message || detail.msg || JSON.stringify(detail);
         }
         throw new Error(detail || `Error ${res.status}`);
       }
@@ -240,6 +272,23 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
           </div>
         )}
 
+        {overage && (
+          <div className="p-3 rounded-xl bg-amber-500/[0.08] ring-1 ring-amber-500/30 space-y-1">
+            <p className="text-xs text-amber-200 font-medium">
+              {t("variant.overage_title") || "Versión adicional — se factura extra"}
+            </p>
+            <p className="text-[11px] text-ink-secondary leading-relaxed">
+              {(t("variant.overage_desc") ||
+                "Esta canción ya tiene {existing} versiones (incluida la original). El plan incluye {included} por canción; a partir de la próxima se factura ${cost} adicional al cierre del mes.")
+                .replace("{existing}", overage.existing_renders ?? "—")
+                .replace("{included}", overage.included_per_song ?? "—")
+                .replace("{cost}", typeof overage.cost_extra_usd === "number"
+                  ? overage.cost_extra_usd.toFixed(2)
+                  : (overage.cost_extra_usd ?? "—"))}
+            </p>
+          </div>
+        )}
+
         <div className="flex items-center justify-end gap-2 pt-2">
           <button
             type="button"
@@ -249,16 +298,29 @@ export default function VariantCreateModal({ job, onClose, onCreated }) {
           >
             {t("variant.cancel") || "Cancelar"}
           </button>
-          <button
-            type="button"
-            onClick={submit}
-            disabled={submitting}
-            className="px-4 py-2 rounded-md text-sm font-medium text-white bg-accent hover:bg-accent/90 ring-1 ring-accent/30 transition-colors disabled:opacity-60"
-          >
-            {submitting
-              ? (t("variant.creating") || "Creando…")
-              : (t("variant.create") || "Crear variante")}
-          </button>
+          {overage ? (
+            <button
+              type="button"
+              onClick={() => submit({ acknowledgeOverage: true })}
+              disabled={submitting}
+              className="px-4 py-2 rounded-md text-sm font-medium text-white bg-amber-600 hover:bg-amber-500 ring-1 ring-amber-500/40 transition-colors disabled:opacity-60"
+            >
+              {submitting
+                ? (t("variant.creating") || "Creando…")
+                : (t("variant.overage_confirm") || "Confirmar y crear (extra)")}
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => submit()}
+              disabled={submitting}
+              className="px-4 py-2 rounded-md text-sm font-medium text-white bg-accent hover:bg-accent/90 ring-1 ring-accent/30 transition-colors disabled:opacity-60"
+            >
+              {submitting
+                ? (t("variant.creating") || "Creando…")
+                : (t("variant.create") || "Crear variante")}
+            </button>
+          )}
         </div>
       </div>
     </div>
