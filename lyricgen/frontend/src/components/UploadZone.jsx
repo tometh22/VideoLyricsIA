@@ -248,6 +248,17 @@ export default function UploadZone({
   // field — el wizard sigue mostrando el control para que el operador
   // VEA el valor actual, pero con overlay + tooltip "no editable".
   editMode = false,
+  // Wizard de "Crear variante" (App.jsx VariantWizardRoute). Es un
+  // sub-modo de `editMode`: los dos montan el wizard sobre un job que ya
+  // existe, así que `editMode` sigue siendo el flag de "modo
+  // no-creación" (locks de pasos, semilla de campos, sin tab "Subir el
+  // mío", sin Multi-escena) y `variantMode` sólo cambia lo que difiere:
+  //   - el costo NO es "1 de tus 3 ediciones" sino 1 video del plan;
+  //   - no hay toggle "Generar otra versión" (una variante SIEMPRE
+  //     genera fondo nuevo, es su razón de ser);
+  //   - la paleta (style) SÍ es editable — /variant acepta `style`,
+  //     /edit no.
+  variantMode = false,
   // Callback opcional para wizard en edit mode: cuando un control de
   // step 2/3/4 escribe a batchDefaults (el path normal new-job), también
   // forward el cambio a currentReview vía este callback. Sin esto, los
@@ -486,6 +497,12 @@ export default function UploadZone({
       concept: editSeed.concept || "",
       backgroundHint: editSeed.backgroundHint || "",
       bgVerbatim: editSeed.bgVerbatim != null ? !!editSeed.bgVerbatim : prev.bgVerbatim,
+      // `wizardFields` sólo llega en modo VARIANTE: ahí el submit manda el
+      // estado ABSOLUTO de cada eje, así que un control que muestre el
+      // sticky de localStorage en vez del valor del padre mandaría ese
+      // sticky al backend. En edición no viene (el submit es un diff: un
+      // campo sin tocar no viaja, así que la semilla es sólo cosmética).
+      ...(editSeed.wizardFields || {}),
     }));
     setSceneMode(
       (editSeed.backgroundHint || "").trim()
@@ -1769,12 +1786,22 @@ export default function UploadZone({
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0">
                   <p className="text-[11px] font-medium text-gray-200">
-                    {t("upload.regen_bg_title") || "Regeneración de fondo incluida"}
+                    {variantMode
+                      ? (t("variant.cost_title") || "Cuesta 1 video de tu plan")
+                      : (t("upload.regen_bg_title") || "Regeneración de fondo incluida")}
                   </p>
                   <p className="text-[10px] text-gray-600 mt-0.5">
-                    {t("upload.regen_bg_desc") || "Editás el fondo como siempre (movimiento, efecto, look). Al aprobar se genera una versión nueva con IA y usa 1 de tus 3 ediciones. Cambiar a un fondo de Biblioteca es gratis."}
+                    {variantMode
+                      ? (t("variant.cost_desc_wizard") || "La variante es un video nuevo: se cobra 1 video al plan y pasa por review como cualquier upload. A partir de la 4ª versión de la misma canción se factura un extra (te lo confirmamos antes de crearla).")
+                      : (t("upload.regen_bg_desc") || "Editás el fondo como siempre (movimiento, efecto, look). Al aprobar se genera una versión nueva con IA y usa 1 de tus 3 ediciones. Cambiar a un fondo de Biblioteca es gratis.")}
                   </p>
                 </div>
+                {/* El toggle "Generar otra versión" existe porque una
+                    edición puede NO tocar el fondo (y entonces el diff
+                    queda vacío). Una variante siempre genera fondo nuevo
+                    — ofrecer el toggle sería mentir sobre una elección
+                    que no existe. */}
+                {!variantMode && (
                 <button
                   type="button"
                   onClick={toggleRegenRequested}
@@ -1787,6 +1814,7 @@ export default function UploadZone({
                 >
                   {regenRequested ? (t("upload.regen_bg_on") || "Se generará ✓") : (t("upload.regen_bg_cta") || "Generar otra versión")}
                 </button>
+                )}
               </div>
               {/* Fondo-libre (bypass del validador) — sólo cuentas no-UMG, y
                   plegado para no ensuciar el editor. UMG tiene política fija
@@ -3460,10 +3488,14 @@ export default function UploadZone({
                       </label>
                     </div>
                   ) : onStyleChange && (
+                    // La paleta se bloquea SOLO en edición: /edit no tiene
+                    // edit_type=palette (recolorear pisaría el fondo IA
+                    // cacheado). En VARIANTE el fondo se genera de cero y
+                    // /variant sí acepta `style` → control desbloqueado.
                     <div className={`rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3 ${
-                      editMode ? "relative opacity-60 pointer-events-none select-none" : ""
+                      editMode && !variantMode ? "relative opacity-60 pointer-events-none select-none" : ""
                     }`}>
-                      {editMode && (
+                      {editMode && !variantMode && (
                         // QA fix 2026-05-27: step 2 ahora navegable en edit
                         // mode (antes estaba locked entero). Pero la paleta
                         // (style) es structural — cambiarla recolorea el
