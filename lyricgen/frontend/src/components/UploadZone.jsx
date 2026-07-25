@@ -411,6 +411,20 @@ export default function UploadZone({
   // llega al render) queda a la vista.
   const portadaControlsRef = useRef(null);
   const [portadaControlsPulse, setPortadaControlsPulse] = useState(false);
+  // Mismo mecanismo, para el grupo de Efecto: "Foto fija" no tiene movimiento
+  // propio (el Ken Burns se sacó por el OOM de Rata Blanca, 02-jun), así que sin
+  // un efecto encima el fondo queda inmóvil los 3-4 minutos. El aviso vive donde
+  // el operador clickea (Movimiento) y este pulse lo lleva al control que lo
+  // resuelve — clon del fix de descubribilidad de la portada (incidente Clari
+  // 19-jul, "no encuentro dónde agrandar el título").
+  const effectControlsRef = useRef(null);
+  const [effectControlsPulse, setEffectControlsPulse] = useState(false);
+  const jumpToEffects = () => {
+    const el = effectControlsRef.current;
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    setEffectControlsPulse(true);
+    setTimeout(() => setEffectControlsPulse(false), 1800);
+  };
   useEffect(() => {
     if (previewFace !== "title") return;
     const el = portadaControlsRef.current;
@@ -518,6 +532,9 @@ export default function UploadZone({
       // render saliera igual que antes.
       ...(editSeed.wizardFields || {}),
     }));
+    // El prompt del job arranca como "guardado": si el operador cambia de modo,
+    // la tarjeta ya puede ofrecérselo de vuelta.
+    setSavedPrompt((editSeed.backgroundHint || "").trim());
     setSceneMode(
       (editSeed.backgroundHint || "").trim()
         ? "prompt"
@@ -601,6 +618,24 @@ export default function UploadZone({
     setCustomPreviewUrl(url);
     return () => URL.revokeObjectURL(url);
   }, [backgroundFile]);
+  // ── "Mi prompt" como artefacto guardado ─────────────────────────────────
+  // Antes, clickear "Auto" o "Inspirado en la letra" ejecutaba un clear del
+  // prompt: sin confirmación, sin undo, sin quedar registrado en ningún lado.
+  // Y la trampa: un job CON prompt y match_lyrics=true se muestra en modo "Mi
+  // prompt" (el hint le gana, fiel a resolve_creative_mode), así que el
+  // operador cuya configuración YA era "inspirado en la letra" clickeaba esa
+  // tarjeta para corregirla — y en ese click perdía su prompt. Pasó dos veces
+  // en la cadena del reclamo.
+  //
+  // El clear del CABLE se mantiene: es el fix #982 y es necesario, porque en el
+  // backend un hint no vacío le gana SIEMPRE a match_lyrics
+  // (background_policy.resolve_creative_mode) y además revive de render_params
+  // en cada regen. Conservar el texto en el payload haría que el modo elegido
+  // se ignore — cambiaría "te borra el prompt" por "te ignora el modo".
+  //
+  // Lo que cambia es que el texto no se DESTRUYE: queda guardado en el wizard y
+  // vuelve con un click. Borrarlo pasa a ser una acción explícita del operador.
+  const [savedPrompt, setSavedPrompt] = useState("");
   const selectSceneMode = (m) => {
     track("wizard.scene_mode", { mode: m });
     setSceneMode(m);
@@ -614,13 +649,24 @@ export default function UploadZone({
     // /edit (computeFieldDiff → bucket background). onInspiredByLyricsChange
     // solo toca el estado top-level del flujo de creación, no currentReview.
     if (editMode) onEditFieldChange?.("matchLyrics", _ml);
-    if (m === "auto") {
-      if (_hint) updateBatchDefault("backgroundHint", "");   // stale prompt must not override
-    } else if (m === "lyrics") {
-      if (_hint) updateBatchDefault("backgroundHint", "");
+    if (m === "auto" || m === "lyrics") {
+      // El prompt sale del payload (el modo manda) pero se GUARDA antes.
+      if (_hint) {
+        setSavedPrompt(_hint);
+        updateBatchDefault("backgroundHint", "");
+      }
+    } else if (m === "prompt") {
+      // Volver a "Mi prompt" restaura lo último guardado si el campo está
+      // vacío — el camino de vuelta que antes no existía.
+      if (!_hint && savedPrompt) updateBatchDefault("backgroundHint", savedPrompt);
     }
     // Nota: multi-escena (enableScenes) es ORTOGONAL — funciona con cualquiera
     // de los 3 modos; su toggle premium vive debajo de las cards.
+  };
+  // Descartar el prompt guardado: única vía de destrucción, y es explícita.
+  const discardSavedPrompt = () => {
+    setSavedPrompt("");
+    if (_hint) updateBatchDefault("backgroundHint", "");
   };
   // Sample lyric for the live preview: first file's title, else a placeholder.
   // Phase 3 (2026-05-25): si estamos en review (reviewSegments presente),
@@ -1749,12 +1795,49 @@ export default function UploadZone({
             );
           })}
         </div>
+
+        {/* Foto fija + sin efecto = fondo 100% inmóvil los 3-4 minutos.
+            El Ken Burns se removió a propósito (OOM Rata Blanca 02-jun) y el
+            `effect="light"` automático que debía compensarlo era un no-op (se
+            borra en este PR). Así que la decisión vuelve al operador: lo
+            empujamos a elegir un efecto, pero "Sin efecto" sigue siendo válido
+            y explícito.
+
+            PERSISTENTE, no un toast: el aviso tiene que seguir ahí mientras la
+            combinación se mantenga. Un hint de una sola vez es exactamente el
+            diseño que produjo este bug — y al sembrar los controles del job
+            (PR anterior) la combinación puede aparecer SIN que el operador haya
+            clickeado nada. */}
+        {batchDefaults.movementStyle === "foto-parallax" && !batchDefaults.effect && (
+          <div
+            data-testid="foto-fija-warning"
+            className="mt-2.5 rounded-lg bg-amber-500/10 ring-1 ring-amber-500/30 px-3 py-2 flex items-start gap-2"
+          >
+            <p className="text-[11px] text-amber-300/90 leading-snug flex-1">
+              {t("upload.foto_fija_no_motion") || "Foto fija no tiene movimiento propio: el fondo queda quieto toda la canción. Elegí un efecto abajo para darle vida — o dejá «Sin efecto» si querés la imagen inmóvil."}
+            </p>
+            <button
+              type="button"
+              onClick={jumpToEffects}
+              className="shrink-0 rounded-full bg-amber-500/20 text-amber-200 text-[10px] font-medium px-2.5 py-1 ring-1 ring-amber-500/40 hover:bg-amber-500/30 transition-colors"
+            >
+              {t("upload.foto_fija_goto_effect") || "Ir a Efecto"}
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Effect gallery — particles composited OVER the background. Available
           for ANY source (IA / Biblioteca / Subido): it's an overlay, not a
           generation choice. Orthogonal to "Movimiento" (camera). */}
-      <div className="mb-4 pt-3 border-t border-white/[0.05]">
+      <div
+        ref={effectControlsRef}
+        className={`mb-4 pt-3 border-t border-white/[0.05] rounded-lg transition-all duration-500 ${
+          effectControlsPulse
+            ? "ring-2 ring-amber-500/60 bg-amber-500/[0.05] -mx-2 px-2"
+            : "ring-2 ring-transparent"
+        }`}
+      >
         <div className="mb-2">
           <div className="flex items-baseline justify-between">
             <p className="text-[11px] text-gray-400 font-medium">
@@ -1808,7 +1891,13 @@ export default function UploadZone({
                   {inVideo && <AnchorChip />}
                 </div>
                 <div className="px-2 py-1.5 bg-surface-1">
-                  <p className={`text-label leading-tight ${active ? "text-white" : "text-gray-200"}`}>{e.label}</p>
+                  {/* Con Foto fija, "Sin efecto" deja de ser un default neutro:
+                      es la decisión de que el fondo quede quieto. Que lo diga. */}
+                  <p className={`text-label leading-tight ${active ? "text-white" : "text-gray-200"}`}>
+                    {(!e.code && batchDefaults.movementStyle === "foto-parallax")
+                      ? (t("upload.effect_none_still") || "Sin efecto — imagen quieta")
+                      : e.label}
+                  </p>
                 </div>
               </button>
             );
@@ -3386,6 +3475,8 @@ export default function UploadZone({
                           key={m.code}
                           type="button"
                           onClick={() => selectSceneMode(m.code)}
+                          aria-pressed={sel}
+                          data-scene-mode={m.code}
                           className={`text-left rounded-card px-4 py-3 flex items-start gap-3 border transition-all duration-200 ${
                             sel ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08] shadow-glow"
                                 : "border-white/[0.06] bg-surface-2/40 hover:border-white/[0.18]"
@@ -3502,6 +3593,47 @@ export default function UploadZone({
                         <li>• {t("upload.scenes_b2") || "Los cortes caen en los cambios de la canción (entra el coro, el puente)."}</li>
                         <li>• {t("upload.scenes_b3") || "El coro vuelve siempre a la misma escena."}</li>
                       </ul>
+                    </div>
+                  )}
+
+                  {/* "Mi prompt guardado": el texto ya no se destruye al cambiar
+                      de tarjeta. Cuando el modo activo no es "Mi prompt" el
+                      prompt NO se usa en el render (el modo manda, y el backend
+                      necesita el campo vacío para que match_lyrics gane), pero
+                      sigue acá con un click para volver a usarlo. Sin textarea
+                      gris: el chip dice explícitamente si está en uso o no. */}
+                  {sceneMode !== "prompt" && savedPrompt && (
+                    <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                      <div className="flex items-center justify-between gap-2 mb-1.5">
+                        <p className="text-[11px] font-medium text-gray-300">
+                          {t("upload.saved_prompt_title") || "Mi prompt guardado"}
+                        </p>
+                        <span className="shrink-0 px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wide bg-surface-3 text-gray-400 ring-1 ring-white/[0.06]">
+                          {t("upload.saved_prompt_unused") || "No se usa en este modo"}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-gray-500 line-clamp-2">{savedPrompt}</p>
+                      <div className="mt-2 flex items-center gap-3">
+                        <button
+                          type="button"
+                          onClick={() => selectSceneMode("prompt")}
+                          className="rounded-full bg-brand/15 text-brand-light text-[11px] font-medium px-3 py-1 ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
+                        >
+                          {t("upload.saved_prompt_use") || "Usar este prompt"}
+                        </button>
+                        <details>
+                          <summary className="text-[10px] text-gray-600 hover:text-gray-400 cursor-pointer list-none">
+                            {t("upload.saved_prompt_more") || "Opciones"}
+                          </summary>
+                          <button
+                            type="button"
+                            onClick={discardSavedPrompt}
+                            className="mt-1.5 text-[10px] text-gray-500 hover:text-red-300 underline-offset-2 hover:underline transition-colors"
+                          >
+                            {t("upload.saved_prompt_discard") || "Descartar mi prompt"}
+                          </button>
+                        </details>
+                      </div>
                     </div>
                   )}
 
