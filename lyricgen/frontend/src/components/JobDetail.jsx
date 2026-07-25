@@ -13,6 +13,7 @@ import DriveTransferModal from "./DriveTransferModal";
 import ScenesFilmstrip from "./ScenesFilmstrip";
 import SceneEditModal from "./SceneEditModal";
 import MediaPreview from "./MediaPreview";
+import JobSettingsCard from "./JobSettingsCard";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -1717,6 +1718,20 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               {t("detail.upload_again") || "Subir nuevo archivo"}
             </button>
           </div>
+        </div>
+      )}
+
+      {/* Ficha de ajustes: con QUÉ se hizo este video. Hasta ahora el operador
+          no tenía forma de verlo — en el reclamo que originó esto regeneró el
+          fondo 7 veces sin poder ver que el job tenía guardado
+          movement_style="animado". Colapsada por defecto: es diagnóstico, no la
+          acción principal. */}
+      {!isArtTrack && (
+        <div className="mb-4">
+          <JobSettingsCard
+            renderParams={job.render_params}
+            provenanceHref={() => setActiveTab("provenance")}
+          />
         </div>
       )}
 
