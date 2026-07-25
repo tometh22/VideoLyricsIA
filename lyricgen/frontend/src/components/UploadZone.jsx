@@ -9,6 +9,7 @@ import ContentValidationToggle, { isUniversalAccount } from "./ContentValidation
 import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
 import { CONCEPT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
+import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS } from "../lib/optionLabels";
 import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBackgroundPreviewTokens";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -1006,15 +1007,19 @@ export default function UploadZone({
   // Los CÓDIGOS viven en lib/catalogCodes.js (contrato de paridad con
   // pipeline._MOVEMENT_STYLE_RULES, asertado por renderParity.test.js);
   // acá solo la metadata de UI por código.
+  // Las ETIQUETAS salen de lib/optionLabels, compartidas con WizardLivePreview
+  // y con la ficha del video (JobDetail). Acá queda sólo la metadata de UI por
+  // código: `kind`, el sample y la descripción.
+  const _MOVE_LABELS = MOVEMENT_LABELS(t);
   const MOVEMENT_META = {
-    estatico:        { kind: "video", label: t("upload.movement_estatico") || "Estático (escena viva)",     sample: "/movement_samples/estatico.mp4",  desc: t("upload.movement_estatico_desc") || "🎬 Escena real con cámara FIJA. Lo que se mueve son los elementos de la escena (gente, olas, nubes, neblina, fuego)." },
-    sutil:           { kind: "video", label: t("upload.movement_sutil") || "Sutil (cámara apenas drift)",   sample: "/movement_samples/sutil.mp4",     desc: t("upload.movement_sutil_desc") || "🎬 Escena real con drift sutil de cámara + motion in-scene. Calmo pero vivo." },
-    estandar:        { kind: "video", label: t("upload.movement_estandar") || "Estándar (cinematográfico)", sample: "/movement_samples/estandar.mp4",  desc: t("upload.movement_estandar_desc") || "🎬 Escena real con movimiento cinematográfico de cámara (zoom/drift)." },
-    "foto-parallax": { kind: "image", label: t("upload.movement_foto_parallax") || "Foto fija",             sample: "/movement_samples/foto-fija.jpg", desc: t("upload.movement_parallax_desc") || "Foto IA fija (sin movimiento de cámara). Sumale un efecto abajo —lluvia, nieve, luces— para darle vida." },
-    animado:         { kind: "video", label: t("upload.movement_animado") || "Animado (ilustración)",       sample: "/movement_samples/animado.mp4",   desc: t("upload.movement_animado_desc") || "🎬 Ilustración 2D estilizada animada, no fotorrealista." },
+    estatico:        { kind: "video", label: _MOVE_LABELS.estatico,         sample: "/movement_samples/estatico.mp4",  desc: t("upload.movement_estatico_desc") || "🎬 Escena real con cámara FIJA. Lo que se mueve son los elementos de la escena (gente, olas, nubes, neblina, fuego)." },
+    sutil:           { kind: "video", label: _MOVE_LABELS.sutil,            sample: "/movement_samples/sutil.mp4",     desc: t("upload.movement_sutil_desc") || "🎬 Escena real con drift sutil de cámara + motion in-scene. Calmo pero vivo." },
+    estandar:        { kind: "video", label: _MOVE_LABELS.estandar,         sample: "/movement_samples/estandar.mp4",  desc: t("upload.movement_estandar_desc") || "🎬 Escena real con movimiento cinematográfico de cámara (zoom/drift)." },
+    "foto-parallax": { kind: "image", label: _MOVE_LABELS["foto-parallax"], sample: "/movement_samples/foto-fija.jpg", desc: t("upload.movement_parallax_desc") || "Foto IA fija (sin movimiento de cámara). Sumale un efecto abajo —lluvia, nieve, luces— para darle vida." },
+    animado:         { kind: "video", label: _MOVE_LABELS.animado,          sample: "/movement_samples/animado.mp4",   desc: t("upload.movement_animado_desc") || "🎬 Ilustración 2D estilizada animada, no fotorrealista." },
   };
   const MOVEMENT_STYLES = [
-    { code: "", kind: "auto", label: t("upload.movement_auto") || "Auto", sample: null, desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
+    { code: "", kind: "auto", label: _MOVE_LABELS[""], sample: null, desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
     ...MOVEMENT_CODES.map((code) => ({
       code,
       ...(MOVEMENT_META[code] || { kind: "video", label: code, sample: null, desc: "" }),
@@ -1027,13 +1032,14 @@ export default function UploadZone({
   // falls on top of anything, even a still photo or a Library/uploaded clip.
   // Backed by pre-rendered alpha-screen loops; preview clips live at
   // /fx_samples/<code>.mp4 (effect composited over a neutral gradient).
+  const _FX_LABELS = EFFECT_LABELS(t);
   const EFFECTS = [
-    { code: "",       label: t("upload.effect_none") || "Ninguno",     sample: null,                     desc: t("upload.effect_none_desc") || "Fondo limpio, sin efecto." },
-    { code: "snow",   label: t("upload.effect_snow") || "Nieve",       sample: "/fx_samples/snow.mp4",   desc: t("upload.effect_snow_desc") || "Copos cayendo. Calmo, invernal." },
-    { code: "rain",   label: t("upload.effect_rain") || "Lluvia",      sample: "/fx_samples/rain.mp4",   desc: t("upload.effect_rain_desc") || "Gotas finas sobre la escena." },
-    { code: "stars",  label: t("upload.effect_stars") || "Estrellas",  sample: "/fx_samples/stars.mp4",  desc: t("upload.effect_stars_desc") || "Partículas que titilan. Nocturno." },
-    { code: "bokeh",  label: t("upload.effect_bokeh") || "Bokeh",      sample: "/fx_samples/bokeh.mp4",  desc: t("upload.effect_bokeh_desc") || "Luces desenfocadas flotando." },
-    { code: "light",  label: t("upload.effect_light") || "Luz",        sample: "/fx_samples/light.mp4",  desc: t("upload.effect_light_desc") || "Destellos suaves. Atardecer, glow." },
+    { code: "",       label: _FX_LABELS[""],     sample: null,                     desc: t("upload.effect_none_desc") || "Fondo limpio, sin efecto." },
+    { code: "snow",   label: _FX_LABELS.snow,       sample: "/fx_samples/snow.mp4",   desc: t("upload.effect_snow_desc") || "Copos cayendo. Calmo, invernal." },
+    { code: "rain",   label: _FX_LABELS.rain,      sample: "/fx_samples/rain.mp4",   desc: t("upload.effect_rain_desc") || "Gotas finas sobre la escena." },
+    { code: "stars",  label: _FX_LABELS.stars,  sample: "/fx_samples/stars.mp4",  desc: t("upload.effect_stars_desc") || "Partículas que titilan. Nocturno." },
+    { code: "bokeh",  label: _FX_LABELS.bokeh,      sample: "/fx_samples/bokeh.mp4",  desc: t("upload.effect_bokeh_desc") || "Luces desenfocadas flotando." },
+    { code: "light",  label: _FX_LABELS.light,        sample: "/fx_samples/light.mp4",  desc: t("upload.effect_light_desc") || "Destellos suaves. Atardecer, glow." },
     // 2026-06-04: "Aurora" removido del selector — su asset (assets/fx/aurora.mp4)
     // es una COPIA de light.mp4, así que renderizaba idéntico a "Luz". El backend
     // sigue soportando effect="aurora" (EFFECTS en fx_compositor.py) por compat,
@@ -1095,19 +1101,20 @@ export default function UploadZone({
     ...CONCEPT_CODES.map((code) => ({ code, label: CONCEPT_LABELS[code] || code })),
   ];
 
+  const _FONT_LABELS = FONT_LABELS(t);
   const FONTS = [
-    { code: "",                label: t("upload.font_auto") || "Auto",     css: "" },
-    { code: "fredoka",         label: "Fredoka (redondeada)",              css: "'Fredoka', sans-serif",    weight: 600 },
-    { code: "quicksand",       label: "Quicksand (suave)",                 css: "'Quicksand', sans-serif",  weight: 700 },
-    { code: "nunito",          label: "Nunito (amigable)",                 css: "'Nunito', sans-serif",     weight: 800 },
-    { code: "jost-bold",       label: "Jost (estilo Futura)",              css: "'Jost', sans-serif",       weight: 700 },
-    { code: "montserrat-bold", label: "Montserrat",                        css: "'Montserrat', sans-serif", weight: 700 },
-    { code: "poppins-bold",    label: "Poppins",                           css: "'Poppins', sans-serif",    weight: 700 },
-    { code: "outfit-bold",     label: "Outfit (estilo Gilroy)",            css: "'Outfit', sans-serif",     weight: 700 },
-    { code: "roboto-bold",     label: "Roboto",                            css: "'Roboto', sans-serif",     weight: 700 },
-    { code: "bebas-neue",      label: "Bebas Neue",                        css: "'Bebas Neue', sans-serif", weight: 400 },
-    { code: "oswald-bold",     label: "Oswald",                            css: "'Oswald', sans-serif",     weight: 700 },
-    { code: "anton",           label: "Anton",                             css: "'Anton', sans-serif",      weight: 400 },
+    { code: "",                label: _FONT_LABELS[""],     css: "" },
+    { code: "fredoka",         label: _FONT_LABELS.fredoka,              css: "'Fredoka', sans-serif",    weight: 600 },
+    { code: "quicksand",       label: _FONT_LABELS.quicksand,                 css: "'Quicksand', sans-serif",  weight: 700 },
+    { code: "nunito",          label: _FONT_LABELS.nunito,                 css: "'Nunito', sans-serif",     weight: 800 },
+    { code: "jost-bold",       label: _FONT_LABELS["jost-bold"],              css: "'Jost', sans-serif",       weight: 700 },
+    { code: "montserrat-bold", label: _FONT_LABELS["montserrat-bold"],                        css: "'Montserrat', sans-serif", weight: 700 },
+    { code: "poppins-bold",    label: _FONT_LABELS["poppins-bold"],                           css: "'Poppins', sans-serif",    weight: 700 },
+    { code: "outfit-bold",     label: _FONT_LABELS["outfit-bold"],            css: "'Outfit', sans-serif",     weight: 700 },
+    { code: "roboto-bold",     label: _FONT_LABELS["roboto-bold"],                            css: "'Roboto', sans-serif",     weight: 700 },
+    { code: "bebas-neue",      label: _FONT_LABELS["bebas-neue"],                        css: "'Bebas Neue', sans-serif", weight: 400 },
+    { code: "oswald-bold",     label: _FONT_LABELS["oswald-bold"],                            css: "'Oswald', sans-serif",     weight: 700 },
+    { code: "anton",           label: _FONT_LABELS.anton,                             css: "'Anton', sans-serif",      weight: 400 },
   ];
 
   // Filename → artist/title heuristic. ONE convention now: the FIRST
