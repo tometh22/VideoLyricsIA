@@ -4531,17 +4531,24 @@ export default function App() {
         onEditFieldChange={(field, value) =>
           setCurrentReview((r) => (r ? { ...r, [field]: value } : r))
         }
-        // Semilla de los controles de escena en edición (género/concepto/prompt
-        // + modo) con los valores persistidos del job. Keyed en el job id dentro
-        // de UploadZone → corre una vez por job, no pisa ediciones en curso.
+        // Semilla de los controles del wizard con los valores persistidos del
+        // job. Keyed en el job id dentro de UploadZone → corre una vez por job,
+        // no pisa ediciones en curso.
         //
-        // En VARIANTE la semilla es más ancha: el submit manda el estado
-        // ABSOLUTO de todos los ejes, así que cualquier control que
-        // muestre el sticky de localStorage en vez del valor del padre
-        // mandaría ese sticky al backend. `wizardFields` siembra el resto
-        // de los controles (tipografía, formato, portada, movimiento) con
-        // el render_params del padre. En edición no se manda: ahí el
-        // submit es un DIFF y un campo sin tocar no viaja.
+        // `wizardFields` va SIEMPRE (2026-07-25). Antes se mandaba sólo en
+        // VARIANTE, con el razonamiento de que en edición el submit es un diff
+        // y "un campo sin tocar no viaja" — cierto para el cable, falso para el
+        // OPERADOR: los controles pintan de `batchDefaults`, que en edición
+        // arranca del sticky de localStorage. El operador abría "editar fondo",
+        // veía "Estático" ya resaltado (su último batch, no este video), no
+        // clickeaba, y el render salía con el valor viejo. Siete veces, en el
+        // reclamo que originó esto.
+        //
+        // Es seguro: el seed effect sólo llama setBatchDefaults (display) y
+        // nunca onEditFieldChange, y `baseline` sigue saliendo de
+        // render_params → la semántica del diff no cambia. Auditado contra los
+        // 60 consumidores de batchDefaults: no hay camino a un POST sin click
+        // explícito del operador.
         editSeed={_wizardOnExistingJob ? {
           jobId: currentReview.editingJobId || currentReview.parentJobId,
           genre: currentReview.genre,
@@ -4549,7 +4556,7 @@ export default function App() {
           backgroundHint: currentReview.backgroundHint,
           bgVerbatim: currentReview.bgVerbatim,
           matchLyrics: currentReview.matchLyrics,
-          wizardFields: currentReview.variantMode ? {
+          wizardFields: {
             font: currentReview.font || "",
             textCase: currentReview.textCase || "upper",
             fontScale: String(currentReview.fontScale || "1.0"),
@@ -4564,8 +4571,12 @@ export default function App() {
             titleArtistFont: currentReview.titleArtistFont || "",
             titleSongFont: currentReview.titleSongFont || "",
             titleSongBreak: currentReview.titleSongBreak || "",
-          } : null,
+          },
         } : null}
+        // baseline: para el chip "EN EL VIDEO" — la galería necesita saber qué
+        // tiene el video HOY, aparte de qué eligió el operador. Sin esto el
+        // anillo violeta es la única señal, y es la que engañó al operador.
+        editBaseline={_wizardOnExistingJob ? currentReview.baseline : null}
         // UI v1.1 (2026-05-30): feed the central title-card preview with the
         // currently-active artist/song. In edit mode the canonical source is
         // currentReview (the operator can edit them in the banner inputs

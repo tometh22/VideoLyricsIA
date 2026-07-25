@@ -273,6 +273,12 @@ export default function UploadZone({
   // backgroundHint, bgVerbatim, matchLyrics }. No toca r.* (el diff usa
   // initialFields), sólo el display.
   editSeed = null,
+  // Cómo está RENDERIZADO el video hoy (currentReview.baseline). Alimenta el
+  // chip "EN EL VIDEO" de las galerías: el anillo violeta dice "lo que elegí",
+  // el chip ámbar dice "lo que el video tiene". Cuando coinciden, una tarjeta
+  // lleva los dos; cuando no, se marcan dos y el cambio queda dibujado.
+  // El anillo solo era la señal que engañó al operador del reclamo original.
+  editBaseline = null,
   // UI v1.1 (2026-05-30): artist/song to render inside the central
   // title-card preview. Caller (App.jsx) passes these from the
   // currentReview when in edit mode, or from the first file when in
@@ -421,11 +427,18 @@ export default function UploadZone({
   const updateBatchDefault = (field, value) => {
     setBatchDefaults((prev) => {
       const next = { ...prev, [field]: value };
-      try {
-        localStorage.setItem(BATCH_DEFAULTS_STORAGE_KEY, JSON.stringify(next));
-      } catch {
-        // Quota exceeded / private-mode storage off — the picks still work
-        // in-session, they just won't survive a refresh. Don't block the UI.
+      // El sticky es para BATCHES NUEVOS. Editar un video existente no puede
+      // reescribirlo: si no, arreglar el fondo de un video contamina el
+      // siguiente upload con los ajustes de ESE video — y encima al volver a
+      // editar otro job el sticky contaminado es lo que se pintaba (el bug que
+      // originó esto). En edición/variante los controles se siembran del job.
+      if (!editMode) {
+        try {
+          localStorage.setItem(BATCH_DEFAULTS_STORAGE_KEY, JSON.stringify(next));
+        } catch {
+          // Quota exceeded / private-mode storage off — the picks still work
+          // in-session, they just won't survive a refresh. Don't block the UI.
+        }
       }
       return next;
     });
@@ -497,11 +510,12 @@ export default function UploadZone({
       concept: editSeed.concept || "",
       backgroundHint: editSeed.backgroundHint || "",
       bgVerbatim: editSeed.bgVerbatim != null ? !!editSeed.bgVerbatim : prev.bgVerbatim,
-      // `wizardFields` sólo llega en modo VARIANTE: ahí el submit manda el
-      // estado ABSOLUTO de cada eje, así que un control que muestre el
-      // sticky de localStorage en vez del valor del padre mandaría ese
-      // sticky al backend. En edición no viene (el submit es un diff: un
-      // campo sin tocar no viaja, así que la semilla es sólo cosmética).
+      // `wizardFields` ahora llega SIEMPRE (edición y variante). En variante es
+      // obligatorio porque el submit manda el estado ABSOLUTO. En edición el
+      // submit es un diff, así que la semilla no cambia qué viaja — pero SÍ
+      // cambia lo que el operador ve, y ver el sticky de otro batch en vez del
+      // valor de este video es exactamente lo que hacía que no clickeara y el
+      // render saliera igual que antes.
       ...(editSeed.wizardFields || {}),
     }));
     setSceneMode(
@@ -511,6 +525,29 @@ export default function UploadZone({
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editMode, editSeed?.jobId]);
+
+  // ── Ancla "EN EL VIDEO" ──────────────────────────────────────────────────
+  // El anillo violeta + check ya es una señal fortísima de "seleccionado" — y
+  // es justamente por eso que el operador confió en él y no clickeó. Marcar
+  // *diferencias* no lo salva: la señal que lo habría salvado es la AUSENCIA de
+  // marca, y eso nadie lo parsea. Así que marcamos el presente en vez del
+  // cambio: dos estados dentro de la misma mirada, "lo que elegí" (violeta) y
+  // "lo que el video tiene" (ámbar). Cuando coinciden, una tarjeta lleva los
+  // dos; cuando no, se marcan dos y el cambio queda dibujado.
+  const ANCHOR_LABEL = t("upload.anchor_in_video") || "En el video";
+  const isAnchor = (field, code) => {
+    if (!editMode || !editBaseline) return false;
+    return String(editBaseline[field] ?? "") === String(code ?? "");
+  };
+  const AnchorChip = () => (
+    <span
+      className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wide bg-amber-500/20 text-amber-300 ring-1 ring-amber-500/40 backdrop-blur-sm"
+      title={t("upload.anchor_in_video_hint") || "Es lo que este video tiene ahora"}
+    >
+      {ANCHOR_LABEL}
+    </span>
+  );
+
   // Elegibilidad del add-on premium "Escenas" (multi-escena). Robusto: el
   // backend manda vía features.scenes (admin OR SCENES_ENABLED_TENANTS), pero
   // los admin siempre califican aunque la sesión cacheada no traiga el flag.
@@ -1660,6 +1697,7 @@ export default function UploadZone({
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
           {MOVEMENT_STYLES.map((m) => {
             const active = batchDefaults.movementStyle === m.code;
+            const inVideo = isAnchor("movementStyle", m.code);
             return (
               <button
                 key={m.code || "auto"}
@@ -1667,7 +1705,10 @@ export default function UploadZone({
                 onClick={() => updateBatchDefault("movementStyle", m.code)}
                 onMouseEnter={() => setHoverMovement(m.code)}
                 onMouseLeave={() => setHoverMovement(null)}
-                aria-label={`${m.label}: ${m.desc}`}
+                aria-pressed={active}
+                data-movement={m.code || "auto"}
+                data-in-video={inVideo ? "true" : undefined}
+                aria-label={`${m.label}: ${m.desc}${inVideo ? ` — ${ANCHOR_LABEL}` : ""}`}
                 title={m.desc}
                 className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
                   active
@@ -1696,6 +1737,7 @@ export default function UploadZone({
                       <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
                     </div>
                   )}
+                  {inVideo && <AnchorChip />}
                 </div>
                 <div className="px-2.5 py-2 bg-surface-1">
                   <p className={`text-[12px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>
@@ -1731,6 +1773,7 @@ export default function UploadZone({
         <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
           {EFFECTS.map((e) => {
             const active = (batchDefaults.effect || "") === e.code;
+            const inVideo = isAnchor("effect", e.code);
             return (
               <button
                 key={e.code || "none"}
@@ -1738,7 +1781,10 @@ export default function UploadZone({
                 onClick={() => updateBatchDefault("effect", e.code)}
                 onMouseEnter={() => setHoverEffect(e.code)}
                 onMouseLeave={() => setHoverEffect(null)}
-                aria-label={`${e.label}: ${e.desc}`}
+                aria-pressed={active}
+                data-effect={e.code || "none"}
+                data-in-video={inVideo ? "true" : undefined}
+                aria-label={`${e.label}: ${e.desc}${inVideo ? ` — ${ANCHOR_LABEL}` : ""}`}
                 title={e.desc}
                 className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
                   active
@@ -1759,6 +1805,7 @@ export default function UploadZone({
                       <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
                     </div>
                   )}
+                  {inVideo && <AnchorChip />}
                 </div>
                 <div className="px-2 py-1.5 bg-surface-1">
                   <p className={`text-label leading-tight ${active ? "text-white" : "text-gray-200"}`}>{e.label}</p>
