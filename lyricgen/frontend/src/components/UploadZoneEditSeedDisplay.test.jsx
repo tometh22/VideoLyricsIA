@@ -23,6 +23,7 @@ import { useState } from "react";
 import { render, screen, cleanup, fireEvent } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import UploadZone from "./UploadZone";
+import { normalizeMovementCode } from "../lib/catalogCodes";
 
 // i18n real-ish: la firma verdadera es t(key, vars) y devuelve el key cuando
 // falta. El mock `t: (_k, fallback) => fallback` que usan otros tests ROMPE
@@ -143,12 +144,19 @@ describe("edición: los controles muestran el video, no el sticky", () => {
     expect(pressed("[data-effect]")).toHaveLength(1);
   });
 
-  it("un valor NO canónico del job igual resalta una tarjeta", () => {
-    // El backend persiste movement_style crudo: "dinamico" normaliza a
-    // "estandar". Sin el espejo JS no se resaltaba NINGUNA tarjeta.
-    render(<Harness jobFields={{ ...JOB_FIELDS, movementStyle: "estandar" }} />);
+  it.each([
+    ["dinamico", "estandar"],
+    ["static", "estatico"],
+    ["fija", "estatico"],
+  ])("un valor NO canónico del job (%s) igual resalta una tarjeta", (raw, expected) => {
+    // El backend persiste movement_style CRUDO. La versión anterior de este
+    // test usaba "estandar" — que ya es canónico — así que pasaba sin ejercitar
+    // el espejo de normalización: una aserción vacía. Estos SÍ son valores que
+    // el backend genera ("dinamico" lo emiten SceneEditModal y el derivado por
+    // energía) y que sin normalizar no resaltan NINGUNA tarjeta.
+    render(<Harness jobFields={{ ...JOB_FIELDS, movementStyle: normalizeMovementCode(raw) }} />);
     goStep(3);
-    expect(pressed("[data-movement]")).toEqual(["estandar"]);
+    expect(pressed("[data-movement]")).toEqual([expected]);
   });
 });
 

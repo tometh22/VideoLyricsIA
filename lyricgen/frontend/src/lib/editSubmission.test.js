@@ -429,3 +429,77 @@ describe("movement_style: la normalización no puede tragarse un valor con senti
     }
   });
 });
+
+describe("un campo VACIADO a propósito no revive al refrescar", () => {
+  // `pickSnapOr` trataba "" como "no seteado", así que el valor del job ganaba.
+  // Vaciar es una intención tan válida como escribir — y desde #982/#997
+  // "sacar el prompt" es una acción de primera clase, así que el caso pasó de
+  // raro a rutinario: borrás el prompt, refrescás antes de aprobar, y el wizard
+  // reabre en modo "Mi prompt" con el texto viejo puesto.
+  const JOB = {
+    ...JOB_BARE,
+    render_params: {
+      background_hint: "un carnaval", effect: "snow", font: "anton",
+      movement_style: "animado", title_song_break: "A|B",
+    },
+  };
+
+  it.each([
+    ["backgroundHint", "background_hint"],
+    ["effect", "effect"],
+    ["font", "font"],
+    ["movementStyle", "movement_style"],
+    ["titleSongBreak", "title_song_break"],
+  ])("%s vaciado en el snapshot se respeta", (camel) => {
+    const snap = { [camel]: "" };
+    expect(buildEditReview(JOB, snap).initialFields[camel]).toBe("");
+  });
+
+  it("pero un campo AUSENTE del snapshot sí cae al valor del job", () => {
+    // undefined/null es "no seteado" de verdad; "" es una elección.
+    const out = buildEditReview(JOB, { font: "montserrat-bold" }).initialFields;
+    expect(out.font).toBe("montserrat-bold");
+    expect(out.backgroundHint).toBe("un carnaval");
+  });
+
+  it("y el baseline NUNCA mira el snapshot (es cómo está renderizado hoy)", () => {
+    const { baseline } = buildEditReview(JOB, { backgroundHint: "", font: "" });
+    expect(baseline.backgroundHint).toBe("un carnaval");
+    expect(baseline.font).toBe("anton");
+  });
+});
+
+describe("job con un movement_style basura: trade-off DELIBERADO", () => {
+  // Un revisor marcó que con un valor no reconocido (p.ej. "zoom-in", que el
+  // backend acepta porque el campo es texto libre) el operador ya no puede
+  // "limpiar" la fila eligiendo Auto: baseline y current normalizan los dos a
+  // "" → no hay diff → "No cambiaste nada".
+  //
+  // Se deja así A PROPÓSITO. La alternativa —dejar el baseline crudo— genera un
+  // diff apenas se abre el wizard, sin que el operador toque nada: un render de
+  // Veo PAGO por un cambio que no pidió. Y el render no se ve afectado en
+  // ningún caso: el backend corre el mismo _normalize_movement_style, así que
+  // "zoom-in" ya se comporta como Auto. Lo único que queda es una fila sucia en
+  // render_params, invisible para el operador.
+  //
+  // Este test fija esa decisión para que no se "arregle" sin ver el costo.
+  const JUNK = { ...JOB_BARE, render_params: { movement_style: "zoom-in" } };
+
+  it("abrir el wizard no produce un diff espurio (que costaría un render)", () => {
+    const { baseline } = buildEditReview(JUNK, null);
+    expect(computeFieldDiff(baseline, currentFrom(JUNK))).toEqual({});
+  });
+
+  it("se muestra como Auto, que es lo que el backend va a hacer igual", () => {
+    expect(buildEditReview(JUNK, null).initialFields.movementStyle).toBe("");
+  });
+
+  it("y elegir cualquier otro movimiento sí viaja normalmente", () => {
+    const { baseline } = buildEditReview(JUNK, null);
+    const out = resolveEditSubmission({
+      baseline, current: currentFrom(JUNK, { movementStyle: "estatico" }),
+      jobStatus: "pending_review",
+    });
+    expect(out.payload.movement_style).toBe("estatico");
+  });
+});
