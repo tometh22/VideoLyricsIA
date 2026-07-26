@@ -8210,6 +8210,10 @@ def status(
         # Frontend uses delivery_profile to decide whether to show the
         # UMG master download tab in JobDetail.
         "delivery_profile": job.get("delivery_profile", "youtube"),
+        # Retroactive ProRes keeps delivery_profile="youtube" as historical
+        # provenance. The persisted spec is therefore required to restore
+        # the ProRes/send-to-UMG UI correctly after a reload.
+        "umg_spec": job.get("umg_spec"),
         # ProRes readiness — drives the badge in JobDetail. Must be
         # included here so the badge reflects server state when the
         # user opens a job that already had ProRes generated.
@@ -8780,7 +8784,7 @@ async def download(
             # Kick off a prewarm in the background, then 202.
             try:
                 from queue_jobs import enqueue_prores_prewarm, SubmissionsPausedError
-                enqueue_prores_prewarm(job_id, file_type)
+                enqueue_prores_prewarm(job_id, file_type, force=True)
             except SubmissionsPausedError as exc:
                 from ops_control import get_submissions_state
                 state = get_submissions_state()
@@ -11259,12 +11263,12 @@ async def enable_prores_for_job(
             detail="Broadcast (ProRes) delivery is not enabled for your account.",
         )
 
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    job_query = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        job_query = job_query.filter(
+            JobModel.tenant_id == current_user["tenant_id"]
+        )
+    job = job_query.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "done":
@@ -11284,6 +11288,9 @@ async def enable_prores_for_job(
     )
 
     job.umg_spec = umg_spec
+    _audit_cross_tenant_access(
+        db, current_user, job, "enable_prores", commit=False,
+    )
     db.add(AuditLog(
         user_id=current_user["id"],
         action="job.enable_prores",
@@ -12856,18 +12863,75 @@ async def admin_create_delivery_from_job(
             detail="Job must be approved (status=done) before it can be published",
         )
 
-    # Validate all 5 files exist in R2. If even one is missing we refuse
-    # to create the Delivery — a half-empty portal entry is worse than
-    # asking the operator to wait for the render to finish.
+    # Validate all 5 files exist in R2. The three render outputs are hard
+    # requirements. ProRes is different: it is a lazy derivative and its
+    # post-render prewarm is deliberately best-effort, so an explicit
+    # "Enviar a UMG" must recover by force-enqueueing missing masters.
     missing = []
     for ft in _DEFAULT_DELIVERY_FILE_TYPES:
         key = _r2_key_for_delivery(job.tenant_id, job.job_id, ft)
         if not storage.object_exists(key):
             missing.append(ft)
     if missing:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Files not yet in R2: {', '.join(missing)}. Wait for the render to finish.",
+        missing_prores = [
+            ft for ft in missing if ft in ("umg_master", "umg_short")
+        ]
+        missing_render_outputs = [
+            ft for ft in missing if ft not in ("umg_master", "umg_short")
+        ]
+        if missing_render_outputs:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Files not yet in R2: "
+                    f"{', '.join(missing_render_outputs)}. "
+                    "Wait for the render to finish."
+                ),
+            )
+        if missing_prores and not job.umg_spec:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "prores_required",
+                    "message": (
+                        "Este video fue generado sólo para YouTube. "
+                        "Elegí la configuración ProRes para preparar los "
+                        "masters antes de enviarlo a UMG."
+                    ),
+                    "missing": missing_prores,
+                },
+            )
+        enqueued = []
+        try:
+            for file_type in missing_prores:
+                rq_id = enqueue_prores_prewarm(
+                    job_id, file_type, force=True,
+                )
+                if rq_id:
+                    enqueued.append(file_type)
+        except Exception as exc:
+            logger.warning(
+                "[DELIVERY] could not prepare ProRes for %s: %s",
+                job_id, exc,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "No se pudo iniciar la preparación ProRes. "
+                    "Probá de nuevo en un momento."
+                ),
+            ) from exc
+        return JSONResponse(
+            status_code=202,
+            content={
+                "ok": False,
+                "status": "preparing_prores",
+                "job_id": job_id,
+                "missing": missing_prores,
+                "enqueued": enqueued,
+                "retry_after": 10,
+            },
+            headers={"Retry-After": "10"},
         )
 
     # Compute label. If caller passed one, honor it. Otherwise: first

@@ -110,6 +110,87 @@ def test_admin_can_create_delivery(client, admin_token, approved_job, all_r2_fil
     assert body["replaced"] is False
 
 
+def test_missing_prores_is_prepared_instead_of_returning_dead_end(
+    client, admin_token, approved_job,
+):
+    """El prewarm post-render es best-effort. Si faltan sólo los .mov,
+    Enviar a UMG los encola de forma explícita y responde 202 para que el
+    cliente espere y reintente la publicación."""
+    def object_exists(key):
+        return not key.endswith(("umg_master.mov", "umg_short.mov"))
+
+    with (
+        patch("main.storage.object_exists", side_effect=object_exists),
+        patch(
+            "main.enqueue_prores_prewarm",
+            side_effect=lambda _job_id, file_type, *, force=False: (
+                f"rq:{file_type}" if force else None
+            ),
+        ) as enqueue,
+    ):
+        res = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token),
+            json={},
+        )
+
+    assert res.status_code == 202, res.text
+    body = res.json()
+    assert body["status"] == "preparing_prores"
+    assert body["missing"] == ["umg_master", "umg_short"]
+    assert body["enqueued"] == ["umg_master", "umg_short"]
+    assert enqueue.call_count == 2
+    assert all(call.kwargs == {"force": True} for call in enqueue.call_args_list)
+
+
+def test_youtube_only_job_requests_prores_configuration(
+    client, admin_token, approved_job, db,
+):
+    approved_job.umg_spec = None
+    approved_job.delivery_profile = "youtube"
+    db.commit()
+
+    def object_exists(key):
+        return not key.endswith(("umg_master.mov", "umg_short.mov"))
+
+    with (
+        patch("main.storage.object_exists", side_effect=object_exists),
+        patch("main.enqueue_prores_prewarm") as enqueue,
+    ):
+        res = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token),
+            json={},
+        )
+
+    assert res.status_code == 409
+    detail = res.json()["detail"]
+    assert detail["code"] == "prores_required"
+    assert detail["missing"] == ["umg_master", "umg_short"]
+    enqueue.assert_not_called()
+
+
+def test_missing_render_output_still_blocks_delivery(
+    client, admin_token, approved_job,
+):
+    def object_exists(key):
+        return not key.endswith("thumbnail.jpg")
+
+    with (
+        patch("main.storage.object_exists", side_effect=object_exists),
+        patch("main.enqueue_prores_prewarm") as enqueue,
+    ):
+        res = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token),
+            json={},
+        )
+
+    assert res.status_code == 409
+    assert "thumbnail" in res.json()["detail"]
+    enqueue.assert_not_called()
+
+
 def test_non_admin_cannot_create_delivery(client, user_token, approved_job, all_r2_files_present):
     res = client.post(
         f"/admin/deliveries/from-job/{approved_job.job_id}",
