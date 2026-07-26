@@ -28,7 +28,9 @@ def _register(client, prefix: str) -> tuple[str, dict]:
 
 
 def _seed_pending_review(db, owner: dict) -> str:
-    job_id = f"approval_scope_{uuid.uuid4().hex[:8]}"
+    # Job.job_id is VARCHAR(12) in Postgres. SQLite does not enforce the
+    # declared length, so keep this fixture explicitly production-shaped.
+    job_id = f"aps_{uuid.uuid4().hex[:8]}"
     db.add(Job(
         job_id=job_id,
         user_id=owner["id"],
@@ -49,10 +51,13 @@ def _seed_pending_review(db, owner: dict) -> str:
 @pytest.fixture(autouse=True)
 def _cleanup(db):
     yield
+    # Recover the shared fixture session even if setup/assertion failed during
+    # a flush; otherwise teardown itself raises PendingRollbackError.
+    db.rollback()
     job_ids = [
         row[0]
         for row in db.query(Job.job_id)
-        .filter(Job.job_id.like("approval_scope_%"))
+        .filter(Job.job_id.like("aps_%"))
         .all()
     ]
     if job_ids:
