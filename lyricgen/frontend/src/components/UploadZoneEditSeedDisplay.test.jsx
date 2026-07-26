@@ -254,8 +254,10 @@ describe("el wizard deja de prometer lo que el backend va a descartar", () => {
     />
   );
 
-  it("job multi-escena: avisa ARRIBA del bloque de fondo, no después de aprobar", () => {
-    render(withPlan({ blocked: { reason: "scenes", buckets: ["background"] }, willApply: {}, willDrop: [] }));
+  it("job multi-escena: avisa ARRIBA del bloque de fondo, SIN cambios previos", () => {
+    // El motivo llega por `bgBlockedReason`, independiente del plan: derivarlo
+    // del plan hacía que el aviso saliera sólo DESPUÉS de configurar el fondo.
+    render(withPlan(null, { bgBlockedReason: "scenes" }));
     goStep(3);
     const notice = screen.getByTestId("bg-blocked-notice");
     expect(notice.textContent).toContain("edit.bg_locked_scenes_title");
@@ -264,14 +266,14 @@ describe("el wizard deja de prometer lo que el backend va a descartar", () => {
   });
 
   it("job aprobado: el motivo es OTRO y el mensaje también", () => {
-    render(withPlan({ blocked: { reason: "status", buckets: ["background"] }, willApply: {}, willDrop: [] }));
+    render(withPlan(null, { bgBlockedReason: "status" }));
     goStep(3);
     expect(screen.getByTestId("bg-blocked-notice").textContent)
       .toContain("edit.bg_locked_done_title");
   });
 
   it("job normal: sin aviso", () => {
-    render(withPlan({ blocked: null, willApply: {}, willDrop: [] }));
+    render(withPlan(null, { bgBlockedReason: null }));
     goStep(3);
     expect(screen.queryByTestId("bg-blocked-notice")).toBeNull();
   });

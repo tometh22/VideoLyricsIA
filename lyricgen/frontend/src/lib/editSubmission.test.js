@@ -25,6 +25,7 @@ import {
   buildEditReview,
   buildEditCurrent,
   resolveEditSubmission,
+  backgroundEditBlockedReason,
   EDIT_TYPE_PRIORITY,
 } from "./editSubmission.js";
 import { computeFieldDiff } from "./editWizardDiff.js";
@@ -497,5 +498,40 @@ describe("job LEGACY con un movement_style no canónico", () => {
       jobStatus: "pending_review",
     });
     expect(out.payload.movement_style).toBe("estatico");
+  });
+});
+
+describe("backgroundEditBlockedReason: se sabe ANTES de tocar nada", () => {
+  // Detectado manejando la app real con un navegador: el aviso salía sólo
+  // DESPUÉS de que el operador configuraba el fondo, porque se derivaba de
+  // `resolveEditSubmission`, que corta temprano cuando no hay cambios. Al
+  // revés de para lo que existe — el punto es avisar antes de que invierta
+  // tiempo en controles que el backend va a ignorar.
+  it("job aprobado → bloqueado por status, sin necesidad de un diff", () => {
+    expect(backgroundEditBlockedReason({ jobStatus: "done" })).toBe("status");
+  });
+
+  it("job multi-escena → bloqueado por escenas, incluso en pending_review", () => {
+    expect(backgroundEditBlockedReason({
+      jobStatus: "pending_review", scenePlan: { scenes: [{ recurrence_key: "coro" }] },
+    })).toBe("scenes");
+  });
+
+  it("job normal en revisión → no bloqueado", () => {
+    expect(backgroundEditBlockedReason({ jobStatus: "pending_review" })).toBeNull();
+    expect(backgroundEditBlockedReason({ jobStatus: "pending_review", scenePlan: { scenes: [] } })).toBeNull();
+  });
+
+  it("coincide con lo que resolveEditSubmission decide al enviar", () => {
+    // Si divergieran, el wizard avisaría una cosa y el submit haría otra.
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    for (const [status, scenePlan] of [["done", null], ["pending_review", { scenes: [{ k: 1 }] }]]) {
+      const anticipado = backgroundEditBlockedReason({ jobStatus: status, scenePlan });
+      const alEnviar = resolveEditSubmission({
+        baseline, current: currentFrom(JOB_FULL, { movementStyle: "sutil" }),
+        jobStatus: status, scenePlan,
+      }).blocked?.reason;
+      expect(alEnviar).toBe(anticipado);
+    }
   });
 });

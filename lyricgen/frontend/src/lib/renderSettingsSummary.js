@@ -69,6 +69,10 @@ export const SETTINGS_GROUPS = [
 // valores con significado propio en cualquier eje donde "none" es una elección
 // real, además de volver inalcanzables las etiquetas escritas para ellos. Lo
 // que es "el default" va en AXIS_DEFAULTS, por eje y explícito.
+// Un chip largo deja de ser un chip. Los valores que pasen esto se truncan
+// (el texto completo queda en el `title` del elemento).
+const MAX_CHIP_CHARS = 42;
+
 const EMPTY_VALUES = new Set(["", "ninguno"]);
 
 // Defaults POR EJE que tampoco se muestran. Van aparte de EMPTY_VALUES porque
@@ -137,6 +141,13 @@ export function buildSettingsSummary(params, deps = {}) {
         value = `${n}×`;
       } else if (axis.kind === "prompt") {
         value = String(raw);
+      } else if (String(raw).length > MAX_CHIP_CHARS) {
+        // Un chip es para valores CORTOS. `concept` y `genre` se ven como
+        // enums, pero el backend los acepta como texto libre: en staging hay
+        // conceptos de 970 caracteres (descripciones de escena enteras) que
+        // reventaban el panel. Descubierto manejando la app real, no con un
+        // fixture — un valor así no se me habría ocurrido inventarlo.
+        value = `${String(raw).slice(0, MAX_CHIP_CHARS).trimEnd()}…`;
       } else {
         const resolve = resolvers[axis.kind];
         value = (resolve && resolve(String(raw))) || String(raw);
@@ -144,6 +155,8 @@ export function buildSettingsSummary(params, deps = {}) {
 
       chips.push({
         key: axis.key,
+        // Valor sin truncar, para el tooltip.
+        full: String(raw),
         label: t(axis.labelKey, undefined) || axis.labelFallback,
         value,
         isPrompt: axis.kind === "prompt",

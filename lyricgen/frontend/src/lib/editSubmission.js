@@ -33,6 +33,31 @@ export const EDIT_TYPE_PRIORITY = [
 const BACKGROUND_TYPES = ["background", "background_library"];
 
 /**
+ * ¿Se puede regenerar el fondo de este job? Depende SÓLO del job, no de si el
+ * operador ya cambió algo.
+ *
+ * Vive aparte de `resolveEditSubmission` porque esa función arranca calculando
+ * el diff y corta temprano cuando no hay cambios — así que preguntarle "¿está
+ * bloqueado?" antes de tocar nada devolvía `null`. El aviso terminaba
+ * apareciendo DESPUÉS de configurar el fondo, que es exactamente lo contrario
+ * de para lo que existe: el punto es avisar antes de que el operador invierta
+ * tiempo en controles que el backend va a ignorar. Detectado manejando la app
+ * real con un navegador, no con un test unitario.
+ *
+ * @returns {"status"|"scenes"|null}
+ */
+export function backgroundEditBlockedReason({ jobStatus, scenePlan } = {}) {
+  const hasScenes = !!(
+    scenePlan && Array.isArray(scenePlan.scenes) && scenePlan.scenes.length > 0
+  );
+  // Multi-escena primero: aplica incluso en pending_review, y el motivo que el
+  // operador necesita leer es otro (regenerá la escena desde el filmstrip).
+  if (hasScenes) return "scenes";
+  if (jobStatus !== "pending_review") return "status";
+  return null;
+}
+
+/**
  * Siembra los campos del wizard de edición desde la row del Job.
  *
  * `initialFields` es lo que el operador ve/edita (el snap del autosave gana si

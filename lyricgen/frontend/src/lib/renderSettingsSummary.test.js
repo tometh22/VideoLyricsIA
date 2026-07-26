@@ -196,3 +196,27 @@ describe("no se le muestran códigos internos ni defaults al operador", () => {
     }
   });
 });
+
+describe("un valor de texto libre no revienta el panel", () => {
+  // En staging hay `concept` de 970 caracteres: descripciones de escena
+  // enteras. El campo parece un enum pero el backend lo acepta libre. Sin
+  // truncar, el chip volcaba el párrafo completo. Detectado con la app real.
+  const LARGO = "Static locked-off cinematic composition inside a cozy sun-drenched Argentine apartment at golden hour, ".repeat(9);
+
+  it("se trunca a algo que entra en un chip", () => {
+    const chip = buildSettingsSummary({ concept: LARGO }, deps)[0].chips[0];
+    expect(chip.value.length).toBeLessThanOrEqual(45);
+    expect(chip.value.endsWith("…")).toBe(true);
+  });
+
+  it("pero el texto completo queda accesible para el tooltip", () => {
+    const chip = buildSettingsSummary({ concept: LARGO }, deps)[0].chips[0];
+    expect(chip.full).toBe(LARGO);
+  });
+
+  it("un valor corto no se toca", () => {
+    const chip = buildSettingsSummary({ genre: "rock" }, deps)[0].chips[0];
+    expect(chip.value).toBe("rock");
+    expect(chip.value.endsWith("…")).toBe(false);
+  });
+});
