@@ -10,6 +10,7 @@ import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
 import { CONCEPT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
 import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS } from "../lib/optionLabels";
+import EditPlanSummary from "./EditPlanSummary";
 import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBackgroundPreviewTokens";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -280,6 +281,14 @@ export default function UploadZone({
   // lleva los dos; cuando no, se marcan dos y el cambio queda dibujado.
   // El anillo solo era la señal que engañó al operador del reclamo original.
   editBaseline = null,
+  // Plan en vivo de la edición: { willApply, willDrop, blocked } calculado con
+  // resolveEditSubmission, la MISMA función que arma el POST. Es lo que permite
+  // que el wizard deje de prometer lo que el backend va a descartar.
+  editPlan = null,
+  // Cupo REAL de ediciones. El texto decía "usa 1 de tus 3 ediciones" fijo,
+  // así que en un job con 7 ediciones mentía.
+  editsRemaining = null,
+  editLimitExempt = false,
   // UI v1.1 (2026-05-30): artist/song to render inside the central
   // title-card preview. Caller (App.jsx) passes these from the
   // currentReview when in edit mode, or from the first file when in
@@ -1702,6 +1711,34 @@ export default function UploadZone({
     setUmgProresProfile(3);
   };
 
+  // El fondo no siempre se puede regenerar: el backend rechaza un edit de fondo
+  // sobre un job multi-escena (el fondo es un TIMELINE) y sobre uno ya
+  // aprobado. Hasta ahora el wizard te dejaba configurarlo igual y te enterabas
+  // DESPUÉS de aprobar — cinco pasos tarde. `editPlan.blocked` viene de la
+  // misma función que arma el POST, así que el aviso no puede desincronizarse
+  // del comportamiento real.
+  const _bgBlocked = editMode ? (editPlan?.blocked || null) : null;
+  const _bgBlockedNotice = _bgBlocked ? (
+    <div
+      data-testid="bg-blocked-notice"
+      className="mb-3 rounded-card bg-amber-500/[0.08] ring-1 ring-amber-500/25 px-3 py-2.5"
+    >
+      <p className="text-[11px] font-medium text-amber-200">
+        {_bgBlocked.reason === "scenes"
+          ? (t("edit.bg_locked_scenes_title") || "Este video usa Escenas")
+          : (t("edit.bg_locked_done_title") || "No se puede regenerar el fondo")}
+      </p>
+      <p className="text-[10px] text-amber-200/70 mt-0.5 leading-snug">
+        {_bgBlocked.reason === "scenes"
+          ? (t("edit.bg_locked_scenes_desc") || "El fondo es un timeline multi-escena. Regenerá la escena que quieras cambiar desde el filmstrip del video — no consume cupo de edición.")
+          : (t("edit.bg_locked_done_desc") || "El fondo de un video ya aprobado no se puede regenerar — para cambiarlo, generá un video nuevo.")}
+      </p>
+      <p className="text-[10px] text-amber-200/50 mt-1">
+        {t("upload.bg_blocked_rest_ok") || "El resto de los ajustes sí se aplican."}
+      </p>
+    </div>
+  ) : null;
+
   const _batchSettingsBlock = (files.length > 0 || editMode) ? (
     <div className="mt-3 glass rounded-card px-4 py-4">
       <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-3">
@@ -1709,6 +1746,8 @@ export default function UploadZone({
           ? (t("upload.batch_settings_title") || "Configuración del lote")
           : (t("upload.single_settings_title") || "Ajustes del video")}
       </p>
+
+      {_bgBlockedNotice}
 
       {user?.role === "admin" && !editMode && (
         <div className="mb-3 flex items-center justify-between gap-3 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-3 py-2.5">
@@ -1951,8 +1990,19 @@ export default function UploadZone({
                   <p className="text-[10px] text-gray-600 mt-0.5">
                     {variantMode
                       ? (t("variant.cost_desc_wizard") || "La variante es un video nuevo: se cobra 1 video al plan y pasa por review como cualquier upload. A partir de la 4ª versión de la misma canción se factura un extra (te lo confirmamos antes de crearla).")
-                      : (t("upload.regen_bg_desc") || "Editás el fondo como siempre (movimiento, efecto, look). Al aprobar se genera una versión nueva con IA y usa 1 de tus 3 ediciones. Cambiar a un fondo de Biblioteca es gratis.")}
+                      : (t("upload.regen_bg_desc_short") || "Editás el fondo como siempre (movimiento, efecto, look). Al aprobar se genera una versión nueva con IA. Cambiar a un fondo de Biblioteca es gratis.")}
                   </p>
+                  {/* Cupo REAL, no el "1 de tus 3" hardcodeado que en un job con
+                      7 ediciones era directamente falso. */}
+                  {!variantMode && !editLimitExempt && Number.isInteger(editsRemaining) && (
+                    <p className="text-[10px] text-gray-500 mt-1" data-testid="edit-quota">
+                      {editsRemaining <= 0
+                        ? (t("upload.regen_quota_none") || "Sin ediciones disponibles en este video.")
+                        : editsRemaining === 1
+                          ? (t("upload.regen_quota_one") || "Te queda 1 edición en este video.")
+                          : (t("upload.regen_quota_many") || "Te quedan {n} ediciones en este video.").replace("{n}", editsRemaining)}
+                    </p>
+                  )}
                 </div>
                 {/* El toggle "Generar otra versión" existe porque una
                     edición puede NO tocar el fondo (y entonces el diff
@@ -3380,6 +3430,13 @@ export default function UploadZone({
               ? `${t("upload.preview_editing") || "Línea actual"}: ${_previewLyric}${files.length > 1 ? ` · +${files.length - 1}` : ""}`
               : (t("upload.preview_disclaimer") || "Aproximación del mood y el movimiento. El fondo final lo genera la IA.")}
           </p>
+          {/* Resumen "qué va a pasar", SIEMPRE visible y en el punto de commit.
+              No es un modal: los productores que hacen lotes aprenden a
+              clickear modales, y un aviso que se puede despachar de un Enter no
+              es un aviso. Acá no se puede saltear ni cerrar.
+              Sale de `editPlan` (resolveEditSubmission), o sea de la MISMA
+              función que arma el POST — no del diff, que no decide el output. */}
+          {editMode && editPlan && <EditPlanSummary plan={editPlan} t={t} />}
           {/* 2026-07-16: slot para el player bar de LyricsEditor (paso 6).
               Lo portalea acá, bajo el video, para que la columna derecha
               quede full con la letra. Fuera del paso 6 no se monta. */}
