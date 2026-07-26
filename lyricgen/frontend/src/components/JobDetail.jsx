@@ -14,6 +14,7 @@ import ScenesFilmstrip from "./ScenesFilmstrip";
 import SceneEditModal from "./SceneEditModal";
 import MediaPreview from "./MediaPreview";
 import JobSettingsCard from "./JobSettingsCard";
+import { SingleGeneratingHero } from "./BatchProgress";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -995,6 +996,34 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               {t("detail.transcription_failed_cta") || "Subir de nuevo"}
             </a>
           </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Initial render / variant render in progress. The detail route already
+  // polls /status above, so show those real pipeline fields instead of
+  // discarding them in the generic "not available" fallback. This is the
+  // same honest-progress panel used immediately after a normal generation.
+  if (isActivelyProcessing) {
+    const progressPct = typeof job.progress === "number"
+      ? Math.max(5, job.progress)
+      : 5;
+    return (
+      <div className="w-full max-w-2xl animate-fade-in">
+        <SingleGeneratingHero
+          jobName={(job.song_title || name).trim()}
+          artist={(job.artist || "").trim()}
+          progressPct={progressPct}
+          currentStep={job.current_step}
+          stepTextEs={job.step_text_es}
+          etaS={typeof job.eta_s === "number" ? job.eta_s : null}
+          t={t}
+        />
+        <div className="mt-6 text-center">
+          <button onClick={onBack} className="btn-secondary">
+            {t("detail.back")}
+          </button>
         </div>
       </div>
     );
