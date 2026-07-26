@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect, lazy, Suspense } from "react";
+import { useState, useRef, useCallback, useEffect, lazy, Suspense, useMemo } from "react";
 import {
   Routes, Route, Navigate, Outlet,
   useNavigate, useLocation, useParams,
@@ -966,6 +966,12 @@ function EditLyricsRoute({
         // main.py:7444). The wizard surface reads this to keep the
         // dialog honest about what will actually re-render.
         jobStatus: job.status,
+        // Cupo real de ediciones. El wizard prometía "usa 1 de tus 3 ediciones"
+        // hardcodeado, así que en un job con 7 ediciones esa frase es falsa.
+        // Mismo cálculo que EditRequestPanel, que ya lo mostraba una pantalla
+        // antes.
+        editsRemaining: job.edits_remaining ?? Math.max(0, 3 - (job.edit_count ?? 0)),
+        editLimitExempt: !!job.edit_limit_exempt,
         // Read-only context — solo display, no editable post-render.
         deliveryProfile: job.delivery_profile || "youtube",
         style: job.style || "",
@@ -4260,6 +4266,38 @@ export default function App() {
   // entre ambos vive detrás del prop `variantMode` de UploadZone.
   const _wizardOnExistingJob = !!currentReview?.editMode || !!currentReview?.variantMode;
 
+  // Plan EN VIVO de la edición: qué se va a aplicar y qué se va a descartar.
+  //
+  // Se calcula con la MISMA función que arma el POST (resolveEditSubmission),
+  // no con el diff pelado. Es la diferencia que importa: el diff NO decide el
+  // output — la degradación por status/escenas sí. Un resumen construido sobre
+  // `computeFieldDiff` diría "Movimiento: Animado → Estático" en un video que
+  // está por descartar ese cambio, o sea el bug original una capa más arriba.
+  //
+  // Sólo en edición: la variante manda el estado absoluto, ahí no hay nada que
+  // "no se aplique".
+  const editPlan = useMemo(() => {
+    const r = currentReview;
+    if (!r?.editMode || !r.baseline) return null;
+    try {
+      return resolveEditSubmission({
+        baseline: r.baseline,
+        current: buildEditCurrent(r, {
+          // Los segments en vuelo del editor; si todavía no montó, los del job.
+          editedSegments: liveReviewSegments || r.segments || [],
+          bgSelectMode,
+          backgroundId,
+        }),
+        jobStatus: r.jobStatus,
+        scenePlan: r.scenePlan,
+      });
+    } catch {
+      // El resumen es informativo: si algo falla, el wizard sigue usable y el
+      // submit real vuelve a calcularlo. Nunca romper la pantalla por un chip.
+      return null;
+    }
+  }, [currentReview, liveReviewSegments, bgSelectMode, backgroundId]);
+
   // Resume banner shown on /new and /review when sessionStorage has a
   // pending batch from a prior visit. Lets the operator restore their
   // approved-jobs + current-review (segments included) or drop the
@@ -4627,6 +4665,13 @@ export default function App() {
         // tiene el video HOY, aparte de qué eligió el operador. Sin esto el
         // anillo violeta es la única señal, y es la que engañó al operador.
         editBaseline={_wizardOnExistingJob ? currentReview.baseline : null}
+        // Plan EN VIVO (willApply / willDrop / blocked), desde la MISMA función
+        // que arma el POST. Alimenta el resumen del paso final y el bloqueo del
+        // bloque de fondo, para que el wizard deje de prometer cosas que el
+        // backend va a descartar.
+        editPlan={editPlan}
+        editsRemaining={_wizardOnExistingJob ? currentReview.editsRemaining : null}
+        editLimitExempt={!!currentReview?.editLimitExempt}
         // UI v1.1 (2026-05-30): feed the central title-card preview with the
         // currently-active artist/song. In edit mode the canonical source is
         // currentReview (the operator can edit them in the banner inputs

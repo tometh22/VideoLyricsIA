@@ -236,3 +236,55 @@ describe("los colores de letra no se ofrecen en edición (editables e ignorados)
     expect(screen.queryByLabelText("upload.lyric_color_label")).toBeNull();
   });
 });
+
+describe("el wizard deja de prometer lo que el backend va a descartar", () => {
+  beforeEach(() => localStorage.setItem(STICKY_KEY, JSON.stringify(STICKY_FIELDS)));
+  afterEach(() => { cleanup(); localStorage.clear(); });
+
+  const withPlan = (plan, extra = {}) => (
+    <UploadZone
+      files={[]} onFiles={() => {}} editMode lockedSteps={[1, 5]} hasReviewableContent
+      user={{ role: "admin", features: {} }} allHaveArtist
+      onStartReview={() => {}} onGenerateDirect={() => {}} onUploadAdvance={() => {}}
+      onEditFieldChange={() => {}}
+      editSeed={{ jobId: "j", wizardFields: JOB_FIELDS, matchLyrics: true }}
+      editBaseline={JOB_FIELDS}
+      editPlan={plan}
+      {...extra}
+    />
+  );
+
+  it("job multi-escena: avisa ARRIBA del bloque de fondo, no después de aprobar", () => {
+    render(withPlan({ blocked: { reason: "scenes", buckets: ["background"] }, willApply: {}, willDrop: [] }));
+    goStep(3);
+    const notice = screen.getByTestId("bg-blocked-notice");
+    expect(notice.textContent).toContain("edit.bg_locked_scenes_title");
+    // Y dice la salida real: regenerar la escena desde el filmstrip.
+    expect(notice.textContent).toContain("edit.bg_locked_scenes_desc");
+  });
+
+  it("job aprobado: el motivo es OTRO y el mensaje también", () => {
+    render(withPlan({ blocked: { reason: "status", buckets: ["background"] }, willApply: {}, willDrop: [] }));
+    goStep(3);
+    expect(screen.getByTestId("bg-blocked-notice").textContent)
+      .toContain("edit.bg_locked_done_title");
+  });
+
+  it("job normal: sin aviso", () => {
+    render(withPlan({ blocked: null, willApply: {}, willDrop: [] }));
+    goStep(3);
+    expect(screen.queryByTestId("bg-blocked-notice")).toBeNull();
+  });
+
+  it("el cupo que se muestra es el REAL, no '1 de tus 3'", () => {
+    render(withPlan({ blocked: null, willApply: {}, willDrop: [] }, { editsRemaining: 0 }));
+    goStep(3);
+    expect(screen.getByTestId("edit-quota").textContent).toContain("upload.regen_quota_none");
+  });
+
+  it("y un cupo exento no muestra contador", () => {
+    render(withPlan({ blocked: null, willApply: {}, willDrop: [] }, { editsRemaining: 2, editLimitExempt: true }));
+    goStep(3);
+    expect(screen.queryByTestId("edit-quota")).toBeNull();
+  });
+});
