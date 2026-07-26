@@ -9346,16 +9346,24 @@ async def approve_job(
     from database import Job as JobModel, AuditLog
     from datetime import datetime, timezone
 
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    job_query = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        job_query = job_query.filter(
+            JobModel.tenant_id == current_user["tenant_id"],
+        )
+    job = job_query.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "pending_review":
         raise HTTPException(status_code=400, detail="Job is not pending review")
+
+    is_cross_tenant_admin = (
+        current_user.get("role") == "admin"
+        and job.tenant_id != current_user.get("tenant_id")
+    )
+    _audit_cross_tenant_access(
+        db, current_user, job, "approve_job", commit=False,
+    )
 
     job.status = "done"
     job.approved_by = current_user["id"]
@@ -9378,7 +9386,11 @@ async def approve_job(
         user_id=current_user["id"],
         action="job.approve",
         detail={"job_id": job_id, "notes": body.notes,
-                "archived_failed_attempts": _archived_n},
+                "archived_failed_attempts": _archived_n,
+                "tenant_id": job.tenant_id,
+                "owner_user_id": job.user_id,
+                "actor_tenant_id": current_user.get("tenant_id"),
+                "cross_tenant_admin": is_cross_tenant_admin},
     ))
     db.commit()
 
@@ -9388,7 +9400,12 @@ async def approve_job(
     # bypasses the cache and reads the live counter.
     try:
         from cache import invalidate, usage_key
-        invalidate(usage_key(current_user["tenant_id"], current_user["id"]))
+        usage_owners = {
+            (job.tenant_id, job.user_id),
+            (current_user["tenant_id"], current_user["id"]),
+        }
+        for tenant_id, user_id in usage_owners:
+            invalidate(usage_key(tenant_id, user_id))
     except Exception:
         pass
 
@@ -9406,16 +9423,24 @@ async def reject_job(
     from database import Job as JobModel, AuditLog
     from datetime import datetime, timezone
 
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    job_query = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        job_query = job_query.filter(
+            JobModel.tenant_id == current_user["tenant_id"],
+        )
+    job = job_query.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "pending_review":
         raise HTTPException(status_code=400, detail="Job is not pending review")
+
+    is_cross_tenant_admin = (
+        current_user.get("role") == "admin"
+        and job.tenant_id != current_user.get("tenant_id")
+    )
+    _audit_cross_tenant_access(
+        db, current_user, job, "reject_job", commit=False,
+    )
 
     job.status = "rejected"
     job.approved_by = current_user["id"]
@@ -9425,9 +9450,24 @@ async def reject_job(
     db.add(AuditLog(
         user_id=current_user["id"],
         action="job.reject",
-        detail={"job_id": job_id, "notes": body.notes},
+        detail={"job_id": job_id, "notes": body.notes,
+                "tenant_id": job.tenant_id,
+                "owner_user_id": job.user_id,
+                "actor_tenant_id": current_user.get("tenant_id"),
+                "cross_tenant_admin": is_cross_tenant_admin},
     ))
     db.commit()
+
+    try:
+        from cache import invalidate, usage_key
+        usage_owners = {
+            (job.tenant_id, job.user_id),
+            (current_user["tenant_id"], current_user["id"]),
+        }
+        for tenant_id, user_id in usage_owners:
+            invalidate(usage_key(tenant_id, user_id))
+    except Exception:
+        pass
 
     return {"ok": True, "status": "rejected", "job_id": job_id}
 
