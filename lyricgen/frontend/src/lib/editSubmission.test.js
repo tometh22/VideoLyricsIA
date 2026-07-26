@@ -469,20 +469,16 @@ describe("un campo VACIADO a propósito no revive al refrescar", () => {
   });
 });
 
-describe("job con un movement_style basura: trade-off DELIBERADO", () => {
-  // Un revisor marcó que con un valor no reconocido (p.ej. "zoom-in", que el
-  // backend acepta porque el campo es texto libre) el operador ya no puede
-  // "limpiar" la fila eligiendo Auto: baseline y current normalizan los dos a
-  // "" → no hay diff → "No cambiaste nada".
+describe("job LEGACY con un movement_style no canónico", () => {
+  // La clase se cerró en el origen: el backend ahora NORMALIZA al escribir
+  // render_params (create, /edit y /variant), así que ningún job nuevo puede
+  // quedar con un valor fuera del catálogo. Medido antes de decidir: cero filas
+  // no canónicas en staging (515 jobs) y en prod (358). El caso era hipotético.
   //
-  // Se deja así A PROPÓSITO. La alternativa —dejar el baseline crudo— genera un
-  // diff apenas se abre el wizard, sin que el operador toque nada: un render de
-  // Veo PAGO por un cambio que no pidió. Y el render no se ve afectado en
-  // ningún caso: el backend corre el mismo _normalize_movement_style, así que
-  // "zoom-in" ya se comporta como Auto. Lo único que queda es una fila sucia en
-  // render_params, invisible para el operador.
-  //
-  // Este test fija esa decisión para que no se "arregle" sin ver el costo.
+  // La normalización del frontend queda como defensa en profundidad para filas
+  // viejas. Estos casos fijan que, si aparece una, el wizard se comporta bien:
+  // se muestra como Auto (que es lo que el backend hace igual) y no genera un
+  // diff espurio al abrir — que costaría un render de Veo que nadie pidió.
   const JUNK = { ...JOB_BARE, render_params: { movement_style: "zoom-in" } };
 
   it("abrir el wizard no produce un diff espurio (que costaría un render)", () => {
