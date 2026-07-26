@@ -285,6 +285,8 @@ export default function UploadZone({
   // resolveEditSubmission, la MISMA función que arma el POST. Es lo que permite
   // que el wizard deje de prometer lo que el backend va a descartar.
   editPlan = null,
+  // "status" | "scenes" | null — independiente de si ya hay cambios.
+  bgBlockedReason = null,
   // Cupo REAL de ediciones. El texto decía "usa 1 de tus 3 ediciones" fijo,
   // así que en un job con 7 ediciones mentía.
   editsRemaining = null,
@@ -1717,7 +1719,7 @@ export default function UploadZone({
   // DESPUÉS de aprobar — cinco pasos tarde. `editPlan.blocked` viene de la
   // misma función que arma el POST, así que el aviso no puede desincronizarse
   // del comportamiento real.
-  const _bgBlocked = editMode ? (editPlan?.blocked || null) : null;
+  const _bgBlocked = editMode && bgBlockedReason ? { reason: bgBlockedReason } : null;
   const _bgBlockedNotice = _bgBlocked ? (
     <div
       data-testid="bg-blocked-notice"

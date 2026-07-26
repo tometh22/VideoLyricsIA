@@ -89,6 +89,7 @@ export default function JobSettingsCard({ renderParams, provenanceHref }) {
                   <span
                     key={chip.key}
                     data-setting={chip.key}
+                    title={`${chip.label}: ${chip.full ?? chip.value}`}
                     className="inline-flex items-baseline gap-1 rounded-full bg-surface-3/70 ring-1 ring-white/[0.06] px-2 py-0.5 text-[10.5px]"
                   >
                     <span className="text-gray-500">{chip.label}</span>

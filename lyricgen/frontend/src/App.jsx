@@ -54,7 +54,7 @@ import { segmentsStore, useJobSegmentsValue } from "./state/segmentsStore";
 import { persistSegments } from "./lib/persistSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
 import { backgroundRegenExtras } from "./lib/editWizardDiff";
-import { buildEditReview, buildEditCurrent, resolveEditSubmission } from "./lib/editSubmission";
+import { buildEditReview, buildEditCurrent, resolveEditSubmission, backgroundEditBlockedReason } from "./lib/editSubmission";
 import { normalizeMovementCode } from "./lib/catalogCodes";
 import { buildVariantPayload } from "./lib/variantPayload";
 import { prefetchKey } from "./lib/prefetchKey";
@@ -4670,6 +4670,15 @@ export default function App() {
         // bloque de fondo, para que el wizard deje de prometer cosas que el
         // backend va a descartar.
         editPlan={editPlan}
+        // Aparte del plan: "¿se puede tocar el fondo de este job?" no depende
+        // de si el operador ya cambió algo. Con el plan solo, el aviso salía
+        // DESPUÉS de configurar el fondo — al revés de para lo que existe.
+        bgBlockedReason={_wizardOnExistingJob && currentReview?.editMode
+          ? backgroundEditBlockedReason({
+              jobStatus: currentReview.jobStatus,
+              scenePlan: currentReview.scenePlan,
+            })
+          : null}
         editsRemaining={_wizardOnExistingJob ? currentReview.editsRemaining : null}
         editLimitExempt={!!currentReview?.editLimitExempt}
         // UI v1.1 (2026-05-30): feed the central title-card preview with the
