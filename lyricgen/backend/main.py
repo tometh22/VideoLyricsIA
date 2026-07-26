@@ -11872,20 +11872,52 @@ async def create_variant(
     El padre debe estar en status='done'. La variante arranca en 'processing'
     y va por el pipeline normal saltando Whisper (segments_override).
 
-    400 si padre no done. 402 si el plan está sin capacidad. 403 si el
-    padre no es del tenant del user. 404 si el padre no existe.
+    400 si padre no done. 402 si el plan está sin capacidad. 404 si el
+    padre no existe o pertenece a otro tenant. Los admins de plataforma
+    pueden crear la variante cross-tenant, igual que pueden abrir y editar
+    el video; en ese caso el job nuevo queda en el tenant y bajo el owner
+    del padre, no bajo la cuenta interna del admin.
     """
     import uuid
     from database import Job as JobModel, AuditLog
 
-    parent = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == parent_job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    # Mismo scope que GET /status y POST /edit: un admin de plataforma
+    # puede operar sobre cualquier tenant; un usuario común sólo sobre el
+    # suyo. Antes /status cargaba el padre cross-tenant y montaba todo el
+    # wizard, pero este query volvía a exigir el tenant del admin y el
+    # submit terminaba en un falso 404 "Parent job not found".
+    _parent_q = db.query(JobModel).filter(JobModel.job_id == parent_job_id)
+    if current_user.get("role") != "admin":
+        _parent_q = _parent_q.filter(
+            JobModel.tenant_id == current_user["tenant_id"]
+        )
+    parent = _parent_q.first()
     if not parent:
         raise HTTPException(status_code=404, detail="Parent job not found")
+
+    _is_cross_tenant_admin = (
+        current_user.get("role") == "admin"
+        and parent.tenant_id != current_user.get("tenant_id")
+    )
+    # Un admin cross-tenant actúa EN NOMBRE del owner original: la variante
+    # debe aparecer en el historial del cliente y consumir su plan/cupo.
+    # Para usuarios comunes (incluidos teammates del mismo tenant) se
+    # conserva el contrato previo: el creador actual es el owner del job.
+    variant_tenant_id = parent.tenant_id
+    variant_user_id = (
+        parent.user_id if _is_cross_tenant_admin else current_user["id"]
+    )
+    billing_user = db.query(User).filter(User.id == variant_user_id).first()
+    if billing_user is None:
+        # Job.user_id tiene FK y esto no debería ocurrir; fallar explícito
+        # evita crear un job sin dueño o facturarlo al admin por accidente.
+        raise HTTPException(
+            status_code=409,
+            detail="No se pudo resolver el owner del video original.",
+        )
+    _audit_cross_tenant_access(
+        db, current_user, parent, "create_variant", commit=False,
+    )
     if parent.status != "done":
         raise HTTPException(
             status_code=400,
@@ -11933,17 +11965,21 @@ async def create_variant(
 
     # Plan capacity check — misma lógica que /generate. Variante cuenta
     # como 1 video del plan.
-    plan = current_user.get("plan", "100")
-    usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], plan,
-                                billing_group=current_user.get("billing_group"))
+    plan = billing_user.plan_id or "100"
+    usage_info = get_plan_usage(
+        db,
+        variant_user_id,
+        variant_tenant_id,
+        plan,
+        billing_group=billing_user.billing_group,
+    )
     if usage_info["alert_100"] and plan == "free":
         raise HTTPException(
             status_code=429,
             detail="Free plan limit reached. Upgrade to continue.",
         )
     # Para planes pagos, allow_overage decide si se permite pasarse del cap.
-    user_model = db.query(User).filter(User.id == current_user["id"]).first()
-    if usage_info.get("alert_100") and not (user_model and user_model.allow_overage):
+    if usage_info.get("alert_100") and not billing_user.allow_overage:
         raise HTTPException(
             status_code=402,
             detail=f"Llegaste al límite de tu plan ({usage_info.get('limit', '?')} canciones). "
@@ -11978,7 +12014,7 @@ async def create_variant(
     )
     existing_renders = (
         db.query(JobModel)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .filter(JobModel.tenant_id == variant_tenant_id)
         .filter(_sql_func.lower(_sql_func.trim(JobModel.artist)) == _song_artist)
         .filter(
             _sql_func.lower(
@@ -12031,7 +12067,7 @@ async def create_variant(
             action="variant.overage_charge",
             detail={
                 "parent_job_id": parent_job_id,
-                "tenant_id": current_user["tenant_id"],
+                "tenant_id": variant_tenant_id,
                 "artist": parent.artist,
                 "song_title": parent.song_title,
                 "existing_renders_before_this_one": existing_renders,
@@ -12120,7 +12156,7 @@ async def create_variant(
         src_filename = _os_mod.path.basename(src_key) if src_key else ""
         if src_key and src_filename and _storage_mod.is_enabled():
             candidate_dst = _storage_mod._input_object_key(
-                current_user["tenant_id"], new_job_id, src_filename
+                variant_tenant_id, new_job_id, src_filename
             )
             if _storage_mod.copy_object(src_key, candidate_dst):
                 variant_input_r2_key = candidate_dst
@@ -12158,6 +12194,12 @@ async def create_variant(
     if body.background_id:
         _variant_job_dir = os.path.join(OUTPUTS_DIR, new_job_id)
         os.makedirs(_variant_job_dir, exist_ok=True)
+        # El admin conserva su identidad como actor, pero el uso del asset
+        # se registra contra el tenant destino, que es quien recibe el job.
+        _variant_asset_user = {
+            **current_user,
+            "tenant_id": variant_tenant_id,
+        }
         (
             variant_bg_path,
             variant_bg_r2_key,
@@ -12167,7 +12209,7 @@ async def create_variant(
         ) = _resolve_library_background(
             body.background_id,
             body.background_mode or "as_is",
-            current_user,
+            _variant_asset_user,
             db,
             _variant_job_dir,
             new_job_id,
@@ -12175,8 +12217,8 @@ async def create_variant(
 
     new_job = JobModel(
         job_id=new_job_id,
-        user_id=current_user["id"],
-        tenant_id=current_user["tenant_id"],
+        user_id=variant_user_id,
+        tenant_id=variant_tenant_id,
         artist=parent.artist,
         song_title=parent.song_title,
         style=new_style,
@@ -12211,13 +12253,15 @@ async def create_variant(
             "variant_owns_input": variant_owns_input,
             "bypass_content_validation": bool(body.bypass_content_validation),
             "force_content_validation": bool(body.force_content_validation),
-            "tenant_id": current_user.get("tenant_id"),
+            "tenant_id": variant_tenant_id,
+            "actor_tenant_id": current_user.get("tenant_id"),
+            "cross_tenant_admin": _is_cross_tenant_admin,
         },
     ))
     db.commit()
     logger.info(
         "[VARIANT] created job=%s parent=%s tenant=%s bypass=%s force=%s",
-        new_job_id, parent.job_id, current_user.get("tenant_id"),
+        new_job_id, parent.job_id, variant_tenant_id,
         bool(body.bypass_content_validation), bool(body.force_content_validation),
     )
 
@@ -12271,7 +12315,7 @@ async def create_variant(
         artist=parent.artist,
         style=new_style,
         plan=plan,
-        tenant_id=current_user.get("tenant_id", ""),
+        tenant_id=variant_tenant_id,
         # Biblioteca de fondos: mismo shape que /generate. Cuando hay
         # background_path/bg_r2_key el pipeline saltea la generación IA;
         # en modo "variation" van los variation_source_* y Veo deriva un
