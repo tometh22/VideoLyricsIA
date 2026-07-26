@@ -1452,7 +1452,16 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "style": style,
             "genre": genre,
             "concept": concept,
-            "movement_style": movement_style,
+            # NORMALIZADO al persistir, no crudo. El campo entra como texto
+            # libre desde el Form, y guardarlo tal cual dejaba render_params con
+            # valores que ninguna otra capa entiende: la UI no puede resaltar la
+            # opción, y admin_insights los cuenta como buckets distintos aunque
+            # el render los trate igual. El pipeline ya normaliza al renderizar,
+            # así que persistir el valor canónico no cambia ningún render — sólo
+            # deja de guardar algo que después hay que interpretar en cada
+            # lector. La invariante es: render_params.movement_style SIEMPRE es
+            # un código de _MOVEMENT_STYLE_RULES o "".
+            "movement_style": _normalize_movement_style(movement_style),
             "effect": effect,
             "match_lyrics": match_lyrics,
             "background_ai_generated": _background_is_ai_generated,

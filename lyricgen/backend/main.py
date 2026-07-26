@@ -94,7 +94,7 @@ from database import (
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
-from pipeline import run_pipeline, transcribe
+from pipeline import run_pipeline, transcribe, _normalize_movement_style
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
 from billing import router as billing_router
@@ -10732,7 +10732,12 @@ async def request_edit(
         # Forward for this render AND persist to durable render_params — same
         # reaped-retry durability rationale as background_hint above, and so
         # a subsequent "Regenerar fondo" pre-fills the operator's last choice.
-        _mv = (body.movement_style or "").strip()
+        # NORMALIZADO al persistir (misma nota que en pipeline al escribir
+        # render_params): la invariante es que render_params.movement_style
+        # SIEMPRE sea un código canónico o "". El pipeline normaliza igual al
+        # renderizar, así que esto no cambia ningún render — deja de guardar
+        # algo que después cada lector tiene que interpretar por su cuenta.
+        _mv = _normalize_movement_style((body.movement_style or "").strip())
         edit_params["movement_style"] = _mv
         _rp_mv = dict(job.render_params or {})
         _rp_mv["movement_style"] = _mv
@@ -12066,6 +12071,10 @@ async def create_variant(
             continue
         if isinstance(_value, str):
             _value = _value.strip()
+        # Misma invariante que en /edit y en el create: movement_style se
+        # persiste CANÓNICO, nunca crudo.
+        if _field == "movement_style":
+            _value = _normalize_movement_style(_value or "")
         new_render_params[_field] = _value
         _overridden_fields.append(_field)
     new_render_params = _merge_content_validation_choice(
