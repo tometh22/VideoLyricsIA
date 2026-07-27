@@ -54,6 +54,23 @@ export const EFFECT_CODES = [
   "scanlines",
   "fog",
   "shapes",
+  "liquid_glass",
+  "caustics",
+  "rgb_glitch",
+  "neon_edge",
+  "shadow_play",
+  "kaleido",
+  "halftone",
+  "ink_reveal",
+  "heatwave",
+  "chromatic_pulse",
+  "cutout_echo",
+  "projector",
+  "bass_pulse",
+  "beat_flash",
+  "chromatic_hit",
+  "beat_ripple",
+  "echo_hit",
 ];
 
 /**

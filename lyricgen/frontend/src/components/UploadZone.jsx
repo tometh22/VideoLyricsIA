@@ -13,6 +13,10 @@ import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS } from "../lib/optionLabels
 import EditPlanSummary from "./EditPlanSummary";
 import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBackgroundPreviewTokens";
 
+const REACTIVE_EFFECT_CODES = new Set([
+  "bass_pulse", "beat_flash", "chromatic_hit", "beat_ripple", "echo_hit",
+]);
+
 const API = import.meta.env.VITE_API_URL || "";
 
 function authHeaders() {
@@ -1104,6 +1108,23 @@ export default function UploadZone({
     scanlines: { category: "stylized", sample: "/fx_samples/scanlines.mp4", desc: t("upload.effect_scanlines_desc") || "Líneas de pantalla y barrido de color retro." },
     fog: { category: "ambient", sample: "/fx_samples/fog.mp4", desc: t("upload.effect_fog_desc") || "Bancos de niebla suaves que recorren la foto." },
     shapes: { category: "stylized", sample: "/fx_samples/shapes.mp4", desc: t("upload.effect_shapes_desc") || "Figuras gráficas que flotan sobre la imagen." },
+    liquid_glass: { category: "ambient", sample: "/fx_samples/liquid_glass.mp4", desc: t("upload.effect_liquid_glass_desc") || "Refracciones fluidas de vidrio que recorren la foto." },
+    caustics: { category: "ambient", sample: "/fx_samples/caustics.mp4", desc: t("upload.effect_caustics_desc") || "Reflejos acuáticos ondulantes, frescos y luminosos." },
+    rgb_glitch: { category: "stylized", sample: "/fx_samples/rgb_glitch.mp4", desc: t("upload.effect_rgb_glitch_desc") || "Cortes digitales con desplazamiento rojo, verde y azul." },
+    neon_edge: { category: "stylized", sample: "/fx_samples/neon_edge.mp4", desc: t("upload.effect_neon_edge_desc") || "Contornos de neón que cruzan y enmarcan la imagen." },
+    shadow_play: { category: "ambient", sample: "/fx_samples/shadow_play.mp4", desc: t("upload.effect_shadow_play_desc") || "Sombras orgánicas se desplazan como luz entre hojas." },
+    kaleido: { category: "stylized", sample: "/fx_samples/kaleido.mp4", desc: t("upload.effect_kaleido_desc") || "Geometría caleidoscópica lenta y envolvente." },
+    halftone: { category: "stylized", sample: "/fx_samples/halftone.mp4", desc: t("upload.effect_halftone_desc") || "Trama editorial de puntos que respira sobre la foto." },
+    ink_reveal: { category: "stylized", sample: "/fx_samples/ink_reveal.mp4", desc: t("upload.effect_ink_reveal_desc") || "Manchas de tinta orgánicas aparecen y se retraen." },
+    heatwave: { category: "ambient", sample: "/fx_samples/heatwave.mp4", desc: t("upload.effect_heatwave_desc") || "Ondas cálidas ascienden como un espejismo." },
+    chromatic_pulse: { category: "stylized", sample: "/fx_samples/chromatic_pulse.mp4", desc: t("upload.effect_chromatic_pulse_desc") || "Anillos de color respiran desde el centro." },
+    cutout_echo: { category: "stylized", sample: "/fx_samples/cutout_echo.mp4", desc: t("upload.effect_cutout_echo_desc") || "Marcos desplazados con estética de recorte editorial." },
+    projector: { category: "ambient", sample: "/fx_samples/projector.mp4", desc: t("upload.effect_projector_desc") || "Haz, polvo y parpadeo de proyector analógico." },
+    bass_pulse: { category: "reactive", sample: "/fx_samples/bass_pulse.mp4", desc: t("upload.effect_bass_pulse_desc") || "Un halo profundo se expande con cada grave." },
+    beat_flash: { category: "reactive", sample: "/fx_samples/beat_flash.mp4", desc: t("upload.effect_beat_flash_desc") || "Destellos breves sincronizados con el tempo." },
+    chromatic_hit: { category: "reactive", sample: "/fx_samples/chromatic_hit.mp4", desc: t("upload.effect_chromatic_hit_desc") || "Los canales RGB se separan en cada golpe." },
+    beat_ripple: { category: "reactive", sample: "/fx_samples/beat_ripple.mp4", desc: t("upload.effect_beat_ripple_desc") || "Ondas concéntricas nacen en cada beat." },
+    echo_hit: { category: "reactive", sample: "/fx_samples/echo_hit.mp4", desc: t("upload.effect_echo_hit_desc") || "Ecos gráficos se alejan después de cada golpe." },
   };
   const EFFECTS = [
     { code: "", category: "clean", label: _FX_LABELS[""], sample: null, desc: t("upload.effect_none_desc") || "Fondo limpio, sin efecto." },
@@ -1118,6 +1139,7 @@ export default function UploadZone({
     { code: "ambient", label: t("upload.effect_category_ambient") || "Ambiente" },
     { code: "particles", label: t("upload.effect_category_particles") || "Partículas" },
     { code: "stylized", label: t("upload.effect_category_stylized") || "Estilos" },
+    { code: "reactive", label: t("upload.effect_category_reactive") || "Al ritmo" },
   ];
   const visibleEffects = effectCategory === "all"
     ? EFFECTS
@@ -2119,9 +2141,14 @@ export default function UploadZone({
                         )}
                         {inVideo && anchorChip}
                       </div>
-                      <p className={`truncate px-2 py-1.5 text-[9px] font-medium ${active ? "text-white" : "text-gray-400"}`}>
-                        {_stillNote || e.label}
-                      </p>
+                      <div className={`flex items-center justify-between gap-1 px-2 py-1.5 text-[9px] font-medium ${active ? "text-white" : "text-gray-400"}`}>
+                        <span className="truncate">{_stillNote || e.label}</span>
+                        {REACTIVE_EFFECT_CODES.has(e.code) && (
+                          <span className="shrink-0 rounded-full bg-fuchsia-400/15 px-1.5 py-0.5 text-[7px] font-bold tracking-[0.12em] text-fuchsia-200">
+                            {t("upload.effect_reactive_badge")}
+                          </span>
+                        )}
+                      </div>
                     </button>
                   );
                 })}
@@ -3701,6 +3728,10 @@ export default function UploadZone({
                           key={e.code || "none"}
                           type="button"
                           onClick={() => updateBatchDefault("effect", e.code)}
+                          onMouseEnter={() => setHoverEffect(e.code)}
+                          onMouseLeave={() => setHoverEffect(null)}
+                          onFocus={() => setHoverEffect(e.code)}
+                          onBlur={() => setHoverEffect(null)}
                           aria-label={`${e.label}: ${e.desc}`}
                           title={e.desc}
                           className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
@@ -3711,7 +3742,20 @@ export default function UploadZone({
                         >
                           <div className="aspect-video bg-black relative overflow-hidden">
                             {e.sample ? (
-                              <video src={e.sample} className="w-full h-full object-cover pointer-events-none" autoPlay loop muted playsInline />
+                              <>
+                                <img
+                                  src={e.sample.replace(/\.mp4$/, ".jpg")}
+                                  alt=""
+                                  className="h-full w-full object-cover pointer-events-none"
+                                />
+                                {(active || hoverEffect === e.code) && (
+                                  <video
+                                    src={e.sample}
+                                    className="absolute inset-0 h-full w-full object-cover pointer-events-none"
+                                    autoPlay preload="auto" loop muted playsInline
+                                  />
+                                )}
+                              </>
                             ) : (
                               <div className="w-full h-full grid place-items-center text-gray-500 text-[10px]" style={{ background: "radial-gradient(120% 100% at 50% 0,#241a40,#0b0820)" }}>
                                 {t("upload.effect_none") || "Ninguno"}

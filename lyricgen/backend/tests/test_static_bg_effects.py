@@ -98,13 +98,16 @@ def test_each_effect_asset_exists_and_composites(tmp_path, effect):
     _static_image_to_mp4(str(img), str(bg), duration=2.0)
 
     comp = tmp_path / f"comp_{effect}.mp4"
-    # The core of build_video_filter's effect branch: screen-blend the looped
+    # The core of build_video_filter's effect branch: blend the looped
     # fx over the bg (the lyrics subtitles step is exercised separately). Pull
     # the SAME per-effect pre-blend gain build_video_filter uses, so this also
     # proves every gain string (incl. bokeh's `curves` with quoted points)
     # composites under real ffmpeg.
     gain = fx.fx_gain(effect)
     gain_step = f"{gain}," if gain else ""
+    blend = fx.effect_blend(effect)
+    opacity = fx.effect_opacity(effect)
+    opacity_step = f":all_opacity={opacity:.2f}" if opacity < 1.0 else ""
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(bg),
@@ -112,7 +115,8 @@ def test_each_effect_asset_exists_and_composites(tmp_path, effect):
         "-filter_complex",
         "[0:v]format=gbrp[b];"
         f"[1:v]scale=1920:1080,setpts=PTS-STARTPTS,{gain_step}format=gbrp[f];"
-        "[b][f]blend=all_mode=screen:shortest=1,format=yuv420p[o]",
+        f"[b][f]blend=all_mode={blend}{opacity_step}:shortest=1,"
+        "format=yuv420p[o]",
         "-map", "[o]", "-t", "2", "-c:v", "libx264", "-preset", "ultrafast",
         str(comp),
     ]
@@ -121,7 +125,10 @@ def test_each_effect_asset_exists_and_composites(tmp_path, effect):
     assert comp.exists() and comp.stat().st_size > 0
 
 
-@pytest.mark.parametrize("effect", ["snow", "rain", "light"])
+@pytest.mark.parametrize(
+    "effect",
+    ["snow", "rain", "light", "shadow_play", "beat_ripple"],
+)
 def test_apply_short_effect_overlays_on_vertical_short(tmp_path, effect):
     """The short's ffmpeg effect post-pass (_apply_short_effect) screen-blends a
     looped fx onto a finished vertical short — this is how the short finally

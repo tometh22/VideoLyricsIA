@@ -40,6 +40,23 @@ export const EFFECT_LABELS = (t) => ({
   scanlines: t("upload.effect_scanlines") || "Barrido retro",
   fog: t("upload.effect_fog") || "Niebla",
   shapes: t("upload.effect_shapes") || "Figuras",
+  liquid_glass: t("upload.effect_liquid_glass") || "Liquid Glass",
+  caustics: t("upload.effect_caustics") || "Reflejos de agua",
+  rgb_glitch: t("upload.effect_rgb_glitch") || "RGB Glitch",
+  neon_edge: t("upload.effect_neon_edge") || "Bordes neón",
+  shadow_play: t("upload.effect_shadow_play") || "Juego de sombras",
+  kaleido: t("upload.effect_kaleido") || "Kaleido Drift",
+  halftone: t("upload.effect_halftone") || "Semitono",
+  ink_reveal: t("upload.effect_ink_reveal") || "Tinta viva",
+  heatwave: t("upload.effect_heatwave") || "Onda de calor",
+  chromatic_pulse: t("upload.effect_chromatic_pulse") || "Pulso cromático",
+  cutout_echo: t("upload.effect_cutout_echo") || "Eco recortado",
+  projector: t("upload.effect_projector") || "Proyector",
+  bass_pulse: t("upload.effect_bass_pulse") || "Pulso de graves",
+  beat_flash: t("upload.effect_beat_flash") || "Flash al beat",
+  chromatic_hit: t("upload.effect_chromatic_hit") || "Golpe cromático",
+  beat_ripple: t("upload.effect_beat_ripple") || "Onda al beat",
+  echo_hit: t("upload.effect_echo_hit") || "Eco de golpe",
 });
 
 /**
