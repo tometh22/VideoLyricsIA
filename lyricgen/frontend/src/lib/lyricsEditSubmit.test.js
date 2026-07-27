@@ -72,6 +72,14 @@ describe("layoutChanged", () => {
 });
 
 describe("translateBackendError", () => {
+  it("maps the structured edit_in_progress conflict", () => {
+    const out = translateBackendError(
+      { code: "edit_in_progress", message: "An edit is already being rendered." },
+      () => null,
+    );
+    expect(out).toMatch(/re-renderizando/);
+  });
+
   it("maps the 'no cached background' error to friendly Spanish copy", () => {
     const out = translateBackendError("No cached background available for job", () => null);
     expect(out).toMatch(/fondo cacheado/);

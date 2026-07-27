@@ -6,7 +6,8 @@ Python), which OOM-SIGKILLed the worker on long songs and left the job stuck
 in "processing" forever. The fix removes the camera pan: the photo background
 is now a STATIC image rendered by ffmpeg (C-level, bounded memory — impossible
 to OOM), and the video's life/motion comes from the composable effect overlay
-(snow/rain/stars/bokeh/light/aurora) that screen-blends on top.
+(snow/rain/stars/bokeh/light plus the expanded atmospheric catalogue) that
+screen-blends on top.
 
 These tests prove, with REAL ffmpeg, that:
   1. the static render produces a valid full-duration video, and

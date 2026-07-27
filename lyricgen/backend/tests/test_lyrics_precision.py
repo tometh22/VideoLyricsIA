@@ -290,9 +290,12 @@ def test_edit_lyrics_rejected_on_non_terminal_states(
         headers={"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"},
         json={"edit_type": "lyrics", "segments": [{"start": 0, "end": 2, "text": "y"}]},
     )
-    assert r.status_code == 400, (
+    expected_status = 409 if forbidden_status == "editing" else 400
+    assert r.status_code == expected_status, (
         f"status={forbidden_status} should reject lyrics edit, got {r.status_code}: {r.text}"
     )
+    if forbidden_status == "editing":
+        assert r.json()["detail"]["code"] == "edit_in_progress"
     _cleanup(db)
 
 

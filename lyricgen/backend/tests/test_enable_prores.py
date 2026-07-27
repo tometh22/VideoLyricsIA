@@ -58,23 +58,54 @@ def test_enable_prores_requires_prores_access(monkeypatch, client, user_token, d
     assert "ProRes" in res.text or "Broadcast" in res.text
 
 
-def test_enable_prores_404_for_other_tenant(monkeypatch, client, admin_token, db):
-    """Admin tiene access, pero el job pertenece a otro tenant → 404
-    (no leakea info de existencia del job a usuarios sin acceso)."""
+def test_admin_can_enable_prores_for_other_tenant(
+    monkeypatch, client, admin_token, db,
+):
+    """El operador admin puede preparar ProRes sobre el job cross-tenant
+    que abrió desde el panel, sin cambiar el owner ni el tenant del video."""
     monkeypatch.setattr(auth, "PRORES_TENANTS", {"some-other-tenant"})
+    job_id = _create_done_youtube_job(db, tenant_id="some-other-tenant")
+
+    with pytest.MonkeyPatch.context() as queue_patch:
+        queue_patch.setattr(
+            "main.enqueue_prores_prewarm",
+            lambda *_args, **_kwargs: "rq-test",
+        )
+        res = client.post(
+            f"/enable-prores/{job_id}",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            json={
+                "umg_frame_size": "HD",
+                "umg_fps": "29.97",
+                "umg_prores_profile": "3",
+            },
+        )
+
+    assert res.status_code == 200, res.text
+    db.expire_all()
+    fresh = db.query(JobModel).filter(JobModel.job_id == job_id).first()
+    assert fresh.tenant_id == "some-other-tenant"
+    assert fresh.umg_spec["frame_size"] == "HD"
+
+
+def test_regular_user_cannot_enable_prores_for_other_tenant(
+    monkeypatch, client, user_token, db,
+):
+    monkeypatch.setattr(auth, "PRORES_TENANTS", {"default"})
     job_id = _create_done_youtube_job(db, tenant_id="some-other-tenant")
 
     res = client.post(
         f"/enable-prores/{job_id}",
-        headers={"Authorization": f"Bearer {admin_token}"},
+        headers={"Authorization": f"Bearer {user_token}"},
         json={
             "umg_frame_size": "HD",
             "umg_fps": "29.97",
             "umg_prores_profile": "3",
         },
     )
-    # admin tenant != "some-other-tenant" → query filter no encuentra el job
-    assert res.status_code == 404, f"expected 404, got {res.status_code}: {res.text[:200]}"
+    # El entitlement se evalúa antes del lookup tenant-scoped; según el
+    # tenant del fixture puede cortar en 403 o esconder el job con 404.
+    assert res.status_code in (403, 404)
 
 
 def test_enable_prores_400_when_job_not_done(monkeypatch, client, admin_token, db):
@@ -163,6 +194,14 @@ def test_enable_prores_happy_path_persists_umg_spec(monkeypatch, client, admin_t
     assert fresh.umg_spec["frame_size"] == "HD"
     # delivery_profile NO debe cambiar — mantenemos el dato histórico.
     assert fresh.delivery_profile == "youtube"
+
+    status = client.get(
+        f"/status/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert status.status_code == 200
+    assert status.json()["umg_spec"]["frame_size"] == "HD"
+    assert status.json()["prores_ready"] is False
 
 
 def test_enable_prores_idempotent_overwrites_umg_spec(monkeypatch, client, admin_token, db):

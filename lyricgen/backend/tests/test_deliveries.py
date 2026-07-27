@@ -69,8 +69,20 @@ def approved_job(db, admin_token, client):
     db.commit()
     db.refresh(job)
     yield job
-    # Cleanup: remove the job + any deliveries we created against it
-    from database import Delivery
+    # Cleanup: remove the job + any deliveries we created against it.
+    # Change requests reference deliveries via a FK (delivery_change_requests
+    # _delivery_id_fkey) — Postgres enforces it even though the local SQLite
+    # test DB silently ignores it, so deleting the CRs first is required or
+    # this teardown 500s and leaves testjob12345 behind, breaking every
+    # subsequent test that reuses this fixture's hardcoded job_id.
+    from database import Delivery, DeliveryChangeRequest
+    delivery_ids = [
+        d.id for d in db.query(Delivery).filter(Delivery.job_id == "testjob12345").all()
+    ]
+    if delivery_ids:
+        db.query(DeliveryChangeRequest).filter(
+            DeliveryChangeRequest.delivery_id.in_(delivery_ids)
+        ).delete(synchronize_session=False)
     db.query(Delivery).filter(Delivery.job_id == "testjob12345").delete()
     db.query(Job).filter(Job.id == job.id).delete()
     db.commit()
@@ -96,6 +108,87 @@ def test_admin_can_create_delivery(client, admin_token, approved_job, all_r2_fil
     assert body["job_id"] == approved_job.job_id
     assert body["label"] == "Renderizado"  # first delivery for this song
     assert body["replaced"] is False
+
+
+def test_missing_prores_is_prepared_instead_of_returning_dead_end(
+    client, admin_token, approved_job,
+):
+    """El prewarm post-render es best-effort. Si faltan sólo los .mov,
+    Enviar a UMG los encola de forma explícita y responde 202 para que el
+    cliente espere y reintente la publicación."""
+    def object_exists(key):
+        return not key.endswith(("umg_master.mov", "umg_short.mov"))
+
+    with (
+        patch("main.storage.object_exists", side_effect=object_exists),
+        patch(
+            "main.enqueue_prores_prewarm",
+            side_effect=lambda _job_id, file_type, *, force=False: (
+                f"rq:{file_type}" if force else None
+            ),
+        ) as enqueue,
+    ):
+        res = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token),
+            json={},
+        )
+
+    assert res.status_code == 202, res.text
+    body = res.json()
+    assert body["status"] == "preparing_prores"
+    assert body["missing"] == ["umg_master", "umg_short"]
+    assert body["enqueued"] == ["umg_master", "umg_short"]
+    assert enqueue.call_count == 2
+    assert all(call.kwargs == {"force": True} for call in enqueue.call_args_list)
+
+
+def test_youtube_only_job_requests_prores_configuration(
+    client, admin_token, approved_job, db,
+):
+    approved_job.umg_spec = None
+    approved_job.delivery_profile = "youtube"
+    db.commit()
+
+    def object_exists(key):
+        return not key.endswith(("umg_master.mov", "umg_short.mov"))
+
+    with (
+        patch("main.storage.object_exists", side_effect=object_exists),
+        patch("main.enqueue_prores_prewarm") as enqueue,
+    ):
+        res = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token),
+            json={},
+        )
+
+    assert res.status_code == 409
+    detail = res.json()["detail"]
+    assert detail["code"] == "prores_required"
+    assert detail["missing"] == ["umg_master", "umg_short"]
+    enqueue.assert_not_called()
+
+
+def test_missing_render_output_still_blocks_delivery(
+    client, admin_token, approved_job,
+):
+    def object_exists(key):
+        return not key.endswith("thumbnail.jpg")
+
+    with (
+        patch("main.storage.object_exists", side_effect=object_exists),
+        patch("main.enqueue_prores_prewarm") as enqueue,
+    ):
+        res = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token),
+            json={},
+        )
+
+    assert res.status_code == 409
+    assert "thumbnail" in res.json()["detail"]
+    enqueue.assert_not_called()
 
 
 def test_non_admin_cannot_create_delivery(client, user_token, approved_job, all_r2_files_present):
@@ -305,4 +398,123 @@ def test_deliveries_routed_to_external_db(
     finally:
         main.app.dependency_overrides.pop(get_deliveries_db, None)
         Base.metadata.drop_all(bind=ext_engine)
-        ext_engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Change requests: UMG pide correcciones desde el portal (POST .../change-
+# request), el operador las resuelve desde el admin (GET/POST /admin/
+# change-requests). Panel re-agregado 2026-07-24 tras detectar que se había
+# sacado la UI (2026-06-02) pero el portal seguía ofreciendo el botón — los
+# pedidos se guardaban sin que nadie los viera.
+# ---------------------------------------------------------------------------
+
+def test_change_request_requires_portal_token(client, admin_token, approved_job, all_r2_files_present):
+    client.post(f"/admin/deliveries/from-job/{approved_job.job_id}",
+                headers=auth(admin_token), json={})
+    items = client.get("/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN}).json()
+    delivery_id = items["songs"][0]["versions"][0]["delivery_id"]
+
+    res = client.post(f"/api/deliveries/{delivery_id}/change-request",
+                       json={"comment": "poner la tipografía más grande"})
+    assert res.status_code == 401
+
+
+def test_change_request_empty_comment_rejected(client, admin_token, approved_job, all_r2_files_present):
+    client.post(f"/admin/deliveries/from-job/{approved_job.job_id}",
+                headers=auth(admin_token), json={})
+    items = client.get("/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN}).json()
+    delivery_id = items["songs"][0]["versions"][0]["delivery_id"]
+
+    res = client.post(
+        f"/api/deliveries/{delivery_id}/change-request",
+        headers={"X-Portal-Token": PORTAL_TOKEN},
+        json={"comment": "   "},
+    )
+    assert res.status_code == 400
+
+
+def test_change_request_submit_and_admin_lists_it(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """El pedido llega al portal, y el admin lo ve pendiente hasta resolverlo."""
+    client.post(f"/admin/deliveries/from-job/{approved_job.job_id}",
+                headers=auth(admin_token), json={})
+    items = client.get("/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN}).json()
+    delivery_id = items["songs"][0]["versions"][0]["delivery_id"]
+
+    with patch("main.emails.send_umg_change_request_notification") as mock_notify:
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": "poner la tipografía más grande"},
+        )
+        assert res.status_code == 200, res.text
+        cr_id = res.json()["id"]
+
+        # Fire-and-forget en un thread daemon — darle un instante a correr.
+        import time
+        time.sleep(0.2)
+
+    # La notificación se disparó con el contexto correcto (best-effort:
+    # nunca debe tirar la request aunque SMTP no esté configurado en test).
+    mock_notify.assert_called_once()
+    call_args = mock_notify.call_args.args
+    assert call_args[0] == "Test Artist"        # artist
+    assert call_args[2] == "poner la tipografía más grande"  # comment
+    assert call_args[3] == delivery_id          # delivery_id
+    assert call_args[4] == approved_job.job_id  # job_id
+
+    # El admin lo ve como pendiente.
+    pending = client.get("/admin/change-requests?status=pending",
+                          headers=auth(admin_token)).json()
+    assert pending["pending_count"] == 1
+    assert pending["resolved_count"] == 0
+    item = next(i for i in pending["items"] if i["id"] == cr_id)
+    assert item["comment"] == "poner la tipografía más grande"
+    assert item["delivery"]["artist"] == "Test Artist"
+    assert item["delivery"]["job_id"] == approved_job.job_id
+    assert item["resolved_at"] is None
+
+    # Resolver lo saca de "pending" y lo pasa a "resolved".
+    res = client.post(f"/admin/change-requests/{cr_id}/resolve",
+                       headers=auth(admin_token),
+                       json={"resolution_note": "re-renderizado con fuente más grande"})
+    assert res.status_code == 200
+
+    pending = client.get("/admin/change-requests?status=pending",
+                          headers=auth(admin_token)).json()
+    assert pending["pending_count"] == 0
+
+    resolved = client.get("/admin/change-requests?status=resolved",
+                           headers=auth(admin_token)).json()
+    assert resolved["resolved_count"] == 1
+    resolved_item = next(i for i in resolved["items"] if i["id"] == cr_id)
+    assert resolved_item["resolution_note"] == "re-renderizado con fuente más grande"
+
+    # Reabrir lo vuelve a poner pendiente.
+    res = client.post(f"/admin/change-requests/{cr_id}/reopen", headers=auth(admin_token))
+    assert res.status_code == 200
+    pending = client.get("/admin/change-requests?status=pending",
+                          headers=auth(admin_token)).json()
+    assert pending["pending_count"] == 1
+
+
+def test_change_request_notification_failure_does_not_break_submit(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """Si el envío de mail explota (SMTP caído, etc.) el pedido se guarda
+    igual — la notificación es best-effort, nunca debe tirar la request de
+    UMG. La excepción queda contenida en el thread daemon."""
+    client.post(f"/admin/deliveries/from-job/{approved_job.job_id}",
+                headers=auth(admin_token), json={})
+    items = client.get("/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN}).json()
+    delivery_id = items["songs"][0]["versions"][0]["delivery_id"]
+
+    with patch("main.emails.send_umg_change_request_notification",
+               side_effect=RuntimeError("smtp down")):
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": "cambiar el fondo"},
+        )
+        assert res.status_code == 200, res.text

@@ -191,6 +191,15 @@ class WarmOnlyWorker(_RQWorker):
             RQ_SUPPORTED_PAYLOAD_VERSIONS,
         )
 
+        # Import local y tolerante: el heartbeat es lo que le dice al health que
+        # este worker está vivo. Si la huella no se puede calcular, se manda
+        # vacía y el gate cae a comparar el SHA — nunca se cae el heartbeat.
+        try:
+            from observability import backend_code_fingerprint
+            _fingerprint = backend_code_fingerprint()
+        except Exception:
+            _fingerprint = ""
+
         ttl = _release_heartbeat_ttl_seconds()
         queues = [getattr(q, "name", str(q)) for q in getattr(self, "queues", [])]
         payload = {
@@ -203,6 +212,12 @@ class WarmOnlyWorker(_RQWorker):
                 or "unknown"
             ),
             "queues": queues,
+            # Huella del código de backend que este worker tiene cargado. Es lo
+            # que el gate de flota compara de verdad: el SHA de git no sirve
+            # porque los workers tienen filtros de path y saltean (bien) los
+            # commits de sólo-frontend, lo que dejaba /health en `down` con todo
+            # funcionando.
+            "code_fingerprint": _fingerprint,
             "rq_payload_version": RQ_PAYLOAD_VERSION,
             "rq_supported_payload_versions": sorted(RQ_SUPPORTED_PAYLOAD_VERSIONS),
             "environment": (

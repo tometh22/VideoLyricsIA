@@ -13,6 +13,8 @@ import DriveTransferModal from "./DriveTransferModal";
 import ScenesFilmstrip from "./ScenesFilmstrip";
 import SceneEditModal from "./SceneEditModal";
 import MediaPreview from "./MediaPreview";
+import JobSettingsCard from "./JobSettingsCard";
+import { SingleGeneratingHero } from "./BatchProgress";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -399,6 +401,8 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const youtubePublishingEnabled = currentUser?.features?.youtube_publish === true;
   const isUmgAdmin = currentUser?.role === "admin";
   const [sendingUmg, setSendingUmg] = useState(false);
+  const [umgSendStage, setUmgSendStage] = useState(null);
+  const [sendUmgAfterProres, setSendUmgAfterProres] = useState(false);
   const [isInUmgPortal, setIsInUmgPortal] = useState(
     Boolean(job.is_in_umg_portal),
   );
@@ -410,29 +414,79 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     setIsInUmgPortal(Boolean(job.is_in_umg_portal));
   }, [job.is_in_umg_portal]);
 
-  const handleSendToUMG = async () => {
+  const waitForUmgMasters = async (retryAfterSeconds = 10) => {
+    const deadline = Date.now() + (10 * 60 * 1000);
+    const retryMs = Math.max(1000, Number(retryAfterSeconds || 10) * 1000);
+    while (Date.now() < deadline) {
+      const statusResp = await fetch(`${API}/status/${job.job_id}`, {
+        headers: authHeaders(),
+      });
+      if (statusResp.ok) {
+        const updated = await statusResp.json();
+        const ready = Boolean(
+          updated.prores_ready
+          || (
+            updated.s3_keys?.umg_master
+            && updated.s3_keys?.umg_short
+          )
+        );
+        onJobUpdate?.({ ...job, ...updated });
+        if (ready) {
+          setLocalProresReady(true);
+          return;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, retryMs));
+    }
+    const timeout = new Error("UMG ProRes preparation timed out");
+    timeout.kind = "timeout";
+    throw timeout;
+  };
+
+  const publishToUMG = async () => {
     if (sendingUmg) return;
     setSendingUmg(true);
+    setUmgSendStage("publishing");
     try {
-      const resp = await fetch(`${API}/admin/deliveries/from-job/${job.job_id}`, {
-        method: "POST",
-        headers: { ...authHeaders(), "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
+      let resp;
+      let result;
+      let preparationRounds = 0;
+      do {
+        resp = await fetch(`${API}/admin/deliveries/from-job/${job.job_id}`, {
+          method: "POST",
+          headers: { ...authHeaders(), "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        result = await resp.json().catch(() => ({}));
+        if (resp.status !== 202 || result.status !== "preparing_prores") break;
+        preparationRounds += 1;
+        if (preparationRounds > 2) {
+          const timeout = new Error("UMG files still unavailable");
+          timeout.kind = "timeout";
+          throw timeout;
+        }
+        setUmgSendStage("preparing");
+        await waitForUmgMasters(result.retry_after);
+        setUmgSendStage("publishing");
+      } while (true);
       if (!resp.ok) {
-        const body = await resp.json().catch(() => ({}));
-        // 409 = files not yet in R2 (renders still cooking). 400 = not
-        // approved yet. 403 = caller isn't admin (shouldn't happen here
-        // since the button is hidden, but defensive). Surface the message
-        // straight from the backend so the operator knows what to fix.
+        const detail = result.detail;
+        if (resp.status === 409 && detail?.code === "prores_required") {
+          setSendUmgAfterProres(true);
+          setShowProResModal(true);
+          return;
+        }
         alert({
           title: "No se pudo enviar a UMG",
-          description: body.detail || "Probá de nuevo en un momento.",
+          description: (
+            typeof detail === "string"
+              ? detail
+              : detail?.message
+          ) || "Probá de nuevo en un momento.",
           tone: "error",
         });
         return;
       }
-      const result = await resp.json();
       setIsInUmgPortal(true);
       const label = result.label || "";
       const verbed = result.replaced ? "actualizado" : "publicado";
@@ -445,12 +499,24 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       console.error("Send to UMG failed:", err);
       alert({
         title: "No se pudo enviar a UMG",
-        description: "Hubo un problema de red. Revisá tu conexión y probá de nuevo.",
+        description: err?.kind === "timeout"
+          ? "La preparación ProRes está tardando más de lo esperado. Podés volver a intentar; el proceso continúa en segundo plano."
+          : "Hubo un problema de red. Revisá tu conexión y probá de nuevo.",
         tone: "error",
       });
     } finally {
       setSendingUmg(false);
+      setUmgSendStage(null);
     }
+  };
+
+  const handleSendToUMG = () => {
+    if (!job.umg_spec) {
+      setSendUmgAfterProres(true);
+      setShowProResModal(true);
+      return;
+    }
+    publishToUMG();
   };
   // Dropdown for HD/2K/4K selection on retry. Only shown when the job
   // has a meaningful umg_spec to override (i.e. went through the UMG
@@ -647,6 +713,20 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       || job.prores_ready
     )
   );
+  useEffect(() => {
+    setLocalProresReady(Boolean(
+      job.prores_ready
+      || (
+        job.s3_keys?.umg_master
+        && job.s3_keys?.umg_short
+      )
+    ));
+  }, [
+    job.job_id,
+    job.prores_ready,
+    job.s3_keys?.umg_master,
+    job.s3_keys?.umg_short,
+  ]);
   const [proResHint, setProResHint] = useState(null);
   const [showProResModal, setShowProResModal] = useState(false);
   const [proResToast, setProResToast] = useState(null);
@@ -994,6 +1074,34 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               {t("detail.transcription_failed_cta") || "Subir de nuevo"}
             </a>
           </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Initial render / variant render in progress. The detail route already
+  // polls /status above, so show those real pipeline fields instead of
+  // discarding them in the generic "not available" fallback. This is the
+  // same honest-progress panel used immediately after a normal generation.
+  if (isActivelyProcessing) {
+    const progressPct = typeof job.progress === "number"
+      ? Math.max(5, job.progress)
+      : 5;
+    return (
+      <div className="w-full max-w-2xl animate-fade-in">
+        <SingleGeneratingHero
+          jobName={(job.song_title || name).trim()}
+          artist={(job.artist || "").trim()}
+          progressPct={progressPct}
+          currentStep={job.current_step}
+          stepTextEs={job.step_text_es}
+          etaS={typeof job.eta_s === "number" ? job.eta_s : null}
+          t={t}
+        />
+        <div className="mt-6 text-center">
+          <button onClick={onBack} className="btn-secondary">
+            {t("detail.back")}
+          </button>
         </div>
       </div>
     );
@@ -1427,7 +1535,12 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const isUmgJob =
     job.delivery_profile === "umg"
     || job.delivery_profile === "both"
-    || !!job.umg_spec;
+    || !!job.umg_spec
+    || !!job.prores_ready
+    || Boolean(
+      job.s3_keys?.umg_master
+      || job.s3_keys?.umg_short
+    );
   const isJobDone = job.status === "done";
   const hasUmgMaster = isUmgJob && isJobDone;
 
@@ -1592,8 +1705,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                   >
                     {isInUmgPortal
                       ? (t("detail.in_umg_portal") || "✓ En UMG")
-                      : sendingUmg
-                        ? (t("detail.sending_umg") || "Enviando…")
+                      : umgSendStage === "preparing"
+                        ? "Preparando masters…"
+                        : sendingUmg
+                          ? (t("detail.sending_umg") || "Enviando…")
                         : (t("detail.send_umg") || "Enviar a UMG")}
                   </button>
                 )}
@@ -1717,6 +1832,20 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
               {t("detail.upload_again") || "Subir nuevo archivo"}
             </button>
           </div>
+        </div>
+      )}
+
+      {/* Ficha de ajustes: con QUÉ se hizo este video. Hasta ahora el operador
+          no tenía forma de verlo — en el reclamo que originó esto regeneró el
+          fondo 7 veces sin poder ver que el job tenía guardado
+          movement_style="animado". Colapsada por defecto: es diagnóstico, no la
+          acción principal. */}
+      {!isArtTrack && (
+        <div className="mb-4">
+          <JobSettingsCard
+            renderParams={job.render_params}
+            provenanceHref={() => setActiveTab("provenance")}
+          />
         </div>
       )}
 
@@ -1951,7 +2080,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           </div>
           <button
             type="button"
-            onClick={() => setShowProResModal(true)}
+            onClick={() => {
+              setSendUmgAfterProres(false);
+              setShowProResModal(true);
+            }}
             className="shrink-0 px-4 py-2 rounded-md text-sm font-medium text-white bg-brand hover:bg-brand-strong ring-1 ring-brand/30 transition-colors"
           >
             {t("prores.cta_button") || "Exportar"}
@@ -1962,9 +2094,14 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       {showProResModal && (
         <EnableProResModal
           jobId={job.job_id}
-          onClose={() => setShowProResModal(false)}
-          onSuccess={(data) => {
+          onClose={() => {
             setShowProResModal(false);
+            setSendUmgAfterProres(false);
+          }}
+          onSuccess={(data) => {
+            const shouldContinueToUmg = sendUmgAfterProres;
+            setShowProResModal(false);
+            setSendUmgAfterProres(false);
             setProResToast(
               t("prores.queued_toast") ||
                 "ProRes encolado. En 1-5 min va a estar disponible para descargar.",
@@ -1973,6 +2110,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             // isUmgJob flipee a true (gracias al umg_spec recién
             // persistido) y aparezca el tab de Máster ProRes.
             onJobUpdate?.({ ...job, umg_spec: data.umg_spec });
+            if (shouldContinueToUmg) {
+              publishToUMG();
+            }
           }}
         />
       )}

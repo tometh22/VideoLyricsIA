@@ -94,7 +94,7 @@ from database import (
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
-from pipeline import run_pipeline, transcribe
+from pipeline import run_pipeline, transcribe, _normalize_movement_style
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
 from billing import router as billing_router
@@ -8210,6 +8210,10 @@ def status(
         # Frontend uses delivery_profile to decide whether to show the
         # UMG master download tab in JobDetail.
         "delivery_profile": job.get("delivery_profile", "youtube"),
+        # Retroactive ProRes keeps delivery_profile="youtube" as historical
+        # provenance. The persisted spec is therefore required to restore
+        # the ProRes/send-to-UMG UI correctly after a reload.
+        "umg_spec": job.get("umg_spec"),
         # ProRes readiness — drives the badge in JobDetail. Must be
         # included here so the badge reflects server state when the
         # user opens a job that already had ProRes generated.
@@ -8780,7 +8784,7 @@ async def download(
             # Kick off a prewarm in the background, then 202.
             try:
                 from queue_jobs import enqueue_prores_prewarm, SubmissionsPausedError
-                enqueue_prores_prewarm(job_id, file_type)
+                enqueue_prores_prewarm(job_id, file_type, force=True)
             except SubmissionsPausedError as exc:
                 from ops_control import get_submissions_state
                 state = get_submissions_state()
@@ -9346,16 +9350,24 @@ async def approve_job(
     from database import Job as JobModel, AuditLog
     from datetime import datetime, timezone
 
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    job_query = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        job_query = job_query.filter(
+            JobModel.tenant_id == current_user["tenant_id"],
+        )
+    job = job_query.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "pending_review":
         raise HTTPException(status_code=400, detail="Job is not pending review")
+
+    is_cross_tenant_admin = (
+        current_user.get("role") == "admin"
+        and job.tenant_id != current_user.get("tenant_id")
+    )
+    _audit_cross_tenant_access(
+        db, current_user, job, "approve_job", commit=False,
+    )
 
     job.status = "done"
     job.approved_by = current_user["id"]
@@ -9378,7 +9390,11 @@ async def approve_job(
         user_id=current_user["id"],
         action="job.approve",
         detail={"job_id": job_id, "notes": body.notes,
-                "archived_failed_attempts": _archived_n},
+                "archived_failed_attempts": _archived_n,
+                "tenant_id": job.tenant_id,
+                "owner_user_id": job.user_id,
+                "actor_tenant_id": current_user.get("tenant_id"),
+                "cross_tenant_admin": is_cross_tenant_admin},
     ))
     db.commit()
 
@@ -9388,7 +9404,12 @@ async def approve_job(
     # bypasses the cache and reads the live counter.
     try:
         from cache import invalidate, usage_key
-        invalidate(usage_key(current_user["tenant_id"], current_user["id"]))
+        usage_owners = {
+            (job.tenant_id, job.user_id),
+            (current_user["tenant_id"], current_user["id"]),
+        }
+        for tenant_id, user_id in usage_owners:
+            invalidate(usage_key(tenant_id, user_id))
     except Exception:
         pass
 
@@ -9406,16 +9427,24 @@ async def reject_job(
     from database import Job as JobModel, AuditLog
     from datetime import datetime, timezone
 
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    job_query = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        job_query = job_query.filter(
+            JobModel.tenant_id == current_user["tenant_id"],
+        )
+    job = job_query.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "pending_review":
         raise HTTPException(status_code=400, detail="Job is not pending review")
+
+    is_cross_tenant_admin = (
+        current_user.get("role") == "admin"
+        and job.tenant_id != current_user.get("tenant_id")
+    )
+    _audit_cross_tenant_access(
+        db, current_user, job, "reject_job", commit=False,
+    )
 
     job.status = "rejected"
     job.approved_by = current_user["id"]
@@ -9425,9 +9454,24 @@ async def reject_job(
     db.add(AuditLog(
         user_id=current_user["id"],
         action="job.reject",
-        detail={"job_id": job_id, "notes": body.notes},
+        detail={"job_id": job_id, "notes": body.notes,
+                "tenant_id": job.tenant_id,
+                "owner_user_id": job.user_id,
+                "actor_tenant_id": current_user.get("tenant_id"),
+                "cross_tenant_admin": is_cross_tenant_admin},
     ))
     db.commit()
+
+    try:
+        from cache import invalidate, usage_key
+        usage_owners = {
+            (job.tenant_id, job.user_id),
+            (current_user["tenant_id"], current_user["id"]),
+        }
+        for tenant_id, user_id in usage_owners:
+            invalidate(usage_key(tenant_id, user_id))
+    except Exception:
+        pass
 
     return {"ok": True, "status": "rejected", "job_id": job_id}
 
@@ -10339,6 +10383,29 @@ async def request_edit(
     from database import Job as JobModel, AuditLog
     from pipeline import _MAX_EDITS
 
+    # Fast-path para pestañas/clientes que reenvían el CTA mientras el primer
+    # edit ya está corriendo. El SELECT MVCC no espera el row-lock corto de los
+    # updates de progreso del worker, a diferencia del FOR UPDATE de abajo:
+    # en el incidente 83f95d0e2679 dos duplicados tardaron 35 s y 120 s para
+    # recién entonces devolver un 400 genérico. El gate se repite después del
+    # lock para cubrir la carrera entre este probe y el commit del primer POST.
+    _probe_q = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        _probe_q = _probe_q.filter(JobModel.tenant_id == current_user["tenant_id"])
+    _probe = _probe_q.first()
+    if not _probe:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if _probe.status == "editing":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "edit_in_progress",
+                "message": "An edit is already being rendered for this video.",
+                "current_step": _probe.current_step,
+                "progress": _probe.progress,
+            },
+        )
+
     # with_for_update() toma row-level lock en Postgres para serializar
     # el read-validate-write de edit_count. Sin esto, dos POST /edit del
     # mismo job en rápida sucesión leen el mismo edit_count, ambos pasan
@@ -10358,6 +10425,16 @@ async def request_edit(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     _audit_cross_tenant_access(db, current_user, job, "edit", commit=False)
+    if job.status == "editing":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "edit_in_progress",
+                "message": "An edit is already being rendered for this video.",
+                "current_step": job.current_step,
+                "progress": job.progress,
+            },
+        )
     valid_edit_types = ("typography", "background", "background_library", "lyrics", "metadata")
     if body.edit_type not in valid_edit_types:
         raise HTTPException(
@@ -10732,7 +10809,12 @@ async def request_edit(
         # Forward for this render AND persist to durable render_params — same
         # reaped-retry durability rationale as background_hint above, and so
         # a subsequent "Regenerar fondo" pre-fills the operator's last choice.
-        _mv = (body.movement_style or "").strip()
+        # NORMALIZADO al persistir (misma nota que en pipeline al escribir
+        # render_params): la invariante es que render_params.movement_style
+        # SIEMPRE sea un código canónico o "". El pipeline normaliza igual al
+        # renderizar, así que esto no cambia ningún render — deja de guardar
+        # algo que después cada lector tiene que interpretar por su cuenta.
+        _mv = _normalize_movement_style((body.movement_style or "").strip())
         edit_params["movement_style"] = _mv
         _rp_mv = dict(job.render_params or {})
         _rp_mv["movement_style"] = _mv
@@ -11214,12 +11296,12 @@ async def enable_prores_for_job(
             detail="Broadcast (ProRes) delivery is not enabled for your account.",
         )
 
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    job_query = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        job_query = job_query.filter(
+            JobModel.tenant_id == current_user["tenant_id"]
+        )
+    job = job_query.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "done":
@@ -11239,6 +11321,9 @@ async def enable_prores_for_job(
     )
 
     job.umg_spec = umg_spec
+    _audit_cross_tenant_access(
+        db, current_user, job, "enable_prores", commit=False,
+    )
     db.add(AuditLog(
         user_id=current_user["id"],
         action="job.enable_prores",
@@ -11867,20 +11952,52 @@ async def create_variant(
     El padre debe estar en status='done'. La variante arranca en 'processing'
     y va por el pipeline normal saltando Whisper (segments_override).
 
-    400 si padre no done. 402 si el plan está sin capacidad. 403 si el
-    padre no es del tenant del user. 404 si el padre no existe.
+    400 si padre no done. 402 si el plan está sin capacidad. 404 si el
+    padre no existe o pertenece a otro tenant. Los admins de plataforma
+    pueden crear la variante cross-tenant, igual que pueden abrir y editar
+    el video; en ese caso el job nuevo queda en el tenant y bajo el owner
+    del padre, no bajo la cuenta interna del admin.
     """
     import uuid
     from database import Job as JobModel, AuditLog
 
-    parent = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == parent_job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    # Mismo scope que GET /status y POST /edit: un admin de plataforma
+    # puede operar sobre cualquier tenant; un usuario común sólo sobre el
+    # suyo. Antes /status cargaba el padre cross-tenant y montaba todo el
+    # wizard, pero este query volvía a exigir el tenant del admin y el
+    # submit terminaba en un falso 404 "Parent job not found".
+    _parent_q = db.query(JobModel).filter(JobModel.job_id == parent_job_id)
+    if current_user.get("role") != "admin":
+        _parent_q = _parent_q.filter(
+            JobModel.tenant_id == current_user["tenant_id"]
+        )
+    parent = _parent_q.first()
     if not parent:
         raise HTTPException(status_code=404, detail="Parent job not found")
+
+    _is_cross_tenant_admin = (
+        current_user.get("role") == "admin"
+        and parent.tenant_id != current_user.get("tenant_id")
+    )
+    # Un admin cross-tenant actúa EN NOMBRE del owner original: la variante
+    # debe aparecer en el historial del cliente y consumir su plan/cupo.
+    # Para usuarios comunes (incluidos teammates del mismo tenant) se
+    # conserva el contrato previo: el creador actual es el owner del job.
+    variant_tenant_id = parent.tenant_id
+    variant_user_id = (
+        parent.user_id if _is_cross_tenant_admin else current_user["id"]
+    )
+    billing_user = db.query(User).filter(User.id == variant_user_id).first()
+    if billing_user is None:
+        # Job.user_id tiene FK y esto no debería ocurrir; fallar explícito
+        # evita crear un job sin dueño o facturarlo al admin por accidente.
+        raise HTTPException(
+            status_code=409,
+            detail="No se pudo resolver el owner del video original.",
+        )
+    _audit_cross_tenant_access(
+        db, current_user, parent, "create_variant", commit=False,
+    )
     if parent.status != "done":
         raise HTTPException(
             status_code=400,
@@ -11928,17 +12045,21 @@ async def create_variant(
 
     # Plan capacity check — misma lógica que /generate. Variante cuenta
     # como 1 video del plan.
-    plan = current_user.get("plan", "100")
-    usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], plan,
-                                billing_group=current_user.get("billing_group"))
+    plan = billing_user.plan_id or "100"
+    usage_info = get_plan_usage(
+        db,
+        variant_user_id,
+        variant_tenant_id,
+        plan,
+        billing_group=billing_user.billing_group,
+    )
     if usage_info["alert_100"] and plan == "free":
         raise HTTPException(
             status_code=429,
             detail="Free plan limit reached. Upgrade to continue.",
         )
     # Para planes pagos, allow_overage decide si se permite pasarse del cap.
-    user_model = db.query(User).filter(User.id == current_user["id"]).first()
-    if usage_info.get("alert_100") and not (user_model and user_model.allow_overage):
+    if usage_info.get("alert_100") and not billing_user.allow_overage:
         raise HTTPException(
             status_code=402,
             detail=f"Llegaste al límite de tu plan ({usage_info.get('limit', '?')} canciones). "
@@ -11973,7 +12094,7 @@ async def create_variant(
     )
     existing_renders = (
         db.query(JobModel)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .filter(JobModel.tenant_id == variant_tenant_id)
         .filter(_sql_func.lower(_sql_func.trim(JobModel.artist)) == _song_artist)
         .filter(
             _sql_func.lower(
@@ -12026,7 +12147,7 @@ async def create_variant(
             action="variant.overage_charge",
             detail={
                 "parent_job_id": parent_job_id,
-                "tenant_id": current_user["tenant_id"],
+                "tenant_id": variant_tenant_id,
                 "artist": parent.artist,
                 "song_title": parent.song_title,
                 "existing_renders_before_this_one": existing_renders,
@@ -12066,6 +12187,10 @@ async def create_variant(
             continue
         if isinstance(_value, str):
             _value = _value.strip()
+        # Misma invariante que en /edit y en el create: movement_style se
+        # persiste CANÓNICO, nunca crudo.
+        if _field == "movement_style":
+            _value = _normalize_movement_style(_value or "")
         new_render_params[_field] = _value
         _overridden_fields.append(_field)
     new_render_params = _merge_content_validation_choice(
@@ -12111,7 +12236,7 @@ async def create_variant(
         src_filename = _os_mod.path.basename(src_key) if src_key else ""
         if src_key and src_filename and _storage_mod.is_enabled():
             candidate_dst = _storage_mod._input_object_key(
-                current_user["tenant_id"], new_job_id, src_filename
+                variant_tenant_id, new_job_id, src_filename
             )
             if _storage_mod.copy_object(src_key, candidate_dst):
                 variant_input_r2_key = candidate_dst
@@ -12149,6 +12274,12 @@ async def create_variant(
     if body.background_id:
         _variant_job_dir = os.path.join(OUTPUTS_DIR, new_job_id)
         os.makedirs(_variant_job_dir, exist_ok=True)
+        # El admin conserva su identidad como actor, pero el uso del asset
+        # se registra contra el tenant destino, que es quien recibe el job.
+        _variant_asset_user = {
+            **current_user,
+            "tenant_id": variant_tenant_id,
+        }
         (
             variant_bg_path,
             variant_bg_r2_key,
@@ -12158,7 +12289,7 @@ async def create_variant(
         ) = _resolve_library_background(
             body.background_id,
             body.background_mode or "as_is",
-            current_user,
+            _variant_asset_user,
             db,
             _variant_job_dir,
             new_job_id,
@@ -12166,8 +12297,8 @@ async def create_variant(
 
     new_job = JobModel(
         job_id=new_job_id,
-        user_id=current_user["id"],
-        tenant_id=current_user["tenant_id"],
+        user_id=variant_user_id,
+        tenant_id=variant_tenant_id,
         artist=parent.artist,
         song_title=parent.song_title,
         style=new_style,
@@ -12202,13 +12333,15 @@ async def create_variant(
             "variant_owns_input": variant_owns_input,
             "bypass_content_validation": bool(body.bypass_content_validation),
             "force_content_validation": bool(body.force_content_validation),
-            "tenant_id": current_user.get("tenant_id"),
+            "tenant_id": variant_tenant_id,
+            "actor_tenant_id": current_user.get("tenant_id"),
+            "cross_tenant_admin": _is_cross_tenant_admin,
         },
     ))
     db.commit()
     logger.info(
         "[VARIANT] created job=%s parent=%s tenant=%s bypass=%s force=%s",
-        new_job_id, parent.job_id, current_user.get("tenant_id"),
+        new_job_id, parent.job_id, variant_tenant_id,
         bool(body.bypass_content_validation), bool(body.force_content_validation),
     )
 
@@ -12262,7 +12395,7 @@ async def create_variant(
         artist=parent.artist,
         style=new_style,
         plan=plan,
-        tenant_id=current_user.get("tenant_id", ""),
+        tenant_id=variant_tenant_id,
         # Biblioteca de fondos: mismo shape que /generate. Cuando hay
         # background_path/bg_r2_key el pipeline saltea la generación IA;
         # en modo "variation" van los variation_source_* y Veo deriva un
@@ -12763,18 +12896,75 @@ async def admin_create_delivery_from_job(
             detail="Job must be approved (status=done) before it can be published",
         )
 
-    # Validate all 5 files exist in R2. If even one is missing we refuse
-    # to create the Delivery — a half-empty portal entry is worse than
-    # asking the operator to wait for the render to finish.
+    # Validate all 5 files exist in R2. The three render outputs are hard
+    # requirements. ProRes is different: it is a lazy derivative and its
+    # post-render prewarm is deliberately best-effort, so an explicit
+    # "Enviar a UMG" must recover by force-enqueueing missing masters.
     missing = []
     for ft in _DEFAULT_DELIVERY_FILE_TYPES:
         key = _r2_key_for_delivery(job.tenant_id, job.job_id, ft)
         if not storage.object_exists(key):
             missing.append(ft)
     if missing:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Files not yet in R2: {', '.join(missing)}. Wait for the render to finish.",
+        missing_prores = [
+            ft for ft in missing if ft in ("umg_master", "umg_short")
+        ]
+        missing_render_outputs = [
+            ft for ft in missing if ft not in ("umg_master", "umg_short")
+        ]
+        if missing_render_outputs:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Files not yet in R2: "
+                    f"{', '.join(missing_render_outputs)}. "
+                    "Wait for the render to finish."
+                ),
+            )
+        if missing_prores and not job.umg_spec:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "prores_required",
+                    "message": (
+                        "Este video fue generado sólo para YouTube. "
+                        "Elegí la configuración ProRes para preparar los "
+                        "masters antes de enviarlo a UMG."
+                    ),
+                    "missing": missing_prores,
+                },
+            )
+        enqueued = []
+        try:
+            for file_type in missing_prores:
+                rq_id = enqueue_prores_prewarm(
+                    job_id, file_type, force=True,
+                )
+                if rq_id:
+                    enqueued.append(file_type)
+        except Exception as exc:
+            logger.warning(
+                "[DELIVERY] could not prepare ProRes for %s: %s",
+                job_id, exc,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "No se pudo iniciar la preparación ProRes. "
+                    "Probá de nuevo en un momento."
+                ),
+            ) from exc
+        return JSONResponse(
+            status_code=202,
+            content={
+                "ok": False,
+                "status": "preparing_prores",
+                "job_id": job_id,
+                "missing": missing_prores,
+                "enqueued": enqueued,
+                "retry_after": 10,
+            },
+            headers={"Retry-After": "10"},
         )
 
     # Compute label. If caller passed one, honor it. Otherwise: first
@@ -12979,6 +13169,25 @@ async def portal_submit_change_request(
         },
     ))
     db.commit()
+
+    # Notificación en tiempo real (Paso "Cambios de UMG" — el panel del admin
+    # exige entrar a mirarlo; esto llega a la bandeja apenas UMG manda el
+    # pedido, sin esperar a que alguien abra Operación). emails._send_email ya
+    # contiene sus propios fallos de SMTP, pero el thread target igual se
+    # envuelve acá (mismo criterio que billing._send_email_async) para que
+    # NINGÚN error de este código best-effort — ni siquiera uno futuro por
+    # fuera de emails.py — se filtre como excepción no manejada del thread.
+    def _notify_umg_change_request():
+        try:
+            emails.send_umg_change_request_notification(
+                delivery.artist_snapshot, delivery.song_title_snapshot,
+                comment, delivery_id, delivery.job_id,
+            )
+        except Exception:
+            logger.warning("[CR] notificación de cambio UMG falló", exc_info=True)
+
+    threading.Thread(target=_notify_umg_change_request, daemon=True).start()
+
     return {"ok": True, "id": cr.id, "submitted_at": cr.submitted_at.isoformat()}
 
 

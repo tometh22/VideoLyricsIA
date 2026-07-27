@@ -374,6 +374,93 @@ def test_cannot_create_variant_of_other_tenant_job(client, db, monkeypatch):
     assert r.status_code == 404
 
 
+def test_admin_can_create_cross_tenant_variant_for_parent_owner(
+    client, admin_token, db, monkeypatch,
+):
+    """El admin que puede abrir un job ajeno también puede crear su variante.
+
+    La variante queda en el tenant y bajo el owner del padre, consume el plan
+    de esa cuenta y deja auditado al admin como actor. Regresión del incidente
+    donde GET /status funcionaba cross-tenant pero POST /variant respondía
+    404 "Parent job not found".
+    """
+    username = f"variant_owner_{uuid.uuid4().hex[:6]}"
+    registered = client.post("/auth/register", json={
+        "username": username,
+        "password": "testpass12345",
+        "email": f"{username}@test.com",
+    })
+    assert registered.status_code == 200, registered.text
+    owner = _decode_user(client, registered.json()["token"])
+    parent_id = _seed_done_job(
+        db,
+        owner_id=owner["id"],
+        tenant_id=owner["tenant_id"],
+        input_r2_key="inputs/foreign-owner/track.wav",
+    )
+
+    captured = {}
+    monkeypatch.setattr(
+        "main.enqueue_pipeline",
+        lambda **kw: captured.update(kw) or "fake_rq_id",
+    )
+
+    new_job_id = None
+    try:
+        response = client.post(
+            f"/jobs/{parent_id}/variant",
+            json={"background_hint": "otra dirección visual"},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert response.status_code == 200, response.text
+        new_job_id = response.json()["job_id"]
+
+        db.expire_all()
+        new_job = db.query(Job).filter(Job.job_id == new_job_id).first()
+        assert new_job is not None
+        assert new_job.parent_job_id == parent_id
+        assert new_job.tenant_id == owner["tenant_id"]
+        assert new_job.user_id == owner["id"]
+        assert captured["tenant_id"] == owner["tenant_id"]
+        assert captured["plan"] == owner["plan"]
+
+        created_log = (
+            db.query(AuditLog)
+            .filter(AuditLog.action == "job.variant_created")
+            .order_by(AuditLog.id.desc())
+            .first()
+        )
+        assert created_log.detail["new_job_id"] == new_job_id
+        assert created_log.detail["tenant_id"] == owner["tenant_id"]
+        assert created_log.detail["cross_tenant_admin"] is True
+
+        cross_tenant_log = (
+            db.query(AuditLog)
+            .filter(AuditLog.action == "admin.cross_tenant_access")
+            .order_by(AuditLog.id.desc())
+            .first()
+        )
+        assert cross_tenant_log is not None
+        assert cross_tenant_log.detail["job_id"] == parent_id
+        assert cross_tenant_log.detail["job_tenant"] == owner["tenant_id"]
+        assert cross_tenant_log.detail["kind"] == "create_variant"
+    finally:
+        if new_job_id:
+            db.query(Job).filter(Job.job_id == new_job_id).delete(
+                synchronize_session=False,
+            )
+        db.query(Job).filter(Job.job_id == parent_id).delete(
+            synchronize_session=False,
+        )
+        db.query(AuditLog).filter(
+            AuditLog.action.in_([
+                "job.variant_created",
+                "admin.cross_tenant_access",
+            ])
+        ).delete(synchronize_session=False)
+        db.commit()
+
+
 # ───────────────────────────────────────────────────────────────────
 # Variant cap (PR feat/variant-cap, 2026-05-29)
 # Each plan includes 3 renders of the same song (original + 2 variants).

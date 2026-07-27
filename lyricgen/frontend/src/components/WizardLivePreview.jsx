@@ -3,6 +3,7 @@ import { useI18n } from "../i18n";
 import { REF_W, lyricFontPx } from "../lib/lyricTiers";
 import { activeWordIndex } from "../lib/karaokeTiming";
 import { FONT_BY_CODE, applyCase } from "./fontCatalog";
+import { MOVEMENT_LABELS, EFFECT_LABELS } from "../lib/optionLabels";
 
 // Studio Console live preview. Shows a sample lyric line over the selected
 // palette/mood with the selected camera movement applied as a real CSS
@@ -251,21 +252,14 @@ export default function WizardLivePreview({
     : sample;
   const baseFontSize = `${((lyricFontPx(_dispText.length, fontScale, font) / REF_W) * 100).toFixed(3)}cqw`;
   const contrastStyle = CONTRAST_STYLES[textContrast] || CONTRAST_STYLES.medium;
-  const moveLabel = {
-    "": t("upload.movement_auto") || "Auto",
-    estatico: t("upload.movement_estatico") || "Estático",
-    sutil: t("upload.movement_sutil") || "Sutil",
-    estandar: t("upload.movement_estandar") || "Estándar",
-    "foto-parallax": t("upload.movement_foto_parallax") || "Parallax",
-    animado: t("upload.movement_animado") || "Animado",
-  }[movementStyle] || (t("upload.movement_auto") || "Auto");
-  const effectLabel = {
-    snow: t("upload.effect_snow") || "Nieve",
-    rain: t("upload.effect_rain") || "Lluvia",
-    stars: t("upload.effect_stars") || "Estrellas",
-    bokeh: t("upload.effect_bokeh") || "Bokeh",
-    light: t("upload.effect_light") || "Luz",
-  }[effect] || "";
+  // Etiquetas desde lib/optionLabels. Eran una copia local de los mismos
+  // strings, y sus fallbacks DIVERGÍAN de los del picker: "Parallax" vs "Foto
+  // fija", "Estándar" vs "Cinematográfico", "Luz" vs "Luces". Tres copias del
+  // mismo string es cómo una opción termina llamándose distinto en dos
+  // pantallas del mismo flujo.
+  const _moveLabels = MOVEMENT_LABELS(t);
+  const moveLabel = _moveLabels[movementStyle] ?? _moveLabels[""];
+  const effectLabel = effect ? (EFFECT_LABELS(t)[effect] || "") : "";
   const modeLabel = {
     auto: t("upload.mode_auto") || "Auto",
     lyrics: t("upload.inspired_by_lyrics_label") || "Inspirado en la letra",
@@ -539,6 +533,16 @@ export default function WizardLivePreview({
               snow: "brightness(1.15)",
               rain: "brightness(1.1)",
               light: "brightness(1.1)",
+              aurora: "brightness(1.2) saturate(1.15)",
+              dust: "brightness(1.25) contrast(1.1)",
+              embers: "brightness(1.3) saturate(1.2)",
+              petals: "brightness(1.15) saturate(1.1)",
+              prism: "brightness(1.2) saturate(1.25)",
+              confetti: "brightness(1.1) saturate(1.2)",
+              film: "brightness(1.2) contrast(1.15) sepia(0.12)",
+              scanlines: "brightness(1.25) saturate(1.2)",
+              fog: "brightness(1.25)",
+              shapes: "brightness(1.2) saturate(1.15)",
             }[effect] || "none",
           }}
           autoPlay loop muted playsInline

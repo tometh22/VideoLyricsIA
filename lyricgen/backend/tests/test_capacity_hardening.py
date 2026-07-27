@@ -210,6 +210,28 @@ def test_prewarm_returns_none_when_disabled(monkeypatch):
     assert queue_jobs.enqueue_prores_prewarm("xx", "umg_master") is None
 
 
+def test_explicit_prores_action_bypasses_optional_prewarm_limits(monkeypatch):
+    """Un click del usuario no puede quedar en polling eterno por el flag o
+    el backpressure que sólo regulan el prewarm oportunista."""
+    import queue_jobs
+
+    fake_q_enterprise = MagicMock()
+    fake_q_enterprise.count = 99
+    fake_q_enterprise.enqueue.return_value.id = "rq-explicit"
+    monkeypatch.setattr(queue_jobs, "PRORES_PREWARM_ENABLED", False)
+    monkeypatch.setattr(
+        queue_jobs, "_init_redis",
+        lambda: (object(), object(), fake_q_enterprise),
+    )
+
+    result = queue_jobs.enqueue_prores_prewarm(
+        "explicit", "umg_master", force=True,
+    )
+
+    assert result == "rq-explicit"
+    fake_q_enterprise.enqueue.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # P5 — disk capacity gate on /upload
 # ---------------------------------------------------------------------------
