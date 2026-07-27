@@ -15563,7 +15563,7 @@ def generate_short(
     fx = _fx.effect_path(effect)
     if fx:
         _short_rhythm = _fx.rhythm_for_window(
-            _fx.detect_effect_rhythm(effect, mp3_path), start, win
+            _fx.detect_effect_rhythm(effect, mp3_path), start_time, short_dur
         )
         out_path = _apply_short_effect(
             out_path, fx, fps, job_dir,

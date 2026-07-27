@@ -246,7 +246,6 @@ export default function WizardLivePreview({
 
   const renderBaseMedia = (key, className = "", styleOverride = {}) => {
     const common = {
-      key,
       src: baseClip,
       className: `absolute inset-0 w-full h-full object-cover ${className}`,
       style: {
@@ -257,9 +256,9 @@ export default function WizardLivePreview({
       },
     };
     return clipIsVideo ? (
-      <video {...common} autoPlay loop muted playsInline />
+      <video key={key} {...common} autoPlay loop muted playsInline />
     ) : (
-      <img {...common} alt="" draggable={false} />
+      <img key={key} {...common} alt="" draggable={false} />
     );
   };
 
