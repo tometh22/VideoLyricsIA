@@ -14,21 +14,21 @@ export default {
         // `text-brand`, `border-brand`, `ring-brand` utilities keep
         // working everywhere they are referenced (~80 sites).
         brand: {
-          DEFAULT: "#6D4AFF",
-          light:   "#8E70FF",
-          dark:    "#5739DD",
-          50:      "#F0EBFF",
+          DEFAULT: "#7557FF",
+          light:   "#8B5CF6",
+          dark:    "#4F7CFF",
+          50:      "#F0EDFF",
         },
         // §3 Teal accent — max 10% usage rule documented separately.
         // Use only for active states, selected tabs, render progress,
         // and the logo micro accent.
         accent: {
-          DEFAULT: "#14C8A8",
-          light:   "#33D9BD",
-          dark:    "#0FA88B",
+          DEFAULT: "#20D4E8",
+          light:   "#66E5F0",
+          dark:    "#14AFC0",
         },
         teal: {
-          DEFAULT: "#14C8A8",
+          DEFAULT: "#20D4E8",
         },
         // §3 Background trio — primary / surface / elevated.
         // surface.DEFAULT remains bg-primary for back-compat with the
@@ -36,15 +36,15 @@ export default {
         // surface / elevated levels (intermediate steps for cards on
         // glass effects).
         surface: {
-          DEFAULT: "#09090F", // bg-primary per spec
-          1:       "#12121A", // bg-surface
-          2:       "#181821", // bg-elevated
-          3:       "#222230", // one step above for hover/popovers
+          DEFAULT: "#080910",
+          1:       "#10121B",
+          2:       "#151824",
+          3:       "#1A1E2B",
         },
         // §3 Text and border tokens.
         ink: {
-          primary:   "#F5F7FA",
-          secondary: "#A0A3B1",
+          primary:   "#F7F8FC",
+          secondary: "#A7ABBA",
         },
       },
       // §4 Typography — Inter (already preloaded in index.css).
@@ -63,14 +63,21 @@ export default {
         body: ["19px", { lineHeight: "1.6" }],
         // Small UI: 14-15px (default 14).
         ui:   ["14px", { lineHeight: "1.45" }],
+        // UI specialist 2026-05-24: tokens semánticos para reemplazar los
+        // arbitrary `text-[10px]`/`text-[11px]`/`text-[12px]` esparcidos
+        // (172+ matches). Usar SIEMPRE estos tokens en componentes nuevos;
+        // los arbitrary se irán migrando.
+        caption: ["12px", { lineHeight: "1.4" }],
+        label:   ["11px", { lineHeight: "1.4", fontWeight: "500" }],
+        section: ["10px", { lineHeight: "1.3", fontWeight: "600", letterSpacing: "0.18em" }],
       },
       // §8 Cards — border-radius 24px → rounded-card. We add a token
       // rather than redefining `rounded-2xl` (Tailwind default = 16px)
       // so tighter inner pills keep their 16px where appropriate.
       // §7 Primary button radius: 16px → rounded-button.
       borderRadius: {
-        card:   "24px",
-        button: "16px",
+        card:   "18px",
+        button: "12px",
       },
       // §9 Motion — 200-300ms duration with a custom ease.
       transitionDuration: {

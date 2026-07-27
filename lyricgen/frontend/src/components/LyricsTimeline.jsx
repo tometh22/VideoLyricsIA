@@ -1,0 +1,746 @@
+/**
+ * Visual per-line timings editor (Rotor-style "Timings" tab), rendered as a
+ * VIEW of the shared LyricsEditor — same `edited` state, no new data model.
+ *
+ * VERTICAL orientation: time flows top → bottom (matches the list view's
+ * mental model and Rotor's actual Timings tab). Each lyric line is a
+ * full-width block. The operator drags:
+ *   - the TOP edge    → move START (when the line enters)
+ *   - the BOTTOM edge → set END independently (when it leaves — the gap the
+ *                       list view can't do)
+ *   - the body        → move the whole block, preserving duration
+ * A horizontal playhead tracks audio currentTime; clicking the lane seeks to
+ * that exact time. Any drag marks the line `locked` so
+ * pipeline._apply_display_timing respects the manual end (no auto-extend).
+ *
+ * All edits go up through the parent's setEdited → existing autosave /
+ * onEditedChange / onApprove. This component owns NO persistence.
+ */
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useI18n } from "../i18n";
+
+// Zoom = px per second (vertical). The former 16 px/s default compressed
+// 30–40 seconds into the first viewport, making handles and short lines hard
+// to distinguish until the operator clicked + several times. 32 px/s opens
+// at a useful editing scale while the − control still provides an overview.
+const ZOOM_DEFAULT = 32;
+const ZOOM_MIN = 8;
+const ZOOM_MAX = 60;
+const ZOOM_STEP = 8;
+const EDGE_PX = 10;            // height of the top/bottom grab handles
+const MIN_DUR_S = 0.3;         // shortest readable on-screen window
+const MIN_BLOCK_PX = 22;       // floor so short lines stay grabbable at any zoom
+// 2026-05-25 — click-vs-drag threshold ahora se mide en TIEMPO, no
+// pixels. A zoom=8 px/s, 4px hardcoded = 500 ms de tolerancia (mucho —
+// clicks cortos disparaban drags accidentales). A zoom=60 px/s, 4px =
+// 67 ms (ok). 50 ms es invariante al zoom: clickSlopPx = 50ms * pxPerSec.
+const CLICK_SLOP_TIME_S = 0.05;
+const LABEL_W = 38;            // left time-label column
+const WAVE_W = 30;             // waveform band width inside the gutter
+const GUTTER_PX = LABEL_W + WAVE_W; // total left gutter (labels + waveform)
+const MAX_VH_NORMAL = "58vh";   // viewport cap default; the lane scrolls within it
+const MAX_VH_FOCUS = "85vh";    // 2026-05-25 — modo enfoque del editor agranda la lane
+const FOLLOW_SUPPRESS_MS = 2500;
+const INTRO_SKIP_S = 3;        // auto-scroll to first lyric if intro longer than this
+
+function fmt(sec) {
+  if (!isFinite(sec) || sec < 0) sec = 0;
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+export default function LyricsTimeline({
+  segments,            // [{_id, start, end, text, locked?}]
+  duration,
+  currentTime,
+  isPlaying = false,
+  activeId,
+  focusedSegId,
+  highlightedIds,      // Set<_id>
+  waveform = null,     // {peaks:[0..1], duration} | null — drawn in the gutter
+  gapS = 0.05,
+  saveStatus = "idle", // "idle" | "saving" | "saved"
+  onSeek,              // (seconds) => void
+  onDragStart,         // () => void  — push one undo snapshot before a drag commits
+  onTimingChange,      // (id, newStart, newEnd) => void — commit; parent sets locked
+  onTextChange,        // (id, text) => void — inline text fix without leaving timeline
+  onFocus,             // (id) => void
+  onReset,             // () => void
+  focusMode = false,   // 2026-05-25 — passed from LyricsEditor focus toggle
+}) {
+  const i18n = useI18n?.() || {};
+  const t = (key, fallback) => i18n.t?.(key) || fallback || key;
+  const laneRef = useRef(null);
+  const scrollRef = useRef(null);
+  const canvasRef = useRef(null);
+  const didAutoScrollRef = useRef(false);
+  const [preview, setPreview] = useState(null); // {id, start, end} | null
+  const dragRef = useRef(null); // {id, mode, originY, origStart, origEnd, moved}
+  const [pxPerSec, setPxPerSec] = useState(ZOOM_DEFAULT);
+  const [editingTextId, setEditingTextId] = useState(null); // line whose text is being fixed inline
+  const [draftText, setDraftText] = useState("");
+  const lastUserScrollRef = useRef(0);
+  const programmaticScrollUntilRef = useRef(0);
+  const followPauseTimerRef = useRef(null);
+  const [followEnabled, setFollowEnabled] = useState(true);
+  const [followSuppressed, setFollowSuppressed] = useState(false);
+  const [scrollState, setScrollState] = useState({ top: 0, viewport: 1 });
+
+  const beginTextEdit = useCallback((seg) => {
+    setEditingTextId(seg._id);
+    setDraftText(seg.text || "");
+  }, []);
+  const commitTextEdit = useCallback((id) => {
+    setEditingTextId((cur) => (cur === id ? null : cur));
+    onTextChange?.(id, draftText);
+  }, [draftText, onTextChange]);
+  const cancelTextEdit = useCallback(() => setEditingTextId(null), []);
+  const markUserScroll = useCallback(() => {
+    lastUserScrollRef.current = Date.now();
+    setFollowSuppressed(true);
+    if (followPauseTimerRef.current) clearTimeout(followPauseTimerRef.current);
+    followPauseTimerRef.current = setTimeout(() => setFollowSuppressed(false), FOLLOW_SUPPRESS_MS);
+  }, []);
+
+  useEffect(() => () => {
+    if (followPauseTimerRef.current) clearTimeout(followPauseTimerRef.current);
+  }, []);
+
+  const total = Math.max(duration || 0, ...segments.map((s) => s.end), 1);
+  const laneHeight = total * pxPerSec;
+
+  // INCIDENT 2026-05-25: forced_align/reconcile sometimes emits two segments
+  // with (almost) identical `start` — typical of a chorus where lrclib has
+  // repeated identical lines ("Legalícenla / Legalícenla / Oh-oh-oh" at the
+  // top of the chorus). Before this fix every overlapping segment was
+  // rendered at `top = start * pxPerSec` with full-width, so the second one
+  // sat literally underneath the first — the operator saw ONE block and
+  // assumed the rest were missing. Worse: those "missing" lines DID exist
+  // in the segments_json (the list view showed them all), so it looked like
+  // the timeline was a buggy view of correct data.
+  //
+  // Fix: Gantt-style lane assignment. Sort segments by start. For each
+  // segment, place it in the first lane whose previous segment has already
+  // ended; if none free → open a new lane. The columns then share the
+  // available horizontal space equally so the operator sees ALL overlapping
+  // lines side by side. When there's no overlap (the common case), the
+  // single lane uses the full width — visually identical to before.
+  //
+  // 50ms epsilon: timestamps that close are functionally simultaneous from
+  // the operator's point of view (single bar of music) and should share a
+  // lane bucket. Larger gaps go in the same lane sequentially.
+  const { laneOfId, laneCount } = (() => {
+    const OVERLAP_EPSILON_S = 0.05;
+    const sorted = [...segments].sort((a, b) => a.start - b.start);
+    const laneEnds = [];                 // laneIdx → latest seg.end in that lane
+    const idToLane = new Map();
+    for (const s of sorted) {
+      let assigned = -1;
+      for (let i = 0; i < laneEnds.length; i++) {
+        if (laneEnds[i] <= s.start + OVERLAP_EPSILON_S) {
+          assigned = i;
+          break;
+        }
+      }
+      if (assigned < 0) {
+        assigned = laneEnds.length;
+        laneEnds.push(s.end);
+      } else {
+        laneEnds[assigned] = s.end;
+      }
+      idToLane.set(s._id, assigned);
+    }
+    return { laneOfId: idToLane, laneCount: Math.max(1, laneEnds.length) };
+  })();
+
+  const neighbours = useCallback(
+    (id) => {
+      // Operator report 2026-05-26: cuando whisperX devuelve líneas que se
+      // solapan en el tiempo (overlap > OVERLAP_EPSILON_S, ej. coros o
+      // dobles voces), el Gantt las renderiza en lanes paralelas. El
+      // pre-fix usaba el orden global por `.start` para buscar prev/next,
+      // y el clamp `lo = prev.end + gapS` / `hi = next.start - gapS`
+      // terminaba bloqueando el drag contra un segmento de OTRA lane —
+      // aunque visualmente esa lane vive al costado, no debajo. Resultado
+      // observado: end edge clampeado a `next.start - gapS` que era
+      // MENOR que `origEnd`, comiteando una "extensión" que en realidad
+      // era una contracción de 50ms. Indistinguible visualmente de un
+      // "snap back to original" — el operador soltaba y nada parecía
+      // haber cambiado.
+      //
+      // Fix: filtrar por mismo lane antes de buscar prev/next. Las lanes
+      // paralelas dejan de ser blockers. Las líneas back-to-back en el
+      // MISMO lane siguen clampeadas (regresión cubierta por test).
+      const myLane = laneOfId.get(id);
+      if (myLane === undefined) return { prev: null, next: null };
+      const sameLane = [...segments]
+        .filter((s) => laneOfId.get(s._id) === myLane)
+        .sort((a, b) => a.start - b.start);
+      const i = sameLane.findIndex((s) => s._id === id);
+      return {
+        prev: i > 0 ? sameLane[i - 1] : null,
+        next: i >= 0 && i < sameLane.length - 1 ? sameLane[i + 1] : null,
+      };
+    },
+    [segments, laneOfId]
+  );
+
+  // clientY → time. laneRef is the inner lane content (full laneHeight); its
+  // rect.top already shifts with vertical scroll, so we do NOT add scrollTop.
+  const clientYToTime = useCallback((clientY) => {
+    const rect = laneRef.current?.getBoundingClientRect();
+    if (!rect) return 0;
+    return Math.max(0, (clientY - rect.top) / pxPerSec);
+  }, [pxPerSec]);
+
+  const onPointerDown = useCallback(
+    (e, seg, mode) => {
+      e.stopPropagation();
+      e.currentTarget.setPointerCapture?.(e.pointerId);
+      onDragStart?.();
+      // Auditoría 2026-06-10: si hay un smooth-scroll del auto-follow EN
+      // VUELO al agarrar el bloque, el viewport sigue moviéndose bajo el
+      // cursor durante el drag ("el bloque se escapa"). Reasignar
+      // scrollTop a sí mismo cancela la animación en curso, y marcamos
+      // interacción para que el follow no re-dispare ya mismo.
+      markUserScroll();
+      const _sc = scrollRef.current;
+      if (_sc) _sc.scrollTop = _sc.scrollTop;
+      // FIX 2 (2026-05-25): snapshot pxPerSec al inicio del drag. Si el
+      // operador clickea zoom +/- mid-drag, el live pxPerSec cambia y el
+      // delta (deltaPx / pxPerSec) queda mal escalado → el segmento
+      // saltaba a una posición incorrecta. El snapshot garantiza que
+      // los pixels que el operador movió siempre se traducen al mismo
+      // tiempo, incluso si el zoom cambia entre frames.
+      dragRef.current = {
+        id: seg._id, mode, originY: e.clientY,
+        origStart: seg.start, origEnd: seg.end, moved: false,
+        origPxPerSec: pxPerSec,
+      };
+      setPreview({ id: seg._id, start: seg.start, end: seg.end });
+    },
+    [onDragStart, markUserScroll]
+  );
+
+  const onPointerMove = useCallback(
+    (e) => {
+      const d = dragRef.current;
+      if (!d) return;
+      const deltaPx = e.clientY - d.originY;
+      // FIX 4 (2026-05-25): click-slop threshold zoom-invariant. A
+      // CLICK_SLOP_TIME_S * pxPerSec ms. Antes era 4px hardcoded — a
+      // zoom=8 px/s eso son 500 ms de "dead zone" que disparaba drags
+      // accidentales en clicks cortos. 50 ms se siente igual en
+      // cualquier zoom level.
+      const clickSlop = CLICK_SLOP_TIME_S * (d.origPxPerSec || pxPerSec);
+      if (Math.abs(deltaPx) > clickSlop) d.moved = true;
+      // FIX 2 (2026-05-25): usar origPxPerSec del snapshot, NO el live
+      // pxPerSec — sino un zoom mid-drag re-escala el delta.
+      const delta = deltaPx / (d.origPxPerSec || pxPerSec);
+      const { prev, next } = neighbours(d.id);
+      const lo = prev ? prev.end + gapS : 0;
+      const hi = next ? next.start - gapS : total;
+      let start = d.origStart;
+      let end = d.origEnd;
+      if (d.mode === "start") {
+        start = Math.min(Math.max(d.origStart + delta, lo), end - MIN_DUR_S);
+      } else if (d.mode === "end") {
+        end = Math.max(Math.min(d.origEnd + delta, hi), start + MIN_DUR_S);
+      } else {
+        const dur = d.origEnd - d.origStart;
+        start = Math.min(Math.max(d.origStart + delta, lo), hi - dur);
+        end = start + dur;
+      }
+      setPreview({ id: d.id, start, end });
+    },
+    [neighbours, gapS, total, pxPerSec]
+  );
+
+  const onPointerUp = useCallback(
+    (e, seg) => {
+      const d = dragRef.current;
+      dragRef.current = null;
+      if (!d) return;
+      const p = preview;
+      setPreview(null);
+      if (!d.moved) {
+        markUserScroll();
+        onFocus?.(seg._id);
+        onSeek?.(clientYToTime(e.clientY)); // exact clicked point, not block start
+        return;
+      }
+      if (p && (Math.abs(p.start - seg.start) > 1e-3 || Math.abs(p.end - seg.end) > 1e-3)) {
+        // Auditoría 2026-06-10: el commit de un drag NO marcaba interacción
+        // — al soltar, el auto-follow podía yankear el viewport al instante
+        // (dragRef ya está limpio) y el bloque recién acomodado "se iba".
+        // El click-path de arriba ya lo hacía; esto empareja el drag-path.
+        markUserScroll();
+        onTimingChange?.(seg._id, p.start, p.end);
+      }
+    },
+    [preview, onFocus, onSeek, onTimingChange, clientYToTime, markUserScroll]
+  );
+
+  const onLaneClick = useCallback(
+    (e) => {
+      if (dragRef.current) return;
+      markUserScroll();
+      onSeek?.(clientYToTime(e.clientY));
+    },
+    [onSeek, clientYToTime, markUserScroll]
+  );
+
+  // Auto-follow the playhead vertically — only while playing AND when the
+  // operator hasn't scrolled/clicked in the last FOLLOW_SUPPRESS_MS, so
+  // manual navigation (e.g. back to 0:40) isn't yanked away.
+  //
+  // FIX 1 (2026-05-25, operator drag report): NUNCA scrollee si hay un
+  // drag activo. El smooth scroll cambia scrollRef.scrollTop durante la
+  // transición (16-250ms), lo que cambia `rect.top` de getBoundingClientRect
+  // que clientYToTime() usa para convertir pointer → tiempo. Resultado:
+  // el segmento arrastrado se commiteaba con un valor incorrecto porque
+  // el viewport se movía mientras el operador soltaba.
+  useEffect(() => {
+    if (!isPlaying || !followEnabled) return;
+    if (dragRef.current) return;          // FIX 1: no follow durante drag
+    if (Date.now() - lastUserScrollRef.current < FOLLOW_SUPPRESS_MS) return;
+    const sc = scrollRef.current;
+    if (!sc || typeof sc.scrollTo !== "function") return;
+    const y = currentTime * pxPerSec;
+    const view = sc.scrollTop;
+    const h = sc.clientHeight;
+    if (y < view + 40 || y > view + h - 80) {
+      programmaticScrollUntilRef.current = Date.now() + 600;
+      sc.scrollTo({ top: Math.max(0, y - h * 0.4), behavior: "smooth" });
+    }
+  }, [currentTime, isPlaying, pxPerSec, followEnabled]);
+
+  // Draw the waveform in the gutter (static — redraws only when the peaks
+  // or the time scale change, never per playhead tick). Guarded for jsdom,
+  // which has no canvas 2d context.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const peaks = waveform?.peaks;
+    if (!canvas || !peaks || !peaks.length) return;
+    const ctx = canvas.getContext?.("2d");
+    if (!ctx) return;
+    const dpr = Math.min((typeof window !== "undefined" && window.devicePixelRatio) || 1, 2);
+    const w = GUTTER_PX;
+    const h = laneHeight;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    canvas.style.width = `${w}px`;
+    canvas.style.height = `${h}px`;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    const N = peaks.length;
+    const cx = LABEL_W + WAVE_W / 2;
+    const band = h / N;
+    ctx.fillStyle = "rgba(139,124,246,0.30)"; // brand violet, faint
+    for (let i = 0; i < N; i++) {
+      const half = peaks[i] * (WAVE_W / 2);
+      if (half <= 0) continue;
+      ctx.fillRect(cx - half, i * band, half * 2, Math.max(1, band));
+    }
+  }, [waveform, laneHeight]);
+
+  // On first mount, skip a long instrumental intro: jump the scroll to the
+  // first lyric so the operator doesn't open to a wall of empty time.
+  useEffect(() => {
+    if (didAutoScrollRef.current) return;
+    if (!segments.length) return;
+    const firstStart = Math.min(...segments.map((s) => s.start));
+    if (firstStart <= INTRO_SKIP_S) { didAutoScrollRef.current = true; return; }
+    // rAF: set scrollTop AFTER the lane has its full laid-out height,
+    // otherwise the browser clamps scrollTop to 0 (the bug that left the
+    // view stuck at 0:00 on top of the instrumental intro).
+    const raf = requestAnimationFrame(() => {
+      // FIX 3 (2026-05-25): no auto-scroll si hay drag activo. Edge
+      // case: el operador empieza a arrastrar el mismo frame que el
+      // intro-skip programó su rAF — el scroll cambia mid-drag y
+      // rompe el clientYToTime() calc.
+      if (dragRef.current) return;
+      const sc = scrollRef.current;
+      if (sc) {
+        programmaticScrollUntilRef.current = Date.now() + 100;
+        sc.scrollTop = Math.max(0, firstStart * pxPerSec - 28);
+      }
+      didAutoScrollRef.current = true;
+    });
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [segments]);
+
+  const activeSeg = segments.find((s) => s._id === activeId) || null;
+
+  const ticks = [];
+  for (let s = 0; s <= total; s += 5) ticks.push(s);
+
+  const fitTimeline = () => {
+    const viewport = scrollRef.current?.clientHeight || 480;
+    setPxPerSec(Math.max(1.5, Math.min(ZOOM_DEFAULT, viewport / total)));
+    requestAnimationFrame(() => {
+      if (scrollRef.current) {
+        programmaticScrollUntilRef.current = Date.now() + 100;
+        scrollRef.current.scrollTop = 0;
+      }
+    });
+  };
+
+  const showDetail = () => {
+    setPxPerSec(ZOOM_DEFAULT);
+    requestAnimationFrame(() => {
+      const sc = scrollRef.current;
+      if (sc) {
+        programmaticScrollUntilRef.current = Date.now() + 100;
+        sc.scrollTop = Math.max(0, currentTime * ZOOM_DEFAULT - sc.clientHeight * 0.4);
+      }
+    });
+  };
+
+  const handleTimelineScroll = (event) => {
+    if (Date.now() > programmaticScrollUntilRef.current) markUserScroll();
+    setScrollState({ top: event.currentTarget.scrollTop, viewport: event.currentTarget.clientHeight });
+  };
+
+  // Keep the minimap viewport accurate before the operator performs the
+  // first scroll and whenever zoom/layout changes alter the visible range.
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => {
+      const sc = scrollRef.current;
+      if (sc) setScrollState({ top: sc.scrollTop, viewport: sc.clientHeight });
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [pxPerSec, focusMode, laneHeight]);
+
+  const jumpFromMinimap = (event) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+    const time = pct * total;
+    onSeek?.(time);
+    const sc = scrollRef.current;
+    if (sc) {
+      programmaticScrollUntilRef.current = Date.now() + 100;
+      sc.scrollTop = Math.max(0, time * pxPerSec - sc.clientHeight * 0.4);
+    }
+  };
+
+  const toggleFollow = () => {
+    if (followEnabled && followSuppressed) {
+      lastUserScrollRef.current = 0;
+      setFollowSuppressed(false);
+      if (followPauseTimerRef.current) clearTimeout(followPauseTimerRef.current);
+      const sc = scrollRef.current;
+      if (sc) {
+        programmaticScrollUntilRef.current = Date.now() + 100;
+        sc.scrollTop = Math.max(0, currentTime * pxPerSec - sc.clientHeight * 0.4);
+      }
+      return;
+    }
+    setFollowEnabled((value) => !value);
+  };
+
+  return (
+    <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.05] overflow-hidden animate-fade-in">
+      {/* Header */}
+      <div className="flex items-center justify-between px-3 py-2.5 border-b border-white/[0.05] gap-3 flex-wrap">
+        <div className="flex items-center gap-2.5">
+          <span className="text-[11px] uppercase tracking-wider text-ink-tertiary font-semibold">
+            {t("timeline.title", "Línea de tiempo")}
+          </span>
+          {saveStatus === "saving" && (
+            <span className="text-[10px] text-ink-tertiary flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-ink-tertiary animate-pulse" />
+              {t("timeline.saving", "Guardando…")}
+            </span>
+          )}
+          {saveStatus === "saved" && (
+            <span className="text-[10px] text-emerald-300 flex items-center gap-1 animate-fade-in">
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                <path d="M20 6 9 17l-5-5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              {t("timeline.saved", "Guardado")}
+            </span>
+          )}
+          {saveStatus === "error" && (
+            // QA fix 2026-05-28 (audit P0 #74): antes el autosave error
+            // caía silente — el operador no se enteraba y al apretar
+            // Aprobar perdía los cambios. Ahora chip rojo persistente.
+            <span className="text-[10px] text-red-400 flex items-center gap-1 animate-fade-in">
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                <path d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zM12 15.75h.01" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              {t("timeline.save_error", "Sin guardar — revisá tu conexión")}
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={toggleFollow}
+            aria-pressed={followEnabled}
+            className={`text-label px-2.5 py-1 rounded-md ring-1 transition-colors ${followEnabled ? "text-brand-light bg-brand/10 ring-brand/30" : "text-ink-secondary ring-white/[0.08] hover:text-white"}`}
+            title={t("timeline.follow_hint", "Mantener la línea activa visible durante la reproducción")}
+          >
+            {followEnabled && followSuppressed ? t("timeline.resume", "Reanudar") : t("timeline.follow", "Seguir")}
+          </button>
+          <div className="inline-flex items-center rounded-md ring-1 ring-white/[0.08] overflow-hidden">
+            <button type="button" onClick={fitTimeline} className="px-2 py-1 text-[10px] text-ink-secondary hover:text-white hover:bg-white/[0.05]" title={t("timeline.fit_hint", "Ver la canción completa")}>{t("timeline.fit", "Ajustar")}</button>
+            <button type="button" onClick={showDetail} className="px-2 py-1 text-[10px] text-ink-secondary hover:text-white hover:bg-white/[0.05] border-l border-white/[0.08]" title={t("timeline.detail_hint", "Volver al zoom de edición")}>{t("timeline.detail", "Detalle")}</button>
+          </div>
+          <div className="inline-flex items-center rounded-md ring-1 ring-white/[0.08] overflow-hidden">
+            <button
+              onClick={() => setPxPerSec((z) => Math.max(ZOOM_MIN, z - ZOOM_STEP))}
+              disabled={pxPerSec <= ZOOM_MIN}
+              className="px-2 py-1 text-ink-secondary hover:text-white hover:bg-white/[0.05] disabled:opacity-30 transition-colors"
+              title={t("timeline.zoom_out", "Alejar")} aria-label={t("timeline.zoom_out", "Alejar")}
+            >−</button>
+            <span className="px-1.5 text-[10px] text-ink-tertiary tabular-nums select-none">{Math.round(pxPerSec)} px/s</span>
+            <button
+              onClick={() => setPxPerSec((z) => Math.min(ZOOM_MAX, z < ZOOM_MIN ? ZOOM_MIN : z + ZOOM_STEP))}
+              disabled={pxPerSec >= ZOOM_MAX}
+              className="px-2 py-1 text-ink-secondary hover:text-white hover:bg-white/[0.05] disabled:opacity-30 transition-colors"
+              title={t("timeline.zoom_in", "Acercar")} aria-label={t("timeline.zoom_in", "Acercar")}
+            >+</button>
+          </div>
+          <button
+            onClick={onReset}
+            className="text-label px-2.5 py-1 rounded-md text-ink-secondary
+              ring-1 ring-white/[0.08] hover:ring-white/20 hover:text-white transition-colors flex items-center gap-1.5"
+            title={t("timeline.reset_hint", "Volver los timings al estado original")}
+          >
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M3 12a9 9 0 1 0 3-6.7L3 8" strokeLinecap="round" strokeLinejoin="round" />
+              <path d="M3 3v5h5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            {t("timeline.reset", "Resetear timings")}
+          </button>
+        </div>
+      </div>
+
+      {/* Scrollable timeline (vertical).
+          QA fix 2026-05-28: el auto-scroll del timeline usa
+          scrollRef.scrollTop directo (línea 334 / 281) para mover el
+          lane cuando la línea activa cambia, así que el scrollRef
+          NECESITA seguir siendo un overflow-y-auto container (no
+          podemos hacerlo overflow-visible bajo el nuevo wizard layout).
+          Dejamos el maxHeight inline tal cual — el timeline mantiene su
+          scroll INTERNO con su auto-scroll a la línea activa, y el
+          wizard OUTER scroll (UploadZone right column) cubre el resto
+          (header del timeline, controles arriba). Nested scroll
+          aceptable: el inner se activa con mouse-wheel sobre el lane,
+          el outer con wheel sobre el header. */}
+      <div className="relative">
+      <div
+        ref={scrollRef}
+        className="overflow-y-auto overflow-x-hidden"
+        style={{ maxHeight: focusMode ? MAX_VH_FOCUS : MAX_VH_NORMAL }}
+        onPointerMove={onPointerMove}
+        onScroll={handleTimelineScroll}
+      >
+        <div
+          ref={laneRef}
+          className="relative cursor-pointer"
+          style={{ height: laneHeight, minHeight: "100%" }}
+          onClick={onLaneClick}
+        >
+          {/* Waveform in the gutter (canvas, time-aligned with the lane) */}
+          {waveform?.peaks?.length ? (
+            <>
+              <canvas
+                ref={canvasRef}
+                className="absolute top-0 left-0 pointer-events-none"
+                style={{ width: GUTTER_PX, height: laneHeight }}
+                aria-hidden="true"
+              />
+              {/* active line's slice of the waveform, highlighted */}
+              {activeSeg && (
+                <div
+                  className="absolute pointer-events-none bg-brand/20"
+                  style={{
+                    left: LABEL_W,
+                    width: WAVE_W,
+                    top: activeSeg.start * pxPerSec,
+                    height: Math.max(2, (activeSeg.end - activeSeg.start) * pxPerSec),
+                  }}
+                />
+              )}
+            </>
+          ) : null}
+
+          {/* Time gutter ticks (horizontal grid lines + labels) */}
+          {ticks.map((s) => (
+            <div key={s} className="absolute left-0 right-0 pointer-events-none" style={{ top: s * pxPerSec }}>
+              <div className={`${s % 10 === 0 ? "bg-white/10" : "bg-white/[0.04]"}`} style={{ height: 1, marginLeft: GUTTER_PX }} />
+              {s % 10 === 0 && (
+                <span className="absolute left-1 -top-1.5 text-[9px] text-ink-tertiary tabular-nums">{fmt(s)}</span>
+              )}
+            </div>
+          ))}
+
+          {/* Blocks */}
+          {segments.map((seg) => {
+            const pv = preview && preview.id === seg._id ? preview : null;
+            const start = pv ? pv.start : seg.start;
+            const end = pv ? pv.end : seg.end;
+            const top = start * pxPerSec;
+            const height = Math.max(MIN_BLOCK_PX, (end - start) * pxPerSec);
+            const isActive = seg._id === activeId;
+            const isFocused = seg._id === focusedSegId;
+            const isLocked = !!seg.locked || !!pv;
+            const isHi = highlightedIds?.has?.(seg._id);
+            // Gantt lane positioning: when there's no overlap (laneCount=1)
+            // the block takes the full width like before; when 2+ segments
+            // overlap the columns split the available space evenly so the
+            // operator sees them side by side instead of stacked invisibly.
+            const laneIdx = laneOfId.get(seg._id) ?? 0;
+            const LANE_GAP_PCT = 1;        // small horizontal breathing space
+            const laneSpan = (100 - LANE_GAP_PCT * (laneCount - 1)) / laneCount;
+            const laneLeftPct = laneIdx * (laneSpan + LANE_GAP_PCT);
+            return (
+              <div
+                key={seg._id}
+                className={[
+                  "absolute rounded-md overflow-hidden text-caption leading-tight ring-1 transition-colors",
+                  isActive ? "bg-brand/25" : "bg-surface-3/25",
+                  isLocked ? "ring-brand/60" : "ring-white/[0.07]",
+                  isFocused ? "outline outline-1 outline-brand-light" : "",
+                  isHi ? "ring-2 ring-accent" : "",
+                ].join(" ")}
+                style={{
+                  top, height,
+                  // Lane positioning: a CSS var sets the lane area (gutter→right);
+                  // each block's left/width are percentages OF the parent's full
+                  // width, but we add a translate offset and reduce the span by
+                  // the gutter via calc. Result: laneCount=1 → block hugs the
+                  // gutter→right strip like before. laneCount>1 → blocks share
+                  // that strip evenly.
+                  left: `calc(${GUTTER_PX + 4}px + (100% - ${GUTTER_PX + 12}px) * ${laneLeftPct / 100})`,
+                  width: `calc((100% - ${GUTTER_PX + 12}px) * ${laneSpan / 100})`,
+                }}
+                onPointerDown={(e) => onPointerDown(e, seg, "move")}
+                onPointerMove={onPointerMove}
+                onPointerUp={(e) => onPointerUp(e, seg)}
+                title={`${fmt(start)} → ${fmt(end)}`}
+              >
+                {/* top edge handle = start (when the line ENTERS) */}
+                <div
+                  className="absolute left-0 right-0 top-0 cursor-ns-resize bg-brand/30 hover:bg-brand/70 flex items-center justify-center group/ht"
+                  style={{ height: EDGE_PX, touchAction: "none" }}
+                  onPointerDown={(e) => onPointerDown(e, seg, "start")}
+                  onPointerMove={onPointerMove}
+                  onPointerUp={(e) => onPointerUp(e, seg)}
+                  title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea")}
+                >
+                  <div className="w-7 h-[3px] rounded-full bg-white/40 group-hover/ht:bg-white/90 transition-colors" />
+                </div>
+                {/* bottom edge handle = end (when the line LEAVES) */}
+                <div
+                  className="absolute left-0 right-0 bottom-0 cursor-ns-resize bg-brand/30 hover:bg-brand/70 flex items-center justify-center group/hb"
+                  style={{ height: EDGE_PX, touchAction: "none" }}
+                  onPointerDown={(e) => onPointerDown(e, seg, "end")}
+                  onPointerMove={onPointerMove}
+                  onPointerUp={(e) => onPointerUp(e, seg)}
+                  title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea")}
+                >
+                  <div className="w-7 h-[3px] rounded-full bg-white/40 group-hover/hb:bg-white/90 transition-colors" />
+                </div>
+                {/* Text anchored to the TOP (where the line enters), not
+                    floating in the middle of a tall held block. */}
+                <div className="px-3 flex items-start gap-2" style={{ touchAction: "none", paddingTop: EDGE_PX + 4 }}>
+                  <span className="text-[9px] text-ink-tertiary tabular-nums shrink-0 mt-px">{fmt(start)}</span>
+                  {editingTextId === seg._id ? (
+                    <input
+                      type="text"
+                      autoFocus
+                      value={draftText}
+                      onChange={(ev) => setDraftText(ev.target.value)}
+                      onPointerDown={(ev) => ev.stopPropagation()}
+                      onClick={(ev) => ev.stopPropagation()}
+                      onBlur={() => commitTextEdit(seg._id)}
+                      onKeyDown={(ev) => {
+                        if (ev.key === "Enter") { ev.preventDefault(); commitTextEdit(seg._id); }
+                        else if (ev.key === "Escape") { ev.preventDefault(); cancelTextEdit(); }
+                      }}
+                      className="flex-1 min-w-0 bg-surface-1 border border-brand/50 focus:border-brand
+                        outline-none rounded px-1 py-0.5 text-caption text-white"
+                    />
+                  ) : (
+                    <span
+                      className="text-white/90 line-clamp-3 cursor-text break-words"
+                      onPointerDown={(ev) => ev.stopPropagation()}
+                      onDoubleClick={(ev) => { ev.stopPropagation(); beginTextEdit(seg); }}
+                      /* UI F14 (2026-05-26): el title= ahora incluye el texto
+                         completo (no solo el hint de doble-click). Si la
+                         card es angosta y line-clamp corta la línea, el
+                         operador puede leer todo en el hover. line-clamp
+                         subió de 2 a 3 líneas para que las líneas de
+                         canción más largas no se corten tan agresivo. */
+                      title={`${seg.text}\n\n— Doble-click para corregir`}
+                    >
+                      {seg.text}
+                    </span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+
+          {/* Playhead (horizontal).
+              FIX 2026-05-25 (operator feedback): el `transition-[top]
+              duration-100` que tenía antes causaba 2 bugs reportados:
+                1) "no baja al ritmo normal de la canción" — la
+                   transition de 100 ms peleaba contra el rAF que
+                   LyricsEditor usa para empujar currentTime a 60 fps,
+                   dejando el playhead ~100ms detrás del audio.
+                2) "click en un tiempo, la línea sube lentamente" — al
+                   hacer seek (jump de 30s → 10s), la transition
+                   ANIMABA suavemente el viaje en vez de saltar.
+              Solución doble:
+                - Cero transition: salta instant en seeks, sigue
+                  fielmente el rAF en playback.
+                - translateY en vez de top: movimiento composited en
+                  GPU, no dispara reflow en la lista de segmentos. */}
+          <div
+            className="absolute left-0 right-0 top-0 h-0.5 bg-brand pointer-events-none z-10 will-change-transform"
+            style={{ transform: `translateY(${currentTime * pxPerSec}px)` }}
+          >
+            <div className="w-2 h-2 rounded-full bg-brand -mt-[3px] ml-0.5" />
+          </div>
+        </div>
+      </div>
+      <button
+        type="button"
+        className="absolute right-1.5 top-2 bottom-2 z-20 w-3 rounded-full bg-black/35 ring-1 ring-white/10 overflow-hidden"
+        onClick={jumpFromMinimap}
+        aria-label={t("timeline.minimap", "Mini-mapa de la canción: click para saltar en el tiempo")}
+        title={t("timeline.minimap", "Mini-mapa de la canción")}
+      >
+        {segments.map((seg) => (
+          <span
+            key={seg._id}
+            className={`absolute left-[3px] right-[3px] rounded-full ${seg._id === activeId ? "bg-brand-light" : "bg-white/25"}`}
+            style={{ top: `${(seg.start / total) * 100}%`, height: `${Math.max(0.5, ((seg.end - seg.start) / total) * 100)}%` }}
+          />
+        ))}
+        <span
+          className="absolute left-0 right-0 rounded-full ring-1 ring-brand-light/80 bg-brand/25 pointer-events-none"
+          style={{
+            top: `${Math.min(100, (scrollState.top / Math.max(laneHeight, 1)) * 100)}%`,
+            height: `${Math.min(100, Math.max(3, (scrollState.viewport / Math.max(laneHeight, 1)) * 100))}%`,
+          }}
+        />
+      </button>
+      </div>
+
+      <p className="px-3 py-2 text-[10px] text-ink-tertiary border-t border-white/[0.05] flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span><span className="text-ink-secondary">↕ {t("timeline.edges", "bordes")}</span> {t("timeline.edges_help", "ajustan entrada/salida")}</span>
+        <span><span className="text-ink-secondary">{t("timeline.body", "cuerpo")}</span> {t("timeline.body_help", "mueve la línea")}</span>
+        <span><span className="text-ink-secondary">click</span> {t("timeline.click_help", "salta a ese punto")}</span>
+        <span><span className="text-ink-secondary">{t("timeline.double_click", "doble-click")}</span> {t("timeline.double_click_help", "corrige el texto")}</span>
+        <span className="text-ink-tertiary/70">{t("timeline.fixed_help", "lo que ajustás queda fijo")}</span>
+      </p>
+    </div>
+  );
+}

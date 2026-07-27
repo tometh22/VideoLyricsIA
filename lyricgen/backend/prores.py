@@ -65,6 +65,88 @@ class ProResSourceMissing(Exception):
     """The source MP4 needed to transcode is gone (not local, not in R2)."""
 
 
+class ProResSuperseded(Exception):
+    """The job was re-rendered (edited) WHILE this transcode was running, so
+    the .mov we produced is from a stale source. We discard it instead of
+    publishing — the edit's own re-enqueued prewarm regenerates from the new
+    cut. See the freshness fence in ensure_prores_exists."""
+
+
+def _source_identity(source_path: str):
+    """(st_size, st_mtime_ns) of the source MP4, or (None, None) if absent.
+
+    This is the MOST DIRECT freshness signal: the .mov is a pure function of
+    this file, and every re-render (edit OR /retry) rewrites lyric_video.mp4
+    in place, bumping size/mtime. Catches paths that don't move the DB
+    signals — notably /retry, which resets edit_count to 0 and leaves
+    editing_started_at None (so the DB part alone is blind to it)."""
+    try:
+        st = os.stat(source_path)
+        return (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return (None, None)
+
+
+def _render_fingerprint(job_id: str, source_path: str | None = None):
+    """Freshness signal for the transcode fence in ensure_prores_exists:
+    (edit_count, editing_started_at, source_size, source_mtime_ns).
+
+    - edit_count: typography/background/lyrics edits.
+    - editing_started_at: metadata edits (which deliberately do NOT bump
+      edit_count, see main.py:request_edit) — they still re-render the title
+      card, so their .mov must not be served stale.
+    - source size+mtime: the direct "the bytes I'm transcoding changed"
+      signal, and the ONLY one that catches /retry (edit_count reset to 0,
+      editing_started_at None — identical DB tuple before and after a retry).
+
+    The DB part is read fresh from Postgres each call. Comparing the whole
+    tuple before vs after the transcode tells us whether the render this .mov
+    derives from is still current."""
+    from database import SessionLocal, Job
+    db = SessionLocal()
+    try:
+        row = db.query(Job).filter(Job.job_id == job_id).first()
+        db_part = (None, None) if row is None else (row.edit_count or 0, row.editing_started_at)
+    finally:
+        db.close()
+    size, mtime_ns = _source_identity(source_path) if source_path else (None, None)
+    return (db_part[0], db_part[1], size, mtime_ns)
+
+
+def _is_superseded(job_id: str, source_path: str, baseline) -> bool:
+    """True only if we can POSITIVELY prove the render moved since `baseline`
+    (the fingerprint snapshotted before the transcode).
+
+    A transient Postgres blip during the post-transcode recheck must NOT
+    discard a good 60-300 s transcode: `_render_fingerprint` reads the DB and
+    would otherwise propagate the error out of `ensure_prores_exists`, failing
+    the prewarm (which has no RQ retry). On any read failure we return False
+    ("can't prove superseded → proceed") — correctness is still guarded by the
+    edit's remove_s3_keys + the freshness short-circuit on the next download."""
+    try:
+        return _render_fingerprint(job_id, source_path) != baseline
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("[PRORES] %s fingerprint recheck failed (%s); proceeding",
+                       job_id, e)
+        return False
+
+
+def _mov_is_fresh(mov_path: str, source_path: str) -> bool:
+    """A cached .mov is fresh iff it is at least as new as the source MP4 it
+    derives from. A re-render (edit/retry) rewrites the source in place,
+    pushing the source mtime above the old .mov's — so `mov older than source`
+    means the .mov is a stale pre-render cut and must be re-transcoded.
+
+    If the source isn't local we can't compare: return True (status quo —
+    the s3_keys/upload fences cover the R2 publish path)."""
+    try:
+        if not os.path.exists(source_path):
+            return True
+        return os.stat(mov_path).st_mtime_ns >= os.stat(source_path).st_mtime_ns
+    except OSError:
+        return True
+
+
 def ensure_prores_exists(
     job_id: str,
     file_type: str,
@@ -98,7 +180,14 @@ def ensure_prores_exists(
     from jobs import update_job
 
     file_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP_PRORES[file_type])
-    if os.path.exists(file_path):
+    source_filename, source_key_name = _SOURCE_MP4[file_type]
+    source_path = os.path.join(OUTPUTS_DIR, job_id, source_filename)
+
+    # Short-circuit ONLY on a FRESH cached .mov. A .mov older than its source
+    # MP4 means the source was re-rendered (edit/retry) after the .mov was
+    # built — returning it would hand back the pre-edit cut. Fall through to
+    # re-transcode in that case. (Freshness audit 2026-06-09.)
+    if os.path.exists(file_path) and _mov_is_fresh(file_path, source_path):
         return file_path
 
     umg_spec = job.get("umg_spec")
@@ -107,14 +196,11 @@ def ensure_prores_exists(
             "This job did not request UMG delivery; ProRes not available."
         )
 
-    source_filename, source_key_name = _SOURCE_MP4[file_type]
-    source_path = os.path.join(OUTPUTS_DIR, job_id, source_filename)
-
     lock = _prores_lock_for(job_id, file_type)
     with lock:
         # Double-check inside the lock: a sibling caller may have
-        # finished the transcode while we were waiting.
-        if os.path.exists(file_path):
+        # finished a FRESH transcode while we were waiting.
+        if os.path.exists(file_path) and _mov_is_fresh(file_path, source_path):
             return file_path
 
         if not os.path.exists(source_path):
@@ -134,6 +220,21 @@ def ensure_prores_exists(
             RenderSpec.umg(**umg_spec) if file_type == "umg_master"
             else _short_prores_spec(umg_spec)
         )
+        # Freshness fence (audit 2026-06-09): the source lyric_video.mp4 is
+        # MUTABLE — run_edit_pipeline overwrites it in place on an edit. This
+        # transcode runs 60-300 s in a SEPARATE process (the per-(job,type)
+        # lock above is a threading.Lock, in-process only — it does NOT
+        # serialize against the edit worker). If an edit lands mid-transcode,
+        # the .mov we built is the PRE-edit cut; publishing it (os.replace +
+        # merge_s3_keys below) would re-create the stale .mov and re-add the
+        # stale R2 key AFTER run_edit_pipeline invalidated them — silently
+        # reproducing the original stale-ProRes bug for UMG. We snapshot a
+        # render fingerprint before transcoding and re-check it just before
+        # publishing; if it moved, we discard the .mov and raise
+        # ProResSuperseded — the edit's own re-enqueued prewarm regenerates
+        # from the new cut.
+        fingerprint = _render_fingerprint(job_id, source_path)
+
         # ffmpeg writes to .tmp; we rename atomically once the post-
         # transcode validator is happy. Two processes may race on the
         # same source but only one's os.replace lands. The loser's .tmp
@@ -141,9 +242,15 @@ def ensure_prores_exists(
         tmp_path = f"{file_path}.tmp"
         try:
             _transcode_to_prores(source_path, tmp_path, spec)
+            if _is_superseded(job_id, source_path, fingerprint):
+                raise ProResSuperseded(
+                    f"Job {job_id} re-rendered during {file_type} transcode; "
+                    "discarding stale .mov (fingerprint changed)."
+                )
             os.replace(tmp_path, file_path)
         finally:
-            # If transcode raised mid-way, drop the partial.
+            # If transcode raised mid-way (or we discarded a superseded
+            # build), drop the partial.
             if os.path.exists(tmp_path):
                 try:
                     os.unlink(tmp_path)
@@ -152,15 +259,61 @@ def ensure_prores_exists(
 
         # Best-effort R2 upload so future downloads of this ProRes skip
         # the transcode entirely. Don't fail the caller if it errors.
+        # (Unreachable when superseded at os.replace — the raise above skips
+        # this.)
         try:
             if storage.is_enabled():
                 key = storage.upload_master(
                     file_path, tenant_id, job_id, FILE_MAP_PRORES[file_type],
                 )
                 if key:
-                    keys = dict(job.get("s3_keys") or {})
-                    keys[file_type] = key
-                    update_job(job_id, s3_keys=keys)
+                    # SECOND freshness fence (audit 2026-06-09): the upload
+                    # above takes seconds (a 4K master is GBs). An edit/retry
+                    # can land in that window — os.replace published a then-
+                    # fresh .mov, but it is stale NOW. Re-check before merging
+                    # the key: otherwise merge_s3_keys would re-add a key
+                    # pointing at the pre-edit bytes AFTER run_edit_pipeline's
+                    # remove_s3_keys already dropped it (last-writer-wins
+                    # across separate FOR-UPDATE txns). On supersede we drop our
+                    # now-stale LOCAL .mov and bail WITHOUT merging the key.
+                    #
+                    # We deliberately do NOT storage.delete_object(key): the R2
+                    # key is fully deterministic ({tenant}/{job}/umg_master.mov),
+                    # so the edit's re-enqueued prewarm — running on another
+                    # replica — uploads the FRESH master to the SAME key. A
+                    # blind delete here can race-clobber that fresh object,
+                    # leaving s3_keys pointing at a deleted key → permanent 404
+                    # (worse than a stale cut; audit re-review 2026-06-09). A
+                    # stale object briefly left at the key is harmless: it is
+                    # overwritten by the fresh upload (last-writer), and we
+                    # never merged a key pointing at it.
+                    if _is_superseded(job_id, source_path, fingerprint):
+                        logger.warning(
+                            "[PRORES] %s/%s superseded during R2 upload; "
+                            "dropping stale local .mov, not merging key",
+                            job_id, file_type,
+                        )
+                        try:
+                            os.unlink(file_path)
+                        except OSError:
+                            pass
+                        raise ProResSuperseded(
+                            f"Job {job_id} re-rendered during {file_type} R2 upload."
+                        )
+                    # U1 fix (audit 2026-05-25): merge atómico vía
+                    # `jobs.merge_s3_keys` — SELECT FOR UPDATE + read +
+                    # write en una sola tx. El path anterior (read en tx
+                    # A, write en tx B) tenía una race window entre los
+                    # dos prewarm workers (umg_master + umg_short) que
+                    # corrieron en paralelo: ambos snapshotean s3_keys={}
+                    # antes del transcode de 60-300s, y al final el
+                    # segundo en escribir pisa la key del primero. Prod
+                    # 2026-05-12: 8/18 jobs UMG perdieron una key,
+                    # reconciliado a mano por SQL.
+                    from jobs import merge_s3_keys
+                    merge_s3_keys(job_id, file_type, key)
+        except ProResSuperseded:
+            raise
         except Exception as e:  # pragma: no cover
             logger.warning("[PRORES] R2 upload skipped: %s", e)
 
@@ -181,6 +334,9 @@ def prewarm_prores(job_id: str, file_type: str) -> str | None:
     while this worker was queued, ensure_prores_exists short-circuits
     on os.path.exists. Returns the path either way.
     """
+    # Observability 2026-06-10: toda línea de log de este job lleva job_id.
+    from observability import set_job_log_context
+    set_job_log_context(job_id)
     from jobs import get_job_model
     from database import SessionLocal
 
@@ -202,10 +358,12 @@ def prewarm_prores(job_id: str, file_type: str) -> str | None:
         path = ensure_prores_exists(job_id, file_type, job, tenant_id)
         logger.info("[PRORES] prewarm: %s/%s ready at %s", job_id, file_type, path)
         return path
-    except (ProResMisconfigured, ProResSourceMissing) as e:
-        # These are normal "this job is not eligible for ProRes
-        # prewarm" outcomes — log and exit cleanly without raising,
-        # so the RQ job ends in `finished` not `failed`.
+    except (ProResMisconfigured, ProResSourceMissing, ProResSuperseded) as e:
+        # These are normal "this job is not eligible / no longer current for
+        # ProRes prewarm" outcomes — log and exit cleanly without raising,
+        # so the RQ job ends in `finished` not `failed`. ProResSuperseded
+        # specifically means an edit raced us; the edit re-enqueued its own
+        # prewarm, which will produce the fresh .mov.
         logger.info("[PRORES] prewarm skipped for %s/%s: %s",
                     job_id, file_type, e)
         return None
@@ -292,12 +450,20 @@ def check_prores_readiness(
             f"check_prores_readiness: unsupported file_type {file_type!r}"
         )
     final_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP_PRORES[file_type])
+    source_filename, source_key_name = _SOURCE_MP4[file_type]
+    source_local = os.path.join(OUTPUTS_DIR, job_id, source_filename)
 
-    # 1. local disk hit (post-prewarm or post-lazy)
-    if os.path.exists(final_path):
+    # 1. local disk hit (post-prewarm or post-lazy) — but only serve a FRESH
+    # .mov. A .mov older than the local source MP4 is a stale pre-edit cut
+    # (e.g. a straggler from before the freshness fences); fall through so we
+    # re-transcode rather than 200 the wrong master. Mirrors the short-circuit
+    # in ensure_prores_exists.
+    if os.path.exists(final_path) and _mov_is_fresh(final_path, source_local):
         return ProResReadiness(ProResReadiness.READY_LOCAL, local_path=final_path)
 
-    # 2. R2 hit (after the upload, before any new local cache)
+    # 2. R2 hit (after the upload, before any new local cache). The key is
+    # only merged after the second freshness fence in ensure_prores_exists,
+    # so a present key points at a fresh master.
     s3_keys = job.get("s3_keys") or {}
     if s3_keys.get(file_type):
         return ProResReadiness(ProResReadiness.READY_R2)
@@ -309,8 +475,12 @@ def check_prores_readiness(
             detail="This job did not request UMG delivery; ProRes not available.",
         )
 
-    # 4. Mid-transcode: short-wait for completion.
-    if _short_wait_for_lock(job_id, file_type, max_wait_seconds=short_wait_seconds):
+    # 4. Mid-transcode: short-wait for completion. Same freshness contract as
+    # step 1 — only serve the just-landed .mov if it's at least as new as the
+    # source (a completing transcode produces a fresh file; the guard is
+    # defense-in-depth so this path can never 200 a stale cut).
+    if (_short_wait_for_lock(job_id, file_type, max_wait_seconds=short_wait_seconds)
+            and _mov_is_fresh(final_path, source_local)):
         return ProResReadiness(ProResReadiness.READY_LOCAL, local_path=final_path)
 
     # If we hit here and the lock is STILL held, the transcode is going
@@ -323,8 +493,6 @@ def check_prores_readiness(
         )
 
     # 5. Source MP4 missing locally AND not in R2 → can't transcode.
-    source_filename, source_key_name = _SOURCE_MP4[file_type]
-    source_local = os.path.join(OUTPUTS_DIR, job_id, source_filename)
     if not os.path.exists(source_local) and not s3_keys.get(source_key_name):
         return ProResReadiness(
             ProResReadiness.SOURCE_MISSING,
@@ -339,3 +507,90 @@ def check_prores_readiness(
         retry_after_seconds=60,
         detail="ProRes transcode queued; please retry in ~60 seconds.",
     )
+
+
+def scan_stale_prores(limit: int = 300) -> list[dict]:
+    """Detecta masters ProRes más viejos que su MP4 fuente (drift de cache).
+
+    Guardia post-incidente 2026-06-10: los edits previos al fix de
+    invalidación (#622) dejaron 15 masters stale latentes que solo se
+    descubrieron cuando una operadora de universal_argentina descargó
+    uno. Este scan es la versión automática de la auditoría manual de
+    ese día: si un .mov en R2 es más viejo que el lyric_video.mp4 del
+    que debería derivar, la descarga va a servir un cut viejo.
+
+    Solo LECTURA (head_object x2 por job con ambos keys). El remediador
+    es scripts/fix_stale_prores.py --apply --rewarm por cada job_id
+    reportado.
+
+    Returns:
+        Lista de dicts {job_id, tenant_id, lag_seconds} — vacía si todo
+        está fresco.
+    """
+    from database import SessionLocal, Job
+    import storage as _storage
+
+    if not _storage.is_enabled():
+        return []
+    client = _storage._get_client()
+    if client is None:
+        return []
+
+    # Fetch only the columns we need and close the session immediately —
+    # the S3 head_object loop below can take several minutes (up to 300
+    # jobs × 2 calls each), which exceeds Neon's 5-minute idle timeout.
+    # Keeping an open session across those calls causes "SSL connection
+    # has been closed unexpectedly" on db.close() (Sentry #7548893603).
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(Job.job_id, Job.tenant_id, Job.s3_keys)
+            .filter(Job.s3_keys.isnot(None))
+            .order_by(Job.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+    finally:
+        db.close()
+
+    stale: list[dict] = []
+    for job_id, tenant_id, s3_keys in rows:
+        s3 = s3_keys or {}
+        master_key = s3.get("umg_master")
+        video_key = s3.get("video")
+        if not master_key or not video_key:
+            continue
+        try:
+            m = client.head_object(Bucket=_storage.R2_BUCKET, Key=master_key)["LastModified"]
+            v = client.head_object(Bucket=_storage.R2_BUCKET, Key=video_key)["LastModified"]
+        except Exception:
+            # Objeto borrado/permiso/red — no es señal de staleness.
+            continue
+        if m < v:
+            stale.append({
+                "job_id": job_id,
+                "tenant_id": tenant_id,
+                "lag_seconds": int((v - m).total_seconds()),
+            })
+
+    if stale:
+        logger.warning(
+            "[PRORES][STALE-SCAN] %d master(s) más viejos que su MP4: %s",
+            len(stale), ", ".join(s["job_id"] for s in stale),
+        )
+        # Sentry con fingerprint estable (estilo #630): UN issue agrupado
+        # cuyo event count crece — las alert rules disparan por frecuencia.
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as _scope:
+                _scope.fingerprint = ["stale-prores-scan"]
+                _scope.set_extra("stale_jobs", stale[:50])
+                _scope.set_extra("count", len(stale))
+                sentry_sdk.capture_message(
+                    f"[PRORES][STALE-SCAN] {len(stale)} master(s) stale — "
+                    "remediar con scripts/fix_stale_prores.py",
+                    level="error",
+                )
+        except Exception:
+            pass
+    return stale

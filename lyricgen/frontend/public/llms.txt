@@ -1,0 +1,34 @@
+# GenLy AI
+
+> GenLy AI is a web application for creating lyric videos with generative visual direction.
+
+Canonical website: https://app.genly.pro/
+
+## What GenLy does
+
+GenLy turns an MP3 or WAV song into a lyric video workflow. It transcribes and synchronizes lyrics, lets the user correct text and timing, builds an AI-generated visual direction, and produces a Full HD 16:9 lyric video, a 30-second vertical Short, and a JPG thumbnail.
+
+## Visual direction system
+
+GenLy is not a library of closed video templates. Users can direct the result through three real modes: Auto, Inspired by lyrics, or a custom prompt. The current product includes controls for musical genre, 15 visual concepts, background motion, color palette, custom colors, visual effects, typography, lyrics animation, and transitions.
+
+The Inspired by lyrics mode uses the lyrics to determine the visual subject while the selected concept determines the aesthetic language. A custom prompt can be followed literally or enriched by the system.
+
+## Editing and review
+
+Users can edit lyrics text and timing in a timeline, preview synchronization, configure typography and animation, generate visual variants while keeping the audio and lyrics, and review work from the history screen.
+
+## Multi-scene
+
+The optional multi-scene mode organizes visual scenes around song sections, uses a shared visual identity, and allows individual scenes to be reviewed or regenerated. Multi-scene consumes additional credits.
+
+## Current limits and qualified features
+
+- The creation wizard currently accepts batches of up to five MP3 or WAV files.
+- ProRes, broadcast delivery, and Google Drive are available only for enabled accounts.
+- Standard output includes a Full HD lyric video, vertical Short, and thumbnail.
+- GenLy does not claim guaranteed render times, perfect synchronization, or universal Content ID immunity.
+
+## Intended users
+
+GenLy is designed for artists, producers, content teams, and music labels that want generative visuals without giving up creative review and control.
