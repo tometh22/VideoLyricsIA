@@ -146,3 +146,69 @@ describe("SingleGeneratingHero (honest progress)", () => {
     expect(screen.getByText("hero.eta_almost_done")).toBeTruthy();
   });
 });
+
+// Regression for the 2026-07-27 freeze: a silent /generate 4xx set the
+// single-song job to status="error" and the hero kept rendering the
+// "Construyendo tu video" spinner forever. The single-song view must be a
+// TOTAL function over status — every terminal-but-not-successful state, plus
+// any stalled/unknown state, renders a dead-end card with an escape hatch.
+describe("single-song view is total over status (no frozen spinner)", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("renders an error card (not the spinner) for a job in error, showing the message", () => {
+    renderBatch({
+      job_id: null,
+      filename: "audio.mp3",
+      status: "error",
+      error: "La sesión expiró antes de generar. Re-subí el audio para regenerar.",
+    });
+    expect(screen.getByText(/La sesión expiró/)).toBeTruthy();
+    expect(screen.getByText("hero.error_title")).toBeTruthy();
+    // The generating spinner ("Construyendo tu video" label) must NOT render.
+    expect(screen.queryByText("hero.label")).toBeNull();
+  });
+
+  it.each(["validation_failed", "rejected"])(
+    "renders the error card for terminal-non-success status %s",
+    (status) => {
+      renderBatch({ job_id: "e1", filename: "x.wav", status, error: "Contenido bloqueado" });
+      expect(screen.getByText("Contenido bloqueado")).toBeTruthy();
+      expect(screen.queryByText("hero.label")).toBeNull();
+    },
+  );
+
+  it("renders an escape card immediately for a ghost bg_preview_done job", () => {
+    // This is the a52795cd8c98 shape: a terminal ghost that leaked into the
+    // jobs array. It must never show the infinite spinner.
+    renderBatch({ job_id: "g1", filename: "x.wav", status: "bg_preview_done", current_step: "cached", progress: 28 });
+    expect(screen.getByText("hero.stalled_title")).toBeTruthy();
+    expect(screen.queryByText("hero.label")).toBeNull();
+  });
+
+  it("swaps the spinner for the stalled card when the worker stops advancing", () => {
+    renderBatch({
+      job_id: "w1",
+      filename: "x.wav",
+      status: "processing",
+      current_step: "background",
+      step_text_es: "Generando el fondo cinematográfico",
+      progress: 22,
+      eta_s: 180,
+    });
+    // Before the watchdog trips, the spinner is shown.
+    expect(screen.getByText("Generando el fondo cinematográfico")).toBeTruthy();
+    act(() => { vi.advanceTimersByTime(46_000); });
+    expect(screen.getByText("hero.stalled_title")).toBeTruthy();
+    expect(screen.queryByText("Generando el fondo cinematográfico")).toBeNull();
+  });
+
+  it("never freezes on an unknown non-terminal status (escapes via watchdog)", () => {
+    renderBatch({ job_id: "u1", filename: "x.wav", status: "quantum_flux", current_step: "background", progress: 30 });
+    // Unknown status is treated as generating initially...
+    expect(screen.getByText("hero.label")).toBeTruthy();
+    // ...but the watchdog guarantees an escape.
+    act(() => { vi.advanceTimersByTime(46_000); });
+    expect(screen.getByText("hero.stalled_title")).toBeTruthy();
+  });
+});

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
+import { isErrorStatus, isTerminalStatus } from "../lib/jobStatus";
 import MediaPreview from "./MediaPreview";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -181,6 +182,112 @@ export function SingleGeneratingHero({
   );
 }
 
+// Shared inline error message box. Extracted 2026-07-27 so the batch row and
+// the single-song error card render errors identically (one implementation).
+function JobErrorMessage({ error }) {
+  if (!error) return null;
+  return (
+    <div className="mt-2 px-3 py-2 rounded-lg bg-red-500/5 border border-red-500/10">
+      <p className="text-[11px] text-red-400/80">{error}</p>
+    </div>
+  );
+}
+
+// ─── Single-song dead-end cards ──────────────────────────────────────────────
+// The single-song "generating" view (SingleGeneratingHero) is purely
+// declarative and has no terminal/error branch. Before 2026-07-27, ANY job
+// that reached a terminal-but-not-successful status (error / validation_failed
+// / rejected / a ghost bg_preview_done / a stalled worker) kept rendering the
+// spinner forever — the operator saw "Generando el fondo cinematográfico" with
+// no way out. These cards make every non-happy path a visible dead-end with an
+// escape hatch, so the freeze can't recur.
+
+// Shell shared by the error and stalled cards — same glass look as the hero.
+function SingleDeadEndCard({ icon, title, description, error, actionLabel, onAction }) {
+  return (
+    <div className="relative w-full max-w-2xl mt-12 animate-fade-in">
+      <div className="relative z-10 rounded-3xl bg-white/[0.03] ring-1 ring-white/[0.08] backdrop-blur-md px-8 py-12 text-center">
+        <div className="w-14 h-14 mx-auto mb-5 rounded-2xl bg-red-500/10 ring-1 ring-red-500/20 flex items-center justify-center">
+          {icon}
+        </div>
+        <h1 className="text-2xl sm:text-3xl font-bold text-white mb-2 leading-tight">
+          {title}
+        </h1>
+        {description && <p className="text-sm text-white/55 mb-4">{description}</p>}
+        {error && (
+          <div className="max-w-md mx-auto text-left">
+            <JobErrorMessage error={error} />
+          </div>
+        )}
+        <div className="mt-8 flex justify-center">
+          <button onClick={onAction} className="btn-primary h-11 px-6 text-sm">
+            {actionLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function SingleErrorHero({ job, t, onReset }) {
+  const errorIcon = (
+    <svg className="w-7 h-7 text-red-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+      <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" />
+    </svg>
+  );
+  return (
+    <SingleDeadEndCard
+      icon={errorIcon}
+      title={t("hero.error_title") || "No pudimos generar tu video"}
+      error={job?.error || (t("hero.error_generic") || "Ocurrió un error inesperado al generar el video.")}
+      actionLabel={t("hero.error_action") || "Volver a crear video"}
+      onAction={() => onReset?.()}
+    />
+  );
+}
+
+export function SingleStalledHero({ t, onReset }) {
+  const stallIcon = (
+    <svg className="w-7 h-7 text-amber-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="10" /><path d="M12 6v6l4 2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+  return (
+    <SingleDeadEndCard
+      icon={stallIcon}
+      title={t("hero.stalled_title") || "Esto está tardando más de lo normal"}
+      description={t("hero.stalled_desc") || "No estamos recibiendo novedades del proceso. Podés volver a crear el video."}
+      actionLabel={t("hero.error_action") || "Volver a crear video"}
+      onAction={() => onReset?.()}
+    />
+  );
+}
+
+// Wraps SingleGeneratingHero with a stall watchdog. If the worker stops
+// advancing (no change in progress/step/eta/status) for `stallMs`, we swap the
+// spinner for SingleStalledHero so an unknown-future status or a dead worker
+// can never freeze the screen indefinitely. The timer resets on every real
+// advance, so legitimately slow steps (e.g. Veo renders) don't trip it.
+function SingleGeneratingWithWatchdog({ heroProps, status, onReset, t, stallMs = 45_000 }) {
+  const [stalled, setStalled] = useState(false);
+  const lastAdvanceRef = useRef(Date.now());
+
+  useEffect(() => {
+    lastAdvanceRef.current = Date.now();
+    setStalled(false);
+  }, [heroProps.progressPct, heroProps.currentStep, heroProps.stepTextEs, heroProps.etaS, status]);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (Date.now() - lastAdvanceRef.current >= stallMs) setStalled(true);
+    }, 5_000);
+    return () => clearInterval(id);
+  }, [stallMs]);
+
+  if (stalled) return <SingleStalledHero t={t} onReset={onReset} />;
+  return <SingleGeneratingHero {...heroProps} t={t} />;
+}
+
 
 function JobRow({ job, index, t, onSelectJob }) {
   const { filename, status, current_step, progress, job_id, error,
@@ -273,11 +380,7 @@ function JobRow({ job, index, t, onSelectJob }) {
           <div className="h-full rounded-full bg-gradient-to-r from-brand to-brand-light transition-all duration-700" style={{ width: `${progress}%` }} />
         </div>
       )}
-      {status === "error" && error && (
-        <div className="mt-2 px-3 py-2 rounded-lg bg-red-500/5 border border-red-500/10">
-          <p className="text-[11px] text-red-400/80">{error}</p>
-        </div>
-      )}
+      {status === "error" && <JobErrorMessage error={error} />}
     </div>
   );
 }
@@ -721,7 +824,22 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
   // (información denser cuando son varios).
   if (isSingle && !allDone) {
     const heroJob = jobs[0] || {};
-    const heroName = (heroJob.song_title || (heroJob.filename || "").replace(/\.(mp3|wav)$/i, "")).trim();
+    // TOTAL dispatch over status — every terminal-but-not-successful state
+    // must render a dead-end card, NEVER the generating spinner (audit
+    // 2026-07-27: a silent /generate 4xx set status="error" and the hero
+    // froze forever on the optimistic "Generando el fondo" snapshot).
+    if (isErrorStatus(heroJob.status)) {
+      return <SingleErrorHero job={heroJob} t={t} onReset={onReset} />;
+    }
+    if (isTerminalStatus(heroJob.status)) {
+      // Terminal but neither success (handled by allDone/redirect above) nor
+      // error — e.g. a ghost bg_preview_done that leaked into the jobs array.
+      // Dead-end with an escape hatch instead of a frozen spinner.
+      return <SingleStalledHero t={t} onReset={onReset} />;
+    }
+    // Actively generating (or an unknown NON-terminal status) → spinner, but
+    // wrapped in a watchdog so a dead worker / future status can't freeze it.
+    const heroName = (heroJob.song_title || heroJob.songTitle || (heroJob.filename || "").replace(/\.(mp3|wav)$/i, "")).trim();
     const heroArtist = (heroJob.artist || "").trim();
     // Use the job's REAL per-step progress (0-100) from the SSE payload,
     // NOT the batch-level (done/total) which only ever reads 0% or 100%
@@ -730,14 +848,18 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
     const heroProgress = typeof heroJob.progress === "number"
       ? Math.max(5, heroJob.progress)
       : 5;
-    return <SingleGeneratingHero
-      jobName={heroName}
-      artist={heroArtist}
-      progressPct={heroProgress}
-      currentStep={heroJob.current_step}
-      stepTextEs={heroJob.step_text_es}
-      etaS={typeof heroJob.eta_s === "number" ? heroJob.eta_s : null}
+    return <SingleGeneratingWithWatchdog
+      status={heroJob.status}
+      onReset={onReset}
       t={t}
+      heroProps={{
+        jobName: heroName,
+        artist: heroArtist,
+        progressPct: heroProgress,
+        currentStep: heroJob.current_step,
+        stepTextEs: heroJob.step_text_es,
+        etaS: typeof heroJob.eta_s === "number" ? heroJob.eta_s : null,
+      }}
     />;
   }
 
