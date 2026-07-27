@@ -39,6 +39,7 @@ from pipeline import (  # noqa: E402
     _MOVEMENT_STYLE_RULES,
     _normalize_movement_style,
 )
+from fx_compositor import EFFECTS as EFFECT_CODES  # noqa: E402
 
 FIXTURE_PATH = os.path.join(
     os.path.dirname(__file__), "..", "..", "frontend", "src", "shared", "renderParity.json"
@@ -129,6 +130,7 @@ def build_fixture() -> dict:
             "fonts": sorted(f["id"] for f in _FONT_CATALOGUE),
             "concepts": sorted(_CONCEPT_SCENE_GUIDE.keys()),
             "movements": sorted(_MOVEMENT_STYLE_RULES.keys()),
+            "effects": sorted(EFFECT_CODES),
         },
         # Tabla de verdad de _normalize_movement_style. `movement_style` viaja
         # como TEXTO LIBRE y se persiste CRUDO en render_params, así que el

@@ -22,7 +22,12 @@ import {
   fadeSeconds,
   lyricFontPx,
 } from "./lyricTiers";
-import { CONCEPT_CODES, MOVEMENT_CODES, normalizeMovementCode } from "./catalogCodes";
+import {
+  CONCEPT_CODES,
+  EFFECT_CODES,
+  MOVEMENT_CODES,
+  normalizeMovementCode,
+} from "./catalogCodes";
 import { FONT_BY_CODE } from "../components/fontCatalog";
 
 describe("render parity: font sizes", () => {
@@ -84,6 +89,10 @@ describe("render parity: option catalogs (dropdown promises = worker delivery)",
 
   it("movement codes match pipeline._MOVEMENT_STYLE_RULES keys", () => {
     expect([...MOVEMENT_CODES].sort()).toEqual(fixture.catalogs.movements);
+  });
+
+  it("effect codes match fx_compositor.EFFECTS", () => {
+    expect([...EFFECT_CODES].sort()).toEqual(fixture.catalogs.effects);
   });
 });
 

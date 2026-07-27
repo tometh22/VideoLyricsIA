@@ -533,6 +533,16 @@ export default function WizardLivePreview({
               snow: "brightness(1.15)",
               rain: "brightness(1.1)",
               light: "brightness(1.1)",
+              aurora: "brightness(1.2) saturate(1.15)",
+              dust: "brightness(1.25) contrast(1.1)",
+              embers: "brightness(1.3) saturate(1.2)",
+              petals: "brightness(1.15) saturate(1.1)",
+              prism: "brightness(1.2) saturate(1.25)",
+              confetti: "brightness(1.1) saturate(1.2)",
+              film: "brightness(1.2) contrast(1.15) sepia(0.12)",
+              scanlines: "brightness(1.25) saturate(1.2)",
+              fog: "brightness(1.25)",
+              shapes: "brightness(1.2) saturate(1.15)",
             }[effect] || "none",
           }}
           autoPlay loop muted playsInline

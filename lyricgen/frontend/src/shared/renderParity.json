@@ -18,6 +18,23 @@
    "urbano",
    "vintage"
   ],
+  "effects": [
+   "aurora",
+   "bokeh",
+   "confetti",
+   "dust",
+   "embers",
+   "film",
+   "fog",
+   "light",
+   "petals",
+   "prism",
+   "rain",
+   "scanlines",
+   "shapes",
+   "snow",
+   "stars"
+  ],
   "fonts": [
    "anton",
    "bebas-neue",

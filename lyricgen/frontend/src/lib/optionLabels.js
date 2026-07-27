@@ -30,10 +30,16 @@ export const EFFECT_LABELS = (t) => ({
   stars: t("upload.effect_stars") || "Estrellas",
   light: t("upload.effect_light") || "Luces",
   bokeh: t("upload.effect_bokeh") || "Bokeh",
-  // aurora está comentado en el picker (deshabilitado), pero jobs viejos lo
-  // tienen persistido en render_params: la ficha tiene que poder nombrarlo en
-  // vez de mostrar el código crudo.
   aurora: t("upload.effect_aurora") || "Aurora",
+  dust: t("upload.effect_dust") || "Polvo de luz",
+  embers: t("upload.effect_embers") || "Chispas",
+  petals: t("upload.effect_petals") || "Pétalos",
+  prism: t("upload.effect_prism") || "Prisma",
+  confetti: t("upload.effect_confetti") || "Confeti",
+  film: t("upload.effect_film") || "Película",
+  scanlines: t("upload.effect_scanlines") || "Barrido retro",
+  fog: t("upload.effect_fog") || "Niebla",
+  shapes: t("upload.effect_shapes") || "Figuras",
 });
 
 /**
