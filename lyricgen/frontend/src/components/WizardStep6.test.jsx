@@ -141,28 +141,47 @@ describe("LyricsEditor — hideTypographyControls (Phase 2)", () => {
 
 import { useState, useEffect } from "react";
 
-function MockWizardLayout({ hasReviewableContent, renderStep6 }) {
+function MockWizardLayout({
+  hasReviewableContent,
+  renderStep6,
+  variantMode = false,
+  editMode = false,
+}) {
+  const guidedExistingJobMode = editMode || variantMode;
   const WIZARD_STEPS = [
     { id: 1, label: "Subí" },
     { id: 2, label: "Modo" },
     { id: 3, label: "Movimiento" },
     { id: 4, label: "Animación" },
     { id: 5, label: "Entregá" },
-    { id: 6, label: "Lyrics" },
+    { id: 6, label: variantMode ? "Resumen" : "Lyrics" },
   ];
-  const [wizardStep, setWizardStep] = useState(1);
-  const _maxInteractiveStep = hasReviewableContent ? 6 : 5;
-  const goStep = (n) => setWizardStep(Math.max(1, Math.min(_maxInteractiveStep, n)));
+  const locked = new Set(guidedExistingJobMode ? [1, 5] : []);
+  const displaySteps = guidedExistingJobMode
+    ? WIZARD_STEPS.filter((step) => !locked.has(step.id))
+    : WIZARD_STEPS;
+  const [wizardStep, setWizardStep] = useState(guidedExistingJobMode ? 2 : 1);
+  const _maxInteractiveStep = hasReviewableContent || locked.size > 0 ? 6 : 5;
+  const goStep = (n) => {
+    const clamped = Math.max(1, Math.min(_maxInteractiveStep, n));
+    if (!locked.has(clamped)) setWizardStep(clamped);
+  };
+  const findNextUnlocked = (n) => {
+    for (let i = n + 1; i <= _maxInteractiveStep; i++) {
+      if (!locked.has(i)) return i;
+    }
+    return null;
+  };
   useEffect(() => {
-    if (hasReviewableContent && wizardStep !== 6) setWizardStep(6);
-    else if (!hasReviewableContent && wizardStep === 6) setWizardStep(5);
+    if (!guidedExistingJobMode && hasReviewableContent && wizardStep !== 6) setWizardStep(6);
+    else if (!guidedExistingJobMode && !hasReviewableContent && wizardStep === 6) setWizardStep(5);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasReviewableContent]);
+  }, [hasReviewableContent, guidedExistingJobMode]);
 
   return (
     <div>
       <nav>
-        {WIZARD_STEPS.map((s) => {
+        {displaySteps.map((s, displayIndex) => {
           const isLyrics = s.id === 6;
           const disabled = isLyrics && !hasReviewableContent;
           return (
@@ -175,6 +194,9 @@ function MockWizardLayout({ hasReviewableContent, renderStep6 }) {
               data-active={wizardStep === s.id ? "true" : "false"}
               data-testid={`step-${s.id}`}
             >
+              <span data-testid={`step-number-${s.id}`}>
+                {guidedExistingJobMode ? displayIndex + 1 : s.id}
+              </span>
               {s.label}
             </button>
           );
@@ -185,6 +207,21 @@ function MockWizardLayout({ hasReviewableContent, renderStep6 }) {
           <div data-testid="upload-content">Step {wizardStep} content</div>
         )}
       </div>
+      {wizardStep < 6 && (
+        hasReviewableContent && !guidedExistingJobMode ? (
+          <button type="button" data-testid="primary-cta" onClick={() => goStep(6)}>
+            Volver a lyrics
+          </button>
+        ) : (
+          <button
+            type="button"
+            data-testid="primary-cta"
+            onClick={() => goStep(findNextUnlocked(wizardStep))}
+          >
+            Continuar
+          </button>
+        )
+      )}
     </div>
   );
 }
@@ -268,5 +305,73 @@ describe("Wizard step 6 — auto-advance + render prop (Phase 2)", () => {
     // El step activo sigue siendo el 1 (no avanzó).
     expect(screen.getByTestId("step-1").getAttribute("data-active")).toBe("true");
     expect(screen.queryByTestId("review-injected")).not.toBeInTheDocument();
+  });
+
+  it("starts a variant at Modo and only shows its four real steps", () => {
+    render(
+      <MockWizardLayout
+        variantMode
+        hasReviewableContent
+        renderStep6={() => <div data-testid="variant-summary">summary</div>}
+      />,
+    );
+
+    expect(screen.queryByTestId("step-1")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("step-5")).not.toBeInTheDocument();
+    expect(screen.getByTestId("step-2").getAttribute("data-active")).toBe("true");
+    expect(screen.getByTestId("step-number-2")).toHaveTextContent("1");
+    expect(screen.getByTestId("step-number-6")).toHaveTextContent("4");
+    expect(screen.queryByTestId("variant-summary")).not.toBeInTheDocument();
+  });
+
+  it("keeps Continuar through a variant and reaches Resumen in order", () => {
+    render(
+      <MockWizardLayout
+        variantMode
+        hasReviewableContent
+        renderStep6={() => <div data-testid="variant-summary">summary</div>}
+      />,
+    );
+
+    const continueButton = screen.getByTestId("primary-cta");
+    expect(continueButton).toHaveTextContent("Continuar");
+
+    fireEvent.click(continueButton);
+    expect(screen.getByTestId("step-3").getAttribute("data-active")).toBe("true");
+    expect(screen.getByTestId("primary-cta")).toHaveTextContent("Continuar");
+
+    fireEvent.click(screen.getByTestId("primary-cta"));
+    expect(screen.getByTestId("step-4").getAttribute("data-active")).toBe("true");
+
+    fireEvent.click(screen.getByTestId("primary-cta"));
+    expect(screen.getByTestId("step-6").getAttribute("data-active")).toBe("true");
+    expect(screen.getByTestId("step-6")).toHaveTextContent("Resumen");
+    expect(screen.getByTestId("variant-summary")).toBeInTheDocument();
+  });
+
+  it("uses the same guided order for editing, ending in editable Lyrics", () => {
+    render(
+      <MockWizardLayout
+        editMode
+        hasReviewableContent
+        renderStep6={() => <div data-testid="lyrics-editor">editor</div>}
+      />,
+    );
+
+    expect(screen.queryByTestId("step-1")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("step-5")).not.toBeInTheDocument();
+    expect(screen.getByTestId("step-2").getAttribute("data-active")).toBe("true");
+    expect(screen.getByTestId("step-number-2")).toHaveTextContent("1");
+    expect(screen.getByTestId("step-6")).toHaveTextContent("Lyrics");
+    expect(screen.getByTestId("primary-cta")).toHaveTextContent("Continuar");
+
+    fireEvent.click(screen.getByTestId("primary-cta"));
+    expect(screen.getByTestId("step-3").getAttribute("data-active")).toBe("true");
+    fireEvent.click(screen.getByTestId("primary-cta"));
+    expect(screen.getByTestId("step-4").getAttribute("data-active")).toBe("true");
+    fireEvent.click(screen.getByTestId("primary-cta"));
+
+    expect(screen.getByTestId("step-6").getAttribute("data-active")).toBe("true");
+    expect(screen.getByTestId("lyrics-editor")).toBeInTheDocument();
   });
 });

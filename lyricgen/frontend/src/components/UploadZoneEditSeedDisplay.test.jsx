@@ -98,12 +98,13 @@ function Harness({ variantMode = false, jobFields = JOB_FIELDS }) {
 }
 
 // El paso del wizard es state INTERNO de UploadZone, no un prop: hay que
-// navegar como el operador. El rail tiene un botón por paso, en orden.
+// navegar como el operador. Los flujos sobre jobs existentes ocultan los
+// pasos heredados, por eso buscamos el id interno y no la posición visual.
 // Paso 3 = Movimiento + Efecto; paso 4 = Tipografía.
 function goStep(n) {
-  const rail = document.querySelectorAll(".wizard-step-rail button");
-  expect(rail.length).toBeGreaterThanOrEqual(n);
-  fireEvent.click(rail[n - 1]);
+  const step = document.querySelector(`[data-wizard-step="${n}"]`);
+  expect(step).not.toBeNull();
+  fireEvent.click(step);
 }
 
 const pressed = (selector) =>
