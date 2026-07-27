@@ -765,19 +765,26 @@ export default function UploadZone({
     { id: 5, label: t("upload.step_deliver") || "Entregá" },
     { id: 6, label: t("upload.step_lyrics") || "Lyrics" },
   ];
-  // En modo post-render edit (lockedSteps no vacío + content reviewable
-  // pre-seeded) arrancamos directo en step 6 para que el operador no vea
-  // un flash del paso 1 mientras el useEffect de auto-advance se acomoda.
-  //
-  // RACE GUARD 2026-05-27 (fix/edit-lyrics-bootstrap-race): en prod un bug
-  // ponía esto en step 1 ("Crear videos") cuando el operador abría
-  // /videos/X/edit-lyrics y currentReview se reseteaba a null por race.
-  // Con lockedSteps.length>0 sabemos que el padre ya intentó montarnos en
-  // modo post-render edit; el currentReview puede llegar después (Phase B
-  // del bootstrap), pero el step 6 ya es el correcto desde el initial
-  // mount. NO REQUIERE hasReviewableContent. Para wizard nuevo (no edit),
-  // lockedSteps es [] así que sigue arrancando en step 1.
+  // Al editar o crear una variante se heredan el audio y los metadatos de
+  // entrega. Mostrar esos pasos como 1/5 deshabilitados hacía que el flujo
+  // pareciera empezar a mitad de camino. Para el operador sus cuatro pasos
+  // reales son Modo → Movimiento → Tipografía → Lyrics/Resumen, numerados 1–4.
+  const _guidedExistingJobMode = editMode;
+  const _displayWizardSteps = _guidedExistingJobMode
+    ? WIZARD_STEPS
+        .filter((s) => s.id !== 1 && s.id !== 5)
+        .map((s) => (
+          variantMode && s.id === 6
+            ? { ...s, label: t("variant.step_summary") || "Resumen" }
+            : s
+        ))
+    : WIZARD_STEPS;
+  // Los flujos sobre un video existente son guiados: empiezan en su primer
+  // paso editable (Modo, id interno 2) y llegan a Lyrics/Resumen en orden.
+  // El fallback a step 6 conserva el bootstrap defensivo histórico para
+  // cualquier caller con lockedSteps que no declare editMode.
   const [wizardStep, setWizardStep] = useState(() => {
+    if (_guidedExistingJobMode) return 2;
     if (Array.isArray(lockedSteps) && lockedSteps.length > 0) return 6;
     return 1;
   });
@@ -821,24 +828,22 @@ export default function UploadZone({
     }
     setWizardStep(clamped);
   };
-  // Auto-advance a step 6 cuando aparece contenido de review O cuando
-  // lockedSteps indica modo post-render edit. Y bajar a step 5 si el
-  // operador clickea "Volver" y desaparece TODO el contexto de review.
+  // Auto-advance a step 6 cuando aparece contenido de review en una creación
+  // nueva. Editar y Variante ya traen contenido reviewable desde el primer
+  // render, pero no deben saltarse su configuración: recorren
+  // Modo → Movimiento → Tipografía → Lyrics/Resumen.
   //
-  // RACE GUARD 2026-05-27: agregamos lockedSteps al check porque en el
-  // bug reportado, currentReview tarda en llegar (Phase B del bootstrap
-  // de EditLyricsRoute) pero lockedSteps ya viene set desde el primer
-  // render. Sin esta defensa, hay una ventana donde el editor monta en
-  // step 1 ("Crear videos") visible al operador.
+  // El fallback por lockedSteps conserva compatibilidad con callers legacy;
+  // editMode/variantMode usan el recorrido guiado y no auto-avanzan.
   const _editMode = Array.isArray(lockedSteps) && lockedSteps.length > 0;
   useEffect(() => {
-    if ((hasReviewableContent || _editMode) && wizardStep !== 6) {
+    if (!_guidedExistingJobMode && (hasReviewableContent || _editMode) && wizardStep !== 6) {
       setWizardStep(6);
-    } else if (!hasReviewableContent && !_editMode && wizardStep === 6) {
+    } else if (!_guidedExistingJobMode && !hasReviewableContent && !_editMode && wizardStep === 6) {
       setWizardStep(5);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasReviewableContent, _editMode]);
+  }, [hasReviewableContent, _editMode, _guidedExistingJobMode]);
 
   // Hovering a movement option previews it in the big stage without committing.
   const [hoverMovement, setHoverMovement] = useState(null);
@@ -3363,16 +3368,15 @@ export default function UploadZone({
         {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile).
             Paso 6 "Lyrics" se ve siempre; está deshabilitado hasta que
             haya contenido reviewable (hasReviewableContent prop). Cuando
-            se activa, el useEffect de arriba auto-avanza el wizard a
-            step 6 y permite navegar libremente entre 4↔6 (operador
-            cambia font/animation en paso 4, vuelve a paso 6 a aprobar).
+            se activa, una creación nueva auto-avanza a step 6. Editar y
+            Variante recorren sus cuatro pasos en orden.
 
             QA fix 2026-05-28 (UX): la versión anterior ocultaba labels en
             step 6 para ganar espacio. Operador reportó que no se entendía
             qué era cada paso. Volvemos a mostrar labels SIEMPRE — el
             grid arriba se ajustó a 168 px de sidebar para acomodarlas. */}
         <nav className="wizard-step-rail flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto lg:overflow-visible lg:sticky lg:top-4 w-full lg:w-auto order-first [.editor-focus-mode_&]:hidden">
-          {WIZARD_STEPS.map((s) => {
+          {_displayWizardSteps.map((s, displayIndex) => {
             const isLyrics = s.id === 6;
             const lyricsDisabled = isLyrics && !hasReviewableContent;
             const locked = _lockedSet.has(s.id);
@@ -3383,6 +3387,7 @@ export default function UploadZone({
               <button
                 key={s.id}
                 type="button"
+                data-wizard-step={s.id}
                 onClick={() => { if (!disabled) goStep(s.id); }}
                 disabled={disabled}
                 aria-disabled={disabled}
@@ -3403,7 +3408,7 @@ export default function UploadZone({
                            : active ? "bg-brand text-white"
                                     : done ? "bg-accent/20 text-accent"
                                            : "bg-surface-3 text-gray-400"
-                }`}>{done ? "✓" : s.id}</span>
+                }`}>{done ? "✓" : (_guidedExistingJobMode ? displayIndex + 1 : s.id)}</span>
                 <span className="ml-0">{s.label}</span>
               </button>
             );
@@ -4671,7 +4676,11 @@ export default function UploadZone({
           <div className="w-full flex flex-wrap items-center gap-3">
             <div className="flex-1 min-w-0">
               <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
-                {t("upload.step")} {wizardStep}/{WIZARD_STEPS.length} · {WIZARD_STEPS[wizardStep - 1]?.label}
+                {t("upload.step")} {
+                  Math.max(1, _displayWizardSteps.findIndex((s) => s.id === wizardStep) + 1)
+                }/{_displayWizardSteps.length} · {
+                  _displayWizardSteps.find((s) => s.id === wizardStep)?.label
+                }
               </p>
               <p className="text-sm text-white truncate mt-0.5">{summary}</p>
               {!allHaveArtist && (
@@ -4698,12 +4707,10 @@ export default function UploadZone({
               );
             })()}
 
-            {/* Phase 2 (2026-05-25): cuando el operador ya está en review
-                (hasReviewableContent=true) y vuelve a un paso anterior para
-                ajustar font/animation/movement, el CTA principal cambia a
-                "Volver a lyrics" para que pueda regresar al editor con 1
-                click, sin re-disparar onStartReview. */}
-            {hasReviewableContent && wizardStep < 6 ? (
+            {/* En una creación nueva ya revisada, volver a un ajuste ofrece
+                el atajo "Volver a lyrics". Editar y Variante son recorridos
+                guiados y mantienen "Continuar" entre sus cuatro pasos. */}
+            {hasReviewableContent && !_guidedExistingJobMode && wizardStep < 6 ? (
               <button
                 onClick={() => goStep(6)}
                 className="btn-primary h-11 px-6"
@@ -4719,7 +4726,7 @@ export default function UploadZone({
                 // lockeado, saltea al siguiente navegable. Si no hay más
                 // pasos navegables, no mostramos botón.
                 const next = _findNextUnlocked(wizardStep);
-                if (next == null || next > 5) return null;
+                if (next == null) return null;
                 return (
                   <button
                     onClick={() => goStep(next)}

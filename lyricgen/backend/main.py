@@ -5565,6 +5565,9 @@ async def _run_transcription_for_job(
             _slice_audio_prefix, _slice_audio_window, _verify_lrclib_alignment,
             _detect_hallucination, _synthesize_segments_from_plain,
             _align_whisper_to_plain, _fill_gaps_with_reference,
+            _initial_asr_lyrics_hint, _plain_lyrics_aligner_enabled,
+            _anchored_recovery_is_safe,
+            _fetch_lrclib_by_audio_evidence,
         )
         # Short-lived DB session JUST for the lrclib cache lookup, released
         # immediately so the connection is free during the long Whisper /
@@ -6989,7 +6992,11 @@ async def _run_transcription_for_job(
             # grounded search step entirely (lrclib already gave us a clean
             # source).
             if plain:
-                logger.info("[LYRICS] lrclib plain hit (%s chars) — running Whisper for timestamps (lyrics_hint primed), skipping Gemini", len(plain))
+                logger.info(
+                    "[LYRICS] lrclib plain hit (%s chars) — ASR-first "
+                    "(reference reserved for post-alignment), skipping Gemini",
+                    len(plain),
+                )
 
                 # Pre-Whisper intro trim. The "Video Oficial" cuts of many
                 # tracks add 30-90s of dialogue / extra music at the start
@@ -7037,9 +7044,9 @@ async def _run_transcription_for_job(
                 # song's lyrics (verified case: "El Plan de la Mariposa —
                 # El Riesgo" Video Oficial has 73 s of voice-over reciting
                 # the first verse before the song starts). Run Whisper on
-                # the intro chunk with the same lyrics_hint so it
-                # transcribes the spoken text against the known vocabulary
-                # and emits real timestamps for it. The segments returned
+                # the intro chunk with the same ASR-first policy. A recited
+                # line must not prime Whisper into repeating the known song
+                # text over the rest of the dialogue. The segments returned
                 # here are kept as-is in the user's full-audio frame
                 # (they were never shifted) and prepended to the final
                 # output so the operator sees the dialogue subtitled at
@@ -7056,10 +7063,8 @@ async def _run_transcription_for_job(
                 # lrclib-plain hit AND intro_offset > 0 — rare). Cost
                 # impact is negligible (~$0.005 extra per fire), latency
                 # reduction is ~10-15 s per affected job.
-                aligner_enabled = (
-                    os.environ.get("LRCLIB_PLAIN_ALIGNER_ENABLED", "0")
-                    .strip().lower() in ("1", "true", "yes", "on", "y", "t")
-                )
+                aligner_enabled = _plain_lyrics_aligner_enabled()
+                initial_hint = _initial_asr_lyrics_hint(plain)
                 await _step("transcribe.transcribe", 50)
 
                 intro_path = None
@@ -7078,7 +7083,12 @@ async def _run_transcription_for_job(
                         return []
                     try:
                         raw = await loop.run_in_executor(
-                            None, transcribe, intro_path, lang, plain,
+                            None,
+                            lambda: transcribe(
+                                intro_path, lang,
+                                lyrics_hint=initial_hint,
+                                return_words=True,
+                            ),
                         )
                         # Keep only segments that fully sit in the intro
                         # window; defensive against ffmpeg frame-boundary
@@ -7094,8 +7104,9 @@ async def _run_transcription_for_job(
                     return await loop.run_in_executor(
                         None,
                         lambda: transcribe(
-                            transcribe_path, lang, plain,
-                            return_words=aligner_enabled,
+                            transcribe_path, lang,
+                            lyrics_hint=initial_hint,
+                            return_words=True,
                         ),
                     )
 
@@ -7148,7 +7159,7 @@ async def _run_transcription_for_job(
                 # the first/last word in each matched span.
                 #
                 # Falls through to raw Whisper segments when:
-                #   - the env flag is off (default)
+                #   - the env kill-switch is off
                 #   - the aligner couldn't match enough lines (< 50%
                 #     coverage) — usually means Whisper missed most of
                 #     the song, in which case downstream hallucination
@@ -7194,7 +7205,10 @@ async def _run_transcription_for_job(
                         plain, user_dur, anchors=anchors,
                         start_time=intro_offset,
                     )
-                    if recovered:
+                    recovery_safe, recovery_reason = _anchored_recovery_is_safe(
+                        plain, anchors, recovered,
+                    )
+                    if recovered and recovery_safe:
                         from pipeline import _filter_intro_song_overlap
                         intro_segments, _dup = _filter_intro_song_overlap(
                             intro_segments, recovered,
@@ -7210,6 +7224,11 @@ async def _run_transcription_for_job(
                             recovery_source="lrclib_plain",
                             coverage_warning=True,
                         )
+                    logger.error(
+                        "[LYRICS] synthetic recovery rejected (%s; ASR=%s; "
+                        "anchors=%s) — preserving audio-timed output for review",
+                        recovery_reason, reason, len(anchors),
+                    )
                 # Happy path: Whisper returned plausibly-many segments.
                 # Combine intro Whisper (if any) with the body output.
                 from pipeline import _filter_intro_song_overlap
@@ -7251,41 +7270,52 @@ async def _run_transcription_for_job(
             _bg_fetch_lyrics, artist_hint, song_hint,
         ))
 
-        # When the plain-lyrics aligner is enabled, request word-level
-        # timestamps so we can re-bucket Whisper's output against the
-        # Gemini/lyrics.ovh reference's line structure (aligner pass below).
-        # Same flag the lrclib-hit path uses. Default off.
-        aligner_enabled = (
-            os.environ.get("LRCLIB_PLAIN_ALIGNER_ENABLED", "0")
-            .strip().lower() in ("1", "true", "yes", "on", "y", "t")
-        )
+        # Post-ASR alignment is default-on with a kill-switch. Word timestamps
+        # are requested regardless so raw lines can end on their last word.
+        aligner_enabled = _plain_lyrics_aligner_enabled()
 
-        # ── Pre-fetch Gemini lyrics BEFORE running Whisper ──────────────────
-        # Without this, Whisper is vocabulary-blind: it doesn't know what words
-        # to expect and confabulates (e.g. "tanto miedo tu don" for "Frágil
-        # espejo de voz"). Passing the reference text as lyrics_hint to each
-        # chunk tells Whisper the vocabulary and dramatically improves accuracy.
+        # ── Fetch Gemini in parallel, keep first-pass ASR audio-first ─────────
+        # The reference remains valuable after recognition for spelling and
+        # human line grouping. Feeding it into Whisper first caused reference
+        # parroting in the measured corpus and on the ROTOR regression track.
+        # `_initial_asr_lyrics_hint` retains an explicit rollback mode.
         #
-        # asyncio.shield() prevents the wait_for timeout from cancelling the
-        # background task — Gemini keeps running and the result is cached in
-        # Postgres for the next request regardless.
-        # Timeout: 10s — typical Gemini latency is 2-4 s on a warm request;
-        # we tolerate up to 10 s before running Whisper without a hint.
+        # In audio-first mode Whisper starts immediately while Gemini continues
+        # in parallel. Only explicit short/full rollback modes wait for Gemini
+        # before ASR, because those modes intentionally need a prompt.
         _gemini_pre = ""
-        try:
-            _gemini_pre = (
-                await asyncio.wait_for(asyncio.shield(gemini_task), timeout=10.0)
-                or ""
-            )
-            if _gemini_pre:
-                logger.info(
-                    "[LYRICS] Gemini returned %d chars before Whisper — using as lyrics_hint",
-                    len(_gemini_pre),
+        _prompt_mode = os.environ.get(
+            "WHISPER_REFERENCE_PROMPT_MODE", "off",
+        ).strip().lower()
+        if _prompt_mode not in ("", "off", "0", "false", "no"):
+            try:
+                _gemini_pre = (
+                    await asyncio.wait_for(
+                        asyncio.shield(gemini_task), timeout=10.0,
+                    )
+                    or ""
                 )
-        except asyncio.TimeoutError:
-            logger.info("[LYRICS] Gemini hint not ready in 10s — Whisper runs without hint")
-        except Exception as _e_gem:
-            logger.info("[LYRICS] Gemini pre-fetch error (%s) — Whisper runs without hint", _e_gem)
+                if _gemini_pre:
+                    logger.info(
+                        "[LYRICS] Gemini returned %d chars before Whisper — "
+                        "reference-prompt rollback mode=%s",
+                        len(_gemini_pre), _prompt_mode,
+                    )
+            except asyncio.TimeoutError:
+                logger.info(
+                    "[LYRICS] Gemini prompt not ready in 10s — Whisper runs "
+                    "audio-first",
+                )
+            except Exception as _e_gem:
+                logger.info(
+                    "[LYRICS] Gemini pre-fetch error (%s) — Whisper runs "
+                    "audio-first", _e_gem,
+                )
+        else:
+            logger.info(
+                "[LYRICS] audio-first mode — Whisper and reference lookup "
+                "running concurrently",
+            )
 
         # Pre-fetch vocal stem so the chunked Whisper-1 transcription uses
         # clean audio (no backing music). The full mix causes timing compression
@@ -7320,8 +7350,8 @@ async def _run_transcription_for_job(
             None,
             lambda: transcribe(
                 _whisper_audio, lang,
-                lyrics_hint=_gemini_pre or None,
-                return_words=aligner_enabled,
+                lyrics_hint=_initial_asr_lyrics_hint(_gemini_pre),
+                return_words=True,
             ),
         )
 
@@ -7356,6 +7386,36 @@ async def _run_transcription_for_job(
                     reference = res.json().get("lyrics", "").strip()
             except Exception:
                 pass
+
+        # Metadata-recovery path: filename artist credits are frequently
+        # truncated ("Rodrig"), while the audio-first ASR text is already a
+        # strong fingerprint. Search LRCLIB by title only and accept a record
+        # exclusively when title + duration + heard words agree. This is
+        # deliberately after ASR; doing it before listening recreated the old
+        # "right duration, wrong song" incident.
+        if not reference and song_hint:
+            try:
+                _evidence_dur = await asyncio.to_thread(
+                    _audio_duration, tmp_path,
+                )
+                _evidence_lrc = await asyncio.to_thread(
+                    _fetch_lrclib_by_audio_evidence,
+                    artist_hint, song_hint, segments, _evidence_dur,
+                )
+                if _evidence_lrc and _evidence_lrc.get("plain"):
+                    reference = (_evidence_lrc.get("plain") or "").strip()
+                    logger.info(
+                        "[LYRICS] recovered reference from audio evidence "
+                        "(%s chars, artist=%r, title=%r, score=%s)",
+                        len(reference),
+                        _evidence_lrc.get("_matched_artist"),
+                        _evidence_lrc.get("_matched_title"),
+                        _evidence_lrc.get("_audio_evidence_score"),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[LYRICS] audio-evidence reference recovery failed: %s", e,
+                )
 
         # Defense-in-depth recovery for the Gemini fallback path. We
         # don't have lrclib's duration here, so we can't compute

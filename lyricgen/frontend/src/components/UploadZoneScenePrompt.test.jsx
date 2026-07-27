@@ -57,8 +57,9 @@ function Harness({ hint = PROMPT, matchLyrics = true, movementStyle = "estatico"
 }
 
 function goStep(n) {
-  const rail = document.querySelectorAll(".wizard-step-rail button");
-  fireEvent.click(rail[n - 1]);
+  const step = document.querySelector(`[data-wizard-step="${n}"]`);
+  expect(step).not.toBeNull();
+  fireEvent.click(step);
 }
 
 const mode = (code) => document.querySelector(`[data-scene-mode="${code}"]`);

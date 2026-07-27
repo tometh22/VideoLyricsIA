@@ -10,7 +10,6 @@ from post_reconcile import (
     LONG_LINE_MIN_WORDS,
     LONG_LINE_MIN_DUR,
     LONG_LINE_GAP_THRESH,
-    STRETCH_GAP_THRESH,
     STRETCH_MARGIN,
 )
 
@@ -192,28 +191,42 @@ def test_cleanup_does_not_split_normal_segments():
 
 
 def test_stretch_trimmer_real_pattern():
-    """Realistic pattern: Whisper extends 'papel' from 28s to 33.5s, next seg at 36.1s."""
+    """Whisper's decoder boundary trails the last acoustic word."""
     seg_a = _seg("Para qué tus santos de papel", 26.08, 33.5,
                  [_w("para", 26.08), _w("que", 26.4), _w("tus", 26.7),
                   _w("santos", 26.9), _w("de", 27.3), _w("papel", 27.5, 28.0)])
     seg_b = _seg("Iluminados por el fuego", 36.1, 38.5,
                  [_w("iluminados", 36.1), _w("por", 36.5), _w("el", 36.7), _w("fuego", 36.9)])
     out = post_reconcile_cleanup([seg_a, seg_b])
-    # gap = 36.1 - 33.5 = 2.6s > STRETCH_GAP_THRESH=1.5 → trim
-    assert out[0]["end"] == round(36.1 - STRETCH_MARGIN, 3), (
-        f"expected {round(36.1 - STRETCH_MARGIN, 3)}, got {out[0]['end']}"
-    )
+    # Close on the actual last word, not next_start - margin. The old behavior
+    # extended this line to 36.02 s and painted through the silence.
+    assert out[0]["end"] == 28.0
     assert out[1]["start"] == 36.1  # next seg untouched
     assert out[0]["start"] == 26.08  # start untouched
 
 
 def test_stretch_trimmer_small_gap_untouched():
-    """A 1.0s gap is below threshold — end must not be trimmed."""
+    """Word evidence wins even when the following silence is short."""
     seg_a = _seg("Normal phrase", 10.0, 14.0, [_w("normal", 10.0), _w("phrase", 10.5)])
     seg_b = _seg("Next phrase", 15.0, 17.0, [_w("next", 15.0), _w("phrase", 15.4)])
     out = post_reconcile_cleanup([seg_a, seg_b])
-    # gap = 15.0 - 14.0 = 1.0s < 1.5s → no trim
-    assert out[0]["end"] == 14.0
+    assert out[0]["end"] == 10.8
+
+
+def test_cleanup_never_extends_wordless_segment_across_instrumental_gap():
+    """ROTOR regression: a line ending at 84 s must not reach the next verse."""
+    seg_a = _seg("Last line before instrumental", 77.1, 84.16, words=None)
+    seg_b = _seg("Verse returns", 127.60, 132.0, words=None)
+    out = post_reconcile_cleanup([seg_a, seg_b])
+    assert out[0]["end"] == 84.16
+    assert out[1]["start"] == 127.60
+
+
+def test_cleanup_clamps_true_overlap_without_extending():
+    seg_a = _seg("Overlapping line", 10.0, 15.5, words=None)
+    seg_b = _seg("Next line", 15.0, 17.0, words=None)
+    out = post_reconcile_cleanup([seg_a, seg_b])
+    assert out[0]["end"] == round(15.0 - STRETCH_MARGIN, 3)
 
 
 def test_adlib_loop_all_long_tokens():
