@@ -92,11 +92,13 @@ def test_short_karaoke_now_has_per_word_payload():
 
 
 def test_generate_short_uses_libass_with_moviepy_fallback():
-    """El recableado: pasada libass primero, moviepy solo como fallback."""
+    """El efecto toca el fondo antes de libass; moviepy queda como fallback."""
     import inspect
     src = inspect.getsource(pipeline.generate_short)
+    assert "_apply_short_effect(" in src
     assert "_burn_short_text_ass(" in src
     assert "_make_short_text_clip(" in src  # fallback presente
+    assert src.index("_apply_short_effect(") < src.index("_burn_short_text_ass(")
     assert src.index("_burn_short_text_ass(") < src.index("_make_short_text_clip(")
 
 

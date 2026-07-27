@@ -7,6 +7,8 @@ pipeline's single-pass libass render relies on, including the RGB-blend fix
 import fx_compositor as fx
 import shutil
 import subprocess
+import sys
+import types
 
 import numpy as np
 import pytest
@@ -148,6 +150,17 @@ def test_rhythm_rebases_to_short_window_without_losing_energy():
     assert short.bpm == 100.0
     assert short.beats == pytest.approx((.2, .8))
     assert short.strengths == pytest.approx((.7, 1.0))
+
+
+def test_invalid_or_empty_beat_grid_uses_safe_120_bpm_fallback(monkeypatch):
+    fake_beat_snap = types.SimpleNamespace(
+        detect_beats=lambda _path: (0.0, [])
+    )
+    monkeypatch.setitem(sys.modules, "beat_snap", fake_beat_snap)
+    fx._detect_rhythm_cached.cache_clear()
+    rhythm = fx._detect_rhythm_cached("/tmp/silent.mp3", 1)
+    assert rhythm == fx.EffectRhythm(120.0, (), ())
+    fx._detect_rhythm_cached.cache_clear()
 
 
 @pytest.mark.parametrize(

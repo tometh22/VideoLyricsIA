@@ -181,10 +181,15 @@ def _detect_rhythm_cached(audio_path: str, mtime_ns: int) -> EffectRhythm:
         import beat_snap
         result = beat_snap.detect_beats(audio_path)
         if result:
-            bpm = min(220.0, max(45.0, float(result[0])))
+            bpm = float(result[0])
             beats = tuple(float(t) for t in result[1] if float(t) >= 0.0)
-            strengths = _beat_strengths(audio_path, beats)
-            return EffectRhythm(bpm=bpm, beats=beats, strengths=strengths)
+            if 45.0 <= bpm <= 220.0 and beats:
+                strengths = _beat_strengths(audio_path, beats)
+                return EffectRhythm(bpm=bpm, beats=beats, strengths=strengths)
+            logger.warning(
+                "[FX] invalid beat grid (bpm=%s, beats=%d); using 120 BPM",
+                result[0], len(beats),
+            )
     except Exception as exc:  # pragma: no cover - beat_snap is already defensive
         logger.warning("[FX] beat detection failed (%s); using 120 BPM", exc)
     return EffectRhythm(bpm=120.0, beats=(), strengths=())
@@ -348,6 +353,21 @@ def _rhythm_envelope(rhythm: EffectRhythm | None, decay: float = 0.16) -> str:
         for beat, strength in pairs
     ]
     return f"min(1,0.10+{'+'.join(pulses)})"
+
+
+def rhythm_mask_graph(rhythm: EffectRhythm | None, width: int, height: int,
+                      *, raw_label: str = "fxraw",
+                      out_label: str = "fx") -> str:
+    """Filtergraph fragment applying the exact energy-weighted beat envelope."""
+    if not rhythm or not rhythm.beats:
+        return f"[{raw_label}]null[{out_label}];"
+    env = _rhythm_envelope(rhythm)
+    return (
+        f"color=c=white:s={width}x{height}:r=30,format=gray,"
+        f"geq=lum='255*({env})',format=gbrp[beatmask];"
+        f"[{raw_label}][beatmask]blend=all_mode=multiply:shortest=1"
+        f"[{out_label}];"
+    )
 
 
 # palette code → ffmpeg `eq` grade. "" / "auto" / unknown → no grade
@@ -854,15 +874,7 @@ def build_video_filter(*, ass_basename: str | None, font_dir: str, width: int,
         f"[{fx_input_index}:v]scale={width}:{height},{timing},"
         f"{gain_step}format=gbrp[fxraw];"
     )
-    if rhythm and rhythm.beats:
-        env = _rhythm_envelope(rhythm)
-        prep += (
-            f"color=c=white:s={width}x{height}:r=30,format=gray,"
-            f"geq=lum='255*({env})',format=gbrp[beatmask];"
-            "[fxraw][beatmask]blend=all_mode=multiply:shortest=1[fx];"
-        )
-    else:
-        prep += "[fxraw]null[fx];"
+    prep += rhythm_mask_graph(rhythm, width, height)
 
     composite = (
         _pixel_transform_graph(effect, width, height)

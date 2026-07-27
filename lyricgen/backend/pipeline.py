@@ -13030,9 +13030,13 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
                 if _fx_blend == "screen" else
                 "gblur=sigma=4,"
             )
+            _fx_rhythm_graph = _fx.rhythm_mask_graph(
+                _fx_rhythm, spec.width, spec.height
+            )
             fc = (
                 f"[3:v]scale={spec.width}:{spec.height},{_fx_timing},"
-                f"{_fx_treatment}format=gbrp[fx];"
+                f"{_fx_treatment}format=gbrp[fxraw];"
+                f"{_fx_rhythm_graph}"
                 f"[0:v]format=gbrp[bg0];"
                 f"[bg0][fx]blend=all_mode={_fx_blend}:all_opacity={_fx_opacity:.2f},"
                 f"format={spec.pix_fmt}[bgfx];"
@@ -15112,7 +15116,8 @@ def _make_short_text_clip(text: str, seg_start: float, seg_end: float, font: str
 
 def _apply_short_effect(short_path: str, fx_path: str, fps: float, job_dir: str,
                         beat_bpm: float | None = None,
-                        rhythm=None) -> str:
+                        rhythm=None, style: str = "",
+                        custom_colors: str = "") -> str:
     """Blend a looped fx layer onto a finished short via ffmpeg.
 
     The short is moviepy-rendered and moviepy can't reproduce these blend
@@ -15133,6 +15138,8 @@ def _apply_short_effect(short_path: str, fx_path: str, fps: float, job_dir: str,
         width=1080,
         height=1920,
         effect=_eff,
+        style=style,
+        custom_colors=custom_colors,
         beat_bpm=beat_bpm,
         rhythm=rhythm,
         fx_input_index=1,
@@ -15404,6 +15411,7 @@ def generate_short(
                        os.path.basename(font))
 
     import fx_compositor as _fx
+    _selected_fx = _fx.effect_path(effect)
 
     audio = AudioFileClip(mp3_path)
     start_time = _find_chorus_start(segments)
@@ -15446,7 +15454,7 @@ def generate_short(
     # Color-grade the BACKGROUND (before lyrics, like the main video — so the
     # lyrics stay ungraded). No-op when style/custom_colors yield no grade.
     _grade_style = style if _fx.grade_filter(style, custom_colors) else ""
-    if _grade_style:
+    if _grade_style and not _selected_fx:
         # grade_frame returns an UNCLIPPED float frame; moviepy fl_image needs
         # uint8 [0,255] — clip+cast like the main moviepy fallback does.
         bg = bg.fl_image(
@@ -15494,6 +15502,20 @@ def generate_short(
     )
     audio.close()
     final.close()
+
+    # Effects belong to the background, BEFORE the subtitle burn. Applying a
+    # photo transform after libass would displace/mirror the lyric glyphs too
+    # (most visible with kaleido/liquid_glass/cutout_echo) and diverge from the
+    # main render's bg → effect → grade → subtitles ordering.
+    fx = _selected_fx
+    if fx:
+        _short_rhythm = _fx.rhythm_for_window(
+            _fx.detect_effect_rhythm(effect, mp3_path), start_time, short_dur
+        )
+        bg_only_path = _apply_short_effect(
+            bg_only_path, fx, fps, job_dir, rhythm=_short_rhythm,
+            style=style, custom_colors=custom_colors,
+        )
 
     burned = _burn_short_text_ass(
         bg_only_path, window_segments, job_dir, short_dur, fps,
@@ -15556,19 +15578,6 @@ def generate_short(
         os.unlink(bg_only_path)
     except OSError:
         pass
-
-    # Optional effect overlay: screen-blend the selected catalogue loop over
-    # the rendered short with ffmpeg — the SAME fx assets the main video
-    # composites. moviepy can't screen-blend, so it's a post-pass.
-    fx = _fx.effect_path(effect)
-    if fx:
-        _short_rhythm = _fx.rhythm_for_window(
-            _fx.detect_effect_rhythm(effect, mp3_path), start_time, short_dur
-        )
-        out_path = _apply_short_effect(
-            out_path, fx, fps, job_dir,
-            rhythm=_short_rhythm,
-        )
 
     return out_path
 
