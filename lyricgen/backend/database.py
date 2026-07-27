@@ -547,6 +547,11 @@ class Job(Base):
     )
 
     def to_dict(self):
+        s3 = self.s3_keys or {}
+        wants_umg = (
+            (self.delivery_profile or "youtube") in ("umg", "both")
+            or bool(self.umg_spec)
+        )
         return {
             "job_id": self.job_id,
             "artist": self.artist,
@@ -567,6 +572,10 @@ class Job(Base):
                 "umg_short_url": self.umg_short_url,
             },
             "s3_keys": self.s3_keys,
+            "prores_ready": (
+                bool(s3.get("umg_master")) and bool(s3.get("umg_short"))
+                if wants_umg else None
+            ),
             "error": self.error,
             "error_category": self.error_category,
             "youtube": self.youtube_data,
@@ -604,7 +613,10 @@ class Job(Base):
         # needing a second round-trip per row. Truthy iff the lazy
         # transcode has both deliverables on R2.
         s3 = self.s3_keys or {}
-        wants_umg = (self.delivery_profile or "youtube") in ("umg", "both")
+        wants_umg = (
+            (self.delivery_profile or "youtube") in ("umg", "both")
+            or bool(self.umg_spec)
+        )
         return {
             "job_id": self.job_id,
             "status": self.status,
@@ -612,6 +624,7 @@ class Job(Base):
             "song_title": self.song_title,
             "filename": self.filename,
             "delivery_profile": self.delivery_profile,
+            "umg_spec": self.umg_spec,
             "prores_ready": (
                 bool(s3.get("umg_master")) and bool(s3.get("umg_short"))
                 if wants_umg else None

@@ -94,7 +94,7 @@ from database import (
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
-from pipeline import run_pipeline, transcribe
+from pipeline import run_pipeline, transcribe, _normalize_movement_style
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
 from billing import router as billing_router
@@ -5565,6 +5565,10 @@ async def _run_transcription_for_job(
             _slice_audio_prefix, _slice_audio_window, _verify_lrclib_alignment,
             _detect_hallucination, _synthesize_segments_from_plain,
             _align_whisper_to_plain, _fill_gaps_with_reference,
+            _initial_asr_lyrics_hint, _plain_lyrics_aligner_enabled,
+            _anchored_recovery_is_safe,
+            _fetch_lrclib_by_audio_evidence,
+            _strip_leading_reference_credits,
         )
         # Short-lived DB session JUST for the lrclib cache lookup, released
         # immediately so the connection is free during the long Whisper /
@@ -5699,6 +5703,23 @@ async def _run_transcription_for_job(
                                 artist_hint, song_hint)
             except Exception as e:
                 logger.warning("[LYRICS] gemini fallback raised: %s — continuing without it", e)
+
+        # Catalogue text may begin with a detached editorial credit rather
+        # than a sung lyric. Remove only explicit, blank-line-delimited credit
+        # blocks before *any* alignment path sees them. A false leading line
+        # shifts ordinal word bucketing for the entire song (La Foto de Tu
+        # Cuerpo: 31 clean reconciled lines became 49 mixed fragments).
+        if lrc and (lrc.get("plain") or "").strip():
+            _clean_plain, _removed_credits = _strip_leading_reference_credits(
+                lrc.get("plain") or "",
+            )
+            if _removed_credits:
+                lrc["plain"] = _clean_plain
+                logger.warning(
+                    "[LYRICS] removed %d detached leading credit line(s): %r",
+                    len(_removed_credits),
+                    _removed_credits,
+                )
 
         # ─────────────────────────────────────────────────────────────────
         # WORLD-CLASS audio-as-truth pipeline (default 2026-05-25).
@@ -5979,7 +6000,17 @@ async def _run_transcription_for_job(
                             except Exception as _clgc_err:
                                 logger.warning("[WC] gap-cluster FAILED: %s", _clgc_err)
                             from pipeline import _post_reconcile_cleanup as _prc
-                            _reconciled = _prc(_reconciled)
+                            # The reconciler has already chosen the catalogue's
+                            # human line structure. Its per-word array is an
+                            # ordinal timing aid, not guaranteed 1:1 lexical
+                            # ownership, so splitting those lines at apparent
+                            # word gaps can create single-word and even reversed
+                            # fragments. Keep line boundaries; still run end
+                            # tightening and overlap clamping.
+                            _reconciled = _prc(
+                                _reconciled,
+                                split_long_lines=False,
+                            )
                             return _emit_segments(
                                 _reconciled, _WC_WX_REC,
                                 reference_lyrics=_canonical,
@@ -6989,7 +7020,11 @@ async def _run_transcription_for_job(
             # grounded search step entirely (lrclib already gave us a clean
             # source).
             if plain:
-                logger.info("[LYRICS] lrclib plain hit (%s chars) — running Whisper for timestamps (lyrics_hint primed), skipping Gemini", len(plain))
+                logger.info(
+                    "[LYRICS] lrclib plain hit (%s chars) — ASR-first "
+                    "(reference reserved for post-alignment), skipping Gemini",
+                    len(plain),
+                )
 
                 # Pre-Whisper intro trim. The "Video Oficial" cuts of many
                 # tracks add 30-90s of dialogue / extra music at the start
@@ -7037,9 +7072,9 @@ async def _run_transcription_for_job(
                 # song's lyrics (verified case: "El Plan de la Mariposa —
                 # El Riesgo" Video Oficial has 73 s of voice-over reciting
                 # the first verse before the song starts). Run Whisper on
-                # the intro chunk with the same lyrics_hint so it
-                # transcribes the spoken text against the known vocabulary
-                # and emits real timestamps for it. The segments returned
+                # the intro chunk with the same ASR-first policy. A recited
+                # line must not prime Whisper into repeating the known song
+                # text over the rest of the dialogue. The segments returned
                 # here are kept as-is in the user's full-audio frame
                 # (they were never shifted) and prepended to the final
                 # output so the operator sees the dialogue subtitled at
@@ -7056,10 +7091,8 @@ async def _run_transcription_for_job(
                 # lrclib-plain hit AND intro_offset > 0 — rare). Cost
                 # impact is negligible (~$0.005 extra per fire), latency
                 # reduction is ~10-15 s per affected job.
-                aligner_enabled = (
-                    os.environ.get("LRCLIB_PLAIN_ALIGNER_ENABLED", "0")
-                    .strip().lower() in ("1", "true", "yes", "on", "y", "t")
-                )
+                aligner_enabled = _plain_lyrics_aligner_enabled()
+                initial_hint = _initial_asr_lyrics_hint(plain)
                 await _step("transcribe.transcribe", 50)
 
                 intro_path = None
@@ -7078,7 +7111,12 @@ async def _run_transcription_for_job(
                         return []
                     try:
                         raw = await loop.run_in_executor(
-                            None, transcribe, intro_path, lang, plain,
+                            None,
+                            lambda: transcribe(
+                                intro_path, lang,
+                                lyrics_hint=initial_hint,
+                                return_words=True,
+                            ),
                         )
                         # Keep only segments that fully sit in the intro
                         # window; defensive against ffmpeg frame-boundary
@@ -7094,8 +7132,9 @@ async def _run_transcription_for_job(
                     return await loop.run_in_executor(
                         None,
                         lambda: transcribe(
-                            transcribe_path, lang, plain,
-                            return_words=aligner_enabled,
+                            transcribe_path, lang,
+                            lyrics_hint=initial_hint,
+                            return_words=True,
                         ),
                     )
 
@@ -7148,7 +7187,7 @@ async def _run_transcription_for_job(
                 # the first/last word in each matched span.
                 #
                 # Falls through to raw Whisper segments when:
-                #   - the env flag is off (default)
+                #   - the env kill-switch is off
                 #   - the aligner couldn't match enough lines (< 50%
                 #     coverage) — usually means Whisper missed most of
                 #     the song, in which case downstream hallucination
@@ -7194,7 +7233,10 @@ async def _run_transcription_for_job(
                         plain, user_dur, anchors=anchors,
                         start_time=intro_offset,
                     )
-                    if recovered:
+                    recovery_safe, recovery_reason = _anchored_recovery_is_safe(
+                        plain, anchors, recovered,
+                    )
+                    if recovered and recovery_safe:
                         from pipeline import _filter_intro_song_overlap
                         intro_segments, _dup = _filter_intro_song_overlap(
                             intro_segments, recovered,
@@ -7210,6 +7252,11 @@ async def _run_transcription_for_job(
                             recovery_source="lrclib_plain",
                             coverage_warning=True,
                         )
+                    logger.error(
+                        "[LYRICS] synthetic recovery rejected (%s; ASR=%s; "
+                        "anchors=%s) — preserving audio-timed output for review",
+                        recovery_reason, reason, len(anchors),
+                    )
                 # Happy path: Whisper returned plausibly-many segments.
                 # Combine intro Whisper (if any) with the body output.
                 from pipeline import _filter_intro_song_overlap
@@ -7251,41 +7298,52 @@ async def _run_transcription_for_job(
             _bg_fetch_lyrics, artist_hint, song_hint,
         ))
 
-        # When the plain-lyrics aligner is enabled, request word-level
-        # timestamps so we can re-bucket Whisper's output against the
-        # Gemini/lyrics.ovh reference's line structure (aligner pass below).
-        # Same flag the lrclib-hit path uses. Default off.
-        aligner_enabled = (
-            os.environ.get("LRCLIB_PLAIN_ALIGNER_ENABLED", "0")
-            .strip().lower() in ("1", "true", "yes", "on", "y", "t")
-        )
+        # Post-ASR alignment is default-on with a kill-switch. Word timestamps
+        # are requested regardless so raw lines can end on their last word.
+        aligner_enabled = _plain_lyrics_aligner_enabled()
 
-        # ── Pre-fetch Gemini lyrics BEFORE running Whisper ──────────────────
-        # Without this, Whisper is vocabulary-blind: it doesn't know what words
-        # to expect and confabulates (e.g. "tanto miedo tu don" for "Frágil
-        # espejo de voz"). Passing the reference text as lyrics_hint to each
-        # chunk tells Whisper the vocabulary and dramatically improves accuracy.
+        # ── Fetch Gemini in parallel, keep first-pass ASR audio-first ─────────
+        # The reference remains valuable after recognition for spelling and
+        # human line grouping. Feeding it into Whisper first caused reference
+        # parroting in the measured corpus and on the ROTOR regression track.
+        # `_initial_asr_lyrics_hint` retains an explicit rollback mode.
         #
-        # asyncio.shield() prevents the wait_for timeout from cancelling the
-        # background task — Gemini keeps running and the result is cached in
-        # Postgres for the next request regardless.
-        # Timeout: 10s — typical Gemini latency is 2-4 s on a warm request;
-        # we tolerate up to 10 s before running Whisper without a hint.
+        # In audio-first mode Whisper starts immediately while Gemini continues
+        # in parallel. Only explicit short/full rollback modes wait for Gemini
+        # before ASR, because those modes intentionally need a prompt.
         _gemini_pre = ""
-        try:
-            _gemini_pre = (
-                await asyncio.wait_for(asyncio.shield(gemini_task), timeout=10.0)
-                or ""
-            )
-            if _gemini_pre:
-                logger.info(
-                    "[LYRICS] Gemini returned %d chars before Whisper — using as lyrics_hint",
-                    len(_gemini_pre),
+        _prompt_mode = os.environ.get(
+            "WHISPER_REFERENCE_PROMPT_MODE", "off",
+        ).strip().lower()
+        if _prompt_mode not in ("", "off", "0", "false", "no"):
+            try:
+                _gemini_pre = (
+                    await asyncio.wait_for(
+                        asyncio.shield(gemini_task), timeout=10.0,
+                    )
+                    or ""
                 )
-        except asyncio.TimeoutError:
-            logger.info("[LYRICS] Gemini hint not ready in 10s — Whisper runs without hint")
-        except Exception as _e_gem:
-            logger.info("[LYRICS] Gemini pre-fetch error (%s) — Whisper runs without hint", _e_gem)
+                if _gemini_pre:
+                    logger.info(
+                        "[LYRICS] Gemini returned %d chars before Whisper — "
+                        "reference-prompt rollback mode=%s",
+                        len(_gemini_pre), _prompt_mode,
+                    )
+            except asyncio.TimeoutError:
+                logger.info(
+                    "[LYRICS] Gemini prompt not ready in 10s — Whisper runs "
+                    "audio-first",
+                )
+            except Exception as _e_gem:
+                logger.info(
+                    "[LYRICS] Gemini pre-fetch error (%s) — Whisper runs "
+                    "audio-first", _e_gem,
+                )
+        else:
+            logger.info(
+                "[LYRICS] audio-first mode — Whisper and reference lookup "
+                "running concurrently",
+            )
 
         # Pre-fetch vocal stem so the chunked Whisper-1 transcription uses
         # clean audio (no backing music). The full mix causes timing compression
@@ -7320,8 +7378,8 @@ async def _run_transcription_for_job(
             None,
             lambda: transcribe(
                 _whisper_audio, lang,
-                lyrics_hint=_gemini_pre or None,
-                return_words=aligner_enabled,
+                lyrics_hint=_initial_asr_lyrics_hint(_gemini_pre),
+                return_words=True,
             ),
         )
 
@@ -7356,6 +7414,36 @@ async def _run_transcription_for_job(
                     reference = res.json().get("lyrics", "").strip()
             except Exception:
                 pass
+
+        # Metadata-recovery path: filename artist credits are frequently
+        # truncated ("Rodrig"), while the audio-first ASR text is already a
+        # strong fingerprint. Search LRCLIB by title only and accept a record
+        # exclusively when title + duration + heard words agree. This is
+        # deliberately after ASR; doing it before listening recreated the old
+        # "right duration, wrong song" incident.
+        if not reference and song_hint:
+            try:
+                _evidence_dur = await asyncio.to_thread(
+                    _audio_duration, tmp_path,
+                )
+                _evidence_lrc = await asyncio.to_thread(
+                    _fetch_lrclib_by_audio_evidence,
+                    artist_hint, song_hint, segments, _evidence_dur,
+                )
+                if _evidence_lrc and _evidence_lrc.get("plain"):
+                    reference = (_evidence_lrc.get("plain") or "").strip()
+                    logger.info(
+                        "[LYRICS] recovered reference from audio evidence "
+                        "(%s chars, artist=%r, title=%r, score=%s)",
+                        len(reference),
+                        _evidence_lrc.get("_matched_artist"),
+                        _evidence_lrc.get("_matched_title"),
+                        _evidence_lrc.get("_audio_evidence_score"),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[LYRICS] audio-evidence reference recovery failed: %s", e,
+                )
 
         # Defense-in-depth recovery for the Gemini fallback path. We
         # don't have lrclib's duration here, so we can't compute
@@ -7741,7 +7829,14 @@ async def generate_with_segments(
         if (not job_row
                 or job_row.user_id != current_user["id"]
                 or job_row.tenant_id != current_user["tenant_id"]):
-            raise HTTPException(status_code=404, detail="Job not found.")
+            # Stable machine-readable code so the frontend doesn't couple to the
+            # HTTP status. `job_not_found` = reaped / cross-tenant / never
+            # existed → the client surfaces a "session expired, re-upload" CTA
+            # instead of freezing the single-song hero (audit 2026-07-27).
+            return JSONResponse(
+                status_code=404,
+                content={"code": "job_not_found", "detail": "Job not found."},
+            )
         # State whitelist for /generate. `transcribed_pending` is what the
         # transcription worker writes on success (post-2026-05-25 fix);
         # `transcribed` is accepted defensively for jobs that were written
@@ -7749,9 +7844,14 @@ async def generate_with_segments(
         # and `awaiting_upload` covers the direct-generate path (no editor).
         # See transcription_worker.py:137 for the writer side.
         if job_row.status not in ("transcribed_pending", "transcribed", "awaiting_upload"):
-            raise HTTPException(
+            # Stable code (mirrors the `job_not_found` path above) so the client
+            # can react without string/status matching.
+            return JSONResponse(
                 status_code=409,
-                detail=f"Job is in state {job_row.status!r}, cannot generate.",
+                content={
+                    "code": "job_not_generatable",
+                    "detail": f"Job is in state {job_row.status!r}, cannot generate.",
+                },
             )
         current_revision = int(getattr(job_row, "segments_revision", 0) or 0)
         if requested_revision is None and current_revision > 0:
@@ -8210,6 +8310,10 @@ def status(
         # Frontend uses delivery_profile to decide whether to show the
         # UMG master download tab in JobDetail.
         "delivery_profile": job.get("delivery_profile", "youtube"),
+        # Retroactive ProRes keeps delivery_profile="youtube" as historical
+        # provenance. The persisted spec is therefore required to restore
+        # the ProRes/send-to-UMG UI correctly after a reload.
+        "umg_spec": job.get("umg_spec"),
         # ProRes readiness — drives the badge in JobDetail. Must be
         # included here so the badge reflects server state when the
         # user opens a job that already had ProRes generated.
@@ -8780,7 +8884,7 @@ async def download(
             # Kick off a prewarm in the background, then 202.
             try:
                 from queue_jobs import enqueue_prores_prewarm, SubmissionsPausedError
-                enqueue_prores_prewarm(job_id, file_type)
+                enqueue_prores_prewarm(job_id, file_type, force=True)
             except SubmissionsPausedError as exc:
                 from ops_control import get_submissions_state
                 state = get_submissions_state()
@@ -9346,16 +9450,24 @@ async def approve_job(
     from database import Job as JobModel, AuditLog
     from datetime import datetime, timezone
 
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    job_query = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        job_query = job_query.filter(
+            JobModel.tenant_id == current_user["tenant_id"],
+        )
+    job = job_query.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "pending_review":
         raise HTTPException(status_code=400, detail="Job is not pending review")
+
+    is_cross_tenant_admin = (
+        current_user.get("role") == "admin"
+        and job.tenant_id != current_user.get("tenant_id")
+    )
+    _audit_cross_tenant_access(
+        db, current_user, job, "approve_job", commit=False,
+    )
 
     job.status = "done"
     job.approved_by = current_user["id"]
@@ -9378,7 +9490,11 @@ async def approve_job(
         user_id=current_user["id"],
         action="job.approve",
         detail={"job_id": job_id, "notes": body.notes,
-                "archived_failed_attempts": _archived_n},
+                "archived_failed_attempts": _archived_n,
+                "tenant_id": job.tenant_id,
+                "owner_user_id": job.user_id,
+                "actor_tenant_id": current_user.get("tenant_id"),
+                "cross_tenant_admin": is_cross_tenant_admin},
     ))
     db.commit()
 
@@ -9388,7 +9504,12 @@ async def approve_job(
     # bypasses the cache and reads the live counter.
     try:
         from cache import invalidate, usage_key
-        invalidate(usage_key(current_user["tenant_id"], current_user["id"]))
+        usage_owners = {
+            (job.tenant_id, job.user_id),
+            (current_user["tenant_id"], current_user["id"]),
+        }
+        for tenant_id, user_id in usage_owners:
+            invalidate(usage_key(tenant_id, user_id))
     except Exception:
         pass
 
@@ -9406,16 +9527,24 @@ async def reject_job(
     from database import Job as JobModel, AuditLog
     from datetime import datetime, timezone
 
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    job_query = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        job_query = job_query.filter(
+            JobModel.tenant_id == current_user["tenant_id"],
+        )
+    job = job_query.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "pending_review":
         raise HTTPException(status_code=400, detail="Job is not pending review")
+
+    is_cross_tenant_admin = (
+        current_user.get("role") == "admin"
+        and job.tenant_id != current_user.get("tenant_id")
+    )
+    _audit_cross_tenant_access(
+        db, current_user, job, "reject_job", commit=False,
+    )
 
     job.status = "rejected"
     job.approved_by = current_user["id"]
@@ -9425,9 +9554,24 @@ async def reject_job(
     db.add(AuditLog(
         user_id=current_user["id"],
         action="job.reject",
-        detail={"job_id": job_id, "notes": body.notes},
+        detail={"job_id": job_id, "notes": body.notes,
+                "tenant_id": job.tenant_id,
+                "owner_user_id": job.user_id,
+                "actor_tenant_id": current_user.get("tenant_id"),
+                "cross_tenant_admin": is_cross_tenant_admin},
     ))
     db.commit()
+
+    try:
+        from cache import invalidate, usage_key
+        usage_owners = {
+            (job.tenant_id, job.user_id),
+            (current_user["tenant_id"], current_user["id"]),
+        }
+        for tenant_id, user_id in usage_owners:
+            invalidate(usage_key(tenant_id, user_id))
+    except Exception:
+        pass
 
     return {"ok": True, "status": "rejected", "job_id": job_id}
 
@@ -10339,6 +10483,29 @@ async def request_edit(
     from database import Job as JobModel, AuditLog
     from pipeline import _MAX_EDITS
 
+    # Fast-path para pestañas/clientes que reenvían el CTA mientras el primer
+    # edit ya está corriendo. El SELECT MVCC no espera el row-lock corto de los
+    # updates de progreso del worker, a diferencia del FOR UPDATE de abajo:
+    # en el incidente 83f95d0e2679 dos duplicados tardaron 35 s y 120 s para
+    # recién entonces devolver un 400 genérico. El gate se repite después del
+    # lock para cubrir la carrera entre este probe y el commit del primer POST.
+    _probe_q = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        _probe_q = _probe_q.filter(JobModel.tenant_id == current_user["tenant_id"])
+    _probe = _probe_q.first()
+    if not _probe:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if _probe.status == "editing":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "edit_in_progress",
+                "message": "An edit is already being rendered for this video.",
+                "current_step": _probe.current_step,
+                "progress": _probe.progress,
+            },
+        )
+
     # with_for_update() toma row-level lock en Postgres para serializar
     # el read-validate-write de edit_count. Sin esto, dos POST /edit del
     # mismo job en rápida sucesión leen el mismo edit_count, ambos pasan
@@ -10358,6 +10525,16 @@ async def request_edit(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     _audit_cross_tenant_access(db, current_user, job, "edit", commit=False)
+    if job.status == "editing":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "edit_in_progress",
+                "message": "An edit is already being rendered for this video.",
+                "current_step": job.current_step,
+                "progress": job.progress,
+            },
+        )
     valid_edit_types = ("typography", "background", "background_library", "lyrics", "metadata")
     if body.edit_type not in valid_edit_types:
         raise HTTPException(
@@ -10732,7 +10909,12 @@ async def request_edit(
         # Forward for this render AND persist to durable render_params — same
         # reaped-retry durability rationale as background_hint above, and so
         # a subsequent "Regenerar fondo" pre-fills the operator's last choice.
-        _mv = (body.movement_style or "").strip()
+        # NORMALIZADO al persistir (misma nota que en pipeline al escribir
+        # render_params): la invariante es que render_params.movement_style
+        # SIEMPRE sea un código canónico o "". El pipeline normaliza igual al
+        # renderizar, así que esto no cambia ningún render — deja de guardar
+        # algo que después cada lector tiene que interpretar por su cuenta.
+        _mv = _normalize_movement_style((body.movement_style or "").strip())
         edit_params["movement_style"] = _mv
         _rp_mv = dict(job.render_params or {})
         _rp_mv["movement_style"] = _mv
@@ -11214,12 +11396,12 @@ async def enable_prores_for_job(
             detail="Broadcast (ProRes) delivery is not enabled for your account.",
         )
 
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    job_query = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        job_query = job_query.filter(
+            JobModel.tenant_id == current_user["tenant_id"]
+        )
+    job = job_query.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "done":
@@ -11239,6 +11421,9 @@ async def enable_prores_for_job(
     )
 
     job.umg_spec = umg_spec
+    _audit_cross_tenant_access(
+        db, current_user, job, "enable_prores", commit=False,
+    )
     db.add(AuditLog(
         user_id=current_user["id"],
         action="job.enable_prores",
@@ -11867,20 +12052,52 @@ async def create_variant(
     El padre debe estar en status='done'. La variante arranca en 'processing'
     y va por el pipeline normal saltando Whisper (segments_override).
 
-    400 si padre no done. 402 si el plan está sin capacidad. 403 si el
-    padre no es del tenant del user. 404 si el padre no existe.
+    400 si padre no done. 402 si el plan está sin capacidad. 404 si el
+    padre no existe o pertenece a otro tenant. Los admins de plataforma
+    pueden crear la variante cross-tenant, igual que pueden abrir y editar
+    el video; en ese caso el job nuevo queda en el tenant y bajo el owner
+    del padre, no bajo la cuenta interna del admin.
     """
     import uuid
     from database import Job as JobModel, AuditLog
 
-    parent = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == parent_job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    # Mismo scope que GET /status y POST /edit: un admin de plataforma
+    # puede operar sobre cualquier tenant; un usuario común sólo sobre el
+    # suyo. Antes /status cargaba el padre cross-tenant y montaba todo el
+    # wizard, pero este query volvía a exigir el tenant del admin y el
+    # submit terminaba en un falso 404 "Parent job not found".
+    _parent_q = db.query(JobModel).filter(JobModel.job_id == parent_job_id)
+    if current_user.get("role") != "admin":
+        _parent_q = _parent_q.filter(
+            JobModel.tenant_id == current_user["tenant_id"]
+        )
+    parent = _parent_q.first()
     if not parent:
         raise HTTPException(status_code=404, detail="Parent job not found")
+
+    _is_cross_tenant_admin = (
+        current_user.get("role") == "admin"
+        and parent.tenant_id != current_user.get("tenant_id")
+    )
+    # Un admin cross-tenant actúa EN NOMBRE del owner original: la variante
+    # debe aparecer en el historial del cliente y consumir su plan/cupo.
+    # Para usuarios comunes (incluidos teammates del mismo tenant) se
+    # conserva el contrato previo: el creador actual es el owner del job.
+    variant_tenant_id = parent.tenant_id
+    variant_user_id = (
+        parent.user_id if _is_cross_tenant_admin else current_user["id"]
+    )
+    billing_user = db.query(User).filter(User.id == variant_user_id).first()
+    if billing_user is None:
+        # Job.user_id tiene FK y esto no debería ocurrir; fallar explícito
+        # evita crear un job sin dueño o facturarlo al admin por accidente.
+        raise HTTPException(
+            status_code=409,
+            detail="No se pudo resolver el owner del video original.",
+        )
+    _audit_cross_tenant_access(
+        db, current_user, parent, "create_variant", commit=False,
+    )
     if parent.status != "done":
         raise HTTPException(
             status_code=400,
@@ -11928,17 +12145,21 @@ async def create_variant(
 
     # Plan capacity check — misma lógica que /generate. Variante cuenta
     # como 1 video del plan.
-    plan = current_user.get("plan", "100")
-    usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], plan,
-                                billing_group=current_user.get("billing_group"))
+    plan = billing_user.plan_id or "100"
+    usage_info = get_plan_usage(
+        db,
+        variant_user_id,
+        variant_tenant_id,
+        plan,
+        billing_group=billing_user.billing_group,
+    )
     if usage_info["alert_100"] and plan == "free":
         raise HTTPException(
             status_code=429,
             detail="Free plan limit reached. Upgrade to continue.",
         )
     # Para planes pagos, allow_overage decide si se permite pasarse del cap.
-    user_model = db.query(User).filter(User.id == current_user["id"]).first()
-    if usage_info.get("alert_100") and not (user_model and user_model.allow_overage):
+    if usage_info.get("alert_100") and not billing_user.allow_overage:
         raise HTTPException(
             status_code=402,
             detail=f"Llegaste al límite de tu plan ({usage_info.get('limit', '?')} canciones). "
@@ -11973,7 +12194,7 @@ async def create_variant(
     )
     existing_renders = (
         db.query(JobModel)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .filter(JobModel.tenant_id == variant_tenant_id)
         .filter(_sql_func.lower(_sql_func.trim(JobModel.artist)) == _song_artist)
         .filter(
             _sql_func.lower(
@@ -12026,7 +12247,7 @@ async def create_variant(
             action="variant.overage_charge",
             detail={
                 "parent_job_id": parent_job_id,
-                "tenant_id": current_user["tenant_id"],
+                "tenant_id": variant_tenant_id,
                 "artist": parent.artist,
                 "song_title": parent.song_title,
                 "existing_renders_before_this_one": existing_renders,
@@ -12066,6 +12287,10 @@ async def create_variant(
             continue
         if isinstance(_value, str):
             _value = _value.strip()
+        # Misma invariante que en /edit y en el create: movement_style se
+        # persiste CANÓNICO, nunca crudo.
+        if _field == "movement_style":
+            _value = _normalize_movement_style(_value or "")
         new_render_params[_field] = _value
         _overridden_fields.append(_field)
     new_render_params = _merge_content_validation_choice(
@@ -12111,7 +12336,7 @@ async def create_variant(
         src_filename = _os_mod.path.basename(src_key) if src_key else ""
         if src_key and src_filename and _storage_mod.is_enabled():
             candidate_dst = _storage_mod._input_object_key(
-                current_user["tenant_id"], new_job_id, src_filename
+                variant_tenant_id, new_job_id, src_filename
             )
             if _storage_mod.copy_object(src_key, candidate_dst):
                 variant_input_r2_key = candidate_dst
@@ -12149,6 +12374,12 @@ async def create_variant(
     if body.background_id:
         _variant_job_dir = os.path.join(OUTPUTS_DIR, new_job_id)
         os.makedirs(_variant_job_dir, exist_ok=True)
+        # El admin conserva su identidad como actor, pero el uso del asset
+        # se registra contra el tenant destino, que es quien recibe el job.
+        _variant_asset_user = {
+            **current_user,
+            "tenant_id": variant_tenant_id,
+        }
         (
             variant_bg_path,
             variant_bg_r2_key,
@@ -12158,7 +12389,7 @@ async def create_variant(
         ) = _resolve_library_background(
             body.background_id,
             body.background_mode or "as_is",
-            current_user,
+            _variant_asset_user,
             db,
             _variant_job_dir,
             new_job_id,
@@ -12166,8 +12397,8 @@ async def create_variant(
 
     new_job = JobModel(
         job_id=new_job_id,
-        user_id=current_user["id"],
-        tenant_id=current_user["tenant_id"],
+        user_id=variant_user_id,
+        tenant_id=variant_tenant_id,
         artist=parent.artist,
         song_title=parent.song_title,
         style=new_style,
@@ -12202,13 +12433,15 @@ async def create_variant(
             "variant_owns_input": variant_owns_input,
             "bypass_content_validation": bool(body.bypass_content_validation),
             "force_content_validation": bool(body.force_content_validation),
-            "tenant_id": current_user.get("tenant_id"),
+            "tenant_id": variant_tenant_id,
+            "actor_tenant_id": current_user.get("tenant_id"),
+            "cross_tenant_admin": _is_cross_tenant_admin,
         },
     ))
     db.commit()
     logger.info(
         "[VARIANT] created job=%s parent=%s tenant=%s bypass=%s force=%s",
-        new_job_id, parent.job_id, current_user.get("tenant_id"),
+        new_job_id, parent.job_id, variant_tenant_id,
         bool(body.bypass_content_validation), bool(body.force_content_validation),
     )
 
@@ -12262,7 +12495,7 @@ async def create_variant(
         artist=parent.artist,
         style=new_style,
         plan=plan,
-        tenant_id=current_user.get("tenant_id", ""),
+        tenant_id=variant_tenant_id,
         # Biblioteca de fondos: mismo shape que /generate. Cuando hay
         # background_path/bg_r2_key el pipeline saltea la generación IA;
         # en modo "variation" van los variation_source_* y Veo deriva un
@@ -12763,18 +12996,75 @@ async def admin_create_delivery_from_job(
             detail="Job must be approved (status=done) before it can be published",
         )
 
-    # Validate all 5 files exist in R2. If even one is missing we refuse
-    # to create the Delivery — a half-empty portal entry is worse than
-    # asking the operator to wait for the render to finish.
+    # Validate all 5 files exist in R2. The three render outputs are hard
+    # requirements. ProRes is different: it is a lazy derivative and its
+    # post-render prewarm is deliberately best-effort, so an explicit
+    # "Enviar a UMG" must recover by force-enqueueing missing masters.
     missing = []
     for ft in _DEFAULT_DELIVERY_FILE_TYPES:
         key = _r2_key_for_delivery(job.tenant_id, job.job_id, ft)
         if not storage.object_exists(key):
             missing.append(ft)
     if missing:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Files not yet in R2: {', '.join(missing)}. Wait for the render to finish.",
+        missing_prores = [
+            ft for ft in missing if ft in ("umg_master", "umg_short")
+        ]
+        missing_render_outputs = [
+            ft for ft in missing if ft not in ("umg_master", "umg_short")
+        ]
+        if missing_render_outputs:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Files not yet in R2: "
+                    f"{', '.join(missing_render_outputs)}. "
+                    "Wait for the render to finish."
+                ),
+            )
+        if missing_prores and not job.umg_spec:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "prores_required",
+                    "message": (
+                        "Este video fue generado sólo para YouTube. "
+                        "Elegí la configuración ProRes para preparar los "
+                        "masters antes de enviarlo a UMG."
+                    ),
+                    "missing": missing_prores,
+                },
+            )
+        enqueued = []
+        try:
+            for file_type in missing_prores:
+                rq_id = enqueue_prores_prewarm(
+                    job_id, file_type, force=True,
+                )
+                if rq_id:
+                    enqueued.append(file_type)
+        except Exception as exc:
+            logger.warning(
+                "[DELIVERY] could not prepare ProRes for %s: %s",
+                job_id, exc,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "No se pudo iniciar la preparación ProRes. "
+                    "Probá de nuevo en un momento."
+                ),
+            ) from exc
+        return JSONResponse(
+            status_code=202,
+            content={
+                "ok": False,
+                "status": "preparing_prores",
+                "job_id": job_id,
+                "missing": missing_prores,
+                "enqueued": enqueued,
+                "retry_after": 10,
+            },
+            headers={"Retry-After": "10"},
         )
 
     # Compute label. If caller passed one, honor it. Otherwise: first
@@ -12979,6 +13269,25 @@ async def portal_submit_change_request(
         },
     ))
     db.commit()
+
+    # Notificación en tiempo real (Paso "Cambios de UMG" — el panel del admin
+    # exige entrar a mirarlo; esto llega a la bandeja apenas UMG manda el
+    # pedido, sin esperar a que alguien abra Operación). emails._send_email ya
+    # contiene sus propios fallos de SMTP, pero el thread target igual se
+    # envuelve acá (mismo criterio que billing._send_email_async) para que
+    # NINGÚN error de este código best-effort — ni siquiera uno futuro por
+    # fuera de emails.py — se filtre como excepción no manejada del thread.
+    def _notify_umg_change_request():
+        try:
+            emails.send_umg_change_request_notification(
+                delivery.artist_snapshot, delivery.song_title_snapshot,
+                comment, delivery_id, delivery.job_id,
+            )
+        except Exception:
+            logger.warning("[CR] notificación de cambio UMG falló", exc_info=True)
+
+    threading.Thread(target=_notify_umg_change_request, daemon=True).start()
+
     return {"ok": True, "id": cr.id, "submitted_at": cr.submitted_at.isoformat()}
 
 

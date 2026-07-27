@@ -245,6 +245,41 @@ def test_metadata_status_gate_rejects_transcribing(client, admin_token, db, monk
     assert res.status_code == 400
 
 
+def test_metadata_editing_returns_structured_conflict_without_enqueue(
+    client, admin_token, db, monkeypatch,
+):
+    """Un CTA duplicado sobre un edit en curso no es un 400 genérico.
+
+    El frontend usa `edit_in_progress` para cerrar el wizard tardío y dejar
+    visible el progreso del primer request, sin afirmar que ese edit falló.
+    """
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _create_pending_review_job(
+        db,
+        tenant_id,
+        user_id,
+        status="editing",
+        current_step="short",
+        progress=75,
+    )
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "metadata", "song_title": "Nuevo título"},
+    )
+
+    assert res.status_code == 409, res.text
+    assert res.json()["detail"] == {
+        "code": "edit_in_progress",
+        "message": "An edit is already being rendered for this video.",
+        "current_step": "short",
+        "progress": 75,
+    }
+    assert captured == []
+
+
 def test_metadata_requires_cached_bg(client, admin_token, db, monkeypatch):
     """Sin bg_r2_key_cached el re-render no puede reusar el fondo → 400."""
     _capture_enqueue_calls(monkeypatch)

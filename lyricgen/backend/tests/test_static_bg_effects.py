@@ -6,7 +6,8 @@ Python), which OOM-SIGKILLed the worker on long songs and left the job stuck
 in "processing" forever. The fix removes the camera pan: the photo background
 is now a STATIC image rendered by ffmpeg (C-level, bounded memory — impossible
 to OOM), and the video's life/motion comes from the composable effect overlay
-(snow/rain/stars/bokeh/light/aurora) that screen-blends on top.
+(snow/rain/stars/bokeh/light plus the expanded atmospheric catalogue) that
+screen-blends on top.
 
 These tests prove, with REAL ffmpeg, that:
   1. the static render produces a valid full-duration video, and
@@ -86,8 +87,7 @@ def test_static_render_handles_long_duration_cheaply(tmp_path):
 
 @pytest.mark.parametrize("effect", list(fx.EFFECTS))
 def test_each_effect_asset_exists_and_composites(tmp_path, effect):
-    """Every composable effect resolves to a real asset and screen-blends onto
-    the static background without ffmpeg erroring — i.e. the effects work."""
+    """Every effect executes through the production graph with real ffmpeg."""
     p = fx.effect_path(effect)
     assert p and os.path.exists(p), f"effect asset missing for {effect!r}"
 
@@ -97,22 +97,23 @@ def test_each_effect_asset_exists_and_composites(tmp_path, effect):
     _static_image_to_mp4(str(img), str(bg), duration=2.0)
 
     comp = tmp_path / f"comp_{effect}.mp4"
-    # The core of build_video_filter's effect branch: screen-blend the looped
-    # fx over the bg (the lyrics subtitles step is exercised separately). Pull
-    # the SAME per-effect pre-blend gain build_video_filter uses, so this also
-    # proves every gain string (incl. bokeh's `curves` with quoted points)
-    # composites under real ffmpeg.
-    gain = fx.fx_gain(effect)
-    gain_step = f"{gain}," if gain else ""
+    rhythm = (
+        fx.EffectRhythm(120.0, (.08, .58, 1.08, 1.58), (1.0, .55, .8, .6))
+        if fx.is_reactive_effect(effect) else None
+    )
+    graph, use_complex, extra = fx.build_video_filter(
+        ass_basename=None, font_dir="", width=320, height=180,
+        effect=effect, rhythm=rhythm,
+    )
+    assert use_complex
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(bg),
-        "-stream_loop", "-1", "-i", p,
-        "-filter_complex",
-        "[0:v]format=gbrp[b];"
-        f"[1:v]scale=1920:1080,setpts=PTS-STARTPTS,{gain_step}format=gbrp[f];"
-        "[b][f]blend=all_mode=screen:shortest=1,format=yuv420p[o]",
-        "-map", "[o]", "-t", "2", "-c:v", "libx264", "-preset", "ultrafast",
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+        *extra,
+        "-filter_complex", graph,
+        "-map", "[out]", "-map", "1:a", "-t", "2",
+        "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
         str(comp),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -120,7 +121,10 @@ def test_each_effect_asset_exists_and_composites(tmp_path, effect):
     assert comp.exists() and comp.stat().st_size > 0
 
 
-@pytest.mark.parametrize("effect", ["snow", "rain", "light"])
+@pytest.mark.parametrize(
+    "effect",
+    ["snow", "rain", "light", "shadow_play", "beat_ripple"],
+)
 def test_apply_short_effect_overlays_on_vertical_short(tmp_path, effect):
     """The short's ffmpeg effect post-pass (_apply_short_effect) screen-blends a
     looped fx onto a finished vertical short — this is how the short finally
@@ -162,3 +166,33 @@ def test_build_video_filter_shape():
     assert complex_snow is True
     assert "blend=all_mode=screen" in f_snow
     assert "-stream_loop" in extra_snow
+
+
+@pytest.mark.parametrize("effect", list(fx.PIXEL_TRANSFORM_EFFECTS))
+def test_pixel_transform_changes_selected_photo_pixels(tmp_path, effect):
+    """Rendered output must materially differ from the source photo itself."""
+    img = tmp_path / "photo.jpg"
+    _make_image(img, 320, 180)
+    out = tmp_path / f"transform_{effect}.mp4"
+    graph, _, extra = fx.build_video_filter(
+        ass_basename=None, font_dir="", width=320, height=180, effect=effect,
+    )
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-loop", "1", "-framerate", "24", "-i", str(img),
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+        *extra,
+        "-filter_complex", graph,
+        "-map", "[out]", "-t", "0.8", "-c:v", "libx264",
+        "-preset", "ultrafast", str(out),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+    frame = subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-ss", "0.5", "-i", str(out),
+         "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
+        check=True, capture_output=True, timeout=30,
+    ).stdout
+    rendered = np.frombuffer(frame, dtype=np.uint8).reshape(180, 320, 3)
+    source = np.asarray(Image.open(img).convert("RGB"), dtype=np.uint8)
+    mad = np.abs(rendered.astype(np.int16) - source.astype(np.int16)).mean()
+    assert mad > 2.0, f"{effect} was visually indistinguishable (MAD={mad:.2f})"

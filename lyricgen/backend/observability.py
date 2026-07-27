@@ -37,6 +37,61 @@ def _resolve_release() -> str:
             or "genly@2.0.0")
 
 
+_CODE_FINGERPRINT: str | None = None
+
+
+def backend_code_fingerprint() -> str:
+    """Huella del CÓDIGO DE BACKEND que este proceso tiene cargado.
+
+    Por qué existe: el gate de flota comparaba el SHA de git entre la API y los
+    workers, y eso confunde dos cosas muy distintas.
+
+    Los servicios de worker tienen filtros de path en Railway, así que un commit
+    que sólo toca el frontend NO los redeploya — y hace bien, no hay nada nuevo
+    que correr ahí. Pero el SHA de la API sí avanza. Resultado: después de CADA
+    merge de sólo-frontend, /health reportaba `down` con la base arriba, Redis
+    arriba, los 10 workers vivos y las colas vacías. Una alarma que grita en
+    falso de rutina es peor que no tenerla: enseña a ignorarla, y el día que un
+    worker quede atrás de verdad nadie va a mirar.
+
+    La huella compara lo que importa: si el código Python que corre la API y el
+    que corren los workers es el mismo, son compatibles, sin importar cuántos
+    commits de frontend haya en el medio. Y si el backend SÍ cambió, la huella
+    cambia y el gate sigue avisando — no se pierde señal real.
+
+    Se calcula una vez y se cachea. Sólo los .py del directorio backend, con la
+    ruta relativa dentro del hash para que renombrar un archivo cuente como
+    cambio. Ante cualquier error devuelve "" y el gate cae a comparar el SHA
+    (el comportamiento viejo), que es el fallback seguro.
+    """
+    global _CODE_FINGERPRINT
+    if _CODE_FINGERPRINT is not None:
+        return _CODE_FINGERPRINT
+    try:
+        import hashlib
+
+        root = os.path.dirname(os.path.abspath(__file__))
+        digest = hashlib.sha256()
+        for dirpath, dirnames, filenames in os.walk(root):
+            # Tests y caches no afectan lo que corre en producción; incluirlos
+            # haría que la huella cambie sin motivo operativo.
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if d not in {"__pycache__", "tests", ".pytest_cache", "venv", ".venv"}
+            )
+            for name in sorted(filenames):
+                if not name.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, name)
+                digest.update(os.path.relpath(path, root).encode("utf-8"))
+                with open(path, "rb") as fh:
+                    digest.update(fh.read())
+        _CODE_FINGERPRINT = digest.hexdigest()[:16]
+    except Exception:
+        _CODE_FINGERPRINT = ""
+    return _CODE_FINGERPRINT
+
+
 def init_sentry():
     """Initialize Sentry for ANY GenLy process (API or RQ worker).
 
@@ -338,16 +393,36 @@ def worker_fleet_coherence(
     api_release: str,
     api_protocol: int,
     expected_service_counts: dict[str, int] | None = None,
+    api_code_fingerprint: str = "",
 ) -> dict:
     """Pure deploy-gate contract shared by health and focused tests."""
     expected = {"transcription", "bg_preview", "enterprise", "default"}
     advertised = {
         queue for row in release_rows for queue in (row.get("queues") or [])
     }
-    release_match = bool(release_rows) and all(
-        not api_release or api_release == "unknown" or row.get("release") == api_release
-        for row in release_rows
-    )
+    # Compatibilidad API↔worker: se compara la HUELLA DEL CÓDIGO DE BACKEND, no
+    # el SHA de git. Los workers tienen filtros de path en Railway, así que un
+    # commit de sólo-frontend no los redeploya (correcto) pero sí mueve el SHA
+    # de la API — y con la comparación por SHA eso dejaba /health en `down`
+    # después de cada merge de frontend, con todo funcionando. Una alarma que
+    # grita en falso de rutina enseña a ignorarla.
+    #
+    # Sólo se usa la huella cuando LOS DOS lados la publican. Un worker viejo
+    # (mid-deploy, antes de que este código llegue) no la trae, y ahí se cae al
+    # SHA: el comportamiento de siempre, sin ventana ciega durante el rollout.
+    api_fingerprint = (api_code_fingerprint or "").strip()
+
+    def _row_matches(row: dict) -> bool:
+        row_fp = (row.get("code_fingerprint") or "").strip()
+        if api_fingerprint and row_fp:
+            return row_fp == api_fingerprint
+        return (
+            not api_release
+            or api_release == "unknown"
+            or row.get("release") == api_release
+        )
+
+    release_match = bool(release_rows) and all(_row_matches(row) for row in release_rows)
     protocol_match = bool(release_rows) and all(
         row.get("rq_payload_version") == api_protocol for row in release_rows
     )
@@ -408,6 +483,7 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
         "status": "ok",
         "env": ENV,
         "release": _resolve_release(),
+        "code_fingerprint": backend_code_fingerprint(),
         "features": {
             "anchor_lyrics": os.environ.get("ANCHOR_LYRICS_ENABLED", "0").strip().lower()
             in ("1", "true", "yes", "on"),
@@ -534,6 +610,7 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
                         str(snap.get("release") or ""),
                         int(snap.get("rq_payload_version") or 0),
                         expected_service_counts=expected_service_counts,
+                        api_code_fingerprint=backend_code_fingerprint(),
                     )
                     snap["fleet_coherent"] = fleet["coherent"]
                     snap["fleet_missing_queues"] = fleet["missing_queues"]

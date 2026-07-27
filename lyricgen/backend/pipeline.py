@@ -910,7 +910,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # DIRECTION + al gradiente fallback.
                  custom_colors: str = "",
                  # effect: overlay animado componible sobre cualquier fondo
-                 # (snow/rain/stars/bokeh/light). "" = ninguno. Se compone en el
+                 # (snow/rain/stars/bokeh/light + atmospheric variants).
+                 # "" = ninguno. Se compone en el
                  # render (libass filter_complex o moviepy) vía fx_compositor.
                  effect: str = "",
                  # Capa C 2026-05-24: hash determinístico (sha256-12) de los
@@ -1452,7 +1453,16 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "style": style,
             "genre": genre,
             "concept": concept,
-            "movement_style": movement_style,
+            # NORMALIZADO al persistir, no crudo. El campo entra como texto
+            # libre desde el Form, y guardarlo tal cual dejaba render_params con
+            # valores que ninguna otra capa entiende: la UI no puede resaltar la
+            # opción, y admin_insights los cuenta como buckets distintos aunque
+            # el render los trate igual. El pipeline ya normaliza al renderizar,
+            # así que persistir el valor canónico no cambia ningún render — sólo
+            # deja de guardar algo que después hay que interpretar en cada
+            # lector. La invariante es: render_params.movement_style SIEMPRE es
+            # un código de _MOVEMENT_STYLE_RULES o "".
+            "movement_style": _normalize_movement_style(movement_style),
             "effect": effect,
             "match_lyrics": match_lyrics,
             "background_ai_generated": _background_is_ai_generated,
@@ -2420,9 +2430,16 @@ def _filter_whisper_hallucinations(segments: list[dict]) -> tuple[list[dict], in
 # Logic lives in post_reconcile.py (lightweight, no heavy deps) so it can be
 # unit-tested in isolation. The alias below preserves the internal call-site.
 
-def _post_reconcile_cleanup(segments: list[dict]) -> list[dict]:
+def _post_reconcile_cleanup(
+    segments: list[dict],
+    *,
+    split_long_lines: bool = True,
+) -> list[dict]:
     from post_reconcile import post_reconcile_cleanup
-    return post_reconcile_cleanup(segments)
+    return post_reconcile_cleanup(
+        segments,
+        split_long_lines=split_long_lines,
+    )
 
 
 def _filter_intro_song_overlap(
@@ -2624,17 +2641,14 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
 
     Cost: ~$0.006 per minute of audio (~$0.02 per song).
 
-    `lyrics_hint`: if provided, the FIRST ~200 tokens of this string are
-    used as Whisper's `prompt` parameter — orienting the model's
-    vocabulary toward the actual lyrics it should expect. This is the
-    documented Whisper-API mechanism for biasing transcription
-    (https://platform.openai.com/docs/guides/speech-to-text/prompting).
-    Significantly reduces hallucination loops on tracks where Whisper
-    otherwise drifts (e.g. confusing artist-name ad-libs for the lyric
-    line). Only the last 224 tokens are read by Whisper and only the
-    first ~30 s of audio benefits from it; on longer tracks the help is
-    most impactful at the song's start where the model establishes its
-    interpretation.
+    `lyrics_hint`: explicit experimental/rollback override. If provided,
+    the first ~200 tokens are sent through Whisper's `prompt` parameter.
+    This can correct vocabulary on some tracks, but the production corpus
+    showed a much larger opposite effect: long references can be repeated
+    instead of heard. The orchestrator therefore defaults to ASR-first
+    (`lyrics_hint=None`) and uses references after recognition for
+    word-level alignment. `WHISPER_REFERENCE_PROMPT_MODE` can restore a
+    120-char or legacy 800-char prompt without a deploy.
 
     Why whisper-1 and not gpt-4o-transcribe (better text quality):
         gpt-4o-transcribe and gpt-4o-mini-transcribe only return plain
@@ -2649,10 +2663,12 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
     client = OpenAI()  # picks up OPENAI_API_KEY from env
     logger.info("[WHISPER-API] transcribing %s via OpenAI (whisper-1)", os.path.basename(mp3_path))
 
-    # Build the initial prompt. When the caller has reference lyrics
-    # (typically from lrclib plain), we ship the first ~200 tokens of
-    # them so Whisper expects that vocabulary. Otherwise fall back to a
-    # generic "song lyrics" hint.
+    # Build the initial prompt. The orchestrator's default policy is ASR-first:
+    # it passes lyrics_hint=None and uses the reference only AFTER transcription
+    # for word-level alignment. A reference is still accepted here for explicit
+    # experiments / rollback, but it is not the production default: corpus A/B
+    # plus the "La Foto de tu cuerpo" regression showed that lyrics prompts can
+    # make Whisper parrot the reference instead of listening to the audio.
     if lyrics_hint and lyrics_hint.strip():
         # ~200 tokens ≈ 800 chars for Spanish/English. Whisper truncates
         # silently if longer; this just keeps logs cleaner.
@@ -2883,9 +2899,22 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         if (seg.no_speech_prob or 0) > 0.92:
             logger.info("[WHISPER-API] Filtered very-low-confidence: %s", text[:60])
             continue
+        # Segment timestamps from Whisper conventionally run until the next
+        # decoder boundary, often 1-6 s after the singer stopped. When word
+        # granularity is requested, the first/last word are the acoustically
+        # useful display bounds (and match ROTOR-style line timing closely).
+        # Keep the words too: the downstream plain-lyrics aligner re-buckets
+        # them into human line structure before `_emit_segments` strips the
+        # raw Whisper payload.
+        word_start = (
+            float(seg_words[0]["start"]) if seg_words else float(seg.start)
+        )
+        word_end = (
+            float(seg_words[-1]["end"]) if seg_words else float(seg.end)
+        )
         out_seg = {
-            "start": float(seg.start),
-            "end": float(seg.end),
+            "start": word_start,
+            "end": max(word_start, word_end),
             "text": text,
         }
         if return_words:
@@ -3248,6 +3277,151 @@ def _is_collapsed_transcription(segments: list[dict]) -> bool:
     return False
 
 
+def _initial_asr_lyrics_hint(reference: str | None) -> str | None:
+    """Return the reference text allowed into Whisper's *first* pass.
+
+    Default is deliberately ``None`` (ASR-first): listen to the audio with the
+    generic language prompt, then use curated lyrics for post-ASR alignment.
+    This prevents a wrong or merely long reference from becoming self-fulfilling
+    transcription output.
+
+    Rollout / diagnosis kill-switch:
+      - ``off`` (default): no reference in the initial prompt
+      - ``short``: first 120 chars (legacy WhisperX-inspired experiment)
+      - ``full``: pass the reference; the API adapter caps it at 800 chars
+    """
+    text = (reference or "").strip()
+    if not text:
+        return None
+    mode = os.environ.get("WHISPER_REFERENCE_PROMPT_MODE", "off").strip().lower()
+    if mode in ("full", "on", "1", "true", "yes"):
+        return text
+    if mode in ("short", "120"):
+        return text[:120]
+    return None
+
+
+def _plain_lyrics_aligner_enabled() -> bool:
+    """Whether curated plain lyrics are aligned to ASR word timestamps.
+
+    Default ON: this path is deterministic post-processing and, unlike an ASR
+    lyrics prompt, cannot make the recognizer hallucinate reference text. The
+    env var remains a kill-switch for rollout.
+    """
+    return os.environ.get(
+        "LRCLIB_PLAIN_ALIGNER_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
+
+_REFERENCE_CREDIT_RE = re.compile(
+    r"\b(?:"
+    r"compuest[oa]\s+por|"
+    r"escrit[oa]\s+por|"
+    r"interpretad[oa]\s+por|"
+    r"presentad[oa]\s+por|"
+    r"tema\s+compuest[oa]|"
+    r"written\s+by|"
+    r"performed\s+by|"
+    r"presented\s+by"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_leading_reference_credits(plain: str) -> tuple[str, list[str]]:
+    """Remove a detached leading credit block from catalogue lyrics.
+
+    Community lyrics occasionally prepend editorial copy such as
+    ``"Primer tema compuesto por el Potro"``.  Feeding that line to a forced
+    word-bucketer is much worse than displaying one extra subtitle: because
+    the credit is not sung, every following reference line can inherit the
+    wrong acoustic words.
+
+    This is intentionally narrow.  We only inspect the first non-empty block,
+    only when it is separated from the song body by a blank line, and only
+    remove the block when *every* line contains an explicit authorship /
+    performance-credit phrase.  A lyric that merely mentions "canción" or an
+    artist name is therefore preserved.
+
+    Returns ``(cleaned_text, removed_lines)`` for observable caller logging.
+    """
+    text = (plain or "").strip()
+    if not text:
+        return text, []
+
+    lines = text.splitlines()
+    first_nonempty = next(
+        (i for i, line in enumerate(lines) if line.strip()),
+        None,
+    )
+    if first_nonempty is None:
+        return "", []
+
+    separator = next(
+        (i for i in range(first_nonempty, len(lines)) if not lines[i].strip()),
+        None,
+    )
+    if separator is None:
+        return text, []
+
+    block = [line.strip() for line in lines[first_nonempty:separator] if line.strip()]
+    if not block or len(block) > 3:
+        return text, []
+    if not all(_REFERENCE_CREDIT_RE.search(line) for line in block):
+        return text, []
+
+    cleaned = "\n".join(lines[separator + 1:]).strip()
+    return (cleaned or text), block
+
+
+def _anchored_recovery_is_safe(
+    plain: str,
+    anchors: list[tuple[int, float]],
+    recovered: list[dict],
+    *,
+    max_segment_s: float = 15.0,
+) -> tuple[bool, str]:
+    """Gate synthetic plain-lyrics timing before it can reach an operator.
+
+    Uniform/piecewise synthesis is only a last-resort approximation. It must not
+    turn two fuzzy matches into 31 allegedly-synchronised lines, as happened on
+    "La Foto de tu cuerpo". Require enough independent anchors and reject any
+    output that still contains a subtitle spanning an implausibly large region.
+    """
+    lines = _split_plain_lines(plain)
+    if not lines or not recovered:
+        return False, "empty reference/recovery"
+    import math as _math
+    min_anchors = max(4, int(_math.ceil(len(lines) * 0.20)))
+    if len(anchors) < min_anchors:
+        return False, (
+            f"insufficient anchors: {len(anchors)}/{len(lines)} "
+            f"(minimum={min_anchors})"
+        )
+    anchor_indices = sorted({int(a[0]) for a in anchors})
+    if len(anchor_indices) < min_anchors:
+        return False, (
+            f"insufficient unique anchors: {len(anchor_indices)}/{len(lines)} "
+            f"(minimum={min_anchors})"
+        )
+    # Anchors clustered in one verse cannot safely time the other half.
+    covered_span = anchor_indices[-1] - anchor_indices[0]
+    if len(lines) >= 8 and covered_span < max(3, int(len(lines) * 0.40)):
+        return False, (
+            f"anchor span too narrow: {covered_span}/{len(lines)} lines"
+        )
+    max_dur = max(
+        (float(s.get("end", 0)) - float(s.get("start", 0)) for s in recovered),
+        default=0.0,
+    )
+    if max_dur > max_segment_s:
+        return False, (
+            f"synthetic segment too long: {max_dur:.1f}s "
+            f"(maximum={max_segment_s:.1f}s)"
+        )
+    return True, "ok"
+
+
 def transcribe(mp3_path: str, language: str = None,
                lyrics_hint: str | None = None,
                job_id: str | None = None,
@@ -3288,25 +3462,54 @@ def transcribe(mp3_path: str, language: str = None,
         else:
             # Default: single full-file pass first (best TEXT — avoids the
             # chunk-boundary mishears VAD introduces), then fall back to VAD
-            # chunking ONLY if single-pass collapsed. The fallback is accepted
-            # only when it un-collapses AND adds structure, so a track where
-            # VAD ALSO fails (e.g. fast rap) stays on single-pass rather than
-            # getting worse.
+            # chunking only when the result fails either the conservative local
+            # shape gate OR the duration-aware global hallucination gate. The
+            # old local gate only caught <=2 segments / >45 s mega-segments, so
+            # 6-10 segment prompt loops bypassed VAD and were discovered too
+            # late by the orchestrator.
             segs = _transcribe_via_openai_api(
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
             )
-            if _is_collapsed_transcription(segs):
+            audio_dur = None
+            duration_bad = False
+            duration_reason = ""
+            try:
+                audio_dur = _audio_duration(mp3_path)
+                duration_bad, duration_reason = _detect_hallucination(
+                    segs, audio_dur, language=language,
+                )
+            except Exception:
+                # The original structural gate remains available even when
+                # ffprobe/audio-duration probing fails.
+                pass
+            single_bad = _is_collapsed_transcription(segs) or duration_bad
+            if single_bad:
                 _max = max((float(s["end"]) - float(s["start"]) for s in segs), default=0.0)
                 logger.warning(
-                    "[transcribe] single-pass collapsed (%d seg, max %.0fs); "
-                    "retrying with VAD chunking", len(segs), _max,
+                    "[transcribe] single-pass collapsed (%d seg, max %.0fs, %s); "
+                    "retrying with reference-free VAD chunking",
+                    len(segs), _max, duration_reason or "structural gate",
                 )
+                # Never carry a suspect reference prompt into the rescue pass.
+                # A second segmentation of the same poisoned prompt is not an
+                # independent recovery attempt.
                 vad_segs = _vad_chunk_transcribe(
-                    mp3_path, language=language, lyrics_hint=lyrics_hint,
+                    mp3_path, language=language, lyrics_hint=None,
                     job_id=job_id, return_words=return_words,
                 )
-                if not _is_collapsed_transcription(vad_segs) and len(vad_segs) > len(segs):
+                vad_duration_bad = False
+                try:
+                    vad_duration_bad, _ = _detect_hallucination(
+                        vad_segs, audio_dur, language=language,
+                    )
+                except Exception:
+                    pass
+                if (
+                    not _is_collapsed_transcription(vad_segs)
+                    and not vad_duration_bad
+                    and len(vad_segs) > len(segs)
+                ):
                     logger.info("[transcribe] VAD fallback accepted (%d → %d seg)",
                                 len(segs), len(vad_segs))
                     segs = vad_segs
@@ -3918,6 +4121,167 @@ def _try_lrclib_search(artist: str, song: str) -> list:
                 _t.sleep(1.5)
     logger.warning("[LYRICS] lrclib /search failed (best-effort, falling back): %s", last_err)
     return []
+
+
+def _try_lrclib_title_search(song: str) -> list:
+    """Broad LRCLIB search used only *after* audio-first ASR.
+
+    Metadata exported in filenames is often truncated (``Rodrig`` instead of
+    ``Rodrigo Romero``), so an artist+title query can miss an otherwise exact
+    record. A title-only search is unsafe before listening — common titles have
+    unrelated songs — therefore this helper merely returns candidates. The
+    caller must validate them against the transcribed audio.
+    """
+    song = (song or "").strip()
+    if len(song) < 4:
+        return []
+    import requests as _req
+    try:
+        r = _req.get(
+            "https://lrclib.net/api/search",
+            params={"q": song},
+            timeout=8.0,
+            headers={"User-Agent": "GenLyAI/1.0 (+https://app.genly.pro)"},
+        )
+        if r.status_code != 200:
+            logger.warning(
+                "[LYRICS] lrclib title-only /search %s for q=%r",
+                r.status_code, song,
+            )
+            return []
+        data = r.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.warning(
+            "[LYRICS] lrclib title-only /search failed (best-effort): %s", e,
+        )
+        return []
+
+
+def _fetch_lrclib_by_audio_evidence(
+    artist: str,
+    song: str,
+    segments: list[dict],
+    audio_duration: float | None,
+) -> dict | None:
+    """Recover a plain-lyrics reference after a metadata miss.
+
+    Unlike the historical duration-only fuzzy lookup, acceptance requires three
+    independent signals:
+
+      1. candidate title resembles the requested title,
+      2. candidate duration resembles this upload,
+      3. candidate lyrics resemble the *reference-free ASR text*.
+
+    The third signal is the safety boundary: a same-title song by another artist
+    cannot become a self-fulfilling forced alignment unless the audio already
+    contains substantially the same words.
+    """
+    if not song or not segments:
+        return None
+
+    import difflib as _difflib
+    import re as _re
+
+    def _norm_text(value: str) -> str:
+        folded = _strip_accents((value or "").lower())
+        return " ".join(_re.findall(r"[a-z0-9ñ]+", folded))
+
+    asr_tokens = _norm_text(
+        " ".join((s.get("text") or "") for s in segments)
+    ).split()
+    if len(asr_tokens) < 40:
+        return None
+    unique_ratio = len(set(asr_tokens)) / max(1, len(asr_tokens))
+    # Prompt loops / ad-lib hallucinations are not admissible audio evidence.
+    if unique_ratio < 0.15:
+        return None
+
+    requested_title = _norm_text(_strip_song_noise(song))
+    requested_artist = _norm_text(artist)
+    best: tuple[float, dict, dict] | None = None
+
+    for candidate in _try_lrclib_title_search(song):
+        if not isinstance(candidate, dict):
+            continue
+        parsed = _parse_lrclib_record(candidate)
+        if not parsed or not parsed.get("plain"):
+            continue
+
+        candidate_title = _norm_text(candidate.get("trackName") or "")
+        title_ratio = _difflib.SequenceMatcher(
+            None, requested_title, candidate_title,
+        ).ratio()
+        if title_ratio < 0.78:
+            continue
+
+        candidate_duration = candidate.get("duration")
+        duration_score = 0.0
+        if audio_duration and candidate_duration:
+            try:
+                delta = abs(float(audio_duration) - float(candidate_duration))
+            except (TypeError, ValueError):
+                delta = 999.0
+            if delta > 20.0:
+                continue
+            duration_score = 1.0 if delta <= 5.0 else max(0.0, 1.0 - delta / 20.0)
+
+        ref_tokens = _norm_text(parsed.get("plain") or "").split()
+        if len(ref_tokens) < 20:
+            continue
+        seq_ratio = _difflib.SequenceMatcher(
+            None, asr_tokens, ref_tokens, autojunk=False,
+        ).ratio()
+        asr_set, ref_set = set(asr_tokens), set(ref_tokens)
+        token_jaccard = len(asr_set & ref_set) / max(1, len(asr_set | ref_set))
+        # Repeated verses/choruses may appear in a different written order
+        # across lyric sources, depressing global sequence similarity even when
+        # the actual vocabulary overlap is overwhelming. Keep Jaccard as the
+        # strong wrong-song guard and allow moderate sequence reordering.
+        if seq_ratio < 0.45 or token_jaccard < 0.50:
+            continue
+
+        candidate_artist = _norm_text(candidate.get("artistName") or "")
+        artist_score = 0.0
+        if requested_artist and candidate_artist:
+            if requested_artist == candidate_artist:
+                artist_score = 1.0
+            elif (
+                requested_artist in candidate_artist
+                or candidate_artist in requested_artist
+            ):
+                artist_score = 0.8
+            else:
+                artist_score = _difflib.SequenceMatcher(
+                    None, requested_artist, candidate_artist,
+                ).ratio()
+
+        score = (
+            title_ratio * 0.25
+            + duration_score * 0.20
+            + seq_ratio * 0.30
+            + token_jaccard * 0.20
+            + artist_score * 0.05
+        )
+        if score < 0.72:
+            continue
+        if best is None or score > best[0]:
+            best = (score, parsed, candidate)
+
+    if best is None:
+        return None
+    score, parsed, raw = best
+    result = dict(parsed)
+    result["_audio_evidence_score"] = round(score, 4)
+    result["_matched_artist"] = raw.get("artistName")
+    result["_matched_title"] = raw.get("trackName")
+    logger.info(
+        "[LYRICS] audio-evidence LRCLIB recovery accepted %r - %r "
+        "(score=%.3f, requested=%r - %r)",
+        result.get("_matched_artist"), result.get("_matched_title"), score,
+        artist, song,
+    )
+    return result
 
 
 def _pick_best_lrclib_candidate(candidates: list, artist: str,
@@ -9643,6 +10007,187 @@ def _bg_scene_discontinuity(video_path: str) -> float:
         return 0.0
 
 
+def _estimate_shift(prev, cur, window) -> tuple[float, float]:
+    """Traslación (dx, dy) en px entre dos frames, por correlación de fase.
+
+    numpy puro (FFT), sin opencv. Dos detalles que NO son opcionales — sin
+    ellos la medición da cero para paneos reales (verificado):
+
+    - VENTANA de Hanning + resta de la media: sin ventanear, la fuga espectral
+      de los bordes domina la correlación y el pico queda en el origen.
+    - SUB-PÍXEL por interpolación parabólica: a 320 px de ancho un drift lento
+      es sub-píxel entre frames, y el pico entero lo redondea a 0.
+    """
+    import numpy as _np
+
+    # Guard de patch UNIFORME. Sin esto la función devuelve el desplazamiento
+    # MÁXIMO posible en vez de cero: con varianza nula el cross-power queda todo
+    # en cero, `argmax` sobre un array plano cae en el índice 0 —la esquina—
+    # y tras el fftshift el origen es el CENTRO, así que un frame negro contra
+    # sí mismo reportaba (-w/2, -h/2) = 57% del ancho.
+    # No es un caso de laboratorio: un clip que abre desde negro deja el frame
+    # de referencia uniforme (y entonces TODA la serie es degenerada), y una
+    # banda de letterbox o un cielo plano dejan uniformes 2 de las 4 franjas de
+    # borde, sesgando la mediana. Justo los clips oscuros que más se querían
+    # medir. Fail-safe hacia "no se movió": esta métrica sólo debe acusar
+    # movimiento que puede demostrar.
+    if prev.std() == 0 or cur.std() == 0:
+        return 0.0, 0.0
+
+    a = (prev - prev.mean()) * window
+    b = (cur - cur.mean()) * window
+    fa = _np.fft.fft2(a)
+    fb = _np.fft.fft2(b)
+    cross = fa * _np.conj(fb)
+    mag = _np.abs(cross)
+    mag[mag == 0] = 1.0
+    corr = _np.fft.fftshift(_np.fft.ifft2(cross / mag).real)
+    # Correlación plana (ventaneo que anula todo, patch casi uniforme): mismo
+    # razonamiento que arriba — sin pico no hay evidencia de desplazamiento.
+    if not _np.isfinite(corr).all() or corr.max() == corr.min():
+        return 0.0, 0.0
+    h, w = prev.shape
+    iy, ix = _np.unravel_index(_np.argmax(corr), corr.shape)
+
+    def _sub(line, i, n):
+        if i <= 0 or i >= n - 1:
+            return 0.0
+        left, mid, right = line[i - 1], line[i], line[i + 1]
+        denom = left - 2 * mid + right
+        return 0.0 if denom == 0 else 0.5 * (left - right) / denom
+
+    dy = (iy - h // 2) + _sub(corr[:, ix], iy, h)
+    dx = (ix - w // 2) + _sub(corr[iy, :], ix, w)
+    return float(dx), float(dy)
+
+
+def _measure_camera_drift(video_path: str, samples: int = 30) -> dict | None:
+    """Mide cuánto se MOVIÓ LA CÁMARA en un clip, como % del ancho del frame.
+
+    Para qué: medición propia sobre los fondos `movement_style=estatico` de
+    staging (25-jul-2026) dio 4 de 7 realmente clavados (≤0,14% del ancho) y
+    3 con paneo real — 6,1%, 26,8% y 29,7%, uno de ellos un push-in frontal,
+    que es justo lo que el prompt prohíbe por legibilidad de la letra. Veo
+    ignora el "locked camera" seguido y no hay campo estructurado para forzarlo,
+    así que lo único posible es MEDIRLO. Esta función sólo mide y loguea: la
+    decisión de re-rollear necesita datos primero (y un presupuesto de retry
+    propio, ver el comentario al final).
+
+    Tres decisiones que importan y que una implementación naive erra:
+
+    1) BORDES, no el frame completo. `estatico` está DISEÑADO para tener
+       movimiento dentro de la escena ("gente caminando, olas, nubes, neblina,
+       fuego" — ver el routing de estatico/sutil). Una correlación global sobre
+       una cascada o una multitud que llena el cuadro mide al SUJETO y reporta
+       paneo donde no hay. Las franjas de borde son lo más cercano a un ancla
+       estática que tiene un plano fijo.
+
+    2) EXCURSIÓN ACUMULADA MÁXIMA, no el desplazamiento neto. Un vaivén vuelve
+       al origen: el neto da ~0 y el paneo es igual de visible.
+
+    3) El clip PRE-LOOP. El fondo final está palindromizado (A + reverse(A)),
+       así que cualquier corrimiento neto se cancela por construcción. Hay que
+       medir la salida cruda de Veo.
+
+    Devuelve {"pct_width", "pct_width_borders", "peak_px", "frames"} o None.
+    Fail-open por diseño: esto NUNCA debe bloquear un fondo.
+
+    Validado contra los 7 fondos `estatico` de staging (con inspección visual de
+    los casos en disputa): los 6 de cámara fija dan ≤0,03% y el único push-in
+    real da 5,9%. Se emiten las DOS variantes (frame completo y mediana de
+    franjas de borde) porque todavía no hay datos para elegir umbral: la de
+    bordes es más robusta a un sujeto que llena el cuadro, la global es más
+    limpia cuando el fondo tiene textura estable.
+    """
+    tmpdir = None
+    try:
+        import numpy as _np
+        import tempfile as _tf
+        from PIL import Image as _Img
+
+        tmpdir = _tf.mkdtemp(prefix="drift_")
+        pattern = os.path.join(tmpdir, "f_%03d.png")
+        # fps bajo + escala chica: alcanza para traslación global y deja el costo
+        # en decenas de ms. Mismo patrón de extracción que
+        # _bg_scene_discontinuity (ffmpeg subprocess, no moviepy).
+        #
+        # `samples` tiene que cubrir el clip ENTERO: los clips de Veo son de 8s
+        # y a 3 fps eso son 24 frames. Con el tope en 12 se medían sólo los
+        # primeros 4s, así que un paneo lento reportaba la mitad de su
+        # excursión y uno que ocurría en la segunda mitad reportaba ~0 — sobre
+        # una métrica cuyo contrato es "excursión acumulada máxima" del clip.
+        # 30 deja margen si algún día el clip es más largo; ffmpeg emite menos
+        # frames si el clip es más corto y el guard de abajo lo cubre.
+        run_checked(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path,
+             "-vf", "fps=3,scale=320:180", "-frames:v", str(samples), pattern],
+            label="ffmpeg-drift-frames",
+            timeout=120,
+        )
+        files = sorted(f for f in os.listdir(tmpdir) if f.endswith(".png"))
+        if len(files) < 3:
+            return None
+
+        frames = []
+        for name in files:
+            with _Img.open(os.path.join(tmpdir, name)) as im:
+                frames.append(_np.asarray(im.convert("L"), dtype=_np.float64))
+
+        h, w = frames[0].shape
+        band = max(24, h // 4)
+        side = max(24, w // 4)
+
+        def _patches(a):
+            # Cuatro franjas de borde, cada una medida POR SEPARADO (apilarlas
+            # en un solo array destruye la continuidad espacial que la
+            # correlación necesita — daba 0 para paneos reales).
+            return [a[:band, :], a[-band:, :], a[:, :side], a[:, -side:]]
+
+        def _hann(shape):
+            return _np.outer(_np.hanning(shape[0]), _np.hanning(shape[1]))
+
+        patch_windows = [_hann(p.shape) for p in _patches(frames[0])]
+        full_window = _hann((h, w))
+
+        # Contra el PRIMER frame, no contra el anterior: la excursión respecto
+        # del inicio es lo que se percibe como "la cámara se movió", y acumular
+        # pasos consecutivos pierde los drifts lentos por cuantización.
+        peak_full = 0.0
+        peak_borders = 0.0
+        base_patches = _patches(frames[0])
+        for i in range(1, len(frames)):
+            est = [
+                _estimate_shift(pa, pb, win)
+                for pa, pb, win in zip(base_patches, _patches(frames[i]), patch_windows)
+            ]
+            # Mediana por componente: robusta a que UNA franja esté dominada por
+            # movimiento de la escena (nubes, niebla, agua) en vez de la cámara.
+            bdx = float(_np.median([e[0] for e in est]))
+            bdy = float(_np.median([e[1] for e in est]))
+            peak_borders = max(peak_borders, (bdx ** 2 + bdy ** 2) ** 0.5)
+
+            fdx, fdy = _estimate_shift(frames[0], frames[i], full_window)
+            peak_full = max(peak_full, (fdx ** 2 + fdy ** 2) ** 0.5)
+
+        return {
+            "pct_width": round(100.0 * peak_full / float(w), 2),
+            "pct_width_borders": round(100.0 * peak_borders / float(w), 2),
+            "peak_px": round(peak_full, 1),
+            "frames": len(frames),
+        }
+    except Exception as e:
+        _raise_if_job_timeout(e)
+        logger.warning("[BG][DRIFT] medición falló (fail-open): %s", e)
+        return None
+    finally:
+        if tmpdir:
+            try:
+                import shutil as _sh
+                _sh.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+
+
 def _score_video_relevance(video_path: str, prompt: str) -> int:
     """Ask Gemini Vision whether the video matches the intended scene prompt.
 
@@ -9718,7 +10263,11 @@ def _darken_prompt_for_effect(prompt: str, effect: str) -> str:
     No-op for effect="" / "none" / unknown.
     """
     import fx_compositor as _fxc
-    if not effect or effect.strip().lower() not in _fxc.EFFECTS:
+    if (
+        not effect
+        or effect.strip().lower() not in _fxc.EFFECTS
+        or _fxc.effect_blend(effect) != "screen"
+    ):
         return prompt
     return (
         prompt.rstrip()
@@ -10808,31 +11357,25 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
 
     _norm_move_bg = _normalize_movement_style(movement_style)
 
-    # UMG-style fix (2026-05-25): si el operador eligió "Estático" o "Sutil"
-    # SIN effect overlay, default a "light" (el más sutil de los 5). Las
-    # references UMG NUNCA tienen 100% quieto — siempre hay particles
-    # overlay o motion in-scene. Combined con subtle Ken Burns drift, esto
-    # garantiza que el video parezca vivo.
-    # Operator override: si seteó effect="" pero tildó algún otro motion
-    # (no estatico/sutil), respetamos su elección (no forzamos light).
-    # Foto fija / estático / sutil SIN effect → default a "light" (el más sutil)
-    # para que el fondo nunca quede 100% muerto. La "Foto fija" (ex foto-parallax)
-    # ya no panea — la vida/movimiento la da el efecto componible (lluvia/nieve/
-    # luces/estrellas/bokeh vía fx_compositor). El operador elige el efecto en el
-    # wizard; este default sólo cubre el caso sin elección.
-    # The operator's ACTUAL effect choice, captured BEFORE the anti-dead-frame
-    # "light" default below — used to gate background darkening so we darken for
-    # the effect the operator really picked (and no-op when they picked none),
-    # not for the forced default. (Review fix 2026-06-03: `effect` was never
-    # forwarded here, so darkening fired off the forced "light" for every still.)
+    # La elección REAL de efecto del operador. Se usa para gatear el darkening
+    # del prompt (oscurecer sólo cuando de verdad va a haber partículas encima).
+    #
+    # BORRADO 2026-07-25 — el default anti-frame-muerto que vivía acá:
+    #     if _norm_move_bg in ("estatico","sutil","foto-parallax") and not effect:
+    #         effect = "light"
+    # era un NO-OP. Reasignaba el parámetro LOCAL de _ensure_background, que sólo
+    # retorna un path; el overlay real se compone del `effect` de run_pipeline
+    # (ver fx_compositor.build_video_filter), que nunca vio este valor. O sea:
+    # "Foto fija" sin efecto rendereaba una imagen 100% congelada — exactamente
+    # lo que el bloque decía prevenir — y el log afirmaba que había aplicado el
+    # default. Un log que miente es peor que no tenerlo.
+    #
+    # En vez de "arreglarlo" (inyectar un efecto que el operador no pidió), la
+    # decisión vuelve al operador: el wizard ahora avisa de forma persistente que
+    # Foto fija sin efecto queda inmóvil, ofrece saltar al selector de Efecto, y
+    # renombra la card a "Sin efecto — imagen quieta" en esa combinación. Elegir
+    # que quede quieto es válido; que sea una decisión y no un accidente.
     _operator_effect = (effect or "").strip().lower()
-    if _norm_move_bg in ("estatico", "sutil", "foto-parallax") and not (effect or "").strip():
-        logger.info(
-            "[BG] movement=%s + no effect selected — defaulting effect=light "
-            "para evitar foto 100%% quieta (UMG-style guideline 2026-05-25)",
-            _norm_move_bg,
-        )
-        effect = "light"
 
     # Animado is a Veo-only aesthetic (the 2D-illustration safe_prompt lives in
     # _generate_veo_video). Imagen renders stills, so an animado+imagen combo
@@ -10892,8 +11435,10 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         # Foto fija + efectos (2026-06-03; review-fixed same day): if the
         # operator picked a luminous particle effect, bias the still toward a
         # dark/low-key canvas so the screen-blended particles read. Gated on the
-        # operator's ACTUAL pick (_operator_effect), NOT the forced "light"
-        # default, so it no-ops when no effect was chosen. AND never applied to
+        # operator's ACTUAL pick (_operator_effect) → no-op cuando no eligió
+        # ninguno. (Hasta 2026-07-25 este gate existía para no dispararse con el
+        # default forzado a "light"; ese default se borró por ser un no-op.)
+        # AND never applied to
         # a verbatim operator prompt — "usá mi prompt tal cual" must not get
         # dark grading bolted on (the imagen branch returns before the Veo
         # path's _is_verbatim is computed, so we check it inline here).
@@ -11029,6 +11574,48 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                     discont, _BG_SCENE_CUT_THRESHOLD,
                     os.path.basename(bg_path), job_id,
                 )
+            # Cumplimiento de "Estático": SOLO MEDIR Y LOGUEAR (2026-07-25).
+            #
+            # Veo ignora el locked-camera bastante seguido y no expone un campo
+            # estructurado para forzarlo: los negativos del prompt son el único
+            # lever. Medición propia sobre los 7 fondos `estatico` de staging: 4
+            # clavados (≤0,14% del ancho) y 3 con paneo real (6,1 / 26,8 /
+            # 29,7%), uno un push-in frontal. Antes de re-rollear hace falta
+            # saber la tasa real, así que esto emite la métrica en cada render
+            # estático y no toca el resultado.
+            #
+            # Por qué NO se re-rollea todavía (y por qué no puede colgarse de
+            # `quality_retry_used`): ese retry RE-DERIVA el prompt, o sea que
+            # cambiaría la escena en vez de corregir la cámara — "me cambió
+            # todo", que es una queja peor. Además comparte el único slot con el
+            # detector de cortes, y si el reintento pega un 429 el except de más
+            # abajo cae al gradiente y tira el clip bueno. Un re-roll de drift
+            # necesita: mismo prompt + generation_nonce fresco (si no, cache HIT
+            # → clip idéntico), quedarse con el MEJOR de los dos candidatos,
+            # presupuesto propio, y no-op duro si veo_breaker está abierto o
+            # bg_verbatim. Va en un PR aparte, con los datos en la mano.
+            if _norm_move_bg == "estatico":
+                _drift = _measure_camera_drift(bg_path)
+                if _drift:
+                    # El modelo va en la línea porque es la variable que se
+                    # quiere correlacionar: veo-3.1-fast tiene un drift prior
+                    # más fuerte que el standard, y VEO_MODEL_STATIC (hoy sin
+                    # setear) es la mitigación a evaluar con estos datos.
+                    # `attempt` va en la línea porque este bloque corre DENTRO
+                    # del loop de reintentos: si hay un re-roll por calidad o
+                    # por corte de escena, se mide también el clip descartado.
+                    # Sin el índice, el dataset mezcla clips entregados con
+                    # clips que nunca llegaron al operador — y este PR existe
+                    # justamente para medir la tasa real de los entregados.
+                    logger.info(
+                        "[BG][DRIFT] job=%s attempt=%s movement=estatico model=%s "
+                        "drift_pct=%.2f drift_pct_borders=%.2f peak_px=%.1f frames=%s",
+                        job_id, attempt,
+                        (os.environ.get("VEO_MODEL_STATIC", "").strip()
+                         or os.environ.get("VEO_MODEL", "veo-3.1-fast-generate-001").strip()),
+                        _drift["pct_width"], _drift["pct_width_borders"],
+                        _drift["peak_px"], _drift["frames"],
+                    )
             # Verbatim: never re-roll. A re-roll re-runs _get_unique_prompt
             # which short-circuits to the SAME verbatim text → identical
             # safe_prompt → Veo cache HIT → same clip, wasting a scoring pass
@@ -12001,7 +12588,7 @@ def _static_image_to_mp4(image_path: str, output_path: str, duration: float,
     leaving the job stuck in "processing". ffmpeg loops the single image at
     C-level with bounded memory — impossible to OOM at any song length. The
     video's life/motion now comes from the composable effect overlay
-    (fx_compositor: snow/rain/stars/bokeh/light), not a camera pan.
+    (fx_compositor's full effect catalogue), not a camera pan.
 
     Same on-disk contract as the old Ken Burns output: a full-duration MP4 at
     `output_path` that the rest of the pipeline composes lyrics + effect onto.
@@ -12423,11 +13010,35 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
                 "-stream_loop", "-1", "-i", os.path.abspath(fx_path),
                 "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(fg_path),
             ]
+            _fx_rhythm = _fx.rhythm_for_window(
+                _fx.detect_effect_rhythm(effect, mp3_path), win_start, dur
+            )
+            _fx_tempo = _fx_rhythm.bpm if _fx_rhythm else None
+            _fx_first_beat = (
+                _fx_rhythm.beats[0] if _fx_rhythm and _fx_rhythm.beats else 0.0
+            )
+            _fx_timing = _fx.effect_setpts(
+                effect, _fx_tempo, _fx_first_beat
+            )
+            _fx_blend = _fx.effect_blend(effect)
+            # Art tracks intentionally stay subtler than lyric-video effects:
+            # the cover card and waveform are the hierarchy. Preserve the
+            # established 0.45 ceiling for legacy loops too.
+            _fx_opacity = min(0.45, _fx.effect_opacity(effect))
+            _fx_treatment = (
+                "eq=saturation=0.70:brightness=-0.04,gblur=sigma=6,"
+                if _fx_blend == "screen" else
+                "gblur=sigma=4,"
+            )
+            _fx_rhythm_graph = _fx.rhythm_mask_graph(
+                _fx_rhythm, spec.width, spec.height
+            )
             fc = (
-                f"[3:v]scale={spec.width}:{spec.height},setpts=PTS-STARTPTS,"
-                f"eq=saturation=0.70:brightness=-0.04,gblur=sigma=6,format=gbrp[fx];"
+                f"[3:v]scale={spec.width}:{spec.height},{_fx_timing},"
+                f"{_fx_treatment}format=gbrp[fxraw];"
+                f"{_fx_rhythm_graph}"
                 f"[0:v]format=gbrp[bg0];"
-                f"[bg0][fx]blend=all_mode=screen:all_opacity=0.45,"
+                f"[bg0][fx]blend=all_mode={_fx_blend}:all_opacity={_fx_opacity:.2f},"
                 f"format={spec.pix_fmt}[bgfx];"
                 f"[bgfx][4:v]overlay=0:0[withcard];"
                 f"[withcard][1:v]overlay={L['wave_x']}:{L['wave_y']}:eof_action=repeat,"
@@ -13700,10 +14311,12 @@ def _render_lyrics_ass(
     # right filter form: a simple -vf when there's no effect (unchanged fast
     # path), or a -filter_complex with the looped fx clip as input #2.
     import fx_compositor as _fx
+    _fx_rhythm = _fx.detect_effect_rhythm(effect, mp3_path)
     vfilter, _use_complex, _extra_in = _fx.build_video_filter(
         ass_basename=("lyrics.ass" if render_text else None), font_dir=font_dir,
         width=spec.width, height=spec.height,
         effect=effect, style=style, custom_colors=custom_colors,
+        rhythm=_fx_rhythm,
     )
     _filter_args = (
         ["-filter_complex", vfilter, "-map", "[out]", "-map", "1:a"]
@@ -14207,12 +14820,32 @@ def generate_lyric_video(
     import fx_compositor as _fx
     import numpy as _np
     _fx_clip = None
+    _fx_rhythm = _fx.detect_effect_rhythm(effect, mp3_path)
     try:
         _fx_path = _fx.effect_path(effect)
         if _fx_path:
-            from moviepy.editor import VideoFileClip as _VFC, vfx as _vfx
-            _fx_clip = (_cover_resize(_VFC(_fx_path), spec.width, spec.height)
-                        .fx(_vfx.loop, duration=duration)
+            from moviepy.editor import (
+                VideoFileClip as _VFC,
+                concatenate_videoclips as _concat_fx,
+                vfx as _vfx,
+            )
+            _fx_source = _cover_resize(_VFC(_fx_path), spec.width, spec.height)
+            _fx_bpm = _fx_rhythm.bpm if _fx_rhythm else None
+            if _fx_bpm:
+                _fx_first = (
+                    _fx_rhythm.beats[0]
+                    if _fx_rhythm and _fx_rhythm.beats else 0.0
+                )
+                _phase_trim = _fx.effect_phase_trim(
+                    effect, _fx_bpm, _fx_first
+                )
+                if 0.001 < _phase_trim < _fx_source.duration:
+                    _fx_source = _concat_fx([
+                        _fx_source.subclip(_phase_trim),
+                        _fx_source.subclip(0, _phase_trim),
+                    ])
+                _fx_source = _fx_source.fx(_vfx.speedx, factor=_fx_bpm / 120.0)
+            _fx_clip = (_fx_source.fx(_vfx.loop, duration=duration)
                         .set_duration(duration))
     except Exception as _e:
         logger.warning("[FX] moviepy effect skipped (%s); continuing", _e)
@@ -14229,7 +14862,17 @@ def generate_lyric_video(
             b = _base_src.get_frame(t).astype(_np.float32)
             if _fx_src is not None:
                 f = _fx_src.get_frame(t).astype(_np.float32)
-                b = 255.0 - (255.0 - b) * (255.0 - f) / 255.0  # screen
+                if _fx.is_reactive_effect(effect):
+                    f *= _fx.effect_strength_at(_fx_rhythm, t)
+                if _fx.is_pixel_transform(effect):
+                    b = _fx.transform_photo_frame(b, effect, t, f)
+                else:
+                    if _fx.effect_blend(effect) == "multiply":
+                        mixed = b * f / 255.0
+                    else:
+                        mixed = 255.0 - (255.0 - b) * (255.0 - f) / 255.0
+                    opacity = _fx.effect_opacity(effect)
+                    b = b * (1.0 - opacity) + mixed * opacity
             return _fx.grade_frame(b, _grade_style, custom_colors).clip(0, 255).astype("uint8")
 
         base = VideoClip(_fx_base_frame, duration=duration).set_fps(spec.fps)
@@ -14471,31 +15114,42 @@ def _make_short_text_clip(text: str, seg_start: float, seg_end: float, font: str
     return [shadow, txt]
 
 
-def _apply_short_effect(short_path: str, fx_path: str, fps: float, job_dir: str) -> str:
-    """Screen-blend a looped fx overlay onto a finished short via ffmpeg.
+def _apply_short_effect(short_path: str, fx_path: str, fps: float, job_dir: str,
+                        beat_bpm: float | None = None,
+                        rhythm=None, style: str = "",
+                        custom_colors: str = "") -> str:
+    """Blend a looped fx layer onto a finished short via ffmpeg.
 
-    The short is moviepy-rendered and moviepy can't screen-blend, so the
+    The short is moviepy-rendered and moviepy can't reproduce these blend
+    modes efficiently, so the
     effect is applied as a C-level ffmpeg post-pass using the SAME pre-baked
     fx assets the main video composites (fx_compositor). Falls back to the
     un-effected short if ffmpeg fails."""
     tmp = os.path.join(job_dir, "short_fx.mp4")
     # Same per-effect pre-blend gain as the main libass path (fx_compositor),
     # so a dim effect (stars/bokeh/snow) reads the same in the short as in the
-    # video. Derive the effect name from the asset filename. eq goes before
-    # format=gbrp (runs on the clip's native YUV).
+    # video. Derive the effect name from the asset filename. The pre-filter
+    # runs before format=gbrp on the clip's native YUV.
     import fx_compositor as _fx
     _eff = os.path.splitext(os.path.basename(fx_path))[0]
-    _gain = _fx.fx_gain(_eff)
-    _gain_step = f"{_gain}," if _gain else ""
+    _graph, _complex, _extra = _fx.build_video_filter(
+        ass_basename=None,
+        font_dir="",
+        width=1080,
+        height=1920,
+        effect=_eff,
+        style=style,
+        custom_colors=custom_colors,
+        beat_bpm=beat_bpm,
+        rhythm=rhythm,
+        fx_input_index=1,
+    )
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", os.path.abspath(short_path),
         "-stream_loop", "-1", "-i", os.path.abspath(fx_path),
-        "-filter_complex",
-        "[0:v]format=gbrp[b];"
-        f"[1:v]scale=1080:1920,setpts=PTS-STARTPTS,{_gain_step}format=gbrp[f];"
-        "[b][f]blend=all_mode=screen:shortest=1,format=yuv420p[o]",
-        "-map", "[o]", "-map", "0:a?",
+        "-filter_complex", _graph,
+        "-map", "[out]", "-map", "0:a?",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-c:a", "copy", "-movflags", "+faststart", "-shortest",
         "-r", str(fps), tmp,
@@ -14757,6 +15411,7 @@ def generate_short(
                        os.path.basename(font))
 
     import fx_compositor as _fx
+    _selected_fx = _fx.effect_path(effect)
 
     audio = AudioFileClip(mp3_path)
     start_time = _find_chorus_start(segments)
@@ -14799,7 +15454,7 @@ def generate_short(
     # Color-grade the BACKGROUND (before lyrics, like the main video — so the
     # lyrics stay ungraded). No-op when style/custom_colors yield no grade.
     _grade_style = style if _fx.grade_filter(style, custom_colors) else ""
-    if _grade_style:
+    if _grade_style and not _selected_fx:
         # grade_frame returns an UNCLIPPED float frame; moviepy fl_image needs
         # uint8 [0,255] — clip+cast like the main moviepy fallback does.
         bg = bg.fl_image(
@@ -14847,6 +15502,20 @@ def generate_short(
     )
     audio.close()
     final.close()
+
+    # Effects belong to the background, BEFORE the subtitle burn. Applying a
+    # photo transform after libass would displace/mirror the lyric glyphs too
+    # (most visible with kaleido/liquid_glass/cutout_echo) and diverge from the
+    # main render's bg → effect → grade → subtitles ordering.
+    fx = _selected_fx
+    if fx:
+        _short_rhythm = _fx.rhythm_for_window(
+            _fx.detect_effect_rhythm(effect, mp3_path), start_time, short_dur
+        )
+        bg_only_path = _apply_short_effect(
+            bg_only_path, fx, fps, job_dir, rhythm=_short_rhythm,
+            style=style, custom_colors=custom_colors,
+        )
 
     burned = _burn_short_text_ass(
         bg_only_path, window_segments, job_dir, short_dur, fps,
@@ -14909,13 +15578,6 @@ def generate_short(
         os.unlink(bg_only_path)
     except OSError:
         pass
-
-    # Effect overlay (snow/rain/stars/bokeh/light/aurora): screen-blend the
-    # pre-baked fx loop over the short with ffmpeg — the SAME fx assets the
-    # main video composites. moviepy can't screen-blend, so it's a post-pass.
-    fx = _fx.effect_path(effect)
-    if fx:
-        out_path = _apply_short_effect(out_path, fx, fps, job_dir)
 
     return out_path
 

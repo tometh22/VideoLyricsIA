@@ -4,11 +4,11 @@ The render burns lyrics with libass in ONE ffmpeg pass (see pipeline.py
 `_render_lyrics_ass`). This module builds the video filter for that pass,
 optionally adding two layers BEFORE the subtitles burn:
 
-  1. EFFECT overlay (snow / rain / stars / bokeh / light): a pre-baked,
-     seamless, black-background RGB loop at assets/fx/<effect>.mp4 (built once
-     by scripts/gen_fx_loops.py), composited with `blend=all_mode=screen`.
-     Effects are ADDITIVE (light-emitting), so screen-blend over black needs no
-     alpha channel — plain H.264, fast to decode.
+  1. EFFECT layer (snow / liquid glass / shadows / beat ripples / ...): a
+     pre-baked seamless RGB loop at assets/fx/<effect>.mp4 (built once by
+     scripts/gen_fx_loops.py). Luminous loops are screen-blended over black;
+     shadow/ink treatments are multiplied over white. Neither needs an alpha
+     codec, so plain H.264 stays fast to decode.
 
      CRITICAL: the blend MUST run in RGB (`format=gbrp`). In YUV, `blend=screen`
      operates on the chroma (U/V) planes and tints the whole frame magenta.
@@ -24,8 +24,12 @@ This module is intentionally a leaf (no pipeline import) so it stays unit-
 testable without moviepy/ffmpeg. The caller (pipeline) splices the returned
 filter + extra inputs into its ffmpeg command.
 """
+from __future__ import annotations
+
 import logging
 import os
+from dataclasses import dataclass
+from functools import lru_cache
 
 logger = logging.getLogger("genly.fx_compositor")
 
@@ -45,12 +49,326 @@ _FX_DIR = next(
     _FX_DIR_CANDIDATES[0],
 )
 
-# Available pre-baked effect loops (must match scripts/gen_fx_loops.py).
-# 2026-05-25: "aurora" agregado para cubrir el estilo UMG observado en
-# los refs Boza / Yatra Cristina / A los cuatro vientos — líneas
-# brillantes ondulantes que flotan sobre el cielo. Asset placeholder
-# basado en light.mp4 hasta que se swap el real (loop ondas + glow).
-EFFECTS = ("snow", "rain", "stars", "bokeh", "light", "aurora")
+# Available pre-baked effect loops (must match scripts/gen_fx_loops.py and the
+# wizard catalogue). Keep this tuple explicit: it is the server-side allowlist
+# that prevents arbitrary filenames from reaching the ffmpeg command.
+EFFECTS = (
+    "snow",
+    "rain",
+    "stars",
+    "bokeh",
+    "light",
+    "aurora",
+    "dust",
+    "embers",
+    "petals",
+    "prism",
+    "confetti",
+    "film",
+    "scanlines",
+    "fog",
+    "shapes",
+    # Motion Lab — effects designed specifically to give fixed photos a
+    # distinct visual language (rather than another particle colourway).
+    "liquid_glass",
+    "caustics",
+    "rgb_glitch",
+    "neon_edge",
+    "shadow_play",
+    "kaleido",
+    "halftone",
+    "ink_reveal",
+    "heatwave",
+    "chromatic_pulse",
+    "cutout_echo",
+    "projector",
+    # Audio-reactive pack. The baked loops are authored at 120 BPM and their
+    # PTS is tempo-matched to the detected song BPM at render time.
+    "bass_pulse",
+    "beat_flash",
+    "chromatic_hit",
+    "beat_ripple",
+    "echo_hit",
+)
+
+REACTIVE_EFFECTS = (
+    "bass_pulse",
+    "beat_flash",
+    "chromatic_hit",
+    "beat_ripple",
+    "echo_hit",
+)
+
+# These treatments derive their visible pixels from the selected photo.  The
+# baked MP4 is only an auxiliary light/mask layer.  Keeping this allow-list
+# explicit lets the editor describe the effect honestly and gives tests a
+# stable contract: these are transformations, not decorative overlays.
+PIXEL_TRANSFORM_EFFECTS = (
+    "liquid_glass",
+    "rgb_glitch",
+    "neon_edge",
+    "kaleido",
+    "halftone",
+    "ink_reveal",
+    "heatwave",
+    "chromatic_pulse",
+    "cutout_echo",
+    "projector",
+)
+
+# Most loops emit light over black and therefore use screen. These three are
+# deliberately authored as dark ink/shadow over white, so multiply gives fixed
+# photos motion without washing their highlights.
+_FX_BLEND = {
+    "shadow_play": "multiply",
+    "halftone": "multiply",
+    "ink_reveal": "multiply",
+}
+
+# Keep the more graphic treatments editorial rather than overpowering lyrics.
+_FX_OPACITY = {
+    "rgb_glitch": 0.72,
+    "neon_edge": 0.74,
+    "shadow_play": 0.58,
+    "kaleido": 0.68,
+    "halftone": 0.46,
+    "ink_reveal": 0.56,
+    "heatwave": 0.62,
+    "cutout_echo": 0.62,
+    "projector": 0.72,
+    "beat_flash": 0.68,
+    "chromatic_hit": 0.72,
+}
+
+
+def effect_blend(effect: str) -> str:
+    """ffmpeg/CSS-compatible blend mode for an effect."""
+    return _FX_BLEND.get((effect or "").strip().lower(), "screen")
+
+
+def effect_opacity(effect: str) -> float:
+    """Editorial strength of the effect layer in [0, 1]."""
+    return _FX_OPACITY.get((effect or "").strip().lower(), 1.0)
+
+
+def is_reactive_effect(effect: str) -> bool:
+    return (effect or "").strip().lower() in REACTIVE_EFFECTS
+
+
+def is_pixel_transform(effect: str) -> bool:
+    return (effect or "").strip().lower() in PIXEL_TRANSFORM_EFFECTS
+
+
+@dataclass(frozen=True)
+class EffectRhythm:
+    """Beat grid used by audio-reactive visuals.
+
+    `beats` are exact detector timestamps.  `strengths` are normalized
+    low-frequency energies at those timestamps, so a kick can drive a
+    stronger visual hit than a quiet metronomic subdivision.
+    """
+
+    bpm: float
+    beats: tuple[float, ...]
+    strengths: tuple[float, ...]
+
+
+@lru_cache(maxsize=32)
+def _detect_rhythm_cached(audio_path: str, mtime_ns: int) -> EffectRhythm:
+    """Detect beat timestamps + bass energy once per source file."""
+    del mtime_ns  # part of the cache key so replacing a file invalidates it
+    try:
+        import beat_snap
+        result = beat_snap.detect_beats(audio_path)
+        if result:
+            bpm = float(result[0])
+            beats = tuple(float(t) for t in result[1] if float(t) >= 0.0)
+            if 45.0 <= bpm <= 220.0 and beats:
+                strengths = _beat_strengths(audio_path, beats)
+                return EffectRhythm(bpm=bpm, beats=beats, strengths=strengths)
+            logger.warning(
+                "[FX] invalid beat grid (bpm=%s, beats=%d); using 120 BPM",
+                result[0], len(beats),
+            )
+    except Exception as exc:  # pragma: no cover - beat_snap is already defensive
+        logger.warning("[FX] beat detection failed (%s); using 120 BPM", exc)
+    return EffectRhythm(bpm=120.0, beats=(), strengths=())
+
+
+def _beat_strengths(audio_path: str, beats: tuple[float, ...]) -> tuple[float, ...]:
+    """Return robust 0.45..1 bass-energy weights for detected beats."""
+    if not beats:
+        return ()
+    try:
+        import librosa
+        import numpy as np
+
+        y, sr = librosa.load(audio_path, sr=11025, mono=True)
+        hop = 256
+        spectrum = np.abs(librosa.stft(y, n_fft=1024, hop_length=hop))
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=1024)
+        bass = spectrum[freqs <= 180.0].mean(axis=0)
+        frame_times = librosa.frames_to_time(
+            np.arange(bass.size), sr=sr, hop_length=hop
+        )
+        values = np.array(
+            [
+                float(
+                    bass[
+                        max(0, int(np.searchsorted(frame_times, beat)) - 1):
+                        min(bass.size, int(np.searchsorted(frame_times, beat)) + 2)
+                    ].max(initial=0.0)
+                )
+                for beat in beats
+            ],
+            dtype=np.float64,
+        )
+        lo, hi = np.percentile(values, (20, 95))
+        if hi <= lo + 1e-9:
+            return tuple(1.0 for _ in beats)
+        normalized = np.clip((values - lo) / (hi - lo), 0.0, 1.0)
+        return tuple(float(0.45 + 0.55 * v) for v in normalized)
+    except Exception as exc:
+        logger.warning("[FX] bass-energy analysis failed (%s); using flat beats", exc)
+        return tuple(1.0 for _ in beats)
+
+
+def detect_effect_rhythm(effect: str, audio_path: str) -> EffectRhythm | None:
+    """Full rhythm contract for a reactive effect, otherwise ``None``."""
+    if not is_reactive_effect(effect) or not audio_path:
+        return None
+    try:
+        mtime_ns = os.stat(audio_path).st_mtime_ns
+    except OSError:
+        return EffectRhythm(120.0, (), ())
+    rhythm = _detect_rhythm_cached(os.path.abspath(audio_path), mtime_ns)
+    logger.info(
+        "[FX] reactive '%s': %.1f BPM, %d exact beats + bass energy",
+        effect, rhythm.bpm, len(rhythm.beats),
+    )
+    return rhythm
+
+
+def detect_effect_tempo(effect: str, audio_path: str) -> float | None:
+    """Backward-compatible BPM accessor for callers outside the compositor.
+
+    Tempo matching is intentionally independent from BEAT_SNAP_ENABLED: that
+    flag controls lyric timestamp correction, while choosing a reactive visual
+    explicitly opts into beat analysis.
+    """
+    rhythm = detect_effect_rhythm(effect, audio_path)
+    return rhythm.bpm if rhythm else None
+
+
+def effect_phase_trim(effect: str, beat_bpm: float | None = None,
+                      beat_offset: float = 0.0) -> float:
+    """Source seconds to cyclically trim for alignment to the first beat."""
+    if not is_reactive_effect(effect):
+        return 0.0
+    try:
+        bpm = float(beat_bpm or 120.0)
+    except (TypeError, ValueError):
+        bpm = 120.0
+    bpm = min(220.0, max(45.0, bpm))
+    factor = 120.0 / bpm
+    # The authored loop hits at 0, .5, 1.0… source seconds. Trim into its
+    # phase so the next authored hit lands on the detector's first timestamp,
+    # while still emitting frames from output t=0 (no black pre-roll).
+    period_out = 0.5 * factor
+    offset = max(0.0, float(beat_offset or 0.0)) % period_out
+    return (0.5 - (offset / factor)) % 0.5
+
+
+def effect_setpts(effect: str, beat_bpm: float | None = None,
+                  beat_offset: float = 0.0) -> str:
+    """PTS step for an authored loop.
+
+    Reactive assets contain one hit every 0.5 s (120 BPM). Scaling their PTS by
+    120/song_BPM makes the hits recur at the detected beat interval.
+    Non-reactive effects retain the historical timing exactly.
+    """
+    if not is_reactive_effect(effect):
+        return "setpts=PTS-STARTPTS"
+    try:
+        bpm = float(beat_bpm or 120.0)
+    except (TypeError, ValueError):
+        bpm = 120.0
+    bpm = min(220.0, max(45.0, bpm))
+    factor = 120.0 / bpm
+    source_trim = effect_phase_trim(effect, bpm, beat_offset)
+    trim = f"trim=start={source_trim:.6f}," if source_trim > 0.000001 else ""
+    return f"{trim}setpts=(PTS-STARTPTS)*{factor:.6f}"
+
+
+def rhythm_for_window(rhythm: EffectRhythm | None, start: float,
+                      duration: float | None = None) -> EffectRhythm | None:
+    """Rebase a song rhythm to an exported window (short/art track)."""
+    if rhythm is None:
+        return None
+    end = float("inf") if duration is None else start + max(0.0, duration)
+    strengths = rhythm.strengths or (1.0,) * len(rhythm.beats)
+    selected = [
+        (beat - start, strength)
+        for beat, strength in zip(rhythm.beats, strengths)
+        if start <= beat <= end
+    ]
+    return EffectRhythm(
+        rhythm.bpm,
+        tuple(pair[0] for pair in selected),
+        tuple(pair[1] for pair in selected),
+    )
+
+
+def effect_strength_at(rhythm: EffectRhythm | None, t: float,
+                       decay: float = 0.16) -> float:
+    """Python/moviepy equivalent of the ffmpeg beat envelope."""
+    if not rhythm or not rhythm.beats:
+        return 1.0
+    value = 0.10
+    for beat, strength in zip(
+        rhythm.beats, rhythm.strengths or (1.0,) * len(rhythm.beats)
+    ):
+        distance = abs(float(t) - beat)
+        if distance < decay:
+            value += strength * (1.0 - distance / decay)
+    return min(1.0, value)
+
+
+def _rhythm_envelope(rhythm: EffectRhythm | None, decay: float = 0.16) -> str:
+    """ffmpeg expression that pulses on exact, energy-weighted beat times."""
+    if not rhythm or not rhythm.beats:
+        return "1"
+    # Cap pathological grids to keep filter arguments well below OS argv
+    # limits. Preserve the strongest hits instead of arbitrary early beats.
+    pairs = list(zip(rhythm.beats, rhythm.strengths or (1.0,) * len(rhythm.beats)))
+    if len(pairs) > 900:
+        keep = sorted(
+            sorted(enumerate(pairs), key=lambda item: item[1][1], reverse=True)[:900],
+            key=lambda item: item[0],
+        )
+        pairs = [item[1] for item in keep]
+    pulses = [
+        f"if(lt(abs(T-{beat:.4f}),{decay:.3f}),"
+        f"{strength:.3f}*(1-abs(T-{beat:.4f})/{decay:.3f}),0)"
+        for beat, strength in pairs
+    ]
+    return f"min(1,0.10+{'+'.join(pulses)})"
+
+
+def rhythm_mask_graph(rhythm: EffectRhythm | None, width: int, height: int,
+                      *, raw_label: str = "fxraw",
+                      out_label: str = "fx") -> str:
+    """Filtergraph fragment applying the exact energy-weighted beat envelope."""
+    if not rhythm or not rhythm.beats:
+        return f"[{raw_label}]null[{out_label}];"
+    env = _rhythm_envelope(rhythm)
+    return (
+        f"color=c=white:s={width}x{height}:r=30,format=gray,"
+        f"geq=lum='255*({env})',format=gbrp[beatmask];"
+        f"[{raw_label}][beatmask]blend=all_mode=multiply:shortest=1"
+        f"[{out_label}];"
+    )
+
 
 # palette code → ffmpeg `eq` grade. "" / "auto" / unknown → no grade
 # (scene-natural). Mirrors the frontend STYLES codes used elsewhere.
@@ -129,23 +447,30 @@ _FX_GAIN = {
     #     composite YMAX 139→129, worse). A `curves` that LIFTS the streak
     #     band (0.3→0.65, 0.6→1) while pinning the near-black bg low brings
     #     composite YMAX 139→229 with YAVG unchanged (bg stays dark).
-    #   - light / aurora: a broad diffuse glow capped at ~0.31 luma (raw YMAX
-    #     79). A contrast boost just dims it (all below the 0.5 pivot). A
-    #     `curves` lifting the glow band (0.2→0.55, 0.31→0.92) brightens the
-    #     glow while keeping the floor dark. NOTE: aurora.mp4 is still a
-    #     placeholder copy of light.mp4 (identical luma stats) — same gain;
-    #     a distinct aurora loop is a separate follow-up.
+    #   - light / aurora / prism: broad diffuse glows. Contrast would dim them
+    #     because most pixels sit below the 0.5 pivot, so lift their mid band.
     "rain": "curves=all='0/0 0.1/0.03 0.3/0.65 0.6/1 1/1'",
     "light": "curves=all='0/0 0.06/0.015 0.2/0.55 0.31/0.92 1/1'",
     "aurora": "curves=all='0/0 0.06/0.015 0.2/0.55 0.31/0.92 1/1'",
+    "prism": "curves=all='0/0 0.06/0.015 0.2/0.52 0.35/0.9 1/1'",
+    "dust": "eq=contrast=1.55:brightness=-0.015",
+    "embers": "curves=all='0/0 0.08/0.025 0.25/0.65 0.55/1 1/1'",
+    "petals": "eq=contrast=1.20",
+    "film": "curves=all='0/0 0.05/0.02 0.18/0.48 0.5/0.88 1/1'",
+    "scanlines": "curves=all='0/0 0.05/0.025 0.18/0.52 0.5/0.9 1/1'",
+    "fog": "curves=all='0/0 0.06/0.025 0.20/0.62 0.5/0.95 1/1'",
+    "shapes": "curves=all='0/0 0.08/0.025 0.28/0.72 0.60/1 1/1'",
+    # The source uses large deterministic leaf-like masks. Blur at composite
+    # resolution turns their hard procedural edges into natural soft shadows.
+    "shadow_play": "gblur=sigma=16",
 }
 
 
 def fx_gain(effect: str) -> str:
-    """ffmpeg `eq` to pre-amplify a dim effect before screen-blend, or ''.
+    """ffmpeg pre-filter for an effect before blend, or ''.
 
-    Goes BEFORE `format=gbrp` in the fx chain (eq runs on the clip's native
-    YUV); empty string for effects that are already bright enough."""
+    Usually a gain curve; some treatments use a blur. Goes BEFORE
+    `format=gbrp` in the fx chain; empty for effects that need no treatment."""
     return _FX_GAIN.get((effect or "").strip().lower(), "")
 
 
@@ -252,15 +577,260 @@ def grade_frame(frame, style: str, custom_colors: str = ""):
     return f
 
 
+def transform_photo_frame(frame, effect: str, t: float, fx_frame=None):
+    """Moviepy fallback for the photo-derived production treatments.
+
+    FFmpeg remains the primary renderer. This bounded numpy/Pillow equivalent
+    prevents a worker that falls back to moviepy from silently degrading a
+    selected transform into a plain decorative overlay.
+    """
+    import numpy as np
+    from PIL import Image, ImageEnhance, ImageFilter
+
+    effect = (effect or "").strip().lower()
+    base = np.clip(frame, 0, 255).astype(np.uint8)
+    height, width = base.shape[:2]
+
+    def screen(a, b):
+        return 255.0 - (255.0 - a) * (255.0 - b) / 255.0
+
+    def resize_center(source, ratio):
+        target_w = max(2, int(width * ratio))
+        target_h = max(2, int(height * ratio))
+        resized = np.asarray(
+            Image.fromarray(source).resize((target_w, target_h), Image.Resampling.BILINEAR)
+        )
+        canvas = np.zeros_like(source)
+        x, y = (width - target_w) // 2, (height - target_h) // 2
+        canvas[y:y + target_h, x:x + target_w] = resized
+        return canvas
+
+    out = base.astype(np.float32)
+    if effect in {"liquid_glass", "heatwave"}:
+        amplitude = 15 if effect == "liquid_glass" else 11
+        frequency = 1.0 if effect == "liquid_glass" else 5.0
+        speed = 0.22 if effect == "liquid_glass" else -0.45
+        warped = np.empty_like(base)
+        for y in range(height):
+            shift = int(
+                amplitude * np.sin(2 * np.pi * (y / height * frequency + t * speed))
+            )
+            warped[y] = np.roll(base[y], shift, axis=0)
+        out = warped.astype(np.float32)
+    elif effect in {"rgb_glitch", "chromatic_pulse"}:
+        shift = 14
+        if effect == "chromatic_pulse":
+            shift = max(2, int(14 * (0.35 + 0.65 * abs(np.sin(2 * np.pi * t)))))
+        out = base.astype(np.float32)
+        out[:, :, 0] = np.roll(base[:, :, 0], shift, axis=1)
+        out[:, :, 2] = np.roll(base[:, :, 2], -shift, axis=1)
+    elif effect == "neon_edge":
+        edge = Image.fromarray(base).filter(ImageFilter.FIND_EDGES)
+        edge = ImageEnhance.Color(edge).enhance(2.0)
+        edge_arr = np.asarray(edge, dtype=np.float32)
+        out = screen(base.astype(np.float32) * 0.86, edge_arr * 0.82)
+    elif effect == "kaleido":
+        quadrant = base[: max(1, height // 2), : max(1, width // 2)]
+        top = np.concatenate([quadrant, np.flip(quadrant, axis=1)], axis=1)
+        tiled = np.concatenate([top, np.flip(top, axis=0)], axis=0)
+        out = np.asarray(
+            Image.fromarray(tiled).resize((width, height), Image.Resampling.BILINEAR),
+            dtype=np.float32,
+        )
+    elif effect == "halftone":
+        tiny = Image.fromarray(base).resize(
+            (max(8, width // 10), max(8, height // 10)), Image.Resampling.BOX
+        )
+        out = np.asarray(
+            tiny.resize((width, height), Image.Resampling.NEAREST),
+            dtype=np.float32,
+        )
+    elif effect == "ink_reveal":
+        paper = np.asarray(
+            Image.fromarray(base).filter(ImageFilter.GaussianBlur(radius=12)),
+            dtype=np.float32,
+        )
+        if fx_frame is not None:
+            fx_gray = np.asarray(fx_frame, dtype=np.float32).mean(axis=2)
+            mask = np.clip(1.0 - fx_gray / 255.0, 0.0, 1.0)
+        else:
+            progress = 0.5 + 0.5 * np.sin(float(t) * np.pi / 2)
+            mask = (np.arange(width)[None, :] < width * progress).astype(np.float32)
+            mask = np.repeat(mask, height, axis=0)
+        out = paper * (1.0 - mask[:, :, None]) + base * mask[:, :, None]
+    elif effect == "cutout_echo":
+        echo1 = resize_center(base, 0.94).astype(np.float32)
+        echo2 = resize_center(base, 0.88).astype(np.float32)
+        out = screen(base.astype(np.float32), echo1 * 0.22)
+        out = screen(out, echo2 * 0.15)
+    elif effect == "projector":
+        angle = 0.45 * np.sin(2 * np.pi * float(t) / 3.7)
+        gate = Image.fromarray(base).rotate(
+            angle, resample=Image.Resampling.BILINEAR, expand=False
+        )
+        out = np.asarray(
+            ImageEnhance.Contrast(gate).enhance(1.08), dtype=np.float32
+        ) * 0.90
+
+    # Ink uses the loop as its actual merge mask above. Other transform loops
+    # remain restrained auxiliary light/dot layers, matching the FFmpeg graph.
+    if fx_frame is not None and effect != "ink_reveal":
+        layer = np.clip(fx_frame, 0, 255).astype(np.float32)
+        opacity = {
+            "liquid_glass": 0.34, "heatwave": 0.26, "rgb_glitch": 0.40,
+            "neon_edge": 0.18, "kaleido": 0.12, "halftone": 0.48,
+            "chromatic_pulse": 0.36, "cutout_echo": 0.24, "projector": 0.42,
+        }.get(effect, effect_opacity(effect))
+        mixed = (
+            out * layer / 255.0
+            if effect_blend(effect) == "multiply"
+            else screen(out, layer)
+        )
+        out = out * (1.0 - opacity) + mixed * opacity
+    return np.clip(out, 0, 255)
+
+
 def _escape_filter_path(p: str) -> str:
     """Escape a path for use as an ffmpeg filter option value (subtitles/
     fontsdir). Backslash first, then the filtergraph delimiters."""
     return p.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
 
+def _overlay_graph(*, blend: str, opacity: float,
+                   bg: str = "bg", fx: str = "fx", out: str = "bl") -> str:
+    opacity_step = f":all_opacity={opacity:.2f}" if opacity < 1.0 else ""
+    return (
+        f"[{bg}][{fx}]blend=all_mode={blend}{opacity_step}:shortest=1"
+        f"[{out}]"
+    )
+
+
+def _pixel_transform_graph(effect: str, width: int, height: int) -> str:
+    """Photo-derived compositor graph from prepared ``[bg]`` + ``[fx]``.
+
+    Each branch must end in ``[bl]`` and remain deterministic/portable across
+    the ffmpeg builds used locally and in the worker image.
+    """
+    effect = (effect or "").strip().lower()
+    half_w, half_h = max(2, width // 2), max(2, height // 2)
+    inset_w, inset_h = max(2, width - 14), height
+    echo1_w, echo1_h = max(2, int(width * 0.94)), max(2, int(height * 0.94))
+    echo2_w, echo2_h = max(2, int(width * 0.88)), max(2, int(height * 0.88))
+
+    if effect == "liquid_glass":
+        xmap = (
+            "128+15*sin(2*PI*(Y/H+T*0.22))"
+            "+5*sin(2*PI*(X/W*2-T*0.10))"
+        )
+        ymap = "128+7*cos(2*PI*(X/W+T*0.15))"
+        return (
+            "[bg]split=3[liqsrc][liqx][liqy];"
+            f"[liqx]geq=r='{xmap}':g='{xmap}':b='{xmap}'[liqxm];"
+            f"[liqy]geq=r='{ymap}':g='{ymap}':b='{ymap}'[liqym];"
+            "[liqsrc][liqxm][liqym]displace=edge=mirror[liq];"
+            "[liq][fx]blend=all_mode=screen:all_opacity=0.34:shortest=1[bl]"
+        )
+    if effect == "heatwave":
+        xmap = "128+11*sin(2*PI*(Y/H*5-T*0.45))"
+        ymap = "128+3*cos(2*PI*(X/W*2+T*0.20))"
+        return (
+            "[bg]split=3[heatsrc][heatx][heaty];"
+            f"[heatx]geq=r='{xmap}':g='{xmap}':b='{xmap}'[heatxm];"
+            f"[heaty]geq=r='{ymap}':g='{ymap}':b='{ymap}'[heatym];"
+            "[heatsrc][heatxm][heatym]displace=edge=mirror[warped];"
+            "[warped][fx]blend=all_mode=screen:all_opacity=0.26:shortest=1[bl]"
+        )
+    if effect == "rgb_glitch":
+        return (
+            "[bg]split=3[glbase][glr][glc];"
+            f"[glr]crop={inset_w}:{inset_h}:0:0,"
+            f"pad={width}:{height}:14:0:black,"
+            "colorchannelmixer=gg=0:bb=0[redshift];"
+            f"[glc]crop={inset_w}:{inset_h}:14:0,"
+            f"pad={width}:{height}:0:0:black,"
+            "colorchannelmixer=rr=0[cyanshift];"
+            "[glbase][redshift]blend=all_mode=screen:all_opacity=0.24[gla];"
+            "[gla][cyanshift]blend=all_mode=screen:all_opacity=0.20[glb];"
+            "[glb][fx]blend=all_mode=screen:all_opacity=0.40:shortest=1[bl]"
+        )
+    if effect == "neon_edge":
+        return (
+            "[bg]split=2[neonbase][neonsrc];"
+            "[neonbase]eq=brightness=-0.055:saturation=0.82[neondim];"
+            "[neonsrc]edgedetect=mode=colormix:high=0.16,"
+            "eq=contrast=1.45:saturation=2.0[edges];"
+            "[neondim][edges]blend=all_mode=screen:all_opacity=0.82[neon];"
+            "[neon][fx]blend=all_mode=screen:all_opacity=0.18:shortest=1[bl]"
+        )
+    if effect == "kaleido":
+        return (
+            "[bg]rotate='0.022*sin(2*PI*t/6)':ow=iw:oh=ih:fillcolor=black,"
+            f"crop={half_w}:{half_h}:(in_w-out_w)/2:(in_h-out_h)/2,"
+            "split=4[k1][k2i][k3i][k4i];"
+            "[k2i]hflip[k2];[k3i]vflip[k3];[k4i]hflip,vflip[k4];"
+            "[k1][k2]hstack=inputs=2[ktop];"
+            "[k3][k4]hstack=inputs=2[kbottom];"
+            "[ktop][kbottom]vstack=inputs=2[kphoto];"
+            f"[kphoto]scale={width}:{height}[kscaled];"
+            "[kscaled][fx]blend=all_mode=screen:all_opacity=0.12:shortest=1[bl]"
+        )
+    if effect == "halftone":
+        dot_w, dot_h = max(8, width // 10), max(8, height // 10)
+        return (
+            f"[bg]scale={dot_w}:{dot_h}:flags=area,"
+            f"scale={width}:{height}:flags=neighbor,"
+            "eq=contrast=1.16:saturation=0.72[poster];"
+            "[poster][fx]blend=all_mode=multiply:all_opacity=0.48:shortest=1[bl]"
+        )
+    if effect == "ink_reveal":
+        return (
+            "[bg]split=2[inkbase][inkalt];"
+            "[inkalt]gblur=sigma=18,eq=saturation=0.35:brightness=-0.03[paper];"
+            "[fx]format=gray,negate,curves=all='0/0 0.32/0 0.62/1 1/1'[inkmask];"
+            "[paper][inkbase][inkmask]maskedmerge[bl]"
+        )
+    if effect == "chromatic_pulse":
+        return (
+            "[bg]split=3[cpbase][cpr][cpb];"
+            f"[cpr]crop={inset_w}:{inset_h}:0:0,"
+            f"pad={width}:{height}:14:0:black,"
+            "colorchannelmixer=gg=0:bb=0[cprshift];"
+            f"[cpb]crop={inset_w}:{inset_h}:14:0,"
+            f"pad={width}:{height}:0:0:black,"
+            "colorchannelmixer=rr=0:gg=0[cpbshift];"
+            "[cpbase][cprshift]blend=all_mode=screen:all_opacity=0.17[cpa];"
+            "[cpa][cpbshift]blend=all_mode=screen:all_opacity=0.14[cpb2];"
+            "[cpb2][fx]blend=all_mode=screen:all_opacity=0.36:shortest=1[bl]"
+        )
+    if effect == "cutout_echo":
+        return (
+            "[bg]split=3[echobase][echo1i][echo2i];"
+            f"[echo1i]scale={echo1_w}:{echo1_h},"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
+            "eq=saturation=1.25[echo1];"
+            f"[echo2i]scale={echo2_w}:{echo2_h},"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
+            "eq=saturation=0.75[echo2];"
+            "[echobase][echo1]blend=all_mode=screen:all_opacity=0.22[echoa];"
+            "[echoa][echo2]blend=all_mode=screen:all_opacity=0.15[echob];"
+            "[echob][fx]blend=all_mode=screen:all_opacity=0.24:shortest=1[bl]"
+        )
+    if effect == "projector":
+        return (
+            "[bg]rotate='0.008*sin(2*PI*t/3.7)':ow=iw:oh=ih:fillcolor=black,"
+            "eq=contrast=1.08:brightness=-0.025:saturation=0.88,"
+            "vignette=PI/5.2:eval=frame[gate];"
+            "[gate][fx]blend=all_mode=screen:all_opacity=0.42:shortest=1[bl]"
+        )
+    raise ValueError(f"Unsupported pixel transform: {effect}")
+
+
 def build_video_filter(*, ass_basename: str | None, font_dir: str, width: int,
                        height: int, effect: str = "", style: str = "",
-                       custom_colors: str = ""):
+                       custom_colors: str = "",
+                       beat_bpm: float | None = None,
+                       rhythm: EffectRhythm | None = None,
+                       fx_input_index: int = 2):
     """Build the video filter for the single-pass libass render.
 
     Returns (filter_str, use_complex, extra_inputs):
@@ -293,10 +863,26 @@ def build_video_filter(*, ass_basename: str | None, font_dir: str, width: int,
     subs_step = subs if subs else "null"
     gain = fx_gain(effect)
     gain_step = f"{gain}," if gain else ""  # before format=gbrp (eq on native YUV)
+    bpm = rhythm.bpm if rhythm else beat_bpm
+    first_beat = rhythm.beats[0] if rhythm and rhythm.beats else 0.0
+    timing = effect_setpts(effect, bpm, first_beat)
+    blend = effect_blend(effect)
+    opacity = effect_opacity(effect)
+    prep = (
+        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},format=gbrp[bg];"
+        f"[{fx_input_index}:v]scale={width}:{height},{timing},"
+        f"{gain_step}format=gbrp[fxraw];"
+    )
+    prep += rhythm_mask_graph(rhythm, width, height)
+
+    composite = (
+        _pixel_transform_graph(effect, width, height)
+        if is_pixel_transform(effect)
+        else _overlay_graph(blend=blend, opacity=opacity)
+    )
     fc = (
-        f"[0:v]format=gbrp[bg];"
-        f"[2:v]scale={width}:{height},setpts=PTS-STARTPTS,{gain_step}format=gbrp[fx];"
-        f"[bg][fx]blend=all_mode=screen:shortest=1[bl];"
+        f"{prep}{composite};"
         f"[bl]{grade_step}format=yuv420p[gr];"
         f"[gr]{subs_step}[out]"
     )

@@ -22,7 +22,9 @@ ADLIB_MIN_REPEATS: int = 5      # _is_single_word_loop min_repeats for SPLIT pat
 LONG_LINE_MIN_WORDS: int = 7    # canonical word count that triggers gap-split
 LONG_LINE_MIN_DUR: float = 3.0  # segment must also be this long (s)
 LONG_LINE_GAP_THRESH: float = 0.7  # internal word-to-word silence (s) → split
-STRETCH_GAP_THRESH: float = 1.5   # gap to next segment (s) that triggers end-trim
+# Deprecated compatibility constant. Positive gaps no longer trigger any
+# extension/trim; word timestamps determine phrase ends.
+STRETCH_GAP_THRESH: float = 1.5
 STRETCH_MARGIN: float = 0.08      # leave this gap before next segment after trim
 
 
@@ -153,6 +155,30 @@ def _split_at_word_gaps(seg: dict, words: list[dict]) -> list[dict]:
     if len(words) < 4:
         return [seg]
 
+    # Reconciled segments historically re-attached words by ordinal position.
+    # When a catalogue line was absent from the audio, those words could belong
+    # to a *different* line and even sit outside this segment's bounds. Splitting
+    # that invalid mapping produced reversed intervals (start > end), then the
+    # global sort interleaved fragments from adjacent lines. Never transform a
+    # segment unless its acoustic evidence is internally monotonic and contained.
+    try:
+        seg_start_bound = float(seg["start"])
+        seg_end_bound = float(seg["end"])
+        previous_start = seg_start_bound
+        for word in words:
+            word_start = float(word["start"])
+            word_end = float(word["end"])
+            if (
+                word_end < word_start
+                or word_start < previous_start
+                or word_start < seg_start_bound - 0.25
+                or word_end > seg_end_bound + 0.25
+            ):
+                return [seg]
+            previous_start = word_start
+    except (KeyError, TypeError, ValueError):
+        return [seg]
+
     canonical_words = (seg.get("text") or "").split()
     n_can = len(canonical_words)
     n_wx = len(words)
@@ -208,12 +234,31 @@ def _split_at_word_gaps(seg: dict, words: list[dict]) -> list[dict]:
             "words": list(last_wx),
         })
 
-    return out_segs if len(out_segs) > 1 else [seg]
+    if len(out_segs) <= 1:
+        return [seg]
+    try:
+        if any(
+            float(part["end"]) <= float(part["start"])
+            for part in out_segs
+        ):
+            return [seg]
+        if any(
+            float(out_segs[i]["start"]) < float(out_segs[i - 1]["end"])
+            for i in range(1, len(out_segs))
+        ):
+            return [seg]
+    except (KeyError, TypeError, ValueError):
+        return [seg]
+    return out_segs
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
-def post_reconcile_cleanup(segments: list[dict]) -> list[dict]:
+def post_reconcile_cleanup(
+    segments: list[dict],
+    *,
+    split_long_lines: bool = True,
+) -> list[dict]:
     """Post-process reconciled segments to reduce manual correction work.
 
     Two passes (each segment processed once — no recursion):
@@ -223,7 +268,8 @@ def post_reconcile_cleanup(segments: list[dict]) -> list[dict]:
        Addresses the "26-second Uh, uh, uh... mega-block" pattern where lrclib
        stores a whole ad-lib section as one line.
 
-    2. **Long-line gap splitter**: any segment with >= LONG_LINE_MIN_WORDS
+    2. **Long-line gap splitter** (when ``split_long_lines`` is true): any
+       segment with >= LONG_LINE_MIN_WORDS
        canonical words AND duration >= LONG_LINE_MIN_DUR gets split at ALL
        internal word gaps >= LONG_LINE_GAP_THRESH. Addresses the "Iluminados
        por el fuego / que dejaste arder" merging pattern where lrclib collapses
@@ -254,7 +300,11 @@ def post_reconcile_cleanup(segments: list[dict]) -> list[dict]:
             continue
 
         # Pass 2: long-line gap splitter
-        if len(words) >= LONG_LINE_MIN_WORDS and dur >= LONG_LINE_MIN_DUR:
+        if (
+            split_long_lines
+            and len(words) >= LONG_LINE_MIN_WORDS
+            and dur >= LONG_LINE_MIN_DUR
+        ):
             parts = _split_at_word_gaps(seg, words)
             if len(parts) > 1:
                 logger.info(
@@ -266,22 +316,58 @@ def post_reconcile_cleanup(segments: list[dict]) -> list[dict]:
 
         out.append(seg)
 
-    # Pass 3: end-time stretch trimmer.
-    # Whisper often extends seg.end to the next voice onset (3–6 s past actual
-    # end of phrase). When the gap to the next segment exceeds STRETCH_GAP_THRESH
-    # we trim seg.end to next_start - STRETCH_MARGIN.
+    # Pass 3: tighten display ends to the last acoustically timestamped word.
+    #
+    # The previous implementation detected a positive silence gap and then set
+    # ``end = next_start - margin``. That does the opposite of trimming: a line
+    # ending at 84 s followed by the next vocal at 127 s was extended across the
+    # instrumental break. "La Foto de tu cuerpo" exposed outputs lasting up to
+    # 37 s on the raw path because of this.
+    #
+    # Word timestamps are the only positive evidence of where the phrase ends.
+    # Tighten to the last word when Whisper's segment boundary trails it. With
+    # no words, preserve the original end; never invent a hold through silence.
+    # Independently clamp true overlaps so one line cannot run into the next.
     out2: list[dict] = []
     for i, seg in enumerate(out):
-        if i + 1 < len(out):
-            next_start = float(out[i + 1].get("start", seg.get("end", 0)))
-            gap = next_start - float(seg.get("end", 0))
-            if gap > STRETCH_GAP_THRESH:
-                trimmed_end = round(next_start - STRETCH_MARGIN, 3)
-                if trimmed_end > float(seg.get("start", 0)):
+        seg = dict(seg)
+        try:
+            seg_start = float(seg.get("start", 0))
+            seg_end = float(seg.get("end", seg_start))
+            words = seg.get("words") or []
+            valid_word_ends = []
+            for word in words:
+                try:
+                    word_end = float(word.get("end"))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if seg_start <= word_end <= seg_end:
+                    valid_word_ends.append(word_end)
+            if valid_word_ends:
+                last_word_end = max(valid_word_ends)
+                if last_word_end < seg_end:
                     logger.info(
-                        "[POST_RECONCILE] stretch trim: %.3f→%.3f (gap %.1fs) %r…",
-                        seg["end"], trimmed_end, gap, (seg.get("text") or "")[:30],
+                        "[POST_RECONCILE] word-end tighten: %.3f→%.3f %r…",
+                        seg_end, last_word_end, (seg.get("text") or "")[:30],
                     )
-                    seg = {**seg, "end": trimmed_end}
+                    seg["end"] = last_word_end
+                    seg_end = last_word_end
+        except (TypeError, ValueError):
+            pass
+        if i + 1 < len(out):
+            try:
+                next_start = float(out[i + 1].get("start", seg.get("end", 0)))
+                current_end = float(seg.get("end", 0))
+                if current_end >= next_start:
+                    trimmed_end = round(next_start - STRETCH_MARGIN, 3)
+                    if trimmed_end > float(seg.get("start", 0)):
+                        logger.info(
+                            "[POST_RECONCILE] overlap trim: %.3f→%.3f %r…",
+                            current_end, trimmed_end,
+                            (seg.get("text") or "")[:30],
+                        )
+                        seg["end"] = trimmed_end
+            except (TypeError, ValueError):
+                pass
         out2.append(seg)
     return out2

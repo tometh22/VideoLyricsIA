@@ -132,3 +132,101 @@ def test_staging_strict_gate_can_be_disabled_only_explicitly(monkeypatch):
     strict, expected = _fleet_readiness_config("staging")
     assert strict is False
     assert expected == {"worker": 7, "short_worker": 3}
+
+
+def test_frontend_only_deploy_no_marca_la_flota_como_incoherente():
+    """El SHA de git no sirve para comparar API vs workers.
+
+    Los servicios de worker tienen filtros de path en Railway: un commit que
+    sólo toca el frontend NO los redeploya — correctamente, no hay nada nuevo
+    que correr ahí. Pero el SHA de la API sí avanza. Con la comparación por SHA,
+    /health quedaba en `down` después de CADA merge de sólo-frontend, con la
+    base arriba, Redis arriba, los workers vivos y las colas vacías.
+
+    Observado en staging el 25-jul-2026: api en 1e72313e (PR frontend-only),
+    workers en fc44880e (el último commit que tocó backend), deploy del Worker
+    marcado SKIPPED por Railway. Todo sano, health "down".
+
+    Una alarma que grita en falso de rutina enseña a ignorarla — y el día que un
+    worker quede atrás de verdad, nadie mira.
+    """
+    from observability import worker_fleet_coherence
+
+    workers = [
+        {"release": "sha-backend", "code_fingerprint": "abc123",
+         "rq_payload_version": 2, "queues": ["enterprise", "default"]},
+        {"release": "sha-backend", "code_fingerprint": "abc123",
+         "rq_payload_version": 2, "queues": ["transcription", "bg_preview"]},
+    ]
+    # API un commit más adelante, pero MISMO código de backend.
+    out = worker_fleet_coherence(
+        workers, "sha-frontend-only", 2, api_code_fingerprint="abc123",
+    )
+    assert out["release_match"] is True
+    assert out["coherent"] is True
+
+
+def test_pero_un_worker_con_backend_VIEJO_sigue_marcandose():
+    """No se pierde la señal real: si el código de backend difiere, se avisa."""
+    from observability import worker_fleet_coherence
+
+    workers = [
+        {"release": "sha-old", "code_fingerprint": "viejo999",
+         "rq_payload_version": 2, "queues": ["enterprise", "default"]},
+        {"release": "sha-old", "code_fingerprint": "viejo999",
+         "rq_payload_version": 2, "queues": ["transcription", "bg_preview"]},
+    ]
+    out = worker_fleet_coherence(
+        workers, "sha-new", 2, api_code_fingerprint="nuevo111",
+    )
+    assert out["release_match"] is False
+    assert out["coherent"] is False
+
+
+def test_worker_sin_huella_cae_al_SHA_sin_ventana_ciega():
+    """Durante el rollout los workers viejos todavía no publican la huella.
+
+    Si en ese caso el gate diera coherente por defecto, habría una ventana en la
+    que un worker realmente desactualizado pasaría desapercibido. Cae al
+    comportamiento de siempre: comparar el SHA.
+    """
+    from observability import worker_fleet_coherence
+
+    sin_huella = [
+        {"release": "sha-old", "rq_payload_version": 2,
+         "queues": ["enterprise", "default"]},
+        {"release": "sha-old", "rq_payload_version": 2,
+         "queues": ["transcription", "bg_preview"]},
+    ]
+    assert worker_fleet_coherence(
+        sin_huella, "sha-new", 2, api_code_fingerprint="nuevo111",
+    )["release_match"] is False
+    assert worker_fleet_coherence(
+        sin_huella, "sha-old", 2, api_code_fingerprint="nuevo111",
+    )["release_match"] is True
+
+
+def test_el_protocolo_sigue_siendo_bloqueante_aunque_la_huella_coincida():
+    """La huella no puede tapar una incompatibilidad de payload de la cola."""
+    from observability import worker_fleet_coherence
+
+    workers = [
+        {"release": "sha", "code_fingerprint": "abc123",
+         "rq_payload_version": 1, "queues": ["enterprise", "default"]},
+        {"release": "sha", "code_fingerprint": "abc123",
+         "rq_payload_version": 1, "queues": ["transcription", "bg_preview"]},
+    ]
+    out = worker_fleet_coherence(workers, "sha", 2, api_code_fingerprint="abc123")
+    assert out["protocol_match"] is False
+    assert out["coherent"] is False
+
+
+def test_la_huella_es_estable_y_no_incluye_los_tests():
+    """Si la huella cambiara entre llamadas, el gate sería un generador de
+    ruido. Y si incluyera tests/, tocar un test marcaría la flota incoherente."""
+    from observability import backend_code_fingerprint
+
+    a = backend_code_fingerprint()
+    b = backend_code_fingerprint()
+    assert a == b
+    assert a and len(a) == 16

@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect, lazy, Suspense } from "react";
+import { useState, useRef, useCallback, useEffect, lazy, Suspense, useMemo } from "react";
 import {
   Routes, Route, Navigate, Outlet,
   useNavigate, useLocation, useParams,
@@ -44,6 +44,7 @@ import TranscribingProgress from "./components/TranscribingProgress";
 import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
 import GiftCreditsBanner from "./components/GiftCreditsBanner";
 import { useAlert } from "./components/AlertProvider";
+import { ACTIVE_STATUSES, isTerminalStatus } from "./lib/jobStatus";
 import {
   shouldEnableBackgroundPreview,
   useBackgroundPreview,
@@ -53,7 +54,9 @@ import { translateBackendError } from "./lib/lyricsEditSubmit";
 import { segmentsStore, useJobSegmentsValue } from "./state/segmentsStore";
 import { persistSegments } from "./lib/persistSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
-import { computeFieldDiff, buildEditPayloads, backgroundRegenExtras } from "./lib/editWizardDiff";
+import { backgroundRegenExtras } from "./lib/editWizardDiff";
+import { buildEditReview, buildEditCurrent, resolveEditSubmission, backgroundEditBlockedReason } from "./lib/editSubmission";
+import { normalizeMovementCode } from "./lib/catalogCodes";
 import { buildVariantPayload } from "./lib/variantPayload";
 import { prefetchKey } from "./lib/prefetchKey";
 import { anchorLyricsForEntry } from "./lib/anchorPayload";
@@ -812,7 +815,20 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
 // dentro del Studio Console en vez de un modal separado con UX distinta.
 // Pasos 1, 2, 3, 5 quedan lockeados desde App (vía currentReview.
 // editingJobId) y el preview central muestra el MP4 ya renderizado.
-function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) {
+function EditLyricsRoute({
+  setCurrentReview,
+  setWizardStage,
+  // bgSelectMode/backgroundId son state de la RAÍZ de App: sobreviven a las
+  // navegaciones dentro de la SPA y se restauran del snapshot. Sin resetearlos
+  // al entrar a editar, un `backgroundId` viejo de un batch anterior con el tab
+  // en "Biblioteca" convierte la edición en un swap de asset —
+  // editWizardDiff hace `delete out.background` — y BORRA todos los cambios de
+  // fondo IA que el operador acaba de hacer. VariantWizardRoute ya lo reseteaba.
+  setBgSelectMode,
+  setBackgroundId,
+  wizardScreen,
+  t,
+}) {
   const { id } = useParams();
   const navigate = useNavigate();
   // status: "loading" | "ready" | "no_segments" | "not_editable" |
@@ -903,7 +919,6 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         return;
       }
 
-      const params = job.render_params || {};
       // Reuso del snapshot: si el operador refrescó con edits in-flight,
       // los segments del snapshot ganan sobre job.segments_json (que es
       // lo último que el autosave guardó pero podría no incluir el
@@ -915,80 +930,26 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
       // pre-llenamos TODOS los campos editables del wizard desde la row del
       // Job para que el operador pueda corregir cualquier cosa post-render
       // (no solo lyrics). La baseline congela el snapshot a la entrada del
-      // edit; el submit calcula el diff contra la baseline y emite N POSTs
-      // /edit (uno por edit_type: metadata / typography / lyrics / background).
+      // edit; el submit calcula el diff contra la baseline y emite UN POST
+      // /edit consolidado (resolveEditSubmission elige el edit_type).
       //
       // Resilience: si el snap tiene fields editados in-flight (el operador
       // refrescó mid-edit), esos ganan. Si no, los valores actuales del job.
+      // Siembra de campos + baseline: lib/editSubmission.buildEditReview.
+      // Estaba inline acá, así que el test del invariante tenía que copiar la
+      // construcción a mano — y una copia a mano es cómo se colaron los 5
+      // `title_*` que faltaban en `current` (bucket typography emitido en el
+      // 100% de las ediciones → guarda "No cambiaste nada" muerta y cambios de
+      // fondo degradados a edición de letra en silencio).
       const snapR = reusableSnap ? snap.currentReview : null;
-      const pickSnapOr = (snapKey, fallback) =>
-        (snapR && snapR[snapKey] != null && snapR[snapKey] !== "")
-          ? snapR[snapKey]
-          : fallback;
+      const { initialFields, baseline } = buildEditReview(job, snapR);
 
-      const initialFields = {
-        artist: pickSnapOr("artist", job.artist || ""),
-        songTitle: pickSnapOr("songTitle", job.song_title || ""),
-        font: pickSnapOr("font", params.font || ""),
-        textCase: pickSnapOr("textCase", params.text_case || "upper"),
-        textContrast: pickSnapOr("textContrast", params.text_contrast || "medium"),
-        fontScale: String(pickSnapOr("fontScale", params.font_scale || "1.0")),
-        lyricsAnimation: pickSnapOr("lyricsAnimation", params.lyrics_animation || "none"),
-        lineTransition: pickSnapOr("lineTransition", params.line_transition || "none"),
-        lyricColor: pickSnapOr("lyricColor", params.lyric_color || "#FFFFFF"),
-        lyricSungColor: pickSnapOr("lyricSungColor", params.lyric_sung_color || "#FFFFFF"),
-        movementStyle: pickSnapOr("movementStyle", params.movement_style || ""),
-        // Ejes de escena editables en edición. matchLyrics: default true cuando
-        // el render_params no lo trae (paridad con el backend match_lyrics=True).
-        genre: pickSnapOr("genre", params.genre || ""),
-        concept: pickSnapOr("concept", params.concept || ""),
-        matchLyrics: snapR?.matchLyrics != null ? !!snapR.matchLyrics : (params.match_lyrics !== false),
-        effect: pickSnapOr("effect", params.effect || ""),
-        backgroundHint: pickSnapOr("backgroundHint", params.background_hint || ""),
-        bgVerbatim: snapR?.bgVerbatim != null ? !!snapR.bgVerbatim : !!params.bg_verbatim,
-        backgroundMode: pickSnapOr("backgroundMode", params.background_mode || ""),
-        // Title card customization (Full Rotor v1).
-        titleTemplate: pickSnapOr("titleTemplate", params.title_template || "auto"),
-        titleSize: String(pickSnapOr("titleSize", params.title_size || "1.0")),
-        titleArtistFont: pickSnapOr("titleArtistFont", params.title_artist_font || ""),
-        titleSongFont: pickSnapOr("titleSongFont", params.title_song_font || ""),
-        // UI v1.1 (2026-05-30): manual song-title line break — "" = auto.
-        titleSongBreak: pickSnapOr("titleSongBreak", params.title_song_break || ""),
-      };
-
-      // Baseline: snapshot inmutable de cómo está RENDERIZADO el video
-      // ahora — el diff del submit compara contra esto, NO contra el snap
-      // del autosave. Si el operador edita y vuelve atrás un campo al valor
-      // original, el diff lo descarta (no manda al backend, no cuesta un
-      // re-render por nada).
-      const baseline = {
-        artist: job.artist || "",
-        songTitle: job.song_title || "",
-        font: params.font || "",
-        textCase: params.text_case || "upper",
-        textContrast: params.text_contrast || "medium",
-        fontScale: String(params.font_scale || "1.0"),
-        lyricsAnimation: params.lyrics_animation || "none",
-        lineTransition: params.line_transition || "none",
-        lyricColor: params.lyric_color || "#FFFFFF",
-        lyricSungColor: params.lyric_sung_color || "#FFFFFF",
-        movementStyle: params.movement_style || "",
-        genre: params.genre || "",
-        concept: params.concept || "",
-        matchLyrics: params.match_lyrics !== false,
-        effect: params.effect || "",
-        backgroundHint: params.background_hint || "",
-        bgVerbatim: !!params.bg_verbatim,
-        backgroundMode: params.background_mode || "",
-        // Title card customization (Full Rotor v1) — baseline for the diff.
-        titleTemplate: params.title_template || "auto",
-        titleSize: String(params.title_size || "1.0"),
-        titleArtistFont: params.title_artist_font || "",
-        titleSongFont: params.title_song_font || "",
-        // UI v1.1: baseline for the manual break.
-        titleSongBreak: params.title_song_break || "",
-        segments: JSON.parse(JSON.stringify(job.segments_json || [])),
-      };
+      // Reset del pick de fondo residual: sin esto un `backgroundId` viejo con
+      // el tab en "Biblioteca" (state de la raíz de App, sobrevive a la
+      // navegación) convierte esta edición en un swap de asset y borra los
+      // cambios de fondo IA. Mismo reset que VariantWizardRoute ya hacía.
+      setBgSelectMode?.("auto");
+      setBackgroundId?.(null);
 
       // Mount the editor NOW with audio/waveform/bg as null. The LyricsEditor
       // handles these as optional — timeline renders without waveform fill,
@@ -1006,6 +967,12 @@ function EditLyricsRoute({ setCurrentReview, setWizardStage, wizardScreen, t }) 
         // main.py:7444). The wizard surface reads this to keep the
         // dialog honest about what will actually re-render.
         jobStatus: job.status,
+        // Cupo real de ediciones. El wizard prometía "usa 1 de tus 3 ediciones"
+        // hardcodeado, así que en un job con 7 ediciones esa frase es falsa.
+        // Mismo cálculo que EditRequestPanel, que ya lo mostraba una pantalla
+        // antes.
+        editsRemaining: job.edits_remaining ?? Math.max(0, 3 - (job.edit_count ?? 0)),
+        editLimitExempt: !!job.edit_limit_exempt,
         // Read-only context — solo display, no editable post-render.
         deliveryProfile: job.delivery_profile || "youtube",
         style: job.style || "",
@@ -1309,13 +1276,20 @@ function VariantWizardRoute({
         frameFormat: params.frame_format || "full",
         lyricsAnimation: params.lyrics_animation || "none",
         lineTransition: params.line_transition || "none",
-        movementStyle: params.movement_style || "",
+        // Normalizado igual que en edición: el backend persiste el valor CRUDO
+        // y un padre con "dinamico" (lo emiten SceneEditModal y el derivado por
+        // energía) no matchea ninguna tarjeta → la galería quedaba sin nada
+        // resaltado. Y acá pesa más que en edición, porque el submit de la
+        // variante manda el estado ABSOLUTO: lo que se muestra es lo que viaja.
+        movementStyle: normalizeMovementCode(params.movement_style || ""),
         genre: params.genre || "",
         concept: params.concept || "",
         matchLyrics: params.match_lyrics !== false,
         effect: params.effect || "",
         backgroundHint: params.background_hint || "",
         bgVerbatim: !!params.bg_verbatim,
+        lyricColor: params.lyric_color || "#FFFFFF",
+        lyricSungColor: params.lyric_sung_color || "#FFFFFF",
         titleTemplate: params.title_template || "auto",
         titleSize: String(params.title_size || "1.0"),
         titleArtistFont: params.title_artist_font || "",
@@ -1340,6 +1314,13 @@ function VariantWizardRoute({
         // Sin editingJobId: nada de este flujo escribe al job padre.
         // handleApproveLyrics ramifica por variantMode ANTES del bloque
         // de edición, que se gatilla con editMode || editingJobId.
+        //
+        // baseline = los ajustes DEL PADRE. La variante no lo usa para un diff
+        // (su submit manda el estado ABSOLUTO), pero alimenta el chip
+        // "EN EL VIDEO" de las galerías. Sin esto el chip no aparecía en toda
+        // la mitad variante del flujo — y ahí importa MÁS, precisamente porque
+        // un control sin tocar manda lo que muestra.
+        baseline: { ...initialFields },
         jobStatus: job.status,
         deliveryProfile: job.delivery_profile || "youtube",
         style: job.style || "",
@@ -2289,10 +2270,9 @@ export default function App() {
   // batches, and never polls the same job concurrently.
   useEffect(() => {
     if (!token) return undefined;
-    const ACTIVE = new Set([
-      "processing", "queued", "editing", "transcribing",
-      "transcribing_queued", "background_generating", "rendering",
-    ]);
+    // Canonical active set (src/lib/jobStatus.js) — kept in one place so the
+    // poller and the backend can't drift.
+    const ACTIVE = new Set(ACTIVE_STATUSES);
     let stopped = false;
     const tick = async () => {
       if (stopped || document.hidden || !getToken()) return;
@@ -2337,7 +2317,10 @@ export default function App() {
   const pollJob = useCallback((jobId) => {
     // Use SSE when available; fall back to 3 s polling for proxies that buffer
     // text/event-stream (some corporate HTTPS interceptors).
-    const TERMINAL = new Set(["done", "pending_review", "error", "validation_failed"]);
+    // Terminal set is the canonical one (src/lib/jobStatus.js), mirroring the
+    // backend SSE close set. It MUST include bg_preview_done / bg_preview_failed
+    // — otherwise the backend closes the stream but the poll never resolves and
+    // the /generate worker await hangs forever (audit 2026-07-27).
 
     return new Promise((resolve) => {
       const token = getToken();
@@ -2366,7 +2349,7 @@ export default function App() {
                   completed_at: data.completed_at ?? j.completed_at }
               : j
           ));
-          if (TERMINAL.has(data.status)) {
+          if (isTerminalStatus(data.status)) {
             cleanupSse();
             fetchHistory();
             resolve(data.status);
@@ -2437,7 +2420,7 @@ export default function App() {
                     completed_at: data.completed_at ?? j.completed_at }
                 : j
             ));
-            if (TERMINAL.has(data.status)) {
+            if (isTerminalStatus(data.status)) {
               clearInterval(iv);
               pollingIntervals.current.delete(iv);
               if (isMountedRef.current) fetchHistory();
@@ -3250,47 +3233,25 @@ export default function App() {
         // Snapshot del estado actual del wizard. editedSegments viene del
         // LyricsEditor con el último drag aplicado — gana sobre r.segments
         // por si el autosave todavía no lo persistió.
-        const current = {
-          artist: r.artist,
-          songTitle: r.songTitle,
-          font: r.font,
-          fontScale: r.fontScale,
-          textCase: r.textCase,
-          textContrast: r.textContrast,
-          lyricsAnimation: r.lyricsAnimation,
-          lineTransition: r.lineTransition,
-          effect: r.effect,
-          backgroundHint: r.backgroundHint,
-          bgVerbatim: r.bgVerbatim,
-          backgroundMode: r.backgroundMode,
-          movementStyle: r.movementStyle,
-          // Ejes de escena editables en edición (cableados 2026-07-24). Llegan a
-          // r.* vía onEditFieldChange (genre/concept por updateBatchDefault;
-          // matchLyrics por selectSceneMode). baseline los siembra del mismo
-          // render_params → un valor sin tocar no difea.
-          genre: r.genre,
-          concept: r.concept,
-          matchLyrics: r.matchLyrics,
-          segments: editedSegments,
-          // Pick de biblioteca en edit mode (PR #940 backend): la grilla
-          // del paso de fondo YA escribía backgroundId en App, pero el
-          // submit lo ignoraba — el operador "elegía" un fondo que nunca
-          // viajaba. Solo cuenta con el tab Library activo; volver a
-          // "IA Auto" lo anula (null → sin bucket → mantener fondo).
-          editBackgroundId:
-            (bgSelectMode === "library" && backgroundId) ? backgroundId : null,
-          // "Regenerar fondo (nueva versión)": acción explícita del wizard en
-          // edición para forzar un re-render del fondo con el MISMO hint (nueva
-          // tirada de Veo/Imagen) aunque no se haya cambiado ningún campo — sin
-          // esto el operador que solo quería "otra versión del fondo" recibía
-          // "No cambiaste nada". Es una intención, no un campo del baseline.
-          forceBackgroundRegen: !!r.forceBackgroundRegen,
-        };
+        // El snapshot del wizard y la resolución del edit_type viven en
+        // lib/editSubmission.js como funciones PURAS. Antes estaban inline acá,
+        // así que ningún test podía verlas: el mirror hand-copiado
+        // (EditWizardSubmit.test.jsx) testeaba N POSTs mientras esto hacía uno
+        // consolidado, y pasaba en verde. Ahora la UI puede leer la MISMA
+        // función para mostrar qué se va a aplicar y qué se descarta.
+        const current = buildEditCurrent(r, {
+          editedSegments,
+          bgSelectMode,
+          backgroundId,
+        });
+        const submission = resolveEditSubmission({
+          baseline: r.baseline,
+          current,
+          jobStatus: r.jobStatus,
+          scenePlan: r.scenePlan,
+        });
 
-        const diff = computeFieldDiff(r.baseline, current);
-        const presentBuckets = Object.keys(diff);
-
-        if (presentBuckets.length === 0) {
+        if (submission.presentBuckets.length === 0) {
           alert({
             title: t("edit.no_changes_title") || "No cambiaste nada",
             description: t("edit.no_changes_subtitle") ||
@@ -3300,73 +3261,59 @@ export default function App() {
           return;
         }
 
-        // Pick edit_type by priority — el más complejo de los presentes.
-        // background_library (swap curado, $0, sin slot) supersede al
-        // regen IA; background regen Veo (paid), lyrics re-renderiza con
-        // nuevos segments, metadata sólo title card, typography el último.
-        const PRIORITY = ["background_library", "background", "lyrics", "metadata", "typography"];
-        let chosenType = PRIORITY.find((k) => diff[k]);
-
-        // Backend gates: typography y background/background_library solo
-        // aceptan jobs en pending_review (main.py). Para done/rejected:
-        //   - bg standalone: backend rechaza. Surface error claro.
-        //   - typography standalone: piggyback en una lyrics edit usando
-        //     los segments actuales (font/case/etc son ungated, se
-        //     aplican en cualquier edit_type).
-        const isPendingReview = r.jobStatus === "pending_review";
-        if (!isPendingReview) {
-          const _bgType = chosenType === "background" || chosenType === "background_library";
-          if (_bgType && presentBuckets.length === 1) {
-            alert({
-              title: t("edit.bg_locked_done_title") || "No se puede regenerar el fondo",
-              description: t("edit.bg_locked_done_desc") ||
-                "El fondo de un video ya aprobado no se puede regenerar — para cambiarlo, generá un video nuevo.",
-              tone: "warning",
-            });
-            return;
-          }
-          if (_bgType) {
-            // bg + otra cosa: bajar a la siguiente prioridad permitida.
-            chosenType = PRIORITY.find(
-              (k) => diff[k] && k !== "background" && k !== "background_library",
-            );
-          }
-          if (chosenType === "typography") {
-            // Convertir a lyrics edit. Necesita segments — usar el snapshot
-            // actual (editedSegments) aunque no haya cambiado, para que el
-            // backend acepte el payload.
-            chosenType = "lyrics";
-            const normalized = (editedSegments || []).map((s) => ({
-              start: Number(s.start) || 0,
-              end: Number(s.end) || 0,
-              text: String(s.text || ""),
-              ...(s.locked ? { locked: true } : {}),
-              ...(s.pos && typeof s.pos.x === "number" ? { pos: { x: s.pos.x, y: s.pos.y } } : {}),
-              ...(typeof s.scale === "number" && s.scale !== 1 ? { scale: s.scale } : {}),
-              ...(typeof s.rot === "number" && s.rot !== 0 ? { rot: s.rot } : {}),
-            }));
-            diff.lyrics = diff.lyrics || { segments: normalized };
-          }
+        if (submission.blocked) {
+          // El motivo importa: en un job multi-escena el fondo es un TIMELINE y
+          // la salida es regenerar la escena desde el filmstrip (que además no
+          // consume cupo de edición). Mostrar ahí "el video ya está aprobado —
+          // generá uno nuevo" son dos mentiras en una frase, y manda al
+          // operador a gastar un video entero al pedo.
+          const _isScenes = submission.blocked.reason === "scenes";
+          alert({
+            title: _isScenes
+              ? (t("edit.bg_locked_scenes_title") || "Este video usa Escenas")
+              : (t("edit.bg_locked_done_title") || "No se puede regenerar el fondo"),
+            description: _isScenes
+              ? (t("edit.bg_locked_scenes_desc") ||
+                 "El fondo es un timeline multi-escena. Regenerá la escena que quieras cambiar desde el filmstrip del video — no consume cupo de edición.")
+              : (t("edit.bg_locked_done_desc") ||
+                 "El fondo de un video ya aprobado no se puede regenerar — para cambiarlo, generá un video nuevo."),
+            tone: "warning",
+          });
+          return;
         }
 
-        // Construir UN único payload con todos los campos cambiados.
-        // Backend aplica los ungated en cualquier edit_type; los gated
-        // (background_*, segments para lyrics) sólo se aplican si el
-        // edit_type matchea.
-        track("edit.submitted", { job_id: editedJobId, fields: presentBuckets });
-        const payload = { edit_type: chosenType };
-        if (diff.metadata) Object.assign(payload, diff.metadata);
-        if (diff.typography) Object.assign(payload, diff.typography);
-        if (diff.lyrics) Object.assign(payload, diff.lyrics);
-        if (diff.background) Object.assign(payload, diff.background);
-        if (diff.background_library) Object.assign(payload, diff.background_library);
+        // Telemetría honesta: `applied` son los buckets que el backend VA a
+        // aplicar y `dropped` los que la degradación por status descarta. Antes
+        // se reportaba `presentBuckets` entero DESPUÉS de degradar, así que un
+        // cambio de fondo descartado igual figuraba como enviado.
+        // `payload` es nullable por contrato: resolveEditSubmission devuelve
+        // null si, tras descartar buckets por status/escenas, no queda ningún
+        // edit_type válido. Hoy ese camino es inalcanzable (todo bucket que el
+        // diff emite está en EDIT_TYPE_PRIORITY), pero sin guard sería un
+        // TypeError con el botón muerto y sin aviso. El refactor introdujo el
+        // contrato nullable; se respeta acá en vez de asumir.
+        if (!submission.payload) {
+          alert({
+            title: t("edit.no_changes_title") || "No cambiaste nada",
+            description: t("edit.no_changes_subtitle") ||
+              "No detectamos diferencias contra el video actual. Modificá algún campo y volvé a intentar.",
+            tone: "warning",
+          });
+          return;
+        }
+        track("edit.submitted", {
+          job_id: editedJobId,
+          fields: Object.keys(submission.willApply),
+          dropped: submission.willDrop,
+        });
+        const payload = submission.payload;
         // Regen de fondo IA (Veo/Imagen + validación): paridad con la tarjeta
         // "Regenerar fondo" que se plegó al wizard (unificación #973). Motor y
         // política de validación son MODIFICADORES de un regen, no campos del
         // baseline — llegan por onEditFieldChange (como forceBackgroundRegen).
         // Sólo aplican si el edit es un regen IA (edit_type="background"; el
         // swap de biblioteca no dispara Veo). Ver backgroundRegenExtras.
-        if (chosenType === "background") {
+        if (submission.editType === "background") {
           Object.assign(payload, backgroundRegenExtras(r));
         }
         if (Array.isArray(payload.segments)) {
@@ -3399,6 +3346,20 @@ export default function App() {
         }
 
         if (!res.ok) {
+          // Un reenvío tardío del mismo CTA puede llegar después de que el
+          // primer POST ya puso el job en `editing` (p. ej. una pestaña vieja
+          // o un cliente previo al single-flight del LyricsEditor). No es una
+          // falla del edit aceptado: cerrar el wizard y llevar al progreso sin
+          // superponer un modal rojo que diga lo contrario.
+          if (res.status === 409 && data?.detail?.code === "edit_in_progress") {
+            track("edit.duplicate_redirected", { job_id: editedJobId });
+            setCurrentReview(null);
+            wizardPersistence.clear();
+            segmentsStore.evict(reviewStoreKey(r));
+            segmentsStore.evict(r.transcribeJobId);
+            navigate(`/videos/${editedJobId}`, { replace: true });
+            return;
+          }
           const friendly = translateBackendError(data?.detail, t) || `Error ${res.status}`;
           alert({
             title: t("edit.error_title") || "No pudimos aplicar el edit",
@@ -3666,20 +3627,25 @@ export default function App() {
             setJobs((prev) => prev.map((j, idx) =>
               idx === i ? { ...j, status: "error", error: reason } : j
             ));
+            // Surface it — a silent status="error" left the single-song hero
+            // frozen on "Construyendo tu video" with no feedback (audit 2026-07-27).
+            alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
             continue;
           }
           if (!res.ok || data.detail) {
-            // 404 here means the transcribed job was reaped before we got
-            // to /generate. Surface a clear message instead of the raw
-            // "Job not found." so the operator knows it's a session-expired
-            // issue, not a corrupt video.
-            const reason = (res.status === 404)
+            // A 404 / `job_not_found` here means the transcribed job was reaped
+            // (or wasn't the caller's) before we got to /generate. Prefer the
+            // stable backend `code` over the raw HTTP status; keep 404 as a
+            // fallback for older backends. Surface a clear session-expired
+            // message instead of the raw "Job not found.".
+            const reason = (data.code === "job_not_found" || res.status === 404)
               ? (t("generate.session_expired")
                  || "La sesión expiró antes de generar. Re-subí el audio para regenerar.")
               : (data.detail || await describeFetchError(null, res, t));
             setJobs((prev) => prev.map((j, idx) =>
               idx === i ? { ...j, status: "error", error: reason } : j
             ));
+            alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
             continue;
           }
           setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
@@ -3689,6 +3655,7 @@ export default function App() {
           setJobs((prev) => prev.map((j, idx) =>
             idx === i ? { ...j, status: "error", error: reason } : j
           ));
+          alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
         }
       }
     };
@@ -4322,6 +4289,38 @@ export default function App() {
   // entre ambos vive detrás del prop `variantMode` de UploadZone.
   const _wizardOnExistingJob = !!currentReview?.editMode || !!currentReview?.variantMode;
 
+  // Plan EN VIVO de la edición: qué se va a aplicar y qué se va a descartar.
+  //
+  // Se calcula con la MISMA función que arma el POST (resolveEditSubmission),
+  // no con el diff pelado. Es la diferencia que importa: el diff NO decide el
+  // output — la degradación por status/escenas sí. Un resumen construido sobre
+  // `computeFieldDiff` diría "Movimiento: Animado → Estático" en un video que
+  // está por descartar ese cambio, o sea el bug original una capa más arriba.
+  //
+  // Sólo en edición: la variante manda el estado absoluto, ahí no hay nada que
+  // "no se aplique".
+  const editPlan = useMemo(() => {
+    const r = currentReview;
+    if (!r?.editMode || !r.baseline) return null;
+    try {
+      return resolveEditSubmission({
+        baseline: r.baseline,
+        current: buildEditCurrent(r, {
+          // Los segments en vuelo del editor; si todavía no montó, los del job.
+          editedSegments: liveReviewSegments || r.segments || [],
+          bgSelectMode,
+          backgroundId,
+        }),
+        jobStatus: r.jobStatus,
+        scenePlan: r.scenePlan,
+      });
+    } catch {
+      // El resumen es informativo: si algo falla, el wizard sigue usable y el
+      // submit real vuelve a calcularlo. Nunca romper la pantalla por un chip.
+      return null;
+    }
+  }, [currentReview, liveReviewSegments, bgSelectMode, backgroundId]);
+
   // Resume banner shown on /new and /review when sessionStorage has a
   // pending batch from a prior visit. Lets the operator restore their
   // approved-jobs + current-review (segments included) or drop the
@@ -4634,17 +4633,24 @@ export default function App() {
         onEditFieldChange={(field, value) =>
           setCurrentReview((r) => (r ? { ...r, [field]: value } : r))
         }
-        // Semilla de los controles de escena en edición (género/concepto/prompt
-        // + modo) con los valores persistidos del job. Keyed en el job id dentro
-        // de UploadZone → corre una vez por job, no pisa ediciones en curso.
+        // Semilla de los controles del wizard con los valores persistidos del
+        // job. Keyed en el job id dentro de UploadZone → corre una vez por job,
+        // no pisa ediciones en curso.
         //
-        // En VARIANTE la semilla es más ancha: el submit manda el estado
-        // ABSOLUTO de todos los ejes, así que cualquier control que
-        // muestre el sticky de localStorage en vez del valor del padre
-        // mandaría ese sticky al backend. `wizardFields` siembra el resto
-        // de los controles (tipografía, formato, portada, movimiento) con
-        // el render_params del padre. En edición no se manda: ahí el
-        // submit es un DIFF y un campo sin tocar no viaja.
+        // `wizardFields` va SIEMPRE (2026-07-25). Antes se mandaba sólo en
+        // VARIANTE, con el razonamiento de que en edición el submit es un diff
+        // y "un campo sin tocar no viaja" — cierto para el cable, falso para el
+        // OPERADOR: los controles pintan de `batchDefaults`, que en edición
+        // arranca del sticky de localStorage. El operador abría "editar fondo",
+        // veía "Estático" ya resaltado (su último batch, no este video), no
+        // clickeaba, y el render salía con el valor viejo. Siete veces, en el
+        // reclamo que originó esto.
+        //
+        // Es seguro: el seed effect sólo llama setBatchDefaults (display) y
+        // nunca onEditFieldChange, y `baseline` sigue saliendo de
+        // render_params → la semántica del diff no cambia. Auditado contra los
+        // 60 consumidores de batchDefaults: no hay camino a un POST sin click
+        // explícito del operador.
         editSeed={_wizardOnExistingJob ? {
           jobId: currentReview.editingJobId || currentReview.parentJobId,
           genre: currentReview.genre,
@@ -4652,7 +4658,7 @@ export default function App() {
           backgroundHint: currentReview.backgroundHint,
           bgVerbatim: currentReview.bgVerbatim,
           matchLyrics: currentReview.matchLyrics,
-          wizardFields: currentReview.variantMode ? {
+          wizardFields: {
             font: currentReview.font || "",
             textCase: currentReview.textCase || "upper",
             fontScale: String(currentReview.fontScale || "1.0"),
@@ -4662,13 +4668,42 @@ export default function App() {
             lineTransition: currentReview.lineTransition || "none",
             movementStyle: currentReview.movementStyle || "",
             effect: currentReview.effect || "",
+            // Los colores de letra TAMBIÉN se siembran, aunque su picker esté
+            // oculto en edición: el preview central los consume de
+            // batchDefaults, así que sin sembrarlos pintaba la letra con el
+            // color del batch ANTERIOR y el operador ya no tenía forma de verlo
+            // ni de resetearlo. Es la misma falla que este trabajo vino a
+            // matar, en el único eje que había quedado afuera.
+            // Es display-only: computeFieldDiff no tiene rama para ellos.
+            lyricColor: currentReview.lyricColor || "#FFFFFF",
+            lyricSungColor: currentReview.lyricSungColor || "#FFFFFF",
             titleTemplate: currentReview.titleTemplate || "auto",
             titleSize: String(currentReview.titleSize || "1.0"),
             titleArtistFont: currentReview.titleArtistFont || "",
             titleSongFont: currentReview.titleSongFont || "",
             titleSongBreak: currentReview.titleSongBreak || "",
-          } : null,
+          },
         } : null}
+        // baseline: para el chip "EN EL VIDEO" — la galería necesita saber qué
+        // tiene el video HOY, aparte de qué eligió el operador. Sin esto el
+        // anillo violeta es la única señal, y es la que engañó al operador.
+        editBaseline={_wizardOnExistingJob ? currentReview.baseline : null}
+        // Plan EN VIVO (willApply / willDrop / blocked), desde la MISMA función
+        // que arma el POST. Alimenta el resumen del paso final y el bloqueo del
+        // bloque de fondo, para que el wizard deje de prometer cosas que el
+        // backend va a descartar.
+        editPlan={editPlan}
+        // Aparte del plan: "¿se puede tocar el fondo de este job?" no depende
+        // de si el operador ya cambió algo. Con el plan solo, el aviso salía
+        // DESPUÉS de configurar el fondo — al revés de para lo que existe.
+        bgBlockedReason={_wizardOnExistingJob && currentReview?.editMode
+          ? backgroundEditBlockedReason({
+              jobStatus: currentReview.jobStatus,
+              scenePlan: currentReview.scenePlan,
+            })
+          : null}
+        editsRemaining={_wizardOnExistingJob ? currentReview.editsRemaining : null}
+        editLimitExempt={!!currentReview?.editLimitExempt}
         // UI v1.1 (2026-05-30): feed the central title-card preview with the
         // currently-active artist/song. In edit mode the canonical source is
         // currentReview (the operator can edit them in the banner inputs
@@ -5117,6 +5152,8 @@ export default function App() {
             <EditLyricsRoute
               setCurrentReview={setCurrentReview}
               setWizardStage={setWizardStage}
+              setBgSelectMode={setBgSelectMode}
+              setBackgroundId={setBackgroundId}
               wizardScreen={wizardScreen}
               t={t}
             />

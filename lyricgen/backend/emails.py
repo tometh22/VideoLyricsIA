@@ -164,6 +164,33 @@ def send_lead_notification(name: str, company: str, email: str, volume: str, mes
     _send_email(to, "Nuevo lead de ventas — GenLy AI", _wrap_template(content))
 
 
+def send_umg_change_request_notification(
+    artist: str, song: str, comment: str, delivery_id: int, job_id: str,
+):
+    """Notify ops the instant UMG submits a change request on the deliveries
+    portal. Real-time counterpart to the "Cambios de UMG" admin panel — the
+    panel requires opening the admin, this lands in the inbox so a pending
+    request never sits unseen (incident 2026-07-24: the panel had been
+    removed from the admin and requests piled up silently).
+    """
+    to = (os.environ.get("ALERT_EMAIL")
+          or os.environ.get("OWNER_EMAIL")
+          or "tomas@epical.digital")
+    esc = html.escape
+    comment_html = esc(comment or "—").replace(chr(10), "<br>")
+    content = f"""
+    <h2 style="color:#fff;margin:0 0 16px;">UMG pidió un cambio</h2>
+    <p><strong>Artista:</strong> {esc(artist or "—")}</p>
+    <p><strong>Canción:</strong> {esc(song or "—")}</p>
+    <p><strong>Job:</strong> {esc(job_id or "—")} · <strong>Delivery:</strong> #{delivery_id}</p>
+    <p style="margin-top:16px;"><strong>Pedido:</strong><br>{comment_html}</p>
+    <p style="margin-top:16px;color:#888;font-size:13px;">
+      Resolvelo desde Admin → Operación → Cambios de UMG.
+    </p>
+    """
+    _send_email(to, f"UMG pidió un cambio — {artist or 'sin artista'}", _wrap_template(content))
+
+
 def send_welcome(email: str, username: str):
     """Send welcome email after registration."""
     content = f"""
