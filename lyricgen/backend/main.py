@@ -5568,6 +5568,7 @@ async def _run_transcription_for_job(
             _initial_asr_lyrics_hint, _plain_lyrics_aligner_enabled,
             _anchored_recovery_is_safe,
             _fetch_lrclib_by_audio_evidence,
+            _strip_leading_reference_credits,
         )
         # Short-lived DB session JUST for the lrclib cache lookup, released
         # immediately so the connection is free during the long Whisper /
@@ -5702,6 +5703,23 @@ async def _run_transcription_for_job(
                                 artist_hint, song_hint)
             except Exception as e:
                 logger.warning("[LYRICS] gemini fallback raised: %s — continuing without it", e)
+
+        # Catalogue text may begin with a detached editorial credit rather
+        # than a sung lyric. Remove only explicit, blank-line-delimited credit
+        # blocks before *any* alignment path sees them. A false leading line
+        # shifts ordinal word bucketing for the entire song (La Foto de Tu
+        # Cuerpo: 31 clean reconciled lines became 49 mixed fragments).
+        if lrc and (lrc.get("plain") or "").strip():
+            _clean_plain, _removed_credits = _strip_leading_reference_credits(
+                lrc.get("plain") or "",
+            )
+            if _removed_credits:
+                lrc["plain"] = _clean_plain
+                logger.warning(
+                    "[LYRICS] removed %d detached leading credit line(s): %r",
+                    len(_removed_credits),
+                    _removed_credits,
+                )
 
         # ─────────────────────────────────────────────────────────────────
         # WORLD-CLASS audio-as-truth pipeline (default 2026-05-25).
@@ -5982,7 +6000,17 @@ async def _run_transcription_for_job(
                             except Exception as _clgc_err:
                                 logger.warning("[WC] gap-cluster FAILED: %s", _clgc_err)
                             from pipeline import _post_reconcile_cleanup as _prc
-                            _reconciled = _prc(_reconciled)
+                            # The reconciler has already chosen the catalogue's
+                            # human line structure. Its per-word array is an
+                            # ordinal timing aid, not guaranteed 1:1 lexical
+                            # ownership, so splitting those lines at apparent
+                            # word gaps can create single-word and even reversed
+                            # fragments. Keep line boundaries; still run end
+                            # tightening and overlap clamping.
+                            _reconciled = _prc(
+                                _reconciled,
+                                split_long_lines=False,
+                            )
                             return _emit_segments(
                                 _reconciled, _WC_WX_REC,
                                 reference_lyrics=_canonical,
