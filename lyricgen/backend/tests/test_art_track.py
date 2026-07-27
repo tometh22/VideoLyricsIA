@@ -241,6 +241,20 @@ def test_render_art_track_effect_adds_fx_screen_blend(monkeypatch, tmp_path):
     assert "2:a" in calls["cmd"]
 
 
+def test_render_art_track_reactive_effect_uses_exact_weighted_beats(
+        monkeypatch, tmp_path):
+    rhythm = fx.EffectRhythm(120.0, (.10, .60), (1.0, .55))
+    monkeypatch.setattr(fx, "detect_effect_rhythm", lambda *_: rhythm)
+    calls = _render_with_stubs(
+        monkeypatch, tmp_path, rs.RenderSpec.youtube_default(),
+        duration=2.0, effect="beat_ripple",
+    )
+    graph = calls["cmd"][calls["cmd"].index("-filter_complex") + 1]
+    assert "abs(T-0.1000)" in graph and "abs(T-0.6000)" in graph
+    assert "1.000*(1-abs" in graph and "0.550*(1-abs" in graph
+    assert "[fxraw][beatmask]blend=all_mode=multiply" in graph
+
+
 def test_render_art_track_unknown_effect_is_noop(monkeypatch, tmp_path):
     spec = rs.RenderSpec.youtube_default()
     calls = _render_with_stubs(monkeypatch, tmp_path, spec,
