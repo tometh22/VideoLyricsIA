@@ -155,6 +155,30 @@ def _split_at_word_gaps(seg: dict, words: list[dict]) -> list[dict]:
     if len(words) < 4:
         return [seg]
 
+    # Reconciled segments historically re-attached words by ordinal position.
+    # When a catalogue line was absent from the audio, those words could belong
+    # to a *different* line and even sit outside this segment's bounds. Splitting
+    # that invalid mapping produced reversed intervals (start > end), then the
+    # global sort interleaved fragments from adjacent lines. Never transform a
+    # segment unless its acoustic evidence is internally monotonic and contained.
+    try:
+        seg_start_bound = float(seg["start"])
+        seg_end_bound = float(seg["end"])
+        previous_start = seg_start_bound
+        for word in words:
+            word_start = float(word["start"])
+            word_end = float(word["end"])
+            if (
+                word_end < word_start
+                or word_start < previous_start
+                or word_start < seg_start_bound - 0.25
+                or word_end > seg_end_bound + 0.25
+            ):
+                return [seg]
+            previous_start = word_start
+    except (KeyError, TypeError, ValueError):
+        return [seg]
+
     canonical_words = (seg.get("text") or "").split()
     n_can = len(canonical_words)
     n_wx = len(words)
@@ -210,12 +234,31 @@ def _split_at_word_gaps(seg: dict, words: list[dict]) -> list[dict]:
             "words": list(last_wx),
         })
 
-    return out_segs if len(out_segs) > 1 else [seg]
+    if len(out_segs) <= 1:
+        return [seg]
+    try:
+        if any(
+            float(part["end"]) <= float(part["start"])
+            for part in out_segs
+        ):
+            return [seg]
+        if any(
+            float(out_segs[i]["start"]) < float(out_segs[i - 1]["end"])
+            for i in range(1, len(out_segs))
+        ):
+            return [seg]
+    except (KeyError, TypeError, ValueError):
+        return [seg]
+    return out_segs
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
-def post_reconcile_cleanup(segments: list[dict]) -> list[dict]:
+def post_reconcile_cleanup(
+    segments: list[dict],
+    *,
+    split_long_lines: bool = True,
+) -> list[dict]:
     """Post-process reconciled segments to reduce manual correction work.
 
     Two passes (each segment processed once — no recursion):
@@ -225,7 +268,8 @@ def post_reconcile_cleanup(segments: list[dict]) -> list[dict]:
        Addresses the "26-second Uh, uh, uh... mega-block" pattern where lrclib
        stores a whole ad-lib section as one line.
 
-    2. **Long-line gap splitter**: any segment with >= LONG_LINE_MIN_WORDS
+    2. **Long-line gap splitter** (when ``split_long_lines`` is true): any
+       segment with >= LONG_LINE_MIN_WORDS
        canonical words AND duration >= LONG_LINE_MIN_DUR gets split at ALL
        internal word gaps >= LONG_LINE_GAP_THRESH. Addresses the "Iluminados
        por el fuego / que dejaste arder" merging pattern where lrclib collapses
@@ -256,7 +300,11 @@ def post_reconcile_cleanup(segments: list[dict]) -> list[dict]:
             continue
 
         # Pass 2: long-line gap splitter
-        if len(words) >= LONG_LINE_MIN_WORDS and dur >= LONG_LINE_MIN_DUR:
+        if (
+            split_long_lines
+            and len(words) >= LONG_LINE_MIN_WORDS
+            and dur >= LONG_LINE_MIN_DUR
+        ):
             parts = _split_at_word_gaps(seg, words)
             if len(parts) > 1:
                 logger.info(

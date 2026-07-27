@@ -7,6 +7,7 @@ from pipeline import (
     _fetch_lrclib_by_audio_evidence,
     _initial_asr_lyrics_hint,
     _plain_lyrics_aligner_enabled,
+    _strip_leading_reference_credits,
 )
 
 
@@ -33,6 +34,27 @@ def test_plain_lyrics_aligner_is_on_by_default_with_kill_switch(monkeypatch):
     assert _plain_lyrics_aligner_enabled() is False
 
 
+def test_detached_catalogue_credit_is_removed_before_alignment():
+    plain = (
+        "Primer tema compuesto por el Potro\n\n"
+        "Sentado, fumando en un bar y pensando\n"
+        "Escribo, mirando tus fotos y extraño"
+    )
+    cleaned, removed = _strip_leading_reference_credits(plain)
+    assert removed == ["Primer tema compuesto por el Potro"]
+    assert cleaned.startswith("Sentado, fumando")
+    assert "Primer tema" not in cleaned
+
+
+def test_reference_credit_filter_does_not_delete_real_lyrics():
+    for plain in (
+        "Esta canción la escribí por vos\nY todavía te espero",
+        "Compuesto por piezas rotas\nSigo caminando",
+        "Written by the sea\nI found my way home",
+    ):
+        assert _strip_leading_reference_credits(plain) == (plain, [])
+
+
 def test_orchestrator_routes_references_through_policy_and_requests_words():
     src = _MAIN_PATH.read_text()
     assert "lyrics_hint=initial_hint" in src
@@ -40,6 +62,7 @@ def test_orchestrator_routes_references_through_policy_and_requests_words():
     assert src.count("return_words=True") >= 3
     assert "lyrics_hint=_gemini_pre or None" not in src
     assert "transcribe_path, lang, plain" not in src
+    assert "split_long_lines=False" in src
 
 
 def test_synthetic_recovery_rejects_two_anchors_for_full_song():
