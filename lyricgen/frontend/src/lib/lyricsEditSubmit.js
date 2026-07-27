@@ -65,6 +65,10 @@ export function layoutChanged(baseline, payloadSegments) {
 export function translateBackendError(raw, t) {
   if (raw == null) return null;
   const tr = typeof t === "function" ? t : () => null;
+  if (raw && typeof raw === "object" && raw.code === "edit_in_progress") {
+    return tr("edit.error_already_editing") ||
+      "Este video se está re-renderizando ahora. Esperá a que termine (revisalo en la página del video) y volvé a aplicar tus cambios.";
+  }
   let str;
   if (typeof raw === "string") {
     str = raw;
