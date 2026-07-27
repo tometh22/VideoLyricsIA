@@ -2430,9 +2430,16 @@ def _filter_whisper_hallucinations(segments: list[dict]) -> tuple[list[dict], in
 # Logic lives in post_reconcile.py (lightweight, no heavy deps) so it can be
 # unit-tested in isolation. The alias below preserves the internal call-site.
 
-def _post_reconcile_cleanup(segments: list[dict]) -> list[dict]:
+def _post_reconcile_cleanup(
+    segments: list[dict],
+    *,
+    split_long_lines: bool = True,
+) -> list[dict]:
     from post_reconcile import post_reconcile_cleanup
-    return post_reconcile_cleanup(segments)
+    return post_reconcile_cleanup(
+        segments,
+        split_long_lines=split_long_lines,
+    )
 
 
 def _filter_intro_song_overlap(
@@ -3304,6 +3311,67 @@ def _plain_lyrics_aligner_enabled() -> bool:
     return os.environ.get(
         "LRCLIB_PLAIN_ALIGNER_ENABLED", "1"
     ).strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
+
+_REFERENCE_CREDIT_RE = re.compile(
+    r"\b(?:"
+    r"compuest[oa]\s+por|"
+    r"escrit[oa]\s+por|"
+    r"interpretad[oa]\s+por|"
+    r"presentad[oa]\s+por|"
+    r"tema\s+compuest[oa]|"
+    r"written\s+by|"
+    r"performed\s+by|"
+    r"presented\s+by"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_leading_reference_credits(plain: str) -> tuple[str, list[str]]:
+    """Remove a detached leading credit block from catalogue lyrics.
+
+    Community lyrics occasionally prepend editorial copy such as
+    ``"Primer tema compuesto por el Potro"``.  Feeding that line to a forced
+    word-bucketer is much worse than displaying one extra subtitle: because
+    the credit is not sung, every following reference line can inherit the
+    wrong acoustic words.
+
+    This is intentionally narrow.  We only inspect the first non-empty block,
+    only when it is separated from the song body by a blank line, and only
+    remove the block when *every* line contains an explicit authorship /
+    performance-credit phrase.  A lyric that merely mentions "canción" or an
+    artist name is therefore preserved.
+
+    Returns ``(cleaned_text, removed_lines)`` for observable caller logging.
+    """
+    text = (plain or "").strip()
+    if not text:
+        return text, []
+
+    lines = text.splitlines()
+    first_nonempty = next(
+        (i for i, line in enumerate(lines) if line.strip()),
+        None,
+    )
+    if first_nonempty is None:
+        return "", []
+
+    separator = next(
+        (i for i in range(first_nonempty, len(lines)) if not lines[i].strip()),
+        None,
+    )
+    if separator is None:
+        return text, []
+
+    block = [line.strip() for line in lines[first_nonempty:separator] if line.strip()]
+    if not block or len(block) > 3:
+        return text, []
+    if not all(_REFERENCE_CREDIT_RE.search(line) for line in block):
+        return text, []
+
+    cleaned = "\n".join(lines[separator + 1:]).strip()
+    return (cleaned or text), block
 
 
 def _anchored_recovery_is_safe(

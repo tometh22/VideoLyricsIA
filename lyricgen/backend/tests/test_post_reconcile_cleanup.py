@@ -143,6 +143,30 @@ def test_gap_splitter_too_few_words():
     assert _split_at_word_gaps(seg, words) == [seg]
 
 
+def test_gap_splitter_rejects_words_outside_reconciled_line_bounds():
+    """La Foto regression: ordinal word reattachment can cross line bounds.
+
+    Splitting this mapping used to create a fragment whose start was after its
+    end; the later global timestamp sort then mixed it into the next line.
+    """
+    words = [
+        _w("no", 35.97, 36.57),
+        _w("quiero", 37.63, 38.10),
+        _w("pasar", 38.20, 38.70),
+        _w("de", 38.75, 38.90),
+        _w("valiente", 39.00, 39.50),
+        _w("a", 39.55, 39.65),
+        _w("cobarde", 41.19, 41.60),  # outside the segment's 41.14 end
+    ]
+    seg = _seg(
+        "no quiero, pasar de valiente a cobarde",
+        35.97,
+        41.14,
+        words,
+    )
+    assert _split_at_word_gaps(seg, words) == [seg]
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # post_reconcile_cleanup (full pipeline)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -176,6 +200,32 @@ def test_cleanup_splits_merged_phrases():
     assert out[0]["text"] == "Iluminados por el fuego"
     assert out[1]["text"] == "que dejaste arder"
     assert out[2]["text"] == "¿Para qué?"
+
+
+def test_cleanup_can_preserve_canonical_line_structure():
+    words = [
+        _w("sentado", 15.87, 16.40),
+        _w("fumando", 17.00, 17.60),
+        _w("en", 18.40, 18.55),
+        _w("un", 18.60, 18.75),
+        _w("bar", 18.80, 19.10),
+        _w("y", 19.20, 19.30),
+        _w("pensando", 19.40, 20.23),
+    ]
+    canonical = _seg(
+        "Sentado, fumando en un bar y pensando",
+        15.87,
+        20.40,
+        words,
+    )
+    out = post_reconcile_cleanup(
+        [canonical],
+        split_long_lines=False,
+    )
+    assert len(out) == 1
+    assert out[0]["text"] == canonical["text"]
+    # Safe cleanup still tightens the display end to the last acoustic word.
+    assert out[0]["end"] == 20.23
 
 
 def test_cleanup_does_not_split_normal_segments():
