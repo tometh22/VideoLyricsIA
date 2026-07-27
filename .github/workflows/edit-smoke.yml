@@ -1,0 +1,82 @@
+# Post-deploy edit smoke — GO/NO-GO del golden path upload→render→edit.
+#
+# Por qué existe: el incidente UMG del 2026-07-09 (#853 deployó el ffmpeg-234
+# que rompía todos los edits de WAVs acentuados) estuvo 8 horas en prod hasta
+# que un cliente escribió por WhatsApp. Este workflow corre el camino exacto
+# tras cada push a staging (= deploy de Railway staging) y lo deja rojo si el
+# pipeline de render/edit se rompió. En su primera corrida real atrapó un
+# worker stale en la flota de staging (TypeError frame_format). Contra PROD
+# solo por dispatch manual — crea un job real y gasta un Veo Fast
+# (~USD 0.10-0.80 por corrida).
+#
+# Secrets requeridos:
+#   PREFLIGHT_USERNAME / PREFLIGHT_PASSWORD  (cuenta admin del entorno)
+#   STAGING_API_URL   opcional; por defecto usa la URL pública de staging
+#   PRODUCTION_API_URL (ya existe — lo usa daily-smoke)
+name: Edit smoke (post-deploy)
+
+on:
+  push:
+    branches: [staging]
+    paths:
+      - "lyricgen/backend/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Entorno a smokear"
+        type: choice
+        options: [staging, production]
+        default: staging
+
+permissions:
+  contents: read
+
+jobs:
+  edit-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ (github.event_name == 'workflow_dispatch' && inputs.environment == 'production') && 'Production' || 'Preview' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (requests only — smoke es black-box HTTP)
+        run: pip install --quiet requests==2.32.3
+
+      - name: Validate smoke configuration
+        env:
+          PREFLIGHT_USERNAME: ${{ secrets.PREFLIGHT_USERNAME }}
+          PREFLIGHT_PASSWORD: ${{ secrets.PREFLIGHT_PASSWORD }}
+          STAGING_API_URL_SECRET: ${{ secrets.STAGING_API_URL }}
+          PRODUCTION_API_URL_SECRET: ${{ secrets.PRODUCTION_API_URL }}
+          TARGET_ENVIRONMENT: ${{ inputs.environment || 'staging' }}
+        run: |
+          if [ -z "$PREFLIGHT_USERNAME" ] || [ -z "$PREFLIGHT_PASSWORD" ]; then
+            echo "::error::Missing PREFLIGHT_USERNAME/PREFLIGHT_PASSWORD. Configure a dedicated smoke account in GitHub Actions secrets; do not reuse a personal operator account."
+            exit 1
+          fi
+          if [ "$TARGET_ENVIRONMENT" = "production" ]; then
+            if [ -z "$PRODUCTION_API_URL_SECRET" ]; then
+              echo "::error::Missing PRODUCTION_API_URL for the explicitly requested production smoke."
+              exit 1
+            fi
+            echo "EDIT_SMOKE_API_URL=$PRODUCTION_API_URL_SECRET" >> "$GITHUB_ENV"
+          else
+            echo "EDIT_SMOKE_API_URL=${STAGING_API_URL_SECRET:-https://api-staging-9b82.up.railway.app}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Wait for Railway deploy to settle
+        # El push que dispara este workflow también dispara el deploy de
+        # Railway; darle ventaja para que el smoke pruebe el código NUEVO.
+        run: sleep 180
+
+      - name: Run edit smoke
+        working-directory: lyricgen/backend
+        env:
+          PREFLIGHT_USERNAME: ${{ secrets.PREFLIGHT_USERNAME }}
+          PREFLIGHT_PASSWORD: ${{ secrets.PREFLIGHT_PASSWORD }}
+        run: python3 -m scripts.preflight.edit_smoke --api-url "$EDIT_SMOKE_API_URL"

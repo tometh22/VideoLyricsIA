@@ -1,0 +1,264 @@
+import { useState } from "react";
+import { useI18n } from "../i18n";
+
+// Hardcoded list. Mirror of backend pipeline.py UMG_TENANTS — if you
+// add a B2B partner here, update the backend constant too. Single source
+// of truth is the backend (which actually enforces the gate); this
+// frontend list only controls UI copy + default toggle position.
+const UMG_TENANTS = new Set([
+  "umg", "omg", "umusic", "universal_argentina", "universal_chile",
+]);
+const UMG_BILLING_GROUPS = new Set(["universal_music"]);
+
+export function isUniversalAccount(tenantId, billingGroup) {
+  const normalized = String(tenantId || "").trim().toLowerCase();
+  const normalizedGroup = String(billingGroup || "").trim().toLowerCase();
+  return UMG_BILLING_GROUPS.has(normalizedGroup)
+    || UMG_TENANTS.has(normalized)
+    || normalized === "universal"
+    || normalized.startsWith("universal_")
+    || normalized.startsWith("universal-");
+}
+
+export function isUmgTenant(tenantId) {
+  return isUniversalAccount(tenantId, null);
+}
+
+/**
+ * Operator-facing toggle for content validation behavior. The wire
+ * representation is a boolean: `value=true` means "validation runs",
+ * `value=false` requests a people-capable background. The parent translates
+ * that boolean into one of the existing mutually-exclusive backend flags:
+ *
+ *   Universal tenant: fixed policy, no operator bypass is rendered. The
+ *   backend independently enforces the same rule from tenant/billing group.
+ *
+ *   Non-Universal account (default behavior: validate):
+ *     - value=true  → send `force_content_validation: true`
+ *     - value=false → send `bypass_content_validation: true`; people still
+ *       require an explicit operator-authored prompt on the backend.
+ *
+ * Props:
+ *   value      — boolean. true = validate, false = skip.
+ *   onChange   — fn(newValue: boolean)
+ *   tenantId / billingGroup — account identifiers used only to render the
+ *                authoritative Universal fixed-policy notice.
+ *   disabled   — boolean
+ *   initialOpen — optional override; defaults to expanded when the
+ *                operator's choice differs from the tenant default
+ *                (so the warning/info is always visible at glance).
+ */
+export default function ContentValidationToggle({
+  value,
+  onChange,
+  tenantId,
+  billingGroup,
+  disabled = false,
+  initialOpen,
+}) {
+  const { t } = useI18n();
+  const isUmg = isUniversalAccount(tenantId, billingGroup);
+  // Tenant default for `value`. The parent should initialize state to
+  // this; if it didn't (value is undefined), treat as the default.
+  const tenantDefault = true; // every account defaults to the safe scan
+  const effectiveValue = typeof value === "boolean" ? value : tenantDefault;
+  // Operator is "departing from default" when their choice doesn't match
+  // the tenant default. That's when we want the amber warning visible.
+  const isDeparting = effectiveValue !== tenantDefault;
+
+  const [expanded, setExpanded] = useState(
+    typeof initialOpen === "boolean" ? initialOpen : isDeparting
+  );
+
+  // Universal returns a fixed notice below. The common-account copy keeps the
+  // existing explicit restricted/free choice and describes the backend's
+  // second requirement: a human must also be requested in the raw prompt.
+  const copy = isUmg
+    ? {
+        sectionLabel: t("validation.section_label") || "¿Restringir el contenido del fondo?",
+        defaultLabel: t("validation.umg_default_label") || "Sí — apto para UMG",
+        defaultRecommended: t("validation.umg_recommended") || "recomendado · default",
+        defaultDesc:
+          t("validation.umg_default_desc") ||
+          "Sin caras, sin manos, sin logos detectables.",
+        altLabel: t("validation.umg_alt_label") || "No — fondo libre",
+        altDesc:
+          t("validation.umg_alt_desc") ||
+          "Cualquier escena. Riesgo de rechazo por UMG.",
+        badge: t("validation.umg_badge") || "FONDO LIBRE",
+        // amber when departing (operator is opting OUT of the safer default)
+        departingTone: "amber",
+      }
+    : {
+        sectionLabel: t("validation.section_label") || "¿Restringir el contenido del fondo?",
+        defaultLabel: t("validation.nonumg_alt_label") || "Sí — sin personas ni marcas",
+        defaultRecommended: t("validation.nonumg_default_recommended") || "default",
+        defaultDesc:
+          t("validation.nonumg_alt_desc") ||
+          "Bloquea personas, manos y logos detectables en el fondo.",
+        // Non-UMG operators don't know what UMG is. Describe the behavior
+        // in concrete terms instead of namedropping the vendor's rule set.
+        altLabel: t("validation.nonumg_default_label") || "No — fondo libre",
+        altDesc:
+          t("validation.nonumg_default_desc") ||
+          "Solo permite personas cuando también las pedís explícitamente en el prompt.",
+        badge: t("validation.nonumg_badge") || "MODO RESTRINGIDO",
+        // brand color when departing (operator is opting INTO the stricter mode)
+        departingTone: "brand",
+      };
+
+  if (isUmg) {
+    return (
+      <div
+        role="note"
+        className="rounded-md ring-1 ring-brand/25 bg-brand/[0.05] px-3 py-3"
+      >
+        <div className="flex items-start gap-2.5">
+          <span
+            aria-hidden="true"
+            className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-full bg-brand/15 text-[11px] text-brand-light"
+          >
+            ✓
+          </span>
+          <div>
+            <p className="text-xs font-medium text-white">
+              {t("validation.universal_fixed_title") ||
+                "Protección Universal activa"}
+            </p>
+            <p className="mt-1 text-[10px] leading-relaxed text-ink-tertiary">
+              {t("validation.universal_fixed_desc") ||
+                "Los fondos no incluyen personas, caras, manos ni figuras humanas. Si la IA las introduce, regeneramos únicamente el fondo y el video continúa."}
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Tone-driven classes (amber for UMG-bypass, brand for non-UMG-enable).
+  const departingRingClass =
+    copy.departingTone === "amber"
+      ? "ring-amber-500/40 bg-amber-500/[0.04]"
+      : "ring-brand/40 bg-brand/[0.04]";
+  const departingBadgeClass =
+    copy.departingTone === "amber"
+      ? "bg-amber-500/15 text-amber-300 ring-amber-500/30"
+      : "bg-brand/15 text-brand-light ring-brand/30";
+  const departingOptionClass =
+    copy.departingTone === "amber"
+      ? "ring-amber-500/50 bg-amber-500/[0.08]"
+      : "ring-brand/50 bg-brand/[0.08]";
+  const departingRadioAccent =
+    copy.departingTone === "amber" ? "accent-amber-500" : "accent-brand";
+
+  // Map to the two radio buttons. "default" radio corresponds to the
+  // tenant's default behavior; "alt" is the departure.
+  const defaultRadioValue = tenantDefault; // boolean for `value` when this radio is selected
+  const altRadioValue = !tenantDefault;
+  const defaultSelected = effectiveValue === defaultRadioValue;
+  const altSelected = effectiveValue === altRadioValue;
+
+  return (
+    <div className={
+      "rounded-md ring-1 transition-colors " +
+      (isDeparting
+        ? departingRingClass
+        : "ring-white/[0.06] bg-surface-3/40")
+    }>
+      <button
+        type="button"
+        onClick={() => setExpanded((e) => !e)}
+        disabled={disabled}
+        className="w-full flex items-center justify-between px-3 py-2 text-[11px] text-ink-secondary tracking-wide disabled:opacity-50"
+      >
+        <span className="flex items-center gap-2">
+          <span>{copy.sectionLabel}</span>
+          {isDeparting && (
+            <span className={
+              "text-[10px] px-1.5 py-0.5 rounded ring-1 font-mono " +
+              departingBadgeClass
+            }>
+              {copy.badge}
+            </span>
+          )}
+        </span>
+        <span className="text-ink-tertiary">{expanded ? "▴" : "▾"}</span>
+      </button>
+
+      {expanded && (
+        <div className="px-3 pb-3 space-y-2">
+          {/* Default (tenant-matching) option */}
+          <label
+            className={
+              "flex items-start gap-2 cursor-pointer p-2 rounded ring-1 transition-colors " +
+              (defaultSelected
+                ? "ring-brand/40 bg-brand/[0.06]"
+                : "ring-white/[0.04] hover:ring-white/[0.10]")
+            }
+          >
+            <input
+              type="radio"
+              checked={defaultSelected}
+              onChange={() => onChange?.(defaultRadioValue)}
+              disabled={disabled}
+              className="mt-0.5 accent-brand"
+            />
+            <div className="flex-1">
+              <div className="text-xs text-white font-medium">
+                {copy.defaultLabel}{" "}
+                <span className="text-[10px] text-ink-tertiary font-normal">
+                  ({copy.defaultRecommended})
+                </span>
+              </div>
+              <p className="text-[10px] text-ink-tertiary mt-0.5 leading-relaxed">
+                {copy.defaultDesc}
+              </p>
+            </div>
+          </label>
+
+          {/* Alt (departure) option */}
+          {!isUmg && <label
+            className={
+              "flex items-start gap-2 cursor-pointer p-2 rounded ring-1 transition-colors " +
+              (altSelected
+                ? departingOptionClass
+                : "ring-white/[0.04] hover:ring-white/[0.10]")
+            }
+          >
+            <input
+              type="radio"
+              checked={altSelected}
+              onChange={() => onChange?.(altRadioValue)}
+              disabled={disabled}
+              className={"mt-0.5 " + departingRadioAccent}
+            />
+            <div className="flex-1">
+              <div className="text-xs text-white font-medium">
+                {copy.altLabel}
+              </div>
+              <p className="text-[10px] text-ink-tertiary mt-0.5 leading-relaxed">
+                {copy.altDesc}
+              </p>
+            </div>
+          </label>}
+
+          {/* Warning when "people allowed" is selected. value=false here
+              means "no restriction" → AI is free to generate faces / hands.
+              Veo's quality on people is uneven (deformed hands, weird
+              eyes). Surface that honestly so the operator knows what
+              they're committing to. */}
+          {!isUmg && effectiveValue === false && (
+            <p className="text-[10px] text-ink-tertiary leading-relaxed px-1 pt-1 border-t border-white/[0.05]">
+              ⚠ {t("validation.people_quality_warning") ||
+                  "El modelo a veces genera personas con artefactos (caras deformadas, manos con dedos extras). Probá un render antes de aprobar — si vas a entregar a un cliente, revisá el resultado."}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Re-exported helpers so parents can share the same tenant logic
+// without duplicating the hardcoded list.
+export { UMG_TENANTS };

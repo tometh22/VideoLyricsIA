@@ -19,13 +19,15 @@ UMG: two users that share `tenant_id` DO see the same job list.
 import uuid
 
 from database import SessionLocal, Job
-from auth import create_user, create_token
+from auth import create_user, start_login_session
 from tests.conftest import auth
 
 
 def _seed_job(db, tenant_id: str, user_id: int, status: str = "done") -> str:
     """Drop a single Job row directly for the given tenant/user."""
-    job_id = f"isol_{uuid.uuid4().hex[:8]}"
+    # Production schema is VARCHAR(12). Keep the fixture honest so these
+    # security tests exercise Postgres in CI instead of failing at INSERT.
+    job_id = f"i{uuid.uuid4().hex[:11]}"
     db.add(Job(
         job_id=job_id,
         user_id=user_id,
@@ -50,7 +52,7 @@ def _make_user(db, tenant_id: str, username_prefix: str):
         email=None,
         tenant_id=tenant_id,
     )
-    token = create_token(user)
+    token = start_login_session(db, user)
     return user, token
 
 
@@ -179,3 +181,194 @@ def test_two_users_same_tenant_share_jobs(client):
     assert status_y.status_code == 200, (
         "teammate in same tenant should be able to read status"
     )
+
+
+# ---------------------------------------------------------------------------
+# get_job() contract (UMG-launch hardening 2026-06-01)
+# ---------------------------------------------------------------------------
+
+def test_get_job_scope_filters_are_keyword_only():
+    """tenant_id/user_id are keyword-only so a future positional call
+    can't silently pass the tenant into the wrong slot. A positional
+    third argument must raise TypeError at call time."""
+    import pytest
+    from jobs import get_job
+
+    db = SessionLocal()
+    try:
+        with pytest.raises(TypeError):
+            get_job(db, "any_job_id", "tenant_alpha")  # positional scope → reject
+    finally:
+        db.close()
+
+
+def test_get_job_unscoped_call_logs_warning(caplog):
+    """An unscoped get_job() (no tenant_id, no user_id) is a global
+    lookup — legitimate only for admin/internal paths, which should use
+    get_job_model() instead. We don't raise (would break admin paths)
+    but we log loudly so a missing tenant filter shows up in review."""
+    import logging
+    from jobs import get_job
+
+    db = SessionLocal()
+    try:
+        with caplog.at_level(logging.WARNING, logger="genly.jobs"):
+            get_job(db, "job_that_does_not_exist")
+        warnings = [r for r in caplog.records
+                    if "without tenant/user scope" in r.getMessage()]
+        assert warnings, "unscoped get_job() must log a warning"
+    finally:
+        db.close()
+
+
+def test_get_job_scoped_call_does_not_log_warning(caplog):
+    """The standard endpoint pattern (tenant_id passed) must stay silent —
+    the warning is only for unscoped calls."""
+    import logging
+    from jobs import get_job
+
+    db = SessionLocal()
+    try:
+        user_a, _ = _make_user(db, "tenant_scoped_ok", "scoped")
+        job_a = _seed_job(db, "tenant_scoped_ok", user_a.id)
+        with caplog.at_level(logging.WARNING, logger="genly.jobs"):
+            found = get_job(db, job_a, tenant_id="tenant_scoped_ok")
+        assert found is not None
+        warnings = [r for r in caplog.records
+                    if "without tenant/user scope" in r.getMessage()]
+        assert not warnings, "scoped get_job() must not warn"
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Cross-tenant para ADMINS (pedido CEO 2026-06-11): el rol admin es de
+# plataforma — puede abrir el video de cualquier tenant (con audit trail);
+# los usuarios comunes siguen aislados.
+# ---------------------------------------------------------------------------
+
+def _seed_foreign_job(db, jid, tenant="otro-tenant-x"):
+    from database import Job, User
+    # user_id es NOT NULL: colgamos el job del primer usuario que exista
+    # (el bootstrap admin); lo que se prueba es el AISLAMIENTO POR TENANT.
+    any_uid = db.query(User.id).order_by(User.id).first()[0]
+    db.add(Job(job_id=jid, user_id=any_uid, tenant_id=tenant, artist="X",
+               song_title="Cross", filename="x.mp3", status="done",
+               s3_keys={"video": f"outputs/{jid}/video.mp4"}))
+    db.commit()
+
+
+def test_admin_can_read_other_tenant_job(client, admin_token, db):
+    from tests.conftest import auth
+    _seed_foreign_job(db, "xtenant00001")
+    try:
+        r = client.get("/status/xtenant00001", headers=auth(admin_token))
+        assert r.status_code == 200, r.text
+        assert r.json()["job_id"] == "xtenant00001"
+    finally:
+        from database import Job
+        db.query(Job).filter(Job.job_id == "xtenant00001").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_regular_user_still_isolated(client, user_token, db):
+    from tests.conftest import auth
+    _seed_foreign_job(db, "xtenant00002")
+    try:
+        r = client.get("/status/xtenant00002", headers=auth(user_token))
+        assert r.status_code == 404
+    finally:
+        from database import Job
+        db.query(Job).filter(Job.job_id == "xtenant00002").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_admin_cross_tenant_media_token_is_audited(client, admin_token, db):
+    from tests.conftest import auth
+    from database import AuditLog, Job
+    _seed_foreign_job(db, "xtenant00003")
+    try:
+        r = client.get("/media-token/xtenant00003/video", headers=auth(admin_token))
+        assert r.status_code == 200, r.text
+        rows = (
+            db.query(AuditLog)
+            .filter(AuditLog.action == "admin.cross_tenant_access")
+            .order_by(AuditLog.id.desc())
+            .limit(5)
+            .all()
+        )
+        assert any(
+            (e.detail or {}).get("job_id") == "xtenant00003"
+            and (e.detail or {}).get("job_tenant") == "otro-tenant-x"
+            for e in rows
+        ), "falta el rastro de auditoría cross-tenant"
+    finally:
+        db.query(Job).filter(Job.job_id == "xtenant00003").delete(synchronize_session=False)
+        db.query(AuditLog).filter(AuditLog.action == "admin.cross_tenant_access").delete(synchronize_session=False)
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# EDITOR cross-tenant para admins (soporte a clientes, jul-2026): el mismo
+# rol admin que ya LEE cualquier tenant ahora también GUARDA la corrección
+# (/jobs/{id}/save-segments). Sin esto el autoguardado del editor daba 404
+# permanente ("No pudimos guardar") sobre un job ajeno. Usuarios comunes
+# siguen aislados; el acceso queda auditado.
+# ---------------------------------------------------------------------------
+
+_SEG_BODY = {"segments": [{"start": 0.0, "end": 1.5, "text": "hola"}]}
+
+
+def test_admin_can_save_segments_cross_tenant(client, admin_token, db):
+    from tests.conftest import auth
+    from database import Job
+    _seed_foreign_job(db, "xtenant00010")
+    try:
+        r = client.post("/jobs/xtenant00010/save-segments",
+                        json=_SEG_BODY, headers=auth(admin_token))
+        assert r.status_code == 200, r.text
+        db.expire_all()
+        job = db.query(Job).filter(Job.job_id == "xtenant00010").first()
+        assert job.segments_json and job.segments_json[0]["text"] == "hola"
+    finally:
+        db.query(Job).filter(Job.job_id == "xtenant00010").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_regular_user_cannot_save_segments_cross_tenant(client, user_token, db):
+    from tests.conftest import auth
+    from database import Job
+    _seed_foreign_job(db, "xtenant00011")
+    try:
+        r = client.post("/jobs/xtenant00011/save-segments",
+                        json=_SEG_BODY, headers=auth(user_token))
+        assert r.status_code == 404, r.text
+    finally:
+        db.query(Job).filter(Job.job_id == "xtenant00011").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_admin_cross_tenant_save_segments_is_audited(client, admin_token, db):
+    from tests.conftest import auth
+    from database import AuditLog, Job
+    _seed_foreign_job(db, "xtenant00012")
+    try:
+        r = client.post("/jobs/xtenant00012/save-segments",
+                        json=_SEG_BODY, headers=auth(admin_token))
+        assert r.status_code == 200, r.text
+        rows = (
+            db.query(AuditLog)
+            .filter(AuditLog.action == "admin.cross_tenant_access")
+            .order_by(AuditLog.id.desc())
+            .limit(5)
+            .all()
+        )
+        assert any(
+            (e.detail or {}).get("job_id") == "xtenant00012"
+            and (e.detail or {}).get("kind") == "save_segments"
+            for e in rows
+        ), "falta el rastro de auditoría del save-segments cross-tenant"
+    finally:
+        db.query(Job).filter(Job.job_id == "xtenant00012").delete(synchronize_session=False)
+        db.query(AuditLog).filter(AuditLog.action == "admin.cross_tenant_access").delete(synchronize_session=False)
+        db.commit()
