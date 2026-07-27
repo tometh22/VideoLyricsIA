@@ -13010,8 +13010,16 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
                 "-stream_loop", "-1", "-i", os.path.abspath(fx_path),
                 "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(fg_path),
             ]
-            _fx_tempo = _fx.detect_effect_tempo(effect, mp3_path)
-            _fx_timing = _fx.effect_setpts(effect, _fx_tempo)
+            _fx_rhythm = _fx.rhythm_for_window(
+                _fx.detect_effect_rhythm(effect, mp3_path), win_start, dur
+            )
+            _fx_tempo = _fx_rhythm.bpm if _fx_rhythm else None
+            _fx_first_beat = (
+                _fx_rhythm.beats[0] if _fx_rhythm and _fx_rhythm.beats else 0.0
+            )
+            _fx_timing = _fx.effect_setpts(
+                effect, _fx_tempo, _fx_first_beat
+            )
             _fx_blend = _fx.effect_blend(effect)
             # Art tracks intentionally stay subtler than lyric-video effects:
             # the cover card and waveform are the hierarchy. Preserve the
@@ -14299,11 +14307,12 @@ def _render_lyrics_ass(
     # right filter form: a simple -vf when there's no effect (unchanged fast
     # path), or a -filter_complex with the looped fx clip as input #2.
     import fx_compositor as _fx
+    _fx_rhythm = _fx.detect_effect_rhythm(effect, mp3_path)
     vfilter, _use_complex, _extra_in = _fx.build_video_filter(
         ass_basename=("lyrics.ass" if render_text else None), font_dir=font_dir,
         width=spec.width, height=spec.height,
         effect=effect, style=style, custom_colors=custom_colors,
-        beat_bpm=_fx.detect_effect_tempo(effect, mp3_path),
+        rhythm=_fx_rhythm,
     )
     _filter_args = (
         ["-filter_complex", vfilter, "-map", "[out]", "-map", "1:a"]
@@ -14807,13 +14816,30 @@ def generate_lyric_video(
     import fx_compositor as _fx
     import numpy as _np
     _fx_clip = None
+    _fx_rhythm = _fx.detect_effect_rhythm(effect, mp3_path)
     try:
         _fx_path = _fx.effect_path(effect)
         if _fx_path:
-            from moviepy.editor import VideoFileClip as _VFC, vfx as _vfx
+            from moviepy.editor import (
+                VideoFileClip as _VFC,
+                concatenate_videoclips as _concat_fx,
+                vfx as _vfx,
+            )
             _fx_source = _cover_resize(_VFC(_fx_path), spec.width, spec.height)
-            _fx_bpm = _fx.detect_effect_tempo(effect, mp3_path)
+            _fx_bpm = _fx_rhythm.bpm if _fx_rhythm else None
             if _fx_bpm:
+                _fx_first = (
+                    _fx_rhythm.beats[0]
+                    if _fx_rhythm and _fx_rhythm.beats else 0.0
+                )
+                _phase_trim = _fx.effect_phase_trim(
+                    effect, _fx_bpm, _fx_first
+                )
+                if 0.001 < _phase_trim < _fx_source.duration:
+                    _fx_source = _concat_fx([
+                        _fx_source.subclip(_phase_trim),
+                        _fx_source.subclip(0, _phase_trim),
+                    ])
                 _fx_source = _fx_source.fx(_vfx.speedx, factor=_fx_bpm / 120.0)
             _fx_clip = (_fx_source.fx(_vfx.loop, duration=duration)
                         .set_duration(duration))
@@ -14832,12 +14858,17 @@ def generate_lyric_video(
             b = _base_src.get_frame(t).astype(_np.float32)
             if _fx_src is not None:
                 f = _fx_src.get_frame(t).astype(_np.float32)
-                if _fx.effect_blend(effect) == "multiply":
-                    mixed = b * f / 255.0
+                if _fx.is_reactive_effect(effect):
+                    f *= _fx.effect_strength_at(_fx_rhythm, t)
+                if _fx.is_pixel_transform(effect):
+                    b = _fx.transform_photo_frame(b, effect, t, f)
                 else:
-                    mixed = 255.0 - (255.0 - b) * (255.0 - f) / 255.0
-                opacity = _fx.effect_opacity(effect)
-                b = b * (1.0 - opacity) + mixed * opacity
+                    if _fx.effect_blend(effect) == "multiply":
+                        mixed = b * f / 255.0
+                    else:
+                        mixed = 255.0 - (255.0 - b) * (255.0 - f) / 255.0
+                    opacity = _fx.effect_opacity(effect)
+                    b = b * (1.0 - opacity) + mixed * opacity
             return _fx.grade_frame(b, _grade_style, custom_colors).clip(0, 255).astype("uint8")
 
         base = VideoClip(_fx_base_frame, duration=duration).set_fps(spec.fps)
@@ -15080,7 +15111,8 @@ def _make_short_text_clip(text: str, seg_start: float, seg_end: float, font: str
 
 
 def _apply_short_effect(short_path: str, fx_path: str, fps: float, job_dir: str,
-                        beat_bpm: float | None = None) -> str:
+                        beat_bpm: float | None = None,
+                        rhythm=None) -> str:
     """Blend a looped fx layer onto a finished short via ffmpeg.
 
     The short is moviepy-rendered and moviepy can't reproduce these blend
@@ -15095,22 +15127,22 @@ def _apply_short_effect(short_path: str, fx_path: str, fps: float, job_dir: str,
     # runs before format=gbrp on the clip's native YUV.
     import fx_compositor as _fx
     _eff = os.path.splitext(os.path.basename(fx_path))[0]
-    _gain = _fx.fx_gain(_eff)
-    _gain_step = f"{_gain}," if _gain else ""
-    _timing = _fx.effect_setpts(_eff, beat_bpm)
-    _blend = _fx.effect_blend(_eff)
-    _opacity = _fx.effect_opacity(_eff)
-    _opacity_step = f":all_opacity={_opacity:.2f}" if _opacity < 1.0 else ""
+    _graph, _complex, _extra = _fx.build_video_filter(
+        ass_basename=None,
+        font_dir="",
+        width=1080,
+        height=1920,
+        effect=_eff,
+        beat_bpm=beat_bpm,
+        rhythm=rhythm,
+        fx_input_index=1,
+    )
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", os.path.abspath(short_path),
         "-stream_loop", "-1", "-i", os.path.abspath(fx_path),
-        "-filter_complex",
-        "[0:v]format=gbrp[b];"
-        f"[1:v]scale=1080:1920,{_timing},{_gain_step}format=gbrp[f];"
-        f"[b][f]blend=all_mode={_blend}{_opacity_step}:shortest=1,"
-        "format=yuv420p[o]",
-        "-map", "[o]", "-map", "0:a?",
+        "-filter_complex", _graph,
+        "-map", "[out]", "-map", "0:a?",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-c:a", "copy", "-movflags", "+faststart", "-shortest",
         "-r", str(fps), tmp,
@@ -15530,9 +15562,12 @@ def generate_short(
     # composites. moviepy can't screen-blend, so it's a post-pass.
     fx = _fx.effect_path(effect)
     if fx:
+        _short_rhythm = _fx.rhythm_for_window(
+            _fx.detect_effect_rhythm(effect, mp3_path), start, win
+        )
         out_path = _apply_short_effect(
             out_path, fx, fps, job_dir,
-            beat_bpm=_fx.detect_effect_tempo(effect, mp3_path),
+            rhythm=_short_rhythm,
         )
 
     return out_path

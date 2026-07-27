@@ -75,8 +75,12 @@ def test_effect_builds_filter_complex_with_rgb_blend_fix():
     )
     assert use_complex is True
     # RGB-blend fix: both inputs to gbrp, screen blend, back to yuv420p.
-    assert "[0:v]format=gbrp[bg]" in fc
-    assert "scale=1280:720" in fc and "format=gbrp[fx]" in fc
+    assert (
+        "[0:v]scale=1280:720:force_original_aspect_ratio=increase,"
+        "crop=1280:720,format=gbrp[bg]"
+    ) in fc
+    assert "scale=1280:720" in fc and "format=gbrp[fxraw]" in fc
+    assert "[fxraw]null[fx]" in fc
     assert "blend=all_mode=screen:shortest=1[bl]" in fc
     assert "format=yuv420p[gr]" in fc
     # subtitles burn last, named output.
@@ -122,6 +126,71 @@ def test_reactive_effect_tempo_matches_authored_loop():
     }
 
 
+def test_reactive_effect_aligns_phase_and_uses_exact_energy_weighted_beats():
+    rhythm = fx.EffectRhythm(120.0, (0.10, 0.60), (1.0, 0.55))
+    fc, _, _ = fx.build_video_filter(
+        ass_basename=None, font_dir="", width=640, height=360,
+        effect="beat_ripple", rhythm=rhythm,
+    )
+    # 120 BPM source hit period is .5 s. Trimming .4 s makes its next hit land
+    # at detector timestamp .1, instead of merely running at the same BPM.
+    assert "trim=start=0.400000,setpts=(PTS-STARTPTS)*1.000000" in fc
+    assert "abs(T-0.1000)" in fc and "abs(T-0.6000)" in fc
+    assert "1.000*(1-abs" in fc and "0.550*(1-abs" in fc
+    assert "[fxraw][beatmask]blend=all_mode=multiply" in fc
+    assert fx.effect_strength_at(rhythm, 0.10) == pytest.approx(1.0)
+    assert fx.effect_strength_at(rhythm, 0.35) == pytest.approx(0.1)
+
+
+def test_rhythm_rebases_to_short_window_without_losing_energy():
+    rhythm = fx.EffectRhythm(100.0, (4.8, 5.2, 5.8, 7.1), (.5, .7, 1.0, .6))
+    short = fx.rhythm_for_window(rhythm, 5.0, 2.0)
+    assert short.bpm == 100.0
+    assert short.beats == pytest.approx((.2, .8))
+    assert short.strengths == pytest.approx((.7, 1.0))
+
+
+@pytest.mark.parametrize(
+    ("effect", "contract"),
+    [
+        ("liquid_glass", "displace=edge=mirror"),
+        ("heatwave", "displace=edge=mirror"),
+        ("rgb_glitch", "colorchannelmixer"),
+        ("neon_edge", "edgedetect=mode=colormix"),
+        ("kaleido", "vstack=inputs=2"),
+        ("halftone", "flags=neighbor"),
+        ("ink_reveal", "maskedmerge"),
+        ("chromatic_pulse", "colorchannelmixer"),
+        ("cutout_echo", "scale=1203:676"),
+        ("projector", "vignette=PI/5.2"),
+    ],
+)
+def test_photo_transform_effects_derive_pixels_from_background(effect, contract):
+    fc, use_complex, _ = fx.build_video_filter(
+        ass_basename=None, font_dir="", width=1280, height=720, effect=effect,
+    )
+    assert use_complex is True
+    assert effect in fx.PIXEL_TRANSFORM_EFFECTS
+    assert contract in fc
+    # An auxiliary raw loop may remain, but the visible graph must explicitly
+    # split/filter the chosen photo instead of only doing [bg][fx] blend.
+    assert "[bg]" in fc and "[bl]" in fc
+
+
+@pytest.mark.parametrize("effect", list(fx.PIXEL_TRANSFORM_EFFECTS))
+def test_moviepy_fallback_also_transforms_selected_photo(effect):
+    yy, xx = np.indices((90, 160))
+    photo = np.stack(
+        [(xx * 2) % 255, (yy * 3) % 255, ((xx + yy) * 2) % 255], axis=2
+    ).astype(np.uint8)
+    layer = np.stack(
+        [(xx + 40) % 255, (yy + 70) % 255, (xx * 0 + 120)], axis=2
+    ).astype(np.uint8)
+    output = fx.transform_photo_frame(photo, effect, 0.65, layer)
+    assert output.shape == photo.shape
+    assert np.abs(output.astype(np.int16) - photo.astype(np.int16)).mean() > 1.0
+
+
 def test_fontsdir_path_is_escaped():
     fc, use_complex, _ = fx.build_video_filter(
         ass_basename="lyrics.ass", font_dir="/tmp/my fonts:weird",
@@ -162,7 +231,7 @@ def test_dim_effect_inserts_gain_before_gbrp():
         width=1080, height=1920, effect="stars", style="",
     )
     gain = fx.fx_gain("stars")
-    assert f"setpts=PTS-STARTPTS,{gain},format=gbrp[fx]" in fc
+    assert f"setpts=PTS-STARTPTS,{gain},format=gbrp[fxraw]" in fc
 
 
 def test_bright_effect_has_no_gain_step():
@@ -170,7 +239,7 @@ def test_bright_effect_has_no_gain_step():
         ass_basename="l.ass", font_dir="/tmp/f",
         width=1080, height=1920, effect="confetti", style="",
     )
-    assert "setpts=PTS-STARTPTS,format=gbrp[fx]" in fc  # no eq between them
+    assert "setpts=PTS-STARTPTS,format=gbrp[fxraw]" in fc  # no eq between them
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg not installed")

@@ -6,7 +6,8 @@ Run from lyricgen/backend:
 
 The backend loop remains the render source of truth. This script creates:
   frontend/public/fx_raw/<effect>.mp4     live-composer layer (854x480)
-  frontend/public/fx_samples/<effect>.mp4 picker demo over a neutral base
+  frontend/public/fx_samples/<effect>.mp4 picker demo over a real photo,
+                                                   through the production graph
   frontend/public/fx_samples/<effect>.jpg picker poster
 """
 from __future__ import annotations
@@ -53,20 +54,41 @@ def build(name: str) -> None:
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", raw,
     ])
 
-    mode = fx.effect_blend(name)
-    opacity = fx.effect_opacity(name)
-    # Multiply needs a mid-light canvas to demonstrate its dark motion in a
-    # tiny card; screen effects need the inverse so emitted light reads.
-    sample_bg = "0x7e86a3" if mode == "multiply" else "0x120d2d"
+    # Picker previews now exercise the exact production compositor over a
+    # representative fixed photo.  A neutral color previously made geometric
+    # transforms look like overlays (or completely invisible), and could not
+    # prove that the selected photo's own pixels were being transformed.
+    # Clean fixed-photo crop (no lyric text baked in). The production graph
+    # scales-to-fill before cropping, so this wide source becomes a natural
+    # 16:9 coral scene without distortion.
+    photo = os.path.join(
+        FRONTEND_PUBLIC, "movement_samples", "foto-fija.jpg"
+    )
+    rhythm = (
+        fx.EffectRhythm(
+            120.0,
+            tuple(i * 0.5 + 0.08 for i in range(10)),
+            tuple(1.0 if i % 2 == 0 else 0.58 for i in range(10)),
+        )
+        if fx.is_reactive_effect(name)
+        else None
+    )
+    graph, use_complex, extra = fx.build_video_filter(
+        ass_basename=None,
+        font_dir="",
+        width=480,
+        height=270,
+        effect=name,
+        rhythm=rhythm,
+    )
+    if not use_complex:
+        raise RuntimeError(f"effect graph unexpectedly simple for {name}")
     _run([
         "ffmpeg", "-y", "-loglevel", "error",
-        "-f", "lavfi", "-i", f"color=c={sample_bg}:s=480x270:r=20:d=5",
-        "-i", source,
-        "-filter_complex",
-        f"[0:v]format=gbrp[base];"
-        f"[1:v]scale=480:270:flags=lanczos,format=gbrp[layer];"
-        f"[base][layer]blend=all_mode={mode}:all_opacity={opacity:.2f}:shortest=1,"
-        "format=yuv420p[out]",
+        "-loop", "1", "-framerate", "20", "-i", photo,
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+        *extra,
+        "-filter_complex", graph,
         "-map", "[out]", "-t", "5", *common, sample,
     ])
 
