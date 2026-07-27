@@ -175,6 +175,8 @@ def test_generate_with_job_id_rejects_other_users_jobs(client, monkeypatch):
         headers=auth(token_b),
     )
     assert res.status_code == 404
+    # Stable machine-readable code the frontend keys off (audit 2026-07-27).
+    assert res.json()["code"] == "job_not_found"
 
 
 def test_generate_with_job_id_rejects_already_promoted_jobs(client, monkeypatch):
@@ -219,6 +221,7 @@ def test_generate_with_job_id_rejects_already_promoted_jobs(client, monkeypatch)
         headers=auth(token),
     )
     assert res.status_code == 409
+    assert res.json()["code"] == "job_not_generatable"
 
 
 def test_generate_legacy_path_still_accepts_full_upload(client, monkeypatch):

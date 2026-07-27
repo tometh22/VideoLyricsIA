@@ -44,6 +44,7 @@ import TranscribingProgress from "./components/TranscribingProgress";
 import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
 import GiftCreditsBanner from "./components/GiftCreditsBanner";
 import { useAlert } from "./components/AlertProvider";
+import { ACTIVE_STATUSES, isTerminalStatus } from "./lib/jobStatus";
 import {
   shouldEnableBackgroundPreview,
   useBackgroundPreview,
@@ -2269,10 +2270,9 @@ export default function App() {
   // batches, and never polls the same job concurrently.
   useEffect(() => {
     if (!token) return undefined;
-    const ACTIVE = new Set([
-      "processing", "queued", "editing", "transcribing",
-      "transcribing_queued", "background_generating", "rendering",
-    ]);
+    // Canonical active set (src/lib/jobStatus.js) — kept in one place so the
+    // poller and the backend can't drift.
+    const ACTIVE = new Set(ACTIVE_STATUSES);
     let stopped = false;
     const tick = async () => {
       if (stopped || document.hidden || !getToken()) return;
@@ -2317,7 +2317,10 @@ export default function App() {
   const pollJob = useCallback((jobId) => {
     // Use SSE when available; fall back to 3 s polling for proxies that buffer
     // text/event-stream (some corporate HTTPS interceptors).
-    const TERMINAL = new Set(["done", "pending_review", "error", "validation_failed"]);
+    // Terminal set is the canonical one (src/lib/jobStatus.js), mirroring the
+    // backend SSE close set. It MUST include bg_preview_done / bg_preview_failed
+    // — otherwise the backend closes the stream but the poll never resolves and
+    // the /generate worker await hangs forever (audit 2026-07-27).
 
     return new Promise((resolve) => {
       const token = getToken();
@@ -2346,7 +2349,7 @@ export default function App() {
                   completed_at: data.completed_at ?? j.completed_at }
               : j
           ));
-          if (TERMINAL.has(data.status)) {
+          if (isTerminalStatus(data.status)) {
             cleanupSse();
             fetchHistory();
             resolve(data.status);
@@ -2417,7 +2420,7 @@ export default function App() {
                     completed_at: data.completed_at ?? j.completed_at }
                 : j
             ));
-            if (TERMINAL.has(data.status)) {
+            if (isTerminalStatus(data.status)) {
               clearInterval(iv);
               pollingIntervals.current.delete(iv);
               if (isMountedRef.current) fetchHistory();
@@ -3624,20 +3627,25 @@ export default function App() {
             setJobs((prev) => prev.map((j, idx) =>
               idx === i ? { ...j, status: "error", error: reason } : j
             ));
+            // Surface it — a silent status="error" left the single-song hero
+            // frozen on "Construyendo tu video" with no feedback (audit 2026-07-27).
+            alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
             continue;
           }
           if (!res.ok || data.detail) {
-            // 404 here means the transcribed job was reaped before we got
-            // to /generate. Surface a clear message instead of the raw
-            // "Job not found." so the operator knows it's a session-expired
-            // issue, not a corrupt video.
-            const reason = (res.status === 404)
+            // A 404 / `job_not_found` here means the transcribed job was reaped
+            // (or wasn't the caller's) before we got to /generate. Prefer the
+            // stable backend `code` over the raw HTTP status; keep 404 as a
+            // fallback for older backends. Surface a clear session-expired
+            // message instead of the raw "Job not found.".
+            const reason = (data.code === "job_not_found" || res.status === 404)
               ? (t("generate.session_expired")
                  || "La sesión expiró antes de generar. Re-subí el audio para regenerar.")
               : (data.detail || await describeFetchError(null, res, t));
             setJobs((prev) => prev.map((j, idx) =>
               idx === i ? { ...j, status: "error", error: reason } : j
             ));
+            alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
             continue;
           }
           setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
@@ -3647,6 +3655,7 @@ export default function App() {
           setJobs((prev) => prev.map((j, idx) =>
             idx === i ? { ...j, status: "error", error: reason } : j
           ));
+          alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
         }
       }
     };

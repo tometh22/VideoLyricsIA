@@ -7829,7 +7829,14 @@ async def generate_with_segments(
         if (not job_row
                 or job_row.user_id != current_user["id"]
                 or job_row.tenant_id != current_user["tenant_id"]):
-            raise HTTPException(status_code=404, detail="Job not found.")
+            # Stable machine-readable code so the frontend doesn't couple to the
+            # HTTP status. `job_not_found` = reaped / cross-tenant / never
+            # existed → the client surfaces a "session expired, re-upload" CTA
+            # instead of freezing the single-song hero (audit 2026-07-27).
+            return JSONResponse(
+                status_code=404,
+                content={"code": "job_not_found", "detail": "Job not found."},
+            )
         # State whitelist for /generate. `transcribed_pending` is what the
         # transcription worker writes on success (post-2026-05-25 fix);
         # `transcribed` is accepted defensively for jobs that were written
@@ -7837,9 +7844,14 @@ async def generate_with_segments(
         # and `awaiting_upload` covers the direct-generate path (no editor).
         # See transcription_worker.py:137 for the writer side.
         if job_row.status not in ("transcribed_pending", "transcribed", "awaiting_upload"):
-            raise HTTPException(
+            # Stable code (mirrors the `job_not_found` path above) so the client
+            # can react without string/status matching.
+            return JSONResponse(
                 status_code=409,
-                detail=f"Job is in state {job_row.status!r}, cannot generate.",
+                content={
+                    "code": "job_not_generatable",
+                    "detail": f"Job is in state {job_row.status!r}, cannot generate.",
+                },
             )
         current_revision = int(getattr(job_row, "segments_revision", 0) or 0)
         if requested_revision is None and current_revision > 0:
