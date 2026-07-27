@@ -3343,6 +3343,20 @@ export default function App() {
         }
 
         if (!res.ok) {
+          // Un reenvío tardío del mismo CTA puede llegar después de que el
+          // primer POST ya puso el job en `editing` (p. ej. una pestaña vieja
+          // o un cliente previo al single-flight del LyricsEditor). No es una
+          // falla del edit aceptado: cerrar el wizard y llevar al progreso sin
+          // superponer un modal rojo que diga lo contrario.
+          if (res.status === 409 && data?.detail?.code === "edit_in_progress") {
+            track("edit.duplicate_redirected", { job_id: editedJobId });
+            setCurrentReview(null);
+            wizardPersistence.clear();
+            segmentsStore.evict(reviewStoreKey(r));
+            segmentsStore.evict(r.transcribeJobId);
+            navigate(`/videos/${editedJobId}`, { replace: true });
+            return;
+          }
           const friendly = translateBackendError(data?.detail, t) || `Error ${res.status}`;
           alert({
             title: t("edit.error_title") || "No pudimos aplicar el edit",

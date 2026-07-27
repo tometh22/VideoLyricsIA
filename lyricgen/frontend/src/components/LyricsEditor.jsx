@@ -2072,7 +2072,16 @@ export default function LyricsEditor({
     });
   };
 
-  const handleApprove = async () => {
+  // Single-flight del CTA completo, incluido el flush de autosave que ocurre
+  // ANTES de onApprove. El lock de App sólo cubre el POST /edit; no alcanzaba
+  // para los clicks que quedaban esperando el mismo flush y luego despertaban
+  // después de que el primer POST ya había navegado al progreso. Esos callbacks
+  // tardíos enviaban el edit de nuevo y mostraban "ya se está re-renderizando"
+  // encima de un edit que en realidad sí había arrancado.
+  const approveInFlightRef = useRef(false);
+  const [isApproving, setIsApproving] = useState(false);
+
+  const runApprove = async () => {
     // Aviso (no bloqueo) si el último autosave falló. IMPORTANTE — contrato
     // real verificado (incidente UMG 21-jul-2026): aprobar manda los
     // segments EN PANTALLA en el cuerpo del POST (onApprove(cleaned) acá;
@@ -2100,9 +2109,9 @@ export default function LyricsEditor({
     const cleaned = _buildCleanedSegments();
     if (disableAutosave || !onPersistSegments || !transcribeJobId) {
       setIsDirty(false);
-      onApprove(cleaned.map(({ _id, ...rest }) => rest), {
+      await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
         baseRevision: Number.isInteger(segmentsRevision) ? segmentsRevision : 0,
-      });
+      }));
       return;
     }
     let saveResult = await flushPendingSave();
@@ -2133,11 +2142,23 @@ export default function LyricsEditor({
       }
     }
     setIsDirty(false);
-    onApprove(cleaned.map(({ _id, ...rest }) => rest), {
+    await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
       baseRevision: Number.isInteger(saveResult?.revision)
         ? saveResult.revision
         : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0),
-    });
+    }));
+  };
+
+  const handleApprove = async () => {
+    if (approveInFlightRef.current) return;
+    approveInFlightRef.current = true;
+    setIsApproving(true);
+    try {
+      await runApprove();
+    } finally {
+      approveInFlightRef.current = false;
+      setIsApproving(false);
+    }
   };
 
   const handleBackSafely = useCallback(async () => {
@@ -2280,10 +2301,14 @@ export default function LyricsEditor({
         bg-gradient-to-t from-surface via-surface/95 to-transparent pt-10 pb-5 px-6">
         <button
           onClick={handleApprove}
+          disabled={isApproving}
+          aria-busy={isApproving}
           data-tour="editor-approve-floating"
-          className="editor-primary-cta pointer-events-auto inline-flex items-center gap-1.5 btn-primary text-sm h-12 px-6 shadow-2xl shadow-brand/30"
+          className="editor-primary-cta pointer-events-auto inline-flex items-center gap-1.5 btn-primary text-sm h-12 px-6 shadow-2xl shadow-brand/30 disabled:opacity-60 disabled:cursor-wait"
         >
-          {submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate"))}
+          {isApproving
+            ? (t("editor.applying_changes") || "Aplicando cambios…")
+            : (submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate")))}
           <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M5 12h14M12 5l7 7-7 7" />
           </svg>

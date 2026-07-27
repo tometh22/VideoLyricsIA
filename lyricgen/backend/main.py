@@ -10383,6 +10383,29 @@ async def request_edit(
     from database import Job as JobModel, AuditLog
     from pipeline import _MAX_EDITS
 
+    # Fast-path para pestañas/clientes que reenvían el CTA mientras el primer
+    # edit ya está corriendo. El SELECT MVCC no espera el row-lock corto de los
+    # updates de progreso del worker, a diferencia del FOR UPDATE de abajo:
+    # en el incidente 83f95d0e2679 dos duplicados tardaron 35 s y 120 s para
+    # recién entonces devolver un 400 genérico. El gate se repite después del
+    # lock para cubrir la carrera entre este probe y el commit del primer POST.
+    _probe_q = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        _probe_q = _probe_q.filter(JobModel.tenant_id == current_user["tenant_id"])
+    _probe = _probe_q.first()
+    if not _probe:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if _probe.status == "editing":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "edit_in_progress",
+                "message": "An edit is already being rendered for this video.",
+                "current_step": _probe.current_step,
+                "progress": _probe.progress,
+            },
+        )
+
     # with_for_update() toma row-level lock en Postgres para serializar
     # el read-validate-write de edit_count. Sin esto, dos POST /edit del
     # mismo job en rápida sucesión leen el mismo edit_count, ambos pasan
@@ -10402,6 +10425,16 @@ async def request_edit(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     _audit_cross_tenant_access(db, current_user, job, "edit", commit=False)
+    if job.status == "editing":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "edit_in_progress",
+                "message": "An edit is already being rendered for this video.",
+                "current_step": job.current_step,
+                "progress": job.progress,
+            },
+        )
     valid_edit_types = ("typography", "background", "background_library", "lyrics", "metadata")
     if body.edit_type not in valid_edit_types:
         raise HTTPException(
