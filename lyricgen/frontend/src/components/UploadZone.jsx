@@ -1929,40 +1929,38 @@ export default function UploadZone({
           <div className="pointer-events-none absolute -bottom-32 -left-20 h-64 w-64 rounded-full bg-accent/10 blur-3xl" />
 
           <div className="relative px-3.5 pt-3.5 sm:px-4 sm:pt-4">
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex items-start gap-2.5">
-                <div className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-brand/90 to-accent/80 text-white shadow-[0_8px_24px_rgba(124,58,237,0.3)]">
-                  <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.7" viewBox="0 0 24 24" aria-hidden="true">
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 3l1.25 4.25L17.5 8.5l-4.25 1.25L12 14l-1.25-4.25L6.5 8.5l4.25-1.25L12 3Z" />
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M18.5 14l.7 2.3 2.3.7-2.3.7-.7 2.3-.7-2.3-2.3-.7 2.3-.7.7-2.3ZM5 13l.55 1.8 1.8.55-1.8.55L5 17.7l-.55-1.8-1.8-.55 1.8-.55L5 13Z" />
-                  </svg>
-                </div>
-                <div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <p className="text-[12px] font-semibold text-white">
-                      {t("upload.effect_gallery_title") || "Efecto encima"}
-                    </p>
-                    <span className="rounded-full border border-white/[0.08] bg-white/[0.04] px-2 py-0.5 text-[9px] font-medium tabular-nums text-gray-400">
-                      {EFFECT_CODES.length} {t("upload.effect_count_label") || "efectos"}
-                    </span>
-                  </div>
-                  <p className="mt-0.5 max-w-2xl text-[10px] leading-relaxed text-gray-500">
-                    {t("upload.effect_gallery_desc") || "Movimiento y textura sobre el fondo: partículas, luces, película, niebla y más. Se suma a cualquier fondo, incluso de Biblioteca."}
-                  </p>
-                </div>
+            <div className="flex items-start gap-2.5">
+              <div className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-brand/90 to-accent/80 text-white shadow-[0_8px_24px_rgba(124,58,237,0.3)]">
+                <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.7" viewBox="0 0 24 24" aria-hidden="true">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 3l1.25 4.25L17.5 8.5l-4.25 1.25L12 14l-1.25-4.25L6.5 8.5l4.25-1.25L12 3Z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M18.5 14l.7 2.3 2.3.7-2.3.7-.7 2.3-.7-2.3-2.3-.7 2.3-.7.7-2.3ZM5 13l.55 1.8 1.8.55-1.8.55L5 17.7l-.55-1.8-1.8-.55 1.8-.55L5 13Z" />
+                </svg>
               </div>
-              {files.length > 1 && (
-                <p className="hidden max-w-[180px] text-right text-[9px] leading-snug text-gray-600 sm:block">
-                  {t("upload.effect_gallery_hint") || "Click para aplicar a todos · personalizable por canción"}
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-[12px] font-semibold text-white">
+                    {t("upload.effect_gallery_title") || "Efecto encima"}
+                  </p>
+                  <span className="rounded-full border border-white/[0.08] bg-white/[0.04] px-2 py-0.5 text-[9px] font-medium tabular-nums text-gray-400">
+                    {EFFECT_CODES.length} {t("upload.effect_count_label") || "efectos"}
+                  </span>
+                </div>
+                <p className="mt-0.5 max-w-2xl text-[10px] leading-relaxed text-gray-500">
+                  {t("upload.effect_gallery_desc") || "Movimiento y textura sobre el fondo: partículas, luces, película, niebla y más. Se suma a cualquier fondo, incluso de Biblioteca."}
                 </p>
-              )}
+                {files.length > 1 && (
+                  <p className="mt-1 text-[9px] leading-snug text-gray-600">
+                    {t("upload.effect_gallery_hint") || "Click para aplicar a todos · personalizable por canción"}
+                  </p>
+                )}
+              </div>
             </div>
 
             {/* Large selected/hovered preview gives the catalogue a visual
                 hierarchy and reuses the exact same sample asset as the card. */}
             <div
               data-testid="effect-featured"
-              className="mt-3 grid overflow-hidden rounded-2xl border border-white/[0.08] bg-black/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] sm:grid-cols-[minmax(0,1.55fr)_minmax(180px,0.9fr)]"
+              className="mt-3 grid grid-cols-1 overflow-hidden rounded-2xl border border-white/[0.08] bg-black/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]"
               aria-live="polite"
             >
               <div className="relative aspect-video min-h-[126px] overflow-hidden bg-black">
@@ -1999,7 +1997,7 @@ export default function UploadZone({
                   )}
                 </div>
               </div>
-              <div className="relative flex min-h-[118px] flex-col justify-between border-t border-white/[0.06] bg-white/[0.025] p-3.5 sm:border-l sm:border-t-0">
+              <div className="relative flex min-h-[112px] flex-col justify-between border-t border-white/[0.06] bg-white/[0.025] p-3.5">
                 <div>
                   <p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-brand-light/80">
                     {featuredCategory?.label || (t("upload.effect_category_clean") || "Limpio")}
@@ -2052,7 +2050,7 @@ export default function UploadZone({
             </div>
           </div>
 
-          <div className="relative grid grid-cols-2 gap-2 p-3 pt-2 sm:grid-cols-3 lg:grid-cols-4">
+          <div className="relative grid grid-cols-[repeat(auto-fit,minmax(118px,1fr))] gap-2 p-3 pt-2">
           {visibleEffects.map((e) => {
             const active = (batchDefaults.effect || "") === e.code;
             const inVideo = isAnchor("effect", e.code);

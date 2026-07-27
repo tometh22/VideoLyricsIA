@@ -535,21 +535,26 @@ def _fog():
 
 def _shapes():
     """Minimal graphic circles, squares and diamonds floating over a still."""
-    n = 14
-    px = _RNG.uniform(0.08, 0.92, n)
-    # Keep the lyric-safe center clear. The reference's animated basketball
-    # lives around the illustration rather than crossing every word.
-    py = np.where(
-        _RNG.random(n) < 0.5,
-        _RNG.uniform(0.08, 0.24, n),
-        _RNG.uniform(0.76, 0.92, n),
-    )
-    amp_x = _RNG.uniform(0.025, 0.11, n)
-    amp_y = _RNG.uniform(0.015, 0.05, n)
+    n = 12
+    per_band = n // 2
+    # Two collision-free bands keep both the lyric-safe center and the other
+    # shapes clear. Even spacing + small motion envelopes means neighbouring
+    # paths never intersect, unlike the previous fully-random trajectories.
+    lane_x = np.linspace(0.09, 0.91, per_band)
+    px = np.concatenate((
+        lane_x + _RNG.uniform(-0.012, 0.012, per_band),
+        lane_x + _RNG.uniform(-0.012, 0.012, per_band),
+    ))
+    py = np.concatenate((
+        np.array((0.10, 0.21, 0.10, 0.21, 0.10, 0.21)),
+        np.array((0.79, 0.90, 0.79, 0.90, 0.79, 0.90)),
+    ))
+    amp_x = _RNG.uniform(0.008, 0.022, n)
+    amp_y = _RNG.uniform(0.008, 0.022, n)
     cyc_x = _RNG.integers(1, 4, n)
     cyc_y = _RNG.integers(1, 4, n)
     phase = _RNG.uniform(0, math.tau, n)
-    size = _RNG.integers(18, 65, n)
+    size = _RNG.integers(18, 56, n)
     kind = _RNG.integers(0, 3, n)
     palette = (
         (105, 78, 145), (62, 118, 145), (145, 90, 60),
