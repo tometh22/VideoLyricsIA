@@ -53,16 +53,34 @@ Por cada canción, la plataforma genera:
 
 ## Planes y precios
 
-### Generación de contenido
+> Fuente única de verdad de precios. Coincide con el pricing del producto (web). Última actualización: 2026-05-20.
+
+### Sellos / producción a volumen (plan principal)
 
 | Plan | Videos/mes | Precio | Por video |
 |------|-----------|--------|-----------|
-| **100** | 100 | **USD 800/mes** | $8.00 |
-| **250** | 250 | **USD 1,750/mes** | $7.00 |
-| **500** | 500 | **USD 3,000/mes** | $6.00 |
-| **1,000** | 1,000 | **USD 5,000/mes** | $5.00 |
+| **100** | 100 | **USD 900/mes** | $9.00 |
+| **250** | 250 | **USD 2,000/mes** | $8.00 |
+| **500** | 500 | **USD 3,500/mes** | $7.00 |
+| **1,000** | 1,000 | **USD 6,000/mes** | $6.00 |
 
-Cada video incluye: Lyric Video (Full HD) + YouTube Short (vertical) + Thumbnail.
+Videos excedentes (overage): +30% sobre el precio unitario del plan. Ej.: Plan 100 ($9/video) → overage a $11.70/video.
+
+Cada video incluye: Lyric Video (Full HD 1920x1080) + YouTube Short (vertical) + Thumbnail.
+
+### Indie / por crédito (funnel — créditos que no expiran)
+
+Para artistas independientes y prueba de calidad antes de escalar. Pensado como puerta de entrada, no como negocio principal.
+
+| Opción | Precio | Por video |
+|--------|--------|-----------|
+| **Prueba gratis** | $0 | 1 lyric video gratis (preview con marca de agua) |
+| **Pack 3** | USD 45 | $15.00 |
+| **Pack 10** | USD 120 | $12.00 |
+| **Pack 25** | USD 250 | $10.00 |
+
+Cada video incluye los 3 outputs, propiedad 100% del cliente y sin marca de agua (salvo la prueba gratis).
+*Posicionamiento: más barato que el self-serve por crédito de la competencia ($24–36 por lyric video) y muy por debajo de estudio ($150–500), manteniendo el margen del plan de sello.*
 
 ### Módulo de publicación en YouTube (add-on)
 
@@ -80,10 +98,10 @@ Subida automática a YouTube con metadata generada por IA.
 
 | Plan | Con módulo YouTube |
 |------|-------------------|
-| **100 videos** | **USD 1,200/mes** (+$400) |
-| **250 videos** | **USD 2,500/mes** (+$750) |
-| **500 videos** | **USD 4,200/mes** (+$1,200) |
-| **1,000 videos** | **USD 7,000/mes** (+$2,000) |
+| **100 videos** | **USD 1,300/mes** (+$400) |
+| **250 videos** | **USD 2,750/mes** (+$750) |
+| **500 videos** | **USD 4,700/mes** (+$1,200) |
+| **1,000 videos** | **USD 8,000/mes** (+$2,000) |
 
 ### Condiciones generales
 
@@ -101,7 +119,7 @@ Subida automática a YouTube con metadata generada por IA.
 
 | | Editor freelance | Estudio de producción | **GenLy AI** |
 |---|---|---|---|
-| Costo por video | $10 - $15 | $150 - $500 | **$8 o menos** |
+| Costo por video | $10 - $15 | $150 - $500 | **$6 a escala** |
 | Tiempo por video | 2-4 horas | 1-2 días | **5 minutos** |
 | 100 videos | 2-3 semanas | 1-2 meses | **1 día** |
 | Escala a 500/mes | Inviable | Muy costoso | **Mismo plan** |
@@ -114,8 +132,8 @@ Subida automática a YouTube con metadata generada por IA.
 
 | vs. | Costo mensual actual | Con GenLy AI | Ahorro |
 |-----|---------------------|-------------|--------|
-| Freelancer ($12/video) | $1,200 | $800 | **$400/mes ($4,800/año)** |
-| Estudio ($200/video) | $20,000 | $800 | **$19,200/mes** |
+| Freelancer ($12/video) | $1,200 | $900 | **$300/mes ($3,600/año)** |
+| Estudio ($200/video) | $20,000 | $900 | **$19,100/mes** |
 
 ---
 

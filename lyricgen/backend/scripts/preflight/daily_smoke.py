@@ -72,7 +72,7 @@ def _send_alert(all_results: list, failed: list) -> bool:
         )
 
     detail_blocks = []
-    for r, _ in failed:
+    for r in failed:
         detail_blocks.append(
             f"<h3 style='margin-top:24px'>❌ {r.name}</h3>"
             f"<p>{r.summary}</p>"

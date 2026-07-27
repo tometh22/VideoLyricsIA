@@ -210,6 +210,28 @@ def test_prewarm_returns_none_when_disabled(monkeypatch):
     assert queue_jobs.enqueue_prores_prewarm("xx", "umg_master") is None
 
 
+def test_explicit_prores_action_bypasses_optional_prewarm_limits(monkeypatch):
+    """Un click del usuario no puede quedar en polling eterno por el flag o
+    el backpressure que sólo regulan el prewarm oportunista."""
+    import queue_jobs
+
+    fake_q_enterprise = MagicMock()
+    fake_q_enterprise.count = 99
+    fake_q_enterprise.enqueue.return_value.id = "rq-explicit"
+    monkeypatch.setattr(queue_jobs, "PRORES_PREWARM_ENABLED", False)
+    monkeypatch.setattr(
+        queue_jobs, "_init_redis",
+        lambda: (object(), object(), fake_q_enterprise),
+    )
+
+    result = queue_jobs.enqueue_prores_prewarm(
+        "explicit", "umg_master", force=True,
+    )
+
+    assert result == "rq-explicit"
+    fake_q_enterprise.enqueue.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # P5 — disk capacity gate on /upload
 # ---------------------------------------------------------------------------
@@ -285,7 +307,7 @@ def test_cleanup_deletes_done_job_with_all_keys_present(tmp_path, monkeypatch):
         "files": {"video_url": "/x", "short_url": "/y", "thumbnail_url": "/z"},
         "s3_keys": {"video": "k1", "short": "k2", "thumbnail": "k3"},
     }
-    monkeypatch.setattr("jobs.get_job_model", lambda jid: fake_model)
+    monkeypatch.setattr("jobs.get_job_model", lambda db, jid: fake_model)
 
     summary = co.cleanup()
     assert summary["deleted"] == 1
@@ -310,7 +332,7 @@ def test_cleanup_keeps_running_job(tmp_path, monkeypatch):
         "files": {},
         "s3_keys": {},
     }
-    monkeypatch.setattr("jobs.get_job_model", lambda jid: fake_model)
+    monkeypatch.setattr("jobs.get_job_model", lambda db, jid: fake_model)
 
     co.cleanup()
     assert job_dir.exists(), "running jobs must not be cleaned up"
@@ -328,7 +350,7 @@ def test_cleanup_deletes_orphan_dir(tmp_path, monkeypatch):
     orphan.mkdir()
     (orphan / "lyric_video.mp4").write_bytes(b"x" * 100)
 
-    monkeypatch.setattr("jobs.get_job_model", lambda jid: None)
+    monkeypatch.setattr("jobs.get_job_model", lambda db, jid: None)
 
     summary = co.cleanup()
     assert summary["deleted"] == 1

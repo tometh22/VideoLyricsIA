@@ -52,6 +52,38 @@ python3 -m scripts.preflight.run \
 
 Exit codes: `0` GO, `1` NO-GO, `2` INCONCLUSIVE (every P0 skipped).
 
+## Launch readiness (UMG go-live)
+
+`check_launch_readiness.py` adds seven read-only checks for the
+"N concurrent operators use the platform for the first time" scenario.
+Run them via the repo-root Makefile:
+
+```bash
+# from the repo root
+STAGING_API_URL=https://staging-api.example make preflight-staging
+PROD_API_URL=https://genly-ai.up.railway.app make preflight-prod
+```
+
+or directly:
+
+```bash
+python3 -m scripts.preflight.run --launch --api-url https://...
+```
+
+| Check               | P0 | Needs                                  |
+|---------------------|----|----------------------------------------|
+| `launch_health`     | ✓  | nothing (public /health)               |
+| `r2_not_public`     | ✓  | `R2_PROBE_URL` (any presigned R2 URL)  |
+| `sentry_configured` | ✓  | nothing (public /health)               |
+| `umg_users_ready`   | ✓  | `UMG_USERNAMES` + `DATABASE_URL`       |
+| `queue_healthy`     | ✓  | `PREFLIGHT_USERNAME/PASSWORD` (admin)  |
+| `presigned_expiry`  |    | `PREFLIGHT_USERNAME/PASSWORD`          |
+| `limits_sane`       |    | nothing (static scrape)                |
+
+Checks missing their inputs degrade to **skipped** (with the reason),
+never to a false fail. All seven are read-only — safe to run against
+prod at any time.
+
 ## Cost notes
 
 | Check                    | Cost per run                              |
@@ -59,6 +91,7 @@ Exit codes: `0` GO, `1` NO-GO, `2` INCONCLUSIVE (every P0 skipped).
 | `volume_caps`            | $0 — static analysis + DB read            |
 | `umg_master_conformance` | $0 — only ffprobes a file you give it     |
 | `validator_quality`      | up to `$validator_budget` (default $5)    |
+| `launch_*` (all seven)   | $0 — read-only HTTP + optional DB read    |
 
 `validator_quality` hits the R2 cache layer in `pipeline.py`, so re-runs
 with the same prompts are free after the first pass.
