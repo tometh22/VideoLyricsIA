@@ -50,6 +50,17 @@ def _stub_whisper_response(text="hola mundo"):
     return resp
 
 
+def _stub_whisper_word_response():
+    """Segment decoder bounds trail the actual words, like sung audio."""
+    resp = _stub_whisper_response("hola mundo")
+    resp.segments[0].start = 0.0
+    resp.segments[0].end = 5.0
+    w1 = MagicMock(word="hola", start=1.0, end=1.4)
+    w2 = MagicMock(word="mundo", start=1.6, end=2.2)
+    resp.words = [w1, w2]
+    return resp
+
+
 @pytest.fixture
 def patched_transcribe(monkeypatch):
     """Returns a factory `setup(side_effects)` that wires the retry loop's
@@ -103,6 +114,26 @@ def test_succeeds_on_first_attempt(patched_transcribe):
     result = pipeline._transcribe_via_openai_api("/tmp/_test.mp3", language="es")
     assert create_mock.call_count == 1
     assert result is not None
+
+
+def test_word_granularity_uses_first_and_last_word_as_segment_bounds(
+    patched_transcribe,
+):
+    """ROTOR regression: don't display a lyric until the decoder boundary."""
+    import pipeline
+
+    create_mock = patched_transcribe([_stub_whisper_word_response()])
+    result = pipeline._transcribe_via_openai_api(
+        "/tmp/_test.mp3", language="es", return_words=True,
+    )
+
+    assert len(result) == 1
+    assert result[0]["start"] == 1.0
+    assert result[0]["end"] == 2.2
+    assert [w["word"] for w in result[0]["words"]] == ["hola", "mundo"]
+    kwargs = create_mock.call_args.kwargs
+    assert kwargs["timestamp_granularities"] == ["word", "segment"]
+    assert kwargs["prompt"] == "Letras de canción:"
 
 
 def test_retries_then_succeeds_on_3rd(patched_transcribe):
