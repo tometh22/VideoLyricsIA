@@ -145,6 +145,7 @@ describe("Foto fija avisa que queda inmóvil", () => {
     render(<Harness movementStyle="foto-parallax" />);
     goStep(3);
     expect(screen.getByTestId("foto-fija-warning")).toBeTruthy();
+    fireEvent.click(screen.getByText("upload.foto_fija_goto_effect"));
     fireEvent.click(document.querySelector('[data-effect="snow"]'));
     expect(screen.queryByTestId("foto-fija-warning")).toBeNull();
   });
@@ -152,22 +153,36 @@ describe("Foto fija avisa que queda inmóvil", () => {
   it("'Sin efecto' se renombra para que elegirlo sea una decisión", () => {
     render(<Harness movementStyle="foto-parallax" />);
     goStep(3);
+    fireEvent.click(screen.getByTestId("effect-picker-toggle"));
     expect(screen.getByText("upload.effect_none_still")).toBeTruthy();
   });
 
   it("y NO se bloquea seguir: 'Sin efecto' es una opción válida", () => {
     render(<Harness movementStyle="foto-parallax" />);
     goStep(3);
+    fireEvent.click(screen.getByTestId("effect-picker-toggle"));
     const none = document.querySelector('[data-effect="none"]');
     expect(none).not.toBeNull();
     expect(none.disabled).toBe(false);
   });
 });
 
-describe("galería moderna de efectos", () => {
+describe("selector compacto de efectos", () => {
+  it("arranca cerrado y resume la selección sin cargar el editor", () => {
+    render(<Harness movementStyle="foto-parallax" />);
+    goStep(3);
+
+    const toggle = screen.getByTestId("effect-picker-toggle");
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByTestId("effect-picker-panel")).toBeNull();
+    expect(document.querySelectorAll("[data-effect]")).toHaveLength(0);
+    expect(screen.getByText("upload.effect_none")).toBeTruthy();
+  });
+
   it("filtra por familia sin cambiar el valor elegido", () => {
     render(<Harness movementStyle="foto-parallax" />);
     goStep(3);
+    fireEvent.click(screen.getByTestId("effect-picker-toggle"));
 
     expect(document.querySelectorAll("[data-effect]")).toHaveLength(16);
     fireEvent.click(document.querySelector('[data-effect-category="stylized"]'));
@@ -177,22 +192,83 @@ describe("galería moderna de efectos", () => {
     expect(visible).toEqual(["prism", "film", "scanlines", "shapes"]);
     expect(visible).not.toContain("none");
     expect(document.querySelector('[data-effect-category="stylized"]')
-      .getAttribute("aria-selected")).toBe("true");
+      .getAttribute("aria-pressed")).toBe("true");
   });
 
-  it("el preview protagonista sigue hover/focus y el click confirma la opción", () => {
+  it("el click confirma la opción y actualiza el resumen compacto", () => {
     render(<Harness />);
     goStep(3);
+    fireEvent.click(screen.getByTestId("effect-picker-toggle"));
 
     const film = document.querySelector('[data-effect="film"]');
-    fireEvent.focus(film);
-    expect(screen.getByTestId("effect-featured").querySelector("video")
-      .getAttribute("src")).toBe("/fx_samples/film.mp4");
-
     fireEvent.click(film);
-    fireEvent.blur(film);
     expect(film.getAttribute("aria-pressed")).toBe("true");
-    expect(screen.getByTestId("effect-featured").querySelector("video")
+    expect(screen.getByTestId("effect-picker-toggle").querySelector("video")
       .getAttribute("src")).toBe("/fx_samples/film.mp4");
+  });
+
+  it("Escape vuelve al composer sin perder la selección confirmada", () => {
+    render(<Harness />);
+    goStep(3);
+    fireEvent.click(screen.getByTestId("effect-picker-toggle"));
+    fireEvent.click(document.querySelector('[data-effect="fog"]'));
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(screen.queryByTestId("effect-picker-panel")).toBeNull();
+    expect(screen.getByTestId("effect-picker-toggle")
+      .getAttribute("data-effect-summary")).toBe("fog");
+  });
+});
+
+describe("E2E del Motion Composer", () => {
+  it("recorre Movimiento → Foto fija → Efectos → Bokeh y conserva el resultado", () => {
+    render(<Harness movementStyle="estatico" />);
+    goStep(3);
+
+    // Estado normal: sólo las dos decisiones confirmadas.
+    expect(screen.getByTestId("movement-picker-toggle")).toBeTruthy();
+    expect(screen.getByTestId("effect-picker-toggle")).toBeTruthy();
+    expect(document.querySelectorAll("[data-movement]")).toHaveLength(0);
+    expect(document.querySelectorAll("[data-effect]")).toHaveLength(0);
+
+    // Drill-in de Movimiento reemplaza el inspector, sin apilar Efectos.
+    fireEvent.click(screen.getByTestId("movement-picker-toggle"));
+    expect(screen.queryByTestId("effect-picker-toggle")).toBeNull();
+    expect(document.querySelectorAll("[data-movement]")).toHaveLength(6);
+    fireEvent.click(document.querySelector('[data-movement="foto-parallax"]'));
+    expect(document.querySelector('[data-movement="foto-parallax"]')
+      .getAttribute("aria-pressed")).toBe("true");
+
+    // Escape vuelve al resumen con la selección confirmada y muestra el
+    // estado neutro de imagen inmóvil.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByTestId("movement-picker-toggle")
+      .getAttribute("data-movement-summary")).toBe("foto-parallax");
+    expect(screen.getByTestId("foto-fija-warning")).toBeTruthy();
+
+    // "Agregar vida" entra directo al catálogo. Cada efecto tiene poster
+    // visible; sólo la opción activa/hovered monta video animado.
+    fireEvent.click(screen.getByText("upload.foto_fija_goto_effect"));
+    expect(screen.queryByTestId("movement-picker-toggle")).toBeNull();
+    expect(screen.getByTestId("effect-picker-panel")).toBeTruthy();
+    const cards = [...document.querySelectorAll("[data-effect]")]
+      .filter((card) => card.dataset.effect !== "none");
+    expect(cards).toHaveLength(15);
+    for (const card of cards) {
+      expect(card.querySelector("img")?.getAttribute("src"))
+        .toBe(`/fx_samples/${card.dataset.effect}.jpg`);
+    }
+
+    const bokeh = document.querySelector('[data-effect="bokeh"]');
+    fireEvent.click(bokeh);
+    expect(bokeh.getAttribute("aria-pressed")).toBe("true");
+    expect(bokeh.querySelector("video")?.getAttribute("src"))
+      .toBe("/fx_samples/bokeh.mp4");
+
+    // Volver conserva el efecto y elimina el nudge de imagen inmóvil.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByTestId("effect-picker-toggle")
+      .getAttribute("data-effect-summary")).toBe("bokeh");
+    expect(screen.queryByTestId("foto-fija-warning")).toBeNull();
   });
 });

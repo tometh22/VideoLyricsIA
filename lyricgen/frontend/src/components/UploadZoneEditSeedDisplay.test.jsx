@@ -109,12 +109,14 @@ function goStep(n) {
 const pressed = (selector) =>
   [...document.querySelectorAll(selector)]
     .filter((el) => el.getAttribute("aria-pressed") === "true")
-    .map((el) => el.dataset.movement ?? el.dataset.effect);
+    .map((el) => el.dataset.movement ?? el.dataset.effect
+      ?? el.dataset.movementSummary ?? el.dataset.effectSummary);
 
 const anchored = (selector) =>
   [...document.querySelectorAll(selector)]
     .filter((el) => el.dataset.inVideo === "true")
-    .map((el) => el.dataset.movement ?? el.dataset.effect);
+    .map((el) => el.dataset.movement ?? el.dataset.effect
+      ?? el.dataset.movementSummary ?? el.dataset.effectSummary);
 
 describe("edición: los controles muestran el video, no el sticky", () => {
   beforeEach(() => {
@@ -128,20 +130,20 @@ describe("edición: los controles muestran el video, no el sticky", () => {
   it("Movimiento: la tarjeta marcada es la del video (animado), no la del sticky (estatico)", () => {
     render(<Harness />);
     goStep(3);
-    expect(pressed("[data-movement]")).toEqual(["animado"]);
+    expect(pressed("[data-movement-summary]")).toEqual(["animado"]);
   });
 
   it("Efecto: la tarjeta marcada es la del video (snow), no la del sticky (rain)", () => {
     render(<Harness />);
     goStep(3);
-    expect(pressed("[data-effect]")).toEqual(["snow"]);
+    expect(pressed("[data-effect-summary]")).toEqual(["snow"]);
   });
 
   it("exactamente UNA tarjeta marcada por galería (no cero, no dos)", () => {
     render(<Harness />);
     goStep(3);
-    expect(pressed("[data-movement]")).toHaveLength(1);
-    expect(pressed("[data-effect]")).toHaveLength(1);
+    expect(pressed("[data-movement-summary]")).toHaveLength(1);
+    expect(pressed("[data-effect-summary]")).toHaveLength(1);
   });
 
   it.each([
@@ -156,7 +158,7 @@ describe("edición: los controles muestran el video, no el sticky", () => {
     // energía) y que sin normalizar no resaltan NINGUNA tarjeta.
     render(<Harness jobFields={{ ...JOB_FIELDS, movementStyle: normalizeMovementCode(raw) }} />);
     goStep(3);
-    expect(pressed("[data-movement]")).toEqual([expected]);
+    expect(pressed("[data-movement-summary]")).toEqual([expected]);
   });
 });
 
@@ -167,13 +169,14 @@ describe("chip EN EL VIDEO: marca el presente, no el cambio", () => {
   it("al abrir, la misma tarjeta lleva el check y el ancla", () => {
     render(<Harness />);
     goStep(3);
-    expect(pressed("[data-movement]")).toEqual(["animado"]);
-    expect(anchored("[data-movement]")).toEqual(["animado"]);
+    expect(pressed("[data-movement-summary]")).toEqual(["animado"]);
+    expect(anchored("[data-movement-summary]")).toEqual(["animado"]);
   });
 
   it("al cambiar de opción quedan DOS tarjetas marcadas: elegida y la del video", () => {
     render(<Harness />);
     goStep(3);
+    fireEvent.click(screen.getByTestId("movement-picker-toggle"));
     fireEvent.click(document.querySelector('[data-movement="estatico"]'));
     expect(pressed("[data-movement]")).toEqual(["estatico"]);   // lo que elegí
     expect(anchored("[data-movement]")).toEqual(["animado"]);   // lo que el video tiene
@@ -189,7 +192,7 @@ describe("chip EN EL VIDEO: marca el presente, no el cambio", () => {
       />,
     );
     goStep(3);
-    expect(anchored("[data-movement]")).toEqual([]);
+    expect(anchored("[data-movement-summary]")).toEqual([]);
   });
 });
 
@@ -200,6 +203,7 @@ describe("el sticky no se contamina editando", () => {
   it("clickear en modo edición NO reescribe genly:wizardBatchDefaultsV1", () => {
     render(<Harness />);
     goStep(3);
+    fireEvent.click(screen.getByTestId("movement-picker-toggle"));
     fireEvent.click(document.querySelector('[data-movement="sutil"]'));
     const after = JSON.parse(localStorage.getItem(STICKY_KEY));
     // Arreglar el fondo de un video no puede cambiar el default del próximo
@@ -222,6 +226,7 @@ describe("el sticky no se contamina editando", () => {
       />,
     );
     goStep(3);
+    fireEvent.click(screen.getByTestId("movement-picker-toggle"));
     fireEvent.click(document.querySelector('[data-movement="sutil"]'));
     expect(seen).toContainEqual(["movementStyle", "sutil"]);
   });
