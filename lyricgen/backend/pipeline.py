@@ -2634,17 +2634,14 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
 
     Cost: ~$0.006 per minute of audio (~$0.02 per song).
 
-    `lyrics_hint`: if provided, the FIRST ~200 tokens of this string are
-    used as Whisper's `prompt` parameter — orienting the model's
-    vocabulary toward the actual lyrics it should expect. This is the
-    documented Whisper-API mechanism for biasing transcription
-    (https://platform.openai.com/docs/guides/speech-to-text/prompting).
-    Significantly reduces hallucination loops on tracks where Whisper
-    otherwise drifts (e.g. confusing artist-name ad-libs for the lyric
-    line). Only the last 224 tokens are read by Whisper and only the
-    first ~30 s of audio benefits from it; on longer tracks the help is
-    most impactful at the song's start where the model establishes its
-    interpretation.
+    `lyrics_hint`: explicit experimental/rollback override. If provided,
+    the first ~200 tokens are sent through Whisper's `prompt` parameter.
+    This can correct vocabulary on some tracks, but the production corpus
+    showed a much larger opposite effect: long references can be repeated
+    instead of heard. The orchestrator therefore defaults to ASR-first
+    (`lyrics_hint=None`) and uses references after recognition for
+    word-level alignment. `WHISPER_REFERENCE_PROMPT_MODE` can restore a
+    120-char or legacy 800-char prompt without a deploy.
 
     Why whisper-1 and not gpt-4o-transcribe (better text quality):
         gpt-4o-transcribe and gpt-4o-mini-transcribe only return plain
@@ -2659,10 +2656,12 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
     client = OpenAI()  # picks up OPENAI_API_KEY from env
     logger.info("[WHISPER-API] transcribing %s via OpenAI (whisper-1)", os.path.basename(mp3_path))
 
-    # Build the initial prompt. When the caller has reference lyrics
-    # (typically from lrclib plain), we ship the first ~200 tokens of
-    # them so Whisper expects that vocabulary. Otherwise fall back to a
-    # generic "song lyrics" hint.
+    # Build the initial prompt. The orchestrator's default policy is ASR-first:
+    # it passes lyrics_hint=None and uses the reference only AFTER transcription
+    # for word-level alignment. A reference is still accepted here for explicit
+    # experiments / rollback, but it is not the production default: corpus A/B
+    # plus the "La Foto de tu cuerpo" regression showed that lyrics prompts can
+    # make Whisper parrot the reference instead of listening to the audio.
     if lyrics_hint and lyrics_hint.strip():
         # ~200 tokens ≈ 800 chars for Spanish/English. Whisper truncates
         # silently if longer; this just keeps logs cleaner.
@@ -2893,9 +2892,22 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         if (seg.no_speech_prob or 0) > 0.92:
             logger.info("[WHISPER-API] Filtered very-low-confidence: %s", text[:60])
             continue
+        # Segment timestamps from Whisper conventionally run until the next
+        # decoder boundary, often 1-6 s after the singer stopped. When word
+        # granularity is requested, the first/last word are the acoustically
+        # useful display bounds (and match ROTOR-style line timing closely).
+        # Keep the words too: the downstream plain-lyrics aligner re-buckets
+        # them into human line structure before `_emit_segments` strips the
+        # raw Whisper payload.
+        word_start = (
+            float(seg_words[0]["start"]) if seg_words else float(seg.start)
+        )
+        word_end = (
+            float(seg_words[-1]["end"]) if seg_words else float(seg.end)
+        )
         out_seg = {
-            "start": float(seg.start),
-            "end": float(seg.end),
+            "start": word_start,
+            "end": max(word_start, word_end),
             "text": text,
         }
         if return_words:
@@ -3258,6 +3270,90 @@ def _is_collapsed_transcription(segments: list[dict]) -> bool:
     return False
 
 
+def _initial_asr_lyrics_hint(reference: str | None) -> str | None:
+    """Return the reference text allowed into Whisper's *first* pass.
+
+    Default is deliberately ``None`` (ASR-first): listen to the audio with the
+    generic language prompt, then use curated lyrics for post-ASR alignment.
+    This prevents a wrong or merely long reference from becoming self-fulfilling
+    transcription output.
+
+    Rollout / diagnosis kill-switch:
+      - ``off`` (default): no reference in the initial prompt
+      - ``short``: first 120 chars (legacy WhisperX-inspired experiment)
+      - ``full``: pass the reference; the API adapter caps it at 800 chars
+    """
+    text = (reference or "").strip()
+    if not text:
+        return None
+    mode = os.environ.get("WHISPER_REFERENCE_PROMPT_MODE", "off").strip().lower()
+    if mode in ("full", "on", "1", "true", "yes"):
+        return text
+    if mode in ("short", "120"):
+        return text[:120]
+    return None
+
+
+def _plain_lyrics_aligner_enabled() -> bool:
+    """Whether curated plain lyrics are aligned to ASR word timestamps.
+
+    Default ON: this path is deterministic post-processing and, unlike an ASR
+    lyrics prompt, cannot make the recognizer hallucinate reference text. The
+    env var remains a kill-switch for rollout.
+    """
+    return os.environ.get(
+        "LRCLIB_PLAIN_ALIGNER_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
+
+def _anchored_recovery_is_safe(
+    plain: str,
+    anchors: list[tuple[int, float]],
+    recovered: list[dict],
+    *,
+    max_segment_s: float = 15.0,
+) -> tuple[bool, str]:
+    """Gate synthetic plain-lyrics timing before it can reach an operator.
+
+    Uniform/piecewise synthesis is only a last-resort approximation. It must not
+    turn two fuzzy matches into 31 allegedly-synchronised lines, as happened on
+    "La Foto de tu cuerpo". Require enough independent anchors and reject any
+    output that still contains a subtitle spanning an implausibly large region.
+    """
+    lines = _split_plain_lines(plain)
+    if not lines or not recovered:
+        return False, "empty reference/recovery"
+    import math as _math
+    min_anchors = max(4, int(_math.ceil(len(lines) * 0.20)))
+    if len(anchors) < min_anchors:
+        return False, (
+            f"insufficient anchors: {len(anchors)}/{len(lines)} "
+            f"(minimum={min_anchors})"
+        )
+    anchor_indices = sorted({int(a[0]) for a in anchors})
+    if len(anchor_indices) < min_anchors:
+        return False, (
+            f"insufficient unique anchors: {len(anchor_indices)}/{len(lines)} "
+            f"(minimum={min_anchors})"
+        )
+    # Anchors clustered in one verse cannot safely time the other half.
+    covered_span = anchor_indices[-1] - anchor_indices[0]
+    if len(lines) >= 8 and covered_span < max(3, int(len(lines) * 0.40)):
+        return False, (
+            f"anchor span too narrow: {covered_span}/{len(lines)} lines"
+        )
+    max_dur = max(
+        (float(s.get("end", 0)) - float(s.get("start", 0)) for s in recovered),
+        default=0.0,
+    )
+    if max_dur > max_segment_s:
+        return False, (
+            f"synthetic segment too long: {max_dur:.1f}s "
+            f"(maximum={max_segment_s:.1f}s)"
+        )
+    return True, "ok"
+
+
 def transcribe(mp3_path: str, language: str = None,
                lyrics_hint: str | None = None,
                job_id: str | None = None,
@@ -3298,25 +3394,54 @@ def transcribe(mp3_path: str, language: str = None,
         else:
             # Default: single full-file pass first (best TEXT — avoids the
             # chunk-boundary mishears VAD introduces), then fall back to VAD
-            # chunking ONLY if single-pass collapsed. The fallback is accepted
-            # only when it un-collapses AND adds structure, so a track where
-            # VAD ALSO fails (e.g. fast rap) stays on single-pass rather than
-            # getting worse.
+            # chunking only when the result fails either the conservative local
+            # shape gate OR the duration-aware global hallucination gate. The
+            # old local gate only caught <=2 segments / >45 s mega-segments, so
+            # 6-10 segment prompt loops bypassed VAD and were discovered too
+            # late by the orchestrator.
             segs = _transcribe_via_openai_api(
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
             )
-            if _is_collapsed_transcription(segs):
+            audio_dur = None
+            duration_bad = False
+            duration_reason = ""
+            try:
+                audio_dur = _audio_duration(mp3_path)
+                duration_bad, duration_reason = _detect_hallucination(
+                    segs, audio_dur, language=language,
+                )
+            except Exception:
+                # The original structural gate remains available even when
+                # ffprobe/audio-duration probing fails.
+                pass
+            single_bad = _is_collapsed_transcription(segs) or duration_bad
+            if single_bad:
                 _max = max((float(s["end"]) - float(s["start"]) for s in segs), default=0.0)
                 logger.warning(
-                    "[transcribe] single-pass collapsed (%d seg, max %.0fs); "
-                    "retrying with VAD chunking", len(segs), _max,
+                    "[transcribe] single-pass collapsed (%d seg, max %.0fs, %s); "
+                    "retrying with reference-free VAD chunking",
+                    len(segs), _max, duration_reason or "structural gate",
                 )
+                # Never carry a suspect reference prompt into the rescue pass.
+                # A second segmentation of the same poisoned prompt is not an
+                # independent recovery attempt.
                 vad_segs = _vad_chunk_transcribe(
-                    mp3_path, language=language, lyrics_hint=lyrics_hint,
+                    mp3_path, language=language, lyrics_hint=None,
                     job_id=job_id, return_words=return_words,
                 )
-                if not _is_collapsed_transcription(vad_segs) and len(vad_segs) > len(segs):
+                vad_duration_bad = False
+                try:
+                    vad_duration_bad, _ = _detect_hallucination(
+                        vad_segs, audio_dur, language=language,
+                    )
+                except Exception:
+                    pass
+                if (
+                    not _is_collapsed_transcription(vad_segs)
+                    and not vad_duration_bad
+                    and len(vad_segs) > len(segs)
+                ):
                     logger.info("[transcribe] VAD fallback accepted (%d → %d seg)",
                                 len(segs), len(vad_segs))
                     segs = vad_segs
@@ -3928,6 +4053,167 @@ def _try_lrclib_search(artist: str, song: str) -> list:
                 _t.sleep(1.5)
     logger.warning("[LYRICS] lrclib /search failed (best-effort, falling back): %s", last_err)
     return []
+
+
+def _try_lrclib_title_search(song: str) -> list:
+    """Broad LRCLIB search used only *after* audio-first ASR.
+
+    Metadata exported in filenames is often truncated (``Rodrig`` instead of
+    ``Rodrigo Romero``), so an artist+title query can miss an otherwise exact
+    record. A title-only search is unsafe before listening — common titles have
+    unrelated songs — therefore this helper merely returns candidates. The
+    caller must validate them against the transcribed audio.
+    """
+    song = (song or "").strip()
+    if len(song) < 4:
+        return []
+    import requests as _req
+    try:
+        r = _req.get(
+            "https://lrclib.net/api/search",
+            params={"q": song},
+            timeout=8.0,
+            headers={"User-Agent": "GenLyAI/1.0 (+https://app.genly.pro)"},
+        )
+        if r.status_code != 200:
+            logger.warning(
+                "[LYRICS] lrclib title-only /search %s for q=%r",
+                r.status_code, song,
+            )
+            return []
+        data = r.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.warning(
+            "[LYRICS] lrclib title-only /search failed (best-effort): %s", e,
+        )
+        return []
+
+
+def _fetch_lrclib_by_audio_evidence(
+    artist: str,
+    song: str,
+    segments: list[dict],
+    audio_duration: float | None,
+) -> dict | None:
+    """Recover a plain-lyrics reference after a metadata miss.
+
+    Unlike the historical duration-only fuzzy lookup, acceptance requires three
+    independent signals:
+
+      1. candidate title resembles the requested title,
+      2. candidate duration resembles this upload,
+      3. candidate lyrics resemble the *reference-free ASR text*.
+
+    The third signal is the safety boundary: a same-title song by another artist
+    cannot become a self-fulfilling forced alignment unless the audio already
+    contains substantially the same words.
+    """
+    if not song or not segments:
+        return None
+
+    import difflib as _difflib
+    import re as _re
+
+    def _norm_text(value: str) -> str:
+        folded = _strip_accents((value or "").lower())
+        return " ".join(_re.findall(r"[a-z0-9ñ]+", folded))
+
+    asr_tokens = _norm_text(
+        " ".join((s.get("text") or "") for s in segments)
+    ).split()
+    if len(asr_tokens) < 40:
+        return None
+    unique_ratio = len(set(asr_tokens)) / max(1, len(asr_tokens))
+    # Prompt loops / ad-lib hallucinations are not admissible audio evidence.
+    if unique_ratio < 0.15:
+        return None
+
+    requested_title = _norm_text(_strip_song_noise(song))
+    requested_artist = _norm_text(artist)
+    best: tuple[float, dict, dict] | None = None
+
+    for candidate in _try_lrclib_title_search(song):
+        if not isinstance(candidate, dict):
+            continue
+        parsed = _parse_lrclib_record(candidate)
+        if not parsed or not parsed.get("plain"):
+            continue
+
+        candidate_title = _norm_text(candidate.get("trackName") or "")
+        title_ratio = _difflib.SequenceMatcher(
+            None, requested_title, candidate_title,
+        ).ratio()
+        if title_ratio < 0.78:
+            continue
+
+        candidate_duration = candidate.get("duration")
+        duration_score = 0.0
+        if audio_duration and candidate_duration:
+            try:
+                delta = abs(float(audio_duration) - float(candidate_duration))
+            except (TypeError, ValueError):
+                delta = 999.0
+            if delta > 20.0:
+                continue
+            duration_score = 1.0 if delta <= 5.0 else max(0.0, 1.0 - delta / 20.0)
+
+        ref_tokens = _norm_text(parsed.get("plain") or "").split()
+        if len(ref_tokens) < 20:
+            continue
+        seq_ratio = _difflib.SequenceMatcher(
+            None, asr_tokens, ref_tokens, autojunk=False,
+        ).ratio()
+        asr_set, ref_set = set(asr_tokens), set(ref_tokens)
+        token_jaccard = len(asr_set & ref_set) / max(1, len(asr_set | ref_set))
+        # Repeated verses/choruses may appear in a different written order
+        # across lyric sources, depressing global sequence similarity even when
+        # the actual vocabulary overlap is overwhelming. Keep Jaccard as the
+        # strong wrong-song guard and allow moderate sequence reordering.
+        if seq_ratio < 0.45 or token_jaccard < 0.50:
+            continue
+
+        candidate_artist = _norm_text(candidate.get("artistName") or "")
+        artist_score = 0.0
+        if requested_artist and candidate_artist:
+            if requested_artist == candidate_artist:
+                artist_score = 1.0
+            elif (
+                requested_artist in candidate_artist
+                or candidate_artist in requested_artist
+            ):
+                artist_score = 0.8
+            else:
+                artist_score = _difflib.SequenceMatcher(
+                    None, requested_artist, candidate_artist,
+                ).ratio()
+
+        score = (
+            title_ratio * 0.25
+            + duration_score * 0.20
+            + seq_ratio * 0.30
+            + token_jaccard * 0.20
+            + artist_score * 0.05
+        )
+        if score < 0.72:
+            continue
+        if best is None or score > best[0]:
+            best = (score, parsed, candidate)
+
+    if best is None:
+        return None
+    score, parsed, raw = best
+    result = dict(parsed)
+    result["_audio_evidence_score"] = round(score, 4)
+    result["_matched_artist"] = raw.get("artistName")
+    result["_matched_title"] = raw.get("trackName")
+    logger.info(
+        "[LYRICS] audio-evidence LRCLIB recovery accepted %r - %r "
+        "(score=%.3f, requested=%r - %r)",
+        result.get("_matched_artist"), result.get("_matched_title"), score,
+        artist, song,
+    )
+    return result
 
 
 def _pick_best_lrclib_candidate(candidates: list, artist: str,

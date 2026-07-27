@@ -22,7 +22,9 @@ ADLIB_MIN_REPEATS: int = 5      # _is_single_word_loop min_repeats for SPLIT pat
 LONG_LINE_MIN_WORDS: int = 7    # canonical word count that triggers gap-split
 LONG_LINE_MIN_DUR: float = 3.0  # segment must also be this long (s)
 LONG_LINE_GAP_THRESH: float = 0.7  # internal word-to-word silence (s) → split
-STRETCH_GAP_THRESH: float = 1.5   # gap to next segment (s) that triggers end-trim
+# Deprecated compatibility constant. Positive gaps no longer trigger any
+# extension/trim; word timestamps determine phrase ends.
+STRETCH_GAP_THRESH: float = 1.5
 STRETCH_MARGIN: float = 0.08      # leave this gap before next segment after trim
 
 
@@ -266,22 +268,58 @@ def post_reconcile_cleanup(segments: list[dict]) -> list[dict]:
 
         out.append(seg)
 
-    # Pass 3: end-time stretch trimmer.
-    # Whisper often extends seg.end to the next voice onset (3–6 s past actual
-    # end of phrase). When the gap to the next segment exceeds STRETCH_GAP_THRESH
-    # we trim seg.end to next_start - STRETCH_MARGIN.
+    # Pass 3: tighten display ends to the last acoustically timestamped word.
+    #
+    # The previous implementation detected a positive silence gap and then set
+    # ``end = next_start - margin``. That does the opposite of trimming: a line
+    # ending at 84 s followed by the next vocal at 127 s was extended across the
+    # instrumental break. "La Foto de tu cuerpo" exposed outputs lasting up to
+    # 37 s on the raw path because of this.
+    #
+    # Word timestamps are the only positive evidence of where the phrase ends.
+    # Tighten to the last word when Whisper's segment boundary trails it. With
+    # no words, preserve the original end; never invent a hold through silence.
+    # Independently clamp true overlaps so one line cannot run into the next.
     out2: list[dict] = []
     for i, seg in enumerate(out):
-        if i + 1 < len(out):
-            next_start = float(out[i + 1].get("start", seg.get("end", 0)))
-            gap = next_start - float(seg.get("end", 0))
-            if gap > STRETCH_GAP_THRESH:
-                trimmed_end = round(next_start - STRETCH_MARGIN, 3)
-                if trimmed_end > float(seg.get("start", 0)):
+        seg = dict(seg)
+        try:
+            seg_start = float(seg.get("start", 0))
+            seg_end = float(seg.get("end", seg_start))
+            words = seg.get("words") or []
+            valid_word_ends = []
+            for word in words:
+                try:
+                    word_end = float(word.get("end"))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if seg_start <= word_end <= seg_end:
+                    valid_word_ends.append(word_end)
+            if valid_word_ends:
+                last_word_end = max(valid_word_ends)
+                if last_word_end < seg_end:
                     logger.info(
-                        "[POST_RECONCILE] stretch trim: %.3f→%.3f (gap %.1fs) %r…",
-                        seg["end"], trimmed_end, gap, (seg.get("text") or "")[:30],
+                        "[POST_RECONCILE] word-end tighten: %.3f→%.3f %r…",
+                        seg_end, last_word_end, (seg.get("text") or "")[:30],
                     )
-                    seg = {**seg, "end": trimmed_end}
+                    seg["end"] = last_word_end
+                    seg_end = last_word_end
+        except (TypeError, ValueError):
+            pass
+        if i + 1 < len(out):
+            try:
+                next_start = float(out[i + 1].get("start", seg.get("end", 0)))
+                current_end = float(seg.get("end", 0))
+                if current_end >= next_start:
+                    trimmed_end = round(next_start - STRETCH_MARGIN, 3)
+                    if trimmed_end > float(seg.get("start", 0)):
+                        logger.info(
+                            "[POST_RECONCILE] overlap trim: %.3f→%.3f %r…",
+                            current_end, trimmed_end,
+                            (seg.get("text") or "")[:30],
+                        )
+                        seg["end"] = trimmed_end
+            except (TypeError, ValueError):
+                pass
         out2.append(seg)
     return out2
