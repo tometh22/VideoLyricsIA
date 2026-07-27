@@ -4,11 +4,11 @@ The render burns lyrics with libass in ONE ffmpeg pass (see pipeline.py
 `_render_lyrics_ass`). This module builds the video filter for that pass,
 optionally adding two layers BEFORE the subtitles burn:
 
-  1. EFFECT overlay (snow / rain / stars / bokeh / light / ...): a pre-baked,
-     seamless, black-background RGB loop at assets/fx/<effect>.mp4 (built once
-     by scripts/gen_fx_loops.py), composited with `blend=all_mode=screen`.
-     Effects are ADDITIVE (light-emitting), so screen-blend over black needs no
-     alpha channel — plain H.264, fast to decode.
+  1. EFFECT layer (snow / liquid glass / shadows / beat ripples / ...): a
+     pre-baked seamless RGB loop at assets/fx/<effect>.mp4 (built once by
+     scripts/gen_fx_loops.py). Luminous loops are screen-blended over black;
+     shadow/ink treatments are multiplied over white. Neither needs an alpha
+     codec, so plain H.264 stays fast to decode.
 
      CRITICAL: the blend MUST run in RGB (`format=gbrp`). In YUV, `blend=screen`
      operates on the chroma (U/V) planes and tints the whole frame magenta.
@@ -24,8 +24,11 @@ This module is intentionally a leaf (no pipeline import) so it stays unit-
 testable without moviepy/ffmpeg. The caller (pipeline) splices the returned
 filter + extra inputs into its ffmpeg command.
 """
+from __future__ import annotations
+
 import logging
 import os
+from functools import lru_cache
 
 logger = logging.getLogger("genly.fx_compositor")
 
@@ -64,7 +67,126 @@ EFFECTS = (
     "scanlines",
     "fog",
     "shapes",
+    # Motion Lab — effects designed specifically to give fixed photos a
+    # distinct visual language (rather than another particle colourway).
+    "liquid_glass",
+    "caustics",
+    "rgb_glitch",
+    "neon_edge",
+    "shadow_play",
+    "kaleido",
+    "halftone",
+    "ink_reveal",
+    "heatwave",
+    "chromatic_pulse",
+    "cutout_echo",
+    "projector",
+    # Audio-reactive pack. The baked loops are authored at 120 BPM and their
+    # PTS is tempo-matched to the detected song BPM at render time.
+    "bass_pulse",
+    "beat_flash",
+    "chromatic_hit",
+    "beat_ripple",
+    "echo_hit",
 )
+
+REACTIVE_EFFECTS = (
+    "bass_pulse",
+    "beat_flash",
+    "chromatic_hit",
+    "beat_ripple",
+    "echo_hit",
+)
+
+# Most loops emit light over black and therefore use screen. These three are
+# deliberately authored as dark ink/shadow over white, so multiply gives fixed
+# photos motion without washing their highlights.
+_FX_BLEND = {
+    "shadow_play": "multiply",
+    "halftone": "multiply",
+    "ink_reveal": "multiply",
+}
+
+# Keep the more graphic treatments editorial rather than overpowering lyrics.
+_FX_OPACITY = {
+    "rgb_glitch": 0.72,
+    "neon_edge": 0.74,
+    "shadow_play": 0.58,
+    "kaleido": 0.68,
+    "halftone": 0.46,
+    "ink_reveal": 0.56,
+    "heatwave": 0.62,
+    "cutout_echo": 0.62,
+    "projector": 0.72,
+    "beat_flash": 0.68,
+    "chromatic_hit": 0.72,
+}
+
+
+def effect_blend(effect: str) -> str:
+    """ffmpeg/CSS-compatible blend mode for an effect."""
+    return _FX_BLEND.get((effect or "").strip().lower(), "screen")
+
+
+def effect_opacity(effect: str) -> float:
+    """Editorial strength of the effect layer in [0, 1]."""
+    return _FX_OPACITY.get((effect or "").strip().lower(), 1.0)
+
+
+def is_reactive_effect(effect: str) -> bool:
+    return (effect or "").strip().lower() in REACTIVE_EFFECTS
+
+
+@lru_cache(maxsize=32)
+def _detect_tempo_cached(audio_path: str, mtime_ns: int) -> float:
+    """Detect tempo once per source file; failures keep a musical 120 BPM."""
+    del mtime_ns  # part of the cache key so replacing a file invalidates it
+    try:
+        import beat_snap
+        result = beat_snap.detect_beats(audio_path)
+        if result:
+            bpm = float(result[0])
+            if 45.0 <= bpm <= 220.0:
+                return bpm
+    except Exception as exc:  # pragma: no cover - beat_snap is already defensive
+        logger.warning("[FX] beat detection failed (%s); using 120 BPM", exc)
+    return 120.0
+
+
+def detect_effect_tempo(effect: str, audio_path: str) -> float | None:
+    """BPM for a reactive effect, otherwise None.
+
+    Tempo matching is intentionally independent from BEAT_SNAP_ENABLED: that
+    flag controls lyric timestamp correction, while choosing a reactive visual
+    explicitly opts into beat analysis.
+    """
+    if not is_reactive_effect(effect) or not audio_path:
+        return None
+    try:
+        mtime_ns = os.stat(audio_path).st_mtime_ns
+    except OSError:
+        return 120.0
+    bpm = _detect_tempo_cached(os.path.abspath(audio_path), mtime_ns)
+    logger.info("[FX] reactive effect '%s' tempo-matched at %.1f BPM", effect, bpm)
+    return bpm
+
+
+def effect_setpts(effect: str, beat_bpm: float | None = None) -> str:
+    """PTS step for an authored loop.
+
+    Reactive assets contain one hit every 0.5 s (120 BPM). Scaling their PTS by
+    120/song_BPM makes the hits recur at the detected beat interval.
+    Non-reactive effects retain the historical timing exactly.
+    """
+    if not is_reactive_effect(effect):
+        return "setpts=PTS-STARTPTS"
+    try:
+        bpm = float(beat_bpm or 120.0)
+    except (TypeError, ValueError):
+        bpm = 120.0
+    bpm = min(220.0, max(45.0, bpm))
+    factor = 120.0 / bpm
+    return f"setpts=(PTS-STARTPTS)*{factor:.6f}"
 
 # palette code → ffmpeg `eq` grade. "" / "auto" / unknown → no grade
 # (scene-natural). Mirrors the frontend STYLES codes used elsewhere.
@@ -156,14 +278,17 @@ _FX_GAIN = {
     "scanlines": "curves=all='0/0 0.05/0.025 0.18/0.52 0.5/0.9 1/1'",
     "fog": "curves=all='0/0 0.06/0.025 0.20/0.62 0.5/0.95 1/1'",
     "shapes": "curves=all='0/0 0.08/0.025 0.28/0.72 0.60/1 1/1'",
+    # The source uses large deterministic leaf-like masks. Blur at composite
+    # resolution turns their hard procedural edges into natural soft shadows.
+    "shadow_play": "gblur=sigma=16",
 }
 
 
 def fx_gain(effect: str) -> str:
-    """ffmpeg `eq` to pre-amplify a dim effect before screen-blend, or ''.
+    """ffmpeg pre-filter for an effect before blend, or ''.
 
-    Goes BEFORE `format=gbrp` in the fx chain (eq runs on the clip's native
-    YUV); empty string for effects that are already bright enough."""
+    Usually a gain curve; some treatments use a blur. Goes BEFORE
+    `format=gbrp` in the fx chain; empty for effects that need no treatment."""
     return _FX_GAIN.get((effect or "").strip().lower(), "")
 
 
@@ -278,7 +403,8 @@ def _escape_filter_path(p: str) -> str:
 
 def build_video_filter(*, ass_basename: str | None, font_dir: str, width: int,
                        height: int, effect: str = "", style: str = "",
-                       custom_colors: str = ""):
+                       custom_colors: str = "",
+                       beat_bpm: float | None = None):
     """Build the video filter for the single-pass libass render.
 
     Returns (filter_str, use_complex, extra_inputs):
@@ -311,10 +437,14 @@ def build_video_filter(*, ass_basename: str | None, font_dir: str, width: int,
     subs_step = subs if subs else "null"
     gain = fx_gain(effect)
     gain_step = f"{gain}," if gain else ""  # before format=gbrp (eq on native YUV)
+    timing = effect_setpts(effect, beat_bpm)
+    blend = effect_blend(effect)
+    opacity = effect_opacity(effect)
+    opacity_step = f":all_opacity={opacity:.2f}" if opacity < 1.0 else ""
     fc = (
         f"[0:v]format=gbrp[bg];"
-        f"[2:v]scale={width}:{height},setpts=PTS-STARTPTS,{gain_step}format=gbrp[fx];"
-        f"[bg][fx]blend=all_mode=screen:shortest=1[bl];"
+        f"[2:v]scale={width}:{height},{timing},{gain_step}format=gbrp[fx];"
+        f"[bg][fx]blend=all_mode={blend}{opacity_step}:shortest=1[bl];"
         f"[bl]{grade_step}format=yuv420p[gr];"
         f"[gr]{subs_step}[out]"
     )

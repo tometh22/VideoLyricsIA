@@ -185,12 +185,15 @@ describe("selector compacto de efectos", () => {
     goStep(3);
     fireEvent.click(screen.getByTestId("effect-picker-toggle"));
 
-    expect(document.querySelectorAll("[data-effect]")).toHaveLength(16);
+    expect(document.querySelectorAll("[data-effect]")).toHaveLength(33);
     fireEvent.click(document.querySelector('[data-effect-category="stylized"]'));
 
     const visible = [...document.querySelectorAll("[data-effect]")]
       .map((button) => button.dataset.effect);
-    expect(visible).toEqual(["prism", "film", "scanlines", "shapes"]);
+    expect(visible).toEqual([
+      "prism", "film", "scanlines", "shapes", "rgb_glitch", "neon_edge",
+      "kaleido", "halftone", "ink_reveal", "chromatic_pulse", "cutout_echo",
+    ]);
     expect(visible).not.toContain("none");
     expect(document.querySelector('[data-effect-category="stylized"]')
       .getAttribute("aria-pressed")).toBe("true");
@@ -254,7 +257,7 @@ describe("E2E del Motion Composer", () => {
     expect(screen.getByTestId("effect-picker-panel")).toBeTruthy();
     const cards = [...document.querySelectorAll("[data-effect]")]
       .filter((card) => card.dataset.effect !== "none");
-    expect(cards).toHaveLength(15);
+    expect(cards).toHaveLength(32);
     for (const card of cards) {
       expect(card.querySelector("img")?.getAttribute("src"))
         .toBe(`/fx_samples/${card.dataset.effect}.jpg`);
