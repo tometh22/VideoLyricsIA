@@ -10263,7 +10263,11 @@ def _darken_prompt_for_effect(prompt: str, effect: str) -> str:
     No-op for effect="" / "none" / unknown.
     """
     import fx_compositor as _fxc
-    if not effect or effect.strip().lower() not in _fxc.EFFECTS:
+    if (
+        not effect
+        or effect.strip().lower() not in _fxc.EFFECTS
+        or _fxc.effect_blend(effect) != "screen"
+    ):
         return prompt
     return (
         prompt.rstrip()
@@ -13006,11 +13010,23 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
                 "-stream_loop", "-1", "-i", os.path.abspath(fx_path),
                 "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(fg_path),
             ]
+            _fx_tempo = _fx.detect_effect_tempo(effect, mp3_path)
+            _fx_timing = _fx.effect_setpts(effect, _fx_tempo)
+            _fx_blend = _fx.effect_blend(effect)
+            # Art tracks intentionally stay subtler than lyric-video effects:
+            # the cover card and waveform are the hierarchy. Preserve the
+            # established 0.45 ceiling for legacy loops too.
+            _fx_opacity = min(0.45, _fx.effect_opacity(effect))
+            _fx_treatment = (
+                "eq=saturation=0.70:brightness=-0.04,gblur=sigma=6,"
+                if _fx_blend == "screen" else
+                "gblur=sigma=4,"
+            )
             fc = (
-                f"[3:v]scale={spec.width}:{spec.height},setpts=PTS-STARTPTS,"
-                f"eq=saturation=0.70:brightness=-0.04,gblur=sigma=6,format=gbrp[fx];"
+                f"[3:v]scale={spec.width}:{spec.height},{_fx_timing},"
+                f"{_fx_treatment}format=gbrp[fx];"
                 f"[0:v]format=gbrp[bg0];"
-                f"[bg0][fx]blend=all_mode=screen:all_opacity=0.45,"
+                f"[bg0][fx]blend=all_mode={_fx_blend}:all_opacity={_fx_opacity:.2f},"
                 f"format={spec.pix_fmt}[bgfx];"
                 f"[bgfx][4:v]overlay=0:0[withcard];"
                 f"[withcard][1:v]overlay={L['wave_x']}:{L['wave_y']}:eof_action=repeat,"
@@ -14287,6 +14303,7 @@ def _render_lyrics_ass(
         ass_basename=("lyrics.ass" if render_text else None), font_dir=font_dir,
         width=spec.width, height=spec.height,
         effect=effect, style=style, custom_colors=custom_colors,
+        beat_bpm=_fx.detect_effect_tempo(effect, mp3_path),
     )
     _filter_args = (
         ["-filter_complex", vfilter, "-map", "[out]", "-map", "1:a"]
@@ -14794,8 +14811,11 @@ def generate_lyric_video(
         _fx_path = _fx.effect_path(effect)
         if _fx_path:
             from moviepy.editor import VideoFileClip as _VFC, vfx as _vfx
-            _fx_clip = (_cover_resize(_VFC(_fx_path), spec.width, spec.height)
-                        .fx(_vfx.loop, duration=duration)
+            _fx_source = _cover_resize(_VFC(_fx_path), spec.width, spec.height)
+            _fx_bpm = _fx.detect_effect_tempo(effect, mp3_path)
+            if _fx_bpm:
+                _fx_source = _fx_source.fx(_vfx.speedx, factor=_fx_bpm / 120.0)
+            _fx_clip = (_fx_source.fx(_vfx.loop, duration=duration)
                         .set_duration(duration))
     except Exception as _e:
         logger.warning("[FX] moviepy effect skipped (%s); continuing", _e)
@@ -14812,7 +14832,12 @@ def generate_lyric_video(
             b = _base_src.get_frame(t).astype(_np.float32)
             if _fx_src is not None:
                 f = _fx_src.get_frame(t).astype(_np.float32)
-                b = 255.0 - (255.0 - b) * (255.0 - f) / 255.0  # screen
+                if _fx.effect_blend(effect) == "multiply":
+                    mixed = b * f / 255.0
+                else:
+                    mixed = 255.0 - (255.0 - b) * (255.0 - f) / 255.0
+                opacity = _fx.effect_opacity(effect)
+                b = b * (1.0 - opacity) + mixed * opacity
             return _fx.grade_frame(b, _grade_style, custom_colors).clip(0, 255).astype("uint8")
 
         base = VideoClip(_fx_base_frame, duration=duration).set_fps(spec.fps)
@@ -15054,30 +15079,37 @@ def _make_short_text_clip(text: str, seg_start: float, seg_end: float, font: str
     return [shadow, txt]
 
 
-def _apply_short_effect(short_path: str, fx_path: str, fps: float, job_dir: str) -> str:
-    """Screen-blend a looped fx overlay onto a finished short via ffmpeg.
+def _apply_short_effect(short_path: str, fx_path: str, fps: float, job_dir: str,
+                        beat_bpm: float | None = None) -> str:
+    """Blend a looped fx layer onto a finished short via ffmpeg.
 
-    The short is moviepy-rendered and moviepy can't screen-blend, so the
+    The short is moviepy-rendered and moviepy can't reproduce these blend
+    modes efficiently, so the
     effect is applied as a C-level ffmpeg post-pass using the SAME pre-baked
     fx assets the main video composites (fx_compositor). Falls back to the
     un-effected short if ffmpeg fails."""
     tmp = os.path.join(job_dir, "short_fx.mp4")
     # Same per-effect pre-blend gain as the main libass path (fx_compositor),
     # so a dim effect (stars/bokeh/snow) reads the same in the short as in the
-    # video. Derive the effect name from the asset filename. eq goes before
-    # format=gbrp (runs on the clip's native YUV).
+    # video. Derive the effect name from the asset filename. The pre-filter
+    # runs before format=gbrp on the clip's native YUV.
     import fx_compositor as _fx
     _eff = os.path.splitext(os.path.basename(fx_path))[0]
     _gain = _fx.fx_gain(_eff)
     _gain_step = f"{_gain}," if _gain else ""
+    _timing = _fx.effect_setpts(_eff, beat_bpm)
+    _blend = _fx.effect_blend(_eff)
+    _opacity = _fx.effect_opacity(_eff)
+    _opacity_step = f":all_opacity={_opacity:.2f}" if _opacity < 1.0 else ""
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", os.path.abspath(short_path),
         "-stream_loop", "-1", "-i", os.path.abspath(fx_path),
         "-filter_complex",
         "[0:v]format=gbrp[b];"
-        f"[1:v]scale=1080:1920,setpts=PTS-STARTPTS,{_gain_step}format=gbrp[f];"
-        "[b][f]blend=all_mode=screen:shortest=1,format=yuv420p[o]",
+        f"[1:v]scale=1080:1920,{_timing},{_gain_step}format=gbrp[f];"
+        f"[b][f]blend=all_mode={_blend}{_opacity_step}:shortest=1,"
+        "format=yuv420p[o]",
         "-map", "[o]", "-map", "0:a?",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-c:a", "copy", "-movflags", "+faststart", "-shortest",
@@ -15498,7 +15530,10 @@ def generate_short(
     # composites. moviepy can't screen-blend, so it's a post-pass.
     fx = _fx.effect_path(effect)
     if fx:
-        out_path = _apply_short_effect(out_path, fx, fps, job_dir)
+        out_path = _apply_short_effect(
+            out_path, fx, fps, job_dir,
+            beat_bpm=_fx.detect_effect_tempo(effect, mp3_path),
+        )
 
     return out_path
 

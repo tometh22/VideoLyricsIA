@@ -37,6 +37,21 @@ const MOVE_ANIM = {
   animado:        "wlp-anim 1.8s linear infinite",
 };
 
+const MULTIPLY_EFFECTS = new Set(["shadow_play", "halftone", "ink_reveal"]);
+const EFFECT_OPACITY = {
+  rgb_glitch: 0.72,
+  neon_edge: 0.74,
+  shadow_play: 0.58,
+  kaleido: 0.68,
+  halftone: 0.46,
+  ink_reveal: 0.56,
+  heatwave: 0.62,
+  cutout_echo: 0.62,
+  projector: 0.72,
+  beat_flash: 0.68,
+  chromatic_hit: 0.72,
+};
+
 // Typography + case transform now come from the shared ./fontCatalog so the
 // preview can't drift from the picker. The inline copy here used to omit
 // fredoka/quicksand/nunito, so those three fell through FONT_BY_CODE[font]
@@ -520,7 +535,8 @@ export default function WizardLivePreview({
           src={`/fx_raw/${effect}.mp4`}
           className="absolute inset-0 w-full h-full object-cover pointer-events-none"
           style={{
-            mixBlendMode: "screen",
+            mixBlendMode: MULTIPLY_EFFECTS.has(effect) ? "multiply" : "screen",
+            opacity: EFFECT_OPACITY[effect] ?? 1,
             // Mirror the backend _FX_GAIN perceptually. The raw loops are
             // screen-blended; mid-tone particles (esp. bokeh ~0.28 luma) wash
             // out on bright/candle-lit scenes with no gain, so the preview
@@ -543,6 +559,23 @@ export default function WizardLivePreview({
               scanlines: "brightness(1.25) saturate(1.2)",
               fog: "brightness(1.25)",
               shapes: "brightness(1.2) saturate(1.15)",
+              liquid_glass: "brightness(1.2) saturate(1.15)",
+              caustics: "brightness(1.2) saturate(1.2)",
+              rgb_glitch: "brightness(1.2) saturate(1.35)",
+              neon_edge: "brightness(1.25) saturate(1.3)",
+              shadow_play: "blur(3px)",
+              kaleido: "brightness(1.2) saturate(1.35)",
+              halftone: "contrast(1.15)",
+              ink_reveal: "contrast(1.08) sepia(0.08)",
+              heatwave: "brightness(1.15) saturate(1.25)",
+              chromatic_pulse: "brightness(1.2) saturate(1.35)",
+              cutout_echo: "brightness(1.15) saturate(1.35)",
+              projector: "brightness(1.2) sepia(0.18)",
+              bass_pulse: "brightness(1.25) saturate(1.3)",
+              beat_flash: "brightness(1.15)",
+              chromatic_hit: "brightness(1.25) saturate(1.4)",
+              beat_ripple: "brightness(1.25) saturate(1.3)",
+              echo_hit: "brightness(1.2) saturate(1.35)",
             }[effect] || "none",
           }}
           autoPlay loop muted playsInline

@@ -5,9 +5,10 @@ frame-loop the libass migration killed (ass_render.py). So we bake short,
 seamless, deterministic loops ONCE here, and the render only DECODES + blends
 them (fast, C-level ffmpeg).
 
-WHY "RGB on black" instead of alpha: these effects are ADDITIVE (light-emitting
-particles). Composited with ffmpeg `blend=all_mode=screen`, pure black reads as
-transparent — no alpha codec (VP9-alpha / ProRes4444) needed. Plain H.264.
+WHY plain RGB instead of alpha: luminous effects are authored on black and
+screen-blended; shadow/ink/halftone are authored on white and multiplied.
+Their neutral background reads as transparent in either blend mode, so no
+alpha codec (VP9-alpha / ProRes4444) is needed. Plain H.264 stays fast.
 
 SEAMLESS by construction: every motion is parametrized as
 `phase = (base + (t/DUR) * k) % 1` with INTEGER k (full cycles over the loop),
@@ -16,7 +17,8 @@ so frame(0) == frame(DUR). No palindrome (which would make snow fall upward).
 Run from lyricgen/backend:
   ./venv/bin/python scripts/gen_fx_loops.py              # all effects
   ./venv/bin/python scripts/gen_fx_loops.py snow rain    # subset
-Outputs to lyricgen/assets/fx/<effect>.mp4 (1920x1080, 24fps, ~8s, H.264).
+Outputs to backend/assets/fx/<effect>.mp4 (normally 1920x1080, 24fps, ~8s,
+H.264; dense resolution-independent patterns may use a smaller bake).
 No API keys needed — pure procedural.
 """
 import math
@@ -38,6 +40,10 @@ except ModuleNotFoundError:  # Local tooling may already have MoviePy 2.x.
 W, H = 1920, 1080
 FPS = 24
 DUR = 8.0
+# Dense halftone geometry is resolution-independent and is always scaled by
+# the compositor. Baking it at half resolution avoids a ~21 MB high-frequency
+# H.264 asset with no visible benefit in the final 1080p render.
+EFFECT_SIZE = {"halftone": (960, 540)}
 # Write into the backend package (lyricgen/backend/assets/fx) so the loops ship
 # inside the Docker build context — matches fx_compositor._FX_DIR. (Moved here
 # 2026-06-04 from the repo-level lyricgen/assets/fx, which was outside the
@@ -594,12 +600,324 @@ def _shapes():
     return make
 
 
+def _liquid_glass():
+    """Travelling glass ribbons and specular highlights."""
+    y, x = np.mgrid[0:H, 0:W]
+    xn = x.astype(np.float32) / W
+    yn = y.astype(np.float32) / H
+
+    def make(t):
+        f = _frac(t)
+        frame = np.zeros((H, W, 3), np.float32)
+        for i, color in enumerate(((38, 65, 92), (75, 38, 92), (28, 88, 86))):
+            center = (0.12 + i * 0.34 + f * (i + 1)) % 1.35 - 0.16
+            warped = xn + 0.075 * np.sin(math.tau * (yn * (1.25 + i * .2) + f))
+            ribbon = np.exp(-((warped - center) / (0.045 + i * .012)) ** 2)
+            edge = np.exp(-((np.abs(warped - center) - .055) / .012) ** 2)
+            frame += (ribbon * .35 + edge)[..., None] * np.array(color, np.float32)
+        return np.clip(frame, 0, 255).astype(np.uint8)
+    return make
+
+
+def _caustics():
+    """Water-caustic light web, animated in two directions."""
+    y, x = np.mgrid[0:H, 0:W]
+    xn = x.astype(np.float32) / W
+    yn = y.astype(np.float32) / H
+
+    def make(t):
+        f = _frac(t)
+        a = np.sin(math.tau * (xn * 3.2 + yn * 1.7 + f * 2))
+        b = np.sin(math.tau * (xn * -1.4 + yn * 3.8 - f * 3))
+        c = np.sin(math.tau * (xn * 4.6 - yn * 2.1 + f))
+        web = np.clip((a + b + c) / 3.0, 0.28, 1.0)
+        web = ((web - .28) / .72) ** 5
+        shimmer = 0.55 + .45 * np.sin(math.tau * (xn + yn + f * 4)) ** 2
+        power = web * shimmer
+        return np.stack((power * 22, power * 105, power * 135), axis=2).astype(np.uint8)
+    return make
+
+
+def _rgb_glitch():
+    """Editorial RGB displacement bars; sparse enough to preserve lyrics."""
+    y, x = np.mgrid[0:H, 0:W]
+    yn = y.astype(np.float32) / H
+    xn = x.astype(np.float32) / W
+
+    def make(t):
+        f = _frac(t)
+        frame = np.zeros((H, W, 3), np.float32)
+        gate = (
+            (np.sin(math.tau * (yn * 17 + f * 8)) > .86)
+            | (np.sin(math.tau * (yn * 31 - f * 5)) > .94)
+        ).astype(np.float32)
+        blocks = (np.sin(math.tau * (xn * 4 + np.floor(yn * 13) * .17 + f * 3)) > .35)
+        mask = gate * blocks
+        frame[:, :, 0] = mask * 132
+        frame[:, :, 1] = np.roll(mask, int(22 * math.sin(math.tau * f)), axis=1) * 72
+        frame[:, :, 2] = np.roll(mask, int(-30 * math.cos(math.tau * f)), axis=1) * 146
+        return frame.astype(np.uint8)
+    return make
+
+
+def _neon_edge():
+    """Moving cyan/magenta contour lines that frame the still."""
+    y, x = np.mgrid[0:H, 0:W]
+    xn = x.astype(np.float32) / W
+    yn = y.astype(np.float32) / H
+
+    def make(t):
+        f = _frac(t)
+        curve_a = np.abs(yn - (.23 + .09 * np.sin(math.tau * (xn * 1.8 + f))))
+        curve_b = np.abs(yn - (.76 + .11 * np.sin(math.tau * (xn * 1.4 - f * 2))))
+        edge_a = np.exp(-(curve_a / .009) ** 2)
+        edge_b = np.exp(-(curve_b / .011) ** 2)
+        vertical = np.exp(-((xn - (.5 + .34 * math.sin(math.tau * f))) / .012) ** 2)
+        return np.stack((
+            (edge_b + vertical * .45) * 145,
+            edge_a * 118,
+            (edge_a + edge_b * .7 + vertical) * 165,
+        ), axis=2).clip(0, 255).astype(np.uint8)
+    return make
+
+
+def _shadow_play():
+    """Soft moving shadows authored over white for multiply compositing."""
+    def make(t):
+        f = _frac(t)
+        image = Image.new("RGB", (W, H), (255, 255, 255))
+        draw = ImageDraw.Draw(image, "RGB")
+        for i in range(7):
+            phase = math.tau * (f * (1 + i % 3) + i / 7)
+            cx = int(W * (.5 + .62 * math.sin(phase)))
+            cy = int(H * (.5 + .45 * math.cos(phase * .73)))
+            rx = int(W * (.12 + .035 * (i % 3)))
+            ry = int(H * (.38 + .04 * (i % 2)))
+            shade = 92 + i * 8
+            draw.ellipse((cx-rx, cy-ry, cx+rx, cy+ry), fill=(shade, shade, shade))
+        return np.asarray(image, dtype=np.uint8)
+    return make
+
+
+def _kaleido():
+    """Slow radial kaleidoscope rays with a luminous centre."""
+    y, x = np.mgrid[0:H, 0:W]
+    xx = x.astype(np.float32) / W - .5
+    yy = y.astype(np.float32) / H - .5
+    theta = np.arctan2(yy, xx)
+    radius = np.sqrt(xx * xx + yy * yy)
+
+    def make(t):
+        f = _frac(t)
+        spokes = np.clip(np.cos(theta * 8 + math.tau * f * 2), .72, 1)
+        spokes = ((spokes - .72) / .28) ** 3
+        rings = .35 + .65 * np.sin(radius * 42 - math.tau * f * 3) ** 2
+        fade = np.clip(1.0 - radius * 1.45, 0, 1)
+        p = spokes * rings * fade
+        return np.stack((p * 110, p * 48, p * 155), axis=2).astype(np.uint8)
+    return make
+
+
+def _halftone():
+    """Animated print dots over white, intended for multiply."""
+    y, x = np.mgrid[0:H, 0:W]
+    cell = 20
+
+    def make(t):
+        f = _frac(t)
+        ox = int(8 * math.sin(math.tau * f))
+        oy = int(8 * math.cos(math.tau * f))
+        dx = ((x + ox) % cell) - cell / 2
+        dy = ((y + oy) % cell) - cell / 2
+        wave = .5 + .5 * np.sin(math.tau * (x / W * 1.8 + y / H * .8 - f * 2))
+        radius = 2.0 + wave * 5.5
+        dots = (dx * dx + dy * dy < radius * radius)
+        level = np.where(dots, 45 + wave * 55, 255)
+        return np.stack((level, level, level), axis=2).astype(np.uint8)
+    return make
+
+
+def _ink_reveal():
+    """Organic ink blooms crossing the photo, authored for multiply."""
+    y, x = np.mgrid[0:H, 0:W]
+    xn = x.astype(np.float32) / W
+    yn = y.astype(np.float32) / H
+    centers = ((.18, .27), (.78, .22), (.55, .72), (.08, .84), (.91, .68))
+
+    def make(t):
+        f = _frac(t)
+        ink = np.zeros((H, W), np.float32)
+        for i, (cx, cy) in enumerate(centers):
+            pulse = .5 + .5 * math.sin(math.tau * (f * (1 + i % 2) - i / len(centers)))
+            r = .025 + pulse * (.12 + .02 * i)
+            wobble = .018 * np.sin(math.tau * (xn * (2+i*.2) + yn * 1.7 + f))
+            dist = np.sqrt((xn-cx+wobble) ** 2 + (yn-cy-wobble) ** 2)
+            ink = np.maximum(ink, np.clip((r - dist) / .035, 0, 1))
+        level = 255 - ink * 205
+        return np.stack((level, level*.98, level*.96), axis=2).clip(0,255).astype(np.uint8)
+    return make
+
+
+def _heatwave():
+    """Warm mirage bands rising continuously."""
+    y, x = np.mgrid[0:H, 0:W]
+    xn = x.astype(np.float32) / W
+    yn = y.astype(np.float32) / H
+
+    def make(t):
+        f = _frac(t)
+        wave = np.sin(math.tau * (yn * 8 - f * 4 + .25 * np.sin(xn * math.tau * 2)))
+        bands = np.clip(wave - .55, 0, 1) ** 2
+        lower = np.clip((yn - .2) / .8, 0, 1)
+        p = bands * lower
+        return np.stack((p * 115, p * 45, p * 10), axis=2).astype(np.uint8)
+    return make
+
+
+def _chromatic_pulse():
+    """Continuous concentric chromatic breathing, independent of the beat."""
+    y, x = np.mgrid[0:H, 0:W]
+    xx = x.astype(np.float32) / W - .5
+    yy = y.astype(np.float32) / H - .5
+    radius = np.sqrt(xx * xx + yy * yy)
+
+    def make(t):
+        f = _frac(t)
+        red = np.exp(-((radius - (.18 + .13 * math.sin(math.tau*f))) / .035) ** 2)
+        cyan = np.exp(-((radius - (.36 + .12 * math.sin(math.tau*f + 2))) / .045) ** 2)
+        violet = np.exp(-((radius - (.54 + .10 * math.sin(math.tau*f + 4))) / .055) ** 2)
+        return np.stack((red*130 + violet*55, cyan*105, cyan*145 + violet*120), axis=2).clip(0,255).astype(np.uint8)
+    return make
+
+
+def _cutout_echo():
+    """Offset editorial frames that read as paper-cut echoes."""
+    def make(t):
+        f = _frac(t)
+        image = Image.new("RGB", (W, H), (0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        for i, color in enumerate(((135, 25, 82), (20, 115, 145), (116, 82, 24))):
+            drift = math.sin(math.tau * f + i * 2.1)
+            margin_x = int(W * (.09 + i*.055 + drift*.018))
+            margin_y = int(H * (.10 + i*.045 - drift*.012))
+            draw.rounded_rectangle(
+                (margin_x, margin_y, W-margin_x, H-margin_y),
+                radius=45+i*12, outline=color, width=13+i*5,
+            )
+        return np.asarray(image, dtype=np.uint8)
+    return make
+
+
+def _projector():
+    """Projector cone, gate weave and exposure flutter."""
+    y, x = np.mgrid[0:H, 0:W]
+    xn = x.astype(np.float32) / W
+    yn = y.astype(np.float32) / H
+    total_frames = int(DUR * FPS)
+
+    def make(t):
+        f = _frac(t)
+        idx = int(f * total_frames) % total_frames
+        rng = np.random.default_rng(0xCAFE + idx)
+        center = .5 + .18 * math.sin(math.tau * f)
+        cone = np.clip(1 - np.abs(xn-center) / (.10 + yn*.48), 0, 1) * (.25 + yn*.75)
+        flutter = .55 + .45 * math.sin(math.tau * f * 24) ** 2
+        frame = cone * (18 + 22*flutter)
+        dust = rng.random((H//4, W//4), dtype=np.float32)
+        dust = np.repeat(np.repeat((dust > .998)*95, 4, axis=0), 4, axis=1)[:H,:W]
+        return np.stack((frame+dust, frame*.82+dust*.82, frame*.52+dust*.55), axis=2).clip(0,255).astype(np.uint8)
+    return make
+
+
+def _beat_phase(t):
+    """One authored hit every 0.5 seconds: canonical 120 BPM."""
+    return (t * 2.0) % 1.0
+
+
+def _bass_pulse():
+    y, x = np.mgrid[0:H, 0:W]
+    xx = x.astype(np.float32) / W - .5
+    yy = y.astype(np.float32) / H - .5
+    radius = np.sqrt(xx*xx + yy*yy)
+
+    def make(t):
+        hit = (1.0 - _beat_phase(t)) ** 4
+        glow = np.exp(-(radius / (.18 + .16*(1-hit))) ** 2) * hit
+        return np.stack((glow*150, glow*42, glow*95), axis=2).astype(np.uint8)
+    return make
+
+
+def _beat_flash():
+    y, x = np.mgrid[0:H, 0:W]
+    vignette = np.clip(1 - np.sqrt(((x/W)-.5)**2 + ((y/H)-.5)**2), 0, 1)
+
+    def make(t):
+        hit = (1.0 - _beat_phase(t)) ** 10
+        p = vignette * hit
+        return np.stack((p*170, p*155, p*132), axis=2).astype(np.uint8)
+    return make
+
+
+def _chromatic_hit():
+    y, x = np.mgrid[0:H, 0:W]
+    xn = x.astype(np.float32) / W
+
+    def make(t):
+        phase = _beat_phase(t)
+        hit = (1-phase) ** 5
+        spread = .025 + phase*.16
+        r = np.exp(-((xn-(.5-spread))/(.018+phase*.025))**2)*hit
+        b = np.exp(-((xn-(.5+spread))/(.018+phase*.025))**2)*hit
+        g = np.exp(-((xn-.5)/(.012+phase*.018))**2)*hit*.55
+        return np.stack((r*180, g*110, b*190), axis=2).astype(np.uint8)
+    return make
+
+
+def _beat_ripple():
+    y, x = np.mgrid[0:H, 0:W]
+    radius = np.sqrt((x.astype(np.float32)/W-.5)**2 + (y.astype(np.float32)/H-.5)**2)
+
+    def make(t):
+        phase = _beat_phase(t)
+        ring = np.exp(-((radius-(.04+phase*.62))/(.012+phase*.018))**2) * (1-phase)**.8
+        return np.stack((ring*55, ring*145, ring*185), axis=2).astype(np.uint8)
+    return make
+
+
+def _echo_hit():
+    def make(t):
+        phase = _beat_phase(t)
+        image = Image.new("RGB", (W, H), (0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        for i, color in enumerate(((155, 35, 105), (30, 130, 165), (125, 82, 35))):
+            local = max(0.0, 1.0 - phase - i*.12)
+            if local <= 0:
+                continue
+            inset = int((.08 + (1-local)*.16 + i*.025) * min(W,H))
+            draw.rounded_rectangle(
+                (inset, inset, W-inset, H-inset),
+                radius=55, outline=tuple(int(c*local) for c in color),
+                width=max(4, int(18*local)),
+            )
+        return np.asarray(image, dtype=np.uint8)
+    return make
+
+
 EFFECTS = {
     "snow": _snow, "rain": _rain, "stars": _stars,
     "bokeh": _bokeh, "light": _light, "aurora": _aurora,
     "dust": _dust, "embers": _embers, "petals": _petals,
     "prism": _prism, "confetti": _confetti, "film": _film,
     "scanlines": _scanlines, "fog": _fog, "shapes": _shapes,
+    "liquid_glass": _liquid_glass, "caustics": _caustics,
+    "rgb_glitch": _rgb_glitch, "neon_edge": _neon_edge,
+    "shadow_play": _shadow_play, "kaleido": _kaleido,
+    "halftone": _halftone, "ink_reveal": _ink_reveal,
+    "heatwave": _heatwave, "chromatic_pulse": _chromatic_pulse,
+    "cutout_echo": _cutout_echo, "projector": _projector,
+    "bass_pulse": _bass_pulse, "beat_flash": _beat_flash,
+    "chromatic_hit": _chromatic_hit, "beat_ripple": _beat_ripple,
+    "echo_hit": _echo_hit,
 }
 
 
@@ -611,7 +929,8 @@ def main():
             continue
         # rng re-seeded per effect with a STABLE seed (crc32, not hash() which
         # is salted per process) so each effect is deterministic across runs.
-        global _RNG
+        global _RNG, W, H
+        W, H = EFFECT_SIZE.get(name, (1920, 1080))
         _RNG = np.random.default_rng(zlib.crc32(name.encode()))
         make = builder()
         out = os.path.abspath(os.path.join(OUT, f"{name}.mp4"))

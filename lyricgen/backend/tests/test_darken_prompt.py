@@ -25,6 +25,12 @@ def test_case_and_space_tolerant():
     assert pipeline._darken_prompt_for_effect(BASE, "  STARS ") != BASE
 
 
+def test_multiply_effect_keeps_bright_scene_available():
+    """Dark ink/shadow effects need highlights to multiply against."""
+    for eff in ("shadow_play", "halftone", "ink_reveal"):
+        assert pipeline._darken_prompt_for_effect(BASE, eff) == BASE
+
+
 def test_does_not_use_scene_guard_forbidden_words():
     """The scene guard forbids night/urban/alley/street/pavement cliches —
     the darkening must be a grading/mood instruction, not a scene swap."""

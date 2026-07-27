@@ -29,6 +29,10 @@ def test_expanded_effect_catalog_has_real_assets():
     added = {
         "aurora", "dust", "embers", "petals", "prism", "confetti",
         "film", "scanlines", "fog", "shapes",
+        "liquid_glass", "caustics", "rgb_glitch", "neon_edge",
+        "shadow_play", "kaleido", "halftone", "ink_reveal", "heatwave",
+        "chromatic_pulse", "cutout_echo", "projector", "bass_pulse",
+        "beat_flash", "chromatic_hit", "beat_ripple", "echo_hit",
     }
     assert added.issubset(set(fx.EFFECTS))
     for effect in added:
@@ -90,6 +94,34 @@ def test_effect_with_grade_inserts_eq_before_yuv():
     assert "[bl]eq=" in fc and "format=yuv420p[gr]" in fc
 
 
+def test_dark_effect_uses_multiply_and_editorial_opacity():
+    fc, use_complex, _ = fx.build_video_filter(
+        ass_basename="lyrics.ass", font_dir="/tmp/fonts",
+        width=1920, height=1080, effect="shadow_play", style="",
+    )
+    assert use_complex is True
+    assert "blend=all_mode=multiply:all_opacity=0.58" in fc
+    assert fx.effect_blend("ink_reveal") == "multiply"
+    assert fx.effect_blend("snow") == "screen"
+
+
+def test_reactive_effect_tempo_matches_authored_loop():
+    slow, _, _ = fx.build_video_filter(
+        ass_basename="lyrics.ass", font_dir="/tmp/fonts",
+        width=1920, height=1080, effect="beat_ripple", beat_bpm=90,
+    )
+    fast, _, _ = fx.build_video_filter(
+        ass_basename="lyrics.ass", font_dir="/tmp/fonts",
+        width=1920, height=1080, effect="beat_ripple", beat_bpm=150,
+    )
+    assert "setpts=(PTS-STARTPTS)*1.333333" in slow
+    assert "setpts=(PTS-STARTPTS)*0.800000" in fast
+    assert fx.effect_setpts("caustics", 90) == "setpts=PTS-STARTPTS"
+    assert set(fx.REACTIVE_EFFECTS) == {
+        "bass_pulse", "beat_flash", "chromatic_hit", "beat_ripple", "echo_hit",
+    }
+
+
 def test_fontsdir_path_is_escaped():
     fc, use_complex, _ = fx.build_video_filter(
         ass_basename="lyrics.ass", font_dir="/tmp/my fonts:weird",
@@ -119,6 +151,7 @@ def test_fx_gain_known_values():
     assert fx.fx_gain("scanlines").startswith("curves=")
     assert fx.fx_gain("fog").startswith("curves=")
     assert fx.fx_gain("shapes").startswith("curves=")
+    assert fx.fx_gain("shadow_play").startswith("gblur=")
     assert fx.fx_gain("") == ""
     assert fx.fx_gain("  STARS ").startswith("eq=")  # case/space tolerant
 
