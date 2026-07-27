@@ -4,7 +4,7 @@ The render burns lyrics with libass in ONE ffmpeg pass (see pipeline.py
 `_render_lyrics_ass`). This module builds the video filter for that pass,
 optionally adding two layers BEFORE the subtitles burn:
 
-  1. EFFECT overlay (snow / rain / stars / bokeh / light): a pre-baked,
+  1. EFFECT overlay (snow / rain / stars / bokeh / light / ...): a pre-baked,
      seamless, black-background RGB loop at assets/fx/<effect>.mp4 (built once
      by scripts/gen_fx_loops.py), composited with `blend=all_mode=screen`.
      Effects are ADDITIVE (light-emitting), so screen-blend over black needs no
@@ -45,12 +45,26 @@ _FX_DIR = next(
     _FX_DIR_CANDIDATES[0],
 )
 
-# Available pre-baked effect loops (must match scripts/gen_fx_loops.py).
-# 2026-05-25: "aurora" agregado para cubrir el estilo UMG observado en
-# los refs Boza / Yatra Cristina / A los cuatro vientos — líneas
-# brillantes ondulantes que flotan sobre el cielo. Asset placeholder
-# basado en light.mp4 hasta que se swap el real (loop ondas + glow).
-EFFECTS = ("snow", "rain", "stars", "bokeh", "light", "aurora")
+# Available pre-baked effect loops (must match scripts/gen_fx_loops.py and the
+# wizard catalogue). Keep this tuple explicit: it is the server-side allowlist
+# that prevents arbitrary filenames from reaching the ffmpeg command.
+EFFECTS = (
+    "snow",
+    "rain",
+    "stars",
+    "bokeh",
+    "light",
+    "aurora",
+    "dust",
+    "embers",
+    "petals",
+    "prism",
+    "confetti",
+    "film",
+    "scanlines",
+    "fog",
+    "shapes",
+)
 
 # palette code → ffmpeg `eq` grade. "" / "auto" / unknown → no grade
 # (scene-natural). Mirrors the frontend STYLES codes used elsewhere.
@@ -129,15 +143,19 @@ _FX_GAIN = {
     #     composite YMAX 139→129, worse). A `curves` that LIFTS the streak
     #     band (0.3→0.65, 0.6→1) while pinning the near-black bg low brings
     #     composite YMAX 139→229 with YAVG unchanged (bg stays dark).
-    #   - light / aurora: a broad diffuse glow capped at ~0.31 luma (raw YMAX
-    #     79). A contrast boost just dims it (all below the 0.5 pivot). A
-    #     `curves` lifting the glow band (0.2→0.55, 0.31→0.92) brightens the
-    #     glow while keeping the floor dark. NOTE: aurora.mp4 is still a
-    #     placeholder copy of light.mp4 (identical luma stats) — same gain;
-    #     a distinct aurora loop is a separate follow-up.
+    #   - light / aurora / prism: broad diffuse glows. Contrast would dim them
+    #     because most pixels sit below the 0.5 pivot, so lift their mid band.
     "rain": "curves=all='0/0 0.1/0.03 0.3/0.65 0.6/1 1/1'",
     "light": "curves=all='0/0 0.06/0.015 0.2/0.55 0.31/0.92 1/1'",
     "aurora": "curves=all='0/0 0.06/0.015 0.2/0.55 0.31/0.92 1/1'",
+    "prism": "curves=all='0/0 0.06/0.015 0.2/0.52 0.35/0.9 1/1'",
+    "dust": "eq=contrast=1.55:brightness=-0.015",
+    "embers": "curves=all='0/0 0.08/0.025 0.25/0.65 0.55/1 1/1'",
+    "petals": "eq=contrast=1.20",
+    "film": "curves=all='0/0 0.05/0.02 0.18/0.48 0.5/0.88 1/1'",
+    "scanlines": "curves=all='0/0 0.05/0.025 0.18/0.52 0.5/0.9 1/1'",
+    "fog": "curves=all='0/0 0.06/0.025 0.20/0.62 0.5/0.95 1/1'",
+    "shapes": "curves=all='0/0 0.08/0.025 0.28/0.72 0.60/1 1/1'",
 }
 
 

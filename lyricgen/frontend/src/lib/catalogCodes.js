@@ -36,6 +36,26 @@ export const MOVEMENT_CODES = [
   "animado",
 ];
 
+// Composable overlay loops. Mirrors fx_compositor.EFFECTS and is asserted
+// against the generated backend fixture in renderParity.test.js.
+export const EFFECT_CODES = [
+  "snow",
+  "rain",
+  "stars",
+  "bokeh",
+  "light",
+  "aurora",
+  "dust",
+  "embers",
+  "petals",
+  "prism",
+  "confetti",
+  "film",
+  "scanlines",
+  "fog",
+  "shapes",
+];
+
 /**
  * Espejo JS de pipeline._normalize_movement_style.
  *

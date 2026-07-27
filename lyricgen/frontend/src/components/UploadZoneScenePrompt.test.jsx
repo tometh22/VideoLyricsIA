@@ -163,3 +163,36 @@ describe("Foto fija avisa que queda inmóvil", () => {
     expect(none.disabled).toBe(false);
   });
 });
+
+describe("galería moderna de efectos", () => {
+  it("filtra por familia sin cambiar el valor elegido", () => {
+    render(<Harness movementStyle="foto-parallax" />);
+    goStep(3);
+
+    expect(document.querySelectorAll("[data-effect]")).toHaveLength(16);
+    fireEvent.click(document.querySelector('[data-effect-category="stylized"]'));
+
+    const visible = [...document.querySelectorAll("[data-effect]")]
+      .map((button) => button.dataset.effect);
+    expect(visible).toEqual(["prism", "film", "scanlines", "shapes"]);
+    expect(visible).not.toContain("none");
+    expect(document.querySelector('[data-effect-category="stylized"]')
+      .getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("el preview protagonista sigue hover/focus y el click confirma la opción", () => {
+    render(<Harness />);
+    goStep(3);
+
+    const film = document.querySelector('[data-effect="film"]');
+    fireEvent.focus(film);
+    expect(screen.getByTestId("effect-featured").querySelector("video")
+      .getAttribute("src")).toBe("/fx_samples/film.mp4");
+
+    fireEvent.click(film);
+    fireEvent.blur(film);
+    expect(film.getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByTestId("effect-featured").querySelector("video")
+      .getAttribute("src")).toBe("/fx_samples/film.mp4");
+  });
+});

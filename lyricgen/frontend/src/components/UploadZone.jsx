@@ -8,7 +8,7 @@ import HelpTip from "./HelpCenter/HelpTip";
 import ContentValidationToggle, { isUniversalAccount } from "./ContentValidationToggle";
 import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
-import { CONCEPT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
+import { CONCEPT_CODES, EFFECT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
 import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS } from "../lib/optionLabels";
 import EditPlanSummary from "./EditPlanSummary";
 import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBackgroundPreviewTokens";
@@ -814,6 +814,7 @@ export default function UploadZone({
   // Hovering a movement option previews it in the big stage without committing.
   const [hoverMovement, setHoverMovement] = useState(null);
   const [hoverEffect, setHoverEffect] = useState(null);
+  const [effectCategory, setEffectCategory] = useState("all");
   // Same for the lyrics-animation step: hover previews the template live.
   const [hoverAnimation, setHoverAnimation] = useState(null);
   // And for the line-transition picker (lives in the same Animación step).
@@ -1053,20 +1054,48 @@ export default function UploadZone({
   // Backed by pre-rendered alpha-screen loops; preview clips live at
   // /fx_samples/<code>.mp4 (effect composited over a neutral gradient).
   const _FX_LABELS = EFFECT_LABELS(t);
+  const EFFECT_META = {
+    snow: { category: "particles", sample: "/fx_samples/snow.mp4", desc: t("upload.effect_snow_desc") || "Copos cayendo. Calmo, invernal." },
+    rain: { category: "particles", sample: "/fx_samples/rain.mp4", desc: t("upload.effect_rain_desc") || "Gotas finas sobre la escena." },
+    stars: { category: "particles", sample: "/fx_samples/stars.mp4", desc: t("upload.effect_stars_desc") || "Partículas que titilan. Nocturno." },
+    bokeh: { category: "ambient", sample: "/fx_samples/bokeh.mp4", desc: t("upload.effect_bokeh_desc") || "Luces desenfocadas flotando." },
+    light: { category: "ambient", sample: "/fx_samples/light.mp4", desc: t("upload.effect_light_desc") || "Focos cálidos y fríos que recorren la imagen." },
+    aurora: { category: "ambient", sample: "/fx_samples/aurora.mp4", desc: t("upload.effect_aurora_desc") || "Cortinas de luz verde y violeta." },
+    dust: { category: "particles", sample: "/fx_samples/dust.mp4", desc: t("upload.effect_dust_desc") || "Motas cálidas suspendidas en el aire." },
+    embers: { category: "particles", sample: "/fx_samples/embers.mp4", desc: t("upload.effect_embers_desc") || "Chispas anaranjadas que suben." },
+    petals: { category: "particles", sample: "/fx_samples/petals.mp4", desc: t("upload.effect_petals_desc") || "Pétalos suaves cayendo." },
+    prism: { category: "stylized", sample: "/fx_samples/prism.mp4", desc: t("upload.effect_prism_desc") || "Barrido de luz multicolor." },
+    confetti: { category: "particles", sample: "/fx_samples/confetti.mp4", desc: t("upload.effect_confetti_desc") || "Papelitos de colores en movimiento." },
+    film: { category: "stylized", sample: "/fx_samples/film.mp4", desc: t("upload.effect_film_desc") || "Grano, polvo y rayas de película analógica." },
+    scanlines: { category: "stylized", sample: "/fx_samples/scanlines.mp4", desc: t("upload.effect_scanlines_desc") || "Líneas de pantalla y barrido de color retro." },
+    fog: { category: "ambient", sample: "/fx_samples/fog.mp4", desc: t("upload.effect_fog_desc") || "Bancos de niebla suaves que recorren la foto." },
+    shapes: { category: "stylized", sample: "/fx_samples/shapes.mp4", desc: t("upload.effect_shapes_desc") || "Figuras gráficas que flotan sobre la imagen." },
+  };
   const EFFECTS = [
-    { code: "",       label: _FX_LABELS[""],     sample: null,                     desc: t("upload.effect_none_desc") || "Fondo limpio, sin efecto." },
-    { code: "snow",   label: _FX_LABELS.snow,       sample: "/fx_samples/snow.mp4",   desc: t("upload.effect_snow_desc") || "Copos cayendo. Calmo, invernal." },
-    { code: "rain",   label: _FX_LABELS.rain,      sample: "/fx_samples/rain.mp4",   desc: t("upload.effect_rain_desc") || "Gotas finas sobre la escena." },
-    { code: "stars",  label: _FX_LABELS.stars,  sample: "/fx_samples/stars.mp4",  desc: t("upload.effect_stars_desc") || "Partículas que titilan. Nocturno." },
-    { code: "bokeh",  label: _FX_LABELS.bokeh,      sample: "/fx_samples/bokeh.mp4",  desc: t("upload.effect_bokeh_desc") || "Luces desenfocadas flotando." },
-    { code: "light",  label: _FX_LABELS.light,        sample: "/fx_samples/light.mp4",  desc: t("upload.effect_light_desc") || "Destellos suaves. Atardecer, glow." },
-    // 2026-06-04: "Aurora" removido del selector — su asset (assets/fx/aurora.mp4)
-    // es una COPIA de light.mp4, así que renderizaba idéntico a "Luz". El backend
-    // sigue soportando effect="aurora" (EFFECTS en fx_compositor.py) por compat,
-    // pero no lo ofrecemos hasta tener un loop de aurora propio (cortinas
-    // ondulantes verde/teal). Para re-activarlo: restaurar la entrada de abajo.
-    // { code: "aurora", label: t("upload.effect_aurora") || "Aurora", sample: "/fx_samples/aurora.mp4", desc: t("upload.effect_aurora_desc") || "Líneas de luz ondulantes que cruzan el cielo." },
+    { code: "", category: "clean", label: _FX_LABELS[""], sample: null, desc: t("upload.effect_none_desc") || "Fondo limpio, sin efecto." },
+    ...EFFECT_CODES.map((code) => ({
+      code,
+      label: _FX_LABELS[code] || code,
+      ...(EFFECT_META[code] || { sample: null, desc: "" }),
+    })),
   ];
+  const EFFECT_CATEGORIES = [
+    { code: "all", label: t("upload.effect_category_all") || "Todos" },
+    { code: "ambient", label: t("upload.effect_category_ambient") || "Ambiente" },
+    { code: "particles", label: t("upload.effect_category_particles") || "Partículas" },
+    { code: "stylized", label: t("upload.effect_category_stylized") || "Estilos" },
+  ];
+  const visibleEffects = effectCategory === "all"
+    ? EFFECTS
+    : EFFECTS.filter((effect) => effect.category === effectCategory);
+  const featuredEffectCode = hoverEffect !== null
+    ? hoverEffect
+    : (batchDefaults.effect || "");
+  const featuredEffect = EFFECTS.find((effect) => effect.code === featuredEffectCode)
+    || EFFECTS[0];
+  const featuredCategory = EFFECT_CATEGORIES.find(
+    (category) => category.code === featuredEffect.category,
+  );
 
   // Lyrics-animation templates. These are rendered as libass override tags in
   // the same single ffmpeg pass as the static text → zero impact on render
@@ -1895,23 +1924,136 @@ export default function UploadZone({
             : "ring-2 ring-transparent"
         }`}
       >
-        <div className="mb-2">
-          <div className="flex items-baseline justify-between">
-            <p className="text-[11px] text-gray-400 font-medium">
-              {t("upload.effect_gallery_title") || "Efecto encima"}
-            </p>
-            {files.length > 1 && (
-              <p className="text-[10px] text-gray-600">
-                {t("upload.effect_gallery_hint") || "Click para aplicar a todos · personalizable por canción"}
-              </p>
-            )}
+        <div className="relative overflow-hidden rounded-2xl border border-white/[0.08] bg-[#0d0b17]/90 shadow-[0_20px_60px_rgba(0,0,0,0.28)]">
+          <div className="pointer-events-none absolute -top-28 -right-20 h-64 w-64 rounded-full bg-brand/15 blur-3xl" />
+          <div className="pointer-events-none absolute -bottom-32 -left-20 h-64 w-64 rounded-full bg-accent/10 blur-3xl" />
+
+          <div className="relative px-3.5 pt-3.5 sm:px-4 sm:pt-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <div className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-brand/90 to-accent/80 text-white shadow-[0_8px_24px_rgba(124,58,237,0.3)]">
+                  <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.7" viewBox="0 0 24 24" aria-hidden="true">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 3l1.25 4.25L17.5 8.5l-4.25 1.25L12 14l-1.25-4.25L6.5 8.5l4.25-1.25L12 3Z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M18.5 14l.7 2.3 2.3.7-2.3.7-.7 2.3-.7-2.3-2.3-.7 2.3-.7.7-2.3ZM5 13l.55 1.8 1.8.55-1.8.55L5 17.7l-.55-1.8-1.8-.55 1.8-.55L5 13Z" />
+                  </svg>
+                </div>
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="text-[12px] font-semibold text-white">
+                      {t("upload.effect_gallery_title") || "Efecto encima"}
+                    </p>
+                    <span className="rounded-full border border-white/[0.08] bg-white/[0.04] px-2 py-0.5 text-[9px] font-medium tabular-nums text-gray-400">
+                      {EFFECT_CODES.length} {t("upload.effect_count_label") || "efectos"}
+                    </span>
+                  </div>
+                  <p className="mt-0.5 max-w-2xl text-[10px] leading-relaxed text-gray-500">
+                    {t("upload.effect_gallery_desc") || "Movimiento y textura sobre el fondo: partículas, luces, película, niebla y más. Se suma a cualquier fondo, incluso de Biblioteca."}
+                  </p>
+                </div>
+              </div>
+              {files.length > 1 && (
+                <p className="hidden max-w-[180px] text-right text-[9px] leading-snug text-gray-600 sm:block">
+                  {t("upload.effect_gallery_hint") || "Click para aplicar a todos · personalizable por canción"}
+                </p>
+              )}
+            </div>
+
+            {/* Large selected/hovered preview gives the catalogue a visual
+                hierarchy and reuses the exact same sample asset as the card. */}
+            <div
+              data-testid="effect-featured"
+              className="mt-3 grid overflow-hidden rounded-2xl border border-white/[0.08] bg-black/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] sm:grid-cols-[minmax(0,1.55fr)_minmax(180px,0.9fr)]"
+              aria-live="polite"
+            >
+              <div className="relative aspect-video min-h-[126px] overflow-hidden bg-black">
+                {featuredEffect.sample ? (
+                  <video
+                    key={`featured-${featuredEffect.code}`}
+                    src={featuredEffect.sample}
+                    className="h-full w-full object-cover"
+                    autoPlay loop muted playsInline
+                  />
+                ) : (
+                  <div
+                    className="absolute inset-0 overflow-hidden"
+                    style={{ background: "radial-gradient(100% 130% at 20% 0%,#30204c 0%,#12101e 50%,#090810 100%)" }}
+                  >
+                    <div className="absolute left-[14%] top-[16%] h-24 w-24 rounded-full border border-white/[0.07]" />
+                    <div className="absolute bottom-[-20%] right-[10%] h-40 w-40 rounded-full border border-brand/20" />
+                    <div className="absolute inset-0 grid place-items-center">
+                      <div className="grid h-12 w-12 place-items-center rounded-2xl border border-white/[0.08] bg-white/[0.04] text-lg text-gray-500 backdrop-blur">
+                        Ø
+                      </div>
+                    </div>
+                  </div>
+                )}
+                <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/45 via-transparent to-black/10" />
+                <div className="absolute left-2.5 top-2.5 flex items-center gap-1.5">
+                  <span className="rounded-full border border-white/10 bg-black/35 px-2 py-1 text-[8px] font-semibold uppercase tracking-[0.12em] text-white/80 backdrop-blur-md">
+                    {hoverEffect !== null
+                      ? (t("upload.effect_previewing") || "Vista previa")
+                      : (t("upload.effect_selected") || "Seleccionado")}
+                  </span>
+                  {featuredEffect.code && (
+                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.9)]" />
+                  )}
+                </div>
+              </div>
+              <div className="relative flex min-h-[118px] flex-col justify-between border-t border-white/[0.06] bg-white/[0.025] p-3.5 sm:border-l sm:border-t-0">
+                <div>
+                  <p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-brand-light/80">
+                    {featuredCategory?.label || (t("upload.effect_category_clean") || "Limpio")}
+                  </p>
+                  <p className="mt-1 text-[16px] font-semibold tracking-[-0.02em] text-white">
+                    {featuredEffect.label}
+                  </p>
+                  <p className="mt-1.5 text-[10px] leading-relaxed text-gray-400">
+                    {featuredEffect.desc}
+                  </p>
+                </div>
+                <div className="mt-3 flex items-center gap-1.5 text-[9px] text-gray-600">
+                  <span className="inline-block h-1.5 w-1.5 rounded-full bg-brand/70" />
+                  {t("upload.effect_hover_hint") || "Pasá el cursor para explorar · click para elegir"}
+                </div>
+              </div>
+            </div>
+
+            <div
+              className="mt-3 flex gap-1.5 overflow-x-auto pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+              role="tablist"
+              aria-label={t("upload.effect_categories_label") || "Categorías de efectos"}
+            >
+              {EFFECT_CATEGORIES.map((category) => {
+                const selected = effectCategory === category.code;
+                const count = category.code === "all"
+                  ? EFFECTS.length
+                  : EFFECTS.filter((effect) => effect.category === category.code).length;
+                return (
+                  <button
+                    key={category.code}
+                    type="button"
+                    role="tab"
+                    aria-selected={selected}
+                    data-effect-category={category.code}
+                    onClick={() => setEffectCategory(category.code)}
+                    className={`flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1.5 text-[10px] font-medium transition-all duration-200 ${
+                      selected
+                        ? "border-brand/50 bg-brand/15 text-white shadow-[0_0_18px_rgba(124,58,237,0.16)]"
+                        : "border-white/[0.07] bg-white/[0.025] text-gray-500 hover:border-white/[0.15] hover:bg-white/[0.05] hover:text-gray-300"
+                    }`}
+                  >
+                    {category.label}
+                    <span className={`text-[8px] tabular-nums ${selected ? "text-brand-light" : "text-gray-600"}`}>
+                      {count}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
           </div>
-          <p className="text-[10px] text-gray-600 mt-0.5">
-            {t("upload.effect_gallery_desc") || "Partículas que caen encima del fondo (nieve, lluvia, estrellas…). Es el toque del formato de UMG. Se suma a cualquier fondo, incluso de Biblioteca."}
-          </p>
-        </div>
-        <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
-          {EFFECTS.map((e) => {
+
+          <div className="relative grid grid-cols-2 gap-2 p-3 pt-2 sm:grid-cols-3 lg:grid-cols-4">
+          {visibleEffects.map((e) => {
             const active = (batchDefaults.effect || "") === e.code;
             const inVideo = isAnchor("effect", e.code);
             // Con Foto fija, "Sin efecto" deja de ser un default neutro: es la
@@ -1929,42 +2071,49 @@ export default function UploadZone({
                 onClick={() => updateBatchDefault("effect", e.code)}
                 onMouseEnter={() => setHoverEffect(e.code)}
                 onMouseLeave={() => setHoverEffect(null)}
+                onFocus={() => setHoverEffect(e.code)}
+                onBlur={() => setHoverEffect(null)}
                 aria-pressed={active}
                 data-effect={e.code || "none"}
                 data-in-video={inVideo ? "true" : undefined}
                 aria-label={`${_stillNote ? _stillNote : `${e.label}: ${e.desc}`}${inVideo ? ` — ${ANCHOR_LABEL}` : ""}`}
                 title={_stillNote || e.desc}
-                className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
+                className={`group relative overflow-hidden rounded-xl border text-left transition-all duration-200 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand ${
                   active
-                    ? "border-transparent ring-1 ring-brand/50 shadow-glow"
-                    : "border-white/[0.06] hover:border-white/[0.20]"
+                    ? "border-brand/60 bg-brand/[0.09] shadow-[0_12px_30px_rgba(104,48,203,0.18)] ring-1 ring-brand/25"
+                    : "border-white/[0.07] bg-white/[0.025] hover:-translate-y-0.5 hover:border-white/[0.18] hover:bg-white/[0.045] hover:shadow-[0_12px_28px_rgba(0,0,0,0.24)]"
                 }`}
               >
-                <div className="aspect-video bg-black relative overflow-hidden">
+                <div className="relative aspect-video overflow-hidden bg-black">
                   {e.sample ? (
-                    <video src={e.sample} className="w-full h-full object-cover pointer-events-none" autoPlay loop muted playsInline />
+                    <video src={e.sample} className="h-full w-full object-cover pointer-events-none transition-transform duration-500 group-hover:scale-[1.035]" autoPlay loop muted playsInline />
                   ) : (
-                    <div className="w-full h-full grid place-items-center text-gray-500 text-[10px]" style={{ background: "radial-gradient(120% 100% at 50% 0,#241a40,#0b0820)" }}>
-                      {t("upload.effect_none") || "Ninguno"}
+                    <div className="grid h-full w-full place-items-center text-gray-500" style={{ background: "radial-gradient(120% 100% at 50% 0,#241a40,#0b0820)" }}>
+                      <span className="grid h-8 w-8 place-items-center rounded-xl border border-white/[0.08] bg-white/[0.04] text-[14px]">Ø</span>
                     </div>
                   )}
+                  <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/55 via-transparent to-transparent opacity-70" />
                   {active && (
-                    <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand grid place-items-center shadow">
-                      <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                    <div className="absolute right-1.5 top-1.5 grid h-5 w-5 place-items-center rounded-full bg-white text-brand shadow-[0_4px_12px_rgba(0,0,0,0.3)]">
+                      <svg className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
                     </div>
                   )}
                   {inVideo && anchorChip}
                 </div>
-                <div className="px-2 py-1.5 bg-surface-1">
+                <div className="flex items-center justify-between gap-2 px-2.5 py-2">
                   {/* Con Foto fija, "Sin efecto" deja de ser un default neutro:
                       es la decisión de que el fondo quede quieto. Que lo diga. */}
-                  <p className={`text-label leading-tight ${active ? "text-white" : "text-gray-200"}`}>
+                  <p className={`truncate text-[10px] font-medium leading-tight ${active ? "text-white" : "text-gray-300"}`}>
                     {_stillNote || e.label}
                   </p>
+                  <span className={`h-1.5 w-1.5 shrink-0 rounded-full transition-colors ${
+                    active ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]" : "bg-white/10 group-hover:bg-white/25"
+                  }`} />
                 </div>
               </button>
             );
           })}
+          </div>
         </div>
       </div>
 

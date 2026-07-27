@@ -910,7 +910,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # DIRECTION + al gradiente fallback.
                  custom_colors: str = "",
                  # effect: overlay animado componible sobre cualquier fondo
-                 # (snow/rain/stars/bokeh/light). "" = ninguno. Se compone en el
+                 # (snow/rain/stars/bokeh/light + atmospheric variants).
+                 # "" = ninguno. Se compone en el
                  # render (libass filter_complex o moviepy) vía fx_compositor.
                  effect: str = "",
                  # Capa C 2026-05-24: hash determinístico (sha256-12) de los
@@ -12229,7 +12230,7 @@ def _static_image_to_mp4(image_path: str, output_path: str, duration: float,
     leaving the job stuck in "processing". ffmpeg loops the single image at
     C-level with bounded memory — impossible to OOM at any song length. The
     video's life/motion now comes from the composable effect overlay
-    (fx_compositor: snow/rain/stars/bokeh/light), not a camera pan.
+    (fx_compositor's full effect catalogue), not a camera pan.
 
     Same on-disk contract as the old Ken Burns output: a full-duration MP4 at
     `output_path` that the rest of the pipeline composes lyrics + effect onto.
@@ -15138,9 +15139,9 @@ def generate_short(
     except OSError:
         pass
 
-    # Effect overlay (snow/rain/stars/bokeh/light/aurora): screen-blend the
-    # pre-baked fx loop over the short with ffmpeg — the SAME fx assets the
-    # main video composites. moviepy can't screen-blend, so it's a post-pass.
+    # Optional effect overlay: screen-blend the selected catalogue loop over
+    # the rendered short with ffmpeg — the SAME fx assets the main video
+    # composites. moviepy can't screen-blend, so it's a post-pass.
     fx = _fx.effect_path(effect)
     if fx:
         out_path = _apply_short_effect(out_path, fx, fps, job_dir)
