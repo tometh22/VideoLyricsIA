@@ -430,13 +430,42 @@ export default function UploadZone({
   // resuelve — clon del fix de descubribilidad de la portada (incidente Clari
   // 19-jul, "no encuentro dónde agrandar el título").
   const effectControlsRef = useRef(null);
+  const movementPickerTriggerRef = useRef(null);
+  const effectPickerTriggerRef = useRef(null);
   const [effectControlsPulse, setEffectControlsPulse] = useState(false);
+  // Step 3 behaves like a creative inspector: its compact summary is the
+  // default, while either catalogue temporarily replaces the inspector body.
+  // This keeps the page height stable as the catalogue grows.
+  const [motionComposerView, setMotionComposerView] = useState(null);
+  const closeMotionComposer = () => {
+    const closingView = motionComposerView;
+    setMotionComposerView(null);
+    setHoverMovement(null);
+    setHoverEffect(null);
+    requestAnimationFrame(() => {
+      const trigger = closingView === "movement"
+        ? movementPickerTriggerRef.current
+        : effectPickerTriggerRef.current;
+      trigger?.focus();
+    });
+  };
+  useEffect(() => {
+    if (!motionComposerView) return undefined;
+    const closeOnEscape = (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeMotionComposer();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [motionComposerView]);
   // El timer vive en un ref y se limpia al desmontar: sin eso un click seguido
   // de navegar fuera del wizard deja un setState pendiente sobre un componente
   // muerto. Mismo cuidado que el pulse de la portada, que ya limpiaba el suyo.
   const effectPulseTimerRef = useRef(null);
   useEffect(() => () => clearTimeout(effectPulseTimerRef.current), []);
   const jumpToEffects = () => {
+    setMotionComposerView("effect");
     const el = effectControlsRef.current;
     if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
     setEffectControlsPulse(true);
@@ -1093,14 +1122,12 @@ export default function UploadZone({
   const visibleEffects = effectCategory === "all"
     ? EFFECTS
     : EFFECTS.filter((effect) => effect.category === effectCategory);
-  const featuredEffectCode = hoverEffect !== null
-    ? hoverEffect
-    : (batchDefaults.effect || "");
-  const featuredEffect = EFFECTS.find((effect) => effect.code === featuredEffectCode)
-    || EFFECTS[0];
-  const featuredCategory = EFFECT_CATEGORIES.find(
-    (category) => category.code === featuredEffect.category,
-  );
+  const selectedEffect = EFFECTS.find(
+    (effect) => effect.code === (batchDefaults.effect || ""),
+  ) || EFFECTS[0];
+  const selectedMovement = MOVEMENT_STYLES.find(
+    (movement) => movement.code === batchDefaults.movementStyle,
+  ) || MOVEMENT_STYLES[0];
 
   // Lyrics-animation templates. These are rendered as libass override tags in
   // the same single ffmpeg pass as the static text → zero impact on render
@@ -1814,315 +1841,326 @@ export default function UploadZone({
         </div>
       )}
 
-      {/* Movement gallery — click a card to apply to all tracks */}
-      <div className="mb-4">
+      {/* Motion Composer: the confirmed state is compact. The catalogue only
+          replaces this inspector when the operator explicitly explores it. */}
+      {motionComposerView !== "effect" && (
         <div className="mb-2">
-          <div className="flex items-baseline justify-between">
-            <p className="text-[11px] text-gray-400 font-medium">
-              {t("upload.movement_gallery_title") || "Movimiento del fondo"}
-            </p>
-            {files.length > 1 && (
-              <p className="text-[10px] text-gray-600">
-                {t("upload.movement_gallery_hint") || "Click para aplicar a todos · personalizable por canción"}
-              </p>
-            )}
-          </div>
-          <p className="text-[10px] text-gray-600 mt-0.5">
-            {t("upload.movement_gallery_desc") || "Cómo se mueve la cámara del fondo. Pasá el mouse o elegí y miralo en el preview ←"}
-          </p>
-        </div>
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-          {MOVEMENT_STYLES.map((m) => {
-            const active = batchDefaults.movementStyle === m.code;
-            const inVideo = isAnchor("movementStyle", m.code);
-            return (
-              <button
-                key={m.code || "auto"}
-                type="button"
-                onClick={() => updateBatchDefault("movementStyle", m.code)}
-                onMouseEnter={() => setHoverMovement(m.code)}
-                onMouseLeave={() => setHoverMovement(null)}
-                aria-pressed={active}
-                data-movement={m.code || "auto"}
-                data-in-video={inVideo ? "true" : undefined}
-                aria-label={`${m.label}: ${m.desc}${inVideo ? ` — ${ANCHOR_LABEL}` : ""}`}
-                title={m.desc}
-                className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
-                  active
-                    ? "border-transparent ring-1 ring-brand/50 shadow-glow"
-                    : "border-white/[0.06] hover:border-white/[0.20]"
-                }`}
-              >
-                {/* Real Veo example clip per style (Auto has no clip → icon) */}
-                <div className="aspect-video bg-black relative overflow-hidden">
-                  {m.sample ? (
-                    m.kind === "image" ? (
-                      // Foto fija = STATIC photo → render an <img>, NOT a looping
-                      // <video> (showing motion on the "fixed photo" card was
-                      // self-contradictory; operator-reported).
-                      <img src={m.sample} alt="" className="w-full h-full object-cover pointer-events-none" />
-                    ) : (
-                      <video src={m.sample} className="w-full h-full object-cover pointer-events-none" autoPlay loop muted playsInline />
-                    )
-                  ) : (
-                    <div className="w-full h-full grid place-items-center text-gray-400" style={{ background: "radial-gradient(120% 100% at 50% 0,#2a1d52,#0b0820)" }}>
-                      <span className="w-7 h-7">{movIcon(m.code)}</span>
-                    </div>
-                  )}
-                  {active && (
-                    <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand grid place-items-center shadow">
-                      <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
-                    </div>
-                  )}
-                  {inVideo && anchorChip}
-                </div>
-                <div className="px-2.5 py-2 bg-surface-1">
-                  <p className={`text-[12px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>
-                    {m.label.replace(/\s*\(.*\)\s*/, "")}
+          {motionComposerView === "movement" ? (
+            <>
+              <div className="mb-3 flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={closeMotionComposer}
+                  aria-label={t("common.back") || "Volver"}
+                  className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-white/[0.07] text-gray-400 transition-colors hover:bg-white/[0.05] hover:text-white"
+                >
+                  <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="m15 18-6-6 6-6" /></svg>
+                </button>
+                <div className="min-w-0">
+                  <p className="text-[12px] font-semibold text-white">
+                    {t("upload.movement_gallery_title") || "Movimiento base"}
                   </p>
-                  <p className="text-[10px] text-gray-500 leading-snug mt-0.5">{m.desc}</p>
+                  <p className="truncate text-[9px] text-gray-600">
+                    {t("upload.movement_gallery_desc") || "Elegí y miralo en el preview"}
+                  </p>
                 </div>
-              </button>
-            );
-          })}
-        </div>
-
-        {/* Foto fija + sin efecto = fondo 100% inmóvil los 3-4 minutos.
-            El Ken Burns se removió a propósito (OOM Rata Blanca 02-jun) y el
-            `effect="light"` automático que debía compensarlo era un no-op (se
-            borra en este PR). Así que la decisión vuelve al operador: lo
-            empujamos a elegir un efecto, pero "Sin efecto" sigue siendo válido
-            y explícito.
-
-            PERSISTENTE, no un toast: el aviso tiene que seguir ahí mientras la
-            combinación se mantenga. Un hint de una sola vez es exactamente el
-            diseño que produjo este bug — y al sembrar los controles del job
-            (PR anterior) la combinación puede aparecer SIN que el operador haya
-            clickeado nada. */}
-        {batchDefaults.movementStyle === "foto-parallax" && !batchDefaults.effect && (
-          <div
-            data-testid="foto-fija-warning"
-            className="mt-2.5 rounded-lg bg-amber-500/10 ring-1 ring-amber-500/30 px-3 py-2 flex items-start gap-2"
-          >
-            <p className="text-[11px] text-amber-300/90 leading-snug flex-1">
-              {t("upload.foto_fija_no_motion") || "Foto fija no tiene movimiento propio: el fondo queda quieto toda la canción. Elegí un efecto abajo para darle vida — o dejá «Sin efecto» si querés la imagen inmóvil."}
-            </p>
+              </div>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                {MOVEMENT_STYLES.map((m) => {
+                  const active = batchDefaults.movementStyle === m.code;
+                  const inVideo = isAnchor("movementStyle", m.code);
+                  return (
+                    <button
+                      key={m.code || "auto"}
+                      type="button"
+                      onClick={() => updateBatchDefault("movementStyle", m.code)}
+                      onMouseEnter={() => setHoverMovement(m.code)}
+                      onMouseLeave={() => setHoverMovement(null)}
+                      onFocus={() => setHoverMovement(m.code)}
+                      onBlur={() => setHoverMovement(null)}
+                      aria-pressed={active}
+                      data-movement={m.code || "auto"}
+                      data-in-video={inVideo ? "true" : undefined}
+                      aria-label={`${m.label}: ${m.desc}${inVideo ? ` — ${ANCHOR_LABEL}` : ""}`}
+                      title={m.desc}
+                      className={`group overflow-hidden rounded-lg border text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand ${
+                        active
+                          ? "border-brand/60 bg-brand/[0.08] ring-1 ring-brand/20"
+                          : "border-white/[0.06] bg-white/[0.02] hover:border-white/[0.18]"
+                      }`}
+                    >
+                      <div className="relative aspect-video overflow-hidden bg-black">
+                        {m.sample ? (
+                          m.kind === "image"
+                            ? <img src={m.sample} alt="" className="h-full w-full object-cover pointer-events-none" />
+                            : <video src={m.sample} className="h-full w-full object-cover pointer-events-none" autoPlay loop muted playsInline />
+                        ) : (
+                          <div className="grid h-full w-full place-items-center text-gray-400" style={{ background: "radial-gradient(120% 100% at 50% 0,#2a1d52,#0b0820)" }}>
+                            <span className="h-7 w-7">{movIcon(m.code)}</span>
+                          </div>
+                        )}
+                        {active && (
+                          <div className="absolute right-1.5 top-1.5 grid h-4 w-4 place-items-center rounded-full bg-brand text-white">
+                            <svg className="h-2.5 w-2.5" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                          </div>
+                        )}
+                        {inVideo && anchorChip}
+                      </div>
+                      <p className={`truncate px-2 py-1.5 text-[10px] font-medium ${active ? "text-white" : "text-gray-400"}`}>
+                        {m.label.replace(/\s*\(.*\)\s*/, "")}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          ) : (
             <button
+              ref={movementPickerTriggerRef}
               type="button"
-              onClick={jumpToEffects}
-              className="shrink-0 rounded-full bg-amber-500/20 text-amber-200 text-[10px] font-medium px-2.5 py-1 ring-1 ring-amber-500/40 hover:bg-amber-500/30 transition-colors"
+              data-testid="movement-picker-toggle"
+              data-movement-summary={selectedMovement.code || "auto"}
+              data-in-video={isAnchor("movementStyle", selectedMovement.code) ? "true" : undefined}
+              aria-pressed="true"
+              aria-haspopup="true"
+              onClick={() => setMotionComposerView("movement")}
+              className="group flex w-full items-center gap-3 rounded-xl border border-white/[0.07] bg-white/[0.02] p-2.5 text-left transition-colors hover:border-white/[0.14] hover:bg-white/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand"
             >
-              {t("upload.foto_fija_goto_effect") || "Ir a Efecto"}
+              <div className="relative h-9 w-16 shrink-0 overflow-hidden rounded-lg bg-black">
+                {selectedMovement.sample ? (
+                  selectedMovement.kind === "image"
+                    ? <img src={selectedMovement.sample} alt="" className="h-full w-full object-cover" />
+                    : <video src={selectedMovement.sample} className="h-full w-full object-cover pointer-events-none" autoPlay loop muted playsInline />
+                ) : (
+                  <div className="grid h-full w-full place-items-center text-gray-400" style={{ background: "radial-gradient(120% 100% at 50% 0,#2a1d52,#0b0820)" }}>
+                    <span className="h-5 w-5">{movIcon(selectedMovement.code)}</span>
+                  </div>
+                )}
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="text-[9px] font-medium text-gray-600">
+                  {t("upload.movement_gallery_title") || "Movimiento base"}
+                </p>
+                <p className="truncate text-[12px] font-semibold text-white">
+                  {selectedMovement.label.replace(/\s*\(.*\)\s*/, "")}
+                </p>
+              </div>
+              <span className="hidden text-[9px] font-medium text-gray-500 sm:block">{t("common.change") || "Cambiar"}</span>
+              <svg className="h-4 w-4 shrink-0 text-gray-600 transition-transform group-hover:translate-x-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="m9 18 6-6-6-6" /></svg>
             </button>
-          </div>
-        )}
-      </div>
+          )}
+        </div>
+      )}
 
       {/* Effect gallery — particles composited OVER the background. Available
           for ANY source (IA / Biblioteca / Subido): it's an overlay, not a
           generation choice. Orthogonal to "Movimiento" (camera). */}
+      {motionComposerView !== "movement" && (
       <div
         ref={effectControlsRef}
-        className={`mb-4 pt-3 border-t border-white/[0.05] rounded-lg transition-all duration-500 ${
+        className={`mb-4 rounded-lg transition-all duration-500 ${
           effectControlsPulse
-            ? "ring-2 ring-amber-500/60 bg-amber-500/[0.05] -mx-2 px-2"
+            ? "ring-2 ring-brand/50 bg-brand/[0.04] -mx-2 px-2"
             : "ring-2 ring-transparent"
         }`}
       >
-        <div className="relative overflow-hidden rounded-2xl border border-white/[0.08] bg-[#0d0b17]/90 shadow-[0_20px_60px_rgba(0,0,0,0.28)]">
-          <div className="pointer-events-none absolute -top-28 -right-20 h-64 w-64 rounded-full bg-brand/15 blur-3xl" />
-          <div className="pointer-events-none absolute -bottom-32 -left-20 h-64 w-64 rounded-full bg-accent/10 blur-3xl" />
-
-          <div className="relative px-3.5 pt-3.5 sm:px-4 sm:pt-4">
-            <div className="flex items-start gap-2.5">
-              <div className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-brand/90 to-accent/80 text-white shadow-[0_8px_24px_rgba(124,58,237,0.3)]">
-                <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.7" viewBox="0 0 24 24" aria-hidden="true">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 3l1.25 4.25L17.5 8.5l-4.25 1.25L12 14l-1.25-4.25L6.5 8.5l4.25-1.25L12 3Z" />
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M18.5 14l.7 2.3 2.3.7-2.3.7-.7 2.3-.7-2.3-2.3-.7 2.3-.7.7-2.3ZM5 13l.55 1.8 1.8.55-1.8.55L5 17.7l-.55-1.8-1.8-.55 1.8-.55L5 13Z" />
-                </svg>
-              </div>
-              <div className="min-w-0 flex-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  <p className="text-[12px] font-semibold text-white">
-                    {t("upload.effect_gallery_title") || "Efecto encima"}
-                  </p>
-                  <span className="rounded-full border border-white/[0.08] bg-white/[0.04] px-2 py-0.5 text-[9px] font-medium tabular-nums text-gray-400">
-                    {EFFECT_CODES.length} {t("upload.effect_count_label") || "efectos"}
-                  </span>
+        <div className="overflow-hidden rounded-xl border border-white/[0.08] bg-white/[0.025]">
+          {/* The editor already has a large live preview. Keep this control
+              collapsed by default so the catalogue never competes with it. */}
+          <button
+            ref={effectPickerTriggerRef}
+            type="button"
+            data-testid="effect-picker-toggle"
+            data-effect-summary={selectedEffect.code || "none"}
+            data-in-video={isAnchor("effect", selectedEffect.code) ? "true" : undefined}
+            aria-pressed="true"
+            aria-expanded={motionComposerView === "effect"}
+            aria-haspopup="true"
+            onClick={() => setMotionComposerView((view) => view === "effect" ? null : "effect")}
+            className="group flex w-full items-center gap-3 p-2.5 text-left transition-colors hover:bg-white/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand"
+          >
+            <div className="relative h-11 w-[70px] shrink-0 overflow-hidden rounded-lg border border-white/[0.08] bg-black">
+              {selectedEffect.sample ? (
+                <video
+                  key={`selected-${selectedEffect.code}`}
+                  src={selectedEffect.sample}
+                  className="h-full w-full object-cover pointer-events-none"
+                  autoPlay loop muted playsInline
+                />
+              ) : (
+                <div
+                  className="grid h-full w-full place-items-center text-sm text-gray-500"
+                  style={{ background: "radial-gradient(120% 100% at 50% 0,#241a40,#0b0820)" }}
+                >
+                  Ø
                 </div>
-                <p className="mt-0.5 max-w-2xl text-[10px] leading-relaxed text-gray-500">
-                  {t("upload.effect_gallery_desc") || "Movimiento y textura sobre el fondo: partículas, luces, película, niebla y más. Se suma a cualquier fondo, incluso de Biblioteca."}
+              )}
+              {selectedEffect.code && (
+                <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_7px_rgba(52,211,153,0.9)]" />
+              )}
+            </div>
+
+            <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 items-center gap-2">
+                <p className="shrink-0 text-[10px] font-medium text-gray-500">
+                  {t("upload.effect_gallery_title") || "Efecto encima"}
                 </p>
-                {files.length > 1 && (
-                  <p className="mt-1 text-[9px] leading-snug text-gray-600">
-                    {t("upload.effect_gallery_hint") || "Click para aplicar a todos · personalizable por canción"}
-                  </p>
-                )}
+                <span className="truncate text-[12px] font-semibold text-white">
+                  {selectedEffect.label}
+                </span>
               </div>
+              <p className="mt-0.5 truncate text-[10px] text-gray-500">
+                {selectedEffect.desc}
+              </p>
             </div>
 
-            {/* Large selected/hovered preview gives the catalogue a visual
-                hierarchy and reuses the exact same sample asset as the card. */}
-            <div
-              data-testid="effect-featured"
-              className="mt-3 grid grid-cols-1 overflow-hidden rounded-2xl border border-white/[0.08] bg-black/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]"
-              aria-live="polite"
-            >
-              <div className="relative aspect-video min-h-[126px] overflow-hidden bg-black">
-                {featuredEffect.sample ? (
-                  <video
-                    key={`featured-${featuredEffect.code}`}
-                    src={featuredEffect.sample}
-                    className="h-full w-full object-cover"
-                    autoPlay loop muted playsInline
-                  />
-                ) : (
-                  <div
-                    className="absolute inset-0 overflow-hidden"
-                    style={{ background: "radial-gradient(100% 130% at 20% 0%,#30204c 0%,#12101e 50%,#090810 100%)" }}
-                  >
-                    <div className="absolute left-[14%] top-[16%] h-24 w-24 rounded-full border border-white/[0.07]" />
-                    <div className="absolute bottom-[-20%] right-[10%] h-40 w-40 rounded-full border border-brand/20" />
-                    <div className="absolute inset-0 grid place-items-center">
-                      <div className="grid h-12 w-12 place-items-center rounded-2xl border border-white/[0.08] bg-white/[0.04] text-lg text-gray-500 backdrop-blur">
-                        Ø
-                      </div>
-                    </div>
-                  </div>
-                )}
-                <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/45 via-transparent to-black/10" />
-                <div className="absolute left-2.5 top-2.5 flex items-center gap-1.5">
-                  <span className="rounded-full border border-white/10 bg-black/35 px-2 py-1 text-[8px] font-semibold uppercase tracking-[0.12em] text-white/80 backdrop-blur-md">
-                    {hoverEffect !== null
-                      ? (t("upload.effect_previewing") || "Vista previa")
-                      : (t("upload.effect_selected") || "Seleccionado")}
-                  </span>
-                  {featuredEffect.code && (
-                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.9)]" />
-                  )}
-                </div>
-              </div>
-              <div className="relative flex min-h-[112px] flex-col justify-between border-t border-white/[0.06] bg-white/[0.025] p-3.5">
-                <div>
-                  <p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-brand-light/80">
-                    {featuredCategory?.label || (t("upload.effect_category_clean") || "Limpio")}
-                  </p>
-                  <p className="mt-1 text-[16px] font-semibold tracking-[-0.02em] text-white">
-                    {featuredEffect.label}
-                  </p>
-                  <p className="mt-1.5 text-[10px] leading-relaxed text-gray-400">
-                    {featuredEffect.desc}
-                  </p>
-                </div>
-                <div className="mt-3 flex items-center gap-1.5 text-[9px] text-gray-600">
-                  <span className="inline-block h-1.5 w-1.5 rounded-full bg-brand/70" />
-                  {t("upload.effect_hover_hint") || "Pasá el cursor para explorar · click para elegir"}
-                </div>
-              </div>
-            </div>
-
-            <div
-              className="mt-3 flex gap-1.5 overflow-x-auto pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-              role="tablist"
-              aria-label={t("upload.effect_categories_label") || "Categorías de efectos"}
-            >
-              {EFFECT_CATEGORIES.map((category) => {
-                const selected = effectCategory === category.code;
-                const count = category.code === "all"
-                  ? EFFECTS.length
-                  : EFFECTS.filter((effect) => effect.category === category.code).length;
-                return (
-                  <button
-                    key={category.code}
-                    type="button"
-                    role="tab"
-                    aria-selected={selected}
-                    data-effect-category={category.code}
-                    onClick={() => setEffectCategory(category.code)}
-                    className={`flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1.5 text-[10px] font-medium transition-all duration-200 ${
-                      selected
-                        ? "border-brand/50 bg-brand/15 text-white shadow-[0_0_18px_rgba(124,58,237,0.16)]"
-                        : "border-white/[0.07] bg-white/[0.025] text-gray-500 hover:border-white/[0.15] hover:bg-white/[0.05] hover:text-gray-300"
-                    }`}
-                  >
-                    {category.label}
-                    <span className={`text-[8px] tabular-nums ${selected ? "text-brand-light" : "text-gray-600"}`}>
-                      {count}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          <div className="relative grid grid-cols-[repeat(auto-fit,minmax(118px,1fr))] gap-2 p-3 pt-2">
-          {visibleEffects.map((e) => {
-            const active = (batchDefaults.effect || "") === e.code;
-            const inVideo = isAnchor("effect", e.code);
-            // Con Foto fija, "Sin efecto" deja de ser un default neutro: es la
-            // decisión de que el fondo quede quieto. El texto ACCESIBLE tiene
-            // que decir lo mismo que el visible — antes el aria-label seguía
-            // diciendo "Ninguno: fondo limpio, sin efecto", o sea que un lector
-            // de pantalla recibía justo el encuadre que este bloque corrige.
-            const _stillNote = (!e.code && batchDefaults.movementStyle === "foto-parallax")
-              ? (t("upload.effect_none_still") || "Sin efecto — imagen quieta")
-              : null;
-            return (
-              <button
-                key={e.code || "none"}
-                type="button"
-                onClick={() => updateBatchDefault("effect", e.code)}
-                onMouseEnter={() => setHoverEffect(e.code)}
-                onMouseLeave={() => setHoverEffect(null)}
-                onFocus={() => setHoverEffect(e.code)}
-                onBlur={() => setHoverEffect(null)}
-                aria-pressed={active}
-                data-effect={e.code || "none"}
-                data-in-video={inVideo ? "true" : undefined}
-                aria-label={`${_stillNote ? _stillNote : `${e.label}: ${e.desc}`}${inVideo ? ` — ${ANCHOR_LABEL}` : ""}`}
-                title={_stillNote || e.desc}
-                className={`group relative overflow-hidden rounded-xl border text-left transition-all duration-200 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand ${
-                  active
-                    ? "border-brand/60 bg-brand/[0.09] shadow-[0_12px_30px_rgba(104,48,203,0.18)] ring-1 ring-brand/25"
-                    : "border-white/[0.07] bg-white/[0.025] hover:-translate-y-0.5 hover:border-white/[0.18] hover:bg-white/[0.045] hover:shadow-[0_12px_28px_rgba(0,0,0,0.24)]"
-                }`}
+            <div className="flex shrink-0 items-center gap-2">
+              <span className="hidden rounded-full border border-white/[0.08] bg-white/[0.035] px-2 py-1 text-[9px] font-medium text-gray-400 sm:block">
+                {t("common.change") || "Cambiar"}
+              </span>
+              <svg
+                className={`h-4 w-4 text-gray-500 transition-transform duration-200 ${motionComposerView === "effect" ? "rotate-180" : ""}`}
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
               >
-                <div className="relative aspect-video overflow-hidden bg-black">
-                  {e.sample ? (
-                    <video src={e.sample} className="h-full w-full object-cover pointer-events-none transition-transform duration-500 group-hover:scale-[1.035]" autoPlay loop muted playsInline />
-                  ) : (
-                    <div className="grid h-full w-full place-items-center text-gray-500" style={{ background: "radial-gradient(120% 100% at 50% 0,#241a40,#0b0820)" }}>
-                      <span className="grid h-8 w-8 place-items-center rounded-xl border border-white/[0.08] bg-white/[0.04] text-[14px]">Ø</span>
-                    </div>
-                  )}
-                  <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/55 via-transparent to-transparent opacity-70" />
-                  {active && (
-                    <div className="absolute right-1.5 top-1.5 grid h-5 w-5 place-items-center rounded-full bg-white text-brand shadow-[0_4px_12px_rgba(0,0,0,0.3)]">
-                      <svg className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
-                    </div>
-                  )}
-                  {inVideo && anchorChip}
-                </div>
-                <div className="flex items-center justify-between gap-2 px-2.5 py-2">
-                  {/* Con Foto fija, "Sin efecto" deja de ser un default neutro:
-                      es la decisión de que el fondo quede quieto. Que lo diga. */}
-                  <p className={`truncate text-[10px] font-medium leading-tight ${active ? "text-white" : "text-gray-300"}`}>
-                    {_stillNote || e.label}
-                  </p>
-                  <span className={`h-1.5 w-1.5 shrink-0 rounded-full transition-colors ${
-                    active ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]" : "bg-white/10 group-hover:bg-white/25"
-                  }`} />
-                </div>
-              </button>
-            );
-          })}
-          </div>
+                <path strokeLinecap="round" strokeLinejoin="round" d="m7 10 5 5 5-5" />
+              </svg>
+            </div>
+          </button>
+
+          {motionComposerView === "effect" && (
+            <div
+              data-testid="effect-picker-panel"
+              className="max-h-[calc(100vh-240px)] overflow-y-auto border-t border-white/[0.07] bg-[#0b0913]/80 px-2.5 pb-2.5 pt-2"
+            >
+              <div
+                className="flex gap-1.5 overflow-x-auto pb-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+                role="group"
+                aria-label={t("upload.effect_categories_label") || "Categorías de efectos"}
+              >
+                {EFFECT_CATEGORIES.map((category) => {
+                  const selected = effectCategory === category.code;
+                  return (
+                    <button
+                      key={category.code}
+                      type="button"
+                      aria-pressed={selected}
+                      data-effect-category={category.code}
+                      onClick={() => setEffectCategory(category.code)}
+                      className={`flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[9px] font-medium transition-colors ${
+                        selected
+                          ? "border-brand/45 bg-brand/15 text-white"
+                          : "border-white/[0.07] bg-white/[0.02] text-gray-500 hover:border-white/[0.14] hover:text-gray-300"
+                      }`}
+                    >
+                      {category.label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                {visibleEffects.map((e) => {
+                  const active = (batchDefaults.effect || "") === e.code;
+                  const inVideo = isAnchor("effect", e.code);
+                  const _stillNote = (!e.code && batchDefaults.movementStyle === "foto-parallax")
+                    ? (t("upload.effect_none_still") || "Sin efecto — imagen quieta")
+                    : null;
+                  return (
+                    <button
+                      key={e.code || "none"}
+                      type="button"
+                      onClick={() => updateBatchDefault("effect", e.code)}
+                      onMouseEnter={() => setHoverEffect(e.code)}
+                      onMouseLeave={() => setHoverEffect(null)}
+                      onFocus={() => setHoverEffect(e.code)}
+                      onBlur={() => setHoverEffect(null)}
+                      aria-pressed={active}
+                      data-effect={e.code || "none"}
+                      data-in-video={inVideo ? "true" : undefined}
+                      aria-label={`${_stillNote || `${e.label}: ${e.desc}`}${inVideo ? ` — ${ANCHOR_LABEL}` : ""}`}
+                      title={_stillNote || e.desc}
+                      className={`group relative overflow-hidden rounded-lg border text-left transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand ${
+                        active
+                          ? "border-brand/70 bg-brand/[0.1] ring-1 ring-brand/20"
+                          : "border-white/[0.07] bg-white/[0.025] hover:border-white/[0.18] hover:bg-white/[0.05]"
+                      }`}
+                    >
+                      <div className="relative aspect-video overflow-hidden bg-black">
+                        {e.sample ? (
+                          <>
+                            <img
+                              src={e.sample.replace(/\.mp4$/, ".jpg")}
+                              alt=""
+                              className="h-full w-full object-cover pointer-events-none transition-transform duration-300 group-hover:scale-[1.04]"
+                            />
+                            {(active || hoverEffect === e.code) && (
+                              <video
+                                src={e.sample}
+                                className="absolute inset-0 h-full w-full object-cover pointer-events-none"
+                                autoPlay
+                                preload="auto"
+                                loop muted playsInline
+                              />
+                            )}
+                          </>
+                        ) : (
+                          <div className="grid h-full w-full place-items-center text-gray-500" style={{ background: "radial-gradient(120% 100% at 50% 0,#241a40,#0b0820)" }}>
+                            <span className="text-sm">Ø</span>
+                          </div>
+                        )}
+                        {active && (
+                          <div className="absolute right-1 top-1 grid h-4 w-4 place-items-center rounded-full bg-white text-brand shadow">
+                            <svg className="h-2.5 w-2.5" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                          </div>
+                        )}
+                        {inVideo && anchorChip}
+                      </div>
+                      <p className={`truncate px-2 py-1.5 text-[9px] font-medium ${active ? "text-white" : "text-gray-400"}`}>
+                        {_stillNote || e.label}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <p className="mt-1.5 text-[9px] leading-snug text-gray-600">
+                {files.length > 1
+                  ? (t("upload.effect_gallery_hint") || "Click para aplicar a todos · personalizable por canción")
+                  : (t("upload.effect_hover_hint") || "Pasá el cursor para explorar · click para elegir")}
+              </p>
+            </div>
+          )}
         </div>
+        {motionComposerView === null
+          && batchDefaults.movementStyle === "foto-parallax"
+          && !batchDefaults.effect && (
+          <div
+            data-testid="foto-fija-warning"
+            className="mt-1.5 flex items-center gap-2 px-1 text-[10px] text-gray-500"
+          >
+            <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-white/20" />
+            <span className="min-w-0 flex-1">
+              {t("upload.effect_none_still") || "Resultado: imagen inmóvil"}
+            </span>
+            <button
+              type="button"
+              onClick={jumpToEffects}
+              className="shrink-0 font-medium text-brand-light transition-colors hover:text-white"
+            >
+              {t("upload.foto_fija_goto_effect") || "Agregar vida"}
+            </button>
+          </div>
+        )}
       </div>
+      )}
 
       {/* Scene metadata (genre + concept) — only when generating with AI.
           Explained inline so it's clear what they DO and how they impact. */}
-      {bgMode === "auto" && (
+      {motionComposerView === null && bgMode === "auto" && (
         <div className="mb-4 pt-3 border-t border-white/[0.05]">
           <p className="text-[11px] text-gray-400 font-medium">{t("upload.scene_meta_title") || "Escena"}</p>
           {/* Edición del fondo = el editor de siempre (Movimiento/Efecto/hint
