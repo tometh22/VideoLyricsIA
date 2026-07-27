@@ -8,7 +8,9 @@ import HelpTip from "./HelpCenter/HelpTip";
 import ContentValidationToggle, { isUniversalAccount } from "./ContentValidationToggle";
 import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
-import { CONCEPT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
+import { CONCEPT_CODES, EFFECT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
+import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS } from "../lib/optionLabels";
+import EditPlanSummary from "./EditPlanSummary";
 import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBackgroundPreviewTokens";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -273,6 +275,22 @@ export default function UploadZone({
   // backgroundHint, bgVerbatim, matchLyrics }. No toca r.* (el diff usa
   // initialFields), sólo el display.
   editSeed = null,
+  // Cómo está RENDERIZADO el video hoy (currentReview.baseline). Alimenta el
+  // chip "EN EL VIDEO" de las galerías: el anillo violeta dice "lo que elegí",
+  // el chip ámbar dice "lo que el video tiene". Cuando coinciden, una tarjeta
+  // lleva los dos; cuando no, se marcan dos y el cambio queda dibujado.
+  // El anillo solo era la señal que engañó al operador del reclamo original.
+  editBaseline = null,
+  // Plan en vivo de la edición: { willApply, willDrop, blocked } calculado con
+  // resolveEditSubmission, la MISMA función que arma el POST. Es lo que permite
+  // que el wizard deje de prometer lo que el backend va a descartar.
+  editPlan = null,
+  // "status" | "scenes" | null — independiente de si ya hay cambios.
+  bgBlockedReason = null,
+  // Cupo REAL de ediciones. El texto decía "usa 1 de tus 3 ediciones" fijo,
+  // así que en un job con 7 ediciones mentía.
+  editsRemaining = null,
+  editLimitExempt = false,
   // UI v1.1 (2026-05-30): artist/song to render inside the central
   // title-card preview. Caller (App.jsx) passes these from the
   // currentReview when in edit mode, or from the first file when in
@@ -405,6 +423,26 @@ export default function UploadZone({
   // llega al render) queda a la vista.
   const portadaControlsRef = useRef(null);
   const [portadaControlsPulse, setPortadaControlsPulse] = useState(false);
+  // Mismo mecanismo, para el grupo de Efecto: "Foto fija" no tiene movimiento
+  // propio (el Ken Burns se sacó por el OOM de Rata Blanca, 02-jun), así que sin
+  // un efecto encima el fondo queda inmóvil los 3-4 minutos. El aviso vive donde
+  // el operador clickea (Movimiento) y este pulse lo lleva al control que lo
+  // resuelve — clon del fix de descubribilidad de la portada (incidente Clari
+  // 19-jul, "no encuentro dónde agrandar el título").
+  const effectControlsRef = useRef(null);
+  const [effectControlsPulse, setEffectControlsPulse] = useState(false);
+  // El timer vive en un ref y se limpia al desmontar: sin eso un click seguido
+  // de navegar fuera del wizard deja un setState pendiente sobre un componente
+  // muerto. Mismo cuidado que el pulse de la portada, que ya limpiaba el suyo.
+  const effectPulseTimerRef = useRef(null);
+  useEffect(() => () => clearTimeout(effectPulseTimerRef.current), []);
+  const jumpToEffects = () => {
+    const el = effectControlsRef.current;
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    setEffectControlsPulse(true);
+    clearTimeout(effectPulseTimerRef.current);
+    effectPulseTimerRef.current = setTimeout(() => setEffectControlsPulse(false), 1800);
+  };
   useEffect(() => {
     if (previewFace !== "title") return;
     const el = portadaControlsRef.current;
@@ -421,11 +459,18 @@ export default function UploadZone({
   const updateBatchDefault = (field, value) => {
     setBatchDefaults((prev) => {
       const next = { ...prev, [field]: value };
-      try {
-        localStorage.setItem(BATCH_DEFAULTS_STORAGE_KEY, JSON.stringify(next));
-      } catch {
-        // Quota exceeded / private-mode storage off — the picks still work
-        // in-session, they just won't survive a refresh. Don't block the UI.
+      // El sticky es para BATCHES NUEVOS. Editar un video existente no puede
+      // reescribirlo: si no, arreglar el fondo de un video contamina el
+      // siguiente upload con los ajustes de ESE video — y encima al volver a
+      // editar otro job el sticky contaminado es lo que se pintaba (el bug que
+      // originó esto). En edición/variante los controles se siembran del job.
+      if (!editMode) {
+        try {
+          localStorage.setItem(BATCH_DEFAULTS_STORAGE_KEY, JSON.stringify(next));
+        } catch {
+          // Quota exceeded / private-mode storage off — the picks still work
+          // in-session, they just won't survive a refresh. Don't block the UI.
+        }
       }
       return next;
     });
@@ -497,13 +542,17 @@ export default function UploadZone({
       concept: editSeed.concept || "",
       backgroundHint: editSeed.backgroundHint || "",
       bgVerbatim: editSeed.bgVerbatim != null ? !!editSeed.bgVerbatim : prev.bgVerbatim,
-      // `wizardFields` sólo llega en modo VARIANTE: ahí el submit manda el
-      // estado ABSOLUTO de cada eje, así que un control que muestre el
-      // sticky de localStorage en vez del valor del padre mandaría ese
-      // sticky al backend. En edición no viene (el submit es un diff: un
-      // campo sin tocar no viaja, así que la semilla es sólo cosmética).
+      // `wizardFields` ahora llega SIEMPRE (edición y variante). En variante es
+      // obligatorio porque el submit manda el estado ABSOLUTO. En edición el
+      // submit es un diff, así que la semilla no cambia qué viaja — pero SÍ
+      // cambia lo que el operador ve, y ver el sticky de otro batch en vez del
+      // valor de este video es exactamente lo que hacía que no clickeara y el
+      // render saliera igual que antes.
       ...(editSeed.wizardFields || {}),
     }));
+    // El prompt del job arranca como "guardado": si el operador cambia de modo,
+    // la tarjeta ya puede ofrecérselo de vuelta.
+    setSavedPrompt((editSeed.backgroundHint || "").trim());
     setSceneMode(
       (editSeed.backgroundHint || "").trim()
         ? "prompt"
@@ -511,6 +560,32 @@ export default function UploadZone({
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editMode, editSeed?.jobId]);
+
+  // ── Ancla "EN EL VIDEO" ──────────────────────────────────────────────────
+  // El anillo violeta + check ya es una señal fortísima de "seleccionado" — y
+  // es justamente por eso que el operador confió en él y no clickeó. Marcar
+  // *diferencias* no lo salva: la señal que lo habría salvado es la AUSENCIA de
+  // marca, y eso nadie lo parsea. Así que marcamos el presente en vez del
+  // cambio: dos estados dentro de la misma mirada, "lo que elegí" (violeta) y
+  // "lo que el video tiene" (ámbar). Cuando coinciden, una tarjeta lleva los
+  // dos; cuando no, se marcan dos y el cambio queda dibujado.
+  const ANCHOR_LABEL = t("upload.anchor_in_video") || "En el video";
+  const isAnchor = (field, code) => {
+    if (!editMode || !editBaseline) return false;
+    return String(editBaseline[field] ?? "") === String(code ?? "");
+  };
+  // Elemento, no COMPONENTE: declarar un componente dentro del cuerpo de
+  // render crea un tipo nuevo en cada pasada, así que React desmontaba y
+  // remontaba el chip en cada hover de las 12 tarjetas de las galerías.
+  const anchorChip = (
+    <span
+      className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wide bg-amber-500/20 text-amber-300 ring-1 ring-amber-500/40 backdrop-blur-sm"
+      title={t("upload.anchor_in_video_hint") || "Es lo que este video tiene ahora"}
+    >
+      {ANCHOR_LABEL}
+    </span>
+  );
+
   // Elegibilidad del add-on premium "Escenas" (multi-escena). Robusto: el
   // backend manda vía features.scenes (admin OR SCENES_ENABLED_TENANTS), pero
   // los admin siempre califican aunque la sesión cacheada no traiga el flag.
@@ -564,6 +639,24 @@ export default function UploadZone({
     setCustomPreviewUrl(url);
     return () => URL.revokeObjectURL(url);
   }, [backgroundFile]);
+  // ── "Mi prompt" como artefacto guardado ─────────────────────────────────
+  // Antes, clickear "Auto" o "Inspirado en la letra" ejecutaba un clear del
+  // prompt: sin confirmación, sin undo, sin quedar registrado en ningún lado.
+  // Y la trampa: un job CON prompt y match_lyrics=true se muestra en modo "Mi
+  // prompt" (el hint le gana, fiel a resolve_creative_mode), así que el
+  // operador cuya configuración YA era "inspirado en la letra" clickeaba esa
+  // tarjeta para corregirla — y en ese click perdía su prompt. Pasó dos veces
+  // en la cadena del reclamo.
+  //
+  // El clear del CABLE se mantiene: es el fix #982 y es necesario, porque en el
+  // backend un hint no vacío le gana SIEMPRE a match_lyrics
+  // (background_policy.resolve_creative_mode) y además revive de render_params
+  // en cada regen. Conservar el texto en el payload haría que el modo elegido
+  // se ignore — cambiaría "te borra el prompt" por "te ignora el modo".
+  //
+  // Lo que cambia es que el texto no se DESTRUYE: queda guardado en el wizard y
+  // vuelve con un click. Borrarlo pasa a ser una acción explícita del operador.
+  const [savedPrompt, setSavedPrompt] = useState("");
   const selectSceneMode = (m) => {
     track("wizard.scene_mode", { mode: m });
     setSceneMode(m);
@@ -577,13 +670,24 @@ export default function UploadZone({
     // /edit (computeFieldDiff → bucket background). onInspiredByLyricsChange
     // solo toca el estado top-level del flujo de creación, no currentReview.
     if (editMode) onEditFieldChange?.("matchLyrics", _ml);
-    if (m === "auto") {
-      if (_hint) updateBatchDefault("backgroundHint", "");   // stale prompt must not override
-    } else if (m === "lyrics") {
-      if (_hint) updateBatchDefault("backgroundHint", "");
+    if (m === "auto" || m === "lyrics") {
+      // El prompt sale del payload (el modo manda) pero se GUARDA antes.
+      if (_hint) {
+        setSavedPrompt(_hint);
+        updateBatchDefault("backgroundHint", "");
+      }
+    } else if (m === "prompt") {
+      // Volver a "Mi prompt" restaura lo último guardado si el campo está
+      // vacío — el camino de vuelta que antes no existía.
+      if (!_hint && savedPrompt) updateBatchDefault("backgroundHint", savedPrompt);
     }
     // Nota: multi-escena (enableScenes) es ORTOGONAL — funciona con cualquiera
     // de los 3 modos; su toggle premium vive debajo de las cards.
+  };
+  // Descartar el prompt guardado: única vía de destrucción, y es explícita.
+  const discardSavedPrompt = () => {
+    setSavedPrompt("");
+    if (_hint) updateBatchDefault("backgroundHint", "");
   };
   // Sample lyric for the live preview: first file's title, else a placeholder.
   // Phase 3 (2026-05-25): si estamos en review (reviewSegments presente),
@@ -710,6 +814,7 @@ export default function UploadZone({
   // Hovering a movement option previews it in the big stage without committing.
   const [hoverMovement, setHoverMovement] = useState(null);
   const [hoverEffect, setHoverEffect] = useState(null);
+  const [effectCategory, setEffectCategory] = useState("all");
   // Same for the lyrics-animation step: hover previews the template live.
   const [hoverAnimation, setHoverAnimation] = useState(null);
   // And for the line-transition picker (lives in the same Animación step).
@@ -923,15 +1028,19 @@ export default function UploadZone({
   // Los CÓDIGOS viven en lib/catalogCodes.js (contrato de paridad con
   // pipeline._MOVEMENT_STYLE_RULES, asertado por renderParity.test.js);
   // acá solo la metadata de UI por código.
+  // Las ETIQUETAS salen de lib/optionLabels, compartidas con WizardLivePreview
+  // y con la ficha del video (JobDetail). Acá queda sólo la metadata de UI por
+  // código: `kind`, el sample y la descripción.
+  const _MOVE_LABELS = MOVEMENT_LABELS(t);
   const MOVEMENT_META = {
-    estatico:        { kind: "video", label: t("upload.movement_estatico") || "Estático (escena viva)",     sample: "/movement_samples/estatico.mp4",  desc: t("upload.movement_estatico_desc") || "🎬 Escena real con cámara FIJA. Lo que se mueve son los elementos de la escena (gente, olas, nubes, neblina, fuego)." },
-    sutil:           { kind: "video", label: t("upload.movement_sutil") || "Sutil (cámara apenas drift)",   sample: "/movement_samples/sutil.mp4",     desc: t("upload.movement_sutil_desc") || "🎬 Escena real con drift sutil de cámara + motion in-scene. Calmo pero vivo." },
-    estandar:        { kind: "video", label: t("upload.movement_estandar") || "Estándar (cinematográfico)", sample: "/movement_samples/estandar.mp4",  desc: t("upload.movement_estandar_desc") || "🎬 Escena real con movimiento cinematográfico de cámara (zoom/drift)." },
-    "foto-parallax": { kind: "image", label: t("upload.movement_foto_parallax") || "Foto fija",             sample: "/movement_samples/foto-fija.jpg", desc: t("upload.movement_parallax_desc") || "Foto IA fija (sin movimiento de cámara). Sumale un efecto abajo —lluvia, nieve, luces— para darle vida." },
-    animado:         { kind: "video", label: t("upload.movement_animado") || "Animado (ilustración)",       sample: "/movement_samples/animado.mp4",   desc: t("upload.movement_animado_desc") || "🎬 Ilustración 2D estilizada animada, no fotorrealista." },
+    estatico:        { kind: "video", label: _MOVE_LABELS.estatico,         sample: "/movement_samples/estatico.mp4",  desc: t("upload.movement_estatico_desc") || "🎬 Escena real con cámara FIJA. Lo que se mueve son los elementos de la escena (gente, olas, nubes, neblina, fuego)." },
+    sutil:           { kind: "video", label: _MOVE_LABELS.sutil,            sample: "/movement_samples/sutil.mp4",     desc: t("upload.movement_sutil_desc") || "🎬 Escena real con drift sutil de cámara + motion in-scene. Calmo pero vivo." },
+    estandar:        { kind: "video", label: _MOVE_LABELS.estandar,         sample: "/movement_samples/estandar.mp4",  desc: t("upload.movement_estandar_desc") || "🎬 Escena real con movimiento cinematográfico de cámara (zoom/drift)." },
+    "foto-parallax": { kind: "image", label: _MOVE_LABELS["foto-parallax"], sample: "/movement_samples/foto-fija.jpg", desc: t("upload.movement_parallax_desc") || "Foto IA fija (sin movimiento de cámara). Sumale un efecto abajo —lluvia, nieve, luces— para darle vida." },
+    animado:         { kind: "video", label: _MOVE_LABELS.animado,          sample: "/movement_samples/animado.mp4",   desc: t("upload.movement_animado_desc") || "🎬 Ilustración 2D estilizada animada, no fotorrealista." },
   };
   const MOVEMENT_STYLES = [
-    { code: "", kind: "auto", label: t("upload.movement_auto") || "Auto", sample: null, desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
+    { code: "", kind: "auto", label: _MOVE_LABELS[""], sample: null, desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
     ...MOVEMENT_CODES.map((code) => ({
       code,
       ...(MOVEMENT_META[code] || { kind: "video", label: code, sample: null, desc: "" }),
@@ -944,20 +1053,49 @@ export default function UploadZone({
   // falls on top of anything, even a still photo or a Library/uploaded clip.
   // Backed by pre-rendered alpha-screen loops; preview clips live at
   // /fx_samples/<code>.mp4 (effect composited over a neutral gradient).
+  const _FX_LABELS = EFFECT_LABELS(t);
+  const EFFECT_META = {
+    snow: { category: "particles", sample: "/fx_samples/snow.mp4", desc: t("upload.effect_snow_desc") || "Copos cayendo. Calmo, invernal." },
+    rain: { category: "particles", sample: "/fx_samples/rain.mp4", desc: t("upload.effect_rain_desc") || "Gotas finas sobre la escena." },
+    stars: { category: "particles", sample: "/fx_samples/stars.mp4", desc: t("upload.effect_stars_desc") || "Partículas que titilan. Nocturno." },
+    bokeh: { category: "ambient", sample: "/fx_samples/bokeh.mp4", desc: t("upload.effect_bokeh_desc") || "Luces desenfocadas flotando." },
+    light: { category: "ambient", sample: "/fx_samples/light.mp4", desc: t("upload.effect_light_desc") || "Focos cálidos y fríos que recorren la imagen." },
+    aurora: { category: "ambient", sample: "/fx_samples/aurora.mp4", desc: t("upload.effect_aurora_desc") || "Cortinas de luz verde y violeta." },
+    dust: { category: "particles", sample: "/fx_samples/dust.mp4", desc: t("upload.effect_dust_desc") || "Motas cálidas suspendidas en el aire." },
+    embers: { category: "particles", sample: "/fx_samples/embers.mp4", desc: t("upload.effect_embers_desc") || "Chispas anaranjadas que suben." },
+    petals: { category: "particles", sample: "/fx_samples/petals.mp4", desc: t("upload.effect_petals_desc") || "Pétalos suaves cayendo." },
+    prism: { category: "stylized", sample: "/fx_samples/prism.mp4", desc: t("upload.effect_prism_desc") || "Barrido de luz multicolor." },
+    confetti: { category: "particles", sample: "/fx_samples/confetti.mp4", desc: t("upload.effect_confetti_desc") || "Papelitos de colores en movimiento." },
+    film: { category: "stylized", sample: "/fx_samples/film.mp4", desc: t("upload.effect_film_desc") || "Grano, polvo y rayas de película analógica." },
+    scanlines: { category: "stylized", sample: "/fx_samples/scanlines.mp4", desc: t("upload.effect_scanlines_desc") || "Líneas de pantalla y barrido de color retro." },
+    fog: { category: "ambient", sample: "/fx_samples/fog.mp4", desc: t("upload.effect_fog_desc") || "Bancos de niebla suaves que recorren la foto." },
+    shapes: { category: "stylized", sample: "/fx_samples/shapes.mp4", desc: t("upload.effect_shapes_desc") || "Figuras gráficas que flotan sobre la imagen." },
+  };
   const EFFECTS = [
-    { code: "",       label: t("upload.effect_none") || "Ninguno",     sample: null,                     desc: t("upload.effect_none_desc") || "Fondo limpio, sin efecto." },
-    { code: "snow",   label: t("upload.effect_snow") || "Nieve",       sample: "/fx_samples/snow.mp4",   desc: t("upload.effect_snow_desc") || "Copos cayendo. Calmo, invernal." },
-    { code: "rain",   label: t("upload.effect_rain") || "Lluvia",      sample: "/fx_samples/rain.mp4",   desc: t("upload.effect_rain_desc") || "Gotas finas sobre la escena." },
-    { code: "stars",  label: t("upload.effect_stars") || "Estrellas",  sample: "/fx_samples/stars.mp4",  desc: t("upload.effect_stars_desc") || "Partículas que titilan. Nocturno." },
-    { code: "bokeh",  label: t("upload.effect_bokeh") || "Bokeh",      sample: "/fx_samples/bokeh.mp4",  desc: t("upload.effect_bokeh_desc") || "Luces desenfocadas flotando." },
-    { code: "light",  label: t("upload.effect_light") || "Luz",        sample: "/fx_samples/light.mp4",  desc: t("upload.effect_light_desc") || "Destellos suaves. Atardecer, glow." },
-    // 2026-06-04: "Aurora" removido del selector — su asset (assets/fx/aurora.mp4)
-    // es una COPIA de light.mp4, así que renderizaba idéntico a "Luz". El backend
-    // sigue soportando effect="aurora" (EFFECTS en fx_compositor.py) por compat,
-    // pero no lo ofrecemos hasta tener un loop de aurora propio (cortinas
-    // ondulantes verde/teal). Para re-activarlo: restaurar la entrada de abajo.
-    // { code: "aurora", label: t("upload.effect_aurora") || "Aurora", sample: "/fx_samples/aurora.mp4", desc: t("upload.effect_aurora_desc") || "Líneas de luz ondulantes que cruzan el cielo." },
+    { code: "", category: "clean", label: _FX_LABELS[""], sample: null, desc: t("upload.effect_none_desc") || "Fondo limpio, sin efecto." },
+    ...EFFECT_CODES.map((code) => ({
+      code,
+      label: _FX_LABELS[code] || code,
+      ...(EFFECT_META[code] || { sample: null, desc: "" }),
+    })),
   ];
+  const EFFECT_CATEGORIES = [
+    { code: "all", label: t("upload.effect_category_all") || "Todos" },
+    { code: "ambient", label: t("upload.effect_category_ambient") || "Ambiente" },
+    { code: "particles", label: t("upload.effect_category_particles") || "Partículas" },
+    { code: "stylized", label: t("upload.effect_category_stylized") || "Estilos" },
+  ];
+  const visibleEffects = effectCategory === "all"
+    ? EFFECTS
+    : EFFECTS.filter((effect) => effect.category === effectCategory);
+  const featuredEffectCode = hoverEffect !== null
+    ? hoverEffect
+    : (batchDefaults.effect || "");
+  const featuredEffect = EFFECTS.find((effect) => effect.code === featuredEffectCode)
+    || EFFECTS[0];
+  const featuredCategory = EFFECT_CATEGORIES.find(
+    (category) => category.code === featuredEffect.category,
+  );
 
   // Lyrics-animation templates. These are rendered as libass override tags in
   // the same single ffmpeg pass as the static text → zero impact on render
@@ -1012,19 +1150,20 @@ export default function UploadZone({
     ...CONCEPT_CODES.map((code) => ({ code, label: CONCEPT_LABELS[code] || code })),
   ];
 
+  const _FONT_LABELS = FONT_LABELS(t);
   const FONTS = [
-    { code: "",                label: t("upload.font_auto") || "Auto",     css: "" },
-    { code: "fredoka",         label: "Fredoka (redondeada)",              css: "'Fredoka', sans-serif",    weight: 600 },
-    { code: "quicksand",       label: "Quicksand (suave)",                 css: "'Quicksand', sans-serif",  weight: 700 },
-    { code: "nunito",          label: "Nunito (amigable)",                 css: "'Nunito', sans-serif",     weight: 800 },
-    { code: "jost-bold",       label: "Jost (estilo Futura)",              css: "'Jost', sans-serif",       weight: 700 },
-    { code: "montserrat-bold", label: "Montserrat",                        css: "'Montserrat', sans-serif", weight: 700 },
-    { code: "poppins-bold",    label: "Poppins",                           css: "'Poppins', sans-serif",    weight: 700 },
-    { code: "outfit-bold",     label: "Outfit (estilo Gilroy)",            css: "'Outfit', sans-serif",     weight: 700 },
-    { code: "roboto-bold",     label: "Roboto",                            css: "'Roboto', sans-serif",     weight: 700 },
-    { code: "bebas-neue",      label: "Bebas Neue",                        css: "'Bebas Neue', sans-serif", weight: 400 },
-    { code: "oswald-bold",     label: "Oswald",                            css: "'Oswald', sans-serif",     weight: 700 },
-    { code: "anton",           label: "Anton",                             css: "'Anton', sans-serif",      weight: 400 },
+    { code: "",                label: _FONT_LABELS[""],     css: "" },
+    { code: "fredoka",         label: _FONT_LABELS.fredoka,              css: "'Fredoka', sans-serif",    weight: 600 },
+    { code: "quicksand",       label: _FONT_LABELS.quicksand,                 css: "'Quicksand', sans-serif",  weight: 700 },
+    { code: "nunito",          label: _FONT_LABELS.nunito,                 css: "'Nunito', sans-serif",     weight: 800 },
+    { code: "jost-bold",       label: _FONT_LABELS["jost-bold"],              css: "'Jost', sans-serif",       weight: 700 },
+    { code: "montserrat-bold", label: _FONT_LABELS["montserrat-bold"],                        css: "'Montserrat', sans-serif", weight: 700 },
+    { code: "poppins-bold",    label: _FONT_LABELS["poppins-bold"],                           css: "'Poppins', sans-serif",    weight: 700 },
+    { code: "outfit-bold",     label: _FONT_LABELS["outfit-bold"],            css: "'Outfit', sans-serif",     weight: 700 },
+    { code: "roboto-bold",     label: _FONT_LABELS["roboto-bold"],                            css: "'Roboto', sans-serif",     weight: 700 },
+    { code: "bebas-neue",      label: _FONT_LABELS["bebas-neue"],                        css: "'Bebas Neue', sans-serif", weight: 400 },
+    { code: "oswald-bold",     label: _FONT_LABELS["oswald-bold"],                            css: "'Oswald', sans-serif",     weight: 700 },
+    { code: "anton",           label: _FONT_LABELS.anton,                             css: "'Anton', sans-serif",      weight: 400 },
   ];
 
   // Filename → artist/title heuristic. ONE convention now: the FIRST
@@ -1603,6 +1742,34 @@ export default function UploadZone({
     setUmgProresProfile(3);
   };
 
+  // El fondo no siempre se puede regenerar: el backend rechaza un edit de fondo
+  // sobre un job multi-escena (el fondo es un TIMELINE) y sobre uno ya
+  // aprobado. Hasta ahora el wizard te dejaba configurarlo igual y te enterabas
+  // DESPUÉS de aprobar — cinco pasos tarde. `editPlan.blocked` viene de la
+  // misma función que arma el POST, así que el aviso no puede desincronizarse
+  // del comportamiento real.
+  const _bgBlocked = editMode && bgBlockedReason ? { reason: bgBlockedReason } : null;
+  const _bgBlockedNotice = _bgBlocked ? (
+    <div
+      data-testid="bg-blocked-notice"
+      className="mb-3 rounded-card bg-amber-500/[0.08] ring-1 ring-amber-500/25 px-3 py-2.5"
+    >
+      <p className="text-[11px] font-medium text-amber-200">
+        {_bgBlocked.reason === "scenes"
+          ? (t("edit.bg_locked_scenes_title") || "Este video usa Escenas")
+          : (t("edit.bg_locked_done_title") || "No se puede regenerar el fondo")}
+      </p>
+      <p className="text-[10px] text-amber-200/70 mt-0.5 leading-snug">
+        {_bgBlocked.reason === "scenes"
+          ? (t("edit.bg_locked_scenes_desc") || "El fondo es un timeline multi-escena. Regenerá la escena que quieras cambiar desde el filmstrip del video — no consume cupo de edición.")
+          : (t("edit.bg_locked_done_desc") || "El fondo de un video ya aprobado no se puede regenerar — para cambiarlo, generá un video nuevo.")}
+      </p>
+      <p className="text-[10px] text-amber-200/50 mt-1">
+        {t("upload.bg_blocked_rest_ok") || "El resto de los ajustes sí se aplican."}
+      </p>
+    </div>
+  ) : null;
+
   const _batchSettingsBlock = (files.length > 0 || editMode) ? (
     <div className="mt-3 glass rounded-card px-4 py-4">
       <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-3">
@@ -1610,6 +1777,8 @@ export default function UploadZone({
           ? (t("upload.batch_settings_title") || "Configuración del lote")
           : (t("upload.single_settings_title") || "Ajustes del video")}
       </p>
+
+      {_bgBlockedNotice}
 
       {user?.role === "admin" && !editMode && (
         <div className="mb-3 flex items-center justify-between gap-3 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-3 py-2.5">
@@ -1660,6 +1829,7 @@ export default function UploadZone({
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
           {MOVEMENT_STYLES.map((m) => {
             const active = batchDefaults.movementStyle === m.code;
+            const inVideo = isAnchor("movementStyle", m.code);
             return (
               <button
                 key={m.code || "auto"}
@@ -1667,7 +1837,10 @@ export default function UploadZone({
                 onClick={() => updateBatchDefault("movementStyle", m.code)}
                 onMouseEnter={() => setHoverMovement(m.code)}
                 onMouseLeave={() => setHoverMovement(null)}
-                aria-label={`${m.label}: ${m.desc}`}
+                aria-pressed={active}
+                data-movement={m.code || "auto"}
+                data-in-video={inVideo ? "true" : undefined}
+                aria-label={`${m.label}: ${m.desc}${inVideo ? ` — ${ANCHOR_LABEL}` : ""}`}
                 title={m.desc}
                 className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
                   active
@@ -1696,6 +1869,7 @@ export default function UploadZone({
                       <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
                     </div>
                   )}
+                  {inVideo && anchorChip}
                 </div>
                 <div className="px-2.5 py-2 bg-surface-1">
                   <p className={`text-[12px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>
@@ -1707,30 +1881,189 @@ export default function UploadZone({
             );
           })}
         </div>
+
+        {/* Foto fija + sin efecto = fondo 100% inmóvil los 3-4 minutos.
+            El Ken Burns se removió a propósito (OOM Rata Blanca 02-jun) y el
+            `effect="light"` automático que debía compensarlo era un no-op (se
+            borra en este PR). Así que la decisión vuelve al operador: lo
+            empujamos a elegir un efecto, pero "Sin efecto" sigue siendo válido
+            y explícito.
+
+            PERSISTENTE, no un toast: el aviso tiene que seguir ahí mientras la
+            combinación se mantenga. Un hint de una sola vez es exactamente el
+            diseño que produjo este bug — y al sembrar los controles del job
+            (PR anterior) la combinación puede aparecer SIN que el operador haya
+            clickeado nada. */}
+        {batchDefaults.movementStyle === "foto-parallax" && !batchDefaults.effect && (
+          <div
+            data-testid="foto-fija-warning"
+            className="mt-2.5 rounded-lg bg-amber-500/10 ring-1 ring-amber-500/30 px-3 py-2 flex items-start gap-2"
+          >
+            <p className="text-[11px] text-amber-300/90 leading-snug flex-1">
+              {t("upload.foto_fija_no_motion") || "Foto fija no tiene movimiento propio: el fondo queda quieto toda la canción. Elegí un efecto abajo para darle vida — o dejá «Sin efecto» si querés la imagen inmóvil."}
+            </p>
+            <button
+              type="button"
+              onClick={jumpToEffects}
+              className="shrink-0 rounded-full bg-amber-500/20 text-amber-200 text-[10px] font-medium px-2.5 py-1 ring-1 ring-amber-500/40 hover:bg-amber-500/30 transition-colors"
+            >
+              {t("upload.foto_fija_goto_effect") || "Ir a Efecto"}
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Effect gallery — particles composited OVER the background. Available
           for ANY source (IA / Biblioteca / Subido): it's an overlay, not a
           generation choice. Orthogonal to "Movimiento" (camera). */}
-      <div className="mb-4 pt-3 border-t border-white/[0.05]">
-        <div className="mb-2">
-          <div className="flex items-baseline justify-between">
-            <p className="text-[11px] text-gray-400 font-medium">
-              {t("upload.effect_gallery_title") || "Efecto encima"}
-            </p>
-            {files.length > 1 && (
-              <p className="text-[10px] text-gray-600">
-                {t("upload.effect_gallery_hint") || "Click para aplicar a todos · personalizable por canción"}
-              </p>
-            )}
+      <div
+        ref={effectControlsRef}
+        className={`mb-4 pt-3 border-t border-white/[0.05] rounded-lg transition-all duration-500 ${
+          effectControlsPulse
+            ? "ring-2 ring-amber-500/60 bg-amber-500/[0.05] -mx-2 px-2"
+            : "ring-2 ring-transparent"
+        }`}
+      >
+        <div className="relative overflow-hidden rounded-2xl border border-white/[0.08] bg-[#0d0b17]/90 shadow-[0_20px_60px_rgba(0,0,0,0.28)]">
+          <div className="pointer-events-none absolute -top-28 -right-20 h-64 w-64 rounded-full bg-brand/15 blur-3xl" />
+          <div className="pointer-events-none absolute -bottom-32 -left-20 h-64 w-64 rounded-full bg-accent/10 blur-3xl" />
+
+          <div className="relative px-3.5 pt-3.5 sm:px-4 sm:pt-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <div className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-brand/90 to-accent/80 text-white shadow-[0_8px_24px_rgba(124,58,237,0.3)]">
+                  <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.7" viewBox="0 0 24 24" aria-hidden="true">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 3l1.25 4.25L17.5 8.5l-4.25 1.25L12 14l-1.25-4.25L6.5 8.5l4.25-1.25L12 3Z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M18.5 14l.7 2.3 2.3.7-2.3.7-.7 2.3-.7-2.3-2.3-.7 2.3-.7.7-2.3ZM5 13l.55 1.8 1.8.55-1.8.55L5 17.7l-.55-1.8-1.8-.55 1.8-.55L5 13Z" />
+                  </svg>
+                </div>
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="text-[12px] font-semibold text-white">
+                      {t("upload.effect_gallery_title") || "Efecto encima"}
+                    </p>
+                    <span className="rounded-full border border-white/[0.08] bg-white/[0.04] px-2 py-0.5 text-[9px] font-medium tabular-nums text-gray-400">
+                      {EFFECT_CODES.length} {t("upload.effect_count_label") || "efectos"}
+                    </span>
+                  </div>
+                  <p className="mt-0.5 max-w-2xl text-[10px] leading-relaxed text-gray-500">
+                    {t("upload.effect_gallery_desc") || "Movimiento y textura sobre el fondo: partículas, luces, película, niebla y más. Se suma a cualquier fondo, incluso de Biblioteca."}
+                  </p>
+                </div>
+              </div>
+              {files.length > 1 && (
+                <p className="hidden max-w-[180px] text-right text-[9px] leading-snug text-gray-600 sm:block">
+                  {t("upload.effect_gallery_hint") || "Click para aplicar a todos · personalizable por canción"}
+                </p>
+              )}
+            </div>
+
+            {/* Large selected/hovered preview gives the catalogue a visual
+                hierarchy and reuses the exact same sample asset as the card. */}
+            <div
+              data-testid="effect-featured"
+              className="mt-3 grid overflow-hidden rounded-2xl border border-white/[0.08] bg-black/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] sm:grid-cols-[minmax(0,1.55fr)_minmax(180px,0.9fr)]"
+              aria-live="polite"
+            >
+              <div className="relative aspect-video min-h-[126px] overflow-hidden bg-black">
+                {featuredEffect.sample ? (
+                  <video
+                    key={`featured-${featuredEffect.code}`}
+                    src={featuredEffect.sample}
+                    className="h-full w-full object-cover"
+                    autoPlay loop muted playsInline
+                  />
+                ) : (
+                  <div
+                    className="absolute inset-0 overflow-hidden"
+                    style={{ background: "radial-gradient(100% 130% at 20% 0%,#30204c 0%,#12101e 50%,#090810 100%)" }}
+                  >
+                    <div className="absolute left-[14%] top-[16%] h-24 w-24 rounded-full border border-white/[0.07]" />
+                    <div className="absolute bottom-[-20%] right-[10%] h-40 w-40 rounded-full border border-brand/20" />
+                    <div className="absolute inset-0 grid place-items-center">
+                      <div className="grid h-12 w-12 place-items-center rounded-2xl border border-white/[0.08] bg-white/[0.04] text-lg text-gray-500 backdrop-blur">
+                        Ø
+                      </div>
+                    </div>
+                  </div>
+                )}
+                <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/45 via-transparent to-black/10" />
+                <div className="absolute left-2.5 top-2.5 flex items-center gap-1.5">
+                  <span className="rounded-full border border-white/10 bg-black/35 px-2 py-1 text-[8px] font-semibold uppercase tracking-[0.12em] text-white/80 backdrop-blur-md">
+                    {hoverEffect !== null
+                      ? (t("upload.effect_previewing") || "Vista previa")
+                      : (t("upload.effect_selected") || "Seleccionado")}
+                  </span>
+                  {featuredEffect.code && (
+                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.9)]" />
+                  )}
+                </div>
+              </div>
+              <div className="relative flex min-h-[118px] flex-col justify-between border-t border-white/[0.06] bg-white/[0.025] p-3.5 sm:border-l sm:border-t-0">
+                <div>
+                  <p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-brand-light/80">
+                    {featuredCategory?.label || (t("upload.effect_category_clean") || "Limpio")}
+                  </p>
+                  <p className="mt-1 text-[16px] font-semibold tracking-[-0.02em] text-white">
+                    {featuredEffect.label}
+                  </p>
+                  <p className="mt-1.5 text-[10px] leading-relaxed text-gray-400">
+                    {featuredEffect.desc}
+                  </p>
+                </div>
+                <div className="mt-3 flex items-center gap-1.5 text-[9px] text-gray-600">
+                  <span className="inline-block h-1.5 w-1.5 rounded-full bg-brand/70" />
+                  {t("upload.effect_hover_hint") || "Pasá el cursor para explorar · click para elegir"}
+                </div>
+              </div>
+            </div>
+
+            <div
+              className="mt-3 flex gap-1.5 overflow-x-auto pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+              role="tablist"
+              aria-label={t("upload.effect_categories_label") || "Categorías de efectos"}
+            >
+              {EFFECT_CATEGORIES.map((category) => {
+                const selected = effectCategory === category.code;
+                const count = category.code === "all"
+                  ? EFFECTS.length
+                  : EFFECTS.filter((effect) => effect.category === category.code).length;
+                return (
+                  <button
+                    key={category.code}
+                    type="button"
+                    role="tab"
+                    aria-selected={selected}
+                    data-effect-category={category.code}
+                    onClick={() => setEffectCategory(category.code)}
+                    className={`flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1.5 text-[10px] font-medium transition-all duration-200 ${
+                      selected
+                        ? "border-brand/50 bg-brand/15 text-white shadow-[0_0_18px_rgba(124,58,237,0.16)]"
+                        : "border-white/[0.07] bg-white/[0.025] text-gray-500 hover:border-white/[0.15] hover:bg-white/[0.05] hover:text-gray-300"
+                    }`}
+                  >
+                    {category.label}
+                    <span className={`text-[8px] tabular-nums ${selected ? "text-brand-light" : "text-gray-600"}`}>
+                      {count}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
           </div>
-          <p className="text-[10px] text-gray-600 mt-0.5">
-            {t("upload.effect_gallery_desc") || "Partículas que caen encima del fondo (nieve, lluvia, estrellas…). Es el toque del formato de UMG. Se suma a cualquier fondo, incluso de Biblioteca."}
-          </p>
-        </div>
-        <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
-          {EFFECTS.map((e) => {
+
+          <div className="relative grid grid-cols-2 gap-2 p-3 pt-2 sm:grid-cols-3 lg:grid-cols-4">
+          {visibleEffects.map((e) => {
             const active = (batchDefaults.effect || "") === e.code;
+            const inVideo = isAnchor("effect", e.code);
+            // Con Foto fija, "Sin efecto" deja de ser un default neutro: es la
+            // decisión de que el fondo quede quieto. El texto ACCESIBLE tiene
+            // que decir lo mismo que el visible — antes el aria-label seguía
+            // diciendo "Ninguno: fondo limpio, sin efecto", o sea que un lector
+            // de pantalla recibía justo el encuadre que este bloque corrige.
+            const _stillNote = (!e.code && batchDefaults.movementStyle === "foto-parallax")
+              ? (t("upload.effect_none_still") || "Sin efecto — imagen quieta")
+              : null;
             return (
               <button
                 key={e.code || "none"}
@@ -1738,34 +2071,49 @@ export default function UploadZone({
                 onClick={() => updateBatchDefault("effect", e.code)}
                 onMouseEnter={() => setHoverEffect(e.code)}
                 onMouseLeave={() => setHoverEffect(null)}
-                aria-label={`${e.label}: ${e.desc}`}
-                title={e.desc}
-                className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
+                onFocus={() => setHoverEffect(e.code)}
+                onBlur={() => setHoverEffect(null)}
+                aria-pressed={active}
+                data-effect={e.code || "none"}
+                data-in-video={inVideo ? "true" : undefined}
+                aria-label={`${_stillNote ? _stillNote : `${e.label}: ${e.desc}`}${inVideo ? ` — ${ANCHOR_LABEL}` : ""}`}
+                title={_stillNote || e.desc}
+                className={`group relative overflow-hidden rounded-xl border text-left transition-all duration-200 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand ${
                   active
-                    ? "border-transparent ring-1 ring-brand/50 shadow-glow"
-                    : "border-white/[0.06] hover:border-white/[0.20]"
+                    ? "border-brand/60 bg-brand/[0.09] shadow-[0_12px_30px_rgba(104,48,203,0.18)] ring-1 ring-brand/25"
+                    : "border-white/[0.07] bg-white/[0.025] hover:-translate-y-0.5 hover:border-white/[0.18] hover:bg-white/[0.045] hover:shadow-[0_12px_28px_rgba(0,0,0,0.24)]"
                 }`}
               >
-                <div className="aspect-video bg-black relative overflow-hidden">
+                <div className="relative aspect-video overflow-hidden bg-black">
                   {e.sample ? (
-                    <video src={e.sample} className="w-full h-full object-cover pointer-events-none" autoPlay loop muted playsInline />
+                    <video src={e.sample} className="h-full w-full object-cover pointer-events-none transition-transform duration-500 group-hover:scale-[1.035]" autoPlay loop muted playsInline />
                   ) : (
-                    <div className="w-full h-full grid place-items-center text-gray-500 text-[10px]" style={{ background: "radial-gradient(120% 100% at 50% 0,#241a40,#0b0820)" }}>
-                      {t("upload.effect_none") || "Ninguno"}
+                    <div className="grid h-full w-full place-items-center text-gray-500" style={{ background: "radial-gradient(120% 100% at 50% 0,#241a40,#0b0820)" }}>
+                      <span className="grid h-8 w-8 place-items-center rounded-xl border border-white/[0.08] bg-white/[0.04] text-[14px]">Ø</span>
                     </div>
                   )}
+                  <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/55 via-transparent to-transparent opacity-70" />
                   {active && (
-                    <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand grid place-items-center shadow">
-                      <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                    <div className="absolute right-1.5 top-1.5 grid h-5 w-5 place-items-center rounded-full bg-white text-brand shadow-[0_4px_12px_rgba(0,0,0,0.3)]">
+                      <svg className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
                     </div>
                   )}
+                  {inVideo && anchorChip}
                 </div>
-                <div className="px-2 py-1.5 bg-surface-1">
-                  <p className={`text-label leading-tight ${active ? "text-white" : "text-gray-200"}`}>{e.label}</p>
+                <div className="flex items-center justify-between gap-2 px-2.5 py-2">
+                  {/* Con Foto fija, "Sin efecto" deja de ser un default neutro:
+                      es la decisión de que el fondo quede quieto. Que lo diga. */}
+                  <p className={`truncate text-[10px] font-medium leading-tight ${active ? "text-white" : "text-gray-300"}`}>
+                    {_stillNote || e.label}
+                  </p>
+                  <span className={`h-1.5 w-1.5 shrink-0 rounded-full transition-colors ${
+                    active ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]" : "bg-white/10 group-hover:bg-white/25"
+                  }`} />
                 </div>
               </button>
             );
           })}
+          </div>
         </div>
       </div>
 
@@ -1793,8 +2141,19 @@ export default function UploadZone({
                   <p className="text-[10px] text-gray-600 mt-0.5">
                     {variantMode
                       ? (t("variant.cost_desc_wizard") || "La variante es un video nuevo: se cobra 1 video al plan y pasa por review como cualquier upload. A partir de la 4ª versión de la misma canción se factura un extra (te lo confirmamos antes de crearla).")
-                      : (t("upload.regen_bg_desc") || "Editás el fondo como siempre (movimiento, efecto, look). Al aprobar se genera una versión nueva con IA y usa 1 de tus 3 ediciones. Cambiar a un fondo de Biblioteca es gratis.")}
+                      : (t("upload.regen_bg_desc_short") || "Editás el fondo como siempre (movimiento, efecto, look). Al aprobar se genera una versión nueva con IA. Cambiar a un fondo de Biblioteca es gratis.")}
                   </p>
+                  {/* Cupo REAL, no el "1 de tus 3" hardcodeado que en un job con
+                      7 ediciones era directamente falso. */}
+                  {!variantMode && !editLimitExempt && Number.isInteger(editsRemaining) && (
+                    <p className="text-[10px] text-gray-500 mt-1" data-testid="edit-quota">
+                      {editsRemaining <= 0
+                        ? (t("upload.regen_quota_none") || "Sin ediciones disponibles en este video.")
+                        : editsRemaining === 1
+                          ? (t("upload.regen_quota_one") || "Te queda 1 edición en este video.")
+                          : (t("upload.regen_quota_many") || "Te quedan {n} ediciones en este video.").replace("{n}", editsRemaining)}
+                    </p>
+                  )}
                 </div>
                 {/* El toggle "Generar otra versión" existe porque una
                     edición puede NO tocar el fondo (y entonces el diff
@@ -3222,6 +3581,13 @@ export default function UploadZone({
               ? `${t("upload.preview_editing") || "Línea actual"}: ${_previewLyric}${files.length > 1 ? ` · +${files.length - 1}` : ""}`
               : (t("upload.preview_disclaimer") || "Aproximación del mood y el movimiento. El fondo final lo genera la IA.")}
           </p>
+          {/* Resumen "qué va a pasar", SIEMPRE visible y en el punto de commit.
+              No es un modal: los productores que hacen lotes aprenden a
+              clickear modales, y un aviso que se puede despachar de un Enter no
+              es un aviso. Acá no se puede saltear ni cerrar.
+              Sale de `editPlan` (resolveEditSubmission), o sea de la MISMA
+              función que arma el POST — no del diff, que no decide el output. */}
+          {editMode && editPlan && <EditPlanSummary plan={editPlan} t={t} />}
           {/* 2026-07-16: slot para el player bar de LyricsEditor (paso 6).
               Lo portalea acá, bajo el video, para que la columna derecha
               quede full con la letra. Fuera del paso 6 no se monta. */}
@@ -3339,6 +3705,8 @@ export default function UploadZone({
                           key={m.code}
                           type="button"
                           onClick={() => selectSceneMode(m.code)}
+                          aria-pressed={sel}
+                          data-scene-mode={m.code}
                           className={`text-left rounded-card px-4 py-3 flex items-start gap-3 border transition-all duration-200 ${
                             sel ? "border-transparent ring-1 ring-brand/50 bg-brand/[0.08] shadow-glow"
                                 : "border-white/[0.06] bg-surface-2/40 hover:border-white/[0.18]"
@@ -3458,6 +3826,47 @@ export default function UploadZone({
                     </div>
                   )}
 
+                  {/* "Mi prompt guardado": el texto ya no se destruye al cambiar
+                      de tarjeta. Cuando el modo activo no es "Mi prompt" el
+                      prompt NO se usa en el render (el modo manda, y el backend
+                      necesita el campo vacío para que match_lyrics gane), pero
+                      sigue acá con un click para volver a usarlo. Sin textarea
+                      gris: el chip dice explícitamente si está en uso o no. */}
+                  {sceneMode !== "prompt" && savedPrompt && (
+                    <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
+                      <div className="flex items-center justify-between gap-2 mb-1.5">
+                        <p className="text-[11px] font-medium text-gray-300">
+                          {t("upload.saved_prompt_title") || "Mi prompt guardado"}
+                        </p>
+                        <span className="shrink-0 px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wide bg-surface-3 text-gray-400 ring-1 ring-white/[0.06]">
+                          {t("upload.saved_prompt_unused") || "No se usa en este modo"}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-gray-500 line-clamp-2">{savedPrompt}</p>
+                      <div className="mt-2 flex items-center gap-3">
+                        <button
+                          type="button"
+                          onClick={() => selectSceneMode("prompt")}
+                          className="rounded-full bg-brand/15 text-brand-light text-[11px] font-medium px-3 py-1 ring-1 ring-brand/30 hover:bg-brand/25 transition-colors"
+                        >
+                          {t("upload.saved_prompt_use") || "Usar este prompt"}
+                        </button>
+                        <details>
+                          <summary className="text-[10px] text-gray-600 hover:text-gray-400 cursor-pointer list-none">
+                            {t("upload.saved_prompt_more") || "Opciones"}
+                          </summary>
+                          <button
+                            type="button"
+                            onClick={discardSavedPrompt}
+                            className="mt-1.5 text-[10px] text-gray-500 hover:text-red-300 underline-offset-2 hover:underline transition-colors"
+                          >
+                            {t("upload.saved_prompt_discard") || "Descartar mi prompt"}
+                          </button>
+                        </details>
+                      </div>
+                    </div>
+                  )}
+
                   {sceneMode === "prompt" ? (
                     <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
                       <p className="text-[11px] text-gray-600 mb-2">
@@ -3465,7 +3874,16 @@ export default function UploadZone({
                       </p>
                       <textarea
                         value={batchDefaults.backgroundHint || ""}
-                        onChange={(e) => updateBatchDefault("backgroundHint", e.target.value.slice(0, 2000))}
+                        onChange={(e) => {
+                          const v = e.target.value.slice(0, 2000);
+                          updateBatchDefault("backgroundHint", v);
+                          // Sincronizar el "guardado" con lo que el operador
+                          // escribe. Sin esto, borrar el texto A MANO dejaba el
+                          // savedPrompt viejo intacto, y al cambiar de tarjeta
+                          // la app le ofrecía de vuelta el prompt que acababa de
+                          // borrar — el opuesto exacto del bug que arreglamos.
+                          setSavedPrompt(v.trim());
+                        }}
                         rows={3}
                         maxLength={2000}
                         placeholder={t("upload.bg_prompt_placeholder") || "Ej: mansión surreal de noche, pileta vacía, cámara fija, sólo se mueve el reflejo del agua…"}
@@ -3776,7 +4194,18 @@ export default function UploadZone({
 
               {/* Lyric text color — color picker(s). El segundo solo aplica a
                   karaoke (color de la palabra cantada). Para none/pop/glow/
-                  word_reveal alcanza con un solo color para todo el texto. */}
+                  word_reveal alcanza con un solo color para todo el texto.
+
+                  OCULTO en edición y variante (2026-07-25): `lyric_color` /
+                  `lyric_sung_color` NO existen en computeFieldDiff, ni en
+                  EditJobRequest, ni en _VARIANT_OVERRIDABLE_FIELDS — el valor
+                  no sale del browser. Era un control editable-e-ignorado, y el
+                  principio del #977 prohíbe exactamente eso. Además pintaba el
+                  sticky de localStorage, así que mentía dos veces. Sigue
+                  disponible en la CREACIÓN, donde /generate sí lo acepta.
+                  Para cablearlo hacen falta 3 cambios (diff + EditJobRequest +
+                  _VARIANT_OVERRIDABLE_FIELDS); /retry ya lo hereda. */}
+              {!editMode && (
               <div className="mt-4 pt-3 border-t border-white/[0.05]">
                 <p className="text-[11px] text-gray-300 font-medium">{t("upload.lyric_color_title") || "Color del texto"}</p>
                 <p className="text-[10px] text-gray-600 mt-0.5 mb-2">
@@ -3816,6 +4245,7 @@ export default function UploadZone({
                   )}
                 </div>
               </div>
+              )}
 
               {/* Transición entre líneas — eje aparte, compone con la animación */}
               <div className="mt-4 pt-3 border-t border-white/[0.05]">

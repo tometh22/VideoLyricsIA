@@ -910,7 +910,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # DIRECTION + al gradiente fallback.
                  custom_colors: str = "",
                  # effect: overlay animado componible sobre cualquier fondo
-                 # (snow/rain/stars/bokeh/light). "" = ninguno. Se compone en el
+                 # (snow/rain/stars/bokeh/light + atmospheric variants).
+                 # "" = ninguno. Se compone en el
                  # render (libass filter_complex o moviepy) vía fx_compositor.
                  effect: str = "",
                  # Capa C 2026-05-24: hash determinístico (sha256-12) de los
@@ -1452,7 +1453,16 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "style": style,
             "genre": genre,
             "concept": concept,
-            "movement_style": movement_style,
+            # NORMALIZADO al persistir, no crudo. El campo entra como texto
+            # libre desde el Form, y guardarlo tal cual dejaba render_params con
+            # valores que ninguna otra capa entiende: la UI no puede resaltar la
+            # opción, y admin_insights los cuenta como buckets distintos aunque
+            # el render los trate igual. El pipeline ya normaliza al renderizar,
+            # así que persistir el valor canónico no cambia ningún render — sólo
+            # deja de guardar algo que después hay que interpretar en cada
+            # lector. La invariante es: render_params.movement_style SIEMPRE es
+            # un código de _MOVEMENT_STYLE_RULES o "".
+            "movement_style": _normalize_movement_style(movement_style),
             "effect": effect,
             "match_lyrics": match_lyrics,
             "background_ai_generated": _background_is_ai_generated,
@@ -9643,6 +9653,187 @@ def _bg_scene_discontinuity(video_path: str) -> float:
         return 0.0
 
 
+def _estimate_shift(prev, cur, window) -> tuple[float, float]:
+    """Traslación (dx, dy) en px entre dos frames, por correlación de fase.
+
+    numpy puro (FFT), sin opencv. Dos detalles que NO son opcionales — sin
+    ellos la medición da cero para paneos reales (verificado):
+
+    - VENTANA de Hanning + resta de la media: sin ventanear, la fuga espectral
+      de los bordes domina la correlación y el pico queda en el origen.
+    - SUB-PÍXEL por interpolación parabólica: a 320 px de ancho un drift lento
+      es sub-píxel entre frames, y el pico entero lo redondea a 0.
+    """
+    import numpy as _np
+
+    # Guard de patch UNIFORME. Sin esto la función devuelve el desplazamiento
+    # MÁXIMO posible en vez de cero: con varianza nula el cross-power queda todo
+    # en cero, `argmax` sobre un array plano cae en el índice 0 —la esquina—
+    # y tras el fftshift el origen es el CENTRO, así que un frame negro contra
+    # sí mismo reportaba (-w/2, -h/2) = 57% del ancho.
+    # No es un caso de laboratorio: un clip que abre desde negro deja el frame
+    # de referencia uniforme (y entonces TODA la serie es degenerada), y una
+    # banda de letterbox o un cielo plano dejan uniformes 2 de las 4 franjas de
+    # borde, sesgando la mediana. Justo los clips oscuros que más se querían
+    # medir. Fail-safe hacia "no se movió": esta métrica sólo debe acusar
+    # movimiento que puede demostrar.
+    if prev.std() == 0 or cur.std() == 0:
+        return 0.0, 0.0
+
+    a = (prev - prev.mean()) * window
+    b = (cur - cur.mean()) * window
+    fa = _np.fft.fft2(a)
+    fb = _np.fft.fft2(b)
+    cross = fa * _np.conj(fb)
+    mag = _np.abs(cross)
+    mag[mag == 0] = 1.0
+    corr = _np.fft.fftshift(_np.fft.ifft2(cross / mag).real)
+    # Correlación plana (ventaneo que anula todo, patch casi uniforme): mismo
+    # razonamiento que arriba — sin pico no hay evidencia de desplazamiento.
+    if not _np.isfinite(corr).all() or corr.max() == corr.min():
+        return 0.0, 0.0
+    h, w = prev.shape
+    iy, ix = _np.unravel_index(_np.argmax(corr), corr.shape)
+
+    def _sub(line, i, n):
+        if i <= 0 or i >= n - 1:
+            return 0.0
+        left, mid, right = line[i - 1], line[i], line[i + 1]
+        denom = left - 2 * mid + right
+        return 0.0 if denom == 0 else 0.5 * (left - right) / denom
+
+    dy = (iy - h // 2) + _sub(corr[:, ix], iy, h)
+    dx = (ix - w // 2) + _sub(corr[iy, :], ix, w)
+    return float(dx), float(dy)
+
+
+def _measure_camera_drift(video_path: str, samples: int = 30) -> dict | None:
+    """Mide cuánto se MOVIÓ LA CÁMARA en un clip, como % del ancho del frame.
+
+    Para qué: medición propia sobre los fondos `movement_style=estatico` de
+    staging (25-jul-2026) dio 4 de 7 realmente clavados (≤0,14% del ancho) y
+    3 con paneo real — 6,1%, 26,8% y 29,7%, uno de ellos un push-in frontal,
+    que es justo lo que el prompt prohíbe por legibilidad de la letra. Veo
+    ignora el "locked camera" seguido y no hay campo estructurado para forzarlo,
+    así que lo único posible es MEDIRLO. Esta función sólo mide y loguea: la
+    decisión de re-rollear necesita datos primero (y un presupuesto de retry
+    propio, ver el comentario al final).
+
+    Tres decisiones que importan y que una implementación naive erra:
+
+    1) BORDES, no el frame completo. `estatico` está DISEÑADO para tener
+       movimiento dentro de la escena ("gente caminando, olas, nubes, neblina,
+       fuego" — ver el routing de estatico/sutil). Una correlación global sobre
+       una cascada o una multitud que llena el cuadro mide al SUJETO y reporta
+       paneo donde no hay. Las franjas de borde son lo más cercano a un ancla
+       estática que tiene un plano fijo.
+
+    2) EXCURSIÓN ACUMULADA MÁXIMA, no el desplazamiento neto. Un vaivén vuelve
+       al origen: el neto da ~0 y el paneo es igual de visible.
+
+    3) El clip PRE-LOOP. El fondo final está palindromizado (A + reverse(A)),
+       así que cualquier corrimiento neto se cancela por construcción. Hay que
+       medir la salida cruda de Veo.
+
+    Devuelve {"pct_width", "pct_width_borders", "peak_px", "frames"} o None.
+    Fail-open por diseño: esto NUNCA debe bloquear un fondo.
+
+    Validado contra los 7 fondos `estatico` de staging (con inspección visual de
+    los casos en disputa): los 6 de cámara fija dan ≤0,03% y el único push-in
+    real da 5,9%. Se emiten las DOS variantes (frame completo y mediana de
+    franjas de borde) porque todavía no hay datos para elegir umbral: la de
+    bordes es más robusta a un sujeto que llena el cuadro, la global es más
+    limpia cuando el fondo tiene textura estable.
+    """
+    tmpdir = None
+    try:
+        import numpy as _np
+        import tempfile as _tf
+        from PIL import Image as _Img
+
+        tmpdir = _tf.mkdtemp(prefix="drift_")
+        pattern = os.path.join(tmpdir, "f_%03d.png")
+        # fps bajo + escala chica: alcanza para traslación global y deja el costo
+        # en decenas de ms. Mismo patrón de extracción que
+        # _bg_scene_discontinuity (ffmpeg subprocess, no moviepy).
+        #
+        # `samples` tiene que cubrir el clip ENTERO: los clips de Veo son de 8s
+        # y a 3 fps eso son 24 frames. Con el tope en 12 se medían sólo los
+        # primeros 4s, así que un paneo lento reportaba la mitad de su
+        # excursión y uno que ocurría en la segunda mitad reportaba ~0 — sobre
+        # una métrica cuyo contrato es "excursión acumulada máxima" del clip.
+        # 30 deja margen si algún día el clip es más largo; ffmpeg emite menos
+        # frames si el clip es más corto y el guard de abajo lo cubre.
+        run_checked(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path,
+             "-vf", "fps=3,scale=320:180", "-frames:v", str(samples), pattern],
+            label="ffmpeg-drift-frames",
+            timeout=120,
+        )
+        files = sorted(f for f in os.listdir(tmpdir) if f.endswith(".png"))
+        if len(files) < 3:
+            return None
+
+        frames = []
+        for name in files:
+            with _Img.open(os.path.join(tmpdir, name)) as im:
+                frames.append(_np.asarray(im.convert("L"), dtype=_np.float64))
+
+        h, w = frames[0].shape
+        band = max(24, h // 4)
+        side = max(24, w // 4)
+
+        def _patches(a):
+            # Cuatro franjas de borde, cada una medida POR SEPARADO (apilarlas
+            # en un solo array destruye la continuidad espacial que la
+            # correlación necesita — daba 0 para paneos reales).
+            return [a[:band, :], a[-band:, :], a[:, :side], a[:, -side:]]
+
+        def _hann(shape):
+            return _np.outer(_np.hanning(shape[0]), _np.hanning(shape[1]))
+
+        patch_windows = [_hann(p.shape) for p in _patches(frames[0])]
+        full_window = _hann((h, w))
+
+        # Contra el PRIMER frame, no contra el anterior: la excursión respecto
+        # del inicio es lo que se percibe como "la cámara se movió", y acumular
+        # pasos consecutivos pierde los drifts lentos por cuantización.
+        peak_full = 0.0
+        peak_borders = 0.0
+        base_patches = _patches(frames[0])
+        for i in range(1, len(frames)):
+            est = [
+                _estimate_shift(pa, pb, win)
+                for pa, pb, win in zip(base_patches, _patches(frames[i]), patch_windows)
+            ]
+            # Mediana por componente: robusta a que UNA franja esté dominada por
+            # movimiento de la escena (nubes, niebla, agua) en vez de la cámara.
+            bdx = float(_np.median([e[0] for e in est]))
+            bdy = float(_np.median([e[1] for e in est]))
+            peak_borders = max(peak_borders, (bdx ** 2 + bdy ** 2) ** 0.5)
+
+            fdx, fdy = _estimate_shift(frames[0], frames[i], full_window)
+            peak_full = max(peak_full, (fdx ** 2 + fdy ** 2) ** 0.5)
+
+        return {
+            "pct_width": round(100.0 * peak_full / float(w), 2),
+            "pct_width_borders": round(100.0 * peak_borders / float(w), 2),
+            "peak_px": round(peak_full, 1),
+            "frames": len(frames),
+        }
+    except Exception as e:
+        _raise_if_job_timeout(e)
+        logger.warning("[BG][DRIFT] medición falló (fail-open): %s", e)
+        return None
+    finally:
+        if tmpdir:
+            try:
+                import shutil as _sh
+                _sh.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+
+
 def _score_video_relevance(video_path: str, prompt: str) -> int:
     """Ask Gemini Vision whether the video matches the intended scene prompt.
 
@@ -10808,31 +10999,25 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
 
     _norm_move_bg = _normalize_movement_style(movement_style)
 
-    # UMG-style fix (2026-05-25): si el operador eligió "Estático" o "Sutil"
-    # SIN effect overlay, default a "light" (el más sutil de los 5). Las
-    # references UMG NUNCA tienen 100% quieto — siempre hay particles
-    # overlay o motion in-scene. Combined con subtle Ken Burns drift, esto
-    # garantiza que el video parezca vivo.
-    # Operator override: si seteó effect="" pero tildó algún otro motion
-    # (no estatico/sutil), respetamos su elección (no forzamos light).
-    # Foto fija / estático / sutil SIN effect → default a "light" (el más sutil)
-    # para que el fondo nunca quede 100% muerto. La "Foto fija" (ex foto-parallax)
-    # ya no panea — la vida/movimiento la da el efecto componible (lluvia/nieve/
-    # luces/estrellas/bokeh vía fx_compositor). El operador elige el efecto en el
-    # wizard; este default sólo cubre el caso sin elección.
-    # The operator's ACTUAL effect choice, captured BEFORE the anti-dead-frame
-    # "light" default below — used to gate background darkening so we darken for
-    # the effect the operator really picked (and no-op when they picked none),
-    # not for the forced default. (Review fix 2026-06-03: `effect` was never
-    # forwarded here, so darkening fired off the forced "light" for every still.)
+    # La elección REAL de efecto del operador. Se usa para gatear el darkening
+    # del prompt (oscurecer sólo cuando de verdad va a haber partículas encima).
+    #
+    # BORRADO 2026-07-25 — el default anti-frame-muerto que vivía acá:
+    #     if _norm_move_bg in ("estatico","sutil","foto-parallax") and not effect:
+    #         effect = "light"
+    # era un NO-OP. Reasignaba el parámetro LOCAL de _ensure_background, que sólo
+    # retorna un path; el overlay real se compone del `effect` de run_pipeline
+    # (ver fx_compositor.build_video_filter), que nunca vio este valor. O sea:
+    # "Foto fija" sin efecto rendereaba una imagen 100% congelada — exactamente
+    # lo que el bloque decía prevenir — y el log afirmaba que había aplicado el
+    # default. Un log que miente es peor que no tenerlo.
+    #
+    # En vez de "arreglarlo" (inyectar un efecto que el operador no pidió), la
+    # decisión vuelve al operador: el wizard ahora avisa de forma persistente que
+    # Foto fija sin efecto queda inmóvil, ofrece saltar al selector de Efecto, y
+    # renombra la card a "Sin efecto — imagen quieta" en esa combinación. Elegir
+    # que quede quieto es válido; que sea una decisión y no un accidente.
     _operator_effect = (effect or "").strip().lower()
-    if _norm_move_bg in ("estatico", "sutil", "foto-parallax") and not (effect or "").strip():
-        logger.info(
-            "[BG] movement=%s + no effect selected — defaulting effect=light "
-            "para evitar foto 100%% quieta (UMG-style guideline 2026-05-25)",
-            _norm_move_bg,
-        )
-        effect = "light"
 
     # Animado is a Veo-only aesthetic (the 2D-illustration safe_prompt lives in
     # _generate_veo_video). Imagen renders stills, so an animado+imagen combo
@@ -10892,8 +11077,10 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         # Foto fija + efectos (2026-06-03; review-fixed same day): if the
         # operator picked a luminous particle effect, bias the still toward a
         # dark/low-key canvas so the screen-blended particles read. Gated on the
-        # operator's ACTUAL pick (_operator_effect), NOT the forced "light"
-        # default, so it no-ops when no effect was chosen. AND never applied to
+        # operator's ACTUAL pick (_operator_effect) → no-op cuando no eligió
+        # ninguno. (Hasta 2026-07-25 este gate existía para no dispararse con el
+        # default forzado a "light"; ese default se borró por ser un no-op.)
+        # AND never applied to
         # a verbatim operator prompt — "usá mi prompt tal cual" must not get
         # dark grading bolted on (the imagen branch returns before the Veo
         # path's _is_verbatim is computed, so we check it inline here).
@@ -11029,6 +11216,48 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                     discont, _BG_SCENE_CUT_THRESHOLD,
                     os.path.basename(bg_path), job_id,
                 )
+            # Cumplimiento de "Estático": SOLO MEDIR Y LOGUEAR (2026-07-25).
+            #
+            # Veo ignora el locked-camera bastante seguido y no expone un campo
+            # estructurado para forzarlo: los negativos del prompt son el único
+            # lever. Medición propia sobre los 7 fondos `estatico` de staging: 4
+            # clavados (≤0,14% del ancho) y 3 con paneo real (6,1 / 26,8 /
+            # 29,7%), uno un push-in frontal. Antes de re-rollear hace falta
+            # saber la tasa real, así que esto emite la métrica en cada render
+            # estático y no toca el resultado.
+            #
+            # Por qué NO se re-rollea todavía (y por qué no puede colgarse de
+            # `quality_retry_used`): ese retry RE-DERIVA el prompt, o sea que
+            # cambiaría la escena en vez de corregir la cámara — "me cambió
+            # todo", que es una queja peor. Además comparte el único slot con el
+            # detector de cortes, y si el reintento pega un 429 el except de más
+            # abajo cae al gradiente y tira el clip bueno. Un re-roll de drift
+            # necesita: mismo prompt + generation_nonce fresco (si no, cache HIT
+            # → clip idéntico), quedarse con el MEJOR de los dos candidatos,
+            # presupuesto propio, y no-op duro si veo_breaker está abierto o
+            # bg_verbatim. Va en un PR aparte, con los datos en la mano.
+            if _norm_move_bg == "estatico":
+                _drift = _measure_camera_drift(bg_path)
+                if _drift:
+                    # El modelo va en la línea porque es la variable que se
+                    # quiere correlacionar: veo-3.1-fast tiene un drift prior
+                    # más fuerte que el standard, y VEO_MODEL_STATIC (hoy sin
+                    # setear) es la mitigación a evaluar con estos datos.
+                    # `attempt` va en la línea porque este bloque corre DENTRO
+                    # del loop de reintentos: si hay un re-roll por calidad o
+                    # por corte de escena, se mide también el clip descartado.
+                    # Sin el índice, el dataset mezcla clips entregados con
+                    # clips que nunca llegaron al operador — y este PR existe
+                    # justamente para medir la tasa real de los entregados.
+                    logger.info(
+                        "[BG][DRIFT] job=%s attempt=%s movement=estatico model=%s "
+                        "drift_pct=%.2f drift_pct_borders=%.2f peak_px=%.1f frames=%s",
+                        job_id, attempt,
+                        (os.environ.get("VEO_MODEL_STATIC", "").strip()
+                         or os.environ.get("VEO_MODEL", "veo-3.1-fast-generate-001").strip()),
+                        _drift["pct_width"], _drift["pct_width_borders"],
+                        _drift["peak_px"], _drift["frames"],
+                    )
             # Verbatim: never re-roll. A re-roll re-runs _get_unique_prompt
             # which short-circuits to the SAME verbatim text → identical
             # safe_prompt → Veo cache HIT → same clip, wasting a scoring pass
@@ -12001,7 +12230,7 @@ def _static_image_to_mp4(image_path: str, output_path: str, duration: float,
     leaving the job stuck in "processing". ffmpeg loops the single image at
     C-level with bounded memory — impossible to OOM at any song length. The
     video's life/motion now comes from the composable effect overlay
-    (fx_compositor: snow/rain/stars/bokeh/light), not a camera pan.
+    (fx_compositor's full effect catalogue), not a camera pan.
 
     Same on-disk contract as the old Ken Burns output: a full-duration MP4 at
     `output_path` that the rest of the pipeline composes lyrics + effect onto.
@@ -14910,9 +15139,9 @@ def generate_short(
     except OSError:
         pass
 
-    # Effect overlay (snow/rain/stars/bokeh/light/aurora): screen-blend the
-    # pre-baked fx loop over the short with ffmpeg — the SAME fx assets the
-    # main video composites. moviepy can't screen-blend, so it's a post-pass.
+    # Optional effect overlay: screen-blend the selected catalogue loop over
+    # the rendered short with ffmpeg — the SAME fx assets the main video
+    # composites. moviepy can't screen-blend, so it's a post-pass.
     fx = _fx.effect_path(effect)
     if fx:
         out_path = _apply_short_effect(out_path, fx, fps, job_dir)

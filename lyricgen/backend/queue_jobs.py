@@ -785,7 +785,12 @@ def enqueue_bg_preview(
     return f"thread:bgpreview:{job_id}"
 
 
-def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
+def enqueue_prores_prewarm(
+    job_id: str,
+    file_type: str,
+    *,
+    force: bool = False,
+) -> str | None:
     """Schedule the ProRes transcode for `job_id` on the enterprise queue.
 
     Called from run_pipeline right before the job flips to "done" when
@@ -794,18 +799,23 @@ def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
     DB lookup. Idempotent against the lazy /download path: whichever
     finishes first wins the os.replace.
 
-    Returns the RQ job id, or None when prewarm is disabled or Redis
-    unreachable (we never raise — prewarm is best-effort by design).
+    Returns the RQ job id, or None when background prewarm is disabled or
+    Redis is unreachable. ``force=True`` is reserved for an explicit user
+    action (download/publish): it bypasses the optional prewarm flag and
+    queue-depth backpressure, and raises if the queue is unavailable so the
+    API can report an honest 503 instead of polling forever.
     """
     _require_submissions_open()
     global prewarm_skipped_total, prewarm_enqueued_total
-    if not PRORES_PREWARM_ENABLED:
+    if not PRORES_PREWARM_ENABLED and not force:
         return None
     if file_type not in ("umg_master", "umg_short"):
         logger.warning("[PRORES] prewarm: unsupported file_type %r", file_type)
         return None
     _, _, q_enterprise = _init_redis()
     if q_enterprise is None:
+        if force:
+            raise RuntimeError("ProRes queue unavailable")
         logger.info("[PRORES] prewarm: queue unavailable; skipping")
         return None
     # Backpressure: if the enterprise queue is already deep, skip the
@@ -817,7 +827,7 @@ def enqueue_prores_prewarm(job_id: str, file_type: str) -> str | None:
         depth = q_enterprise.count
     except Exception:
         depth = 0
-    if depth > PRORES_PREWARM_MAX_QUEUE_DEPTH:
+    if depth > PRORES_PREWARM_MAX_QUEUE_DEPTH and not force:
         prewarm_skipped_total += 1
         logger.warning(
             "[PRORES] prewarm: queue depth %d > %d; skipping prewarm for %s/%s "

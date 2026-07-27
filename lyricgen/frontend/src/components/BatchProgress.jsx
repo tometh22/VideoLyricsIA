@@ -45,7 +45,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // No setInterval, no cycling. The text changes when the worker actually
 // transitions, the bar advances when the worker actually advances,
 // the ETA refreshes when the backend recomputes.
-function SingleGeneratingHero({
+export function SingleGeneratingHero({
   jobName,
   artist,
   progressPct,

@@ -188,73 +188,14 @@ export function computeFieldDiff(baseline, current) {
   return out;
 }
 
-// Convenience: convert a diff into the array of POST bodies that
-// submitEdit will fan out, with edit_type set on each. Returned in a
-// stable order so submitEdit's sequential POSTs always run metadata →
-// typography → lyrics → background. The backend reads CURRENT row state
-// at the start of each edit, so this order means later edits see earlier
-// edits' DB mutations — important when (e.g.) a metadata edit lands in
-// the audit log before a typography edit consumes an edit_count slot.
-//
-// `opts.jobStatus` (optional): when provided, the function bundles the
-// typography fields into another payload to reduce POST count AND to
-// sidestep the backend's `pending_review` gate for typography/background
-// standalone edits. The font/text_case/contrast/lyrics_animation fields
-// are ungated server-side (they write to edit_params regardless of
-// edit_type, main.py:7576-7608), so a metadata or lyrics edit can carry
-// them piggyback in the same re-render. Saves 1 re-render slot + 1
-// status hop in the UI.
-export function buildEditPayloads(diff, opts = {}) {
-  const payloads = [];
-  if (diff.metadata) {
-    payloads.push({ edit_type: "metadata", ...diff.metadata });
-  }
-  if (diff.typography) {
-    payloads.push({ edit_type: "typography", ...diff.typography });
-  }
-  if (diff.lyrics) {
-    payloads.push({ edit_type: "lyrics", ...diff.lyrics });
-  }
-  if (diff.background) {
-    payloads.push({ edit_type: "background", ...diff.background });
-  }
-  return bundleTypographyIntoFirstBucket(payloads, opts);
-}
-
-// Merge the typography payload's fields into whichever non-typography
-// payload comes first in the array (metadata → lyrics → background),
-// then drop the separate typography slot. Keeps the wire-shape minimal
-// and avoids the backend's pending_review gate when the operator
-// changes typography alongside metadata (typo + font fix in one
-// re-render). Pure / no side effects on the input.
-export function bundleTypographyIntoFirstBucket(payloads, _opts = {}) {
-  const typoIdx = payloads.findIndex((p) => p.edit_type === "typography");
-  if (typoIdx < 0) return payloads;
-  const typo = payloads[typoIdx];
-  // eslint-disable-next-line no-unused-vars
-  const { edit_type, ...typoFields } = typo;
-  // Priority order: prefer bundling into metadata (cheaper, no edit_count)
-  // then lyrics (already needs segments anyway) then background (last
-  // resort — background regens Veo, so a piggyback there means the
-  // operator wanted a regen anyway).
-  const targetOrder = ["metadata", "lyrics", "background"];
-  for (const target of targetOrder) {
-    const targetIdx = payloads.findIndex((p) => p.edit_type === target);
-    if (targetIdx >= 0) {
-      // Mutate the existing object in-place? No — return a fresh array
-      // so callers don't have to clone. Spread typo fields onto a copy.
-      const merged = { ...payloads[targetIdx], ...typoFields };
-      const next = payloads.slice();
-      next[targetIdx] = merged;
-      next.splice(typoIdx, 1);
-      return next;
-    }
-  }
-  // No other bucket — typography stays standalone (backend will require
-  // pending_review status). Caller can detect this case and convert to
-  // a lyrics-with-current-segments edit if the job is done/rejected.
-  return payloads;
-}
+// NOTA (2026-07-25): `buildEditPayloads` / `bundleTypographyIntoFirstBucket`
+// se borraron acá. Eran el modelo VIEJO de fan-out (N POSTs, uno por bucket),
+// reemplazado hace tiempo en App.jsx por UN POST consolidado. Quedaban sin
+// usar en producción pero con tests propios, y eso sostenía el mirror
+// hand-copiado de EditWizardSubmit.test.jsx: el test verde describía un
+// contrato que la app ya no ejecutaba. La resolución real del edit_type
+// (prioridad + gates por status/escenas) vive en lib/editSubmission.js y se
+// testea contra la función que la app llama de verdad.
 
 // ── background regen: política de content-validation (fondo-libre) ──────
 // NO es un campo del baseline sino ACCIÓN del wizard de edición: el operador
