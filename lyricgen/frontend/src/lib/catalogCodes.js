@@ -36,8 +36,9 @@ export const MOVEMENT_CODES = [
   "animado",
 ];
 
-// Composable overlay loops. Mirrors fx_compositor.EFFECTS and is asserted
-// against the generated backend fixture in renderParity.test.js.
+// Composable visual effects (overlay loops plus Foto viva's generative-first
+// transform). Mirrors fx_compositor.EFFECTS and is asserted against the
+// generated backend fixture in renderParity.test.js.
 export const EFFECT_CODES = [
   "snow",
   "rain",
@@ -66,6 +67,7 @@ export const EFFECT_CODES = [
   "chromatic_pulse",
   "cutout_echo",
   "projector",
+  "foto_viva",
   "bass_pulse",
   "beat_flash",
   "chromatic_hit",

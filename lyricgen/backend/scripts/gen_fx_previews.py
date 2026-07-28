@@ -54,15 +54,13 @@ def build(name: str) -> None:
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", raw,
     ])
 
-    # Picker previews now exercise the exact production compositor over a
-    # representative fixed photo.  A neutral color previously made geometric
-    # transforms look like overlays (or completely invisible), and could not
-    # prove that the selected photo's own pixels were being transformed.
-    # Clean fixed-photo crop (no lyric text baked in). The production graph
-    # scales-to-fill before cropping, so this wide source becomes a natural
-    # 16:9 coral scene without distortion.
+    # Picker previews exercise the exact production compositor over a bright,
+    # medium-contrast QA photograph.  The former dark coral scene hid shadow,
+    # ink and chromatic defects and made most cards visually indistinguishable.
+    # Pale architecture + sky + foliage exposes both dark and luminous effects
+    # while keeping enough edge detail to judge transforms honestly.
     photo = os.path.join(
-        FRONTEND_PUBLIC, "movement_samples", "foto-fija.jpg"
+        FRONTEND_PUBLIC, "samples", "fx-preview-base-v2.jpg"
     )
     rhythm = (
         fx.EffectRhythm(
@@ -94,7 +92,14 @@ def build(name: str) -> None:
 
     # Reactive loops peak at the start of each half-second beat. A 50 ms frame
     # makes the poster representative instead of capturing the dark decay.
-    poster_at = "0.05" if fx.is_reactive_effect(name) else "1.35"
+    if fx.is_reactive_effect(name):
+        poster_at = "0.05"
+    elif name in {"ink_reveal", "chromatic_pulse"}:
+        # Both treatments deliberately start from the clean photo. Capture the
+        # authored peak so the static card communicates the effect before hover.
+        poster_at = "4.0"
+    else:
+        poster_at = "1.35"
     _run([
         "ffmpeg", "-y", "-loglevel", "error", "-ss", poster_at,
         "-i", sample, "-frames:v", "1", "-q:v", "2", poster,

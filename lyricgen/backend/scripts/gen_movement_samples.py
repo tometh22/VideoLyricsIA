@@ -69,13 +69,15 @@ VEO_PROMPTS = {
         "clouds, warm golden light. Graceful and premium — smooth and unhurried, "
         "NOT fast, no dizzying motion. Cinematic, photorealistic, 4k, 16:9."
     ),
-    # Premium 2D illustration with gentle hand-drawn motion.
+    # Living illustration: one authored subject moves; the frame does not
+    # receive generic weather or ambient filler just to manufacture motion.
     "animado": (
-        "A premium stylised 2D animated illustration: a dreamy mountain-and-sky "
-        "landscape in bold flat shapes and a rich vibrant gradient palette, gentle "
-        "hand-drawn motion — drifting clouds and softly shifting light. Elegant, "
-        "artful, NOT photorealistic, smooth and calm, hand-drawn animation look. "
-        "4k, 16:9."
+        "A premium stylised 2D illustrated basketball court in bold flat shapes. "
+        "One basketball makes a clean, seamless arc toward the hoop and repeats; "
+        "the hoop, court lines, background, lighting and every other element remain "
+        "perfectly still. Locked camera, no pan or zoom, no smoke, rain, fog, "
+        "particles, drifting clouds or generic atmospheric motion. Elegant, artful, "
+        "NOT photorealistic, hand-drawn animation look, 4k, 16:9."
     ),
 }
 

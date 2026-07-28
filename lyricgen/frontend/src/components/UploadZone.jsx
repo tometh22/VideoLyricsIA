@@ -16,6 +16,7 @@ import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBa
 const REACTIVE_EFFECT_CODES = new Set([
   "bass_pulse", "beat_flash", "chromatic_hit", "beat_ripple", "echo_hit",
 ]);
+const AI_EFFECT_CODES = new Set(["foto_viva"]);
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -525,6 +526,15 @@ export default function UploadZone({
     } else if (LYRIC_RENDER_FIELDS.has(field)) {
       setPreviewFace("lyrics");
     }
+  };
+  const chooseEffect = (code) => {
+    // Foto viva is photo-first. Keep the two axes honest in the UI instead of
+    // letting a stale cinematic movement selection promise a video source
+    // while the effect actually needs an image-to-video seed.
+    if (code === "foto_viva" && batchDefaults.movementStyle !== "foto-parallax") {
+      updateBatchDefault("movementStyle", "foto-parallax");
+    }
+    updateBatchDefault("effect", code);
   };
 
   const [hoverCaseBatch, setHoverCaseBatch] = useState(null);
@@ -1090,8 +1100,8 @@ export default function UploadZone({
     estatico:        { kind: "video", label: _MOVE_LABELS.estatico,         sample: "/movement_samples/estatico.mp4",  desc: t("upload.movement_estatico_desc") || "🎬 Escena real con cámara FIJA. Lo que se mueve son los elementos de la escena (gente, olas, nubes, neblina, fuego)." },
     sutil:           { kind: "video", label: _MOVE_LABELS.sutil,            sample: "/movement_samples/sutil.mp4",     desc: t("upload.movement_sutil_desc") || "🎬 Escena real con drift sutil de cámara + motion in-scene. Calmo pero vivo." },
     estandar:        { kind: "video", label: _MOVE_LABELS.estandar,         sample: "/movement_samples/estandar.mp4",  desc: t("upload.movement_estandar_desc") || "🎬 Escena real con movimiento cinematográfico de cámara (zoom/drift)." },
-    "foto-parallax": { kind: "image", label: _MOVE_LABELS["foto-parallax"], sample: "/movement_samples/foto-fija.jpg", desc: t("upload.movement_parallax_desc") || "Foto IA fija (sin movimiento de cámara). Sumale un efecto abajo —lluvia, nieve, luces— para darle vida." },
-    animado:         { kind: "video", label: _MOVE_LABELS.animado,          sample: "/movement_samples/animado.mp4",   desc: t("upload.movement_animado_desc") || "🎬 Ilustración 2D estilizada animada, no fotorrealista." },
+    "foto-parallax": { kind: "image", label: _MOVE_LABELS["foto-parallax"], sample: "/movement_samples/foto-fija.jpg", desc: t("upload.movement_parallax_desc") || "Foto IA fija. Podés dejarla quieta o darle movimiento localizado con Foto viva." },
+    animado:         { kind: "video", label: _MOVE_LABELS.animado,          sample: "/movement_samples/animado.mp4",   desc: t("upload.movement_animado_desc") || "🎬 Dibujo casi estático: un protagonista de la escena se mueve en loop. Sin cámara ni clima genérico." },
   };
   const MOVEMENT_STYLES = [
     { code: "", kind: "auto", label: _MOVE_LABELS[""], sample: null, desc: t("upload.movement_auto_desc") || "La IA decide el movimiento según la canción." },
@@ -1103,10 +1113,11 @@ export default function UploadZone({
 
   // Effect overlay — animated particles composited OVER the background (the
   // proven UMG pattern: foto/loop calmo + nieve/lluvia/estrellas encima). It's
-  // an ORTHOGONAL axis to "Movimiento" (which moves the camera): the effect
-  // falls on top of anything, even a still photo or a Library/uploaded clip.
-  // Backed by pre-rendered alpha-screen loops; preview clips live at
-  // /fx_samples/<code>.mp4 (effect composited over a neutral gradient).
+  // usually an ORTHOGONAL axis to "Movimiento": overlays fall on top of any
+  // background. Foto viva is the intentional exception — it aligns Movimiento
+  // to a still-photo source because its provider path is image-to-video.
+  // Every option also has a deterministic baked loop/fallback; picker previews
+  // live at /fx_samples/<code>.mp4.
   const _FX_LABELS = EFFECT_LABELS(t);
   const EFFECT_META = {
     snow: { category: "particles", sample: "/fx_samples/snow.mp4", desc: t("upload.effect_snow_desc") || "Copos cayendo. Calmo, invernal." },
@@ -1131,11 +1142,12 @@ export default function UploadZone({
     shadow_play: { category: "ambient", sample: "/fx_samples/shadow_play.mp4", desc: t("upload.effect_shadow_play_desc") || "Sombras orgánicas se desplazan como luz entre hojas." },
     kaleido: { category: "stylized", sample: "/fx_samples/kaleido.mp4", desc: t("upload.effect_kaleido_desc") || "Geometría caleidoscópica lenta y envolvente." },
     halftone: { category: "stylized", sample: "/fx_samples/halftone.mp4", desc: t("upload.effect_halftone_desc") || "Trama editorial de puntos que respira sobre la foto." },
-    ink_reveal: { category: "stylized", sample: "/fx_samples/ink_reveal.mp4", desc: t("upload.effect_ink_reveal_desc") || "Manchas de tinta orgánicas aparecen y se retraen." },
+    ink_reveal: { category: "stylized", sample: "/fx_samples/ink_reveal.mp4", desc: t("upload.effect_ink_reveal_desc") || "Pinceladas de tinta transforman zonas de la foto sin taparla." },
     heatwave: { category: "ambient", sample: "/fx_samples/heatwave.mp4", desc: t("upload.effect_heatwave_desc") || "Ondas cálidas ascienden como un espejismo." },
-    chromatic_pulse: { category: "stylized", sample: "/fx_samples/chromatic_pulse.mp4", desc: t("upload.effect_chromatic_pulse_desc") || "Anillos de color respiran desde el centro." },
+    chromatic_pulse: { category: "stylized", sample: "/fx_samples/chromatic_pulse.mp4", desc: t("upload.effect_chromatic_pulse_desc") || "La aberración cromática respira suavemente sobre los contornos." },
     cutout_echo: { category: "stylized", sample: "/fx_samples/cutout_echo.mp4", desc: t("upload.effect_cutout_echo_desc") || "Marcos desplazados con estética de recorte editorial." },
     projector: { category: "ambient", sample: "/fx_samples/projector.mp4", desc: t("upload.effect_projector_desc") || "Haz, polvo y parpadeo de proyector analógico." },
+    foto_viva: { category: "stylized", sample: "/fx_samples/foto_viva.mp4", desc: t("upload.effect_foto_viva_desc") || "Anima una sola región significativa de la foto. La IA elige qué mover según la imagen; no agrega clima genérico." },
     bass_pulse: { category: "reactive", sample: "/fx_samples/bass_pulse.mp4", desc: t("upload.effect_bass_pulse_desc") || "Un halo profundo se expande con cada grave." },
     beat_flash: { category: "reactive", sample: "/fx_samples/beat_flash.mp4", desc: t("upload.effect_beat_flash_desc") || "Destellos breves sincronizados con el tempo." },
     chromatic_hit: { category: "reactive", sample: "/fx_samples/chromatic_hit.mp4", desc: t("upload.effect_chromatic_hit_desc") || "Los canales RGB se separan en cada golpe." },
@@ -1870,29 +1882,73 @@ export default function UploadZone({
         </div>
       )}
 
-      {/* Motion Composer: the confirmed state is compact. The catalogue only
-          replaces this inspector when the operator explicitly explores it. */}
+      {/* Motion Studio: one cohesive creative surface. The confirmed state
+          shows both decisions side by side; a catalogue temporarily takes over
+          the same canvas so the editor never grows into a wall of controls. */}
+      <div
+        ref={effectControlsRef}
+        data-testid="motion-studio"
+        className={`relative mb-4 overflow-hidden rounded-2xl border bg-[#0b0913]/90 shadow-[0_24px_70px_rgba(0,0,0,0.24)] transition-all duration-500 ${
+          effectControlsPulse
+            ? "scale-[1.006] border-brand/45 drop-shadow-[0_0_24px_rgba(139,92,246,0.18)]"
+            : "border-white/[0.08]"
+        } ${motionComposerView === null ? "sm:grid sm:grid-cols-2" : ""}`}
+      >
+        <div
+          className="pointer-events-none absolute inset-x-0 top-0 h-28 opacity-80"
+          style={{ background: "radial-gradient(70% 120% at 15% 0%,rgba(139,92,246,.19),transparent 72%),radial-gradient(60% 100% at 92% 0%,rgba(34,211,238,.10),transparent 76%)" }}
+        />
+        <div className="relative col-span-full flex items-start justify-between gap-3 px-3.5 pb-3 pt-3.5 sm:px-4">
+          <div className="flex min-w-0 items-start gap-2.5">
+            <div className="grid h-8 w-8 shrink-0 place-items-center rounded-xl border border-brand/25 bg-brand/10 text-brand-light shadow-[inset_0_1px_0_rgba(255,255,255,.08)]">
+              <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.7" viewBox="0 0 24 24" aria-hidden="true">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4 8h4l2-3 4 14 2-7h4" />
+              </svg>
+            </div>
+            <div className="min-w-0">
+              <p className="text-[11px] font-semibold tracking-[-0.01em] text-white">
+                {t("upload.motion_studio_title") || "Motion Studio"}
+              </p>
+              <p className="mt-0.5 text-[9px] leading-snug text-gray-500">
+                {t("upload.motion_studio_desc") || "Combiná el movimiento de la escena con un tratamiento visual."}
+              </p>
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-1.5 rounded-full border border-emerald-400/15 bg-emerald-400/[0.06] px-2 py-1">
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_7px_rgba(52,211,153,.8)]" />
+            <span className="text-[8px] font-semibold uppercase tracking-[0.12em] text-emerald-200/80">
+              {t("upload.motion_live_badge") || "Preview live"}
+            </span>
+          </div>
+        </div>
+
+      {/* Movement decision / catalogue. */}
       {motionComposerView !== "effect" && (
-        <div className="mb-2">
+        <div className={motionComposerView === "movement"
+          ? "relative border-t border-white/[0.06] bg-black/10 px-3 pb-3 pt-3 sm:px-4 sm:pb-4"
+          : "relative px-3 pb-2 sm:pb-4 sm:pl-4 sm:pr-1.5"}>
           {motionComposerView === "movement" ? (
             <>
-              <div className="mb-3 flex items-center gap-2">
+              <div className="mb-3 flex items-center gap-2.5">
                 <button
                   type="button"
                   onClick={closeMotionComposer}
                   aria-label={t("common.back") || "Volver"}
-                  className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-white/[0.07] text-gray-400 transition-colors hover:bg-white/[0.05] hover:text-white"
+                  className="grid h-8 w-8 shrink-0 place-items-center rounded-full border border-white/[0.08] bg-white/[0.025] text-gray-400 transition-all hover:border-white/[0.16] hover:bg-white/[0.06] hover:text-white"
                 >
                   <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="m15 18-6-6 6-6" /></svg>
                 </button>
-                <div className="min-w-0">
-                  <p className="text-[12px] font-semibold text-white">
+                <div className="min-w-0 flex-1">
+                  <p className="text-[8px] font-semibold uppercase tracking-[0.15em] text-brand-light/75">
+                    01 · {t("upload.motion_editing_badge") || "Editando"}
+                  </p>
+                  <p className="truncate text-[12px] font-semibold text-white">
                     {t("upload.movement_gallery_title") || "Movimiento base"}
                   </p>
-                  <p className="truncate text-[9px] text-gray-600">
-                    {t("upload.movement_gallery_desc") || "Elegí y miralo en el preview"}
-                  </p>
                 </div>
+                <span className="max-w-[42%] truncate rounded-full border border-brand/20 bg-brand/[0.08] px-2 py-1 text-[8px] font-medium text-brand-light">
+                  {selectedMovement.label.replace(/\s*\(.*\)\s*/, "")}
+                </span>
               </div>
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                 {MOVEMENT_STYLES.map((m) => {
@@ -1912,36 +1968,40 @@ export default function UploadZone({
                       data-in-video={inVideo ? "true" : undefined}
                       aria-label={`${m.label}: ${m.desc}${inVideo ? ` — ${ANCHOR_LABEL}` : ""}`}
                       title={m.desc}
-                      className={`group overflow-hidden rounded-lg border text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand ${
+                      className={`group relative overflow-hidden rounded-xl border text-left transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand ${
                         active
-                          ? "border-brand/60 bg-brand/[0.08] ring-1 ring-brand/20"
-                          : "border-white/[0.06] bg-white/[0.02] hover:border-white/[0.18]"
+                          ? "border-brand/65 bg-brand/[0.1] shadow-[0_0_0_1px_rgba(139,92,246,.12),0_12px_24px_rgba(0,0,0,.18)]"
+                          : "border-white/[0.07] bg-white/[0.02] hover:-translate-y-0.5 hover:border-white/[0.18] hover:bg-white/[0.045]"
                       }`}
                     >
                       <div className="relative aspect-video overflow-hidden bg-black">
                         {m.sample ? (
                           m.kind === "image"
-                            ? <img src={m.sample} alt="" className="h-full w-full object-cover pointer-events-none" />
-                            : <video src={m.sample} className="h-full w-full object-cover pointer-events-none" autoPlay loop muted playsInline />
+                            ? <img src={m.sample} alt="" className="h-full w-full object-cover pointer-events-none transition-transform duration-500 group-hover:scale-[1.04]" />
+                            : <video src={m.sample} className="h-full w-full object-cover pointer-events-none transition-transform duration-500 group-hover:scale-[1.04]" autoPlay loop muted playsInline />
                         ) : (
-                          <div className="grid h-full w-full place-items-center text-gray-400" style={{ background: "radial-gradient(120% 100% at 50% 0,#2a1d52,#0b0820)" }}>
+                          <div className="grid h-full w-full place-items-center text-gray-300" style={{ background: "radial-gradient(120% 100% at 50% 0,#38235d,#0b0820)" }}>
                             <span className="h-7 w-7">{movIcon(m.code)}</span>
                           </div>
                         )}
+                        <div className="absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-black/85 to-transparent" />
+                        <p className="absolute inset-x-2 bottom-1.5 truncate text-[9px] font-semibold text-white">
+                          {m.label.replace(/\s*\(.*\)\s*/, "")}
+                        </p>
                         {active && (
-                          <div className="absolute right-1.5 top-1.5 grid h-4 w-4 place-items-center rounded-full bg-brand text-white">
-                            <svg className="h-2.5 w-2.5" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                          <div className="absolute right-1.5 top-1.5 grid h-5 w-5 place-items-center rounded-full bg-white text-brand shadow-lg">
+                            <svg className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
                           </div>
                         )}
                         {inVideo && anchorChip}
                       </div>
-                      <p className={`truncate px-2 py-1.5 text-[10px] font-medium ${active ? "text-white" : "text-gray-400"}`}>
-                        {m.label.replace(/\s*\(.*\)\s*/, "")}
-                      </p>
                     </button>
                   );
                 })}
               </div>
+              <p className="mt-2 text-[9px] leading-snug text-gray-600">
+                {t("upload.movement_gallery_desc") || "Elegí una opción y mirá el resultado en el preview."}
+              </p>
             </>
           ) : (
             <button
@@ -1953,47 +2013,51 @@ export default function UploadZone({
               aria-pressed="true"
               aria-haspopup="true"
               onClick={() => setMotionComposerView("movement")}
-              className="group flex w-full items-center gap-3 rounded-xl border border-white/[0.07] bg-white/[0.02] p-2.5 text-left transition-colors hover:border-white/[0.14] hover:bg-white/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand"
+              className="group relative flex min-w-0 overflow-hidden rounded-xl border border-white/[0.08] bg-white/[0.025] text-left transition-all hover:-translate-y-0.5 hover:border-brand/35 hover:bg-white/[0.045] hover:shadow-[0_14px_30px_rgba(0,0,0,.2)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand sm:block"
             >
-              <div className="relative h-9 w-16 shrink-0 overflow-hidden rounded-lg bg-black">
+              <div className="relative h-[82px] w-[116px] shrink-0 overflow-hidden bg-black sm:h-[108px] sm:w-full">
                 {selectedMovement.sample ? (
                   selectedMovement.kind === "image"
-                    ? <img src={selectedMovement.sample} alt="" className="h-full w-full object-cover" />
-                    : <video src={selectedMovement.sample} className="h-full w-full object-cover pointer-events-none" autoPlay loop muted playsInline />
+                    ? <img src={selectedMovement.sample} alt="" className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-[1.035]" />
+                    : <video src={selectedMovement.sample} className="h-full w-full object-cover pointer-events-none transition-transform duration-500 group-hover:scale-[1.035]" autoPlay loop muted playsInline />
                 ) : (
-                  <div className="grid h-full w-full place-items-center text-gray-400" style={{ background: "radial-gradient(120% 100% at 50% 0,#2a1d52,#0b0820)" }}>
-                    <span className="h-5 w-5">{movIcon(selectedMovement.code)}</span>
+                  <div className="grid h-full w-full place-items-center text-gray-300" style={{ background: "radial-gradient(120% 100% at 50% 0,#38235d,#0b0820)" }}>
+                    <span className="h-7 w-7">{movIcon(selectedMovement.code)}</span>
                   </div>
                 )}
+                <div className="absolute inset-x-0 bottom-0 hidden h-14 bg-gradient-to-t from-[#0b0913] to-transparent sm:block" />
+                <span className="absolute left-2 top-2 rounded-full border border-white/10 bg-black/55 px-1.5 py-0.5 text-[7px] font-bold tracking-[0.12em] text-white/70 backdrop-blur-md">01</span>
+                {isAnchor("movementStyle", selectedMovement.code) && anchorChip}
               </div>
-              <div className="min-w-0 flex-1">
-                <p className="text-[9px] font-medium text-gray-600">
+              <div className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2.5 sm:-mt-4 sm:relative sm:items-end sm:px-3 sm:pb-3 sm:pt-0">
+                <div className="min-w-0 flex-1">
+                <p className="text-[8px] font-semibold uppercase tracking-[0.14em] text-brand-light/75">
                   {t("upload.movement_gallery_title") || "Movimiento base"}
                 </p>
                 <p className="truncate text-[12px] font-semibold text-white">
                   {selectedMovement.label.replace(/\s*\(.*\)\s*/, "")}
                 </p>
+                <p className="mt-0.5 line-clamp-2 text-[9px] leading-snug text-gray-500 sm:min-h-[24px]">
+                  {selectedMovement.desc}
+                </p>
+                </div>
+                <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full border border-white/[0.08] bg-white/[0.035] text-gray-500 transition-all group-hover:border-brand/30 group-hover:bg-brand/10 group-hover:text-white">
+                  <svg className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="m9 18 6-6-6-6" /></svg>
+                </span>
               </div>
-              <span className="hidden text-[9px] font-medium text-gray-500 sm:block">{t("common.change") || "Cambiar"}</span>
-              <svg className="h-4 w-4 shrink-0 text-gray-600 transition-transform group-hover:translate-x-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="m9 18 6-6-6-6" /></svg>
             </button>
           )}
         </div>
       )}
 
-      {/* Effect gallery — particles composited OVER the background. Available
-          for ANY source (IA / Biblioteca / Subido): it's an overlay, not a
-          generation choice. Orthogonal to "Movimiento" (camera). */}
+      {/* Effect decision / catalogue. */}
       {motionComposerView !== "movement" && (
-      <div
-        ref={effectControlsRef}
-        className={`mb-4 rounded-lg transition-all duration-500 ${
-          effectControlsPulse
-            ? "ring-2 ring-brand/50 bg-brand/[0.04] -mx-2 px-2"
-            : "ring-2 ring-transparent"
-        }`}
-      >
-        <div className="overflow-hidden rounded-xl border border-white/[0.08] bg-white/[0.025]">
+      <div className={motionComposerView === null ? "px-3 pb-3 sm:pl-1.5 sm:pr-4" : "px-3 pb-3 sm:px-4"}>
+        <div className={`overflow-hidden rounded-xl border border-white/[0.08] bg-white/[0.025] ${
+          motionComposerView === null
+            ? "transition-all hover:-translate-y-0.5 hover:border-cyan-300/25 hover:bg-white/[0.045] hover:shadow-[0_14px_30px_rgba(0,0,0,.2)]"
+            : ""
+        }`}>
           {/* The editor already has a large live preview. Keep this control
               collapsed by default so the catalogue never competes with it. */}
           <button
@@ -2006,14 +2070,22 @@ export default function UploadZone({
             aria-expanded={motionComposerView === "effect"}
             aria-haspopup="true"
             onClick={() => setMotionComposerView((view) => view === "effect" ? null : "effect")}
-            className="group flex w-full items-center gap-3 p-2.5 text-left transition-colors hover:bg-white/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand"
+            className={`group w-full text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand ${
+              motionComposerView === null
+                ? "relative flex min-w-0 overflow-hidden sm:block"
+                : "flex items-center gap-3 p-2.5 transition-colors hover:bg-white/[0.035]"
+            }`}
           >
-            <div className="relative h-11 w-[70px] shrink-0 overflow-hidden rounded-lg border border-white/[0.08] bg-black">
+            <div className={`relative shrink-0 overflow-hidden bg-black ${
+              motionComposerView === null
+                ? "h-[82px] w-[116px] sm:h-[108px] sm:w-full"
+                : "h-11 w-[70px] rounded-lg border border-white/[0.08]"
+            }`}>
               {selectedEffect.sample ? (
                 <video
                   key={`selected-${selectedEffect.code}`}
                   src={selectedEffect.sample}
-                  className="h-full w-full object-cover pointer-events-none"
+                  className="h-full w-full object-cover pointer-events-none transition-transform duration-500 group-hover:scale-[1.035]"
                   autoPlay loop muted playsInline
                 />
               ) : (
@@ -2025,25 +2097,60 @@ export default function UploadZone({
                 </div>
               )}
               {selectedEffect.code && (
-                <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_7px_rgba(52,211,153,0.9)]" />
+                <span className="absolute right-2 top-2 h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,.9)]" />
+              )}
+              {motionComposerView === null && (
+                <>
+                  <div className="absolute inset-x-0 bottom-0 hidden h-14 bg-gradient-to-t from-[#0b0913] to-transparent sm:block" />
+                  <span className="absolute left-2 top-2 rounded-full border border-white/10 bg-black/55 px-1.5 py-0.5 text-[7px] font-bold tracking-[0.12em] text-white/70 backdrop-blur-md">02</span>
+                  {isAnchor("effect", selectedEffect.code) && anchorChip}
+                </>
               )}
             </div>
 
-            <div className="min-w-0 flex-1">
-              <div className="flex min-w-0 items-center gap-2">
-                <p className="shrink-0 text-[10px] font-medium text-gray-500">
-                  {t("upload.effect_gallery_title") || "Efecto encima"}
-                </p>
-                <span className="truncate text-[12px] font-semibold text-white">
-                  {selectedEffect.label}
-                </span>
+            <div className={`min-w-0 flex-1 ${
+              motionComposerView === null
+                ? "px-3 py-2.5 sm:-mt-4 sm:relative sm:pb-3 sm:pt-0"
+                : ""
+            }`}>
+              <div className={`flex min-w-0 items-center gap-2 ${motionComposerView === null ? "sm:items-end" : ""}`}>
+                <div className="min-w-0 flex-1">
+                  <p className={`shrink-0 font-semibold ${
+                    motionComposerView === null
+                      ? "text-[8px] uppercase tracking-[0.14em] text-cyan-200/65"
+                      : "text-[8px] uppercase tracking-[0.15em] text-cyan-200/65"
+                  }`}>
+                    {motionComposerView === "effect"
+                      ? <>02 · {t("upload.motion_editing_badge") || "Editando"}</>
+                      : (t("upload.effect_gallery_title") || "Efecto encima")}
+                  </p>
+                  <div className="mt-0.5 flex min-w-0 items-center gap-1.5">
+                    <span className="truncate text-[12px] font-semibold text-white">
+                      {selectedEffect.label}
+                    </span>
+                    {motionComposerView === null && AI_EFFECT_CODES.has(selectedEffect.code) && (
+                      <span className="rounded-full bg-cyan-400/15 px-1.5 py-0.5 text-[7px] font-bold tracking-[0.12em] text-cyan-100">
+                        {t("upload.effect_ai_badge") || "IA"}
+                      </span>
+                    )}
+                  </div>
+                  <p className={`mt-0.5 text-gray-500 ${
+                    motionComposerView === null
+                      ? "line-clamp-2 text-[9px] leading-snug sm:min-h-[24px]"
+                      : "truncate text-[10px]"
+                  }`}>
+                    {selectedEffect.desc}
+                  </p>
+                </div>
+                {motionComposerView === null && (
+                  <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full border border-white/[0.08] bg-white/[0.035] text-gray-500 transition-all group-hover:border-cyan-300/20 group-hover:bg-cyan-300/[0.06] group-hover:text-white">
+                    <svg className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="m9 18 6-6-6-6" /></svg>
+                  </span>
+                )}
               </div>
-              <p className="mt-0.5 truncate text-[10px] text-gray-500">
-                {selectedEffect.desc}
-              </p>
             </div>
 
-            <div className="flex shrink-0 items-center gap-2">
+            <div className={`shrink-0 items-center gap-2 ${motionComposerView === null ? "hidden" : "flex"}`}>
               <span className="hidden rounded-full border border-white/[0.08] bg-white/[0.035] px-2 py-1 text-[9px] font-medium text-gray-400 sm:block">
                 {t("common.change") || "Cambiar"}
               </span>
@@ -2063,7 +2170,7 @@ export default function UploadZone({
           {motionComposerView === "effect" && (
             <div
               data-testid="effect-picker-panel"
-              className="max-h-[calc(100vh-240px)] overflow-y-auto border-t border-white/[0.07] bg-[#0b0913]/80 px-2.5 pb-2.5 pt-2"
+              className="max-h-[calc(100vh-260px)] overflow-y-auto border-t border-white/[0.06] bg-black/10 px-2.5 pb-2.5 pt-2.5"
             >
               <div
                 className="flex gap-1.5 overflow-x-auto pb-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
@@ -2079,10 +2186,10 @@ export default function UploadZone({
                       aria-pressed={selected}
                       data-effect-category={category.code}
                       onClick={() => setEffectCategory(category.code)}
-                      className={`flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[9px] font-medium transition-colors ${
+                      className={`flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[9px] font-medium transition-all ${
                         selected
-                          ? "border-brand/45 bg-brand/15 text-white"
-                          : "border-white/[0.07] bg-white/[0.02] text-gray-500 hover:border-white/[0.14] hover:text-gray-300"
+                          ? "border-brand/40 bg-brand/15 text-white shadow-[inset_0_1px_0_rgba(255,255,255,.06)]"
+                          : "border-white/[0.07] bg-white/[0.02] text-gray-500 hover:border-white/[0.15] hover:bg-white/[0.04] hover:text-gray-300"
                       }`}
                     >
                       {category.label}
@@ -2102,7 +2209,7 @@ export default function UploadZone({
                     <button
                       key={e.code || "none"}
                       type="button"
-                      onClick={() => updateBatchDefault("effect", e.code)}
+                      onClick={() => chooseEffect(e.code)}
                       onMouseEnter={() => setHoverEffect(e.code)}
                       onMouseLeave={() => setHoverEffect(null)}
                       onFocus={() => setHoverEffect(e.code)}
@@ -2112,10 +2219,10 @@ export default function UploadZone({
                       data-in-video={inVideo ? "true" : undefined}
                       aria-label={`${_stillNote || `${e.label}: ${e.desc}`}${inVideo ? ` — ${ANCHOR_LABEL}` : ""}`}
                       title={_stillNote || e.desc}
-                      className={`group relative overflow-hidden rounded-lg border text-left transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand ${
+                      className={`group relative overflow-hidden rounded-xl border text-left transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand ${
                         active
-                          ? "border-brand/70 bg-brand/[0.1] ring-1 ring-brand/20"
-                          : "border-white/[0.07] bg-white/[0.025] hover:border-white/[0.18] hover:bg-white/[0.05]"
+                          ? "border-brand/65 bg-brand/[0.1] shadow-[0_0_0_1px_rgba(139,92,246,.12),0_12px_24px_rgba(0,0,0,.18)]"
+                          : "border-white/[0.07] bg-white/[0.025] hover:-translate-y-0.5 hover:border-white/[0.18] hover:bg-white/[0.05]"
                       }`}
                     >
                       <div className="relative aspect-video overflow-hidden bg-black">
@@ -2124,7 +2231,7 @@ export default function UploadZone({
                             <img
                               src={e.sample.replace(/\.mp4$/, ".jpg")}
                               alt=""
-                              className="h-full w-full object-cover pointer-events-none transition-transform duration-300 group-hover:scale-[1.04]"
+                              className="h-full w-full object-cover pointer-events-none transition-transform duration-500 group-hover:scale-[1.045]"
                             />
                             {(active || hoverEffect === e.code) && (
                               <video
@@ -2141,20 +2248,26 @@ export default function UploadZone({
                             <span className="text-sm">Ø</span>
                           </div>
                         )}
-                        {active && (
-                          <div className="absolute right-1 top-1 grid h-4 w-4 place-items-center rounded-full bg-white text-brand shadow">
-                            <svg className="h-2.5 w-2.5" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
-                          </div>
-                        )}
-                        {inVideo && anchorChip}
-                      </div>
-                      <div className={`flex items-center justify-between gap-1 px-2 py-1.5 text-[9px] font-medium ${active ? "text-white" : "text-gray-400"}`}>
-                        <span className="truncate">{_stillNote || e.label}</span>
+                        <div className="absolute inset-x-0 bottom-0 h-14 bg-gradient-to-t from-black/90 via-black/45 to-transparent" />
+                        <div className="absolute inset-x-2 bottom-1.5 flex items-end justify-between gap-1">
+                          <span className="truncate text-[9px] font-semibold text-white">{_stillNote || e.label}</span>
                         {REACTIVE_EFFECT_CODES.has(e.code) && (
-                          <span className="shrink-0 rounded-full bg-fuchsia-400/15 px-1.5 py-0.5 text-[7px] font-bold tracking-[0.12em] text-fuchsia-200">
+                          <span className="shrink-0 rounded-full bg-fuchsia-400/20 px-1.5 py-0.5 text-[7px] font-bold tracking-[0.12em] text-fuchsia-100 backdrop-blur">
                             {t("upload.effect_reactive_badge")}
                           </span>
                         )}
+                        {AI_EFFECT_CODES.has(e.code) && (
+                          <span className="shrink-0 rounded-full bg-cyan-400/20 px-1.5 py-0.5 text-[7px] font-bold tracking-[0.12em] text-cyan-50 backdrop-blur">
+                            {t("upload.effect_ai_badge") || "IA"}
+                          </span>
+                        )}
+                        </div>
+                        {active && (
+                          <div className="absolute right-1.5 top-1.5 grid h-5 w-5 place-items-center rounded-full bg-white text-brand shadow-lg">
+                            <svg className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                          </div>
+                        )}
+                        {inVideo && anchorChip}
                       </div>
                     </button>
                   );
@@ -2174,16 +2287,18 @@ export default function UploadZone({
           && !batchDefaults.effect && (
           <div
             data-testid="foto-fija-warning"
-            className="mt-1.5 flex items-center gap-2 px-1 text-[10px] text-gray-500"
+            className="mt-2 flex items-center gap-2 rounded-xl border border-amber-300/10 bg-amber-300/[0.035] px-2.5 py-2 text-[9px] text-amber-100/65"
           >
-            <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-white/20" />
+            <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-amber-300/[0.08] text-amber-200/80">
+              <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4m0 4h.01M10.3 3.8 2.6 17.1A2 2 0 0 0 4.3 20h15.4a2 2 0 0 0 1.7-2.9L13.7 3.8a2 2 0 0 0-3.4 0Z" /></svg>
+            </span>
             <span className="min-w-0 flex-1">
               {t("upload.effect_none_still") || "Resultado: imagen inmóvil"}
             </span>
             <button
               type="button"
               onClick={jumpToEffects}
-              className="shrink-0 font-medium text-brand-light transition-colors hover:text-white"
+              className="shrink-0 rounded-full border border-brand/25 bg-brand/10 px-2.5 py-1 font-semibold text-brand-light transition-all hover:border-brand/40 hover:bg-brand/20 hover:text-white"
             >
               {t("upload.foto_fija_goto_effect") || "Agregar vida"}
             </button>
@@ -2191,6 +2306,7 @@ export default function UploadZone({
         )}
       </div>
       )}
+      </div>
 
       {/* Scene metadata (genre + concept) — only when generating with AI.
           Explained inline so it's clear what they DO and how they impact. */}

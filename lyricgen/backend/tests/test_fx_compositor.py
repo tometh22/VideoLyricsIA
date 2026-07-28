@@ -34,7 +34,7 @@ def test_expanded_effect_catalog_has_real_assets():
         "liquid_glass", "caustics", "rgb_glitch", "neon_edge",
         "shadow_play", "kaleido", "halftone", "ink_reveal", "heatwave",
         "chromatic_pulse", "cutout_echo", "projector", "bass_pulse",
-        "beat_flash", "chromatic_hit", "beat_ripple", "echo_hit",
+        "foto_viva", "beat_flash", "chromatic_hit", "beat_ripple", "echo_hit",
     }
     assert added.issubset(set(fx.EFFECTS))
     for effect in added:
@@ -106,7 +106,7 @@ def test_dark_effect_uses_multiply_and_editorial_opacity():
         width=1920, height=1080, effect="shadow_play", style="",
     )
     assert use_complex is True
-    assert "blend=all_mode=multiply:all_opacity=0.58" in fc
+    assert "blend=all_mode=multiply:all_opacity=0.34" in fc
     assert fx.effect_blend("ink_reveal") == "multiply"
     assert fx.effect_blend("snow") == "screen"
 
@@ -169,13 +169,14 @@ def test_invalid_or_empty_beat_grid_uses_safe_120_bpm_fallback(monkeypatch):
         ("liquid_glass", "displace=edge=mirror"),
         ("heatwave", "displace=edge=mirror"),
         ("rgb_glitch", "colorchannelmixer"),
-        ("neon_edge", "edgedetect=mode=colormix"),
+        ("neon_edge", "edgedetect=mode=wires"),
         ("kaleido", "vstack=inputs=2"),
         ("halftone", "flags=neighbor"),
         ("ink_reveal", "maskedmerge"),
         ("chromatic_pulse", "colorchannelmixer"),
         ("cutout_echo", "scale=1203:676"),
         ("projector", "vignette=PI/5.2"),
+        ("foto_viva", "maskedmerge"),
     ],
 )
 def test_photo_transform_effects_derive_pixels_from_background(effect, contract):
@@ -202,6 +203,52 @@ def test_moviepy_fallback_also_transforms_selected_photo(effect):
     output = fx.transform_photo_frame(photo, effect, 0.65, layer)
     assert output.shape == photo.shape
     assert np.abs(output.astype(np.int16) - photo.astype(np.int16)).mean() > 1.0
+
+
+def test_foto_viva_is_generative_first_but_keeps_a_local_transform_fallback():
+    assert fx.is_generative_effect(" FOTO_VIVA ")
+    assert fx.is_pixel_transform("foto_viva")
+    assert not fx.is_generative_effect("rain")
+
+
+def test_corrected_editorial_effects_keep_the_photo_readable():
+    kaleido, _, _ = fx.build_video_filter(
+        ass_basename=None, font_dir="", width=1280, height=720, effect="kaleido",
+    )
+    ink, _, _ = fx.build_video_filter(
+        ass_basename=None, font_dir="", width=1280, height=720, effect="ink_reveal",
+    )
+    chromatic, _, _ = fx.build_video_filter(
+        ass_basename=None, font_dir="", width=1280, height=720,
+        effect="chromatic_pulse",
+    )
+    # Kaleido's auxiliary rays are now only a barely-visible accent.
+    assert "all_opacity=0.03" in kaleido
+    # Ink leaves the original photograph as the neutral state and applies the
+    # stylized treatment only inside the authored brush mask.
+    assert "[inkbase][inkwash][inkmask]maskedmerge[inkmerged]" in ink
+    assert "[inkmerged][inktexture]blend=all_mode=multiply:all_opacity=0.12" in ink
+    # Chromatic Pulse isolates shifted-photo differences (contours) instead of
+    # screen-blending whole red/blue copies and washing the frame magenta.
+    assert chromatic.count("blend=all_mode=difference") == 2
+    assert "all_opacity=0.22" in chromatic
+
+
+def test_neon_and_halftone_do_not_apply_full_frame_color_washes():
+    neon, _, _ = fx.build_video_filter(
+        ass_basename=None, font_dir="", width=1280, height=720,
+        effect="neon_edge",
+    )
+    halftone, _, _ = fx.build_video_filter(
+        ass_basename=None, font_dir="", width=1280, height=720,
+        effect="halftone",
+    )
+    assert "mode=wires" in neon
+    assert "mode=colormix" not in neon
+    # `eq=saturation` on planar GBR treated the green plane as luminance and
+    # turned the delivered halftone sample solid green.
+    assert "saturation=" not in halftone
+    assert "all_opacity=0.36" in halftone
 
 
 def test_fontsdir_path_is_escaped():

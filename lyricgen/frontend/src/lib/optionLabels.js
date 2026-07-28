@@ -19,7 +19,7 @@ export const MOVEMENT_LABELS = (t) => ({
   sutil: t("upload.movement_sutil") || "Sutil (mínimo movimiento)",
   estandar: t("upload.movement_estandar") || "Cinematográfico",
   "foto-parallax": t("upload.movement_foto_parallax") || "Foto fija",
-  animado: t("upload.movement_animado") || "Animado (ilustración)",
+  animado: t("upload.movement_animado") || "Ilustración viva",
 });
 
 /** code → etiqueta de Efecto. "" (Ninguno) incluido. */
@@ -52,6 +52,7 @@ export const EFFECT_LABELS = (t) => ({
   chromatic_pulse: t("upload.effect_chromatic_pulse") || "Pulso cromático",
   cutout_echo: t("upload.effect_cutout_echo") || "Eco recortado",
   projector: t("upload.effect_projector") || "Proyector",
+  foto_viva: t("upload.effect_foto_viva") || "Foto viva",
   bass_pulse: t("upload.effect_bass_pulse") || "Pulso de graves",
   beat_flash: t("upload.effect_beat_flash") || "Flash al beat",
   chromatic_hit: t("upload.effect_chromatic_hit") || "Golpe cromático",
