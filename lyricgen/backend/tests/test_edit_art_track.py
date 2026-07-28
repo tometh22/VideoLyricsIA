@@ -168,8 +168,10 @@ def test_edit_rejects_while_processing(client, admin_token):
 
 
 def test_edit_art_track_404_other_tenant(client, admin_token):
-    """No se puede editar un job de otro tenant."""
-    job_id = _seed_art_track_job(999, "some-other-tenant")
+    """No se puede editar un job de otro tenant (el endpoint filtra por tenant,
+    sin bypass de admin). user_id válido (FK a users) pero tenant ajeno."""
+    uid, _tid = _admin_identity(client, admin_token)
+    job_id = _seed_art_track_job(uid, "some-other-tenant")
 
     with patch("main.enqueue_pipeline") as enq:
         res = client.post(
