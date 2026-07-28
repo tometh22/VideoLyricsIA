@@ -983,6 +983,22 @@ export default function UploadZone({
     }
   }, [bgMode, libraryLoaded]);
 
+  // Presets internos del wizard (SOLO-ADMIN). Se piden al backend SOLO si el
+  // usuario es admin — así el nombre y los valores del preset no viajan en el
+  // bundle de un no-admin (audit 2026-07-27). Un no-admin nunca dispara el
+  // fetch ni recibe el JSON (el endpoint responde 403). Sin presets = no se
+  // muestra la tarjeta; nunca bloquea el wizard.
+  const [adminPresets, setAdminPresets] = useState([]);
+  useEffect(() => {
+    if (user?.role !== "admin" || editMode) { setAdminPresets([]); return undefined; }
+    let alive = true;
+    fetch(`${API}/admin/wizard-presets`, { headers: authHeaders() })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (alive && Array.isArray(data?.presets)) setAdminPresets(data.presets); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [user?.role, editMode]);
+
   // When the user clears the library selection (or switches mode),
   // reset the variation toggle so a fresh pick starts in the safe
   // "as-is" default rather than inheriting the previous song's choice.
@@ -1765,35 +1781,23 @@ export default function UploadZone({
   // Los sub-bloques internos siguen con sus propios checks
   // (`files.length > 1` para acciones de batch) — esos correctamente
   // se ocultan si no hay archivos.
-  // Preset interno SOLO-ADMIN: la "receta UMG Argentina" derivada del análisis
-  // de los videos aprobados de Universal (may–jul 2026). Un click rellena el
-  // wizard con los settings de menor retrabajo (fuente grande, estático,
-  // mayúsculas, sin escenas, ProRes/HD). El operador puede ajustar cualquiera
-  // antes de generar. NO cambia defaults del servidor ni del tenant, y no se
-  // expone en el portal de descargas de UMG — solo rellena el formulario, igual
-  // que si se tipeara a mano. Gateado por role=admin en el JSX.
-  const applyUmgArgentinaRecipe = () => {
-    track("wizard.preset", { preset: "umg_argentina" });
-    // Fondo: Auto (AI) + inspirado en la letra; sin multi-escena.
-    onStyleChange?.("auto");
-    onBgMode?.("auto");
-    selectSceneMode("lyrics");        // match_lyrics=true, sin hint
-    onEnableScenesChange?.(false);
-    // Render (batchDefaults; el fan-out interno los aplica también por canción).
-    updateBatchDefault("movementStyle", "estatico");
-    updateBatchDefault("font", "poppins-bold");
-    updateBatchDefault("fontScale", "1.3");
-    updateBatchDefault("textCase", "upper");
-    updateBatchDefault("lyricsAnimation", "none");
-    updateBatchDefault("lineTransition", "none");
-    updateBatchDefault("effect", "");
-    updateBatchDefault("titleTemplate", "auto");
-    updateBatchDefault("frameFormat", "full");
-    // Entrega: master ProRes + YouTube, HD / 24fps / ProRes 422 HQ.
-    setDeliveryProfile("both");
-    setUmgFrameSize("HD");
-    setUmgFps(24);
-    setUmgProresProfile(3);
+  // Aplica un preset del wizard (server-driven, SOLO-ADMIN). Cada campo del
+  // `apply` mapea 1:1 a un setter del wizard — solo rellena el formulario del
+  // admin, no cambia nada server-side. Los valores llegan del backend, no del
+  // bundle.
+  const applyWizardPreset = (preset) => {
+    const apply = preset?.apply;
+    if (!apply) return;
+    track("wizard.preset", { preset: preset.key || "unknown" });
+    if (apply.style != null) onStyleChange?.(apply.style);
+    if (apply.bgMode != null) onBgMode?.(apply.bgMode);
+    if (apply.sceneMode != null) selectSceneMode(apply.sceneMode);
+    if (apply.enableScenes != null) onEnableScenesChange?.(apply.enableScenes);
+    for (const [k, v] of Object.entries(apply.batchDefaults || {})) updateBatchDefault(k, v);
+    if (apply.deliveryProfile != null) setDeliveryProfile(apply.deliveryProfile);
+    if (apply.umgFrameSize != null) setUmgFrameSize(apply.umgFrameSize);
+    if (typeof apply.umgFps === "number") setUmgFps(apply.umgFps);
+    if (typeof apply.umgProresProfile === "number") setUmgProresProfile(apply.umgProresProfile);
   };
 
   // El fondo no siempre se puede regenerar: el backend rechaza un edit de fondo
@@ -1834,26 +1838,29 @@ export default function UploadZone({
 
       {_bgBlockedNotice}
 
-      {user?.role === "admin" && !editMode && (
-        <div className="mb-3 flex items-center justify-between gap-3 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-3 py-2.5">
+      {/* Presets internos SOLO-ADMIN. Label/descripción/valores vienen del
+          backend (admin-gated); un no-admin nunca recibe `adminPresets` ni ve
+          esta tarjeta. */}
+      {user?.role === "admin" && !editMode && adminPresets.map((preset) => (
+        <div key={preset.key} className="mb-3 flex items-center justify-between gap-3 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-3 py-2.5">
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">
-              <span className="rounded-full bg-accent/[0.08] px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent ring-1 ring-accent/20">{t("upload.recipe_umg_badge") || "Admin"}</span>
-              <span className="text-[11px] font-medium text-gray-200">{t("upload.recipe_umg_title") || "Receta UMG Argentina"}</span>
+              <span className="rounded-full bg-accent/[0.08] px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent ring-1 ring-accent/20">{t("upload.admin_preset_badge") || "Admin"}</span>
+              <span className="text-[11px] font-medium text-gray-200">{preset.label}</span>
             </div>
-            <p className="text-[10px] text-gray-600 mt-0.5">
-              {t("upload.recipe_umg_desc") || "Rellena los settings de menor retrabajo. Podés ajustar cualquiera antes de generar."}
-            </p>
+            {preset.description && (
+              <p className="text-[10px] text-gray-600 mt-0.5">{preset.description}</p>
+            )}
           </div>
           <button
             type="button"
-            onClick={applyUmgArgentinaRecipe}
+            onClick={() => applyWizardPreset(preset)}
             className="shrink-0 rounded-full bg-brand text-white text-[11px] font-medium px-3 py-1.5 hover:opacity-90 transition-opacity"
           >
-            {t("upload.recipe_umg_apply") || "Aplicar"}
+            {t("upload.admin_preset_apply") || "Aplicar"}
           </button>
         </div>
-      )}
+      ))}
 
       {bgMode !== "auto" && (
         <div className="mb-3 rounded-lg bg-surface-1/60 ring-1 ring-white/[0.05] px-3 py-2 text-[11px] text-gray-400">
