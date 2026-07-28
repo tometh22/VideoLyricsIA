@@ -24,8 +24,143 @@ CONTRACT
 from __future__ import annotations
 
 import logging
+import os
 
 logger = logging.getLogger("genly.whisperx_reconcile")
+
+# Cola cantada que la referencia no cubre. `wordstamps_to_segments` itera
+# sobre las LÍNEAS DE LA REFERENCIA, así que emite como mucho una línea por
+# línea de referencia: si lrclib devuelve la letra truncada (pasa seguido —
+# registros con la duración correcta pero sólo las estrofas, sin el outro),
+# las palabras que whisperX oyó después de la última línea quedan huérfanas
+# y NUNCA se emiten. Peor: `coverage` se mide contra la referencia, así que
+# una referencia truncada achica el denominador y la cobertura SUBE — el
+# fallo se autocertifica como 100 % de éxito.
+#
+# Caso testigo: "Rodando Por Ahí" (Intoxicados). lrclib trae 15 líneas que
+# terminan en 186 s; el audio canta hasta 265,6 s (medido con demucs). El
+# resultado salía con 80 s de voz sin un solo cartel y coverage 15/15.
+#
+# Acá recuperamos esa cola reusando la segmentación PROPIA de whisperX para
+# la zona no cubierta: el cuerpo conserva el texto curado de la referencia y
+# la cola recupera lo que realmente se canta.
+_TAIL_MIN_GAP_S = 15.0   # voz sin cubrir que amerita recuperación
+_TAIL_MIN_WORDS = 8      # palabras huérfanas mínimas (evita ruido de VAD)
+_TAIL_LINE_GAP_S = 1.2   # silencio que corta una línea (fallback por palabras)
+_TAIL_LINE_MAX_S = 6.0   # largo máximo de una línea recuperada
+
+
+def _tail_recovery_enabled() -> bool:
+    return os.environ.get(
+        "RECONCILE_TAIL_RECOVERY_ENABLED", "1"
+    ).strip().lower() not in ("0", "false", "off", "no")
+
+
+def _f(v, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _lineas_desde_palabras(orphan: list[dict], covered_end: float) -> list[dict]:
+    """Agrupa palabras huérfanas en líneas cantables (corta por silencio o
+    por largo). Fallback para cuando whisperX no dejó texto por segmento."""
+    lineas: list[dict] = []
+    actual: list[dict] = []
+
+    def cerrar():
+        if not actual:
+            return
+        texto = " ".join(
+            str(w.get("word", "")).strip() for w in actual
+            if str(w.get("word", "")).strip()
+        ).strip()
+        if not texto:
+            actual.clear()
+            return
+        ini = max(_f(actual[0].get("start")), covered_end + 0.05)
+        fin = _f(actual[-1].get("end"))
+        if fin - ini >= 0.3:
+            lineas.append({
+                "start": round(ini, 3), "end": round(fin, 3),
+                "text": texto, "words": list(actual), "tail_recovered": True,
+            })
+        actual.clear()
+
+    for w in orphan:
+        if actual:
+            hueco = _f(w.get("start")) - _f(actual[-1].get("end"))
+            largo = _f(w.get("end")) - _f(actual[0].get("start"))
+            if hueco > _TAIL_LINE_GAP_S or largo > _TAIL_LINE_MAX_S:
+                cerrar()
+        actual.append(w)
+    cerrar()
+    return lineas
+
+
+def _recover_uncovered_tail(out: list[dict], wx_segs: list[dict],
+                            words: list[dict]) -> list[dict]:
+    """Devuelve `out` + los segmentos de whisperX que cubren la voz posterior
+    a la última línea reconciliada. No-op salvo que sobre una cola cantada
+    significativa (`_TAIL_MIN_GAP_S` y `_TAIL_MIN_WORDS`).
+
+    Nunca levanta: ante cualquier problema devuelve `out` intacto."""
+    if not out or not words:
+        return out
+    try:
+        covered_end = max(_f(s.get("end")) for s in out)
+        orphan = [w for w in words if _f(w.get("start")) >= covered_end - 0.05]
+        if len(orphan) < _TAIL_MIN_WORDS:
+            return out
+        last_voice = max(_f(w.get("end")) for w in orphan)
+        if (last_voice - covered_end) < _TAIL_MIN_GAP_S:
+            return out
+
+        tail: list[dict] = []
+        for s in wx_segs or []:
+            if not isinstance(s, dict):
+                continue
+            text = (s.get("text") or "").strip()
+            if not text:
+                continue
+            start, end = _f(s.get("start")), _f(s.get("end"))
+            if end <= covered_end + 0.05 or end <= start:
+                continue
+            # Recortar el arranque para no pisar la última línea del cuerpo.
+            start = max(start, covered_end + 0.05)
+            if end - start < 0.3:
+                continue
+            seg = {"start": round(start, 3), "end": round(end, 3), "text": text}
+            ws = [w for w in (s.get("words") or [])
+                  if isinstance(w, dict) and _f(w.get("start")) >= start - 0.05]
+            if ws:
+                seg["words"] = ws
+            seg["tail_recovered"] = True
+            tail.append(seg)
+        if not tail:
+            # whisperX no dejó segmentos con texto en la cola (pasa cuando la
+            # segmentación viene de otra etapa o el texto quedó vacío). Armamos
+            # las líneas con las palabras huérfanas, que sí traen `word`.
+            tail = _lineas_desde_palabras(orphan, covered_end)
+        if not tail:
+            logger.warning(
+                "[RECONCILE] %.1fs de voz sin cubrir tras la última línea "
+                "(%.1fs) pero no hay texto recuperable ahí — se entrega "
+                "truncado", last_voice - covered_end, covered_end,
+            )
+            return out
+
+        logger.warning(
+            "[RECONCILE] referencia truncada: %.1fs de voz sin letra tras "
+            "%.1fs (%d palabras huérfanas) — recuperadas %d línea(s) de "
+            "whisperX para la cola",
+            last_voice - covered_end, covered_end, len(orphan), len(tail),
+        )
+        return out + tail
+    except Exception as e:  # pragma: no cover — nunca romper la cascada
+        logger.warning("[RECONCILE] recuperación de cola declinó: %r", e)
+        return out
 
 
 def _flatten_words(wx_segs: list[dict]) -> list[dict]:
@@ -101,6 +236,13 @@ def reconcile(wx_segs: list[dict],
         "[RECONCILE] %s/%s lines reconciled (%.0f%% coverage) — adopting reference text + whisperX timing",
         len(out), len(lines), coverage * 100,
     )
+
+    # `coverage` sólo dice qué fracción de la REFERENCIA se ancló; no dice
+    # nada sobre el audio. Si la referencia vino truncada, acá todavía queda
+    # voz sin ninguna línea encima. Ver `_recover_uncovered_tail`.
+    if _tail_recovery_enabled():
+        out = _recover_uncovered_tail(out, wx_segs, words)
+
     return out
 
 
