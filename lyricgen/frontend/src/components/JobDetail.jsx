@@ -5,6 +5,7 @@ import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
 import EditRequestPanel from "./EditRequestPanel";
+import ArtTrackEditPanel from "./ArtTrackEditPanel";
 import ContentValidationToggle, { isUniversalAccount } from "./ContentValidationToggle";
 import { useAlert } from "./AlertProvider";
 import HelpTip from "./HelpCenter/HelpTip";
@@ -680,6 +681,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // Art track = "official audio" sin letra: no hay letra que editar.
   const isArtTrack = !!(job.art_track ?? job.render_params?.art_track);
   const canEditLyrics = (isPendingReview || isDone || isRejected) && !isArtTrack;
+  // Art tracks no tienen letra que editar, pero SÍ portada / efecto / título /
+  // línea legal. En vez del wizard de letra, se editan con ArtTrackEditPanel
+  // (POST /jobs/:id/edit-art-track, re-render gratis vía run_pipeline).
+  const canEditArtTrack = (isPendingReview || isDone || isRejected) && isArtTrack;
 
   // A detail deep-link owns local state, so the root history poller cannot
   // advance it. Poll every active state and stop at the first terminal or
@@ -1994,6 +1999,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           // /new). Todo el editing —incluido el fondo— vive ahí ahora.
           onLyricsClick={() => navigate(`/videos/${job.job_id}/edit-lyrics`)}
         />
+      )}
+
+      {canEditArtTrack && (
+        <ArtTrackEditPanel job={job} onEdited={handleEditTriggered} />
       )}
 
       {/* Approval panel for pending_review */}

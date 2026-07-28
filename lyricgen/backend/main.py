@@ -11894,6 +11894,201 @@ async def retry_job(
     }
 
 
+@app.post("/jobs/{job_id}/edit-art-track")
+async def edit_art_track(
+    job_id: str,
+    background_file: UploadFile = File(None),
+    effect: str = Form(""),
+    song_title: str = Form(None),
+    artist: str = Form(None),
+    label_line: str = Form("", max_length=120),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Editar un Art Track ya generado sin rehacerlo desde cero: cambiar la
+    portada (cover), el efecto de partículas, el título/artista y la línea
+    legal ℗/©, y re-renderizar.
+
+    Los art tracks son un composite ffmpeg determinístico y barato (~14-42s),
+    así que la edición es un re-render completo vía `run_pipeline(art_track=True)`
+    —el mismo camino que /retry— reusando el audio de R2 (input_r2_key) y la
+    portada cacheada (bg_r2_key_cached) salvo que se suba una nueva. NO consume
+    cuota ni crédito (igual que /retry): la edición es gratis.
+
+    Multipart (no JSON) para poder recibir una portada nueva opcional. Todos
+    los campos son opcionales; el panel del front manda el estado completo
+    pre-cargado, así que el valor recibido es autoritativo (un `effect`/
+    `label_line` vacío = limpiar). La portada solo se reemplaza si viene un
+    archivo nuevo; si no, se reusa la actual.
+    """
+    from database import Job as JobModel, AuditLog
+    from jobs import merge_render_params
+
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Solo art tracks. Un job de lyric video no debe caer acá (se re-rendería
+    # sin letra). El marker vive en render_params.art_track.
+    if not bool((job.render_params or {}).get("art_track")):
+        raise HTTPException(
+            status_code=400,
+            detail="This endpoint only edits Art Track jobs.",
+        )
+
+    # Re-gate de la feature con el acceso ACTUAL del usuario (igual que
+    # /generate y /retry): un tenant al que se le sacó el acceso no sigue
+    # editando art tracks.
+    if not has_art_track_access(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Art Track no está habilitado para tu cuenta.",
+        )
+
+    # Estados editables = los mismos que habilitan el panel de edición en el
+    # front (JobDetail.canEditLyrics): revisión pendiente / listo / rechazado.
+    # No se edita mientras se procesa o si falló (para eso está /retry).
+    if job.status not in ("pending_review", "done", "rejected"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Art track cannot be edited from status '{job.status}'.",
+        )
+
+    # El re-render necesita el audio original en R2 (no se re-sube).
+    if not job.input_r2_key:
+        raise HTTPException(
+            status_code=422,
+            detail="Source audio no longer available — please re-generate the video.",
+        )
+    try:
+        import storage as _storage
+        if _storage.is_enabled() and not _storage.object_exists(job.input_r2_key):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "El audio original ya no está en storage. "
+                    "Volvé a generar el video."
+                ),
+            )
+    except HTTPException:
+        raise
+    except Exception as _exc:
+        logger.warning(
+            "[ART-EDIT] R2 pre-check failed for %s key=%r — proceeding: %s",
+            job_id, job.input_r2_key, _exc,
+        )
+
+    job_dir = os.path.join(OUTPUTS_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    # Portada: reemplazar solo si viene una nueva. _save_custom_background
+    # valida (imagen), sube a R2 y persiste bg_r2_key_cached. Si no viene
+    # archivo, reusamos el cover cacheado.
+    new_bg_r2_key = None
+    if background_file and background_file.filename:
+        if not background_file.filename.lower().endswith((".jpg", ".jpeg", ".png")):
+            raise HTTPException(
+                status_code=400,
+                detail="Art track cover must be an image (.jpg/.jpeg/.png).",
+            )
+        _bg_path, new_bg_r2_key = _save_custom_background(
+            background_file, job_dir, job_id, current_user["tenant_id"],
+        )
+    bg_r2_key = new_bg_r2_key or job.bg_r2_key_cached
+    if not bg_r2_key:
+        raise HTTPException(
+            status_code=422,
+            detail="No cover image on file — please upload a cover.",
+        )
+
+    # Persistir los ejes editables en render_params (autoritativo: vacío =
+    # limpiar). Así el re-render y cualquier /retry futuro los re-dibujan.
+    effect_val = (effect or "").strip()
+    label_val = (label_line or "").strip()
+    merge_render_params(job_id, {
+        "art_track": True,
+        "effect": effect_val,
+        "label_line": label_val,
+    })
+
+    # Título/artista viven en columnas; se actualizan solo si vinieron.
+    if song_title is not None:
+        job.song_title = song_title.strip()
+    if artist is not None:
+        job.artist = artist.strip()
+
+    # Reset del row a estado de re-render limpio (mismo patrón que /retry),
+    # para que los entregables viejos no queden pegados si el nuevo render
+    # produce menos archivos.
+    _previous_status = job.status
+    job.status = "editing"
+    job.current_step = "render"
+    job.progress = 0
+    job.error = None
+    job.validation_result = None
+    job.video_url = None
+    job.short_url = None
+    job.thumbnail_url = None
+    job.umg_master_url = None
+    job.umg_short_url = None
+    job.s3_keys = None
+    job.completed_at = None
+    job.approved_by = None
+    job.approved_at = None
+    job.last_progress_at = datetime.now(timezone.utc)
+
+    # Cancelar prewarms de ProRes de la corrida anterior (mismo hazard que
+    # /retry: publicarían un .mov viejo tras limpiar s3_keys).
+    try:
+        from queue_jobs import cancel_rq_job
+        for _ft in ("umg_master", "umg_short"):
+            cancel_rq_job(f"prewarm:{job_id}:{_ft}")
+    except Exception as _exc:
+        logger.warning("edit_art_track: prewarm cancel skipped for %s: %s", job_id, _exc)
+
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="job.edit_art_track",
+        detail={
+            "job_id": job_id,
+            "previous_status": _previous_status,
+            "cover_replaced": new_bg_r2_key is not None,
+            "effect": effect_val,
+        },
+    ))
+    db.commit()
+
+    enqueue_pipeline(
+        job_id=job_id,
+        mp3_path=None,
+        artist=job.artist,
+        style=job.style or "oscuro",
+        plan=current_user.get("plan", "100"),
+        tenant_id=current_user.get("tenant_id", ""),
+        delivery_profile=job.delivery_profile or "youtube",
+        input_r2_key=job.input_r2_key,
+        song_title=job.song_title or "",
+        umg_spec=job.umg_spec or {},
+        segments_override=job.segments_json if job.segments_json else None,
+        bg_r2_key=bg_r2_key,
+        art_track=True,
+        effect=effect_val,
+        label_line=label_val,
+    )
+
+    return {
+        "ok": True,
+        "status": "editing",
+        "job_id": job_id,
+        "cover_replaced": new_bg_r2_key is not None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Variantes — re-generar un job aprobado con otro Veo background
 # ---------------------------------------------------------------------------
