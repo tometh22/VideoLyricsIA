@@ -2,10 +2,16 @@
 
 Runs every ~5 min from .github/workflows/uptime.yml (vs daily_smoke which
 runs once a day). Deliberately lightweight: it ONLY checks that the public
-prod /health endpoint answers 200 with status=ok. No DB scan, no Veo, no
-heavy deps — so it keeps working even when Railway's DB or workers are sick,
-and it runs on GitHub's infra (not Railway, not the operator's laptop), so
-it survives the exact outages it's meant to catch.
+prod /health/deploy endpoint answers HTTP 200 (rollout-safe — see _probe).
+No DB scan, no Veo, no heavy deps — so it keeps working even when Railway's
+DB or workers are sick, and it runs on GitHub's infra (not Railway, not the
+operator's laptop), so it survives the exact outages it's meant to catch.
+
+Uses /health/deploy (not strict /health) on purpose: strict /health 503s
+during every rolling deploy, and since this ping is part of the commit's
+check suite that Railway's "Wait for CI" gates on, a false red here BLOCKS
+prod deploys (deadlock, audit 2026-07-28). /health/deploy stays green during
+rollouts and only 503s on a real DB/Redis outage.
 
 Why this exists: 2026-05-20 Railway had two edge outages. The operator
 found out both times because the UMG contact (Santi) messaged "no funciona
@@ -33,6 +39,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
@@ -46,37 +53,55 @@ _MAX_BODY_BYTES = 256 * 1024
 
 
 def _probe(url: str) -> tuple[bool, str]:
-    """One /health probe. Returns (ok, detail)."""
+    """One deploy-gate health probe. Returns (ok, detail).
+
+    Hits /health/deploy, NOT /health. `/health` is strict fleet-coherence: it
+    returns 503 `status:down` during ANY rolling deploy (the new API seats
+    before every worker advertises the new release SHA). `/health/deploy`
+    reports that expected mismatch as `status:degraded` with HTTP 200, and only
+    503s on a REAL critical-dependency outage (DB/Redis down). We use the HTTP
+    code as the up/down signal: 200 (ok OR degraded) = users are served = UP;
+    503 / unreachable = DOWN.
+
+    Why (audit 2026-07-28): pinging strict /health DEADLOCKED prod deploys.
+    Railway's "Wait for CI" on api/Worker waits for the whole check suite,
+    which includes this ping. A partial deploy → strict /health 503 → ping red
+    → Railway skips api/Worker → the fleet never converges → /health stays 503
+    → ping stays red. Self-reinforcing. Pinging /health/deploy stays green
+    through the rollout, so the fleet converges and the loop can't form. (This
+    is the fundamental version of the 2026-07-25 truncated-body false positive
+    that first surfaced the same Railway-skip symptom.)
+    """
     try:
-        req = urllib.request.Request(f"{url}/health", method="GET")
+        req = urllib.request.Request(f"{url}/health/deploy", method="GET")
         with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
             code = resp.getcode()
-            # Leer el cuerpo COMPLETO (con un tope generoso solo como guarda
-            # anti-respuesta-gigante). Antes se leían 2048 bytes fijos: el
-            # payload de /health fue creciendo (fleet_*, worker_releases, r2,
-            # reaper, submissions…) hasta pasar ese corte, y el JSON truncado
-            # hacía fallar json.loads → el monitor reportaba "prod caído" con
-            # producción perfecta. Ese falso positivo no era inofensivo:
-            # ensuciaba el check suite de main y Railway, que espera el check
-            # suite, salteaba los deploys de producción (2026-07-25).
+            # Leer el cuerpo COMPLETO (tope generoso solo como guarda
+            # anti-respuesta-gigante) — evita el falso "prod caído" por JSON
+            # truncado del 2026-07-25.
             body = resp.read(_MAX_BODY_BYTES).decode("utf-8", "replace")
-        if code != 200:
-            return False, f"HTTP {code}"
+    except urllib.error.HTTPError as e:
+        # 503 = outage real (DB/Redis). Surfaceamos el cuerpo para la alerta.
+        detail = ""
         try:
-            data = json.loads(body)
-        except ValueError:
-            return False, (
-                f"200 but non-JSON body ({len(body)}B leídos, tope "
-                f"{_MAX_BODY_BYTES}B): {body[:120]}"
-            )
-        status = data.get("status")
-        if status != "ok":
-            # Surface which subsystem is down (db/redis/r2) for the alert.
-            subs = {k: data.get(k) for k in ("db", "redis", "r2") if k in data}
-            return False, f"status={status} {subs}"
-        return True, "ok"
+            detail = e.read(512).decode("utf-8", "replace")
+        except Exception:
+            pass
+        return False, f"HTTP {e.code} {detail}".strip()
     except Exception as e:  # urllib timeout, connection refused, DNS, etc.
         return False, f"{type(e).__name__}: {e}"
+    if code != 200:
+        return False, f"HTTP {code}"
+    # Un /health/deploy sano SIEMPRE devuelve JSON; un 200 con cuerpo no-JSON
+    # (ej. HTML de un proxy interpuesto) es sospechoso → caída.
+    try:
+        status = json.loads(body).get("status")
+    except ValueError:
+        return False, f"200 but non-JSON body: {body[:120]}"
+    # 200 + JSON = prod atiende. Aceptamos `ok` Y `degraded` (mismatch de
+    # rollout, disco bajo, etc.) como UP — el gate es rollout-safe. Solo
+    # 503/unreachable (arriba) pagina.
+    return True, f"200 status={status}"
 
 
 def main() -> int:
@@ -143,6 +168,16 @@ def _send_alert(url: str, detail: str, ts: str) -> None:
         with _u.urlopen(req, timeout=15) as resp:
             rid = json.loads(resp.read().decode("utf-8", "replace")).get("id")
         print(f"[uptime] alert delivered: {rid}")
+    except urllib.error.HTTPError as e:
+        # Surface Resend's body — a 403 usually means RESEND_FROM's domain
+        # isn't verified, or the API key lacks send permission. Without the
+        # body it's undebuggable (audit 2026-07-28: silent 403).
+        body = ""
+        try:
+            body = e.read(512).decode("utf-8", "replace")
+        except Exception:
+            pass
+        print(f"[uptime] resend failed: HTTP {e.code} from={sender}: {body}", file=sys.stderr)
     except Exception as e:
         print(f"[uptime] resend failed: {type(e).__name__}: {e}", file=sys.stderr)
 
