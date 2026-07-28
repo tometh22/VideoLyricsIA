@@ -67,15 +67,25 @@ def _f(v, default: float = 0.0) -> float:
         return default
 
 
-# Piso de cobertura medida contra el AUDIO (no contra la referencia). Por
-# debajo de esto la referencia directamente no representa a esta grabación
-# —otra edición, otro tema, o una letra recortada— y reconciliar contra ella
-# es peor que quedarse con la segmentación del ASR, que sí oyó el audio.
+# Piso de cobertura medida contra el AUDIO. APAGADO por default (0.0) — a
+# propósito.
 #
-# Medido en el caso testigo: el gate viejo daba 15/15 = 100 % de "cobertura"
-# mientras sólo el 39,4 % de las palabras del ASR quedaba bajo alguna línea.
-# Declinar ahí sube la cobertura de la referencia de Rotor de 13/26 a 26/26.
-_MIN_AUDIO_COVERAGE = 0.55
+# La idea: por debajo de cierta cobertura la referencia no representa a esta
+# grabación y quedarse con el ASR da mejor resultado (medido: en el caso
+# testigo declinar sube de 13/26 a 26/26 líneas contra Rotor).
+#
+# Por qué NO gatea todavía: la métrica SUB-REPORTA cuando el texto canónico
+# tokeniza distinto que el ASR. Caso real del corpus (Legalícenla): la letra
+# tiene una palabra compuesta donde whisperX oyó tres; el segmento emitido
+# cubre una de esas tres y las otras dos cuentan como "canto sin letra"
+# aunque la línea esté perfectamente puesta. Ahí la cobertura da 54 % en un
+# resultado CORRECTO.
+#
+# Con un umbral calibrado sobre UNA canción (39 %) ese caso caía del lado
+# equivocado. Así que primero se juntan datos reales por rama —para eso está
+# la instrumentación de `_emit_segments` y del worker— y recién después se
+# elige el piso. Se enciende con RECONCILE_MIN_AUDIO_COVERAGE=0.45 (p.ej.).
+_MIN_AUDIO_COVERAGE = 0.0
 
 
 def _min_audio_coverage() -> float:

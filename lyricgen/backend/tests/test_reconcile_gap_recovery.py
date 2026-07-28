@@ -186,27 +186,55 @@ def test_kill_switch(monkeypatch):
     assert not [s for s in out if s.get("gap_recovered")]
 
 
-# ── Gate contra el AUDIO ──────────────────────────────────────────────────
+# ── Gate contra el AUDIO (APAGADO por default) ────────────────────────────
 
-def test_declina_cuando_la_referencia_no_representa_la_grabacion():
-    """Sub-cobertura SEVERA: la referencia explica una minoría de lo cantado
-    (otra edición, otro tema, letra muy recortada). Ahí no alcanza con
-    parchear huecos — hay que declinar y quedarse con el ASR, que sí oyó el
-    audio. En el caso testigo el gate viejo daba 100 % de 'cobertura' con
-    sólo el 39 % del canto cubierto."""
+def test_el_gate_viene_apagado_por_default():
+    """Decisión explícita: la métrica se mide y se loguea, pero NO gatea
+    hasta tener datos reales para calibrar el piso. Ver
+    `test_la_metrica_subreporta_si_la_tokenizacion_difiere` para el motivo."""
+    assert wr._min_audio_coverage() == 0.0
     wx = (_wx_cuerpo()[:14] + _wx_bloque(155.0, 179.0, "medio")
           + _wx_cuerpo()[14:] + _wx_bloque(200.0, 264.0, "outro"))
-    assert wr.reconcile(wx, REFERENCIA) is None, \
-        "con la referencia explicando una minoría del canto hay que declinar"
+    assert wr.reconcile(wx, REFERENCIA) is not None, \
+        "con el gate apagado no se puede declinar por cobertura"
 
 
-def test_no_declina_con_una_referencia_sana():
-    """El gate no debe castigar el caso normal."""
+def test_el_gate_se_puede_encender_por_env(monkeypatch):
+    """Sub-cobertura severa CON el gate encendido: declina y el caller se
+    queda con el ASR, que sí oyó el audio."""
+    monkeypatch.setenv("RECONCILE_MIN_AUDIO_COVERAGE", "0.55")
+    wx = (_wx_cuerpo()[:14] + _wx_bloque(155.0, 179.0, "medio")
+          + _wx_cuerpo()[14:] + _wx_bloque(200.0, 264.0, "outro"))
+    assert wr.reconcile(wx, REFERENCIA) is None
+
+
+def test_encendido_no_castiga_una_referencia_sana(monkeypatch):
+    monkeypatch.setenv("RECONCILE_MIN_AUDIO_COVERAGE", "0.55")
     assert wr.reconcile(_wx_cuerpo(), REFERENCIA) is not None
 
 
+def test_la_metrica_subreporta_si_la_tokenizacion_difiere():
+    """POR QUÉ EL GATE VIENE APAGADO. Cuando la letra canónica usa una
+    palabra compuesta donde el ASR oyó varias, el segmento emitido cubre
+    sólo una de ellas y el resto cuenta como 'canto sin letra' — aunque la
+    línea esté perfectamente puesta.
+
+    Es el caso Legalícenla del corpus (`test_audio_as_truth_corpus.py`): un
+    resultado CORRECTO mide 54 %. Un piso calibrado sobre una sola canción
+    (39 %) lo tiraba del lado equivocado. Este test fija el conocimiento:
+    la métrica sirve para observar, todavía no para decidir sola."""
+    words = [{"word": w, "start": s, "end": e} for w, s, e in [
+        ("Le", 17.0, 17.5), ("realizan", 17.5, 18.2), ("la", 18.2, 18.6),
+    ]]
+    # La línea canónica es UNA palabra: el segmento emitido cubre sólo la
+    # primera de las tres que oyó el ASR.
+    emitido = [{"start": 17.0, "end": 17.5, "text": "Legalícenla"}]
+    cov = wr._audio_coverage(emitido, words)
+    assert cov < 0.6, f"esperaba sub-reporte, dio {cov:.2f}"
+
+
 def test_audio_coverage_baja_cuando_se_pierde_canto():
-    """La métrica nueva sólo puede bajar si se pierde canto — al revés que
+    """La métrica sólo puede bajar si se pierde canto — al revés que
     `coverage`, que SUBE cuando la referencia viene recortada."""
     cuerpo = _wx_cuerpo()
     words = wr._flatten_words(cuerpo + _wx_bloque(200.0, 264.0, "outro"))
@@ -215,8 +243,3 @@ def test_audio_coverage_baja_cuando_se_pierde_canto():
     assert wr._audio_coverage(solo_cuerpo, words) < 0.75
 
 
-def test_gate_de_audio_tiene_escape_hatch(monkeypatch):
-    monkeypatch.setenv("RECONCILE_MIN_AUDIO_COVERAGE", "0")
-    wx = (_wx_cuerpo()[:14] + _wx_bloque(155.0, 179.0, "medio")
-          + _wx_cuerpo()[14:] + _wx_bloque(200.0, 264.0, "outro"))
-    assert wr.reconcile(wx, REFERENCIA) is not None
