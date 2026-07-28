@@ -73,7 +73,7 @@ def _voz_de(segs):
 # ── El defecto ────────────────────────────────────────────────────────────
 
 def test_referencia_incompleta_no_deja_el_outro_sin_letra():
-    wx = _wx_cuerpo() + _wx_bloque(200.0, 264.0, "outro")
+    wx = _wx_cuerpo() + _wx_bloque(200.0, 230.0, "outro")
     out = wr.reconcile(wx, REFERENCIA)
     assert out is not None
     hueco = _voz_de(wx) - max(s["end"] for s in out)
@@ -85,7 +85,7 @@ def test_recupera_huecos_INTERNOS_no_solo_la_cola():
     en el caso testigo, 6 de las 13 líneas faltantes eran internas."""
     cuerpo = _wx_cuerpo()
     interno = _wx_bloque(155.0, 179.0, "medio")
-    wx = cuerpo[:14] + interno + cuerpo[14:] + _wx_bloque(200.0, 264.0, "outro")
+    wx = cuerpo[:14] + interno + cuerpo[14:] + _wx_bloque(200.0, 230.0, "outro")
     out = wr.reconcile(wx, REFERENCIA)
 
     rec = [s for s in out if s.get("gap_recovered")]
@@ -93,14 +93,14 @@ def test_recupera_huecos_INTERNOS_no_solo_la_cola():
     assert [s for s in rec if s["start"] >= 190.0], "no se recuperó la cola"
 
     todas = sorted(out, key=lambda s: s["start"])
-    for s in interno + _wx_bloque(200.0, 264.0, "outro"):
+    for s in interno + _wx_bloque(200.0, 230.0, "outro"):
         mid = (s["start"] + s["end"]) / 2
         assert any(x["start"] - 0.6 <= mid <= x["end"] + 0.6 for x in todas), \
             f"quedó sin letra la voz de {s['start']:.1f}-{s['end']:.1f}s"
 
 
 def test_lo_recuperado_trae_texto_real():
-    wx = _wx_cuerpo() + _wx_bloque(200.0, 264.0, "outro")
+    wx = _wx_cuerpo() + _wx_bloque(200.0, 230.0, "outro")
     out = wr.reconcile(wx, REFERENCIA)
     rec = [s for s in out if s.get("gap_recovered")]
     assert rec
@@ -112,7 +112,7 @@ def test_lo_recuperado_trae_texto_real():
 def test_fallback_arma_lineas_desde_las_palabras_si_no_hay_texto():
     """Si los segmentos de la zona no traen `text`, las líneas se arman con
     las palabras huérfanas."""
-    wx = _wx_cuerpo() + _wx_bloque(200.0, 264.0, "outro")
+    wx = _wx_cuerpo() + _wx_bloque(200.0, 230.0, "outro")
     for s in wx[len(LINEAS):]:
         s["text"] = ""
     out = wr.reconcile(wx, REFERENCIA)
@@ -126,7 +126,7 @@ def test_fallback_arma_lineas_desde_las_palabras_si_no_hay_texto():
 # ── Que no rompa lo que ya andaba ─────────────────────────────────────────
 
 def test_el_cuerpo_conserva_el_texto_curado_de_la_referencia():
-    wx = _wx_cuerpo() + _wx_bloque(200.0, 264.0, "outro")
+    wx = _wx_cuerpo() + _wx_bloque(200.0, 230.0, "outro")
     out = wr.reconcile(wx, REFERENCIA)
     cuerpo = [s for s in out if not s.get("gap_recovered")]
     assert len(cuerpo) == len(LINEAS)
@@ -134,14 +134,14 @@ def test_el_cuerpo_conserva_el_texto_curado_de_la_referencia():
 
 
 def test_segmentos_monotonos_y_sin_solape():
-    wx = _wx_cuerpo() + _wx_bloque(200.0, 264.0, "outro")
+    wx = _wx_cuerpo() + _wx_bloque(200.0, 230.0, "outro")
     out = sorted(wr.reconcile(wx, REFERENCIA), key=lambda s: s["start"])
     for a, b in zip(out, out[1:]):
         assert a["end"] <= b["start"] + 1e-6, f"solape entre {a} y {b}"
 
 
 def test_no_rompe_cuando_no_hay_word_stamps_en_la_zona():
-    wx = _wx_cuerpo() + _wx_bloque(200.0, 264.0, "outro")
+    wx = _wx_cuerpo() + _wx_bloque(200.0, 230.0, "outro")
     for s in wx[len(LINEAS):]:
         s.pop("words", None)
     out = wr.reconcile(wx, REFERENCIA)
@@ -180,6 +180,43 @@ def test_no_dispara_por_un_resto_minimo():
 
 def test_kill_switch(monkeypatch):
     monkeypatch.setenv("RECONCILE_GAP_RECOVERY_ENABLED", "0")
-    wx = _wx_cuerpo() + _wx_bloque(200.0, 264.0, "outro")
+    wx = _wx_cuerpo() + _wx_bloque(200.0, 230.0, "outro")
     out = wr.reconcile(wx, REFERENCIA)
+    assert out is not None
     assert not [s for s in out if s.get("gap_recovered")]
+
+
+# ── Gate contra el AUDIO ──────────────────────────────────────────────────
+
+def test_declina_cuando_la_referencia_no_representa_la_grabacion():
+    """Sub-cobertura SEVERA: la referencia explica una minoría de lo cantado
+    (otra edición, otro tema, letra muy recortada). Ahí no alcanza con
+    parchear huecos — hay que declinar y quedarse con el ASR, que sí oyó el
+    audio. En el caso testigo el gate viejo daba 100 % de 'cobertura' con
+    sólo el 39 % del canto cubierto."""
+    wx = (_wx_cuerpo()[:14] + _wx_bloque(155.0, 179.0, "medio")
+          + _wx_cuerpo()[14:] + _wx_bloque(200.0, 264.0, "outro"))
+    assert wr.reconcile(wx, REFERENCIA) is None, \
+        "con la referencia explicando una minoría del canto hay que declinar"
+
+
+def test_no_declina_con_una_referencia_sana():
+    """El gate no debe castigar el caso normal."""
+    assert wr.reconcile(_wx_cuerpo(), REFERENCIA) is not None
+
+
+def test_audio_coverage_baja_cuando_se_pierde_canto():
+    """La métrica nueva sólo puede bajar si se pierde canto — al revés que
+    `coverage`, que SUBE cuando la referencia viene recortada."""
+    cuerpo = _wx_cuerpo()
+    words = wr._flatten_words(cuerpo + _wx_bloque(200.0, 264.0, "outro"))
+    solo_cuerpo = [{"start": i, "end": f} for _, (i, f) in zip(LINEAS, TIEMPOS)]
+    assert wr._audio_coverage(solo_cuerpo, wr._flatten_words(cuerpo)) == 1.0
+    assert wr._audio_coverage(solo_cuerpo, words) < 0.75
+
+
+def test_gate_de_audio_tiene_escape_hatch(monkeypatch):
+    monkeypatch.setenv("RECONCILE_MIN_AUDIO_COVERAGE", "0")
+    wx = (_wx_cuerpo()[:14] + _wx_bloque(155.0, 179.0, "medio")
+          + _wx_cuerpo()[14:] + _wx_bloque(200.0, 264.0, "outro"))
+    assert wr.reconcile(wx, REFERENCIA) is not None

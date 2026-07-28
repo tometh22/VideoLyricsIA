@@ -67,6 +67,45 @@ def _f(v, default: float = 0.0) -> float:
         return default
 
 
+# Piso de cobertura medida contra el AUDIO (no contra la referencia). Por
+# debajo de esto la referencia directamente no representa a esta grabación
+# —otra edición, otro tema, o una letra recortada— y reconciliar contra ella
+# es peor que quedarse con la segmentación del ASR, que sí oyó el audio.
+#
+# Medido en el caso testigo: el gate viejo daba 15/15 = 100 % de "cobertura"
+# mientras sólo el 39,4 % de las palabras del ASR quedaba bajo alguna línea.
+# Declinar ahí sube la cobertura de la referencia de Rotor de 13/26 a 26/26.
+_MIN_AUDIO_COVERAGE = 0.55
+
+
+def _min_audio_coverage() -> float:
+    """Piso configurable; `RECONCILE_MIN_AUDIO_COVERAGE=0` apaga el gate."""
+    try:
+        return float(os.environ.get("RECONCILE_MIN_AUDIO_COVERAGE",
+                                    _MIN_AUDIO_COVERAGE))
+    except (TypeError, ValueError):
+        return _MIN_AUDIO_COVERAGE
+
+
+def _audio_coverage(out: list[dict], words: list[dict]) -> float:
+    """Fracción de las palabras del ASR que alguna línea emitida reclama.
+    A diferencia de `coverage` (que se mide contra la referencia y por eso
+    SUBE cuando la referencia viene recortada), esta métrica sólo puede
+    bajar si se pierde canto — es la que detecta el fallo real."""
+    if not words:
+        return 1.0
+    iv = [(_f(s.get("start")), _f(s.get("end"))) for s in out]
+    if not iv:
+        return 0.0
+    n = 0
+    for w in words:
+        a, b = _f(w.get("start")), _f(w.get("end"))
+        mid = (a + b) / 2 if b > a else a
+        if any(ini - 0.05 <= mid <= fin + 0.05 for ini, fin in iv):
+            n += 1
+    return n / len(words)
+
+
 def _lineas_desde_palabras(orphan: list[dict], covered_end: float) -> list[dict]:
     """Agrupa palabras huérfanas en líneas cantables (corta por silencio o
     por largo). Fallback para cuando whisperX no dejó texto por segmento."""
@@ -279,9 +318,27 @@ def reconcile(wx_segs: list[dict],
         len(out), len(lines), coverage * 100,
     )
 
-    # `coverage` sólo dice qué fracción de la REFERENCIA se ancló; no dice
-    # nada sobre el audio. Si la referencia vino truncada, acá todavía queda
-    # voz sin ninguna línea encima. Ver `_recover_uncovered_regions`.
+    # Gate contra el AUDIO, ANTES de intentar parchear nada. `coverage` sólo
+    # dice qué fracción de la REFERENCIA se ancló — y sube cuando la
+    # referencia viene recortada. La pregunta que importa es la inversa:
+    # ¿esta letra describe esta grabación? Si sólo cubre una minoría de lo
+    # cantado, no la describe (otra edición, otro tema, letra recortada) y
+    # reconciliar contra ella es peor que quedarse con la segmentación del
+    # ASR, que sí oyó el audio. Recuperar huecos acá sería maquillar una
+    # referencia que no corresponde.
+    audio_cov = _audio_coverage(out, words)
+    if audio_cov < _min_audio_coverage():
+        logger.warning(
+            "[RECONCILE] la letra sólo cubre el %.0f%% de lo cantado "
+            "(%d/%d líneas de referencia ancladas) — la referencia no "
+            "representa este audio, me quedo con whisperX",
+            audio_cov * 100, len(out), len(lines),
+        )
+        return None
+    logger.info("[RECONCILE] cobertura del audio: %.0f%%", audio_cov * 100)
+
+    # Referencia válida pero con zonas sin cubrir (típico: falta el outro o
+    # una repetición). Se conserva el texto curado y se rellenan los huecos.
     if _gap_recovery_enabled():
         out = _recover_uncovered_regions(out, wx_segs, words)
 
