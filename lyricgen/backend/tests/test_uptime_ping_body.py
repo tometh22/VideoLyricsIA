@@ -73,13 +73,13 @@ def test_large_health_payload_is_not_truncated(monkeypatch):
     ok, detail = uptime_ping._probe("https://api.example.com")
 
     assert ok is True, f"prod sana no puede reportarse caída: {detail}"
-    assert detail == "ok"
+    assert "status=ok" in detail
 
 
 def test_small_healthy_payload_still_works(monkeypatch):
     _patch_urlopen(monkeypatch, _health_payload())
     ok, detail = uptime_ping._probe("https://api.example.com")
-    assert ok is True and detail == "ok"
+    assert ok is True and "status=ok" in detail
 
 
 def test_read_cap_is_far_above_the_real_payload():
@@ -99,12 +99,45 @@ def test_real_outage_is_still_detected(monkeypatch):
     assert "503" in detail
 
 
-def test_degraded_status_is_still_reported(monkeypatch):
-    """200 con status != ok sigue contando como falla."""
-    _patch_urlopen(monkeypatch, {"status": "down", "db": "down", "redis": "up"})
+def test_rolling_deploy_degraded_200_is_up(monkeypatch):
+    """EL FIX 2026-07-28: durante un rolling deploy, /health/deploy devuelve
+    200 con status=degraded (worker_fleet_incoherent). Eso NO debe paginar —
+    si no, el ping rojo bloquea el propio deploy en Railway ("Wait for CI"),
+    y la flota nunca converge (deadlock auto-reforzado)."""
+    _patch_urlopen(monkeypatch, {"status": "degraded",
+                                 "degraded_reason": "worker_fleet_incoherent"})
+    ok, detail = uptime_ping._probe("https://api.example.com")
+    assert ok is True, f"un rollout degradado no es una caída: {detail}"
+    assert "degraded" in detail
+
+
+def test_probe_targets_health_deploy_not_strict_health(monkeypatch):
+    """Debe pegar a /health/deploy (rollout-safe), NO a /health estricto —
+    /health 503ea en cada rollout y eso es lo que dispara el deadlock."""
+    seen = {}
+
+    def _fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        return _FakeResponse(json.dumps({"status": "ok"}).encode())
+
+    monkeypatch.setattr(uptime_ping.urllib.request, "urlopen", _fake_urlopen)
+    uptime_ping._probe("https://api.example.com")
+    assert seen["url"].endswith("/health/deploy"), seen["url"]
+
+
+def test_http_error_503_is_down(monkeypatch):
+    """Un 503 real (urllib lo levanta como HTTPError) sigue siendo caída —
+    el fix no puede volver ciego al monitor ante un outage de DB/Redis."""
+    def _raise_503(req, timeout=None):
+        raise uptime_ping.urllib.error.HTTPError(
+            req.full_url, 503, "Service Unavailable", {},
+            io.BytesIO(b'{"status":"down","down_reason":"db_down"}'),
+        )
+
+    monkeypatch.setattr(uptime_ping.urllib.request, "urlopen", _raise_503)
     ok, detail = uptime_ping._probe("https://api.example.com")
     assert ok is False
-    assert "status=down" in detail
+    assert "503" in detail
 
 
 def test_genuinely_non_json_body_is_reported(monkeypatch):
