@@ -13760,6 +13760,61 @@ class CreditGrantRequest(BaseModel):
     dry_run: bool = False
 
 
+# Presets internos del wizard, SOLO-ADMIN. Rellenan el formulario del operador
+# con settings derivados del trabajo aprobado de un cliente. El nombre y los
+# valores NO deben viajar en el bundle del frontend — un no-admin no debe ni
+# recibir el JSON. Por eso viven acá, detrás de auth admin, en vez de hardcodeados
+# en el cliente (audit 2026-07-27: la tarjeta "Receta UMG Argentina" estaba en el
+# bundle público; sólo se renderizaba para admins pero el string+valores eran
+# inspeccionables por DevTools).
+_ADMIN_WIZARD_PRESETS = [
+    {
+        "key": "umg_argentina",
+        "label": "Receta UMG Argentina",
+        "description": (
+            "Rellena los settings de menor retrabajo. "
+            "Podés ajustar cualquiera antes de generar."
+        ),
+        # Cada campo mapea 1:1 a un setter del wizard en el cliente. Aplicarlo
+        # sólo rellena el formulario del propio admin — no cambia defaults del
+        # servidor ni del tenant, igual que si se tipeara a mano.
+        "apply": {
+            "style": "auto",
+            "bgMode": "auto",
+            "sceneMode": "lyrics",
+            "enableScenes": False,
+            "batchDefaults": {
+                "movementStyle": "estatico",
+                "font": "poppins-bold",
+                "fontScale": "1.3",
+                "textCase": "upper",
+                "lyricsAnimation": "none",
+                "lineTransition": "none",
+                "effect": "",
+                "titleTemplate": "auto",
+                "frameFormat": "full",
+            },
+            "deliveryProfile": "both",
+            "umgFrameSize": "HD",
+            "umgFps": 24,
+            "umgProresProfile": 3,
+        },
+    },
+]
+
+
+@app.get("/admin/wizard-presets")
+async def admin_wizard_presets(
+    current_user: dict = Depends(get_current_user),
+):
+    """Presets internos del wizard (SOLO-ADMIN). El frontend los pide únicamente
+    cuando el usuario es admin, así el nombre + los valores nunca llegan al
+    bundle de un no-admin. 403 para cualquier no-admin."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    return {"presets": _ADMIN_WIZARD_PRESETS}
+
+
 @app.get("/admin/credit-grants")
 async def admin_list_credit_grants(
     current_user: dict = Depends(get_current_user),
