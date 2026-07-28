@@ -39,6 +39,79 @@ import os
 logger = logging.getLogger("genly.transcription_worker")
 
 
+# ── Cobertura contra el audio, por etapa ──────────────────────────────────
+#
+# La cascada deja en el result su propia cobertura (`audio_coverage`) y el
+# stream de palabras del ASR (`_asr_words`, transporte interno). Acá volvemos
+# a medir DESPUÉS de los post-pases, porque dos de ellos pueden sacar líneas
+# (el filtro de ad-libs borra la cola; el formateador reescribe textos) y
+# ninguno actualiza `timing_source`. Sin esta medición por etapa no se puede
+# atribuir la pérdida — que es exactamente lo que bloqueó el diagnóstico del
+# job b3a51559: llegó al editor con 2 carteles vacíos y una línea duplicada y
+# no había forma de saber qué etapa los produjo.
+#
+# Sólo observabilidad: no altera el resultado.
+
+def _coverage_de(r) -> float | None:
+    """Cobertura del audio del result actual, o None si no se puede medir."""
+    if not isinstance(r, dict):
+        return None
+    words = r.get("_asr_words")
+    if not words:
+        return None
+    try:
+        from audio_coverage import audio_coverage
+        return audio_coverage(r.get("segments") or [], words)
+    except Exception:
+        return None
+
+
+def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None):
+    """Loguea la cobertura final y la compara con la de la cascada y la
+    previa al formateador. Saca `_asr_words` del result (transporte interno:
+    no se persiste ni llega al cliente). Nunca levanta."""
+    if not isinstance(r, dict):
+        return r
+    try:
+        words = r.get("_asr_words")
+        if words:
+            from audio_coverage import summarize
+            c = summarize(r.get("segments") or [], words)
+            cascada = r.get("audio_coverage")
+            final = c["audio_coverage"]
+            r["audio_coverage"] = final
+            log = logger.warning if final < 0.8 else logger.info
+            log("[COVERAGE] final=%.0f%% (cascada=%s, pre-formatter=%s) "
+                "zonas_sin_letra=%d (%.1fs, peor %.1fs) job=%s",
+                final * 100,
+                f"{cascada * 100:.0f}%" if cascada is not None else "?",
+                f"{antes_fmt * 100:.0f}%" if antes_fmt is not None else "?",
+                c["uncovered_spans"], c["uncovered_seconds"],
+                c["worst_span_s"], job_id)
+            # Atribución explícita: qué etapa se comió el canto.
+            if cascada is not None and (cascada - final) > 0.02:
+                logger.warning(
+                    "[COVERAGE] los POST-PASES perdieron %.0f%% del canto "
+                    "(cascada %.0f%% → final %.0f%%) job=%s",
+                    (cascada - final) * 100, cascada * 100, final * 100, job_id)
+            if antes_fmt is not None and (antes_fmt - final) > 0.02:
+                logger.warning(
+                    "[COVERAGE] el FORMATTER perdió %.0f%% del canto job=%s",
+                    (antes_fmt - final) * 100, job_id)
+            # Carteles vacíos: el defecto que no se pudo explicar en b3a51559.
+            vacios = sum(1 for s in (r.get("segments") or [])
+                         if isinstance(s, dict) and not (s.get("text") or "").strip())
+            if vacios:
+                logger.warning("[COVERAGE] %d segmento(s) con TEXTO VACÍO "
+                               "en la salida final job=%s", vacios, job_id)
+    except Exception as e:
+        logger.warning("[COVERAGE] medición final falló: %r job=%s", e, job_id)
+    finally:
+        if isinstance(r, dict):
+            r.pop("_asr_words", None)
+    return r
+
+
 def run_transcription_job(
     job_id: str,
     audio_path: str,
@@ -137,7 +210,9 @@ def run_transcription_job(
                 r, audio_path, job_id,
                 live_hint=live or _looks_live(title, filename))
             from lyrics_format import format_lyrics_pass as _fmt
-            return await _fmt(r, language=language or "es")
+            _antes = _coverage_de(r)
+            r = await _fmt(r, language=language or "es")
+            return _medir_cobertura_final(r, job_id, _antes)
 
         result = asyncio.run(_run_with_retime())
     except Exception as e:

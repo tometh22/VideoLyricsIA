@@ -91,19 +91,12 @@ def _audio_coverage(out: list[dict], words: list[dict]) -> float:
     """Fracción de las palabras del ASR que alguna línea emitida reclama.
     A diferencia de `coverage` (que se mide contra la referencia y por eso
     SUBE cuando la referencia viene recortada), esta métrica sólo puede
-    bajar si se pierde canto — es la que detecta el fallo real."""
-    if not words:
-        return 1.0
-    iv = [(_f(s.get("start")), _f(s.get("end"))) for s in out]
-    if not iv:
-        return 0.0
-    n = 0
-    for w in words:
-        a, b = _f(w.get("start")), _f(w.get("end"))
-        mid = (a + b) / 2 if b > a else a
-        if any(ini - 0.05 <= mid <= fin + 0.05 for ini, fin in iv):
-            n += 1
-    return n / len(words)
+    bajar si se pierde canto — es la que detecta el fallo real.
+
+    Implementación en `audio_coverage.py`, compartida con la instrumentación
+    del punto de salida de la cascada."""
+    from audio_coverage import audio_coverage as _cov
+    return _cov(out, words)
 
 
 def _lineas_desde_palabras(orphan: list[dict], covered_end: float) -> list[dict]:
