@@ -43,7 +43,7 @@ DUR = 8.0
 # Dense halftone geometry is resolution-independent and is always scaled by
 # the compositor. Baking it at half resolution avoids a ~21 MB high-frequency
 # H.264 asset with no visible benefit in the final 1080p render.
-EFFECT_SIZE = {"halftone": (960, 540)}
+EFFECT_SIZE = {"halftone": (960, 540), "foto_viva": (960, 540)}
 # Write into the backend package (lyricgen/backend/assets/fx) so the loops ship
 # inside the Docker build context — matches fx_compositor._FX_DIR. (Moved here
 # 2026-06-04 from the repo-level lyricgen/assets/fx, which was outside the
@@ -682,19 +682,93 @@ def _neon_edge():
 
 
 def _shadow_play():
-    """Soft moving shadows authored over white for multiply compositing."""
+    """Edge-weighted leaf gobos authored over white for multiply compositing.
+
+    The old loop used seven screen-height ellipses.  On a bright photograph
+    they read as fingers/smudges over the lens and repeatedly crossed the lyric
+    safe area.  These pointed leaves and slender branches keep a recognisable
+    light-through-foliage silhouette, enter from the frame edges, and move as
+    one coherent gobo instead of as unrelated blobs.
+    """
+    clusters = ((-.03, .10, 1.0), (.98, .04, -1.0))
+    leaves = []
+    branches = []
+    for cluster_x, cluster_y, direction in clusters:
+        for branch_index in range(5):
+            angle = (
+                (.30 + branch_index * .16)
+                if direction > 0
+                else (math.pi - .30 - branch_index * .16)
+            )
+            length = _RNG.uniform(.18, .34)
+            branches.append((cluster_x, cluster_y, angle, length))
+            for leaf_index in range(5):
+                along = _RNG.uniform(.20, .96) * length
+                side = -1 if leaf_index % 2 else 1
+                local_angle = angle + side * _RNG.uniform(.42, .78)
+                cx = cluster_x + math.cos(angle) * along
+                cy = cluster_y + math.sin(angle) * along
+                leaves.append((
+                    cx,
+                    cy,
+                    _RNG.uniform(.026, .045),
+                    _RNG.uniform(.010, .020),
+                    local_angle,
+                    int(_RNG.integers(164, 205)),
+                ))
+
+    def leaf_polygon(cx, cy, length, width, angle):
+        """Pointed, slightly asymmetric leaf polygon in pixel coordinates."""
+        points = []
+        ca, sa = math.cos(angle), math.sin(angle)
+        for side in (1.0, -1.0):
+            samples = range(11) if side > 0 else range(10, -1, -1)
+            for index in samples:
+                u = index / 10.0
+                longitudinal = (u - .5) * 2.0 * length
+                half_width = math.sin(math.pi * u) ** .72 * width * side
+                # A tiny mid-rib bend keeps the silhouettes from looking like
+                # perfectly stamped ellipses.
+                half_width += math.sin(math.pi * u * 2.0) * width * .08
+                px = cx + longitudinal * ca - half_width * sa
+                py = cy + longitudinal * sa + half_width * ca
+                points.append((int(px * W), int(py * H)))
+        return points
+
     def make(t):
         f = _frac(t)
         image = Image.new("RGB", (W, H), (255, 255, 255))
         draw = ImageDraw.Draw(image, "RGB")
-        for i in range(7):
-            phase = math.tau * (f * (1 + i % 3) + i / 7)
-            cx = int(W * (.5 + .62 * math.sin(phase)))
-            cy = int(H * (.5 + .45 * math.cos(phase * .73)))
-            rx = int(W * (.12 + .035 * (i % 3)))
-            ry = int(H * (.38 + .04 * (i % 2)))
-            shade = 92 + i * 8
-            draw.ellipse((cx-rx, cy-ry, cx+rx, cy+ry), fill=(shade, shade, shade))
+        drift_x = math.sin(math.tau * f) * .018
+        drift_y = math.cos(math.tau * f) * .012
+        sway = math.sin(math.tau * f) * .035
+        for cluster_x, cluster_y, direction in clusters:
+            root = (
+                int((cluster_x + drift_x * direction) * W),
+                int((cluster_y + drift_y) * H),
+            )
+            tips = []
+            for bx, by, angle, length in branches:
+                if bx != cluster_x:
+                    continue
+                tip = (
+                    int((bx + drift_x * direction + math.cos(angle + sway * direction) * length) * W),
+                    int((by + drift_y + math.sin(angle + sway * direction) * length) * H),
+                )
+                tips.append(tip)
+                draw.line((root, tip), fill=(198, 198, 198), width=max(4, W // 260))
+            if tips:
+                draw.line((root, tips[-1]), fill=(188, 188, 188), width=max(6, W // 190))
+        for cx, cy, length, width, angle, shade in leaves:
+            direction = 1.0 if cx < .5 else -1.0
+            points = leaf_polygon(
+                cx + drift_x * direction,
+                cy + drift_y,
+                length,
+                width,
+                angle + sway * direction,
+            )
+            draw.polygon(points, fill=(shade, shade, shade))
         return np.asarray(image, dtype=np.uint8)
     return make
 
@@ -738,23 +812,68 @@ def _halftone():
 
 
 def _ink_reveal():
-    """Organic ink blooms crossing the photo, authored for multiply."""
+    """Irregular calligraphic strokes used as a photo-transform mask.
+
+    White is neutral and black selects the alternate high-contrast treatment
+    in ``fx_compositor``.  The mask is intentionally made from dry-brush bands,
+    bristles and restrained splatter — not large blurred circles.
+    """
     y, x = np.mgrid[0:H, 0:W]
     xn = x.astype(np.float32) / W
     yn = y.astype(np.float32) / H
-    centers = ((.18, .27), (.78, .22), (.55, .72), (.08, .84), (.91, .68))
+    noise_small = _RNG.integers(0, 256, (max(12, H // 28), max(20, W // 28)), dtype=np.uint8)
+    noise = np.asarray(
+        Image.fromarray(noise_small, mode="L").resize(
+            (W, H), Image.Resampling.BICUBIC
+        ),
+        dtype=np.float32,
+    ) / 255.0
+    splatters = []
+    for _ in range(28):
+        sx = float(_RNG.uniform(.04, .96))
+        base_y = .34 + .11 * math.sin(math.tau * (sx * 1.05 + .08))
+        sy = float(base_y + _RNG.normal(0, .075))
+        splatters.append((sx, sy, float(_RNG.uniform(.003, .011))))
 
     def make(t):
         f = _frac(t)
-        ink = np.zeros((H, W), np.float32)
-        for i, (cx, cy) in enumerate(centers):
-            pulse = .5 + .5 * math.sin(math.tau * (f * (1 + i % 2) - i / len(centers)))
-            r = .025 + pulse * (.12 + .02 * i)
-            wobble = .018 * np.sin(math.tau * (xn * (2+i*.2) + yn * 1.7 + f))
-            dist = np.sqrt((xn-cx+wobble) ** 2 + (yn-cy-wobble) ** 2)
-            ink = np.maximum(ink, np.clip((r - dist) / .035, 0, 1))
-        level = 255 - ink * 205
-        return np.stack((level, level*.98, level*.96), axis=2).clip(0,255).astype(np.uint8)
+        # 0 → 1 → 0 is periodic and reads as a deliberate paint/retract cycle.
+        progress = .5 - .5 * math.cos(math.tau * f)
+        dry = np.clip((noise - .12) / .58, 0, 1)
+
+        center_a = .34 + .11 * np.sin(math.tau * (xn * 1.05 + .08))
+        width_a = .040 + noise * .030
+        body_a = np.clip((width_a - np.abs(yn - center_a)) / .016, 0, 1)
+        reveal_a = np.clip((progress * 1.22 - xn) / .075, 0, 1)
+
+        center_b = .78 - .24 * xn + .055 * np.sin(math.tau * (xn * 1.7 + .23))
+        width_b = .024 + noise * .021
+        body_b = np.clip((width_b - np.abs(yn - center_b)) / .012, 0, 1)
+        reveal_b = np.clip((progress * 1.18 - (1.0 - xn)) / .070, 0, 1)
+
+        ink = np.maximum(body_a * reveal_a, body_b * reveal_b) * (.62 + .38 * dry)
+        # Fine parallel bristles sell a real dry brush without obscuring the
+        # underlying image or the central lyric-safe area.
+        for offset in (-.027, -.014, .016, .029):
+            bristle = np.clip(
+                (.0038 - np.abs(yn - center_a - offset)) / .0030,
+                0,
+                1,
+            )
+            ink = np.maximum(ink, bristle * reveal_a * (.22 + .68 * dry))
+        for sx, sy, radius in splatters:
+            active = np.clip((progress - sx * .88) / .07, 0, 1)
+            irregular = radius * (.75 + noise * .55)
+            dot = np.clip(
+                (irregular - np.sqrt((xn - sx) ** 2 + (yn - sy) ** 2))
+                / max(.002, radius * .38),
+                0,
+                1,
+            )
+            ink = np.maximum(ink, dot * active * .72)
+
+        level = 255 - ink * 228
+        return np.stack((level, level * .985, level * .965), axis=2).clip(0, 255).astype(np.uint8)
     return make
 
 
@@ -775,18 +894,34 @@ def _heatwave():
 
 
 def _chromatic_pulse():
-    """Continuous concentric chromatic breathing, independent of the beat."""
+    """Subtle chromatic breathing around the frame perimeter.
+
+    The previous full-frame concentric rings looked like a cheap overlay and
+    imposed a centre on every composition.  This loop protects the middle of
+    the image and provides only restrained, travelling colour energy for the
+    photo-derived edge treatment in the compositor.
+    """
     y, x = np.mgrid[0:H, 0:W]
     xx = x.astype(np.float32) / W - .5
     yy = y.astype(np.float32) / H - .5
-    radius = np.sqrt(xx * xx + yy * yy)
+    radius = np.sqrt((xx / .5) ** 2 + (yy / .5) ** 2)
+    theta = np.arctan2(yy, xx)
+    periphery = np.clip((radius - .48) / .52, 0, 1) ** 1.35
 
     def make(t):
         f = _frac(t)
-        red = np.exp(-((radius - (.18 + .13 * math.sin(math.tau*f))) / .035) ** 2)
-        cyan = np.exp(-((radius - (.36 + .12 * math.sin(math.tau*f + 2))) / .045) ** 2)
-        violet = np.exp(-((radius - (.54 + .10 * math.sin(math.tau*f + 4))) / .055) ** 2)
-        return np.stack((red*130 + violet*55, cyan*105, cyan*145 + violet*120), axis=2).clip(0,255).astype(np.uint8)
+        breathe = .32 + .68 * (.5 - .5 * math.cos(math.tau * f))
+        red_lobes = (.5 + .5 * np.cos(theta * 3 - math.tau * f)) ** 5
+        cyan_lobes = (.5 + .5 * np.cos(theta * 3 - math.tau * f + 2.25)) ** 5
+        violet_lobes = (.5 + .5 * np.cos(theta * 2 + math.tau * f + 1.1)) ** 7
+        red = periphery * breathe * red_lobes
+        cyan = periphery * (.48 + .52 * breathe) * cyan_lobes
+        violet = periphery * (.35 + .65 * breathe) * violet_lobes
+        return np.stack((
+            red * 82 + violet * 28,
+            cyan * 52,
+            cyan * 76 + violet * 58,
+        ), axis=2).clip(0, 255).astype(np.uint8)
     return make
 
 
@@ -826,6 +961,36 @@ def _projector():
         dust = rng.random((H//4, W//4), dtype=np.float32)
         dust = np.repeat(np.repeat((dust > .998)*95, 4, axis=0), 4, axis=1)[:H,:W]
         return np.stack((frame+dust, frame*.82+dust*.82, frame*.52+dust*.55), axis=2).clip(0,255).astype(np.uint8)
+    return make
+
+
+def _foto_viva():
+    """Travelling feathered mask for the provider-free living-photo fallback.
+
+    The production path asks image-to-video to animate a semantic subject.
+    When that provider is unavailable, this mask keeps the photo alive by
+    revealing a subtly shifted copy in one bounded region.  Its Lissajous path
+    deliberately covers the canvas instead of pinning motion to the centre.
+    """
+    y, x = np.mgrid[0:H, 0:W]
+    xn = x.astype(np.float32) / max(1, W - 1)
+    yn = y.astype(np.float32) / max(1, H - 1)
+
+    def make(t):
+        f = _frac(t)
+        cx = 0.5 + 0.30 * math.sin(math.tau * f)
+        cy = 0.5 + 0.24 * math.cos(math.tau * f)
+        # A soft organic lobe rather than a mechanical perfect oval.
+        wobble = 0.035 * np.sin(
+            math.tau * (xn * 1.7 + yn * 1.2 + f)
+        )
+        dist = (
+            ((xn - cx + wobble) / 0.30) ** 2
+            + ((yn - cy - wobble) / 0.38) ** 2
+        )
+        mask = np.clip(1.0 - dist, 0.0, 1.0) ** 1.7
+        level = mask * 255.0
+        return np.stack((level, level, level), axis=2).astype(np.uint8)
     return make
 
 
@@ -915,6 +1080,7 @@ EFFECTS = {
     "halftone": _halftone, "ink_reveal": _ink_reveal,
     "heatwave": _heatwave, "chromatic_pulse": _chromatic_pulse,
     "cutout_echo": _cutout_echo, "projector": _projector,
+    "foto_viva": _foto_viva,
     "bass_pulse": _bass_pulse, "beat_flash": _beat_flash,
     "chromatic_hit": _chromatic_hit, "beat_ripple": _beat_ripple,
     "echo_hit": _echo_hit,

@@ -1225,7 +1225,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # JPG/PNG (NOT an MP4 — those are already video).
         _is_still = (background_path and
                      background_path.lower().endswith((".jpg", ".jpeg", ".png")))
-        _animate_user_image = bool(animate_image and _is_still)
+        _live_photo_effect = (effect or "").strip().lower() == "foto_viva"
+        _animate_user_image = bool(
+            (animate_image or _live_photo_effect) and _is_still
+        )
         _background_is_ai_generated = _background_source_is_ai(
             background_path,
             bg_r2_key,
@@ -1359,7 +1362,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # (_scenes_active → bg_prelooped=True). Si algo falla, log + caemos al
             # fondo único de _ensure_background (no rompemos el job).
             _scenes_active = False
-            if bg_image_path is None and enable_scenes and not _animate_user_image:
+            if (
+                bg_image_path is None
+                and enable_scenes
+                and not _animate_user_image
+                and not _live_photo_effect
+            ):
                 try:
                     update_job(job_id, current_step="scenes", progress=22)
                     _scene_timeline, _scene_plan = _generate_scene_background(
@@ -7918,7 +7926,17 @@ _MOVEMENT_STYLE_RULES = {
     "sutil":         "Movement: minimal and ambient — gentle sway, slow drift, breathing motion. Subjects barely move. Easy to loop seamlessly.",
     "estandar":      "",  # no extra rule; the existing prompt template controls motion
     "foto-parallax": "Aesthetic: photographic still with subtle parallax — composition feels like a single photo, motion is restricted to slow camera moves, depth-of-field shifts, and lighting passes. No moving subjects.",
-    "animado":       "Aesthetic: stylised 2D animated illustration — flat shapes, deliberate cartoon-like motion. NOT photorealistic.",
+    "animado":       (
+        "Aesthetic: LIVING ILLUSTRATION — a stylised 2D drawing with a locked "
+        "camera and almost the entire composition held still. Choose ONE "
+        "semantically important subject already belonging to this specific "
+        "scene and give only that subject one simple cyclic action. Everything "
+        "else remains drawn and still. The moving subject comes from the song/"
+        "scene, never from a fixed atmospheric recipe. Do not add smoke, rain, "
+        "fog, floating particles, swaying foliage or light flicker as generic "
+        "motion unless explicitly present in the lyrics or operator prompt. "
+        "Seamless loop, flat shapes, NOT photorealistic."
+    ),
 }
 
 
@@ -8261,16 +8279,19 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
                     "itself is essentially still. NEVER push-in, NEVER zoom, "
                     "NEVER dolly forward, NEVER orbit. Just a faint breath")
     elif _animado:
-        # 2D illustration: cámara CALMA y variada. Antes caía al `else` ("exact
-        # camera movement") → paneos en cada escena, todas iguales (bug
-        # 2026-06-30). La vida viene de la animación 2D, no de la cámara.
-        _clause2 = ("(2) framing and composition chosen for THIS scene's mood "
-                    "(vary the angle and shot size between scenes so they don't all "
-                    "look alike), with a CALM camera — at most a slow, gentle "
-                    "lateral drift; this is a stylised 2D illustration, so keep the "
-                    "camera movement minimal and let the illustrated shapes and "
-                    "elements carry the motion. NEVER push-in, zoom, dolly forward "
-                    "or orbit")
+        # Living illustration: the source example is a mostly frozen drawing
+        # where one meaningful object performs a clean loop.  Do not make the
+        # model "solve motion" with the same smoke/rain/particle filler.
+        _clause2 = (
+            "(2) a LOCKED illustrated composition with NO camera movement. "
+            "Select exactly ONE semantically important subject that already "
+            "belongs to THIS scene, and animate only that subject with one "
+            "simple, readable, cyclic action. Keep every other illustrated "
+            "element still. The subject and action must be inferred from the "
+            "song, scene or operator prompt — never default to atmospheric "
+            "filler. No generic smoke, rain, fog, floating particles, swaying "
+            "foliage or light flicker unless explicitly requested. Seamless loop"
+        )
     elif _foto:
         # Foto fija: cámara casi inmóvil (foto), NO "exact camera movement".
         _clause2 = ("(2) framing and composition for THIS scene (vary it between "
@@ -9110,6 +9131,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         allow_people: bool = False,
                         atmospherics_policy: dict | None = None,
                         verbatim: bool = False,
+                        live_photo: bool = False,
                         cache_only: bool = False,
                         cache_key_override: str | None = None,
                         cache_override_policy_fingerprint: str | None = None,
@@ -9137,6 +9159,10 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     the "no CGI / no animation" clauses so they don't contradict the
     cartoon-illustration aesthetic. All other safety clauses (no people,
     no text, etc.) stay in place.
+
+    `live_photo`: preserves an image-to-video seed and animates exactly one
+    semantic region. It explicitly rejects generic atmospheric filler unless
+    the source/operator already asks for it.
     """
     from provenance import record_ai_call
     import storage as _storage
@@ -9259,13 +9285,32 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         "perfectly still"
     )
     _norm_move = _normalize_movement_style(movement_style)
-    if _norm_move == "animado":
+    if live_photo:
+        safe_prompt = (
+            f"{prompt}. Preserve the supplied image's exact composition, "
+            "identity, framing, palette and subjects. First identify the ONE "
+            "most semantically meaningful animatable subject already visible "
+            "in the image; animate only that subject with one restrained, "
+            "natural, cyclic action. Keep all other regions stable and keep the "
+            "camera completely locked. Do not invent new subjects or objects. "
+            "No generic smoke, rain, fog, floating particles, wind, swaying "
+            "foliage or light flicker unless that element is already visible or "
+            "explicitly requested by the operator. No morphing, no scene cut, "
+            "no camera move. Make the first and last frame loop seamlessly. "
+            f"{no_alley}{_base_negatives}"
+        )
+    elif _norm_move == "animado":
         # Cartoon / 2D illustration aesthetic — keep all safety clauses
         # except the "no CGI / no animation" pair, which would directly
         # contradict the requested look.
         safe_prompt = (
-            f"{prompt}. Stylised 2D animated illustration, flat shapes, "
-            "deliberate cartoon-like motion. "
+            f"{prompt}. LIVING ILLUSTRATION: a stylised 2D drawing, flat "
+            "shapes, locked camera, almost the entire composition still. "
+            "Animate exactly ONE semantically important subject already in "
+            "this scene with one simple cyclic action. Every other element "
+            "remains still. No generic smoke, rain, fog, floating particles, "
+            "swaying foliage or light flicker unless explicitly requested. "
+            "No camera movement, no morphing, seamless loop. "
             f"{no_alley}"
             f"{_base_negatives}"
             " no extra animation noise."
@@ -9384,6 +9429,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         "blur_sigma": blur_sigma,
         "ns": cache_namespace or "",
         "background_policy": _policy_fingerprint,
+        "live_photo": bool(live_photo),
     }
     # Image-to-video: la imagen semilla entra al hash vía digest del
     # contenido — ver _seed_image_digest para el porqué (audit 2026-06-09).
@@ -10266,6 +10312,7 @@ def _darken_prompt_for_effect(prompt: str, effect: str) -> str:
     if (
         not effect
         or effect.strip().lower() not in _fxc.EFFECTS
+        or _fxc.is_generative_effect(effect)
         or _fxc.effect_blend(effect) != "screen"
     ):
         return prompt
@@ -11376,11 +11423,20 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     # renombra la card a "Sin efecto — imagen quieta" en esa combinación. Elegir
     # que quede quieto es válido; que sea una decisión y no un accidente.
     _operator_effect = (effect or "").strip().lower()
+    _live_photo = _operator_effect == "foto_viva"
+
+    # Foto viva is a photo-first contract: create/select a still, then animate
+    # one semantic region through image-to-video.  It must never silently fall
+    # through to generic text-to-video just because another client sent a stale
+    # movement value.
+    if _live_photo and not image_to_video_path and bg_mode != "imagen":
+        logger.info("[BG] effect=foto_viva overrides bg_mode → imagen + image-to-video")
+        bg_mode = "imagen"
 
     # Animado is a Veo-only aesthetic (the 2D-illustration safe_prompt lives in
     # _generate_veo_video). Imagen renders stills, so an animado+imagen combo
     # is incoherent — downgrade to Veo. (Matrix rule: Imagen × Animado → Veo.)
-    if _norm_move_bg == "animado" and bg_mode != "veo":
+    if not _live_photo and _norm_move_bg == "animado" and bg_mode != "veo":
         logger.info("[BG] movement=animado overrides bg_mode → veo")
         bg_mode = "veo"
     # Foto + parallax is a still photo that gains depth via a slow LATERAL pan.
@@ -11467,6 +11523,30 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                                 allow_people=allow_people,
                                 atmospherics_policy=atmospherics_policy,
                                 verbatim=_verbatim_bg)
+        if _live_photo:
+            try:
+                _generate_veo_video(
+                    prompt,
+                    bg_path,
+                    job_id=job_id,
+                    cache_namespace=f"{artist}|{song_title}|foto_viva",
+                    image_path=image_path,
+                    movement_style=movement_style,
+                    normalized_concept=_normalize_concept(concept),
+                    allow_people=allow_people,
+                    atmospherics_policy=atmospherics_policy,
+                    verbatim=_verbatim_bg,
+                    live_photo=True,
+                )
+                if os.path.exists(bg_path) and os.path.getsize(bg_path) > 0:
+                    return bg_path
+                raise RuntimeError("Veo returned no living-photo artifact")
+            except Exception as exc:
+                _raise_if_job_timeout(exc)
+                logger.warning(
+                    "[BG] foto_viva provider failed; using bounded local "
+                    "photo-motion fallback: %s", exc,
+                )
         # Ken Burns produces a 60s sample that downstream palindrome-loops
         # to match the audio duration. Same contract as the Veo path.
         #   - "Estático"        → hold the frame (no zoom/pan).
@@ -11555,6 +11635,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 allow_people=allow_people,
                 atmospherics_policy=atmospherics_policy,
                 verbatim=_is_verbatim,
+                live_photo=_live_photo,
             )
             # Semantic relevance check — always score, but cap retries at one
             # to bound cost (+$0.80 worst case). quality_retry_used gates the
@@ -11680,6 +11761,17 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 wait = 30
                 logger.info("[BG] Waiting %ss before retry...", wait)
                 _time_bg.sleep(wait)
+
+    # A living photo must preserve the operator's image even when Veo is down.
+    # Turn it into a static sample here; fx_compositor's travelling semantic-
+    # region mask supplies bounded local motion later in the render.
+    if _live_photo and image_to_video_path and os.path.exists(image_to_video_path):
+        logger.warning(
+            "[BG] foto_viva Veo unavailable — preserving source image and "
+            "falling back to local masked motion"
+        )
+        _static_image_to_mp4(image_to_video_path, bg_path, duration=60.0)
+        return bg_path
 
     # All Veo attempts failed — render a gradient as fallback.
     # We do NOT fall back to a library asset: UMG and other rights-sensitive

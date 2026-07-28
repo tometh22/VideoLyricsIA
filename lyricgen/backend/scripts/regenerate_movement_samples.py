@@ -60,9 +60,11 @@ SAMPLES = [
     {
         "style": "animado",
         "prompt": (
-            "Stylised 2D animated illustration of a basketball spinning slowly "
-            "above an empty court, flat shapes, deliberate cartoon-like motion, "
-            "saturated colors. NOT photorealistic."
+            "Stylised 2D illustrated basketball court. One basketball makes a "
+            "clean seamless arc toward the hoop; the camera and every other "
+            "element remain perfectly still. Flat shapes, saturated colors, "
+            "no smoke, rain, fog, particles or generic atmospheric motion. "
+            "NOT photorealistic."
         ),
     },
 ]

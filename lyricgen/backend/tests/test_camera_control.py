@@ -14,6 +14,7 @@ without network or a real genai client — matching the style of
 test_background_genre_bias.py.
 """
 import inspect
+from pathlib import Path
 
 import pipeline
 
@@ -46,6 +47,15 @@ def test_normalize_movement_style_dinamico_maps_to_estandar():
     "estandar" (cinematográfico), un valor válido con regla de cámara."""
     for alias in ("dinamico", "dinámico", "dynamic"):
         assert pipeline._normalize_movement_style(alias) == "estandar", alias
+
+
+def test_animado_is_a_living_illustration_not_an_atmospheric_default():
+    rule = pipeline._MOVEMENT_STYLE_RULES["animado"].lower()
+    assert "one" in rule and "subject" in rule
+    assert "locked" in rule and "loop" in rule
+    for generic in ("smoke", "rain", "fog", "particles"):
+        assert generic in rule
+    assert "unless" in rule and "explicitly" in rule
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +114,17 @@ def test_generate_veo_video_accepts_high_fidelity_and_routes_model():
     src = inspect.getsource(pipeline._generate_veo_video)
     # Static / verbatim renders can route to a higher-fidelity model via env.
     assert "VEO_MODEL_STATIC" in src
+
+
+def test_generate_veo_video_has_source_preserving_live_photo_contract():
+    sig = inspect.signature(pipeline._generate_veo_video)
+    assert "live_photo" in sig.parameters
+    src = inspect.getsource(pipeline._generate_veo_video).lower()
+    assert "if live_photo" in src
+    assert "most semantically meaningful" in src
+    assert "animate only that subject" in src
+    assert "preserve the supplied image's exact composition" in src
+    assert "generic atmospheric filler" in src
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +226,60 @@ def test_ensure_background_routes_foto_to_imagen_static():
         "the imagen background path must NOT call the moviepy Ken Burns render "
         "(it animated ~7,800 frames in Python and OOM-killed the worker)"
     )
+
+
+def test_foto_viva_routes_through_image_to_video_and_preserves_local_fallback():
+    src = inspect.getsource(pipeline._ensure_background)
+    assert '_operator_effect == "foto_viva"' in src
+    assert 'if not _live_photo and _norm_move_bg == "animado"' in src
+    assert "live_photo=True" in src
+    assert "preserving source image" in src
+    assert "_static_image_to_mp4(image_to_video_path" in src
+
+
+def test_foto_viva_does_not_force_dark_atmospheric_grading():
+    prompt = "Bright editorial portrait with a clean blue wall"
+    assert pipeline._darken_prompt_for_effect(prompt, "foto_viva") == prompt
+
+
+def test_foto_viva_executes_imagen_then_source_preserving_veo(
+    monkeypatch, tmp_path,
+):
+    """Functional dispatch regression: a stale Animado value must not steal
+    Foto viva's photo-first path after the UI has selected the effect."""
+    calls = {}
+    monkeypatch.setattr(
+        pipeline, "_get_unique_prompt",
+        lambda *args, **kwargs: {"prompt": "one vivid editorial subject", "style": "image"},
+    )
+
+    def fake_imagen(prompt, output_path, **kwargs):
+        calls["imagen"] = (prompt, kwargs)
+        Path(output_path).write_bytes(b"jpeg")
+
+    def fake_veo(prompt, output_path, **kwargs):
+        calls["veo"] = (prompt, kwargs)
+        Path(output_path).write_bytes(b"mp4")
+
+    monkeypatch.setattr(pipeline, "_generate_imagen_image", fake_imagen)
+    monkeypatch.setattr(pipeline, "_generate_veo_video", fake_veo)
+
+    result = pipeline._ensure_background(
+        "auto", str(tmp_path), artist="Artist", song_title="Song",
+        movement_style="animado", bg_mode="veo", effect="foto_viva",
+    )
+
+    assert Path(result).read_bytes() == b"mp4"
+    assert "imagen" in calls
+    assert calls["veo"][1]["live_photo"] is True
+    assert calls["veo"][1]["image_path"].endswith("bg_imagen.jpg")
+
+
+def test_run_pipeline_treats_foto_viva_as_single_photo_animation():
+    src = inspect.getsource(pipeline.run_pipeline)
+    assert '_live_photo_effect = (effect or "").strip().lower() == "foto_viva"' in src
+    assert "(animate_image or _live_photo_effect) and _is_still" in src
+    assert "and not _live_photo_effect" in src  # incompatible multi-scene route
 
 
 def test_ken_burns_pan_modes_have_no_zoom():
