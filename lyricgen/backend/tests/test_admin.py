@@ -482,3 +482,28 @@ def test_admin_jobs_excludes_bg_previews_by_default(client, admin_token, db):
         assert ids == ["actv7b"]
     finally:
         _cleanup_activity_seed(db, "actv7", uid)
+
+
+def test_wizard_presets_admin_gets_them(client, admin_token):
+    """Admin recibe los presets internos del wizard (label + apply). Estos NO
+    viajan en el bundle del frontend — solo se sirven acá, gateado por admin."""
+    res = client.get("/admin/wizard-presets", headers=auth(admin_token))
+    assert res.status_code == 200
+    data = res.json()
+    assert isinstance(data.get("presets"), list) and len(data["presets"]) >= 1
+    p = data["presets"][0]
+    assert p.get("key") and p.get("label") and isinstance(p.get("apply"), dict)
+    # El apply debe traer los settings que el cliente mapea a setters.
+    assert "batchDefaults" in p["apply"]
+
+
+def test_wizard_presets_non_admin_forbidden(client, user_token):
+    """Un usuario NO-admin no debe poder ni recibir el JSON del preset."""
+    res = client.get("/admin/wizard-presets", headers=auth(user_token))
+    assert res.status_code == 403
+
+
+def test_wizard_presets_unauthenticated_rejected(client):
+    """Sin token, 401/403 — nunca 200."""
+    res = client.get("/admin/wizard-presets")
+    assert res.status_code in (401, 403)
