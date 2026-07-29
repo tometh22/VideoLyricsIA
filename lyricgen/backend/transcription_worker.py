@@ -98,6 +98,7 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             cascada = r.get("audio_coverage")
             final = c["audio_coverage"]
             r["audio_coverage"] = final
+            r.setdefault("postpass_stats", {})["coverage_final"] = c
             log = logger.warning if final < 0.8 else logger.info
             log("[COVERAGE] final=%.0f%% (cascada=%s, pre-formatter=%s) "
                 "zonas_sin_letra=%d (%.1fs, peor %.1fs) "
