@@ -151,7 +151,8 @@ def run_transcription_job(
     # que es lo que queremos (jobs independientes, sin event-loop leak).
     from main import (  # type: ignore
         _looks_live, _maybe_anchor_align, _maybe_ctc_retime,
-        _maybe_adlib_filter, _run_transcription_for_job,
+        _maybe_adlib_filter, _maybe_phrase_segment,
+        _maybe_repetition_reconcile, _run_transcription_for_job,
     )
     from jobs import update_job, get_job
     import storage
@@ -220,6 +221,8 @@ def run_transcription_job(
             r = await _maybe_adlib_filter(
                 r, audio_path, job_id,
                 live_hint=live or _looks_live(title, filename))
+            r = _maybe_repetition_reconcile(r, job_id)
+            r = _maybe_phrase_segment(r, job_id)
             from lyrics_format import format_lyrics_pass as _fmt
             _antes = _coverage_de(r)
             r = await _fmt(r, language=language or "es")
