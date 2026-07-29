@@ -49,6 +49,19 @@ _TRUE = ("1", "true", "yes", "on")
 _MIN_GAP_S = 0.01     # mismo gap mínimo entre carteles que usa lead_in
 _MIN_CARD_S = 0.1     # duración mínima de una carta tras clamps
 
+# Mínimo de palabras por cartel. Sin esto, el costo por duración parte
+# frases cortas para "aliviar" el tiempo en pantalla y deja palabras
+# huérfanas: en el job ff76ebfa salieron carteles con una sola palabra
+# ("Ahí", "Estuve") porque el cantante sostenía la última nota 8 segundos.
+# Un cartel de una palabra es peor que un cartel largo.
+_MIN_LEN = 3
+
+# Tope de la duración de UNA palabra a efectos del costo. Una nota
+# sostenida no es un problema de legibilidad — el texto es corto y ya se
+# leyó; penalizarla empujaba a partir la frase. Solo cuenta como "tiempo
+# en pantalla" hasta este tope.
+_WORD_DUR_CAP_S = 1.5
+
 
 def is_enabled() -> bool:
     return os.environ.get(
@@ -110,18 +123,39 @@ def words_trusted(seg: dict) -> bool:
     return _phonetic_ratio(tt, wt) >= 0.8
 
 
+def _effective_dur(words: list[dict], i: int, j: int) -> float:
+    """Tiempo que el cartel 'pesa' en pantalla, para el costo por duración.
+
+    NO es el span crudo: la duración de cada palabra se topea en
+    `_WORD_DUR_CAP_S`. Una nota sostenida de 8 s no es un problema de
+    legibilidad (el texto es corto y ya se leyó), pero contarla completa
+    empujaba al DP a partir la frase para aliviar la penalización — así
+    salieron los carteles de una sola palabra del job ff76ebfa."""
+    total = 0.0
+    for k in range(i, j):
+        w = words[k]
+        total += min(_f(w.get("end")) - _f(w.get("start")), _WORD_DUR_CAP_S)
+        if k + 1 < j:                     # silencio hasta la palabra siguiente
+            total += max(0.0, _f(words[k + 1].get("start"))
+                         - _f(w.get("end")))
+    return total
+
+
 def segment_words(words: list[dict], *, target_len: int = 6,
-                  max_len: int = 11, len_w: float = 1.0,
-                  dur_w: float = 3.0, max_dur: float = 5.0,
-                  gap_w: float = 2.5, gap_cap: float = 1.5
-                  ) -> list[list[dict]]:
+                  max_len: int = 11, min_len: int = _MIN_LEN,
+                  len_w: float = 1.0, dur_w: float = 3.0,
+                  max_dur: float = 5.0, gap_w: float = 2.5,
+                  gap_cap: float = 1.5) -> list[list[dict]]:
     """Reparto globalmente óptimo del stream de palabras en carteles.
     Puro y determinista. Devuelve la lista de grupos de words, en orden,
-    cubriendo todas las palabras exactamente una vez."""
+    cubriendo todas las palabras exactamente una vez. Todo cartel tiene
+    entre `min_len` y `max_len` palabras (salvo que el stream entero sea
+    más corto que `min_len`, en cuyo caso sale un único cartel)."""
     n = len(words)
     if n == 0:
         return []
-    if n == 1:
+    if n < max(2, min_len) * 2 - 1 and n <= max_len:
+        # Demasiado corto para partir respetando el mínimo en ambos lados.
         return [list(words)]
 
     def gap_after(i: int) -> float:
@@ -135,15 +169,23 @@ def segment_words(words: list[dict], *, target_len: int = 6,
     prev = [0] * (n + 1)
     best[0] = 0.0
     for j in range(1, n + 1):
-        for i in range(max(0, j - max_len), j):
+        # Cada cartel debe tener >= min_len palabras: el corte anterior no
+        # puede caer a menos de min_len de j.
+        for i in range(max(0, j - max_len), j - min_len + 1):
+            if best[i] == INF:
+                continue
             length = j - i
-            dur = _f(words[j - 1].get("end")) - _f(words[i].get("start"))
             cost = (len_w * (length - target_len) ** 2
-                    + dur_w * max(0.0, dur - max_dur) ** 2
+                    + dur_w * max(0.0,
+                                  _effective_dur(words, i, j) - max_dur) ** 2
                     - gap_w * min(gap_after(j - 1), gap_cap))
             if best[i] + cost < best[j]:
                 best[j] = best[i] + cost
                 prev[j] = i
+    if best[n] == INF:
+        # Sin partición válida bajo el mínimo (p. ej. n entre min_len y
+        # 2·min_len−1): un solo cartel.
+        return [list(words)]
     cuts: list[tuple[int, int]] = []
     j = n
     while j > 0:
@@ -159,6 +201,7 @@ def resegment(segments: list[dict], *, lead_s: float = 0.0,
     words y los de words no confiables pasan intactos (mismo objeto)."""
     target_len = _env_int("PHRASE_SEG_TARGET_LEN", 6)
     max_len = _env_int("PHRASE_SEG_MAX_LEN", 11)
+    min_len = _env_int("PHRASE_SEG_MIN_LEN", _MIN_LEN)
     max_dur = _env_float("PHRASE_SEG_MAX_DUR_S", 5.0)
     gap_cap = _env_float("PHRASE_SEG_GAP_CAP_S", 1.5)
     lead = max(0.0, float(lead_s or 0.0))
@@ -171,14 +214,16 @@ def resegment(segments: list[dict], *, lead_s: float = 0.0,
             continue
         words = seg.get("words") or []
         n = len(words)
-        dur = _f(seg.get("end")) - _f(seg.get("start"))
+        # Duración EFECTIVA (notas sostenidas topeadas): un cartel corto que
+        # dura mucho por un sostenido no necesita partirse.
+        dur = _effective_dur(words, 0, n) if n else 0.0
         needs_split = n > max_len or dur > max_dur
         if n < 4 or not needs_split or not words_trusted(seg):
             out.append(seg)
             continue
         groups = segment_words(words, target_len=target_len,
-                               max_len=max_len, max_dur=max_dur,
-                               gap_cap=gap_cap)
+                               max_len=max_len, min_len=min_len,
+                               max_dur=max_dur, gap_cap=gap_cap)
         if len(groups) <= 1:
             out.append(seg)
             continue
