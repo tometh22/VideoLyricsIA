@@ -4221,6 +4221,7 @@ async def transcribe_uploaded(
                                           body.language or "es")
         _result = await _maybe_word_vote(_result, audio_path, job_id,
                                          body.language or "es")
+        _result = _maybe_chorus_snap(_result, job_id)
         _result = _maybe_phrase_segment(_result, job_id)
         from lyrics_format import format_lyrics_pass as _fmt
         return await _fmt(_result, language=body.language or "es")
@@ -4902,6 +4903,7 @@ async def transcribe_endpoint(
                                       language or "es")
     _result = await _maybe_word_vote(_result, audio_path, job_id,
                                      language or "es")
+    _result = _maybe_chorus_snap(_result, job_id)
     _result = _maybe_phrase_segment(_result, job_id)
     from lyrics_format import format_lyrics_pass as _fmt
     return await _fmt(_result, language=language or "es")
@@ -5097,6 +5099,38 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
                 os.unlink(_stem)
             except OSError:
                 pass
+
+
+def _maybe_chorus_snap(result, job_id: str):
+    """Post-pass gateado (CHORUS_SNAP_ENABLED, default off): en zonas de coro
+    repetido, repara los fragmentos mal cortados a la frase canónica del
+    grupo. Rotor gana en el outro porque estampa la frase del coro limpia en
+    cada repetición en vez de confiar palabra-por-palabra en un ASR que
+    patina sobre voz enterrada; esto hace lo mismo con repetition_group.
+    Corre DESPUÉS de gap_rescue/word_vote (repara lo que ellos dejaron) y
+    ANTES del segmentador. Puro, sync, never raises."""
+    if not isinstance(result, dict):
+        return result
+    try:
+        import chorus_snap as _cs
+        if not _cs.is_enabled():
+            return result
+        segs = result.get("segments") or []
+        if len(segs) < 3:
+            return result
+        nuevo, stats = _cs.snap(segs)
+        if stats.get("snapped") or stats.get("merged"):
+            result = dict(result)
+            result["segments"] = nuevo
+            logger.info(
+                "[CHORUS-SNAP] %d fragmento(s) del coro reparados, %d "
+                "órfano(s) absorbidos (grupos=%d) job=%s",
+                stats["snapped"], stats["merged"], stats["groups"], job_id)
+            result.setdefault("postpass_stats", {})["chorus_snap"] = stats
+        return result
+    except Exception as e:
+        logger.warning("[CHORUS-SNAP] wrapper declinó: %r (job=%s)", e, job_id)
+        return result
 
 
 def _maybe_phrase_segment(result, job_id: str):
