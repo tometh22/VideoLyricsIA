@@ -95,7 +95,7 @@ def test_summarize_es_serializable_y_completo():
     words = _palabras(10, 20) + _palabras(60, 80)
     s = summarize([_seg(9.5, 20.5)], words)
     assert set(s) == {"audio_coverage", "uncovered_spans",
-                      "uncovered_seconds", "worst_span_s"}
+                      "uncovered_seconds", "worst_span_s", "text_mismatches"}
     assert all(isinstance(v, (int, float)) for v in s.values())
     assert s["uncovered_spans"] == 1
     assert 18 <= s["worst_span_s"] <= 21
@@ -119,3 +119,58 @@ def test_caso_real_referencia_recortada():
     cov = audio_coverage(lineas, cantado)
     assert cov < 0.75, f"debería delatar la pérdida, dio {cov:.2f}"
     assert summarize(lineas, cantado)["worst_span_s"] > 50
+
+
+# ── text_mismatches: ¿el cartel DICE lo que se canta? ─────────────────────
+
+def _wtxt(texto, ini, paso=0.5):
+    out, t = [], ini
+    for w in texto.split():
+        out.append({"word": w, "start": round(t, 2), "end": round(t + 0.4, 2)})
+        t += paso
+    return out
+
+
+def test_mismatch_detecta_cartel_con_texto_equivocado():
+    """El caso que el usuario vio a ojo y la cobertura no: cartel de la
+    estrofa pintado sobre audio del estribillo."""
+    from audio_coverage import text_mismatches
+    words = _wtxt("estuve rodando por ahi sin parar", 10.0)
+    seg = [{"start": 10.0, "end": 13.5,
+            "text": "cuando los meses pasan y mi ropa no cambia"}]
+    got = text_mismatches(seg, words)
+    assert len(got) == 1 and got[0]["index"] == 0 and got[0]["ratio"] < 0.4
+
+
+def test_mismatch_ok_cuando_el_texto_coincide():
+    from audio_coverage import text_mismatches
+    words = _wtxt("estuve rodando por ahi sin parar", 10.0)
+    seg = [{"start": 10.0, "end": 13.5,
+            "text": "Estuve rodando por ahí sin parar"}]
+    assert text_mismatches(seg, words) == []
+
+
+def test_mismatch_tolera_mishears_foneticos():
+    """'le realizan la' vs 'legalícenla' — mismo sonido, tokens distintos.
+    No debe acusarse."""
+    from audio_coverage import text_mismatches
+    words = _wtxt("le realizan la vida entera", 10.0)
+    seg = [{"start": 10.0, "end": 13.0, "text": "legalicenla vida entera"}]
+    assert text_mismatches(seg, words) == []
+
+
+def test_mismatch_no_acusa_sin_evidencia():
+    """Ventanas con <2 palabras del ASR no se evalúan: sin evidencia no se
+    acusa (evita falsos positivos en zonas que el ASR apenas oyó)."""
+    from audio_coverage import text_mismatches
+    words = [{"word": "eco", "start": 10.0, "end": 10.4}]
+    seg = [{"start": 9.0, "end": 14.0, "text": "una linea larga cualquiera"}]
+    assert text_mismatches(seg, words) == []
+
+
+def test_summarize_incluye_text_mismatches():
+    from audio_coverage import summarize
+    words = _wtxt("estuve rodando por ahi sin parar", 10.0)
+    seg = [{"start": 10.0, "end": 13.5, "text": "otra cosa totalmente distinta aqui"}]
+    s = summarize(seg, words)
+    assert s["text_mismatches"] == 1

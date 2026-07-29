@@ -103,13 +103,59 @@ def uncovered_spans(segments, words, *, min_gap_s: float = 3.0,
     return out
 
 
+def _norm_tokens(text: str) -> list[str]:
+    import unicodedata as _u
+    s = _u.normalize("NFD", (text or "").lower())
+    s = "".join(c for c in s if c.isalnum() or c.isspace())
+    return [t for t in s.split() if t]
+
+
+def text_mismatches(segments, words, *, min_ratio: float = 0.4,
+                    min_window_words: int = 2,
+                    pad: float = 0.3) -> list[dict]:
+    """Carteles cuyo TEXTO no suena a lo que el ASR oyó en su ventana.
+
+    La cobertura dice si HAY cartel; esto dice si el cartel DICE lo que se
+    canta en ese momento — la dimensión que faltaba: el job 6f4047db tenía
+    76 % de cobertura y aun así 2 carteles pintaban la estrofa equivocada
+    sobre el estribillo (0 % de coincidencia). El usuario lo vio a ojo; la
+    instrumentación no podía.
+
+    Compara con `_phonetic_ratio` (forced_align) para tolerar mishears.
+    Ventanas con menos de `min_window_words` palabras no se evalúan (sin
+    evidencia suficiente no se acusa a nadie)."""
+    from forced_align import _phonetic_ratio
+    ws = [w for w in (words or []) if isinstance(w, dict)]
+    if not ws:
+        return []
+    out = []
+    for i, s in enumerate(segments or []):
+        if not isinstance(s, dict):
+            continue
+        toks = _norm_tokens(s.get("text", ""))
+        if not toks:
+            continue
+        a, b = _f(s.get("start")), _f(s.get("end"))
+        win = [w for w in ws if a - pad <= _mid(w) <= b + pad]
+        if len(win) < min_window_words:
+            continue
+        win_toks = _norm_tokens(" ".join(str(w.get("word", "")) for w in win))
+        ratio = _phonetic_ratio(toks, win_toks)
+        if ratio < min_ratio:
+            out.append({"index": i, "start": round(a, 2), "end": round(b, 2),
+                        "ratio": round(ratio, 3)})
+    return out
+
+
 def summarize(segments, words) -> dict:
     """Resumen listo para loguear/persistir."""
     spans = uncovered_spans(segments, words)
     duraciones = [b - a for a, b, _ in spans]
+    mismatches = text_mismatches(segments, words)
     return {
         "audio_coverage": round(audio_coverage(segments, words), 4),
         "uncovered_spans": len(spans),
         "uncovered_seconds": round(sum(duraciones), 2),
         "worst_span_s": round(max(duraciones), 2) if duraciones else 0.0,
+        "text_mismatches": len(mismatches),
     }
