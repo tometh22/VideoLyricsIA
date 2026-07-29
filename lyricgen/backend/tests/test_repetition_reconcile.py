@@ -109,16 +109,23 @@ def test_decline_por_ambiguedad_entre_grupos():
     assert any(r == "run_ambigua_entre_grupos" for _, r in stats["declined"])
 
 
-def test_decline_por_demasiadas_huerfanas():
-    segs, asr = _fixture_real()
-    for ini in (212.5, 215.5):                    # 3 huérfanas en total
-        asr.extend(_words_de(CORO, ini, paso=0.28))
+def test_muchas_huerfanas_inserta_hasta_el_tope_por_mejor_ratio():
+    """Un outro repetitivo puede tener VARIAS ocurrencias huérfanas legítimas
+    (el caso real tiene 4). No se declina: se insertan las de mejor ratio
+    hasta _MAX_INSERTS_PER_GROUP, y la salida queda monótona."""
+    # 4 miembros cada 20s; el audio canta el coro TAMBIÉN entre medio y
+    # después: 6 ocurrencias huérfanas dentro del envolvente (1.5x cadencia).
+    miembros = [_seg(CORO, ini, ini + 3.4, ctc_lr=-0.05)
+                for ini in (100.0, 120.0, 140.0, 160.0)]
+    asr = [w for s in miembros for w in s["words"]]
+    for ini in (108.0, 128.0, 148.0, 168.0, 176.0, 184.0):
+        asr.extend(_words_de(CORO, ini))
     asr.sort(key=lambda w: w["start"])
-    out, stats = rr.reconcile(segs, asr)
-    ok = (stats["inserted"] == 0
-          and any(r == "demasiadas_huerfanas" for _, r in stats["declined"]))
-    merged_ok = stats["inserted"] <= rr._MAX_INSERTS_PER_GROUP
-    assert ok or merged_ok  # según cómo agrupe _runs, nunca más del tope
+    out, stats = rr.reconcile(miembros, asr)
+    assert stats["inserted"] == rr._MAX_INSERTS_PER_GROUP
+    assert any(r == "huerfanas_extra_recortadas" for _, r in stats["declined"])
+    starts = [s["start"] for s in out]
+    assert starts == sorted(starts)
 
 
 def test_grupos_chicos_no_participan():

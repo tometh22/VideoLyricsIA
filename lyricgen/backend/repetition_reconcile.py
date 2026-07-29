@@ -37,8 +37,9 @@ ad-libs. Por cada grupo de repetición con `>= min_group` miembros:
 
 DISEÑO DEFENSIVO
 ----------------
-Decline por defecto: ante ambigüedad (sub-región que suena a dos grupos,
-demasiadas huérfanas en un grupo, miembros no monótonos) no se toca nada.
+Decline por defecto: una sub-región que suena casi igual a dos grupos se
+saltea (no se sabe de quién es); miembros no monótonos declinan el grupo;
+con más huérfanas que el tope se insertan solo las de mejor ratio.
 Sin gates acústicos nuevos — el runbook de gap-transplant documenta que
 los discriminadores acústicos verso↔coro fallaron 3 veces; acá la
 evidencia es TEXTUAL (fonética) + TEMPORAL (envolvente del grupo), nunca
@@ -69,8 +70,12 @@ _RUN_MAX_S = 6.0
 _FLOAT_TOL_S = 1.0
 # Tier 2: outlier de confianza = ctc_lr < mediana del grupo − esto.
 _LR_OUTLIER_DELTA = 0.10
-# Máximo de inserts por grupo (v1 conservador: el caso real necesita 1-2).
-_MAX_INSERTS_PER_GROUP = 2
+# Máximo de inserts por grupo. El caso real ("Rodando Por Ahí") tiene 4
+# ocurrencias huérfanas legítimas en el outro — declinar por "demasiadas"
+# castigaría justo a las canciones con outro repetitivo, que son la clase
+# que motivó este módulo. Si hay más candidatas que el tope, se insertan
+# las de mejor ratio fonético; el resto queda para el editor.
+_MAX_INSERTS_PER_GROUP = 4
 
 
 def is_enabled() -> bool:
@@ -160,8 +165,12 @@ def _reconcile_inner(segments, asr_words, *, lead_s, hold_s, min_group,
         gid = s.get("repetition_group")
         if gid is not None:
             groups.setdefault(gid, []).append(s)
-    groups = {g: sorted(m, key=lambda s: _f(s.get("start")))
-              for g, m in groups.items() if len(m) >= min_group}
+    # Para ACTUAR se exige min_group; para el chequeo de ambigüedad
+    # participan TODOS los grupos (un texto que aparece 2 veces también
+    # puede ser el verdadero dueño de una región huérfana).
+    all_groups = {g: sorted(m, key=lambda s: _f(s.get("start")))
+                  for g, m in groups.items()}
+    groups = {g: m for g, m in all_groups.items() if len(m) >= min_group}
     stats["groups"] = len(groups)
     if not groups:
         return annotated, stats
@@ -180,8 +189,9 @@ def _reconcile_inner(segments, asr_words, *, lead_s, hold_s, min_group,
                                  "end": _f(run[-1].get("end")),
                                  "used": False})
 
-    # Ratio de cada run contra cada grupo (para el chequeo de ambigüedad).
-    group_tokens = {g: _tokens(m[0].get("text", "")) for g, m in groups.items()}
+    # Ratio de cada run contra cada grupo — TODOS, para la ambigüedad.
+    group_tokens = {g: _tokens(m[0].get("text", ""))
+                    for g, m in all_groups.items()}
     for run in all_runs:
         rt = _word_tokens(run["words"])
         run["ratios"] = {g: _phonetic_ratio(toks, rt)
@@ -216,17 +226,21 @@ def _reconcile_inner(segments, asr_words, *, lead_s, hold_s, min_group,
                 continue
             others = [r for g, r in run["ratios"].items() if g != gid]
             if others and max(others) > mine - _AMBIG_MARGIN:
+                # Esta run suena casi igual a otro grupo: no sabemos de
+                # quién es → se saltea ESA run, no el grupo entero.
                 stats["declined"].append((gid, "run_ambigua_entre_grupos"))
-                cands = []
-                break
+                continue
             if len(run["words"]) < max(2, int(0.6 * len(toks))):
                 continue
             cands.append(run)
         if not cands:
             continue
         if len(cands) > _MAX_INSERTS_PER_GROUP:
-            stats["declined"].append((gid, "demasiadas_huerfanas"))
-            continue
+            cands = sorted(cands,
+                           key=lambda r: -r["ratios"].get(gid, 0.0)
+                           )[:_MAX_INSERTS_PER_GROUP]
+            cands.sort(key=lambda r: r["start"])
+            stats["declined"].append((gid, "huerfanas_extra_recortadas"))
 
         # ── Tier 2 primero: reasignar miembros flotantes ─────────────────
         # Corre ANTES del insert a propósito: si un miembro flota y hay
