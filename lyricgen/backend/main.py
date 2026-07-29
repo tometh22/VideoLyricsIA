@@ -5470,6 +5470,40 @@ async def _run_transcription_for_job(
                 out["coverage_warning"] = True
             if extra:
                 out.update(extra)
+
+            # Cobertura contra el AUDIO en el punto de salida de la cascada.
+            # Toda métrica previa se mide contra la letra de REFERENCIA y por
+            # eso SUBE cuando la referencia viene recortada (un job reportaba
+            # 100 % teniendo el 39 % del canto sin letra). Ésta sólo puede
+            # bajar si se pierde canto. Se mide en el único exit point, así
+            # queda registrada para TODAS las ramas — no dentro de una sola,
+            # que fue el error de diagnóstico original.
+            #
+            # Sólo observabilidad: no gatea ni altera el resultado. Las
+            # palabras crudas viajan en `_asr_words` para que el worker pueda
+            # re-medir tras los post-pases (CTC / adlib / formatter) y
+            # atribuir la pérdida a la etapa que la produjo.
+            try:
+                _asr_words = [w for s in (_wx_segs or [])
+                              for w in (s.get("words") or [])
+                              if isinstance(w, dict)]
+            except NameError:
+                _asr_words = []
+            if _asr_words:
+                try:
+                    from audio_coverage import summarize as _cov_summary
+                    _c = _cov_summary(polished, _asr_words)
+                    out["audio_coverage"] = _c["audio_coverage"]
+                    out["_asr_words"] = _asr_words
+                    _log = (logger.warning if _c["audio_coverage"] < 0.8
+                            else logger.info)
+                    _log("[COVERAGE] cascada source=%s cobertura_audio=%.0f%% "
+                         "zonas_sin_letra=%d (%.1fs, peor %.1fs) job=%s",
+                         source, _c["audio_coverage"] * 100,
+                         _c["uncovered_spans"], _c["uncovered_seconds"],
+                         _c["worst_span_s"], job_id)
+                except Exception as e:  # nunca romper la transcripción
+                    logger.warning("[COVERAGE] no se pudo medir: %r", e)
             return out
 
         async def _get_align_audio() -> str:
