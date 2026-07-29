@@ -21,7 +21,8 @@ Métricas por job (todas estructurales, cero subjetivas):
   pal.med     palabras por cartel (objetivo Rotor: ~5,8)
   huérf       carteles de 1-2 palabras generados por el pipeline
   vacíos      carteles sin texto (el defecto b3a51559)
-  dup         líneas adyacentes idénticas
+  dup         líneas adyacentes idénticas (informativo: los estribillos se
+              repiten legítimamente — NO cuenta como falla)
   voz s/letra segundos de canto sin cartel según VAD del stem (de logs)
   breaker     si el circuit breaker marcó el job
 
@@ -86,7 +87,11 @@ def score(rows: list[tuple], tags: dict, logmap: dict) -> int:
         L = logmap.get(jid, {})
         vg = L.get("voiced_gap_s")
         br = L.get("breaker", False)
-        estructural = vac > 0 or dup > 0 or (vg is not None and vg >= 10)
+        # dup NO es falla: un coro repetido produce líneas adyacentes
+        # idénticas legítimas (medido: la testigo sana tiene 7). El defecto
+        # b3a51559 eran duplicados CON hueco/vacío entre medio — eso ya lo
+        # capturan `vacíos` y `voz s/letra`.
+        estructural = vac > 0 or (vg is not None and vg >= 10)
         fallas += 1 if estructural else 0
         print(f"{tag:32} {len(sj):4d} {st.median(pal):7.1f} {huerf:5d} "
               f"{vac:6d} {dup:4d} {str(vg if vg is not None else '?'):>11} "
