@@ -95,7 +95,8 @@ def test_summarize_es_serializable_y_completo():
     words = _palabras(10, 20) + _palabras(60, 80)
     s = summarize([_seg(9.5, 20.5)], words)
     assert set(s) == {"audio_coverage", "uncovered_spans",
-                      "uncovered_seconds", "worst_span_s", "text_mismatches"}
+                      "uncovered_seconds", "worst_span_s", "text_mismatches",
+                      "voiced_gaps", "voiced_gap_s"}
     assert all(isinstance(v, (int, float)) for v in s.values())
     assert s["uncovered_spans"] == 1
     assert 18 <= s["worst_span_s"] <= 21
@@ -174,3 +175,67 @@ def test_summarize_incluye_text_mismatches():
     seg = [{"start": 10.0, "end": 13.5, "text": "otra cosa totalmente distinta aqui"}]
     s = summarize(seg, words)
     assert s["text_mismatches"] == 1
+
+
+# ── voiced_gaps: el guardrail que no depende del ASR ──────────────────────
+
+def _mock_vad(monkeypatch, regiones):
+    import anchor_align
+    monkeypatch.setattr(anchor_align, "vocal_regions", lambda *a, **k: regiones)
+
+
+def test_voiced_gap_detecta_canto_sin_cartel(monkeypatch, tmp_path):
+    """El caso dcf773b5: hueco de 30s entre carteles, el stem canta ahí,
+    audio_coverage no lo veía (el ASR estaba sordo). Este sí."""
+    from audio_coverage import voiced_gaps
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"x")
+    _mock_vad(monkeypatch, [(215.0, 229.0)])         # canto real en el hueco
+    segs = [_seg(180, 209), _seg(240, 250)]
+    got = voiced_gaps(segs, str(stem))
+    assert len(got) == 1
+    assert got[0]["voiced_s"] == 14.0
+
+
+def test_voiced_gap_ignora_hueco_instrumental(monkeypatch, tmp_path):
+    """Un solo de guitarra de 30s NO es letra faltante: el VAD del stem no
+    marca voz ahí."""
+    from audio_coverage import voiced_gaps
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"x")
+    _mock_vad(monkeypatch, [(100.0, 200.0)])         # voz solo FUERA del hueco
+    segs = [_seg(100, 209), _seg(240, 250)]
+    assert voiced_gaps(segs, str(stem)) == []
+
+
+def test_voiced_gap_sin_stem_no_acusa(monkeypatch):
+    from audio_coverage import voiced_gaps
+    assert voiced_gaps([_seg(10, 20), _seg(60, 70)], None) == []
+
+
+def test_voiced_gap_vad_vacio_no_acusa(monkeypatch, tmp_path):
+    """Stem ilegible / librosa ausente → vocal_regions devuelve [] → sin
+    evidencia no se acusa."""
+    from audio_coverage import voiced_gaps
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"x")
+    _mock_vad(monkeypatch, [])
+    assert voiced_gaps([_seg(10, 20), _seg(60, 70)], str(stem)) == []
+
+
+def test_voiced_gap_cola_final(monkeypatch, tmp_path):
+    """La cola también cuenta: canto después del último cartel."""
+    from audio_coverage import voiced_gaps
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"x")
+    _mock_vad(monkeypatch, [(205.0, 260.0)])
+    got = voiced_gaps([_seg(10, 200)], str(stem), audio_duration=278.0)
+    assert len(got) == 1 and got[0]["voiced_s"] > 50
+
+
+def test_summarize_incluye_voiced_gap(monkeypatch, tmp_path):
+    from audio_coverage import summarize
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"x")
+    _mock_vad(monkeypatch, [(30.0, 50.0)])
+    words = _palabras(10, 20)
+    s = summarize([_seg(9.5, 20.5), _seg(60, 70)], words, stem_path=str(stem))
+    assert s["voiced_gaps"] == 1
+    assert s["voiced_gap_s"] == 20.0
+    # y las claves viejas siguen (compat con el log)
+    assert "audio_coverage" in s and "text_mismatches" in s
