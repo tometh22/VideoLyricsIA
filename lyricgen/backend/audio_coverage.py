@@ -147,15 +147,54 @@ def text_mismatches(segments, words, *, min_ratio: float = 0.4,
     return out
 
 
-def summarize(segments, words) -> dict:
+def voiced_gaps(segments, stem_path: str | None, *,
+                audio_duration: float | None = None,
+                min_gap_s: float = 12.0,
+                min_voiced_s: float = 3.0) -> list[dict]:
+    """Huecos entre carteles que contienen CANTO según el VAD del stem.
+
+    Es el guardrail que la cobertura por palabras no puede dar: `audio_coverage`
+    mide contra lo que el ASR oyó, así que un punto sordo del ASR le resulta
+    invisible — el job dcf773b5 reportó `zonas_sin_letra=0` con un hueco de
+    30,7 s cantado en pantalla. El stem no depende del ASR: energía en el stem
+    aislado = alguien canta ahí. Si un hueco entre carteles se solapa con
+    regiones de voz del stem por más de `min_voiced_s`, ese hueco es letra
+    faltante, no un respiro instrumental.
+
+    Devuelve [{"start", "end", "voiced_s"}] por hueco culpable. [] si no hay
+    stem o librosa (nunca acusa sin evidencia). Never raises."""
+    if not stem_path:
+        return []
+    try:
+        from anchor_align import vocal_regions
+        from gap_rescue import find_gaps
+        regs = vocal_regions(stem_path)
+        if not regs:
+            return []
+        out = []
+        for a, b in find_gaps(segments, audio_duration, min_gap_s=min_gap_s):
+            voiced = sum(max(0.0, min(b, rb) - max(a, ra)) for ra, rb in regs)
+            if voiced >= min_voiced_s:
+                out.append({"start": round(a, 2), "end": round(b, 2),
+                            "voiced_s": round(voiced, 2)})
+        return out
+    except Exception:
+        return []
+
+
+def summarize(segments, words, *, stem_path: str | None = None,
+              audio_duration: float | None = None) -> dict:
     """Resumen listo para loguear/persistir."""
     spans = uncovered_spans(segments, words)
     duraciones = [b - a for a, b, _ in spans]
     mismatches = text_mismatches(segments, words)
+    vg = voiced_gaps(segments, stem_path, audio_duration=audio_duration)
     return {
         "audio_coverage": round(audio_coverage(segments, words), 4),
         "uncovered_spans": len(spans),
         "uncovered_seconds": round(sum(duraciones), 2),
         "worst_span_s": round(max(duraciones), 2) if duraciones else 0.0,
         "text_mismatches": len(mismatches),
+        "voiced_gaps": len(vg),
+        "voiced_gap_s": round(sum(g["voiced_s"] for g in vg), 2),
     }

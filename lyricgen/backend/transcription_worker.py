@@ -66,29 +66,59 @@ def _coverage_de(r) -> float | None:
         return None
 
 
-def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None):
+def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
+                           audio_path: str = ""):
     """Loguea la cobertura final y la compara con la de la cascada y la
     previa al formateador. Saca `_asr_words` del result (transporte interno:
-    no se persiste ni llega al cliente). Nunca levanta."""
+    no se persiste ni llega al cliente). Nunca levanta.
+
+    Con `audio_path` y stem cacheado disponible, agrega el guardrail
+    definitivo `voiced_gaps`: huecos entre carteles cruzados contra el VAD
+    del stem. Es la métrica que la cobertura por palabras no puede dar — un
+    punto sordo del ASR le es invisible (dcf773b5 reportó zonas_sin_letra=0
+    con 30,7s de canto sin cartel en pantalla)."""
     if not isinstance(r, dict):
         return r
+    _stem = None
     try:
         words = r.get("_asr_words")
         if words:
             from audio_coverage import summarize
-            c = summarize(r.get("segments") or [], words)
+            _dur = None
+            if audio_path and os.path.exists(audio_path):
+                try:
+                    from pipeline import _audio_duration
+                    _dur = _audio_duration(audio_path)
+                    import vocal_sep as _vs
+                    _stem = _vs.separate_vocals(audio_path, cache_only=True)
+                except Exception as e:
+                    logger.info("[COVERAGE] sin stem para voiced_gaps (%r)", e)
+            c = summarize(r.get("segments") or [], words,
+                          stem_path=_stem, audio_duration=_dur)
             cascada = r.get("audio_coverage")
             final = c["audio_coverage"]
             r["audio_coverage"] = final
             log = logger.warning if final < 0.8 else logger.info
             log("[COVERAGE] final=%.0f%% (cascada=%s, pre-formatter=%s) "
                 "zonas_sin_letra=%d (%.1fs, peor %.1fs) "
-                "carteles_texto_equivocado=%d job=%s",
+                "carteles_texto_equivocado=%d huecos_con_voz=%d (%.1fs) job=%s",
                 final * 100,
                 f"{cascada * 100:.0f}%" if cascada is not None else "?",
                 f"{antes_fmt * 100:.0f}%" if antes_fmt is not None else "?",
                 c["uncovered_spans"], c["uncovered_seconds"],
-                c["worst_span_s"], c.get("text_mismatches", 0), job_id)
+                c["worst_span_s"], c.get("text_mismatches", 0),
+                c.get("voiced_gaps", 0), c.get("voiced_gap_s", 0.0), job_id)
+            # Circuit breaker: canto sin cartel según el VAD del stem → el
+            # job sale con bandera, nunca en silencio. Peor caso acotado.
+            _warn_s = float(os.environ.get("VOICED_GAP_WARN_S", "10"))
+            if c.get("voiced_gap_s", 0.0) >= _warn_s:
+                r["coverage_warning"] = True
+                r["voiced_gap_s"] = c["voiced_gap_s"]
+                logger.warning(
+                    "[COVERAGE] CIRCUIT BREAKER: %.1fs de CANTO sin cartel "
+                    "según el VAD del stem — el job sale marcado para "
+                    "revisión, no en silencio job=%s",
+                    c["voiced_gap_s"], job_id)
             # Carteles que no dicen lo que se canta: la dimensión que la
             # cobertura no ve (el usuario detectó a ojo 2 en un job con
             # 76 % de cobertura). Detalle por línea para diagnóstico.
@@ -120,6 +150,11 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None):
     finally:
         if isinstance(r, dict):
             r.pop("_asr_words", None)
+        if _stem:
+            try:
+                os.unlink(_stem)
+            except OSError:
+                pass
     return r
 
 
@@ -227,7 +262,7 @@ def run_transcription_job(
             from lyrics_format import format_lyrics_pass as _fmt
             _antes = _coverage_de(r)
             r = await _fmt(r, language=language or "es")
-            return _medir_cobertura_final(r, job_id, _antes)
+            return _medir_cobertura_final(r, job_id, _antes, audio_path)
 
         result = asyncio.run(_run_with_retime())
     except Exception as e:
