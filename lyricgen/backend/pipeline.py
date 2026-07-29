@@ -9299,6 +9299,41 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             "no camera move. Make the first and last frame loop seamlessly. "
             f"{no_alley}{_base_negatives}"
         )
+    elif image_path:
+        # Image-to-video ("Animar con AI" sobre una foto SUBIDA por el
+        # operador, sin foto_viva). A diferencia de text-to-video NO
+        # generamos una escena ni inyectamos el filler atmosférico que Veo
+        # mete por default (humo + papeles/hojas volando) — la queja #1
+        # (render obelisco, 2026-07-29: "el sesgo de siempre del humo y esos
+        # papeles volando que no tienen nada que ver"). A diferencia de
+        # live_photo (UN solo sujeto) acá animamos VARIOS elementos reales de
+        # la foto (bandera, pájaros, semáforo, luces del auto, agua, follaje),
+        # siempre con cámara clavada y sin agregar nada que no esté en la foto.
+        _i2v_operator = f"{prompt}. " if (verbatim and prompt.strip()) else ""
+        safe_prompt = (
+            f"{_i2v_operator}"
+            "Animate this photograph as a living cinemagraph. PRESERVE the "
+            "supplied image EXACTLY — identical composition, framing, colors, "
+            "lighting and every object; add NOTHING that is not already "
+            "visible. The camera is completely LOCKED (no pan, tilt, zoom, "
+            "dolly, push-in, parallax or drift). Bring the scene to life using "
+            "ONLY the natural motion of elements ALREADY PRESENT in the photo: "
+            "flags and fabric rippling in the breeze, a few birds gliding "
+            "across the sky, vehicles easing along with their head/brake/turn "
+            "lights and the traffic lights blinking on and off, water and "
+            "wet-street reflections shimmering, trees and foliage swaying "
+            "gently, clouds drifting slowly, distant people walking naturally, "
+            "sunlight glinting off surfaces. Every motion must originate from "
+            "an object that is visible in the photo. "
+            # El sesgo exacto a matar (obelisco 2026-07-29): humo + papeles.
+            "STRICTLY DO NOT ADD anything that is not in the photo: no smoke, "
+            "no haze, no fog, no mist, no dust, no embers, no sparks, no "
+            "floating particles, no flying papers, no falling leaves or petals, "
+            "no confetti, no debris, no rain or snow unless already visible. No "
+            "new objects, no morphing, no scene change, no camera move. Subtle, "
+            "photorealistic, seamless loop. "
+            f"{no_alley}{_base_negatives}{_camera_negatives}"
+        )
     elif _norm_move == "animado":
         # Cartoon / 2D illustration aesthetic — keep all safety clauses
         # except the "no CGI / no animation" pair, which would directly
@@ -11584,17 +11619,36 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     # short-circuit condition in _get_unique_prompt.
     _is_verbatim = bool(bg_verbatim and background_hint and background_hint.strip())
 
-    # Generate video background with Veo 3 (always video, no images)
-    result = _get_unique_prompt(
-        lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
-        concept=concept, movement_style=movement_style, match_lyrics=match_lyrics,
-        background_hint=background_hint,
-        bg_verbatim=bg_verbatim,
-        palette_style=style_hint, custom_colors=custom_colors,
-        allow_people=allow_people, creative_mode=creative_mode,
-        atmospherics_policy=atmospherics_policy,
+    # Image-to-video ("Animar con AI" sobre una foto subida): NO generamos una
+    # escena de cero. El prompt de escena de _get_unique_prompt — sobre todo el
+    # branch estatico, que EXIGE "≥3 fuentes de movimiento" con ejemplos
+    # genéricos (dust motes, falling petals, drifting clouds) — hacía que Veo le
+    # metiera humo + papeles/hojas volando a la foto del operador (queja #1,
+    # obelisco 2026-07-29). Para i2v el prompt es MOTION-ONLY (ver la rama
+    # `elif image_path` en _generate_veo_video): solo pasamos el texto del
+    # operador si escribió el suyo ("mi prompt manda"), y un descriptor neutro
+    # si no. Evita además el costo del Gemini de escena que no se usaría.
+    _i2v_animate = bool(
+        image_to_video_path and not _live_photo
+        and os.path.exists(image_to_video_path)
     )
-    prompt = result["prompt"]
+    if _i2v_animate:
+        prompt = (
+            (background_hint or "").strip() if _is_verbatim
+            else "Cinemagraph: animate only the real elements already visible in the uploaded photo"
+        )
+    else:
+        # Generate video background with Veo 3 (always video, no images)
+        result = _get_unique_prompt(
+            lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
+            concept=concept, movement_style=movement_style, match_lyrics=match_lyrics,
+            background_hint=background_hint,
+            bg_verbatim=bg_verbatim,
+            palette_style=style_hint, custom_colors=custom_colors,
+            allow_people=allow_people, creative_mode=creative_mode,
+            atmospherics_policy=atmospherics_policy,
+        )
+        prompt = result["prompt"]
 
     bg_path = os.path.join(job_dir, "bg_generated.mp4")
     import time as _time_bg
