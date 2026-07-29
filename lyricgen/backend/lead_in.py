@@ -39,15 +39,38 @@ logger = logging.getLogger("genly.lead_in")
 # la línea queda donde estaba — el bias solo actúa donde hay aire.
 _MIN_GAP_S = 0.01
 
+# Tope duro del lead. Tres calibraciones independientes convergen en que
+# un lead grande se percibe como DESincronización, no como anticipación:
+#   - whisperx_transcribe.py bajó su lead de 120→80ms (2026-05-31) porque
+#     los revisores UMG leían 120ms como "la línea cae antes que la voz".
+#   - Rotor, medido línea-a-línea contra el job 6f4047db (28-07): sus
+#     carteles aparecen ~0.07s antes del onset — no 0.4.
+#   - El usuario reportó "partes mal sincronizadas" con staging en 0.4;
+#     el desfase medido contra Rotor era exactamente el lead (−0.33s
+#     sistemático en 17 líneas).
+# El sweep del docstring (mediana de ajuste manual −0.41s) midió a los
+# operadores corrigiendo el output SIN lead — incluye compensar retardo
+# del aligner, no es un target de lead puro. Valores arriba del cap se
+# clampean con warning en vez de aceptarse en silencio: 0.4 en staging
+# fue exactamente ese footgun.
+_MAX_LEAD_S = 0.15
+
 
 def lead_seconds() -> float:
-    """Lead configurado, saneado. 0 (default) = apagado; negativos = 0."""
+    """Lead configurado, saneado. 0 (default) = apagado; negativos = 0;
+    valores por encima de `_MAX_LEAD_S` se clampean (con warning)."""
     raw = os.environ.get("LYRIC_LEAD_IN_S", "0")
     try:
-        return max(0.0, float(raw))
+        lead = max(0.0, float(raw))
     except (TypeError, ValueError):
         logger.warning("[LEAD_IN] LYRIC_LEAD_IN_S=%r inválido — apagado", raw)
         return 0.0
+    if lead > _MAX_LEAD_S:
+        logger.warning("[LEAD_IN] LYRIC_LEAD_IN_S=%.2f excede el tope %.2f — "
+                       "clampeado (leads grandes se perciben como "
+                       "desincronización)", lead, _MAX_LEAD_S)
+        return _MAX_LEAD_S
+    return lead
 
 
 def hold_seconds() -> float:
