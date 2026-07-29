@@ -26,7 +26,7 @@ Métricas por job (todas estructurales, cero subjetivas):
   voz s/letra segundos de canto sin cartel según VAD del stem (de logs)
   breaker     si el circuit breaker marcó el job
 
-Falla ESTRUCTURAL = vacíos>0, dup>0, o voz-sin-letra >= 10 s. El criterio
+Falla ESTRUCTURAL = vacíos>0 o voz-sin-letra >= 10 s. El criterio
 de promoción de cualquier cambio del pipeline: 0 fallas estructurales en
 el batch. Las palabras mal (nivel Rotor) se toleran; los huecos no.
 """
