@@ -414,6 +414,22 @@ export default function UploadZone({
   const [batchDefaults, setBatchDefaults] = useState(loadStoredBatchDefaults);
   const batchDefaultsRef = useRef(batchDefaults);
   useEffect(() => { batchDefaultsRef.current = batchDefaults; }, [batchDefaults]);
+  // Telemetría 2026-07-29 (incidente "elegí Estático y salió Animado ilustrado",
+  // job fef30a2434d0): registramos qué movimiento/efecto le ENTREGÓ el sticky de
+  // localStorage al arrancar el batch. Junto con "wizard.style_pick" (cada pick
+  // explícito, en updateBatchDefault) permite distinguir "heredado en silencio"
+  // de "elegido en esta sesión" — hoy el origen del movement_style era una caja
+  // negra y no se pudo diagnosticar el incidente. Solo en creación: en edición/
+  // variante los controles se siembran del job, no del sticky.
+  useEffect(() => {
+    if (editMode) return;
+    const bd = batchDefaultsRef.current;
+    track("wizard.sticky_restored", {
+      movement_style: bd.movementStyle || "",
+      effect: bd.effect || "",
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // UI v1.1 (2026-05-30): which face of the preview is showing on the
   // central sticky slot — the lyric (default) or the title card. We
@@ -496,6 +512,15 @@ export default function UploadZone({
   // setter without juggling refs.
 
   const updateBatchDefault = (field, value) => {
+    // Telemetría del incidente animado/estático (ver "wizard.sticky_restored"):
+    // logueamos cada pick EXPLÍCITO de los dos ejes que cruzan la frontera
+    // realista→ilustrado. Todos los callers de estos dos campos son acciones de
+    // usuario (galería de movimiento :1961, galería de efecto :3854, chooseEffect
+    // foto_viva, apply-preset); el seed de edición usa setBatchDefaults directo,
+    // así que no genera falsos "pick".
+    if (field === "movementStyle" || field === "effect") {
+      track("wizard.style_pick", { field, value });
+    }
     setBatchDefaults((prev) => {
       const next = { ...prev, [field]: value };
       // El sticky es para BATCHES NUEVOS. Editar un video existente no puede
