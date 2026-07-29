@@ -16173,6 +16173,10 @@ def run_edit_pipeline(
         # timeline is never identity-bound to that plan and cannot inherit its
         # validation shortcut.
         _scene_timeline_from_current_clips = False
+        # True cuando un fondo custom (edit_type="custom") se animó con Veo
+        # image-to-video → provenance AI-derived (aplica validación). Sin
+        # animar es human-provided. Se resuelve dentro de la rama custom.
+        _animate_custom = False
         if edit_type in ("typography", "lyrics", "metadata"):
             # All three reuse the cached background — only the foreground
             # layer changes. Lyrics edit ALSO swaps the segments, and
@@ -16422,6 +16426,89 @@ def run_edit_pipeline(
             _pending_background_recache = True
             update_job(job_id, progress=35)
 
+        elif edit_type == "custom":
+            # Fondo subido por el operador en el wizard de EDICIÓN ("Subir
+            # el mío", restaurada tras #970). El archivo ya vive en R2
+            # (POST /edit/{job}/custom-background, multipart) — acá lo
+            # materializamos y, si pidió "Animar con AI" sobre una imagen
+            # fija, lo pasamos por Veo image-to-video (mismo seam que
+            # create-time). Sin animar = human-provided (sin costo Veo).
+            # Como el fondo único, nunca en jobs multi-escena.
+            if scene_plan and scene_plan.get("scenes"):
+                raise RuntimeError(
+                    "custom background edit no soportado en jobs multi-escena — "
+                    "regenerar escenas individuales (edit_type='scene')."
+                )
+            _cbg = edit_params.get("custom_bg") or {}
+            _cbg_r2 = _cbg.get("bg_r2_key")
+            _cbg_ext = os.path.splitext(_cbg_r2 or "")[1].lower() or ".mp4"
+            _cbg_local = os.path.join(job_dir, f"bg_custom_edit{_cbg_ext}")
+            if not os.path.exists(_cbg_local):
+                if _cbg_r2 and storage.is_enabled():
+                    if not storage.download_object(_cbg_r2, _cbg_local):
+                        raise RuntimeError(
+                            f"Could not download custom background {_cbg_r2!r} from R2"
+                        )
+                else:
+                    raise RuntimeError(
+                        f"custom background edit sin asset alcanzable (bg_r2_key={_cbg_r2!r})"
+                    )
+            # "Animar con AI" solo aplica a imágenes fijas (.jpg/.png); un
+            # video subido ya es video. Mismo criterio que create-time.
+            _cbg_is_still = _cbg_local.lower().endswith((".jpg", ".jpeg", ".png"))
+            _animate_custom = bool(_cbg.get("animate_image") and _cbg_is_still)
+            if not _animate_custom:
+                # Usar tal cual: imagen fija (Ken Burns aguas abajo) o video
+                # ya listo. Human-provided → sin Veo, sin validación IA.
+                update_job(job_id, status="editing", current_step="video", progress=30)
+                bg_image_path = _cbg_local
+            else:
+                # Animar la imagen del usuario con Veo image-to-video (mismo
+                # seam que create-time, pipeline.py ~1398). Provenance =
+                # AI-derived → la validación Universal corre normalmente.
+                update_job(job_id, status="editing", current_step="background", progress=22)
+                lyrics_text = " ".join(
+                    str(seg.get("text") or "") for seg in segments
+                    if isinstance(seg, dict)
+                )
+                try:
+                    bg_image_path = _ensure_background(
+                        style, job_dir,
+                        lyrics_text=lyrics_text, artist=artist, job_id=job_id,
+                        song_title=song_title, genre=genre, concept=concept,
+                        movement_style=movement_style,
+                        image_to_video_path=_cbg_local,
+                        background_hint=effective_background_hint,
+                        bg_mode=background_mode,
+                        bg_verbatim=bg_verbatim,
+                        effect=effect,
+                        match_lyrics=effective_match_lyrics,
+                        allow_people=_compute_allow_people(job_id, effective_background_hint),
+                    )
+                except Exception as _custom_anim_error:
+                    _raise_if_job_timeout(_custom_anim_error)
+                    # Si Veo falla, caer a la imagen fija con Ken Burns (mismo
+                    # fallback que create-time) en vez de romper el edit.
+                    logger.error(
+                        "[EDIT] custom image-to-video falló job=%s; uso la imagen "
+                        "fija con Ken Burns: %s", job_id, _custom_anim_error,
+                    )
+                    bg_image_path = _cbg_local
+                    _animate_custom = False
+                if _animate_custom and (not bg_image_path or not os.path.exists(bg_image_path)):
+                    logger.warning(
+                        "[EDIT] custom image-to-video sin salida — fallback Ken Burns %s",
+                        _cbg_local,
+                    )
+                    bg_image_path = _cbg_local
+                    _animate_custom = False
+            bg_prelooped = False
+            # El fondo subido pasa a ser el DURABLE del job (espeja library):
+            # el recache post-render actualiza bg_r2_key_cached y los edits
+            # de tipografía/lyrics posteriores lo reusan.
+            _pending_background_recache = True
+            update_job(job_id, progress=35)
+
         else:
             raise ValueError(f"Unknown edit_type {edit_type!r}")
 
@@ -16442,6 +16529,11 @@ def run_edit_pipeline(
             # provided: NO generado por IA (cambia el short-circuit de
             # validación Universal y la provenance del deliverable).
             False if edit_type == "background_library" else
+            # Fondo custom: tal cual = human-provided (False); animado con
+            # Veo image-to-video = AI-derived (True), igual que create-time
+            # (_background_source_is_ai animate_image=True). Esto habilita
+            # la validación Universal sobre la salida de Veo.
+            (True if _animate_custom else False) if edit_type == "custom" else
             bool(_stored_background_ai_generated)
         )
         _edit_safety_policy = _background_safety_policy(

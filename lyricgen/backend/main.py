@@ -2648,13 +2648,22 @@ def _validate_background_file_on_disk(filename: str, path: str) -> None:
             _reject("File does not look like a valid MP4/MOV (magic bytes check failed).")
 
 
-def _save_custom_background(background_file, job_dir: str, job_id: str, tenant_id: str):
+def _save_custom_background(background_file, job_dir: str, job_id: str, tenant_id: str,
+                            persist_cache: bool = True):
     """Materializa el fondo subido por el usuario: valida (extensión +
     magic bytes + tamaño), escribe a disco, sube a R2 y — clave del fix
     2026-06-11 — persiste la key en `bg_r2_key_cached` para que los edits
     rápidos y /retry preserven el archivo del usuario en vez de
     regenerar con Veo. Devuelve (bg_path, bg_r2_key) o (None, None) si
-    no vino archivo."""
+    no vino archivo.
+
+    persist_cache=False lo usa el upload de fondo custom en EDICIÓN
+    (POST /edit/{job}/custom-background): ahí el archivo aún no es el
+    fondo durable — el job ya tiene un video renderizado con el fondo
+    viejo, y bg_r2_key_cached recién debe apuntar al nuevo DESPUÉS de que
+    el edit re-renderice y valide (vía _pending_background_recache, igual
+    que background_library). Persistirlo antes haría que un edit de
+    tipografía posterior reusara un fondo que el operador nunca aprobó."""
     if not (background_file and background_file.filename):
         return None, None
     bg_ext = os.path.splitext(background_file.filename)[1].lower()
@@ -2676,7 +2685,7 @@ def _save_custom_background(background_file, job_dir: str, job_id: str, tenant_i
     bg_r2_key = None
     if storage.is_enabled():
         bg_r2_key = storage.upload_input(bg_path, tenant_id, job_id, bg_filename)
-        if bg_r2_key:
+        if bg_r2_key and persist_cache:
             # El archivo humano YA vive en R2: esa misma key habilita el
             # fast-path de edits (gate en request_edit) y la preservación
             # en /retry (preserved_bg_r2_key) desde el minuto cero. Si el
@@ -9422,6 +9431,20 @@ class EditJobRequest(BaseModel):
     # 2026-07-08, job eaff5c7baf50: 3 regens sin control y sin salida a
     # biblioteca). Required for that edit_type; ignored otherwise.
     background_id: int | None = Field(default=None)
+    # Fondo subido por el operador para edit_type=="custom": restaura en el
+    # wizard de EDICIÓN la opción "Subir el mío" que #970 ocultó (el backend
+    # /edit no tenía este edit_type → no-op silencioso). El body de /edit es
+    # JSON y no puede transportar bytes, así que el browser sube el archivo a
+    # R2 vía POST /edit/{job}/custom-background (multipart) y manda acá la key
+    # devuelta. El worker la baja y la usa tal cual (human-provided) o —si
+    # animate_image y es imagen fija— la anima con Veo image-to-video (mismo
+    # seam que create-time). Requerido para ese edit_type; ignorado si no.
+    custom_background_r2_key: str | None = Field(default=None, max_length=512)
+    # "Animar con AI" sobre la imagen subida (solo imágenes fijas). Espeja el
+    # flag animate_image de /generate. Provenance: la imagen animada por Veo
+    # se clasifica como AI-derived (aplica validación Universal), igual que en
+    # create-time (_background_source_is_ai animate_image=True → True).
+    animate_image: bool = Field(default=False)
     # FX layer + lyric animations chosen in the wizard. Added 2026-05-22:
     # antes el operador no podía cambiarlos post-upload y, peor, los
     # whitelists de /retry y /variant los descartaban silenciosamente.
@@ -10497,6 +10520,87 @@ async def reanchor_segments(
     }
 
 
+@app.post("/edit/{job_id}/custom-background")
+@limiter.limit("30/minute")
+async def upload_edit_custom_background(
+    request: Request,
+    job_id: str,
+    background_file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Sube un fondo custom para un job en pending_review y devuelve su R2 key.
+
+    Paso multipart previo al POST /edit/{job_id} con edit_type="custom".
+    El body de /edit es JSON y no puede llevar bytes, así que el browser
+    primero sube el archivo acá (mismo mecanismo que create-time:
+    _save_custom_background valida extensión + magic-bytes + tamaño y lo
+    guarda en inputs/{tenant}/{job}/bg_custom.*), recibe la key y la manda
+    en custom_background_r2_key. NO toca bg_r2_key_cached (persist_cache=
+    False): ese fondo recién pasa a ser el durable cuando el edit
+    re-renderiza y valida.
+
+    Restaura la opción "Subir el mío" que #970 ocultó en el wizard de
+    edición porque el backend no la soportaba.
+    """
+    from database import Job as JobModel
+
+    _q = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        _q = _q.filter(JobModel.tenant_id == current_user["tenant_id"])
+    job = _q.first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    _audit_cross_tenant_access(db, current_user, job, "edit")
+    if job.status != "pending_review":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Custom background upload requires the job to be in "
+                f"pending_review (current: {job.status})"
+            ),
+        )
+    # Mismo guard que background/background_library: un fondo único pisaría
+    # el timeline multi-escena cacheado (ver request_edit / incidente
+    # 2026-07-01).
+    _sp = job.scene_plan if isinstance(job.scene_plan, dict) else None
+    if _sp and _sp.get("scenes"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Este video usa Escenas: regenerá la escena desde el "
+                "filmstrip en vez de subir un fondo único."
+            ),
+        )
+    if not storage.is_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="Los fondos custom requieren object storage (R2).",
+        )
+
+    _job_dir = os.path.join(OUTPUTS_DIR, job_id)
+    os.makedirs(_job_dir, exist_ok=True)
+    # tenant del JOB (no del caller): un admin de plataforma editando el
+    # job de otro tenant debe dejar el archivo bajo el namespace del dueño,
+    # para que la key valide contra inputs/{job.tenant_id}/{job}/ en /edit.
+    _bg_path, _bg_r2_key = _save_custom_background(
+        background_file, _job_dir, job_id, job.tenant_id, persist_cache=False,
+    )
+    if not _bg_r2_key:
+        raise HTTPException(
+            status_code=503,
+            detail="No se pudo subir el fondo custom a storage.",
+        )
+    logger.info("[EDIT] custom bg subido job=%s key=%s por user=%s",
+                job_id, _bg_r2_key, current_user["id"])
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "bg_r2_key": _bg_r2_key,
+        "filename": _safe_basename(background_file.filename or ""),
+    }
+
+
 @app.post("/edit/{job_id}")
 async def request_edit(
     job_id: str,
@@ -10569,7 +10673,7 @@ async def request_edit(
                 "progress": job.progress,
             },
         )
-    valid_edit_types = ("typography", "background", "background_library", "lyrics", "metadata")
+    valid_edit_types = ("typography", "background", "background_library", "lyrics", "metadata", "custom")
     if body.edit_type not in valid_edit_types:
         raise HTTPException(
             status_code=400,
@@ -10580,6 +10684,14 @@ async def request_edit(
             status_code=400,
             detail="background_library edit requires 'background_id'.",
         )
+    if body.edit_type == "custom" and not body.custom_background_r2_key:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "custom edit requires 'custom_background_r2_key' "
+                "(subí el archivo con POST /edit/{job_id}/custom-background primero)."
+            ),
+        )
     # Escenas (incidente 2026-07-01, job 53b9513225b1): el edit "background"
     # es del mundo fondo-único — para un job multi-escena generaba UN clip
     # Veo de 8 s, PISABA bg_r2_key_cached (que era el timeline completo) y
@@ -10587,8 +10699,8 @@ async def request_edit(
     # correcto para estos jobs es la regeneración por escena del filmstrip
     # (edit_type="scene" vía /edit-scene, no consume cupo de edición).
     # background_library comparte el guard: un asset único también pisaría
-    # el timeline multi-escena cacheado.
-    if body.edit_type in ("background", "background_library"):
+    # el timeline multi-escena cacheado. custom (fondo subido) idem.
+    if body.edit_type in ("background", "background_library", "custom"):
         _sp = job.scene_plan if isinstance(job.scene_plan, dict) else None
         if _sp and _sp.get("scenes"):
             raise HTTPException(
@@ -10683,7 +10795,13 @@ async def request_edit(
     # para quien ya quemó sus regens sin converger — si consumiera slot,
     # seguiría atrapado. AuditLog registra igual (edit_type en detail).
     _library_swap = body.edit_type == "background_library"
-    if (not _is_admin and not _metadata_only and not _library_swap
+    # Fondo custom SIN animar = swap $0 (misma clase que la biblioteca):
+    # no consume slot, es una salida de emergencia para quien ya quemó sus
+    # regens. Custom CON "Animar con AI" sí pasa por Veo (~$0.50) → consume
+    # slot como un background regen normal.
+    _custom_as_is = body.edit_type == "custom" and not body.animate_image
+    _no_slot = _metadata_only or _library_swap or _custom_as_is
+    if (not _is_admin and not _no_slot
             and current_edit_count >= _MAX_EDITS):
         raise HTTPException(
             status_code=400,
@@ -11045,11 +11163,29 @@ async def request_edit(
             "asset_id": _lib_asset_id,
         }
 
+    if body.edit_type == "custom":
+        # SEGURIDAD: la key llega en el body del cliente. Validar que
+        # pertenece a ESTE job/tenant (prefijo inputs/{tenant}/{job}/) antes
+        # de que el worker la baje — sin esto un cliente podría apuntar a un
+        # objeto de otro tenant y hornearlo en su propio video. El endpoint
+        # de subida guarda bajo inputs/{job.tenant_id}/{job}/bg_custom.*.
+        from storage import _safe_filename as _r2_safe
+        _expected_prefix = f"inputs/{_r2_safe(job.tenant_id)}/{_r2_safe(job_id)}/"
+        if not (body.custom_background_r2_key or "").startswith(_expected_prefix):
+            raise HTTPException(
+                status_code=400,
+                detail="custom_background_r2_key no pertenece a este job.",
+            )
+        edit_params["custom_bg"] = {
+            "bg_r2_key": body.custom_background_r2_key,
+            "animate_image": bool(body.animate_image),
+        }
+
     # PR C 2026-05-26: metadata edits do NOT bump edit_count (see
     # rationale at the edit-cap gate above). All other types still
     # consume a slot.
     new_edit_count = (
-        current_edit_count if (_metadata_only or _library_swap)
+        current_edit_count if _no_slot
         else current_edit_count + 1
     )
 
@@ -11102,8 +11238,14 @@ async def request_edit(
     job.edit_count = new_edit_count
     # Both typography and lyrics edits jump straight into the video
     # compositing step (cached bg reused). Only background edit goes
-    # back through Veo, which is the `background` step.
-    job.current_step = "background" if body.edit_type == "background" else "video"
+    # back through Veo, which is the `background` step. Un fondo custom
+    # ANIMADO también corre Veo (image-to-video); tal cual va directo a
+    # video (sin costo IA).
+    _custom_animates = body.edit_type == "custom" and bool(body.animate_image)
+    job.current_step = (
+        "background" if (body.edit_type == "background" or _custom_animates)
+        else "video"
+    )
     job.progress = 0
     # Stamp the moment editing began so the reaper can spot edits that
     # died mid-render (worker killed by Railway deploy / OOM / crash).

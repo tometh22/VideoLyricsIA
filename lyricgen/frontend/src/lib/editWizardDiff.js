@@ -185,6 +185,22 @@ export function computeFieldDiff(baseline, current) {
     delete out.background;
   }
 
+  // ── custom (fondo subido en edición) ─────────────────────────────────
+  // "Subir el mío" en el wizard de edición (restaurado tras #970, que lo
+  // había ocultado porque el backend no lo soportaba). El File NO es
+  // diffable ni JSON-serializable: este bucket sólo transporta la intención
+  // + el flag "Animar con AI"; App.jsx sube el archivo a R2 aparte (POST
+  // /edit/{job}/custom-background) e inyecta custom_background_r2_key en el
+  // payload antes del POST. El baseline nunca tiene fondo custom, así que
+  // seleccionarlo SIEMPRE difea. Mutuamente excluyente con background /
+  // background_library (subir tu foto supersede cualquier regen IA o pick
+  // de biblioteca que haya quedado en el formulario).
+  if (current.editCustomBg) {
+    out.custom = { animate_image: !!current.animateCustomImage };
+    delete out.background;
+    delete out.background_library;
+  }
+
   return out;
 }
 
