@@ -126,3 +126,47 @@ def test_flags_de_procedencia_se_copian():
         assert c.get("gap_recovered") is True         # procedencia viaja
         assert "ctc_lr" not in c                      # telemetría de línea entera no
         assert c.get("phrase_split") is True
+
+
+# ── regresión: notas sostenidas partían la frase (staging, job ff76ebfa) ──
+
+def _seg_con_nota_sostenida():
+    """'Estuve rodando por ahí' con la última nota sostenida 8s — geometría
+    exacta de los carteles #17 y #37 del job real: 4 palabras, la última de
+    8,00s. El costo por duración empujaba a partir la frase y dejaba la
+    palabra sostenida SOLA en un cartel."""
+    ws = [{"word": "estuve", "start": 100.0, "end": 100.34},
+          {"word": "rodando", "start": 100.4, "end": 101.76},
+          {"word": "por", "start": 101.9, "end": 102.14},
+          {"word": "ahi", "start": 102.3, "end": 110.30}]   # 8,00s sostenida
+    return {"start": 100.0, "end": 110.3, "text": "estuve rodando por ahi",
+            "words": ws}
+
+
+def test_nota_sostenida_no_parte_la_frase():
+    out = ps.resegment([_seg_con_nota_sostenida()])
+    assert len(out) == 1, \
+        f"la frase de 4 palabras no debe partirse, salieron {len(out)}"
+
+
+def test_nunca_deja_palabras_huerfanas():
+    """Ningún cartel con menos de _MIN_LEN palabras (salvo que el segmento
+    entero sea más corto que eso)."""
+    casos = [_seg_con_nota_sostenida(),
+             _seg(PARED, 10.0, gaps={9: 1.3, 19: 1.3}),
+             _seg("una frase de siete palabras aca mismo", 10.0)]
+    for seg in casos:
+        for c in ps.resegment([seg]):
+            n = len(c["text"].split())
+            assert n >= ps._MIN_LEN or n == len(seg["words"]), \
+                f"cartel huérfano de {n} palabra(s): {c['text']!r}"
+
+
+def test_pared_larga_con_sostenido_final_igual_se_parte():
+    """El mínimo no debe impedir partir una pared legítima."""
+    seg = _seg(PARED, 10.0, gaps={9: 1.3, 19: 1.3})
+    seg["words"][-1]["end"] = seg["words"][-1]["start"] + 7.0
+    seg["end"] = seg["words"][-1]["end"]
+    out = ps.resegment([seg])
+    assert len(out) >= 3
+    assert all(len(c["text"].split()) >= ps._MIN_LEN for c in out)
