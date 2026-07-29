@@ -4216,6 +4216,8 @@ async def transcribe_uploaded(
             _result, audio_path, job_id,
             live_hint=bool(getattr(body, "live", False))
             or _looks_live(_row_title, _row_filename))
+        _result = _maybe_repetition_reconcile(_result, job_id)
+        _result = _maybe_phrase_segment(_result, job_id)
         from lyrics_format import format_lyrics_pass as _fmt
         return await _fmt(_result, language=body.language or "es")
     finally:
@@ -4891,6 +4893,8 @@ async def transcribe_endpoint(
     _result = await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
     _result = await _maybe_adlib_filter(_result, audio_path, job_id,
                                         live_hint=_looks_live(title, file.filename))
+    _result = _maybe_repetition_reconcile(_result, job_id)
+    _result = _maybe_phrase_segment(_result, job_id)
     from lyrics_format import format_lyrics_pass as _fmt
     return await _fmt(_result, language=language or "es")
 
@@ -4909,6 +4913,82 @@ def _looks_live(*texts) -> bool:
     vivos en el título ('Live In Buenos Aires 2001'); para archivos sin
     etiquetar existe el toggle del operador (body.live)."""
     return any(t and _LIVE_MARKER_RE.search(str(t)) for t in texts)
+
+
+def _maybe_repetition_reconcile(result, job_id: str):
+    """Post-pass gateado (REPETITION_RECONCILE_ENABLED, default off): cuando
+    el audio canta un estribillo M veces y la referencia listó K<M, el grupo
+    entero queda corrido una repetición (~±5,6 s medido contra Rotor, job
+    6f4047db). Inserta la ocurrencia huérfana / reasigna miembros flotantes
+    usando repetition_group + ctc_lr + uncovered_spans — señales que ya
+    existían y nadie consumía. Puro (CPU-only, sin I/O): sync a propósito.
+    Corre en los 3 call sites (worker + 2 endpoints HTTP) en lockstep — ver
+    tests/test_postpass_lockstep.py. Never raises."""
+    if not isinstance(result, dict):
+        return result
+    try:
+        import repetition_reconcile as _rr
+        if not _rr.is_enabled():
+            return result
+        segs = result.get("segments") or []
+        words = result.get("_asr_words") or []
+        if len(segs) < 3 or not words:
+            return result
+        import lead_in as _li
+        nuevo, stats = _rr.reconcile(
+            segs, words, lead_s=_li.lead_seconds(), hold_s=_li.hold_seconds(),
+        )
+        if stats.get("inserted") or stats.get("reassigned"):
+            result = dict(result)
+            result["segments"] = nuevo
+            logger.info(
+                "[REP-RECONCILE] %d insertada(s), %d reasignada(s) "
+                "(grupos=%d) job=%s", stats["inserted"], stats["reassigned"],
+                stats["groups"], job_id)
+        elif stats.get("declined"):
+            logger.info("[REP-RECONCILE] sin cambios (declines=%s) job=%s",
+                        stats["declined"][:4], job_id)
+        return result
+    except Exception as e:  # nunca romper la transcripción
+        logger.warning("[REP-RECONCILE] wrapper declinó: %r (job=%s)",
+                       e, job_id)
+        return result
+
+
+def _maybe_phrase_segment(result, job_id: str):
+    """Post-pass gateado (PHRASE_SEGMENTER_ENABLED, default off): re-corta
+    los carteles largos en frases de ~6 palabras por DP sobre word-stamps
+    (nuestros carteles medían 11-38 palabras vs ~5,8 de Rotor). Corre
+    DESPUÉS de repetition_reconcile (necesita líneas enteras con membresía
+    final) y ANTES del formatter. Re-anota repetition_group porque los
+    grupos cambian al partir. Puro y sync. Never raises."""
+    if not isinstance(result, dict):
+        return result
+    try:
+        import phrase_segmenter as _ps
+        if not _ps.is_enabled():
+            return result
+        segs = result.get("segments") or []
+        if not segs:
+            return result
+        import lead_in as _li
+        nuevo = _ps.resegment(segs, lead_s=_li.lead_seconds(),
+                              hold_s=_li.hold_seconds())
+        if len(nuevo) != len(segs):
+            from chorus_trim import mark_repetitions as _mr
+            nuevo = _mr(nuevo)
+            _pal = sorted(len((s.get("text") or "").split())
+                          for s in nuevo if isinstance(s, dict))
+            result = dict(result)
+            result["segments"] = nuevo
+            logger.info(
+                "[PHRASE-SEG] %d → %d carteles (mediana %d pal/cartel) "
+                "job=%s", len(segs), len(nuevo),
+                _pal[len(_pal) // 2] if _pal else 0, job_id)
+        return result
+    except Exception as e:  # nunca romper la transcripción
+        logger.warning("[PHRASE-SEG] wrapper declinó: %r (job=%s)", e, job_id)
+        return result
 
 
 async def _maybe_adlib_filter(result, audio_path: str, job_id: str,

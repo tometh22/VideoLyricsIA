@@ -82,12 +82,23 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None):
             r["audio_coverage"] = final
             log = logger.warning if final < 0.8 else logger.info
             log("[COVERAGE] final=%.0f%% (cascada=%s, pre-formatter=%s) "
-                "zonas_sin_letra=%d (%.1fs, peor %.1fs) job=%s",
+                "zonas_sin_letra=%d (%.1fs, peor %.1fs) "
+                "carteles_texto_equivocado=%d job=%s",
                 final * 100,
                 f"{cascada * 100:.0f}%" if cascada is not None else "?",
                 f"{antes_fmt * 100:.0f}%" if antes_fmt is not None else "?",
                 c["uncovered_spans"], c["uncovered_seconds"],
-                c["worst_span_s"], job_id)
+                c["worst_span_s"], c.get("text_mismatches", 0), job_id)
+            # Carteles que no dicen lo que se canta: la dimensión que la
+            # cobertura no ve (el usuario detectó a ojo 2 en un job con
+            # 76 % de cobertura). Detalle por línea para diagnóstico.
+            if c.get("text_mismatches"):
+                from audio_coverage import text_mismatches as _tm
+                for m in _tm(r.get("segments") or [], words)[:6]:
+                    logger.warning(
+                        "[COVERAGE] cartel #%d (%.1f-%.1fs) no suena a lo "
+                        "cantado ahí (ratio=%.2f) job=%s",
+                        m["index"], m["start"], m["end"], m["ratio"], job_id)
             # Atribución explícita: qué etapa se comió el canto.
             if cascada is not None and (cascada - final) > 0.02:
                 logger.warning(
@@ -140,7 +151,8 @@ def run_transcription_job(
     # que es lo que queremos (jobs independientes, sin event-loop leak).
     from main import (  # type: ignore
         _looks_live, _maybe_anchor_align, _maybe_ctc_retime,
-        _maybe_adlib_filter, _run_transcription_for_job,
+        _maybe_adlib_filter, _maybe_phrase_segment,
+        _maybe_repetition_reconcile, _run_transcription_for_job,
     )
     from jobs import update_job, get_job
     import storage
@@ -209,6 +221,8 @@ def run_transcription_job(
             r = await _maybe_adlib_filter(
                 r, audio_path, job_id,
                 live_hint=live or _looks_live(title, filename))
+            r = _maybe_repetition_reconcile(r, job_id)
+            r = _maybe_phrase_segment(r, job_id)
             from lyrics_format import format_lyrics_pass as _fmt
             _antes = _coverage_de(r)
             r = await _fmt(r, language=language or "es")

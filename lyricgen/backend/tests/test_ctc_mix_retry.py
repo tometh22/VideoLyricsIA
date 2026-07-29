@@ -104,10 +104,10 @@ def test_retimed_segments_get_lead_in(monkeypatch, tmp_path):
                for i in range(5)]
     calls, stem = _arm(monkeypatch, tmp_path, stem_exists=True,
                        per_call=[[dict(s) for s in retimed]])
-    monkeypatch.setenv("LYRIC_LEAD_IN_S", "0.4")
+    monkeypatch.setenv("LYRIC_LEAD_IN_S", "0.1")
     out = asyncio.run(_maybe_ctc_retime(_fake_result(), "/mix/audio.wav", "j"))
-    # primer start: 10.0 − 0.4 = 9.6 (aire de sobra)
-    assert out["segments"][0]["start"] == 9.6
+    # primer start: 10.0 − 0.1 = 9.9 (aire de sobra)
+    assert out["segments"][0]["start"] == 9.9
     # todos adelantados respecto del onset crudo de CTC
     assert all(o["start"] < r["start"]
                for o, r in zip(out["segments"], retimed))
@@ -118,7 +118,7 @@ def test_decline_path_does_not_double_apply_lead(monkeypatch, tmp_path):
     pasan intactos — sin segunda aplicación."""
     calls, _ = _arm(monkeypatch, tmp_path, stem_exists=True, per_call=[None, None])
     ctc_align.last_decline_reason = ""
-    monkeypatch.setenv("LYRIC_LEAD_IN_S", "0.4")
+    monkeypatch.setenv("LYRIC_LEAD_IN_S", "0.1")
     result = _fake_result()
     starts_before = [s["start"] for s in result["segments"]]
     out = asyncio.run(_maybe_ctc_retime(result, "/mix/audio.wav", "j"))
