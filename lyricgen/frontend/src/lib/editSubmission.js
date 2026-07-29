@@ -23,6 +23,7 @@ import { normalizeMovementCode } from "./catalogCodes.js";
 // background regen Veo (pago); lyrics re-renderiza con nuevos segments;
 // metadata sólo title card; typography el último.
 export const EDIT_TYPE_PRIORITY = [
+  "custom",
   "background_library",
   "background",
   "lyrics",
@@ -30,7 +31,10 @@ export const EDIT_TYPE_PRIORITY = [
   "typography",
 ];
 
-const BACKGROUND_TYPES = ["background", "background_library"];
+// Tipos "de fondo": comparten el gate de status (exigen pending_review) y el
+// de multi-escena (se rechazan porque el fondo es un timeline). custom (fondo
+// subido en edición) entra acá: pisaría el timeline igual que un asset único.
+const BACKGROUND_TYPES = ["background", "background_library", "custom"];
 
 /**
  * ¿Se puede regenerar el fondo de este job? Depende SÓLO del job, no de si el
@@ -180,7 +184,7 @@ export function buildEditReview(job, snapReview = null) {
  */
 export function buildEditCurrent(review, opts = {}) {
   const r = review || {};
-  const { editedSegments, bgSelectMode, backgroundId } = opts;
+  const { editedSegments, bgSelectMode, backgroundId, backgroundFile, animateImage } = opts;
   return {
     artist: r.artist,
     songTitle: r.songTitle,
@@ -222,6 +226,12 @@ export function buildEditCurrent(review, opts = {}) {
     // Library activo; volver a "IA Auto" lo anula (null → sin bucket).
     editBackgroundId:
       (bgSelectMode === "library" && backgroundId) ? backgroundId : null,
+    // Fondo custom subido en edición ("Subir el mío"): sólo cuenta con el
+    // tab custom activo y un archivo cargado. El File no viaja en el diff
+    // (no es serializable); App.jsx lo sube a R2 y manda la key. Volver a
+    // "IA Auto"/Library lo anula (sin archivo → sin bucket).
+    editCustomBg: !!(bgSelectMode === "custom" && backgroundFile),
+    animateCustomImage: !!animateImage,
     // "Regenerar fondo (nueva versión)": acción explícita del wizard para
     // forzar un re-render del fondo con el MISMO hint aunque no haya cambiado
     // ningún campo. Es una intención, no un campo del baseline.
@@ -336,7 +346,7 @@ export function resolveEditSubmission({
   // lyrics) sólo si el edit_type matchea.
   const payload = { edit_type: editType };
   const willApply = {};
-  for (const bucket of ["metadata", "typography", "lyrics", "background", "background_library"]) {
+  for (const bucket of ["metadata", "typography", "lyrics", "background", "background_library", "custom"]) {
     if (!diff[bucket]) continue;
     Object.assign(payload, diff[bucket]);
     if (!willDrop.includes(bucket)) willApply[bucket] = diff[bucket];

@@ -3116,12 +3116,13 @@ export default function UploadZone({
             {[
               { id: "auto", label: t("upload.bg_auto") || "Generar con IA" },
               { id: "library", label: t("upload.bg_library") || "Library" },
-              // "Subir el mío" (portada custom) NO se ofrece en edición: el
-              // backend /edit no tiene edit_type "custom" (valid_edit_types sin
-              // custom), así que elegirlo daba un no-op silencioso — el operador
-              // "cambiaba el fondo" y el botón de aprobar decía "No cambiaste
-              // nada". Fuera del wizard de edición sigue disponible al crear.
-              ...(editMode ? [] : [{ id: "custom", label: t("upload.bg_custom_tab") || "Upload" }]),
+              // "Subir el mío" (portada custom): disponible también en edición.
+              // #970 la había ocultado porque el backend /edit no tenía
+              // edit_type "custom" y elegirlo daba un no-op silencioso; ahora el
+              // backend lo soporta (sube el archivo a R2 vía
+              // /edit/{job}/custom-background y re-renderiza), así que la
+              // restauramos en el wizard de edición.
+              { id: "custom", label: t("upload.bg_custom_tab") || "Upload" },
             ].map((m) => (
               <button
                 key={m.id}
