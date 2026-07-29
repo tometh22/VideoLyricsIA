@@ -4217,6 +4217,8 @@ async def transcribe_uploaded(
             live_hint=bool(getattr(body, "live", False))
             or _looks_live(_row_title, _row_filename))
         _result = _maybe_repetition_reconcile(_result, job_id)
+        _result = await _maybe_gap_rescue(_result, audio_path, job_id,
+                                          body.language or "es")
         _result = _maybe_phrase_segment(_result, job_id)
         from lyrics_format import format_lyrics_pass as _fmt
         return await _fmt(_result, language=body.language or "es")
@@ -4894,6 +4896,8 @@ async def transcribe_endpoint(
     _result = await _maybe_adlib_filter(_result, audio_path, job_id,
                                         live_hint=_looks_live(title, file.filename))
     _result = _maybe_repetition_reconcile(_result, job_id)
+    _result = await _maybe_gap_rescue(_result, audio_path, job_id,
+                                      language or "es")
     _result = _maybe_phrase_segment(_result, job_id)
     from lyrics_format import format_lyrics_pass as _fmt
     return await _fmt(_result, language=language or "es")
@@ -4953,6 +4957,72 @@ def _maybe_repetition_reconcile(result, job_id: str):
         logger.warning("[REP-RECONCILE] wrapper declinó: %r (job=%s)",
                        e, job_id)
         return result
+
+
+async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
+                            language: str = "es"):
+    """Post-pass gateado (GAP_RESCUE_ENABLED, default off): re-transcribe los
+    tramos donde el ASR de la cascada quedó SORDO.
+
+    Los otros dos post-pases colocan texto donde el ASR oyó algo; cuando el
+    ASR no oyó nada, no tienen con qué trabajar — así quedó un hueco de 30 s
+    sin un solo cartel en el job dcf773b5 mientras el audio cantaba. Medido
+    sobre ese hueco: transcribir la MEZCLA devuelve 1 palabra; transcribir el
+    STEM de voz devuelve 16. Por eso usa el stem cacheado por la cascada
+    (nunca corre demucs: `cache_only=True`) y sólo cae a la mezcla si no está.
+
+    Never raises: ante cualquier fallo devuelve el resultado intacto."""
+    if not isinstance(result, dict):
+        return result
+    _stem = None
+    try:
+        import gap_rescue as _gr
+        if not _gr.is_enabled():
+            return result
+        segs = result.get("segments") or []
+        if len(segs) < 3 or not audio_path or not os.path.exists(audio_path):
+            return result
+        from pipeline import _audio_duration
+        dur = await asyncio.to_thread(_audio_duration, audio_path)
+        if not _gr.find_gaps(segs, dur):
+            return result          # sin huecos: ni tocamos el stem
+
+        try:
+            import vocal_sep as _vs
+            _stem = await asyncio.wait_for(
+                asyncio.to_thread(_vs.separate_vocals, audio_path,
+                                  cache_only=True),
+                timeout=120,
+            )
+        except Exception as e:
+            logger.info("[GAP-RESCUE] sin stem cacheado (%r) — uso la mezcla", e)
+
+        import lead_in as _li
+        nuevo, stats = await asyncio.to_thread(
+            _gr.rescue, segs, audio_path, stem_path=_stem, audio_duration=dur,
+            language=language or "es", lead_s=_li.lead_seconds(),
+            hold_s=_li.hold_seconds(),
+        )
+        if stats.get("rescued_lines"):
+            result = dict(result)
+            result["segments"] = nuevo
+            logger.warning(
+                "[GAP-RESCUE] %d línea(s) rescatada(s) de %d hueco(s) usando "
+                "%s — el ASR de la cascada no había oído nada ahí job=%s",
+                stats["rescued_lines"], stats["gaps"], stats["source"], job_id)
+        elif stats.get("gaps"):
+            logger.info("[GAP-RESCUE] %d hueco(s) sin contenido recuperable "
+                        "(%s) job=%s", stats["gaps"], stats["skipped"], job_id)
+        return result
+    except Exception as e:
+        logger.warning("[GAP-RESCUE] wrapper declinó: %r (job=%s)", e, job_id)
+        return result
+    finally:
+        if _stem:
+            try:
+                os.unlink(_stem)
+            except OSError:
+                pass
 
 
 def _maybe_phrase_segment(result, job_id: str):

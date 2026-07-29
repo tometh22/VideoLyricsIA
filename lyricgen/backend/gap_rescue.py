@@ -1,0 +1,304 @@
+"""Rescate de huecos: re-transcribir los tramos donde el ASR quedó SORDO.
+
+EL DEFECTO (job dcf773b5, "Rodando Por Ahí", 29-07-2026)
+--------------------------------------------------------
+El video salió con un hueco de 30,7 s (3:29 → 4:00) sin un solo cartel,
+mientras el audio canta el estribillo tres veces (medido con separación de
+voz: canto real en 214-229 s). Ni la recuperación de huecos de
+`whisperx_reconcile` ni `repetition_reconcile` lo taparon, y no por un bug:
+ambos colocan texto donde el ASR oyó algo, y **whisperX no oyó nada ahí**.
+
+Lo confirma nuestra propia métrica, que reportó `zonas_sin_letra=0` con el
+hueco en pantalla: `audio_coverage` mide contra las PALABRAS del ASR, así
+que un punto sordo del ASR le resulta invisible por construcción. Esa
+ceguera es deliberada (evita falsos positivos en pasajes instrumentales),
+pero deja este caso sin detectar.
+
+Un whisper-1 sobre el mismo audio SÍ transcribió esa zona (8 palabras en
+210-217, 7 en 219-223). O sea: no es que no se pueda oír — es que ESE
+motor, en ESA pasada, se lo comió.
+
+QUÉ HACE
+--------
+Post-pass gateado: busca huecos grandes entre carteles (y la cola), recorta
+una ventana del audio QUE INCLUYE CONTEXTO CANTADO A AMBOS LADOS, la
+re-transcribe con whisper-1 pidiendo timestamps por palabra, se queda sólo
+con las palabras que caen DENTRO del hueco, y emite líneas con timing REAL
+(no interpolado).
+
+DOS COSAS SON IMPRESCINDIBLES, las dos medidas sobre el hueco real
+(209,4-240,2 s del job dcf773b5):
+
+1. EL STEM DE VOZ, no la mezcla. Con la voz enterrada bajo la banda, el
+   ASR no engancha:
+
+       mezcla, 2 corridas   ->  1 palabra dentro del hueco (0,03/s)
+       stem,   2 corridas   -> 16 palabras dentro del hueco (0,53/s)
+
+   Las dos corridas de cada fuente dieron idéntico: no es varianza, es que
+   sobre la mezcla no se oye. El stem ya lo computa y cachea la cascada
+   (`vocal_sep.separate_vocals`), así que sale gratis.
+
+2. CONTEXTO CANTADO A AMBOS LADOS. Un clip aislado del hueco devuelve el
+   emoji de música o la alucinación de Amara.org; con canto reconocible
+   alrededor, el modelo se ancla. Por eso el módulo NO recorta el hueco:
+   recorta el hueco MÁS su vecindad y descarta después lo ya cubierto.
+
+Sobre la MEZCLA hubo además corridas que devolvieron 379 palabras en 70 s
+(5,4 palabras/segundo: imposible cantando) — bucles de patrón del propio
+modelo. De ahí el filtro de densidad y de alucinación: la evidencia débil
+se descarta en vez de pintarse en pantalla.
+
+DEFENSAS
+--------
+- Ventana topeada (`GAP_RESCUE_CLIP_MAX_S`): clips largos hacen que los ASR
+  entren en bucle de patrón (documentado en `_recover_gap_lyrics`).
+- Filtro de alucinaciones reusando `pipeline._filter_whisper_hallucinations`
+  + descarte de bucles de una sola palabra.
+- Exige densidad mínima de palabras: un "uh" suelto no arma línea.
+- Nunca pisa carteles existentes: las líneas nuevas se recortan al hueco.
+- Tope de huecos por canción y kill switch. Never raises.
+"""
+from __future__ import annotations
+
+import logging
+import os
+
+logger = logging.getLogger("genly.gap_rescue")
+
+_TRUE = ("1", "true", "yes", "on")
+
+# Hueco mínimo para molestarse en re-transcribir. Por debajo de esto, una
+# zona sin cartel es casi siempre un respiro instrumental legítimo.
+_MIN_GAP_S = 12.0
+# Contexto cantado a cada lado del hueco. Sin esto el ASR no engancha
+# (ver la medición en el docstring del módulo).
+_CONTEXT_S = 20.0
+# Tope de la ventana completa (hueco + contexto) que se manda al ASR.
+_CLIP_MAX_S = 120.0
+# Márgenes: entrar un toque después del cartel previo y salir antes del
+# siguiente, para no re-transcribir lo que ya está cubierto.
+_PAD_S = 0.4
+# Densidad mínima para aceptar el rescate de una ventana.
+_MIN_WORDS = 3
+_MIN_WORDS_PER_S = 0.25
+# Máximo de huecos rescatados por canción.
+_MAX_GAPS = 4
+# Corte de líneas dentro de lo rescatado (mismos valores que el resto).
+_LINE_GAP_S = 1.2
+_LINE_MAX_S = 6.0
+
+
+def is_enabled() -> bool:
+    return os.environ.get("GAP_RESCUE_ENABLED", "0").strip().lower() in _TRUE
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _f(v, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def find_gaps(segments: list[dict], audio_duration: float | None = None, *,
+              min_gap_s: float = _MIN_GAP_S) -> list[tuple[float, float]]:
+    """Huecos entre carteles (y la cola) más largos que `min_gap_s`.
+    Puro y testeable — no mira el audio."""
+    segs = sorted((s for s in (segments or []) if isinstance(s, dict)),
+                  key=lambda s: _f(s.get("start")))
+    if not segs:
+        return []
+    gaps: list[tuple[float, float]] = []
+    for a, b in zip(segs, segs[1:]):
+        ini, fin = _f(a.get("end")), _f(b.get("start"))
+        if fin - ini >= min_gap_s:
+            gaps.append((ini, fin))
+    if audio_duration:
+        fin_ultimo = max(_f(s.get("end")) for s in segs)
+        if audio_duration - fin_ultimo >= min_gap_s:
+            gaps.append((fin_ultimo, float(audio_duration)))
+    return gaps
+
+
+def _agrupar_en_lineas(words: list[dict]) -> list[list[dict]]:
+    """Corta las palabras rescatadas en líneas cantables."""
+    lineas: list[list[dict]] = []
+    cur: list[dict] = []
+    for w in words:
+        if cur:
+            hueco = _f(w.get("start")) - _f(cur[-1].get("end"))
+            largo = _f(w.get("end")) - _f(cur[0].get("start"))
+            if hueco > _LINE_GAP_S or largo > _LINE_MAX_S:
+                lineas.append(cur)
+                cur = []
+        cur.append(w)
+    if cur:
+        lineas.append(cur)
+    return lineas
+
+
+def _transcribe_window(audio_path: str, ini: float, dur: float,
+                       language: str = "es") -> list[dict]:
+    """Recorta [ini, ini+dur] y lo transcribe con whisper-1 pidiendo
+    timestamps por PALABRA. Devuelve words en el marco temporal del audio
+    COMPLETO (ya desplazadas). [] ante cualquier fallo."""
+    import subprocess
+    import tempfile
+    fd, clip = tempfile.mkstemp(suffix=".mp3", prefix="genly_gap_")
+    os.close(fd)
+    try:
+        # ffmpeg directo: este módulo NO importa `pipeline` (300+ MB de
+        # moviepy/librosa) sólo para recortar 30 s de audio.
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", audio_path, "-ss", str(ini), "-t", str(dur),
+             "-ac", "1", "-b:a", "128k", "-loglevel", "error", clip],
+            check=True, timeout=90,
+        )
+        if not os.path.exists(clip) or os.path.getsize(clip) == 0:
+            return []
+        from openai import OpenAI
+        with open(clip, "rb") as f:
+            r = OpenAI().audio.transcriptions.create(
+                model="whisper-1", file=f, response_format="verbose_json",
+                timestamp_granularities=["word"], temperature=0.0,
+                language=language or "es",
+            )
+        out = []
+        for w in (getattr(r, "words", None) or []):
+            try:
+                out.append({"word": str(w.word), "start": float(w.start) + ini,
+                            "end": float(w.end) + ini})
+            except (AttributeError, TypeError, ValueError):
+                continue
+        return out
+    except Exception as e:
+        logger.warning("[GAP-RESCUE] transcripción de ventana falló: %r", e)
+        return []
+    finally:
+        try:
+            os.unlink(clip)
+        except OSError:
+            pass
+
+
+_HALLUC = (
+    "amara.org", "subtitulos realizados por", "subtitled by",
+    "subtitles by", "subtitulado por", "transcripcion por",
+    "music", "gracias por ver", "suscribete",
+)
+
+
+def _texto_sospechoso(texto: str) -> bool:
+    """Alucinaciones típicas de whisper sobre silencio/instrumental.
+    Usa el filtro de `pipeline` si está importable; si no, la lista local
+    (el módulo no debe depender de pipeline para funcionar)."""
+    t = (texto or "").strip()
+    if not t:
+        return True
+    try:
+        from pipeline import _is_whisper_hallucination, _is_single_word_loop
+        if _is_whisper_hallucination(t) or _is_single_word_loop(t):
+            return True
+    except Exception:
+        low = t.lower()
+        if any(h in low for h in _HALLUC):
+            return True
+    # Una sola palabra repetida (bucle corto que el filtro de arriba no toma).
+    toks = [x.lower() for x in t.split()]
+    return len(toks) >= 4 and len(set(toks)) == 1
+
+
+def rescue(segments: list[dict], audio_path: str, *,
+           stem_path: str | None = None,
+           audio_duration: float | None = None, language: str = "es",
+           lead_s: float = 0.0, hold_s: float = 0.0) -> tuple[list[dict], dict]:
+    """Devuelve (segmentos + líneas rescatadas, stats). Nunca levanta.
+
+    `stem_path`: stem de voz (demucs) si está cacheado. Es MUY superior a la
+    mezcla para esto — ver el docstring del módulo. Sin stem se usa la
+    mezcla, pero los gates de densidad harán declinar casi siempre."""
+    stats = {"gaps": 0, "rescued_lines": 0, "skipped": [], "source": "mix"}
+    if not segments or not audio_path or not os.path.exists(audio_path):
+        return list(segments or []), stats
+    fuente = audio_path
+    if stem_path and os.path.exists(stem_path):
+        fuente, stats["source"] = stem_path, "stem"
+    try:
+        min_gap = _env_float("GAP_RESCUE_MIN_GAP_S", _MIN_GAP_S)
+        clip_max = _env_float("GAP_RESCUE_CLIP_MAX_S", _CLIP_MAX_S)
+        contexto = _env_float("GAP_RESCUE_CONTEXT_S", _CONTEXT_S)
+        max_gaps = int(_env_float("GAP_RESCUE_MAX_GAPS", _MAX_GAPS))
+        fin_audio = float(audio_duration) if audio_duration else None
+
+        gaps = find_gaps(segments, audio_duration, min_gap_s=min_gap)
+        stats["gaps"] = len(gaps)
+        if not gaps:
+            return list(segments), stats
+
+        nuevas: list[dict] = []
+        for ini, fin in gaps[:max_gaps]:
+            # Zona útil (lo que puede aportar contenido nuevo) y ventana a
+            # transcribir (zona + contexto cantado alrededor).
+            zona_a, zona_b = ini + _PAD_S, fin - _PAD_S
+            if zona_b - zona_a < 2.0:
+                stats["skipped"].append((round(ini, 1), "ventana_corta"))
+                continue
+            w_ini = max(0.0, zona_a - contexto)
+            w_fin = zona_b + contexto
+            if fin_audio:
+                w_fin = min(w_fin, fin_audio)
+            if w_fin - w_ini > clip_max:      # recortar contexto, no la zona
+                sobra = (w_fin - w_ini) - clip_max
+                w_ini = min(zona_a, w_ini + sobra / 2)
+                w_fin = max(zona_b, w_fin - sobra / 2)
+            words = _transcribe_window(fuente, w_ini, w_fin - w_ini,
+                                       language)
+            # Sólo lo que cae DENTRO del hueco: el contexto era para que el
+            # ASR enganche, no para re-escribir lo ya cubierto.
+            words = [w for w in words
+                     if zona_a <= (_f(w.get("start")) + _f(w.get("end"))) / 2
+                     <= zona_b]
+            if (len(words) < _MIN_WORDS
+                    or len(words) / (zona_b - zona_a) < _MIN_WORDS_PER_S):
+                stats["skipped"].append((round(ini, 1), "sin_canto"))
+                continue
+            texto_total = " ".join(str(w.get("word", "")) for w in words)
+            if _texto_sospechoso(texto_total):
+                stats["skipped"].append((round(ini, 1), "alucinacion"))
+                continue
+            for grupo in _agrupar_en_lineas(words):
+                txt = " ".join(str(w.get("word", "")).strip()
+                               for w in grupo).strip()
+                if not txt or len(grupo) < 2:
+                    continue
+                s0 = max(ini + 0.05, _f(grupo[0].get("start")) - lead_s)
+                e0 = min(fin - 0.05, _f(grupo[-1].get("end")) + hold_s)
+                if e0 - s0 < 0.3:
+                    continue
+                nuevas.append({"start": round(s0, 3), "end": round(e0, 3),
+                               "text": txt, "words": [dict(w) for w in grupo],
+                               "gap_rescued": True, "review": True})
+            logger.info(
+                "[GAP-RESCUE] hueco %.1f-%.1fs: %d palabras rescatadas del "
+                "%s (el ASR original no oyó nada ahí)", ini, fin, len(words),
+                stats["source"])
+
+        if not nuevas:
+            return list(segments), stats
+        stats["rescued_lines"] = len(nuevas)
+        out = sorted(list(segments) + nuevas, key=lambda s: _f(s.get("start")))
+        for x, y in zip(out, out[1:]):
+            if _f(x.get("end")) > _f(y.get("start")):
+                x["end"] = round(max(_f(x.get("start")) + 0.1,
+                                     _f(y.get("start")) - 0.01), 3)
+        return out, stats
+    except Exception as e:  # pragma: no cover — nunca romper la transcripción
+        logger.warning("[GAP-RESCUE] declinó por excepción: %r", e)
+        return list(segments), stats
