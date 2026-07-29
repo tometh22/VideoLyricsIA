@@ -3243,6 +3243,8 @@ export default function App() {
           editedSegments,
           bgSelectMode,
           backgroundId,
+          backgroundFile,
+          animateImage,
         });
         const submission = resolveEditSubmission({
           baseline: r.baseline,
@@ -3315,6 +3317,51 @@ export default function App() {
         // swap de biblioteca no dispara Veo). Ver backgroundRegenExtras.
         if (submission.editType === "background") {
           Object.assign(payload, backgroundRegenExtras(r));
+        }
+        // Fondo custom subido en edición ("Subir el mío"): el File no cabe en
+        // el body JSON de /edit, así que primero lo subimos a R2 (multipart) y
+        // metemos la key devuelta en el payload. Si la subida falla, cortamos
+        // acá con un aviso — sin esto el /edit rebotaría con 400 y el operador
+        // no sabría por qué.
+        if (submission.editType === "custom") {
+          if (!backgroundFile) {
+            alert({
+              title: t("edit.custom_bg_missing_title") || "Falta el archivo",
+              description: t("edit.custom_bg_missing_desc") ||
+                "Volvé a subir tu foto o video de fondo y reintentá.",
+              tone: "warning",
+            });
+            return;
+          }
+          try {
+            const _fd = new FormData();
+            _fd.append("background_file", backgroundFile);
+            const _up = await authFetch(`${API}/edit/${editedJobId}/custom-background`, {
+              method: "POST",
+              body: _fd,
+            });
+            let _upData = {};
+            try { _upData = await _up.json(); } catch { /* empty body */ }
+            if (!_up.ok || !_upData?.bg_r2_key) {
+              const _friendly = translateBackendError(_upData?.detail, t) || `Error ${_up.status}`;
+              alert({
+                title: t("edit.custom_bg_upload_failed_title") || "No pudimos subir el fondo",
+                description: _friendly,
+                tone: "error",
+              });
+              console.warn("[edit-wizard] custom-background upload failed", { status: _up.status, detail: _upData });
+              return;
+            }
+            payload.custom_background_r2_key = _upData.bg_r2_key;
+          } catch (e) {
+            alert({
+              title: t("edit.custom_bg_upload_failed_title") || "No pudimos subir el fondo",
+              description: t("common.network_error") || "Error de red. Reintentá en unos segundos.",
+              tone: "error",
+            });
+            console.warn("[edit-wizard] custom-background upload threw", e);
+            return;
+          }
         }
         if (Array.isArray(payload.segments)) {
           payload.base_revision = Number.isInteger(saveMeta.baseRevision)
