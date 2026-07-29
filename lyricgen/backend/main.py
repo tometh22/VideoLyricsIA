@@ -4956,6 +4956,8 @@ def _maybe_repetition_reconcile(result, job_id: str):
         elif stats.get("declined"):
             logger.info("[REP-RECONCILE] sin cambios (declines=%s) job=%s",
                         stats["declined"][:4], job_id)
+        result.setdefault("postpass_stats", {})["rep_reconcile"] = {
+            k: v for k, v in stats.items() if k != "declined"}
         return result
     except Exception as e:  # nunca romper la transcripción
         logger.warning("[REP-RECONCILE] wrapper declinó: %r (job=%s)",
@@ -5017,6 +5019,10 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
         elif stats.get("gaps"):
             logger.info("[GAP-RESCUE] %d hueco(s) sin contenido recuperable "
                         "(%s) job=%s", stats["gaps"], stats["skipped"], job_id)
+        result.setdefault("postpass_stats", {})["gap_rescue"] = {
+            "gaps": stats.get("gaps", 0),
+            "rescued_lines": stats.get("rescued_lines", 0),
+            "source": stats.get("source")}
         return result
     except Exception as e:
         logger.warning("[GAP-RESCUE] wrapper declinó: %r (job=%s)", e, job_id)
@@ -5079,6 +5085,8 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
                 "línea(s) — el stem contradijo a la referencia job=%s",
                 stats["substitutions"], stats["insertions"],
                 stats["lines_changed"], job_id)
+        result.setdefault("postpass_stats", {})["word_vote"] = {
+            k: v for k, v in stats.items() if k != "declined"}
         return result
     except Exception as e:  # nunca romper la transcripción
         logger.warning("[WORD-VOTE] wrapper declinó: %r (job=%s)", e, job_id)
@@ -5121,6 +5129,8 @@ def _maybe_phrase_segment(result, job_id: str):
                 "[PHRASE-SEG] %d → %d carteles (mediana %d pal/cartel) "
                 "job=%s", len(segs), len(nuevo),
                 _pal[len(_pal) // 2] if _pal else 0, job_id)
+            result.setdefault("postpass_stats", {})["phrase_seg"] = {
+                "before": len(segs), "after": len(nuevo)}
         return result
     except Exception as e:  # nunca romper la transcripción
         logger.warning("[PHRASE-SEG] wrapper declinó: %r (job=%s)", e, job_id)
