@@ -17,7 +17,7 @@ import pathlib
 BACKEND = pathlib.Path(__file__).resolve().parent.parent
 
 REQUIRED_AFTER_ADLIB = ("_maybe_repetition_reconcile", "_maybe_gap_rescue",
-                        "_maybe_phrase_segment")
+                        "_maybe_word_vote", "_maybe_phrase_segment")
 
 
 def _call_sites():
@@ -66,6 +66,12 @@ def test_todo_camino_corre_los_postpases_nuevos_en_orden():
         assert calls["_maybe_phrase_segment"] > calls["_maybe_gap_rescue"], (
             f"{fname}:{func}: el segmentador debe correr después del rescate "
             f"(las líneas rescatadas también se cortan en frases)")
+        assert calls["_maybe_word_vote"] > calls["_maybe_gap_rescue"], (
+            f"{fname}:{func}: el voto corre después del rescate (vota "
+            f"también las líneas rescatadas)")
+        assert calls["_maybe_phrase_segment"] > calls["_maybe_word_vote"], (
+            f"{fname}:{func}: el segmentador va último — corta el texto YA "
+            f"votado")
         if "_fmt" in calls:
             for req in REQUIRED_AFTER_ADLIB:
                 assert calls[req] < calls["_fmt"], (
