@@ -187,7 +187,8 @@ def run_transcription_job(
     from main import (  # type: ignore
         _looks_live, _maybe_anchor_align, _maybe_ctc_retime,
         _maybe_adlib_filter, _maybe_gap_rescue, _maybe_phrase_segment,
-        _maybe_repetition_reconcile, _run_transcription_for_job,
+        _maybe_repetition_reconcile, _maybe_word_vote,
+        _run_transcription_for_job,
     )
     from jobs import update_job, get_job
     import storage
@@ -258,6 +259,7 @@ def run_transcription_job(
                 live_hint=live or _looks_live(title, filename))
             r = _maybe_repetition_reconcile(r, job_id)
             r = await _maybe_gap_rescue(r, audio_path, job_id, language or "es")
+            r = await _maybe_word_vote(r, audio_path, job_id, language or "es")
             r = _maybe_phrase_segment(r, job_id)
             from lyrics_format import format_lyrics_pass as _fmt
             _antes = _coverage_de(r)

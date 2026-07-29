@@ -4219,6 +4219,8 @@ async def transcribe_uploaded(
         _result = _maybe_repetition_reconcile(_result, job_id)
         _result = await _maybe_gap_rescue(_result, audio_path, job_id,
                                           body.language or "es")
+        _result = await _maybe_word_vote(_result, audio_path, job_id,
+                                         body.language or "es")
         _result = _maybe_phrase_segment(_result, job_id)
         from lyrics_format import format_lyrics_pass as _fmt
         return await _fmt(_result, language=body.language or "es")
@@ -4898,6 +4900,8 @@ async def transcribe_endpoint(
     _result = _maybe_repetition_reconcile(_result, job_id)
     _result = await _maybe_gap_rescue(_result, audio_path, job_id,
                                       language or "es")
+    _result = await _maybe_word_vote(_result, audio_path, job_id,
+                                     language or "es")
     _result = _maybe_phrase_segment(_result, job_id)
     from lyrics_format import format_lyrics_pass as _fmt
     return await _fmt(_result, language=language or "es")
@@ -5016,6 +5020,68 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
         return result
     except Exception as e:
         logger.warning("[GAP-RESCUE] wrapper declinó: %r (job=%s)", e, job_id)
+        return result
+    finally:
+        if _stem:
+            try:
+                os.unlink(_stem)
+            except OSError:
+                pass
+
+
+async def _maybe_word_vote(result, audio_path: str, job_id: str,
+                           language: str = "es"):
+    """Post-pass gateado (WORD_VOTE_ENABLED, default off): el audio corrige
+    a la referencia palabra por palabra, la referencia aporta la ortografía.
+
+    El testigo TIENE que ser independiente: el ASR principal se ceba con la
+    letra de referencia como prompt y hereda sus errores (el mix-ASR primed
+    oyó "estaciones" donde se canta "canciones"). Por eso el testigo es un
+    whisper-1 SIN prompt sobre el stem cacheado — sin stem, se declina
+    entero (votar con un testigo sesgado es peor que no votar).
+
+    Validado contra el job real: corrige exactamente las 3 palabras en las
+    que Rotor nos ganaba (canciones, embriagué, "Cuando…mi vida") y las
+    inserciones quedan con review=True para el operador. Never raises."""
+    if not isinstance(result, dict):
+        return result
+    _stem = None
+    try:
+        import word_vote as _wv
+        if not _wv.is_enabled():
+            return result
+        segs = result.get("segments") or []
+        if len(segs) < 3 or not audio_path or not os.path.exists(audio_path):
+            return result
+        import vocal_sep as _vs
+        _stem = await asyncio.wait_for(
+            asyncio.to_thread(_vs.separate_vocals, audio_path,
+                              cache_only=True),
+            timeout=120,
+        )
+        if not _stem:
+            logger.info("[WORD-VOTE] sin stem cacheado — declino (el "
+                        "testigo debe ser independiente) job=%s", job_id)
+            return result
+        from pipeline import _audio_duration
+        dur = await asyncio.to_thread(_audio_duration, audio_path)
+        from gap_rescue import _transcribe_window
+        witness = await asyncio.to_thread(
+            _transcribe_window, _stem, 0.0, float(dur or 600.0),
+            language or "es",
+        )
+        nuevo, stats = _wv.vote(segs, witness)
+        if stats.get("lines_changed"):
+            result = dict(result)
+            result["segments"] = nuevo
+            logger.info(
+                "[WORD-VOTE] %d sustitución(es) + %d inserción(es) en %d "
+                "línea(s) — el stem contradijo a la referencia job=%s",
+                stats["substitutions"], stats["insertions"],
+                stats["lines_changed"], job_id)
+        return result
+    except Exception as e:  # nunca romper la transcripción
+        logger.warning("[WORD-VOTE] wrapper declinó: %r (job=%s)", e, job_id)
         return result
     finally:
         if _stem:
