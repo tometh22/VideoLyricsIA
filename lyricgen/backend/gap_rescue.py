@@ -102,6 +102,14 @@ _MAX_WORDS_PER_S = 6.0
 # el guardrail voiced_gaps — acá previene en vez de sólo detectar.
 _VAD_MIN_VOICED_S = 3.0
 _VAD_LINE_OVERLAP = 0.3
+# Rescate por MISMATCH: un cartel largo cuyo texto no suena a lo que el ASR
+# oyó en su ventana es un cartel MANCHADO — el alineador untó pocas palabras
+# sobre audio que canta otra cosa (Hombre Lobo: "En el fondo" estirado
+# 6,8s con "el"=2,4s y "fondo"=3,0s sobre "Nunca me imaginé / Cantando /
+# Para vos / En un mundo"). Su zona se re-transcribe y el cartel se
+# REEMPLAZA por lo realmente cantado.
+_MISMATCH_MAX_RATIO = 0.3
+_MISMATCH_MIN_DUR_S = 4.0
 
 
 def is_enabled() -> bool:
@@ -250,13 +258,19 @@ def _voiced_overlap(a: float, b: float, regs: list[tuple]) -> float:
 def rescue(segments: list[dict], audio_path: str, *,
            stem_path: str | None = None,
            audio_duration: float | None = None, language: str = "es",
-           lead_s: float = 0.0, hold_s: float = 0.0) -> tuple[list[dict], dict]:
+           lead_s: float = 0.0, hold_s: float = 0.0,
+           asr_words: list[dict] | None = None) -> tuple[list[dict], dict]:
     """Devuelve (segmentos + líneas rescatadas, stats). Nunca levanta.
 
     `stem_path`: stem de voz (demucs) si está cacheado. Es MUY superior a la
     mezcla para esto — ver el docstring del módulo. Sin stem se usa la
-    mezcla, pero los gates de densidad harán declinar casi siempre."""
-    stats = {"gaps": 0, "rescued_lines": 0, "skipped": [], "source": "mix"}
+    mezcla, pero los gates de densidad harán declinar casi siempre.
+
+    `asr_words`: stream de palabras del ASR de la cascada. Habilita el
+    rescate por MISMATCH: carteles largos cuyo texto no suena a su ventana
+    (`audio_coverage.text_mismatches`) se re-transcriben y reemplazan."""
+    stats = {"gaps": 0, "rescued_lines": 0, "skipped": [], "source": "mix",
+             "mismatch_replaced": 0}
     if not segments or not audio_path or not os.path.exists(audio_path):
         return list(segments or []), stats
     fuente = audio_path
@@ -349,10 +363,85 @@ def rescue(segments: list[dict], audio_path: str, *,
                 "%s (el ASR original no oyó nada ahí)", ini, fin, len(words),
                 stats["source"])
 
+        # ── Rescate por MISMATCH: reemplazar carteles manchados ──────────
+        reemplazados: set = set()
+        if asr_words and stats["source"] == "stem":
+            try:
+                from audio_coverage import text_mismatches
+                sospechosos = [
+                    m for m in text_mismatches(segments, asr_words,
+                                               min_ratio=_MISMATCH_MAX_RATIO)
+                    if (m["end"] - m["start"]) >= _MISMATCH_MIN_DUR_S
+                ]
+            except Exception:
+                sospechosos = []
+            ordenados = sorted((s for s in segments if isinstance(s, dict)),
+                               key=lambda x: _f(x.get("start")))
+            for m in sospechosos[:2]:          # tope conservador por canción
+                idx = m["index"]
+                card = segments[idx]
+                # Zona = el cartel + el hueco que le sigue (el manchado suele
+                # tapar el arranque de un hueco real, como en Hombre Lobo).
+                zona_a = m["start"]
+                zona_b = m["end"]
+                for nx in ordenados:
+                    if _f(nx.get("start")) > zona_b:
+                        zona_b = _f(nx.get("start")) - _PAD_S
+                        break
+                if regs and _voiced_overlap(zona_a, zona_b, regs) < _VAD_MIN_VOICED_S:
+                    stats["skipped"].append((round(zona_a, 1), "mismatch_sin_voz"))
+                    continue
+                w_ini = max(0.0, zona_a - contexto)
+                w_fin = zona_b + contexto
+                if fin_audio:
+                    w_fin = min(w_fin, fin_audio)
+                words = _transcribe_window(fuente, w_ini, w_fin - w_ini,
+                                           language)
+                words = [w for w in words
+                         if zona_a - 0.2 <= (_f(w.get("start")) + _f(w.get("end"))) / 2
+                         <= zona_b + 0.2]
+                if len(words) < _MIN_WORDS:
+                    stats["skipped"].append((round(zona_a, 1), "mismatch_sin_canto"))
+                    continue
+                if _texto_sospechoso(" ".join(str(w.get("word", "")) for w in words)):
+                    stats["skipped"].append((round(zona_a, 1), "mismatch_alucinacion"))
+                    continue
+                lineas_zona = []
+                for grupo in _agrupar_en_lineas(words):
+                    g0, g1 = _f(grupo[0].get("start")), _f(grupo[-1].get("end"))
+                    txt = " ".join(str(w.get("word", "")).strip()
+                                   for w in grupo).strip()
+                    if not txt or len(grupo) < 2 or g1 - g0 < _MIN_LINE_S:
+                        continue
+                    if len(grupo) / max(g1 - g0, 0.1) > _MAX_WORDS_PER_S:
+                        continue
+                    if regs and _voiced_overlap(g0, g1, regs) < min(
+                            _VAD_LINE_OVERLAP, (g1 - g0) * 0.5):
+                        continue
+                    lineas_zona.append({
+                        "start": round(max(zona_a, g0 - lead_s), 3),
+                        "end": round(min(zona_b + _PAD_S, g1 + hold_s), 3),
+                        "text": txt, "words": [dict(w) for w in grupo],
+                        "gap_rescued": True, "review": True})
+                # Reemplazo sólo si lo nuevo cubre razonablemente la zona del
+                # cartel viejo: no cambiar un cartel malo por un agujero.
+                cubre = sum(l["end"] - l["start"] for l in lineas_zona
+                            if l["start"] < m["end"])
+                if lineas_zona and cubre >= (m["end"] - m["start"]) * 0.4:
+                    reemplazados.add(idx)
+                    nuevas.extend(lineas_zona)
+                    stats["mismatch_replaced"] += 1
+                    logger.warning(
+                        "[GAP-RESCUE] cartel manchado %.1f-%.1fs (%r, "
+                        "ratio<%.2f) reemplazado por %d línea(s) reales",
+                        m["start"], m["end"], str(card.get("text", ""))[:32],
+                        _MISMATCH_MAX_RATIO, len(lineas_zona))
+
         if not nuevas:
             return list(segments), stats
         stats["rescued_lines"] = len(nuevas)
-        out = sorted(list(segments) + nuevas, key=lambda s: _f(s.get("start")))
+        base = [s for i, s in enumerate(segments) if i not in reemplazados]
+        out = sorted(base + nuevas, key=lambda s: _f(s.get("start")))
         for x, y in zip(out, out[1:]):
             if _f(x.get("end")) > _f(y.get("start")):
                 x["end"] = round(max(_f(x.get("start")) + 0.1,
