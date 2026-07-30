@@ -97,6 +97,10 @@ export default function WizardLivePreview({
   style = "auto",
   customColors = "",
   movementStyle = "",
+  // La base es una FOTO que subió el operador. Con eso la cámara no se mueve
+  // nunca —ni "quieta" ni "animada" la mueven— así que no se le puede aplicar
+  // la animación CSS de cámara del eje de IA.
+  operatorPhoto = false,
   effect = "",
   lyricsAnimation = "none",
   lineTransition = "none",
@@ -224,7 +228,13 @@ export default function WizardLivePreview({
   const baseClip = clipSrc;
   // Los videos de movimiento ya traen su cámara horneada. Las fuentes fijas
   // sí necesitan la animación CSS correspondiente (por ejemplo, parallax).
-  const baseAnim = !clipIsVideo ? (MOVE_ANIM[movementStyle] || "none") : "none";
+  // Regla: la animación CSS sólo puede representar movimiento de CÁMARA que el
+  // render vaya a hacer de verdad. Con la foto del operador no hay ninguno — y
+  // con Auto, que es el default, `MOVE_ANIM[""]` es `wlp-sutil`, así que la foto
+  // derivaba en pantalla sin que el operador tocara nada.
+  const baseAnim = (!clipIsVideo && !operatorPhoto)
+    ? (MOVE_ANIM[movementStyle] || "none")
+    : "none";
   const isPixelTransform = PIXEL_TRANSFORM_EFFECTS.has(effect);
   const liquidFilterId = `wlp-liquid-${filterId}`;
   const heatFilterId = `wlp-heat-${filterId}`;

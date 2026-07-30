@@ -834,6 +834,35 @@ def _background_source_is_ai(
     return True
 
 
+def _background_is_operator_upload(
+    background_path: str | None,
+    bg_r2_key: str | None,
+    *,
+    variation_source_path: str | None = None,
+    library_asset_id: int | None = None,
+) -> bool:
+    """True si el fondo salió de un archivo que SUBIÓ el operador.
+
+    Pregunta distinta a la de `_background_source_is_ai`, y por eso función
+    aparte. Ahí se clasifica la provenance del OUTPUT: un upload que animamos
+    con Veo cuenta como AI, y está bien — los píxeles finales los generó un
+    modelo, así que la validación de contenido tiene que correr.
+    Acá se pregunta por el INPUT: ¿este fondo es material humano que el operador
+    eligió y aprobó? Un arte del sello sigue siendo del sello aunque le
+    animemos las nubes, y por lo tanto NO es descartable.
+
+    Convención de nombres (la misma que usa `_background_source_is_ai`): los
+    uploads del operador se guardan como `bg_custom*` (`main.py:2680`, y
+    `bg_custom_edit*` en el path de edición). Biblioteca y variaciones NO son
+    upload del operador: son catálogo o derivados generados.
+    """
+    if not background_path or variation_source_path or library_asset_id is not None:
+        return False
+    key = (bg_r2_key or "").lower()
+    name = os.path.basename(background_path).lower()
+    return "bg_custom" in key or name.startswith("bg_custom")
+
+
 def _legacy_background_source_is_ai(
     *,
     asset_usage_mode: str | None,
@@ -1237,6 +1266,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             library_asset_id=variation_parent_asset_id,
         )
         _background_is_deterministic_fallback = False
+        # ¿La animación que pidió el operador terminó degradada a imagen fija?
+        # Hasta ahora esto se perdía en un logger.warning: el operador pedía
+        # animar su foto, Veo fallaba, se entregaba un zoom lento y no había
+        # NINGUNA señal (ni en el job, ni en la ficha del video, ni en Sentry).
+        # Se persiste en render_params más abajo para que la UI pueda decirlo.
+        _bg_animation_degraded = False
 
         # P0 fix 2026-06-19: _scenes_active se usa SIEMPRE en el render
         # (bg_prelooped=_scenes_active) pero antes sólo se inicializaba dentro de
@@ -1432,6 +1467,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 logger.warning("[BG] image-to-video failed, falling back to Ken Burns on %s",
                                background_path)
                 bg_image_path = background_path
+                # El operador pidió animar y no se pudo: queda registrado en el
+                # job (render_params.bg_animation_degraded) para que la ficha del
+                # video lo diga en vez de entregar un zoom en silencio.
+                _bg_animation_degraded = True
             if bg_image_path is None:
                 _background_is_ai_generated = False
         update_job(job_id, progress=40)
@@ -1488,6 +1527,13 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # Only persist background_hint / bg_verbatim when this run actually
         # received them — otherwise a hint-less typography edit would null out
         # values a prior background edit had stored (merge-not-replace).
+        # Resultado real de la animación pedida. Se escribe SIEMPRE que se haya
+        # intentado animar (True o False), así un re-render exitoso LIMPIA un
+        # True viejo y no quedamos avisando de una degradación que ya no existe.
+        # Si no se intentó animar, la clave no se toca (semántica merge-no-
+        # replace del resto del bloque).
+        if _animate_user_image:
+            _new_rp["bg_animation_degraded"] = bool(_bg_animation_degraded)
         if background_hint:
             _new_rp["background_hint"] = background_hint
         if bg_verbatim:
@@ -1700,12 +1746,34 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     # safe. Non-Universal AI output gets the same recovery;
                     # intentionally uploaded common-user assets keep the
                     # explicit validation failure behavior.
+                    # El arte que SUBIÓ el operador no es descartable (2026-07-30).
+                    # El comentario de arriba ya declara la intención —
+                    # "intentionally uploaded common-user assets keep the explicit
+                    # validation failure behavior"— pero la implementación la
+                    # contradecía: `_background_source_is_ai` devuelve True cuando
+                    # `animate_image` está prendido (~820), así que animar la foto
+                    # del operador la reclasificaba como "generated model output =
+                    # disposable". Resultado: un arte aprobado que no pasaba
+                    # validación se reemplazaba por un GRADIENTE y el job quedaba
+                    # `passed: True` (~1786). Para un sello es el peor modo de
+                    # falla: entregar otra cosa sin avisar.
+                    # Con este guard cae al camino que ya existe abajo:
+                    # status="validation_failed" + motivo. Un fallo visible es
+                    # mejor que una entrega silenciosa equivocada.
+                    _operator_upload_bg = _background_is_operator_upload(
+                        background_path, bg_r2_key,
+                        variation_source_path=variation_source_path,
+                        library_asset_id=variation_parent_asset_id,
+                    )
                     _recover_background = bool(
-                        _is_umg or _background_is_ai_generated
+                        (_is_umg or _background_is_ai_generated)
+                        and not _operator_upload_bg
                     )
                     logger.warning(
-                        "[VALIDATION] unsafe background job=%s recover=%s issues=%s",
-                        job_id, _recover_background, pre_validation["issues"],
+                        "[VALIDATION] unsafe background job=%s recover=%s "
+                        "operator_upload=%s issues=%s",
+                        job_id, _recover_background, _operator_upload_bg,
+                        pre_validation["issues"],
                     )
                     _recovered_validation = None
                     if _recover_background and _background_is_ai_generated:
@@ -1904,6 +1972,14 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 # y rinde sin letra. bg_image_path es el cover (imagen).
                 art_track=art_track,
                 label_line=label_line,
+                # "Quieta de verdad": si el fondo entregado es una IMAGEN y el
+                # operador eligió Estático, no le metemos el zoom del 15%.
+                # Es además la primera vez que `movement_style` hace algo en el
+                # camino de fondo humano: hasta ahora el eje entero era inerte
+                # acá (se enviaba, se persistía y nadie lo leía).
+                still_background=(
+                    _normalize_movement_style(movement_style) == "estatico"
+                ),
             )
             # Cinemascope opt-in: letterbox the finished YouTube master. Skipped
             # for UMG (that path returns a ProRes .mov — re-encoding it as h264
@@ -14636,6 +14712,14 @@ def generate_lyric_video(
     # SIN letra ni title card. Requiere una imagen como bg_image_path.
     art_track: bool = False,
     label_line: str = "",
+    # "Quieta de verdad" (2026-07-30). Un fondo que es IMAGEN recibía SIEMPRE un
+    # zoom del 15% (`_prerender_kenburns_bg`), así que "sin movimiento" no
+    # existía para una foto subida por el operador: la única forma de que su
+    # foto quedara quieta era... que no quedara quieta. Asimetría absurda: el
+    # still que genera Imagen sí queda quieto (usa `_static_image_to_mp4`).
+    # Con este flag el caller —que es quien sabe si el operador pidió "quieta"—
+    # elige, y el render sólo ejecuta. Default False = comportamiento histórico.
+    still_background: bool = False,
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -14747,11 +14831,22 @@ def generate_lyric_video(
         try:
             ass_bg = bg_source
             if not _bg_is_video:
-                # Image background → pre-render the Ken Burns motion to a
-                # video with ffmpeg zoompan so the single-pass burn applies.
-                ass_bg = _prerender_kenburns_bg(
-                    bg_source, duration, job_dir, spec=spec,
-                )
+                if still_background:
+                    # El operador pidió que su foto quede QUIETA. Mismo helper
+                    # que usa la rama Imagen, así que "quieta" significa lo
+                    # mismo venga de IA o de un archivo propio.
+                    ass_bg = _static_image_to_mp4(
+                        bg_source,
+                        os.path.join(job_dir, "bg_still_ass.mp4"),
+                        duration,
+                        spec=spec,
+                    )
+                else:
+                    # Image background → pre-render the Ken Burns motion to a
+                    # video with ffmpeg zoompan so the single-pass burn applies.
+                    ass_bg = _prerender_kenburns_bg(
+                        bg_source, duration, job_dir, spec=spec,
+                    )
             logger.info("[ASS] libass fast path (engine=ass, profile=%s, bg=%s)",
                         spec.profile, "image" if not _bg_is_video else "video")
             _t0 = _time.monotonic()
@@ -16854,6 +16949,10 @@ def run_edit_pipeline(
             title_song_break=title_song_break,
             # Multi-escena: el timeline ya cubre toda la canción → no re-loopear.
             bg_prelooped=bg_prelooped,
+            # Espejo de run_pipeline: un edit no puede perder el "quieta".
+            still_background=(
+                _normalize_movement_style(movement_style) == "estatico"
+            ),
         )
         # Cinemascope opt-in — mirror run_pipeline. YouTube master only.
         if _video_out and not wants_umg:
