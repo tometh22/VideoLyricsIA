@@ -4992,8 +4992,19 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
             return result
         from pipeline import _audio_duration
         dur = await asyncio.to_thread(_audio_duration, audio_path)
-        if not _gr.find_gaps(segs, dur):
-            return result          # sin huecos: ni tocamos el stem
+        _hay_huecos = bool(_gr.find_gaps(segs, dur))
+        _hay_manchados = False
+        _words_pre = result.get("_asr_words") or []
+        if _words_pre:
+            try:
+                from audio_coverage import text_mismatches as _tm_pre
+                _hay_manchados = any(
+                    (m["end"] - m["start"]) >= 4.0
+                    for m in _tm_pre(segs, _words_pre, min_ratio=0.3))
+            except Exception:
+                pass
+        if not _hay_huecos and not _hay_manchados:
+            return result          # nada que rescatar: ni tocamos el stem
 
         try:
             import vocal_sep as _vs
@@ -5010,14 +5021,16 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
             _gr.rescue, segs, audio_path, stem_path=_stem, audio_duration=dur,
             language=language or "es", lead_s=_li.lead_seconds(),
             hold_s=_li.hold_seconds(),
+            asr_words=result.get("_asr_words"),
         )
         if stats.get("rescued_lines"):
             result = dict(result)
             result["segments"] = nuevo
             logger.warning(
-                "[GAP-RESCUE] %d línea(s) rescatada(s) de %d hueco(s) usando "
-                "%s — el ASR de la cascada no había oído nada ahí job=%s",
-                stats["rescued_lines"], stats["gaps"], stats["source"], job_id)
+                "[GAP-RESCUE] %d línea(s) rescatada(s) (%d hueco(s), %d "
+                "cartel(es) manchado(s) reemplazado(s)) usando %s job=%s",
+                stats["rescued_lines"], stats["gaps"],
+                stats.get("mismatch_replaced", 0), stats["source"], job_id)
         elif stats.get("gaps"):
             logger.info("[GAP-RESCUE] %d hueco(s) sin contenido recuperable "
                         "(%s) job=%s", stats["gaps"], stats["skipped"], job_id)

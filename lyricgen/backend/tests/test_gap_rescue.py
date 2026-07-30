@@ -246,3 +246,89 @@ def test_dedup_del_eco_extiende_en_vez_de_duplicar(audio, tmp_path, monkeypatch)
     out, stats = gr.rescue(segs, audio, stem_path=str(stem), audio_duration=80.0)
     rescatadas = [s for s in out if s.get("gap_rescued")]
     assert len(rescatadas) == 1, "el eco repetido se funde, no se duplica"
+
+
+# ── rescate por MISMATCH: carteles manchados (Hombre Lobo, job ed72b608) ──
+
+def _witness(texto, ini, paso=0.5):
+    return _words(texto, ini, paso)
+
+
+def test_reemplaza_cartel_manchado(audio, tmp_path, monkeypatch):
+    """El alineador untó 'En el fondo' sobre 6,8s que cantan otra cosa. Con
+    testigo que lo delata (ratio<0.3), la zona se re-transcribe y el cartel
+    se reemplaza por lo realmente cantado."""
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"RIFF" + b"\0" * 128)
+    _con_vad(monkeypatch, [(10.0, 60.0)])
+    manchado = _seg(20, 32, "En el fondo")
+    segs = [_seg(10, 18, "linea previa bien puesta aqui"), manchado,
+            _seg(40, 48, "otra linea posterior bien puesta")]
+    testigo = (_witness("linea previa bien puesta aqui", 10.5)
+               + _witness("nunca me imagine cantando para vos en un mundo", 21.0)
+               + _witness("casi ya sin ley nosotros somos el amor", 26.5)
+               + _witness("otra linea posterior bien puesta", 40.5))
+    monkeypatch.setattr(
+        gr, "_transcribe_window",
+        lambda *a, **k: (_witness("nunca me imagine cantando para vos en un mundo", 21.0)
+                         + _witness("casi ya sin ley nosotros somos el amor", 26.5)))
+    out, stats = gr.rescue(segs, audio, stem_path=str(stem),
+                           audio_duration=60.0, asr_words=testigo)
+    assert stats["mismatch_replaced"] == 1
+    textos = [s["text"] for s in out]
+    assert "En el fondo" not in textos, "el cartel manchado debe reemplazarse"
+    assert any("nunca me imagine" in t for t in textos)
+    assert all(s.get("review") for s in out if s.get("gap_rescued"))
+
+
+def test_cartel_correcto_no_se_toca(audio, tmp_path, monkeypatch):
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"RIFF" + b"\0" * 128)
+    _con_vad(monkeypatch, [(10.0, 60.0)])
+    seg = _seg(20, 26, "nunca me imagine cantando para vos")
+    testigo = (_witness("nunca me imagine cantando para vos", 20.5)
+               + _witness("relleno uno dos tres cuatro", 28.5))
+    monkeypatch.setattr(gr, "_transcribe_window",
+                        lambda *a, **k: pytest.fail("no debería re-transcribir"))
+    out, stats = gr.rescue([_seg(10, 18), seg, _seg(28, 36)], audio,
+                           stem_path=str(stem), audio_duration=40.0,
+                           asr_words=testigo)
+    assert stats["mismatch_replaced"] == 0
+
+
+def test_mismatch_sin_voz_no_reemplaza(audio, tmp_path, monkeypatch):
+    """Cartel manchado pero el stem no canta en su zona → se deja (el VAD
+    manda: sin voz no hay verdad con qué reemplazar)."""
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"RIFF" + b"\0" * 128)
+    _con_vad(monkeypatch, [(5.0, 12.0)])              # voz solo al principio
+    manchado = _seg(20, 32, "En el fondo")
+    testigo = _witness("texto totalmente distinto que delata al cartel aqui", 21.0)
+    out, stats = gr.rescue([_seg(10, 12), manchado, _seg(40, 48)], audio,
+                           stem_path=str(stem), audio_duration=60.0,
+                           asr_words=testigo)
+    assert stats["mismatch_replaced"] == 0
+    assert any(r == "mismatch_sin_voz" for _, r in stats["skipped"])
+    assert any(s.get("text") == "En el fondo" for s in out)
+
+
+def test_reemplazo_exige_cubrir_la_zona(audio, tmp_path, monkeypatch):
+    """Si la re-transcripción devuelve poco, el cartel NO se borra: peor un
+    cartel dudoso que un agujero."""
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"RIFF" + b"\0" * 128)
+    _con_vad(monkeypatch, [(10.0, 60.0)])
+    manchado = _seg(20, 32, "En el fondo")
+    testigo = _witness("texto totalmente distinto que delata al cartel aqui", 21.0)
+    monkeypatch.setattr(gr, "_transcribe_window",
+                        lambda *a, **k: _witness("dos palabras", 21.0))
+    out, stats = gr.rescue([_seg(10, 18), manchado, _seg(40, 48)], audio,
+                           stem_path=str(stem), audio_duration=60.0,
+                           asr_words=testigo)
+    assert stats["mismatch_replaced"] == 0
+    assert any(s.get("text") == "En el fondo" for s in out)
+
+
+def test_sin_asr_words_no_hay_pasada_mismatch(audio, tmp_path, monkeypatch):
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"RIFF" + b"\0" * 128)
+    _con_vad(monkeypatch, [(10.0, 60.0)])
+    out, stats = gr.rescue([_seg(10, 18), _seg(20, 32, "En el fondo"),
+                            _seg(40, 48)], audio, stem_path=str(stem),
+                           audio_duration=60.0)
+    assert stats["mismatch_replaced"] == 0
