@@ -35,7 +35,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
-from sqlalchemy import exists, func
+from sqlalchemy import JSON, exists, func, or_
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -78,11 +78,12 @@ _ORPHAN_POLL_THRESHOLD_MIN = int(os.environ.get(
     "REAPER_ORPHAN_POLL_THRESHOLD_MIN", "10",
 ))
 
-# transcribed_pending jobs are uploaded but waiting on the user to finish
-# the lyrics editor and click Generate. They consume disk + R2 storage,
-# and abandoned ones (closed tab, lost connection) accumulate forever
-# without a separate sweep. A 30-min TTL covers the realistic editing
-# window without prematurely killing live sessions.
+# Incomplete transcribed_pending jobs can be left behind before the worker
+# persists segments. Completed transcriptions are operator work and must never
+# be hard-deleted by this short TTL: a real lyrics review can legitimately sit
+# idle for more than 30 minutes. The query below therefore only reaps rows with
+# segments_json IS NULL. Completed rows need a separate archival/retention
+# policy with an audit trail.
 _TRANSCRIBED_PENDING_TTL_MIN = int(os.environ.get(
     "REAPER_TRANSCRIBED_PENDING_TTL_MIN", "30",
 ))
@@ -271,10 +272,13 @@ def find_abandoned_transcribed(
     db: Session,
     ttl_min: int = _TRANSCRIBED_PENDING_TTL_MIN,
 ) -> list[Job]:
-    """Return jobs stuck in transcribed_pending past the editing TTL.
-    These represent users who transcribed but never clicked Generate
-    (closed tab, lost connection). The associated audio file lives on
-    disk + R2 and needs to be reaped or it accumulates forever.
+    """Return incomplete transcribed_pending rows past the editing TTL.
+
+    A row with ``segments_json`` is a completed transcription waiting for
+    operator review, not disposable upload state. Never include those rows in
+    this hard-delete sweep, regardless of age or activity. This distinction
+    matters because the async transcription worker intentionally finishes in
+    ``transcribed_pending`` after persisting the segments.
 
     Staleness anchor is coalesce(last_user_activity_at, created_at): any
     authenticated touch (POST /save-segments, /status poll, etc) bumps
@@ -291,6 +295,12 @@ def find_abandoned_transcribed(
     return (
         db.query(Job)
         .filter(Job.status == "transcribed_pending")
+        # SQLAlchemy JSON may persist Python None as JSON `null` rather than
+        # SQL NULL, depending on the dialect/path that created the row.
+        .filter(or_(
+            Job.segments_json.is_(None),
+            Job.segments_json == JSON.NULL,
+        ))
         .filter(anchor < cutoff)
         .order_by(Job.created_at.asc())
         .all()
@@ -742,10 +752,19 @@ def _reason_for_stalled(job: Job) -> str:
 
 
 def _delete_abandoned_transcribed(db: Session, job: Job) -> None:
-    """Hard-delete an abandoned transcribed_pending row + its audio file.
-    The user never finalized the upload, so there's no operator-facing
-    artifact to preserve."""
+    """Hard-delete an incomplete transcribed_pending row + its audio file.
+
+    Callers must only pass rows without persisted segments. Completed
+    transcriptions are protected by ``find_abandoned_transcribed``.
+    """
     job_id = job.job_id
+    if job.segments_json is not None:
+        logger.warning(
+            "[REAPER] refused hard-delete of completed transcription %s "
+            "(segments are persisted)",
+            job_id,
+        )
+        return
     # Local file under OUTPUTS_DIR.
     try:
         from pipeline import OUTPUTS_DIR
