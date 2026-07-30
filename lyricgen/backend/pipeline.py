@@ -9973,7 +9973,26 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
         " no close-up of a person, no recognizable faces, no identifiable "
         "individual, no portrait, no person as the subject of the shot,"
     )
-    safe_prompt = f"{prompt}. No text, no words, no letters,{_people_suffix} no logos, no readable signage."
+    # Riel anti-ilustración en el borde de Imagen (2026-07-29). Las 3 ramas de
+    # Veo no-`animado` ya lo llevan de forma INCONDICIONAL ("Photorealistic,
+    # filmed with cinema camera, real footage … no CGI, no animation"), pero
+    # Imagen no tenía NINGÚN negativo estético. Como `foto-parallax` y
+    # `effect=foto_viva` fuerzan bg_mode=imagen, un fondo podía salir
+    # ilustrado/3D sin que el operador eligiera "Ilustración viva".
+    # El contrato es el mismo que en Veo: la estética ilustrada se sirve
+    # EXCLUSIVAMENTE con `animado`, que rutea a Veo por diseño (regla de matriz
+    # "Imagen × Animado → Veo"), así que el registro Imagen es siempre
+    # fotográfico. Por eso el negativo es incondicional acá también.
+    # Ojo: `_imagen_quality_line` dice algo equivalente, pero es una instrucción
+    # a GEMINI y sólo se emite en las ramas concept/genre — no cubre la rama
+    # pura-Auto (genre="" y concept="", el default del wizard) ni el modo
+    # verbatim, que saltea Gemini entero. Este es el borde real del generador.
+    safe_prompt = (
+        f"{prompt}. Photorealistic photograph, real photo. "
+        f"No text, no words, no letters,{_people_suffix} no logos, "
+        "no readable signage, no illustration, no drawing, no cartoon, "
+        "no anime, no 3D render, no CGI."
+    )
 
     recorder = record_ai_call(
         job_id=job_id or "unknown",
