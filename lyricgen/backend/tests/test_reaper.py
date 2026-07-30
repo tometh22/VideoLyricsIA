@@ -651,6 +651,7 @@ def test_completed_transcription_is_never_hard_deleted_by_short_ttl():
             db,
             status="transcribed_pending",
             age_minutes=24 * 60,
+            job_id="done_keep",
             last_user_activity_minutes_ago=23 * 60,
             segments_json=[
                 {"start": 1.0, "end": 3.0, "text": "Trabajo del operador"},
@@ -676,6 +677,7 @@ def test_delete_helper_refuses_completed_transcription():
             db,
             status="transcribed_pending",
             age_minutes=24 * 60,
+            job_id="done_guard",
             segments_json=[
                 {"start": 1.0, "end": 3.0, "text": "Trabajo del operador"},
             ],
