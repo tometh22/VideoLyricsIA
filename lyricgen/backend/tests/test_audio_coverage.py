@@ -239,3 +239,77 @@ def test_summarize_incluye_voiced_gap(monkeypatch, tmp_path):
     assert s["voiced_gap_s"] == 20.0
     # y las claves viejas siguen (compat con el log)
     assert "audio_coverage" in s and "text_mismatches" in s
+
+
+# ── el breaker no puede confundir fuga instrumental con canto ─────────────
+# Batch de 12 (30-07-2026): disparó en 3 canciones y las 8 zonas acusadas
+# eran falsas — al transcribirlas sobre el stem devolvieron nada o pura
+# alucinación. El stem de demucs arrastra solos de guitarra, vientos y
+# colas de reverb: energía sí, canto no.
+
+def _vad(monkeypatch, regiones):
+    import audio_coverage as _ac
+    monkeypatch.setattr("anchor_align.vocal_regions", lambda *a, **k: regiones)
+    return _ac
+
+
+def test_fuga_instrumental_no_dispara(monkeypatch, tmp_path):
+    """Rata Blanca: 76,2s de outro de guitarra. La energía sola lo acusa;
+    el veredicto del sondeo (whisper oyó 'Amara.org') lo absuelve."""
+    ac = _vad(monkeypatch, [(376.0, 378.0), (400.0, 402.2)])
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"RIFF")
+    segs = [{"start": 360, "end": 375.2, "text": "ultima linea"}]
+    assert ac.voiced_gaps(segs, str(stem), audio_duration=451.4)
+    assert ac.voiced_gaps(segs, str(stem), audio_duration=451.4,
+                          rescue_skipped=[(375.2, "alucinacion")]) == []
+
+
+def test_hueco_real_si_dispara(monkeypatch, tmp_path):
+    """Hombre Lobo 116,9-131,0: cuatro versos perdidos, 100% cantado."""
+    ac = _vad(monkeypatch, [(116.9, 131.0)])
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"RIFF")
+    segs = [{"start": 100, "end": 116.9, "text": "a"},
+            {"start": 131.0, "end": 140, "text": "b"}]
+    out = ac.voiced_gaps(segs, str(stem), audio_duration=219.3)
+    assert len(out) == 1 and out[0]["voiced_s"] >= 13.0
+
+
+def test_la_fraccion_NO_discrimina(monkeypatch, tmp_path):
+    """Guardián de la tabla del docstring: el hueco fundacional (Rodando
+    209-240, 14s cantados de 31 = 45%) tiene MENOS fracción que un falso
+    positivo real (Pericos, 65%). Cualquier corte por fracción que mate al
+    falso mata también al verdadero — por eso el gate es inerte."""
+    ac = _vad(monkeypatch, [(215.0, 229.0)])
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"RIFF")
+    real = [{"start": 180, "end": 209, "text": "a"},
+            {"start": 240, "end": 250, "text": "b"}]
+    got = ac.voiced_gaps(real, str(stem), audio_duration=280.0)
+    assert len(got) == 1, "el defecto fundacional debe seguir detectándose"
+    frac = got[0]["voiced_s"] / (got[0]["end"] - got[0]["start"])
+    assert frac < 0.65, "y su fracción es menor que la de un falso positivo"
+
+
+def test_no_contradice_al_sondeo_de_gap_rescue(monkeypatch, tmp_path):
+    """Pericos: 65% de energía en un break de 20s, pero el ASR sobre el stem
+    oyó 2 palabras en total. gap_rescue lo descartó; el breaker lo acata."""
+    ac = _vad(monkeypatch, [(106.5, 119.7)])
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"RIFF")
+    segs = [{"start": 96, "end": 106.5, "text": "a"},
+            {"start": 126.8, "end": 131, "text": "b"}]
+    assert ac.voiced_gaps(segs, str(stem), audio_duration=211.0,
+                          min_voiced_frac=0.0)
+    assert ac.voiced_gaps(segs, str(stem), audio_duration=211.0,
+                          min_voiced_frac=0.0,
+                          rescue_skipped=[(106.5, "sin_canto")]) == []
+
+
+def test_summarize_propaga_los_veredictos(monkeypatch, tmp_path):
+    ac = _vad(monkeypatch, [(20.0, 40.0)])
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"RIFF")
+    segs = [{"start": 10, "end": 20, "text": "hola que tal"},
+            {"start": 40, "end": 50, "text": "chau que tal"}]
+    words = [{"word": "hola", "start": 11, "end": 12}]
+    con = ac.summarize(segs, words, stem_path=str(stem), audio_duration=60.0)
+    sin = ac.summarize(segs, words, stem_path=str(stem), audio_duration=60.0,
+                       rescue_skipped=[(20.0, "alucinacion")])
+    assert con["voiced_gaps"] == 1 and sin["voiced_gaps"] == 0

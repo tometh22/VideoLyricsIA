@@ -5034,9 +5034,15 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
         elif stats.get("gaps"):
             logger.info("[GAP-RESCUE] %d hueco(s) sin contenido recuperable "
                         "(%s) job=%s", stats["gaps"], stats["skipped"], job_id)
+        if stats.get("skipped"):
+            # Siempre, aunque haya habido rescates: son los veredictos que
+            # el circuit breaker necesita para no contradecir al sondeo.
+            logger.info("[GAP-RESCUE] descartados: %s job=%s",
+                        stats["skipped"], job_id)
         result.setdefault("postpass_stats", {})["gap_rescue"] = {
             "gaps": stats.get("gaps", 0),
             "rescued_lines": stats.get("rescued_lines", 0),
+            "skipped": stats.get("skipped", []),
             "source": stats.get("source")}
         return result
     except Exception as e:

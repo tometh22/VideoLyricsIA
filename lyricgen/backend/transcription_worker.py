@@ -93,8 +93,15 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                     _stem = _vs.separate_vocals(audio_path, cache_only=True)
                 except Exception as e:
                     logger.info("[COVERAGE] sin stem para voiced_gaps (%r)", e)
+            # Veredictos del sondeo con ASR: gap_rescue mide PALABRAS, la
+            # única evidencia real de letra faltante. El breaker no puede
+            # acusar un hueco que aquél ya descartó (batch 30-07: 8 de 8
+            # zonas acusadas por energía eran fuga de guitarra/vientos).
+            _skip = ((r.get("postpass_stats") or {})
+                     .get("gap_rescue", {}).get("skipped") or [])
             c = summarize(r.get("segments") or [], words,
-                          stem_path=_stem, audio_duration=_dur)
+                          stem_path=_stem, audio_duration=_dur,
+                          rescue_skipped=_skip)
             cascada = r.get("audio_coverage")
             final = c["audio_coverage"]
             r["audio_coverage"] = final
