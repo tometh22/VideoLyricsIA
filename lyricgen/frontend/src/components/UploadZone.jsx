@@ -53,6 +53,11 @@ const LYRIC_RENDER_FIELDS = new Set([
   "font", "textCase", "fontScale", "textContrast", "frameFormat",
   "lyricsAnimation", "lineTransition", "lyricColor", "lyricSungColor",
 ]);
+// Qué cuenta como FOTO subida (vs video). Mismo criterio que el backend, que
+// sólo reconoce estas extensiones como still animable (`_is_still` en
+// pipeline.py): si acá y allá no coinciden, el operador elige "animar" y el
+// pipeline lo ignora sin decir nada.
+const CUSTOM_STILL_RE = /\.(jpe?g|png)$/i;
 
 function applyTextCase(text, c) {
   if (c === "upper") return text.toUpperCase();
@@ -531,7 +536,16 @@ export default function UploadZone({
     // Foto viva is photo-first. Keep the two axes honest in the UI instead of
     // letting a stale cinematic movement selection promise a video source
     // while the effect actually needs an image-to-video seed.
-    if (code === "foto_viva" && batchDefaults.movementStyle !== "foto-parallax") {
+    // Con una foto SUBIDA no se toca el movimiento: ahí `foto-parallax` no lo
+    // lee nadie en el render pero SÍ se persiste en render_params y SÍ se
+    // muestra en la ficha del video — un valor inventado que el operador nunca
+    // eligió. Es el vector del "regeneré siete veces sin ver que decía otra
+    // cosa". Peor: hasta el fix del P0 (#1038) ese mismo valor hacía que la
+    // foto del operador se descartara.
+    if (
+      code === "foto_viva" && !_customStill
+      && batchDefaults.movementStyle !== "foto-parallax"
+    ) {
       updateBatchDefault("movementStyle", "foto-parallax");
     }
     updateBatchDefault("effect", code);
@@ -682,6 +696,42 @@ export default function UploadZone({
     setCustomPreviewUrl(url);
     return () => URL.revokeObjectURL(url);
   }, [backgroundFile]);
+  // ── Eje "¿qué hace tu foto?" (2026-07-30) ───────────────────────────────
+  // Sólo aplica a una IMAGEN subida por el operador. El .mp4/.mov ya trae su
+  // movimiento, y el eje de 6 tarjetas de Movimiento es inerte para un fondo
+  // humano: `movement_style` se enviaba y se persistía, y el render no lo leía
+  // en ninguna de las dos ramas (con animate_image el prompt sale por
+  // `elif image_path` antes de mirar el movimiento; sin animate_image el
+  // pipeline ni entra a `_ensure_background`). Acá el eje pasa a significar
+  // algo real para una foto: quieta o animada.
+  const _customStill = (
+    bgMode === "custom" && !!backgroundFile
+    && CUSTOM_STILL_RE.test(backgroundFile.name || "")
+  );
+  const _customVideo = (
+    bgMode === "custom" && !!backgroundFile && !_customStill
+  );
+  // Con una foto subida el movimiento es `estatico` SIEMPRE:
+  //   - "Foto quieta"  → el backend lo lee (`still_background`) y no le mete el
+  //     zoom del 15% que recortaba ~13% del encuadre.
+  //   - "Foto animada" → es inerte en el prompt de Veo (la rama de
+  //     image-to-video no mira el movimiento), pero deja el fallback HONESTO:
+  //     si Veo falla se entrega la foto QUIETA en vez de un zoom sorpresa.
+  // Se coerciona al subir, no al clickear, para que valga aunque el operador
+  // nunca abra el paso de Movimiento.
+  useEffect(() => {
+    if (!_customStill) return;
+    if (batchDefaultsRef.current.movementStyle !== "estatico") {
+      updateBatchDefault("movementStyle", "estatico");
+    }
+    // Un `foto_viva` heredado del sticky seguiría disparando la animación por
+    // la puerta de atrás (es un OR con animate_image), con la tarjeta oculta y
+    // "Foto quieta" marcada: el "elegí X y salió Y" exacto. Se limpia.
+    if (batchDefaultsRef.current.effect === "foto_viva") {
+      updateBatchDefault("effect", "");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [_customStill]);
   // ── "Mi prompt" como artefacto guardado ─────────────────────────────────
   // Antes, clickear "Auto" o "Inspirado en la letra" ejecutaba un clear del
   // prompt: sin confirmación, sin undo, sin quedar registrado en ningún lado.
@@ -1111,6 +1161,38 @@ export default function UploadZone({
     })),
   ];
 
+  // Eje de FOTO SUBIDA. Dos opciones, no tres: el "zoom lento" que hoy recibe
+  // toda foto subida no está acá a propósito. Recorta ~13% del encuadre
+  // (zoom_end=1.15), y sobre arte aprobado por un sello eso se come un logo o un
+  // crédito ℗. Además ya se decidió que la foto que genera la IA queda quieta;
+  // ofrecer el zoom como opción reabriría una pregunta cerrada y daría dos
+  // respuestas distintas para el mismo objeto. Queda accesible por env
+  // (CUSTOM_STILL_KEN_BURNS) si hiciera falta volver atrás, no como UI.
+  // El eje EFECTO sigue siendo independiente y aditivo: se combina con las dos.
+  const PHOTO_MOTIONS = [
+    {
+      code: "quieta",
+      animate: false,
+      label: t("upload.photo_motion_still"),
+      desc: t("upload.photo_motion_still_desc"),
+    },
+    {
+      code: "animar",
+      animate: true,
+      label: t("upload.photo_motion_animate"),
+      desc: t("upload.photo_motion_animate_desc"),
+      badge: t("upload.photo_motion_time_badge"),
+      note: t("upload.photo_motion_animate_fallback"),
+    },
+  ];
+  // Selector inverso: total y sin agujeros. `animateImage` es la única fuente de
+  // verdad, así que cualquier movement_style viejo/sticky no puede desincronizar
+  // la tarjeta que se ve marcada de lo que el render va a hacer.
+  const _photoMotion = animateImage ? "animar" : "quieta";
+  const _photoMotionOption = (
+    PHOTO_MOTIONS.find((p) => p.code === _photoMotion) || PHOTO_MOTIONS[0]
+  );
+
   // Effect overlay — animated particles composited OVER the background (the
   // proven UMG pattern: foto/loop calmo + nieve/lluvia/estrellas encima). It's
   // usually an ORTHOGONAL axis to "Movimiento": overlays fall on top of any
@@ -1169,9 +1251,18 @@ export default function UploadZone({
     { code: "stylized", label: t("upload.effect_category_stylized") || "Estilos" },
     { code: "reactive", label: t("upload.effect_category_reactive") || "Al ritmo" },
   ];
-  const visibleEffects = effectCategory === "all"
-    ? EFFECTS
-    : EFFECTS.filter((effect) => effect.category === effectCategory);
+  // `foto_viva` es la SEGUNDA puerta a "animar mi foto": dispara el mismo
+  // image-to-video que la tarjeta "Foto animada" (`_animate_user_image` es un OR
+  // entre las dos) pero con un prompt más pobre — anima UN sujeto en vez de
+  // varios elementos reales— y encima le ganaba en precedencia. Con el eje
+  // explícito, dejarlo visible acá son dos controles peleando por la misma
+  // decisión. Sigue intacto en el camino de fondo IA, donde genera su propio
+  // still y sí es un efecto.
+  const visibleEffects = (
+    effectCategory === "all"
+      ? EFFECTS
+      : EFFECTS.filter((effect) => effect.category === effectCategory)
+  ).filter((effect) => !(_customStill && effect.code === "foto_viva"));
   const selectedEffect = EFFECTS.find(
     (effect) => effect.code === (batchDefaults.effect || ""),
   ) || EFFECTS[0];
@@ -1943,13 +2034,104 @@ export default function UploadZone({
                     01 · {t("upload.motion_editing_badge") || "Editando"}
                   </p>
                   <p className="truncate text-[12px] font-semibold text-white">
-                    {t("upload.movement_gallery_title") || "Movimiento base"}
+                    {_customStill || _customVideo
+                      ? t("upload.movement_photo_title")
+                      : t("upload.movement_gallery_title")}
                   </p>
                 </div>
-                <span className="max-w-[42%] truncate rounded-full border border-brand/20 bg-brand/[0.08] px-2 py-1 text-[8px] font-medium text-brand-light">
-                  {selectedMovement.label.replace(/\s*\(.*\)\s*/, "")}
-                </span>
+                {/* El chip tiene que decir lo que el render va a hacer. Con una
+                    foto subida, mostrar una opción del eje de IA (que ahí no se
+                    lee) es exactamente el "elegí X y salió Y". */}
+                {!_customVideo && (
+                  <span className="max-w-[42%] truncate rounded-full border border-brand/20 bg-brand/[0.08] px-2 py-1 text-[8px] font-medium text-brand-light">
+                    {_customStill
+                      ? PHOTO_MOTIONS.find((p) => p.code === _photoMotion)?.label
+                      : selectedMovement.label.replace(/\s*\(.*\)\s*/, "")}
+                  </span>
+                )}
               </div>
+              {_customVideo ? (
+                /* Un .mp4/.mov ya trae su movimiento y el eje no aplica. No se
+                   renderizan tarjetas deshabilitadas: un control que nunca va a
+                   poder habilitarse en este contexto es ruido. El slot se
+                   mantiene (si desapareciera, el "02 · Efecto" quedaría
+                   huérfano numerado 02 sin 01). */
+                <div
+                  data-testid="photo-motion-video-note"
+                  className="rounded-xl border border-dashed border-gray-600/40 bg-surface-3/50 px-3 py-2.5 text-[10px] leading-snug text-gray-500"
+                >
+                  {t("upload.movement_custom_video_note")}
+                </div>
+              ) : _customStill ? (
+                <div
+                  role="radiogroup"
+                  aria-label={t("upload.movement_photo_title")}
+                  data-testid="photo-motion-group"
+                  className="grid grid-cols-2 gap-2"
+                >
+                  {PHOTO_MOTIONS.map((p) => {
+                    const active = _photoMotion === p.code;
+                    return (
+                      <button
+                        key={p.code}
+                        type="button"
+                        role="radio"
+                        aria-checked={active}
+                        tabIndex={active ? 0 : -1}
+                        onClick={() => onAnimateImage?.(p.animate)}
+                        data-photo-motion={p.code}
+                        /* El nombre accesible incluye el costo en tiempo y la
+                           promesa de fallback: quien usa lector de pantalla
+                           tiene que poder decidir sin recorrer el DOM. */
+                        aria-label={`${p.label}: ${p.desc}${p.note ? ` ${p.note}` : ""}`}
+                        title={`${p.desc}${p.note ? ` ${p.note}` : ""}`}
+                        className={`group relative overflow-hidden rounded-xl border text-left transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand ${
+                          active
+                            ? "border-brand/65 bg-brand/[0.1] shadow-[0_0_0_1px_rgba(139,92,246,.12),0_12px_24px_rgba(0,0,0,.18)]"
+                            : "border-white/[0.07] bg-white/[0.02] hover:-translate-y-0.5 hover:border-white/[0.18] hover:bg-white/[0.045]"
+                        }`}
+                      >
+                        <div className="relative aspect-video overflow-hidden bg-black">
+                          {/* La miniatura es la FOTO REAL del operador, no un
+                              sample genérico: mostrarle un stock de palmeras a
+                              quien subió el arte de su single es la clase de
+                              mentira que este cambio viene a sacar. */}
+                          {customPreviewUrl ? (
+                            <img
+                              src={customPreviewUrl}
+                              alt=""
+                              className="h-full w-full object-cover pointer-events-none"
+                            />
+                          ) : (
+                            <div className="h-full w-full" style={{ background: "radial-gradient(120% 100% at 50% 0,#38235d,#0b0820)" }} />
+                          )}
+                          {/* "Animada": se insinúa con la ventana viva que ya
+                              existe para foto_viva — movimiento de CONTENIDO,
+                              nunca un paneo de cámara, que enseñaría justo el
+                              modelo mental equivocado. */}
+                          {p.animate && (active || hoverMovement === p.code) && (
+                            <span aria-hidden="true" className="wlp-living-window motion-reduce:hidden" />
+                          )}
+                          <div className="absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-black/85 to-transparent" />
+                          <p className="absolute inset-x-2 bottom-1.5 truncate text-[9px] font-semibold text-white">
+                            {p.label}
+                          </p>
+                          {p.badge && (
+                            <span className="absolute left-1.5 top-1.5 shrink-0 rounded-full bg-cyan-400/20 px-1.5 py-0.5 text-[7px] font-bold tracking-[0.12em] text-cyan-50 backdrop-blur">
+                              {p.badge}
+                            </span>
+                          )}
+                          {active && (
+                            <div className="absolute right-1.5 top-1.5 grid h-5 w-5 place-items-center rounded-full bg-white text-brand shadow-lg">
+                              <svg className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                            </div>
+                          )}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : (
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                 {MOVEMENT_STYLES.map((m) => {
                   const active = batchDefaults.movementStyle === m.code;
@@ -1999,8 +2181,11 @@ export default function UploadZone({
                   );
                 })}
               </div>
+              )}
               <p className="mt-2 text-[9px] leading-snug text-gray-600">
-                {t("upload.movement_gallery_desc") || "Elegí una opción y mirá el resultado en el preview."}
+                {_customStill
+                  ? t("upload.movement_photo_desc")
+                  : t("upload.movement_gallery_desc")}
               </p>
             </>
           ) : (
@@ -2016,7 +2201,14 @@ export default function UploadZone({
               className="group relative flex min-w-0 overflow-hidden rounded-xl border border-white/[0.08] bg-white/[0.025] text-left transition-all hover:-translate-y-0.5 hover:border-brand/35 hover:bg-white/[0.045] hover:shadow-[0_14px_30px_rgba(0,0,0,.2)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand sm:block"
             >
               <div className="relative h-[82px] w-[116px] shrink-0 overflow-hidden bg-black sm:h-[108px] sm:w-full">
-                {selectedMovement.sample ? (
+                {/* Con fondo propio la miniatura es el archivo del operador. Antes
+                    mostraba el sample genérico del eje de IA (un clip de otra
+                    escena) para un video cuyo fondo es SU foto. */}
+                {(_customStill || _customVideo) && customPreviewUrl ? (
+                  _customStill
+                    ? <img src={customPreviewUrl} alt="" className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-[1.035]" />
+                    : <video src={customPreviewUrl} className="h-full w-full object-cover pointer-events-none" muted playsInline />
+                ) : selectedMovement.sample ? (
                   selectedMovement.kind === "image"
                     ? <img src={selectedMovement.sample} alt="" className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-[1.035]" />
                     : <video src={selectedMovement.sample} className="h-full w-full object-cover pointer-events-none transition-transform duration-500 group-hover:scale-[1.035]" autoPlay loop muted playsInline />
@@ -2032,13 +2224,23 @@ export default function UploadZone({
               <div className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2.5 sm:-mt-4 sm:relative sm:items-end sm:px-3 sm:pb-3 sm:pt-0">
                 <div className="min-w-0 flex-1">
                 <p className="text-[8px] font-semibold uppercase tracking-[0.14em] text-brand-light/75">
-                  {t("upload.movement_gallery_title") || "Movimiento base"}
+                  {_customStill || _customVideo
+                    ? t("upload.movement_photo_title")
+                    : t("upload.movement_gallery_title")}
                 </p>
                 <p className="truncate text-[12px] font-semibold text-white">
-                  {selectedMovement.label.replace(/\s*\(.*\)\s*/, "")}
+                  {_customVideo
+                    ? t("upload.movement_custom_video_note")
+                    : _customStill
+                      ? _photoMotionOption.label
+                      : selectedMovement.label.replace(/\s*\(.*\)\s*/, "")}
                 </p>
                 <p className="mt-0.5 line-clamp-2 text-[9px] leading-snug text-gray-500 sm:min-h-[24px]">
-                  {selectedMovement.desc}
+                  {_customVideo
+                    ? ""
+                    : _customStill
+                      ? _photoMotionOption.desc
+                      : selectedMovement.desc}
                 </p>
                 </div>
                 <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full border border-white/[0.08] bg-white/[0.035] text-gray-500 transition-all group-hover:border-brand/30 group-hover:bg-brand/10 group-hover:text-white">
@@ -3380,7 +3582,12 @@ export default function UploadZone({
                     </div>
                     <div className="flex-1 min-w-0">
                       <p className="text-sm text-white truncate">{backgroundFile.name}</p>
-                      <p className="text-[11px] text-cyan-400">{t("upload.custom_bg_active") || "Custom background - AI generation skipped"}</p>
+                      {/* Antes decía "se omite generación IA", que es falso
+                          cuando el operador pide animar (ahí Veo sí corre). El
+                          texto nuevo es verdadero en los dos estados y además
+                          dice la promesa que el backend ahora sí cumple: tu
+                          archivo no se reemplaza por uno generado. */}
+                      <p className="text-[11px] text-cyan-400">{t("upload.custom_bg_active")}</p>
                     </div>
                     <button
                       onClick={() => { onBackgroundFile?.(null); onAnimateImage?.(false); }}
@@ -3391,36 +3598,17 @@ export default function UploadZone({
                       </svg>
                     </button>
                   </div>
-                  {/* "Animar con AI" — only meaningful for still images
-                      (.jpg/.png). Veo 3.1 image-to-video animates the
-                      uploaded still while preserving its identity. For
-                      video uploads (.mp4/.mov) the toggle stays hidden
-                      because the file is already a video. */}
-                  {/\.(jpe?g|png)$/i.test(backgroundFile.name) && (
-                    <label className="mt-2 flex items-center gap-3 px-3 py-2.5 rounded-xl bg-surface-1 border border-white/[0.06] hover:border-white/[0.12] cursor-pointer transition-colors">
-                      {/* Custom iOS-style toggle. Hidden native checkbox
-                          drives the state for accessibility; the visual
-                          track + thumb are pure Tailwind so the look
-                          matches the rest of the dark glassmorphism. */}
-                      <input
-                        type="checkbox"
-                        checked={!!animateImage}
-                        onChange={(e) => onAnimateImage?.(e.target.checked)}
-                        className="peer sr-only"
-                      />
-                      <div className="relative w-9 h-5 rounded-full bg-surface-3 peer-checked:bg-brand transition-colors duration-200 shrink-0">
-                        <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
-                      </div>
-                      <div className="flex-1">
-                        <p className="text-xs text-white font-medium">
-                          {t("upload.animate_image_label") || "Animar con AI"}
-                        </p>
-                        <p className="text-[11px] text-gray-500">
-                          {t("upload.animate_image_hint") || "El video cinemático anima tu imagen en lugar de usar zoom/pan"}
-                        </p>
-                      </div>
-                    </label>
-                  )}
+                  {/* El toggle "Animar con AI" vivía acá. Se eliminó (2026-07-30):
+                      preguntaba por el MECANISMO ("anima tu imagen en lugar de
+                      usar zoom/pan") en un paso distinto del eje que hace la
+                      misma pregunta, y su rama "off" tampoco dejaba la foto
+                      quieta — le metía un zoom del 15%. La decisión ahora vive
+                      en el paso Movimiento, junto a Efecto, que es el eje
+                      hermano y aditivo. Accesibilidad de paso: el toggle era un
+                      `peer sr-only` sin `peer-focus-visible:`, así que con
+                      teclado no tenía NINGÚN indicador de foco (WCAG 2.4.7), y
+                      su estado se señalaba sólo por color (1.4.1). Las tarjetas
+                      marcan selección por borde, fondo, sombra y un check. */}
                 </>
               )}
             </div>
@@ -3681,6 +3869,7 @@ export default function UploadZone({
               style={style}
               customColors={customColors}
               movementStyle={hoverMovement ?? batchDefaults.movementStyle}
+              operatorPhoto={_customStill}
               effect={hoverEffect ?? batchDefaults.effect}
               lyricsAnimation={hoverAnimation ?? batchDefaults.lyricsAnimation}
               lineTransition={hoverTransition ?? batchDefaults.lineTransition}
