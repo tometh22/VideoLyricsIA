@@ -387,6 +387,34 @@ def test_lrclib_returns_none_on_network_error(monkeypatch):
     assert _fetch_lrclib("X", "Y") is None
 
 
+def test_lrclib_retry_exhaustion_logs_warning_not_error(monkeypatch, caplog):
+    """A transient timeout that survives the single retry is best-effort:
+    the caller degrades to Genius/Gemini/WhisperX, so the exhausted-retry
+    log must stay at WARNING. Logging it at ERROR turns a recovered
+    external blip into a high-priority Sentry event via the default
+    LoggingIntegration (the r-37124 false alarm). Pin the level here."""
+    import logging as _logging
+    from pipeline import _fetch_lrclib
+
+    def _timeout(*a, **kw):
+        raise TimeoutError("read timed out")
+    monkeypatch.setattr("requests.get", _timeout)
+
+    with caplog.at_level(_logging.WARNING, logger="genly.pipeline"):
+        assert _fetch_lrclib("X", "Y") is None
+
+    retry_records = [
+        rec for rec in caplog.records
+        if "fetch failed after retry" in rec.getMessage()
+    ]
+    assert retry_records, "expected a 'fetch failed after retry' log record"
+    for rec in retry_records:
+        assert rec.levelno == _logging.WARNING, (
+            f"retry-exhaustion must log at WARNING, got {rec.levelname} — "
+            "an ERROR here fires a false high-priority Sentry alert"
+        )
+
+
 def test_lrclib_returns_none_on_empty_inputs():
     from pipeline import _fetch_lrclib
     assert _fetch_lrclib("", "Some Song") is None

@@ -3865,7 +3865,13 @@ def _fetch_lrclib(artist: str, song: str, db=None,
                 logger.warning("[LYRICS] lrclib attempt 1 failed (%s: %s); retrying once",
                                e.__class__.__name__, str(e)[:80])
                 continue
-            logger.error("[LYRICS] lrclib fetch failed after retry: %s", e)
+            # Best-effort, never raises: a transient timeout/network hiccup to
+            # the free public lrclib.net API is already handled — the caller
+            # degrades to Genius/Gemini/WhisperX. Log at WARNING (like the
+            # attempt-1 log above) so a recovered external blip doesn't fire a
+            # high-priority Sentry error via the default LoggingIntegration.
+            logger.warning("[LYRICS] lrclib fetch failed after retry (best-effort, "
+                           "falling back): %s", e)
             return None
     if r is None:
         result = None
