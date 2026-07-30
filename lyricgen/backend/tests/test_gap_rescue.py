@@ -177,3 +177,72 @@ def test_kill_switch(monkeypatch):
 def test_nunca_levanta_con_basura(audio):
     out, stats = gr.rescue([{"start": "x"}, None, 42], audio)  # type: ignore
     assert isinstance(out, list) and isinstance(stats, dict)
+
+
+# ── gates de VAD y sanidad física (caso Hombre Lobo, job 9e19f29c) ────────
+
+def _con_vad(monkeypatch, regiones):
+    monkeypatch.setattr(gr, "_vad_regions", lambda *a, **k: regiones)
+
+
+def test_vad_descarta_hueco_instrumental(audio, tmp_path, monkeypatch):
+    """El outro de saxo hizo alucinar a whisper con el coro en eco (6 líneas
+    falsas). Si el stem no canta en el hueco, NO se transcribe ni se emite."""
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"RIFF" + b"\0" * 128)
+    _con_vad(monkeypatch, [(5.0, 18.0)])          # voz solo ANTES del hueco
+    monkeypatch.setattr(gr, "_transcribe_window",
+                        lambda *a, **k: pytest.fail("no debería transcribir"))
+    segs = [_seg(10, 20), _seg(60, 70)]
+    out, stats = gr.rescue(segs, audio, stem_path=str(stem), audio_duration=80.0)
+    assert stats["rescued_lines"] == 0
+    assert any(r == "sin_voz_vad" for _, r in stats["skipped"])
+
+
+def test_vad_permite_hueco_cantado(audio, tmp_path, monkeypatch):
+    """El hueco histórico de UMG: 10,6s con 12s de canto según el stem."""
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"RIFF" + b"\0" * 128)
+    _con_vad(monkeypatch, [(15.0, 55.0)])          # canta en el hueco
+    monkeypatch.setattr(
+        gr, "_transcribe_window",
+        lambda *a, **k: _words("vos en un mundo casi ya sin ley nosotros "
+                               "somos el amor", 25.0))
+    segs = [_seg(10, 20), _seg(60, 70)]
+    out, stats = gr.rescue(segs, audio, stem_path=str(stem), audio_duration=80.0)
+    assert stats["rescued_lines"] >= 1
+
+
+def test_umbral_8s_rescata_el_hueco_historico():
+    """find_gaps con el default nuevo agarra el hueco de 10,6s que el
+    umbral viejo (12s) dejaba pasar."""
+    segs = [_seg(110, 120.4), _seg(131.0, 140)]
+    assert gr.find_gaps(segs) == [(120.4, 131.0)]
+
+
+def test_sanidad_fisica_mata_los_slivers(audio, tmp_path, monkeypatch):
+    """5 palabras en 0,3s = 16 palabras/s: alucinación, no canto."""
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"RIFF" + b"\0" * 128)
+    _con_vad(monkeypatch, [(20.0, 55.0)])
+    def _sliver(*a, **k):
+        t = 30.0
+        out = []
+        for w in "en el fondo nunca me".split():
+            out.append({"word": w, "start": round(t, 2), "end": round(t + 0.05, 2)})
+            t += 0.06
+        return out
+    monkeypatch.setattr(gr, "_transcribe_window", _sliver)
+    segs = [_seg(10, 20), _seg(60, 70)]
+    out, stats = gr.rescue(segs, audio, stem_path=str(stem), audio_duration=80.0)
+    assert stats["rescued_lines"] == 0, "un destello de 0,3s no es una línea"
+
+
+def test_dedup_del_eco_extiende_en_vez_de_duplicar(audio, tmp_path, monkeypatch):
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"RIFF" + b"\0" * 128)
+    _con_vad(monkeypatch, [(20.0, 55.0)])
+    monkeypatch.setattr(
+        gr, "_transcribe_window",
+        lambda *a, **k: (_words("en el fondo nunca me imagine", 25.0)
+                         + _words("en el fondo nunca me imagine", 29.5)))
+    segs = [_seg(10, 20), _seg(60, 70)]
+    out, stats = gr.rescue(segs, audio, stem_path=str(stem), audio_duration=80.0)
+    rescatadas = [s for s in out if s.get("gap_rescued")]
+    assert len(rescatadas) == 1, "el eco repetido se funde, no se duplica"

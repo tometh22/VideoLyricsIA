@@ -68,9 +68,13 @@ logger = logging.getLogger("genly.gap_rescue")
 
 _TRUE = ("1", "true", "yes", "on")
 
-# Hueco mínimo para molestarse en re-transcribir. Por debajo de esto, una
-# zona sin cartel es casi siempre un respiro instrumental legítimo.
-_MIN_GAP_S = 12.0
+# Hueco mínimo para molestarse en re-transcribir. Bajado de 12 a 8 con dos
+# casos reales: el hueco histórico de UMG en Hombre Lobo mide 10,6s (con
+# 12,0s de canto según el VAD del stem) y quedaba justo debajo del umbral
+# viejo; ídem los huecos de Mercedes Sosa / Mujer Amante del batch. Con el
+# gate de VAD de abajo, bajar el umbral no arriesga: solo se rescatan
+# huecos donde el stem CANTA.
+_MIN_GAP_S = 8.0
 # Contexto cantado a cada lado del hueco. Sin esto el ASR no engancha
 # (ver la medición en el docstring del módulo).
 _CONTEXT_S = 20.0
@@ -87,6 +91,17 @@ _MAX_GAPS = 4
 # Corte de líneas dentro de lo rescatado (mismos valores que el resto).
 _LINE_GAP_S = 1.2
 _LINE_MAX_S = 6.0
+# Sanidad FÍSICA por línea rescatada. En Hombre Lobo el rescate emitió
+# líneas de 0,2-0,5s con 5 palabras (16 palabras/segundo: nadie canta así)
+# sobre el outro instrumental — alucinación de whisper en eco. Nada humano
+# supera ~6 palabras/s sostenidas, y un cartel de <0,5s es un destello.
+_MIN_LINE_S = 0.5
+_MAX_WORDS_PER_S = 6.0
+# Gate de VAD: un hueco se rescata sólo si el stem CANTA ahí, y cada línea
+# rescatada debe solaparse con una región de voz. Es la misma señal que usa
+# el guardrail voiced_gaps — acá previene en vez de sólo detectar.
+_VAD_MIN_VOICED_S = 3.0
+_VAD_LINE_OVERLAP = 0.3
 
 
 def is_enabled() -> bool:
@@ -215,6 +230,23 @@ def _texto_sospechoso(texto: str) -> bool:
     return len(toks) >= 4 and len(set(toks)) == 1
 
 
+def _vad_regions(stem_path: str | None) -> list[tuple]:
+    """Regiones de voz del stem (energy-VAD de anchor_align). [] si no hay
+    stem o librosa: en ese caso el gate de VAD no aplica (permisivo, como
+    antes) — nunca bloquea por falta de evidencia."""
+    if not stem_path:
+        return []
+    try:
+        from anchor_align import vocal_regions
+        return vocal_regions(stem_path) or []
+    except Exception:
+        return []
+
+
+def _voiced_overlap(a: float, b: float, regs: list[tuple]) -> float:
+    return sum(max(0.0, min(b, rb) - max(a, ra)) for ra, rb in regs)
+
+
 def rescue(segments: list[dict], audio_path: str, *,
            stem_path: str | None = None,
            audio_duration: float | None = None, language: str = "es",
@@ -230,6 +262,7 @@ def rescue(segments: list[dict], audio_path: str, *,
     fuente = audio_path
     if stem_path and os.path.exists(stem_path):
         fuente, stats["source"] = stem_path, "stem"
+    regs = _vad_regions(stem_path if stats["source"] == "stem" else None)
     try:
         min_gap = _env_float("GAP_RESCUE_MIN_GAP_S", _MIN_GAP_S)
         clip_max = _env_float("GAP_RESCUE_CLIP_MAX_S", _CLIP_MAX_S)
@@ -249,6 +282,12 @@ def rescue(segments: list[dict], audio_path: str, *,
             zona_a, zona_b = ini + _PAD_S, fin - _PAD_S
             if zona_b - zona_a < 2.0:
                 stats["skipped"].append((round(ini, 1), "ventana_corta"))
+                continue
+            # Gate de VAD del hueco: si el stem no canta ahí, no hay nada
+            # que rescatar — es un pasaje instrumental (Hombre Lobo: el
+            # outro de saxo hacía alucinar a whisper con el coro en eco).
+            if regs and _voiced_overlap(zona_a, zona_b, regs) < _VAD_MIN_VOICED_S:
+                stats["skipped"].append((round(ini, 1), "sin_voz_vad"))
                 continue
             w_ini = max(0.0, zona_a - contexto)
             w_fin = zona_b + contexto
@@ -273,18 +312,38 @@ def rescue(segments: list[dict], audio_path: str, *,
             if _texto_sospechoso(texto_total):
                 stats["skipped"].append((round(ini, 1), "alucinacion"))
                 continue
+            ultima_txt = None
             for grupo in _agrupar_en_lineas(words):
                 txt = " ".join(str(w.get("word", "")).strip()
                                for w in grupo).strip()
                 if not txt or len(grupo) < 2:
                     continue
-                s0 = max(ini + 0.05, _f(grupo[0].get("start")) - lead_s)
-                e0 = min(fin - 0.05, _f(grupo[-1].get("end")) + hold_s)
+                g0, g1 = _f(grupo[0].get("start")), _f(grupo[-1].get("end"))
+                # Sanidad física: una "línea" de 0,3s con 5 palabras es un
+                # destello alucinado, no canto.
+                if g1 - g0 < _MIN_LINE_S:
+                    continue
+                if len(grupo) / max(g1 - g0, 0.1) > _MAX_WORDS_PER_S:
+                    continue
+                # Gate de VAD por línea: sin voz del stem debajo, afuera.
+                if regs and _voiced_overlap(g0, g1, regs) < min(
+                        _VAD_LINE_OVERLAP, (g1 - g0) * 0.5):
+                    continue
+                # Dedup: el eco repite la misma frase — extender la anterior
+                # en vez de emitir un duplicado. Texto IDÉNTICO dentro de
+                # 2s es eco; frases legítimas repetidas del coro vienen más
+                # espaciadas (la cadencia mínima medida fue ~6s).
+                if nuevas and txt.lower() == (ultima_txt or "").lower()                         and g0 - _f(nuevas[-1]["end"]) < 2.0:
+                    nuevas[-1]["end"] = round(min(fin - 0.05, g1 + hold_s), 3)
+                    continue
+                s0 = max(ini + 0.05, g0 - lead_s)
+                e0 = min(fin - 0.05, g1 + hold_s)
                 if e0 - s0 < 0.3:
                     continue
                 nuevas.append({"start": round(s0, 3), "end": round(e0, 3),
                                "text": txt, "words": [dict(w) for w in grupo],
                                "gap_rescued": True, "review": True})
+                ultima_txt = txt
             logger.info(
                 "[GAP-RESCUE] hueco %.1f-%.1fs: %d palabras rescatadas del "
                 "%s (el ASR original no oyó nada ahí)", ini, fin, len(words),
