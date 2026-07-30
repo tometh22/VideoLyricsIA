@@ -196,6 +196,59 @@ describe("fondo de IA: el eje de siempre queda intacto", () => {
   });
 });
 
+describe("teclado: el grupo se navega con flechas", () => {
+  // Declarar role="radio" sin las flechas es PEOR que no declararlo: el lector
+  // anuncia "1 de 2" y con roving tabindex la única tarjeta alcanzable con Tab
+  // es la ya seleccionada, así que la otra quedaría inalcanzable.
+  it("una sola parada de tabulación: la opción activa", () => {
+    render(<Harness />);
+    goStep(3);
+    openMovementSlot();
+    const tabbables = [...document.querySelectorAll("[data-photo-motion]")]
+      .filter((el) => el.getAttribute("tabindex") === "0")
+      .map((el) => el.dataset.photoMotion);
+    expect(tabbables).toEqual(["quieta"]);
+  });
+
+  it.each(["ArrowRight", "ArrowDown"])("%s mueve la selección a la siguiente", (key) => {
+    render(<Harness />);
+    goStep(3);
+    openMovementSlot();
+    fireEvent.keyDown(document.querySelector('[data-photo-motion="quieta"]'), { key });
+    expect(checked()).toEqual(["animar"]);
+  });
+
+  it.each(["ArrowLeft", "ArrowUp"])("%s vuelve a la anterior (con wrap)", (key) => {
+    render(<Harness />);
+    goStep(3);
+    openMovementSlot();
+    fireEvent.keyDown(document.querySelector('[data-photo-motion="quieta"]'), { key });
+    expect(checked()).toEqual(["animar"]);
+  });
+});
+
+describe("empujón a Efecto cuando la foto queda inmóvil", () => {
+  // El aviso existía sólo para el eje de IA, justo donde menos falta. De 197
+  // videos con fondo propio, 3 llevaban efecto: el efecto ya funcionaba, no se
+  // encontraba.
+  it("avisa cuando la foto está quieta y sin efecto", () => {
+    render(<Harness />);
+    goStep(3);
+    expect(document.querySelector('[data-testid="foto-fija-warning"]')).not.toBeNull();
+  });
+
+  it("no avisa si la foto se anima (ahí ya hay movimiento)", () => {
+    render(<Harness />);
+    goStep(3);
+    openMovementSlot();
+    fireEvent.click(document.querySelector('[data-photo-motion="animar"]'));
+    // Volver al resumen: el aviso vive fuera del composer abierto.
+    const back = document.querySelector('[data-testid="motion-composer-back"]');
+    if (back) fireEvent.click(back);
+    expect(document.querySelector('[data-testid="foto-fija-warning"]')).toBeNull();
+  });
+});
+
 describe("el toggle de mecanismo ya no existe", () => {
   it("no queda ningún checkbox 'Animar con AI' en el paso del archivo", () => {
     render(<Harness />);

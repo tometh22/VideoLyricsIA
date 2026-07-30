@@ -43,13 +43,34 @@ export default function JobSettingsCard({ renderParams, provenanceHref }) {
   const scene = describeSceneSource(params, t);
   const prompt = String(params.background_hint || "").trim();
 
-  if (groups.length === 0 && !prompt) {
+  // El operador pidió animar su foto y no se pudo: el fondo salió con el zoom
+  // lento en vez de la animación. Antes esto moría en un `logger.warning` del
+  // worker — pedías animar, recibías otra cosa, y no había forma de enterarse.
+  // El pipeline ahora lo persiste; acá se dice.
+  const animationDegraded = params.bg_animation_degraded === true;
+
+  if (groups.length === 0 && !prompt && !animationDegraded) {
     // Un job sin ningún ajuste explícito (todo en Auto): no vale un panel.
     return null;
   }
 
   return (
     <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden">
+      {/* Fuera del plegado a propósito: es algo que le pasó a SU material, no un
+          ajuste más que haya que ir a buscar. */}
+      {animationDegraded && (
+        <div
+          data-testid="bg-animation-degraded"
+          className="flex items-start gap-2 border-b border-amber-300/10 bg-amber-300/[0.05] px-4 py-2.5 text-[11px] leading-snug text-amber-100/80"
+        >
+          <span className="grid h-5 w-5 shrink-0 place-items-center rounded-full bg-amber-300/[0.1] text-amber-200/80">
+            <svg className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4m0 4h.01M10.3 3.8 2.6 17.1A2 2 0 0 0 4.3 20h15.4a2 2 0 0 0 1.7-2.9L13.7 3.8a2 2 0 0 0-3.4 0Z" />
+            </svg>
+          </span>
+          <span className="min-w-0 flex-1">{t("detail.bg_animation_degraded")}</span>
+        </div>
+      )}
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}

@@ -2094,7 +2094,7 @@ export default function UploadZone({
                   data-testid="photo-motion-group"
                   className="grid grid-cols-2 gap-2"
                 >
-                  {PHOTO_MOTIONS.map((p) => {
+                  {PHOTO_MOTIONS.map((p, _i) => {
                     const active = _photoMotion === p.code;
                     return (
                       <button
@@ -2102,7 +2102,28 @@ export default function UploadZone({
                         type="button"
                         role="radio"
                         aria-checked={active}
+                        /* Roving tabindex: el grupo entero es UNA parada de
+                           tabulación y adentro se navega con flechas. Con
+                           role="radio" el lector de sonido anuncia "1 de 2", y
+                           sin las flechas la única tarjeta alcanzable sería la
+                           ya seleccionada — declarar el rol sin el teclado que
+                           implica es peor que no declararlo. */
                         tabIndex={active ? 0 : -1}
+                        onKeyDown={(e) => {
+                          if (!["ArrowRight", "ArrowDown", "ArrowLeft", "ArrowUp"].includes(e.key)) return;
+                          e.preventDefault();
+                          const dir = (e.key === "ArrowRight" || e.key === "ArrowDown") ? 1 : -1;
+                          const next = PHOTO_MOTIONS[
+                            (_i + dir + PHOTO_MOTIONS.length) % PHOTO_MOTIONS.length
+                          ];
+                          onAnimateImage?.(next.animate);
+                          // El foco sigue a la selección, que es el contrato de
+                          // un radiogroup: mover el foco sin mover la selección
+                          // deja al operador sin saber qué está elegido.
+                          e.currentTarget.parentElement
+                            ?.querySelector(`[data-photo-motion="${next.code}"]`)
+                            ?.focus();
+                        }}
                         onClick={() => onAnimateImage?.(p.animate)}
                         data-photo-motion={p.code}
                         /* El nombre accesible incluye el costo en tiempo y la
@@ -2509,9 +2530,17 @@ export default function UploadZone({
             </div>
           )}
         </div>
+        {/* El aviso "va a quedar inmóvil" + el atajo a Efecto existía sólo para
+            el eje de IA (`foto-parallax`), justo donde MENOS falta. Con una foto
+            propia quieta y sin efecto el resultado es literalmente una imagen
+            fija los 3 minutos, y ahí el aviso no aparecía: de 197 videos con
+            fondo propio, sólo 3 llevaban efecto. Este empujón es el mecanismo
+            que corrige esa cifra — el efecto ya funcionaba, no se encontraba. */}
         {motionComposerView === null
-          && batchDefaults.movementStyle === "foto-parallax"
-          && !batchDefaults.effect && (
+          && !batchDefaults.effect
+          && (_customStill
+            ? !animateImage
+            : batchDefaults.movementStyle === "foto-parallax") && (
           <div
             data-testid="foto-fija-warning"
             className="mt-2 flex items-center gap-2 rounded-xl border border-amber-300/10 bg-amber-300/[0.035] px-2.5 py-2 text-[9px] text-amber-100/65"
