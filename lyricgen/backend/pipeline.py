@@ -11509,6 +11509,45 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # bg_mode stays "veo" — _generate_veo_video receives the
             # hardened safe_prompt for estatico/sutil (C2 + C3).
 
+    # ── INVARIANTE (P0, 2026-07-29): la imagen del operador nunca se descarta ──
+    # `image_to_video_path` sólo llega con valor cuando el operador subió un
+    # still Y pidió animarlo (`_animate_user_image`, ~1229/1403): o con el toggle
+    # "Animar con AI", o con el efecto "Foto viva". Veo es el ÚNICO proveedor que
+    # hace image-to-video; la rama `imagen` genera un still NUEVO desde texto y
+    # NUNCA lee `image_to_video_path`, así que rutear ahí descarta en silencio el
+    # arte del operador y entrega otra imagen (peor con foto_viva: `:11543` anima
+    # `bg_imagen.jpg`, la generada, no la subida).
+    #
+    # Era alcanzable por dos caminos triviales, ambos con la matriz de movimiento
+    # pisando la intención de animar:
+    #   (a) sticky de localStorage: `movement_style` quedaba en "foto-parallax" de
+    #       un lote anterior → el `elif` de foto-parallax (abajo) forzaba imagen;
+    #   (b) elegir "Foto viva": `chooseEffect` (UploadZone.jsx) fuerza
+    #       movementStyle="foto-parallax" → mismo elif. Es decir: el único control
+    #       pensado para "animá MI foto" garantizaba que la foto se descartara.
+    # Para un sello (UMG) el modo de falla es el peor posible: sustitución
+    # silenciosa de arte aprobado, sin error y con el job marcado OK.
+    #
+    # Se expresa como invariante en un solo lugar (en vez de sumar el guard a
+    # cada `elif` de la matriz) para que cubra también el legacy
+    # STATIC_SUTIL_VIA_IMAGEN y cualquier register futuro que rutee a imagen.
+    # OJO: el `if` de foto_viva de arriba (`_live_photo and not
+    # image_to_video_path`) es el caso legítimo inverso — foto_viva SIN subida
+    # genera su propio still con Imagen y después lo anima; ese sigue intacto.
+    # Se compara contra "veo" (en vez de contra el nombre del otro proveedor) por
+    # dos razones: Veo es el ÚNICO proveedor con image-to-video, así que cualquier
+    # otro valor —presente o futuro— tiene que caer acá; y así este guard no
+    # aparece antes que la rama de dispatch real para
+    # `test_imagen_branch_uses_imagen_aware_prompt`, que la localiza por la
+    # primera aparición literal de su condición.
+    if image_to_video_path and bg_mode != "veo":
+        logger.info(
+            "[BG] operator image-to-video pinned → bg_mode=veo "
+            "(era %s por movement=%s; ese path descartaría la imagen subida)",
+            bg_mode, _norm_move_bg or "auto",
+        )
+        bg_mode = "veo"
+
     # Imagen-4 + Ken Burns branch. Cabled 2026-05-16 — _generate_imagen_image
     # has existed in the codebase as dead code since the original architecture
     # but was never wired into the dispatch. This is the wire.
