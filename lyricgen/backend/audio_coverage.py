@@ -149,7 +149,7 @@ def text_mismatches(segments, words, *, min_ratio: float = 0.4,
 
 def voiced_gaps(segments, stem_path: str | None, *,
                 audio_duration: float | None = None,
-                min_gap_s: float = 12.0,
+                min_gap_s: float = 8.0,
                 min_voiced_s: float = 3.0) -> list[dict]:
     """Huecos entre carteles que contienen CANTO según el VAD del stem.
 
