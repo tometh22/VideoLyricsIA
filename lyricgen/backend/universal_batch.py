@@ -27,7 +27,9 @@ DEFAULT_EXPECTED_COUNT = 30
 
 
 class BatchError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, job_id: str | None = None):
+        super().__init__(message)
+        self.job_id = job_id
 
 
 class Api:
@@ -85,11 +87,30 @@ class Api:
                         json={"job_id": job_id, "part_number": part_number},
                     )["url"]
                 body = fh.read(part_size)
-                put = self.session.put(signed[part_number], data=body,
-                                       headers={"Content-Type": "audio/wav"},
-                                       timeout=max(self.timeout, 900))
-                if put.status_code >= 300:
-                    raise BatchError(f"R2 part {part_number} failed for {entry.filename}: {put.status_code}")
+                put = None
+                for attempt in range(3):
+                    put = self.session.put(
+                        signed[part_number], data=body,
+                        headers={"Content-Type": "audio/wav"},
+                        timeout=max(self.timeout, 900),
+                    )
+                    if put.status_code < 300:
+                        break
+                    # R2 can return a transient 4xx while a freshly-created
+                    # multipart upload propagates. Refresh the signature and
+                    # retry the same bytes before failing the job.
+                    if attempt < 2:
+                        signed[part_number] = self.request(
+                            "POST", "/upload-multipart-part-url",
+                            json={"job_id": job_id, "part_number": part_number},
+                        )["url"]
+                if put is None or put.status_code >= 300:
+                    detail = (put.text[:200] if put is not None else "no response")
+                    raise BatchError(
+                        f"R2 part {part_number} failed for {entry.filename}: "
+                        f"{put.status_code if put is not None else 'unknown'} {detail}",
+                        job_id=job_id,
+                    )
                 etag = put.headers.get("ETag") or put.headers.get("Etag")
                 if not etag:
                     raise BatchError(f"R2 part {part_number} has no ETag for {entry.filename}")
@@ -281,6 +302,8 @@ def run(args: argparse.Namespace) -> int:
                 segments = api.transcribe(entry, entry.job_id, args.poll_seconds)
                 api.generate(entry, entry.job_id, segments, args.poll_seconds)
             except Exception as exc:
+                if isinstance(exc, BatchError) and exc.job_id:
+                    entry.job_id = exc.job_id
                 entry.status = "error"
                 entry.error = str(exc)[:1000]
                 write_manifest(manifest_path, entries, expected_count=args.expected_count)
