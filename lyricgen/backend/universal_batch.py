@@ -307,7 +307,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--folder", default="/Users/tomi/Downloads/Audio_Wavs 2")
     parser.add_argument("--manifest", default=".context/universal-batch-manifest.json")
-    parser.add_argument("--api-base", default=os.environ.get("STAGING_API_BASE", "https://staging.genly.pro"))
+    parser.add_argument(
+        "--api-base",
+        default=os.environ.get(
+            "STAGING_API_BASE",
+            os.environ.get("STAGING_API_URL", "https://api-staging-9b82.up.railway.app"),
+        ),
+    )
     parser.add_argument("--token", default=os.environ.get("STAGING_ADMIN_TOKEN", ""))
     parser.add_argument("--expected-count", type=int, default=DEFAULT_EXPECTED_COUNT)
     parser.add_argument("--allow-count-mismatch", action="store_true")
