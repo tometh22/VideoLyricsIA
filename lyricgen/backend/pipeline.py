@@ -983,7 +983,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  art_track: bool = False,
                  # Línea legal opcional en pantalla (art tracks): ej.
                  # "℗ 2026 Universal Music Chile". Vacía = no se dibuja.
-                 label_line: str = ""):
+                 label_line: str = "",
+                 # Canonical allowlisted batch contract. Individual fields
+                 # above remain for backwards compatibility; this object is
+                 # persisted verbatim (after API validation) for audit/retry.
+                 render_profile: dict | None = None):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -1524,6 +1528,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # the wizard and we persist it so retries/edits respect it.
             "title_song_break": title_song_break,
         }
+        if isinstance(render_profile, dict):
+            _new_rp["render_profile"] = dict(render_profile)
         # Only persist background_hint / bg_verbatim when this run actually
         # received them — otherwise a hint-less typography edit would null out
         # values a prior background edit had stored (merge-not-replace).
@@ -1978,7 +1984,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 # camino de fondo humano: hasta ahora el eje entero era inerte
                 # acá (se enviaba, se persistía y nadie lo leía).
                 still_background=(
-                    _normalize_movement_style(movement_style) == "estatico"
+                    _normalize_movement_style(movement_style) in {"estatico", "foto-estatica"}
                 ),
             )
             # Cinemascope opt-in: letterbox the finished YouTube master. Skipped
@@ -8063,6 +8069,9 @@ def _normalize_movement_style(s: str) -> str:
         "dinamico": "estandar", "dinámico": "estandar", "dynamic": "estandar",
         "photo": "foto-parallax", "parallax": "foto-parallax",
         "foto+parallax": "foto-parallax", "foto_parallax": "foto-parallax",
+        # Batch profile name; internally it uses the existing static register
+        # so frontend render-parity catalogs remain backwards compatible.
+        "foto-estatica": "estatico", "photo-static": "estatico", "foto_static": "estatico",
         "animated": "animado", "illustration": "animado", "cartoon": "animado",
     }
     if s in aliases:
@@ -8320,7 +8329,7 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     # For an explicit non-static register (sutil/estandar/foto-parallax/
     # animado) the existing movement_rule steers it, so clause (2) keeps its
     # original "exact camera movement" wording.
-    _static = normalized_movement == "estatico"
+    _static = normalized_movement in {"estatico", "foto-estatica"}
     _sutil = normalized_movement == "sutil"
     _animado = normalized_movement == "animado"
     _foto = normalized_movement == "foto-parallax"
@@ -9062,7 +9071,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
     # Movement-aware camera pool for the combinatorial fallback (rare — only
     # when Gemini fails to parse). Static intent must NOT get a motion verb.
     _norm_move = _normalize_movement_style(movement_style)
-    _camera_pool = _BG_CAMERAS_STATIC if _norm_move == "estatico" else _BG_CAMERAS
+    _camera_pool = _BG_CAMERAS_STATIC if _norm_move in {"estatico", "foto-estatica"} else _BG_CAMERAS
 
     # Gemini analysis
     if lyrics_text or song_title:
@@ -9426,7 +9435,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             f"{_base_negatives}"
             " no extra animation noise."
         )
-    elif _norm_move == "estatico":
+    elif _norm_move == "estatico" or _norm_move == "foto-estatica":
         # C2 (2026-05-25) — Hardening del prompt estatico. Veo ignoraba
         # ~50% de las locked-frame requests pre-2026-05-22, motivando el
         # routing a Imagen. Ahora endurecemos vía:
@@ -9514,7 +9523,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # untouched for everything else, and lets us A/B fast-vs-standard + measure
     # real cost without a redeploy (see plan Phase 5).
     _static_model = os.environ.get("VEO_MODEL_STATIC", "").strip()
-    if _static_model and (high_fidelity or _norm_move == "estatico"):
+    if _static_model and (high_fidelity or _norm_move in {"estatico", "foto-estatica"}):
         model = _static_model
         logger.info("[BG] high-fidelity render → model=%s (movement=%s, verbatim=%s)",
                     model, _norm_move or "auto", high_fidelity)
@@ -11569,6 +11578,11 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     if not _live_photo and _norm_move_bg == "animado" and bg_mode != "veo":
         logger.info("[BG] movement=animado overrides bg_mode → veo")
         bg_mode = "veo"
+    # Foto estática is a still photo with a locked frame and optional overlay;
+    # unlike foto-parallax it must never enter the Ken Burns path.
+    elif _norm_move_bg == "foto-estatica" and bg_mode != "imagen":
+        logger.info("[BG] movement=foto-estatica overrides bg_mode → imagen (locked photo)")
+        bg_mode = "imagen"
     # Foto + parallax is a still photo that gains depth via a slow LATERAL pan.
     # Veo can't do clean 2.5D parallax from a text prompt (it comes out muddy),
     # so this register always routes through Imagen-4 + the lateral Ken Burns
@@ -11863,7 +11877,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # → clip idéntico), quedarse con el MEJOR de los dos candidatos,
             # presupuesto propio, y no-op duro si veo_breaker está abierto o
             # bg_verbatim. Va en un PR aparte, con los datos en la mano.
-            if _norm_move_bg == "estatico":
+            if _norm_move_bg in {"estatico", "foto-estatica"}:
                 _drift = _measure_camera_drift(bg_path)
                 if _drift:
                     # El modelo va en la línea porque es la variable que se
@@ -16970,7 +16984,7 @@ def run_edit_pipeline(
             bg_prelooped=bg_prelooped,
             # Espejo de run_pipeline: un edit no puede perder el "quieta".
             still_background=(
-                _normalize_movement_style(movement_style) == "estatico"
+                _normalize_movement_style(movement_style) in {"estatico", "foto-estatica"}
             ),
         )
         # Cinemascope opt-in — mirror run_pipeline. YouTube master only.
