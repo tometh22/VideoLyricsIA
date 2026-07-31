@@ -8005,7 +8005,6 @@ _CONCEPT_SCENE_GUIDE = {
 # scene is; this decides HOW it moves.
 _MOVEMENT_STYLE_RULES = {
     "estatico":      "Viewpoint: LOCKED STATIC FRAME. The viewpoint does NOT move at all — no pan, no tilt, no zoom, no dolly, no push-in, no drift, no orbit, no crane, no handheld, no parallax. A single fixed composition held for the whole shot. ALL motion lives WITHIN the scene only — only subtle motion that genuinely belongs in the chosen scene (do not default to floating particles, swaying foliage or smoke unless the scene calls for them). The frame edges never move.",
-    "foto-estatica": "PHOTOGRAPHIC STILL: one frozen composition held for the whole shot. The camera is completely locked — no pan, tilt, zoom, dolly, Ken Burns, travel or parallax. Motion may only come from an explicitly selected overlay/effect (rain, smoke, light, particles or bokeh) over the unchanged photo.",
     "sutil":         "Movement: minimal and ambient — gentle sway, slow drift, breathing motion. Subjects barely move. Easy to loop seamlessly.",
     "estandar":      "",  # no extra rule; the existing prompt template controls motion
     "foto-parallax": "Aesthetic: photographic still with subtle parallax — composition feels like a single photo, motion is restricted to slow camera moves, depth-of-field shifts, and lighting passes. No moving subjects.",
@@ -8070,8 +8069,9 @@ def _normalize_movement_style(s: str) -> str:
         "dinamico": "estandar", "dinámico": "estandar", "dynamic": "estandar",
         "photo": "foto-parallax", "parallax": "foto-parallax",
         "foto+parallax": "foto-parallax", "foto_parallax": "foto-parallax",
-        "photo-static": "foto-estatica", "foto_static": "foto-estatica",
-        "foto fija": "foto-estatica", "foto-fija": "foto-estatica",
+        # Batch profile name; internally it uses the existing static register
+        # so frontend render-parity catalogs remain backwards compatible.
+        "foto-estatica": "estatico", "photo-static": "estatico", "foto_static": "estatico",
         "animated": "animado", "illustration": "animado", "cartoon": "animado",
     }
     if s in aliases:
@@ -9435,7 +9435,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             f"{_base_negatives}"
             " no extra animation noise."
         )
-    elif _norm_move in {"estatico", "foto-estatica"}:
+    elif _norm_move == "estatico" or _norm_move == "foto-estatica":
         # C2 (2026-05-25) — Hardening del prompt estatico. Veo ignoraba
         # ~50% de las locked-frame requests pre-2026-05-22, motivando el
         # routing a Imagen. Ahora endurecemos vía:
