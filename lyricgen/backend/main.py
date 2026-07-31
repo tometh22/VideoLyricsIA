@@ -97,6 +97,9 @@ from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe, _normalize_movement_style
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
+from batch_profiles import (
+    RenderProfileError, normalize_render_profile, pipeline_fields,
+)
 from billing import router as billing_router
 from admin import router as admin_router
 import emails
@@ -8079,6 +8082,9 @@ async def generate_with_segments(
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
     custom_colors: str = Form("", max_length=200),
+    # Batch-only canonical visual contract. Empty keeps the legacy individual
+    # form fields unchanged; non-empty is validated and takes precedence.
+    render_profile: str = Form("", max_length=4000),
     # Add-on premium "Escenas" (multi-escena). Opt-in del operador en el
     # wizard. La ELEGIBILIDAD se chequea contra has_scenes_access ANTES de
     # forwardearlo al pipeline (un usuario sin acceso que mande el flag igual
@@ -8120,6 +8126,26 @@ async def generate_with_segments(
         callers that bypassed /transcribe. Streams the file in like before.
     """
     job_id = (job_id or "").strip()
+    try:
+        _render_profile = normalize_render_profile(render_profile)
+    except RenderProfileError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if _render_profile:
+        # A batch profile is the signed-off visual contract.  Keep the legacy
+        # form fields for old clients, but let the canonical object win when
+        # it is present so retries cannot drift from the manifest.
+        _profile_fields = pipeline_fields(_render_profile)
+        style = _profile_fields["style"]
+        font = _profile_fields["font"]
+        genre = _profile_fields["genre"]
+        concept = _profile_fields["concept"]
+        movement_style = _profile_fields["movement_style"]
+        effect = _profile_fields["effect"]
+        text_case = _profile_fields["text_case"]
+        font_scale = str(_profile_fields["font_scale"])
+        line_transition = _profile_fields["line_transition"]
+        if _render_profile.get("background_id") is not None:
+            background_id = _render_profile["background_id"]
     reuse = bool(job_id)
     try:
         segments = json.loads(segments_json)
@@ -8375,6 +8401,13 @@ async def generate_with_segments(
         except Exception as _e:
             logger.warning("[ART] could not persist art_track render_param: %s", _e)
 
+    if _render_profile:
+        try:
+            from jobs import merge_render_params
+            merge_render_params(job_id, {"render_profile": _render_profile})
+        except Exception as _e:
+            logger.warning("[BATCH] could not persist render_profile: %s", _e)
+
     mp3_path = os.path.join(job_dir, existing_filename)
 
     if reuse:
@@ -8572,6 +8605,7 @@ async def generate_with_segments(
         # only). The pipeline skips transcription + AI background.
         art_track=art_track,
         label_line=(label_line or "").strip() if art_track else "",
+        render_profile=_render_profile,
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -8877,6 +8911,25 @@ def list_jobs(
     db: Session = Depends(get_db),
 ):
     return get_all_jobs(db, **_job_scope(current_user))
+
+
+@app.get("/batch/jobs/{job_id}")
+def batch_job_status(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Scoped detail endpoint for the resumable batch runner.
+
+    It intentionally lives under ``/batch`` so it cannot shadow the legacy
+    ``/jobs/{job_id}/...`` media routes.  No delivery or portal mutation is
+    performed; the response is read-only and includes render_params/files so
+    the runner can build its scoreboard.
+    """
+    row = get_job(db, job_id, **_job_scope(current_user))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return row
 
 
 @app.delete("/jobs/{job_id}")
