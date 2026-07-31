@@ -105,18 +105,57 @@ class Api:
                             json={"job_id": job_id, "part_number": part_number},
                         )["url"]
                 if put is None or put.status_code >= 300:
-                    detail = (put.text[:200] if put is not None else "no response")
-                    raise BatchError(
-                        f"R2 part {part_number} failed for {entry.filename}: "
-                        f"{put.status_code if put is not None else 'unknown'} {detail}",
-                        job_id=job_id,
+                    # Some R2-compatible endpoints intermittently reject a
+                    # browser-style presigned PUT with `Missing
+                    # x-amz-content-sha256` even though the URL signs only
+                    # `host`. Keep the direct path first; use the existing
+                    # authenticated proxy as a bounded fallback so a batch
+                    # does not strand a multipart upload on that provider
+                    # quirk. The proxy still streams the part to R2 and
+                    # returns the canonical ETag.
+                    proxy = self.session.post(
+                        self.base + "/upload-part-proxy",
+                        params={"job_id": job_id, "part_number": part_number},
+                        data=body,
+                        headers={"Content-Type": "application/octet-stream"},
+                        timeout=max(self.timeout, 900),
                     )
-                etag = put.headers.get("ETag") or put.headers.get("Etag")
+                    if proxy.status_code < 300:
+                        proxy_etag = proxy.json().get("etag")
+                        if proxy_etag:
+                            etag = proxy_etag.strip('"')
+                        else:
+                            raise BatchError(
+                                f"R2 proxy part {part_number} has no ETag for {entry.filename}",
+                                job_id=job_id,
+                            )
+                    else:
+                        detail = (put.text[:200] if put is not None else "no response")
+                        raise BatchError(
+                            f"R2 part {part_number} failed for {entry.filename}: "
+                            f"{put.status_code if put is not None else 'unknown'} {detail}; "
+                            f"proxy={proxy.status_code} {proxy.text[:200]}",
+                            job_id=job_id,
+                        )
+                else:
+                    etag = (put.headers.get("ETag") or put.headers.get("Etag") or "").strip('"')
                 if not etag:
-                    raise BatchError(f"R2 part {part_number} has no ETag for {entry.filename}")
-                parts.append({"part_number": part_number, "etag": etag.strip('"')})
-        self.request("POST", "/upload-multipart-complete",
-                     json={"job_id": job_id, "parts": parts})
+                    raise BatchError(f"R2 part {part_number} has no ETag for {entry.filename}", job_id=job_id)
+                parts.append({"part_number": part_number, "etag": etag})
+        try:
+            self.request("POST", "/upload-multipart-complete",
+                         json={"job_id": job_id, "parts": parts})
+        except BatchError as exc:
+            # CompleteMultipartUpload is destructive at R2: if the first
+            # response is lost, a retry can return 409 after the object is
+            # already durable and the API has cleared multipart_upload_id.
+            # Confirm the job is still awaiting_upload; the next
+            # /transcribe-uploaded call will promote it from the durable key.
+            if "409" not in str(exc):
+                raise
+            detail = self.request("GET", f"/batch/jobs/{job_id}")
+            if detail.get("status") != "awaiting_upload":
+                raise
         return job_id
 
     def transcribe(self, entry: AudioManifestEntry, job_id: str,
