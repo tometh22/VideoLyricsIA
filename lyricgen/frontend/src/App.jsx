@@ -818,6 +818,13 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
 function EditLyricsRoute({
   setCurrentReview,
   setWizardStage,
+  // style/customColors: la paleta vive en el state top-level de App (no en la
+  // review), y es lo que WizardLivePreview lee para pintar el texto. Sin
+  // sembrarlos al entrar a editar, la preview usa la paleta del último batch —
+  // si era "minimal" (fondo claro), el texto se fuerza a negro. VariantWizardRoute
+  // ya los recibía; edición se los había olvidado.
+  setStyle,
+  setCustomColors,
   // bgSelectMode/backgroundId son state de la RAÍZ de App: sobreviven a las
   // navegaciones dentro de la SPA y se restauran del snapshot. Sin resetearlos
   // al entrar a editar, un `backgroundId` viejo de un batch anterior con el tab
@@ -950,6 +957,15 @@ function EditLyricsRoute({
       // cambios de fondo IA. Mismo reset que VariantWizardRoute ya hacía.
       setBgSelectMode?.("auto");
       setBackgroundId?.(null);
+
+      // Sembrar la paleta en el state top-level de App. WizardLivePreview la lee
+      // de ahí (via UploadZone `style={style}`), NO de currentReview.style. Sin
+      // este seeding, editar un video deja la paleta del último batch: si era
+      // "minimal" (fondo claro), plainTextColor se fuerza a #111827 y el texto de
+      // la preview sale negro aunque el render use la paleta real del job. Mismo
+      // seeding que VariantWizardRoute (donde además la paleta es editable).
+      setStyle?.(job.style || "auto");
+      setCustomColors?.((job.render_params && job.render_params.custom_colors) || "");
 
       // Mount the editor NOW with audio/waveform/bg as null. The LyricsEditor
       // handles these as optional — timeline renders without waveform fill,
@@ -5199,6 +5215,8 @@ export default function App() {
             <EditLyricsRoute
               setCurrentReview={setCurrentReview}
               setWizardStage={setWizardStage}
+              setStyle={setStyle}
+              setCustomColors={setCustomColors}
               setBgSelectMode={setBgSelectMode}
               setBackgroundId={setBackgroundId}
               wizardScreen={wizardScreen}
