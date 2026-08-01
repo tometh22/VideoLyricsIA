@@ -411,6 +411,7 @@ export default function App() {
       filename: f.file.name, _file: f.file, artist: f.artist.trim(),
       songTitle: (f.songTitle || "").trim(),
       language: f.language, genre: f.genre || "", font: f.font || "",
+      textCase: f.textCase || "upper",
       concept: f.concept || "", movementStyle: f.movementStyle || "",
       status: "queued", current_step: null,
       progress: 0, job_id: null, error: null,
@@ -471,6 +472,7 @@ export default function App() {
         file: entry.file, artist: entry.artist, language: entry.language,
         songTitle: entry.songTitle || "",
         genre: entry.genre || "", font: entry.font || "",
+        textCase: entry.textCase || "upper",
         concept: entry.concept || "", movementStyle: entry.movementStyle || "",
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         coverageWarning: !!data.coverage_warning,
@@ -494,6 +496,7 @@ export default function App() {
       file: r.file, artist: r.artist, language: r.language,
       songTitle: r.songTitle || "",
       genre: r.genre || "", font: r.font || "", concept: r.concept || "",
+      textCase: r.textCase || "upper",
       movementStyle: r.movementStyle || "",
       segments: editedSegments,
       transcribeJobId: r.transcribeJobId || null,
@@ -516,6 +519,7 @@ export default function App() {
       filename: a.file.name, _file: a.file, artist: a.artist,
       songTitle: (a.songTitle || "").trim(),
       language: a.language, genre: a.genre || "", font: a.font || "",
+      textCase: a.textCase || "upper",
       concept: a.concept || "", movementStyle: a.movementStyle || "",
       segments: a.segments,
       transcribeJobId: a.transcribeJobId || null,
@@ -549,6 +553,7 @@ export default function App() {
         if (jobList[i].language) formData.append("language", jobList[i].language);
         if (jobList[i].genre) formData.append("genre", jobList[i].genre);
         if (jobList[i].font) formData.append("font", jobList[i].font);
+        formData.append("text_case", jobList[i].textCase || "upper");
         if (jobList[i].concept) formData.append("concept", jobList[i].concept);
         if (jobList[i].movementStyle) formData.append("movement_style", jobList[i].movementStyle);
         if (animateImage && backgroundFile) formData.append("animate_image", "true");
@@ -658,6 +663,7 @@ export default function App() {
         if (jobList[i].language) generateBody.append("language", jobList[i].language);
         if (jobList[i].genre) generateBody.append("genre", jobList[i].genre);
         if (jobList[i].font) generateBody.append("font", jobList[i].font);
+        generateBody.append("text_case", jobList[i].textCase || "upper");
         if (jobList[i].concept) generateBody.append("concept", jobList[i].concept);
         if (jobList[i].movementStyle) generateBody.append("movement_style", jobList[i].movementStyle);
         if (animateImage && backgroundFile) generateBody.append("animate_image", "true");
@@ -734,6 +740,7 @@ export default function App() {
         language: last.language,
         genre: last.genre || "",
         font: last.font || "",
+        textCase: last.textCase || "upper",
         concept: last.concept || "",
         movementStyle: last.movementStyle || "",
         segments: last.segments,

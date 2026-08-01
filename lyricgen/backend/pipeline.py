@@ -222,7 +222,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  concept: str = "",
                  movement_style: str = "",
                  animate_image: bool = False,
-                 song_title: str = ""):
+                 song_title: str = "",
+                 text_case: str = "upper"):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -426,6 +427,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 mp3_path, segments, style, job_dir, artist, bg_image_path,
                 font=chosen_font, spec=intermediate_spec,
                 song_title=song_title,
+                text_case=text_case,
             )
             files["video_url"] = f"/download/{job_id}/video"
             update_job(job_id, progress=55)
@@ -448,6 +450,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             generate_short(
                 mp3_path, segments, job_dir, bg_source=bg_source,
                 style=style, font=chosen_font, fps=short_fps,
+                text_case=text_case,
             )
             files["short_url"] = f"/download/{job_id}/short"
             update_job(job_id, progress=85)
@@ -3878,14 +3881,131 @@ def _resolve_font(font_id: str) -> str | None:
     return None
 
 
+_PROPER_NOUNS = frozenset({
+    # Países en español.
+    "afganistán", "albania", "alemania", "andorra", "angola", "argentina",
+    "argelia", "armenia", "australia", "austria", "azerbaiyán", "bangladés",
+    "barbados", "baréin", "bélgica", "belice", "benín", "bielorrusia",
+    "birmania", "bolivia", "botsuana", "brasil", "brunéi", "bulgaria",
+    "burundi", "bután", "camboya", "camerún", "canadá", "catar", "chad",
+    "chile", "china", "chipre", "colombia", "comoras", "congo", "croacia",
+    "cuba", "dinamarca", "dominica", "ecuador", "egipto", "eritrea",
+    "eslovaquia", "eslovenia", "españa", "estonia", "etiopía", "filipinas",
+    "finlandia", "francia", "gabón", "gambia", "georgia", "ghana", "granada",
+    "grecia", "guatemala", "guinea", "guyana", "haití", "honduras", "hungría",
+    "india", "indonesia", "irak", "irán", "irlanda", "islandia", "israel",
+    "italia", "jamaica", "japón", "jordania", "kazajistán", "kenia",
+    "kirguistán", "kiribati", "kuwait", "laos", "lesoto", "letonia", "líbano",
+    "liberia", "libia", "liechtenstein", "lituania", "luxemburgo",
+    "madagascar", "malasia", "malaui", "maldivas", "malí", "malta",
+    "marruecos", "mauricio", "mauritania", "méxico", "micronesia", "moldavia",
+    "mónaco", "mongolia", "montenegro", "mozambique", "namibia", "nauru",
+    "nepal", "nicaragua", "níger", "nigeria", "noruega", "omán", "pakistán",
+    "palaos", "palestina", "panamá", "paraguay", "perú", "polonia", "portugal",
+    "ruanda", "rumania", "rusia", "samoa", "senegal", "serbia", "seychelles",
+    "singapur", "siria", "somalia", "sudán", "suecia", "suiza", "surinam",
+    "tailandia", "taiwán", "tanzania", "tayikistán", "togo", "tonga", "túnez",
+    "turquía", "turkmenistán", "tuvalu", "ucrania", "uganda", "uruguay",
+    "uzbekistán", "vanuatu", "venezuela", "vietnam", "yemen", "yibuti",
+    "zambia", "zimbabue", "salvador",
+    # Gentilicios frecuentes y nombres de alta frecuencia en letras.
+    "argentino", "argentina", "argentinos", "argentinas", "mexicano",
+    "mexicana", "mexicanos", "mexicanas", "español", "española", "españoles",
+    "españolas", "colombiano", "colombiana", "peruano", "peruana", "chileno",
+    "chilena", "venezolano", "venezolana", "boliviano", "cubano", "cubana",
+    "brasileño", "brasileña", "uruguayo", "paraguayo", "americano", "americana",
+    "latino", "latina", "latinos", "latinas", "dios", "jesús", "cristo", "maría",
+    "satán",
+})
+
+
+def _proper_noun_case(word: str) -> str | None:
+    """Return normalized Title Case for a known proper noun, if recognized."""
+    leading = word[:len(word) - len(word.lstrip("\"'()[]—–-…"))]
+    trailing = word[len(word.rstrip("\"'()[]—–-…")):]
+    end = len(word) - len(trailing) if trailing else len(word)
+    core = word[len(leading):end]
+    if core.casefold() not in _PROPER_NOUNS:
+        return None
+    return f"{leading}{core[:1].upper()}{core[1:].lower()}{trailing}"
+
+
+def _smart_lower(text: str) -> str:
+    """Lowercase lyric text while retaining deliberate proper-noun capitals.
+
+    Natural sentence-case keeps interior capitals (``a Guinea``, ``el Sol``),
+    because those are operator/transcription intent. Words following sentence
+    punctuation or a newline are lowercased unless they are recognized proper
+    nouns (``Argentina``, ``México``, ``Guinea``). Uniformly title-cased or
+    all-caps input is treated as formatting and lowercased everywhere except
+    the same dictionary entries.
+    """
+    boundary = set(".,;:!?¡¿")
+    words = re.findall(r"[^\W\d_]+", text, flags=re.UNICODE)
+
+    def first_alpha_upper(word: str) -> bool:
+        return bool(word) and word[0].isupper()
+
+    uniformly_titled = len(words) >= 2 and all(first_alpha_upper(word) for word in words)
+    out = []
+    seen_word = False
+    after_boundary = True
+
+    for chunk in re.split(r"(\s+)", text):
+        if not chunk or chunk.isspace():
+            out.append(chunk)
+            if "\n" in chunk:
+                after_boundary = True
+            continue
+
+        # Split punctuation inside a whitespace-delimited chunk too, so
+        # ``na,Na`` follows the same rule as ``na, Na``.
+        for part in re.split(r"([.,;:!?¡¿])", chunk):
+            if not part:
+                continue
+            if part in boundary:
+                out.append(part)
+                after_boundary = True
+                continue
+            if not any(char.isalpha() for char in part):
+                out.append(part)
+                continue
+
+            proper = _proper_noun_case(part)
+            if uniformly_titled:
+                out.append(proper if proper is not None else part.lower())
+            elif not seen_word:
+                out.append(part.lower())
+            elif after_boundary:
+                out.append(proper if proper is not None else part.lower())
+            else:
+                out.append(part)
+            seen_word = True
+            after_boundary = False
+
+    return "".join(out)
+
+
+def _apply_text_case(text: str, text_case: str = "upper") -> str:
+    """Return the lyric text in the case selected by the operator."""
+    text_case = (text_case or "upper").strip().lower()
+    if text_case == "lower":
+        return _smart_lower(text)
+    if text_case == "title":
+        return text.title()
+    if text_case == "original":
+        return text
+    return text.upper()
+
+
 def _make_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Arial",
-                    spec: RenderSpec | None = None):
+                    spec: RenderSpec | None = None, text_case: str = "upper"):
     """Create a clean text clip matching pro lyric video style (bold white, subtle shadow)."""
     import unicodedata
     if spec is None:
         spec = RenderSpec.youtube_default()
     # Sanitize text: normalize unicode and remove problematic characters
-    display_text = unicodedata.normalize("NFC", text.upper())
+    display_text = unicodedata.normalize("NFC", _apply_text_case(text, text_case))
     # Remove characters that break ImageMagick's @file parsing
     display_text = display_text.replace("@", "").replace("`", "'").replace("\x00", "")
 
@@ -4306,6 +4426,7 @@ def generate_lyric_video(
     spec: RenderSpec | None = None,
     font: str | None = None,
     song_title: str = "",
+    text_case: str = "upper",
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -4490,7 +4611,10 @@ def generate_lyric_video(
                 print(f"[TITLE] top title card failed ({e}); continuing without it")
 
     for seg in segments:
-        layers = _make_text_clip(seg["text"], seg["start"], seg["end"], font, spec=spec)
+        layers = _make_text_clip(
+            seg["text"], seg["start"], seg["end"], font,
+            spec=spec, text_case=text_case,
+        )
         text_layers.extend(layers)
 
     video = CompositeVideoClip([bg] + text_layers, size=(spec.width, spec.height))
@@ -4623,7 +4747,8 @@ def _find_chorus_start(segments: list[dict], window_sec: int = 30) -> float:
     return best_start
 
 
-def _make_short_text_clip(text: str, seg_start: float, seg_end: float, font: str = "Arial"):
+def _make_short_text_clip(text: str, seg_start: float, seg_end: float,
+                          font: str = "Arial", text_case: str = "upper"):
     """Create text clips sized for vertical 1080x1920 short.
 
     Sizes are tuned for TikTok / Reels / Shorts viewing on mobile — the
@@ -4631,7 +4756,7 @@ def _make_short_text_clip(text: str, seg_start: float, seg_end: float, font: str
     length. Bumped to 75 / 95 / 115 which fills more of the vertical
     real-estate and matches what creators on those platforms actually use.
     """
-    display_text = text.upper()
+    display_text = _apply_text_case(text, text_case)
 
     text_len = len(display_text)
     if text_len > 60:
@@ -4682,6 +4807,7 @@ def generate_short(
     style: str = "oscuro",
     font: str = "Arial",
     fps: float = 24,
+    text_case: str = "upper",
 ) -> str:
     """Generate a 1080x1920 vertical short from the chorus section.
 
@@ -4727,7 +4853,7 @@ def generate_short(
         e = min(short_dur, seg["end"] - start_time)
         if e - s < 0.1:
             continue
-        layers = _make_short_text_clip(seg["text"], s, e, font)
+        layers = _make_short_text_clip(seg["text"], s, e, font, text_case=text_case)
         text_layers.extend(layers)
 
     final = CompositeVideoClip([bg] + text_layers, size=(1080, 1920))
