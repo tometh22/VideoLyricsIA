@@ -88,6 +88,19 @@ logger = logging.getLogger("genly")
 
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
 
+_TEXT_CASES = {"upper", "lower", "title", "original"}
+
+
+def _normalize_text_case(value: str) -> str:
+    """Keep the render contract small and reject unknown client values."""
+    value = (value or "upper").strip().lower()
+    if value not in _TEXT_CASES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"text_case must be one of {sorted(_TEXT_CASES)}.",
+        )
+    return value
+
 app = FastAPI(
     title="GenLy AI API",
     version="2.0.0",
@@ -1521,6 +1534,7 @@ async def upload(
     background_file: UploadFile = File(None),
     genre: str = Form(""),
     font: str = Form(""),
+    text_case: str = Form("upper"),
     concept: str = Form(""),
     movement_style: str = Form(""),
     animate_image: str = Form(""),
@@ -1534,6 +1548,7 @@ async def upload(
     the upload memory + bandwidth cost. Removal: 2026-08-01.
     """
     _set_deprecation_headers(response, "/upload")
+    text_case = _normalize_text_case(text_case)
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing filename.")
     name_lower = file.filename.lower()
@@ -1654,6 +1669,7 @@ async def upload(
         bg_r2_key=bg_r2_key,
         genre=genre,
         font=font,
+        text_case=text_case,
         concept=concept,
         movement_style=movement_style,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
@@ -2251,6 +2267,7 @@ async def generate_with_segments(
     background_file: UploadFile = File(None),
     genre: str = Form(""),
     font: str = Form(""),
+    text_case: str = Form("upper"),
     concept: str = Form(""),
     movement_style: str = Form(""),
     animate_image: str = Form(""),
@@ -2268,6 +2285,7 @@ async def generate_with_segments(
         callers that bypassed /transcribe. Streams the file in like before.
     """
     job_id = (job_id or "").strip()
+    text_case = _normalize_text_case(text_case)
     reuse = bool(job_id)
 
     if reuse:
@@ -2444,6 +2462,7 @@ async def generate_with_segments(
         bg_r2_key=bg_r2_key,
         genre=genre,
         font=font,
+        text_case=text_case,
         concept=concept,
         movement_style=movement_style,
         animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),

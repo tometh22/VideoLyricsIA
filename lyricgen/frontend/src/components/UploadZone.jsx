@@ -219,6 +219,13 @@ export default function UploadZone({
     { code: "anton",           label: "Anton",                             css: "'Anton', sans-serif",      weight: 400 },
   ];
 
+  const TEXT_CASES = [
+    { code: "upper",    label: "MAYÚSCULAS" },
+    { code: "lower",    label: "minúsculas" },
+    { code: "title",    label: "Primera letra de cada palabra" },
+    { code: "original", label: "Original" },
+  ];
+
   // Two upload conventions are supported:
   //   "Artist - Title.ext"  → artist=Artist, song=Title
   //   "Title_Artist.ext"    → song=Title,    artist=Artist
@@ -280,6 +287,7 @@ export default function UploadZone({
           artist,
           songTitle: song,
           language: "",
+          textCase: "upper",
         };
       });
       return [...prev, ...newEntries];
@@ -641,9 +649,12 @@ export default function UploadZone({
                 {(() => {
                   const isExpanded = expandedRows.has(i);
                   const hasFontCustom = !!entry.font;
+                  const hasTextCaseCustom = entry.textCase && entry.textCase !== "upper";
                   const hasAutoCustom = !!(entry.concept || entry.movementStyle);
                   const hasCustom =
-                    bgMode === "auto" ? (hasFontCustom || hasAutoCustom) : hasFontCustom;
+                    bgMode === "auto"
+                      ? (hasFontCustom || hasTextCaseCustom || hasAutoCustom)
+                      : (hasFontCustom || hasTextCaseCustom);
                   return (
                     <button
                       type="button"
@@ -708,6 +719,18 @@ export default function UploadZone({
                         options={FONTS}
                         className="flex-1"
                         ariaLabel={t("upload.font_label") || "Tipografía"}
+                      />
+                    </div>
+                    <div className="flex items-center gap-2 pt-1">
+                      <span className="text-[11px] text-gray-600 shrink-0">
+                        Estilo de texto:
+                      </span>
+                      <Listbox
+                        value={entry.textCase || "upper"}
+                        onChange={(v) => updateField(i, "textCase", v)}
+                        options={TEXT_CASES}
+                        className="flex-1"
+                        ariaLabel="Estilo de texto"
                       />
                     </div>
                     {bgMode !== "auto" && (
