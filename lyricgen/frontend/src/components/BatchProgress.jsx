@@ -17,7 +17,12 @@ async function triggerDownload(jobId, type) {
 function JobRow({ job, index, t }) {
   const { filename, status, current_step, progress, job_id, error,
           queue_reason, queue_retry_in_s } = job;
-  const name = filename.replace(/\.mp3$/i, "");
+  // The filename is an upload transport detail, not the song identity. The
+  // operator may have corrected the title before rendering, so prefer the
+  // structured value and only fall back to the filename for legacy callers.
+  const name = (job.songTitle || job.song_title || filename || "")
+    .replace(/\.(mp3|wav|m4a|flac|aac|ogg)$/i, "");
+  const artist = (job.artist || "").trim();
 
   const STEP_LABELS = {
     // current_step="uploading" is set by processQueueDirect while the
@@ -51,6 +56,17 @@ function JobRow({ job, index, t }) {
     }
     return null;
   })();
+  const statusLabel = status === "done" ? t("dash.completed") :
+    status === "pending_review" ? (t("batch.pending_review") || "Pendiente de aprobacion") :
+    status === "validation_failed" ? (t("batch.validation_failed") || "Validacion fallida") :
+    status === "error" ? (error || t("dash.error")) :
+    status === "processing" ? (
+      current_step === "uploading"
+        ? `${STEP_LABELS.uploading} ${progress || 0}%`
+        : STEP_LABELS[current_step] || current_step
+    ) :
+    queueLabel ? queueLabel :
+    t("batch.queued");
 
   return (
     <div className={`glass rounded-card p-4 transition-all duration-300 ${
@@ -91,18 +107,9 @@ function JobRow({ job, index, t }) {
         {/* File info */}
         <div className="min-w-0 flex-1">
           <p className="text-sm font-medium text-white truncate">{name}</p>
-          <p className={`text-[11px] ${queueLabel ? "text-amber-300/80" : "text-gray-500"}`}>
-            {status === "done" ? t("dash.completed") :
-             status === "pending_review" ? (t("batch.pending_review") || "Pendiente de aprobacion") :
-             status === "validation_failed" ? (t("batch.validation_failed") || "Validacion fallida") :
-             status === "error" ? (error || t("dash.error")) :
-             status === "processing" ? (
-               current_step === "uploading"
-                 ? `${STEP_LABELS.uploading} ${progress || 0}%`
-                 : STEP_LABELS[current_step] || current_step
-             ) :
-             queueLabel ? queueLabel :
-             t("batch.queued")}
+          {artist && <p className="text-[11px] text-gray-500 truncate">{artist}</p>}
+          <p className={`text-[11px] truncate ${queueLabel ? "text-amber-300/80" : "text-gray-500"}`}>
+            {statusLabel}
           </p>
         </div>
 

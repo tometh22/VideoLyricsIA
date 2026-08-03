@@ -2506,6 +2506,7 @@ async def status(
         "files": job["files"],
         "error": job.get("error"),
         "artist": job.get("artist"),
+        "song_title": job.get("song_title"),
         "filename": job.get("filename"),
         "created_at": job.get("created_at"),
         # Frontend uses delivery_profile to decide whether to show the

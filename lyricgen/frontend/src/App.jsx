@@ -738,6 +738,10 @@ export default function App() {
         file: last.file,
         artist: last.artist,
         language: last.language,
+        // Keep the operator's explicit title when stepping back in a batch.
+        // Losing it here makes /generate fall back to parsing the raw
+        // filename, which can display a different song after a correction.
+        songTitle: last.songTitle || "",
         genre: last.genre || "",
         font: last.font || "",
         textCase: last.textCase || "upper",

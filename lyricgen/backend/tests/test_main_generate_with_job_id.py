@@ -140,6 +140,14 @@ def test_generate_reuses_persisted_audio_when_job_id_provided(
     assert captured["job_id"] == job_id
     assert captured["mp3_path"].endswith("song.wav")
     assert captured["segments_override"] == [{"start": 0, "end": 1, "text": "test"}]
+    assert captured["song_title"] == "No Tengo Ganas"
+
+    # The status payload feeds the render/detail UI. It must expose the
+    # structured title as well as the upload filename so the UI never has to
+    # infer the song name from a potentially unrelated raw filename.
+    status_res = client.get(f"/status/{job_id}", headers=auth(token))
+    assert status_res.status_code == 200, status_res.text
+    assert status_res.json()["song_title"] == "No Tengo Ganas"
 
 
 def test_generate_with_job_id_rejects_other_users_jobs(client, monkeypatch):
