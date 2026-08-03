@@ -615,7 +615,11 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // any await, so the second handler sees `current=true` immediately and
   // bails out.
   const approveLockRef = useRef(false);
-  const name = (job.filename || "").replace(/\.mp3$/i, "");
+  // Show the metadata the operator reviewed, not the raw upload filename.
+  // A filename can be inherited from an export or an earlier correction and
+  // is not authoritative once song_title has been captured on the job.
+  const name = (job.song_title || job.filename || "")
+    .replace(/\.(mp3|wav|m4a|flac|aac|ogg)$/i, "");
 
   // Short-lived media URLs (re-fetch when the active tab changes).
   const previewMediaType = activeTab === "thumbnail" ? "thumbnail" : activeTab;
