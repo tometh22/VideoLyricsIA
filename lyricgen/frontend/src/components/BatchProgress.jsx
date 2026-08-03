@@ -292,7 +292,12 @@ function SingleGeneratingWithWatchdog({ heroProps, status, onReset, t, stallMs =
 function JobRow({ job, index, t, onSelectJob }) {
   const { filename, status, current_step, progress, job_id, error,
           queue_reason, queue_retry_in_s } = job;
-  const name = filename.replace(/\.(mp3|wav)$/i, "");
+  // The filename is an upload transport detail, not the song identity. The
+  // operator may have corrected the title before rendering, so prefer the
+  // structured value and only fall back to the filename for legacy callers.
+  const name = (job.songTitle || job.song_title || filename || "")
+    .replace(/\.(mp3|wav|m4a|flac|aac|ogg)$/i, "");
+  const artist = (job.artist || "").trim();
   const isClickable = (status === "pending_review" || status === "done" || status === "editing") && job_id && onSelectJob;
 
   const STEP_LABELS = {
@@ -312,6 +317,18 @@ function JobRow({ job, index, t, onSelectJob }) {
     if (queue_reason === "rate_limit") return t("batch.queue_rate_limit") || "Subiendo… reintentamos en unos segundos";
     return null;
   })();
+  const statusLabel = status === "done" ? t("dash.completed") :
+    status === "pending_review" ? (t("batch.pending_review") || "Pendiente de aprobacion") :
+    status === "validation_failed" ? (t("batch.validation_failed") || "Validacion fallida") :
+    status === "error" ? (error || t("dash.error")) :
+    status === "editing" ? (t("batch.editing") || `Re-renderizando · ${STEP_LABELS[current_step] || current_step || "..."} ${progress || 0}%`) :
+    status === "processing" ? (
+      current_step === "uploading"
+        ? `${STEP_LABELS.uploading} ${progress || 0}%`
+        : STEP_LABELS[current_step] || current_step
+    ) :
+    queueLabel ? queueLabel :
+    t("batch.queued");
 
   return (
     <div
@@ -343,19 +360,9 @@ function JobRow({ job, index, t, onSelectJob }) {
               </svg>
             )}
           </div>
-          <p className={`text-[11px] ${queueLabel ? "text-amber-300/80" : "text-gray-500"}`}>
-            {status === "done" ? t("dash.completed") :
-             status === "pending_review" ? (t("batch.pending_review") || "Pendiente de aprobación") :
-             status === "validation_failed" ? (t("batch.validation_failed") || "Validación fallida") :
-             status === "error" ? (error || t("dash.error")) :
-             status === "editing" ? (t("batch.editing") || `Re-renderizando · ${STEP_LABELS[current_step] || current_step || "..."} ${progress || 0}%`) :
-             status === "processing" ? (
-               current_step === "uploading"
-                 ? `${STEP_LABELS.uploading} ${progress || 0}%`
-                 : STEP_LABELS[current_step] || current_step
-             ) :
-             queueLabel ? queueLabel :
-             t("batch.queued")}
+          {artist && <p className="text-[11px] text-gray-500 truncate">{artist}</p>}
+          <p className={`text-[11px] truncate ${queueLabel ? "text-amber-300/80" : "text-gray-500"}`}>
+            {statusLabel}
           </p>
         </div>
         {status === "done" && job_id && (
