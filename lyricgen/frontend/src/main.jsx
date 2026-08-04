@@ -31,16 +31,27 @@ initSentry();
 // es hacer reload al toque para forzar el browser a re-bajar el index.js
 // nuevo + el chunk con el hash correcto. El operador ve un flash de la
 // página + recarga limpia — mucho mejor que el error fullscreen.
+//
+// Cubre tanto el chunk JS ("Failed to fetch dynamically imported module")
+// como el CSS asociado ("Unable to preload CSS for /assets/X.css",
+// Sentry #31): ambos llegan por el mismo evento.
 window.addEventListener("vite:preloadError", (event) => {
   // Evitar reloads en loop: usar sessionStorage como circuit breaker.
   // Si ya recargamos por este motivo en los últimos 10s, no insistir
   // (puede ser un problema de red real, no un stale bundle).
   const last = parseInt(sessionStorage.getItem("__vite_reload_at") || "0", 10);
   if (Date.now() - last < 10_000) {
-    // ya intentamos hace poco, dejar que el GlobalErrorBoundary muestre
-    // el error para que el operador vea algo más que un flash infinito.
+    // ya intentamos hace poco, dejar que el error se propague al
+    // GlobalErrorBoundary para que el operador vea algo más que un flash
+    // infinito. NO llamamos preventDefault: queremos que Vite re-lance.
     return;
   }
+  // preventDefault frena el re-throw de Vite. Sin esto, aunque
+  // recarguemos, Vite igual re-lanza el error sincrónicamente → se
+  // propaga como unhandledrejection → lo captura Sentry (ruido: la
+  // recarga ya resolvió el problema) y puede parpadear el
+  // GlobalErrorBoundary antes de que la navegación complete.
+  event.preventDefault();
   sessionStorage.setItem("__vite_reload_at", String(Date.now()));
   console.warn("[stale-bundle] vite:preloadError detected, forcing reload", event);
   window.location.reload();
