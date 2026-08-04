@@ -10,6 +10,7 @@ import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
 import { CONCEPT_CODES, EFFECT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
 import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS } from "../lib/optionLabels";
+import { canCreateArtTrack } from "../lib/artTrackAccess";
 import EditPlanSummary from "./EditPlanSummary";
 import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBackgroundPreviewTokens";
 
@@ -675,13 +676,12 @@ export default function UploadZone({
   // Art Track gateado por tenant (default OFF salvo admin). Si no califica,
   // no mostramos el selector de tipo de video (queda solo lyric, como antes
   // de la feature) y reseteamos artTrack si vino prendido de un estado viejo.
-  // Kill-switch de build: Art Track NO va a producción (2026-07-22). El build
-  // de prod (genly.pro) no setea VITE_ART_TRACK_ENABLED → la feature queda
-  // totalmente oculta (ni admins la ven). Se habilita por entorno para testeo
-  // (staging: VITE_ART_TRACK_ENABLED=true); ahí sigue gateada por feature/admin.
+  // Kill-switch de build para rollouts públicos. Los admins conservan acceso
+  // aunque el build de producción no habilite VITE_ART_TRACK_ENABLED; para
+  // cualquier no-admin hacen falta el flag de build Y features.art_track del
+  // backend. /generate repite el gate server-side.
   const ART_TRACK_ENABLED = import.meta.env.VITE_ART_TRACK_ENABLED === "true";
-  const artTrackEligible =
-    ART_TRACK_ENABLED && (user?.features?.art_track === true || user?.role === "admin");
+  const artTrackEligible = canCreateArtTrack(user, ART_TRACK_ENABLED);
   useEffect(() => {
     if (artTrack && !artTrackEligible) onArtTrackChange?.(false);
   }, [artTrack, artTrackEligible]);

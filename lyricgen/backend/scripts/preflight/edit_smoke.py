@@ -12,7 +12,8 @@ existe para cazar.
   1. Craftea un WAV PCM de 2 s con tags INFO en LATIN-1 ("Estrechez de
      Corazón", byte 0xf3) — el disparador real del UnicodeDecodeError que
      activó el 234.
-  2. Lo sube (/upload) y espera el render (pending_review).
+  2. Lo sube directo a R2 con el flujo vigente (/upload-url), lo transcribe
+     (/transcribe-uploaded), genera el video y espera pending_review.
   3. Pide un edit de metadata (/edit) — recorre run_edit_pipeline: la
      apertura moviepy del source_audio, el fallback UTF-8, el re-render y
      el re-upload de deliverables.
@@ -31,10 +32,10 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import struct
 import sys
-import tempfile
 import time
 import wave
 
@@ -91,32 +92,96 @@ def main() -> int:
         return _fail(f"login {r.status_code}: {r.text[:200]}")
     headers = {"Authorization": f"Bearer {r.json()['token']}"}
 
-    # 2. Upload del WAV acentuado. Reintenta en 5xx: este workflow corre
-    # justo después de un push a staging, y Railway puede estar swapeando
-    # el contenedor (502 "Application failed to respond" observado en la
-    # primera corrida real). El sleep del workflow amortigua; esto remata.
+    # 2. Upload vigente: API crea el job + firma una URL, luego el WAV viaja
+    # directo a R2. El endpoint multipart legado /upload fue retirado el
+    # 2026-08-01 y además sostenía una sesión DB durante todo el I/O a R2,
+    # por lo que dejó de representar el camino real del frontend.
     wav = _accented_wav_bytes()
-    r = None
-    for attempt in range(1, 4):
-        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
-            f.write(wav)
-            f.flush()
-            f.seek(0)
-            r = requests.post(
-                f"{api}/upload", headers=headers,
-                files={"file": ("estrechez_smoke.wav", f, "audio/wav")},
-                data={"artist": _ARTIST, "delivery_profile": "youtube"},
-                timeout=120,
-            )
-        if r.ok or r.status_code < 500:
+    r = requests.post(
+        f"{api}/upload-url", headers=headers,
+        json={
+            "filename": "estrechez_smoke.wav",
+            "content_type": "audio/wav",
+            "size_bytes": len(wav),
+            "artist": _ARTIST,
+            "title": _TITLE,
+        },
+        timeout=30,
+    )
+    if not r.ok:
+        return _fail(f"/upload-url {r.status_code}: {r.text[:300]}")
+    ticket = r.json()
+    if ticket.get("use_multipart") or not ticket.get("upload_url"):
+        return _fail("/upload-url devolvió multipart para el WAV mínimo")
+    job_id = ticket["job_id"]
+
+    r = requests.put(
+        ticket["upload_url"], data=wav,
+        headers={"Content-Type": "audio/wav"}, timeout=120,
+    )
+    if not r.ok:
+        return _fail(f"R2 PUT {r.status_code}: {r.text[:300]}")
+
+    r = requests.post(
+        f"{api}/transcribe-uploaded", headers=headers,
+        json={
+            "job_id": job_id,
+            "language": "es",
+            "artist": _ARTIST,
+            "title": _TITLE,
+        },
+        timeout=120,
+    )
+    if not r.ok:
+        return _fail(f"/transcribe-uploaded {r.status_code}: {r.text[:300]}")
+    print(f"[edit-smoke] job {job_id} subido — esperando transcripción…")
+
+    transcription_deadline = time.time() + args.render_timeout
+    transcription_last = ""
+    segments = []
+    while time.time() < transcription_deadline:
+        r = requests.get(
+            f"{api}/transcription-status/{job_id}", headers=headers,
+            timeout=20,
+        )
+        if not r.ok:
+            return _fail(f"/transcription-status {r.status_code}: {r.text[:300]}")
+        transcription = r.json()
+        transcription_status = transcription.get("status")
+        if transcription_status != transcription_last:
+            print(f"[edit-smoke]   transcripción: {transcription_status}")
+            transcription_last = transcription_status
+        if transcription_status == "transcribed":
+            segments = transcription.get("segments") or []
             break
-        print(f"[edit-smoke] upload intento {attempt} → {r.status_code} "
-              f"(deploy en curso?) — reintento en 45s…")
-        time.sleep(45)
-    if r is None or not r.ok:
-        return _fail(f"upload {r.status_code}: {r.text[:300]}")
-    job_id = r.json()["job_id"]
-    print(f"[edit-smoke] job {job_id} subido — esperando render inicial…")
+        if transcription_status in (
+            "error", "failed", "transcription_failed", "validation_failed",
+        ):
+            return _fail(
+                "transcripción terminó en "
+                f"{transcription_status}: {transcription.get('error')}"
+            )
+        time.sleep(10)
+    else:
+        return _fail(f"transcripción no terminó en {args.render_timeout}s")
+
+    # Generar reusando el audio ya persistido y los segmentos aprobados: es
+    # exactamente el contrato que usa el wizard después del editor de letra.
+    generate_fields = {
+        "job_id": job_id,
+        "artist": _ARTIST,
+        "song_title": _TITLE,
+        "segments_json": json.dumps(segments, ensure_ascii=False),
+        "delivery_profile": "youtube",
+    }
+    r = requests.post(
+        f"{api}/generate", headers=headers,
+        files={key: (None, value) for key, value in generate_fields.items()},
+        timeout=120,
+    )
+    if not r.ok:
+        return _fail(f"/generate {r.status_code}: {r.text[:300]}")
+    print("[edit-smoke] generación aceptada — esperando render inicial…")
 
     def wait_for(target: set[str], phase: str) -> dict:
         deadline = time.time() + args.render_timeout
