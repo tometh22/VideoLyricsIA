@@ -1005,6 +1005,29 @@ export default function LyricsEditor({
     setFlushCounter((c) => c + 1);
   }, []);
 
+  const handleTimelineTimingChangeBatch = useCallback((changes) => {
+    if (!changes?.length) return;
+    setIsDirty(true);
+    const byId = new Map(changes.map(({ id, start, end }) => [id, { start, end }]));
+    setEdited((prev) => prev.map((s) => {
+      const change = byId.get(s._id);
+      return change
+        ? { ...s, start: change.start, end: change.end, locked: true }
+        : s;
+    }));
+    setHighlightedIds((prev) => {
+      const next = new Set(prev);
+      changes.forEach(({ id }) => next.add(id));
+      return next;
+    });
+    setTimeout(() => setHighlightedIds((prev) => {
+      const next = new Set(prev);
+      changes.forEach(({ id }) => next.delete(id));
+      return next;
+    }), 10000);
+    setFlushCounter((c) => c + 1);
+  }, []);
+
   // Per-line layout (position / size / rotation) committed from the live
   // preview. Same flush-on-commit as the timeline so "Guardado" shows fast.
   const handleLayoutChange = useCallback((id, layout) => {
@@ -3256,6 +3279,7 @@ export default function LyricsEditor({
                 onSeek={(s) => seekTo(s, false)}
                 onDragStart={pushEditHistory}
                 onTimingChange={handleTimelineTimingChange}
+                onTimingChangeBatch={handleTimelineTimingChangeBatch}
                 onTextChange={updateText}
                 onFocus={focusSegment}
                 onReset={resetTimings}

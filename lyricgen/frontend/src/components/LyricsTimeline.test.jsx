@@ -27,6 +27,7 @@ function setup(overrides = {}) {
     onSeek: vi.fn(),
     onDragStart: vi.fn(),
     onTimingChange: vi.fn(),
+    onTimingChangeBatch: vi.fn(),
     onTextChange: vi.fn(),
     onFocus: vi.fn(),
     onReset: vi.fn(),
@@ -177,6 +178,101 @@ it("locked / dragged block does not crash without setPointerCapture (jsdom)", ()
     fireEvent.pointerUp(block, { clientY: 50, pointerId: 1 });
   }).not.toThrow();
   expect(props.onFocus).toHaveBeenCalledWith(0);
+});
+
+it("selects multiple lines with Shift-click and commits one group move", () => {
+  const props = setup();
+  const first = screen.getByText("primera línea").closest("div[title]");
+  const second = screen.getByText("segunda línea").closest("div[title]");
+
+  fireEvent.pointerDown(first, { clientY: 20, pointerId: 1, shiftKey: true });
+  fireEvent.pointerUp(first, { clientY: 20, pointerId: 1, shiftKey: true });
+  fireEvent.pointerDown(second, { clientY: 320, pointerId: 2, shiftKey: true });
+  fireEvent.pointerUp(second, { clientY: 320, pointerId: 2, shiftKey: true });
+
+  expect(screen.getByText("2 seleccionadas")).toBeInTheDocument();
+  fireEvent.pointerDown(first, { clientY: 20, pointerId: 3 });
+  fireEvent.pointerMove(first, { clientY: 52, pointerId: 3 });
+  fireEvent.pointerUp(first, { clientY: 52, pointerId: 3 });
+
+  expect(props.onDragStart).toHaveBeenCalledTimes(1);
+  expect(props.onTimingChangeBatch).toHaveBeenCalledTimes(1);
+  const [changes] = props.onTimingChangeBatch.mock.calls[0];
+  expect(changes).toHaveLength(2);
+  expect(changes[0].start).toBeGreaterThan(0);
+  expect(changes[1].start).toBeGreaterThan(10);
+  expect(props.onTimingChange).not.toHaveBeenCalled();
+});
+
+it("paints a selection over the timeline when selection mode is enabled", () => {
+  setup();
+  fireEvent.click(screen.getByRole("button", { name: "Seleccionar" }));
+  const lane = screen.getByTestId("timeline-lane");
+  fireEvent.pointerDown(lane, { clientY: 0, pointerId: 1, button: 0 });
+  fireEvent.pointerMove(lane, { clientY: 370, pointerId: 1 });
+  fireEvent.pointerUp(lane, { clientY: 370, pointerId: 1 });
+  expect(screen.getByText("2 seleccionadas")).toBeInTheDocument();
+});
+
+it("does not restart smooth auto-follow while the previous scroll is pending", () => {
+  const props = {
+    segments: SEGS,
+    duration: 60,
+    currentTime: 5,
+    isPlaying: true,
+    activeId: null,
+    focusedSegId: null,
+    highlightedIds: new Set(),
+    onSeek: vi.fn(),
+    onDragStart: vi.fn(),
+    onTimingChange: vi.fn(),
+    onTimingChangeBatch: vi.fn(),
+    onTextChange: vi.fn(),
+    onFocus: vi.fn(),
+    onReset: vi.fn(),
+  };
+  const { rerender } = render(<LyricsTimeline {...props} />);
+  const scroll = screen.getByTestId("timeline-lane").parentElement;
+  Object.defineProperty(scroll, "clientHeight", { configurable: true, value: 80 });
+  Object.defineProperty(scroll, "scrollTop", { configurable: true, writable: true, value: 0 });
+  scroll.scrollTo = vi.fn();
+  rerender(<LyricsTimeline {...props} currentTime={5.1} />);
+  rerender(<LyricsTimeline {...props} currentTime={5.2} />);
+  expect(scroll.scrollTo).toHaveBeenCalledTimes(1);
+});
+
+it("allows auto-follow again after the smooth-scroll fallback expires", () => {
+  vi.useFakeTimers();
+  try {
+    const props = {
+      segments: SEGS,
+      duration: 60,
+      currentTime: 5,
+      isPlaying: true,
+      activeId: null,
+      focusedSegId: null,
+      highlightedIds: new Set(),
+      onSeek: vi.fn(),
+      onDragStart: vi.fn(),
+      onTimingChange: vi.fn(),
+      onTimingChangeBatch: vi.fn(),
+      onTextChange: vi.fn(),
+      onFocus: vi.fn(),
+      onReset: vi.fn(),
+    };
+    const { rerender } = render(<LyricsTimeline {...props} />);
+    const scroll = screen.getByTestId("timeline-lane").parentElement;
+    Object.defineProperty(scroll, "clientHeight", { configurable: true, value: 80 });
+    Object.defineProperty(scroll, "scrollTop", { configurable: true, writable: true, value: 0 });
+    scroll.scrollTo = vi.fn();
+    rerender(<LyricsTimeline {...props} currentTime={5.1} />);
+    expect(scroll.scrollTo).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(750);
+    rerender(<LyricsTimeline {...props} currentTime={5.2} />);
+    expect(scroll.scrollTo).toHaveBeenCalledTimes(2);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 // ---------------------------------------------------------------------------
