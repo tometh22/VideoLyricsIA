@@ -16,7 +16,7 @@
  * All edits go up through the parent's setEdited → existing autosave /
  * onEditedChange / onApprove. This component owns NO persistence.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 
 // Zoom = px per second (vertical). The former 16 px/s default compressed
@@ -41,6 +41,10 @@ const GUTTER_PX = LABEL_W + WAVE_W; // total left gutter (labels + waveform)
 const MAX_VH_NORMAL = "58vh";   // viewport cap default; the lane scrolls within it
 const MAX_VH_FOCUS = "85vh";    // 2026-05-25 — modo enfoque del editor agranda la lane
 const FOLLOW_SUPPRESS_MS = 2500;
+// A smooth scroll is a browser animation. Reissuing it on every audio tick
+// keeps replacing the destination and can make the playhead disappear while
+// the viewport is trying to catch up.
+const FOLLOW_SCROLL_LOCK_MS = 750;
 const INTRO_SKIP_S = 3;        // auto-scroll to first lyric if intro longer than this
 
 function fmt(sec) {
@@ -64,6 +68,7 @@ export default function LyricsTimeline({
   onSeek,              // (seconds) => void
   onDragStart,         // () => void  — push one undo snapshot before a drag commits
   onTimingChange,      // (id, newStart, newEnd) => void — commit; parent sets locked
+  onTimingChangeBatch, // ([{id, start, end}]) => void — commit a group move
   onTextChange,        // (id, text) => void — inline text fix without leaving timeline
   onFocus,             // (id) => void
   onReset,             // () => void
@@ -76,13 +81,18 @@ export default function LyricsTimeline({
   const canvasRef = useRef(null);
   const didAutoScrollRef = useRef(false);
   const [preview, setPreview] = useState(null); // {id, start, end} | null
-  const dragRef = useRef(null); // {id, mode, originY, origStart, origEnd, moved}
+  const dragRef = useRef(null); // single or group drag snapshot
+  const selectionDragRef = useRef(null);
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectionBox, setSelectionBox] = useState(null);
   const [pxPerSec, setPxPerSec] = useState(ZOOM_DEFAULT);
   const [editingTextId, setEditingTextId] = useState(null); // line whose text is being fixed inline
   const [draftText, setDraftText] = useState("");
   const lastUserScrollRef = useRef(0);
   const programmaticScrollUntilRef = useRef(0);
   const followPauseTimerRef = useRef(null);
+  const followScrollRef = useRef(false);
   const [followEnabled, setFollowEnabled] = useState(true);
   const [followSuppressed, setFollowSuppressed] = useState(false);
   const [scrollState, setScrollState] = useState({ top: 0, viewport: 1 });
@@ -103,9 +113,31 @@ export default function LyricsTimeline({
     followPauseTimerRef.current = setTimeout(() => setFollowSuppressed(false), FOLLOW_SUPPRESS_MS);
   }, []);
 
+  const releaseFollowScroll = useCallback(() => {
+    followScrollRef.current = false;
+  }, []);
+
+  const requestFollowScroll = useCallback((sc, top) => {
+    if (followScrollRef.current) return false;
+    followScrollRef.current = true;
+    programmaticScrollUntilRef.current = Date.now() + FOLLOW_SCROLL_LOCK_MS;
+    sc.scrollTo({ top, behavior: "smooth" });
+    // scrollend is not available in every browser version (and jsdom), so
+    // always retain a bounded fallback to release the single-flight lock.
+    window.setTimeout(releaseFollowScroll, FOLLOW_SCROLL_LOCK_MS);
+    return true;
+  }, [releaseFollowScroll]);
+
   useEffect(() => () => {
     if (followPauseTimerRef.current) clearTimeout(followPauseTimerRef.current);
   }, []);
+
+  useEffect(() => {
+    const sc = scrollRef.current;
+    if (!sc || typeof sc.addEventListener !== "function") return undefined;
+    sc.addEventListener("scrollend", releaseFollowScroll);
+    return () => sc.removeEventListener("scrollend", releaseFollowScroll);
+  }, [releaseFollowScroll]);
 
   const total = Math.max(duration || 0, ...segments.map((s) => s.end), 1);
   const laneHeight = total * pxPerSec;
@@ -130,7 +162,7 @@ export default function LyricsTimeline({
   // 50ms epsilon: timestamps that close are functionally simultaneous from
   // the operator's point of view (single bar of music) and should share a
   // lane bucket. Larger gaps go in the same lane sequentially.
-  const { laneOfId, laneCount } = (() => {
+  const { laneOfId, laneCount } = useMemo(() => {
     const OVERLAP_EPSILON_S = 0.05;
     const sorted = [...segments].sort((a, b) => a.start - b.start);
     const laneEnds = [];                 // laneIdx → latest seg.end in that lane
@@ -152,7 +184,17 @@ export default function LyricsTimeline({
       idToLane.set(s._id, assigned);
     }
     return { laneOfId: idToLane, laneCount: Math.max(1, laneEnds.length) };
-  })();
+  }, [segments]);
+
+  // Keep selection valid when the editor replaces/rehydrates its segment
+  // array after a save or a reset.
+  useEffect(() => {
+    const ids = new Set(segments.map((s) => s._id));
+    setSelectedIds((prev) => {
+      const next = new Set([...prev].filter((id) => ids.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [segments]);
 
   const neighbours = useCallback(
     (id) => {
@@ -194,9 +236,25 @@ export default function LyricsTimeline({
     return Math.max(0, (clientY - rect.top) / pxPerSec);
   }, [pxPerSec]);
 
+  const toggleSelection = useCallback((id) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
   const onPointerDown = useCallback(
     (e, seg, mode) => {
       e.stopPropagation();
+      // Shift/Cmd-click is the quick selection path. Selection mode is the
+      // explicit "paint" path for dense timelines where clicking individual
+      // blocks is impractical.
+      if (selectionMode || e.shiftKey || e.metaKey || e.ctrlKey) {
+        toggleSelection(seg._id);
+        return;
+      }
       e.currentTarget.setPointerCapture?.(e.pointerId);
       onDragStart?.();
       // Auditoría 2026-06-10: si hay un smooth-scroll del auto-follow EN
@@ -213,14 +271,19 @@ export default function LyricsTimeline({
       // saltaba a una posición incorrecta. El snapshot garantiza que
       // los pixels que el operador movió siempre se traducen al mismo
       // tiempo, incluso si el zoom cambia entre frames.
+      const isGroupMove = mode === "move" && selectedIds.has(seg._id) && selectedIds.size > 1;
+      const snapshots = (isGroupMove ? segments.filter((s) => selectedIds.has(s._id)) : [seg])
+        .map((s) => ({ id: s._id, start: s.start, end: s.end }));
       dragRef.current = {
-        id: seg._id, mode, originY: e.clientY,
-        origStart: seg.start, origEnd: seg.end, moved: false,
+        id: seg._id, ids: snapshots.map((s) => s.id), mode, originY: e.clientY,
+        origStart: seg.start, origEnd: seg.end, snapshots, moved: false,
         origPxPerSec: pxPerSec,
       };
-      setPreview({ id: seg._id, start: seg.start, end: seg.end });
+      setPreview(isGroupMove
+        ? { changes: snapshots }
+        : { id: seg._id, start: seg.start, end: seg.end });
     },
-    [onDragStart, markUserScroll]
+    [onDragStart, markUserScroll, pxPerSec, segments, selectedIds, selectionMode, toggleSelection]
   );
 
   const onPointerMove = useCallback(
@@ -238,6 +301,19 @@ export default function LyricsTimeline({
       // FIX 2 (2026-05-25): usar origPxPerSec del snapshot, NO el live
       // pxPerSec — sino un zoom mid-drag re-escala el delta.
       const delta = deltaPx / (d.origPxPerSec || pxPerSec);
+      if (d.snapshots?.length > 1) {
+        const minStart = Math.min(...d.snapshots.map((s) => s.start));
+        const maxEnd = Math.max(...d.snapshots.map((s) => s.end));
+        const clampedDelta = Math.min(Math.max(delta, -minStart), total - maxEnd);
+        setPreview({
+          changes: d.snapshots.map((s) => ({
+            id: s.id,
+            start: s.start + clampedDelta,
+            end: s.end + clampedDelta,
+          })),
+        });
+        return;
+      }
       const { prev, next } = neighbours(d.id);
       const lo = prev ? prev.end + gapS : 0;
       const hi = next ? next.start - gapS : total;
@@ -270,7 +346,17 @@ export default function LyricsTimeline({
         onSeek?.(clientYToTime(e.clientY)); // exact clicked point, not block start
         return;
       }
-      if (p && (Math.abs(p.start - seg.start) > 1e-3 || Math.abs(p.end - seg.end) > 1e-3)) {
+      if (p?.changes?.length > 1) {
+        const changes = p.changes.filter((change) => {
+          const original = d.snapshots.find((s) => s.id === change.id);
+          return original && (Math.abs(change.start - original.start) > 1e-3 || Math.abs(change.end - original.end) > 1e-3);
+        });
+        if (changes.length) {
+          markUserScroll();
+          if (onTimingChangeBatch) onTimingChangeBatch(changes);
+          else changes.forEach((change) => onTimingChange?.(change.id, change.start, change.end));
+        }
+      } else if (p && (Math.abs(p.start - seg.start) > 1e-3 || Math.abs(p.end - seg.end) > 1e-3)) {
         // Auditoría 2026-06-10: el commit de un drag NO marcaba interacción
         // — al soltar, el auto-follow podía yankear el viewport al instante
         // (dragRef ya está limpio) y el bloque recién acomodado "se iba".
@@ -279,16 +365,51 @@ export default function LyricsTimeline({
         onTimingChange?.(seg._id, p.start, p.end);
       }
     },
-    [preview, onFocus, onSeek, onTimingChange, clientYToTime, markUserScroll]
+    [preview, onFocus, onSeek, onTimingChange, onTimingChangeBatch, clientYToTime, markUserScroll]
   );
+
+  const onSelectionPointerDown = useCallback((e) => {
+    if (!selectionMode || e.button !== 0 || e.target !== e.currentTarget) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    selectionDragRef.current = { originY: e.clientY, currentY: e.clientY, moved: false };
+    setSelectionBox({ originY: e.clientY, currentY: e.clientY });
+  }, [selectionMode]);
+
+  const onSelectionPointerMove = useCallback((e) => {
+    const drag = selectionDragRef.current;
+    if (!drag) return;
+    drag.currentY = e.clientY;
+    if (Math.abs(drag.currentY - drag.originY) > 4) drag.moved = true;
+    setSelectionBox({ originY: drag.originY, currentY: drag.currentY });
+  }, []);
+
+  const onSelectionPointerUp = useCallback((e) => {
+    const drag = selectionDragRef.current;
+    selectionDragRef.current = null;
+    setSelectionBox(null);
+    if (!drag) return;
+    const top = Math.min(drag.originY, e.clientY);
+    const bottom = Math.max(drag.originY, e.clientY);
+    if (!drag.moved) {
+      setSelectedIds(new Set());
+      return;
+    }
+    const from = clientYToTime(top);
+    const to = clientYToTime(bottom);
+    setSelectedIds(new Set(segments
+      .filter((seg) => seg.end >= from && seg.start <= to)
+      .map((seg) => seg._id)));
+  }, [clientYToTime, segments]);
 
   const onLaneClick = useCallback(
     (e) => {
-      if (dragRef.current) return;
+      if (dragRef.current || selectionDragRef.current || selectionMode) return;
       markUserScroll();
       onSeek?.(clientYToTime(e.clientY));
     },
-    [onSeek, clientYToTime, markUserScroll]
+    [onSeek, clientYToTime, markUserScroll, selectionMode]
   );
 
   // Auto-follow the playhead vertically — only while playing AND when the
@@ -311,10 +432,9 @@ export default function LyricsTimeline({
     const view = sc.scrollTop;
     const h = sc.clientHeight;
     if (y < view + 40 || y > view + h - 80) {
-      programmaticScrollUntilRef.current = Date.now() + 600;
-      sc.scrollTo({ top: Math.max(0, y - h * 0.4), behavior: "smooth" });
+      requestFollowScroll(sc, Math.max(0, y - h * 0.4));
     }
-  }, [currentTime, isPlaying, pxPerSec, followEnabled]);
+  }, [currentTime, isPlaying, pxPerSec, followEnabled, requestFollowScroll]);
 
   // Draw the waveform in the gutter (static — redraws only when the peaks
   // or the time scale change, never per playhead tick). Guarded for jsdom,
@@ -478,6 +598,27 @@ export default function LyricsTimeline({
         <div className="flex items-center gap-2">
           <button
             type="button"
+            onClick={() => setSelectionMode((value) => !value)}
+            aria-pressed={selectionMode}
+            className={`text-label px-2.5 py-1 rounded-md ring-1 transition-colors ${selectionMode ? "text-brand-light bg-brand/10 ring-brand/30" : "text-ink-secondary ring-white/[0.08] hover:text-white"}`}
+            title={t("timeline.select_hint", "Pintar para seleccionar varias líneas")}
+          >
+            {selectionMode ? t("timeline.painting", "Pintando") : t("timeline.select", "Seleccionar")}
+          </button>
+          {selectedIds.size > 0 && (
+            <span className="inline-flex items-center gap-1 text-[10px] text-brand-light" aria-live="polite">
+              {selectedIds.size} {t("timeline.selected", "seleccionadas")}
+              <button
+                type="button"
+                className="text-ink-tertiary hover:text-white"
+                onClick={() => setSelectedIds(new Set())}
+                aria-label={t("timeline.clear_selection", "Limpiar selección")}
+                title={t("timeline.clear_selection", "Limpiar selección")}
+              >×</button>
+            </span>
+          )}
+          <button
+            type="button"
             onClick={toggleFollow}
             aria-pressed={followEnabled}
             className={`text-label px-2.5 py-1 rounded-md ring-1 transition-colors ${followEnabled ? "text-brand-light bg-brand/10 ring-brand/30" : "text-ink-secondary ring-white/[0.08] hover:text-white"}`}
@@ -541,8 +682,12 @@ export default function LyricsTimeline({
       >
         <div
           ref={laneRef}
-          className="relative cursor-pointer"
+          data-testid="timeline-lane"
+          className={`relative cursor-pointer ${selectionMode ? "cursor-crosshair" : ""}`}
           style={{ height: laneHeight, minHeight: "100%" }}
+          onPointerDown={onSelectionPointerDown}
+          onPointerMove={onSelectionPointerMove}
+          onPointerUp={onSelectionPointerUp}
           onClick={onLaneClick}
         >
           {/* Waveform in the gutter (canvas, time-aligned with the lane) */}
@@ -579,9 +724,22 @@ export default function LyricsTimeline({
             </div>
           ))}
 
+          {selectionBox && (
+            <div
+              className="absolute left-0 right-0 z-20 rounded-sm bg-brand/15 ring-1 ring-brand/60 pointer-events-none"
+              style={{
+                top: Math.min(selectionBox.originY, selectionBox.currentY) - (laneRef.current?.getBoundingClientRect().top || 0),
+                height: Math.abs(selectionBox.currentY - selectionBox.originY),
+              }}
+              aria-hidden="true"
+            />
+          )}
+
           {/* Blocks */}
           {segments.map((seg) => {
-            const pv = preview && preview.id === seg._id ? preview : null;
+            const pv = preview?.changes
+              ? preview.changes.find((change) => change.id === seg._id) || null
+              : preview && preview.id === seg._id ? preview : null;
             const start = pv ? pv.start : seg.start;
             const end = pv ? pv.end : seg.end;
             const top = start * pxPerSec;
@@ -590,6 +748,7 @@ export default function LyricsTimeline({
             const isFocused = seg._id === focusedSegId;
             const isLocked = !!seg.locked || !!pv;
             const isHi = highlightedIds?.has?.(seg._id);
+            const isSelected = selectedIds.has(seg._id);
             // Gantt lane positioning: when there's no overlap (laneCount=1)
             // the block takes the full width like before; when 2+ segments
             // overlap the columns split the available space evenly so the
@@ -607,6 +766,7 @@ export default function LyricsTimeline({
                   isLocked ? "ring-brand/60" : "ring-white/[0.07]",
                   isFocused ? "outline outline-1 outline-brand-light" : "",
                   isHi ? "ring-2 ring-accent" : "",
+                  isSelected ? "ring-2 ring-brand-light bg-brand/20" : "",
                 ].join(" ")}
                 style={{
                   top, height,
@@ -735,6 +895,7 @@ export default function LyricsTimeline({
       </div>
 
       <p className="px-3 py-2 text-[10px] text-ink-tertiary border-t border-white/[0.05] flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span><span className="text-ink-secondary">{t("timeline.selection", "selección")}</span> {t("timeline.selection_help", "Shift/Cmd-click o activá Seleccionar y pintá varias líneas")}</span>
         <span><span className="text-ink-secondary">↕ {t("timeline.edges", "bordes")}</span> {t("timeline.edges_help", "ajustan entrada/salida")}</span>
         <span><span className="text-ink-secondary">{t("timeline.body", "cuerpo")}</span> {t("timeline.body_help", "mueve la línea")}</span>
         <span><span className="text-ink-secondary">click</span> {t("timeline.click_help", "salta a ese punto")}</span>
