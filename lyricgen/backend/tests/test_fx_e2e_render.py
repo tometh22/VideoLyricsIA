@@ -55,7 +55,18 @@ def _spec():
     )
 
 
-@pytest.mark.parametrize("effect", ["liquid_glass", "beat_ripple"])
+@pytest.mark.parametrize(
+    "effect",
+    [
+        "liquid_glass",
+        "shadow_play",
+        "kaleido",
+        "ink_reveal",
+        "chromatic_pulse",
+        "foto_viva",
+        "beat_ripple",
+    ],
+)
 def test_fixed_photo_effect_pipeline_e2e(tmp_path, effect):
     image = tmp_path / "selected-photo.jpg"
     audio = tmp_path / "song.mp3"
@@ -100,7 +111,21 @@ def test_fixed_photo_effect_pipeline_e2e(tmp_path, effect):
     mad = np.abs(rendered.astype(np.int16) - source.astype(np.int16)).mean()
     # Sparse reactive rings intentionally alter less global image area than a
     # geometric warp, but must still survive the final H.264 encode.
-    assert mad > (0.45 if fx.is_reactive_effect(effect) else 2.0)
+    if fx.is_reactive_effect(effect):
+        threshold = 0.45
+    elif effect in {"shadow_play", "chromatic_pulse"}:
+        # Both are intentionally edge-weighted and protect the lyric-safe
+        # centre; their global MAD is lower than a full-frame transform.
+        threshold = 0.45
+    elif effect == "ink_reveal":
+        threshold = 0.75
+    elif effect == "foto_viva":
+        # Localized semantic motion changes less global image area than a
+        # full-frame geometric warp, but must survive the complete pipeline.
+        threshold = 0.75
+    else:
+        threshold = 2.0
+    assert mad > threshold
 
     if effect == "beat_ripple":
         rhythm = fx.detect_effect_rhythm(effect, str(audio))

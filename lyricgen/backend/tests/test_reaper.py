@@ -25,11 +25,14 @@ from reaper import (
     reap_all_stuck,
 )
 
+_UNSET = object()
+
 
 def _seed(db, *, status: str, age_minutes: float, job_id: str | None = None,
           editing_started_minutes_ago: float | None = None,
           last_progress_minutes_ago: float | None = None,
           last_user_activity_minutes_ago: float | None = None,
+          segments_json=_UNSET,
           edit_count: int = 0,
           progress: int = 20,
           current_step: str = "video"):
@@ -56,7 +59,7 @@ def _seed(db, *, status: str, age_minutes: float, job_id: str | None = None,
             datetime.now(timezone.utc)
             - timedelta(minutes=last_user_activity_minutes_ago)
         )
-    db.add(Job(
+    values = dict(
         job_id=jid,
         user_id=1,
         tenant_id="tenant_reap_test",
@@ -72,7 +75,10 @@ def _seed(db, *, status: str, age_minutes: float, job_id: str | None = None,
         last_progress_at=last_progress_at,
         last_user_activity_at=last_user_activity_at,
         created_at=datetime.now(timezone.utc) - timedelta(minutes=age_minutes),
-    ))
+    )
+    if segments_json is not _UNSET:
+        values["segments_json"] = segments_json
+    db.add(Job(**values))
     db.commit()
     return jid
 
@@ -612,7 +618,7 @@ def test_transcribed_pending_with_recent_user_activity_is_kept():
 
 
 def test_transcribed_pending_with_stale_user_activity_is_reaped():
-    """Old created_at AND stale last_user_activity_at → genuinely abandoned."""
+    """Old incomplete row + stale activity → genuinely abandoned."""
     db = SessionLocal()
     try:
         _cleanup(db)
@@ -626,6 +632,60 @@ def test_transcribed_pending_with_stale_user_activity_is_reaped():
         assert any(j.job_id == jid for j in abandoned), (
             "transcribed_pending with stale activity should be reaped"
         )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_completed_transcription_is_never_hard_deleted_by_short_ttl():
+    """Regression (staging batch A/D, 2026-07-30): the worker successfully
+    persisted lyrics and intentionally left the row in transcribed_pending.
+    Thirty minutes later the reaper hard-deleted all 12 rows. The same path
+    could erase a real UMG operator's completed transcription while they
+    reviewed another song. Persisted segments make the row operator work, not
+    abandoned upload state, so this short-TTL sweep must never select it."""
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(
+            db,
+            status="transcribed_pending",
+            age_minutes=24 * 60,
+            job_id="done_keep",
+            last_user_activity_minutes_ago=23 * 60,
+            segments_json=[
+                {"start": 1.0, "end": 3.0, "text": "Trabajo del operador"},
+            ],
+        )
+        abandoned = find_abandoned_transcribed(db, ttl_min=30)
+        assert all(j.job_id != jid for j in abandoned), (
+            "completed transcriptions with segments must not be hard-deleted"
+        )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_delete_helper_refuses_completed_transcription():
+    """Defense in depth: even a future caller that bypasses the selector
+    cannot hard-delete a row once operator-visible segments exist."""
+    from reaper import _delete_abandoned_transcribed
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(
+            db,
+            status="transcribed_pending",
+            age_minutes=24 * 60,
+            job_id="done_guard",
+            segments_json=[
+                {"start": 1.0, "end": 3.0, "text": "Trabajo del operador"},
+            ],
+        )
+        job = db.query(Job).filter(Job.job_id == jid).one()
+        _delete_abandoned_transcribed(db, job)
+        db.commit()
+        assert db.query(Job).filter(Job.job_id == jid).one_or_none() is not None
     finally:
         _cleanup(db)
         db.close()

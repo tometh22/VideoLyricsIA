@@ -38,20 +38,24 @@ const MOVE_ANIM = {
 };
 
 const MULTIPLY_EFFECTS = new Set(["shadow_play", "halftone", "ink_reveal"]);
+// These loops are compositor masks, not visible overlays. Rendering them as a
+// second dark video layer was the source of the large "dirty lens" blobs in
+// the Ink Reveal preview.
+const MASK_ONLY_EFFECTS = new Set(["ink_reveal", "foto_viva"]);
 export const PIXEL_TRANSFORM_EFFECTS = new Set([
   "liquid_glass", "rgb_glitch", "neon_edge", "kaleido", "halftone",
   "ink_reveal", "heatwave", "chromatic_pulse", "cutout_echo", "projector",
+  "foto_viva",
 ]);
 const EFFECT_OPACITY = {
   liquid_glass: 0.34,
-  rgb_glitch: 0.40,
-  neon_edge: 0.18,
-  shadow_play: 0.58,
-  kaleido: 0.12,
-  halftone: 0.48,
-  ink_reveal: 0.44,
+  rgb_glitch: 0.18,
+  neon_edge: 0.10,
+  shadow_play: 0.34,
+  kaleido: 0.03,
+  halftone: 0.36,
   heatwave: 0.26,
-  chromatic_pulse: 0.36,
+  chromatic_pulse: 0.22,
   cutout_echo: 0.24,
   projector: 0.42,
   beat_flash: 0.68,
@@ -93,6 +97,10 @@ export default function WizardLivePreview({
   style = "auto",
   customColors = "",
   movementStyle = "",
+  // La base es una FOTO que subió el operador. Con eso la cámara no se mueve
+  // nunca —ni "quieta" ni "animada" la mueven— así que no se le puede aplicar
+  // la animación CSS de cámara del eje de IA.
+  operatorPhoto = false,
   effect = "",
   lyricsAnimation = "none",
   lineTransition = "none",
@@ -213,32 +221,20 @@ export default function WizardLivePreview({
     return () => cancelAnimationFrame(raf);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playbackTickRef]);
-  const isAnimado = movementStyle === "animado";
-  // Bug fix 2026-05-25 (reportado por operador): cuando un efecto estaba
-  // activo, baseClip se forzaba a /preview_base.mp4 (escena de montañas
-  // fija), IGNORANDO la elección de movement del operador. El operador
-  // clickeaba el thumbnail de Sutil (interior room) pero el preview seguía
-  // mostrando montañas — disconnect visual entre la galería de movements
-  // y el preview central.
-  //
-  // Cambio: usar SIEMPRE el clipSrc del movement elegido. Los samples
-  // (estatico/sutil/estandar/foto-parallax) son ya escenas calmas — un
-  // overlay de nieve/lluvia no clash. El único caso problemático es
-  // 'animado' (nebula 2D) + effect partículas, donde el clash es real;
-  // ahí caemos a preview_base.mp4 para preservar la legibilidad de las
-  // partículas. Animado SIN effect mantiene su clip original.
-  const baseClip = (effect && isAnimado) ? "/preview_base.mp4" : clipSrc;
-  // With an effect active the base is a FIXED calm scene, so the chosen movement
-  // is conveyed by a CSS camera transform on it (Estático=still, Cinematográfico
-  // =zoom/drift, Foto+parallax=lateral pan…) — clicking a register visibly
-  // changes the preview's motion. Without an effect the base IS the movement
-  // clip (motion already baked in), so no extra transform.
-  // Si baseClip es preview_base.mp4 (escena fija calma), aplicamos CSS
-  // animation para que se note el movement style (no hay motion baked).
-  // Si baseClip es el movement clip directo, el motion ya está horneado
-  // en el video — aplicar CSS animation encima compondría. Por eso solo
-  // CSS animation cuando estamos en el fallback preview_base.
-  const baseAnim = (baseClip === "/preview_base.mp4") ? (MOVE_ANIM[movementStyle] || "none") : "none";
+  // La preview debe respetar siempre la fuente de la opción seleccionada.
+  // Antes, "Ilustración viva" + cualquier efecto sustituía silenciosamente
+  // animado.mp4 por preview_base.mp4: la tarjeta mostraba la ilustración,
+  // pero el escenario grande podía quedar negro o enseñar otra escena.
+  const baseClip = clipSrc;
+  // Los videos de movimiento ya traen su cámara horneada. Las fuentes fijas
+  // sí necesitan la animación CSS correspondiente (por ejemplo, parallax).
+  // Regla: la animación CSS sólo puede representar movimiento de CÁMARA que el
+  // render vaya a hacer de verdad. Con la foto del operador no hay ninguno — y
+  // con Auto, que es el default, `MOVE_ANIM[""]` es `wlp-sutil`, así que la foto
+  // derivaba en pantalla sin que el operador tocara nada.
+  const baseAnim = (!clipIsVideo && !operatorPhoto)
+    ? (MOVE_ANIM[movementStyle] || "none")
+    : "none";
   const isPixelTransform = PIXEL_TRANSFORM_EFFECTS.has(effect);
   const liquidFilterId = `wlp-liquid-${filterId}`;
   const heatFilterId = `wlp-heat-${filterId}`;
@@ -263,6 +259,16 @@ export default function WizardLivePreview({
   };
 
   const renderPhotoTransform = () => {
+    if (effect === "foto_viva") {
+      return (
+        <>
+          {renderBaseMedia(`living-base-${baseClip}`)}
+          <div className="absolute inset-0 overflow-hidden pointer-events-none wlp-living-window">
+            {renderBaseMedia(`living-subject-${baseClip}`, "wlp-living-subject")}
+          </div>
+        </>
+      );
+    }
     if (effect === "liquid_glass" || effect === "heatwave") {
       return renderBaseMedia(
         `transform-${effect}-${baseClip}`,
@@ -272,24 +278,34 @@ export default function WizardLivePreview({
         },
       );
     }
-    if (effect === "rgb_glitch" || effect === "chromatic_pulse") {
-      const pulse = effect === "chromatic_pulse" ? "wlp-chromatic-pulse" : "wlp-rgb-glitch";
+    if (effect === "rgb_glitch") {
       return (
         <>
           {renderBaseMedia(`transform-base-${baseClip}`)}
-          {renderBaseMedia(`transform-red-${baseClip}`, "", {
-            animation: `${pulse} 1.4s steps(2,end) infinite`,
+          {renderBaseMedia(`transform-red-${baseClip}`, "wlp-rgb-red", {
             clipPath: "inset(7% 0 52% 0)",
             filter: "sepia(1) saturate(8) hue-rotate(310deg)",
             mixBlendMode: "screen",
-            opacity: 0.34,
           })}
-          {renderBaseMedia(`transform-cyan-${baseClip}`, "", {
-            animation: `${pulse} 1.1s steps(2,end) infinite reverse`,
+          {renderBaseMedia(`transform-cyan-${baseClip}`, "wlp-rgb-cyan", {
             clipPath: "inset(55% 0 10% 0)",
             filter: "sepia(1) saturate(8) hue-rotate(135deg)",
             mixBlendMode: "screen",
-            opacity: 0.28,
+          })}
+        </>
+      );
+    }
+    if (effect === "chromatic_pulse") {
+      return (
+        <>
+          {renderBaseMedia(`chromatic-base-${baseClip}`)}
+          {renderBaseMedia(`chromatic-red-${baseClip}`, "wlp-chromatic-edge-red", {
+            filter: `url(#${edgeFilterId}) sepia(1) saturate(7) hue-rotate(304deg)`,
+            mixBlendMode: "screen",
+          })}
+          {renderBaseMedia(`chromatic-cyan-${baseClip}`, "wlp-chromatic-edge-cyan", {
+            filter: `url(#${edgeFilterId}) sepia(1) saturate(7) hue-rotate(132deg)`,
+            mixBlendMode: "screen",
           })}
         </>
       );
@@ -298,51 +314,61 @@ export default function WizardLivePreview({
       return (
         <>
           {renderBaseMedia(`transform-base-${baseClip}`, "", {
-            filter: "brightness(.86) saturate(.82)",
+            filter: "brightness(.94) saturate(.90)",
           })}
           {renderBaseMedia(`transform-edge-${baseClip}`, "", {
-            filter: `url(#${edgeFilterId}) saturate(2) contrast(1.35)`,
+            filter: `url(#${edgeFilterId}) sepia(1) saturate(6) hue-rotate(132deg) contrast(1.22)`,
             mixBlendMode: "screen",
-            opacity: 0.82,
+            opacity: 0.58,
           })}
         </>
       );
     }
     if (effect === "kaleido") {
-      const quadrants = [
-        ["inset(0 50% 50% 0)", "none"],
-        ["inset(0 0 50% 50%)", "scaleX(-1)"],
-        ["inset(50% 50% 0 0)", "scaleY(-1)"],
-        ["inset(50% 0 0 50%)", "scale(-1)"],
+      const panels = [
+        { clipPath: "inset(0 50% 50% 0)", mirror: "scale(1)" },
+        { clipPath: "inset(0 0 50% 50%)", mirror: "scaleX(-1)" },
+        { clipPath: "inset(50% 50% 0 0)", mirror: "scaleY(-1)" },
+        { clipPath: "inset(50% 0 0 50%)", mirror: "scale(-1)" },
       ];
-      return quadrants.map(([clipPath, transform], index) =>
-        renderBaseMedia(`kaleido-${index}-${baseClip}`, "", {
-          clipPath,
-          transform,
-          animation: "wlp-kaleido 6s ease-in-out infinite alternate",
-          transformOrigin: "center",
-          "--wlp-quadrant": transform,
-        }),
+      return (
+        <div
+          className="absolute inset-0 overflow-hidden"
+          data-testid="kaleido-grid"
+        >
+          {panels.map(({ clipPath, mirror }, index) => (
+            <div
+              key={`kaleido-panel-${index}`}
+              className="absolute inset-0 overflow-hidden wlp-kaleido-panel"
+              style={{ clipPath }}
+            >
+              {renderBaseMedia(`kaleido-${index}-${baseClip}`, "", {
+                animation: "wlp-kaleido 6s ease-in-out infinite alternate",
+                transformOrigin: "center",
+                "--wlp-mirror": mirror,
+              })}
+            </div>
+          ))}
+        </div>
       );
     }
     if (effect === "halftone") {
       return (
         <>
           {renderBaseMedia(`halftone-${baseClip}`, "", {
-            filter: "grayscale(.35) contrast(1.16) saturate(.72)",
+            filter: "contrast(1.08) saturate(.88)",
           })}
-          <div className="absolute inset-0 pointer-events-none opacity-50 mix-blend-multiply wlp-halftone-dots" />
+          <div className="absolute inset-0 pointer-events-none opacity-35 mix-blend-multiply wlp-halftone-dots" />
         </>
       );
     }
     if (effect === "ink_reveal") {
       return (
         <>
-          {renderBaseMedia(`ink-paper-${baseClip}`, "", {
-            filter: "blur(5px) grayscale(.65) brightness(.78)",
-            transform: "scale(1.04)",
+          {renderBaseMedia(`ink-base-${baseClip}`)}
+          {renderBaseMedia(`ink-treatment-${baseClip}`, "wlp-ink-reveal", {
+            filter: "grayscale(1) sepia(.12) contrast(1.52) brightness(.64)",
           })}
-          {renderBaseMedia(`ink-photo-${baseClip}`, "wlp-ink-reveal")}
         </>
       );
     }
@@ -640,23 +666,44 @@ export default function WizardLivePreview({
         @keyframes wlp-trans-blur { 0% { filter: blur(10px); opacity: 0; } 26%, 80% { filter: blur(0); opacity: 1; } 100% { filter: blur(10px); opacity: 0; } }
         /* Motion Lab v2: these animations move pixels from the selected photo,
            while /fx_raw remains only a restrained auxiliary light/mask. */
-        @keyframes wlp-rgb-glitch {
-          0%, 72%, 100% { transform: translateX(0); }
-          76% { transform: translateX(2.8%); }
-          82% { transform: translateX(-1.8%); }
+        @keyframes wlp-rgb-red {
+          0%,68%,84%,100% { transform: translateX(0); opacity: 0; }
+          72% { transform: translateX(1.25%); opacity: .22; }
+          76% { transform: translateX(-.7%); opacity: .16; }
+          80% { transform: translateX(.4%); opacity: .08; }
         }
-        @keyframes wlp-chromatic-pulse {
-          0%, 100% { transform: scale(1); }
-          12% { transform: scale(1.035); }
-          24% { transform: scale(1); }
+        @keyframes wlp-rgb-cyan {
+          0%,69%,85%,100% { transform: translateX(0); opacity: 0; }
+          73% { transform: translateX(-1.1%); opacity: .18; }
+          77% { transform: translateX(.65%); opacity: .13; }
+          81% { transform: translateX(-.35%); opacity: .07; }
+        }
+        @keyframes wlp-rgb-overlay {
+          0%,68%,84%,100% { opacity: 0; }
+          72%,78% { opacity: .18; }
+          81% { opacity: .07; }
+        }
+        @keyframes wlp-chromatic-red {
+          0%,100% { transform: translateX(-1px) scale(1.003); opacity: .12; }
+          50% { transform: translateX(3px) scale(1.008); opacity: .32; }
+        }
+        @keyframes wlp-chromatic-cyan {
+          0%,100% { transform: translateX(1px) scale(1.003); opacity: .11; }
+          50% { transform: translateX(-3px) scale(1.008); opacity: .28; }
         }
         @keyframes wlp-kaleido {
-          from { transform: var(--wlp-quadrant) rotate(-.7deg) scale(1.025); }
-          to { transform: var(--wlp-quadrant) rotate(.7deg) scale(1.055); }
+          from { transform: var(--wlp-mirror) rotate(-.65deg) scale(1.035); }
+          to { transform: var(--wlp-mirror) rotate(.65deg) scale(1.055); }
         }
         @keyframes wlp-ink-mask {
-          0%, 8% { -webkit-mask-position: 100% 0; mask-position: 100% 0; }
-          65%, 100% { -webkit-mask-position: 0 0; mask-position: 0 0; }
+          0%, 8% {
+            -webkit-mask-position: 108% 2%, -12% 92%, 116% 48%;
+            mask-position: 108% 2%, -12% 92%, 116% 48%;
+          }
+          62%, 100% {
+            -webkit-mask-position: -12% 2%, 102% 12%, -8% 48%;
+            mask-position: -12% 2%, 102% 12%, -8% 48%;
+          }
         }
         @keyframes wlp-echo-one {
           0%, 100% { transform: scale(.94); filter: hue-rotate(0); }
@@ -670,16 +717,57 @@ export default function WizardLivePreview({
           0%, 100% { transform: translate(-.35%, -.15%) rotate(-.12deg) scale(1.015); }
           50% { transform: translate(.35%, .12%) rotate(.12deg) scale(1.015); }
         }
+        @keyframes wlp-living-window {
+          0%,100% { clip-path: ellipse(28% 38% at 26% 35%); }
+          50% { clip-path: ellipse(31% 40% at 72% 62%); }
+        }
+        @keyframes wlp-living-subject {
+          0%,100% { transform: scale(1.045) translate3d(-0.8%,0.4%,0); }
+          50% { transform: scale(1.075) translate3d(1.2%,-0.8%,0); }
+        }
+        .wlp-living-window {
+          animation: wlp-living-window 8s ease-in-out infinite;
+          will-change: clip-path;
+        }
+        .wlp-living-subject {
+          animation: wlp-living-subject 8s ease-in-out infinite;
+          will-change: transform;
+        }
         .wlp-halftone-dots {
           background-image: radial-gradient(circle, rgba(5,5,8,.9) 0 26%, transparent 29%);
           background-size: 6px 6px;
         }
+        .wlp-rgb-red {
+          animation: wlp-rgb-red 2.8s steps(1,end) infinite;
+          will-change: transform, opacity;
+        }
+        .wlp-rgb-cyan {
+          animation: wlp-rgb-cyan 2.8s steps(1,end) infinite;
+          will-change: transform, opacity;
+        }
+        .wlp-chromatic-edge-red {
+          animation: wlp-chromatic-red 4s ease-in-out infinite;
+          will-change: transform, opacity;
+        }
+        .wlp-chromatic-edge-cyan {
+          animation: wlp-chromatic-cyan 4s ease-in-out infinite;
+          will-change: transform, opacity;
+        }
         .wlp-ink-reveal {
-          -webkit-mask-image: linear-gradient(90deg, #000 0 42%, transparent 58% 100%);
-          mask-image: linear-gradient(90deg, #000 0 42%, transparent 58% 100%);
-          -webkit-mask-size: 220% 100%;
-          mask-size: 220% 100%;
+          -webkit-mask-image:
+            radial-gradient(ellipse 38% 8% at 30% 34%, #000 0 58%, transparent 78%),
+            radial-gradient(ellipse 32% 7% at 67% 70%, #000 0 54%, transparent 76%),
+            radial-gradient(ellipse 24% 5% at 48% 52%, #000 0 48%, transparent 72%);
+          mask-image:
+            radial-gradient(ellipse 38% 8% at 30% 34%, #000 0 58%, transparent 78%),
+            radial-gradient(ellipse 32% 7% at 67% 70%, #000 0 54%, transparent 76%),
+            radial-gradient(ellipse 24% 5% at 48% 52%, #000 0 48%, transparent 72%);
+          -webkit-mask-size: 154% 130%, 164% 128%, 148% 125%;
+          mask-size: 154% 130%, 164% 128%, 148% 125%;
+          -webkit-mask-repeat: no-repeat;
+          mask-repeat: no-repeat;
           animation: wlp-ink-mask 4.2s ease-in-out infinite alternate;
+          will-change: mask-position;
         }
       `}</style>
 
@@ -699,7 +787,7 @@ export default function WizardLivePreview({
           </filter>
           <filter id={edgeFilterId} colorInterpolationFilters="sRGB">
             <feConvolveMatrix order="3" kernelMatrix="-1 -1 -1 -1 8 -1 -1 -1 -1" divisor="1" bias="0" result="edge" />
-            <feColorMatrix in="edge" type="matrix" values="0 0 0 0 0.1  0 0 0 0 0.95  0 0 0 0 0.85  0 0 0 1 0" />
+            <feColorMatrix in="edge" type="matrix" values="0.333 0.333 0.333 0 0  0.333 0.333 0.333 0 0  0.333 0.333 0.333 0 0  0 0 0 1 0" />
           </filter>
         </defs>
       </svg>
@@ -721,7 +809,7 @@ export default function WizardLivePreview({
           grade so the palette tints them too (mirrors the backend
           bg→effect→grade→subs order). mix-blend-screen makes the black loop
           background transparent, exactly like ffmpeg blend=screen. */}
-      {effect ? (
+      {effect && !MASK_ONLY_EFFECTS.has(effect) ? (
         <video
           key={`fx-${effect}`}
           src={`/fx_raw/${effect}.mp4`}
@@ -753,14 +841,13 @@ export default function WizardLivePreview({
               shapes: "brightness(1.2) saturate(1.15)",
               liquid_glass: "brightness(1.2) saturate(1.15)",
               caustics: "brightness(1.2) saturate(1.2)",
-              rgb_glitch: "brightness(1.2) saturate(1.35)",
-              neon_edge: "brightness(1.25) saturate(1.3)",
-              shadow_play: "blur(3px)",
-              kaleido: "brightness(1.2) saturate(1.35)",
-              halftone: "contrast(1.15)",
-              ink_reveal: "contrast(1.08) sepia(0.08)",
+              rgb_glitch: "brightness(1.08) saturate(1.15)",
+              neon_edge: "brightness(1.08) saturate(1.12)",
+              shadow_play: "blur(6px)",
+              kaleido: "brightness(1.08) saturate(1.08)",
+              halftone: "contrast(1.05)",
               heatwave: "brightness(1.15) saturate(1.25)",
-              chromatic_pulse: "brightness(1.2) saturate(1.35)",
+              chromatic_pulse: "brightness(1.05) saturate(1.12)",
               cutout_echo: "brightness(1.15) saturate(1.35)",
               projector: "brightness(1.2) sepia(0.18)",
               bass_pulse: "brightness(1.25) saturate(1.3)",
@@ -769,6 +856,9 @@ export default function WizardLivePreview({
               beat_ripple: "brightness(1.25) saturate(1.3)",
               echo_hit: "brightness(1.2) saturate(1.35)",
             }[effect] || "none",
+            animation: effect === "rgb_glitch"
+              ? "wlp-rgb-overlay 2.8s steps(1,end) infinite"
+              : undefined,
           }}
           autoPlay loop muted playsInline
         />

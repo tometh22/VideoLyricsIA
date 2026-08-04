@@ -82,6 +82,11 @@ EFFECTS = (
     "chromatic_pulse",
     "cutout_echo",
     "projector",
+    # Generative-first: the pipeline animates one semantic region of the
+    # selected/generated photo through Veo image-to-video.  This baked mask is
+    # the deterministic fallback, so the option still moves pixels when the
+    # provider is unavailable.
+    "foto_viva",
     # Audio-reactive pack. The baked loops are authored at 120 BPM and their
     # PTS is tempo-matched to the detected song BPM at render time.
     "bass_pulse",
@@ -99,6 +104,10 @@ REACTIVE_EFFECTS = (
     "echo_hit",
 )
 
+GENERATIVE_EFFECTS = (
+    "foto_viva",
+)
+
 # These treatments derive their visible pixels from the selected photo.  The
 # baked MP4 is only an auxiliary light/mask layer.  Keeping this allow-list
 # explicit lets the editor describe the effect honestly and gives tests a
@@ -114,6 +123,7 @@ PIXEL_TRANSFORM_EFFECTS = (
     "chromatic_pulse",
     "cutout_echo",
     "projector",
+    "foto_viva",
 )
 
 # Most loops emit light over black and therefore use screen. These three are
@@ -127,9 +137,9 @@ _FX_BLEND = {
 
 # Keep the more graphic treatments editorial rather than overpowering lyrics.
 _FX_OPACITY = {
-    "rgb_glitch": 0.72,
-    "neon_edge": 0.74,
-    "shadow_play": 0.58,
+    "rgb_glitch": 0.44,
+    "neon_edge": 0.52,
+    "shadow_play": 0.34,
     "kaleido": 0.68,
     "halftone": 0.46,
     "ink_reveal": 0.56,
@@ -153,6 +163,10 @@ def effect_opacity(effect: str) -> float:
 
 def is_reactive_effect(effect: str) -> bool:
     return (effect or "").strip().lower() in REACTIVE_EFFECTS
+
+
+def is_generative_effect(effect: str) -> bool:
+    return (effect or "").strip().lower() in GENERATIVE_EFFECTS
 
 
 def is_pixel_transform(effect: str) -> bool:
@@ -462,7 +476,7 @@ _FX_GAIN = {
     "shapes": "curves=all='0/0 0.08/0.025 0.28/0.72 0.60/1 1/1'",
     # The source uses large deterministic leaf-like masks. Blur at composite
     # resolution turns their hard procedural edges into natural soft shadows.
-    "shadow_play": "gblur=sigma=16",
+    "shadow_play": "gblur=sigma=18",
 }
 
 
@@ -585,7 +599,7 @@ def transform_photo_frame(frame, effect: str, t: float, fx_frame=None):
     selected transform into a plain decorative overlay.
     """
     import numpy as np
-    from PIL import Image, ImageEnhance, ImageFilter
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
     effect = (effect or "").strip().lower()
     base = np.clip(frame, 0, 255).astype(np.uint8)
@@ -620,17 +634,25 @@ def transform_photo_frame(frame, effect: str, t: float, fx_frame=None):
     elif effect in {"rgb_glitch", "chromatic_pulse"}:
         shift = 14
         if effect == "chromatic_pulse":
-            shift = max(2, int(14 * (0.35 + 0.65 * abs(np.sin(2 * np.pi * t)))))
+            breathe = .5 - .5 * np.cos(2 * np.pi * float(t) / 4.0)
+            shift = max(1, int(2 + 4 * breathe))
         out = base.astype(np.float32)
         out[:, :, 0] = np.roll(base[:, :, 0], shift, axis=1)
         out[:, :, 2] = np.roll(base[:, :, 2], -shift, axis=1)
     elif effect == "neon_edge":
-        edge = Image.fromarray(base).filter(ImageFilter.FIND_EDGES)
-        edge = ImageEnhance.Color(edge).enhance(2.0)
+        edge = ImageOps.grayscale(
+            Image.fromarray(base).filter(ImageFilter.FIND_EDGES)
+        )
         edge_arr = np.asarray(edge, dtype=np.float32)
-        out = screen(base.astype(np.float32) * 0.86, edge_arr * 0.82)
+        edge_color = np.stack(
+            (edge_arr * .42, edge_arr * .82, edge_arr),
+            axis=2,
+        )
+        out = screen(base.astype(np.float32) * 0.94, edge_color * 0.58)
     elif effect == "kaleido":
-        quadrant = base[: max(1, height // 2), : max(1, width // 2)]
+        half_h, half_w = max(1, height // 2), max(1, width // 2)
+        y0, x0 = max(0, (height - half_h) // 2), max(0, (width - half_w) // 2)
+        quadrant = base[y0:y0 + half_h, x0:x0 + half_w]
         top = np.concatenate([quadrant, np.flip(quadrant, axis=1)], axis=1)
         tiled = np.concatenate([top, np.flip(top, axis=0)], axis=0)
         out = np.asarray(
@@ -646,18 +668,40 @@ def transform_photo_frame(frame, effect: str, t: float, fx_frame=None):
             dtype=np.float32,
         )
     elif effect == "ink_reveal":
-        paper = np.asarray(
-            Image.fromarray(base).filter(ImageFilter.GaussianBlur(radius=12)),
+        ink_alt_image = ImageEnhance.Contrast(
+            ImageOps.grayscale(Image.fromarray(base)).convert("RGB")
+        ).enhance(1.32)
+        ink_alt = np.asarray(
+            ImageEnhance.Brightness(ink_alt_image).enhance(.66),
             dtype=np.float32,
         )
         if fx_frame is not None:
             fx_gray = np.asarray(fx_frame, dtype=np.float32).mean(axis=2)
             mask = np.clip(1.0 - fx_gray / 255.0, 0.0, 1.0)
         else:
-            progress = 0.5 + 0.5 * np.sin(float(t) * np.pi / 2)
-            mask = (np.arange(width)[None, :] < width * progress).astype(np.float32)
-            mask = np.repeat(mask, height, axis=0)
-        out = paper * (1.0 - mask[:, :, None]) + base * mask[:, :, None]
+            yy, xx = np.indices((height, width), dtype=np.float32)
+            progress = .5 - .5 * np.cos(2 * np.pi * float(t) / 8.0)
+            center = height * (.34 + .10 * np.sin(
+                2 * np.pi * (xx / max(1, width) * 1.05 + .08)
+            ))
+            brush = np.clip(
+                (height * .065 - np.abs(yy - center)) / max(1.0, height * .02),
+                0.0,
+                1.0,
+            )
+            reveal = np.clip(
+                (progress * width * 1.2 - xx) / max(1.0, width * .08),
+                0.0,
+                1.0,
+            )
+            mask = brush * reveal
+        out = base.astype(np.float32) * (1.0 - mask[:, :, None]) + ink_alt * mask[:, :, None]
+        if fx_frame is not None:
+            # Preserve a restrained amount of the authored dry-brush texture.
+            # The previous circular asset made this look like dirty-lens blobs;
+            # the corrected mask contains real bristles and bounded splatter.
+            texture = np.asarray(fx_frame, dtype=np.float32).mean(axis=2) / 255.0
+            out *= (.88 + .12 * texture[:, :, None])
     elif effect == "cutout_echo":
         echo1 = resize_center(base, 0.94).astype(np.float32)
         echo2 = resize_center(base, 0.88).astype(np.float32)
@@ -671,15 +715,46 @@ def transform_photo_frame(frame, effect: str, t: float, fx_frame=None):
         out = np.asarray(
             ImageEnhance.Contrast(gate).enhance(1.08), dtype=np.float32
         ) * 0.90
+    elif effect == "foto_viva":
+        # Deterministic fallback for the generative image-to-video path:
+        # subtly move only the soft region supplied by the procedural mask.
+        # The mask travels across the photo, so unlike the old light overlay it
+        # is not nailed to one position for the whole song.
+        # Eight percent gives the local fallback enough travel to read after
+        # H.264 compression while remaining a bounded subject motion rather
+        # than turning into a global Ken Burns zoom.
+        scale = 1.08
+        scaled_w, scaled_h = max(width + 2, int(width * scale)), max(height + 2, int(height * scale))
+        enlarged = np.asarray(
+            Image.fromarray(base).resize(
+                (scaled_w, scaled_h), Image.Resampling.BICUBIC
+            )
+        )
+        room_x, room_y = scaled_w - width, scaled_h - height
+        x0 = int((room_x / 2) * (1.0 + np.sin(2 * np.pi * float(t) / 8.0)))
+        y0 = int((room_y / 2) * (1.0 + np.cos(2 * np.pi * float(t) / 8.0)))
+        moved = enlarged[y0:y0 + height, x0:x0 + width].astype(np.float32)
+        if fx_frame is not None:
+            mask = np.asarray(fx_frame, dtype=np.float32).mean(axis=2) / 255.0
+        else:
+            yy, xx = np.indices((height, width), dtype=np.float32)
+            cx = width * (0.5 + 0.24 * np.sin(2 * np.pi * float(t) / 8.0))
+            cy = height * (0.5 + 0.18 * np.cos(2 * np.pi * float(t) / 8.0))
+            mask = np.exp(
+                -(((xx - cx) / max(1.0, width * 0.24)) ** 2
+                  + ((yy - cy) / max(1.0, height * 0.32)) ** 2)
+            )
+        mask = np.clip(mask, 0.0, 1.0)[:, :, None] * 0.88
+        out = base.astype(np.float32) * (1.0 - mask) + moved * mask
 
     # Ink uses the loop as its actual merge mask above. Other transform loops
     # remain restrained auxiliary light/dot layers, matching the FFmpeg graph.
-    if fx_frame is not None and effect != "ink_reveal":
+    if fx_frame is not None and effect not in {"ink_reveal", "foto_viva"}:
         layer = np.clip(fx_frame, 0, 255).astype(np.float32)
         opacity = {
-            "liquid_glass": 0.34, "heatwave": 0.26, "rgb_glitch": 0.40,
-            "neon_edge": 0.18, "kaleido": 0.12, "halftone": 0.48,
-            "chromatic_pulse": 0.36, "cutout_echo": 0.24, "projector": 0.42,
+            "liquid_glass": 0.34, "heatwave": 0.26, "rgb_glitch": 0.18,
+            "neon_edge": 0.10, "kaleido": 0.03, "halftone": 0.36,
+            "chromatic_pulse": 0.22, "cutout_echo": 0.24, "projector": 0.42,
         }.get(effect, effect_opacity(effect))
         mixed = (
             out * layer / 255.0
@@ -716,6 +791,9 @@ def _pixel_transform_graph(effect: str, width: int, height: int) -> str:
     inset_w, inset_h = max(2, width - 14), height
     echo1_w, echo1_h = max(2, int(width * 0.94)), max(2, int(height * 0.94))
     echo2_w, echo2_h = max(2, int(width * 0.88)), max(2, int(height * 0.88))
+    live_w, live_h = max(width + 2, int(width * 1.08)), max(height + 2, int(height * 1.08))
+    pulse_shift = max(3, int(width * .006))
+    pulse_w = max(2, width - pulse_shift)
 
     if effect == "liquid_glass":
         xmap = (
@@ -749,18 +827,19 @@ def _pixel_transform_graph(effect: str, width: int, height: int) -> str:
             f"[glc]crop={inset_w}:{inset_h}:14:0,"
             f"pad={width}:{height}:0:0:black,"
             "colorchannelmixer=rr=0[cyanshift];"
-            "[glbase][redshift]blend=all_mode=screen:all_opacity=0.24[gla];"
-            "[gla][cyanshift]blend=all_mode=screen:all_opacity=0.20[glb];"
-            "[glb][fx]blend=all_mode=screen:all_opacity=0.40:shortest=1[bl]"
+            "[glbase][redshift]blend=all_mode=screen:all_opacity=0.12[gla];"
+            "[gla][cyanshift]blend=all_mode=screen:all_opacity=0.10[glb];"
+            "[glb][fx]blend=all_mode=screen:all_opacity=0.18:shortest=1[bl]"
         )
     if effect == "neon_edge":
         return (
             "[bg]split=2[neonbase][neonsrc];"
-            "[neonbase]eq=brightness=-0.055:saturation=0.82[neondim];"
-            "[neonsrc]edgedetect=mode=colormix:high=0.16,"
-            "eq=contrast=1.45:saturation=2.0[edges];"
-            "[neondim][edges]blend=all_mode=screen:all_opacity=0.82[neon];"
-            "[neon][fx]blend=all_mode=screen:all_opacity=0.18:shortest=1[bl]"
+            "[neonbase]curves=all='0/0 0.5/0.46 1/0.96'[neondim];"
+            "[neonsrc]edgedetect=mode=wires:low=0.06:high=0.18,"
+            "curves=all='0/0 0.08/0 0.26/0.88 1/1',"
+            "colorchannelmixer=rr=0.42:gg=0.82:bb=1.0[edges];"
+            "[neondim][edges]blend=all_mode=screen:all_opacity=0.58[neon];"
+            "[neon][fx]blend=all_mode=screen:all_opacity=0.10:shortest=1[bl]"
         )
     if effect == "kaleido":
         return (
@@ -772,35 +851,42 @@ def _pixel_transform_graph(effect: str, width: int, height: int) -> str:
             "[k3][k4]hstack=inputs=2[kbottom];"
             "[ktop][kbottom]vstack=inputs=2[kphoto];"
             f"[kphoto]scale={width}:{height}[kscaled];"
-            "[kscaled][fx]blend=all_mode=screen:all_opacity=0.12:shortest=1[bl]"
+            "[kscaled][fx]blend=all_mode=screen:all_opacity=0.03:shortest=1[bl]"
         )
     if effect == "halftone":
         dot_w, dot_h = max(8, width // 10), max(8, height // 10)
         return (
             f"[bg]scale={dot_w}:{dot_h}:flags=area,"
-            f"scale={width}:{height}:flags=neighbor,"
-            "eq=contrast=1.16:saturation=0.72[poster];"
-            "[poster][fx]blend=all_mode=multiply:all_opacity=0.48:shortest=1[bl]"
+            f"scale={width}:{height}:flags=neighbor[poster];"
+            "[poster][fx]blend=all_mode=multiply:all_opacity=0.36:shortest=1[bl]"
         )
     if effect == "ink_reveal":
         return (
             "[bg]split=2[inkbase][inkalt];"
-            "[inkalt]gblur=sigma=18,eq=saturation=0.35:brightness=-0.03[paper];"
-            "[fx]format=gray,negate,curves=all='0/0 0.32/0 0.62/1 1/1'[inkmask];"
-            "[paper][inkbase][inkmask]maskedmerge[bl]"
+            "[inkalt]eq=saturation=0.08:contrast=1.40:brightness=-0.090[inkwash];"
+            "[fx]split=2[inkmasksrc][inktexture];"
+            "[inkmasksrc]format=gray,negate,gblur=sigma=1.4,"
+            "curves=all='0/0 0.18/0.03 0.58/0.90 1/1'[inkmask];"
+            "[inkbase][inkwash][inkmask]maskedmerge[inkmerged];"
+            "[inkmerged][inktexture]blend=all_mode=multiply:"
+            "all_opacity=0.12:shortest=1[bl]"
         )
     if effect == "chromatic_pulse":
         return (
-            "[bg]split=3[cpbase][cpr][cpb];"
-            f"[cpr]crop={inset_w}:{inset_h}:0:0,"
-            f"pad={width}:{height}:14:0:black,"
-            "colorchannelmixer=gg=0:bb=0[cprshift];"
-            f"[cpb]crop={inset_w}:{inset_h}:14:0,"
-            f"pad={width}:{height}:0:0:black,"
-            "colorchannelmixer=rr=0:gg=0[cpbshift];"
-            "[cpbase][cprshift]blend=all_mode=screen:all_opacity=0.17[cpa];"
-            "[cpa][cpbshift]blend=all_mode=screen:all_opacity=0.14[cpb2];"
-            "[cpb2][fx]blend=all_mode=screen:all_opacity=0.36:shortest=1[bl]"
+            "[bg]split=5[cpbase][cprbase][cprmovei][cpbbase][cpbmovei];"
+            f"[cprmovei]crop={pulse_w}:{height}:0:0,"
+            f"pad={width}:{height}:{pulse_shift}:0:black[cprmove];"
+            "[cprbase][cprmove]blend=all_mode=difference,"
+            "eq=contrast=1.65:brightness=-0.022,"
+            "colorchannelmixer=rr=1.35:gg=0:bb=0[cpred];"
+            f"[cpbmovei]crop={pulse_w}:{height}:{pulse_shift}:0,"
+            f"pad={width}:{height}:0:0:black[cpbmove];"
+            "[cpbbase][cpbmove]blend=all_mode=difference,"
+            "eq=contrast=1.65:brightness=-0.022,"
+            "colorchannelmixer=rr=0:gg=0:bb=1.35[cpblue];"
+            "[cpbase][cpred]blend=all_mode=screen:all_opacity=0.48[cpa];"
+            "[cpa][cpblue]blend=all_mode=screen:all_opacity=0.44[cpb2];"
+            "[cpb2][fx]blend=all_mode=screen:all_opacity=0.22:shortest=1[bl]"
         )
     if effect == "cutout_echo":
         return (
@@ -821,6 +907,17 @@ def _pixel_transform_graph(effect: str, width: int, height: int) -> str:
             "eq=contrast=1.08:brightness=-0.025:saturation=0.88,"
             "vignette=PI/5.2:eval=frame[gate];"
             "[gate][fx]blend=all_mode=screen:all_opacity=0.42:shortest=1[bl]"
+        )
+    if effect == "foto_viva":
+        room_x, room_y = live_w - width, live_h - height
+        return (
+            "[bg]split=2[livebase][livesrc];"
+            f"[livesrc]scale={live_w}:{live_h}:flags=lanczos,"
+            f"crop={width}:{height}:"
+            f"x='{room_x}/2*(1+sin(2*PI*t/8))':"
+            f"y='{room_y}/2*(1+cos(2*PI*t/8))'[livemove];"
+            "[fx]format=gray,curves=all='0/0 0.18/0 0.72/1 1/1'[livemask];"
+            "[livebase][livemove][livemask]maskedmerge[bl]"
         )
     raise ValueError(f"Unsupported pixel transform: {effect}")
 

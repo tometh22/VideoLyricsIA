@@ -834,6 +834,35 @@ def _background_source_is_ai(
     return True
 
 
+def _background_is_operator_upload(
+    background_path: str | None,
+    bg_r2_key: str | None,
+    *,
+    variation_source_path: str | None = None,
+    library_asset_id: int | None = None,
+) -> bool:
+    """True si el fondo salió de un archivo que SUBIÓ el operador.
+
+    Pregunta distinta a la de `_background_source_is_ai`, y por eso función
+    aparte. Ahí se clasifica la provenance del OUTPUT: un upload que animamos
+    con Veo cuenta como AI, y está bien — los píxeles finales los generó un
+    modelo, así que la validación de contenido tiene que correr.
+    Acá se pregunta por el INPUT: ¿este fondo es material humano que el operador
+    eligió y aprobó? Un arte del sello sigue siendo del sello aunque le
+    animemos las nubes, y por lo tanto NO es descartable.
+
+    Convención de nombres (la misma que usa `_background_source_is_ai`): los
+    uploads del operador se guardan como `bg_custom*` (`main.py:2680`, y
+    `bg_custom_edit*` en el path de edición). Biblioteca y variaciones NO son
+    upload del operador: son catálogo o derivados generados.
+    """
+    if not background_path or variation_source_path or library_asset_id is not None:
+        return False
+    key = (bg_r2_key or "").lower()
+    name = os.path.basename(background_path).lower()
+    return "bg_custom" in key or name.startswith("bg_custom")
+
+
 def _legacy_background_source_is_ai(
     *,
     asset_usage_mode: str | None,
@@ -954,7 +983,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  art_track: bool = False,
                  # Línea legal opcional en pantalla (art tracks): ej.
                  # "℗ 2026 Universal Music Chile". Vacía = no se dibuja.
-                 label_line: str = ""):
+                 label_line: str = "",
+                 # Canonical allowlisted batch contract. Individual fields
+                 # above remain for backwards compatibility; this object is
+                 # persisted verbatim (after API validation) for audit/retry.
+                 render_profile: dict | None = None):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -1225,7 +1258,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # JPG/PNG (NOT an MP4 — those are already video).
         _is_still = (background_path and
                      background_path.lower().endswith((".jpg", ".jpeg", ".png")))
-        _animate_user_image = bool(animate_image and _is_still)
+        _live_photo_effect = (effect or "").strip().lower() == "foto_viva"
+        _animate_user_image = bool(
+            (animate_image or _live_photo_effect) and _is_still
+        )
         _background_is_ai_generated = _background_source_is_ai(
             background_path,
             bg_r2_key,
@@ -1234,6 +1270,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             library_asset_id=variation_parent_asset_id,
         )
         _background_is_deterministic_fallback = False
+        # ¿La animación que pidió el operador terminó degradada a imagen fija?
+        # Hasta ahora esto se perdía en un logger.warning: el operador pedía
+        # animar su foto, Veo fallaba, se entregaba un zoom lento y no había
+        # NINGUNA señal (ni en el job, ni en la ficha del video, ni en Sentry).
+        # Se persiste en render_params más abajo para que la UI pueda decirlo.
+        _bg_animation_degraded = False
 
         # P0 fix 2026-06-19: _scenes_active se usa SIEMPRE en el render
         # (bg_prelooped=_scenes_active) pero antes sólo se inicializaba dentro de
@@ -1359,7 +1401,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # (_scenes_active → bg_prelooped=True). Si algo falla, log + caemos al
             # fondo único de _ensure_background (no rompemos el job).
             _scenes_active = False
-            if bg_image_path is None and enable_scenes and not _animate_user_image:
+            if (
+                bg_image_path is None
+                and enable_scenes
+                and not _animate_user_image
+                and not _live_photo_effect
+            ):
                 try:
                     update_job(job_id, current_step="scenes", progress=22)
                     _scene_timeline, _scene_plan = _generate_scene_background(
@@ -1424,6 +1471,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 logger.warning("[BG] image-to-video failed, falling back to Ken Burns on %s",
                                background_path)
                 bg_image_path = background_path
+                # El operador pidió animar y no se pudo: queda registrado en el
+                # job (render_params.bg_animation_degraded) para que la ficha del
+                # video lo diga en vez de entregar un zoom en silencio.
+                _bg_animation_degraded = True
             if bg_image_path is None:
                 _background_is_ai_generated = False
         update_job(job_id, progress=40)
@@ -1477,9 +1528,18 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # the wizard and we persist it so retries/edits respect it.
             "title_song_break": title_song_break,
         }
+        if isinstance(render_profile, dict):
+            _new_rp["render_profile"] = dict(render_profile)
         # Only persist background_hint / bg_verbatim when this run actually
         # received them — otherwise a hint-less typography edit would null out
         # values a prior background edit had stored (merge-not-replace).
+        # Resultado real de la animación pedida. Se escribe SIEMPRE que se haya
+        # intentado animar (True o False), así un re-render exitoso LIMPIA un
+        # True viejo y no quedamos avisando de una degradación que ya no existe.
+        # Si no se intentó animar, la clave no se toca (semántica merge-no-
+        # replace del resto del bloque).
+        if _animate_user_image:
+            _new_rp["bg_animation_degraded"] = bool(_bg_animation_degraded)
         if background_hint:
             _new_rp["background_hint"] = background_hint
         if bg_verbatim:
@@ -1692,12 +1752,34 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     # safe. Non-Universal AI output gets the same recovery;
                     # intentionally uploaded common-user assets keep the
                     # explicit validation failure behavior.
+                    # El arte que SUBIÓ el operador no es descartable (2026-07-30).
+                    # El comentario de arriba ya declara la intención —
+                    # "intentionally uploaded common-user assets keep the explicit
+                    # validation failure behavior"— pero la implementación la
+                    # contradecía: `_background_source_is_ai` devuelve True cuando
+                    # `animate_image` está prendido (~820), así que animar la foto
+                    # del operador la reclasificaba como "generated model output =
+                    # disposable". Resultado: un arte aprobado que no pasaba
+                    # validación se reemplazaba por un GRADIENTE y el job quedaba
+                    # `passed: True` (~1786). Para un sello es el peor modo de
+                    # falla: entregar otra cosa sin avisar.
+                    # Con este guard cae al camino que ya existe abajo:
+                    # status="validation_failed" + motivo. Un fallo visible es
+                    # mejor que una entrega silenciosa equivocada.
+                    _operator_upload_bg = _background_is_operator_upload(
+                        background_path, bg_r2_key,
+                        variation_source_path=variation_source_path,
+                        library_asset_id=variation_parent_asset_id,
+                    )
                     _recover_background = bool(
-                        _is_umg or _background_is_ai_generated
+                        (_is_umg or _background_is_ai_generated)
+                        and not _operator_upload_bg
                     )
                     logger.warning(
-                        "[VALIDATION] unsafe background job=%s recover=%s issues=%s",
-                        job_id, _recover_background, pre_validation["issues"],
+                        "[VALIDATION] unsafe background job=%s recover=%s "
+                        "operator_upload=%s issues=%s",
+                        job_id, _recover_background, _operator_upload_bg,
+                        pre_validation["issues"],
                     )
                     _recovered_validation = None
                     if _recover_background and _background_is_ai_generated:
@@ -1896,6 +1978,14 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 # y rinde sin letra. bg_image_path es el cover (imagen).
                 art_track=art_track,
                 label_line=label_line,
+                # "Quieta de verdad": si el fondo entregado es una IMAGEN y el
+                # operador eligió Estático, no le metemos el zoom del 15%.
+                # Es además la primera vez que `movement_style` hace algo en el
+                # camino de fondo humano: hasta ahora el eje entero era inerte
+                # acá (se enviaba, se persistía y nadie lo leía).
+                still_background=(
+                    _normalize_movement_style(movement_style) in {"estatico", "foto-estatica"}
+                ),
             )
             # Cinemascope opt-in: letterbox the finished YouTube master. Skipped
             # for UMG (that path returns a ProRes .mov — re-encoding it as h264
@@ -7918,7 +8008,17 @@ _MOVEMENT_STYLE_RULES = {
     "sutil":         "Movement: minimal and ambient — gentle sway, slow drift, breathing motion. Subjects barely move. Easy to loop seamlessly.",
     "estandar":      "",  # no extra rule; the existing prompt template controls motion
     "foto-parallax": "Aesthetic: photographic still with subtle parallax — composition feels like a single photo, motion is restricted to slow camera moves, depth-of-field shifts, and lighting passes. No moving subjects.",
-    "animado":       "Aesthetic: stylised 2D animated illustration — flat shapes, deliberate cartoon-like motion. NOT photorealistic.",
+    "animado":       (
+        "Aesthetic: LIVING ILLUSTRATION — a stylised 2D drawing with a locked "
+        "camera and almost the entire composition held still. Choose ONE "
+        "semantically important subject already belonging to this specific "
+        "scene and give only that subject one simple cyclic action. Everything "
+        "else remains drawn and still. The moving subject comes from the song/"
+        "scene, never from a fixed atmospheric recipe. Do not add smoke, rain, "
+        "fog, floating particles, swaying foliage or light flicker as generic "
+        "motion unless explicitly present in the lyrics or operator prompt. "
+        "Seamless loop, flat shapes, NOT photorealistic."
+    ),
 }
 
 
@@ -7969,6 +8069,9 @@ def _normalize_movement_style(s: str) -> str:
         "dinamico": "estandar", "dinámico": "estandar", "dynamic": "estandar",
         "photo": "foto-parallax", "parallax": "foto-parallax",
         "foto+parallax": "foto-parallax", "foto_parallax": "foto-parallax",
+        # Batch profile name; internally it uses the existing static register
+        # so frontend render-parity catalogs remain backwards compatible.
+        "foto-estatica": "estatico", "photo-static": "estatico", "foto_static": "estatico",
         "animated": "animado", "illustration": "animado", "cartoon": "animado",
     }
     if s in aliases:
@@ -8226,7 +8329,7 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     # For an explicit non-static register (sutil/estandar/foto-parallax/
     # animado) the existing movement_rule steers it, so clause (2) keeps its
     # original "exact camera movement" wording.
-    _static = normalized_movement == "estatico"
+    _static = normalized_movement in {"estatico", "foto-estatica"}
     _sutil = normalized_movement == "sutil"
     _animado = normalized_movement == "animado"
     _foto = normalized_movement == "foto-parallax"
@@ -8261,16 +8364,19 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
                     "itself is essentially still. NEVER push-in, NEVER zoom, "
                     "NEVER dolly forward, NEVER orbit. Just a faint breath")
     elif _animado:
-        # 2D illustration: cámara CALMA y variada. Antes caía al `else` ("exact
-        # camera movement") → paneos en cada escena, todas iguales (bug
-        # 2026-06-30). La vida viene de la animación 2D, no de la cámara.
-        _clause2 = ("(2) framing and composition chosen for THIS scene's mood "
-                    "(vary the angle and shot size between scenes so they don't all "
-                    "look alike), with a CALM camera — at most a slow, gentle "
-                    "lateral drift; this is a stylised 2D illustration, so keep the "
-                    "camera movement minimal and let the illustrated shapes and "
-                    "elements carry the motion. NEVER push-in, zoom, dolly forward "
-                    "or orbit")
+        # Living illustration: the source example is a mostly frozen drawing
+        # where one meaningful object performs a clean loop.  Do not make the
+        # model "solve motion" with the same smoke/rain/particle filler.
+        _clause2 = (
+            "(2) a LOCKED illustrated composition with NO camera movement. "
+            "Select exactly ONE semantically important subject that already "
+            "belongs to THIS scene, and animate only that subject with one "
+            "simple, readable, cyclic action. Keep every other illustrated "
+            "element still. The subject and action must be inferred from the "
+            "song, scene or operator prompt — never default to atmospheric "
+            "filler. No generic smoke, rain, fog, floating particles, swaying "
+            "foliage or light flicker unless explicitly requested. Seamless loop"
+        )
     elif _foto:
         # Foto fija: cámara casi inmóvil (foto), NO "exact camera movement".
         _clause2 = ("(2) framing and composition for THIS scene (vary it between "
@@ -8965,7 +9071,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
     # Movement-aware camera pool for the combinatorial fallback (rare — only
     # when Gemini fails to parse). Static intent must NOT get a motion verb.
     _norm_move = _normalize_movement_style(movement_style)
-    _camera_pool = _BG_CAMERAS_STATIC if _norm_move == "estatico" else _BG_CAMERAS
+    _camera_pool = _BG_CAMERAS_STATIC if _norm_move in {"estatico", "foto-estatica"} else _BG_CAMERAS
 
     # Gemini analysis
     if lyrics_text or song_title:
@@ -9110,6 +9216,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         allow_people: bool = False,
                         atmospherics_policy: dict | None = None,
                         verbatim: bool = False,
+                        live_photo: bool = False,
                         cache_only: bool = False,
                         cache_key_override: str | None = None,
                         cache_override_policy_fingerprint: str | None = None,
@@ -9137,6 +9244,10 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     the "no CGI / no animation" clauses so they don't contradict the
     cartoon-illustration aesthetic. All other safety clauses (no people,
     no text, etc.) stay in place.
+
+    `live_photo`: preserves an image-to-video seed and animates exactly one
+    semantic region. It explicitly rejects generic atmospheric filler unless
+    the source/operator already asks for it.
     """
     from provenance import record_ai_call
     import storage as _storage
@@ -9259,18 +9370,72 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         "perfectly still"
     )
     _norm_move = _normalize_movement_style(movement_style)
-    if _norm_move == "animado":
+    if live_photo:
+        safe_prompt = (
+            f"{prompt}. Preserve the supplied image's exact composition, "
+            "identity, framing, palette and subjects. First identify the ONE "
+            "most semantically meaningful animatable subject already visible "
+            "in the image; animate only that subject with one restrained, "
+            "natural, cyclic action. Keep all other regions stable and keep the "
+            "camera completely locked. Do not invent new subjects or objects. "
+            "No generic smoke, rain, fog, floating particles, wind, swaying "
+            "foliage or light flicker unless that element is already visible or "
+            "explicitly requested by the operator. No morphing, no scene cut, "
+            "no camera move. Make the first and last frame loop seamlessly. "
+            f"{no_alley}{_base_negatives}"
+        )
+    elif image_path:
+        # Image-to-video ("Animar con AI" sobre una foto SUBIDA por el
+        # operador, sin foto_viva). A diferencia de text-to-video NO
+        # generamos una escena ni inyectamos el filler atmosférico que Veo
+        # mete por default (humo + papeles/hojas volando) — la queja #1
+        # (render obelisco, 2026-07-29: "el sesgo de siempre del humo y esos
+        # papeles volando que no tienen nada que ver"). A diferencia de
+        # live_photo (UN solo sujeto) acá animamos VARIOS elementos reales de
+        # la foto (bandera, pájaros, semáforo, luces del auto, agua, follaje),
+        # siempre con cámara clavada y sin agregar nada que no esté en la foto.
+        _i2v_operator = f"{prompt}. " if (verbatim and prompt.strip()) else ""
+        safe_prompt = (
+            f"{_i2v_operator}"
+            "Animate this photograph as a living cinemagraph. PRESERVE the "
+            "supplied image EXACTLY — identical composition, framing, colors, "
+            "lighting and every object; add NOTHING that is not already "
+            "visible. The camera is completely LOCKED (no pan, tilt, zoom, "
+            "dolly, push-in, parallax or drift). Bring the scene to life using "
+            "ONLY the natural motion of elements ALREADY PRESENT in the photo: "
+            "flags and fabric rippling in the breeze, a few birds gliding "
+            "across the sky, vehicles easing along with their head/brake/turn "
+            "lights and the traffic lights blinking on and off, water and "
+            "wet-street reflections shimmering, trees and foliage swaying "
+            "gently, clouds drifting slowly, distant people walking naturally, "
+            "sunlight glinting off surfaces. Every motion must originate from "
+            "an object that is visible in the photo. "
+            # El sesgo exacto a matar (obelisco 2026-07-29): humo + papeles.
+            "STRICTLY DO NOT ADD anything that is not in the photo: no smoke, "
+            "no haze, no fog, no mist, no dust, no embers, no sparks, no "
+            "floating particles, no flying papers, no falling leaves or petals, "
+            "no confetti, no debris, no rain or snow unless already visible. No "
+            "new objects, no morphing, no scene change, no camera move. Subtle, "
+            "photorealistic, seamless loop. "
+            f"{no_alley}{_base_negatives}{_camera_negatives}"
+        )
+    elif _norm_move == "animado":
         # Cartoon / 2D illustration aesthetic — keep all safety clauses
         # except the "no CGI / no animation" pair, which would directly
         # contradict the requested look.
         safe_prompt = (
-            f"{prompt}. Stylised 2D animated illustration, flat shapes, "
-            "deliberate cartoon-like motion. "
+            f"{prompt}. LIVING ILLUSTRATION: a stylised 2D drawing, flat "
+            "shapes, locked camera, almost the entire composition still. "
+            "Animate exactly ONE semantically important subject already in "
+            "this scene with one simple cyclic action. Every other element "
+            "remains still. No generic smoke, rain, fog, floating particles, "
+            "swaying foliage or light flicker unless explicitly requested. "
+            "No camera movement, no morphing, seamless loop. "
             f"{no_alley}"
             f"{_base_negatives}"
             " no extra animation noise."
         )
-    elif _norm_move == "estatico":
+    elif _norm_move == "estatico" or _norm_move == "foto-estatica":
         # C2 (2026-05-25) — Hardening del prompt estatico. Veo ignoraba
         # ~50% de las locked-frame requests pre-2026-05-22, motivando el
         # routing a Imagen. Ahora endurecemos vía:
@@ -9358,7 +9523,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # untouched for everything else, and lets us A/B fast-vs-standard + measure
     # real cost without a redeploy (see plan Phase 5).
     _static_model = os.environ.get("VEO_MODEL_STATIC", "").strip()
-    if _static_model and (high_fidelity or _norm_move == "estatico"):
+    if _static_model and (high_fidelity or _norm_move in {"estatico", "foto-estatica"}):
         model = _static_model
         logger.info("[BG] high-fidelity render → model=%s (movement=%s, verbatim=%s)",
                     model, _norm_move or "auto", high_fidelity)
@@ -9384,6 +9549,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         "blur_sigma": blur_sigma,
         "ns": cache_namespace or "",
         "background_policy": _policy_fingerprint,
+        "live_photo": bool(live_photo),
     }
     # Image-to-video: la imagen semilla entra al hash vía digest del
     # contenido — ver _seed_image_digest para el porqué (audit 2026-06-09).
@@ -9816,7 +9982,26 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
         " no close-up of a person, no recognizable faces, no identifiable "
         "individual, no portrait, no person as the subject of the shot,"
     )
-    safe_prompt = f"{prompt}. No text, no words, no letters,{_people_suffix} no logos, no readable signage."
+    # Riel anti-ilustración en el borde de Imagen (2026-07-29). Las 3 ramas de
+    # Veo no-`animado` ya lo llevan de forma INCONDICIONAL ("Photorealistic,
+    # filmed with cinema camera, real footage … no CGI, no animation"), pero
+    # Imagen no tenía NINGÚN negativo estético. Como `foto-parallax` y
+    # `effect=foto_viva` fuerzan bg_mode=imagen, un fondo podía salir
+    # ilustrado/3D sin que el operador eligiera "Ilustración viva".
+    # El contrato es el mismo que en Veo: la estética ilustrada se sirve
+    # EXCLUSIVAMENTE con `animado`, que rutea a Veo por diseño (regla de matriz
+    # "Imagen × Animado → Veo"), así que el registro Imagen es siempre
+    # fotográfico. Por eso el negativo es incondicional acá también.
+    # Ojo: `_imagen_quality_line` dice algo equivalente, pero es una instrucción
+    # a GEMINI y sólo se emite en las ramas concept/genre — no cubre la rama
+    # pura-Auto (genre="" y concept="", el default del wizard) ni el modo
+    # verbatim, que saltea Gemini entero. Este es el borde real del generador.
+    safe_prompt = (
+        f"{prompt}. Photorealistic photograph, real photo. "
+        f"No text, no words, no letters,{_people_suffix} no logos, "
+        "no readable signage, no illustration, no drawing, no cartoon, "
+        "no anime, no 3D render, no CGI."
+    )
 
     recorder = record_ai_call(
         job_id=job_id or "unknown",
@@ -10266,6 +10451,7 @@ def _darken_prompt_for_effect(prompt: str, effect: str) -> str:
     if (
         not effect
         or effect.strip().lower() not in _fxc.EFFECTS
+        or _fxc.is_generative_effect(effect)
         or _fxc.effect_blend(effect) != "screen"
     ):
         return prompt
@@ -11376,13 +11562,27 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     # renombra la card a "Sin efecto — imagen quieta" en esa combinación. Elegir
     # que quede quieto es válido; que sea una decisión y no un accidente.
     _operator_effect = (effect or "").strip().lower()
+    _live_photo = _operator_effect == "foto_viva"
+
+    # Foto viva is a photo-first contract: create/select a still, then animate
+    # one semantic region through image-to-video.  It must never silently fall
+    # through to generic text-to-video just because another client sent a stale
+    # movement value.
+    if _live_photo and not image_to_video_path and bg_mode != "imagen":
+        logger.info("[BG] effect=foto_viva overrides bg_mode → imagen + image-to-video")
+        bg_mode = "imagen"
 
     # Animado is a Veo-only aesthetic (the 2D-illustration safe_prompt lives in
     # _generate_veo_video). Imagen renders stills, so an animado+imagen combo
     # is incoherent — downgrade to Veo. (Matrix rule: Imagen × Animado → Veo.)
-    if _norm_move_bg == "animado" and bg_mode != "veo":
+    if not _live_photo and _norm_move_bg == "animado" and bg_mode != "veo":
         logger.info("[BG] movement=animado overrides bg_mode → veo")
         bg_mode = "veo"
+    # Foto estática is a still photo with a locked frame and optional overlay;
+    # unlike foto-parallax it must never enter the Ken Burns path.
+    elif _norm_move_bg == "foto-estatica" and bg_mode != "imagen":
+        logger.info("[BG] movement=foto-estatica overrides bg_mode → imagen (locked photo)")
+        bg_mode = "imagen"
     # Foto + parallax is a still photo that gains depth via a slow LATERAL pan.
     # Veo can't do clean 2.5D parallax from a text prompt (it comes out muddy),
     # so this register always routes through Imagen-4 + the lateral Ken Burns
@@ -11417,6 +11617,45 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             logger.info("[BG] movement=%s stays on Veo (design intent 2026-05-25 — scene REAL)", _norm_move_bg)
             # bg_mode stays "veo" — _generate_veo_video receives the
             # hardened safe_prompt for estatico/sutil (C2 + C3).
+
+    # ── INVARIANTE (P0, 2026-07-29): la imagen del operador nunca se descarta ──
+    # `image_to_video_path` sólo llega con valor cuando el operador subió un
+    # still Y pidió animarlo (`_animate_user_image`, ~1229/1403): o con el toggle
+    # "Animar con AI", o con el efecto "Foto viva". Veo es el ÚNICO proveedor que
+    # hace image-to-video; la rama `imagen` genera un still NUEVO desde texto y
+    # NUNCA lee `image_to_video_path`, así que rutear ahí descarta en silencio el
+    # arte del operador y entrega otra imagen (peor con foto_viva: `:11543` anima
+    # `bg_imagen.jpg`, la generada, no la subida).
+    #
+    # Era alcanzable por dos caminos triviales, ambos con la matriz de movimiento
+    # pisando la intención de animar:
+    #   (a) sticky de localStorage: `movement_style` quedaba en "foto-parallax" de
+    #       un lote anterior → el `elif` de foto-parallax (abajo) forzaba imagen;
+    #   (b) elegir "Foto viva": `chooseEffect` (UploadZone.jsx) fuerza
+    #       movementStyle="foto-parallax" → mismo elif. Es decir: el único control
+    #       pensado para "animá MI foto" garantizaba que la foto se descartara.
+    # Para un sello (UMG) el modo de falla es el peor posible: sustitución
+    # silenciosa de arte aprobado, sin error y con el job marcado OK.
+    #
+    # Se expresa como invariante en un solo lugar (en vez de sumar el guard a
+    # cada `elif` de la matriz) para que cubra también el legacy
+    # STATIC_SUTIL_VIA_IMAGEN y cualquier register futuro que rutee a imagen.
+    # OJO: el `if` de foto_viva de arriba (`_live_photo and not
+    # image_to_video_path`) es el caso legítimo inverso — foto_viva SIN subida
+    # genera su propio still con Imagen y después lo anima; ese sigue intacto.
+    # Se compara contra "veo" (en vez de contra el nombre del otro proveedor) por
+    # dos razones: Veo es el ÚNICO proveedor con image-to-video, así que cualquier
+    # otro valor —presente o futuro— tiene que caer acá; y así este guard no
+    # aparece antes que la rama de dispatch real para
+    # `test_imagen_branch_uses_imagen_aware_prompt`, que la localiza por la
+    # primera aparición literal de su condición.
+    if image_to_video_path and bg_mode != "veo":
+        logger.info(
+            "[BG] operator image-to-video pinned → bg_mode=veo "
+            "(era %s por movement=%s; ese path descartaría la imagen subida)",
+            bg_mode, _norm_move_bg or "auto",
+        )
+        bg_mode = "veo"
 
     # Imagen-4 + Ken Burns branch. Cabled 2026-05-16 — _generate_imagen_image
     # has existed in the codebase as dead code since the original architecture
@@ -11467,6 +11706,30 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                                 allow_people=allow_people,
                                 atmospherics_policy=atmospherics_policy,
                                 verbatim=_verbatim_bg)
+        if _live_photo:
+            try:
+                _generate_veo_video(
+                    prompt,
+                    bg_path,
+                    job_id=job_id,
+                    cache_namespace=f"{artist}|{song_title}|foto_viva",
+                    image_path=image_path,
+                    movement_style=movement_style,
+                    normalized_concept=_normalize_concept(concept),
+                    allow_people=allow_people,
+                    atmospherics_policy=atmospherics_policy,
+                    verbatim=_verbatim_bg,
+                    live_photo=True,
+                )
+                if os.path.exists(bg_path) and os.path.getsize(bg_path) > 0:
+                    return bg_path
+                raise RuntimeError("Veo returned no living-photo artifact")
+            except Exception as exc:
+                _raise_if_job_timeout(exc)
+                logger.warning(
+                    "[BG] foto_viva provider failed; using bounded local "
+                    "photo-motion fallback: %s", exc,
+                )
         # Ken Burns produces a 60s sample that downstream palindrome-loops
         # to match the audio duration. Same contract as the Veo path.
         #   - "Estático"        → hold the frame (no zoom/pan).
@@ -11504,17 +11767,36 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     # short-circuit condition in _get_unique_prompt.
     _is_verbatim = bool(bg_verbatim and background_hint and background_hint.strip())
 
-    # Generate video background with Veo 3 (always video, no images)
-    result = _get_unique_prompt(
-        lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
-        concept=concept, movement_style=movement_style, match_lyrics=match_lyrics,
-        background_hint=background_hint,
-        bg_verbatim=bg_verbatim,
-        palette_style=style_hint, custom_colors=custom_colors,
-        allow_people=allow_people, creative_mode=creative_mode,
-        atmospherics_policy=atmospherics_policy,
+    # Image-to-video ("Animar con AI" sobre una foto subida): NO generamos una
+    # escena de cero. El prompt de escena de _get_unique_prompt — sobre todo el
+    # branch estatico, que EXIGE "≥3 fuentes de movimiento" con ejemplos
+    # genéricos (dust motes, falling petals, drifting clouds) — hacía que Veo le
+    # metiera humo + papeles/hojas volando a la foto del operador (queja #1,
+    # obelisco 2026-07-29). Para i2v el prompt es MOTION-ONLY (ver la rama
+    # `elif image_path` en _generate_veo_video): solo pasamos el texto del
+    # operador si escribió el suyo ("mi prompt manda"), y un descriptor neutro
+    # si no. Evita además el costo del Gemini de escena que no se usaría.
+    _i2v_animate = bool(
+        image_to_video_path and not _live_photo
+        and os.path.exists(image_to_video_path)
     )
-    prompt = result["prompt"]
+    if _i2v_animate:
+        prompt = (
+            (background_hint or "").strip() if _is_verbatim
+            else "Cinemagraph: animate only the real elements already visible in the uploaded photo"
+        )
+    else:
+        # Generate video background with Veo 3 (always video, no images)
+        result = _get_unique_prompt(
+            lyrics_text, artist, job_id=job_id, song_title=song_title, genre=genre,
+            concept=concept, movement_style=movement_style, match_lyrics=match_lyrics,
+            background_hint=background_hint,
+            bg_verbatim=bg_verbatim,
+            palette_style=style_hint, custom_colors=custom_colors,
+            allow_people=allow_people, creative_mode=creative_mode,
+            atmospherics_policy=atmospherics_policy,
+        )
+        prompt = result["prompt"]
 
     bg_path = os.path.join(job_dir, "bg_generated.mp4")
     import time as _time_bg
@@ -11555,6 +11837,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 allow_people=allow_people,
                 atmospherics_policy=atmospherics_policy,
                 verbatim=_is_verbatim,
+                live_photo=_live_photo,
             )
             # Semantic relevance check — always score, but cap retries at one
             # to bound cost (+$0.80 worst case). quality_retry_used gates the
@@ -11594,7 +11877,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # → clip idéntico), quedarse con el MEJOR de los dos candidatos,
             # presupuesto propio, y no-op duro si veo_breaker está abierto o
             # bg_verbatim. Va en un PR aparte, con los datos en la mano.
-            if _norm_move_bg == "estatico":
+            if _norm_move_bg in {"estatico", "foto-estatica"}:
                 _drift = _measure_camera_drift(bg_path)
                 if _drift:
                     # El modelo va en la línea porque es la variable que se
@@ -11680,6 +11963,17 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 wait = 30
                 logger.info("[BG] Waiting %ss before retry...", wait)
                 _time_bg.sleep(wait)
+
+    # A living photo must preserve the operator's image even when Veo is down.
+    # Turn it into a static sample here; fx_compositor's travelling semantic-
+    # region mask supplies bounded local motion later in the render.
+    if _live_photo and image_to_video_path and os.path.exists(image_to_video_path):
+        logger.warning(
+            "[BG] foto_viva Veo unavailable — preserving source image and "
+            "falling back to local masked motion"
+        )
+        _static_image_to_mp4(image_to_video_path, bg_path, duration=60.0)
+        return bg_path
 
     # All Veo attempts failed — render a gradient as fallback.
     # We do NOT fall back to a library asset: UMG and other rights-sensitive
@@ -14451,6 +14745,14 @@ def generate_lyric_video(
     # SIN letra ni title card. Requiere una imagen como bg_image_path.
     art_track: bool = False,
     label_line: str = "",
+    # "Quieta de verdad" (2026-07-30). Un fondo que es IMAGEN recibía SIEMPRE un
+    # zoom del 15% (`_prerender_kenburns_bg`), así que "sin movimiento" no
+    # existía para una foto subida por el operador: la única forma de que su
+    # foto quedara quieta era... que no quedara quieta. Asimetría absurda: el
+    # still que genera Imagen sí queda quieto (usa `_static_image_to_mp4`).
+    # Con este flag el caller —que es quien sabe si el operador pidió "quieta"—
+    # elige, y el render sólo ejecuta. Default False = comportamiento histórico.
+    still_background: bool = False,
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -14562,11 +14864,22 @@ def generate_lyric_video(
         try:
             ass_bg = bg_source
             if not _bg_is_video:
-                # Image background → pre-render the Ken Burns motion to a
-                # video with ffmpeg zoompan so the single-pass burn applies.
-                ass_bg = _prerender_kenburns_bg(
-                    bg_source, duration, job_dir, spec=spec,
-                )
+                if still_background:
+                    # El operador pidió que su foto quede QUIETA. Mismo helper
+                    # que usa la rama Imagen, así que "quieta" significa lo
+                    # mismo venga de IA o de un archivo propio.
+                    ass_bg = _static_image_to_mp4(
+                        bg_source,
+                        os.path.join(job_dir, "bg_still_ass.mp4"),
+                        duration,
+                        spec=spec,
+                    )
+                else:
+                    # Image background → pre-render the Ken Burns motion to a
+                    # video with ffmpeg zoompan so the single-pass burn applies.
+                    ass_bg = _prerender_kenburns_bg(
+                        bg_source, duration, job_dir, spec=spec,
+                    )
             logger.info("[ASS] libass fast path (engine=ass, profile=%s, bg=%s)",
                         spec.profile, "image" if not _bg_is_video else "video")
             _t0 = _time.monotonic()
@@ -16081,6 +16394,10 @@ def run_edit_pipeline(
         # timeline is never identity-bound to that plan and cannot inherit its
         # validation shortcut.
         _scene_timeline_from_current_clips = False
+        # True cuando un fondo custom (edit_type="custom") se animó con Veo
+        # image-to-video → provenance AI-derived (aplica validación). Sin
+        # animar es human-provided. Se resuelve dentro de la rama custom.
+        _animate_custom = False
         if edit_type in ("typography", "lyrics", "metadata"):
             # All three reuse the cached background — only the foreground
             # layer changes. Lyrics edit ALSO swaps the segments, and
@@ -16330,6 +16647,89 @@ def run_edit_pipeline(
             _pending_background_recache = True
             update_job(job_id, progress=35)
 
+        elif edit_type == "custom":
+            # Fondo subido por el operador en el wizard de EDICIÓN ("Subir
+            # el mío", restaurada tras #970). El archivo ya vive en R2
+            # (POST /edit/{job}/custom-background, multipart) — acá lo
+            # materializamos y, si pidió "Animar con AI" sobre una imagen
+            # fija, lo pasamos por Veo image-to-video (mismo seam que
+            # create-time). Sin animar = human-provided (sin costo Veo).
+            # Como el fondo único, nunca en jobs multi-escena.
+            if scene_plan and scene_plan.get("scenes"):
+                raise RuntimeError(
+                    "custom background edit no soportado en jobs multi-escena — "
+                    "regenerar escenas individuales (edit_type='scene')."
+                )
+            _cbg = edit_params.get("custom_bg") or {}
+            _cbg_r2 = _cbg.get("bg_r2_key")
+            _cbg_ext = os.path.splitext(_cbg_r2 or "")[1].lower() or ".mp4"
+            _cbg_local = os.path.join(job_dir, f"bg_custom_edit{_cbg_ext}")
+            if not os.path.exists(_cbg_local):
+                if _cbg_r2 and storage.is_enabled():
+                    if not storage.download_object(_cbg_r2, _cbg_local):
+                        raise RuntimeError(
+                            f"Could not download custom background {_cbg_r2!r} from R2"
+                        )
+                else:
+                    raise RuntimeError(
+                        f"custom background edit sin asset alcanzable (bg_r2_key={_cbg_r2!r})"
+                    )
+            # "Animar con AI" solo aplica a imágenes fijas (.jpg/.png); un
+            # video subido ya es video. Mismo criterio que create-time.
+            _cbg_is_still = _cbg_local.lower().endswith((".jpg", ".jpeg", ".png"))
+            _animate_custom = bool(_cbg.get("animate_image") and _cbg_is_still)
+            if not _animate_custom:
+                # Usar tal cual: imagen fija (Ken Burns aguas abajo) o video
+                # ya listo. Human-provided → sin Veo, sin validación IA.
+                update_job(job_id, status="editing", current_step="video", progress=30)
+                bg_image_path = _cbg_local
+            else:
+                # Animar la imagen del usuario con Veo image-to-video (mismo
+                # seam que create-time, pipeline.py ~1398). Provenance =
+                # AI-derived → la validación Universal corre normalmente.
+                update_job(job_id, status="editing", current_step="background", progress=22)
+                lyrics_text = " ".join(
+                    str(seg.get("text") or "") for seg in segments
+                    if isinstance(seg, dict)
+                )
+                try:
+                    bg_image_path = _ensure_background(
+                        style, job_dir,
+                        lyrics_text=lyrics_text, artist=artist, job_id=job_id,
+                        song_title=song_title, genre=genre, concept=concept,
+                        movement_style=movement_style,
+                        image_to_video_path=_cbg_local,
+                        background_hint=effective_background_hint,
+                        bg_mode=background_mode,
+                        bg_verbatim=bg_verbatim,
+                        effect=effect,
+                        match_lyrics=effective_match_lyrics,
+                        allow_people=_compute_allow_people(job_id, effective_background_hint),
+                    )
+                except Exception as _custom_anim_error:
+                    _raise_if_job_timeout(_custom_anim_error)
+                    # Si Veo falla, caer a la imagen fija con Ken Burns (mismo
+                    # fallback que create-time) en vez de romper el edit.
+                    logger.error(
+                        "[EDIT] custom image-to-video falló job=%s; uso la imagen "
+                        "fija con Ken Burns: %s", job_id, _custom_anim_error,
+                    )
+                    bg_image_path = _cbg_local
+                    _animate_custom = False
+                if _animate_custom and (not bg_image_path or not os.path.exists(bg_image_path)):
+                    logger.warning(
+                        "[EDIT] custom image-to-video sin salida — fallback Ken Burns %s",
+                        _cbg_local,
+                    )
+                    bg_image_path = _cbg_local
+                    _animate_custom = False
+            bg_prelooped = False
+            # El fondo subido pasa a ser el DURABLE del job (espeja library):
+            # el recache post-render actualiza bg_r2_key_cached y los edits
+            # de tipografía/lyrics posteriores lo reusan.
+            _pending_background_recache = True
+            update_job(job_id, progress=35)
+
         else:
             raise ValueError(f"Unknown edit_type {edit_type!r}")
 
@@ -16350,6 +16750,11 @@ def run_edit_pipeline(
             # provided: NO generado por IA (cambia el short-circuit de
             # validación Universal y la provenance del deliverable).
             False if edit_type == "background_library" else
+            # Fondo custom: tal cual = human-provided (False); animado con
+            # Veo image-to-video = AI-derived (True), igual que create-time
+            # (_background_source_is_ai animate_image=True). Esto habilita
+            # la validación Universal sobre la salida de Veo.
+            (True if _animate_custom else False) if edit_type == "custom" else
             bool(_stored_background_ai_generated)
         )
         _edit_safety_policy = _background_safety_policy(
@@ -16577,6 +16982,10 @@ def run_edit_pipeline(
             title_song_break=title_song_break,
             # Multi-escena: el timeline ya cubre toda la canción → no re-loopear.
             bg_prelooped=bg_prelooped,
+            # Espejo de run_pipeline: un edit no puede perder el "quieta".
+            still_background=(
+                _normalize_movement_style(movement_style) in {"estatico", "foto-estatica"}
+            ),
         )
         # Cinemascope opt-in — mirror run_pipeline. YouTube master only.
         if _video_out and not wants_umg:

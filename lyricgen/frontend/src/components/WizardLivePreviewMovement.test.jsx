@@ -75,11 +75,7 @@ describe("WizardLivePreview — movement preview reactivity (regression 0511fa3)
   });
 
   it("base video uses the movement clip even with effect active (fix 2026-05-25)", () => {
-    // Bug fix 2026-05-25: el código anterior forzaba preview_base.mp4
-    // siempre que había effect, lo cual desconectaba el preview del
-    // thumbnail elegido. Ahora SIEMPRE se respeta el clipSrc del
-    // movement (excepto para 'animado' que sigue cayendo a preview_base
-    // para no clashear con efectos partícula sobre la nebula).
+    // El efecto no puede desconectar el preview del thumbnail elegido.
     const { container } = render(
       <WizardLivePreview
         style="oscuro"
@@ -92,30 +88,29 @@ describe("WizardLivePreview — movement preview reactivity (regression 0511fa3)
     expect(baseVideo.getAttribute("src")).toBe("/movement_samples/estandar.mp4");
   });
 
-  it("falls back to preview_base.mp4 ONLY when movement is animado + effect active", () => {
-    // Animado con efecto: el motion bakeado del clip (nebula 2D) clash
-    // con las partículas del efecto → fallback a escena calma + CSS
-    // animation para que el movement se note.
+  it("keeps the live illustration visible when animado has an active effect", () => {
+    // Regression: animado + effect used to be silently replaced by the
+    // generic preview base, so the selected illustration disappeared.
     const { container } = render(
       <WizardLivePreview
         style="oscuro"
         movementStyle="animado"
-        effect="snow"
+        effect="kaleido"
         clipSrc="/movement_samples/animado.mp4"
+        clipIsVideo
       />,
     );
-    const baseVideo = container.querySelector("video");
-    expect(baseVideo.getAttribute("src")).toBe("/preview_base.mp4");
-    // Y CSS animation aplicada porque preview_base no tiene motion baked.
-    const animStyle = baseVideo.getAttribute("style") || "";
-    expect(animStyle.includes("animation")).toBe(true);
-    expect(animStyle).toMatch(/wlp-anim/);
+    const illustrationLayers = container.querySelectorAll(
+      'video[src="/movement_samples/animado.mp4"]',
+    );
+    expect(illustrationLayers.length).toBeGreaterThan(0);
+    expect(container.querySelector('video[src="/preview_base.mp4"]')).toBeNull();
+    expect(container.querySelector('[data-photo-transform="kaleido"]')).toBeTruthy();
   });
 
   it("movement clip has no CSS animation overlay (motion is baked into the clip)", () => {
-    // Cuando usamos el movement clip directo (no preview_base), la animation
-    // CSS NO debe aplicarse — el movement ya está en el video. Aplicar CSS
-    // animation encima compondría motions y se vería raro.
+    // El movement ya está horneado en el video. Aplicar CSS animation encima
+    // compondría motions y se vería raro.
     const { container } = render(
       <WizardLivePreview
         style="oscuro"
@@ -128,6 +123,21 @@ describe("WizardLivePreview — movement preview reactivity (regression 0511fa3)
     const animStyle = baseVideo.getAttribute("style") || "";
     // estandar clip + effect → no CSS animation (motion baked).
     expect(animStyle.includes("animation")).toBe(false);
+  });
+
+  it("applies the selected movement animation to a still-image source", () => {
+    const { container } = render(
+      <WizardLivePreview
+        style="oscuro"
+        movementStyle="foto-parallax"
+        effect=""
+        clipSrc="/library/operator-photo.jpg"
+        clipIsVideo={false}
+      />,
+    );
+    const baseImage = container.querySelector('img[src="/library/operator-photo.jpg"]');
+    expect(baseImage).toBeTruthy();
+    expect(baseImage.getAttribute("style") || "").toMatch(/wlp-parallax/);
   });
 
   it("changing only movementStyle (no clipSrc change) doesn't crash", () => {

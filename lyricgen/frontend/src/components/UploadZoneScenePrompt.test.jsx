@@ -169,6 +169,18 @@ describe("Foto fija avisa que queda inmóvil", () => {
 });
 
 describe("selector compacto de efectos", () => {
+  it("agrupa Movimiento y Efecto en un único studio responsive", () => {
+    render(<Harness movementStyle="estatico" />);
+    goStep(3);
+
+    const studio = screen.getByTestId("motion-studio");
+    expect(studio.className).toContain("sm:grid-cols-2");
+    expect(studio.contains(screen.getByTestId("movement-picker-toggle"))).toBe(true);
+    expect(studio.contains(screen.getByTestId("effect-picker-toggle"))).toBe(true);
+    expect(screen.getByText("upload.motion_studio_title")).toBeTruthy();
+    expect(screen.getByText("upload.motion_live_badge")).toBeTruthy();
+  });
+
   it("arranca cerrado y resume la selección sin cargar el editor", () => {
     render(<Harness movementStyle="foto-parallax" />);
     goStep(3);
@@ -185,7 +197,7 @@ describe("selector compacto de efectos", () => {
     goStep(3);
     fireEvent.click(screen.getByTestId("effect-picker-toggle"));
 
-    expect(document.querySelectorAll("[data-effect]")).toHaveLength(33);
+    expect(document.querySelectorAll("[data-effect]")).toHaveLength(34);
     fireEvent.click(document.querySelector('[data-effect-category="stylized"]'));
 
     const visible = [...document.querySelectorAll("[data-effect]")]
@@ -193,10 +205,13 @@ describe("selector compacto de efectos", () => {
     expect(visible).toEqual([
       "prism", "film", "scanlines", "shapes", "rgb_glitch", "neon_edge",
       "kaleido", "halftone", "ink_reveal", "chromatic_pulse", "cutout_echo",
+      "foto_viva",
     ]);
     expect(visible).not.toContain("none");
     expect(document.querySelector('[data-effect-category="stylized"]')
       .getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByTestId("effect-picker-toggle").textContent)
+      .toContain("upload.motion_editing_badge");
   });
 
   it("el click confirma la opción y actualiza el resumen compacto", () => {
@@ -221,6 +236,27 @@ describe("selector compacto de efectos", () => {
     expect(screen.queryByTestId("effect-picker-panel")).toBeNull();
     expect(screen.getByTestId("effect-picker-toggle")
       .getAttribute("data-effect-summary")).toBe("fog");
+  });
+
+  it("Foto viva alinea el origen a Foto fija y se identifica como IA", () => {
+    const fields = [];
+    render(<Harness movementStyle="estatico" onField={(f, v) => fields.push([f, v])} />);
+    goStep(3);
+    fireEvent.click(screen.getByTestId("effect-picker-toggle"));
+
+    const livingPhoto = document.querySelector('[data-effect="foto_viva"]');
+    expect(livingPhoto).not.toBeNull();
+    expect(livingPhoto.textContent).toContain("upload.effect_ai_badge");
+    fireEvent.click(livingPhoto);
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(fields).toContainEqual(["movementStyle", "foto-parallax"]);
+    expect(fields).toContainEqual(["effect", "foto_viva"]);
+    expect(screen.getByTestId("movement-picker-toggle")
+      .getAttribute("data-movement-summary")).toBe("foto-parallax");
+    expect(screen.getByTestId("effect-picker-toggle")
+      .getAttribute("data-effect-summary")).toBe("foto_viva");
+    expect(screen.queryByTestId("foto-fija-warning")).toBeNull();
   });
 });
 
@@ -257,7 +293,7 @@ describe("E2E del Motion Composer", () => {
     expect(screen.getByTestId("effect-picker-panel")).toBeTruthy();
     const cards = [...document.querySelectorAll("[data-effect]")]
       .filter((card) => card.dataset.effect !== "none");
-    expect(cards).toHaveLength(32);
+    expect(cards).toHaveLength(33);
     for (const card of cards) {
       expect(card.querySelector("img")?.getAttribute("src"))
         .toBe(`/fx_samples/${card.dataset.effect}.jpg`);

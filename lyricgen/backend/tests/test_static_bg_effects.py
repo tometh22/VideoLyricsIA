@@ -195,4 +195,128 @@ def test_pixel_transform_changes_selected_photo_pixels(tmp_path, effect):
     rendered = np.frombuffer(frame, dtype=np.uint8).reshape(180, 320, 3)
     source = np.asarray(Image.open(img).convert("RGB"), dtype=np.uint8)
     mad = np.abs(rendered.astype(np.int16) - source.astype(np.int16)).mean()
-    assert mad > 2.0, f"{effect} was visually indistinguishable (MAD={mad:.2f})"
+    # Foto viva intentionally modifies a bounded subject region, so global
+    # image MAD is lower than full-frame warps. Temporal locality is asserted
+    # separately below; here we only prove it survives the final encode.
+    threshold = (
+        0.55
+        if effect in {"foto_viva", "chromatic_pulse", "ink_reveal"}
+        else 2.0
+    )
+    assert mad > threshold, f"{effect} was visually indistinguishable (MAD={mad:.2f})"
+
+
+def _raw_effect_gray(effect, at=4.0):
+    raw = subprocess.run(
+        [
+            "ffmpeg", "-loglevel", "error", "-ss", str(at),
+            "-i", fx.effect_path(effect), "-vf", "scale=320:180",
+            "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    ).stdout
+    return np.frombuffer(raw, dtype=np.uint8).reshape(180, 320)
+
+
+def test_corrected_mask_assets_protect_the_lyric_safe_area():
+    shadows = _raw_effect_gray("shadow_play")
+    ink = _raw_effect_gray("ink_reveal")
+    chromatic = _raw_effect_gray("chromatic_pulse")
+
+    # Leaf gobos enter from the corners instead of covering the centre with
+    # screen-height ellipses.
+    assert shadows[45:145, 80:240].mean() > 249
+    assert 0.01 < (shadows < 235).mean() < 0.22
+    # Ink is made of bounded brushstrokes, never a near-full-frame black mask.
+    assert 0.02 < (ink < 220).mean() < 0.28
+    # Chromatic energy stays peripheral so the lyric area is not color-washed.
+    centre = chromatic[50:130, 90:230].mean()
+    border = np.concatenate(
+        [
+            chromatic[:35].ravel(),
+            chromatic[-35:].ravel(),
+            chromatic[:, :45].ravel(),
+            chromatic[:, -45:].ravel(),
+        ]
+    ).mean()
+    assert border > centre + 3.0
+
+
+def test_halftone_production_graph_preserves_neutral_channel_balance(tmp_path):
+    """Regression: planar-GBR `eq=saturation` turned this effect solid green."""
+    image = tmp_path / "neutral.png"
+    Image.new("RGB", (320, 180), (176, 176, 176)).save(image)
+    output = tmp_path / "halftone.mp4"
+    graph, _, extra = fx.build_video_filter(
+        ass_basename=None, font_dir="", width=320, height=180, effect="halftone",
+    )
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-loop", "1", "-framerate", "24", "-i", str(image),
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+            *extra, "-filter_complex", graph, "-map", "[out]",
+            "-t", "0.7", "-c:v", "libx264", "-preset", "ultrafast", str(output),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    raw = subprocess.run(
+        [
+            "ffmpeg", "-loglevel", "error", "-ss", "0.45", "-i", str(output),
+            "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    ).stdout
+    frame = np.frombuffer(raw, dtype=np.uint8).reshape(180, 320, 3)
+    channel_means = frame.mean(axis=(0, 1))
+    assert channel_means.max() - channel_means.min() < 4.0
+
+
+def test_foto_viva_moves_a_bounded_region_over_time(tmp_path):
+    """The local fallback reads as motion without moving the whole frame."""
+    img = tmp_path / "photo.jpg"
+    _make_image(img, 320, 180)
+    image = Image.open(img).convert("RGB")
+    # Semantic-looking high-frequency landmarks make local movement measurable
+    # (the generic gradient fixture is deliberately almost textureless).
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((42, 35, 126, 119), fill=(245, 185, 54), outline=(15, 20, 45), width=7)
+    draw.rectangle((205, 50, 283, 137), fill=(40, 202, 188), outline=(15, 20, 45), width=7)
+    image.save(img)
+
+    out = tmp_path / "foto_viva_motion.mp4"
+    graph, _, extra = fx.build_video_filter(
+        ass_basename=None, font_dir="", width=320, height=180, effect="foto_viva",
+    )
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-loop", "1", "-framerate", "24", "-i", str(img),
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+            *extra, "-filter_complex", graph, "-map", "[out]",
+            "-t", "2", "-c:v", "libx264", "-preset", "ultrafast", str(out),
+        ],
+        check=True, capture_output=True, timeout=60,
+    )
+
+    def frame(at):
+        raw = subprocess.run(
+            [
+                "ffmpeg", "-loglevel", "error", "-ss", str(at), "-i", str(out),
+                "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+            ],
+            check=True, capture_output=True, timeout=30,
+        ).stdout
+        return np.frombuffer(raw, dtype=np.uint8).reshape(180, 320, 3)
+
+    delta = np.abs(frame(0.1).astype(np.int16) - frame(1.6).astype(np.int16))
+    changed = delta.mean(axis=2) > 2.0
+    assert delta.mean() > 2.0
+    assert 0.08 < changed.mean() < 0.70

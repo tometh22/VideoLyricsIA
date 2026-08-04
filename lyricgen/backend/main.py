@@ -97,6 +97,9 @@ from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe, _normalize_movement_style
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
+from batch_profiles import (
+    RenderProfileError, normalize_render_profile, pipeline_fields,
+)
 from billing import router as billing_router
 from admin import router as admin_router
 import emails
@@ -2648,13 +2651,22 @@ def _validate_background_file_on_disk(filename: str, path: str) -> None:
             _reject("File does not look like a valid MP4/MOV (magic bytes check failed).")
 
 
-def _save_custom_background(background_file, job_dir: str, job_id: str, tenant_id: str):
+def _save_custom_background(background_file, job_dir: str, job_id: str, tenant_id: str,
+                            persist_cache: bool = True):
     """Materializa el fondo subido por el usuario: valida (extensión +
     magic bytes + tamaño), escribe a disco, sube a R2 y — clave del fix
     2026-06-11 — persiste la key en `bg_r2_key_cached` para que los edits
     rápidos y /retry preserven el archivo del usuario en vez de
     regenerar con Veo. Devuelve (bg_path, bg_r2_key) o (None, None) si
-    no vino archivo."""
+    no vino archivo.
+
+    persist_cache=False lo usa el upload de fondo custom en EDICIÓN
+    (POST /edit/{job}/custom-background): ahí el archivo aún no es el
+    fondo durable — el job ya tiene un video renderizado con el fondo
+    viejo, y bg_r2_key_cached recién debe apuntar al nuevo DESPUÉS de que
+    el edit re-renderice y valide (vía _pending_background_recache, igual
+    que background_library). Persistirlo antes haría que un edit de
+    tipografía posterior reusara un fondo que el operador nunca aprobó."""
     if not (background_file and background_file.filename):
         return None, None
     bg_ext = os.path.splitext(background_file.filename)[1].lower()
@@ -2676,7 +2688,7 @@ def _save_custom_background(background_file, job_dir: str, job_id: str, tenant_i
     bg_r2_key = None
     if storage.is_enabled():
         bg_r2_key = storage.upload_input(bg_path, tenant_id, job_id, bg_filename)
-        if bg_r2_key:
+        if bg_r2_key and persist_cache:
             # El archivo humano YA vive en R2: esa misma key habilita el
             # fast-path de edits (gate en request_edit) y la preservación
             # en /retry (preserved_bg_r2_key) desde el minuto cero. Si el
@@ -4207,6 +4219,13 @@ async def transcribe_uploaded(
             _result, audio_path, job_id,
             live_hint=bool(getattr(body, "live", False))
             or _looks_live(_row_title, _row_filename))
+        _result = _maybe_repetition_reconcile(_result, job_id)
+        _result = await _maybe_gap_rescue(_result, audio_path, job_id,
+                                          body.language or "es")
+        _result = await _maybe_word_vote(_result, audio_path, job_id,
+                                         body.language or "es")
+        _result = _maybe_chorus_snap(_result, job_id)
+        _result = _maybe_phrase_segment(_result, job_id)
         from lyrics_format import format_lyrics_pass as _fmt
         return await _fmt(_result, language=body.language or "es")
     finally:
@@ -4882,6 +4901,13 @@ async def transcribe_endpoint(
     _result = await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
     _result = await _maybe_adlib_filter(_result, audio_path, job_id,
                                         live_hint=_looks_live(title, file.filename))
+    _result = _maybe_repetition_reconcile(_result, job_id)
+    _result = await _maybe_gap_rescue(_result, audio_path, job_id,
+                                      language or "es")
+    _result = await _maybe_word_vote(_result, audio_path, job_id,
+                                     language or "es")
+    _result = _maybe_chorus_snap(_result, job_id)
+    _result = _maybe_phrase_segment(_result, job_id)
     from lyrics_format import format_lyrics_pass as _fmt
     return await _fmt(_result, language=language or "es")
 
@@ -4900,6 +4926,271 @@ def _looks_live(*texts) -> bool:
     vivos en el título ('Live In Buenos Aires 2001'); para archivos sin
     etiquetar existe el toggle del operador (body.live)."""
     return any(t and _LIVE_MARKER_RE.search(str(t)) for t in texts)
+
+
+def _maybe_repetition_reconcile(result, job_id: str):
+    """Post-pass gateado (REPETITION_RECONCILE_ENABLED, default off): cuando
+    el audio canta un estribillo M veces y la referencia listó K<M, el grupo
+    entero queda corrido una repetición (~±5,6 s medido contra Rotor, job
+    6f4047db). Inserta la ocurrencia huérfana / reasigna miembros flotantes
+    usando repetition_group + ctc_lr + uncovered_spans — señales que ya
+    existían y nadie consumía. Puro (CPU-only, sin I/O): sync a propósito.
+    Corre en los 3 call sites (worker + 2 endpoints HTTP) en lockstep — ver
+    tests/test_postpass_lockstep.py. Never raises."""
+    if not isinstance(result, dict):
+        return result
+    try:
+        import repetition_reconcile as _rr
+        if not _rr.is_enabled():
+            return result
+        segs = result.get("segments") or []
+        words = result.get("_asr_words") or []
+        if len(segs) < 3 or not words:
+            return result
+        import lead_in as _li
+        nuevo, stats = _rr.reconcile(
+            segs, words, lead_s=_li.lead_seconds(), hold_s=_li.hold_seconds(),
+        )
+        if stats.get("inserted") or stats.get("reassigned"):
+            result = dict(result)
+            result["segments"] = nuevo
+            logger.info(
+                "[REP-RECONCILE] %d insertada(s), %d reasignada(s) "
+                "(grupos=%d) job=%s", stats["inserted"], stats["reassigned"],
+                stats["groups"], job_id)
+        elif stats.get("declined"):
+            logger.info("[REP-RECONCILE] sin cambios (declines=%s) job=%s",
+                        stats["declined"][:4], job_id)
+        result.setdefault("postpass_stats", {})["rep_reconcile"] = {
+            k: v for k, v in stats.items() if k != "declined"}
+        return result
+    except Exception as e:  # nunca romper la transcripción
+        logger.warning("[REP-RECONCILE] wrapper declinó: %r (job=%s)",
+                       e, job_id)
+        return result
+
+
+async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
+                            language: str = "es"):
+    """Post-pass gateado (GAP_RESCUE_ENABLED, default off): re-transcribe los
+    tramos donde el ASR de la cascada quedó SORDO.
+
+    Los otros dos post-pases colocan texto donde el ASR oyó algo; cuando el
+    ASR no oyó nada, no tienen con qué trabajar — así quedó un hueco de 30 s
+    sin un solo cartel en el job dcf773b5 mientras el audio cantaba. Medido
+    sobre ese hueco: transcribir la MEZCLA devuelve 1 palabra; transcribir el
+    STEM de voz devuelve 16. Por eso usa el stem cacheado por la cascada
+    (nunca corre demucs: `cache_only=True`) y sólo cae a la mezcla si no está.
+
+    Never raises: ante cualquier fallo devuelve el resultado intacto."""
+    if not isinstance(result, dict):
+        return result
+    _stem = None
+    try:
+        import gap_rescue as _gr
+        if not _gr.is_enabled():
+            return result
+        segs = result.get("segments") or []
+        if len(segs) < 3 or not audio_path or not os.path.exists(audio_path):
+            return result
+        from pipeline import _audio_duration
+        dur = await asyncio.to_thread(_audio_duration, audio_path)
+        _hay_huecos = bool(_gr.find_gaps(segs, dur))
+        _hay_manchados = False
+        _words_pre = result.get("_asr_words") or []
+        if _words_pre:
+            try:
+                from audio_coverage import text_mismatches as _tm_pre
+                _hay_manchados = any(
+                    (m["end"] - m["start"]) >= 4.0
+                    for m in _tm_pre(segs, _words_pre, min_ratio=0.3))
+            except Exception:
+                pass
+        if not _hay_huecos and not _hay_manchados:
+            return result          # nada que rescatar: ni tocamos el stem
+
+        try:
+            import vocal_sep as _vs
+            _stem = await asyncio.wait_for(
+                asyncio.to_thread(_vs.separate_vocals, audio_path,
+                                  cache_only=True),
+                timeout=120,
+            )
+        except Exception as e:
+            logger.info("[GAP-RESCUE] sin stem cacheado (%r) — uso la mezcla", e)
+
+        import lead_in as _li
+        nuevo, stats = await asyncio.to_thread(
+            _gr.rescue, segs, audio_path, stem_path=_stem, audio_duration=dur,
+            language=language or "es", lead_s=_li.lead_seconds(),
+            hold_s=_li.hold_seconds(),
+            asr_words=result.get("_asr_words"),
+        )
+        if stats.get("rescued_lines"):
+            result = dict(result)
+            result["segments"] = nuevo
+            logger.warning(
+                "[GAP-RESCUE] %d línea(s) rescatada(s) (%d hueco(s), %d "
+                "cartel(es) manchado(s) reemplazado(s)) usando %s job=%s",
+                stats["rescued_lines"], stats["gaps"],
+                stats.get("mismatch_replaced", 0), stats["source"], job_id)
+        elif stats.get("gaps"):
+            logger.info("[GAP-RESCUE] %d hueco(s) sin contenido recuperable "
+                        "(%s) job=%s", stats["gaps"], stats["skipped"], job_id)
+        if stats.get("skipped"):
+            # Siempre, aunque haya habido rescates: son los veredictos que
+            # el circuit breaker necesita para no contradecir al sondeo.
+            logger.info("[GAP-RESCUE] descartados: %s job=%s",
+                        stats["skipped"], job_id)
+        result.setdefault("postpass_stats", {})["gap_rescue"] = {
+            "gaps": stats.get("gaps", 0),
+            "rescued_lines": stats.get("rescued_lines", 0),
+            "skipped": stats.get("skipped", []),
+            "source": stats.get("source")}
+        return result
+    except Exception as e:
+        logger.warning("[GAP-RESCUE] wrapper declinó: %r (job=%s)", e, job_id)
+        return result
+    finally:
+        if _stem:
+            try:
+                os.unlink(_stem)
+            except OSError:
+                pass
+
+
+async def _maybe_word_vote(result, audio_path: str, job_id: str,
+                           language: str = "es"):
+    """Post-pass gateado (WORD_VOTE_ENABLED, default off): el audio corrige
+    a la referencia palabra por palabra, la referencia aporta la ortografía.
+
+    El testigo TIENE que ser independiente: el ASR principal se ceba con la
+    letra de referencia como prompt y hereda sus errores (el mix-ASR primed
+    oyó "estaciones" donde se canta "canciones"). Por eso el testigo es un
+    whisper-1 SIN prompt sobre el stem cacheado — sin stem, se declina
+    entero (votar con un testigo sesgado es peor que no votar).
+
+    Validado contra el job real: corrige exactamente las 3 palabras en las
+    que Rotor nos ganaba (canciones, embriagué, "Cuando…mi vida") y las
+    inserciones quedan con review=True para el operador. Never raises."""
+    if not isinstance(result, dict):
+        return result
+    _stem = None
+    try:
+        import word_vote as _wv
+        if not _wv.is_enabled():
+            return result
+        segs = result.get("segments") or []
+        if len(segs) < 3 or not audio_path or not os.path.exists(audio_path):
+            return result
+        import vocal_sep as _vs
+        _stem = await asyncio.wait_for(
+            asyncio.to_thread(_vs.separate_vocals, audio_path,
+                              cache_only=True),
+            timeout=120,
+        )
+        if not _stem:
+            logger.info("[WORD-VOTE] sin stem cacheado — declino (el "
+                        "testigo debe ser independiente) job=%s", job_id)
+            return result
+        from pipeline import _audio_duration
+        dur = await asyncio.to_thread(_audio_duration, audio_path)
+        from gap_rescue import _transcribe_window
+        witness = await asyncio.to_thread(
+            _transcribe_window, _stem, 0.0, float(dur or 600.0),
+            language or "es",
+        )
+        nuevo, stats = _wv.vote(segs, witness)
+        if stats.get("lines_changed"):
+            result = dict(result)
+            result["segments"] = nuevo
+            logger.info(
+                "[WORD-VOTE] %d sustitución(es) + %d inserción(es) en %d "
+                "línea(s) — el stem contradijo a la referencia job=%s",
+                stats["substitutions"], stats["insertions"],
+                stats["lines_changed"], job_id)
+        result.setdefault("postpass_stats", {})["word_vote"] = {
+            k: v for k, v in stats.items() if k != "declined"}
+        return result
+    except Exception as e:  # nunca romper la transcripción
+        logger.warning("[WORD-VOTE] wrapper declinó: %r (job=%s)", e, job_id)
+        return result
+    finally:
+        if _stem:
+            try:
+                os.unlink(_stem)
+            except OSError:
+                pass
+
+
+def _maybe_chorus_snap(result, job_id: str):
+    """Post-pass gateado (CHORUS_SNAP_ENABLED, default off): en zonas de coro
+    repetido, repara los fragmentos mal cortados a la frase canónica del
+    grupo. Rotor gana en el outro porque estampa la frase del coro limpia en
+    cada repetición en vez de confiar palabra-por-palabra en un ASR que
+    patina sobre voz enterrada; esto hace lo mismo con repetition_group.
+    Corre DESPUÉS de gap_rescue/word_vote (repara lo que ellos dejaron) y
+    ANTES del segmentador. Puro, sync, never raises."""
+    if not isinstance(result, dict):
+        return result
+    try:
+        import chorus_snap as _cs
+        if not _cs.is_enabled():
+            return result
+        segs = result.get("segments") or []
+        if len(segs) < 3:
+            return result
+        nuevo, stats = _cs.snap(segs)
+        if stats.get("snapped") or stats.get("merged"):
+            result = dict(result)
+            result["segments"] = nuevo
+            logger.info(
+                "[CHORUS-SNAP] %d fragmento(s) del coro reparados, %d "
+                "órfano(s) absorbidos (grupos=%d) job=%s",
+                stats["snapped"], stats["merged"], stats["groups"], job_id)
+            result.setdefault("postpass_stats", {})["chorus_snap"] = stats
+        return result
+    except Exception as e:
+        logger.warning("[CHORUS-SNAP] wrapper declinó: %r (job=%s)", e, job_id)
+        return result
+
+
+def _maybe_phrase_segment(result, job_id: str):
+    """Post-pass gateado (PHRASE_SEGMENTER_ENABLED, default off): re-corta
+    los carteles largos en frases de ~6 palabras por DP sobre word-stamps
+    (nuestros carteles medían 11-38 palabras vs ~5,8 de Rotor). Corre
+    DESPUÉS de repetition_reconcile (necesita líneas enteras con membresía
+    final) y ANTES del formatter. Re-anota repetition_group porque los
+    grupos cambian al partir. Puro y sync. Never raises."""
+    if not isinstance(result, dict):
+        return result
+    try:
+        import phrase_segmenter as _ps
+        if not _ps.is_enabled():
+            return result
+        segs = result.get("segments") or []
+        if not segs:
+            return result
+        import lead_in as _li
+        nuevo = _ps.resegment(segs, lead_s=_li.lead_seconds(),
+                              hold_s=_li.hold_seconds())
+        if len(nuevo) != len(segs):
+            from chorus_trim import mark_repetitions as _mr
+            nuevo = _mr(nuevo)
+            _pal = sorted(len((s.get("text") or "").split())
+                          for s in nuevo if isinstance(s, dict))
+            result = dict(result)
+            result["segments"] = nuevo
+            logger.info(
+                "[PHRASE-SEG] %d → %d carteles (mediana %d pal/cartel) "
+                "job=%s", len(segs), len(nuevo),
+                _pal[len(_pal) // 2] if _pal else 0, job_id)
+            result.setdefault("postpass_stats", {})["phrase_seg"] = {
+                "before": len(segs), "after": len(nuevo)}
+        return result
+    except Exception as e:  # nunca romper la transcripción
+        logger.warning("[PHRASE-SEG] wrapper declinó: %r (job=%s)", e, job_id)
+        return result
 
 
 async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
@@ -5470,6 +5761,40 @@ async def _run_transcription_for_job(
                 out["coverage_warning"] = True
             if extra:
                 out.update(extra)
+
+            # Cobertura contra el AUDIO en el punto de salida de la cascada.
+            # Toda métrica previa se mide contra la letra de REFERENCIA y por
+            # eso SUBE cuando la referencia viene recortada (un job reportaba
+            # 100 % teniendo el 39 % del canto sin letra). Ésta sólo puede
+            # bajar si se pierde canto. Se mide en el único exit point, así
+            # queda registrada para TODAS las ramas — no dentro de una sola,
+            # que fue el error de diagnóstico original.
+            #
+            # Sólo observabilidad: no gatea ni altera el resultado. Las
+            # palabras crudas viajan en `_asr_words` para que el worker pueda
+            # re-medir tras los post-pases (CTC / adlib / formatter) y
+            # atribuir la pérdida a la etapa que la produjo.
+            try:
+                _asr_words = [w for s in (_wx_segs or [])
+                              for w in (s.get("words") or [])
+                              if isinstance(w, dict)]
+            except NameError:
+                _asr_words = []
+            if _asr_words:
+                try:
+                    from audio_coverage import summarize as _cov_summary
+                    _c = _cov_summary(polished, _asr_words)
+                    out["audio_coverage"] = _c["audio_coverage"]
+                    out["_asr_words"] = _asr_words
+                    _log = (logger.warning if _c["audio_coverage"] < 0.8
+                            else logger.info)
+                    _log("[COVERAGE] cascada source=%s cobertura_audio=%.0f%% "
+                         "zonas_sin_letra=%d (%.1fs, peor %.1fs) job=%s",
+                         source, _c["audio_coverage"] * 100,
+                         _c["uncovered_spans"], _c["uncovered_seconds"],
+                         _c["worst_span_s"], job_id)
+                except Exception as e:  # nunca romper la transcripción
+                    logger.warning("[COVERAGE] no se pudo medir: %r", e)
             return out
 
         async def _get_align_audio() -> str:
@@ -7757,6 +8082,9 @@ async def generate_with_segments(
     background_hint: str = Form("", max_length=2000),
     bg_verbatim: bool = Form(False),
     custom_colors: str = Form("", max_length=200),
+    # Batch-only canonical visual contract. Empty keeps the legacy individual
+    # form fields unchanged; non-empty is validated and takes precedence.
+    render_profile: str = Form("", max_length=4000),
     # Add-on premium "Escenas" (multi-escena). Opt-in del operador en el
     # wizard. La ELEGIBILIDAD se chequea contra has_scenes_access ANTES de
     # forwardearlo al pipeline (un usuario sin acceso que mande el flag igual
@@ -7798,6 +8126,26 @@ async def generate_with_segments(
         callers that bypassed /transcribe. Streams the file in like before.
     """
     job_id = (job_id or "").strip()
+    try:
+        _render_profile = normalize_render_profile(render_profile)
+    except RenderProfileError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if _render_profile:
+        # A batch profile is the signed-off visual contract.  Keep the legacy
+        # form fields for old clients, but let the canonical object win when
+        # it is present so retries cannot drift from the manifest.
+        _profile_fields = pipeline_fields(_render_profile)
+        style = _profile_fields["style"]
+        font = _profile_fields["font"]
+        genre = _profile_fields["genre"]
+        concept = _profile_fields["concept"]
+        movement_style = _profile_fields["movement_style"]
+        effect = _profile_fields["effect"]
+        text_case = _profile_fields["text_case"]
+        font_scale = str(_profile_fields["font_scale"])
+        line_transition = _profile_fields["line_transition"]
+        if _render_profile.get("background_id") is not None:
+            background_id = _render_profile["background_id"]
     reuse = bool(job_id)
     try:
         segments = json.loads(segments_json)
@@ -8053,6 +8401,13 @@ async def generate_with_segments(
         except Exception as _e:
             logger.warning("[ART] could not persist art_track render_param: %s", _e)
 
+    if _render_profile:
+        try:
+            from jobs import merge_render_params
+            merge_render_params(job_id, {"render_profile": _render_profile})
+        except Exception as _e:
+            logger.warning("[BATCH] could not persist render_profile: %s", _e)
+
     mp3_path = os.path.join(job_dir, existing_filename)
 
     if reuse:
@@ -8250,6 +8605,7 @@ async def generate_with_segments(
         # only). The pipeline skips transcription + AI background.
         art_track=art_track,
         label_line=(label_line or "").strip() if art_track else "",
+        render_profile=_render_profile,
     )
 
     return {"job_id": job_id, "status": initial_status}
@@ -8555,6 +8911,25 @@ def list_jobs(
     db: Session = Depends(get_db),
 ):
     return get_all_jobs(db, **_job_scope(current_user))
+
+
+@app.get("/batch/jobs/{job_id}")
+def batch_job_status(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Scoped detail endpoint for the resumable batch runner.
+
+    It intentionally lives under ``/batch`` so it cannot shadow the legacy
+    ``/jobs/{job_id}/...`` media routes.  No delivery or portal mutation is
+    performed; the response is read-only and includes render_params/files so
+    the runner can build its scoreboard.
+    """
+    row = get_job(db, job_id, **_job_scope(current_user))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return row
 
 
 @app.delete("/jobs/{job_id}")
@@ -9388,6 +9763,20 @@ class EditJobRequest(BaseModel):
     # 2026-07-08, job eaff5c7baf50: 3 regens sin control y sin salida a
     # biblioteca). Required for that edit_type; ignored otherwise.
     background_id: int | None = Field(default=None)
+    # Fondo subido por el operador para edit_type=="custom": restaura en el
+    # wizard de EDICIÓN la opción "Subir el mío" que #970 ocultó (el backend
+    # /edit no tenía este edit_type → no-op silencioso). El body de /edit es
+    # JSON y no puede transportar bytes, así que el browser sube el archivo a
+    # R2 vía POST /edit/{job}/custom-background (multipart) y manda acá la key
+    # devuelta. El worker la baja y la usa tal cual (human-provided) o —si
+    # animate_image y es imagen fija— la anima con Veo image-to-video (mismo
+    # seam que create-time). Requerido para ese edit_type; ignorado si no.
+    custom_background_r2_key: str | None = Field(default=None, max_length=512)
+    # "Animar con AI" sobre la imagen subida (solo imágenes fijas). Espeja el
+    # flag animate_image de /generate. Provenance: la imagen animada por Veo
+    # se clasifica como AI-derived (aplica validación Universal), igual que en
+    # create-time (_background_source_is_ai animate_image=True → True).
+    animate_image: bool = Field(default=False)
     # FX layer + lyric animations chosen in the wizard. Added 2026-05-22:
     # antes el operador no podía cambiarlos post-upload y, peor, los
     # whitelists de /retry y /variant los descartaban silenciosamente.
@@ -10463,6 +10852,87 @@ async def reanchor_segments(
     }
 
 
+@app.post("/edit/{job_id}/custom-background")
+@limiter.limit("30/minute")
+async def upload_edit_custom_background(
+    request: Request,
+    job_id: str,
+    background_file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Sube un fondo custom para un job en pending_review y devuelve su R2 key.
+
+    Paso multipart previo al POST /edit/{job_id} con edit_type="custom".
+    El body de /edit es JSON y no puede llevar bytes, así que el browser
+    primero sube el archivo acá (mismo mecanismo que create-time:
+    _save_custom_background valida extensión + magic-bytes + tamaño y lo
+    guarda en inputs/{tenant}/{job}/bg_custom.*), recibe la key y la manda
+    en custom_background_r2_key. NO toca bg_r2_key_cached (persist_cache=
+    False): ese fondo recién pasa a ser el durable cuando el edit
+    re-renderiza y valida.
+
+    Restaura la opción "Subir el mío" que #970 ocultó en el wizard de
+    edición porque el backend no la soportaba.
+    """
+    from database import Job as JobModel
+
+    _q = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        _q = _q.filter(JobModel.tenant_id == current_user["tenant_id"])
+    job = _q.first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    _audit_cross_tenant_access(db, current_user, job, "edit")
+    if job.status != "pending_review":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Custom background upload requires the job to be in "
+                f"pending_review (current: {job.status})"
+            ),
+        )
+    # Mismo guard que background/background_library: un fondo único pisaría
+    # el timeline multi-escena cacheado (ver request_edit / incidente
+    # 2026-07-01).
+    _sp = job.scene_plan if isinstance(job.scene_plan, dict) else None
+    if _sp and _sp.get("scenes"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Este video usa Escenas: regenerá la escena desde el "
+                "filmstrip en vez de subir un fondo único."
+            ),
+        )
+    if not storage.is_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="Los fondos custom requieren object storage (R2).",
+        )
+
+    _job_dir = os.path.join(OUTPUTS_DIR, job_id)
+    os.makedirs(_job_dir, exist_ok=True)
+    # tenant del JOB (no del caller): un admin de plataforma editando el
+    # job de otro tenant debe dejar el archivo bajo el namespace del dueño,
+    # para que la key valide contra inputs/{job.tenant_id}/{job}/ en /edit.
+    _bg_path, _bg_r2_key = _save_custom_background(
+        background_file, _job_dir, job_id, job.tenant_id, persist_cache=False,
+    )
+    if not _bg_r2_key:
+        raise HTTPException(
+            status_code=503,
+            detail="No se pudo subir el fondo custom a storage.",
+        )
+    logger.info("[EDIT] custom bg subido job=%s key=%s por user=%s",
+                job_id, _bg_r2_key, current_user["id"])
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "bg_r2_key": _bg_r2_key,
+        "filename": _safe_basename(background_file.filename or ""),
+    }
+
+
 @app.post("/edit/{job_id}")
 async def request_edit(
     job_id: str,
@@ -10535,7 +11005,7 @@ async def request_edit(
                 "progress": job.progress,
             },
         )
-    valid_edit_types = ("typography", "background", "background_library", "lyrics", "metadata")
+    valid_edit_types = ("typography", "background", "background_library", "lyrics", "metadata", "custom")
     if body.edit_type not in valid_edit_types:
         raise HTTPException(
             status_code=400,
@@ -10546,6 +11016,14 @@ async def request_edit(
             status_code=400,
             detail="background_library edit requires 'background_id'.",
         )
+    if body.edit_type == "custom" and not body.custom_background_r2_key:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "custom edit requires 'custom_background_r2_key' "
+                "(subí el archivo con POST /edit/{job_id}/custom-background primero)."
+            ),
+        )
     # Escenas (incidente 2026-07-01, job 53b9513225b1): el edit "background"
     # es del mundo fondo-único — para un job multi-escena generaba UN clip
     # Veo de 8 s, PISABA bg_r2_key_cached (que era el timeline completo) y
@@ -10553,8 +11031,8 @@ async def request_edit(
     # correcto para estos jobs es la regeneración por escena del filmstrip
     # (edit_type="scene" vía /edit-scene, no consume cupo de edición).
     # background_library comparte el guard: un asset único también pisaría
-    # el timeline multi-escena cacheado.
-    if body.edit_type in ("background", "background_library"):
+    # el timeline multi-escena cacheado. custom (fondo subido) idem.
+    if body.edit_type in ("background", "background_library", "custom"):
         _sp = job.scene_plan if isinstance(job.scene_plan, dict) else None
         if _sp and _sp.get("scenes"):
             raise HTTPException(
@@ -10649,7 +11127,13 @@ async def request_edit(
     # para quien ya quemó sus regens sin converger — si consumiera slot,
     # seguiría atrapado. AuditLog registra igual (edit_type en detail).
     _library_swap = body.edit_type == "background_library"
-    if (not _is_admin and not _metadata_only and not _library_swap
+    # Fondo custom SIN animar = swap $0 (misma clase que la biblioteca):
+    # no consume slot, es una salida de emergencia para quien ya quemó sus
+    # regens. Custom CON "Animar con AI" sí pasa por Veo (~$0.50) → consume
+    # slot como un background regen normal.
+    _custom_as_is = body.edit_type == "custom" and not body.animate_image
+    _no_slot = _metadata_only or _library_swap or _custom_as_is
+    if (not _is_admin and not _no_slot
             and current_edit_count >= _MAX_EDITS):
         raise HTTPException(
             status_code=400,
@@ -11011,11 +11495,29 @@ async def request_edit(
             "asset_id": _lib_asset_id,
         }
 
+    if body.edit_type == "custom":
+        # SEGURIDAD: la key llega en el body del cliente. Validar que
+        # pertenece a ESTE job/tenant (prefijo inputs/{tenant}/{job}/) antes
+        # de que el worker la baje — sin esto un cliente podría apuntar a un
+        # objeto de otro tenant y hornearlo en su propio video. El endpoint
+        # de subida guarda bajo inputs/{job.tenant_id}/{job}/bg_custom.*.
+        from storage import _safe_filename as _r2_safe
+        _expected_prefix = f"inputs/{_r2_safe(job.tenant_id)}/{_r2_safe(job_id)}/"
+        if not (body.custom_background_r2_key or "").startswith(_expected_prefix):
+            raise HTTPException(
+                status_code=400,
+                detail="custom_background_r2_key no pertenece a este job.",
+            )
+        edit_params["custom_bg"] = {
+            "bg_r2_key": body.custom_background_r2_key,
+            "animate_image": bool(body.animate_image),
+        }
+
     # PR C 2026-05-26: metadata edits do NOT bump edit_count (see
     # rationale at the edit-cap gate above). All other types still
     # consume a slot.
     new_edit_count = (
-        current_edit_count if (_metadata_only or _library_swap)
+        current_edit_count if _no_slot
         else current_edit_count + 1
     )
 
@@ -11068,8 +11570,14 @@ async def request_edit(
     job.edit_count = new_edit_count
     # Both typography and lyrics edits jump straight into the video
     # compositing step (cached bg reused). Only background edit goes
-    # back through Veo, which is the `background` step.
-    job.current_step = "background" if body.edit_type == "background" else "video"
+    # back through Veo, which is the `background` step. Un fondo custom
+    # ANIMADO también corre Veo (image-to-video); tal cual va directo a
+    # video (sin costo IA).
+    _custom_animates = body.edit_type == "custom" and bool(body.animate_image)
+    job.current_step = (
+        "background" if (body.edit_type == "background" or _custom_animates)
+        else "video"
+    )
     job.progress = 0
     # Stamp the moment editing began so the reaper can spot edits that
     # died mid-render (worker killed by Railway deploy / OOM / crash).
@@ -11891,6 +12399,201 @@ async def retry_job(
         "job_id": job_id,
         "preserved_lyrics": segments_override is not None,
         "preserved_background": preserved_bg_r2_key is not None,
+    }
+
+
+@app.post("/jobs/{job_id}/edit-art-track")
+async def edit_art_track(
+    job_id: str,
+    background_file: UploadFile = File(None),
+    effect: str = Form(""),
+    song_title: str = Form(None),
+    artist: str = Form(None),
+    label_line: str = Form("", max_length=120),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Editar un Art Track ya generado sin rehacerlo desde cero: cambiar la
+    portada (cover), el efecto de partículas, el título/artista y la línea
+    legal ℗/©, y re-renderizar.
+
+    Los art tracks son un composite ffmpeg determinístico y barato (~14-42s),
+    así que la edición es un re-render completo vía `run_pipeline(art_track=True)`
+    —el mismo camino que /retry— reusando el audio de R2 (input_r2_key) y la
+    portada cacheada (bg_r2_key_cached) salvo que se suba una nueva. NO consume
+    cuota ni crédito (igual que /retry): la edición es gratis.
+
+    Multipart (no JSON) para poder recibir una portada nueva opcional. Todos
+    los campos son opcionales; el panel del front manda el estado completo
+    pre-cargado, así que el valor recibido es autoritativo (un `effect`/
+    `label_line` vacío = limpiar). La portada solo se reemplaza si viene un
+    archivo nuevo; si no, se reusa la actual.
+    """
+    from database import Job as JobModel, AuditLog
+    from jobs import merge_render_params
+
+    job = (
+        db.query(JobModel)
+        .filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Solo art tracks. Un job de lyric video no debe caer acá (se re-rendería
+    # sin letra). El marker vive en render_params.art_track.
+    if not bool((job.render_params or {}).get("art_track")):
+        raise HTTPException(
+            status_code=400,
+            detail="This endpoint only edits Art Track jobs.",
+        )
+
+    # Re-gate de la feature con el acceso ACTUAL del usuario (igual que
+    # /generate y /retry): un tenant al que se le sacó el acceso no sigue
+    # editando art tracks.
+    if not has_art_track_access(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Art Track no está habilitado para tu cuenta.",
+        )
+
+    # Estados editables = los mismos que habilitan el panel de edición en el
+    # front (JobDetail.canEditLyrics): revisión pendiente / listo / rechazado.
+    # No se edita mientras se procesa o si falló (para eso está /retry).
+    if job.status not in ("pending_review", "done", "rejected"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Art track cannot be edited from status '{job.status}'.",
+        )
+
+    # El re-render necesita el audio original en R2 (no se re-sube).
+    if not job.input_r2_key:
+        raise HTTPException(
+            status_code=422,
+            detail="Source audio no longer available — please re-generate the video.",
+        )
+    try:
+        import storage as _storage
+        if _storage.is_enabled() and not _storage.object_exists(job.input_r2_key):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "El audio original ya no está en storage. "
+                    "Volvé a generar el video."
+                ),
+            )
+    except HTTPException:
+        raise
+    except Exception as _exc:
+        logger.warning(
+            "[ART-EDIT] R2 pre-check failed for %s key=%r — proceeding: %s",
+            job_id, job.input_r2_key, _exc,
+        )
+
+    job_dir = os.path.join(OUTPUTS_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    # Portada: reemplazar solo si viene una nueva. _save_custom_background
+    # valida (imagen), sube a R2 y persiste bg_r2_key_cached. Si no viene
+    # archivo, reusamos el cover cacheado.
+    new_bg_r2_key = None
+    if background_file and background_file.filename:
+        if not background_file.filename.lower().endswith((".jpg", ".jpeg", ".png")):
+            raise HTTPException(
+                status_code=400,
+                detail="Art track cover must be an image (.jpg/.jpeg/.png).",
+            )
+        _bg_path, new_bg_r2_key = _save_custom_background(
+            background_file, job_dir, job_id, current_user["tenant_id"],
+        )
+    bg_r2_key = new_bg_r2_key or job.bg_r2_key_cached
+    if not bg_r2_key:
+        raise HTTPException(
+            status_code=422,
+            detail="No cover image on file — please upload a cover.",
+        )
+
+    # Persistir los ejes editables en render_params (autoritativo: vacío =
+    # limpiar). Así el re-render y cualquier /retry futuro los re-dibujan.
+    effect_val = (effect or "").strip()
+    label_val = (label_line or "").strip()
+    merge_render_params(job_id, {
+        "art_track": True,
+        "effect": effect_val,
+        "label_line": label_val,
+    })
+
+    # Título/artista viven en columnas; se actualizan solo si vinieron.
+    if song_title is not None:
+        job.song_title = song_title.strip()
+    if artist is not None:
+        job.artist = artist.strip()
+
+    # Reset del row a estado de re-render limpio (mismo patrón que /retry),
+    # para que los entregables viejos no queden pegados si el nuevo render
+    # produce menos archivos.
+    _previous_status = job.status
+    job.status = "editing"
+    job.current_step = "render"
+    job.progress = 0
+    job.error = None
+    job.validation_result = None
+    job.video_url = None
+    job.short_url = None
+    job.thumbnail_url = None
+    job.umg_master_url = None
+    job.umg_short_url = None
+    job.s3_keys = None
+    job.completed_at = None
+    job.approved_by = None
+    job.approved_at = None
+    job.last_progress_at = datetime.now(timezone.utc)
+
+    # Cancelar prewarms de ProRes de la corrida anterior (mismo hazard que
+    # /retry: publicarían un .mov viejo tras limpiar s3_keys).
+    try:
+        from queue_jobs import cancel_rq_job
+        for _ft in ("umg_master", "umg_short"):
+            cancel_rq_job(f"prewarm:{job_id}:{_ft}")
+    except Exception as _exc:
+        logger.warning("edit_art_track: prewarm cancel skipped for %s: %s", job_id, _exc)
+
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="job.edit_art_track",
+        detail={
+            "job_id": job_id,
+            "previous_status": _previous_status,
+            "cover_replaced": new_bg_r2_key is not None,
+            "effect": effect_val,
+        },
+    ))
+    db.commit()
+
+    enqueue_pipeline(
+        job_id=job_id,
+        mp3_path=None,
+        artist=job.artist,
+        style=job.style or "oscuro",
+        plan=current_user.get("plan", "100"),
+        tenant_id=current_user.get("tenant_id", ""),
+        delivery_profile=job.delivery_profile or "youtube",
+        input_r2_key=job.input_r2_key,
+        song_title=job.song_title or "",
+        umg_spec=job.umg_spec or {},
+        segments_override=job.segments_json if job.segments_json else None,
+        bg_r2_key=bg_r2_key,
+        art_track=True,
+        effect=effect_val,
+        label_line=label_val,
+    )
+
+    return {
+        "ok": True,
+        "status": "editing",
+        "job_id": job_id,
+        "cover_replaced": new_bg_r2_key is not None,
     }
 
 

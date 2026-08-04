@@ -192,6 +192,19 @@ def _phonetic_ratio(line_tokens: list[str], window_tokens: list[str]) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+# Gate texto-vs-audio del fallback best-effort (ANCHOR_TEXT_GATE_ENABLED,
+# default off). Umbral bajo a propósito: no busca calidad, busca descartar
+# solo lo INDEFENDIBLE — una línea cuyo texto ni siquiera suena a lo que se
+# canta en la ventana donde caería.
+_TEXT_GATE_MIN = 0.5
+
+
+def _text_gate_enabled() -> bool:
+    return os.environ.get(
+        "ANCHOR_TEXT_GATE_ENABLED", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
 def wordstamps_to_segments(
     wordstamps: list[dict], lyric_lines: list[str], *, max_tail_dur: float = 1.5,
     max_drift: int = 8, min_anchor_score: float = 0.5, drift_abort: int = 4,
@@ -279,7 +292,8 @@ def wordstamps_to_segments(
             if score > best_score:
                 best_score, best_start = score, st
 
-        if best_start < 0 or best_score < min_anchor_score:
+        anchored = not (best_start < 0 or best_score < min_anchor_score)
+        if not anchored:
             # Couldn't anchor this line — keep position (best effort) and
             # count it toward the drift-abort budget.
             best_start = min(cur, max(0, n_words - wc))
@@ -291,6 +305,29 @@ def wordstamps_to_segments(
             # Alignment has lost the plot for several lines running — bail so
             # the caller falls back rather than ship a drifting transcript.
             return []
+
+        if not anchored and _text_gate_enabled():
+            # Gate texto-vs-audio (ANCHOR_TEXT_GATE_ENABLED, default off).
+            # El fallback best-effort emite la línea EN LA POSICIÓN DEL
+            # CURSOR aunque ninguna ventana haya matcheado — así una línea
+            # de la estrofa 2 quedó pintada sobre el audio del estribillo
+            # (job 6f4047db: líneas en 92s/104s con 0 % de coincidencia
+            # contra lo cantado), dejando vacío su lugar real, que la
+            # recuperación de huecos rellenó después → texto duplicado en
+            # pantalla. Antes de emitir una línea no-anclada, medimos si su
+            # texto al menos SUENA a las palabras de la ventana donde va a
+            # caer; si ni eso, se descarta — la zona queda como hueco y la
+            # recuperación de huecos la cubre con lo que realmente se canta.
+            # El strike de drift ya quedó contado: el presupuesto de abort
+            # no cambia.
+            _win = [t for t in norm_words[best_start:best_start + wc] if t]
+            if _win and _phonetic_ratio(line_tokens, _win) < _TEXT_GATE_MIN:
+                logger.info(
+                    "[FA] text-gate: línea %r no suena a la ventana donde "
+                    "caería — descartada en vez de emitida mal ubicada",
+                    line[:48],
+                )
+                continue
 
         span = wordstamps[best_start:best_start + wc]
         if not span:

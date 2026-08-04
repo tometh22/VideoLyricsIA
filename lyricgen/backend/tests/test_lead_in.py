@@ -57,8 +57,8 @@ def test_words_untouched():
 
 
 def test_env_parsing(monkeypatch):
-    monkeypatch.setenv("LYRIC_LEAD_IN_S", "0.4")
-    assert lead_in.lead_seconds() == 0.4
+    monkeypatch.setenv("LYRIC_LEAD_IN_S", "0.1")
+    assert lead_in.lead_seconds() == 0.1
     monkeypatch.setenv("LYRIC_LEAD_IN_S", "-1")
     assert lead_in.lead_seconds() == 0.0
     monkeypatch.setenv("LYRIC_LEAD_IN_S", "banana")
@@ -98,15 +98,15 @@ def test_hold_never_shortens():
 
 
 def test_polish_composes_lead_then_hold(monkeypatch):
-    """El tope del hold usa el start YA adelantado: con lead 0.4, la línea
-    siguiente arranca antes, y el hold no puede pisarla."""
-    monkeypatch.setenv("LYRIC_LEAD_IN_S", "0.4")
+    """El tope del hold usa el start YA adelantado: con lead activo, la
+    línea siguiente arranca antes, y el hold no puede pisarla."""
+    monkeypatch.setenv("LYRIC_LEAD_IN_S", "0.15")
     monkeypatch.setenv("LYRIC_HOLD_S", "0.25")
-    segs = [{"start": 10.0, "end": 13.5, "text": "a"},
+    segs = [{"start": 10.0, "end": 13.7, "text": "a"},
             {"start": 14.0, "end": 16.0, "text": "b"}]
     out = lead_in.polish(segs)
-    assert out[1]["start"] == 13.6         # lead aplicado (14.0-0.4)
-    assert out[0]["end"] == 13.59          # hold topeado en el start NUEVO
+    assert out[1]["start"] == 13.85        # lead aplicado (14.0-0.15)
+    assert out[0]["end"] == 13.84          # hold topeado en el start NUEVO
     assert out[0]["end"] < out[1]["start"]
 
 
@@ -115,3 +115,17 @@ def test_hold_env_parsing(monkeypatch):
     assert lead_in.hold_seconds() == 0.25
     monkeypatch.setenv("LYRIC_HOLD_S", "nope")
     assert lead_in.hold_seconds() == 0.0
+
+
+def test_lead_clampeado_al_tope(monkeypatch, caplog):
+    """0.4 en staging fue el footgun: leads grandes se perciben como
+    desincronización (ver _MAX_LEAD_S). Arriba del tope se clampea."""
+    import lead_in
+    monkeypatch.setenv("LYRIC_LEAD_IN_S", "0.4")
+    assert lead_in.lead_seconds() == lead_in._MAX_LEAD_S
+
+
+def test_lead_bajo_el_tope_pasa_intacto(monkeypatch):
+    import lead_in
+    monkeypatch.setenv("LYRIC_LEAD_IN_S", "0.08")
+    assert lead_in.lead_seconds() == 0.08

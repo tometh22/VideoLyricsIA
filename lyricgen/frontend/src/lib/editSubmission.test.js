@@ -280,6 +280,7 @@ describe("prioridad de edit_type", () => {
 
   it("el orden de prioridad es el que el backend espera", () => {
     expect(EDIT_TYPE_PRIORITY).toEqual([
+      "custom",
       "background_library",
       "background",
       "lyrics",
@@ -533,5 +534,79 @@ describe("backgroundEditBlockedReason: se sabe ANTES de tocar nada", () => {
       }).blocked?.reason;
       expect(alEnviar).toBe(anticipado);
     }
+  });
+});
+
+describe("custom: fondo subido en el wizard de edición (restaurado tras #970)", () => {
+  // El File no viaja en el diff: buildEditCurrent recibe bgSelectMode="custom"
+  // + un backgroundFile y emite el marcador editCustomBg; App.jsx sube el
+  // archivo a R2 aparte e inyecta custom_background_r2_key en el payload.
+  const fakeFile = { name: "mi-foto.jpg" };
+  const customCurrent = (job, opts = {}) =>
+    buildEditCurrent(reviewFrom(job), {
+      editedSegments: JSON.parse(JSON.stringify(job.segments_json || [])),
+      bgSelectMode: "custom",
+      backgroundId: null,
+      backgroundFile: "backgroundFile" in opts ? opts.backgroundFile : fakeFile,
+      animateImage: opts.animateImage ?? false,
+    });
+
+  it("un archivo subido emite el bucket custom con edit_type='custom'", () => {
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    const out = resolveEditSubmission({
+      baseline, current: customCurrent(JOB_FULL),
+      jobStatus: "pending_review",
+    });
+    expect(out.editType).toBe("custom");
+    expect(out.payload.edit_type).toBe("custom");
+    expect(out.payload.animate_image).toBe(false);
+  });
+
+  it("propaga el flag animate_image cuando el operador pide 'Animar con AI'", () => {
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    const out = resolveEditSubmission({
+      baseline, current: customCurrent(JOB_FULL, { animateImage: true }),
+      jobStatus: "pending_review",
+    });
+    expect(out.payload.animate_image).toBe(true);
+  });
+
+  it("sin archivo NO emite bucket custom (volver a Auto/Library lo anula)", () => {
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    const out = resolveEditSubmission({
+      baseline, current: customCurrent(JOB_FULL, { backgroundFile: null }),
+      jobStatus: "pending_review",
+    });
+    expect(out.presentBuckets).not.toContain("custom");
+  });
+
+  it("supersede un regen de fondo IA (subir tu foto gana sobre 'otra versión')", () => {
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    const current = {
+      ...customCurrent(JOB_FULL),
+      forceBackgroundRegen: true,
+    };
+    const diff = computeFieldDiff(baseline, current);
+    expect(diff.custom).toBeTruthy();
+    expect(diff.background).toBeUndefined();
+    expect(diff.background_library).toBeUndefined();
+  });
+
+  it("se bloquea en un job ya aprobado (exige pending_review, como background)", () => {
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    const out = resolveEditSubmission({
+      baseline, current: customCurrent(JOB_FULL),
+      jobStatus: "done",
+    });
+    expect(out.blocked?.reason).toBe("status");
+  });
+
+  it("se bloquea en un job multi-escena (el fondo es un timeline)", () => {
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    const out = resolveEditSubmission({
+      baseline, current: customCurrent(JOB_FULL),
+      jobStatus: "pending_review", scenePlan: { scenes: [{ k: 1 }] },
+    });
+    expect(out.blocked?.reason).toBe("scenes");
   });
 });

@@ -39,6 +39,133 @@ import os
 logger = logging.getLogger("genly.transcription_worker")
 
 
+# ── Cobertura contra el audio, por etapa ──────────────────────────────────
+#
+# La cascada deja en el result su propia cobertura (`audio_coverage`) y el
+# stream de palabras del ASR (`_asr_words`, transporte interno). Acá volvemos
+# a medir DESPUÉS de los post-pases, porque dos de ellos pueden sacar líneas
+# (el filtro de ad-libs borra la cola; el formateador reescribe textos) y
+# ninguno actualiza `timing_source`. Sin esta medición por etapa no se puede
+# atribuir la pérdida — que es exactamente lo que bloqueó el diagnóstico del
+# job b3a51559: llegó al editor con 2 carteles vacíos y una línea duplicada y
+# no había forma de saber qué etapa los produjo.
+#
+# Sólo observabilidad: no altera el resultado.
+
+def _coverage_de(r) -> float | None:
+    """Cobertura del audio del result actual, o None si no se puede medir."""
+    if not isinstance(r, dict):
+        return None
+    words = r.get("_asr_words")
+    if not words:
+        return None
+    try:
+        from audio_coverage import audio_coverage
+        return audio_coverage(r.get("segments") or [], words)
+    except Exception:
+        return None
+
+
+def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
+                           audio_path: str = ""):
+    """Loguea la cobertura final y la compara con la de la cascada y la
+    previa al formateador. Saca `_asr_words` del result (transporte interno:
+    no se persiste ni llega al cliente). Nunca levanta.
+
+    Con `audio_path` y stem cacheado disponible, agrega el guardrail
+    definitivo `voiced_gaps`: huecos entre carteles cruzados contra el VAD
+    del stem. Es la métrica que la cobertura por palabras no puede dar — un
+    punto sordo del ASR le es invisible (dcf773b5 reportó zonas_sin_letra=0
+    con 30,7s de canto sin cartel en pantalla)."""
+    if not isinstance(r, dict):
+        return r
+    _stem = None
+    try:
+        words = r.get("_asr_words")
+        if words:
+            from audio_coverage import summarize
+            _dur = None
+            if audio_path and os.path.exists(audio_path):
+                try:
+                    from pipeline import _audio_duration
+                    _dur = _audio_duration(audio_path)
+                    import vocal_sep as _vs
+                    _stem = _vs.separate_vocals(audio_path, cache_only=True)
+                except Exception as e:
+                    logger.info("[COVERAGE] sin stem para voiced_gaps (%r)", e)
+            # Veredictos del sondeo con ASR: gap_rescue mide PALABRAS, la
+            # única evidencia real de letra faltante. El breaker no puede
+            # acusar un hueco que aquél ya descartó (batch 30-07: 8 de 8
+            # zonas acusadas por energía eran fuga de guitarra/vientos).
+            _skip = ((r.get("postpass_stats") or {})
+                     .get("gap_rescue", {}).get("skipped") or [])
+            c = summarize(r.get("segments") or [], words,
+                          stem_path=_stem, audio_duration=_dur,
+                          rescue_skipped=_skip)
+            cascada = r.get("audio_coverage")
+            final = c["audio_coverage"]
+            r["audio_coverage"] = final
+            r.setdefault("postpass_stats", {})["coverage_final"] = c
+            log = logger.warning if final < 0.8 else logger.info
+            log("[COVERAGE] final=%.0f%% (cascada=%s, pre-formatter=%s) "
+                "zonas_sin_letra=%d (%.1fs, peor %.1fs) "
+                "carteles_texto_equivocado=%d huecos_con_voz=%d (%.1fs) job=%s",
+                final * 100,
+                f"{cascada * 100:.0f}%" if cascada is not None else "?",
+                f"{antes_fmt * 100:.0f}%" if antes_fmt is not None else "?",
+                c["uncovered_spans"], c["uncovered_seconds"],
+                c["worst_span_s"], c.get("text_mismatches", 0),
+                c.get("voiced_gaps", 0), c.get("voiced_gap_s", 0.0), job_id)
+            # Circuit breaker: canto sin cartel según el VAD del stem → el
+            # job sale con bandera, nunca en silencio. Peor caso acotado.
+            _warn_s = float(os.environ.get("VOICED_GAP_WARN_S", "10"))
+            if c.get("voiced_gap_s", 0.0) >= _warn_s:
+                r["coverage_warning"] = True
+                r["voiced_gap_s"] = c["voiced_gap_s"]
+                logger.warning(
+                    "[COVERAGE] CIRCUIT BREAKER: %.1fs de CANTO sin cartel "
+                    "según el VAD del stem — el job sale marcado para "
+                    "revisión, no en silencio job=%s",
+                    c["voiced_gap_s"], job_id)
+            # Carteles que no dicen lo que se canta: la dimensión que la
+            # cobertura no ve (el usuario detectó a ojo 2 en un job con
+            # 76 % de cobertura). Detalle por línea para diagnóstico.
+            if c.get("text_mismatches"):
+                from audio_coverage import text_mismatches as _tm
+                for m in _tm(r.get("segments") or [], words)[:6]:
+                    logger.warning(
+                        "[COVERAGE] cartel #%d (%.1f-%.1fs) no suena a lo "
+                        "cantado ahí (ratio=%.2f) job=%s",
+                        m["index"], m["start"], m["end"], m["ratio"], job_id)
+            # Atribución explícita: qué etapa se comió el canto.
+            if cascada is not None and (cascada - final) > 0.02:
+                logger.warning(
+                    "[COVERAGE] los POST-PASES perdieron %.0f%% del canto "
+                    "(cascada %.0f%% → final %.0f%%) job=%s",
+                    (cascada - final) * 100, cascada * 100, final * 100, job_id)
+            if antes_fmt is not None and (antes_fmt - final) > 0.02:
+                logger.warning(
+                    "[COVERAGE] el FORMATTER perdió %.0f%% del canto job=%s",
+                    (antes_fmt - final) * 100, job_id)
+            # Carteles vacíos: el defecto que no se pudo explicar en b3a51559.
+            vacios = sum(1 for s in (r.get("segments") or [])
+                         if isinstance(s, dict) and not (s.get("text") or "").strip())
+            if vacios:
+                logger.warning("[COVERAGE] %d segmento(s) con TEXTO VACÍO "
+                               "en la salida final job=%s", vacios, job_id)
+    except Exception as e:
+        logger.warning("[COVERAGE] medición final falló: %r job=%s", e, job_id)
+    finally:
+        if isinstance(r, dict):
+            r.pop("_asr_words", None)
+        if _stem:
+            try:
+                os.unlink(_stem)
+            except OSError:
+                pass
+    return r
+
+
 def run_transcription_job(
     job_id: str,
     audio_path: str,
@@ -67,7 +194,9 @@ def run_transcription_job(
     # que es lo que queremos (jobs independientes, sin event-loop leak).
     from main import (  # type: ignore
         _looks_live, _maybe_anchor_align, _maybe_ctc_retime,
-        _maybe_adlib_filter, _run_transcription_for_job,
+        _maybe_adlib_filter, _maybe_chorus_snap, _maybe_gap_rescue,
+        _maybe_phrase_segment, _maybe_repetition_reconcile, _maybe_word_vote,
+        _run_transcription_for_job,
     )
     from jobs import update_job, get_job
     import storage
@@ -136,8 +265,15 @@ def run_transcription_job(
             r = await _maybe_adlib_filter(
                 r, audio_path, job_id,
                 live_hint=live or _looks_live(title, filename))
+            r = _maybe_repetition_reconcile(r, job_id)
+            r = await _maybe_gap_rescue(r, audio_path, job_id, language or "es")
+            r = await _maybe_word_vote(r, audio_path, job_id, language or "es")
+            r = _maybe_chorus_snap(r, job_id)
+            r = _maybe_phrase_segment(r, job_id)
             from lyrics_format import format_lyrics_pass as _fmt
-            return await _fmt(r, language=language or "es")
+            _antes = _coverage_de(r)
+            r = await _fmt(r, language=language or "es")
+            return _medir_cobertura_final(r, job_id, _antes, audio_path)
 
         result = asyncio.run(_run_with_retime())
     except Exception as e:
