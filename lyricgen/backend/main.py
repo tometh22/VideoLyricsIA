@@ -14266,6 +14266,7 @@ async def portal_get_items(
             "job_id": d.job_id,
             "label": d.label,
             "frame_size": d.frame_size_snapshot,
+            "added_at": d.added_at.isoformat() if d.added_at else None,
             "files": files,
             "preview_url": preview_url,
             "short_preview_url": short_preview_url,
