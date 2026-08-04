@@ -1,4 +1,4 @@
-# Post-deploy edit smoke — GO/NO-GO del golden path upload→render→edit.
+# Post-deploy edit smoke — GO/NO-GO del golden path R2→transcribe→render→edit.
 #
 # Por qué existe: el incidente UMG del 2026-07-09 (#853 deployó el ffmpeg-234
 # que rompía todos los edits de WAVs acentuados) estuvo 8 horas en prod hasta
