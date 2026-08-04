@@ -226,8 +226,11 @@ export function initSentry() {
       // is genuinely useless — don't pre-filter on speculation.
       ignoreErrors: [
         // Vite preload errors are handled by the reload-on-stale-bundle
-        // hook in main.jsx; don't double-alert.
+        // hook in main.jsx; don't double-alert. Cubrimos el chunk JS y su
+        // CSS asociado ("Unable to preload CSS for ...", Sentry #31) —
+        // ambos son la misma clase de deploy stale.
         /Failed to fetch dynamically imported module/i,
+        /Unable to preload CSS/i,
         // Browser extensions throw these on innocuous DOM mutations.
         /ResizeObserver loop limit exceeded/i,
         /ResizeObserver loop completed with undelivered notifications/i,
