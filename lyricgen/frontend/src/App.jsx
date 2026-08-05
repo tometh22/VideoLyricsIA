@@ -1,4 +1,5 @@
-import { useState, useRef, useCallback, useEffect, lazy, Suspense, useMemo } from "react";
+import { useState, useRef, useCallback, useEffect, Suspense, useMemo } from "react";
+import lazyWithReload from "./lazyWithReload";
 import {
   Routes, Route, Navigate, Outlet,
   useNavigate, useLocation, useParams,
@@ -26,19 +27,19 @@ import TitleCardPreview from "./components/TitleCardPreview";
 // a ~50-100 ms perceived delay on the FIRST /videos/:id open of
 // a session in exchange for a much faster cold start everywhere
 // else; subsequent opens are instant because the chunk is cached.
-const LyricsEditor = lazy(() => import("./components/LyricsEditor"));
-const AdminPanel = lazy(() => import("./components/admin/AdminPanel"));
-const Settings = lazy(() => import("./components/Settings"));
-const Landing = lazy(() => import("./components/Landing"));
-const JobDetail = lazy(() => import("./components/JobDetail"));
-const HistoryView = lazy(() => import("./components/HistoryView"));
-const Dashboard = lazy(() => import("./components/Dashboard"));
-const UploadZone = lazy(() => import("./components/UploadZone"));
-const SearchPalette = lazy(() => import("./components/SearchPalette"));
+const LyricsEditor = lazyWithReload(() => import("./components/LyricsEditor"));
+const AdminPanel = lazyWithReload(() => import("./components/admin/AdminPanel"));
+const Settings = lazyWithReload(() => import("./components/Settings"));
+const Landing = lazyWithReload(() => import("./components/Landing"));
+const JobDetail = lazyWithReload(() => import("./components/JobDetail"));
+const HistoryView = lazyWithReload(() => import("./components/HistoryView"));
+const Dashboard = lazyWithReload(() => import("./components/Dashboard"));
+const UploadZone = lazyWithReload(() => import("./components/UploadZone"));
+const SearchPalette = lazyWithReload(() => import("./components/SearchPalette"));
 // Paso final del wizard de variante: la letra en modo LECTURA (el POST
 // /variant no lleva segments y el autosave del editor le escribiría al
 // job padre). Ver components/VariantLyricsSummary.jsx.
-const VariantLyricsSummary = lazy(() => import("./components/VariantLyricsSummary"));
+const VariantLyricsSummary = lazyWithReload(() => import("./components/VariantLyricsSummary"));
 import BatchProgress from "./components/BatchProgress";
 import TranscribingProgress from "./components/TranscribingProgress";
 import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
