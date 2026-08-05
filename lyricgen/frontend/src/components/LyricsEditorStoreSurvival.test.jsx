@@ -117,12 +117,12 @@ describe("LyricsEditor — el estado editado sobrevive unmount/remount (wizard 6
     expect(screen.getByDisplayValue("alpha original")).toBeInTheDocument();
   });
 
-  it("F2: 'Resetear timings' apunta al ORIGINAL real tras un remount (no al ya editado)", () => {
+  it("F2: 'Restaurar' apunta al ORIGINAL real tras un remount (no al ya editado)", () => {
     // Bug F2: originalSegmentsRef se sembraba con `edited` (la entrada YA
     // editada del store) en el remount → Reset restauraba las filas a sí
     // mismas (no-op). Fix: la baseline vive en el store (getOriginal) y
     // sobrevive edits/remount. Este test lo prueba de punta a punta con el
-    // botón real "Resetear timings" del timeline.
+    // botón real "Restaurar" del timeline.
     const props = baseProps({ audioUrl: "blob:fake" });
     const { unmount } = render(<LyricsEditor {...props} />);
 
@@ -139,9 +139,9 @@ describe("LyricsEditor — el estado editado sobrevive unmount/remount (wizard 6
     // El edit sobrevive (store), como en los otros casos.
     expect(segmentsStore.get("job-x")[0].start).toBeCloseTo(1.5, 3);
 
-    // Cambiar a la vista avanzada y apretar "Resetear timings" (el handler real).
+    // Cambiar a la vista avanzada y apretar "Restaurar" (el handler real).
     fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
-    fireEvent.click(screen.getByText("Resetear timings"));
+    fireEvent.click(screen.getByText("Restaurar"));
 
     // Con el fix, Reset restaura el ORIGINAL (1.0), no el ya editado (1.5).
     expect(segmentsStore.get("job-x")[0].start).toBeCloseTo(1.0, 3);

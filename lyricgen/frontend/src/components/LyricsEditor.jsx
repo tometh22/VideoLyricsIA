@@ -493,6 +493,7 @@ export default function LyricsEditor({
   // default; timing tools only appear after the operator explicitly opens
   // the advanced view.
   const [viewMode, setViewMode] = useState("basic"); // "basic" | "advanced"
+  const [previewDockOpen, setPreviewDockOpen] = useState(true);
   // 2026-05-25 Studio Console — Modo enfoque. Toggle persistente que
   // agranda max-h de la lista + MAX_VH del timeline. Operador con 30-50
   // segments por video estaba scrolleando constante. localStorage usa
@@ -2274,7 +2275,7 @@ export default function LyricsEditor({
     // bajo el botón flotante "Aprobar y generar" (h-12 = 48 px + bottom-6
     // = 24 px + sombra). Sin esto la última card del timeline o de la
     // lista quedaba tapada cuando el operador scrolleaba hasta el final.
-    <div className={`w-full animate-fade-in mx-auto pb-28 ${viewMode === "advanced" ? "max-w-6xl" : "max-w-[1400px]"}`}>
+    <div className={`w-full animate-fade-in mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
       {/* Hidden audio element drives playback. */}
       {audioUrl && (
         <audio
@@ -2554,6 +2555,18 @@ export default function LyricsEditor({
               <span className="hidden sm:inline">{t("editor.advanced_view") || "Ajustar tiempos"}</span>
             </button>
           </div>
+          {viewMode === "advanced" && !hideTypographyControls && (
+            <button
+              type="button"
+              onClick={() => setPreviewDockOpen((value) => !value)}
+              aria-pressed={previewDockOpen}
+              title={previewDockOpen ? "Ocultar preview" : "Mostrar preview"}
+              className={`h-8 px-2.5 rounded-md ring-1 transition-colors text-label ${previewDockOpen ? "bg-white/[0.06] text-white ring-white/[0.14]" : "text-ink-secondary ring-white/[0.08] hover:text-white"}`}
+            >
+              <span className="hidden sm:inline">Preview</span>
+              <span className="sm:hidden">▣</span>
+            </button>
+          )}
           {/* ⋯ Overflow — 2026-07 rediseño: absorbe los controles secundarios
               (Expandir/Enfoque, Re-sincronizar con IA, Modo Sync) que antes
               eran botones sueltos en la barra. Re-sincronizar es una acción
@@ -3162,12 +3175,12 @@ export default function LyricsEditor({
              izquierda no renderiza — los controles ya están en el paso
              4 del stepper y el preview central del wizard refleja los
              cambios. El grid colapsa a 1 columna full-width. */}
-      <div className={`grid gap-4 mb-4 items-start ${hideTypographyControls ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2"}`}>
+      <div className={`grid gap-4 mb-4 items-start ${viewMode === "advanced" ? (previewDockOpen && !hideTypographyControls ? "grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px]" : "grid-cols-1") : (hideTypographyControls ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2")}`}>
           {/* COLUMNA IZQUIERDA — sticky en desktop. Controles tipográficos
               + LyricVideoPreview (editable) + scope toggle.
               Phase 2: oculta si hideTypographyControls=true (modo wizard). */}
           {!hideTypographyControls && (
-          <div className="space-y-2 lg:sticky lg:top-2 lg:self-start">
+          <div className={`space-y-2 lg:sticky lg:top-2 lg:self-start ${viewMode === "advanced" ? "xl:order-2" : ""}`}>
             {/* Live font switcher — preview re-renders in the chosen
                 typeface instantly; applied to the render on re-render. */}
             <div className="flex items-center gap-2 px-1">
@@ -3268,7 +3281,7 @@ export default function LyricsEditor({
               según viewMode. min-w-0 evita que rows muy largas rompan el grid.
               Phase E 2026-05-25: relative + el mini-map vertical se posiciona
               absolute a la derecha cuando hay >20 segments. */}
-          <div className="min-w-0 space-y-2 relative">
+          <div className={`min-w-0 space-y-2 relative ${viewMode === "advanced" ? "xl:order-1" : ""}`}>
             {viewMode === "advanced" && audioUrl ? (
               <LyricsTimeline
                 segments={edited}
