@@ -170,15 +170,45 @@ function parseTimestamp(str) {
   if (trimmed.includes(":")) {
     const parts = trimmed.split(":");
     if (parts.length !== 2) return null;
-    const m = parseInt(parts[0], 10);
-    const s = parseFloat(parts[1]);
-    if (Number.isNaN(m) || Number.isNaN(s)) return null;
+    if (!/^\d+$/.test(parts[0]) || !/^\d+(?:\.\d+)?$/.test(parts[1])) return null;
+    const m = Number(parts[0]);
+    const s = Number(parts[1]);
+    if (!Number.isFinite(m) || !Number.isFinite(s)) return null;
     if (m < 0 || s < 0 || s >= 60) return null;
     return m * 60 + s;
   }
-  const v = parseFloat(trimmed);
-  if (Number.isNaN(v) || v < 0) return null;
+  if (!/^\d+(?:\.\d+)?$/.test(trimmed)) return null;
+  const v = Number(trimmed);
+  if (!Number.isFinite(v) || v < 0) return null;
   return v;
+}
+
+// Timestamps can come from the API as numbers, numeric strings, null, or
+// malformed values. Keep one strict boundary sanitizer for every path that
+// reads, sorts, restores, or persists timings. In particular, never use
+// parseFloat here: Number("12abc") must be rejected rather than truncated.
+function sanitizeSegmentTiming(segment, fallbackStart = 0) {
+  const rawStart = segment?.start ?? segment?.startTime ?? segment?.start_time;
+  const rawEnd = segment?.end ?? segment?.endTime ?? segment?.end_time;
+  const parsedStart = parseTimestamp(rawStart);
+  const start = parsedStart == null ? fallbackStart : parsedStart;
+  const parsedEnd = parseTimestamp(rawEnd);
+  const end = parsedEnd == null ? start + 1 : Math.max(start, parsedEnd);
+  return { ...segment, start, end };
+}
+
+function sanitizeSegments(segments) {
+  if (!Array.isArray(segments)) return [];
+  let fallbackStart = 0;
+  return segments.map((segment) => {
+    const sanitized = sanitizeSegmentTiming(segment, fallbackStart);
+    fallbackStart = sanitized.start;
+    return sanitized;
+  });
+}
+
+function sanitizeSegmentsForPersistence(segments) {
+  return sanitizeSegments(segments).map(({ _id, review, ...rest }) => rest);
 }
 
 function findSuggestion(whisperText, refLines, startIdx) {
@@ -486,8 +516,9 @@ export default function LyricsEditor({
   const _storeKey = storeKey ?? transcribeJobId ?? null;
   const [edited, setEdited] = useJobSegments(
     _storeKey,
-    () => reseedPreservingIds([], segments),
+    () => reseedPreservingIds([], sanitizeSegments(segments)),
   );
+  const sanitizedEdited = useMemo(() => sanitizeSegments(edited), [edited]);
   const [isDirty, setIsDirty] = useState(false);
   // Two views over the same editor state. The basic review flow is the
   // default; timing tools only appear after the operator explicitly opens
@@ -640,7 +671,7 @@ export default function LyricsEditor({
     const queue = saveQueueRef.current;
     queue.prime(transcribeJobId, Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
     queue.schedule(transcribeJobId, () =>
-      editedRef.current.map(({ _id, review, ...rest }) => rest));
+      sanitizeSegmentsForPersistence(editedRef.current));
     return undefined;
   }, [edited, transcribeJobId, onPersistSegments, disableAutosave, segmentsRevision]);
 
@@ -673,7 +704,7 @@ export default function LyricsEditor({
     try {
       const saved = JSON.parse(localStorage.getItem(draftKey) || "null");
       if (Array.isArray(saved?.segments) && saved.segments.length) {
-        setEdited(reseedPreservingIds(editedRef.current, saved.segments));
+        setEdited(reseedPreservingIds(editedRef.current, sanitizeSegments(saved.segments)));
         setIsDirty(true);
       }
     } catch { /* corrupt or unavailable storage */ }
@@ -682,7 +713,7 @@ export default function LyricsEditor({
   useEffect(() => {
     if (!draftKey || !isDirty) return;
     try {
-      const cleaned = edited.map(({ _id, review, ...rest }) => rest);
+      const cleaned = sanitizeSegmentsForPersistence(edited);
       localStorage.setItem(draftKey, JSON.stringify({
         segments: cleaned,
         base_revision: saveQueueRef.current._peek(transcribeJobId)?.revision || 0,
@@ -700,7 +731,7 @@ export default function LyricsEditor({
     const state = queue._peek(transcribeJobId);
     if (!dirtyRef.current || (!state?.debounceTimer && !state?.pending)) return;
     queue.flush(transcribeJobId, {
-      provider: () => editedRef.current.map(({ _id, review, ...rest }) => rest),
+      provider: () => sanitizeSegmentsForPersistence(editedRef.current),
     });
   }, [disableAutosave, onPersistSegments, transcribeJobId]);
 
@@ -719,7 +750,7 @@ export default function LyricsEditor({
     if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
     const flushOnUnload = () => {
       try {
-        const cleaned = editedRef.current.map(({ _id, review, ...rest }) => rest);
+        const cleaned = sanitizeSegmentsForPersistence(editedRef.current);
         // useEffect puede no alcanzar a correr entre el último keystroke y
         // pagehide. Persistimos sincrónicamente acá antes de cualquier red;
         // si hay un CAS en vuelo, esta es la recuperación canónica al volver.
@@ -759,7 +790,7 @@ export default function LyricsEditor({
     if (flushCounter === 0) return undefined;
     if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
     saveQueueRef.current.flush(transcribeJobId, {
-      provider: () => editedRef.current.map(({ _id, review, ...rest }) => rest),
+      provider: () => sanitizeSegmentsForPersistence(editedRef.current),
     });
     return undefined;
     // Only react to the flush trigger — `edited` is intentionally read fresh
@@ -772,7 +803,7 @@ export default function LyricsEditor({
       return Promise.resolve({ ok: true, skipped: true });
     }
     return saveQueueRef.current.flush(transcribeJobId, {
-      provider: () => editedRef.current.map(({ _id, review, ...rest }) => rest),
+      provider: () => sanitizeSegmentsForPersistence(editedRef.current),
       persistOpts,
     });
   }, [disableAutosave, onPersistSegments, transcribeJobId]);
@@ -838,6 +869,11 @@ export default function LyricsEditor({
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [audioError, setAudioError] = useState(false);
+
+  useEffect(() => {
+    setAudioError(false);
+  }, [audioUrl]);
 
   // INCIDENT (mobile 2026-05-24): the audio element's `onTimeUpdate`
   // event fires every ~250 ms on most browsers (sometimes slower on
@@ -867,7 +903,7 @@ export default function LyricsEditor({
         // WizardLivePreview central pueda hacer word-jump real.
         if (onPlaybackTick) {
           let active = null;
-          for (const s of edited) {
+          for (const s of sanitizedEdited) {
             if (ct >= s.start && ct < s.end) { active = s; break; }
             if (ct >= s.start) active = s;
           }
@@ -886,7 +922,7 @@ export default function LyricsEditor({
       rafRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPlaying, edited, onPlaybackTick]);
+  }, [isPlaying, sanitizedEdited, onPlaybackTick]);
   const [wrapWarning, setWrapWarning] = useState(null); // {ids: [...]} for 3+ line segs
   const [focusedSegId, setFocusedSegId] = useState(null); // for preview panel
 
@@ -1047,7 +1083,7 @@ export default function LyricsEditor({
   // flags, so the render goes back to auto hold-until-next.
   const resetTimings = useCallback(() => {
     pushEditHistory();
-    const byId = new Map((originalSegmentsRef.current || []).map((s) => [s._id, s]));
+    const byId = new Map(sanitizeSegments(originalSegmentsRef.current || []).map((s) => [s._id, s]));
     setEdited((prev) => prev.map((s) => {
       const o = byId.get(s._id);
       if (!o) return s;
@@ -1055,6 +1091,7 @@ export default function LyricsEditor({
       const { locked, ...rest } = s;
       return { ...rest, start: o.start, end: o.end };
     }));
+    setFlushCounter((c) => c + 1);
     toast({ message: "Timings restaurados al original", tone: "info" });
   }, [pushEditHistory, toast]);
 
@@ -1091,7 +1128,7 @@ export default function LyricsEditor({
         pushEditHistory();
         // PR E: ids frescos vía el mismo helper que el seed inicial —
         // consistencia con la identidad estable del store (PR D).
-        setEdited(reseedPreservingIds([], res.segments));
+        setEdited(reseedPreservingIds([], sanitizeSegments(res.segments)));
         toast({
           message: (t("editor.reanchor_done") || "{n} líneas re-sincronizadas, {m} para revisar")
             .replace("{n}", String(res.count ?? res.segments.length))
@@ -1182,12 +1219,12 @@ export default function LyricsEditor({
   const activeId = useMemo(() => {
     let containing = null;
     let lastStarted = null;
-    for (const seg of edited) {
+    for (const seg of sanitizedEdited) {
       if (currentTime >= seg.start && currentTime < seg.end) containing = seg;
       if (currentTime >= seg.start) lastStarted = seg;
     }
     return (containing || lastStarted)?._id ?? null;
-  }, [edited, currentTime]);
+  }, [sanitizedEdited, currentTime]);
 
   // UI freeze / render-storm capture (P0 UMG Chile 2026-06-16). Cause-agnostic
   // safety net: if the main thread saturates (the "se queda pegado" + flicker),
@@ -1197,7 +1234,7 @@ export default function LyricsEditor({
     active: true,
     getContext: () => {
       const segs = Array.isArray(edited) ? edited : [];
-      const sorted = [...segs].sort((a, b) => a.start - b.start);
+      const sorted = sanitizeSegments(segs).sort((a, b) => a.start - b.start);
       let overlaps = 0;
       let maxOverlapDepth = 0;
       for (let i = 0; i < sorted.length - 1; i++) {
@@ -1799,7 +1836,10 @@ export default function LyricsEditor({
 
   const deleteSeg = (id) => {
     recordEditorAction("delete", { id });
+    if (!edited.some((seg) => seg._id === id)) return;
+    pushEditHistory();
     setEdited((prev) => prev.filter((seg) => seg._id !== id));
+    setFlushCounter((c) => c + 1);
   };
 
   // Text-length-based cap. Used by the per-row ✂ button + bulk-trim
@@ -1969,6 +2009,8 @@ export default function LyricsEditor({
   // repeat — duplicate the chorus block, then tap-sync the copies.
   const duplicateSeg = (id) => {
     recordEditorAction("duplicate", { id, segments: Array.isArray(edited) ? edited.length : null });
+    if (!edited.some((seg) => seg._id === id)) return;
+    pushEditHistory();
     setEdited((prev) => {
       const idx = prev.findIndex((s) => s._id === id);
       if (idx === -1) return prev;
@@ -1980,12 +2022,14 @@ export default function LyricsEditor({
       const dup = { ...orig, _id: nextId, start: newStart, end: newEnd };
       return [...prev.slice(0, idx + 1), dup, ...prev.slice(idx + 1)];
     });
+    setFlushCounter((c) => c + 1);
   };
 
   // Append a blank line at the end of the list. Operator types the
   // missing lyrics into the text input, then tap-syncs it.
   const addBlankLine = () => {
     recordEditorAction("addLine", { segments: Array.isArray(edited) ? edited.length : null });
+    pushEditHistory();
     setEdited((prev) => {
       // Insert the new line at the audio playhead — that's where the
       // operator is listening when they realise something's missing
@@ -2025,6 +2069,7 @@ export default function LyricsEditor({
       // immediate render consistent without waiting for a round-trip.
       return [...prev, inserted].sort((a, b) => a.start - b.start);
     });
+    setFlushCounter((c) => c + 1);
   };
 
   // Insert a blank line right AFTER the row at display index `idx`, timing
@@ -2033,6 +2078,8 @@ export default function LyricsEditor({
   // forced the operator to scroll away from where they were working.
   const insertLineAfter = (idx) => {
     recordEditorAction("insertLine", { idx });
+    if (idx < 0 || idx >= edited.length) return;
+    pushEditHistory();
     setEdited((prev) => {
       const cur = prev[idx];
       const nxt = prev[idx + 1];
@@ -2050,6 +2097,7 @@ export default function LyricsEditor({
       const inserted = { _id: nextId, start: s, end: e, text: "" };
       return [...prev, inserted].sort((a, b) => a.start - b.start);
     });
+    setFlushCounter((c) => c + 1);
   };
 
   // Smart "Agregar línea": when the operator has a row selected/focused,
@@ -2083,7 +2131,7 @@ export default function LyricsEditor({
   const blankCount = edited.filter((seg) => !(seg.text || "").trim()).length;
 
   const _buildCleanedSegments = () => {
-    const sorted = [...edited]
+    const sorted = sanitizeSegments(edited)
       .filter((seg) => (seg.text || "").trim())
       .sort((a, b) => a.start - b.start);
     return sorted.map((seg, i) => {
@@ -2287,6 +2335,10 @@ export default function LyricsEditor({
           onPlay={() => setIsPlaying(true)}
           onPause={() => setIsPlaying(false)}
           onEnded={() => setIsPlaying(false)}
+          onError={() => {
+            setAudioError(true);
+            setIsPlaying(false);
+          }}
         />
       )}
 
@@ -2329,6 +2381,11 @@ export default function LyricsEditor({
           onClick={handleApprove}
           disabled={isApproving}
           aria-busy={isApproving}
+          aria-label={isApproving
+            ? (t("editor.applying_changes") || "Aplicando cambios…")
+            : (submitLabel || (isBatch
+              ? (t("editor.approve_next") || "Aprobar y continuar")
+              : (t("editor.approve_generate") || "Aprobar y generar")))}
           data-tour="editor-approve-floating"
           className="editor-primary-cta pointer-events-auto inline-flex items-center gap-1.5 btn-primary text-sm h-12 px-6 shadow-2xl shadow-brand/30 disabled:opacity-60 disabled:cursor-wait"
         >
@@ -3296,27 +3353,71 @@ export default function LyricsEditor({
               Phase E 2026-05-25: relative + el mini-map vertical se posiciona
               absolute a la derecha cuando hay >20 segments. */}
           <div className={`min-w-0 space-y-2 relative ${viewMode === "advanced" ? "xl:order-1" : ""}`}>
-            {viewMode === "advanced" && audioUrl ? (
-              <LyricsTimeline
-                segments={edited}
-                duration={duration}
-                currentTime={currentTime}
-                isPlaying={isPlaying}
-                saveStatus={saveStatus}
-                activeId={activeId}
-                focusedSegId={focusedSegId}
-                highlightedIds={highlightedIds}
-                waveform={waveform}
-                gapS={MIN_GAP_S}
-                focusMode={workspaceFocusMode}
-                onSeek={(s) => seekTo(s, false)}
-                onDragStart={pushEditHistory}
-                onTimingChange={handleTimelineTimingChange}
-                onTimingChangeBatch={handleTimelineTimingChangeBatch}
-                onTextChange={updateText}
-                onFocus={focusSegment}
-                onReset={resetTimings}
-              />
+            {viewMode === "advanced" ? (
+              <div
+                data-testid="advanced-workspace-shell"
+                className="min-h-[260px] rounded-2xl ring-1 ring-white/[0.08] bg-surface-2/20"
+              >
+                {audioLoading ? (
+                  <div data-testid="advanced-audio-loading" className="flex min-h-[260px] flex-col items-center justify-center gap-3 px-6 text-center">
+                    <svg className="h-6 w-6 animate-spin text-brand-light" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M21 12a9 9 0 1 1-6.219-8.56" strokeLinecap="round" />
+                    </svg>
+                    <div>
+                      <p className="text-sm font-medium text-white">Cargando audio…</p>
+                      <p className="mt-1 text-xs text-ink-tertiary">La vista avanzada aparecerá cuando el audio esté listo.</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => { setViewMode("basic"); setSyncMode(false); }}
+                      className="text-xs text-brand-light hover:text-white transition-colors"
+                    >
+                      Volver a Revisar letra
+                    </button>
+                  </div>
+                ) : !audioUrl || audioError ? (
+                  <div data-testid="advanced-audio-unavailable" className="flex min-h-[260px] flex-col items-center justify-center gap-3 px-6 text-center">
+                    <svg className="h-7 w-7 text-amber-300" fill="none" stroke="currentColor" strokeWidth="1.7" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M12 9v4M12 17h.01" />
+                      <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+                    </svg>
+                    <div>
+                      <p className="text-sm font-medium text-white">No se puede ajustar tiempos sin audio</p>
+                      <p className="mt-1 max-w-md text-xs text-ink-tertiary">
+                        Podés corregir el texto en la vista básica. Cuando el audio esté disponible, volvé a Ajustar tiempos.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => { setViewMode("basic"); setSyncMode(false); }}
+                      className="rounded-lg bg-brand/15 px-3 py-2 text-xs font-medium text-brand-light ring-1 ring-brand/30 hover:bg-brand/25 hover:text-white transition-colors"
+                    >
+                      Volver a Revisar letra
+                    </button>
+                  </div>
+                ) : (
+                  <LyricsTimeline
+                    segments={edited}
+                    duration={duration}
+                    currentTime={currentTime}
+                    isPlaying={isPlaying}
+                    saveStatus={saveStatus}
+                    activeId={activeId}
+                    focusedSegId={focusedSegId}
+                    highlightedIds={highlightedIds}
+                    waveform={waveform}
+                    gapS={MIN_GAP_S}
+                    focusMode={workspaceFocusMode}
+                    onSeek={(s) => seekTo(s, false)}
+                    onDragStart={pushEditHistory}
+                    onTimingChange={handleTimelineTimingChange}
+                    onTimingChangeBatch={handleTimelineTimingChangeBatch}
+                    onTextChange={updateText}
+                    onFocus={focusSegment}
+                    onReset={resetTimings}
+                  />
+                )}
+              </div>
             ) : (
               <>
                 <p className="text-[11px] text-gray-600 mb-2 px-1">

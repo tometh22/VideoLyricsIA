@@ -211,6 +211,110 @@ describe("LyricsEditor — recuperación de audio remoto post-mount", () => {
   });
 });
 
+describe("LyricsEditor — advanced shell and timing safety", () => {
+  it("keeps the advanced shell explicit while audio is loading and offers a basic-view escape", async () => {
+    render(<LyricsEditor {...baseProps({ audioLoading: true, audioUrl: null })} />);
+
+    await userEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+
+    expect(screen.getByTestId("advanced-workspace-shell")).toBeInTheDocument();
+    expect(screen.getByTestId("advanced-audio-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("advanced-audio-unavailable")).toBeNull();
+    expect(screen.queryByDisplayValue("alpha line")).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "Volver a Revisar letra" }));
+    expect(screen.getByRole("tab", { name: "Revisar letra" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByDisplayValue("alpha line")).toBeInTheDocument();
+  });
+
+  it("shows an unavailable-audio state instead of silently falling back to the basic list", async () => {
+    render(<LyricsEditor {...baseProps({ audioLoading: false, audioUrl: null })} />);
+
+    await userEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+
+    expect(screen.getByTestId("advanced-audio-unavailable")).toBeInTheDocument();
+    expect(screen.getByText(/No se puede ajustar tiempos sin audio/i)).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("alpha line")).toBeNull();
+  });
+
+  it("rejects partial timestamps and never sends non-finite timings on approve or autosave", async () => {
+    const onApprove = vi.fn();
+    const onPersistSegments = vi.fn().mockResolvedValue({ ok: true });
+    render(<LyricsEditor {...baseProps({
+      segments: [
+        { start: "12abc", end: "bad", text: "kept" },
+        { start: "1:02.5xyz", end: "1:04.5", text: "second" },
+      ],
+      onApprove,
+      onPersistSegments,
+      transcribeJobId: "job-timing-safety",
+    })} />);
+
+    const kept = screen.getByDisplayValue("kept");
+    expect(kept).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Aprobar/i }));
+
+    expect(onApprove).toHaveBeenCalledOnce();
+    const approved = onApprove.mock.calls[0][0];
+    expect(approved).toHaveLength(2);
+    approved.forEach((segment) => {
+      expect(Number.isFinite(segment.start)).toBe(true);
+      expect(Number.isFinite(segment.end)).toBe(true);
+    });
+    expect(approved[0].start).toBe(0);
+    expect(approved[0].end).toBeGreaterThanOrEqual(0.3);
+    expect(approved[1].start).toBe(0);
+    expect(approved[1].end).toBeGreaterThan(approved[1].start);
+
+    window.dispatchEvent(new Event("pagehide"));
+    expect(onPersistSegments).toHaveBeenCalled();
+    const saved = onPersistSegments.mock.calls.at(-1)[1];
+    saved.forEach((segment) => {
+      expect(Number.isFinite(segment.start)).toBe(true);
+      expect(Number.isFinite(segment.end)).toBe(true);
+    });
+  });
+});
+
+describe("LyricsEditor — structural mutations share undo and save behavior", () => {
+  const structuralProps = (overrides = {}) => baseProps({
+    segments: [
+      { start: 1, end: 2, text: "alpha" },
+      { start: 4, end: 5, text: "beta" },
+    ],
+    transcribeJobId: "job-structural-mutations",
+    onPersistSegments: vi.fn().mockResolvedValue({ ok: true }),
+    ...overrides,
+  });
+
+  it.each([
+    ["delete", "Eliminar línea", "alpha"],
+    ["duplicate", /Duplicar línea/, "alpha"],
+  ])("%s records an undo snapshot", async (_name, title, text) => {
+    render(<LyricsEditor {...structuralProps()} />);
+    await userEvent.click(screen.getAllByTitle(title)[0]);
+    expect(screen.queryAllByDisplayValue(text)).toHaveLength(_name === "duplicate" ? 2 : 0);
+
+    fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+    expect(screen.getAllByDisplayValue(text)).toHaveLength(1);
+  });
+
+  it("add blank and insert-after both become undoable edits", async () => {
+    render(<LyricsEditor {...structuralProps()} />);
+    const before = segmentsStore.get("job-structural-mutations").length;
+
+    await userEvent.click(screen.getByRole("button", { name: /Agregar línea/i }));
+    expect(segmentsStore.get("job-structural-mutations")).toHaveLength(before + 1);
+    fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+    expect(segmentsStore.get("job-structural-mutations")).toHaveLength(before);
+
+    await userEvent.click(screen.getAllByTitle(/Insertar línea acá/i)[0]);
+    expect(segmentsStore.get("job-structural-mutations")).toHaveLength(before + 1);
+    fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+    expect(segmentsStore.get("job-structural-mutations")).toHaveLength(before);
+  });
+});
+
 
 describe("LyricsEditor — reemplazo externo post-mount (ex prop-sync B7)", () => {
   // HISTORIA: B7 (2026-05-18) era "el prop `segments` cambió → re-seed".
