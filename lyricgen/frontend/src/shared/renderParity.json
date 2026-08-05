@@ -4065,6 +4065,24 @@
   "sutil": "sutil",
   "tripod": "estatico"
  },
+ "strip_trailing_punctuation": {
+  "": "",
+  "   ": "   ",
+  ".": ".",
+  "...": "...",
+  "Costumbres argentinas": "Costumbres argentinas",
+  "Costumbres argentinas.": "Costumbres argentinas",
+  "Dime una cosa;": "Dime una cosa",
+  "Escuchame bien:": "Escuchame bien",
+  "Mil horas.   ": "Mil horas   ",
+  "No hay nadie mas que vos y yo,": "No hay nadie mas que vos y yo",
+  "No, no puedo mas.": "No, no puedo mas",
+  "Y sigue el tren...": "Y sigue el tren",
+  "Y sigue el tren\u2026": "Y sigue el tren",
+  "\u00a1La argentinidad al palo!": "\u00a1La argentinidad al palo!",
+  "\u00bfQuien te mira?": "\u00bfQuien te mira?",
+  "\u2026": "\u2026"
+ },
  "tiers": [
   {
    "base_px": 85,

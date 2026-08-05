@@ -116,7 +116,16 @@ def _build_prompt(texts: list, lang: str) -> str:
         "For each numbered line:\n"
         f"- Fix {lang} accents and diacritics (e.g. fragil→frágil, mas→más)\n"
         "- Capitalize the first word of each line\n"
-        "- Fix punctuation (commas, periods, ellipsis)\n"
+        # Was "Fix punctuation (commas, periods, ellipsis)" until 2026-08-05.
+        # That instruction is what put the sentence-final period on screen —
+        # and UMG asked us to take it back off six separate times between
+        # May and August. Mid-line commas still get fixed (they genuinely
+        # help a lyric read); we simply stop asking for terminal punctuation
+        # nobody wants. Accounts that do want it are unaffected: this only
+        # stops us ADDING periods, it never removes what the reference
+        # lyrics already carry.
+        "- Fix mid-line commas where a clause boundary is obvious\n"
+        "- Do NOT add a period, ellipsis or other terminal punctuation at the end of a line\n"
         "- For Spanish: add inverted opening marks (¿, ¡) where the line is a question or exclamation\n\n"
         "Rules:\n"
         f"- Output EXACTLY {n} lines — one per input line, same order\n"

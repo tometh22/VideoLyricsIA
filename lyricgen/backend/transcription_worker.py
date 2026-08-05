@@ -66,6 +66,37 @@ def _coverage_de(r) -> float | None:
         return None
 
 
+def _quality_snapshot(r) -> dict | None:
+    """Extract the persistable alignment-quality summary from a result dict.
+
+    Returns None when the job never measured (no ASR words → no
+    `coverage_final`), so a NULL column means "not measured" rather than
+    "measured as zero". `uncovered_spans` and friends are already plain
+    ints/floats from `audio_coverage.summarize`; `voiced_gaps` is kept as
+    the count, not the span list, so the column stays small enough to
+    query without a JSONB expansion.
+    """
+    if not isinstance(r, dict):
+        return None
+    stats = (r.get("postpass_stats") or {}).get("coverage_final")
+    if not isinstance(stats, dict):
+        return None
+    out = {
+        "audio_coverage": stats.get("audio_coverage"),
+        "uncovered_spans": stats.get("uncovered_spans"),
+        "uncovered_seconds": stats.get("uncovered_seconds"),
+        "worst_span_s": stats.get("worst_span_s"),
+        "text_mismatches": stats.get("text_mismatches"),
+        "voiced_gaps": stats.get("voiced_gaps"),
+        "voiced_gap_s": stats.get("voiced_gap_s"),
+        # The circuit breaker's verdict, so a reader does not have to
+        # re-derive it from VOICED_GAP_WARN_S as it stood at render time.
+        "coverage_warning": bool(r.get("coverage_warning")),
+        "timing_source": r.get("timing_source"),
+    }
+    return {k: v for k, v in out.items() if v is not None}
+
+
 def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                            audio_path: str = ""):
     """Loguea la cobertura final y la compara con la de la cascada y la
@@ -321,6 +352,17 @@ def run_transcription_job(
         update_kwargs = {"status": "transcribed_pending", "current_step": "editing"}
         if segments is not None:
             update_kwargs["segments_json"] = segments
+        # Telemetría de alineado. Hasta 2026-08 estos números se calculaban
+        # en CADA job y se tiraban: el worker sólo persistía status /
+        # current_step / segments_json, así que `coverage_final` vivía dos
+        # segundos y sobrevivía nada más que en los logs del container. Por
+        # eso `coverage_warning` daba false para siempre en el path async
+        # (main.py hacía getattr contra una columna inexistente), no había
+        # forma de gatear una entrega por calidad, y no podíamos decir qué
+        # motor produjo un video que UMG rechazó.
+        _q = _quality_snapshot(result)
+        if _q:
+            update_kwargs["quality_json"] = _q
         # reference_lyrics no tiene columna en el modelo Job (defer a otro PR
         # si el editor lo necesita post-transcribe). Lo dejo en el log para
         # diagnóstico mientras tanto.

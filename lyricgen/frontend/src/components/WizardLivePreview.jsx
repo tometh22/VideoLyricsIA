@@ -3,6 +3,7 @@ import { useI18n } from "../i18n";
 import { REF_W, lyricFontPx } from "../lib/lyricTiers";
 import { activeWordIndex } from "../lib/karaokeTiming";
 import { FONT_BY_CODE, applyCase } from "./fontCatalog";
+import { applyLyricStyleProfile } from "../lib/lyricText";
 import { MOVEMENT_LABELS, EFFECT_LABELS } from "../lib/optionLabels";
 
 // Studio Console live preview. Shows a sample lyric line over the selected
@@ -121,6 +122,10 @@ export default function WizardLivePreview({
   // cuando el operador no toca nada.
   font = "",
   textCase = "upper",
+  // Defaults visuales de la cuenta (tenant_style). Espejo de
+  // pipeline._display_segments — sin esto la preview mostraría el
+  // punto final que el render saca.
+  styleProfile = null,
   // "full" (16:9) | "cine" (2.39:1 letterbox, simulated with CSS bars so the
   // operator sees the framing before spending a render).
   frameFormat = "full",
@@ -414,7 +419,7 @@ export default function WizardLivePreview({
   // textCase 2026-05-26: aplicamos el case del operador al sample para que
   // "MAY/Aa/min/ori" se note ANTES de tener letras reales — antes el
   // sample salía siempre lowercase ignorando el pick.
-  const sample = applyCase(t("upload.preview_sample") || "esta es tu letra", textCase);
+  const sample = applyCase(applyLyricStyleProfile(t("upload.preview_sample") || "esta es tu letra", styleProfile), textCase);
   // Typography resolved values:
   // - fontInfo: { css, weight } o defaults Auto (no override).
   // - baseFontSize: lyricTiers.lyricFontPx (tier por largo × font_scale
@@ -428,7 +433,7 @@ export default function WizardLivePreview({
   // 1920-wide frame, matching LyricVideoPreview). Length comes from the
   // actual displayed text — the live line if playing, else the sample.
   const _dispText = (livePlaybackTick && livePlaybackTick.activeLine)
-    ? applyCase(livePlaybackTick.activeLine, textCase)
+    ? applyCase(applyLyricStyleProfile(livePlaybackTick.activeLine, styleProfile), textCase)
     : sample;
   const baseFontSize = `${((lyricFontPx(_dispText.length, fontScale, font) / REF_W) * 100).toFixed(3)}cqw`;
   const contrastStyle = CONTRAST_STYLES[textContrast] || CONTRAST_STYLES.medium;
@@ -497,7 +502,7 @@ export default function WizardLivePreview({
     // textCase aplicado a la línea real reproducida (mismo treatment que
     // el sample fallback): el operador eligió "MAY" → el preview lo
     // muestra en MAY también, no en el case original del lyric.
-    const segText = applyCase(liveActive.activeLine, textCase);
+    const segText = applyCase(applyLyricStyleProfile(liveActive.activeLine, styleProfile), textCase);
     liveLineKey = segText;
     const segStart = liveActive.activeStart;
     const segEnd = liveActive.activeEnd;

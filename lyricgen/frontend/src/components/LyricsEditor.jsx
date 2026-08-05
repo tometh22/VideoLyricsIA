@@ -3242,6 +3242,7 @@ export default function LyricsEditor({
               font={FONT_CSS_BY_CODE[selectedFont] || undefined}
               textCase={selectedCase}
               textContrast={selectedContrast}
+              styleProfile={user?.style_profile || null}
               // 2026-05-23: la prop `transition` (Corte/Fade) salió con el
               // deprecation de lyric_transition. Cuando el preview soporte
               // las animaciones libass nuevas se pasa por acá:

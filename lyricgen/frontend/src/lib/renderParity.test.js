@@ -29,6 +29,7 @@ import {
   normalizeMovementCode,
 } from "./catalogCodes";
 import { FONT_BY_CODE } from "../components/fontCatalog";
+import { applyLyricStyleProfile, stripTrailingPunctuation } from "./lyricText";
 
 describe("render parity: font sizes", () => {
   it("lyricFontPx matches ass_render.lyric_fontsize across the whole matrix", () => {
@@ -122,5 +123,35 @@ describe("render parity: normalización de movement_style", () => {
       const out = normalizeMovementCode(raw);
       expect(out === "" || MOVEMENT_CODES.includes(out)).toBe(true);
     }
+  });
+});
+
+describe("render parity: strip_trailing_punctuation", () => {
+  // El perfil de estilo de la cuenta puede pedir que la letra salga sin
+  // puntuación final (UMG lo pidió seis veces entre mayo y agosto de 2026).
+  // El backend lo aplica en pipeline._display_segments, justo antes de
+  // entregarle los segmentos a los renderers; la preview tiene que aplicar
+  // exactamente lo mismo o el operador ve una cosa y el video sale con otra.
+  const table = Object.entries(fixture.strip_trailing_punctuation);
+
+  it("la tabla de sondeo no está vacía", () => {
+    expect(table.length).toBeGreaterThan(10);
+  });
+
+  it.each(table)("stripTrailingPunctuation(%j) === %j", (raw, expected) => {
+    expect(stripTrailingPunctuation(raw)).toBe(expected);
+  });
+
+  it("no toca ? ni ! — cargan sentido y nadie pidió sacarlos", () => {
+    expect(stripTrailingPunctuation("¿Quien te mira?")).toBe("¿Quien te mira?");
+    expect(stripTrailingPunctuation("¡Al palo!")).toBe("¡Al palo!");
+  });
+
+  it("respeta el perfil: sin la preferencia prendida no cambia nada", () => {
+    expect(applyLyricStyleProfile("Mil horas.", {})).toBe("Mil horas.");
+    expect(applyLyricStyleProfile("Mil horas.", null)).toBe("Mil horas.");
+    expect(
+      applyLyricStyleProfile("Mil horas.", { strip_trailing_punctuation: true }),
+    ).toBe("Mil horas");
   });
 });

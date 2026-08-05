@@ -1550,6 +1550,11 @@ def me(current_user: dict = Depends(get_current_user), db: Session = Depends(get
     _u = user if user else current_user
     return {
         **current_user,
+        # Defaults visuales de la cuenta. El wizard los usa para SEMBRAR sus
+        # controles: sin esto el frontend mostraría 1.0 mientras el backend
+        # renderiza con el default del tenant, y la preview volvería a mentir
+        # respecto del render.
+        "style_profile": _account_style_profile(db, current_user),
         "features": {
             "prores_export": has_prores_access(_u),
             "scenes": has_scenes_access(_u),
@@ -2838,6 +2843,48 @@ def _try_send_usage_alert(db: Session, current_user: dict, usage: dict) -> None:
         ).start()
     except Exception as _e:
         logger.warning("usage alert skipped: %s", _e)
+
+
+def _account_style_profile(db: Session, current_user: dict) -> dict:
+    """Effective visual defaults for this account (see tenant_style.py).
+
+    Resolved once per job creation and then snapshotted into render_params,
+    so a re-render months later reproduces the video as it shipped rather
+    than as the profile reads by then.
+
+    Never raises: a style profile is a preference, so any failure degrades
+    to platform defaults instead of blocking the upload.
+    """
+    try:
+        import tenant_style
+        user = get_user_by_id(db, current_user.get("id"))
+        return tenant_style.resolve_style_profile(
+            db,
+            tenant_id=(current_user.get("tenant_id")
+                       or getattr(user, "tenant_id", None)),
+            billing_group=getattr(user, "billing_group", None),
+        )
+    except Exception as e:
+        logger.warning("[STYLE] no se pudo resolver el perfil (%s)", e)
+        return {}
+
+
+def _effective_font_scale(raw: str | None, style_profile: dict) -> float:
+    """Clamp the requested font_scale, falling back to the account default.
+
+    An EMPTY/absent value means "the operator did not choose" — that is
+    when the account profile applies. An explicit value always wins, so an
+    operator can still render a UMG job at 1.0 on purpose.
+    """
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(0.6, min(1.5, float(raw)))
+        except (ValueError, TypeError):
+            pass
+    try:
+        return max(0.6, min(1.5, float(style_profile.get("font_scale", 1.0))))
+    except (ValueError, TypeError):
+        return 1.0
 
 
 def _enforce_plan_quota(db: Session, current_user: dict,
@@ -4282,13 +4329,20 @@ def transcription_status(
         if status == "transcribed_pending":
             status = "transcribed"
 
+        # `coverage_warning` / `recovery_source` NUNCA fueron columnas del
+        # modelo Job: este getattr con default corría contra un atributo
+        # inexistente, así que el path async — el que usa el frontend real —
+        # devolvía false para siempre y el cartel de aviso al operador no
+        # se encendía nunca. El worker sí calculaba el flag; ahora lo
+        # persiste en quality_json y acá lo leemos de ahí.
+        _quality = job_row.quality_json if isinstance(job_row.quality_json, dict) else {}
         payload = {
             "job_id": job_id,
             "status": status,
             "segments": None,
             "reference_lyrics": None,
-            "coverage_warning": bool(getattr(job_row, "coverage_warning", False)),
-            "recovery_source": getattr(job_row, "recovery_source", None),
+            "coverage_warning": bool(_quality.get("coverage_warning", False)),
+            "recovery_source": _quality.get("timing_source"),
             "error": None,
         }
         if status == "transcribed":
@@ -4566,7 +4620,9 @@ async def upload(
     animate_image: str = Form("", max_length=8),
     text_case: str = Form("upper", max_length=16),
     frame_format: str = Form("full", max_length=16),
-    font_scale: str = Form("1.0", max_length=8),
+    # "" = el operador no eligió → aplica el default de la cuenta
+    # (tenant_style). Un valor explícito siempre gana, incluso "1.0".
+    font_scale: str = Form("", max_length=8),
     lyric_transition: str = Form("cut", max_length=16),
     text_motion: str = Form("none", max_length=16),
     lyrics_animation: str = Form("none", max_length=16),
@@ -4732,11 +4788,8 @@ async def upload(
     # Always enqueue. RQ's per-priority worker pool naturally caps how many
     # jobs run at once — the rest wait in Redis. UMG (plan=unlimited) goes
     # to the enterprise queue, which workers drain before the default queue.
-    _font_scale = 1.0
-    try:
-        _font_scale = max(0.6, min(1.5, float(font_scale or "1.0")))
-    except (ValueError, TypeError):
-        pass
+    _style_profile = _account_style_profile(db, current_user)
+    _font_scale = _effective_font_scale(font_scale, _style_profile)
 
     enqueue_pipeline(
         job_id=job_id,
@@ -4764,6 +4817,7 @@ async def upload(
         text_case=text_case if text_case in ("upper", "title", "lower", "original", "sentence") else "upper",
         frame_format=frame_format if frame_format in ("full", "cine") else "full",
         font_scale=_font_scale,
+        style_profile=_style_profile,
         # lyric_transition + text_motion: deprecados 2026-05-23 (ver run_pipeline).
         # Aceptamos los Form params por back-compat pero coerce a defaults.
         lyric_transition="cut",
@@ -8064,7 +8118,9 @@ async def generate_with_segments(
     animate_image: str = Form("", max_length=8),
     text_case: str = Form("upper", max_length=16),
     frame_format: str = Form("full", max_length=16),
-    font_scale: str = Form("1.0", max_length=8),
+    # "" = el operador no eligió → aplica el default de la cuenta
+    # (tenant_style). Un valor explícito siempre gana, incluso "1.0".
+    font_scale: str = Form("", max_length=8),
     lyric_transition: str = Form("cut", max_length=16),
     text_motion: str = Form("none", max_length=16),
     lyrics_animation: str = Form("none", max_length=16),
@@ -8454,11 +8510,8 @@ async def generate_with_segments(
             background_file, job_dir, job_id, current_user["tenant_id"],
         )
 
-    _font_scale_gen = 1.0
-    try:
-        _font_scale_gen = max(0.6, min(1.5, float(font_scale or "1.0")))
-    except (ValueError, TypeError):
-        pass
+    _style_profile_gen = _account_style_profile(db, current_user)
+    _font_scale_gen = _effective_font_scale(font_scale, _style_profile_gen)
 
     # Remove the orphan draft the wizard sometimes leaves behind: if a
     # sibling transcribed_pending/awaiting_upload row for the same audio was
@@ -8568,6 +8621,7 @@ async def generate_with_segments(
         text_case=text_case if text_case in ("upper", "title", "lower", "original", "sentence") else "upper",
         frame_format=frame_format if frame_format in ("full", "cine") else "full",
         font_scale=_font_scale_gen,
+        style_profile=_style_profile_gen,
         # Deprecados 2026-05-23 (ver primer endpoint /upload).
         lyric_transition="cut",
         text_motion="none",

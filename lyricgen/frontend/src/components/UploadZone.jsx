@@ -387,10 +387,20 @@ export default function UploadZone({
     // UI v1.1 (2026-05-30): manual song-title break. "" = auto wrap.
     titleSongBreak: "",
   };
+  // Defaults visuales de la cuenta (tenant_style, vía /auth/me). Se aplican
+  // ENTRE el hardcode y el sticky: la cuenta manda sobre el default de
+  // plataforma, y una elección explícita del operador manda sobre la cuenta.
+  // Sin esto el wizard mostraría 1.0 mientras el backend renderiza con el
+  // default del tenant, y la preview volvería a mentir respecto del render.
+  const ACCOUNT_BATCH_DEFAULTS = (() => {
+    const sp = user?.style_profile;
+    if (!sp || sp.font_scale === undefined || sp.font_scale === null) return {};
+    return { fontScale: String(sp.font_scale) };
+  })();
   const loadStoredBatchDefaults = () => {
     try {
       const raw = localStorage.getItem(BATCH_DEFAULTS_STORAGE_KEY);
-      if (!raw) return HARDCODED_BATCH_DEFAULTS;
+      if (!raw) return { ...HARDCODED_BATCH_DEFAULTS, ...ACCOUNT_BATCH_DEFAULTS };
       const parsed = JSON.parse(raw);
       // Merge keeps any future fields safe-defaulted when the user has an
       // older saved object missing the new key.
@@ -404,12 +414,13 @@ export default function UploadZone({
       // `parsed`, así también limpia el localStorage ya contaminado.
       return {
         ...HARDCODED_BATCH_DEFAULTS,
+        ...ACCOUNT_BATCH_DEFAULTS,
         ...parsed,
         backgroundHint: HARDCODED_BATCH_DEFAULTS.backgroundHint,
         bgVerbatim: HARDCODED_BATCH_DEFAULTS.bgVerbatim,
       };
     } catch {
-      return HARDCODED_BATCH_DEFAULTS;
+      return { ...HARDCODED_BATCH_DEFAULTS, ...ACCOUNT_BATCH_DEFAULTS };
     }
   };
   const [batchDefaults, setBatchDefaults] = useState(loadStoredBatchDefaults);
@@ -3922,6 +3933,7 @@ export default function UploadZone({
             <WizardLivePreview
               style={style}
               customColors={customColors}
+              styleProfile={user?.style_profile || null}
               movementStyle={hoverMovement ?? batchDefaults.movementStyle}
               operatorPhoto={_customStill}
               effect={hoverEffect ?? batchDefaults.effect}
