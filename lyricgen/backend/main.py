@@ -6125,32 +6125,45 @@ async def _run_transcription_for_job(
                 # stuck-phoneme and similar mishears in well-known regions).
                 await _step("transcribe.transcribe_word", 50)
                 _aa = await _get_align_audio()
-                # Divergent live/extended detection (2026-06-04, LIVE_NO_HINT_ENABLED,
-                # default off). When the upload is much longer than the lrclib record
-                # (the documented diff>60s "live / extended" case, see ~4082), the
-                # lrclib STUDIO text poisons whisperX's initial_prompt — the model
-                # parrots the prompt in studio order and scrambles the live (lab: Coti
-                # "Nada" live → offset +75s, first verse at 1:29 instead of 0:39) — AND
-                # the downstream reconcile/scaffold drift against the wrong structure.
+                # Divergent version detection (2026-06-04, LIVE_NO_HINT_ENABLED,
+                # default off). When the upload and the lrclib record describe
+                # DIFFERENT versions, the lrclib STUDIO text poisons whisperX's
+                # initial_prompt — the model parrots the prompt in studio order and
+                # scrambles the performance (lab: Coti "Nada" live → offset +75s,
+                # first verse at 1:29 instead of 0:39) — AND the downstream
+                # reconcile/scaffold drift against the wrong structure.
                 # Lab (7 songs, 3 Rotor ground-truths): clean NO-hint whisperX matches
                 # Rotor's own timing (median 0.03-0.8 s); Rotor itself transcribes blind
                 # the same way. So for divergent audio: drop the hint + emit the clean
                 # transcription raw, skipping the canonical cascade. Reversible; falsy
                 # when we can't measure (missing lrclib duration) so default behavior
                 # is untouched.
+                #
+                # SYMMETRIC since 2026-08-05. This used to test the SIGNED difference
+                # (audio - lrclib > 60), so it only caught the "extended live" side and
+                # was blind to the opposite, equally broken case: a reference LONGER
+                # than the upload (radio edit / snippet / short live cut). Los Pericos
+                # "Runaway (En Vivo)" — 110s upload vs a 205s lrclib studio record,
+                # diff -95s — sailed past this check into the canonical cascade, and
+                # forced_align clamped every studio line past the 110s mark onto the
+                # final timestamp: ~17 lines piled at 1:50 in the editor, including an
+                # outro this cut never sings. See timing_confidence.divergent_duration.
                 _lrc_dur = (lrc or {}).get("duration") if isinstance(lrc, dict) else None
+                from timing_confidence import divergent_duration as _divergent_dur
                 _live_no_hint = bool(
                     os.environ.get("LIVE_NO_HINT_ENABLED", "0").strip().lower()
                     in ("1", "true", "yes", "on")
-                    and _audio_dur_for_lrc and _lrc_dur
-                    and (float(_audio_dur_for_lrc) - float(_lrc_dur)) > 60.0
+                    and _divergent_dur(_audio_dur_for_lrc, _lrc_dur)
                 )
                 if _live_no_hint:
+                    _dur_diff = float(_audio_dur_for_lrc) - float(_lrc_dur)
                     logger.info(
-                        "[WC] divergent live/extended (audio %.0fs vs lrclib %.0fs, "
-                        "diff %.0fs) — clean whisperX, no hint, raw emit",
-                        float(_audio_dur_for_lrc), float(_lrc_dur),
-                        float(_audio_dur_for_lrc) - float(_lrc_dur),
+                        "[WC] divergent version (audio %.0fs vs lrclib %.0fs, "
+                        "diff %+.0fs — reference is %s) — clean whisperX, no hint, "
+                        "raw emit",
+                        float(_audio_dur_for_lrc), float(_lrc_dur), _dur_diff,
+                        "shorter (extended/live)" if _dur_diff > 0
+                        else "longer (edit/snippet)",
                     )
                 # Phase 2 (WHISPERX_NO_HINT_ALWAYS, default off): drop the lrclib
                 # hint for EVERY song, not just divergent lives. The hint

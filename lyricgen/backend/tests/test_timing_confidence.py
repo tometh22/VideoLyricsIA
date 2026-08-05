@@ -86,3 +86,49 @@ def test_returns_frozen_verdict():
     v = span_gate(_segs(100.0), 200.0)
     with pytest.raises(Exception):
         v.ok = False  # frozen dataclass
+
+
+# ── divergent_duration: is the reference even describing THIS recording? ────
+#
+# Symmetric by design. The signed version of this check shipped blind to the
+# "reference longer than the upload" side, which is what let Los Pericos
+# "Runaway (En Vivo)" (110 s upload vs a 205 s lrclib studio record) reach
+# forced_align and pile the studio outro onto the final timestamp.
+
+from timing_confidence import divergent_duration  # noqa: E402
+
+
+def test_reference_longer_than_upload_is_divergent():
+    """The Runaway (En Vivo) incident: 110 s cut vs a 205 s studio record."""
+    assert divergent_duration(110.0, 205.0) is True
+
+
+def test_reference_shorter_than_upload_is_divergent():
+    """The original extended-live case the signed check already caught."""
+    assert divergent_duration(300.0, 200.0) is True
+
+
+def test_matching_durations_are_not_divergent():
+    """Luciano Pereyra "Una Mujer Como Tu": 224 s audio vs 225 s reference.
+    Duration cannot tell these apart — a different guard has to."""
+    assert divergent_duration(224.0, 225.0) is False
+
+
+def test_normal_slack_is_not_divergent():
+    """Everyday few-second mismatches must not divert the whole pipeline."""
+    assert divergent_duration(200.0, 210.0) is False
+
+
+def test_short_song_uses_the_ratio_not_just_absolute_seconds():
+    """90 s audio vs a 140 s reference is only 50 s — under the absolute
+    tolerance — but 36% of the track, which is the same defect."""
+    assert divergent_duration(90.0, 140.0) is True
+
+
+@pytest.mark.parametrize("audio,ref", [
+    (None, 205.0), (110.0, None), (None, None),
+    (0, 205.0), (110.0, 0), (-5, 205.0), ("junk", 205.0), (110.0, "junk"),
+])
+def test_unmeasurable_never_diverts(audio, ref):
+    """If we cannot measure we must not change the caller's behaviour."""
+    assert divergent_duration(audio, ref) is False
