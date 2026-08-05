@@ -489,9 +489,11 @@ export default function LyricsEditor({
     () => reseedPreservingIds([], segments),
   );
   const [isDirty, setIsDirty] = useState(false);
-  // List vs visual timeline. Default "list" so the existing operator flow is
-  // untouched; the timeline is opt-in via the toolbar toggle.
-  const [viewMode, setViewMode] = useState("list"); // "list" | "timeline"
+  // Two views over the same editor state. The basic review flow is the
+  // default; timing tools only appear after the operator explicitly opens
+  // the advanced view.
+  const [viewMode, setViewMode] = useState("basic"); // "basic" | "advanced"
+  const [previewDockOpen, setPreviewDockOpen] = useState(true);
   // 2026-05-25 Studio Console — Modo enfoque. Toggle persistente que
   // agranda max-h de la lista + MAX_VH del timeline. Operador con 30-50
   // segments por video estaba scrolleando constante. localStorage usa
@@ -2273,7 +2275,7 @@ export default function LyricsEditor({
     // bajo el botón flotante "Aprobar y generar" (h-12 = 48 px + bottom-6
     // = 24 px + sombra). Sin esto la última card del timeline o de la
     // lista quedaba tapada cuando el operador scrolleaba hasta el final.
-    <div className={`w-full animate-fade-in mx-auto pb-28 ${viewMode === "timeline" ? "max-w-6xl" : "max-w-[1400px]"}`}>
+    <div className={`w-full animate-fade-in mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
       {/* Hidden audio element drives playback. */}
       {audioUrl && (
         <audio
@@ -2514,15 +2516,17 @@ export default function LyricsEditor({
               </span>
             </div>
           )}
-          {/* Lista | Línea de tiempo — the timeline is a VIEW of the same
-              editor (shared state), default Lista. Narrow/mobile: icon-only
-              (labels ocultos) para que el toggle entre sin empujar el ⋯. */}
-          <div className="inline-flex shrink-0 rounded-md ring-1 ring-white/[0.08] overflow-hidden text-label">
+          {/* Two clear views over the same editor and data. Basic is the
+              default review flow; advanced exposes the timing workspace. */}
+          <div className="inline-flex shrink-0 rounded-md ring-1 ring-white/[0.08] overflow-hidden text-label" role="tablist" aria-label={t("editor.mode_label") || "Modo de edición"}>
             <button
-              onClick={() => setViewMode("list")}
-              title="Mejor para corregir el texto: cada línea en una fila ancha con input directo."
-              aria-label={t("editor.view_list") || "Lista"}
-              className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "list" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
+              type="button"
+              role="tab"
+              aria-selected={viewMode === "basic"}
+              onClick={() => { setViewMode("basic"); setSyncMode(false); setOverflowOpen(false); }}
+              title={t("editor.basic_hint") || "Corregí la letra y revisá los tiempos."}
+              aria-label={t("editor.basic_view") || "Revisar letra"}
+              className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "basic" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
             >
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <line x1="8" y1="6" x2="21" y2="6" strokeLinecap="round" />
@@ -2532,27 +2536,42 @@ export default function LyricsEditor({
                 <circle cx="3.5" cy="12" r="1" fill="currentColor" stroke="none" />
                 <circle cx="3.5" cy="18" r="1" fill="currentColor" stroke="none" />
               </svg>
-              <span className="hidden sm:inline">{t("editor.view_list") || "Lista"}</span>
+              <span className="hidden sm:inline">{t("editor.basic_view") || "Revisar letra"}</span>
             </button>
             <button
-              onClick={() => setViewMode("timeline")}
-              title="Mejor para revisar el timing: cada línea en su posición temporal, arrastrable."
-              aria-label={t("editor.view_timeline") || "Línea de tiempo"}
-              className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "timeline" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
+              type="button"
+              role="tab"
+              aria-selected={viewMode === "advanced"}
+              onClick={() => setViewMode("advanced")}
+              title={t("editor.advanced_hint") || "Ajustá la posición de varias líneas en el audio."}
+              aria-label={t("editor.advanced_view") || "Ajustar tiempos"}
+              className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "advanced" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
             >
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <rect x="3" y="7" width="8" height="4" rx="1" />
                 <rect x="13" y="13" width="7" height="4" rx="1" />
                 <line x1="3" y1="3" x2="3" y2="21" strokeLinecap="round" opacity="0.5" />
               </svg>
-              <span className="hidden sm:inline">{t("editor.view_timeline") || "Línea de tiempo"}</span>
+              <span className="hidden sm:inline">{t("editor.advanced_view") || "Ajustar tiempos"}</span>
             </button>
           </div>
+          {viewMode === "advanced" && !hideTypographyControls && (
+            <button
+              type="button"
+              onClick={() => setPreviewDockOpen((value) => !value)}
+              aria-pressed={previewDockOpen}
+              title={previewDockOpen ? "Ocultar preview" : "Mostrar preview"}
+              className={`h-8 px-2.5 rounded-md ring-1 transition-colors text-label ${previewDockOpen ? "bg-white/[0.06] text-white ring-white/[0.14]" : "text-ink-secondary ring-white/[0.08] hover:text-white"}`}
+            >
+              <span className="hidden sm:inline">Preview</span>
+              <span className="sm:hidden">▣</span>
+            </button>
+          )}
           {/* ⋯ Overflow — 2026-07 rediseño: absorbe los controles secundarios
               (Expandir/Enfoque, Re-sincronizar con IA, Modo Sync) que antes
               eran botones sueltos en la barra. Re-sincronizar es una acción
               PESADA → no vive como botón púrpura permanente. */}
-          <div className="relative shrink-0">
+          {viewMode === "advanced" && <div className="relative shrink-0">
             <button
               type="button"
               data-testid="editor-overflow-btn"
@@ -2642,7 +2661,7 @@ export default function LyricsEditor({
                 </div>
               </>
             )}
-          </div>
+          </div>}
         </div>
       ); return playerSlot ? createPortal(_playerBar, playerSlot) : _playerBar; })()}
 
@@ -3156,12 +3175,12 @@ export default function LyricsEditor({
              izquierda no renderiza — los controles ya están en el paso
              4 del stepper y el preview central del wizard refleja los
              cambios. El grid colapsa a 1 columna full-width. */}
-      <div className={`grid gap-4 mb-4 items-start ${hideTypographyControls ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2"}`}>
+      <div className={`grid gap-4 mb-4 items-start ${viewMode === "advanced" ? (previewDockOpen && !hideTypographyControls ? "grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px]" : "grid-cols-1") : (hideTypographyControls ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2")}`}>
           {/* COLUMNA IZQUIERDA — sticky en desktop. Controles tipográficos
               + LyricVideoPreview (editable) + scope toggle.
               Phase 2: oculta si hideTypographyControls=true (modo wizard). */}
           {!hideTypographyControls && (
-          <div className="space-y-2 lg:sticky lg:top-2 lg:self-start">
+          <div className={`space-y-2 lg:sticky lg:top-2 lg:self-start ${viewMode === "advanced" ? "xl:order-2" : ""}`}>
             {/* Live font switcher — preview re-renders in the chosen
                 typeface instantly; applied to the render on re-render. */}
             <div className="flex items-center gap-2 px-1">
@@ -3262,8 +3281,8 @@ export default function LyricsEditor({
               según viewMode. min-w-0 evita que rows muy largas rompan el grid.
               Phase E 2026-05-25: relative + el mini-map vertical se posiciona
               absolute a la derecha cuando hay >20 segments. */}
-          <div className="min-w-0 space-y-2 relative">
-            {viewMode === "timeline" && audioUrl ? (
+          <div className={`min-w-0 space-y-2 relative ${viewMode === "advanced" ? "xl:order-1" : ""}`}>
+            {viewMode === "advanced" && audioUrl ? (
               <LyricsTimeline
                 segments={edited}
                 duration={duration}
