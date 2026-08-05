@@ -45,6 +45,25 @@ function nearestTick(step) {
   return 30;
 }
 
+function normalizeTimelineSegments(input) {
+  if (!Array.isArray(input)) return [];
+  return input.map((segment, index) => {
+    const rawStart = segment?.start ?? segment?.startTime ?? segment?.start_time ?? 0;
+    const rawEnd = segment?.end ?? segment?.endTime ?? segment?.end_time;
+    const parsedStart = Number(rawStart);
+    const parsedEnd = Number(rawEnd);
+    const start = Number.isFinite(parsedStart) ? Math.max(0, parsedStart) : 0;
+    const end = Number.isFinite(parsedEnd) ? Math.max(start + MIN_DUR_S, parsedEnd) : start + 1;
+    return {
+      ...segment,
+      _id: segment?._id ?? index,
+      start,
+      end,
+      text: segment?.text == null ? "" : String(segment.text),
+    };
+  });
+}
+
 export default function LyricsTimeline({
   segments,
   duration,
@@ -88,10 +107,11 @@ export default function LyricsTimeline({
   const [followEnabled, setFollowEnabled] = useState(true);
   const [followSuppressed, setFollowSuppressed] = useState(false);
 
-  const total = Math.max(duration || 0, ...segments.map((s) => s.end), 1);
+  const normalizedSegments = useMemo(() => normalizeTimelineSegments(segments), [segments]);
+  const total = Math.max(Number(duration) || 0, ...normalizedSegments.map((s) => s.end), 1);
   const trackWidth = Math.max(viewportWidth, total * pxPerSec + 120);
-  const trackHeight = Math.max(ROW_H, segments.length * ROW_H);
-  const rowOfId = useMemo(() => new Map(segments.map((s, index) => [s._id, index])), [segments]);
+  const trackHeight = Math.max(ROW_H, normalizedSegments.length * ROW_H);
+  const rowOfId = useMemo(() => new Map(normalizedSegments.map((s, index) => [s._id, index])), [normalizedSegments]);
   const ticks = useMemo(() => {
     const step = nearestTick(120 / pxPerSec);
     const out = [];
@@ -125,12 +145,12 @@ export default function LyricsTimeline({
   }, []);
 
   useEffect(() => {
-    const valid = new Set(segments.map((s) => s._id));
+    const valid = new Set(normalizedSegments.map((s) => s._id));
     setSelectedIds((previous) => {
       const next = new Set([...previous].filter((id) => valid.has(id)));
       return next.size === previous.size ? previous : next;
     });
-  }, [segments]);
+  }, [normalizedSegments]);
 
   const xToTime = useCallback((clientX) => {
     const rect = surfaceRef.current?.getBoundingClientRect();
@@ -205,7 +225,7 @@ export default function LyricsTimeline({
     const bottom = Math.max(current.originY, current.currentY) - trackRect.top;
     const from = clamp(left / pxPerSec, 0, total);
     const to = clamp(right / pxPerSec, 0, total);
-    const ids = segments
+    const ids = normalizedSegments
       .filter((segment) => {
         const row = rowOfId.get(segment._id) ?? 0;
         const rowTop = row * ROW_H;
@@ -215,7 +235,7 @@ export default function LyricsTimeline({
       .map((segment) => segment._id);
     setSelectedIds(new Set(ids));
     markInteraction();
-  }, [markInteraction, onSeek, pxPerSec, rowOfId, segments, seekAt, toggleSelection, total]);
+  }, [markInteraction, normalizedSegments, onSeek, pxPerSec, rowOfId, seekAt, toggleSelection, total]);
 
   const startDrag = useCallback((event, segment, mode) => {
     event.preventDefault();
@@ -229,7 +249,7 @@ export default function LyricsTimeline({
       return;
     }
     const movingGroup = mode === "move" && selectedIds.has(segment._id) && selectedIds.size > 1;
-    const snapshots = (movingGroup ? segments.filter((item) => selectedIds.has(item._id)) : [segment])
+    const snapshots = (movingGroup ? normalizedSegments.filter((item) => selectedIds.has(item._id)) : [segment])
       .map((item) => ({ id: item._id, start: item.start, end: item.end }));
     if (!selectedIds.has(segment._id)) setSelectedIds(new Set([segment._id]));
     dragRef.current = {
@@ -245,7 +265,7 @@ export default function LyricsTimeline({
     event.currentTarget.setPointerCapture?.(event.pointerId);
     markInteraction();
     setPreview(movingGroup ? { changes: snapshots } : { id: segment._id, start: segment.start, end: segment.end });
-  }, [beginMarquee, markInteraction, onDragStart, pxPerSec, segments, selectedIds, selectionMode, toggleSelection]);
+  }, [beginMarquee, markInteraction, normalizedSegments, onDragStart, pxPerSec, selectedIds, selectionMode, toggleSelection]);
 
   const updateDrag = useCallback((event) => {
     const drag = dragRef.current;
@@ -383,6 +403,9 @@ export default function LyricsTimeline({
           {saveStatus === "saving" && <span className="text-[10px] text-ink-tertiary animate-pulse">{t("timeline.saving", "Guardando…")}</span>}
           {saveStatus === "saved" && <span className="text-[10px] text-emerald-300">✓ {t("timeline.saved", "Guardado")}</span>}
           {saveStatus === "error" && <span className="text-[10px] text-red-300">{t("timeline.save_error", "Sin guardar")}</span>}
+          <span className="text-[10px] text-ink-tertiary tabular-nums" aria-live="polite">
+            {normalizedSegments.length} {t("timeline.lines_count", "líneas")}
+          </span>
         </div>
         <div className="flex items-center gap-1.5 flex-wrap">
           <button
@@ -447,7 +470,7 @@ export default function LyricsTimeline({
               if (!marqueeRef.current && !clickSuppressRef.current) seekAt(event.clientX);
             }}
           >
-            {segments.map((segment, index) => {
+            {normalizedSegments.map((segment, index) => {
               const previewItem = preview?.changes
                 ? preview.changes.find((change) => change.id === segment._id) || null
                 : preview?.id === segment._id ? preview : null;
@@ -462,7 +485,8 @@ export default function LyricsTimeline({
                 <div
                   key={segment._id}
                   title={`${fmt(start)} → ${fmt(end)}`}
-                  className={`absolute rounded-xl overflow-hidden ring-1 transition-colors select-none ${isActive ? "bg-brand/25" : "bg-surface-3/35"} ${isSelected ? "ring-2 ring-brand-light bg-brand/20" : "ring-white/[0.09]"} ${isFocused ? "outline outline-1 outline-white/80" : ""} ${isRecent ? "ring-accent" : ""}`}
+                  data-testid="timeline-segment"
+                  className={`absolute z-10 rounded-xl overflow-hidden ring-1 transition-colors select-none ${isActive ? "bg-brand/45" : "bg-surface-3/90"} ${isSelected ? "ring-2 ring-brand-light bg-brand/35" : "ring-white/[0.18]"} ${isFocused ? "outline outline-1 outline-white/80" : ""} ${isRecent ? "ring-accent" : ""}`}
                   style={{ left: start * pxPerSec, top: index * ROW_H + 7, width, height: ROW_H - 14, touchAction: "none" }}
                   onPointerDown={(event) => startDrag(event, segment, "move")}
                   onPointerMove={updateDrag}
@@ -496,9 +520,18 @@ export default function LyricsTimeline({
               );
             })}
 
-            {segments.map((segment, index) => (
+            {normalizedSegments.map((segment, index) => (
               <div key={`row-${segment._id}`} className="absolute left-0 right-0 border-b border-white/[0.035] pointer-events-none" style={{ top: index * ROW_H + ROW_H - 1 }} />
             ))}
+
+            {normalizedSegments.length === 0 && (
+              <div className="absolute inset-0 grid place-items-center text-center pointer-events-none">
+                <div className="rounded-xl bg-surface-2/80 ring-1 ring-white/[0.1] px-4 py-3">
+                  <p className="text-xs text-white">{t("timeline.empty_title", "No hay líneas para ajustar")}</p>
+                  <p className="mt-1 text-[10px] text-ink-tertiary">{t("timeline.empty_hint", "Volvé a la vista básica o recargá la letra")}</p>
+                </div>
+              </div>
+            )}
 
             {marquee && (
               <div className="absolute z-20 rounded-lg bg-brand/15 ring-1 ring-brand/70 pointer-events-none" style={{ left: Math.min(marquee.originX, marquee.currentX) - (surfaceRef.current?.getBoundingClientRect().left || 0), top: Math.min(marquee.originY, marquee.currentY) - (trackRef.current?.getBoundingClientRect().top || 0), width: Math.abs(marquee.currentX - marquee.originX), height: Math.abs(marquee.currentY - marquee.originY) }} aria-hidden="true" />
