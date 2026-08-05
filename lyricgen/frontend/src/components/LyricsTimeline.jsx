@@ -15,7 +15,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 
 const ZOOM_DEFAULT = 90;
-const ZOOM_MIN = 30;
+const ZOOM_MIN = 8;
 const ZOOM_MAX = 260;
 const ZOOM_STEP = 20;
 const ROW_H = 48;
@@ -96,12 +96,14 @@ export default function LyricsTimeline({
   const followLockRef = useRef(false);
   const lastInteractionRef = useRef(0);
   const clickSuppressRef = useRef(false);
-  const [viewportWidth, setViewportWidth] = useState(960);
+  const autoFitKeyRef = useRef(null);
+  const [viewportWidth, setViewportWidth] = useState(0);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [selectionMode, setSelectionMode] = useState(false);
   const [marquee, setMarquee] = useState(null);
   const [preview, setPreview] = useState(null);
   const [pxPerSec, setPxPerSec] = useState(ZOOM_DEFAULT);
+  const [moreActionsOpen, setMoreActionsOpen] = useState(false);
   const [editingTextId, setEditingTextId] = useState(null);
   const [draftText, setDraftText] = useState("");
   const [followEnabled, setFollowEnabled] = useState(true);
@@ -109,7 +111,7 @@ export default function LyricsTimeline({
 
   const normalizedSegments = useMemo(() => normalizeTimelineSegments(segments), [segments]);
   const total = Math.max(Number(duration) || 0, ...normalizedSegments.map((s) => s.end), 1);
-  const trackWidth = Math.max(viewportWidth, total * pxPerSec + 120);
+  const trackWidth = Math.max(viewportWidth || 960, total * pxPerSec + 24);
   const trackHeight = Math.max(ROW_H, normalizedSegments.length * ROW_H);
   const rowOfId = useMemo(() => new Map(normalizedSegments.map((s, index) => [s._id, index])), [normalizedSegments]);
   const ticks = useMemo(() => {
@@ -143,6 +145,18 @@ export default function LyricsTimeline({
     observer.observe(node);
     return () => observer.disconnect();
   }, []);
+
+  const fitZoom = useCallback(() => (
+    clamp((Math.max(viewportWidth, 960) - 24) / Math.max(total, 1), ZOOM_MIN, ZOOM_MAX)
+  ), [total, viewportWidth]);
+
+  useEffect(() => {
+    if (!viewportWidth || !total) return;
+    const fitKey = `${Number(duration) || 0}:${normalizedSegments.length}`;
+    if (autoFitKeyRef.current === fitKey) return;
+    autoFitKeyRef.current = fitKey;
+    setPxPerSec(fitZoom());
+  }, [duration, fitZoom, normalizedSegments.length, total, viewportWidth]);
 
   useEffect(() => {
     const valid = new Set(normalizedSegments.map((s) => s._id));
@@ -240,11 +254,14 @@ export default function LyricsTimeline({
   const startDrag = useCallback((event, segment, mode) => {
     event.preventDefault();
     event.stopPropagation();
-    if (event.metaKey || event.ctrlKey || event.shiftKey) {
+    if ((event.metaKey || event.ctrlKey) && !event.shiftKey) {
       toggleSelection(segment._id);
       return;
     }
-    if (selectionMode) {
+    // Body drag keeps its familiar move behavior. Selection intent is explicit
+    // through the Select button or Shift+drag, so a user can paint from a line
+    // without sacrificing precise timing moves and edge resizing.
+    if (mode === "move" && (selectionMode || event.shiftKey)) {
       beginMarquee(event, segment._id);
       return;
     }
@@ -330,8 +347,9 @@ export default function LyricsTimeline({
   }, [finishMarquee, onFocus, onTimingChange, onTimingChangeBatch, preview, seekAt]);
 
   const fitTimeline = useCallback(() => {
-    setPxPerSec(clamp(viewportWidth / Math.max(total, 1), ZOOM_MIN, 140));
-  }, [total, viewportWidth]);
+    setPxPerSec(fitZoom());
+    setMoreActionsOpen(false);
+  }, [fitZoom]);
 
   const scrollToPlayhead = useCallback(() => {
     const sc = scrollRef.current;
@@ -407,15 +425,15 @@ export default function LyricsTimeline({
             {normalizedSegments.length} {t("timeline.lines_count", "líneas")}
           </span>
         </div>
-        <div className="flex items-center gap-1.5 flex-wrap">
+        <div className="flex items-center gap-1.5 flex-wrap" data-testid="timeline-primary-actions">
           <button
             type="button"
             onClick={() => setSelectionMode((value) => !value)}
             aria-pressed={selectionMode}
-            title={t("timeline.select_hint", "Arrastrá sobre las líneas para seleccionar")}
+            title={t("timeline.select_hint", "Arrastrá sobre cualquier zona para seleccionar líneas")}
             className={`h-8 px-3 rounded-lg text-[11px] font-medium ring-1 transition-colors ${selectionMode ? "bg-brand/20 text-brand-light ring-brand/40" : "text-ink-secondary ring-white/[0.1] hover:text-white hover:bg-white/[0.05]"}`}
           >
-            {selectionMode ? t("timeline.selecting", "Seleccionando") : t("timeline.select", "Seleccionar líneas")}
+            {selectionMode ? t("timeline.selecting", "Seleccionando") : t("timeline.select", "Seleccionar")}
           </button>
           {selectedIds.size > 0 && (
             <span className="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-lg bg-brand/10 text-brand-light text-[11px]" aria-live="polite">
@@ -423,23 +441,45 @@ export default function LyricsTimeline({
               <button type="button" onClick={() => setSelectedIds(new Set())} className="text-brand-light/70 hover:text-white" aria-label={t("timeline.clear_selection", "Limpiar selección")}>×</button>
             </span>
           )}
+          <button type="button" onClick={fitTimeline} title={t("timeline.fit_hint", "Ver la canción completa")} className="h-8 px-3 rounded-lg text-[11px] text-ink-secondary ring-1 ring-white/[0.1] hover:text-white">{t("timeline.fit", "Ajustar")}</button>
+          <button type="button" onClick={onReset} className="h-8 px-3 rounded-lg text-[11px] text-ink-secondary ring-1 ring-white/[0.1] hover:text-white">{t("timeline.reset", "Restaurar")}</button>
           <button
             type="button"
-            onClick={() => setFollowEnabled((value) => !value)}
-            aria-pressed={followEnabled}
-            title={t("timeline.follow_hint", "Mantener la línea activa visible")}
-            className={`h-8 px-3 rounded-lg text-[11px] ring-1 transition-colors ${followEnabled && !followSuppressed ? "text-brand-light bg-brand/10 ring-brand/30" : "text-ink-secondary ring-white/[0.1] hover:text-white"}`}
+            aria-expanded={moreActionsOpen}
+            aria-controls="timeline-more-actions"
+            onClick={() => setMoreActionsOpen((value) => !value)}
+            className="h-8 px-3 rounded-lg text-[11px] text-ink-secondary ring-1 ring-white/[0.1] hover:text-white"
           >
-            {followEnabled && followSuppressed ? t("timeline.resume", "Reanudar seguimiento") : t("timeline.follow", "Seguir reproducción")}
+            {t("editor.more_actions", "Más acciones")} <span aria-hidden="true">⌄</span>
           </button>
-          <button type="button" onClick={fitTimeline} className="h-8 px-3 rounded-lg text-[11px] text-ink-secondary ring-1 ring-white/[0.1] hover:text-white">{t("timeline.fit", "Ajustar")}</button>
-          <div className="inline-flex items-center h-8 rounded-lg ring-1 ring-white/[0.1] overflow-hidden">
-            <button type="button" onClick={() => setPxPerSec((value) => Math.max(ZOOM_MIN, value - ZOOM_STEP))} className="w-8 h-full text-ink-secondary hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.zoom_out", "Alejar")}>−</button>
-            <span className="px-2 text-[10px] text-ink-tertiary tabular-nums">{Math.round(pxPerSec)} px/s</span>
-            <button type="button" onClick={() => setPxPerSec((value) => Math.min(ZOOM_MAX, value + ZOOM_STEP))} className="w-8 h-full text-ink-secondary hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.zoom_in", "Acercar")}>+</button>
-          </div>
-          <button type="button" onClick={onReset} className="h-8 px-3 rounded-lg text-[11px] text-ink-secondary ring-1 ring-white/[0.1] hover:text-white">{t("timeline.reset", "Restaurar")}</button>
+          {moreActionsOpen && (
+            <div id="timeline-more-actions" role="menu" className="basis-full flex items-center gap-1.5 flex-wrap justify-end pt-1">
+              <button
+                type="button"
+                onClick={() => setFollowEnabled((value) => !value)}
+                aria-pressed={followEnabled}
+                title={t("timeline.follow_hint", "Mantener la línea activa visible")}
+                className={`h-8 px-3 rounded-lg text-[11px] ring-1 transition-colors ${followEnabled && !followSuppressed ? "text-brand-light bg-brand/10 ring-brand/30" : "text-ink-secondary ring-white/[0.1] hover:text-white"}`}
+              >
+                {followEnabled && followSuppressed ? t("timeline.resume", "Reanudar seguimiento") : t("timeline.follow", "Seguir reproducción")}
+              </button>
+              <div className="inline-flex items-center h-8 rounded-lg ring-1 ring-white/[0.1] overflow-hidden">
+                <button type="button" onClick={() => setPxPerSec((value) => Math.max(ZOOM_MIN, value - ZOOM_STEP))} className="w-8 h-full text-ink-secondary hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.zoom_out", "Alejar")}>−</button>
+                <span data-testid="timeline-zoom" className="px-2 text-[10px] text-ink-tertiary tabular-nums">{Math.round(pxPerSec)} px/s</span>
+                <button type="button" onClick={() => setPxPerSec((value) => Math.min(ZOOM_MAX, value + ZOOM_STEP))} className="w-8 h-full text-ink-secondary hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.zoom_in", "Acercar")}>+</button>
+              </div>
+            </div>
+          )}
         </div>
+      </div>
+
+      <div data-testid="timeline-selection-help" aria-live="polite" className="flex items-center gap-2 px-4 py-2 border-b border-white/[0.06] bg-surface-1/25 text-[10px] text-ink-tertiary">
+        <span className={`inline-block w-2 h-2 rounded-full ${selectionMode ? "bg-brand-light shadow-glow" : "bg-emerald-300"}`} aria-hidden="true" />
+        <span>
+          {selectionMode
+            ? `${t("timeline.selection_help", "Selección")}. Arrastrá sobre una línea o el espacio vacío para pintar varias.`
+            : `${t("timeline.selection_help", "Selección")}. Shift+arrastrar una línea pinta · arrastrar el cuerpo mueve · bordes ajustan`}
+        </span>
       </div>
 
       <div ref={scrollRef} data-testid="timeline-scroll" className="overflow-auto overscroll-contain" style={{ maxHeight: focusMode ? "calc(100vh - 220px)" : "min(620px, calc(100vh - 300px))" }}>
@@ -460,6 +500,7 @@ export default function LyricsTimeline({
           <div
             ref={trackRef}
             data-testid="timeline-lane"
+            data-px-per-sec={pxPerSec}
             className={`relative ${selectionMode ? "cursor-crosshair" : "cursor-crosshair"}`}
             style={{ height: trackHeight }}
             onPointerDown={(event) => beginMarquee(event)}
@@ -486,7 +527,7 @@ export default function LyricsTimeline({
                   key={segment._id}
                   title={`${fmt(start)} → ${fmt(end)}`}
                   data-testid="timeline-segment"
-                  className={`absolute z-10 rounded-xl overflow-hidden ring-1 transition-colors select-none ${isActive ? "bg-brand/45" : "bg-surface-3/90"} ${isSelected ? "ring-2 ring-brand-light bg-brand/35" : "ring-white/[0.18]"} ${isFocused ? "outline outline-1 outline-white/80" : ""} ${isRecent ? "ring-accent" : ""}`}
+                  className={`absolute z-10 rounded-xl overflow-hidden ring-1 transition-colors select-none ${selectionMode ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing"} ${isActive ? "bg-brand/45" : "bg-surface-3/90"} ${isSelected ? "ring-2 ring-brand-light bg-brand/35" : "ring-white/[0.18]"} ${isFocused ? "outline outline-1 outline-white/80" : ""} ${isRecent ? "ring-accent" : ""}`}
                   style={{ left: start * pxPerSec, top: index * ROW_H + 7, width, height: ROW_H - 14, touchAction: "none" }}
                   onPointerDown={(event) => startDrag(event, segment, "move")}
                   onPointerMove={updateDrag}
@@ -494,8 +535,12 @@ export default function LyricsTimeline({
                   onClick={(event) => event.stopPropagation()}
                 >
                   <div className="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize bg-brand/25 hover:bg-brand/80" title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea")} onPointerDown={(event) => startDrag(event, segment, "start")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} />
-                  <div className="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize bg-brand/25 hover:bg-brand/80" title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea")} onPointerDown={(event) => startDrag(event, segment, "end")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} />
-                  <div className="flex items-center gap-2 h-full px-3 pl-4 pointer-events-none">
+                  <div data-testid="timeline-edge-end" className="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize bg-brand/25 hover:bg-brand/80" title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea")} onPointerDown={(event) => startDrag(event, segment, "end")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} />
+                  <div
+                    data-testid="timeline-segment-body"
+                    className={`flex items-center gap-2 h-full px-3 pl-4 pointer-events-none ${selectionMode ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing"}`}
+                    title={selectionMode ? "Arrastrá para pintar una selección" : "Arrastrá para mover · Shift+arrastrá para seleccionar"}
+                  >
                     <span className="text-[9px] text-ink-tertiary tabular-nums shrink-0">{fmt(start)}</span>
                     {editingTextId === segment._id ? (
                       <input

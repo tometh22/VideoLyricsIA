@@ -45,10 +45,11 @@ describe("LyricsTimeline", () => {
         { _id: "a", start: "13.2", end: "15.8", text: "línea desde API" },
       ],
     });
-    const block = screen.getByTestId("timeline-segment");
+    const block = screen.getAllByTestId("timeline-segment")[0];
+    const zoom = Number(screen.getByTestId("timeline-lane").dataset.pxPerSec);
     expect(block).toBeInTheDocument();
-    expect(block.style.left).toBe("1188px");
-    expect(parseFloat(block.style.width)).toBeCloseTo(234, 5);
+    expect(parseFloat(block.style.left)).toBeCloseTo(13.2 * zoom, 5);
+    expect(parseFloat(block.style.width)).toBeCloseTo(Math.max(56, 2.6 * zoom), 5);
   });
 
   it("seeks when clicking anywhere on the empty timeline", () => {
@@ -57,7 +58,16 @@ describe("LyricsTimeline", () => {
     fireEvent.pointerDown(lane, { clientX: 300, clientY: 10, pointerId: 1, button: 0 });
     fireEvent.pointerUp(lane, { clientX: 300, clientY: 10, pointerId: 1, button: 0 });
     expect(props.onSeek).toHaveBeenCalledTimes(1);
-    expect(props.onSeek.mock.calls[0][0]).toBeCloseTo(300 / 90, 2);
+    const zoom = Number(lane.dataset.pxPerSec);
+    expect(props.onSeek.mock.calls[0][0]).toBeCloseTo(300 / zoom, 2);
+  });
+
+  it("fits the timeline to the available width on first render", () => {
+    setup();
+    const lane = screen.getByTestId("timeline-lane");
+    const surface = lane.closest("div[style*='width']");
+    expect(Number(lane.dataset.pxPerSec)).toBeLessThan(90);
+    expect(parseFloat(surface.style.width)).toBeLessThanOrEqual(960);
   });
 
   it("clicking a line focuses it and seeks without editing its timing", () => {
@@ -108,26 +118,34 @@ describe("LyricsTimeline", () => {
     setup();
     const lane = screen.getByTestId("timeline-lane");
     fireEvent.pointerDown(lane, { clientX: 0, clientY: 0, pointerId: 1, button: 0 });
-    fireEvent.pointerMove(lane, { clientX: 1100, clientY: 100, pointerId: 1 });
-    fireEvent.pointerUp(lane, { clientX: 1100, clientY: 100, pointerId: 1 });
+    fireEvent.pointerMove(lane, { clientX: 1100, clientY: 80, pointerId: 1 });
+    fireEvent.pointerUp(lane, { clientX: 1100, clientY: 80, pointerId: 1 });
     expect(screen.getByText("2 seleccionadas")).toBeInTheDocument();
   });
 
-  it("can start painting from a line after enabling selection mode", () => {
+  it("can start painting from a line with Shift without enabling selection mode", () => {
     setup();
-    fireEvent.click(screen.getByRole("button", { name: "Seleccionar líneas" }));
     const block = screen.getByText("segunda línea").closest("div[title]");
-    fireEvent.pointerDown(block, { clientX: 900, clientY: 55, pointerId: 1, button: 0 });
+    fireEvent.pointerDown(block, { clientX: 900, clientY: 55, pointerId: 1, button: 0, shiftKey: true });
     fireEvent.pointerMove(block, { clientX: 0, clientY: 0, pointerId: 1 });
     fireEvent.pointerUp(block, { clientX: 0, clientY: 0, pointerId: 1 });
-    expect(screen.getByText(/seleccionando/i)).toBeInTheDocument();
     expect(screen.getByText("2 seleccionadas")).toBeInTheDocument();
+  });
+
+  it("shows selection instructions and distinct move/resize cursors", () => {
+    setup();
+    const help = screen.getByTestId("timeline-selection-help");
+    const block = screen.getAllByTestId("timeline-segment")[0];
+    const edge = block.querySelector('[data-testid="timeline-edge-end"]');
+    expect(help).toHaveTextContent("Shift+arrastrar");
+    expect(block.className).toContain("cursor-grab");
+    expect(edge.className).toContain("cursor-ew-resize");
   });
 
   it("resizes timing from either horizontal edge", () => {
     const props = setup();
-    const block = screen.getByText("segunda línea").closest("div[title]");
-    const edge = block.querySelector('[title="Arrastrá: cuándo SALE la línea"]');
+    const block = screen.getAllByTestId("timeline-segment")[1];
+    const edge = block.querySelector('[data-testid="timeline-edge-end"]');
     fireEvent.pointerDown(edge, { clientX: 1000, pointerId: 1, button: 0 });
     fireEvent.pointerMove(edge, { clientX: 1080, pointerId: 1 });
     fireEvent.pointerUp(edge, { clientX: 1080, pointerId: 1 });
@@ -154,6 +172,7 @@ describe("LyricsTimeline", () => {
   it("shows save status, restore action and zoom controls", () => {
     const props = setup({ saveStatus: "saving" });
     expect(screen.getByText("Guardando…")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /más acciones/i }));
     fireEvent.click(screen.getByText("Restaurar"));
     expect(props.onReset).toHaveBeenCalledTimes(1);
     expect(screen.getByLabelText("Alejar")).toBeInTheDocument();
