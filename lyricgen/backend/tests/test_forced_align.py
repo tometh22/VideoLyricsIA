@@ -292,3 +292,67 @@ def test_phonetic_does_not_rescue_genuinely_unrelated_text():
     # phonetic must not lower the bar so far that drift-abort stops firing
     # on random noise.
     assert fa.wordstamps_to_segments(words, lines) == []
+
+
+# ── tail pile-up: reference longer than the recording ───────────────────────
+#
+# Incident "638" (2026-05-26, "5 lines stuck at exactly 1:15.5") and Los Pericos
+# "Runaway (En Vivo)" (2026-08-05, ~17 lines piled at 1:50). A studio reference
+# over a radio edit / live cut leaves surplus lines with nowhere to anchor; the
+# best-effort fallback used to pin each of them to the same end-of-stream
+# window. Neither drift_abort (reset by the lines that DO anchor) nor the text
+# gate (the final window genuinely sounds like the repeated chorus) catches it.
+
+def _runaway_audio():
+    """A 14 s cut: four sung lines, then an outro that sings the hook twice.
+    Outro words are 0.25 s apart, which is what makes the surplus lines crowd
+    into tenths of a second instead of landing on one identical timestamp."""
+    words = ("uno dos tres cuatro cinco seis siete ocho nueve diez once doce "
+             "runa runa runa runaway away runa runa runaway").split()
+    stamps, t = [], 0.0
+    for i, w in enumerate(words):
+        dur = 1.0 if i < 12 else 0.25
+        stamps.append(_w(w, t, t + dur * 0.9))
+        t += dur
+    return stamps
+
+
+def _runaway_studio_reference():
+    """The 205 s studio lyric: the hook eight times over, plus an outro verse
+    this 14 s cut never reaches."""
+    return (["uno dos tres", "cuatro cinco seis", "siete ocho nueve",
+             "diez once doce"]
+            + ["runa runa runa runaway", "away"] * 8
+            + ["cuida cuidame bien", "que lo mio es serio",
+               "quiero quiero que estes", "a mi lado otra vez"])
+
+
+def test_surplus_reference_lines_are_not_crowded_at_the_end():
+    """No two lines may share a timestamp, and none may be pinned past the
+    last sung word. Before the guard this emitted 'away' and the hook both at
+    13.0 s — the operator's stack of lines under one time."""
+    segs = fa.wordstamps_to_segments(_runaway_audio(),
+                                     _runaway_studio_reference())
+    starts = [s["start"] for s in segs]
+    assert len(starts) == len(set(starts)), f"pile-up: {starts}"
+    last_word_end = _runaway_audio()[-1]["end"]
+    assert all(s["start"] <= last_word_end for s in segs)
+
+
+def test_reference_tail_absent_from_audio_is_not_emitted():
+    """The studio outro is not sung in this cut, so it must not reach the
+    editor — that is the 'Cuida, cuídame bien' the operator saw at 1:50."""
+    segs = fa.wordstamps_to_segments(_runaway_audio(),
+                                     _runaway_studio_reference())
+    texts = " | ".join(s["text"] for s in segs)
+    assert "cuida cuidame bien" not in texts
+    assert "a mi lado otra vez" not in texts
+
+
+def test_lines_that_anchor_are_untouched_by_the_guard():
+    """Non-regression: a reference that matches the audio keeps every line."""
+    stamps = [_w(t, float(i), float(i) + 0.9)
+              for i, t in enumerate("una dos tres cuatro cinco seis".split())]
+    segs = fa.wordstamps_to_segments(stamps, ["una dos tres", "cuatro cinco seis"])
+    assert [s["text"] for s in segs] == ["una dos tres", "cuatro cinco seis"]
+    assert segs[0]["start"] != segs[1]["start"]
