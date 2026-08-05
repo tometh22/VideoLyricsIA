@@ -46,12 +46,23 @@ window.addEventListener("vite:preloadError", (event) => {
     // infinito. NO llamamos preventDefault: queremos que Vite re-lance.
     return;
   }
-  // preventDefault frena el re-throw de Vite. Sin esto, aunque
-  // recarguemos, Vite igual re-lanza el error sincrónicamente → se
-  // propaga como unhandledrejection → lo captura Sentry (ruido: la
-  // recarga ya resolvió el problema) y puede parpadear el
-  // GlobalErrorBoundary antes de que la navegación complete.
-  event.preventDefault();
+  // NO llamar event.preventDefault() acá. Cancelar el evento hace que el
+  // helper __vitePreload de Vite NO re-lance el error → la promesa del
+  // import() lazy RESUELVE con `undefined` en vez de rejectar. Entonces
+  // React.lazy hace `undefined.default` y tira "Cannot read properties of
+  // undefined (reading 'default')" — un error que GlobalErrorBoundary NO
+  // reconoce como stale-bundle (isStaleBundleError busca "failed to fetch
+  // dynamically imported module", no "default"), así que muestra el cartel
+  // rojo genérico "Algo salió mal" en vez del amber "Nueva versión
+  // disponible", y encima le gana la carrera al reload → operador trabado.
+  // (Regresión introducida por #1062, reportada en staging 2026-08-05.)
+  //
+  // Dejando que Vite re-lance: el import() rejecta con "Failed to fetch
+  // dynamically imported module", React.lazy lo re-tira, GlobalErrorBoundary
+  // lo detecta como stale-bundle (fallback amigable) mientras el reload de
+  // abajo ya está en vuelo. El ruido en Sentry que motivó el preventDefault
+  // ya lo cubre observability.js (ignoreErrors: /Failed to fetch dynamically
+  // imported module/i + /Unable to preload CSS/i).
   sessionStorage.setItem("__vite_reload_at", String(Date.now()));
   console.warn("[stale-bundle] vite:preloadError detected, forcing reload", event);
   window.location.reload();
