@@ -420,6 +420,10 @@ describe("LyricsEditor — modo enfoque body class broadcast", () => {
     // Default OFF — la clase no debe estar al montar.
     expect(document.body.classList.contains("editor-focus-mode")).toBe(false);
 
+    // La vista básica mantiene la barra despejada; los controles avanzados
+    // viven en "Ajustar tiempos".
+    await userEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+
     // Abrí el menú ⋯ y clic en "Expandir (modo enfoque)".
     await userEvent.click(screen.getByTestId("editor-overflow-btn"));
     await userEvent.click(screen.getByText(/Expandir \(modo enfoque\)/i));
@@ -436,6 +440,7 @@ describe("LyricsEditor — modo enfoque body class broadcast", () => {
     const { unmount } = render(<LyricsEditor {...props} />);
 
     // Prendé focus mode desde el menú ⋯.
+    await userEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
     await userEvent.click(screen.getByTestId("editor-overflow-btn"));
     await userEvent.click(screen.getByText(/Expandir \(modo enfoque\)/i));
     expect(document.body.classList.contains("editor-focus-mode")).toBe(true);
