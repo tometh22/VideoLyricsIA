@@ -39,6 +39,18 @@ describe("LyricsTimeline", () => {
     expect(screen.getByText("tercera línea")).toBeInTheDocument();
   });
 
+  it("keeps blocks visible when API timings arrive as strings", () => {
+    setup({
+      segments: [
+        { _id: "a", start: "13.2", end: "15.8", text: "línea desde API" },
+      ],
+    });
+    const block = screen.getByTestId("timeline-segment");
+    expect(block).toBeInTheDocument();
+    expect(block.style.left).toBe("1188px");
+    expect(parseFloat(block.style.width)).toBeCloseTo(234, 5);
+  });
+
   it("seeks when clicking anywhere on the empty timeline", () => {
     const props = setup();
     const lane = screen.getByTestId("timeline-lane");

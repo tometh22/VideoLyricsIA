@@ -493,13 +493,14 @@ export default function LyricsEditor({
   // default; timing tools only appear after the operator explicitly opens
   // the advanced view.
   const [viewMode, setViewMode] = useState("basic"); // "basic" | "advanced"
-  const [previewDockOpen, setPreviewDockOpen] = useState(true);
+  const [previewDockOpen, setPreviewDockOpen] = useState(false);
   // 2026-05-25 Studio Console — Modo enfoque. Toggle persistente que
   // agranda max-h de la lista + MAX_VH del timeline. Operador con 30-50
   // segments por video estaba scrolleando constante. localStorage usa
   // string "1"/"0" (el hook es string-only).
   const [focusModeRaw, setFocusModeRaw] = useLocalStorage("genly_editor_focus", "0");
   const focusMode = focusModeRaw === "1";
+  const workspaceFocusMode = focusMode || (viewMode === "advanced" && hideTypographyControls);
   const toggleFocusMode = useCallback(
     () => setFocusModeRaw((v) => (v === "1" ? "0" : "1")),
     [setFocusModeRaw],
@@ -515,9 +516,9 @@ export default function LyricsEditor({
   // se limpia solo en unmount cuando el operador navega a otro paso.
   useEffect(() => {
     if (typeof document === "undefined") return undefined;
-    document.body.classList.toggle("editor-focus-mode", focusMode);
+    document.body.classList.toggle("editor-focus-mode", workspaceFocusMode);
     return () => document.body.classList.remove("editor-focus-mode");
-  }, [focusMode]);
+  }, [workspaceFocusMode]);
   // El auto-fix dejó de ser un card/pill propio (2026-07 rediseño): ahora
   // es el chip ghost "Aplicar corrección · N" con popover en la fila de
   // chips, así que ya no hace falta un estado de expand/collapse propio.
@@ -3175,6 +3176,19 @@ export default function LyricsEditor({
              izquierda no renderiza — los controles ya están en el paso
              4 del stepper y el preview central del wizard refleja los
              cambios. El grid colapsa a 1 columna full-width. */}
+      <div className="mb-3 flex items-center gap-3 rounded-xl bg-surface-2/35 px-3 py-2.5 ring-1 ring-white/[0.06]" data-testid="editor-mode-explainer">
+        <span className="text-[10px] font-semibold uppercase tracking-[0.16em] text-ink-tertiary">{t("editor.mode_label") || "Modo de trabajo"}</span>
+        <span className="text-xs text-white font-medium">
+          {viewMode === "advanced"
+            ? (t("editor.advanced_mode_label") || "Avanzada · Ajustar tiempos")
+            : (t("editor.basic_mode_label") || "Básica · Revisar letra")}
+        </span>
+        <span className="hidden md:inline text-[11px] text-ink-tertiary">
+          {viewMode === "advanced"
+            ? (t("editor.advanced_mode_desc") || "Timeline, selección múltiple y movimiento grupal")
+            : (t("editor.basic_mode_desc") || "Texto, reproducción y correcciones rápidas")}
+        </span>
+      </div>
       <div className={`grid gap-4 mb-4 items-start ${viewMode === "advanced" ? (previewDockOpen && !hideTypographyControls ? "grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px]" : "grid-cols-1") : (hideTypographyControls ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2")}`}>
           {/* COLUMNA IZQUIERDA — sticky en desktop. Controles tipográficos
               + LyricVideoPreview (editable) + scope toggle.
@@ -3294,7 +3308,7 @@ export default function LyricsEditor({
                 highlightedIds={highlightedIds}
                 waveform={waveform}
                 gapS={MIN_GAP_S}
-                focusMode={focusMode}
+                focusMode={workspaceFocusMode}
                 onSeek={(s) => seekTo(s, false)}
                 onDragStart={pushEditHistory}
                 onTimingChange={handleTimelineTimingChange}
@@ -3372,7 +3386,7 @@ export default function LyricsEditor({
                       pero el mouse-wheel no transfiere → scroll trapped.
                       Mobile mantiene el cap original (no hay outer
                       overflow ahí, el page scroll cubre todo). */}
-                  <div ref={listRef} className={`space-y-0.5 overflow-y-auto pr-1 pb-8 ${focusMode ? "max-h-[calc(100vh-110px)]" : "max-h-[calc(100vh-200px)]"} lg:max-h-none lg:overflow-visible`}>
+                  <div ref={listRef} className={`space-y-0.5 overflow-y-auto pr-1 pb-8 ${workspaceFocusMode ? "max-h-[calc(100vh-110px)]" : "max-h-[calc(100vh-200px)]"} lg:max-h-none lg:overflow-visible`}>
           {edited.map((seg, idx) => {
             const suggestion = suggestionsById[seg._id];
             const isApplied = suggestion && seg.text === suggestion;
