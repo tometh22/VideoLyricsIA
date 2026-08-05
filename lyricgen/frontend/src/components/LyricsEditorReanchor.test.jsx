@@ -92,6 +92,7 @@ describe("Re-sincronizar con IA", () => {
       <LyricsEditor {...baseProps({ onPersistSegments, onReanchor })} />,
     );
 
+    fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
     fireEvent.click(screen.getByTestId("editor-overflow-btn"));
 
     fireEvent.click(screen.getByTestId("reanchor-btn"));
@@ -118,6 +119,7 @@ describe("Re-sincronizar con IA", () => {
       })} />,
     );
 
+    fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
     fireEvent.click(screen.getByTestId("editor-overflow-btn"));
 
     fireEvent.click(screen.getByTestId("reanchor-btn"));
@@ -136,6 +138,7 @@ describe("Re-sincronizar con IA", () => {
         onReanchor,
       })} />,
     );
+    fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
     fireEvent.click(screen.getByTestId("editor-overflow-btn"));
     fireEvent.click(screen.getByTestId("reanchor-btn"));
     await waitFor(() => expect(toastSpy).toHaveBeenCalled());
