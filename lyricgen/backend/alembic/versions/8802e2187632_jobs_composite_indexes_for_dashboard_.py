@@ -46,18 +46,37 @@ def upgrade() -> None:
     # CREATE INDEX CONCURRENTLY (which Postgres refuses to run inside a
     # txn) succeeds. IF NOT EXISTS makes the migration safe to re-run
     # if a previous attempt was interrupted mid-build.
-    with op.get_context().autocommit_block():
-        op.execute(
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_jobs_tenant_status_created "
-            "ON jobs (tenant_id, status, created_at DESC)"
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        with op.get_context().autocommit_block():
+            op.execute(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_jobs_tenant_status_created "
+                "ON jobs (tenant_id, status, created_at DESC)"
+            )
+            op.execute(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_jobs_tenant_created "
+                "ON jobs (tenant_id, created_at DESC)"
+            )
+    else:
+        # SQLite (used by the test suite) does not support PostgreSQL's
+        # CONCURRENTLY syntax. Alembic owns the transaction here, so use
+        # portable DDL for non-Postgres dialects.
+        op.create_index(
+            "ix_jobs_tenant_status_created", "jobs",
+            ["tenant_id", "status", "created_at"], unique=False,
         )
-        op.execute(
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_jobs_tenant_created "
-            "ON jobs (tenant_id, created_at DESC)"
+        op.create_index(
+            "ix_jobs_tenant_created", "jobs",
+            ["tenant_id", "created_at"], unique=False,
         )
 
 
 def downgrade() -> None:
-    with op.get_context().autocommit_block():
-        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_jobs_tenant_created")
-        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_jobs_tenant_status_created")
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        with op.get_context().autocommit_block():
+            op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_jobs_tenant_created")
+            op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_jobs_tenant_status_created")
+    else:
+        op.drop_index("ix_jobs_tenant_created", table_name="jobs")
+        op.drop_index("ix_jobs_tenant_status_created", table_name="jobs")

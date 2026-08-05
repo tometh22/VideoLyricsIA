@@ -34,7 +34,7 @@ if _SENTRY_DSN:
 from fastapi import FastAPI, File, Form, Query, UploadFile, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -64,8 +64,21 @@ from auth import (
 import storage
 from datetime import datetime, timedelta, timezone
 
-from database import Job, User, UserSettings, AuditLog, get_db, init_db
+from database import (
+    Job, User, UserSettings, AuditLog, ProductEvent, EditorDocument, EditorVersion, get_db, init_db,
+)
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
+from editor import (
+    acquire_lock,
+    get_job_for_tenant,
+    get_or_create_document,
+    list_versions,
+    release_lock,
+    restore_version,
+    save_document,
+    serialize_document,
+    ensure_document,
+)
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
 from queue_jobs import enqueue_pipeline, queue_depth
@@ -1254,9 +1267,7 @@ async def upload_multipart_init(
     _validate_audio_filename_only(body.filename)
     from jobs import get_job_model
     job_row = get_job_model(db, body.job_id)
-    if (not job_row
-            or job_row.user_id != current_user["id"]
-            or job_row.tenant_id != current_user["tenant_id"]):
+    if (not job_row or job_row.tenant_id != current_user["tenant_id"]):
         raise HTTPException(status_code=404, detail="Job not found.")
     if job_row.status != "awaiting_upload":
         raise HTTPException(
@@ -1313,9 +1324,7 @@ async def upload_multipart_part_url(
         raise HTTPException(status_code=400, detail="part_number out of range")
     from jobs import get_job_model
     job_row = get_job_model(db, body.job_id)
-    if (not job_row
-            or job_row.user_id != current_user["id"]
-            or job_row.tenant_id != current_user["tenant_id"]):
+    if (not job_row or job_row.tenant_id != current_user["tenant_id"]):
         raise HTTPException(status_code=404, detail="Job not found.")
     if job_row.status != "awaiting_upload" or not job_row.multipart_upload_id:
         raise HTTPException(
@@ -1348,9 +1357,7 @@ async def upload_multipart_complete(
     stays in awaiting_upload until /transcribe-uploaded promotes it."""
     from jobs import get_job_model
     job_row = get_job_model(db, body.job_id)
-    if (not job_row
-            or job_row.user_id != current_user["id"]
-            or job_row.tenant_id != current_user["tenant_id"]):
+    if (not job_row or job_row.tenant_id != current_user["tenant_id"]):
         raise HTTPException(status_code=404, detail="Job not found.")
     if job_row.status != "awaiting_upload" or not job_row.multipart_upload_id:
         raise HTTPException(
@@ -1399,9 +1406,7 @@ async def upload_multipart_abort(
     and drop the Job row. Idempotent — calling twice is fine."""
     from jobs import get_job_model
     job_row = get_job_model(db, body.job_id)
-    if (not job_row
-            or job_row.user_id != current_user["id"]
-            or job_row.tenant_id != current_user["tenant_id"]):
+    if (not job_row or job_row.tenant_id != current_user["tenant_id"]):
         return {"ok": True}  # idempotent
     if job_row.multipart_upload_id and job_row.input_r2_key:
         storage.multipart_abort(job_row.input_r2_key, job_row.multipart_upload_id)
@@ -1416,6 +1421,16 @@ class _TranscribeUploadedReq(BaseModel):
     language: str = ""
     artist: str = ""
     title: str = ""
+
+
+def _persist_editor_transcription(db: Session, job_id: str, tenant_id: str, result: dict) -> dict:
+    """Seed the durable editor document without changing the response contract."""
+    segments = result.get("segments") or []
+    try:
+        ensure_document(db, job_id, tenant_id, segments)
+    except (LookupError, ValueError) as exc:
+        logger.warning("could not seed editor document for %s: %s", job_id, exc)
+    return result
 
 
 @app.post("/transcribe-uploaded")
@@ -1435,9 +1450,7 @@ async def transcribe_uploaded(
     """
     from jobs import get_job_model
     job_row = get_job_model(db, body.job_id)
-    if (not job_row
-            or job_row.user_id != current_user["id"]
-            or job_row.tenant_id != current_user["tenant_id"]):
+    if (not job_row or job_row.tenant_id != current_user["tenant_id"]):
         raise HTTPException(status_code=404, detail="Job not found.")
     if job_row.status not in ("awaiting_upload", "transcribed_pending"):
         raise HTTPException(
@@ -1481,10 +1494,236 @@ async def transcribe_uploaded(
     job_row.current_step = "editing"
     db.commit()
 
-    return await _run_transcription_for_job(
+    result = await _run_transcription_for_job(
         request, db, current_user, job_id, audio_path,
         language=body.language, artist=body.artist, title=body.title,
     )
+    return _persist_editor_transcription(db, job_id, current_user["tenant_id"], result)
+
+
+class EditorPatchRequest(BaseModel):
+    base_revision: int
+    segments: list[dict]
+    checkpoint: str = "autosave"
+
+
+class EditorRestoreRequest(BaseModel):
+    version_id: str
+    base_revision: int
+
+
+class ProductEventItem(BaseModel):
+    name: str
+    job_id: str | None = None
+    occurred_at: str | None = None
+    properties: dict = Field(default_factory=dict)
+
+
+class ProductEventsRequest(BaseModel):
+    events: list[ProductEventItem]
+
+
+def _editor_document_or_404(db: Session, job_id: str, current_user: dict):
+    job = get_job_for_tenant(db, job_id, current_user["tenant_id"])
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    try:
+        document = get_or_create_document(db, job_id, current_user["tenant_id"])
+    except LookupError:
+        raise HTTPException(
+            status_code=404,
+            detail="editor_document_not_found",
+        ) from None
+    return job, document
+
+
+@app.get("/editor/{job_id}")
+async def get_editor_document(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    payload = serialize_document(db, document)
+    payload.update({
+        "artist": job.artist,
+        "song_title": job.song_title,
+        "filename": job.filename,
+        "job_status": job.status,
+    })
+    return payload
+
+
+@app.patch("/editor/{job_id}")
+async def patch_editor_document(
+    job_id: str,
+    body: EditorPatchRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _, document = _editor_document_or_404(db, job_id, current_user)
+    try:
+        document, version = save_document(
+            db, document, current_user["id"], body.base_revision,
+            body.segments, body.checkpoint,
+        )
+    except RuntimeError:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "detail": "editor_revision_conflict",
+                "server_revision": document.revision,
+                "server_segments": document.current_segments,
+                "updated_by": serialize_document(db, document)["updated_by"],
+                "updated_at": serialize_document(db, document)["updated_at"],
+            },
+        ) from None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    return {
+        "job_id": job_id,
+        "revision": document.revision,
+        "version_id": version.id if version else None,
+        "saved_at": document.updated_at.isoformat(),
+    }
+
+
+@app.post("/editor/{job_id}/lock")
+@app.post("/editor/{job_id}/lock/heartbeat")
+async def editor_lock(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _, document = _editor_document_or_404(db, job_id, current_user)
+    return acquire_lock(db, document, current_user["id"])
+
+
+@app.delete("/editor/{job_id}/lock")
+async def editor_unlock(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _, document = _editor_document_or_404(db, job_id, current_user)
+    if not release_lock(db, document, current_user["id"]):
+        raise HTTPException(status_code=409, detail="editor_lock_owned_by_other_user")
+    return {"released": True}
+
+
+@app.get("/editor/{job_id}/versions")
+async def get_editor_versions(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _, document = _editor_document_or_404(db, job_id, current_user)
+    return {"versions": list_versions(db, document)}
+
+
+@app.post("/editor/{job_id}/restore")
+async def restore_editor_version(
+    job_id: str,
+    body: EditorRestoreRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _, document = _editor_document_or_404(db, job_id, current_user)
+    try:
+        document, version = restore_version(
+            db, document, current_user["id"], body.version_id, body.base_revision,
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="editor_version_not_found") from None
+    except RuntimeError:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "detail": "editor_revision_conflict",
+                "server_revision": document.revision,
+                "server_segments": document.current_segments,
+            },
+        ) from None
+    return {
+        "job_id": job_id,
+        "revision": document.revision,
+        "version_id": version.id,
+        "segments": document.current_segments,
+    }
+
+
+_PRODUCT_EVENT_NAMES = {
+    "editor_opened", "editor_view_changed", "editor_seek",
+    "editor_selection_created", "editor_group_moved", "editor_timing_changed",
+    "editor_undo",
+    "editor_autosave_success", "editor_autosave_failed", "editor_conflict",
+    "editor_version_restored", "editor_approved", "editor_help_opened",
+}
+
+
+@app.post("/analytics/events")
+async def record_product_events(
+    body: ProductEventsRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if len(body.events) > 50:
+        raise HTTPException(status_code=422, detail="A maximum of 50 events is accepted per batch.")
+    accepted = 0
+    for item in body.events:
+        if item.name not in _PRODUCT_EVENT_NAMES:
+            continue
+        properties = item.properties or {}
+        # Never persist lyrics, audio blobs, or unbounded client payloads.
+        properties = {
+            key: value for key, value in properties.items()
+            if key not in {"segments", "lyrics", "audio", "audio_url"}
+        }
+        if len(json.dumps(properties, ensure_ascii=False)) > 2000:
+            continue
+        occurred_at = None
+        if item.occurred_at:
+            try:
+                occurred_at = datetime.fromisoformat(item.occurred_at.replace("Z", "+00:00"))
+            except ValueError:
+                occurred_at = None
+        db.add(ProductEvent(
+            tenant_id=current_user["tenant_id"],
+            user_id=current_user["id"],
+            job_id=item.job_id,
+            name=item.name,
+            occurred_at=occurred_at,
+            properties=properties,
+        ))
+        accepted += 1
+    db.commit()
+    return {"accepted": accepted}
+
+
+@app.get("/admin/product-metrics")
+async def product_metrics(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    rows = db.query(ProductEvent).order_by(ProductEvent.created_at.desc()).limit(10000).all()
+    counts: dict[str, int] = {}
+    durations = []
+    first_edits = []
+    for row in rows:
+        counts[row.name] = counts.get(row.name, 0) + 1
+        props = row.properties or {}
+        if isinstance(props.get("duration_ms"), (int, float)):
+            durations.append(float(props["duration_ms"]))
+        if isinstance(props.get("time_to_first_edit_ms"), (int, float)):
+            first_edits.append(float(props["time_to_first_edit_ms"]))
+    return {
+        "events": counts,
+        "sample_size": len(rows),
+        "avg_session_duration_ms": sum(durations) / len(durations) if durations else None,
+        "avg_time_to_first_edit_ms": sum(first_edits) / len(first_edits) if first_edits else None,
+    }
 
 
 # Deprecation metadata for the legacy multipart-form endpoints. RFC 8594
@@ -1582,6 +1821,7 @@ async def upload(
     # moment one is free, and pipeline.run_pipeline flips status to
     # "processing" on its first line. No 429 for capacity reasons.
     initial_status = "queued"
+    tenant_id = current_user["tenant_id"]
 
     umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile, current_user=current_user)
 
@@ -1596,7 +1836,6 @@ async def upload(
     if usage_info["alert_100"] and current_user.get("plan") == "free":
         raise HTTPException(status_code=429, detail="Free plan limit reached. Upgrade to continue.")
 
-    tenant_id = current_user["tenant_id"]
     job_id = create_job(
         db,
         artist=artist, style=style, filename=file.filename,
@@ -1758,11 +1997,12 @@ async def transcribe_endpoint(
     # Per-request scratch dir for intermediate slices (intro/body cuts).
     # The main audio file lives under job_dir and stays around until
     # /generate enqueues it (or the reaper cleans it up).
-    return await _run_transcription_for_job(
+    result = await _run_transcription_for_job(
         request, db, current_user, job_id, audio_path,
         language=language, artist=artist, title=title,
         filename=file.filename,
     )
+    return _persist_editor_transcription(db, job_id, current_user["tenant_id"], result)
 
 
 async def _run_transcription_for_job(
@@ -2259,6 +2499,8 @@ async def generate_with_segments(
     style: str = Form("oscuro"),
     language: str = Form(""),
     segments_json: str = Form(...),
+    editor_version_id: str = Form(""),
+    editor_revision: int | None = Form(None),
     delivery_profile: str = Form("youtube"),
     umg_frame_size: str = Form(""),
     umg_fps: str = Form(""),
@@ -2299,9 +2541,7 @@ async def generate_with_segments(
         #     against the audio that already landed in R2).
         from jobs import get_job_model
         job_row = get_job_model(db, job_id)
-        if (not job_row
-                or job_row.user_id != current_user["id"]
-                or job_row.tenant_id != current_user["tenant_id"]):
+        if (not job_row or job_row.tenant_id != current_user["tenant_id"]):
             raise HTTPException(status_code=404, detail="Job not found.")
         if job_row.status not in ("transcribed_pending", "awaiting_upload"):
             raise HTTPException(
@@ -2353,6 +2593,7 @@ async def generate_with_segments(
     # moment one is free, and pipeline.run_pipeline flips status to
     # "processing" on its first line. No 429 for capacity reasons.
     initial_status = "queued"
+    tenant_id = current_user["tenant_id"]
 
     # Check AI authorization (UMG Guideline 5) — skip if using library background (no AI)
     if not background_id and current_user.get("role") != "admin":
@@ -2360,15 +2601,43 @@ async def generate_with_segments(
         if user_model and not user_model.ai_authorized:
             raise HTTPException(status_code=403, detail="AI tool usage not authorized. Contact admin for approval.")
 
-    segments = json.loads(segments_json)
+    try:
+        segments = json.loads(segments_json)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=422, detail="segments_json must be valid JSON") from None
+    if reuse and (editor_version_id or editor_revision is not None):
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+            EditorDocument.tenant_id == tenant_id,
+        ).first()
+        if not document:
+            raise HTTPException(status_code=409, detail="editor_document_not_found")
+        if editor_version_id:
+            version = db.query(EditorVersion).filter(
+                EditorVersion.id == editor_version_id,
+                EditorVersion.job_id == job_id,
+                EditorVersion.tenant_id == tenant_id,
+            ).first()
+            if not version:
+                raise HTTPException(status_code=409, detail="editor_version_not_found")
+            segments = version.segments
+        elif editor_revision != document.revision:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "detail": "editor_revision_conflict",
+                    "server_revision": document.revision,
+                    "server_segments": document.current_segments,
+                },
+            )
+        else:
+            segments = document.current_segments
     umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile, current_user=current_user)
 
     # Check plan limits
     usage_info = get_plan_usage(db, current_user["id"], current_user["tenant_id"], current_user.get("plan", "100"))
     if usage_info["alert_100"] and current_user.get("plan") == "free":
         raise HTTPException(status_code=429, detail="Free plan limit reached. Upgrade to continue.")
-
-    tenant_id = current_user["tenant_id"]
 
     if reuse:
         # Promote the existing transcribed_pending row in place — fill in

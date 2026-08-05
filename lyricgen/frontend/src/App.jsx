@@ -4,7 +4,7 @@ import {
   useNavigate, useLocation, useParams,
 } from "react-router-dom";
 import { useI18n } from "./i18n";
-import { IS_PRODUCTION, APP_ENV } from "./env";
+import { IS_PRODUCTION, APP_ENV, EDITOR_V2_ENABLED } from "./env";
 import { fetchWithTimeout } from "./fetchWithTimeout";
 import { uploadFileToR2 } from "./r2Upload";
 import LoginPage from "./components/LoginPage";
@@ -490,7 +490,7 @@ export default function App() {
     }
   };
 
-  const handleApproveLyrics = (editedSegments) => {
+  const handleApproveLyrics = (editedSegments, editorRevision = null) => {
     const r = currentReview;
     const newApproved = [...approvedJobs, {
       file: r.file, artist: r.artist, language: r.language,
@@ -499,6 +499,7 @@ export default function App() {
       textCase: r.textCase || "upper",
       movementStyle: r.movementStyle || "",
       segments: editedSegments,
+      editorRevision,
       transcribeJobId: r.transcribeJobId || null,
     }];
     setApprovedJobs(newApproved);
@@ -522,6 +523,7 @@ export default function App() {
       textCase: a.textCase || "upper",
       concept: a.concept || "", movementStyle: a.movementStyle || "",
       segments: a.segments,
+      editorRevision: a.editorRevision ?? null,
       transcribeJobId: a.transcribeJobId || null,
       status: "queued", current_step: null, progress: 0, job_id: null, error: null,
     }));
@@ -558,6 +560,9 @@ export default function App() {
         if (jobList[i].movementStyle) formData.append("movement_style", jobList[i].movementStyle);
         if (animateImage && backgroundFile) formData.append("animate_image", "true");
         formData.append("segments_json", JSON.stringify(jobList[i].segments));
+        if (jobList[i].editorRevision !== null && jobList[i].editorRevision !== undefined) {
+          formData.append("editor_revision", String(jobList[i].editorRevision));
+        }
         formData.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
           formData.append("umg_frame_size", delivery.umg_frame_size);
@@ -918,6 +923,8 @@ export default function App() {
             // when handleBackInReview swaps currentReview underneath it.
             key={`${currentReview.file.name}:${currentReview.queueIdx}`}
             segments={currentReview.segments}
+            jobId={currentReview.transcribeJobId || ""}
+            editorV2Enabled={EDITOR_V2_ENABLED}
             filename={currentReview.file.name}
             audioFile={currentReview.file}
             referenceLyrics={currentReview.referenceLyrics || ""}

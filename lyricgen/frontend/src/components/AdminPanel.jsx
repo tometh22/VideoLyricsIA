@@ -40,6 +40,7 @@ export default function AdminPanel({ onBack }) {
   const [bgUploading, setBgUploading] = useState(false);
   const [bgName, setBgName] = useState("");
   const [bgTags, setBgTags] = useState("");
+  const [productMetrics, setProductMetrics] = useState(null);
 
   // Create user modal
   const [showCreate, setShowCreate] = useState(false);
@@ -77,6 +78,13 @@ export default function AdminPanel({ onBack }) {
       const res = await fetch(`${API}/admin/stats`, { headers: authHeaders() });
       setStats(await res.json());
     } catch {} finally { setLoading(false); }
+  };
+
+  const loadProductMetrics = async () => {
+    try {
+      const res = await fetch(`${API}/admin/product-metrics`, { headers: authHeaders() });
+      if (res.ok) setProductMetrics(await res.json());
+    } catch {}
   };
 
   const [health, setHealth] = useState(null);
@@ -120,7 +128,8 @@ export default function AdminPanel({ onBack }) {
     if (tab !== "overview") return;
     loadHealth();
     loadStuckJobs();
-    const iv = setInterval(() => { loadHealth(); loadStuckJobs(); }, 15000);
+    loadProductMetrics();
+    const iv = setInterval(() => { loadHealth(); loadStuckJobs(); loadProductMetrics(); }, 15000);
     return () => clearInterval(iv);
   }, [tab]);
 
@@ -454,6 +463,23 @@ export default function AdminPanel({ onBack }) {
                   </div>
                 ))}
               </div>
+            </div>
+          </div>
+
+          <div className="glass-elevated rounded-card p-6">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h3 className="text-sm font-semibold">Editor UX</h3>
+                <p className="text-[11px] text-gray-500 mt-1">Señales de uso para decidir qué mejorar después.</p>
+              </div>
+              <button type="button" onClick={loadProductMetrics} className="text-[11px] text-brand-light hover:text-white">Actualizar</button>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+              <div><p className="text-lg font-bold">{productMetrics?.events?.editor_opened || 0}</p><p className="text-[10px] text-gray-500">Sesiones</p></div>
+              <div><p className="text-lg font-bold">{productMetrics?.events?.editor_view_changed || 0}</p><p className="text-[10px] text-gray-500">Cambios de vista</p></div>
+              <div><p className="text-lg font-bold">{productMetrics?.events?.editor_conflict || 0}</p><p className="text-[10px] text-gray-500">Conflictos</p></div>
+              <div><p className="text-lg font-bold">{productMetrics?.events?.editor_autosave_failed || 0}</p><p className="text-[10px] text-gray-500">Autosaves fallidos</p></div>
+              <div><p className="text-lg font-bold">{productMetrics?.avg_time_to_first_edit_ms ? `${Math.round(productMetrics.avg_time_to_first_edit_ms / 1000)}s` : "—"}</p><p className="text-[10px] text-gray-500">Primera edición</p></div>
             </div>
           </div>
         </div>

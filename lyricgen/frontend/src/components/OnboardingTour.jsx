@@ -235,34 +235,14 @@ export function EditorTour({ user, forceRun = false, onDone }) {
       target: '[data-tour="editor-playbar"]',
       title: t("tour.editor_playbar_title") || "Reproducción",
       content: t("tour.editor_playbar_body") ||
-        "Apretá Play para escuchar. Espacio = play/pause. Mientras suena, la línea actual se resalta.",
+        "Hacé click en un tiempo para ir directo a ese momento. Espacio reproduce o pausa.",
       disableBeacon: true,
       placement: "bottom",
     },
     {
-      target: '[data-tour="editor-list-row"]',
-      title: t("tour.editor_list_title") || "Tus líneas",
-      content: t("tour.editor_list_body") ||
-        "Click un timestamp para saltar a ese momento. Doble click para editarlo a mano.",
-    },
-    {
-      target: '[data-tour="editor-sync-entry"]',
-      title: t("tour.editor_sync_title") || "Modo Sync",
-      content: t("tour.editor_sync_body") ||
-        "Si necesitás ajustar los tiempos, click acá. Apretás Espacio cuando arranca cada línea y se sincronizan en vivo.",
-    },
-    {
-      target: '[data-tour="editor-row-sync"]',
-      title: t("tour.editor_row_sync_title") || "Sync desde acá",
-      content: t("tour.editor_row_sync_body") ||
-        "Hover una línea, click el target 🎯 y arrancás Sync desde ahí. Las anteriores quedan intactas.",
-    },
-    {
-      target: '[data-tour="editor-add-line"]',
-      title: t("tour.editor_add_title") || "Líneas faltantes",
-      content: t("tour.editor_add_body") ||
-        "¿Faltó una repetición del estribillo? Duplicá una línea (📋 al hover) o agregá una vacía abajo y tipeá.",
-      placement: "top",
+      target: '[data-testid="editor-advanced-view"]',
+      title: "Vista profesional",
+      content: "Cuando necesites ajustar tiempos, abrí la vista profesional. Pintá varias líneas y arrastrá la selección para moverlas juntas.",
     },
     {
       target: '[data-tour="editor-approve"]',

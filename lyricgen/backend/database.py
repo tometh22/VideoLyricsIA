@@ -237,6 +237,14 @@ class Job(Base):
     # Relationships
     user = relationship("User", back_populates="jobs", foreign_keys=[user_id])
     provenance = relationship("AIProvenance", back_populates="job", lazy="dynamic")
+    editor_document = relationship(
+        "EditorDocument", back_populates="job", uselist=False,
+        cascade="all, delete-orphan",
+    )
+    editor_versions = relationship(
+        "EditorVersion", back_populates="job", lazy="dynamic",
+        cascade="all, delete-orphan",
+    )
 
     def to_dict(self):
         return {
@@ -289,6 +297,68 @@ class Job(Base):
             ),
             "created_at": self.created_at.timestamp() if self.created_at else None,
         }
+
+
+class EditorDocument(Base):
+    """Durable working copy for the lyrics editor.
+
+    The job remains the source of delivery metadata while this document is
+    the source of truth for edits made before generation.  Keeping the
+    current draft separate means autosaves never mutate a completed job's
+    audit fields and historical jobs can be opened lazily.
+    """
+    __tablename__ = "editor_documents"
+
+    job_id = Column(String(12), ForeignKey("jobs.job_id"), primary_key=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    current_segments = Column(JSON, nullable=False)
+    original_segments = Column(JSON, nullable=False)
+    revision = Column(Integer, nullable=False, default=0)
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    lock_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    lock_expires_at = Column(DateTime(timezone=True), nullable=True)
+
+    job = relationship("Job", back_populates="editor_document")
+
+
+class EditorVersion(Base):
+    """Immutable checkpoints of an editor document."""
+    __tablename__ = "editor_versions"
+    __table_args__ = (
+        Index("ix_editor_versions_job_revision", "job_id", "revision", unique=True),
+        Index("ix_editor_versions_job_created", "job_id", "created_at"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    job_id = Column(String(12), ForeignKey("jobs.job_id"), nullable=False, index=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    revision = Column(Integer, nullable=False)
+    segments = Column(JSON, nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    reason = Column(String(20), nullable=False, default="autosave")
+    is_approved = Column(Boolean, nullable=False, default=False)
+
+    job = relationship("Job", back_populates="editor_versions")
+
+
+class ProductEvent(Base):
+    """Small, privacy-preserving product analytics event."""
+    __tablename__ = "product_events"
+    __table_args__ = (
+        Index("ix_product_events_tenant_created", "tenant_id", "created_at"),
+        Index("ix_product_events_name_created", "name", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    job_id = Column(String(12), nullable=True, index=True)
+    name = Column(String(80), nullable=False, index=True)
+    occurred_at = Column(DateTime(timezone=True), nullable=True)
+    properties = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
 class Invoice(Base):

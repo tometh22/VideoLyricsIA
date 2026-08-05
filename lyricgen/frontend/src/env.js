@@ -26,3 +26,7 @@ export const APP_ENV = explicit || detectFromHostname();
 export const IS_PRODUCTION = APP_ENV === "production";
 export const IS_STAGING = APP_ENV === "staging";
 export const IS_DEV = APP_ENV === "development";
+// Rollout guard for the durable editor contract. The default is enabled so
+// staging and new deployments exercise Editor 2.0; set VITE_EDITOR_V2=false
+// to keep the pre-persistence session-local behavior during an emergency.
+export const EDITOR_V2_ENABLED = (import.meta.env.VITE_EDITOR_V2 || "true").toLowerCase() !== "false";

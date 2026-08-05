@@ -110,7 +110,7 @@ def validate_password_strength(password: str) -> None:
             "(roughly 72 ASCII chars or 36 emoji-heavy chars)."
         )
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +355,8 @@ async def get_current_user(
     db: Session = Depends(get_db),
 ) -> dict:
     """FastAPI dependency — extracts and validates the current user from Bearer token."""
+    if credentials is None:
+        raise HTTPException(status_code=403, detail="Not authenticated")
     payload = decode_token(credentials.credentials)
     # Refresh user data from DB to get latest plan etc.
     user = get_user_by_id(db, int(payload["sub"]))

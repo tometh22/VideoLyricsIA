@@ -1,6 +1,10 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useI18n } from "../i18n";
 import { EditorTour } from "./OnboardingTour";
+import LyricsTimeline from "./LyricsTimeline";
+import VersionHistory from "./VersionHistory";
+import { useEditorAnalytics } from "../hooks/useEditorAnalytics";
+import { useEditorDocument } from "../hooks/useEditorDocument";
 
 function formatTime(seconds) {
   if (!isFinite(seconds) || seconds < 0) return "0:00";
@@ -35,6 +39,17 @@ function parseTimestamp(str) {
   const v = parseFloat(trimmed);
   if (Number.isNaN(v) || v < 0) return null;
   return v;
+}
+
+function withEditorIds(list) {
+  return (Array.isArray(list) ? list : []).map((segment, index) => ({
+    ...segment,
+    _id: index,
+  }));
+}
+
+function withoutEditorIds(list) {
+  return list.map(({ _id, ...segment }) => segment);
 }
 
 function findSuggestion(whisperText, refLines, startIdx) {
@@ -75,11 +90,65 @@ function findSuggestion(whisperText, refLines, startIdx) {
   return null;
 }
 
-export default function LyricsEditor({ segments, filename, audioFile, referenceLyrics, coverageWarning = false, recoverySource = "", onApprove, onBack, isBatch = false, batchProgress = "", user = null }) {
+export default function LyricsEditor({ jobId = "", editorV2Enabled = true, segments, filename, audioFile, referenceLyrics, coverageWarning = false, recoverySource = "", onApprove, onBack, isBatch = false, batchProgress = "", user = null }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
-    segments.map((s, i) => ({ ...s, _id: i }))
+    withEditorIds(segments)
   );
+  const originalSegmentsRef = useRef(
+    withEditorIds(segments)
+  );
+  const effectiveJobId = editorV2Enabled ? jobId : "";
+  const hydratedRef = useRef(!effectiveJobId);
+  const ignoreNextPersistenceRef = useRef(Boolean(effectiveJobId));
+  const [viewMode, setViewMode] = useState(() => {
+    try { return localStorage.getItem("genly_editor_view") || "basic"; } catch { return "basic"; }
+  });
+  const track = useEditorAnalytics(effectiveJobId);
+  const applyRemoteSegments = useCallback((nextSegments) => {
+    const next = withEditorIds(nextSegments);
+    hydratedRef.current = true;
+    ignoreNextPersistenceRef.current = true;
+    originalSegmentsRef.current = withEditorIds(nextSegments);
+    setEditHistory([]);
+    setEdited(next);
+  }, []);
+  const editorDocument = useEditorDocument({
+    jobId: effectiveJobId,
+    initialSegments: segments,
+    onRemoteSegments: applyRemoteSegments,
+  });
+
+  const lastSaveStateRef = useRef(editorDocument.saveState);
+  useEffect(() => {
+    const previous = lastSaveStateRef.current;
+    if (previous === "saving" && editorDocument.saveState === "saved") {
+      track("editor_autosave_success", { revision: editorDocument.revision });
+    }
+    if (previous === "saving" && editorDocument.saveState === "offline") {
+      track("editor_autosave_failed", { reason: "network" });
+    }
+    if (editorDocument.saveState === "conflict" && previous !== "conflict") {
+      track("editor_conflict", { server_revision: editorDocument.conflict?.serverRevision });
+    }
+    lastSaveStateRef.current = editorDocument.saveState;
+  }, [editorDocument.conflict, editorDocument.revision, editorDocument.saveState, track]);
+
+  useEffect(() => {
+    if (!effectiveJobId || editorDocument.saveState === "loading") return;
+    if (ignoreNextPersistenceRef.current) {
+      ignoreNextPersistenceRef.current = false;
+      return;
+    }
+    if (!hydratedRef.current) hydratedRef.current = true;
+    editorDocument.scheduleSave(withoutEditorIds(edited));
+  }, [edited, editorDocument.saveState, editorDocument.scheduleSave, effectiveJobId]);
+
+  useEffect(() => {
+    track("editor_opened", { has_audio: Boolean(audioFile), line_count: edited.length });
+  // The editor is mounted once per song; tracking on mount is intentional.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effectiveJobId]);
 
   // ─── Audio sync ─────────────────────────────────────────────────────
   const audioUrl = useMemo(
@@ -139,7 +208,16 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       setEdited(snapshot);
       return prev.slice(0, -1);
     });
-  }, []);
+    track("editor_undo", {});
+  }, [track]);
+
+  const resetTimings = useCallback(() => {
+    pushEditHistory();
+    setEdited((current) => current.map((segment) => {
+      const original = originalSegmentsRef.current.find((item) => item._id === segment._id);
+      return original ? { ...segment, start: original.start, end: original.end } : segment;
+    }));
+  }, [pushEditHistory]);
 
   const startEditTimestamp = (seg) => {
     setEditingId(seg._id);
@@ -474,6 +552,25 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   };
 
   const name = filename.replace(/\.(mp3|wav)$/i, "");
+  const saveLabel = {
+    loading: "Cargando borrador…",
+    saving: "Guardando…",
+    saved: "Guardado",
+    local: "Cambios locales",
+    offline: "Sin conexión",
+    conflict: "Conflicto detectado",
+  }[editorDocument.saveState] || "Guardado";
+  const changeViewMode = (mode) => {
+    setViewMode(mode);
+    try { localStorage.setItem("genly_editor_view", mode); } catch {}
+    track("editor_view_changed", { view: mode });
+    if (mode === "basic") setSyncMode(false);
+  };
+  const restoreEditorVersion = async (version) => {
+    if (typeof window !== "undefined" && !window.confirm(`¿Restaurar la versión ${version.revision}?`)) return;
+    const result = await editorDocument.restore(version.id);
+    if (result.ok) track("editor_version_restored", { revision: version.revision });
+  };
   const pendingSuggestions = edited.filter((seg) => {
     const s = suggestionsById[seg._id];
     return s && s !== seg.text;
@@ -481,7 +578,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   const hasSuggestions = pendingSuggestions > 0;
   const blankCount = edited.filter((seg) => !(seg.text || "").trim()).length;
 
-  const handleApprove = () => {
+  const handleApprove = async () => {
     // Drop empty / whitespace-only rows BEFORE clamping. Operator can
     // leave blanks from "Agregar línea" if they didn't type lyrics —
     // sending those to the worker triggers an ImageMagick "label
@@ -499,7 +596,13 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       }
       return { ...seg, end };
     });
-    onApprove(cleaned.map(({ _id, ...rest }) => rest));
+    const approvedSegments = cleaned.map(({ _id, ...rest }) => rest);
+    editorDocument.scheduleSave(approvedSegments, "approve");
+    const persisted = await editorDocument.flush();
+    if (persisted?.conflict || persisted?.offline) return;
+    const persistedRevision = persisted?.data?.revision || editorDocument.revision;
+    track("editor_approved", { line_count: approvedSegments.length, revision: persistedRevision });
+    onApprove(approvedSegments, persistedRevision);
   };
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
@@ -509,10 +612,30 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
     const rect = e.currentTarget.getBoundingClientRect();
     const pct = (e.clientX - rect.left) / rect.width;
     seekTo(pct * duration, false);
+    track("editor_seek", { seconds: Number((pct * duration).toFixed(2)), source: "transport" });
   };
 
+  const handleTimelineTimingChange = useCallback((id, start, end) => {
+    pushEditHistory();
+    setEdited((current) => current.map((segment) => (
+      segment._id === id ? { ...segment, start, end } : segment
+    )));
+    track("editor_timing_changed", { count: 1, source: "professional" });
+  }, [pushEditHistory, track]);
+
+  const handleTimelineTimingChangeBatch = useCallback((changes) => {
+    if (!changes?.length) return;
+    pushEditHistory();
+    const byId = new Map(changes.map((change) => [change.id, change]));
+    setEdited((current) => current.map((segment) => {
+      const change = byId.get(segment._id);
+      return change ? { ...segment, start: change.start, end: change.end } : segment;
+    }));
+    track("editor_group_moved", { count: changes.length });
+  }, [pushEditHistory, track]);
+
   return (
-    <div className="w-full max-w-3xl animate-fade-in">
+    <div className="w-full max-w-screen-2xl px-2 sm:px-4 animate-fade-in">
       {/* Hidden audio element drives playback. */}
       {audioUrl && (
         <audio
@@ -526,7 +649,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
         />
       )}
 
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex items-center justify-between mb-6 gap-4">
         <div className="flex items-center gap-3">
           <button onClick={onBack}
             className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors">
@@ -534,12 +657,23 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
               <path d="M19 12H5M12 19l-7-7 7-7" />
             </svg>
           </button>
-          <div>
+          <div className="min-w-0">
             <h2 className="text-lg font-bold tracking-tight">{t("editor.title")}</h2>
-            <p className="text-sm text-ink-secondary">
+            <p className="text-sm text-ink-secondary truncate">
               {name}
               {batchProgress && <span className="ml-2 text-brand-light text-xs">({batchProgress})</span>}
             </p>
+            <div className="flex items-center gap-2 mt-1 text-[10px]" aria-live="polite">
+              <span className={`${editorDocument.saveState === "conflict" ? "text-amber-300" : editorDocument.saveState === "offline" ? "text-red-300" : "text-gray-500"}`}>
+                {saveLabel}
+              </span>
+              {editorDocument.revision > 0 && <span className="text-gray-600">v{editorDocument.revision}</span>}
+              {editorDocument.remoteMeta?.lock?.active && editorDocument.remoteMeta.lock.user?.id !== user?.id && (
+                <span className="text-amber-300 truncate">
+                  · {editorDocument.remoteMeta.lock.user.username || "Alguien"} también está editando
+                </span>
+              )}
+            </div>
           </div>
         </div>
         <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5">
@@ -632,8 +766,58 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
         </div>
       )}
 
+      <div className="mb-4 flex items-center justify-between gap-3 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.05] p-1.5">
+        <div className="px-2">
+          <p className="text-[11px] text-gray-400 font-medium">{t("editor.mode_label") || "Modo de edición"}</p>
+          <p className="text-[10px] text-gray-600 hidden sm:block">
+            {viewMode === "basic" ? (t("editor.basic_hint") || "Corregí la letra y revisá los tiempos.") : (t("editor.advanced_hint") || "Ajustá la posición de varias líneas en el audio.")}
+          </p>
+        </div>
+        <div className="inline-flex rounded-lg ring-1 ring-white/[0.08] overflow-hidden shrink-0" role="tablist" aria-label="Modo de edición">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === "basic"}
+            data-testid="editor-basic-view"
+            onClick={() => changeViewMode("basic")}
+            className={`px-3 py-2 text-[11px] transition-colors ${viewMode === "basic" ? "bg-brand/20 text-brand-light" : "text-gray-400 hover:text-white hover:bg-white/[0.05]"}`}
+          >
+            {t("editor.basic_view") || "Básica · Revisar letra"}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === "advanced"}
+            data-testid="editor-advanced-view"
+            onClick={() => changeViewMode("advanced")}
+            className={`px-3 py-2 text-[11px] transition-colors ${viewMode === "advanced" ? "bg-brand/20 text-brand-light" : "text-gray-400 hover:text-white hover:bg-white/[0.05]"}`}
+          >
+            {t("editor.advanced_view") || "Profesional · Ajustar tiempos"}
+          </button>
+        </div>
+      </div>
+
+      {editorDocument.conflict && (
+        <div className="mb-4 rounded-2xl bg-amber-500/[0.08] ring-1 ring-amber-400/30 px-4 py-3" role="alert">
+          <div className="flex items-start gap-3">
+            <svg className="w-5 h-5 text-amber-300 shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="9" /><path d="M12 7v5M12 16h.01" strokeLinecap="round" />
+            </svg>
+            <div className="min-w-0 flex-1">
+              <p className="text-sm text-amber-100 font-medium">Otra persona guardó una versión más nueva</p>
+              <p className="text-xs text-amber-200/70 mt-1">Elegí qué versión querés conservar. No combinamos cambios automáticamente para evitar perder letras o tiempos.</p>
+              <div className="flex flex-wrap gap-2 mt-3">
+                <button type="button" onClick={editorDocument.resolveConflictWithServer} className="h-8 px-3 rounded-lg bg-amber-300/15 text-amber-100 ring-1 ring-amber-300/30 text-xs hover:bg-amber-300/25">Usar versión del equipo</button>
+                <button type="button" onClick={() => editorDocument.rebaseLocalChanges(withoutEditorIds(edited))} className="h-8 px-3 rounded-lg bg-brand/20 text-brand-light ring-1 ring-brand/30 text-xs hover:bg-brand/30">Guardar mis cambios</button>
+                <button type="button" onClick={editorDocument.dismissConflict} className="h-8 px-3 rounded-lg text-gray-300 hover:text-white text-xs">Cancelar</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ─── Tap-to-sync entry / active panel ────────────────────── */}
-      {audioUrl && !syncMode && (
+      {viewMode === "advanced" && audioUrl && !syncMode && (
         <div className="mb-3 px-3 py-2.5 rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] flex items-center gap-3">
           <svg className="w-4 h-4 text-ink-secondary shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
             <circle cx="12" cy="12" r="9" />
@@ -658,7 +842,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
         </div>
       )}
 
-      {audioUrl && syncMode && (
+      {viewMode === "advanced" && audioUrl && syncMode && (
         <div className="mb-3 px-3 py-2 rounded-card bg-brand/[0.08] ring-1 ring-brand/40 animate-fade-in">
           {/* Top row: status + counter + exit. Compact, single line. */}
           <div className="flex items-center justify-between mb-1.5 gap-2">
@@ -746,7 +930,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
               real vocal entry is roughly where line 2 starts. We offer
               to nudge line 1 only — leaves the rest of the timeline
               (which is correct relative to line 2) untouched. */}
-      {(() => {
+      {viewMode === "advanced" && (() => {
         if (syncMode || edited.length === 0) return null;
         const first = edited[0];
         const second = edited[1];
@@ -843,6 +1027,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
         return null;
       })()}
 
+      {viewMode === "basic" && (<>
       {/* ─── Lyrics list ──────────────────────────────────────────── */}
       <p className="text-[11px] text-gray-600 mb-2 px-1">
         {t("editor.list_hint") || "Click en un tiempo para reproducir desde ahí · doble click para editarlo"}
@@ -919,7 +1104,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
                     )}
                   </div>
                   <div className="shrink-0 flex items-center gap-0.5 mt-0.5">
-                    {!syncMode && (
+                    {viewMode === "advanced" && !syncMode && (
                       <button onClick={() => enterSyncModeAt(idx)}
                         {...(idx === 0 ? { "data-tour": "editor-row-sync" } : {})}
                         className="w-8 h-8 rounded-lg opacity-0 group-hover:opacity-100
@@ -988,6 +1173,38 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
           {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
         </button>
       </div>
+      </>)}
+
+      {viewMode === "advanced" && (
+        <div className="space-y-3">
+          <div className="flex items-center justify-between gap-3 px-1">
+            <p className="text-xs text-gray-500">Pintá para seleccionar · Cmd/Ctrl + click agrega líneas · arrastrá la selección para moverla junta</p>
+            <VersionHistory
+              versions={editorDocument.versions}
+              fetchVersions={editorDocument.fetchVersions}
+              onRestore={restoreEditorVersion}
+            />
+          </div>
+          <LyricsTimeline
+            segments={edited}
+            audioFile={audioFile}
+            duration={duration}
+            currentTime={currentTime}
+            isPlaying={isPlaying}
+            syncMode={syncMode}
+            syncCursor={syncCursor}
+            onSeek={(seconds) => { seekTo(seconds, false); track("editor_seek", { seconds: Number(seconds.toFixed(2)), source: "timeline" }); }}
+            onFocus={(id) => {
+              const segment = edited.find((item) => item._id === id);
+              if (segment) seekTo(Math.max(0, segment.start), false);
+            }}
+            onTimingChange={handleTimelineTimingChange}
+            onTimingChangeBatch={handleTimelineTimingChangeBatch}
+            onTextChange={updateText}
+            onReset={resetTimings}
+          />
+        </div>
+      )}
 
       <EditorTour user={user} />
     </div>
