@@ -82,7 +82,15 @@ export async function installEditorHarness(page, options = {}) {
     const path = url.pathname;
 
     if (path === "/e2e/audio.wav") {
-      await route.fulfill({ status: 200, contentType: "audio/wav", body: audioBytes });
+      await route.fulfill({
+        status: 200,
+        contentType: "audio/wav",
+        headers: {
+          "Accept-Ranges": "bytes",
+          "Content-Length": String(audioBytes.length),
+        },
+        body: audioBytes,
+      });
       return;
     }
 
@@ -195,7 +203,11 @@ export async function openAdvanced(page, { expectTimeline = true } = {}) {
 }
 
 export async function selectionCount(page, count) {
-  await expect(page.getByText(new RegExp(`^${count} seleccionadas\\b`))).toBeVisible();
+  await expect.poll(async () => Number(await page.getByTestId("timeline-primary-actions").getAttribute("data-selected-count"))).toBe(count);
+}
+
+export async function selectionAtLeast(page, count) {
+  await expect.poll(async () => Number(await page.getByTestId("timeline-primary-actions").getAttribute("data-selected-count"))).toBeGreaterThanOrEqual(count);
 }
 
 export async function drag(page, from, to, steps = 8) {

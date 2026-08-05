@@ -99,7 +99,10 @@ export default function LyricsTimeline({
   const autoFitKeyRef = useRef(null);
   const [viewportWidth, setViewportWidth] = useState(0);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
-  const [selectionMode, setSelectionMode] = useState(false);
+  // Advanced mode opens ready for the most common operator gesture: paint a
+  // selection. A selected block can still be dragged to move its group, so
+  // the mode does not hide the second core action behind another toggle.
+  const [selectionMode, setSelectionMode] = useState(true);
   const [marquee, setMarquee] = useState(null);
   const [preview, setPreview] = useState(null);
   const [pxPerSec, setPxPerSec] = useState(ZOOM_DEFAULT);
@@ -258,10 +261,11 @@ export default function LyricsTimeline({
       toggleSelection(segment._id);
       return;
     }
-    // Body drag keeps its familiar move behavior. Selection intent is explicit
-    // through the Select button or Shift+drag, so a user can paint from a line
-    // without sacrificing precise timing moves and edge resizing.
-    if (mode === "move" && (selectionMode || event.shiftKey)) {
+    const movingSelectedBody = mode === "move" && selectedIds.has(segment._id);
+    // In selection mode, an unselected body paints a marquee while a selected
+    // body remains the direct handle for moving the selected group. This keeps
+    // painting discoverable without taking group movement away from operators.
+    if (mode === "move" && (event.shiftKey || (selectionMode && !movingSelectedBody))) {
       beginMarquee(event, segment._id);
       return;
     }
@@ -425,7 +429,7 @@ export default function LyricsTimeline({
             {normalizedSegments.length} {t("timeline.lines_count", "líneas")}
           </span>
         </div>
-        <div className="flex items-center gap-1.5 flex-wrap" data-testid="timeline-primary-actions">
+        <div className="flex items-center gap-1.5 flex-wrap" data-testid="timeline-primary-actions" data-selected-count={selectedIds.size}>
           <button
             type="button"
             onClick={() => setSelectionMode((value) => !value)}
@@ -477,14 +481,14 @@ export default function LyricsTimeline({
         <span className={`inline-block w-2 h-2 rounded-full ${selectionMode ? "bg-brand-light shadow-glow" : "bg-emerald-300"}`} aria-hidden="true" />
         <span>
           {selectionMode
-            ? `${t("timeline.selection_help", "Selección")}. Arrastrá sobre una línea o el espacio vacío para pintar varias.`
-            : `${t("timeline.selection_help", "Selección")}. Shift+arrastrar una línea pinta · arrastrar el cuerpo mueve · bordes ajustan`}
+            ? `${t("timeline.selection_help", "Selección")}. Arrastrá sobre una línea o el espacio vacío para pintar varias · arrastrá una seleccionada para moverla.`
+            : `${t("timeline.selection_help", "Selección")}. Arrastrá una línea pinta · arrastrá una seleccionada mueve · bordes ajustan`}
         </span>
       </div>
 
       <div ref={scrollRef} data-testid="timeline-scroll" className="overflow-auto overscroll-contain" style={{ maxHeight: focusMode ? "calc(100vh - 220px)" : "min(620px, calc(100vh - 300px))" }}>
         <div ref={surfaceRef} className="relative min-w-full" style={{ width: trackWidth }}>
-          <div className="relative h-9 border-b border-white/[0.06] bg-surface-1/80" onClick={(event) => seekAt(event.clientX)}>
+          <div data-testid="timeline-ruler" className="relative h-9 border-b border-white/[0.06] bg-surface-1/80" onClick={(event) => seekAt(event.clientX)}>
             {ticks.map((time) => (
               <div key={time} className="absolute top-0 bottom-0 border-l border-white/[0.08] pointer-events-none" style={{ left: time * pxPerSec }}>
                 <span className="absolute top-1 left-1 text-[9px] text-ink-tertiary tabular-nums whitespace-nowrap">{fmt(time)}</span>
@@ -530,8 +534,8 @@ export default function LyricsTimeline({
                   className={`absolute z-10 rounded-xl overflow-hidden ring-1 transition-colors select-none ${selectionMode ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing"} ${isActive ? "bg-brand/45" : "bg-surface-3/90"} ${isSelected ? "ring-2 ring-brand-light bg-brand/35" : "ring-white/[0.18]"} ${isFocused ? "outline outline-1 outline-white/80" : ""} ${isRecent ? "ring-accent" : ""}`}
                   style={{ left: start * pxPerSec, top: index * ROW_H + 7, width, height: ROW_H - 14, touchAction: "none" }}
                   onPointerDown={(event) => startDrag(event, segment, "move")}
-                  onPointerMove={updateDrag}
-                  onPointerUp={(event) => finishDrag(event, segment)}
+                  onPointerMove={selectionMode && !selectedIds.has(segment._id) ? undefined : updateDrag}
+                  onPointerUp={selectionMode && !selectedIds.has(segment._id) ? undefined : (event) => finishDrag(event, segment)}
                   onClick={(event) => event.stopPropagation()}
                 >
                   <div className="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize bg-brand/25 hover:bg-brand/80" title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea")} onPointerDown={(event) => startDrag(event, segment, "start")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} />

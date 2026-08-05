@@ -2497,7 +2497,7 @@ export default function LyricsEditor({
            Cuando se portalea bajo el video (playerSlot), NO va sticky ni
            lleva el offset del header — vive estático debajo del preview. */
         <div
-          className={`${playerSlot ? "" : "mb-3 sticky z-20"} backdrop-blur-md bg-surface-1/85 flex items-center gap-3 p-3 rounded-xl ring-1 ring-white/[0.04]`}
+          className={`${playerSlot ? "relative z-30" : "mb-3 sticky z-20"} min-w-0 max-w-full backdrop-blur-md bg-surface-1/95 flex items-center gap-3 p-3 rounded-xl ring-1 ring-white/[0.04]`}
           style={playerSlot ? undefined : { top: stickyHeaderTop || 0 }}
           data-tour="editor-playbar"
         >
@@ -2549,7 +2549,7 @@ export default function LyricsEditor({
                NO mostrar "no disponible" acá — es un falso alarma mientras
                el fetch (con reintentos) está en vuelo. Mismo ancho que el
                reproductor para no colapsar la fila. */
-            <div className="flex-1 flex items-center gap-2 text-[11px] text-ink-secondary">
+            <div className="min-w-0 flex-1 flex items-center gap-2 text-[11px] text-ink-secondary">
               <svg className="w-3.5 h-3.5 flex-shrink-0 animate-spin" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M21 12a9 9 0 1 1-6.219-8.56" strokeLinecap="round" />
               </svg>
@@ -2563,7 +2563,7 @@ export default function LyricsEditor({
                no colapse y los controles de vista (a la derecha) queden en
                la misma posición que cuando hay audio. Esto preserva la
                memoria muscular del operador. */
-            <div className="flex-1 flex items-center gap-2 text-[11px] text-amber-300/90">
+            <div className="min-w-0 flex-1 flex items-center gap-2 text-[11px] text-amber-300/90">
               <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M12 9v4M12 17h.01" />
                 <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
@@ -2576,7 +2576,7 @@ export default function LyricsEditor({
           )}
           {/* Two clear views over the same editor and data. Basic is the
               default review flow; advanced exposes the timing workspace. */}
-          <div className="inline-flex shrink-0 rounded-md ring-1 ring-white/[0.08] overflow-hidden text-label" role="tablist" aria-label={t("editor.mode_label") || "Modo de edición"}>
+          <div className="inline-flex min-w-0 shrink-0 rounded-md ring-1 ring-white/[0.08] overflow-hidden text-label" role="tablist" aria-label={t("editor.mode_label") || "Modo de edición"}>
             <button
               type="button"
               role="tab"

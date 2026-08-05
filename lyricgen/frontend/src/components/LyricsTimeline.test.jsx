@@ -72,6 +72,7 @@ describe("LyricsTimeline", () => {
 
   it("clicking a line focuses it and seeks without editing its timing", () => {
     const props = setup();
+    fireEvent.click(screen.getByRole("button", { name: "Seleccionando" }));
     const block = screen.getByText("segunda línea").closest("div[title]");
     fireEvent.pointerDown(block, { clientX: 1000, pointerId: 1, button: 0 });
     fireEvent.pointerUp(block, { clientX: 1000, pointerId: 1, button: 0 });
@@ -82,6 +83,7 @@ describe("LyricsTimeline", () => {
 
   it("dragging a line commits a horizontal timing change and one undo snapshot", () => {
     const props = setup();
+    fireEvent.click(screen.getByRole("button", { name: "Seleccionando" }));
     const block = screen.getByText("segunda línea").closest("div[title]");
     fireEvent.pointerDown(block, { clientX: 900, pointerId: 1, button: 0 });
     fireEvent.pointerMove(block, { clientX: 1080, pointerId: 1 });
@@ -137,8 +139,8 @@ describe("LyricsTimeline", () => {
     const help = screen.getByTestId("timeline-selection-help");
     const block = screen.getAllByTestId("timeline-segment")[0];
     const edge = block.querySelector('[data-testid="timeline-edge-end"]');
-    expect(help).toHaveTextContent("Shift+arrastrar");
-    expect(block.className).toContain("cursor-grab");
+    expect(help).toHaveTextContent("Arrastrá sobre una línea");
+    expect(block.className).toContain("cursor-crosshair");
     expect(edge.className).toContain("cursor-ew-resize");
   });
 
