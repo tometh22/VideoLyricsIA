@@ -84,6 +84,7 @@ export default function LyricsTimeline({
   onTextChange,
   onFocus,
   onReset,
+  onDeleteSelection,
   onSelectionCreated,
   onGroupMoved,
   focusMode = false,
@@ -485,11 +486,26 @@ export default function LyricsTimeline({
     setSelectedIds(new Set());
   }, []);
 
+  const deleteSelection = useCallback(() => {
+    if (!selectedIds.size || editingTextId != null) return;
+    const deleted = onDeleteSelection?.([...selectedIds]);
+    if (deleted !== false) clearSelection();
+  }, [clearSelection, editingTextId, onDeleteSelection, selectedIds]);
+
   const handleKeyDown = (event) => {
     if (event.key === "Escape") clearSelection();
+    const targetIsEditable = ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(event.target?.tagName)
+      || event.target?.isContentEditable;
+    if ((event.key === "Delete" || event.key === "Backspace")
+      && selectedIds.size > 0
+      && !targetIsEditable) {
+      event.preventDefault();
+      deleteSelection();
+      return;
+    }
     if ((event.key === "ArrowLeft" || event.key === "ArrowRight")
       && selectedIds.size > 0
-      && !["INPUT", "TEXTAREA", "SELECT"].includes(event.target?.tagName)) {
+      && !targetIsEditable) {
       event.preventDefault();
       const amount = event.shiftKey ? 0.5 : event.altKey ? 0.01 : 0.1;
       nudgeSelection(event.key === "ArrowLeft" ? -amount : amount);
@@ -580,7 +596,17 @@ export default function LyricsTimeline({
             <button type="button" onClick={() => nudgeSelection(0.1)} className="h-7 border-l border-white/[0.08] px-2.5 text-[10px] text-ink-secondary hover:bg-white/[0.07] hover:text-white">{t("timeline.nudge_forward", "+100 ms")}</button>
           </div>
           <span className="hidden sm:inline text-[10px] text-ink-tertiary">{t("timeline.move_selection_hint", "o arrastrá cualquier bloque seleccionado")}</span>
-          <button type="button" onClick={clearSelection} className="ml-auto h-7 px-2.5 rounded-lg text-[10px] text-ink-secondary hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.clear_selection", "Limpiar selección")}>{t("timeline.clear", "Limpiar")}</button>
+          <div className="ml-auto flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={deleteSelection}
+              aria-keyshortcuts="Delete Backspace"
+              className="h-7 rounded-lg px-2.5 text-[10px] font-medium text-red-300 hover:bg-red-400/10 hover:text-red-200"
+            >
+              {t("timeline.delete_selection", "Eliminar")}
+            </button>
+            <button type="button" onClick={clearSelection} className="h-7 px-2.5 rounded-lg text-[10px] text-ink-secondary hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.clear_selection", "Limpiar selección")}>{t("timeline.clear", "Limpiar")}</button>
+          </div>
         </div>
       ) : (
         <div data-testid="timeline-selection-help" className="flex items-center gap-2 border-b border-white/[0.06] bg-surface-1/25 px-4 sm:px-5 py-2 text-[10px] text-ink-tertiary">

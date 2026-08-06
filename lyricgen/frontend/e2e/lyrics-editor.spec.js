@@ -151,6 +151,23 @@ test.describe("lyrics editor browser contract", () => {
     await expect.poll(async () => lines.nth(0).evaluate((element) => parseFloat(element.style.left))).toBeCloseTo(before, 1);
   });
 
+  test("deletes selected timing lines and restores them with undo", async ({ page }) => {
+    const harness = await installEditorHarness(page);
+    await harness.open();
+    await openAdvanced(page);
+
+    const lines = page.getByTestId("timeline-segment");
+    const modifier = modifierForCurrentPlatform();
+    await lines.nth(0).click({ modifiers: [modifier] });
+    await lines.nth(1).click({ modifiers: [modifier] });
+    await selectionCount(page, 2);
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.getByRole("button", { name: "Eliminar" }).click();
+    await expect(lines).toHaveCount(DEFAULT_SEGMENTS.length - 2);
+    await page.keyboard.press(`${modifier}+z`);
+    await expect(lines).toHaveCount(DEFAULT_SEGMENTS.length);
+  });
+
   test("separates cyan playback state from purple selection state", async ({ page }) => {
     const harness = await installEditorHarness(page);
     await harness.open();

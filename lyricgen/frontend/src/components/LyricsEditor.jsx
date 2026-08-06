@@ -2022,13 +2022,27 @@ export default function LyricsEditor({
     setEdited((prev) => shiftBlockWithinDuration(prev, delta, duration));
   }, [pushEditHistory, duration]);
 
-  const deleteSeg = (id) => {
-    recordEditorAction("delete", { id });
-    if (!edited.some((seg) => seg._id === id)) return;
+  const deleteSegments = useCallback((ids) => {
+    const requested = new Set(Array.isArray(ids) ? ids : [ids]);
+    const existingIds = edited.filter((seg) => requested.has(seg._id)).map((seg) => seg._id);
+    if (!existingIds.length) return false;
+    if (existingIds.length > 1 && !window.confirm(
+      `¿Eliminar ${existingIds.length} líneas? Podés deshacerlo con Cmd/Ctrl+Z.`,
+    )) return false;
+    recordEditorAction("delete", { ids: existingIds, count: existingIds.length });
     pushEditHistory();
-    setEdited((prev) => prev.filter((seg) => seg._id !== id));
+    const idSet = new Set(existingIds);
+    setEdited((prev) => prev.filter((seg) => !idSet.has(seg._id)));
     setFlushCounter((c) => c + 1);
-  };
+    trackEditorEvent("editor_timing_changed", {
+      count: existingIds.length,
+      operation: "delete",
+      duration_ms: 0,
+    });
+    return true;
+  }, [edited, pushEditHistory, trackEditorEvent]);
+
+  const deleteSeg = (id) => deleteSegments([id]);
 
   // Text-length-based cap. Used by the per-row ✂ button + bulk-trim
   // action in this editor. There is NO automatic application — the
@@ -3604,6 +3618,7 @@ export default function LyricsEditor({
                     onTimingChange={handleTimelineTimingChange}
                     onTimingChangeBatch={handleTimelineTimingChangeBatch}
                     onTextChange={updateText}
+                    onDeleteSelection={deleteSegments}
                     onFocus={focusSegment}
                     onReset={resetTimings}
                     onSelectionCreated={({ count, method, durationMs }) => trackEditorEvent("editor_selection_created", {
