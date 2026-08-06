@@ -843,7 +843,7 @@ export default function UploadZone({
   // (la prop que App.jsx prende cuando empieza el transcribe o hay
   // currentReview con segments).
   // - hasReviewableContent=false → paso 6 con border dashed gris,
-  //   cursor-not-allowed, tooltip "Disponible después de Revisar lyrics".
+  //   cursor-not-allowed, tooltip "Disponible después de Revisar letra".
   // - hasReviewableContent=true  → paso 6 clickeable; auto-advance del
   //   wizard a step=6 vía el useEffect de abajo.
   const WIZARD_STEPS = [
@@ -3788,7 +3788,7 @@ export default function UploadZone({
                 title={locked
                   ? (t("upload.step_locked_hint") || "No editable en este modo — usá \"Regenerar fondo\" desde el video.")
                   : lyricsDisabled
-                    ? (t("upload.step_lyrics_hint") || "Disponible después de \"Revisar lyrics\"")
+                    ? (t("upload.step_lyrics_hint") || "Disponible después de \"Revisar letra\"")
                     : (isStep6 ? s.label : undefined)}
                 className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-[12.5px] font-medium whitespace-nowrap transition-all text-left shrink-0 ${
                   disabled
@@ -5058,7 +5058,7 @@ export default function UploadZone({
             <div className="min-w-0 w-full">
               {renderStep6 ? renderStep6() : (
                 <div className="text-center py-12 text-sm text-gray-500">
-                  {t("upload.step_lyrics_hint") || "Disponible después de \"Revisar lyrics\""}
+                  {t("upload.step_lyrics_hint") || "Disponible después de \"Revisar letra\""}
                 </div>
               )}
             </div>
@@ -5183,7 +5183,7 @@ export default function UploadZone({
                     disabled={!allHaveArtist}
                     className="btn-primary h-11 px-6 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
-                    {t("upload.review_lyrics") || "Revisar lyrics"}
+                    {t("upload.review_lyrics") || "Revisar letra"}
                     <svg className="inline-block ml-1.5 w-4 h-4 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                       <path d="M5 12h14M12 5l7 7-7 7" />
                     </svg>

@@ -23,6 +23,7 @@ function setup(overrides = {}) {
     onTimingChange: vi.fn(),
     onTimingChangeBatch: vi.fn(),
     onTextChange: vi.fn(),
+    onDeleteSelection: vi.fn(() => true),
     onFocus: vi.fn(),
     onReset: vi.fn(),
     ...overrides,
@@ -49,7 +50,7 @@ describe("LyricsTimeline", () => {
     const zoom = Number(screen.getByTestId("timeline-lane").dataset.pxPerSec);
     expect(block).toBeInTheDocument();
     expect(parseFloat(block.style.left)).toBeCloseTo(13.2 * zoom, 5);
-    expect(parseFloat(block.style.width)).toBeCloseTo(Math.max(56, 2.6 * zoom), 5);
+    expect(parseFloat(block.style.width)).toBeCloseTo(2.6 * zoom, 5);
   });
 
   it("seeks when clicking anywhere on the empty timeline", () => {
@@ -138,6 +139,31 @@ describe("LyricsTimeline", () => {
     expect(screen.getByText("2 líneas")).toBeInTheDocument();
   });
 
+  it("deletes the selected lines from the contextual action", () => {
+    const props = setup();
+    const [first, second] = screen.getAllByTestId("timeline-segment");
+    fireEvent.pointerDown(first, { clientX: 100, pointerId: 1, button: 0, metaKey: true });
+    fireEvent.pointerDown(second, { clientX: 900, pointerId: 2, button: 0, ctrlKey: true });
+
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar" }));
+    expect(props.onDeleteSelection).toHaveBeenCalledWith([0, 1]);
+  });
+
+  it("supports Delete from a focused timing block but ignores editable text", () => {
+    const props = setup();
+    const first = screen.getAllByTestId("timeline-segment")[0];
+    fireEvent.pointerDown(first, { clientX: 100, pointerId: 1, button: 0, metaKey: true });
+    first.focus();
+    fireEvent.keyDown(first, { key: "Delete" });
+    expect(props.onDeleteSelection).toHaveBeenCalledWith([0]);
+
+    props.onDeleteSelection.mockClear();
+    const second = screen.getAllByTestId("timeline-segment")[1];
+    fireEvent.doubleClick(second.querySelector("span[title*='Doble-click']"));
+    fireEvent.keyDown(screen.getByDisplayValue("segunda línea"), { key: "Backspace" });
+    expect(props.onDeleteSelection).not.toHaveBeenCalled();
+  });
+
   it("shows selection instructions and distinct move/resize cursors", () => {
     setup();
     const help = screen.getByTestId("timeline-selection-help");
@@ -146,7 +172,7 @@ describe("LyricsTimeline", () => {
     expect(help).toHaveTextContent("Arrastrá el fondo");
     expect(block.className).toContain("cursor-grab");
     expect(edge.className).toContain("cursor-ew-resize");
-    expect(edge.style.width).toBe("16px");
+    expect(edge.style.width).toBe("22px");
   });
 
   it("distinguishes the playing row from purple selection", () => {

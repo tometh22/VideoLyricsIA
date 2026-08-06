@@ -10,7 +10,7 @@ export const DEFAULT_SEGMENTS = [
   { _id: "line-e", start: "3.55", end: "3.90", text: "Quinta línea" },
 ];
 
-function createSyntheticWav({ durationSeconds = 4, sampleRate = 8_000 } = {}) {
+export function createSyntheticWav({ durationSeconds = 4, sampleRate = 8_000 } = {}) {
   const sampleCount = Math.floor(durationSeconds * sampleRate);
   const dataSize = sampleCount * 2;
   const wav = Buffer.alloc(44 + dataSize);
@@ -60,7 +60,13 @@ export async function installEditorHarness(page, options = {}) {
   const segments = options.segments === undefined ? DEFAULT_SEGMENTS : options.segments;
   const empty = options.empty === true;
   const audio = options.audio === "unavailable" ? "unavailable" : "available";
+  const editorV2 = options.editorV2 === true;
   const saves = [];
+  const approvals = [];
+  let durableRevision = 0;
+  let durableSegments = JSON.parse(JSON.stringify(empty ? [] : segments));
+  const durableOriginal = JSON.parse(JSON.stringify(durableSegments));
+  const versions = [];
   const audioBytes = createSyntheticWav();
 
   await page.addInitScript(({ token }) => {
@@ -105,7 +111,61 @@ export async function installEditorHarness(page, options = {}) {
     }
 
     if (request.method() === "GET" && path === "/auth/me") {
-      await route.fulfill(jsonResponse({ id: "e2e-user", email: "e2e@example.test", role: "user" }));
+      await route.fulfill(jsonResponse({ id: "e2e-user", email: "e2e@example.test", role: "user", tenant_id: "e2e-team", features: { editor_v2: editorV2 } }));
+      return;
+    }
+
+    if (editorV2 && request.method() === "GET" && path === `/editor/${jobId}`) {
+      await route.fulfill(jsonResponse({
+        job_id: jobId,
+        revision: durableRevision,
+        segments: durableSegments,
+        original_segments: durableOriginal,
+        updated_by: null,
+        updated_at: new Date().toISOString(),
+        lock: { active: false, user: null, expires_at: null },
+      }));
+      return;
+    }
+
+    if (editorV2 && request.method() === "PATCH" && path === `/editor/${jobId}`) {
+      const body = request.postDataJSON();
+      if (body.base_revision !== durableRevision) {
+        await route.fulfill(jsonResponse({ detail: {
+          detail: "editor_revision_conflict",
+          server_revision: durableRevision,
+          server_segments: durableSegments,
+          updated_by: { id: "teammate", username: "Teammate" },
+          updated_at: new Date().toISOString(),
+        } }, 409));
+        return;
+      }
+      const changed = JSON.stringify(body.segments) !== JSON.stringify(durableSegments);
+      if (changed) durableRevision += 1;
+      durableSegments = body.segments;
+      const versionId = body.checkpoint === "draft" ? null : `version-${durableRevision}`;
+      if (versionId && !versions.some((version) => version.id === versionId)) {
+        versions.unshift({ id: versionId, revision: durableRevision, reason: body.checkpoint, is_approved: false, created_at: new Date().toISOString() });
+      }
+      saves.push(body);
+      await route.fulfill(jsonResponse({ applied: changed, revision: durableRevision, version_id: versionId, saved_at: new Date().toISOString() }));
+      return;
+    }
+
+    if (editorV2 && request.method() === "POST" && path.endsWith("/lock/heartbeat")) {
+      await route.fulfill(jsonResponse({ acquired: true, user: { id: "e2e-user", username: "E2E Operator" }, expires_at: new Date(Date.now() + 60_000).toISOString() }));
+      return;
+    }
+    if (editorV2 && request.method() === "DELETE" && path.endsWith("/lock")) {
+      await route.fulfill(jsonResponse({ released: true }));
+      return;
+    }
+    if (editorV2 && request.method() === "GET" && path === `/editor/${jobId}/versions`) {
+      await route.fulfill(jsonResponse({ versions }));
+      return;
+    }
+    if (request.method() === "POST" && path === "/analytics/events") {
+      await route.fulfill(jsonResponse({ accepted: 1, rejected: 0 }));
       return;
     }
 
@@ -154,6 +214,15 @@ export async function installEditorHarness(page, options = {}) {
       return;
     }
 
+    if (request.method() === "POST" && path === `/edit/${jobId}`) {
+      approvals.push(request.postDataJSON());
+      await route.fulfill(jsonResponse({
+        job_id: jobId,
+        approved_editor_version_id: approvals.at(-1)?.editor_version_id || null,
+      }));
+      return;
+    }
+
     // Keep the auth refresh path deterministic if the app decides to refresh
     // the synthetic token in a future change.
     if (request.method() === "POST" && path === "/auth/refresh") {
@@ -167,6 +236,7 @@ export async function installEditorHarness(page, options = {}) {
   return {
     jobId,
     saves,
+    approvals,
     async open() {
       await page.setViewportSize({ width: 1440, height: 1000 });
       await page.goto(`/videos/${jobId}/edit-lyrics`);

@@ -570,7 +570,7 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
   };
 
   return (
-    <div className="min-h-screen bg-surface flex">
+    <div className="min-h-screen overflow-x-hidden bg-surface flex">
       <Sidebar
         activeView={activeView}
         onNav={handleNav}
@@ -588,7 +588,7 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
         />
       )}
 
-      <div className={`flex-1 min-h-screen transition-all duration-300 ${sidebarOpen ? "md:ml-60" : "md:ml-[72px]"}`}>
+      <div className={`min-w-0 flex-1 min-h-screen transition-all duration-300 ${sidebarOpen ? "md:ml-60" : "md:ml-[72px]"}`}>
         <GlobalTopbar
           user={user}
           activeRenders={(history || []).filter((job) => ["processing", "queued", "editing", "transcribing", "transcribing_queued"].includes(job.status)).length}
@@ -2815,7 +2815,7 @@ export default function App() {
     // BUG FIX 2026-05-25 (job duplication): si el prefetch del auto-transcribe
     // YA arrancó (status="loading") y todavía no terminó, NO crear un job
     // nuevo — esperar al existente. Sin este check, el operador clickeaba
-    // "Revisar lyrics" mientras el prefetch corría → caía al slow path →
+    // "Revisar letra" mientras el prefetch corría → caía al slow path →
     // segundo uploadFileToR2 → SEGUNDO job creado para el mismo audio.
     // DB confirma: pares de jobs con MISMO filename, mismo user, ~121s
     // apart (el tiempo típico de wizard antes de clickear Revisar).
@@ -3074,6 +3074,10 @@ export default function App() {
   // contrato real, no un mirror inline stale). authFetch + API se inyectan.
   const persistSegmentsToBackend = useCallback(
     (jobId, segments, opts = {}) => persistSegments(authFetch, API, jobId, segments, opts),
+    [],
+  );
+  const editorRequest = useCallback(
+    (path, options = {}) => authFetch(`${API}${path}`, options),
     [],
   );
   // Una sola cola por App sobrevive remounts del editor (pasos 6↔4 y
@@ -3383,6 +3387,12 @@ export default function App() {
           payload.base_revision = Number.isInteger(saveMeta.baseRevision)
             ? saveMeta.baseRevision
             : (Number.isInteger(r.segmentsRevision) ? r.segmentsRevision : 0);
+          if (Number.isInteger(saveMeta.editorRevision)) {
+            payload.editor_revision = saveMeta.editorRevision;
+          }
+          if (saveMeta.editorVersionId) {
+            payload.editor_version_id = saveMeta.editorVersionId;
+          }
         }
 
         const doPost = async (body) => {
@@ -3421,7 +3431,7 @@ export default function App() {
             segmentsStore.evict(reviewStoreKey(r));
             segmentsStore.evict(r.transcribeJobId);
             navigate(`/videos/${editedJobId}`, { replace: true });
-            return;
+            return { ok: true, duplicate: true };
           }
           const friendly = translateBackendError(data?.detail, t) || `Error ${res.status}`;
           alert({
@@ -3430,7 +3440,13 @@ export default function App() {
             tone: "error",
           });
           console.warn("[edit-wizard] /edit failed", { status: res.status, detail: data });
-          return;
+          const conflict = data?.detail && typeof data.detail === "object"
+            && data.detail.detail === "editor_revision_conflict";
+          return {
+            ok: false,
+            reason: conflict ? "conflict" : `http-${res.status}`,
+            conflict: conflict ? data.detail : null,
+          };
         }
 
         setCurrentReview(null);
@@ -3443,7 +3459,7 @@ export default function App() {
         segmentsStore.evict(reviewStoreKey(r));
         segmentsStore.evict(r.transcribeJobId);
         navigate(`/videos/${editedJobId}`, { replace: true });
-        return;
+        return { ok: true, approvedEditorVersionId: data?.approved_editor_version_id || null };
       } finally {
         editSubmitLockRef.current = false;
       }
@@ -3476,6 +3492,8 @@ export default function App() {
       segmentsRevision: Number.isInteger(saveMeta.baseRevision)
         ? saveMeta.baseRevision
         : (Number.isInteger(r.segmentsRevision) ? r.segmentsRevision : 0),
+      editorRevision: Number.isInteger(saveMeta.editorRevision) ? saveMeta.editorRevision : null,
+      editorVersionId: saveMeta.editorVersionId || null,
       transcribeJobId: r.transcribeJobId || null,
       // Capa C 2026-05-24: bgCacheKey viene del useBackgroundPreview hook
       // que corrió durante review. Si null = no se hizo pre-gen (free-tier
@@ -3591,6 +3609,8 @@ export default function App() {
       titleSongBreak: a.titleSongBreak || "",
       segments: a.segments,
       segmentsRevision: Number.isInteger(a.segmentsRevision) ? a.segmentsRevision : 0,
+      editorRevision: Number.isInteger(a.editorRevision) ? a.editorRevision : null,
+      editorVersionId: a.editorVersionId || null,
       transcribeJobId: a.transcribeJobId || null,
       status: "queued", current_step: null, progress: 0, job_id: null, error: null,
     }));
@@ -3667,6 +3687,12 @@ export default function App() {
         formData.append("segments_json", JSON.stringify(jobList[i].segments));
         if (Number.isInteger(jobList[i].segmentsRevision)) {
           formData.append("base_revision", String(jobList[i].segmentsRevision));
+        }
+        if (Number.isInteger(jobList[i].editorRevision)) {
+          formData.append("editor_revision", String(jobList[i].editorRevision));
+        }
+        if (jobList[i].editorVersionId) {
+          formData.append("editor_version_id", jobList[i].editorVersionId);
         }
         formData.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
@@ -4967,6 +4993,7 @@ export default function App() {
             segmentsRevision={currentReview.segmentsRevision || 0}
             storeKey={reviewStoreKey(currentReview)}
             onPersistSegments={persistSegmentsToBackend}
+            editorRequest={editorRequest}
             saveQueue={segmentsSaveQueueRef.current}
             onReanchor={reanchorSegmentsOnBackend}
             onReloadServer={({ draftKey, storeKey }) => {

@@ -44,20 +44,7 @@ export async function persistSegments(authFetch, API, jobId, segments, opts = {}
   }));
   console.info("[drag-persist] POST", { jobId, count: safeSegments.length, sample: _sample });
   try {
-    let baseRevision = Number.isInteger(opts.baseRevision) ? opts.baseRevision : 0;
-    // A conflict overwrite is always based on a fresh server read.  Reusing
-    // the revision returned by an earlier 409 is racy: another tab may have
-    // committed again while the operator was deciding what to do.
-    if (opts.resolveConflict === true) {
-      const statusRes = await authFetch(`${API}/status/${jobId}`);
-      if (!statusRes.ok) {
-        return { ok: false, reason: `http-${statusRes.status}`, status: statusRes.status };
-      }
-      const current = await statusRes.json();
-      baseRevision = Number.isInteger(current?.segments_revision)
-        ? current.segments_revision
-        : baseRevision;
-    }
+    const baseRevision = Number.isInteger(opts.baseRevision) ? opts.baseRevision : 0;
     const res = await authFetch(`${API}/jobs/${jobId}/save-segments`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

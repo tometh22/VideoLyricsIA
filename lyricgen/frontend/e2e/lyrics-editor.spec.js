@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import AxeBuilder from "@axe-core/playwright";
 import {
   DEFAULT_SEGMENTS,
   drag,
@@ -111,7 +112,10 @@ test.describe("lyrics editor browser contract", () => {
 
   test("moves a selected group as one edit, supports undo, and saves finite timestamps", async ({ page }) => {
     const malformedSegments = [
-      ...DEFAULT_SEGMENTS.slice(0, 3),
+      { _id: "a", start: 0.4, end: 1, text: "Primera línea" },
+      { _id: "b", start: 1.2, end: 1.8, text: "Segunda línea" },
+      { _id: "c", start: 2, end: 2.6, text: "Tercera línea" },
+      { _id: "d", start: 5, end: 5.6, text: "Cuarta línea" },
       { _id: "malformed", start: "not-a-time", end: null, text: "Línea recuperable" },
     ];
     const harness = await installEditorHarness(page, { segments: malformedSegments });
@@ -145,6 +149,23 @@ test.describe("lyrics editor browser contract", () => {
 
     await page.keyboard.press(`${modifier}+z`);
     await expect.poll(async () => lines.nth(0).evaluate((element) => parseFloat(element.style.left))).toBeCloseTo(before, 1);
+  });
+
+  test("deletes selected timing lines and restores them with undo", async ({ page }) => {
+    const harness = await installEditorHarness(page);
+    await harness.open();
+    await openAdvanced(page);
+
+    const lines = page.getByTestId("timeline-segment");
+    const modifier = modifierForCurrentPlatform();
+    await lines.nth(0).click({ modifiers: [modifier] });
+    await lines.nth(1).click({ modifiers: [modifier] });
+    await selectionCount(page, 2);
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.getByRole("button", { name: "Eliminar" }).click();
+    await expect(lines).toHaveCount(DEFAULT_SEGMENTS.length - 2);
+    await page.keyboard.press(`${modifier}+z`);
+    await expect(lines).toHaveCount(DEFAULT_SEGMENTS.length);
   });
 
   test("separates cyan playback state from purple selection state", async ({ page }) => {
@@ -209,7 +230,7 @@ test.describe("lyrics editor browser contract", () => {
 
     const block = page.getByTestId("timeline-segment").first();
     const edge = block.getByTestId("timeline-edge-end");
-    await expect(edge).toHaveCSS("width", "16px");
+    await expect(edge).toHaveCSS("width", "22px");
     const beforeWidth = await block.evaluate((element) => parseFloat(element.style.width));
     const edgeBox = await edge.boundingBox();
     expect(edgeBox).not.toBeNull();
@@ -219,9 +240,113 @@ test.describe("lyrics editor browser contract", () => {
       { x: edgeBox.x + edgeBox.width / 2 + 24, y: edgeBox.y + edgeBox.height / 2 },
     );
 
-    await expect.poll(async () => block.evaluate((element) => parseFloat(element.style.width))).toBeGreaterThan(beforeWidth + 18);
+    await expect.poll(async () => block.evaluate((element) => parseFloat(element.style.width))).toBeGreaterThan(beforeWidth + 10);
     await expect.poll(() => harness.saves.length).toBeGreaterThan(0);
     const saved = harness.saves.at(-1).segments.find((segment) => segment.text === "Línea para estirar");
-    expect(Number(saved.end)).toBeGreaterThan(2.8);
+    expect(Number(saved.end)).toBeCloseTo(2.65, 2);
+    expect(Number(saved.end)).toBeLessThanOrEqual(2.65 + Number.EPSILON * 4);
+  });
+
+  test("keeps short-line geometry real while handles remain easy to hit", async ({ page }) => {
+    const harness = await installEditorHarness(page, {
+      segments: [
+        { _id: "short", start: 0.4, end: 0.7, text: "Oh" },
+        { _id: "next", start: 1.2, end: 2, text: "Siguiente" },
+      ],
+    });
+    await harness.open();
+    await openAdvanced(page);
+    const block = page.getByTestId("timeline-segment").first();
+    const width = await block.evaluate((element) => parseFloat(element.style.width));
+    const zoom = Number(await page.getByTestId("timeline-lane").getAttribute("data-px-per-sec"));
+    expect(width).toBeCloseTo(0.3 * zoom, 1);
+    await expect(block.getByTestId("timeline-edge-start")).toHaveCSS("width", "22px");
+    await expect(block.getByTestId("timeline-edge-end")).toHaveCSS("width", "22px");
+  });
+
+  test("supports keyboard tabs and accessible selection nudges", async ({ page }) => {
+    const harness = await installEditorHarness(page);
+    await harness.open();
+    const basic = page.getByRole("tab", { name: "Revisar letra" });
+    await basic.focus();
+    await page.keyboard.press("ArrowRight");
+    await expect(page.getByRole("tab", { name: "Ajustar tiempos" })).toHaveAttribute("aria-selected", "true");
+    const block = page.getByTestId("timeline-segment").first();
+    await block.focus();
+    await page.keyboard.press("Enter");
+    await selectionCount(page, 1);
+    const before = await block.evaluate((element) => parseFloat(element.style.left));
+    await page.keyboard.press("ArrowRight");
+    await expect.poll(async () => block.evaluate((element) => parseFloat(element.style.left))).toBeGreaterThan(before);
+  });
+
+  test("uses the durable editor contract when editor_v2 is enabled", async ({ page }) => {
+    const harness = await installEditorHarness(page, { editorV2: true });
+    await harness.open();
+    const input = page.locator('input[value="Primera línea"]');
+    await input.fill("Primera línea durable");
+    await expect.poll(() => harness.saves.length).toBeGreaterThan(0);
+    expect(harness.saves[0]).toMatchObject({ base_revision: 0, checkpoint: "draft" });
+
+    await page.getByRole("button", { name: /Aprobar y generar/i }).click();
+    await expect.poll(() => harness.approvals.length).toBe(1);
+    const approved = harness.approvals[0];
+    const persisted = harness.saves.at(-1);
+    expect(approved.editor_revision).toBeGreaterThan(0);
+    expect(approved.editor_version_id).toBe(`version-${approved.editor_revision}`);
+    expect(approved.segments).toEqual(persisted.segments.map(({ _id, ...segment }) => segment));
+  });
+
+  test("passes the automated accessibility audit in both editor views", async ({ page }) => {
+    const harness = await installEditorHarness(page);
+    await harness.open();
+    for (const mode of ["basic", "advanced"]) {
+      if (mode === "advanced") await openAdvanced(page);
+      const results = await new AxeBuilder({ page })
+        .include('[data-testid="lyrics-editor"]')
+        .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+        .analyze();
+      const blocking = results.violations.filter((violation) => ["critical", "serious"].includes(violation.impact));
+      expect(blocking, `${mode}: ${blocking.map((violation) => violation.id).join(", ")}`).toEqual([]);
+    }
+  });
+
+  test("has no global overflow or CTA overlap across product breakpoints", async ({ page }) => {
+    const segments = Array.from({ length: 80 }, (_, index) => ({
+      _id: `line-${index}`,
+      start: index * 0.5,
+      end: index * 0.5 + 0.35,
+      text: `Línea ${index + 1}`,
+    }));
+    const harness = await installEditorHarness(page, { segments });
+    await harness.open();
+    for (const viewport of [
+      { width: 1366, height: 768 },
+      { width: 1440, height: 900 },
+      { width: 2048, height: 1100 },
+      { width: 834, height: 1112 },
+      { width: 390, height: 844 },
+    ]) {
+      await page.setViewportSize(viewport);
+      await expect.poll(() => page.evaluate(() => {
+        const root = document.documentElement;
+        if (root.scrollWidth <= root.clientWidth + 1) return [];
+        return [...document.querySelectorAll("body *")]
+          .map((element) => {
+            const rect = element.getBoundingClientRect();
+            return { element, rect };
+          })
+          .filter(({ rect }) => rect.right > root.clientWidth + 1 || rect.left < -1)
+          .slice(0, 8)
+          .map(({ element, rect }) => ({
+            tag: element.tagName.toLowerCase(),
+            testId: element.getAttribute("data-testid"),
+            className: typeof element.className === "string" ? element.className.slice(0, 160) : "",
+            left: Math.round(rect.left),
+            right: Math.round(rect.right),
+          }));
+      })).toEqual([]);
+      await expect(page.getByRole("button", { name: /Aprobar y generar/i })).toBeVisible();
+    }
   });
 });

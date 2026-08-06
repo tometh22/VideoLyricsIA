@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   clampBlockShiftDelta,
+  clampResizeTiming,
+  clampSelectionShiftDelta,
   shiftBlockWithinDuration,
 } from "./segmentTiming";
 
@@ -67,5 +69,49 @@ describe("block timeline shifts", () => {
       10,
       duration,
     )).toBe(0);
+  });
+});
+
+describe("collision-safe timeline edits", () => {
+  const lines = [
+    { _id: "a", start: 0, end: 1 },
+    { _id: "b", start: 2, end: 3 },
+    { _id: "c", start: 4, end: 5 },
+    { _id: "d", start: 6, end: 7 },
+  ];
+
+  it("intersects bounds for a non-contiguous selection", () => {
+    expect(clampSelectionShiftDelta(lines, new Set(["b", "d"]), -10, 10, 0.05))
+      .toBeCloseTo(-0.95);
+    expect(clampSelectionShiftDelta(lines, new Set(["b", "d"]), 10, 10, 0.05))
+      .toBeCloseTo(0.95);
+  });
+
+  it("keeps a moved line 50ms away from neighbours", () => {
+    expect(clampSelectionShiftDelta(lines, new Set(["b"]), -2, 10, 0.05))
+      .toBeCloseTo(-0.95);
+    expect(clampSelectionShiftDelta(lines, new Set(["b"]), 2, 10, 0.05))
+      .toBeCloseTo(0.95);
+  });
+
+  it("clamps resize handles against adjacent lines", () => {
+    expect(clampResizeTiming(lines, "b", 0, 8, 10, 0.05, 0.3)).toMatchObject({
+      start: 1.05,
+      end: 3.95,
+      blocked: false,
+    });
+  });
+
+  it("refuses an impossible resize without mutating the snapshot", () => {
+    const crowded = [
+      { _id: "a", start: 0, end: 1 },
+      { _id: "b", start: 1.02, end: 1.2 },
+      { _id: "c", start: 1.22, end: 2 },
+    ];
+    expect(clampResizeTiming(crowded, "b", 1, 1.5, 2, 0.05, 0.3)).toEqual({
+      start: 1.02,
+      end: 1.2,
+      blocked: true,
+    });
   });
 });
