@@ -78,6 +78,7 @@ from auth import (
     has_art_track_access,
     scenes_credit_cost,
     telemetry_enabled,
+    editor_v2_enabled,
     generate_api_key,
     is_explicitly_local_environment,
     is_super_admin,
@@ -95,12 +96,16 @@ from database import (
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from editor import (
+    approve_document,
     acquire_lock,
     get_job_for_tenant,
+    get_version,
     get_or_create_document,
     list_versions,
+    normalize_segments,
     release_lock,
     restore_version,
+    resolve_conflict,
     save_document,
     serialize_document,
     sync_legacy_snapshot,
@@ -1387,6 +1392,7 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
                 # front oculta la opción "Art Track" si esto es false.
                 "art_track": has_art_track_access(user),
                 "telemetry": telemetry_enabled(),
+                "editor_v2": editor_v2_enabled(user),
                 # Versión B (letra anclada): el frontend gatea el textarea
                 # del wizard y el botón "Re-sincronizar con IA" con esto.
                 "anchor_lyrics": _anchor_lyrics_enabled(),
@@ -1495,6 +1501,7 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
                 # front oculta la opción "Art Track" si esto es false.
                 "art_track": has_art_track_access(user),
                 "telemetry": telemetry_enabled(),
+                "editor_v2": editor_v2_enabled(user),
                 # Versión B (letra anclada): el frontend gatea el textarea
                 # del wizard y el botón "Re-sincronizar con IA" con esto.
                 "anchor_lyrics": _anchor_lyrics_enabled(),
@@ -1569,6 +1576,7 @@ def me(current_user: dict = Depends(get_current_user), db: Session = Depends(get
             "scenes_credit_cost": scenes_credit_cost(),
             "art_track": has_art_track_access(_u),
             "telemetry": telemetry_enabled(),
+            "editor_v2": editor_v2_enabled(_u),
             # Versión B (letra anclada): el frontend gatea el textarea
             # del wizard y el botón "Re-sincronizar con IA" con esto.
             "anchor_lyrics": _anchor_lyrics_enabled(),
@@ -8189,6 +8197,7 @@ async def generate_with_segments(
         raise HTTPException(status_code=400, detail="base_revision must be a non-negative integer") from exc
 
     editor_document = None
+    selected_editor_version = None
 
     if reuse:
         # Reuse path: verify the job belongs to caller and pull the audio
@@ -8231,35 +8240,36 @@ async def generate_with_segments(
                 },
             )
         if editor_version_id or str(editor_revision).strip():
-            document = get_or_create_document(
-                db, job_id, current_user["tenant_id"], job_row.segments_json or [],
-            )
-            editor_document = document
-            if editor_version_id:
-                version = db.query(EditorVersion).filter(
-                    EditorVersion.id == editor_version_id,
-                    EditorVersion.job_id == job_id,
-                    EditorVersion.tenant_id == current_user["tenant_id"],
-                ).first()
-                if not version:
-                    raise HTTPException(status_code=409, detail="editor_version_not_found")
-                segments = version.segments
-                requested_revision = document.revision
-            else:
+            if not current_user.get("features", {}).get("editor_v2"):
+                raise HTTPException(status_code=404, detail="Job not found.")
+            parsed_editor_revision = None
+            if str(editor_revision).strip():
                 try:
-                    requested_revision = int(editor_revision)
+                    parsed_editor_revision = int(editor_revision)
                 except (TypeError, ValueError):
                     raise HTTPException(status_code=422, detail="editor_revision must be an integer") from None
-                if requested_revision != document.revision:
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "detail": "editor_revision_conflict",
-                            "server_revision": document.revision,
-                            "server_segments": document.current_segments,
-                        },
-                    )
-                segments = document.current_segments
+            try:
+                editor_document, selected_editor_version = approve_document(
+                    db, job_row, current_user["id"],
+                    editor_revision=parsed_editor_revision,
+                    editor_version_id=editor_version_id or None,
+                )
+            except LookupError:
+                raise HTTPException(status_code=409, detail="editor_version_not_found") from None
+            except RuntimeError:
+                current_document = get_or_create_document(
+                    db, job_id, current_user["tenant_id"], job_row.segments_json or [],
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "detail": "editor_revision_conflict",
+                        "server_revision": current_document.revision,
+                        "server_segments": current_document.current_segments,
+                    },
+                ) from None
+            segments = selected_editor_version.segments
+            requested_revision = selected_editor_version.revision
         current_revision = int(getattr(job_row, "segments_revision", 0) or 0)
         if requested_revision is None and current_revision > 0:
             return JSONResponse(
@@ -8700,7 +8710,13 @@ async def generate_with_segments(
         render_profile=_render_profile,
     )
 
-    return {"job_id": job_id, "status": initial_status}
+    return {
+        "job_id": job_id,
+        "status": initial_status,
+        "approved_editor_version_id": (
+            selected_editor_version.id if selected_editor_version is not None else None
+        ),
+    }
 
 
 @app.get("/admin/queue")
@@ -9790,6 +9806,8 @@ class EditJobRequest(BaseModel):
     # end (s), text (str); anything else is ignored.
     segments: list[dict] | None = Field(default=None)
     base_revision: int | None = Field(default=None, ge=0)
+    editor_revision: int | None = Field(default=None, ge=0)
+    editor_version_id: str | None = Field(default=None, max_length=36)
     force_conflict_overwrite: bool = False
     # Optional free-form hint for edit_type=="background". The operator
     # types what they want the new background to convey ("paisaje cálido
@@ -10399,6 +10417,12 @@ class EditorRestoreRequest(BaseModel):
     base_revision: int
 
 
+class EditorConflictRequest(BaseModel):
+    strategy: str
+    server_revision: int = Field(ge=0)
+    segments: list[dict] | None = None
+
+
 class ProductEventItem(BaseModel):
     name: str
     job_id: str | None = None
@@ -10411,6 +10435,10 @@ class ProductEventsRequest(BaseModel):
 
 
 def _editor_document_or_404(db: Session, job_id: str, current_user: dict):
+    # Keep rollback effective: production tenants outside the canary cannot
+    # mutate the durable editor by calling the API directly.
+    if not current_user.get("features", {}).get("editor_v2"):
+        raise HTTPException(status_code=404, detail="Job not found.")
     job = get_job_for_tenant(db, job_id, current_user["tenant_id"])
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -10423,6 +10451,17 @@ def _editor_document_or_404(db: Session, job_id: str, current_user: dict):
     return job, document
 
 
+def _editor_conflict_payload(db: Session, document: EditorDocument) -> dict:
+    payload = serialize_document(db, document)
+    return {
+        "detail": "editor_revision_conflict",
+        "server_revision": payload["revision"],
+        "server_segments": payload["segments"],
+        "updated_by": payload["updated_by"],
+        "updated_at": payload["updated_at"],
+    }
+
+
 @app.get("/editor/{job_id}")
 async def get_editor_document(
     job_id: str,
@@ -10430,6 +10469,7 @@ async def get_editor_document(
     db: Session = Depends(get_db),
 ):
     job, document = _editor_document_or_404(db, job_id, current_user)
+    db.commit()  # lazy migration/reconciliation is an intentional GET side effect
     payload = serialize_document(db, document)
     payload.update({
         "artist": job.artist,
@@ -10449,32 +10489,27 @@ async def patch_editor_document(
 ):
     job, document = _editor_document_or_404(db, job_id, current_user)
     try:
-        document, version = save_document(
-            db, document, current_user["id"], body.base_revision,
+        document, version, applied = save_document(
+            db, job, document, current_user["id"], body.base_revision,
             body.segments, body.checkpoint,
         )
-        # Keep the legacy editor/generator contract in sync during rollout.
-        job.segments_json = document.current_segments
-        job.segments_revision = document.revision
         db.commit()
     except RuntimeError:
+        db.rollback()
+        _, document = _editor_document_or_404(db, job_id, current_user)
         raise HTTPException(
             status_code=409,
-            detail={
-                "detail": "editor_revision_conflict",
-                "server_revision": document.revision,
-                "server_segments": document.current_segments,
-                "updated_by": serialize_document(db, document)["updated_by"],
-                "updated_at": serialize_document(db, document)["updated_at"],
-            },
+            detail=_editor_conflict_payload(db, document),
         ) from None
     except ValueError as exc:
+        db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from None
     return {
         "job_id": job_id,
         "revision": document.revision,
         "version_id": version.id if version else None,
         "saved_at": document.updated_at.isoformat(),
+        "applied": applied,
     }
 
 
@@ -10486,7 +10521,9 @@ async def editor_lock(
     db: Session = Depends(get_db),
 ):
     _, document = _editor_document_or_404(db, job_id, current_user)
-    return acquire_lock(db, document, current_user["id"])
+    result = acquire_lock(db, document, current_user["id"])
+    db.commit()
+    return result
 
 
 @app.delete("/editor/{job_id}/lock")
@@ -10497,18 +10534,43 @@ async def editor_unlock(
 ):
     _, document = _editor_document_or_404(db, job_id, current_user)
     if not release_lock(db, document, current_user["id"]):
+        db.rollback()
         raise HTTPException(status_code=409, detail="editor_lock_owned_by_other_user")
+    db.commit()
     return {"released": True}
 
 
 @app.get("/editor/{job_id}/versions")
 async def get_editor_versions(
     job_id: str,
+    limit: int = Query(default=50, ge=1, le=50),
+    offset: int = Query(default=0, ge=0),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     _, document = _editor_document_or_404(db, job_id, current_user)
-    return {"versions": list_versions(db, document)}
+    return {"versions": list_versions(db, document, limit=limit, offset=offset)}
+
+
+@app.get("/editor/{job_id}/versions/{version_id}")
+async def get_editor_version(
+    job_id: str,
+    version_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _, document = _editor_document_or_404(db, job_id, current_user)
+    version = get_version(db, document, version_id)
+    if not version:
+        raise HTTPException(status_code=404, detail="editor_version_not_found")
+    return {
+        "id": version.id,
+        "revision": version.revision,
+        "reason": version.reason,
+        "is_approved": bool(version.is_approved),
+        "segments": version.segments,
+        "created_at": version.created_at.isoformat() if version.created_at else None,
+    }
 
 
 @app.post("/editor/{job_id}/restore")
@@ -10521,27 +10583,53 @@ async def restore_editor_version(
     job, document = _editor_document_or_404(db, job_id, current_user)
     try:
         document, version = restore_version(
-            db, document, current_user["id"], body.version_id, body.base_revision,
+            db, job, document, current_user["id"], body.version_id, body.base_revision,
         )
-        job.segments_json = document.current_segments
-        job.segments_revision = document.revision
         db.commit()
     except LookupError:
         raise HTTPException(status_code=404, detail="editor_version_not_found") from None
     except RuntimeError:
+        db.rollback()
+        _, document = _editor_document_or_404(db, job_id, current_user)
         raise HTTPException(
             status_code=409,
-            detail={
-                "detail": "editor_revision_conflict",
-                "server_revision": document.revision,
-                "server_segments": document.current_segments,
-            },
+            detail=_editor_conflict_payload(db, document),
         ) from None
     return {
         "job_id": job_id,
         "revision": document.revision,
         "version_id": version.id,
         "segments": document.current_segments,
+    }
+
+
+@app.post("/editor/{job_id}/conflicts/resolve")
+async def resolve_editor_conflict(
+    job_id: str,
+    body: EditorConflictRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    try:
+        document, version, applied = resolve_conflict(
+            db, job, document, current_user["id"], body.server_revision,
+            body.strategy, body.segments,
+        )
+        db.commit()
+    except RuntimeError:
+        db.rollback()
+        _, document = _editor_document_or_404(db, job_id, current_user)
+        raise HTTPException(
+            status_code=409, detail=_editor_conflict_payload(db, document),
+        ) from None
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    return {
+        **serialize_document(db, document),
+        "version_id": version.id if version else None,
+        "applied": applied,
     }
 
 
@@ -10553,9 +10641,28 @@ _PRODUCT_EVENT_NAMES = {
     "editor_help_opened",
 }
 
+_PRODUCT_EVENT_PROPERTIES = {
+    "editor_opened": {"line_count", "view", "source"},
+    "editor_view_changed": {"from", "to"},
+    "editor_seek": {"position_ms", "source"},
+    "editor_selection_created": {"count", "method", "duration_ms"},
+    "editor_group_moved": {"count", "delta_ms", "duration_ms"},
+    "editor_timing_changed": {"count", "operation", "delta_ms", "duration_ms"},
+    "editor_undo": {"operation", "count"},
+    "editor_autosave_success": {"duration_ms", "checkpoint", "retry_count"},
+    "editor_autosave_failed": {"duration_ms", "checkpoint", "reason", "status", "retry_count"},
+    "editor_conflict": {"server_revision", "local_revision", "resolution"},
+    "editor_version_restored": {"from_revision", "to_revision"},
+    "editor_approved": {"revision", "duration_ms"},
+    "editor_help_opened": {"context"},
+}
+_PRODUCT_EVENT_COMMON_PROPERTIES = {"session_id"}
+
 
 @app.post("/analytics/events")
+@limiter.limit("120/minute")
 async def record_product_events(
+    request: Request,
     body: ProductEventsRequest,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -10563,14 +10670,27 @@ async def record_product_events(
     if len(body.events) > 50:
         raise HTTPException(status_code=422, detail="A maximum of 50 events is accepted per batch.")
     accepted = 0
+    rejected = 0
     for item in body.events:
         if item.name not in _PRODUCT_EVENT_NAMES:
+            rejected += 1
             continue
-        properties = {
-            key: value for key, value in (item.properties or {}).items()
-            if key not in {"segments", "lyrics", "audio", "audio_url"}
-        }
+        if item.job_id and not get_job_for_tenant(db, item.job_id, current_user["tenant_id"]):
+            rejected += 1
+            continue
+        allowed = _PRODUCT_EVENT_PROPERTIES[item.name] | _PRODUCT_EVENT_COMMON_PROPERTIES
+        properties = {}
+        invalid_properties = False
+        for key, value in (item.properties or {}).items():
+            if key not in allowed or not isinstance(value, (str, int, float, bool)):
+                invalid_properties = True
+                break
+            properties[key] = value
+        if invalid_properties:
+            rejected += 1
+            continue
         if len(json.dumps(properties, ensure_ascii=False)) > 2000:
+            rejected += 1
             continue
         occurred_at = None
         if item.occurred_at:
@@ -10585,7 +10705,7 @@ async def record_product_events(
         ))
         accepted += 1
     db.commit()
-    return {"accepted": accepted}
+    return {"accepted": accepted, "rejected": rejected}
 
 
 @app.get("/admin/product-metrics")
@@ -10595,21 +10715,70 @@ async def product_metrics(
 ):
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
-    rows = db.query(ProductEvent).order_by(ProductEvent.created_at.desc()).limit(10000).all()
+    query = db.query(ProductEvent)
+    if not current_user.get("is_super_admin"):
+        query = query.filter(ProductEvent.tenant_id == current_user["tenant_id"])
+    rows = query.order_by(ProductEvent.created_at.desc()).limit(10000).all()
     counts: dict[str, int] = {}
-    durations = []
-    first_edits = []
+    group_move_durations = []
+    sessions: dict[tuple, dict] = {}
+    view_usage = {"basic": 0, "advanced": 0}
     for row in rows:
         counts[row.name] = counts.get(row.name, 0) + 1
         properties = row.properties or {}
-        if isinstance(properties.get("duration_ms"), (int, float)):
-            durations.append(float(properties["duration_ms"]))
-        if isinstance(properties.get("time_to_first_edit_ms"), (int, float)):
-            first_edits.append(float(properties["time_to_first_edit_ms"]))
+        timestamp = row.occurred_at or row.created_at
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        session_id = properties.get("session_id")
+        # Older clients have no session id; bucket by UTC date so two visits
+        # months apart never become one enormous synthetic session.
+        key = (row.user_id, row.job_id, session_id or timestamp.date().isoformat())
+        session = sessions.setdefault(key, {"opened": None, "first_edit": None, "first": timestamp, "last": timestamp})
+        session["first"] = min(session["first"], timestamp)
+        session["last"] = max(session["last"], timestamp)
+        if row.name == "editor_opened":
+            session["opened"] = timestamp if session["opened"] is None else min(session["opened"], timestamp)
+            view = properties.get("view")
+            if view in view_usage:
+                view_usage[view] += 1
+        elif row.name == "editor_view_changed":
+            view = properties.get("to")
+            if view in view_usage:
+                view_usage[view] += 1
+        if row.name in {
+            "editor_timing_changed", "editor_group_moved",
+            "editor_selection_created", "editor_autosave_success",
+        }:
+            session["first_edit"] = timestamp if session["first_edit"] is None else min(session["first_edit"], timestamp)
+        if row.name == "editor_group_moved" and isinstance(properties.get("duration_ms"), (int, float)):
+            group_move_durations.append(float(properties["duration_ms"]))
+    session_durations = [
+        (session["last"] - session["first"]).total_seconds() * 1000
+        for session in sessions.values() if session["last"] >= session["first"]
+    ]
+    first_edits = [
+        (session["first_edit"] - session["opened"]).total_seconds() * 1000
+        for session in sessions.values()
+        if session["opened"] is not None and session["first_edit"] is not None
+        and session["first_edit"] >= session["opened"]
+    ]
+    opened = counts.get("editor_opened", 0)
+    approvals = counts.get("editor_approved", 0)
     return {
         "events": counts,
         "sample_size": len(rows),
-        "avg_session_duration_ms": sum(durations) / len(durations) if durations else None,
+        "view_usage": view_usage,
+        "approval_rate": approvals / opened if opened else None,
+        "conflicts": counts.get("editor_conflict", 0),
+        "autosave_failures": counts.get("editor_autosave_failed", 0),
+        "undo_count": counts.get("editor_undo", 0),
+        "avg_group_move_duration_ms": (
+            sum(group_move_durations) / len(group_move_durations)
+            if group_move_durations else None
+        ),
+        "avg_session_duration_ms": (
+            sum(session_durations) / len(session_durations) if session_durations else None
+        ),
         "avg_time_to_first_edit_ms": sum(first_edits) / len(first_edits) if first_edits else None,
     }
 
@@ -10672,7 +10841,7 @@ async def save_segments(
     # y las ediciones no persistían. Para no-admins el editor se comparte
     # entre miembros del mismo workspace; el control optimista por revisión
     # detecta cualquier guardado sobre una versión vieja.
-    _is_platform_admin = current_user.get("role") == "admin"
+    _is_platform_admin = bool(current_user.get("is_super_admin"))
     if (not job
             or (not _is_platform_admin
                 and job.tenant_id != current_user["tenant_id"])):
@@ -10781,6 +10950,16 @@ async def save_segments(
     # Vez Más — Viejas Locas (agus.cafisi, 2026-05-18).
     segs = sorted(segs, key=lambda s: float(s.get("start", 0) or 0))
 
+    # Reconcile the durable document before evaluating OCC so both legacy and
+    # Editor 2.0 clients advance one shared monotonic revision.
+    try:
+        editor_document = get_or_create_document(
+            db, job_id, job.tenant_id, job.segments_json or [],
+        )
+    except (LookupError, ValueError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
     current_revision = int(getattr(job, "segments_revision", 0) or 0)
     if body.base_revision is None and current_revision > 0:
         return JSONResponse(
@@ -10887,24 +11066,21 @@ async def save_segments(
         logger.warning("[save-segments] audit log failed: %s", e)
 
     job.segments_json = segs
-    if body.base_revision is not None:
-        job.segments_revision = current_revision + 1
+    job.segments_revision = current_revision + 1
     touch_user_activity(db, job)
-    db.commit()
-
-    # Bridge the existing staging CAS endpoint into the durable Editor 2.0
-    # document/version model. Legacy clients keep their contract while new
-    # clients can read history, restore, and collaborate through /editor.
     try:
-        document = get_or_create_document(
-            db, job_id, job.tenant_id, job.segments_json or [],
-        )
         sync_legacy_snapshot(
-            db, document, current_user["id"], job.segments_json or [],
+            db, editor_document, current_user["id"], job.segments_json or [],
             int(getattr(job, "segments_revision", 0) or 0),
         )
-    except (LookupError, ValueError) as exc:
-        logger.warning("[save-segments] editor bridge skipped job=%s: %s", job_id, exc)
+        db.commit()
+    except (LookupError, ValueError, RuntimeError) as exc:
+        db.rollback()
+        logger.warning("[save-segments] editor bridge rejected job=%s: %s", job_id, exc)
+        return JSONResponse(
+            status_code=409,
+            content={"code": "editor_state_conflict", "detail": str(exc)},
+        )
 
     # Outcome metric (issue #934): éxito consultable por tenant — junto con
     # el warning del 409 de arriba permite medir la tasa real de fallas del
@@ -11484,6 +11660,36 @@ async def request_edit(
             ),
         )
 
+    # Editor 2.0 approvals resolve an exact durable snapshot under the Job
+    # lock. Browser JSON is ignored whenever a revision/version selector is
+    # present, and a remote save between autosave and approval fails closed.
+    _approved_editor_version = None
+    if body.editor_revision is not None or body.editor_version_id:
+        if not current_user.get("features", {}).get("editor_v2"):
+            raise HTTPException(status_code=404, detail="Job not found.")
+        try:
+            _editor_document, _approved_editor_version = approve_document(
+                db, job, current_user["id"],
+                editor_revision=body.editor_revision,
+                editor_version_id=body.editor_version_id,
+            )
+        except LookupError:
+            raise HTTPException(status_code=409, detail="editor_version_not_found") from None
+        except RuntimeError:
+            _current_document = get_or_create_document(
+                db, job_id, job.tenant_id, job.segments_json or [],
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "detail": "editor_revision_conflict",
+                    "server_revision": _current_document.revision,
+                    "server_segments": _current_document.current_segments,
+                },
+            ) from None
+        body.segments = _approved_editor_version.segments
+        body.base_revision = _approved_editor_version.revision
+
     # Segments handling. Two cases:
     #
     #   - edit_type=lyrics: caller MUST send segments (it's the whole point
@@ -11534,38 +11740,10 @@ async def request_edit(
     # edit_params payload).
     normalized_segments = None
     if body.segments and len(body.segments) > 0:
-        normalized_segments = [
-            {
-                "start": float(s["start"]),
-                "end": float(s["end"]),
-                "text": str(s["text"]),
-                # Preserve the manual-timing lock set in the visual Timings
-                # editor. Without this, a lyrics re-render strips `locked`
-                # and pipeline._apply_display_timing re-applies hold-until-next,
-                # clobbering the operator's hand-set end. Only carry it when
-                # truthy so untouched lines stay clean.
-                **({"locked": True} if s.get("locked") else {}),
-                # Preserve per-line layout overrides set in the live preview
-                # (position / size / rotation). Same reason as `locked`: a
-                # re-render must not strip the operator's layout. Only carried
-                # when set to a non-default value so untouched lines stay clean.
-                **({"pos": {"x": float(s["pos"]["x"]), "y": float(s["pos"]["y"])}}
-                   if isinstance(s.get("pos"), dict)
-                   and "x" in s["pos"] and "y" in s["pos"] else {}),
-                **({"scale": float(s["scale"])}
-                   if isinstance(s.get("scale"), (int, float))
-                   and float(s["scale"]) != 1.0 else {}),
-                **({"rot": float(s["rot"])}
-                   if isinstance(s.get("rot"), (int, float))
-                   and float(s["rot"]) != 0.0 else {}),
-                # Preserve per-word timestamps (forced-align / whisperX) so a
-                # re-render or future word-level/karaoke editor doesn't lose
-                # them. The line-level editor ignores `words`; carried only
-                # when present so untouched line-level edits stay lean.
-                **({"words": s["words"]} if isinstance(s.get("words"), list) else {}),
-            }
-            for s in body.segments
-        ]
+        try:
+            normalized_segments = normalize_segments(body.segments)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         # Persist immediately so any subsequent reader (worker, /status
         # poll, the operator opening another tab) sees the corrected text.
         # The /edit handler is the right place for this — it's already
@@ -11600,9 +11778,10 @@ async def request_edit(
                     ),
                 },
             )
-        job.segments_json = normalized_segments
-        if body.base_revision is not None:
-            job.segments_revision = _pre_edit_revision + 1
+        if _approved_editor_version is None:
+            job.segments_json = normalized_segments
+            if body.base_revision is not None:
+                job.segments_revision = _pre_edit_revision + 1
 
     edit_params: dict = {}
     if body.font is not None:
@@ -11994,6 +12173,9 @@ async def request_edit(
         "edits_remaining": max(0, _MAX_EDITS - new_edit_count),
         "edit_limit_exempt": _is_admin,
         "segments_revision": int(getattr(job, "segments_revision", 0) or 0),
+        "approved_editor_version_id": (
+            _approved_editor_version.id if _approved_editor_version is not None else None
+        ),
     }
 
 

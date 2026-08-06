@@ -49,7 +49,7 @@ describe("LyricsTimeline", () => {
     const zoom = Number(screen.getByTestId("timeline-lane").dataset.pxPerSec);
     expect(block).toBeInTheDocument();
     expect(parseFloat(block.style.left)).toBeCloseTo(13.2 * zoom, 5);
-    expect(parseFloat(block.style.width)).toBeCloseTo(Math.max(56, 2.6 * zoom), 5);
+    expect(parseFloat(block.style.width)).toBeCloseTo(2.6 * zoom, 5);
   });
 
   it("seeks when clicking anywhere on the empty timeline", () => {
@@ -146,7 +146,7 @@ describe("LyricsTimeline", () => {
     expect(help).toHaveTextContent("Arrastrá el fondo");
     expect(block.className).toContain("cursor-grab");
     expect(edge.className).toContain("cursor-ew-resize");
-    expect(edge.style.width).toBe("16px");
+    expect(edge.style.width).toBe("22px");
   });
 
   it("distinguishes the playing row from purple selection", () => {

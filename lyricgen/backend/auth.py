@@ -232,6 +232,33 @@ def telemetry_enabled() -> bool:
     return os.environ.get("TELEMETRY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def editor_v2_enabled(user) -> bool:
+    """Staging-on, production-canary gate for the durable editor client."""
+    environment = (
+        os.environ.get("ENVIRONMENT")
+        or os.environ.get("RAILWAY_ENVIRONMENT_NAME")
+        or os.environ.get("VERCEL_ENV")
+        or os.environ.get("ENV")
+        or "production"
+    ).strip().lower()
+    if environment in {"staging", "dev", "development", "test", "testing", "local"}:
+        return True
+    if os.environ.get("EDITOR_V2_GLOBALLY_ENABLED", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        return True
+    if user is None:
+        return False
+    tenant = getattr(user, "tenant_id", None) if not isinstance(user, dict) else user.get("tenant_id")
+    billing_group = getattr(user, "billing_group", None) if not isinstance(user, dict) else user.get("billing_group")
+    allowed = {
+        value.strip().lower()
+        for value in os.environ.get("EDITOR_V2_TENANTS", "").split(",")
+        if value.strip()
+    }
+    return (tenant or "").lower() in allowed or (billing_group or "").lower() in allowed
+
+
 def _super_admin_allowlist() -> set:
     """Parse SUPER_ADMIN_USERS (comma-separated usernames/emails, case-insensitive).
 
@@ -375,6 +402,7 @@ def verify_api_key(db: Session, full_key: str) -> Optional[dict]:
         "features": {
             "prores_export": has_prores_access(user),
             "drive_export": has_drive_access(user),
+            "editor_v2": editor_v2_enabled(user),
         },
     }
 
@@ -955,6 +983,7 @@ def get_current_user(
             # Heartbeat de sesiones: el frontend solo manda pings cuando
             # el server lo habilita → kill-switch sin redeploy de Vercel.
             "telemetry": telemetry_enabled(),
+            "editor_v2": editor_v2_enabled(user),
         },
     }
 

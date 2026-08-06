@@ -670,7 +670,7 @@ describe("LyricsEditor — durable save on page unload (refresh/close) (2026-06-
     expect(onPersistSegments).toHaveBeenCalledTimes(1);
     const [jobId, segments, opts] = onPersistSegments.mock.calls[0];
     expect(jobId).toBe("job-1");
-    expect(segments).toEqual([{ start: 1.0, end: 2.0, text: "alpha EDITED" }]);
+    expect(segments).toEqual([{ _id: 0, start: 1.0, end: 2.0, text: "alpha EDITED" }]);
     expect(opts).toMatchObject({ keepalive: true, baseRevision: 0 });
   });
 
