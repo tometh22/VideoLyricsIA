@@ -14,13 +14,13 @@ test.describe("lyrics editor browser contract", () => {
     const harness = await installEditorHarness(page);
     await harness.open();
 
-    await expect(page.getByTestId("editor-mode-explainer")).toContainText("Básica");
+    await expect(page.getByTestId("editor-mode-explainer")).toContainText("Corregir texto y aprobar");
     await expect(page.getByRole("tab", { name: "Revisar letra" })).toHaveAttribute("aria-selected", "true");
     await expect(page.getByText("Primera línea")).toBeVisible();
 
     await openAdvanced(page);
     await expect(page.getByTestId("timeline-segment")).toHaveCount(DEFAULT_SEGMENTS.length);
-    await expect(page.getByTestId("editor-mode-explainer")).toContainText("Avanzada");
+    await expect(page.getByTestId("editor-mode-explainer")).toContainText("Timeline y edición en grupo");
 
     await page.getByRole("tab", { name: "Revisar letra" }).click();
     await expect(page.getByRole("tab", { name: "Revisar letra" })).toHaveAttribute("aria-selected", "true");
@@ -53,10 +53,12 @@ test.describe("lyrics editor browser contract", () => {
 
     const ruler = page.getByTestId("timeline-ruler");
     const box = await ruler.boundingBox();
+    const lane = await page.getByTestId("timeline-lane").boundingBox();
     const viewport = await page.getByTestId("timeline-scroll").boundingBox();
     expect(box).not.toBeNull();
+    expect(lane).not.toBeNull();
     expect(viewport).not.toBeNull();
-    await ruler.click({ position: { x: Math.min(box.width * 0.3, viewport.width - 20), y: box.height / 2 } });
+    await ruler.click({ position: { x: Math.min((lane.x - box.x) + lane.width * 0.3, viewport.width - 20), y: box.height / 2 } });
 
     await expect.poll(async () => page.locator("audio").evaluate((audio) => audio.currentTime)).toBeGreaterThan(0.5);
   });
@@ -66,7 +68,7 @@ test.describe("lyrics editor browser contract", () => {
     await harness.open();
     await openAdvanced(page);
 
-    await expect(page.getByRole("button", { name: "Seleccionando" })).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("timeline-selection-help")).toContainText("Arrastrá el fondo");
 
     const scroll = await page.getByTestId("timeline-scroll").boundingBox();
     const lane = await page.getByTestId("timeline-lane").boundingBox();
@@ -90,7 +92,7 @@ test.describe("lyrics editor browser contract", () => {
     await selectionAtLeast(page, 2);
   });
 
-  test("toggles individual lines with both modifier-click conventions", async ({ page }) => {
+  test("toggles individual lines with modifiers and selects ranges with Shift-click", async ({ page }) => {
     const harness = await installEditorHarness(page);
     await harness.open();
     await openAdvanced(page);
@@ -103,6 +105,8 @@ test.describe("lyrics editor browser contract", () => {
     await selectionCount(page, 2);
     await lines.nth(0).click({ modifiers: [modifier] });
     await selectionCount(page, 1);
+    await lines.nth(2).click({ modifiers: ["Shift"] });
+    await selectionCount(page, 3);
   });
 
   test("moves a selected group as one edit, supports undo, and saves finite timestamps", async ({ page }) => {
@@ -122,9 +126,11 @@ test.describe("lyrics editor browser contract", () => {
     await selectionCount(page, 3);
 
     const before = await lines.nth(0).evaluate((element) => parseFloat(element.style.left));
-    const box = await lines.nth(0).boundingBox();
+    const driverBefore = await lines.nth(2).evaluate((element) => parseFloat(element.style.left));
+    const box = await lines.nth(2).boundingBox();
     expect(box).not.toBeNull();
     await drag(page, { x: box.x + box.width / 2, y: box.y + box.height / 2 }, { x: box.x + box.width / 2 + 36, y: box.y + box.height / 2 });
+    await expect.poll(async () => lines.nth(2).evaluate((element) => parseFloat(element.style.left))).toBeGreaterThan(driverBefore + 20);
     await expect.poll(async () => lines.nth(0).evaluate((element) => parseFloat(element.style.left))).toBeGreaterThan(before + 20);
 
     await expect.poll(() => harness.saves.length).toBeGreaterThan(0);

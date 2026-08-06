@@ -139,9 +139,10 @@ describe("LyricsEditor — el estado editado sobrevive unmount/remount (wizard 6
     // El edit sobrevive (store), como en los otros casos.
     expect(segmentsStore.get("job-x")[0].start).toBeCloseTo(1.5, 3);
 
-    // Cambiar a la vista avanzada y apretar "Restaurar" (el handler real).
+    // Cambiar a la vista avanzada y restaurar desde el menú contextual.
     fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
-    fireEvent.click(screen.getByText("Restaurar"));
+    fireEvent.click(screen.getByRole("button", { name: "Más acciones" }));
+    fireEvent.click(screen.getByText("Restaurar tiempos originales"));
 
     // Con el fix, Reset restaura el ORIGINAL (1.0), no el ya editado (1.5).
     expect(segmentsStore.get("job-x")[0].start).toBeCloseTo(1.0, 3);

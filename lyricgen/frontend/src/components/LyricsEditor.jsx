@@ -2375,27 +2375,32 @@ export default function LyricsEditor({
           list in the transparent upper region; the button re-enables them.
           The container's pb-28 still reserves space so the last row clears
           the bar when scrolled to the end. */}
-      <div className="fixed bottom-0 left-0 right-0 z-50 pointer-events-none flex justify-end
-        bg-gradient-to-t from-surface via-surface/95 to-transparent pt-10 pb-5 px-6">
-        <button
-          onClick={handleApprove}
-          disabled={isApproving}
-          aria-busy={isApproving}
-          aria-label={isApproving
-            ? (t("editor.applying_changes") || "Aplicando cambios…")
-            : (submitLabel || (isBatch
-              ? (t("editor.approve_next") || "Aprobar y continuar")
-              : (t("editor.approve_generate") || "Aprobar y generar")))}
-          data-tour="editor-approve-floating"
-          className="editor-primary-cta pointer-events-auto inline-flex items-center gap-1.5 btn-primary text-sm h-12 px-6 shadow-2xl shadow-brand/30 disabled:opacity-60 disabled:cursor-wait"
-        >
-          {isApproving
-            ? (t("editor.applying_changes") || "Aplicando cambios…")
-            : (submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate")))}
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <path d="M5 12h14M12 5l7 7-7 7" />
-          </svg>
-        </button>
+      <div className="fixed bottom-0 left-0 right-0 z-50 border-t border-white/[0.08] bg-surface-1/95 px-4 py-3 shadow-[0_-16px_50px_rgba(0,0,0,.28)] backdrop-blur-xl">
+        <div className="mx-auto flex w-full max-w-[1800px] items-center justify-between gap-4">
+          <div className="hidden min-w-0 sm:block">
+            <p className="text-[11px] font-medium text-white">{isDirty ? "Cambios listos para guardar" : "Letra lista para generar"}</p>
+            <p className="mt-0.5 truncate text-[10px] text-ink-tertiary">{saveStatus === "saving" ? "Guardando última edición…" : `${edited.length} líneas · ${viewMode === "advanced" ? "timings revisados" : "texto revisado"}`}</p>
+          </div>
+          <button
+            onClick={handleApprove}
+            disabled={isApproving}
+            aria-busy={isApproving}
+            aria-label={isApproving
+              ? (t("editor.applying_changes") || "Aplicando cambios…")
+              : (submitLabel || (isBatch
+                ? (t("editor.approve_next") || "Aprobar y continuar")
+                : (t("editor.approve_generate") || "Aprobar y generar")))}
+            data-tour="editor-approve-floating"
+            className="editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl bg-gradient-to-r from-brand to-brand-light px-5 text-sm font-semibold text-white shadow-xl shadow-brand/25 transition-transform hover:-translate-y-0.5 disabled:cursor-wait disabled:opacity-60"
+          >
+            {isApproving
+              ? (t("editor.applying_changes") || "Aplicando cambios…")
+              : (submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate")))}
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M5 12h14M12 5l7 7-7 7" />
+            </svg>
+          </button>
+        </div>
       </div>
 
       {coverageWarning && (
@@ -2574,152 +2579,6 @@ export default function LyricsEditor({
               </span>
             </div>
           )}
-          {/* Two clear views over the same editor and data. Basic is the
-              default review flow; advanced exposes the timing workspace. */}
-          <div className="inline-flex min-w-0 shrink-0 rounded-md ring-1 ring-white/[0.08] overflow-hidden text-label" role="tablist" aria-label={t("editor.mode_label") || "Modo de edición"}>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={viewMode === "basic"}
-              onClick={() => { setViewMode("basic"); setSyncMode(false); setOverflowOpen(false); }}
-              title={t("editor.basic_hint") || "Corregí la letra y revisá los tiempos."}
-              aria-label={t("editor.basic_view") || "Revisar letra"}
-              className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "basic" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
-            >
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                <line x1="8" y1="6" x2="21" y2="6" strokeLinecap="round" />
-                <line x1="8" y1="12" x2="21" y2="12" strokeLinecap="round" />
-                <line x1="8" y1="18" x2="21" y2="18" strokeLinecap="round" />
-                <circle cx="3.5" cy="6" r="1" fill="currentColor" stroke="none" />
-                <circle cx="3.5" cy="12" r="1" fill="currentColor" stroke="none" />
-                <circle cx="3.5" cy="18" r="1" fill="currentColor" stroke="none" />
-              </svg>
-              <span className="hidden sm:inline">{t("editor.basic_view") || "Revisar letra"}</span>
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={viewMode === "advanced"}
-              onClick={() => setViewMode("advanced")}
-              title={t("editor.advanced_hint") || "Ajustá la posición de varias líneas en el audio."}
-              aria-label={t("editor.advanced_view") || "Ajustar tiempos"}
-              className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "advanced" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
-            >
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                <rect x="3" y="7" width="8" height="4" rx="1" />
-                <rect x="13" y="13" width="7" height="4" rx="1" />
-                <line x1="3" y1="3" x2="3" y2="21" strokeLinecap="round" opacity="0.5" />
-              </svg>
-              <span className="hidden sm:inline">{t("editor.advanced_view") || "Ajustar tiempos"}</span>
-            </button>
-          </div>
-          {viewMode === "advanced" && !hideTypographyControls && (
-            <button
-              type="button"
-              onClick={() => setPreviewDockOpen((value) => !value)}
-              aria-pressed={previewDockOpen}
-              title={previewDockOpen ? "Ocultar preview" : "Mostrar preview"}
-              className={`h-8 px-2.5 rounded-md ring-1 transition-colors text-label ${previewDockOpen ? "bg-white/[0.06] text-white ring-white/[0.14]" : "text-ink-secondary ring-white/[0.08] hover:text-white"}`}
-            >
-              <span className="hidden sm:inline">Preview</span>
-              <span className="sm:hidden">▣</span>
-            </button>
-          )}
-          {/* ⋯ Overflow — 2026-07 rediseño: absorbe los controles secundarios
-              (Expandir/Enfoque, Re-sincronizar con IA, Modo Sync) que antes
-              eran botones sueltos en la barra. Re-sincronizar es una acción
-              PESADA → no vive como botón púrpura permanente. */}
-          {viewMode === "advanced" && <div className="relative shrink-0">
-            <button
-              type="button"
-              data-testid="editor-overflow-btn"
-              onClick={() => setOverflowOpen((v) => !v)}
-              aria-haspopup="menu"
-              aria-expanded={overflowOpen}
-              title={t("editor.more_actions") || "Más acciones"}
-              aria-label={t("editor.more_actions") || "Más acciones"}
-              className={`inline-flex shrink-0 w-8 h-8 rounded-md ring-1 transition-colors items-center justify-center
-                ${overflowOpen
-                  ? "ring-brand/40 bg-brand/15 text-brand-light"
-                  : "ring-white/[0.08] text-ink-secondary hover:text-brand-light hover:bg-brand/10 hover:ring-brand/30"}`}
-            >
-              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                <circle cx="5" cy="12" r="1.6" /><circle cx="12" cy="12" r="1.6" /><circle cx="19" cy="12" r="1.6" />
-              </svg>
-            </button>
-            {overflowOpen && (
-              <>
-                {/* backdrop para cerrar al click afuera */}
-                <button
-                  type="button"
-                  aria-hidden="true"
-                  tabIndex={-1}
-                  onClick={() => setOverflowOpen(false)}
-                  className="fixed inset-0 z-20 cursor-default"
-                />
-                <div
-                  role="menu"
-                  className="absolute right-0 top-full mt-1.5 z-30 w-56 py-1 rounded-xl bg-surface-1 ring-1 ring-white/[0.08] shadow-2xl shadow-black/40 animate-fade-in"
-                >
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => { toggleFocusMode(); setOverflowOpen(false); }}
-                    className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-gray-200 hover:bg-white/[0.05] transition-colors"
-                  >
-                    <svg className="w-3.5 h-3.5 text-ink-secondary shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                      {focusMode
-                        ? <><path d="M9 4v6H3M21 14h-6v6" strokeLinecap="round" strokeLinejoin="round" /><path d="M9 10L4 5M15 14l5 5" strokeLinecap="round" strokeLinejoin="round" /></>
-                        : <path d="M4 9V4h5M20 15v5h-5M4 9l5-5M20 15l-5 5" strokeLinecap="round" strokeLinejoin="round" />}
-                    </svg>
-                    {focusMode
-                      ? (t("editor.focus_exit") || "Salir de modo enfoque")
-                      : (t("editor.focus_enter") || "Expandir (modo enfoque)")}
-                  </button>
-                  {canReanchor && !syncMode && (
-                    <button
-                      type="button"
-                      role="menuitem"
-                      data-testid="reanchor-btn"
-                      onClick={() => { handleReanchor(); setOverflowOpen(false); }}
-                      disabled={reanchoring}
-                      title={t("editor.reanchor_hint") || "Vuelve a alinear el timing de cada línea con el audio usando el texto ya corregido. Las líneas que moviste a mano no se tocan."}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-gray-200 hover:bg-white/[0.05] transition-colors disabled:opacity-50 disabled:cursor-wait"
-                    >
-                      {reanchoring ? (
-                        <span className="w-3.5 h-3.5 border-[1.5px] border-brand-light border-t-transparent rounded-full animate-spin shrink-0" />
-                      ) : (
-                        <svg className="w-3.5 h-3.5 text-brand-light shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                          <path d="M21 12a9 9 0 11-2.64-6.36" strokeLinecap="round" />
-                          <path d="M21 3v6h-6" strokeLinecap="round" strokeLinejoin="round" />
-                        </svg>
-                      )}
-                      {reanchoring
-                        ? (t("editor.reanchor_running") || "Re-sincronizando…")
-                        : (t("editor.reanchor") || "Re-sincronizar con IA")}
-                    </button>
-                  )}
-                  {!syncMode && (
-                    <button
-                      type="button"
-                      role="menuitem"
-                      data-tour="editor-sync-entry"
-                      onClick={() => { enterSyncMode(); setOverflowOpen(false); }}
-                      title={t("editor.sync_cta_hint") || "Modo Sync — anclar timings por tap (⌘K / Ctrl+K)"}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-gray-200 hover:bg-white/[0.05] transition-colors"
-                    >
-                      <svg className="w-3.5 h-3.5 text-ink-secondary shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                        <circle cx="12" cy="12" r="9" />
-                        <circle cx="12" cy="12" r="4" />
-                        <circle cx="12" cy="12" r="1" fill="currentColor" />
-                      </svg>
-                      {t("editor.sync_enter_full") || "Re-anclar por tap (Modo Sync)"}
-                    </button>
-                  )}
-                </div>
-              </>
-            )}
-          </div>}
         </div>
       ); return playerSlot ? createPortal(_playerBar, playerSlot) : _playerBar; })()}
 
@@ -3233,18 +3092,81 @@ export default function LyricsEditor({
              izquierda no renderiza — los controles ya están en el paso
              4 del stepper y el preview central del wizard refleja los
              cambios. El grid colapsa a 1 columna full-width. */}
-      <div className="mb-3 flex items-center gap-3 rounded-xl bg-surface-2/35 px-3 py-2.5 ring-1 ring-white/[0.06]" data-testid="editor-mode-explainer">
-        <span className="text-[10px] font-semibold uppercase tracking-[0.16em] text-ink-tertiary">{t("editor.mode_label") || "Modo de trabajo"}</span>
-        <span className="text-xs text-white font-medium">
-          {viewMode === "advanced"
-            ? (t("editor.advanced_mode_label") || "Avanzada · Ajustar tiempos")
-            : (t("editor.basic_mode_label") || "Básica · Revisar letra")}
-        </span>
-        <span className="hidden md:inline text-[11px] text-ink-tertiary">
-          {viewMode === "advanced"
-            ? (t("editor.advanced_mode_desc") || "Timeline, selección múltiple y movimiento grupal")
-            : (t("editor.basic_mode_desc") || "Texto, reproducción y correcciones rápidas")}
-        </span>
+      <div className="relative mb-4 flex items-center gap-3 rounded-2xl bg-gradient-to-r from-surface-2/80 via-surface-2/45 to-brand/[0.055] p-2 ring-1 ring-white/[0.08] shadow-xl shadow-black/10" data-testid="editor-mode-explainer">
+        <div className="grid min-w-0 flex-1 grid-cols-2 gap-1 rounded-xl bg-black/20 p-1" role="tablist" aria-label={t("editor.mode_label") || "Modo de edición"}>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === "basic"}
+            onClick={() => { setViewMode("basic"); setSyncMode(false); setOverflowOpen(false); }}
+            aria-label={t("editor.basic_view") || "Revisar letra"}
+            className={`group flex min-w-0 items-center gap-2.5 rounded-lg px-3 py-2.5 text-left transition-all ${viewMode === "basic" ? "bg-white/[0.09] text-white ring-1 ring-white/[0.11] shadow-lg" : "text-ink-secondary hover:bg-white/[0.04] hover:text-white"}`}
+          >
+            <span className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg ${viewMode === "basic" ? "bg-emerald-400/15 text-emerald-300" : "bg-white/[0.04] text-ink-tertiary"}`}>
+              <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path d="M6 6h12M6 12h12M6 18h8" strokeLinecap="round" /></svg>
+            </span>
+            <span className="min-w-0">
+              <span className="block truncate text-[12px] font-semibold">{t("editor.basic_view") || "Revisar letra"}</span>
+              <span className="hidden truncate text-[10px] text-ink-tertiary sm:block">Corregir texto y aprobar</span>
+            </span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === "advanced"}
+            onClick={() => { setViewMode("advanced"); setOverflowOpen(false); }}
+            aria-label={t("editor.advanced_view") || "Ajustar tiempos"}
+            className={`group flex min-w-0 items-center gap-2.5 rounded-lg px-3 py-2.5 text-left transition-all ${viewMode === "advanced" ? "bg-brand/20 text-white ring-1 ring-brand/35 shadow-lg shadow-brand/10" : "text-ink-secondary hover:bg-white/[0.04] hover:text-white"}`}
+          >
+            <span className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg ${viewMode === "advanced" ? "bg-brand text-white shadow-lg shadow-brand/25" : "bg-white/[0.04] text-ink-tertiary"}`}>
+              <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path d="M4 7h7v4H4zM13 13h7v4h-7z" /><path d="M4 3v18" strokeLinecap="round" /></svg>
+            </span>
+            <span className="min-w-0">
+              <span className="block truncate text-[12px] font-semibold">{t("editor.advanced_view") || "Ajustar tiempos"}</span>
+              <span className="hidden truncate text-[10px] text-ink-tertiary sm:block">Timeline y edición en grupo</span>
+            </span>
+          </button>
+        </div>
+        {viewMode === "advanced" && (
+          <div className="relative shrink-0">
+            <button
+              type="button"
+              data-testid="editor-overflow-btn"
+              onClick={() => setOverflowOpen((value) => !value)}
+              aria-haspopup="menu"
+              aria-expanded={overflowOpen}
+              className="inline-flex h-10 items-center gap-2 rounded-xl px-3 text-[11px] font-medium text-ink-secondary ring-1 ring-white/[0.09] transition-colors hover:bg-white/[0.06] hover:text-white"
+            >
+              <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path d="M4 7h16M7 12h10M10 17h4" strokeLinecap="round" /></svg>
+              <span className="hidden md:inline">Herramientas</span>
+            </button>
+            {overflowOpen && (
+              <>
+                <button type="button" aria-hidden="true" tabIndex={-1} onClick={() => setOverflowOpen(false)} className="fixed inset-0 z-40 cursor-default" />
+                <div role="menu" className="absolute right-0 top-full z-50 mt-2 w-64 overflow-hidden rounded-2xl bg-surface-1 p-1.5 ring-1 ring-white/[0.1] shadow-2xl shadow-black/50">
+                  {!hideTypographyControls && (
+                    <button type="button" role="menuitem" onClick={() => { setPreviewDockOpen((value) => !value); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white">
+                      <span className="block font-medium">{previewDockOpen ? "Ocultar preview" : "Mostrar preview"}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Abre una referencia visual lateral</span>
+                    </button>
+                  )}
+                  <button type="button" role="menuitem" onClick={() => { toggleFocusMode(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white">
+                    <span className="block font-medium">{focusMode ? (t("editor.focus_exit") || "Salir de modo enfoque") : (t("editor.focus_enter") || "Trabajar a pantalla completa")}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Maximiza el espacio de edición</span>
+                  </button>
+                  {canReanchor && !syncMode && (
+                    <button type="button" role="menuitem" data-testid="reanchor-btn" disabled={reanchoring} onClick={() => { handleReanchor(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white disabled:opacity-50">
+                      <span className="block font-medium">{reanchoring ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.reanchor") || "Re-sincronizar con IA")}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Conserva los ajustes manuales</span>
+                    </button>
+                  )}
+                  {!syncMode && (
+                    <button type="button" role="menuitem" data-tour="editor-sync-entry" onClick={() => { enterSyncMode(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white">
+                      <span className="block font-medium">{t("editor.sync_enter_full") || "Re-anclar por tap (Modo Sync)"}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Marcá entradas mientras escuchás</span>
+                    </button>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        )}
       </div>
       <div className={`grid gap-4 mb-4 items-start ${viewMode === "advanced" ? (previewDockOpen && !hideTypographyControls ? "grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px]" : "grid-cols-1") : (hideTypographyControls ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2")}`}>
           {/* COLUMNA IZQUIERDA — sticky en desktop. Controles tipográficos
