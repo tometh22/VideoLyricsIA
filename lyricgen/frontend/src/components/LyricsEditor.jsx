@@ -2606,7 +2606,7 @@ export default function LyricsEditor({
         </button>
         <div className="min-w-0">
           <h2 className="text-lg font-bold tracking-tight">{t("editor.title")}</h2>
-          <p className="text-sm text-ink-secondary truncate">
+          <p className="text-sm text-gray-200 truncate">
             {name}
             {batchProgress && <span className="ml-2 text-brand-light text-xs">({batchProgress})</span>}
           </p>
@@ -3636,7 +3636,7 @@ export default function LyricsEditor({
               </div>
             ) : (
               <>
-                <p className="text-[11px] text-gray-600 mb-2 px-1">
+                <p className="text-[11px] text-gray-200 mb-2 px-1">
                   {t("editor.list_hint") || "Click en un tiempo para reproducir desde ahí · doble click para editarlo"}
                 </p>
                 <div className="relative">
@@ -3781,7 +3781,7 @@ export default function LyricsEditor({
                           ${isActive ? "text-brand-light font-semibold"
                             : wasRecentlyAnchored ? "text-brand-light"
                             : isReview ? "text-amber-400/80 hover:text-amber-300"
-                            : "text-gray-400 hover:text-brand-light"}`}
+                            : "text-gray-200 hover:text-brand-light"}`}
                       >
                         {/* Phase A 2026-05-25: indicador ▶ visible solo en
                             la fila activa para reforzar "esta es la que está
@@ -4057,7 +4057,7 @@ export default function LyricsEditor({
             data-tour="editor-add-line"
             onClick={addLineSmart}
             className="w-full mt-2 py-2.5 rounded-xl border border-dashed border-white/[0.08]
-              hover:border-brand/40 hover:bg-brand/[0.04] text-gray-300 hover:text-brand-light
+              hover:border-brand/40 hover:bg-brand/[0.04] text-white/80 hover:text-brand-light
               text-caption transition-all flex items-center justify-center gap-1.5"
           >
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -4075,7 +4075,7 @@ export default function LyricsEditor({
       {/* Line-count + blank-line note. The primary CTA lives in the sticky
           header now (always reachable) — no duplicate button here. */}
       <div className="mt-4 flex items-center gap-2 min-w-0" data-tour="editor-approve">
-        <span className="text-xs text-gray-400 shrink-0">
+        <span className="text-xs text-gray-200 shrink-0">
           {edited.length} {t("editor.lines")}
         </span>
         {blankCount > 0 && (
