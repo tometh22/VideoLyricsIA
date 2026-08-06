@@ -2575,7 +2575,7 @@ export default function LyricsEditor({
     // bajo el botón flotante "Aprobar y generar" (h-12 = 48 px + bottom-6
     // = 24 px + sombra). Sin esto la última card del timeline o de la
     // lista quedaba tapada cuando el operador scrolleaba hasta el final.
-    <div className={`w-full animate-fade-in mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+    <div data-testid="lyrics-editor" className={`w-full animate-fade-in mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
       {/* Hidden audio element drives playback. */}
       {audioUrl && (
         <audio
@@ -2598,6 +2598,7 @@ export default function LyricsEditor({
           app's own sticky top bar — the recurring "botón cortado". */}
       <div className="py-3 mb-4 flex items-center gap-3">
         <button onClick={handleBackSafely}
+          aria-label="Volver"
           className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors shrink-0">
           <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M19 12H5M12 19l-7-7 7-7" />
@@ -3746,6 +3747,7 @@ export default function LyricsEditor({
                   {editingId === seg._id ? (
                     <input
                       type="text"
+                      aria-label={`Tiempo de inicio de la línea ${idx + 1}`}
                       autoFocus
                       value={editValue}
                       onChange={(e) => setEditValue(e.target.value)}
@@ -3773,12 +3775,13 @@ export default function LyricsEditor({
                       <button
                         onClick={() => seekTo(Math.max(0, seg.start), true)}
                         onDoubleClick={() => startEditTimestamp(seg)}
+                        aria-label={`Reproducir desde ${formatTimestamp(seg.start)}. Doble click para editar el tiempo de la línea ${idx + 1}`}
                         title={t("editor.timestamp_hint") || "Click: ir al tiempo · Doble click: editar"}
                         className={`text-[11px] font-mono pt-2.5 w-14 text-right transition-colors
                           ${isActive ? "text-brand-light font-semibold"
                             : wasRecentlyAnchored ? "text-brand-light"
                             : isReview ? "text-amber-400/80 hover:text-amber-300"
-                            : "text-gray-600 hover:text-brand-light"}`}
+                            : "text-gray-400 hover:text-brand-light"}`}
                       >
                         {/* Phase A 2026-05-25: indicador ▶ visible solo en
                             la fila activa para reforzar "esta es la que está
@@ -3811,6 +3814,7 @@ export default function LyricsEditor({
                   <div className="flex-1 min-w-0 relative">
                     <input
                       type="text"
+                      aria-label={`Letra de la línea ${idx + 1}`}
                       value={seg.text}
                       onChange={(e) => updateText(seg._id, e.target.value)}
                       onKeyDown={(e) => {
@@ -3858,7 +3862,7 @@ export default function LyricsEditor({
                          y el texto vuelve. */
                       className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm
                         focus:border-brand/40 focus:outline-none hover:border-white/[0.08] transition-all
-                        ${isActive && focusedSegId !== seg._id ? "text-transparent caret-transparent selection:text-white" : "text-white"}
+                        text-white
                         ${suggestion && !isApplied ? "border-amber-500/20" : "border-white/[0.04]"}`}
                     />
                     {/* Phase A 2026-05-25: overlay karaoke word-jump (Apple
@@ -3877,7 +3881,7 @@ export default function LyricsEditor({
                       let nonSpaceIdx = -1;
                       return (
                         <div
-                          className="absolute inset-0 px-3 py-2 text-sm pointer-events-none whitespace-pre-wrap leading-[1.4]"
+                          className="absolute inset-0 rounded-xl bg-surface-1 px-3 py-2 text-sm pointer-events-none whitespace-pre-wrap leading-[1.4]"
                           aria-hidden="true"
                           style={{ fontFeatureSettings: "normal" }}
                         >
@@ -4053,7 +4057,7 @@ export default function LyricsEditor({
             data-tour="editor-add-line"
             onClick={addLineSmart}
             className="w-full mt-2 py-2.5 rounded-xl border border-dashed border-white/[0.08]
-              hover:border-brand/40 hover:bg-brand/[0.04] text-gray-500 hover:text-brand-light
+              hover:border-brand/40 hover:bg-brand/[0.04] text-gray-300 hover:text-brand-light
               text-caption transition-all flex items-center justify-center gap-1.5"
           >
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -4071,7 +4075,7 @@ export default function LyricsEditor({
       {/* Line-count + blank-line note. The primary CTA lives in the sticky
           header now (always reachable) — no duplicate button here. */}
       <div className="mt-4 flex items-center gap-2 min-w-0" data-tour="editor-approve">
-        <span className="text-xs text-gray-600 shrink-0">
+        <span className="text-xs text-gray-400 shrink-0">
           {edited.length} {t("editor.lines")}
         </span>
         {blankCount > 0 && (

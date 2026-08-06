@@ -426,6 +426,7 @@ export default function HelpDrawer({ open, initialArticleId, onClose }) {
         aria-modal="true"
         aria-labelledby="hc-drawer-title"
         aria-hidden={!open}
+        inert={open ? undefined : ""}
       >
         <header className="hc-drawer-head">
           {showBack ? (

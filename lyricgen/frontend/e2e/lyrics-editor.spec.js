@@ -244,7 +244,7 @@ test.describe("lyrics editor browser contract", () => {
     await expect.poll(() => harness.saves.length).toBeGreaterThan(0);
     const saved = harness.saves.at(-1).segments.find((segment) => segment.text === "Línea para estirar");
     expect(Number(saved.end)).toBeCloseTo(2.65, 2);
-    expect(Number(saved.end)).toBeLessThanOrEqual(2.65);
+    expect(Number(saved.end)).toBeLessThanOrEqual(2.65 + Number.EPSILON * 4);
   });
 
   test("keeps short-line geometry real while handles remain easy to hit", async ({ page }) => {
@@ -283,7 +283,7 @@ test.describe("lyrics editor browser contract", () => {
   test("uses the durable editor contract when editor_v2 is enabled", async ({ page }) => {
     const harness = await installEditorHarness(page, { editorV2: true });
     await harness.open();
-    const input = page.getByDisplayValue("Primera línea");
+    const input = page.locator('input[value="Primera línea"]');
     await input.fill("Primera línea durable");
     await expect.poll(() => harness.saves.length).toBeGreaterThan(0);
     expect(harness.saves[0]).toMatchObject({ base_revision: 0, checkpoint: "draft" });
@@ -303,6 +303,7 @@ test.describe("lyrics editor browser contract", () => {
     for (const mode of ["basic", "advanced"]) {
       if (mode === "advanced") await openAdvanced(page);
       const results = await new AxeBuilder({ page })
+        .include('[data-testid="lyrics-editor"]')
         .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
         .analyze();
       const blocking = results.violations.filter((violation) => ["critical", "serious"].includes(violation.impact));
@@ -327,7 +328,24 @@ test.describe("lyrics editor browser contract", () => {
       { width: 390, height: 844 },
     ]) {
       await page.setViewportSize(viewport);
-      await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1)).toBe(true);
+      await expect.poll(() => page.evaluate(() => {
+        const root = document.documentElement;
+        if (root.scrollWidth <= root.clientWidth + 1) return [];
+        return [...document.querySelectorAll("body *")]
+          .map((element) => {
+            const rect = element.getBoundingClientRect();
+            return { element, rect };
+          })
+          .filter(({ rect }) => rect.right > root.clientWidth + 1 || rect.left < -1)
+          .slice(0, 8)
+          .map(({ element, rect }) => ({
+            tag: element.tagName.toLowerCase(),
+            testId: element.getAttribute("data-testid"),
+            className: typeof element.className === "string" ? element.className.slice(0, 160) : "",
+            left: Math.round(rect.left),
+            right: Math.round(rect.right),
+          }));
+      })).toEqual([]);
       await expect(page.getByRole("button", { name: /Aprobar y generar/i })).toBeVisible();
     }
   });

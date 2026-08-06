@@ -570,7 +570,7 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
   };
 
   return (
-    <div className="min-h-screen bg-surface flex">
+    <div className="min-h-screen overflow-x-hidden bg-surface flex">
       <Sidebar
         activeView={activeView}
         onNav={handleNav}
@@ -588,7 +588,7 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
         />
       )}
 
-      <div className={`flex-1 min-h-screen transition-all duration-300 ${sidebarOpen ? "md:ml-60" : "md:ml-[72px]"}`}>
+      <div className={`min-w-0 flex-1 min-h-screen transition-all duration-300 ${sidebarOpen ? "md:ml-60" : "md:ml-[72px]"}`}>
         <GlobalTopbar
           user={user}
           activeRenders={(history || []).filter((job) => ["processing", "queued", "editing", "transcribing", "transcribing_queued"].includes(job.status)).length}
