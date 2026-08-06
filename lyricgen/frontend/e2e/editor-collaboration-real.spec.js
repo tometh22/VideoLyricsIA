@@ -15,11 +15,15 @@ async function login(request, username) {
 async function openEditor(browser, token) {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   await context.addInitScript(({ authToken }) => {
-    localStorage.clear();
-    sessionStorage.clear();
-    localStorage.setItem("genly_token", authToken);
-    localStorage.setItem("genly_lang", "es");
-    localStorage.setItem("genly_tour_editor_timing_v2_done", "1");
+    // Initialize a fresh context once. Running clear() on every navigation
+    // makes reload unlike a real browser and destroys drafts/one-time receipts.
+    if (localStorage.getItem("genly_token") !== authToken) {
+      localStorage.clear();
+      sessionStorage.clear();
+      localStorage.setItem("genly_token", authToken);
+      localStorage.setItem("genly_lang", "es");
+      localStorage.setItem("genly_tour_editor_timing_v2_done", "1");
+    }
   }, { authToken: token });
   const page = await context.newPage();
   const wav = createSyntheticWav({ durationSeconds: 6 });
@@ -50,6 +54,9 @@ async function revision(request, token) {
 const firstLyricsInput = (page) => page.getByRole("textbox", { name: "Letra de la línea 1" });
 
 test.describe("Editor 2.0 real collaboration", () => {
+  // This scenario intentionally mutates one seeded document. Retrying against
+  // the same database would start from a later revision and produce false data.
+  test.describe.configure({ retries: 0 });
   test.skip(!ENABLED, "requires the real API/PostgreSQL CI job");
 
   test("preserves both users through conflict, reload and history", async ({ browser, request }) => {
