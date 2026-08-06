@@ -8443,23 +8443,29 @@ async def generate_with_segments(
         # The generate/approve action freezes the exact persisted editor
         # snapshot used by the worker as an immutable audit version. Legacy
         # clients are bridged lazily so they receive the same guarantee.
-        if editor_document is None:
-            editor_document = get_or_create_document(
-                db, job_id, current_user["tenant_id"], job_row.segments_json or [],
-            )
-        if editor_document.revision < current_revision:
-            sync_legacy_snapshot(
-                db, editor_document, current_user["id"],
-                job_row.segments_json or [], current_revision,
-            )
-        approved_version = db.query(EditorVersion).filter(
-            EditorVersion.job_id == job_id,
-            EditorVersion.tenant_id == current_user["tenant_id"],
-            EditorVersion.revision == editor_document.revision,
-        ).first()
-        if approved_version and approved_version.segments == (job_row.segments_json or []):
-            approved_version.is_approved = True
-            approved_version.reason = "approve"
+        try:
+            if editor_document is None:
+                editor_document = get_or_create_document(
+                    db, job_id, current_user["tenant_id"], job_row.segments_json or [],
+                )
+            if editor_document.revision < current_revision:
+                sync_legacy_snapshot(
+                    db, editor_document, current_user["id"],
+                    job_row.segments_json or [], current_revision,
+                )
+            approved_version = db.query(EditorVersion).filter(
+                EditorVersion.job_id == job_id,
+                EditorVersion.tenant_id == current_user["tenant_id"],
+                EditorVersion.revision == editor_document.revision,
+            ).first()
+            if approved_version and approved_version.segments == (job_row.segments_json or []):
+                approved_version.is_approved = True
+                approved_version.reason = "approve"
+        except ValueError:
+            # Keep legacy generate compatibility for malformed-but-JSON
+            # payloads; the durable editor layer must never turn that existing
+            # path into a 500 while the pipeline emits its normal validation.
+            logger.warning("[editor] skipped approval snapshot for invalid segments job=%s", job_id)
         db.commit()
     else:
         job_id = create_job(

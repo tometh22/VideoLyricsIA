@@ -660,7 +660,9 @@ class EditorDocument(Base):
     """Durable editor working copy layered over the legacy Job snapshot."""
     __tablename__ = "editor_documents"
 
-    job_id = Column(String(12), ForeignKey("jobs.job_id"), primary_key=True)
+    job_id = Column(
+        String(12), ForeignKey("jobs.job_id", ondelete="CASCADE"), primary_key=True,
+    )
     tenant_id = Column(String(100), nullable=False, index=True)
     current_segments = Column(JSONB, nullable=False)
     original_segments = Column(JSONB, nullable=False)
@@ -682,7 +684,10 @@ class EditorVersion(Base):
     )
 
     id = Column(String(36), primary_key=True)
-    job_id = Column(String(12), ForeignKey("jobs.job_id"), nullable=False, index=True)
+    job_id = Column(
+        String(12), ForeignKey("jobs.job_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
     tenant_id = Column(String(100), nullable=False, index=True)
     revision = Column(Integer, nullable=False)
     segments = Column(JSONB, nullable=False)

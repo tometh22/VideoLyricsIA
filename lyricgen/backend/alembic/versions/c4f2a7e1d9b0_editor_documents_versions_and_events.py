@@ -29,7 +29,7 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("lock_user_id", sa.Integer(), nullable=True),
         sa.Column("lock_expires_at", sa.DateTime(timezone=True), nullable=True),
-        sa.ForeignKeyConstraint(["job_id"], ["jobs.job_id"]),
+        sa.ForeignKeyConstraint(["job_id"], ["jobs.job_id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["updated_by"], ["users.id"]),
         sa.ForeignKeyConstraint(["lock_user_id"], ["users.id"]),
         sa.PrimaryKeyConstraint("job_id"),
@@ -47,7 +47,7 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("reason", sa.String(length=20), nullable=False),
         sa.Column("is_approved", sa.Boolean(), nullable=False, server_default=sa.false()),
-        sa.ForeignKeyConstraint(["job_id"], ["jobs.job_id"]),
+        sa.ForeignKeyConstraint(["job_id"], ["jobs.job_id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["created_by"], ["users.id"]),
         sa.PrimaryKeyConstraint("id"),
     )
