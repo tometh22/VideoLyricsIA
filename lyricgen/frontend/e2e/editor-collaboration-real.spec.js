@@ -29,6 +29,11 @@ async function openEditor(browser, token) {
   await page.route(`**/jobs/${JOB_ID}/background-url`, (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ url: null }) }));
   await page.goto(`/videos/${JOB_ID}/edit-lyrics`);
   await expect(page.getByRole("button", { name: /4 Lyrics/ })).toBeVisible();
+  // A fresh browser profile can legitimately receive the one-time product
+  // announcement before the editor. Dismiss it through the same accessible
+  // control a real user sees so it cannot intercept the workflow below.
+  const announcementClose = page.getByRole("button", { name: "Cerrar" });
+  if (await announcementClose.isVisible()) await announcementClose.click();
   await page.getByRole("button", { name: /4 Lyrics/ }).click();
   await expect(page.getByTestId("editor-mode-explainer")).toBeVisible();
   return { context, page };
