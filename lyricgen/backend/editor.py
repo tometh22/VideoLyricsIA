@@ -156,7 +156,13 @@ def ensure_document(db: Session, job_id: str, tenant_id: str, segments: list[dic
     if not job:
         raise LookupError("job_not_found")
     normalized = normalize_segments(segments)
-    document = db.query(EditorDocument).filter(EditorDocument.job_id == job_id).with_for_update().first()
+    document = (
+        db.query(EditorDocument)
+        .filter(EditorDocument.job_id == job_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
     if document:
         return document
 
@@ -194,13 +200,13 @@ def get_or_create_document(
 ) -> EditorDocument:
     job = db.query(Job).filter(
         Job.job_id == job_id, Job.tenant_id == tenant_id,
-    ).with_for_update().first()
+    ).populate_existing().with_for_update().first()
     if not job:
         raise LookupError("job_not_found")
     document = db.query(EditorDocument).filter(
         EditorDocument.job_id == job_id,
         EditorDocument.tenant_id == tenant_id,
-    ).with_for_update().first()
+    ).populate_existing().with_for_update().first()
     if not document:
         if segments is None:
             raise LookupError("editor_document_not_found")
@@ -283,10 +289,17 @@ def save_document(
     # can both observe the same revision and overwrite one another before the
     # optimistic check runs. PostgreSQL enforces the lease; SQLite keeps the
     # same code path for local tests.
-    job = db.query(Job).filter(Job.job_id == job.job_id).with_for_update().one()
+    job = (
+        db.query(Job)
+        .filter(Job.job_id == job.job_id)
+        .populate_existing()
+        .with_for_update()
+        .one()
+    )
     document = (
         db.query(EditorDocument)
         .filter(EditorDocument.job_id == document.job_id)
+        .populate_existing()
         .with_for_update()
         .one()
     )
@@ -338,7 +351,7 @@ def acquire_lock(db: Session, document: EditorDocument, user_id: int) -> dict:
     document = db.query(EditorDocument).filter(
         EditorDocument.job_id == document.job_id,
         EditorDocument.tenant_id == document.tenant_id,
-    ).with_for_update().one()
+    ).populate_existing().with_for_update().one()
     now = now_utc()
     expires = _aware(document.lock_expires_at)
     if expires and expires > now and document.lock_user_id not in (None, user_id):
@@ -361,7 +374,7 @@ def release_lock(db: Session, document: EditorDocument, user_id: int) -> bool:
     document = db.query(EditorDocument).filter(
         EditorDocument.job_id == document.job_id,
         EditorDocument.tenant_id == document.tenant_id,
-    ).with_for_update().one()
+    ).populate_existing().with_for_update().one()
     if document.lock_user_id not in (None, user_id):
         return False
     document.lock_user_id = None
@@ -403,7 +416,7 @@ def sync_legacy_snapshot(
     document = db.query(EditorDocument).filter(
         EditorDocument.job_id == document.job_id,
         EditorDocument.tenant_id == document.tenant_id,
-    ).with_for_update().one()
+    ).populate_existing().with_for_update().one()
     if document.revision == revision and document.current_segments == normalized:
         return document
     if revision <= document.revision:
@@ -434,11 +447,17 @@ def resolve_conflict(
     db: Session, job: Job, document: EditorDocument, user_id: int,
     server_revision: int, strategy: str, segments: list[dict] | None = None,
 ) -> tuple[EditorDocument, EditorVersion | None, bool]:
-    job = db.query(Job).filter(Job.job_id == job.job_id).with_for_update().one()
+    job = (
+        db.query(Job)
+        .filter(Job.job_id == job.job_id)
+        .populate_existing()
+        .with_for_update()
+        .one()
+    )
     document = db.query(EditorDocument).filter(
         EditorDocument.job_id == document.job_id,
         EditorDocument.tenant_id == document.tenant_id,
-    ).with_for_update().one()
+    ).populate_existing().with_for_update().one()
     if document.revision != server_revision:
         raise RuntimeError("editor_revision_conflict")
     if strategy == "use_server":
@@ -468,7 +487,13 @@ def approve_document(
     else saved. Both selectors must still identify the document's current
     revision, otherwise approval fails closed with the standard conflict.
     """
-    job = db.query(Job).filter(Job.job_id == job.job_id).with_for_update().one()
+    job = (
+        db.query(Job)
+        .filter(Job.job_id == job.job_id)
+        .populate_existing()
+        .with_for_update()
+        .one()
+    )
     document = get_or_create_document(
         db, job.job_id, job.tenant_id, job.segments_json or [],
     )
