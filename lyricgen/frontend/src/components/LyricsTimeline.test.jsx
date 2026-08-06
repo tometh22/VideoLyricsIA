@@ -34,9 +34,9 @@ function setup(overrides = {}) {
 describe("LyricsTimeline", () => {
   it("renders one horizontal block per segment", () => {
     setup();
-    expect(screen.getByText("primera línea")).toBeInTheDocument();
-    expect(screen.getByText("segunda línea")).toBeInTheDocument();
-    expect(screen.getByText("tercera línea")).toBeInTheDocument();
+    expect(screen.getAllByText("primera línea").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("segunda línea").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("tercera línea").length).toBeGreaterThan(0);
   });
 
   it("keeps blocks visible when API timings arrive as strings", () => {
@@ -72,8 +72,7 @@ describe("LyricsTimeline", () => {
 
   it("clicking a line focuses it and seeks without editing its timing", () => {
     const props = setup();
-    fireEvent.click(screen.getByRole("button", { name: "Seleccionando" }));
-    const block = screen.getByText("segunda línea").closest("div[title]");
+    const block = screen.getAllByTestId("timeline-segment")[1];
     fireEvent.pointerDown(block, { clientX: 1000, pointerId: 1, button: 0 });
     fireEvent.pointerUp(block, { clientX: 1000, pointerId: 1, button: 0 });
     expect(props.onFocus).toHaveBeenCalledWith(1);
@@ -83,8 +82,7 @@ describe("LyricsTimeline", () => {
 
   it("dragging a line commits a horizontal timing change and one undo snapshot", () => {
     const props = setup();
-    fireEvent.click(screen.getByRole("button", { name: "Seleccionando" }));
-    const block = screen.getByText("segunda línea").closest("div[title]");
+    const block = screen.getAllByTestId("timeline-segment")[1];
     fireEvent.pointerDown(block, { clientX: 900, pointerId: 1, button: 0 });
     fireEvent.pointerMove(block, { clientX: 1080, pointerId: 1 });
     fireEvent.pointerUp(block, { clientX: 1080, pointerId: 1 });
@@ -98,15 +96,14 @@ describe("LyricsTimeline", () => {
 
   it("Cmd/Ctrl-click toggles lines and dragging the group commits one batch", () => {
     const props = setup();
-    const first = screen.getByText("primera línea").closest("div[title]");
-    const second = screen.getByText("segunda línea").closest("div[title]");
+    const [first, second] = screen.getAllByTestId("timeline-segment");
 
     fireEvent.pointerDown(first, { clientX: 100, pointerId: 1, button: 0, metaKey: true });
     fireEvent.pointerUp(first, { clientX: 100, pointerId: 1, button: 0, metaKey: true });
     fireEvent.pointerDown(second, { clientX: 950, pointerId: 2, button: 0, ctrlKey: true });
     fireEvent.pointerUp(second, { clientX: 950, pointerId: 2, button: 0, ctrlKey: true });
 
-    expect(screen.getByText("2 seleccionadas")).toBeInTheDocument();
+    expect(screen.getByText("2 líneas")).toBeInTheDocument();
     fireEvent.pointerDown(first, { clientX: 100, pointerId: 3, button: 0 });
     fireEvent.pointerMove(first, { clientX: 190, pointerId: 3 });
     fireEvent.pointerUp(first, { clientX: 190, pointerId: 3 });
@@ -122,16 +119,15 @@ describe("LyricsTimeline", () => {
     fireEvent.pointerDown(lane, { clientX: 0, clientY: 0, pointerId: 1, button: 0 });
     fireEvent.pointerMove(lane, { clientX: 1100, clientY: 80, pointerId: 1 });
     fireEvent.pointerUp(lane, { clientX: 1100, clientY: 80, pointerId: 1 });
-    expect(screen.getByText("2 seleccionadas")).toBeInTheDocument();
+    expect(screen.getByText("2 líneas")).toBeInTheDocument();
   });
 
-  it("can start painting from a line with Shift without enabling selection mode", () => {
+  it("selects a contiguous range with Shift-click", () => {
     setup();
-    const block = screen.getByText("segunda línea").closest("div[title]");
-    fireEvent.pointerDown(block, { clientX: 900, clientY: 55, pointerId: 1, button: 0, shiftKey: true });
-    fireEvent.pointerMove(block, { clientX: 0, clientY: 0, pointerId: 1 });
-    fireEvent.pointerUp(block, { clientX: 0, clientY: 0, pointerId: 1 });
-    expect(screen.getByText("2 seleccionadas")).toBeInTheDocument();
+    const [first, second] = screen.getAllByTestId("timeline-segment");
+    fireEvent.pointerDown(first, { clientX: 100, pointerId: 1, button: 0, metaKey: true });
+    fireEvent.pointerDown(second, { clientX: 900, pointerId: 2, button: 0, shiftKey: true });
+    expect(screen.getByText("2 líneas")).toBeInTheDocument();
   });
 
   it("shows selection instructions and distinct move/resize cursors", () => {
@@ -139,8 +135,8 @@ describe("LyricsTimeline", () => {
     const help = screen.getByTestId("timeline-selection-help");
     const block = screen.getAllByTestId("timeline-segment")[0];
     const edge = block.querySelector('[data-testid="timeline-edge-end"]');
-    expect(help).toHaveTextContent("Arrastrá sobre una línea");
-    expect(block.className).toContain("cursor-crosshair");
+    expect(help).toHaveTextContent("Arrastrá el fondo");
+    expect(block.className).toContain("cursor-grab");
     expect(edge.className).toContain("cursor-ew-resize");
   });
 
@@ -157,7 +153,8 @@ describe("LyricsTimeline", () => {
 
   it("edits line text inline", () => {
     const props = setup();
-    fireEvent.doubleClick(screen.getByText("segunda línea"));
+    const block = screen.getAllByTestId("timeline-segment")[1];
+    fireEvent.doubleClick(block.querySelector("span[title*='Doble-click']"));
     const input = screen.getByDisplayValue("segunda línea");
     fireEvent.change(input, { target: { value: "segunda línea corregida" } });
     fireEvent.keyDown(input, { key: "Enter" });
@@ -175,10 +172,10 @@ describe("LyricsTimeline", () => {
     const props = setup({ saveStatus: "saving" });
     expect(screen.getByText("Guardando…")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /más acciones/i }));
-    fireEvent.click(screen.getByText("Restaurar"));
-    expect(props.onReset).toHaveBeenCalledTimes(1);
     expect(screen.getByLabelText("Alejar")).toBeInTheDocument();
     expect(screen.getByLabelText("Acercar")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Restaurar tiempos originales"));
+    expect(props.onReset).toHaveBeenCalledTimes(1);
   });
 
   it("auto-follows the playhead once and does not restart a pending smooth scroll", () => {

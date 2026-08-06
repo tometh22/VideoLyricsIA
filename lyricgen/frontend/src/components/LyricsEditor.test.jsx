@@ -528,9 +528,9 @@ describe("LyricsEditor — modo enfoque body class broadcast", () => {
     // viven en "Ajustar tiempos".
     await userEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
 
-    // Abrí el menú ⋯ y clic en "Expandir (modo enfoque)".
+    // Abrí Herramientas y entrá al espacio de trabajo expandido.
     await userEvent.click(screen.getByTestId("editor-overflow-btn"));
-    await userEvent.click(screen.getByText(/Expandir \(modo enfoque\)/i));
+    await userEvent.click(screen.getByText(/Trabajar a pantalla completa/i));
     expect(document.body.classList.contains("editor-focus-mode")).toBe(true);
 
     // Reabrí el menú — el item ahora dice "Salir de modo enfoque".
@@ -546,7 +546,7 @@ describe("LyricsEditor — modo enfoque body class broadcast", () => {
     // Prendé focus mode desde el menú ⋯.
     await userEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
     await userEvent.click(screen.getByTestId("editor-overflow-btn"));
-    await userEvent.click(screen.getByText(/Expandir \(modo enfoque\)/i));
+    await userEvent.click(screen.getByText(/Trabajar a pantalla completa/i));
     expect(document.body.classList.contains("editor-focus-mode")).toBe(true);
 
     // Operador navega a otro step / cambia de pantalla — el editor

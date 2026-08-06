@@ -3740,8 +3740,9 @@ export default function UploadZone({
         // El preview baja a 360-500 px (≈40 px menos) lo cual sigue
         // bien usable para el operador.
         const gridCols = isStep6
-          ? "lg:grid-cols-[200px_minmax(360px,500px)_minmax(0,1fr)]"
+          ? "lg:grid-cols-[170px_minmax(280px,360px)_minmax(0,1fr)]"
           : "lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)]";
+        const gridGap = isStep6 ? "gap-4" : "gap-6";
         // Studio focus: when LyricsEditor emits `editor-focus-mode`, collapse
         // the three-column wizard into a two-column editing workspace. The
         // step rail disappears, but the live preview stays docked at a compact
@@ -3756,7 +3757,7 @@ export default function UploadZone({
         // lg:min-h-0 deja la grid ocupar el espacio que el flex-col
         // exterior le da. lg:overflow-hidden previene que la grid haga
         // overflow al body — el scroll vive en la columna RIGHT.
-        <div className={`wizard-workspace-grid flex flex-col lg:grid ${gridCols} [.editor-focus-mode_&]:lg:grid-cols-[clamp(320px,24vw,400px)_minmax(0,1fr)] gap-6 items-start lg:items-stretch lg:h-full lg:min-h-0 lg:overflow-hidden lg:flex-1`}>
+        <div className={`wizard-workspace-grid flex flex-col lg:grid ${gridCols} ${gridGap} [.editor-focus-mode_&]:lg:grid-cols-[clamp(240px,19vw,290px)_minmax(0,1fr)] [.editor-focus-mode_&]:gap-4 items-start lg:items-stretch lg:h-full lg:min-h-0 lg:overflow-hidden lg:flex-1`}>
 
         {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile).
             Paso 6 "Lyrics" se ve siempre; está deshabilitado hasta que
