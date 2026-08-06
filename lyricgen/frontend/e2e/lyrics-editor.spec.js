@@ -146,4 +146,82 @@ test.describe("lyrics editor browser contract", () => {
     await page.keyboard.press(`${modifier}+z`);
     await expect.poll(async () => lines.nth(0).evaluate((element) => parseFloat(element.style.left))).toBeCloseTo(before, 1);
   });
+
+  test("separates cyan playback state from purple selection state", async ({ page }) => {
+    const harness = await installEditorHarness(page);
+    await harness.open();
+    await openAdvanced(page);
+
+    const ruler = page.getByTestId("timeline-ruler");
+    const rulerBox = await ruler.boundingBox();
+    const lane = page.getByTestId("timeline-lane");
+    const laneBox = await lane.boundingBox();
+    const pxPerSec = Number(await lane.getAttribute("data-px-per-sec"));
+    expect(rulerBox).not.toBeNull();
+    expect(laneBox).not.toBeNull();
+    await ruler.click({ position: { x: (laneBox.x - rulerBox.x) + 1.3 * pxPerSec, y: rulerBox.height / 2 } });
+
+    const rows = page.getByTestId("timeline-label-row");
+    await expect(rows.nth(1)).toHaveAttribute("data-active", "true");
+    await page.getByRole("button", { name: "Reproducir" }).click();
+    await expect(rows.nth(1)).toHaveAttribute("data-playing", "true");
+    await expect(rows.nth(1)).toContainText("Sonando");
+
+    await page.getByTestId("timeline-segment").nth(2).click({ modifiers: [modifierForCurrentPlatform()] });
+    await expect(rows.nth(2)).toHaveAttribute("data-selected", "true");
+    await expect(rows.nth(2)).toHaveAttribute("data-active", "false");
+    await expect(rows.nth(1)).toHaveClass(/bg-cyan/);
+    await expect(rows.nth(2)).toHaveClass(/bg-brand/);
+    await expect(page.getByTestId("timeline-active-playhead")).toBeVisible();
+  });
+
+  test("scrolls long lyrics in the editor instead of trapping the wheel inside the timeline", async ({ page }) => {
+    const longSegments = Array.from({ length: 18 }, (_, index) => ({
+      _id: `long-${index}`,
+      start: index * 0.2,
+      end: index * 0.2 + 0.16,
+      text: `Línea extensa ${index + 1}`,
+    }));
+    const harness = await installEditorHarness(page, { segments: longSegments });
+    await harness.open();
+    await openAdvanced(page);
+
+    const panel = page.locator(".wizard-controls-panel");
+    const timelineScroll = page.getByTestId("timeline-scroll");
+    await expect.poll(() => panel.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
+    await timelineScroll.hover();
+    await page.mouse.wheel(0, 700);
+    await expect.poll(() => panel.evaluate((element) => element.scrollTop)).toBeGreaterThan(100);
+    await expect.poll(() => timelineScroll.evaluate((element) => element.scrollTop)).toBe(0);
+    await expect(page.getByTestId("timeline-label-row").last()).toContainText("Línea extensa 18");
+    await expect(page.getByTestId("timeline-label-row").last()).toBeVisible();
+  });
+
+  test("resizes a line from a generous edge hit area with one continuous drag", async ({ page }) => {
+    const harness = await installEditorHarness(page, {
+      segments: [
+        { _id: "wide", start: 0.4, end: 2.4, text: "Línea para estirar" },
+        { _id: "next", start: 2.7, end: 3.5, text: "Línea siguiente" },
+      ],
+    });
+    await harness.open();
+    await openAdvanced(page);
+
+    const block = page.getByTestId("timeline-segment").first();
+    const edge = block.getByTestId("timeline-edge-end");
+    await expect(edge).toHaveCSS("width", "16px");
+    const beforeWidth = await block.evaluate((element) => parseFloat(element.style.width));
+    const edgeBox = await edge.boundingBox();
+    expect(edgeBox).not.toBeNull();
+    await drag(
+      page,
+      { x: edgeBox.x + edgeBox.width / 2, y: edgeBox.y + edgeBox.height / 2 },
+      { x: edgeBox.x + edgeBox.width / 2 + 24, y: edgeBox.y + edgeBox.height / 2 },
+    );
+
+    await expect.poll(async () => block.evaluate((element) => parseFloat(element.style.width))).toBeGreaterThan(beforeWidth + 18);
+    await expect.poll(() => harness.saves.length).toBeGreaterThan(0);
+    const saved = harness.saves.at(-1).segments.find((segment) => segment.text === "Línea para estirar");
+    expect(Number(saved.end)).toBeGreaterThan(2.8);
+  });
 });
