@@ -23,6 +23,7 @@ import { useEditorAutosave } from "../hooks/useEditorAutosave";
 import { createSaveQueue } from "../lib/saveQueue";
 import ConflictDialog from "./ConflictDialog";
 import VersionHistory from "./VersionHistory";
+import WrapWarningDialog from "./WrapWarningDialog";
 
 // Copy honesto del fallo de respaldo (autosave), por CAUSA real. El banner
 // + el confirm de "Aprobar" antes decían "problema de red" para cualquier
@@ -2357,7 +2358,7 @@ export default function LyricsEditor({
   const approveInFlightRef = useRef(false);
   const [isApproving, setIsApproving] = useState(false);
 
-  const runApprove = async () => {
+  const runApprove = async ({ skipWrapWarning = false } = {}) => {
     if (editorV2Enabled && (!durableHydrated || durableEditor.loading)) {
       toast({ message: "Estamos cargando la última versión. Esperá un instante para aprobar.", tone: "info" });
       return;
@@ -2390,7 +2391,7 @@ export default function LyricsEditor({
     const problematic = edited.filter(
       (seg) => (seg.text || "").trim() && linesForSeg(seg.text) >= 3
     );
-    if (problematic.length > 0 && !wrapWarning) {
+    if (problematic.length > 0 && !skipWrapWarning) {
       setWrapWarning({ ids: problematic.map((s) => s._id) });
       return;
     }
@@ -2459,12 +2460,12 @@ export default function LyricsEditor({
     }));
   };
 
-  const handleApprove = async () => {
+  const handleApprove = async (options = {}) => {
     if (approveInFlightRef.current) return;
     approveInFlightRef.current = true;
     setIsApproving(true);
     try {
-      await runApprove();
+      await runApprove({ skipWrapWarning: options?.skipWrapWarning === true });
     } finally {
       approveInFlightRef.current = false;
       setIsApproving(false);
@@ -4086,44 +4087,6 @@ export default function LyricsEditor({
         )}
       </div>
 
-      {/* ── 3+ line wrap warning banner ────────────────────────────── */}
-      {wrapWarning && (
-        <div className="mt-3 rounded-card bg-red-500/[0.06] ring-1 ring-red-500/20 px-5 py-4 animate-fade-in">
-          <p className="text-sm font-semibold text-red-300 mb-1">
-            {wrapWarning.ids.length === 1
-              ? "1 línea ocupará 3+ renglones en el video"
-              : `${wrapWarning.ids.length} líneas ocuparán 3+ renglones en el video`}
-          </p>
-          <p className="text-xs text-red-400/70 mb-3">
-            Las líneas marcadas en rojo quedarán muy largas. Podés dividirlas ahora o continuar igual.
-          </p>
-          <div className="flex gap-3">
-            <button
-              onClick={() => {
-                // Auto-split all problematic segments
-                wrapWarning.ids.forEach((id) => splitSeg(id));
-                setWrapWarning(null);
-              }}
-              className="inline-flex items-center gap-1.5 h-9 px-4 rounded-button text-xs font-semibold
-                text-white bg-brand hover:bg-brand/90 transition-colors"
-            >
-              ✂ Auto-dividir todo
-            </button>
-            <button
-              onClick={() => {
-                setWrapWarning(null);
-                // Conserva el mismo contrato CAS que el CTA principal. Esta
-                // rama antes salteaba el flush y enviaba un edit sin revisión.
-                handleApprove();
-              }}
-              className="btn-secondary h-9 px-4 text-xs"
-            >
-              Continuar igual
-            </button>
-          </div>
-        </div>
-      )}
-
       {/* Inline preview list-only ELIMINADO 2026-05-23 — el refactor world-class
           deja el LyricVideoPreview siempre visible en la columna izquierda,
           en ambas vistas. Este bloque (que sólo aparecía en list mode cuando
@@ -4155,6 +4118,24 @@ export default function LyricsEditor({
           setConflictDialogOpen(false);
           trackEditorEvent("editor_conflict", { server_revision: result.document.revision, resolution: "save_local_as_new" });
           try { if (draftKey) localStorage.removeItem(draftKey); } catch { /* best effort */ }
+        }}
+      />
+      <WrapWarningDialog
+        warning={wrapWarning}
+        onReview={() => {
+          const firstId = wrapWarning?.ids?.[0];
+          setWrapWarning(null);
+          if (firstId == null) return;
+          setFocusedSegId(firstId);
+          window.setTimeout(() => rowRefs.current[firstId]?.scrollIntoView?.({ block: "center", behavior: "smooth" }), 0);
+        }}
+        onAutoSplit={() => {
+          wrapWarning?.ids?.forEach((id) => splitSeg(id));
+          setWrapWarning(null);
+        }}
+        onApproveAnyway={() => {
+          setWrapWarning(null);
+          handleApprove({ skipWrapWarning: true });
         }}
       />
       <VersionHistory

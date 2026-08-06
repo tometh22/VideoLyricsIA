@@ -318,6 +318,29 @@ test.describe("lyrics editor browser contract", () => {
     await expect.poll(async () => block.evaluate((element) => parseFloat(element.style.left))).toBeGreaterThan(before);
   });
 
+  test("keeps the typography warning visible and allows approval from the bottom of the editor", async ({ page }) => {
+    const longLine = Array.from({ length: 80 }, () => "palabra").join(" ");
+    const harness = await installEditorHarness(page, {
+      segments: [{ _id: "oversized", start: 1, end: 8, text: `${longLine}.` }],
+    });
+    await harness.open();
+    await page.getByLabel("Letra de la línea 1").fill(longLine);
+
+    const panel = page.locator(".wizard-controls-panel");
+    await panel.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+    await page.getByRole("button", { name: /Aprobar y generar/i }).click();
+
+    const dialog = page.getByRole("dialog", { name: /Una línea puede ocupar 3 renglones/i });
+    await expect(dialog).toBeVisible();
+    const box = await dialog.boundingBox();
+    expect(box).not.toBeNull();
+    expect(box.y).toBeGreaterThanOrEqual(0);
+    expect(box.y + box.height).toBeLessThanOrEqual(page.viewportSize().height);
+
+    await dialog.getByRole("button", { name: "Aprobar igualmente" }).click();
+    await expect.poll(() => harness.approvals.length).toBe(1);
+  });
+
   test("uses the durable editor contract when editor_v2 is enabled", async ({ page }) => {
     const harness = await installEditorHarness(page, { editorV2: true });
     await harness.open();
