@@ -89,10 +89,23 @@ from database import (
     Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
     BackgroundAsset, AssetUsage, Delivery, DeliveryChangeRequest,
     SalesLead, UserSession, LoginSession, UiEvent, CreditGrant,
+    ProductEvent, EditorDocument, EditorVersion,
     scoped_db, pool_stats,
     get_deliveries_db, deliveries_added_by, DELIVERIES_DATABASE_URL,
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
+from editor import (
+    acquire_lock,
+    get_job_for_tenant,
+    get_or_create_document,
+    list_versions,
+    release_lock,
+    restore_version,
+    save_document,
+    serialize_document,
+    sync_legacy_snapshot,
+    ensure_document,
+)
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe, _normalize_movement_style
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
@@ -8062,6 +8075,8 @@ async def generate_with_segments(
     # generoso que rechaza payload absurdo sin restringir casos reales.
     segments_json: str = Form(..., max_length=5_000_000),
     base_revision: str = Form("", max_length=20),
+    editor_version_id: str = Form("", max_length=36),
+    editor_revision: str = Form("", max_length=20),
     delivery_profile: str = Form("youtube", max_length=20),  # Job.delivery_profile = VARCHAR(20)
     umg_frame_size: str = Form("", max_length=16),
     umg_fps: str = Form("", max_length=16),
@@ -8173,6 +8188,8 @@ async def generate_with_segments(
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="base_revision must be a non-negative integer") from exc
 
+    editor_document = None
+
     if reuse:
         # Reuse path: verify the job belongs to caller and pull the audio
         # path / R2 key from the row. Two valid entry states:
@@ -8188,7 +8205,6 @@ async def generate_with_segments(
             .first()
         )
         if (not job_row
-                or job_row.user_id != current_user["id"]
                 or job_row.tenant_id != current_user["tenant_id"]):
             # Stable machine-readable code so the frontend doesn't couple to the
             # HTTP status. `job_not_found` = reaped / cross-tenant / never
@@ -8214,6 +8230,36 @@ async def generate_with_segments(
                     "detail": f"Job is in state {job_row.status!r}, cannot generate.",
                 },
             )
+        if editor_version_id or str(editor_revision).strip():
+            document = get_or_create_document(
+                db, job_id, current_user["tenant_id"], job_row.segments_json or [],
+            )
+            editor_document = document
+            if editor_version_id:
+                version = db.query(EditorVersion).filter(
+                    EditorVersion.id == editor_version_id,
+                    EditorVersion.job_id == job_id,
+                    EditorVersion.tenant_id == current_user["tenant_id"],
+                ).first()
+                if not version:
+                    raise HTTPException(status_code=409, detail="editor_version_not_found")
+                segments = version.segments
+                requested_revision = document.revision
+            else:
+                try:
+                    requested_revision = int(editor_revision)
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=422, detail="editor_revision must be an integer") from None
+                if requested_revision != document.revision:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "detail": "editor_revision_conflict",
+                            "server_revision": document.revision,
+                            "server_segments": document.current_segments,
+                        },
+                    )
+                segments = document.current_segments
         current_revision = int(getattr(job_row, "segments_revision", 0) or 0)
         if requested_revision is None and current_revision > 0:
             return JSONResponse(
@@ -8366,9 +8412,15 @@ async def generate_with_segments(
         # Normally the preceding autosave already persisted the exact payload.
         # A CAS-matching direct client may still combine save+generate; in that
         # case the server performs the segment write and owns the increment.
+        if requested_revision is None and current_revision == 0:
+            # Legacy clients did not send a revision, but their submitted
+            # segments are still the approval snapshot and must be persisted
+            # before enqueueing the worker.
+            job_row.segments_json = segments
         if requested_revision is not None and job_row.segments_json != segments:
             job_row.segments_json = segments
             job_row.segments_revision = current_revision + 1
+            current_revision += 1
         job_row.artist = artist
         job_row.song_title = song_title or None
         job_row.style = style
@@ -8387,6 +8439,27 @@ async def generate_with_segments(
         job_row.progress = 0
         job_row.error = None
         job_row.last_progress_at = datetime.now(timezone.utc)
+
+        # The generate/approve action freezes the exact persisted editor
+        # snapshot used by the worker as an immutable audit version. Legacy
+        # clients are bridged lazily so they receive the same guarantee.
+        if editor_document is None:
+            editor_document = get_or_create_document(
+                db, job_id, current_user["tenant_id"], job_row.segments_json or [],
+            )
+        if editor_document.revision < current_revision:
+            sync_legacy_snapshot(
+                db, editor_document, current_user["id"],
+                job_row.segments_json or [], current_revision,
+            )
+        approved_version = db.query(EditorVersion).filter(
+            EditorVersion.job_id == job_id,
+            EditorVersion.tenant_id == current_user["tenant_id"],
+            EditorVersion.revision == editor_document.revision,
+        ).first()
+        if approved_version and approved_version.segments == (job_row.segments_json or []):
+            approved_version.is_approved = True
+            approved_version.reason = "approve"
         db.commit()
     else:
         job_id = create_job(
@@ -10309,6 +10382,232 @@ def get_waveform(
     return payload
 
 
+class EditorPatchRequest(BaseModel):
+    base_revision: int
+    segments: list[dict]
+    checkpoint: str = "autosave"
+
+
+class EditorRestoreRequest(BaseModel):
+    version_id: str
+    base_revision: int
+
+
+class ProductEventItem(BaseModel):
+    name: str
+    job_id: str | None = None
+    occurred_at: str | None = None
+    properties: dict = Field(default_factory=dict)
+
+
+class ProductEventsRequest(BaseModel):
+    events: list[ProductEventItem]
+
+
+def _editor_document_or_404(db: Session, job_id: str, current_user: dict):
+    job = get_job_for_tenant(db, job_id, current_user["tenant_id"])
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    try:
+        document = get_or_create_document(
+            db, job_id, current_user["tenant_id"], job.segments_json or [],
+        )
+    except (LookupError, ValueError):
+        raise HTTPException(status_code=422, detail="Invalid editor segments.") from None
+    return job, document
+
+
+@app.get("/editor/{job_id}")
+async def get_editor_document(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    payload = serialize_document(db, document)
+    payload.update({
+        "artist": job.artist,
+        "song_title": job.song_title,
+        "filename": job.filename,
+        "job_status": job.status,
+    })
+    return payload
+
+
+@app.patch("/editor/{job_id}")
+async def patch_editor_document(
+    job_id: str,
+    body: EditorPatchRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    try:
+        document, version = save_document(
+            db, document, current_user["id"], body.base_revision,
+            body.segments, body.checkpoint,
+        )
+        # Keep the legacy editor/generator contract in sync during rollout.
+        job.segments_json = document.current_segments
+        job.segments_revision = document.revision
+        db.commit()
+    except RuntimeError:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "detail": "editor_revision_conflict",
+                "server_revision": document.revision,
+                "server_segments": document.current_segments,
+                "updated_by": serialize_document(db, document)["updated_by"],
+                "updated_at": serialize_document(db, document)["updated_at"],
+            },
+        ) from None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    return {
+        "job_id": job_id,
+        "revision": document.revision,
+        "version_id": version.id if version else None,
+        "saved_at": document.updated_at.isoformat(),
+    }
+
+
+@app.post("/editor/{job_id}/lock")
+@app.post("/editor/{job_id}/lock/heartbeat")
+async def editor_lock(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _, document = _editor_document_or_404(db, job_id, current_user)
+    return acquire_lock(db, document, current_user["id"])
+
+
+@app.delete("/editor/{job_id}/lock")
+async def editor_unlock(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _, document = _editor_document_or_404(db, job_id, current_user)
+    if not release_lock(db, document, current_user["id"]):
+        raise HTTPException(status_code=409, detail="editor_lock_owned_by_other_user")
+    return {"released": True}
+
+
+@app.get("/editor/{job_id}/versions")
+async def get_editor_versions(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _, document = _editor_document_or_404(db, job_id, current_user)
+    return {"versions": list_versions(db, document)}
+
+
+@app.post("/editor/{job_id}/restore")
+async def restore_editor_version(
+    job_id: str,
+    body: EditorRestoreRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    try:
+        document, version = restore_version(
+            db, document, current_user["id"], body.version_id, body.base_revision,
+        )
+        job.segments_json = document.current_segments
+        job.segments_revision = document.revision
+        db.commit()
+    except LookupError:
+        raise HTTPException(status_code=404, detail="editor_version_not_found") from None
+    except RuntimeError:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "detail": "editor_revision_conflict",
+                "server_revision": document.revision,
+                "server_segments": document.current_segments,
+            },
+        ) from None
+    return {
+        "job_id": job_id,
+        "revision": document.revision,
+        "version_id": version.id,
+        "segments": document.current_segments,
+    }
+
+
+_PRODUCT_EVENT_NAMES = {
+    "editor_opened", "editor_view_changed", "editor_seek",
+    "editor_selection_created", "editor_group_moved", "editor_timing_changed",
+    "editor_undo", "editor_autosave_success", "editor_autosave_failed",
+    "editor_conflict", "editor_version_restored", "editor_approved",
+    "editor_help_opened",
+}
+
+
+@app.post("/analytics/events")
+async def record_product_events(
+    body: ProductEventsRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if len(body.events) > 50:
+        raise HTTPException(status_code=422, detail="A maximum of 50 events is accepted per batch.")
+    accepted = 0
+    for item in body.events:
+        if item.name not in _PRODUCT_EVENT_NAMES:
+            continue
+        properties = {
+            key: value for key, value in (item.properties or {}).items()
+            if key not in {"segments", "lyrics", "audio", "audio_url"}
+        }
+        if len(json.dumps(properties, ensure_ascii=False)) > 2000:
+            continue
+        occurred_at = None
+        if item.occurred_at:
+            try:
+                occurred_at = datetime.fromisoformat(item.occurred_at.replace("Z", "+00:00"))
+            except ValueError:
+                occurred_at = None
+        db.add(ProductEvent(
+            tenant_id=current_user["tenant_id"], user_id=current_user["id"],
+            job_id=item.job_id, name=item.name, occurred_at=occurred_at,
+            properties=properties,
+        ))
+        accepted += 1
+    db.commit()
+    return {"accepted": accepted}
+
+
+@app.get("/admin/product-metrics")
+async def product_metrics(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    rows = db.query(ProductEvent).order_by(ProductEvent.created_at.desc()).limit(10000).all()
+    counts: dict[str, int] = {}
+    durations = []
+    first_edits = []
+    for row in rows:
+        counts[row.name] = counts.get(row.name, 0) + 1
+        properties = row.properties or {}
+        if isinstance(properties.get("duration_ms"), (int, float)):
+            durations.append(float(properties["duration_ms"]))
+        if isinstance(properties.get("time_to_first_edit_ms"), (int, float)):
+            first_edits.append(float(properties["time_to_first_edit_ms"]))
+    return {
+        "events": counts,
+        "sample_size": len(rows),
+        "avg_session_duration_ms": sum(durations) / len(durations) if durations else None,
+        "avg_time_to_first_edit_ms": sum(first_edits) / len(first_edits) if first_edits else None,
+    }
+
+
 class SaveSegmentsRequest(BaseModel):
     # Persisted to Job.segments_json (JSONB). Same shape /generate and
     # /edit accept. 5 MB upper bound mirrors /generate's segments_json
@@ -10364,13 +10663,13 @@ async def save_segments(
     # _job_scope): un super admin corrige y GUARDA el job de cualquier
     # usuario cuando tiene problemas. Sin esto, abrir el editor de un job
     # ajeno dejaba el autoguardado en 404 permanente ("No pudimos guardar")
-    # y las ediciones no persistían. Para no-admins se mantiene el scope
-    # estricto por dueño + tenant. Acceso auditado (compliance UMG).
+    # y las ediciones no persistían. Para no-admins el editor se comparte
+    # entre miembros del mismo workspace; el control optimista por revisión
+    # detecta cualquier guardado sobre una versión vieja.
     _is_platform_admin = current_user.get("role") == "admin"
     if (not job
             or (not _is_platform_admin
-                and (job.user_id != current_user["id"]
-                     or job.tenant_id != current_user["tenant_id"]))):
+                and job.tenant_id != current_user["tenant_id"])):
         raise HTTPException(status_code=404, detail="Job not found.")
     _audit_cross_tenant_access(db, current_user, job, "save_segments", commit=False)
 
@@ -10586,6 +10885,20 @@ async def save_segments(
         job.segments_revision = current_revision + 1
     touch_user_activity(db, job)
     db.commit()
+
+    # Bridge the existing staging CAS endpoint into the durable Editor 2.0
+    # document/version model. Legacy clients keep their contract while new
+    # clients can read history, restore, and collaborate through /editor.
+    try:
+        document = get_or_create_document(
+            db, job_id, job.tenant_id, job.segments_json or [],
+        )
+        sync_legacy_snapshot(
+            db, document, current_user["id"], job.segments_json or [],
+            int(getattr(job, "segments_revision", 0) or 0),
+        )
+    except (LookupError, ValueError) as exc:
+        logger.warning("[save-segments] editor bridge skipped job=%s: %s", job_id, exc)
 
     # Outcome metric (issue #934): éxito consultable por tenant — junto con
     # el warning del 409 de arriba permite medir la tasa real de fallas del

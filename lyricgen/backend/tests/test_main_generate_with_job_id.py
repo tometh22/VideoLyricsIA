@@ -142,6 +142,20 @@ def test_generate_reuses_persisted_audio_when_job_id_provided(
     assert captured["segments_override"] == [{"start": 0, "end": 1, "text": "test"}]
     assert captured["song_title"] == "No Tengo Ganas"
 
+    # Approval persists the exact submitted snapshot as an immutable editor
+    # version even for legacy clients that omit base_revision.
+    from database import EditorVersion
+    version_db = SessionLocal()
+    try:
+        approved = version_db.query(EditorVersion).filter(
+            EditorVersion.job_id == job_id,
+            EditorVersion.is_approved.is_(True),
+        ).one()
+        assert approved.reason == "approve"
+        assert approved.segments == [{"start": 0, "end": 1, "text": "test"}]
+    finally:
+        version_db.close()
+
     # The status payload feeds the render/detail UI. It must expose the
     # structured title as well as the upload filename so the UI never has to
     # infer the song name from a potentially unrelated raw filename.
