@@ -266,7 +266,7 @@ test.describe("lyrics editor browser contract", () => {
     expect(Number(saved.end)).toBeLessThanOrEqual(2.65 + Number.EPSILON * 4);
   });
 
-  test("keeps short-line geometry real while handles remain easy to hit", async ({ page }) => {
+  test("moves a short line from its body while resize handles stay outside", async ({ page }) => {
     const harness = await installEditorHarness(page, {
       segments: [
         { _id: "short", start: 0.4, end: 0.7, text: "Oh" },
@@ -279,8 +279,27 @@ test.describe("lyrics editor browser contract", () => {
     const width = await block.evaluate((element) => parseFloat(element.style.width));
     const zoom = Number(await page.getByTestId("timeline-lane").getAttribute("data-px-per-sec"));
     expect(width).toBeCloseTo(0.3 * zoom, 1);
-    await expect(block.getByTestId("timeline-edge-start")).toHaveCSS("width", "22px");
-    await expect(block.getByTestId("timeline-edge-end")).toHaveCSS("width", "22px");
+    const body = block.getByTestId("timeline-segment-body");
+    const startEdge = block.getByTestId("timeline-edge-start");
+    const endEdge = block.getByTestId("timeline-edge-end");
+    await expect(body).toHaveCSS("width", "28px");
+    await expect(startEdge).toHaveCSS("width", "22px");
+    await expect(endEdge).toHaveCSS("width", "22px");
+
+    const beforeLeft = await block.evaluate((element) => parseFloat(element.style.left));
+    const bodyBox = await body.boundingBox();
+    const startBox = await startEdge.boundingBox();
+    const endBox = await endEdge.boundingBox();
+    expect(bodyBox).not.toBeNull();
+    expect(startBox.x + startBox.width).toBeLessThanOrEqual(bodyBox.x + 0.5);
+    expect(endBox.x).toBeGreaterThanOrEqual(bodyBox.x + bodyBox.width - 0.5);
+
+    await drag(
+      page,
+      { x: bodyBox.x + bodyBox.width / 2, y: bodyBox.y + bodyBox.height / 2 },
+      { x: bodyBox.x + bodyBox.width / 2 + 12, y: bodyBox.y + bodyBox.height / 2 },
+    );
+    await expect.poll(async () => block.evaluate((element) => parseFloat(element.style.left))).toBeGreaterThan(beforeLeft + 8);
   });
 
   test("supports keyboard tabs and accessible selection nudges", async ({ page }) => {

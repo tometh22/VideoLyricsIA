@@ -23,6 +23,7 @@ const ROW_H = 48;
 const WAVE_H = 46;
 const MIN_BLOCK_PX = 2;
 const EDGE_PX = 22;
+const MOVE_HIT_MIN_PX = 28;
 const MIN_DUR_S = 0.3;
 const CLICK_SLOP_PX = 5;
 const FOLLOW_SUPPRESS_MS = 2500;
@@ -736,6 +737,8 @@ export default function LyricsTimeline({
               const start = previewItem?.start ?? segment.start;
               const end = previewItem?.end ?? segment.end;
               const width = Math.max(MIN_BLOCK_PX, (end - start) * pxPerSec);
+              const moveHitWidth = Math.max(width, MOVE_HIT_MIN_PX);
+              const moveHitOverflow = (moveHitWidth - width) / 2;
               const isSelected = selectedIds.has(segment._id);
               const isActive = activeId === segment._id;
               const isFocused = focusedSegId === segment._id;
@@ -751,10 +754,6 @@ export default function LyricsTimeline({
                   aria-label={`Línea ${index + 1}: ${segment.text}. ${fmt(start)} a ${fmt(end)}`}
                   className={`absolute z-10 cursor-grab active:cursor-grabbing rounded-lg ring-1 transition-all select-none ${isSelected ? "bg-brand/30" : isActive ? "bg-cyan-400/25 shadow-[0_0_22px_rgba(34,211,238,.16)]" : "bg-surface-3/95"} ${isSelected ? "ring-2 ring-brand-light shadow-[0_0_0_3px_rgba(139,92,246,.13)]" : isActive ? "ring-cyan-300/60" : "ring-white/[0.18] hover:ring-white/[0.32]"} ${isFocused ? "outline outline-1 outline-white/80" : ""} ${isRecent ? "ring-accent" : ""}`}
                   style={{ left: start * pxPerSec, top: index * ROW_H + 7, width, height: ROW_H - 14, touchAction: "none", scrollMarginLeft: LABEL_W + 12 }}
-                  onPointerDown={(event) => startDrag(event, segment, "move")}
-                  onPointerMove={updateDrag}
-                  onPointerUp={(event) => finishDrag(event, segment)}
-                  onPointerCancel={cancelPointerInteraction}
                   onClick={(event) => event.stopPropagation()}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" || event.key === " ") {
@@ -763,16 +762,29 @@ export default function LyricsTimeline({
                     }
                   }}
                 >
-                  <div data-testid="timeline-edge-start" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, left: -EDGE_PX / 2 }} title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea")} onPointerDown={(event) => startDrag(event, segment, "start")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
-                    <span className="absolute inset-y-1 left-1/2 w-1 -translate-x-1/2 rounded-full bg-brand-light/55 transition-all group-hover/edge:inset-y-0.5 group-hover/edge:bg-white group-hover/edge:shadow-[0_0_8px_rgba(255,255,255,.7)]" />
-                  </div>
-                  <div data-testid="timeline-edge-end" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, right: -EDGE_PX / 2 }} title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea")} onPointerDown={(event) => startDrag(event, segment, "end")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
-                    <span className="absolute inset-y-1 left-1/2 w-1 -translate-x-1/2 rounded-full bg-brand-light/55 transition-all group-hover/edge:inset-y-0.5 group-hover/edge:bg-white group-hover/edge:shadow-[0_0_8px_rgba(255,255,255,.7)]" />
-                  </div>
                   <div
                     data-testid="timeline-segment-body"
-                    className="flex items-center gap-2 h-full px-3 pl-4 pointer-events-none cursor-grab active:cursor-grabbing"
+                    className="absolute bottom-0 top-0 left-1/2 z-30 cursor-grab active:cursor-grabbing"
+                    style={{ width: moveHitWidth, transform: "translateX(-50%)", touchAction: "none" }}
                     title={t("timeline.move_range_hint", "Arrastrá para mover · Shift+click selecciona un rango")}
+                    onPointerDown={(event) => startDrag(event, segment, "move")}
+                    onPointerMove={updateDrag}
+                    onPointerUp={(event) => finishDrag(event, segment)}
+                    onPointerCancel={cancelPointerInteraction}
+                    onDoubleClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      startTextEdit(segment);
+                    }}
+                  />
+                  <div data-testid="timeline-edge-start" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, left: -(moveHitOverflow + EDGE_PX), touchAction: "none" }} title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea")} onPointerDown={(event) => startDrag(event, segment, "start")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
+                    <span className="absolute inset-y-1 right-0 w-1 rounded-full bg-brand-light/70 transition-all group-hover/edge:inset-y-0.5 group-hover/edge:bg-white group-hover/edge:shadow-[0_0_8px_rgba(255,255,255,.7)]" />
+                  </div>
+                  <div data-testid="timeline-edge-end" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, right: -(moveHitOverflow + EDGE_PX), touchAction: "none" }} title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea")} onPointerDown={(event) => startDrag(event, segment, "end")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
+                    <span className="absolute inset-y-1 left-0 w-1 rounded-full bg-brand-light/70 transition-all group-hover/edge:inset-y-0.5 group-hover/edge:bg-white group-hover/edge:shadow-[0_0_8px_rgba(255,255,255,.7)]" />
+                  </div>
+                  <div
+                    className={`absolute inset-0 flex items-center gap-2 px-3 pl-4 pointer-events-none ${editingTextId === segment._id ? "z-40" : "z-10"}`}
                   >
                     {width >= 54 && <span className="text-[9px] text-ink-tertiary tabular-nums shrink-0">{fmt(start)}</span>}
                     {editingTextId === segment._id ? (

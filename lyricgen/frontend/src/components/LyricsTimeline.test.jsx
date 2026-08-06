@@ -82,8 +82,9 @@ describe("LyricsTimeline", () => {
   it("clicking a line focuses it and seeks without editing its timing", () => {
     const props = setup();
     const block = screen.getAllByTestId("timeline-segment")[1];
-    fireEvent.pointerDown(block, { clientX: 1000, pointerId: 1, button: 0 });
-    fireEvent.pointerUp(block, { clientX: 1000, pointerId: 1, button: 0 });
+    const body = block.querySelector('[data-testid="timeline-segment-body"]');
+    fireEvent.pointerDown(body, { clientX: 1000, pointerId: 1, button: 0 });
+    fireEvent.pointerUp(body, { clientX: 1000, pointerId: 1, button: 0 });
     expect(props.onFocus).toHaveBeenCalledWith(1);
     expect(props.onSeek).toHaveBeenCalledTimes(1);
     expect(props.onTimingChange).not.toHaveBeenCalled();
@@ -92,9 +93,10 @@ describe("LyricsTimeline", () => {
   it("dragging a line commits a horizontal timing change and one undo snapshot", () => {
     const props = setup();
     const block = screen.getAllByTestId("timeline-segment")[1];
-    fireEvent.pointerDown(block, { clientX: 900, pointerId: 1, button: 0 });
-    fireEvent.pointerMove(block, { clientX: 1080, pointerId: 1 });
-    fireEvent.pointerUp(block, { clientX: 1080, pointerId: 1 });
+    const body = block.querySelector('[data-testid="timeline-segment-body"]');
+    fireEvent.pointerDown(body, { clientX: 900, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(body, { clientX: 1080, pointerId: 1 });
+    fireEvent.pointerUp(body, { clientX: 1080, pointerId: 1 });
     expect(props.onDragStart).toHaveBeenCalledTimes(1);
     expect(props.onTimingChange).toHaveBeenCalledTimes(1);
     const [id, newStart, newEnd] = props.onTimingChange.mock.calls[0];
@@ -106,16 +108,18 @@ describe("LyricsTimeline", () => {
   it("Cmd/Ctrl-click toggles lines and dragging the group commits one batch", () => {
     const props = setup();
     const [first, second] = screen.getAllByTestId("timeline-segment");
+    const firstBody = first.querySelector('[data-testid="timeline-segment-body"]');
+    const secondBody = second.querySelector('[data-testid="timeline-segment-body"]');
 
-    fireEvent.pointerDown(first, { clientX: 100, pointerId: 1, button: 0, metaKey: true });
-    fireEvent.pointerUp(first, { clientX: 100, pointerId: 1, button: 0, metaKey: true });
-    fireEvent.pointerDown(second, { clientX: 950, pointerId: 2, button: 0, ctrlKey: true });
-    fireEvent.pointerUp(second, { clientX: 950, pointerId: 2, button: 0, ctrlKey: true });
+    fireEvent.pointerDown(firstBody, { clientX: 100, pointerId: 1, button: 0, metaKey: true });
+    fireEvent.pointerUp(firstBody, { clientX: 100, pointerId: 1, button: 0, metaKey: true });
+    fireEvent.pointerDown(secondBody, { clientX: 950, pointerId: 2, button: 0, ctrlKey: true });
+    fireEvent.pointerUp(secondBody, { clientX: 950, pointerId: 2, button: 0, ctrlKey: true });
 
     expect(screen.getByText("2 líneas")).toBeInTheDocument();
-    fireEvent.pointerDown(first, { clientX: 100, pointerId: 3, button: 0 });
-    fireEvent.pointerMove(first, { clientX: 190, pointerId: 3 });
-    fireEvent.pointerUp(first, { clientX: 190, pointerId: 3 });
+    fireEvent.pointerDown(firstBody, { clientX: 100, pointerId: 3, button: 0 });
+    fireEvent.pointerMove(firstBody, { clientX: 190, pointerId: 3 });
+    fireEvent.pointerUp(firstBody, { clientX: 190, pointerId: 3 });
 
     expect(props.onTimingChangeBatch).toHaveBeenCalledTimes(1);
     expect(props.onTimingChangeBatch.mock.calls[0][0]).toHaveLength(2);
@@ -134,16 +138,16 @@ describe("LyricsTimeline", () => {
   it("selects a contiguous range with Shift-click", () => {
     setup();
     const [first, second] = screen.getAllByTestId("timeline-segment");
-    fireEvent.pointerDown(first, { clientX: 100, pointerId: 1, button: 0, metaKey: true });
-    fireEvent.pointerDown(second, { clientX: 900, pointerId: 2, button: 0, shiftKey: true });
+    fireEvent.pointerDown(first.querySelector('[data-testid="timeline-segment-body"]'), { clientX: 100, pointerId: 1, button: 0, metaKey: true });
+    fireEvent.pointerDown(second.querySelector('[data-testid="timeline-segment-body"]'), { clientX: 900, pointerId: 2, button: 0, shiftKey: true });
     expect(screen.getByText("2 líneas")).toBeInTheDocument();
   });
 
   it("deletes the selected lines from the contextual action", () => {
     const props = setup();
     const [first, second] = screen.getAllByTestId("timeline-segment");
-    fireEvent.pointerDown(first, { clientX: 100, pointerId: 1, button: 0, metaKey: true });
-    fireEvent.pointerDown(second, { clientX: 900, pointerId: 2, button: 0, ctrlKey: true });
+    fireEvent.pointerDown(first.querySelector('[data-testid="timeline-segment-body"]'), { clientX: 100, pointerId: 1, button: 0, metaKey: true });
+    fireEvent.pointerDown(second.querySelector('[data-testid="timeline-segment-body"]'), { clientX: 900, pointerId: 2, button: 0, ctrlKey: true });
 
     fireEvent.click(screen.getByRole("button", { name: "Eliminar 2 líneas" }));
     expect(props.onDeleteSelection).toHaveBeenCalledWith([0, 1]);
@@ -165,7 +169,7 @@ describe("LyricsTimeline", () => {
   it("supports Delete from a focused timing block but ignores editable text", () => {
     const props = setup();
     const first = screen.getAllByTestId("timeline-segment")[0];
-    fireEvent.pointerDown(first, { clientX: 100, pointerId: 1, button: 0, metaKey: true });
+    fireEvent.pointerDown(first.querySelector('[data-testid="timeline-segment-body"]'), { clientX: 100, pointerId: 1, button: 0, metaKey: true });
     first.focus();
     fireEvent.keyDown(first, { key: "Delete" });
     expect(props.onDeleteSelection).toHaveBeenCalledWith([0]);
@@ -175,6 +179,30 @@ describe("LyricsTimeline", () => {
     fireEvent.doubleClick(second.querySelector("span[title*='Doble-click']"));
     fireEvent.keyDown(screen.getByDisplayValue("segunda línea"), { key: "Backspace" });
     expect(props.onDeleteSelection).not.toHaveBeenCalled();
+  });
+
+  it("keeps a usable move target on a very short line without overlapping its resize handles", () => {
+    const props = setup({
+      segments: [
+        { _id: "short", start: 0.4, end: 0.7, text: "Oh" },
+        { _id: "next", start: 1.2, end: 2, text: "Siguiente" },
+      ],
+      duration: 5,
+    });
+    const block = screen.getAllByTestId("timeline-segment")[0];
+    const body = block.querySelector('[data-testid="timeline-segment-body"]');
+    const startEdge = block.querySelector('[data-testid="timeline-edge-start"]');
+    const endEdge = block.querySelector('[data-testid="timeline-edge-end"]');
+
+    expect(parseFloat(block.style.width)).toBeCloseTo(0.3 * 48, 5);
+    expect(body.style.width).toBe("28px");
+    expect(parseFloat(startEdge.style.left)).toBeLessThan(-22);
+    expect(parseFloat(endEdge.style.right)).toBeLessThan(-22);
+
+    fireEvent.pointerDown(body, { clientX: 100, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(body, { clientX: 124, pointerId: 1 });
+    fireEvent.pointerUp(body, { clientX: 124, pointerId: 1 });
+    expect(props.onTimingChange).toHaveBeenCalledWith("short", expect.any(Number), expect.any(Number));
   });
 
   it("shows selection instructions and distinct move/resize cursors", () => {
