@@ -133,6 +133,7 @@ describe("Editor 2.0 stale draft recovery", () => {
     });
     renderEditor(request, { onApprove });
     await screen.findByDisplayValue("versión equipo");
+    await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
 
     fireEvent.click(screen.getByRole("button", { name: /Aprobar y generar/i }));
     expect(await screen.findByRole("dialog", { name: /Hay una versión más nueva/i })).toBeInTheDocument();

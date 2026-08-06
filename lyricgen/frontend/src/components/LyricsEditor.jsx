@@ -2358,6 +2358,10 @@ export default function LyricsEditor({
   const [isApproving, setIsApproving] = useState(false);
 
   const runApprove = async () => {
+    if (editorV2Enabled && (!durableHydrated || durableEditor.loading)) {
+      toast({ message: "Estamos cargando la última versión. Esperá un instante para aprobar.", tone: "info" });
+      return;
+    }
     if (saveStatus === "conflict" || durableEditor.conflict) {
       setConflictDialogOpen(true);
       toast({ message: "Resolvé el conflicto antes de aprobar.", tone: "error" });
@@ -2641,7 +2645,7 @@ export default function LyricsEditor({
           </div>
           <button
             onClick={handleApprove}
-            disabled={isApproving || saveStatus === "conflict" || saveErrorReason === "draft-corrupt"}
+            disabled={isApproving || (editorV2Enabled && (!durableHydrated || durableEditor.loading)) || saveStatus === "conflict" || saveErrorReason === "draft-corrupt"}
             aria-busy={isApproving}
             aria-label={isApproving
               ? (t("editor.applying_changes") || "Aplicando cambios…")
