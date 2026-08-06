@@ -32,8 +32,10 @@ async function openEditor(browser, token) {
   // A fresh browser profile can legitimately receive the one-time product
   // announcement before the editor. Dismiss it through the same accessible
   // control a real user sees so it cannot intercept the workflow below.
-  const announcementClose = page.getByRole("button", { name: "Cerrar" });
-  if (await announcementClose.isVisible()) await announcementClose.click();
+  const announcement = page.getByRole("dialog");
+  if (await announcement.isVisible()) {
+    await announcement.getByRole("button", { name: "Cancelar", exact: true }).click();
+  }
   await page.getByRole("button", { name: /4 Lyrics/ }).click();
   await expect(page.getByTestId("editor-mode-explainer")).toBeVisible();
   return { context, page };
