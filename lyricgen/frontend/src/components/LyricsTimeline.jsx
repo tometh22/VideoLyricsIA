@@ -492,6 +492,21 @@ export default function LyricsTimeline({
     if (deleted !== false) clearSelection();
   }, [clearSelection, editingTextId, onDeleteSelection, selectedIds]);
 
+  const deleteLine = useCallback((event, id) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const deleted = onDeleteSelection?.([id]);
+    if (deleted !== false) {
+      setSelectedIds((previous) => {
+        if (!previous.has(id)) return previous;
+        const next = new Set(previous);
+        next.delete(id);
+        return next;
+      });
+      if (selectionAnchorRef.current === id) selectionAnchorRef.current = null;
+    }
+  }, [onDeleteSelection]);
+
   const handleKeyDown = (event) => {
     if (event.key === "Escape") clearSelection();
     const targetIsEditable = ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(event.target?.tagName)
@@ -601,9 +616,15 @@ export default function LyricsTimeline({
               type="button"
               onClick={deleteSelection}
               aria-keyshortcuts="Delete Backspace"
-              className="h-7 rounded-lg px-2.5 text-[10px] font-medium text-red-300 hover:bg-red-400/10 hover:text-red-200"
+              className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-red-400/10 px-3 text-[10px] font-semibold text-red-200 ring-1 ring-red-300/20 transition-colors hover:bg-red-400/20 hover:ring-red-300/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-200"
             >
-              {t("timeline.delete_selection", "Eliminar")}
+              <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5m4-5v5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              {(selectedIds.size === 1
+                ? t("timeline.delete_selected_one", "Eliminar 1 línea")
+                : t("timeline.delete_selected_many", "Eliminar {n} líneas")
+              ).replace("{n}", selectedIds.size)}
             </button>
             <button type="button" onClick={clearSelection} className="h-7 px-2.5 rounded-lg text-[10px] text-ink-secondary hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.clear_selection", "Limpiar selección")}>{t("timeline.clear", "Limpiar")}</button>
           </div>
@@ -611,7 +632,7 @@ export default function LyricsTimeline({
       ) : (
         <div data-testid="timeline-selection-help" className="flex items-center gap-2 border-b border-white/[0.06] bg-surface-1/25 px-4 sm:px-5 py-2 text-[10px] text-ink-tertiary">
           <span className="inline-block h-1.5 w-1.5 rounded-full bg-brand-light shadow-glow" aria-hidden="true" />
-          <span>{t("timeline.paint_hint", "Arrastrá el fondo o la lista de letras para seleccionar varias líneas")}</span>
+          <span>{t("timeline.paint_hint", "Papelera: elimina una línea · Arrastrá el fondo: seleccioná varias para moverlas o eliminarlas")}</span>
         </div>
       )}
       <p aria-live="polite" className="sr-only">{limitFeedback}</p>
@@ -675,6 +696,19 @@ export default function LyricsTimeline({
                     <span className={`min-w-0 flex-1 truncate text-[11px] ${isActive ? "font-medium text-white" : "text-ink-secondary"}`}>{segment.text || "Línea sin texto"}</span>
                     {isActive && <span className="hidden shrink-0 text-[8px] font-semibold uppercase tracking-[0.12em] text-cyan-200 xl:inline">{isPlaying ? t("timeline.playing", "Sonando") : t("timeline.current", "Actual")}</span>}
                     <span className="shrink-0 text-[9px] tabular-nums text-ink-tertiary">{fmt(segment.start)}</span>
+                    <button
+                      type="button"
+                      data-testid="timeline-delete-line"
+                      onPointerDown={(event) => event.stopPropagation()}
+                      onClick={(event) => deleteLine(event, segment._id)}
+                      aria-label={`${t("timeline.delete_line", "Eliminar línea")} ${index + 1}`}
+                      title={t("timeline.delete_line_hint", "Eliminar esta línea")}
+                      className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-red-300/70 ring-1 ring-transparent transition-colors hover:bg-red-400/12 hover:text-red-200 hover:ring-red-300/20 focus-visible:bg-red-400/12 focus-visible:text-red-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-200"
+                    >
+                      <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5m4-5v5" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </button>
                   </div>
                 );
               })}

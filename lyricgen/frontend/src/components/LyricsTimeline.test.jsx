@@ -145,8 +145,21 @@ describe("LyricsTimeline", () => {
     fireEvent.pointerDown(first, { clientX: 100, pointerId: 1, button: 0, metaKey: true });
     fireEvent.pointerDown(second, { clientX: 900, pointerId: 2, button: 0, ctrlKey: true });
 
-    fireEvent.click(screen.getByRole("button", { name: "Eliminar" }));
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar 2 líneas" }));
     expect(props.onDeleteSelection).toHaveBeenCalledWith([0, 1]);
+  });
+
+  it("deletes one line directly from its visible row action without selecting it first", () => {
+    const props = setup();
+    const deleteButtons = screen.getAllByTestId("timeline-delete-line");
+
+    expect(deleteButtons).toHaveLength(3);
+    expect(deleteButtons[1]).toHaveAccessibleName("Eliminar línea 2");
+    fireEvent.pointerDown(deleteButtons[1], { pointerId: 1, button: 0 });
+    fireEvent.click(deleteButtons[1]);
+
+    expect(props.onDeleteSelection).toHaveBeenCalledWith([1]);
+    expect(screen.queryByText("1 línea")).not.toBeInTheDocument();
   });
 
   it("supports Delete from a focused timing block but ignores editable text", () => {
@@ -169,6 +182,7 @@ describe("LyricsTimeline", () => {
     const help = screen.getByTestId("timeline-selection-help");
     const block = screen.getAllByTestId("timeline-segment")[0];
     const edge = block.querySelector('[data-testid="timeline-edge-end"]');
+    expect(help).toHaveTextContent("Papelera: elimina una línea");
     expect(help).toHaveTextContent("Arrastrá el fondo");
     expect(block.className).toContain("cursor-grab");
     expect(edge.className).toContain("cursor-ew-resize");

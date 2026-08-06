@@ -151,18 +151,27 @@ test.describe("lyrics editor browser contract", () => {
     await expect.poll(async () => lines.nth(0).evaluate((element) => parseFloat(element.style.left))).toBeCloseTo(before, 1);
   });
 
-  test("deletes selected timing lines and restores them with undo", async ({ page }) => {
+  test("deletes a timing line directly or as a selection and restores with undo", async ({ page }) => {
     const harness = await installEditorHarness(page);
     await harness.open();
     await openAdvanced(page);
 
     const lines = page.getByTestId("timeline-segment");
     const modifier = modifierForCurrentPlatform();
+    const deleteLineButtons = page.getByTestId("timeline-delete-line");
+
+    await expect(deleteLineButtons).toHaveCount(DEFAULT_SEGMENTS.length);
+    await expect(deleteLineButtons.nth(0)).toHaveAccessibleName("Eliminar línea 1");
+    await deleteLineButtons.nth(0).click();
+    await expect(lines).toHaveCount(DEFAULT_SEGMENTS.length - 1);
+    await page.keyboard.press(`${modifier}+z`);
+    await expect(lines).toHaveCount(DEFAULT_SEGMENTS.length);
+
     await lines.nth(0).click({ modifiers: [modifier] });
     await lines.nth(1).click({ modifiers: [modifier] });
     await selectionCount(page, 2);
     page.once("dialog", (dialog) => dialog.accept());
-    await page.getByRole("button", { name: "Eliminar" }).click();
+    await page.getByRole("button", { name: "Eliminar 2 líneas" }).click();
     await expect(lines).toHaveCount(DEFAULT_SEGMENTS.length - 2);
     await page.keyboard.press(`${modifier}+z`);
     await expect(lines).toHaveCount(DEFAULT_SEGMENTS.length);
@@ -180,16 +189,26 @@ test.describe("lyrics editor browser contract", () => {
     const pxPerSec = Number(await lane.getAttribute("data-px-per-sec"));
     expect(rulerBox).not.toBeNull();
     expect(laneBox).not.toBeNull();
+    const rows = page.getByTestId("timeline-label-row");
+    await page.getByTestId("timeline-segment").nth(2).click({ modifiers: [modifierForCurrentPlatform()] });
+    await expect(rows.nth(2)).toHaveAttribute("data-selected", "true");
+
     await ruler.click({ position: { x: (laneBox.x - rulerBox.x) + 1.3 * pxPerSec, y: rulerBox.height / 2 } });
 
-    const rows = page.getByTestId("timeline-label-row");
     await expect(rows.nth(1)).toHaveAttribute("data-active", "true");
     await page.getByRole("button", { name: "Reproducir" }).click();
     await expect(rows.nth(1)).toHaveAttribute("data-playing", "true");
     await expect(rows.nth(1)).toContainText("Sonando");
-
-    await page.getByTestId("timeline-segment").nth(2).click({ modifiers: [modifierForCurrentPlatform()] });
-    await expect(rows.nth(2)).toHaveAttribute("data-selected", "true");
+    // Freeze the short synthetic fixture before testing selection colors.
+    // Otherwise it can naturally advance to another 600 ms line while the
+    // browser assertions run, making playback timing part of a color test.
+    await page.getByRole("button", { name: "Pausar" }).click();
+    await expect(rows.nth(1)).toHaveAttribute("data-playing", "false");
+    await page.locator("audio").evaluate((audio) => {
+      audio.currentTime = 1.3;
+      audio.dispatchEvent(new Event("timeupdate"));
+    });
+    await expect(rows.nth(1)).toHaveAttribute("data-active", "true");
     await expect(rows.nth(2)).toHaveAttribute("data-active", "false");
     await expect(rows.nth(1)).toHaveClass(/bg-cyan/);
     await expect(rows.nth(2)).toHaveClass(/bg-brand/);
