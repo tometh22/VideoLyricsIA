@@ -47,6 +47,8 @@ async function revision(request, token) {
   return await response.json();
 }
 
+const firstLyricsInput = (page) => page.getByRole("textbox", { name: "Letra de la línea 1" });
+
 test.describe("Editor 2.0 real collaboration", () => {
   test.skip(!ENABLED, "requires the real API/PostgreSQL CI job");
 
@@ -55,33 +57,33 @@ test.describe("Editor 2.0 real collaboration", () => {
     const tokenB = await login(request, "editor_e2e_b");
     const a = await openEditor(browser, tokenA);
 
-    await a.page.getByDisplayValue("Primera línea").fill("Edición de A");
+    await firstLyricsInput(a.page).fill("Edición de A");
     await expect.poll(async () => (await revision(request, tokenA)).revision).toBe(1);
 
     const b = await openEditor(browser, tokenB);
-    await expect(b.page.getByDisplayValue("Edición de A")).toBeVisible();
-    await b.page.getByDisplayValue("Edición de A").fill("Edición de B");
+    await expect(firstLyricsInput(b.page)).toHaveValue("Edición de A");
+    await firstLyricsInput(b.page).fill("Edición de B");
     await expect.poll(async () => (await revision(request, tokenB)).revision).toBe(2);
 
-    await a.page.getByDisplayValue("Edición de A").fill("A queda local");
+    await firstLyricsInput(a.page).fill("A queda local");
     await expect(a.page.getByRole("dialog", { name: /Hay una versión más nueva/ })).toBeVisible();
     await a.page.getByRole("button", { name: "Usar versión del equipo" }).click();
-    await expect(a.page.getByDisplayValue("Edición de B")).toBeVisible();
+    await expect(firstLyricsInput(a.page)).toHaveValue("Edición de B");
 
     await a.context.setOffline(true);
-    await a.page.getByDisplayValue("Edición de B").fill("A segunda versión local");
-    await b.page.getByDisplayValue("Edición de B").fill("B vuelve a guardar");
+    await firstLyricsInput(a.page).fill("A segunda versión local");
+    await firstLyricsInput(b.page).fill("B vuelve a guardar");
     await expect.poll(async () => (await revision(request, tokenB)).revision).toBe(3);
     await a.context.setOffline(false);
     await expect(a.page.getByRole("dialog", { name: /Hay una versión más nueva/ })).toBeVisible();
     await a.page.getByRole("button", { name: "Guardar mi versión como nueva revisión" }).click();
     await expect.poll(async () => (await revision(request, tokenA)).revision).toBe(4);
-    await expect(a.page.getByDisplayValue("A segunda versión local")).toBeVisible();
+    await expect(firstLyricsInput(a.page)).toHaveValue("A segunda versión local");
 
     await a.page.reload();
     await expect(a.page.getByRole("button", { name: /4 Lyrics/ })).toBeVisible();
     await a.page.getByRole("button", { name: /4 Lyrics/ }).click();
-    await expect(a.page.getByDisplayValue("A segunda versión local")).toBeVisible();
+    await expect(firstLyricsInput(a.page)).toHaveValue("A segunda versión local");
     await a.page.getByRole("tab", { name: "Ajustar tiempos" }).click();
     await a.page.getByTestId("editor-overflow-btn").click();
     await a.page.getByRole("menuitem", { name: /Historial de versiones/ }).click();
