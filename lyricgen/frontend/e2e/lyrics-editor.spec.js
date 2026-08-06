@@ -151,18 +151,27 @@ test.describe("lyrics editor browser contract", () => {
     await expect.poll(async () => lines.nth(0).evaluate((element) => parseFloat(element.style.left))).toBeCloseTo(before, 1);
   });
 
-  test("deletes selected timing lines and restores them with undo", async ({ page }) => {
+  test("deletes a timing line directly or as a selection and restores with undo", async ({ page }) => {
     const harness = await installEditorHarness(page);
     await harness.open();
     await openAdvanced(page);
 
     const lines = page.getByTestId("timeline-segment");
     const modifier = modifierForCurrentPlatform();
+    const deleteLineButtons = page.getByTestId("timeline-delete-line");
+
+    await expect(deleteLineButtons).toHaveCount(DEFAULT_SEGMENTS.length);
+    await expect(deleteLineButtons.nth(0)).toHaveAccessibleName("Eliminar línea 1");
+    await deleteLineButtons.nth(0).click();
+    await expect(lines).toHaveCount(DEFAULT_SEGMENTS.length - 1);
+    await page.keyboard.press(`${modifier}+z`);
+    await expect(lines).toHaveCount(DEFAULT_SEGMENTS.length);
+
     await lines.nth(0).click({ modifiers: [modifier] });
     await lines.nth(1).click({ modifiers: [modifier] });
     await selectionCount(page, 2);
     page.once("dialog", (dialog) => dialog.accept());
-    await page.getByRole("button", { name: "Eliminar" }).click();
+    await page.getByRole("button", { name: "Eliminar 2 líneas" }).click();
     await expect(lines).toHaveCount(DEFAULT_SEGMENTS.length - 2);
     await page.keyboard.press(`${modifier}+z`);
     await expect(lines).toHaveCount(DEFAULT_SEGMENTS.length);
@@ -180,16 +189,26 @@ test.describe("lyrics editor browser contract", () => {
     const pxPerSec = Number(await lane.getAttribute("data-px-per-sec"));
     expect(rulerBox).not.toBeNull();
     expect(laneBox).not.toBeNull();
+    const rows = page.getByTestId("timeline-label-row");
+    await page.getByTestId("timeline-segment").nth(2).click({ modifiers: [modifierForCurrentPlatform()] });
+    await expect(rows.nth(2)).toHaveAttribute("data-selected", "true");
+
     await ruler.click({ position: { x: (laneBox.x - rulerBox.x) + 1.3 * pxPerSec, y: rulerBox.height / 2 } });
 
-    const rows = page.getByTestId("timeline-label-row");
     await expect(rows.nth(1)).toHaveAttribute("data-active", "true");
     await page.getByRole("button", { name: "Reproducir" }).click();
     await expect(rows.nth(1)).toHaveAttribute("data-playing", "true");
     await expect(rows.nth(1)).toContainText("Sonando");
-
-    await page.getByTestId("timeline-segment").nth(2).click({ modifiers: [modifierForCurrentPlatform()] });
-    await expect(rows.nth(2)).toHaveAttribute("data-selected", "true");
+    // Freeze the short synthetic fixture before testing selection colors.
+    // Otherwise it can naturally advance to another 600 ms line while the
+    // browser assertions run, making playback timing part of a color test.
+    await page.getByRole("button", { name: "Pausar" }).click();
+    await expect(rows.nth(1)).toHaveAttribute("data-playing", "false");
+    await page.locator("audio").evaluate((audio) => {
+      audio.currentTime = 1.3;
+      audio.dispatchEvent(new Event("timeupdate"));
+    });
+    await expect(rows.nth(1)).toHaveAttribute("data-active", "true");
     await expect(rows.nth(2)).toHaveAttribute("data-active", "false");
     await expect(rows.nth(1)).toHaveClass(/bg-cyan/);
     await expect(rows.nth(2)).toHaveClass(/bg-brand/);
@@ -247,7 +266,7 @@ test.describe("lyrics editor browser contract", () => {
     expect(Number(saved.end)).toBeLessThanOrEqual(2.65 + Number.EPSILON * 4);
   });
 
-  test("keeps short-line geometry real while handles remain easy to hit", async ({ page }) => {
+  test("moves a short line from its body while resize handles stay outside", async ({ page }) => {
     const harness = await installEditorHarness(page, {
       segments: [
         { _id: "short", start: 0.4, end: 0.7, text: "Oh" },
@@ -260,8 +279,27 @@ test.describe("lyrics editor browser contract", () => {
     const width = await block.evaluate((element) => parseFloat(element.style.width));
     const zoom = Number(await page.getByTestId("timeline-lane").getAttribute("data-px-per-sec"));
     expect(width).toBeCloseTo(0.3 * zoom, 1);
-    await expect(block.getByTestId("timeline-edge-start")).toHaveCSS("width", "22px");
-    await expect(block.getByTestId("timeline-edge-end")).toHaveCSS("width", "22px");
+    const body = block.getByTestId("timeline-segment-body");
+    const startEdge = block.getByTestId("timeline-edge-start");
+    const endEdge = block.getByTestId("timeline-edge-end");
+    await expect(body).toHaveCSS("width", "28px");
+    await expect(startEdge).toHaveCSS("width", "22px");
+    await expect(endEdge).toHaveCSS("width", "22px");
+
+    const beforeLeft = await block.evaluate((element) => parseFloat(element.style.left));
+    const bodyBox = await body.boundingBox();
+    const startBox = await startEdge.boundingBox();
+    const endBox = await endEdge.boundingBox();
+    expect(bodyBox).not.toBeNull();
+    expect(startBox.x + startBox.width).toBeLessThanOrEqual(bodyBox.x + 0.5);
+    expect(endBox.x).toBeGreaterThanOrEqual(bodyBox.x + bodyBox.width - 0.5);
+
+    await drag(
+      page,
+      { x: bodyBox.x + bodyBox.width / 2, y: bodyBox.y + bodyBox.height / 2 },
+      { x: bodyBox.x + bodyBox.width / 2 + 12, y: bodyBox.y + bodyBox.height / 2 },
+    );
+    await expect.poll(async () => block.evaluate((element) => parseFloat(element.style.left))).toBeGreaterThan(beforeLeft + 8);
   });
 
   test("supports keyboard tabs and accessible selection nudges", async ({ page }) => {
@@ -278,6 +316,29 @@ test.describe("lyrics editor browser contract", () => {
     const before = await block.evaluate((element) => parseFloat(element.style.left));
     await page.keyboard.press("ArrowRight");
     await expect.poll(async () => block.evaluate((element) => parseFloat(element.style.left))).toBeGreaterThan(before);
+  });
+
+  test("keeps the typography warning visible and allows approval from the bottom of the editor", async ({ page }) => {
+    const longLine = Array.from({ length: 80 }, () => "palabra").join(" ");
+    const harness = await installEditorHarness(page, {
+      segments: [{ _id: "oversized", start: 1, end: 8, text: `${longLine}.` }],
+    });
+    await harness.open();
+    await page.getByLabel("Letra de la línea 1").fill(longLine);
+
+    const panel = page.locator(".wizard-controls-panel");
+    await panel.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+    await page.getByRole("button", { name: /Aprobar y generar/i }).click();
+
+    const dialog = page.getByRole("dialog", { name: /Una línea puede ocupar 3 renglones/i });
+    await expect(dialog).toBeVisible();
+    const box = await dialog.boundingBox();
+    expect(box).not.toBeNull();
+    expect(box.y).toBeGreaterThanOrEqual(0);
+    expect(box.y + box.height).toBeLessThanOrEqual(page.viewportSize().height);
+
+    await dialog.getByRole("button", { name: "Aprobar igualmente" }).click();
+    await expect.poll(() => harness.approvals.length).toBe(1);
   });
 
   test("uses the durable editor contract when editor_v2 is enabled", async ({ page }) => {

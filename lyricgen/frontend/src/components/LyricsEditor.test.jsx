@@ -276,6 +276,45 @@ describe("LyricsEditor — advanced shell and timing safety", () => {
   });
 });
 
+describe("LyricsEditor — aprobación con advertencia de tipografía", () => {
+  const oversizedLine = Array.from({ length: 80 }, () => "palabra").join(" ");
+
+  it("muestra la decisión en un diálogo visible y permite aprobar igualmente", async () => {
+    const onApprove = vi.fn();
+    render(<LyricsEditor {...baseProps({
+      segments: [{ start: 1, end: 8, text: oversizedLine }],
+      fontScale: 1.5,
+      disableAutoSplit: true,
+      onApprove,
+    })} />);
+
+    await userEvent.click(screen.getByRole("button", { name: /Aprobar y generar/i }));
+
+    const dialog = screen.getByRole("dialog", { name: /Una línea puede ocupar 3 renglones/i });
+    expect(dialog).toBeVisible();
+    expect(dialog.parentElement.className).toContain("fixed");
+    expect(onApprove).not.toHaveBeenCalled();
+
+    await userEvent.click(within(dialog).getByRole("button", { name: "Aprobar igualmente" }));
+    expect(onApprove).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("dialog", { name: /puede ocupar 3 renglones/i })).toBeNull();
+  });
+
+  it("permite volver a revisar sin perder la línea afectada", async () => {
+    render(<LyricsEditor {...baseProps({
+      segments: [{ start: 1, end: 8, text: oversizedLine }],
+      fontScale: 1.5,
+      disableAutoSplit: true,
+    })} />);
+
+    await userEvent.click(screen.getByRole("button", { name: /Aprobar y generar/i }));
+    await userEvent.click(screen.getByRole("button", { name: "Seguir revisando" }));
+
+    expect(screen.queryByRole("dialog", { name: /puede ocupar 3 renglones/i })).toBeNull();
+    expect(screen.getByDisplayValue(oversizedLine)).toBeInTheDocument();
+  });
+});
+
 describe("LyricsEditor — structural mutations share undo and save behavior", () => {
   const structuralProps = (overrides = {}) => baseProps({
     segments: [

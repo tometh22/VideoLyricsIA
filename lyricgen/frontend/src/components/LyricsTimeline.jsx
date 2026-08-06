@@ -23,6 +23,7 @@ const ROW_H = 48;
 const WAVE_H = 46;
 const MIN_BLOCK_PX = 2;
 const EDGE_PX = 22;
+const MOVE_HIT_MIN_PX = 28;
 const MIN_DUR_S = 0.3;
 const CLICK_SLOP_PX = 5;
 const FOLLOW_SUPPRESS_MS = 2500;
@@ -492,6 +493,21 @@ export default function LyricsTimeline({
     if (deleted !== false) clearSelection();
   }, [clearSelection, editingTextId, onDeleteSelection, selectedIds]);
 
+  const deleteLine = useCallback((event, id) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const deleted = onDeleteSelection?.([id]);
+    if (deleted !== false) {
+      setSelectedIds((previous) => {
+        if (!previous.has(id)) return previous;
+        const next = new Set(previous);
+        next.delete(id);
+        return next;
+      });
+      if (selectionAnchorRef.current === id) selectionAnchorRef.current = null;
+    }
+  }, [onDeleteSelection]);
+
   const handleKeyDown = (event) => {
     if (event.key === "Escape") clearSelection();
     const targetIsEditable = ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(event.target?.tagName)
@@ -601,9 +617,15 @@ export default function LyricsTimeline({
               type="button"
               onClick={deleteSelection}
               aria-keyshortcuts="Delete Backspace"
-              className="h-7 rounded-lg px-2.5 text-[10px] font-medium text-red-300 hover:bg-red-400/10 hover:text-red-200"
+              className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-red-400/10 px-3 text-[10px] font-semibold text-red-200 ring-1 ring-red-300/20 transition-colors hover:bg-red-400/20 hover:ring-red-300/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-200"
             >
-              {t("timeline.delete_selection", "Eliminar")}
+              <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5m4-5v5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              {(selectedIds.size === 1
+                ? t("timeline.delete_selected_one", "Eliminar 1 línea")
+                : t("timeline.delete_selected_many", "Eliminar {n} líneas")
+              ).replace("{n}", selectedIds.size)}
             </button>
             <button type="button" onClick={clearSelection} className="h-7 px-2.5 rounded-lg text-[10px] text-ink-secondary hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.clear_selection", "Limpiar selección")}>{t("timeline.clear", "Limpiar")}</button>
           </div>
@@ -611,7 +633,7 @@ export default function LyricsTimeline({
       ) : (
         <div data-testid="timeline-selection-help" className="flex items-center gap-2 border-b border-white/[0.06] bg-surface-1/25 px-4 sm:px-5 py-2 text-[10px] text-ink-tertiary">
           <span className="inline-block h-1.5 w-1.5 rounded-full bg-brand-light shadow-glow" aria-hidden="true" />
-          <span>{t("timeline.paint_hint", "Arrastrá el fondo o la lista de letras para seleccionar varias líneas")}</span>
+          <span>{t("timeline.paint_hint", "Papelera: elimina una línea · Arrastrá el fondo: seleccioná varias para moverlas o eliminarlas")}</span>
         </div>
       )}
       <p aria-live="polite" className="sr-only">{limitFeedback}</p>
@@ -675,6 +697,19 @@ export default function LyricsTimeline({
                     <span className={`min-w-0 flex-1 truncate text-[11px] ${isActive ? "font-medium text-white" : "text-ink-secondary"}`}>{segment.text || "Línea sin texto"}</span>
                     {isActive && <span className="hidden shrink-0 text-[8px] font-semibold uppercase tracking-[0.12em] text-cyan-200 xl:inline">{isPlaying ? t("timeline.playing", "Sonando") : t("timeline.current", "Actual")}</span>}
                     <span className="shrink-0 text-[9px] tabular-nums text-ink-tertiary">{fmt(segment.start)}</span>
+                    <button
+                      type="button"
+                      data-testid="timeline-delete-line"
+                      onPointerDown={(event) => event.stopPropagation()}
+                      onClick={(event) => deleteLine(event, segment._id)}
+                      aria-label={`${t("timeline.delete_line", "Eliminar línea")} ${index + 1}`}
+                      title={t("timeline.delete_line_hint", "Eliminar esta línea")}
+                      className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-red-300/70 ring-1 ring-transparent transition-colors hover:bg-red-400/12 hover:text-red-200 hover:ring-red-300/20 focus-visible:bg-red-400/12 focus-visible:text-red-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-200"
+                    >
+                      <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5m4-5v5" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </button>
                   </div>
                 );
               })}
@@ -702,6 +737,8 @@ export default function LyricsTimeline({
               const start = previewItem?.start ?? segment.start;
               const end = previewItem?.end ?? segment.end;
               const width = Math.max(MIN_BLOCK_PX, (end - start) * pxPerSec);
+              const moveHitWidth = Math.max(width, MOVE_HIT_MIN_PX);
+              const moveHitOverflow = (moveHitWidth - width) / 2;
               const isSelected = selectedIds.has(segment._id);
               const isActive = activeId === segment._id;
               const isFocused = focusedSegId === segment._id;
@@ -717,10 +754,6 @@ export default function LyricsTimeline({
                   aria-label={`Línea ${index + 1}: ${segment.text}. ${fmt(start)} a ${fmt(end)}`}
                   className={`absolute z-10 cursor-grab active:cursor-grabbing rounded-lg ring-1 transition-all select-none ${isSelected ? "bg-brand/30" : isActive ? "bg-cyan-400/25 shadow-[0_0_22px_rgba(34,211,238,.16)]" : "bg-surface-3/95"} ${isSelected ? "ring-2 ring-brand-light shadow-[0_0_0_3px_rgba(139,92,246,.13)]" : isActive ? "ring-cyan-300/60" : "ring-white/[0.18] hover:ring-white/[0.32]"} ${isFocused ? "outline outline-1 outline-white/80" : ""} ${isRecent ? "ring-accent" : ""}`}
                   style={{ left: start * pxPerSec, top: index * ROW_H + 7, width, height: ROW_H - 14, touchAction: "none", scrollMarginLeft: LABEL_W + 12 }}
-                  onPointerDown={(event) => startDrag(event, segment, "move")}
-                  onPointerMove={updateDrag}
-                  onPointerUp={(event) => finishDrag(event, segment)}
-                  onPointerCancel={cancelPointerInteraction}
                   onClick={(event) => event.stopPropagation()}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" || event.key === " ") {
@@ -729,16 +762,29 @@ export default function LyricsTimeline({
                     }
                   }}
                 >
-                  <div data-testid="timeline-edge-start" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, left: -EDGE_PX / 2 }} title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea")} onPointerDown={(event) => startDrag(event, segment, "start")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
-                    <span className="absolute inset-y-1 left-1/2 w-1 -translate-x-1/2 rounded-full bg-brand-light/55 transition-all group-hover/edge:inset-y-0.5 group-hover/edge:bg-white group-hover/edge:shadow-[0_0_8px_rgba(255,255,255,.7)]" />
-                  </div>
-                  <div data-testid="timeline-edge-end" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, right: -EDGE_PX / 2 }} title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea")} onPointerDown={(event) => startDrag(event, segment, "end")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
-                    <span className="absolute inset-y-1 left-1/2 w-1 -translate-x-1/2 rounded-full bg-brand-light/55 transition-all group-hover/edge:inset-y-0.5 group-hover/edge:bg-white group-hover/edge:shadow-[0_0_8px_rgba(255,255,255,.7)]" />
-                  </div>
                   <div
                     data-testid="timeline-segment-body"
-                    className="flex items-center gap-2 h-full px-3 pl-4 pointer-events-none cursor-grab active:cursor-grabbing"
+                    className="absolute bottom-0 top-0 left-1/2 z-30 cursor-grab active:cursor-grabbing"
+                    style={{ width: moveHitWidth, transform: "translateX(-50%)", touchAction: "none" }}
                     title={t("timeline.move_range_hint", "Arrastrá para mover · Shift+click selecciona un rango")}
+                    onPointerDown={(event) => startDrag(event, segment, "move")}
+                    onPointerMove={updateDrag}
+                    onPointerUp={(event) => finishDrag(event, segment)}
+                    onPointerCancel={cancelPointerInteraction}
+                    onDoubleClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      startTextEdit(segment);
+                    }}
+                  />
+                  <div data-testid="timeline-edge-start" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, left: -(moveHitOverflow + EDGE_PX), touchAction: "none" }} title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea")} onPointerDown={(event) => startDrag(event, segment, "start")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
+                    <span className="absolute inset-y-1 right-0 w-1 rounded-full bg-brand-light/70 transition-all group-hover/edge:inset-y-0.5 group-hover/edge:bg-white group-hover/edge:shadow-[0_0_8px_rgba(255,255,255,.7)]" />
+                  </div>
+                  <div data-testid="timeline-edge-end" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, right: -(moveHitOverflow + EDGE_PX), touchAction: "none" }} title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea")} onPointerDown={(event) => startDrag(event, segment, "end")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
+                    <span className="absolute inset-y-1 left-0 w-1 rounded-full bg-brand-light/70 transition-all group-hover/edge:inset-y-0.5 group-hover/edge:bg-white group-hover/edge:shadow-[0_0_8px_rgba(255,255,255,.7)]" />
+                  </div>
+                  <div
+                    className={`absolute inset-0 flex items-center gap-2 px-3 pl-4 pointer-events-none ${editingTextId === segment._id ? "z-40" : "z-10"}`}
                   >
                     {width >= 54 && <span className="text-[9px] text-ink-tertiary tabular-nums shrink-0">{fmt(start)}</span>}
                     {editingTextId === segment._id ? (
