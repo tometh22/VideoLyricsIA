@@ -14,14 +14,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 
-const ZOOM_DEFAULT = 90;
+const ZOOM_DEFAULT = 48;
 const ZOOM_MIN = 8;
 const ZOOM_MAX = 260;
 const ZOOM_STEP = 20;
 const ROW_H = 48;
 const WAVE_H = 46;
-const MIN_BLOCK_PX = 56;
-const EDGE_PX = 9;
+const MIN_BLOCK_PX = 48;
+const EDGE_PX = 16;
 const MIN_DUR_S = 0.3;
 const CLICK_SLOP_PX = 5;
 const FOLLOW_SUPPRESS_MS = 2500;
@@ -88,7 +88,6 @@ export default function LyricsTimeline({
   const i18n = useI18n?.() || {};
   const t = (key, fallback) => i18n.t?.(key) || fallback || key;
   const scrollRef = useRef(null);
-  const surfaceRef = useRef(null);
   const trackRef = useRef(null);
   const canvasRef = useRef(null);
   const dragRef = useRef(null);
@@ -98,7 +97,7 @@ export default function LyricsTimeline({
   const selectionAnchorRef = useRef(null);
   const lastInteractionRef = useRef(0);
   const clickSuppressRef = useRef(false);
-  const autoFitKeyRef = useRef(null);
+  const activeRowRefs = useRef(new Map());
   const [viewportWidth, setViewportWidth] = useState(0);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [marquee, setMarquee] = useState(null);
@@ -116,6 +115,7 @@ export default function LyricsTimeline({
   const surfaceWidth = LABEL_W + trackWidth;
   const trackHeight = Math.max(ROW_H, normalizedSegments.length * ROW_H);
   const rowOfId = useMemo(() => new Map(normalizedSegments.map((s, index) => [s._id, index])), [normalizedSegments]);
+  const activeRowIndex = activeId == null ? null : rowOfId.get(activeId);
   const ticks = useMemo(() => {
     const step = nearestTick(120 / pxPerSec);
     const out = [];
@@ -151,14 +151,6 @@ export default function LyricsTimeline({
   const fitZoom = useCallback(() => (
     clamp((Math.max(viewportWidth, 960) - LABEL_W - 24) / Math.max(total, 1), ZOOM_MIN, ZOOM_MAX)
   ), [total, viewportWidth]);
-
-  useEffect(() => {
-    if (!viewportWidth || !total) return;
-    const fitKey = `${Number(duration) || 0}:${normalizedSegments.length}`;
-    if (autoFitKeyRef.current === fitKey) return;
-    autoFitKeyRef.current = fitKey;
-    setPxPerSec(fitZoom());
-  }, [duration, fitZoom, normalizedSegments.length, total, viewportWidth]);
 
   useEffect(() => {
     const valid = new Set(normalizedSegments.map((s) => s._id));
@@ -300,7 +292,7 @@ export default function LyricsTimeline({
     };
     event.currentTarget.setPointerCapture?.(event.pointerId);
     markInteraction();
-    setPreview(movingGroup ? { changes: snapshots } : { id: segment._id, start: segment.start, end: segment.end });
+    setPreview(movingGroup ? { changes: snapshots, mode } : { id: segment._id, start: segment.start, end: segment.end, mode });
   }, [markInteraction, normalizedSegments, pxPerSec, selectRangeTo, selectedIds, toggleSelection]);
 
   const updateDrag = useCallback((event) => {
@@ -321,7 +313,7 @@ export default function LyricsTimeline({
       const minStart = Math.min(...drag.snapshots.map((item) => item.start));
       const maxEnd = Math.max(...drag.snapshots.map((item) => item.end));
       const safeDelta = clamp(delta, -minStart, total - maxEnd);
-      setPreview({ changes: drag.snapshots.map((item) => ({ id: item.id, start: item.start + safeDelta, end: item.end + safeDelta })) });
+      setPreview({ changes: drag.snapshots.map((item) => ({ id: item.id, start: item.start + safeDelta, end: item.end + safeDelta })), mode: drag.mode });
       return;
     }
     let start = drag.origStart;
@@ -333,7 +325,7 @@ export default function LyricsTimeline({
       start = clamp(drag.origStart + delta, 0, total - durationS);
       end = start + durationS;
     }
-    setPreview({ id: drag.id, start, end });
+    setPreview({ id: drag.id, start, end, mode: drag.mode });
   }, [onDragStart, total, updateMarquee]);
 
   const finishDrag = useCallback((event, segment) => {
@@ -402,6 +394,12 @@ export default function LyricsTimeline({
   useEffect(() => {
     if (isPlaying && followEnabled) scrollToPlayhead();
   }, [isPlaying, followEnabled, scrollToPlayhead]);
+
+  useEffect(() => {
+    if (!isPlaying || !followEnabled || followSuppressed || activeId == null) return;
+    const row = activeRowRefs.current.get(activeId);
+    row?.scrollIntoView?.({ block: "center", inline: "nearest", behavior: "smooth" });
+  }, [activeId, followEnabled, followSuppressed, isPlaying]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -533,8 +531,15 @@ export default function LyricsTimeline({
         </div>
       )}
 
-      <div ref={scrollRef} data-testid="timeline-scroll" className="overflow-auto overscroll-contain" style={{ maxHeight: focusMode ? "calc(100vh - 220px)" : "min(620px, calc(100vh - 300px))", scrollPaddingLeft: LABEL_W + 12 }}>
-        <div ref={surfaceRef} className="relative min-w-full" style={{ width: surfaceWidth }}>
+      <div
+        ref={scrollRef}
+        data-testid="timeline-scroll"
+        data-scroll-owner="horizontal-only"
+        className="overflow-x-auto overflow-y-hidden overscroll-x-contain"
+        style={{ scrollPaddingLeft: LABEL_W + 12 }}
+        onWheel={markInteraction}
+      >
+        <div className="relative min-w-full" style={{ width: surfaceWidth }}>
           <div data-testid="timeline-ruler" className="relative h-9 border-b border-white/[0.06] bg-surface-1/90">
             <div className="sticky left-0 z-40 flex h-full items-center border-r border-white/[0.08] bg-surface-1/95 px-4 text-[9px] font-semibold uppercase tracking-[0.16em] text-ink-tertiary" style={{ width: LABEL_W }}>{t("timeline.lyrics_rail", "Letras")}</div>
             <div className="absolute inset-y-0 cursor-pointer" style={{ left: LABEL_W, width: trackWidth }} onClick={(event) => seekAt(event.clientX)}>
@@ -563,16 +568,26 @@ export default function LyricsTimeline({
                 return (
                   <div
                     key={`label-${segment._id}`}
+                    ref={(node) => {
+                      if (node) activeRowRefs.current.set(segment._id, node);
+                      else activeRowRefs.current.delete(segment._id);
+                    }}
                     data-testid="timeline-label-row"
-                    className={`absolute left-0 right-0 flex cursor-crosshair items-center gap-2 border-b px-3 transition-colors ${isSelected ? "border-brand/20 bg-brand/15" : "border-white/[0.045] hover:bg-white/[0.035]"}`}
+                    data-active={isActive ? "true" : "false"}
+                    data-playing={isActive && isPlaying ? "true" : "false"}
+                    data-selected={isSelected ? "true" : "false"}
+                    aria-current={isActive ? "true" : undefined}
+                    className={`absolute left-0 right-0 flex cursor-crosshair items-center gap-2 border-b px-3 transition-colors ${isActive ? "border-cyan-300/30 bg-cyan-300/[0.11]" : isSelected ? "border-brand/20 bg-brand/15" : "border-white/[0.045] hover:bg-white/[0.035]"}`}
                     style={{ top: index * ROW_H, height: ROW_H, touchAction: "none" }}
                     title={t("timeline.paint_rows_hint", "Arrastrá para seleccionar varias líneas")}
                     onPointerDown={(event) => beginMarquee(event, segment._id)}
                     onPointerMove={updateMarquee}
                     onPointerUp={finishMarquee}
                   >
-                    <span className={`grid h-5 w-5 shrink-0 place-items-center rounded-md text-[9px] font-semibold tabular-nums ${isSelected ? "bg-brand text-white" : "bg-white/[0.05] text-ink-tertiary"}`}>{index + 1}</span>
+                    {isActive && <span className="absolute inset-y-1.5 left-0 w-0.5 rounded-full bg-cyan-300 shadow-[0_0_10px_rgba(103,232,249,.8)]" aria-hidden="true" />}
+                    <span className={`grid h-5 w-5 shrink-0 place-items-center rounded-md text-[9px] font-semibold tabular-nums ${isActive ? "bg-cyan-300 text-slate-950" : isSelected ? "bg-brand text-white" : "bg-white/[0.05] text-ink-tertiary"}`}>{isActive ? (isPlaying ? "▶" : "•") : index + 1}</span>
                     <span className={`min-w-0 flex-1 truncate text-[11px] ${isActive ? "font-medium text-white" : "text-ink-secondary"}`}>{segment.text || "Línea sin texto"}</span>
+                    {isActive && <span className="hidden shrink-0 text-[8px] font-semibold uppercase tracking-[0.12em] text-cyan-200 xl:inline">{isPlaying ? t("timeline.playing", "Sonando") : t("timeline.current", "Actual")}</span>}
                     <span className="shrink-0 text-[9px] tabular-nums text-ink-tertiary">{fmt(segment.start)}</span>
                   </div>
                 );
@@ -609,15 +624,19 @@ export default function LyricsTimeline({
                   key={segment._id}
                   title={`${fmt(start)} → ${fmt(end)}`}
                   data-testid="timeline-segment"
-                  className={`absolute z-10 cursor-grab active:cursor-grabbing rounded-lg overflow-hidden ring-1 transition-all select-none ${isActive ? "bg-brand/50 shadow-[0_0_22px_rgba(124,58,237,.2)]" : "bg-surface-3/95"} ${isSelected ? "ring-2 ring-brand-light bg-brand/40 shadow-[0_0_0_3px_rgba(139,92,246,.13)]" : "ring-white/[0.18] hover:ring-white/[0.32]"} ${isFocused ? "outline outline-1 outline-white/80" : ""} ${isRecent ? "ring-accent" : ""}`}
+                  className={`absolute z-10 cursor-grab active:cursor-grabbing rounded-lg ring-1 transition-all select-none ${isActive ? "bg-cyan-400/25 shadow-[0_0_22px_rgba(34,211,238,.16)]" : "bg-surface-3/95"} ${isSelected ? "ring-2 ring-brand-light shadow-[0_0_0_3px_rgba(139,92,246,.13)]" : isActive ? "ring-cyan-300/60" : "ring-white/[0.18] hover:ring-white/[0.32]"} ${isFocused ? "outline outline-1 outline-white/80" : ""} ${isRecent ? "ring-accent" : ""}`}
                   style={{ left: start * pxPerSec, top: index * ROW_H + 7, width, height: ROW_H - 14, touchAction: "none", scrollMarginLeft: LABEL_W + 12 }}
                   onPointerDown={(event) => startDrag(event, segment, "move")}
                   onPointerMove={updateDrag}
                   onPointerUp={(event) => finishDrag(event, segment)}
                   onClick={(event) => event.stopPropagation()}
                 >
-                  <div className="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize bg-brand/25 hover:bg-brand/80" title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea")} onPointerDown={(event) => startDrag(event, segment, "start")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} />
-                  <div data-testid="timeline-edge-end" className="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize bg-brand/25 hover:bg-brand/80" title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea")} onPointerDown={(event) => startDrag(event, segment, "end")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} />
+                  <div data-testid="timeline-edge-start" className="group/edge absolute left-0 top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX }} title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea")} onPointerDown={(event) => startDrag(event, segment, "start")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)}>
+                    <span className="absolute inset-y-1 left-1 w-1 rounded-full bg-brand-light/55 transition-all group-hover/edge:inset-y-0.5 group-hover/edge:bg-white group-hover/edge:shadow-[0_0_8px_rgba(255,255,255,.7)]" />
+                  </div>
+                  <div data-testid="timeline-edge-end" className="group/edge absolute right-0 top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX }} title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea")} onPointerDown={(event) => startDrag(event, segment, "end")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)}>
+                    <span className="absolute inset-y-1 right-1 w-1 rounded-full bg-brand-light/55 transition-all group-hover/edge:inset-y-0.5 group-hover/edge:bg-white group-hover/edge:shadow-[0_0_8px_rgba(255,255,255,.7)]" />
+                  </div>
                   <div
                     data-testid="timeline-segment-body"
                     className="flex items-center gap-2 h-full px-3 pl-4 pointer-events-none cursor-grab active:cursor-grabbing"
@@ -643,6 +662,11 @@ export default function LyricsTimeline({
                       <span className="min-w-0 truncate text-xs text-white/90 pointer-events-auto cursor-text" onDoubleClick={(event) => { event.stopPropagation(); startTextEdit(segment); }} title={`${segment.text}\n\n— Doble-click para corregir`}>{segment.text}</span>
                     )}
                   </div>
+                  {previewItem && (preview?.mode === "start" || preview?.mode === "end") && (
+                    <span className="pointer-events-none absolute -top-7 right-0 z-40 rounded-md bg-black/90 px-2 py-1 text-[9px] font-medium text-white shadow-xl ring-1 ring-white/[0.12] tabular-nums whitespace-nowrap">
+                      {fmt(start)} → {fmt(end)}
+                    </span>
+                  )}
                 </div>
               );
             })}
@@ -664,9 +688,12 @@ export default function LyricsTimeline({
               <div className="absolute z-20 rounded-lg bg-brand/15 ring-1 ring-brand/70 pointer-events-none" style={{ left: marquee.anchorId != null ? 0 : Math.min(marquee.originX, marquee.currentX) - (trackRef.current?.getBoundingClientRect().left || 0), top: Math.min(marquee.originY, marquee.currentY) - (trackRef.current?.getBoundingClientRect().top || 0), width: marquee.anchorId != null ? trackWidth : Math.abs(marquee.currentX - marquee.originX), height: Math.abs(marquee.currentY - marquee.originY) }} aria-hidden="true" />
             )}
 
-            <div className="absolute top-0 bottom-0 z-30 w-px bg-brand-light shadow-[0_0_10px_rgba(167,139,250,.9)] pointer-events-none" style={{ left: currentTime * pxPerSec }}>
-              <span className="absolute -top-1 -left-1.5 w-3 h-3 rounded-full bg-brand-light" />
+            <div data-testid="timeline-playhead" className="absolute top-0 bottom-0 z-30 w-px bg-cyan-200/35 pointer-events-none" style={{ left: currentTime * pxPerSec }}>
+              <span className="absolute -top-1 -left-1.5 w-3 h-3 rounded-full bg-cyan-300 shadow-[0_0_10px_rgba(103,232,249,.8)]" />
             </div>
+            {activeRowIndex != null && (
+              <div data-testid="timeline-active-playhead" className="absolute z-30 w-0.5 bg-cyan-200 shadow-[0_0_10px_rgba(103,232,249,.75)] pointer-events-none" style={{ left: currentTime * pxPerSec, top: activeRowIndex * ROW_H + 4, height: ROW_H - 8 }} aria-hidden="true" />
+            )}
             </div>
           </div>
         </div>

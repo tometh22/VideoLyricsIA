@@ -62,12 +62,20 @@ describe("LyricsTimeline", () => {
     expect(props.onSeek.mock.calls[0][0]).toBeCloseTo(300 / zoom, 2);
   });
 
-  it("fits the timeline to the available width on first render", () => {
+  it("opens at an editing zoom instead of compressing the full song", () => {
     setup();
     const lane = screen.getByTestId("timeline-lane");
-    const surface = lane.closest("div[style*='width']");
-    expect(Number(lane.dataset.pxPerSec)).toBeLessThan(90);
-    expect(parseFloat(surface.style.width)).toBeLessThanOrEqual(960);
+    expect(Number(lane.dataset.pxPerSec)).toBe(48);
+    expect(screen.getByRole("button", { name: "Ver canción completa" })).toBeInTheDocument();
+  });
+
+  it("delegates vertical scrolling to the editor and keeps horizontal timeline scroll", () => {
+    setup();
+    const scroll = screen.getByTestId("timeline-scroll");
+    expect(scroll).toHaveAttribute("data-scroll-owner", "horizontal-only");
+    expect(scroll.className).toContain("overflow-x-auto");
+    expect(scroll.className).toContain("overflow-y-hidden");
+    expect(scroll.style.maxHeight).toBe("");
   });
 
   it("clicking a line focuses it and seeks without editing its timing", () => {
@@ -138,6 +146,16 @@ describe("LyricsTimeline", () => {
     expect(help).toHaveTextContent("Arrastrá el fondo");
     expect(block.className).toContain("cursor-grab");
     expect(edge.className).toContain("cursor-ew-resize");
+    expect(edge.style.width).toBe("16px");
+  });
+
+  it("distinguishes the playing row from purple selection", () => {
+    setup({ activeId: 1, isPlaying: true });
+    const rows = screen.getAllByTestId("timeline-label-row");
+    expect(rows[1]).toHaveAttribute("aria-current", "true");
+    expect(rows[1]).toHaveAttribute("data-active", "true");
+    expect(rows[1].className).toContain("bg-cyan");
+    expect(screen.getByText("Sonando")).toBeInTheDocument();
   });
 
   it("resizes timing from either horizontal edge", () => {
