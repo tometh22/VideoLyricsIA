@@ -8403,6 +8403,10 @@ async def generate_with_segments(
         job_row = (
             db.query(Job)
             .filter(Job.job_id == job_id)
+            # SessionLocal has autoflush disabled. Refresh after waiting for
+            # the row lock so a concurrent generate/save cannot leave this
+            # request making decisions from the earlier ownership lookup.
+            .populate_existing()
             .with_for_update()
             .first()
         )
@@ -8449,6 +8453,12 @@ async def generate_with_segments(
         job_row.progress = 0
         job_row.error = None
         job_row.last_progress_at = datetime.now(timezone.utc)
+
+        # The durable editor bridge locks and refreshes this same Job row.
+        # Persist the pending transition inside the current transaction first;
+        # otherwise populate_existing() would restore the pre-generate state
+        # when SessionLocal(autoflush=False) is in use.
+        db.flush()
 
         # The generate/approve action freezes the exact persisted editor
         # snapshot used by the worker as an immutable audit version. Legacy
