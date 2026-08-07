@@ -8,7 +8,7 @@ from threading import Barrier
 import pytest
 
 from auth import create_user, start_login_session
-from database import EditorDocument, EditorVersion, Job, SessionLocal, engine
+from database import AuditLog, EditorDocument, EditorVersion, Job, SessionLocal, engine
 from editor import acquire_lock, approve_document, ensure_document, get_or_create_document, save_document
 from tests.conftest import auth
 
@@ -159,6 +159,48 @@ def test_editor_rejects_other_tenant_and_analytics_is_bounded(client):
     )
     assert events.status_code == 200
     assert events.json()["accepted"] == 1
+
+
+def test_platform_admin_can_use_editor_for_cross_tenant_review(client):
+    _, _, job_id = _users_and_job("editor_client_workspace")
+    db = SessionLocal()
+    try:
+        admin = create_user(
+            db, f"editor_admin_{uuid.uuid4().hex[:6]}", "testpass12345", None,
+            role="admin", tenant_id="editor_platform_admin",
+        )
+        admin_id = admin.id
+    finally:
+        db.close()
+
+    token = _token_for(admin)
+    loaded = client.get(f"/editor/{job_id}", headers=auth(token))
+    assert loaded.status_code == 200, loaded.text
+    assert loaded.json()["segments"][0]["text"] == "one"
+
+    saved = client.patch(
+        f"/editor/{job_id}", headers=auth(token),
+        json={
+            "base_revision": 0,
+            "segments": [{"start": 0, "end": 1, "text": "admin correction"}],
+            "checkpoint": "manual",
+        },
+    )
+    assert saved.status_code == 200, saved.text
+
+    verify = SessionLocal()
+    try:
+        job = verify.query(Job).filter(Job.job_id == job_id).one()
+        document = verify.query(EditorDocument).filter(EditorDocument.job_id == job_id).one()
+        assert job.tenant_id == "editor_client_workspace"
+        assert document.tenant_id == "editor_client_workspace"
+        assert document.current_segments[0]["text"] == "admin correction"
+        actions = {
+            row.action for row in verify.query(AuditLog).filter(AuditLog.user_id == admin_id).all()
+        }
+        assert "admin.cross_tenant_access" in actions
+    finally:
+        verify.close()
 
 
 def test_editor_preserves_metadata_draft_retry_and_version_details(client):

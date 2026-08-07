@@ -50,4 +50,16 @@ describe("useEditorDocument save ordering", () => {
     expect(patchBodies).toHaveLength(2);
     expect(patchBodies[1].base_revision).toBe(1);
   });
+
+  it("does not start a lock heartbeat when the durable document fails to load", async () => {
+    const request = vi.fn(async () => reply({ detail: "Job not found." }, 404));
+    const { result } = renderHook(() => useEditorDocument({
+      jobId: "historical-job", enabled: true, request,
+    }));
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.errorStatus).toBe(404);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledWith("/editor/historical-job");
+  });
 });

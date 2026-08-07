@@ -753,6 +753,12 @@ export default function LyricsEditor({
     onStatus: handleDurableStatus,
   });
 
+  // Never let an operator type against the legacy seed while the durable
+  // revision is still unknown.  Besides preventing a false base-revision=0
+  // conflict, this replaces the previously silent disabled approval CTA
+  // with an explicit loading/retry state.
+  const editorInitializationBlocked = editorV2Enabled && !durableHydrated;
+
   // Hydrate only after comparing the local draft against the durable server
   // revision. A stale/malformed draft is never silently submitted.
   const durableHydratedJobRef = useRef(null);
@@ -2576,7 +2582,45 @@ export default function LyricsEditor({
     // bajo el botón flotante "Aprobar y generar" (h-12 = 48 px + bottom-6
     // = 24 px + sombra). Sin esto la última card del timeline o de la
     // lista quedaba tapada cuando el operador scrolleaba hasta el final.
-    <div data-testid="lyrics-editor" className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+    <div data-testid="lyrics-editor" aria-busy={editorInitializationBlocked} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+      {editorInitializationBlocked && createPortal(
+        <div
+          className="fixed inset-0 z-[80] flex items-center justify-center bg-surface-0/70 px-5 backdrop-blur-sm"
+          role={durableEditor.error ? "alertdialog" : "status"}
+          aria-modal={durableEditor.error ? "true" : undefined}
+          aria-label={durableEditor.error ? "No pudimos abrir la versión editable" : "Preparando editor"}
+        >
+          <div className="w-full max-w-sm rounded-3xl border border-white/[0.10] bg-surface-1 p-6 text-center shadow-2xl shadow-black/40">
+            {durableEditor.error ? (
+              <>
+                <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-2xl bg-red-500/10 text-red-300 ring-1 ring-red-400/20" aria-hidden="true">
+                  <svg className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path d="M12 9v4m0 4h.01M10.3 3.6 2.5 17.1A2 2 0 0 0 4.2 20h15.6a2 2 0 0 0 1.7-2.9L13.7 3.6a2 2 0 0 0-3.4 0Z" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </div>
+                <h3 className="mt-4 text-base font-semibold text-white">No pudimos abrir la versión editable</h3>
+                <p className="mt-2 text-sm leading-6 text-ink-secondary">
+                  Tus líneas siguen a salvo. Reconectá el editor antes de modificar o aprobar.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => durableEditor.load()}
+                  className="mt-5 inline-flex h-11 items-center justify-center rounded-xl bg-white px-5 text-sm font-semibold text-surface-0 transition-colors hover:bg-gray-100"
+                >
+                  Reintentar
+                </button>
+              </>
+            ) : (
+              <>
+                <span className="mx-auto block h-8 w-8 animate-spin rounded-full border-2 border-brand/30 border-t-brand-light" aria-hidden="true" />
+                <h3 className="mt-4 text-base font-semibold text-white">Preparando el editor…</h3>
+                <p className="mt-2 text-sm text-ink-secondary">Cargando la última versión guardada.</p>
+              </>
+            )}
+          </div>
+        </div>,
+        document.body,
+      )}
       {/* Hidden audio element drives playback. */}
       {audioUrl && (
         <audio

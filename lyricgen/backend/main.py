@@ -10449,12 +10449,22 @@ def _editor_document_or_404(db: Session, job_id: str, current_user: dict):
     # mutate the durable editor by calling the API directly.
     if not current_user.get("features", {}).get("editor_v2"):
         raise HTTPException(status_code=404, detail="Job not found.")
-    job = get_job_for_tenant(db, job_id, current_user["tenant_id"])
+    # Platform admins already have audited cross-tenant access to the review
+    # and /edit flows (see `_job_scope` and POST /edit).  Editor 2.0 used a
+    # stricter tenant-only lookup here, so an admin could open a historical
+    # client's lyrics through the legacy status endpoint but GET /editor
+    # returned 404.  The frontend then waited forever for durable hydration
+    # and kept "Aprobar" disabled.  Resolve the same Job the surrounding
+    # review flow authorises, while keeping regular users tenant-isolated.
+    if current_user.get("role") == "admin":
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+    else:
+        job = get_job_for_tenant(db, job_id, current_user["tenant_id"])
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
     try:
         document = get_or_create_document(
-            db, job_id, current_user["tenant_id"], job.segments_json or [],
+            db, job_id, job.tenant_id, job.segments_json or [],
         )
     except (LookupError, ValueError):
         raise HTTPException(status_code=422, detail="Invalid editor segments.") from None
@@ -10479,6 +10489,7 @@ async def get_editor_document(
     db: Session = Depends(get_db),
 ):
     job, document = _editor_document_or_404(db, job_id, current_user)
+    _audit_cross_tenant_access(db, current_user, job, "editor_read", commit=False)
     db.commit()  # lazy migration/reconciliation is an intentional GET side effect
     payload = serialize_document(db, document)
     payload.update({
@@ -10499,6 +10510,7 @@ async def patch_editor_document(
 ):
     job, document = _editor_document_or_404(db, job_id, current_user)
     try:
+        _audit_cross_tenant_access(db, current_user, job, "editor_save", commit=False)
         document, version, applied = save_document(
             db, job, document, current_user["id"], body.base_revision,
             body.segments, body.checkpoint,
@@ -10592,6 +10604,7 @@ async def restore_editor_version(
 ):
     job, document = _editor_document_or_404(db, job_id, current_user)
     try:
+        _audit_cross_tenant_access(db, current_user, job, "editor_restore", commit=False)
         document, version = restore_version(
             db, job, document, current_user["id"], body.version_id, body.base_revision,
         )
@@ -10622,6 +10635,7 @@ async def resolve_editor_conflict(
 ):
     job, document = _editor_document_or_404(db, job_id, current_user)
     try:
+        _audit_cross_tenant_access(db, current_user, job, "editor_conflict_resolve", commit=False)
         document, version, applied = resolve_conflict(
             db, job, document, current_user["id"], body.server_revision,
             body.strategy, body.segments,
