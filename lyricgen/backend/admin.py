@@ -785,18 +785,6 @@ async def admin_cost_dashboard(
     }
 
 
-@router.get("/cost/{tenant_id}")
-async def admin_tenant_cost(
-    tenant_id: str,
-    admin: dict = Depends(require_admin),
-    db: Session = Depends(get_db),
-    since_days: int = Query(30, ge=1, le=365),
-):
-    """Cost summary for a single tenant, broken down by tool."""
-    from provenance import tenant_cost_summary
-    return tenant_cost_summary(db, tenant_id=tenant_id, since_days=since_days)
-
-
 @router.get("/margin")
 async def admin_margin_dashboard(
     admin: dict = Depends(require_admin),
@@ -816,6 +804,299 @@ async def admin_margin_dashboard(
         since_days=since_days,
         revenue_per_video_usd=revenue_per_video_usd,
     )
+
+
+# ---------------------------------------------------------------------------
+# Real invoiced cost (billing_sources) + reconciliation vs the model
+# ---------------------------------------------------------------------------
+
+@router.post("/cost/refresh")
+async def admin_cost_refresh(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    period: str = Query("", description="YYYY-MM; vacío = mes actual"),
+    only: str = Query("", description="fuentes separadas por coma"),
+):
+    """Pull real cost from every configured provider and persist it.
+
+    Providers only expose a rolling window (Railway shows the open cycle,
+    Replicate paginates predictions that age out), so an un-snapshotted
+    month becomes unrecoverable — run this at least once after each month
+    closes. Safe to re-run: rows are upserted on (period, source).
+    """
+    import billing_sources
+    from database import CostSnapshot
+
+    period = period.strip() or billing_sources.current_period()
+    names = [s.strip() for s in only.split(",") if s.strip()] or None
+    try:
+        result = billing_sources.fetch_all(period=period, only=names)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    for entry in result["sources"]:
+        row = (
+            db.query(CostSnapshot)
+            .filter(CostSnapshot.period == period,
+                    CostSnapshot.source == entry["source"])
+            .one_or_none()
+        )
+        if row is None:
+            row = CostSnapshot(period=period, source=entry["source"])
+            db.add(row)
+        row.amount_usd = entry["amount_usd"]
+        row.status = entry["status"]
+        row.detail = entry["detail"]
+        row.is_estimate = bool(entry["is_estimate"])
+        row.breakdown = entry["breakdown"]
+        row.fetched_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return result
+
+
+@router.get("/cost/real")
+async def admin_cost_real(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    period: str = Query("", description="YYYY-MM; vacío = mes actual"),
+    live: bool = Query(False, description="consultar las APIs en vez de leer el snapshot"),
+):
+    """Invoiced cost for a month, per provider.
+
+    Reads the persisted snapshot by default (fast, and the only option for
+    closed months). `live=true` re-queries the provider APIs without
+    writing anything — use it to sanity-check before refreshing.
+
+    `complete=false` means at least one source is unconfigured or errored,
+    so `total_usd` is a floor, not the real total. Don't divide by video
+    count and quote the result until it's true.
+    """
+    import billing_sources
+    from database import CostSnapshot
+
+    period = period.strip() or billing_sources.current_period()
+    try:
+        billing_sources._period_bounds(period)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if live:
+        return {**billing_sources.fetch_all(period=period), "source_of_truth": "live"}
+
+    rows = (
+        db.query(CostSnapshot)
+        .filter(CostSnapshot.period == period)
+        .all()
+    )
+    if not rows:
+        return {
+            "period": period, "total_usd": 0.0, "sources": [],
+            "configured": [], "not_configured": list(billing_sources.SOURCES),
+            "errored": [], "complete": False, "source_of_truth": "snapshot",
+            "detail": "sin snapshot para este período — corré POST /admin/cost/refresh",
+        }
+
+    sources, total, ok, missing, errored = [], 0.0, [], [], []
+    for r in rows:
+        sources.append({
+            "source": r.source, "period": r.period, "amount_usd": r.amount_usd,
+            "status": r.status, "detail": r.detail,
+            "is_estimate": r.is_estimate, "breakdown": r.breakdown or [],
+            "fetched_at": r.fetched_at.isoformat() if r.fetched_at else None,
+        })
+        if r.status == "ok" and r.amount_usd is not None:
+            total += r.amount_usd
+            ok.append(r.source)
+        elif r.status == "not_configured":
+            missing.append(r.source)
+        else:
+            errored.append(r.source)
+    missing += [s for s in billing_sources.SOURCES
+                if s not in {r.source for r in rows}]
+    sources.sort(key=lambda s: -(s["amount_usd"] or 0))
+
+    return {
+        "period": period, "total_usd": round(total, 2), "sources": sources,
+        "configured": ok, "not_configured": missing, "errored": errored,
+        "complete": not missing and not errored,
+        "source_of_truth": "snapshot",
+    }
+
+
+@router.get("/cost/unit-economics")
+async def admin_cost_unit_economics(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    period: str = Query("", description="YYYY-MM; vacío = mes actual"),
+    price_per_video_usd: float = Query(13.50, ge=0, le=10000),
+):
+    """The number to price against: real invoiced cost ÷ videos delivered.
+
+    This is the endpoint the 2026-08 audit was built for. Two traps it
+    closes:
+
+    1. **Denominator.** Cost is divided by videos actually DELIVERED
+       (done + pending_review), never by jobs created. Dividing $199.53 of
+       jun-2026 Google Cloud by 173 created jobs gives $1.15/video; by the
+       65 that shipped it is $3.07. The second one is real — the discarded
+       previews cost money too.
+    2. **Completeness.** `cost_complete` propagates from /cost/real. When
+       false, `cost_per_delivered` is a floor and is labelled as such.
+    """
+    import billing_sources
+    from database import CostSnapshot
+    from provenance import cost_waste_breakdown
+
+    period = period.strip() or billing_sources.current_period()
+    try:
+        start, end = billing_sources._period_bounds(period)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    rows = db.query(CostSnapshot).filter(CostSnapshot.period == period).all()
+    real_total = sum(
+        r.amount_usd for r in rows
+        if r.status == "ok" and r.amount_usd is not None
+    )
+    have = {r.source for r in rows if r.status == "ok"}
+    cost_complete = have >= set(billing_sources.SOURCES)
+
+    start_dt = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
+    end_dt = datetime(end.year, end.month, end.day, 23, 59, 59,
+                      tzinfo=timezone.utc)
+    delivered = int(
+        db.query(func.count(Job.id))
+        .filter(Job.created_at >= start_dt, Job.created_at <= end_dt)
+        .filter(Job.status.in_(("done", "pending_review")))
+        .scalar() or 0
+    )
+    created = int(
+        db.query(func.count(Job.id))
+        .filter(Job.created_at >= start_dt, Job.created_at <= end_dt)
+        .scalar() or 0
+    )
+
+    cost_per_delivered = round(real_total / delivered, 4) if delivered else None
+    # Kept only to show the operator how misleading it is next to the real
+    # one — it is the number the old internal doc quoted.
+    cost_per_created = round(real_total / created, 4) if created else None
+
+    # Waste attribution runs off provenance (the invoice cannot say which
+    # job a dollar belonged to), scoped to roughly the same window.
+    days = max(1, (end - start).days + 1)
+    waste = cost_waste_breakdown(db, since_days=days)
+
+    return {
+        "period": period,
+        "real_cost_usd": round(real_total, 2),
+        "cost_complete": cost_complete,
+        "missing_sources": sorted(set(billing_sources.SOURCES) - have),
+        "videos_delivered": delivered,
+        "videos_created": created,
+        "cost_per_delivered": cost_per_delivered,
+        "cost_per_created_MISLEADING": cost_per_created,
+        "price_per_video_usd": price_per_video_usd,
+        "margin_per_video": (
+            round(price_per_video_usd - cost_per_delivered, 4)
+            if cost_per_delivered is not None else None
+        ),
+        "margin_pct": (
+            round((price_per_video_usd - cost_per_delivered)
+                  / price_per_video_usd, 4)
+            if cost_per_delivered is not None and price_per_video_usd else None
+        ),
+        "waste": waste,
+        "note": (
+            "cost_per_delivered usa SOLO videos entregados como denominador. "
+            "Si cost_complete=false, el número es un piso."
+        ),
+    }
+
+
+@router.get("/cost/reconcile")
+async def admin_cost_reconcile(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    period: str = Query("", description="YYYY-MM; vacío = mes actual"),
+):
+    """Modeled AI cost (provenance × rate table) vs what the provider billed.
+
+    The rate table in provenance.py is an estimate. This is how we know
+    whether it still holds: jun-2026 reconciled at $163 modeled vs $199.53
+    invoiced (-18%), the gap being staging usage plus real Imagen/Gemini
+    token pricing. If `variance_pct` drifts much beyond that, the rates
+    need recalibrating — a silently-wrong rate table is worse than none,
+    because per-tenant cost attribution inherits the error.
+
+    Only compares AI providers (gcp/openai/replicate); Railway, R2 and the
+    flat subscriptions never flow through `record_ai_call`, so the model
+    has nothing to say about them.
+    """
+    import billing_sources
+    from database import CostSnapshot
+    from provenance import cost_dashboard_global
+
+    period = period.strip() or billing_sources.current_period()
+    try:
+        start, end = billing_sources._period_bounds(period)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    AI_SOURCES = ("gcp", "openai", "replicate")
+    rows = (
+        db.query(CostSnapshot)
+        .filter(CostSnapshot.period == period,
+                CostSnapshot.source.in_(AI_SOURCES))
+        .all()
+    )
+    invoiced = sum(
+        r.amount_usd for r in rows
+        if r.status == "ok" and r.amount_usd is not None
+    )
+    have = {r.source for r in rows if r.status == "ok"}
+
+    days = max(1, (end - start).days + 1)
+    modeled_dash = cost_dashboard_global(db, since_days=days)
+    modeled = modeled_dash["total_cost"]
+
+    variance = invoiced - modeled
+    return {
+        "period": period,
+        "modeled_usd": round(modeled, 2),
+        "invoiced_usd": round(invoiced, 2),
+        "variance_usd": round(variance, 2),
+        "variance_pct": (round(variance / modeled, 4) if modeled else None),
+        "invoiced_sources_present": sorted(have),
+        "invoiced_sources_missing": sorted(set(AI_SOURCES) - have),
+        "calibration_factor": (
+            round(invoiced / modeled, 4) if modeled else None
+        ),
+        "by_tool_modeled": modeled_dash["by_tool"],
+        "row_quality": modeled_dash["row_quality"],
+        "note": (
+            "calibration_factor >1 = el modelo subestima. Multiplicá las "
+            "tarifas de COST_PER_CALL por este factor para recalibrar. "
+            "Comparación imperfecta: la ventana del modelo son días "
+            "corridos y la factura es mes calendario."
+        ),
+    }
+
+
+# NOTE: this catch-all must stay AFTER every literal /cost/<name> route.
+# FastAPI matches in registration order, so declaring it earlier made
+# `/admin/cost/real` resolve here with tenant_id="real" — a 200 with an
+# empty cost summary instead of the real-invoice payload.
+@router.get("/cost/{tenant_id}")
+async def admin_tenant_cost(
+    tenant_id: str,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    since_days: int = Query(30, ge=1, le=365),
+):
+    """Cost summary for a single tenant, broken down by tool."""
+    from provenance import tenant_cost_summary
+    return tenant_cost_summary(db, tenant_id=tenant_id, since_days=since_days)
 
 
 @router.get("/provenance")

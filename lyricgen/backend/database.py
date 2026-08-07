@@ -16,6 +16,7 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     event,
     text,
@@ -1305,6 +1306,37 @@ class SalesLead(Base):
     message = Column(Text, nullable=True)
     ip_address = Column(String(45), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class CostSnapshot(Base):
+    """Monthly invoiced cost per provider, pulled by billing_sources.py.
+
+    Provider billing APIs only expose a rolling window (Railway shows the
+    open cycle, GitHub the current billing period, Replicate paginates
+    predictions that eventually age out), so a month that is never
+    snapshotted becomes unrecoverable. This table is the durable record:
+    one row per (period, source), refreshed by POST /admin/cost/refresh
+    and frozen once the month closes.
+
+    `amount_usd` is nullable on purpose — a source that was not configured
+    yet must be distinguishable from one that genuinely cost $0, otherwise
+    a missing credential silently reads as free. See `status`.
+    """
+    __tablename__ = "cost_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    period = Column(String(7), nullable=False, index=True)   # "YYYY-MM"
+    source = Column(String(32), nullable=False)              # gcp | railway | ...
+    amount_usd = Column(Float, nullable=True)
+    status = Column(String(20), nullable=False, default="ok")
+    detail = Column(Text, nullable=True)
+    is_estimate = Column(Boolean, nullable=False, default=False)
+    breakdown = Column(JSONB, nullable=True)
+    fetched_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("period", "source", name="uq_cost_snapshot_period_source"),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -2,8 +2,24 @@
 
 Also exposes per-tool cost rates and a tenant cost summary helper for the
 admin dashboard. Rates are estimates of marginal API cost per call as of
-2026-04, sourced from public pricing pages. The dict is the single source
+2026-08, sourced from public pricing pages. The dict is the single source
 of truth — update it when pricing changes.
+
+Cost accounting rules (2026-08 audit — see docs/COST_TRACKING.md):
+
+* **Cache hits are not billable.** `_generate_veo_video` opens the
+  provenance recorder *before* the R2 cache lookup, so a cache hit still
+  writes a full row (marked `cache_hit:` in `response_summary`). Counting
+  those rows at $0.80 inflated the dashboard by ~19% in jul-2026 (40 of
+  248 Veo rows). Every aggregate here filters them out.
+* **The denominator is delivered videos, not jobs created.** Dividing
+  spend by created jobs hid the fact that 59% of jul-2026 Veo spend went
+  to discarded previews and rejected jobs. `cost_waste_breakdown()`
+  attributes every billable call to what it actually produced.
+* **Modeled cost is calibrated against real invoices.** These per-call
+  rates reconcile to within ~18% of the jun-2026 Google Cloud invoice
+  ($163 modeled vs $199.53 billed, the gap being staging + real Imagen /
+  Gemini token pricing). `billing_sources.py` pulls the real numbers.
 """
 
 import hashlib
@@ -11,7 +27,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func
+from sqlalchemy import func, not_, or_
 from sqlalchemy.orm import Session
 
 from database import AIProvenance, Job, SessionLocal
@@ -34,13 +50,31 @@ COST_PER_CALL: dict[tuple[str, str], float] = {
     ("veo-3.0-fast-generate-001", "google_vertex"): 0.80,
     ("veo-3.0-generate-001", "google_vertex"): 3.20,
     ("veo-2.0-generate-001", "google_vertex"): 4.00,
-    # Imagen still images
+    # Imagen still images. Imagen 4 is the runtime default
+    # (pipeline `_generate_imagen_image`) but was missing from this table
+    # until the 2026-08 audit, so every Imagen 4 call fell through to
+    # DEFAULT_COST_PER_CALL ($0.01) and was under-counted ~4-6x.
     ("imagen-3.0-generate-001", "google_vertex"): 0.04,
     ("imagen-3.0-fast-generate-001", "google_vertex"): 0.02,
+    ("imagen-4.0-generate-001", "google_vertex"): 0.04,
+    ("imagen-4.0-fast-generate-001", "google_vertex"): 0.02,
+    ("imagen-4.0-ultra-generate-001", "google_vertex"): 0.06,
     # Gemini text/multimodal — averaged across our prompt sizes
     ("gemini-2.5-flash", "google_vertex"): 0.01,
     ("gemini-2.5-flash-lite", "google_vertex"): 0.005,
     ("gemini-2.5-pro", "google_vertex"): 0.05,
+    # Content validator. ONE provenance row covers a whole video scan, and
+    # the scan is one Gemini vision call per extracted frame (up to
+    # `max_frames`, currently 48 at 1 fps). Pricing the row like a single
+    # flash call under-counted the validator by ~an order of magnitude;
+    # this rate is per-scan, not per-frame.
+    ("gemini-2.5-flash-vision", "google_vertex"): 0.02,
+    # Replicate — invisible to this table until the 2026-08 audit, so
+    # whisperX / forced-align / demucs spend never showed up at all
+    # (real invoices: $3.67 may, $7.12 jun). Rates from the model pages.
+    ("victor-upmeet/whisperx", "replicate"): 0.02,
+    ("cureau/force-align-wordstamps", "replicate"): 0.007,
+    ("cjwbw/demucs", "replicate"): 0.035,
     # Whisper local — runs on our compute, no API charge
     ("whisper", "local"): 0.0,
     ("whisper-large-v3", "local"): 0.0,
@@ -60,6 +94,183 @@ DEFAULT_COST_PER_CALL = 0.01
 def cost_for_record(tool_name: str, tool_provider: str) -> float:
     """Best-effort cost estimate for a single AIProvenance record."""
     return COST_PER_CALL.get((tool_name, tool_provider), DEFAULT_COST_PER_CALL)
+
+
+# ---------------------------------------------------------------------------
+# Billable-row filter
+# ---------------------------------------------------------------------------
+
+# `response_summary` prefix written by pipeline._generate_veo_video when the
+# R2 cache served the clip. The recorder is opened before the cache lookup,
+# so the row exists but no provider call was made and nothing was billed.
+CACHE_HIT_PREFIX = "cache_hit"
+
+
+def billable_filter():
+    """SQLAlchemy criterion selecting provenance rows we actually paid for.
+
+    Excludes cache hits. Deliberately KEEPS error rows and in-flight rows
+    (`response_summary IS NULL`): a Veo generation that succeeded upstream
+    but whose download/worker died is still billed by the provider, and we
+    would rather over-report cost than discover the gap on the invoice.
+    `cost_dashboard_global` surfaces those two buckets separately so the
+    uncertainty is visible instead of buried.
+    """
+    return or_(
+        AIProvenance.response_summary.is_(None),
+        not_(AIProvenance.response_summary.like(f"{CACHE_HIT_PREFIX}%")),
+    )
+
+
+# Job statuses that represent a video we can actually invoice. Mirrors
+# `deliverable` in cost_dashboard_global.
+DELIVERED_STATUSES = ("done", "pending_review")
+
+# Human labels per status. Delivered statuses get distinct labels so the
+# panel doesn't render two identical "entregado" rows — both count as
+# delivered, but `pending_review` is still awaiting client approval and
+# can yet turn into a rejection.
+_DELIVERED_LABELS = {
+    "done": "entregado",
+    "pending_review": "entregado (a revisar)",
+}
+
+# Job statuses whose spend produced nothing shippable, split so the panel
+# can name the failure mode rather than lumping it into "other".
+_WASTE_LABELS = {
+    "bg_preview_done": "preview_descartado",
+    "bg_preview_failed": "preview_fallido",
+    "rejected": "rechazado",
+    "failed": "fallido",
+    "error": "error",
+    "transcription_failed": "transcripcion_fallida",
+}
+
+
+def cost_waste_breakdown(db: Session, since_days: int = 30,
+                         tenant_id: str | None = None) -> dict:
+    """Attribute billable AI spend to what it actually produced.
+
+    The headline number the 2026-08 audit surfaced: in jul-2026, 59% of
+    billable Veo spend went to background previews the operator discarded
+    and to jobs that ended up rejected — none of which became a delivered
+    video, yet all of which were divided into "cost per video" as if they
+    had. This splits spend by the destination of the job that incurred it.
+
+    Returns:
+        {
+          "since": iso8601, "since_days": int,
+          "total_cost": float,
+          "delivered_cost": float, "wasted_cost": float,
+          "waste_ratio": float | None,       # wasted / total
+          "delivered_videos": int,
+          "cost_per_delivered": float | None,    # total / delivered (honest)
+          "cost_per_delivered_direct": float | None,  # delivered_cost only
+          "by_destination": [
+              {"destination", "status", "jobs", "calls", "cost"}, ...
+          ],
+        }
+
+    `cost_per_delivered` charges the waste to the videos that shipped —
+    that is the number to price against. `cost_per_delivered_direct` is
+    the floor you would reach if the waste were eliminated; the gap
+    between the two is the size of the prize.
+
+    Pass `tenant_id` to scope to one client — useful for seeing which
+    tenant's operators are burning previews, since the waste rate is a
+    workflow habit and varies a lot between them.
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=since_days)
+
+    def _scoped(query):
+        return query.filter(Job.tenant_id == tenant_id) if tenant_id else query
+
+    rows = _scoped(
+        db.query(
+            Job.status,
+            AIProvenance.tool_name,
+            AIProvenance.tool_provider,
+            func.count(AIProvenance.id).label("calls"),
+            func.count(func.distinct(Job.job_id)).label("jobs"),
+        )
+        .join(Job, Job.job_id == AIProvenance.job_id)
+        .filter(AIProvenance.created_at >= since)
+        .filter(billable_filter())
+    ).group_by(
+        Job.status, AIProvenance.tool_name, AIProvenance.tool_provider
+    ).all()
+
+    # Aggregate per status first; a status spans many tools.
+    per_status: dict[str, dict] = {}
+    for status, tool_name, tool_provider, calls, _jobs in rows:
+        agg = per_status.setdefault(status, {"calls": 0, "cost": 0.0})
+        agg["calls"] += calls
+        agg["cost"] += calls * cost_for_record(tool_name, tool_provider)
+
+    # Distinct job counts must be queried separately — summing the
+    # per-tool distinct counts above would multiply-count a job that used
+    # several tools.
+    job_counts = dict(
+        _scoped(
+            db.query(Job.status, func.count(func.distinct(Job.job_id)))
+            .join(AIProvenance, Job.job_id == AIProvenance.job_id)
+            .filter(AIProvenance.created_at >= since)
+            .filter(billable_filter())
+        ).group_by(Job.status).all()
+    )
+
+    by_destination = []
+    total_cost = 0.0
+    delivered_cost = 0.0
+    for status, agg in per_status.items():
+        is_delivered = status in DELIVERED_STATUSES
+        total_cost += agg["cost"]
+        if is_delivered:
+            delivered_cost += agg["cost"]
+        by_destination.append({
+            "destination": (
+                _DELIVERED_LABELS.get(status, "entregado") if is_delivered
+                else _WASTE_LABELS.get(status, f"descarte ({status})")
+            ),
+            "status": status,
+            "delivered": is_delivered,
+            "jobs": int(job_counts.get(status, 0)),
+            "calls": agg["calls"],
+            "cost": round(agg["cost"], 4),
+        })
+    by_destination.sort(key=lambda r: r["cost"], reverse=True)
+
+    # Delivered video count comes from the jobs table, not from the
+    # provenance join: a job that shipped without any billable AI call
+    # (library background reused as-is) is still a delivered video and
+    # must dilute the cost per video.
+    delivered_videos = int(
+        _scoped(
+            db.query(func.count(Job.id))
+            .filter(Job.created_at >= since)
+            .filter(Job.status.in_(DELIVERED_STATUSES))
+        ).scalar() or 0
+    )
+
+    wasted_cost = total_cost - delivered_cost
+    return {
+        "since": since.isoformat(),
+        "since_days": since_days,
+        "tenant_id": tenant_id,
+        "total_cost": round(total_cost, 4),
+        "delivered_cost": round(delivered_cost, 4),
+        "wasted_cost": round(wasted_cost, 4),
+        "waste_ratio": round(wasted_cost / total_cost, 4) if total_cost else None,
+        "delivered_videos": delivered_videos,
+        "cost_per_delivered": (
+            round(total_cost / delivered_videos, 4) if delivered_videos else None
+        ),
+        "cost_per_delivered_direct": (
+            round(delivered_cost / delivered_videos, 4)
+            if delivered_videos else None
+        ),
+        "by_destination": by_destination,
+    }
 
 
 def tenant_cost_summary(
@@ -91,6 +302,7 @@ def tenant_cost_summary(
         .join(Job, Job.job_id == AIProvenance.job_id)
         .filter(Job.tenant_id == tenant_id)
         .filter(AIProvenance.created_at >= since)
+        .filter(billable_filter())
         .group_by(AIProvenance.tool_name, AIProvenance.tool_provider)
         .all()
     )
@@ -159,7 +371,7 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
     """
     since = datetime.now(timezone.utc) - timedelta(days=since_days)
 
-    # --- AI spend by tool/provider ---
+    # --- AI spend by tool/provider (billable rows only) ---
     rows = (
         db.query(
             AIProvenance.tool_name,
@@ -167,8 +379,33 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
             func.count(AIProvenance.id).label("calls"),
         )
         .filter(AIProvenance.created_at >= since)
+        .filter(billable_filter())
         .group_by(AIProvenance.tool_name, AIProvenance.tool_provider)
         .all()
+    )
+
+    # --- Row-quality counters -------------------------------------------
+    # Cache hits are excluded from spend above; errored and in-flight rows
+    # are INCLUDED (we may well have been billed). Surfacing all three
+    # lets the operator see how much of the total is uncertain instead of
+    # trusting a single opaque number.
+    cache_hits = int(
+        db.query(func.count(AIProvenance.id))
+        .filter(AIProvenance.created_at >= since)
+        .filter(AIProvenance.response_summary.like(f"{CACHE_HIT_PREFIX}%"))
+        .scalar() or 0
+    )
+    errored = int(
+        db.query(func.count(AIProvenance.id))
+        .filter(AIProvenance.created_at >= since)
+        .filter(AIProvenance.response_summary.like("error%"))
+        .scalar() or 0
+    )
+    in_flight = int(
+        db.query(func.count(AIProvenance.id))
+        .filter(AIProvenance.created_at >= since)
+        .filter(AIProvenance.response_summary.is_(None))
+        .scalar() or 0
     )
 
     by_tool = []
@@ -248,6 +485,7 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
         )
         .join(Job, Job.job_id == AIProvenance.job_id)
         .filter(AIProvenance.created_at >= since)
+        .filter(billable_filter())
         .group_by(Job.tenant_id, AIProvenance.tool_name, AIProvenance.tool_provider)
         .all()
     )
@@ -319,6 +557,7 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
         .join(Job, Job.job_id == AIProvenance.job_id)
         .outerjoin(UserModel, UserModel.id == Job.user_id)
         .filter(AIProvenance.created_at >= since)
+        .filter(billable_filter())
         .group_by(Job.user_id, Job.tenant_id, UserModel.username,
                   AIProvenance.tool_name, AIProvenance.tool_provider)
         .all()
@@ -408,6 +647,16 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
         "revenue_per_video_usd": revenue_per_video_usd,
         "margin_per_video": margin_per_video,
         "margin_total": margin_total,
+        # Row-quality counters. `cache_hits` are already excluded from
+        # total_cost; `errored` and `in_flight` are included and represent
+        # the uncertain slice of the total.
+        "row_quality": {
+            "cache_hits_excluded": cache_hits,
+            "errored_included": errored,
+            "in_flight_included": in_flight,
+        },
+        # Where the money actually went. See cost_waste_breakdown().
+        "waste": cost_waste_breakdown(db, since_days=since_days),
     }
 
 
