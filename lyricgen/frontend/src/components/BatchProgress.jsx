@@ -184,11 +184,25 @@ export function SingleGeneratingHero({
 
 // Shared inline error message box. Extracted 2026-07-27 so the batch row and
 // the single-song error card render errors identically (one implementation).
+//
+// 2026-08-06: `error` used to be rendered as a raw React child. When a generate
+// path caught a 409 whose `data.detail` was an OBJECT (the editor revision
+// conflict payload {detail, server_revision, server_segments}) it set
+// job.error to that object → "Objects are not valid as a React child" crashed
+// the whole /generating tree (Sentry #33). The source paths now coerce with
+// translateBackendError, but keep this net so NO object can ever crash render.
+function coerceErrorText(error) {
+  if (error == null) return null;
+  if (typeof error === "string") return error;
+  if (typeof error === "object") return error.msg || error.detail || error.message || JSON.stringify(error);
+  return String(error);
+}
 function JobErrorMessage({ error }) {
-  if (!error) return null;
+  const text = coerceErrorText(error);
+  if (!text) return null;
   return (
     <div className="mt-2 px-3 py-2 rounded-lg bg-red-500/5 border border-red-500/10">
-      <p className="text-[11px] text-red-400/80">{error}</p>
+      <p className="text-[11px] text-red-400/80">{text}</p>
     </div>
   );
 }
@@ -320,7 +334,7 @@ function JobRow({ job, index, t, onSelectJob }) {
   const statusLabel = status === "done" ? t("dash.completed") :
     status === "pending_review" ? (t("batch.pending_review") || "Pendiente de aprobacion") :
     status === "validation_failed" ? (t("batch.validation_failed") || "Validacion fallida") :
-    status === "error" ? (error || t("dash.error")) :
+    status === "error" ? (coerceErrorText(error) || t("dash.error")) :
     status === "editing" ? (t("batch.editing") || `Re-renderizando · ${STEP_LABELS[current_step] || current_step || "..."} ${progress || 0}%`) :
     status === "processing" ? (
       current_step === "uploading"

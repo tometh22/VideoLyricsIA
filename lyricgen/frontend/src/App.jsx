@@ -3730,7 +3730,7 @@ export default function App() {
             const reason = (data.code === "job_not_found" || res.status === 404)
               ? (t("generate.session_expired")
                  || "La sesión expiró antes de generar. Re-subí el audio para regenerar.")
-              : (data.detail || await describeFetchError(null, res, t));
+              : (translateBackendError(data.detail, t) || await describeFetchError(null, res, t));
             setJobs((prev) => prev.map((j, idx) =>
               idx === i ? { ...j, status: "error", error: reason } : j
             ));
@@ -3871,7 +3871,7 @@ export default function App() {
             const reason = (genRes.status === 404)
               ? (t("generate.session_expired")
                  || "La sesión expiró antes de generar. Re-subí el audio para regenerar.")
-              : (data.detail || await describeFetchError(null, genRes, t));
+              : (translateBackendError(data.detail, t) || await describeFetchError(null, genRes, t));
             setJobs((prev) => prev.map((j, idx) =>
               idx === i ? { ...j, status: "error", error: reason } : j
             ));
@@ -3960,7 +3960,7 @@ export default function App() {
           }
           if (!genRes.ok || data.detail) {
             if ((genRes.status ?? 0) === 401) { handleLogout("expired"); return; }
-            const reason = data.detail || await describeFetchError(null, genRes, t);
+            const reason = translateBackendError(data.detail, t) || await describeFetchError(null, genRes, t);
             setJobs((prev) => prev.map((j, idx) =>
               idx === i ? { ...j, status: "error", error: reason } : j));
             continue;

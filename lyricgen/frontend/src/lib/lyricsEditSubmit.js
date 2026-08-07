@@ -69,6 +69,13 @@ export function translateBackendError(raw, t) {
     return tr("edit.error_already_editing") ||
       "Este video se está re-renderizando ahora. Esperá a que termine (revisalo en la página del video) y volvé a aplicar tus cambios.";
   }
+  // 409 revision conflict: the backend returns {detail:"editor_revision_conflict",
+  // server_revision, server_segments}. Without this map the raw object leaked into
+  // React and crashed /generating (Sentry #33); map it to a clear retry message.
+  if (raw && typeof raw === "object" && raw.detail === "editor_revision_conflict") {
+    return tr("edit.error_revision_conflict") ||
+      "La letra cambió en el servidor mientras editabas. Recargá el editor para traer la última versión y volvé a aplicar tus cambios.";
+  }
   let str;
   if (typeof raw === "string") {
     str = raw;
