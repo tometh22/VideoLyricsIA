@@ -151,6 +151,21 @@ tiene. Como Replicate no tiene endpoint de facturación, se listan las
 predictions de la ventana y se valorizan por tiempo de compute
 (`REPLICATE_USD_PER_SECOND`, default blended). Sale `is_estimate: true`.
 
+**Precisión medida** contra las facturas reales:
+
+| Mes | Estimado | Facturado | Desvío |
+|---|---|---|---|
+| may-2026 | $4,90 | $3,67 | +33% |
+| jun-2026 | $6,10 | $7,12 | −14% |
+| jul-2026 | $3,60 | $1,82 (a mitad de mes) | consistente |
+
+La tarifa default ($0,000225/s) queda dentro del **4% del promedio de los
+dos meses cerrados** — está bien centrada. El desvío mes a mes es por
+mezcla de modelos: demucs corre en hardware más caro que whisperX y una
+sola tarifa mezclada no los distingue. Sirve para ver la magnitud y
+detectar saltos, no para cuadrar al centavo. Es la línea más chica del
+stack (~$5/mes), así que no vale la pena refinarla más.
+
 ### 6. GitHub — Actions
 
 ```bash
