@@ -261,3 +261,157 @@ def test_fixed_subscriptions_bad_json_errors_not_crashes(monkeypatch):
     result = billing_sources.fetch_fixed("2026-07")
     assert result.status == "error"
     assert result.amount_usd is None
+
+
+# ---------------------------------------------------------------------------
+# Railway — dollars are derived, so the pricing math is the contract
+# ---------------------------------------------------------------------------
+
+def test_railway_prices_usage_metrics_against_real_invoice(monkeypatch):
+    """Railway's GraphQL exposes no COST measurement — only raw resource
+    metrics — so we price them ourselves. These are the real jun-2026
+    numbers from the API; the model must land near the $124.54 invoice.
+
+    Resource metrics arrive as unit-MINUTES over the window; NETWORK_TX_GB
+    is a flow already in GB. Getting that distinction wrong is a ~700x
+    error, hence this test.
+    """
+    real_june_usage = [
+        {"measurement": "MEMORY_USAGE_GB", "value": 374188.80},
+        {"measurement": "CPU_USAGE", "value": 10522.98},
+        {"measurement": "DISK_USAGE_GB", "value": 219516.45},
+        {"measurement": "BACKUP_USAGE_GB", "value": 28013.51},
+        {"measurement": "NETWORK_TX_GB", "value": 673.35},
+    ]
+
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {"data": {"usage": real_june_usage}}
+
+    monkeypatch.setenv("RAILWAY_API_TOKEN", "fake")
+    monkeypatch.setenv("RAILWAY_PROJECT_ID", "proj-genly")
+    monkeypatch.setattr(billing_sources.requests, "post",
+                        lambda *a, **k: _Resp())
+
+    result = billing_sources.fetch_railway("2026-06")
+    assert result.status == "ok"
+    assert result.is_estimate is True
+    # Invoice was $124.54; stay within 5%.
+    assert 118.0 < result.amount_usd < 131.0, result.amount_usd
+
+    by_measure = {b["measurement"]: b for b in result.breakdown}
+    # Memory dominates, egress is second — if egress were divided by
+    # minutes it would round to $0 and the total would collapse.
+    assert by_measure["NETWORK_TX_GB"]["cost"] == round(673.35 * 0.05, 4)
+    assert by_measure["MEMORY_USAGE_GB"]["cost"] > 80
+
+
+def test_railway_uses_actual_days_in_month(monkeypatch):
+    """A fixed 43200-minute divisor would misprice every month that isn't
+    30 days — February would come out ~7% high."""
+    usage = [{"measurement": "MEMORY_USAGE_GB", "value": 100000.0}]
+
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {"data": {"usage": usage}}
+
+    monkeypatch.setenv("RAILWAY_API_TOKEN", "fake")
+    monkeypatch.setattr(billing_sources.requests, "post",
+                        lambda *a, **k: _Resp())
+
+    feb = billing_sources.fetch_railway("2026-02")   # 28 days
+    jul = billing_sources.fetch_railway("2026-07")   # 31 days
+    # Same raw GB-minutes over a shorter month = more GB-months = costlier.
+    assert feb.amount_usd > jul.amount_usd
+
+
+def test_railway_empty_usage_is_zero_not_error(monkeypatch):
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {"data": {"usage": []}}
+
+    monkeypatch.setenv("RAILWAY_API_TOKEN", "fake")
+    monkeypatch.setattr(billing_sources.requests, "post",
+                        lambda *a, **k: _Resp())
+    result = billing_sources.fetch_railway("2026-07")
+    assert result.status == "ok"
+    assert result.amount_usd == 0.0
+
+
+# ---------------------------------------------------------------------------
+# OpenAI — the org key is shared, so filtering is the contract
+# ---------------------------------------------------------------------------
+
+def test_openai_filters_to_genly_line_items(monkeypatch):
+    """The OpenAI org is shared with unrelated projects: jul-2026 was
+    $567.43 org-wide against $20.15 of whisper, which is all GenLy uses.
+    Summing the org would overstate GenLy's cost ~28x."""
+    payload = {
+        "data": [{"results": [
+            {"line_item": "whisper", "amount": {"value": 20.15}},
+            {"line_item": "gpt-5.4-mini-2026-03-17, output",
+             "amount": {"value": 309.71}},
+            {"line_item": "gpt-image-1 image, output", "amount": {"value": 9.81}},
+        ]}],
+        "has_more": False,
+    }
+
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return payload
+
+    monkeypatch.setenv("OPENAI_ADMIN_KEY", "sk-admin-fake")
+    monkeypatch.setattr(billing_sources, "OPENAI_LINE_ITEM_FILTER", ["whisper"])
+    monkeypatch.setattr(billing_sources.requests, "get", lambda *a, **k: _Resp())
+
+    result = billing_sources.fetch_openai("2026-07")
+    assert result.status == "ok"
+    assert result.amount_usd == 20.15
+    # Excluded lines stay visible so it's obvious what was filtered out.
+    excluded = [b for b in result.breakdown if not b["incluido"]]
+    assert len(excluded) == 2
+    assert "otros proyectos" in result.detail
+
+
+def test_openai_empty_filter_bills_whole_org(monkeypatch):
+    payload = {
+        "data": [{"results": [
+            {"line_item": "whisper", "amount": {"value": 20.0}},
+            {"line_item": "gpt-5.4", "amount": {"value": 80.0}},
+        ]}],
+        "has_more": False,
+    }
+
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return payload
+
+    monkeypatch.setenv("OPENAI_ADMIN_KEY", "sk-admin-fake")
+    monkeypatch.setattr(billing_sources, "OPENAI_LINE_ITEM_FILTER", [])
+    monkeypatch.setattr(billing_sources.requests, "get", lambda *a, **k: _Resp())
+
+    assert billing_sources.fetch_openai("2026-07").amount_usd == 100.0
+
+
+def test_github_404_explains_missing_scope(monkeypatch):
+    """A 404 here means the PAT lacks the `user` scope, not that the
+    account doesn't exist — worth saying so, since the generic error
+    sends you looking in the wrong place."""
+    class _Resp:
+        status_code = 404
+        def raise_for_status(self): raise AssertionError("no debe llegar acá")
+        def json(self): return {}
+
+    monkeypatch.setenv("GITHUB_BILLING_TOKEN", "ghp_fake")
+    monkeypatch.setenv("GITHUB_BILLING_USER", "alguien")
+    monkeypatch.setattr(billing_sources.requests, "get", lambda *a, **k: _Resp())
+
+    result = billing_sources.fetch_github("2026-07")
+    assert result.status == "error"
+    assert "user" in result.detail
+    assert result.amount_usd is None

@@ -37,7 +37,7 @@ import json
 import logging
 import os
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
 import requests
@@ -209,18 +209,40 @@ def _gcp_credentials() -> str:
 # Railway — compute/hosting. Second-largest line.
 # ---------------------------------------------------------------------------
 
+# Railway's published Pro-plan rates. The GraphQL API deliberately exposes
+# only raw resource metrics (there is no COST measurement in the
+# MetricMeasurement enum), so dollars have to be derived here.
+#
+# Resource metrics come back as unit-MINUTES accumulated over the window
+# (e.g. MEMORY_USAGE_GB is GB-minutes), except NETWORK_TX_GB which is a
+# flow already expressed in GB. Validated against the jun-2026 invoice:
+# this model produced $126.02 against $124.54 actually billed (1.2% off).
+RAILWAY_RATES_PER_UNIT_MONTH = {
+    "CPU_USAGE": float(os.environ.get("RAILWAY_USD_PER_VCPU_MONTH", "20.0")),
+    "MEMORY_USAGE_GB": float(os.environ.get("RAILWAY_USD_PER_GB_MONTH", "10.0")),
+    "DISK_USAGE_GB": float(os.environ.get("RAILWAY_USD_PER_DISK_GB_MONTH", "0.15")),
+    "EPHEMERAL_DISK_USAGE_GB": 0.0,     # included in the plan
+    "BACKUP_USAGE_GB": float(os.environ.get("RAILWAY_USD_PER_BACKUP_GB_MONTH", "0.15")),
+}
+# Charged per GB transferred, not per GB-month.
+RAILWAY_USD_PER_EGRESS_GB = float(os.environ.get("RAILWAY_USD_PER_EGRESS_GB", "0.05"))
+
+
 def fetch_railway(period: str) -> SourceCost:
-    """Railway usage for the month via the public GraphQL API.
+    """Railway cost for the month, derived from usage metrics.
 
     Env:
-        RAILWAY_API_TOKEN       account or team token
-        RAILWAY_WORKSPACE_ID    (optional) restrict to one workspace
+        RAILWAY_API_TOKEN       account/team token (NOT a project token —
+                                project tokens cannot read the usage query)
         RAILWAY_PROJECT_ID      (optional) restrict to the Genly IA project
+        RAILWAY_WORKSPACE_ID    (optional) restrict to one workspace
 
-    Railway bills usage per resource (CPU/RAM/network/volume) and reports
-    it in *micro-dollars* under `estimatedUsage`. Scoping to the Genly
-    project matters: the account also carries unrelated projects, and the
-    jun-2026 numbers differed ($124.54 Genly vs $135.25 whole account).
+    Scoping to the project matters: the account carries unrelated projects
+    and the jun-2026 numbers differed ($124.54 Genly vs $135.25 account).
+
+    Marked `is_estimate` because we price the metrics ourselves — Railway
+    exposes no billed figure over the API. Watch `NETWORK_TX_GB`: egress
+    doubled between jun and jul 2026 and is the fastest-moving line.
     """
     token = os.environ.get("RAILWAY_API_TOKEN", "").strip()
     if not token:
@@ -233,17 +255,21 @@ def fetch_railway(period: str) -> SourceCost:
     query = """
     query usage($startDate: DateTime!, $endDate: DateTime!,
                 $projectId: String, $workspaceId: String) {
-      estimatedUsage(startDate: $startDate, endDate: $endDate,
-                     projectId: $projectId, workspaceId: $workspaceId) {
+      usage(startDate: $startDate, endDate: $endDate,
+            projectId: $projectId, workspaceId: $workspaceId,
+            measurements: [CPU_USAGE, MEMORY_USAGE_GB, NETWORK_TX_GB,
+                           DISK_USAGE_GB, BACKUP_USAGE_GB]) {
         measurement
-        estimatedValue
+        value
       }
     }
     """
-
+    # `end` is the last day of the month; the API wants an exclusive upper
+    # bound at midnight of the following day.
+    end_exclusive = end + timedelta(days=1)
     variables = {
         "startDate": f"{start.isoformat()}T00:00:00Z",
-        "endDate": f"{end.isoformat()}T23:59:59Z",
+        "endDate": f"{end_exclusive.isoformat()}T00:00:00Z",
     }
     if project_id:
         variables["projectId"] = project_id
@@ -267,24 +293,52 @@ def fetch_railway(period: str) -> SourceCost:
         return SourceCost("railway", period, status="error",
                           detail=json.dumps(payload["errors"])[:500])
 
-    items = (payload.get("data") or {}).get("estimatedUsage") or []
+    rows = (payload.get("data") or {}).get("usage") or []
+    if not rows:
+        return SourceCost(
+            "railway", period, amount_usd=0.0, is_estimate=True,
+            detail="la API no devolvió uso para ese período/proyecto",
+            raw={"scope": project_id or workspace_id or "cuenta completa"},
+        )
+
+    # Minutes in this specific month — 28/29/30/31 days all differ, and
+    # using a fixed 43200 would skew every non-30-day month.
+    minutes_in_period = ((end_exclusive - start).days) * 24 * 60
+
+    totals: dict[str, float] = {}
+    for row in rows:
+        m = row.get("measurement", "")
+        totals[m] = totals.get(m, 0.0) + float(row.get("value") or 0.0)
+
     breakdown = []
     total = 0.0
-    for item in items:
-        # estimatedValue is in USD for cost measurements; Railway also
-        # returns non-cost measurements (CPU seconds, GB) which we skip.
-        measurement = item.get("measurement", "")
-        value = float(item.get("estimatedValue") or 0.0)
-        if "COST" not in measurement.upper() and value and value > 1000:
-            continue  # a raw usage metric, not dollars
-        total += value
-        breakdown.append({"measurement": measurement, "cost": round(value, 4)})
+    for measurement, raw_value in sorted(totals.items()):
+        if measurement == "NETWORK_TX_GB":
+            cost = raw_value * RAILWAY_USD_PER_EGRESS_GB
+            units, unit_label = raw_value, "GB transferidos"
+        else:
+            rate = RAILWAY_RATES_PER_UNIT_MONTH.get(measurement)
+            if rate is None:
+                continue
+            units = raw_value / minutes_in_period      # unit-minutes → unit-months
+            cost = units * rate
+            unit_label = "unidad-mes"
+        total += cost
+        breakdown.append({
+            "measurement": measurement,
+            "units": round(units, 4),
+            "unit": unit_label,
+            "cost": round(cost, 4),
+        })
+    breakdown.sort(key=lambda r: -r["cost"])
 
     return SourceCost(
         source="railway", period=period, amount_usd=round(total, 2),
         breakdown=breakdown, is_estimate=True,
-        detail="Railway reporta uso estimado en vivo; cierra a fin de mes.",
-        raw={"scope": project_id or workspace_id or "cuenta completa"},
+        detail=("calculado sobre métricas de uso con tarifas publicadas "
+                "(Railway no expone el importe facturado por API)"),
+        raw={"scope": project_id or workspace_id or "cuenta completa",
+             "minutes_in_period": minutes_in_period},
     )
 
 
@@ -292,14 +346,32 @@ def fetch_railway(period: str) -> SourceCost:
 # OpenAI — whisper-1 transcription.
 # ---------------------------------------------------------------------------
 
+# GenLy's only OpenAI dependency is whisper-1 transcription. The org's
+# key is shared with unrelated work, so summing the whole organization
+# wildly overstates GenLy: jul-2026 was $567.43 org-wide (GPT-5.4, GPT-4.1,
+# image models, batch API — all other projects) against $20.15 of whisper.
+# Substring match, case-insensitive; set to "" to bill the entire org.
+OPENAI_LINE_ITEM_FILTER = [
+    s.strip().lower()
+    for s in os.environ.get("OPENAI_COST_LINE_ITEMS", "whisper").split(",")
+    if s.strip()
+]
+
+
 def fetch_openai(period: str) -> SourceCost:
-    """OpenAI spend from the organization Costs API.
+    """OpenAI spend from the organization Costs API, filtered to GenLy.
 
     Env:
-        OPENAI_ADMIN_KEY   an *admin* key (sk-admin-...), NOT the regular
-                           API key — the regular key cannot read billing.
+        OPENAI_ADMIN_KEY        an *admin* key (sk-admin-...), NOT the
+                                regular API key — that one cannot read
+                                billing.
+        OPENAI_COST_LINE_ITEMS  comma-separated substrings to keep
+                                (default "whisper"). Empty = whole org.
+        OPENAI_PROJECT_ID       (optional) restrict to one project.
 
-    Returns daily buckets summed for the month.
+    Returns daily buckets summed for the month. `breakdown` always lists
+    the excluded lines too, so it stays obvious what was filtered out and
+    why the number is smaller than the OpenAI dashboard's headline.
     """
     key = os.environ.get("OPENAI_ADMIN_KEY", "").strip()
     if not key:
@@ -310,15 +382,28 @@ def fetch_openai(period: str) -> SourceCost:
                             tzinfo=timezone.utc).timestamp())
     end_ts = int(datetime(end.year, end.month, end.day, 23, 59, 59,
                           tzinfo=timezone.utc).timestamp())
+    project_id = os.environ.get("OPENAI_PROJECT_ID", "").strip()
 
-    total = 0.0
-    breakdown: dict[str, float] = {}
+    def _keep(line_item: str) -> bool:
+        if not OPENAI_LINE_ITEM_FILTER:
+            return True
+        low = (line_item or "").lower()
+        return any(f in low for f in OPENAI_LINE_ITEM_FILTER)
+
+    kept: dict[str, float] = {}
+    excluded: dict[str, float] = {}
     page = None
     try:
-        # The endpoint paginates a day at a time; 31 days fits in a couple
-        # of pages but loop defensively with a hard cap.
+        # One bucket per day; a 31-day month fits in a single page at
+        # limit=180, but loop defensively with a hard cap. `page` is a
+        # cursor from `next_page` — re-sending the same one would
+        # double-count, so bail the moment it stops advancing.
+        seen_pages = set()
         for _ in range(20):
-            params = {"start_time": start_ts, "end_time": end_ts, "limit": 180}
+            params = {"start_time": start_ts, "end_time": end_ts,
+                      "limit": 180, "group_by": "line_item"}
+            if project_id:
+                params["project_ids"] = project_id
             if page:
                 params["page"] = page
             resp = requests.get(
@@ -330,23 +415,34 @@ def fetch_openai(period: str) -> SourceCost:
             payload = resp.json()
             for bucket in payload.get("data", []) or []:
                 for result in bucket.get("results", []) or []:
-                    amount = (result.get("amount") or {}).get("value") or 0.0
+                    amount = float((result.get("amount") or {}).get("value") or 0.0)
                     line = result.get("line_item") or "otros"
-                    total += float(amount)
-                    breakdown[line] = breakdown.get(line, 0.0) + float(amount)
+                    target = kept if _keep(line) else excluded
+                    target[line] = target.get(line, 0.0) + amount
             if not payload.get("has_more"):
                 break
             page = payload.get("next_page")
-            if not page:
+            if not page or page in seen_pages:
                 break
+            seen_pages.add(page)
     except Exception as e:
         return SourceCost("openai", period, status="error", detail=str(e))
 
+    total = sum(kept.values())
+    excluded_total = sum(excluded.values())
+    breakdown = [{"line_item": k, "cost": round(v, 4), "incluido": True}
+                 for k, v in sorted(kept.items(), key=lambda kv: -kv[1])]
+    breakdown += [{"line_item": k, "cost": round(v, 4), "incluido": False}
+                  for k, v in sorted(excluded.items(), key=lambda kv: -kv[1])]
+
+    detail = None
+    if OPENAI_LINE_ITEM_FILTER:
+        detail = (f"filtrado a {'/'.join(OPENAI_LINE_ITEM_FILTER)}; "
+                  f"${excluded_total:,.2f} de la organización quedaron "
+                  f"afuera por ser de otros proyectos")
     return SourceCost(
         source="openai", period=period, amount_usd=round(total, 2),
-        breakdown=[{"line_item": k, "cost": round(v, 4)}
-                   for k, v in sorted(breakdown.items(),
-                                      key=lambda kv: -kv[1])],
+        detail=detail, breakdown=breakdown,
     )
 
 
@@ -549,15 +645,25 @@ def fetch_replicate(period: str) -> SourceCost:
 # ---------------------------------------------------------------------------
 
 def fetch_github(period: str) -> SourceCost:
-    """GitHub Actions minutes billed for the account.
+    """GitHub Actions/Codespaces minutes actually billed.
 
     Env:
-        GITHUB_BILLING_TOKEN   PAT with `read:org` + `manage_billing:*`
+        GITHUB_BILLING_TOKEN   PAT — for a PERSONAL account it needs the
+                               `user` scope; `repo`/`admin:org` are not
+                               enough and the endpoint 404s without it
+                               (a 404 here means missing scope, not a
+                               missing account).
         GITHUB_BILLING_ORG     org name, or
         GITHUB_BILLING_USER    user login (personal accounts)
 
-    Note the API reports the *current billing cycle*, not an arbitrary
-    month, so `period` is echoed back but does not filter.
+    Low value: as of ago-2026 gross metered usage was fully offset by the
+    plan's included allowance ($21.93 gross, $21.93 discount, $0 due), so
+    the only real GitHub cost is the flat GitHub Pro subscription, which
+    `fetch_fixed` already carries. Wire this up only if usage starts
+    exceeding the included minutes.
+
+    The API reports the *current billing cycle*, not an arbitrary month,
+    so `period` is echoed back but does not filter.
     """
     token = os.environ.get("GITHUB_BILLING_TOKEN", "").strip()
     org = os.environ.get("GITHUB_BILLING_ORG", "").strip()
@@ -575,6 +681,14 @@ def fetch_github(period: str) -> SourceCost:
                      "Accept": "application/vnd.github+json"},
             timeout=HTTP_TIMEOUT,
         )
+        if resp.status_code == 404:
+            return SourceCost(
+                "github", period, status="error",
+                detail=("404 — al PAT le falta el scope `user` (para cuentas "
+                        "personales es el único que habilita facturación). "
+                        "Poco importa: el uso medido está cubierto por el "
+                        "plan y GitHub Pro ya se cuenta en `fixed`."),
+            )
         resp.raise_for_status()
         payload = resp.json()
     except Exception as e:

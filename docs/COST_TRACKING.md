@@ -73,6 +73,28 @@ gratis", que es una mentira distinta.
 
 ---
 
+## Precisión medida (validación 7-ago-2026)
+
+Cada conector se corrió con las credenciales reales y se comparó contra la
+factura del proveedor:
+
+| Fuente | Período | Conector | Factura real | Error |
+|---|---|---|---|---|
+| **Railway** | jun-2026 | $126,02 | $124,54 | **+1,2%** ✅ |
+| **R2** | jul-2026 | $26,30 | $26,49 | **−0,7%** ✅ |
+| **OpenAI** | jul-2026 | $19,41 | $19,30 | **+0,6%** ✅ |
+| Replicate | jun-2026 | $6,10 | $7,12 | −14% ⚠️ |
+| GCP | — | sin export habilitado | $199,53 | — |
+| GitHub | — | 404 (falta scope) | $0 facturado | — |
+
+Los tres primeros están dentro del 1,2%. Replicate afloja porque usa una
+tarifa de hardware mezclada (ver más abajo), pero es la línea más chica
+del stack.
+
+**Los dos que faltan son los que importan distinto:** GCP es el ~50% del
+gasto total y hay que habilitar el export; GitHub factura $0 y no vale el
+esfuerzo.
+
 ## Configurar cada proveedor
 
 Todas las variables van en el servicio `api` de Railway. Cada fuente es
@@ -115,17 +137,40 @@ RAILWAY_API_TOKEN=...            # Account Settings → Tokens
 RAILWAY_PROJECT_ID=...           # opcional pero recomendado
 ```
 
+⚠️ Tiene que ser un **token de cuenta**, no un *project token*: los
+project tokens no pueden leer la query `usage`.
+
 Acotar al proyecto Genly IA importa: la cuenta tiene otros proyectos y en
 jun-2026 la diferencia fue **$124,54 (Genly) vs $135,25 (cuenta entera)**.
+
+**Railway no expone dólares por API.** El enum `MetricMeasurement` no
+tiene ninguna medida de costo — sólo recursos crudos. El conector pide
+`usage` (CPU, memoria, disco, backup, red) y lo valoriza con las tarifas
+publicadas, todas overrideables por env (`RAILWAY_USD_PER_VCPU_MONTH`,
+`RAILWAY_USD_PER_GB_MONTH`, `RAILWAY_USD_PER_EGRESS_GB`…).
+
+> **La trampa de las unidades:** los recursos vuelven en *unidad-minutos*
+> acumulados sobre la ventana, pero `NETWORK_TX_GB` es un flujo ya
+> expresado en GB. Confundirlos es un error de ~700x. Hay un test que lo
+> fija.
 
 ### 3. OpenAI — transcripción whisper-1
 
 ```bash
 OPENAI_ADMIN_KEY=sk-admin-...
+OPENAI_COST_LINE_ITEMS=whisper   # default; vacío = toda la organización
 ```
 
 Tiene que ser una **admin key**, no la API key normal — la común no puede
 leer facturación.
+
+> **Filtrar es obligatorio.** La organización de OpenAI está compartida
+> con otros proyectos: jul-2026 fueron **$567,43 en toda la org**
+> (GPT-5.4, GPT-4.1, modelos de imagen, batch API) contra **$20,15 de
+> whisper**, que es lo único que usa GenLy. Sin filtro el costo por video
+> queda inflado 28x. El `breakdown` igual lista lo excluido, así que se ve
+> qué quedó afuera y por qué el número no coincide con el titular del
+> dashboard de OpenAI.
 
 ### 4. Cloudflare R2 — storage ⚠️ nunca se midió
 
@@ -166,15 +211,21 @@ sola tarifa mezclada no los distingue. Sirve para ver la magnitud y
 detectar saltos, no para cuadrar al centavo. Es la línea más chica del
 stack (~$5/mes), así que no vale la pena refinarla más.
 
-### 6. GitHub — Actions
+### 6. GitHub — Actions ⚠️ no vale la pena
 
 ```bash
-GITHUB_BILLING_TOKEN=ghp_...
+GITHUB_BILLING_TOKEN=ghp_...  # necesita el scope `user`
 GITHUB_BILLING_ORG=...        # o GITHUB_BILLING_USER
 ```
 
-Hoy factura $0 (cubierto por el plan). El endpoint reporta el **ciclo de
-facturación**, no el mes calendario.
+**Factura $0.** En ago-2026 el uso bruto medido fue $21,93 y el descuento
+incluido del plan fue $21,93 — neto cero. El único costo real de GitHub
+es la suscripción Pro de $4/mes, que ya está en `fixed`.
+
+Si igual lo querés conectar: en cuentas personales el PAT necesita el
+scope **`user`**. `repo` + `admin:org` no alcanzan y el endpoint tira
+**404** — un 404 acá significa scope faltante, no cuenta inexistente.
+El endpoint reporta el **ciclo de facturación**, no el mes calendario.
 
 ### 7. Suscripciones fijas
 
