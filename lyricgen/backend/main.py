@@ -115,6 +115,7 @@ from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe, _normalize_movement_style
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
+from transcription_language import resolve_transcription_language
 from batch_profiles import (
     RenderProfileError, normalize_render_profile, pipeline_fields,
 )
@@ -4236,19 +4237,24 @@ async def transcribe_uploaded(
                 and _result.get("timing_source") == "anchor_ctc"):
             _result = await _maybe_ctc_retime(_result, audio_path, job_id,
                                               _row_artist, _row_title)
+        _post_lang = _resolve_postprocess_language(
+            body.language, _result, job_id=job_id,
+        )
         _result = await _maybe_adlib_filter(
             _result, audio_path, job_id,
             live_hint=bool(getattr(body, "live", False))
-            or _looks_live(_row_title, _row_filename))
+            or _looks_live(_row_title, _row_filename),
+            language=_post_lang,
+        )
         _result = _maybe_repetition_reconcile(_result, job_id)
         _result = await _maybe_gap_rescue(_result, audio_path, job_id,
-                                          body.language or "es")
+                                          _post_lang)
         _result = await _maybe_word_vote(_result, audio_path, job_id,
-                                         body.language or "es")
+                                         _post_lang)
         _result = _maybe_chorus_snap(_result, job_id)
         _result = _maybe_phrase_segment(_result, job_id)
         from lyrics_format import format_lyrics_pass as _fmt
-        return await _fmt(_result, language=body.language or "es")
+        return await _fmt(_result, language=_post_lang)
     finally:
         _release_transcription_slot(transcription_lease)
 
@@ -4920,17 +4926,21 @@ async def transcribe_endpoint(
         filename=file.filename,
     )
     _result = await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
+    _post_lang = _resolve_postprocess_language(
+        language, _result, job_id=job_id,
+    )
     _result = await _maybe_adlib_filter(_result, audio_path, job_id,
-                                        live_hint=_looks_live(title, file.filename))
+                                        live_hint=_looks_live(title, file.filename),
+                                        language=_post_lang)
     _result = _maybe_repetition_reconcile(_result, job_id)
     _result = await _maybe_gap_rescue(_result, audio_path, job_id,
-                                      language or "es")
+                                      _post_lang)
     _result = await _maybe_word_vote(_result, audio_path, job_id,
-                                     language or "es")
+                                     _post_lang)
     _result = _maybe_chorus_snap(_result, job_id)
     _result = _maybe_phrase_segment(_result, job_id)
     from lyrics_format import format_lyrics_pass as _fmt
-    return await _fmt(_result, language=language or "es")
+    return await _fmt(_result, language=_post_lang)
 
 
 from ctc_cascade_veto import _ctc_cascade_veto  # noqa: E402
@@ -4947,6 +4957,23 @@ def _looks_live(*texts) -> bool:
     vivos en el título ('Live In Buenos Aires 2001'); para archivos sin
     etiquetar existe el toggle del operador (body.live)."""
     return any(t and _LIVE_MARKER_RE.search(str(t)) for t in texts)
+
+
+def _resolve_postprocess_language(requested_language, result, *, job_id: str):
+    """Resolve auto once, then reuse the same language in every post-pass."""
+    reference = result.get("reference_lyrics", "") if isinstance(result, dict) else ""
+    resolved = resolve_transcription_language(
+        requested_language,
+        result=result if isinstance(result, dict) else None,
+        reference_text=reference,
+    )
+    logger.info(
+        "[LANGUAGE] requested=%s resolved=%s job=%s",
+        requested_language or "auto",
+        resolved or "provider-auto",
+        job_id,
+    )
+    return resolved
 
 
 def _maybe_repetition_reconcile(result, job_id: str):
@@ -4992,7 +5019,7 @@ def _maybe_repetition_reconcile(result, job_id: str):
 
 
 async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
-                            language: str = "es"):
+                            language: str | None = None):
     """Post-pass gateado (GAP_RESCUE_ENABLED, default off): re-transcribe los
     tramos donde el ASR de la cascada quedó SORDO.
 
@@ -5043,7 +5070,7 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
         import lead_in as _li
         nuevo, stats = await asyncio.to_thread(
             _gr.rescue, segs, audio_path, stem_path=_stem, audio_duration=dur,
-            language=language or "es", lead_s=_li.lead_seconds(),
+            language=language, lead_s=_li.lead_seconds(),
             hold_s=_li.hold_seconds(),
             asr_words=result.get("_asr_words"),
         )
@@ -5081,7 +5108,7 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
 
 
 async def _maybe_word_vote(result, audio_path: str, job_id: str,
-                           language: str = "es"):
+                           language: str | None = None):
     """Post-pass gateado (WORD_VOTE_ENABLED, default off): el audio corrige
     a la referencia palabra por palabra, la referencia aporta la ortografía.
 
@@ -5119,7 +5146,7 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
         from gap_rescue import _transcribe_window
         witness = await asyncio.to_thread(
             _transcribe_window, _stem, 0.0, float(dur or 600.0),
-            language or "es",
+            language,
         )
         nuevo, stats = _wv.vote(segs, witness)
         if stats.get("lines_changed"):
@@ -5215,7 +5242,8 @@ def _maybe_phrase_segment(result, job_id: str):
 
 
 async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
-                              live_hint: bool = False):
+                              live_hint: bool = False,
+                              language: str | None = None):
     """Paso post-cascada (gate ADLIB_CONSENSUS_ENABLED, default off): descarta
     líneas fantasma alucinadas en zonas de ad-lib y colapsa los 'uh'
     fragmentados. Corre en TODOS los caminos de la cascada (whisperx,
@@ -5297,7 +5325,7 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
                                "de cola (job=%s)", e, job_id)
         if not _has_adlib and _tail_after is None and not _audit_on:
             return result
-        _tw = _make_stem_window_transcriber(_stem)
+        _tw = _make_stem_window_transcriber(_stem, language=language)
         _before = len(segs)
         filtered = await asyncio.to_thread(
             _ac.filter_and_collapse, segs, _tw, tail_after=_tail_after,
@@ -5327,7 +5355,10 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
     return result
 
 
-def _make_stem_window_transcriber(stem_path: str):
+def _make_stem_window_transcriber(
+    stem_path: str,
+    language: str | None = None,
+):
     """Devuelve transcribe_window(start, end) -> str: recorta esa ventana del
     stem de voz y la transcribe con whisper-1. Para el filtro de consenso
     (adlib_consensus): solo se llama en líneas candidatas (pocas por canción).
@@ -5348,7 +5379,7 @@ def _make_stem_window_transcriber(stem_path: str):
                 check=True, timeout=30,
             )
             from pipeline import _transcribe_via_openai_api as _wx
-            segs = _wx(clip, language="es") or []
+            segs = _wx(clip, language=language) or []
             return " ".join((s.get("text") or "").strip() for s in segs).strip()
         except Exception as e:
             logger.warning("[ADLIB] window %.1f-%.1f transcribe failed: %s",
@@ -6067,6 +6098,27 @@ async def _run_transcription_for_job(
                     _removed_credits,
                 )
 
+        # The upload wizard defaults to Auto.  Resolve that choice from the
+        # canonical lyrics before the primary ASR runs, so English references
+        # are transcribed as English while Spanish references retain the
+        # explicit hint that historically made Whisper more reliable.
+        if not lang and lrc:
+            _reference_for_language = (
+                (lrc.get("plain") or "").strip()
+                or (lrc.get("synced") or "").strip()
+            )
+            _detected_lang = resolve_transcription_language(
+                None,
+                reference_text=_reference_for_language,
+            )
+            if _detected_lang:
+                lang = _detected_lang
+                logger.info(
+                    "[LANGUAGE] auto-resolved %s from reference before primary ASR job=%s",
+                    lang,
+                    job_id,
+                )
+
         # ─────────────────────────────────────────────────────────────────
         # WORLD-CLASS audio-as-truth pipeline (default 2026-05-25).
         #
@@ -6569,7 +6621,13 @@ async def _run_transcription_for_job(
                                 )
                                 _wa_segs = await asyncio.to_thread(
                                     _wwa, _wa_audio, _canonical_lines,
-                                    language=lang or "es",
+                                    language=(
+                                        resolve_transcription_language(
+                                            lang,
+                                            reference_text=_canonical,
+                                        )
+                                        or lang
+                                    ),
                                     job_id=job_id,
                                 )
                                 if _wa_segs:

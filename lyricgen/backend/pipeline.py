@@ -83,6 +83,7 @@ from background_policy import (
 )
 from render_spec import FPS_RATIONAL, RenderSpec
 from subprocess_utils import run_checked, SubprocessExecutionError  # noqa: F401 — exported for upstream catches
+from transcription_language import resolve_transcription_language
 
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets")
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
@@ -6008,7 +6009,8 @@ def _validate_background_asset_for_job(
 
 def _validate_segments_against_audio(audio_path: str, segments: list[dict],
                                       job_id: str | None = None,
-                                      n_samples: int = 3) -> list[dict]:
+                                      n_samples: int = 3,
+                                      language: str | None = None) -> list[dict]:
     """Sample N short audio clips, transcribe each with Whisper, and
     flag any segment whose text disagrees with what Whisper hears in
     the same window. Returns segments with `seg["flagged"] = True`
@@ -6043,6 +6045,10 @@ def _validate_segments_against_audio(audio_path: str, segments: list[dict],
     if not candidates:
         return segments
     n = min(n_samples, len(candidates))
+    validation_language = resolve_transcription_language(
+        language,
+        result={"segments": segments},
+    )
     # Spread the picks across the song so we don't sample 3 lines from
     # the same chorus repetition.
     step = max(1, len(candidates) // n)
@@ -6067,7 +6073,11 @@ def _validate_segments_against_audio(audio_path: str, segments: list[dict],
                 )
                 # Re-transcribe just this slice
                 from pipeline import transcribe as _transcribe  # self-import for testing
-                heard_segs = _transcribe(clip_path, language="es", lyrics_hint=None)
+                heard_segs = _transcribe(
+                    clip_path,
+                    language=validation_language,
+                    lyrics_hint=None,
+                )
                 heard_text = " ".join((s.get("text") or "").strip() for s in (heard_segs or [])).lower()
                 expected = (seg.get("text") or "").lower().strip()
                 if not heard_text or not expected:
