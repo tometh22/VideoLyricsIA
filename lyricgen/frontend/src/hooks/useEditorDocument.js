@@ -20,12 +20,14 @@ export function useEditorDocument({ jobId, enabled, request }) {
   const [document, setDocument] = useState(null);
   const [loading, setLoading] = useState(Boolean(enabled && jobId));
   const [error, setError] = useState(null);
+  const [errorStatus, setErrorStatus] = useState(null);
   const [conflict, setConflict] = useState(null);
   const [lock, setLock] = useState(null);
   const revisionRef = useRef(0);
   const mountedRef = useRef(true);
   const conflictRef = useRef(null);
   const saveChainRef = useRef(Promise.resolve());
+  const hasDocument = Boolean(document);
   conflictRef.current = conflict;
 
   const applyDocument = useCallback((value) => {
@@ -39,14 +41,24 @@ export function useEditorDocument({ jobId, enabled, request }) {
     if (!enabled || !jobId || !request) return null;
     setLoading(true);
     setError(null);
+    setErrorStatus(null);
     try {
       const response = await request(`/editor/${jobId}`);
       const body = await responseBody(response);
-      if (!response.ok) throw new Error(body?.detail || `editor_load_${response.status}`);
+      if (!response.ok) {
+        const detail = typeof body?.detail === "string"
+          ? body.detail : `editor_load_${response.status}`;
+        const loadError = new Error(detail);
+        loadError.status = response.status;
+        throw loadError;
+      }
       applyDocument(body);
       return body;
     } catch (err) {
-      if (mountedRef.current) setError(String(err));
+      if (mountedRef.current) {
+        setError(String(err));
+        setErrorStatus(Number.isInteger(err?.status) ? err.status : null);
+      }
       return null;
     } finally {
       if (mountedRef.current) setLoading(false);
@@ -60,7 +72,10 @@ export function useEditorDocument({ jobId, enabled, request }) {
   }, [load]);
 
   useEffect(() => {
-    if (!enabled || !jobId || !request) return undefined;
+    // A lock only exists after the durable document loaded.  Starting the
+    // heartbeat before that point used to hammer a failing historical job
+    // with a 404 every 15 seconds while the UI remained silently blocked.
+    if (!enabled || !jobId || !request || !hasDocument) return undefined;
     let stopped = false;
     const heartbeat = async () => {
       try {
@@ -79,7 +94,7 @@ export function useEditorDocument({ jobId, enabled, request }) {
       window.clearInterval(timer);
       request(`/editor/${jobId}/lock`, { method: "DELETE", keepalive: true }).catch(() => {});
     };
-  }, [enabled, jobId, request]);
+  }, [enabled, hasDocument, jobId, request]);
 
   const performSave = useCallback(async (segments, checkpoint = "draft") => {
     if (!enabled || !jobId || !request) return { ok: false, reason: "disabled" };
@@ -210,7 +225,7 @@ export function useEditorDocument({ jobId, enabled, request }) {
   }, [applyDocument, document, jobId, request]);
 
   return {
-    document, loading, error, conflict, lock,
+    document, loading, error, errorStatus, conflict, lock,
     revisionRef, load, save, reconcile, stageConflict, resolve,
     listVersions, restoreVersion,
   };

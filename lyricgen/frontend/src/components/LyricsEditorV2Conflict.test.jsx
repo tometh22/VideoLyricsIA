@@ -88,6 +88,39 @@ afterEach(() => {
 });
 
 describe("Editor 2.0 stale draft recovery", () => {
+  it("explains a failed durable load and unblocks only after an explicit retry succeeds", async () => {
+    localStorage.clear();
+    let loadAttempts = 0;
+    const request = vi.fn(async (path, options = {}) => {
+      if (path === `/editor/${JOB}` && !options.method) {
+        loadAttempts += 1;
+        if (loadAttempts === 1) return reply({ detail: "Job not found." }, 404);
+        return reply({
+          job_id: JOB, revision: 5, segments: SERVER, original_segments: SERVER,
+          updated_by: null, updated_at: "2026-08-06T10:00:00Z",
+          lock: { active: false },
+        });
+      }
+      if (path.endsWith("/lock/heartbeat")) return reply({ acquired: true, user: USER });
+      if (path.endsWith("/lock") && options.method === "DELETE") return reply({ released: true });
+      if (path === "/analytics/events") return reply({ accepted: 1, rejected: 0 });
+      return reply({}, 404);
+    });
+    renderEditor(request);
+
+    const loadError = await screen.findByRole("alertdialog", {
+      name: "No pudimos abrir la versión editable",
+    });
+    expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeDisabled();
+    expect(request.mock.calls.some(([path]) => path.endsWith("/lock/heartbeat"))).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Reintentar" }));
+    await waitFor(() => expect(loadError).not.toBeInTheDocument());
+    expect(await screen.findByDisplayValue("versión equipo")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
+    expect(request.mock.calls.some(([path]) => path.endsWith("/lock/heartbeat"))).toBe(true);
+  });
+
   it("never autosaves a stale draft and can explicitly use the team version", async () => {
     const request = makeRequest();
     renderEditor(request);
