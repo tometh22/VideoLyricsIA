@@ -196,7 +196,7 @@ def run_transcription_job(
         _looks_live, _maybe_anchor_align, _maybe_ctc_retime,
         _maybe_adlib_filter, _maybe_chorus_snap, _maybe_gap_rescue,
         _maybe_phrase_segment, _maybe_repetition_reconcile, _maybe_word_vote,
-        _run_transcription_for_job,
+        _resolve_postprocess_language, _run_transcription_for_job,
     )
     from jobs import update_job, get_job
     import storage
@@ -262,17 +262,22 @@ def run_transcription_job(
             if not (isinstance(r, dict)
                     and r.get("timing_source") == "anchor_ctc"):
                 r = await _maybe_ctc_retime(r, audio_path, job_id, artist, title)
+            _post_lang = _resolve_postprocess_language(
+                language, r, job_id=job_id,
+            )
             r = await _maybe_adlib_filter(
                 r, audio_path, job_id,
-                live_hint=live or _looks_live(title, filename))
+                live_hint=live or _looks_live(title, filename),
+                language=_post_lang,
+            )
             r = _maybe_repetition_reconcile(r, job_id)
-            r = await _maybe_gap_rescue(r, audio_path, job_id, language or "es")
-            r = await _maybe_word_vote(r, audio_path, job_id, language or "es")
+            r = await _maybe_gap_rescue(r, audio_path, job_id, _post_lang)
+            r = await _maybe_word_vote(r, audio_path, job_id, _post_lang)
             r = _maybe_chorus_snap(r, job_id)
             r = _maybe_phrase_segment(r, job_id)
             from lyrics_format import format_lyrics_pass as _fmt
             _antes = _coverage_de(r)
-            r = await _fmt(r, language=language or "es")
+            r = await _fmt(r, language=_post_lang)
             return _medir_cobertura_final(r, job_id, _antes, audio_path)
 
         result = asyncio.run(_run_with_retime())

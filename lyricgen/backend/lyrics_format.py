@@ -37,8 +37,11 @@ _SPLIT_MIN_WORDS = 8   # segments shorter than this are never split
 _SPLIT_MAX_PARTS = 3   # never more than 3 sub-lines per segment
 
 
-def _lang_name(language: str) -> str:
-    return _LANG_NAMES.get((language or "es").lower()[:3], "Spanish")
+def _lang_name(language: str | None) -> str:
+    """Human-readable prompt label without treating auto as Spanish."""
+    if not language:
+        return "the source language"
+    return _LANG_NAMES.get(language.lower()[:3], "the source language")
 
 
 # ── Timestamp assignment ──────────────────────────────────────────────────────
@@ -112,9 +115,9 @@ def _build_prompt(texts: list, lang: str) -> str:
     n = len(texts)
     numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
     return (
-        f"You are correcting song lyric transcription orthography for a {lang} song.\n\n"
+        f"You are correcting song lyric transcription orthography in {lang}.\n\n"
         "For each numbered line:\n"
-        f"- Fix {lang} accents and diacritics (e.g. fragil→frágil, mas→más)\n"
+        f"- Fix accents and diacritics appropriate for {lang}\n"
         "- Capitalize the first word of each line\n"
         "- Fix punctuation (commas, periods, ellipsis)\n"
         "- For Spanish: add inverted opening marks (¿, ¡) where the line is a question or exclamation\n\n"
@@ -154,7 +157,7 @@ def _parse_response(raw: str, n_input: int) -> "dict | None":
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-async def format_lyrics_pass(result: dict, language: str = "es") -> dict:
+async def format_lyrics_pass(result: dict, language: str | None = None) -> dict:
     """Orthographic correction + line splitting on the final segment list.
 
     Only touches `seg["text"]`, `seg["start"]`, `seg["end"]` (and `seg["words"]`

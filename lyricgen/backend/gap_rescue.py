@@ -168,7 +168,7 @@ def _agrupar_en_lineas(words: list[dict]) -> list[list[dict]]:
 
 
 def _transcribe_window(audio_path: str, ini: float, dur: float,
-                       language: str = "es") -> list[dict]:
+                       language: str | None = None) -> list[dict]:
     """Recorta [ini, ini+dur] y lo transcribe con whisper-1 pidiendo
     timestamps por PALABRA. Devuelve words en el marco temporal del audio
     COMPLETO (ya desplazadas). [] ante cualquier fallo."""
@@ -188,11 +188,16 @@ def _transcribe_window(audio_path: str, ini: float, dur: float,
             return []
         from openai import OpenAI
         with open(clip, "rb") as f:
-            r = OpenAI().audio.transcriptions.create(
-                model="whisper-1", file=f, response_format="verbose_json",
-                timestamp_granularities=["word"], temperature=0.0,
-                language=language or "es",
-            )
+            kwargs = {
+                "model": "whisper-1",
+                "file": f,
+                "response_format": "verbose_json",
+                "timestamp_granularities": ["word"],
+                "temperature": 0.0,
+            }
+            if language:
+                kwargs["language"] = language
+            r = OpenAI().audio.transcriptions.create(**kwargs)
         out = []
         for w in (getattr(r, "words", None) or []):
             try:
@@ -257,7 +262,7 @@ def _voiced_overlap(a: float, b: float, regs: list[tuple]) -> float:
 
 def rescue(segments: list[dict], audio_path: str, *,
            stem_path: str | None = None,
-           audio_duration: float | None = None, language: str = "es",
+           audio_duration: float | None = None, language: str | None = None,
            lead_s: float = 0.0, hold_s: float = 0.0,
            asr_words: list[dict] | None = None) -> tuple[list[dict], dict]:
     """Devuelve (segmentos + líneas rescatadas, stats). Nunca levanta.
