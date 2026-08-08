@@ -9230,10 +9230,19 @@ class VeoBudgetExceeded(RuntimeError):
 # llegó a 26 llamadas — unos $16 en un video que se vende a $8. Un job sano
 # usa 1-3.
 #
-# El default es holgado a propósito: 10 sólo atrapa fugas reales (re-rolls
-# de escenas en loop, reintentos que no cachean porque el prompt sale con
-# temperature=0.8 y cambia el hash) y no toca el trabajo normal. Bajarlo a
-# 4-6 aprieta más, pero puede cortar storyboards multi-escena legítimos.
+# El default es holgado a propósito: 10 sólo atrapa fugas reales — re-rolls
+# de escenas en loop (SCENE_REROLL_MAX=5 por escena × MAX_UNIQUE_SCENES=6) —
+# y no toca el trabajo normal. Bajarlo a 4-6 aprieta más, pero puede cortar
+# storyboards multi-escena legítimos.
+#
+# CORRECCIÓN (ago-2026): una versión anterior de este comentario decía que
+# los reintentos re-pagan Veo "porque el prompt sale con temperature=0.8 y
+# cambia el hash". Es FALSO y no estaba verificado: no existe ningún
+# temperature=0.8 en el código (los prompts se generan con 0.0-0.1), y
+# `queue_jobs.py` documenta que las fallas de Veo caen al gradient fallback
+# sin re-lanzar, así que el Retry de RQ NO reintenta Veo. El re-pago real
+# viene de los re-rolls y de `policy-recovery`, que fuerza cache miss.
+#
 # `VEO_MAX_CALLS_PER_JOB=0` lo desactiva.
 VEO_MAX_CALLS_PER_JOB = int(os.environ.get("VEO_MAX_CALLS_PER_JOB", "10"))
 

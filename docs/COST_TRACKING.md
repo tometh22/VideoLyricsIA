@@ -341,10 +341,13 @@ Las causas, verificadas en el código:
   fondo nuevo a $0,80 aunque el video no se renderice nunca.
 - **Rechazos.** Un job rechazado quema ~5 llamadas Veo: el validador
   bloquea y la regeneración `policy-recovery` **fuerza un cache miss**.
-- **Retry del worker ×3.** El comentario en `queue_jobs.py` asume que el
-  cache de R2 salva el reintento. **Es falso**: el prompt se genera con
-  `temperature=0.8`, así que cada retry produce un hash distinto y se
-  vuelve a pagar entero.
+- ~~**Retry del worker ×3** re-paga porque el prompt sale con
+  `temperature=0.8`.~~ **CORREGIDO (ago-2026): era falso.** No existe ningún
+  `temperature=0.8` en el código — los prompts se generan con 0.0-0.1 — y
+  `queue_jobs.py:744-747` documenta que las fallas de Veo caen al gradient
+  fallback sin re-lanzar, así que el `Retry` de RQ **no** reintenta Veo. El
+  reclamo venía de un reporte no verificado y se propagó a la doc y a un
+  comentario del código antes de que alguien lo chequeara.
 - **Re-roll de escenas.** 5 por escena × 6 escenas = hasta $24 en un solo
   job, y no consume el presupuesto de 3 edits.
 
