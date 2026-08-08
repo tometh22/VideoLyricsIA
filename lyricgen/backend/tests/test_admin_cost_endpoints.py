@@ -224,3 +224,53 @@ def test_umg_endpoint_truncates_song_detail(client, admin_token):
     body = res.json()
     assert len(body["umg"]["by_song"]) <= 1
     assert "by_song_truncated" in body["umg"]
+
+
+# ---------------------------------------------------------------------------
+# Pool hygiene
+# ---------------------------------------------------------------------------
+
+def test_cost_endpoints_do_not_leak_db_sessions(client, admin_token):
+    """These endpoints open sessions the framework does NOT manage — the
+    peer environment and the deliveries portal — so nothing returns them
+    automatically.
+
+    Without `DELIVERIES_DATABASE_URL`, `DeliveriesSessionLocal` *is*
+    `SessionLocal`, so a leak here drains the MAIN pool. And `pool_stats()`
+    reports the whole pool, so one stranded session fails health checks and
+    unrelated leak tests, pointing the blame anywhere but here. Hence the
+    `scoped_*` context managers, and hence this test.
+    """
+    from database import pool_stats
+
+    before = pool_stats().get("checked_out", 0)
+    for path in ("/admin/cost/umg", "/admin/cost/business",
+                 "/admin/quality/change-requests",
+                 "/admin/cost/unit-economics?period=2019-05",
+                 "/admin/cost/reconcile?period=2019-05"):
+        assert client.get(path, headers=auth(admin_token)).status_code == 200, path
+    # SQLite returns {} from pool_stats — the assertion is a no-op there but
+    # real in CI, which runs Postgres.
+    assert pool_stats().get("checked_out", 0) == before
+
+
+def test_change_requests_endpoint_requires_admin(client, user_token):
+    res = client.get("/admin/quality/change-requests", headers=auth(user_token))
+    assert res.status_code == 403
+
+
+def test_change_requests_endpoint_shape(client, admin_token):
+    res = client.get("/admin/quality/change-requests", headers=auth(admin_token))
+    assert res.status_code == 200
+    body = res.json()
+    for key in ("requests", "categories", "requests_per_delivery",
+                "excluded_as_noise", "unclassified"):
+        assert key in body
+    keys = {c["key"] for c in body["categories"]}
+    assert "puntos_finales" in keys
+
+
+def test_change_requests_rejects_malformed_period(client, admin_token):
+    res = client.get("/admin/quality/change-requests?period=2026-13",
+                     headers=auth(admin_token))
+    assert res.status_code == 400

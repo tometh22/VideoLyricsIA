@@ -970,7 +970,7 @@ async def admin_cost_unit_economics(
     # only the local environment would divide two-env spend by one-env
     # output — and since managed UMG production runs in staging, on prod
     # that inflates cost-per-video by roughly an order of magnitude.
-    from database import peer_session
+    from database import scoped_peer_db
 
     def _count(session):
         base = session.query(func.count(Job.id)).filter(
@@ -982,16 +982,13 @@ async def admin_cost_unit_economics(
         )
 
     delivered, created = _count(db)
-    peer = peer_session()
     counted_environments = 1
-    if peer is not None:
-        try:
+    with scoped_peer_db() as peer:
+        if peer is not None:
             d2, c2 = _count(peer)
             delivered += d2
             created += c2
             counted_environments = 2
-        finally:
-            peer.close()
 
     cost_per_delivered = round(real_total / delivered, 4) if delivered else None
     # Kept only to show the operator how misleading it is next to the real
@@ -1111,17 +1108,14 @@ async def admin_cost_reconcile(
 
     modeled, by_tool = _modeled(db)
     # The invoice is for the shared GCP project, i.e. both environments.
-    from database import peer_session
-    peer = peer_session()
+    from database import scoped_peer_db
     counted_environments = 1
-    if peer is not None:
-        try:
+    with scoped_peer_db() as peer:
+        if peer is not None:
             peer_total, peer_tools = _modeled(peer)
             modeled += peer_total
             by_tool += peer_tools
             counted_environments = 2
-        finally:
-            peer.close()
     by_tool.sort(key=lambda r: -r["cost"])
 
     variance = invoiced - modeled
@@ -1161,7 +1155,7 @@ def _run_attribution(db, period: str | None):
     of quietly under-reporting.
     """
     import cost_attribution as ca
-    from database import PEER_DATABASE_URL, peer_session
+    from database import PEER_DATABASE_URL, scoped_deliveries_db, scoped_peer_db
 
     if period:
         try:
@@ -1169,20 +1163,15 @@ def _run_attribution(db, period: str | None):
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-    peer = peer_session()
-    sessions = {"local": db}
-    if peer is not None:
-        sessions["peer"] = peer
-    try:
-        # The deliveries portal is prod-backed. `get_deliveries_db` already
-        # routes to it, so reuse that rather than guessing which session
-        # holds the table.
-        from database import DeliveriesSessionLocal
-        portal_db = DeliveriesSessionLocal()
-        try:
+    with scoped_peer_db() as peer:
+        sessions = {"local": db}
+        if peer is not None:
+            sessions["peer"] = peer
+
+        # The deliveries portal is prod-backed; `scoped_deliveries_db` already
+        # routes there and guarantees the session is returned to the pool.
+        with scoped_deliveries_db() as portal_db:
             portal = ca.collect_portal_songs(portal_db)
-        finally:
-            portal_db.close()
 
         jobs_by_env = {
             env: ca.collect_jobs(s, env, period=period)
@@ -1206,9 +1195,6 @@ def _run_attribution(db, period: str | None):
             )
         result["peer_configured"] = bool(PEER_DATABASE_URL)
         return result
-    finally:
-        if peer is not None:
-            peer.close()
 
 
 @router.get("/cost/umg")
@@ -1293,10 +1279,9 @@ async def admin_change_requests(
     desde los dos entornos.
     """
     import change_request_stats as crs
-    from database import Delivery, DeliveryChangeRequest, DeliveriesSessionLocal
+    from database import Delivery, DeliveryChangeRequest, scoped_deliveries_db
 
-    ddb = DeliveriesSessionLocal()
-    try:
+    with scoped_deliveries_db() as ddb:
         q = ddb.query(DeliveryChangeRequest)
         dq = ddb.query(func.count(Delivery.id)).filter(
             Delivery.removed_at.is_(None))
@@ -1322,8 +1307,6 @@ async def admin_change_requests(
                 for r in rows
             ]
         return result
-    finally:
-        ddb.close()
 
 
 def _month_bounds(period: str):

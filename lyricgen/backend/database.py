@@ -291,6 +291,37 @@ def scoped_db():
         db.close()
 
 
+@contextmanager
+def scoped_deliveries_db():
+    """Sesión a la DB del portal, garantizada cerrada.
+
+    Sin `DELIVERIES_DATABASE_URL`, `DeliveriesSessionLocal` ES `SessionLocal`,
+    así que una fuga acá drena el pool PRINCIPAL. Y como `pool_stats()` mide
+    el pool entero, una sola sesión colgada rompe chequeos de salud y tests
+    de fuga que no tienen nada que ver con el endpoint culpable. Usar esto en
+    vez de abrir la sesión a mano."""
+    db = DeliveriesSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@contextmanager
+def scoped_peer_db():
+    """Sesión al otro entorno, o None si no está configurado.
+
+    Pensado para `with scoped_peer_db() as peer:` seguido de
+    `if peer is not None:` — el bloque corre igual cuando no hay peer, así el
+    llamador no necesita un camino de cierre aparte que se pueda olvidar."""
+    db = peer_session()
+    try:
+        yield db
+    finally:
+        if db is not None:
+            db.close()
+
+
 def pool_stats() -> dict:
     """Best-effort snapshot of the SQLAlchemy connection pool.
 
