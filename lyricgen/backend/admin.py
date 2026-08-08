@@ -1083,6 +1083,153 @@ async def admin_cost_reconcile(
     }
 
 
+def _run_attribution(db, period: str | None):
+    """Shared helper for the attribution endpoints.
+
+    Collects from the local environment plus the peer one (staging↔prod)
+    when `PEER_DATABASE_URL` is configured. Managed UMG production runs in
+    staging under team accounts while Universal's self-service runs in
+    prod, so a single-environment answer is always partial — the caller
+    gets `environments` and `single_environment` so it can say so instead
+    of quietly under-reporting.
+    """
+    import cost_attribution as ca
+    from database import PEER_DATABASE_URL, peer_session
+
+    if period:
+        try:
+            ca.period_bounds(period)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    peer = peer_session()
+    sessions = {"local": db}
+    if peer is not None:
+        sessions["peer"] = peer
+    try:
+        # The deliveries portal is prod-backed. `get_deliveries_db` already
+        # routes to it, so reuse that rather than guessing which session
+        # holds the table.
+        from database import DeliveriesSessionLocal
+        portal_db = DeliveriesSessionLocal()
+        try:
+            portal = ca.collect_portal_songs(portal_db)
+        finally:
+            portal_db.close()
+
+        jobs_by_env = {
+            env: ca.collect_jobs(s, env, period=period)
+            for env, s in sessions.items()
+        }
+        all_time_keys: set[str] = set()
+        if period:
+            for s in sessions.values():
+                all_time_keys |= ca.collect_song_keys(s)
+
+        result = ca.build_attribution(
+            jobs_by_env, portal, period=period,
+            all_time_song_keys=all_time_keys if period else None,
+        )
+        result["single_environment"] = peer is None
+        if peer is None:
+            result["warning"] = (
+                "PEER_DATABASE_URL no configurada: solo se midió este "
+                "entorno. La producción gestionada de UMG corre en STAGING, "
+                "así que el costo puede quedar muy subestimado."
+            )
+        result["peer_configured"] = bool(PEER_DATABASE_URL)
+        return result
+    finally:
+        if peer is not None:
+            peer.close()
+
+
+@router.get("/cost/umg")
+async def admin_cost_umg(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    period: str = Query("", description="YYYY-MM; vacío = todo el histórico"),
+    revenue_usd: float = Query(0.0, ge=0, le=1_000_000,
+                               description="ingreso del período, para el margen"),
+    basis: str = Query("cost", pattern="^(cost|jobs)$"),
+    top: int = Query(25, ge=1, le=500),
+):
+    """Costo real por canción entregada a Universal (niveles 1 y 2).
+
+    Nivel 1 es el costo directo de IA de las canciones que UMG pidió —
+    las del portal `umg.genly.pro` más las de los tenants `universal_*` —
+    contando TODOS los jobs de cada canción (variantes, re-renders,
+    ediciones), que es lo que realmente se pagó por entregarla.
+
+    Nivel 2 suma la parte prorrateada de infraestructura compartida, y sale
+    solo si hay snapshots de facturación del período (POST /admin/cost/refresh).
+
+    El denominador es la CANCIÓN, no el job: un entregable lleva ~2,4 jobs,
+    así que el costo por job subestima ~2,4x lo que cuesta entregar.
+    """
+    import billing_sources
+    from database import CostSnapshot
+
+    period = period.strip() or None
+    result = _run_attribution(db, period)
+
+    # Trim the per-song detail; the full list is large and the caller
+    # almost always wants the expensive tail.
+    songs = result["umg"]["by_song"]
+    result["umg"]["by_song_truncated"] = len(songs) > top
+    result["umg"]["by_song"] = songs[:top]
+
+    # Level 2 needs the real invoices for the period.
+    if period:
+        rows = (
+            db.query(CostSnapshot)
+            .filter(CostSnapshot.period == period,
+                    CostSnapshot.status == "ok")
+            .all()
+        )
+        invoices = {r.source: r.amount_usd for r in rows
+                    if r.amount_usd is not None}
+        if invoices:
+            import cost_attribution as ca
+            ca.add_total_cost(
+                result, invoices,
+                revenue_usd=revenue_usd or None, basis=basis,
+            )
+            missing = sorted(set(billing_sources.SOURCES) - set(invoices))
+            result["umg_total"]["invoices_missing_sources"] = missing
+            result["umg_total"]["invoices_complete"] = not missing
+        else:
+            result["umg_total_unavailable"] = (
+                f"sin snapshots de facturación para {period} — corré "
+                f"POST /admin/cost/refresh?period={period}"
+            )
+    return result
+
+
+@router.get("/cost/business")
+async def admin_cost_business(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    period: str = Query("", description="YYYY-MM; vacío = todo el histórico"),
+):
+    """A qué se fue cada dólar del negocio (nivel 3).
+
+    Clasifica TODO el gasto de ambos entornos: producción de UMG, otros
+    clientes, automatización/CI (golden_render_bot, smokes, e2e) e I+D
+    interno. Sirve para separar costo de bienes vendidos de costo de
+    operar — lo segundo no se le carga al precio del cliente.
+
+    El orden de clasificación importa y está fijado por tests: un job del
+    render bot que reprocesa una canción real del catálogo cuenta como CI,
+    nunca como producción del cliente.
+    """
+    result = _run_attribution(db, period.strip() or None)
+    # The per-song detail belongs to /cost/umg; keep this response about
+    # the business-wide split.
+    result["umg"].pop("by_song", None)
+    return result
+
+
 # NOTE: this catch-all must stay AFTER every literal /cost/<name> route.
 # FastAPI matches in registration order, so declaring it earlier made
 # `/admin/cost/real` resolve here with tenant_id="real" — a 200 with an

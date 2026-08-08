@@ -161,3 +161,60 @@ def test_reconcile_rejects_malformed_period(client, admin_token):
     res = client.get("/admin/cost/reconcile?period=nope",
                      headers=auth(admin_token))
     assert res.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# /admin/cost/umg + /admin/cost/business — cross-environment attribution
+# ---------------------------------------------------------------------------
+
+def test_attribution_endpoints_require_admin(client, user_token):
+    for path in ("/admin/cost/umg", "/admin/cost/business"):
+        assert client.get(path, headers=auth(user_token)).status_code == 403
+
+
+def test_umg_endpoint_warns_when_peer_env_missing(client, admin_token):
+    """Managed production for UMG runs in STAGING. Answering from a single
+    environment is legitimate but partial, and the response has to say so —
+    silently reporting half the cost is the failure mode that started this
+    whole audit."""
+    res = client.get("/admin/cost/umg", headers=auth(admin_token))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["single_environment"] is True
+    assert "STAGING" in body["warning"]
+    assert body["peer_configured"] is False
+
+
+def test_umg_endpoint_rejects_malformed_period(client, admin_token):
+    res = client.get("/admin/cost/umg?period=2026-99",
+                     headers=auth(admin_token))
+    assert res.status_code == 400
+
+
+def test_umg_endpoint_reports_missing_invoices_instead_of_zero(client, admin_token):
+    """Level 2 needs the real bill. With no snapshot it must decline to
+    compute rather than prorate an invented total."""
+    res = client.get("/admin/cost/umg?period=2019-04",
+                     headers=auth(admin_token))
+    assert res.status_code == 200
+    body = res.json()
+    assert "umg_total" not in body
+    assert "refresh" in body["umg_total_unavailable"]
+
+
+def test_business_endpoint_returns_categories(client, admin_token):
+    res = client.get("/admin/cost/business", headers=auth(admin_token))
+    assert res.status_code == 200
+    body = res.json()
+    assert "by_category" in body["business"]
+    assert "total_direct_cost" in body["business"]
+    # The per-song detail belongs to /cost/umg, not here.
+    assert "by_song" not in body["umg"]
+
+
+def test_umg_endpoint_truncates_song_detail(client, admin_token):
+    res = client.get("/admin/cost/umg?top=1", headers=auth(admin_token))
+    assert res.status_code == 200
+    body = res.json()
+    assert len(body["umg"]["by_song"]) <= 1
+    assert "by_song_truncated" in body["umg"]

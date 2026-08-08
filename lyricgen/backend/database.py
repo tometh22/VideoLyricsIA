@@ -210,6 +210,56 @@ def deliveries_added_by(default_user_id):
     return default_user_id
 
 
+# ── Peer environment DB (read-only, para atribución de costos) ────────────
+# La producción gestionada para UMG corre en STAGING bajo cuentas del equipo,
+# mientras que el autoservicio de Universal corre en PROD bajo tenants
+# universal_*. Como además staging y prod comparten proyecto de GCP, bucket R2
+# y proyecto de Railway, ninguna factura se puede separar por entorno: el
+# costo real por canción SOLO sale mirando las dos bases a la vez.
+#
+# `PEER_DATABASE_URL` apunta al OTRO entorno (desde prod → staging; desde
+# staging → prod). En staging ya existe esa conexión como
+# DELIVERIES_DATABASE_URL, así que se reusa por defecto y no hay que
+# configurar nada. Sin la var, los endpoints de atribución siguen andando
+# con un solo entorno y lo dicen explícitamente — nunca reportan que el otro
+# entorno costó $0, que sería la mentira peligrosa.
+#
+# SOLO LECTURA por convención: no se corre create_all contra este engine y
+# ningún camino de escritura lo usa.
+PEER_DATABASE_URL = os.environ.get("PEER_DATABASE_URL", "").strip() or DELIVERIES_DATABASE_URL
+if PEER_DATABASE_URL.startswith("postgres://"):
+    PEER_DATABASE_URL = PEER_DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+if PEER_DATABASE_URL:
+    peer_engine = create_engine(
+        PEER_DATABASE_URL,
+        # Pool mínimo: cross-project por red pública y de uso esporádico
+        # (un par de consultas cuando alguien abre el panel de costos).
+        pool_size=int(os.environ.get("PEER_DB_POOL_SIZE", "1")),
+        max_overflow=int(os.environ.get("PEER_DB_MAX_OVERFLOW", "2")),
+        pool_pre_ping=True,
+        pool_recycle=120,
+        pool_reset_on_return="rollback",
+        echo=os.environ.get("SQL_ECHO", "").lower() == "true",
+        connect_args=_build_pg_connect_args(),
+    )
+    PeerSessionLocal = sessionmaker(
+        bind=peer_engine, autoflush=False, expire_on_commit=False
+    )
+else:
+    peer_engine = None
+    PeerSessionLocal = None
+
+
+def peer_session():
+    """Sesión al otro entorno, o None si no está configurado.
+
+    Devuelve None en vez de caer a la sesión local: mezclar los datos del
+    entorno propio como si fueran los del peer duplicaría el gasto y el
+    resultado se vería plausible, que es peor que no tenerlo."""
+    return PeerSessionLocal() if PeerSessionLocal else None
+
+
 from contextlib import contextmanager  # noqa: E402 — kept next to the helper it powers
 
 

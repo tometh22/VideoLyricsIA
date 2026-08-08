@@ -73,6 +73,64 @@ gratis", que es una mentira distinta.
 
 ---
 
+## Costo por canción de un cliente (atribución)
+
+Las secciones de abajo miden **cuánto se gastó**. Para saber **en nombre de
+quién**, está `cost_attribution.py` + `scripts/umg_cost_report.py`, que
+responden tres niveles: costo directo por canción, costo total del cliente con
+infraestructura prorrateada, y a qué se fue cada dólar del negocio.
+
+Tres hechos hacen que un `GROUP BY tenant_id` dé mal, y los tres están
+verificados contra datos reales:
+
+1. **La producción gestionada de UMG corre en STAGING, bajo cuentas del
+   equipo.** 67 de las 68 entregas vigentes del portal `umg.genly.pro` tienen
+   su job en la base de staging, propiedad de `tomas@epical.digital`,
+   `agus77`, `default` y `omg` — ningún tenant `universal_*`. Atribuir por
+   tenant se pierde casi toda la producción gestionada.
+2. **Staging no es gratis.** Staging y prod comparten proyecto de GCP, bucket
+   R2 y proyecto de Railway, así que ninguna factura se puede partir por
+   entorno. El corte sale de las bases.
+3. **La unidad facturable es la canción, no el job.** Una canción entregada
+   arrastra ~2,4 jobs (variantes, re-renders, ediciones).
+
+Además, `golden_render_bot` re-renderiza catálogo real para QA. Por eso la
+clasificación **chequea tenants de CI antes que canciones** — al revés, cada
+corrida de regresión se le facturaría al cliente. Hay tests que lo fijan.
+
+### Uso
+
+```bash
+export DATABASE_URL_PROD='postgresql://...'
+export DATABASE_URL_STAGING='postgresql://...'
+python scripts/umg_cost_report.py --period 2026-07 --revenue 2000 \
+  --invoices '{"gcp":199.53,"railway":126.02,"r2":18.84,"fixed":44}'
+```
+
+En el panel: `GET /admin/cost/umg` y `GET /admin/cost/business`. Necesitan
+**`PEER_DATABASE_URL`** apuntando al otro entorno (en staging ya se reusa
+`DELIVERIES_DATABASE_URL`, así que no hay que configurar nada). Sin ella los
+endpoints responden igual pero marcan `single_environment: true` — nunca
+reportan que el otro entorno costó $0.
+
+### Resultado medido (jun-2026, facturas completas)
+
+| | |
+|---|---|
+| Canciones de UMG entregadas | 51 |
+| Jobs asociados | 151 (2,96 por canción) |
+| **Costo directo de IA por canción** | **$2,48** (mediana $1,62) |
+| **Costo total por canción** (con infra prorrateada) | **$4,39** |
+| Precio real por canción ($2.000 ÷ 51) | $39,22 |
+| **Margen** | **88,8%** |
+
+UMG fue el **56,1%** del gasto de IA; el resto fue I+D interno (42,7%) y
+CI (1,1%). Esa parte es costo de operar el negocio, no costo de bienes
+vendidos — no va al precio del cliente.
+
+> La **mediana** ($1,62) es mejor que el promedio para cotizar: el promedio se
+> distorsiona con las pocas canciones que se re-generaron 10-20 veces.
+
 ## Precisión medida (validación 7-ago-2026)
 
 Cada conector se corrió con las credenciales reales y se comparó contra la
