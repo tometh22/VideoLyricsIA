@@ -398,6 +398,50 @@ def test_openai_empty_filter_bills_whole_org(monkeypatch):
     assert billing_sources.fetch_openai("2026-07").amount_usd == 100.0
 
 
+def test_gcp_timeout_is_an_error_not_zero_dollars(monkeypatch):
+    """BigQuery returns HTTP 200 with `jobComplete: false` and no rows when
+    the query outruns `timeoutMs`. Reporting that as $0/ok would show ~half
+    of all spend as free while `complete` stayed true — the exact failure
+    this module exists to prevent. Scanning an unpartitioned billing export
+    is slow enough that this is routine."""
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {"jobComplete": False}
+
+    for k, v in (("GCP_BILLING_BQ_PROJECT", "p"),
+                 ("GCP_BILLING_BQ_DATASET", "d"),
+                 ("GCP_BILLING_BQ_TABLE", "t")):
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(billing_sources, "_gcp_credentials", lambda: "tok")
+    monkeypatch.setattr(billing_sources.requests, "post", lambda *a, **k: _Resp())
+
+    result = billing_sources.fetch_gcp("2026-07")
+    assert result.status == "error"
+    assert result.amount_usd is None
+    assert "jobComplete" in result.detail
+
+
+def test_gcp_empty_result_is_an_error_not_zero_dollars(monkeypatch):
+    """No rows usually means the export wasn't enabled yet (it is not
+    retroactive) or the table name is wrong — never that GCP was free."""
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {"jobComplete": True, "rows": []}
+
+    for k, v in (("GCP_BILLING_BQ_PROJECT", "p"),
+                 ("GCP_BILLING_BQ_DATASET", "d"),
+                 ("GCP_BILLING_BQ_TABLE", "t")):
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(billing_sources, "_gcp_credentials", lambda: "tok")
+    monkeypatch.setattr(billing_sources.requests, "post", lambda *a, **k: _Resp())
+
+    result = billing_sources.fetch_gcp("2026-07")
+    assert result.status == "error"
+    assert result.amount_usd is None
+
+
 def test_github_404_explains_missing_scope(monkeypatch):
     """A 404 here means the PAT lacks the `user` scope, not that the
     account doesn't exist — worth saying so, since the generic error

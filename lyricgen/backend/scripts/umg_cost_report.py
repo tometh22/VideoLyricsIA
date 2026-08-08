@@ -91,36 +91,52 @@ def render_markdown(a: dict, top_n: int) -> str:
     u = a["umg"]
     w("\n## 1 · Costo DIRECTO de IA por canción de UMG\n")
     w("| | |\n|---|---|")
-    w(f"| Canciones de UMG | **{u['songs']}** |")
-    w(f"| Jobs asociados | {u['jobs']} ({u['jobs_per_song']} por canción) |")
+    w(f"| **Canciones ENTREGADAS** | **{u['songs']}** |")
+    w(f"| Canciones tocadas sin entregar | {u['songs_touched_not_delivered']} "
+      f"({_fmt_usd(u['cost_of_undelivered_songs'])} que igual se pagó) |")
+    w(f"| Jobs asociados | {u['jobs']} ({u['jobs_per_song']} por entregada) |")
     w(f"| Costo IA directo | **{_fmt_usd(u['direct_cost'])}** |")
-    w(f"| **Costo directo por canción** | **{_fmt_usd(u['direct_cost_per_song'])}** |")
+    w(f"| **Costo directo por canción entregada** | **{_fmt_usd(u['direct_cost_per_song'])}** |")
+    w("\n> El divisor son las canciones **entregadas**. Las que se tocaron y "
+      "no salieron consumieron plata igual, así que suman al numerador pero "
+      "no al denominador — meterlas abajo abarataría el costo de entregar.")
 
     songs = u["by_song"]
     if songs:
         w(f"\n### Las {min(top_n, len(songs))} canciones más caras\n")
-        w("| Canción | Jobs | Llamadas | Cache hits | Costo | Entorno |")
+        w("| Canción | Entregada | Jobs | Llamadas | Costo | Entorno |")
         w("|---|---|---|---|---|---|")
         for s in songs[:top_n]:
             name = f"{s['artist']} — {s['title']}".strip(" —") or "(sin título)"
-            w(f"| {name[:52]} | {s['jobs']} | {s['billable_calls']} | "
-              f"{s['cache_hits']} | {_fmt_usd(s['cost'])} | "
+            w(f"| {name[:48]} | {'sí' if s['delivered'] else '**no**'} | "
+              f"{s['jobs']} | {s['billable_calls']} | {_fmt_usd(s['cost'])} | "
               f"{'/'.join(s['envs'])} |")
 
-        costs = [s["cost"] for s in songs]
-        mid = sorted(costs)[len(costs) // 2]
-        w(f"\nMediana por canción: **{_fmt_usd(mid)}** · "
-          f"máximo **{_fmt_usd(max(costs))}** · mínimo **{_fmt_usd(min(costs))}**")
-        w("\n> La mediana es el número honesto para cotizar: el promedio se "
-          "distorsiona con las pocas canciones que se re-generaron muchas veces.")
+        # Statistics over DELIVERED songs only: mixing in abandoned ones
+        # drags the median down, and they sit at the cheap end by
+        # construction (they stopped before rendering).
+        dcosts = [s["cost"] for s in songs if s["delivered"]]
+        if dcosts:
+            ordered = sorted(dcosts)
+            n = len(ordered)
+            mid = (ordered[n // 2] if n % 2
+                   else (ordered[n // 2 - 1] + ordered[n // 2]) / 2)
+            w(f"\nSobre las {n} entregadas — mediana **{_fmt_usd(mid)}** · "
+              f"promedio **{_fmt_usd(sum(dcosts) / n)}** · "
+              f"máx **{_fmt_usd(max(dcosts))}** · mín **{_fmt_usd(min(dcosts))}**")
+            w("\n> Para cotizar usá el **promedio**, no la mediana: la plata "
+              "que sale es la suma, y la cola de canciones re-generadas "
+              "muchas veces es real. La mediana sirve para ver el caso "
+              "típico, no para fijar precio.")
 
     # ---------------- Level 2 ----------------
     t = a.get("umg_total")
     if t:
         w("\n## 2 · Costo TOTAL de servir a UMG (con infraestructura)\n")
-        w(f"Reparto por **{t['basis']}** — UMG es el "
-          f"**{t['share_used']:.1%}** de la actividad medida.")
-        w(f"(por costo: {t['share_by_cost']:.1%} · "
+        w(f"IA directa repartida por costo (**{t['share_used_for_direct_ai']:.1%}**); "
+          f"infra compartida por **{t['basis']}** "
+          f"(**{t['share_used_for_shared_infra']:.1%}**).")
+        w(f"(share por costo: {t['share_by_cost']:.1%} · "
           f"por jobs: {t['share_by_jobs']:.1%})\n")
         w("| Concepto | Monto |")
         w("|---|---|")
@@ -139,7 +155,8 @@ def render_markdown(a: dict, top_n: int) -> str:
             w(f"| **Precio real por canción** | **{_fmt_usd(t['revenue_per_song'])}** |")
             w(f"| Costo total | {_fmt_usd(t['umg_total_cost'])} |")
             w(f"| **Ganancia neta** | **{_fmt_usd(t['gross_profit'])}** |")
-            w(f"| **Margen** | **{t['margin_pct']:.1%}** |")
+            if t.get("margin_pct") is not None:
+                w(f"| **Margen** | **{t['margin_pct']:.1%}** |")
         w(f"\n> Modelado desde la tabla de tarifas: "
           f"{_fmt_usd(t['modeled_direct_cost'])}. Si se aleja mucho de la "
           f"parte directa facturada, `COST_PER_CALL` quedó vieja.")

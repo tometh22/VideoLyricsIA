@@ -89,16 +89,35 @@ def is_ci_tenant(tenant_id: str | None) -> bool:
     return any(p.search(t) for p in CI_TENANT_PATTERNS)
 
 
-def song_key(artist: str | None, title: str | None) -> str:
+# Placeholder song metadata written by the background-preview path when the
+# caller has no artist/title yet (`main.py` uses `body.artist or "preview"`).
+# These are not songs and must never merge into one.
+_PLACEHOLDER_TITLES = frozenset({"preview", "untitled", "sin titulo", "sin título"})
+
+
+def song_key(artist: str | None, title: str | None,
+             job_id: str | None = None) -> str:
     """Normalized song identity, used to join across environments.
 
     Collapses case and whitespace runs. Deliberately conservative: it does
     NOT strip punctuation or accents, because "Sube sube sube" and
     "Sube, sube, sube" being separate rows is a data-entry issue we would
     rather see than silently merge.
+
+    **Degenerate identities fall back to the job id.** A blank artist AND
+    title would otherwise produce the key `"|"`, silently merging every
+    metadata-less job in both databases into a single enormous fake song —
+    one row in the denominator carrying an unbounded numerator. Same for
+    the `"preview|preview"` placeholder the background-preview path writes.
+    Falling back to `job_id` keeps each one distinct (and, having no
+    delivered job, they are excluded from the per-song denominator anyway).
     """
     a = re.sub(r"\s+", " ", (artist or "").strip().lower())
     t = re.sub(r"\s+", " ", (title or "").strip().lower())
+    degenerate = (not a and not t) or (t in _PLACEHOLDER_TITLES and
+                                       a in _PLACEHOLDER_TITLES | {""})
+    if degenerate:
+        return f"__sin_metadata__|{job_id or 'desconocido'}"
     return f"{a}|{t}"
 
 
@@ -158,7 +177,7 @@ def collect_jobs(db, env: str, period: str | None = None) -> dict[str, JobCost]:
         jobs[job_id] = JobCost(
             job_id=job_id, env=env, tenant_id=tenant_id or "",
             status=status or "", artist=artist or "", title=title or "",
-            key=song_key(artist, title), created_at=created_at,
+            key=song_key(artist, title, job_id), created_at=created_at,
         )
 
     if not jobs:
@@ -365,9 +384,24 @@ def build_attribution(jobs_by_env: dict[str, dict[str, JobCost]],
     for s in songs:
         s["envs"] = sorted(s["envs"])
         s["tenants"] = sorted(s["tenants"])
+        s["delivered"] = s["delivered_jobs"] > 0
 
     umg_cost = sum(s["cost"] for s in songs)
-    umg_songs = len(songs)
+
+    # THE denominator. Only songs that actually shipped can be invoiced, so
+    # only they may divide the cost. Songs that were touched but produced
+    # nothing (previews the operator abandoned, jobs that ended rejected)
+    # still contribute their spend to the numerator — someone paid for
+    # them — but adding them to the denominator would understate the cost
+    # of delivering. Measured jun-2026: 51 songs touched, 37 delivered;
+    # dividing by 51 understated cost per song by 38%.
+    #
+    # This is the same defect the whole audit started from ("divide by jobs
+    # created instead of delivered"), one level up. It is easy to
+    # reintroduce, hence the explicit split and the test that pins it.
+    delivered_songs = [s for s in songs if s["delivered"]]
+    umg_songs = len(delivered_songs)
+    umg_songs_touched = len(songs)
 
     categories = []
     total_cost = 0.0
@@ -395,12 +429,20 @@ def build_attribution(jobs_by_env: dict[str, dict[str, JobCost]],
         },
         # --- Level 1 ---
         "umg": {
+            # `songs` = DELIVERED songs. Anything divided by it is a real
+            # unit cost; `songs_touched` is a diagnostic, never a divisor.
             "songs": umg_songs,
+            "songs_touched": umg_songs_touched,
+            "songs_touched_not_delivered": umg_songs_touched - umg_songs,
             "jobs": sum(s["jobs"] for s in songs),
             "direct_cost": round(umg_cost, 4),
             "direct_cost_per_song": (
                 round(umg_cost / umg_songs, 4) if umg_songs else None
             ),
+            # Spend on songs that never shipped, carried by the ones that
+            # did. Sizing the prize for fixing the waste.
+            "cost_of_undelivered_songs": round(
+                sum(s["cost"] for s in songs if not s["delivered"]), 4),
             "jobs_per_song": (
                 round(sum(s["jobs"] for s in songs) / umg_songs, 2)
                 if umg_songs else None
@@ -459,21 +501,28 @@ def add_total_cost(attribution: dict, invoices: dict[str, float],
     """
     share_by_cost = attribution["business"]["umg_share_of_cost"] or 0.0
     share_by_jobs = attribution["business"]["umg_share_of_jobs"] or 0.0
-    share = share_by_cost if basis == "cost" else share_by_jobs
+    shared_share = share_by_cost if basis == "cost" else share_by_jobs
 
     direct_invoiced = sum(v for k, v in invoices.items()
                           if k in DIRECT_INVOICE_SOURCES)
     shared_invoiced = sum(v for k, v in invoices.items()
                           if k not in DIRECT_INVOICE_SOURCES)
 
-    umg_direct = direct_invoiced * share
-    umg_shared = shared_invoiced * share
+    # Direct providers are ALWAYS split by cost share, never by `basis`.
+    # Their spend is per-call and level 1 already attributed it call by
+    # call; a job-count share would price one Veo-heavy delivery the same
+    # as one whisper-only smoke test, a ~2.7x error on the largest line.
+    # `basis` only governs the shared infrastructure, where no per-job
+    # measurement exists.
+    umg_direct = direct_invoiced * share_by_cost
+    umg_shared = shared_invoiced * shared_share
     umg_total = umg_direct + umg_shared
     songs = attribution["umg"]["songs"]
 
     result = {
         "basis": basis,
-        "share_used": round(share, 4),
+        "share_used_for_shared_infra": round(shared_share, 4),
+        "share_used_for_direct_ai": round(share_by_cost, 4),
         "share_by_cost": round(share_by_cost, 4),
         "share_by_jobs": round(share_by_jobs, 4),
         "invoices_total": round(direct_invoiced + shared_invoiced, 2),

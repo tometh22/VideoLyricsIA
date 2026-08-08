@@ -153,8 +153,14 @@ def test_reconcile_reports_calibration_factor(client, admin_token):
     # No invoices snapshotted for that month → everything AI is missing.
     assert set(body["invoiced_sources_missing"]) == {"gcp", "openai", "replicate"}
     assert body["invoiced_usd"] == 0.0
-    assert "row_quality" in body
-    assert "cache_hits_excluded" in body["row_quality"]
+    # The modeled side must cover the SAME calendar month as the invoice.
+    # It used to call cost_dashboard_global(since_days=N), which measures a
+    # window ending today — so asking about June in August compared two
+    # disjoint months and then told the operator to recalibrate the rate
+    # table from the result.
+    assert body["modeled_usd"] == 0.0, "2019-03 no tiene provenance"
+    assert "counted_environments" in body
+    assert "by_tool_modeled" in body
 
 
 def test_reconcile_rejects_malformed_period(client, admin_token):

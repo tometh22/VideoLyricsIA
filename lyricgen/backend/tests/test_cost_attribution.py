@@ -270,7 +270,14 @@ def test_level_2_prorates_shared_infra_by_umg_share():
     assert t["gross_profit"] == pytest.approx(1793.6)
 
 
-def test_level_2_reports_both_bases_so_the_choice_is_visible():
+def test_basis_governs_shared_infra_only_never_the_ai_invoice():
+    """`basis="jobs"` must not touch the direct AI invoice.
+
+    AI spend is per-call and level 1 already attributed it call by call; a
+    job-count share would price one Veo-heavy delivery the same as one
+    whisper-only smoke test. On this fixture that is a 2.7x error applied
+    to GCP — the largest line in the bill.
+    """
     portal = _portal(("A", "B"))
     jobs = {"staging": {
         "u": _job("u", "A", "B", "agus77", cost=9.0, calls=9),
@@ -278,13 +285,75 @@ def test_level_2_reports_both_bases_so_the_choice_is_visible():
         "d": _job("d", "Z", "W", "golden_render_bot", cost=0.0, calls=0),
     }}
     out = ca.build_attribution(jobs, portal)
-    ca.add_total_cost(out, {"railway": 100.0}, basis="jobs")
+    ca.add_total_cost(out, {"gcp": 100.0, "railway": 100.0}, basis="jobs")
     t = out["umg_total"]
-    # By cost UMG is 90%; by jobs only 33%. A negotiation may prefer the
-    # latter because it doesn't depend on our own rate table.
+
+    # By cost UMG is 90%; by jobs only 33%.
     assert t["share_by_cost"] == 0.9
     assert t["share_by_jobs"] == pytest.approx(1 / 3, abs=1e-3)
-    assert t["share_used"] == t["share_by_jobs"]
+    # Shared infra follows `basis`...
+    assert t["share_used_for_shared_infra"] == t["share_by_jobs"]
+    assert t["umg_shared_cost"] == pytest.approx(33.33, abs=0.02)
+    # ...but the AI invoice always follows the cost share.
+    assert t["share_used_for_direct_ai"] == 0.9
+    assert t["umg_direct_cost"] == pytest.approx(90.0)
+
+
+# ---------------------------------------------------------------------------
+# Regressions found by adversarial review (ago-2026)
+# ---------------------------------------------------------------------------
+
+def test_denominator_counts_delivered_songs_only():
+    """The defect the whole audit exists to prevent, one level up.
+
+    A song that was worked on but never shipped still costs money, so it
+    belongs in the numerator — but putting it in the denominator makes
+    delivering look cheaper than it is. Measured on real jun-2026 data:
+    51 songs touched vs 37 delivered, a 38% understatement.
+    """
+    portal = _portal(("Entregada", "Sí"), ("Abandonada", "No"))
+    jobs = {"staging": {
+        "d": _job("d", "Entregada", "Sí", "agus77",
+                  status="done", cost=6.0, calls=6),
+        # Only ever produced a discarded preview.
+        "p": _job("p", "Abandonada", "No", "agus77",
+                  status="bg_preview_done", cost=4.0, calls=4),
+    }}
+    out = ca.build_attribution(jobs, portal)
+
+    assert out["umg"]["songs"] == 1                    # delivered
+    assert out["umg"]["songs_touched"] == 2
+    assert out["umg"]["songs_touched_not_delivered"] == 1
+    # Both costs are in the numerator; only the delivered one divides.
+    assert out["umg"]["direct_cost"] == 10.0
+    assert out["umg"]["direct_cost_per_song"] == 10.0   # NOT 5.0
+    assert out["umg"]["cost_of_undelivered_songs"] == 4.0
+
+
+def test_blank_metadata_jobs_do_not_merge_into_one_fake_song():
+    """Without a guard, `song_key("", "")` is `"|"` for every job, merging
+    every metadata-less job in both databases into a single 'song' — one
+    denominator slot carrying an unbounded numerator."""
+    jobs = {"staging": {
+        "x": _job("x", "", "", "universal_chile", cost=5.0, calls=5),
+        "y": _job("y", "", "", "universal_chile", cost=7.0, calls=7),
+    }}
+    # Rebuild keys the way collect_jobs does (per job id).
+    for jid, j in jobs["staging"].items():
+        j.key = ca.song_key(j.artist, j.title, jid)
+
+    out = ca.build_attribution(jobs, _portal())
+    assert out["umg"]["songs_touched"] == 2, "no deben colapsar en una"
+
+
+def test_preview_placeholder_is_not_a_song():
+    """The background-preview path writes artist/title = "preview" when the
+    caller has none (`body.artist or "preview"`), so every discarded
+    preview in a tenant would otherwise merge into one giant fake song."""
+    k1 = ca.song_key("preview", "preview", "job1")
+    k2 = ca.song_key("preview", "preview", "job2")
+    assert k1 != k2
+    assert "__sin_metadata__" in k1
 
 
 def test_period_bounds_rejects_bad_month():

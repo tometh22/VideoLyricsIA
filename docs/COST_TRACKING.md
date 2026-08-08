@@ -113,23 +113,42 @@ En el panel: `GET /admin/cost/umg` y `GET /admin/cost/business`. Necesitan
 endpoints responden igual pero marcan `single_environment: true` — nunca
 reportan que el otro entorno costó $0.
 
+### El denominador son las canciones ENTREGADAS
+
+Es el mismo defecto que originó toda esta auditoría, un nivel más arriba, y es
+fácil de reintroducir. Una canción que se trabajó y nunca salió **consumió
+plata igual**: suma al numerador. Pero meterla en el denominador abarata
+artificialmente el costo de entregar.
+
+Medido en jun-2026: **51 canciones tocadas, 37 entregadas**. Dividir por 51
+subestimaba el costo un **38%**. `umg.songs` son las entregadas;
+`umg.songs_touched` es diagnóstico y nunca divide. Hay un test que lo fija.
+
 ### Resultado medido (jun-2026, facturas completas)
 
 | | |
 |---|---|
-| Canciones de UMG entregadas | 51 |
-| Jobs asociados | 151 (2,96 por canción) |
-| **Costo directo de IA por canción** | **$2,48** (mediana $1,62) |
-| **Costo total por canción** (con infra prorrateada) | **$4,39** |
-| Precio real por canción ($2.000 ÷ 51) | $39,22 |
+| Canciones de UMG **entregadas** | 37 |
+| Tocadas sin entregar | 14 ($12,96 que se pagó igual) |
+| Jobs asociados | 151 (4,08 por entregada) |
+| **Costo directo de IA por canción** | **$3,42** |
+| **Costo total por canción** (con infra prorrateada) | **$6,05** |
+| Precio real por canción ($2.000 ÷ 37) | $54,05 |
 | **Margen** | **88,8%** |
 
 UMG fue el **56,1%** del gasto de IA; el resto fue I+D interno (42,7%) y
-CI (1,1%). Esa parte es costo de operar el negocio, no costo de bienes
-vendidos — no va al precio del cliente.
+CI (1,1%).
 
-> La **mediana** ($1,62) es mejor que el promedio para cotizar: el promedio se
-> distorsiona con las pocas canciones que se re-generaron 10-20 veces.
+> **Cotizá con el promedio, no con la mediana.** La plata que sale es la suma,
+> y la cola de canciones re-generadas 10-20 veces es real. La mediana ($2,43)
+> describe el caso típico, no el costo.
+
+> ⚠️ **El 42,7% de "I+D interno" hay que mirarlo con desconfianza.** Con un
+> solo cliente grande, buena parte del trabajo de desarrollo es corregir
+> defectos que afectan a UMG. `classify_job` manda un job del equipo a I+D
+> salvo que su canción esté en el portal, y `song_key` no normaliza acentos ni
+> puntuación a propósito — así que un tipeo distinto mueve trabajo de UMG a
+> I+D, nunca al revés. El sesgo es en una sola dirección.
 
 ## Precisión medida (validación 7-ago-2026)
 

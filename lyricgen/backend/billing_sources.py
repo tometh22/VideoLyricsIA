@@ -162,6 +162,29 @@ def fetch_gcp(period: str) -> SourceCost:
     except Exception as e:
         return SourceCost("gcp", period, status="error", detail=str(e))
 
+    # A BigQuery query that exceeds `timeoutMs` returns HTTP 200 with
+    # `jobComplete: false` and NO rows. Treating that as "$0, ok" would
+    # report ~half of all spend as free, with `complete: true` — the exact
+    # failure this module is supposed to make impossible. Scanning an
+    # unpartitioned billing export is slow enough that this is a routine
+    # occurrence, not a corner case.
+    if payload.get("jobComplete") is False:
+        return SourceCost(
+            "gcp", period, status="error",
+            detail=("la consulta a BigQuery no terminó dentro de "
+                    f"{HTTP_TIMEOUT}s (jobComplete=false). Subí "
+                    "BILLING_HTTP_TIMEOUT o particioná el export."),
+        )
+    rows_returned = payload.get("rows")
+    if not rows_returned:
+        return SourceCost(
+            "gcp", period, status="error",
+            detail=("BigQuery no devolvió filas para el período. Puede que "
+                    "el export no estuviera habilitado todavía (no es "
+                    "retroactivo) o que el nombre de tabla sea otro. NO se "
+                    "reporta $0 porque sería indistinguible de gasto cero."),
+        )
+
     breakdown = []
     total = 0.0
     for row in payload.get("rows", []) or []:

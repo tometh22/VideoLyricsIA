@@ -965,17 +965,33 @@ async def admin_cost_unit_economics(
     start_dt = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
     end_dt = datetime(end.year, end.month, end.day, 23, 59, 59,
                       tzinfo=timezone.utc)
-    delivered = int(
-        db.query(func.count(Job.id))
-        .filter(Job.created_at >= start_dt, Job.created_at <= end_dt)
-        .filter(Job.status.in_(("done", "pending_review")))
-        .scalar() or 0
-    )
-    created = int(
-        db.query(func.count(Job.id))
-        .filter(Job.created_at >= start_dt, Job.created_at <= end_dt)
-        .scalar() or 0
-    )
+    # The invoice covers BOTH environments (shared GCP project, R2 bucket
+    # and Railway project), so the denominator has to as well. Counting
+    # only the local environment would divide two-env spend by one-env
+    # output — and since managed UMG production runs in staging, on prod
+    # that inflates cost-per-video by roughly an order of magnitude.
+    from database import peer_session
+
+    def _count(session):
+        base = session.query(func.count(Job.id)).filter(
+            Job.created_at >= start_dt, Job.created_at <= end_dt)
+        return (
+            int(base.filter(Job.status.in_(("done", "pending_review")))
+                .scalar() or 0),
+            int(base.scalar() or 0),
+        )
+
+    delivered, created = _count(db)
+    peer = peer_session()
+    counted_environments = 1
+    if peer is not None:
+        try:
+            d2, c2 = _count(peer)
+            delivered += d2
+            created += c2
+            counted_environments = 2
+        finally:
+            peer.close()
 
     cost_per_delivered = round(real_total / delivered, 4) if delivered else None
     # Kept only to show the operator how misleading it is next to the real
@@ -994,6 +1010,9 @@ async def admin_cost_unit_economics(
         "missing_sources": sorted(set(billing_sources.SOURCES) - have),
         "videos_delivered": delivered,
         "videos_created": created,
+        # 1 = only this environment was counted while the invoice covers
+        # both; the cost per video is then overstated. Check before quoting.
+        "counted_environments": counted_environments,
         "cost_per_delivered": cost_per_delivered,
         "cost_per_created_MISLEADING": cost_per_created,
         "price_per_video_usd": price_per_video_usd,
@@ -1035,7 +1054,7 @@ async def admin_cost_reconcile(
     """
     import billing_sources
     from database import CostSnapshot
-    from provenance import cost_dashboard_global
+    from provenance import cost_for_record
 
     period = period.strip() or billing_sources.current_period()
     try:
@@ -1056,9 +1075,54 @@ async def admin_cost_reconcile(
     )
     have = {r.source for r in rows if r.status == "ok"}
 
-    days = max(1, (end - start).days + 1)
-    modeled_dash = cost_dashboard_global(db, since_days=days)
-    modeled = modeled_dash["total_cost"]
+    # `cost_dashboard_global` measures a window ending NOW, so asking it
+    # for "30 days" while comparing against June's invoice compared two
+    # disjoint months. Sum the calendar period directly instead — the
+    # whole point of this endpoint is that the two sides line up, and the
+    # note tells the operator to recalibrate the rate table from the
+    # result.
+    from provenance import billable_filter
+    from database import AIProvenance
+
+    start_dt = datetime(start.year, start.month, start.day,
+                        tzinfo=timezone.utc)
+    end_dt = datetime(end.year, end.month, end.day, 23, 59, 59,
+                      tzinfo=timezone.utc)
+
+    def _modeled(session):
+        rows = (
+            session.query(AIProvenance.tool_name, AIProvenance.tool_provider,
+                          func.count(AIProvenance.id))
+            .filter(AIProvenance.created_at >= start_dt,
+                    AIProvenance.created_at <= end_dt)
+            .filter(billable_filter())
+            .group_by(AIProvenance.tool_name, AIProvenance.tool_provider)
+            .all()
+        )
+        total = 0.0
+        by_tool = []
+        for tool_name, tool_provider, calls in rows:
+            cost = calls * cost_for_record(tool_name, tool_provider)
+            total += cost
+            by_tool.append({"tool_name": tool_name,
+                            "tool_provider": tool_provider,
+                            "calls": calls, "cost": round(cost, 4)})
+        return total, by_tool
+
+    modeled, by_tool = _modeled(db)
+    # The invoice is for the shared GCP project, i.e. both environments.
+    from database import peer_session
+    peer = peer_session()
+    counted_environments = 1
+    if peer is not None:
+        try:
+            peer_total, peer_tools = _modeled(peer)
+            modeled += peer_total
+            by_tool += peer_tools
+            counted_environments = 2
+        finally:
+            peer.close()
+    by_tool.sort(key=lambda r: -r["cost"])
 
     variance = invoiced - modeled
     return {
@@ -1072,13 +1136,16 @@ async def admin_cost_reconcile(
         "calibration_factor": (
             round(invoiced / modeled, 4) if modeled else None
         ),
-        "by_tool_modeled": modeled_dash["by_tool"],
-        "row_quality": modeled_dash["row_quality"],
+        "by_tool_modeled": by_tool,
+        "counted_environments": counted_environments,
         "note": (
             "calibration_factor >1 = el modelo subestima. Multiplicá las "
             "tarifas de COST_PER_CALL por este factor para recalibrar. "
-            "Comparación imperfecta: la ventana del modelo son días "
-            "corridos y la factura es mes calendario."
+            "Ambos lados cubren el MISMO mes calendario. Si "
+            "counted_environments=1 el modelo mide un solo entorno "
+            "mientras la factura cubre los dos (proyecto GCP compartido), "
+            "así que el factor va a salir alto: configurá PEER_DATABASE_URL "
+            "antes de recalibrar nada."
         ),
     }
 
