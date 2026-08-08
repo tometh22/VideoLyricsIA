@@ -275,9 +275,17 @@ def run_transcription_job(
             r = await _maybe_word_vote(r, audio_path, job_id, _post_lang)
             r = _maybe_chorus_snap(r, job_id)
             r = _maybe_phrase_segment(r, job_id)
-            from lyrics_format import format_lyrics_pass as _fmt
+            from lyrics_format import (
+                format_lyrics_pass as _fmt,
+                strip_trailing_periods as _strip_dots,
+            )
             _antes = _coverage_de(r)
             r = await _fmt(r, language=_post_lang)
+            # Runs OUTSIDE the format pass on purpose: `_fmt` returns early
+            # when disabled, when the LLM call fails, or when there are no
+            # segments, and periods also arrive straight from whisper-1. This
+            # has to apply to every text source, not just the LLM's output.
+            r = _strip_dots(r)
             return _medir_cobertura_final(r, job_id, _antes, audio_path)
 
         result = asyncio.run(_run_with_retime())

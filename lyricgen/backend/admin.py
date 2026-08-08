@@ -1273,6 +1273,70 @@ async def admin_cost_umg(
     return result
 
 
+@router.get("/quality/change-requests")
+async def admin_change_requests(
+    admin: dict = Depends(require_admin),
+    period: str = Query("", description="YYYY-MM; vacío = todo el histórico"),
+    include_raw: bool = Query(False, description="devolver los comentarios crudos"),
+):
+    """Qué nos pide cambiar el cliente, clasificado.
+
+    La única medición directa de calidad que existe: todo lo demás (ediciones
+    del operador, tasa de rechazo) mide trabajo interno, que es un supuesto
+    sobre lo que el cliente quiere. Esto es lo que el cliente escribió.
+
+    `requests_per_delivery` es el indicador a seguir mes a mes — el retrabajo
+    es la línea de costo que define el margen del contrato llave en mano.
+
+    La tabla vive en la base de PROD (el portal es prod-backed) aunque la
+    producción gestionada corra en staging; `get_deliveries_db` ya rutea bien
+    desde los dos entornos.
+    """
+    import change_request_stats as crs
+    from database import Delivery, DeliveryChangeRequest, DeliveriesSessionLocal
+
+    ddb = DeliveriesSessionLocal()
+    try:
+        q = ddb.query(DeliveryChangeRequest)
+        dq = ddb.query(func.count(Delivery.id)).filter(
+            Delivery.removed_at.is_(None))
+        if period.strip():
+            try:
+                start, end = _month_bounds(period.strip())
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            q = q.filter(DeliveryChangeRequest.submitted_at >= start,
+                         DeliveryChangeRequest.submitted_at < end)
+            dq = dq.filter(Delivery.added_at >= start, Delivery.added_at < end)
+
+        rows = q.order_by(DeliveryChangeRequest.submitted_at).all()
+        result = crs.summarize(rows, deliveries_total=int(dq.scalar() or 0))
+        result["period"] = period.strip() or None
+        if include_raw:
+            result["raw"] = [
+                {"id": r.id, "comment": r.comment,
+                 "submitted_at": r.submitted_at.isoformat() if r.submitted_at else None,
+                 "resolved": r.resolved_at is not None,
+                 "categories": crs.classify(r.comment or ""),
+                 "noise": crs.is_noise(r.comment or "")}
+                for r in rows
+            ]
+        return result
+    finally:
+        ddb.close()
+
+
+def _month_bounds(period: str):
+    """"YYYY-MM" -> (inicio, fin exclusivo) en UTC."""
+    year, month = (int(x) for x in period.split("-", 1))
+    if not 1 <= month <= 12:
+        raise ValueError(f"período inválido: {period!r}")
+    start = datetime(year, month, 1, tzinfo=timezone.utc)
+    end = datetime(year + (month == 12), (month % 12) + 1, 1,
+                   tzinfo=timezone.utc)
+    return start, end
+
+
 @router.get("/cost/business")
 async def admin_cost_business(
     admin: dict = Depends(require_admin),
