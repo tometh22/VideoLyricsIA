@@ -174,10 +174,26 @@ def test_build_scene_plan_respects_operator_static(monkeypatch):
     # sutil → todas sutiles.
     plan_s = scenes.build_scene_plan(secs, bible, pf, operator_movement="sutil")
     assert all(s["movement_style"] == "sutil" for s in plan_s["scenes"])
-    # vacío/estandar → energy-derived (el coro de alta energía NO es estatico).
+    # "estandar" es una elección explícita que PIDE variación por sección →
+    # sigue cayendo al energy-derived (el coro de alta energía NO es estatico).
+    plan_e = scenes.build_scene_plan(secs, bible, pf, operator_movement="estandar")
+    assert {s["movement_style"] for s in plan_e["scenes"]} != {"estatico"}, \
+        "estandar debe variar por energía"
+
+    # Vacío (Auto) ya NO cae al energy-derived: usa BG_DEFAULT_MOVEMENT.
+    # Cambio ago-2026 — el 86,6% de los jobs llegaba sin elección y el
+    # energy-derived les ponía cámara en movimiento en los estribillos, que
+    # es justo lo que el cliente pidió sacar cinco veces por escrito.
+    monkeypatch.setattr(scenes, "DEFAULT_MOVEMENT_WHEN_AUTO", "estatico")
     plan0 = scenes.build_scene_plan(secs, bible, pf, operator_movement="")
-    movs = {s["movement_style"] for s in plan0["scenes"]}
-    assert movs != {"estatico"}, "sin override debe variar por energía"
+    assert {s["movement_style"] for s in plan0["scenes"]} == {"estatico"}
+
+    # Con el default apagado vuelve el comportamiento viejo — así este test
+    # sigue probando que el override del operador hace algo, en vez de
+    # coincidir con el default por casualidad.
+    monkeypatch.setattr(scenes, "DEFAULT_MOVEMENT_WHEN_AUTO", "")
+    plan_auto = scenes.build_scene_plan(secs, bible, pf, operator_movement="")
+    assert {s["movement_style"] for s in plan_auto["scenes"]} != {"estatico"}
 
 
 def test_build_scene_plan_respects_operator_animado(monkeypatch):

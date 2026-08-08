@@ -419,6 +419,27 @@ def _cap_unique_scenes(sections: list[Section]) -> list[Section]:
     return sections
 
 
+# Movimiento cuando el operador NO eligió ninguno ("Auto").
+#
+# Medido en ago-2026: el **86,6%** de los jobs de staging llega sin
+# `movement_style`, y antes esos caían al energy-derived, que para energía
+# ≥0,75 (los estribillos) devuelve "dinamico". El cliente pidió lo contrario
+# cinco veces por escrito: *"cambiar el fondo más estático"*, *"podríamos
+# cambiar este fondo a más estático?"*, *"un fondo sin tormenta y que no sea
+# animado"*, *"más tranqui o sin loop"*.
+#
+# No es que elijan mal el movimiento: es que nadie elige, y el default se
+# movía. Cada pedido evitado vale mucho más que el Veo del re-render — es
+# tiempo de operador y una ida y vuelta con el cliente.
+#
+# Solo afecta el camino Auto: una elección explícita del operador (incluido
+# "estandar", que pide variación por sección) sigue mandando. Poner
+# `BG_DEFAULT_MOVEMENT=""` restaura el comportamiento anterior.
+DEFAULT_MOVEMENT_WHEN_AUTO = os.environ.get(
+    "BG_DEFAULT_MOVEMENT", "estatico"
+).strip().lower()
+
+
 def energy_to_movement(energy: float) -> str:
     """Mapea energía de sección al movement_style existente del pipeline.
 
@@ -460,12 +481,20 @@ def build_scene_plan(
         — bug 2026-06-30: el operador elegía "Animado"/"Foto fija" y salía
         fotorrealista con paneo porque caían al energy-derived. No son niveles de
         cámara sino estilos visuales → deben ir en cada escena sí o sí.
-    "estandar" y "" (Auto) SÍ caen al energy-derived (varían la cámara por
-    sección, todas fotorrealistas → sin romper la intención).
+    "estandar" cae al energy-derived (varía la cámara por sección, todas
+    fotorrealistas → sin romper la intención).
+
+    "" (Auto) usa `BG_DEFAULT_MOVEMENT` — ver DEFAULT_MOVEMENT_WHEN_AUTO.
     """
     bible_text = _bible_to_prompt_fragment(bible)
     _om = (operator_movement or "").strip().lower()
     _forced_movement = _om if _om in ("estatico", "sutil", "animado", "foto-parallax") else None
+    # Auto (el operador no eligió) ya no cae al energy-derived. Ver el
+    # comentario de DEFAULT_MOVEMENT_WHEN_AUTO: el 86,6% de los jobs llega
+    # sin elección y el energy-derived les pone cámara en movimiento en los
+    # estribillos, que es exactamente lo que el cliente pide sacar.
+    if _forced_movement is None and not _om and DEFAULT_MOVEMENT_WHEN_AUTO:
+        _forced_movement = DEFAULT_MOVEMENT_WHEN_AUTO
     scenes: list[dict] = []
     seen: dict[str, dict] = {}
     for sec in sections:

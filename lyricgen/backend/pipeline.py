@@ -9217,6 +9217,77 @@ def _veo_cache_key(prompt: str, model: str, params: dict) -> str:
     return _hash.sha256(payload.encode()).hexdigest()[:16]
 
 
+class VeoBudgetExceeded(RuntimeError):
+    """Un job pidió más generaciones de Veo que el tope configurado.
+
+    Los tres llamadores de `_generate_veo_video` ya envuelven la llamada en
+    try/except con fallback (gradiente o reintento), así que esto frena el
+    gasto sin romper la entrega."""
+
+
+# Tope de generaciones PAGAS de Veo por job. Medido en jul-2026: en prod,
+# 12 jobs (el 10%) se comieron el **42,8%** del gasto de Veo, y uno solo
+# llegó a 26 llamadas — unos $16 en un video que se vende a $8. Un job sano
+# usa 1-3.
+#
+# El default es holgado a propósito: 10 sólo atrapa fugas reales (re-rolls
+# de escenas en loop, reintentos que no cachean porque el prompt sale con
+# temperature=0.8 y cambia el hash) y no toca el trabajo normal. Bajarlo a
+# 4-6 aprieta más, pero puede cortar storyboards multi-escena legítimos.
+# `VEO_MAX_CALLS_PER_JOB=0` lo desactiva.
+VEO_MAX_CALLS_PER_JOB = int(os.environ.get("VEO_MAX_CALLS_PER_JOB", "10"))
+
+
+def _veo_budget_exceeded(job_id: str | None) -> tuple[bool, int]:
+    """(¿pasó el tope?, llamadas pagas ya hechas) para este job.
+
+    Cuenta sobre `ai_provenance`, que es la misma fuente que factura el
+    panel, así que el tope y el reporte no pueden divergir. Los cache hits
+    no cuentan: no se pagan.
+
+    Nunca levanta: si la consulta falla, deja pasar la generación. Un tope
+    de costo que rompe entregas cuando la DB hipa es peor que el gasto que
+    evita.
+    """
+    if not job_id or VEO_MAX_CALLS_PER_JOB <= 0:
+        return False, 0
+    try:
+        from sqlalchemy import func as _func
+
+        from database import AIProvenance, SessionLocal
+        from provenance import billable_filter
+
+        db = SessionLocal()
+        try:
+            n = int(
+                db.query(_func.count(AIProvenance.id))
+                .filter(AIProvenance.job_id == job_id)
+                .filter(AIProvenance.tool_name.like("veo%"))
+                .filter(billable_filter())
+                .scalar() or 0
+            )
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("[BG] no pude chequear el tope de Veo para job=%s: %r",
+                       job_id, exc)
+        return False, 0
+
+    if n >= VEO_MAX_CALLS_PER_JOB:
+        logger.error(
+            "[BG][BUDGET] job=%s alcanzó el tope de Veo: %d generaciones "
+            "pagas (tope %d). Se corta acá.",
+            job_id, n, VEO_MAX_CALLS_PER_JOB,
+        )
+        return True, n
+    if n >= VEO_MAX_CALLS_PER_JOB - 2:
+        logger.warning(
+            "[BG][BUDGET] job=%s va por %d/%d generaciones de Veo",
+            job_id, n, VEO_MAX_CALLS_PER_JOB,
+        )
+    return False, n
+
+
 def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         cache_namespace: str = "",
                         image_path: str | None = None,
@@ -9632,6 +9703,19 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # cache here. This function runs before content validation, so a normal
     # hit could reuse a hallucinated person. ``cache_only`` above is retained
     # exclusively for storyboard keys published after dense validation.
+
+    # Runaway guard. Everything above this line is free (cache); from here
+    # down every path costs money, so this is the one place a per-job
+    # ceiling can be enforced.
+    _over, _spent = _veo_budget_exceeded(job_id)
+    if _over:
+        recorder.finish(
+            response_summary=f"budget_exceeded: {_spent} llamadas Veo en el job")
+        raise VeoBudgetExceeded(
+            f"job {job_id}: {_spent} generaciones de Veo ya hechas "
+            f"(tope {VEO_MAX_CALLS_PER_JOB}). No se genera más para no "
+            f"seguir gastando; el llamador cae a su fallback."
+        )
 
     elapsed = _time.time() - _last_veo_request
     if elapsed < _VEO_COOLDOWN and _last_veo_request > 0:
