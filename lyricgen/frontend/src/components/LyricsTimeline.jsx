@@ -1,51 +1,38 @@
 /**
- * Visual per-line timings editor (Rotor-style "Timings" tab), rendered as a
- * VIEW of the shared LyricsEditor — same `edited` state, no new data model.
+ * Lyrics timing workspace.
  *
- * VERTICAL orientation: time flows top → bottom (matches the list view's
- * mental model and Rotor's actual Timings tab). Each lyric line is a
- * full-width block. The operator drags:
- *   - the TOP edge    → move START (when the line enters)
- *   - the BOTTOM edge → set END independently (when it leaves — the gap the
- *                       list view can't do)
- *   - the body        → move the whole block, preserving duration
- * A horizontal playhead tracks audio currentTime; clicking the lane seeks to
- * that exact time. Any drag marks the line `locked` so
- * pipeline._apply_display_timing respects the manual end (no auto-extend).
+ * The timeline intentionally follows a DAW interaction model:
+ * - click anywhere on the canvas/ruler/waveform to seek;
+ * - drag the empty canvas to marquee-select lines;
+ * - Cmd/Ctrl-click toggles individual lines;
+ * - dragging a selected line moves the whole group;
+ * - the left/right edges adjust entry/exit independently.
  *
- * All edits go up through the parent's setEdited → existing autosave /
- * onEditedChange / onApprove. This component owns NO persistence.
+ * The component is still a view over LyricsEditor state. It owns only visual
+ * interaction state; persistence and autosave remain in the parent.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
+import { clampResizeTiming, clampSelectionShiftDelta } from "../lib/segmentTiming";
 
-// Zoom = px per second (vertical). The former 16 px/s default compressed
-// 30–40 seconds into the first viewport, making handles and short lines hard
-// to distinguish until the operator clicked + several times. 32 px/s opens
-// at a useful editing scale while the − control still provides an overview.
-const ZOOM_DEFAULT = 32;
+const ZOOM_DEFAULT = 48;
 const ZOOM_MIN = 8;
-const ZOOM_MAX = 60;
-const ZOOM_STEP = 8;
-const EDGE_PX = 10;            // height of the top/bottom grab handles
-const MIN_DUR_S = 0.3;         // shortest readable on-screen window
-const MIN_BLOCK_PX = 22;       // floor so short lines stay grabbable at any zoom
-// 2026-05-25 — click-vs-drag threshold ahora se mide en TIEMPO, no
-// pixels. A zoom=8 px/s, 4px hardcoded = 500 ms de tolerancia (mucho —
-// clicks cortos disparaban drags accidentales). A zoom=60 px/s, 4px =
-// 67 ms (ok). 50 ms es invariante al zoom: clickSlopPx = 50ms * pxPerSec.
-const CLICK_SLOP_TIME_S = 0.05;
-const LABEL_W = 38;            // left time-label column
-const WAVE_W = 30;             // waveform band width inside the gutter
-const GUTTER_PX = LABEL_W + WAVE_W; // total left gutter (labels + waveform)
-const MAX_VH_NORMAL = "58vh";   // viewport cap default; the lane scrolls within it
-const MAX_VH_FOCUS = "85vh";    // 2026-05-25 — modo enfoque del editor agranda la lane
+const ZOOM_MAX = 260;
+const ZOOM_STEP = 20;
+const ROW_H = 48;
+const WAVE_H = 46;
+const MIN_BLOCK_PX = 2;
+const EDGE_PX = 22;
+const MOVE_HIT_MIN_PX = 28;
+const MIN_DUR_S = 0.3;
+const CLICK_SLOP_PX = 5;
 const FOLLOW_SUPPRESS_MS = 2500;
-// A smooth scroll is a browser animation. Reissuing it on every audio tick
-// keeps replacing the destination and can make the playhead disappear while
-// the viewport is trying to catch up.
-const FOLLOW_SCROLL_LOCK_MS = 750;
-const INTRO_SKIP_S = 3;        // auto-scroll to first lyric if intro longer than this
+const FOLLOW_LOCK_MS = 750;
+const LABEL_W = 264;
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
 
 function fmt(sec) {
   if (!isFinite(sec) || sec < 0) sec = 0;
@@ -54,854 +41,813 @@ function fmt(sec) {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+function nearestTick(step) {
+  if (step <= 5) return 1;
+  if (step <= 15) return 5;
+  if (step <= 45) return 10;
+  return 30;
+}
+
+function normalizeTimelineSegments(input) {
+  if (!Array.isArray(input)) return [];
+  return input.map((segment, index) => {
+    const rawStart = segment?.start ?? segment?.startTime ?? segment?.start_time ?? 0;
+    const rawEnd = segment?.end ?? segment?.endTime ?? segment?.end_time;
+    const parsedStart = Number(rawStart);
+    const parsedEnd = Number(rawEnd);
+    const start = Number.isFinite(parsedStart) ? Math.max(0, parsedStart) : 0;
+    const end = Number.isFinite(parsedEnd) ? Math.max(start + MIN_DUR_S, parsedEnd) : start + 1;
+    return {
+      ...segment,
+      _id: segment?._id ?? index,
+      start,
+      end,
+      text: segment?.text == null ? "" : String(segment.text),
+    };
+  });
+}
+
 export default function LyricsTimeline({
-  segments,            // [{_id, start, end, text, locked?}]
+  segments,
   duration,
   currentTime,
   isPlaying = false,
   activeId,
   focusedSegId,
-  highlightedIds,      // Set<_id>
-  waveform = null,     // {peaks:[0..1], duration} | null — drawn in the gutter
+  highlightedIds,
+  waveform = null,
   gapS = 0.05,
-  saveStatus = "idle", // "idle" | "saving" | "saved"
-  onSeek,              // (seconds) => void
-  onDragStart,         // () => void  — push one undo snapshot before a drag commits
-  onTimingChange,      // (id, newStart, newEnd) => void — commit; parent sets locked
-  onTimingChangeBatch, // ([{id, start, end}]) => void — commit a group move
-  onTextChange,        // (id, text) => void — inline text fix without leaving timeline
-  onFocus,             // (id) => void
-  onReset,             // () => void
-  focusMode = false,   // 2026-05-25 — passed from LyricsEditor focus toggle
+  saveStatus = "idle",
+  onSeek,
+  onDragStart,
+  onTimingChange,
+  onTimingChangeBatch,
+  onTextChange,
+  onFocus,
+  onReset,
+  onDeleteSelection,
+  onSelectionCreated,
+  onGroupMoved,
+  focusMode = false,
 }) {
   const i18n = useI18n?.() || {};
   const t = (key, fallback) => i18n.t?.(key) || fallback || key;
-  const laneRef = useRef(null);
   const scrollRef = useRef(null);
+  const trackRef = useRef(null);
   const canvasRef = useRef(null);
-  const didAutoScrollRef = useRef(false);
-  const [preview, setPreview] = useState(null); // {id, start, end} | null
-  const dragRef = useRef(null); // single or group drag snapshot
-  const selectionDragRef = useRef(null);
+  const dragRef = useRef(null);
+  const marqueeRef = useRef(null);
+  const followTimerRef = useRef(null);
+  const followLockRef = useRef(false);
+  const selectionAnchorRef = useRef(null);
+  const lastInteractionRef = useRef(0);
+  const clickSuppressRef = useRef(false);
+  const activeRowRefs = useRef(new Map());
+  const [viewportWidth, setViewportWidth] = useState(0);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
-  const [selectionMode, setSelectionMode] = useState(false);
-  const [selectionBox, setSelectionBox] = useState(null);
+  const [marquee, setMarquee] = useState(null);
+  const [preview, setPreview] = useState(null);
   const [pxPerSec, setPxPerSec] = useState(ZOOM_DEFAULT);
-  const [editingTextId, setEditingTextId] = useState(null); // line whose text is being fixed inline
+  const [moreActionsOpen, setMoreActionsOpen] = useState(false);
+  const [editingTextId, setEditingTextId] = useState(null);
   const [draftText, setDraftText] = useState("");
-  const lastUserScrollRef = useRef(0);
-  const programmaticScrollUntilRef = useRef(0);
-  const followPauseTimerRef = useRef(null);
-  const followScrollRef = useRef(false);
   const [followEnabled, setFollowEnabled] = useState(true);
   const [followSuppressed, setFollowSuppressed] = useState(false);
-  const [scrollState, setScrollState] = useState({ top: 0, viewport: 1 });
+  const [limitFeedback, setLimitFeedback] = useState("");
 
-  const beginTextEdit = useCallback((seg) => {
-    setEditingTextId(seg._id);
-    setDraftText(seg.text || "");
-  }, []);
-  const commitTextEdit = useCallback((id) => {
-    setEditingTextId((cur) => (cur === id ? null : cur));
-    onTextChange?.(id, draftText);
-  }, [draftText, onTextChange]);
-  const cancelTextEdit = useCallback(() => setEditingTextId(null), []);
-  const markUserScroll = useCallback(() => {
-    lastUserScrollRef.current = Date.now();
+  const normalizedSegments = useMemo(() => normalizeTimelineSegments(segments), [segments]);
+  const total = Math.max(Number(duration) || 0, ...normalizedSegments.map((s) => s.end), 1);
+  const trackWidth = Math.max(Math.max(320, (viewportWidth || 960) - LABEL_W), total * pxPerSec + 24);
+  const surfaceWidth = LABEL_W + trackWidth;
+  const trackHeight = Math.max(ROW_H, normalizedSegments.length * ROW_H);
+  const rowOfId = useMemo(() => new Map(normalizedSegments.map((s, index) => [s._id, index])), [normalizedSegments]);
+  const activeRowIndex = activeId == null ? null : rowOfId.get(activeId);
+  const ticks = useMemo(() => {
+    const step = nearestTick(120 / pxPerSec);
+    const out = [];
+    for (let time = 0; time <= total + step; time += step) out.push(time);
+    return out;
+  }, [pxPerSec, total]);
+
+  const markInteraction = useCallback(() => {
+    lastInteractionRef.current = Date.now();
     setFollowSuppressed(true);
-    if (followPauseTimerRef.current) clearTimeout(followPauseTimerRef.current);
-    followPauseTimerRef.current = setTimeout(() => setFollowSuppressed(false), FOLLOW_SUPPRESS_MS);
+    if (followTimerRef.current) clearTimeout(followTimerRef.current);
+    followTimerRef.current = setTimeout(() => setFollowSuppressed(false), FOLLOW_SUPPRESS_MS);
   }, []);
-
-  const releaseFollowScroll = useCallback(() => {
-    followScrollRef.current = false;
-  }, []);
-
-  const requestFollowScroll = useCallback((sc, top) => {
-    if (followScrollRef.current) return false;
-    followScrollRef.current = true;
-    programmaticScrollUntilRef.current = Date.now() + FOLLOW_SCROLL_LOCK_MS;
-    sc.scrollTo({ top, behavior: "smooth" });
-    // scrollend is not available in every browser version (and jsdom), so
-    // always retain a bounded fallback to release the single-flight lock.
-    window.setTimeout(releaseFollowScroll, FOLLOW_SCROLL_LOCK_MS);
-    return true;
-  }, [releaseFollowScroll]);
 
   useEffect(() => () => {
-    if (followPauseTimerRef.current) clearTimeout(followPauseTimerRef.current);
+    if (followTimerRef.current) clearTimeout(followTimerRef.current);
   }, []);
 
   useEffect(() => {
-    const sc = scrollRef.current;
-    if (!sc || typeof sc.addEventListener !== "function") return undefined;
-    sc.addEventListener("scrollend", releaseFollowScroll);
-    return () => sc.removeEventListener("scrollend", releaseFollowScroll);
-  }, [releaseFollowScroll]);
-
-  const total = Math.max(duration || 0, ...segments.map((s) => s.end), 1);
-  const laneHeight = total * pxPerSec;
-
-  // INCIDENT 2026-05-25: forced_align/reconcile sometimes emits two segments
-  // with (almost) identical `start` — typical of a chorus where lrclib has
-  // repeated identical lines ("Legalícenla / Legalícenla / Oh-oh-oh" at the
-  // top of the chorus). Before this fix every overlapping segment was
-  // rendered at `top = start * pxPerSec` with full-width, so the second one
-  // sat literally underneath the first — the operator saw ONE block and
-  // assumed the rest were missing. Worse: those "missing" lines DID exist
-  // in the segments_json (the list view showed them all), so it looked like
-  // the timeline was a buggy view of correct data.
-  //
-  // Fix: Gantt-style lane assignment. Sort segments by start. For each
-  // segment, place it in the first lane whose previous segment has already
-  // ended; if none free → open a new lane. The columns then share the
-  // available horizontal space equally so the operator sees ALL overlapping
-  // lines side by side. When there's no overlap (the common case), the
-  // single lane uses the full width — visually identical to before.
-  //
-  // 50ms epsilon: timestamps that close are functionally simultaneous from
-  // the operator's point of view (single bar of music) and should share a
-  // lane bucket. Larger gaps go in the same lane sequentially.
-  const { laneOfId, laneCount } = useMemo(() => {
-    const OVERLAP_EPSILON_S = 0.05;
-    const sorted = [...segments].sort((a, b) => a.start - b.start);
-    const laneEnds = [];                 // laneIdx → latest seg.end in that lane
-    const idToLane = new Map();
-    for (const s of sorted) {
-      let assigned = -1;
-      for (let i = 0; i < laneEnds.length; i++) {
-        if (laneEnds[i] <= s.start + OVERLAP_EPSILON_S) {
-          assigned = i;
-          break;
-        }
-      }
-      if (assigned < 0) {
-        assigned = laneEnds.length;
-        laneEnds.push(s.end);
-      } else {
-        laneEnds[assigned] = s.end;
-      }
-      idToLane.set(s._id, assigned);
+    const node = scrollRef.current;
+    if (!node) return undefined;
+    const measure = () => setViewportWidth(Math.max(320, node.clientWidth || 960));
+    measure();
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", measure);
+      return () => window.removeEventListener("resize", measure);
     }
-    return { laneOfId: idToLane, laneCount: Math.max(1, laneEnds.length) };
-  }, [segments]);
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
 
-  // Keep selection valid when the editor replaces/rehydrates its segment
-  // array after a save or a reset.
+  const fitZoom = useCallback(() => (
+    clamp((Math.max(viewportWidth, 960) - LABEL_W - 24) / Math.max(total, 1), ZOOM_MIN, ZOOM_MAX)
+  ), [total, viewportWidth]);
+
   useEffect(() => {
-    const ids = new Set(segments.map((s) => s._id));
-    setSelectedIds((prev) => {
-      const next = new Set([...prev].filter((id) => ids.has(id)));
-      return next.size === prev.size ? prev : next;
+    const valid = new Set(normalizedSegments.map((s) => s._id));
+    setSelectedIds((previous) => {
+      const next = new Set([...previous].filter((id) => valid.has(id)));
+      return next.size === previous.size ? previous : next;
     });
-  }, [segments]);
+  }, [normalizedSegments]);
 
-  const neighbours = useCallback(
-    (id) => {
-      // Operator report 2026-05-26: cuando whisperX devuelve líneas que se
-      // solapan en el tiempo (overlap > OVERLAP_EPSILON_S, ej. coros o
-      // dobles voces), el Gantt las renderiza en lanes paralelas. El
-      // pre-fix usaba el orden global por `.start` para buscar prev/next,
-      // y el clamp `lo = prev.end + gapS` / `hi = next.start - gapS`
-      // terminaba bloqueando el drag contra un segmento de OTRA lane —
-      // aunque visualmente esa lane vive al costado, no debajo. Resultado
-      // observado: end edge clampeado a `next.start - gapS` que era
-      // MENOR que `origEnd`, comiteando una "extensión" que en realidad
-      // era una contracción de 50ms. Indistinguible visualmente de un
-      // "snap back to original" — el operador soltaba y nada parecía
-      // haber cambiado.
-      //
-      // Fix: filtrar por mismo lane antes de buscar prev/next. Las lanes
-      // paralelas dejan de ser blockers. Las líneas back-to-back en el
-      // MISMO lane siguen clampeadas (regresión cubierta por test).
-      const myLane = laneOfId.get(id);
-      if (myLane === undefined) return { prev: null, next: null };
-      const sameLane = [...segments]
-        .filter((s) => laneOfId.get(s._id) === myLane)
-        .sort((a, b) => a.start - b.start);
-      const i = sameLane.findIndex((s) => s._id === id);
-      return {
-        prev: i > 0 ? sameLane[i - 1] : null,
-        next: i >= 0 && i < sameLane.length - 1 ? sameLane[i + 1] : null,
-      };
-    },
-    [segments, laneOfId]
-  );
-
-  // clientY → time. laneRef is the inner lane content (full laneHeight); its
-  // rect.top already shifts with vertical scroll, so we do NOT add scrollTop.
-  const clientYToTime = useCallback((clientY) => {
-    const rect = laneRef.current?.getBoundingClientRect();
+  const xToTime = useCallback((clientX) => {
+    const rect = trackRef.current?.getBoundingClientRect();
     if (!rect) return 0;
-    return Math.max(0, (clientY - rect.top) / pxPerSec);
-  }, [pxPerSec]);
+    return clamp((clientX - rect.left) / pxPerSec, 0, total);
+  }, [pxPerSec, total]);
+
+  const seekAt = useCallback((clientX) => {
+    markInteraction();
+    onSeek?.(xToTime(clientX));
+  }, [markInteraction, onSeek, xToTime]);
+
+  const suppressNextClick = useCallback(() => {
+    clickSuppressRef.current = true;
+    window.setTimeout(() => { clickSuppressRef.current = false; }, 0);
+  }, []);
 
   const toggleSelection = useCallback((id) => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
+    selectionAnchorRef.current = id;
+    setSelectedIds((previous) => {
+      const next = new Set(previous);
       if (next.has(id)) next.delete(id);
       else next.add(id);
+      onSelectionCreated?.({ count: next.size, method: "modifier" });
       return next;
     });
-  }, []);
+  }, [onSelectionCreated]);
 
-  const onPointerDown = useCallback(
-    (e, seg, mode) => {
-      e.stopPropagation();
-      // Shift/Cmd-click is the quick selection path. Selection mode is the
-      // explicit "paint" path for dense timelines where clicking individual
-      // blocks is impractical.
-      if (selectionMode || e.shiftKey || e.metaKey || e.ctrlKey) {
-        toggleSelection(seg._id);
-        return;
-      }
-      e.currentTarget.setPointerCapture?.(e.pointerId);
-      onDragStart?.();
-      // Auditoría 2026-06-10: si hay un smooth-scroll del auto-follow EN
-      // VUELO al agarrar el bloque, el viewport sigue moviéndose bajo el
-      // cursor durante el drag ("el bloque se escapa"). Reasignar
-      // scrollTop a sí mismo cancela la animación en curso, y marcamos
-      // interacción para que el follow no re-dispare ya mismo.
-      markUserScroll();
-      const _sc = scrollRef.current;
-      if (_sc) _sc.scrollTop = _sc.scrollTop;
-      // FIX 2 (2026-05-25): snapshot pxPerSec al inicio del drag. Si el
-      // operador clickea zoom +/- mid-drag, el live pxPerSec cambia y el
-      // delta (deltaPx / pxPerSec) queda mal escalado → el segmento
-      // saltaba a una posición incorrecta. El snapshot garantiza que
-      // los pixels que el operador movió siempre se traducen al mismo
-      // tiempo, incluso si el zoom cambia entre frames.
-      const isGroupMove = mode === "move" && selectedIds.has(seg._id) && selectedIds.size > 1;
-      const snapshots = (isGroupMove ? segments.filter((s) => selectedIds.has(s._id)) : [seg])
-        .map((s) => ({ id: s._id, start: s.start, end: s.end }));
-      dragRef.current = {
-        id: seg._id, ids: snapshots.map((s) => s.id), mode, originY: e.clientY,
-        origStart: seg.start, origEnd: seg.end, snapshots, moved: false,
-        origPxPerSec: pxPerSec,
-      };
-      setPreview(isGroupMove
-        ? { changes: snapshots }
-        : { id: seg._id, start: seg.start, end: seg.end });
-    },
-    [onDragStart, markUserScroll, pxPerSec, segments, selectedIds, selectionMode, toggleSelection]
-  );
-
-  const onPointerMove = useCallback(
-    (e) => {
-      const d = dragRef.current;
-      if (!d) return;
-      const deltaPx = e.clientY - d.originY;
-      // FIX 4 (2026-05-25): click-slop threshold zoom-invariant. A
-      // CLICK_SLOP_TIME_S * pxPerSec ms. Antes era 4px hardcoded — a
-      // zoom=8 px/s eso son 500 ms de "dead zone" que disparaba drags
-      // accidentales en clicks cortos. 50 ms se siente igual en
-      // cualquier zoom level.
-      const clickSlop = CLICK_SLOP_TIME_S * (d.origPxPerSec || pxPerSec);
-      if (Math.abs(deltaPx) > clickSlop) d.moved = true;
-      // FIX 2 (2026-05-25): usar origPxPerSec del snapshot, NO el live
-      // pxPerSec — sino un zoom mid-drag re-escala el delta.
-      const delta = deltaPx / (d.origPxPerSec || pxPerSec);
-      if (d.snapshots?.length > 1) {
-        const minStart = Math.min(...d.snapshots.map((s) => s.start));
-        const maxEnd = Math.max(...d.snapshots.map((s) => s.end));
-        const clampedDelta = Math.min(Math.max(delta, -minStart), total - maxEnd);
-        setPreview({
-          changes: d.snapshots.map((s) => ({
-            id: s.id,
-            start: s.start + clampedDelta,
-            end: s.end + clampedDelta,
-          })),
-        });
-        return;
-      }
-      const { prev, next } = neighbours(d.id);
-      const lo = prev ? prev.end + gapS : 0;
-      const hi = next ? next.start - gapS : total;
-      let start = d.origStart;
-      let end = d.origEnd;
-      if (d.mode === "start") {
-        start = Math.min(Math.max(d.origStart + delta, lo), end - MIN_DUR_S);
-      } else if (d.mode === "end") {
-        end = Math.max(Math.min(d.origEnd + delta, hi), start + MIN_DUR_S);
-      } else {
-        const dur = d.origEnd - d.origStart;
-        start = Math.min(Math.max(d.origStart + delta, lo), hi - dur);
-        end = start + dur;
-      }
-      setPreview({ id: d.id, start, end });
-    },
-    [neighbours, gapS, total, pxPerSec]
-  );
-
-  const onPointerUp = useCallback(
-    (e, seg) => {
-      const d = dragRef.current;
-      dragRef.current = null;
-      if (!d) return;
-      const p = preview;
-      setPreview(null);
-      if (!d.moved) {
-        markUserScroll();
-        onFocus?.(seg._id);
-        onSeek?.(clientYToTime(e.clientY)); // exact clicked point, not block start
-        return;
-      }
-      if (p?.changes?.length > 1) {
-        const changes = p.changes.filter((change) => {
-          const original = d.snapshots.find((s) => s.id === change.id);
-          return original && (Math.abs(change.start - original.start) > 1e-3 || Math.abs(change.end - original.end) > 1e-3);
-        });
-        if (changes.length) {
-          markUserScroll();
-          if (onTimingChangeBatch) onTimingChangeBatch(changes);
-          else changes.forEach((change) => onTimingChange?.(change.id, change.start, change.end));
-        }
-      } else if (p && (Math.abs(p.start - seg.start) > 1e-3 || Math.abs(p.end - seg.end) > 1e-3)) {
-        // Auditoría 2026-06-10: el commit de un drag NO marcaba interacción
-        // — al soltar, el auto-follow podía yankear el viewport al instante
-        // (dragRef ya está limpio) y el bloque recién acomodado "se iba".
-        // El click-path de arriba ya lo hacía; esto empareja el drag-path.
-        markUserScroll();
-        onTimingChange?.(seg._id, p.start, p.end);
-      }
-    },
-    [preview, onFocus, onSeek, onTimingChange, onTimingChangeBatch, clientYToTime, markUserScroll]
-  );
-
-  const onSelectionPointerDown = useCallback((e) => {
-    if (!selectionMode || e.button !== 0 || e.target !== e.currentTarget) return;
-    e.preventDefault();
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture?.(e.pointerId);
-    selectionDragRef.current = { originY: e.clientY, currentY: e.clientY, moved: false };
-    setSelectionBox({ originY: e.clientY, currentY: e.clientY });
-  }, [selectionMode]);
-
-  const onSelectionPointerMove = useCallback((e) => {
-    const drag = selectionDragRef.current;
-    if (!drag) return;
-    drag.currentY = e.clientY;
-    if (Math.abs(drag.currentY - drag.originY) > 4) drag.moved = true;
-    setSelectionBox({ originY: drag.originY, currentY: drag.currentY });
-  }, []);
-
-  const onSelectionPointerUp = useCallback((e) => {
-    const drag = selectionDragRef.current;
-    selectionDragRef.current = null;
-    setSelectionBox(null);
-    if (!drag) return;
-    const top = Math.min(drag.originY, e.clientY);
-    const bottom = Math.max(drag.originY, e.clientY);
-    if (!drag.moved) {
-      setSelectedIds(new Set());
+  const selectRangeTo = useCallback((id) => {
+    const targetIndex = rowOfId.get(id);
+    const anchorIndex = rowOfId.get(selectionAnchorRef.current);
+    if (targetIndex == null || anchorIndex == null) {
+      selectionAnchorRef.current = id;
+      setSelectedIds(new Set([id]));
       return;
     }
-    const from = clientYToTime(top);
-    const to = clientYToTime(bottom);
-    setSelectedIds(new Set(segments
-      .filter((seg) => seg.end >= from && seg.start <= to)
-      .map((seg) => seg._id)));
-  }, [clientYToTime, segments]);
+    const from = Math.min(anchorIndex, targetIndex);
+    const to = Math.max(anchorIndex, targetIndex);
+    const next = new Set(normalizedSegments.slice(from, to + 1).map((segment) => segment._id));
+    setSelectedIds(next);
+    onSelectionCreated?.({ count: next.size, method: "range" });
+  }, [normalizedSegments, onSelectionCreated, rowOfId]);
 
-  const onLaneClick = useCallback(
-    (e) => {
-      if (dragRef.current || selectionDragRef.current || selectionMode) return;
-      markUserScroll();
-      onSeek?.(clientYToTime(e.clientY));
-    },
-    [onSeek, clientYToTime, markUserScroll, selectionMode]
-  );
+  const beginMarquee = useCallback((event, anchorId = null) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    marqueeRef.current = {
+      originX: event.clientX,
+      originY: event.clientY,
+      currentX: event.clientX,
+      currentY: event.clientY,
+      anchorId,
+      moved: false,
+      startedAt: performance.now(),
+    };
+    setMarquee({ originX: event.clientX, originY: event.clientY, currentX: event.clientX, currentY: event.clientY, anchorId });
+  }, []);
 
-  // Auto-follow the playhead vertically — only while playing AND when the
-  // operator hasn't scrolled/clicked in the last FOLLOW_SUPPRESS_MS, so
-  // manual navigation (e.g. back to 0:40) isn't yanked away.
-  //
-  // FIX 1 (2026-05-25, operator drag report): NUNCA scrollee si hay un
-  // drag activo. El smooth scroll cambia scrollRef.scrollTop durante la
-  // transición (16-250ms), lo que cambia `rect.top` de getBoundingClientRect
-  // que clientYToTime() usa para convertir pointer → tiempo. Resultado:
-  // el segmento arrastrado se commiteaba con un valor incorrecto porque
-  // el viewport se movía mientras el operador soltaba.
-  useEffect(() => {
-    if (!isPlaying || !followEnabled) return;
-    if (dragRef.current) return;          // FIX 1: no follow durante drag
-    if (Date.now() - lastUserScrollRef.current < FOLLOW_SUPPRESS_MS) return;
-    const sc = scrollRef.current;
-    if (!sc || typeof sc.scrollTo !== "function") return;
-    const y = currentTime * pxPerSec;
-    const view = sc.scrollTop;
-    const h = sc.clientHeight;
-    if (y < view + 40 || y > view + h - 80) {
-      requestFollowScroll(sc, Math.max(0, y - h * 0.4));
+  const updateMarquee = useCallback((event) => {
+    const current = marqueeRef.current;
+    if (!current) return;
+    current.currentX = event.clientX;
+    current.currentY = event.clientY;
+    if (Math.abs(current.currentX - current.originX) > CLICK_SLOP_PX || Math.abs(current.currentY - current.originY) > CLICK_SLOP_PX) {
+      current.moved = true;
     }
-  }, [currentTime, isPlaying, pxPerSec, followEnabled, requestFollowScroll]);
+    setMarquee({ ...current });
+  }, []);
 
-  // Draw the waveform in the gutter (static — redraws only when the peaks
-  // or the time scale change, never per playhead tick). Guarded for jsdom,
-  // which has no canvas 2d context.
+  const finishMarquee = useCallback((event) => {
+    const current = marqueeRef.current;
+    marqueeRef.current = null;
+    setMarquee(null);
+    if (!current) return;
+    event.stopPropagation();
+    if (!current.moved) {
+      suppressNextClick();
+      if (current.anchorId != null) toggleSelection(current.anchorId);
+      else seekAt(event.clientX);
+      return;
+    }
+    const trackRect = trackRef.current?.getBoundingClientRect();
+    if (!trackRect) return;
+    const left = Math.min(current.originX, current.currentX) - trackRect.left;
+    const right = Math.max(current.originX, current.currentX) - trackRect.left;
+    const top = Math.min(current.originY, current.currentY) - trackRect.top;
+    const bottom = Math.max(current.originY, current.currentY) - trackRect.top;
+    const from = clamp(left / pxPerSec, 0, total);
+    const to = clamp(right / pxPerSec, 0, total);
+    const ids = normalizedSegments
+      .filter((segment) => {
+        const row = rowOfId.get(segment._id) ?? 0;
+        const rowTop = row * ROW_H;
+        const rowBottom = rowTop + ROW_H;
+        const rowIntersects = rowBottom >= top && rowTop <= bottom;
+        return current.anchorId != null
+          ? rowIntersects
+          : rowIntersects && segment.end >= from && segment.start <= to;
+      })
+      .map((segment) => segment._id);
+    setSelectedIds(new Set(ids));
+    onSelectionCreated?.({
+      count: ids.length,
+      method: "paint",
+      durationMs: Math.max(0, performance.now() - current.startedAt),
+    });
+    if (ids.length) selectionAnchorRef.current = ids[0];
+    markInteraction();
+  }, [markInteraction, normalizedSegments, onSelectionCreated, pxPerSec, rowOfId, seekAt, toggleSelection, total]);
+
+  const startDrag = useCallback((event, segment, mode) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if ((event.metaKey || event.ctrlKey) && !event.shiftKey) {
+      toggleSelection(segment._id);
+      return;
+    }
+    if (mode === "move" && event.shiftKey) {
+      selectRangeTo(segment._id);
+      return;
+    }
+    const movingGroup = mode === "move" && selectedIds.has(segment._id) && selectedIds.size > 1;
+    const snapshots = (movingGroup ? normalizedSegments.filter((item) => selectedIds.has(item._id)) : [segment])
+      .map((item) => ({ id: item._id, start: item.start, end: item.end }));
+    if (!selectedIds.has(segment._id)) {
+      selectionAnchorRef.current = segment._id;
+      setSelectedIds(new Set([segment._id]));
+    }
+    dragRef.current = {
+      id: segment._id,
+      mode,
+      originX: event.clientX,
+      snapshots,
+      origStart: segment.start,
+      origEnd: segment.end,
+      moved: false,
+      pxPerSec,
+      startedAt: performance.now(),
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    markInteraction();
+    setPreview(movingGroup ? { changes: snapshots, mode } : { id: segment._id, start: segment.start, end: segment.end, mode });
+  }, [markInteraction, normalizedSegments, pxPerSec, selectRangeTo, selectedIds, toggleSelection]);
+
+  const updateDrag = useCallback((event) => {
+    const drag = dragRef.current;
+    if (!drag) {
+      updateMarquee(event);
+      return;
+    }
+    const delta = (event.clientX - drag.originX) / drag.pxPerSec;
+    if (Math.abs(event.clientX - drag.originX) > CLICK_SLOP_PX) {
+      drag.moved = true;
+      if (!drag.historyStarted) {
+        drag.historyStarted = true;
+        onDragStart?.();
+      }
+    }
+    if (drag.snapshots.length > 1) {
+      const safeDelta = clampSelectionShiftDelta(
+        normalizedSegments,
+        new Set(drag.snapshots.map((item) => item.id)),
+        delta,
+        total,
+        gapS,
+      );
+      setLimitFeedback(Math.abs(delta) > 1e-4 && Math.abs(safeDelta) < 1e-4
+        ? "No hay espacio para mover esta selección."
+        : "");
+      setPreview({ changes: drag.snapshots.map((item) => ({ id: item.id, start: item.start + safeDelta, end: item.end + safeDelta })), mode: drag.mode });
+      return;
+    }
+    let start = drag.origStart;
+    let end = drag.origEnd;
+    if (drag.mode === "start" || drag.mode === "end") {
+      const bounded = clampResizeTiming(
+        normalizedSegments,
+        drag.id,
+        drag.mode === "start" ? drag.origStart + delta : drag.origStart,
+        drag.mode === "end" ? drag.origEnd + delta : drag.origEnd,
+        total,
+        gapS,
+        MIN_DUR_S,
+      );
+      if (bounded) ({ start, end } = bounded);
+      setLimitFeedback(bounded?.blocked ? "La línea no tiene espacio para cambiar su duración." : "");
+    } else {
+      const safeDelta = clampSelectionShiftDelta(
+        normalizedSegments, new Set([drag.id]), delta, total, gapS,
+      );
+      start = drag.origStart + safeDelta;
+      end = drag.origEnd + safeDelta;
+      setLimitFeedback(Math.abs(delta) > 1e-4 && Math.abs(safeDelta) < 1e-4
+        ? "La línea llegó al límite disponible."
+        : "");
+    }
+    setPreview({ id: drag.id, start, end, mode: drag.mode });
+  }, [gapS, normalizedSegments, onDragStart, total, updateMarquee]);
+
+  const finishDrag = useCallback((event, segment) => {
+    if (marqueeRef.current) {
+      finishMarquee(event);
+      return;
+    }
+    const drag = dragRef.current;
+    dragRef.current = null;
+    const current = preview;
+    setPreview(null);
+    if (!drag || !current) return;
+    event.stopPropagation();
+    if (!drag.moved) {
+      onFocus?.(segment._id);
+      seekAt(event.clientX);
+      return;
+    }
+    if (current.changes?.length > 1) {
+      const changes = current.changes.filter((change) => {
+        const original = drag.snapshots.find((item) => item.id === change.id);
+        return original && (Math.abs(original.start - change.start) > 1e-3 || Math.abs(original.end - change.end) > 1e-3);
+      });
+      const durationMs = Math.max(0, performance.now() - drag.startedAt);
+      if (changes.length) onTimingChangeBatch?.(changes, { durationMs });
+      if (changes.length) onGroupMoved?.({ count: changes.length, delta: changes[0].start - drag.snapshots[0].start });
+      return;
+    }
+    if (Math.abs(current.start - segment.start) > 1e-3 || Math.abs(current.end - segment.end) > 1e-3) {
+      onTimingChange?.(segment._id, current.start, current.end);
+    }
+  }, [finishMarquee, onFocus, onGroupMoved, onTimingChange, onTimingChangeBatch, preview, seekAt]);
+
+  const cancelPointerInteraction = useCallback((event) => {
+    dragRef.current = null;
+    marqueeRef.current = null;
+    setPreview(null);
+    setMarquee(null);
+    setLimitFeedback("Edición cancelada; se restauraron los tiempos anteriores.");
+    event?.stopPropagation?.();
+  }, []);
+
+  const fitTimeline = useCallback(() => {
+    setPxPerSec(fitZoom());
+    setMoreActionsOpen(false);
+  }, [fitZoom]);
+
+  const nudgeSelection = useCallback((delta) => {
+    const snapshots = normalizedSegments.filter((segment) => selectedIds.has(segment._id));
+    if (!snapshots.length) return;
+    const safeDelta = clampSelectionShiftDelta(normalizedSegments, selectedIds, delta, total, gapS);
+    if (Math.abs(safeDelta) < 1e-6) {
+      setLimitFeedback("No hay espacio para mover esta selección.");
+      return;
+    }
+    onDragStart?.();
+    onTimingChangeBatch?.(snapshots.map((segment) => ({
+      id: segment._id,
+      start: segment.start + safeDelta,
+      end: segment.end + safeDelta,
+    })));
+    markInteraction();
+  }, [gapS, markInteraction, normalizedSegments, onDragStart, onTimingChangeBatch, selectedIds, total]);
+
+  const scrollToPlayhead = useCallback(() => {
+    const sc = scrollRef.current;
+    if (!sc || typeof sc.scrollTo !== "function" || followLockRef.current || Date.now() - lastInteractionRef.current < FOLLOW_SUPPRESS_MS) return;
+    const x = LABEL_W + currentTime * pxPerSec;
+    const left = sc.scrollLeft;
+    const right = left + sc.clientWidth;
+    if (x < left + 80 || x > right - 120) {
+      followLockRef.current = true;
+      sc.scrollTo({ left: Math.max(0, x - sc.clientWidth * 0.4), behavior: "smooth" });
+      window.setTimeout(() => { followLockRef.current = false; }, FOLLOW_LOCK_MS);
+    }
+  }, [currentTime, pxPerSec]);
+
+  useEffect(() => {
+    if (isPlaying && followEnabled) scrollToPlayhead();
+  }, [isPlaying, followEnabled, scrollToPlayhead]);
+
+  useEffect(() => {
+    if (!isPlaying || !followEnabled || followSuppressed || activeId == null) return;
+    const row = activeRowRefs.current.get(activeId);
+    row?.scrollIntoView?.({ block: "center", inline: "nearest", behavior: "smooth" });
+  }, [activeId, followEnabled, followSuppressed, isPlaying]);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     const peaks = waveform?.peaks;
-    if (!canvas || !peaks || !peaks.length) return;
+    if (!canvas || !peaks?.length) return;
     const ctx = canvas.getContext?.("2d");
     if (!ctx) return;
-    const dpr = Math.min((typeof window !== "undefined" && window.devicePixelRatio) || 1, 2);
-    const w = GUTTER_PX;
-    const h = laneHeight;
-    canvas.width = Math.round(w * dpr);
-    canvas.height = Math.round(h * dpr);
-    canvas.style.width = `${w}px`;
-    canvas.style.height = `${h}px`;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(trackWidth * dpr);
+    canvas.height = Math.round(WAVE_H * dpr);
+    canvas.style.width = `${trackWidth}px`;
+    canvas.style.height = `${WAVE_H}px`;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, w, h);
-    const N = peaks.length;
-    const cx = LABEL_W + WAVE_W / 2;
-    const band = h / N;
-    ctx.fillStyle = "rgba(139,124,246,0.30)"; // brand violet, faint
-    for (let i = 0; i < N; i++) {
-      const half = peaks[i] * (WAVE_W / 2);
-      if (half <= 0) continue;
-      ctx.fillRect(cx - half, i * band, half * 2, Math.max(1, band));
+    ctx.clearRect(0, 0, trackWidth, WAVE_H);
+    const stride = Math.max(1, Math.ceil(peaks.length / Math.max(1, Math.floor(trackWidth / 4))));
+    ctx.fillStyle = "rgba(139,124,246,0.45)";
+    for (let i = 0; i < peaks.length; i += stride) {
+      const x = (i / peaks.length) * trackWidth;
+      const height = Math.max(2, peaks[i] * (WAVE_H - 8));
+      ctx.fillRect(x, (WAVE_H - height) / 2, Math.max(1, 2.5 * stride), height);
     }
-  }, [waveform, laneHeight]);
+  }, [trackWidth, waveform]);
 
-  // On first mount, skip a long instrumental intro: jump the scroll to the
-  // first lyric so the operator doesn't open to a wall of empty time.
-  useEffect(() => {
-    if (didAutoScrollRef.current) return;
-    if (!segments.length) return;
-    const firstStart = Math.min(...segments.map((s) => s.start));
-    if (firstStart <= INTRO_SKIP_S) { didAutoScrollRef.current = true; return; }
-    // rAF: set scrollTop AFTER the lane has its full laid-out height,
-    // otherwise the browser clamps scrollTop to 0 (the bug that left the
-    // view stuck at 0:00 on top of the instrumental intro).
-    const raf = requestAnimationFrame(() => {
-      // FIX 3 (2026-05-25): no auto-scroll si hay drag activo. Edge
-      // case: el operador empieza a arrastrar el mismo frame que el
-      // intro-skip programó su rAF — el scroll cambia mid-drag y
-      // rompe el clientYToTime() calc.
-      if (dragRef.current) return;
-      const sc = scrollRef.current;
-      if (sc) {
-        programmaticScrollUntilRef.current = Date.now() + 100;
-        sc.scrollTop = Math.max(0, firstStart * pxPerSec - 28);
-      }
-      didAutoScrollRef.current = true;
-    });
-    return () => cancelAnimationFrame(raf);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [segments]);
+  const startTextEdit = useCallback((segment) => {
+    setEditingTextId(segment._id);
+    setDraftText(segment.text || "");
+  }, []);
+  const commitTextEdit = useCallback((id) => {
+    setEditingTextId(null);
+    onTextChange?.(id, draftText);
+  }, [draftText, onTextChange]);
 
-  const activeSeg = segments.find((s) => s._id === activeId) || null;
+  const clearSelection = useCallback(() => {
+    selectionAnchorRef.current = null;
+    setSelectedIds(new Set());
+  }, []);
 
-  const ticks = [];
-  for (let s = 0; s <= total; s += 5) ticks.push(s);
+  const deleteSelection = useCallback(() => {
+    if (!selectedIds.size || editingTextId != null) return;
+    const deleted = onDeleteSelection?.([...selectedIds]);
+    if (deleted !== false) clearSelection();
+  }, [clearSelection, editingTextId, onDeleteSelection, selectedIds]);
 
-  const fitTimeline = () => {
-    const viewport = scrollRef.current?.clientHeight || 480;
-    setPxPerSec(Math.max(1.5, Math.min(ZOOM_DEFAULT, viewport / total)));
-    requestAnimationFrame(() => {
-      if (scrollRef.current) {
-        programmaticScrollUntilRef.current = Date.now() + 100;
-        scrollRef.current.scrollTop = 0;
-      }
-    });
-  };
-
-  const showDetail = () => {
-    setPxPerSec(ZOOM_DEFAULT);
-    requestAnimationFrame(() => {
-      const sc = scrollRef.current;
-      if (sc) {
-        programmaticScrollUntilRef.current = Date.now() + 100;
-        sc.scrollTop = Math.max(0, currentTime * ZOOM_DEFAULT - sc.clientHeight * 0.4);
-      }
-    });
-  };
-
-  const handleTimelineScroll = (event) => {
-    if (Date.now() > programmaticScrollUntilRef.current) markUserScroll();
-    setScrollState({ top: event.currentTarget.scrollTop, viewport: event.currentTarget.clientHeight });
-  };
-
-  // Keep the minimap viewport accurate before the operator performs the
-  // first scroll and whenever zoom/layout changes alter the visible range.
-  useEffect(() => {
-    const raf = requestAnimationFrame(() => {
-      const sc = scrollRef.current;
-      if (sc) setScrollState({ top: sc.scrollTop, viewport: sc.clientHeight });
-    });
-    return () => cancelAnimationFrame(raf);
-  }, [pxPerSec, focusMode, laneHeight]);
-
-  const jumpFromMinimap = (event) => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    const pct = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
-    const time = pct * total;
-    onSeek?.(time);
-    const sc = scrollRef.current;
-    if (sc) {
-      programmaticScrollUntilRef.current = Date.now() + 100;
-      sc.scrollTop = Math.max(0, time * pxPerSec - sc.clientHeight * 0.4);
+  const deleteLine = useCallback((event, id) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const deleted = onDeleteSelection?.([id]);
+    if (deleted !== false) {
+      setSelectedIds((previous) => {
+        if (!previous.has(id)) return previous;
+        const next = new Set(previous);
+        next.delete(id);
+        return next;
+      });
+      if (selectionAnchorRef.current === id) selectionAnchorRef.current = null;
     }
-  };
+  }, [onDeleteSelection]);
 
-  const toggleFollow = () => {
-    if (followEnabled && followSuppressed) {
-      lastUserScrollRef.current = 0;
-      setFollowSuppressed(false);
-      if (followPauseTimerRef.current) clearTimeout(followPauseTimerRef.current);
-      const sc = scrollRef.current;
-      if (sc) {
-        programmaticScrollUntilRef.current = Date.now() + 100;
-        sc.scrollTop = Math.max(0, currentTime * pxPerSec - sc.clientHeight * 0.4);
-      }
+  const handleKeyDown = (event) => {
+    if (event.key === "Escape") clearSelection();
+    const targetIsEditable = ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(event.target?.tagName)
+      || event.target?.isContentEditable;
+    if ((event.key === "Delete" || event.key === "Backspace")
+      && selectedIds.size > 0
+      && !targetIsEditable) {
+      event.preventDefault();
+      deleteSelection();
       return;
     }
-    setFollowEnabled((value) => !value);
+    if ((event.key === "ArrowLeft" || event.key === "ArrowRight")
+      && selectedIds.size > 0
+      && !targetIsEditable) {
+      event.preventDefault();
+      const amount = event.shiftKey ? 0.5 : event.altKey ? 0.01 : 0.1;
+      nudgeSelection(event.key === "ArrowLeft" ? -amount : amount);
+    }
   };
 
+  const tickStep = nearestTick(120 / pxPerSec);
+
   return (
-    <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.05] overflow-hidden animate-fade-in">
-      {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2.5 border-b border-white/[0.05] gap-3 flex-wrap">
-        <div className="flex items-center gap-2.5">
-          <span className="text-[11px] uppercase tracking-wider text-ink-tertiary font-semibold">
-            {t("timeline.title", "Línea de tiempo")}
-          </span>
-          {saveStatus === "saving" && (
-            <span className="text-[10px] text-ink-tertiary flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-ink-tertiary animate-pulse" />
-              {t("timeline.saving", "Guardando…")}
-            </span>
-          )}
-          {saveStatus === "saved" && (
-            <span className="text-[10px] text-emerald-300 flex items-center gap-1 animate-fade-in">
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                <path d="M20 6 9 17l-5-5" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-              {t("timeline.saved", "Guardado")}
-            </span>
-          )}
-          {saveStatus === "error" && (
-            // QA fix 2026-05-28 (audit P0 #74): antes el autosave error
-            // caía silente — el operador no se enteraba y al apretar
-            // Aprobar perdía los cambios. Ahora chip rojo persistente.
-            <span className="text-[10px] text-red-400 flex items-center gap-1 animate-fade-in">
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                <path d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zM12 15.75h.01" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-              {t("timeline.save_error", "Sin guardar — revisá tu conexión")}
-            </span>
-          )}
+    <div
+      className="rounded-2xl bg-surface-2/40 ring-1 ring-white/[0.07] overflow-hidden animate-fade-in outline-none focus-visible:ring-2 focus-visible:ring-brand-light"
+      tabIndex={0}
+      onKeyDown={handleKeyDown}
+      aria-label={t("timeline.workspace", "Studio de tiempos")}
+    >
+      <div className="relative flex items-center justify-between gap-4 px-4 sm:px-5 py-4 border-b border-white/[0.07] flex-wrap bg-gradient-to-r from-white/[0.025] to-brand/[0.035]">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-brand/15 text-brand-light ring-1 ring-brand/25" aria-hidden="true">
+            <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+              <path d="M4 7h7v4H4zM13 13h7v4h-7z" /><path d="M4 3v18" strokeLinecap="round" />
+            </svg>
+          </div>
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <p className="text-sm font-semibold text-white tracking-tight">{t("timeline.title", "Ajustar tiempos")}</p>
+              <span className="text-[10px] text-ink-tertiary tabular-nums">{normalizedSegments.length} {t("timeline.lines_count", "líneas")}</span>
+            </div>
+            <p className="text-[11px] text-ink-tertiary truncate">{t("timeline.subtitle", "Click reproduce · arrastrá el fondo para seleccionar")}</p>
+          </div>
+          {saveStatus === "saving" && <span className="text-[10px] text-ink-tertiary animate-pulse">{t("timeline.saving", "Guardando…")}</span>}
+          {saveStatus === "saved" && <span className="text-[10px] text-emerald-300">✓ {t("timeline.saved", "Guardado")}</span>}
+          {saveStatus === "local" && <span className="text-[10px] text-amber-300">{t("timeline.local_changes", "Cambios locales")}</span>}
+          {saveStatus === "offline" && <span className="text-[10px] text-red-300">{t("timeline.offline", "Sin conexión")}</span>}
+          {saveStatus === "conflict" && <span className="text-[10px] text-amber-300">{t("timeline.conflict", "Conflicto detectado")}</span>}
+          {saveStatus === "error" && <span className="text-[10px] text-red-300">{t("timeline.save_error", "Sin guardar")}</span>}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="relative flex items-center gap-2" data-testid="timeline-primary-actions" data-selected-count={selectedIds.size}>
+          <button type="button" onClick={fitTimeline} title={t("timeline.fit_hint", "Ver la canción completa")} className="h-9 px-3 rounded-xl text-[11px] font-medium text-white bg-white/[0.055] ring-1 ring-white/[0.1] hover:bg-white/[0.09] transition-colors">{t("timeline.fit", "Ver canción completa")}</button>
           <button
             type="button"
-            onClick={() => setSelectionMode((value) => !value)}
-            aria-pressed={selectionMode}
-            className={`text-label px-2.5 py-1 rounded-md ring-1 transition-colors ${selectionMode ? "text-brand-light bg-brand/10 ring-brand/30" : "text-ink-secondary ring-white/[0.08] hover:text-white"}`}
-            title={t("timeline.select_hint", "Pintar para seleccionar varias líneas")}
+            aria-expanded={moreActionsOpen}
+            aria-controls="timeline-more-actions"
+            onClick={() => setMoreActionsOpen((value) => !value)}
+            aria-label={t("editor.more_actions", "Más acciones")}
+            className="grid h-9 w-9 place-items-center rounded-xl text-ink-secondary ring-1 ring-white/[0.1] hover:text-white hover:bg-white/[0.06] transition-colors"
           >
-            {selectionMode ? t("timeline.painting", "Pintando") : t("timeline.select", "Seleccionar")}
+            <svg className="h-4 w-4" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>
           </button>
-          {selectedIds.size > 0 && (
-            <span className="inline-flex items-center gap-1 text-[10px] text-brand-light" aria-live="polite">
-              {selectedIds.size} {t("timeline.selected", "seleccionadas")}
+          {moreActionsOpen && (
+            <>
+            <button type="button" tabIndex={-1} aria-hidden="true" onClick={() => setMoreActionsOpen(false)} className="fixed inset-0 z-40 cursor-default" />
+            <div id="timeline-more-actions" role="menu" className="absolute right-0 top-full z-50 mt-2 w-64 overflow-hidden rounded-2xl bg-surface-1 p-1.5 ring-1 ring-white/[0.1] shadow-2xl shadow-black/50">
               <button
                 type="button"
-                className="text-ink-tertiary hover:text-white"
-                onClick={() => setSelectedIds(new Set())}
-                aria-label={t("timeline.clear_selection", "Limpiar selección")}
-                title={t("timeline.clear_selection", "Limpiar selección")}
-              >×</button>
-            </span>
+                onClick={() => setFollowEnabled((value) => !value)}
+                aria-pressed={followEnabled}
+                title={t("timeline.follow_hint", "Mantener la línea activa visible")}
+                role="menuitem"
+                className={`w-full rounded-xl px-3 py-2.5 text-left text-[11px] transition-colors ${followEnabled && !followSuppressed ? "text-brand-light bg-brand/10" : "text-ink-secondary hover:text-white hover:bg-white/[0.05]"}`}
+              >
+                <span className="block font-medium">{followEnabled && followSuppressed ? t("timeline.resume", "Reanudar seguimiento") : t("timeline.follow", "Seguir reproducción")}</span>
+                <span className="mt-0.5 block text-[10px] text-ink-tertiary">{t("timeline.follow_desc", "Mantiene el playhead visible")}</span>
+              </button>
+              <div className="my-1 flex items-center justify-between rounded-xl px-3 py-2 text-[11px] text-ink-secondary hover:bg-white/[0.04]">
+                <span>{t("timeline.zoom", "Zoom")}</span>
+                <div className="inline-flex items-center h-7 rounded-lg ring-1 ring-white/[0.1] overflow-hidden">
+                  <button type="button" onClick={() => setPxPerSec((value) => Math.max(ZOOM_MIN, value - ZOOM_STEP))} className="w-7 h-full hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.zoom_out", "Alejar")}>−</button>
+                  <span data-testid="timeline-zoom" className="w-16 text-center text-[9px] text-ink-tertiary tabular-nums">{Math.round(pxPerSec)} px/s</span>
+                  <button type="button" onClick={() => setPxPerSec((value) => Math.min(ZOOM_MAX, value + ZOOM_STEP))} className="w-7 h-full hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.zoom_in", "Acercar")}>+</button>
+                </div>
+              </div>
+              <button type="button" role="menuitem" onClick={() => { onReset?.(); setMoreActionsOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:text-white hover:bg-white/[0.05]">
+                <span className="block font-medium">{t("timeline.reset", "Restaurar tiempos originales")}</span>
+                <span className="mt-0.5 block text-[10px] text-ink-tertiary">{t("timeline.reset_desc", "Deshace todos los ajustes de timing")}</span>
+              </button>
+            </div>
+            </>
           )}
-          <button
-            type="button"
-            onClick={toggleFollow}
-            aria-pressed={followEnabled}
-            className={`text-label px-2.5 py-1 rounded-md ring-1 transition-colors ${followEnabled ? "text-brand-light bg-brand/10 ring-brand/30" : "text-ink-secondary ring-white/[0.08] hover:text-white"}`}
-            title={t("timeline.follow_hint", "Mantener la línea activa visible durante la reproducción")}
-          >
-            {followEnabled && followSuppressed ? t("timeline.resume", "Reanudar") : t("timeline.follow", "Seguir")}
-          </button>
-          <div className="inline-flex items-center rounded-md ring-1 ring-white/[0.08] overflow-hidden">
-            <button type="button" onClick={fitTimeline} className="px-2 py-1 text-[10px] text-ink-secondary hover:text-white hover:bg-white/[0.05]" title={t("timeline.fit_hint", "Ver la canción completa")}>{t("timeline.fit", "Ajustar")}</button>
-            <button type="button" onClick={showDetail} className="px-2 py-1 text-[10px] text-ink-secondary hover:text-white hover:bg-white/[0.05] border-l border-white/[0.08]" title={t("timeline.detail_hint", "Volver al zoom de edición")}>{t("timeline.detail", "Detalle")}</button>
-          </div>
-          <div className="inline-flex items-center rounded-md ring-1 ring-white/[0.08] overflow-hidden">
-            <button
-              onClick={() => setPxPerSec((z) => Math.max(ZOOM_MIN, z - ZOOM_STEP))}
-              disabled={pxPerSec <= ZOOM_MIN}
-              className="px-2 py-1 text-ink-secondary hover:text-white hover:bg-white/[0.05] disabled:opacity-30 transition-colors"
-              title={t("timeline.zoom_out", "Alejar")} aria-label={t("timeline.zoom_out", "Alejar")}
-            >−</button>
-            <span className="px-1.5 text-[10px] text-ink-tertiary tabular-nums select-none">{Math.round(pxPerSec)} px/s</span>
-            <button
-              onClick={() => setPxPerSec((z) => Math.min(ZOOM_MAX, z < ZOOM_MIN ? ZOOM_MIN : z + ZOOM_STEP))}
-              disabled={pxPerSec >= ZOOM_MAX}
-              className="px-2 py-1 text-ink-secondary hover:text-white hover:bg-white/[0.05] disabled:opacity-30 transition-colors"
-              title={t("timeline.zoom_in", "Acercar")} aria-label={t("timeline.zoom_in", "Acercar")}
-            >+</button>
-          </div>
-          <button
-            onClick={onReset}
-            className="text-label px-2.5 py-1 rounded-md text-ink-secondary
-              ring-1 ring-white/[0.08] hover:ring-white/20 hover:text-white transition-colors flex items-center gap-1.5"
-            title={t("timeline.reset_hint", "Volver los timings al estado original")}
-          >
-            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <path d="M3 12a9 9 0 1 0 3-6.7L3 8" strokeLinecap="round" strokeLinejoin="round" />
-              <path d="M3 3v5h5" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-            {t("timeline.reset", "Resetear timings")}
-          </button>
         </div>
       </div>
 
-      {/* Scrollable timeline (vertical).
-          QA fix 2026-05-28: el auto-scroll del timeline usa
-          scrollRef.scrollTop directo (línea 334 / 281) para mover el
-          lane cuando la línea activa cambia, así que el scrollRef
-          NECESITA seguir siendo un overflow-y-auto container (no
-          podemos hacerlo overflow-visible bajo el nuevo wizard layout).
-          Dejamos el maxHeight inline tal cual — el timeline mantiene su
-          scroll INTERNO con su auto-scroll a la línea activa, y el
-          wizard OUTER scroll (UploadZone right column) cubre el resto
-          (header del timeline, controles arriba). Nested scroll
-          aceptable: el inner se activa con mouse-wheel sobre el lane,
-          el outer con wheel sobre el header. */}
-      <div className="relative">
+      {selectedIds.size > 0 ? (
+        <div data-testid="timeline-selection-help" aria-live="polite" className="flex items-center gap-2.5 border-b border-brand/20 bg-gradient-to-r from-brand/20 via-brand/10 to-transparent px-4 sm:px-5 py-2.5 flex-wrap">
+          <span className="inline-flex h-7 items-center rounded-lg bg-brand px-2.5 text-[11px] font-semibold text-white shadow-lg shadow-brand/20">{selectedIds.size} {selectedIds.size === 1 ? "línea" : "líneas"}</span>
+          <span className="text-[11px] text-ink-secondary">{t("timeline.move_selection", "Mover selección")}</span>
+          <div className="inline-flex overflow-hidden rounded-lg ring-1 ring-white/[0.12]">
+            <button type="button" onClick={() => nudgeSelection(-0.1)} className="h-7 px-2.5 text-[10px] text-ink-secondary hover:bg-white/[0.07] hover:text-white">{t("timeline.nudge_back", "−100 ms")}</button>
+            <button type="button" onClick={() => nudgeSelection(0.1)} className="h-7 border-l border-white/[0.08] px-2.5 text-[10px] text-ink-secondary hover:bg-white/[0.07] hover:text-white">{t("timeline.nudge_forward", "+100 ms")}</button>
+          </div>
+          <span className="hidden sm:inline text-[10px] text-ink-tertiary">{t("timeline.move_selection_hint", "o arrastrá cualquier bloque seleccionado")}</span>
+          <div className="ml-auto flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={deleteSelection}
+              aria-keyshortcuts="Delete Backspace"
+              className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-red-400/10 px-3 text-[10px] font-semibold text-red-200 ring-1 ring-red-300/20 transition-colors hover:bg-red-400/20 hover:ring-red-300/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-200"
+            >
+              <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5m4-5v5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              {(selectedIds.size === 1
+                ? t("timeline.delete_selected_one", "Eliminar 1 línea")
+                : t("timeline.delete_selected_many", "Eliminar {n} líneas")
+              ).replace("{n}", selectedIds.size)}
+            </button>
+            <button type="button" onClick={clearSelection} className="h-7 px-2.5 rounded-lg text-[10px] text-ink-secondary hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.clear_selection", "Limpiar selección")}>{t("timeline.clear", "Limpiar")}</button>
+          </div>
+        </div>
+      ) : (
+        <div data-testid="timeline-selection-help" className="flex items-center gap-2 border-b border-white/[0.06] bg-surface-1/25 px-4 sm:px-5 py-2 text-[10px] text-ink-tertiary">
+          <span className="inline-block h-1.5 w-1.5 rounded-full bg-brand-light shadow-glow" aria-hidden="true" />
+          <span>{t("timeline.paint_hint", "Papelera: elimina una línea · Arrastrá el fondo: seleccioná varias para moverlas o eliminarlas")}</span>
+        </div>
+      )}
+      <p aria-live="polite" className="sr-only">{limitFeedback}</p>
+
       <div
         ref={scrollRef}
-        className="overflow-y-auto overflow-x-hidden"
-        style={{ maxHeight: focusMode ? MAX_VH_FOCUS : MAX_VH_NORMAL }}
-        onPointerMove={onPointerMove}
-        onScroll={handleTimelineScroll}
+        data-testid="timeline-scroll"
+        data-scroll-owner="horizontal-only"
+        className="overflow-x-auto overflow-y-hidden overscroll-x-contain"
+        style={{ scrollPaddingLeft: LABEL_W + 12 }}
+        onWheel={markInteraction}
       >
-        <div
-          ref={laneRef}
-          data-testid="timeline-lane"
-          className={`relative cursor-pointer ${selectionMode ? "cursor-crosshair" : ""}`}
-          style={{ height: laneHeight, minHeight: "100%" }}
-          onPointerDown={onSelectionPointerDown}
-          onPointerMove={onSelectionPointerMove}
-          onPointerUp={onSelectionPointerUp}
-          onClick={onLaneClick}
-        >
-          {/* Waveform in the gutter (canvas, time-aligned with the lane) */}
-          {waveform?.peaks?.length ? (
-            <>
-              <canvas
-                ref={canvasRef}
-                className="absolute top-0 left-0 pointer-events-none"
-                style={{ width: GUTTER_PX, height: laneHeight }}
-                aria-hidden="true"
-              />
-              {/* active line's slice of the waveform, highlighted */}
-              {activeSeg && (
-                <div
-                  className="absolute pointer-events-none bg-brand/20"
-                  style={{
-                    left: LABEL_W,
-                    width: WAVE_W,
-                    top: activeSeg.start * pxPerSec,
-                    height: Math.max(2, (activeSeg.end - activeSeg.start) * pxPerSec),
-                  }}
-                />
-              )}
-            </>
-          ) : null}
-
-          {/* Time gutter ticks (horizontal grid lines + labels) */}
-          {ticks.map((s) => (
-            <div key={s} className="absolute left-0 right-0 pointer-events-none" style={{ top: s * pxPerSec }}>
-              <div className={`${s % 10 === 0 ? "bg-white/10" : "bg-white/[0.04]"}`} style={{ height: 1, marginLeft: GUTTER_PX }} />
-              {s % 10 === 0 && (
-                <span className="absolute left-1 -top-1.5 text-[9px] text-ink-tertiary tabular-nums">{fmt(s)}</span>
-              )}
+        <div className="relative min-w-full" style={{ width: surfaceWidth }}>
+          <div data-testid="timeline-ruler" className="relative h-9 border-b border-white/[0.06] bg-surface-1/90">
+            <div className="sticky left-0 z-40 flex h-full items-center border-r border-white/[0.08] bg-surface-1/95 px-4 text-[9px] font-semibold uppercase tracking-[0.16em] text-ink-tertiary" style={{ width: LABEL_W }}>{t("timeline.lyrics_rail", "Letras")}</div>
+            <div className="absolute inset-y-0 cursor-pointer" style={{ left: LABEL_W, width: trackWidth }} onClick={(event) => seekAt(event.clientX)}>
+              {ticks.map((time) => (
+                <div key={time} className="absolute top-0 bottom-0 border-l border-white/[0.08] pointer-events-none" style={{ left: time * pxPerSec }}>
+                  <span className="absolute top-1 left-1 text-[9px] text-ink-tertiary tabular-nums whitespace-nowrap">{fmt(time)}</span>
+                </div>
+              ))}
             </div>
-          ))}
+          </div>
 
-          {selectionBox && (
-            <div
-              className="absolute left-0 right-0 z-20 rounded-sm bg-brand/15 ring-1 ring-brand/60 pointer-events-none"
-              style={{
-                top: Math.min(selectionBox.originY, selectionBox.currentY) - (laneRef.current?.getBoundingClientRect().top || 0),
-                height: Math.abs(selectionBox.currentY - selectionBox.originY),
-              }}
-              aria-hidden="true"
-            />
-          )}
+          <div className="relative h-12 border-b border-white/[0.06] bg-brand/[0.035]">
+            <div className="sticky left-0 z-40 flex h-full items-center border-r border-white/[0.08] bg-surface-1/95 px-4 text-[10px] text-ink-tertiary" style={{ width: LABEL_W }}>
+              <span className="inline-flex items-center gap-2"><span className="h-1.5 w-1.5 rounded-full bg-brand-light/70" />{t("timeline.waveform", "Forma de onda")}</span>
+            </div>
+            <div className="absolute inset-y-0 cursor-pointer" style={{ left: LABEL_W, width: trackWidth }} onClick={(event) => seekAt(event.clientX)}>
+              {waveform?.peaks?.length ? <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none opacity-80" aria-hidden="true" /> : null}
+            </div>
+          </div>
 
-          {/* Blocks */}
-          {segments.map((seg) => {
-            const pv = preview?.changes
-              ? preview.changes.find((change) => change.id === seg._id) || null
-              : preview && preview.id === seg._id ? preview : null;
-            const start = pv ? pv.start : seg.start;
-            const end = pv ? pv.end : seg.end;
-            const top = start * pxPerSec;
-            const height = Math.max(MIN_BLOCK_PX, (end - start) * pxPerSec);
-            const isActive = seg._id === activeId;
-            const isFocused = seg._id === focusedSegId;
-            const isLocked = !!seg.locked || !!pv;
-            const isHi = highlightedIds?.has?.(seg._id);
-            const isSelected = selectedIds.has(seg._id);
-            // Gantt lane positioning: when there's no overlap (laneCount=1)
-            // the block takes the full width like before; when 2+ segments
-            // overlap the columns split the available space evenly so the
-            // operator sees them side by side instead of stacked invisibly.
-            const laneIdx = laneOfId.get(seg._id) ?? 0;
-            const LANE_GAP_PCT = 1;        // small horizontal breathing space
-            const laneSpan = (100 - LANE_GAP_PCT * (laneCount - 1)) / laneCount;
-            const laneLeftPct = laneIdx * (laneSpan + LANE_GAP_PCT);
-            return (
-              <div
-                key={seg._id}
-                className={[
-                  "absolute rounded-md overflow-hidden text-caption leading-tight ring-1 transition-colors",
-                  isActive ? "bg-brand/25" : "bg-surface-3/25",
-                  isLocked ? "ring-brand/60" : "ring-white/[0.07]",
-                  isFocused ? "outline outline-1 outline-brand-light" : "",
-                  isHi ? "ring-2 ring-accent" : "",
-                  isSelected ? "ring-2 ring-brand-light bg-brand/20" : "",
-                ].join(" ")}
-                style={{
-                  top, height,
-                  // Lane positioning: a CSS var sets the lane area (gutter→right);
-                  // each block's left/width are percentages OF the parent's full
-                  // width, but we add a translate offset and reduce the span by
-                  // the gutter via calc. Result: laneCount=1 → block hugs the
-                  // gutter→right strip like before. laneCount>1 → blocks share
-                  // that strip evenly.
-                  left: `calc(${GUTTER_PX + 4}px + (100% - ${GUTTER_PX + 12}px) * ${laneLeftPct / 100})`,
-                  width: `calc((100% - ${GUTTER_PX + 12}px) * ${laneSpan / 100})`,
-                }}
-                onPointerDown={(e) => onPointerDown(e, seg, "move")}
-                onPointerMove={onPointerMove}
-                onPointerUp={(e) => onPointerUp(e, seg)}
-                title={`${fmt(start)} → ${fmt(end)}`}
-              >
-                {/* top edge handle = start (when the line ENTERS) */}
-                <div
-                  className="absolute left-0 right-0 top-0 cursor-ns-resize bg-brand/30 hover:bg-brand/70 flex items-center justify-center group/ht"
-                  style={{ height: EDGE_PX, touchAction: "none" }}
-                  onPointerDown={(e) => onPointerDown(e, seg, "start")}
-                  onPointerMove={onPointerMove}
-                  onPointerUp={(e) => onPointerUp(e, seg)}
-                  title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea")}
-                >
-                  <div className="w-7 h-[3px] rounded-full bg-white/40 group-hover/ht:bg-white/90 transition-colors" />
-                </div>
-                {/* bottom edge handle = end (when the line LEAVES) */}
-                <div
-                  className="absolute left-0 right-0 bottom-0 cursor-ns-resize bg-brand/30 hover:bg-brand/70 flex items-center justify-center group/hb"
-                  style={{ height: EDGE_PX, touchAction: "none" }}
-                  onPointerDown={(e) => onPointerDown(e, seg, "end")}
-                  onPointerMove={onPointerMove}
-                  onPointerUp={(e) => onPointerUp(e, seg)}
-                  title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea")}
-                >
-                  <div className="w-7 h-[3px] rounded-full bg-white/40 group-hover/hb:bg-white/90 transition-colors" />
-                </div>
-                {/* Text anchored to the TOP (where the line enters), not
-                    floating in the middle of a tall held block. */}
-                <div className="px-3 flex items-start gap-2" style={{ touchAction: "none", paddingTop: EDGE_PX + 4 }}>
-                  <span className="text-[9px] text-ink-tertiary tabular-nums shrink-0 mt-px">{fmt(start)}</span>
-                  {editingTextId === seg._id ? (
-                    <input
-                      type="text"
-                      autoFocus
-                      value={draftText}
-                      onChange={(ev) => setDraftText(ev.target.value)}
-                      onPointerDown={(ev) => ev.stopPropagation()}
-                      onClick={(ev) => ev.stopPropagation()}
-                      onBlur={() => commitTextEdit(seg._id)}
-                      onKeyDown={(ev) => {
-                        if (ev.key === "Enter") { ev.preventDefault(); commitTextEdit(seg._id); }
-                        else if (ev.key === "Escape") { ev.preventDefault(); cancelTextEdit(); }
-                      }}
-                      className="flex-1 min-w-0 bg-surface-1 border border-brand/50 focus:border-brand
-                        outline-none rounded px-1 py-0.5 text-caption text-white"
-                    />
-                  ) : (
-                    <span
-                      className="text-white/90 line-clamp-3 cursor-text break-words"
-                      onPointerDown={(ev) => ev.stopPropagation()}
-                      onDoubleClick={(ev) => { ev.stopPropagation(); beginTextEdit(seg); }}
-                      /* UI F14 (2026-05-26): el title= ahora incluye el texto
-                         completo (no solo el hint de doble-click). Si la
-                         card es angosta y line-clamp corta la línea, el
-                         operador puede leer todo en el hover. line-clamp
-                         subió de 2 a 3 líneas para que las líneas de
-                         canción más largas no se corten tan agresivo. */
-                      title={`${seg.text}\n\n— Doble-click para corregir`}
+          <div className="relative" style={{ width: surfaceWidth, height: trackHeight }}>
+            <div className="sticky left-0 z-40 border-r border-white/[0.08] bg-surface-1/95 shadow-[12px_0_24px_rgba(0,0,0,.18)]" style={{ width: LABEL_W, height: trackHeight }}>
+              {normalizedSegments.map((segment, index) => {
+                const isSelected = selectedIds.has(segment._id);
+                const isActive = activeId === segment._id;
+                return (
+                  <div
+                    key={`label-${segment._id}`}
+                    ref={(node) => {
+                      if (node) activeRowRefs.current.set(segment._id, node);
+                      else activeRowRefs.current.delete(segment._id);
+                    }}
+                    data-testid="timeline-label-row"
+                    data-active={isActive ? "true" : "false"}
+                    data-playing={isActive && isPlaying ? "true" : "false"}
+                    data-selected={isSelected ? "true" : "false"}
+                    aria-current={isActive ? "true" : undefined}
+                    className={`absolute left-0 right-0 flex cursor-crosshair items-center gap-2 border-b px-3 transition-colors ${isActive ? "border-cyan-300/30 bg-cyan-300/[0.11]" : isSelected ? "border-brand/20 bg-brand/15" : "border-white/[0.045] hover:bg-white/[0.035]"}`}
+                    style={{ top: index * ROW_H, height: ROW_H, touchAction: "none" }}
+                    title={t("timeline.paint_rows_hint", "Arrastrá para seleccionar varias líneas")}
+                    onPointerDown={(event) => beginMarquee(event, segment._id)}
+                    onPointerMove={updateMarquee}
+                    onPointerUp={finishMarquee}
+                    onPointerCancel={cancelPointerInteraction}
+                  >
+                    {isActive && <span className="absolute inset-y-1.5 left-0 w-0.5 rounded-full bg-cyan-300 shadow-[0_0_10px_rgba(103,232,249,.8)]" aria-hidden="true" />}
+                    <span className={`grid h-5 w-5 shrink-0 place-items-center rounded-md text-[9px] font-semibold tabular-nums ${isActive ? "bg-cyan-300 text-slate-950" : isSelected ? "bg-brand text-white" : "bg-white/[0.05] text-ink-tertiary"}`}>{isActive ? (isPlaying ? "▶" : "•") : index + 1}</span>
+                    <span className={`min-w-0 flex-1 truncate text-[11px] ${isActive ? "font-medium text-white" : "text-ink-secondary"}`}>{segment.text || "Línea sin texto"}</span>
+                    {isActive && <span className="hidden shrink-0 text-[8px] font-semibold uppercase tracking-[0.12em] text-cyan-200 xl:inline">{isPlaying ? t("timeline.playing", "Sonando") : t("timeline.current", "Actual")}</span>}
+                    <span className="shrink-0 text-[9px] tabular-nums text-ink-tertiary">{fmt(segment.start)}</span>
+                    <button
+                      type="button"
+                      data-testid="timeline-delete-line"
+                      onPointerDown={(event) => event.stopPropagation()}
+                      onClick={(event) => deleteLine(event, segment._id)}
+                      aria-label={`${t("timeline.delete_line", "Eliminar línea")} ${index + 1}`}
+                      title={t("timeline.delete_line_hint", "Eliminar esta línea")}
+                      className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-red-300/70 ring-1 ring-transparent transition-colors hover:bg-red-400/12 hover:text-red-200 hover:ring-red-300/20 focus-visible:bg-red-400/12 focus-visible:text-red-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-200"
                     >
-                      {seg.text}
+                      <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5m4-5v5" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div
+              ref={trackRef}
+              data-testid="timeline-lane"
+              data-px-per-sec={pxPerSec}
+              className="absolute top-0 cursor-crosshair bg-[linear-gradient(90deg,rgba(255,255,255,.018)_1px,transparent_1px)]"
+              style={{ left: LABEL_W, width: trackWidth, height: trackHeight, backgroundSize: `${Math.max(24, tickStep * pxPerSec)}px 100%` }}
+              onPointerDown={(event) => beginMarquee(event)}
+              onPointerMove={updateMarquee}
+              onPointerUp={finishMarquee}
+              onPointerCancel={cancelPointerInteraction}
+              onClick={(event) => {
+                event.stopPropagation();
+                if (!marqueeRef.current && !clickSuppressRef.current) seekAt(event.clientX);
+              }}
+            >
+            {normalizedSegments.map((segment, index) => {
+              const previewItem = preview?.changes
+                ? preview.changes.find((change) => change.id === segment._id) || null
+                : preview?.id === segment._id ? preview : null;
+              const start = previewItem?.start ?? segment.start;
+              const end = previewItem?.end ?? segment.end;
+              const width = Math.max(MIN_BLOCK_PX, (end - start) * pxPerSec);
+              const moveHitWidth = Math.max(width, MOVE_HIT_MIN_PX);
+              const moveHitOverflow = (moveHitWidth - width) / 2;
+              const isSelected = selectedIds.has(segment._id);
+              const isActive = activeId === segment._id;
+              const isFocused = focusedSegId === segment._id;
+              const isRecent = highlightedIds?.has?.(segment._id);
+              return (
+                <div
+                  key={segment._id}
+                  title={`${fmt(start)} → ${fmt(end)}`}
+                  data-testid="timeline-segment"
+                  tabIndex={0}
+                  role="button"
+                  aria-pressed={isSelected}
+                  aria-label={`Línea ${index + 1}: ${segment.text}. ${fmt(start)} a ${fmt(end)}`}
+                  className={`absolute z-10 cursor-grab active:cursor-grabbing rounded-lg ring-1 transition-all select-none ${isSelected ? "bg-brand/30" : isActive ? "bg-cyan-400/25 shadow-[0_0_22px_rgba(34,211,238,.16)]" : "bg-surface-3/95"} ${isSelected ? "ring-2 ring-brand-light shadow-[0_0_0_3px_rgba(139,92,246,.13)]" : isActive ? "ring-cyan-300/60" : "ring-white/[0.18] hover:ring-white/[0.32]"} ${isFocused ? "outline outline-1 outline-white/80" : ""} ${isRecent ? "ring-accent" : ""}`}
+                  style={{ left: start * pxPerSec, top: index * ROW_H + 7, width, height: ROW_H - 14, touchAction: "none", scrollMarginLeft: LABEL_W + 12 }}
+                  onClick={(event) => event.stopPropagation()}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      toggleSelection(segment._id);
+                    }
+                  }}
+                >
+                  <div
+                    data-testid="timeline-segment-body"
+                    className="absolute bottom-0 top-0 left-1/2 z-30 cursor-grab active:cursor-grabbing"
+                    style={{ width: moveHitWidth, transform: "translateX(-50%)", touchAction: "none" }}
+                    title={t("timeline.move_range_hint", "Arrastrá para mover · Shift+click selecciona un rango")}
+                    onPointerDown={(event) => startDrag(event, segment, "move")}
+                    onPointerMove={updateDrag}
+                    onPointerUp={(event) => finishDrag(event, segment)}
+                    onPointerCancel={cancelPointerInteraction}
+                    onDoubleClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      startTextEdit(segment);
+                    }}
+                  />
+                  <div data-testid="timeline-edge-start" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, left: -(moveHitOverflow + EDGE_PX), touchAction: "none" }} title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea")} onPointerDown={(event) => startDrag(event, segment, "start")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
+                    <span className="absolute inset-y-1 right-0 w-1 rounded-full bg-brand-light/70 transition-all group-hover/edge:inset-y-0.5 group-hover/edge:bg-white group-hover/edge:shadow-[0_0_8px_rgba(255,255,255,.7)]" />
+                  </div>
+                  <div data-testid="timeline-edge-end" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, right: -(moveHitOverflow + EDGE_PX), touchAction: "none" }} title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea")} onPointerDown={(event) => startDrag(event, segment, "end")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
+                    <span className="absolute inset-y-1 left-0 w-1 rounded-full bg-brand-light/70 transition-all group-hover/edge:inset-y-0.5 group-hover/edge:bg-white group-hover/edge:shadow-[0_0_8px_rgba(255,255,255,.7)]" />
+                  </div>
+                  <div
+                    className={`absolute inset-0 flex items-center gap-2 px-3 pl-4 pointer-events-none ${editingTextId === segment._id ? "z-40" : "z-10"}`}
+                  >
+                    {width >= 54 && <span className="text-[9px] text-ink-tertiary tabular-nums shrink-0">{fmt(start)}</span>}
+                    {editingTextId === segment._id ? (
+                      <input
+                        autoFocus
+                        type="text"
+                        value={draftText}
+                        onChange={(event) => setDraftText(event.target.value)}
+                        onPointerDown={(event) => event.stopPropagation()}
+                        onClick={(event) => event.stopPropagation()}
+                        onBlur={() => commitTextEdit(segment._id)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") { event.preventDefault(); commitTextEdit(segment._id); }
+                          if (event.key === "Escape") { event.preventDefault(); setEditingTextId(null); }
+                        }}
+                        className="pointer-events-auto min-w-0 flex-1 bg-surface-1 border border-brand/50 rounded px-1 py-0.5 text-xs text-white outline-none"
+                      />
+                    ) : width >= 32 ? (
+                      <span className="min-w-0 truncate text-xs text-white/90 pointer-events-auto cursor-text" onDoubleClick={(event) => { event.stopPropagation(); startTextEdit(segment); }} title={`${segment.text}\n\n— Doble-click para corregir`}>{segment.text}</span>
+                    ) : null}
+                  </div>
+                  {previewItem && (preview?.mode === "start" || preview?.mode === "end") && (
+                    <span className="pointer-events-none absolute -top-7 right-0 z-40 rounded-md bg-black/90 px-2 py-1 text-[9px] font-medium text-white shadow-xl ring-1 ring-white/[0.12] tabular-nums whitespace-nowrap">
+                      {fmt(start)} → {fmt(end)}
                     </span>
                   )}
                 </div>
-              </div>
-            );
-          })}
+              );
+            })}
 
-          {/* Playhead (horizontal).
-              FIX 2026-05-25 (operator feedback): el `transition-[top]
-              duration-100` que tenía antes causaba 2 bugs reportados:
-                1) "no baja al ritmo normal de la canción" — la
-                   transition de 100 ms peleaba contra el rAF que
-                   LyricsEditor usa para empujar currentTime a 60 fps,
-                   dejando el playhead ~100ms detrás del audio.
-                2) "click en un tiempo, la línea sube lentamente" — al
-                   hacer seek (jump de 30s → 10s), la transition
-                   ANIMABA suavemente el viaje en vez de saltar.
-              Solución doble:
-                - Cero transition: salta instant en seeks, sigue
-                  fielmente el rAF en playback.
-                - translateY en vez de top: movimiento composited en
-                  GPU, no dispara reflow en la lista de segmentos. */}
-          <div
-            className="absolute left-0 right-0 top-0 h-0.5 bg-brand pointer-events-none z-10 will-change-transform"
-            style={{ transform: `translateY(${currentTime * pxPerSec}px)` }}
-          >
-            <div className="w-2 h-2 rounded-full bg-brand -mt-[3px] ml-0.5" />
+            {normalizedSegments.map((segment, index) => (
+              <div key={`row-${segment._id}`} className="absolute left-0 right-0 border-b border-white/[0.035] pointer-events-none" style={{ top: index * ROW_H + ROW_H - 1 }} />
+            ))}
+
+            {normalizedSegments.length === 0 && (
+              <div className="absolute inset-0 grid place-items-center text-center pointer-events-none">
+                <div className="rounded-xl bg-surface-2/80 ring-1 ring-white/[0.1] px-4 py-3">
+                  <p className="text-xs text-white">{t("timeline.empty_title", "No hay líneas para ajustar")}</p>
+                  <p className="mt-1 text-[10px] text-ink-tertiary">{t("timeline.empty_hint", "Volvé a Revisar letra o recargá la letra")}</p>
+                </div>
+              </div>
+            )}
+
+            {marquee && (
+              <div className="absolute z-20 rounded-lg bg-brand/15 ring-1 ring-brand/70 pointer-events-none" style={{ left: marquee.anchorId != null ? 0 : Math.min(marquee.originX, marquee.currentX) - (trackRef.current?.getBoundingClientRect().left || 0), top: Math.min(marquee.originY, marquee.currentY) - (trackRef.current?.getBoundingClientRect().top || 0), width: marquee.anchorId != null ? trackWidth : Math.abs(marquee.currentX - marquee.originX), height: Math.abs(marquee.currentY - marquee.originY) }} aria-hidden="true" />
+            )}
+
+            <div data-testid="timeline-playhead" className="absolute top-0 bottom-0 z-30 w-px bg-cyan-200/15 pointer-events-none" style={{ left: currentTime * pxPerSec }}>
+              <span className="absolute -top-1 -left-1.5 w-3 h-3 rounded-full bg-cyan-300 shadow-[0_0_10px_rgba(103,232,249,.8)]" />
+            </div>
+            {activeRowIndex != null && (
+              <div data-testid="timeline-active-playhead" className="absolute z-30 w-0.5 bg-cyan-200 shadow-[0_0_10px_rgba(103,232,249,.75)] pointer-events-none" style={{ left: currentTime * pxPerSec, top: activeRowIndex * ROW_H + 4, height: ROW_H - 8 }} aria-hidden="true" />
+            )}
+            </div>
           </div>
         </div>
       </div>
-      <button
-        type="button"
-        className="absolute right-1.5 top-2 bottom-2 z-20 w-3 rounded-full bg-black/35 ring-1 ring-white/10 overflow-hidden"
-        onClick={jumpFromMinimap}
-        aria-label={t("timeline.minimap", "Mini-mapa de la canción: click para saltar en el tiempo")}
-        title={t("timeline.minimap", "Mini-mapa de la canción")}
-      >
-        {segments.map((seg) => (
-          <span
-            key={seg._id}
-            className={`absolute left-[3px] right-[3px] rounded-full ${seg._id === activeId ? "bg-brand-light" : "bg-white/25"}`}
-            style={{ top: `${(seg.start / total) * 100}%`, height: `${Math.max(0.5, ((seg.end - seg.start) / total) * 100)}%` }}
-          />
-        ))}
-        <span
-          className="absolute left-0 right-0 rounded-full ring-1 ring-brand-light/80 bg-brand/25 pointer-events-none"
-          style={{
-            top: `${Math.min(100, (scrollState.top / Math.max(laneHeight, 1)) * 100)}%`,
-            height: `${Math.min(100, Math.max(3, (scrollState.viewport / Math.max(laneHeight, 1)) * 100))}%`,
-          }}
-        />
-      </button>
-      </div>
 
-      <p className="px-3 py-2 text-[10px] text-ink-tertiary border-t border-white/[0.05] flex flex-wrap items-center gap-x-3 gap-y-1">
-        <span><span className="text-ink-secondary">{t("timeline.selection", "selección")}</span> {t("timeline.selection_help", "Shift/Cmd-click o activá Seleccionar y pintá varias líneas")}</span>
-        <span><span className="text-ink-secondary">↕ {t("timeline.edges", "bordes")}</span> {t("timeline.edges_help", "ajustan entrada/salida")}</span>
-        <span><span className="text-ink-secondary">{t("timeline.body", "cuerpo")}</span> {t("timeline.body_help", "mueve la línea")}</span>
-        <span><span className="text-ink-secondary">click</span> {t("timeline.click_help", "salta a ese punto")}</span>
-        <span><span className="text-ink-secondary">{t("timeline.double_click", "doble-click")}</span> {t("timeline.double_click_help", "corrige el texto")}</span>
-        <span className="text-ink-tertiary/70">{t("timeline.fixed_help", "lo que ajustás queda fijo")}</span>
-      </p>
+      <div className="flex items-center gap-x-5 gap-y-1.5 px-4 sm:px-5 py-2.5 border-t border-white/[0.06] text-[10px] text-ink-tertiary flex-wrap">
+        <span><strong className="text-ink-secondary">{t("timeline.click_label", "Click")}</strong> {t("timeline.click_help", "reproduce desde ese punto")}</span>
+        <span><strong className="text-ink-secondary">{t("timeline.drag_label", "Arrastrar fondo")}</strong> {t("timeline.drag_help", "selecciona líneas")}</span>
+        <span><strong className="text-ink-secondary">{t("timeline.modifier_label", "Cmd/Ctrl-click")}</strong> {t("timeline.modifier_help", "agrega o quita una línea")}</span>
+      </div>
     </div>
   );
 }

@@ -38,7 +38,7 @@ step is exactly what we're working around here.
 
 CONTRACT
 --------
-`whisper_word_align(audio_path, cleaned_lines, language='es') -> list[Segment] | None`
+`whisper_word_align(audio_path, cleaned_lines, language=None) -> list[Segment] | None`
 
 Pure-ish (does I/O for the API call). Returns segments
 `[{"start", "end", "text"}]` covering every line of `cleaned_lines`,
@@ -383,7 +383,7 @@ def whisper_word_align(
     audio_path: str,
     cleaned_lines: list[str],
     *,
-    language: str = "es",
+    language: str | None = None,
     job_id: str | None = None,
 ) -> Optional[list[dict]]:
     """Align cleaned canonical lines against the audio using Whisper-1
@@ -445,15 +445,17 @@ def whisper_word_align(
             import time as _t
             t0 = _t.time()
             with open(api_path, "rb") as f:
-                response = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f,
-                    prompt=prompt,
-                    response_format="verbose_json",
-                    timestamp_granularities=["word"],
-                    language=language,
-                    temperature=0.0,
-                )
+                kwargs = {
+                    "model": "whisper-1",
+                    "file": f,
+                    "prompt": prompt,
+                    "response_format": "verbose_json",
+                    "timestamp_granularities": ["word"],
+                    "temperature": 0.0,
+                }
+                if language:
+                    kwargs["language"] = language
+                response = client.audio.transcriptions.create(**kwargs)
             elapsed = _t.time() - t0
         except Exception as e:
             logger.warning("[WHISPER-ALIGN] Whisper API failed: %s", str(e)[:200])

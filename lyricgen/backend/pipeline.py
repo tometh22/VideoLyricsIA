@@ -83,6 +83,7 @@ from background_policy import (
 )
 from render_spec import FPS_RATIONAL, RenderSpec
 from subprocess_utils import run_checked, SubprocessExecutionError  # noqa: F401 — exported for upstream catches
+from transcription_language import resolve_transcription_language
 
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets")
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
@@ -6008,7 +6009,8 @@ def _validate_background_asset_for_job(
 
 def _validate_segments_against_audio(audio_path: str, segments: list[dict],
                                       job_id: str | None = None,
-                                      n_samples: int = 3) -> list[dict]:
+                                      n_samples: int = 3,
+                                      language: str | None = None) -> list[dict]:
     """Sample N short audio clips, transcribe each with Whisper, and
     flag any segment whose text disagrees with what Whisper hears in
     the same window. Returns segments with `seg["flagged"] = True`
@@ -6043,6 +6045,10 @@ def _validate_segments_against_audio(audio_path: str, segments: list[dict],
     if not candidates:
         return segments
     n = min(n_samples, len(candidates))
+    validation_language = resolve_transcription_language(
+        language,
+        result={"segments": segments},
+    )
     # Spread the picks across the song so we don't sample 3 lines from
     # the same chorus repetition.
     step = max(1, len(candidates) // n)
@@ -6067,7 +6073,11 @@ def _validate_segments_against_audio(audio_path: str, segments: list[dict],
                 )
                 # Re-transcribe just this slice
                 from pipeline import transcribe as _transcribe  # self-import for testing
-                heard_segs = _transcribe(clip_path, language="es", lyrics_hint=None)
+                heard_segs = _transcribe(
+                    clip_path,
+                    language=validation_language,
+                    lyrics_hint=None,
+                )
                 heard_text = " ".join((s.get("text") or "").strip() for s in (heard_segs or [])).lower()
                 expected = (seg.get("text") or "").lower().strip()
                 if not heard_text or not expected:
@@ -16207,6 +16217,20 @@ def run_edit_pipeline(
         prior_s3_keys = dict(job_row.s3_keys) if job_row.s3_keys else None
         version_n = int(job_row.edit_count or 0)
         prior_versions = list(job_row.previous_versions or [])
+        # A job carries ProRes deliverables whenever it has a umg_spec (the
+        # config ensure_prores_exists needs) or already materialised a .mov
+        # key — INDEPENDENT of delivery_profile. Those derivatives are lazy-
+        # transcoded from lyric_video.mp4, so any edit leaves them stale. The
+        # portal serves the ProRes straight from its deterministic R2 key with
+        # NO lazy re-transcode, so unless we refresh here it keeps serving the
+        # pre-edit cut. Gating the invalidation below on wants_umg was the bug:
+        # a delivery_profile="youtube" job with umg_spec kept a stale ProRes
+        # master across three lyric edits while the MP4 updated, so UMG QC'd the
+        # old cut on the portal (Rata Blanca / Los Pericos, 2026-08-03).
+        has_prores_deliverable = bool(umg_spec) or bool(
+            prior_s3_keys
+            and (prior_s3_keys.get("umg_master") or prior_s3_keys.get("umg_short"))
+        )
         # Multi-escena: para edit_type=="scene" reconstruimos el timeline desde
         # el storyboard persistido (regenerando sólo la escena pedida).
         scene_plan = dict(job_row.scene_plan) if job_row.scene_plan else None
@@ -17092,7 +17116,12 @@ def run_edit_pipeline(
         # already archived the prior .mov keys as {key}.vN, so the rollback
         # path is preserved. Then re-enqueue prewarm (mirrors run_pipeline)
         # so UMG gets an instant 302 instead of a cold 60-120 s transcode.
-        if wants_umg:
+        #
+        # Gate on has_prores_deliverable, NOT wants_umg: the portal serves the
+        # ProRes from its deterministic R2 key with no lazy re-transcode, so a
+        # umg_spec job on delivery_profile="youtube" would otherwise keep the
+        # stale cut forever (2026-08-03 incident).
+        if wants_umg or has_prores_deliverable:
             for _ft in ("umg_master", "umg_short"):
                 _stale = os.path.join(job_dir, _DELIVERABLE_FILENAMES[_ft])
                 if os.path.exists(_stale):
@@ -17116,8 +17145,14 @@ def run_edit_pipeline(
                 # publishing). Then re-enqueue fresh.
                 for _ft in ("umg_master", "umg_short"):
                     cancel_rq_job(f"prewarm:{job_id}:{_ft}")
-                enqueue_prores_prewarm(job_id, "umg_master")
-                enqueue_prores_prewarm(job_id, "umg_short")
+                # force=True: the portal has NO lazy re-transcode fallback (it
+                # signs the deterministic R2 key directly), so this rewarm is
+                # the only thing that refreshes the delivered ProRes after an
+                # edit. Without force, queue-depth backpressure silently skips
+                # it during a UMG batch and the portal serves the stale cut
+                # (observed 2026-08-03). One transcode per edit is affordable.
+                enqueue_prores_prewarm(job_id, "umg_master", force=True)
+                enqueue_prores_prewarm(job_id, "umg_short", force=True)
             except Exception as _e:
                 logger.warning("[EDIT] prores prewarm re-enqueue skipped: %s", _e)
 

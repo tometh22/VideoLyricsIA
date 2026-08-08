@@ -18,7 +18,12 @@ import { useJobSegments, segmentsStore } from "../state/segmentsStore";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
 import { splitWordsAtCharOffset, firstWordStart, lastWordEnd } from "../lib/splitWords";
 import useLocalStorage from "../hooks/useLocalStorage";
+import { useEditorDocument } from "../hooks/useEditorDocument";
+import { useEditorAutosave } from "../hooks/useEditorAutosave";
 import { createSaveQueue } from "../lib/saveQueue";
+import ConflictDialog from "./ConflictDialog";
+import VersionHistory from "./VersionHistory";
+import WrapWarningDialog from "./WrapWarningDialog";
 
 // Copy honesto del fallo de respaldo (autosave), por CAUSA real. El banner
 // + el confirm de "Aprobar" antes decían "problema de red" para cualquier
@@ -51,6 +56,17 @@ const _SAVE_ERROR_COPY = {
       "Puede haber expirado por inactividad. Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla, pero al generar el servidor podría rechazarlo. Si falla, volvé a subir la canción.",
     confirm:
       "Este trabajo ya no está en el servidor (pudo expirar por inactividad). Tus cambios siguen en pantalla, pero al generar podría fallar. ¿Intentar aprobar igual?",
+  },
+  "draft-corrupt": {
+    short: "Encontramos un borrador local que necesita revisión",
+    detail:
+      "No lo enviamos ni sobrescribimos la versión del equipo. El borrador permanece en este navegador para recuperación manual.",
+    confirm: "Revisá el borrador local antes de aprobar.",
+  },
+  offline: {
+    short: "Estás sin conexión",
+    detail: "Tus cambios siguen guardados localmente. Al volver la conexión compararemos primero la versión del equipo.",
+    confirm: "Esperá a recuperar la conexión antes de aprobar.",
   },
   server: {
     short: "No pudimos respaldar tu última edición en el servidor",
@@ -170,15 +186,48 @@ function parseTimestamp(str) {
   if (trimmed.includes(":")) {
     const parts = trimmed.split(":");
     if (parts.length !== 2) return null;
-    const m = parseInt(parts[0], 10);
-    const s = parseFloat(parts[1]);
-    if (Number.isNaN(m) || Number.isNaN(s)) return null;
+    if (!/^\d+$/.test(parts[0]) || !/^\d+(?:\.\d+)?$/.test(parts[1])) return null;
+    const m = Number(parts[0]);
+    const s = Number(parts[1]);
+    if (!Number.isFinite(m) || !Number.isFinite(s)) return null;
     if (m < 0 || s < 0 || s >= 60) return null;
     return m * 60 + s;
   }
-  const v = parseFloat(trimmed);
-  if (Number.isNaN(v) || v < 0) return null;
+  if (!/^\d+(?:\.\d+)?$/.test(trimmed)) return null;
+  const v = Number(trimmed);
+  if (!Number.isFinite(v) || v < 0) return null;
   return v;
+}
+
+// Timestamps can come from the API as numbers, numeric strings, null, or
+// malformed values. Keep one strict boundary sanitizer for every path that
+// reads, sorts, restores, or persists timings. In particular, never use
+// parseFloat here: Number("12abc") must be rejected rather than truncated.
+function sanitizeSegmentTiming(segment, fallbackStart = 0) {
+  const rawStart = segment?.start ?? segment?.startTime ?? segment?.start_time;
+  const rawEnd = segment?.end ?? segment?.endTime ?? segment?.end_time;
+  const parsedStart = parseTimestamp(rawStart);
+  const start = parsedStart == null ? fallbackStart : parsedStart;
+  const parsedEnd = parseTimestamp(rawEnd);
+  const end = parsedEnd == null ? start + 1 : Math.max(start, parsedEnd);
+  return { ...segment, start, end };
+}
+
+function sanitizeSegments(segments) {
+  if (!Array.isArray(segments)) return [];
+  let fallbackStart = 0;
+  return segments.map((segment) => {
+    const sanitized = sanitizeSegmentTiming(segment, fallbackStart);
+    fallbackStart = sanitized.start;
+    return sanitized;
+  });
+}
+
+function sanitizeSegmentsForPersistence(segments) {
+  // Editor 2.0 persists the whole segment contract. Backend validation only
+  // normalizes start/end/text and deliberately preserves present/future
+  // render metadata (_id, words, review, pos, scale, rot, etc.).
+  return sanitizeSegments(segments).map((segment) => ({ ...segment }));
 }
 
 function findSuggestion(whisperText, refLines, startIdx) {
@@ -384,6 +433,7 @@ export default function LyricsEditor({
   // transcribeJobId sigan keyando el store correctamente.
   storeKey = null,
   onPersistSegments = null,
+  editorRequest = null,
   saveQueue = null,
   // Descarta caches/draft locales y vuelve a hidratar la versión canónica
   // después de un 409. El padre conoce el ciclo de vida del wizard.
@@ -486,18 +536,30 @@ export default function LyricsEditor({
   const _storeKey = storeKey ?? transcribeJobId ?? null;
   const [edited, setEdited] = useJobSegments(
     _storeKey,
-    () => reseedPreservingIds([], segments),
+    () => reseedPreservingIds([], sanitizeSegments(segments)),
   );
+  const sanitizedEdited = useMemo(() => sanitizeSegments(edited), [edited]);
   const [isDirty, setIsDirty] = useState(false);
-  // List vs visual timeline. Default "list" so the existing operator flow is
-  // untouched; the timeline is opt-in via the toolbar toggle.
-  const [viewMode, setViewMode] = useState("list"); // "list" | "timeline"
+  // Two views over the same editor state. The basic review flow is the
+  // default; timing tools only appear after the operator explicitly opens
+  // the advanced view.
+  const editorPreferenceKey = `genly_editor_view:${user?.id || user?.username || "anonymous"}`;
+  const [persistedViewMode, setPersistedViewMode] = useLocalStorage(editorPreferenceKey, "basic");
+  const [anonymousViewMode, setAnonymousViewMode] = useState("basic");
+  const hasEditorPreferenceOwner = Boolean(user?.id || user?.username);
+  const viewMode = hasEditorPreferenceOwner ? persistedViewMode : anonymousViewMode;
+  const setViewMode = useCallback((next) => {
+    if (hasEditorPreferenceOwner) setPersistedViewMode(next);
+    else setAnonymousViewMode(next);
+  }, [hasEditorPreferenceOwner, setPersistedViewMode]); // "basic" | "advanced"
+  const [previewDockOpen, setPreviewDockOpen] = useState(false);
   // 2026-05-25 Studio Console — Modo enfoque. Toggle persistente que
   // agranda max-h de la lista + MAX_VH del timeline. Operador con 30-50
   // segments por video estaba scrolleando constante. localStorage usa
   // string "1"/"0" (el hook es string-only).
   const [focusModeRaw, setFocusModeRaw] = useLocalStorage("genly_editor_focus", "0");
   const focusMode = focusModeRaw === "1";
+  const workspaceFocusMode = focusMode || (viewMode === "advanced" && hideTypographyControls);
   const toggleFocusMode = useCallback(
     () => setFocusModeRaw((v) => (v === "1" ? "0" : "1")),
     [setFocusModeRaw],
@@ -513,9 +575,9 @@ export default function LyricsEditor({
   // se limpia solo en unmount cuando el operador navega a otro paso.
   useEffect(() => {
     if (typeof document === "undefined") return undefined;
-    document.body.classList.toggle("editor-focus-mode", focusMode);
+    document.body.classList.toggle("editor-focus-mode", workspaceFocusMode);
     return () => document.body.classList.remove("editor-focus-mode");
-  }, [focusMode]);
+  }, [workspaceFocusMode]);
   // El auto-fix dejó de ser un card/pill propio (2026-07 rediseño): ahora
   // es el chip ghost "Aplicar corrección · N" con popover en la fila de
   // chips, así que ya no hace falta un estado de expand/collapse propio.
@@ -554,7 +616,7 @@ export default function LyricsEditor({
   // text-edit posterior haya fallado → al apretar Aprobar perdía
   // changes. Ahora ambos autosaves actualizan saveStatus, y "error"
   // se muestra como chip rojo con botón Reintentar.
-  const [saveStatus, setSaveStatus] = useState("idle"); // idle|saving|saved|error
+  const [saveStatus, setSaveStatus] = useState("idle"); // idle|local|saving|saved|offline|conflict|error
   // Motivo del último fallo de respaldo, para que el banner + el confirm de
   // "Aprobar" digan la CAUSA REAL en vez de "problema de red" siempre (el
   // copy honesto de PR A quedó hardcodeado a "red"; la causa real puede ser
@@ -562,6 +624,9 @@ export default function LyricsEditor({
   // no hay error. Se deriva de result.reason/status de persistSegments.
   const [saveErrorReason, setSaveErrorReason] = useState(null);
   const [flushCounter, setFlushCounter] = useState(0);
+  const [durableHydrated, setDurableHydrated] = useState(false);
+  const [conflictDialogOpen, setConflictDialogOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const editedRef = useRef(edited);
   editedRef.current = edited;
   const persistRef = useRef(onPersistSegments);
@@ -573,10 +638,53 @@ export default function LyricsEditor({
       { categorize: _saveErrorCategory },
     );
   }
+  const editorV2Enabled = Boolean(
+    user?.features?.editor_v2 && transcribeJobId && editorRequest && !disableAutosave,
+  );
+  const durableEditor = useEditorDocument({
+    jobId: transcribeJobId,
+    enabled: editorV2Enabled,
+    request: editorRequest,
+  });
   const draftOwner = user?.id || user?.username || null;
+  const draftTenant = user?.tenant_id || user?.billing_account_id || "workspace";
   const draftKey = transcribeJobId && draftOwner
-    ? `genly_segments_draft:${draftOwner}:${transcribeJobId}`
+    ? `${editorV2Enabled ? "genly_editor_draft" : "genly_segments_draft"}:${draftTenant}:${draftOwner}:${transcribeJobId}`
     : null;
+  const editorSessionIdRef = useRef(null);
+  if (!editorSessionIdRef.current) {
+    editorSessionIdRef.current = globalThis.crypto?.randomUUID?.()
+      || `editor-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+  const trackEditorEvent = useCallback((name, properties = {}) => {
+    if (!editorRequest || !transcribeJobId) return;
+    editorRequest("/analytics/events", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ events: [{
+        name,
+        job_id: transcribeJobId,
+        properties: { ...properties, session_id: editorSessionIdRef.current },
+      }] }),
+    }).catch(() => {});
+  }, [editorRequest, transcribeJobId]);
+  const openedEventJobRef = useRef(null);
+  useEffect(() => {
+    if (!transcribeJobId || openedEventJobRef.current === transcribeJobId) return;
+    if (editorV2Enabled && !durableHydrated) return;
+    openedEventJobRef.current = transcribeJobId;
+    trackEditorEvent("editor_opened", {
+      line_count: editedRef.current.length,
+      view: viewMode,
+      source: editorV2Enabled ? "editor_v2" : "legacy",
+    });
+  }, [durableHydrated, editorV2Enabled, trackEditorEvent, transcribeJobId, viewMode]);
+  const previousViewRef = useRef(viewMode);
+  useEffect(() => {
+    if (previousViewRef.current === viewMode) return;
+    trackEditorEvent("editor_view_changed", { from: previousViewRef.current, to: viewMode });
+    previousViewRef.current = viewMode;
+  }, [trackEditorEvent, viewMode]);
   // Snapshot of the timings as first handed to us — the baseline for the
   // timeline's "Resetear timings". PR E + F2 fix: se lee del `original` del
   // store (getOriginal), que es la baseline del PRIMER seed y NUNCA se pisa
@@ -612,6 +720,110 @@ export default function LyricsEditor({
     return () => window.removeEventListener("beforeunload", handler);
   }, [isDirty, disableBeforeUnload]);
 
+  const handleDurableStatus = useCallback((status, reason, metadata = {}) => {
+    setSaveStatus(status);
+    setSaveErrorReason(reason);
+    if (status === "saved") {
+      trackEditorEvent("editor_autosave_success", {
+        duration_ms: Math.round(metadata.durationMs || 0),
+        checkpoint: metadata.checkpoint || "draft",
+      });
+    } else if (["offline", "error"].includes(status)) {
+      trackEditorEvent("editor_autosave_failed", {
+        checkpoint: metadata.checkpoint || "draft",
+        reason: reason || status,
+      });
+    }
+    if (status === "saved" && draftKey) {
+      try { localStorage.removeItem(draftKey); } catch { /* storage blocked */ }
+    }
+  }, [draftKey, trackEditorEvent]);
+
+  const durableSegments = useMemo(
+    () => sanitizeSegmentsForPersistence(edited),
+    [edited],
+  );
+  const { flush: flushDurableSave } = useEditorAutosave({
+    enabled: editorV2Enabled && durableHydrated && !durableEditor.loading,
+    segments: durableSegments,
+    dirty: isDirty,
+    blocked: Boolean(durableEditor.conflict),
+    save: durableEditor.save,
+    reconcile: durableEditor.reconcile,
+    onStatus: handleDurableStatus,
+  });
+
+  // Never let an operator type against the legacy seed while the durable
+  // revision is still unknown.  Besides preventing a false base-revision=0
+  // conflict, this replaces the previously silent disabled approval CTA
+  // with an explicit loading/retry state.
+  const editorInitializationBlocked = editorV2Enabled && !durableHydrated;
+
+  // Hydrate only after comparing the local draft against the durable server
+  // revision. A stale/malformed draft is never silently submitted.
+  const durableHydratedJobRef = useRef(null);
+  useEffect(() => {
+    if (!editorV2Enabled || durableEditor.loading || !durableEditor.document) return;
+    if (durableHydratedJobRef.current === transcribeJobId) return;
+    durableHydratedJobRef.current = transcribeJobId;
+    const remote = sanitizeSegments(durableEditor.document.segments || []);
+    const remoteOriginal = sanitizeSegments(durableEditor.document.original_segments || remote);
+    originalSegmentsRef.current = remoteOriginal;
+    let next = remote;
+    let markDirty = false;
+    if (draftKey) {
+      try {
+        const raw = localStorage.getItem(draftKey);
+        if (raw) {
+          const draft = JSON.parse(raw);
+          if (!Array.isArray(draft?.segments) || !draft.segments.length) {
+            setSaveStatus("error");
+            setSaveErrorReason("draft-corrupt");
+          } else {
+            const local = sanitizeSegments(draft.segments);
+            const sameContent = JSON.stringify(sanitizeSegmentsForPersistence(local))
+              === JSON.stringify(sanitizeSegmentsForPersistence(remote));
+            if (sameContent) {
+              localStorage.removeItem(draftKey);
+            } else if (Number.isInteger(draft.base_revision)
+              && draft.base_revision === durableEditor.document.revision) {
+              next = local;
+              markDirty = true;
+              setSaveStatus("local");
+            } else {
+              next = local;
+              markDirty = true;
+              durableEditor.stageConflict(local, {
+                reason: Number.isInteger(draft.base_revision) ? "stale-draft" : "unversioned-draft",
+              });
+              setSaveStatus("conflict");
+              setSaveErrorReason("conflict");
+              setConflictDialogOpen(true);
+            }
+          }
+        }
+      } catch {
+        setSaveStatus("error");
+        setSaveErrorReason("draft-corrupt");
+      }
+    }
+    setEdited(reseedPreservingIds(editedRef.current, next));
+    setIsDirty(markDirty);
+    setDurableHydrated(true);
+  }, [draftKey, durableEditor.document, durableEditor.loading, durableEditor.stageConflict,
+    editorV2Enabled, setEdited, transcribeJobId]);
+
+  useEffect(() => {
+    if (!durableEditor.conflict) return;
+    setSaveStatus("conflict");
+    setSaveErrorReason("conflict");
+    setConflictDialogOpen(true);
+    trackEditorEvent("editor_conflict", {
+      server_revision: durableEditor.conflict.serverRevision,
+      local_revision: durableEditor.revisionRef.current,
+    });
+  }, [durableEditor.conflict, durableEditor.revisionRef, trackEditorEvent]);
+
   // Debounced autosave to backend: every 3s after the last edit, persist
   // the current segments to /jobs/{id}/save-segments. This bumps the
   // reaper's last_user_activity_at anchor so long edit sessions don't get
@@ -631,21 +843,21 @@ export default function LyricsEditor({
   // `_pendingFlushRef` guarda el estado más fresco aún-no-persistido; el
   // effect de unmount (deps vacías, abajo) lo dispara fire-and-forget.
   useEffect(() => {
-    if (disableAutosave) return undefined;
+    if (disableAutosave || editorV2Enabled) return undefined;
     if (!onPersistSegments || !transcribeJobId) return undefined;
     if (!Array.isArray(edited) || edited.length === 0) return undefined;
     const queue = saveQueueRef.current;
     queue.prime(transcribeJobId, Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
     queue.schedule(transcribeJobId, () =>
-      editedRef.current.map(({ _id, review, ...rest }) => rest));
+      sanitizeSegmentsForPersistence(editedRef.current));
     return undefined;
-  }, [edited, transcribeJobId, onPersistSegments, disableAutosave, segmentsRevision]);
+  }, [edited, transcribeJobId, onPersistSegments, disableAutosave, segmentsRevision, editorV2Enabled]);
 
   // The queue is the single status source for debounce, drag, retry and
   // navigation flushes.  A trailing snapshot is coalesced while a request is
   // in flight, and the returned Promise resolves only when the job drains.
   useEffect(() => {
-    if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
+    if (disableAutosave || editorV2Enabled || !onPersistSegments || !transcribeJobId) return undefined;
     const queue = saveQueueRef.current;
     queue.prime(transcribeJobId, Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
     const unsubscribe = queue.subscribe(transcribeJobId, ({ status, reason }) => {
@@ -656,7 +868,7 @@ export default function LyricsEditor({
       }
     });
     return unsubscribe;
-  }, [disableAutosave, onPersistSegments, transcribeJobId, segmentsRevision, draftKey]);
+  }, [disableAutosave, editorV2Enabled, onPersistSegments, transcribeJobId, segmentsRevision, draftKey]);
 
   // Keep a per-user, per-job recoverable local draft.  This is independent
   // from fetch keepalive: browsers cap keepalive request bodies and may kill
@@ -665,41 +877,43 @@ export default function LyricsEditor({
   const dirtyRef = useRef(isDirty);
   dirtyRef.current = isDirty;
   useEffect(() => {
-    if (!draftKey || draftRestoredRef.current) return;
+    if (editorV2Enabled || !draftKey || draftRestoredRef.current) return;
     draftRestoredRef.current = true;
     try {
       const saved = JSON.parse(localStorage.getItem(draftKey) || "null");
       if (Array.isArray(saved?.segments) && saved.segments.length) {
-        setEdited(reseedPreservingIds(editedRef.current, saved.segments));
+        setEdited(reseedPreservingIds(editedRef.current, sanitizeSegments(saved.segments)));
         setIsDirty(true);
       }
     } catch { /* corrupt or unavailable storage */ }
-  }, [draftKey, setEdited]);
+  }, [draftKey, editorV2Enabled, setEdited]);
 
   useEffect(() => {
     if (!draftKey || !isDirty) return;
     try {
-      const cleaned = edited.map(({ _id, review, ...rest }) => rest);
+      const cleaned = sanitizeSegmentsForPersistence(edited);
       localStorage.setItem(draftKey, JSON.stringify({
         segments: cleaned,
-        base_revision: saveQueueRef.current._peek(transcribeJobId)?.revision || 0,
+        base_revision: editorV2Enabled
+          ? durableEditor.revisionRef.current
+          : (saveQueueRef.current._peek(transcribeJobId)?.revision || 0),
         updated_at: new Date().toISOString(),
       }));
     } catch { /* quota/storage blocked; network autosave still runs */ }
-  }, [draftKey, edited, isDirty, transcribeJobId]);
+  }, [draftKey, edited, editorV2Enabled, isDirty, transcribeJobId, durableEditor.revisionRef]);
 
   // SPA navigation unmounts React before pagehide. Flush only when a
   // debounce/trailing snapshot is actually pending; a completed save must not
   // be duplicated merely because isDirty remains true until approval.
   useEffect(() => () => {
-    if (disableAutosave || !onPersistSegments || !transcribeJobId) return;
+    if (disableAutosave || editorV2Enabled || !onPersistSegments || !transcribeJobId) return;
     const queue = saveQueueRef.current;
     const state = queue._peek(transcribeJobId);
     if (!dirtyRef.current || (!state?.debounceTimer && !state?.pending)) return;
     queue.flush(transcribeJobId, {
-      provider: () => editedRef.current.map(({ _id, review, ...rest }) => rest),
+      provider: () => sanitizeSegmentsForPersistence(editedRef.current),
     });
-  }, [disableAutosave, onPersistSegments, transcribeJobId]);
+  }, [disableAutosave, editorV2Enabled, onPersistSegments, transcribeJobId]);
 
   // Durable flush on page unload (refresh / tab close). The beforeunload
   // handler above only WARNS via a native dialog — it does not persist. And
@@ -713,10 +927,10 @@ export default function LyricsEditor({
   // (Reporte Gaby 2026-06-24: el editor titiló, refrescó para salir y perdió
   // TODO el trabajo no persistido.)
   useEffect(() => {
-    if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
+    if (disableAutosave || editorV2Enabled || !onPersistSegments || !transcribeJobId) return undefined;
     const flushOnUnload = () => {
       try {
-        const cleaned = editedRef.current.map(({ _id, review, ...rest }) => rest);
+        const cleaned = sanitizeSegmentsForPersistence(editedRef.current);
         // useEffect puede no alcanzar a correr entre el último keystroke y
         // pagehide. Persistimos sincrónicamente acá antes de cualquier red;
         // si hay un CAS en vuelo, esta es la recuperación canónica al volver.
@@ -746,7 +960,7 @@ export default function LyricsEditor({
       window.removeEventListener("pagehide", flushOnUnload);
       window.removeEventListener("beforeunload", flushOnUnload);
     };
-  }, [disableAutosave, onPersistSegments, transcribeJobId]);
+  }, [disableAutosave, editorV2Enabled, onPersistSegments, transcribeJobId, draftKey]);
 
   // Flush-save on a timeline drag (no 3 s wait) + drive the "Guardado ✓"
   // chip. Runs only when flushCounter bumps. By the time this effect fires,
@@ -754,25 +968,30 @@ export default function LyricsEditor({
   // post-drag value. Idempotent vs the debounced autosave above.
   useEffect(() => {
     if (flushCounter === 0) return undefined;
+    if (editorV2Enabled) {
+      flushDurableSave("manual");
+      return undefined;
+    }
     if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
     saveQueueRef.current.flush(transcribeJobId, {
-      provider: () => editedRef.current.map(({ _id, review, ...rest }) => rest),
+      provider: () => sanitizeSegmentsForPersistence(editedRef.current),
     });
     return undefined;
     // Only react to the flush trigger — `edited` is intentionally read fresh
     // but NOT a dep (we don't want every keystroke to flush).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [flushCounter]);
+  }, [flushCounter, editorV2Enabled, flushDurableSave]);
 
   const flushPendingSave = useCallback((persistOpts = null, force = false) => {
+    if (editorV2Enabled) return flushDurableSave("manual");
     if ((!force && disableAutosave) || !onPersistSegments || !transcribeJobId) {
       return Promise.resolve({ ok: true, skipped: true });
     }
     return saveQueueRef.current.flush(transcribeJobId, {
-      provider: () => editedRef.current.map(({ _id, review, ...rest }) => rest),
+      provider: () => sanitizeSegmentsForPersistence(editedRef.current),
       persistOpts,
     });
-  }, [disableAutosave, onPersistSegments, transcribeJobId]);
+  }, [disableAutosave, editorV2Enabled, flushDurableSave, onPersistSegments, transcribeJobId]);
 
   // PR E (2026-07): acá vivía el espejo sincrónico por keystroke
   // (onEditedChange → App.setCurrentReview). Eliminado — era la mitad del
@@ -835,6 +1054,11 @@ export default function LyricsEditor({
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [audioError, setAudioError] = useState(false);
+
+  useEffect(() => {
+    setAudioError(false);
+  }, [audioUrl]);
 
   // INCIDENT (mobile 2026-05-24): the audio element's `onTimeUpdate`
   // event fires every ~250 ms on most browsers (sometimes slower on
@@ -864,7 +1088,7 @@ export default function LyricsEditor({
         // WizardLivePreview central pueda hacer word-jump real.
         if (onPlaybackTick) {
           let active = null;
-          for (const s of edited) {
+          for (const s of sanitizedEdited) {
             if (ct >= s.start && ct < s.end) { active = s; break; }
             if (ct >= s.start) active = s;
           }
@@ -883,7 +1107,7 @@ export default function LyricsEditor({
       rafRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPlaying, edited, onPlaybackTick]);
+  }, [isPlaying, sanitizedEdited, onPlaybackTick]);
   const [wrapWarning, setWrapWarning] = useState(null); // {ids: [...]} for 3+ line segs
   const [focusedSegId, setFocusedSegId] = useState(null); // for preview panel
 
@@ -975,9 +1199,10 @@ export default function LyricsEditor({
       if (!prev.length) return prev;
       const snapshot = prev[prev.length - 1];
       setEdited(snapshot);
+      trackEditorEvent("editor_undo", { operation: "edit", count: 1 });
       return prev.slice(0, -1);
     });
-  }, []);
+  }, [trackEditorEvent]);
 
   // ─── Visual timeline (Timings view) handlers ────────────────────────
   // A drag commits here. We stamp `locked: true` so the render
@@ -1003,10 +1228,13 @@ export default function LyricsEditor({
     // the operator sees "Guardado" right after dropping a block — the
     // flush effect below reads the just-updated `edited` and persists.
     setFlushCounter((c) => c + 1);
-  }, []);
+    trackEditorEvent("editor_timing_changed", { count: 1, operation: "resize_or_move" });
+  }, [trackEditorEvent]);
 
-  const handleTimelineTimingChangeBatch = useCallback((changes) => {
+  const handleTimelineTimingChangeBatch = useCallback((changes, interaction = {}) => {
     if (!changes?.length) return;
+    const firstOriginal = editedRef.current.find((segment) => segment._id === changes[0].id);
+    const deltaMs = firstOriginal ? Math.round((changes[0].start - firstOriginal.start) * 1000) : 0;
     setIsDirty(true);
     const byId = new Map(changes.map(({ id, start, end }) => [id, { start, end }]));
     setEdited((prev) => prev.map((s) => {
@@ -1026,7 +1254,12 @@ export default function LyricsEditor({
       return next;
     }), 10000);
     setFlushCounter((c) => c + 1);
-  }, []);
+    trackEditorEvent("editor_group_moved", {
+      count: changes.length,
+      delta_ms: deltaMs,
+      duration_ms: Math.round(interaction.durationMs || 0),
+    });
+  }, [trackEditorEvent]);
 
   // Per-line layout (position / size / rotation) committed from the live
   // preview. Same flush-on-commit as the timeline so "Guardado" shows fast.
@@ -1044,7 +1277,7 @@ export default function LyricsEditor({
   // flags, so the render goes back to auto hold-until-next.
   const resetTimings = useCallback(() => {
     pushEditHistory();
-    const byId = new Map((originalSegmentsRef.current || []).map((s) => [s._id, s]));
+    const byId = new Map(sanitizeSegments(originalSegmentsRef.current || []).map((s) => [s._id, s]));
     setEdited((prev) => prev.map((s) => {
       const o = byId.get(s._id);
       if (!o) return s;
@@ -1052,6 +1285,7 @@ export default function LyricsEditor({
       const { locked, ...rest } = s;
       return { ...rest, start: o.start, end: o.end };
     }));
+    setFlushCounter((c) => c + 1);
     toast({ message: "Timings restaurados al original", tone: "info" });
   }, [pushEditHistory, toast]);
 
@@ -1088,7 +1322,7 @@ export default function LyricsEditor({
         pushEditHistory();
         // PR E: ids frescos vía el mismo helper que el seed inicial —
         // consistencia con la identidad estable del store (PR D).
-        setEdited(reseedPreservingIds([], res.segments));
+        setEdited(reseedPreservingIds([], sanitizeSegments(res.segments)));
         toast({
           message: (t("editor.reanchor_done") || "{n} líneas re-sincronizadas, {m} para revisar")
             .replace("{n}", String(res.count ?? res.segments.length))
@@ -1179,12 +1413,12 @@ export default function LyricsEditor({
   const activeId = useMemo(() => {
     let containing = null;
     let lastStarted = null;
-    for (const seg of edited) {
+    for (const seg of sanitizedEdited) {
       if (currentTime >= seg.start && currentTime < seg.end) containing = seg;
       if (currentTime >= seg.start) lastStarted = seg;
     }
     return (containing || lastStarted)?._id ?? null;
-  }, [edited, currentTime]);
+  }, [sanitizedEdited, currentTime]);
 
   // UI freeze / render-storm capture (P0 UMG Chile 2026-06-16). Cause-agnostic
   // safety net: if the main thread saturates (the "se queda pegado" + flicker),
@@ -1194,7 +1428,7 @@ export default function LyricsEditor({
     active: true,
     getContext: () => {
       const segs = Array.isArray(edited) ? edited : [];
-      const sorted = [...segs].sort((a, b) => a.start - b.start);
+      const sorted = sanitizeSegments(segs).sort((a, b) => a.start - b.start);
       let overlaps = 0;
       let maxOverlapDepth = 0;
       for (let i = 0; i < sorted.length - 1; i++) {
@@ -1557,7 +1791,8 @@ export default function LyricsEditor({
     // próximo rAF tick (~16ms) y el playhead "se desliza" en vez de saltar.
     setCurrentTime(t);
     if (autoplay && a.paused) a.play().catch(() => {});
-  }, []);
+    trackEditorEvent("editor_seek", { position_ms: Math.round(t * 1000), source: "editor" });
+  }, [trackEditorEvent]);
 
   // "Revisar →": salta a la SIGUIENTE línea marcada review, en orden.
   // Cicla. Hace scroll a la fila, foco al input de texto, seek del audio a
@@ -1794,10 +2029,27 @@ export default function LyricsEditor({
     setEdited((prev) => shiftBlockWithinDuration(prev, delta, duration));
   }, [pushEditHistory, duration]);
 
-  const deleteSeg = (id) => {
-    recordEditorAction("delete", { id });
-    setEdited((prev) => prev.filter((seg) => seg._id !== id));
-  };
+  const deleteSegments = useCallback((ids) => {
+    const requested = new Set(Array.isArray(ids) ? ids : [ids]);
+    const existingIds = edited.filter((seg) => requested.has(seg._id)).map((seg) => seg._id);
+    if (!existingIds.length) return false;
+    if (existingIds.length > 1 && !window.confirm(
+      `¿Eliminar ${existingIds.length} líneas? Podés deshacerlo con Cmd/Ctrl+Z.`,
+    )) return false;
+    recordEditorAction("delete", { ids: existingIds, count: existingIds.length });
+    pushEditHistory();
+    const idSet = new Set(existingIds);
+    setEdited((prev) => prev.filter((seg) => !idSet.has(seg._id)));
+    setFlushCounter((c) => c + 1);
+    trackEditorEvent("editor_timing_changed", {
+      count: existingIds.length,
+      operation: "delete",
+      duration_ms: 0,
+    });
+    return true;
+  }, [edited, pushEditHistory, trackEditorEvent]);
+
+  const deleteSeg = (id) => deleteSegments([id]);
 
   // Text-length-based cap. Used by the per-row ✂ button + bulk-trim
   // action in this editor. There is NO automatic application — the
@@ -1966,6 +2218,8 @@ export default function LyricsEditor({
   // repeat — duplicate the chorus block, then tap-sync the copies.
   const duplicateSeg = (id) => {
     recordEditorAction("duplicate", { id, segments: Array.isArray(edited) ? edited.length : null });
+    if (!edited.some((seg) => seg._id === id)) return;
+    pushEditHistory();
     setEdited((prev) => {
       const idx = prev.findIndex((s) => s._id === id);
       if (idx === -1) return prev;
@@ -1977,12 +2231,14 @@ export default function LyricsEditor({
       const dup = { ...orig, _id: nextId, start: newStart, end: newEnd };
       return [...prev.slice(0, idx + 1), dup, ...prev.slice(idx + 1)];
     });
+    setFlushCounter((c) => c + 1);
   };
 
   // Append a blank line at the end of the list. Operator types the
   // missing lyrics into the text input, then tap-syncs it.
   const addBlankLine = () => {
     recordEditorAction("addLine", { segments: Array.isArray(edited) ? edited.length : null });
+    pushEditHistory();
     setEdited((prev) => {
       // Insert the new line at the audio playhead — that's where the
       // operator is listening when they realise something's missing
@@ -2022,6 +2278,7 @@ export default function LyricsEditor({
       // immediate render consistent without waiting for a round-trip.
       return [...prev, inserted].sort((a, b) => a.start - b.start);
     });
+    setFlushCounter((c) => c + 1);
   };
 
   // Insert a blank line right AFTER the row at display index `idx`, timing
@@ -2030,6 +2287,8 @@ export default function LyricsEditor({
   // forced the operator to scroll away from where they were working.
   const insertLineAfter = (idx) => {
     recordEditorAction("insertLine", { idx });
+    if (idx < 0 || idx >= edited.length) return;
+    pushEditHistory();
     setEdited((prev) => {
       const cur = prev[idx];
       const nxt = prev[idx + 1];
@@ -2047,6 +2306,7 @@ export default function LyricsEditor({
       const inserted = { _id: nextId, start: s, end: e, text: "" };
       return [...prev, inserted].sort((a, b) => a.start - b.start);
     });
+    setFlushCounter((c) => c + 1);
   };
 
   // Smart "Agregar línea": when the operator has a row selected/focused,
@@ -2080,7 +2340,7 @@ export default function LyricsEditor({
   const blankCount = edited.filter((seg) => !(seg.text || "").trim()).length;
 
   const _buildCleanedSegments = () => {
-    const sorted = [...edited]
+    const sorted = sanitizeSegments(edited)
       .filter((seg) => (seg.text || "").trim())
       .sort((a, b) => a.start - b.start);
     return sorted.map((seg, i) => {
@@ -2104,7 +2364,20 @@ export default function LyricsEditor({
   const approveInFlightRef = useRef(false);
   const [isApproving, setIsApproving] = useState(false);
 
-  const runApprove = async () => {
+  const runApprove = async ({ skipWrapWarning = false } = {}) => {
+    if (editorV2Enabled && (!durableHydrated || durableEditor.loading)) {
+      toast({ message: "Estamos cargando la última versión. Esperá un instante para aprobar.", tone: "info" });
+      return;
+    }
+    if (saveStatus === "conflict" || durableEditor.conflict) {
+      setConflictDialogOpen(true);
+      toast({ message: "Resolvé el conflicto antes de aprobar.", tone: "error" });
+      return;
+    }
+    if (saveErrorReason === "draft-corrupt") {
+      toast({ message: "Descartá o recuperá manualmente el borrador local antes de aprobar.", tone: "error" });
+      return;
+    }
     // Aviso (no bloqueo) si el último autosave falló. IMPORTANTE — contrato
     // real verificado (incidente UMG 21-jul-2026): aprobar manda los
     // segments EN PANTALLA en el cuerpo del POST (onApprove(cleaned) acá;
@@ -2124,12 +2397,53 @@ export default function LyricsEditor({
     const problematic = edited.filter(
       (seg) => (seg.text || "").trim() && linesForSeg(seg.text) >= 3
     );
-    if (problematic.length > 0 && !wrapWarning) {
+    if (problematic.length > 0 && !skipWrapWarning) {
       setWrapWarning({ ids: problematic.map((s) => s._id) });
       return;
     }
     setWrapWarning(null);
     const cleaned = _buildCleanedSegments();
+    if (editorV2Enabled) {
+      // `_buildCleanedSegments` may tighten an overlap by 50 ms. Persist
+      // that exact final snapshot before sending its revision/version id;
+      // Editor 2.0 intentionally ignores browser JSON during approval.
+      const cleanedForPersistence = sanitizeSegmentsForPersistence(cleaned);
+      const saveResult = await flushDurableSave("manual", cleanedForPersistence);
+      if (saveResult?.ok === false) {
+        if (saveResult.reason === "conflict") setConflictDialogOpen(true);
+        else toast({ message: "No pudimos confirmar esta versión. Reintentá sin cerrar el editor.", tone: "error" });
+        return;
+      }
+      const approvalResult = await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
+        baseRevision: saveResult.revision,
+        editorRevision: saveResult.revision,
+        editorVersionId: saveResult.versionId,
+      }));
+      if (approvalResult?.ok === false) {
+        setIsDirty(true);
+        if (approvalResult.reason === "conflict") {
+          const remote = approvalResult.conflict || {};
+          durableEditor.stageConflict(cleanedForPersistence, {
+            serverRevision: Number.isInteger(remote.server_revision)
+              ? remote.server_revision : durableEditor.revisionRef.current,
+            serverSegments: Array.isArray(remote.server_segments)
+              ? remote.server_segments : durableEditor.document?.segments || [],
+            updatedBy: remote.updated_by || null,
+            updatedAt: remote.updated_at || null,
+            reason: "approval-conflict",
+          });
+          setSaveStatus("conflict");
+          setSaveErrorReason("conflict");
+          setConflictDialogOpen(true);
+        } else {
+          toast({ message: "No pudimos aprobar esta versión. Tus cambios siguen guardados para reintentar.", tone: "error" });
+        }
+        return;
+      }
+      setIsDirty(false);
+      trackEditorEvent("editor_approved", { revision: saveResult.revision });
+      return;
+    }
     if (disableAutosave || !onPersistSegments || !transcribeJobId) {
       setIsDirty(false);
       await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
@@ -2138,31 +2452,11 @@ export default function LyricsEditor({
       return;
     }
     let saveResult = await flushPendingSave();
-    // Stale-revision (409): el backup del servidor quedó adelante de nuestra
-    // base_revision (un autosave previo la subió, otra pestaña, o el reaper).
-    // ANTES esto hacía `return` en silencio → el operador clickeaba "Aprobar
-    // y generar" una y otra vez sin que pasara NADA hasta que el polling de
-    // fondo re-sincronizaba la revisión (reporte UMG 2026-07-24: "tuve que
-    // clickearlo muchas veces"). El botón no está deshabilitado, así que el
-    // no-op silencioso se lee como "no anda".
-    //
-    // Al aprobar, los segments EN PANTALLA son la fuente de verdad (ver el
-    // contrato de render arriba: onApprove manda `cleaned`, no el backup), así
-    // que un conflicto del backup NO debe bloquear. Auto-resolvemos una vez
-    // re-leyendo la revisión fresca del servidor (mismo path que el botón
-    // "Resolver conflicto") y seguimos. Si aún así falla, avisamos con un
-    // toast en vez de morir en silencio.
     if (saveResult?.ok === false && saveResult.reason === "stale-revision") {
-      saveResult = await flushPendingSave({ resolveConflict: true }, true);
-      if (saveResult?.ok === false) {
-        toast({
-          message:
-            t("editor.approve_conflict") ||
-            "No pudimos sincronizar los cambios con el servidor. Reintentá en unos segundos.",
-          tone: "error",
-        });
-        return;
-      }
+      setSaveStatus("conflict");
+      setSaveErrorReason("conflict");
+      toast({ message: t("editor.approve_conflict") || "Hay una versión más nueva. Recargá para compararla antes de aprobar.", tone: "error" });
+      return;
     }
     setIsDirty(false);
     await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
@@ -2172,12 +2466,12 @@ export default function LyricsEditor({
     }));
   };
 
-  const handleApprove = async () => {
+  const handleApprove = async (options = {}) => {
     if (approveInFlightRef.current) return;
     approveInFlightRef.current = true;
     setIsApproving(true);
     try {
-      await runApprove();
+      await runApprove({ skipWrapWarning: options?.skipWrapWarning === true });
     } finally {
       approveInFlightRef.current = false;
       setIsApproving(false);
@@ -2252,6 +2546,21 @@ export default function LyricsEditor({
   const confidenceText = confidenceParts.length
     ? confidenceParts.join(" · ")
     : (t("editor.confidence_all_ready") || "Todo listo");
+  const saveStatusLabel = {
+    idle: isDirty ? "Cambios locales" : "Guardado",
+    local: "Cambios locales",
+    saving: "Guardando…",
+    saved: "Guardado",
+    offline: "Sin conexión",
+    conflict: "Conflicto detectado",
+    error: "No se pudo guardar",
+  }[saveStatus] || "Cambios locales";
+  const collaboratingUser = editorV2Enabled
+    && durableEditor.lock?.active
+    && durableEditor.lock?.user
+    && String(durableEditor.lock.user.id) !== String(user?.id)
+    ? durableEditor.lock.user
+    : null;
 
   const handleScrub = (e) => {
     if (!duration) return;
@@ -2273,7 +2582,45 @@ export default function LyricsEditor({
     // bajo el botón flotante "Aprobar y generar" (h-12 = 48 px + bottom-6
     // = 24 px + sombra). Sin esto la última card del timeline o de la
     // lista quedaba tapada cuando el operador scrolleaba hasta el final.
-    <div className={`w-full animate-fade-in mx-auto pb-28 ${viewMode === "timeline" ? "max-w-6xl" : "max-w-[1400px]"}`}>
+    <div data-testid="lyrics-editor" aria-busy={editorInitializationBlocked} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+      {editorInitializationBlocked && createPortal(
+        <div
+          className="fixed inset-0 z-[80] flex items-center justify-center bg-surface-0/70 px-5 backdrop-blur-sm"
+          role={durableEditor.error ? "alertdialog" : "status"}
+          aria-modal={durableEditor.error ? "true" : undefined}
+          aria-label={durableEditor.error ? "No pudimos abrir la versión editable" : "Preparando editor"}
+        >
+          <div className="w-full max-w-sm rounded-3xl border border-white/[0.10] bg-surface-1 p-6 text-center shadow-2xl shadow-black/40">
+            {durableEditor.error ? (
+              <>
+                <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-2xl bg-red-500/10 text-red-300 ring-1 ring-red-400/20" aria-hidden="true">
+                  <svg className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path d="M12 9v4m0 4h.01M10.3 3.6 2.5 17.1A2 2 0 0 0 4.2 20h15.6a2 2 0 0 0 1.7-2.9L13.7 3.6a2 2 0 0 0-3.4 0Z" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </div>
+                <h3 className="mt-4 text-base font-semibold text-white">No pudimos abrir la versión editable</h3>
+                <p className="mt-2 text-sm leading-6 text-ink-secondary">
+                  Tus líneas siguen a salvo. Reconectá el editor antes de modificar o aprobar.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => durableEditor.load()}
+                  className="mt-5 inline-flex h-11 items-center justify-center rounded-xl bg-white px-5 text-sm font-semibold text-surface-0 transition-colors hover:bg-gray-100"
+                >
+                  Reintentar
+                </button>
+              </>
+            ) : (
+              <>
+                <span className="mx-auto block h-8 w-8 animate-spin rounded-full border-2 border-brand/30 border-t-brand-light" aria-hidden="true" />
+                <h3 className="mt-4 text-base font-semibold text-white">Preparando el editor…</h3>
+                <p className="mt-2 text-sm text-ink-secondary">Cargando la última versión guardada.</p>
+              </>
+            )}
+          </div>
+        </div>,
+        document.body,
+      )}
       {/* Hidden audio element drives playback. */}
       {audioUrl && (
         <audio
@@ -2284,6 +2631,10 @@ export default function LyricsEditor({
           onPlay={() => setIsPlaying(true)}
           onPause={() => setIsPlaying(false)}
           onEnded={() => setIsPlaying(false)}
+          onError={() => {
+            setAudioError(true);
+            setIsPlaying(false);
+          }}
         />
       )}
 
@@ -2292,6 +2643,7 @@ export default function LyricsEditor({
           app's own sticky top bar — the recurring "botón cortado". */}
       <div className="py-3 mb-4 flex items-center gap-3">
         <button onClick={handleBackSafely}
+          aria-label="Volver"
           className="w-9 h-9 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] hover:text-white flex items-center justify-center text-gray-400 transition-colors shrink-0">
           <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M19 12H5M12 19l-7-7 7-7" />
@@ -2299,11 +2651,22 @@ export default function LyricsEditor({
         </button>
         <div className="min-w-0">
           <h2 className="text-lg font-bold tracking-tight">{t("editor.title")}</h2>
-          <p className="text-sm text-ink-secondary truncate">
+          <p className="text-sm text-gray-200 truncate">
             {name}
             {batchProgress && <span className="ml-2 text-brand-light text-xs">({batchProgress})</span>}
           </p>
         </div>
+        {collaboratingUser && (
+          <div className="ml-auto hidden max-w-xs items-center gap-2 rounded-xl bg-cyan-400/[0.08] px-3 py-2 text-cyan-100 ring-1 ring-cyan-300/20 sm:flex" aria-live="polite">
+            <span className="relative flex h-2 w-2 shrink-0" aria-hidden="true">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-cyan-300 opacity-50" />
+              <span className="relative inline-flex h-2 w-2 rounded-full bg-cyan-300" />
+            </span>
+            <span className="truncate text-[11px]">
+              <strong className="font-semibold">{collaboratingUser.username || "Alguien del equipo"}</strong> está editando
+            </span>
+          </div>
+        )}
       </div>
 
       {/* El status del pre-gen del fondo ("Fondo listo" / "Generando…") ya
@@ -2320,22 +2683,32 @@ export default function LyricsEditor({
           list in the transparent upper region; the button re-enables them.
           The container's pb-28 still reserves space so the last row clears
           the bar when scrolled to the end. */}
-      <div className="fixed bottom-0 left-0 right-0 z-50 pointer-events-none flex justify-end
-        bg-gradient-to-t from-surface via-surface/95 to-transparent pt-10 pb-5 px-6">
-        <button
-          onClick={handleApprove}
-          disabled={isApproving}
-          aria-busy={isApproving}
-          data-tour="editor-approve-floating"
-          className="editor-primary-cta pointer-events-auto inline-flex items-center gap-1.5 btn-primary text-sm h-12 px-6 shadow-2xl shadow-brand/30 disabled:opacity-60 disabled:cursor-wait"
-        >
-          {isApproving
-            ? (t("editor.applying_changes") || "Aplicando cambios…")
-            : (submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate")))}
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <path d="M5 12h14M12 5l7 7-7 7" />
-          </svg>
-        </button>
+      <div className="fixed bottom-0 left-0 right-0 z-50 border-t border-white/[0.08] bg-surface-1/95 px-4 py-3 shadow-[0_-16px_50px_rgba(0,0,0,.28)] backdrop-blur-xl">
+        <div className="mx-auto flex w-full max-w-[1800px] items-center justify-between gap-4">
+          <div className="hidden min-w-0 sm:block">
+            <p className={`text-[11px] font-medium ${saveStatus === "conflict" ? "text-amber-300" : saveStatus === "error" || saveStatus === "offline" ? "text-red-300" : "text-white"}`}>{saveStatusLabel}</p>
+            <p className="mt-0.5 truncate text-[10px] text-ink-tertiary">{edited.length} líneas · {viewMode === "advanced" ? "timings revisados" : "texto revisado"}</p>
+          </div>
+          <button
+            onClick={handleApprove}
+            disabled={isApproving || (editorV2Enabled && (!durableHydrated || durableEditor.loading)) || saveStatus === "conflict" || saveErrorReason === "draft-corrupt"}
+            aria-busy={isApproving}
+            aria-label={isApproving
+              ? (t("editor.applying_changes") || "Aplicando cambios…")
+              : (submitLabel || (isBatch
+                ? (t("editor.approve_next") || "Aprobar y continuar")
+                : (t("editor.approve_generate") || "Aprobar y generar")))}
+            data-tour="editor-approve-floating"
+            className="editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl bg-gradient-to-r from-brand to-brand-light px-5 text-sm font-semibold text-white shadow-xl shadow-brand/25 transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {isApproving
+              ? (t("editor.applying_changes") || "Aplicando cambios…")
+              : (submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate")))}
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M5 12h14M12 5l7 7-7 7" />
+            </svg>
+          </button>
+        </div>
       </div>
 
       {coverageWarning && (
@@ -2363,9 +2736,9 @@ export default function LyricsEditor({
           del audio bar lo hace imposible de perder.
           (Timeline view ya tiene el chip embedded en su header,
           LyricsTimeline.jsx:354+) */}
-      {saveStatus === "error" && (
-        <div className="mb-3 rounded-card bg-red-500/10 ring-1 ring-red-500/30 px-4 py-3 flex items-center gap-3 animate-fade-in">
-          <svg className="w-4 h-4 text-red-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+      {["error", "offline", "conflict"].includes(saveStatus) && (
+        <div className={`mb-3 rounded-card px-4 py-3 flex items-center gap-3 animate-fade-in ring-1 ${saveStatus === "conflict" ? "bg-amber-500/10 ring-amber-500/30" : "bg-red-500/10 ring-red-500/30"}`}>
+          <svg className={`w-4 h-4 shrink-0 ${saveStatus === "conflict" ? "text-amber-300" : "text-red-400"}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zM12 15.75h.01" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
           <div className="flex-1 min-w-0">
@@ -2378,25 +2751,29 @@ export default function LyricsEditor({
           </div>
           <div className="flex shrink-0 gap-2">
             {saveErrorReason === "conflict" ? (
-              <>
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (onReloadServer) onReloadServer({ draftKey, storeKey: _storeKey });
-                    else window.location.reload();
-                  }}
-                  className="text-[11px] text-red-200 hover:text-white bg-red-500/20 hover:bg-red-500/30 rounded-lg px-3 py-1.5 transition-colors"
-                >
-                  Recargar servidor
-                </button>
-                <button
-                  type="button"
-                  onClick={() => flushPendingSave({ resolveConflict: true })}
-                  className="text-[11px] text-white bg-brand hover:bg-brand-light rounded-lg px-3 py-1.5 transition-colors"
-                >
-                  Sobrescribir mi versión
-                </button>
-              </>
+              <button
+                type="button"
+                onClick={() => {
+                  if (editorV2Enabled) setConflictDialogOpen(true);
+                  else if (onReloadServer) onReloadServer({ draftKey, storeKey: _storeKey });
+                  else window.location.reload();
+                }}
+                className="text-[11px] text-white bg-brand hover:bg-brand-light rounded-lg px-3 py-1.5 transition-colors"
+              >
+                {editorV2Enabled ? "Resolver conflicto" : "Cargar versión del servidor"}
+              </button>
+            ) : saveErrorReason === "draft-corrupt" ? (
+              <button
+                type="button"
+                onClick={() => {
+                  try { if (draftKey) localStorage.removeItem(draftKey); } catch { /* best effort */ }
+                  setSaveStatus("saved");
+                  setSaveErrorReason(null);
+                }}
+                className="text-[11px] text-red-200 hover:text-white bg-red-500/20 hover:bg-red-500/30 rounded-lg px-3 py-1.5 transition-colors"
+              >
+                Descartar borrador local
+              </button>
             ) : (
               <button
                 type="button"
@@ -2437,7 +2814,7 @@ export default function LyricsEditor({
            Cuando se portalea bajo el video (playerSlot), NO va sticky ni
            lleva el offset del header — vive estático debajo del preview. */
         <div
-          className={`${playerSlot ? "" : "mb-3 sticky z-20"} backdrop-blur-md bg-surface-1/85 flex items-center gap-3 p-3 rounded-xl ring-1 ring-white/[0.04]`}
+          className={`${playerSlot ? "relative z-30" : "mb-3 sticky z-20"} min-w-0 max-w-full backdrop-blur-md bg-surface-1/95 flex items-center gap-3 p-3 rounded-xl ring-1 ring-white/[0.04]`}
           style={playerSlot ? undefined : { top: stickyHeaderTop || 0 }}
           data-tour="editor-playbar"
         >
@@ -2489,7 +2866,7 @@ export default function LyricsEditor({
                NO mostrar "no disponible" acá — es un falso alarma mientras
                el fetch (con reintentos) está en vuelo. Mismo ancho que el
                reproductor para no colapsar la fila. */
-            <div className="flex-1 flex items-center gap-2 text-[11px] text-ink-secondary">
+            <div className="min-w-0 flex-1 flex items-center gap-2 text-[11px] text-ink-secondary">
               <svg className="w-3.5 h-3.5 flex-shrink-0 animate-spin" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M21 12a9 9 0 1 1-6.219-8.56" strokeLinecap="round" />
               </svg>
@@ -2503,7 +2880,7 @@ export default function LyricsEditor({
                no colapse y los controles de vista (a la derecha) queden en
                la misma posición que cuando hay audio. Esto preserva la
                memoria muscular del operador. */
-            <div className="flex-1 flex items-center gap-2 text-[11px] text-amber-300/90">
+            <div className="min-w-0 flex-1 flex items-center gap-2 text-[11px] text-amber-300/90">
               <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M12 9v4M12 17h.01" />
                 <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
@@ -2514,135 +2891,6 @@ export default function LyricsEditor({
               </span>
             </div>
           )}
-          {/* Lista | Línea de tiempo — the timeline is a VIEW of the same
-              editor (shared state), default Lista. Narrow/mobile: icon-only
-              (labels ocultos) para que el toggle entre sin empujar el ⋯. */}
-          <div className="inline-flex shrink-0 rounded-md ring-1 ring-white/[0.08] overflow-hidden text-label">
-            <button
-              onClick={() => setViewMode("list")}
-              title="Mejor para corregir el texto: cada línea en una fila ancha con input directo."
-              aria-label={t("editor.view_list") || "Lista"}
-              className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "list" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
-            >
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                <line x1="8" y1="6" x2="21" y2="6" strokeLinecap="round" />
-                <line x1="8" y1="12" x2="21" y2="12" strokeLinecap="round" />
-                <line x1="8" y1="18" x2="21" y2="18" strokeLinecap="round" />
-                <circle cx="3.5" cy="6" r="1" fill="currentColor" stroke="none" />
-                <circle cx="3.5" cy="12" r="1" fill="currentColor" stroke="none" />
-                <circle cx="3.5" cy="18" r="1" fill="currentColor" stroke="none" />
-              </svg>
-              <span className="hidden sm:inline">{t("editor.view_list") || "Lista"}</span>
-            </button>
-            <button
-              onClick={() => setViewMode("timeline")}
-              title="Mejor para revisar el timing: cada línea en su posición temporal, arrastrable."
-              aria-label={t("editor.view_timeline") || "Línea de tiempo"}
-              className={`px-2.5 py-1 flex items-center gap-1.5 transition-colors ${viewMode === "timeline" ? "bg-brand/20 text-brand-light" : "text-ink-secondary hover:text-white"}`}
-            >
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                <rect x="3" y="7" width="8" height="4" rx="1" />
-                <rect x="13" y="13" width="7" height="4" rx="1" />
-                <line x1="3" y1="3" x2="3" y2="21" strokeLinecap="round" opacity="0.5" />
-              </svg>
-              <span className="hidden sm:inline">{t("editor.view_timeline") || "Línea de tiempo"}</span>
-            </button>
-          </div>
-          {/* ⋯ Overflow — 2026-07 rediseño: absorbe los controles secundarios
-              (Expandir/Enfoque, Re-sincronizar con IA, Modo Sync) que antes
-              eran botones sueltos en la barra. Re-sincronizar es una acción
-              PESADA → no vive como botón púrpura permanente. */}
-          <div className="relative shrink-0">
-            <button
-              type="button"
-              data-testid="editor-overflow-btn"
-              onClick={() => setOverflowOpen((v) => !v)}
-              aria-haspopup="menu"
-              aria-expanded={overflowOpen}
-              title={t("editor.more_actions") || "Más acciones"}
-              aria-label={t("editor.more_actions") || "Más acciones"}
-              className={`inline-flex shrink-0 w-8 h-8 rounded-md ring-1 transition-colors items-center justify-center
-                ${overflowOpen
-                  ? "ring-brand/40 bg-brand/15 text-brand-light"
-                  : "ring-white/[0.08] text-ink-secondary hover:text-brand-light hover:bg-brand/10 hover:ring-brand/30"}`}
-            >
-              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                <circle cx="5" cy="12" r="1.6" /><circle cx="12" cy="12" r="1.6" /><circle cx="19" cy="12" r="1.6" />
-              </svg>
-            </button>
-            {overflowOpen && (
-              <>
-                {/* backdrop para cerrar al click afuera */}
-                <button
-                  type="button"
-                  aria-hidden="true"
-                  tabIndex={-1}
-                  onClick={() => setOverflowOpen(false)}
-                  className="fixed inset-0 z-20 cursor-default"
-                />
-                <div
-                  role="menu"
-                  className="absolute right-0 top-full mt-1.5 z-30 w-56 py-1 rounded-xl bg-surface-1 ring-1 ring-white/[0.08] shadow-2xl shadow-black/40 animate-fade-in"
-                >
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => { toggleFocusMode(); setOverflowOpen(false); }}
-                    className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-gray-200 hover:bg-white/[0.05] transition-colors"
-                  >
-                    <svg className="w-3.5 h-3.5 text-ink-secondary shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                      {focusMode
-                        ? <><path d="M9 4v6H3M21 14h-6v6" strokeLinecap="round" strokeLinejoin="round" /><path d="M9 10L4 5M15 14l5 5" strokeLinecap="round" strokeLinejoin="round" /></>
-                        : <path d="M4 9V4h5M20 15v5h-5M4 9l5-5M20 15l-5 5" strokeLinecap="round" strokeLinejoin="round" />}
-                    </svg>
-                    {focusMode
-                      ? (t("editor.focus_exit") || "Salir de modo enfoque")
-                      : (t("editor.focus_enter") || "Expandir (modo enfoque)")}
-                  </button>
-                  {canReanchor && !syncMode && (
-                    <button
-                      type="button"
-                      role="menuitem"
-                      data-testid="reanchor-btn"
-                      onClick={() => { handleReanchor(); setOverflowOpen(false); }}
-                      disabled={reanchoring}
-                      title={t("editor.reanchor_hint") || "Vuelve a alinear el timing de cada línea con el audio usando el texto ya corregido. Las líneas que moviste a mano no se tocan."}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-gray-200 hover:bg-white/[0.05] transition-colors disabled:opacity-50 disabled:cursor-wait"
-                    >
-                      {reanchoring ? (
-                        <span className="w-3.5 h-3.5 border-[1.5px] border-brand-light border-t-transparent rounded-full animate-spin shrink-0" />
-                      ) : (
-                        <svg className="w-3.5 h-3.5 text-brand-light shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                          <path d="M21 12a9 9 0 11-2.64-6.36" strokeLinecap="round" />
-                          <path d="M21 3v6h-6" strokeLinecap="round" strokeLinejoin="round" />
-                        </svg>
-                      )}
-                      {reanchoring
-                        ? (t("editor.reanchor_running") || "Re-sincronizando…")
-                        : (t("editor.reanchor") || "Re-sincronizar con IA")}
-                    </button>
-                  )}
-                  {!syncMode && (
-                    <button
-                      type="button"
-                      role="menuitem"
-                      data-tour="editor-sync-entry"
-                      onClick={() => { enterSyncMode(); setOverflowOpen(false); }}
-                      title={t("editor.sync_cta_hint") || "Modo Sync — anclar timings por tap (⌘K / Ctrl+K)"}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-gray-200 hover:bg-white/[0.05] transition-colors"
-                    >
-                      <svg className="w-3.5 h-3.5 text-ink-secondary shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                        <circle cx="12" cy="12" r="9" />
-                        <circle cx="12" cy="12" r="4" />
-                        <circle cx="12" cy="12" r="1" fill="currentColor" />
-                      </svg>
-                      {t("editor.sync_enter_full") || "Re-anclar por tap (Modo Sync)"}
-                    </button>
-                  )}
-                </div>
-              </>
-            )}
-          </div>
         </div>
       ); return playerSlot ? createPortal(_playerBar, playerSlot) : _playerBar; })()}
 
@@ -3156,12 +3404,109 @@ export default function LyricsEditor({
              izquierda no renderiza — los controles ya están en el paso
              4 del stepper y el preview central del wizard refleja los
              cambios. El grid colapsa a 1 columna full-width. */}
-      <div className={`grid gap-4 mb-4 items-start ${hideTypographyControls ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2"}`}>
+      <div className="relative mb-4 flex items-center gap-3 rounded-2xl bg-gradient-to-r from-surface-2/80 via-surface-2/45 to-brand/[0.055] p-2 ring-1 ring-white/[0.08] shadow-xl shadow-black/10" data-testid="editor-mode-explainer">
+        <div
+          className="grid min-w-0 flex-1 grid-cols-2 gap-1 rounded-xl bg-black/20 p-1"
+          role="tablist"
+          aria-label={t("editor.mode_label") || "Modo de edición"}
+          onKeyDown={(event) => {
+            if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+            event.preventDefault();
+            const next = event.key === "ArrowLeft" || event.key === "Home" ? "basic" : "advanced";
+            setViewMode(next);
+            if (next === "basic") setSyncMode(false);
+            event.currentTarget.querySelector(`[data-editor-view="${next}"]`)?.focus();
+          }}
+        >
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === "basic"}
+            tabIndex={viewMode === "basic" ? 0 : -1}
+            data-editor-view="basic"
+            onClick={() => { setViewMode("basic"); setSyncMode(false); setOverflowOpen(false); }}
+            aria-label={t("editor.basic_view") || "Revisar letra"}
+            className={`group flex min-w-0 items-center gap-2.5 rounded-lg px-3 py-2.5 text-left transition-all ${viewMode === "basic" ? "bg-white/[0.09] text-white ring-1 ring-white/[0.11] shadow-lg" : "text-ink-secondary hover:bg-white/[0.04] hover:text-white"}`}
+          >
+            <span className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg ${viewMode === "basic" ? "bg-emerald-400/15 text-emerald-300" : "bg-white/[0.04] text-ink-tertiary"}`}>
+              <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path d="M6 6h12M6 12h12M6 18h8" strokeLinecap="round" /></svg>
+            </span>
+            <span className="min-w-0">
+              <span className="block truncate text-[12px] font-semibold">{t("editor.basic_view") || "Revisar letra"}</span>
+              <span className="hidden truncate text-[10px] text-ink-tertiary sm:block">Corregir texto y aprobar</span>
+            </span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === "advanced"}
+            tabIndex={viewMode === "advanced" ? 0 : -1}
+            data-editor-view="advanced"
+            onClick={() => { setViewMode("advanced"); setOverflowOpen(false); }}
+            aria-label={t("editor.advanced_view") || "Ajustar tiempos"}
+            className={`group flex min-w-0 items-center gap-2.5 rounded-lg px-3 py-2.5 text-left transition-all ${viewMode === "advanced" ? "bg-brand/20 text-white ring-1 ring-brand/35 shadow-lg shadow-brand/10" : "text-ink-secondary hover:bg-white/[0.04] hover:text-white"}`}
+          >
+            <span className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg ${viewMode === "advanced" ? "bg-brand text-white shadow-lg shadow-brand/25" : "bg-white/[0.04] text-ink-tertiary"}`}>
+              <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path d="M4 7h7v4H4zM13 13h7v4h-7z" /><path d="M4 3v18" strokeLinecap="round" /></svg>
+            </span>
+            <span className="min-w-0">
+              <span className="block truncate text-[12px] font-semibold">{t("editor.advanced_view") || "Ajustar tiempos"}</span>
+              <span className="hidden truncate text-[10px] text-ink-tertiary sm:block">Timeline y edición en grupo</span>
+            </span>
+          </button>
+        </div>
+        {viewMode === "advanced" && (
+          <div className="relative shrink-0">
+            <button
+              type="button"
+              data-testid="editor-overflow-btn"
+              onClick={() => setOverflowOpen((value) => !value)}
+              aria-haspopup="menu"
+              aria-expanded={overflowOpen}
+              className="inline-flex h-10 items-center gap-2 rounded-xl px-3 text-[11px] font-medium text-ink-secondary ring-1 ring-white/[0.09] transition-colors hover:bg-white/[0.06] hover:text-white"
+            >
+              <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path d="M4 7h16M7 12h10M10 17h4" strokeLinecap="round" /></svg>
+              <span className="hidden md:inline">Herramientas</span>
+            </button>
+            {overflowOpen && (
+              <>
+                <button type="button" aria-hidden="true" tabIndex={-1} onClick={() => setOverflowOpen(false)} className="fixed inset-0 z-40 cursor-default" />
+                <div role="menu" className="absolute right-0 top-full z-50 mt-2 w-64 overflow-hidden rounded-2xl bg-surface-1 p-1.5 ring-1 ring-white/[0.1] shadow-2xl shadow-black/50">
+                  {!hideTypographyControls && (
+                    <button type="button" role="menuitem" onClick={() => { setPreviewDockOpen((value) => !value); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white">
+                      <span className="block font-medium">{previewDockOpen ? "Ocultar preview" : "Mostrar preview"}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Abre una referencia visual lateral</span>
+                    </button>
+                  )}
+                  <button type="button" role="menuitem" onClick={() => { toggleFocusMode(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white">
+                    <span className="block font-medium">{focusMode ? (t("editor.focus_exit") || "Salir de modo enfoque") : (t("editor.focus_enter") || "Trabajar a pantalla completa")}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Maximiza el espacio de edición</span>
+                  </button>
+                  {canReanchor && !syncMode && (
+                    <button type="button" role="menuitem" data-testid="reanchor-btn" disabled={reanchoring} onClick={() => { handleReanchor(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white disabled:opacity-50">
+                      <span className="block font-medium">{reanchoring ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.reanchor") || "Re-sincronizar con IA")}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Conserva los ajustes manuales</span>
+                    </button>
+                  )}
+                  {!syncMode && (
+                    <button type="button" role="menuitem" data-tour="editor-sync-entry" onClick={() => { enterSyncMode(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white">
+                      <span className="block font-medium">{t("editor.sync_enter_full") || "Re-anclar por tap (Modo Sync)"}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Marcá entradas mientras escuchás</span>
+                    </button>
+                  )}
+                  {editorV2Enabled && (
+                    <button type="button" role="menuitem" onClick={() => { setHistoryOpen(true); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white">
+                      <span className="block font-medium">Historial de versiones</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Restaurá un checkpoint sin perder el actual</span>
+                    </button>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+      <div className={`grid gap-4 mb-4 items-start ${viewMode === "advanced" ? (previewDockOpen && !hideTypographyControls ? "grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px]" : "grid-cols-1") : (hideTypographyControls ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2")}`}>
           {/* COLUMNA IZQUIERDA — sticky en desktop. Controles tipográficos
               + LyricVideoPreview (editable) + scope toggle.
               Phase 2: oculta si hideTypographyControls=true (modo wizard). */}
           {!hideTypographyControls && (
-          <div className="space-y-2 lg:sticky lg:top-2 lg:self-start">
+          <div className={`space-y-2 lg:sticky lg:top-2 lg:self-start ${viewMode === "advanced" ? "xl:order-2" : ""}`}>
             {/* Live font switcher — preview re-renders in the chosen
                 typeface instantly; applied to the render on re-render. */}
             <div className="flex items-center gap-2 px-1">
@@ -3262,31 +3607,81 @@ export default function LyricsEditor({
               según viewMode. min-w-0 evita que rows muy largas rompan el grid.
               Phase E 2026-05-25: relative + el mini-map vertical se posiciona
               absolute a la derecha cuando hay >20 segments. */}
-          <div className="min-w-0 space-y-2 relative">
-            {viewMode === "timeline" && audioUrl ? (
-              <LyricsTimeline
-                segments={edited}
-                duration={duration}
-                currentTime={currentTime}
-                isPlaying={isPlaying}
-                saveStatus={saveStatus}
-                activeId={activeId}
-                focusedSegId={focusedSegId}
-                highlightedIds={highlightedIds}
-                waveform={waveform}
-                gapS={MIN_GAP_S}
-                focusMode={focusMode}
-                onSeek={(s) => seekTo(s, false)}
-                onDragStart={pushEditHistory}
-                onTimingChange={handleTimelineTimingChange}
-                onTimingChangeBatch={handleTimelineTimingChangeBatch}
-                onTextChange={updateText}
-                onFocus={focusSegment}
-                onReset={resetTimings}
-              />
+          <div className={`min-w-0 space-y-2 relative ${viewMode === "advanced" ? "xl:order-1" : ""}`}>
+            {viewMode === "advanced" ? (
+              <div
+                data-testid="advanced-workspace-shell"
+                className="min-h-[260px] rounded-2xl ring-1 ring-white/[0.08] bg-surface-2/20"
+              >
+                {audioLoading ? (
+                  <div data-testid="advanced-audio-loading" className="flex min-h-[260px] flex-col items-center justify-center gap-3 px-6 text-center">
+                    <svg className="h-6 w-6 animate-spin text-brand-light" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M21 12a9 9 0 1 1-6.219-8.56" strokeLinecap="round" />
+                    </svg>
+                    <div>
+                      <p className="text-sm font-medium text-white">Cargando audio…</p>
+                      <p className="mt-1 text-xs text-ink-tertiary">Ajustar tiempos aparecerá cuando el audio esté listo.</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => { setViewMode("basic"); setSyncMode(false); }}
+                      className="text-xs text-brand-light hover:text-white transition-colors"
+                    >
+                      Volver a Revisar letra
+                    </button>
+                  </div>
+                ) : !audioUrl || audioError ? (
+                  <div data-testid="advanced-audio-unavailable" className="flex min-h-[260px] flex-col items-center justify-center gap-3 px-6 text-center">
+                    <svg className="h-7 w-7 text-amber-300" fill="none" stroke="currentColor" strokeWidth="1.7" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M12 9v4M12 17h.01" />
+                      <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+                    </svg>
+                    <div>
+                      <p className="text-sm font-medium text-white">No se puede ajustar tiempos sin audio</p>
+                      <p className="mt-1 max-w-md text-xs text-ink-tertiary">
+                        Podés corregir el texto en Revisar letra. Cuando el audio esté disponible, volvé a Ajustar tiempos.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => { setViewMode("basic"); setSyncMode(false); }}
+                      className="rounded-lg bg-brand/15 px-3 py-2 text-xs font-medium text-brand-light ring-1 ring-brand/30 hover:bg-brand/25 hover:text-white transition-colors"
+                    >
+                      Volver a Revisar letra
+                    </button>
+                  </div>
+                ) : (
+                  <LyricsTimeline
+                    segments={edited}
+                    duration={duration}
+                    currentTime={currentTime}
+                    isPlaying={isPlaying}
+                    saveStatus={saveStatus}
+                    activeId={activeId}
+                    focusedSegId={focusedSegId}
+                    highlightedIds={highlightedIds}
+                    waveform={waveform}
+                    gapS={MIN_GAP_S}
+                    focusMode={workspaceFocusMode}
+                    onSeek={(s) => seekTo(s, false)}
+                    onDragStart={pushEditHistory}
+                    onTimingChange={handleTimelineTimingChange}
+                    onTimingChangeBatch={handleTimelineTimingChangeBatch}
+                    onTextChange={updateText}
+                    onDeleteSelection={deleteSegments}
+                    onFocus={focusSegment}
+                    onReset={resetTimings}
+                    onSelectionCreated={({ count, method, durationMs }) => trackEditorEvent("editor_selection_created", {
+                      count,
+                      method,
+                      duration_ms: Math.round(durationMs || 0),
+                    })}
+                  />
+                )}
+              </div>
             ) : (
               <>
-                <p className="text-[11px] text-gray-600 mb-2 px-1">
+                <p className="text-[11px] text-gray-200 mb-2 px-1">
                   {t("editor.list_hint") || "Click en un tiempo para reproducir desde ahí · doble click para editarlo"}
                 </p>
                 <div className="relative">
@@ -3353,7 +3748,7 @@ export default function LyricsEditor({
                       pero el mouse-wheel no transfiere → scroll trapped.
                       Mobile mantiene el cap original (no hay outer
                       overflow ahí, el page scroll cubre todo). */}
-                  <div ref={listRef} className={`space-y-0.5 overflow-y-auto pr-1 pb-8 ${focusMode ? "max-h-[calc(100vh-110px)]" : "max-h-[calc(100vh-200px)]"} lg:max-h-none lg:overflow-visible`}>
+                  <div ref={listRef} className={`space-y-0.5 overflow-y-auto pr-1 pb-8 ${workspaceFocusMode ? "max-h-[calc(100vh-110px)]" : "max-h-[calc(100vh-200px)]"} lg:max-h-none lg:overflow-visible`}>
           {edited.map((seg, idx) => {
             const suggestion = suggestionsById[seg._id];
             const isApplied = suggestion && seg.text === suggestion;
@@ -3397,6 +3792,7 @@ export default function LyricsEditor({
                   {editingId === seg._id ? (
                     <input
                       type="text"
+                      aria-label={`Tiempo de inicio de la línea ${idx + 1}`}
                       autoFocus
                       value={editValue}
                       onChange={(e) => setEditValue(e.target.value)}
@@ -3424,12 +3820,13 @@ export default function LyricsEditor({
                       <button
                         onClick={() => seekTo(Math.max(0, seg.start), true)}
                         onDoubleClick={() => startEditTimestamp(seg)}
+                        aria-label={`Reproducir desde ${formatTimestamp(seg.start)}. Doble click para editar el tiempo de la línea ${idx + 1}`}
                         title={t("editor.timestamp_hint") || "Click: ir al tiempo · Doble click: editar"}
                         className={`text-[11px] font-mono pt-2.5 w-14 text-right transition-colors
                           ${isActive ? "text-brand-light font-semibold"
                             : wasRecentlyAnchored ? "text-brand-light"
                             : isReview ? "text-amber-400/80 hover:text-amber-300"
-                            : "text-gray-600 hover:text-brand-light"}`}
+                            : "text-gray-200 hover:text-brand-light"}`}
                       >
                         {/* Phase A 2026-05-25: indicador ▶ visible solo en
                             la fila activa para reforzar "esta es la que está
@@ -3462,6 +3859,7 @@ export default function LyricsEditor({
                   <div className="flex-1 min-w-0 relative">
                     <input
                       type="text"
+                      aria-label={`Letra de la línea ${idx + 1}`}
                       value={seg.text}
                       onChange={(e) => updateText(seg._id, e.target.value)}
                       onKeyDown={(e) => {
@@ -3509,7 +3907,7 @@ export default function LyricsEditor({
                          y el texto vuelve. */
                       className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm
                         focus:border-brand/40 focus:outline-none hover:border-white/[0.08] transition-all
-                        ${isActive && focusedSegId !== seg._id ? "text-transparent caret-transparent selection:text-white" : "text-white"}
+                        text-white
                         ${suggestion && !isApplied ? "border-amber-500/20" : "border-white/[0.04]"}`}
                     />
                     {/* Phase A 2026-05-25: overlay karaoke word-jump (Apple
@@ -3528,7 +3926,7 @@ export default function LyricsEditor({
                       let nonSpaceIdx = -1;
                       return (
                         <div
-                          className="absolute inset-0 px-3 py-2 text-sm pointer-events-none whitespace-pre-wrap leading-[1.4]"
+                          className="absolute inset-0 rounded-xl bg-surface-1 px-3 py-2 text-sm pointer-events-none whitespace-pre-wrap leading-[1.4]"
                           aria-hidden="true"
                           style={{ fontFeatureSettings: "normal" }}
                         >
@@ -3704,7 +4102,7 @@ export default function LyricsEditor({
             data-tour="editor-add-line"
             onClick={addLineSmart}
             className="w-full mt-2 py-2.5 rounded-xl border border-dashed border-white/[0.08]
-              hover:border-brand/40 hover:bg-brand/[0.04] text-gray-500 hover:text-brand-light
+              hover:border-brand/40 hover:bg-brand/[0.04] text-white hover:text-brand-light
               text-caption transition-all flex items-center justify-center gap-1.5"
           >
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -3722,7 +4120,7 @@ export default function LyricsEditor({
       {/* Line-count + blank-line note. The primary CTA lives in the sticky
           header now (always reachable) — no duplicate button here. */}
       <div className="mt-4 flex items-center gap-2 min-w-0" data-tour="editor-approve">
-        <span className="text-xs text-gray-600 shrink-0">
+        <span className="text-xs text-gray-200 shrink-0">
           {edited.length} {t("editor.lines")}
         </span>
         {blankCount > 0 && (
@@ -3733,50 +4131,73 @@ export default function LyricsEditor({
         )}
       </div>
 
-      {/* ── 3+ line wrap warning banner ────────────────────────────── */}
-      {wrapWarning && (
-        <div className="mt-3 rounded-card bg-red-500/[0.06] ring-1 ring-red-500/20 px-5 py-4 animate-fade-in">
-          <p className="text-sm font-semibold text-red-300 mb-1">
-            {wrapWarning.ids.length === 1
-              ? "1 línea ocupará 3+ renglones en el video"
-              : `${wrapWarning.ids.length} líneas ocuparán 3+ renglones en el video`}
-          </p>
-          <p className="text-xs text-red-400/70 mb-3">
-            Las líneas marcadas en rojo quedarán muy largas. Podés dividirlas ahora o continuar igual.
-          </p>
-          <div className="flex gap-3">
-            <button
-              onClick={() => {
-                // Auto-split all problematic segments
-                wrapWarning.ids.forEach((id) => splitSeg(id));
-                setWrapWarning(null);
-              }}
-              className="inline-flex items-center gap-1.5 h-9 px-4 rounded-button text-xs font-semibold
-                text-white bg-brand hover:bg-brand/90 transition-colors"
-            >
-              ✂ Auto-dividir todo
-            </button>
-            <button
-              onClick={() => {
-                setWrapWarning(null);
-                // Conserva el mismo contrato CAS que el CTA principal. Esta
-                // rama antes salteaba el flush y enviaba un edit sin revisión.
-                handleApprove();
-              }}
-              className="btn-secondary h-9 px-4 text-xs"
-            >
-              Continuar igual
-            </button>
-          </div>
-        </div>
-      )}
-
       {/* Inline preview list-only ELIMINADO 2026-05-23 — el refactor world-class
           deja el LyricVideoPreview siempre visible en la columna izquierda,
           en ambas vistas. Este bloque (que sólo aparecía en list mode cuando
           una fila tenía foco) era redundante y a veces divergía visualmente. */}
 
-      <EditorTour user={user} />
+      <ConflictDialog
+        conflict={conflictDialogOpen ? durableEditor.conflict : null}
+        onCancel={() => setConflictDialogOpen(false)}
+        onUseServer={async () => {
+          const result = await durableEditor.resolve("use_server");
+          if (!result?.ok) return;
+          const next = sanitizeSegments(result.document.segments || []);
+          setEdited(reseedPreservingIds(editedRef.current, next));
+          setIsDirty(false);
+          setSaveStatus("saved");
+          setSaveErrorReason(null);
+          setConflictDialogOpen(false);
+          trackEditorEvent("editor_conflict", { server_revision: result.document.revision, resolution: "use_server" });
+          try { if (draftKey) localStorage.removeItem(draftKey); } catch { /* best effort */ }
+        }}
+        onSaveLocal={async () => {
+          const result = await durableEditor.resolve("save_local_as_new");
+          if (!result?.ok) return;
+          const next = sanitizeSegments(result.document.segments || editedRef.current);
+          setEdited(reseedPreservingIds(editedRef.current, next));
+          setIsDirty(false);
+          setSaveStatus("saved");
+          setSaveErrorReason(null);
+          setConflictDialogOpen(false);
+          trackEditorEvent("editor_conflict", { server_revision: result.document.revision, resolution: "save_local_as_new" });
+          try { if (draftKey) localStorage.removeItem(draftKey); } catch { /* best effort */ }
+        }}
+      />
+      <WrapWarningDialog
+        warning={wrapWarning}
+        onReview={() => {
+          const firstId = wrapWarning?.ids?.[0];
+          setWrapWarning(null);
+          if (firstId == null) return;
+          setFocusedSegId(firstId);
+          window.setTimeout(() => rowRefs.current[firstId]?.scrollIntoView?.({ block: "center", behavior: "smooth" }), 0);
+        }}
+        onAutoSplit={() => {
+          wrapWarning?.ids?.forEach((id) => splitSeg(id));
+          setWrapWarning(null);
+        }}
+        onApproveAnyway={() => {
+          setWrapWarning(null);
+          handleApprove({ skipWrapWarning: true });
+        }}
+      />
+      <VersionHistory
+        open={historyOpen}
+        loadVersions={durableEditor.listVersions}
+        onClose={() => setHistoryOpen(false)}
+        onRestore={async (versionId) => {
+          const result = await durableEditor.restoreVersion(versionId);
+          if (!result?.ok) return;
+          const next = sanitizeSegments(result.document.segments || []);
+          setEdited(reseedPreservingIds(editedRef.current, next));
+          setIsDirty(false);
+          setSaveStatus("saved");
+          setHistoryOpen(false);
+          trackEditorEvent("editor_version_restored", { to_revision: result.document.revision });
+        }}
+      />
+      <EditorTour user={user} viewMode={viewMode} />
     </div>
   );
 }

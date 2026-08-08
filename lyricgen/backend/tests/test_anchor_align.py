@@ -226,3 +226,30 @@ def test_vocal_onset_anchor_when_whisperx_mishears():
     assert meta["align"]["anchors"] == 0          # no word anchors → vocal-onset path
     cuenta = next(s for s in segs if "Cuenta" in s["text"])
     assert 14.3 <= cuenta["start"] <= 15.1, f"Cuenta at {cuenta['start']} (want ~14.7)"
+
+
+# ── REJECT: modest overshoot the shared 15% default used to let through ─────
+
+def test_modest_overshoot_rejected_scaffold_gate_is_strict():
+    """Luciano Pereyra "Una Mujer Como Tu" (ft. Los Ángeles Azules, live):
+    224 s audio, scaffold ran to ~234 s. Under the shared span_gate default
+    (ratio 1.15 → a 262 s limit) that sailed through and shipped a whole song
+    of shifted lines. A scaffold maps lrclib's timeline onto THIS recording, so
+    landing past the audio end means the mapping is wrong — not a held note."""
+    pairs = _pairs(12.0, 5.5, 41)             # last line ~232s
+    wx = _wx(first_word=12.0, last_word=213.0)
+    segs, meta = build_synced_scaffold(pairs, wx, 224.0,
+                                       vocal_regions=[(10.0, 215.0)])
+    assert segs is None, f"expected rejection, got {len(segs or [])} lines"
+    assert meta["reason"].startswith("span_gate")
+
+
+def test_scaffold_ending_within_the_audio_still_accepted():
+    """Non-regression for the tightened ratio: a scaffold that fits must pass,
+    including the synthetic +3 s tail this builder gives its last line."""
+    pairs = _pairs(10.0, 6.5, 30)             # last line ~198.5s (+3s tail)
+    wx = _wx(first_word=10.0, last_word=205.0)
+    segs, meta = build_synced_scaffold(pairs, wx, 210.0,
+                                       vocal_regions=[(8.0, 206.0)])
+    assert segs is not None, meta
+    assert meta["reason"] == "ok"

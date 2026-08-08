@@ -123,12 +123,32 @@ def test_edit_pipeline_invalidates_and_rewarms_prores():
     assert "remove_s3_keys(job_id, [\"umg_master\", \"umg_short\"])" in src, (
         "edit pipeline must drop the stale ProRes s3_keys"
     )
-    assert "enqueue_prores_prewarm(job_id, \"umg_master\")" in src, (
-        "edit pipeline must re-warm the ProRes master after invalidation"
+    assert "enqueue_prores_prewarm(job_id, \"umg_master\", force=True)" in src, (
+        "edit pipeline must re-warm the ProRes master after invalidation "
+        "(force=True: the portal has no lazy re-transcode fallback, so "
+        "queue-depth backpressure must not silently skip it)"
     )
     # The stale local .mov is unlinked so check_prores_readiness step 1
     # (local-disk hit) can't serve it.
     assert "os.unlink(_stale)" in src
+
+
+def test_edit_pipeline_invalidation_gated_on_prores_not_delivery_profile():
+    """2026-08-03 incident: a job with umg_spec but delivery_profile="youtube"
+    kept a stale ProRes on the portal across edits because the invalidation
+    block was gated on wants_umg. It must gate on the job actually HAVING a
+    ProRes deliverable (umg_spec / a .mov s3_key), independent of profile."""
+    import pipeline
+    src = inspect.getsource(pipeline.run_edit_pipeline)
+    # The flag is derived from umg_spec / prior ProRes keys, not delivery_profile.
+    assert "has_prores_deliverable = bool(umg_spec)" in src, (
+        "invalidation must key off ProRes deliverables, not delivery_profile"
+    )
+    # And the invalidation block fires on it (not on wants_umg alone).
+    assert "if wants_umg or has_prores_deliverable:" in src, (
+        "the ProRes invalidation/re-warm block must fire whenever the job has "
+        "a ProRes deliverable, regardless of delivery_profile"
+    )
 
 
 def test_edit_pipeline_cancels_inflight_prewarm():

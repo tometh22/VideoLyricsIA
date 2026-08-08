@@ -132,6 +132,7 @@ const FLAGS = {
   dashboard: "genly_tour_dashboard_done",
   upload:    "genly_tour_upload_done",
   editor:    "genly_tour_editor_done",
+  editorTiming: "genly_tour_editor_timing_v2_done",
   // jobdetail covers the approval workflow + ProRes download. Fires
   // when the user lands on a pending_review job — that's the moment
   // those affordances actually exist on screen.
@@ -358,7 +359,7 @@ export function UploadTour({ user, forceRun = false, onDone }) {
       target: '[data-tour="upload-cta-bar"]',
       title: t("tour.upload_cta_title") || "¿Revisar o generar directo?",
       content: t("tour.upload_cta_body") ||
-        "'Revisar lyrics' te deja editar timestamps antes del render. 'Generar directo' salta esa edición.",
+        "'Revisar letra' te deja corregir antes del render. 'Generar directo' salta esa edición.",
       placement: "top",
     },
   ], [t]);
@@ -366,51 +367,29 @@ export function UploadTour({ user, forceRun = false, onDone }) {
 }
 
 // ─── Tour 3: Lyrics Editor ───────────────────────────────────────
-export function EditorTour({ user, forceRun = false, onDone }) {
+export function EditorTour({ user, viewMode = "basic", forceRun = false, onDone }) {
   const { t } = useI18n();
   const steps = useMemo(() => [
     {
-      target: '[data-tour="editor-playbar"]',
-      title: t("tour.editor_playbar_title") || "Reproducción",
-      content: t("tour.editor_playbar_body") ||
-        "Apretá Play para escuchar. Espacio = play/pause. Mientras suena, la línea actual se resalta.",
+      target: '[data-testid="timeline-lane"]',
+      title: "Reproducí desde cualquier punto",
+      content: "Hacé click en una zona vacía de la línea de tiempo para escuchar desde ahí.",
       disableBeacon: true,
       placement: "bottom",
     },
     {
-      target: '[data-tour="editor-list-row"]',
-      title: t("tour.editor_list_title") || "Tus líneas",
-      content: t("tour.editor_list_body") ||
-        "Click un timestamp para saltar a ese momento. Doble click para editarlo a mano.",
+      target: '[data-testid="timeline-selection-help"]',
+      title: "Pintá tu selección",
+      content: "Mantené el click y pintá varias filas. También podés usar Cmd/Ctrl+click o Shift+click.",
     },
     {
-      target: '[data-tour="editor-sync-entry"]',
-      title: t("tour.editor_sync_title") || "Modo Sync",
-      content: t("tour.editor_sync_body") ||
-        "Si necesitás ajustar los tiempos, click acá. Apretás Espacio cuando arranca cada línea y se sincronizan en vivo.",
-    },
-    {
-      target: '[data-tour="editor-row-sync"]',
-      title: t("tour.editor_row_sync_title") || "Sync desde acá",
-      content: t("tour.editor_row_sync_body") ||
-        "Hover una línea, click el target 🎯 y arrancás Sync desde ahí. Las anteriores quedan intactas.",
-    },
-    {
-      target: '[data-tour="editor-add-line"]',
-      title: t("tour.editor_add_title") || "Líneas faltantes",
-      content: t("tour.editor_add_body") ||
-        "¿Faltó una repetición del estribillo? Duplicá una línea (📋 al hover) o agregá una vacía abajo y tipeá.",
-      placement: "top",
-    },
-    {
-      target: '[data-tour="editor-approve"]',
-      title: t("tour.editor_approve_title") || "Aprobar y generar",
-      content: t("tour.editor_approve_body") ||
-        "Cuando esté listo, aprobás y se renderiza el video final. Listo para descargar.",
-      placement: "left",
+      target: '[data-testid="timeline-segment"]',
+      title: "Mové el grupo junto",
+      content: "Arrastrá cualquier bloque seleccionado. Los bordes ajustan entrada y salida con precisión.",
     },
   ], [t]);
-  return <TourRunner flagKey={FLAGS.editor} steps={steps} user={user} forceRun={forceRun} onDone={onDone} />;
+  if (viewMode !== "advanced") return null;
+  return <TourRunner flagKey={FLAGS.editorTiming} steps={steps} user={user} forceRun={forceRun} onDone={onDone} />;
 }
 
 // ─── Tour 4: Job Detail (approval + delivery) ────────────────────

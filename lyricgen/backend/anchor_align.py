@@ -370,9 +370,19 @@ def build_synced_scaffold(
     # ── Validation ────────────────────────────────────────────────────────
     # 1) span gate: the scaffold must not overshoot the recording (foreign /
     #    longer edit — cumbia 248 s on 169 s audio).
+    #    STRICTER than the shared default (ratio 1.15 → 1.0) since 2026-08-05.
+    #    The generic gate tolerates 15% of slack because a *transcribed*
+    #    candidate can legitimately hold a final word; a scaffold cannot — its
+    #    lines are lrclib's timeline mapped onto THIS recording, so any line
+    #    landing past the audio end means the mapping is wrong, not that the
+    #    singer held a note. Luciano Pereyra "Una Mujer Como Tu" (ft. Los
+    #    Ángeles Azules, live): 224 s audio, scaffold ran to 233.8 s and passed
+    #    at the 262 s default limit, shipping a whole song of shifted lines. The
+    #    5 s pad still absorbs the synthetic +3 s tail this builder gives the
+    #    last line.
     try:
         from timing_confidence import span_gate
-        sv = span_gate(segs, audio_dur)
+        sv = span_gate(segs, audio_dur, overshoot_ratio=1.0, overshoot_pad=5.0)
         if not sv.ok and sv.reason != "no_duration":
             meta["reason"] = f"span_gate:{sv.reason}"
             return None, meta
