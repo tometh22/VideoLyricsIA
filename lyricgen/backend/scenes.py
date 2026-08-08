@@ -435,6 +435,14 @@ def _cap_unique_scenes(sections: list[Section]) -> list[Section]:
 # Solo afecta el camino Auto: una elección explícita del operador (incluido
 # "estandar", que pide variación por sección) sigue mandando. Poner
 # `BG_DEFAULT_MOVEMENT=""` restaura el comportamiento anterior.
+#
+# ⚠️ OJO al activar `VEO_MODEL_STATIC`: `pipeline._generate_veo_video` rutea
+# los renders "estatico"/"foto-estatica" a ese modelo, que sigue mejor la
+# consigna de cámara fija pero cuesta ~4x ($3,20 vs $0,80). Cuando esa
+# variable se pensó, "estatico" era una elección explícita y rara; con este
+# default pasa a ser el camino del ~86% de los jobs. Hoy la var está VACÍA en
+# staging y en prod (verificado ago-2026), así que no hay impacto — pero
+# activarla ahora multiplicaría el costo de casi todo, no de unos pocos.
 DEFAULT_MOVEMENT_WHEN_AUTO = os.environ.get(
     "BG_DEFAULT_MOVEMENT", "estatico"
 ).strip().lower()
