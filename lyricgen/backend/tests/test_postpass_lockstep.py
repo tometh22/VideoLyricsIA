@@ -82,3 +82,22 @@ def test_todo_camino_corre_los_postpases_nuevos_en_orden():
                 assert calls[req] < calls["_fmt"], (
                     f"{fname}:{func}: {req} debe correr ANTES del formatter "
                     f"(el formatter debe ver los carteles finales)")
+
+
+def test_todo_camino_pasa_el_idioma_resuelto_al_filtro_de_adlibs():
+    """No post-pass may silently fall back to Spanish in auto mode."""
+    for fname in ("main.py", "transcription_worker.py"):
+        tree = ast.parse((BACKEND / fname).read_text())
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and (getattr(node.func, "id", None)
+                 or getattr(node.func, "attr", None)) == "_maybe_adlib_filter"
+        ]
+        assert calls, f"{fname}: falta _maybe_adlib_filter"
+        for call in calls:
+            keywords = {kw.arg for kw in call.keywords}
+            assert "language" in keywords, (
+                f"{fname}:{call.lineno}: _maybe_adlib_filter debe recibir "
+                "el idioma resuelto"
+            )

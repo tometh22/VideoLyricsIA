@@ -132,17 +132,16 @@ describe("persistSegments — contrato real (sin eco a currentReview)", () => {
     });
   });
 
-  it("overwrite consulta /status de nuevo antes de guardar", async () => {
-    authFetch
-      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ segments_revision: 7 }) })
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        clone: () => ({ json: async () => ({ applied: true, revision: 8 }) }),
-      });
+  it("nunca obtiene una revisión fresca para sobrescribir un conflicto", async () => {
+    authFetch.mockResolvedValue({
+      ok: false,
+      status: 409,
+      clone: () => ({ json: async () => ({ current_revision: 7 }) }),
+    });
     const result = await persist("abc123", SEGMENTS, { baseRevision: 3, resolveConflict: true });
-    expect(authFetch.mock.calls[0][0]).toBe(`${API}/status/abc123`);
-    expect(JSON.parse(authFetch.mock.calls[1][1].body).base_revision).toBe(7);
-    expect(result.revision).toBe(8);
+    expect(authFetch).toHaveBeenCalledTimes(1);
+    expect(authFetch.mock.calls[0][0]).toBe(`${API}/jobs/abc123/save-segments`);
+    expect(JSON.parse(authFetch.mock.calls[0][1].body).base_revision).toBe(3);
+    expect(result).toMatchObject({ ok: false, reason: "stale-revision", currentRevision: 7 });
   });
 });

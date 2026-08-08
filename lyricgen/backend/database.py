@@ -545,6 +545,14 @@ class Job(Base):
         "AIProvenance", back_populates="job", lazy="dynamic",
         cascade="all, delete-orphan",
     )
+    editor_document = relationship(
+        "EditorDocument", back_populates="job", uselist=False,
+        cascade="all, delete-orphan",
+    )
+    editor_versions = relationship(
+        "EditorVersion", back_populates="job", lazy="dynamic",
+        cascade="all, delete-orphan",
+    )
 
     def to_dict(self):
         s3 = self.s3_keys or {}
@@ -646,6 +654,67 @@ class Job(Base):
             # pesa en jobs con Escenas; los normales llevan null.
             "scene_plan": self.scene_plan,
         }
+
+
+class EditorDocument(Base):
+    """Durable editor working copy layered over the legacy Job snapshot."""
+    __tablename__ = "editor_documents"
+
+    job_id = Column(
+        String(12), ForeignKey("jobs.job_id", ondelete="CASCADE"), primary_key=True,
+    )
+    tenant_id = Column(String(100), nullable=False, index=True)
+    current_segments = Column(JSONB, nullable=False)
+    original_segments = Column(JSONB, nullable=False)
+    revision = Column(Integer, nullable=False, default=0, server_default="0")
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    lock_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    lock_expires_at = Column(DateTime(timezone=True), nullable=True)
+
+    job = relationship("Job", back_populates="editor_document")
+
+
+class EditorVersion(Base):
+    """Immutable editor checkpoints; approved snapshots are never pruned."""
+    __tablename__ = "editor_versions"
+    __table_args__ = (
+        Index("ix_editor_versions_job_revision", "job_id", "revision", unique=True),
+        Index("ix_editor_versions_job_created", "job_id", "created_at"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    job_id = Column(
+        String(12), ForeignKey("jobs.job_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    tenant_id = Column(String(100), nullable=False, index=True)
+    revision = Column(Integer, nullable=False)
+    segments = Column(JSONB, nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    reason = Column(String(20), nullable=False, default="autosave")
+    is_approved = Column(Boolean, nullable=False, default=False, server_default="false")
+
+    job = relationship("Job", back_populates="editor_versions")
+
+
+class ProductEvent(Base):
+    """Privacy-safe editor telemetry; never stores lyric text or audio."""
+    __tablename__ = "product_events"
+    __table_args__ = (
+        Index("ix_product_events_tenant_created", "tenant_id", "created_at"),
+        Index("ix_product_events_name_created", "name", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    job_id = Column(String(12), nullable=True, index=True)
+    name = Column(String(80), nullable=False, index=True)
+    occurred_at = Column(DateTime(timezone=True), nullable=True)
+    properties = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
 class Delivery(Base):

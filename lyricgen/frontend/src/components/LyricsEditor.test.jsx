@@ -211,6 +211,149 @@ describe("LyricsEditor — recuperación de audio remoto post-mount", () => {
   });
 });
 
+describe("LyricsEditor — advanced shell and timing safety", () => {
+  it("keeps the advanced shell explicit while audio is loading and offers a basic-view escape", async () => {
+    render(<LyricsEditor {...baseProps({ audioLoading: true, audioUrl: null })} />);
+
+    await userEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+
+    expect(screen.getByTestId("advanced-workspace-shell")).toBeInTheDocument();
+    expect(screen.getByTestId("advanced-audio-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("advanced-audio-unavailable")).toBeNull();
+    expect(screen.queryByDisplayValue("alpha line")).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "Volver a Revisar letra" }));
+    expect(screen.getByRole("tab", { name: "Revisar letra" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByDisplayValue("alpha line")).toBeInTheDocument();
+  });
+
+  it("shows an unavailable-audio state instead of silently falling back to the basic list", async () => {
+    render(<LyricsEditor {...baseProps({ audioLoading: false, audioUrl: null })} />);
+
+    await userEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+
+    expect(screen.getByTestId("advanced-audio-unavailable")).toBeInTheDocument();
+    expect(screen.getByText(/No se puede ajustar tiempos sin audio/i)).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("alpha line")).toBeNull();
+  });
+
+  it("rejects partial timestamps and never sends non-finite timings on approve or autosave", async () => {
+    const onApprove = vi.fn();
+    const onPersistSegments = vi.fn().mockResolvedValue({ ok: true });
+    render(<LyricsEditor {...baseProps({
+      segments: [
+        { start: "12abc", end: "bad", text: "kept" },
+        { start: "1:02.5xyz", end: "1:04.5", text: "second" },
+      ],
+      onApprove,
+      onPersistSegments,
+      transcribeJobId: "job-timing-safety",
+    })} />);
+
+    const kept = screen.getByDisplayValue("kept");
+    expect(kept).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Aprobar/i }));
+
+    expect(onApprove).toHaveBeenCalledOnce();
+    const approved = onApprove.mock.calls[0][0];
+    expect(approved).toHaveLength(2);
+    approved.forEach((segment) => {
+      expect(Number.isFinite(segment.start)).toBe(true);
+      expect(Number.isFinite(segment.end)).toBe(true);
+    });
+    expect(approved[0].start).toBe(0);
+    expect(approved[0].end).toBeGreaterThanOrEqual(0.3);
+    expect(approved[1].start).toBe(0);
+    expect(approved[1].end).toBeGreaterThan(approved[1].start);
+
+    window.dispatchEvent(new Event("pagehide"));
+    expect(onPersistSegments).toHaveBeenCalled();
+    const saved = onPersistSegments.mock.calls.at(-1)[1];
+    saved.forEach((segment) => {
+      expect(Number.isFinite(segment.start)).toBe(true);
+      expect(Number.isFinite(segment.end)).toBe(true);
+    });
+  });
+});
+
+describe("LyricsEditor — aprobación con advertencia de tipografía", () => {
+  const oversizedLine = Array.from({ length: 80 }, () => "palabra").join(" ");
+
+  it("muestra la decisión en un diálogo visible y permite aprobar igualmente", async () => {
+    const onApprove = vi.fn();
+    render(<LyricsEditor {...baseProps({
+      segments: [{ start: 1, end: 8, text: oversizedLine }],
+      fontScale: 1.5,
+      disableAutoSplit: true,
+      onApprove,
+    })} />);
+
+    await userEvent.click(screen.getByRole("button", { name: /Aprobar y generar/i }));
+
+    const dialog = screen.getByRole("dialog", { name: /Una línea puede ocupar 3 renglones/i });
+    expect(dialog).toBeVisible();
+    expect(dialog.parentElement.className).toContain("fixed");
+    expect(onApprove).not.toHaveBeenCalled();
+
+    await userEvent.click(within(dialog).getByRole("button", { name: "Aprobar igualmente" }));
+    expect(onApprove).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("dialog", { name: /puede ocupar 3 renglones/i })).toBeNull();
+  });
+
+  it("permite volver a revisar sin perder la línea afectada", async () => {
+    render(<LyricsEditor {...baseProps({
+      segments: [{ start: 1, end: 8, text: oversizedLine }],
+      fontScale: 1.5,
+      disableAutoSplit: true,
+    })} />);
+
+    await userEvent.click(screen.getByRole("button", { name: /Aprobar y generar/i }));
+    await userEvent.click(screen.getByRole("button", { name: "Seguir revisando" }));
+
+    expect(screen.queryByRole("dialog", { name: /puede ocupar 3 renglones/i })).toBeNull();
+    expect(screen.getByDisplayValue(oversizedLine)).toBeInTheDocument();
+  });
+});
+
+describe("LyricsEditor — structural mutations share undo and save behavior", () => {
+  const structuralProps = (overrides = {}) => baseProps({
+    segments: [
+      { start: 1, end: 2, text: "alpha" },
+      { start: 4, end: 5, text: "beta" },
+    ],
+    transcribeJobId: "job-structural-mutations",
+    onPersistSegments: vi.fn().mockResolvedValue({ ok: true }),
+    ...overrides,
+  });
+
+  it.each([
+    ["delete", "Eliminar línea", "alpha"],
+    ["duplicate", /Duplicar línea/, "alpha"],
+  ])("%s records an undo snapshot", async (_name, title, text) => {
+    render(<LyricsEditor {...structuralProps()} />);
+    await userEvent.click(screen.getAllByTitle(title)[0]);
+    expect(screen.queryAllByDisplayValue(text)).toHaveLength(_name === "duplicate" ? 2 : 0);
+
+    fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+    expect(screen.getAllByDisplayValue(text)).toHaveLength(1);
+  });
+
+  it("add blank and insert-after both become undoable edits", async () => {
+    render(<LyricsEditor {...structuralProps()} />);
+    const before = segmentsStore.get("job-structural-mutations").length;
+
+    await userEvent.click(screen.getByRole("button", { name: /Agregar línea/i }));
+    expect(segmentsStore.get("job-structural-mutations")).toHaveLength(before + 1);
+    fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+    expect(segmentsStore.get("job-structural-mutations")).toHaveLength(before);
+
+    await userEvent.click(screen.getAllByTitle(/Insertar línea acá/i)[0]);
+    expect(segmentsStore.get("job-structural-mutations")).toHaveLength(before + 1);
+    fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+    expect(segmentsStore.get("job-structural-mutations")).toHaveLength(before);
+  });
+});
+
 
 describe("LyricsEditor — reemplazo externo post-mount (ex prop-sync B7)", () => {
   // HISTORIA: B7 (2026-05-18) era "el prop `segments` cambió → re-seed".
@@ -420,9 +563,13 @@ describe("LyricsEditor — modo enfoque body class broadcast", () => {
     // Default OFF — la clase no debe estar al montar.
     expect(document.body.classList.contains("editor-focus-mode")).toBe(false);
 
-    // Abrí el menú ⋯ y clic en "Expandir (modo enfoque)".
+    // La vista básica mantiene la barra despejada; los controles avanzados
+    // viven en "Ajustar tiempos".
+    await userEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+
+    // Abrí Herramientas y entrá al espacio de trabajo expandido.
     await userEvent.click(screen.getByTestId("editor-overflow-btn"));
-    await userEvent.click(screen.getByText(/Expandir \(modo enfoque\)/i));
+    await userEvent.click(screen.getByText(/Trabajar a pantalla completa/i));
     expect(document.body.classList.contains("editor-focus-mode")).toBe(true);
 
     // Reabrí el menú — el item ahora dice "Salir de modo enfoque".
@@ -436,8 +583,9 @@ describe("LyricsEditor — modo enfoque body class broadcast", () => {
     const { unmount } = render(<LyricsEditor {...props} />);
 
     // Prendé focus mode desde el menú ⋯.
+    await userEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
     await userEvent.click(screen.getByTestId("editor-overflow-btn"));
-    await userEvent.click(screen.getByText(/Expandir \(modo enfoque\)/i));
+    await userEvent.click(screen.getByText(/Trabajar a pantalla completa/i));
     expect(document.body.classList.contains("editor-focus-mode")).toBe(true);
 
     // Operador navega a otro step / cambia de pantalla — el editor
@@ -561,7 +709,7 @@ describe("LyricsEditor — durable save on page unload (refresh/close) (2026-06-
     expect(onPersistSegments).toHaveBeenCalledTimes(1);
     const [jobId, segments, opts] = onPersistSegments.mock.calls[0];
     expect(jobId).toBe("job-1");
-    expect(segments).toEqual([{ start: 1.0, end: 2.0, text: "alpha EDITED" }]);
+    expect(segments).toEqual([{ _id: 0, start: 1.0, end: 2.0, text: "alpha EDITED" }]);
     expect(opts).toMatchObject({ keepalive: true, baseRevision: 0 });
   });
 

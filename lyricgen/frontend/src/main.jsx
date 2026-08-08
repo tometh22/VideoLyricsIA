@@ -31,16 +31,38 @@ initSentry();
 // es hacer reload al toque para forzar el browser a re-bajar el index.js
 // nuevo + el chunk con el hash correcto. El operador ve un flash de la
 // página + recarga limpia — mucho mejor que el error fullscreen.
+//
+// Cubre tanto el chunk JS ("Failed to fetch dynamically imported module")
+// como el CSS asociado ("Unable to preload CSS for /assets/X.css",
+// Sentry #31): ambos llegan por el mismo evento.
 window.addEventListener("vite:preloadError", (event) => {
   // Evitar reloads en loop: usar sessionStorage como circuit breaker.
   // Si ya recargamos por este motivo en los últimos 10s, no insistir
   // (puede ser un problema de red real, no un stale bundle).
   const last = parseInt(sessionStorage.getItem("__vite_reload_at") || "0", 10);
   if (Date.now() - last < 10_000) {
-    // ya intentamos hace poco, dejar que el GlobalErrorBoundary muestre
-    // el error para que el operador vea algo más que un flash infinito.
+    // ya intentamos hace poco, dejar que el error se propague al
+    // GlobalErrorBoundary para que el operador vea algo más que un flash
+    // infinito. NO llamamos preventDefault: queremos que Vite re-lance.
     return;
   }
+  // NO llamar event.preventDefault() acá. Cancelar el evento hace que el
+  // helper __vitePreload de Vite NO re-lance el error → la promesa del
+  // import() lazy RESUELVE con `undefined` en vez de rejectar. Entonces
+  // React.lazy hace `undefined.default` y tira "Cannot read properties of
+  // undefined (reading 'default')" — un error que GlobalErrorBoundary NO
+  // reconoce como stale-bundle (isStaleBundleError busca "failed to fetch
+  // dynamically imported module", no "default"), así que muestra el cartel
+  // rojo genérico "Algo salió mal" en vez del amber "Nueva versión
+  // disponible", y encima le gana la carrera al reload → operador trabado.
+  // (Regresión introducida por #1062, reportada en staging 2026-08-05.)
+  //
+  // Dejando que Vite re-lance: el import() rejecta con "Failed to fetch
+  // dynamically imported module", React.lazy lo re-tira, GlobalErrorBoundary
+  // lo detecta como stale-bundle (fallback amigable) mientras el reload de
+  // abajo ya está en vuelo. El ruido en Sentry que motivó el preventDefault
+  // ya lo cubre observability.js (ignoreErrors: /Failed to fetch dynamically
+  // imported module/i + /Unable to preload CSS/i).
   sessionStorage.setItem("__vite_reload_at", String(Date.now()));
   console.warn("[stale-bundle] vite:preloadError detected, forcing reload", event);
   window.location.reload();

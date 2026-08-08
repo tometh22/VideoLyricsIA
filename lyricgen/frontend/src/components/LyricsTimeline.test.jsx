@@ -1,9 +1,3 @@
-// Component tests for LyricsTimeline — the visual per-line timings editor.
-// Covers the key contract: a click focuses+seeks (no edit), a drag commits
-// a new timing via onTimingChange (which the parent stamps `locked`), and
-// Reset is wired. Full pixel-accurate drag math isn't asserted (jsdom
-// getBoundingClientRect is zeroed); we assert the callbacks fire with the
-// right segment identity and direction.
 import { render, screen, cleanup, fireEvent } from "@testing-library/react";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import LyricsTimeline from "./LyricsTimeline";
@@ -27,7 +21,9 @@ function setup(overrides = {}) {
     onSeek: vi.fn(),
     onDragStart: vi.fn(),
     onTimingChange: vi.fn(),
+    onTimingChangeBatch: vi.fn(),
     onTextChange: vi.fn(),
+    onDeleteSelection: vi.fn(() => true),
     onFocus: vi.fn(),
     onReset: vi.fn(),
     ...overrides,
@@ -36,246 +32,253 @@ function setup(overrides = {}) {
   return props;
 }
 
-it("renders a block per segment with its text", () => {
-  setup();
-  expect(screen.getByText("primera línea")).toBeInTheDocument();
-  expect(screen.getByText("segunda línea")).toBeInTheDocument();
-  expect(screen.getByText("tercera línea")).toBeInTheDocument();
-});
+describe("LyricsTimeline", () => {
+  it("renders one horizontal block per segment", () => {
+    setup();
+    expect(screen.getAllByText("primera línea").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("segunda línea").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("tercera línea").length).toBeGreaterThan(0);
+  });
 
-it("Reset button calls onReset", () => {
-  const props = setup();
-  fireEvent.click(screen.getByText("Resetear timings"));
-  expect(props.onReset).toHaveBeenCalledTimes(1);
-});
+  it("keeps blocks visible when API timings arrive as strings", () => {
+    setup({
+      segments: [
+        { _id: "a", start: "13.2", end: "15.8", text: "línea desde API" },
+      ],
+    });
+    const block = screen.getAllByTestId("timeline-segment")[0];
+    const zoom = Number(screen.getByTestId("timeline-lane").dataset.pxPerSec);
+    expect(block).toBeInTheDocument();
+    expect(parseFloat(block.style.left)).toBeCloseTo(13.2 * zoom, 5);
+    expect(parseFloat(block.style.width)).toBeCloseTo(2.6 * zoom, 5);
+  });
 
-it("offers fit/detail presets and an accessible song minimap", () => {
-  setup();
-  expect(screen.getByText("32 px/s")).toBeInTheDocument();
-  fireEvent.click(screen.getByText("Ajustar"));
-  expect(screen.getByText("8 px/s")).toBeInTheDocument();
-  fireEvent.click(screen.getByText("Detalle"));
-  expect(screen.getByText("32 px/s")).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: /Mini-mapa de la canción/i })).toBeInTheDocument();
-});
+  it("seeks when clicking anywhere on the empty timeline", () => {
+    const props = setup();
+    const lane = screen.getByTestId("timeline-lane");
+    fireEvent.pointerDown(lane, { clientX: 300, clientY: 10, pointerId: 1, button: 0 });
+    fireEvent.pointerUp(lane, { clientX: 300, clientY: 10, pointerId: 1, button: 0 });
+    expect(props.onSeek).toHaveBeenCalledTimes(1);
+    const zoom = Number(lane.dataset.pxPerSec);
+    expect(props.onSeek.mock.calls[0][0]).toBeCloseTo(300 / zoom, 2);
+  });
 
-it("a click (no movement) focuses + seeks to the clicked point, no edit", () => {
-  const props = setup();
-  const block = screen.getByText("segunda línea").closest("div[title]");
-  // Vertical: clientY → time. jsdom rect.top is 0, so time = clientY/pxPerSec.
-  fireEvent.pointerDown(block, { clientY: 100, pointerId: 1 });
-  fireEvent.pointerUp(block, { clientY: 100, pointerId: 1 });
-  expect(props.onFocus).toHaveBeenCalledWith(1);
-  expect(props.onSeek).toHaveBeenCalledTimes(1);
-  expect(props.onSeek.mock.calls[0][0]).toBeCloseTo(100 / 32, 2); // ZOOM_DEFAULT=32
-  expect(props.onTimingChange).not.toHaveBeenCalled();
-});
+  it("opens at an editing zoom instead of compressing the full song", () => {
+    setup();
+    const lane = screen.getByTestId("timeline-lane");
+    expect(Number(lane.dataset.pxPerSec)).toBe(48);
+    expect(screen.getByRole("button", { name: "Ver canción completa" })).toBeInTheDocument();
+  });
 
-it("dragging commits a new timing via onTimingChange + pushes one undo snapshot", () => {
-  const props = setup();
-  const block = screen.getByText("segunda línea").closest("div[title]");
-  // Vertical drag: drag DOWN (later in time) past the click slop.
-  fireEvent.pointerDown(block, { clientY: 100, pointerId: 1 });
-  fireEvent.pointerMove(block, { clientY: 160, pointerId: 1 }); // +60px = +1.5s @40px/s
-  fireEvent.pointerUp(block, { clientY: 160, pointerId: 1 });
-  expect(props.onDragStart).toHaveBeenCalledTimes(1);
-  expect(props.onTimingChange).toHaveBeenCalledTimes(1);
-  const [id, newStart, newEnd] = props.onTimingChange.mock.calls[0];
-  expect(id).toBe(1);
-  expect(newStart).toBeGreaterThan(10); // moved later
-  expect(newEnd).toBeGreaterThan(11);
-  expect(props.onFocus).not.toHaveBeenCalled();
-});
+  it("delegates vertical scrolling to the editor and keeps horizontal timeline scroll", () => {
+    setup();
+    const scroll = screen.getByTestId("timeline-scroll");
+    expect(scroll).toHaveAttribute("data-scroll-owner", "horizontal-only");
+    expect(scroll.className).toContain("overflow-x-auto");
+    expect(scroll.className).toContain("overflow-y-hidden");
+    expect(scroll.style.maxHeight).toBe("");
+  });
 
-it("double-click on a line's text edits it inline and commits via onTextChange (no view switch)", () => {
-  const props = setup();
-  const span = screen.getByText("segunda línea");
-  fireEvent.doubleClick(span);
-  const input = screen.getByDisplayValue("segunda línea");
-  fireEvent.change(input, { target: { value: "segunda línea corregida" } });
-  fireEvent.keyDown(input, { key: "Enter" });
-  expect(props.onTextChange).toHaveBeenCalledWith(1, "segunda línea corregida");
-});
+  it("clicking a line focuses it and seeks without editing its timing", () => {
+    const props = setup();
+    const block = screen.getAllByTestId("timeline-segment")[1];
+    const body = block.querySelector('[data-testid="timeline-segment-body"]');
+    fireEvent.pointerDown(body, { clientX: 1000, pointerId: 1, button: 0 });
+    fireEvent.pointerUp(body, { clientX: 1000, pointerId: 1, button: 0 });
+    expect(props.onFocus).toHaveBeenCalledWith(1);
+    expect(props.onSeek).toHaveBeenCalledTimes(1);
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+  });
 
-it("Escape cancels an inline text edit without committing", () => {
-  const props = setup();
-  fireEvent.doubleClick(screen.getByText("segunda línea"));
-  const input = screen.getByDisplayValue("segunda línea");
-  fireEvent.change(input, { target: { value: "descartar" } });
-  fireEvent.keyDown(input, { key: "Escape" });
-  expect(props.onTextChange).not.toHaveBeenCalled();
-  expect(screen.getByText("segunda línea")).toBeInTheDocument();
-});
+  it("dragging a line commits a horizontal timing change and one undo snapshot", () => {
+    const props = setup();
+    const block = screen.getAllByTestId("timeline-segment")[1];
+    const body = block.querySelector('[data-testid="timeline-segment-body"]');
+    fireEvent.pointerDown(body, { clientX: 900, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(body, { clientX: 1080, pointerId: 1 });
+    fireEvent.pointerUp(body, { clientX: 1080, pointerId: 1 });
+    expect(props.onDragStart).toHaveBeenCalledTimes(1);
+    expect(props.onTimingChange).toHaveBeenCalledTimes(1);
+    const [id, newStart, newEnd] = props.onTimingChange.mock.calls[0];
+    expect(id).toBe(1);
+    expect(newStart).toBeGreaterThan(10);
+    expect(newEnd).toBeGreaterThan(11);
+  });
 
-it("zoom + makes blocks taller (vertical px/s geometry)", () => {
-  setup();
-  const block = () => screen.getByText("segunda línea").closest("div[title]");
-  const hBefore = parseFloat(block().style.height);
-  fireEvent.click(screen.getByLabelText("Acercar"));
-  const hAfter = parseFloat(block().style.height);
-  expect(hAfter).toBeGreaterThan(hBefore);
-});
+  it("Cmd/Ctrl-click toggles lines and dragging the group commits one batch", () => {
+    const props = setup();
+    const [first, second] = screen.getAllByTestId("timeline-segment");
+    const firstBody = first.querySelector('[data-testid="timeline-segment-body"]');
+    const secondBody = second.querySelector('[data-testid="timeline-segment-body"]');
 
-it("shows the save-status chip", () => {
-  cleanup();
-  setup({ saveStatus: "saving" });
-  expect(screen.getByText("Guardando…")).toBeInTheDocument();
-  cleanup();
-  setup({ saveStatus: "saved" });
-  expect(screen.getByText("Guardado")).toBeInTheDocument();
-});
+    fireEvent.pointerDown(firstBody, { clientX: 100, pointerId: 1, button: 0, metaKey: true });
+    fireEvent.pointerUp(firstBody, { clientX: 100, pointerId: 1, button: 0, metaKey: true });
+    fireEvent.pointerDown(secondBody, { clientX: 950, pointerId: 2, button: 0, ctrlKey: true });
+    fireEvent.pointerUp(secondBody, { clientX: 950, pointerId: 2, button: 0, ctrlKey: true });
 
-it("renders a waveform canvas when a waveform prop is provided", () => {
-  cleanup();
-  const { container } = render(
-    <LyricsTimeline
-      segments={SEGS}
-      duration={60}
-      currentTime={5}
-      activeId={null}
-      focusedSegId={null}
-      highlightedIds={new Set()}
-      waveform={{ peaks: [0.1, 0.9, 0.4, 0.2], duration: 60 }}
-      onSeek={vi.fn()}
-      onDragStart={vi.fn()}
-      onTimingChange={vi.fn()}
-      onFocus={vi.fn()}
-      onReset={vi.fn()}
-    />
-  );
-  expect(container.querySelector("canvas")).toBeInTheDocument();
-});
+    expect(screen.getByText("2 líneas")).toBeInTheDocument();
+    fireEvent.pointerDown(firstBody, { clientX: 100, pointerId: 3, button: 0 });
+    fireEvent.pointerMove(firstBody, { clientX: 190, pointerId: 3 });
+    fireEvent.pointerUp(firstBody, { clientX: 190, pointerId: 3 });
 
-it("renders without a canvas (graceful) when no waveform is provided", () => {
-  cleanup();
-  const { container } = render(
-    <LyricsTimeline
-      segments={SEGS}
-      duration={60}
-      currentTime={5}
-      activeId={null}
-      focusedSegId={null}
-      highlightedIds={new Set()}
-      onSeek={vi.fn()}
-      onDragStart={vi.fn()}
-      onTimingChange={vi.fn()}
-      onFocus={vi.fn()}
-      onReset={vi.fn()}
-    />
-  );
-  // No waveform → no canvas, but the timeline (blocks) still renders.
-  expect(container.querySelector("canvas")).not.toBeInTheDocument();
-  expect(screen.getByText("primera línea")).toBeInTheDocument();
-});
+    expect(props.onTimingChangeBatch).toHaveBeenCalledTimes(1);
+    expect(props.onTimingChangeBatch.mock.calls[0][0]).toHaveLength(2);
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+  });
 
-it("locked / dragged block does not crash without setPointerCapture (jsdom)", () => {
-  // jsdom elements lack setPointerCapture; the component must tolerate it.
-  const props = setup({ segments: [{ _id: 0, start: 0, end: 2, text: "x", locked: true }] });
-  const block = screen.getByText("x").closest("div[title]");
-  expect(() => {
-    fireEvent.pointerDown(block, { clientY: 50, pointerId: 1 });
-    fireEvent.pointerUp(block, { clientY: 50, pointerId: 1 });
-  }).not.toThrow();
-  expect(props.onFocus).toHaveBeenCalledWith(0);
-});
+  it("selects multiple lines by painting a marquee with the mouse", () => {
+    setup();
+    const lane = screen.getByTestId("timeline-lane");
+    fireEvent.pointerDown(lane, { clientX: 0, clientY: 0, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(lane, { clientX: 1100, clientY: 80, pointerId: 1 });
+    fireEvent.pointerUp(lane, { clientX: 1100, clientY: 80, pointerId: 1 });
+    expect(screen.getByText("2 líneas")).toBeInTheDocument();
+  });
 
-// ---------------------------------------------------------------------------
-// Multi-lane drag — operator report 2026-05-26
-//
-// WhisperX devuelve a veces 2+ líneas que se solapan en el tiempo (un coro
-// con overdubs, o frases superpuestas). El Gantt las renderiza en lanes
-// paralelas. Cuando el operador arrastra el bottom edge de UNA de ellas
-// para extender el timing a cubrir toda la voz, el `neighbours()` pre-fix
-// usaba el orden global por `.start` y devolvía como `next` al segmento de
-// la lane PARALELA — la clamp `hi = next.start - gapS` bloqueaba la
-// extensión a unos pocos milisegundos, indistinguible visualmente de un
-// "snap back" inmediato.
-//
-// Fix: `neighbours()` filtra por mismo lane antes de buscar prev/next. Las
-// líneas en lanes paralelas dejan de bloquear la extensión.
-// ---------------------------------------------------------------------------
+  it("selects a contiguous range with Shift-click", () => {
+    setup();
+    const [first, second] = screen.getAllByTestId("timeline-segment");
+    fireEvent.pointerDown(first.querySelector('[data-testid="timeline-segment-body"]'), { clientX: 100, pointerId: 1, button: 0, metaKey: true });
+    fireEvent.pointerDown(second.querySelector('[data-testid="timeline-segment-body"]'), { clientX: 900, pointerId: 2, button: 0, shiftKey: true });
+    expect(screen.getByText("2 líneas")).toBeInTheDocument();
+  });
 
-// Multi-lane fixtures: A en lane 0 (0-2s), B en lane 1 overlap (1-5s),
-// C en lane 0 lejos (20-21s). Por el algoritmo de lane assignment:
-//   sort by start → [A, B, C]
-//   A → lane 0 (laneEnds=[2])
-//   B starts at 1, laneEnds[0]=2 > 1 → lane 1 (laneEnds=[2, 5])
-//   C starts at 20, laneEnds[0]=2 ≤ 20 → lane 0 (laneEnds=[21, 5])
-const MULTI_LANE_SEGS = [
-  { _id: 0, start: 0,  end: 2,  text: "A lane 0" },
-  { _id: 1, start: 1,  end: 5,  text: "B lane 1 (overlap)" },
-  { _id: 2, start: 20, end: 21, text: "C lane 0 (far)" },
-];
+  it("deletes the selected lines from the contextual action", () => {
+    const props = setup();
+    const [first, second] = screen.getAllByTestId("timeline-segment");
+    fireEvent.pointerDown(first.querySelector('[data-testid="timeline-segment-body"]'), { clientX: 100, pointerId: 1, button: 0, metaKey: true });
+    fireEvent.pointerDown(second.querySelector('[data-testid="timeline-segment-body"]'), { clientX: 900, pointerId: 2, button: 0, ctrlKey: true });
 
-it("end-edge drag can extend past an overlapping segment in another lane", () => {
-  // PRE-FIX: this asserted-greater-than would fail because the clamp,
-  // using B (lane 1) as the next neighbour, would force end ≈ 0.95 —
-  // a value LESS than origEnd (2). The commit would actually SHRINK the
-  // segment, which the operator perceives as "snap back to original".
-  //
-  // POST-FIX: lane-aware neighbours skips B (different lane) and uses
-  // C (same lane, far away). The end extends freely up to C - gapS.
-  const props = setup({ segments: MULTI_LANE_SEGS });
-  const aBlock = screen.getByText("A lane 0").closest("div[title]");
-  const bottomEdge = aBlock.querySelector('[title="Arrastrá: cuándo SALE la línea"]');
-  expect(bottomEdge).not.toBeNull();
-  // Drag the bottom edge DOWN by 80px = +2.5s @ pxPerSec=32.
-  fireEvent.pointerDown(bottomEdge, { clientY: 20, pointerId: 1 });
-  fireEvent.pointerMove(bottomEdge, { clientY: 100, pointerId: 1 });
-  fireEvent.pointerUp(bottomEdge, { clientY: 100, pointerId: 1 });
-  expect(props.onTimingChange).toHaveBeenCalledTimes(1);
-  const [id, newStart, newEnd] = props.onTimingChange.mock.calls[0];
-  expect(id).toBe(0);
-  expect(newStart).toBeCloseTo(0, 3); // start unchanged
-  // Bug repro: pre-fix newEnd ≈ 0.95 (< origEnd 2). Post-fix newEnd ≈ 7.
-  expect(newEnd).toBeGreaterThan(2);
-  expect(newEnd).toBeLessThan(20); // still clamped by C in same lane
-});
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar 2 líneas" }));
+    expect(props.onDeleteSelection).toHaveBeenCalledWith([0, 1]);
+  });
 
-it("start-edge drag can move earlier past an overlapping segment in another lane", () => {
-  // Mismo bug en la otra punta. C en lane 0 quiere moverse hacia el
-  // segundo 5 — pero el sorted `prev` es B (lane 1) que ends en 5, por
-  // lo que `lo = B.end + gapS = 5.05` parecía ser el piso, cuando en
-  // realidad la lane 0 está libre entre 2 (A.end) y 20 (C.start).
-  const props = setup({ segments: MULTI_LANE_SEGS });
-  const cBlock = screen.getByText("C lane 0 (far)").closest("div[title]");
-  const topEdge = cBlock.querySelector('[title="Arrastrá: cuándo ENTRA la línea"]');
-  expect(topEdge).not.toBeNull();
-  // C en y=20*32=640. Arrastrar UP 480 px = -15s @ pxPerSec=32.
-  // Target start: 20 - 15 = 5.
-  fireEvent.pointerDown(topEdge, { clientY: 640, pointerId: 1 });
-  fireEvent.pointerMove(topEdge, { clientY: 160, pointerId: 1 });
-  fireEvent.pointerUp(topEdge, { clientY: 160, pointerId: 1 });
-  expect(props.onTimingChange).toHaveBeenCalledTimes(1);
-  const [id, newStart, newEnd] = props.onTimingChange.mock.calls[0];
-  expect(id).toBe(2);
-  // Bug repro: pre-fix newStart ≈ 5.05 (clamped by B.end). Post-fix
-  // newStart should reach 5 (free space in lane 0 from A.end=2 onwards).
-  expect(newStart).toBeLessThan(5.05);
-  expect(newStart).toBeGreaterThan(2); // still clamped by A in same lane
-  expect(newEnd).toBeCloseTo(21, 3); // end unchanged for start-mode drag
-});
+  it("deletes one line directly from its visible row action without selecting it first", () => {
+    const props = setup();
+    const deleteButtons = screen.getAllByTestId("timeline-delete-line");
 
-it("regression: single-lane back-to-back lines still clamp at next.start - gapS", () => {
-  // Cuando NO hay overlap, el comportamiento es idéntico al pre-fix: el
-  // operador no puede empujar un end hacia donde arranca la próxima línea
-  // del MISMO lane. Esto evita que dos líneas secuenciales se solapen
-  // accidentalmente en el render. Aseguramos que el fix no rompió esta
-  // semántica.
-  const SINGLE_LANE = [
-    { _id: 0, start: 0, end: 2, text: "primera" },
-    { _id: 1, start: 5, end: 6, text: "segunda" },
-  ];
-  const props = setup({ segments: SINGLE_LANE });
-  const firstBlock = screen.getByText("primera").closest("div[title]");
-  const bottomEdge = firstBlock.querySelector('[title="Arrastrá: cuándo SALE la línea"]');
-  fireEvent.pointerDown(bottomEdge, { clientY: 20, pointerId: 1 });
-  // Drag DOWN 200 px = +12.5 s. Sin clamp llegaría a 14.5 s; clampeado por
-  // segunda.start - gapS = 5 - 0.05 = 4.95 s.
-  fireEvent.pointerMove(bottomEdge, { clientY: 220, pointerId: 1 });
-  fireEvent.pointerUp(bottomEdge, { clientY: 220, pointerId: 1 });
-  expect(props.onTimingChange).toHaveBeenCalledTimes(1);
-  const [, , newEnd] = props.onTimingChange.mock.calls[0];
-  expect(newEnd).toBeGreaterThan(2);
-  expect(newEnd).toBeCloseTo(4.95, 1); // still clamped at next.start - gapS
+    expect(deleteButtons).toHaveLength(3);
+    expect(deleteButtons[1]).toHaveAccessibleName("Eliminar línea 2");
+    fireEvent.pointerDown(deleteButtons[1], { pointerId: 1, button: 0 });
+    fireEvent.click(deleteButtons[1]);
+
+    expect(props.onDeleteSelection).toHaveBeenCalledWith([1]);
+    expect(screen.queryByText("1 línea")).not.toBeInTheDocument();
+  });
+
+  it("supports Delete from a focused timing block but ignores editable text", () => {
+    const props = setup();
+    const first = screen.getAllByTestId("timeline-segment")[0];
+    fireEvent.pointerDown(first.querySelector('[data-testid="timeline-segment-body"]'), { clientX: 100, pointerId: 1, button: 0, metaKey: true });
+    first.focus();
+    fireEvent.keyDown(first, { key: "Delete" });
+    expect(props.onDeleteSelection).toHaveBeenCalledWith([0]);
+
+    props.onDeleteSelection.mockClear();
+    const second = screen.getAllByTestId("timeline-segment")[1];
+    fireEvent.doubleClick(second.querySelector("span[title*='Doble-click']"));
+    fireEvent.keyDown(screen.getByDisplayValue("segunda línea"), { key: "Backspace" });
+    expect(props.onDeleteSelection).not.toHaveBeenCalled();
+  });
+
+  it("keeps a usable move target on a very short line without overlapping its resize handles", () => {
+    const props = setup({
+      segments: [
+        { _id: "short", start: 0.4, end: 0.7, text: "Oh" },
+        { _id: "next", start: 1.2, end: 2, text: "Siguiente" },
+      ],
+      duration: 5,
+    });
+    const block = screen.getAllByTestId("timeline-segment")[0];
+    const body = block.querySelector('[data-testid="timeline-segment-body"]');
+    const startEdge = block.querySelector('[data-testid="timeline-edge-start"]');
+    const endEdge = block.querySelector('[data-testid="timeline-edge-end"]');
+
+    expect(parseFloat(block.style.width)).toBeCloseTo(0.3 * 48, 5);
+    expect(body.style.width).toBe("28px");
+    expect(parseFloat(startEdge.style.left)).toBeLessThan(-22);
+    expect(parseFloat(endEdge.style.right)).toBeLessThan(-22);
+
+    fireEvent.pointerDown(body, { clientX: 100, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(body, { clientX: 124, pointerId: 1 });
+    fireEvent.pointerUp(body, { clientX: 124, pointerId: 1 });
+    expect(props.onTimingChange).toHaveBeenCalledWith("short", expect.any(Number), expect.any(Number));
+  });
+
+  it("shows selection instructions and distinct move/resize cursors", () => {
+    setup();
+    const help = screen.getByTestId("timeline-selection-help");
+    const block = screen.getAllByTestId("timeline-segment")[0];
+    const edge = block.querySelector('[data-testid="timeline-edge-end"]');
+    expect(help).toHaveTextContent("Papelera: elimina una línea");
+    expect(help).toHaveTextContent("Arrastrá el fondo");
+    expect(block.className).toContain("cursor-grab");
+    expect(edge.className).toContain("cursor-ew-resize");
+    expect(edge.style.width).toBe("22px");
+  });
+
+  it("distinguishes the playing row from purple selection", () => {
+    setup({ activeId: 1, isPlaying: true });
+    const rows = screen.getAllByTestId("timeline-label-row");
+    expect(rows[1]).toHaveAttribute("aria-current", "true");
+    expect(rows[1]).toHaveAttribute("data-active", "true");
+    expect(rows[1].className).toContain("bg-cyan");
+    expect(screen.getByText("Sonando")).toBeInTheDocument();
+  });
+
+  it("resizes timing from either horizontal edge", () => {
+    const props = setup();
+    const block = screen.getAllByTestId("timeline-segment")[1];
+    const edge = block.querySelector('[data-testid="timeline-edge-end"]');
+    fireEvent.pointerDown(edge, { clientX: 1000, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(edge, { clientX: 1080, pointerId: 1 });
+    fireEvent.pointerUp(edge, { clientX: 1080, pointerId: 1 });
+    expect(props.onTimingChange).toHaveBeenCalledWith(1, 10, expect.any(Number));
+    expect(props.onTimingChange.mock.calls[0][2]).toBeGreaterThan(11);
+  });
+
+  it("edits line text inline", () => {
+    const props = setup();
+    const block = screen.getAllByTestId("timeline-segment")[1];
+    fireEvent.doubleClick(block.querySelector("span[title*='Doble-click']"));
+    const input = screen.getByDisplayValue("segunda línea");
+    fireEvent.change(input, { target: { value: "segunda línea corregida" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(props.onTextChange).toHaveBeenCalledWith(1, "segunda línea corregida");
+  });
+
+  it("renders waveform only when waveform data exists", () => {
+    const { container, rerender } = render(<LyricsTimeline segments={SEGS} duration={60} currentTime={5} onSeek={vi.fn()} onReset={vi.fn()} />);
+    expect(container.querySelector("canvas")).not.toBeInTheDocument();
+    rerender(<LyricsTimeline segments={SEGS} duration={60} currentTime={5} waveform={{ peaks: [0.1, 0.9] }} onSeek={vi.fn()} onReset={vi.fn()} />);
+    expect(container.querySelector("canvas")).toBeInTheDocument();
+  });
+
+  it("shows save status, restore action and zoom controls", () => {
+    const props = setup({ saveStatus: "saving" });
+    expect(screen.getByText("Guardando…")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /más acciones/i }));
+    expect(screen.getByLabelText("Alejar")).toBeInTheDocument();
+    expect(screen.getByLabelText("Acercar")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Restaurar tiempos originales"));
+    expect(props.onReset).toHaveBeenCalledTimes(1);
+  });
+
+  it("auto-follows the playhead once and does not restart a pending smooth scroll", () => {
+    const props = {
+      segments: SEGS,
+      duration: 60,
+      currentTime: 5,
+      isPlaying: true,
+      onSeek: vi.fn(),
+      onReset: vi.fn(),
+    };
+    const { rerender } = render(<LyricsTimeline {...props} />);
+    const scroll = screen.getByTestId("timeline-scroll");
+    Object.defineProperty(scroll, "clientWidth", { configurable: true, value: 80 });
+    scroll.scrollTo = vi.fn();
+    rerender(<LyricsTimeline {...props} currentTime={5.1} />);
+    rerender(<LyricsTimeline {...props} currentTime={5.2} />);
+    expect(scroll.scrollTo).toHaveBeenCalledTimes(1);
+  });
 });

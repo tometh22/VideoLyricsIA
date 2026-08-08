@@ -78,6 +78,7 @@ from auth import (
     has_art_track_access,
     scenes_credit_cost,
     telemetry_enabled,
+    editor_v2_enabled,
     generate_api_key,
     is_explicitly_local_environment,
     is_super_admin,
@@ -89,14 +90,32 @@ from database import (
     Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
     BackgroundAsset, AssetUsage, Delivery, DeliveryChangeRequest,
     SalesLead, UserSession, LoginSession, UiEvent, CreditGrant,
+    ProductEvent, EditorDocument, EditorVersion,
     scoped_db, pool_stats,
     get_deliveries_db, deliveries_added_by, DELIVERIES_DATABASE_URL,
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
+from editor import (
+    approve_document,
+    acquire_lock,
+    get_job_for_tenant,
+    get_version,
+    get_or_create_document,
+    list_versions,
+    normalize_segments,
+    release_lock,
+    restore_version,
+    resolve_conflict,
+    save_document,
+    serialize_document,
+    sync_legacy_snapshot,
+    ensure_document,
+)
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe, _normalize_movement_style
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
+from transcription_language import resolve_transcription_language
 from batch_profiles import (
     RenderProfileError, normalize_render_profile, pipeline_fields,
 )
@@ -1374,6 +1393,7 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
                 # front oculta la opción "Art Track" si esto es false.
                 "art_track": has_art_track_access(user),
                 "telemetry": telemetry_enabled(),
+                "editor_v2": editor_v2_enabled(user),
                 # Versión B (letra anclada): el frontend gatea el textarea
                 # del wizard y el botón "Re-sincronizar con IA" con esto.
                 "anchor_lyrics": _anchor_lyrics_enabled(),
@@ -1482,6 +1502,7 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
                 # front oculta la opción "Art Track" si esto es false.
                 "art_track": has_art_track_access(user),
                 "telemetry": telemetry_enabled(),
+                "editor_v2": editor_v2_enabled(user),
                 # Versión B (letra anclada): el frontend gatea el textarea
                 # del wizard y el botón "Re-sincronizar con IA" con esto.
                 "anchor_lyrics": _anchor_lyrics_enabled(),
@@ -1556,6 +1577,7 @@ def me(current_user: dict = Depends(get_current_user), db: Session = Depends(get
             "scenes_credit_cost": scenes_credit_cost(),
             "art_track": has_art_track_access(_u),
             "telemetry": telemetry_enabled(),
+            "editor_v2": editor_v2_enabled(_u),
             # Versión B (letra anclada): el frontend gatea el textarea
             # del wizard y el botón "Re-sincronizar con IA" con esto.
             "anchor_lyrics": _anchor_lyrics_enabled(),
@@ -4215,19 +4237,24 @@ async def transcribe_uploaded(
                 and _result.get("timing_source") == "anchor_ctc"):
             _result = await _maybe_ctc_retime(_result, audio_path, job_id,
                                               _row_artist, _row_title)
+        _post_lang = _resolve_postprocess_language(
+            body.language, _result, job_id=job_id,
+        )
         _result = await _maybe_adlib_filter(
             _result, audio_path, job_id,
             live_hint=bool(getattr(body, "live", False))
-            or _looks_live(_row_title, _row_filename))
+            or _looks_live(_row_title, _row_filename),
+            language=_post_lang,
+        )
         _result = _maybe_repetition_reconcile(_result, job_id)
         _result = await _maybe_gap_rescue(_result, audio_path, job_id,
-                                          body.language or "es")
+                                          _post_lang)
         _result = await _maybe_word_vote(_result, audio_path, job_id,
-                                         body.language or "es")
+                                         _post_lang)
         _result = _maybe_chorus_snap(_result, job_id)
         _result = _maybe_phrase_segment(_result, job_id)
         from lyrics_format import format_lyrics_pass as _fmt
-        return await _fmt(_result, language=body.language or "es")
+        return await _fmt(_result, language=_post_lang)
     finally:
         _release_transcription_slot(transcription_lease)
 
@@ -4899,17 +4926,21 @@ async def transcribe_endpoint(
         filename=file.filename,
     )
     _result = await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
+    _post_lang = _resolve_postprocess_language(
+        language, _result, job_id=job_id,
+    )
     _result = await _maybe_adlib_filter(_result, audio_path, job_id,
-                                        live_hint=_looks_live(title, file.filename))
+                                        live_hint=_looks_live(title, file.filename),
+                                        language=_post_lang)
     _result = _maybe_repetition_reconcile(_result, job_id)
     _result = await _maybe_gap_rescue(_result, audio_path, job_id,
-                                      language or "es")
+                                      _post_lang)
     _result = await _maybe_word_vote(_result, audio_path, job_id,
-                                     language or "es")
+                                     _post_lang)
     _result = _maybe_chorus_snap(_result, job_id)
     _result = _maybe_phrase_segment(_result, job_id)
     from lyrics_format import format_lyrics_pass as _fmt
-    return await _fmt(_result, language=language or "es")
+    return await _fmt(_result, language=_post_lang)
 
 
 from ctc_cascade_veto import _ctc_cascade_veto  # noqa: E402
@@ -4926,6 +4957,23 @@ def _looks_live(*texts) -> bool:
     vivos en el título ('Live In Buenos Aires 2001'); para archivos sin
     etiquetar existe el toggle del operador (body.live)."""
     return any(t and _LIVE_MARKER_RE.search(str(t)) for t in texts)
+
+
+def _resolve_postprocess_language(requested_language, result, *, job_id: str):
+    """Resolve auto once, then reuse the same language in every post-pass."""
+    reference = result.get("reference_lyrics", "") if isinstance(result, dict) else ""
+    resolved = resolve_transcription_language(
+        requested_language,
+        result=result if isinstance(result, dict) else None,
+        reference_text=reference,
+    )
+    logger.info(
+        "[LANGUAGE] requested=%s resolved=%s job=%s",
+        requested_language or "auto",
+        resolved or "provider-auto",
+        job_id,
+    )
+    return resolved
 
 
 def _maybe_repetition_reconcile(result, job_id: str):
@@ -4971,7 +5019,7 @@ def _maybe_repetition_reconcile(result, job_id: str):
 
 
 async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
-                            language: str = "es"):
+                            language: str | None = None):
     """Post-pass gateado (GAP_RESCUE_ENABLED, default off): re-transcribe los
     tramos donde el ASR de la cascada quedó SORDO.
 
@@ -5022,7 +5070,7 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
         import lead_in as _li
         nuevo, stats = await asyncio.to_thread(
             _gr.rescue, segs, audio_path, stem_path=_stem, audio_duration=dur,
-            language=language or "es", lead_s=_li.lead_seconds(),
+            language=language, lead_s=_li.lead_seconds(),
             hold_s=_li.hold_seconds(),
             asr_words=result.get("_asr_words"),
         )
@@ -5060,7 +5108,7 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
 
 
 async def _maybe_word_vote(result, audio_path: str, job_id: str,
-                           language: str = "es"):
+                           language: str | None = None):
     """Post-pass gateado (WORD_VOTE_ENABLED, default off): el audio corrige
     a la referencia palabra por palabra, la referencia aporta la ortografía.
 
@@ -5098,7 +5146,7 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
         from gap_rescue import _transcribe_window
         witness = await asyncio.to_thread(
             _transcribe_window, _stem, 0.0, float(dur or 600.0),
-            language or "es",
+            language,
         )
         nuevo, stats = _wv.vote(segs, witness)
         if stats.get("lines_changed"):
@@ -5194,7 +5242,8 @@ def _maybe_phrase_segment(result, job_id: str):
 
 
 async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
-                              live_hint: bool = False):
+                              live_hint: bool = False,
+                              language: str | None = None):
     """Paso post-cascada (gate ADLIB_CONSENSUS_ENABLED, default off): descarta
     líneas fantasma alucinadas en zonas de ad-lib y colapsa los 'uh'
     fragmentados. Corre en TODOS los caminos de la cascada (whisperx,
@@ -5276,7 +5325,7 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
                                "de cola (job=%s)", e, job_id)
         if not _has_adlib and _tail_after is None and not _audit_on:
             return result
-        _tw = _make_stem_window_transcriber(_stem)
+        _tw = _make_stem_window_transcriber(_stem, language=language)
         _before = len(segs)
         filtered = await asyncio.to_thread(
             _ac.filter_and_collapse, segs, _tw, tail_after=_tail_after,
@@ -5306,7 +5355,10 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
     return result
 
 
-def _make_stem_window_transcriber(stem_path: str):
+def _make_stem_window_transcriber(
+    stem_path: str,
+    language: str | None = None,
+):
     """Devuelve transcribe_window(start, end) -> str: recorta esa ventana del
     stem de voz y la transcribe con whisper-1. Para el filtro de consenso
     (adlib_consensus): solo se llama en líneas candidatas (pocas por canción).
@@ -5327,7 +5379,7 @@ def _make_stem_window_transcriber(stem_path: str):
                 check=True, timeout=30,
             )
             from pipeline import _transcribe_via_openai_api as _wx
-            segs = _wx(clip, language="es") or []
+            segs = _wx(clip, language=language) or []
             return " ".join((s.get("text") or "").strip() for s in segs).strip()
         except Exception as e:
             logger.warning("[ADLIB] window %.1f-%.1f transcribe failed: %s",
@@ -6046,6 +6098,27 @@ async def _run_transcription_for_job(
                     _removed_credits,
                 )
 
+        # The upload wizard defaults to Auto.  Resolve that choice from the
+        # canonical lyrics before the primary ASR runs, so English references
+        # are transcribed as English while Spanish references retain the
+        # explicit hint that historically made Whisper more reliable.
+        if not lang and lrc:
+            _reference_for_language = (
+                (lrc.get("plain") or "").strip()
+                or (lrc.get("synced") or "").strip()
+            )
+            _detected_lang = resolve_transcription_language(
+                None,
+                reference_text=_reference_for_language,
+            )
+            if _detected_lang:
+                lang = _detected_lang
+                logger.info(
+                    "[LANGUAGE] auto-resolved %s from reference before primary ASR job=%s",
+                    lang,
+                    job_id,
+                )
+
         # ─────────────────────────────────────────────────────────────────
         # WORLD-CLASS audio-as-truth pipeline (default 2026-05-25).
         #
@@ -6125,32 +6198,45 @@ async def _run_transcription_for_job(
                 # stuck-phoneme and similar mishears in well-known regions).
                 await _step("transcribe.transcribe_word", 50)
                 _aa = await _get_align_audio()
-                # Divergent live/extended detection (2026-06-04, LIVE_NO_HINT_ENABLED,
-                # default off). When the upload is much longer than the lrclib record
-                # (the documented diff>60s "live / extended" case, see ~4082), the
-                # lrclib STUDIO text poisons whisperX's initial_prompt — the model
-                # parrots the prompt in studio order and scrambles the live (lab: Coti
-                # "Nada" live → offset +75s, first verse at 1:29 instead of 0:39) — AND
-                # the downstream reconcile/scaffold drift against the wrong structure.
+                # Divergent version detection (2026-06-04, LIVE_NO_HINT_ENABLED,
+                # default off). When the upload and the lrclib record describe
+                # DIFFERENT versions, the lrclib STUDIO text poisons whisperX's
+                # initial_prompt — the model parrots the prompt in studio order and
+                # scrambles the performance (lab: Coti "Nada" live → offset +75s,
+                # first verse at 1:29 instead of 0:39) — AND the downstream
+                # reconcile/scaffold drift against the wrong structure.
                 # Lab (7 songs, 3 Rotor ground-truths): clean NO-hint whisperX matches
                 # Rotor's own timing (median 0.03-0.8 s); Rotor itself transcribes blind
                 # the same way. So for divergent audio: drop the hint + emit the clean
                 # transcription raw, skipping the canonical cascade. Reversible; falsy
                 # when we can't measure (missing lrclib duration) so default behavior
                 # is untouched.
+                #
+                # SYMMETRIC since 2026-08-05. This used to test the SIGNED difference
+                # (audio - lrclib > 60), so it only caught the "extended live" side and
+                # was blind to the opposite, equally broken case: a reference LONGER
+                # than the upload (radio edit / snippet / short live cut). Los Pericos
+                # "Runaway (En Vivo)" — 110s upload vs a 205s lrclib studio record,
+                # diff -95s — sailed past this check into the canonical cascade, and
+                # forced_align clamped every studio line past the 110s mark onto the
+                # final timestamp: ~17 lines piled at 1:50 in the editor, including an
+                # outro this cut never sings. See timing_confidence.divergent_duration.
                 _lrc_dur = (lrc or {}).get("duration") if isinstance(lrc, dict) else None
+                from timing_confidence import divergent_duration as _divergent_dur
                 _live_no_hint = bool(
                     os.environ.get("LIVE_NO_HINT_ENABLED", "0").strip().lower()
                     in ("1", "true", "yes", "on")
-                    and _audio_dur_for_lrc and _lrc_dur
-                    and (float(_audio_dur_for_lrc) - float(_lrc_dur)) > 60.0
+                    and _divergent_dur(_audio_dur_for_lrc, _lrc_dur)
                 )
                 if _live_no_hint:
+                    _dur_diff = float(_audio_dur_for_lrc) - float(_lrc_dur)
                     logger.info(
-                        "[WC] divergent live/extended (audio %.0fs vs lrclib %.0fs, "
-                        "diff %.0fs) — clean whisperX, no hint, raw emit",
-                        float(_audio_dur_for_lrc), float(_lrc_dur),
-                        float(_audio_dur_for_lrc) - float(_lrc_dur),
+                        "[WC] divergent version (audio %.0fs vs lrclib %.0fs, "
+                        "diff %+.0fs — reference is %s) — clean whisperX, no hint, "
+                        "raw emit",
+                        float(_audio_dur_for_lrc), float(_lrc_dur), _dur_diff,
+                        "shorter (extended/live)" if _dur_diff > 0
+                        else "longer (edit/snippet)",
                     )
                 # Phase 2 (WHISPERX_NO_HINT_ALWAYS, default off): drop the lrclib
                 # hint for EVERY song, not just divergent lives. The hint
@@ -6535,7 +6621,13 @@ async def _run_transcription_for_job(
                                 )
                                 _wa_segs = await asyncio.to_thread(
                                     _wwa, _wa_audio, _canonical_lines,
-                                    language=lang or "es",
+                                    language=(
+                                        resolve_transcription_language(
+                                            lang,
+                                            reference_text=_canonical,
+                                        )
+                                        or lang
+                                    ),
                                     job_id=job_id,
                                 )
                                 if _wa_segs:
@@ -8049,6 +8141,8 @@ async def generate_with_segments(
     # generoso que rechaza payload absurdo sin restringir casos reales.
     segments_json: str = Form(..., max_length=5_000_000),
     base_revision: str = Form("", max_length=20),
+    editor_version_id: str = Form("", max_length=36),
+    editor_revision: str = Form("", max_length=20),
     delivery_profile: str = Form("youtube", max_length=20),  # Job.delivery_profile = VARCHAR(20)
     umg_frame_size: str = Form("", max_length=16),
     umg_fps: str = Form("", max_length=16),
@@ -8160,6 +8254,9 @@ async def generate_with_segments(
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="base_revision must be a non-negative integer") from exc
 
+    editor_document = None
+    selected_editor_version = None
+
     if reuse:
         # Reuse path: verify the job belongs to caller and pull the audio
         # path / R2 key from the row. Two valid entry states:
@@ -8175,7 +8272,6 @@ async def generate_with_segments(
             .first()
         )
         if (not job_row
-                or job_row.user_id != current_user["id"]
                 or job_row.tenant_id != current_user["tenant_id"]):
             # Stable machine-readable code so the frontend doesn't couple to the
             # HTTP status. `job_not_found` = reaped / cross-tenant / never
@@ -8201,6 +8297,37 @@ async def generate_with_segments(
                     "detail": f"Job is in state {job_row.status!r}, cannot generate.",
                 },
             )
+        if editor_version_id or str(editor_revision).strip():
+            if not current_user.get("features", {}).get("editor_v2"):
+                raise HTTPException(status_code=404, detail="Job not found.")
+            parsed_editor_revision = None
+            if str(editor_revision).strip():
+                try:
+                    parsed_editor_revision = int(editor_revision)
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=422, detail="editor_revision must be an integer") from None
+            try:
+                editor_document, selected_editor_version = approve_document(
+                    db, job_row, current_user["id"],
+                    editor_revision=parsed_editor_revision,
+                    editor_version_id=editor_version_id or None,
+                )
+            except LookupError:
+                raise HTTPException(status_code=409, detail="editor_version_not_found") from None
+            except RuntimeError:
+                current_document = get_or_create_document(
+                    db, job_id, current_user["tenant_id"], job_row.segments_json or [],
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "detail": "editor_revision_conflict",
+                        "server_revision": current_document.revision,
+                        "server_segments": current_document.current_segments,
+                    },
+                ) from None
+            segments = selected_editor_version.segments
+            requested_revision = selected_editor_version.revision
         current_revision = int(getattr(job_row, "segments_revision", 0) or 0)
         if requested_revision is None and current_revision > 0:
             return JSONResponse(
@@ -8334,6 +8461,10 @@ async def generate_with_segments(
         job_row = (
             db.query(Job)
             .filter(Job.job_id == job_id)
+            # SessionLocal has autoflush disabled. Refresh after waiting for
+            # the row lock so a concurrent generate/save cannot leave this
+            # request making decisions from the earlier ownership lookup.
+            .populate_existing()
             .with_for_update()
             .first()
         )
@@ -8353,9 +8484,15 @@ async def generate_with_segments(
         # Normally the preceding autosave already persisted the exact payload.
         # A CAS-matching direct client may still combine save+generate; in that
         # case the server performs the segment write and owns the increment.
+        if requested_revision is None and current_revision == 0:
+            # Legacy clients did not send a revision, but their submitted
+            # segments are still the approval snapshot and must be persisted
+            # before enqueueing the worker.
+            job_row.segments_json = segments
         if requested_revision is not None and job_row.segments_json != segments:
             job_row.segments_json = segments
             job_row.segments_revision = current_revision + 1
+            current_revision += 1
         job_row.artist = artist
         job_row.song_title = song_title or None
         job_row.style = style
@@ -8374,6 +8511,39 @@ async def generate_with_segments(
         job_row.progress = 0
         job_row.error = None
         job_row.last_progress_at = datetime.now(timezone.utc)
+
+        # The durable editor bridge locks and refreshes this same Job row.
+        # Persist the pending transition inside the current transaction first;
+        # otherwise populate_existing() would restore the pre-generate state
+        # when SessionLocal(autoflush=False) is in use.
+        db.flush()
+
+        # The generate/approve action freezes the exact persisted editor
+        # snapshot used by the worker as an immutable audit version. Legacy
+        # clients are bridged lazily so they receive the same guarantee.
+        try:
+            if editor_document is None:
+                editor_document = get_or_create_document(
+                    db, job_id, current_user["tenant_id"], job_row.segments_json or [],
+                )
+            if editor_document.revision < current_revision:
+                sync_legacy_snapshot(
+                    db, editor_document, current_user["id"],
+                    job_row.segments_json or [], current_revision,
+                )
+            approved_version = db.query(EditorVersion).filter(
+                EditorVersion.job_id == job_id,
+                EditorVersion.tenant_id == current_user["tenant_id"],
+                EditorVersion.revision == editor_document.revision,
+            ).first()
+            if approved_version and approved_version.segments == (job_row.segments_json or []):
+                approved_version.is_approved = True
+                approved_version.reason = "approve"
+        except ValueError:
+            # Keep legacy generate compatibility for malformed-but-JSON
+            # payloads; the durable editor layer must never turn that existing
+            # path into a 500 while the pipeline emits its normal validation.
+            logger.warning("[editor] skipped approval snapshot for invalid segments job=%s", job_id)
         db.commit()
     else:
         job_id = create_job(
@@ -8608,7 +8778,13 @@ async def generate_with_segments(
         render_profile=_render_profile,
     )
 
-    return {"job_id": job_id, "status": initial_status}
+    return {
+        "job_id": job_id,
+        "status": initial_status,
+        "approved_editor_version_id": (
+            selected_editor_version.id if selected_editor_version is not None else None
+        ),
+    }
 
 
 @app.get("/admin/queue")
@@ -9698,6 +9874,8 @@ class EditJobRequest(BaseModel):
     # end (s), text (str); anything else is ignored.
     segments: list[dict] | None = Field(default=None)
     base_revision: int | None = Field(default=None, ge=0)
+    editor_revision: int | None = Field(default=None, ge=0)
+    editor_version_id: str | None = Field(default=None, max_length=36)
     force_conflict_overwrite: bool = False
     # Optional free-form hint for edit_type=="background". The operator
     # types what they want the new background to convey ("paisaje cálido
@@ -10296,6 +10474,397 @@ def get_waveform(
     return payload
 
 
+class EditorPatchRequest(BaseModel):
+    base_revision: int
+    segments: list[dict]
+    checkpoint: str = "autosave"
+
+
+class EditorRestoreRequest(BaseModel):
+    version_id: str
+    base_revision: int
+
+
+class EditorConflictRequest(BaseModel):
+    strategy: str
+    server_revision: int = Field(ge=0)
+    segments: list[dict] | None = None
+
+
+class ProductEventItem(BaseModel):
+    name: str
+    job_id: str | None = None
+    occurred_at: str | None = None
+    properties: dict = Field(default_factory=dict)
+
+
+class ProductEventsRequest(BaseModel):
+    events: list[ProductEventItem]
+
+
+def _editor_document_or_404(db: Session, job_id: str, current_user: dict):
+    # Keep rollback effective: production tenants outside the canary cannot
+    # mutate the durable editor by calling the API directly.
+    if not current_user.get("features", {}).get("editor_v2"):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    # Platform admins already have audited cross-tenant access to the review
+    # and /edit flows (see `_job_scope` and POST /edit).  Editor 2.0 used a
+    # stricter tenant-only lookup here, so an admin could open a historical
+    # client's lyrics through the legacy status endpoint but GET /editor
+    # returned 404.  The frontend then waited forever for durable hydration
+    # and kept "Aprobar" disabled.  Resolve the same Job the surrounding
+    # review flow authorises, while keeping regular users tenant-isolated.
+    if current_user.get("role") == "admin":
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+    else:
+        job = get_job_for_tenant(db, job_id, current_user["tenant_id"])
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    try:
+        document = get_or_create_document(
+            db, job_id, job.tenant_id, job.segments_json or [],
+        )
+    except (LookupError, ValueError):
+        raise HTTPException(status_code=422, detail="Invalid editor segments.") from None
+    return job, document
+
+
+def _editor_conflict_payload(db: Session, document: EditorDocument) -> dict:
+    payload = serialize_document(db, document)
+    return {
+        "detail": "editor_revision_conflict",
+        "server_revision": payload["revision"],
+        "server_segments": payload["segments"],
+        "updated_by": payload["updated_by"],
+        "updated_at": payload["updated_at"],
+    }
+
+
+@app.get("/editor/{job_id}")
+async def get_editor_document(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    _audit_cross_tenant_access(db, current_user, job, "editor_read", commit=False)
+    db.commit()  # lazy migration/reconciliation is an intentional GET side effect
+    payload = serialize_document(db, document)
+    payload.update({
+        "artist": job.artist,
+        "song_title": job.song_title,
+        "filename": job.filename,
+        "job_status": job.status,
+    })
+    return payload
+
+
+@app.patch("/editor/{job_id}")
+async def patch_editor_document(
+    job_id: str,
+    body: EditorPatchRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    try:
+        _audit_cross_tenant_access(db, current_user, job, "editor_save", commit=False)
+        document, version, applied = save_document(
+            db, job, document, current_user["id"], body.base_revision,
+            body.segments, body.checkpoint,
+        )
+        db.commit()
+    except RuntimeError:
+        db.rollback()
+        _, document = _editor_document_or_404(db, job_id, current_user)
+        raise HTTPException(
+            status_code=409,
+            detail=_editor_conflict_payload(db, document),
+        ) from None
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    return {
+        "job_id": job_id,
+        "revision": document.revision,
+        "version_id": version.id if version else None,
+        "saved_at": document.updated_at.isoformat(),
+        "applied": applied,
+    }
+
+
+@app.post("/editor/{job_id}/lock")
+@app.post("/editor/{job_id}/lock/heartbeat")
+async def editor_lock(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _, document = _editor_document_or_404(db, job_id, current_user)
+    result = acquire_lock(db, document, current_user["id"])
+    db.commit()
+    return result
+
+
+@app.delete("/editor/{job_id}/lock")
+async def editor_unlock(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _, document = _editor_document_or_404(db, job_id, current_user)
+    if not release_lock(db, document, current_user["id"]):
+        db.rollback()
+        raise HTTPException(status_code=409, detail="editor_lock_owned_by_other_user")
+    db.commit()
+    return {"released": True}
+
+
+@app.get("/editor/{job_id}/versions")
+async def get_editor_versions(
+    job_id: str,
+    limit: int = Query(default=50, ge=1, le=50),
+    offset: int = Query(default=0, ge=0),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _, document = _editor_document_or_404(db, job_id, current_user)
+    return {"versions": list_versions(db, document, limit=limit, offset=offset)}
+
+
+@app.get("/editor/{job_id}/versions/{version_id}")
+async def get_editor_version(
+    job_id: str,
+    version_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _, document = _editor_document_or_404(db, job_id, current_user)
+    version = get_version(db, document, version_id)
+    if not version:
+        raise HTTPException(status_code=404, detail="editor_version_not_found")
+    return {
+        "id": version.id,
+        "revision": version.revision,
+        "reason": version.reason,
+        "is_approved": bool(version.is_approved),
+        "segments": version.segments,
+        "created_at": version.created_at.isoformat() if version.created_at else None,
+    }
+
+
+@app.post("/editor/{job_id}/restore")
+async def restore_editor_version(
+    job_id: str,
+    body: EditorRestoreRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    try:
+        _audit_cross_tenant_access(db, current_user, job, "editor_restore", commit=False)
+        document, version = restore_version(
+            db, job, document, current_user["id"], body.version_id, body.base_revision,
+        )
+        db.commit()
+    except LookupError:
+        raise HTTPException(status_code=404, detail="editor_version_not_found") from None
+    except RuntimeError:
+        db.rollback()
+        _, document = _editor_document_or_404(db, job_id, current_user)
+        raise HTTPException(
+            status_code=409,
+            detail=_editor_conflict_payload(db, document),
+        ) from None
+    return {
+        "job_id": job_id,
+        "revision": document.revision,
+        "version_id": version.id,
+        "segments": document.current_segments,
+    }
+
+
+@app.post("/editor/{job_id}/conflicts/resolve")
+async def resolve_editor_conflict(
+    job_id: str,
+    body: EditorConflictRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    try:
+        _audit_cross_tenant_access(db, current_user, job, "editor_conflict_resolve", commit=False)
+        document, version, applied = resolve_conflict(
+            db, job, document, current_user["id"], body.server_revision,
+            body.strategy, body.segments,
+        )
+        db.commit()
+    except RuntimeError:
+        db.rollback()
+        _, document = _editor_document_or_404(db, job_id, current_user)
+        raise HTTPException(
+            status_code=409, detail=_editor_conflict_payload(db, document),
+        ) from None
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    return {
+        **serialize_document(db, document),
+        "version_id": version.id if version else None,
+        "applied": applied,
+    }
+
+
+_PRODUCT_EVENT_NAMES = {
+    "editor_opened", "editor_view_changed", "editor_seek",
+    "editor_selection_created", "editor_group_moved", "editor_timing_changed",
+    "editor_undo", "editor_autosave_success", "editor_autosave_failed",
+    "editor_conflict", "editor_version_restored", "editor_approved",
+    "editor_help_opened",
+}
+
+_PRODUCT_EVENT_PROPERTIES = {
+    "editor_opened": {"line_count", "view", "source"},
+    "editor_view_changed": {"from", "to"},
+    "editor_seek": {"position_ms", "source"},
+    "editor_selection_created": {"count", "method", "duration_ms"},
+    "editor_group_moved": {"count", "delta_ms", "duration_ms"},
+    "editor_timing_changed": {"count", "operation", "delta_ms", "duration_ms"},
+    "editor_undo": {"operation", "count"},
+    "editor_autosave_success": {"duration_ms", "checkpoint", "retry_count"},
+    "editor_autosave_failed": {"duration_ms", "checkpoint", "reason", "status", "retry_count"},
+    "editor_conflict": {"server_revision", "local_revision", "resolution"},
+    "editor_version_restored": {"from_revision", "to_revision"},
+    "editor_approved": {"revision", "duration_ms"},
+    "editor_help_opened": {"context"},
+}
+_PRODUCT_EVENT_COMMON_PROPERTIES = {"session_id"}
+
+
+@app.post("/analytics/events")
+@limiter.limit("120/minute")
+async def record_product_events(
+    request: Request,
+    body: ProductEventsRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if len(body.events) > 50:
+        raise HTTPException(status_code=422, detail="A maximum of 50 events is accepted per batch.")
+    accepted = 0
+    rejected = 0
+    for item in body.events:
+        if item.name not in _PRODUCT_EVENT_NAMES:
+            rejected += 1
+            continue
+        if item.job_id and not get_job_for_tenant(db, item.job_id, current_user["tenant_id"]):
+            rejected += 1
+            continue
+        allowed = _PRODUCT_EVENT_PROPERTIES[item.name] | _PRODUCT_EVENT_COMMON_PROPERTIES
+        properties = {}
+        invalid_properties = False
+        for key, value in (item.properties or {}).items():
+            if key not in allowed or not isinstance(value, (str, int, float, bool)):
+                invalid_properties = True
+                break
+            properties[key] = value
+        if invalid_properties:
+            rejected += 1
+            continue
+        if len(json.dumps(properties, ensure_ascii=False)) > 2000:
+            rejected += 1
+            continue
+        occurred_at = None
+        if item.occurred_at:
+            try:
+                occurred_at = datetime.fromisoformat(item.occurred_at.replace("Z", "+00:00"))
+            except ValueError:
+                occurred_at = None
+        db.add(ProductEvent(
+            tenant_id=current_user["tenant_id"], user_id=current_user["id"],
+            job_id=item.job_id, name=item.name, occurred_at=occurred_at,
+            properties=properties,
+        ))
+        accepted += 1
+    db.commit()
+    return {"accepted": accepted, "rejected": rejected}
+
+
+@app.get("/admin/product-metrics")
+async def product_metrics(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    query = db.query(ProductEvent)
+    if not current_user.get("is_super_admin"):
+        query = query.filter(ProductEvent.tenant_id == current_user["tenant_id"])
+    rows = query.order_by(ProductEvent.created_at.desc()).limit(10000).all()
+    counts: dict[str, int] = {}
+    group_move_durations = []
+    sessions: dict[tuple, dict] = {}
+    view_usage = {"basic": 0, "advanced": 0}
+    for row in rows:
+        counts[row.name] = counts.get(row.name, 0) + 1
+        properties = row.properties or {}
+        timestamp = row.occurred_at or row.created_at
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        session_id = properties.get("session_id")
+        # Older clients have no session id; bucket by UTC date so two visits
+        # months apart never become one enormous synthetic session.
+        key = (row.user_id, row.job_id, session_id or timestamp.date().isoformat())
+        session = sessions.setdefault(key, {"opened": None, "first_edit": None, "first": timestamp, "last": timestamp})
+        session["first"] = min(session["first"], timestamp)
+        session["last"] = max(session["last"], timestamp)
+        if row.name == "editor_opened":
+            session["opened"] = timestamp if session["opened"] is None else min(session["opened"], timestamp)
+            view = properties.get("view")
+            if view in view_usage:
+                view_usage[view] += 1
+        elif row.name == "editor_view_changed":
+            view = properties.get("to")
+            if view in view_usage:
+                view_usage[view] += 1
+        if row.name in {
+            "editor_timing_changed", "editor_group_moved",
+            "editor_selection_created", "editor_autosave_success",
+        }:
+            session["first_edit"] = timestamp if session["first_edit"] is None else min(session["first_edit"], timestamp)
+        if row.name == "editor_group_moved" and isinstance(properties.get("duration_ms"), (int, float)):
+            group_move_durations.append(float(properties["duration_ms"]))
+    session_durations = [
+        (session["last"] - session["first"]).total_seconds() * 1000
+        for session in sessions.values() if session["last"] >= session["first"]
+    ]
+    first_edits = [
+        (session["first_edit"] - session["opened"]).total_seconds() * 1000
+        for session in sessions.values()
+        if session["opened"] is not None and session["first_edit"] is not None
+        and session["first_edit"] >= session["opened"]
+    ]
+    opened = counts.get("editor_opened", 0)
+    approvals = counts.get("editor_approved", 0)
+    return {
+        "events": counts,
+        "sample_size": len(rows),
+        "view_usage": view_usage,
+        "approval_rate": approvals / opened if opened else None,
+        "conflicts": counts.get("editor_conflict", 0),
+        "autosave_failures": counts.get("editor_autosave_failed", 0),
+        "undo_count": counts.get("editor_undo", 0),
+        "avg_group_move_duration_ms": (
+            sum(group_move_durations) / len(group_move_durations)
+            if group_move_durations else None
+        ),
+        "avg_session_duration_ms": (
+            sum(session_durations) / len(session_durations) if session_durations else None
+        ),
+        "avg_time_to_first_edit_ms": sum(first_edits) / len(first_edits) if first_edits else None,
+    }
+
+
 class SaveSegmentsRequest(BaseModel):
     # Persisted to Job.segments_json (JSONB). Same shape /generate and
     # /edit accept. 5 MB upper bound mirrors /generate's segments_json
@@ -10351,13 +10920,13 @@ async def save_segments(
     # _job_scope): un super admin corrige y GUARDA el job de cualquier
     # usuario cuando tiene problemas. Sin esto, abrir el editor de un job
     # ajeno dejaba el autoguardado en 404 permanente ("No pudimos guardar")
-    # y las ediciones no persistían. Para no-admins se mantiene el scope
-    # estricto por dueño + tenant. Acceso auditado (compliance UMG).
-    _is_platform_admin = current_user.get("role") == "admin"
+    # y las ediciones no persistían. Para no-admins el editor se comparte
+    # entre miembros del mismo workspace; el control optimista por revisión
+    # detecta cualquier guardado sobre una versión vieja.
+    _is_platform_admin = bool(current_user.get("is_super_admin"))
     if (not job
             or (not _is_platform_admin
-                and (job.user_id != current_user["id"]
-                     or job.tenant_id != current_user["tenant_id"]))):
+                and job.tenant_id != current_user["tenant_id"])):
         raise HTTPException(status_code=404, detail="Job not found.")
     _audit_cross_tenant_access(db, current_user, job, "save_segments", commit=False)
 
@@ -10462,6 +11031,16 @@ async def save_segments(
     # cursor / clamp logic referenced the wrong neighbors. Origin: Una
     # Vez Más — Viejas Locas (agus.cafisi, 2026-05-18).
     segs = sorted(segs, key=lambda s: float(s.get("start", 0) or 0))
+
+    # Reconcile the durable document before evaluating OCC so both legacy and
+    # Editor 2.0 clients advance one shared monotonic revision.
+    try:
+        editor_document = get_or_create_document(
+            db, job_id, job.tenant_id, job.segments_json or [],
+        )
+    except (LookupError, ValueError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
 
     current_revision = int(getattr(job, "segments_revision", 0) or 0)
     if body.base_revision is None and current_revision > 0:
@@ -10569,10 +11148,21 @@ async def save_segments(
         logger.warning("[save-segments] audit log failed: %s", e)
 
     job.segments_json = segs
-    if body.base_revision is not None:
-        job.segments_revision = current_revision + 1
+    job.segments_revision = current_revision + 1
     touch_user_activity(db, job)
-    db.commit()
+    try:
+        sync_legacy_snapshot(
+            db, editor_document, current_user["id"], job.segments_json or [],
+            int(getattr(job, "segments_revision", 0) or 0),
+        )
+        db.commit()
+    except (LookupError, ValueError, RuntimeError) as exc:
+        db.rollback()
+        logger.warning("[save-segments] editor bridge rejected job=%s: %s", job_id, exc)
+        return JSONResponse(
+            status_code=409,
+            content={"code": "editor_state_conflict", "detail": str(exc)},
+        )
 
     # Outcome metric (issue #934): éxito consultable por tenant — junto con
     # el warning del 409 de arriba permite medir la tasa real de fallas del
@@ -11152,6 +11742,36 @@ async def request_edit(
             ),
         )
 
+    # Editor 2.0 approvals resolve an exact durable snapshot under the Job
+    # lock. Browser JSON is ignored whenever a revision/version selector is
+    # present, and a remote save between autosave and approval fails closed.
+    _approved_editor_version = None
+    if body.editor_revision is not None or body.editor_version_id:
+        if not current_user.get("features", {}).get("editor_v2"):
+            raise HTTPException(status_code=404, detail="Job not found.")
+        try:
+            _editor_document, _approved_editor_version = approve_document(
+                db, job, current_user["id"],
+                editor_revision=body.editor_revision,
+                editor_version_id=body.editor_version_id,
+            )
+        except LookupError:
+            raise HTTPException(status_code=409, detail="editor_version_not_found") from None
+        except RuntimeError:
+            _current_document = get_or_create_document(
+                db, job_id, job.tenant_id, job.segments_json or [],
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "detail": "editor_revision_conflict",
+                    "server_revision": _current_document.revision,
+                    "server_segments": _current_document.current_segments,
+                },
+            ) from None
+        body.segments = _approved_editor_version.segments
+        body.base_revision = _approved_editor_version.revision
+
     # Segments handling. Two cases:
     #
     #   - edit_type=lyrics: caller MUST send segments (it's the whole point
@@ -11202,38 +11822,10 @@ async def request_edit(
     # edit_params payload).
     normalized_segments = None
     if body.segments and len(body.segments) > 0:
-        normalized_segments = [
-            {
-                "start": float(s["start"]),
-                "end": float(s["end"]),
-                "text": str(s["text"]),
-                # Preserve the manual-timing lock set in the visual Timings
-                # editor. Without this, a lyrics re-render strips `locked`
-                # and pipeline._apply_display_timing re-applies hold-until-next,
-                # clobbering the operator's hand-set end. Only carry it when
-                # truthy so untouched lines stay clean.
-                **({"locked": True} if s.get("locked") else {}),
-                # Preserve per-line layout overrides set in the live preview
-                # (position / size / rotation). Same reason as `locked`: a
-                # re-render must not strip the operator's layout. Only carried
-                # when set to a non-default value so untouched lines stay clean.
-                **({"pos": {"x": float(s["pos"]["x"]), "y": float(s["pos"]["y"])}}
-                   if isinstance(s.get("pos"), dict)
-                   and "x" in s["pos"] and "y" in s["pos"] else {}),
-                **({"scale": float(s["scale"])}
-                   if isinstance(s.get("scale"), (int, float))
-                   and float(s["scale"]) != 1.0 else {}),
-                **({"rot": float(s["rot"])}
-                   if isinstance(s.get("rot"), (int, float))
-                   and float(s["rot"]) != 0.0 else {}),
-                # Preserve per-word timestamps (forced-align / whisperX) so a
-                # re-render or future word-level/karaoke editor doesn't lose
-                # them. The line-level editor ignores `words`; carried only
-                # when present so untouched line-level edits stay lean.
-                **({"words": s["words"]} if isinstance(s.get("words"), list) else {}),
-            }
-            for s in body.segments
-        ]
+        try:
+            normalized_segments = normalize_segments(body.segments)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         # Persist immediately so any subsequent reader (worker, /status
         # poll, the operator opening another tab) sees the corrected text.
         # The /edit handler is the right place for this — it's already
@@ -11268,9 +11860,10 @@ async def request_edit(
                     ),
                 },
             )
-        job.segments_json = normalized_segments
-        if body.base_revision is not None:
-            job.segments_revision = _pre_edit_revision + 1
+        if _approved_editor_version is None:
+            job.segments_json = normalized_segments
+            if body.base_revision is not None:
+                job.segments_revision = _pre_edit_revision + 1
 
     edit_params: dict = {}
     if body.font is not None:
@@ -11662,6 +12255,9 @@ async def request_edit(
         "edits_remaining": max(0, _MAX_EDITS - new_edit_count),
         "edit_limit_exempt": _is_admin,
         "segments_revision": int(getattr(job, "segments_revision", 0) or 0),
+        "approved_editor_version_id": (
+            _approved_editor_version.id if _approved_editor_version is not None else None
+        ),
     }
 
 
@@ -14266,6 +14862,7 @@ async def portal_get_items(
             "job_id": d.job_id,
             "label": d.label,
             "frame_size": d.frame_size_snapshot,
+            "added_at": d.added_at.isoformat() if d.added_at else None,
             "files": files,
             "preview_url": preview_url,
             "short_preview_url": short_preview_url,

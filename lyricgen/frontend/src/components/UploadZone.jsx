@@ -10,6 +10,7 @@ import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
 import { CONCEPT_CODES, EFFECT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
 import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS } from "../lib/optionLabels";
+import { canCreateArtTrack } from "../lib/artTrackAccess";
 import EditPlanSummary from "./EditPlanSummary";
 import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBackgroundPreviewTokens";
 
@@ -675,13 +676,12 @@ export default function UploadZone({
   // Art Track gateado por tenant (default OFF salvo admin). Si no califica,
   // no mostramos el selector de tipo de video (queda solo lyric, como antes
   // de la feature) y reseteamos artTrack si vino prendido de un estado viejo.
-  // Kill-switch de build: Art Track NO va a producción (2026-07-22). El build
-  // de prod (genly.pro) no setea VITE_ART_TRACK_ENABLED → la feature queda
-  // totalmente oculta (ni admins la ven). Se habilita por entorno para testeo
-  // (staging: VITE_ART_TRACK_ENABLED=true); ahí sigue gateada por feature/admin.
+  // Kill-switch de build para rollouts públicos. Los admins conservan acceso
+  // aunque el build de producción no habilite VITE_ART_TRACK_ENABLED; para
+  // cualquier no-admin hacen falta el flag de build Y features.art_track del
+  // backend. /generate repite el gate server-side.
   const ART_TRACK_ENABLED = import.meta.env.VITE_ART_TRACK_ENABLED === "true";
-  const artTrackEligible =
-    ART_TRACK_ENABLED && (user?.features?.art_track === true || user?.role === "admin");
+  const artTrackEligible = canCreateArtTrack(user, ART_TRACK_ENABLED);
   useEffect(() => {
     if (artTrack && !artTrackEligible) onArtTrackChange?.(false);
   }, [artTrack, artTrackEligible]);
@@ -843,7 +843,7 @@ export default function UploadZone({
   // (la prop que App.jsx prende cuando empieza el transcribe o hay
   // currentReview con segments).
   // - hasReviewableContent=false → paso 6 con border dashed gris,
-  //   cursor-not-allowed, tooltip "Disponible después de Revisar lyrics".
+  //   cursor-not-allowed, tooltip "Disponible después de Revisar letra".
   // - hasReviewableContent=true  → paso 6 clickeable; auto-advance del
   //   wizard a step=6 vía el useEffect de abajo.
   const WIZARD_STEPS = [
@@ -1109,17 +1109,14 @@ export default function UploadZone({
     } catch { return ""; }
   };
 
-  // Idiomas soportados. Spanish primero porque ~95% del catálogo target
-  // (Universal Music Argentina) es en español; cualquier auto-detect que
-  // se confunda termina disparando coverage_warning y timing sintetizado.
-  // El default del entry.language al cargar un archivo es "es" (ver más
-  // abajo en parseFilename); "auto" sigue disponible como opt-out
-  // explícito para canciones en otros idiomas.
+  // Auto is the safe default for a mixed catalogue. The backend resolves it
+  // once from reference lyrics / recognized text and reuses that language in
+  // every post-pass; an explicit operator choice still takes precedence.
   const LANGUAGES = [
+    { code: "", label: t("lang.auto") },
     { code: "es", label: t("lang.es") },
     { code: "en", label: t("lang.en") },
     { code: "pt", label: t("lang.pt") },
-    { code: "", label: t("lang.auto") },
     { code: "fr", label: t("lang.fr") },
     { code: "it", label: t("lang.it") },
     { code: "de", label: t("lang.de") },
@@ -1555,13 +1552,7 @@ export default function UploadZone({
         file: f,
         artist,
         songTitle: song,
-        // Default 'es' instead of '' (auto-detect). Auto was producing
-        // ~50% language-misdetection on Spanish catalogue (audited
-        // 2026-05-15 across 4 sample tracks: 2 misdetected as javanese
-        // and italian respectively, ending in the synthesizer path with
-        // bad timestamps). Operator can still flip to 'auto' if they
-        // upload a non-Spanish song.
-        language: "es",
+        language: "",
         ...batchDefaultsRef.current,
       };
     });
@@ -3148,10 +3139,8 @@ export default function UploadZone({
                   </section>
                 );
               })()}
-              {/* Language pills. Default 'es' is highlighted on file
-                  load — operator can click another to override, or
-                  click 'auto' to let Whisper detect (not recommended
-                  for Spanish catalogue: ~50% misdetection rate). */}
+              {/* Language pills. Auto is highlighted on file load; choosing
+                  a language explicitly overrides backend detection. */}
               <div className="flex items-center gap-1.5 flex-wrap">
                 <span className="text-[11px] text-gray-600 mr-1">{t("upload.lang_label") || "Idioma:"}</span>
                 {LANGUAGES.map((l) => (
@@ -3740,8 +3729,9 @@ export default function UploadZone({
         // El preview baja a 360-500 px (≈40 px menos) lo cual sigue
         // bien usable para el operador.
         const gridCols = isStep6
-          ? "lg:grid-cols-[200px_minmax(360px,500px)_minmax(0,1fr)]"
+          ? "lg:grid-cols-[170px_minmax(280px,360px)_minmax(0,1fr)]"
           : "lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)]";
+        const gridGap = isStep6 ? "gap-4" : "gap-6";
         // Studio focus: when LyricsEditor emits `editor-focus-mode`, collapse
         // the three-column wizard into a two-column editing workspace. The
         // step rail disappears, but the live preview stays docked at a compact
@@ -3756,7 +3746,7 @@ export default function UploadZone({
         // lg:min-h-0 deja la grid ocupar el espacio que el flex-col
         // exterior le da. lg:overflow-hidden previene que la grid haga
         // overflow al body — el scroll vive en la columna RIGHT.
-        <div className={`wizard-workspace-grid flex flex-col lg:grid ${gridCols} [.editor-focus-mode_&]:lg:grid-cols-[clamp(320px,24vw,400px)_minmax(0,1fr)] gap-6 items-start lg:items-stretch lg:h-full lg:min-h-0 lg:overflow-hidden lg:flex-1`}>
+        <div className={`wizard-workspace-grid flex flex-col lg:grid ${gridCols} ${gridGap} [.editor-focus-mode_&]:lg:grid-cols-[clamp(240px,19vw,290px)_minmax(0,1fr)] [.editor-focus-mode_&]:gap-4 items-start lg:items-stretch lg:h-full lg:min-h-0 lg:overflow-hidden lg:flex-1`}>
 
         {/* LEFT — step rail (vertical on desktop, horizontal pills on mobile).
             Paso 6 "Lyrics" se ve siempre; está deshabilitado hasta que
@@ -3787,7 +3777,7 @@ export default function UploadZone({
                 title={locked
                   ? (t("upload.step_locked_hint") || "No editable en este modo — usá \"Regenerar fondo\" desde el video.")
                   : lyricsDisabled
-                    ? (t("upload.step_lyrics_hint") || "Disponible después de \"Revisar lyrics\"")
+                    ? (t("upload.step_lyrics_hint") || "Disponible después de \"Revisar letra\"")
                     : (isStep6 ? s.label : undefined)}
                 className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-[12.5px] font-medium whitespace-nowrap transition-all text-left shrink-0 ${
                   disabled
@@ -5057,7 +5047,7 @@ export default function UploadZone({
             <div className="min-w-0 w-full">
               {renderStep6 ? renderStep6() : (
                 <div className="text-center py-12 text-sm text-gray-500">
-                  {t("upload.step_lyrics_hint") || "Disponible después de \"Revisar lyrics\""}
+                  {t("upload.step_lyrics_hint") || "Disponible después de \"Revisar letra\""}
                 </div>
               )}
             </div>
@@ -5182,7 +5172,7 @@ export default function UploadZone({
                     disabled={!allHaveArtist}
                     className="btn-primary h-11 px-6 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
-                    {t("upload.review_lyrics") || "Revisar lyrics"}
+                    {t("upload.review_lyrics") || "Revisar letra"}
                     <svg className="inline-block ml-1.5 w-4 h-4 -mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                       <path d="M5 12h14M12 5l7 7-7 7" />
                     </svg>

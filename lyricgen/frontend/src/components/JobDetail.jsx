@@ -16,6 +16,7 @@ import SceneEditModal from "./SceneEditModal";
 import MediaPreview from "./MediaPreview";
 import JobSettingsCard from "./JobSettingsCard";
 import { SingleGeneratingHero } from "./BatchProgress";
+import { hasArtTrackAccess } from "../lib/artTrackAccess";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -615,7 +616,11 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // any await, so the second handler sees `current=true` immediately and
   // bails out.
   const approveLockRef = useRef(false);
-  const name = (job.filename || "").replace(/\.mp3$/i, "");
+  // Show the metadata the operator reviewed, not the raw upload filename.
+  // A filename can be inherited from an export or an earlier correction and
+  // is not authoritative once song_title has been captured on the job.
+  const name = (job.song_title || job.filename || "")
+    .replace(/\.(mp3|wav|m4a|flac|aac|ogg)$/i, "");
 
   // Short-lived media URLs (re-fetch when the active tab changes).
   const previewMediaType = activeTab === "thumbnail" ? "thumbnail" : activeTab;
@@ -684,7 +689,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // Art tracks no tienen letra que editar, pero SÍ portada / efecto / título /
   // línea legal. En vez del wizard de letra, se editan con ArtTrackEditPanel
   // (POST /jobs/:id/edit-art-track, re-render gratis vía run_pipeline).
-  const canEditArtTrack = (isPendingReview || isDone || isRejected) && isArtTrack;
+  const canEditArtTrack =
+    (isPendingReview || isDone || isRejected) &&
+    isArtTrack &&
+    hasArtTrackAccess(currentUser);
 
   // A detail deep-link owns local state, so the root history poller cannot
   // advance it. Poll every active state and stop at the first terminal or
