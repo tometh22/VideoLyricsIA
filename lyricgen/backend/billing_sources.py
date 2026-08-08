@@ -141,11 +141,12 @@ def fetch_gcp(period: str) -> SourceCost:
     sql = f"""
         SELECT
           service.description AS service,
+          sku.description AS sku,
           SUM(cost) AS cost,
           SUM(IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) c), 0)) AS credits
         FROM `{project}.{dataset}.{table}`
         WHERE DATE(usage_start_time) BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
-        GROUP BY service
+        GROUP BY service, sku
         ORDER BY cost DESC
     """
     url = f"https://bigquery.googleapis.com/bigquery/v2/projects/{project}/queries"
@@ -185,24 +186,61 @@ def fetch_gcp(period: str) -> SourceCost:
                     "reporta $0 porque sería indistinguible de gasto cero."),
         )
 
+    # SKU granularity is what makes auto-calibration possible: "Vertex AI"
+    # as a service lumps Veo, Imagen and Gemini together, and their unit
+    # costs differ by ~50x. Only the SKU line isolates Veo.
     breakdown = []
     total = 0.0
     for row in payload.get("rows", []) or []:
         cells = row.get("f", [])
-        if len(cells) < 3:
+        if len(cells) < 4:
             continue
         service = cells[0].get("v") or "(sin nombre)"
-        cost = float(cells[1].get("v") or 0.0)
-        credits = float(cells[2].get("v") or 0.0)
+        sku = cells[1].get("v") or "(sin sku)"
+        cost = float(cells[2].get("v") or 0.0)
+        credits = float(cells[3].get("v") or 0.0)
         net = cost + credits          # credits arrive negative
         total += net
-        breakdown.append({"service": service, "cost": round(net, 4)})
+        breakdown.append({"service": service, "sku": sku,
+                          "cost": round(net, 4)})
+    breakdown.sort(key=lambda r: -r["cost"])
 
     return SourceCost(
         source="gcp", period=period, amount_usd=round(total, 2),
         breakdown=breakdown,
         raw={"rows": payload.get("totalRows"), "table": f"{dataset}.{table}"},
     )
+
+
+# Substrings that identify each tool's SKU line on the Google Cloud bill.
+# Matched case-insensitively against `sku.description`. Used to turn the
+# invoice into a real per-call rate — see `rate_calibration.py`.
+GCP_SKU_PATTERNS: dict[str, tuple[str, ...]] = {
+    "veo": ("veo",),
+    "imagen": ("imagen",),
+    "gemini": ("gemini",),
+}
+
+
+def gcp_cost_by_tool(source: SourceCost) -> dict[str, float]:
+    """Collapse a GCP breakdown into {"veo": usd, "imagen": usd, ...}.
+
+    Anything that matches no pattern lands under "otros" instead of being
+    dropped — a SKU we don't recognise is money we still spent, and
+    silently losing it would make the derived rates look cheaper than
+    they are.
+    """
+    out: dict[str, float] = {}
+    for row in source.breakdown or []:
+        sku = (row.get("sku") or "").lower()
+        cost = float(row.get("cost") or 0.0)
+        for tool, pats in GCP_SKU_PATTERNS.items():
+            if any(p in sku for p in pats):
+                out[tool] = out.get(tool, 0.0) + cost
+                break
+        else:
+            out["otros"] = out.get("otros", 0.0) + cost
+    return {k: round(v, 4) for k, v in out.items()}
 
 
 def _gcp_credentials() -> str:

@@ -1259,6 +1259,117 @@ async def admin_cost_umg(
     return result
 
 
+@router.post("/cost/calibrate-rates")
+async def admin_calibrate_rates(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    period: str = Query("", description="YYYY-MM; vacío = mes actual"),
+    dry_run: bool = Query(False, description="calcular sin guardar"),
+):
+    """Deriva la tarifa REAL por llamada desde la factura y la persiste.
+
+    Ningún proveedor de IA devuelve el costo en la respuesta, así que la
+    única fuente real es la factura:
+
+        tarifa real = costo facturado del SKU ÷ llamadas facturables medidas
+
+    Medido: Veo estaba cargado a $0,80 de lista y la factura da ~$0,62 —
+    el panel sobreestimaba ~25%, y ese error se propagaba al costo por
+    canción, al margen por tenant y al tamaño del desperdicio.
+
+    Requiere `PEER_DATABASE_URL`: staging y prod comparten el proyecto de
+    GCP, así que la factura cubre los dos entornos y contar uno solo
+    duplicaría la tarifa. Sin peer, se niega a calibrar en vez de guardar
+    un número mal.
+
+    Necesita también el export de facturación a BigQuery configurado
+    (`GCP_BILLING_BQ_*`) — es el único lugar con granularidad de SKU.
+    """
+    import billing_sources
+    import rate_calibration as rc
+    from database import PEER_DATABASE_URL, scoped_peer_db
+
+    period = period.strip() or billing_sources.current_period()
+    try:
+        rc_period_check = billing_sources._period_bounds(period)
+        del rc_period_check
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    gcp = billing_sources.fetch_gcp(period)
+    if gcp.status != "ok":
+        return {
+            "period": period, "calibrated": False,
+            "reason": f"sin factura de GCP utilizable: {gcp.detail}",
+            "hint": ("configurá el export de facturación a BigQuery "
+                     "(GCP_BILLING_BQ_*). No es retroactivo."),
+        }
+
+    invoiced = billing_sources.gcp_cost_by_tool(gcp)
+
+    with scoped_peer_db() as peer:
+        if peer is None:
+            return {
+                "period": period, "calibrated": False,
+                "reason": ("falta PEER_DATABASE_URL. La factura de GCP cubre "
+                           "staging Y prod (mismo proyecto); calibrar con un "
+                           "solo entorno duplicaría la tarifa."),
+                "invoiced_by_tool": invoiced,
+            }
+        sessions = {"local": db, "peer": peer}
+        result = rc.derive_rates(sessions, invoiced, period)
+
+    result["invoiced_by_tool"] = invoiced
+    result["gcp_total_usd"] = gcp.amount_usd
+    if not dry_run:
+        result["stored"] = rc.store_rates(db, period, result)
+    result["calibrated"] = bool(result.get("applied"))
+    return result
+
+
+@router.get("/cost/rates")
+async def admin_cost_rates(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    period: str = Query("", description="YYYY-MM; vacío = mes actual"),
+):
+    """Qué tarifa está usando el panel para cada herramienta, y de dónde sale.
+
+    `source: "factura"` = derivada del gasto real de ese mes.
+    `source: "estimada"` = tarifa de lista de COST_PER_CALL, porque todavía
+    no hay factura calibrada. La distinción importa: la estimada de Veo
+    venía ~25% alta.
+    """
+    import billing_sources
+    import rate_calibration as rc
+    from provenance import COST_PER_CALL
+
+    period = period.strip() or billing_sources.current_period()
+    calibrated = rc.load_applied_rates(db, period)
+
+    rows = []
+    for (name, provider), estimated in sorted(COST_PER_CALL.items()):
+        real = rc.rate_for_tool(name, calibrated)
+        rows.append({
+            "tool_name": name, "provider": provider,
+            "rate_in_use": real if real is not None else estimated,
+            "source": "factura" if real is not None else "estimada",
+            "estimated_rate": estimated,
+            "calibrated_rate": real,
+            "drift": (round(real / estimated, 3)
+                      if real is not None and estimated else None),
+        })
+    rows.sort(key=lambda r: -r["rate_in_use"])
+    return {
+        "period": period,
+        "calibrated_tools": sorted(calibrated),
+        "rates": rows,
+        "note": ("'estimada' es tarifa de lista y puede desviarse: Veo "
+                 "estaba a $0,80 y la factura da ~$0,62. Corré "
+                 f"POST /admin/cost/calibrate-rates?period={period}"),
+    }
+
+
 @router.get("/quality/change-requests")
 async def admin_change_requests(
     admin: dict = Depends(require_admin),
