@@ -4407,6 +4407,34 @@ async def generate_preview(
     sin tocar la cola — cada preview descartado gasta $0.80-3.20 Veo y un
     trial toquetea opciones más que un paid customer. Paid pasan normal.
     """
+    # Kill-switch de entorno, por encima del gate por plan.
+    #
+    # Medido en jul-2026 sobre los dos entornos: 147 fondos pre-generados,
+    # **4 reusados**. $91/mes fabricando fondos que se descartan.
+    #
+    # El motivo NO es que el operador cambie las opciones (eso se creyó
+    # primero y los datos lo desmienten): son dos flujos que no se cruzan.
+    # El 79% de los renders de staging entra por API — el bot de regresión y
+    # el preflight — y esos nunca disparan preview. Y los que sí usan el
+    # wizard renderizan 51-56 min después, cuando la ventana útil del
+    # pre-generado es de 30-90 s. La función asume un flujo de una canción
+    # de punta a punta; la producción real trabaja en lotes.
+    #
+    # Apagarlo NO hace esperar más al operador: hoy el render genera el fondo
+    # igual porque el pre-generado ya se descartó. Sólo se deja de pagar la
+    # fabricación duplicada.
+    #
+    # Se reusa el contrato `skipped` que el frontend ya maneja, así que
+    # apagarlo no rompe la UI. `BG_PREVIEW_ENABLED=1` lo vuelve a prender.
+    if os.environ.get("BG_PREVIEW_ENABLED", "1").strip().lower() in (
+        "0", "false", "off", "no"
+    ):
+        return {
+            "skipped": True,
+            "reason": "disabled",
+            "message": "El pre-render del fondo está desactivado. El video se genera igual al apretar 'Crear video'.",
+        }
+
     from auth import PLANS
     plan_id = (current_user.get("plan") or "free").strip()
     plan_cfg = PLANS.get(plan_id, PLANS["free"])

@@ -323,6 +323,20 @@ def run_bg_preview_job(
                         bg_verbatim=bool(params.get("bg_verbatim", False)),
                         bg_mode=params.get("background_mode", "veo"),
                         custom_colors=params.get("custom_colors", ""),
+                        # `effect` ENTRA al hash del cache (ver el dict
+                        # canónico de compute_bg_cache_key) pero no se pasaba
+                        # acá, mientras que el render sí lo pasa. O sea que
+                        # preview y render generaban cosas distintas bajo la
+                        # MISMA clave: el preview quedaba cacheado como si
+                        # fuera el fondo del render y nunca lo era.
+                        #
+                        # Impacto hoy = $0 (601 de 647 jobs tienen `effect`
+                        # vacío y no hay `foto_viva` desde junio), pero es un
+                        # camino de envenenamiento de cache latente: con
+                        # `foto_viva` el render fuerza Imagen mientras el
+                        # preview quemaba Veo, ~17x más caro, para un asset
+                        # que además nunca se puede reusar.
+                        effect=params.get("effect", ""),
                         allow_people=_compute_allow_people(
                             job_id, params.get("background_hint")
                         ),

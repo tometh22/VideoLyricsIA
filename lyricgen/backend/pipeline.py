@@ -9217,6 +9217,137 @@ def _veo_cache_key(prompt: str, model: str, params: dict) -> str:
     return _hash.sha256(payload.encode()).hexdigest()[:16]
 
 
+class VeoBudgetExceeded(RuntimeError):
+    """Una canción pidió más generaciones de Veo que el tope configurado.
+
+    Los tres llamadores de `_generate_veo_video` ya envuelven la llamada en
+    try/except con fallback (gradiente o reintento), así que esto frena el
+    gasto sin romper la entrega."""
+
+
+# Tope de generaciones PAGAS de Veo POR CANCIÓN. Medido en jul-2026: en prod,
+# 12 jobs (el 10%) se comieron el **42,8%** del gasto de Veo, y uno solo llegó
+# a 26 llamadas — unos $16 en un video que se vende a $8. Un job sano usa 1-3.
+#
+# El presupuesto es por CANCIÓN, no por job, y la diferencia importa: una
+# edición o un re-render crean un job NUEVO, así que un tope por job se
+# esquiva solo. Una canción que pasa por 5 ediciones a 10 llamadas cada una
+# gasta 50 sin que ningún tope se entere. Se cuenta sobre todos los jobs que
+# comparten `artista|título` normalizado — la misma identidad que usa
+# `cost_attribution`, así que el tope y el reporte de costos hablan de la
+# misma unidad.
+#
+# La ventana de `VEO_BUDGET_WINDOW_DAYS` evita que una canción rendereada
+# hace meses bloquee un re-render legítimo de hoy.
+#
+# El default es holgado a propósito: 10 sólo atrapa fugas reales — re-rolls
+# de escenas en loop (SCENE_REROLL_MAX=5 por escena × MAX_UNIQUE_SCENES=6) —
+# y no toca el trabajo normal. Bajarlo a 4-6 aprieta más, pero puede cortar
+# storyboards multi-escena legítimos.
+#
+# CORRECCIÓN (ago-2026): una versión anterior de este comentario decía que
+# los reintentos re-pagan Veo "porque el prompt sale con temperature=0.8 y
+# cambia el hash". Es FALSO y no estaba verificado: no existe ningún
+# temperature=0.8 en el código (los prompts se generan con 0.0-0.1), y
+# `queue_jobs.py` documenta que las fallas de Veo caen al gradient fallback
+# sin re-lanzar, así que el Retry de RQ NO reintenta Veo. El re-pago real
+# viene de los re-rolls y de `policy-recovery`, que fuerza cache miss.
+#
+# `VEO_MAX_CALLS_PER_SONG=0` lo desactiva.
+VEO_MAX_CALLS_PER_SONG = int(
+    os.environ.get("VEO_MAX_CALLS_PER_SONG",
+                   # Nombre viejo, para no romper entornos ya configurados.
+                   os.environ.get("VEO_MAX_CALLS_PER_JOB", "10"))
+)
+VEO_BUDGET_WINDOW_DAYS = int(os.environ.get("VEO_BUDGET_WINDOW_DAYS", "30"))
+
+
+def _veo_budget_exceeded(job_id: str | None) -> tuple[bool, int]:
+    """(¿pasó el tope?, llamadas pagas ya hechas) para la CANCIÓN de este job.
+
+    Suma todos los jobs que comparten `artista|título` dentro de la ventana,
+    así una edición o un re-render no estrenan presupuesto. Cuenta sobre
+    `ai_provenance` con el mismo `billable_filter()` que factura el panel, de
+    modo que el tope y el reporte no puedan divergir. Los cache hits no
+    cuentan: no se pagan.
+
+    Si el job no tiene artista ni título (previews sin metadata), cae a
+    contar sólo ese job — es lo más ajustado que se puede hacer sin una
+    identidad de canción.
+
+    Nunca levanta: si la consulta falla, deja pasar la generación. Un tope
+    de costo que rompe entregas cuando la DB hipa es peor que el gasto que
+    evita.
+    """
+    if not job_id or VEO_MAX_CALLS_PER_SONG <= 0:
+        return False, 0
+    try:
+        from datetime import datetime as _dt, timedelta, timezone as _tz
+
+        from sqlalchemy import func as _func
+
+        from database import AIProvenance, Job, SessionLocal
+        from provenance import billable_filter
+
+        db = SessionLocal()
+        try:
+            row = (db.query(Job.artist, Job.song_title)
+                     .filter(Job.job_id == job_id).one_or_none())
+            artist = (row[0] if row else "") or ""
+            title = (row[1] if row else "") or ""
+
+            q = (db.query(_func.count(AIProvenance.id))
+                   .filter(AIProvenance.tool_name.like("veo%"))
+                   .filter(billable_filter()))
+
+            if artist.strip() or title.strip():
+                since = _dt.now(_tz.utc) - timedelta(
+                    days=VEO_BUDGET_WINDOW_DAYS)
+                # Mismos jobs que agrupa cost_attribution.song_key():
+                # artista|título normalizado por mayúsculas y espacios.
+                # Se materializa la lista en vez de usar una subquery: son un
+                # puñado de jobs por canción y el SQL queda trivial de leer.
+                hermanos = [
+                    r[0] for r in
+                    db.query(Job.job_id)
+                      .filter(_func.lower(_func.trim(
+                          _func.coalesce(Job.artist, ""))) == artist.strip().lower())
+                      .filter(_func.lower(_func.trim(
+                          _func.coalesce(Job.song_title, ""))) == title.strip().lower())
+                      .filter(Job.created_at >= since)
+                      .all()
+                ]
+                # `or [job_id]` cubre el arranque: el job todavía puede no
+                # estar visible en su propia transacción.
+                q = q.filter(AIProvenance.job_id.in_(hermanos or [job_id]))
+                alcance = f"canción {artist!r}/{title!r} ({len(hermanos)} jobs)"
+            else:
+                q = q.filter(AIProvenance.job_id == job_id)
+                alcance = f"job {job_id} (sin metadata de canción)"
+
+            n = int(q.scalar() or 0)
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("[BG] no pude chequear el tope de Veo para job=%s: %r",
+                       job_id, exc)
+        return False, 0
+
+    if n >= VEO_MAX_CALLS_PER_SONG:
+        logger.error(
+            "[BG][BUDGET] %s alcanzó el tope de Veo: %d generaciones "
+            "pagas (tope %d). Se corta acá.",
+            alcance, n, VEO_MAX_CALLS_PER_SONG,
+        )
+        return True, n
+    if n >= VEO_MAX_CALLS_PER_SONG - 2:
+        logger.warning(
+            "[BG][BUDGET] %s va por %d/%d generaciones de Veo",
+            alcance, n, VEO_MAX_CALLS_PER_SONG,
+        )
+    return False, n
+
+
 def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         cache_namespace: str = "",
                         image_path: str | None = None,
@@ -9632,6 +9763,19 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # cache here. This function runs before content validation, so a normal
     # hit could reuse a hallucinated person. ``cache_only`` above is retained
     # exclusively for storyboard keys published after dense validation.
+
+    # Runaway guard. Everything above this line is free (cache); from here
+    # down every path costs money, so this is the one place a per-job
+    # ceiling can be enforced.
+    _over, _spent = _veo_budget_exceeded(job_id)
+    if _over:
+        recorder.finish(
+            response_summary=f"budget_exceeded: {_spent} llamadas Veo en la canción")
+        raise VeoBudgetExceeded(
+            f"job {job_id}: {_spent} generaciones de Veo ya hechas para esta "
+            f"canción (tope {VEO_MAX_CALLS_PER_SONG}). No se genera más para no "
+            f"seguir gastando; el llamador cae a su fallback."
+        )
 
     elapsed = _time.time() - _last_veo_request
     if elapsed < _VEO_COOLDOWN and _last_veo_request > 0:
