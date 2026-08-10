@@ -91,9 +91,40 @@ COST_PER_CALL: dict[tuple[str, str], float] = {
 DEFAULT_COST_PER_CALL = 0.01
 
 
-def cost_for_record(tool_name: str, tool_provider: str) -> float:
-    """Best-effort cost estimate for a single AIProvenance record."""
+def cost_for_record(tool_name: str, tool_provider: str,
+                    rates: dict[str, float] | None = None) -> float:
+    """Cost of one AIProvenance record.
+
+    `rates` are the per-tool rates DERIVED FROM THE INVOICE for the period
+    being measured (see `rate_calibration.load_applied_rates`). When present
+    they win over `COST_PER_CALL`, which is list price and drifts: Veo is
+    carried at $0.80 and the real invoice divides out to ~$0.62, so every
+    aggregate ran ~25% high.
+
+    Storing the calibration without applying it here — which is what the
+    first version of this did — makes the whole calibration module
+    decorative: the panel would report a "real" rate it never used.
+    """
+    if rates:
+        from rate_calibration import rate_for_tool
+        derived = rate_for_tool(tool_name, rates)
+        if derived is not None:
+            return derived
     return COST_PER_CALL.get((tool_name, tool_provider), DEFAULT_COST_PER_CALL)
+
+
+def rates_for_window(db, since: datetime) -> dict[str, float]:
+    """Calibrated rates for the month `since` falls in, or {} if none.
+
+    A window that spans two months uses the calibration of the month it
+    starts in — imperfect, but far closer than list price, and the
+    alternative (per-row month lookup) costs a query per row.
+    """
+    try:
+        from rate_calibration import load_applied_rates
+        return load_applied_rates(db, f"{since.year:04d}-{since.month:02d}")
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +179,9 @@ _WASTE_LABELS = {
 
 
 def cost_waste_breakdown(db: Session, since_days: int = 30,
-                         tenant_id: str | None = None) -> dict:
+                         tenant_id: str | None = None,
+                         start: datetime | None = None,
+                         end: datetime | None = None) -> dict:
     """Attribute billable AI spend to what it actually produced.
 
     The headline number the 2026-08 audit surfaced: in jul-2026, 59% of
@@ -180,12 +213,23 @@ def cost_waste_breakdown(db: Session, since_days: int = 30,
     tenant's operators are burning previews, since the waste rate is a
     workflow habit and varies a lot between them.
     """
-    since = datetime.now(timezone.utc) - timedelta(days=since_days)
+    # `start`/`end` explícitos ganan sobre `since_days`. Sin ellos, la
+    # ventana termina HOY — correcto para el panel en vivo, pero MAL para
+    # pedir un mes cerrado: preguntar por junio en agosto medía jul-ago y se
+    # comparaba contra la factura de junio.
+    since = start or (datetime.now(timezone.utc) - timedelta(days=since_days))
+    until = end
+    # Tarifas derivadas de la factura del período; {} cae a COST_PER_CALL.
+    _rates = rates_for_window(db, since)
+
+    def _window(query):
+        query = query.filter(AIProvenance.created_at >= since)
+        return query.filter(AIProvenance.created_at < until) if until else query
 
     def _scoped(query):
         return query.filter(Job.tenant_id == tenant_id) if tenant_id else query
 
-    rows = _scoped(
+    rows_q = _scoped(
         db.query(
             Job.status,
             AIProvenance.tool_name,
@@ -194,9 +238,8 @@ def cost_waste_breakdown(db: Session, since_days: int = 30,
             func.count(func.distinct(Job.job_id)).label("jobs"),
         )
         .join(Job, Job.job_id == AIProvenance.job_id)
-        .filter(AIProvenance.created_at >= since)
-        .filter(billable_filter())
-    ).group_by(
+    )
+    rows = _window(rows_q).filter(billable_filter()).group_by(
         Job.status, AIProvenance.tool_name, AIProvenance.tool_provider
     ).all()
 
@@ -205,18 +248,16 @@ def cost_waste_breakdown(db: Session, since_days: int = 30,
     for status, tool_name, tool_provider, calls, _jobs in rows:
         agg = per_status.setdefault(status, {"calls": 0, "cost": 0.0})
         agg["calls"] += calls
-        agg["cost"] += calls * cost_for_record(tool_name, tool_provider)
+        agg["cost"] += calls * cost_for_record(tool_name, tool_provider, _rates)
 
     # Distinct job counts must be queried separately — summing the
     # per-tool distinct counts above would multiply-count a job that used
     # several tools.
     job_counts = dict(
-        _scoped(
+        _window(_scoped(
             db.query(Job.status, func.count(func.distinct(Job.job_id)))
             .join(AIProvenance, Job.job_id == AIProvenance.job_id)
-            .filter(AIProvenance.created_at >= since)
-            .filter(billable_filter())
-        ).group_by(Job.status).all()
+        )).filter(billable_filter()).group_by(Job.status).all()
     )
 
     by_destination = []
@@ -251,6 +292,14 @@ def cost_waste_breakdown(db: Session, since_days: int = 30,
     # created_at silently lands it in the wrong month and skews both months'
     # cost per video. `coalesce` covers older rows without the column.
     delivered_videos = int(
+        _scoped(
+            db.query(func.count(Job.id))
+            .filter(func.coalesce(Job.completed_at, Job.created_at) >= since)
+            .filter(Job.status.in_(DELIVERED_STATUSES))
+        ).filter(
+            func.coalesce(Job.completed_at, Job.created_at) < until
+        ).scalar() or 0
+    ) if until else int(
         _scoped(
             db.query(func.count(Job.id))
             .filter(func.coalesce(Job.completed_at, Job.created_at) >= since)
@@ -298,6 +347,7 @@ def tenant_cost_summary(
     Joins AIProvenance with Job to filter by tenant_id.
     """
     since = datetime.now(timezone.utc) - timedelta(days=since_days)
+    _rates = rates_for_window(db, since)
 
     rows = (
         db.query(
@@ -317,7 +367,7 @@ def tenant_cost_summary(
     total_cost = 0.0
     total_calls = 0
     for tool_name, tool_provider, calls in rows:
-        rate = cost_for_record(tool_name, tool_provider)
+        rate = cost_for_record(tool_name, tool_provider, _rates)
         cost = calls * rate
         total_cost += cost
         total_calls += calls
@@ -376,6 +426,7 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
     Local Whisper stays at 0 (matches actual marginal cost).
     """
     since = datetime.now(timezone.utc) - timedelta(days=since_days)
+    _rates = rates_for_window(db, since)
 
     # --- AI spend by tool/provider (billable rows only) ---
     rows = (
@@ -419,7 +470,7 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
     total_cost = 0.0
     total_calls = 0
     for tool_name, tool_provider, calls in rows:
-        rate = cost_for_record(tool_name, tool_provider)
+        rate = cost_for_record(tool_name, tool_provider, _rates)
         cost = calls * rate
         bucket = _bucket_for(tool_name, tool_provider)
         total_cost += cost
@@ -500,7 +551,7 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
         agg = tenant_cost.setdefault(
             tenant_id, {"calls": 0, "cost": 0.0}
         )
-        rate = cost_for_record(tool_name, tool_provider)
+        rate = cost_for_record(tool_name, tool_provider, _rates)
         agg["calls"] += calls
         agg["cost"] += calls * rate
 
@@ -578,7 +629,7 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
             "calls": 0,
             "cost": 0.0,
         })
-        rate = cost_for_record(tool_name, tool_provider)
+        rate = cost_for_record(tool_name, tool_provider, _rates)
         agg["calls"] += calls
         agg["cost"] += calls * rate
 

@@ -891,9 +891,14 @@ def admin_cost_real(          # `def`, no `async def`: con live=true hace HTTP
     if live:
         return {**billing_sources.fetch_all(period=period), "source_of_truth": "live"}
 
+    # `rate_calibration` guarda tarifas, no gasto: su `amount_usd` es NULL a
+    # propósito. Contarla como una fuente de facturación la mandaba al balde
+    # de "errored" y dejaba `complete=false` para siempre, escondiendo si
+    # faltaba de verdad alguna factura.
     rows = (
         db.query(CostSnapshot)
         .filter(CostSnapshot.period == period)
+        .filter(CostSnapshot.source != "rate_calibration")
         .all()
     )
     if not rows:
@@ -961,7 +966,11 @@ async def admin_cost_unit_economics(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    rows = db.query(CostSnapshot).filter(CostSnapshot.period == period).all()
+    # Igual que en /cost/real: `rate_calibration` no es una fuente de gasto.
+    rows = (db.query(CostSnapshot)
+              .filter(CostSnapshot.period == period)
+              .filter(CostSnapshot.source != "rate_calibration")
+              .all())
     real_total = sum(
         r.amount_usd for r in rows
         if r.status == "ok" and r.amount_usd is not None
@@ -1016,7 +1025,10 @@ async def admin_cost_unit_economics(
     # Waste attribution runs off provenance (the invoice cannot say which
     # job a dollar belonged to), scoped to roughly the same window.
     days = max(1, (end - start).days + 1)
-    waste = cost_waste_breakdown(db, since_days=days)
+    # Ventana EXPLÍCITA del mes pedido. Con `since_days` la ventana termina
+    # hoy, así que pedir junio en agosto medía jul-ago y lo comparaba contra
+    # la factura de junio.
+    waste = cost_waste_breakdown(db, start=start_dt, end=end_dt)
 
     return {
         "period": period,
