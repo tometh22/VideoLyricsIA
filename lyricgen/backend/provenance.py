@@ -244,10 +244,16 @@ def cost_waste_breakdown(db: Session, since_days: int = 30,
     # provenance join: a job that shipped without any billable AI call
     # (library background reused as-is) is still a delivered video and
     # must dilute the cost per video.
+    #
+    # Counted by `completed_at`, not `created_at`: a song started on the last
+    # day of a month and finished in the next one belongs to the period it
+    # SHIPPED in, which is the period the invoice is compared against. Using
+    # created_at silently lands it in the wrong month and skews both months'
+    # cost per video. `coalesce` covers older rows without the column.
     delivered_videos = int(
         _scoped(
             db.query(func.count(Job.id))
-            .filter(Job.created_at >= since)
+            .filter(func.coalesce(Job.completed_at, Job.created_at) >= since)
             .filter(Job.status.in_(DELIVERED_STATUSES))
         ).scalar() or 0
     )

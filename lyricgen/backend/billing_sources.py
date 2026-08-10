@@ -734,6 +734,19 @@ def fetch_github(period: str) -> SourceCost:
             "github", period,
             "GITHUB_BILLING_TOKEN + GITHUB_BILLING_ORG o GITHUB_BILLING_USER")
 
+    # La API sólo devuelve el CICLO DE FACTURACIÓN EN CURSO — no acepta un
+    # mes. Sin este guard, pedir `period=2026-06` devolvía los minutos de HOY
+    # y `store_rates`/`/cost/refresh` los guardaba como si fueran de junio:
+    # un número inventado con apariencia de dato histórico. Preferimos
+    # declarar que no se puede antes que archivar algo falso.
+    if period != current_period():
+        return SourceCost(
+            "github", period, status="error",
+            detail=("la API de GitHub sólo expone el ciclo de facturación en "
+                    f"curso; no se puede consultar {period} en retrospectiva. "
+                    "Snapshotear el mes mientras está abierto."),
+        )
+
     scope = f"orgs/{org}" if org else f"users/{user}"
     try:
         resp = requests.get(

@@ -32,6 +32,7 @@ Uso
 """
 
 import os
+import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -51,13 +52,33 @@ WINDOWS_DAYS = (7, 14, 30, 60, 90, 180)
 REGENERABLE = (".mov",)
 
 
+# Los snapshots de versiones anteriores se guardan como `{key}.v1`, `.v2`…
+# (pipeline._snapshot_previous_deliverables). Clasificar sólo por la extensión
+# final los mandaba a "otros" y subestimaba ProRes en 808 GB — un 45% del
+# total. Son además los MEJORES candidatos a expirar: nadie descarga la v1 de
+# un video que ya se re-renderizó.
+_VERSION_SUFFIX = re.compile(r"\.v\d+$")
+
+
+def _base_ext(key: str) -> str:
+    """Extensión real, ignorando el sufijo de versión `.vN`."""
+    low = key.lower()
+    low = _VERSION_SUFFIX.sub("", low)
+    _, _, ext = low.rpartition(".")
+    return ext
+
+
 def _classify(key: str) -> str:
     low = key.lower()
-    if low.endswith(".mov"):
-        return "master ProRes (regenerable)"
-    if low.endswith(".mp4"):
-        return "video MP4 (FUENTE — no expirar)"
-    if low.endswith((".jpg", ".jpeg", ".png")):
+    versionado = bool(_VERSION_SUFFIX.search(low))
+    ext = _base_ext(low)
+    if ext == "mov":
+        return ("master ProRes VERSIÓN VIEJA" if versionado
+                else "master ProRes (regenerable)")
+    if ext == "mp4":
+        return ("MP4 versión vieja" if versionado
+                else "video MP4 (FUENTE — no expirar)")
+    if ext in ("jpg", "jpeg", "png"):
         return "miniatura"
     if "/inputs/" in low or low.startswith("inputs/"):
         return "audio original"
@@ -115,6 +136,8 @@ def main() -> int:
           f"{'ahorro/mes':>12}{'ahorro/año':>12}")
     print("-" * 70)
     for days in WINDOWS_DAYS:
+        # `startswith("master ProRes")` cubre las dos categorías: el master
+        # vigente y las versiones viejas `.vN`.
         freed = sum(sz for age, sz, kind in ages
                     if age > days and kind.startswith("master ProRes"))
         n = sum(1 for age, sz, kind in ages

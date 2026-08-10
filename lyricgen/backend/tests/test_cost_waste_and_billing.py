@@ -455,7 +455,25 @@ def test_github_404_explains_missing_scope(monkeypatch):
     monkeypatch.setenv("GITHUB_BILLING_USER", "alguien")
     monkeypatch.setattr(billing_sources.requests, "get", lambda *a, **k: _Resp())
 
-    result = billing_sources.fetch_github("2026-07")
+    result = billing_sources.fetch_github(billing_sources.current_period())
     assert result.status == "error"
     assert "user" in result.detail
     assert result.amount_usd is None
+
+
+def test_github_rechaza_meses_historicos(monkeypatch):
+    """La API sólo devuelve el ciclo de facturación EN CURSO. Sin este guard,
+    pedir un mes viejo devolvía los minutos de hoy y el snapshot los archivaba
+    como si fueran de ese mes — un número inventado con cara de dato
+    histórico."""
+    monkeypatch.setenv("GITHUB_BILLING_TOKEN", "ghp_fake")
+    monkeypatch.setenv("GITHUB_BILLING_USER", "alguien")
+    # Si llegara a pegarle a la API, esto reventaría el test.
+    monkeypatch.setattr(billing_sources.requests, "get",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("no debe consultar la API")))
+
+    result = billing_sources.fetch_github("2019-01")
+    assert result.status == "error"
+    assert result.amount_usd is None
+    assert "en curso" in result.detail

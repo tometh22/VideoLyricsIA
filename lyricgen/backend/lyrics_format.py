@@ -157,7 +157,26 @@ def _parse_response(raw: str, n_input: int) -> "dict | None":
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def strip_trailing_periods(result: dict) -> dict:
+def strip_periods_enabled_for(tenant_id: str | None) -> bool:
+    """¿Este tenant tiene activo el borrado del punto final?
+
+    Apagado por defecto. Un cambio que altera el texto entregado no debe poder
+    activarse por accidente para un cliente que no lo pidió — UMG lo pidió seis
+    veces, otro cliente puede querer la puntuación intacta.
+    """
+    if os.environ.get("LYRICS_STRIP_TRAILING_DOT", "0").strip().lower() not in (
+        "1", "true", "on", "yes"
+    ):
+        return False
+    tenants = {
+        t.strip().lower()
+        for t in os.environ.get("LYRICS_STRIP_TRAILING_DOT_TENANTS", "").split(",")
+        if t.strip()
+    }
+    return "*" in tenants or (tenant_id or "").strip().lower() in tenants
+
+
+def strip_trailing_periods(result: dict, tenant_id: str | None = None) -> dict:
     """Remove the final period from each lyric line.
 
     UMG's single most repeated change request — six times, unprompted, across
@@ -189,11 +208,13 @@ def strip_trailing_periods(result: dict) -> dict:
     on-screen line is a "frase" to the client. None exist in the current data,
     but the render path allows them.
 
-    Disable with `LYRICS_STRIP_TRAILING_DOT=0` if a client ever wants periods.
+    **Apagado por defecto y habilitado por tenant.** Cambia el texto que ve
+    todo cliente, así que no puede entrar de forma global: UMG lo pidió, otro
+    cliente puede querer la puntuación. `LYRICS_STRIP_TRAILING_DOT=1` +
+    `LYRICS_STRIP_TRAILING_DOT_TENANTS=universal_argentina,universal_chile`.
+    Con `*` aplica a todos.
     """
-    if os.environ.get("LYRICS_STRIP_TRAILING_DOT", "1").strip().lower() in (
-        "0", "false", "off", "no"
-    ):
+    if not strip_periods_enabled_for(tenant_id):
         return result
     if not isinstance(result, dict):
         return result

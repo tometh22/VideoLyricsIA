@@ -811,7 +811,7 @@ async def admin_margin_dashboard(
 # ---------------------------------------------------------------------------
 
 @router.post("/cost/refresh")
-async def admin_cost_refresh(
+def admin_cost_refresh(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
     period: str = Query("", description="YYYY-MM; vacío = mes actual"),
@@ -823,6 +823,13 @@ async def admin_cost_refresh(
     Replicate paginates predictions that age out), so an un-snapshotted
     month becomes unrecoverable — run this at least once after each month
     closes. Safe to re-run: rows are upserted on (period, source).
+
+    **Deliberately `def`, not `async def`.** `billing_sources` uses blocking
+    `requests` calls, and Replicate paginates up to 50 pages at 30 s timeout
+    each — worst case several minutes. Inside an `async def` that runs on the
+    event loop and stalls EVERY other request the process is serving; with
+    2 api replicas that is half the API frozen. FastAPI runs a plain `def`
+    endpoint in its threadpool, so the blocking I/O stays off the loop.
     """
     import billing_sources
     from database import CostSnapshot
@@ -856,8 +863,8 @@ async def admin_cost_refresh(
 
 
 @router.get("/cost/real")
-async def admin_cost_real(
-    admin: dict = Depends(require_admin),
+def admin_cost_real(          # `def`, no `async def`: con live=true hace HTTP
+    admin: dict = Depends(require_admin),   # bloqueante (ver /cost/refresh).
     db: Session = Depends(get_db),
     period: str = Query("", description="YYYY-MM; vacío = mes actual"),
     live: bool = Query(False, description="consultar las APIs en vez de leer el snapshot"),
@@ -973,13 +980,24 @@ async def admin_cost_unit_economics(
     from database import scoped_peer_db
 
     def _count(session):
-        base = session.query(func.count(Job.id)).filter(
-            Job.created_at >= start_dt, Job.created_at <= end_dt)
-        return (
-            int(base.filter(Job.status.in_(("done", "pending_review")))
-                .scalar() or 0),
-            int(base.scalar() or 0),
+        # Los ENTREGADOS se cuentan por `completed_at`, no por `created_at`:
+        # una canción arrancada el 30 de junio y terminada el 2 de julio
+        # pertenece al costo de julio, que es cuando se gastó y cuando se
+        # factura. `coalesce` cubre filas viejas sin el campo.
+        entregado_en = func.coalesce(Job.completed_at, Job.created_at)
+        delivered = int(
+            session.query(func.count(Job.id))
+            .filter(entregado_en >= start_dt, entregado_en <= end_dt)
+            .filter(Job.status.in_(("done", "pending_review")))
+            .scalar() or 0
         )
+        # Los CREADOS sí van por created_at — es literalmente eso lo que mide.
+        created = int(
+            session.query(func.count(Job.id))
+            .filter(Job.created_at >= start_dt, Job.created_at <= end_dt)
+            .scalar() or 0
+        )
+        return delivered, created
 
     delivered, created = _count(db)
     counted_environments = 1
@@ -1260,8 +1278,8 @@ async def admin_cost_umg(
 
 
 @router.post("/cost/calibrate-rates")
-async def admin_calibrate_rates(
-    admin: dict = Depends(require_admin),
+def admin_calibrate_rates(    # `def`: consulta BigQuery, que bloquea hasta
+    admin: dict = Depends(require_admin),   # BILLING_HTTP_TIMEOUT segundos.
     db: Session = Depends(get_db),
     period: str = Query("", description="YYYY-MM; vacío = mes actual"),
     dry_run: bool = Query(False, description="calcular sin guardar"),

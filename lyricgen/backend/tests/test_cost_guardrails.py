@@ -42,51 +42,84 @@ def test_energy_derived_seguia_moviendo_los_estribillos():
     assert scenes.energy_to_movement(0.20) == "estatico"
 
 
-def test_auto_ahora_usa_estatico_en_todas_las_escenas(monkeypatch):
+TENANT = "universal_argentina"
+
+
+def _habilitar(monkeypatch, tenants=TENANT):
     monkeypatch.setattr(scenes, "DEFAULT_MOVEMENT_WHEN_AUTO", "estatico")
-    plan = build_scene_plan(_sections(), {}, _prompt_fn, operator_movement="")
-    movs = [s["movement_style"] for s in plan["scenes"]]
-    assert movs == ["estatico", "estatico"], movs
+    monkeypatch.setattr(scenes, "DEFAULT_MOVEMENT_TENANTS",
+                        frozenset(t.strip() for t in tenants.split(",")))
+
+
+def test_apagado_por_defecto_no_cambia_nada(monkeypatch):
+    """Contrato principal: sin configurar nada, el video que ve TODO cliente
+    queda igual que antes (energy-derived). Un cambio que altera el
+    entregable no puede entrar prendido."""
+    monkeypatch.setattr(scenes, "DEFAULT_MOVEMENT_WHEN_AUTO", "")
+    monkeypatch.setattr(scenes, "DEFAULT_MOVEMENT_TENANTS", frozenset())
+    plan = build_scene_plan(_sections(), {}, _prompt_fn,
+                            operator_movement="", tenant_id=TENANT)
+    assert [s["movement_style"] for s in plan["scenes"]] == \
+        ["estatico", "dinamico"]
+
+
+def test_auto_usa_estatico_en_el_tenant_habilitado(monkeypatch):
+    _habilitar(monkeypatch)
+    plan = build_scene_plan(_sections(), {}, _prompt_fn,
+                            operator_movement="", tenant_id=TENANT)
+    assert [s["movement_style"] for s in plan["scenes"]] == \
+        ["estatico", "estatico"]
+
+
+def test_los_demas_tenants_no_se_tocan(monkeypatch):
+    """El canary: se prende para un cliente y el resto sigue exactamente
+    igual, así se puede mirar el resultado antes de ampliar."""
+    _habilitar(monkeypatch)
+    plan = build_scene_plan(_sections(), {}, _prompt_fn,
+                            operator_movement="", tenant_id="otro_sello")
+    assert [s["movement_style"] for s in plan["scenes"]] == \
+        ["estatico", "dinamico"]
 
 
 def test_la_eleccion_explicita_del_operador_sigue_mandando(monkeypatch):
     """El default sólo toca el camino Auto. Si el operador eligió, manda él."""
-    monkeypatch.setattr(scenes, "DEFAULT_MOVEMENT_WHEN_AUTO", "estatico")
+    _habilitar(monkeypatch)
     plan = build_scene_plan(_sections(), {}, _prompt_fn,
-                            operator_movement="animado")
+                            operator_movement="animado", tenant_id=TENANT)
     assert {s["movement_style"] for s in plan["scenes"]} == {"animado"}
 
 
 def test_estandar_sigue_cayendo_al_energy_derived(monkeypatch):
     """"estandar" es una elección explícita que PIDE variación por sección —
     no debe quedar aplastada por el default."""
-    monkeypatch.setattr(scenes, "DEFAULT_MOVEMENT_WHEN_AUTO", "estatico")
+    _habilitar(monkeypatch)
     plan = build_scene_plan(_sections(), {}, _prompt_fn,
-                            operator_movement="estandar")
-    movs = [s["movement_style"] for s in plan["scenes"]]
-    assert movs == ["estatico", "dinamico"], movs
+                            operator_movement="estandar", tenant_id=TENANT)
+    assert [s["movement_style"] for s in plan["scenes"]] == \
+        ["estatico", "dinamico"]
 
 
-def test_se_puede_volver_al_comportamiento_anterior(monkeypatch):
-    """`BG_DEFAULT_MOVEMENT=""` restaura el energy-derived, por si el default
-    resulta demasiado quieto para otro cliente."""
-    monkeypatch.setattr(scenes, "DEFAULT_MOVEMENT_WHEN_AUTO", "")
-    plan = build_scene_plan(_sections(), {}, _prompt_fn, operator_movement="")
-    movs = [s["movement_style"] for s in plan["scenes"]]
-    assert movs == ["estatico", "dinamico"], movs
+def test_asterisco_aplica_a_todos(monkeypatch):
+    _habilitar(monkeypatch, tenants="*")
+    plan = build_scene_plan(_sections(), {}, _prompt_fn,
+                            operator_movement="", tenant_id="cualquiera")
+    assert {s["movement_style"] for s in plan["scenes"]} == {"estatico"}
 
 
 # ---------------------------------------------------------------------------
 # Tope de generaciones de Veo
 # ---------------------------------------------------------------------------
 
-def _fake_counter(monkeypatch, n):
-    """Simula `n` llamadas pagas ya registradas para el job."""
+def _fake_counter(monkeypatch, n, artist="Bersuit", title="La Argentinidad"):
+    """Sesión falsa: `n` llamadas pagas ya registradas, y un job con la
+    identidad de canción indicada (o sin metadata si van vacías)."""
     import pipeline
 
     class _Q:
         def filter(self, *a, **k): return self
         def scalar(self): return n
+        def one_or_none(self): return (artist, title)
+        def all(self): return [("job-hermano-1",), ("job-hermano-2",)]
 
     class _S:
         def query(self, *a, **k): return _Q()
@@ -98,14 +131,14 @@ def _fake_counter(monkeypatch, n):
 
 def test_bajo_el_tope_deja_pasar(monkeypatch):
     p = _fake_counter(monkeypatch, 3)
-    monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_JOB", 10)
+    monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_SONG", 10)
     over, spent = p._veo_budget_exceeded("job123")
     assert over is False and spent == 3
 
 
 def test_en_el_tope_corta(monkeypatch):
     p = _fake_counter(monkeypatch, 10)
-    monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_JOB", 10)
+    monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_SONG", 10)
     over, spent = p._veo_budget_exceeded("job123")
     assert over is True and spent == 10
 
@@ -113,19 +146,42 @@ def test_en_el_tope_corta(monkeypatch):
 def test_el_job_de_26_llamadas_se_habria_cortado(monkeypatch):
     """El outlier real de jul-2026: 26 generaciones en una sola canción."""
     p = _fake_counter(monkeypatch, 26)
-    monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_JOB", 10)
+    monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_SONG", 10)
     assert p._veo_budget_exceeded("job123")[0] is True
+
+
+def test_el_presupuesto_es_POR_CANCION_no_por_job(monkeypatch):
+    """El punto de la revisión: un tope por job se esquiva solo, porque cada
+    edición o re-render crea un job NUEVO con presupuesto fresco. Una canción
+    que pasa por 5 ediciones a 10 llamadas gastaría 50 sin que ningún tope se
+    entere.
+
+    Acá el job es nuevo (0 llamadas propias) pero su canción ya acumuló 12
+    entre jobs hermanos → tiene que cortar igual.
+    """
+    p = _fake_counter(monkeypatch, 12, artist="Bersuit", title="La Argentinidad")
+    monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_SONG", 10)
+    over, spent = p._veo_budget_exceeded("job-recien-creado")
+    assert over is True and spent == 12
+
+
+def test_sin_metadata_de_cancion_cae_a_contar_solo_el_job(monkeypatch):
+    """Los previews sin artista/título no tienen identidad de canción; contar
+    sólo ese job es lo más ajustado posible sin inventar una."""
+    p = _fake_counter(monkeypatch, 11, artist="", title="")
+    monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_SONG", 10)
+    assert p._veo_budget_exceeded("job-sin-metadata")[0] is True
 
 
 def test_tope_en_cero_lo_desactiva(monkeypatch):
     p = _fake_counter(monkeypatch, 999)
-    monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_JOB", 0)
+    monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_SONG", 0)
     assert p._veo_budget_exceeded("job123") == (False, 0)
 
 
 def test_sin_job_id_no_topea(monkeypatch):
     p = _fake_counter(monkeypatch, 999)
-    monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_JOB", 10)
+    monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_SONG", 10)
     assert p._veo_budget_exceeded(None) == (False, 0)
     assert p._veo_budget_exceeded("") == (False, 0)
 
@@ -139,7 +195,7 @@ def test_si_la_db_falla_deja_generar(monkeypatch):
         def __init__(self): raise RuntimeError("db caida")
 
     monkeypatch.setattr("database.SessionLocal", _Boom)
-    monkeypatch.setattr(pipeline, "VEO_MAX_CALLS_PER_JOB", 10)
+    monkeypatch.setattr(pipeline, "VEO_MAX_CALLS_PER_SONG", 10)
     assert pipeline._veo_budget_exceeded("job123") == (False, 0)
 
 

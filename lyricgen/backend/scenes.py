@@ -421,31 +421,54 @@ def _cap_unique_scenes(sections: list[Section]) -> list[Section]:
 
 # Movimiento cuando el operador NO eligió ninguno ("Auto").
 #
-# Medido en ago-2026: el **86,6%** de los jobs de staging llega sin
-# `movement_style`, y antes esos caían al energy-derived, que para energía
-# ≥0,75 (los estribillos) devuelve "dinamico". El cliente pidió lo contrario
-# cinco veces por escrito: *"cambiar el fondo más estático"*, *"podríamos
-# cambiar este fondo a más estático?"*, *"un fondo sin tormenta y que no sea
-# animado"*, *"más tranqui o sin loop"*.
+# **Default VACÍO = comportamiento histórico intacto (energy-derived).** Es un
+# cambio que altera el video que ve TODO cliente, así que entra apagado y se
+# habilita por tenant, no globalmente. Ver `default_movement_for_tenant`.
 #
-# No es que elijan mal el movimiento: es que nadie elige, y el default se
-# movía. Cada pedido evitado vale mucho más que el Veo del re-render — es
-# tiempo de operador y una ida y vuelta con el cliente.
+# Por qué existe: medido en ago-2026, el **86,6%** de los jobs de staging llega
+# sin `movement_style` y esos caen al energy-derived, que para energía ≥0,75
+# (los estribillos) devuelve "dinamico". UMG pidió lo contrario cinco veces por
+# escrito: *"cambiar el fondo más estático"*, *"podríamos cambiar este fondo a
+# más estático?"*, *"un fondo sin tormenta y que no sea animado"*, *"más
+# tranqui o sin loop"*. No es que elijan mal: nadie elige, y el default se
+# movía.
 #
-# Solo afecta el camino Auto: una elección explícita del operador (incluido
-# "estandar", que pide variación por sección) sigue mandando. Poner
-# `BG_DEFAULT_MOVEMENT=""` restaura el comportamiento anterior.
+# Sólo afecta el camino Auto: una elección explícita del operador (incluido
+# "estandar", que pide variación por sección) sigue mandando.
 #
 # ⚠️ OJO al activar `VEO_MODEL_STATIC`: `pipeline._generate_veo_video` rutea
 # los renders "estatico"/"foto-estatica" a ese modelo, que sigue mejor la
-# consigna de cámara fija pero cuesta ~4x ($3,20 vs $0,80). Cuando esa
-# variable se pensó, "estatico" era una elección explícita y rara; con este
-# default pasa a ser el camino del ~86% de los jobs. Hoy la var está VACÍA en
-# staging y en prod (verificado ago-2026), así que no hay impacto — pero
-# activarla ahora multiplicaría el costo de casi todo, no de unos pocos.
+# consigna de cámara fija pero cuesta ~4x ($3,20 vs $0,80). Con este default
+# activo para un tenant, ese ruteo pasa a cubrir el ~86% de sus jobs en vez de
+# unos pocos. Hoy la var está VACÍA en staging y prod (verificado ago-2026).
 DEFAULT_MOVEMENT_WHEN_AUTO = os.environ.get(
-    "BG_DEFAULT_MOVEMENT", "estatico"
+    "BG_DEFAULT_MOVEMENT", ""
 ).strip().lower()
+
+# Tenants con el default activo, separados por coma. Permite el canary: se
+# prende para `universal_argentina` primero, se mira el resultado, y recién
+# después se amplía. `BG_DEFAULT_MOVEMENT_TENANTS=*` lo aplica a todos.
+DEFAULT_MOVEMENT_TENANTS = frozenset(
+    t.strip().lower()
+    for t in os.environ.get("BG_DEFAULT_MOVEMENT_TENANTS", "").split(",")
+    if t.strip()
+)
+
+
+def default_movement_for_tenant(tenant_id: str | None) -> str:
+    """Movimiento por defecto que le corresponde a este tenant, o "".
+
+    Devuelve "" (energy-derived, comportamiento histórico) salvo que el tenant
+    esté explícitamente habilitado. Un cambio que altera el entregable no debe
+    poder activarse por accidente para un cliente que no lo pidió.
+    """
+    if not DEFAULT_MOVEMENT_WHEN_AUTO:
+        return ""
+    if "*" in DEFAULT_MOVEMENT_TENANTS:
+        return DEFAULT_MOVEMENT_WHEN_AUTO
+    return (DEFAULT_MOVEMENT_WHEN_AUTO
+            if (tenant_id or "").strip().lower() in DEFAULT_MOVEMENT_TENANTS
+            else "")
 
 
 def energy_to_movement(energy: float) -> str:
@@ -470,6 +493,7 @@ def build_scene_plan(
     song_title: str = "",
     style: str = "",
     operator_movement: str = "",
+    tenant_id: str = "",
 ) -> dict:
     """Construye el storyboard: una escena por recurrence_key única.
 
@@ -501,8 +525,8 @@ def build_scene_plan(
     # comentario de DEFAULT_MOVEMENT_WHEN_AUTO: el 86,6% de los jobs llega
     # sin elección y el energy-derived les pone cámara en movimiento en los
     # estribillos, que es exactamente lo que el cliente pide sacar.
-    if _forced_movement is None and not _om and DEFAULT_MOVEMENT_WHEN_AUTO:
-        _forced_movement = DEFAULT_MOVEMENT_WHEN_AUTO
+    if _forced_movement is None and not _om:
+        _forced_movement = default_movement_for_tenant(tenant_id) or None
     scenes: list[dict] = []
     seen: dict[str, dict] = {}
     for sec in sections:
