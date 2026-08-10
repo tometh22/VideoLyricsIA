@@ -695,12 +695,16 @@ def fetch_r2(period: str) -> SourceCost:
     acct = accounts[0]
 
     storage_rows = acct.get("r2StorageAdaptiveGroups") or []
-    # Average the daily maxima to approximate GB-month.
+    # Integrate daily maxima over the *whole requested month*. Cloudflare
+    # omits dates with no/future observations, so dividing by the number of
+    # returned rows would turn ten observed days into a full GB-month and
+    # overstate an open month (or a bucket created mid-month).
     daily_gb = [
         float((r.get("max") or {}).get("payloadSize") or 0) / (1024 ** 3)
         for r in storage_rows
     ]
-    avg_gb = sum(daily_gb) / len(daily_gb) if daily_gb else 0.0
+    days_in_month = (end - start).days + 1
+    avg_gb = sum(daily_gb) / days_in_month if daily_gb else 0.0
     billable_gb = max(0.0, avg_gb - R2_FREE_GB)
     storage_cost = billable_gb * R2_USD_PER_GB_MONTH
 
