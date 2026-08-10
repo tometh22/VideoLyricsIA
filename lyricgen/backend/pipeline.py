@@ -11193,6 +11193,24 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
     return clip_for_key
 
 
+def _tenant_of_job(job_id: str | None) -> str:
+    """Tenant del job, normalizado, o "" si no se puede resolver.
+
+    Nunca levanta: un canary de producto que no se puede resolver tiene que
+    caer al comportamiento por defecto (apagado), no tumbar el render.
+    """
+    if not job_id:
+        return ""
+    try:
+        from database import SessionLocal as _SL, Job as _Job
+        with _SL() as _db:
+            row = (_db.query(_Job.tenant_id)
+                      .filter(_Job.job_id == job_id).one_or_none())
+        return _normalise_account_id(row[0] if row else None)
+    except Exception:
+        return ""
+
+
 def _generate_scene_background(segments: list[dict], audio_duration: float,
                               job_dir: str, *, style_hint: str, lyrics_text: str,
                               artist: str, song_title: str = "", genre: str = "",
@@ -11239,7 +11257,11 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                                       atmospherics_policy=atmospherics_policy)
     plan = _scenes.build_scene_plan(secs, bible, prompt_fn, artist=artist,
                                     song_title=song_title, style=style_hint,
-                                    operator_movement=_normalize_movement_style(movement_style))
+                                    operator_movement=_normalize_movement_style(movement_style),
+                                    # El canary de BG_DEFAULT_MOVEMENT es por
+                                    # tenant; sin esto sólo podía activarse con
+                                    # `*` (o sea, para todos los clientes).
+                                    tenant_id=_tenant_of_job(job_id))
     plan["generation_policy"] = {
         "policy_version": BACKGROUND_POLICY_VERSION,
         "creative_mode": creative_mode,

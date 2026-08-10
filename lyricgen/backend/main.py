@@ -4253,8 +4253,17 @@ async def transcribe_uploaded(
                                          _post_lang)
         _result = _maybe_chorus_snap(_result, job_id)
         _result = _maybe_phrase_segment(_result, job_id)
-        from lyrics_format import format_lyrics_pass as _fmt
-        return await _fmt(_result, language=_post_lang)
+        from lyrics_format import (
+            format_lyrics_pass as _fmt,
+            strip_trailing_periods as _strip_dots,
+        )
+        _result = await _fmt(_result, language=_post_lang)
+        # Mismo post-pase que el worker async (transcription_worker.py:311).
+        # Sin esto el texto entregado dependía de qué camino corrió — con
+        # ASYNC_TRANSCRIBE_ENABLED=0 el tenant habilitado seguía recibiendo
+        # los puntos finales.
+        return _strip_dots(_result,
+                           tenant_id=current_user.get("tenant_id", ""))
     finally:
         _release_transcription_slot(transcription_lease)
 
@@ -4939,8 +4948,14 @@ async def transcribe_endpoint(
                                      _post_lang)
     _result = _maybe_chorus_snap(_result, job_id)
     _result = _maybe_phrase_segment(_result, job_id)
-    from lyrics_format import format_lyrics_pass as _fmt
-    return await _fmt(_result, language=_post_lang)
+    from lyrics_format import (
+        format_lyrics_pass as _fmt,
+        strip_trailing_periods as _strip_dots,
+    )
+    _result = await _fmt(_result, language=_post_lang)
+    # Idem: el legacy /transcribe tiene que entregar el mismo texto que el
+    # worker async, o el resultado depende del endpoint que se use.
+    return _strip_dots(_result, tenant_id=current_user.get("tenant_id", ""))
 
 
 from ctc_cascade_veto import _ctc_cascade_veto  # noqa: E402
