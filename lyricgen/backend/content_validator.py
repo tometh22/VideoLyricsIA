@@ -482,7 +482,10 @@ def validate_image(
     recorder = record_ai_call(
         job_id=job_id or "unknown",
         step="output_validation",
-        tool_name="gemini-2.5-flash-vision",
+        # A single-image verdict is one Gemini request. Keep it distinct from
+        # the video-scan key, whose list rate represents as many as 48 frame
+        # requests, so calibration can preserve their relative cost.
+        tool_name="gemini-2.5-flash-vision-image",
         tool_provider="google_vertex",
         prompt=(
             "Classify image for people, commercial brands and atmospheric effects; "
