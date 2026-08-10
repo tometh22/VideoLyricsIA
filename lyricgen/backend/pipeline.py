@@ -9319,25 +9319,15 @@ def _song_identity(artist: str | None, title: str | None,
 
 def _veo_budget_exceeded(job_id: str | None,
                          own_row_id: int | None = None) -> tuple[bool, int]:
-    """(¿pasó el tope?, llamadas pagas ya hechas) para la CANCIÓN de este job.
+    """Reserva atómicamente un lugar de Veo para la canción del job.
 
-    `own_row_id` es la fila de provenance de la llamada EN CURSO. El recorder
-    se abre antes del chequeo, así que sin excluirla la llamada se cuenta a sí
-    misma y el tope corta una generación antes de lo configurado.
-
-    Esa exclusión, sola, no alcanza cuando varias escenas arrancan juntas:
-    `_generate_scene_clips` las manda por un ThreadPoolExecutor y cada hilo
-    inserta y commitea SU fila antes de llegar acá. Con 5 llamadas históricas
-    y 6 escenas simultáneas, cada hilo veía las otras 5 reservas, calculaba 10
-    y rechazaba — las 6 borraban su fila y la canción se quedaba sin ningún
-    clip, teniendo 5 lugares libres.
-
-    El desempate es el ORDEN DE LLEGADA, sin lock: además de la propia, se
-    ignoran las filas EN VUELO posteriores (`id` mayor). Las ya cerradas
-    cuentan siempre, vengan de donde vengan. Así el primero en reservar ve 5 y
-    entra, el segundo ve 6, y sólo el que se pasa del tope se cae. El id
-    autoincremental de Postgres es el árbitro y ya está serializado por la
-    propia base.
+    La fila propia nace como `budget_pending` (no facturable). En PostgreSQL,
+    todos los workers de un mismo tenant+canción serializan count+reserva con
+    `pg_advisory_xact_lock`; si hay cupo, la fila cambia a
+    `budget_reserved` ANTES de soltar el lock. Esto evita contar la llamada
+    propia y evita admitir dos escenas cuando queda un solo lugar. Un id de
+    secuencia no alcanza: PostgreSQL puede asignarlo antes del commit y hacer
+    visibles las transacciones en otro orden.
 
     Suma todos los jobs que comparten `artista|título` dentro de la ventana,
     así una edición o un re-render no estrenan presupuesto. Cuenta sobre
@@ -9357,11 +9347,12 @@ def _veo_budget_exceeded(job_id: str | None,
         return False, 0
     try:
         from datetime import datetime as _dt, timedelta, timezone as _tz
+        import hashlib as _hashlib
 
-        from sqlalchemy import func as _func
+        from sqlalchemy import func as _func, text as _sql_text
 
         from database import AIProvenance, Job, SessionLocal
-        from provenance import billable_filter
+        from provenance import BUDGET_RESERVED_PREFIX, billable_filter
 
         db = SessionLocal()
         try:
@@ -9370,13 +9361,30 @@ def _veo_budget_exceeded(job_id: str | None,
             artist = (row[0] if row else "") or ""
             title = (row[1] if row else "") or ""
             tenant = (row[2] if row else "") or ""
+            mio = _song_identity(artist, title, job_id)
+
+            # Cross-process serialization in production. Diagnostic calls
+            # without a recorder row remain read-only; SQLite is used by the
+            # local suite and serializes its writes independently.
+            bind = getattr(db, "bind", None)
+            dialect = getattr(getattr(bind, "dialect", None), "name", "")
+            if own_row_id is not None and dialect == "postgresql":
+                scope = f"{tenant}\0{mio}".encode("utf-8")
+                lock_key = int.from_bytes(
+                    _hashlib.sha256(scope).digest()[:8],
+                    byteorder="big",
+                    signed=True,
+                )
+                db.execute(
+                    _sql_text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                    {"lock_key": lock_key},
+                )
 
             since = _dt.now(_tz.utc) - timedelta(days=VEO_BUDGET_WINDOW_DAYS)
             q = (db.query(_func.count(AIProvenance.id))
                    .filter(AIProvenance.tool_name.like("veo%"))
                    .filter(billable_filter()))
 
-            mio = _song_identity(artist, title, job_id)
             if not mio.startswith("__sin_metadata__|"):
                 # Sólo los jobs con actividad de Veo PAGA en la ventana pueden
                 # ser hermanos. Arrancar por ahí en vez de por la tabla `jobs`
@@ -9418,17 +9426,29 @@ def _veo_budget_exceeded(job_id: str | None,
                 q = q.filter(AIProvenance.created_at >= since)
                 alcance = f"job {job_id} (sin metadata de canción)"
 
-            if own_row_id is not None:
-                from sqlalchemy import or_ as _or
-                q = q.filter(_or(
-                    # Ya cerradas: cuentan siempre.
-                    AIProvenance.response_summary.isnot(None),
-                    # En vuelo: sólo las que reservaron ANTES que yo. Excluye
-                    # también la propia (id no es < id).
-                    AIProvenance.id < own_row_id,
-                ))
-
             n = int(q.scalar() or 0)
+
+            # Reserve inside the same transaction as the advisory lock. The
+            # next worker must see this row as billable before deciding.
+            if n < VEO_MAX_CALLS_PER_SONG and own_row_id is not None:
+                updated = (
+                    db.query(AIProvenance)
+                    .filter(AIProvenance.id == own_row_id)
+                    .update(
+                        {"response_summary": (
+                            f"{BUDGET_RESERVED_PREFIX}: tenant={tenant} song={mio}"
+                        )},
+                        synchronize_session=False,
+                    )
+                )
+                if not updated:
+                    db.rollback()
+                    logger.warning(
+                        "[BG][BUDGET] no pude reservar fila=%s; fail-open",
+                        own_row_id,
+                    )
+                    return False, n
+                db.commit()
         finally:
             db.close()
     except Exception as exc:
@@ -9826,6 +9846,10 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                 job_id=job_id, step="video_bg", tool_name=model,
                 tool_provider="google_vertex", prompt=safe_prompt,
                 input_data_types=["generated_prompt"],
+                # The lookup is known to be free already. Persist that fact
+                # in the INSERT itself so another worker cannot observe a
+                # transient NULL and count it as a paid reservation.
+                initial_response_summary=summary,
             ).finish(response_summary=summary, output_artifact=artifact)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[BG] no pude registrar el lookup cache_only: %r", exc)
@@ -9875,6 +9899,8 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             f"[BG] cache_only: sin clip cacheado (probé {_candidates}) — no se genera "
             "para no re-cobrar Veo en una regeneración de escena")
 
+    from provenance import BUDGET_PENDING_PREFIX
+
     recorder = record_ai_call(
         job_id=job_id or "unknown",
         step="video_bg",
@@ -9882,6 +9908,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         tool_provider="google_vertex",
         prompt=safe_prompt,
         input_data_types=["generated_prompt"],
+        initial_response_summary=BUDGET_PENDING_PREFIX,
     ) if job_id else None
 
     # Fresh provider output is intentionally not read from the shared raw

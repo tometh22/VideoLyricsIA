@@ -144,6 +144,13 @@ CACHE_ONLY_MISS_PREFIX = "cache_only_miss"
 # salió: sin excluirla, cada rechazo del tope fabricaba gasto y además hacía
 # avanzar el propio tope.
 BUDGET_EXCEEDED_PREFIX = "budget_exceeded"
+# A paid Veo attempt waits in this non-billable state while it competes for
+# the per-song atomic budget reservation. It has not reached the provider.
+BUDGET_PENDING_PREFIX = "budget_pending"
+# Once admitted, the same row is marked reserved before the database lock is
+# released. This state is intentionally billable: a worker crash after
+# admission may still correspond to an upstream call.
+BUDGET_RESERVED_PREFIX = "budget_reserved"
 
 # Prefijos de `response_summary` que significan "esta fila existe para el
 # registro de auditoría, pero no salió plata". Toda la contabilidad los filtra.
@@ -151,6 +158,7 @@ NON_BILLABLE_PREFIXES = (
     CACHE_HIT_PREFIX,
     CACHE_ONLY_MISS_PREFIX,
     BUDGET_EXCEEDED_PREFIX,
+    BUDGET_PENDING_PREFIX,
 )
 
 
@@ -817,6 +825,7 @@ def record_ai_call(
     prompt: str,
     input_data_types: list[str] = None,
     tool_version: str = None,
+    initial_response_summary: str = None,
 ):
     """Start recording an AI call. Returns a ProvenanceRecorder.
 
@@ -833,6 +842,7 @@ def record_ai_call(
         prompt=prompt,
         input_data_types=input_data_types,
         tool_version=tool_version,
+        initial_response_summary=initial_response_summary,
     )
 
 
@@ -881,7 +891,8 @@ class ProvenanceRecorder:
     """
 
     def __init__(self, job_id, step, tool_name, tool_provider, prompt,
-                 input_data_types=None, tool_version=None):
+                 input_data_types=None, tool_version=None,
+                 initial_response_summary=None):
         self.job_id = job_id
         self.step = step
         self.tool_name = tool_name
@@ -889,6 +900,7 @@ class ProvenanceRecorder:
         self.prompt = prompt
         self.input_data_types = input_data_types
         self.tool_version = tool_version
+        self.initial_response_summary = initial_response_summary
         self.start_time = time.time()
         self._row_id: int | None = None
         self._finished = False
@@ -909,7 +921,12 @@ class ProvenanceRecorder:
                 tool_version=_fit_varchar(self.tool_version, "tool_version", self.job_id),
                 prompt_sent=prompt_text,
                 prompt_hash=hashlib.sha256(prompt_text.encode()).hexdigest(),
-                response_summary=None,
+                # Some operations are known to be non-billable before the
+                # row is inserted (cache-only lookups and budget candidates).
+                # Store that state atomically so another worker never observes
+                # a transient NULL and charges it.
+                response_summary=(str(self.initial_response_summary)[:2000]
+                                  if self.initial_response_summary else None),
                 input_data_types=self.input_data_types,
                 output_artifact=None,
                 duration_ms=None,

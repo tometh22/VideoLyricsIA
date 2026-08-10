@@ -141,40 +141,20 @@ def test_la_excepcion_es_atrapable_por_los_llamadores():
 # Regresiones de la segunda revisión
 # ---------------------------------------------------------------------------
 
-def test_no_se_cuenta_a_si_misma(monkeypatch):
-    """El recorder se abre ANTES del chequeo (tiene que cubrir el camino de
-    cache), así que sin excluir la fila propia el tope corta una generación
-    antes de lo configurado."""
-    p = _fake_counter(monkeypatch, 10)
-    monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_SONG", 10)
+def test_la_reserva_pendiente_no_se_cuenta_a_si_misma():
+    """La fila se inserta antes del guard para no perder auditoría si muere el
+    worker. Tiene que nacer explícitamente no facturable; excluirla por id no
+    alcanza bajo concurrencia entre transacciones."""
+    from provenance import BUDGET_PENDING_PREFIX, billable_filter
 
-    estado = {"excluido": False}
+    sql = str(billable_filter().compile(
+        compile_kwargs={"literal_binds": True}))
+    assert BUDGET_PENDING_PREFIX in sql
 
-    class _QExcl:
-        """Devuelve 9 cuando se excluye una fila, 10 cuando no."""
-        def __init__(self):
-            self._distinct = False
-        def filter(self, *a, **k):
-            # El filtro de admisión es el único que compara ids con `<`.
-            if a and "ai_provenance.id <" in str(a[0]):
-                estado["excluido"] = True
-            return self
-        def distinct(self):
-            self._distinct = True
-            return self
-        def scalar(self): return 9 if estado["excluido"] else 10
-        def one_or_none(self): return ("Bersuit", "La Argentinidad", "t1")
-        def all(self):
-            if self._distinct:
-                return [("j1",)]
-            return [("j1", "Bersuit", "La Argentinidad")]
-
-    monkeypatch.setattr(
-        "database.SessionLocal",
-        lambda: type("S", (), {"query": lambda s, *a, **k: _QExcl(),
-                               "close": lambda s: None})())
-    over, spent = p._veo_budget_exceeded("job123", own_row_id=555)
-    assert over is False and spent == 9, "la llamada en curso no debe contarse"
+    import inspect
+    import pipeline
+    source = inspect.getsource(pipeline._generate_veo_video)
+    assert "initial_response_summary=BUDGET_PENDING_PREFIX" in source
 
 
 def test_la_identidad_de_cancion_colapsa_espacios(monkeypatch):
@@ -333,6 +313,36 @@ def test_el_lookup_cache_only_se_registra_despues_de_saber_el_resultado():
     assert i_rec > i_cache, (
         "el recorder pago se abre antes del bloque cache_only → los lookups "
         "gratis quedan en vuelo contando como pagos")
+    bloque = src[src.index("def _registrar_cache_only"):i_cache]
+    assert "initial_response_summary=summary" in bloque, (
+        "el resultado cache_only se inserta primero como NULL y queda "
+        "transitoriamente facturable")
+
+
+def test_record_ai_call_inserta_el_estado_conocido_atomicamente(db):
+    """No debe existir una transacción intermedia con response_summary=NULL."""
+    from database import AIProvenance, Job
+    from provenance import CACHE_ONLY_MISS_PREFIX, record_ai_call
+
+    job_id = "atomiccache1"
+    db.query(Job).filter(Job.job_id == job_id).delete()
+    db.add(Job(job_id=job_id, user_id=1, tenant_id="atomic-cache",
+               artist="A", filename="a.mp3", status="processing"))
+    db.commit()
+    try:
+        recorder = record_ai_call(
+            job_id, "video_bg", "veo-3.1-fast-generate-001",
+            "google_vertex", "prompt",
+            initial_response_summary=f"{CACHE_ONLY_MISS_PREFIX}: key=x",
+        )
+        db.expire_all()
+        row = db.query(AIProvenance).filter(
+            AIProvenance.id == recorder._row_id).one()
+        assert row.response_summary.startswith(CACHE_ONLY_MISS_PREFIX)
+    finally:
+        db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+        db.query(Job).filter(Job.job_id == job_id).delete()
+        db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -388,53 +398,82 @@ def test_el_tope_no_se_reintenta():
     assert "break" in bloque and "sleep" not in bloque
 
 
-def test_seis_escenas_simultaneas_no_se_rechazan_entre_si(monkeypatch):
+def test_la_reserva_concurrente_usa_lock_atomico_no_orden_de_ids():
+    import inspect
     """`_generate_scene_clips` manda las escenas por un ThreadPoolExecutor y
-    cada hilo inserta y commitea SU fila antes de llegar al chequeo. Con 5
-    llamadas históricas y 6 escenas juntas, cada hilo veía las otras 5
-    reservas, calculaba 10 y rechazaba: las 6 borraban su fila y la canción se
-    quedaba sin NINGÚN clip, teniendo 5 lugares libres.
-
-    El desempate es el orden de llegada: se ignoran las filas en vuelo con id
-    mayor al propio. El primero ve 5 y entra; el sexto ve 10 y se cae.
+    cada proceso puede commitear en un orden distinto al de la secuencia. El
+    count y la reserva deben vivir bajo un lock de base compartido por todos
+    los workers, nunca bajo una comparación de ids.
     """
     import pipeline
+    src = inspect.getsource(pipeline._veo_budget_exceeded)
+    assert "pg_advisory_xact_lock" in src
+    assert "AIProvenance.id < own_row_id" not in src
 
-    HISTORICAS = 5
-    # ids de las 6 reservas simultáneas, en orden de llegada.
-    EN_VUELO = [101, 102, 103, 104, 105, 106]
 
-    def _contar(own_row_id):
-        anteriores = [i for i in EN_VUELO if i < own_row_id]
-        return HISTORICAS + len(anteriores)
+def test_seis_escenas_concurrentes_reservan_exactamente_cinco(db, monkeypatch):
+    """Integración real en PostgreSQL: con cinco llamadas históricas y cinco
+    lugares libres, seis transacciones simultáneas admiten exactamente cinco.
+    SQLite local no implementa advisory locks; CI ejecuta este caso en PG."""
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime, timezone
 
-    class _Q:
-        def __init__(self): self._own = None
-        def filter(self, *a, **k):
-            for arg in a:
-                txt = str(arg)
-                if "ai_provenance.id <" in txt:
-                    self._own = "marcado"
-            return self
-        def distinct(self): return self
-        def one_or_none(self): return ("Bersuit", "La Argentinidad", "t1")
-        def all(self): return [("j1", "Bersuit", "La Argentinidad")]
-        def scalar(self): return _contar(_actual["id"])
+    import pipeline
+    from database import AIProvenance, Job, User, engine
+    from provenance import BUDGET_PENDING_PREFIX, BUDGET_RESERVED_PREFIX
 
-    _actual = {"id": None}
-    monkeypatch.setattr(
-        "database.SessionLocal",
-        lambda: type("S", (), {"query": lambda s, *a, **k: _Q(),
-                               "close": lambda s: None})())
+    if engine.dialect.name != "postgresql":
+        pytest.skip("la carrera cross-process requiere PostgreSQL")
+
+    job_id = "atomicbudget"
+    db.query(Job).filter(Job.job_id == job_id).delete()
+    user = User(username="atomic-budget-user", hashed_password="unused",
+                tenant_id="atomic-tenant")
+    db.add(user)
+    db.flush()
+    db.add(Job(job_id=job_id, user_id=user.id, tenant_id="atomic-tenant",
+               artist="Bersuit", song_title="La Argentinidad",
+               filename="a.mp3", status="processing"))
+    db.flush()
+    now = datetime.now(timezone.utc)
+    for _ in range(5):
+        db.add(AIProvenance(
+            job_id=job_id, step="video_bg",
+            tool_name="veo-3.1-fast-generate-001",
+            tool_provider="google_vertex", prompt_sent="historical",
+            response_summary="provider_ok", created_at=now,
+        ))
+    pending = []
+    for _ in range(6):
+        row = AIProvenance(
+            job_id=job_id, step="video_bg",
+            tool_name="veo-3.1-fast-generate-001",
+            tool_provider="google_vertex", prompt_sent="pending",
+            response_summary=BUDGET_PENDING_PREFIX, created_at=now,
+        )
+        db.add(row)
+        pending.append(row)
+    db.commit()
+
     monkeypatch.setattr(pipeline, "VEO_MAX_CALLS_PER_SONG", 10)
-
-    admitidos = []
-    for rid in EN_VUELO:
-        _actual["id"] = rid
-        over, _ = pipeline._veo_budget_exceeded("job123", own_row_id=rid)
-        if not over:
-            admitidos.append(rid)
-
-    assert admitidos == [101, 102, 103, 104, 105], (
-        "los 5 lugares libres tienen que repartirse por orden de llegada, no "
-        f"perderse porque todos se rechazan entre sí. Admitidos: {admitidos}")
+    row_ids = [row.id for row in pending]
+    try:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(
+                lambda rid: pipeline._veo_budget_exceeded(job_id, rid),
+                row_ids,
+            ))
+        assert sum(not over for over, _spent in results) == 5
+        assert sum(over for over, _spent in results) == 1
+        db.expire_all()
+        reserved = db.query(AIProvenance).filter(
+            AIProvenance.id.in_(row_ids),
+            AIProvenance.response_summary.like(
+                f"{BUDGET_RESERVED_PREFIX}%"),
+        ).count()
+        assert reserved == 5
+    finally:
+        db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+        db.query(Job).filter(Job.job_id == job_id).delete()
+        db.query(User).filter(User.username == "atomic-budget-user").delete()
+        db.commit()
