@@ -586,6 +586,56 @@ def test_railway_vacio_tampoco_borra_snapshot_provisional(
         db.commit()
 
 
+def test_refresh_fallido_del_mes_abierto_conserva_snapshot_pero_no_completa(
+    client, admin_token, db, monkeypatch,
+):
+    import billing_sources
+    from database import CostSnapshot
+
+    period = billing_sources.current_period()
+    db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+    db.add(CostSnapshot(
+        period=period, source="gcp", amount_usd=10.0, status="ok",
+        detail="captura intrames", breakdown=[{"cost": 10.0}],
+        fetched_at=datetime.now(timezone.utc) - timedelta(days=1),
+    ))
+    db.commit()
+    entries = [
+        {"source": source, "amount_usd": (None if source == "gcp" else 1.0),
+         "status": ("error" if source == "gcp" else "ok"),
+         "detail": ("timeout" if source == "gcp" else "ok"),
+         "is_estimate": False, "breakdown": []}
+        for source in billing_sources.SOURCES
+    ]
+    monkeypatch.setattr(billing_sources, "fetch_all", lambda **kw: {
+        "period": period, "sources": entries,
+    })
+    try:
+        response = client.post(
+            f"/admin/cost/refresh?period={period}",
+            headers=auth(admin_token),
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        gcp = next(row for row in body["sources"] if row["source"] == "gcp")
+        assert gcp["status"] == "error"
+        assert gcp["amount_usd"] is None
+        assert gcp["retained_amount_usd"] == 10.0
+        assert gcp["stale"] is True
+        assert body["complete"] is False
+        assert body["errored"] == ["gcp"]
+        db.expire_all()
+        stored = db.query(CostSnapshot).filter(
+            CostSnapshot.period == period,
+            CostSnapshot.source == "gcp",
+        ).one()
+        assert stored.status == "ok"
+        assert stored.amount_usd == 10.0
+    finally:
+        db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+        db.commit()
+
+
 def test_primer_refresh_maduro_finaliza_snapshot_provisional(
     client, admin_token, db, monkeypatch,
 ):
@@ -1123,6 +1173,36 @@ def test_r2_descuenta_las_cuotas_gratuitas_de_operaciones(monkeypatch):
     by_concept = {row["concepto"]: row for row in out.breakdown}
     assert by_concept["operaciones clase A"]["billable_requests"] == 0
     assert by_concept["operaciones clase B"]["billable_requests"] == 0
+
+
+def test_r2_no_imputa_franquicia_account_wide_a_un_bucket(monkeypatch):
+    import billing_sources
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"data": {"viewer": {"accounts": [{
+                "r2StorageAdaptiveGroups": [],
+                "r2OperationsAdaptiveGroups": [
+                    {"sum": {"requests": 100},
+                     "dimensions": {"actionType": "PutObject"}},
+                    {"sum": {"requests": 200},
+                     "dimensions": {"actionType": "GetObject"}},
+                ],
+            }]}}}
+
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "token")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "account")
+    monkeypatch.setenv("R2_BUCKET", "genly")
+    monkeypatch.setattr(billing_sources.requests, "post", lambda *a, **k: _Resp())
+
+    out = billing_sources.fetch_r2("2026-07")
+    by_concept = {row["concepto"]: row for row in out.breakdown}
+    assert by_concept["operaciones clase A"]["included_requests"] == 0
+    assert by_concept["operaciones clase A"]["billable_requests"] == 100
+    assert by_concept["operaciones clase B"]["included_requests"] == 0
+    assert by_concept["operaciones clase B"]["billable_requests"] == 200
+    assert out.raw["account_allowances_applied"] is False
 
 
 def test_r2_prorratea_filas_parciales_sobre_todo_el_mes(monkeypatch):

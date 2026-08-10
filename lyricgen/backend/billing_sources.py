@@ -483,7 +483,11 @@ def fetch_railway(period: str) -> SourceCost:
         })
     metered_total = total
     plan_minimum = _railway_plan_minimum_usd()
-    if metered_total < plan_minimum:
+    # The commitment is charged at account/workspace scope. When analytics
+    # are narrowed to one project, applying the entire top-up to that project
+    # can invent spend if sibling projects already consume the commitment.
+    minimum_applies = not project_id
+    if minimum_applies and metered_total < plan_minimum:
         top_up = plan_minimum - metered_total
         breakdown.append({
             "measurement": "PLAN_MINIMUM_TOP_UP",
@@ -497,13 +501,20 @@ def fetch_railway(period: str) -> SourceCost:
     return SourceCost(
         source="railway", period=period, amount_usd=round(total, 2),
         breakdown=breakdown, is_estimate=True,
-        detail=("calculado sobre métricas de uso con tarifas publicadas "
+        detail=(
+            "calculado sobre métricas de uso con tarifas publicadas "
+            + (
                 f"y compromiso mínimo de ${plan_minimum:.2f} "
-                "(Railway no expone el importe facturado por API)"),
+                if minimum_applies else
+                "sin imputar el compromiso account-wide al proyecto "
+            )
+            + "(Railway no expone el importe facturado por API)"
+        ),
         raw={"scope": project_id or workspace_id or "cuenta completa",
              "minutes_in_period": minutes_in_period,
              "metered_usage_usd": round(metered_total, 4),
-             "plan_minimum_usd": round(plan_minimum, 2)},
+             "plan_minimum_usd": round(plan_minimum, 2),
+             "plan_minimum_applied": minimum_applies},
     )
 
 
@@ -714,7 +725,15 @@ def fetch_r2(period: str) -> SourceCost:
     ]
     days_in_month = (end - start).days + 1
     avg_gb = sum(daily_gb) / days_in_month if daily_gb else 0.0
-    billable_gb = max(0.0, avg_gb - R2_FREE_GB)
+    # R2 allowances belong to the Cloudflare account, not a bucket. A
+    # bucket-scoped query cannot know whether sibling buckets consumed them;
+    # charging this bucket's metered usage without the account-wide discount
+    # is conservative and avoids freezing an understated "complete" cost.
+    allowances_apply = not bucket
+    included_gb = R2_FREE_GB if allowances_apply else 0.0
+    included_class_a = R2_FREE_CLASS_A if allowances_apply else 0
+    included_class_b = R2_FREE_CLASS_B if allowances_apply else 0
+    billable_gb = max(0.0, avg_gb - included_gb)
     storage_cost = billable_gb * R2_USD_PER_GB_MONTH
 
     class_a = class_b = 0
@@ -733,8 +752,8 @@ def fetch_r2(period: str) -> SourceCost:
     # Price only the excess, just like storage above. These defaults mirror
     # Cloudflare's published allowances and remain env-tunable if the plan or
     # pricing changes.
-    billable_class_a = max(0, class_a - R2_FREE_CLASS_A)
-    billable_class_b = max(0, class_b - R2_FREE_CLASS_B)
+    billable_class_a = max(0, class_a - included_class_a)
+    billable_class_b = max(0, class_b - included_class_b)
     class_a_cost = (billable_class_a / 1e6) * R2_USD_PER_MILLION_CLASS_A
     class_b_cost = (billable_class_b / 1e6) * R2_USD_PER_MILLION_CLASS_B
     ops_cost = class_a_cost + class_b_cost
@@ -747,17 +766,22 @@ def fetch_r2(period: str) -> SourceCost:
         source="r2", period=period,
         amount_usd=round(storage_cost + ops_cost, 2), is_estimate=True,
         detail=(f"calculado: {avg_gb:.1f} GB promedio ({billable_gb:.1f} GB "
-                f"facturables tras {R2_FREE_GB:.0f} GB gratis), {objects:,} objetos"),
+                f"facturables tras {included_gb:.0f} GB imputados de franquicia), "
+                f"{objects:,} objetos"
+                + ("; franquicias account-wide no aplicadas al bucket"
+                   if bucket else "")),
         breakdown=[
             {"concepto": "storage", "cost": round(storage_cost, 4),
-             "avg_gb": round(avg_gb, 2)},
+             "avg_gb": round(avg_gb, 2), "included_gb": included_gb},
             {"concepto": "operaciones clase A", "cost": round(class_a_cost, 4),
-             "requests": class_a, "included_requests": R2_FREE_CLASS_A,
+             "requests": class_a, "included_requests": included_class_a,
              "billable_requests": billable_class_a},
             {"concepto": "operaciones clase B", "cost": round(class_b_cost, 4),
-             "requests": class_b, "included_requests": R2_FREE_CLASS_B,
+             "requests": class_b, "included_requests": included_class_b,
              "billable_requests": billable_class_b},
         ],
+        raw={"scope": bucket or "cuenta completa",
+             "account_allowances_applied": allowances_apply},
     )
 
 
