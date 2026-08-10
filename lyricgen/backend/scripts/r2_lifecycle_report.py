@@ -47,9 +47,10 @@ FREE_GB = float(os.environ.get("R2_FREE_GB", "10"))
 # cota inferior teórica).
 WINDOWS_DAYS = (7, 14, 30, 60, 90, 180)
 
-# Sufijos que se pueden regenerar desde otro artefacto que sí conservamos.
-# Sólo estos son candidatos a expirar.
-REGENERABLE = (".mov",)
+# Nombres determinísticos que produce el transcode ProRes. La extensión sola
+# no alcanza: el operador también puede subir un MOV como fondo y ese input no
+# es regenerable desde el MP4 final.
+REGENERABLE_PRORES_NAMES = frozenset({"umg_master.mov", "umg_short.mov"})
 
 
 # Los snapshots de versiones anteriores se guardan como `{key}.v1`, `.v2`…
@@ -71,17 +72,21 @@ def _base_ext(key: str) -> str:
 def _classify(key: str) -> str:
     low = key.lower()
     versionado = bool(_VERSION_SUFFIX.search(low))
+    base_key = _VERSION_SUFFIX.sub("", low)
+    filename = base_key.rsplit("/", 1)[-1]
     ext = _base_ext(low)
-    if ext == "mov":
+    if filename in REGENERABLE_PRORES_NAMES:
         return ("master ProRes VERSIÓN VIEJA" if versionado
                 else "master ProRes (regenerable)")
+    if "/inputs/" in low or low.startswith("inputs/"):
+        return "input original (FUENTE — no expirar)"
+    if ext == "mov":
+        return "MOV no reconocido (NO expirar)"
     if ext == "mp4":
         return ("MP4 versión vieja" if versionado
                 else "video MP4 (FUENTE — no expirar)")
     if ext in ("jpg", "jpeg", "png"):
         return "miniatura"
-    if "/inputs/" in low or low.startswith("inputs/"):
-        return "audio original"
     return "otros"
 
 

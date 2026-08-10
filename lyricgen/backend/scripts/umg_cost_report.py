@@ -66,6 +66,23 @@ def _fmt_usd(v) -> str:
     return "—" if v is None else f"${v:,.2f}"
 
 
+def _delivered_cost_stats(songs: list[dict], quoteable_average) -> dict | None:
+    """Distribution of delivered songs plus the all-spend quote average."""
+    delivered = sorted(s["cost"] for s in songs if s["delivered"])
+    if not delivered:
+        return None
+    n = len(delivered)
+    median = (delivered[n // 2] if n % 2 else
+              (delivered[n // 2 - 1] + delivered[n // 2]) / 2)
+    return {
+        "n": n,
+        "median": median,
+        "quoteable_average": quoteable_average,
+        "max": max(delivered),
+        "min": min(delivered),
+    }
+
+
 def parse_invoices(raw: str) -> tuple[dict[str, float], dict[str, list[dict]]]:
     """Parse flat amounts plus optional provider service breakdowns.
 
@@ -155,19 +172,17 @@ def render_markdown(a: dict, top_n: int) -> str:
         # Statistics over DELIVERED songs only: mixing in abandoned ones
         # drags the median down, and they sit at the cheap end by
         # construction (they stopped before rendering).
-        dcosts = [s["cost"] for s in songs if s["delivered"]]
-        if dcosts:
-            ordered = sorted(dcosts)
-            n = len(ordered)
-            mid = (ordered[n // 2] if n % 2
-                   else (ordered[n // 2 - 1] + ordered[n // 2]) / 2)
-            w(f"\nSobre las {n} entregadas — mediana **{_fmt_usd(mid)}** · "
-              f"promedio **{_fmt_usd(sum(dcosts) / n)}** · "
-              f"máx **{_fmt_usd(max(dcosts))}** · mín **{_fmt_usd(min(dcosts))}**")
-            w("\n> Para cotizar usá el **promedio**, no la mediana: la plata "
-              "que sale es la suma, y la cola de canciones re-generadas "
-              "muchas veces es real. La mediana sirve para ver el caso "
-              "típico, no para fijar precio.")
+        stats = _delivered_cost_stats(songs, u["direct_cost_per_song"])
+        if stats:
+            w(f"\nSobre las {stats['n']} entregadas — "
+              f"mediana **{_fmt_usd(stats['median'])}** · "
+              f"promedio cotizable **{_fmt_usd(stats['quoteable_average'])}** · "
+              f"máx **{_fmt_usd(stats['max'])}** · "
+              f"mín **{_fmt_usd(stats['min'])}**")
+            w("\n> Para cotizar usá el **promedio cotizable**, no la mediana: "
+              "incluye toda la IA directa pagada —también canciones tocadas "
+              "que no se entregaron— dividida sólo por entregas. La mediana y "
+              "los extremos describen las entregadas, pero no fijan precio.")
 
     # ---------------- Level 2 ----------------
     t = a.get("umg_total")
