@@ -9288,6 +9288,22 @@ def _discard_provenance_row(recorder) -> None:
         recorder.finish(response_summary="budget_exceeded: no se generó nada")
 
 
+def _release_veo_reservation(recorder, reason: str) -> None:
+    """Close a reserved row as free after a definite provider rejection.
+
+    Unlike an exception raised by ``requests.post`` (ambiguous: Vertex may
+    have accepted the operation), an HTTP rejection or a pre-POST failure
+    proves there is no billable generation behind the reservation. Keep the
+    row for audit, but exclude it from spend and the per-song ceiling.
+    """
+    if recorder is None:
+        return
+    from provenance import BUDGET_RELEASED_PREFIX
+    recorder.finish(
+        response_summary=f"{BUDGET_RELEASED_PREFIX}: {str(reason)[:1900]}"
+    )
+
+
 def _song_identity(artist: str | None, title: str | None,
                    job_id: str | None = None) -> str:
     """Identidad de canción, IDÉNTICA a `cost_attribution.song_key`.
@@ -9958,7 +9974,6 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     MAX_BACKOFF_S = 120
     MAX_ATTEMPTS = 5
     operation_name: str | None = None
-    last_error: str | None = None
     rate_limit_hits = 0
 
     import veo_breaker
@@ -10004,10 +10019,18 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         )
 
     for attempt in range(MAX_ATTEMPTS):
+        if attempt:
+            try:
+                token = _veo_access_token()
+            except Exception as exc:
+                # Every prior attempt was a confirmed 429 rejection. If token
+                # refresh now fails, no request for this reservation is in
+                # flight and the slot is definitely free.
+                _release_veo_reservation(
+                    recorder, f"pre-submit auth failed: {exc}")
+                raise
         try:
             logger.info("[BG] Veo 3: generating video (attempt %s/%s)...", attempt + 1, MAX_ATTEMPTS)
-            if attempt:
-                token = _veo_access_token()
             r = _req.post(
                 submit_url,
                 headers={
@@ -10018,66 +10041,66 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                 json=request_body,
                 timeout=60,
             )
-            if r.status_code == 429 or "RESOURCE_EXHAUSTED" in r.text:
-                rate_limit_hits += 1
-                last_error = f"HTTP {r.status_code} rate-limited"
-                veo_breaker.record_rate_limit()  # feeds the cross-worker breaker
-                # Capped exponential backoff + ±20 % jitter. Without
-                # jitter, N concurrent jobs that all hit a 429 at the
-                # same instant retry in lock-step → second wave of
-                # 429s → cascade. Jitter spreads the retry window so
-                # quota recovers naturally.
-                base = min(MAX_BACKOFF_S, 30 * (2 ** attempt))
-                wait = base * random.uniform(0.8, 1.2)
-                # Submit budget: don't keep sleeping in-slot past the budget —
-                # bail so the job falls to gradient instead of burning the full
-                # backoff during a quota storm.
-                if _time.time() + wait > _submit_deadline:
-                    logger.warning("[BG] Veo submit budget (%.0fs) exhausted — bailing to fallback", _submit_budget_s)
-                    break
-                logger.warning("[BG] Rate limited (HTTP %s), waiting %.1fs before retry...",
-                               r.status_code, wait)
-                _time.sleep(wait)
-                continue
-            if not r.ok:
-                detail = r.text[:500]
-                # Non-retryable: bubble immediately so the caller can mark
-                # the job error with a useful reason.
-                raise RuntimeError(
-                    f"Veo predictLongRunning HTTP {r.status_code}: {detail}"
-                )
-            payload = r.json()
-            operation_name = payload.get("name")
-            if not operation_name:
-                raise RuntimeError(f"Veo response missing 'name': {payload}")
-            veo_breaker.record_success()  # Veo accepted → close the breaker if open
-            break
-        except RuntimeError:
-            raise
         except Exception as e:
             _raise_if_job_timeout(e)
-            last_error = f"network/transient: {e}"
-            logger.error("[BG] Veo 3 attempt %s request error: %s", attempt + 1, e)
-            base = min(MAX_BACKOFF_S, 15 * (2 ** attempt))
+            # Once post() has started, a timeout/disconnect is ambiguous: the
+            # provider may already be rendering. Preserve this one billable
+            # reservation and DO NOT submit again under the same row.
+            if recorder:
+                recorder.finish(
+                    response_summary=f"error: ambiguous submission; not retrying: {str(e)[:300]}"
+                )
+            raise RuntimeError(
+                f"Veo 3 submission response was ambiguous; not retrying: {e}"
+            ) from e
+
+        if r.status_code == 429 or "RESOURCE_EXHAUSTED" in r.text:
+            rate_limit_hits += 1
+            veo_breaker.record_rate_limit()  # feeds the cross-worker breaker
+            # Capped exponential backoff + ±20 % jitter. All retries here are
+            # safe under ONE reservation because every prior HTTP response
+            # explicitly rejected the request and created no operation.
+            base = min(MAX_BACKOFF_S, 30 * (2 ** attempt))
             wait = base * random.uniform(0.8, 1.2)
             if _time.time() + wait > _submit_deadline:
-                logger.warning("[BG] Veo submit budget exhausted (transient) — bailing to fallback")
+                logger.warning("[BG] Veo submit budget (%.0fs) exhausted — bailing to fallback", _submit_budget_s)
                 break
+            logger.warning("[BG] Rate limited (HTTP %s), waiting %.1fs before retry...",
+                           r.status_code, wait)
             _time.sleep(wait)
             continue
+        if not r.ok:
+            detail = r.text[:500]
+            _release_veo_reservation(
+                recorder, f"HTTP {r.status_code} rejected: {detail}")
+            raise RuntimeError(
+                f"Veo predictLongRunning HTTP {r.status_code}: {detail}"
+            )
+        try:
+            payload = r.json()
+        except Exception as exc:
+            # A successful HTTP response with an unreadable body is ambiguous;
+            # keep the one reservation and never duplicate the submission.
+            if recorder:
+                recorder.finish(response_summary=(
+                    f"error: ambiguous success response; not retrying: {str(exc)[:300]}"
+                ))
+            raise RuntimeError("Veo returned an unreadable success response") from exc
+        operation_name = payload.get("name")
+        if not operation_name:
+            _release_veo_reservation(
+                recorder, f"response missing operation name: {payload}")
+            raise RuntimeError(f"Veo response missing 'name': {payload}")
+        veo_breaker.record_success()  # Veo accepted → close the breaker if open
+        break
 
     if operation_name is None:
-        reason = last_error or "unknown"
-        summary = (
-            f"error: rate_limited_after_{MAX_ATTEMPTS}_retries"
-            if rate_limit_hits == MAX_ATTEMPTS
-            else f"error: {reason} after {MAX_ATTEMPTS} retries"
+        _release_veo_reservation(
+            recorder,
+            f"rate limited {rate_limit_hits} times; no operation created",
         )
-        if recorder:
-            recorder.finish(response_summary=summary)
-        if rate_limit_hits == MAX_ATTEMPTS:
-            raise RuntimeError(f"Veo 3 rate limit exceeded after {MAX_ATTEMPTS} retries")
-        raise RuntimeError(f"Veo 3 submission failed after {MAX_ATTEMPTS} retries: {reason}")
+        raise RuntimeError(
+            f"Veo 3 rate limit exceeded after {rate_limit_hits} rejected attempts")
 
     _last_veo_request = _time.time()
     logger.info("[BG] Veo 3 operation: %s", operation_name)

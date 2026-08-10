@@ -147,6 +147,10 @@ BUDGET_EXCEEDED_PREFIX = "budget_exceeded"
 # A paid Veo attempt waits in this non-billable state while it competes for
 # the per-song atomic budget reservation. It has not reached the provider.
 BUDGET_PENDING_PREFIX = "budget_pending"
+# A budget slot was reserved, but a provider response proved that no Veo
+# operation was created (for example HTTP 429/401). Kept for audit, excluded
+# from both spend and the per-song ceiling.
+BUDGET_RELEASED_PREFIX = "budget_released"
 # Once admitted, the same row is marked reserved before the database lock is
 # released. This state is intentionally billable: a worker crash after
 # admission may still correspond to an upstream call.
@@ -159,6 +163,7 @@ NON_BILLABLE_PREFIXES = (
     CACHE_ONLY_MISS_PREFIX,
     BUDGET_EXCEEDED_PREFIX,
     BUDGET_PENDING_PREFIX,
+    BUDGET_RELEASED_PREFIX,
 )
 
 
@@ -172,8 +177,10 @@ def billable_filter():
     `cost_dashboard_global` surfaces those two buckets separately so the
     uncertainty is visible instead of buried.
 
-    Also excludes `cache_only_miss` and `budget_exceeded` — see
-    `NON_BILLABLE_PREFIXES`. Both are rows for calls that never reached the
+    Also excludes `cache_only_miss`, `budget_exceeded` and
+    `budget_released` — see `NON_BILLABLE_PREFIXES`. They are rows for calls
+    that never reached the provider or were definitively rejected before an
+    operation was created. The
     provider: the multi-scene regen path looks the clip up in R2 and
     deliberately does NOT generate when it is missing (that is the whole
     point of `cache_only` — regenerating one scene must not re-bill the

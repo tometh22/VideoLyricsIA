@@ -187,6 +187,40 @@ def test_el_preflight_de_veo_ocurre_antes_de_reservar_presupuesto():
     assert request_body < first_token < recorder < reserve < first_post
 
 
+def test_los_rechazos_confirmados_liberan_la_reserva():
+    """Un HTTP de rechazo no creó una operación: debe quedar auditable pero
+    fuera del gasto y del tope, incluso si fue 429 o credenciales inválidas.
+    """
+    from provenance import BUDGET_RELEASED_PREFIX, billable_filter
+
+    sql = str(billable_filter().compile(
+        compile_kwargs={"literal_binds": True}))
+    assert BUDGET_RELEASED_PREFIX in sql
+
+    import inspect
+    import pipeline
+    source = inspect.getsource(pipeline._generate_veo_video)
+    assert "_release_veo_reservation(" in source
+    assert "HTTP {r.status_code} rejected" in source
+    assert "rate limited {rate_limit_hits} times" in source
+
+
+def test_una_respuesta_ambigua_no_duplica_el_post():
+    """Tras un timeout de post Vertex puede haber aceptado el render. Se cuenta
+    una reserva conservadora y se corta: reintentar bajo la misma fila podría
+    crear hasta cinco operaciones pagas contando sólo una.
+    """
+    import inspect
+    import pipeline
+
+    source = inspect.getsource(pipeline._generate_veo_video)
+    ambiguous = source.index("ambiguous submission; not retrying")
+    next_rate_limit = source.index("if r.status_code == 429", ambiguous)
+    block = source[ambiguous:next_rate_limit]
+    assert "raise RuntimeError" in block
+    assert "continue" not in block
+
+
 def test_la_identidad_de_cancion_colapsa_espacios(monkeypatch):
     """Comparando con `lower(trim(...))` en SQL, "La  Argentinidad" y
     "La Argentinidad" eran canciones distintas — corregir la metadata de un
