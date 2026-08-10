@@ -579,6 +579,12 @@ def test_los_cache_hits_no_arrastran_la_historia_del_job(db):
                         tool_name="veo-3.1-fast-generate-001",
                         tool_provider="google_vertex", prompt_sent="p",
                         created_at=julio))
+    # También son no facturables, pero NO ahorraron una generación.
+    for summary in ("cache_only_miss: key=x", "budget_exceeded: no se generó"):
+        db.add(AIProvenance(job_id="ch1", step="video_bg",
+                            tool_name="veo-3.1-fast-generate-001",
+                            tool_provider="google_vertex", prompt_sent="p",
+                            response_summary=summary, created_at=julio))
     db.commit()
 
     try:
