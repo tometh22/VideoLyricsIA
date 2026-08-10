@@ -896,14 +896,28 @@ def admin_cost_refresh(
         # sobrevive.
         if (entry["status"] != "ok" and row.status == "ok"
                 and row.amount_usd is not None):
+            failed_status = entry["status"]
+            failed_detail = entry["detail"]
             entry["kept_previous"] = True
             entry["previous_amount_usd"] = row.amount_usd
-            entry["discarded_refresh_status"] = entry["status"]
-            entry["discarded_refresh_detail"] = entry["detail"]
+            entry["discarded_refresh_status"] = failed_status
+            entry["discarded_refresh_detail"] = failed_detail
             row.detail = (
                 f"{row.detail or ''} | refresh {datetime.now(timezone.utc):%Y-%m-%d}: "
-                f"{entry['status']} ({entry['detail']}) — se conservó el valor anterior"
+                f"{failed_status} ({failed_detail}) — se conservó el valor anterior"
             ).strip(" |")
+            if period == billing_sources.current_period():
+                # The saved value is still useful as a checkpoint, but usage
+                # keeps accruing during an open month. Do not turn a failed
+                # live refresh into a seemingly complete stale total.
+                entry["retained_amount_usd"] = row.amount_usd
+                entry["amount_usd"] = None
+                entry["status"] = failed_status
+                entry["detail"] = (
+                    f"{failed_detail} — snapshot previo conservado pero stale"
+                )
+                entry["stale"] = True
+                continue
             entry["amount_usd"] = row.amount_usd
             entry["status"] = row.status
             entry["detail"] = row.detail

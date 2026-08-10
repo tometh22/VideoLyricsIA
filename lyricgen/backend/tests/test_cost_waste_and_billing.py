@@ -417,6 +417,27 @@ def test_railway_plan_es_minimo_no_cargo_aditivo(monkeypatch):
     assert top_up["cost"] == pytest.approx(18.0)
 
 
+def test_railway_no_imputa_minimo_account_wide_a_un_proyecto(monkeypatch):
+    usage = [{"measurement": "CPU_USAGE", "value": 4320.0}]
+
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {"data": {"usage": usage}}
+
+    monkeypatch.setenv("RAILWAY_API_TOKEN", "fake")
+    monkeypatch.setenv("RAILWAY_PROJECT_ID", "proj-genly")
+    monkeypatch.setenv("RAILWAY_PLAN_MINIMUM_USD", "20")
+    monkeypatch.setattr(billing_sources.requests, "post",
+                        lambda *a, **k: _Resp())
+
+    result = billing_sources.fetch_railway("2026-06")
+    assert result.amount_usd == pytest.approx(2.0)
+    assert result.raw["plan_minimum_applied"] is False
+    assert all(row["measurement"] != "PLAN_MINIMUM_TOP_UP"
+               for row in result.breakdown)
+
+
 def test_fixed_no_suma_railway_y_acepta_config_legacy(monkeypatch):
     monkeypatch.setenv(
         "FIXED_SUBSCRIPTIONS_JSON",
