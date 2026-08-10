@@ -240,6 +240,33 @@ def test_reconcile_reports_calibration_factor(client, admin_token):
     assert "by_tool_modeled" in body
 
 
+def test_reconcile_trata_ok_sin_monto_como_fuente_faltante(
+    client, admin_token, db,
+):
+    from database import CostSnapshot
+
+    period = "2019-05"
+    sources = ("gcp", "openai", "replicate")
+    db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+    for source in sources:
+        db.add(CostSnapshot(
+            period=period, source=source, amount_usd=None, status="ok",
+        ))
+    db.commit()
+    try:
+        res = client.get(
+            f"/admin/cost/reconcile?period={period}",
+            headers=auth(admin_token),
+        )
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert set(body["invoiced_sources_missing"]) == set(sources)
+        assert body["invoiced_usd"] == 0.0
+    finally:
+        db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+        db.commit()
+
+
 def test_reconcile_rejects_malformed_period(client, admin_token):
     res = client.get("/admin/cost/reconcile?period=nope",
                      headers=auth(admin_token))
