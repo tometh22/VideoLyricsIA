@@ -247,10 +247,12 @@ def test_la_reserva_pendiente_no_se_cuenta_a_si_misma():
     assert "initial_response_summary=BUDGET_PENDING_PREFIX" in source
 
 
-def test_el_preflight_de_veo_ocurre_antes_de_reservar_presupuesto():
-    """Credenciales o payload inválidos no llegan al proveedor y no deben
-    gastar uno de los diez lugares de la canción. La reserva empieza sólo
-    después del preflight local y justo antes del primer POST.
+def test_el_tope_de_veo_se_chequea_antes_de_pedir_credenciales():
+    """Una canción bloqueada corta aun si las credenciales están rotas.
+
+    El payload local se construye primero, luego la reserva atómica decide el
+    techo y recién entonces se pide el token. Una falla de auth libera esa
+    reserva porque todavía no hubo POST.
 
     Desde que se invoca ``post`` el resultado ya es ambiguo (un timeout puede
     llegar después de que Vertex aceptó el trabajo), por lo que esa reserva sí
@@ -266,7 +268,10 @@ def test_el_preflight_de_veo_ocurre_antes_de_reservar_presupuesto():
     first_post = source.index("r = _req.post(")
     request_body = source.index("request_body = {")
 
-    assert request_body < first_token < recorder < reserve < first_post
+    assert request_body < recorder < reserve < first_token < first_post
+    auth_failure = source[first_token:first_post]
+    assert "_release_veo_reservation(" in auth_failure
+    assert "pre-submit auth failed" in auth_failure
 
 
 def test_los_rechazos_confirmados_liberan_la_reserva():

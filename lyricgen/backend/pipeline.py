@@ -10073,12 +10073,6 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     _submit_budget_s = float(os.environ.get("VEO_SUBMIT_BUDGET_S", "240"))
     _submit_deadline = _time.time() + _submit_budget_s
 
-    # Todo lo anterior es preflight local y gratis. En particular, obtener el
-    # token puede fallar por credenciales/configuración y construir el payload
-    # puede fallar por una imagen inválida. Ninguno de esos casos debe consumir
-    # una reserva: el proveedor todavía no recibió una solicitud.
-    token = _veo_access_token()
-
     from provenance import BUDGET_PENDING_PREFIX
 
     recorder = record_ai_call(
@@ -10106,6 +10100,17 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             f"canción (tope {VEO_MAX_CALLS_PER_SONG}). No se genera más para no "
             f"seguir gastando; el llamador cae a su fallback."
         )
+
+    # Check the ceiling before touching credentials so a blocked song exits
+    # immediately even during an auth outage. Token acquisition is still a
+    # definite pre-submit failure: release this reservation before falling
+    # back because Vertex has not received a request.
+    try:
+        token = _veo_access_token()
+    except Exception as exc:
+        _release_veo_reservation(
+            recorder, f"pre-submit auth failed: {exc}")
+        raise
 
     for attempt in range(MAX_ATTEMPTS):
         if attempt:
