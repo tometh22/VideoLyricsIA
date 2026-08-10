@@ -1428,6 +1428,23 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     _scenes_active = True
                     update_job(job_id, scene_plan=_scene_plan)
                     logger.info("[SCENES] timeline multi-escena listo para job=%s", job_id)
+                except VeoAmbiguousSubmission as e:
+                    # At least one paid scene operation may exist without an
+                    # id we can poll. Skip the normal single-background path,
+                    # which would submit a duplicate, and finish with a fully
+                    # local visual instead.
+                    logger.error(
+                        "[SCENES] envío ambiguo para job=%s (%s) — "
+                        "fallback determinístico sin otro proveedor",
+                        job_id, e,
+                    )
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style,
+                        filename="bg_scene_ambiguous_fallback.mp4",
+                    )
+                    _background_is_ai_generated = False
+                    _background_is_deterministic_fallback = True
+                    _scenes_active = False
                 except Exception as e:  # noqa: BLE001
                     _raise_if_job_timeout(e)
                     logger.error("[SCENES] multi-escena falló para job=%s (%s) — "
@@ -11493,6 +11510,11 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                 ),
                 "validation": dict(scene.get("validation") or {}),
             }
+        except VeoAmbiguousSubmission:
+            # The provider may already be rendering and billing this scene.
+            # Never collapse this into a recoverable scene miss: doing so can
+            # reach the single-background fallback and submit Veo again.
+            raise
         except Exception as e:  # noqa: BLE001
             _raise_if_job_timeout(e)
             # Cache_only-miss ESPERADO (review del PR del Sentinel, 2026-07-10):

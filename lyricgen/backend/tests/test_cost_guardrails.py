@@ -335,6 +335,26 @@ def test_un_envio_ambiguo_tampoco_reintenta_en_el_bucle_exterior():
     assert "continue" not in block
 
 
+def test_un_envio_ambiguo_de_escena_no_cae_a_otro_veo():
+    """La ruta multi-escena debe terminar localmente, no repagar fondo único."""
+    import inspect
+    import pipeline
+
+    scene_source = inspect.getsource(pipeline._generate_scene_clips)
+    specific = scene_source.index("except VeoAmbiguousSubmission")
+    generic = scene_source.index("except Exception as e", specific)
+    assert specific < generic
+    assert "raise" in scene_source[specific:generic]
+
+    run_source = inspect.getsource(pipeline.run_pipeline)
+    scene_call = run_source.index("_generate_scene_background(")
+    single_bg = run_source.index("_ensure_background(", scene_call)
+    handler = run_source[scene_call:single_bg]
+    assert "except VeoAmbiguousSubmission" in handler
+    ambiguous_block = handler[handler.index("except VeoAmbiguousSubmission"):]
+    assert "_write_safe_gradient_background(" in ambiguous_block
+
+
 def test_http_408_y_5xx_son_ambiguos_pero_4xx_rechaza():
     import inspect
     import pipeline
