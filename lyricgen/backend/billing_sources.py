@@ -600,10 +600,20 @@ def fetch_openai(period: str) -> SourceCost:
                     target[line] = target.get(line, 0.0) + amount
             if not payload.get("has_more"):
                 break
-            page = payload.get("next_page")
-            if not page or page in seen_pages:
-                break
-            seen_pages.add(page)
+            next_page = payload.get("next_page")
+            if not next_page or next_page in seen_pages:
+                return SourceCost(
+                    "openai", period, status="error",
+                    detail=("paginación incompleta de OpenAI Costs: "
+                            "has_more sin cursor nuevo"),
+                )
+            page = next_page
+            seen_pages.add(next_page)
+        else:
+            return SourceCost(
+                "openai", period, status="error",
+                detail="paginación incompleta de OpenAI Costs: más de 20 páginas",
+            )
     except Exception as e:
         return SourceCost("openai", period, status="error", detail=str(e))
 

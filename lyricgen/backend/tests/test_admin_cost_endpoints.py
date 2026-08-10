@@ -190,6 +190,34 @@ def test_unit_economics_handles_month_with_no_videos(client, admin_token):
     assert body["margin_per_video"] is None
 
 
+def test_unit_economics_no_trata_ok_sin_monto_como_completo(
+    client, admin_token, db,
+):
+    import billing_sources
+    from database import CostSnapshot
+
+    period = "2019-04"
+    db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+    for source in billing_sources.SOURCES:
+        db.add(CostSnapshot(
+            period=period, source=source, amount_usd=None, status="ok",
+        ))
+    db.commit()
+    try:
+        res = client.get(
+            f"/admin/cost/unit-economics?period={period}",
+            headers=auth(admin_token),
+        )
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["cost_complete"] is False
+        assert body["missing_sources"] == sorted(billing_sources.SOURCES)
+        assert body["real_cost_usd"] == 0.0
+    finally:
+        db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+        db.commit()
+
+
 # ---------------------------------------------------------------------------
 # /admin/cost/reconcile
 # ---------------------------------------------------------------------------
