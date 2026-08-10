@@ -333,3 +333,56 @@ def test_el_lookup_cache_only_se_registra_despues_de_saber_el_resultado():
     assert i_rec > i_cache, (
         "el recorder pago se abre antes del bloque cache_only → los lookups "
         "gratis quedan en vuelo contando como pagos")
+
+
+# ---------------------------------------------------------------------------
+# Regresiones de la cuarta revisión
+# ---------------------------------------------------------------------------
+
+def test_la_ventana_tambien_aplica_a_los_jobs_sin_metadata(monkeypatch):
+    """El fallback por job filtraba SÓLO por job_id. Un job_id estable y
+    reutilizado (los `sample-{style}` del script de muestras) quedaba
+    bloqueado para siempre al llegar a 10, aunque los VEO_BUDGET_WINDOW_DAYS
+    hubieran pasado hace meses."""
+    visto = {}
+    p = _fake_counter(monkeypatch, 3, artist="", title="", visto=visto)
+    monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_SONG", 10)
+    p._veo_budget_exceeded("sample-estatico")
+    filtros = " | ".join(visto.get("filtros", []))
+    assert "created_at" in filtros, (
+        "sin la ventana, un job_id reutilizado se bloquea de por vida. "
+        f"Filtros vistos: {filtros}")
+
+
+def test_la_fila_de_tope_no_borrada_no_cuenta_como_gasto():
+    """Cuando el DELETE falla (un rol con UPDATE pero sin DELETE, o un fallo
+    transitorio) la fila se cierra con `budget_exceeded:`. No hubo llamada al
+    proveedor: si esa fila se cuenta, cada rechazo del tope fabrica gasto y
+    encima hace avanzar el propio tope."""
+    from provenance import BUDGET_EXCEEDED_PREFIX, billable_filter
+    sql = str(billable_filter().compile(
+        compile_kwargs={"literal_binds": True}))
+    assert BUDGET_EXCEEDED_PREFIX in sql
+    # Y el resumen que escribe el fallback tiene que matchear ese prefijo.
+    import inspect
+
+    import pipeline
+    src = inspect.getsource(pipeline._discard_provenance_row)
+    assert f'response_summary="{BUDGET_EXCEEDED_PREFIX}' in src
+
+
+def test_el_tope_no_se_reintenta():
+    """El loop de 2 intentos de `_ensure_background` duerme 30s antes de
+    reintentar. El tope no puede cambiar durante esa espera: reintentar sólo
+    agrega latencia y otro ciclo de reserva+borrado de fila."""
+    import inspect
+
+    import pipeline
+    src = inspect.getsource(pipeline._ensure_background)
+    i_budget = src.index("except VeoBudgetExceeded")
+    i_generic = src.index("except Exception as e:", i_budget - 4000)
+    assert i_budget < i_generic, (
+        "el handler específico tiene que ir ANTES del genérico o nunca corre")
+    # Y tiene que cortar el loop, no dormir.
+    bloque = src[i_budget:i_budget + 500]
+    assert "break" in bloque and "sleep" not in bloque

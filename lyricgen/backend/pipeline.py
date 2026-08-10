@@ -9397,7 +9397,12 @@ def _veo_budget_exceeded(job_id: str | None,
             else:
                 # Sin metadata de canción (o con el placeholder `preview`) no
                 # hay identidad que compartir: cada job lleva su propio tope.
+                # La ventana se aplica IGUAL: un job_id estable y reutilizado
+                # (los `sample-{style}` del script de muestras, por ejemplo)
+                # quedaba bloqueado para siempre al llegar a 10, aunque los
+                # VEO_BUDGET_WINDOW_DAYS hubieran pasado hace meses.
                 q = q.filter(AIProvenance.job_id == job_id)
+                q = q.filter(AIProvenance.created_at >= since)
                 alcance = f"job {job_id} (sin metadata de canción)"
 
             if exclude_row_id is not None:
@@ -12214,6 +12219,12 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # Real RQ death-penalty timeout — propagate (don't degrade to
             # gradient + swallow). Keeps the JobTimeoutException visible.
             raise
+        except VeoBudgetExceeded as e:
+            # No es un fallo transitorio: el tope no puede cambiar durante los
+            # 30s de espera, así que reintentar sólo agrega latencia y otro
+            # ciclo de reserva+borrado de fila. Directo al fallback local.
+            logger.error("[BG] %s — sin reintento, al fallback", e)
+            break
         except Exception as e:
             logger.error("[BG] Veo 3 attempt %s/2 failed: %s", attempt + 1, e)
             if attempt < 1:

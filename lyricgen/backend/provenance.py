@@ -139,6 +139,19 @@ CACHE_HIT_PREFIX = "cache_hit"
 # Prefijo de `_registrar_cache_only` en pipeline.py: se buscó el clip en R2,
 # no estaba, y NO se generó. Cero dólares.
 CACHE_ONLY_MISS_PREFIX = "cache_only_miss"
+# Prefijo de `_discard_provenance_row` cuando NO puede borrar la fila (un rol
+# de DB con UPDATE pero sin DELETE, o un fallo transitorio). La llamada nunca
+# salió: sin excluirla, cada rechazo del tope fabricaba gasto y además hacía
+# avanzar el propio tope.
+BUDGET_EXCEEDED_PREFIX = "budget_exceeded"
+
+# Prefijos de `response_summary` que significan "esta fila existe para el
+# registro de auditoría, pero no salió plata". Toda la contabilidad los filtra.
+NON_BILLABLE_PREFIXES = (
+    CACHE_HIT_PREFIX,
+    CACHE_ONLY_MISS_PREFIX,
+    BUDGET_EXCEEDED_PREFIX,
+)
 
 
 def billable_filter():
@@ -151,22 +164,22 @@ def billable_filter():
     `cost_dashboard_global` surfaces those two buckets separately so the
     uncertainty is visible instead of buried.
 
-    Also excludes `cache_only_miss`: the multi-scene regen path looks the
-    clip up in R2 and, when it is not there, deliberately does NOT generate
-    (that is the whole point of `cache_only` — regenerating one scene must
-    not re-bill the other N). Zero dollars leave the building, so counting
-    those rows inflated both the reported cost and the per-song Veo ceiling.
+    Also excludes `cache_only_miss` and `budget_exceeded` — see
+    `NON_BILLABLE_PREFIXES`. Both are rows for calls that never reached the
+    provider: the multi-scene regen path looks the clip up in R2 and
+    deliberately does NOT generate when it is missing (that is the whole
+    point of `cache_only` — regenerating one scene must not re-bill the
+    other N), and the per-song Veo ceiling rejects the attempt before it
+    starts. Counting either inflated both the reported cost and the ceiling
+    itself.
     """
-    return and_(
+    return and_(*[
         or_(
             AIProvenance.response_summary.is_(None),
-            not_(AIProvenance.response_summary.like(f"{CACHE_HIT_PREFIX}%")),
-        ),
-        or_(
-            AIProvenance.response_summary.is_(None),
-            not_(AIProvenance.response_summary.like(f"{CACHE_ONLY_MISS_PREFIX}%")),
-        ),
-    )
+            not_(AIProvenance.response_summary.like(f"{prefix}%")),
+        )
+        for prefix in NON_BILLABLE_PREFIXES
+    ])
 
 
 # Job statuses that represent a video we can actually invoice. Mirrors
