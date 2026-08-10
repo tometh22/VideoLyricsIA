@@ -31,7 +31,7 @@ Usage
         --invoices '{"gcp":{"amount_usd":199.53,"breakdown":[
                        {"service":"Vertex AI","sku":"Veo","cost":163.20},
                        {"service":"Cloud Storage","sku":"Storage","cost":36.33}]},
-                     "railway":126.02,"r2":18.84,"fixed":44,
+                     "railway":126.02,"r2":18.84,"fixed":24,
                      "openai":4.18,"replicate":6.10}' \
         --revenue 2000
 

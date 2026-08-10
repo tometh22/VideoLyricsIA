@@ -356,6 +356,24 @@ RAILWAY_RATES_PER_UNIT_MONTH = {
 RAILWAY_USD_PER_EGRESS_GB = float(os.environ.get("RAILWAY_USD_PER_EGRESS_GB", "0.05"))
 
 
+def _railway_plan_minimum_usd() -> float:
+    """Monthly commitment, including the legacy fixed-subscription config."""
+    explicit = os.environ.get("RAILWAY_PLAN_MINIMUM_USD", "").strip()
+    if explicit:
+        return max(0.0, float(explicit))
+    raw_fixed = os.environ.get("FIXED_SUBSCRIPTIONS_JSON", "").strip()
+    if raw_fixed:
+        try:
+            legacy = json.loads(raw_fixed).get("railway_plan")
+            if legacy is not None:
+                return max(0.0, float(legacy))
+        except Exception:
+            # fetch_fixed reports malformed JSON explicitly; Railway can still
+            # use the documented default instead of failing a second source.
+            pass
+    return 20.0
+
+
 def fetch_railway(period: str) -> SourceCost:
     """Railway cost for the month, derived from usage metrics.
 
@@ -364,6 +382,7 @@ def fetch_railway(period: str) -> SourceCost:
                                 project tokens cannot read the usage query)
         RAILWAY_PROJECT_ID      (optional) restrict to the Genly IA project
         RAILWAY_WORKSPACE_ID    (optional) restrict to one workspace
+        RAILWAY_PLAN_MINIMUM_USD monthly usage commitment (default 20)
 
     Scoping to the project matters: the account carries unrelated projects
     and the jun-2026 numbers differed ($124.54 Genly vs $135.25 account).
@@ -424,8 +443,9 @@ def fetch_railway(period: str) -> SourceCost:
     rows = (payload.get("data") or {}).get("usage") or []
     if not rows:
         return SourceCost(
-            "railway", period, amount_usd=0.0, is_estimate=True,
-            detail="la API no devolvió uso para ese período/proyecto",
+            "railway", period, status="error",
+            detail=("la API no devolvió uso para ese período/proyecto; "
+                    "no se puede distinguir cero real de ventana histórica vacía"),
             raw={"scope": project_id or workspace_id or "cuenta completa"},
         )
 
@@ -458,15 +478,29 @@ def fetch_railway(period: str) -> SourceCost:
             "unit": unit_label,
             "cost": round(cost, 4),
         })
+    metered_total = total
+    plan_minimum = _railway_plan_minimum_usd()
+    if metered_total < plan_minimum:
+        top_up = plan_minimum - metered_total
+        breakdown.append({
+            "measurement": "PLAN_MINIMUM_TOP_UP",
+            "units": 1.0,
+            "unit": "compromiso mensual",
+            "cost": round(top_up, 4),
+        })
+        total = plan_minimum
     breakdown.sort(key=lambda r: -r["cost"])
 
     return SourceCost(
         source="railway", period=period, amount_usd=round(total, 2),
         breakdown=breakdown, is_estimate=True,
         detail=("calculado sobre métricas de uso con tarifas publicadas "
+                f"y compromiso mínimo de ${plan_minimum:.2f} "
                 "(Railway no expone el importe facturado por API)"),
         raw={"scope": project_id or workspace_id or "cuenta completa",
-             "minutes_in_period": minutes_in_period},
+             "minutes_in_period": minutes_in_period,
+             "metered_usage_usd": round(metered_total, 4),
+             "plan_minimum_usd": round(plan_minimum, 2)},
     )
 
 
@@ -875,7 +909,6 @@ def fetch_github(period: str) -> SourceCost:
 DEFAULT_FIXED_SUBSCRIPTIONS = {
     "vercel_pro": 20.00,
     "github_pro": 4.00,
-    "railway_plan": 20.00,
 }
 
 
@@ -892,6 +925,10 @@ def fetch_fixed(period: str) -> SourceCost:
         except Exception as e:
             return SourceCost("fixed", period, status="error",
                               detail=f"FIXED_SUBSCRIPTIONS_JSON inválido: {e}")
+    # Backwards compatibility: deployments may still carry this legacy key.
+    # It is a minimum usage commitment, modeled inside fetch_railway as
+    # max(metered, minimum), never an additive fixed subscription.
+    items.pop("railway_plan", None)
     total = sum(float(v) for v in items.values())
     return SourceCost(
         source="fixed", period=period, amount_usd=round(total, 2),
