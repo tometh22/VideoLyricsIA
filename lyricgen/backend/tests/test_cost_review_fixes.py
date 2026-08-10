@@ -826,6 +826,42 @@ def test_cost_real_ignora_snapshot_desconocido(client, admin_token, db):
         db.commit()
 
 
+def test_portal_sin_metadata_usa_el_job_id_como_identidad(db):
+    import cost_attribution as ca
+    from database import Delivery, Job
+
+    job_ids = ("portalblank1", "portalblank2")
+    db.query(Delivery).filter(Delivery.job_id.in_(job_ids)).delete(
+        synchronize_session=False)
+    db.query(Job).filter(Job.job_id.in_(job_ids)).delete(
+        synchronize_session=False)
+    for job_id in job_ids:
+        db.add(Job(
+            job_id=job_id, user_id=1, tenant_id="default", artist="",
+            song_title="", filename="a.mp3", status="done",
+        ))
+        db.add(Delivery(
+            job_id=job_id, label="Renderizado", file_types=[],
+            artist_snapshot="", song_title_snapshot="",
+            tenant_snapshot="default", added_by_user_id=1,
+        ))
+    db.commit()
+    try:
+        portal = ca.collect_portal_songs(db)
+        expected = {ca.song_key("", "", job_id) for job_id in job_ids}
+        assert set(portal["songs"]) >= expected
+        assert len(expected) == 2
+        assert ca.collect_song_keys(db) >= expected
+        jobs = ca.collect_jobs(db, "prod")
+        assert {jobs[job_id].key for job_id in job_ids} == expected
+    finally:
+        db.query(Delivery).filter(Delivery.job_id.in_(job_ids)).delete(
+            synchronize_session=False)
+        db.query(Job).filter(Job.job_id.in_(job_ids)).delete(
+            synchronize_session=False)
+        db.commit()
+
+
 # ---------------------------------------------------------------------------
 # 16. El mes es [inicio, inicio del mes siguiente)
 # ---------------------------------------------------------------------------
