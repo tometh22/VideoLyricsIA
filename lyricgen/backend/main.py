@@ -5073,6 +5073,7 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
             language=language, lead_s=_li.lead_seconds(),
             hold_s=_li.hold_seconds(),
             asr_words=result.get("_asr_words"),
+            job_id=job_id,
         )
         if stats.get("rescued_lines"):
             result = dict(result)

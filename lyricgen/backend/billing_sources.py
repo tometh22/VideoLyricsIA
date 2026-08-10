@@ -511,14 +511,17 @@ def fetch_railway(period: str) -> SourceCost:
 # OpenAI — whisper-1 transcription.
 # ---------------------------------------------------------------------------
 
-# GenLy's only OpenAI dependency is whisper-1 transcription. The org's
-# key is shared with unrelated work, so summing the whole organization
-# wildly overstates GenLy: jul-2026 was $567.43 org-wide (GPT-5.4, GPT-4.1,
-# image models, batch API — all other projects) against $20.15 of whisper.
+# GenLy's OpenAI dependencies are whisper-1 transcription and the default
+# gpt-4o-mini lyric formatter. The org's key is shared with unrelated work,
+# so summing the whole organization wildly overstates GenLy: jul-2026 was
+# $567.43 org-wide (GPT-5.4, GPT-4.1, image models, batch API — other projects)
+# against a much smaller GenLy subtotal.
 # Substring match, case-insensitive; set to "" to bill the entire org.
 OPENAI_LINE_ITEM_FILTER = [
     s.strip().lower()
-    for s in os.environ.get("OPENAI_COST_LINE_ITEMS", "whisper").split(",")
+    for s in os.environ.get(
+        "OPENAI_COST_LINE_ITEMS", "whisper,gpt-4o-mini"
+    ).split(",")
     if s.strip()
 ]
 
@@ -530,8 +533,8 @@ def fetch_openai(period: str) -> SourceCost:
         OPENAI_ADMIN_KEY        an *admin* key (sk-admin-...), NOT the
                                 regular API key — that one cannot read
                                 billing.
-        OPENAI_COST_LINE_ITEMS  comma-separated substrings to keep
-                                (default "whisper"). Empty = whole org.
+        OPENAI_COST_LINE_ITEMS  comma-separated substrings to keep (default
+                                "whisper,gpt-4o-mini"). Empty = whole org.
         OPENAI_PROJECT_ID       (optional) restrict to one project.
 
     Returns daily buckets summed for the month. `breakdown` always lists
