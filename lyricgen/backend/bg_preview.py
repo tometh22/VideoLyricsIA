@@ -242,22 +242,17 @@ def run_bg_preview_job(
             "[BG_PREVIEW] job=%s skipped: BG_PREVIEW_ENABLED is disabled",
             job_id,
         )
-        try:
-            # Keep the established terminal status so existing pollers stop
-            # immediately; current_step + the RQ result preserve that this
-            # was intentionally skipped rather than generated/cached.
-            update_job(
-                job_id,
-                status="bg_preview_done",
-                current_step="disabled",
-                error=None,
-            )
-        except Exception as _status_err:
-            logger.warning(
-                "[BG_PREVIEW] no pude marcar disabled job=%s: %s",
-                job_id,
-                _status_err,
-            )
+        # Keep the established terminal status so existing pollers stop
+        # immediately; current_step + the RQ result preserve that this was
+        # intentionally skipped rather than generated/cached. Do not swallow
+        # DB failures here: production RQ has Retry(max=2), and acknowledging
+        # success without this terminal write strands the UI in queued state.
+        update_job(
+            job_id,
+            status="bg_preview_done",
+            current_step="disabled",
+            error=None,
+        )
         return {
             "job_id": job_id,
             "status": "bg_preview_done",

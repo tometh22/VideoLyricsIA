@@ -13,6 +13,8 @@ Apagarlo no hace esperar más al operador: el render genera el fondo igual
 porque el pre-generado ya se descartó.
 """
 
+import pytest
+
 from tests.conftest import auth
 
 
@@ -104,3 +106,31 @@ def test_worker_omite_backlog_ya_encolado_cuando_se_apaga(monkeypatch):
         "current_step": "disabled",
         "error": None,
     }]
+
+
+def test_worker_reintenta_si_no_puede_persistir_disabled(monkeypatch):
+    """RQ must see the exception instead of consuming a still-queued job."""
+    import bg_preview
+    import jobs
+
+    monkeypatch.setenv("BG_PREVIEW_ENABLED", "0")
+    monkeypatch.setattr(
+        jobs,
+        "update_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("database temporarily unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        bg_preview,
+        "cache_check",
+        lambda _key: (_ for _ in ()).throw(
+            AssertionError("disabled preview must not reach cache/provider")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="database temporarily unavailable"):
+        bg_preview.run_bg_preview_job(
+            "previewqueued01", "unused-key",
+            {"artist": "Bersuit", "song_title": "La Argentinidad Al Palo"},
+        )

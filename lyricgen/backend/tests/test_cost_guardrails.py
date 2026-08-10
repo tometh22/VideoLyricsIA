@@ -589,6 +589,20 @@ def test_la_ventana_tambien_aplica_a_los_jobs_sin_metadata(monkeypatch):
         f"Filtros vistos: {filtros}")
 
 
+def test_muestras_crean_identidades_persistentes_para_presupuesto(db):
+    from database import Job
+    from scripts import regenerate_movement_samples as samples
+
+    ids = [samples._ensure_tracking_job(entry["style"], db=db)
+           for entry in samples.SAMPLES]
+    assert len(set(ids)) == len(samples.SAMPLES)
+    assert all(len(job_id) == 12 for job_id in ids)
+    rows = db.query(Job).filter(Job.job_id.in_(ids)).all()
+    assert len(rows) == len(ids)
+    assert {row.tenant_id for row in rows} == {samples._TRACKING_TENANT}
+    assert {row.status for row in rows} == {"internal_sample"}
+
+
 def test_la_fila_de_tope_no_borrada_no_cuenta_como_gasto():
     """Cuando el DELETE falla (un rol con UPDATE pero sin DELETE, o un fallo
     transitorio) la fila se cierra con `budget_exceeded:`. No hubo llamada al
