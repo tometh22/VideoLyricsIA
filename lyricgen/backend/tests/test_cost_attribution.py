@@ -121,6 +121,17 @@ def test_universal_tenant_is_umg_regardless_of_song():
     assert ca.classify_job(job, set()) == ca.CAT_UMG
 
 
+@pytest.mark.parametrize("tenant", ["universality", "universalmedia"])
+def test_universal_prefix_without_boundary_is_not_umg(tenant):
+    job = _job("j-lookalike", "Quien Sea", "Lo Que Sea", tenant)
+    assert ca.classify_job(job, set()) == ca.CAT_OTHER_CLIENT
+
+    attribution = ca.build_attribution(
+        {"prod": {job.job_id: job}}, _portal(),
+    )
+    assert attribution["umg"]["songs"] == 0
+
+
 def test_unknown_tenant_is_another_client():
     job = _job("j4", "Artista", "Tema", "sello_random")
     assert ca.classify_job(job, set()) == ca.CAT_OTHER_CLIENT

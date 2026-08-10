@@ -79,7 +79,7 @@ TEAM_TENANTS = frozenset({
     "__internal_samples__",  # platform-owned movement gallery generations
 })
 
-UMG_TENANT_PREFIX = "universal"
+UMG_TENANT_RE = re.compile(r"universal(?:[_-][a-z0-9_-]+)?")
 
 # Categories emitted by `classify_job`.
 CAT_UMG = "umg_produccion"
@@ -91,6 +91,12 @@ CAT_RND = "id_interno"
 def is_ci_tenant(tenant_id: str | None) -> bool:
     t = (tenant_id or "").strip()
     return any(p.search(t) for p in CI_TENANT_PATTERNS)
+
+
+def is_umg_tenant(tenant_id: str | None) -> bool:
+    """Match Universal account IDs without swallowing lookalike tenants."""
+    tenant = (tenant_id or "").strip().lower()
+    return bool(UMG_TENANT_RE.fullmatch(tenant))
 
 
 # Placeholder song metadata written by the background-preview path when the
@@ -399,7 +405,7 @@ def classify_job(job: JobCost, umg_keys: set[str]) -> str:
     """Bucket a job. Order is load-bearing — see the module docstring."""
     if is_ci_tenant(job.tenant_id):
         return CAT_CI
-    if job.tenant_id.startswith(UMG_TENANT_PREFIX):
+    if is_umg_tenant(job.tenant_id):
         return CAT_UMG
     if job.key in umg_keys:
         return CAT_UMG
@@ -436,7 +442,7 @@ def build_attribution(jobs_by_env: dict[str, dict[str, JobCost]],
     # environment or account produced it.
     umg_keys: set[str] = set(portal["songs"])
     for job in all_jobs:
-        if job.tenant_id.startswith(UMG_TENANT_PREFIX) and job.delivered:
+        if is_umg_tenant(job.tenant_id) and job.delivered:
             umg_keys.add(job.key)
 
     # --- classify ------------------------------------------------------
