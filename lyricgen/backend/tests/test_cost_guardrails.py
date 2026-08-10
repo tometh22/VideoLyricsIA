@@ -274,6 +274,19 @@ def test_el_tope_de_veo_se_chequea_antes_de_pedir_credenciales():
     assert "pre-submit auth failed" in auth_failure
 
 
+def test_un_job_ya_topeado_corta_antes_del_cooldown():
+    import inspect
+    import pipeline
+
+    source = inspect.getsource(pipeline._generate_veo_video)
+    precheck = source.index("_pre_over, _pre_spent = _veo_budget_exceeded(job_id)")
+    cooldown = source.index("elapsed = _time.time() - _last_veo_request")
+    recorder = source.index("recorder = record_ai_call(")
+    atomic_reservation = source.index(
+        "_over, _spent = _veo_budget_exceeded(", recorder)
+    assert precheck < cooldown < recorder < atomic_reservation
+
+
 def test_los_rechazos_confirmados_liberan_la_reserva():
     """Un HTTP de rechazo no creó una operación: debe quedar auditable pero
     fuera del gasto y del tope, incluso si fue 429 o credenciales inválidas.

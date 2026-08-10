@@ -10027,6 +10027,18 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             "untracked provider submission"
         )
 
+    # Fast read-only rejection before the global provider cooldown. This is
+    # deliberately only an optimization: another worker can spend the final
+    # slot after this read, so the atomic reservation immediately before the
+    # POST remains the authority.
+    _pre_over, _pre_spent = _veo_budget_exceeded(job_id)
+    if _pre_over:
+        raise VeoBudgetExceeded(
+            f"job {job_id}: {_pre_spent} generaciones de Veo ya hechas para "
+            f"esta canción (tope {VEO_MAX_CALLS_PER_SONG}). No se espera el "
+            "cooldown ni se genera más; el llamador cae a su fallback."
+        )
+
     # Fresh provider output is intentionally not read from the shared raw
     # cache here. This function runs before content validation, so a normal
     # hit could reuse a hallucinated person. ``cache_only`` above is retained
