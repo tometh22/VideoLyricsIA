@@ -613,6 +613,10 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
         db.query(func.count(AIProvenance.id))
         .filter(AIProvenance.created_at >= since)
         .filter(AIProvenance.response_summary.like("error%"))
+        # Some legacy ``error:`` summaries are confirmed pre-operation
+        # rejections and therefore excluded from spend. Keep this counter's
+        # ``_included`` contract aligned with the rows priced above.
+        .filter(billable_filter())
         .scalar() or 0
     )
     in_flight = int(

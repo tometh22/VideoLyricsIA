@@ -123,6 +123,25 @@ def test_errored_and_in_flight_rows_stay_billable(db):
     assert s["total_cost"] == 1.60
 
 
+def test_row_quality_cuenta_solo_errores_incluidos_en_el_gasto(db):
+    from provenance import (
+        LEGACY_CONFIRMED_RATE_LIMIT_PREFIX,
+        cost_dashboard_global,
+    )
+
+    before = cost_dashboard_global(db, since_days=30)["row_quality"][
+        "errored_included"]
+    _job(db, "errquality1", "done", tenant="error-quality")
+    _veo(db, "errquality1", summary="error: ambiguous submission", n=1)
+    _veo(db, "errquality1",
+         summary=LEGACY_CONFIRMED_RATE_LIMIT_PREFIX, n=1)
+    db.commit()
+
+    after = cost_dashboard_global(db, since_days=30)["row_quality"][
+        "errored_included"]
+    assert after - before == 1
+
+
 def test_row_quality_incluye_reservas_veo_sin_finalizar(db):
     from database import AIProvenance
     from provenance import (
