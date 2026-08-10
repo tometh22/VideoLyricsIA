@@ -62,7 +62,8 @@ def _split_lyrics_into_acts(segments: list[dict], n_acts: int) -> list[str]:
 
 
 def build_variety_background(audio_path: str, artist: str, song_title: str,
-                              segments: list[dict], out_dir: Path) -> str:
+                              segments: list[dict], out_dir: Path,
+                              benchmark_job_id: str) -> str:
     """4 distinct Imagen stills, each with own Ken Burns, xfade-chained."""
     from pipeline import (
         _generate_imagen_image,
@@ -90,7 +91,7 @@ def build_variety_background(audio_path: str, artist: str, song_title: str,
 
         print(f"  [opt-a] analyzing act {i+1}/{N_SCENES} for Imagen prompt...")
         tracking_job_id = ensure_internal_tracking_job(
-            f"loop-exp-a:act:{i}", style="experiment")
+            f"loop-exp-a:{benchmark_job_id}:act:{i}", style="experiment")
         analysis = _analyze_lyrics_for_background(
             lyrics_text=act_text,
             artist=artist,
@@ -155,7 +156,7 @@ def main():
 
     bg_path = build_variety_background(
         job["audio_path"], meta.get("artist", ""), meta.get("song_title", ""),
-        job["segments"], out_dir,
+        job["segments"], out_dir, benchmark_job_id=job["job_id"],
     )
 
     out_path = compose_with_lyrics(

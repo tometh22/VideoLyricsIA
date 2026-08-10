@@ -670,6 +670,19 @@ def test_generadores_pagos_de_scripts_declaran_una_identidad_persistente():
     assert missing == [], f"provider calls without job_id: {missing}"
 
 
+def test_experimentos_aislan_tracking_por_job_de_benchmark():
+    from pathlib import Path
+
+    experiment_dir = (
+        Path(__file__).resolve().parents[1] / "scripts" / "loop_experiments"
+    )
+    for option in "abcd":
+        source = (experiment_dir / f"run_option_{option}.py").read_text()
+        assert "benchmark_job_id" in source
+        assert 'benchmark_job_id=job["job_id"]' in source
+        assert f'f"loop-exp-{option}:{{benchmark_job_id}}' in source
+
+
 def test_veo_fresco_sin_job_id_falla_antes_del_proveedor(monkeypatch):
     import pipeline
 

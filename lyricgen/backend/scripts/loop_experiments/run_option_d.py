@@ -81,7 +81,8 @@ def detect_chorus_region(segments: list[dict]) -> tuple[int, int] | None:
 
 
 def build_hybrid_background(audio_path: str, artist: str, song_title: str,
-                             segments: list[dict], out_dir: Path) -> str:
+                             segments: list[dict], out_dir: Path,
+                             benchmark_job_id: str) -> str:
     """Veo for chorus region, Imagen+KB for verses, xfade at boundaries."""
     from pipeline import (
         _generate_veo_video,
@@ -120,7 +121,7 @@ def build_hybrid_background(audio_path: str, artist: str, song_title: str,
     if not (Path(img_path).exists() and Path(img_path).stat().st_size > 10_000):
         print(f"  [opt-d] analyzing verse lyrics for Imagen prompt...")
         verse_tracking_job_id = ensure_internal_tracking_job(
-            "loop-exp-d:verse", style="experiment")
+            f"loop-exp-d:{benchmark_job_id}:verse", style="experiment")
         analysis = _analyze_lyrics_for_background(
             lyrics_text=verse_text or "atmospheric introspective",
             artist=artist,
@@ -164,7 +165,7 @@ def build_hybrid_background(audio_path: str, artist: str, song_title: str,
         )
         print(f"  [opt-d] analyzing chorus lyrics for Veo prompt...")
         chorus_tracking_job_id = ensure_internal_tracking_job(
-            "loop-exp-d:chorus", style="experiment")
+            f"loop-exp-d:{benchmark_job_id}:chorus", style="experiment")
         analysis = _analyze_lyrics_for_background(
             lyrics_text=chorus_text,
             artist=artist,
@@ -254,7 +255,7 @@ def main():
 
     bg_path = build_hybrid_background(
         job["audio_path"], meta.get("artist", ""), meta.get("song_title", ""),
-        job["segments"], out_dir,
+        job["segments"], out_dir, benchmark_job_id=job["job_id"],
     )
 
     out_path = compose_with_lyrics(

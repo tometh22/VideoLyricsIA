@@ -37,7 +37,8 @@ from internal_tracking import ensure_internal_tracking_job  # noqa: E402
 
 
 def build_baseline_background(audio_path: str, artist: str, song_title: str,
-                              segments: list[dict], out_dir: Path) -> str:
+                              segments: list[dict], out_dir: Path,
+                              benchmark_job_id: str) -> str:
     """Generate a Veo 8s clip + palindrome-loop it to the audio duration.
 
     Returns the path to the looped mp4 (duration ≈ audio duration).
@@ -63,7 +64,7 @@ def build_baseline_background(audio_path: str, artist: str, song_title: str,
         lyrics_text = "\n".join(s.get("text", "") for s in segments[:20])
         print(f"  [opt-c] analyzing lyrics for Veo prompt...")
         tracking_job_id = ensure_internal_tracking_job(
-            "loop-exp-c", style="experiment")
+            f"loop-exp-c:{benchmark_job_id}", style="experiment")
         analysis = _analyze_lyrics_for_background(
             lyrics_text=lyrics_text,
             artist=artist,
@@ -112,7 +113,7 @@ def main():
 
     bg_path = build_baseline_background(
         job["audio_path"], meta.get("artist", ""), meta.get("song_title", ""),
-        job["segments"], out_dir,
+        job["segments"], out_dir, benchmark_job_id=job["job_id"],
     )
 
     out_path = compose_with_lyrics(

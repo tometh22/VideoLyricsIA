@@ -43,7 +43,8 @@ XFADE_DUR = 2.0
 
 
 def build_seam_hidden_background(audio_path: str, artist: str, song_title: str,
-                                  segments: list[dict], out_dir: Path) -> str:
+                                  segments: list[dict], out_dir: Path,
+                                  benchmark_job_id: str) -> str:
     """Imagen still + N randomized Ken Burns + xfade chain."""
     from pipeline import (
         _generate_imagen_image,
@@ -66,7 +67,7 @@ def build_seam_hidden_background(audio_path: str, artist: str, song_title: str,
         lyrics_text = "\n".join(s.get("text", "") for s in segments[:20])
         print(f"  [opt-b] analyzing lyrics for Imagen prompt...")
         tracking_job_id = ensure_internal_tracking_job(
-            "loop-exp-b", style="experiment")
+            f"loop-exp-b:{benchmark_job_id}", style="experiment")
         analysis = _analyze_lyrics_for_background(
             lyrics_text=lyrics_text,
             artist=artist,
@@ -130,7 +131,7 @@ def main():
 
     bg_path = build_seam_hidden_background(
         job["audio_path"], meta.get("artist", ""), meta.get("song_title", ""),
-        job["segments"], out_dir,
+        job["segments"], out_dir, benchmark_job_id=job["job_id"],
     )
 
     out_path = compose_with_lyrics(
