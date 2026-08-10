@@ -30,6 +30,55 @@ def test_cost_refresh_requires_admin(client, user_token):
     assert res.status_code == 403
 
 
+def test_calibracion_de_mes_abierto_es_provisional_y_no_se_guarda(
+    client, admin_token, db, monkeypatch,
+):
+    from contextlib import contextmanager
+    import billing_sources
+    import database
+    import rate_calibration
+
+    @contextmanager
+    def _peer():
+        yield db
+
+    monkeypatch.setattr(billing_sources, "current_period", lambda: "2099-12")
+    monkeypatch.setattr(
+        billing_sources,
+        "fetch_gcp",
+        lambda _period: billing_sources.SourceCost(
+            "gcp", "2099-12", amount_usd=50.0,
+            breakdown=[{"service": "Vertex AI", "sku": "Veo", "cost": 50.0}],
+        ),
+    )
+    monkeypatch.setattr(database, "scoped_peer_db", _peer)
+    monkeypatch.setattr(
+        rate_calibration,
+        "derive_rates",
+        lambda *_args, **_kwargs: {
+            "period": "2099-12", "rates": [], "applied": {"veo": 0.5},
+        },
+    )
+    monkeypatch.setattr(
+        rate_calibration,
+        "store_rates",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an open-month rate must not be stored")
+        ),
+    )
+
+    response = client.post(
+        "/admin/cost/calibrate-rates", headers=auth(admin_token),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["provisional"] is True
+    assert body["stored"] is False
+    assert body["calibrated"] is False
+    assert body["applied"] == {}
+    assert body["provisional_applied"] == {"veo": 0.5}
+
+
 # ---------------------------------------------------------------------------
 # /admin/cost/real
 # ---------------------------------------------------------------------------
