@@ -31,7 +31,10 @@ def _result(segs):
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # Python 3.11 no longer creates a replacement loop implicitly after a
+    # previous test closes the process-global one. Give every sync wrapper an
+    # isolated lifecycle so this file is independent of suite order.
+    return asyncio.run(coro)
 
 
 def _patch_openai(monkeypatch, lines_per_seg: "dict[int, list[str]]"):
