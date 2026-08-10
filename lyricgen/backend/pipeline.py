@@ -9262,8 +9262,59 @@ VEO_MAX_CALLS_PER_SONG = int(
 VEO_BUDGET_WINDOW_DAYS = int(os.environ.get("VEO_BUDGET_WINDOW_DAYS", "30"))
 
 
-def _veo_budget_exceeded(job_id: str | None) -> tuple[bool, int]:
+def _discard_provenance_row(recorder) -> None:
+    """Borra la fila in-flight de una llamada que nunca se hizo.
+
+    Nunca levanta: si el borrado falla, se cierra la fila con un resumen que
+    la deja fuera del conteo igual (`cache_hit`-prefijado no sirve acá porque
+    miente sobre el origen, así que se marca y se acepta el ruido).
+    """
+    row_id = getattr(recorder, "_row_id", None)
+    if row_id is None:
+        recorder._finished = True
+        return
+    try:
+        from database import AIProvenance, SessionLocal
+        db = SessionLocal()
+        try:
+            db.query(AIProvenance).filter(AIProvenance.id == row_id).delete(
+                synchronize_session=False)
+            db.commit()
+        finally:
+            db.close()
+        recorder._finished = True
+    except Exception as exc:
+        logger.warning("[BG][BUDGET] no pude borrar la fila %s: %r", row_id, exc)
+        recorder.finish(response_summary="budget_exceeded: no se generó nada")
+
+
+def _song_identity(artist: str | None, title: str | None) -> str:
+    """Identidad de canción, IDÉNTICA a `cost_attribution.song_key`.
+
+    Tiene que colapsar los espacios internos igual que aquella: comparando
+    con `lower(trim(...))` en SQL, "La  Argentinidad" y "La Argentinidad"
+    quedaban como canciones distintas, así que corregir la metadata de un job
+    le estrenaba presupuesto. Se delega en la función de verdad para que no
+    puedan divergir.
+    """
+    try:
+        from cost_attribution import song_key
+        return song_key(artist, title)
+    except Exception:
+        import re as _re
+        a = _re.sub(r"\s+", " ", (artist or "").strip().lower())
+        t = _re.sub(r"\s+", " ", (title or "").strip().lower())
+        return f"{a}|{t}"
+
+
+def _veo_budget_exceeded(job_id: str | None,
+                         exclude_row_id: int | None = None) -> tuple[bool, int]:
     """(¿pasó el tope?, llamadas pagas ya hechas) para la CANCIÓN de este job.
+
+    `exclude_row_id` es la fila de provenance de la llamada EN CURSO. El
+    recorder se abre antes del chequeo (necesita cubrir también el camino de
+    cache), así que sin excluirla la llamada se cuenta a sí misma y el tope
+    corta una generación antes de lo configurado.
 
     Suma todos los jobs que comparten `artista|título` dentro de la ventana,
     así una edición o un re-render no estrenan presupuesto. Cuenta sobre
@@ -9303,27 +9354,29 @@ def _veo_budget_exceeded(job_id: str | None) -> tuple[bool, int]:
             if artist.strip() or title.strip():
                 since = _dt.now(_tz.utc) - timedelta(
                     days=VEO_BUDGET_WINDOW_DAYS)
-                # Mismos jobs que agrupa cost_attribution.song_key():
-                # artista|título normalizado por mayúsculas y espacios.
                 # Se materializa la lista en vez de usar una subquery: son un
                 # puñado de jobs por canción y el SQL queda trivial de leer.
+                # El filtro por fecha va sobre la PROVENANCE, no sobre el job:
+                # un job viejo puede seguir generando hoy (re-render de una
+                # canción de hace meses), y acotar sólo por `Job.created_at`
+                # lo dejaba fuera del presupuesto.
+                candidatos = db.query(Job.job_id, Job.artist, Job.song_title).all()
+                mio = _song_identity(artist, title)
                 hermanos = [
-                    r[0] for r in
-                    db.query(Job.job_id)
-                      .filter(_func.lower(_func.trim(
-                          _func.coalesce(Job.artist, ""))) == artist.strip().lower())
-                      .filter(_func.lower(_func.trim(
-                          _func.coalesce(Job.song_title, ""))) == title.strip().lower())
-                      .filter(Job.created_at >= since)
-                      .all()
+                    jid for jid, a, t in candidatos
+                    if _song_identity(a, t) == mio
                 ]
                 # `or [job_id]` cubre el arranque: el job todavía puede no
                 # estar visible en su propia transacción.
                 q = q.filter(AIProvenance.job_id.in_(hermanos or [job_id]))
-                alcance = f"canción {artist!r}/{title!r} ({len(hermanos)} jobs)"
+                q = q.filter(AIProvenance.created_at >= since)
+                alcance = f"canción {mio!r} ({len(hermanos)} jobs)"
             else:
                 q = q.filter(AIProvenance.job_id == job_id)
                 alcance = f"job {job_id} (sin metadata de canción)"
+
+            if exclude_row_id is not None:
+                q = q.filter(AIProvenance.id != exclude_row_id)
 
             n = int(q.scalar() or 0)
         finally:
@@ -9767,10 +9820,13 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # Runaway guard. Everything above this line is free (cache); from here
     # down every path costs money, so this is the one place a per-job
     # ceiling can be enforced.
-    _over, _spent = _veo_budget_exceeded(job_id)
+    _over, _spent = _veo_budget_exceeded(
+        job_id, exclude_row_id=getattr(recorder, "_row_id", None))
     if _over:
-        recorder.finish(
-            response_summary=f"budget_exceeded: {_spent} llamadas Veo en la canción")
+        # La fila se BORRA en vez de cerrarse: no hubo llamada al proveedor,
+        # así que dejarla registrada inventaba gasto y además contaminaba el
+        # propio conteo del tope en la siguiente pasada.
+        _discard_provenance_row(recorder)
         raise VeoBudgetExceeded(
             f"job {job_id}: {_spent} generaciones de Veo ya hechas para esta "
             f"canción (tope {VEO_MAX_CALLS_PER_SONG}). No se genera más para no "
