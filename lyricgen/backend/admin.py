@@ -1242,7 +1242,10 @@ async def admin_cost_reconcile(
             amount, _shared = ca.split_gcp_invoice(
                 amount, row.breakdown or [])
         invoiced += amount
-    have = {r.source for r in rows if r.status == "ok"}
+    have = {
+        r.source for r in rows
+        if r.status == "ok" and r.amount_usd is not None
+    }
 
     # `cost_dashboard_global` measures a window ending NOW, so asking it
     # for "30 days" while comparing against June's invoice compared two
