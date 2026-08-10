@@ -9359,7 +9359,12 @@ def _veo_budget_exceeded(job_id: str | None,
     de costo que rompe entregas cuando la DB hipa es peor que el gasto que
     evita.
     """
-    if not job_id or VEO_MAX_CALLS_PER_SONG <= 0:
+    if not job_id:
+        return False, 0
+    # Diagnostic callers do not own a provenance row, so disabling the cap is
+    # a true no-op for them. Provider submissions do pass ``own_row_id`` and
+    # still need to transition that row to a billable in-flight state below.
+    if VEO_MAX_CALLS_PER_SONG <= 0 and own_row_id is None:
         return False, 0
     try:
         from datetime import datetime as _dt, timedelta, timezone as _tz
@@ -9372,6 +9377,28 @@ def _veo_budget_exceeded(job_id: str | None,
 
         db = SessionLocal()
         try:
+            if VEO_MAX_CALLS_PER_SONG <= 0:
+                updated = (
+                    db.query(AIProvenance)
+                    .filter(AIProvenance.id == own_row_id)
+                    .update(
+                        {"response_summary": (
+                            f"{BUDGET_RESERVED_PREFIX}: ceiling disabled"
+                        )},
+                        synchronize_session=False,
+                    )
+                )
+                if updated:
+                    db.commit()
+                else:
+                    db.rollback()
+                    logger.warning(
+                        "[BG][BUDGET] no pude marcar fila=%s como facturable "
+                        "con el tope desactivado; fail-open",
+                        own_row_id,
+                    )
+                return False, 0
+
             row = (db.query(Job.artist, Job.song_title, Job.tenant_id)
                      .filter(Job.job_id == job_id).one_or_none())
             artist = (row[0] if row else "") or ""
@@ -10088,8 +10115,14 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             raise RuntimeError("Veo returned an unreadable success response") from exc
         operation_name = payload.get("name")
         if not operation_name:
-            _release_veo_reservation(
-                recorder, f"response missing operation name: {payload}")
+            # A 2xx means Vertex may already have accepted a paid operation,
+            # even if a schema change/anomaly hid its identifier. Keep exactly
+            # one billable reservation and stop: retrying could duplicate it.
+            if recorder:
+                recorder.finish(response_summary=(
+                    "error: ambiguous success response missing operation name; "
+                    f"not retrying: {str(payload)[:300]}"
+                ))
             raise RuntimeError(f"Veo response missing 'name': {payload}")
         veo_breaker.record_success()  # Veo accepted → close the breaker if open
         break

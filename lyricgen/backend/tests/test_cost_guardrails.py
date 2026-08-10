@@ -116,6 +116,40 @@ def test_tope_en_cero_lo_desactiva(monkeypatch):
     assert p._veo_budget_exceeded("job123") == (False, 0)
 
 
+def test_tope_desactivado_conserva_la_fila_facturable(db, monkeypatch):
+    """Apagar el ceiling no apaga la contabilidad de la llamada a Vertex."""
+    import pipeline
+    from database import AIProvenance, Job
+    from provenance import BUDGET_PENDING_PREFIX, BUDGET_RESERVED_PREFIX
+
+    job_id = "budget-disabled-billable"
+    db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+    db.query(Job).filter(Job.job_id == job_id).delete()
+    db.add(Job(job_id=job_id, user_id=1, tenant_id="budget-disabled",
+               artist="A", song_title="S", filename="a.mp3",
+               status="processing"))
+    row = AIProvenance(
+        job_id=job_id, step="video_bg",
+        tool_name="veo-3.1-fast-generate-001",
+        tool_provider="google_vertex", prompt_sent="p",
+        response_summary=BUDGET_PENDING_PREFIX,
+    )
+    db.add(row)
+    db.commit()
+    row_id = row.id
+    try:
+        monkeypatch.setattr(pipeline, "VEO_MAX_CALLS_PER_SONG", 0)
+        assert pipeline._veo_budget_exceeded(job_id, row_id) == (False, 0)
+        db.expire_all()
+        stored = db.query(AIProvenance).filter(
+            AIProvenance.id == row_id).one()
+        assert stored.response_summary.startswith(BUDGET_RESERVED_PREFIX)
+    finally:
+        db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+        db.query(Job).filter(Job.job_id == job_id).delete()
+        db.commit()
+
+
 def test_sin_job_id_no_topea(monkeypatch):
     p = _fake_counter(monkeypatch, 999)
     monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_SONG", 10)
@@ -219,6 +253,24 @@ def test_una_respuesta_ambigua_no_duplica_el_post():
     block = source[ambiguous:next_rate_limit]
     assert "raise RuntimeError" in block
     assert "continue" not in block
+
+
+def test_un_2xx_sin_operation_name_se_conserva_como_ambiguo():
+    """Un 2xx anómalo puede haber creado una operación aunque cambie el JSON.
+
+    No se libera el costo ni se repite el POST sin un identificador con el que
+    consultar la primera operación.
+    """
+    import inspect
+    import pipeline
+
+    source = inspect.getsource(pipeline._generate_veo_video)
+    start = source.index("if not operation_name:")
+    end = source.index("veo_breaker.record_success()", start)
+    block = source[start:end]
+    assert "ambiguous success response missing operation name" in block
+    assert "_release_veo_reservation" not in block
+    assert "raise RuntimeError" in block
 
 
 def test_la_identidad_de_cancion_colapsa_espacios(monkeypatch):
