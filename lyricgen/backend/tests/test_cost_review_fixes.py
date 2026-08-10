@@ -636,6 +636,64 @@ def test_refresh_fallido_del_mes_abierto_conserva_snapshot_pero_no_completa(
         db.commit()
 
 
+def test_refresh_final_fallido_no_convierte_checkpoint_en_factura(
+    client, admin_token, db, monkeypatch,
+):
+    """Un snapshot intrames sigue incompleto hasta un refresh maduro exitoso."""
+    import billing_sources
+    from database import CostSnapshot
+
+    period = "2020-10"
+    db.query(CostSnapshot).filter(
+        CostSnapshot.period == period,
+        CostSnapshot.source == "railway",
+    ).delete()
+    db.add(CostSnapshot(
+        period=period, source="railway", amount_usd=12.0, status="ok",
+        detail="checkpoint intrames", breakdown=[{"usage": 12.0}],
+        fetched_at=datetime(2020, 10, 15, tzinfo=timezone.utc),
+    ))
+    db.commit()
+    monkeypatch.setattr(billing_sources, "fetch_all", lambda **kw: {
+        "period": period,
+        "sources": [{
+            "source": "railway", "amount_usd": None,
+            "status": "error", "detail": "timeout de cierre",
+            "is_estimate": False, "breakdown": [],
+        }],
+    })
+    try:
+        response = client.post(
+            f"/admin/cost/refresh?period={period}&only=railway",
+            headers=auth(admin_token),
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        entry = body["sources"][0]
+        assert entry["status"] == "error"
+        assert entry["amount_usd"] is None
+        assert entry["retained_amount_usd"] == 12.0
+        assert entry["stale"] is True
+        assert body["configured"] == []
+        assert body["errored"] == ["railway"]
+        assert body["complete"] is False
+
+        db.expire_all()
+        stored = db.query(CostSnapshot).filter(
+            CostSnapshot.period == period,
+            CostSnapshot.source == "railway",
+        ).one()
+        assert stored.status == "ok"
+        assert stored.amount_usd == 12.0
+        assert stored.breakdown == [{"usage": 12.0}]
+    finally:
+        db.query(CostSnapshot).filter(
+            CostSnapshot.period == period,
+            CostSnapshot.source == "railway",
+        ).delete()
+        db.commit()
+
+
 def test_primer_refresh_maduro_finaliza_snapshot_provisional(
     client, admin_token, db, monkeypatch,
 ):

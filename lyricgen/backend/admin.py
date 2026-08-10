@@ -906,10 +906,18 @@ def admin_cost_refresh(
                 f"{row.detail or ''} | refresh {datetime.now(timezone.utc):%Y-%m-%d}: "
                 f"{failed_status} ({failed_detail}) — se conservó el valor anterior"
             ).strip(" |")
-            if period == billing_sources.current_period():
-                # The saved value is still useful as a checkpoint, but usage
-                # keeps accruing during an open month. Do not turn a failed
-                # live refresh into a seemingly complete stale total.
+            if (
+                period == billing_sources.current_period()
+                or not billing_sources.snapshot_is_final(
+                    period, entry["source"], row.fetched_at,
+                )
+            ):
+                # The saved value is still useful as a checkpoint, but an
+                # open-month capture remains provisional even after the
+                # calendar rolls over. Only a successful post-close refresh
+                # can cross this source's finalization boundary. Do not turn
+                # its first failed finalization attempt into a seemingly
+                # complete stale total.
                 entry["retained_amount_usd"] = row.amount_usd
                 entry["amount_usd"] = None
                 entry["status"] = failed_status
