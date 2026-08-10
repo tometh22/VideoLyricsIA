@@ -155,8 +155,8 @@ def test_no_se_cuenta_a_si_misma(monkeypatch):
         def __init__(self):
             self._distinct = False
         def filter(self, *a, **k):
-            # El filtro de exclusión es el único que compara con `!=`.
-            if a and "!=" in str(a[0]):
+            # El filtro de admisión es el único que compara ids con `<`.
+            if a and "ai_provenance.id <" in str(a[0]):
                 estado["excluido"] = True
             return self
         def distinct(self):
@@ -173,7 +173,7 @@ def test_no_se_cuenta_a_si_misma(monkeypatch):
         "database.SessionLocal",
         lambda: type("S", (), {"query": lambda s, *a, **k: _QExcl(),
                                "close": lambda s: None})())
-    over, spent = p._veo_budget_exceeded("job123", exclude_row_id=555)
+    over, spent = p._veo_budget_exceeded("job123", own_row_id=555)
     assert over is False and spent == 9, "la llamada en curso no debe contarse"
 
 
@@ -386,3 +386,55 @@ def test_el_tope_no_se_reintenta():
     # Y tiene que cortar el loop, no dormir.
     bloque = src[i_budget:i_budget + 500]
     assert "break" in bloque and "sleep" not in bloque
+
+
+def test_seis_escenas_simultaneas_no_se_rechazan_entre_si(monkeypatch):
+    """`_generate_scene_clips` manda las escenas por un ThreadPoolExecutor y
+    cada hilo inserta y commitea SU fila antes de llegar al chequeo. Con 5
+    llamadas históricas y 6 escenas juntas, cada hilo veía las otras 5
+    reservas, calculaba 10 y rechazaba: las 6 borraban su fila y la canción se
+    quedaba sin NINGÚN clip, teniendo 5 lugares libres.
+
+    El desempate es el orden de llegada: se ignoran las filas en vuelo con id
+    mayor al propio. El primero ve 5 y entra; el sexto ve 10 y se cae.
+    """
+    import pipeline
+
+    HISTORICAS = 5
+    # ids de las 6 reservas simultáneas, en orden de llegada.
+    EN_VUELO = [101, 102, 103, 104, 105, 106]
+
+    def _contar(own_row_id):
+        anteriores = [i for i in EN_VUELO if i < own_row_id]
+        return HISTORICAS + len(anteriores)
+
+    class _Q:
+        def __init__(self): self._own = None
+        def filter(self, *a, **k):
+            for arg in a:
+                txt = str(arg)
+                if "ai_provenance.id <" in txt:
+                    self._own = "marcado"
+            return self
+        def distinct(self): return self
+        def one_or_none(self): return ("Bersuit", "La Argentinidad", "t1")
+        def all(self): return [("j1", "Bersuit", "La Argentinidad")]
+        def scalar(self): return _contar(_actual["id"])
+
+    _actual = {"id": None}
+    monkeypatch.setattr(
+        "database.SessionLocal",
+        lambda: type("S", (), {"query": lambda s, *a, **k: _Q(),
+                               "close": lambda s: None})())
+    monkeypatch.setattr(pipeline, "VEO_MAX_CALLS_PER_SONG", 10)
+
+    admitidos = []
+    for rid in EN_VUELO:
+        _actual["id"] = rid
+        over, _ = pipeline._veo_budget_exceeded("job123", own_row_id=rid)
+        if not over:
+            admitidos.append(rid)
+
+    assert admitidos == [101, 102, 103, 104, 105], (
+        "los 5 lugares libres tienen que repartirse por orden de llegada, no "
+        f"perderse porque todos se rechazan entre sí. Admitidos: {admitidos}")

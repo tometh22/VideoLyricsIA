@@ -9318,13 +9318,26 @@ def _song_identity(artist: str | None, title: str | None,
 
 
 def _veo_budget_exceeded(job_id: str | None,
-                         exclude_row_id: int | None = None) -> tuple[bool, int]:
+                         own_row_id: int | None = None) -> tuple[bool, int]:
     """(¿pasó el tope?, llamadas pagas ya hechas) para la CANCIÓN de este job.
 
-    `exclude_row_id` es la fila de provenance de la llamada EN CURSO. El
-    recorder se abre antes del chequeo (necesita cubrir también el camino de
-    cache), así que sin excluirla la llamada se cuenta a sí misma y el tope
-    corta una generación antes de lo configurado.
+    `own_row_id` es la fila de provenance de la llamada EN CURSO. El recorder
+    se abre antes del chequeo, así que sin excluirla la llamada se cuenta a sí
+    misma y el tope corta una generación antes de lo configurado.
+
+    Esa exclusión, sola, no alcanza cuando varias escenas arrancan juntas:
+    `_generate_scene_clips` las manda por un ThreadPoolExecutor y cada hilo
+    inserta y commitea SU fila antes de llegar acá. Con 5 llamadas históricas
+    y 6 escenas simultáneas, cada hilo veía las otras 5 reservas, calculaba 10
+    y rechazaba — las 6 borraban su fila y la canción se quedaba sin ningún
+    clip, teniendo 5 lugares libres.
+
+    El desempate es el ORDEN DE LLEGADA, sin lock: además de la propia, se
+    ignoran las filas EN VUELO posteriores (`id` mayor). Las ya cerradas
+    cuentan siempre, vengan de donde vengan. Así el primero en reservar ve 5 y
+    entra, el segundo ve 6, y sólo el que se pasa del tope se cae. El id
+    autoincremental de Postgres es el árbitro y ya está serializado por la
+    propia base.
 
     Suma todos los jobs que comparten `artista|título` dentro de la ventana,
     así una edición o un re-render no estrenan presupuesto. Cuenta sobre
@@ -9405,8 +9418,15 @@ def _veo_budget_exceeded(job_id: str | None,
                 q = q.filter(AIProvenance.created_at >= since)
                 alcance = f"job {job_id} (sin metadata de canción)"
 
-            if exclude_row_id is not None:
-                q = q.filter(AIProvenance.id != exclude_row_id)
+            if own_row_id is not None:
+                from sqlalchemy import or_ as _or
+                q = q.filter(_or(
+                    # Ya cerradas: cuentan siempre.
+                    AIProvenance.response_summary.isnot(None),
+                    # En vuelo: sólo las que reservaron ANTES que yo. Excluye
+                    # también la propia (id no es < id).
+                    AIProvenance.id < own_row_id,
+                ))
 
             n = int(q.scalar() or 0)
         finally:
@@ -9873,7 +9893,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # down every path costs money, so this is the one place a per-job
     # ceiling can be enforced.
     _over, _spent = _veo_budget_exceeded(
-        job_id, exclude_row_id=getattr(recorder, "_row_id", None))
+        job_id, own_row_id=getattr(recorder, "_row_id", None))
     if _over:
         # La fila se BORRA en vez de cerrarse: no hubo llamada al proveedor,
         # así que dejarla registrada inventaba gasto y además contaminaba el
