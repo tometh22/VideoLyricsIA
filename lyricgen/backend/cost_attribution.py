@@ -136,6 +136,11 @@ class JobCost:
     title: str
     key: str
     created_at: datetime | None
+    completed_at: datetime | None = None
+    # None means an all-time report. For a monthly report this is computed
+    # from the terminal timestamp, so a job that merely incurs spend in the
+    # month does not also inflate that month's delivery denominator.
+    delivered_in_period: bool | None = None
     cost: float = 0.0
     billable_calls: int = 0
     cache_hits: int = 0
@@ -149,6 +154,8 @@ class JobCost:
 
     @property
     def delivered(self) -> bool:
+        if self.delivered_in_period is not None:
+            return self.delivered_in_period
         return self.status in DELIVERED_STATUSES
 
 
@@ -186,13 +193,12 @@ def collect_jobs(db, env: str, period: str | None = None,
     bucket, and june is then compared against june's invoice. The two sides
     have to cover the same window or the reconciliation is meaningless.
 
-    The job side is a UNION, not a filter: jobs created in the period (they
-    are the delivery denominator, spend or no spend) **plus** any older job
-    that incurred spend inside it. Filtering jobs by `created_at` alone
-    dropped a june job whose background was re-generated through
-    `run_edit_pipeline` in july — the provider invoiced that call in july
-    while the report omitted it entirely, which is exactly the kind of
-    silent gap the reconciliation exists to catch.
+    The job side is a UNION, not a filter: jobs delivered in the period
+    (the denominator, spend or no spend) **plus** any job that incurred spend
+    inside it. Filtering by `created_at` dropped a june job whose background
+    was re-generated through `run_edit_pipeline` in july; using it as the
+    delivery date also assigned june-30 uploads completed on july-2 to the
+    wrong denominator.
 
     `rates` are the invoice-derived per-call rates. They MUST be passed in
     when reading more than one environment: the calibration snapshot lives
@@ -208,24 +214,43 @@ def collect_jobs(db, env: str, period: str | None = None,
     bounds = period_bounds(period) if period else None
 
     q = db.query(Job.job_id, Job.tenant_id, Job.status, Job.artist,
-                 Job.song_title, Job.created_at)
+                 Job.song_title, Job.created_at, Job.completed_at)
     if bounds:
         con_gasto = [r[0] for r in
                      db.query(AIProvenance.job_id)
                        .filter(AIProvenance.created_at >= bounds[0],
                                AIProvenance.created_at < bounds[1])
                        .distinct().all()]
-        creado_en_periodo = and_(Job.created_at >= bounds[0],
-                                 Job.created_at < bounds[1])
-        q = (q.filter(or_(creado_en_periodo, Job.job_id.in_(con_gasto)))
-             if con_gasto else q.filter(creado_en_periodo))
+        entregado_en = func.coalesce(Job.completed_at, Job.created_at)
+        entregado_en_periodo = and_(
+            Job.status.in_(DELIVERED_STATUSES),
+            entregado_en >= bounds[0],
+            entregado_en < bounds[1],
+        )
+        q = (q.filter(or_(entregado_en_periodo, Job.job_id.in_(con_gasto)))
+             if con_gasto else q.filter(entregado_en_periodo))
 
     jobs: dict[str, JobCost] = {}
-    for job_id, tenant_id, status, artist, title, created_at in q.all():
+    for (job_id, tenant_id, status, artist, title, created_at,
+         completed_at) in q.all():
+        delivered_in_period = None
+        if bounds:
+            delivered_at = completed_at or created_at
+            # SQLite (tests/local) drops timezone information even for
+            # timezone-aware columns; production Postgres preserves it.
+            if delivered_at is not None and delivered_at.tzinfo is None:
+                delivered_at = delivered_at.replace(tzinfo=timezone.utc)
+            delivered_in_period = bool(
+                status in DELIVERED_STATUSES
+                and delivered_at is not None
+                and bounds[0] <= delivered_at < bounds[1]
+            )
         jobs[job_id] = JobCost(
             job_id=job_id, env=env, tenant_id=tenant_id or "",
             status=status or "", artist=artist or "", title=title or "",
             key=song_key(artist, title, job_id), created_at=created_at,
+            completed_at=completed_at,
+            delivered_in_period=delivered_in_period,
         )
 
     if not jobs:
