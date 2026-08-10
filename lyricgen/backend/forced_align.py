@@ -127,9 +127,10 @@ def _call_with_budget(model: str, input_factory, *,
             finish_replicate_provenance,
             start_replicate_provenance,
         )
-        inputs = input_factory()
-        recorder = start_replicate_provenance(model, "FORCED", attempt + 1)
+        recorder = None
         try:
+            inputs = input_factory()
+            recorder = start_replicate_provenance(model, "FORCED", attempt + 1)
             result = replicate.run(model, input=inputs)
             finish_replicate_provenance(recorder, "succeeded")
             return result

@@ -70,6 +70,9 @@ COST_PER_CALL: dict[tuple[str, str], float] = {
     # flash call under-counted the validator by ~an order of magnitude;
     # this rate is per-scan, not per-frame.
     ("gemini-2.5-flash-vision", "google_vertex"): 0.02,
+    # Single still-image validation performs exactly one frame request. Keep
+    # a separate key so it is not priced like the up-to-48-frame video scan.
+    ("gemini-2.5-flash-vision-image", "google_vertex"): 0.0005,
     # Replicate — invisible to this table until the 2026-08 audit, so
     # whisperX / forced-align / demucs spend never showed up at all
     # (real invoices: $3.67 may, $7.12 jun). Rates from the model pages.
