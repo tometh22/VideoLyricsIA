@@ -1202,3 +1202,63 @@ def test_replicate_acepta_ultima_pagina_dentro_del_limite(monkeypatch):
     assert out.status == "ok"
     assert out.amount_usd == pytest.approx(0.0)
     assert out.breakdown[0]["runs"] == 2
+
+
+# ---------------------------------------------------------------------------
+# 21. Cada intento Replicate queda atribuido al job activo
+# ---------------------------------------------------------------------------
+
+def test_replicate_registra_whisperx_demucs_y_forced_align_por_job(
+    db, monkeypatch,
+):
+    from database import AIProvenance, Job
+    from observability import clear_job_log_context, set_job_log_context
+    from replicate_budget import call_with_budget
+    import forced_align
+
+    job_id = "replprov001"
+    db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+    db.query(Job).filter(Job.job_id == job_id).delete()
+    db.add(Job(job_id=job_id, user_id=1, tenant_id="repl-prov",
+               artist="A", filename="a.mp3", status="processing"))
+    db.commit()
+    monkeypatch.setattr("replicate.run", lambda *_args, **_kwargs: {"ok": True})
+
+    try:
+        set_job_log_context(job_id)
+        assert call_with_budget(
+            "victor-upmeet/whisperx:version-a",
+            lambda: {}, total_budget_s=10, backoff=[0], call_label="WHISPERX",
+        ) == {"ok": True}
+        assert call_with_budget(
+            "cjwbw/demucs:version-b",
+            lambda: {}, total_budget_s=10, backoff=[0], call_label="VOCALSEP",
+        ) == {"ok": True}
+        assert forced_align._call_with_budget(
+            "cureau/force-align-wordstamps:version-c",
+            lambda: {}, total_budget_s=10, backoff=[0],
+        ) == {"ok": True}
+
+        db.expire_all()
+        rows = (
+            db.query(AIProvenance)
+            .filter(AIProvenance.job_id == job_id)
+            .order_by(AIProvenance.id)
+            .all()
+        )
+        assert [row.tool_name for row in rows] == [
+            "victor-upmeet/whisperx",
+            "cjwbw/demucs",
+            "cureau/force-align-wordstamps",
+        ]
+        assert {row.tool_provider for row in rows} == {"replicate"}
+        assert [row.tool_version for row in rows] == [
+            "version-a", "version-b", "version-c",
+        ]
+        assert all(row.response_summary == "succeeded" for row in rows)
+        assert all(row.duration_ms is not None for row in rows)
+    finally:
+        clear_job_log_context()
+        db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+        db.query(Job).filter(Job.job_id == job_id).delete()
+        db.commit()

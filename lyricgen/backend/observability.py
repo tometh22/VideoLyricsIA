@@ -268,6 +268,11 @@ def set_job_log_context(job_id):
     _current_job_id.set(str(job_id) if job_id else None)
 
 
+def current_job_log_context() -> str | None:
+    """Return the job bound to the current worker/request context."""
+    return _current_job_id.get()
+
+
 def clear_job_log_context():
     _current_job_id.set(None)
 
