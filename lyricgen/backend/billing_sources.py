@@ -46,6 +46,7 @@ logger = logging.getLogger("genly.billing")
 
 # Providers can be slow; keep the panel responsive.
 HTTP_TIMEOUT = int(os.environ.get("BILLING_HTTP_TIMEOUT", "30"))
+REPLICATE_MAX_PAGES = 50
 
 
 # ---------------------------------------------------------------------------
@@ -771,15 +772,17 @@ def fetch_replicate(period: str) -> SourceCost:
     url = "https://api.replicate.com/v1/predictions"
     total_seconds = 0.0
     per_model: dict[str, dict] = {}
+    pages_fetched = 0
+    stop = False
     try:
-        for _ in range(50):          # hard page cap
+        for _ in range(REPLICATE_MAX_PAGES):
             resp = requests.get(
                 url, headers={"Authorization": f"Bearer {token}"},
                 timeout=HTTP_TIMEOUT,
             )
             resp.raise_for_status()
             payload = resp.json()
-            stop = False
+            pages_fetched += 1
             for pred in payload.get("results", []) or []:
                 created = pred.get("created_at")
                 if not created:
@@ -803,6 +806,21 @@ def fetch_replicate(period: str) -> SourceCost:
                 break
     except Exception as e:
         return SourceCost("replicate", period, status="error", detail=str(e))
+
+    # Never label a capped subtotal as a complete monthly bill.  A healthy
+    # post-close result may be frozen forever, so a remaining cursor must
+    # stay incomplete and preserve any previous snapshot at the caller.
+    if url and not stop:
+        return SourceCost(
+            "replicate",
+            period,
+            status="error",
+            detail=(
+                "paginación de Replicate truncada después de "
+                f"{pages_fetched} páginas; queda un cursor pendiente"
+            ),
+            raw={"pages_fetched": pages_fetched, "next": url},
+        )
 
     return SourceCost(
         source="replicate", period=period,
