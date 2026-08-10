@@ -136,6 +136,28 @@ def fetch_gcp(period: str) -> SourceCost:
                           detail=f"credenciales GCP: {e}")
 
     start, end = _period_bounds(period)
+    # La tabla de export es de la CUENTA DE FACTURACIÓN entera, no del
+    # proyecto que la hospeda: si esa cuenta tiene otros proyectos, su gasto
+    # se suma acá, infla /cost/real, entra en la calibración de tarifas y
+    # termina atribuido a clientes de GenLy. `GCP_BILLING_PROJECT_IDS` acota
+    # a los proyectos de trabajo.
+    #
+    # Sin configurar NO se filtra (filtrar por el proyecto del dataset
+    # reportaría $0 si el export vive en un proyecto aparte, que es peor que
+    # sobrecontar) — pero el alcance se declara en `detail` para que nadie
+    # lea el número como si fuera sólo nuestro.
+    proyectos = [p.strip() for p in
+                 os.environ.get("GCP_BILLING_PROJECT_IDS", "").split(",")
+                 if p.strip()]
+    if proyectos:
+        _lista = ", ".join(f"'{p}'" for p in proyectos)
+        filtro_proyecto = f"AND project.id IN ({_lista})"
+        alcance = f"proyectos {', '.join(proyectos)}"
+    else:
+        filtro_proyecto = ""
+        alcance = ("TODA la cuenta de facturación (sin "
+                   "GCP_BILLING_PROJECT_IDS): incluye cualquier otro "
+                   "proyecto que cuelgue de la misma cuenta")
     # cost + credits is the number that actually lands on the invoice;
     # `cost` alone ignores sustained-use discounts and promo credits.
     sql = f"""
@@ -146,6 +168,7 @@ def fetch_gcp(period: str) -> SourceCost:
           SUM(IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) c), 0)) AS credits
         FROM `{project}.{dataset}.{table}`
         WHERE DATE(usage_start_time) BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
+          {filtro_proyecto}
         GROUP BY service, sku
         ORDER BY cost DESC
     """
@@ -208,7 +231,9 @@ def fetch_gcp(period: str) -> SourceCost:
     return SourceCost(
         source="gcp", period=period, amount_usd=round(total, 2),
         breakdown=breakdown,
-        raw={"rows": payload.get("totalRows"), "table": f"{dataset}.{table}"},
+        detail=f"alcance: {alcance}",
+        raw={"rows": payload.get("totalRows"), "table": f"{dataset}.{table}",
+             "project_scope": proyectos or "billing_account"},
     )
 
 

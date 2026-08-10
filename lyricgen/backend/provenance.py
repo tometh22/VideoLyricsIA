@@ -210,7 +210,8 @@ _WASTE_LABELS = {
 def cost_waste_breakdown(db: Session, since_days: int = 30,
                          tenant_id: str | None = None,
                          start: datetime | None = None,
-                         end: datetime | None = None) -> dict:
+                         end: datetime | None = None,
+                         rates: dict[str, float] | None = None) -> dict:
     """Attribute billable AI spend to what it actually produced.
 
     The headline number the 2026-08 audit surfaced: in jul-2026, 59% of
@@ -241,6 +242,11 @@ def cost_waste_breakdown(db: Session, since_days: int = 30,
     Pass `tenant_id` to scope to one client — useful for seeing which
     tenant's operators are burning previews, since the waste rate is a
     workflow habit and varies a lot between them.
+
+    Pass `rates` when reading more than one environment. The calibration
+    snapshot lives in whichever database it was computed against, so a peer
+    session would load nothing and value its half at list price — the merged
+    waste ratio would then mix two valuation bases.
     """
     # `start`/`end` explícitos ganan sobre `since_days`. Sin ellos, la
     # ventana termina HOY — correcto para el panel en vivo, pero MAL para
@@ -249,7 +255,7 @@ def cost_waste_breakdown(db: Session, since_days: int = 30,
     since = start or (datetime.now(timezone.utc) - timedelta(days=since_days))
     until = end
     # Tarifas derivadas de la factura del período; {} cae a COST_PER_CALL.
-    _rates = rates_for_window(db, since)
+    _rates = rates if rates is not None else rates_for_window(db, since)
 
     def _window(query):
         query = query.filter(AIProvenance.created_at >= since)
