@@ -1057,6 +1057,35 @@ def test_cli_transporta_el_breakdown_de_gcp():
     assert breakdowns["gcp"][1]["service"] == "Cloud Storage"
 
 
+def test_lifecycle_solo_expira_prores_generado():
+    from scripts.r2_lifecycle_report import _classify
+
+    assert _classify("tenant/job/umg_master.mov").startswith("master ProRes")
+    assert _classify("tenant/job/umg_short.mov.v2").startswith("master ProRes")
+    assert not _classify("tenant/job/inputs/bg_custom.mov").startswith("master ProRes")
+    assert not _classify("tenant/job/otro.mov").startswith("master ProRes")
+
+
+def test_promedio_cotizable_incluye_gasto_abandonado():
+    from scripts.umg_cost_report import _delivered_cost_stats
+
+    songs = [
+        {"delivered": True, "cost": 4.0},
+        {"delivered": True, "cost": 6.0},
+        {"delivered": False, "cost": 10.0},
+    ]
+    # $20 de gasto total / 2 entregas = $10 cotizable. La distribución de
+    # entregadas conserva mediana $5 y extremos $4-$6.
+    stats = _delivered_cost_stats(songs, quoteable_average=10.0)
+    assert stats == {
+        "n": 2,
+        "median": 5.0,
+        "quoteable_average": 10.0,
+        "max": 6.0,
+        "min": 4.0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 18. R2 descuenta las operaciones incluidas
 # ---------------------------------------------------------------------------
