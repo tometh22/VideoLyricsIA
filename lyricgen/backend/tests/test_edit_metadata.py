@@ -21,6 +21,7 @@ Tests pinean el contrato API + el comportamiento del edit-slot:
   - el AuditLog lleva `metadata_only=True`
 """
 import uuid
+from datetime import datetime, timezone
 
 from database import Job as JobModel, User as UserModel, AuditLog
 
@@ -96,6 +97,43 @@ def test_metadata_updates_db_and_enqueues(client, admin_token, db, monkeypatch):
     assert edit_params.get("artist") == "Sín Gamulán"
     assert edit_params.get("song_title") == "Los Abuelos De La Nada"
     assert captured[0]["edit_type"] == "metadata"
+
+
+def test_edit_rejected_clears_failed_completion_timestamp(
+    client, admin_token, db, monkeypatch,
+):
+    """A rescued rejection must be stamped when it is actually delivered.
+
+    Keeping the rejection timestamp assigns a July rescue to June's delivery
+    denominator because ``update_job`` only stamps terminal transitions when
+    ``completed_at`` is null.
+    """
+    _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    rejected_at = datetime(2026, 6, 30, tzinfo=timezone.utc)
+    job_id = _create_pending_review_job(
+        db, tenant_id, user_id, status="rejected", completed_at=rejected_at)
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "metadata", "song_title": "Título corregido"},
+    )
+    assert res.status_code == 200, res.text
+    db.expire_all()
+    row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
+    assert row.status == "editing"
+    assert row.completed_at is None
+
+    from jobs import update_job
+    update_job(job_id, status="pending_review")
+    db.expire_all()
+    row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
+    assert row.completed_at is not None
+    completed_at = row.completed_at
+    if completed_at.tzinfo is None:  # SQLite drops timezone information.
+        completed_at = completed_at.replace(tzinfo=timezone.utc)
+    assert completed_at > rejected_at
 
 
 def test_metadata_does_not_consume_edit_slot(client, admin_token, db, monkeypatch):

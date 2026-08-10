@@ -701,3 +701,107 @@ def test_unit_economics_incluye_el_ultimo_microsegundo(client, admin_token, db):
     finally:
         db.query(Job).filter(Job.tenant_id == tenant).delete()
         db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 17. Los cargos GCP no-Vertex son infraestructura compartida
+# ---------------------------------------------------------------------------
+
+def test_gcp_separa_vertex_de_storage_y_red():
+    import cost_attribution as ca
+
+    attribution = {
+        "business": {
+            "umg_share_of_cost": 0.75,
+            "umg_share_of_jobs": 0.25,
+            "umg_share_by_source": {"gcp": 0.8},
+        },
+        "umg": {"songs": 2, "direct_cost": 10.0},
+    }
+    ca.add_total_cost(
+        attribution,
+        {"gcp": 100.0},
+        basis="jobs",
+        invoice_breakdowns={"gcp": [
+            {"service": "Vertex AI", "sku": "Veo", "cost": 70.0},
+            {"service": "Cloud Storage", "sku": "Storage", "cost": 20.0},
+            {"service": "Networking", "sku": "Egress", "cost": 10.0},
+        ]},
+    )
+    out = attribution["umg_total"]
+    assert out["umg_direct_cost"] == pytest.approx(56.0)  # 70 * 80%
+    assert out["umg_shared_cost"] == pytest.approx(7.5)   # 30 * 25%
+    assert out["invoiced_shared_cost_by_source"] == {
+        "gcp_infrastructure": 30.0,
+    }
+    assert out["invoices_total"] == 100.0
+
+
+# ---------------------------------------------------------------------------
+# 18. R2 descuenta las operaciones incluidas
+# ---------------------------------------------------------------------------
+
+def test_r2_descuenta_las_cuotas_gratuitas_de_operaciones(monkeypatch):
+    import billing_sources
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"data": {"viewer": {"accounts": [{
+                "r2StorageAdaptiveGroups": [],
+                "r2OperationsAdaptiveGroups": [
+                    {"sum": {"requests": 1_000_000},
+                     "dimensions": {"actionType": "PutObject"}},
+                    {"sum": {"requests": 10_000_000},
+                     "dimensions": {"actionType": "GetObject"}},
+                    {"sum": {"requests": 50_000_000},
+                     "dimensions": {"actionType": "DeleteObject"}},
+                ],
+            }]}}}
+
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "token")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "account")
+    monkeypatch.setattr(billing_sources.requests, "post", lambda *a, **k: _Resp())
+
+    out = billing_sources.fetch_r2("2026-07")
+    assert out.amount_usd == 0.0
+    by_concept = {row["concepto"]: row for row in out.breakdown}
+    assert by_concept["operaciones clase A"]["billable_requests"] == 0
+    assert by_concept["operaciones clase B"]["billable_requests"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 19. Un snapshot fijo cerrado no cambia con la configuración de hoy
+# ---------------------------------------------------------------------------
+
+def test_refresh_no_reescribe_suscripciones_de_un_mes_cerrado(
+    client, admin_token, db, monkeypatch,
+):
+    from database import CostSnapshot
+
+    period = "2020-06"
+    db.query(CostSnapshot).filter(
+        CostSnapshot.period == period, CostSnapshot.source == "fixed").delete()
+    db.add(CostSnapshot(period=period, source="fixed", amount_usd=44.0,
+                        status="ok", breakdown=[{"concepto": "legacy"}]))
+    db.commit()
+    monkeypatch.setenv("FIXED_SUBSCRIPTIONS_JSON", '{"new_plan": 99}')
+    try:
+        response = client.post(
+            f"/admin/cost/refresh?period={period}&only=fixed",
+            headers=auth(admin_token),
+        )
+        assert response.status_code == 200, response.text
+        entry = response.json()["sources"][0]
+        assert entry["kept_previous"] is True
+        db.expire_all()
+        row = db.query(CostSnapshot).filter(
+            CostSnapshot.period == period,
+            CostSnapshot.source == "fixed",
+        ).one()
+        assert row.amount_usd == 44.0
+        assert row.breakdown == [{"concepto": "legacy"}]
+    finally:
+        db.query(CostSnapshot).filter(
+            CostSnapshot.period == period, CostSnapshot.source == "fixed").delete()
+        db.commit()

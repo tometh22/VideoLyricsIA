@@ -851,6 +851,19 @@ def admin_cost_refresh(
         if row is None:
             row = CostSnapshot(period=period, source=entry["source"])
             db.add(row)
+        # A closed-month fixed-cost snapshot is the historical price list.
+        # Re-evaluating it with today's FIXED_SUBSCRIPTIONS_JSON after a plan
+        # change rewrites history. Keep a healthy closed snapshot immutable;
+        # the current month remains refreshable until it closes.
+        if (
+            entry["source"] == "fixed"
+            and period < billing_sources.current_period()
+            and row.status == "ok"
+            and row.amount_usd is not None
+        ):
+            entry["kept_previous"] = True
+            entry["previous_amount_usd"] = row.amount_usd
+            continue
         # Un refresh fallido NO pisa un snapshot sano. Las fuentes son
         # ventanas móviles: GitHub sólo puede consultar el ciclo vigente, así
         # que re-refrescar julio en agosto devuelve su error deliberado y
@@ -1314,11 +1327,13 @@ async def admin_cost_umg(
         )
         invoices = {r.source: r.amount_usd for r in rows
                     if r.amount_usd is not None}
+        invoice_breakdowns = {r.source: (r.breakdown or []) for r in rows}
         if invoices:
             import cost_attribution as ca
             ca.add_total_cost(
                 result, invoices,
                 revenue_usd=revenue_usd or None, basis=basis,
+                invoice_breakdowns=invoice_breakdowns,
             )
             missing = sorted(set(billing_sources.SOURCES) - set(invoices))
             result["umg_total"]["invoices_missing_sources"] = missing
