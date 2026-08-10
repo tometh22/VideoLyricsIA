@@ -165,6 +165,28 @@ def test_la_reserva_pendiente_no_se_cuenta_a_si_misma():
     assert "initial_response_summary=BUDGET_PENDING_PREFIX" in source
 
 
+def test_el_preflight_de_veo_ocurre_antes_de_reservar_presupuesto():
+    """Credenciales o payload inválidos no llegan al proveedor y no deben
+    gastar uno de los diez lugares de la canción. La reserva empieza sólo
+    después del preflight local y justo antes del primer POST.
+
+    Desde que se invoca ``post`` el resultado ya es ambiguo (un timeout puede
+    llegar después de que Vertex aceptó el trabajo), por lo que esa reserva sí
+    se conserva como facturable.
+    """
+    import inspect
+    import pipeline
+
+    source = inspect.getsource(pipeline._generate_veo_video)
+    first_token = source.index("token = _veo_access_token()")
+    recorder = source.index("recorder = record_ai_call(")
+    reserve = source.index("_over, _spent = _veo_budget_exceeded(")
+    first_post = source.index("r = _req.post(")
+    request_body = source.index("request_body = {")
+
+    assert request_body < first_token < recorder < reserve < first_post
+
+
 def test_la_identidad_de_cancion_colapsa_espacios(monkeypatch):
     """Comparando con `lower(trim(...))` en SQL, "La  Argentinidad" y
     "La Argentinidad" eran canciones distintas — corregir la metadata de un

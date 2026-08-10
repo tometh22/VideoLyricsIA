@@ -9899,38 +9899,10 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             f"[BG] cache_only: sin clip cacheado (probé {_candidates}) — no se genera "
             "para no re-cobrar Veo en una regeneración de escena")
 
-    from provenance import BUDGET_PENDING_PREFIX
-
-    recorder = record_ai_call(
-        job_id=job_id or "unknown",
-        step="video_bg",
-        tool_name=model,
-        tool_provider="google_vertex",
-        prompt=safe_prompt,
-        input_data_types=["generated_prompt"],
-        initial_response_summary=BUDGET_PENDING_PREFIX,
-    ) if job_id else None
-
     # Fresh provider output is intentionally not read from the shared raw
     # cache here. This function runs before content validation, so a normal
     # hit could reuse a hallucinated person. ``cache_only`` above is retained
     # exclusively for storyboard keys published after dense validation.
-
-    # Runaway guard. Everything above this line is free (cache); from here
-    # down every path costs money, so this is the one place a per-job
-    # ceiling can be enforced.
-    _over, _spent = _veo_budget_exceeded(
-        job_id, own_row_id=getattr(recorder, "_row_id", None))
-    if _over:
-        # La fila se BORRA en vez de cerrarse: no hubo llamada al proveedor,
-        # así que dejarla registrada inventaba gasto y además contaminaba el
-        # propio conteo del tope en la siguiente pasada.
-        _discard_provenance_row(recorder)
-        raise VeoBudgetExceeded(
-            f"job {job_id}: {_spent} generaciones de Veo ya hechas para esta "
-            f"canción (tope {VEO_MAX_CALLS_PER_SONG}). No se genera más para no "
-            f"seguir gastando; el llamador cae a su fallback."
-        )
 
     elapsed = _time.time() - _last_veo_request
     if elapsed < _VEO_COOLDOWN and _last_veo_request > 0:
@@ -9997,10 +9969,45 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     _submit_budget_s = float(os.environ.get("VEO_SUBMIT_BUDGET_S", "240"))
     _submit_deadline = _time.time() + _submit_budget_s
 
+    # Todo lo anterior es preflight local y gratis. En particular, obtener el
+    # token puede fallar por credenciales/configuración y construir el payload
+    # puede fallar por una imagen inválida. Ninguno de esos casos debe consumir
+    # una reserva: el proveedor todavía no recibió una solicitud.
+    token = _veo_access_token()
+
+    from provenance import BUDGET_PENDING_PREFIX
+
+    recorder = record_ai_call(
+        job_id=job_id or "unknown",
+        step="video_bg",
+        tool_name=model,
+        tool_provider="google_vertex",
+        prompt=safe_prompt,
+        input_data_types=["generated_prompt"],
+        initial_response_summary=BUDGET_PENDING_PREFIX,
+    ) if job_id else None
+
+    # Reserva y chequeo atómicos en el último punto seguro antes del POST. A
+    # partir de `_req.post` un timeout es ambiguo (Vertex puede haber aceptado
+    # la generación), por eso esos errores conservan la reserva facturable.
+    _over, _spent = _veo_budget_exceeded(
+        job_id, own_row_id=getattr(recorder, "_row_id", None))
+    if _over:
+        # La fila se BORRA en vez de cerrarse: no hubo llamada al proveedor,
+        # así que dejarla registrada inventaba gasto y además contaminaba el
+        # propio conteo del tope en la siguiente pasada.
+        _discard_provenance_row(recorder)
+        raise VeoBudgetExceeded(
+            f"job {job_id}: {_spent} generaciones de Veo ya hechas para esta "
+            f"canción (tope {VEO_MAX_CALLS_PER_SONG}). No se genera más para no "
+            f"seguir gastando; el llamador cae a su fallback."
+        )
+
     for attempt in range(MAX_ATTEMPTS):
         try:
             logger.info("[BG] Veo 3: generating video (attempt %s/%s)...", attempt + 1, MAX_ATTEMPTS)
-            token = _veo_access_token()
+            if attempt:
+                token = _veo_access_token()
             r = _req.post(
                 submit_url,
                 headers={
