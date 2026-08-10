@@ -335,6 +335,28 @@ def test_un_envio_ambiguo_tampoco_reintenta_en_el_bucle_exterior():
     assert "continue" not in block
 
 
+def test_http_408_y_5xx_son_ambiguos_pero_4xx_rechaza():
+    import inspect
+    import pipeline
+
+    assert pipeline._veo_http_failure_is_ambiguous(408) is True
+    assert pipeline._veo_http_failure_is_ambiguous(500) is True
+    assert pipeline._veo_http_failure_is_ambiguous(502) is True
+    assert pipeline._veo_http_failure_is_ambiguous(599) is True
+    assert pipeline._veo_http_failure_is_ambiguous(400) is False
+    assert pipeline._veo_http_failure_is_ambiguous(401) is False
+    assert pipeline._veo_http_failure_is_ambiguous(403) is False
+    assert pipeline._veo_http_failure_is_ambiguous(422) is False
+
+    source = inspect.getsource(pipeline._generate_veo_video)
+    failure = source[source.index("if not r.ok:"):
+                     source.index("try:\n            payload = r.json()")]
+    ambiguous = failure.index("_veo_http_failure_is_ambiguous")
+    release = failure.index("_release_veo_reservation")
+    assert ambiguous < release
+    assert "raise VeoAmbiguousSubmission" in failure[:release]
+
+
 def test_la_identidad_de_cancion_colapsa_espacios(monkeypatch):
     """Comparando con `lower(trim(...))` en SQL, "La  Argentinidad" y
     "La Argentinidad" eran canciones distintas — corregir la metadata de un

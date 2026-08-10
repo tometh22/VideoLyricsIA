@@ -9233,6 +9233,11 @@ class VeoAmbiguousSubmission(RuntimeError):
     """
 
 
+def _veo_http_failure_is_ambiguous(status_code: int) -> bool:
+    """HTTP failures that may arrive after Vertex accepted the operation."""
+    return status_code == 408 or 500 <= status_code <= 599
+
+
 # Tope de generaciones PAGAS de Veo POR CANCIÓN. Medido en jul-2026: en prod,
 # 12 jobs (el 10%) se comieron el **42,8%** del gasto de Veo, y uno solo llegó
 # a 26 llamadas — unos $16 en un video que se vende a $8. Un job sano usa 1-3.
@@ -10138,6 +10143,16 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             continue
         if not r.ok:
             detail = r.text[:500]
+            if _veo_http_failure_is_ambiguous(r.status_code):
+                if recorder:
+                    recorder.finish(response_summary=(
+                        f"error: ambiguous HTTP {r.status_code}; not retrying: "
+                        f"{detail[:300]}"
+                    ))
+                raise VeoAmbiguousSubmission(
+                    f"Veo predictLongRunning HTTP {r.status_code} was "
+                    f"ambiguous; not retrying: {detail}"
+                )
             _release_veo_reservation(
                 recorder, f"HTTP {r.status_code} rejected: {detail}")
             raise RuntimeError(
