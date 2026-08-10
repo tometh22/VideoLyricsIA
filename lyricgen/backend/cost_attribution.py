@@ -594,9 +594,35 @@ def build_attribution(jobs_by_env: dict[str, dict[str, JobCost]],
 DIRECT_INVOICE_SOURCES = frozenset({"gcp", "openai", "replicate"})
 
 
+def _split_gcp_invoice(amount: float, breakdown: list[dict] | None) -> tuple[float, float]:
+    """Return ``(direct_ai, shared_infra)`` from a GCP invoice snapshot.
+
+    The billing export groups Vertex AI, Cloud Storage and networking under
+    the same provider. Only Vertex AI has per-job provenance; treating the
+    whole provider total as direct assigns storage/network spend using the AI
+    call mix instead of the selected shared-infrastructure basis.
+
+    Old/manual snapshots may not carry a breakdown. Preserve their legacy
+    behaviour rather than silently moving a known invoice to a different
+    bucket; every snapshot produced by ``fetch_gcp`` includes service+SKU.
+    """
+    if not breakdown:
+        return float(amount), 0.0
+    direct_ai = sum(
+        float(row.get("cost") or 0.0)
+        for row in breakdown
+        if "vertex ai" in str(row.get("service") or "").lower()
+    )
+    # Use the snapshot amount as the source of truth. Breakdown entries are
+    # rounded to four decimals, so subtraction keeps the two buckets adding
+    # back to the invoiced total exactly.
+    return direct_ai, float(amount) - direct_ai
+
+
 def add_total_cost(attribution: dict, invoices: dict[str, float],
                    revenue_usd: float | None = None,
-                   basis: str = "cost") -> dict:
+                   basis: str = "cost",
+                   invoice_breakdowns: dict[str, list[dict]] | None = None) -> dict:
     """Level 2: direct UMG cost + UMG's share of shared infrastructure.
 
     `invoices` maps source -> USD for the period (the real bill, e.g.
@@ -621,10 +647,23 @@ def add_total_cost(attribution: dict, invoices: dict[str, float],
     share_by_jobs = attribution["business"]["umg_share_of_jobs"] or 0.0
     shared_share = share_by_cost if basis == "cost" else share_by_jobs
 
-    direct_invoiced = sum(v for k, v in invoices.items()
-                          if k in DIRECT_INVOICE_SOURCES)
-    shared_invoiced = sum(v for k, v in invoices.items()
-                          if k not in DIRECT_INVOICE_SOURCES)
+    invoice_breakdowns = invoice_breakdowns or {}
+    direct_amounts: dict[str, float] = {}
+    shared_amounts: dict[str, float] = {}
+    for source, raw_amount in invoices.items():
+        amount = float(raw_amount)
+        if source == "gcp":
+            direct_ai, shared_infra = _split_gcp_invoice(
+                amount, invoice_breakdowns.get(source))
+            direct_amounts[source] = direct_ai
+            if shared_infra:
+                shared_amounts["gcp_infrastructure"] = shared_infra
+        elif source in DIRECT_INVOICE_SOURCES:
+            direct_amounts[source] = amount
+        else:
+            shared_amounts[source] = amount
+    direct_invoiced = sum(direct_amounts.values())
+    shared_invoiced = sum(shared_amounts.values())
 
     # Direct providers are ALWAYS split by cost share, never by `basis`.
     # Their spend is per-call and level 1 already attributed it call by
@@ -643,9 +682,7 @@ def add_total_cost(attribution: dict, invoices: dict[str, float],
                        or {})
     umg_direct = 0.0
     direct_detail: dict[str, float] = {}
-    for src, amount in invoices.items():
-        if src not in DIRECT_INVOICE_SOURCES:
-            continue
+    for src, amount in direct_amounts.items():
         s = share_by_source.get(src)
         if s is None:
             s = share_by_cost
@@ -665,6 +702,9 @@ def add_total_cost(attribution: dict, invoices: dict[str, float],
         "invoices_total": round(direct_invoiced + shared_invoiced, 2),
         "invoiced_direct_sources": round(direct_invoiced, 2),
         "invoiced_shared_sources": round(shared_invoiced, 2),
+        "invoiced_shared_cost_by_source": {
+            k: round(v, 2) for k, v in sorted(shared_amounts.items())
+        },
         "umg_direct_cost": round(umg_direct, 2),
         "umg_direct_cost_by_source": direct_detail,
         "share_by_source": {k: round(v, 4) for k, v in

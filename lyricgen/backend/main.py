@@ -12186,6 +12186,14 @@ async def request_edit(
             job_id, job.input_r2_key, _exc,
         )
 
+    # A rejected/error job has a terminal timestamp, but it has never been a
+    # delivery. Clear that failed-attempt timestamp when the operator rescues
+    # it so the next done/pending_review transition stamps the real delivery
+    # month. Preserve it for already delivered jobs: an edit is not a second
+    # song in the denominator.
+    if job.status not in ("done", "pending_review"):
+        job.completed_at = None
+
     # Flip to editing immediately so the UI can show progress.
     job.status = "editing"
     job.edit_count = new_edit_count

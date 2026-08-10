@@ -543,6 +543,8 @@ R2_USD_PER_GB_MONTH = float(os.environ.get("R2_USD_PER_GB_MONTH", "0.015"))
 R2_USD_PER_MILLION_CLASS_A = float(os.environ.get("R2_USD_PER_M_CLASS_A", "4.50"))
 R2_USD_PER_MILLION_CLASS_B = float(os.environ.get("R2_USD_PER_M_CLASS_B", "0.36"))
 R2_FREE_GB = float(os.environ.get("R2_FREE_GB", "10"))
+R2_FREE_CLASS_A = int(os.environ.get("R2_FREE_CLASS_A", "1000000"))
+R2_FREE_CLASS_B = int(os.environ.get("R2_FREE_CLASS_B", "10000000"))
 
 
 def fetch_r2(period: str) -> SourceCost:
@@ -624,13 +626,23 @@ def fetch_r2(period: str) -> SourceCost:
     for row in acct.get("r2OperationsAdaptiveGroups") or []:
         action = ((row.get("dimensions") or {}).get("actionType") or "").lower()
         requests_n = int((row.get("sum") or {}).get("requests") or 0)
-        # Cloudflare labels the op; writes/lists are class A, reads class B.
-        if any(k in action for k in ("put", "post", "copy", "list", "delete", "multipart")):
+        # Cloudflare labels the op; deletes and multipart aborts are free,
+        # writes/lists are class A, and reads are class B.
+        if "delete" in action or "abortmultipart" in action:
+            continue
+        if any(k in action for k in ("put", "post", "copy", "list", "multipart")):
             class_a += requests_n
         else:
             class_b += requests_n
-    ops_cost = (class_a / 1e6) * R2_USD_PER_MILLION_CLASS_A + \
-               (class_b / 1e6) * R2_USD_PER_MILLION_CLASS_B
+    # R2 Standard includes 1M Class A and 10M Class B operations each month.
+    # Price only the excess, just like storage above. These defaults mirror
+    # Cloudflare's published allowances and remain env-tunable if the plan or
+    # pricing changes.
+    billable_class_a = max(0, class_a - R2_FREE_CLASS_A)
+    billable_class_b = max(0, class_b - R2_FREE_CLASS_B)
+    class_a_cost = (billable_class_a / 1e6) * R2_USD_PER_MILLION_CLASS_A
+    class_b_cost = (billable_class_b / 1e6) * R2_USD_PER_MILLION_CLASS_B
+    ops_cost = class_a_cost + class_b_cost
 
     objects = max(
         [int((r.get("max") or {}).get("objectCount") or 0) for r in storage_rows]
@@ -644,10 +656,12 @@ def fetch_r2(period: str) -> SourceCost:
         breakdown=[
             {"concepto": "storage", "cost": round(storage_cost, 4),
              "avg_gb": round(avg_gb, 2)},
-            {"concepto": "operaciones clase A", "cost": round(
-                (class_a / 1e6) * R2_USD_PER_MILLION_CLASS_A, 4), "requests": class_a},
-            {"concepto": "operaciones clase B", "cost": round(
-                (class_b / 1e6) * R2_USD_PER_MILLION_CLASS_B, 4), "requests": class_b},
+            {"concepto": "operaciones clase A", "cost": round(class_a_cost, 4),
+             "requests": class_a, "included_requests": R2_FREE_CLASS_A,
+             "billable_requests": billable_class_a},
+            {"concepto": "operaciones clase B", "cost": round(class_b_cost, 4),
+             "requests": class_b, "included_requests": R2_FREE_CLASS_B,
+             "billable_requests": billable_class_b},
         ],
     )
 
