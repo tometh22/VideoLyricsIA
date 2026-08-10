@@ -160,17 +160,24 @@ def period_bounds(period: str) -> tuple[datetime, datetime]:
 def collect_jobs(db, env: str, period: str | None = None) -> dict[str, JobCost]:
     """All jobs in one environment with their billable spend attached.
 
-    `period` filters on `Job.created_at`; None takes the whole history.
+    `period` filters BOTH `Job.created_at` and `AIProvenance.created_at`;
+    None takes the whole history. Bounding the provenance side matters: a job
+    created on 30-jun that re-rolls scenes into july would otherwise put
+    july's spend in june's bucket, and june is then compared against june's
+    invoice. The two sides have to cover the same window or the reconciliation
+    is meaningless.
+
     Returns a dict keyed by job_id so the caller can merge environments —
     job_ids are 12-char hex and collide across environments only by
     accident, which `merge_environments` reports rather than silently
     resolving.
     """
+    bounds = period_bounds(period) if period else None
+
     q = db.query(Job.job_id, Job.tenant_id, Job.status, Job.artist,
                  Job.song_title, Job.created_at)
-    if period:
-        start, end = period_bounds(period)
-        q = q.filter(Job.created_at >= start, Job.created_at < end)
+    if bounds:
+        q = q.filter(Job.created_at >= bounds[0], Job.created_at < bounds[1])
 
     jobs: dict[str, JobCost] = {}
     for job_id, tenant_id, status, artist, title, created_at in q.all():
@@ -183,9 +190,16 @@ def collect_jobs(db, env: str, period: str | None = None) -> dict[str, JobCost]:
     if not jobs:
         return jobs
 
+    # Tarifas derivadas de la factura del período. Sin esto el costo sale con
+    # precio de lista y se va ~25% arriba en Veo.
+    rates = {}
+    if period:
+        from rate_calibration import load_applied_rates
+        rates = load_applied_rates(db, period)
+
     # Billable spend per job/tool. Cache hits are counted separately (never
     # charged) so the panel can show how much the cache actually saved.
-    rows = (
+    prov = (
         db.query(
             AIProvenance.job_id,
             AIProvenance.tool_name,
@@ -194,15 +208,18 @@ def collect_jobs(db, env: str, period: str | None = None) -> dict[str, JobCost]:
         )
         .filter(AIProvenance.job_id.in_(list(jobs)))
         .filter(billable_filter())
-        .group_by(AIProvenance.job_id, AIProvenance.tool_name,
-                  AIProvenance.tool_provider)
-        .all()
     )
+    if bounds:
+        prov = prov.filter(AIProvenance.created_at >= bounds[0],
+                           AIProvenance.created_at < bounds[1])
+    rows = prov.group_by(AIProvenance.job_id, AIProvenance.tool_name,
+                         AIProvenance.tool_provider).all()
+
     for job_id, tool_name, tool_provider, calls in rows:
         job = jobs.get(job_id)
         if job is None:
             continue
-        cost = calls * cost_for_record(tool_name, tool_provider)
+        cost = calls * cost_for_record(tool_name, tool_provider, rates)
         job.cost += cost
         job.billable_calls += calls
         job.by_tool[tool_name] = job.by_tool.get(tool_name, 0.0) + cost
