@@ -857,9 +857,8 @@ def admin_cost_refresh(
         # post-close refresh must be allowed to replace it. Rolling APIs can
         # later return a superficially successful empty window (Replicate
         # returns ok/$0), hence the source-aware finalization boundary.
-        _rolling_history_would_be_erased = (
-            entry["source"] == "replicate"
-            and row.amount_usd is not None
+        _empty_window_would_erase_spend = (
+            row.amount_usd is not None
             and row.amount_usd > 0
             and entry["status"] == "ok"
             and float(entry["amount_usd"] or 0) == 0
@@ -872,10 +871,11 @@ def admin_cost_refresh(
             and (
                 billing_sources.snapshot_is_final(
                     period, entry["source"], row.fetched_at)
-                # Replicate's rolling history may already be empty before the
-                # post-close finalization date. A cumulative positive monthly
-                # amount cannot legitimately fall back to zero.
-                or _rolling_history_would_be_erased
+                # Rolling provider history (notably Replicate and Railway)
+                # may already be empty before the post-close finalization
+                # date. Cumulative positive monthly spend cannot legitimately
+                # become an exact zero with no line-item evidence.
+                or _empty_window_would_erase_spend
             )
         ):
             entry["kept_previous"] = True
@@ -898,10 +898,17 @@ def admin_cost_refresh(
                 and row.amount_usd is not None):
             entry["kept_previous"] = True
             entry["previous_amount_usd"] = row.amount_usd
+            entry["discarded_refresh_status"] = entry["status"]
+            entry["discarded_refresh_detail"] = entry["detail"]
             row.detail = (
                 f"{row.detail or ''} | refresh {datetime.now(timezone.utc):%Y-%m-%d}: "
                 f"{entry['status']} ({entry['detail']}) — se conservó el valor anterior"
             ).strip(" |")
+            entry["amount_usd"] = row.amount_usd
+            entry["status"] = row.status
+            entry["detail"] = row.detail
+            entry["is_estimate"] = row.is_estimate
+            entry["breakdown"] = row.breakdown or []
             continue
         row.amount_usd = entry["amount_usd"]
         row.status = entry["status"]
@@ -910,13 +917,34 @@ def admin_cost_refresh(
         row.breakdown = entry["breakdown"]
         row.fetched_at = datetime.now(timezone.utc)
     db.commit()
-    # `fetch_all` computed its total before immutable historical rows were
-    # restored above. Return the same numbers that were actually persisted.
-    result["total_usd"] = round(sum(
-        float(entry["amount_usd"])
-        for entry in result["sources"]
+    # `fetch_all` computed its aggregates before immutable/healthy historical
+    # rows were restored above. Rebuild every summary field from the final
+    # entries so the response cannot say a restored `ok` source is errored or
+    # incomplete at the same time.
+    configured = [
+        entry["source"] for entry in result["sources"]
         if entry["status"] == "ok" and entry["amount_usd"] is not None
-    ), 2)
+    ]
+    not_configured = [
+        entry["source"] for entry in result["sources"]
+        if entry["status"] == "not_configured"
+    ]
+    errored = [
+        entry["source"] for entry in result["sources"]
+        if entry["status"] not in ("ok", "not_configured")
+        or (entry["status"] == "ok" and entry["amount_usd"] is None)
+    ]
+    result.update({
+        "total_usd": round(sum(
+            float(entry["amount_usd"])
+            for entry in result["sources"]
+            if entry["status"] == "ok" and entry["amount_usd"] is not None
+        ), 2),
+        "configured": configured,
+        "not_configured": not_configured,
+        "errored": errored,
+        "complete": not not_configured and not errored,
+    })
 
     return result
 
