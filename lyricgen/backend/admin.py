@@ -12,7 +12,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, case, func, or_
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from auth import (
@@ -1004,6 +1004,7 @@ async def admin_cost_unit_economics(
     from database import CostSnapshot
     from provenance import (
         cost_waste_breakdown,
+        delivered_job_filter,
         merge_waste_breakdowns,
         rates_for_window,
     )
@@ -1049,18 +1050,10 @@ async def admin_cost_unit_economics(
         # job reopened by the fixed /edit path clears completed_at first; if
         # that rescue fails, its new failure timestamp is after editing_started_at
         # and therefore does not masquerade as a delivery.
-        delivery_fact = or_(
-            Job.status.in_(("done", "pending_review")),
-            and_(
-                Job.editing_started_at.isnot(None),
-                Job.completed_at.isnot(None),
-                Job.completed_at < Job.editing_started_at,
-            ),
-        )
         delivered = int(
             session.query(func.count(Job.id))
             .filter(entregado_en >= start_dt, entregado_en < end_dt)
-            .filter(delivery_fact)
+            .filter(delivered_job_filter())
             .scalar() or 0
         )
         # Los CREADOS sí van por created_at — es literalmente eso lo que mide.

@@ -27,7 +27,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, not_, or_
+from sqlalchemy import and_, case, func, not_, or_
 from sqlalchemy.orm import Session
 
 from database import AIProvenance, Job, SessionLocal
@@ -164,6 +164,7 @@ DELIVERED_STATUSES = ("done", "pending_review")
 _DELIVERED_LABELS = {
     "done": "entregado",
     "pending_review": "entregado (a revisar)",
+    "delivered_reopened": "entregado (reabierto)",
 }
 
 # Job statuses whose spend produced nothing shippable, split so the panel
@@ -176,6 +177,36 @@ _WASTE_LABELS = {
     "error": "error",
     "transcription_failed": "transcripcion_fallida",
 }
+
+
+def retained_delivery_filter():
+    """SQL predicate for a shipped job currently inside/after an edit.
+
+    ``completed_at < editing_started_at`` is the durable evidence: /edit
+    preserves the old completion for delivered jobs, but clears it for an
+    undelivered rejection. If that rescue later fails, the failure timestamp
+    is newer than editing_started_at and therefore does not become a delivery.
+    """
+    return and_(
+        ~Job.status.in_(DELIVERED_STATUSES),
+        Job.editing_started_at.isnot(None),
+        Job.completed_at.isnot(None),
+        Job.completed_at < Job.editing_started_at,
+    )
+
+
+def delivered_job_filter():
+    """SQL predicate for current or retained historical delivery state."""
+    return or_(Job.status.in_(DELIVERED_STATUSES), retained_delivery_filter())
+
+
+def job_was_delivered(status: str | None, completed_at, editing_started_at) -> bool:
+    """Python twin of :func:`delivered_job_filter` for materialized rows."""
+    if status in DELIVERED_STATUSES:
+        return True
+    if completed_at is None or editing_started_at is None:
+        return False
+    return completed_at < editing_started_at
 
 
 def cost_waste_breakdown(db: Session, since_days: int = 30,
@@ -235,9 +266,15 @@ def cost_waste_breakdown(db: Session, since_days: int = 30,
     def _scoped(query):
         return query.filter(Job.tenant_id == tenant_id) if tenant_id else query
 
+    # Keep the human-facing current statuses, but fold a job whose retained
+    # timestamps prove prior delivery into one explicit delivered bucket.
+    effective_status = case(
+        (retained_delivery_filter(), "delivered_reopened"),
+        else_=Job.status,
+    )
     rows_q = _scoped(
         db.query(
-            Job.status,
+            effective_status.label("effective_status"),
             AIProvenance.tool_name,
             AIProvenance.tool_provider,
             func.count(AIProvenance.id).label("calls"),
@@ -246,7 +283,7 @@ def cost_waste_breakdown(db: Session, since_days: int = 30,
         .join(Job, Job.job_id == AIProvenance.job_id)
     )
     rows = _window(rows_q).filter(billable_filter()).group_by(
-        Job.status, AIProvenance.tool_name, AIProvenance.tool_provider
+        effective_status, AIProvenance.tool_name, AIProvenance.tool_provider
     ).all()
 
     # Aggregate per status first; a status spans many tools.
@@ -261,16 +298,16 @@ def cost_waste_breakdown(db: Session, since_days: int = 30,
     # several tools.
     job_counts = dict(
         _window(_scoped(
-            db.query(Job.status, func.count(func.distinct(Job.job_id)))
+            db.query(effective_status, func.count(func.distinct(Job.job_id)))
             .join(AIProvenance, Job.job_id == AIProvenance.job_id)
-        )).filter(billable_filter()).group_by(Job.status).all()
+        )).filter(billable_filter()).group_by(effective_status).all()
     )
 
     by_destination = []
     total_cost = 0.0
     delivered_cost = 0.0
     for status, agg in per_status.items():
-        is_delivered = status in DELIVERED_STATUSES
+        is_delivered = status in (*DELIVERED_STATUSES, "delivered_reopened")
         total_cost += agg["cost"]
         if is_delivered:
             delivered_cost += agg["cost"]
@@ -301,7 +338,7 @@ def cost_waste_breakdown(db: Session, since_days: int = 30,
         _scoped(
             db.query(func.count(Job.id))
             .filter(func.coalesce(Job.completed_at, Job.created_at) >= since)
-            .filter(Job.status.in_(DELIVERED_STATUSES))
+            .filter(delivered_job_filter())
         ).filter(
             func.coalesce(Job.completed_at, Job.created_at) < until
         ).scalar() or 0
@@ -309,7 +346,7 @@ def cost_waste_breakdown(db: Session, since_days: int = 30,
         _scoped(
             db.query(func.count(Job.id))
             .filter(func.coalesce(Job.completed_at, Job.created_at) >= since)
-            .filter(Job.status.in_(DELIVERED_STATUSES))
+            .filter(delivered_job_filter())
         ).scalar() or 0
     )
 

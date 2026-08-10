@@ -75,6 +75,9 @@ class SourceCost:
 
 def _period_bounds(period: str) -> tuple[date, date]:
     """"2026-07" -> (2026-07-01, 2026-07-31). Raises ValueError if malformed."""
+    if (len(period) != 7 or period[4] != "-"
+            or not period[:4].isdigit() or not period[5:].isdigit()):
+        raise ValueError(f"invalid month in period {period!r}; expected YYYY-MM")
     year, month = (int(x) for x in period.split("-", 1))
     if not 1 <= month <= 12:
         raise ValueError(f"invalid month in period {period!r}")

@@ -136,6 +136,35 @@ def test_edit_rejected_clears_failed_completion_timestamp(
     assert completed_at > rejected_at
 
 
+def test_enqueue_fallido_restaura_estado_y_timestamp_del_rechazo(
+    client, admin_token, db, monkeypatch,
+):
+    import main
+
+    user_id, tenant_id = _admin_identity(db)
+    rejected_at = datetime(2026, 6, 30, tzinfo=timezone.utc)
+    job_id = _create_pending_review_job(
+        db, tenant_id, user_id, status="rejected", completed_at=rejected_at)
+    monkeypatch.setattr(
+        main, "enqueue_edit",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("redis down")),
+    )
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "metadata", "song_title": "Título corregido"},
+    )
+    assert res.status_code == 503, res.text
+    db.expire_all()
+    row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
+    assert row.status == "rejected"
+    completed_at = row.completed_at
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.replace(tzinfo=timezone.utc)
+    assert completed_at == rejected_at
+
+
 def test_metadata_does_not_consume_edit_slot(client, admin_token, db, monkeypatch):
     """Fire 5 metadata edits on a job with edit_count=2 — edit_count
     must stay at 2 every time. Regular edits would have capped at 3."""

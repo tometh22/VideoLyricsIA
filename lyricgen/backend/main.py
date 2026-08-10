@@ -12158,6 +12158,8 @@ async def request_edit(
             job_id, job.input_r2_key, _exc,
         )
 
+    _pre_edit_status = job.status
+    _pre_edit_completed_at = job.completed_at
     # A rejected/error job has a terminal timestamp, but it has never been a
     # delivery. Clear that failed-attempt timestamp when the operator rescues
     # it so the next done/pending_review transition stamps the real delivery
@@ -12218,10 +12220,11 @@ async def request_edit(
             tenant_id=current_user.get("tenant_id", ""),
         )
     except Exception as exc:
-        # Enqueue failed (Redis down, unexpected RQ error). Roll back the DB
-        # to pending_review so the user can retry without waiting for the reaper.
+        # Enqueue failed (Redis down, unexpected RQ error). Restore the exact
+        # pre-edit state so the user can retry without waiting for the reaper.
         logger.error("enqueue_edit failed for %s: %s", job_id, exc)
-        job.status = "pending_review"
+        job.status = _pre_edit_status
+        job.completed_at = _pre_edit_completed_at
         job.edit_count = current_edit_count
         job.editing_started_at = None
         job.progress = 100
