@@ -10,6 +10,14 @@ job nuevo, así que un techo por job se esquiva solo.
 
 import pytest
 
+# Importado ACÁ a propósito, antes de cualquier monkeypatch. `pipeline` importa
+# `provenance` de forma perezosa DENTRO de `_veo_budget_exceeded`; si ese primer
+# import ocurre con `database.SessionLocal` parcheado por `_fake_counter`,
+# `provenance.SessionLocal` queda ligado a la sesión falsa para siempre —
+# monkeypatch restaura `database`, no el binding que `provenance` ya copió— y
+# revienta cualquier test posterior que escriba provenance de verdad.
+import provenance  # noqa: F401
+
 # ---------------------------------------------------------------------------
 # Tope de generaciones de Veo
 # ---------------------------------------------------------------------------
