@@ -169,3 +169,47 @@ def test_el_stripper_sincrono_recibe_el_tenant_del_usuario():
     for bloque in ctx[1:]:
         assert "tenant_id=" in bloque[:200], (
             "el stripper síncrono se llamó sin tenant_id → gate siempre off")
+
+
+# ---------------------------------------------------------------------------
+# 3. El default de tenant vale para TODOS los caminos de fondo
+# ---------------------------------------------------------------------------
+
+def test_el_default_se_resuelve_antes_de_elegir_el_camino():
+    """El default vivía sólo dentro de `build_scene_plan`, así que un tenant
+    habilitado SIN el add-on de Escenas —o cuyo multi-escena falla y cae al
+    fondo único— seguía recibiendo el Auto en movimiento, que es justo lo que
+    el flag existe para sacar.
+
+    Se verifica sobre el código: `_bg_movement` se resuelve antes del `if`
+    que elige escenas, y los tres caminos de fondo lo usan.
+    """
+    src = inspect.getsource(pipeline.run_pipeline)
+    i_resuelve = src.index("_bg_movement = movement_style")
+    i_ramifica = src.index("and enable_scenes")
+    assert i_resuelve < i_ramifica, (
+        "el default tiene que resolverse ANTES de elegir escenas vs fondo único")
+    # Los tres consumidores lo usan; ninguno se quedó con el crudo.
+    assert src.count("movement_style=_bg_movement") == 3, (
+        "algún camino de fondo sigue recibiendo el movement_style sin resolver")
+
+
+def test_el_default_no_pisa_la_eleccion_guardada_del_operador():
+    """`render_params.movement_style` guarda lo que eligió el OPERADOR y el
+    editor lo pinta desde ahí. Si el default lo sobrescribiera, el operador
+    vería "Estático" donde había elegido "Auto"."""
+    src = inspect.getsource(pipeline.run_pipeline)
+    assert '"movement_style": _normalize_movement_style(movement_style)' in src, (
+        "render_params tiene que seguir guardando la elección cruda del "
+        "operador, no el default resuelto")
+
+
+def test_la_clave_de_cache_del_preview_usa_el_movimiento_crudo():
+    """El preview calculó su hash con lo que mandó el wizard. Validar la clave
+    contra el movimiento ya resuelto la invalidaría siempre y tiraría a la
+    basura el fondo pre-generado."""
+    src = inspect.getsource(pipeline.run_pipeline)
+    i_val = src.index("_validate_bg_cache_key(")
+    bloque = src[i_val:i_val + 600]
+    assert "movement_style=movement_style" in bloque
+    assert "_bg_movement" not in bloque

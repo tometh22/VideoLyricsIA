@@ -1336,6 +1336,29 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # opciones después del preview, o el preview falló, o el TTL
             # de 24h del cache lo limpió), seguimos con el flow normal.
             bg_image_path = None
+
+            # Default de movimiento por tenant, resuelto UNA vez para TODOS
+            # los caminos de fondo. Antes vivía sólo dentro de
+            # `build_scene_plan`, así que un tenant habilitado sin el add-on
+            # de Escenas —o cuyo multi-escena falla y cae al fondo único—
+            # seguía recibiendo el fondo Auto en movimiento, que es
+            # exactamente lo que el flag existe para sacar.
+            #
+            # NO se pisa `render_params.movement_style` (línea de abajo): eso
+            # guarda la elección del OPERADOR, y el editor la pinta desde ahí.
+            # Si lo sobrescribiéramos, el operador vería "Estático" donde
+            # eligió "Auto".
+            _bg_movement = movement_style
+            if not _normalize_movement_style(movement_style):
+                import scenes as _sc_default
+                _tenant_default = _sc_default.default_movement_for_tenant(
+                    _tenant_of_job(job_id))
+                if _tenant_default:
+                    _bg_movement = _tenant_default
+                    logger.info(
+                        "[BG] Auto → %s por default de tenant job=%s",
+                        _tenant_default, job_id)
+
             # Multi-scene owns its own per-clip cache. A stale single-background
             # preview key must never short-circuit the scenes branch.
             if enable_scenes and bg_cache_key:
@@ -1414,7 +1437,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         segments, _audio_dur_for_kb or _audio_duration(mp3_path),
                         job_dir, style_hint=style, lyrics_text=lyrics_text,
                         artist=artist, song_title=_song_title, genre=genre,
-                        concept=concept, movement_style=movement_style,
+                        concept=concept, movement_style=_bg_movement,
                         custom_colors=custom_colors,
                         # El prompt del operador ("Mi prompt") moldea TODA la
                         # biblia → multi-escena respeta auto/letra/prompt igual
@@ -1439,7 +1462,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         style, job_dir,
                         lyrics_text=lyrics_text, artist=artist, job_id=job_id,
                         song_title=_song_title, genre=genre, concept=concept,
-                        movement_style=movement_style,
+                        movement_style=_bg_movement,
                         image_to_video_path=(background_path if _animate_user_image else None),
                         match_lyrics=match_lyrics,
                         background_hint=background_hint,
@@ -1794,7 +1817,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                                 lyrics_text=lyrics_text, artist=artist,
                                 job_id=job_id, song_title=_song_title,
                                 genre=genre, concept=concept,
-                                movement_style=movement_style,
+                                movement_style=_bg_movement,
                                 image_to_video_path=(
                                     background_path if _animate_user_image else None
                                 ),
