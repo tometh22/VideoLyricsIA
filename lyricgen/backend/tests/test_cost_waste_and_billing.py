@@ -327,7 +327,7 @@ def test_railway_uses_actual_days_in_month(monkeypatch):
     assert feb.amount_usd > jul.amount_usd
 
 
-def test_railway_empty_usage_is_zero_not_error(monkeypatch):
+def test_railway_empty_usage_is_incomplete_not_fake_zero(monkeypatch):
     class _Resp:
         status_code = 200
         def raise_for_status(self): pass
@@ -337,8 +337,44 @@ def test_railway_empty_usage_is_zero_not_error(monkeypatch):
     monkeypatch.setattr(billing_sources.requests, "post",
                         lambda *a, **k: _Resp())
     result = billing_sources.fetch_railway("2026-07")
+    assert result.status == "error"
+    assert result.amount_usd is None
+
+
+def test_railway_plan_es_minimo_no_cargo_aditivo(monkeypatch):
+    # Uso real de $2/mes: la factura estimada debe ser el mínimo de $20, no
+    # $2 de uso + $20 repetidos en la fuente de suscripciones.
+    usage = [{"measurement": "CPU_USAGE", "value": 4320.0}]
+
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {"data": {"usage": usage}}
+
+    monkeypatch.setenv("RAILWAY_API_TOKEN", "fake")
+    monkeypatch.setenv("RAILWAY_PLAN_MINIMUM_USD", "20")
+    monkeypatch.setattr(billing_sources.requests, "post",
+                        lambda *a, **k: _Resp())
+    result = billing_sources.fetch_railway("2026-06")
     assert result.status == "ok"
-    assert result.amount_usd == 0.0
+    assert result.amount_usd == 20.0
+    assert result.raw["metered_usage_usd"] == pytest.approx(2.0)
+    top_up = next(
+        row for row in result.breakdown
+        if row["measurement"] == "PLAN_MINIMUM_TOP_UP"
+    )
+    assert top_up["cost"] == pytest.approx(18.0)
+
+
+def test_fixed_no_suma_railway_y_acepta_config_legacy(monkeypatch):
+    monkeypatch.setenv(
+        "FIXED_SUBSCRIPTIONS_JSON",
+        '{"vercel_pro":20,"github_pro":4,"railway_plan":20}',
+    )
+    fixed = billing_sources.fetch_fixed("2026-07")
+    assert fixed.amount_usd == 24.0
+    assert all(row["concepto"] != "railway_plan" for row in fixed.breakdown)
+    assert billing_sources._railway_plan_minimum_usd() == 20.0
 
 
 # ---------------------------------------------------------------------------

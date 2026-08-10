@@ -636,7 +636,7 @@ def add_total_cost(attribution: dict, invoices: dict[str, float],
     """Level 2: direct UMG cost + UMG's share of shared infrastructure.
 
     `invoices` maps source -> USD for the period (the real bill, e.g.
-    ``{"gcp": 199.53, "railway": 126.02, "r2": 18.84, "fixed": 44.0}``).
+    ``{"gcp": 199.53, "railway": 126.02, "r2": 18.84, "fixed": 24.0}``).
 
     Shared infra is prorated by `basis`:
       * ``"cost"``  — UMG's share of measured AI spend (default; tracks
