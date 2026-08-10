@@ -171,6 +171,20 @@ def test_el_stripper_sincrono_recibe_el_tenant_del_usuario():
             "el stripper síncrono se llamó sin tenant_id → gate siempre off")
 
 
+def test_la_transcripcion_fresca_del_pipeline_tambien_corre_el_stripper():
+    """POST /upload salta los endpoints de transcripción y entra directo a
+    ``run_pipeline``. Su Whisper fresco debe pasar por el mismo post-proceso
+    tenant-gated antes de persistir y renderizar los segmentos.
+    """
+    src = inspect.getsource(pipeline.run_pipeline)
+    i_transcribe = src.index("segments = transcribe(")
+    i_persist = src.index("if _persist_segments:", i_transcribe)
+    bloque = src[i_transcribe:i_persist]
+    assert "strip_trailing_periods as _strip_dots" in bloque
+    assert "tenant_id=_tenant_of_job(job_id)" in bloque
+    assert "segments = _stripped_result.get" in bloque
+
+
 # ---------------------------------------------------------------------------
 # 3. El default de tenant vale para TODOS los caminos de fondo
 # ---------------------------------------------------------------------------

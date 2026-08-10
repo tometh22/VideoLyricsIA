@@ -1245,6 +1245,17 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     mp3_path, language=language, lyrics_hint=lyrics_hint,
                     job_id=job_id,
                 )
+                # The deprecated POST /upload path enters the full pipeline
+                # directly and transcribes here, bypassing both synchronous
+                # transcription endpoints and transcription_worker. Apply the
+                # same tenant-gated final pass before these segments become the
+                # persisted/rendered source of truth.
+                from lyrics_format import strip_trailing_periods as _strip_dots
+                _stripped_result = _strip_dots(
+                    {"segments": segments},
+                    tenant_id=_tenant_of_job(job_id),
+                )
+                segments = _stripped_result.get("segments", segments)
         # Persist segments so edit re-renders can skip re-transcription.
         # Skip when we just read them from the same row — pointless write.
         if _persist_segments:
