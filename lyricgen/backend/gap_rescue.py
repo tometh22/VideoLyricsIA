@@ -168,7 +168,8 @@ def _agrupar_en_lineas(words: list[dict]) -> list[list[dict]]:
 
 
 def _transcribe_window(audio_path: str, ini: float, dur: float,
-                       language: str | None = None) -> list[dict]:
+                       language: str | None = None,
+                       job_id: str | None = None) -> list[dict]:
     """Recorta [ini, ini+dur] y lo transcribe con whisper-1 pidiendo
     timestamps por PALABRA. Devuelve words en el marco temporal del audio
     COMPLETO (ya desplazadas). [] ante cualquier fallo."""
@@ -176,6 +177,7 @@ def _transcribe_window(audio_path: str, ini: float, dur: float,
     import tempfile
     fd, clip = tempfile.mkstemp(suffix=".mp3", prefix="genly_gap_")
     os.close(fd)
+    recorder = None
     try:
         # ffmpeg directo: este módulo NO importa `pipeline` (300+ MB de
         # moviepy/librosa) sólo para recortar 30 s de audio.
@@ -197,7 +199,22 @@ def _transcribe_window(audio_path: str, ini: float, dur: float,
             }
             if language:
                 kwargs["language"] = language
+            if job_id:
+                from provenance import record_ai_call
+                recorder = record_ai_call(
+                    job_id=job_id,
+                    step="gap_rescue",
+                    tool_name="whisper-1-gap-rescue",
+                    tool_provider="openai",
+                    prompt=(
+                        f"Transcribe rescue window start={ini:.2f}s "
+                        f"duration={dur:.2f}s language={language or 'auto'}"
+                    ),
+                    input_data_types=["audio_clip"],
+                )
             r = OpenAI().audio.transcriptions.create(**kwargs)
+        if recorder:
+            recorder.finish(response_summary="succeeded")
         out = []
         for w in (getattr(r, "words", None) or []):
             try:
@@ -207,6 +224,10 @@ def _transcribe_window(audio_path: str, ini: float, dur: float,
                 continue
         return out
     except Exception as e:
+        if recorder:
+            recorder.finish(
+                response_summary=f"error: {type(e).__name__}: {str(e)[:300]}"
+            )
         logger.warning("[GAP-RESCUE] transcripción de ventana falló: %r", e)
         return []
     finally:
@@ -264,7 +285,8 @@ def rescue(segments: list[dict], audio_path: str, *,
            stem_path: str | None = None,
            audio_duration: float | None = None, language: str | None = None,
            lead_s: float = 0.0, hold_s: float = 0.0,
-           asr_words: list[dict] | None = None) -> tuple[list[dict], dict]:
+           asr_words: list[dict] | None = None,
+           job_id: str | None = None) -> tuple[list[dict], dict]:
     """Devuelve (segmentos + líneas rescatadas, stats). Nunca levanta.
 
     `stem_path`: stem de voz (demucs) si está cacheado. Es MUY superior a la
@@ -317,7 +339,7 @@ def rescue(segments: list[dict], audio_path: str, *,
                 w_ini = min(zona_a, w_ini + sobra / 2)
                 w_fin = max(zona_b, w_fin - sobra / 2)
             words = _transcribe_window(fuente, w_ini, w_fin - w_ini,
-                                       language)
+                                       language, job_id=job_id)
             # Sólo lo que cae DENTRO del hueco: el contexto era para que el
             # ASR enganche, no para re-escribir lo ya cubierto.
             words = [w for w in words
@@ -401,7 +423,7 @@ def rescue(segments: list[dict], audio_path: str, *,
                 if fin_audio:
                     w_fin = min(w_fin, fin_audio)
                 words = _transcribe_window(fuente, w_ini, w_fin - w_ini,
-                                           language)
+                                           language, job_id=job_id)
                 words = [w for w in words
                          if zona_a - 0.2 <= (_f(w.get("start")) + _f(w.get("end"))) / 2
                          <= zona_b + 0.2]

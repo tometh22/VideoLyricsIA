@@ -466,6 +466,34 @@ def test_openai_empty_filter_bills_whole_org(monkeypatch):
     assert billing_sources.fetch_openai("2026-07").amount_usd == 100.0
 
 
+def test_openai_incluye_formatter_y_whisper_pero_no_otros_proyectos(monkeypatch):
+    payload = {
+        "data": [{"results": [
+            {"line_item": "whisper audio", "amount": {"value": 20.0}},
+            {"line_item": "gpt-4o-mini input", "amount": {"value": 0.4}},
+            {"line_item": "gpt-4o-mini output", "amount": {"value": 0.2}},
+            {"line_item": "gpt-5.4 output", "amount": {"value": 80.0}},
+        ]}],
+        "has_more": False,
+    }
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self): return payload
+
+    monkeypatch.setenv("OPENAI_ADMIN_KEY", "sk-admin-fake")
+    monkeypatch.setattr(
+        billing_sources, "OPENAI_LINE_ITEM_FILTER", ["whisper", "gpt-4o-mini"],
+    )
+    monkeypatch.setattr(billing_sources.requests, "get", lambda *a, **k: _Resp())
+
+    result = billing_sources.fetch_openai("2026-07")
+    assert result.amount_usd == 20.6
+    assert [row["line_item"] for row in result.breakdown if not row["incluido"]] == [
+        "gpt-5.4 output",
+    ]
+
+
 def test_gcp_timeout_is_an_error_not_zero_dollars(monkeypatch):
     """BigQuery returns HTTP 200 with `jobComplete: false` and no rows when
     the query outruns `timeoutMs`. Reporting that as $0/ok would show ~half

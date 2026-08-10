@@ -235,7 +235,7 @@ publicadas, todas overrideables por env (`RAILWAY_USD_PER_VCPU_MONTH`,
 
 ```bash
 OPENAI_ADMIN_KEY=sk-admin-...
-OPENAI_COST_LINE_ITEMS=whisper   # default; vacío = toda la organización
+OPENAI_COST_LINE_ITEMS=whisper,gpt-4o-mini  # default; vacío = toda la organización
 ```
 
 Tiene que ser una **admin key**, no la API key normal — la común no puede

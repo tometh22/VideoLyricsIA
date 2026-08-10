@@ -29,6 +29,49 @@ def test_encuentra_hueco_interno():
     assert gr.find_gaps(segs, min_gap_s=12.0) == [(20.0, 50.0)]
 
 
+def test_ventana_whisper_registra_provenance_del_job(monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+    import openai
+    import provenance
+
+    captured = {}
+
+    class _Recorder:
+        def finish(self, **kwargs):
+            captured["summary"] = kwargs["response_summary"]
+
+    class _Transcriptions:
+        def create(self, **_kwargs):
+            return SimpleNamespace(words=[
+                SimpleNamespace(word="hola", start=0.1, end=0.5),
+            ])
+
+    class _Client:
+        audio = SimpleNamespace(transcriptions=_Transcriptions())
+
+    def _ffmpeg(cmd, **_kwargs):
+        Path(cmd[-1]).write_bytes(b"audio")
+
+    monkeypatch.setattr("subprocess.run", _ffmpeg)
+    monkeypatch.setattr(openai, "OpenAI", _Client)
+    monkeypatch.setattr(
+        provenance,
+        "record_ai_call",
+        lambda **kwargs: captured.update(kwargs) or _Recorder(),
+    )
+
+    words = gr._transcribe_window(
+        "song.wav", 10.0, 20.0, language="es", job_id="gap-job",
+    )
+
+    assert words[0]["start"] == 10.1
+    assert captured["job_id"] == "gap-job"
+    assert captured["tool_name"] == "whisper-1-gap-rescue"
+    assert captured["tool_provider"] == "openai"
+    assert captured["summary"] == "succeeded"
+
+
 def test_ignora_huecos_chicos():
     segs = [_seg(10, 20), _seg(25, 35)]
     assert gr.find_gaps(segs, min_gap_s=12.0) == []

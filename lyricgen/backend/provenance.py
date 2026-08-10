@@ -87,6 +87,10 @@ COST_PER_CALL: dict[tuple[str, str], float] = {
     # gives ~$0.021 per call. Cheap to bump if real audio lengths drift.
     ("whisper-1", "openai"): 0.021,
     ("whisper", "openai"): 0.021,
+    # Gap rescue transcribes clips capped at 120 s, not a full ~3.5 min song.
+    ("whisper-1-gap-rescue", "openai"): 0.012,
+    # Small text-only formatter call (one numbered lyric payload per song).
+    ("gpt-4o-mini", "openai"): 0.001,
     # Human-provided fallback — no AI cost
     ("human-provided", "user_upload"): 0.0,
 }
