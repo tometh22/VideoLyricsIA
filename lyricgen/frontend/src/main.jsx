@@ -7,16 +7,32 @@ import GlobalErrorBoundary from "./components/GlobalErrorBoundary";
 import { AlertProvider } from "./components/AlertProvider";
 import { ToastProvider } from "./components/ToastProvider";
 import { HelpProvider } from "./components/HelpCenter/HelpProvider";
-import { initSentry } from "./observability";
 import { registerServiceWorker } from "./registerSW";
 import { initAutoUpdate } from "./autoUpdate";
 import "./index.css";
 
-// Sentry init runs before React mounts so the SDK is ready to catch
-// any error from the first render. No-op if VITE_SENTRY_DSN is unset
-// (dev or pre-configured deploy) — see observability.js header for
-// the DSN setup walkthrough.
-initSentry();
+// Observability is optional infrastructure, not an app-shell dependency.
+// Keep it behind a dynamic import and start it only after React mounts. Some
+// corporate filters block URLs containing "sentry"; when this was a static
+// import, a blocked sentry-vendor chunk prevented the whole module graph from
+// executing and left users on the 12-second HTML fallback forever.
+function initObservabilityAfterMount() {
+  const start = () => {
+    import("./observability")
+      .then(({ initSentry }) => initSentry())
+      .catch((err) => {
+        // Telemetry must never take down the product. This warning remains
+        // local because the telemetry transport is precisely what failed.
+        console.warn("[OBS] Deferred Sentry load failed:", err?.message || err);
+      });
+  };
+
+  if (typeof window.requestIdleCallback === "function") {
+    window.requestIdleCallback(start, { timeout: 4_000 });
+  } else {
+    window.setTimeout(start, 0);
+  }
+}
 
 // QA fix 2026-05-28: post-deploy stale-bundle reload. Cuando Vercel
 // publica un build nuevo, los hashes de los chunks lazy-imported cambian
@@ -68,19 +84,6 @@ window.addEventListener("vite:preloadError", (event) => {
   window.location.reload();
 });
 
-// Service Worker: caches hashed /assets/* for offline / flaky-network
-// resilience. Prod-only, post-load registration — see registerSW.js for
-// the safety contract. The SW never caches HTML or API responses so it
-// can't serve stale builds or leak per-user data.
-registerServiceWorker();
-
-// Auto-update on new deploy: an open SPA tab never re-fetches index.html on its
-// own and the static SW doesn't change between deploys, so a long-lived editor
-// tab stays on the old build until a manual reload. This polls for a new build
-// and reloads while the tab is backgrounded (never mid-edit; keepalive #727
-// persists unsaved work on the reload). See autoUpdate.js.
-initAutoUpdate();
-
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>
     <GlobalErrorBoundary>
@@ -98,3 +101,20 @@ ReactDOM.createRoot(document.getElementById("root")).render(
     </GlobalErrorBoundary>
   </React.StrictMode>
 );
+
+// From this point onward the HTML loader has been replaced by the real app.
+// Optional boot services can fail or be filtered without blanking the UI.
+initObservabilityAfterMount();
+
+// Service Worker: caches hashed /assets/* for offline / flaky-network
+// resilience. Prod-only, post-load registration — see registerSW.js for
+// the safety contract. The SW never caches HTML or API responses so it
+// can't serve stale builds or leak per-user data.
+registerServiceWorker();
+
+// Auto-update on new deploy: an open SPA tab never re-fetches index.html on its
+// own and the static SW doesn't change between deploys, so a long-lived editor
+// tab stays on the old build until a manual reload. This polls for a new build
+// and reloads while the tab is backgrounded (never mid-edit; keepalive #727
+// persists unsaved work on the reload). See autoUpdate.js.
+initAutoUpdate();
