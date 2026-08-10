@@ -1286,6 +1286,20 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # fondo no-IA (incl. los golden renders). Inicializar acá, incondicional.
         _scenes_active = False
 
+        # Resolve before branching on human vs generated backgrounds. The
+        # render consumes this value even for a still library/custom asset
+        # (to decide whether Ken Burns is allowed), so defining it only in the
+        # generated-background branch crashes those normal human paths.
+        import scenes as _sc_default
+        _bg_movement = _sc_default.effective_movement_for_tenant(
+            movement_style, _tenant_of_job(job_id)
+        )
+        if (_bg_movement
+                and not _normalize_movement_style(movement_style)):
+            logger.info(
+                "[BG] Auto → %s por default de tenant job=%s",
+                _bg_movement, job_id)
+
         if background_path and not _animate_user_image:
             # Human-provided background — skip AI generation (UMG Guideline 10)
             from provenance import record_ai_call
@@ -1349,16 +1363,6 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # guarda la elección del OPERADOR, y el editor la pinta desde ahí.
             # Si lo sobrescribiéramos, el operador vería "Estático" donde
             # eligió "Auto".
-            import scenes as _sc_default
-            _bg_movement = _sc_default.effective_movement_for_tenant(
-                movement_style, _tenant_of_job(job_id)
-            )
-            if (_bg_movement
-                    and not _normalize_movement_style(movement_style)):
-                logger.info(
-                    "[BG] Auto → %s por default de tenant job=%s",
-                    _bg_movement, job_id)
-
             # Multi-scene owns its own per-clip cache. A stale single-background
             # preview key must never short-circuit the scenes branch.
             if enable_scenes and bg_cache_key:

@@ -186,7 +186,11 @@ def test_el_default_se_resuelve_antes_de_elegir_el_camino():
     """
     src = inspect.getsource(pipeline.run_pipeline)
     i_resuelve = src.index("_bg_movement = _sc_default.effective_movement_for_tenant")
+    i_fuente_humana = src.index("if background_path and not _animate_user_image")
     i_ramifica = src.index("and enable_scenes")
+    assert i_resuelve < i_fuente_humana, (
+        "un fondo humano también usa _bg_movement al renderizar; resolverlo "
+        "dentro del else deja la variable sin inicializar")
     assert i_resuelve < i_ramifica, (
         "el default tiene que resolverse ANTES de elegir escenas vs fondo único")
     # Los tres generadores y la validación de cache lo usan; ninguno se quedó
