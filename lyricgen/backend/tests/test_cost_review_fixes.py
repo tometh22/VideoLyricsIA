@@ -1125,3 +1125,80 @@ def test_refresh_no_reescribe_suscripciones_de_un_mes_cerrado(
         db.query(CostSnapshot).filter(
             CostSnapshot.period == period, CostSnapshot.source == "fixed").delete()
         db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 20. Replicate no congela subtotales cuando agota el límite de páginas
+# ---------------------------------------------------------------------------
+
+def test_replicate_marca_error_si_queda_paginacion_pendiente(monkeypatch):
+    import billing_sources
+
+    class _Resp:
+        def __init__(self, next_url):
+            self._next_url = next_url
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "results": [{
+                    "created_at": "2026-07-15T12:00:00Z",
+                    "model": "owner/model",
+                    "metrics": {"predict_time": 10},
+                }],
+                "next": self._next_url,
+            }
+
+    calls = []
+
+    def _get(url, **_kwargs):
+        calls.append(url)
+        return _Resp(f"https://replicate.test/page/{len(calls) + 1}")
+
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "token")
+    monkeypatch.setattr(billing_sources, "REPLICATE_MAX_PAGES", 2)
+    monkeypatch.setattr(billing_sources.requests, "get", _get)
+
+    out = billing_sources.fetch_replicate("2026-07")
+
+    assert len(calls) == 2
+    assert out.status == "error"
+    assert out.amount_usd is None
+    assert out.raw["pages_fetched"] == 2
+    assert "cursor pendiente" in out.detail
+
+
+def test_replicate_acepta_ultima_pagina_dentro_del_limite(monkeypatch):
+    import billing_sources
+
+    class _Resp:
+        def __init__(self, next_url):
+            self._next_url = next_url
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "results": [{
+                    "created_at": "2026-07-15T12:00:00Z",
+                    "model": "owner/model",
+                    "metrics": {"predict_time": 10},
+                }],
+                "next": self._next_url,
+            }
+
+    responses = iter([_Resp("https://replicate.test/page/2"), _Resp(None)])
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "token")
+    monkeypatch.setattr(billing_sources, "REPLICATE_MAX_PAGES", 2)
+    monkeypatch.setattr(
+        billing_sources.requests, "get", lambda *_args, **_kwargs: next(responses),
+    )
+
+    out = billing_sources.fetch_replicate("2026-07")
+
+    assert out.status == "ok"
+    assert out.amount_usd == pytest.approx(0.0)
+    assert out.breakdown[0]["runs"] == 2
