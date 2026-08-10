@@ -1394,7 +1394,8 @@ async def admin_cost_umg(
         rows = (
             db.query(CostSnapshot)
             .filter(CostSnapshot.period == period,
-                    CostSnapshot.status == "ok")
+                    CostSnapshot.status == "ok",
+                    CostSnapshot.source.in_(tuple(billing_sources.SOURCES)))
             .all()
         )
         invoices = {r.source: r.amount_usd for r in rows

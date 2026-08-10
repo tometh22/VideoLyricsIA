@@ -826,6 +826,34 @@ def test_cost_real_ignora_snapshot_desconocido(client, admin_token, db):
         db.commit()
 
 
+def test_cost_umg_ignora_snapshot_legacy_desconocido(
+    client, admin_token, db,
+):
+    from database import CostSnapshot
+
+    period = "2020-10"
+    db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+    db.add_all([
+        CostSnapshot(period=period, source="fixed", amount_usd=10.0,
+                     status="ok", breakdown=[]),
+        CostSnapshot(period=period, source="gcpp", amount_usd=999.0,
+                     status="ok", breakdown=[]),
+    ])
+    db.commit()
+    try:
+        response = client.get(
+            f"/admin/cost/umg?period={period}",
+            headers=auth(admin_token),
+        )
+        assert response.status_code == 200, response.text
+        total = response.json()["umg_total"]
+        assert total["invoices_total"] == 10.0
+        assert "gcpp" not in total["invoiced_shared_cost_by_source"]
+    finally:
+        db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+        db.commit()
+
+
 def test_portal_sin_metadata_usa_el_job_id_como_identidad(db):
     import cost_attribution as ca
     from database import Delivery, Job
