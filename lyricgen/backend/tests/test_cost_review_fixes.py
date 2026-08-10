@@ -443,7 +443,10 @@ def test_un_refresh_fallido_conserva_el_valor_anterior(client, admin_token, db,
         assert entry.get("previous_amount_usd") == 41.0
         assert r.json()["configured"] == ["github"]
         assert r.json()["errored"] == []
-        assert r.json()["complete"] is True
+        assert r.json()["complete"] is False
+        assert r.json()["partial"] is True
+        assert "github" not in r.json()["not_requested"]
+        assert set(r.json()["not_requested"]) == set(billing_sources.SOURCES) - {"github"}
 
         db.expire_all()
         row = (db.query(CostSnapshot)
@@ -564,7 +567,9 @@ def test_railway_vacio_tampoco_borra_snapshot_provisional(
         assert body["total_usd"] == 88.0
         assert body["configured"] == ["railway"]
         assert body["errored"] == []
-        assert body["complete"] is True
+        assert body["complete"] is False
+        assert body["partial"] is True
+        assert set(body["not_requested"]) == set(billing_sources.SOURCES) - {"railway"}
         assert body["sources"][0]["kept_previous"] is True
         db.expire_all()
         row = db.query(CostSnapshot).filter(

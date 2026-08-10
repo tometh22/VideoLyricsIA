@@ -1018,6 +1018,7 @@ def fetch_all(period: str | None = None,
             errored.append(name)
         results.append(result.as_dict())
 
+    not_requested = [name for name in SOURCES if name not in names]
     return {
         "period": period,
         "total_usd": round(total, 2),
@@ -1025,5 +1026,7 @@ def fetch_all(period: str | None = None,
         "configured": ok,
         "not_configured": missing,
         "errored": errored,
-        "complete": not missing and not errored,
+        "not_requested": not_requested,
+        "partial": bool(not_requested),
+        "complete": not missing and not errored and not not_requested,
     }

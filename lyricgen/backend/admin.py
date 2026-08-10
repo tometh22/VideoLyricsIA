@@ -934,6 +934,13 @@ def admin_cost_refresh(
         if entry["status"] not in ("ok", "not_configured")
         or (entry["status"] == "ok" and entry["amount_usd"] is None)
     ]
+    # `only=` is an operational refresh scope, never proof that the monthly
+    # total is complete. Even a healthy `only=fixed` response omits every
+    # provider API and must remain explicitly partial/non-quoteable.
+    not_requested = (
+        [source for source in billing_sources.SOURCES if source not in names]
+        if names is not None else []
+    )
     result.update({
         "total_usd": round(sum(
             float(entry["amount_usd"])
@@ -943,7 +950,9 @@ def admin_cost_refresh(
         "configured": configured,
         "not_configured": not_configured,
         "errored": errored,
-        "complete": not not_configured and not errored,
+        "not_requested": not_requested,
+        "partial": bool(not_requested),
+        "complete": not not_configured and not errored and not not_requested,
     })
 
     return result
