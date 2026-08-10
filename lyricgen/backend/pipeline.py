@@ -9341,6 +9341,50 @@ def _song_identity(artist: str | None, title: str | None,
         return f"{a}|{t}"
 
 
+def _mark_veo_reservation_billable(row_id: int | None, reason: str) -> bool:
+    """Best-effort pending -> reserved transition in a fresh transaction."""
+    if row_id is None:
+        return False
+    from database import AIProvenance, SessionLocal
+    from provenance import BUDGET_RESERVED_PREFIX
+
+    db = None
+    try:
+        db = SessionLocal()
+        updated = (
+            db.query(AIProvenance)
+            .filter(AIProvenance.id == row_id)
+            .update(
+                {"response_summary": (
+                    f"{BUDGET_RESERVED_PREFIX}: {str(reason)[:1900]}"
+                )},
+                synchronize_session=False,
+            )
+        )
+        if not updated:
+            db.rollback()
+            return False
+        db.commit()
+        return True
+    except Exception as exc:
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        logger.warning(
+            "[BG][BUDGET] no pude marcar fila=%s como facturable: %r",
+            row_id, exc,
+        )
+        return False
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
 def _veo_budget_exceeded(job_id: str | None,
                          own_row_id: int | None = None) -> tuple[bool, int]:
     """Reserva atómicamente un lugar de Veo para la canción del job.
@@ -9374,6 +9418,9 @@ def _veo_budget_exceeded(job_id: str | None,
     # still need to transition that row to a billable in-flight state below.
     if VEO_MAX_CALLS_PER_SONG <= 0 and own_row_id is None:
         return False, 0
+    if VEO_MAX_CALLS_PER_SONG <= 0:
+        _mark_veo_reservation_billable(own_row_id, "ceiling disabled")
+        return False, 0
     try:
         from datetime import datetime as _dt, timedelta, timezone as _tz
         import hashlib as _hashlib
@@ -9385,28 +9432,6 @@ def _veo_budget_exceeded(job_id: str | None,
 
         db = SessionLocal()
         try:
-            if VEO_MAX_CALLS_PER_SONG <= 0:
-                updated = (
-                    db.query(AIProvenance)
-                    .filter(AIProvenance.id == own_row_id)
-                    .update(
-                        {"response_summary": (
-                            f"{BUDGET_RESERVED_PREFIX}: ceiling disabled"
-                        )},
-                        synchronize_session=False,
-                    )
-                )
-                if updated:
-                    db.commit()
-                else:
-                    db.rollback()
-                    logger.warning(
-                        "[BG][BUDGET] no pude marcar fila=%s como facturable "
-                        "con el tope desactivado; fail-open",
-                        own_row_id,
-                    )
-                return False, 0
-
             row = (db.query(Job.artist, Job.song_title, Job.tenant_id)
                      .filter(Job.job_id == job_id).one_or_none())
             artist = (row[0] if row else "") or ""
@@ -9498,6 +9523,8 @@ def _veo_budget_exceeded(job_id: str | None,
                         "[BG][BUDGET] no pude reservar fila=%s; fail-open",
                         own_row_id,
                     )
+                    _mark_veo_reservation_billable(
+                        own_row_id, "budget row update missed; fail-open")
                     return False, n
                 db.commit()
         finally:
@@ -9505,6 +9532,11 @@ def _veo_budget_exceeded(job_id: str | None,
     except Exception as exc:
         logger.warning("[BG] no pude chequear el tope de Veo para job=%s: %r",
                        job_id, exc)
+        # Delivery remains fail-open, but a provider POST follows immediately.
+        # Retry the state transition in a fresh transaction so a later worker
+        # crash cannot leave paid spend hidden as `budget_pending`.
+        _mark_veo_reservation_billable(
+            own_row_id, f"budget check failed; fail-open: {exc}")
         return False, 0
 
     if n >= VEO_MAX_CALLS_PER_SONG:

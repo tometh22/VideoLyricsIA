@@ -150,6 +150,54 @@ def test_tope_desactivado_conserva_la_fila_facturable(db, monkeypatch):
         db.commit()
 
 
+def test_fallo_del_guard_reintenta_la_reserva_en_transaccion_nueva(
+    db, monkeypatch,
+):
+    import database
+    import pipeline
+    from database import AIProvenance, Job
+    from provenance import BUDGET_PENDING_PREFIX, BUDGET_RESERVED_PREFIX
+
+    job_id = "budget-guard-failopen"
+    db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+    db.query(Job).filter(Job.job_id == job_id).delete()
+    db.add(Job(job_id=job_id, user_id=1, tenant_id="budget-failopen",
+               artist="A", song_title="S", filename="a.mp3",
+               status="processing"))
+    row = AIProvenance(
+        job_id=job_id, step="video_bg",
+        tool_name="veo-3.1-fast-generate-001",
+        tool_provider="google_vertex", prompt_sent="p",
+        response_summary=BUDGET_PENDING_PREFIX,
+    )
+    db.add(row)
+    db.commit()
+    row_id = row.id
+    real_session_local = database.SessionLocal
+    attempts = 0
+
+    def flaky_session_local():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("guard DB unavailable")
+        return real_session_local()
+
+    try:
+        monkeypatch.setattr(database, "SessionLocal", flaky_session_local)
+        monkeypatch.setattr(pipeline, "VEO_MAX_CALLS_PER_SONG", 10)
+        assert pipeline._veo_budget_exceeded(job_id, row_id) == (False, 0)
+        assert attempts >= 2
+        db.expire_all()
+        stored = db.query(AIProvenance).filter(
+            AIProvenance.id == row_id).one()
+        assert stored.response_summary.startswith(BUDGET_RESERVED_PREFIX)
+    finally:
+        db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+        db.query(Job).filter(Job.job_id == job_id).delete()
+        db.commit()
+
+
 def test_sin_job_id_no_topea(monkeypatch):
     p = _fake_counter(monkeypatch, 999)
     monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_SONG", 10)
