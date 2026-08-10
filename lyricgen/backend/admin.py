@@ -1090,7 +1090,10 @@ async def admin_cost_unit_economics(
         r.amount_usd for r in rows
         if r.status == "ok" and r.amount_usd is not None
     )
-    have = {r.source for r in rows if r.status == "ok"}
+    have = {
+        r.source for r in rows
+        if r.status == "ok" and r.amount_usd is not None
+    }
     cost_complete = have >= set(billing_sources.SOURCES)
 
     start_dt = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)

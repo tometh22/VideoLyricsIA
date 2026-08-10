@@ -483,6 +483,33 @@ def test_openai_incluye_formatter_y_whisper_pero_no_otros_proyectos(monkeypatch)
     ]
 
 
+@pytest.mark.parametrize("next_pages", [[None], ["cursor-1", "cursor-1"]])
+def test_openai_rechaza_paginacion_que_no_puede_avanzar(
+    monkeypatch, next_pages,
+):
+    payloads = [
+        {"data": [], "has_more": True, "next_page": cursor}
+        for cursor in next_pages
+    ]
+
+    class _Resp:
+        def __init__(self, payload): self._payload = payload
+        def raise_for_status(self): pass
+        def json(self): return self._payload
+
+    calls = iter(payloads)
+    monkeypatch.setenv("OPENAI_ADMIN_KEY", "sk-admin-fake")
+    monkeypatch.setattr(
+        billing_sources.requests, "get",
+        lambda *a, **k: _Resp(next(calls)),
+    )
+
+    result = billing_sources.fetch_openai("2026-07")
+    assert result.status == "error"
+    assert result.amount_usd is None
+    assert "paginación incompleta" in result.detail
+
+
 def test_gcp_timeout_is_an_error_not_zero_dollars(monkeypatch):
     """BigQuery returns HTTP 200 with `jobComplete: false` and no rows when
     the query outruns `timeoutMs`. Reporting that as $0/ok would show ~half
