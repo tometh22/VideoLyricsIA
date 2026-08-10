@@ -67,3 +67,40 @@ def test_acepta_las_variantes_de_apagado(client, admin_token, monkeypatch):
         body = client.post("/generate-preview", headers=auth(admin_token),
                            json=_body()).json()
         assert body.get("reason") == "disabled", valor
+
+
+def test_worker_omite_backlog_ya_encolado_cuando_se_apaga(monkeypatch):
+    """El switch también debe cortar jobs que ya estaban esperando en Redis."""
+    import bg_preview
+    import jobs
+
+    monkeypatch.setenv("BG_PREVIEW_ENABLED", "0")
+    updates = []
+    monkeypatch.setattr(jobs, "update_job", lambda *args, **kw: updates.append(kw))
+    monkeypatch.setattr(
+        bg_preview,
+        "cache_check",
+        lambda _key: (_ for _ in ()).throw(
+            AssertionError("un preview desactivado no debe tocar cache ni generar")
+        ),
+    )
+
+    result = bg_preview.run_bg_preview_job(
+        "previewqueued01",
+        "unused-key",
+        {"artist": "Bersuit", "song_title": "La Argentinidad Al Palo"},
+    )
+
+    assert result == {
+        "job_id": "previewqueued01",
+        "status": "bg_preview_done",
+        "bg_cache_key": "unused-key",
+        "cached": False,
+        "skipped": True,
+        "reason": "disabled",
+    }
+    assert updates == [{
+        "status": "bg_preview_done",
+        "current_step": "disabled",
+        "error": None,
+    }]

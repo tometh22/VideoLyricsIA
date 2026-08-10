@@ -64,6 +64,21 @@ from background_policy import (
 logger = logging.getLogger("genly.bg_preview")
 
 
+_DISABLED_FLAG_VALUES = frozenset({"0", "false", "off", "no"})
+
+
+def bg_preview_enabled() -> bool:
+    """Return whether background pre-generation may spend provider credits.
+
+    This check intentionally lives in the worker module so the HTTP enqueue
+    guard and already-queued RQ jobs share one interpretation of the flag.
+    """
+    return (
+        os.environ.get("BG_PREVIEW_ENABLED", "1").strip().lower()
+        not in _DISABLED_FLAG_VALUES
+    )
+
+
 # Campos del request que entran al hash. Determinístico — JSON con keys
 # ordenadas para que el mismo dict en distinto orden produzca el mismo key.
 # Si agregamos params futuros que afecten el background, sumarlos acá +
@@ -218,6 +233,39 @@ def run_bg_preview_job(
     from observability import set_job_log_context
     set_job_log_context(job_id)
     from jobs import update_job
+
+    # The API guard prevents new work, but a deploy can leave paid previews
+    # waiting in Redis.  Re-check at the spend boundary so flipping the
+    # kill-switch also drains that backlog without calling Veo/Imagen.
+    if not bg_preview_enabled():
+        logger.info(
+            "[BG_PREVIEW] job=%s skipped: BG_PREVIEW_ENABLED is disabled",
+            job_id,
+        )
+        try:
+            # Keep the established terminal status so existing pollers stop
+            # immediately; current_step + the RQ result preserve that this
+            # was intentionally skipped rather than generated/cached.
+            update_job(
+                job_id,
+                status="bg_preview_done",
+                current_step="disabled",
+                error=None,
+            )
+        except Exception as _status_err:
+            logger.warning(
+                "[BG_PREVIEW] no pude marcar disabled job=%s: %s",
+                job_id,
+                _status_err,
+            )
+        return {
+            "job_id": job_id,
+            "status": "bg_preview_done",
+            "bg_cache_key": bg_cache_key,
+            "cached": False,
+            "skipped": True,
+            "reason": "disabled",
+        }
 
     runtime_policy = resolve_atmospherics_policy(params.get("background_hint"))
     runtime_fingerprint = runtime_rollout_fingerprint(

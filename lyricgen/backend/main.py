@@ -4426,9 +4426,8 @@ async def generate_preview(
     #
     # Se reusa el contrato `skipped` que el frontend ya maneja, así que
     # apagarlo no rompe la UI. `BG_PREVIEW_ENABLED=1` lo vuelve a prender.
-    if os.environ.get("BG_PREVIEW_ENABLED", "1").strip().lower() in (
-        "0", "false", "off", "no"
-    ):
+    from bg_preview import bg_preview_enabled
+    if not bg_preview_enabled():
         return {
             "skipped": True,
             "reason": "disabled",
