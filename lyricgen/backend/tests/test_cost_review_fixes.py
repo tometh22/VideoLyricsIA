@@ -483,6 +483,48 @@ def test_un_refresh_ok_si_pisa(client, admin_token, db, monkeypatch):
         db.commit()
 
 
+def test_un_refresh_historico_ok_pero_vacio_no_pisa(client, admin_token, db,
+                                                    monkeypatch):
+    """Replicate envejece predicciones y devuelve una página vacía como $0 ok.
+    Un mes cerrado ya capturado no puede convertirse retroactivamente en cero.
+    """
+    import billing_sources
+    from database import CostSnapshot
+
+    period = "2020-07"
+    db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+    db.add(CostSnapshot(period=period, source="replicate", amount_usd=19.25,
+                        status="ok", detail="captura original",
+                        is_estimate=True, breakdown=[{"runs": 20}]))
+    db.commit()
+    monkeypatch.setattr(billing_sources, "fetch_all", lambda **kw: {
+        "period": period, "total_usd": 0.0,
+        "sources": [{"source": "replicate", "amount_usd": 0.0,
+                     "status": "ok", "detail": "0s de compute",
+                     "is_estimate": True, "breakdown": []}],
+    })
+    try:
+        response = client.post(
+            f"/admin/cost/refresh?period={period}&only=replicate",
+            headers=auth(admin_token),
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["total_usd"] == 19.25
+        assert body["sources"][0]["kept_previous"] is True
+        assert body["sources"][0]["discarded_refresh_amount_usd"] == 0.0
+        db.expire_all()
+        row = db.query(CostSnapshot).filter(
+            CostSnapshot.period == period,
+            CostSnapshot.source == "replicate",
+        ).one()
+        assert row.amount_usd == 19.25
+        assert row.breakdown == [{"runs": 20}]
+    finally:
+        db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+        db.commit()
+
+
 # ---------------------------------------------------------------------------
 # 11. El export de facturación es de la CUENTA, no del proyecto
 # ---------------------------------------------------------------------------
@@ -706,6 +748,54 @@ def test_unit_economics_incluye_el_ultimo_microsegundo(client, admin_token, db):
         assert body["videos_created"] >= 1
     finally:
         db.query(Job).filter(Job.tenant_id == tenant).delete()
+        db.commit()
+
+
+def test_unit_economics_conserva_una_entrega_mientras_se_edita(
+    client, admin_token, db,
+):
+    from database import Job
+
+    tenant = "reopened-delivery"
+    delivered_at = datetime(2020, 6, 15, tzinfo=timezone.utc)
+    editing_at = datetime(2020, 7, 1, tzinfo=timezone.utc)
+    db.query(Job).filter(Job.tenant_id == tenant).delete()
+    db.add(Job(job_id="rd1", user_id=1, tenant_id=tenant, artist="A",
+               filename="a.mp3", status="editing", created_at=delivered_at,
+               completed_at=delivered_at, editing_started_at=editing_at))
+    db.commit()
+    try:
+        body = client.get(
+            "/admin/cost/unit-economics?period=2020-06",
+            headers=auth(admin_token),
+        ).json()
+        assert body["videos_delivered"] >= 1
+    finally:
+        db.query(Job).filter(Job.tenant_id == tenant).delete()
+        db.commit()
+
+
+def test_reconcile_excluye_storage_de_la_factura_gcp(client, admin_token, db):
+    from database import CostSnapshot
+
+    period = "2020-08"
+    db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+    db.add(CostSnapshot(
+        period=period, source="gcp", amount_usd=100.0, status="ok",
+        breakdown=[
+            {"service": "Vertex AI", "sku": "Veo", "cost": 70.0},
+            {"service": "Cloud Storage", "sku": "Storage", "cost": 30.0},
+        ],
+    ))
+    db.commit()
+    try:
+        body = client.get(
+            f"/admin/cost/reconcile?period={period}",
+            headers=auth(admin_token),
+        ).json()
+        assert body["invoiced_usd"] == 70.0
+    finally:
+        db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
         db.commit()
 
 

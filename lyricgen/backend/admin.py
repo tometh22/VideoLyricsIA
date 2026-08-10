@@ -12,7 +12,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import case, func
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.orm import Session
 
 from auth import (
@@ -851,18 +851,26 @@ def admin_cost_refresh(
         if row is None:
             row = CostSnapshot(period=period, source=entry["source"])
             db.add(row)
-        # A closed-month fixed-cost snapshot is the historical price list.
-        # Re-evaluating it with today's FIXED_SUBSCRIPTIONS_JSON after a plan
-        # change rewrites history. Keep a healthy closed snapshot immutable;
-        # the current month remains refreshable until it closes.
+        # A healthy closed-month snapshot is immutable. Rolling APIs can return
+        # a superficially successful empty window after their history expires
+        # (Replicate returns ok/$0), and fixed subscriptions are evaluated with
+        # today's price list. Either result would rewrite a bill we already
+        # captured. The current month remains refreshable until it closes, and
+        # a missing/failed historical row can still be filled later by a source
+        # that actually supports historical reads (for example BigQuery).
         if (
-            entry["source"] == "fixed"
-            and period < billing_sources.current_period()
+            period < billing_sources.current_period()
             and row.status == "ok"
             and row.amount_usd is not None
         ):
             entry["kept_previous"] = True
             entry["previous_amount_usd"] = row.amount_usd
+            entry["discarded_refresh_amount_usd"] = entry["amount_usd"]
+            entry["amount_usd"] = row.amount_usd
+            entry["status"] = row.status
+            entry["detail"] = row.detail
+            entry["is_estimate"] = row.is_estimate
+            entry["breakdown"] = row.breakdown or []
             continue
         # Un refresh fallido NO pisa un snapshot sano. Las fuentes son
         # ventanas móviles: GitHub sólo puede consultar el ciclo vigente, así
@@ -887,6 +895,13 @@ def admin_cost_refresh(
         row.breakdown = entry["breakdown"]
         row.fetched_at = datetime.now(timezone.utc)
     db.commit()
+    # `fetch_all` computed its total before immutable historical rows were
+    # restored above. Return the same numbers that were actually persisted.
+    result["total_usd"] = round(sum(
+        float(entry["amount_usd"])
+        for entry in result["sources"]
+        if entry["status"] == "ok" and entry["amount_usd"] is not None
+    ), 2)
 
     return result
 
@@ -1028,10 +1043,24 @@ async def admin_cost_unit_economics(
         # pertenece al costo de julio, que es cuando se gastó y cuando se
         # factura. `coalesce` cubre filas viejas sin el campo.
         entregado_en = func.coalesce(Job.completed_at, Job.created_at)
+        # During an edit the current status is transiently `editing` (or may
+        # finish as `error`), but a retained completion timestamp older than
+        # editing_started_at proves the video had already shipped. A rejected
+        # job reopened by the fixed /edit path clears completed_at first; if
+        # that rescue fails, its new failure timestamp is after editing_started_at
+        # and therefore does not masquerade as a delivery.
+        delivery_fact = or_(
+            Job.status.in_(("done", "pending_review")),
+            and_(
+                Job.editing_started_at.isnot(None),
+                Job.completed_at.isnot(None),
+                Job.completed_at < Job.editing_started_at,
+            ),
+        )
         delivered = int(
             session.query(func.count(Job.id))
             .filter(entregado_en >= start_dt, entregado_en < end_dt)
-            .filter(Job.status.in_(("done", "pending_review")))
+            .filter(delivery_fact)
             .scalar() or 0
         )
         # Los CREADOS sí van por created_at — es literalmente eso lo que mide.
@@ -1140,10 +1169,17 @@ async def admin_cost_reconcile(
                 CostSnapshot.source.in_(AI_SOURCES))
         .all()
     )
-    invoiced = sum(
-        r.amount_usd for r in rows
-        if r.status == "ok" and r.amount_usd is not None
-    )
+    import cost_attribution as ca
+
+    invoiced = 0.0
+    for row in rows:
+        if row.status != "ok" or row.amount_usd is None:
+            continue
+        amount = float(row.amount_usd)
+        if row.source == "gcp":
+            amount, _shared = ca.split_gcp_invoice(
+                amount, row.breakdown or [])
+        invoiced += amount
     have = {r.source for r in rows if r.status == "ok"}
 
     # `cost_dashboard_global` measures a window ending NOW, so asking it

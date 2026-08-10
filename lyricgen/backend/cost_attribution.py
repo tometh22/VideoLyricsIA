@@ -598,7 +598,7 @@ def build_attribution(jobs_by_env: dict[str, dict[str, JobCost]],
 DIRECT_INVOICE_SOURCES = frozenset({"gcp", "openai", "replicate"})
 
 
-def _split_gcp_invoice(amount: float, breakdown: list[dict] | None) -> tuple[float, float]:
+def split_gcp_invoice(amount: float, breakdown: list[dict] | None) -> tuple[float, float]:
     """Return ``(direct_ai, shared_infra)`` from a GCP invoice snapshot.
 
     The billing export groups Vertex AI, Cloud Storage and networking under
@@ -657,7 +657,7 @@ def add_total_cost(attribution: dict, invoices: dict[str, float],
     for source, raw_amount in invoices.items():
         amount = float(raw_amount)
         if source == "gcp":
-            direct_ai, shared_infra = _split_gcp_invoice(
+            direct_ai, shared_infra = split_gcp_invoice(
                 amount, invoice_breakdowns.get(source))
             direct_amounts[source] = direct_ai
             if shared_infra:
