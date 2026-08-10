@@ -122,7 +122,7 @@ def test_tope_desactivado_conserva_la_fila_facturable(db, monkeypatch):
     from database import AIProvenance, Job
     from provenance import BUDGET_PENDING_PREFIX, BUDGET_RESERVED_PREFIX
 
-    job_id = "budget-disabled-billable"
+    job_id = "buddisabled"
     db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
     db.query(Job).filter(Job.job_id == job_id).delete()
     db.add(Job(job_id=job_id, user_id=1, tenant_id="budget-disabled",
@@ -158,7 +158,7 @@ def test_fallo_del_guard_reintenta_la_reserva_en_transaccion_nueva(
     from database import AIProvenance, Job
     from provenance import BUDGET_PENDING_PREFIX, BUDGET_RESERVED_PREFIX
 
-    job_id = "budget-guard-failopen"
+    job_id = "budfailopen"
     db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
     db.query(Job).filter(Job.job_id == job_id).delete()
     db.add(Job(job_id=job_id, user_id=1, tenant_id="budget-failopen",
@@ -589,18 +589,35 @@ def test_la_ventana_tambien_aplica_a_los_jobs_sin_metadata(monkeypatch):
         f"Filtros vistos: {filtros}")
 
 
-def test_muestras_crean_identidades_persistentes_para_presupuesto(db):
-    from database import Job
+def test_muestras_crean_identidades_persistentes_para_presupuesto(db, monkeypatch):
+    import uuid
+    from database import Job, User
     from scripts import regenerate_movement_samples as samples
 
-    ids = [samples._ensure_tracking_job(entry["style"], db=db)
-           for entry in samples.SAMPLES]
-    assert len(set(ids)) == len(samples.SAMPLES)
-    assert all(len(job_id) == 12 for job_id in ids)
-    rows = db.query(Job).filter(Job.job_id.in_(ids)).all()
-    assert len(rows) == len(ids)
-    assert {row.tenant_id for row in rows} == {samples._TRACKING_TENANT}
-    assert {row.status for row in rows} == {"internal_sample"}
+    owner = User(
+        username=f"movement-samples-{uuid.uuid4().hex[:8]}",
+        hashed_password="unused",
+        role="user",
+        tenant_id="test-internal",
+    )
+    db.add(owner)
+    db.commit()
+    monkeypatch.setenv("MOVEMENT_SAMPLES_USER_ID", str(owner.id))
+    ids = []
+    try:
+        ids = [samples._ensure_tracking_job(entry["style"], db=db)
+               for entry in samples.SAMPLES]
+        assert len(set(ids)) == len(samples.SAMPLES)
+        assert all(len(job_id) == 12 for job_id in ids)
+        rows = db.query(Job).filter(Job.job_id.in_(ids)).all()
+        assert len(rows) == len(ids)
+        assert {row.tenant_id for row in rows} == {samples._TRACKING_TENANT}
+        assert {row.status for row in rows} == {"internal_sample"}
+    finally:
+        if ids:
+            db.query(Job).filter(Job.job_id.in_(ids)).delete()
+        db.query(User).filter(User.id == owner.id).delete()
+        db.commit()
 
 
 def test_la_fila_de_tope_no_borrada_no_cuenta_como_gasto():

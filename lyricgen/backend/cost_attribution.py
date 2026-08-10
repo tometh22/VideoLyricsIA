@@ -76,6 +76,7 @@ CI_TENANT_PATTERNS = (
 TEAM_TENANTS = frozenset({
     "genly", "default", "omg", "agus77", "tomas@epical.digital",
     "golden_render_bot",   # also CI-matched; listed for completeness
+    "__internal_samples__",  # platform-owned movement gallery generations
 })
 
 UMG_TENANT_PREFIX = "universal"
