@@ -152,6 +152,20 @@ def summarize(rows: list, deliveries_total: int | None = None) -> dict:
             round(n / deliveries_total, 4)
             if deliveries_total else None
         ),
+        # Advertencia explícita, no una nota al pie: el numerador y el
+        # denominador NO son la misma cohorte. Un reclamo que entra el mes
+        # siguiente al de su entrega suma arriba y no abajo; una entrega
+        # recién cargada que todavía no recibió feedback hace lo contrario.
+        # Cuál es la cohorte correcta ("cuántos reclamos entraron este mes"
+        # vs "qué tan buena fue la tanda de este mes") es una decisión de
+        # negocio, así que el número se publica con la salvedad al lado en
+        # vez de elegirla el código en silencio.
+        "requests_per_delivery_caveat": (
+            "cohortes mezcladas: los pedidos se cuentan por su propia fecha "
+            "y las entregas por la suya. Un pedido de una entrega del mes "
+            "anterior infla el ratio; una entrega sin feedback todavía lo "
+            "diluye. Sirve para ver tendencia, no como tasa exacta."
+        ),
         "note": (
             "Un pedido puede tener varias categorías (suelen pedir 2-3 cosas "
             "juntas), así que los shares suman más de 100%. El denominador "
