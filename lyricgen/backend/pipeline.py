@@ -10383,7 +10383,9 @@ def _measure_camera_drift(video_path: str, samples: int = 30) -> dict | None:
                 pass
 
 
-def _score_video_relevance(video_path: str, prompt: str) -> int:
+def _score_video_relevance(
+    video_path: str, prompt: str, job_id: str | None = None,
+) -> int:
     """Ask Gemini Vision whether the video matches the intended scene prompt.
 
     Extracts one frame and returns a relevance score 1-10.
@@ -10393,6 +10395,7 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
     import tempfile
 
     tmp_frame = None
+    recorder = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
             tmp_frame = f.name
@@ -10406,6 +10409,16 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
         # generated Veo video; a hang here adds to total render latency
         # but is gated by the same outer except → fall-through to score=8.
         # 30 s suffices (single-frame Vision call is fast).
+        if job_id:
+            from provenance import record_ai_call
+            recorder = record_ai_call(
+                job_id=job_id,
+                step="video_relevance",
+                tool_name="gemini-2.5-flash",
+                tool_provider="google_vertex",
+                prompt=prompt,
+                input_data_types=["video_frame", "scene_prompt"],
+            )
         response = _call_with_timeout(
             lambda: client.models.generate_content(
                 model="gemini-2.5-flash",
@@ -10432,8 +10445,12 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
         import re as _re
         m = _re.search(r'\b(10|[1-9])\b', response.text)
         score = int(m.group()) if m else 5
+        if recorder:
+            recorder.finish(response_summary=f"score={score}")
         return max(1, min(10, score))
     except Exception as e:
+        if recorder:
+            recorder.finish(response_summary=f"error: {e!r}")
         _raise_if_job_timeout(e)
         logger.warning("[BG] Relevance score error (fail-open): %s", e)
         return 8
@@ -11853,7 +11870,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # to bound cost (+$0.80 worst case). quality_retry_used gates the
             # re-generation decision, not the scoring itself, so the retry's
             # result is also evaluated before we accept and return it.
-            score = _score_video_relevance(bg_path, prompt)
+            score = _score_video_relevance(bg_path, prompt, job_id=job_id)
             logger.info("[BG] Relevance score: %s/10 for prompt: %s...", score, prompt[:60])
             # Detector de corte de escena (incidente mural 2026-06-09):
             # un clip cuyo primer y último frame son escenas distintas

@@ -1084,6 +1084,72 @@ def test_r2_descuenta_las_cuotas_gratuitas_de_operaciones(monkeypatch):
     assert by_concept["operaciones clase B"]["billable_requests"] == 0
 
 
+def test_r2_prorratea_filas_parciales_sobre_todo_el_mes(monkeypatch):
+    import billing_sources
+
+    gib = 1024 ** 3
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"data": {"viewer": {"accounts": [{
+                # Diez días observados a 100 GiB en un mes de 31 días.
+                "r2StorageAdaptiveGroups": [
+                    {"max": {"payloadSize": 100 * gib, "objectCount": 10},
+                     "dimensions": {"date": f"2026-07-{day:02d}"}}
+                    for day in range(1, 11)
+                ],
+                "r2OperationsAdaptiveGroups": [],
+            }]}}}
+
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "token")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "account")
+    monkeypatch.setattr(billing_sources, "R2_FREE_GB", 0.0)
+    monkeypatch.setattr(billing_sources, "R2_USD_PER_GB_MONTH", 1.0)
+    monkeypatch.setattr(billing_sources.requests, "post", lambda *a, **k: _Resp())
+
+    out = billing_sources.fetch_r2("2026-07")
+    storage = next(row for row in out.breakdown if row["concepto"] == "storage")
+    assert storage["avg_gb"] == pytest.approx(1000 / 31, abs=0.01)
+    assert out.amount_usd == pytest.approx(32.26, abs=0.01)
+
+
+def test_relevance_gemini_queda_en_provenance(db, monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+    from database import AIProvenance, Job
+    import pipeline
+
+    job_id = "relprov001"
+    db.add(Job(job_id=job_id, user_id=1, tenant_id="rel-prov",
+               artist="A", filename="a.mp3", status="processing"))
+    db.commit()
+
+    monkeypatch.setattr(
+        pipeline, "_extract_frame_from_video",
+        lambda _video, frame: Path(frame).write_bytes(b"jpeg"),
+    )
+    monkeypatch.setattr(
+        pipeline, "_get_genai_client",
+        lambda: SimpleNamespace(models=SimpleNamespace(
+            generate_content=lambda **_kwargs: SimpleNamespace(text="8"),
+        )),
+    )
+    monkeypatch.setattr(
+        pipeline, "_call_with_timeout", lambda call, **_kwargs: call(),
+    )
+
+    assert pipeline._score_video_relevance("video.mp4", "una cancha", job_id) == 8
+    db.expire_all()
+    row = db.query(AIProvenance).filter(
+        AIProvenance.job_id == job_id,
+        AIProvenance.step == "video_relevance",
+    ).one()
+    assert row.tool_name == "gemini-2.5-flash"
+    assert row.tool_provider == "google_vertex"
+    assert row.response_summary == "score=8"
+
+
 # ---------------------------------------------------------------------------
 # 19. Un snapshot fijo cerrado no cambia con la configuración de hoy
 # ---------------------------------------------------------------------------
