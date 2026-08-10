@@ -1062,6 +1062,13 @@ def test_cli_transporta_el_breakdown_de_gcp():
     assert breakdowns["gcp"][1]["service"] == "Cloud Storage"
 
 
+def test_cli_rechaza_fuentes_de_factura_desconocidas():
+    from scripts.umg_cost_report import parse_invoices
+
+    with pytest.raises(ValueError, match="fuentes desconocidas: gcpp"):
+        parse_invoices(json.dumps({"gcp": 100, "gcpp": 100}))
+
+
 def test_lifecycle_solo_expira_prores_generado():
     from scripts.r2_lifecycle_report import _classify
 

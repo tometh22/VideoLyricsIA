@@ -54,6 +54,7 @@ from sqlalchemy import create_engine                     # noqa: E402
 from sqlalchemy.orm import sessionmaker                  # noqa: E402
 
 import cost_attribution as ca                            # noqa: E402
+from billing_sources import SOURCES                     # noqa: E402
 
 
 def _session(url: str):
@@ -93,6 +94,14 @@ def parse_invoices(raw: str) -> tuple[dict[str, float], dict[str, list[dict]]]:
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError("--invoices debe ser un objeto JSON por fuente")
+    unknown = sorted(set(payload) - set(SOURCES))
+    if unknown:
+        raise ValueError(
+            "--invoices contiene fuentes desconocidas: "
+            + ", ".join(unknown)
+            + "; válidas: "
+            + ", ".join(SOURCES)
+        )
     invoices: dict[str, float] = {}
     breakdowns: dict[str, list[dict]] = {}
     for source, value in payload.items():
