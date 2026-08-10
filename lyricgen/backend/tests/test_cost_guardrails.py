@@ -251,7 +251,7 @@ def test_una_respuesta_ambigua_no_duplica_el_post():
     ambiguous = source.index("ambiguous submission; not retrying")
     next_rate_limit = source.index("if r.status_code == 429", ambiguous)
     block = source[ambiguous:next_rate_limit]
-    assert "raise RuntimeError" in block
+    assert "raise VeoAmbiguousSubmission" in block
     assert "continue" not in block
 
 
@@ -270,7 +270,21 @@ def test_un_2xx_sin_operation_name_se_conserva_como_ambiguo():
     block = source[start:end]
     assert "ambiguous success response missing operation name" in block
     assert "_release_veo_reservation" not in block
-    assert "raise RuntimeError" in block
+    assert "raise VeoAmbiguousSubmission" in block
+
+
+def test_un_envio_ambiguo_tampoco_reintenta_en_el_bucle_exterior():
+    """Cortar el retry HTTP no alcanza: `_ensure_background` tiene otro loop."""
+    import inspect
+    import pipeline
+
+    assert issubclass(pipeline.VeoAmbiguousSubmission, RuntimeError)
+    source = inspect.getsource(pipeline._ensure_background)
+    ambiguous = source.index("except VeoAmbiguousSubmission")
+    generic = source.index("except Exception", ambiguous)
+    block = source[ambiguous:generic]
+    assert "break" in block
+    assert "continue" not in block
 
 
 def test_la_identidad_de_cancion_colapsa_espacios(monkeypatch):

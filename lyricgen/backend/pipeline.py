@@ -9225,6 +9225,14 @@ class VeoBudgetExceeded(RuntimeError):
     gasto sin romper la entrega."""
 
 
+class VeoAmbiguousSubmission(RuntimeError):
+    """Vertex may have accepted a paid operation whose id we cannot recover.
+
+    Callers must fall back without another submission: retrying at either the
+    HTTP layer or the outer background layer can duplicate a billable render.
+    """
+
+
 # Tope de generaciones PAGAS de Veo POR CANCIÓN. Medido en jul-2026: en prod,
 # 12 jobs (el 10%) se comieron el **42,8%** del gasto de Veo, y uno solo llegó
 # a 26 llamadas — unos $16 en un video que se vende a $8. Un job sano usa 1-3.
@@ -10077,7 +10085,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                 recorder.finish(
                     response_summary=f"error: ambiguous submission; not retrying: {str(e)[:300]}"
                 )
-            raise RuntimeError(
+            raise VeoAmbiguousSubmission(
                 f"Veo 3 submission response was ambiguous; not retrying: {e}"
             ) from e
 
@@ -10112,7 +10120,9 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                 recorder.finish(response_summary=(
                     f"error: ambiguous success response; not retrying: {str(exc)[:300]}"
                 ))
-            raise RuntimeError("Veo returned an unreadable success response") from exc
+            raise VeoAmbiguousSubmission(
+                "Veo returned an unreadable success response"
+            ) from exc
         operation_name = payload.get("name")
         if not operation_name:
             # A 2xx means Vertex may already have accepted a paid operation,
@@ -10123,7 +10133,9 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                     "error: ambiguous success response missing operation name; "
                     f"not retrying: {str(payload)[:300]}"
                 ))
-            raise RuntimeError(f"Veo response missing 'name': {payload}")
+            raise VeoAmbiguousSubmission(
+                f"Veo response missing 'name': {payload}"
+            )
         veo_breaker.record_success()  # Veo accepted → close the breaker if open
         break
 
@@ -12334,6 +12346,12 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # 30s de espera, así que reintentar sólo agrega latencia y otro
             # ciclo de reserva+borrado de fila. Directo al fallback local.
             logger.error("[BG] %s — sin reintento, al fallback", e)
+            break
+        except VeoAmbiguousSubmission as e:
+            # Vertex may already be rendering and billing this operation. The
+            # inner submitter preserved one reservation; do not re-enter it
+            # from this outer quality/transient retry loop.
+            logger.error("[BG] %s — envío ambiguo, sin reintento", e)
             break
         except Exception as e:
             logger.error("[BG] Veo 3 attempt %s/2 failed: %s", attempt + 1, e)
