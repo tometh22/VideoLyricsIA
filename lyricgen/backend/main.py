@@ -5683,6 +5683,13 @@ async def _run_transcription_for_job(
     import tempfile
     import asyncio
 
+    # Bind inline/legacy requests too (the RQ entrypoint already does this).
+    # Context variables are copied into asyncio.to_thread, so every Replicate
+    # consumer below can attribute its prediction without threading job_id
+    # through a dozen fallback signatures.
+    from observability import set_job_log_context
+    set_job_log_context(job_id)
+
     if not filename:
         filename = os.path.basename(audio_path)
 
