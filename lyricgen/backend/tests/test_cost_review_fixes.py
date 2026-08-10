@@ -661,6 +661,9 @@ def test_el_query_de_bigquery_se_acota_a_los_proyectos_configurados(monkeypatch)
     monkeypatch.setenv("GCP_BILLING_PROJECT_IDS", "genly-prod,genly-staging")
     out = billing_sources.fetch_gcp("2026-07")
     assert "project.id IN ('genly-prod', 'genly-staging')" in consultas[-1]
+    assert "invoice.month = '202607'" in consultas[-1]
+    assert "usage_start_time" not in consultas[-1]
+    assert out.raw["invoice_month"] == "202607"
     assert out.raw["project_scope"] == ["genly-prod", "genly-staging"]
 
     # Sin configurar NO filtra (filtrar por el proyecto del dataset daría $0

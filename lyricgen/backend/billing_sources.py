@@ -141,7 +141,7 @@ def _not_configured(source: str, period: str, missing: str) -> SourceCost:
 # ---------------------------------------------------------------------------
 
 def fetch_gcp(period: str) -> SourceCost:
-    """Monthly Google Cloud cost from the BigQuery billing export.
+    """Monthly Google Cloud invoice cost from the BigQuery billing export.
 
     GCP has no API that returns "what did I spend last month" directly; the
     supported path is to enable Cloud Billing export to BigQuery (free,
@@ -177,7 +177,8 @@ def fetch_gcp(period: str) -> SourceCost:
         return SourceCost("gcp", period, status="error",
                           detail=f"credenciales GCP: {e}")
 
-    start, end = _period_bounds(period)
+    start, _end = _period_bounds(period)
+    invoice_month = f"{start.year:04d}{start.month:02d}"
     # La tabla de export es de la CUENTA DE FACTURACIÓN entera, no del
     # proyecto que la hospeda: si esa cuenta tiene otros proyectos, su gasto
     # se suma acá, infla /cost/real, entra en la calibración de tarifas y
@@ -209,7 +210,7 @@ def fetch_gcp(period: str) -> SourceCost:
           SUM(cost) AS cost,
           SUM(IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) c), 0)) AS credits
         FROM `{project}.{dataset}.{table}`
-        WHERE DATE(usage_start_time) BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
+        WHERE invoice.month = '{invoice_month}'
           {filtro_proyecto}
         GROUP BY service, sku
         ORDER BY cost DESC
@@ -273,8 +274,9 @@ def fetch_gcp(period: str) -> SourceCost:
     return SourceCost(
         source="gcp", period=period, amount_usd=round(total, 2),
         breakdown=breakdown,
-        detail=f"alcance: {alcance}",
+        detail=f"invoice.month={invoice_month}; alcance: {alcance}",
         raw={"rows": payload.get("totalRows"), "table": f"{dataset}.{table}",
+             "invoice_month": invoice_month,
              "project_scope": proyectos or "billing_account"},
     )
 
