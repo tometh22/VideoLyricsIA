@@ -1154,6 +1154,27 @@ def test_r2_prorratea_filas_parciales_sobre_todo_el_mes(monkeypatch):
     assert out.amount_usd == pytest.approx(32.26, abs=0.01)
 
 
+def test_r2_vacio_no_confirma_costo_cero(monkeypatch):
+    import billing_sources
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"data": {"viewer": {"accounts": [{
+                "r2StorageAdaptiveGroups": [],
+                "r2OperationsAdaptiveGroups": [],
+            }]}}}
+
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "token")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "account")
+    monkeypatch.setattr(billing_sources.requests, "post", lambda *a, **k: _Resp())
+
+    out = billing_sources.fetch_r2("2026-07")
+    assert out.status == "error"
+    assert out.amount_usd is None
+    assert "R2_BUCKET" in out.detail
+
+
 def test_relevance_gemini_queda_en_provenance(db, monkeypatch):
     from pathlib import Path
     from types import SimpleNamespace

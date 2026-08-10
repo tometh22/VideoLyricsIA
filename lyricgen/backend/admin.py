@@ -1465,6 +1465,13 @@ def admin_calibrate_rates(    # `def`: consulta BigQuery, que bloquea hasta
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # GCP's export lags the usage it describes. A current/open month (or a
+    # just-closed month still inside that lag) can be useful as a preview but
+    # must never overwrite the estimated rate used by dashboards.
+    rates_are_final = billing_sources.snapshot_is_final(
+        period, "gcp", datetime.now(timezone.utc),
+    )
+
     gcp = billing_sources.fetch_gcp(period)
     if gcp.status != "ok":
         return {
@@ -1490,8 +1497,21 @@ def admin_calibrate_rates(    # `def`: consulta BigQuery, que bloquea hasta
 
     result["invoiced_by_tool"] = invoiced
     result["gcp_total_usd"] = gcp.amount_usd
-    if not dry_run:
+    if not rates_are_final:
+        result["provisional"] = True
+        result["provisional_applied"] = dict(result.get("applied") or {})
+        result["applied"] = {}
+        result["stored"] = False
+        result["reason"] = (
+            "mes abierto o dentro del rezago de finalización de GCP; "
+            "las tarifas se muestran como provisionales y no se aplican"
+        )
+    elif not dry_run:
         result["stored"] = rc.store_rates(db, period, result)
+        result["provisional"] = False
+    else:
+        result["stored"] = False
+        result["provisional"] = False
     result["calibrated"] = bool(result.get("applied"))
     return result
 

@@ -695,6 +695,15 @@ def fetch_r2(period: str) -> SourceCost:
     acct = accounts[0]
 
     storage_rows = acct.get("r2StorageAdaptiveGroups") or []
+    operation_rows = acct.get("r2OperationsAdaptiveGroups") or []
+    if not storage_rows and not operation_rows:
+        return SourceCost(
+            "r2", period, status="error",
+            detail=(
+                "Cloudflare no devolvió observaciones de storage ni operaciones; "
+                "verificá R2_BUCKET y la ventana antes de aceptar costo $0"
+            ),
+        )
     # Integrate daily maxima over the *whole requested month*. Cloudflare
     # omits dates with no/future observations, so dividing by the number of
     # returned rows would turn ten observed days into a full GB-month and
@@ -709,7 +718,7 @@ def fetch_r2(period: str) -> SourceCost:
     storage_cost = billable_gb * R2_USD_PER_GB_MONTH
 
     class_a = class_b = 0
-    for row in acct.get("r2OperationsAdaptiveGroups") or []:
+    for row in operation_rows:
         action = ((row.get("dimensions") or {}).get("actionType") or "").lower()
         requests_n = int((row.get("sum") or {}).get("requests") or 0)
         # Cloudflare labels the op; deletes and multipart aborts are free,
