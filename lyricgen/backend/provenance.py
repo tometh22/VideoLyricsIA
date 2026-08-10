@@ -605,7 +605,12 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
     in_flight = int(
         db.query(func.count(AIProvenance.id))
         .filter(AIProvenance.created_at >= since)
-        .filter(AIProvenance.response_summary.is_(None))
+        # A recorder can carry a meaningful provisional summary
+        # (``budget_reserved``) while the provider operation is still polling.
+        # ``duration_ms`` is the durable finish marker; combine it with the
+        # same billable predicate as spend so pending/free rows stay excluded.
+        .filter(AIProvenance.duration_ms.is_(None))
+        .filter(billable_filter())
         .scalar() or 0
     )
 

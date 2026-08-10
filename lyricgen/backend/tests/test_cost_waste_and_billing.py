@@ -28,7 +28,7 @@ from provenance import (
 # file order. Clean up explicitly instead of relying on ordering.
 _TEST_TENANTS = (
     "cache-tenant", "err-tenant", "waste-mix", "waste-cache",
-    "waste-lib", "scope-a", "scope-b",
+    "waste-lib", "scope-a", "scope-b", "inflight-quality",
 )
 
 
@@ -121,6 +121,38 @@ def test_errored_and_in_flight_rows_stay_billable(db):
     s = tenant_cost_summary(db, tenant_id="err-tenant", since_days=30)
     assert s["total_calls"] == 2
     assert s["total_cost"] == 1.60
+
+
+def test_row_quality_incluye_reservas_veo_sin_finalizar(db):
+    from database import AIProvenance
+    from provenance import (
+        BUDGET_PENDING_PREFIX,
+        BUDGET_RELEASED_PREFIX,
+        BUDGET_RESERVED_PREFIX,
+        cost_dashboard_global,
+    )
+
+    before = cost_dashboard_global(db, since_days=30)["row_quality"][
+        "in_flight_included"]
+    _job(db, "inflight1", "done", tenant="inflight-quality")
+    for summary, duration in (
+        (f"{BUDGET_RESERVED_PREFIX}: song=a|s", None),  # billable + active
+        (None, None),                                  # legacy active row
+        ("provider_ok", 1200),                         # finished
+        (BUDGET_PENDING_PREFIX, None),                 # free candidate
+        (BUDGET_RELEASED_PREFIX, None),                # confirmed free
+    ):
+        db.add(AIProvenance(
+            job_id="inflight1", step="video_bg",
+            tool_name="veo-3.1-fast-generate-001",
+            tool_provider="google_vertex", prompt_sent="p",
+            response_summary=summary, duration_ms=duration,
+        ))
+    db.commit()
+
+    after = cost_dashboard_global(db, since_days=30)["row_quality"][
+        "in_flight_included"]
+    assert after - before == 2
 
 
 # ---------------------------------------------------------------------------
