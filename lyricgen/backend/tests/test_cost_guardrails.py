@@ -15,12 +15,14 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def _fake_counter(monkeypatch, n, artist="Bersuit", title="La Argentinidad",
-                  hermanos=None):
+                  hermanos=None, tenant="universal_argentina", visto=None):
     """Sesión falsa: `n` llamadas pagas ya registradas, y un job con la
     identidad de canción indicada (o sin metadata si van vacías).
 
     `hermanos` son las filas (job_id, artista, título) que la query de
     candidatos devuelve — sirve para probar la normalización de identidad.
+    `visto` es un dict opcional donde se anotan los job_id que la query final
+    terminó filtrando, para poder afirmar QUIÉN entró al conteo.
     """
     import pipeline
 
@@ -30,10 +32,23 @@ def _fake_counter(monkeypatch, n, artist="Bersuit", title="La Argentinidad",
     ]
 
     class _Q:
-        def filter(self, *a, **k): return self
+        def __init__(self):
+            # La única query que llama a distinct() es la de job_ids con gasto
+            # de Veo en la ventana; es lo que las distingue en el fake.
+            self._distinct = False
+        def filter(self, *a, **k):
+            if visto is not None:
+                visto.setdefault("filtros", []).extend(str(x) for x in a)
+            return self
+        def distinct(self):
+            self._distinct = True
+            return self
         def scalar(self): return n
-        def one_or_none(self): return (artist, title)
-        def all(self): return filas
+        def one_or_none(self): return (artist, title, tenant)
+        def all(self):
+            if self._distinct:
+                return [(jid,) for jid, _a, _t in filas]
+            return filas
 
     class _S:
         def query(self, *a, **k): return _Q()
@@ -133,22 +148,31 @@ def test_no_se_cuenta_a_si_misma(monkeypatch):
     p = _fake_counter(monkeypatch, 10)
     monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_SONG", 10)
 
+    estado = {"excluido": False}
+
     class _QExcl:
         """Devuelve 9 cuando se excluye una fila, 10 cuando no."""
-        def __init__(self): self.excluido = False
+        def __init__(self):
+            self._distinct = False
         def filter(self, *a, **k):
             # El filtro de exclusión es el único que compara con `!=`.
             if a and "!=" in str(a[0]):
-                self.excluido = True
+                estado["excluido"] = True
             return self
-        def scalar(self): return 9 if self.excluido else 10
-        def one_or_none(self): return ("Bersuit", "La Argentinidad")
-        def all(self): return [("j1", "Bersuit", "La Argentinidad")]
+        def distinct(self):
+            self._distinct = True
+            return self
+        def scalar(self): return 9 if estado["excluido"] else 10
+        def one_or_none(self): return ("Bersuit", "La Argentinidad", "t1")
+        def all(self):
+            if self._distinct:
+                return [("j1",)]
+            return [("j1", "Bersuit", "La Argentinidad")]
 
-    q = _QExcl()
-    monkeypatch.setattr("database.SessionLocal",
-                        lambda: type("S", (), {"query": lambda s, *a, **k: q,
-                                               "close": lambda s: None})())
+    monkeypatch.setattr(
+        "database.SessionLocal",
+        lambda: type("S", (), {"query": lambda s, *a, **k: _QExcl(),
+                               "close": lambda s: None})())
     over, spent = p._veo_budget_exceeded("job123", exclude_row_id=555)
     assert over is False and spent == 9, "la llamada en curso no debe contarse"
 
@@ -217,3 +241,95 @@ def test_si_no_puede_borrar_no_rompe(monkeypatch):
     pipeline._discard_provenance_row(rec)   # no debe levantar
     assert cerrada, "cae a cerrar la fila si no puede borrarla"
 
+
+
+# ---------------------------------------------------------------------------
+# Regresiones de la tercera revisión
+# ---------------------------------------------------------------------------
+
+def test_el_presupuesto_no_cruza_tenants(monkeypatch):
+    """Dos clientes que rinden la misma canción NO comparten un techo.
+
+    Sin filtrar por tenant, el primero en llegar a 10 generaciones le corta el
+    render pago al segundo, que no gastó nada. La canción es la unidad de
+    presupuesto DENTRO de un cliente, no entre clientes.
+    """
+    visto = {}
+    p = _fake_counter(monkeypatch, 3, tenant="universal_argentina", visto=visto)
+    monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_SONG", 10)
+    p._veo_budget_exceeded("job123")
+    filtros = " | ".join(visto.get("filtros", []))
+    assert "tenant_id" in filtros, (
+        "los jobs hermanos se buscan sin acotar por tenant → un cliente le "
+        f"come el presupuesto a otro. Filtros vistos: {filtros}")
+
+
+def test_los_previews_sin_metadata_no_comparten_un_solo_tope(monkeypatch):
+    """`/generate-preview` guarda el placeholder `preview|preview` cuando el
+    caller no manda artista/título. `song_key` lo trata como identidad
+    degenerada y la desambigua con el job_id — pero sólo si se lo pasan.
+
+    Sin el job_id, TODOS esos jobs colapsan en `__sin_metadata__|desconocido`,
+    comparten un único tope de 10 y se agotan globalmente: el preview 11 de
+    cualquier canción del sistema queda cortado para siempre.
+    """
+    import pipeline
+
+    a = pipeline._song_identity("preview", "preview", "job-A")
+    b = pipeline._song_identity("preview", "preview", "job-B")
+    assert a != b, "dos previews sin metadata no son la misma canción"
+    assert a.startswith("__sin_metadata__|")
+
+    # Y el guard tiene que caer al conteo por job, no al de hermanos.
+    p = _fake_counter(monkeypatch, 11, artist="preview", title="preview")
+    monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_SONG", 10)
+    over, spent = p._veo_budget_exceeded("job-preview")
+    assert over is True and spent == 11
+
+
+def test_una_cancion_de_verdad_sigue_agrupando(monkeypatch):
+    """Contraprueba del anterior: la desambiguación por job_id NO puede romper
+    el agrupamiento real, que es todo el punto del tope por canción."""
+    import pipeline
+    assert (pipeline._song_identity("Bersuit", "La  Argentinidad", "job-A")
+            == pipeline._song_identity(" bersuit ", "La Argentinidad", "job-B"))
+
+
+# ---------------------------------------------------------------------------
+# Los lookups cache_only no gastan: no pueden consumir presupuesto
+# ---------------------------------------------------------------------------
+
+def test_un_cache_only_miss_no_cuenta_como_llamada_paga():
+    """Un `cache_only` busca el clip en R2 y, si no está, NO genera — ese es
+    todo el punto (regenerar una escena no puede re-cobrar las otras N).
+
+    La fila quedaba contada como paga para siempre: inflaba el costo del panel
+    y le comía el tope a la canción."""
+    from provenance import billable_filter
+    from database import AIProvenance
+    sql = str(billable_filter().compile(
+        compile_kwargs={"literal_binds": True}))
+    assert "cache_only_miss" in sql, (
+        "billable_filter no excluye los cache_only_miss")
+    assert "cache_hit" in sql, "y tiene que seguir excluyendo los cache hits"
+    assert AIProvenance is not None
+
+
+def test_el_lookup_cache_only_se_registra_despues_de_saber_el_resultado():
+    """La fila se insertaba ANTES del lookup, y mientras está en vuelo
+    (`response_summary` NULL) `billable_filter()` la cuenta como paga. En un
+    regen multi-escena esas consultas corren en paralelo con la ÚNICA escena
+    que sí paga, así que le comían el tope con llamadas de $0.
+
+    Se verifica sobre el código: dentro de `_generate_veo_video`, el recorder
+    de la generación paga tiene que crearse DESPUÉS del bloque `cache_only`.
+    """
+    import inspect
+    import pipeline
+
+    src = inspect.getsource(pipeline._generate_veo_video)
+    i_cache = src.index("if cache_only:")
+    i_rec = src.index("recorder = record_ai_call(")
+    assert i_rec > i_cache, (
+        "el recorder pago se abre antes del bloque cache_only → los lookups "
+        "gratis quedan en vuelo contando como pagos")

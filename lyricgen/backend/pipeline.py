@@ -9288,7 +9288,8 @@ def _discard_provenance_row(recorder) -> None:
         recorder.finish(response_summary="budget_exceeded: no se generó nada")
 
 
-def _song_identity(artist: str | None, title: str | None) -> str:
+def _song_identity(artist: str | None, title: str | None,
+                   job_id: str | None = None) -> str:
     """Identidad de canción, IDÉNTICA a `cost_attribution.song_key`.
 
     Tiene que colapsar los espacios internos igual que aquella: comparando
@@ -9296,14 +9297,23 @@ def _song_identity(artist: str | None, title: str | None) -> str:
     quedaban como canciones distintas, así que corregir la metadata de un job
     le estrenaba presupuesto. Se delega en la función de verdad para que no
     puedan divergir.
+
+    `job_id` NO es opcional en la práctica: `song_key` lo usa para desambiguar
+    las identidades degeneradas (sin metadata, o el placeholder
+    `preview|preview` que escribe `/generate-preview`). Sin pasarlo, TODOS
+    esos jobs colapsan en `__sin_metadata__|desconocido` y comparten un único
+    tope de 10 llamadas para siempre — el tope se agota globalmente y corta
+    previews de canciones que no tienen nada que ver entre sí.
     """
     try:
         from cost_attribution import song_key
-        return song_key(artist, title)
+        return song_key(artist, title, job_id)
     except Exception:
         import re as _re
         a = _re.sub(r"\s+", " ", (artist or "").strip().lower())
         t = _re.sub(r"\s+", " ", (title or "").strip().lower())
+        if not a and not t:
+            return f"__sin_metadata__|{job_id or 'desconocido'}"
         return f"{a}|{t}"
 
 
@@ -9342,36 +9352,51 @@ def _veo_budget_exceeded(job_id: str | None,
 
         db = SessionLocal()
         try:
-            row = (db.query(Job.artist, Job.song_title)
+            row = (db.query(Job.artist, Job.song_title, Job.tenant_id)
                      .filter(Job.job_id == job_id).one_or_none())
             artist = (row[0] if row else "") or ""
             title = (row[1] if row else "") or ""
+            tenant = (row[2] if row else "") or ""
 
+            since = _dt.now(_tz.utc) - timedelta(days=VEO_BUDGET_WINDOW_DAYS)
             q = (db.query(_func.count(AIProvenance.id))
                    .filter(AIProvenance.tool_name.like("veo%"))
                    .filter(billable_filter()))
 
-            if artist.strip() or title.strip():
-                since = _dt.now(_tz.utc) - timedelta(
-                    days=VEO_BUDGET_WINDOW_DAYS)
-                # Se materializa la lista en vez de usar una subquery: son un
-                # puñado de jobs por canción y el SQL queda trivial de leer.
-                # El filtro por fecha va sobre la PROVENANCE, no sobre el job:
-                # un job viejo puede seguir generando hoy (re-render de una
-                # canción de hace meses), y acotar sólo por `Job.created_at`
-                # lo dejaba fuera del presupuesto.
-                candidatos = db.query(Job.job_id, Job.artist, Job.song_title).all()
-                mio = _song_identity(artist, title)
+            mio = _song_identity(artist, title, job_id)
+            if not mio.startswith("__sin_metadata__|"):
+                # Sólo los jobs con actividad de Veo PAGA en la ventana pueden
+                # ser hermanos. Arrancar por ahí en vez de por la tabla `jobs`
+                # entera acota el escaneo a lo que puede sumar al tope.
+                con_gasto = [r[0] for r in
+                             db.query(AIProvenance.job_id)
+                               .filter(AIProvenance.tool_name.like("veo%"))
+                               .filter(billable_filter())
+                               .filter(AIProvenance.created_at >= since)
+                               .distinct().all()]
+                # El presupuesto es POR TENANT: sin este filtro, dos clientes
+                # que rinden la misma canción comparten un único techo de 10 y
+                # el primero en llegar le corta el render pago al segundo.
+                candidatos = (db.query(Job.job_id, Job.artist, Job.song_title)
+                                .filter(Job.job_id.in_(con_gasto or [job_id]))
+                                .filter(Job.tenant_id == tenant)
+                                .all())
                 hermanos = [
                     jid for jid, a, t in candidatos
-                    if _song_identity(a, t) == mio
+                    if _song_identity(a, t, jid) == mio
                 ]
                 # `or [job_id]` cubre el arranque: el job todavía puede no
                 # estar visible en su propia transacción.
                 q = q.filter(AIProvenance.job_id.in_(hermanos or [job_id]))
+                # El filtro por fecha va sobre la PROVENANCE, no sobre el job:
+                # un job viejo puede seguir generando hoy (re-render de una
+                # canción de hace meses), y acotar sólo por `Job.created_at`
+                # lo dejaba fuera del presupuesto.
                 q = q.filter(AIProvenance.created_at >= since)
-                alcance = f"canción {mio!r} ({len(hermanos)} jobs)"
+                alcance = f"canción {mio!r} ({len(hermanos)} jobs, tenant {tenant!r})"
             else:
+                # Sin metadata de canción (o con el placeholder `preview`) no
+                # hay identidad que compartir: cada job lleva su propio tope.
                 q = q.filter(AIProvenance.job_id == job_id)
                 alcance = f"job {job_id} (sin metadata de canción)"
 
@@ -9757,14 +9782,28 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         out_meta["cache_object_key"] = cache_object_key
         out_meta["policy_fingerprint"] = _policy_fingerprint
 
-    recorder = record_ai_call(
-        job_id=job_id or "unknown",
-        step="video_bg",
-        tool_name=model,
-        tool_provider="google_vertex",
-        prompt=safe_prompt,
-        input_data_types=["generated_prompt"],
-    ) if job_id else None
+    def _registrar_cache_only(summary: str, artifact: str | None = None):
+        """Registra una consulta `cache_only` DESPUÉS de saber su resultado.
+
+        A diferencia de una generación real, un lookup cache_only nunca toca
+        al proveedor: no hay plata en vuelo que trazar si el worker muere en
+        el medio, que es la razón por la que el recorder normal inserta la
+        fila por adelantado. Y esa fila adelantada sí hacía daño: mientras
+        está "en vuelo" (`response_summary` NULL) `billable_filter()` la
+        cuenta como paga, y en un regen multi-escena estas consultas corren
+        en paralelo con la única escena que sí paga — le comían el tope con
+        llamadas que nunca costaron nada.
+        """
+        if not job_id:
+            return
+        try:
+            record_ai_call(
+                job_id=job_id, step="video_bg", tool_name=model,
+                tool_provider="google_vertex", prompt=safe_prompt,
+                input_data_types=["generated_prompt"],
+            ).finish(response_summary=summary, output_artifact=artifact)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[BG] no pude registrar el lookup cache_only: %r", exc)
 
     # cache_only (multi-escena regen): SÓLO servir de caché, NUNCA generar
     # fresco. Garantiza que regenerar UNA escena no re-cobre las otras N: si su
@@ -9802,15 +9841,23 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                     # La key que REALMENTE sirvió el clip — así el GC y las
                     # próximas búsquedas apuntan al objeto vivo.
                     out_meta["cache_object_key"] = _ck
-                if recorder:
-                    recorder.finish(response_summary=f"cache_hit(cache_only,{_via}): {size_mb:.1f}MB key={_ck}",
-                                    output_artifact=output_path)
+                _registrar_cache_only(
+                    f"cache_hit(cache_only,{_via}): {size_mb:.1f}MB key={_ck}",
+                    output_path)
                 return output_path
-        if recorder:
-            recorder.finish(response_summary=f"cache_only_miss: keys={_candidates}")
+        _registrar_cache_only(f"cache_only_miss: keys={_candidates}")
         raise RuntimeError(
             f"[BG] cache_only: sin clip cacheado (probé {_candidates}) — no se genera "
             "para no re-cobrar Veo en una regeneración de escena")
+
+    recorder = record_ai_call(
+        job_id=job_id or "unknown",
+        step="video_bg",
+        tool_name=model,
+        tool_provider="google_vertex",
+        prompt=safe_prompt,
+        input_data_types=["generated_prompt"],
+    ) if job_id else None
 
     # Fresh provider output is intentionally not read from the shared raw
     # cache here. This function runs before content validation, so a normal

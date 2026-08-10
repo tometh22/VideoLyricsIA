@@ -7,11 +7,12 @@ of truth — update it when pricing changes.
 
 Cost accounting rules (2026-08 audit — see docs/COST_TRACKING.md):
 
-* **Cache hits are not billable.** `_generate_veo_video` opens the
-  provenance recorder *before* the R2 cache lookup, so a cache hit still
-  writes a full row (marked `cache_hit:` in `response_summary`). Counting
-  those rows at $0.80 inflated the dashboard by ~19% in jul-2026 (40 of
-  248 Veo rows). Every aggregate here filters them out.
+* **Cache hits are not billable.** `_generate_veo_video`'s `cache_only`
+  path records the R2 lookup either way (marked `cache_hit:` or
+  `cache_only_miss:` in `response_summary`), because knowing how often the
+  cache saves a generation is worth a row. Neither one contacts the
+  provider. Counting the hits at $0.80 inflated the dashboard by ~19% in
+  jul-2026 (40 of 248 Veo rows). Every aggregate here filters both out.
 * **The denominator is delivered videos, not jobs created.** Dividing
   spend by created jobs hid the fact that 59% of jul-2026 Veo spend went
   to discarded previews and rejected jobs. `cost_waste_breakdown()`
@@ -27,7 +28,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, not_, or_
+from sqlalchemy import and_, func, not_, or_
 from sqlalchemy.orm import Session
 
 from database import AIProvenance, Job, SessionLocal
@@ -135,6 +136,9 @@ def rates_for_window(db, since: datetime) -> dict[str, float]:
 # R2 cache served the clip. The recorder is opened before the cache lookup,
 # so the row exists but no provider call was made and nothing was billed.
 CACHE_HIT_PREFIX = "cache_hit"
+# Prefijo de `_registrar_cache_only` en pipeline.py: se buscó el clip en R2,
+# no estaba, y NO se generó. Cero dólares.
+CACHE_ONLY_MISS_PREFIX = "cache_only_miss"
 
 
 def billable_filter():
@@ -146,10 +150,22 @@ def billable_filter():
     would rather over-report cost than discover the gap on the invoice.
     `cost_dashboard_global` surfaces those two buckets separately so the
     uncertainty is visible instead of buried.
+
+    Also excludes `cache_only_miss`: the multi-scene regen path looks the
+    clip up in R2 and, when it is not there, deliberately does NOT generate
+    (that is the whole point of `cache_only` — regenerating one scene must
+    not re-bill the other N). Zero dollars leave the building, so counting
+    those rows inflated both the reported cost and the per-song Veo ceiling.
     """
-    return or_(
-        AIProvenance.response_summary.is_(None),
-        not_(AIProvenance.response_summary.like(f"{CACHE_HIT_PREFIX}%")),
+    return and_(
+        or_(
+            AIProvenance.response_summary.is_(None),
+            not_(AIProvenance.response_summary.like(f"{CACHE_HIT_PREFIX}%")),
+        ),
+        or_(
+            AIProvenance.response_summary.is_(None),
+            not_(AIProvenance.response_summary.like(f"{CACHE_ONLY_MISS_PREFIX}%")),
+        ),
     )
 
 
