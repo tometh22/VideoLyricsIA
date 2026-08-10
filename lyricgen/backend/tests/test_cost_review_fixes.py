@@ -441,6 +441,9 @@ def test_un_refresh_fallido_conserva_el_valor_anterior(client, admin_token, db,
         entry = r.json()["sources"][0]
         assert entry.get("kept_previous") is True
         assert entry.get("previous_amount_usd") == 41.0
+        assert r.json()["configured"] == ["github"]
+        assert r.json()["errored"] == []
+        assert r.json()["complete"] is True
 
         db.expire_all()
         row = (db.query(CostSnapshot)
@@ -525,6 +528,56 @@ def test_un_refresh_historico_ok_pero_vacio_no_pisa(client, admin_token, db,
         assert row.breakdown == [{"runs": 20}]
     finally:
         db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+        db.commit()
+
+
+def test_railway_vacio_tampoco_borra_snapshot_provisional(
+    client, admin_token, db, monkeypatch,
+):
+    import billing_sources
+    from database import CostSnapshot
+
+    period = "2020-08"
+    db.query(CostSnapshot).filter(
+        CostSnapshot.period == period,
+        CostSnapshot.source == "railway",
+    ).delete()
+    db.add(CostSnapshot(
+        period=period, source="railway", amount_usd=88.0, status="ok",
+        detail="captura intrames", breakdown=[{"usage": 88.0}],
+        fetched_at=datetime(2020, 8, 20, tzinfo=timezone.utc),
+    ))
+    db.commit()
+    monkeypatch.setattr(billing_sources, "fetch_all", lambda **kw: {
+        "period": period,
+        "sources": [{"source": "railway", "amount_usd": 0.0,
+                     "status": "ok", "detail": "sin usage devuelto",
+                     "is_estimate": False, "breakdown": []}],
+    })
+    try:
+        response = client.post(
+            f"/admin/cost/refresh?period={period}&only=railway",
+            headers=auth(admin_token),
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["total_usd"] == 88.0
+        assert body["configured"] == ["railway"]
+        assert body["errored"] == []
+        assert body["complete"] is True
+        assert body["sources"][0]["kept_previous"] is True
+        db.expire_all()
+        row = db.query(CostSnapshot).filter(
+            CostSnapshot.period == period,
+            CostSnapshot.source == "railway",
+        ).one()
+        assert row.amount_usd == 88.0
+        assert row.breakdown == [{"usage": 88.0}]
+    finally:
+        db.query(CostSnapshot).filter(
+            CostSnapshot.period == period,
+            CostSnapshot.source == "railway",
+        ).delete()
         db.commit()
 
 
