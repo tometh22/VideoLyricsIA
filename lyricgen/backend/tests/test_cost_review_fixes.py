@@ -590,3 +590,114 @@ def test_los_cache_hits_no_arrastran_la_historia_del_job(db):
         db.query(AIProvenance).filter(AIProvenance.job_id == "ch1").delete()
         db.query(Job).filter(Job.tenant_id == "hits-historicos").delete()
         db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 14. El denominador mensual usa finalización, no creación
+# ---------------------------------------------------------------------------
+
+def test_collect_jobs_asigna_la_entrega_al_mes_de_finalizacion(db):
+    """Un upload de junio terminado en julio pertenece al denominador de
+    julio. Si además se edita en agosto, su costo entra en agosto pero no se
+    vuelve a contar como otra entrega."""
+    import cost_attribution as ca
+    from database import AIProvenance, Job
+
+    db.query(Job).filter(Job.tenant_id == "delivery-month").delete()
+    created = datetime(2026, 6, 30, 23, tzinfo=timezone.utc)
+    completed = datetime(2026, 7, 2, 1, tzinfo=timezone.utc)
+    august_edit = datetime(2026, 8, 4, 12, tzinfo=timezone.utc)
+    db.add(Job(job_id="dm1", user_id=1, tenant_id="delivery-month",
+               artist="A", song_title="B", filename="a.mp3", status="done",
+               created_at=created, completed_at=completed))
+    db.flush()
+    db.add(AIProvenance(job_id="dm1", step="video_bg",
+                        tool_name="veo-3.1-fast-generate-001",
+                        tool_provider="google_vertex", prompt_sent="p",
+                        created_at=august_edit))
+    db.commit()
+
+    try:
+        assert "dm1" not in ca.collect_jobs(db, "test", period="2026-06")
+
+        july = ca.collect_jobs(db, "test", period="2026-07")
+        assert july["dm1"].delivered is True
+        assert july["dm1"].billable_calls == 0
+
+        august = ca.collect_jobs(db, "test", period="2026-08")
+        assert august["dm1"].billable_calls == 1
+        assert august["dm1"].delivered is False
+    finally:
+        db.query(AIProvenance).filter(AIProvenance.job_id == "dm1").delete()
+        db.query(Job).filter(Job.tenant_id == "delivery-month").delete()
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 15. Sólo las fuentes registradas pueden persistirse o leerse
+# ---------------------------------------------------------------------------
+
+def test_refresh_rechaza_fuentes_desconocidas(client, admin_token, db):
+    import billing_sources
+    from database import CostSnapshot
+
+    with pytest.raises(ValueError, match="fuentes desconocidas"):
+        billing_sources.fetch_all("2026-07", only=["gcpp"])
+
+    response = client.post(
+        "/admin/cost/refresh?period=2026-07&only=gcpp",
+        headers=auth(admin_token),
+    )
+    assert response.status_code == 400
+    assert not db.query(CostSnapshot).filter(
+        CostSnapshot.period == "2026-07", CostSnapshot.source == "gcpp"
+    ).count()
+
+
+def test_cost_real_ignora_snapshot_desconocido(client, admin_token, db):
+    import billing_sources
+    from database import CostSnapshot
+
+    period = "2098-11"
+    db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+    for source in billing_sources.SOURCES:
+        db.add(CostSnapshot(period=period, source=source, amount_usd=1.0,
+                            status="ok"))
+    db.add(CostSnapshot(period=period, source="gcpp", amount_usd=None,
+                        status="error", detail="legacy typo"))
+    db.commit()
+    try:
+        body = client.get(f"/admin/cost/real?period={period}",
+                          headers=auth(admin_token)).json()
+        assert body["complete"] is True
+        assert body["total_usd"] == pytest.approx(len(billing_sources.SOURCES))
+        assert "gcpp" not in body["errored"]
+        assert all(row["source"] != "gcpp" for row in body["sources"])
+    finally:
+        db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 16. El mes es [inicio, inicio del mes siguiente)
+# ---------------------------------------------------------------------------
+
+def test_unit_economics_incluye_el_ultimo_microsegundo(client, admin_token, db):
+    from database import Job
+
+    tenant = "last-microsecond"
+    db.query(Job).filter(Job.tenant_id == tenant).delete()
+    instant = datetime(2020, 6, 30, 23, 59, 59, 500000,
+                       tzinfo=timezone.utc)
+    db.add(Job(job_id="lm1", user_id=1, tenant_id=tenant, artist="A",
+               filename="a.mp3", status="done", created_at=instant,
+               completed_at=instant))
+    db.commit()
+    try:
+        body = client.get("/admin/cost/unit-economics?period=2020-06",
+                          headers=auth(admin_token)).json()
+        assert body["videos_delivered"] >= 1
+        assert body["videos_created"] >= 1
+    finally:
+        db.query(Job).filter(Job.tenant_id == tenant).delete()
+        db.commit()

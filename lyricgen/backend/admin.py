@@ -914,7 +914,7 @@ def admin_cost_real(          # `def`, no `async def`: con live=true hace HTTP
     rows = (
         db.query(CostSnapshot)
         .filter(CostSnapshot.period == period)
-        .filter(CostSnapshot.source != "rate_calibration")
+        .filter(CostSnapshot.source.in_(tuple(billing_sources.SOURCES)))
         .all()
     )
     if not rows:
@@ -989,7 +989,7 @@ async def admin_cost_unit_economics(
     # Igual que en /cost/real: `rate_calibration` no es una fuente de gasto.
     rows = (db.query(CostSnapshot)
               .filter(CostSnapshot.period == period)
-              .filter(CostSnapshot.source != "rate_calibration")
+              .filter(CostSnapshot.source.in_(tuple(billing_sources.SOURCES)))
               .all())
     real_total = sum(
         r.amount_usd for r in rows
@@ -999,7 +999,8 @@ async def admin_cost_unit_economics(
     cost_complete = have >= set(billing_sources.SOURCES)
 
     start_dt = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
-    end_dt = datetime(end.year, end.month, end.day, 23, 59, 59,
+    next_day = end + timedelta(days=1)
+    end_dt = datetime(next_day.year, next_day.month, next_day.day,
                       tzinfo=timezone.utc)
     # The invoice covers BOTH environments (shared GCP project, R2 bucket
     # and Railway project), so the denominator has to as well. Counting
@@ -1016,14 +1017,14 @@ async def admin_cost_unit_economics(
         entregado_en = func.coalesce(Job.completed_at, Job.created_at)
         delivered = int(
             session.query(func.count(Job.id))
-            .filter(entregado_en >= start_dt, entregado_en <= end_dt)
+            .filter(entregado_en >= start_dt, entregado_en < end_dt)
             .filter(Job.status.in_(("done", "pending_review")))
             .scalar() or 0
         )
         # Los CREADOS sí van por created_at — es literalmente eso lo que mide.
         created = int(
             session.query(func.count(Job.id))
-            .filter(Job.created_at >= start_dt, Job.created_at <= end_dt)
+            .filter(Job.created_at >= start_dt, Job.created_at < end_dt)
             .scalar() or 0
         )
         return delivered, created
@@ -1143,7 +1144,8 @@ async def admin_cost_reconcile(
 
     start_dt = datetime(start.year, start.month, start.day,
                         tzinfo=timezone.utc)
-    end_dt = datetime(end.year, end.month, end.day, 23, 59, 59,
+    next_day = end + timedelta(days=1)
+    end_dt = datetime(next_day.year, next_day.month, next_day.day,
                       tzinfo=timezone.utc)
 
     def _modeled(session):
@@ -1151,7 +1153,7 @@ async def admin_cost_reconcile(
             session.query(AIProvenance.tool_name, AIProvenance.tool_provider,
                           func.count(AIProvenance.id))
             .filter(AIProvenance.created_at >= start_dt,
-                    AIProvenance.created_at <= end_dt)
+                    AIProvenance.created_at < end_dt)
             .filter(billable_filter())
             .group_by(AIProvenance.tool_name, AIProvenance.tool_provider)
             .all()

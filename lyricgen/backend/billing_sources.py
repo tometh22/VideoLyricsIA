@@ -873,16 +873,17 @@ def fetch_all(period: str | None = None,
     _period_bounds(period)   # validate early, fail loudly on a bad period
 
     names = only or list(SOURCES)
+    unknown = sorted(set(names) - set(SOURCES))
+    if unknown:
+        raise ValueError(
+            "fuentes desconocidas: " + ", ".join(unknown)
+            + "; válidas: " + ", ".join(SOURCES)
+        )
     results: list[dict] = []
     total = 0.0
     ok, missing, errored = [], [], []
     for name in names:
-        fn = SOURCES.get(name)
-        if fn is None:
-            results.append(SourceCost(name, period, status="error",
-                                      detail="fuente desconocida").as_dict())
-            errored.append(name)
-            continue
+        fn = SOURCES[name]
         try:
             result = fn(period)
         except Exception as e:                       # defence in depth
