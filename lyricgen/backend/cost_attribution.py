@@ -340,8 +340,9 @@ def collect_song_keys(db) -> set[str]:
     make ordinary month-boundary spill look like data loss.
     """
     return {
-        song_key(artist, title)
-        for artist, title in db.query(Job.artist, Job.song_title).all()
+        song_key(artist, title, job_id)
+        for job_id, artist, title in
+        db.query(Job.job_id, Job.artist, Job.song_title).all()
     }
 
 
@@ -372,7 +373,7 @@ def collect_portal_songs(db_prod) -> dict:
     keys: dict[str, dict] = {}
     job_ids: set[str] = set()
     for job_id, artist, title, tenant, added_at, approved_at in rows:
-        k = song_key(artist, title)
+        k = song_key(artist, title, job_id)
         job_ids.add(job_id)
         entry = keys.setdefault(k, {
             "key": k, "artist": artist, "title": title,
