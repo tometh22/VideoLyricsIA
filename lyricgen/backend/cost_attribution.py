@@ -41,7 +41,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
 
 from database import AIProvenance, Job
 from provenance import (
@@ -140,10 +140,29 @@ class JobCost:
     billable_calls: int = 0
     cache_hits: int = 0
     by_tool: dict = field(default_factory=dict)
+    # Gasto por FUENTE DE FACTURA (gcp / openai / replicate). Es lo que
+    # permite prorratear cada factura directa con su propia proporción de uso
+    # en vez de con una mezcla: trabajo interno pesado en Replicate movía la
+    # proporción aplicada a la factura de GCP aunque el uso de GCP de UMG no
+    # hubiera cambiado, y el error salía reportado como costo de UMG.
+    by_source: dict = field(default_factory=dict)
 
     @property
     def delivered(self) -> bool:
         return self.status in DELIVERED_STATUSES
+
+
+def invoice_source_of(tool_provider: str | None) -> str:
+    """Fuente de factura de un proveedor de provenance.
+
+    Las tres directas se facturan por llamada, así que cada una tiene su
+    propia proporción de uso y hay que prorratearlas por separado.
+    """
+    return {
+        "google_vertex": "gcp",
+        "openai": "openai",
+        "replicate": "replicate",
+    }.get((tool_provider or "").lower(), "otros")
 
 
 def period_bounds(period: str) -> tuple[datetime, datetime]:
@@ -157,15 +176,29 @@ def period_bounds(period: str) -> tuple[datetime, datetime]:
     return start, end
 
 
-def collect_jobs(db, env: str, period: str | None = None) -> dict[str, JobCost]:
+def collect_jobs(db, env: str, period: str | None = None,
+                 rates: dict[str, float] | None = None) -> dict[str, JobCost]:
     """All jobs in one environment with their billable spend attached.
 
-    `period` filters BOTH `Job.created_at` and `AIProvenance.created_at`;
-    None takes the whole history. Bounding the provenance side matters: a job
-    created on 30-jun that re-rolls scenes into july would otherwise put
-    july's spend in june's bucket, and june is then compared against june's
-    invoice. The two sides have to cover the same window or the reconciliation
-    is meaningless.
+    `period` bounds `AIProvenance.created_at`; None takes the whole history.
+    Bounding the provenance side matters: a job created on 30-jun that
+    re-rolls scenes into july would otherwise put july's spend in june's
+    bucket, and june is then compared against june's invoice. The two sides
+    have to cover the same window or the reconciliation is meaningless.
+
+    The job side is a UNION, not a filter: jobs created in the period (they
+    are the delivery denominator, spend or no spend) **plus** any older job
+    that incurred spend inside it. Filtering jobs by `created_at` alone
+    dropped a june job whose background was re-generated through
+    `run_edit_pipeline` in july — the provider invoiced that call in july
+    while the report omitted it entirely, which is exactly the kind of
+    silent gap the reconciliation exists to catch.
+
+    `rates` are the invoice-derived per-call rates. They MUST be passed in
+    when reading more than one environment: the calibration snapshot lives
+    in whichever database `/cost/calibrate-rates` was run against, so a
+    peer session would silently fall back to list price and value identical
+    calls differently inside a single report.
 
     Returns a dict keyed by job_id so the caller can merge environments —
     job_ids are 12-char hex and collide across environments only by
@@ -177,7 +210,15 @@ def collect_jobs(db, env: str, period: str | None = None) -> dict[str, JobCost]:
     q = db.query(Job.job_id, Job.tenant_id, Job.status, Job.artist,
                  Job.song_title, Job.created_at)
     if bounds:
-        q = q.filter(Job.created_at >= bounds[0], Job.created_at < bounds[1])
+        con_gasto = [r[0] for r in
+                     db.query(AIProvenance.job_id)
+                       .filter(AIProvenance.created_at >= bounds[0],
+                               AIProvenance.created_at < bounds[1])
+                       .distinct().all()]
+        creado_en_periodo = and_(Job.created_at >= bounds[0],
+                                 Job.created_at < bounds[1])
+        q = (q.filter(or_(creado_en_periodo, Job.job_id.in_(con_gasto)))
+             if con_gasto else q.filter(creado_en_periodo))
 
     jobs: dict[str, JobCost] = {}
     for job_id, tenant_id, status, artist, title, created_at in q.all():
@@ -191,11 +232,15 @@ def collect_jobs(db, env: str, period: str | None = None) -> dict[str, JobCost]:
         return jobs
 
     # Tarifas derivadas de la factura del período. Sin esto el costo sale con
-    # precio de lista y se va ~25% arriba en Veo.
-    rates = {}
-    if period:
-        from rate_calibration import load_applied_rates
-        rates = load_applied_rates(db, period)
+    # precio de lista y se va ~25% arriba en Veo. El caller las pasa una sola
+    # vez para TODOS los entornos: la calibración vive en la base donde se
+    # corrió `/cost/calibrate-rates`, y leerla por sesión valuaba las mismas
+    # llamadas a precios distintos según el entorno.
+    if rates is None:
+        rates = {}
+        if period:
+            from rate_calibration import load_applied_rates
+            rates = load_applied_rates(db, period)
 
     # Billable spend per job/tool. Cache hits are counted separately (never
     # charged) so the panel can show how much the cache actually saved.
@@ -223,6 +268,8 @@ def collect_jobs(db, env: str, period: str | None = None) -> dict[str, JobCost]:
         job.cost += cost
         job.billable_calls += calls
         job.by_tool[tool_name] = job.by_tool.get(tool_name, 0.0) + cost
+        src = invoice_source_of(tool_provider)
+        job.by_source[src] = job.by_source.get(src, 0.0) + cost
 
     hit_rows = (
         db.query(AIProvenance.job_id, func.count(AIProvenance.id))
@@ -348,8 +395,16 @@ def build_attribution(jobs_by_env: dict[str, dict[str, JobCost]],
 
     # --- classify ------------------------------------------------------
     by_category: dict[str, dict] = {}
+    # Gasto medido por fuente de factura, para UMG y para el total. Cada
+    # factura directa se prorratea después con SU proporción, no con la mezcla.
+    umg_by_source: dict[str, float] = {}
+    total_by_source: dict[str, float] = {}
     for job in all_jobs:
         cat = classify_job(job, umg_keys)
+        for _src, _c in job.by_source.items():
+            total_by_source[_src] = total_by_source.get(_src, 0.0) + _c
+            if cat == CAT_UMG:
+                umg_by_source[_src] = umg_by_source.get(_src, 0.0) + _c
         agg = by_category.setdefault(cat, {
             "category": cat, "jobs": 0, "cost": 0.0,
             "billable_calls": 0, "cache_hits": 0,
@@ -478,6 +533,21 @@ def build_attribution(jobs_by_env: dict[str, dict[str, JobCost]],
                 round(sum(s["jobs"] for s in songs) / total_jobs, 4)
                 if total_jobs else None
             ),
+            # Proporción POR PROVEEDOR. Un solo share agregado repartía mal
+            # las facturas directas cuando UMG y el resto usan GCP, OpenAI y
+            # Replicate en proporciones distintas.
+            "umg_share_by_source": {
+                src: round(umg_by_source.get(src, 0.0) / tot, 4)
+                for src, tot in sorted(total_by_source.items()) if tot
+            },
+            "cost_by_source": {
+                src: round(tot, 4)
+                for src, tot in sorted(total_by_source.items())
+            },
+            "umg_cost_by_source": {
+                src: round(c, 4)
+                for src, c in sorted(umg_by_source.items())
+            },
         },
         "id_collisions": id_collisions,
     }
@@ -531,7 +601,26 @@ def add_total_cost(attribution: dict, invoices: dict[str, float],
     # as one whisper-only smoke test, a ~2.7x error on the largest line.
     # `basis` only governs the shared infrastructure, where no per-job
     # measurement exists.
-    umg_direct = direct_invoiced * share_by_cost
+    #
+    # And each direct invoice gets ITS OWN usage share, not the blended one.
+    # UMG and internal work use GCP, OpenAI and Replicate in very different
+    # proportions: Replicate-heavy internal work moved the share applied to
+    # the GCP invoice even when UMG's GCP usage had not changed, and the
+    # error surfaced as UMG cost and margin. Falls back to the blended share
+    # for a source with no measured usage (nothing better exists).
+    share_by_source = (attribution["business"].get("umg_share_by_source")
+                       or {})
+    umg_direct = 0.0
+    direct_detail: dict[str, float] = {}
+    for src, amount in invoices.items():
+        if src not in DIRECT_INVOICE_SOURCES:
+            continue
+        s = share_by_source.get(src)
+        if s is None:
+            s = share_by_cost
+        attributed = amount * s
+        direct_detail[src] = round(attributed, 2)
+        umg_direct += attributed
     umg_shared = shared_invoiced * shared_share
     umg_total = umg_direct + umg_shared
     songs = attribution["umg"]["songs"]
@@ -546,6 +635,9 @@ def add_total_cost(attribution: dict, invoices: dict[str, float],
         "invoiced_direct_sources": round(direct_invoiced, 2),
         "invoiced_shared_sources": round(shared_invoiced, 2),
         "umg_direct_cost": round(umg_direct, 2),
+        "umg_direct_cost_by_source": direct_detail,
+        "share_by_source": {k: round(v, 4) for k, v in
+                            sorted(share_by_source.items())},
         "umg_shared_cost": round(umg_shared, 2),
         "umg_total_cost": round(umg_total, 2),
         "songs": songs,
