@@ -271,13 +271,19 @@ def collect_jobs(db, env: str, period: str | None = None,
         src = invoice_source_of(tool_provider)
         job.by_source[src] = job.by_source.get(src, 0.0) + cost
 
-    hit_rows = (
+    # Acotada al período igual que la de gasto. Desde que los jobs viejos con
+    # gasto adentro entran al informe, dejar esta query sin acotar traía
+    # TODOS los cache hits históricos de ese job al mes reportado — la
+    # métrica de ahorro por caché acumulaba la vida entera del job.
+    hits_q = (
         db.query(AIProvenance.job_id, func.count(AIProvenance.id))
         .filter(AIProvenance.job_id.in_(list(jobs)))
         .filter(~billable_filter())
-        .group_by(AIProvenance.job_id)
-        .all()
     )
+    if bounds:
+        hits_q = hits_q.filter(AIProvenance.created_at >= bounds[0],
+                               AIProvenance.created_at < bounds[1])
+    hit_rows = hits_q.group_by(AIProvenance.job_id).all()
     for job_id, hits in hit_rows:
         if job_id in jobs:
             jobs[job_id].cache_hits = int(hits)

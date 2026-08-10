@@ -851,6 +851,22 @@ def admin_cost_refresh(
         if row is None:
             row = CostSnapshot(period=period, source=entry["source"])
             db.add(row)
+        # Un refresh fallido NO pisa un snapshot sano. Las fuentes son
+        # ventanas móviles: GitHub sólo puede consultar el ciclo vigente, así
+        # que re-refrescar julio en agosto devuelve su error deliberado y
+        # borraba el valor bueno capturado cuando julio ERA el mes actual —
+        # un dato que ya no se puede volver a pedir. El intento fallido se
+        # reporta igual (va en `result`, y queda en `detail`), pero el número
+        # sobrevive.
+        if (entry["status"] != "ok" and row.status == "ok"
+                and row.amount_usd is not None):
+            entry["kept_previous"] = True
+            entry["previous_amount_usd"] = row.amount_usd
+            row.detail = (
+                f"{row.detail or ''} | refresh {datetime.now(timezone.utc):%Y-%m-%d}: "
+                f"{entry['status']} ({entry['detail']}) — se conservó el valor anterior"
+            ).strip(" |")
+            continue
         row.amount_usd = entry["amount_usd"]
         row.status = entry["status"]
         row.detail = entry["detail"]
@@ -958,7 +974,11 @@ async def admin_cost_unit_economics(
     """
     import billing_sources
     from database import CostSnapshot
-    from provenance import cost_waste_breakdown, merge_waste_breakdowns
+    from provenance import (
+        cost_waste_breakdown,
+        merge_waste_breakdowns,
+        rates_for_window,
+    )
 
     period = period.strip() or billing_sources.current_period()
     try:
@@ -1013,7 +1033,13 @@ async def admin_cost_unit_economics(
     # la factura de junio.
     delivered, created = _count(db)
     counted_environments = 1
-    waste_parts = [cost_waste_breakdown(db, start=start_dt, end=end_dt)]
+    # Una sola base de valuación para los dos entornos: la calibración vive
+    # en la base local y la peer no la tiene, así que dejarla cargar la suya
+    # valuaba su mitad a precio de lista y el `waste_ratio` mezclado salía de
+    # dos tarifas distintas para el mismo Veo.
+    _waste_rates = rates_for_window(db, start_dt)
+    waste_parts = [cost_waste_breakdown(db, start=start_dt, end=end_dt,
+                                        rates=_waste_rates)]
     with scoped_peer_db() as peer:
         if peer is not None:
             d2, c2 = _count(peer)
@@ -1025,7 +1051,8 @@ async def admin_cost_unit_economics(
             # al lado de totales de dos entornos describía una porción del
             # negocio con cara de describirlo entero.
             waste_parts.append(
-                cost_waste_breakdown(peer, start=start_dt, end=end_dt))
+                cost_waste_breakdown(peer, start=start_dt, end=end_dt,
+                                     rates=_waste_rates))
     waste = merge_waste_breakdowns(*waste_parts)
 
     cost_per_delivered = round(real_total / delivered, 4) if delivered else None

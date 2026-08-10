@@ -404,3 +404,189 @@ def test_merge_de_uno_solo_devuelve_lo_mismo():
     uno = {"total_cost": 1.0, "by_destination": [], "environments": 1}
     assert merge_waste_breakdowns(uno) is uno
     assert merge_waste_breakdowns() == {}
+
+
+# ---------------------------------------------------------------------------
+# 10. Un refresh fallido no puede pisar un snapshot sano
+# ---------------------------------------------------------------------------
+
+def test_un_refresh_fallido_conserva_el_valor_anterior(client, admin_token, db,
+                                                       monkeypatch):
+    """Las fuentes son ventanas móviles: GitHub sólo puede consultar el ciclo
+    vigente. Re-refrescar julio en agosto devuelve su error deliberado y
+    borraba el valor bueno capturado cuando julio ERA el mes actual — un dato
+    que ya no se puede volver a pedir."""
+    import billing_sources
+    from database import CostSnapshot
+
+    db.query(CostSnapshot).filter(CostSnapshot.period == "2099-01").delete()
+    db.add(CostSnapshot(period="2099-01", source="github", amount_usd=41.0,
+                        status="ok", detail="capturado cuando era el mes actual",
+                        is_estimate=False, breakdown=[],
+                        fetched_at=datetime.now(timezone.utc)))
+    db.commit()
+
+    monkeypatch.setattr(billing_sources, "fetch_all", lambda **kw: {
+        "period": "2099-01",
+        "sources": [{"source": "github", "amount_usd": None, "status": "error",
+                     "detail": "sólo se puede consultar el ciclo vigente",
+                     "is_estimate": False, "breakdown": []}],
+    })
+
+    try:
+        r = client.post("/admin/cost/refresh?period=2099-01&only=github",
+                        headers=auth(admin_token))
+        assert r.status_code == 200
+        entry = r.json()["sources"][0]
+        assert entry.get("kept_previous") is True
+        assert entry.get("previous_amount_usd") == 41.0
+
+        db.expire_all()
+        row = (db.query(CostSnapshot)
+                 .filter(CostSnapshot.period == "2099-01",
+                         CostSnapshot.source == "github").one())
+        assert row.amount_usd == 41.0, "el refresh fallido borró el dato bueno"
+        assert row.status == "ok"
+        assert "se conservó el valor anterior" in (row.detail or "")
+    finally:
+        db.query(CostSnapshot).filter(CostSnapshot.period == "2099-01").delete()
+        db.commit()
+
+
+def test_un_refresh_ok_si_pisa(client, admin_token, db, monkeypatch):
+    """Contraprueba: conservar el valor viejo no puede convertirse en no
+    actualizar nunca."""
+    import billing_sources
+    from database import CostSnapshot
+
+    db.query(CostSnapshot).filter(CostSnapshot.period == "2099-02").delete()
+    db.add(CostSnapshot(period="2099-02", source="github", amount_usd=41.0,
+                        status="ok", detail="viejo", is_estimate=False,
+                        breakdown=[], fetched_at=datetime.now(timezone.utc)))
+    db.commit()
+
+    monkeypatch.setattr(billing_sources, "fetch_all", lambda **kw: {
+        "period": "2099-02",
+        "sources": [{"source": "github", "amount_usd": 44.0, "status": "ok",
+                     "detail": "nuevo", "is_estimate": False, "breakdown": []}],
+    })
+    try:
+        client.post("/admin/cost/refresh?period=2099-02&only=github",
+                    headers=auth(admin_token))
+        db.expire_all()
+        row = (db.query(CostSnapshot)
+                 .filter(CostSnapshot.period == "2099-02",
+                         CostSnapshot.source == "github").one())
+        assert row.amount_usd == 44.0
+    finally:
+        db.query(CostSnapshot).filter(CostSnapshot.period == "2099-02").delete()
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 11. El export de facturación es de la CUENTA, no del proyecto
+# ---------------------------------------------------------------------------
+
+def test_el_query_de_bigquery_se_acota_a_los_proyectos_configurados(monkeypatch):
+    """La tabla de export cubre la cuenta de facturación entera. Si esa cuenta
+    tiene otros proyectos, su gasto infla /cost/real, entra en la calibración
+    y termina atribuido a clientes de GenLy."""
+    import billing_sources
+
+    consultas = []
+
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self):
+            return {"jobComplete": True, "totalRows": "1", "rows": [
+                {"f": [{"v": "Vertex AI"}, {"v": "Veo"}, {"v": "10"},
+                       {"v": "0"}]}]}
+
+    def _post(url, **kw):
+        consultas.append(kw["json"]["query"])
+        return _Resp()
+
+    monkeypatch.setenv("GCP_BILLING_BQ_PROJECT", "proj")
+    monkeypatch.setenv("GCP_BILLING_BQ_DATASET", "ds")
+    monkeypatch.setenv("GCP_BILLING_BQ_TABLE", "tbl")
+    monkeypatch.setattr(billing_sources, "_gcp_credentials", lambda: "tok")
+    monkeypatch.setattr(billing_sources.requests, "post", _post)
+
+    monkeypatch.setenv("GCP_BILLING_PROJECT_IDS", "genly-prod,genly-staging")
+    out = billing_sources.fetch_gcp("2026-07")
+    assert "project.id IN ('genly-prod', 'genly-staging')" in consultas[-1]
+    assert out.raw["project_scope"] == ["genly-prod", "genly-staging"]
+
+    # Sin configurar NO filtra (filtrar por el proyecto del dataset daría $0
+    # si el export vive aparte, que es peor que sobrecontar) pero lo DECLARA.
+    monkeypatch.delenv("GCP_BILLING_PROJECT_IDS", raising=False)
+    out2 = billing_sources.fetch_gcp("2026-07")
+    assert "project.id IN" not in consultas[-1]
+    assert out2.raw["project_scope"] == "billing_account"
+    assert "cuenta de facturación" in (out2.detail or "")
+
+
+# ---------------------------------------------------------------------------
+# 12. Una sola base de valuación para el desperdicio de los dos entornos
+# ---------------------------------------------------------------------------
+
+def test_el_waste_usa_las_tarifas_que_le_pasan(db, monkeypatch):
+    """Si la peer carga su propia calibración (que no tiene), su mitad sale a
+    precio de lista y el waste_ratio mezclado sale de dos tarifas para el
+    mismo Veo."""
+    from provenance import cost_waste_breakdown
+
+    leidas = []
+    monkeypatch.setattr("provenance.rates_for_window",
+                        lambda d, s: leidas.append(s) or {})
+    cost_waste_breakdown(
+        db,
+        start=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        rates={"veo": 0.62},
+    )
+    assert leidas == [], "con `rates` explícitas no puede leer la suya"
+
+
+# ---------------------------------------------------------------------------
+# 13. Los cache hits también se acotan al período
+# ---------------------------------------------------------------------------
+
+def test_los_cache_hits_no_arrastran_la_historia_del_job(db):
+    """Desde que un job viejo con gasto adentro entra al informe, contar sus
+    cache hits sin acotar traía la vida entera del job al mes reportado."""
+    import cost_attribution as ca
+    from database import AIProvenance, Job
+
+    db.query(Job).filter(Job.tenant_id == "hits-historicos").delete()
+    junio = datetime(2026, 6, 10, tzinfo=timezone.utc)
+    julio = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    db.add(Job(job_id="ch1", user_id=1, tenant_id="hits-historicos",
+               artist="A", song_title="B", filename="a.mp3",
+               status="done", created_at=junio))
+    db.flush()
+    # 2 cache hits en junio, 1 en julio, y una llamada paga en julio (que es
+    # lo que hace entrar el job al informe de julio).
+    for cuando, n in ((junio, 2), (julio, 1)):
+        for _ in range(n):
+            db.add(AIProvenance(job_id="ch1", step="video_bg",
+                                tool_name="veo-3.1-fast-generate-001",
+                                tool_provider="google_vertex", prompt_sent="p",
+                                response_summary="cache_hit: 1MB",
+                                created_at=cuando))
+    db.add(AIProvenance(job_id="ch1", step="video_bg",
+                        tool_name="veo-3.1-fast-generate-001",
+                        tool_provider="google_vertex", prompt_sent="p",
+                        created_at=julio))
+    db.commit()
+
+    try:
+        jobs = ca.collect_jobs(db, "test", period="2026-07")
+        assert jobs["ch1"].cache_hits == 1, (
+            "los cache hits de junio no son ahorro de julio")
+        assert ca.collect_jobs(db, "test", period="2026-06")["ch1"].cache_hits == 2
+    finally:
+        db.query(AIProvenance).filter(AIProvenance.job_id == "ch1").delete()
+        db.query(Job).filter(Job.tenant_id == "hits-historicos").delete()
+        db.commit()
