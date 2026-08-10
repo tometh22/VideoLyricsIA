@@ -292,6 +292,21 @@ def test_los_rechazos_confirmados_liberan_la_reserva():
     assert "rate limited {rate_limit_hits} times" in source
 
 
+def test_el_rechazo_legacy_confirmado_no_cuenta_como_gasto():
+    """La implementación vieja dejó otro resumen después de cinco HTTP 429.
+    Es un rechazo pre-operación confirmado, no un error ambiguo."""
+    from provenance import (
+        LEGACY_CONFIRMED_RATE_LIMIT_PREFIX,
+        billable_filter,
+    )
+
+    sql = str(billable_filter().compile(
+        compile_kwargs={"literal_binds": True}))
+    assert LEGACY_CONFIRMED_RATE_LIMIT_PREFIX in sql
+    assert LEGACY_CONFIRMED_RATE_LIMIT_PREFIX == (
+        "error: rate_limited_after_5_retries")
+
+
 def test_una_respuesta_ambigua_no_duplica_el_post():
     """Tras un timeout de post Vertex puede haber aceptado el render. Se cuenta
     una reserva conservadora y se corta: reintentar bajo la misma fila podría
@@ -618,6 +633,73 @@ def test_muestras_crean_identidades_persistentes_para_presupuesto(db, monkeypatc
             db.query(Job).filter(Job.job_id.in_(ids)).delete()
         db.query(User).filter(User.id == owner.id).delete()
         db.commit()
+
+
+def test_generadores_pagos_de_scripts_declaran_una_identidad_persistente():
+    """Ningún one-off puede volver a llamar Vertex sin pasar ``job_id``."""
+    import ast
+    from pathlib import Path
+
+    scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+    missing = []
+    for path in scripts_dir.rglob("*.py"):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = (
+                func.attr if isinstance(func, ast.Attribute)
+                else func.id if isinstance(func, ast.Name)
+                else ""
+            )
+            if name not in {"_generate_veo_video", "_generate_imagen_image"}:
+                continue
+            if not any(kw.arg == "job_id" for kw in node.keywords):
+                missing.append(f"{path.relative_to(scripts_dir)}:{node.lineno}")
+            if name == "_generate_veo_video" and not any(
+                kw.arg == "require_persistent_tracking"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+                for kw in node.keywords
+            ):
+                missing.append(
+                    f"{path.relative_to(scripts_dir)}:{node.lineno} "
+                    "(tracking is not fail-closed)"
+                )
+    assert missing == [], f"provider calls without job_id: {missing}"
+
+
+def test_veo_fresco_sin_job_id_falla_antes_del_proveedor(monkeypatch):
+    import pipeline
+
+    provider_touched = []
+    monkeypatch.setattr(
+        pipeline, "_veo_access_token",
+        lambda: provider_touched.append(True) or "token")
+    with pytest.raises(RuntimeError, match="persistent job_id"):
+        pipeline._generate_veo_video(
+            "prompt", "/tmp/untracked-veo.mp4", job_id=None)
+    assert provider_touched == []
+
+
+def test_veo_fresco_rechaza_un_job_id_sin_fila_persistente(monkeypatch):
+    import pipeline
+
+    provider_touched = []
+    recorder = type("Recorder", (), {"_row_id": None})()
+    monkeypatch.setattr(
+        provenance, "record_ai_call", lambda **kwargs: recorder)
+    monkeypatch.setattr(
+        pipeline, "_veo_access_token",
+        lambda: provider_touched.append(True) or "token")
+    monkeypatch.setattr(pipeline, "_last_veo_request", 0)
+
+    with pytest.raises(RuntimeError, match="persistent tracking Job"):
+        pipeline._generate_veo_video(
+            "prompt", "/tmp/untracked-veo.mp4", job_id="not-a-realjob",
+            require_persistent_tracking=True)
+    assert provider_touched == []
 
 
 def test_la_fila_de_tope_no_borrada_no_cuenta_como_gasto():

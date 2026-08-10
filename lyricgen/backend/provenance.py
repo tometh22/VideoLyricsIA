@@ -162,6 +162,11 @@ BUDGET_RELEASED_PREFIX = "budget_released"
 # released. This state is intentionally billable: a worker crash after
 # admission may still correspond to an upstream call.
 BUDGET_RESERVED_PREFIX = "budget_reserved"
+# Exact summary written by the legacy Veo retry loop after five explicit 429
+# responses. Vertex rejected every attempt before creating an operation, so
+# these historical rows are confirmed zero-cost (unlike generic ``error:``
+# rows, which remain conservatively billable).
+LEGACY_CONFIRMED_RATE_LIMIT_PREFIX = "error: rate_limited_after_5_retries"
 
 # Prefijos de `response_summary` que significan "esta fila existe para el
 # registro de auditoría, pero no salió plata". Toda la contabilidad los filtra.
@@ -171,6 +176,7 @@ NON_BILLABLE_PREFIXES = (
     BUDGET_EXCEEDED_PREFIX,
     BUDGET_PENDING_PREFIX,
     BUDGET_RELEASED_PREFIX,
+    LEGACY_CONFIRMED_RATE_LIMIT_PREFIX,
 )
 
 

@@ -33,6 +33,7 @@ from common import (  # noqa: E402
     load_job, audio_duration, ensure_out_dir,
     compose_with_lyrics, trim_or_pad_to_duration,
 )
+from internal_tracking import ensure_internal_tracking_job  # noqa: E402
 
 
 def build_baseline_background(audio_path: str, artist: str, song_title: str,
@@ -61,11 +62,13 @@ def build_baseline_background(audio_path: str, artist: str, song_title: str,
     else:
         lyrics_text = "\n".join(s.get("text", "") for s in segments[:20])
         print(f"  [opt-c] analyzing lyrics for Veo prompt...")
+        tracking_job_id = ensure_internal_tracking_job(
+            "loop-exp-c", style="experiment")
         analysis = _analyze_lyrics_for_background(
             lyrics_text=lyrics_text,
             artist=artist,
             song_title=song_title,
-            job_id="loop_exp_c",
+            job_id=tracking_job_id,
             for_provider="veo",
             match_lyrics=True,
         )
@@ -78,8 +81,9 @@ def build_baseline_background(audio_path: str, artist: str, song_title: str,
         _generate_veo_video(
             prompt=prompt,
             output_path=veo_clip_path,
-            job_id="loop_exp_c",
+            job_id=tracking_job_id,
             cache_namespace=f"{artist}|{song_title}|opt-c",
+            require_persistent_tracking=True,
         )
         print(f"  [opt-c] Veo done in {time.time() - t0:.0f}s")
 

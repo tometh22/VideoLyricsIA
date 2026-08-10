@@ -18,7 +18,6 @@ import os
 import shutil
 import subprocess
 import sys
-import hashlib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -26,7 +25,11 @@ from credentials_bootstrap import bootstrap_vertex_credentials
 bootstrap_vertex_credentials()
 
 from pipeline import _generate_veo_video
-from database import Job, SessionLocal, User
+from internal_tracking import (
+    INTERNAL_TRACKING_TENANT,
+    ensure_internal_tracking_job,
+    internal_tracking_job_id,
+)
 
 
 # Hand-picked prompts that demonstrate each style cleanly. Each is short,
@@ -77,12 +80,12 @@ OUT_DIR = os.path.join(
 )
 os.makedirs(OUT_DIR, exist_ok=True)
 
-_TRACKING_TENANT = "__internal_samples__"
+_TRACKING_TENANT = INTERNAL_TRACKING_TENANT
 
 
 def _tracking_job_id(style: str) -> str:
     """Stable, FK-valid 12-char identity used by provenance and the cap."""
-    return hashlib.sha256(f"movement-sample:{style}".encode()).hexdigest()[:12]
+    return internal_tracking_job_id(f"movement-sample:{style}")
 
 
 def _ensure_tracking_job(style: str, db=None) -> str:
@@ -93,59 +96,8 @@ def _ensure_tracking_job(style: str, db=None) -> str:
     A stable internal job per style makes both attribution and the rolling Veo
     ceiling durable across script runs.
     """
-    owns_session = db is None
-    if db is None:
-        db = SessionLocal()
-    job_id = _tracking_job_id(style)
-    try:
-        existing = db.query(Job).filter(Job.job_id == job_id).one_or_none()
-        if existing is not None:
-            if existing.tenant_id != _TRACKING_TENANT:
-                raise RuntimeError(
-                    f"tracking job collision for {job_id}: tenant={existing.tenant_id!r}"
-                )
-            return job_id
-
-        configured_owner = os.environ.get("MOVEMENT_SAMPLES_USER_ID", "").strip()
-        owner = None
-        if configured_owner:
-            try:
-                owner = db.query(User).filter(User.id == int(configured_owner)).one_or_none()
-            except ValueError as exc:
-                raise RuntimeError("MOVEMENT_SAMPLES_USER_ID must be an integer") from exc
-        else:
-            owner = (
-                db.query(User)
-                .filter(User.role == "admin")
-                .order_by(User.id)
-                .first()
-            )
-        if owner is None:
-            raise RuntimeError(
-                "No valid owner for sample tracking; set MOVEMENT_SAMPLES_USER_ID "
-                "to an existing user"
-            )
-
-        db.add(Job(
-            job_id=job_id,
-            user_id=owner.id,
-            tenant_id=_TRACKING_TENANT,
-            artist="",
-            song_title="",
-            style=style,
-            filename=f"movement-sample-{style}.mp4",
-            status="internal_sample",
-            current_step="sample",
-            progress=100,
-        ))
-        db.commit()
-        return job_id
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        if owns_session:
-            db.close()
+    return ensure_internal_tracking_job(
+        f"movement-sample:{style}", db=db, style=style)
 
 
 def _post_process(raw_path: str, final_path: str) -> bool:
@@ -182,7 +134,8 @@ def main():
             t0 = _time.time()
             _generate_veo_video(prompt, raw, job_id=tracking_job_id,
                                 cache_namespace=f"sample|{style}",
-                                movement_style=style)
+                                movement_style=style,
+                                require_persistent_tracking=True)
             elapsed = _time.time() - t0
             print(f"  Veo OK in {elapsed:.1f} s; raw={os.path.getsize(raw)/1e6:.1f} MB")
             if _post_process(raw, final):

@@ -45,14 +45,13 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import storage
+from internal_tracking import ensure_internal_tracking_job
 from pipeline import _generate_imagen_image, _generate_veo_video
 
-# DB import is optional — when DATABASE_URL is unreachable from the runner
-# (e.g. Railway's private hostname from a developer Mac without the public
-# TCP proxy enabled), we run in "no-db" mode: still upload to R2, write
-# metadata to a local JSON file, and emit a SQL file the user can paste
-# into `railway connect Postgres` to register the rows. Generation itself
-# is the expensive step — we never lose a paid generation to a DB blip.
+# Keep import failure handling so the CLI can print a useful diagnostic, but a
+# live DB is now mandatory: every paid generation needs a persistent internal
+# Job before it may reach Vertex. Per-row JSON checkpoints still protect
+# completed assets from later metadata-write failures.
 try:
     from database import SessionLocal, BackgroundAsset
     _DB_IMPORTABLE = True
@@ -377,7 +376,9 @@ def main() -> int:
     SessionFactory = _try_open_db_factory()
     no_db = SessionFactory is None
     if no_db:
-        print("[MODE] no-db: will upload to R2 + write JSON + SQL for manual import")
+        print("ERROR: database unavailable; refusing paid generation without "
+              "persistent provenance tracking")
+        return 1
 
     json_records: list[dict] = []
     json_out_path = "/tmp/library_umg_assets.json"
@@ -429,19 +430,25 @@ def main() -> int:
             print(f"\n[GEN] {label}")
             print(f"      prompt: {prompt[:100]}…")
             try:
+                tracking_job_id = ensure_internal_tracking_job(
+                    f"library-umg:{expected_name}", style=asset_type)
                 if asset_type == "image":
-                    _generate_imagen_image(prompt, tmp_path, model=IMAGEN_MODEL)
+                    _generate_imagen_image(
+                        prompt, tmp_path, job_id=tracking_job_id,
+                        model=IMAGEN_MODEL)
                 elif asset_type == "video_cinematic":
                     _generate_veo_video(
-                        prompt, tmp_path,
+                        prompt, tmp_path, job_id=tracking_job_id,
                         cache_namespace="library_umg",
                         movement_style="",
+                        require_persistent_tracking=True,
                     )
                 elif asset_type == "video_simple":
                     _generate_veo_video(
-                        prompt, tmp_path,
+                        prompt, tmp_path, job_id=tracking_job_id,
                         cache_namespace="library_umg",
                         movement_style="animado",
+                        require_persistent_tracking=True,
                     )
                 else:
                     raise ValueError(f"Unknown asset_type {asset_type!r}")

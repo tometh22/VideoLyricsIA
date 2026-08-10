@@ -37,6 +37,7 @@ from common import (  # noqa: E402
     load_job, audio_duration, ensure_out_dir,
     compose_with_lyrics, ffmpeg_xfade_chain, trim_or_pad_to_duration,
 )
+from internal_tracking import ensure_internal_tracking_job  # noqa: E402
 
 XFADE_DUR = 1.5
 
@@ -118,18 +119,22 @@ def build_hybrid_background(audio_path: str, artist: str, song_title: str,
     img_path = str(out_dir / "d_imagen_verse.jpg")
     if not (Path(img_path).exists() and Path(img_path).stat().st_size > 10_000):
         print(f"  [opt-d] analyzing verse lyrics for Imagen prompt...")
+        verse_tracking_job_id = ensure_internal_tracking_job(
+            "loop-exp-d:verse", style="experiment")
         analysis = _analyze_lyrics_for_background(
             lyrics_text=verse_text or "atmospheric introspective",
             artist=artist,
             song_title=song_title,
-            job_id="loop_exp_d_verse",
+            job_id=verse_tracking_job_id,
             for_provider="imagen",
             match_lyrics=True,
         )
         prompt = analysis.get("prompt") or f"{artist} {song_title} verse, intimate"
         print(f"  [opt-d] verse Imagen prompt: {prompt[:160]}...")
         t0 = time.time()
-        _generate_imagen_image(prompt=prompt, output_path=img_path, job_id="loop_exp_d_verse")
+        _generate_imagen_image(
+            prompt=prompt, output_path=img_path,
+            job_id=verse_tracking_job_id)
         print(f"  [opt-d] Imagen done in {time.time() - t0:.0f}s")
     else:
         print(f"  [opt-d] reusing cached verse Imagen still")
@@ -158,11 +163,13 @@ def build_hybrid_background(audio_path: str, artist: str, song_title: str,
             segments[i].get("text", "") for i in range(chorus[0], chorus[1] + 1)
         )
         print(f"  [opt-d] analyzing chorus lyrics for Veo prompt...")
+        chorus_tracking_job_id = ensure_internal_tracking_job(
+            "loop-exp-d:chorus", style="experiment")
         analysis = _analyze_lyrics_for_background(
             lyrics_text=chorus_text,
             artist=artist,
             song_title=song_title,
-            job_id="loop_exp_d_chorus",
+            job_id=chorus_tracking_job_id,
             for_provider="veo",
             match_lyrics=True,
         )
@@ -172,8 +179,9 @@ def build_hybrid_background(audio_path: str, artist: str, song_title: str,
         _generate_veo_video(
             prompt=prompt,
             output_path=veo_path,
-            job_id="loop_exp_d_chorus",
+            job_id=chorus_tracking_job_id,
             cache_namespace=f"{artist}|{song_title}|opt-d-chorus",
+            require_persistent_tracking=True,
         )
         print(f"  [opt-d] Veo done in {time.time() - t0:.0f}s")
     else:

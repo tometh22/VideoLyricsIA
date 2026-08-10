@@ -9600,7 +9600,8 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         cache_only: bool = False,
                         cache_key_override: str | None = None,
                         cache_override_policy_fingerprint: str | None = None,
-                        out_meta: dict | None = None) -> str:
+                        out_meta: dict | None = None,
+                        require_persistent_tracking: bool = False) -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
     We bypass google-genai SDK for Veo specifically because its internal auth
@@ -9628,6 +9629,11 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     `live_photo`: preserves an image-to-video seed and animates exactly one
     semantic region. It explicitly rejects generic atmospheric filler unless
     the source/operator already asks for it.
+
+    `require_persistent_tracking`: operator-run generators set this so a
+    failed provenance reservation aborts before Vertex. Production renders
+    retain the existing fail-open behavior for transient audit-DB outages,
+    while every fresh call still requires a non-empty job_id.
     """
     from provenance import record_ai_call
     import storage as _storage
@@ -10015,6 +10021,12 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             f"[BG] cache_only: sin clip cacheado (probé {_candidates}) — no se genera "
             "para no re-cobrar Veo en una regeneración de escena")
 
+    if not job_id:
+        raise RuntimeError(
+            "Paid Veo generation requires a persistent job_id; refusing an "
+            "untracked provider submission"
+        )
+
     # Fresh provider output is intentionally not read from the shared raw
     # cache here. This function runs before content validation, so a normal
     # hit could reuse a hallucinated person. ``cache_only`` above is retained
@@ -10094,7 +10106,12 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         prompt=safe_prompt,
         input_data_types=["generated_prompt"],
         initial_response_summary=BUDGET_PENDING_PREFIX,
-    ) if job_id else None
+    )
+    if require_persistent_tracking and recorder._row_id is None:
+        raise RuntimeError(
+            f"Paid Veo generation requires a persistent tracking Job; "
+            f"provenance reservation failed for job_id={job_id!r}"
+        )
 
     # Reserva y chequeo atómicos en el último punto seguro antes del POST. A
     # partir de `_req.post` un timeout es ambiguo (Vertex puede haber aceptado

@@ -34,6 +34,7 @@ from common import (  # noqa: E402
     load_job, audio_duration, ensure_out_dir,
     compose_with_lyrics, ffmpeg_xfade_chain, trim_or_pad_to_duration,
 )
+from internal_tracking import ensure_internal_tracking_job  # noqa: E402
 
 N_SCENES = 4
 KB_SUB_DURATION = 60.0  # Each scene shows for ~60s before crossfade
@@ -88,11 +89,13 @@ def build_variety_background(audio_path: str, artist: str, song_title: str,
             continue
 
         print(f"  [opt-a] analyzing act {i+1}/{N_SCENES} for Imagen prompt...")
+        tracking_job_id = ensure_internal_tracking_job(
+            f"loop-exp-a:act:{i}", style="experiment")
         analysis = _analyze_lyrics_for_background(
             lyrics_text=act_text,
             artist=artist,
             song_title=song_title,
-            job_id=f"loop_exp_a_act{i}",
+            job_id=tracking_job_id,
             for_provider="imagen",
             match_lyrics=True,
         )
@@ -103,7 +106,7 @@ def build_variety_background(audio_path: str, artist: str, song_title: str,
         _generate_imagen_image(
             prompt=prompt,
             output_path=img_path,
-            job_id=f"loop_exp_a_act{i}",
+            job_id=tracking_job_id,
         )
         print(f"  [opt-a] Imagen act {i+1} done in {time.time() - t0:.0f}s")
         img_paths.append(img_path)
