@@ -116,6 +116,7 @@ from pipeline import run_pipeline, transcribe, _normalize_movement_style
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
 from transcription_language import resolve_transcription_language
+from provenance import job_was_delivered
 from batch_profiles import (
     RenderProfileError, normalize_render_profile, pipeline_fields,
 )
@@ -12195,12 +12196,13 @@ async def request_edit(
 
     _pre_edit_status = job.status
     _pre_edit_completed_at = job.completed_at
-    # A rejected/error job has a terminal timestamp, but it has never been a
-    # delivery. Clear that failed-attempt timestamp when the operator rescues
-    # it so the next done/pending_review transition stamps the real delivery
-    # month. Preserve it for already delivered jobs: an edit is not a second
-    # song in the denominator.
-    if job.status not in ("done", "pending_review"):
+    # A rejected/error job can still represent a retained historical delivery
+    # when it was reopened after shipping. Clear only failed-attempt timestamps;
+    # an edit of a previously delivered song must not move the denominator to
+    # the new edit month.
+    if not job_was_delivered(
+        job.status, job.completed_at, job.editing_started_at,
+    ):
         job.completed_at = None
 
     # Flip to editing immediately so the UI can show progress.
@@ -12443,10 +12445,12 @@ async def regenerate_scene(
     _pre_regen_editing_started_at = job.editing_started_at
     _pre_regen_progress = job.progress
     _pre_regen_current_step = job.current_step
-    # A rejection timestamp is not a delivery timestamp. Clear it before a
-    # rescue so the eventual done/pending_review transition is stamped in the
-    # real delivery month; already delivered jobs retain their completion.
-    if job.status not in ("done", "pending_review"):
+    # A rejection timestamp is not necessarily a failed-attempt timestamp: a
+    # rejected job may have been delivered before it was reopened. Keep that
+    # historical completion and clear only jobs that were never delivered.
+    if not job_was_delivered(
+        job.status, job.completed_at, job.editing_started_at,
+    ):
         job.completed_at = None
     job.status = "editing"
     job.current_step = "scenes"
