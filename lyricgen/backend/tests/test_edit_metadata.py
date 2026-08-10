@@ -136,6 +136,37 @@ def test_edit_rejected_clears_failed_completion_timestamp(
     assert completed_at > rejected_at
 
 
+def test_edit_rejected_preserves_retained_delivery_timestamp(
+    client, admin_token, db, monkeypatch,
+):
+    """A rejection after an earlier delivery remains attributed to that month."""
+    _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    delivered_at = datetime(2026, 6, 28, tzinfo=timezone.utc)
+    reopened_at = datetime(2026, 6, 29, tzinfo=timezone.utc)
+    job_id = _create_pending_review_job(
+        db,
+        tenant_id,
+        user_id,
+        status="rejected",
+        completed_at=delivered_at,
+        editing_started_at=reopened_at,
+    )
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "metadata", "song_title": "Título corregido"},
+    )
+    assert res.status_code == 200, res.text
+    db.expire_all()
+    row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
+    completed_at = row.completed_at
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.replace(tzinfo=timezone.utc)
+    assert completed_at == delivered_at
+
+
 def test_enqueue_fallido_restaura_estado_y_timestamp_del_rechazo(
     client, admin_token, db, monkeypatch,
 ):

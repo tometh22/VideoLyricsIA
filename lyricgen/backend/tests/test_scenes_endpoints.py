@@ -270,6 +270,38 @@ def test_regen_scene_rejected_restores_timestamp_if_enqueue_fails(
     assert editing_started_at == previous_edit
 
 
+def test_regen_scene_rejected_preserves_retained_delivery(
+    client, admin_token, db, monkeypatch,
+):
+    from database import Job as JobModel
+    import main
+
+    monkeypatch.setattr(main, "enqueue_edit", lambda **k: "edit:fake")
+    me = client.get("/auth/me", headers=_hdr(admin_token)).json()
+    delivered_at = datetime(2026, 6, 28, tzinfo=timezone.utc)
+    reopened_at = datetime(2026, 6, 29, tzinfo=timezone.utc)
+    jid = _make_scene_job(
+        db,
+        me["tenant_id"],
+        status="rejected",
+        completed_at=delivered_at,
+        editing_started_at=reopened_at,
+    )
+
+    response = client.post(
+        f"/jobs/{jid}/scenes/coro_1/regenerate",
+        headers=_hdr(admin_token),
+        json={},
+    )
+    assert response.status_code == 200, response.text
+    db.expire_all()
+    row = db.query(JobModel).filter(JobModel.job_id == jid).one()
+    completed_at = row.completed_at
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.replace(tzinfo=timezone.utc)
+    assert completed_at == delivered_at
+
+
 def test_scenes_thumbs_ownership_and_shape(client, admin_token, db):
     me = client.get("/auth/me", headers=_hdr(admin_token)).json()
     jid = _make_scene_job(db, me["tenant_id"])

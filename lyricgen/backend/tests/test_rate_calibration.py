@@ -118,6 +118,19 @@ def test_tarifa_implausible_se_reporta_pero_no_se_aplica():
     assert "SKU" in veo["reason"]
 
 
+def test_credito_de_factura_no_genera_tarifa_negativa():
+    """Un ajuste neto negativo se informa, pero no contamina costos futuros."""
+    out = rc.derive_rates(
+        _fake_sessions({"prod": [("veo-3.1-fast-generate-001", 100)]}),
+        {"veo": -62.0}, "2026-07")
+    veo = next(r for r in out["rates"] if r["tool"] == "veo")
+    assert veo["invoiced_usd"] == -62.0
+    assert veo["derived_rate"] is None
+    assert veo["drift"] is None
+    assert veo["status"] == "ajuste_no_positivo"
+    assert "veo" not in out["applied"]
+
+
 def test_sin_factura_no_inventa_tarifa():
     out = rc.derive_rates(
         _fake_sessions({"prod": [("veo-3.1-fast-generate-001", 300)]}),

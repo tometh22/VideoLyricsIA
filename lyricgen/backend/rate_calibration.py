@@ -146,10 +146,20 @@ def derive_rates(sessions: dict, invoiced_by_tool: dict[str, float],
         n = calls.get(tool, 0)
         billed = float(invoiced_by_tool.get(tool, 0.0))
         est = estimated.get(tool)
-        derived = round(billed / n, 6) if (n and billed) else None
+        # Credits and billing adjustments can make a SKU's net amount
+        # negative. That is useful invoice evidence, but never a usable
+        # per-call price: persisting it would make attributed cost and margin
+        # negative for every later job.
+        derived = round(billed / n, 6) if (n and billed > 0) else None
 
         status, reason = "ok", None
-        if not billed:
+        if billed < 0:
+            status, reason = (
+                "ajuste_no_positivo",
+                "el importe neto incluye créditos o ajustes y no permite "
+                "derivar una tarifa positiva",
+            )
+        elif not billed:
             status, reason = "sin_factura", "el SKU no aparece en la factura"
         elif n < MIN_CALLS_FOR_CALIBRATION:
             status, reason = ("muestra_chica",
