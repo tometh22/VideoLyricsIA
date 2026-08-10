@@ -8880,17 +8880,7 @@ Hard rules:
                 job_id, sorted(set(observed)),
             )
 
-    full_prompt = f"system:{system_prompt}\nuser:{user_content}"
-
-    recorder = record_ai_call(
-        job_id=job_id or "unknown",
-        step="lyrics_analysis",
-        tool_name="gemini-2.5-flash",
-        tool_provider="google_vertex",
-        prompt=full_prompt,
-        input_data_types=["artist_name", "lyrics_text_600chars"],
-    ) if job_id else None
-
+    recorder = None
     try:
         # Corrective re-roll for the noir-urban-alley cliché. The system
         # prompt already instructs against alleys, but Gemini ignores that
@@ -8937,6 +8927,18 @@ Hard rules:
                     if policy_enforces(atmospherics_policy) else {}
                 ),
             )
+            # One provenance row per provider attempt. The corrective alley
+            # re-roll below is a second billed Gemini call, not merely local
+            # post-processing, so a recorder outside this loop undercounted
+            # the denominator used by invoice-derived rates.
+            recorder = record_ai_call(
+                job_id=job_id or "unknown",
+                step="lyrics_analysis",
+                tool_name="gemini-2.5-flash",
+                tool_provider="google_vertex",
+                prompt=f"system:{_sys_instr}\nuser:{user_content}",
+                input_data_types=["artist_name", "lyrics_text_1800chars"],
+            ) if job_id else None
             # Quota-aware wrapper (2026-07-24): a single 429/RESOURCE_EXHAUSTED
             # used to abort the whole analysis and drop to the fallback prompt.
             # Retries 429s with backoff; TimeoutError still propagates raw.
@@ -8979,6 +8981,13 @@ Hard rules:
                                 "with hard-negative. genre=%s job=%s",
                                 _attempt, normalized_genre or 'auto', job_id,
                             )
+                            if recorder:
+                                recorder.finish(
+                                    response_summary=(
+                                        f"attempt={_attempt} corrective_alley_retry "
+                                        + text[:440]
+                                    )
+                                )
                             continue  # re-roll with the anti-alley addendum
                         logger.warning(
                             "[BG][ALLEY-BIAS PERSISTENT] re-roll still chose alley; "
@@ -8990,6 +8999,10 @@ Hard rules:
                     return {"style": style, "prompt": prompt}
             # Parse failed this attempt. If attempts remain, the loop retries
             # (a re-roll often parses cleanly); otherwise fall through.
+            if recorder:
+                recorder.finish(
+                    response_summary=f"attempt={_attempt} parse_failed: {text[:420]}"
+                )
 
         # All attempts exhausted without a usable parse.
         finish_reason = "unknown"
@@ -9002,8 +9015,6 @@ Hard rules:
             pass
         logger.warning("[BG] Failed to parse Gemini JSON, using combinatorial fallback. "
                        "raw_len=%s finish_reason=%s", len(text), finish_reason)
-        if recorder:
-            recorder.finish(response_summary=f"parse_failed: {text[:200]}")
         return {"style": "video", "prompt": None}
 
     except Exception as e:

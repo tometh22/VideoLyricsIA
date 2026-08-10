@@ -1150,6 +1150,53 @@ def test_relevance_gemini_queda_en_provenance(db, monkeypatch):
     assert row.response_summary == "score=8"
 
 
+def test_cada_reroll_correctivo_gemini_tiene_provenance(db, monkeypatch):
+    from types import SimpleNamespace
+    from database import AIProvenance, Job
+    import pipeline
+
+    job_id = "rerollprov01"
+    db.add(Job(job_id=job_id, user_id=1, tenant_id="reroll-prov",
+               artist="A", filename="a.mp3", status="processing"))
+    db.commit()
+    responses = iter([
+        SimpleNamespace(text=(
+            '{"style":"video","prompt":"A rain-slicked narrow alley with '
+            'graffiti walls and neon reflections, cinematic night scene"}'
+        )),
+        SimpleNamespace(text=(
+            '{"style":"video","prompt":"A wide mountain valley at dawn with '
+            'pine trees, shifting sunlight and distant birds, cinematic scene"}'
+        )),
+    ])
+    monkeypatch.setattr(
+        pipeline, "_get_genai_client",
+        lambda: SimpleNamespace(models=SimpleNamespace(
+            generate_content=lambda **_kwargs: next(responses),
+        )),
+    )
+    monkeypatch.setattr(
+        pipeline, "_generate_content_with_quota_retry",
+        lambda call, **_kwargs: call(),
+    )
+
+    result = pipeline._analyze_lyrics_for_background(
+        "Una canción sobre volver a casa", "Artista", job_id=job_id,
+    )
+    assert "mountain valley" in result["prompt"]
+    db.expire_all()
+    rows = (
+        db.query(AIProvenance)
+        .filter(AIProvenance.job_id == job_id,
+                AIProvenance.step == "lyrics_analysis")
+        .order_by(AIProvenance.id)
+        .all()
+    )
+    assert len(rows) == 2
+    assert "corrective_alley_retry" in rows[0].response_summary
+    assert rows[1].response_summary.startswith("attempt=2")
+
+
 # ---------------------------------------------------------------------------
 # 19. Un snapshot fijo cerrado no cambia con la configuración de hoy
 # ---------------------------------------------------------------------------
