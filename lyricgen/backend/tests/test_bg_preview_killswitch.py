@@ -71,6 +71,25 @@ def test_acepta_las_variantes_de_apagado(client, admin_token, monkeypatch):
         assert body.get("reason") == "disabled", valor
 
 
+def test_apagado_reusa_preview_ya_pagado(client, admin_token, monkeypatch):
+    """The switch blocks provider work, not exact artifacts already in R2."""
+    import bg_preview
+
+    monkeypatch.setenv("BG_PREVIEW_ENABLED", "0")
+    monkeypatch.setattr(bg_preview, "cache_check", lambda _key: True)
+    monkeypatch.setattr(
+        bg_preview, "cache_r2_key", lambda key: f"bg_cache/{key}.mp4",
+    )
+
+    body = client.post(
+        "/generate-preview", headers=auth(admin_token), json=_body(),
+    ).json()
+    assert body["cached"] is True
+    assert body["status"] == "bg_preview_done"
+    assert body["r2_key"] == f"bg_cache/{body['bg_cache_key']}.mp4"
+    assert "skipped" not in body
+
+
 def test_worker_omite_backlog_ya_encolado_cuando_se_apaga(monkeypatch):
     """El switch también debe cortar jobs que ya estaban esperando en Redis."""
     import bg_preview
