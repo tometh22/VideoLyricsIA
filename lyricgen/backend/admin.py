@@ -958,7 +958,7 @@ async def admin_cost_unit_economics(
     """
     import billing_sources
     from database import CostSnapshot
-    from provenance import cost_waste_breakdown
+    from provenance import cost_waste_breakdown, merge_waste_breakdowns
 
     period = period.strip() or billing_sources.current_period()
     try:
@@ -1008,27 +1008,30 @@ async def admin_cost_unit_economics(
         )
         return delivered, created
 
+    # Ventana EXPLÍCITA del mes pedido. Con `since_days` la ventana termina
+    # hoy, así que pedir junio en agosto medía jul-ago y lo comparaba contra
+    # la factura de junio.
     delivered, created = _count(db)
     counted_environments = 1
+    waste_parts = [cost_waste_breakdown(db, start=start_dt, end=end_dt)]
     with scoped_peer_db() as peer:
         if peer is not None:
             d2, c2 = _count(peer)
             delivered += d2
             created += c2
             counted_environments = 2
+            # El desperdicio también sale de los DOS entornos: la producción
+            # gestionada de UMG corre en staging, así que un subárbol local
+            # al lado de totales de dos entornos describía una porción del
+            # negocio con cara de describirlo entero.
+            waste_parts.append(
+                cost_waste_breakdown(peer, start=start_dt, end=end_dt))
+    waste = merge_waste_breakdowns(*waste_parts)
 
     cost_per_delivered = round(real_total / delivered, 4) if delivered else None
     # Kept only to show the operator how misleading it is next to the real
     # one — it is the number the old internal doc quoted.
     cost_per_created = round(real_total / created, 4) if created else None
-
-    # Waste attribution runs off provenance (the invoice cannot say which
-    # job a dollar belonged to), scoped to roughly the same window.
-    days = max(1, (end - start).days + 1)
-    # Ventana EXPLÍCITA del mes pedido. Con `since_days` la ventana termina
-    # hoy, así que pedir junio en agosto medía jul-ago y lo comparaba contra
-    # la factura de junio.
-    waste = cost_waste_breakdown(db, start=start_dt, end=end_dt)
 
     return {
         "period": period,
@@ -1203,8 +1206,18 @@ def _run_attribution(db, period: str | None):
         with scoped_deliveries_db() as portal_db:
             portal = ca.collect_portal_songs(portal_db)
 
+        # Una sola calibración para TODOS los entornos. La leemos de `db`
+        # porque es la base contra la que se corre `/cost/calibrate-rates`;
+        # la peer es de sólo lectura y no tiene el snapshot, así que dejarla
+        # cargar la suya valuaba las mismas llamadas a precio de lista y el
+        # informe mezclaba dos tarifas para el mismo Veo.
+        rates = {}
+        if period:
+            from rate_calibration import load_applied_rates
+            rates = load_applied_rates(db, period)
+
         jobs_by_env = {
-            env: ca.collect_jobs(s, env, period=period)
+            env: ca.collect_jobs(s, env, period=period, rates=rates)
             for env, s in sessions.items()
         }
         all_time_keys: set[str] = set()

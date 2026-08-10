@@ -198,3 +198,209 @@ def test_la_fila_de_calibracion_no_marca_incompleto(client, admin_token, db):
     finally:
         db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
         db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 5. Un job viejo que gasta DENTRO del mes tiene que entrar
+# ---------------------------------------------------------------------------
+
+def test_un_job_de_junio_que_gasta_en_julio_cuenta_en_julio(db):
+    """Simétrico al de arriba, y el que faltaba.
+
+    `run_edit_pipeline` re-genera el fondo sobre la MISMA fila de job. Un job
+    creado en junio y editado en julio quedaba excluido antes de que corriera
+    la query de provenance: el proveedor facturaba esa llamada en julio y el
+    informe la omitía por completo — justo el agujero que la reconciliación
+    existe para detectar.
+    """
+    import cost_attribution as ca
+    from database import AIProvenance, Job
+
+    db.query(Job).filter(Job.tenant_id == "edit-tardio").delete()
+    junio = datetime(2026, 6, 15, 12, tzinfo=timezone.utc)
+    julio = datetime(2026, 7, 10, 12, tzinfo=timezone.utc)
+    db.add(Job(job_id="lt1", user_id=1, tenant_id="edit-tardio",
+               artist="A", song_title="B", filename="a.mp3",
+               status="done", created_at=junio))
+    db.flush()
+    db.add(AIProvenance(job_id="lt1", step="video_bg",
+                        tool_name="veo-3.1-fast-generate-001",
+                        tool_provider="google_vertex", prompt_sent="p",
+                        created_at=julio))
+    db.commit()
+
+    try:
+        jobs = ca.collect_jobs(db, "test", period="2026-07")
+        assert "lt1" in jobs, (
+            "el job de junio editado en julio quedaba fuera del informe de "
+            "julio, pero su llamada sí estaba en la factura de julio")
+        assert jobs["lt1"].billable_calls == 1
+        # Y NO aparece en junio, donde no gastó nada.
+        assert ca.collect_jobs(db, "test", period="2026-06")["lt1"].cost == 0
+    finally:
+        db.query(AIProvenance).filter(AIProvenance.job_id == "lt1").delete()
+        db.query(Job).filter(Job.tenant_id == "edit-tardio").delete()
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 6. Una sola calibración para los dos entornos
+# ---------------------------------------------------------------------------
+
+def test_collect_jobs_usa_las_tarifas_que_le_pasan(db, monkeypatch):
+    """La calibración vive en la base donde se corrió /cost/calibrate-rates.
+    Si cada sesión lee la suya, la peer (staging, de sólo lectura) cae a
+    precio de lista y el MISMO Veo sale valuado a dos tarifas distintas
+    dentro de un solo informe."""
+    import cost_attribution as ca
+    from database import AIProvenance, Job
+
+    leidas = []
+
+    def _no_deberia_leer(db_, period):
+        leidas.append(period)
+        return {}
+
+    monkeypatch.setattr("rate_calibration.load_applied_rates", _no_deberia_leer)
+
+    db.query(Job).filter(Job.tenant_id == "rates-inyectadas").delete()
+    julio = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    db.add(Job(job_id="ri1", user_id=1, tenant_id="rates-inyectadas",
+               artist="A", song_title="B", filename="a.mp3",
+               status="done", created_at=julio))
+    db.flush()
+    db.add(AIProvenance(job_id="ri1", step="video_bg",
+                        tool_name="veo-3.1-fast-generate-001",
+                        tool_provider="google_vertex", prompt_sent="p",
+                        created_at=julio))
+    db.commit()
+
+    try:
+        jobs = ca.collect_jobs(db, "test", period="2026-07",
+                               rates={"veo": 0.62})
+        assert abs(jobs["ri1"].cost - 0.62) < 1e-6, (
+            "no aplicó las tarifas que le pasó el caller")
+        assert leidas == [], (
+            "con `rates` explícitas no puede volver a leer la calibración de "
+            "su propia sesión")
+    finally:
+        db.query(AIProvenance).filter(AIProvenance.job_id == "ri1").delete()
+        db.query(Job).filter(Job.tenant_id == "rates-inyectadas").delete()
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 7. La calibración conserva los precios relativos dentro del grupo
+# ---------------------------------------------------------------------------
+
+def test_la_calibracion_no_aplana_veo_fast_contra_standard():
+    """El SKU de la factura agrega la familia entera. Devolver la tarifa
+    mezclada plana valuaba igual un Veo Fast ($0,80 de lista) y un Veo
+    Standard ($3,20): el total del mes cuadraba, pero la atribución movía
+    gasto de los usuarios de Standard a los de Fast."""
+    from rate_calibration import EST_KEY_SUFFIX, rate_for_tool
+
+    # Mes con mezcla: la estimada ponderada dio $1,00 y la factura $0,80 →
+    # todo el grupo está 20% por debajo de lista.
+    cal = {"veo": 0.80, f"veo{EST_KEY_SUFFIX}": 1.00}
+    fast = rate_for_tool("veo-3.1-fast-generate-001", cal)
+    std = rate_for_tool("veo-3.1-generate-001", cal)
+    assert fast is not None and std is not None
+    assert fast < std, "Standard tiene que seguir costando más que Fast"
+    assert abs(std / fast - 4.0) < 0.01, "la razón de lista (4x) se conserva"
+    assert abs(fast - 0.64) < 1e-6   # 0.80 de lista × 0.8
+
+
+def test_sin_estimada_la_calibracion_sigue_siendo_plana():
+    """Compatibilidad: una calibración vieja (sin la estimada guardada) tiene
+    que seguir devolviendo la tarifa derivada tal cual."""
+    from rate_calibration import rate_for_tool
+    assert rate_for_tool("veo-3.1-fast-generate-001", {"veo": 0.62}) == 0.62
+
+
+# ---------------------------------------------------------------------------
+# 8. Cada factura directa se prorratea con SU proporción de uso
+# ---------------------------------------------------------------------------
+
+def test_cada_proveedor_directo_usa_su_propia_proporcion():
+    """UMG y el trabajo interno usan GCP, OpenAI y Replicate en proporciones
+    muy distintas. Con una sola proporción mezclada, trabajo interno pesado en
+    Replicate movía la porción aplicada a la factura de GCP aunque el uso de
+    GCP de UMG no hubiera cambiado — y el error salía como costo de UMG."""
+    import cost_attribution as ca
+
+    attribution = {
+        "umg": {"songs": 10, "direct_cost": 90.0},
+        "business": {
+            "umg_share_of_cost": 0.5,      # mezcla
+            "umg_share_of_jobs": 0.5,
+            # UMG es casi todo GCP; Replicate es casi todo interno.
+            "umg_share_by_source": {"gcp": 0.9, "replicate": 0.1},
+        },
+    }
+    out = ca.add_total_cost(attribution,
+                            {"gcp": 100.0, "replicate": 100.0},
+                            basis="cost")["umg_total"]
+    # 100×0,9 + 100×0,1 = 100, no 100×0,5 + 100×0,5 = 100... acá coinciden
+    # por simetría, así que lo que se afirma es el DESGLOSE por proveedor.
+    assert out["umg_direct_cost_by_source"] == {"gcp": 90.0, "replicate": 10.0}
+
+
+def test_un_proveedor_sin_uso_medido_cae_a_la_proporcion_mezclada():
+    """No hay nada mejor que la mezcla si no se midió uso de ese proveedor;
+    lo que no puede es desaparecer de la cuenta."""
+    import cost_attribution as ca
+
+    attribution = {
+        "umg": {"songs": 1, "direct_cost": 1.0},
+        "business": {"umg_share_of_cost": 0.4, "umg_share_of_jobs": 0.4,
+                     "umg_share_by_source": {}},
+    }
+    out = ca.add_total_cost(attribution, {"openai": 10.0},
+                            basis="cost")["umg_total"]
+    assert out["umg_direct_cost_by_source"] == {"openai": 4.0}
+
+
+# ---------------------------------------------------------------------------
+# 9. El desperdicio se suma de los dos entornos
+# ---------------------------------------------------------------------------
+
+def test_el_desperdicio_se_suma_entre_entornos():
+    """La producción gestionada de UMG corre en staging. Un subárbol de
+    desperdicio de un solo entorno, al lado de totales de dos, describía una
+    porción del negocio con cara de describirlo entero."""
+    from provenance import merge_waste_breakdowns
+
+    prod = {"total_cost": 10.0, "delivered_cost": 6.0, "delivered_videos": 2,
+            "by_destination": [
+                {"destination": "entregado", "status": "done",
+                 "delivered": True, "jobs": 2, "calls": 6, "cost": 6.0},
+                {"destination": "rechazado", "status": "rejected",
+                 "delivered": False, "jobs": 1, "calls": 4, "cost": 4.0},
+            ], "environments": 1}
+    staging = {"total_cost": 90.0, "delivered_cost": 30.0,
+               "delivered_videos": 8,
+               "by_destination": [
+                   {"destination": "entregado", "status": "done",
+                    "delivered": True, "jobs": 8, "calls": 30, "cost": 30.0},
+                   {"destination": "preview_descartado",
+                    "status": "bg_preview_done", "delivered": False,
+                    "jobs": 20, "calls": 60, "cost": 60.0},
+               ], "environments": 1}
+
+    m = merge_waste_breakdowns(prod, staging)
+    assert m["total_cost"] == 100.0
+    assert m["delivered_videos"] == 10
+    assert m["wasted_cost"] == 64.0
+    assert m["waste_ratio"] == 0.64
+    assert m["environments"] == 2
+    # Los mismos destinos se funden en una fila, no se duplican.
+    done = [r for r in m["by_destination"] if r["status"] == "done"]
+    assert len(done) == 1 and done[0]["cost"] == 36.0 and done[0]["jobs"] == 10
+
+
+def test_merge_de_uno_solo_devuelve_lo_mismo():
+    from provenance import merge_waste_breakdowns
+    uno = {"total_cost": 1.0, "by_destination": [], "environments": 1}
+    assert merge_waste_breakdowns(uno) is uno
+    assert merge_waste_breakdowns() == {}

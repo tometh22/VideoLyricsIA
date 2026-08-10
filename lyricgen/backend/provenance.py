@@ -341,6 +341,63 @@ def cost_waste_breakdown(db: Session, since_days: int = 30,
             if delivered_videos else None
         ),
         "by_destination": by_destination,
+        "environments": 1,
+    }
+
+
+def merge_waste_breakdowns(*breakdowns: dict) -> dict:
+    """Suma varios `cost_waste_breakdown` en uno, para el mismo período.
+
+    La producción gestionada de UMG corre en STAGING mientras la factura y
+    el conteo de entregas cubren los dos entornos: devolver un desperdicio
+    de un solo entorno al lado de totales de dos hacía que `waste_ratio` y
+    `delivered_videos` describieran una porción del negocio y parecieran
+    describirlo entero.
+    """
+    breakdowns = tuple(b for b in breakdowns if b)
+    if not breakdowns:
+        return {}
+    if len(breakdowns) == 1:
+        return breakdowns[0]
+
+    total = sum(b.get("total_cost") or 0.0 for b in breakdowns)
+    delivered_cost = sum(b.get("delivered_cost") or 0.0 for b in breakdowns)
+    delivered_videos = sum(int(b.get("delivered_videos") or 0)
+                           for b in breakdowns)
+    wasted = total - delivered_cost
+
+    por_estado: dict[str, dict] = {}
+    for b in breakdowns:
+        for row in b.get("by_destination") or []:
+            acc = por_estado.setdefault(row["status"], {
+                "destination": row["destination"], "status": row["status"],
+                "delivered": row["delivered"], "jobs": 0, "calls": 0,
+                "cost": 0.0,
+            })
+            acc["jobs"] += int(row.get("jobs") or 0)
+            acc["calls"] += int(row.get("calls") or 0)
+            acc["cost"] += float(row.get("cost") or 0.0)
+    filas = sorted(por_estado.values(), key=lambda r: -r["cost"])
+    for r in filas:
+        r["cost"] = round(r["cost"], 4)
+
+    base = breakdowns[0]
+    return {
+        "since": base.get("since"),
+        "since_days": base.get("since_days"),
+        "tenant_id": base.get("tenant_id"),
+        "total_cost": round(total, 4),
+        "delivered_cost": round(delivered_cost, 4),
+        "wasted_cost": round(wasted, 4),
+        "waste_ratio": round(wasted / total, 4) if total else None,
+        "delivered_videos": delivered_videos,
+        "cost_per_delivered": (round(total / delivered_videos, 4)
+                               if delivered_videos else None),
+        "cost_per_delivered_direct": (round(delivered_cost / delivered_videos, 4)
+                                      if delivered_videos else None),
+        "by_destination": filas,
+        "environments": sum(int(b.get("environments") or 1)
+                            for b in breakdowns),
     }
 
 

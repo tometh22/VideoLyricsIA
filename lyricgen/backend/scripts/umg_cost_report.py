@@ -228,8 +228,15 @@ def main() -> int:
 
     try:
         portal = ca.collect_portal_songs(db_prod)
+        # La calibración se lee UNA vez (de prod) y se aplica a los dos
+        # entornos: staging no tiene el snapshot y caería a precio de lista,
+        # valuando el mismo Veo a dos tarifas dentro de un solo informe.
+        rates = {}
+        if args.period:
+            from rate_calibration import load_applied_rates
+            rates = load_applied_rates(db_prod, args.period)
         jobs_by_env = {
-            env: ca.collect_jobs(db, env, period=args.period)
+            env: ca.collect_jobs(db, env, period=args.period, rates=rates)
             for env, db in sessions.items()
         }
         # Unfiltered song identities, so a portal song whose jobs ran in

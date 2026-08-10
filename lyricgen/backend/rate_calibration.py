@@ -52,6 +52,11 @@ TOOL_PREFIXES: dict[str, tuple[str, ...]] = {
 # a miles. Por debajo de esto se ignora la calibración y se usa la tabla.
 MIN_CALLS_FOR_CALIBRATION = 25
 
+# Sufijo con el que `load_applied_rates` guarda, junto a la tarifa derivada de
+# la factura, la estimada de lista ponderada por uso. `rate_for_tool` divide
+# una por otra para conservar los precios relativos DENTRO del grupo.
+EST_KEY_SUFFIX = "::estimada"
+
 # Cinturón de seguridad: si la tarifa derivada se va más de esto respecto de
 # la estimada, casi seguro el SKU está mal mapeado (por ejemplo, la línea de
 # Veo capturando también almacenamiento). Se reporta pero no se aplica.
@@ -227,11 +232,18 @@ def load_applied_rates(db, period: str) -> dict[str, float]:
         )
         if not row or not row.breakdown:
             return {}
-        return {
-            r["tool"]: float(r["derived_rate"])
-            for r in row.breakdown
-            if r.get("status") == "ok" and r.get("derived_rate")
-        }
+        out: dict[str, float] = {}
+        for r in row.breakdown:
+            if r.get("status") != "ok" or not r.get("derived_rate"):
+                continue
+            out[r["tool"]] = float(r["derived_rate"])
+            # La estimada es el promedio de lista PONDERADO por los modelos
+            # realmente usados ese mes. `rate_for_tool` la necesita para
+            # repartir la tarifa facturada entre modelos del mismo grupo sin
+            # aplastar sus precios relativos — ver allá.
+            if r.get("estimated_rate"):
+                out[f"{r['tool']}{EST_KEY_SUFFIX}"] = float(r["estimated_rate"])
+        return out
     except Exception as exc:
         logger.warning("[RATES] no pude leer la calibración de %s: %r",
                        period, exc)
@@ -239,9 +251,32 @@ def load_applied_rates(db, period: str) -> dict[str, float]:
 
 
 def rate_for_tool(tool_name: str, calibrated: dict[str, float]) -> float | None:
-    """Tarifa calibrada para un `tool_name`, o None si no hay."""
+    """Tarifa calibrada para un `tool_name` concreto, o None si no hay.
+
+    La factura de GCP agrega por SKU y nuestro mapeo colapsa cada familia en
+    un grupo ("veo", "imagen", "gemini"), así que la tarifa derivada es una
+    MEZCLA de los modelos que se usaron ese mes. Devolverla plana valuaba
+    igual a un Veo Fast y a un Veo Standard, que cuesta ~4x: el total del mes
+    seguía cuadrando, pero la atribución por canción, tenant y desperdicio
+    movía gasto de los usuarios de Standard a los de Fast.
+
+    Así que la calibración se aplica como MULTIPLICADOR sobre el precio de
+    lista del modelo (`derivada / estimada`, donde la estimada es el promedio
+    de lista ponderado por uso), en vez de como reemplazo. Con un solo modelo
+    en el grupo da exactamente lo mismo que antes; con varios, conserva sus
+    precios relativos y sigue reconciliando contra la factura.
+    """
     low = (tool_name or "").lower()
     for tool, prefixes in TOOL_PREFIXES.items():
-        if any(low.startswith(p) for p in prefixes):
-            return calibrated.get(tool)
+        if not any(low.startswith(p) for p in prefixes):
+            continue
+        derived = calibrated.get(tool)
+        if derived is None:
+            return None
+        est = calibrated.get(f"{tool}{EST_KEY_SUFFIX}")
+        from provenance import COST_PER_CALL
+        lista = COST_PER_CALL.get((tool_name, "google_vertex"))
+        if est and lista:
+            return round(lista * (derived / est), 6)
+        return derived
     return None
