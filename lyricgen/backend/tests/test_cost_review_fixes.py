@@ -692,6 +692,9 @@ def test_refresh_rechaza_fuentes_desconocidas(client, admin_token, db):
     with pytest.raises(ValueError, match="fuentes desconocidas"):
         billing_sources.fetch_all("2026-07", only=["gcpp"])
 
+    with pytest.raises(ValueError, match="YYYY-MM"):
+        billing_sources.fetch_all("2026-7", only=["gcp"])
+
     response = client.post(
         "/admin/cost/refresh?period=2026-07&only=gcpp",
         headers=auth(admin_token),
@@ -754,6 +757,7 @@ def test_unit_economics_incluye_el_ultimo_microsegundo(client, admin_token, db):
 def test_unit_economics_conserva_una_entrega_mientras_se_edita(
     client, admin_token, db,
 ):
+    import cost_attribution as ca
     from database import Job
 
     tenant = "reopened-delivery"
@@ -765,12 +769,43 @@ def test_unit_economics_conserva_una_entrega_mientras_se_edita(
                completed_at=delivered_at, editing_started_at=editing_at))
     db.commit()
     try:
+        monthly = ca.collect_jobs(db, "test", period="2020-06")
+        assert monthly["rd1"].delivered is True
         body = client.get(
             "/admin/cost/unit-economics?period=2020-06",
             headers=auth(admin_token),
         ).json()
         assert body["videos_delivered"] >= 1
     finally:
+        db.query(Job).filter(Job.tenant_id == tenant).delete()
+        db.commit()
+
+
+def test_waste_conserva_el_costo_de_una_entrega_reabierta(db):
+    from database import AIProvenance, Job
+    from provenance import cost_waste_breakdown
+
+    tenant = "reopened-waste"
+    delivered_at = datetime.now(timezone.utc) - timedelta(days=5)
+    editing_at = datetime.now(timezone.utc) - timedelta(days=1)
+    db.query(Job).filter(Job.tenant_id == tenant).delete()
+    db.add(Job(job_id="rw1", user_id=1, tenant_id=tenant, artist="A",
+               filename="a.mp3", status="error", created_at=delivered_at,
+               completed_at=delivered_at, editing_started_at=editing_at))
+    db.flush()
+    db.add(AIProvenance(job_id="rw1", step="video_bg",
+                        tool_name="veo-3.1-fast-generate-001",
+                        tool_provider="google_vertex", prompt_sent="p",
+                        created_at=delivered_at))
+    db.commit()
+    try:
+        out = cost_waste_breakdown(db, since_days=30, tenant_id=tenant)
+        assert out["delivered_videos"] == 1
+        assert out["delivered_cost"] == pytest.approx(0.8)
+        assert out["wasted_cost"] == 0.0
+        assert out["by_destination"][0]["status"] == "delivered_reopened"
+    finally:
+        db.query(AIProvenance).filter(AIProvenance.job_id == "rw1").delete()
         db.query(Job).filter(Job.tenant_id == tenant).delete()
         db.commit()
 

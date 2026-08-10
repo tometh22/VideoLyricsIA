@@ -49,6 +49,8 @@ from provenance import (
     DELIVERED_STATUSES,
     billable_filter,
     cost_for_record,
+    delivered_job_filter,
+    job_was_delivered,
 )
 
 # ---------------------------------------------------------------------------
@@ -175,6 +177,9 @@ def invoice_source_of(tool_provider: str | None) -> str:
 
 def period_bounds(period: str) -> tuple[datetime, datetime]:
     """"2026-07" -> aware UTC datetimes [start, end_exclusive)."""
+    if (len(period) != 7 or period[4] != "-"
+            or not period[:4].isdigit() or not period[5:].isdigit()):
+        raise ValueError(f"período inválido: {period!r}; se espera YYYY-MM")
     year, month = (int(x) for x in period.split("-", 1))
     if not 1 <= month <= 12:
         raise ValueError(f"período inválido: {period!r}")
@@ -215,7 +220,8 @@ def collect_jobs(db, env: str, period: str | None = None,
     bounds = period_bounds(period) if period else None
 
     q = db.query(Job.job_id, Job.tenant_id, Job.status, Job.artist,
-                 Job.song_title, Job.created_at, Job.completed_at)
+                 Job.song_title, Job.created_at, Job.completed_at,
+                 Job.editing_started_at)
     if bounds:
         con_gasto = [r[0] for r in
                      db.query(AIProvenance.job_id)
@@ -224,7 +230,7 @@ def collect_jobs(db, env: str, period: str | None = None,
                        .distinct().all()]
         entregado_en = func.coalesce(Job.completed_at, Job.created_at)
         entregado_en_periodo = and_(
-            Job.status.in_(DELIVERED_STATUSES),
+            delivered_job_filter(),
             entregado_en >= bounds[0],
             entregado_en < bounds[1],
         )
@@ -233,7 +239,7 @@ def collect_jobs(db, env: str, period: str | None = None,
 
     jobs: dict[str, JobCost] = {}
     for (job_id, tenant_id, status, artist, title, created_at,
-         completed_at) in q.all():
+         completed_at, editing_started_at) in q.all():
         delivered_in_period = None
         if bounds:
             delivered_at = completed_at or created_at
@@ -242,7 +248,7 @@ def collect_jobs(db, env: str, period: str | None = None,
             if delivered_at is not None and delivered_at.tzinfo is None:
                 delivered_at = delivered_at.replace(tzinfo=timezone.utc)
             delivered_in_period = bool(
-                status in DELIVERED_STATUSES
+                job_was_delivered(status, completed_at, editing_started_at)
                 and delivered_at is not None
                 and bounds[0] <= delivered_at < bounds[1]
             )
