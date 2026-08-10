@@ -9261,6 +9261,10 @@ class VeoAmbiguousSubmission(RuntimeError):
     """
 
 
+class VeoTrackingUnavailable(RuntimeError):
+    """A paid call cannot proceed without durable budget/provenance state."""
+
+
 def _veo_http_failure_is_ambiguous(status_code: int) -> bool:
     """HTTP failures that may arrive after Vertex accepted the operation."""
     return status_code == 408 or 500 <= status_code <= 599
@@ -9329,19 +9333,136 @@ def _discard_provenance_row(recorder) -> None:
         recorder.finish(response_summary="budget_exceeded: no se generó nada")
 
 
-def _release_veo_reservation(recorder, reason: str) -> None:
+def _persist_veo_reservation_summary(
+    row_id: int | None,
+    summary: str,
+    *,
+    duration_ms: int | None = None,
+) -> bool:
+    """Verified provenance UPDATE in a fresh transaction."""
+    if row_id is None:
+        return False
+    from database import AIProvenance, SessionLocal
+
+    db = None
+    try:
+        db = SessionLocal()
+        values = {"response_summary": str(summary)[:2000]}
+        if duration_ms is not None:
+            values["duration_ms"] = max(0, int(duration_ms))
+        updated = (
+            db.query(AIProvenance)
+            .filter(AIProvenance.id == row_id)
+            .update(
+                values,
+                synchronize_session=False,
+            )
+        )
+        if not updated:
+            db.rollback()
+            return False
+        db.commit()
+        return True
+    except Exception as exc:
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        logger.warning(
+            "[BG][BUDGET] no pude actualizar reserva fila=%s: %r",
+            row_id, exc,
+        )
+        return False
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+def _delete_provenance_row_by_id(row_id: int | None) -> bool:
+    """Verified fresh-transaction delete for a known zero-cost attempt."""
+    if row_id is None:
+        return False
+    from database import AIProvenance, SessionLocal
+
+    db = None
+    try:
+        db = SessionLocal()
+        deleted = (
+            db.query(AIProvenance)
+            .filter(AIProvenance.id == row_id)
+            .delete(synchronize_session=False)
+        )
+        if not deleted:
+            db.rollback()
+            return False
+        db.commit()
+        return True
+    except Exception as exc:
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        logger.warning(
+            "[BG][BUDGET] no pude borrar reserva libre fila=%s: %r",
+            row_id, exc,
+        )
+        return False
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+def _release_veo_reservation(recorder, reason: str) -> bool:
     """Close a reserved row as free after a definite provider rejection.
 
     Unlike an exception raised by ``requests.post`` (ambiguous: Vertex may
     have accepted the operation), an HTTP rejection or a pre-POST failure
     proves there is no billable generation behind the reservation. Keep the
-    row for audit, but exclude it from spend and the per-song ceiling.
+    row for audit, but exclude it from spend and the per-song ceiling. The
+    generic recorder marks itself finished before knowing whether its UPDATE
+    committed, so this path uses verified fresh transactions instead. If all
+    UPDATE retries fail, deleting the definitely-free row is safer than
+    leaving a false paid reservation behind.
     """
     if recorder is None:
-        return
+        return False
     from provenance import BUDGET_RELEASED_PREFIX
-    recorder.finish(
-        response_summary=f"{BUDGET_RELEASED_PREFIX}: {str(reason)[:1900]}"
+    row_id = getattr(recorder, "_row_id", None)
+    if row_id is None:
+        recorder._finished = True
+        return False
+    summary = f"{BUDGET_RELEASED_PREFIX}: {str(reason)[:1900]}"
+    finished_at = time.time()
+    duration_ms = int(max(
+        0.0, finished_at - getattr(recorder, "start_time", finished_at)
+    ) * 1000)
+    for _attempt in range(3):
+        if _persist_veo_reservation_summary(
+            row_id, summary, duration_ms=duration_ms,
+        ):
+            recorder._finished = True
+            return True
+    if _delete_provenance_row_by_id(row_id):
+        recorder._finished = True
+        logger.error(
+            "[BG][BUDGET] reserva libre fila=%s borrada tras fallar UPDATE; "
+            "se preserva el tope aunque se pierde el detalle de rechazo",
+            row_id,
+        )
+        return True
+    # Do not claim success: callers that require persistent tracking must see
+    # this as an infrastructure failure, and the object remains retryable.
+    recorder._finished = False
+    raise VeoTrackingUnavailable(
+        f"Could not release definitely-free Veo reservation row={row_id}"
     )
 
 
@@ -9376,50 +9497,17 @@ def _song_identity(artist: str | None, title: str | None,
 
 def _mark_veo_reservation_billable(row_id: int | None, reason: str) -> bool:
     """Best-effort pending -> reserved transition in a fresh transaction."""
-    if row_id is None:
-        return False
-    from database import AIProvenance, SessionLocal
     from provenance import BUDGET_RESERVED_PREFIX
-
-    db = None
-    try:
-        db = SessionLocal()
-        updated = (
-            db.query(AIProvenance)
-            .filter(AIProvenance.id == row_id)
-            .update(
-                {"response_summary": (
-                    f"{BUDGET_RESERVED_PREFIX}: {str(reason)[:1900]}"
-                )},
-                synchronize_session=False,
-            )
-        )
-        if not updated:
-            db.rollback()
-            return False
-        db.commit()
-        return True
-    except Exception as exc:
-        if db is not None:
-            try:
-                db.rollback()
-            except Exception:
-                pass
-        logger.warning(
-            "[BG][BUDGET] no pude marcar fila=%s como facturable: %r",
-            row_id, exc,
-        )
-        return False
-    finally:
-        if db is not None:
-            try:
-                db.close()
-            except Exception:
-                pass
+    return _persist_veo_reservation_summary(
+        row_id,
+        f"{BUDGET_RESERVED_PREFIX}: {str(reason)[:1900]}",
+    )
 
 
 def _veo_budget_exceeded(job_id: str | None,
-                         own_row_id: int | None = None) -> tuple[bool, int]:
+                         own_row_id: int | None = None,
+                         require_persistent_tracking: bool = False,
+                         ) -> tuple[bool, int]:
     """Reserva atómicamente un lugar de Veo para la canción del job.
 
     La fila propia nace como `budget_pending` (no facturable). En PostgreSQL,
@@ -9440,19 +9528,29 @@ def _veo_budget_exceeded(job_id: str | None,
     contar sólo ese job — es lo más ajustado que se puede hacer sin una
     identidad de canción.
 
-    Nunca levanta: si la consulta falla, deja pasar la generación. Un tope
-    de costo que rompe entregas cuando la DB hipa es peor que el gasto que
-    evita.
+    Por defecto nunca levanta: si la consulta falla, deja pasar la generación.
+    Los callers internos que declaran ``require_persistent_tracking`` son la
+    excepción: fallan antes del proveedor si no se pudo confirmar la reserva,
+    porque una llamada paga invisible viola el contrato de esos scripts.
     """
     if not job_id:
         return False, 0
+    if require_persistent_tracking and own_row_id is None:
+        raise VeoTrackingUnavailable(
+            "Persistent Veo budget tracking requires a provenance row"
+        )
     # Diagnostic callers do not own a provenance row, so disabling the cap is
     # a true no-op for them. Provider submissions do pass ``own_row_id`` and
     # still need to transition that row to a billable in-flight state below.
     if VEO_MAX_CALLS_PER_SONG <= 0 and own_row_id is None:
         return False, 0
     if VEO_MAX_CALLS_PER_SONG <= 0:
-        _mark_veo_reservation_billable(own_row_id, "ceiling disabled")
+        marked = _mark_veo_reservation_billable(
+            own_row_id, "ceiling disabled")
+        if require_persistent_tracking and not marked:
+            raise VeoTrackingUnavailable(
+                f"Could not persist Veo reservation row={own_row_id}"
+            )
         return False, 0
     try:
         from datetime import datetime as _dt, timedelta, timezone as _tz
@@ -9561,20 +9659,30 @@ def _veo_budget_exceeded(job_id: str | None,
                         "[BG][BUDGET] no pude reservar fila=%s; fail-open",
                         own_row_id,
                     )
-                    _mark_veo_reservation_billable(
+                    marked = _mark_veo_reservation_billable(
                         own_row_id, "budget row update missed; fail-open")
+                    if require_persistent_tracking and not marked:
+                        raise VeoTrackingUnavailable(
+                            f"Could not persist Veo reservation row={own_row_id}"
+                        )
                     return False, n
                 db.commit()
         finally:
             db.close()
+    except VeoTrackingUnavailable:
+        raise
     except Exception as exc:
         logger.warning("[BG] no pude chequear el tope de Veo para job=%s: %r",
                        job_id, exc)
         # Delivery remains fail-open, but a provider POST follows immediately.
         # Retry the state transition in a fresh transaction so a later worker
         # crash cannot leave paid spend hidden as `budget_pending`.
-        _mark_veo_reservation_billable(
+        marked = _mark_veo_reservation_billable(
             own_row_id, f"budget check failed; fail-open: {exc}")
+        if require_persistent_tracking and not marked:
+            raise VeoTrackingUnavailable(
+                f"Could not persist Veo reservation row={own_row_id}"
+            ) from exc
         return False, 0
 
     if n >= VEO_MAX_CALLS_PER_SONG:
@@ -10134,7 +10242,10 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # partir de `_req.post` un timeout es ambiguo (Vertex puede haber aceptado
     # la generación), por eso esos errores conservan la reserva facturable.
     _over, _spent = _veo_budget_exceeded(
-        job_id, own_row_id=getattr(recorder, "_row_id", None))
+        job_id,
+        own_row_id=getattr(recorder, "_row_id", None),
+        require_persistent_tracking=require_persistent_tracking,
+    )
     if _over:
         # La fila se BORRA en vez de cerrarse: no hubo llamada al proveedor,
         # así que dejarla registrada inventaba gasto y además contaminaba el

@@ -282,6 +282,124 @@ def test_fallo_del_guard_reintenta_la_reserva_en_transaccion_nueva(
         db.commit()
 
 
+def test_tracking_requerido_falla_antes_de_veo_si_no_puede_reservar(
+    monkeypatch,
+):
+    import pipeline
+
+    class BrokenSession:
+        def __init__(self):
+            raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr("database.SessionLocal", BrokenSession)
+    monkeypatch.setattr(
+        pipeline, "_mark_veo_reservation_billable", lambda *_a, **_k: False,
+    )
+    monkeypatch.setattr(pipeline, "VEO_MAX_CALLS_PER_SONG", 10)
+
+    with pytest.raises(pipeline.VeoTrackingUnavailable):
+        pipeline._veo_budget_exceeded(
+            "trackedjob01",
+            own_row_id=123,
+            require_persistent_tracking=True,
+        )
+
+
+def test_generador_propaga_el_contrato_de_tracking_a_la_reserva():
+    import inspect
+    import pipeline
+
+    source = inspect.getsource(pipeline._generate_veo_video)
+    reservation = source[source.index(
+        "_over, _spent = _veo_budget_exceeded("
+    ):source.index("if _over:")]
+    assert "require_persistent_tracking=require_persistent_tracking" in reservation
+
+
+def test_liberacion_verificada_persiste_estado_no_facturable(db):
+    import pipeline
+    from database import AIProvenance, Job
+    from provenance import BUDGET_RELEASED_PREFIX, BUDGET_RESERVED_PREFIX
+
+    job_id = "vrelease001"
+    db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+    db.query(Job).filter(Job.job_id == job_id).delete()
+    db.add(Job(
+        job_id=job_id, user_id=1, tenant_id="release-test",
+        artist="A", song_title="S", filename="a.mp3", status="processing",
+    ))
+    row = AIProvenance(
+        job_id=job_id, step="video_bg",
+        tool_name="veo-3.1-fast-generate-001",
+        tool_provider="google_vertex", prompt_sent="p",
+        response_summary=BUDGET_RESERVED_PREFIX,
+    )
+    db.add(row)
+    db.commit()
+    recorder = type("Recorder", (), {
+        "_row_id": row.id,
+        "_finished": False,
+    })()
+    try:
+        assert pipeline._release_veo_reservation(
+            recorder, "HTTP 429 rejected") is True
+        db.expire_all()
+        stored = db.query(AIProvenance).filter(
+            AIProvenance.id == row.id).one()
+        assert stored.response_summary.startswith(BUDGET_RELEASED_PREFIX)
+        assert stored.duration_ms is not None
+        assert recorder._finished is True
+    finally:
+        db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+        db.query(Job).filter(Job.job_id == job_id).delete()
+        db.commit()
+
+
+def test_liberacion_borra_fila_libre_si_los_updates_fallan(monkeypatch):
+    import pipeline
+
+    updates = []
+    deletes = []
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_veo_reservation_summary",
+        lambda *_a, **_k: updates.append(True) and False,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_delete_provenance_row_by_id",
+        lambda row_id: deletes.append(row_id) or True,
+    )
+    recorder = type("Recorder", (), {
+        "_row_id": 42,
+        "_finished": False,
+    })()
+
+    assert pipeline._release_veo_reservation(recorder, "rejected") is True
+    assert len(updates) == 3
+    assert deletes == [42]
+    assert recorder._finished is True
+
+
+def test_liberacion_no_finge_exito_si_update_y_delete_fallan(monkeypatch):
+    import pipeline
+
+    monkeypatch.setattr(
+        pipeline, "_persist_veo_reservation_summary", lambda *_a, **_k: False,
+    )
+    monkeypatch.setattr(
+        pipeline, "_delete_provenance_row_by_id", lambda *_a, **_k: False,
+    )
+    recorder = type("Recorder", (), {
+        "_row_id": 42,
+        "_finished": True,
+    })()
+
+    with pytest.raises(pipeline.VeoTrackingUnavailable):
+        pipeline._release_veo_reservation(recorder, "rejected")
+    assert recorder._finished is False
+
+
 def test_sin_job_id_no_topea(monkeypatch):
     p = _fake_counter(monkeypatch, 999)
     monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_SONG", 10)
