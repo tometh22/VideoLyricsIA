@@ -90,6 +90,45 @@ def current_period() -> str:
     return f"{now.year:04d}-{now.month:02d}"
 
 
+# A snapshot captured while usage is still accruing is provisional. Sources
+# with historical APIs become final only after their usual export lag; the
+# next successful refresh at/after this boundary can then be frozen. GitHub
+# cannot query a past cycle and fixed subscriptions do not accrue with usage,
+# so their healthy in-month capture is the durable record once the month ends.
+SNAPSHOT_FINALIZATION_LAG_DAYS: dict[str, int] = {
+    "gcp": 3,
+    "railway": 1,
+    "openai": 1,
+    "replicate": 1,
+    "r2": 1,
+}
+SNAPSHOT_FINAL_FROM_OPEN_MONTH = frozenset({"github", "fixed"})
+
+
+def snapshot_is_final(period: str, source: str,
+                      fetched_at: datetime | None) -> bool:
+    """Whether a healthy closed-month capture is safe to freeze.
+
+    This deliberately evaluates the timestamp of the *stored capture*, not
+    today's date. Otherwise an in-month provisional row would become final by
+    merely waiting, without ever fetching the provider's completed invoice.
+    """
+    if source in SNAPSHOT_FINAL_FROM_OPEN_MONTH:
+        return True
+    if fetched_at is None:
+        return False
+    _start, end = _period_bounds(period)
+    final_after = datetime.combine(
+        end + timedelta(days=1 + SNAPSHOT_FINALIZATION_LAG_DAYS.get(source, 1)),
+        datetime.min.time(),
+        tzinfo=timezone.utc,
+    )
+    captured = fetched_at
+    if captured.tzinfo is None:  # SQLite/local drops timezone information.
+        captured = captured.replace(tzinfo=timezone.utc)
+    return captured >= final_after
+
+
 def _not_configured(source: str, period: str, missing: str) -> SourceCost:
     return SourceCost(
         source=source, period=period, status="not_configured",

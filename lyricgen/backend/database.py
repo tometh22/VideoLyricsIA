@@ -1397,7 +1397,8 @@ class CostSnapshot(Base):
     predictions that eventually age out), so a month that is never
     snapshotted becomes unrecoverable. This table is the durable record:
     one row per (period, source), refreshed by POST /admin/cost/refresh
-    and frozen once the month closes.
+    and frozen after that source's post-close finalization window. Captures
+    made while usage is still accruing remain provisional.
 
     `amount_usd` is nullable on purpose — a source that was not configured
     yet must be distinguishable from one that genuinely cost $0, otherwise

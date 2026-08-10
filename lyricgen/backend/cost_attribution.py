@@ -140,6 +140,7 @@ class JobCost:
     key: str
     created_at: datetime | None
     completed_at: datetime | None = None
+    editing_started_at: datetime | None = None
     # None means an all-time report. For a monthly report this is computed
     # from the terminal timestamp, so a job that merely incurs spend in the
     # month does not also inflate that month's delivery denominator.
@@ -159,7 +160,8 @@ class JobCost:
     def delivered(self) -> bool:
         if self.delivered_in_period is not None:
             return self.delivered_in_period
-        return self.status in DELIVERED_STATUSES
+        return job_was_delivered(
+            self.status, self.completed_at, self.editing_started_at)
 
 
 def invoice_source_of(tool_provider: str | None) -> str:
@@ -257,6 +259,7 @@ def collect_jobs(db, env: str, period: str | None = None,
             status=status or "", artist=artist or "", title=title or "",
             key=song_key(artist, title, job_id), created_at=created_at,
             completed_at=completed_at,
+            editing_started_at=editing_started_at,
             delivered_in_period=delivered_in_period,
         )
 

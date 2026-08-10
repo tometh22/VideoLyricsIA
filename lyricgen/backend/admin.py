@@ -851,17 +851,32 @@ def admin_cost_refresh(
         if row is None:
             row = CostSnapshot(period=period, source=entry["source"])
             db.add(row)
-        # A healthy closed-month snapshot is immutable. Rolling APIs can return
-        # a superficially successful empty window after their history expires
-        # (Replicate returns ok/$0), and fixed subscriptions are evaluated with
-        # today's price list. Either result would rewrite a bill we already
-        # captured. The current month remains refreshable until it closes, and
-        # a missing/failed historical row can still be filled later by a source
-        # that actually supports historical reads (for example BigQuery).
+        # A healthy *final* closed-month snapshot is immutable. An in-month
+        # capture is provisional for usage sources: GCP exports lag and
+        # Railway keeps accruing through the boundary, so the first mature
+        # post-close refresh must be allowed to replace it. Rolling APIs can
+        # later return a superficially successful empty window (Replicate
+        # returns ok/$0), hence the source-aware finalization boundary.
+        _rolling_history_would_be_erased = (
+            entry["source"] == "replicate"
+            and row.amount_usd is not None
+            and row.amount_usd > 0
+            and entry["status"] == "ok"
+            and float(entry["amount_usd"] or 0) == 0
+            and not entry.get("breakdown")
+        )
         if (
             period < billing_sources.current_period()
             and row.status == "ok"
             and row.amount_usd is not None
+            and (
+                billing_sources.snapshot_is_final(
+                    period, entry["source"], row.fetched_at)
+                # Replicate's rolling history may already be empty before the
+                # post-close finalization date. A cumulative positive monthly
+                # amount cannot legitimately fall back to zero.
+                or _rolling_history_would_be_erased
+            )
         ):
             entry["kept_previous"] = True
             entry["previous_amount_usd"] = row.amount_usd
