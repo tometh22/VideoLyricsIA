@@ -40,10 +40,11 @@ def _fake_counter(monkeypatch, n, artist="Bersuit", title="La Argentinidad",
     ]
 
     class _Q:
-        def __init__(self):
+        def __init__(self, *, ledger=False):
             # La única query que llama a distinct() es la de job_ids con gasto
             # de Veo en la ventana; es lo que las distingue en el fake.
             self._distinct = False
+            self._ledger = ledger
         def filter(self, *a, **k):
             if visto is not None:
                 visto.setdefault("filtros", []).extend(str(x) for x in a)
@@ -51,7 +52,7 @@ def _fake_counter(monkeypatch, n, artist="Bersuit", title="La Argentinidad",
         def distinct(self):
             self._distinct = True
             return self
-        def scalar(self): return n
+        def scalar(self): return 0 if self._ledger else n
         def one_or_none(self): return (artist, title, tenant)
         def all(self):
             if self._distinct:
@@ -59,7 +60,8 @@ def _fake_counter(monkeypatch, n, artist="Bersuit", title="La Argentinidad",
             return filas
 
     class _S:
-        def query(self, *a, **k): return _Q()
+        def query(self, *a, **k):
+            return _Q(ledger=any("veo_budget_ledger" in str(x) for x in a))
         def close(self): pass
 
     monkeypatch.setattr("database.SessionLocal", _S)
@@ -85,6 +87,88 @@ def test_el_job_de_26_llamadas_se_habria_cortado(monkeypatch):
     p = _fake_counter(monkeypatch, 26)
     monkeypatch.setattr(p, "VEO_MAX_CALLS_PER_SONG", 10)
     assert p._veo_budget_exceeded("job123")[0] is True
+
+
+def test_borrar_job_no_reinicia_el_presupuesto(db, monkeypatch):
+    """El hard-delete conserva sólo un ledger hasheado de llamadas pagas."""
+    import uuid
+    from datetime import datetime, timezone
+
+    import jobs
+    import pipeline
+    from database import AIProvenance, Job, User, VeoBudgetLedger
+    from provenance import CACHE_HIT_PREFIX
+    from veo_budget import scope_hash
+
+    old_id = "veoledger001"
+    new_id = "veoledger002"
+    tenant = f"ledger-{uuid.uuid4().hex[:8]}"
+    user = User(
+        username=f"ledger-user-{uuid.uuid4().hex[:8]}",
+        hashed_password="unused",
+        tenant_id=tenant,
+    )
+    db.add(user)
+    db.flush()
+    db.add(Job(
+        job_id=old_id, user_id=user.id, tenant_id=tenant,
+        artist="Bersuit", song_title="La Argentinidad",
+        filename="old.mp3", status="error",
+    ))
+    now = datetime.now(timezone.utc)
+    for _ in range(10):
+        db.add(AIProvenance(
+            job_id=old_id, step="video_bg",
+            tool_name="veo-3.1-fast-generate-001",
+            tool_provider="google_vertex", prompt_sent="paid",
+            response_summary="provider_ok", created_at=now,
+        ))
+    db.add(AIProvenance(
+        job_id=old_id, step="video_bg",
+        tool_name="veo-3.1-fast-generate-001",
+        tool_provider="google_vertex", prompt_sent="cache",
+        response_summary=f"{CACHE_HIT_PREFIX}: key=x", created_at=now,
+    ))
+    db.commit()
+
+    monkeypatch.setattr(jobs, "_delete_r2_objects", lambda *_a, **_k: None)
+    try:
+        assert jobs.delete_job(db, old_id, tenant) == (True, "ok")
+        expected_scope = scope_hash(
+            tenant, pipeline._song_identity(
+                "Bersuit", "La Argentinidad", old_id,
+            ),
+        )
+        ledger = db.query(VeoBudgetLedger).filter(
+            VeoBudgetLedger.scope_hash == expected_scope,
+        ).all()
+        assert len(ledger) == 10
+        assert db.query(AIProvenance).filter(
+            AIProvenance.job_id == old_id).count() == 0
+
+        db.add(Job(
+            job_id=new_id, user_id=user.id, tenant_id=tenant,
+            artist="Bersuit", song_title="La Argentinidad",
+            filename="new.mp3", status="processing",
+        ))
+        db.commit()
+        monkeypatch.setattr(pipeline, "VEO_MAX_CALLS_PER_SONG", 10)
+        assert pipeline._veo_budget_exceeded(new_id) == (True, 10)
+    finally:
+        db.query(AIProvenance).filter(
+            AIProvenance.job_id.in_([old_id, new_id])).delete(
+            synchronize_session=False)
+        db.query(Job).filter(Job.job_id.in_([old_id, new_id])).delete(
+            synchronize_session=False)
+        db.query(VeoBudgetLedger).filter(
+            VeoBudgetLedger.scope_hash == scope_hash(
+                tenant, pipeline._song_identity(
+                    "Bersuit", "La Argentinidad", old_id,
+                ),
+            )).delete(synchronize_session=False)
+        db.query(User).filter(User.id == user.id).delete(
+            synchronize_session=False)
+        db.commit()
 
 
 def test_el_presupuesto_es_POR_CANCION_no_por_job(monkeypatch):

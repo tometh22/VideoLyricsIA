@@ -265,6 +265,8 @@ def test_delete_job_calls_r2_cleanup(monkeypatch):
     job = MagicMock()
     job.job_id = "j-cleanup-test"
     job.tenant_id = "t1"
+    job.artist = "Artist"
+    job.song_title = "Song"
     job.status = "error"
     db = _mock_db_for_job(job)
 
@@ -310,6 +312,9 @@ def test_bulk_delete_jobs_cleans_all_deletable(monkeypatch):
     def _make_row(job_id, status):
         r = MagicMock(spec=_Job)
         r.job_id = job_id
+        r.tenant_id = "t1"
+        r.artist = "Artist"
+        r.song_title = job_id
         r.status = status
         r.input_r2_key = f"inputs/{job_id}/track.wav"
         r.s3_keys = {}
@@ -325,3 +330,72 @@ def test_bulk_delete_jobs_cleans_all_deletable(monkeypatch):
     # R2 cleanup only for deletable rows (j1, j2), not protected (j3)
     assert set(cleanup_calls) == {"j1", "j2"}
     assert "j3" not in cleanup_calls
+
+
+def test_bulk_delete_archives_paid_veo_before_removing_provenance(
+    db, monkeypatch,
+):
+    import uuid
+    from datetime import datetime, timezone
+
+    import jobs
+    from cost_attribution import song_key
+    from database import AIProvenance, Job, User, VeoBudgetLedger
+    from veo_budget import scope_hash
+
+    tenant = f"bulk-ledger-{uuid.uuid4().hex[:8]}"
+    user = User(
+        username=f"bulk-ledger-user-{uuid.uuid4().hex[:8]}",
+        hashed_password="unused",
+        tenant_id=tenant,
+    )
+    db.add(user)
+    db.flush()
+    rows = [
+        Job(job_id="bulkveoled01", user_id=user.id, tenant_id=tenant,
+            artist="A", song_title="One", filename="1.mp3", status="error"),
+        Job(job_id="bulkveoled02", user_id=user.id, tenant_id=tenant,
+            artist="A", song_title="Two", filename="2.mp3", status="queued"),
+    ]
+    db.add_all(rows)
+    db.flush()
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        db.add(AIProvenance(
+            job_id=row.job_id, step="video_bg",
+            tool_name="veo-3.1-fast-generate-001",
+            tool_provider="google_vertex", prompt_sent="paid",
+            response_summary="provider_ok", created_at=now,
+        ))
+    db.commit()
+    scopes = {
+        scope_hash(tenant, song_key(row.artist, row.song_title, row.job_id))
+        for row in rows
+    }
+    monkeypatch.setattr(jobs, "_delete_r2_objects", lambda *_a, **_k: None)
+
+    try:
+        result = jobs.bulk_delete_jobs(
+            db, [row.job_id for row in rows], tenant,
+        )
+        assert set(result["deleted"]) == {row.job_id for row in rows}
+        ledger = db.query(VeoBudgetLedger).filter(
+            VeoBudgetLedger.scope_hash.in_(scopes),
+        ).all()
+        assert len(ledger) == 2
+        assert db.query(AIProvenance).filter(
+            AIProvenance.job_id.in_([row.job_id for row in rows]),
+        ).count() == 0
+    finally:
+        db.query(VeoBudgetLedger).filter(
+            VeoBudgetLedger.scope_hash.in_(scopes),
+        ).delete(synchronize_session=False)
+        db.query(AIProvenance).filter(
+            AIProvenance.job_id.in_([row.job_id for row in rows]),
+        ).delete(synchronize_session=False)
+        db.query(Job).filter(
+            Job.job_id.in_([row.job_id for row in rows]),
+        ).delete(synchronize_session=False)
+        db.query(User).filter(User.id == user.id).delete(
+            synchronize_session=False)
+        db.commit()

@@ -193,6 +193,82 @@ def test_provider_errors_retry_then_fall_back_without_caching(monkeypatch):
     ]
 
 
+def test_provider_fallback_returned_as_a_file_is_never_cached(monkeypatch):
+    """_ensure_background swallows Veo exhaustion and returns a gradient.
+
+    A valid local file is not proof of a provider result: the explicit marker
+    must keep that degraded artifact out of the shared content cache.
+    """
+    events = []
+    _wire_preview(monkeypatch, events, validation_passes=True)
+
+    def fallback_file(_style, job_dir, **kwargs):
+        path = f"{job_dir}/bg_gradient_fallback.mp4"
+        with open(path, "wb") as fh:
+            fh.write(b"gradient")
+        kwargs["out_meta"].update({
+            "provider_fallback": True,
+            "fallback_reason": "veo_budget_exceeded",
+        })
+        events.append("provider_fallback")
+        return path
+
+    monkeypatch.setattr(pipeline, "_ensure_background", fallback_file)
+    monkeypatch.setattr(
+        bg_preview,
+        "cache_put",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("provider fallback must never enter shared cache")
+        ),
+    )
+
+    result = bg_preview.run_bg_preview_job(
+        "previewjob01", "cachekey", {"background_hint": "empty room"},
+    )
+
+    assert result["status"] == "bg_preview_done"
+    assert events == ["provider_fallback", "fallback"]
+
+
+def test_ensure_background_marks_budget_gradient_as_provider_fallback(
+    monkeypatch, tmp_path,
+):
+    class FakeGradient:
+        def write_videofile(self, path, **_kwargs):
+            with open(path, "wb") as fh:
+                fh.write(b"gradient")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        pipeline, "_get_unique_prompt", lambda *_a, **_k: {"prompt": "p"},
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_generate_veo_video",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            pipeline.VeoBudgetExceeded("10/10")
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline, "_make_gradient_clip", lambda *_a, **_k: FakeGradient(),
+    )
+    monkeypatch.setattr("veo_breaker.is_open", lambda: False)
+    meta = {}
+
+    result = pipeline._ensure_background(
+        "auto", str(tmp_path), artist="A", song_title="S",
+        job_id="previewjob01", out_meta=meta,
+    )
+
+    assert result.endswith("bg_gradient_fallback.mp4")
+    assert meta == {
+        "provider_fallback": True,
+        "fallback_reason": "veo_budget_exceeded",
+    }
+
+
 def test_preview_reraises_rq_death_penalty(monkeypatch):
     events = []
     _wire_preview(monkeypatch, events, validation_passes=True)

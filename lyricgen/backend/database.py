@@ -1326,6 +1326,33 @@ class AIProvenance(Base):
     job = relationship("Job", back_populates="provenance")
 
 
+class VeoBudgetLedger(Base):
+    """Minimal spend tombstones that survive deletion of failed jobs.
+
+    The rolling Veo ceiling cannot depend solely on ``ai_provenance`` because
+    operators may hard-delete stuck/failed jobs and their provenance rows.
+    We retain no catalogue metadata or prompt here: ``scope_hash`` is a
+    one-way tenant+song identity and ``source_provenance_id`` only makes the
+    archival insert idempotent.
+    """
+    __tablename__ = "veo_budget_ledger"
+    __table_args__ = (
+        Index(
+            "ix_veo_budget_ledger_scope_call_at",
+            "scope_hash",
+            "provider_call_at",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    scope_hash = Column(String(64), nullable=False)
+    source_provenance_id = Column(Integer, unique=True, nullable=False)
+    provider_call_at = Column(DateTime(timezone=True), nullable=False)
+    archived_at = Column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True,
+    )
+
+
 class LyricsCache(Base):
     """Reference lyrics fetched via Gemini-grounded web search, cached
     per (artist, title) so we only pay Gemini once per song across the

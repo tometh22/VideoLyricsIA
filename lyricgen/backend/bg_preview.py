@@ -347,6 +347,7 @@ def run_bg_preview_job(
             # namespace. Never turn the preview tracker into a rejected video.
             bg_path = None
             for safety_attempt in range(2):
+                generation_meta = {}
                 try:
                     candidate = _ensure_background(
                         params.get("style", "auto"),
@@ -387,6 +388,7 @@ def run_bg_preview_job(
                             f"preview-{job_id}-{safety_attempt}"
                             if safety_attempt else ""
                         ),
+                        out_meta=generation_meta,
                     )
                 except Exception as generation_error:
                     _raise_if_job_timeout(generation_error)
@@ -395,6 +397,15 @@ def run_bg_preview_job(
                         job_id, safety_attempt + 1, generation_error,
                     )
                     continue
+                if generation_meta.get("provider_fallback"):
+                    logger.warning(
+                        "[BG_PREVIEW] job=%s provider fallback=%s — no se "
+                        "valida ni cachea bajo key=%s",
+                        job_id,
+                        generation_meta.get("fallback_reason", "unknown"),
+                        bg_cache_key,
+                    )
+                    break
                 if not candidate or not os.path.exists(candidate):
                     continue
                 if _validate_background_asset_for_job(

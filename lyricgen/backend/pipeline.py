@@ -9456,12 +9456,11 @@ def _veo_budget_exceeded(job_id: str | None,
         return False, 0
     try:
         from datetime import datetime as _dt, timedelta, timezone as _tz
-        import hashlib as _hashlib
-
         from sqlalchemy import func as _func, text as _sql_text
 
-        from database import AIProvenance, Job, SessionLocal
+        from database import AIProvenance, Job, SessionLocal, VeoBudgetLedger
         from provenance import BUDGET_RESERVED_PREFIX, billable_filter
+        from veo_budget import advisory_lock_key, scope_hash
 
         db = SessionLocal()
         try:
@@ -9471,22 +9470,20 @@ def _veo_budget_exceeded(job_id: str | None,
             title = (row[1] if row else "") or ""
             tenant = (row[2] if row else "") or ""
             mio = _song_identity(artist, title, job_id)
+            budget_scope = scope_hash(tenant, mio)
 
-            # Cross-process serialization in production. Diagnostic calls
-            # without a recorder row remain read-only; SQLite is used by the
-            # local suite and serializes its writes independently.
+            # Cross-process serialization in production. Deletions take this
+            # same lock while atomically moving spend from live provenance to
+            # the tombstone ledger. Diagnostic/preflight reads also lock so
+            # their separate live+ledger SELECTs cannot straddle that move and
+            # briefly double-count it. SQLite is used by the local suite and
+            # serializes its writes independently.
             bind = getattr(db, "bind", None)
             dialect = getattr(getattr(bind, "dialect", None), "name", "")
-            if own_row_id is not None and dialect == "postgresql":
-                scope = f"{tenant}\0{mio}".encode("utf-8")
-                lock_key = int.from_bytes(
-                    _hashlib.sha256(scope).digest()[:8],
-                    byteorder="big",
-                    signed=True,
-                )
+            if dialect == "postgresql":
                 db.execute(
                     _sql_text("SELECT pg_advisory_xact_lock(:lock_key)"),
-                    {"lock_key": lock_key},
+                    {"lock_key": advisory_lock_key(budget_scope)},
                 )
 
             since = _dt.now(_tz.utc) - timedelta(days=VEO_BUDGET_WINDOW_DAYS)
@@ -9535,7 +9532,15 @@ def _veo_budget_exceeded(job_id: str | None,
                 q = q.filter(AIProvenance.created_at >= since)
                 alcance = f"job {job_id} (sin metadata de canción)"
 
-            n = int(q.scalar() or 0)
+            live_count = int(q.scalar() or 0)
+            archived_count = int(
+                db.query(_func.count(VeoBudgetLedger.id))
+                .filter(VeoBudgetLedger.scope_hash == budget_scope)
+                .filter(VeoBudgetLedger.provider_call_at >= since)
+                .scalar()
+                or 0
+            )
+            n = live_count + archived_count
 
             # Reserve inside the same transaction as the advisory lock. The
             # next worker must see this row as billable before deciding.
@@ -12021,7 +12026,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        allow_people: bool = False,
                        atmospherics_policy: dict | None = None,
                        audio_duration: float | None = None,
-                       generation_nonce: str = "") -> str:
+                       generation_nonce: str = "",
+                       out_meta: dict | None = None) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     background_hint: optional free-form operator description, set via /edit
@@ -12039,6 +12045,10 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
 
     Returns path to .mp4 (video style) or .jpg/.png (photo/illustration style).
     """
+    if out_meta is not None:
+        out_meta["provider_fallback"] = False
+        out_meta.pop("fallback_reason", None)
+
     creative_mode = resolve_creative_mode(
         match_lyrics=match_lyrics,
         operator_prompt=background_hint,
@@ -12241,6 +12251,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 raise RuntimeError("Veo returned no living-photo artifact")
             except Exception as exc:
                 _raise_if_job_timeout(exc)
+                if out_meta is not None:
+                    out_meta["provider_fallback"] = True
+                    out_meta["fallback_reason"] = "foto_viva_provider_failed"
                 logger.warning(
                     "[BG] foto_viva provider failed; using bounded local "
                     "photo-motion fallback: %s", exc,
@@ -12326,6 +12339,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     import veo_breaker
     _veo_breaker_open = veo_breaker.is_open()
     if _veo_breaker_open:
+        if out_meta is not None:
+            out_meta["fallback_reason"] = "veo_breaker_open"
         logger.warning("[BG] Veo breaker OPEN — short-circuiting to gradient (skipping Veo)")
     # 1 retry interno (2 intentos). Antes eran 3, lo que sumado al
     # poll_deadline de 600s de Veo podía exceder cualquier job_timeout
@@ -12477,12 +12492,16 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # 30s de espera, así que reintentar sólo agrega latencia y otro
             # ciclo de reserva+borrado de fila. Directo al fallback local.
             logger.error("[BG] %s — sin reintento, al fallback", e)
+            if out_meta is not None:
+                out_meta["fallback_reason"] = "veo_budget_exceeded"
             break
         except VeoAmbiguousSubmission as e:
             # Vertex may already be rendering and billing this operation. The
             # inner submitter preserved one reservation; do not re-enter it
             # from this outer quality/transient retry loop.
             logger.error("[BG] %s — envío ambiguo, sin reintento", e)
+            if out_meta is not None:
+                out_meta["fallback_reason"] = "veo_ambiguous_submission"
             break
         except Exception as e:
             logger.error("[BG] Veo 3 attempt %s/2 failed: %s", attempt + 1, e)
@@ -12500,6 +12519,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             "falling back to local masked motion"
         )
         _static_image_to_mp4(image_to_video_path, bg_path, duration=60.0)
+        if out_meta is not None:
+            out_meta["provider_fallback"] = True
+            out_meta.setdefault("fallback_reason", "foto_viva_provider_failed")
         return bg_path
 
     # All Veo attempts failed — render a gradient as fallback.
@@ -12507,6 +12529,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     # tenants need clear provenance of every visual element, and a stock asset
     # silently substituted into an AI-mode job would break that contract.
     logger.warning("[BG] Veo 3 unavailable, falling back to gradient background")
+    if out_meta is not None:
+        out_meta["provider_fallback"] = True
+        out_meta.setdefault("fallback_reason", "veo_unavailable")
     fallback_path = os.path.join(job_dir, "bg_gradient_fallback.mp4")
     gradient = _make_gradient_clip(30.0, style_hint)
     gradient.write_videofile(fallback_path, fps=24, logger=None)
