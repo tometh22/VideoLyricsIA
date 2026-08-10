@@ -12403,6 +12403,16 @@ async def regenerate_scene(
 
     # Nota: el re-roll de escena NO incrementa job.edit_count — tiene su propio
     # cupo (SCENE_REROLL_MAX, contado vía audit log arriba).
+    _pre_regen_status = job.status
+    _pre_regen_completed_at = job.completed_at
+    _pre_regen_editing_started_at = job.editing_started_at
+    _pre_regen_progress = job.progress
+    _pre_regen_current_step = job.current_step
+    # A rejection timestamp is not a delivery timestamp. Clear it before a
+    # rescue so the eventual done/pending_review transition is stamped in the
+    # real delivery month; already delivered jobs retain their completion.
+    if job.status not in ("done", "pending_review"):
+        job.completed_at = None
     job.status = "editing"
     job.current_step = "scenes"
     job.progress = 0
@@ -12425,11 +12435,12 @@ async def regenerate_scene(
         )
     except Exception as exc:
         logger.error("enqueue_edit (scene) failed for %s: %s", job_id, exc)
-        job.status = "pending_review"
+        job.status = _pre_regen_status
+        job.completed_at = _pre_regen_completed_at
         # el re-roll de escena no tocó edit_count → nada que revertir acá
-        job.editing_started_at = None
-        job.progress = 100
-        job.current_step = "thumbnail"
+        job.editing_started_at = _pre_regen_editing_started_at
+        job.progress = _pre_regen_progress
+        job.current_step = _pre_regen_current_step
         db.commit()
         raise HTTPException(status_code=503, detail="No se pudo encolar la regeneración. Reintentá.")
 

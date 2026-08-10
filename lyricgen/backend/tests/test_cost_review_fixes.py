@@ -13,6 +13,7 @@ usaba, o que mezclaran meses:
 """
 
 from datetime import datetime, timedelta, timezone
+import json
 
 import pytest
 
@@ -495,7 +496,9 @@ def test_un_refresh_historico_ok_pero_vacio_no_pisa(client, admin_token, db,
     db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
     db.add(CostSnapshot(period=period, source="replicate", amount_usd=19.25,
                         status="ok", detail="captura original",
-                        is_estimate=True, breakdown=[{"runs": 20}]))
+                        is_estimate=True, breakdown=[{"runs": 20}],
+                        fetched_at=datetime(2020, 7, 20,
+                                            tzinfo=timezone.utc)))
     db.commit()
     monkeypatch.setattr(billing_sources, "fetch_all", lambda **kw: {
         "period": period, "total_usd": 0.0,
@@ -522,6 +525,53 @@ def test_un_refresh_historico_ok_pero_vacio_no_pisa(client, admin_token, db,
         assert row.breakdown == [{"runs": 20}]
     finally:
         db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+        db.commit()
+
+
+def test_primer_refresh_maduro_finaliza_snapshot_provisional(
+    client, admin_token, db, monkeypatch,
+):
+    """Una captura GCP hecha durante el mes no puede congelar gasto parcial."""
+    import billing_sources
+    from database import CostSnapshot
+
+    period = "2020-09"
+    db.query(CostSnapshot).filter(
+        CostSnapshot.period == period, CostSnapshot.source == "gcp").delete()
+    db.add(CostSnapshot(
+        period=period, source="gcp", amount_usd=40.0, status="ok",
+        detail="captura parcial", breakdown=[],
+        fetched_at=datetime(2020, 9, 15, tzinfo=timezone.utc),
+    ))
+    db.commit()
+    monkeypatch.setattr(billing_sources, "fetch_all", lambda **kw: {
+        "period": period, "total_usd": 100.0,
+        "sources": [{"source": "gcp", "amount_usd": 100.0,
+                     "status": "ok", "detail": "factura madura",
+                     "is_estimate": False,
+                     "breakdown": [{"service": "Vertex AI", "cost": 100.0}]}],
+    })
+    try:
+        response = client.post(
+            f"/admin/cost/refresh?period={period}&only=gcp",
+            headers=auth(admin_token),
+        )
+        assert response.status_code == 200, response.text
+        entry = response.json()["sources"][0]
+        assert entry.get("kept_previous") is not True
+        assert entry["amount_usd"] == 100.0
+        db.expire_all()
+        row = db.query(CostSnapshot).filter(
+            CostSnapshot.period == period,
+            CostSnapshot.source == "gcp",
+        ).one()
+        assert row.amount_usd == 100.0
+        assert row.detail == "factura madura"
+    finally:
+        db.query(CostSnapshot).filter(
+            CostSnapshot.period == period,
+            CostSnapshot.source == "gcp",
+        ).delete()
         db.commit()
 
 
@@ -765,6 +815,8 @@ def test_unit_economics_conserva_una_entrega_mientras_se_edita(
     try:
         monthly = ca.collect_jobs(db, "test", period="2020-06")
         assert monthly["rd1"].delivered is True
+        all_time = ca.collect_jobs(db, "test")
+        assert all_time["rd1"].delivered is True
         body = client.get(
             "/admin/cost/unit-economics?period=2020-06",
             headers=auth(admin_token),
@@ -860,6 +912,23 @@ def test_gcp_separa_vertex_de_storage_y_red():
         "gcp_infrastructure": 30.0,
     }
     assert out["invoices_total"] == 100.0
+
+
+def test_cli_transporta_el_breakdown_de_gcp():
+    from scripts.umg_cost_report import parse_invoices
+
+    invoices, breakdowns = parse_invoices(json.dumps({
+        "gcp": {
+            "amount_usd": 100,
+            "breakdown": [
+                {"service": "Vertex AI", "sku": "Veo", "cost": 70},
+                {"service": "Cloud Storage", "sku": "Storage", "cost": 30},
+            ],
+        },
+        "railway": 20,
+    }))
+    assert invoices == {"gcp": 100.0, "railway": 20.0}
+    assert breakdowns["gcp"][1]["service"] == "Cloud Storage"
 
 
 # ---------------------------------------------------------------------------

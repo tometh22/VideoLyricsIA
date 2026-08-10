@@ -28,7 +28,10 @@ Usage
     export DATABASE_URL_PROD='postgresql://...'      # prod
     export DATABASE_URL_STAGING='postgresql://...'   # staging
     python scripts/umg_cost_report.py --period 2026-07 \
-        --invoices '{"gcp":199.53,"railway":126.02,"r2":18.84,"fixed":44,
+        --invoices '{"gcp":{"amount_usd":199.53,"breakdown":[
+                       {"service":"Vertex AI","sku":"Veo","cost":163.20},
+                       {"service":"Cloud Storage","sku":"Storage","cost":36.33}]},
+                     "railway":126.02,"r2":18.84,"fixed":44,
                      "openai":4.18,"replicate":6.10}' \
         --revenue 2000
 
@@ -61,6 +64,43 @@ def _session(url: str):
 
 def _fmt_usd(v) -> str:
     return "—" if v is None else f"${v:,.2f}"
+
+
+def parse_invoices(raw: str) -> tuple[dict[str, float], dict[str, list[dict]]]:
+    """Parse flat amounts plus optional provider service breakdowns.
+
+    Backwards compatible input keeps working (``{"gcp": 199.53}``). A source
+    may instead be an object with ``amount_usd`` and ``breakdown``; this is
+    required for GCP when Storage/networking must be split from Vertex AI.
+    """
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("--invoices debe ser un objeto JSON por fuente")
+    invoices: dict[str, float] = {}
+    breakdowns: dict[str, list[dict]] = {}
+    for source, value in payload.items():
+        if isinstance(value, dict):
+            amount = value.get("amount_usd")
+            breakdown = value.get("breakdown", [])
+            if not isinstance(breakdown, list) or not all(
+                isinstance(row, dict) for row in breakdown
+            ):
+                raise ValueError(
+                    f"--invoices {source}.breakdown debe ser una lista de objetos"
+                )
+            if breakdown:
+                breakdowns[str(source)] = breakdown
+        else:
+            amount = value
+        if isinstance(amount, bool):
+            raise ValueError(f"--invoices {source} no es un monto válido")
+        try:
+            invoices[str(source)] = float(amount)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"--invoices {source} requiere un monto numérico"
+            ) from exc
+    return invoices, breakdowns
 
 
 def render_markdown(a: dict, top_n: int) -> str:
@@ -193,7 +233,8 @@ def main() -> int:
     ap.add_argument("--period", default=None,
                     help="YYYY-MM; omitir = todo el histórico")
     ap.add_argument("--invoices", default=None,
-                    help='JSON {"gcp":199.53,"railway":126.02,...} — habilita el nivel 2')
+                    help=('JSON por fuente; admite monto plano o '
+                          '{"amount_usd":...,"breakdown":[...]} — habilita nivel 2'))
     ap.add_argument("--revenue", type=float, default=None,
                     help="ingreso del período para calcular margen (ej. 2000)")
     ap.add_argument("--basis", choices=("cost", "jobs"), default="cost",
@@ -252,13 +293,14 @@ def main() -> int:
 
         if args.invoices:
             try:
-                invoices = json.loads(args.invoices)
-            except json.JSONDecodeError as e:
-                print(f"ERROR: --invoices no es JSON válido: {e}",
+                invoices, invoice_breakdowns = parse_invoices(args.invoices)
+            except (json.JSONDecodeError, ValueError) as e:
+                print(f"ERROR: --invoices inválido: {e}",
                       file=sys.stderr)
                 return 2
             ca.add_total_cost(attribution, invoices,
-                              revenue_usd=args.revenue, basis=args.basis)
+                              revenue_usd=args.revenue, basis=args.basis,
+                              invoice_breakdowns=invoice_breakdowns)
 
         if args.json:
             print(json.dumps(attribution, indent=2, ensure_ascii=False,
