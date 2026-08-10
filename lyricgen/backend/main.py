@@ -4431,6 +4431,9 @@ async def generate_preview(
     )
 
     params = body.model_dump()
+    # Internal, authenticated scope used to resolve the tenant canary before
+    # both hashing and generation. It is not accepted from the request model.
+    params["_tenant_id"] = current_user.get("tenant_id", "")
     bg_cache_key = compute_bg_cache_key(params)
 
     # Fast path — cache hit.
@@ -8707,6 +8710,7 @@ async def generate_with_segments(
                 concept=concept,
                 background_hint=(background_hint.strip() or None),
                 bg_verbatim=bg_verbatim, match_lyrics=match_lyrics,
+                tenant_id=current_user.get("tenant_id", ""),
             )
         except Exception as _recompute_err:
             logger.warning(

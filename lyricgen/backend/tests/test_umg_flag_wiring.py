@@ -185,12 +185,13 @@ def test_el_default_se_resuelve_antes_de_elegir_el_camino():
     que elige escenas, y los tres caminos de fondo lo usan.
     """
     src = inspect.getsource(pipeline.run_pipeline)
-    i_resuelve = src.index("_bg_movement = movement_style")
+    i_resuelve = src.index("_bg_movement = _sc_default.effective_movement_for_tenant")
     i_ramifica = src.index("and enable_scenes")
     assert i_resuelve < i_ramifica, (
         "el default tiene que resolverse ANTES de elegir escenas vs fondo único")
-    # Los tres consumidores lo usan; ninguno se quedó con el crudo.
-    assert src.count("movement_style=_bg_movement") == 3, (
+    # Los tres generadores y la validación de cache lo usan; ninguno se quedó
+    # con el valor crudo.
+    assert src.count("movement_style=_bg_movement") == 4, (
         "algún camino de fondo sigue recibiendo el movement_style sin resolver")
 
 
@@ -204,12 +205,76 @@ def test_el_default_no_pisa_la_eleccion_guardada_del_operador():
         "operador, no el default resuelto")
 
 
-def test_la_clave_de_cache_del_preview_usa_el_movimiento_crudo():
-    """El preview calculó su hash con lo que mandó el wizard. Validar la clave
-    contra el movimiento ya resuelto la invalidaría siempre y tiraría a la
-    basura el fondo pre-generado."""
+def test_la_validacion_de_cache_usa_el_movimiento_efectivo():
+    """Preview y render deben hashear el asset que realmente generan. Usar el
+    Auto crudo permitiría reutilizar un video móvil en el tenant canary."""
     src = inspect.getsource(pipeline.run_pipeline)
     i_val = src.index("_validate_bg_cache_key(")
     bloque = src[i_val:i_val + 600]
-    assert "movement_style=movement_style" in bloque
-    assert "_bg_movement" not in bloque
+    assert "movement_style=_bg_movement" in bloque
+
+
+def test_el_cache_separa_auto_historico_del_default_del_tenant(monkeypatch):
+    import bg_preview
+
+    monkeypatch.setattr(scenes, "DEFAULT_MOVEMENT_WHEN_AUTO", "estatico")
+    monkeypatch.setattr(scenes, "DEFAULT_MOVEMENT_TENANTS",
+                        frozenset({"universal_argentina"}))
+    base = {"artist": "Bersuit", "song_title": "La Argentinidad",
+            "style": "auto", "movement_style": ""}
+
+    canary = bg_preview.compute_bg_cache_key(
+        {**base, "_tenant_id": "universal_argentina"})
+    historical = bg_preview.compute_bg_cache_key(
+        {**base, "_tenant_id": "otro_sello"})
+    explicit_static = bg_preview.compute_bg_cache_key(
+        {**base, "movement_style": "estatico", "_tenant_id": "otro_sello"})
+
+    assert canary != historical
+    assert canary == explicit_static
+
+
+def test_el_worker_de_preview_genera_con_el_movimiento_efectivo(monkeypatch):
+    import os
+
+    import bg_preview
+    import jobs
+
+    monkeypatch.setattr(scenes, "DEFAULT_MOVEMENT_WHEN_AUTO", "estatico")
+    monkeypatch.setattr(scenes, "DEFAULT_MOVEMENT_TENANTS",
+                        frozenset({"universal_argentina"}))
+    monkeypatch.setattr(bg_preview, "cache_check", lambda _key: False)
+    monkeypatch.setattr(bg_preview, "cache_put", lambda key, _path: key)
+    monkeypatch.setattr(jobs, "update_job", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "_compute_allow_people", lambda *a, **k: False)
+    monkeypatch.setattr(pipeline, "_raise_if_job_timeout", lambda _e: None)
+    monkeypatch.setattr(pipeline, "_validate_background_asset_for_job",
+                        lambda *a, **k: True)
+    captured = {}
+
+    def _fake_ensure(_style, job_dir, **kwargs):
+        captured["movement_style"] = kwargs.get("movement_style")
+        path = os.path.join(job_dir, "preview.mp4")
+        with open(path, "w") as output:
+            output.write("preview")
+        return path
+
+    monkeypatch.setattr(pipeline, "_ensure_background", _fake_ensure)
+    params = {
+        "artist": "Bersuit", "song_title": "La Argentinidad",
+        "style": "auto", "movement_style": "",
+        "_tenant_id": "universal_argentina",
+    }
+    from background_policy import runtime_rollout_fingerprint
+    key = bg_preview.compute_bg_cache_key(params)
+    result = bg_preview.run_bg_preview_job(
+        "previewcanary", key, params, runtime_rollout_fingerprint())
+    assert result["status"] == "bg_preview_done"
+    assert captured["movement_style"] == "estatico"
+
+
+def test_las_ediciones_reaplican_el_default_del_tenant():
+    src = inspect.getsource(pipeline.run_edit_pipeline)
+    assert "effective_movement_for_tenant" in src
+    assert src.count("movement_style=_edit_bg_movement") == 3
+    assert "_normalize_movement_style(_edit_bg_movement)" in src

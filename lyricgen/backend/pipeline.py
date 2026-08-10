@@ -632,6 +632,7 @@ def _validate_bg_cache_key(bg_cache_key, *, job_id, artist, song_title, style,
             custom_colors=custom_colors, genre=genre, concept=concept,
             background_hint=background_hint, bg_verbatim=bg_verbatim,
             match_lyrics=match_lyrics,
+            tenant_id=_tenant_of_job(job_id),
         )
         if expected is None or bg_cache_key != expected:
             logger.warning(
@@ -1348,16 +1349,15 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # guarda la elección del OPERADOR, y el editor la pinta desde ahí.
             # Si lo sobrescribiéramos, el operador vería "Estático" donde
             # eligió "Auto".
-            _bg_movement = movement_style
-            if not _normalize_movement_style(movement_style):
-                import scenes as _sc_default
-                _tenant_default = _sc_default.default_movement_for_tenant(
-                    _tenant_of_job(job_id))
-                if _tenant_default:
-                    _bg_movement = _tenant_default
-                    logger.info(
-                        "[BG] Auto → %s por default de tenant job=%s",
-                        _tenant_default, job_id)
+            import scenes as _sc_default
+            _bg_movement = _sc_default.effective_movement_for_tenant(
+                movement_style, _tenant_of_job(job_id)
+            )
+            if (_bg_movement
+                    and not _normalize_movement_style(movement_style)):
+                logger.info(
+                    "[BG] Auto → %s por default de tenant job=%s",
+                    _bg_movement, job_id)
 
             # Multi-scene owns its own per-clip cache. A stale single-background
             # preview key must never short-circuit the scenes branch.
@@ -1368,7 +1368,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 bg_cache_key = _validate_bg_cache_key(
                     bg_cache_key, job_id=job_id, artist=artist,
                     song_title=song_title, style=style,
-                    movement_style=movement_style, effect=effect,
+                    movement_style=_bg_movement, effect=effect,
                     custom_colors=custom_colors, genre=genre, concept=concept,
                     background_hint=background_hint, bg_verbatim=bg_verbatim,
                     match_lyrics=match_lyrics,
@@ -2008,7 +2008,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 # camino de fondo humano: hasta ahora el eje entero era inerte
                 # acá (se enviaba, se persistía y nadie lo leía).
                 still_background=(
-                    _normalize_movement_style(movement_style) in {"estatico", "foto-estatica"}
+                    _normalize_movement_style(_bg_movement) in {"estatico", "foto-estatica"}
                 ),
             )
             # Cinemascope opt-in: letterbox the finished YouTube master. Skipped
@@ -16318,6 +16318,13 @@ def run_edit_pipeline(
     genre = merged.get("genre") or ""
     concept = merged.get("concept") or ""
     movement_style = merged.get("movement_style") or ""
+    # Same effective value used by initial renders and previews. The raw Auto
+    # selection remains in render_params; only artifact-producing paths use
+    # the tenant-specific default.
+    import scenes as _edit_scenes
+    _edit_bg_movement = _edit_scenes.effective_movement_for_tenant(
+        movement_style, _tenant_of_job(job_id)
+    )
     # Effect overlay + custom palette persist across edits via render_params,
     # so a re-render keeps the snow/rain/grade the operator picked at upload.
     effect = merged.get("effect") or ""
@@ -16580,7 +16587,7 @@ def run_edit_pipeline(
                     style, job_dir,
                     lyrics_text=lyrics_text, artist=artist, job_id=job_id,
                     song_title=song_title, genre=genre, concept=concept,
-                    movement_style=movement_style,
+                    movement_style=_edit_bg_movement,
                     background_hint=effective_background_hint,
                     bg_mode=background_mode,
                     bg_verbatim=bg_verbatim,
@@ -16766,7 +16773,7 @@ def run_edit_pipeline(
                         style, job_dir,
                         lyrics_text=lyrics_text, artist=artist, job_id=job_id,
                         song_title=song_title, genre=genre, concept=concept,
-                        movement_style=movement_style,
+                        movement_style=_edit_bg_movement,
                         image_to_video_path=_cbg_local,
                         background_hint=effective_background_hint,
                         bg_mode=background_mode,
@@ -16945,7 +16952,7 @@ def run_edit_pipeline(
                             lyrics_text=lyrics_text, artist=artist,
                             job_id=job_id, song_title=song_title,
                             genre=genre, concept=concept,
-                            movement_style=movement_style,
+                            movement_style=_edit_bg_movement,
                             background_hint=effective_background_hint,
                             bg_mode=background_mode,
                             bg_verbatim=bg_verbatim,
@@ -17053,7 +17060,7 @@ def run_edit_pipeline(
             bg_prelooped=bg_prelooped,
             # Espejo de run_pipeline: un edit no puede perder el "quieta".
             still_background=(
-                _normalize_movement_style(movement_style) in {"estatico", "foto-estatica"}
+                _normalize_movement_style(_edit_bg_movement) in {"estatico", "foto-estatica"}
             ),
         )
         # Cinemascope opt-in — mirror run_pipeline. YouTube master only.

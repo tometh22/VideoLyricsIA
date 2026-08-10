@@ -471,6 +471,18 @@ def default_movement_for_tenant(tenant_id: str | None) -> str:
             else "")
 
 
+def effective_movement_for_tenant(movement_style: str | None,
+                                  tenant_id: str | None) -> str:
+    """Operator choice when explicit; otherwise the tenant canary default.
+
+    Keep the raw value persisted in ``render_params`` so the editor continues
+    to display Auto. This helper is for every consumer that creates or keys an
+    artifact: preview, cache validation, initial render and edits.
+    """
+    raw = (movement_style or "").strip()
+    return raw or default_movement_for_tenant(tenant_id)
+
+
 def energy_to_movement(energy: float) -> str:
     """Mapea energía de sección al movement_style existente del pipeline.
 

@@ -113,6 +113,11 @@ def compute_bg_cache_key(params: dict) -> str:
     )
     atmospheric_policy = resolve_atmospherics_policy(raw_operator_prompt)
 
+    from scenes import effective_movement_for_tenant
+
+    effective_movement = effective_movement_for_tenant(
+        params.get("movement_style"), params.get("_tenant_id")
+    )
     canonical = {
         "_cache_version": CACHE_VERSION,
         "_creative_mode": creative_mode,
@@ -120,7 +125,7 @@ def compute_bg_cache_key(params: dict) -> str:
         "artist":          (params.get("artist") or "").strip(),
         "song_title":      (params.get("song_title") or "").strip(),
         "style":           (params.get("style") or "").strip().lower(),
-        "movement_style":  (params.get("movement_style") or "").strip().lower(),
+        "movement_style":  effective_movement.strip().lower(),
         "effect":          (params.get("effect") or "").strip().lower(),
         "custom_colors":   (params.get("custom_colors") or "").strip().lower(),
         "genre":           (params.get("genre") or "").strip().lower(),
@@ -140,7 +145,7 @@ def compute_bg_cache_key(params: dict) -> str:
 
 def job_bg_cache_key(*, artist, song_title, style, movement_style, effect,
                      custom_colors, genre, concept, background_hint,
-                     bg_verbatim, match_lyrics):
+                     bg_verbatim, match_lyrics, tenant_id=None):
     """Key esperado para el fast-path de fondo único AI de un job /generate.
 
     Única fuente de verdad de los hardcodes `background_mode="veo"` /
@@ -159,6 +164,7 @@ def job_bg_cache_key(*, artist, song_title, style, movement_style, effect,
             "song_title": song_title or "",
             "style": style or "",
             "movement_style": movement_style or "",
+            "_tenant_id": tenant_id or "",
             "effect": effect or "",
             "custom_colors": custom_colors or "",
             "genre": genre or "",
@@ -218,6 +224,20 @@ def run_bg_preview_job(
     from observability import set_job_log_context
     set_job_log_context(job_id)
     from jobs import update_job
+
+    # New API requests carry the authenticated tenant in this internal field.
+    # Resolve it from the ghost job as a compatibility fallback for previews
+    # that were queued immediately before a deploy.
+    params = dict(params)
+    if not params.get("_tenant_id"):
+        try:
+            from database import Job, SessionLocal
+            with SessionLocal() as _db:
+                _row = (_db.query(Job.tenant_id)
+                          .filter(Job.job_id == job_id).one_or_none())
+            params["_tenant_id"] = (_row[0] if _row else "") or ""
+        except Exception:
+            params["_tenant_id"] = ""
 
     runtime_policy = resolve_atmospherics_policy(params.get("background_hint"))
     runtime_fingerprint = runtime_rollout_fingerprint(
@@ -296,6 +316,11 @@ def run_bg_preview_job(
             _validate_background_asset_for_job,
             _write_safe_gradient_background,
         )
+        from scenes import effective_movement_for_tenant
+
+        effective_movement = effective_movement_for_tenant(
+            params.get("movement_style"), params.get("_tenant_id")
+        )
 
         with tempfile.TemporaryDirectory() as job_dir:
             # Generation prompts are guidance, not a compliance boundary. If
@@ -313,7 +338,7 @@ def run_bg_preview_job(
                         song_title=params.get("song_title", ""),
                         genre=params.get("genre", ""),
                         concept=params.get("concept", ""),
-                        movement_style=params.get("movement_style", ""),
+                        movement_style=effective_movement,
                         match_lyrics=bool(params.get("match_lyrics", True)),
                         # v6: el preview genera CON la letra (si el frontend
                         # la mandó) — antes generaba ciego a ella y el render
