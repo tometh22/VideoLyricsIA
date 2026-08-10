@@ -196,6 +196,45 @@ def test_enqueue_fallido_restaura_estado_y_timestamp_del_rechazo(
     assert completed_at == rejected_at
 
 
+def test_enqueue_fallido_conserva_evidencia_de_entrega_reabierta(
+    client, admin_token, db, monkeypatch,
+):
+    import main
+
+    user_id, tenant_id = _admin_identity(db)
+    delivered_at = datetime(2026, 6, 28, tzinfo=timezone.utc)
+    reopened_at = datetime(2026, 6, 29, tzinfo=timezone.utc)
+    job_id = _create_pending_review_job(
+        db,
+        tenant_id,
+        user_id,
+        status="rejected",
+        completed_at=delivered_at,
+        editing_started_at=reopened_at,
+    )
+    monkeypatch.setattr(
+        main, "enqueue_edit",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("redis down")),
+    )
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "metadata", "song_title": "Título corregido"},
+    )
+    assert res.status_code == 503, res.text
+    db.expire_all()
+    row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
+    completed_at = row.completed_at
+    editing_started_at = row.editing_started_at
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.replace(tzinfo=timezone.utc)
+    if editing_started_at.tzinfo is None:
+        editing_started_at = editing_started_at.replace(tzinfo=timezone.utc)
+    assert completed_at == delivered_at
+    assert editing_started_at == reopened_at
+
+
 def test_metadata_does_not_consume_edit_slot(client, admin_token, db, monkeypatch):
     """Fire 5 metadata edits on a job with edit_count=2 — edit_count
     must stay at 2 every time. Regular edits would have capped at 3."""
