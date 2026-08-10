@@ -12169,6 +12169,7 @@ async def request_edit(
 
     _pre_edit_status = job.status
     _pre_edit_completed_at = job.completed_at
+    _pre_edit_editing_started_at = job.editing_started_at
     # A rejected/error job can still represent a retained historical delivery
     # when it was reopened after shipping. Clear only failed-attempt timestamps;
     # an edit of a previously delivered song must not move the denominator to
@@ -12236,7 +12237,7 @@ async def request_edit(
         job.status = _pre_edit_status
         job.completed_at = _pre_edit_completed_at
         job.edit_count = current_edit_count
-        job.editing_started_at = None
+        job.editing_started_at = _pre_edit_editing_started_at
         job.progress = 100
         job.current_step = "thumbnail"
         # Audit 2026-05-26: restore the pre-edit segments_json. The edit
