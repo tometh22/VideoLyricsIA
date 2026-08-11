@@ -773,7 +773,9 @@ def fetch_r2(period: str) -> SourceCost:
         # writes/lists are class A, and reads are class B.
         if "delete" in action or "abortmultipart" in action:
             continue
-        if any(k in action for k in ("put", "post", "copy", "list", "multipart")):
+        if any(k in action for k in (
+            "put", "post", "copy", "list", "multipart", "uploadpart",
+        )):
             class_a += requests_n
         else:
             class_b += requests_n

@@ -67,7 +67,6 @@ CI_TENANT_PATTERNS = (
     re.compile(r"_smoke_|^genly_edit_smoke"),
     re.compile(r"^e2e"),
     re.compile(r"^dk_d1_"),
-    re.compile(r"^\w+_\d{9,}$"),      # e2ecustom_1785286338, e2e_matrix_...
 )
 
 # Accounts the GenLy team operates. Their jobs are managed production when
