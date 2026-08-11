@@ -1007,6 +1007,18 @@ def admin_cost_refresh(
         "partial": bool(not_requested),
         "complete": not not_configured and not errored and not not_requested,
     })
+    if period >= billing_sources.current_period():
+        # A successful refresh proves provider coverage, not finality. The
+        # durable rows remain useful month-to-date checkpoints, while the
+        # response must not present an accruing period as a closed invoice.
+        result.update({
+            "complete": False,
+            "provisional": True,
+            "detail": (
+                "snapshot del período abierto; el gasto todavía puede "
+                "acumularse y requiere refresh post-cierre"
+            ),
+        })
 
     return result
 

@@ -132,6 +132,49 @@ def test_cost_real_live_del_mes_abierto_sigue_provisional(
     assert "período abierto" in body["detail"]
 
 
+def test_cost_refresh_del_mes_abierto_sigue_provisional(
+    client, admin_token, db, monkeypatch,
+):
+    """Persistir checkpoints sanos no cierra una factura que sigue creciendo."""
+    import billing_sources
+    from database import CostSnapshot
+
+    period = "2099-12"
+    monkeypatch.setattr(billing_sources, "current_period", lambda: period)
+    monkeypatch.setattr(billing_sources, "fetch_all", lambda **kwargs: {
+        "period": period,
+        "total_usd": float(len(billing_sources.SOURCES)),
+        "sources": [
+            {
+                "source": source, "period": period, "amount_usd": 1.0,
+                "status": "ok", "detail": "month-to-date",
+                "is_estimate": False, "breakdown": [],
+            }
+            for source in billing_sources.SOURCES
+        ],
+    })
+    db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+    db.commit()
+
+    try:
+        res = client.post(
+            f"/admin/cost/refresh?period={period}",
+            headers=auth(admin_token),
+        )
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["total_usd"] == float(len(billing_sources.SOURCES))
+        assert body["complete"] is False
+        assert body["provisional"] is True
+        assert "período abierto" in body["detail"]
+        assert db.query(CostSnapshot).filter(
+            CostSnapshot.period == period,
+        ).count() == len(billing_sources.SOURCES)
+    finally:
+        db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+        db.commit()
+
+
 def test_cost_real_roundtrips_a_snapshot(client, admin_token, db):
     """A persisted snapshot is summed and reported as the source of truth."""
     from database import CostSnapshot
