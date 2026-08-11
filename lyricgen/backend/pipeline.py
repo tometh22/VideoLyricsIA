@@ -5161,17 +5161,48 @@ def _fill_gaps_with_reference(whisper_segments: list[dict],
     return output
 
 
+_AUDIO_DURATION_MAX_SANE_SECONDS = 3600  # no legit song upload runs past an hour
+
+
 def _audio_duration(audio_path: str) -> float | None:
     """Best-effort audio duration in seconds. Handles both MP3 and WAV.
     For MP3 we use mutagen.mp3 (header-only, ~1 ms). For WAV we use the
-    stdlib `wave` module (also header-only). Falls back to moviepy
-    (slower, opens the full file) on any failure. Returns None if
-    everything fails."""
+    stdlib `wave` module (also header-only). Falls back to ffprobe (real
+    demux) and then moviepy (slower, opens the full file) on any failure
+    or implausible result. Returns None if everything fails.
+
+    Header-only reads are fast but blindly trust a single declared-size
+    field:
+    - WAV: some exporters (live/streaming capture tools that never
+      rewrite the header once recording stops) leave a placeholder
+      "unknown length" sentinel in the `data` chunk size (seen in
+      production: 0xFFFFFFFE). `wave.getnframes()` takes that at face
+      value, so a corrupted header can report hours of audio for a
+      4-minute song (confirmed root cause of job 878d99b8da76 /
+      51fac94587cd / 072f9646c349 — Sentry PYTHON-FASTAPI-3F).
+    - MP3: without a Xing/VBRI header, mutagen estimates duration from
+      the first frame's bitrate assuming CBR; a VBR file (or a weird
+      first frame) can throw that off by a large factor.
+
+    Since this value is only ever used as the *expected* duration in the
+    render's final verify step (and as an upper bound for lyric timing
+    elsewhere), a bogus-but-not-`None` result silently guarantees a
+    failure/misbehavior downstream — even though the audio decoded and
+    rendered correctly. Discard any header-only result that isn't a
+    plausible song length and fall through to a real decode instead.
+    """
     name_lower = audio_path.lower()
     if name_lower.endswith(".mp3"):
         try:
             from mutagen.mp3 import MP3
-            return float(MP3(audio_path).info.length)
+            dur = float(MP3(audio_path).info.length)
+            if 0 < dur <= _AUDIO_DURATION_MAX_SANE_SECONDS:
+                return dur
+            logger.warning(
+                "[AUDIO-DURATION] %s: mutagen reports %.1fs — implausible "
+                "for a song, likely VBR without Xing/VBRI header. Falling "
+                "back to ffprobe.", audio_path, dur,
+            )
         except Exception:
             pass
     elif name_lower.endswith(".wav"):
@@ -5181,9 +5212,24 @@ def _audio_duration(audio_path: str) -> float | None:
                 frames = wf.getnframes()
                 rate = wf.getframerate() or 0
                 if rate > 0:
-                    return float(frames) / rate
+                    dur = float(frames) / rate
+                    if 0 < dur <= _AUDIO_DURATION_MAX_SANE_SECONDS:
+                        return dur
+                    logger.warning(
+                        "[AUDIO-DURATION] %s: wave header reports %.1fs "
+                        "(frames=%s, rate=%s) — implausible for a song, "
+                        "likely a corrupted/placeholder WAV header. Falling "
+                        "back to ffprobe.", audio_path, dur, frames, rate,
+                    )
         except Exception:
             pass
+    # Header-only read missing, failed, or implausible — fall back to a
+    # real decode. ffprobe demuxes the actual stream instead of trusting
+    # a single (possibly corrupted) header field, so it survives both the
+    # WAV "unknown length" sentinel and MP3 VBR-without-Xing misestimates.
+    dur = _ffprobe_duration(audio_path)
+    if dur and 0 < dur <= _AUDIO_DURATION_MAX_SANE_SECONDS:
+        return dur
     try:
         from moviepy.editor import AudioFileClip
         with AudioFileClip(audio_path) as a:
