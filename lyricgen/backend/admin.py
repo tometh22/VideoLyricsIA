@@ -1599,7 +1599,7 @@ def admin_calibrate_rates(    # `def`: consulta BigQuery, que bloquea hasta
 
 
 @router.get("/cost/rates")
-async def admin_cost_rates(
+def admin_cost_rates(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
     period: str = Query("", description="YYYY-MM; vacío = mes actual"),
@@ -1731,7 +1731,7 @@ def admin_cost_business(
 # `/admin/cost/real` resolve here with tenant_id="real" — a 200 with an
 # empty cost summary instead of the real-invoice payload.
 @router.get("/cost/{tenant_id}")
-async def admin_tenant_cost(
+def admin_tenant_cost(
     tenant_id: str,
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
