@@ -305,6 +305,41 @@ def test_tracking_requerido_falla_antes_de_veo_si_no_puede_reservar(
         )
 
 
+def test_reserva_borrada_cancela_veo_incluso_en_fail_open(db, monkeypatch):
+    """Borrar el job no puede dejar salir un POST pago sin contabilidad."""
+    import pipeline
+    from database import AIProvenance, Job
+    from provenance import BUDGET_PENDING_PREFIX
+
+    job_id = "buddeleted"
+    db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+    db.query(Job).filter(Job.job_id == job_id).delete()
+    db.add(Job(
+        job_id=job_id, user_id=1, tenant_id="budget-deleted",
+        artist="A", song_title="S", filename="a.mp3", status="processing",
+    ))
+    row = AIProvenance(
+        job_id=job_id, step="video_bg",
+        tool_name="veo-3.1-fast-generate-001",
+        tool_provider="google_vertex", prompt_sent="p",
+        response_summary=BUDGET_PENDING_PREFIX,
+    )
+    db.add(row)
+    db.commit()
+    row_id = row.id
+
+    # Mirrors jobs.delete_job(): both live rows disappear before the pending
+    # reservation can transition to billable. This is cancellation, not a DB
+    # outage, so the default production path must fail closed as well.
+    db.query(AIProvenance).filter(AIProvenance.id == row_id).delete()
+    db.query(Job).filter(Job.job_id == job_id).delete()
+    db.commit()
+
+    monkeypatch.setattr(pipeline, "VEO_MAX_CALLS_PER_SONG", 10)
+    with pytest.raises(pipeline.VeoTrackingUnavailable, match="disappeared"):
+        pipeline._veo_budget_exceeded(job_id, own_row_id=row_id)
+
+
 def test_generador_propaga_el_contrato_de_tracking_a_la_reserva():
     import inspect
     import pipeline

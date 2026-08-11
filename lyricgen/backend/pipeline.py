@@ -9655,17 +9655,19 @@ def _veo_budget_exceeded(job_id: str | None,
                 )
                 if not updated:
                     db.rollback()
-                    logger.warning(
-                        "[BG][BUDGET] no pude reservar fila=%s; fail-open",
+                    # A successful UPDATE statement that matched zero rows is
+                    # not a transient DB outage: the reservation disappeared
+                    # (normally because an operator deleted the processing
+                    # job and its provenance). There is then no durable row or
+                    # tombstone to account for the provider call, so abort even
+                    # on the production fail-open path before touching Vertex.
+                    logger.info(
+                        "[BG][BUDGET] reserva fila=%s desapareció; se cancela Veo",
                         own_row_id,
                     )
-                    marked = _mark_veo_reservation_billable(
-                        own_row_id, "budget row update missed; fail-open")
-                    if require_persistent_tracking and not marked:
-                        raise VeoTrackingUnavailable(
-                            f"Could not persist Veo reservation row={own_row_id}"
-                        )
-                    return False, n
+                    raise VeoTrackingUnavailable(
+                        f"Veo reservation row disappeared row={own_row_id}"
+                    )
                 db.commit()
         finally:
             db.close()
