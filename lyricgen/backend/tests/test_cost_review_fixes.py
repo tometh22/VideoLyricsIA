@@ -1647,23 +1647,30 @@ def test_replicate_acepta_ultima_pagina_dentro_del_limite(monkeypatch):
     import billing_sources
 
     class _Resp:
-        def __init__(self, next_url):
+        def __init__(self, next_url, dates):
             self._next_url = next_url
+            self._dates = dates
 
         def raise_for_status(self):
             pass
 
         def json(self):
             return {
-                "results": [{
-                    "created_at": "2026-07-15T12:00:00Z",
-                    "model": "owner/model",
-                    "metrics": {"predict_time": 10},
-                }],
+                "results": [
+                    {
+                        "created_at": created_at,
+                        "model": "owner/model",
+                        "metrics": {"predict_time": 10},
+                    }
+                    for created_at in self._dates
+                ],
                 "next": self._next_url,
             }
 
-    responses = iter([_Resp("https://replicate.test/page/2"), _Resp(None)])
+    responses = iter([
+        _Resp("https://replicate.test/page/2", ["2026-07-15T12:00:00Z"]),
+        _Resp(None, ["2026-07-10T12:00:00Z", "2026-06-30T23:59:59Z"]),
+    ])
     monkeypatch.setenv("REPLICATE_API_TOKEN", "token")
     monkeypatch.setattr(billing_sources, "REPLICATE_MAX_PAGES", 2)
     monkeypatch.setattr(
@@ -1675,6 +1682,34 @@ def test_replicate_acepta_ultima_pagina_dentro_del_limite(monkeypatch):
     assert out.status == "ok"
     assert out.amount_usd == pytest.approx(0.0)
     assert out.breakdown[0]["runs"] == 2
+
+
+def test_replicate_rechaza_historial_que_no_alcanza_inicio(monkeypatch):
+    import billing_sources
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "results": [{
+                    "created_at": "2026-07-15T12:00:00Z",
+                    "model": "owner/model",
+                    "metrics": {"predict_time": 10},
+                }],
+                "next": None,
+            }
+
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "token")
+    monkeypatch.setattr(billing_sources.requests, "get", lambda *_a, **_k: _Resp())
+
+    out = billing_sources.fetch_replicate("2026-07")
+
+    assert out.status == "error"
+    assert out.amount_usd is None
+    assert out.raw == {"pages_fetched": 1, "next": None}
+    assert "sin alcanzar el inicio del período" in out.detail
 
 
 # ---------------------------------------------------------------------------
