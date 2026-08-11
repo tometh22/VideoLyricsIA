@@ -103,4 +103,3 @@ def test_asterisco_aplica_a_todos(monkeypatch):
     plan = build_scene_plan(_sections(), {}, _prompt_fn,
                             operator_movement="", tenant_id="cualquiera")
     assert {s["movement_style"] for s in plan["scenes"]} == {"estatico"}
-
