@@ -5516,7 +5516,8 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             texts = await asyncio.wait_for(
                 asyncio.to_thread(_pt.transcribe_performance, audio_path,
                                   artist, title,
-                                  result.get("reference_lyrics") or ""),
+                                  result.get("reference_lyrics") or "",
+                                  job_id),
                 timeout=300,
             )
             if texts:
@@ -9418,7 +9419,11 @@ async def download(
     # sends Content-Disposition: attachment and the browser downloads
     # instead of opening the file inline.
     s3_key = (job.get("s3_keys") or {}).get(file_type)
-    if s3_key and storage.is_enabled():
+    # ProRes keys need a lifecycle-aware HEAD check in
+    # check_prores_readiness before redirecting. Other immutable artifacts
+    # retain the direct fast path.
+    if (s3_key and storage.is_enabled()
+            and file_type not in ("umg_master", "umg_short")):
         url = storage.generate_signed_url(
             s3_key, expiry_seconds=3600,
             download_filename=FILE_MAP.get(file_type),
