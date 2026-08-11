@@ -37,7 +37,10 @@ def _make_user(client, *, ai_authorized: bool = True):
     import uuid
     from database import SessionLocal, User
 
-    username = f"upuser_{uuid.uuid4().hex[:6]}"
+    # The suite creates many users in one shared database.  Six hex digits
+    # occasionally collide in CI and turn an unrelated authorization test
+    # into a duplicate-registration failure.
+    username = f"upuser_{uuid.uuid4().hex}"
     res = client.post("/auth/register", json={
         "username": username,
         "password": "testpass12345",
