@@ -10,6 +10,15 @@ def _config(name: str) -> dict:
         return tomllib.load(handle)
 
 
+def test_ci_runs_for_stacked_pull_requests():
+    workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text()
+    pull_request_block = workflow.split("pull_request:", 1)[1].split("jobs:", 1)[0]
+    assert "branches:" not in pull_request_block, (
+        "Stacked PRs must run CI even when their temporary base is another "
+        "feature branch."
+    )
+
+
 def test_railway_uses_one_config_per_service():
     assert not (REPO / "railway.toml").exists()
     assert {p.name for p in (REPO / "railway").glob("*.toml")} == {
