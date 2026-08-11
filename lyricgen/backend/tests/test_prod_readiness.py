@@ -192,12 +192,81 @@ def test_alembic_upgrade_head_creates_full_schema(tmp_path):
     expected = {
         "users", "jobs", "invoices", "audit_log",
         "background_assets", "ai_provenance",
+        "veo_budget_ledger",
         "password_reset_tokens", "email_verification_tokens",
         "user_settings", "lyrics_cache",
         "alembic_version",
     }
     missing = expected - tables
     assert not missing, f"Migration missed tables: {missing}\nFound: {tables}"
+
+    conn = sqlite3.connect(str(db_path))
+    provenance_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(ai_provenance)")
+    }
+    provenance_indexes = {
+        row[1] for row in conn.execute("PRAGMA index_list(ai_provenance)")
+    }
+    ledger_indexes = {
+        row[1] for row in conn.execute("PRAGMA index_list(veo_budget_ledger)")
+    }
+    conn.close()
+
+    assert "reservation_expires_at" in provenance_columns
+    assert "ix_ai_provenance_reservation_expires_at" in provenance_indexes
+    assert "ix_veo_budget_ledger_scope_call_at" in ledger_indexes
+    assert "ix_veo_budget_ledger_archived_at" in ledger_indexes
+
+
+def test_cost_controls_upgrade_from_observability_head(tmp_path):
+    """The staged rollout applies the additive schema in #1084 before the
+    # #1085 workers use it. Exercise that exact a1 -> head upgrade, not only a
+    # fresh database bootstrap."""
+    import importlib.util
+
+    try:
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+    except ImportError:
+        pytest.skip("Alembic CLI/runtime is installed in CI and production")
+
+    from sqlalchemy import create_engine, inspect
+    from database import Base
+
+    db_path = tmp_path / "observability_to_controls.db"
+    upgrade_engine = create_engine(f"sqlite:///{db_path}")
+    # Base on #1084 is the schema immediately before these additive controls
+    # migrations: ai_provenance exists, but the lease column and ledger do not.
+    Base.metadata.create_all(upgrade_engine)
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    versions_dir = os.path.join(backend_dir, "alembic", "versions")
+
+    with upgrade_engine.begin() as connection:
+        operations = Operations(MigrationContext.configure(connection))
+        for filename in (
+            "b2c3d4e5f6a7_veo_budget_ledger.py",
+            "c3d4e5f6a7b8_veo_reservation_lease.py",
+        ):
+            path = os.path.join(versions_dir, filename)
+            spec = importlib.util.spec_from_file_location(filename, path)
+            module = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+            spec.loader.exec_module(module)
+            module.op = operations
+            module.upgrade()
+
+    schema = inspect(upgrade_engine)
+    assert "veo_budget_ledger" in schema.get_table_names()
+    assert "reservation_expires_at" in {
+        column["name"] for column in schema.get_columns("ai_provenance")
+    }
+    assert {
+        "ix_veo_budget_ledger_scope_call_at",
+        "ix_veo_budget_ledger_archived_at",
+    } <= {index["name"] for index in schema.get_indexes("veo_budget_ledger")}
+    assert "ix_ai_provenance_reservation_expires_at" in {
+        index["name"] for index in schema.get_indexes("ai_provenance")
+    }
 
 
 def test_alembic_current_matches_head_after_upgrade(tmp_path):
