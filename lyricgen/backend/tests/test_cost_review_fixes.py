@@ -182,7 +182,12 @@ def test_la_fila_de_calibracion_no_marca_incompleto(client, admin_token, db):
     db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
     for src in billing_sources.SOURCES:
         db.add(CostSnapshot(period=period, source=src, amount_usd=10.0,
-                            status="ok"))
+                            status="ok", fetched_at=(
+                                datetime(2020, 7, 31, 23, 59, 30,
+                                         tzinfo=timezone.utc)
+                                if src == "github" else
+                                datetime.now(timezone.utc)
+                            )))
     db.add(CostSnapshot(period=period, source="rate_calibration",
                         amount_usd=None, status="ok",
                         breakdown=[{"tool": "veo", "derived_rate": 0.62,
@@ -420,22 +425,24 @@ def test_un_refresh_fallido_conserva_el_valor_anterior(client, admin_token, db,
     import billing_sources
     from database import CostSnapshot
 
-    db.query(CostSnapshot).filter(CostSnapshot.period == "2099-01").delete()
-    db.add(CostSnapshot(period="2099-01", source="github", amount_usd=41.0,
+    period = "2020-01"
+    db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+    db.add(CostSnapshot(period=period, source="github", amount_usd=41.0,
                         status="ok", detail="capturado cuando era el mes actual",
                         is_estimate=False, breakdown=[],
-                        fetched_at=datetime.now(timezone.utc)))
+                        fetched_at=datetime(2020, 1, 31, 23, 59, 30,
+                                            tzinfo=timezone.utc)))
     db.commit()
 
     monkeypatch.setattr(billing_sources, "fetch_all", lambda **kw: {
-        "period": "2099-01",
+        "period": period,
         "sources": [{"source": "github", "amount_usd": None, "status": "error",
                      "detail": "sólo se puede consultar el ciclo vigente",
                      "is_estimate": False, "breakdown": []}],
     })
 
     try:
-        r = client.post("/admin/cost/refresh?period=2099-01&only=github",
+        r = client.post(f"/admin/cost/refresh?period={period}&only=github",
                         headers=auth(admin_token))
         assert r.status_code == 200
         entry = r.json()["sources"][0]
@@ -450,13 +457,13 @@ def test_un_refresh_fallido_conserva_el_valor_anterior(client, admin_token, db,
 
         db.expire_all()
         row = (db.query(CostSnapshot)
-                 .filter(CostSnapshot.period == "2099-01",
+                 .filter(CostSnapshot.period == period,
                          CostSnapshot.source == "github").one())
         assert row.amount_usd == 41.0, "el refresh fallido borró el dato bueno"
         assert row.status == "ok"
-        assert "se conservó el valor anterior" in (row.detail or "")
+        assert row.detail == "capturado cuando era el mes actual"
     finally:
-        db.query(CostSnapshot).filter(CostSnapshot.period == "2099-01").delete()
+        db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
         db.commit()
 
 
@@ -503,7 +510,7 @@ def test_un_refresh_historico_ok_pero_vacio_no_pisa(client, admin_token, db,
     db.add(CostSnapshot(period=period, source="replicate", amount_usd=19.25,
                         status="ok", detail="captura original",
                         is_estimate=True, breakdown=[{"runs": 20}],
-                        fetched_at=datetime(2020, 7, 20,
+                        fetched_at=datetime(2020, 8, 3,
                                             tzinfo=timezone.utc)))
     db.commit()
     monkeypatch.setattr(billing_sources, "fetch_all", lambda **kw: {
@@ -564,13 +571,17 @@ def test_railway_vacio_tampoco_borra_snapshot_provisional(
         )
         assert response.status_code == 200, response.text
         body = response.json()
-        assert body["total_usd"] == 88.0
-        assert body["configured"] == ["railway"]
-        assert body["errored"] == []
+        assert body["total_usd"] == 0.0
+        assert body["configured"] == []
+        assert body["errored"] == ["railway"]
         assert body["complete"] is False
         assert body["partial"] is True
         assert set(body["not_requested"]) == set(billing_sources.SOURCES) - {"railway"}
         assert body["sources"][0]["kept_previous"] is True
+        assert body["sources"][0]["status"] == "stale"
+        assert body["sources"][0]["amount_usd"] is None
+        assert body["sources"][0]["retained_amount_usd"] == 88.0
+        assert body["sources"][0]["stale"] is True
         db.expire_all()
         row = db.query(CostSnapshot).filter(
             CostSnapshot.period == period,

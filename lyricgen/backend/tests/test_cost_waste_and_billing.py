@@ -691,3 +691,17 @@ def test_github_acepta_ciclo_pago_alineado_al_mes(monkeypatch):
     result = billing_sources.fetch_github(billing_sources.current_period())
     assert result.status == "ok"
     assert result.amount_usd == 0.16
+
+
+def test_github_checkpoint_temprano_no_se_vuelve_final_por_esperar():
+    """Sólo una captura en el borde del mes puede cerrar el ciclo alineado."""
+    from datetime import datetime, timezone
+
+    assert billing_sources.snapshot_is_final(
+        "2020-10", "github",
+        datetime(2020, 10, 15, tzinfo=timezone.utc),
+    ) is False
+    assert billing_sources.snapshot_is_final(
+        "2020-10", "github",
+        datetime(2020, 10, 31, 23, 59, 30, tzinfo=timezone.utc),
+    ) is True
