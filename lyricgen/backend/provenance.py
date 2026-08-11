@@ -268,9 +268,24 @@ def billable_filter():
     return _exclude_summary_prefixes(NON_BILLABLE_PREFIXES)
 
 
-def budget_occupancy_filter():
-    """Rows occupying the rolling Veo ceiling, including reservations."""
-    return _exclude_summary_prefixes(NON_BUDGET_PREFIXES)
+def budget_occupancy_filter(now=None):
+    """Rows occupying the rolling Veo ceiling, including live reservations.
+
+    ``budget_reserved`` is a pre-submit lease rather than spend. A worker can
+    die after reserving capacity but before calling Vertex, so only an
+    unexpired reservation may occupy the ceiling. Submitted/ambiguous calls
+    remain counted by the normal prefix filter for the full budget window.
+    """
+    if now is None:
+        now = func.now()
+    return and_(
+        _exclude_summary_prefixes(NON_BUDGET_PREFIXES),
+        or_(
+            AIProvenance.response_summary.is_(None),
+            ~AIProvenance.response_summary.like(f"{BUDGET_RESERVED_PREFIX}%"),
+            AIProvenance.reservation_expires_at > now,
+        ),
+    )
 
 
 # Job statuses that represent a video we can actually invoice. Mirrors

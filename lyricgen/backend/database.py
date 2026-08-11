@@ -1321,6 +1321,10 @@ class AIProvenance(Base):
     input_data_types = Column(JSONB, nullable=True)      # ["lyrics_text", "artist_name"]
     output_artifact = Column(String(500), nullable=True) # path to generated file
     duration_ms = Column(Integer, nullable=True)
+    # Only pre-submit Veo budget reservations use this lease. Once the worker
+    # crosses the provider POST boundary it is cleared and the row remains in
+    # the rolling ceiling as actual/ambiguous spend via response_summary.
+    reservation_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
 
     job = relationship("Job", back_populates="provenance")

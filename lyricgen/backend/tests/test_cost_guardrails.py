@@ -423,6 +423,8 @@ def test_guard_distingue_insert_fallido_de_reserva_borrada(db):
 
 
 def test_liberacion_verificada_persiste_estado_no_facturable(db):
+    from datetime import datetime, timedelta, timezone
+
     import pipeline
     from database import AIProvenance, Job
     from provenance import BUDGET_RELEASED_PREFIX, BUDGET_RESERVED_PREFIX
@@ -439,6 +441,9 @@ def test_liberacion_verificada_persiste_estado_no_facturable(db):
         tool_name="veo-3.1-fast-generate-001",
         tool_provider="google_vertex", prompt_sent="p",
         response_summary=BUDGET_RESERVED_PREFIX,
+        reservation_expires_at=(
+            datetime.now(timezone.utc) + timedelta(minutes=10)
+        ),
     )
     db.add(row)
     db.commit()
@@ -454,6 +459,7 @@ def test_liberacion_verificada_persiste_estado_no_facturable(db):
             AIProvenance.id == row.id).one()
         assert stored.response_summary.startswith(BUDGET_RELEASED_PREFIX)
         assert stored.duration_ms is not None
+        assert stored.reservation_expires_at is None
         assert recorder._finished is True
     finally:
         db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
@@ -598,7 +604,7 @@ def test_el_post_de_veo_revalida_cancelacion_despues_del_token():
 
 
 def test_reserva_admitida_ocupa_tope_pero_no_es_gasto():
-    """La ventana auth/delete necesita capacidad sin inventar una llamada."""
+    """La ventana auth/delete usa un lease sin inventar una llamada paga."""
     from provenance import (
         BUDGET_RESERVED_PREFIX,
         budget_occupancy_filter,
@@ -612,7 +618,8 @@ def test_reserva_admitida_ocupa_tope_pero_no_es_gasto():
         compile_kwargs={"literal_binds": True},
     ))
     assert BUDGET_RESERVED_PREFIX in billable_sql
-    assert BUDGET_RESERVED_PREFIX not in budget_sql
+    assert BUDGET_RESERVED_PREFIX in budget_sql
+    assert "reservation_expires_at" in budget_sql
 
     import inspect
     import pipeline
@@ -620,10 +627,82 @@ def test_reserva_admitida_ocupa_tope_pero_no_es_gasto():
     assert "_mark_veo_submission_started" in guard_source
 
 
+def test_reserva_pre_submit_vencida_no_bloquea_el_tope(db, monkeypatch):
+    """Un SIGKILL antes del POST libera capacidad al vencer el lease."""
+    from datetime import datetime, timedelta, timezone
+
+    import pipeline
+    from database import AIProvenance, Job
+    from provenance import BUDGET_RESERVED_PREFIX
+
+    job_id = "expiredlease"
+    db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+    db.query(Job).filter(Job.job_id == job_id).delete()
+    db.add(Job(
+        job_id=job_id, user_id=1, tenant_id="lease-test",
+        artist="A", song_title="S", filename="a.mp3", status="processing",
+    ))
+    expired_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    for _ in range(10):
+        db.add(AIProvenance(
+            job_id=job_id, step="video_bg",
+            tool_name="veo-3.1-fast-generate-001",
+            tool_provider="google_vertex", prompt_sent="p",
+            response_summary=BUDGET_RESERVED_PREFIX,
+            reservation_expires_at=expired_at,
+        ))
+    db.commit()
+    try:
+        monkeypatch.setattr(pipeline, "VEO_MAX_CALLS_PER_SONG", 10)
+        assert pipeline._veo_budget_exceeded(job_id) == (False, 0)
+    finally:
+        db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+        db.query(Job).filter(Job.job_id == job_id).delete()
+        db.commit()
+
+
+def test_guard_rechaza_lease_vencido_antes_del_post(db):
+    from datetime import datetime, timedelta, timezone
+
+    import pipeline
+    from database import AIProvenance, Job
+    from provenance import BUDGET_RESERVED_PREFIX
+
+    job_id = "expiredguard"
+    db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+    db.query(Job).filter(Job.job_id == job_id).delete()
+    db.add(Job(
+        job_id=job_id, user_id=1, tenant_id="lease-guard",
+        artist="A", song_title="S", filename="a.mp3", status="processing",
+    ))
+    row = AIProvenance(
+        job_id=job_id, step="video_bg",
+        tool_name="veo-3.1-fast-generate-001",
+        tool_provider="google_vertex", prompt_sent="p",
+        response_summary=BUDGET_RESERVED_PREFIX,
+        reservation_expires_at=(
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ),
+    )
+    db.add(row)
+    db.commit()
+    try:
+        with pytest.raises(
+            pipeline.VeoTrackingUnavailable, match="reservation expired",
+        ):
+            with pipeline._VeoSubmissionGuard(job_id, row.id):
+                pass
+    finally:
+        db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+        db.query(Job).filter(Job.job_id == job_id).delete()
+        db.commit()
+
+
 def test_el_guard_de_submit_serializa_el_delete_en_postgres(db, monkeypatch):
     """A delete cannot remove tracking while the provider POST owns the lock."""
     import uuid
     from concurrent.futures import ThreadPoolExecutor, TimeoutError
+    from datetime import datetime, timedelta, timezone
     from threading import Event
 
     import jobs
@@ -668,6 +747,9 @@ def test_el_guard_de_submit_serializa_el_delete_en_postgres(db, monkeypatch):
         tool_provider="google_vertex",
         prompt_sent="guard",
         response_summary=BUDGET_RESERVED_PREFIX,
+        reservation_expires_at=(
+            datetime.now(timezone.utc) + timedelta(minutes=10)
+        ),
     )
     db.add(row)
     db.commit()
@@ -1301,6 +1383,12 @@ def test_seis_escenas_concurrentes_reservan_exactamente_cinco(db, monkeypatch):
                 f"{BUDGET_RESERVED_PREFIX}%"),
         ).count()
         assert reserved == 5
+        assert db.query(AIProvenance).filter(
+            AIProvenance.id.in_(row_ids),
+            AIProvenance.response_summary.like(
+                f"{BUDGET_RESERVED_PREFIX}%"),
+            AIProvenance.reservation_expires_at.is_(None),
+        ).count() == 0
     finally:
         db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
         db.query(Job).filter(Job.job_id == job_id).delete()

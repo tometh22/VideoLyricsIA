@@ -9322,6 +9322,13 @@ VEO_MAX_CALLS_PER_SONG = int(
                    os.environ.get("VEO_MAX_CALLS_PER_JOB", "10"))
 )
 VEO_BUDGET_WINDOW_DAYS = int(os.environ.get("VEO_BUDGET_WINDOW_DAYS", "30"))
+# A reservation only bridges the budget decision, auth lookup and final POST
+# guard. If a worker dies in that gap it must not consume a slot for 30 days.
+# Ten minutes is deliberately much longer than normal token acquisition while
+# still recovering capacity promptly after a deploy/OOM/SIGKILL.
+VEO_RESERVATION_LEASE_SECONDS = max(
+    30, int(os.environ.get("VEO_RESERVATION_LEASE_SECONDS", "600")),
+)
 
 
 def _discard_provenance_row(recorder) -> None:
@@ -9355,6 +9362,7 @@ def _persist_veo_reservation_summary(
     summary: str,
     *,
     duration_ms: int | None = None,
+    reservation_expires_at=None,
 ) -> bool:
     """Verified provenance UPDATE in a fresh transaction."""
     if row_id is None:
@@ -9364,7 +9372,10 @@ def _persist_veo_reservation_summary(
     db = None
     try:
         db = SessionLocal()
-        values = {"response_summary": str(summary)[:2000]}
+        values = {
+            "response_summary": str(summary)[:2000],
+            "reservation_expires_at": reservation_expires_at,
+        }
         if duration_ms is not None:
             values["duration_ms"] = max(0, int(duration_ms))
         updated = (
@@ -9538,10 +9549,16 @@ def _song_identity(artist: str | None, title: str | None,
 
 def _mark_veo_reservation_admitted(row_id: int | None, reason: str) -> bool:
     """Best-effort pending -> admitted transition in a fresh transaction."""
+    from datetime import datetime, timedelta, timezone
+
     from provenance import BUDGET_RESERVED_PREFIX
     return _persist_veo_reservation_summary(
         row_id,
         f"{BUDGET_RESERVED_PREFIX}: {str(reason)[:1900]}",
+        reservation_expires_at=(
+            datetime.now(timezone.utc)
+            + timedelta(seconds=VEO_RESERVATION_LEASE_SECONDS)
+        ),
     )
 
 
@@ -9555,13 +9572,14 @@ def _mark_veo_submission_started(row_id: int | None) -> bool:
 
 
 class _VeoSubmissionGuard:
-    """Serialize a job's final cancellation check with one provider POST.
+    """Serialize budget/cancellation checks with one provider POST.
 
     Token acquisition deliberately happens before entering this guard. That
     gives an operator deletion requested during slow auth a chance to commit.
-    Once entered, the same PostgreSQL advisory lock is held by this read
-    transaction until the HTTP request returns; delete_job/bulk_delete_jobs
-    take the matching lock before removing the Job and its provenance.
+    Once entered, the budget-scope and per-job PostgreSQL advisory locks are
+    held by this read transaction until the HTTP request returns;
+    delete_job/bulk_delete_jobs take the matching locks before removing the
+    Job and its provenance.
     """
 
     def __init__(self, job_id: str, row_id: int | None,
@@ -9572,10 +9590,11 @@ class _VeoSubmissionGuard:
         self.db = None
 
     def __enter__(self):
-        from sqlalchemy import text as _sql_text
+        from sqlalchemy import func as _sql_func, text as _sql_text
 
         from database import AIProvenance, Job, SessionLocal
-        from veo_budget import submission_lock_key
+        from provenance import BUDGET_RESERVED_PREFIX
+        from veo_budget import advisory_lock_key, scope_hash, submission_lock_key
 
         self.db = SessionLocal()
         try:
@@ -9583,7 +9602,7 @@ class _VeoSubmissionGuard:
             # the lock. The authoritative existence checks happen after lock
             # acquisition, in a fresh READ COMMITTED statement snapshot.
             tenant_row = (
-                self.db.query(Job.tenant_id)
+                self.db.query(Job.artist, Job.song_title, Job.tenant_id)
                 .filter(Job.job_id == self.job_id)
                 .one_or_none()
             )
@@ -9591,14 +9610,27 @@ class _VeoSubmissionGuard:
                 raise VeoTrackingUnavailable(
                     f"Veo Job disappeared before submission job_id={self.job_id}"
                 )
-            tenant_id = tenant_row[0] or ""
+            artist, title, tenant_id = tenant_row
+            tenant_id = tenant_id or ""
+            budget_scope = scope_hash(
+                tenant_id,
+                _song_identity(artist, title, self.job_id),
+            )
             bind = getattr(self.db, "bind", None)
             dialect = getattr(getattr(bind, "dialect", None), "name", "")
             if dialect == "postgresql":
-                self.db.execute(
-                    _sql_text("SELECT pg_advisory_xact_lock(:lock_key)"),
-                    {"lock_key": submission_lock_key(tenant_id, self.job_id)},
-                )
+                # Deletion acquires this same sorted pair. The budget lock
+                # prevents another worker from ignoring an expired lease
+                # while this guard converts it to submitted spend.
+                lock_keys = {
+                    advisory_lock_key(budget_scope),
+                    submission_lock_key(tenant_id, self.job_id),
+                }
+                for lock_key in sorted(lock_keys):
+                    self.db.execute(
+                        _sql_text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                        {"lock_key": lock_key},
+                    )
 
             job_exists = (
                 self.db.query(Job.job_id)
@@ -9606,12 +9638,25 @@ class _VeoSubmissionGuard:
                 .one_or_none()
             )
             reservation_exists = None
+            active_reservation = None
             if self.row_id is not None:
                 reservation_exists = (
                     self.db.query(AIProvenance.id)
                     .filter(
                         AIProvenance.id == self.row_id,
                         AIProvenance.job_id == self.job_id,
+                    )
+                    .one_or_none()
+                )
+                active_reservation = (
+                    self.db.query(AIProvenance.id)
+                    .filter(
+                        AIProvenance.id == self.row_id,
+                        AIProvenance.job_id == self.job_id,
+                        AIProvenance.response_summary.like(
+                            f"{BUDGET_RESERVED_PREFIX}%"
+                        ),
+                        AIProvenance.reservation_expires_at > _sql_func.now(),
                     )
                     .one_or_none()
                 )
@@ -9634,6 +9679,11 @@ class _VeoSubmissionGuard:
                 raise VeoTrackingUnavailable(
                     "Veo reservation disappeared before provider submission "
                     f"job_id={self.job_id} row={self.row_id}"
+                )
+            if active_reservation is None:
+                raise VeoTrackingUnavailable(
+                    "Veo reservation expired or became inactive before "
+                    f"provider submission job_id={self.job_id} row={self.row_id}"
                 )
             # Deletion now waits on the per-job lock. Mark the precise
             # external side-effect boundary durably before touching Vertex;
@@ -9689,9 +9739,11 @@ def _veo_budget_exceeded(job_id: str | None,
     Suma todos los jobs que comparten `artista|título` dentro de la ventana,
     así una edición o un re-render no estrenan presupuesto. Cuenta sobre
     `ai_provenance` con `budget_occupancy_filter()`: coincide con la
-    facturación salvo por `budget_reserved`, que ocupa un lugar contra
-    carreras concurrentes aunque todavía no sea gasto. Los cache hits no
-    cuentan: no se pagan.
+    facturación salvo por un `budget_reserved` cuyo lease siga vigente, que
+    ocupa un lugar contra carreras concurrentes aunque todavía no sea gasto.
+    Una reserva abandonada vence y deja de bloquear; el guard final impide
+    que su worker haga POST después de vencer. Los cache hits no cuentan: no
+    se pagan.
 
     Si el job no tiene artista ni título (previews sin metadata), cae a
     contar sólo ese job — es lo más ajustado que se puede hacer sin una
@@ -9766,10 +9818,11 @@ def _veo_budget_exceeded(job_id: str | None,
                     {"lock_key": advisory_lock_key(budget_scope)},
                 )
 
-            since = _dt.now(_tz.utc) - timedelta(days=VEO_BUDGET_WINDOW_DAYS)
+            budget_now = _dt.now(_tz.utc)
+            since = budget_now - timedelta(days=VEO_BUDGET_WINDOW_DAYS)
             q = (db.query(_func.count(AIProvenance.id))
                    .filter(AIProvenance.tool_name.like("veo%"))
-                   .filter(budget_occupancy_filter()))
+                   .filter(budget_occupancy_filter(budget_now)))
 
             if not mio.startswith("__sin_metadata__|"):
                 # Sólo los jobs con actividad de Veo que ocupa presupuesto en
@@ -9778,7 +9831,7 @@ def _veo_budget_exceeded(job_id: str | None,
                 con_gasto = [r[0] for r in
                              db.query(AIProvenance.job_id)
                                .filter(AIProvenance.tool_name.like("veo%"))
-                               .filter(budget_occupancy_filter())
+                               .filter(budget_occupancy_filter(budget_now))
                                .filter(AIProvenance.created_at >= since)
                                .distinct().all()]
                 # El presupuesto es POR TENANT: sin este filtro, dos clientes
@@ -9823,15 +9876,23 @@ def _veo_budget_exceeded(job_id: str | None,
             n = live_count + archived_count
 
             # Reserve inside the same transaction as the advisory lock. The
-            # next worker must see this row as billable before deciding.
+            # next worker must see this live lease as occupied before deciding.
             if n < VEO_MAX_CALLS_PER_SONG and own_row_id is not None:
                 updated = (
                     db.query(AIProvenance)
                     .filter(AIProvenance.id == own_row_id)
                     .update(
-                        {"response_summary": (
-                            f"{BUDGET_RESERVED_PREFIX}: tenant={tenant} song={mio}"
-                        )},
+                        {
+                            "response_summary": (
+                                f"{BUDGET_RESERVED_PREFIX}: tenant={tenant} "
+                                f"song={mio}"
+                            ),
+                            "reservation_expires_at": (
+                                budget_now + timedelta(
+                                    seconds=VEO_RESERVATION_LEASE_SECONDS,
+                                )
+                            ),
+                        },
                         synchronize_session=False,
                     )
                 )
