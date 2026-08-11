@@ -8880,17 +8880,7 @@ Hard rules:
                 job_id, sorted(set(observed)),
             )
 
-    full_prompt = f"system:{system_prompt}\nuser:{user_content}"
-
-    recorder = record_ai_call(
-        job_id=job_id or "unknown",
-        step="lyrics_analysis",
-        tool_name="gemini-2.5-flash",
-        tool_provider="google_vertex",
-        prompt=full_prompt,
-        input_data_types=["artist_name", "lyrics_text_600chars"],
-    ) if job_id else None
-
+    recorder = None
     try:
         # Corrective re-roll for the noir-urban-alley cliché. The system
         # prompt already instructs against alleys, but Gemini ignores that
@@ -8937,6 +8927,18 @@ Hard rules:
                     if policy_enforces(atmospherics_policy) else {}
                 ),
             )
+            # One provenance row per provider attempt. The corrective alley
+            # re-roll below is a second billed Gemini call, not merely local
+            # post-processing, so a recorder outside this loop undercounted
+            # the denominator used by invoice-derived rates.
+            recorder = record_ai_call(
+                job_id=job_id or "unknown",
+                step="lyrics_analysis",
+                tool_name="gemini-2.5-flash",
+                tool_provider="google_vertex",
+                prompt=f"system:{_sys_instr}\nuser:{user_content}",
+                input_data_types=["artist_name", "lyrics_text_1800chars"],
+            ) if job_id else None
             # Quota-aware wrapper (2026-07-24): a single 429/RESOURCE_EXHAUSTED
             # used to abort the whole analysis and drop to the fallback prompt.
             # Retries 429s with backoff; TimeoutError still propagates raw.
@@ -8979,6 +8981,13 @@ Hard rules:
                                 "with hard-negative. genre=%s job=%s",
                                 _attempt, normalized_genre or 'auto', job_id,
                             )
+                            if recorder:
+                                recorder.finish(
+                                    response_summary=(
+                                        f"attempt={_attempt} corrective_alley_retry "
+                                        + text[:440]
+                                    )
+                                )
                             continue  # re-roll with the anti-alley addendum
                         logger.warning(
                             "[BG][ALLEY-BIAS PERSISTENT] re-roll still chose alley; "
@@ -8990,6 +8999,10 @@ Hard rules:
                     return {"style": style, "prompt": prompt}
             # Parse failed this attempt. If attempts remain, the loop retries
             # (a re-roll often parses cleanly); otherwise fall through.
+            if recorder:
+                recorder.finish(
+                    response_summary=f"attempt={_attempt} parse_failed: {text[:420]}"
+                )
 
         # All attempts exhausted without a usable parse.
         finish_reason = "unknown"
@@ -9002,8 +9015,6 @@ Hard rules:
             pass
         logger.warning("[BG] Failed to parse Gemini JSON, using combinatorial fallback. "
                        "raw_len=%s finish_reason=%s", len(text), finish_reason)
-        if recorder:
-            recorder.finish(response_summary=f"parse_failed: {text[:200]}")
         return {"style": "video", "prompt": None}
 
     except Exception as e:
@@ -10383,7 +10394,9 @@ def _measure_camera_drift(video_path: str, samples: int = 30) -> dict | None:
                 pass
 
 
-def _score_video_relevance(video_path: str, prompt: str) -> int:
+def _score_video_relevance(
+    video_path: str, prompt: str, job_id: str | None = None,
+) -> int:
     """Ask Gemini Vision whether the video matches the intended scene prompt.
 
     Extracts one frame and returns a relevance score 1-10.
@@ -10393,6 +10406,7 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
     import tempfile
 
     tmp_frame = None
+    recorder = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
             tmp_frame = f.name
@@ -10406,6 +10420,19 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
         # generated Veo video; a hang here adds to total render latency
         # but is gated by the same outer except → fall-through to score=8.
         # 30 s suffices (single-frame Vision call is fast).
+        if job_id:
+            from provenance import record_ai_call
+            recorder = record_ai_call(
+                job_id=job_id,
+                step="video_relevance",
+                # One JPEG frame, same billing shape as the single-image
+                # validation call. The generic text key weighted this request
+                # ~20x too high after invoice calibration.
+                tool_name="gemini-2.5-flash-vision-image",
+                tool_provider="google_vertex",
+                prompt=prompt,
+                input_data_types=["video_frame", "scene_prompt"],
+            )
         response = _call_with_timeout(
             lambda: client.models.generate_content(
                 model="gemini-2.5-flash",
@@ -10432,8 +10459,12 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
         import re as _re
         m = _re.search(r'\b(10|[1-9])\b', response.text)
         score = int(m.group()) if m else 5
+        if recorder:
+            recorder.finish(response_summary=f"score={score}")
         return max(1, min(10, score))
     except Exception as e:
+        if recorder:
+            recorder.finish(response_summary=f"error: {e!r}")
         _raise_if_job_timeout(e)
         logger.warning("[BG] Relevance score error (fail-open): %s", e)
         return 8
@@ -11853,7 +11884,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # to bound cost (+$0.80 worst case). quality_retry_used gates the
             # re-generation decision, not the scoring itself, so the retry's
             # result is also evaluated before we accept and return it.
-            score = _score_video_relevance(bg_path, prompt)
+            score = _score_video_relevance(bg_path, prompt, job_id=job_id)
             logger.info("[BG] Relevance score: %s/10 for prompt: %s...", score, prompt[:60])
             # Detector de corte de escena (incidente mural 2026-06-09):
             # un clip cuyo primer y último frame son escenas distintas

@@ -16,6 +16,7 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     event,
     text,
@@ -209,6 +210,72 @@ def deliveries_added_by(default_user_id):
     return default_user_id
 
 
+# ── Peer environment DB (read-only, para atribución de costos) ────────────
+# La producción gestionada para UMG corre en STAGING bajo cuentas del equipo,
+# mientras que el autoservicio de Universal corre en PROD bajo tenants
+# universal_*. Como además staging y prod comparten proyecto de GCP, bucket R2
+# y proyecto de Railway, ninguna factura se puede separar por entorno: el
+# costo real por canción SOLO sale mirando las dos bases a la vez.
+#
+# `PEER_DATABASE_URL` apunta al OTRO entorno (desde prod → staging; desde
+# staging → prod). En staging ya existe esa conexión como
+# DELIVERIES_DATABASE_URL, así que se reusa por defecto y no hay que
+# configurar nada. Sin la var, los endpoints de atribución siguen andando
+# con un solo entorno y lo dicen explícitamente — nunca reportan que el otro
+# entorno costó $0, que sería la mentira peligrosa.
+#
+# SOLO LECTURA por convención: no se corre create_all contra este engine y
+# ningún camino de escritura lo usa.
+PEER_DATABASE_URL = os.environ.get("PEER_DATABASE_URL", "").strip() or DELIVERIES_DATABASE_URL
+if PEER_DATABASE_URL.startswith("postgres://"):
+    PEER_DATABASE_URL = PEER_DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+if (
+    PEER_DATABASE_URL
+    and deliveries_engine is not None
+    and PEER_DATABASE_URL == DELIVERIES_DATABASE_URL
+):
+    # Staging normally points both features at the production DB.  Reuse the
+    # existing low-volume deliveries pool instead of reserving a second pool
+    # (and up to three more sockets per API process) for cost attribution.
+    peer_engine = deliveries_engine
+    PeerSessionLocal = DeliveriesSessionLocal
+elif PEER_DATABASE_URL and PEER_DATABASE_URL == DATABASE_URL:
+    # An explicitly configured peer URL can also point at the local DB.  Keep
+    # one pool in that case; peer_session() still returns an independent
+    # short-lived Session.
+    peer_engine = engine
+    PeerSessionLocal = SessionLocal
+elif PEER_DATABASE_URL:
+    peer_engine = create_engine(
+        PEER_DATABASE_URL,
+        # Pool mínimo: cross-project por red pública y de uso esporádico
+        # (un par de consultas cuando alguien abre el panel de costos).
+        pool_size=int(os.environ.get("PEER_DB_POOL_SIZE", "1")),
+        max_overflow=int(os.environ.get("PEER_DB_MAX_OVERFLOW", "2")),
+        pool_pre_ping=True,
+        pool_recycle=120,
+        pool_reset_on_return="rollback",
+        echo=os.environ.get("SQL_ECHO", "").lower() == "true",
+        connect_args=_build_pg_connect_args(),
+    )
+    PeerSessionLocal = sessionmaker(
+        bind=peer_engine, autoflush=False, expire_on_commit=False
+    )
+else:
+    peer_engine = None
+    PeerSessionLocal = None
+
+
+def peer_session():
+    """Sesión al otro entorno, o None si no está configurado.
+
+    Devuelve None en vez de caer a la sesión local: mezclar los datos del
+    entorno propio como si fueran los del peer duplicaría el gasto y el
+    resultado se vería plausible, que es peor que no tenerlo."""
+    return PeerSessionLocal() if PeerSessionLocal else None
+
+
 from contextlib import contextmanager  # noqa: E402 — kept next to the helper it powers
 
 
@@ -238,6 +305,37 @@ def scoped_db():
         yield db
     finally:
         db.close()
+
+
+@contextmanager
+def scoped_deliveries_db():
+    """Sesión a la DB del portal, garantizada cerrada.
+
+    Sin `DELIVERIES_DATABASE_URL`, `DeliveriesSessionLocal` ES `SessionLocal`,
+    así que una fuga acá drena el pool PRINCIPAL. Y como `pool_stats()` mide
+    el pool entero, una sola sesión colgada rompe chequeos de salud y tests
+    de fuga que no tienen nada que ver con el endpoint culpable. Usar esto en
+    vez de abrir la sesión a mano."""
+    db = DeliveriesSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@contextmanager
+def scoped_peer_db():
+    """Sesión al otro entorno, o None si no está configurado.
+
+    Pensado para `with scoped_peer_db() as peer:` seguido de
+    `if peer is not None:` — el bloque corre igual cuando no hay peer, así el
+    llamador no necesita un camino de cierre aparte que se pueda olvidar."""
+    db = peer_session()
+    try:
+        yield db
+    finally:
+        if db is not None:
+            db.close()
 
 
 def pool_stats() -> dict:
@@ -1305,6 +1403,38 @@ class SalesLead(Base):
     message = Column(Text, nullable=True)
     ip_address = Column(String(45), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class CostSnapshot(Base):
+    """Monthly invoiced cost per provider, pulled by billing_sources.py.
+
+    Provider billing APIs only expose a rolling window (Railway shows the
+    open cycle, GitHub the current billing period, Replicate paginates
+    predictions that eventually age out), so a month that is never
+    snapshotted becomes unrecoverable. This table is the durable record:
+    one row per (period, source), refreshed by POST /admin/cost/refresh
+    and frozen after that source's post-close finalization window. Captures
+    made while usage is still accruing remain provisional.
+
+    `amount_usd` is nullable on purpose — a source that was not configured
+    yet must be distinguishable from one that genuinely cost $0, otherwise
+    a missing credential silently reads as free. See `status`.
+    """
+    __tablename__ = "cost_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    period = Column(String(7), nullable=False, index=True)   # "YYYY-MM"
+    source = Column(String(32), nullable=False)              # gcp | railway | ...
+    amount_usd = Column(Float, nullable=True)
+    status = Column(String(20), nullable=False, default="ok")
+    detail = Column(Text, nullable=True)
+    is_estimate = Column(Boolean, nullable=False, default=False)
+    breakdown = Column(JSONB, nullable=True)
+    fetched_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("period", "source", name="uq_cost_snapshot_period_source"),
+    )
 
 
 # ---------------------------------------------------------------------------

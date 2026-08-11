@@ -109,6 +109,50 @@ def is_non_retryable(err: Exception) -> bool:
     return any(f in msg for f in NON_RETRYABLE_FRAGMENTS)
 
 
+def start_replicate_provenance(model: str, call_label: str, attempt: int):
+    """Start one provenance row for one actual Replicate SDK attempt.
+
+    The active job comes from the worker context, which ``asyncio.to_thread``
+    propagates automatically. Tool names omit the version suffix so they
+    match the calibrated Replicate rate table; the pinned hash is retained in
+    ``tool_version``. Best-effort like every other provenance write.
+    """
+    try:
+        from observability import current_job_log_context
+        job_id = current_job_log_context()
+        if not job_id:
+            return None
+        from provenance import record_ai_call
+        tool_name, separator, tool_version = model.partition(":")
+        label = (call_label or "replicate").strip().lower()
+        return record_ai_call(
+            job_id,
+            f"replicate_{label}",
+            tool_name,
+            "replicate",
+            f"Replicate prediction ({label}), attempt {attempt}",
+            input_data_types=["audio"],
+            tool_version=tool_version if separator else None,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[%s] could not start Replicate provenance: %s",
+            call_label,
+            exc,
+        )
+        return None
+
+
+def finish_replicate_provenance(recorder, summary: str) -> None:
+    """Finish an optional recorder without affecting provider execution."""
+    if recorder is None:
+        return
+    try:
+        recorder.finish(response_summary=summary)
+    except Exception as exc:
+        logger.warning("Could not finish Replicate provenance: %s", exc)
+
+
 def _run_predict_with_progress(
     model: str,
     inputs: dict,
@@ -246,17 +290,25 @@ def call_with_budget(
         # after the call, win or lose.
         _input = input_factory()
         _closables = [v for v in _input.values() if hasattr(v, "close") and callable(v.close)]
+        recorder = start_replicate_provenance(model, call_label, attempt + 1)
         try:
             if on_progress is not None:
-                return _run_predict_with_progress(
+                result = _run_predict_with_progress(
                     model, _input,
                     deadline=deadline,
                     call_label=call_label,
                     on_progress=on_progress,
                     typical_runtime_s=typical_runtime_s,
                 )
-            return replicate.run(model, input=_input)
+            else:
+                result = replicate.run(model, input=_input)
+            finish_replicate_provenance(recorder, "succeeded")
+            return result
         except Exception as e:
+            finish_replicate_provenance(
+                recorder,
+                f"error: {type(e).__name__}: {str(e)[:300]}",
+            )
             last_err = e
             if is_non_retryable(e):
                 logger.warning("[%s] non-retryable error on attempt %s (%s) — aborting",

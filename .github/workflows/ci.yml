@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [main, staging, claude/*]
+  # Stacked PRs use another feature branch as their temporary base. Running
+  # CI only for main/staging left those exact heads without backend coverage.
   pull_request:
-    branches: [main, staging]
 
 jobs:
   # ─── Backend tests ───

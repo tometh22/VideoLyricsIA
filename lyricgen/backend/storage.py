@@ -397,6 +397,28 @@ def upload_input(local_path: str, tenant_id: str, job_id: str, filename: str) ->
     return key
 
 
+def object_status(key: str) -> str:
+    """Return ``exists``, ``missing`` or ``unavailable`` for an R2 key.
+
+    Lifecycle reconciliation must distinguish a real 404 from a transient
+    HEAD failure: deleting a database key on a timeout/403 could orphan a
+    valid multi-GB deliverable. Cache callers that only need a bool continue
+    to use :func:`object_exists` below.
+    """
+    client = _get_client()
+    if client is None:
+        return "unavailable"
+    try:
+        client.head_object(Bucket=R2_BUCKET, Key=key)
+        return "exists"
+    except Exception as exc:
+        code = (getattr(exc, "response", {}) or {}).get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey"):
+            return "missing"
+        logger.error("object_status check failed for key=%r: %s", key, exc)
+        return "unavailable"
+
+
 def object_exists(key: str) -> bool:
     """Check whether an object exists at the given key.
 
@@ -405,22 +427,7 @@ def object_exists(key: str) -> bool:
     an error and returns False — callers treat a missing object as a cache
     miss, so we degrade gracefully instead of propagating transient errors.
     """
-    client = _get_client()
-    if client is None:
-        return False
-    try:
-        client.head_object(Bucket=R2_BUCKET, Key=key)
-        return True
-    except Exception as exc:
-        # boto3 / botocore raises ClientError for all HTTP-level errors.
-        # 404 / NoSuchKey → object absent (expected). Anything else (403,
-        # network timeout, credential failure) is a real problem we should
-        # surface in logs rather than silently treating as "not found".
-        code = (getattr(exc, "response", {}) or {}).get("Error", {}).get("Code", "")
-        if code in ("404", "NoSuchKey"):
-            return False
-        logger.error("object_exists check failed for key=%r: %s", key, exc)
-        return False
+    return object_status(key) == "exists"
 
 
 def upload_file(local_path: str, key: str) -> Optional[str]:

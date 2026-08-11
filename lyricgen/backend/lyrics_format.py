@@ -182,10 +182,23 @@ async def format_lyrics_pass(result: dict, language: str | None = None) -> dict:
 
     lang = _lang_name(language)
     prompt = _build_prompt(texts, lang)
+    recorder = None
 
     try:
         from openai import AsyncOpenAI
         client = AsyncOpenAI()
+
+        job_id = result.get("job_id")
+        if job_id:
+            from provenance import record_ai_call
+            recorder = record_ai_call(
+                job_id=job_id,
+                step="lyrics_format",
+                tool_name="gpt-4o-mini",
+                tool_provider="openai",
+                prompt=prompt,
+                input_data_types=["lyrics_text"],
+            )
 
         resp = await asyncio.wait_for(
             client.chat.completions.create(
@@ -196,6 +209,8 @@ async def format_lyrics_pass(result: dict, language: str | None = None) -> dict:
             ),
             timeout=30,
         )
+        if recorder:
+            recorder.finish(response_summary="succeeded")
 
         raw = (resp.choices[0].message.content or "").strip()
         groups = _parse_response(raw, len(segs))
@@ -235,5 +250,9 @@ async def format_lyrics_pass(result: dict, language: str | None = None) -> dict:
         return result
 
     except Exception as exc:
+        if recorder:
+            recorder.finish(
+                response_summary=f"error: {type(exc).__name__}: {str(exc)[:300]}"
+            )
         logger.warning("[FORMAT] pass failed: %r — returning original", exc)
         return result
