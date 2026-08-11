@@ -728,7 +728,7 @@ def test_un_2xx_sin_operation_name_se_conserva_como_ambiguo():
 
     source = inspect.getsource(pipeline._generate_veo_video)
     start = source.index("if not operation_name:")
-    end = source.index("veo_breaker.record_success()", start)
+    end = source.index("except VeoTrackingUnavailable:", start)
     block = source[start:end]
     assert "ambiguous success response missing operation name" in block
     assert "_release_veo_reservation" not in block
@@ -785,12 +785,33 @@ def test_http_408_y_5xx_son_ambiguos_pero_4xx_rechaza():
     assert pipeline._veo_http_failure_is_ambiguous(422) is False
 
     source = inspect.getsource(pipeline._generate_veo_video)
-    failure = source[source.index("if not r.ok:"):
-                     source.index("try:\n            payload = r.json()")]
+    failure = source[source.index("elif not r.ok:"):
+                     source.index("payload = r.json()")]
     ambiguous = failure.index("_veo_http_failure_is_ambiguous")
     release = failure.index("_release_veo_reservation")
     assert ambiguous < release
     assert "raise VeoAmbiguousSubmission" in failure[:release]
+
+
+def test_429_se_vuelve_no_facturable_antes_de_soltar_el_lock():
+    """Delete during backoff must not archive a rejected call as paid."""
+    import inspect
+    import pipeline
+
+    source = inspect.getsource(pipeline._generate_veo_video)
+    guard = source.index("with _VeoSubmissionGuard(")
+    pause = source.index("_pause_veo_reservation_for_retry(", guard)
+    guard_handler = source.index("except VeoTrackingUnavailable:", guard)
+    backoff = source.index("if rejected_429:", guard_handler)
+    assert guard < pause < guard_handler < backoff
+
+    attempt = source.index("if attempt:")
+    retry_token = source.index("token = _veo_access_token()", attempt)
+    retry_reserve = source.index(
+        "_retry_over, _retry_spent = _veo_budget_exceeded(", retry_token,
+    )
+    next_guard = source.index("with _VeoSubmissionGuard(", retry_reserve)
+    assert retry_token < retry_reserve < next_guard
 
 
 def test_la_identidad_de_cancion_colapsa_espacios(monkeypatch):

@@ -9483,6 +9483,25 @@ def _release_veo_reservation(recorder, reason: str) -> bool:
     )
 
 
+def _pause_veo_reservation_for_retry(recorder, reason: str) -> None:
+    """Make a confirmed rejection non-billable between submit attempts.
+
+    Unlike ``_release_veo_reservation``, this does not finish the recorder:
+    the same audit row will be atomically reserved again immediately before
+    the next POST. A delete during auth/backoff can therefore remove the free
+    row without archiving phantom spend into the tombstone ledger.
+    """
+    from provenance import BUDGET_RELEASED_PREFIX
+
+    row_id = getattr(recorder, "_row_id", None)
+    if not _persist_veo_reservation_summary(
+        row_id, f"{BUDGET_RELEASED_PREFIX}: {str(reason)[:1900]}",
+    ):
+        raise VeoTrackingUnavailable(
+            f"Could not pause rejected Veo reservation row={row_id}"
+        )
+
+
 def _song_identity(artist: str | None, title: str | None,
                    job_id: str | None = None) -> str:
     """Identidad de canción, IDÉNTICA a `cost_attribution.song_key`.
@@ -10396,6 +10415,22 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                 _release_veo_reservation(
                     recorder, f"pre-submit auth failed: {exc}")
                 raise
+            # The previous attempt was a confirmed 429 and its row was made
+            # non-billable before releasing the submission lock. Re-acquire a
+            # budget slot only now, after auth and immediately before the next
+            # guarded POST. If deletion won during backoff/auth, this aborts.
+            _retry_over, _retry_spent = _veo_budget_exceeded(
+                job_id,
+                own_row_id=getattr(recorder, "_row_id", None),
+                require_persistent_tracking=require_persistent_tracking,
+            )
+            if _retry_over:
+                raise VeoBudgetExceeded(
+                    f"job {job_id}: {_retry_spent} generaciones de Veo ya "
+                    f"hechas para esta canción (tope "
+                    f"{VEO_MAX_CALLS_PER_SONG}). No se reintenta."
+                )
+        rejected_429 = False
         try:
             logger.info("[BG] Veo 3: generating video (attempt %s/%s)...", attempt + 1, MAX_ATTEMPTS)
             # Re-check deletion after token acquisition, then keep the same
@@ -10404,16 +10439,81 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             with _VeoSubmissionGuard(
                 job_id, getattr(recorder, "_row_id", None),
             ):
-                r = _req.post(
-                    submit_url,
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json",
-                        "x-goog-user-project": _VERTEX_PROJECT,
-                    },
-                    json=request_body,
-                    timeout=60,
-                )
+                try:
+                    r = _req.post(
+                        submit_url,
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Content-Type": "application/json",
+                            "x-goog-user-project": _VERTEX_PROJECT,
+                        },
+                        json=request_body,
+                        timeout=60,
+                    )
+                except Exception as e:
+                    _raise_if_job_timeout(e)
+                    # The provider may have accepted the request. Persist the
+                    # ambiguous/billable state before deletion can take the
+                    # shared lock and archive it.
+                    if recorder:
+                        recorder.finish(response_summary=(
+                            "error: ambiguous submission; not retrying: "
+                            f"{str(e)[:300]}"
+                        ))
+                    raise VeoAmbiguousSubmission(
+                        "Veo 3 submission response was ambiguous; not "
+                        f"retrying: {e}"
+                    ) from e
+
+                if r.status_code == 429 or "RESOURCE_EXHAUSTED" in r.text:
+                    rate_limit_hits += 1
+                    veo_breaker.record_rate_limit()
+                    _pause_veo_reservation_for_retry(
+                        recorder,
+                        f"HTTP {r.status_code} rate limited attempt "
+                        f"{attempt + 1}",
+                    )
+                    rejected_429 = True
+                elif not r.ok:
+                    detail = r.text[:500]
+                    if _veo_http_failure_is_ambiguous(r.status_code):
+                        if recorder:
+                            recorder.finish(response_summary=(
+                                f"error: ambiguous HTTP {r.status_code}; "
+                                f"not retrying: {detail[:300]}"
+                            ))
+                        raise VeoAmbiguousSubmission(
+                            f"Veo predictLongRunning HTTP {r.status_code} was "
+                            f"ambiguous; not retrying: {detail}"
+                        )
+                    _release_veo_reservation(
+                        recorder, f"HTTP {r.status_code} rejected: {detail}")
+                    raise RuntimeError(
+                        f"Veo predictLongRunning HTTP {r.status_code}: {detail}"
+                    )
+                else:
+                    try:
+                        payload = r.json()
+                    except Exception as exc:
+                        if recorder:
+                            recorder.finish(response_summary=(
+                                "error: ambiguous success response; not "
+                                f"retrying: {str(exc)[:300]}"
+                            ))
+                        raise VeoAmbiguousSubmission(
+                            "Veo returned an unreadable success response"
+                        ) from exc
+                    operation_name = payload.get("name")
+                    if not operation_name:
+                        if recorder:
+                            recorder.finish(response_summary=(
+                                "error: ambiguous success response missing operation name; "
+                                "not retrying: "
+                                f"{str(payload)[:300]}"
+                            ))
+                        raise VeoAmbiguousSubmission(
+                            f"Veo response missing 'name': {payload}"
+                        )
         except VeoTrackingUnavailable:
             # No request began. The row may already have been removed by the
             # deletion transaction; release it only when it still exists.
@@ -10423,25 +10523,10 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             except VeoTrackingUnavailable:
                 pass
             raise
-        except Exception as e:
-            _raise_if_job_timeout(e)
-            # Once post() has started, a timeout/disconnect is ambiguous: the
-            # provider may already be rendering. Preserve this one billable
-            # reservation and DO NOT submit again under the same row.
-            if recorder:
-                recorder.finish(
-                    response_summary=f"error: ambiguous submission; not retrying: {str(e)[:300]}"
-                )
-            raise VeoAmbiguousSubmission(
-                f"Veo 3 submission response was ambiguous; not retrying: {e}"
-            ) from e
-
-        if r.status_code == 429 or "RESOURCE_EXHAUSTED" in r.text:
-            rate_limit_hits += 1
-            veo_breaker.record_rate_limit()  # feeds the cross-worker breaker
+        if rejected_429:
             # Capped exponential backoff + ±20 % jitter. All retries here are
-            # safe under ONE reservation because every prior HTTP response
-            # explicitly rejected the request and created no operation.
+            # safe because every prior HTTP response explicitly rejected the
+            # request. The reservation stays non-billable during this wait.
             base = min(MAX_BACKOFF_S, 30 * (2 ** attempt))
             wait = base * random.uniform(0.8, 1.2)
             if _time.time() + wait > _submit_deadline:
@@ -10451,48 +10536,6 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                            r.status_code, wait)
             _time.sleep(wait)
             continue
-        if not r.ok:
-            detail = r.text[:500]
-            if _veo_http_failure_is_ambiguous(r.status_code):
-                if recorder:
-                    recorder.finish(response_summary=(
-                        f"error: ambiguous HTTP {r.status_code}; not retrying: "
-                        f"{detail[:300]}"
-                    ))
-                raise VeoAmbiguousSubmission(
-                    f"Veo predictLongRunning HTTP {r.status_code} was "
-                    f"ambiguous; not retrying: {detail}"
-                )
-            _release_veo_reservation(
-                recorder, f"HTTP {r.status_code} rejected: {detail}")
-            raise RuntimeError(
-                f"Veo predictLongRunning HTTP {r.status_code}: {detail}"
-            )
-        try:
-            payload = r.json()
-        except Exception as exc:
-            # A successful HTTP response with an unreadable body is ambiguous;
-            # keep the one reservation and never duplicate the submission.
-            if recorder:
-                recorder.finish(response_summary=(
-                    f"error: ambiguous success response; not retrying: {str(exc)[:300]}"
-                ))
-            raise VeoAmbiguousSubmission(
-                "Veo returned an unreadable success response"
-            ) from exc
-        operation_name = payload.get("name")
-        if not operation_name:
-            # A 2xx means Vertex may already have accepted a paid operation,
-            # even if a schema change/anomaly hid its identifier. Keep exactly
-            # one billable reservation and stop: retrying could duplicate it.
-            if recorder:
-                recorder.finish(response_summary=(
-                    "error: ambiguous success response missing operation name; "
-                    f"not retrying: {str(payload)[:300]}"
-                ))
-            raise VeoAmbiguousSubmission(
-                f"Veo response missing 'name': {payload}"
-            )
         veo_breaker.record_success()  # Veo accepted → close the breaker if open
         break
 
