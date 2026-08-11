@@ -396,8 +396,8 @@ def fetch_railway(period: str) -> SourceCost:
     Env:
         RAILWAY_API_TOKEN       account/team token (NOT a project token —
                                 project tokens cannot read the usage query)
-        RAILWAY_PROJECT_ID      (optional) restrict to the Genly IA project
-        RAILWAY_WORKSPACE_ID    (optional) restrict to one workspace
+        RAILWAY_PROJECT_ID      restrict to the Genly IA project, or
+        RAILWAY_WORKSPACE_ID    restrict to the Genly-only workspace
         RAILWAY_PLAN_MINIMUM_USD monthly usage commitment (default 20)
 
     Scoping to the project matters: the account carries unrelated projects
@@ -414,6 +414,12 @@ def fetch_railway(period: str) -> SourceCost:
     start, end = _period_bounds(period)
     project_id = os.environ.get("RAILWAY_PROJECT_ID", "").strip()
     workspace_id = os.environ.get("RAILWAY_WORKSPACE_ID", "").strip()
+    if not (project_id or workspace_id):
+        return _not_configured(
+            "railway", period,
+            "RAILWAY_PROJECT_ID o RAILWAY_WORKSPACE_ID (scope GenLy; la "
+            "cuenta contiene proyectos ajenos)",
+        )
 
     query = """
     query usage($startDate: DateTime!, $endDate: DateTime!,

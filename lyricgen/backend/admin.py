@@ -1038,7 +1038,20 @@ def admin_cost_real(          # `def`, no `async def`: con live=true hace HTTP
         raise HTTPException(status_code=400, detail=str(e))
 
     if live:
-        return {**billing_sources.fetch_all(period=period), "source_of_truth": "live"}
+        result = billing_sources.fetch_all(period=period)
+        if period >= billing_sources.current_period():
+            # Healthy provider calls only prove source coverage. They cannot
+            # turn month-to-date usage into a closed invoice while spend is
+            # still accruing.
+            result.update({
+                "complete": False,
+                "provisional": True,
+                "detail": (
+                    "totales live del período abierto; el gasto todavía "
+                    "puede acumularse y no constituye una factura cerrada"
+                ),
+            })
+        return {**result, "source_of_truth": "live"}
 
     # `rate_calibration` guarda tarifas, no gasto: su `amount_usd` es NULL a
     # propósito. Contarla como una fuente de facturación la mandaba al balde

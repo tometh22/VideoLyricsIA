@@ -101,6 +101,37 @@ def test_cost_real_rejects_malformed_period(client, admin_token):
     assert res.status_code == 400
 
 
+def test_cost_real_live_del_mes_abierto_sigue_provisional(
+    client, admin_token, monkeypatch,
+):
+    """Cobertura sana no convierte un acumulado intrames en factura final."""
+    import billing_sources
+
+    period = "2099-12"
+    monkeypatch.setattr(billing_sources, "current_period", lambda: period)
+    monkeypatch.setattr(billing_sources, "fetch_all", lambda **kwargs: {
+        "period": period,
+        "total_usd": 7.0,
+        "sources": [],
+        "configured": list(billing_sources.SOURCES),
+        "not_configured": [],
+        "errored": [],
+        "complete": True,
+    })
+
+    res = client.get(
+        f"/admin/cost/real?period={period}&live=true",
+        headers=auth(admin_token),
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["total_usd"] == 7.0
+    assert body["complete"] is False
+    assert body["provisional"] is True
+    assert body["source_of_truth"] == "live"
+    assert "período abierto" in body["detail"]
+
+
 def test_cost_real_roundtrips_a_snapshot(client, admin_token, db):
     """A persisted snapshot is summed and reported as the source of truth."""
     from database import CostSnapshot
