@@ -287,7 +287,9 @@ def test_cost_reports_run_blocking_queries_in_threadpool():
     import inspect
     from admin import (
         admin_cost_business,
+        admin_cost_rates,
         admin_cost_reconcile,
+        admin_tenant_cost,
         admin_cost_umg,
         admin_cost_unit_economics,
         admin_change_requests,
@@ -298,6 +300,8 @@ def test_cost_reports_run_blocking_queries_in_threadpool():
     assert not inspect.iscoroutinefunction(admin_cost_unit_economics)
     assert not inspect.iscoroutinefunction(admin_cost_reconcile)
     assert not inspect.iscoroutinefunction(admin_change_requests)
+    assert not inspect.iscoroutinefunction(admin_cost_rates)
+    assert not inspect.iscoroutinefunction(admin_tenant_cost)
 
 
 def test_umg_endpoint_warns_when_peer_env_missing(client, admin_token):
