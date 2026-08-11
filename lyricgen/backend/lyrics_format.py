@@ -157,6 +157,103 @@ def _parse_response(raw: str, n_input: int) -> "dict | None":
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def strip_periods_enabled_for(tenant_id: str | None) -> bool:
+    """¿Este tenant tiene activo el borrado del punto final?
+
+    Apagado por defecto. Un cambio que altera el texto entregado no debe poder
+    activarse por accidente para un cliente que no lo pidió — UMG lo pidió seis
+    veces, otro cliente puede querer la puntuación intacta.
+    """
+    if os.environ.get("LYRICS_STRIP_TRAILING_DOT", "0").strip().lower() not in (
+        "1", "true", "on", "yes"
+    ):
+        return False
+    tenants = {
+        t.strip().lower()
+        for t in os.environ.get("LYRICS_STRIP_TRAILING_DOT_TENANTS", "").split(",")
+        if t.strip()
+    }
+    return "*" in tenants or (tenant_id or "").strip().lower() in tenants
+
+
+def strip_trailing_periods(result: dict, tenant_id: str | None = None) -> dict:
+    """Remove the final period from each lyric line.
+
+    UMG's single most repeated change request — six times, unprompted, across
+    three months, the most recent three days before this was written:
+    *"casi todas las frases tienen punto finales. Sacarlos porfa!"* (27-05),
+    *"quitar los puntos finales de cada frase"* (27-07), *"que las letras no
+    tengan puntos"* (04-08), *"sacar los puntos finales de todas las frases"*
+    (05-08). Measured on `editor_documents`: 214 of 586 lines (36.5%) arrive
+    with a trailing period and only 35 of 593 survive to delivery — operators
+    were stripping **83.6%** of them by hand, one line at a time.
+
+    Deliberately deterministic rather than a prompt tweak. `_build_prompt`
+    tells an LLM to "Fix punctuation (commas, periods, ellipsis)", but that
+    is not provably the source: OpenAI `whisper-1` emits sentence punctuation
+    on its own, and the pre-format text is never persisted (the editor's
+    `original_segments` is seeded from `job.segments_json`, already
+    post-format). Removing a word from a prompt is non-deterministic and
+    would miss the whisper path entirely; this runs after every text source.
+
+    Scope is intentionally narrow — only the period:
+
+    * `?` (55 lines) and `!` (27) are kept. UMG never asked for those, and the
+      Spanish prompt adds the opening `¿`/`¡` on purpose.
+    * Ellipsis is kept. 14 lines legitimately trail off, and dropping one dot
+      of a `...` would leave a broken `..`.
+    * Internal punctuation is untouched — only the very end of each line.
+
+    Multi-line cards (`\\n` inside `text`) are handled per physical line: each
+    on-screen line is a "frase" to the client. None exist in the current data,
+    but the render path allows them.
+
+    **Apagado por defecto y habilitado por tenant.** Cambia el texto que ve
+    todo cliente, así que no puede entrar de forma global: UMG lo pidió, otro
+    cliente puede querer la puntuación. `LYRICS_STRIP_TRAILING_DOT=1` +
+    `LYRICS_STRIP_TRAILING_DOT_TENANTS=universal_argentina,universal_chile`.
+    Con `*` aplica a todos.
+    """
+    if not strip_periods_enabled_for(tenant_id):
+        return result
+    if not isinstance(result, dict):
+        return result
+    segs = result.get("segments") or []
+    if not segs:
+        return result
+
+    n_stripped = 0
+    new_segs = []
+    for seg in segs:
+        text = seg.get("text")
+        if not isinstance(text, str) or not text:
+            new_segs.append(seg)
+            continue
+        lines = text.split("\n")
+        out_lines = []
+        changed = False
+        for line in lines:
+            stripped = line.rstrip()
+            # A single trailing "." only. `endswith("..")` guards the ellipsis,
+            # and "…" (U+2026) never matches "." in the first place.
+            if stripped.endswith(".") and not stripped.endswith(".."):
+                out_lines.append(stripped[:-1].rstrip())
+                changed = True
+                n_stripped += 1
+            else:
+                out_lines.append(line)
+        if changed:
+            new_segs.append({**seg, "text": "\n".join(out_lines)})
+        else:
+            new_segs.append(seg)
+
+    if n_stripped:
+        logger.info("[FORMAT] %d puntos finales removidos", n_stripped)
+        result = dict(result)
+        result["segments"] = new_segs
+    return result
+
+
 async def format_lyrics_pass(result: dict, language: str | None = None) -> dict:
     """Orthographic correction + line splitting on the final segment list.
 

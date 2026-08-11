@@ -166,6 +166,25 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
     return r
 
 
+def _tenant_of(job_id: str) -> str:
+    """Tenant del job, o "" si no se puede resolver.
+
+    Nunca levanta: un flag de producto que no se puede resolver debe caer al
+    comportamiento por defecto (apagado), no romper la transcripción.
+    """
+    try:
+        from database import Job, SessionLocal
+        db = SessionLocal()
+        try:
+            row = (db.query(Job.tenant_id)
+                     .filter(Job.job_id == job_id).one_or_none())
+            return (row[0] if row else "") or ""
+        finally:
+            db.close()
+    except Exception:
+        return ""
+
+
 def run_transcription_job(
     job_id: str,
     audio_path: str,
@@ -275,9 +294,21 @@ def run_transcription_job(
             r = await _maybe_word_vote(r, audio_path, job_id, _post_lang)
             r = _maybe_chorus_snap(r, job_id)
             r = _maybe_phrase_segment(r, job_id)
-            from lyrics_format import format_lyrics_pass as _fmt
+            from lyrics_format import (
+                format_lyrics_pass as _fmt,
+                strip_trailing_periods as _strip_dots,
+            )
             _antes = _coverage_de(r)
             r = await _fmt(r, language=_post_lang)
+            # Runs OUTSIDE the format pass on purpose: `_fmt` returns early
+            # when disabled, when the LLM call fails, or when there are no
+            # segments, and periods also arrive straight from whisper-1. This
+            # has to apply to every text source, not just the LLM's output.
+            #
+            # Gated per tenant: cambia el texto entregado, así que sólo corre
+            # para los clientes que lo pidieron. El tenant sale del job porque
+            # no viaja en la firma de esta función.
+            r = _strip_dots(r, tenant_id=_tenant_of(job_id))
             return _medir_cobertura_final(r, job_id, _antes, audio_path)
 
         result = asyncio.run(_run_with_retime())

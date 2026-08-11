@@ -37,6 +37,33 @@ def test_apagado_devuelve_skipped_sin_encolar(client, admin_token, monkeypatch):
     assert "job_id" not in body
 
 
+def test_preview_hashea_el_tenant_autenticado_antes_del_killswitch(
+    client, admin_token, monkeypatch,
+):
+    """La resolución del conflicto #1085/#1086 debe conservar el canary por
+    tenant aunque el preview esté apagado y sólo se consulte cache paga."""
+    import bg_preview
+
+    captured = {}
+    monkeypatch.setenv("BG_PREVIEW_ENABLED", "0")
+    monkeypatch.setattr(
+        bg_preview,
+        "compute_bg_cache_key",
+        lambda params: captured.update(params) or "tenant-aware-key",
+    )
+    monkeypatch.setattr(bg_preview, "cache_check", lambda _key: False)
+
+    response = client.post(
+        "/generate-preview",
+        headers=auth(admin_token),
+        json=_body(),
+    )
+
+    assert response.status_code == 200
+    assert "_tenant_id" in captured
+    assert captured["_tenant_id"]
+
+
 def test_el_mensaje_le_dice_al_operador_que_igual_va_a_salir(client, admin_token,
                                                             monkeypatch):
     """Si el mensaje sugiriera que algo falló, el operador reintentaría — y
@@ -103,6 +130,12 @@ def test_worker_omite_backlog_ya_encolado_cuando_se_apaga(monkeypatch):
         "cache_check",
         lambda _key: (_ for _ in ()).throw(
             AssertionError("un preview desactivado no debe tocar cache ni generar")
+        ),
+    )
+    monkeypatch.setattr(
+        "database.SessionLocal",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("disabled backlog must not resolve tenant or touch DB")
         ),
     )
 

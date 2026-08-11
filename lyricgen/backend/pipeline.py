@@ -632,6 +632,7 @@ def _validate_bg_cache_key(bg_cache_key, *, job_id, artist, song_title, style,
             custom_colors=custom_colors, genre=genre, concept=concept,
             background_hint=background_hint, bg_verbatim=bg_verbatim,
             match_lyrics=match_lyrics,
+            tenant_id=_tenant_of_job(job_id),
         )
         if expected is None or bg_cache_key != expected:
             logger.warning(
@@ -1244,6 +1245,17 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     mp3_path, language=language, lyrics_hint=lyrics_hint,
                     job_id=job_id,
                 )
+                # The deprecated POST /upload path enters the full pipeline
+                # directly and transcribes here, bypassing both synchronous
+                # transcription endpoints and transcription_worker. Apply the
+                # same tenant-gated final pass before these segments become the
+                # persisted/rendered source of truth.
+                from lyrics_format import strip_trailing_periods as _strip_dots
+                _stripped_result = _strip_dots(
+                    {"segments": segments},
+                    tenant_id=_tenant_of_job(job_id),
+                )
+                segments = _stripped_result.get("segments", segments)
         # Persist segments so edit re-renders can skip re-transcription.
         # Skip when we just read them from the same row — pointless write.
         if _persist_segments:
@@ -1284,6 +1296,20 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # variable quedaba sin asignar → UnboundLocalError tumbaba TODO job de
         # fondo no-IA (incl. los golden renders). Inicializar acá, incondicional.
         _scenes_active = False
+
+        # Resolve before branching on human vs generated backgrounds. The
+        # render consumes this value even for a still library/custom asset
+        # (to decide whether Ken Burns is allowed), so defining it only in the
+        # generated-background branch crashes those normal human paths.
+        import scenes as _sc_default
+        _bg_movement = _sc_default.effective_movement_for_tenant(
+            movement_style, _tenant_of_job(job_id)
+        )
+        if (_bg_movement
+                and not _normalize_movement_style(movement_style)):
+            logger.info(
+                "[BG] Auto → %s por default de tenant job=%s",
+                _bg_movement, job_id)
 
         if background_path and not _animate_user_image:
             # Human-provided background — skip AI generation (UMG Guideline 10)
@@ -1336,6 +1362,18 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # opciones después del preview, o el preview falló, o el TTL
             # de 24h del cache lo limpió), seguimos con el flow normal.
             bg_image_path = None
+
+            # Default de movimiento por tenant, resuelto UNA vez para TODOS
+            # los caminos de fondo. Antes vivía sólo dentro de
+            # `build_scene_plan`, así que un tenant habilitado sin el add-on
+            # de Escenas —o cuyo multi-escena falla y cae al fondo único—
+            # seguía recibiendo el fondo Auto en movimiento, que es
+            # exactamente lo que el flag existe para sacar.
+            #
+            # NO se pisa `render_params.movement_style` (línea de abajo): eso
+            # guarda la elección del OPERADOR, y el editor la pinta desde ahí.
+            # Si lo sobrescribiéramos, el operador vería "Estático" donde
+            # eligió "Auto".
             # Multi-scene owns its own per-clip cache. A stale single-background
             # preview key must never short-circuit the scenes branch.
             if enable_scenes and bg_cache_key:
@@ -1345,7 +1383,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 bg_cache_key = _validate_bg_cache_key(
                     bg_cache_key, job_id=job_id, artist=artist,
                     song_title=song_title, style=style,
-                    movement_style=movement_style, effect=effect,
+                    movement_style=_bg_movement, effect=effect,
                     custom_colors=custom_colors, genre=genre, concept=concept,
                     background_hint=background_hint, bg_verbatim=bg_verbatim,
                     match_lyrics=match_lyrics,
@@ -1414,7 +1452,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         segments, _audio_dur_for_kb or _audio_duration(mp3_path),
                         job_dir, style_hint=style, lyrics_text=lyrics_text,
                         artist=artist, song_title=_song_title, genre=genre,
-                        concept=concept, movement_style=movement_style,
+                        concept=concept, movement_style=_bg_movement,
                         custom_colors=custom_colors,
                         # El prompt del operador ("Mi prompt") moldea TODA la
                         # biblia → multi-escena respeta auto/letra/prompt igual
@@ -1473,7 +1511,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         style, job_dir,
                         lyrics_text=lyrics_text, artist=artist, job_id=job_id,
                         song_title=_song_title, genre=genre, concept=concept,
-                        movement_style=movement_style,
+                        movement_style=_bg_movement,
                         image_to_video_path=(background_path if _animate_user_image else None),
                         match_lyrics=match_lyrics,
                         background_hint=background_hint,
@@ -1828,7 +1866,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                                 lyrics_text=lyrics_text, artist=artist,
                                 job_id=job_id, song_title=_song_title,
                                 genre=genre, concept=concept,
-                                movement_style=movement_style,
+                                movement_style=_bg_movement,
                                 image_to_video_path=(
                                     background_path if _animate_user_image else None
                                 ),
@@ -2019,7 +2057,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 # camino de fondo humano: hasta ahora el eje entero era inerte
                 # acá (se enviaba, se persistía y nadie lo leía).
                 still_background=(
-                    _normalize_movement_style(movement_style) in {"estatico", "foto-estatica"}
+                    _normalize_movement_style(_bg_movement) in {"estatico", "foto-estatica"}
                 ),
             )
             # Cinemascope opt-in: letterbox the finished YouTube master. Skipped
@@ -12174,6 +12212,24 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
     return clip_for_key
 
 
+def _tenant_of_job(job_id: str | None) -> str:
+    """Tenant del job, normalizado, o "" si no se puede resolver.
+
+    Nunca levanta: un canary de producto que no se puede resolver tiene que
+    caer al comportamiento por defecto (apagado), no tumbar el render.
+    """
+    if not job_id:
+        return ""
+    try:
+        from database import SessionLocal as _SL, Job as _Job
+        with _SL() as _db:
+            row = (_db.query(_Job.tenant_id)
+                      .filter(_Job.job_id == job_id).one_or_none())
+        return _normalise_account_id(row[0] if row else None)
+    except Exception:
+        return ""
+
+
 def _generate_scene_background(segments: list[dict], audio_duration: float,
                               job_dir: str, *, style_hint: str, lyrics_text: str,
                               artist: str, song_title: str = "", genre: str = "",
@@ -12220,7 +12276,11 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                                       atmospherics_policy=atmospherics_policy)
     plan = _scenes.build_scene_plan(secs, bible, prompt_fn, artist=artist,
                                     song_title=song_title, style=style_hint,
-                                    operator_movement=_normalize_movement_style(movement_style))
+                                    operator_movement=_normalize_movement_style(movement_style),
+                                    # El canary de BG_DEFAULT_MOVEMENT es por
+                                    # tenant; sin esto sólo podía activarse con
+                                    # `*` (o sea, para todos los clientes).
+                                    tenant_id=_tenant_of_job(job_id))
     plan["generation_policy"] = {
         "policy_version": BACKGROUND_POLICY_VERSION,
         "creative_mode": creative_mode,
@@ -15941,7 +16001,15 @@ def generate_lyric_video(
 
     # --- moviepy composite path (default) ---
     if bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
-        bg = _ken_burns_clip(bg_source, duration, spec=spec)
+        # Keep the operator's static intent when MoviePy is selected directly
+        # or libass fails. Without this flag the fallback silently reintroduced
+        # the 15% Ken Burns zoom that the ASS path had just avoided.
+        bg = _ken_burns_clip(
+            bg_source,
+            duration,
+            spec=spec,
+            static=still_background,
+        )
     else:
         bg = _get_background_clip_from_path(bg_source, style, duration, job_dir, spec=spec,
                                             bg_prelooped=bg_prelooped)
@@ -17294,6 +17362,13 @@ def run_edit_pipeline(
     genre = merged.get("genre") or ""
     concept = merged.get("concept") or ""
     movement_style = merged.get("movement_style") or ""
+    # Same effective value used by initial renders and previews. The raw Auto
+    # selection remains in render_params; only artifact-producing paths use
+    # the tenant-specific default.
+    import scenes as _edit_scenes
+    _edit_bg_movement = _edit_scenes.effective_movement_for_tenant(
+        movement_style, _tenant_of_job(job_id)
+    )
     # Effect overlay + custom palette persist across edits via render_params,
     # so a re-render keeps the snow/rain/grade the operator picked at upload.
     effect = merged.get("effect") or ""
@@ -17556,7 +17631,7 @@ def run_edit_pipeline(
                     style, job_dir,
                     lyrics_text=lyrics_text, artist=artist, job_id=job_id,
                     song_title=song_title, genre=genre, concept=concept,
-                    movement_style=movement_style,
+                    movement_style=_edit_bg_movement,
                     background_hint=effective_background_hint,
                     bg_mode=background_mode,
                     bg_verbatim=bg_verbatim,
@@ -17742,7 +17817,7 @@ def run_edit_pipeline(
                         style, job_dir,
                         lyrics_text=lyrics_text, artist=artist, job_id=job_id,
                         song_title=song_title, genre=genre, concept=concept,
-                        movement_style=movement_style,
+                        movement_style=_edit_bg_movement,
                         image_to_video_path=_cbg_local,
                         background_hint=effective_background_hint,
                         bg_mode=background_mode,
@@ -17921,7 +17996,7 @@ def run_edit_pipeline(
                             lyrics_text=lyrics_text, artist=artist,
                             job_id=job_id, song_title=song_title,
                             genre=genre, concept=concept,
-                            movement_style=movement_style,
+                            movement_style=_edit_bg_movement,
                             background_hint=effective_background_hint,
                             bg_mode=background_mode,
                             bg_verbatim=bg_verbatim,
@@ -18029,7 +18104,7 @@ def run_edit_pipeline(
             bg_prelooped=bg_prelooped,
             # Espejo de run_pipeline: un edit no puede perder el "quieta".
             still_background=(
-                _normalize_movement_style(movement_style) in {"estatico", "foto-estatica"}
+                _normalize_movement_style(_edit_bg_movement) in {"estatico", "foto-estatica"}
             ),
         )
         # Cinemascope opt-in — mirror run_pipeline. YouTube master only.
