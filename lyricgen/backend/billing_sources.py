@@ -976,56 +976,53 @@ def fetch_github(period: str) -> SourceCost:
     breakdown = [{"included_minutes": included, "used_minutes": used,
                   "paid_minutes": paid}]
 
-    # This endpoint is account-cycle-to-date, not calendar-month usage. Zero
-    # paid minutes are zero under either partition, but a positive amount may
-    # only enter the monthly invoice when the account cycle starts on day 1.
-    # Otherwise the aggregate straddles two calendar months and cannot be
-    # split honestly from this API. Fail incomplete and retain the observed
-    # cycle value for diagnosis instead of archiving it under a false month.
-    if amount > 0:
-        cycle_day_raw = os.environ.get(
-            "GITHUB_BILLING_CYCLE_DAY", ""
-        ).strip()
-        try:
-            cycle_day = int(cycle_day_raw)
-        except (TypeError, ValueError):
-            cycle_day = 0
-        if not 1 <= cycle_day <= 28:
-            return SourceCost(
-                "github", period, status="error",
-                detail=(
-                    f"GitHub reportó ${amount:.2f} para su ciclo corriente, "
-                    "pero GITHUB_BILLING_CYCLE_DAY no está configurado con "
-                    "un día válido (1-28); no se atribuye a un mes calendario"
-                ),
-                breakdown=[{**breakdown[0],
-                            "observed_cycle_amount_usd": amount}],
+    # This endpoint is account-cycle-to-date, not calendar-month usage. Even
+    # a zero is only the current cycle's zero: with a mid-month boundary it
+    # can omit paid minutes from the earlier part of this calendar month.
+    # Only a cycle starting on day 1 can be archived as monthly billing data.
+    cycle_day_raw = os.environ.get(
+        "GITHUB_BILLING_CYCLE_DAY", ""
+    ).strip()
+    try:
+        cycle_day = int(cycle_day_raw)
+    except (TypeError, ValueError):
+        cycle_day = 0
+    if not 1 <= cycle_day <= 28:
+        return SourceCost(
+            "github", period, status="error",
+            detail=(
+                f"GitHub reportó ${amount:.2f} para su ciclo corriente, "
+                "pero GITHUB_BILLING_CYCLE_DAY no está configurado con "
+                "un día válido (1-28); no se atribuye a un mes calendario"
+            ),
+            breakdown=[{**breakdown[0],
+                        "observed_cycle_amount_usd": amount}],
+        )
+    if cycle_day != 1:
+        today = datetime.now(timezone.utc).date()
+        if today.day >= cycle_day:
+            cycle_start = date(today.year, today.month, cycle_day)
+        else:
+            previous = today.replace(day=1) - timedelta(days=1)
+            cycle_start = date(previous.year, previous.month, cycle_day)
+        if cycle_start.month == 12:
+            cycle_end = date(cycle_start.year + 1, 1, cycle_day)
+        else:
+            cycle_end = date(
+                cycle_start.year, cycle_start.month + 1, cycle_day,
             )
-        if cycle_day != 1:
-            today = datetime.now(timezone.utc).date()
-            if today.day >= cycle_day:
-                cycle_start = date(today.year, today.month, cycle_day)
-            else:
-                previous = today.replace(day=1) - timedelta(days=1)
-                cycle_start = date(previous.year, previous.month, cycle_day)
-            if cycle_start.month == 12:
-                cycle_end = date(cycle_start.year + 1, 1, cycle_day)
-            else:
-                cycle_end = date(
-                    cycle_start.year, cycle_start.month + 1, cycle_day,
-                )
-            return SourceCost(
-                "github", period, status="error",
-                detail=(
-                    f"GitHub reportó ${amount:.2f} para el ciclo "
-                    f"{cycle_start.isoformat()}..{cycle_end.isoformat()}, "
-                    f"que cruza meses calendario; no se atribuye a {period}"
-                ),
-                breakdown=[{**breakdown[0],
-                            "observed_cycle_amount_usd": amount,
-                            "cycle_start": cycle_start.isoformat(),
-                            "cycle_end_exclusive": cycle_end.isoformat()}],
-            )
+        return SourceCost(
+            "github", period, status="error",
+            detail=(
+                f"GitHub reportó ${amount:.2f} para el ciclo "
+                f"{cycle_start.isoformat()}..{cycle_end.isoformat()}, "
+                f"que cruza meses calendario; no se atribuye a {period}"
+            ),
+            breakdown=[{**breakdown[0],
+                        "observed_cycle_amount_usd": amount,
+                        "cycle_start": cycle_start.isoformat(),
+                        "cycle_end_exclusive": cycle_end.isoformat()}],
+        )
     return SourceCost(
         source="github", period=period, amount_usd=amount,
         detail=(f"{used} min usados de {included} incluidos; "
