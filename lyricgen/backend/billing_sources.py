@@ -94,8 +94,9 @@ def current_period() -> str:
 # A snapshot captured while usage is still accruing is provisional. Sources
 # with historical APIs become final only after their usual export lag; the
 # next successful refresh at/after this boundary can then be frozen. GitHub
-# cannot query a past cycle and fixed subscriptions do not accrue with usage,
-# so their healthy in-month capture is the durable record once the month ends.
+# cannot query a past cycle, but an early GitHub capture can still omit usage
+# accrued later in the month. Only fixed subscriptions are final regardless of
+# capture time; GitHub needs a capture at the calendar boundary (see below).
 SNAPSHOT_FINALIZATION_LAG_DAYS: dict[str, int] = {
     "gcp": 3,
     "railway": 1,
@@ -103,7 +104,7 @@ SNAPSHOT_FINALIZATION_LAG_DAYS: dict[str, int] = {
     "replicate": 1,
     "r2": 1,
 }
-SNAPSHOT_FINAL_FROM_OPEN_MONTH = frozenset({"github", "fixed"})
+SNAPSHOT_FINAL_FROM_OPEN_MONTH = frozenset({"fixed"})
 
 
 def snapshot_is_final(period: str, source: str,
@@ -119,14 +120,26 @@ def snapshot_is_final(period: str, source: str,
     if fetched_at is None:
         return False
     _start, end = _period_bounds(period)
+    captured = fetched_at
+    if captured.tzinfo is None:  # SQLite/local drops timezone information.
+        captured = captured.replace(tzinfo=timezone.utc)
+    if source == "github":
+        # The legacy Actions endpoint cannot query the just-closed cycle. A
+        # capture made earlier in the month remains only a checkpoint after
+        # rollover; accepting it would omit late paid minutes. A final-minute
+        # capture is the narrowest honest boundary available from this API.
+        boundary = datetime.combine(
+            end, datetime.max.time(), tzinfo=timezone.utc,
+        ).replace(second=0, microsecond=0)
+        next_month = datetime.combine(
+            end + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc,
+        )
+        return boundary <= captured < next_month
     final_after = datetime.combine(
         end + timedelta(days=1 + SNAPSHOT_FINALIZATION_LAG_DAYS.get(source, 1)),
         datetime.min.time(),
         tzinfo=timezone.utc,
     )
-    captured = fetched_at
-    if captured.tzinfo is None:  # SQLite/local drops timezone information.
-        captured = captured.replace(tzinfo=timezone.utc)
     return captured >= final_after
 
 

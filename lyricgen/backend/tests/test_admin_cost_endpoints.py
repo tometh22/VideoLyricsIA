@@ -282,18 +282,22 @@ def test_attribution_endpoints_require_admin(client, user_token):
         assert client.get(path, headers=auth(user_token)).status_code == 403
 
 
-def test_attribution_endpoints_run_blocking_queries_in_threadpool():
+def test_cost_reports_run_blocking_queries_in_threadpool():
     """Plain ``def`` makes FastAPI keep remote SQLAlchemy I/O off the loop."""
     import inspect
     from admin import (
         admin_cost_business,
+        admin_cost_reconcile,
         admin_cost_umg,
         admin_cost_unit_economics,
+        admin_change_requests,
     )
 
     assert not inspect.iscoroutinefunction(admin_cost_umg)
     assert not inspect.iscoroutinefunction(admin_cost_business)
     assert not inspect.iscoroutinefunction(admin_cost_unit_economics)
+    assert not inspect.iscoroutinefunction(admin_cost_reconcile)
+    assert not inspect.iscoroutinefunction(admin_change_requests)
 
 
 def test_umg_endpoint_warns_when_peer_env_missing(client, admin_token):

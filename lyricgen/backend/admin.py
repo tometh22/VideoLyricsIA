@@ -881,13 +881,15 @@ def admin_cost_refresh(
             and float(entry["amount_usd"] or 0) == 0
             and not entry.get("breakdown")
         )
+        _stored_snapshot_is_final = billing_sources.snapshot_is_final(
+            period, entry["source"], row.fetched_at,
+        )
         if (
             period < billing_sources.current_period()
             and row.status == "ok"
             and row.amount_usd is not None
             and (
-                billing_sources.snapshot_is_final(
-                    period, entry["source"], row.fetched_at)
+                _stored_snapshot_is_final
                 # Rolling provider history (notably Replicate and Railway)
                 # may already be empty before the post-close finalization
                 # date. Cumulative positive monthly spend cannot legitimately
@@ -903,6 +905,19 @@ def admin_cost_refresh(
             entry["detail"] = row.detail
             entry["is_estimate"] = row.is_estimate
             entry["breakdown"] = row.breakdown or []
+            if not _stored_snapshot_is_final:
+                # The positive checkpoint is safer than erasing it, but an
+                # empty provider window cannot finalize a capture made while
+                # spend was still accruing. Keep the durable floor and make
+                # this response explicitly non-quoteable.
+                entry["retained_amount_usd"] = row.amount_usd
+                entry["amount_usd"] = None
+                entry["status"] = "stale"
+                entry["detail"] = (
+                    "refresh devolvió una ventana vacía; snapshot previo "
+                    "conservado pero todavía provisional"
+                )
+                entry["stale"] = True
             continue
         # Un refresh fallido NO pisa un snapshot sano. Las fuentes son
         # ventanas móviles: GitHub sólo puede consultar el ciclo vigente, así
@@ -1239,7 +1254,7 @@ def admin_cost_unit_economics(
 
 
 @router.get("/cost/reconcile")
-async def admin_cost_reconcile(
+def admin_cost_reconcile(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
     period: str = Query("", description="YYYY-MM; vacío = mes actual"),
@@ -1627,7 +1642,7 @@ async def admin_cost_rates(
 
 
 @router.get("/quality/change-requests")
-async def admin_change_requests(
+def admin_change_requests(
     admin: dict = Depends(require_admin),
     period: str = Query("", description="YYYY-MM; vacío = todo el histórico"),
     include_raw: bool = Query(False, description="devolver los comentarios crudos"),
