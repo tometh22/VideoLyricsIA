@@ -9631,6 +9631,15 @@ class _VeoSubmissionGuard:
                         _sql_text("SELECT pg_advisory_xact_lock(:lock_key)"),
                         {"lock_key": lock_key},
                     )
+            # PostgreSQL now() is fixed at transaction start, before a
+            # potentially long advisory-lock wait. clock_timestamp() is
+            # evaluated by the statement after both locks are held, so a
+            # lease that expired while waiting cannot still authorize a POST.
+            lease_clock = (
+                _sql_func.clock_timestamp()
+                if dialect == "postgresql"
+                else _sql_func.now()
+            )
 
             job_exists = (
                 self.db.query(Job.job_id)
@@ -9656,7 +9665,7 @@ class _VeoSubmissionGuard:
                         AIProvenance.response_summary.like(
                             f"{BUDGET_RESERVED_PREFIX}%"
                         ),
-                        AIProvenance.reservation_expires_at > _sql_func.now(),
+                        AIProvenance.reservation_expires_at > lease_clock,
                     )
                     .one_or_none()
                 )

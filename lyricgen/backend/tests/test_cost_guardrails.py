@@ -698,6 +698,18 @@ def test_guard_rechaza_lease_vencido_antes_del_post(db):
         db.commit()
 
 
+def test_guard_usa_reloj_posterior_al_lock_para_el_lease():
+    """Postgres now() queda congelado antes de esperar el advisory lock."""
+    import inspect
+    import pipeline
+
+    source = inspect.getsource(pipeline._VeoSubmissionGuard.__enter__)
+    lock = source.index("pg_advisory_xact_lock")
+    lease_clock = source.index("clock_timestamp()")
+    active_check = source.index("reservation_expires_at > lease_clock")
+    assert lock < lease_clock < active_check
+
+
 def test_el_guard_de_submit_serializa_el_delete_en_postgres(db, monkeypatch):
     """A delete cannot remove tracking while the provider POST owns the lock."""
     import uuid
