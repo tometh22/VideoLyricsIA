@@ -12735,14 +12735,18 @@ async def retry_job(
     """
     from database import Job as JobModel, AuditLog
 
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    # Cross-tenant para admins de plataforma: mismo contrato que _job_scope
+    # / POST /edit — un admin re-encola el fix de cualquier cliente (caso
+    # UMG Chile: soporte necesita reintentar un job del cliente sin pedirle
+    # que haga el click). Sin esto, un job de otro tenant daba 404 aun para
+    # el super admin. Auditado vía _audit_cross_tenant_access más abajo.
+    _retry_q = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        _retry_q = _retry_q.filter(JobModel.tenant_id == current_user["tenant_id"])
+    job = _retry_q.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _audit_cross_tenant_access(db, current_user, job, "retry")
     if job.status not in ("error", "validation_failed"):
         raise HTTPException(
             status_code=400,
