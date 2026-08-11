@@ -214,7 +214,8 @@ def clean_libretto(items: list[tuple]) -> list[str]:
     return [r[1] for r in rows]
 
 
-def _one_pass(client, genai, y, sr, dur, who, win_base: int = 0):
+def _one_pass(client, genai, y, sr, dur, who, win_base: int = 0,
+              job_id: str | None = None):
     """Una pasada de ventanas Gemini → items (ts, texto, win)."""
     items: list[tuple[float, str, int]] = []
     t = 0.0
@@ -223,12 +224,24 @@ def _one_pass(client, genai, y, sr, dur, who, win_base: int = 0):
     while t < dur - 0.5:
         c0, c1 = t, min(dur, t + CHUNK_S)
         clip = y[int(c0 * sr):int(c1 * sr)]
+        recorder = None
         try:
             import io as _io
             import soundfile as sf
             buf = _io.BytesIO()
             sf.write(buf, clip, sr, format="WAV")
             from pipeline import _call_with_timeout
+            if job_id:
+                from provenance import record_ai_call
+
+                recorder = record_ai_call(
+                    job_id=job_id,
+                    step="performance_text",
+                    tool_name=MODEL,
+                    tool_provider="google_vertex",
+                    prompt=_SYS_TS.format(dur=c1 - c0, who=who),
+                    input_data_types=["audio_chunk"],
+                )
             resp = _call_with_timeout(
                 lambda: client.models.generate_content(
                     model=MODEL,
@@ -250,7 +263,17 @@ def _one_pass(client, genai, y, sr, dur, who, win_base: int = 0):
                 label=f"perf-text chunk {c0:.0f}-{c1:.0f}s",
             )
             lines = [l for l in (resp.text or "").splitlines() if l.strip()]
+            if recorder:
+                recorder.finish(response_summary=(
+                    f"performance_text window={c0:.1f}-{c1:.1f}s "
+                    f"lines={len(lines)}"
+                ))
         except Exception as e:
+            if recorder:
+                recorder.finish(response_summary=(
+                    f"error: performance_text window={c0:.1f}-{c1:.1f}s: "
+                    f"{str(e)[:300]}"
+                ))
             logger.warning("[PERF-TEXT] window %.0f-%.0f failed: %s", c0, c1, e)
             lines = []
             fails += 1
@@ -268,7 +291,8 @@ def _one_pass(client, genai, y, sr, dur, who, win_base: int = 0):
 
 def transcribe_performance(audio_path: str, artist: str = "",
                            title: str = "",
-                           reference: str = "") -> list[str] | None:
+                           reference: str = "",
+                           job_id: str | None = None) -> list[str] | None:
     """Ordered line texts of what THIS audio performs. None on any
     failure (caller falls back). Cost ~$0.02-0.05/song, ~60-90 s."""
     try:
@@ -283,7 +307,7 @@ def transcribe_performance(audio_path: str, artist: str = "",
         y, _ = librosa.load(audio_path, sr=sr, mono=True)
         dur = len(y) / sr
         who = f" ({artist} — {title})" if artist else ""
-        items = _one_pass(client, genai, y, sr, dur, who)
+        items = _one_pass(client, genai, y, sr, dur, who, job_id=job_id)
         if os.environ.get("PERF_TEXT_PASSES", "2").strip() == "2":
             # DUAL-PASS UNION (la lección de las 7 generaciones): la
             # varianza corrida-a-corrida de Gemini en zonas de público es
@@ -294,7 +318,10 @@ def transcribe_performance(audio_path: str, artist: str = "",
             # repetición real — la pasada 2 usa índices de ventana
             # corridos (+1000) así sus líneas dedupean contra la pasada 1
             # como costuras del mismo momento.
-            items2 = _one_pass(client, genai, y, sr, dur, who, win_base=1000)
+            items2 = _one_pass(
+                client, genai, y, sr, dur, who,
+                win_base=1000, job_id=job_id,
+            )
             # semántica de unión (gate-1 del dual-pass): la pasada 1 es la
             # BASE; la 2 solo aporta momentos donde la 1 no tiene NADA en
             # ±2s — variantes del mismo momento no se duplican (116 líneas

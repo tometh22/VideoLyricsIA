@@ -1200,7 +1200,7 @@ def admin_cost_unit_economics(
     # en la base local y la peer no la tiene, así que dejarla cargar la suya
     # valuaba su mitad a precio de lista y el `waste_ratio` mezclado salía de
     # dos tarifas distintas para el mismo Veo.
-    _waste_rates = rates_for_window(db, start_dt)
+    _waste_rates = rates_for_window(db, start_dt, end_dt)
     waste_parts = [cost_waste_breakdown(db, start=start_dt, end=end_dt,
                                         rates=_waste_rates)]
     with scoped_peer_db() as peer:

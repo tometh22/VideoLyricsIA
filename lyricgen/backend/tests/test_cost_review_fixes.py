@@ -80,6 +80,51 @@ def test_los_agregados_aplican_la_calibracion(db, monkeypatch):
         db.commit()
 
 
+def test_ventana_multimes_aplica_la_tarifa_de_cada_mes(db, monkeypatch):
+    """A rolling window cannot value July calls with June's calibration."""
+    from database import AIProvenance, Job
+    import provenance
+    import rate_calibration
+
+    db.query(Job).filter(Job.tenant_id == "multi-rate-test").delete()
+    db.add(Job(
+        job_id="multirate1", user_id=1, tenant_id="multi-rate-test",
+        artist="A", filename="a.mp3", status="done",
+    ))
+    db.flush()
+    for when in (
+        datetime(2026, 6, 20, 12, tzinfo=timezone.utc),
+        datetime(2026, 7, 20, 12, tzinfo=timezone.utc),
+    ):
+        db.add(AIProvenance(
+            job_id="multirate1", step="video_bg",
+            tool_name="veo-3.1-fast-generate-001",
+            tool_provider="google_vertex", prompt_sent="p",
+            created_at=when,
+        ))
+    db.commit()
+
+    def load(_db, period):
+        return {"2026-06": {"veo": 0.50},
+                "2026-07": {"veo": 0.25}}.get(period, {})
+
+    monkeypatch.setattr(rate_calibration, "load_applied_rates", load)
+    try:
+        out = provenance.cost_waste_breakdown(
+            db,
+            tenant_id="multi-rate-test",
+            start=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        )
+        assert out["total_cost"] == pytest.approx(0.75)
+    finally:
+        db.query(AIProvenance).filter(
+            AIProvenance.job_id == "multirate1",
+        ).delete()
+        db.query(Job).filter(Job.tenant_id == "multi-rate-test").delete()
+        db.commit()
+
+
 # ---------------------------------------------------------------------------
 # 2. La atribución acota la provenance al período
 # ---------------------------------------------------------------------------

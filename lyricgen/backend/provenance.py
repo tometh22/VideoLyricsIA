@@ -27,7 +27,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, case, func, not_, or_
+from sqlalchemy import and_, case, extract, func, not_, or_
 from sqlalchemy.orm import Session
 
 from database import AIProvenance, Job, SessionLocal
@@ -120,18 +120,58 @@ def cost_for_record(tool_name: str, tool_provider: str,
     return COST_PER_CALL.get((tool_name, tool_provider), DEFAULT_COST_PER_CALL)
 
 
-def rates_for_window(db, since: datetime) -> dict[str, float]:
-    """Calibrated rates for the month `since` falls in, or {} if none.
+def rates_for_window(
+    db,
+    since: datetime,
+    until: datetime | None = None,
+) -> dict[str, dict[str, float]]:
+    """Load every monthly calibration intersecting a reporting window.
 
-    A window that spans two months uses the calibration of the month it
-    starts in — imperfect, but far closer than list price, and the
-    alternative (per-row month lookup) costs a query per row.
+    The dashboard supports rolling 30/90/365-day windows, so applying only
+    the start month's discount/model mix can misprice almost the entire
+    range. This loads one snapshot per calendar month up front; aggregate
+    queries then group calls by month and select the matching rates without
+    issuing a query per provenance row.
     """
     try:
         from rate_calibration import load_applied_rates
-        return load_applied_rates(db, f"{since.year:04d}-{since.month:02d}")
+
+        end = until or datetime.now(timezone.utc)
+        cursor = datetime(since.year, since.month, 1, tzinfo=timezone.utc)
+        out: dict[str, dict[str, float]] = {}
+        while cursor < end:
+            period = f"{cursor.year:04d}-{cursor.month:02d}"
+            loaded = load_applied_rates(db, period)
+            if loaded:
+                out[period] = loaded
+            if cursor.month == 12:
+                cursor = datetime(cursor.year + 1, 1, 1, tzinfo=timezone.utc)
+            else:
+                cursor = datetime(
+                    cursor.year, cursor.month + 1, 1, tzinfo=timezone.utc,
+                )
+        return out
     except Exception:
         return {}
+
+
+def _rates_for_month(rates: dict | None, year, month) -> dict[str, float]:
+    """Accept new period maps plus legacy flat rates supplied by callers."""
+    if not rates:
+        return {}
+    if all(not isinstance(v, dict) for v in rates.values()):
+        return rates
+    period = f"{int(year):04d}-{int(month):02d}"
+    selected = rates.get(period) or {}
+    return selected if isinstance(selected, dict) else {}
+
+
+def _provenance_month_columns():
+    """Portable SQL month bucket (PostgreSQL and SQLite test DB)."""
+    return (
+        extract("year", AIProvenance.created_at).label("rate_year"),
+        extract("month", AIProvenance.created_at).label("rate_month"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +260,7 @@ def cost_waste_breakdown(db: Session, since_days: int = 30,
                          tenant_id: str | None = None,
                          start: datetime | None = None,
                          end: datetime | None = None,
-                         rates: dict[str, float] | None = None) -> dict:
+                         rates: dict | None = None) -> dict:
     """Attribute billable AI spend to what it actually produced.
 
     The headline number the 2026-08 audit surfaced: in jul-2026, 59% of
@@ -264,7 +304,7 @@ def cost_waste_breakdown(db: Session, since_days: int = 30,
     since = start or (datetime.now(timezone.utc) - timedelta(days=since_days))
     until = end
     # Tarifas derivadas de la factura del período; {} cae a COST_PER_CALL.
-    _rates = rates if rates is not None else rates_for_window(db, since)
+    _rates = rates if rates is not None else rates_for_window(db, since, until)
 
     def _window(query):
         query = query.filter(AIProvenance.created_at >= since)
@@ -279,26 +319,33 @@ def cost_waste_breakdown(db: Session, since_days: int = 30,
         (retained_delivery_filter(), "delivered_reopened"),
         else_=Job.status,
     )
+    rate_year, rate_month = _provenance_month_columns()
     rows_q = _scoped(
         db.query(
             effective_status.label("effective_status"),
             AIProvenance.tool_name,
             AIProvenance.tool_provider,
+            rate_year,
+            rate_month,
             func.count(AIProvenance.id).label("calls"),
             func.count(func.distinct(Job.job_id)).label("jobs"),
         )
         .join(Job, Job.job_id == AIProvenance.job_id)
     )
     rows = _window(rows_q).filter(billable_filter()).group_by(
-        effective_status, AIProvenance.tool_name, AIProvenance.tool_provider
+        effective_status, AIProvenance.tool_name, AIProvenance.tool_provider,
+        rate_year, rate_month,
     ).all()
 
     # Aggregate per status first; a status spans many tools.
     per_status: dict[str, dict] = {}
-    for status, tool_name, tool_provider, calls, _jobs in rows:
+    for status, tool_name, tool_provider, year, month, calls, _jobs in rows:
         agg = per_status.setdefault(status, {"calls": 0, "cost": 0.0})
         agg["calls"] += calls
-        agg["cost"] += calls * cost_for_record(tool_name, tool_provider, _rates)
+        month_rates = _rates_for_month(_rates, year, month)
+        agg["cost"] += calls * cost_for_record(
+            tool_name, tool_provider, month_rates,
+        )
 
     # Distinct job counts must be queried separately — summing the
     # per-tool distinct counts above would multiply-count a job that used
@@ -455,34 +502,53 @@ def tenant_cost_summary(
     """
     since = datetime.now(timezone.utc) - timedelta(days=since_days)
     _rates = rates_for_window(db, since)
+    rate_year, rate_month = _provenance_month_columns()
 
     rows = (
         db.query(
             AIProvenance.tool_name,
             AIProvenance.tool_provider,
+            rate_year,
+            rate_month,
             func.count(AIProvenance.id).label("calls"),
         )
         .join(Job, Job.job_id == AIProvenance.job_id)
         .filter(Job.tenant_id == tenant_id)
         .filter(AIProvenance.created_at >= since)
         .filter(billable_filter())
-        .group_by(AIProvenance.tool_name, AIProvenance.tool_provider)
+        .group_by(
+            AIProvenance.tool_name, AIProvenance.tool_provider,
+            rate_year, rate_month,
+        )
         .all()
     )
 
-    by_tool = []
+    tool_totals: dict[tuple[str, str], dict] = {}
     total_cost = 0.0
     total_calls = 0
-    for tool_name, tool_provider, calls in rows:
-        rate = cost_for_record(tool_name, tool_provider, _rates)
+    for tool_name, tool_provider, year, month, calls in rows:
+        rate = cost_for_record(
+            tool_name, tool_provider, _rates_for_month(_rates, year, month),
+        )
         cost = calls * rate
         total_cost += cost
         total_calls += calls
-        by_tool.append({
+        agg = tool_totals.setdefault((tool_name, tool_provider), {
             "tool_name": tool_name,
             "tool_provider": tool_provider,
-            "calls": calls,
-            "rate_per_call": rate,
+            "calls": 0,
+            "cost": 0.0,
+        })
+        agg["calls"] += calls
+        agg["cost"] += cost
+
+    by_tool = []
+    for agg in tool_totals.values():
+        calls = agg["calls"]
+        cost = agg["cost"]
+        by_tool.append({
+            **agg,
+            "rate_per_call": round(cost / calls, 6) if calls else 0.0,
             "cost": round(cost, 4),
         })
 
@@ -534,17 +600,23 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
     """
     since = datetime.now(timezone.utc) - timedelta(days=since_days)
     _rates = rates_for_window(db, since)
+    rate_year, rate_month = _provenance_month_columns()
 
     # --- AI spend by tool/provider (billable rows only) ---
     rows = (
         db.query(
             AIProvenance.tool_name,
             AIProvenance.tool_provider,
+            rate_year,
+            rate_month,
             func.count(AIProvenance.id).label("calls"),
         )
         .filter(AIProvenance.created_at >= since)
         .filter(billable_filter())
-        .group_by(AIProvenance.tool_name, AIProvenance.tool_provider)
+        .group_by(
+            AIProvenance.tool_name, AIProvenance.tool_provider,
+            rate_year, rate_month,
+        )
         .all()
     )
 
@@ -572,30 +644,42 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
         .scalar() or 0
     )
 
-    by_tool = []
+    tool_totals: dict[tuple[str, str], dict] = {}
     by_provider: dict[str, dict] = {}
     total_cost = 0.0
     total_calls = 0
-    for tool_name, tool_provider, calls in rows:
-        rate = cost_for_record(tool_name, tool_provider, _rates)
+    for tool_name, tool_provider, year, month, calls in rows:
+        rate = cost_for_record(
+            tool_name, tool_provider, _rates_for_month(_rates, year, month),
+        )
         cost = calls * rate
         bucket = _bucket_for(tool_name, tool_provider)
         total_cost += cost
         total_calls += calls
-        by_tool.append({
+        tool_agg = tool_totals.setdefault((tool_name, tool_provider), {
             "tool_name": tool_name,
             "tool_provider": tool_provider,
-            "calls": calls,
-            "rate_per_call": rate,
-            "cost": round(cost, 4),
+            "calls": 0,
+            "cost": 0.0,
             "provider_bucket": bucket,
         })
+        tool_agg["calls"] += calls
+        tool_agg["cost"] += cost
         agg = by_provider.setdefault(
             bucket, {"calls": 0, "cost": 0.0}
         )
         agg["calls"] += calls
         agg["cost"] += cost
 
+    by_tool = []
+    for agg in tool_totals.values():
+        calls = agg["calls"]
+        cost = agg["cost"]
+        by_tool.append({
+            **agg,
+            "rate_per_call": round(cost / calls, 6) if calls else 0.0,
+            "cost": round(cost, 4),
+        })
     by_tool.sort(key=lambda r: r["cost"], reverse=True)
     by_provider_list = sorted(
         [{"provider": k, **v, "cost": round(v["cost"], 4)}
@@ -645,20 +729,27 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
             Job.tenant_id,
             AIProvenance.tool_name,
             AIProvenance.tool_provider,
+            rate_year,
+            rate_month,
             func.count(AIProvenance.id).label("calls"),
         )
         .join(Job, Job.job_id == AIProvenance.job_id)
         .filter(AIProvenance.created_at >= since)
         .filter(billable_filter())
-        .group_by(Job.tenant_id, AIProvenance.tool_name, AIProvenance.tool_provider)
+        .group_by(
+            Job.tenant_id, AIProvenance.tool_name,
+            AIProvenance.tool_provider, rate_year, rate_month,
+        )
         .all()
     )
     tenant_cost: dict[str, dict] = {}
-    for tenant_id, tool_name, tool_provider, calls in tenant_rows:
+    for tenant_id, tool_name, tool_provider, year, month, calls in tenant_rows:
         agg = tenant_cost.setdefault(
             tenant_id, {"calls": 0, "cost": 0.0}
         )
-        rate = cost_for_record(tool_name, tool_provider, _rates)
+        rate = cost_for_record(
+            tool_name, tool_provider, _rates_for_month(_rates, year, month),
+        )
         agg["calls"] += calls
         agg["cost"] += calls * rate
 
@@ -716,6 +807,8 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
             UserModel.username,
             AIProvenance.tool_name,
             AIProvenance.tool_provider,
+            rate_year,
+            rate_month,
             func.count(AIProvenance.id).label("calls"),
         )
         .join(Job, Job.job_id == AIProvenance.job_id)
@@ -723,11 +816,13 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
         .filter(AIProvenance.created_at >= since)
         .filter(billable_filter())
         .group_by(Job.user_id, Job.tenant_id, UserModel.username,
-                  AIProvenance.tool_name, AIProvenance.tool_provider)
+                  AIProvenance.tool_name, AIProvenance.tool_provider,
+                  rate_year, rate_month)
         .all()
     )
     user_cost: dict = {}
-    for user_id, tenant_id, username, tool_name, tool_provider, calls in user_rows:
+    for (user_id, tenant_id, username, tool_name, tool_provider,
+         year, month, calls) in user_rows:
         key = (user_id, tenant_id)
         agg = user_cost.setdefault(key, {
             "user_id": user_id,
@@ -736,7 +831,9 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
             "calls": 0,
             "cost": 0.0,
         })
-        rate = cost_for_record(tool_name, tool_provider, _rates)
+        rate = cost_for_record(
+            tool_name, tool_provider, _rates_for_month(_rates, year, month),
+        )
         agg["calls"] += calls
         agg["cost"] += calls * rate
 
