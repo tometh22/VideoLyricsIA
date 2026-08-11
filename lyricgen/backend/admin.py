@@ -1090,7 +1090,7 @@ def admin_cost_real(          # `def`, no `async def`: con live=true hace HTTP
 
 
 @router.get("/cost/unit-economics")
-async def admin_cost_unit_economics(
+def admin_cost_unit_economics(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
     period: str = Query("", description="YYYY-MM; vacío = mes actual"),
