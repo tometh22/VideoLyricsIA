@@ -794,8 +794,11 @@ def test_lecturas_no_reviven_checkpoint_intrames_como_factura(
             headers=auth(admin_token),
         )
         assert reconcile.status_code == 200, reconcile.text
-        assert reconcile.json()["invoiced_usd"] == 0.0
-        assert "gcp" in reconcile.json()["invoiced_sources_missing"]
+        reconcile_body = reconcile.json()
+        assert reconcile_body["invoiced_usd"] == 0.0
+        assert "gcp" in reconcile_body["invoiced_sources_missing"]
+        assert "/admin/cost/calibrate-rates" in reconcile_body["note"]
+        assert "Multiplicá" not in reconcile_body["note"]
 
         umg = client.get(
             f"/admin/cost/umg?period={period}",

@@ -1391,8 +1391,10 @@ def admin_cost_reconcile(
         "by_tool_modeled": by_tool,
         "counted_environments": counted_environments,
         "note": (
-            "calibration_factor >1 = el modelo subestima. Multiplicá las "
-            "tarifas de COST_PER_CALL por este factor para recalibrar. "
+            "calibration_factor >1 = el modelo subestima; es una señal "
+            "diagnóstica, no una tarifa. Recalibrá el período y su mix de "
+            "SKU con POST /admin/cost/calibrate-rates?period=YYYY-MM, y "
+            "verificá el resultado en GET /admin/cost/rates?period=YYYY-MM. "
             "Ambos lados cubren el MISMO mes calendario. Si "
             "counted_environments=1 el modelo mide un solo entorno "
             "mientras la factura cubre los dos (proyecto GCP compartido), "
