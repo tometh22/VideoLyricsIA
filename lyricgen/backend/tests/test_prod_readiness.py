@@ -230,14 +230,20 @@ def test_cost_controls_upgrade_from_observability_head(tmp_path):
     except ImportError:
         pytest.skip("Alembic CLI/runtime is installed in CI and production")
 
-    from sqlalchemy import create_engine, inspect
-    from database import Base
+    from sqlalchemy import Column, Integer, MetaData, Table, create_engine, inspect
 
     db_path = tmp_path / "observability_to_controls.db"
     upgrade_engine = create_engine(f"sqlite:///{db_path}")
-    # Base on #1084 is the schema immediately before these additive controls
-    # migrations: ai_provenance exists, but the lease column and ledger do not.
-    Base.metadata.create_all(upgrade_engine)
+    # Model the exact pre-control surface instead of calling current
+    # Base.metadata.create_all(): on #1085 the current model already contains
+    # the new table/column, which would make this upgrade test a false failure.
+    pre_controls = MetaData()
+    Table(
+        "ai_provenance",
+        pre_controls,
+        Column("id", Integer, primary_key=True),
+    )
+    pre_controls.create_all(upgrade_engine)
     backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     versions_dir = os.path.join(backend_dir, "alembic", "versions")
 
