@@ -849,13 +849,13 @@ def test_el_query_de_bigquery_se_acota_a_los_proyectos_configurados(monkeypatch)
     assert out.raw["invoice_month"] == "202607"
     assert out.raw["project_scope"] == ["genly-prod", "genly-staging"]
 
-    # Sin configurar NO filtra (filtrar por el proyecto del dataset daría $0
-    # si el export vive aparte, que es peor que sobrecontar) pero lo DECLARA.
+    # Sin scope explícito no consulta toda la cuenta ni finge completitud.
     monkeypatch.delenv("GCP_BILLING_PROJECT_IDS", raising=False)
     out2 = billing_sources.fetch_gcp("2026-07")
-    assert "project.id IN" not in consultas[-1]
-    assert out2.raw["project_scope"] == "billing_account"
-    assert "cuenta de facturación" in (out2.detail or "")
+    assert len(consultas) == 1
+    assert out2.status == "not_configured"
+    assert out2.amount_usd is None
+    assert "GCP_BILLING_PROJECT_IDS" in (out2.detail or "")
 
 
 # ---------------------------------------------------------------------------
@@ -1421,7 +1421,7 @@ def test_relevance_gemini_queda_en_provenance(db, monkeypatch):
         AIProvenance.job_id == job_id,
         AIProvenance.step == "video_relevance",
     ).one()
-    assert row.tool_name == "gemini-2.5-flash"
+    assert row.tool_name == "gemini-2.5-flash-vision-image"
     assert row.tool_provider == "google_vertex"
     assert row.response_summary == "score=8"
 

@@ -199,22 +199,22 @@ def fetch_gcp(period: str) -> SourceCost:
     # termina atribuido a clientes de GenLy. `GCP_BILLING_PROJECT_IDS` acota
     # a los proyectos de trabajo.
     #
-    # Sin configurar NO se filtra (filtrar por el proyecto del dataset
-    # reportaría $0 si el export vive en un proyecto aparte, que es peor que
-    # sobrecontar) — pero el alcance se declara en `detail` para que nadie
-    # lea el número como si fuera sólo nuestro.
+    # Without an explicit workload scope there is no honest GenLy total: the
+    # dataset-hosting project may be different, while querying the whole
+    # billing account silently includes unrelated products and corrupts both
+    # unit economics and invoice-derived AI rates. Stay incomplete instead.
     proyectos = [p.strip() for p in
                  os.environ.get("GCP_BILLING_PROJECT_IDS", "").split(",")
                  if p.strip()]
-    if proyectos:
-        _lista = ", ".join(f"'{p}'" for p in proyectos)
-        filtro_proyecto = f"AND project.id IN ({_lista})"
-        alcance = f"proyectos {', '.join(proyectos)}"
-    else:
-        filtro_proyecto = ""
-        alcance = ("TODA la cuenta de facturación (sin "
-                   "GCP_BILLING_PROJECT_IDS): incluye cualquier otro "
-                   "proyecto que cuelgue de la misma cuenta")
+    if not proyectos:
+        return _not_configured(
+            "gcp", period,
+            "GCP_BILLING_PROJECT_IDS (proyectos de workload GenLy; el export "
+            "cubre toda la cuenta de facturación)",
+        )
+    _lista = ", ".join(f"'{p}'" for p in proyectos)
+    filtro_proyecto = f"AND project.id IN ({_lista})"
+    alcance = f"proyectos {', '.join(proyectos)}"
     # cost + credits is the number that actually lands on the invoice;
     # `cost` alone ignores sustained-use discounts and promo credits.
     sql = f"""

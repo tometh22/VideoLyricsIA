@@ -576,6 +576,7 @@ def test_gcp_timeout_is_an_error_not_zero_dollars(monkeypatch):
                  ("GCP_BILLING_BQ_DATASET", "d"),
                  ("GCP_BILLING_BQ_TABLE", "t")):
         monkeypatch.setenv(k, v)
+    monkeypatch.setenv("GCP_BILLING_PROJECT_IDS", "genly-prod")
     monkeypatch.setattr(billing_sources, "_gcp_credentials", lambda: "tok")
     monkeypatch.setattr(billing_sources.requests, "post", lambda *a, **k: _Resp())
 
@@ -597,6 +598,7 @@ def test_gcp_empty_result_is_an_error_not_zero_dollars(monkeypatch):
                  ("GCP_BILLING_BQ_DATASET", "d"),
                  ("GCP_BILLING_BQ_TABLE", "t")):
         monkeypatch.setenv(k, v)
+    monkeypatch.setenv("GCP_BILLING_PROJECT_IDS", "genly-prod")
     monkeypatch.setattr(billing_sources, "_gcp_credentials", lambda: "tok")
     monkeypatch.setattr(billing_sources.requests, "post", lambda *a, **k: _Resp())
 
