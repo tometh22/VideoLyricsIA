@@ -37,10 +37,10 @@ Es la verdad, pero no se puede desagregar por cliente.
 
 `GET /admin/cost/reconcile` compara ambos y devuelve un
 `calibration_factor`. En jun-2026 el modelo dio $163 contra $199,53
-facturados (factor 1,22; la diferencia es staging + precios reales de
-tokens). **Si ese factor se mueve mucho, las tarifas de `COST_PER_CALL`
-quedaron viejas** — y como la atribución por tenant hereda el error, una
-tabla silenciosamente incorrecta es peor que no tener ninguna.
+facturados (factor 1,22; la diferencia era staging + precios reales de
+tokens). Ese factor es diagnóstico; `POST /admin/cost/calibrate-rates`
+deriva y guarda tarifas mensuales por SKU. `COST_PER_CALL` queda sólo como
+fallback para períodos todavía no calibrados.
 
 ---
 
@@ -52,6 +52,8 @@ tabla silenciosamente incorrecta es peor que no tener ninguna.
 | `GET /admin/cost/real?period=YYYY-MM` | Costo facturado por proveedor. `live=true` consulta las APIs sin guardar. |
 | `GET /admin/cost/unit-economics?period=…&price_per_video_usd=13.5` | **El número para cotizar**: costo real ÷ videos entregados, más margen. |
 | `GET /admin/cost/reconcile?period=…` | Modelado vs facturado + factor de calibración. |
+| `POST /admin/cost/calibrate-rates?period=…` | Deriva y persiste tarifas mensuales desde la factura GCP por SKU. Requiere ambos entornos. |
+| `GET /admin/cost/rates?period=…` | Muestra la tarifa aplicada y si viene de factura o del fallback estimado. |
 | `GET /admin/margin` | Dashboard modelado, ahora con `waste` y `row_quality`. |
 
 > ⚠️ **`POST /admin/cost/refresh` hay que correrlo todos los meses.** Las
@@ -372,13 +374,16 @@ clip. Es un seguro de idempotencia contra retries, no una palanca.
 
 ## Recalibrar las tarifas
 
-1. `POST /admin/cost/refresh?period=YYYY-MM` con el mes cerrado.
-2. `GET /admin/cost/reconcile?period=YYYY-MM`.
-3. Si `calibration_factor` se fue lejos de ~1,2, multiplicar las tarifas
-   de `COST_PER_CALL` en `provenance.py` por el factor y actualizar el
-   test `test_veo_fast_rate_matches_invoice_reconciliation`.
+1. `POST /admin/cost/refresh?period=YYYY-MM` después de cerrar el mes y
+   cumplirse el rezago de GCP.
+2. `POST /admin/cost/calibrate-rates?period=YYYY-MM`. Requiere
+   `PEER_DATABASE_URL` porque la factura compartida cubre staging y prod; sin
+   el segundo entorno el endpoint se niega a guardar una tarifa sesgada.
+3. Confirmar en `GET /admin/cost/rates?period=YYYY-MM` que las herramientas
+   esperadas muestran `source: "factura"`. Usar
+   `GET /admin/cost/reconcile?period=YYYY-MM` como control de deriva global.
 
-La comparación es imperfecta a propósito y el endpoint lo aclara: la
-ventana del modelo son días corridos, la factura es mes calendario, y la
-factura de GCP incluye staging mientras que el modelo mide sólo prod.
-Sirve para detectar deriva, no para cuadrar al centavo.
+No multipliques `COST_PER_CALL` por `calibration_factor`: cambiaría el fallback
+de todos los períodos sin snapshot. Esa tabla se modifica sólo cuando cambia
+deliberadamente la tarifa estimada de lista; la calibración operativa es
+mensual y se guarda mediante el endpoint.
