@@ -810,6 +810,23 @@ async def admin_margin_dashboard(
 # Real invoiced cost (billing_sources) + reconciliation vs the model
 # ---------------------------------------------------------------------------
 
+def _cost_snapshot_is_usable(period: str, row, billing_sources) -> bool:
+    """Whether a stored amount may be treated as a complete invoice.
+
+    An ``ok`` row captured while a month was still accruing is a useful
+    checkpoint, but it is not a closed-month invoice.  Keep accepting healthy
+    snapshots for an open period (where every total is necessarily
+    provisional); for a closed month require the source-specific post-close
+    capture boundary used by ``/cost/refresh``.
+    """
+    if row.status != "ok" or row.amount_usd is None:
+        return False
+    if period >= billing_sources.current_period():
+        return True
+    return billing_sources.snapshot_is_final(
+        period, row.source, row.fetched_at,
+    )
+
 @router.post("/cost/refresh")
 def admin_cost_refresh(
     admin: dict = Depends(require_admin),
@@ -1029,22 +1046,40 @@ def admin_cost_real(          # `def`, no `async def`: con live=true hace HTTP
 
     sources, total, ok, missing, errored = [], 0.0, [], [], []
     for r in rows:
-        sources.append({
+        usable = _cost_snapshot_is_usable(period, r, billing_sources)
+        source = {
             "source": r.source, "period": r.period, "amount_usd": r.amount_usd,
             "status": r.status, "detail": r.detail,
             "is_estimate": r.is_estimate, "breakdown": r.breakdown or [],
             "fetched_at": r.fetched_at.isoformat() if r.fetched_at else None,
-        })
-        if r.status == "ok" and r.amount_usd is not None:
+        }
+        if usable:
             total += r.amount_usd
             ok.append(r.source)
+        elif r.status == "ok" and r.amount_usd is not None:
+            # Preserve the checkpoint for diagnostics without letting callers
+            # sum or quote it as a completed invoice.
+            source.update({
+                "amount_usd": None,
+                "status": "provisional",
+                "retained_amount_usd": r.amount_usd,
+                "stale": True,
+                "detail": (
+                    f"{r.detail or 'snapshot'} — captura previa al cierre; "
+                    "requiere refresh post-cierre"
+                ),
+            })
+            errored.append(r.source)
         elif r.status == "not_configured":
             missing.append(r.source)
         else:
             errored.append(r.source)
+        sources.append(source)
     missing += [s for s in billing_sources.SOURCES
                 if s not in {r.source for r in rows}]
-    sources.sort(key=lambda s: -(s["amount_usd"] or 0))
+    sources.sort(key=lambda s: -(
+        s["amount_usd"] or s.get("retained_amount_usd") or 0
+    ))
 
     return {
         "period": period, "total_usd": round(total, 2), "sources": sources,
@@ -1094,13 +1129,13 @@ async def admin_cost_unit_economics(
               .filter(CostSnapshot.period == period)
               .filter(CostSnapshot.source.in_(tuple(billing_sources.SOURCES)))
               .all())
-    real_total = sum(
-        r.amount_usd for r in rows
-        if r.status == "ok" and r.amount_usd is not None
-    )
+    usable_rows = [
+        r for r in rows
+        if _cost_snapshot_is_usable(period, r, billing_sources)
+    ]
+    real_total = sum(r.amount_usd for r in usable_rows)
     have = {
-        r.source for r in rows
-        if r.status == "ok" and r.amount_usd is not None
+        r.source for r in usable_rows
     }
     cost_complete = have >= set(billing_sources.SOURCES)
 
@@ -1243,7 +1278,7 @@ async def admin_cost_reconcile(
 
     invoiced = 0.0
     for row in rows:
-        if row.status != "ok" or row.amount_usd is None:
+        if not _cost_snapshot_is_usable(period, row, billing_sources):
             continue
         amount = float(row.amount_usd)
         if row.source == "gcp":
@@ -1252,7 +1287,7 @@ async def admin_cost_reconcile(
         invoiced += amount
     have = {
         r.source for r in rows
-        if r.status == "ok" and r.amount_usd is not None
+        if _cost_snapshot_is_usable(period, r, billing_sources)
     }
 
     # `cost_dashboard_global` measures a window ending NOW, so asking it
@@ -1392,7 +1427,7 @@ def _run_attribution(db, period: str | None):
 
 
 @router.get("/cost/umg")
-async def admin_cost_umg(
+def admin_cost_umg(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
     period: str = Query("", description="YYYY-MM; vacío = todo el histórico"),
@@ -1431,13 +1466,17 @@ async def admin_cost_umg(
         rows = (
             db.query(CostSnapshot)
             .filter(CostSnapshot.period == period,
-                    CostSnapshot.status == "ok",
                     CostSnapshot.source.in_(tuple(billing_sources.SOURCES)))
             .all()
         )
-        invoices = {r.source: r.amount_usd for r in rows
-                    if r.amount_usd is not None}
-        invoice_breakdowns = {r.source: (r.breakdown or []) for r in rows}
+        usable_rows = [
+            r for r in rows
+            if _cost_snapshot_is_usable(period, r, billing_sources)
+        ]
+        invoices = {r.source: r.amount_usd for r in usable_rows}
+        invoice_breakdowns = {
+            r.source: (r.breakdown or []) for r in usable_rows
+        }
         if invoices:
             import cost_attribution as ca
             ca.add_total_cost(
@@ -1649,7 +1688,7 @@ def _month_bounds(period: str):
 
 
 @router.get("/cost/business")
-async def admin_cost_business(
+def admin_cost_business(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
     period: str = Query("", description="YYYY-MM; vacío = todo el histórico"),
