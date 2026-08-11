@@ -217,14 +217,16 @@ UMG con números en vez de estimaciones.
 
 ```bash
 RAILWAY_API_TOKEN=...            # Account Settings → Tokens
-RAILWAY_PROJECT_ID=...           # opcional pero recomendado
+RAILWAY_PROJECT_ID=...           # requerido, o RAILWAY_WORKSPACE_ID
 ```
 
 ⚠️ Tiene que ser un **token de cuenta**, no un *project token*: los
 project tokens no pueden leer la query `usage`.
 
-Acotar al proyecto Genly IA importa: la cuenta tiene otros proyectos y en
-jun-2026 la diferencia fue **$124,54 (Genly) vs $135,25 (cuenta entera)**.
+Acotar al proyecto o workspace exclusivo de Genly IA es obligatorio: la
+cuenta tiene otros proyectos y en jun-2026 la diferencia fue **$124,54
+(Genly) vs $135,25 (cuenta entera)**. Sin uno de esos scopes el conector queda
+incompleto y no consulta la API.
 
 **Railway no expone dólares por API.** El enum `MetricMeasurement` no
 tiene ninguna medida de costo — sólo recursos crudos. El conector pide

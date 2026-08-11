@@ -318,6 +318,7 @@ def test_railway_uses_actual_days_in_month(monkeypatch):
         def json(self): return {"data": {"usage": usage}}
 
     monkeypatch.setenv("RAILWAY_API_TOKEN", "fake")
+    monkeypatch.setenv("RAILWAY_PROJECT_ID", "proj-genly")
     monkeypatch.setattr(billing_sources.requests, "post",
                         lambda *a, **k: _Resp())
 
@@ -334,6 +335,7 @@ def test_railway_empty_usage_is_incomplete_not_fake_zero(monkeypatch):
         def json(self): return {"data": {"usage": []}}
 
     monkeypatch.setenv("RAILWAY_API_TOKEN", "fake")
+    monkeypatch.setenv("RAILWAY_PROJECT_ID", "proj-genly")
     monkeypatch.setattr(billing_sources.requests, "post",
                         lambda *a, **k: _Resp())
     result = billing_sources.fetch_railway("2026-07")
@@ -352,6 +354,7 @@ def test_railway_plan_es_minimo_no_cargo_aditivo(monkeypatch):
         def json(self): return {"data": {"usage": usage}}
 
     monkeypatch.setenv("RAILWAY_API_TOKEN", "fake")
+    monkeypatch.setenv("RAILWAY_WORKSPACE_ID", "workspace-genly")
     monkeypatch.setenv("RAILWAY_PLAN_MINIMUM_USD", "20")
     monkeypatch.setattr(billing_sources.requests, "post",
                         lambda *a, **k: _Resp())
@@ -364,6 +367,23 @@ def test_railway_plan_es_minimo_no_cargo_aditivo(monkeypatch):
         if row["measurement"] == "PLAN_MINIMUM_TOP_UP"
     )
     assert top_up["cost"] == pytest.approx(18.0)
+
+
+def test_railway_sin_scope_genly_permanece_incompleto(monkeypatch):
+    monkeypatch.setenv("RAILWAY_API_TOKEN", "fake")
+    monkeypatch.delenv("RAILWAY_PROJECT_ID", raising=False)
+    monkeypatch.delenv("RAILWAY_WORKSPACE_ID", raising=False)
+    monkeypatch.setattr(
+        billing_sources.requests, "post",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("no debe consultar la cuenta completa")
+        ),
+    )
+
+    result = billing_sources.fetch_railway("2026-06")
+    assert result.status == "not_configured"
+    assert result.amount_usd is None
+    assert "RAILWAY_PROJECT_ID" in result.detail
 
 
 def test_railway_no_imputa_minimo_account_wide_a_un_proyecto(monkeypatch):
