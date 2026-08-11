@@ -1445,6 +1445,23 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     _background_is_ai_generated = False
                     _background_is_deterministic_fallback = True
                     _scenes_active = False
+                except VeoTrackingUnavailable as e:
+                    # The operator deleted/cancelled the processing job before
+                    # its pending reservation became billable. Never fall
+                    # through to the single-background provider path: it would
+                    # create a second untracked submission attempt.
+                    logger.info(
+                        "[SCENES] tracking cancelado para job=%s (%s) — "
+                        "fallback determinístico sin otro proveedor",
+                        job_id, e,
+                    )
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style,
+                        filename="bg_scene_cancelled_fallback.mp4",
+                    )
+                    _background_is_ai_generated = False
+                    _background_is_deterministic_fallback = True
+                    _scenes_active = False
                 except Exception as e:  # noqa: BLE001
                     _raise_if_job_timeout(e)
                     logger.error("[SCENES] multi-escena falló para job=%s (%s) — "
@@ -11690,10 +11707,11 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                 ),
                 "validation": dict(scene.get("validation") or {}),
             }
-        except VeoAmbiguousSubmission:
-            # The provider may already be rendering and billing this scene.
-            # Never collapse this into a recoverable scene miss: doing so can
-            # reach the single-background fallback and submit Veo again.
+        except (VeoAmbiguousSubmission, VeoTrackingUnavailable):
+            # An ambiguous provider submission or an operator cancellation
+            # must escape the per-scene substitution path. Collapsing either
+            # into a recoverable miss can reach the single-background path and
+            # submit Veo again after the reservation/job disappeared.
             raise
         except Exception as e:  # noqa: BLE001
             _raise_if_job_timeout(e)
@@ -12615,6 +12633,14 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             logger.error("[BG] %s — envío ambiguo, sin reintento", e)
             if out_meta is not None:
                 out_meta["fallback_reason"] = "veo_ambiguous_submission"
+            break
+        except VeoTrackingUnavailable as e:
+            # A vanished reservation is cancellation, not a transient provider
+            # error. Retrying after 30s can reach Vertex with the job and its
+            # provenance already deleted, so go directly to the local fallback.
+            logger.info("[BG] %s — tracking cancelado, sin reintento", e)
+            if out_meta is not None:
+                out_meta["fallback_reason"] = "veo_tracking_cancelled"
             break
         except Exception as e:
             logger.error("[BG] Veo 3 attempt %s/2 failed: %s", attempt + 1, e)

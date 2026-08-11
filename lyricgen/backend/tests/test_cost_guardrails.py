@@ -340,6 +340,25 @@ def test_reserva_borrada_cancela_veo_incluso_en_fail_open(db, monkeypatch):
         pipeline._veo_budget_exceeded(job_id, own_row_id=row_id)
 
 
+def test_cancelacion_de_tracking_no_reintenta_ni_cae_a_otro_veo():
+    import inspect
+    import pipeline
+
+    ensure = inspect.getsource(pipeline._ensure_background)
+    retry_loop = ensure[ensure.index("for attempt in range(2):"):]
+    tracking_catch = retry_loop.index("except VeoTrackingUnavailable as e:")
+    generic_catch = retry_loop.index("except Exception as e:", tracking_catch)
+    assert tracking_catch < generic_catch
+    assert "veo_tracking_cancelled" in retry_loop[tracking_catch:generic_catch]
+
+    scenes = inspect.getsource(pipeline._generate_scene_clips)
+    assert "except (VeoAmbiguousSubmission, VeoTrackingUnavailable):" in scenes
+
+    run = inspect.getsource(pipeline.run_pipeline)
+    assert "except VeoTrackingUnavailable as e:" in run
+    assert "bg_scene_cancelled_fallback.mp4" in run
+
+
 def test_generador_propaga_el_contrato_de_tracking_a_la_reserva():
     import inspect
     import pipeline
@@ -611,7 +630,9 @@ def test_un_envio_ambiguo_de_escena_no_cae_a_otro_veo():
     import pipeline
 
     scene_source = inspect.getsource(pipeline._generate_scene_clips)
-    specific = scene_source.index("except VeoAmbiguousSubmission")
+    specific = scene_source.index(
+        "except (VeoAmbiguousSubmission, VeoTrackingUnavailable)"
+    )
     generic = scene_source.index("except Exception as e", specific)
     assert specific < generic
     assert "raise" in scene_source[specific:generic]
