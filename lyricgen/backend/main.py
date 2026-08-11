@@ -9440,14 +9440,14 @@ async def download(
 
     file_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP[file_type])
 
-    # Lazy ProRes path: never run ffmpeg synchronously in the request
-    # thread. check_prores_readiness short-waits up to 15 s if a
-    # transcode is mid-flight; otherwise tells us to enqueue a prewarm
-    # and respond 202 + Retry-After. UMG's "first download" is now
-    # bounded to whatever this thread does — no 60-300 s blocking,
-    # no uvicorn-worker exhaustion under concurrent load.
+    # Lazy ProRes path: never run ffmpeg or blocking R2/lock readiness I/O on
+    # the event loop. check_prores_readiness may HEAD R2 and short-wait up to
+    # 15 s for an in-flight transcode, so the whole check runs in a worker
+    # thread before this handler decides between redirect, prewarm and 202.
     if file_type in ("umg_master", "umg_short"):
-        readiness = check_prores_readiness(job_id, file_type, job, tenant_id)
+        readiness = await asyncio.to_thread(
+            check_prores_readiness, job_id, file_type, job, tenant_id,
+        )
         if readiness.state == ProResReadiness.READY_LOCAL:
             pass  # fall through to FileResponse below
         elif readiness.state == ProResReadiness.READY_R2:

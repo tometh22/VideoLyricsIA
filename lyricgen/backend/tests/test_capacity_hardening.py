@@ -21,6 +21,16 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+def test_download_offloads_blocking_prores_readiness_check():
+    import inspect
+    import main
+
+    source = inspect.getsource(main.download)
+    readiness = source.index("check_prores_readiness, job_id")
+    offload = source.rindex("await asyncio.to_thread(", 0, readiness)
+    assert offload < readiness
+
+
 @pytest.fixture
 def fake_outputs(tmp_path, monkeypatch):
     """Point prores.OUTPUTS_DIR at a fresh tmp dir."""
