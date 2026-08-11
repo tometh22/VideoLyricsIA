@@ -293,6 +293,7 @@ stack (~$5/mes), así que no vale la pena refinarla más.
 ```bash
 GITHUB_BILLING_TOKEN=ghp_...  # necesita el scope `user`
 GITHUB_BILLING_ORG=...        # o GITHUB_BILLING_USER
+GITHUB_BILLING_CYCLE_DAY=1    # sólo si el ciclo real empieza el día 1
 ```
 
 **Factura $0.** En ago-2026 el uso bruto medido fue $21,93 y el descuento
@@ -303,6 +304,9 @@ Si igual lo querés conectar: en cuentas personales el PAT necesita el
 scope **`user`**. `repo` + `admin:org` no alcanzan y el endpoint tira
 **404** — un 404 acá significa scope faltante, no cuenta inexistente.
 El endpoint reporta el **ciclo de facturación**, no el mes calendario.
+Si aparecen minutos pagos y el ciclo no empieza el día 1, el conector los
+muestra como diagnóstico pero deja el total mensual incompleto: ese agregado
+cruza dos meses y la API no ofrece datos para separarlo honestamente.
 
 ### 7. Suscripciones fijas
 

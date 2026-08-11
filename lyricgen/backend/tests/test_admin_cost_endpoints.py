@@ -285,10 +285,15 @@ def test_attribution_endpoints_require_admin(client, user_token):
 def test_attribution_endpoints_run_blocking_queries_in_threadpool():
     """Plain ``def`` makes FastAPI keep remote SQLAlchemy I/O off the loop."""
     import inspect
-    from admin import admin_cost_business, admin_cost_umg
+    from admin import (
+        admin_cost_business,
+        admin_cost_umg,
+        admin_cost_unit_economics,
+    )
 
     assert not inspect.iscoroutinefunction(admin_cost_umg)
     assert not inspect.iscoroutinefunction(admin_cost_business)
+    assert not inspect.iscoroutinefunction(admin_cost_unit_economics)
 
 
 def test_umg_endpoint_warns_when_peer_env_missing(client, admin_token):
