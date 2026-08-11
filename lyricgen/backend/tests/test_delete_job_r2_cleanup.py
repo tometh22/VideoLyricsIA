@@ -242,7 +242,7 @@ def test_delete_r2_objects_keeps_input_when_db_query_throws(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Unit: delete_job calls _delete_r2_objects before DB deletion
+# Unit: delete_job cleans R2 only after the DB transaction releases its locks
 # ---------------------------------------------------------------------------
 
 
@@ -272,6 +272,32 @@ def test_delete_job_calls_r2_cleanup(monkeypatch):
 
     jobs.delete_job(db, "j-cleanup-test", "t1")
     assert "j-cleanup-test" in cleanup_calls, "_delete_r2_objects was not called"
+
+
+def test_delete_job_commits_before_remote_r2_cleanup(monkeypatch):
+    import jobs
+
+    events = []
+    monkeypatch.setattr(
+        jobs,
+        "_archive_veo_budget_spend",
+        lambda *_args: events.append("archive"),
+    )
+    monkeypatch.setattr(
+        jobs,
+        "_delete_r2_objects",
+        lambda *_args: events.append("r2"),
+    )
+
+    job = MagicMock()
+    job.job_id = "j-order-test"
+    job.tenant_id = "t1"
+    job.status = "error"
+    db = _mock_db_for_job(job)
+    db.commit.side_effect = lambda: events.append("commit")
+
+    assert jobs.delete_job(db, "j-order-test", "t1") == (True, "ok")
+    assert events == ["archive", "commit", "r2"]
 
 
 def test_delete_job_does_not_call_r2_cleanup_for_protected_status(monkeypatch):

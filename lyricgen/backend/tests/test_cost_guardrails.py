@@ -200,6 +200,56 @@ def test_tope_en_cero_lo_desactiva(monkeypatch):
     assert p._veo_budget_exceeded("job123") == (False, 0)
 
 
+def test_el_tope_esta_apagado_por_default_y_tiene_canary(monkeypatch):
+    import inspect
+    import pipeline
+
+    source = inspect.getsource(pipeline)
+    assert 'os.environ.get("VEO_MAX_CALLS_PER_JOB", "0")' in source
+
+    monkeypatch.setattr(pipeline, "VEO_MAX_CALLS_PER_SONG", 10)
+    monkeypatch.setattr(pipeline, "VEO_BUDGET_TENANTS", frozenset())
+    assert pipeline._veo_budget_enforced_for_job("any-job") is False
+
+    monkeypatch.setattr(pipeline, "VEO_BUDGET_TENANTS", frozenset({"*"}))
+    assert pipeline._veo_budget_enforced_for_job("any-job") is True
+
+
+def test_canary_de_veo_aisla_por_tenant(monkeypatch):
+    import pipeline
+
+    class _Query:
+        def filter(self, *_args):
+            return self
+
+        def one_or_none(self):
+            return ("universal_argentina",)
+
+    class _Session:
+        def query(self, *_args):
+            return _Query()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(pipeline, "VEO_MAX_CALLS_PER_SONG", 10)
+    monkeypatch.setattr(
+        pipeline,
+        "VEO_BUDGET_TENANTS",
+        frozenset({"universal_argentina"}),
+    )
+    monkeypatch.setattr("database.SessionLocal", _Session)
+
+    assert pipeline._veo_budget_enforced_for_job("canary-job") is True
+
+    monkeypatch.setattr(
+        pipeline,
+        "VEO_BUDGET_TENANTS",
+        frozenset({"otro_tenant"}),
+    )
+    assert pipeline._veo_budget_enforced_for_job("canary-job") is False
+
+
 def test_tope_desactivado_conserva_la_fila_facturable(db, monkeypatch):
     """Apagar el ceiling no apaga la contabilidad de la llamada a Vertex."""
     import pipeline
@@ -384,7 +434,7 @@ def test_generador_propaga_el_contrato_de_tracking_a_la_reserva():
         "_over, _spent = _veo_budget_exceeded("
     ):source.index("if _over:")]
     assert "require_persistent_tracking=require_persistent_tracking" in reservation
-    guard = source[source.index("with _VeoSubmissionGuard("):
+    guard = source[source.index("_submission_guard = _VeoSubmissionGuard("):
                    source.index("r = _req.post(")]
     assert "require_persistent_tracking=require_persistent_tracking" in guard
 
@@ -558,7 +608,7 @@ def test_la_reserva_pendiente_no_se_cuenta_a_si_misma():
     import inspect
     import pipeline
     source = inspect.getsource(pipeline._generate_veo_video)
-    assert "initial_response_summary=BUDGET_PENDING_PREFIX" in source
+    assert "BUDGET_PENDING_PREFIX if _budget_enforced else None" in source
 
 
 def test_el_tope_de_veo_se_chequea_antes_de_pedir_credenciales():
@@ -595,7 +645,7 @@ def test_el_post_de_veo_revalida_cancelacion_despues_del_token():
 
     source = inspect.getsource(pipeline._generate_veo_video)
     first_token = source.index("token = _veo_access_token()")
-    guard = source.index("with _VeoSubmissionGuard(")
+    guard = source.index("_submission_guard = _VeoSubmissionGuard(")
     first_post = source.index("r = _req.post(")
     assert first_token < guard < first_post
 
@@ -952,7 +1002,7 @@ def test_429_se_vuelve_no_facturable_antes_de_soltar_el_lock():
     import pipeline
 
     source = inspect.getsource(pipeline._generate_veo_video)
-    guard = source.index("with _VeoSubmissionGuard(")
+    guard = source.index("with _submission_guard:")
     pause = source.index("_pause_veo_reservation_for_retry(", guard)
     guard_handler = source.index("except VeoTrackingUnavailable:", guard)
     backoff = source.index("if rejected_429:", guard_handler)
@@ -963,7 +1013,7 @@ def test_429_se_vuelve_no_facturable_antes_de_soltar_el_lock():
     retry_reserve = source.index(
         "_retry_over, _retry_spent = _veo_budget_exceeded(", retry_token,
     )
-    next_guard = source.index("with _VeoSubmissionGuard(", retry_reserve)
+    next_guard = source.index("with _submission_guard:", retry_reserve)
     assert retry_token < retry_reserve < next_guard
 
 

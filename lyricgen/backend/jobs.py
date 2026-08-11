@@ -557,10 +557,16 @@ def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
     if job.status not in _DELETABLE_STATUSES:
         return False, f"protected_status:{job.status}"
     _archive_veo_budget_spend(db, [job])
-    _delete_r2_objects(db, job)
     db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete(synchronize_session=False)
     db.delete(job)
     db.commit()
+
+    # R2 is remote, best-effort I/O.  The archive helper above may hold
+    # advisory locks that serialize a Veo submission for this song/job; never
+    # keep those transaction locks while waiting on object-storage timeouts.
+    # The committed delete also makes the sibling check see exactly the jobs
+    # that still reference the input audio.
+    _delete_r2_objects(db, job)
     return True, "ok"
 
 
