@@ -444,7 +444,8 @@ def test_guard_distingue_insert_fallido_de_reserva_borrada(db):
     import pipeline
     from database import AIProvenance, Job
 
-    job_id = "guardnoinsert"
+    # Production uses VARCHAR(12); SQLite does not enforce that limit.
+    job_id = "guardnoinsrt"
     db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
     db.query(Job).filter(Job.job_id == job_id).delete()
     db.add(Job(
