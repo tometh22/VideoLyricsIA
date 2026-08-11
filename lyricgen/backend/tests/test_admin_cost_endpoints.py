@@ -282,6 +282,15 @@ def test_attribution_endpoints_require_admin(client, user_token):
         assert client.get(path, headers=auth(user_token)).status_code == 403
 
 
+def test_attribution_endpoints_run_blocking_queries_in_threadpool():
+    """Plain ``def`` makes FastAPI keep remote SQLAlchemy I/O off the loop."""
+    import inspect
+    from admin import admin_cost_business, admin_cost_umg
+
+    assert not inspect.iscoroutinefunction(admin_cost_umg)
+    assert not inspect.iscoroutinefunction(admin_cost_business)
+
+
 def test_umg_endpoint_warns_when_peer_env_missing(client, admin_token):
     """Managed production for UMG runs in STAGING. Answering from a single
     environment is legitimate but partial, and the response has to say so —

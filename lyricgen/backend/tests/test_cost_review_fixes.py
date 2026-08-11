@@ -694,6 +694,65 @@ def test_refresh_final_fallido_no_convierte_checkpoint_en_factura(
         db.commit()
 
 
+def test_lecturas_no_reviven_checkpoint_intrames_como_factura(
+    client, admin_token, db,
+):
+    """El row durable conserva el piso, pero ningún panel puede cotizarlo."""
+    from database import CostSnapshot
+
+    period = "2020-10"
+    db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+    db.add(CostSnapshot(
+        period=period, source="gcp", amount_usd=12.0, status="ok",
+        detail="checkpoint intrames", breakdown=[{"cost": 12.0}],
+        fetched_at=datetime(2020, 10, 15, tzinfo=timezone.utc),
+    ))
+    db.commit()
+    try:
+        real = client.get(
+            f"/admin/cost/real?period={period}",
+            headers=auth(admin_token),
+        )
+        assert real.status_code == 200, real.text
+        real_body = real.json()
+        gcp = next(s for s in real_body["sources"] if s["source"] == "gcp")
+        assert gcp["status"] == "provisional"
+        assert gcp["amount_usd"] is None
+        assert gcp["retained_amount_usd"] == 12.0
+        assert gcp["stale"] is True
+        assert real_body["total_usd"] == 0.0
+        assert real_body["complete"] is False
+        assert "gcp" in real_body["errored"]
+
+        unit = client.get(
+            f"/admin/cost/unit-economics?period={period}",
+            headers=auth(admin_token),
+        )
+        assert unit.status_code == 200, unit.text
+        assert unit.json()["real_cost_usd"] == 0.0
+        assert unit.json()["cost_complete"] is False
+        assert "gcp" in unit.json()["missing_sources"]
+
+        reconcile = client.get(
+            f"/admin/cost/reconcile?period={period}",
+            headers=auth(admin_token),
+        )
+        assert reconcile.status_code == 200, reconcile.text
+        assert reconcile.json()["invoiced_usd"] == 0.0
+        assert "gcp" in reconcile.json()["invoiced_sources_missing"]
+
+        umg = client.get(
+            f"/admin/cost/umg?period={period}",
+            headers=auth(admin_token),
+        )
+        assert umg.status_code == 200, umg.text
+        assert "umg_total" not in umg.json()
+        assert "refresh" in umg.json()["umg_total_unavailable"]
+    finally:
+        db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+        db.commit()
+
+
 def test_primer_refresh_maduro_finaliza_snapshot_provisional(
     client, admin_token, db, monkeypatch,
 ):
