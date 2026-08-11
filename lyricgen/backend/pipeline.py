@@ -9494,6 +9494,11 @@ def _pause_veo_reservation_for_retry(recorder, reason: str) -> None:
     from provenance import BUDGET_RELEASED_PREFIX
 
     row_id = getattr(recorder, "_row_id", None)
+    if row_id is None:
+        # The normal delivery path is deliberately fail-open when the initial
+        # provenance INSERT never succeeded. Persistent callers are rejected
+        # earlier; there is no row to pause between confirmed 429 retries.
+        return
     if not _persist_veo_reservation_summary(
         row_id, f"{BUDGET_RELEASED_PREFIX}: {str(reason)[:1900]}",
     ):
@@ -9559,9 +9564,11 @@ class _VeoSubmissionGuard:
     take the matching lock before removing the Job and its provenance.
     """
 
-    def __init__(self, job_id: str, row_id: int | None):
+    def __init__(self, job_id: str, row_id: int | None,
+                 require_persistent_tracking: bool = False):
         self.job_id = job_id
         self.row_id = row_id
+        self.require_persistent_tracking = require_persistent_tracking
         self.db = None
 
     def __enter__(self):
@@ -9598,18 +9605,35 @@ class _VeoSubmissionGuard:
                 .filter(Job.job_id == self.job_id)
                 .one_or_none()
             )
-            reservation_exists = (
-                self.db.query(AIProvenance.id)
-                .filter(
-                    AIProvenance.id == self.row_id,
-                    AIProvenance.job_id == self.job_id,
+            reservation_exists = None
+            if self.row_id is not None:
+                reservation_exists = (
+                    self.db.query(AIProvenance.id)
+                    .filter(
+                        AIProvenance.id == self.row_id,
+                        AIProvenance.job_id == self.job_id,
+                    )
+                    .one_or_none()
                 )
-                .one_or_none()
-            )
-            if job_exists is None or reservation_exists is None:
+            if job_exists is None:
                 raise VeoTrackingUnavailable(
-                    "Veo job or reservation disappeared before provider "
-                    f"submission job_id={self.job_id} row={self.row_id}"
+                    "Veo job disappeared before provider submission "
+                    f"job_id={self.job_id}"
+                )
+            if self.row_id is None:
+                if self.require_persistent_tracking:
+                    raise VeoTrackingUnavailable(
+                        "Persistent Veo submission requires provenance "
+                        f"job_id={self.job_id}"
+                    )
+                # Provenance INSERT failed before any row id existed. This is
+                # the documented normal-delivery fail-open mode, distinct
+                # from a known reservation id that deletion removed.
+                return self
+            if reservation_exists is None:
+                raise VeoTrackingUnavailable(
+                    "Veo reservation disappeared before provider submission "
+                    f"job_id={self.job_id} row={self.row_id}"
                 )
             # Deletion now waits on the per-job lock. Mark the precise
             # external side-effect boundary durably before touching Vertex;
@@ -10462,6 +10486,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             # cancellation race without holding a DB connection during auth.
             with _VeoSubmissionGuard(
                 job_id, getattr(recorder, "_row_id", None),
+                require_persistent_tracking=require_persistent_tracking,
             ):
                 try:
                     r = _req.post(

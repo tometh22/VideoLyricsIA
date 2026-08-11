@@ -384,6 +384,42 @@ def test_generador_propaga_el_contrato_de_tracking_a_la_reserva():
         "_over, _spent = _veo_budget_exceeded("
     ):source.index("if _over:")]
     assert "require_persistent_tracking=require_persistent_tracking" in reservation
+    guard = source[source.index("with _VeoSubmissionGuard("):
+                   source.index("r = _req.post(")]
+    assert "require_persistent_tracking=require_persistent_tracking" in guard
+
+
+def test_guard_distingue_insert_fallido_de_reserva_borrada(db):
+    """row_id=None es fail-open; una id conocida ausente es cancelación."""
+    import pipeline
+    from database import AIProvenance, Job
+
+    job_id = "guardnoinsert"
+    db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+    db.query(Job).filter(Job.job_id == job_id).delete()
+    db.add(Job(
+        job_id=job_id, user_id=1, tenant_id="guard-no-insert",
+        artist="A", song_title="S", filename="a.mp3", status="processing",
+    ))
+    db.commit()
+    try:
+        with pipeline._VeoSubmissionGuard(job_id, None):
+            pass
+        with pytest.raises(
+            pipeline.VeoTrackingUnavailable, match="reservation disappeared",
+        ):
+            with pipeline._VeoSubmissionGuard(job_id, 999_999_999):
+                pass
+        with pytest.raises(
+            pipeline.VeoTrackingUnavailable, match="requires provenance",
+        ):
+            with pipeline._VeoSubmissionGuard(
+                job_id, None, require_persistent_tracking=True,
+            ):
+                pass
+    finally:
+        db.query(Job).filter(Job.job_id == job_id).delete()
+        db.commit()
 
 
 def test_liberacion_verificada_persiste_estado_no_facturable(db):
