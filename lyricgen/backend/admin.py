@@ -748,7 +748,7 @@ async def list_audit_log(
 # ---------------------------------------------------------------------------
 
 @router.get("/cost")
-async def admin_cost_dashboard(
+def admin_cost_dashboard(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
     since_days: int = Query(30, ge=1, le=365),
@@ -759,7 +759,10 @@ async def admin_cost_dashboard(
     spend descending. Use this to spot tenants approaching cap, to validate
     pricing assumptions, and as the data source for cost alerts.
     """
-    from provenance import tenant_cost_summary
+    from provenance import rates_for_window, tenant_cost_summary
+
+    since = datetime.now(timezone.utc) - timedelta(days=since_days)
+    rates = rates_for_window(db, since)
 
     tenant_ids = [
         row[0]
@@ -770,7 +773,12 @@ async def admin_cost_dashboard(
     grand_total = 0.0
     grand_calls = 0
     for tid in tenant_ids:
-        s = tenant_cost_summary(db, tenant_id=tid, since_days=since_days)
+        s = tenant_cost_summary(
+            db,
+            tenant_id=tid,
+            since_days=since_days,
+            rates=rates,
+        )
         summaries.append(s)
         grand_total += s["total_cost"]
         grand_calls += s["total_calls"]
@@ -786,7 +794,7 @@ async def admin_cost_dashboard(
 
 
 @router.get("/margin")
-async def admin_margin_dashboard(
+def admin_margin_dashboard(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
     since_days: int = Query(30, ge=1, le=365),

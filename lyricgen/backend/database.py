@@ -230,7 +230,23 @@ PEER_DATABASE_URL = os.environ.get("PEER_DATABASE_URL", "").strip() or DELIVERIE
 if PEER_DATABASE_URL.startswith("postgres://"):
     PEER_DATABASE_URL = PEER_DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-if PEER_DATABASE_URL:
+if (
+    PEER_DATABASE_URL
+    and deliveries_engine is not None
+    and PEER_DATABASE_URL == DELIVERIES_DATABASE_URL
+):
+    # Staging normally points both features at the production DB.  Reuse the
+    # existing low-volume deliveries pool instead of reserving a second pool
+    # (and up to three more sockets per API process) for cost attribution.
+    peer_engine = deliveries_engine
+    PeerSessionLocal = DeliveriesSessionLocal
+elif PEER_DATABASE_URL and PEER_DATABASE_URL == DATABASE_URL:
+    # An explicitly configured peer URL can also point at the local DB.  Keep
+    # one pool in that case; peer_session() still returns an independent
+    # short-lived Session.
+    peer_engine = engine
+    PeerSessionLocal = SessionLocal
+elif PEER_DATABASE_URL:
     peer_engine = create_engine(
         PEER_DATABASE_URL,
         # Pool mínimo: cross-project por red pública y de uso esporádico
