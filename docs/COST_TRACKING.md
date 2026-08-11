@@ -196,7 +196,13 @@ GCP_BILLING_BQ_PROJECT=genly-prod
 GCP_BILLING_BQ_DATASET=billing_export
 GCP_BILLING_BQ_TABLE=gcp_billing_export_v1_XXXXXX_XXXXXX_XXXXXX
 GCP_BILLING_SA_JSON='{"type":"service_account",...}'   # JSON inline
+GCP_BILLING_PROJECT_IDS=genly-prod,genly-staging          # obligatorio
 ```
+
+`GCP_BILLING_PROJECT_IDS` enumera los proyectos donde corre el workload de
+GenLy, no necesariamente el proyecto que hospeda el dataset. Sin este scope el
+conector queda incompleto: el export cubre toda la cuenta de facturación y
+aceptarlo mezclaría otros proyectos en costos y tarifas.
 
 > El export tarda ~24 h en empezar a poblar y **no es retroactivo**:
 > los meses anteriores a habilitarlo no van a estar. Habilitalo ya aunque

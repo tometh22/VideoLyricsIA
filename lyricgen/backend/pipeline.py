@@ -10425,7 +10425,10 @@ def _score_video_relevance(
             recorder = record_ai_call(
                 job_id=job_id,
                 step="video_relevance",
-                tool_name="gemini-2.5-flash",
+                # One JPEG frame, same billing shape as the single-image
+                # validation call. The generic text key weighted this request
+                # ~20x too high after invoice calibration.
+                tool_name="gemini-2.5-flash-vision-image",
                 tool_provider="google_vertex",
                 prompt=prompt,
                 input_data_types=["video_frame", "scene_prompt"],
