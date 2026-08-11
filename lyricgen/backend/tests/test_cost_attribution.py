@@ -72,9 +72,17 @@ def test_ci_tenants_are_recognized(tenant):
 @pytest.mark.parametrize("tenant", [
     "universal_argentina", "universal_chile", "agus77",
     "tomas@epical.digital", "default", "omg", "genly", "",
+    "studio_123456789",
 ])
 def test_real_tenants_are_not_ci(tenant):
     assert not ca.is_ci_tenant(tenant)
+
+
+def test_cliente_con_sufijo_numerico_no_se_clasifica_como_ci():
+    job = _job(
+        "numeric-client", "Artista", "Tema", "studio_123456789",
+    )
+    assert ca.classify_job(job, set()) == ca.CAT_OTHER_CLIENT
 
 
 # ---------------------------------------------------------------------------

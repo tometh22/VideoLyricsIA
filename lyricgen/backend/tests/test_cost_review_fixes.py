@@ -1411,6 +1411,8 @@ def test_r2_no_imputa_franquicia_account_wide_a_un_bucket(monkeypatch):
                 "r2OperationsAdaptiveGroups": [
                     {"sum": {"requests": 100},
                      "dimensions": {"actionType": "PutObject"}},
+                    {"sum": {"requests": 300},
+                     "dimensions": {"actionType": "UploadPart"}},
                     {"sum": {"requests": 200},
                      "dimensions": {"actionType": "GetObject"}},
                 ],
@@ -1424,7 +1426,7 @@ def test_r2_no_imputa_franquicia_account_wide_a_un_bucket(monkeypatch):
     out = billing_sources.fetch_r2("2026-07")
     by_concept = {row["concepto"]: row for row in out.breakdown}
     assert by_concept["operaciones clase A"]["included_requests"] == 0
-    assert by_concept["operaciones clase A"]["billable_requests"] == 100
+    assert by_concept["operaciones clase A"]["billable_requests"] == 400
     assert by_concept["operaciones clase B"]["included_requests"] == 0
     assert by_concept["operaciones clase B"]["billable_requests"] == 200
     assert out.raw["account_allowances_applied"] is False
