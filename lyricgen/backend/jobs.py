@@ -483,7 +483,7 @@ def _archive_veo_budget_spend(db: Session, job_rows: list[Job]) -> None:
     from database import AIProvenance, VeoBudgetLedger
     from provenance import billable_filter
     from sqlalchemy import text as sql_text
-    from veo_budget import advisory_lock_key, scope_hash
+    from veo_budget import advisory_lock_key, scope_hash, submission_lock_key
 
     if not job_rows:
         return
@@ -502,10 +502,23 @@ def _archive_veo_budget_spend(db: Session, job_rows: list[Job]) -> None:
     bind = getattr(db, "bind", None)
     dialect = getattr(getattr(bind, "dialect", None), "name", "")
     if dialect == "postgresql":
-        for digest in sorted(set(scopes_by_job.values())):
+        lock_keys = {
+            advisory_lock_key(digest)
+            for digest in scopes_by_job.values()
+        }
+        # A worker takes the same per-job lock for the final existence check
+        # and keeps it until Vertex answers the submission request. If delete
+        # wins while auth is running, the worker observes the committed delete
+        # and aborts; if submission already started, deletion waits until its
+        # billable reservation is safe to archive.
+        lock_keys.update(
+            submission_lock_key(job.tenant_id, job.job_id)
+            for job in job_rows
+        )
+        for lock_key in sorted(lock_keys):
             db.execute(
                 sql_text("SELECT pg_advisory_xact_lock(:lock_key)"),
-                {"lock_key": advisory_lock_key(digest)},
+                {"lock_key": lock_key},
             )
     paid_rows = (
         db.query(AIProvenance)

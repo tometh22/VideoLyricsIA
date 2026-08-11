@@ -546,6 +546,115 @@ def test_el_tope_de_veo_se_chequea_antes_de_pedir_credenciales():
     assert "pre-submit auth failed" in auth_failure
 
 
+def test_el_post_de_veo_revalida_cancelacion_despues_del_token():
+    """Delete and POST share one lock at the last external-effect boundary."""
+    import inspect
+    import pipeline
+
+    source = inspect.getsource(pipeline._generate_veo_video)
+    first_token = source.index("token = _veo_access_token()")
+    guard = source.index("with _VeoSubmissionGuard(")
+    first_post = source.index("r = _req.post(")
+    assert first_token < guard < first_post
+
+    jobs_source = inspect.getsource(__import__("jobs")._archive_veo_budget_spend)
+    assert "submission_lock_key" in jobs_source
+
+
+def test_el_guard_de_submit_serializa_el_delete_en_postgres(db, monkeypatch):
+    """A delete cannot remove tracking while the provider POST owns the lock."""
+    import uuid
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+    from threading import Event
+
+    import jobs
+    import pipeline
+    from database import (
+        AIProvenance,
+        Job,
+        SessionLocal,
+        User,
+        VeoBudgetLedger,
+        engine,
+    )
+    from provenance import BUDGET_RESERVED_PREFIX
+
+    if engine.dialect.name != "postgresql":
+        pytest.skip("la carrera delete/submit requiere PostgreSQL")
+
+    suffix = uuid.uuid4().hex[:6]
+    job_id = f"guard{suffix}"[:12]
+    tenant = f"guard-tenant-{suffix}"
+    user = User(
+        username=f"guard-user-{suffix}",
+        hashed_password="unused",
+        tenant_id=tenant,
+    )
+    db.add(user)
+    db.flush()
+    db.add(Job(
+        job_id=job_id,
+        user_id=user.id,
+        tenant_id=tenant,
+        artist="Bersuit",
+        song_title="La Argentinidad",
+        filename="guard.mp3",
+        status="processing",
+    ))
+    db.flush()
+    row = AIProvenance(
+        job_id=job_id,
+        step="video_bg",
+        tool_name="veo-3.1-fast-generate-001",
+        tool_provider="google_vertex",
+        prompt_sent="guard",
+        response_summary=BUDGET_RESERVED_PREFIX,
+    )
+    db.add(row)
+    db.commit()
+    row_id = row.id
+    entered = Event()
+    release = Event()
+    monkeypatch.setattr(jobs, "_delete_r2_objects", lambda *_a, **_k: None)
+
+    def hold_submission():
+        with pipeline._VeoSubmissionGuard(job_id, row_id):
+            entered.set()
+            assert release.wait(5)
+
+    def delete():
+        session = SessionLocal()
+        try:
+            return jobs.delete_job(session, job_id, tenant)
+        finally:
+            session.close()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            submit_future = pool.submit(hold_submission)
+            assert entered.wait(5)
+            delete_future = pool.submit(delete)
+            with pytest.raises(TimeoutError):
+                delete_future.result(timeout=0.2)
+            release.set()
+            submit_future.result(timeout=5)
+            assert delete_future.result(timeout=5) == (True, "ok")
+    finally:
+        release.set()
+        db.rollback()
+        db.query(VeoBudgetLedger).filter(
+            VeoBudgetLedger.source_provenance_id == row_id,
+        ).delete(synchronize_session=False)
+        db.query(AIProvenance).filter(
+            AIProvenance.job_id == job_id,
+        ).delete(synchronize_session=False)
+        db.query(Job).filter(Job.job_id == job_id).delete(
+            synchronize_session=False)
+        db.query(User).filter(User.id == user.id).delete(
+            synchronize_session=False)
+        db.commit()
+
+
 def test_un_job_ya_topeado_corta_antes_del_cooldown():
     import inspect
     import pipeline

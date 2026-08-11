@@ -21,3 +21,9 @@ def advisory_lock_key(scope_digest: str) -> int:
         byteorder="big",
         signed=True,
     )
+
+
+def submission_lock_key(tenant_id: str | None, job_id: str) -> int:
+    """Stable per-job lock that serializes cancellation with a Veo POST."""
+    digest = scope_hash(tenant_id, f"__veo_submission__|{job_id}")
+    return advisory_lock_key(digest)

@@ -9521,6 +9521,94 @@ def _mark_veo_reservation_billable(row_id: int | None, reason: str) -> bool:
     )
 
 
+class _VeoSubmissionGuard:
+    """Serialize a job's final cancellation check with one provider POST.
+
+    Token acquisition deliberately happens before entering this guard. That
+    gives an operator deletion requested during slow auth a chance to commit.
+    Once entered, the same PostgreSQL advisory lock is held by this read
+    transaction until the HTTP request returns; delete_job/bulk_delete_jobs
+    take the matching lock before removing the Job and its provenance.
+    """
+
+    def __init__(self, job_id: str, row_id: int | None):
+        self.job_id = job_id
+        self.row_id = row_id
+        self.db = None
+
+    def __enter__(self):
+        from sqlalchemy import text as _sql_text
+
+        from database import AIProvenance, Job, SessionLocal
+        from veo_budget import submission_lock_key
+
+        self.db = SessionLocal()
+        try:
+            # This first read only discovers the immutable tenant component of
+            # the lock. The authoritative existence checks happen after lock
+            # acquisition, in a fresh READ COMMITTED statement snapshot.
+            tenant_row = (
+                self.db.query(Job.tenant_id)
+                .filter(Job.job_id == self.job_id)
+                .one_or_none()
+            )
+            if tenant_row is None:
+                raise VeoTrackingUnavailable(
+                    f"Veo Job disappeared before submission job_id={self.job_id}"
+                )
+            tenant_id = tenant_row[0] or ""
+            bind = getattr(self.db, "bind", None)
+            dialect = getattr(getattr(bind, "dialect", None), "name", "")
+            if dialect == "postgresql":
+                self.db.execute(
+                    _sql_text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                    {"lock_key": submission_lock_key(tenant_id, self.job_id)},
+                )
+
+            job_exists = (
+                self.db.query(Job.job_id)
+                .filter(Job.job_id == self.job_id)
+                .one_or_none()
+            )
+            reservation_exists = (
+                self.db.query(AIProvenance.id)
+                .filter(
+                    AIProvenance.id == self.row_id,
+                    AIProvenance.job_id == self.job_id,
+                )
+                .one_or_none()
+            )
+            if job_exists is None or reservation_exists is None:
+                raise VeoTrackingUnavailable(
+                    "Veo job or reservation disappeared before provider "
+                    f"submission job_id={self.job_id} row={self.row_id}"
+                )
+            return self
+        except VeoTrackingUnavailable:
+            self.db.rollback()
+            self.db.close()
+            self.db = None
+            raise
+        except Exception as exc:
+            self.db.rollback()
+            self.db.close()
+            self.db = None
+            raise VeoTrackingUnavailable(
+                "Could not verify Veo cancellation state before provider "
+                f"submission job_id={self.job_id} row={self.row_id}"
+            ) from exc
+
+    def __exit__(self, exc_type, exc, traceback):
+        if self.db is not None:
+            try:
+                # Read-only transaction: rollback releases the xact lock.
+                self.db.rollback()
+            finally:
+                self.db.close()
+                self.db = None
+        return False
+
+
 def _veo_budget_exceeded(job_id: str | None,
                          own_row_id: int | None = None,
                          require_persistent_tracking: bool = False,
@@ -10310,16 +10398,31 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                 raise
         try:
             logger.info("[BG] Veo 3: generating video (attempt %s/%s)...", attempt + 1, MAX_ATTEMPTS)
-            r = _req.post(
-                submit_url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                    "x-goog-user-project": _VERTEX_PROJECT,
-                },
-                json=request_body,
-                timeout=60,
-            )
+            # Re-check deletion after token acquisition, then keep the same
+            # lock through the external side-effect. This closes the final
+            # cancellation race without holding a DB connection during auth.
+            with _VeoSubmissionGuard(
+                job_id, getattr(recorder, "_row_id", None),
+            ):
+                r = _req.post(
+                    submit_url,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                        "x-goog-user-project": _VERTEX_PROJECT,
+                    },
+                    json=request_body,
+                    timeout=60,
+                )
+        except VeoTrackingUnavailable:
+            # No request began. The row may already have been removed by the
+            # deletion transaction; release it only when it still exists.
+            try:
+                _release_veo_reservation(
+                    recorder, "job cancelled before provider submission")
+            except VeoTrackingUnavailable:
+                pass
+            raise
         except Exception as e:
             _raise_if_job_timeout(e)
             # Once post() has started, a timeout/disconnect is ambiguous: the
