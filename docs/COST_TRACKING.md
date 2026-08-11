@@ -309,10 +309,11 @@ es la suscripción Pro de $4/mes, que ya está en `fixed`.
 Si igual lo querés conectar: en cuentas personales el PAT necesita el
 scope **`user`**. `repo` + `admin:org` no alcanzan y el endpoint tira
 **404** — un 404 acá significa scope faltante, no cuenta inexistente.
-El endpoint reporta el **ciclo de facturación**, no el mes calendario.
-Si aparecen minutos pagos y el ciclo no empieza el día 1, el conector los
-muestra como diagnóstico pero deja el total mensual incompleto: ese agregado
-cruza dos meses y la API no ofrece datos para separarlo honestamente.
+El endpoint reporta el **ciclo de facturación**, no el mes calendario. El
+ciclo debe empezar el día 1 incluso cuando el total sea $0: con un corte a
+mitad de mes, ese cero podría omitir minutos pagos de la primera quincena. Si
+no está alineado, el conector muestra el valor observado como diagnóstico y
+deja el total mensual incompleto porque la API no permite separar los meses.
 
 ### 7. Suscripciones fijas
 
