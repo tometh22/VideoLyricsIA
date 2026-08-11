@@ -236,6 +236,14 @@ tiene ninguna medida de costo — sólo recursos crudos. El conector pide
 publicadas, todas overrideables por env (`RAILWAY_USD_PER_VCPU_MONTH`,
 `RAILWAY_USD_PER_GB_MONTH`, `RAILWAY_USD_PER_EGRESS_GB`…).
 
+El compromiso mínimo del plan se configura con
+`RAILWAY_PLAN_MINIMUM_USD` (default `$20`) y sólo se aplica cuando el scope es
+un workspace exclusivo de Genly. Con `RAILWAY_PROJECT_ID` el conector informa
+únicamente el uso medido: el compromiso se cobra a nivel cuenta/workspace y no
+hay una base confiable para imputarle al proyecto el top-up compartido. Ese
+mínimo queda deliberadamente sin asignar; no se debe sumar como suscripción
+fija porque podría duplicar gasto ya absorbido por otros proyectos.
+
 > **La trampa de las unidades:** los recursos vuelven en *unidad-minutos*
 > acumulados sobre la ventana, pero `NETWORK_TX_GB` es un flujo ya
 > expresado en GB. Confundirlos es un error de ~700x. Hay un test que lo
@@ -322,15 +330,20 @@ deja el total mensual incompleto porque la API no permite separar los meses.
 ### 7. Suscripciones fijas
 
 Sin API que valga la pena. Default en código: Vercel Pro $20 + GitHub Pro
-$4 + Railway plan $20. Se cambian sin deploy:
+$4. Se cambian sin deploy:
 
 ```bash
-FIXED_SUBSCRIPTIONS_JSON='{"vercel_pro":20,"github_pro":4,"railway_plan":40}'
+FIXED_SUBSCRIPTIONS_JSON='{"vercel_pro":20,"github_pro":4}'
 ```
 
-Son chicas pero son la parte del costo unitario que **se amortiza**: a 65
-videos/mes son $0,68/video, a 400/mes son $0,11. Dejarlas afuera es lo que
-hace que los meses de bajo volumen parezcan baratos.
+Railway no entra acá: su compromiso mínimo se trata dentro del conector de
+Railway como se explica arriba. La clave legacy `railway_plan`, si todavía
+existe en `FIXED_SUBSCRIPTIONS_JSON`, se interpreta como ese mínimo pero se
+elimina de esta suma para no duplicarlo.
+
+Estas suscripciones son la parte del costo unitario que **se amortiza**: a 65
+videos/mes son $0,37/video, a 400/mes son $0,06. Dejarlas afuera es lo que hace
+que los meses de bajo volumen parezcan baratos.
 
 ---
 
