@@ -7,11 +7,12 @@ of truth — update it when pricing changes.
 
 Cost accounting rules (2026-08 audit — see docs/COST_TRACKING.md):
 
-* **Cache hits are not billable.** `_generate_veo_video` opens the
-  provenance recorder *before* the R2 cache lookup, so a cache hit still
-  writes a full row (marked `cache_hit:` in `response_summary`). Counting
-  those rows at $0.80 inflated the dashboard by ~19% in jul-2026 (40 of
-  248 Veo rows). Every aggregate here filters them out.
+* **Cache hits are not billable.** `_generate_veo_video`'s `cache_only`
+  path records the R2 lookup either way (marked `cache_hit:` or
+  `cache_only_miss:` in `response_summary`), because knowing how often the
+  cache saves a generation is worth a row. Neither one contacts the
+  provider. Counting the hits at $0.80 inflated the dashboard by ~19% in
+  jul-2026 (40 of 248 Veo rows). Every aggregate here filters both out.
 * **The denominator is delivered videos, not jobs created.** Dividing
   spend by created jobs hid the fact that 59% of jul-2026 Veo spend went
   to discarded previews and rejected jobs. `cost_waste_breakdown()`
@@ -182,6 +183,66 @@ def _provenance_month_columns():
 # R2 cache served the clip. The recorder is opened before the cache lookup,
 # so the row exists but no provider call was made and nothing was billed.
 CACHE_HIT_PREFIX = "cache_hit"
+# Prefijo de `_registrar_cache_only` en pipeline.py: se buscó el clip en R2,
+# no estaba, y NO se generó. Cero dólares.
+CACHE_ONLY_MISS_PREFIX = "cache_only_miss"
+# Prefijo de `_discard_provenance_row` cuando NO puede borrar la fila (un rol
+# de DB con UPDATE pero sin DELETE, o un fallo transitorio). La llamada nunca
+# salió: sin excluirla, cada rechazo del tope fabricaba gasto y además hacía
+# avanzar el propio tope.
+BUDGET_EXCEEDED_PREFIX = "budget_exceeded"
+# A paid Veo attempt waits in this non-billable state while it competes for
+# the per-song atomic budget reservation. It has not reached the provider.
+BUDGET_PENDING_PREFIX = "budget_pending"
+# A budget slot was reserved, but a provider response proved that no Veo
+# operation was created (for example HTTP 429/401). Kept for audit, excluded
+# from both spend and the per-song ceiling.
+BUDGET_RELEASED_PREFIX = "budget_released"
+# Once admitted, the same row is marked reserved before the database lock is
+# released. It occupies a budget slot so concurrent workers cannot overspend,
+# but is not billable yet: token acquisition and the final cancellation guard
+# still happen before the provider sees a request.
+BUDGET_RESERVED_PREFIX = "budget_reserved"
+# The final cancellation guard has been acquired and the worker is crossing
+# the external side-effect boundary. From here an interrupted/ambiguous POST
+# may have created a paid operation, so deletion and cost reporting preserve
+# the row conservatively as spend.
+BUDGET_SUBMITTED_PREFIX = "budget_submitted"
+# Exact summary written by the legacy Veo retry loop after five explicit 429
+# responses. Vertex rejected every attempt before creating an operation, so
+# these historical rows are confirmed zero-cost (unlike generic ``error:``
+# rows, which remain conservatively billable).
+LEGACY_CONFIRMED_RATE_LIMIT_PREFIX = "error: rate_limited_after_5_retries"
+
+# Prefijos de `response_summary` que significan "esta fila existe para el
+# registro de auditoría, pero no salió plata". Toda la contabilidad los filtra.
+NON_BILLABLE_PREFIXES = (
+    CACHE_HIT_PREFIX,
+    CACHE_ONLY_MISS_PREFIX,
+    BUDGET_EXCEEDED_PREFIX,
+    BUDGET_PENDING_PREFIX,
+    BUDGET_RELEASED_PREFIX,
+    BUDGET_RESERVED_PREFIX,
+    LEGACY_CONFIRMED_RATE_LIMIT_PREFIX,
+)
+
+# Atomic budget occupancy differs from actual billing by one state: admitted
+# pre-submit reservations must block another worker, but must not become cost
+# or a deletion tombstone until the submission boundary is crossed.
+NON_BUDGET_PREFIXES = tuple(
+    prefix for prefix in NON_BILLABLE_PREFIXES
+    if prefix != BUDGET_RESERVED_PREFIX
+)
+
+
+def _exclude_summary_prefixes(prefixes):
+    return and_(*[
+        or_(
+            AIProvenance.response_summary.is_(None),
+            not_(AIProvenance.response_summary.like(f"{prefix}%")),
+        )
+        for prefix in prefixes
+    ])
 
 
 def billable_filter():
@@ -193,10 +254,37 @@ def billable_filter():
     would rather over-report cost than discover the gap on the invoice.
     `cost_dashboard_global` surfaces those two buckets separately so the
     uncertainty is visible instead of buried.
+
+    Also excludes `cache_only_miss`, `budget_exceeded`, `budget_reserved` and
+    `budget_released` — see `NON_BILLABLE_PREFIXES`. They are rows for calls
+    that never reached the provider or were definitively rejected before an
+    operation was created. The multi-scene regen path looks the clip up in R2
+    and deliberately does NOT generate when it is missing (that is the whole
+    point of `cache_only` — regenerating one scene must not re-bill the
+    other N), and the per-song Veo ceiling rejects the attempt before it
+    starts. Counting either inflated both the reported cost and the ceiling
+    itself.
     """
-    return or_(
-        AIProvenance.response_summary.is_(None),
-        not_(AIProvenance.response_summary.like(f"{CACHE_HIT_PREFIX}%")),
+    return _exclude_summary_prefixes(NON_BILLABLE_PREFIXES)
+
+
+def budget_occupancy_filter(now=None):
+    """Rows occupying the rolling Veo ceiling, including live reservations.
+
+    ``budget_reserved`` is a pre-submit lease rather than spend. A worker can
+    die after reserving capacity but before calling Vertex, so only an
+    unexpired reservation may occupy the ceiling. Submitted/ambiguous calls
+    remain counted by the normal prefix filter for the full budget window.
+    """
+    if now is None:
+        now = func.now()
+    return and_(
+        _exclude_summary_prefixes(NON_BUDGET_PREFIXES),
+        or_(
+            AIProvenance.response_summary.is_(None),
+            ~AIProvenance.response_summary.like(f"{BUDGET_RESERVED_PREFIX}%"),
+            AIProvenance.reservation_expires_at > now,
+        ),
     )
 
 
@@ -639,12 +727,21 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
         db.query(func.count(AIProvenance.id))
         .filter(AIProvenance.created_at >= since)
         .filter(AIProvenance.response_summary.like("error%"))
+        # Some legacy ``error:`` summaries are confirmed pre-operation
+        # rejections and therefore excluded from spend. Keep this counter's
+        # ``_included`` contract aligned with the rows priced above.
+        .filter(billable_filter())
         .scalar() or 0
     )
     in_flight = int(
         db.query(func.count(AIProvenance.id))
         .filter(AIProvenance.created_at >= since)
-        .filter(AIProvenance.response_summary.is_(None))
+        # A recorder can carry a meaningful provisional summary
+        # (``budget_reserved``) while the provider operation is still polling.
+        # ``duration_ms`` is the durable finish marker; combine it with the
+        # same billable predicate as spend so pending/free rows stay excluded.
+        .filter(AIProvenance.duration_ms.is_(None))
+        .filter(billable_filter())
         .scalar() or 0
     )
 
@@ -937,6 +1034,7 @@ def record_ai_call(
     prompt: str,
     input_data_types: list[str] = None,
     tool_version: str = None,
+    initial_response_summary: str = None,
 ):
     """Start recording an AI call. Returns a ProvenanceRecorder.
 
@@ -953,6 +1051,7 @@ def record_ai_call(
         prompt=prompt,
         input_data_types=input_data_types,
         tool_version=tool_version,
+        initial_response_summary=initial_response_summary,
     )
 
 
@@ -1001,7 +1100,8 @@ class ProvenanceRecorder:
     """
 
     def __init__(self, job_id, step, tool_name, tool_provider, prompt,
-                 input_data_types=None, tool_version=None):
+                 input_data_types=None, tool_version=None,
+                 initial_response_summary=None):
         self.job_id = job_id
         self.step = step
         self.tool_name = tool_name
@@ -1009,6 +1109,7 @@ class ProvenanceRecorder:
         self.prompt = prompt
         self.input_data_types = input_data_types
         self.tool_version = tool_version
+        self.initial_response_summary = initial_response_summary
         self.start_time = time.time()
         self._row_id: int | None = None
         self._finished = False
@@ -1029,7 +1130,12 @@ class ProvenanceRecorder:
                 tool_version=_fit_varchar(self.tool_version, "tool_version", self.job_id),
                 prompt_sent=prompt_text,
                 prompt_hash=hashlib.sha256(prompt_text.encode()).hexdigest(),
-                response_summary=None,
+                # Some operations are known to be non-billable before the
+                # row is inserted (cache-only lookups and budget candidates).
+                # Store that state atomically so another worker never observes
+                # a transient NULL and charges it.
+                response_summary=(str(self.initial_response_summary)[:2000]
+                                  if self.initial_response_summary else None),
                 input_data_types=self.input_data_types,
                 output_artifact=None,
                 duration_ms=None,

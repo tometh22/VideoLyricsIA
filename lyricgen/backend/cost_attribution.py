@@ -45,6 +45,7 @@ from sqlalchemy import and_, func, or_
 
 from database import AIProvenance, Job
 from provenance import (
+    CACHE_HIT_PREFIX,
     DELIVERED_STATUSES,
     billable_filter,
     cost_for_record,
@@ -74,6 +75,7 @@ CI_TENANT_PATTERNS = (
 TEAM_TENANTS = frozenset({
     "genly", "default", "omg", "agus77", "tomas@epical.digital",
     "golden_render_bot",   # also CI-matched; listed for completeness
+    "__internal_samples__",  # platform-owned movement gallery generations
 })
 
 UMG_TENANT_RE = re.compile(r"universal(?:[_-][a-z0-9_-]+)?")
@@ -317,7 +319,10 @@ def collect_jobs(db, env: str, period: str | None = None,
     hits_q = (
         db.query(AIProvenance.job_id, func.count(AIProvenance.id))
         .filter(AIProvenance.job_id.in_(list(jobs)))
-        .filter(~billable_filter())
+        # Non-billable is broader than cache hit: cache-only misses, budget
+        # rejections and pending reservations are all free, but none reused an
+        # artifact or saved a generation. Count only an actual served hit.
+        .filter(AIProvenance.response_summary.like(f"{CACHE_HIT_PREFIX}%"))
     )
     if bounds:
         hits_q = hits_q.filter(AIProvenance.created_at >= bounds[0],

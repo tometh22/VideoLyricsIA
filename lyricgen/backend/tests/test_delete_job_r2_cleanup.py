@@ -242,7 +242,7 @@ def test_delete_r2_objects_keeps_input_when_db_query_throws(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Unit: delete_job calls _delete_r2_objects before DB deletion
+# Unit: delete_job cleans R2 only after the DB transaction releases its locks
 # ---------------------------------------------------------------------------
 
 
@@ -265,11 +265,39 @@ def test_delete_job_calls_r2_cleanup(monkeypatch):
     job = MagicMock()
     job.job_id = "j-cleanup-test"
     job.tenant_id = "t1"
+    job.artist = "Artist"
+    job.song_title = "Song"
     job.status = "error"
     db = _mock_db_for_job(job)
 
     jobs.delete_job(db, "j-cleanup-test", "t1")
     assert "j-cleanup-test" in cleanup_calls, "_delete_r2_objects was not called"
+
+
+def test_delete_job_commits_before_remote_r2_cleanup(monkeypatch):
+    import jobs
+
+    events = []
+    monkeypatch.setattr(
+        jobs,
+        "_archive_veo_budget_spend",
+        lambda *_args: events.append("archive"),
+    )
+    monkeypatch.setattr(
+        jobs,
+        "_delete_r2_objects",
+        lambda *_args: events.append("r2"),
+    )
+
+    job = MagicMock()
+    job.job_id = "j-order-test"
+    job.tenant_id = "t1"
+    job.status = "error"
+    db = _mock_db_for_job(job)
+    db.commit.side_effect = lambda: events.append("commit")
+
+    assert jobs.delete_job(db, "j-order-test", "t1") == (True, "ok")
+    assert events == ["archive", "commit", "r2"]
 
 
 def test_delete_job_does_not_call_r2_cleanup_for_protected_status(monkeypatch):
@@ -310,6 +338,9 @@ def test_bulk_delete_jobs_cleans_all_deletable(monkeypatch):
     def _make_row(job_id, status):
         r = MagicMock(spec=_Job)
         r.job_id = job_id
+        r.tenant_id = "t1"
+        r.artist = "Artist"
+        r.song_title = job_id
         r.status = status
         r.input_r2_key = f"inputs/{job_id}/track.wav"
         r.s3_keys = {}
@@ -325,3 +356,128 @@ def test_bulk_delete_jobs_cleans_all_deletable(monkeypatch):
     # R2 cleanup only for deletable rows (j1, j2), not protected (j3)
     assert set(cleanup_calls) == {"j1", "j2"}
     assert "j3" not in cleanup_calls
+
+
+def test_bulk_delete_archives_paid_veo_before_removing_provenance(
+    db, monkeypatch,
+):
+    import uuid
+    from datetime import datetime, timezone
+
+    import jobs
+    from cost_attribution import song_key
+    from database import AIProvenance, Job, User, VeoBudgetLedger
+    from veo_budget import scope_hash
+
+    tenant = f"bulk-ledger-{uuid.uuid4().hex[:8]}"
+    user = User(
+        username=f"bulk-ledger-user-{uuid.uuid4().hex[:8]}",
+        hashed_password="unused",
+        tenant_id=tenant,
+    )
+    db.add(user)
+    db.flush()
+    rows = [
+        Job(job_id="bulkveoled01", user_id=user.id, tenant_id=tenant,
+            artist="A", song_title="One", filename="1.mp3", status="error"),
+        Job(job_id="bulkveoled02", user_id=user.id, tenant_id=tenant,
+            artist="A", song_title="Two", filename="2.mp3", status="queued"),
+    ]
+    db.add_all(rows)
+    db.flush()
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        db.add(AIProvenance(
+            job_id=row.job_id, step="video_bg",
+            tool_name="veo-3.1-fast-generate-001",
+            tool_provider="google_vertex", prompt_sent="paid",
+            response_summary="provider_ok", created_at=now,
+        ))
+    db.commit()
+    scopes = {
+        scope_hash(tenant, song_key(row.artist, row.song_title, row.job_id))
+        for row in rows
+    }
+    monkeypatch.setattr(jobs, "_delete_r2_objects", lambda *_a, **_k: None)
+
+    try:
+        result = jobs.bulk_delete_jobs(
+            db, [row.job_id for row in rows], tenant,
+        )
+        assert set(result["deleted"]) == {row.job_id for row in rows}
+        ledger = db.query(VeoBudgetLedger).filter(
+            VeoBudgetLedger.scope_hash.in_(scopes),
+        ).all()
+        assert len(ledger) == 2
+        assert db.query(AIProvenance).filter(
+            AIProvenance.job_id.in_([row.job_id for row in rows]),
+        ).count() == 0
+    finally:
+        db.query(VeoBudgetLedger).filter(
+            VeoBudgetLedger.scope_hash.in_(scopes),
+        ).delete(synchronize_session=False)
+        db.query(AIProvenance).filter(
+            AIProvenance.job_id.in_([row.job_id for row in rows]),
+        ).delete(synchronize_session=False)
+        db.query(Job).filter(
+            Job.job_id.in_([row.job_id for row in rows]),
+        ).delete(synchronize_session=False)
+        db.query(User).filter(User.id == user.id).delete(
+            synchronize_session=False)
+        db.commit()
+
+
+def test_delete_no_archiva_reserva_veo_anterior_al_submit(db, monkeypatch):
+    """Un slot admitido durante auth no representa una llamada a Vertex."""
+    import uuid
+
+    import jobs
+    from database import AIProvenance, Job, User, VeoBudgetLedger
+    from provenance import BUDGET_RESERVED_PREFIX
+
+    suffix = uuid.uuid4().hex[:8]
+    job_id = f"predel{suffix}"[:12]
+    tenant = f"pre-submit-delete-{suffix}"
+    user = User(
+        username=f"pre-submit-user-{suffix}",
+        hashed_password="unused",
+        tenant_id=tenant,
+    )
+    db.add(user)
+    db.flush()
+    db.add(Job(
+        job_id=job_id, user_id=user.id, tenant_id=tenant,
+        artist="A", song_title="Pre Submit", filename="pre.mp3",
+        status="processing",
+    ))
+    db.flush()
+    row = AIProvenance(
+        job_id=job_id, step="video_bg",
+        tool_name="veo-3.1-fast-generate-001",
+        tool_provider="google_vertex", prompt_sent="reserved",
+        response_summary=f"{BUDGET_RESERVED_PREFIX}: admitted",
+    )
+    db.add(row)
+    db.commit()
+    row_id = row.id
+    monkeypatch.setattr(jobs, "_delete_r2_objects", lambda *_a, **_k: None)
+
+    try:
+        assert jobs.delete_job(db, job_id, tenant) == (True, "ok")
+        assert db.query(VeoBudgetLedger).filter(
+            VeoBudgetLedger.source_provenance_id == row_id,
+        ).count() == 0
+    finally:
+        db.query(VeoBudgetLedger).filter(
+            VeoBudgetLedger.source_provenance_id == row_id,
+        ).delete(synchronize_session=False)
+        db.query(AIProvenance).filter(
+            AIProvenance.job_id == job_id,
+        ).delete(synchronize_session=False)
+        db.query(Job).filter(Job.job_id == job_id).delete(
+            synchronize_session=False,
+        )
+        db.query(User).filter(User.id == user.id).delete(
+            synchronize_session=False,
+        )
+        db.commit()

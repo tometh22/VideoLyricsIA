@@ -117,6 +117,11 @@ def test_team_account_on_an_unrelated_song_is_internal_rnd():
     assert ca.classify_job(job, set()) == ca.CAT_RND
 
 
+def test_movement_gallery_samples_are_internal_rnd():
+    job = _job("sample1", "", "", "__internal_samples__", cost=0.8, calls=1)
+    assert ca.classify_job(job, set()) == ca.CAT_RND
+
+
 def test_universal_tenant_is_umg_regardless_of_song():
     """Self-service work by Universal's own users always counts, even for a
     song that never reached the portal."""

@@ -198,6 +198,31 @@ def test_scene_clips_all_fail_raises(monkeypatch, tmp_path):
         pipeline._generate_scene_clips(plan, str(tmp_path), artist="A", song_title="S")
 
 
+def test_scene_clips_propagates_ambiguous_submission(monkeypatch, tmp_path):
+    """Un POST posiblemente aceptado no puede degradar al fallback que repaga."""
+    import pytest
+    import veo_breaker
+
+    monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
+    monkeypatch.setattr(
+        pipeline,
+        "_generate_veo_video",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            pipeline.VeoAmbiguousSubmission("operation id unavailable")
+        ),
+    )
+    plan = {"scenes": [{
+        "recurrence_key": "coro_1",
+        "prompt": "p",
+        "movement_style": "x",
+    }]}
+
+    with pytest.raises(pipeline.VeoAmbiguousSubmission):
+        pipeline._generate_scene_clips(
+            plan, str(tmp_path), artist="A", song_title="S",
+        )
+
+
 def test_scene_people_authorization_is_isolated_per_scene(monkeypatch, tmp_path):
     import veo_breaker
     monkeypatch.setattr(veo_breaker, "is_open", lambda: False)

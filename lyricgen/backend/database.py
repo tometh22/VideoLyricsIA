@@ -1337,9 +1337,40 @@ class AIProvenance(Base):
     input_data_types = Column(JSONB, nullable=True)      # ["lyrics_text", "artist_name"]
     output_artifact = Column(String(500), nullable=True) # path to generated file
     duration_ms = Column(Integer, nullable=True)
+    # Only pre-submit Veo budget reservations use this lease. Once the worker
+    # crosses the provider POST boundary it is cleared and the row remains in
+    # the rolling ceiling as actual/ambiguous spend via response_summary.
+    reservation_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
 
     job = relationship("Job", back_populates="provenance")
+
+
+class VeoBudgetLedger(Base):
+    """Minimal spend tombstones that survive deletion of failed jobs.
+
+    The rolling Veo ceiling cannot depend solely on ``ai_provenance`` because
+    operators may hard-delete stuck/failed jobs and their provenance rows.
+    We retain no catalogue metadata or prompt here: ``scope_hash`` is a
+    one-way tenant+song identity and ``source_provenance_id`` only makes the
+    archival insert idempotent.
+    """
+    __tablename__ = "veo_budget_ledger"
+    __table_args__ = (
+        Index(
+            "ix_veo_budget_ledger_scope_call_at",
+            "scope_hash",
+            "provider_call_at",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    scope_hash = Column(String(64), nullable=False)
+    source_provenance_id = Column(Integer, unique=True, nullable=False)
+    provider_call_at = Column(DateTime(timezone=True), nullable=False)
+    archived_at = Column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True,
+    )
 
 
 class LyricsCache(Base):

@@ -19,7 +19,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
-def test_veo_retry_backoff_includes_jitter():
+def test_veo_safe_retry_backoff_includes_jitter():
     """Locked-in: the 429-retry sleep must vary per call. Without
     jitter, N parallel jobs that hit a 429 at the same instant retry
     in lock-step → second wave of 429s → cascade. We verify by
@@ -38,13 +38,13 @@ def test_veo_retry_backoff_includes_jitter():
     import random
 
     src = inspect.getsource(_pipeline._generate_veo_video)
-    # The fix is two random.uniform(0.8, 1.2) multipliers on the wait
-    # variable — one for the 429 path, one for the network-error path.
-    assert src.count("random.uniform") >= 2, (
-        "Expected at least 2 random.uniform calls in _generate_veo_video "
-        "(one for 429 backoff, one for network-error backoff). Source "
-        "lacks the jitter pattern."
+    # Only an explicit 429 is safe to retry: a network timeout may arrive
+    # after Vertex accepted the operation, so retrying it can double-charge.
+    assert src.count("random.uniform") >= 1, (
+        "Expected jitter on the confirmed-429 retry path."
     )
+    assert "ambiguous submission; not retrying" in src
+    assert "VeoAmbiguousSubmission" in src
     assert "0.8" in src and "1.2" in src, (
         "Jitter window expected to be ±20 % (0.8-1.2 multiplier)."
     )

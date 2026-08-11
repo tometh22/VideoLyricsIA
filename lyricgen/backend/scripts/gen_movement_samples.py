@@ -49,6 +49,7 @@ os.chdir(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ".")
 
 import pipeline  # noqa: E402
+from internal_tracking import ensure_internal_tracking_job  # noqa: E402
 
 TMP = "/tmp/movsamp"
 OUT = "../frontend/public/movement_samples"
@@ -118,11 +119,15 @@ ALL_CODES = list(VEO_PROMPTS) + list(IMAGEN_PROMPTS)
 
 def _veo_take(code: str, prompt: str, n: int) -> str:
     out = f"{TMP}/{code}_{n}.mp4"
+    tracking_job_id = ensure_internal_tracking_job(
+        f"movement-premium:{code}:{n}", style=code)
     # Distinct namespace per take → distinct cache key → a fresh generation
     # (Veo is non-deterministic), instead of the prompt-hash cache returning
     # the same clip for every take.
     pipeline._generate_veo_video(
-        prompt, out, movement_style=code, cache_namespace=f"movsamp-{code}-{n}",
+        prompt, out, job_id=tracking_job_id, movement_style=code,
+        cache_namespace=f"movsamp-{code}-{n}",
+        require_persistent_tracking=True,
     )
     return out
 
@@ -130,7 +135,11 @@ def _veo_take(code: str, prompt: str, n: int) -> str:
 def _imagen_take(code: str, prompt: str, n: int) -> str:
     img = f"{TMP}/{code}_{n}.jpg"
     out = f"{TMP}/{code}_{n}.mp4"
-    pipeline._generate_imagen_image(prompt, img, model="imagen-4.0-ultra-generate-001")
+    tracking_job_id = ensure_internal_tracking_job(
+        f"movement-premium:{code}:{n}", style=code)
+    pipeline._generate_imagen_image(
+        prompt, img, job_id=tracking_job_id,
+        model="imagen-4.0-ultra-generate-001")
     # 8s deterministic camera move over the still (1920x1080), per register.
     mode = KB_MODE.get(code, "lateral")
     pipeline._ken_burns_image_to_mp4(
