@@ -809,6 +809,48 @@ def test_lecturas_no_reviven_checkpoint_intrames_como_factura(
         db.commit()
 
 
+def test_lecturas_del_mes_abierto_son_siempre_provisionales(
+    client, admin_token, db, monkeypatch,
+):
+    """Un checkpoint sano del mes actual no es todavía una factura cerrada."""
+    import billing_sources
+    from database import CostSnapshot
+
+    period = "2099-12"
+    monkeypatch.setattr(billing_sources, "current_period", lambda: period)
+    db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+    for source in billing_sources.SOURCES:
+        db.add(CostSnapshot(
+            period=period, source=source, amount_usd=1.0, status="ok",
+            detail="captura del mes abierto", breakdown=[],
+            fetched_at=datetime(2099, 12, 15, tzinfo=timezone.utc),
+        ))
+    db.commit()
+    try:
+        real = client.get(
+            f"/admin/cost/real?period={period}", headers=auth(admin_token),
+        )
+        assert real.status_code == 200, real.text
+        body = real.json()
+        assert body["total_usd"] == 0.0
+        assert body["complete"] is False
+        assert set(body["errored"]) == set(billing_sources.SOURCES)
+        assert all(row["status"] == "provisional" for row in body["sources"])
+        assert all(row["retained_amount_usd"] == 1.0 for row in body["sources"])
+
+        unit = client.get(
+            f"/admin/cost/unit-economics?period={period}",
+            headers=auth(admin_token),
+        )
+        assert unit.status_code == 200, unit.text
+        assert unit.json()["real_cost_usd"] == 0.0
+        assert unit.json()["cost_complete"] is False
+        assert set(unit.json()["missing_sources"]) == set(billing_sources.SOURCES)
+    finally:
+        db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+        db.commit()
+
+
 def test_primer_refresh_maduro_finaliza_snapshot_provisional(
     client, admin_token, db, monkeypatch,
 ):
@@ -1039,11 +1081,15 @@ def test_refresh_rechaza_fuentes_desconocidas(client, admin_token, db):
     ).count()
 
 
-def test_cost_real_ignora_snapshot_desconocido(client, admin_token, db):
+def test_cost_real_ignora_snapshot_desconocido(
+    client, admin_token, db, monkeypatch,
+):
     import billing_sources
     from database import CostSnapshot
 
     period = "2098-11"
+    monkeypatch.setattr(billing_sources, "current_period", lambda: "2099-12")
+    monkeypatch.setattr(billing_sources, "snapshot_is_final", lambda *args: True)
     db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
     for source in billing_sources.SOURCES:
         db.add(CostSnapshot(period=period, source=source, amount_usd=1.0,

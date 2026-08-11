@@ -695,6 +695,33 @@ def test_github_acepta_ciclo_pago_alineado_al_mes(monkeypatch):
     assert result.amount_usd == 0.16
 
 
+def test_github_cero_tambien_exige_ciclo_alineado_al_mes(monkeypatch):
+    """$0 del ciclo 15→15 no demuestra que todo el mes haya sido gratis."""
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "included_minutes": 100,
+                "total_minutes_used": 0,
+                "total_paid_minutes_used": 0,
+            }
+
+    monkeypatch.setenv("GITHUB_BILLING_TOKEN", "ghp_fake")
+    monkeypatch.setenv("GITHUB_BILLING_USER", "alguien")
+    monkeypatch.setenv("GITHUB_BILLING_CYCLE_DAY", "15")
+    monkeypatch.setattr(billing_sources.requests, "get", lambda *a, **k: _Resp())
+
+    result = billing_sources.fetch_github(billing_sources.current_period())
+    assert result.status == "error"
+    assert result.amount_usd is None
+    assert result.breakdown[0]["observed_cycle_amount_usd"] == 0.0
+    assert "cruza meses calendario" in result.detail
+
+
 def test_github_checkpoint_temprano_no_se_vuelve_final_por_esperar():
     """Sólo una captura en el borde del mes puede cerrar el ciclo alineado."""
     from datetime import datetime, timezone

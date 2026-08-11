@@ -814,15 +814,14 @@ def _cost_snapshot_is_usable(period: str, row, billing_sources) -> bool:
     """Whether a stored amount may be treated as a complete invoice.
 
     An ``ok`` row captured while a month was still accruing is a useful
-    checkpoint, but it is not a closed-month invoice.  Keep accepting healthy
-    snapshots for an open period (where every total is necessarily
-    provisional); for a closed month require the source-specific post-close
-    capture boundary used by ``/cost/refresh``.
+    checkpoint, but it is not a closed-month invoice.  Open-period snapshots
+    are therefore always provisional; for a closed month require the
+    source-specific post-close capture boundary used by ``/cost/refresh``.
     """
     if row.status != "ok" or row.amount_usd is None:
         return False
     if period >= billing_sources.current_period():
-        return True
+        return False
     return billing_sources.snapshot_is_final(
         period, row.source, row.fetched_at,
     )
