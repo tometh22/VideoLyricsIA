@@ -970,6 +970,46 @@ def test_el_waste_usa_las_tarifas_que_le_pasan(db, monkeypatch):
     assert leidas == [], "con `rates` explícitas no puede leer la suya"
 
 
+def test_margin_reusa_tarifas_para_el_desperdicio(db, monkeypatch):
+    """El dashboard no debe volver a leer un año de calibraciones dentro
+    del subreporte de desperdicio."""
+    import provenance
+
+    lecturas = []
+    rates = {"2026-08": {"veo": 0.62}}
+    monkeypatch.setattr(
+        provenance,
+        "rates_for_window",
+        lambda *_args, **_kwargs: lecturas.append(1) or rates,
+    )
+
+    provenance.cost_dashboard_global(db, since_days=30)
+
+    assert lecturas == [1]
+
+
+def test_resumen_tenant_acepta_tarifas_precargadas(db, monkeypatch):
+    """Permite que /admin/cost cargue calibraciones una sola vez para todos
+    los tenants, en vez de repetir meses por tenant."""
+    import provenance
+
+    monkeypatch.setattr(
+        provenance,
+        "rates_for_window",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("no debe releer calibraciones")
+        ),
+    )
+
+    out = provenance.tenant_cost_summary(
+        db,
+        tenant_id="rates-precargadas",
+        rates={"2026-08": {"veo": 0.62}},
+    )
+
+    assert out["tenant_id"] == "rates-precargadas"
+
+
 # ---------------------------------------------------------------------------
 # 13. Los cache hits también se acotan al período
 # ---------------------------------------------------------------------------

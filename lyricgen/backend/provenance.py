@@ -574,6 +574,7 @@ def tenant_cost_summary(
     db: Session,
     tenant_id: str,
     since_days: int = 30,
+    rates: dict | None = None,
 ) -> dict:
     """Summarize AI cost for one tenant over the last `since_days` days.
 
@@ -589,7 +590,10 @@ def tenant_cost_summary(
     Joins AIProvenance with Job to filter by tenant_id.
     """
     since = datetime.now(timezone.utc) - timedelta(days=since_days)
-    _rates = rates_for_window(db, since)
+    # A caller rendering several tenants can load the monthly calibration
+    # once and pass it to every summary.  Without this, /admin/cost issues
+    # one query per month *per tenant*.
+    _rates = rates if rates is not None else rates_for_window(db, since)
     rate_year, rate_month = _provenance_month_columns()
 
     rows = (
@@ -1014,7 +1018,11 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
             "in_flight_included": in_flight,
         },
         # Where the money actually went. See cost_waste_breakdown().
-        "waste": cost_waste_breakdown(db, since_days=since_days),
+        "waste": cost_waste_breakdown(
+            db,
+            since_days=since_days,
+            rates=_rates,
+        ),
     }
 
 

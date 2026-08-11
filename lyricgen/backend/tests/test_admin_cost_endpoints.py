@@ -11,6 +11,11 @@ Contract these lock down:
   $1.15/video; the honest number over the 65 that shipped is $3.07.
 """
 
+import os
+from pathlib import Path
+import subprocess
+import sys
+
 from tests.conftest import auth
 
 
@@ -360,7 +365,9 @@ def test_cost_reports_run_blocking_queries_in_threadpool():
     """Plain ``def`` makes FastAPI keep remote SQLAlchemy I/O off the loop."""
     import inspect
     from admin import (
+        admin_cost_dashboard,
         admin_cost_business,
+        admin_margin_dashboard,
         admin_cost_rates,
         admin_cost_reconcile,
         admin_tenant_cost,
@@ -370,6 +377,8 @@ def test_cost_reports_run_blocking_queries_in_threadpool():
     )
 
     assert not inspect.iscoroutinefunction(admin_cost_umg)
+    assert not inspect.iscoroutinefunction(admin_cost_dashboard)
+    assert not inspect.iscoroutinefunction(admin_margin_dashboard)
     assert not inspect.iscoroutinefunction(admin_cost_business)
     assert not inspect.iscoroutinefunction(admin_cost_unit_economics)
     assert not inspect.iscoroutinefunction(admin_cost_reconcile)
@@ -429,6 +438,35 @@ def test_umg_endpoint_truncates_song_detail(client, admin_token):
 # ---------------------------------------------------------------------------
 # Pool hygiene
 # ---------------------------------------------------------------------------
+
+def test_peer_reuses_deliveries_pool_when_urls_match():
+    """Staging uses the production DB for both deliveries and attribution.
+    Import in a subprocess so the environment-specific engines cannot leak
+    into the test suite's already-imported database module."""
+    env = os.environ.copy()
+    env["DATABASE_URL"] = "postgresql://local:local@127.0.0.1/local"
+    env["DELIVERIES_DATABASE_URL"] = (
+        "postgresql://peer:peer@127.0.0.1/production"
+    )
+    env.pop("PEER_DATABASE_URL", None)
+    backend_dir = Path(__file__).resolve().parents[1]
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import database; "
+            "assert database.peer_engine is database.deliveries_engine; "
+            "assert database.PeerSessionLocal is database.DeliveriesSessionLocal",
+        ],
+        cwd=backend_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 def test_cost_endpoints_do_not_leak_db_sessions(client, admin_token):
     """These endpoints open sessions the framework does NOT manage — the
