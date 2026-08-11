@@ -878,18 +878,28 @@ def fetch_replicate(period: str) -> SourceCost:
     except Exception as e:
         return SourceCost("replicate", period, status="error", detail=str(e))
 
-    # Never label a capped subtotal as a complete monthly bill.  A healthy
-    # post-close result may be frozen forever, so a remaining cursor must
-    # stay incomplete and preserve any previous snapshot at the caller.
-    if url and not stop:
+    # Never label an unproven subtotal as a complete monthly bill. A healthy
+    # post-close result may be frozen forever. A remaining cursor proves the
+    # page cap truncated the scan; exhausting the provider history without
+    # crossing `start_dt` is also incomplete because old Replicate history may
+    # already have aged out. Only an observed prediction before the requested
+    # month proves that the whole calendar window was traversed.
+    if not stop:
+        if url:
+            detail = (
+                "paginación de Replicate truncada después de "
+                f"{pages_fetched} páginas; queda un cursor pendiente"
+            )
+        else:
+            detail = (
+                "el historial disponible de Replicate terminó sin alcanzar "
+                "el inicio del período; el subtotal puede estar incompleto"
+            )
         return SourceCost(
             "replicate",
             period,
             status="error",
-            detail=(
-                "paginación de Replicate truncada después de "
-                f"{pages_fetched} páginas; queda un cursor pendiente"
-            ),
+            detail=detail,
             raw={"pages_fetched": pages_fetched, "next": url},
         )
 
