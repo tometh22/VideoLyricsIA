@@ -340,6 +340,22 @@ def test_reserva_borrada_cancela_veo_incluso_en_fail_open(db, monkeypatch):
         pipeline._veo_budget_exceeded(job_id, own_row_id=row_id)
 
 
+@pytest.mark.parametrize("limit", [10, 0])
+def test_job_borrado_antes_del_worker_cancela_veo(db, monkeypatch, limit):
+    """Un SELECT sano sin parent es cancelación, con o sin ceiling activo."""
+    import pipeline
+    from database import AIProvenance, Job
+
+    job_id = "budmissingparent"
+    db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete()
+    db.query(Job).filter(Job.job_id == job_id).delete()
+    db.commit()
+
+    monkeypatch.setattr(pipeline, "VEO_MAX_CALLS_PER_SONG", limit)
+    with pytest.raises(pipeline.VeoTrackingUnavailable, match="Job disappeared"):
+        pipeline._veo_budget_exceeded(job_id)
+
+
 def test_cancelacion_de_tracking_no_reintenta_ni_cae_a_otro_veo():
     import inspect
     import pipeline
@@ -979,7 +995,9 @@ def test_veo_fresco_rechaza_un_job_id_sin_fila_persistente(monkeypatch):
         lambda: provider_touched.append(True) or "token")
     monkeypatch.setattr(pipeline, "_last_veo_request", 0)
 
-    with pytest.raises(RuntimeError, match="persistent tracking Job"):
+    with pytest.raises(
+        pipeline.VeoTrackingUnavailable, match="Job disappeared"
+    ):
         pipeline._generate_veo_video(
             "prompt", "/tmp/untracked-veo.mp4", job_id="not-a-realjob",
             require_persistent_tracking=True)

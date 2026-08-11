@@ -9556,19 +9556,6 @@ def _veo_budget_exceeded(job_id: str | None,
         raise VeoTrackingUnavailable(
             "Persistent Veo budget tracking requires a provenance row"
         )
-    # Diagnostic callers do not own a provenance row, so disabling the cap is
-    # a true no-op for them. Provider submissions do pass ``own_row_id`` and
-    # still need to transition that row to a billable in-flight state below.
-    if VEO_MAX_CALLS_PER_SONG <= 0 and own_row_id is None:
-        return False, 0
-    if VEO_MAX_CALLS_PER_SONG <= 0:
-        marked = _mark_veo_reservation_billable(
-            own_row_id, "ceiling disabled")
-        if require_persistent_tracking and not marked:
-            raise VeoTrackingUnavailable(
-                f"Could not persist Veo reservation row={own_row_id}"
-            )
-        return False, 0
     try:
         from datetime import datetime as _dt, timedelta, timezone as _tz
         from sqlalchemy import func as _func, text as _sql_text
@@ -9581,11 +9568,34 @@ def _veo_budget_exceeded(job_id: str | None,
         try:
             row = (db.query(Job.artist, Job.song_title, Job.tenant_id)
                      .filter(Job.job_id == job_id).one_or_none())
-            artist = (row[0] if row else "") or ""
-            title = (row[1] if row else "") or ""
-            tenant = (row[2] if row else "") or ""
+            if row is None:
+                # The query itself succeeded, so this is not a transient DB
+                # outage eligible for fail-open. The operator deleted the job
+                # before its worker reached Veo; no paid provider call may
+                # outlive that cancellation. This check intentionally runs
+                # even when the ceiling is disabled.
+                raise VeoTrackingUnavailable(
+                    f"Veo Job disappeared before reservation job_id={job_id}"
+                )
+            artist = (row[0] or "")
+            title = (row[1] or "")
+            tenant = (row[2] or "")
             mio = _song_identity(artist, title, job_id)
             budget_scope = scope_hash(tenant, mio)
+
+            # Diagnostic callers do not own a provenance row, so disabling the
+            # cap is a true no-op after the parent-existence check. Provider
+            # submissions still transition their row to a billable state.
+            if VEO_MAX_CALLS_PER_SONG <= 0 and own_row_id is None:
+                return False, 0
+            if VEO_MAX_CALLS_PER_SONG <= 0:
+                marked = _mark_veo_reservation_billable(
+                    own_row_id, "ceiling disabled")
+                if require_persistent_tracking and not marked:
+                    raise VeoTrackingUnavailable(
+                        f"Could not persist Veo reservation row={own_row_id}"
+                    )
+                return False, 0
 
             # Cross-process serialization in production. Deletions take this
             # same lock while atomically moving spend from live provenance to
