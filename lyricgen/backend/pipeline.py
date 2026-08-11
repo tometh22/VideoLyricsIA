@@ -9531,12 +9531,21 @@ def _song_identity(artist: str | None, title: str | None,
         return f"{a}|{t}"
 
 
-def _mark_veo_reservation_billable(row_id: int | None, reason: str) -> bool:
-    """Best-effort pending -> reserved transition in a fresh transaction."""
+def _mark_veo_reservation_admitted(row_id: int | None, reason: str) -> bool:
+    """Best-effort pending -> admitted transition in a fresh transaction."""
     from provenance import BUDGET_RESERVED_PREFIX
     return _persist_veo_reservation_summary(
         row_id,
         f"{BUDGET_RESERVED_PREFIX}: {str(reason)[:1900]}",
+    )
+
+
+def _mark_veo_submission_started(row_id: int | None) -> bool:
+    """Persist the billable boundary immediately before the provider POST."""
+    from provenance import BUDGET_SUBMITTED_PREFIX
+    return _persist_veo_reservation_summary(
+        row_id,
+        f"{BUDGET_SUBMITTED_PREFIX}: provider POST boundary entered",
     )
 
 
@@ -9602,6 +9611,15 @@ class _VeoSubmissionGuard:
                     "Veo job or reservation disappeared before provider "
                     f"submission job_id={self.job_id} row={self.row_id}"
                 )
+            # Deletion now waits on the per-job lock. Mark the precise
+            # external side-effect boundary durably before touching Vertex;
+            # an earlier `budget_reserved` row only occupied capacity and
+            # must never be archived as a paid call.
+            if not _mark_veo_submission_started(self.row_id):
+                raise VeoTrackingUnavailable(
+                    "Could not persist Veo submission boundary "
+                    f"job_id={self.job_id} row={self.row_id}"
+                )
             return self
         except VeoTrackingUnavailable:
             self.db.rollback()
@@ -9637,15 +9655,18 @@ def _veo_budget_exceeded(job_id: str | None,
     La fila propia nace como `budget_pending` (no facturable). En PostgreSQL,
     todos los workers de un mismo tenant+canción serializan count+reserva con
     `pg_advisory_xact_lock`; si hay cupo, la fila cambia a
-    `budget_reserved` ANTES de soltar el lock. Esto evita contar la llamada
+    `budget_reserved` ANTES de soltar el lock. Esta reserva ocupa capacidad
+    aunque todavía no sea gasto; `budget_submitted` recién se escribe bajo el
+    guard final inmediatamente antes del POST. Esto evita contar la llamada
     propia y evita admitir dos escenas cuando queda un solo lugar. Un id de
     secuencia no alcanza: PostgreSQL puede asignarlo antes del commit y hacer
     visibles las transacciones en otro orden.
 
     Suma todos los jobs que comparten `artista|título` dentro de la ventana,
     así una edición o un re-render no estrenan presupuesto. Cuenta sobre
-    `ai_provenance` con el mismo `billable_filter()` que factura el panel, de
-    modo que el tope y el reporte no puedan divergir. Los cache hits no
+    `ai_provenance` con `budget_occupancy_filter()`: coincide con la
+    facturación salvo por `budget_reserved`, que ocupa un lugar contra
+    carreras concurrentes aunque todavía no sea gasto. Los cache hits no
     cuentan: no se pagan.
 
     Si el job no tiene artista ni título (previews sin metadata), cae a
@@ -9668,7 +9689,10 @@ def _veo_budget_exceeded(job_id: str | None,
         from sqlalchemy import func as _func, text as _sql_text
 
         from database import AIProvenance, Job, SessionLocal, VeoBudgetLedger
-        from provenance import BUDGET_RESERVED_PREFIX, billable_filter
+        from provenance import (
+            BUDGET_RESERVED_PREFIX,
+            budget_occupancy_filter,
+        )
         from veo_budget import advisory_lock_key, scope_hash
 
         db = SessionLocal()
@@ -9696,7 +9720,7 @@ def _veo_budget_exceeded(job_id: str | None,
             if VEO_MAX_CALLS_PER_SONG <= 0 and own_row_id is None:
                 return False, 0
             if VEO_MAX_CALLS_PER_SONG <= 0:
-                marked = _mark_veo_reservation_billable(
+                marked = _mark_veo_reservation_admitted(
                     own_row_id, "ceiling disabled")
                 if require_persistent_tracking and not marked:
                     raise VeoTrackingUnavailable(
@@ -9721,16 +9745,16 @@ def _veo_budget_exceeded(job_id: str | None,
             since = _dt.now(_tz.utc) - timedelta(days=VEO_BUDGET_WINDOW_DAYS)
             q = (db.query(_func.count(AIProvenance.id))
                    .filter(AIProvenance.tool_name.like("veo%"))
-                   .filter(billable_filter()))
+                   .filter(budget_occupancy_filter()))
 
             if not mio.startswith("__sin_metadata__|"):
-                # Sólo los jobs con actividad de Veo PAGA en la ventana pueden
-                # ser hermanos. Arrancar por ahí en vez de por la tabla `jobs`
-                # entera acota el escaneo a lo que puede sumar al tope.
+                # Sólo los jobs con actividad de Veo que ocupa presupuesto en
+                # la ventana pueden ser hermanos. Arrancar por ahí en vez de
+                # la tabla `jobs` entera acota el escaneo a lo relevante.
                 con_gasto = [r[0] for r in
                              db.query(AIProvenance.job_id)
                                .filter(AIProvenance.tool_name.like("veo%"))
-                               .filter(billable_filter())
+                               .filter(budget_occupancy_filter())
                                .filter(AIProvenance.created_at >= since)
                                .distinct().all()]
                 # El presupuesto es POR TENANT: sin este filtro, dos clientes
@@ -9813,7 +9837,7 @@ def _veo_budget_exceeded(job_id: str | None,
         # Delivery remains fail-open, but a provider POST follows immediately.
         # Retry the state transition in a fresh transaction so a later worker
         # crash cannot leave paid spend hidden as `budget_pending`.
-        marked = _mark_veo_reservation_billable(
+        marked = _mark_veo_reservation_admitted(
             own_row_id, f"budget check failed; fail-open: {exc}")
         if require_persistent_tracking and not marked:
             raise VeoTrackingUnavailable(

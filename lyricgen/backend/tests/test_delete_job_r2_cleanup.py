@@ -399,3 +399,59 @@ def test_bulk_delete_archives_paid_veo_before_removing_provenance(
         db.query(User).filter(User.id == user.id).delete(
             synchronize_session=False)
         db.commit()
+
+
+def test_delete_no_archiva_reserva_veo_anterior_al_submit(db, monkeypatch):
+    """Un slot admitido durante auth no representa una llamada a Vertex."""
+    import uuid
+
+    import jobs
+    from database import AIProvenance, Job, User, VeoBudgetLedger
+    from provenance import BUDGET_RESERVED_PREFIX
+
+    suffix = uuid.uuid4().hex[:8]
+    job_id = f"predel{suffix}"[:12]
+    tenant = f"pre-submit-delete-{suffix}"
+    user = User(
+        username=f"pre-submit-user-{suffix}",
+        hashed_password="unused",
+        tenant_id=tenant,
+    )
+    db.add(user)
+    db.flush()
+    db.add(Job(
+        job_id=job_id, user_id=user.id, tenant_id=tenant,
+        artist="A", song_title="Pre Submit", filename="pre.mp3",
+        status="processing",
+    ))
+    db.flush()
+    row = AIProvenance(
+        job_id=job_id, step="video_bg",
+        tool_name="veo-3.1-fast-generate-001",
+        tool_provider="google_vertex", prompt_sent="reserved",
+        response_summary=f"{BUDGET_RESERVED_PREFIX}: admitted",
+    )
+    db.add(row)
+    db.commit()
+    row_id = row.id
+    monkeypatch.setattr(jobs, "_delete_r2_objects", lambda *_a, **_k: None)
+
+    try:
+        assert jobs.delete_job(db, job_id, tenant) == (True, "ok")
+        assert db.query(VeoBudgetLedger).filter(
+            VeoBudgetLedger.source_provenance_id == row_id,
+        ).count() == 0
+    finally:
+        db.query(VeoBudgetLedger).filter(
+            VeoBudgetLedger.source_provenance_id == row_id,
+        ).delete(synchronize_session=False)
+        db.query(AIProvenance).filter(
+            AIProvenance.job_id == job_id,
+        ).delete(synchronize_session=False)
+        db.query(Job).filter(Job.job_id == job_id).delete(
+            synchronize_session=False,
+        )
+        db.query(User).filter(User.id == user.id).delete(
+            synchronize_session=False,
+        )
+        db.commit()

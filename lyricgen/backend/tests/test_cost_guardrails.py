@@ -293,7 +293,7 @@ def test_tracking_requerido_falla_antes_de_veo_si_no_puede_reservar(
 
     monkeypatch.setattr("database.SessionLocal", BrokenSession)
     monkeypatch.setattr(
-        pipeline, "_mark_veo_reservation_billable", lambda *_a, **_k: False,
+        pipeline, "_mark_veo_reservation_admitted", lambda *_a, **_k: False,
     )
     monkeypatch.setattr(pipeline, "VEO_MAX_CALLS_PER_SONG", 10)
 
@@ -559,6 +559,29 @@ def test_el_post_de_veo_revalida_cancelacion_despues_del_token():
 
     jobs_source = inspect.getsource(__import__("jobs")._archive_veo_budget_spend)
     assert "submission_lock_key" in jobs_source
+
+
+def test_reserva_admitida_ocupa_tope_pero_no_es_gasto():
+    """La ventana auth/delete necesita capacidad sin inventar una llamada."""
+    from provenance import (
+        BUDGET_RESERVED_PREFIX,
+        budget_occupancy_filter,
+        billable_filter,
+    )
+
+    billable_sql = str(billable_filter().compile(
+        compile_kwargs={"literal_binds": True},
+    ))
+    budget_sql = str(budget_occupancy_filter().compile(
+        compile_kwargs={"literal_binds": True},
+    ))
+    assert BUDGET_RESERVED_PREFIX in billable_sql
+    assert BUDGET_RESERVED_PREFIX not in budget_sql
+
+    import inspect
+    import pipeline
+    guard_source = inspect.getsource(pipeline._VeoSubmissionGuard.__enter__)
+    assert "_mark_veo_submission_started" in guard_source
 
 
 def test_el_guard_de_submit_serializa_el_delete_en_postgres(db, monkeypatch):

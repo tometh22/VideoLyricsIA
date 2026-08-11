@@ -199,9 +199,15 @@ BUDGET_PENDING_PREFIX = "budget_pending"
 # from both spend and the per-song ceiling.
 BUDGET_RELEASED_PREFIX = "budget_released"
 # Once admitted, the same row is marked reserved before the database lock is
-# released. This state is intentionally billable: a worker crash after
-# admission may still correspond to an upstream call.
+# released. It occupies a budget slot so concurrent workers cannot overspend,
+# but is not billable yet: token acquisition and the final cancellation guard
+# still happen before the provider sees a request.
 BUDGET_RESERVED_PREFIX = "budget_reserved"
+# The final cancellation guard has been acquired and the worker is crossing
+# the external side-effect boundary. From here an interrupted/ambiguous POST
+# may have created a paid operation, so deletion and cost reporting preserve
+# the row conservatively as spend.
+BUDGET_SUBMITTED_PREFIX = "budget_submitted"
 # Exact summary written by the legacy Veo retry loop after five explicit 429
 # responses. Vertex rejected every attempt before creating an operation, so
 # these historical rows are confirmed zero-cost (unlike generic ``error:``
@@ -216,8 +222,27 @@ NON_BILLABLE_PREFIXES = (
     BUDGET_EXCEEDED_PREFIX,
     BUDGET_PENDING_PREFIX,
     BUDGET_RELEASED_PREFIX,
+    BUDGET_RESERVED_PREFIX,
     LEGACY_CONFIRMED_RATE_LIMIT_PREFIX,
 )
+
+# Atomic budget occupancy differs from actual billing by one state: admitted
+# pre-submit reservations must block another worker, but must not become cost
+# or a deletion tombstone until the submission boundary is crossed.
+NON_BUDGET_PREFIXES = tuple(
+    prefix for prefix in NON_BILLABLE_PREFIXES
+    if prefix != BUDGET_RESERVED_PREFIX
+)
+
+
+def _exclude_summary_prefixes(prefixes):
+    return and_(*[
+        or_(
+            AIProvenance.response_summary.is_(None),
+            not_(AIProvenance.response_summary.like(f"{prefix}%")),
+        )
+        for prefix in prefixes
+    ])
 
 
 def billable_filter():
@@ -230,24 +255,22 @@ def billable_filter():
     `cost_dashboard_global` surfaces those two buckets separately so the
     uncertainty is visible instead of buried.
 
-    Also excludes `cache_only_miss`, `budget_exceeded` and
+    Also excludes `cache_only_miss`, `budget_exceeded`, `budget_reserved` and
     `budget_released` — see `NON_BILLABLE_PREFIXES`. They are rows for calls
     that never reached the provider or were definitively rejected before an
-    operation was created. The
-    provider: the multi-scene regen path looks the clip up in R2 and
-    deliberately does NOT generate when it is missing (that is the whole
+    operation was created. The multi-scene regen path looks the clip up in R2
+    and deliberately does NOT generate when it is missing (that is the whole
     point of `cache_only` — regenerating one scene must not re-bill the
     other N), and the per-song Veo ceiling rejects the attempt before it
     starts. Counting either inflated both the reported cost and the ceiling
     itself.
     """
-    return and_(*[
-        or_(
-            AIProvenance.response_summary.is_(None),
-            not_(AIProvenance.response_summary.like(f"{prefix}%")),
-        )
-        for prefix in NON_BILLABLE_PREFIXES
-    ])
+    return _exclude_summary_prefixes(NON_BILLABLE_PREFIXES)
+
+
+def budget_occupancy_filter():
+    """Rows occupying the rolling Veo ceiling, including reservations."""
+    return _exclude_summary_prefixes(NON_BUDGET_PREFIXES)
 
 
 # Job statuses that represent a video we can actually invoice. Mirrors

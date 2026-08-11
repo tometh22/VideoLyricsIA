@@ -148,6 +148,7 @@ def test_row_quality_incluye_reservas_veo_sin_finalizar(db):
         BUDGET_PENDING_PREFIX,
         BUDGET_RELEASED_PREFIX,
         BUDGET_RESERVED_PREFIX,
+        BUDGET_SUBMITTED_PREFIX,
         cost_dashboard_global,
     )
 
@@ -155,11 +156,12 @@ def test_row_quality_incluye_reservas_veo_sin_finalizar(db):
         "in_flight_included"]
     _job(db, "inflight1", "done", tenant="inflight-quality")
     for summary, duration in (
-        (f"{BUDGET_RESERVED_PREFIX}: song=a|s", None),  # billable + active
-        (None, None),                                  # legacy active row
-        ("provider_ok", 1200),                         # finished
-        (BUDGET_PENDING_PREFIX, None),                 # free candidate
-        (BUDGET_RELEASED_PREFIX, None),                # confirmed free
+        (f"{BUDGET_RESERVED_PREFIX}: song=a|s", None),  # admitted, pre-POST
+        (BUDGET_SUBMITTED_PREFIX, None),                # billable + active
+        (None, None),                                   # legacy active row
+        ("provider_ok", 1200),                          # finished
+        (BUDGET_PENDING_PREFIX, None),                  # free candidate
+        (BUDGET_RELEASED_PREFIX, None),                 # confirmed free
     ):
         db.add(AIProvenance(
             job_id="inflight1", step="video_bg",
