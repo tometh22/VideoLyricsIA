@@ -21,6 +21,16 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+def test_download_offloads_blocking_prores_readiness_check():
+    import inspect
+    import main
+
+    source = inspect.getsource(main.download)
+    readiness = source.index("check_prores_readiness, job_id")
+    offload = source.rindex("await asyncio.to_thread(", 0, readiness)
+    assert offload < readiness
+
+
 @pytest.fixture
 def fake_outputs(tmp_path, monkeypatch):
     """Point prores.OUTPUTS_DIR at a fresh tmp dir."""
@@ -58,6 +68,54 @@ def test_readiness_returns_ready_r2_when_s3_key_present(fake_outputs):
         tenant_id="t",
     )
     assert res.state == prores.ProResReadiness.READY_R2
+
+
+def test_readiness_invalidates_lifecycle_expired_prores(fake_outputs, monkeypatch):
+    """A confirmed R2 404 must fall through to 202/re-transcode."""
+    import jobs
+    import prores
+    import storage
+
+    removed = []
+    monkeypatch.setattr(storage, "object_status", lambda _key: "missing")
+    monkeypatch.setattr(
+        jobs, "remove_s3_keys",
+        lambda job_id, file_types: removed.append((job_id, file_types)) or True,
+    )
+    res = prores.check_prores_readiness(
+        "expired1",
+        "umg_master",
+        _job(s3_keys={
+            "umg_master": "tenant/expired1/umg_master.mov",
+            "video": "tenant/expired1/lyric_video.mp4",
+        }),
+        tenant_id="t",
+    )
+    assert res.state == prores.ProResReadiness.NOT_STARTED
+    assert removed == [("expired1", ["umg_master"])]
+
+
+def test_readiness_preserves_key_when_r2_head_is_unavailable(
+    fake_outputs, monkeypatch,
+):
+    """A timeout/403 is not proof lifecycle deleted the object."""
+    import jobs
+    import prores
+    import storage
+
+    removed = []
+    monkeypatch.setattr(storage, "object_status", lambda _key: "unavailable")
+    monkeypatch.setattr(
+        jobs, "remove_s3_keys",
+        lambda *args: removed.append(args) or True,
+    )
+    res = prores.check_prores_readiness(
+        "r2maybe", "umg_master",
+        _job(s3_keys={"umg_master": "tenant/r2maybe/umg_master.mov"}),
+        tenant_id="t",
+    )
+    assert res.state == prores.ProResReadiness.READY_R2
+    assert removed == []
 
 
 def test_readiness_returns_misconfigured_when_no_umg_spec(fake_outputs):

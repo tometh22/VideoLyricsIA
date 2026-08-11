@@ -472,6 +472,69 @@ _DELETABLE_STATUSES = {
 }
 
 
+def _archive_veo_budget_spend(db: Session, job_rows: list[Job]) -> None:
+    """Preserve paid Veo usage before deleting its owning job/provenance.
+
+    The inserts share the deletion transaction. If archival cannot be made
+    durable, the job is not deleted: silently resetting a paid ceiling is a
+    worse failure mode than asking the operator to retry cleanup.
+    """
+    from cost_attribution import song_key
+    from database import AIProvenance, VeoBudgetLedger
+    from provenance import billable_filter
+    from sqlalchemy import text as sql_text
+    from veo_budget import advisory_lock_key, scope_hash, submission_lock_key
+
+    if not job_rows:
+        return
+    jobs_by_id = {job.job_id: job for job in job_rows}
+    scopes_by_job = {
+        job.job_id: scope_hash(
+            job.tenant_id,
+            song_key(job.artist, job.song_title, job.job_id),
+        )
+        for job in job_rows
+    }
+    # Keep the two-statement live+ledger read in _veo_budget_exceeded from
+    # straddling this transaction's move and briefly counting every call
+    # twice. Sorted acquisition also prevents two overlapping bulk deletions
+    # from deadlocking when they touch the same scopes in a different order.
+    bind = getattr(db, "bind", None)
+    dialect = getattr(getattr(bind, "dialect", None), "name", "")
+    if dialect == "postgresql":
+        lock_keys = {
+            advisory_lock_key(digest)
+            for digest in scopes_by_job.values()
+        }
+        # A worker takes the same per-job lock for the final existence check
+        # and keeps it until Vertex answers the submission request. If delete
+        # wins while auth is running, the worker observes the committed delete
+        # and aborts; if submission already started, deletion waits until its
+        # billable reservation is safe to archive.
+        lock_keys.update(
+            submission_lock_key(job.tenant_id, job.job_id)
+            for job in job_rows
+        )
+        for lock_key in sorted(lock_keys):
+            db.execute(
+                sql_text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": lock_key},
+            )
+    paid_rows = (
+        db.query(AIProvenance)
+        .filter(AIProvenance.job_id.in_(list(jobs_by_id)))
+        .filter(AIProvenance.tool_name.like("veo%"))
+        .filter(billable_filter())
+        .all()
+    )
+    for row in paid_rows:
+        db.add(VeoBudgetLedger(
+            scope_hash=scopes_by_job[row.job_id],
+            source_provenance_id=row.id,
+            provider_call_at=row.created_at or datetime.now(timezone.utc),
+        ))
+
+
 def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
     """Hard-delete a job row owned by `tenant_id`. Returns (ok, reason).
 
@@ -493,10 +556,17 @@ def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
         return False, "not_found"
     if job.status not in _DELETABLE_STATUSES:
         return False, f"protected_status:{job.status}"
-    _delete_r2_objects(db, job)
+    _archive_veo_budget_spend(db, [job])
     db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete(synchronize_session=False)
     db.delete(job)
     db.commit()
+
+    # R2 is remote, best-effort I/O.  The archive helper above may hold
+    # advisory locks that serialize a Veo submission for this song/job; never
+    # keep those transaction locks while waiting on object-storage timeouts.
+    # The committed delete also makes the sibling check see exactly the jobs
+    # that still reference the input audio.
+    _delete_r2_objects(db, job)
     return True, "ok"
 
 
@@ -537,6 +607,7 @@ def bulk_delete_jobs(db: Session, job_ids: list[str], tenant_id: str) -> dict:
         deletable_set = set(deletable_ids)
         r2_rows = [r for r in rows if r.job_id in deletable_set]
 
+        _archive_veo_budget_spend(db, r2_rows)
         db.query(AIProvenance).filter(AIProvenance.job_id.in_(deletable_ids)).delete(synchronize_session=False)
         db.query(Job).filter(Job.tenant_id == tenant_id, Job.job_id.in_(deletable_ids)).delete(synchronize_session=False)
         db.commit()

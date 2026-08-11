@@ -64,6 +64,21 @@ from background_policy import (
 logger = logging.getLogger("genly.bg_preview")
 
 
+_DISABLED_FLAG_VALUES = frozenset({"0", "false", "off", "no"})
+
+
+def bg_preview_enabled() -> bool:
+    """Return whether background pre-generation may spend provider credits.
+
+    This check intentionally lives in the worker module so the HTTP enqueue
+    guard and already-queued RQ jobs share one interpretation of the flag.
+    """
+    return (
+        os.environ.get("BG_PREVIEW_ENABLED", "1").strip().lower()
+        not in _DISABLED_FLAG_VALUES
+    )
+
+
 # Campos del request que entran al hash. Determinístico — JSON con keys
 # ordenadas para que el mismo dict en distinto orden produzca el mismo key.
 # Si agregamos params futuros que afecten el background, sumarlos acá +
@@ -225,9 +240,38 @@ def run_bg_preview_job(
     set_job_log_context(job_id)
     from jobs import update_job
 
+    # The API guard prevents new work, but a deploy can leave paid previews
+    # waiting in Redis.  Re-check at the spend boundary so flipping the
+    # kill-switch also drains that backlog without calling Veo/Imagen.
+    if not bg_preview_enabled():
+        logger.info(
+            "[BG_PREVIEW] job=%s skipped: BG_PREVIEW_ENABLED is disabled",
+            job_id,
+        )
+        # Keep the established terminal status so existing pollers stop
+        # immediately; current_step + the RQ result preserve that this was
+        # intentionally skipped rather than generated/cached. Do not swallow
+        # DB failures here: production RQ has Retry(max=2), and acknowledging
+        # success without this terminal write strands the UI in queued state.
+        update_job(
+            job_id,
+            status="bg_preview_done",
+            current_step="disabled",
+            error=None,
+        )
+        return {
+            "job_id": job_id,
+            "status": "bg_preview_done",
+            "bg_cache_key": bg_cache_key,
+            "cached": False,
+            "skipped": True,
+            "reason": "disabled",
+        }
+
     # New API requests carry the authenticated tenant in this internal field.
     # Resolve it from the ghost job as a compatibility fallback for previews
-    # that were queued immediately before a deploy.
+    # that were queued immediately before a deploy. This must happen before
+    # recomputing the cache key or generating the background.
     params = dict(params)
     if not params.get("_tenant_id"):
         try:
@@ -329,6 +373,7 @@ def run_bg_preview_job(
             # namespace. Never turn the preview tracker into a rejected video.
             bg_path = None
             for safety_attempt in range(2):
+                generation_meta = {}
                 try:
                     candidate = _ensure_background(
                         params.get("style", "auto"),
@@ -348,6 +393,20 @@ def run_bg_preview_job(
                         bg_verbatim=bool(params.get("bg_verbatim", False)),
                         bg_mode=params.get("background_mode", "veo"),
                         custom_colors=params.get("custom_colors", ""),
+                        # `effect` ENTRA al hash del cache (ver el dict
+                        # canónico de compute_bg_cache_key) pero no se pasaba
+                        # acá, mientras que el render sí lo pasa. O sea que
+                        # preview y render generaban cosas distintas bajo la
+                        # MISMA clave: el preview quedaba cacheado como si
+                        # fuera el fondo del render y nunca lo era.
+                        #
+                        # Impacto hoy = $0 (601 de 647 jobs tienen `effect`
+                        # vacío y no hay `foto_viva` desde junio), pero es un
+                        # camino de envenenamiento de cache latente: con
+                        # `foto_viva` el render fuerza Imagen mientras el
+                        # preview quemaba Veo, ~17x más caro, para un asset
+                        # que además nunca se puede reusar.
+                        effect=params.get("effect", ""),
                         allow_people=_compute_allow_people(
                             job_id, params.get("background_hint")
                         ),
@@ -355,6 +414,7 @@ def run_bg_preview_job(
                             f"preview-{job_id}-{safety_attempt}"
                             if safety_attempt else ""
                         ),
+                        out_meta=generation_meta,
                     )
                 except Exception as generation_error:
                     _raise_if_job_timeout(generation_error)
@@ -363,6 +423,15 @@ def run_bg_preview_job(
                         job_id, safety_attempt + 1, generation_error,
                     )
                     continue
+                if generation_meta.get("provider_fallback"):
+                    logger.warning(
+                        "[BG_PREVIEW] job=%s provider fallback=%s — no se "
+                        "valida ni cachea bajo key=%s",
+                        job_id,
+                        generation_meta.get("fallback_reason", "unknown"),
+                        bg_cache_key,
+                    )
+                    break
                 if not candidate or not os.path.exists(candidate):
                     continue
                 if _validate_background_asset_for_job(

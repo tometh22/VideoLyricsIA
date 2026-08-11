@@ -73,6 +73,34 @@ dashboards.
 - **`watchPatterns`** keep the Worker from redeploying on frontend-only changes — don't remove.
 - **No native canary / percentage rollout** — staging soak is the substitute. For true canary/blue-green/SLO-driven auto-rollback you'd need a traffic proxy or a flag service (LaunchDarkly/Flagsmith); that's a separate investment, relevant around the ~50-user scale inflection.
 
+### Veo cost-control rollout (schema + locking protocol)
+
+The per-song ceiling changes both the database schema and the delete/submit
+locking protocol. It must not ship as one ordinary rolling deploy:
+
+1. Merge/deploy the additive schema release first (#1084). Wait until its API
+   migration logs show Alembic at head and `/health/ready` reports one coherent
+   release. Do not start #1085 while #1084 is still rolling.
+2. Keep `VEO_MAX_CALLS_PER_SONG=0` and `VEO_BUDGET_TENANTS=` while deploying
+   #1085. At those values the new ceiling/reservation protocol is not entered.
+3. Before enabling the control, pause submissions through
+   `PUT /admin/ops/submissions`, wait for `/admin/queue` to be empty, and do not
+   delete jobs. Restart API, Worker and ShortWorker with the same variables;
+   wait for `/health/ready` to confirm that no old replica remains.
+4. Enable one tenant only, for example:
+
+   ```env
+   VEO_MAX_CALLS_PER_SONG=10
+   VEO_BUDGET_TENANTS=universal_argentina
+   ```
+
+   Audit the previous 30 days of incomplete/legacy provenance before this
+   flip. Keep submissions paused until every service has the same effective
+   configuration, then reopen and run one canary render.
+5. Widen `VEO_BUDGET_TENANTS` only after the canary. `*` means all tenants;
+   an empty value is the fail-safe rollback and the cap remains zero by
+   default in code.
+
 ---
 
 ## Sequencing the stability tiers

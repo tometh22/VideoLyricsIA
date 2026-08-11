@@ -22,9 +22,18 @@ google-genai>=1.40.0,<2.0.0
 google-api-python-client>=2.0.0,<3.0.0
 google-auth>=2.0.0,<3.0.0
 requests>=2.28.0,<3.0.0
-diffusers>=0.27.0,<1.0.0
+# transformers: lo usa ctc_align.py (AutoModelForCTC + Wav2Vec2CTCTokenizer)
+# para el alineador de timing. safetensors entra como dependencia suya y se
+# pinea acá sólo para fijar la versión.
+#
+# Sacados en ago-2026 tras verificar 0 imports en todo el repo:
+#   - diffusers: nunca se usó. Quedó de una prueba de generación de imágenes
+#     local que no llegó a producción; Imagen/Veo corren en Vertex.
+#   - accelerate: sólo hace falta para `device_map` / `low_cpu_mem_usage`, y
+#     ctc_align carga el modelo con `from_pretrained()` plano (ctc_align.py:701).
+# Entre las dos son ~200 MB de imagen que se construían y deployaban en cada
+# push sin que ningún camino de código las tocara.
 transformers>=4.38.0,<5.0.0
-accelerate>=0.27.0,<2.0.0
 safetensors>=0.4.0,<1.0.0
 # --- SaaS infrastructure ---
 sqlalchemy>=2.0.0,<3.0.0

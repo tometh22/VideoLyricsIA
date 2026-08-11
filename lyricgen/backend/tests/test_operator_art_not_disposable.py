@@ -165,6 +165,15 @@ def test_still_background_uses_static_not_kenburns():
         "la rama quieta NO debe llamar al Ken Burns"
     )
 
+    # LYRIC_RENDER_ENGINE=moviepy and the supported libass fallback must keep
+    # the same intent. The helper can render a truly static image, but only if
+    # this call forwards the flag.
+    moviepy_path = src[src.find("# --- moviepy composite path"):]
+    assert "static=still_background" in moviepy_path, (
+        "el fallback MoviePy debe mantener quieta la imagen; de otro modo "
+        "master y short pueden divergir"
+    )
+
 
 def test_still_background_wired_from_both_pipelines():
     """Creación y edición deben pasar la señal, o un edit pierde el 'quieta'."""

@@ -152,3 +152,22 @@ def test_input_factory_called_fresh_each_attempt(monkeypatch):
     assert out == {"ok": True}
     assert factory_calls[0] == 3
     assert [i["id"] for i in seen_inputs] == [1, 2, 3]
+
+
+def test_input_factory_failure_falls_back_instead_of_raising(monkeypatch):
+    """Un temporal borrado/EMFILE mantiene el contrato `Never raises`."""
+    monkeypatch.setattr(
+        "replicate.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("sin input no se llama a Replicate")
+        ),
+    )
+
+    out = forced_align._call_with_budget(
+        "m",
+        lambda: (_ for _ in ()).throw(OSError("Too many open files")),
+        total_budget_s=10,
+        backoff=[0],
+    )
+
+    assert out is None

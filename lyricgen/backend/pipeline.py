@@ -1466,6 +1466,40 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     _scenes_active = True
                     update_job(job_id, scene_plan=_scene_plan)
                     logger.info("[SCENES] timeline multi-escena listo para job=%s", job_id)
+                except VeoAmbiguousSubmission as e:
+                    # At least one paid scene operation may exist without an
+                    # id we can poll. Skip the normal single-background path,
+                    # which would submit a duplicate, and finish with a fully
+                    # local visual instead.
+                    logger.error(
+                        "[SCENES] envío ambiguo para job=%s (%s) — "
+                        "fallback determinístico sin otro proveedor",
+                        job_id, e,
+                    )
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style,
+                        filename="bg_scene_ambiguous_fallback.mp4",
+                    )
+                    _background_is_ai_generated = False
+                    _background_is_deterministic_fallback = True
+                    _scenes_active = False
+                except VeoTrackingUnavailable as e:
+                    # The operator deleted/cancelled the processing job before
+                    # its pending reservation became billable. Never fall
+                    # through to the single-background provider path: it would
+                    # create a second untracked submission attempt.
+                    logger.info(
+                        "[SCENES] tracking cancelado para job=%s (%s) — "
+                        "fallback determinístico sin otro proveedor",
+                        job_id, e,
+                    )
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style,
+                        filename="bg_scene_cancelled_fallback.mp4",
+                    )
+                    _background_is_ai_generated = False
+                    _background_is_deterministic_fallback = True
+                    _scenes_active = False
                 except Exception as e:  # noqa: BLE001
                     _raise_if_job_timeout(e)
                     logger.error("[SCENES] multi-escena falló para job=%s (%s) — "
@@ -8918,17 +8952,7 @@ Hard rules:
                 job_id, sorted(set(observed)),
             )
 
-    full_prompt = f"system:{system_prompt}\nuser:{user_content}"
-
-    recorder = record_ai_call(
-        job_id=job_id or "unknown",
-        step="lyrics_analysis",
-        tool_name="gemini-2.5-flash",
-        tool_provider="google_vertex",
-        prompt=full_prompt,
-        input_data_types=["artist_name", "lyrics_text_600chars"],
-    ) if job_id else None
-
+    recorder = None
     try:
         # Corrective re-roll for the noir-urban-alley cliché. The system
         # prompt already instructs against alleys, but Gemini ignores that
@@ -8975,6 +8999,18 @@ Hard rules:
                     if policy_enforces(atmospherics_policy) else {}
                 ),
             )
+            # One provenance row per provider attempt. The corrective alley
+            # re-roll below is a second billed Gemini call, not merely local
+            # post-processing, so a recorder outside this loop undercounted
+            # the denominator used by invoice-derived rates.
+            recorder = record_ai_call(
+                job_id=job_id or "unknown",
+                step="lyrics_analysis",
+                tool_name="gemini-2.5-flash",
+                tool_provider="google_vertex",
+                prompt=f"system:{_sys_instr}\nuser:{user_content}",
+                input_data_types=["artist_name", "lyrics_text_1800chars"],
+            ) if job_id else None
             # Quota-aware wrapper (2026-07-24): a single 429/RESOURCE_EXHAUSTED
             # used to abort the whole analysis and drop to the fallback prompt.
             # Retries 429s with backoff; TimeoutError still propagates raw.
@@ -9017,6 +9053,13 @@ Hard rules:
                                 "with hard-negative. genre=%s job=%s",
                                 _attempt, normalized_genre or 'auto', job_id,
                             )
+                            if recorder:
+                                recorder.finish(
+                                    response_summary=(
+                                        f"attempt={_attempt} corrective_alley_retry "
+                                        + text[:440]
+                                    )
+                                )
                             continue  # re-roll with the anti-alley addendum
                         logger.warning(
                             "[BG][ALLEY-BIAS PERSISTENT] re-roll still chose alley; "
@@ -9028,6 +9071,10 @@ Hard rules:
                     return {"style": style, "prompt": prompt}
             # Parse failed this attempt. If attempts remain, the loop retries
             # (a re-roll often parses cleanly); otherwise fall through.
+            if recorder:
+                recorder.finish(
+                    response_summary=f"attempt={_attempt} parse_failed: {text[:420]}"
+                )
 
         # All attempts exhausted without a usable parse.
         finish_reason = "unknown"
@@ -9040,8 +9087,6 @@ Hard rules:
             pass
         logger.warning("[BG] Failed to parse Gemini JSON, using combinatorial fallback. "
                        "raw_len=%s finish_reason=%s", len(text), finish_reason)
-        if recorder:
-            recorder.finish(response_summary=f"parse_failed: {text[:200]}")
         return {"style": "video", "prompt": None}
 
     except Exception as e:
@@ -9255,6 +9300,744 @@ def _veo_cache_key(prompt: str, model: str, params: dict) -> str:
     return _hash.sha256(payload.encode()).hexdigest()[:16]
 
 
+class VeoBudgetExceeded(RuntimeError):
+    """Una canción pidió más generaciones de Veo que el tope configurado.
+
+    Los tres llamadores de `_generate_veo_video` ya envuelven la llamada en
+    try/except con fallback (gradiente o reintento), así que esto frena el
+    gasto sin romper la entrega."""
+
+
+class VeoAmbiguousSubmission(RuntimeError):
+    """Vertex may have accepted a paid operation whose id we cannot recover.
+
+    Callers must fall back without another submission: retrying at either the
+    HTTP layer or the outer background layer can duplicate a billable render.
+    """
+
+
+class VeoTrackingUnavailable(RuntimeError):
+    """A paid call cannot proceed without durable budget/provenance state."""
+
+
+def _veo_http_failure_is_ambiguous(status_code: int) -> bool:
+    """HTTP failures that may arrive after Vertex accepted the operation."""
+    return status_code == 408 or 500 <= status_code <= 599
+
+
+# Tope de generaciones PAGAS de Veo POR CANCIÓN. Medido en jul-2026: en prod,
+# 12 jobs (el 10%) se comieron el **42,8%** del gasto de Veo, y uno solo llegó
+# a 26 llamadas — unos $16 en un video que se vende a $8. Un job sano usa 1-3.
+#
+# El presupuesto es por CANCIÓN, no por job, y la diferencia importa: una
+# edición o un re-render crean un job NUEVO, así que un tope por job se
+# esquiva solo. Una canción que pasa por 5 ediciones a 10 llamadas cada una
+# gasta 50 sin que ningún tope se entere. Se cuenta sobre todos los jobs que
+# comparten `artista|título` normalizado — la misma identidad que usa
+# `cost_attribution`, así que el tope y el reporte de costos hablan de la
+# misma unidad.
+#
+# La ventana de `VEO_BUDGET_WINDOW_DAYS` evita que una canción rendereada
+# hace meses bloquee un re-render legítimo de hoy.
+#
+# El default es APAGADO: activar un techo cambia el entregable cuando una
+# canción lo alcanza, así que producción debe pasar explícitamente por shadow
+# y canary después de auditar las filas históricas. Un valor inicial razonable
+# para ese canary es 10; bajarlo a 4-6 puede cortar storyboards multi-escena
+# legítimos.
+#
+# CORRECCIÓN (ago-2026): una versión anterior de este comentario decía que
+# los reintentos re-pagan Veo "porque el prompt sale con temperature=0.8 y
+# cambia el hash". Es FALSO y no estaba verificado: no existe ningún
+# temperature=0.8 en el código (los prompts se generan con 0.0-0.1), y
+# `queue_jobs.py` documenta que las fallas de Veo caen al gradient fallback
+# sin re-lanzar, así que el Retry de RQ NO reintenta Veo. El re-pago real
+# viene de los re-rolls y de `policy-recovery`, que fuerza cache miss.
+#
+# `VEO_MAX_CALLS_PER_SONG=0` lo desactiva.
+VEO_MAX_CALLS_PER_SONG = int(
+    os.environ.get("VEO_MAX_CALLS_PER_SONG",
+                   # Nombre viejo, para no romper entornos ya configurados.
+                   os.environ.get("VEO_MAX_CALLS_PER_JOB", "0"))
+)
+VEO_BUDGET_TENANTS = frozenset(
+    tenant.strip()
+    for tenant in os.environ.get("VEO_BUDGET_TENANTS", "*").split(",")
+    if tenant.strip()
+)
+VEO_BUDGET_WINDOW_DAYS = int(os.environ.get("VEO_BUDGET_WINDOW_DAYS", "30"))
+# A reservation only bridges the budget decision, auth lookup and final POST
+# guard. If a worker dies in that gap it must not consume a slot for 30 days.
+# Ten minutes is deliberately much longer than normal token acquisition while
+# still recovering capacity promptly after a deploy/OOM/SIGKILL.
+VEO_RESERVATION_LEASE_SECONDS = max(
+    30, int(os.environ.get("VEO_RESERVATION_LEASE_SECONDS", "600")),
+)
+
+
+def _veo_budget_enforced_for_job(job_id: str | None) -> bool:
+    """Whether the paid ceiling protocol is active for this job.
+
+    The numerical cap defaults to zero, so deploying the code is behaviorally
+    inert.  ``VEO_BUDGET_TENANTS`` permits a one-tenant canary before widening
+    to ``*``.  When no tenant is allowlisted, even an accidentally configured
+    positive cap remains off.
+    """
+    if VEO_MAX_CALLS_PER_SONG <= 0 or not VEO_BUDGET_TENANTS:
+        return False
+    if "*" in VEO_BUDGET_TENANTS:
+        return True
+    if not job_id:
+        return False
+
+    try:
+        from database import Job, SessionLocal
+
+        db = SessionLocal()
+        try:
+            row = db.query(Job.tenant_id).filter(Job.job_id == job_id).one_or_none()
+        finally:
+            db.close()
+    except Exception as exc:
+        # Same fail-open posture as the existing budget query. Provenance still
+        # records the call; an observability outage cannot stop delivery.
+        logger.warning(
+            "[BG][BUDGET] no pude resolver tenant para canary job=%s: %r",
+            job_id,
+            exc,
+        )
+        return False
+
+    if row is None:
+        raise VeoTrackingUnavailable(
+            f"Veo Job disappeared before budget canary lookup job_id={job_id}"
+        )
+    return (row[0] or "") in VEO_BUDGET_TENANTS
+
+
+def _discard_provenance_row(recorder) -> None:
+    """Borra la fila in-flight de una llamada que nunca se hizo.
+
+    Nunca levanta: si el borrado falla, se cierra la fila con un resumen que
+    la deja fuera del conteo igual (`cache_hit`-prefijado no sirve acá porque
+    miente sobre el origen, así que se marca y se acepta el ruido).
+    """
+    row_id = getattr(recorder, "_row_id", None)
+    if row_id is None:
+        recorder._finished = True
+        return
+    try:
+        from database import AIProvenance, SessionLocal
+        db = SessionLocal()
+        try:
+            db.query(AIProvenance).filter(AIProvenance.id == row_id).delete(
+                synchronize_session=False)
+            db.commit()
+        finally:
+            db.close()
+        recorder._finished = True
+    except Exception as exc:
+        logger.warning("[BG][BUDGET] no pude borrar la fila %s: %r", row_id, exc)
+        recorder.finish(response_summary="budget_exceeded: no se generó nada")
+
+
+def _persist_veo_reservation_summary(
+    row_id: int | None,
+    summary: str,
+    *,
+    duration_ms: int | None = None,
+    reservation_expires_at=None,
+) -> bool:
+    """Verified provenance UPDATE in a fresh transaction."""
+    if row_id is None:
+        return False
+    from database import AIProvenance, SessionLocal
+
+    db = None
+    try:
+        db = SessionLocal()
+        values = {
+            "response_summary": str(summary)[:2000],
+            "reservation_expires_at": reservation_expires_at,
+        }
+        if duration_ms is not None:
+            values["duration_ms"] = max(0, int(duration_ms))
+        updated = (
+            db.query(AIProvenance)
+            .filter(AIProvenance.id == row_id)
+            .update(
+                values,
+                synchronize_session=False,
+            )
+        )
+        if not updated:
+            db.rollback()
+            return False
+        db.commit()
+        return True
+    except Exception as exc:
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        logger.warning(
+            "[BG][BUDGET] no pude actualizar reserva fila=%s: %r",
+            row_id, exc,
+        )
+        return False
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+def _delete_provenance_row_by_id(row_id: int | None) -> bool:
+    """Verified fresh-transaction delete for a known zero-cost attempt."""
+    if row_id is None:
+        return False
+    from database import AIProvenance, SessionLocal
+
+    db = None
+    try:
+        db = SessionLocal()
+        deleted = (
+            db.query(AIProvenance)
+            .filter(AIProvenance.id == row_id)
+            .delete(synchronize_session=False)
+        )
+        if not deleted:
+            db.rollback()
+            return False
+        db.commit()
+        return True
+    except Exception as exc:
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        logger.warning(
+            "[BG][BUDGET] no pude borrar reserva libre fila=%s: %r",
+            row_id, exc,
+        )
+        return False
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+def _release_veo_reservation(recorder, reason: str) -> bool:
+    """Close a reserved row as free after a definite provider rejection.
+
+    Unlike an exception raised by ``requests.post`` (ambiguous: Vertex may
+    have accepted the operation), an HTTP rejection or a pre-POST failure
+    proves there is no billable generation behind the reservation. Keep the
+    row for audit, but exclude it from spend and the per-song ceiling. The
+    generic recorder marks itself finished before knowing whether its UPDATE
+    committed, so this path uses verified fresh transactions instead. If all
+    UPDATE retries fail, deleting the definitely-free row is safer than
+    leaving a false paid reservation behind.
+    """
+    if recorder is None:
+        return False
+    from provenance import BUDGET_RELEASED_PREFIX
+    row_id = getattr(recorder, "_row_id", None)
+    if row_id is None:
+        recorder._finished = True
+        return False
+    summary = f"{BUDGET_RELEASED_PREFIX}: {str(reason)[:1900]}"
+    finished_at = time.time()
+    duration_ms = int(max(
+        0.0, finished_at - getattr(recorder, "start_time", finished_at)
+    ) * 1000)
+    for _attempt in range(3):
+        if _persist_veo_reservation_summary(
+            row_id, summary, duration_ms=duration_ms,
+        ):
+            recorder._finished = True
+            return True
+    if _delete_provenance_row_by_id(row_id):
+        recorder._finished = True
+        logger.error(
+            "[BG][BUDGET] reserva libre fila=%s borrada tras fallar UPDATE; "
+            "se preserva el tope aunque se pierde el detalle de rechazo",
+            row_id,
+        )
+        return True
+    # Do not claim success: callers that require persistent tracking must see
+    # this as an infrastructure failure, and the object remains retryable.
+    recorder._finished = False
+    raise VeoTrackingUnavailable(
+        f"Could not release definitely-free Veo reservation row={row_id}"
+    )
+
+
+def _pause_veo_reservation_for_retry(recorder, reason: str) -> None:
+    """Make a confirmed rejection non-billable between submit attempts.
+
+    Unlike ``_release_veo_reservation``, this does not finish the recorder:
+    the same audit row will be atomically reserved again immediately before
+    the next POST. A delete during auth/backoff can therefore remove the free
+    row without archiving phantom spend into the tombstone ledger.
+    """
+    from provenance import BUDGET_RELEASED_PREFIX
+
+    row_id = getattr(recorder, "_row_id", None)
+    if row_id is None:
+        # The normal delivery path is deliberately fail-open when the initial
+        # provenance INSERT never succeeded. Persistent callers are rejected
+        # earlier; there is no row to pause between confirmed 429 retries.
+        return
+    if not _persist_veo_reservation_summary(
+        row_id, f"{BUDGET_RELEASED_PREFIX}: {str(reason)[:1900]}",
+    ):
+        raise VeoTrackingUnavailable(
+            f"Could not pause rejected Veo reservation row={row_id}"
+        )
+
+
+def _song_identity(artist: str | None, title: str | None,
+                   job_id: str | None = None) -> str:
+    """Identidad de canción, IDÉNTICA a `cost_attribution.song_key`.
+
+    Tiene que colapsar los espacios internos igual que aquella: comparando
+    con `lower(trim(...))` en SQL, "La  Argentinidad" y "La Argentinidad"
+    quedaban como canciones distintas, así que corregir la metadata de un job
+    le estrenaba presupuesto. Se delega en la función de verdad para que no
+    puedan divergir.
+
+    `job_id` NO es opcional en la práctica: `song_key` lo usa para desambiguar
+    las identidades degeneradas (sin metadata, o el placeholder
+    `preview|preview` que escribe `/generate-preview`). Sin pasarlo, TODOS
+    esos jobs colapsan en `__sin_metadata__|desconocido` y comparten un único
+    tope de 10 llamadas para siempre — el tope se agota globalmente y corta
+    previews de canciones que no tienen nada que ver entre sí.
+    """
+    try:
+        from cost_attribution import song_key
+        return song_key(artist, title, job_id)
+    except Exception:
+        import re as _re
+        a = _re.sub(r"\s+", " ", (artist or "").strip().lower())
+        t = _re.sub(r"\s+", " ", (title or "").strip().lower())
+        if not a and not t:
+            return f"__sin_metadata__|{job_id or 'desconocido'}"
+        return f"{a}|{t}"
+
+
+def _mark_veo_reservation_admitted(row_id: int | None, reason: str) -> bool:
+    """Best-effort pending -> admitted transition in a fresh transaction."""
+    from datetime import datetime, timedelta, timezone
+
+    from provenance import BUDGET_RESERVED_PREFIX
+    return _persist_veo_reservation_summary(
+        row_id,
+        f"{BUDGET_RESERVED_PREFIX}: {str(reason)[:1900]}",
+        reservation_expires_at=(
+            datetime.now(timezone.utc)
+            + timedelta(seconds=VEO_RESERVATION_LEASE_SECONDS)
+        ),
+    )
+
+
+def _mark_veo_submission_started(row_id: int | None) -> bool:
+    """Persist the billable boundary immediately before the provider POST."""
+    from provenance import BUDGET_SUBMITTED_PREFIX
+    return _persist_veo_reservation_summary(
+        row_id,
+        f"{BUDGET_SUBMITTED_PREFIX}: provider POST boundary entered",
+    )
+
+
+class _VeoSubmissionGuard:
+    """Serialize budget/cancellation checks with one provider POST.
+
+    Token acquisition deliberately happens before entering this guard. That
+    gives an operator deletion requested during slow auth a chance to commit.
+    Once entered, the budget-scope and per-job PostgreSQL advisory locks are
+    held by this read transaction until the HTTP request returns;
+    delete_job/bulk_delete_jobs take the matching locks before removing the
+    Job and its provenance.
+    """
+
+    def __init__(self, job_id: str, row_id: int | None,
+                 require_persistent_tracking: bool = False):
+        self.job_id = job_id
+        self.row_id = row_id
+        self.require_persistent_tracking = require_persistent_tracking
+        self.db = None
+
+    def __enter__(self):
+        from sqlalchemy import func as _sql_func, text as _sql_text
+
+        from database import AIProvenance, Job, SessionLocal
+        from provenance import BUDGET_RESERVED_PREFIX
+        from veo_budget import advisory_lock_key, scope_hash, submission_lock_key
+
+        self.db = SessionLocal()
+        try:
+            # This first read only discovers the immutable tenant component of
+            # the lock. The authoritative existence checks happen after lock
+            # acquisition, in a fresh READ COMMITTED statement snapshot.
+            tenant_row = (
+                self.db.query(Job.artist, Job.song_title, Job.tenant_id)
+                .filter(Job.job_id == self.job_id)
+                .one_or_none()
+            )
+            if tenant_row is None:
+                raise VeoTrackingUnavailable(
+                    f"Veo Job disappeared before submission job_id={self.job_id}"
+                )
+            artist, title, tenant_id = tenant_row
+            tenant_id = tenant_id or ""
+            budget_scope = scope_hash(
+                tenant_id,
+                _song_identity(artist, title, self.job_id),
+            )
+            bind = getattr(self.db, "bind", None)
+            dialect = getattr(getattr(bind, "dialect", None), "name", "")
+            if dialect == "postgresql":
+                # Deletion acquires this same sorted pair. The budget lock
+                # prevents another worker from ignoring an expired lease
+                # while this guard converts it to submitted spend.
+                lock_keys = {
+                    advisory_lock_key(budget_scope),
+                    submission_lock_key(tenant_id, self.job_id),
+                }
+                for lock_key in sorted(lock_keys):
+                    self.db.execute(
+                        _sql_text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                        {"lock_key": lock_key},
+                    )
+            # PostgreSQL now() is fixed at transaction start, before a
+            # potentially long advisory-lock wait. clock_timestamp() is
+            # evaluated by the statement after both locks are held, so a
+            # lease that expired while waiting cannot still authorize a POST.
+            lease_clock = (
+                _sql_func.clock_timestamp()
+                if dialect == "postgresql"
+                else _sql_func.now()
+            )
+
+            job_exists = (
+                self.db.query(Job.job_id)
+                .filter(Job.job_id == self.job_id)
+                .one_or_none()
+            )
+            reservation_exists = None
+            active_reservation = None
+            if self.row_id is not None:
+                reservation_exists = (
+                    self.db.query(AIProvenance.id)
+                    .filter(
+                        AIProvenance.id == self.row_id,
+                        AIProvenance.job_id == self.job_id,
+                    )
+                    .one_or_none()
+                )
+                active_reservation = (
+                    self.db.query(AIProvenance.id)
+                    .filter(
+                        AIProvenance.id == self.row_id,
+                        AIProvenance.job_id == self.job_id,
+                        AIProvenance.response_summary.like(
+                            f"{BUDGET_RESERVED_PREFIX}%"
+                        ),
+                        AIProvenance.reservation_expires_at > lease_clock,
+                    )
+                    .one_or_none()
+                )
+            if job_exists is None:
+                raise VeoTrackingUnavailable(
+                    "Veo job disappeared before provider submission "
+                    f"job_id={self.job_id}"
+                )
+            if self.row_id is None:
+                if self.require_persistent_tracking:
+                    raise VeoTrackingUnavailable(
+                        "Persistent Veo submission requires provenance "
+                        f"job_id={self.job_id}"
+                    )
+                # Provenance INSERT failed before any row id existed. This is
+                # the documented normal-delivery fail-open mode, distinct
+                # from a known reservation id that deletion removed.
+                return self
+            if reservation_exists is None:
+                raise VeoTrackingUnavailable(
+                    "Veo reservation disappeared before provider submission "
+                    f"job_id={self.job_id} row={self.row_id}"
+                )
+            if active_reservation is None:
+                raise VeoTrackingUnavailable(
+                    "Veo reservation expired or became inactive before "
+                    f"provider submission job_id={self.job_id} row={self.row_id}"
+                )
+            # Deletion now waits on the per-job lock. Mark the precise
+            # external side-effect boundary durably before touching Vertex;
+            # an earlier `budget_reserved` row only occupied capacity and
+            # must never be archived as a paid call.
+            if not _mark_veo_submission_started(self.row_id):
+                raise VeoTrackingUnavailable(
+                    "Could not persist Veo submission boundary "
+                    f"job_id={self.job_id} row={self.row_id}"
+                )
+            return self
+        except VeoTrackingUnavailable:
+            self.db.rollback()
+            self.db.close()
+            self.db = None
+            raise
+        except Exception as exc:
+            self.db.rollback()
+            self.db.close()
+            self.db = None
+            raise VeoTrackingUnavailable(
+                "Could not verify Veo cancellation state before provider "
+                f"submission job_id={self.job_id} row={self.row_id}"
+            ) from exc
+
+    def __exit__(self, exc_type, exc, traceback):
+        if self.db is not None:
+            try:
+                # Read-only transaction: rollback releases the xact lock.
+                self.db.rollback()
+            finally:
+                self.db.close()
+                self.db = None
+        return False
+
+
+def _veo_budget_exceeded(job_id: str | None,
+                         own_row_id: int | None = None,
+                         require_persistent_tracking: bool = False,
+                         ) -> tuple[bool, int]:
+    """Reserva atómicamente un lugar de Veo para la canción del job.
+
+    La fila propia nace como `budget_pending` (no facturable). En PostgreSQL,
+    todos los workers de un mismo tenant+canción serializan count+reserva con
+    `pg_advisory_xact_lock`; si hay cupo, la fila cambia a
+    `budget_reserved` ANTES de soltar el lock. Esta reserva ocupa capacidad
+    aunque todavía no sea gasto; `budget_submitted` recién se escribe bajo el
+    guard final inmediatamente antes del POST. Esto evita contar la llamada
+    propia y evita admitir dos escenas cuando queda un solo lugar. Un id de
+    secuencia no alcanza: PostgreSQL puede asignarlo antes del commit y hacer
+    visibles las transacciones en otro orden.
+
+    Suma todos los jobs que comparten `artista|título` dentro de la ventana,
+    así una edición o un re-render no estrenan presupuesto. Cuenta sobre
+    `ai_provenance` con `budget_occupancy_filter()`: coincide con la
+    facturación salvo por un `budget_reserved` cuyo lease siga vigente, que
+    ocupa un lugar contra carreras concurrentes aunque todavía no sea gasto.
+    Una reserva abandonada vence y deja de bloquear; el guard final impide
+    que su worker haga POST después de vencer. Los cache hits no cuentan: no
+    se pagan.
+
+    Si el job no tiene artista ni título (previews sin metadata), cae a
+    contar sólo ese job — es lo más ajustado que se puede hacer sin una
+    identidad de canción.
+
+    Por defecto nunca levanta: si la consulta falla, deja pasar la generación.
+    Los callers internos que declaran ``require_persistent_tracking`` son la
+    excepción: fallan antes del proveedor si no se pudo confirmar la reserva,
+    porque una llamada paga invisible viola el contrato de esos scripts.
+    """
+    if not job_id:
+        return False, 0
+    if require_persistent_tracking and own_row_id is None:
+        raise VeoTrackingUnavailable(
+            "Persistent Veo budget tracking requires a provenance row"
+        )
+    try:
+        from datetime import datetime as _dt, timedelta, timezone as _tz
+        from sqlalchemy import func as _func, text as _sql_text
+
+        from database import AIProvenance, Job, SessionLocal, VeoBudgetLedger
+        from provenance import (
+            BUDGET_RESERVED_PREFIX,
+            budget_occupancy_filter,
+        )
+        from veo_budget import advisory_lock_key, scope_hash
+
+        db = SessionLocal()
+        try:
+            row = (db.query(Job.artist, Job.song_title, Job.tenant_id)
+                     .filter(Job.job_id == job_id).one_or_none())
+            if row is None:
+                # The query itself succeeded, so this is not a transient DB
+                # outage eligible for fail-open. The operator deleted the job
+                # before its worker reached Veo; no paid provider call may
+                # outlive that cancellation. This check intentionally runs
+                # even when the ceiling is disabled.
+                raise VeoTrackingUnavailable(
+                    f"Veo Job disappeared before reservation job_id={job_id}"
+                )
+            artist = (row[0] or "")
+            title = (row[1] or "")
+            tenant = (row[2] or "")
+            mio = _song_identity(artist, title, job_id)
+            budget_scope = scope_hash(tenant, mio)
+
+            # Diagnostic callers do not own a provenance row, so disabling the
+            # cap is a true no-op after the parent-existence check. Provider
+            # submissions still transition their row to a billable state.
+            if VEO_MAX_CALLS_PER_SONG <= 0 and own_row_id is None:
+                return False, 0
+            if VEO_MAX_CALLS_PER_SONG <= 0:
+                marked = _mark_veo_reservation_admitted(
+                    own_row_id, "ceiling disabled")
+                if require_persistent_tracking and not marked:
+                    raise VeoTrackingUnavailable(
+                        f"Could not persist Veo reservation row={own_row_id}"
+                    )
+                return False, 0
+
+            # Cross-process serialization in production. Deletions take this
+            # same lock while atomically moving spend from live provenance to
+            # the tombstone ledger. Diagnostic/preflight reads also lock so
+            # their separate live+ledger SELECTs cannot straddle that move and
+            # briefly double-count it. SQLite is used by the local suite and
+            # serializes its writes independently.
+            bind = getattr(db, "bind", None)
+            dialect = getattr(getattr(bind, "dialect", None), "name", "")
+            if dialect == "postgresql":
+                db.execute(
+                    _sql_text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                    {"lock_key": advisory_lock_key(budget_scope)},
+                )
+
+            budget_now = _dt.now(_tz.utc)
+            since = budget_now - timedelta(days=VEO_BUDGET_WINDOW_DAYS)
+            q = (db.query(_func.count(AIProvenance.id))
+                   .filter(AIProvenance.tool_name.like("veo%"))
+                   .filter(budget_occupancy_filter(budget_now)))
+
+            if not mio.startswith("__sin_metadata__|"):
+                # Sólo los jobs con actividad de Veo que ocupa presupuesto en
+                # la ventana pueden ser hermanos. Arrancar por ahí en vez de
+                # la tabla `jobs` entera acota el escaneo a lo relevante.
+                con_gasto = [r[0] for r in
+                             db.query(AIProvenance.job_id)
+                               .filter(AIProvenance.tool_name.like("veo%"))
+                               .filter(budget_occupancy_filter(budget_now))
+                               .filter(AIProvenance.created_at >= since)
+                               .distinct().all()]
+                # El presupuesto es POR TENANT: sin este filtro, dos clientes
+                # que rinden la misma canción comparten un único techo de 10 y
+                # el primero en llegar le corta el render pago al segundo.
+                candidatos = (db.query(Job.job_id, Job.artist, Job.song_title)
+                                .filter(Job.job_id.in_(con_gasto or [job_id]))
+                                .filter(Job.tenant_id == tenant)
+                                .all())
+                hermanos = [
+                    jid for jid, a, t in candidatos
+                    if _song_identity(a, t, jid) == mio
+                ]
+                # `or [job_id]` cubre el arranque: el job todavía puede no
+                # estar visible en su propia transacción.
+                q = q.filter(AIProvenance.job_id.in_(hermanos or [job_id]))
+                # El filtro por fecha va sobre la PROVENANCE, no sobre el job:
+                # un job viejo puede seguir generando hoy (re-render de una
+                # canción de hace meses), y acotar sólo por `Job.created_at`
+                # lo dejaba fuera del presupuesto.
+                q = q.filter(AIProvenance.created_at >= since)
+                alcance = f"canción {mio!r} ({len(hermanos)} jobs, tenant {tenant!r})"
+            else:
+                # Sin metadata de canción (o con el placeholder `preview`) no
+                # hay identidad que compartir: cada job lleva su propio tope.
+                # La ventana se aplica IGUAL: un job_id estable y reutilizado
+                # (los `sample-{style}` del script de muestras, por ejemplo)
+                # quedaba bloqueado para siempre al llegar a 10, aunque los
+                # VEO_BUDGET_WINDOW_DAYS hubieran pasado hace meses.
+                q = q.filter(AIProvenance.job_id == job_id)
+                q = q.filter(AIProvenance.created_at >= since)
+                alcance = f"job {job_id} (sin metadata de canción)"
+
+            live_count = int(q.scalar() or 0)
+            archived_count = int(
+                db.query(_func.count(VeoBudgetLedger.id))
+                .filter(VeoBudgetLedger.scope_hash == budget_scope)
+                .filter(VeoBudgetLedger.provider_call_at >= since)
+                .scalar()
+                or 0
+            )
+            n = live_count + archived_count
+
+            # Reserve inside the same transaction as the advisory lock. The
+            # next worker must see this live lease as occupied before deciding.
+            if n < VEO_MAX_CALLS_PER_SONG and own_row_id is not None:
+                updated = (
+                    db.query(AIProvenance)
+                    .filter(AIProvenance.id == own_row_id)
+                    .update(
+                        {
+                            "response_summary": (
+                                f"{BUDGET_RESERVED_PREFIX}: tenant={tenant} "
+                                f"song={mio}"
+                            ),
+                            "reservation_expires_at": (
+                                budget_now + timedelta(
+                                    seconds=VEO_RESERVATION_LEASE_SECONDS,
+                                )
+                            ),
+                        },
+                        synchronize_session=False,
+                    )
+                )
+                if not updated:
+                    db.rollback()
+                    # A successful UPDATE statement that matched zero rows is
+                    # not a transient DB outage: the reservation disappeared
+                    # (normally because an operator deleted the processing
+                    # job and its provenance). There is then no durable row or
+                    # tombstone to account for the provider call, so abort even
+                    # on the production fail-open path before touching Vertex.
+                    logger.info(
+                        "[BG][BUDGET] reserva fila=%s desapareció; se cancela Veo",
+                        own_row_id,
+                    )
+                    raise VeoTrackingUnavailable(
+                        f"Veo reservation row disappeared row={own_row_id}"
+                    )
+                db.commit()
+        finally:
+            db.close()
+    except VeoTrackingUnavailable:
+        raise
+    except Exception as exc:
+        logger.warning("[BG] no pude chequear el tope de Veo para job=%s: %r",
+                       job_id, exc)
+        # Delivery remains fail-open, but a provider POST follows immediately.
+        # Retry the state transition in a fresh transaction so a later worker
+        # crash cannot leave paid spend hidden as `budget_pending`.
+        marked = _mark_veo_reservation_admitted(
+            own_row_id, f"budget check failed; fail-open: {exc}")
+        if require_persistent_tracking and not marked:
+            raise VeoTrackingUnavailable(
+                f"Could not persist Veo reservation row={own_row_id}"
+            ) from exc
+        return False, 0
+
+    if n >= VEO_MAX_CALLS_PER_SONG:
+        logger.error(
+            "[BG][BUDGET] %s alcanzó el tope de Veo: %d generaciones "
+            "pagas (tope %d). Se corta acá.",
+            alcance, n, VEO_MAX_CALLS_PER_SONG,
+        )
+        return True, n
+    if n >= VEO_MAX_CALLS_PER_SONG - 2:
+        logger.warning(
+            "[BG][BUDGET] %s va por %d/%d generaciones de Veo",
+            alcance, n, VEO_MAX_CALLS_PER_SONG,
+        )
+    return False, n
+
+
 def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         cache_namespace: str = "",
                         image_path: str | None = None,
@@ -9268,7 +10051,8 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         cache_only: bool = False,
                         cache_key_override: str | None = None,
                         cache_override_policy_fingerprint: str | None = None,
-                        out_meta: dict | None = None) -> str:
+                        out_meta: dict | None = None,
+                        require_persistent_tracking: bool = False) -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
     We bypass google-genai SDK for Veo specifically because its internal auth
@@ -9296,6 +10080,11 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     `live_photo`: preserves an image-to-video seed and animates exactly one
     semantic region. It explicitly rejects generic atmospheric filler unless
     the source/operator already asks for it.
+
+    `require_persistent_tracking`: operator-run generators set this so a
+    failed provenance reservation aborts before Vertex. Production renders
+    retain the existing fail-open behavior for transient audit-DB outages,
+    while every fresh call still requires a non-empty job_id.
     """
     from provenance import record_ai_call
     import storage as _storage
@@ -9611,14 +10400,32 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         out_meta["cache_object_key"] = cache_object_key
         out_meta["policy_fingerprint"] = _policy_fingerprint
 
-    recorder = record_ai_call(
-        job_id=job_id or "unknown",
-        step="video_bg",
-        tool_name=model,
-        tool_provider="google_vertex",
-        prompt=safe_prompt,
-        input_data_types=["generated_prompt"],
-    ) if job_id else None
+    def _registrar_cache_only(summary: str, artifact: str | None = None):
+        """Registra una consulta `cache_only` DESPUÉS de saber su resultado.
+
+        A diferencia de una generación real, un lookup cache_only nunca toca
+        al proveedor: no hay plata en vuelo que trazar si el worker muere en
+        el medio, que es la razón por la que el recorder normal inserta la
+        fila por adelantado. Y esa fila adelantada sí hacía daño: mientras
+        está "en vuelo" (`response_summary` NULL) `billable_filter()` la
+        cuenta como paga, y en un regen multi-escena estas consultas corren
+        en paralelo con la única escena que sí paga — le comían el tope con
+        llamadas que nunca costaron nada.
+        """
+        if not job_id:
+            return
+        try:
+            record_ai_call(
+                job_id=job_id, step="video_bg", tool_name=model,
+                tool_provider="google_vertex", prompt=safe_prompt,
+                input_data_types=["generated_prompt"],
+                # The lookup is known to be free already. Persist that fact
+                # in the INSERT itself so another worker cannot observe a
+                # transient NULL and count it as a paid reservation.
+                initial_response_summary=summary,
+            ).finish(response_summary=summary, output_artifact=artifact)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[BG] no pude registrar el lookup cache_only: %r", exc)
 
     # cache_only (multi-escena regen): SÓLO servir de caché, NUNCA generar
     # fresco. Garantiza que regenerar UNA escena no re-cobre las otras N: si su
@@ -9656,15 +10463,36 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                     # La key que REALMENTE sirvió el clip — así el GC y las
                     # próximas búsquedas apuntan al objeto vivo.
                     out_meta["cache_object_key"] = _ck
-                if recorder:
-                    recorder.finish(response_summary=f"cache_hit(cache_only,{_via}): {size_mb:.1f}MB key={_ck}",
-                                    output_artifact=output_path)
+                _registrar_cache_only(
+                    f"cache_hit(cache_only,{_via}): {size_mb:.1f}MB key={_ck}",
+                    output_path)
                 return output_path
-        if recorder:
-            recorder.finish(response_summary=f"cache_only_miss: keys={_candidates}")
+        _registrar_cache_only(f"cache_only_miss: keys={_candidates}")
         raise RuntimeError(
             f"[BG] cache_only: sin clip cacheado (probé {_candidates}) — no se genera "
             "para no re-cobrar Veo en una regeneración de escena")
+
+    if not job_id:
+        raise RuntimeError(
+            "Paid Veo generation requires a persistent job_id; refusing an "
+            "untracked provider submission"
+        )
+
+    _budget_enforced = _veo_budget_enforced_for_job(job_id)
+
+    # Fast read-only rejection before the global provider cooldown. This is
+    # deliberately only an optimization: another worker can spend the final
+    # slot after this read, so the atomic reservation immediately before the
+    # POST remains the authority.
+    if _budget_enforced:
+        _pre_over, _pre_spent = _veo_budget_exceeded(job_id)
+        if _pre_over:
+            raise VeoBudgetExceeded(
+                f"job {job_id}: {_pre_spent} generaciones de Veo ya hechas "
+                f"para esta canción (tope {VEO_MAX_CALLS_PER_SONG}). No se "
+                "espera el cooldown ni se genera más; el llamador cae a su "
+                "fallback."
+            )
 
     # Fresh provider output is intentionally not read from the shared raw
     # cache here. This function runs before content validation, so a normal
@@ -9725,7 +10553,6 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     MAX_BACKOFF_S = 120
     MAX_ATTEMPTS = 5
     operation_name: str | None = None
-    last_error: str | None = None
     rate_limit_hits = 0
 
     import veo_breaker
@@ -9736,80 +10563,208 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     _submit_budget_s = float(os.environ.get("VEO_SUBMIT_BUDGET_S", "240"))
     _submit_deadline = _time.time() + _submit_budget_s
 
+    from provenance import BUDGET_PENDING_PREFIX
+
+    recorder = record_ai_call(
+        job_id=job_id or "unknown",
+        step="video_bg",
+        tool_name=model,
+        tool_provider="google_vertex",
+        prompt=safe_prompt,
+        input_data_types=["generated_prompt"],
+        initial_response_summary=(
+            BUDGET_PENDING_PREFIX if _budget_enforced else None
+        ),
+    )
+    if require_persistent_tracking and recorder._row_id is None:
+        raise VeoTrackingUnavailable(
+            "Veo Job disappeared or provenance reservation could not be "
+            f"persisted for job_id={job_id!r}"
+        )
+
+    # Reserva y chequeo atómicos en el último punto seguro antes del POST. A
+    # partir de `_req.post` un timeout es ambiguo (Vertex puede haber aceptado
+    # la generación), por eso esos errores conservan la reserva facturable.
+    if _budget_enforced:
+        _over, _spent = _veo_budget_exceeded(
+            job_id,
+            own_row_id=getattr(recorder, "_row_id", None),
+            require_persistent_tracking=require_persistent_tracking,
+        )
+    else:
+        _over, _spent = False, 0
+    if _over:
+        # La fila se BORRA en vez de cerrarse: no hubo llamada al proveedor,
+        # así que dejarla registrada inventaba gasto y además contaminaba el
+        # propio conteo del tope en la siguiente pasada.
+        _discard_provenance_row(recorder)
+        raise VeoBudgetExceeded(
+            f"job {job_id}: {_spent} generaciones de Veo ya hechas para esta "
+            f"canción (tope {VEO_MAX_CALLS_PER_SONG}). No se genera más para no "
+            f"seguir gastando; el llamador cae a su fallback."
+        )
+
+    # Check the ceiling before touching credentials so a blocked song exits
+    # immediately even during an auth outage. Token acquisition is still a
+    # definite pre-submit failure: release this reservation before falling
+    # back because Vertex has not received a request.
+    try:
+        token = _veo_access_token()
+    except Exception as exc:
+        _release_veo_reservation(
+            recorder, f"pre-submit auth failed: {exc}")
+        raise
+
     for attempt in range(MAX_ATTEMPTS):
+        if attempt:
+            try:
+                token = _veo_access_token()
+            except Exception as exc:
+                # Every prior attempt was a confirmed 429 rejection. If token
+                # refresh now fails, no request for this reservation is in
+                # flight and the slot is definitely free.
+                _release_veo_reservation(
+                    recorder, f"pre-submit auth failed: {exc}")
+                raise
+            # The previous attempt was a confirmed 429 and its row was made
+            # non-billable before releasing the submission lock. Re-acquire a
+            # budget slot only now, after auth and immediately before the next
+            # guarded POST. If deletion won during backoff/auth, this aborts.
+            if _budget_enforced:
+                _retry_over, _retry_spent = _veo_budget_exceeded(
+                    job_id,
+                    own_row_id=getattr(recorder, "_row_id", None),
+                    require_persistent_tracking=require_persistent_tracking,
+                )
+                if _retry_over:
+                    raise VeoBudgetExceeded(
+                        f"job {job_id}: {_retry_spent} generaciones de Veo ya "
+                        f"hechas para esta canción (tope "
+                        f"{VEO_MAX_CALLS_PER_SONG}). No se reintenta."
+                    )
+        rejected_429 = False
         try:
             logger.info("[BG] Veo 3: generating video (attempt %s/%s)...", attempt + 1, MAX_ATTEMPTS)
-            token = _veo_access_token()
-            r = _req.post(
-                submit_url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                    "x-goog-user-project": _VERTEX_PROJECT,
-                },
-                json=request_body,
-                timeout=60,
-            )
-            if r.status_code == 429 or "RESOURCE_EXHAUSTED" in r.text:
-                rate_limit_hits += 1
-                last_error = f"HTTP {r.status_code} rate-limited"
-                veo_breaker.record_rate_limit()  # feeds the cross-worker breaker
-                # Capped exponential backoff + ±20 % jitter. Without
-                # jitter, N concurrent jobs that all hit a 429 at the
-                # same instant retry in lock-step → second wave of
-                # 429s → cascade. Jitter spreads the retry window so
-                # quota recovers naturally.
-                base = min(MAX_BACKOFF_S, 30 * (2 ** attempt))
-                wait = base * random.uniform(0.8, 1.2)
-                # Submit budget: don't keep sleeping in-slot past the budget —
-                # bail so the job falls to gradient instead of burning the full
-                # backoff during a quota storm.
-                if _time.time() + wait > _submit_deadline:
-                    logger.warning("[BG] Veo submit budget (%.0fs) exhausted — bailing to fallback", _submit_budget_s)
-                    break
-                logger.warning("[BG] Rate limited (HTTP %s), waiting %.1fs before retry...",
-                               r.status_code, wait)
-                _time.sleep(wait)
-                continue
-            if not r.ok:
-                detail = r.text[:500]
-                # Non-retryable: bubble immediately so the caller can mark
-                # the job error with a useful reason.
-                raise RuntimeError(
-                    f"Veo predictLongRunning HTTP {r.status_code}: {detail}"
+            # Re-check deletion after token acquisition, then keep the same
+            # lock through the external side-effect. This closes the final
+            # cancellation race without holding a DB connection during auth.
+            if _budget_enforced:
+                _submission_guard = _VeoSubmissionGuard(
+                    job_id,
+                    getattr(recorder, "_row_id", None),
+                    require_persistent_tracking=require_persistent_tracking,
                 )
-            payload = r.json()
-            operation_name = payload.get("name")
-            if not operation_name:
-                raise RuntimeError(f"Veo response missing 'name': {payload}")
-            veo_breaker.record_success()  # Veo accepted → close the breaker if open
-            break
-        except RuntimeError:
+            else:
+                from contextlib import nullcontext
+                _submission_guard = nullcontext()
+            with _submission_guard:
+                try:
+                    r = _req.post(
+                        submit_url,
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Content-Type": "application/json",
+                            "x-goog-user-project": _VERTEX_PROJECT,
+                        },
+                        json=request_body,
+                        timeout=60,
+                    )
+                except Exception as e:
+                    _raise_if_job_timeout(e)
+                    # The provider may have accepted the request. Persist the
+                    # ambiguous/billable state before deletion can take the
+                    # shared lock and archive it.
+                    if recorder:
+                        recorder.finish(response_summary=(
+                            "error: ambiguous submission; not retrying: "
+                            f"{str(e)[:300]}"
+                        ))
+                    raise VeoAmbiguousSubmission(
+                        "Veo 3 submission response was ambiguous; not "
+                        f"retrying: {e}"
+                    ) from e
+
+                if r.status_code == 429 or "RESOURCE_EXHAUSTED" in r.text:
+                    rate_limit_hits += 1
+                    veo_breaker.record_rate_limit()
+                    _pause_veo_reservation_for_retry(
+                        recorder,
+                        f"HTTP {r.status_code} rate limited attempt "
+                        f"{attempt + 1}",
+                    )
+                    rejected_429 = True
+                elif not r.ok:
+                    detail = r.text[:500]
+                    if _veo_http_failure_is_ambiguous(r.status_code):
+                        if recorder:
+                            recorder.finish(response_summary=(
+                                f"error: ambiguous HTTP {r.status_code}; "
+                                f"not retrying: {detail[:300]}"
+                            ))
+                        raise VeoAmbiguousSubmission(
+                            f"Veo predictLongRunning HTTP {r.status_code} was "
+                            f"ambiguous; not retrying: {detail}"
+                        )
+                    _release_veo_reservation(
+                        recorder, f"HTTP {r.status_code} rejected: {detail}")
+                    raise RuntimeError(
+                        f"Veo predictLongRunning HTTP {r.status_code}: {detail}"
+                    )
+                else:
+                    try:
+                        payload = r.json()
+                    except Exception as exc:
+                        if recorder:
+                            recorder.finish(response_summary=(
+                                "error: ambiguous success response; not "
+                                f"retrying: {str(exc)[:300]}"
+                            ))
+                        raise VeoAmbiguousSubmission(
+                            "Veo returned an unreadable success response"
+                        ) from exc
+                    operation_name = payload.get("name")
+                    if not operation_name:
+                        if recorder:
+                            recorder.finish(response_summary=(
+                                "error: ambiguous success response missing operation name; "
+                                "not retrying: "
+                                f"{str(payload)[:300]}"
+                            ))
+                        raise VeoAmbiguousSubmission(
+                            f"Veo response missing 'name': {payload}"
+                        )
+        except VeoTrackingUnavailable:
+            # No request began. The row may already have been removed by the
+            # deletion transaction; release it only when it still exists.
+            try:
+                _release_veo_reservation(
+                    recorder, "job cancelled before provider submission")
+            except VeoTrackingUnavailable:
+                pass
             raise
-        except Exception as e:
-            _raise_if_job_timeout(e)
-            last_error = f"network/transient: {e}"
-            logger.error("[BG] Veo 3 attempt %s request error: %s", attempt + 1, e)
-            base = min(MAX_BACKOFF_S, 15 * (2 ** attempt))
+        if rejected_429:
+            # Capped exponential backoff + ±20 % jitter. All retries here are
+            # safe because every prior HTTP response explicitly rejected the
+            # request. The reservation stays non-billable during this wait.
+            base = min(MAX_BACKOFF_S, 30 * (2 ** attempt))
             wait = base * random.uniform(0.8, 1.2)
             if _time.time() + wait > _submit_deadline:
-                logger.warning("[BG] Veo submit budget exhausted (transient) — bailing to fallback")
+                logger.warning("[BG] Veo submit budget (%.0fs) exhausted — bailing to fallback", _submit_budget_s)
                 break
+            logger.warning("[BG] Rate limited (HTTP %s), waiting %.1fs before retry...",
+                           r.status_code, wait)
             _time.sleep(wait)
             continue
+        veo_breaker.record_success()  # Veo accepted → close the breaker if open
+        break
 
     if operation_name is None:
-        reason = last_error or "unknown"
-        summary = (
-            f"error: rate_limited_after_{MAX_ATTEMPTS}_retries"
-            if rate_limit_hits == MAX_ATTEMPTS
-            else f"error: {reason} after {MAX_ATTEMPTS} retries"
+        _release_veo_reservation(
+            recorder,
+            f"rate limited {rate_limit_hits} times; no operation created",
         )
-        if recorder:
-            recorder.finish(response_summary=summary)
-        if rate_limit_hits == MAX_ATTEMPTS:
-            raise RuntimeError(f"Veo 3 rate limit exceeded after {MAX_ATTEMPTS} retries")
-        raise RuntimeError(f"Veo 3 submission failed after {MAX_ATTEMPTS} retries: {reason}")
+        raise RuntimeError(
+            f"Veo 3 rate limit exceeded after {rate_limit_hits} rejected attempts")
 
     _last_veo_request = _time.time()
     logger.info("[BG] Veo 3 operation: %s", operation_name)
@@ -10421,7 +11376,9 @@ def _measure_camera_drift(video_path: str, samples: int = 30) -> dict | None:
                 pass
 
 
-def _score_video_relevance(video_path: str, prompt: str) -> int:
+def _score_video_relevance(
+    video_path: str, prompt: str, job_id: str | None = None,
+) -> int:
     """Ask Gemini Vision whether the video matches the intended scene prompt.
 
     Extracts one frame and returns a relevance score 1-10.
@@ -10431,6 +11388,7 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
     import tempfile
 
     tmp_frame = None
+    recorder = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
             tmp_frame = f.name
@@ -10444,6 +11402,19 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
         # generated Veo video; a hang here adds to total render latency
         # but is gated by the same outer except → fall-through to score=8.
         # 30 s suffices (single-frame Vision call is fast).
+        if job_id:
+            from provenance import record_ai_call
+            recorder = record_ai_call(
+                job_id=job_id,
+                step="video_relevance",
+                # One JPEG frame, same billing shape as the single-image
+                # validation call. The generic text key weighted this request
+                # ~20x too high after invoice calibration.
+                tool_name="gemini-2.5-flash-vision-image",
+                tool_provider="google_vertex",
+                prompt=prompt,
+                input_data_types=["video_frame", "scene_prompt"],
+            )
         response = _call_with_timeout(
             lambda: client.models.generate_content(
                 model="gemini-2.5-flash",
@@ -10470,8 +11441,12 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
         import re as _re
         m = _re.search(r'\b(10|[1-9])\b', response.text)
         score = int(m.group()) if m else 5
+        if recorder:
+            recorder.finish(response_summary=f"score={score}")
         return max(1, min(10, score))
     except Exception as e:
+        if recorder:
+            recorder.finish(response_summary=f"error: {e!r}")
         _raise_if_job_timeout(e)
         logger.warning("[BG] Relevance score error (fail-open): %s", e)
         return 8
@@ -11110,6 +12085,12 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                 ),
                 "validation": dict(scene.get("validation") or {}),
             }
+        except (VeoAmbiguousSubmission, VeoTrackingUnavailable):
+            # An ambiguous provider submission or an operator cancellation
+            # must escape the per-scene substitution path. Collapsing either
+            # into a recoverable miss can reach the single-background path and
+            # submit Veo again after the reservation/job disappeared.
+            raise
         except Exception as e:  # noqa: BLE001
             _raise_if_job_timeout(e)
             # Cache_only-miss ESPERADO (review del PR del Sentinel, 2026-07-10):
@@ -11576,7 +12557,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        allow_people: bool = False,
                        atmospherics_policy: dict | None = None,
                        audio_duration: float | None = None,
-                       generation_nonce: str = "") -> str:
+                       generation_nonce: str = "",
+                       out_meta: dict | None = None) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     background_hint: optional free-form operator description, set via /edit
@@ -11594,6 +12576,10 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
 
     Returns path to .mp4 (video style) or .jpg/.png (photo/illustration style).
     """
+    if out_meta is not None:
+        out_meta["provider_fallback"] = False
+        out_meta.pop("fallback_reason", None)
+
     creative_mode = resolve_creative_mode(
         match_lyrics=match_lyrics,
         operator_prompt=background_hint,
@@ -11796,6 +12782,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 raise RuntimeError("Veo returned no living-photo artifact")
             except Exception as exc:
                 _raise_if_job_timeout(exc)
+                if out_meta is not None:
+                    out_meta["provider_fallback"] = True
+                    out_meta["fallback_reason"] = "foto_viva_provider_failed"
                 logger.warning(
                     "[BG] foto_viva provider failed; using bounded local "
                     "photo-motion fallback: %s", exc,
@@ -11881,6 +12870,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     import veo_breaker
     _veo_breaker_open = veo_breaker.is_open()
     if _veo_breaker_open:
+        if out_meta is not None:
+            out_meta["fallback_reason"] = "veo_breaker_open"
         logger.warning("[BG] Veo breaker OPEN — short-circuiting to gradient (skipping Veo)")
     # 1 retry interno (2 intentos). Antes eran 3, lo que sumado al
     # poll_deadline de 600s de Veo podía exceder cualquier job_timeout
@@ -11913,7 +12904,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # to bound cost (+$0.80 worst case). quality_retry_used gates the
             # re-generation decision, not the scoring itself, so the retry's
             # result is also evaluated before we accept and return it.
-            score = _score_video_relevance(bg_path, prompt)
+            score = _score_video_relevance(bg_path, prompt, job_id=job_id)
             logger.info("[BG] Relevance score: %s/10 for prompt: %s...", score, prompt[:60])
             # Detector de corte de escena (incidente mural 2026-06-09):
             # un clip cuyo primer y último frame son escenas distintas
@@ -12027,6 +13018,30 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # Real RQ death-penalty timeout — propagate (don't degrade to
             # gradient + swallow). Keeps the JobTimeoutException visible.
             raise
+        except VeoBudgetExceeded as e:
+            # No es un fallo transitorio: el tope no puede cambiar durante los
+            # 30s de espera, así que reintentar sólo agrega latencia y otro
+            # ciclo de reserva+borrado de fila. Directo al fallback local.
+            logger.error("[BG] %s — sin reintento, al fallback", e)
+            if out_meta is not None:
+                out_meta["fallback_reason"] = "veo_budget_exceeded"
+            break
+        except VeoAmbiguousSubmission as e:
+            # Vertex may already be rendering and billing this operation. The
+            # inner submitter preserved one reservation; do not re-enter it
+            # from this outer quality/transient retry loop.
+            logger.error("[BG] %s — envío ambiguo, sin reintento", e)
+            if out_meta is not None:
+                out_meta["fallback_reason"] = "veo_ambiguous_submission"
+            break
+        except VeoTrackingUnavailable as e:
+            # A vanished reservation is cancellation, not a transient provider
+            # error. Retrying after 30s can reach Vertex with the job and its
+            # provenance already deleted, so go directly to the local fallback.
+            logger.info("[BG] %s — tracking cancelado, sin reintento", e)
+            if out_meta is not None:
+                out_meta["fallback_reason"] = "veo_tracking_cancelled"
+            break
         except Exception as e:
             logger.error("[BG] Veo 3 attempt %s/2 failed: %s", attempt + 1, e)
             if attempt < 1:
@@ -12043,6 +13058,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             "falling back to local masked motion"
         )
         _static_image_to_mp4(image_to_video_path, bg_path, duration=60.0)
+        if out_meta is not None:
+            out_meta["provider_fallback"] = True
+            out_meta.setdefault("fallback_reason", "foto_viva_provider_failed")
         return bg_path
 
     # All Veo attempts failed — render a gradient as fallback.
@@ -12050,6 +13068,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     # tenants need clear provenance of every visual element, and a stock asset
     # silently substituted into an AI-mode job would break that contract.
     logger.warning("[BG] Veo 3 unavailable, falling back to gradient background")
+    if out_meta is not None:
+        out_meta["provider_fallback"] = True
+        out_meta.setdefault("fallback_reason", "veo_unavailable")
     fallback_path = os.path.join(job_dir, "bg_gradient_fallback.mp4")
     gradient = _make_gradient_clip(30.0, style_hint)
     gradient.write_videofile(fallback_path, fps=24, logger=None)
@@ -14980,7 +16001,15 @@ def generate_lyric_video(
 
     # --- moviepy composite path (default) ---
     if bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
-        bg = _ken_burns_clip(bg_source, duration, spec=spec)
+        # Keep the operator's static intent when MoviePy is selected directly
+        # or libass fails. Without this flag the fallback silently reintroduced
+        # the 15% Ken Burns zoom that the ASS path had just avoided.
+        bg = _ken_burns_clip(
+            bg_source,
+            duration,
+            spec=spec,
+            static=still_background,
+        )
     else:
         bg = _get_background_clip_from_path(bg_source, style, duration, job_dir, spec=spec,
                                             bg_prelooped=bg_prelooped)
