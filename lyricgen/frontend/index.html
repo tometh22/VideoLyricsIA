@@ -164,16 +164,34 @@
       </main>
     </div>
     <script>
-      // If React hasn't mounted after 12s, show the JS error visibly
+      // If React hasn't mounted after 15s, keep the user informed and offer a
+      // real recovery action. Slow corporate/VPN links can legitimately take
+      // longer, so don't label the first delay as an application error.
       var _t = setTimeout(function() {
         var el = document.getElementById('_loader_msg');
-        if (el) el.textContent = 'Error al cargar la app. Recargá la página.';
-      }, 12000);
+        if (!el) return;
+        el.textContent = 'La carga está tardando más de lo normal. ';
+        var retry = document.createElement('button');
+        retry.type = 'button';
+        retry.textContent = 'Reintentar';
+        retry.style.cssText = 'margin-left:6px;padding:7px 12px;border:1px solid #9f8cff;border-radius:8px;background:transparent;color:#f7f8fc;cursor:pointer;font:inherit;font-weight:700;';
+        retry.onclick = function() { window.location.reload(); };
+        el.appendChild(retry);
+      }, 15000);
       window.addEventListener('error', function(e) {
         clearTimeout(_t);
         var el = document.getElementById('_loader_msg');
-        if (el) el.textContent = 'JS Error: ' + (e.message || 'desconocido') + ' — ' + (e.filename || '');
-      });
+        if (!el) return;
+        // Resource-load errors (script/link) do not bubble. This listener is
+        // registered in capture mode so a missing or filtered startup chunk is
+        // no longer misreported as a generic timeout.
+        var target = e.target;
+        if (!e.message && target && (target.tagName === 'SCRIPT' || target.tagName === 'LINK')) {
+          el.textContent = 'No se pudo descargar un archivo necesario. Revisá la conexión o el filtro de red y reintentá.';
+          return;
+        }
+        el.textContent = 'JS Error: ' + (e.message || 'desconocido') + ' — ' + (e.filename || '');
+      }, true);
       window.addEventListener('unhandledrejection', function(e) {
         var el = document.getElementById('_loader_msg');
         if (el && !el.textContent) el.textContent = 'Promise error: ' + String(e.reason);
