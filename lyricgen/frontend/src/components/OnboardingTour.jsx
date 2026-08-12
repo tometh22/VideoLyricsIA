@@ -387,8 +387,8 @@ function coachSeen(key) {
 export function MotionStudioCoach({ user, view }) {
   const { t } = useI18n();
   const active =
-    (!view && !coachSeen("genly_coach_motion_intro")) ? "intro"
-      : (view === "movement" && !coachSeen("genly_coach_motion_back")) ? "back"
+    (!view && !coachSeen("genly_coach_motion_intro_v2")) ? "intro"
+      : (view === "movement" && !coachSeen("genly_coach_motion_back_v2")) ? "back"
         : null;
   const steps = useMemo(() => {
     if (active === "intro") return [{
@@ -410,7 +410,7 @@ export function MotionStudioCoach({ user, view }) {
     return [];
   }, [active, t]);
   if (!active) return null;
-  const flagKey = active === "intro" ? "genly_coach_motion_intro" : "genly_coach_motion_back";
+  const flagKey = active === "intro" ? "genly_coach_motion_intro_v2" : "genly_coach_motion_back_v2";
   return <TourRunner key={active} flagKey={flagKey} steps={steps} user={user} forceRun />;
 }
 
