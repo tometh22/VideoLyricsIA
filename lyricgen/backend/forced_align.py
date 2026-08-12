@@ -123,9 +123,22 @@ def _call_with_budget(model: str, input_factory, *,
             logger.warning("[FORCED] budget exhausted before attempt %s/%s",
                            attempt + 1, len(backoff))
             break
+        from replicate_budget import (
+            finish_replicate_provenance,
+            start_replicate_provenance,
+        )
+        recorder = None
         try:
-            return replicate.run(model, input=input_factory())
+            inputs = input_factory()
+            recorder = start_replicate_provenance(model, "FORCED", attempt + 1)
+            result = replicate.run(model, input=inputs)
+            finish_replicate_provenance(recorder, "succeeded")
+            return result
         except Exception as e:
+            finish_replicate_provenance(
+                recorder,
+                f"error: {type(e).__name__}: {str(e)[:300]}",
+            )
             last_err = e
             if _is_non_retryable(e):
                 logger.warning("[FORCED] non-retryable error on attempt %s (%s) — aborting",

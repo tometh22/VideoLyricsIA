@@ -461,12 +461,37 @@ def check_prores_readiness(
     if os.path.exists(final_path) and _mov_is_fresh(final_path, source_local):
         return ProResReadiness(ProResReadiness.READY_LOCAL, local_path=final_path)
 
-    # 2. R2 hit (after the upload, before any new local cache). The key is
-    # only merged after the second freshness fence in ensure_prores_exists,
-    # so a present key points at a fresh master.
+    # 2. R2 hit (after the upload, before any new local cache). Lifecycle
+    # expiration deletes the object without touching Job.s3_keys, so a key
+    # alone is not proof anymore: reconcile a confirmed 404 and fall through
+    # to the normal 202/re-transcode path. On transient HEAD failures we keep
+    # the key and preserve the old behavior rather than orphaning a valid
+    # multi-GB deliverable.
     s3_keys = job.get("s3_keys") or {}
-    if s3_keys.get(file_type):
-        return ProResReadiness(ProResReadiness.READY_R2)
+    stored_key = s3_keys.get(file_type)
+    if stored_key:
+        import storage
+
+        status = storage.object_status(stored_key)
+        if status != "missing":
+            return ProResReadiness(ProResReadiness.READY_R2)
+        try:
+            from jobs import remove_s3_keys
+
+            remove_s3_keys(job_id, [file_type])
+        except Exception as exc:
+            logger.warning(
+                "Could not invalidate expired ProRes key job=%s type=%s: %s",
+                job_id, file_type, exc,
+            )
+            return ProResReadiness(ProResReadiness.READY_R2)
+        s3_keys = dict(s3_keys)
+        s3_keys.pop(file_type, None)
+        logger.info(
+            "Expired ProRes key invalidated; scheduling regeneration "
+            "job=%s type=%s key=%s",
+            job_id, file_type, stored_key,
+        )
 
     # 3. Validate job is eligible BEFORE we wait or enqueue.
     if not job.get("umg_spec"):

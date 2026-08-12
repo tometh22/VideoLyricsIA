@@ -31,7 +31,10 @@ def _result(segs):
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # Python 3.11 no longer creates a replacement loop implicitly after a
+    # previous test closes the process-global one. Give every sync wrapper an
+    # isolated lifecycle so this file is independent of suite order.
+    return asyncio.run(coro)
 
 
 def _patch_openai(monkeypatch, lines_per_seg: "dict[int, list[str]]"):
@@ -64,6 +67,15 @@ def _patch_openai(monkeypatch, lines_per_seg: "dict[int, list[str]]"):
         chat = _FakeChat()
 
     import openai
+    import provenance
+
+    class _Recorder:
+        def finish(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        provenance, "record_ai_call", lambda **_kwargs: _Recorder(),
+    )
     monkeypatch.setattr(openai, "AsyncOpenAI", lambda: _FakeClient())
     monkeypatch.setattr(lf.asyncio, "wait_for", lambda coro, **_kw: coro)
 
@@ -79,6 +91,30 @@ def test_corrects_accents(monkeypatch):
     result = _run(lf.format_lyrics_pass(_result(segs), language="es"))
     assert result["segments"][0]["text"] == "Frágil espejo de voz"
     assert result["segments"][1]["text"] == "¿Para qué tus santos?"
+
+
+def test_formatter_registra_el_job_y_modelo_openai(monkeypatch):
+    import provenance
+
+    _patch_openai(monkeypatch, {1: ["Frágil espejo de voz"]})
+    captured = {}
+
+    class _Recorder:
+        def finish(self, **kwargs):
+            captured["summary"] = kwargs["response_summary"]
+
+    monkeypatch.setattr(
+        provenance,
+        "record_ai_call",
+        lambda **kwargs: captured.update(kwargs) or _Recorder(),
+    )
+
+    _run(lf.format_lyrics_pass(_result([_seg("fragil espejo de voz")]), "es"))
+
+    assert captured["job_id"] == "test"
+    assert captured["tool_name"] == "gpt-4o-mini"
+    assert captured["tool_provider"] == "openai"
+    assert captured["summary"] == "succeeded"
 
 
 def test_timestamps_unchanged_no_split(monkeypatch):

@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 load_dotenv(BACKEND / ".env")
 
 from pipeline import _generate_imagen_image
+from internal_tracking import ensure_internal_tracking_job
 
 OUT = Path("/Users/tomi/VideoLyricsIA-landing/lyricgen/frontend/public/samples/looks")
 OUT.mkdir(parents=True, exist_ok=True)
@@ -40,7 +41,9 @@ def main():
         out = OUT / f"look-{name}.png"
         try:
             print(f"[gen] {name} ...", flush=True)
-            _generate_imagen_image(prompt, str(out), job_id=None,
+            tracking_job_id = ensure_internal_tracking_job(
+                f"landing-look:{name}", style="image")
+            _generate_imagen_image(prompt, str(out), job_id=tracking_job_id,
                                    model="imagen-4.0-generate-001")
             size = out.stat().st_size if out.exists() else 0
             print(f"[ok]  {name} -> {out} ({size} bytes)", flush=True)

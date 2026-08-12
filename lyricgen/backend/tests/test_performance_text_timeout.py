@@ -76,6 +76,41 @@ def test_gemini_call_wrapped_with_45s_timeout(monkeypatch):
     assert out == [(1.0, "línea de prueba", 0)]
 
 
+def test_each_performance_window_records_one_billable_call(monkeypatch):
+    """Invoice calibration denominator includes every chunked Gemini call."""
+    import performance_text as pt
+    import pipeline
+    import provenance
+
+    records = []
+
+    class Recorder:
+        def finish(self, **kwargs):
+            records[-1]["finish"] = kwargs
+
+    def record(**kwargs):
+        records.append(dict(kwargs))
+        return Recorder()
+
+    monkeypatch.setattr(provenance, "record_ai_call", record)
+    monkeypatch.setattr(
+        pipeline, "_call_with_timeout",
+        lambda fn, timeout_s, label="": fn(),
+    )
+    genai, client = _fake_genai_and_client()
+    y = np.zeros(16000 * 55, dtype="float32")
+    pt._one_pass(
+        client, genai, y, sr=16000, dur=55.0, who="test", job_id="job123",
+    )
+
+    # Windows 0-30, 24-54, 48-55: each external request has one row.
+    assert len(records) == 3
+    assert all(r["job_id"] == "job123" for r in records)
+    assert all(r["step"] == "performance_text" for r in records)
+    assert all(r["tool_name"] == pt.MODEL for r in records)
+    assert all("finish" in r for r in records)
+
+
 def test_hung_chunk_times_out_and_counts_as_failure(monkeypatch):
     """Si pipeline._call_with_timeout dispara el timeout real (chunk
     colgado), _one_pass debe tratarlo como un fallo de ventana —no

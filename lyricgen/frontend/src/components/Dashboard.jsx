@@ -4,6 +4,7 @@ import { useI18n } from "../i18n";
 import { useMediaUrl } from "../mediaUrl";
 import { fetchWithTimeout } from "../fetchWithTimeout";
 import { DashboardTour } from "./OnboardingTour";
+import NovedadHero from "./WhatsNew/NovedadHero";
 import ProResBadge from "./ProResBadge";
 import { SkeletonVideoCard } from "./Skeleton";
 import DashboardStepper from "./DashboardRich/Stepper";
@@ -688,6 +689,9 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
           }}
         />
       )}
+      {/* Hero de Novedades: anuncia la release featured del changelog y
+          provee el target data-tour="whatsnew-release" del DashboardTour. */}
+      <NovedadHero />
       {/* ─── Tus últimos videos — visual scan, NOT a copy of History ── */}
       {recentDone.length > 0 && (
         <div data-tour="dashboard-recent">

@@ -116,6 +116,7 @@ from pipeline import run_pipeline, transcribe, _normalize_movement_style
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
 from transcription_language import resolve_transcription_language
+from provenance import job_was_delivered
 from batch_profiles import (
     RenderProfileError, normalize_render_profile, pipeline_fields,
 )
@@ -4407,6 +4408,53 @@ async def generate_preview(
     sin tocar la cola — cada preview descartado gasta $0.80-3.20 Veo y un
     trial toquetea opciones más que un paid customer. Paid pasan normal.
     """
+    from bg_preview import (
+        bg_preview_enabled, compute_bg_cache_key, cache_check, cache_r2_key,
+        track_request,
+    )
+
+    params = body.model_dump()
+    bg_cache_key = compute_bg_cache_key(params)
+
+    # Cache is already-paid work, not pre-generation. Serve it before both
+    # spend gates so disabling new previews cannot force `/generate` to buy
+    # the exact same background again.
+    if cache_check(bg_cache_key):
+        track_request(cache_hit=True)
+        return {
+            "bg_cache_key": bg_cache_key,
+            "cached": True,
+            "r2_key": cache_r2_key(bg_cache_key),
+            "status": "bg_preview_done",
+        }
+
+    # Kill-switch de entorno en el límite de trabajo nuevo, antes del gate
+    # por plan y de crear/encolar un job.
+    #
+    # Medido en jul-2026 sobre los dos entornos: 147 fondos pre-generados,
+    # **4 reusados**. $91/mes fabricando fondos que se descartan.
+    #
+    # El motivo NO es que el operador cambie las opciones (eso se creyó
+    # primero y los datos lo desmienten): son dos flujos que no se cruzan.
+    # El 79% de los renders de staging entra por API — el bot de regresión y
+    # el preflight — y esos nunca disparan preview. Y los que sí usan el
+    # wizard renderizan 51-56 min después, cuando la ventana útil del
+    # pre-generado es de 30-90 s. La función asume un flujo de una canción
+    # de punta a punta; la producción real trabaja en lotes.
+    #
+    # Apagarlo NO hace esperar más al operador: hoy el render genera el fondo
+    # igual porque el pre-generado ya se descartó. Sólo se deja de pagar la
+    # fabricación duplicada.
+    #
+    # Se reusa el contrato `skipped` que el frontend ya maneja, así que
+    # apagarlo no rompe la UI. `BG_PREVIEW_ENABLED=1` lo vuelve a prender.
+    if not bg_preview_enabled():
+        return {
+            "skipped": True,
+            "reason": "disabled",
+            "message": "El pre-render del fondo está desactivado. El video se genera igual al apretar 'Crear video'.",
+        }
+
     from auth import PLANS
     plan_id = (current_user.get("plan") or "free").strip()
     plan_cfg = PLANS.get(plan_id, PLANS["free"])
@@ -4415,23 +4463,6 @@ async def generate_preview(
             "skipped": True,
             "reason": "plan_tier",
             "message": "El pre-render del fondo está disponible en planes paid. El video se genera igual al apretar 'Crear video'.",
-        }
-
-    from bg_preview import (
-        compute_bg_cache_key, cache_check, cache_r2_key, track_request,
-    )
-
-    params = body.model_dump()
-    bg_cache_key = compute_bg_cache_key(params)
-
-    # Fast path — cache hit.
-    if cache_check(bg_cache_key):
-        track_request(cache_hit=True)
-        return {
-            "bg_cache_key": bg_cache_key,
-            "cached": True,
-            "r2_key": cache_r2_key(bg_cache_key),
-            "status": "bg_preview_done",
         }
 
     # Crear un job "ghost" en la DB sólo para tracking del status; tiene
@@ -5073,6 +5104,7 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
             language=language, lead_s=_li.lead_seconds(),
             hold_s=_li.hold_seconds(),
             asr_words=result.get("_asr_words"),
+            job_id=job_id,
         )
         if stats.get("rescued_lines"):
             result = dict(result)
@@ -5484,7 +5516,8 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             texts = await asyncio.wait_for(
                 asyncio.to_thread(_pt.transcribe_performance, audio_path,
                                   artist, title,
-                                  result.get("reference_lyrics") or ""),
+                                  result.get("reference_lyrics") or "",
+                                  job_id),
                 timeout=300,
             )
             if texts:
@@ -5682,6 +5715,13 @@ async def _run_transcription_for_job(
     (caller owns that file)."""
     import tempfile
     import asyncio
+
+    # Bind inline/legacy requests too (the RQ entrypoint already does this).
+    # Context variables are copied into asyncio.to_thread, so every Replicate
+    # consumer below can attribute its prediction without threading job_id
+    # through a dozen fallback signatures.
+    from observability import set_job_log_context
+    set_job_log_context(job_id)
 
     if not filename:
         filename = os.path.basename(audio_path)
@@ -9379,7 +9419,11 @@ async def download(
     # sends Content-Disposition: attachment and the browser downloads
     # instead of opening the file inline.
     s3_key = (job.get("s3_keys") or {}).get(file_type)
-    if s3_key and storage.is_enabled():
+    # ProRes keys need a lifecycle-aware HEAD check in
+    # check_prores_readiness before redirecting. Other immutable artifacts
+    # retain the direct fast path.
+    if (s3_key and storage.is_enabled()
+            and file_type not in ("umg_master", "umg_short")):
         url = storage.generate_signed_url(
             s3_key, expiry_seconds=3600,
             download_filename=FILE_MAP.get(file_type),
@@ -9396,14 +9440,14 @@ async def download(
 
     file_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP[file_type])
 
-    # Lazy ProRes path: never run ffmpeg synchronously in the request
-    # thread. check_prores_readiness short-waits up to 15 s if a
-    # transcode is mid-flight; otherwise tells us to enqueue a prewarm
-    # and respond 202 + Retry-After. UMG's "first download" is now
-    # bounded to whatever this thread does — no 60-300 s blocking,
-    # no uvicorn-worker exhaustion under concurrent load.
+    # Lazy ProRes path: never run ffmpeg or blocking R2/lock readiness I/O on
+    # the event loop. check_prores_readiness may HEAD R2 and short-wait up to
+    # 15 s for an in-flight transcode, so the whole check runs in a worker
+    # thread before this handler decides between redirect, prewarm and 202.
     if file_type in ("umg_master", "umg_short"):
-        readiness = check_prores_readiness(job_id, file_type, job, tenant_id)
+        readiness = await asyncio.to_thread(
+            check_prores_readiness, job_id, file_type, job, tenant_id,
+        )
         if readiness.state == ProResReadiness.READY_LOCAL:
             pass  # fall through to FileResponse below
         elif readiness.state == ProResReadiness.READY_R2:
@@ -12158,6 +12202,18 @@ async def request_edit(
             job_id, job.input_r2_key, _exc,
         )
 
+    _pre_edit_status = job.status
+    _pre_edit_completed_at = job.completed_at
+    _pre_edit_editing_started_at = job.editing_started_at
+    # A rejected/error job can still represent a retained historical delivery
+    # when it was reopened after shipping. Clear only failed-attempt timestamps;
+    # an edit of a previously delivered song must not move the denominator to
+    # the new edit month.
+    if not job_was_delivered(
+        job.status, job.completed_at, job.editing_started_at,
+    ):
+        job.completed_at = None
+
     # Flip to editing immediately so the UI can show progress.
     job.status = "editing"
     job.edit_count = new_edit_count
@@ -12210,12 +12266,13 @@ async def request_edit(
             tenant_id=current_user.get("tenant_id", ""),
         )
     except Exception as exc:
-        # Enqueue failed (Redis down, unexpected RQ error). Roll back the DB
-        # to pending_review so the user can retry without waiting for the reaper.
+        # Enqueue failed (Redis down, unexpected RQ error). Restore the exact
+        # pre-edit state so the user can retry without waiting for the reaper.
         logger.error("enqueue_edit failed for %s: %s", job_id, exc)
-        job.status = "pending_review"
+        job.status = _pre_edit_status
+        job.completed_at = _pre_edit_completed_at
         job.edit_count = current_edit_count
-        job.editing_started_at = None
+        job.editing_started_at = _pre_edit_editing_started_at
         job.progress = 100
         job.current_step = "thumbnail"
         # Audit 2026-05-26: restore the pre-edit segments_json. The edit
@@ -12392,6 +12449,18 @@ async def regenerate_scene(
 
     # Nota: el re-roll de escena NO incrementa job.edit_count — tiene su propio
     # cupo (SCENE_REROLL_MAX, contado vía audit log arriba).
+    _pre_regen_status = job.status
+    _pre_regen_completed_at = job.completed_at
+    _pre_regen_editing_started_at = job.editing_started_at
+    _pre_regen_progress = job.progress
+    _pre_regen_current_step = job.current_step
+    # A rejection timestamp is not necessarily a failed-attempt timestamp: a
+    # rejected job may have been delivered before it was reopened. Keep that
+    # historical completion and clear only jobs that were never delivered.
+    if not job_was_delivered(
+        job.status, job.completed_at, job.editing_started_at,
+    ):
+        job.completed_at = None
     job.status = "editing"
     job.current_step = "scenes"
     job.progress = 0
@@ -12414,11 +12483,12 @@ async def regenerate_scene(
         )
     except Exception as exc:
         logger.error("enqueue_edit (scene) failed for %s: %s", job_id, exc)
-        job.status = "pending_review"
+        job.status = _pre_regen_status
+        job.completed_at = _pre_regen_completed_at
         # el re-roll de escena no tocó edit_count → nada que revertir acá
-        job.editing_started_at = None
-        job.progress = 100
-        job.current_step = "thumbnail"
+        job.editing_started_at = _pre_regen_editing_started_at
+        job.progress = _pre_regen_progress
+        job.current_step = _pre_regen_current_step
         db.commit()
         raise HTTPException(status_code=503, detail="No se pudo encolar la regeneración. Reintentá.")
 

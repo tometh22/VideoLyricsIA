@@ -1995,6 +1995,7 @@ export default function UploadZone({
       <div
         ref={effectControlsRef}
         data-testid="motion-studio"
+        data-tour="upload-motion-studio"
         className={`relative mb-4 overflow-hidden rounded-2xl border bg-[#0b0913]/90 shadow-[0_24px_70px_rgba(0,0,0,0.24)] transition-all duration-500 ${
           effectControlsPulse
             ? "scale-[1.006] border-brand/45 drop-shadow-[0_0_24px_rgba(139,92,246,0.18)]"
