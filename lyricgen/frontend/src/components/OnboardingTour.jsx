@@ -338,6 +338,13 @@ export function UploadTour({ user, forceRun = false, onDone }) {
         "La IA lo genera, lo elegís de la biblioteca de fondos pre-aprobados, o subís uno tuyo.",
     },
     {
+      target: '[data-tour="upload-motion-studio"]',
+      title: t("tour.upload_motion_title") || "Movimiento y Efecto",
+      content: t("tour.upload_motion_body") ||
+        "Ahora son dos: el Movimiento de la escena y el Efecto encima. Tocá una tarjeta para abrir su estudio, elegí, y volvé con la flecha ← arriba a la izquierda. Los cambios se ven en el preview al instante.",
+      placement: "bottom",
+    },
+    {
       target: '[data-tour="upload-text-case"]',
       title: t("tour.upload_textcase_title") || "Nuevo estilo Abc",
       content: t("tour.upload_textcase_body") ||
