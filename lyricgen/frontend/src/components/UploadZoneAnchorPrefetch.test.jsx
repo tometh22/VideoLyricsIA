@@ -24,7 +24,7 @@ vi.mock("../i18n", () => ({
   useI18n: () => ({ t: () => "", lang: "es" }),
 }));
 vi.mock("./OnboardingTour", () => ({
-  UploadTour: () => null,
+  UploadTour: () => null, MotionStudioCoach: () => null,
   EditorTour: () => null,
 }));
 vi.mock("./WizardLivePreview", () => ({ default: () => null }));

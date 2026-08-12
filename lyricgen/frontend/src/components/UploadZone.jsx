@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import Listbox from "./Listbox";
-import { UploadTour } from "./OnboardingTour";
+import { UploadTour, MotionStudioCoach } from "./OnboardingTour";
 import WizardLivePreview from "./WizardLivePreview";
 import TitleCardPreview, { AUTO_INTRO_THRESHOLD_S } from "./TitleCardPreview";
 import HelpTip from "./HelpCenter/HelpTip";
@@ -464,23 +464,7 @@ export default function UploadZone({
   // default, while either catalogue temporarily replaces the inspector body.
   // This keeps the page height stable as the catalogue grows.
   const [motionComposerView, setMotionComposerView] = useState(null);
-  // Coachmarks de primer uso del Motion Studio: (1) las tarjetas son clickeables
-  // y abren un estudio, (2) una vez adentro se vuelve con la flecha. Se muestran
-  // una vez por usuario (localStorage). Si el storage falla → "ya visto", no molestar.
-  const [motionCoach, setMotionCoach] = useState(() => {
-    try {
-      return {
-        intro: localStorage.getItem("genly_coach_motion_intro") === "1",
-        back: localStorage.getItem("genly_coach_motion_back") === "1",
-      };
-    } catch { return { intro: true, back: true }; }
-  });
-  const markMotionCoach = (key) => {
-    setMotionCoach((prev) => (prev[key] ? prev : { ...prev, [key]: true }));
-    try { localStorage.setItem(`genly_coach_motion_${key}`, "1"); } catch { /* storage bloqueado */ }
-  };
   const closeMotionComposer = () => {
-    markMotionCoach("back");
     const closingView = motionComposerView;
     setMotionComposerView(null);
     setHoverMovement(null);
@@ -2005,6 +1989,10 @@ export default function UploadZone({
         </div>
       )}
 
+      {/* Coachmark spotlight de primer uso (montado junto al studio → solo
+          existe en el paso Movimiento, cuando sus targets están en el DOM). */}
+      <MotionStudioCoach user={user} view={motionComposerView} />
+
       {/* Motion Studio: one cohesive creative surface. The confirmed state
           shows both decisions side by side; a catalogue temporarily takes over
           the same canvas so the editor never grows into a wall of controls. */}
@@ -2046,48 +2034,6 @@ export default function UploadZone({
           </div>
         </div>
 
-      {/* Coachmark de primer uso: en colapsado señala que las tarjetas se
-          tocan; adentro, que se vuelve con la flecha. Uno a la vez, una vez. */}
-      {(() => {
-        const showIntro = motionComposerView === null && !motionCoach.intro;
-        const showBack = motionComposerView !== null && !motionCoach.back;
-        if (!showIntro && !showBack) return null;
-        const key = showIntro ? "intro" : "back";
-        return (
-          <div className="relative col-span-full px-3.5 pt-0.5 pb-1 sm:px-4">
-            <div className="flex items-start gap-2.5 rounded-xl border border-brand/30 bg-brand/[0.09] px-3 py-2.5 shadow-[0_8px_24px_rgba(109,74,255,.16)] animate-fade-in">
-              <span className="mt-0.5 grid h-6 w-6 shrink-0 place-items-center rounded-full bg-brand/20 text-brand-light ring-1 ring-brand/30">
-                {showIntro ? (
-                  <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24" aria-hidden="true"><path strokeLinecap="round" strokeLinejoin="round" d="M15 9l-3 3m0 0l-3-3m3 3V4m6 8a6 6 0 11-12 0" /><path strokeLinecap="round" strokeLinejoin="round" d="M9 13l1.5 5.5a1 1 0 001.9.1L14 14l4 1.5a1 1 0 00.3-1.8L9 9" /></svg>
-                ) : (
-                  <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" aria-hidden="true"><path strokeLinecap="round" strokeLinejoin="round" d="m12 19-7-7 7-7M5 12h14" /></svg>
-                )}
-              </span>
-              <div className="min-w-0 flex-1">
-                <p className="text-[10px] font-semibold leading-tight text-white">
-                  {showIntro
-                    ? (t("upload.coach_motion_intro_title") || "Movimiento y Efecto viven acá")
-                    : (t("upload.coach_motion_back_title") || "¿Terminaste? Volvé para seguir")}
-                </p>
-                <p className="mt-0.5 text-[9px] leading-snug text-ink-secondary">
-                  {showIntro
-                    ? (t("upload.coach_motion_intro_body") || "Tocá una tarjeta para abrir su estudio y personalizarla. El preview se actualiza al instante.")
-                    : (t("upload.coach_motion_back_body") || "Usá la flecha ← de arriba a la izquierda para volver al Motion Studio y ajustar lo demás.")}
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => markMotionCoach(key)}
-                aria-label={t("common.cancel") || "Entendido"}
-                className="grid h-6 w-6 shrink-0 place-items-center rounded-lg text-[15px] leading-none text-gray-400 transition-colors hover:bg-white/[0.06] hover:text-white"
-              >
-                ×
-              </button>
-            </div>
-          </div>
-        );
-      })()}
-
       {/* Movement decision / catalogue. */}
       {motionComposerView !== "effect" && (
         <div className={motionComposerView === "movement"
@@ -2098,6 +2044,7 @@ export default function UploadZone({
               <div className="mb-3 flex items-center gap-2.5">
                 <button
                   type="button"
+                  data-tour="motion-back"
                   onClick={closeMotionComposer}
                   aria-label={t("common.back") || "Volver"}
                   className="grid h-8 w-8 shrink-0 place-items-center rounded-full border border-white/[0.08] bg-white/[0.025] text-gray-400 transition-all hover:border-white/[0.16] hover:bg-white/[0.06] hover:text-white"
@@ -2293,7 +2240,7 @@ export default function UploadZone({
               data-in-video={isAnchor("movementStyle", selectedMovement.code) ? "true" : undefined}
               aria-pressed="true"
               aria-haspopup="true"
-              onClick={() => { markMotionCoach("intro"); setMotionComposerView("movement"); }}
+              onClick={() => setMotionComposerView("movement")}
               className="group relative flex min-w-0 overflow-hidden rounded-xl border border-white/[0.08] bg-white/[0.025] text-left transition-all hover:-translate-y-0.5 hover:border-brand/35 hover:bg-white/[0.045] hover:shadow-[0_14px_30px_rgba(0,0,0,.2)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand sm:block"
             >
               <div className="relative h-[82px] w-[116px] shrink-0 overflow-hidden bg-black sm:h-[108px] sm:w-full">
@@ -2367,7 +2314,7 @@ export default function UploadZone({
             aria-pressed="true"
             aria-expanded={motionComposerView === "effect"}
             aria-haspopup="true"
-            onClick={() => { markMotionCoach("intro"); setMotionComposerView((view) => view === "effect" ? null : "effect"); }}
+            onClick={() => setMotionComposerView((view) => view === "effect" ? null : "effect")}
             className={`group w-full text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand ${
               motionComposerView === null
                 ? "relative flex min-w-0 overflow-hidden sm:block"
