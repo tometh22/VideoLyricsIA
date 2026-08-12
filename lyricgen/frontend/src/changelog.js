@@ -33,6 +33,27 @@
 // técnica. El historial largo (highlightKeys/body) sigue viviendo en el panel.
 export const CHANGELOG = [
   {
+    id: "editor-studio-agosto",
+    date: "2026-08-12",
+    titleKey: "announce.editor2_title",
+    taglineKey: "announce.editor2_tagline",
+    bodyKey: "announce.editor2_body",
+    visual: "control",
+    highlightKeys: [
+      "announce.editor2_hl1",
+      "announce.editor2_hl2",
+      "announce.editor2_hl3",
+    ],
+    modalFeatures: [
+      { titleKey: "announce.editor2_f1_title", bodyKey: "announce.editor2_f1_body" },
+      { titleKey: "announce.editor2_f2_title", bodyKey: "announce.editor2_f2_body" },
+      { titleKey: "announce.editor2_f3_title", bodyKey: "announce.editor2_f3_body" },
+    ],
+    ctaKey: "announce.editor2_cta",
+    ctaTo: "/new",
+    featured: true,
+  },
+  {
     id: "mas-control-julio-v2",
     date: "2026-07-22",
     titleKey: "announce.control_title",
@@ -51,7 +72,7 @@ export const CHANGELOG = [
     ],
     ctaKey: "announce.control_cta",
     ctaTo: "/new",
-    featured: true,
+    // ya no featured: el editor-studio-agosto tomó la posta 12/08.
   },
   {
     id: "motor-v2",
