@@ -373,6 +373,47 @@ export function UploadTour({ user, forceRun = false, onDone }) {
   return <TourRunner flagKey={FLAGS.upload} steps={steps} user={user} forceRun={forceRun} onDone={onDone} />;
 }
 
+// ─── Coachmark: Motion Studio (primer uso, SIN age-gate) ─────────
+// Spotlight one-shot con el mismo tooltip de marca de los tours. Resalta que
+// (1) las tarjetas del Motion Studio se tocan para abrir su estudio y (2) una
+// vez en Movimiento se vuelve con la flecha. Se muestra a TODOS (nuevos y
+// existentes) una sola vez por tipo — `forceRun` saltea el gate de edad y el
+// flag de localStorage evita repetirlo.
+function coachSeen(key) {
+  if (typeof window === "undefined") return true;
+  try { return localStorage.getItem(key) === "1"; } catch { return true; }
+}
+
+export function MotionStudioCoach({ user, view }) {
+  const { t } = useI18n();
+  const active =
+    (!view && !coachSeen("genly_coach_motion_intro_v2")) ? "intro"
+      : (view === "movement" && !coachSeen("genly_coach_motion_back_v2")) ? "back"
+        : null;
+  const steps = useMemo(() => {
+    if (active === "intro") return [{
+      target: '[data-tour="upload-motion-studio"]',
+      title: t("upload.coach_motion_intro_title") || "Movimiento y Efecto viven acá",
+      content: t("upload.coach_motion_intro_body") ||
+        "Tocá una tarjeta para abrir su estudio y personalizarla. El preview se actualiza al instante.",
+      placement: "left",
+      disableBeacon: true,
+    }];
+    if (active === "back") return [{
+      target: '[data-tour="motion-back"]',
+      title: t("upload.coach_motion_back_title") || "¿Terminaste? Volvé para seguir",
+      content: t("upload.coach_motion_back_body") ||
+        "Usá esta flecha para volver al Motion Studio y ajustar lo demás.",
+      placement: "bottom-start",
+      disableBeacon: true,
+    }];
+    return [];
+  }, [active, t]);
+  if (!active) return null;
+  const flagKey = active === "intro" ? "genly_coach_motion_intro_v2" : "genly_coach_motion_back_v2";
+  return <TourRunner key={active} flagKey={flagKey} steps={steps} user={user} forceRun />;
+}
+
 // ─── Tour 3: Lyrics Editor ───────────────────────────────────────
 export function EditorTour({ user, viewMode = "basic", forceRun = false, onDone }) {
   const { t } = useI18n();

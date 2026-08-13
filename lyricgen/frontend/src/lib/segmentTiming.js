@@ -127,3 +127,74 @@ export function clampResizeTiming(
   }
   return { start, end, blocked: false };
 }
+
+/**
+ * Resize one edge and, when two lyric lines are packed together, move the
+ * shared boundary instead of making the dragged handle look frozen.
+ *
+ * The adjacent line keeps its opposite edge, so this is a local two-line
+ * edit rather than a cascade through the rest of the song. Both lines retain
+ * the configured minimum duration and gap.
+ */
+export function clampResizeTimingWithAdjacent(
+  allSegments, id, requestedStart, requestedEnd, duration, gap = 0.05, minDuration = 0.3,
+  edge = null,
+) {
+  const bounded = clampResizeTiming(
+    allSegments, id, requestedStart, requestedEnd, duration, gap, minDuration, edge,
+  );
+  if (!bounded) return null;
+
+  const index = allSegments.findIndex((segment) => segment?._id === id);
+  const segment = allSegments[index];
+  const safeGap = Math.max(0, Number(gap) || 0);
+  const safeMinDuration = Math.max(0, Number(minDuration) || 0);
+  const single = (result = bounded) => ({
+    changes: [{ id, start: result.start, end: result.end }],
+    blocked: result.blocked,
+    coupled: false,
+  });
+
+  if (edge === "end") {
+    const next = index + 1 < allSegments.length ? allSegments[index + 1] : null;
+    const requested = Number(requestedEnd);
+    if (!next || !Number.isFinite(requested) || requested <= bounded.end + 1e-6) return single();
+
+    const songCeiling = Number(duration) > 0 ? Number(duration) : Infinity;
+    const maxEnd = Math.min(Number(next.end) - safeMinDuration - safeGap, songCeiling);
+    const end = Math.min(requested, maxEnd);
+    if (!Number.isFinite(end) || end <= bounded.end + 1e-6) {
+      return { ...single(), blocked: true };
+    }
+    return {
+      changes: [
+        { id, start: Number(segment.start), end },
+        { id: next._id, start: end + safeGap, end: Number(next.end) },
+      ],
+      blocked: false,
+      coupled: true,
+    };
+  }
+
+  if (edge === "start") {
+    const previous = index > 0 ? allSegments[index - 1] : null;
+    const requested = Number(requestedStart);
+    if (!previous || !Number.isFinite(requested) || requested >= bounded.start - 1e-6) return single();
+
+    const minStart = Number(previous.start) + safeMinDuration + safeGap;
+    const start = Math.max(requested, minStart, 0);
+    if (!Number.isFinite(start) || start >= bounded.start - 1e-6) {
+      return { ...single(), blocked: true };
+    }
+    return {
+      changes: [
+        { id: previous._id, start: Number(previous.start), end: start - safeGap },
+        { id, start, end: Number(segment.end) },
+      ],
+      blocked: false,
+      coupled: true,
+    };
+  }
+
+  return single();
+}

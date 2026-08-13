@@ -31,7 +31,7 @@ import { normalizeMovementCode } from "../lib/catalogCodes";
 vi.mock("../i18n", () => ({
   useI18n: () => ({ t: (key) => key, lang: "es" }),
 }));
-vi.mock("./OnboardingTour", () => ({ UploadTour: () => null, EditorTour: () => null }));
+vi.mock("./OnboardingTour", () => ({ UploadTour: () => null, MotionStudioCoach: () => null, EditorTour: () => null }));
 vi.mock("./WizardLivePreview", () => ({ default: () => null }));
 vi.mock("./TitleCardPreview", () => ({ default: () => null }));
 vi.mock("./HelpCenter/HelpTip", () => ({ default: () => null }));

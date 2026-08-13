@@ -13,7 +13,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
-import { clampResizeTiming, clampSelectionShiftDelta } from "../lib/segmentTiming";
+import { clampResizeTimingWithAdjacent, clampSelectionShiftDelta } from "../lib/segmentTiming";
 
 const ZOOM_DEFAULT = 48;
 const ZOOM_MIN = 8;
@@ -299,7 +299,14 @@ export default function LyricsTimeline({
       return;
     }
     const movingGroup = mode === "move" && selectedIds.has(segment._id) && selectedIds.size > 1;
-    const snapshots = (movingGroup ? normalizedSegments.filter((item) => selectedIds.has(item._id)) : [segment])
+    const segmentIndex = normalizedSegments.findIndex((item) => item._id === segment._id);
+    const resizeNeighbour = mode === "start"
+      ? normalizedSegments[segmentIndex - 1]
+      : mode === "end" ? normalizedSegments[segmentIndex + 1] : null;
+    const snapshotSegments = movingGroup
+      ? normalizedSegments.filter((item) => selectedIds.has(item._id))
+      : [segment, resizeNeighbour].filter(Boolean);
+    const snapshots = snapshotSegments
       .map((item) => ({ id: item._id, start: item.start, end: item.end }));
     if (!selectedIds.has(segment._id)) {
       selectionAnchorRef.current = segment._id;
@@ -312,6 +319,7 @@ export default function LyricsTimeline({
       snapshots,
       origStart: segment.start,
       origEnd: segment.end,
+      movingGroup,
       moved: false,
       pxPerSec,
       startedAt: performance.now(),
@@ -338,7 +346,7 @@ export default function LyricsTimeline({
         onDragStart?.();
       }
     }
-    if (drag.snapshots.length > 1) {
+    if (drag.movingGroup) {
       const safeDelta = clampSelectionShiftDelta(
         normalizedSegments,
         new Set(drag.snapshots.map((item) => item.id)),
@@ -355,7 +363,7 @@ export default function LyricsTimeline({
     let start = drag.origStart;
     let end = drag.origEnd;
     if (drag.mode === "start" || drag.mode === "end") {
-      const bounded = clampResizeTiming(
+      const resize = clampResizeTimingWithAdjacent(
         normalizedSegments,
         drag.id,
         drag.mode === "start" ? drag.origStart + delta : drag.origStart,
@@ -365,8 +373,13 @@ export default function LyricsTimeline({
         MIN_DUR_S,
         drag.mode,
       );
-      if (bounded) ({ start, end } = bounded);
-      setLimitFeedback(bounded?.blocked ? "La línea no tiene espacio para cambiar su duración." : "");
+      const ownChange = resize?.changes?.find((change) => change.id === drag.id);
+      if (ownChange) ({ start, end } = ownChange);
+      setLimitFeedback(resize?.blocked ? "La línea no tiene espacio para cambiar su duración." : "");
+      if (resize?.changes?.length > 1) {
+        setPreview({ changes: resize.changes, mode: drag.mode });
+        return;
+      }
     } else {
       const safeDelta = clampSelectionShiftDelta(
         normalizedSegments, new Set([drag.id]), delta, total, gapS,
@@ -402,8 +415,8 @@ export default function LyricsTimeline({
         return original && (Math.abs(original.start - change.start) > 1e-3 || Math.abs(original.end - change.end) > 1e-3);
       });
       const durationMs = Math.max(0, performance.now() - drag.startedAt);
-      if (changes.length) onTimingChangeBatch?.(changes, { durationMs });
-      if (changes.length) onGroupMoved?.({ count: changes.length, delta: changes[0].start - drag.snapshots[0].start });
+      if (changes.length) onTimingChangeBatch?.(changes, { durationMs, operation: drag.mode === "move" ? "move" : "resize" });
+      if (changes.length && drag.movingGroup) onGroupMoved?.({ count: changes.length, delta: changes[0].start - drag.snapshots[0].start });
       return;
     }
     if (Math.abs(current.start - segment.start) > 1e-3 || Math.abs(current.end - segment.end) > 1e-3) {

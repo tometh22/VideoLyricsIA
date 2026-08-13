@@ -27,7 +27,7 @@ vi.mock("../i18n", () => ({
   }),
 }));
 vi.mock("./OnboardingTour", () => ({
-  UploadTour: () => null,
+  UploadTour: () => null, MotionStudioCoach: () => null,
   EditorTour: () => null,
 }));
 vi.mock("./WizardLivePreview", () => ({ default: () => null }));

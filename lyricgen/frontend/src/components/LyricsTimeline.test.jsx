@@ -270,6 +270,26 @@ describe("LyricsTimeline", () => {
     expect(end).toBeCloseTo(11.1, 4);
   });
 
+  it("extends a packed line by moving the shared boundary with its neighbour", () => {
+    const props = setup({
+      segments: [
+        { _id: "a", start: 0, end: 2, text: "línea actual" },
+        { _id: "b", start: 2.05, end: 3.5, text: "línea siguiente" },
+      ],
+    });
+    const block = screen.getAllByTestId("timeline-segment")[0];
+    const edge = block.querySelector('[data-testid="timeline-edge-end"]');
+    fireEvent.pointerDown(edge, { clientX: 100, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(edge, { clientX: 124, pointerId: 1 });
+    fireEvent.pointerUp(edge, { clientX: 124, pointerId: 1 });
+
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+    expect(props.onTimingChangeBatch).toHaveBeenCalledWith([
+      { id: "a", start: 0, end: 2.5 },
+      { id: "b", start: 2.55, end: 3.5 },
+    ], expect.objectContaining({ operation: "resize" }));
+  });
+
   it("edits line text inline", () => {
     const props = setup();
     const block = screen.getAllByTestId("timeline-segment")[1];
