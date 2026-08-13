@@ -99,7 +99,10 @@ test.describe("Editor 2.0 real collaboration", () => {
     await a.page.getByTestId("editor-overflow-btn").click();
     await a.page.getByRole("menuitem", { name: /Historial de versiones/ }).click();
     await expect(a.page.getByRole("dialog", { name: "Historial de versiones" })).toBeVisible();
-    await expect(a.page.getByText(`Revisión ${latestRevision}`)).toBeVisible();
+    // Draft autosaves advance the durable CAS revision but intentionally do
+    // not create a visible history checkpoint. The immutable migration
+    // checkpoint must remain available after the silent merge flow.
+    await expect(a.page.getByText("Revisión 0")).toBeVisible();
 
     await a.context.close();
     await b.context.close();
