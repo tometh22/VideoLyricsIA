@@ -237,7 +237,7 @@ test.describe("lyrics editor browser contract", () => {
     await expect(page.getByTestId("timeline-label-row").last()).toBeVisible();
   });
 
-  test("resizes a line from a generous edge hit area with one continuous drag", async ({ page }) => {
+  test("resizes a packed line from a generous edge and moves the shared boundary", async ({ page }) => {
     const harness = await installEditorHarness(page, {
       segments: [
         { _id: "wide", start: 0.4, end: 2.4, text: "Línea para estirar" },
@@ -261,9 +261,13 @@ test.describe("lyrics editor browser contract", () => {
 
     await expect.poll(async () => block.evaluate((element) => parseFloat(element.style.width))).toBeGreaterThan(beforeWidth + 10);
     await expect.poll(() => harness.saves.length).toBeGreaterThan(0);
-    const saved = harness.saves.at(-1).segments.find((segment) => segment.text === "Línea para estirar");
-    expect(Number(saved.end)).toBeCloseTo(2.65, 2);
-    expect(Number(saved.end)).toBeLessThanOrEqual(2.65 + Number.EPSILON * 4);
+    const savedSegments = harness.saves.at(-1).segments;
+    const saved = savedSegments.find((segment) => segment.text === "Línea para estirar");
+    const savedNext = savedSegments.find((segment) => segment.text === "Línea siguiente");
+    expect(Number(saved.end)).toBeCloseTo(2.9, 2);
+    expect(Number(savedNext.start)).toBeCloseTo(2.95, 2);
+    expect(Number(savedNext.start) - Number(saved.end)).toBeCloseTo(0.05, 2);
+    expect(Number(savedNext.end) - Number(savedNext.start)).toBeGreaterThanOrEqual(0.3);
   });
 
   test("moves a short line from its body while resize handles stay outside", async ({ page }) => {

@@ -226,6 +226,27 @@ describe("LyricsTimeline", () => {
     expect(screen.getByText("Sonando")).toBeInTheDocument();
   });
 
+  it("moves playheads with compositor transforms instead of layout left", () => {
+    setup({ activeId: 1, currentTime: 2.5 });
+    const main = screen.getByTestId("timeline-playhead");
+    const active = screen.getByTestId("timeline-active-playhead");
+    expect(main.style.left).toBe("");
+    expect(active.style.left).toBe("");
+    expect(main.style.transform).toBe("translate3d(120px, 0, 0)");
+    expect(active.style.transform).toBe("translate3d(120px, 0, 0)");
+  });
+
+  it("does not scroll the outer editor when the active lyric changes", () => {
+    const scrollIntoView = vi.fn();
+    const original = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scrollIntoView;
+    const props = { segments: SEGS, duration: 60, currentTime: 5, isPlaying: true, activeId: 0 };
+    const { rerender } = render(<LyricsTimeline {...props} />);
+    rerender(<LyricsTimeline {...props} currentTime={10} activeId={1} />);
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    HTMLElement.prototype.scrollIntoView = original;
+  });
+
   it("resizes timing from either horizontal edge", () => {
     const props = setup();
     const block = screen.getAllByTestId("timeline-segment")[1];
@@ -235,6 +256,38 @@ describe("LyricsTimeline", () => {
     fireEvent.pointerUp(edge, { clientX: 1080, pointerId: 1 });
     expect(props.onTimingChange).toHaveBeenCalledWith(1, 10, expect.any(Number));
     expect(props.onTimingChange.mock.calls[0][2]).toBeGreaterThan(11);
+  });
+
+  it("uses Alt for fine edge adjustment", () => {
+    const props = setup();
+    const block = screen.getAllByTestId("timeline-segment")[1];
+    const edge = block.querySelector('[data-testid="timeline-edge-end"]');
+    fireEvent.pointerDown(edge, { clientX: 1000, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(edge, { clientX: 1048, pointerId: 1, altKey: true });
+    fireEvent.pointerUp(edge, { clientX: 1048, pointerId: 1, altKey: true });
+    const [, start, end] = props.onTimingChange.mock.calls[0];
+    expect(start).toBe(10);
+    expect(end).toBeCloseTo(11.1, 4);
+  });
+
+  it("extends a packed line by moving the shared boundary with its neighbour", () => {
+    const props = setup({
+      segments: [
+        { _id: "a", start: 0, end: 2, text: "línea actual" },
+        { _id: "b", start: 2.05, end: 3.5, text: "línea siguiente" },
+      ],
+    });
+    const block = screen.getAllByTestId("timeline-segment")[0];
+    const edge = block.querySelector('[data-testid="timeline-edge-end"]');
+    fireEvent.pointerDown(edge, { clientX: 100, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(edge, { clientX: 124, pointerId: 1 });
+    fireEvent.pointerUp(edge, { clientX: 124, pointerId: 1 });
+
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+    expect(props.onTimingChangeBatch).toHaveBeenCalledWith([
+      { id: "a", start: 0, end: 2.5 },
+      { id: "b", start: 2.55, end: 3.5 },
+    ], expect.objectContaining({ operation: "resize" }));
   });
 
   it("edits line text inline", () => {
@@ -264,7 +317,7 @@ describe("LyricsTimeline", () => {
     expect(props.onReset).toHaveBeenCalledTimes(1);
   });
 
-  it("auto-follows the playhead once and does not restart a pending smooth scroll", () => {
+  it("auto-follows the playhead once without issuing near-duplicate scrolls", () => {
     const props = {
       segments: SEGS,
       duration: 60,
