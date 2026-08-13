@@ -11528,6 +11528,29 @@ async def reanchor_segments(
             ))
         except Exception as e:  # noqa: BLE001 — audit best-effort
             logger.warning("[REANCHOR] audit log failed: %s", e)
+        # Audit 2026-08-13: bridge into editor_documents, same as
+        # /save-segments (main.py sync_legacy_snapshot call) — this
+        # endpoint used to write job.segments_json directly and commit
+        # without it, which is the same divergence-then-stomp bug fixed on
+        # /edit above: the next GET /editor would see job_revision >
+        # document_revision and reconcile by overwriting whatever was in
+        # the durable editor document with this re-anchored snapshot,
+        # silently discarding any newer edit made in the editor meanwhile.
+        try:
+            _reanchor_document = get_or_create_document(
+                _db2, job_id, row.tenant_id, row.segments_json or [],
+            )
+            sync_legacy_snapshot(
+                _db2, _reanchor_document, current_user["id"],
+                row.segments_json or [], persisted_revision,
+            )
+        except (LookupError, ValueError, RuntimeError) as exc:
+            _db2.rollback()
+            logger.warning("[REANCHOR] editor bridge rejected job=%s: %s", job_id, exc)
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "editor_state_conflict", "detail": str(exc)},
+            ) from exc
         _db2.commit()
     finally:
         _db2.close()
@@ -11948,25 +11971,66 @@ async def request_edit(
                     "current_revision": _pre_edit_revision,
                 },
             )
-        if (body.base_revision is not None
-                and body.base_revision != _pre_edit_revision):
-            from ops_metrics import increment
-            increment("segments_revision_conflict")
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "code": "stale_revision",
-                    "current_revision": _pre_edit_revision,
-                    "updated_at": (
-                        job.last_user_activity_at.isoformat()
-                        if job.last_user_activity_at else None
-                    ),
-                },
-            )
         if _approved_editor_version is None:
-            job.segments_json = normalized_segments
-            if body.base_revision is not None:
-                job.segments_revision = _pre_edit_revision + 1
+            # Audit 2026-08-13: this used to write job.segments_json /
+            # job.segments_revision directly, checked only against
+            # job.segments_revision. That let editor_documents (the
+            # LyricsEditor's durable source of truth) fall out of sync with
+            # the job row — any writer here (including a background-only
+            # edit that merely carries along whatever segments the wizard
+            # had cached, per editSubmission.js bundling all pending
+            # buckets into one POST) could advance job.segments_revision
+            # without editor_documents ever knowing. The next GET /editor
+            # then saw job_revision > document_revision and reconciled by
+            # blindly overwriting editor_documents.current_segments with
+            # the job's segments (editor.py get_or_create_document) —
+            # silently stomping real edits with a stale wizard snapshot.
+            # Confirmed root cause of a real incident (UMG Chile,
+            # 2026-08-13): "edité la letra y luego me borró partes en un
+            # segundo cambio de fondo".
+            #
+            # Fix: route through the same durable save_document() path
+            # PATCH /editor and /save-segments already use. It re-fetches
+            # job + document under a row lock and checks base_revision
+            # against document.revision (the actual source of truth, not
+            # a separately-tracked counter that can drift), so both rows
+            # move together atomically — no more divergence, no more
+            # stale-snapshot overwrite on the next reconcile.
+            _edit_document = get_or_create_document(
+                db, job_id, job.tenant_id, job.segments_json or [],
+            )
+            _pre_edit_document_segments = _edit_document.current_segments
+            _pre_edit_document_revision = _edit_document.revision
+            try:
+                save_document(
+                    db, job, _edit_document, current_user["id"],
+                    base_revision=(
+                        body.base_revision if body.base_revision is not None
+                        else _edit_document.revision
+                    ),
+                    segments=normalized_segments,
+                    reason="manual",
+                )
+            except RuntimeError:
+                from ops_metrics import increment
+                increment("segments_revision_conflict")
+                _conflict_document = get_or_create_document(
+                    db, job_id, job.tenant_id, job.segments_json or [],
+                )
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "code": "stale_revision",
+                        "detail": "editor_revision_conflict",
+                        "current_revision": _conflict_document.revision,
+                        "server_revision": _conflict_document.revision,
+                        "server_segments": _conflict_document.current_segments,
+                        "updated_at": (
+                            job.last_user_activity_at.isoformat()
+                            if job.last_user_activity_at else None
+                        ),
+                    },
+                )
 
     edit_params: dict = {}
     if body.font is not None:
@@ -12348,6 +12412,34 @@ async def request_edit(
             # body.segments was non-empty. Non-lyrics edits (typography,
             # background) skip that branch and don't need the rollback.
             pass
+        # Audit 2026-08-13: mirror the same rollback on editor_documents.
+        # Since the segments write above now goes through save_document()
+        # (job + document move together atomically), leaving the document
+        # at its new revision while job.segments_json reverts would
+        # reintroduce the exact divergence this fix exists to close.
+        # Two separate try/excepts on purpose: the first only guards against
+        # the (expected, common) NameError from a non-lyrics edit that never
+        # touched the document at all — anything else there is a real bug
+        # and should surface. The second is genuinely best-effort (mirrors
+        # this file's existing "audit logging is best-effort" convention):
+        # get_or_create_document does its own row-locked reconciliation
+        # query, and this whole block exists only to restore a UI nicety
+        # (the LyricsEditor showing pre-edit content) — it must never be
+        # able to swallow the actual state rollback above or the final
+        # db.commit() below.
+        _had_document_write = "_pre_edit_document_revision" in locals()
+        if _had_document_write:
+            try:
+                _rollback_document = get_or_create_document(
+                    db, job_id, job.tenant_id, job.segments_json or [],
+                )
+                _rollback_document.current_segments = _pre_edit_document_segments
+                _rollback_document.revision = _pre_edit_document_revision
+            except Exception as _doc_rollback_exc:  # noqa: BLE001
+                logger.warning(
+                    "[EDIT] editor_documents rollback failed for %s (job rollback "
+                    "still applies): %s", job_id, _doc_rollback_exc,
+                )
         # PR C 2026-05-26: same rollback for metadata. If the enqueue
         # never landed, the visible artist/song_title in JobDetail would
         # lie — operator clicks "Guardar título", error, but UI still
