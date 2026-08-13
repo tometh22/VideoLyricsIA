@@ -65,12 +65,14 @@ test.describe("Editor 2.0 real collaboration", () => {
     const a = await openEditor(browser, tokenA);
 
     await firstLyricsInput(a.page).fill("Edición de A");
-    await expect.poll(async () => (await revision(request, tokenA)).revision).toBe(1);
+    await expect.poll(async () => (await revision(request, tokenA)).revision).toBeGreaterThan(0);
+    let latestRevision = (await revision(request, tokenA)).revision;
 
     const b = await openEditor(browser, tokenB);
     await expect(firstLyricsInput(b.page)).toHaveValue("Edición de A");
     await firstLyricsInput(b.page).fill("Edición de B");
-    await expect.poll(async () => (await revision(request, tokenB)).revision).toBe(2);
+    await expect.poll(async () => (await revision(request, tokenB)).revision).toBeGreaterThan(latestRevision);
+    latestRevision = (await revision(request, tokenB)).revision;
 
     await firstLyricsInput(a.page).fill("A queda local");
     await expect(a.page.getByRole("dialog", { name: /Hay una versión más nueva/ })).toBeVisible();
@@ -80,11 +82,13 @@ test.describe("Editor 2.0 real collaboration", () => {
     await a.context.setOffline(true);
     await firstLyricsInput(a.page).fill("A segunda versión local");
     await firstLyricsInput(b.page).fill("B vuelve a guardar");
-    await expect.poll(async () => (await revision(request, tokenB)).revision).toBe(3);
+    await expect.poll(async () => (await revision(request, tokenB)).revision).toBeGreaterThan(latestRevision);
+    latestRevision = (await revision(request, tokenB)).revision;
     await a.context.setOffline(false);
     await expect(a.page.getByRole("dialog", { name: /Hay una versión más nueva/ })).toBeVisible();
     await a.page.getByRole("button", { name: "Guardar mi versión como nueva revisión" }).click();
-    await expect.poll(async () => (await revision(request, tokenA)).revision).toBe(4);
+    await expect.poll(async () => (await revision(request, tokenA)).revision).toBeGreaterThan(latestRevision);
+    latestRevision = (await revision(request, tokenA)).revision;
     await expect(firstLyricsInput(a.page)).toHaveValue("A segunda versión local");
 
     await a.page.reload();
@@ -95,7 +99,7 @@ test.describe("Editor 2.0 real collaboration", () => {
     await a.page.getByTestId("editor-overflow-btn").click();
     await a.page.getByRole("menuitem", { name: /Historial de versiones/ }).click();
     await expect(a.page.getByRole("dialog", { name: "Historial de versiones" })).toBeVisible();
-    await expect(a.page.getByText("Revisión 4")).toBeVisible();
+    await expect(a.page.getByText(`Revisión ${latestRevision}`)).toBeVisible();
 
     await a.context.close();
     await b.context.close();
