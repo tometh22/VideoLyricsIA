@@ -20,6 +20,7 @@ import { splitWordsAtCharOffset, firstWordStart, lastWordEnd } from "../lib/spli
 import useLocalStorage from "../hooks/useLocalStorage";
 import { useEditorDocument } from "../hooks/useEditorDocument";
 import { useEditorAutosave } from "../hooks/useEditorAutosave";
+import { mergeThreeWay, segmentsEquivalent } from "../editorMerge";
 import { createSaveQueue } from "../lib/saveQueue";
 import ConflictDialog from "./ConflictDialog";
 import VersionHistory from "./VersionHistory";
@@ -781,8 +782,12 @@ export default function LyricsEditor({
             setSaveErrorReason("draft-corrupt");
           } else {
             const local = sanitizeSegments(draft.segments);
-            const sameContent = JSON.stringify(sanitizeSegmentsForPersistence(local))
-              === JSON.stringify(sanitizeSegmentsForPersistence(remote));
+            // A local draft can outlive a background/typography edit. Those
+            // operations may advance the document revision or refresh
+            // renderer metadata without changing any operator-owned lyric
+            // content. Comparing raw JSON here made that harmless case look
+            // like a collaboration conflict as soon as the editor reopened.
+            const sameContent = segmentsEquivalent(local, remote);
             if (sameContent) {
               localStorage.removeItem(draftKey);
             } else if (Number.isInteger(draft.base_revision)
@@ -791,14 +796,28 @@ export default function LyricsEditor({
               markDirty = true;
               setSaveStatus("local");
             } else {
-              next = local;
-              markDirty = true;
-              durableEditor.stageConflict(local, {
-                reason: Number.isInteger(draft.base_revision) ? "stale-draft" : "unversioned-draft",
-              });
-              setSaveStatus("conflict");
-              setSaveErrorReason("conflict");
-              setConflictDialogOpen(true);
+              const baseSegments = Array.isArray(draft.base_segments)
+                ? sanitizeSegments(draft.base_segments)
+                : null;
+              const merged = baseSegments
+                ? mergeThreeWay(baseSegments, local, remote)
+                : { merged: [], conflicts: [{ key: "unknown-base" }] };
+              if (merged.conflicts.length === 0) {
+                next = merged.merged;
+                markDirty = !segmentsEquivalent(next, remote);
+                if (markDirty) setSaveStatus("local");
+                else localStorage.removeItem(draftKey);
+              } else {
+                next = local;
+                markDirty = true;
+                durableEditor.stageConflict(local, {
+                  baseSegments,
+                  reason: Number.isInteger(draft.base_revision) ? "stale-draft" : "unversioned-draft",
+                });
+                setSaveStatus("conflict");
+                setSaveErrorReason("conflict");
+                setConflictDialogOpen(true);
+              }
             }
           }
         }
@@ -894,6 +913,9 @@ export default function LyricsEditor({
       const cleaned = sanitizeSegmentsForPersistence(edited);
       localStorage.setItem(draftKey, JSON.stringify({
         segments: cleaned,
+        base_segments: editorV2Enabled
+          ? sanitizeSegmentsForPersistence(durableEditor.document?.segments || [])
+          : undefined,
         base_revision: editorV2Enabled
           ? durableEditor.revisionRef.current
           : (saveQueueRef.current._peek(transcribeJobId)?.revision || 0),
@@ -938,6 +960,9 @@ export default function LyricsEditor({
           try {
             localStorage.setItem(draftKey, JSON.stringify({
               segments: cleaned,
+              base_segments: editorV2Enabled
+                ? sanitizeSegmentsForPersistence(durableEditor.document?.segments || [])
+                : undefined,
               base_revision: saveQueueRef.current._peek(transcribeJobId)?.revision || 0,
               updated_at: new Date().toISOString(),
             }));

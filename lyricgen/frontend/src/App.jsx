@@ -3433,15 +3433,17 @@ export default function App() {
             navigate(`/videos/${editedJobId}`, { replace: true });
             return { ok: true, duplicate: true };
           }
-          const friendly = translateBackendError(data?.detail, t) || `Error ${res.status}`;
-          alert({
-            title: t("edit.error_title") || "No pudimos aplicar el edit",
-            description: friendly,
-            tone: "error",
-          });
-          console.warn("[edit-wizard] /edit failed", { status: res.status, detail: data });
           const conflict = data?.detail && typeof data.detail === "object"
             && data.detail.detail === "editor_revision_conflict";
+          console.warn("[edit-wizard] /edit failed", { status: res.status, detail: data });
+          if (!conflict) {
+            const friendly = translateBackendError(data?.detail, t) || `Error ${res.status}`;
+            alert({
+              title: t("edit.error_title") || "No pudimos aplicar el edit",
+              description: friendly,
+              tone: "error",
+            });
+          }
           return {
             ok: false,
             reason: conflict ? "conflict" : `http-${res.status}`,
