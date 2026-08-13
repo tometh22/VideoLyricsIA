@@ -42,6 +42,21 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    if bind.dialect.name == "sqlite":
+        # SQLite has no CONCURRENTLY syntax. The migration chain is also
+        # exercised against fresh SQLite databases in CI and local tests.
+        op.create_index(
+            "ix_jobs_tenant_status_created",
+            "jobs",
+            ["tenant_id", "status", "created_at"],
+        )
+        op.create_index(
+            "ix_jobs_tenant_created",
+            "jobs",
+            ["tenant_id", "created_at"],
+        )
+        return
     # autocommit_block exits the migration's surrounding transaction so
     # CREATE INDEX CONCURRENTLY (which Postgres refuses to run inside a
     # txn) succeeds. IF NOT EXISTS makes the migration safe to re-run
@@ -58,6 +73,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    bind = op.get_bind()
+    if bind.dialect.name == "sqlite":
+        op.drop_index("ix_jobs_tenant_created", table_name="jobs")
+        op.drop_index("ix_jobs_tenant_status_created", table_name="jobs")
+        return
     with op.get_context().autocommit_block():
         op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_jobs_tenant_created")
         op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_jobs_tenant_status_created")

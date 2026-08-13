@@ -1,6 +1,7 @@
 """PostgreSQL database layer with SQLAlchemy + async support."""
 
 import os
+import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
@@ -220,6 +221,13 @@ class Job(Base):
     # the reaper if the upload is abandoned).
     multipart_upload_id = Column(String(255), nullable=True)
 
+    # Durable lyrics snapshot used by the review editor.  The worker still
+    # receives segments_override from /generate, but the editor writes its
+    # draft here with optimistic concurrency so an old tab can never silently
+    # overwrite a newer correction.
+    segments_json = Column(JSON, nullable=True)
+    segments_revision = Column(Integer, nullable=False, default=0, server_default="0")
+
     # YouTube info
     youtube_data = Column(JSON, nullable=True)
 
@@ -260,6 +268,7 @@ class Job(Base):
             },
             "s3_keys": self.s3_keys,
             "error": self.error,
+            "segments_revision": self.segments_revision or 0,
             "youtube": self.youtube_data,
             "validation_result": self.validation_result,
             "approved_by": self.approved_by,
@@ -434,6 +443,24 @@ class LyricsCache(Base):
     fetched_by_model = Column(String(64), nullable=True)
 
 
+class EditorVersion(Base):
+    """Immutable editor checkpoints for recovery and auditability."""
+    __tablename__ = "editor_versions"
+    __table_args__ = (
+        Index("ix_editor_versions_job_revision", "job_id", "revision", unique=True),
+        Index("ix_editor_versions_job_created", "job_id", "created_at"),
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    job_id = Column(String(12), ForeignKey("jobs.job_id", ondelete="CASCADE"), nullable=False)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    revision = Column(Integer, nullable=False)
+    segments = Column(JSON, nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reason = Column(String(30), nullable=False, default="autosave")
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 # ---------------------------------------------------------------------------
 # Init
 # ---------------------------------------------------------------------------
@@ -462,6 +489,8 @@ def _migrate_user_columns():
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS song_title VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS input_r2_key VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS multipart_upload_id VARCHAR(255)",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS segments_json JSON",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS segments_revision INTEGER DEFAULT 0 NOT NULL",
     ]
     with engine.begin() as conn:
         for sql in column_adds:

@@ -66,6 +66,15 @@ from datetime import datetime, timedelta, timezone
 
 from database import Job, User, UserSettings, AuditLog, get_db, init_db
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
+from editor_versions import (
+    EditorConflict,
+    conflict_payload,
+    editor_job,
+    ensure_editor_snapshot,
+    normalize_segments,
+    save_editor,
+    serialize_editor,
+)
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
 from queue_jobs import enqueue_pipeline, queue_depth
@@ -1481,10 +1490,11 @@ async def transcribe_uploaded(
     job_row.current_step = "editing"
     db.commit()
 
-    return await _run_transcription_for_job(
+    result = await _run_transcription_for_job(
         request, db, current_user, job_id, audio_path,
         language=body.language, artist=body.artist, title=body.title,
     )
+    return _persist_transcription_editor_snapshot(db, current_user, job_id, result)
 
 
 # Deprecation metadata for the legacy multipart-form endpoints. RFC 8594
@@ -1758,11 +1768,127 @@ async def transcribe_endpoint(
     # Per-request scratch dir for intermediate slices (intro/body cuts).
     # The main audio file lives under job_dir and stays around until
     # /generate enqueues it (or the reaper cleans it up).
-    return await _run_transcription_for_job(
+    result = await _run_transcription_for_job(
         request, db, current_user, job_id, audio_path,
         language=language, artist=artist, title=title,
         filename=file.filename,
     )
+    return _persist_transcription_editor_snapshot(db, current_user, job_id, result)
+
+
+def _persist_transcription_editor_snapshot(db, current_user, job_id, result):
+    """Seed revision zero once, without replacing a user's existing draft."""
+    job = editor_job(db, job_id, current_user, lock=True)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job.segments_json is None:
+        job.segments_json = normalize_segments(result.get("segments") or [])
+        job.segments_revision = 0
+    ensure_editor_snapshot(db, job, current_user.get("id"))
+    job.status = "transcribed_pending"
+    job.current_step = "editing"
+    db.commit()
+    result = dict(result)
+    result["editor_revision"] = int(job.segments_revision or 0)
+    return result
+
+
+class EditorPatchRequest(BaseModel):
+    base_revision: int
+    segments: list[dict]
+    checkpoint: str = "autosave"
+
+
+class EditorConflictRequest(BaseModel):
+    strategy: str
+    server_revision: int
+    segments: list[dict] | None = None
+
+
+@app.get("/editor/{job_id}")
+async def get_editor_document(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = editor_job(db, job_id, current_user, lock=True)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    ensure_editor_snapshot(db, job, current_user.get("id"))
+    payload = serialize_editor(db, job)
+    db.commit()
+    return payload
+
+
+@app.patch("/editor/{job_id}")
+async def patch_editor_document(
+    job_id: str,
+    body: EditorPatchRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = editor_job(db, job_id, current_user, lock=True)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    try:
+        job, version, applied = save_editor(
+            db, job, current_user["id"], body.base_revision,
+            body.segments, body.checkpoint,
+        )
+        db.commit()
+    except EditorConflict as conflict:
+        payload = conflict_payload(conflict.job)
+        db.rollback()
+        raise HTTPException(status_code=409, detail=payload) from None
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    return {
+        "job_id": job_id,
+        "revision": int(job.segments_revision or 0),
+        "version_id": version.id if version else None,
+        "applied": applied,
+    }
+
+
+@app.post("/editor/{job_id}/conflicts/resolve")
+async def resolve_editor_conflict(
+    job_id: str,
+    body: EditorConflictRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = editor_job(db, job_id, current_user, lock=True)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    ensure_editor_snapshot(db, job, current_user.get("id"))
+    if int(job.segments_revision or 0) != body.server_revision:
+        payload = conflict_payload(job)
+        db.rollback()
+        raise HTTPException(status_code=409, detail=payload)
+    if body.strategy == "use_server":
+        payload = serialize_editor(db, job)
+        db.commit()
+        return payload
+    if body.strategy != "save_local_as_new" or body.segments is None:
+        db.rollback()
+        raise HTTPException(status_code=422, detail="Unknown conflict strategy.")
+    try:
+        job, version, _ = save_editor(
+            db, job, current_user["id"], body.server_revision,
+            body.segments, "conflict",
+        )
+        payload = serialize_editor(db, job)
+        payload["version_id"] = version.id if version else None
+        db.commit()
+        return payload
+    except EditorConflict as conflict:
+        payload = conflict_payload(conflict.job)
+        db.rollback()
+        raise HTTPException(status_code=409, detail=payload) from None
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
 
 
 async def _run_transcription_for_job(
@@ -2254,6 +2380,7 @@ async def generate_with_segments(
     request: Request,
     file: UploadFile = File(None),
     job_id: str = Form(""),
+    editor_revision: str = Form(""),
     artist: str = Form(""),
     song_title: str = Form(""),
     style: str = Form("oscuro"),
@@ -2360,7 +2487,64 @@ async def generate_with_segments(
         if user_model and not user_model.ai_authorized:
             raise HTTPException(status_code=403, detail="AI tool usage not authorized. Contact admin for approval.")
 
-    segments = json.loads(segments_json)
+    try:
+        segments = json.loads(segments_json)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="segments_json must be valid JSON.") from None
+    editor_job_row = None
+    editor_revision = (editor_revision or "").strip()
+    if reuse:
+        # Modern editor submissions must prove they are generating the exact
+        # snapshot they last saved. Legacy callers without a persisted editor
+        # snapshot keep the old request-body contract for compatibility.
+        editor_job_row = (
+            db.query(Job)
+            .filter(Job.job_id == job_id)
+            .populate_existing()
+            .with_for_update()
+            .one()
+        )
+        # Keep the direct uploaded-audio path compatible: awaiting_upload
+        # jobs do not have an editor snapshot and are queued for Whisper by
+        # the worker. Only the editor flow requires transcribed_pending.
+        if (
+            editor_job_row.status != "transcribed_pending"
+            and not (
+                editor_job_row.status == "awaiting_upload"
+                and editor_job_row.segments_json is None
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Job is in state {editor_job_row.status!r}, cannot generate.",
+            )
+        if editor_job_row.segments_json is not None:
+            if not editor_revision:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "detail": "editor_revision_required",
+                        "server_revision": int(editor_job_row.segments_revision or 0),
+                        "server_segments": editor_job_row.segments_json or [],
+                    },
+                )
+            try:
+                requested_revision = int(editor_revision)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="editor_revision must be an integer.") from None
+            current_revision = int(editor_job_row.segments_revision or 0)
+            if requested_revision != current_revision:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "detail": "editor_revision_conflict",
+                        "server_revision": current_revision,
+                        "server_segments": editor_job_row.segments_json or [],
+                    },
+                )
+            # The durable editor snapshot is authoritative. Do not trust a
+            # stale/replayed multipart field to replace it at approval time.
+            segments = editor_job_row.segments_json or []
     umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile, current_user=current_user)
 
     # Check plan limits
@@ -2373,7 +2557,7 @@ async def generate_with_segments(
     if reuse:
         # Promote the existing transcribed_pending row in place — fill in
         # the fields the editor finalised + flip status to queued.
-        job_row = get_job_model(db, job_id)
+        job_row = editor_job_row or get_job_model(db, job_id)
         job_row.artist = artist
         job_row.song_title = song_title or None
         job_row.style = style

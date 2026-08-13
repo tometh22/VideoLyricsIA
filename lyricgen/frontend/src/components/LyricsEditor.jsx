@@ -1,6 +1,11 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useI18n } from "../i18n";
 import { EditorTour } from "./OnboardingTour";
+import {
+  decorateSegments,
+  mergeThreeWay,
+  persistedSegments,
+} from "../editorMerge";
 
 function formatTime(seconds) {
   if (!isFinite(seconds) || seconds < 0) return "0:00";
@@ -75,11 +80,131 @@ function findSuggestion(whisperText, refLines, startIdx) {
   return null;
 }
 
-export default function LyricsEditor({ segments, filename, audioFile, referenceLyrics, coverageWarning = false, recoverySource = "", onApprove, onBack, isBatch = false, batchProgress = "", user = null }) {
+export default function LyricsEditor({ segments, filename, audioFile, referenceLyrics, coverageWarning = false, recoverySource = "", onApprove, onBack, isBatch = false, batchProgress = "", user = null, transcribeJobId = "", onLoadEditor = null, onSaveEditor = null }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
-    segments.map((s, i) => ({ ...s, _id: i }))
+    decorateSegments(segments)
   );
+
+  // Durable editor state. `baseSegmentsRef` is the last server-confirmed
+  // snapshot; `revisionRef` is the exact revision that snapshot represents.
+  // A 409 is never retried by blindly writing local data over the server.
+  const [editorReady, setEditorReady] = useState(!transcribeJobId || !onLoadEditor);
+  const [editorLoadError, setEditorLoadError] = useState(null);
+  const [saveState, setSaveState] = useState("idle"); // idle|saving|saved|conflict|error
+  const [conflict, setConflict] = useState(null);
+  const baseSegmentsRef = useRef(decorateSegments(segments));
+  const revisionRef = useRef(0);
+  const editedRef = useRef(decorateSegments(segments));
+  const saveTimerRef = useRef(null);
+  const saveChainRef = useRef(Promise.resolve());
+  const suppressSaveRef = useRef(false);
+  const mountedRef = useRef(true);
+  editedRef.current = edited;
+
+  const applyServerSegments = useCallback((serverSegments, revision) => {
+    const decorated = decorateSegments(serverSegments || []);
+    baseSegmentsRef.current = decorated;
+    revisionRef.current = Number.isInteger(revision) ? revision : revisionRef.current;
+    setEdited(decorated);
+    editedRef.current = decorated;
+    setConflict(null);
+    setSaveState("saved");
+  }, []);
+
+  const persistNow = useCallback(async (snapshot = editedRef.current, reason = "autosave") => {
+    if (!onSaveEditor || !transcribeJobId || !editorReady) return { ok: true, revision: revisionRef.current };
+    const payload = persistedSegments(snapshot);
+    const operation = saveChainRef.current.then(async () => {
+      if (!mountedRef.current) return { ok: false, reason: "unmounted" };
+      setSaveState("saving");
+      const result = await onSaveEditor(transcribeJobId, payload, revisionRef.current, reason);
+      if (result?.ok) {
+        revisionRef.current = Number.isInteger(result.revision) ? result.revision : revisionRef.current;
+        baseSegmentsRef.current = decorateSegments(snapshot);
+        setSaveState("saved");
+        return result;
+      }
+      if (result?.reason === "conflict") {
+        const remote = decorateSegments(result.conflict?.serverSegments || []);
+        const merged = mergeThreeWay(baseSegmentsRef.current, snapshot, remote);
+        if (merged.conflicts.length === 0) {
+          baseSegmentsRef.current = remote;
+          revisionRef.current = Number.isInteger(result.conflict?.serverRevision)
+            ? result.conflict.serverRevision : revisionRef.current;
+          setEdited(merged.merged);
+          editedRef.current = merged.merged;
+          setSaveState("saving");
+          // Queue the rebased snapshot after the current request settles;
+          // chaining it from inside the current promise would deadlock.
+          window.setTimeout(() => persistNow(merged.merged, "autosave"), 0);
+          return { ok: false, reason: "merged" };
+        }
+        setConflict({
+          ...result.conflict,
+          baseSegments: baseSegmentsRef.current,
+          localSegments: decorateSegments(snapshot),
+          serverSegments: remote,
+          conflicts: merged.conflicts,
+        });
+        setSaveState("conflict");
+        return { ok: false, reason: "conflict" };
+      }
+      setSaveState("error");
+      return result || { ok: false, reason: "save-failed" };
+    });
+    saveChainRef.current = operation.catch(() => undefined);
+    return operation;
+  }, [editorReady, onSaveEditor, transcribeJobId]);
+
+  const schedulePersist = useCallback(() => {
+    if (!onSaveEditor || !transcribeJobId || !editorReady || suppressSaveRef.current || conflict) return;
+    if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = window.setTimeout(() => {
+      saveTimerRef.current = null;
+      persistNow(editedRef.current);
+    }, 700);
+  }, [conflict, editorReady, onSaveEditor, persistNow, transcribeJobId]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!transcribeJobId || !onLoadEditor) return undefined;
+    let alive = true;
+    setEditorReady(false);
+    setEditorLoadError(null);
+    onLoadEditor(transcribeJobId).then((result) => {
+      if (!alive) return;
+      if (!result?.ok) {
+        setEditorLoadError(result?.error || "No pudimos cargar la versión guardada.");
+        return;
+      }
+      suppressSaveRef.current = true;
+      const server = decorateSegments(result.segments || segments);
+      baseSegmentsRef.current = server;
+      revisionRef.current = Number.isInteger(result.revision) ? result.revision : 0;
+      setEdited(server);
+      editedRef.current = server;
+      setEditorReady(true);
+      setSaveState("saved");
+      window.setTimeout(() => { suppressSaveRef.current = false; }, 0);
+    }).catch((error) => {
+      if (alive) setEditorLoadError(String(error));
+    });
+    return () => { alive = false; };
+  }, [onLoadEditor, segments, transcribeJobId]);
+
+  useEffect(() => {
+    if (!editorReady || suppressSaveRef.current || !onSaveEditor) return;
+    if (JSON.stringify(persistedSegments(edited)) === JSON.stringify(persistedSegments(baseSegmentsRef.current))) return;
+    schedulePersist();
+  }, [edited, editorReady, onSaveEditor, schedulePersist]);
 
   // ─── Audio sync ─────────────────────────────────────────────────────
   const audioUrl = useMemo(
@@ -456,7 +581,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       const newStart = Math.min(duration || orig.end + segDur, orig.end);
       const newEnd = Math.min(duration || newStart + segDur, newStart + segDur);
       const nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
-      const dup = { ...orig, _id: nextId, start: newStart, end: newEnd };
+      const dup = { ...orig, _id: nextId, segment_id: "local-" + nextId, start: newStart, end: newEnd };
       return [...prev.slice(0, idx + 1), dup, ...prev.slice(idx + 1)];
     });
   };
@@ -469,7 +594,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       const baseStart = last ? Math.min(duration || last.end + 2, last.end + 0.5) : 0;
       const baseEnd = Math.min(duration || baseStart + 3, baseStart + 3);
       const nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
-      return [...prev, { _id: nextId, start: baseStart, end: baseEnd, text: "" }];
+      return [...prev, { _id: nextId, segment_id: "local-" + nextId, start: baseStart, end: baseEnd, text: "" }];
     });
   };
 
@@ -481,15 +606,11 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   const hasSuggestions = pendingSuggestions > 0;
   const blankCount = edited.filter((seg) => !(seg.text || "").trim()).length;
 
-  const handleApprove = () => {
-    // Drop empty / whitespace-only rows BEFORE clamping. Operator can
-    // leave blanks from "Agregar línea" if they didn't type lyrics —
-    // sending those to the worker triggers an ImageMagick "label
-    // expected" crash that aborts the whole render.
-    const sorted = [...edited]
+  const buildCleanedSegments = (source) => {
+    const sorted = [...source]
       .filter((seg) => (seg.text || "").trim())
       .sort((a, b) => a.start - b.start);
-    const cleaned = sorted.map((seg, i) => {
+    return sorted.map((seg, i) => {
       let end = seg.end;
       if (i + 1 < sorted.length) {
         const nextStart = sorted[i + 1].start;
@@ -499,7 +620,47 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
       }
       return { ...seg, end };
     });
-    onApprove(cleaned.map(({ _id, ...rest }) => rest));
+  };
+
+  const resolveConflict = async (strategy) => {
+    if (!conflict) return;
+    if (strategy === "use_server") {
+      applyServerSegments(conflict.serverSegments, conflict.serverRevision);
+      return;
+    }
+    // This is the only path allowed to intentionally replace the server
+    // snapshot. It is explicit, carries the exact server revision, and still
+    // receives a 409 if somebody changed it again before this request.
+    const local = decorateSegments(conflict.localSegments || editedRef.current);
+    baseSegmentsRef.current = decorateSegments(conflict.serverSegments || []);
+    revisionRef.current = Number.isInteger(conflict.serverRevision)
+      ? conflict.serverRevision : revisionRef.current;
+    setConflict(null);
+    setEdited(local);
+    editedRef.current = local;
+    const result = await persistNow(local, "conflict");
+    if (!result?.ok) setSaveState("conflict");
+  };
+
+  const handleApprove = async () => {
+    if (editorLoadError || !editorReady) return;
+    if (conflict) return;
+    // Drop empty / whitespace-only rows BEFORE clamping. Operator can
+    // leave blanks from "Agregar línea" if they didn't type lyrics —
+    // sending those to the worker triggers an ImageMagick "label
+    // expected" crash that aborts the whole render.
+    let cleaned = buildCleanedSegments(edited);
+    let saveResult = await persistNow(cleaned, "manual");
+    if (saveResult?.reason === "merged") {
+      await new Promise((resolve) => window.setTimeout(resolve, 40));
+      cleaned = buildCleanedSegments(editedRef.current);
+      saveResult = await persistNow(cleaned, "manual");
+    }
+    if (saveResult?.ok === false) return;
+    await Promise.resolve(onApprove(
+      cleaned.map(({ _id, ...rest }) => rest),
+      { editorRevision: revisionRef.current },
+    ));
   };
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
@@ -542,7 +703,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
             </p>
           </div>
         </div>
-        <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5">
+        <button onClick={handleApprove} disabled={!editorReady || !!editorLoadError || !!conflict} className="btn-primary text-sm h-11 px-5 disabled:opacity-50 disabled:cursor-not-allowed">
           {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
           <svg className="inline-block ml-1.5 w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M5 12h14M12 5l7 7-7 7" />
@@ -559,6 +720,55 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
           <p className="text-xs text-ink-secondary leading-relaxed">
             {t("editor.coverage_warning")}
           </p>
+        </div>
+      )}
+
+      {!editorReady && !editorLoadError && (
+        <div className="mb-4 rounded-2xl bg-surface-2/50 ring-1 ring-white/[0.06] px-4 py-3 flex items-center gap-3">
+          <div className="w-4 h-4 border-2 border-brand border-t-transparent rounded-full animate-spin shrink-0" />
+          <p className="text-xs text-ink-secondary">Cargando la versión guardada…</p>
+        </div>
+      )}
+
+      {editorLoadError && (
+        <div className="mb-4 rounded-2xl bg-red-500/[0.08] ring-1 ring-red-400/25 px-4 py-3 flex items-center gap-3">
+          <svg className="w-4 h-4 text-red-300 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="9" /><path d="M12 8v5m0 3h.01" strokeLinecap="round" />
+          </svg>
+          <p className="text-xs text-red-200">No pudimos cargar la versión guardada. No se puede aprobar hasta reintentar.</p>
+        </div>
+      )}
+
+      {conflict && (
+        <div className="mb-4 rounded-2xl bg-amber-500/[0.08] ring-1 ring-amber-400/30 px-4 py-3 animate-fade-in">
+          <p className="text-xs font-semibold text-amber-200">Hay un cambio en conflicto</p>
+          <p className="mt-1 text-[11px] leading-relaxed text-amber-100/70">
+            Se modificaron {conflict.conflicts?.length || 1} línea(s) en otra sesión. Tus cambios siguen acá y no se guardaron encima.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => resolveConflict("use_server")}
+              className="rounded-lg bg-white/[0.08] px-3 py-1.5 text-[11px] font-medium text-white ring-1 ring-white/10 hover:bg-white/[0.14]"
+            >
+              Usar versión guardada
+            </button>
+            <button
+              type="button"
+              onClick={() => resolveConflict("save_local_as_new")}
+              className="rounded-lg bg-brand px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-brand-light"
+            >
+              Conservar mis cambios
+            </button>
+          </div>
+        </div>
+      )}
+
+      {onSaveEditor && editorReady && !conflict && (
+        <div className="mb-3 flex items-center justify-end gap-2 text-[10px] text-gray-500">
+          {saveState === "saving" && <span>Guardando cambios…</span>}
+          {saveState === "saved" && <span className="text-emerald-400/80">Cambios guardados</span>}
+          {saveState === "error" && <span className="text-red-300">No pudimos guardar; reintentaremos automáticamente</span>}
         </div>
       )}
 
@@ -984,7 +1194,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
             </span>
           )}
         </div>
-        <button onClick={handleApprove} className="btn-primary text-sm h-11 px-5 shrink-0" data-tour="editor-approve">
+        <button onClick={handleApprove} disabled={!editorReady || !!editorLoadError || !!conflict} className="btn-primary text-sm h-11 px-5 shrink-0 disabled:opacity-50 disabled:cursor-not-allowed" data-tour="editor-approve">
           {isBatch ? t("editor.approve_next") : t("editor.approve_generate")}
         </button>
       </div>

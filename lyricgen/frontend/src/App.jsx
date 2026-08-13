@@ -309,6 +309,51 @@ export default function App() {
     navigate("/");
   }, [navigate]);
 
+  const loadEditorDocument = useCallback(async (jobId) => {
+    try {
+      const res = await authFetch(`${API}/editor/${jobId}`);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.detail || `HTTP ${res.status}` };
+      return {
+        ok: true,
+        revision: Number.isInteger(body.revision) ? body.revision : 0,
+        segments: Array.isArray(body.segments) ? body.segments : [],
+      };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  }, []);
+
+  const saveEditorDocument = useCallback(async (jobId, segments, baseRevision, checkpoint = "autosave") => {
+    try {
+      const res = await authFetch(`${API}/editor/${jobId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          base_revision: baseRevision,
+          segments,
+          checkpoint,
+        }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (res.status === 409) {
+        const detail = body.detail && typeof body.detail === "object" ? body.detail : body;
+        return {
+          ok: false,
+          reason: "conflict",
+          conflict: {
+            serverRevision: Number.isInteger(detail.server_revision) ? detail.server_revision : baseRevision,
+            serverSegments: Array.isArray(detail.server_segments) ? detail.server_segments : [],
+          },
+        };
+      }
+      if (!res.ok) return { ok: false, reason: `http-${res.status}`, error: body.detail || `HTTP ${res.status}` };
+      return { ok: true, revision: Number.isInteger(body.revision) ? body.revision : baseRevision };
+    } catch (error) {
+      return { ok: false, reason: "network", error: String(error) };
+    }
+  }, []);
+
   // `historyError` lets the dashboard surface a "connection failed,
   // retry" state instead of silently rendering an empty list when /jobs
   // hangs or 5xx's (CORS misconfig, backend cold start, R2 outage). The
@@ -480,6 +525,7 @@ export default function App() {
         // Same job_id covers the whole upload→transcribe→generate flow
         // now (it's minted in /upload-url and reused throughout).
         transcribeJobId: data.job_id || uploadJobId,
+        editorRevision: Number.isInteger(data.editor_revision) ? data.editor_revision : 0,
         queueIdx: idx, queue,
       });
     } catch (err) {
@@ -490,7 +536,7 @@ export default function App() {
     }
   };
 
-  const handleApproveLyrics = (editedSegments) => {
+  const handleApproveLyrics = (editedSegments, editorMeta = {}) => {
     const r = currentReview;
     const newApproved = [...approvedJobs, {
       file: r.file, artist: r.artist, language: r.language,
@@ -500,6 +546,7 @@ export default function App() {
       movementStyle: r.movementStyle || "",
       segments: editedSegments,
       transcribeJobId: r.transcribeJobId || null,
+      editorRevision: Number.isInteger(editorMeta.editorRevision) ? editorMeta.editorRevision : null,
     }];
     setApprovedJobs(newApproved);
     setCurrentReview(null);
@@ -523,6 +570,7 @@ export default function App() {
       concept: a.concept || "", movementStyle: a.movementStyle || "",
       segments: a.segments,
       transcribeJobId: a.transcribeJobId || null,
+      editorRevision: Number.isInteger(a.editorRevision) ? a.editorRevision : null,
       status: "queued", current_step: null, progress: 0, job_id: null, error: null,
     }));
     setJobs(jobList);
@@ -544,6 +592,9 @@ export default function App() {
         // backend didn't return a job_id (older deploy).
         if (jobList[i].transcribeJobId) {
           formData.append("job_id", jobList[i].transcribeJobId);
+          if (Number.isInteger(jobList[i].editorRevision)) {
+            formData.append("editor_revision", String(jobList[i].editorRevision));
+          }
         } else {
           formData.append("file", jobList[i]._file);
         }
@@ -921,6 +972,9 @@ export default function App() {
             filename={currentReview.file.name}
             audioFile={currentReview.file}
             referenceLyrics={currentReview.referenceLyrics || ""}
+            transcribeJobId={currentReview.transcribeJobId || ""}
+            onLoadEditor={loadEditorDocument}
+            onSaveEditor={saveEditorDocument}
             coverageWarning={currentReview.coverageWarning}
             recoverySource={currentReview.recoverySource}
             onApprove={handleApproveLyrics}
