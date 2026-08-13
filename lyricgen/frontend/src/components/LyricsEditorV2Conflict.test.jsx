@@ -27,14 +27,22 @@ function reply(body, status = 200) {
   };
 }
 
-function makeRequest() {
+function makeRequest({ legacyBase = false } = {}) {
   return vi.fn(async (path, options = {}) => {
     if (path === `/editor/${JOB}` && !options.method) {
       return reply({
-        job_id: JOB, revision: 5, segments: SERVER, original_segments: SERVER,
+        job_id: JOB, revision: 5,
+        segments: legacyBase ? [{ ...SERVER[0], text: "base" }] : SERVER,
+        original_segments: legacyBase ? [{ ...SERVER[0], text: "base" }] : SERVER,
         updated_by: { id: 7, username: "teammate" }, updated_at: "2026-08-06T10:00:00Z",
         lock: { active: false },
       });
+    }
+    if (legacyBase && path === `/editor/${JOB}/versions?limit=50`) {
+      return reply({ versions: [{ id: "version-4", revision: 4 }] });
+    }
+    if (legacyBase && path === `/editor/${JOB}/versions/version-4`) {
+      return reply({ segments: [{ ...SERVER[0], text: "base" }] });
     }
     if (path.endsWith("/lock/heartbeat")) {
       return reply({ acquired: true, user: USER, expires_at: "2026-08-06T10:01:00Z" });
@@ -134,6 +142,21 @@ describe("Editor 2.0 stale draft recovery", () => {
     await waitFor(() => expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument());
     expect(screen.getByDisplayValue("versión equipo")).toBeInTheDocument();
     expect(localStorage.getItem(`genly_editor_draft:team-a:42:${JOB}`)).toBeNull();
+  });
+
+  it("recovers a legacy draft base from version history without opening a false conflict", async () => {
+    localStorage.clear();
+    localStorage.setItem(
+      `genly_editor_draft:team-a:42:${JOB}`,
+      JSON.stringify({ segments: LOCAL, base_revision: 4 }),
+    );
+    const request = makeRequest({ legacyBase: true });
+    renderEditor(request);
+
+    expect(await screen.findByDisplayValue("versión local")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
+    expect(request.mock.calls.some(([path]) => path === `/editor/${JOB}/versions?limit=50`)).toBe(true);
+    await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
   });
 
   it("saves the local copy only through the explicit conflict strategy", async () => {
