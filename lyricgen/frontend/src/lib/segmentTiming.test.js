@@ -4,6 +4,7 @@ import {
   clampResizeTiming,
   clampResizeTimingWithAdjacent,
   clampSelectionShiftDelta,
+  shiftTimingWithAdjacent,
   shiftBlockWithinDuration,
 } from "./segmentTiming";
 
@@ -93,6 +94,70 @@ describe("collision-safe timeline edits", () => {
       .toBeCloseTo(-0.95);
     expect(clampSelectionShiftDelta(lines, new Set(["b"]), 2, 10, 0.05))
       .toBeCloseTo(0.95);
+  });
+
+  it("moves a packed line forward by rippling its following neighbours", () => {
+    const packed = [
+      { _id: "a", start: 0, end: 1 },
+      { _id: "b", start: 1.05, end: 2 },
+      { _id: "c", start: 2.05, end: 3 },
+    ];
+    expect(shiftTimingWithAdjacent(packed, "b", 0.5, 10, 0.05)).toEqual({
+      changes: [
+        { id: "b", start: 1.55, end: 2.5 },
+        { id: "c", start: 2.55, end: 3.5 },
+      ],
+      delta: 0.5,
+      coupled: true,
+      blocked: false,
+    });
+  });
+
+  it("moves a packed line backward by rippling its previous neighbours", () => {
+    const packed = [
+      { _id: "a", start: 1, end: 2 },
+      { _id: "b", start: 2.05, end: 3 },
+      { _id: "c", start: 3.05, end: 4 },
+    ];
+    expect(shiftTimingWithAdjacent(packed, "b", -0.5, 10, 0.05)).toEqual({
+      changes: [
+        { id: "a", start: 0.5, end: 1.5 },
+        { id: "b", start: 1.55, end: 2.5 },
+      ],
+      delta: -0.5,
+      coupled: true,
+      blocked: false,
+    });
+  });
+
+  it("uses an available gap without moving an unrelated neighbour", () => {
+    const spaced = [
+      { _id: "a", start: 0, end: 1 },
+      { _id: "b", start: 1.05, end: 2 },
+      { _id: "c", start: 3, end: 4 },
+    ];
+    expect(shiftTimingWithAdjacent(spaced, "b", 0.5, 10, 0.05).changes).toEqual([
+      { id: "b", start: 1.55, end: 2.5 },
+    ]);
+  });
+
+  it("bounds a packed ripple at the song edges", () => {
+    const packed = [
+      { _id: "a", start: 0, end: 1 },
+      { _id: "b", start: 1.05, end: 2 },
+      { _id: "c", start: 2.05, end: 3 },
+    ];
+    expect(shiftTimingWithAdjacent(packed, "b", -0.5, 3.2, 0.05)).toMatchObject({
+      changes: [], delta: 0, blocked: true,
+    });
+    expect(shiftTimingWithAdjacent(packed, "b", 1, 3.2, 0.05)).toMatchObject({
+      changes: [
+        { id: "b", start: 1.25, end: 2.2 },
+        { id: "c", start: 2.25, end: 3.2 },
+      ],
+      delta: 0.2,
+      blocked: false,
+    });
   });
 
   it("clamps resize handles against adjacent lines", () => {

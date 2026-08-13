@@ -13,7 +13,11 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
-import { clampResizeTimingWithAdjacent, clampSelectionShiftDelta } from "../lib/segmentTiming";
+import {
+  clampResizeTimingWithAdjacent,
+  clampSelectionShiftDelta,
+  shiftTimingWithAdjacent,
+} from "../lib/segmentTiming";
 
 const ZOOM_DEFAULT = 48;
 const ZOOM_MIN = 8;
@@ -305,7 +309,9 @@ export default function LyricsTimeline({
       : mode === "end" ? normalizedSegments[segmentIndex + 1] : null;
     const snapshotSegments = movingGroup
       ? normalizedSegments.filter((item) => selectedIds.has(item._id))
-      : [segment, resizeNeighbour].filter(Boolean);
+      : mode === "move"
+        ? normalizedSegments
+        : [segment, resizeNeighbour].filter(Boolean);
     const snapshots = snapshotSegments
       .map((item) => ({ id: item._id, start: item.start, end: item.end }));
     if (!selectedIds.has(segment._id)) {
@@ -381,14 +387,16 @@ export default function LyricsTimeline({
         return;
       }
     } else {
-      const safeDelta = clampSelectionShiftDelta(
-        normalizedSegments, new Set([drag.id]), delta, total, gapS,
+      const move = shiftTimingWithAdjacent(
+        normalizedSegments, drag.id, delta, total, gapS,
       );
-      start = drag.origStart + safeDelta;
-      end = drag.origEnd + safeDelta;
-      setLimitFeedback(Math.abs(delta) > 1e-4 && Math.abs(safeDelta) < 1e-4
-        ? "La línea llegó al límite disponible."
-        : "");
+      const ownChange = move.changes.find((change) => change.id === drag.id);
+      if (ownChange) ({ start, end } = ownChange);
+      setLimitFeedback(move.blocked ? "La línea llegó al límite disponible." : "");
+      if (move.changes.length > 1) {
+        setPreview({ changes: move.changes, mode: drag.mode });
+        return;
+      }
     }
     setPreview({ id: drag.id, start, end, mode: drag.mode });
   }, [gapS, normalizedSegments, onDragStart, total, updateMarquee]);
