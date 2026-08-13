@@ -31,7 +31,7 @@ from __future__ import annotations
 import difflib
 import os
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 
 def _env_float(name: str, default: float) -> float:
@@ -193,6 +193,8 @@ def synced_offset_decision(
     *,
     dur_tol: float = 3.0,
     anchor_cap: float = 60.0,
+    verify_fn: Optional[Callable[[], Optional[float]]] = None,
+    verify_min_score: float = 0.4,
 ) -> tuple[float, bool]:
     """Decide how to shift an lrclib SYNCED timeline onto THIS audio, and
     whether the result is trustworthy enough to skip the per-line `review`
@@ -216,11 +218,38 @@ def synced_offset_decision(
        is clamped to 0. The offset is a genuine estimate, so the caller keeps
        the per-line review flag.
 
+    ``verify_fn`` (audit 2026-08-13, F4): two numbers agreeing (``audio_dur``
+    and ``lrc_dur``, both external metadata — one uploaded by the user, one
+    scraped from a community lyrics site) is not proof the synced timeline
+    actually lines up with what's sung, just that nobody's clock is *that*
+    far off. Regime 1 used to trust on that alone and specifically suppress
+    the operator's review flag, so a coincidental match shipped a
+    potentially wrong timeline as if it had been verified. When provided,
+    ``verify_fn`` is called ONLY when regime 1's durations agree — it should
+    return a content-alignment score in [0, 1] (``None`` if it couldn't
+    check) comparing real audio at the claimed zero-offset position against
+    the synced text; trust is granted only if that score also clears
+    ``verify_min_score``. Kept optional (default ``None`` = old behaviour)
+    so this stays a pure, dependency-free function for existing callers/
+    tests — the caller supplies the (blocking, Whisper-backed) check via
+    closure instead of this module importing pipeline.py's render stack.
+
     Returns ``(offset_seconds, trust)``.
     """
-    if (audio_dur is not None and lrc_dur is not None
-            and abs(audio_dur - lrc_dur) <= dur_tol):
-        return 0.0, True
+    duration_agrees = (
+        audio_dur is not None and lrc_dur is not None
+        and abs(audio_dur - lrc_dur) <= dur_tol
+    )
+    if duration_agrees:
+        if verify_fn is None:
+            return 0.0, True
+        score = verify_fn()
+        if score is not None and score >= verify_min_score:
+            return 0.0, True
+        # Duration metadata agreed but the audio content at the claimed
+        # zero offset doesn't actually match lrclib's text — fall through
+        # to the anchor-based estimate instead of shipping a trusted-but-
+        # unverified offset.
     if first_wx_t is not None and first_synced_t is not None:
         offset = first_wx_t - first_synced_t
         if abs(offset) > anchor_cap:
