@@ -2047,9 +2047,10 @@ export default function UploadZone({
                   data-tour="motion-back"
                   onClick={closeMotionComposer}
                   aria-label={t("common.back") || "Volver"}
-                  className="grid h-8 w-8 shrink-0 place-items-center rounded-full border border-white/[0.08] bg-white/[0.025] text-gray-400 transition-all hover:border-white/[0.16] hover:bg-white/[0.06] hover:text-white"
+                  className="inline-flex h-8 shrink-0 items-center gap-1 rounded-full border border-brand/40 bg-brand/[0.12] pl-2 pr-3 text-[11px] font-semibold text-brand-light transition-all hover:border-brand/60 hover:bg-brand/20 hover:text-white"
                 >
-                  <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="m15 18-6-6 6-6" /></svg>
+                  <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="m15 18-6-6 6-6" /></svg>
+                  {t("common.back") || "Volver"}
                 </button>
                 <div className="min-w-0 flex-1">
                   <p className="text-[8px] font-semibold uppercase tracking-[0.15em] text-brand-light/75">
@@ -2286,7 +2287,8 @@ export default function UploadZone({
                       : selectedMovement.desc}
                 </p>
                 </div>
-                <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full border border-white/[0.08] bg-white/[0.035] text-gray-500 transition-all group-hover:border-brand/30 group-hover:bg-brand/10 group-hover:text-white">
+                <span className="inline-flex h-7 shrink-0 items-center gap-1 rounded-full border border-white/[0.08] bg-white/[0.035] pl-2.5 pr-2 text-[10px] font-semibold text-gray-400 transition-all group-hover:border-brand/30 group-hover:bg-brand/10 group-hover:text-white">
+                  {t("common.change") || "Cambiar"}
                   <svg className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="m9 18 6-6-6-6" /></svg>
                 </span>
               </div>
@@ -2358,7 +2360,13 @@ export default function UploadZone({
                 ? "px-3 py-2.5 sm:-mt-4 sm:relative sm:pb-3 sm:pt-0"
                 : ""
             }`}>
-              <div className={`flex min-w-0 items-center gap-2 ${motionComposerView === null ? "sm:items-end" : ""}`}>
+              <div className={`flex min-w-0 items-center gap-2.5 ${motionComposerView === null ? "sm:items-end" : ""}`}>
+                {motionComposerView === "effect" && (
+                  <span className="inline-flex h-8 shrink-0 items-center gap-1 rounded-full border border-brand/40 bg-brand/[0.12] pl-2 pr-3 text-[11px] font-semibold text-brand-light transition-all group-hover:border-brand/60 group-hover:bg-brand/20 group-hover:text-white">
+                    <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24" aria-hidden="true"><path strokeLinecap="round" strokeLinejoin="round" d="m15 18-6-6 6-6" /></svg>
+                    {t("common.back") || "Volver"}
+                  </span>
+                )}
                 <div className="min-w-0 flex-1">
                   <p className={`shrink-0 font-semibold ${
                     motionComposerView === null
@@ -2388,28 +2396,14 @@ export default function UploadZone({
                   </p>
                 </div>
                 {motionComposerView === null && (
-                  <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full border border-white/[0.08] bg-white/[0.035] text-gray-500 transition-all group-hover:border-cyan-300/20 group-hover:bg-cyan-300/[0.06] group-hover:text-white">
+                  <span className="inline-flex h-7 shrink-0 items-center gap-1 rounded-full border border-white/[0.08] bg-white/[0.035] pl-2.5 pr-2 text-[10px] font-semibold text-gray-400 transition-all group-hover:border-cyan-300/20 group-hover:bg-cyan-300/[0.06] group-hover:text-white">
+                    {t("common.change") || "Cambiar"}
                     <svg className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="m9 18 6-6-6-6" /></svg>
                   </span>
                 )}
               </div>
             </div>
 
-            <div className={`shrink-0 items-center gap-2 ${motionComposerView === null ? "hidden" : "flex"}`}>
-              <span className="hidden rounded-full border border-white/[0.08] bg-white/[0.035] px-2 py-1 text-[9px] font-medium text-gray-400 sm:block">
-                {t("common.change") || "Cambiar"}
-              </span>
-              <svg
-                className={`h-4 w-4 text-gray-500 transition-transform duration-200 ${motionComposerView === "effect" ? "rotate-180" : ""}`}
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.8"
-                viewBox="0 0 24 24"
-                aria-hidden="true"
-              >
-                <path strokeLinecap="round" strokeLinejoin="round" d="m7 10 5 5 5-5" />
-              </svg>
-            </div>
           </button>
 
           {motionComposerView === "effect" && (
@@ -2519,11 +2513,33 @@ export default function UploadZone({
                 })}
               </div>
 
-              <p className="mt-1.5 text-[9px] leading-snug text-gray-600">
-                {files.length > 1
-                  ? (t("upload.effect_gallery_hint") || "Click para aplicar a todos · personalizable por canción")
-                  : (t("upload.effect_hover_hint") || "Pasá el cursor para explorar · click para elegir")}
-              </p>
+              {(() => {
+                const _cap = (hoverEffect && EFFECTS.find((e) => e.code === hoverEffect)) || selectedEffect;
+                return (
+                  <div className="mt-1.5 space-y-1">
+                    {_cap && _cap.code !== "none" && _cap.desc && (
+                      <p className="text-[10px] leading-snug text-gray-300">
+                        <span className="font-semibold text-white">{_cap.label}:</span> {_cap.desc}
+                      </p>
+                    )}
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[9px] leading-snug text-gray-500">
+                      <span className="inline-flex items-center gap-1">
+                        <span className="rounded-full bg-cyan-400/20 px-1.5 py-0.5 text-[7px] font-bold text-cyan-50">{t("upload.effect_ai_badge") || "IA"}</span>
+                        {t("upload.effect_ai_legend") || "usa generación IA, tarda un poco más"}
+                      </span>
+                      <span className="inline-flex items-center gap-1">
+                        <span className="rounded-full bg-fuchsia-400/20 px-1.5 py-0.5 text-[7px] font-bold text-fuchsia-100">{t("upload.effect_reactive_badge")}</span>
+                        {t("upload.effect_reactive_legend") || "reacciona al audio"}
+                      </span>
+                    </div>
+                    <p className="text-[9px] leading-snug text-gray-600">
+                      {files.length > 1
+                        ? (t("upload.effect_gallery_hint") || "Click para aplicar a todos · personalizable por canción")
+                        : (t("upload.effect_hover_hint") || "Pasá el cursor para explorar · click para elegir")}
+                    </p>
+                  </div>
+                );
+              })()}
             </div>
           )}
         </div>
@@ -5037,9 +5053,9 @@ export default function UploadZone({
             <>
               {user?.features?.prores_export && _deliveryBlock}
               <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
-                <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-1">{t("upload.step_deliver") || "Entregá"}</p>
+                <p className="text-[10px] uppercase tracking-[0.18em] text-brand-light/80 mb-1">{t("upload.deliver_recap_title") || "Casi listo · elegí cómo terminar"}</p>
                 <p className="text-[13px] text-gray-200">{summary}</p>
-                <p className="text-[11px] text-gray-600 mt-1">{t("upload.deliver_hint") || "Revisá los lyrics para ajustar el tiempo, o generá directo."}</p>
+                <p className="text-[11px] text-gray-600 mt-1">{t("upload.deliver_hint") || "«Revisar letra» te deja ajustar el tiempo y el texto antes de generar. «Generar sin revisar» salta esa edición."}</p>
               </div>
             </>
           )}
