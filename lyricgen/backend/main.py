@@ -115,7 +115,7 @@ from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe, _normalize_movement_style
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
-from transcription_language import resolve_transcription_language
+from transcription_language import resolve_transcription_language, forced_language_for_tenant
 from provenance import job_was_delivered
 from batch_profiles import (
     RenderProfileError, normalize_render_profile, pipeline_fields,
@@ -4225,7 +4225,7 @@ async def transcribe_uploaded(
         # row and create ghost jobs.
         _result = await _run_transcription_for_job(
             request, current_user, job_id, audio_path,
-            language=body.language,
+            language=forced_language_for_tenant(current_user.get("tenant_id", ""), body.language),
             artist=_row_artist,
             title=_row_title,
         )
@@ -4953,7 +4953,8 @@ async def transcribe_endpoint(
     db.close()
     _result = await _run_transcription_for_job(
         request, current_user, job_id, audio_path,
-        language=language, artist=artist, title=title,
+        language=forced_language_for_tenant(current_user.get("tenant_id", ""), language),
+        artist=artist, title=title,
         filename=file.filename,
     )
     _result = await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)

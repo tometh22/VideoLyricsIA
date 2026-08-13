@@ -7,6 +7,7 @@ transcription on English (and other non-Spanish) songs.
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Iterable
 
@@ -109,9 +110,44 @@ def resolve_transcription_language(
     return detect_text_language(reference_text) or detect_text_language(result or {})
 
 
+def forced_language_for_tenant(
+    tenant_id: str | None, requested_language: str | None
+) -> str:
+    """Pin the transcription language for single-language tenants.
+
+    A tenant that only ever uploads one language (e.g. UMG Chile = always
+    Spanish) can be configured to force it, so WhisperX cannot misdetect a
+    Spanish song as English and poison the transcription cache under `en`
+    (incident 2026-08-12: Sebastián/UMG Chile got English lyrics from a
+    Spanish audio because auto-detect chose `en`, and every re-upload hit
+    the cached English result).
+
+    Env: ``TRANSCRIPTION_LANG_BY_TENANT="universal_chile:es,other:pt"``.
+    Read per-call (not import-time) so an ops change applies on redeploy
+    without import-order surprises — same pattern as the editor_v2 gate.
+
+    A configured tenant's language OVERRIDES auto-detect. If the tenant is
+    not configured, the requested language passes through unchanged.
+    """
+    tid = (tenant_id or "").strip().lower()
+    if not tid:
+        return requested_language or ""
+    raw = os.environ.get("TRANSCRIPTION_LANG_BY_TENANT", "")
+    for pair in raw.split(","):
+        if ":" not in pair:
+            continue
+        mapped_tenant, _, mapped_lang = pair.partition(":")
+        if mapped_tenant.strip().lower() == tid:
+            forced = normalize_language(mapped_lang)
+            if forced:
+                return forced
+    return requested_language or ""
+
+
 __all__ = [
     "SUPPORTED_LANGUAGES",
     "detect_text_language",
     "normalize_language",
     "resolve_transcription_language",
+    "forced_language_for_tenant",
 ]
