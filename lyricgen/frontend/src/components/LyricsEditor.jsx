@@ -4138,6 +4138,7 @@ export default function LyricsEditor({
 
       <ConflictDialog
         conflict={conflictDialogOpen ? durableEditor.conflict : null}
+        currentUserId={user?.id}
         onCancel={() => setConflictDialogOpen(false)}
         onUseServer={async () => {
           const result = await durableEditor.resolve("use_server");
