@@ -699,6 +699,55 @@ def test_cached_bg_duration_guard_never_renders_black():
     assert "se loopea para evitar render negro" in src
 
 
+def test_duration_guard_measures_fresh_instead_of_trusting_stale_plan():
+    """Audit 2026-08-13 (F2): the duration guard above exists specifically to
+    catch 'cached bg shorter than the real audio'. It used to compare a real
+    ffprobe measurement (_bg_dur) against scene_plan['audio_duration'] — the
+    exact metadata persisted when THAT bg was generated — so a wrong
+    persisted value validated itself: blind by construction in the one case
+    the guard exists to catch. Confirm the fix ships a fresh _audio_duration
+    measurement FIRST, with the persisted plan value only as a last resort,
+    and that the old self-referential ordering is gone."""
+    import inspect
+    src = inspect.getsource(pipeline.run_edit_pipeline)
+    assert '_aud_dur = _audio_duration(mp3_path) or scene_plan.get("audio_duration")' in src, (
+        "guard must measure fresh before falling back to the persisted plan value"
+    )
+    assert '_aud_dur = scene_plan.get("audio_duration") or _audio_duration(mp3_path)' not in src, (
+        "self-referential ordering (trust the persisted value first) re-introduced"
+    )
+
+
+def test_scene_edit_paths_measure_fresh_instead_of_trusting_stale_plan():
+    """Audit 2026-08-13 (F2): the 3 other scene_plan['audio_duration'] readers
+    in the edit path (lyrics re-stitch, single-scene regen, dense
+    revalidation) had the same shape — trust the value persisted at
+    original-render time, only re-measure if it was falsy — plus a dead
+    try/except around _audio_duration (which never raises, so the except
+    branch was unreachable, same class of bug as F5). Confirm all 3 now
+    measure fresh first and the dead try/except pattern is gone."""
+    import inspect
+    src = inspect.getsource(pipeline.run_edit_pipeline)
+
+    fresh_first_count = src.count(
+        '_audio_duration(mp3_path) or _ffprobe_duration(mp3_path)'
+    )
+    assert fresh_first_count >= 3, (
+        f"expected >=3 edit-path sites to measure fresh before falling back "
+        f"to the persisted scene_plan value, found {fresh_first_count}"
+    )
+
+    dead_pattern = (
+        "if not _sc_audio:\n                    try:\n"
+        "                        _sc_audio = _audio_duration(mp3_path)"
+    )
+    assert dead_pattern not in src, (
+        "dead try/except re-introduced around a scene_plan-derived "
+        "_audio_duration() call — it never raises, so `except Exception` "
+        "there is always unreachable (same bug class as F5)"
+    )
+
+
 def test_restitch_failure_persists_scene_statuses():
     """Cuando el re-stitch falla, los status/error por escena que dejó el
     intento deben persistirse — sin esto /status muestra 'generated' stale y
