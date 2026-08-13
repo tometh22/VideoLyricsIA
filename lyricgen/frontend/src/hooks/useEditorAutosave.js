@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef } from "react";
 
-export function useEditorAutosave({ enabled, segments, dirty, blocked, save, reconcile, onStatus }) {
+export function useEditorAutosave({ enabled, segments, dirty, blocked, save, reconcile, onStatus, onMerged }) {
   const MAX_REBASE_ATTEMPTS = 3;
   const segmentsRef = useRef(segments);
   const draftTimerRef = useRef(null);
@@ -57,6 +57,7 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
       // moves the document again, bounded retries keep the editor responsive
       // without ever bypassing the backend CAS check.
       if (rebaseAttempts < MAX_REBASE_ATTEMPTS) {
+        onMerged?.(result.mergedSegments, result);
         return runSave(checkpoint, false, result.mergedSegments, rebaseAttempts + 1);
       }
       const delay = Math.min(30_000, 1_000 * (2 ** retryCountRef.current));
@@ -74,7 +75,7 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
     retryCountRef.current += 1;
     retryTimerRef.current = window.setTimeout(() => runSave(checkpoint, true), delay + Math.random() * 250);
     return result;
-  }, [blocked, enabled, onStatus, reconcile, save]);
+  }, [blocked, enabled, onMerged, onStatus, reconcile, save]);
 
   useEffect(() => {
     if (!enabled || !dirty || blocked) return undefined;

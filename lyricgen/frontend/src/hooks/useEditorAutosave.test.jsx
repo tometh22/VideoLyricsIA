@@ -61,4 +61,29 @@ describe("useEditorAutosave", () => {
     await act(async () => { await result.current.flush("manual", approved); });
     expect(save).toHaveBeenCalledWith(approved, "manual");
   });
+
+  it("applies a silent three-way merge to the visible editor before retrying", async () => {
+    const merged = [
+      { start: 0, end: 1, text: "local" },
+      { start: 1, end: 2, text: "remote-only" },
+    ];
+    const save = vi.fn()
+      .mockResolvedValueOnce({ ok: false, reason: "merged", mergedSegments: merged })
+      .mockResolvedValueOnce({ ok: true, revision: 4 });
+    const onMerged = vi.fn();
+    const { result } = renderHook(() => useEditorAutosave({
+      enabled: true,
+      segments: [{ start: 0, end: 1, text: "local" }],
+      dirty: false,
+      blocked: false,
+      save,
+      onStatus: vi.fn(),
+      onMerged,
+    }));
+
+    await act(async () => { await result.current.flush("manual"); });
+    expect(onMerged).toHaveBeenCalledWith(merged, expect.objectContaining({ reason: "merged" }));
+    expect(save).toHaveBeenCalledTimes(2);
+    expect(save.mock.calls[1][0]).toEqual(merged);
+  });
 });

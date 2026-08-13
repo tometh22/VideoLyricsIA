@@ -738,6 +738,11 @@ export default function LyricsEditor({
     () => sanitizeSegmentsForPersistence(edited),
     [edited],
   );
+  const handleDurableMerge = useCallback((mergedSegments) => {
+    if (!Array.isArray(mergedSegments)) return;
+    setEdited(reseedPreservingIds(editedRef.current, mergedSegments));
+    setIsDirty(true);
+  }, []);
   const { flush: flushDurableSave } = useEditorAutosave({
     enabled: editorV2Enabled && durableHydrated && !durableEditor.loading,
     segments: durableSegments,
@@ -748,6 +753,7 @@ export default function LyricsEditor({
     save: durableEditor.save,
     reconcile: durableEditor.reconcile,
     onStatus: handleDurableStatus,
+    onMerged: handleDurableMerge,
   });
 
   // Never let an operator type against the legacy seed while the durable
