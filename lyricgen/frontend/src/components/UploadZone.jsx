@@ -2513,11 +2513,33 @@ export default function UploadZone({
                 })}
               </div>
 
-              <p className="mt-1.5 text-[9px] leading-snug text-gray-600">
-                {files.length > 1
-                  ? (t("upload.effect_gallery_hint") || "Click para aplicar a todos · personalizable por canción")
-                  : (t("upload.effect_hover_hint") || "Pasá el cursor para explorar · click para elegir")}
-              </p>
+              {(() => {
+                const _cap = (hoverEffect && EFFECTS.find((e) => e.code === hoverEffect)) || selectedEffect;
+                return (
+                  <div className="mt-1.5 space-y-1">
+                    {_cap && _cap.code !== "none" && _cap.desc && (
+                      <p className="text-[10px] leading-snug text-gray-300">
+                        <span className="font-semibold text-white">{_cap.label}:</span> {_cap.desc}
+                      </p>
+                    )}
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[9px] leading-snug text-gray-500">
+                      <span className="inline-flex items-center gap-1">
+                        <span className="rounded-full bg-cyan-400/20 px-1.5 py-0.5 text-[7px] font-bold text-cyan-50">{t("upload.effect_ai_badge") || "IA"}</span>
+                        {t("upload.effect_ai_legend") || "usa generación IA, tarda un poco más"}
+                      </span>
+                      <span className="inline-flex items-center gap-1">
+                        <span className="rounded-full bg-fuchsia-400/20 px-1.5 py-0.5 text-[7px] font-bold text-fuchsia-100">{t("upload.effect_reactive_badge")}</span>
+                        {t("upload.effect_reactive_legend") || "reacciona al audio"}
+                      </span>
+                    </div>
+                    <p className="text-[9px] leading-snug text-gray-600">
+                      {files.length > 1
+                        ? (t("upload.effect_gallery_hint") || "Click para aplicar a todos · personalizable por canción")
+                        : (t("upload.effect_hover_hint") || "Pasá el cursor para explorar · click para elegir")}
+                    </p>
+                  </div>
+                );
+              })()}
             </div>
           )}
         </div>
@@ -5031,9 +5053,9 @@ export default function UploadZone({
             <>
               {user?.features?.prores_export && _deliveryBlock}
               <div className="rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] px-4 py-3">
-                <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-1">{t("upload.step_deliver") || "Entregá"}</p>
+                <p className="text-[10px] uppercase tracking-[0.18em] text-brand-light/80 mb-1">{t("upload.deliver_recap_title") || "Casi listo · elegí cómo terminar"}</p>
                 <p className="text-[13px] text-gray-200">{summary}</p>
-                <p className="text-[11px] text-gray-600 mt-1">{t("upload.deliver_hint") || "Revisá los lyrics para ajustar el tiempo, o generá directo."}</p>
+                <p className="text-[11px] text-gray-600 mt-1">{t("upload.deliver_hint") || "«Revisar letra» te deja ajustar el tiempo y el texto antes de generar. «Generar sin revisar» salta esa edición."}</p>
               </div>
             </>
           )}
