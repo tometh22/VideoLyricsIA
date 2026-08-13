@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef } from "react";
 
 export function useEditorAutosave({ enabled, segments, dirty, blocked, save, reconcile, onStatus }) {
+  const MAX_REBASE_ATTEMPTS = 3;
   const segmentsRef = useRef(segments);
   const draftTimerRef = useRef(null);
   const checkpointTimerRef = useRef(null);
@@ -15,14 +16,22 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
     }
   }, []);
 
-  const runSave = useCallback(async (checkpoint = "draft", isRetry = false, overrideSegments = null) => {
+  const runSave = useCallback(async (
+    checkpoint = "draft",
+    isRetry = false,
+    overrideSegments = null,
+    rebaseAttempts = 0,
+  ) => {
     if (!enabled || blocked) return { ok: false, reason: blocked ? "conflict" : "disabled" };
     let snapshot = overrideSegments || segmentsRef.current;
     if (isRetry && reconcile) {
       const state = await reconcile(snapshot);
       if (!state?.ok) {
-        if (state?.reason === "conflict") onStatus?.("conflict", "conflict", { checkpoint, result: state });
-        return state;
+        if (state?.reason === "conflict" && rebaseAttempts < MAX_REBASE_ATTEMPTS) {
+          return runSave(checkpoint, false, snapshot, rebaseAttempts + 1);
+        }
+        onStatus?.("error", "server", { checkpoint, result: state });
+        return { ...state, reason: "server" };
       }
       if (Array.isArray(state?.mergedSegments)) snapshot = state.mergedSegments;
     }
@@ -35,14 +44,29 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
       return result;
     }
     if (result?.reason === "conflict") {
-      onStatus?.("conflict", "conflict", { checkpoint, result });
-      return result;
+      if (rebaseAttempts < MAX_REBASE_ATTEMPTS) {
+        return runSave(checkpoint, true, snapshot, rebaseAttempts + 1);
+      }
+      onStatus?.("error", "server", { checkpoint, result });
+      return { ...result, reason: "server" };
     }
     if (result?.reason === "merged" && Array.isArray(result.mergedSegments)) {
       // The first request was rejected because the base was stale, but the
       // three-way merge proved the edits were independent. Retry the rebased
-      // document through the same serialized save queue.
-      return runSave(checkpoint, false, result.mergedSegments);
+      // document through the same serialized save queue. If a second writer
+      // moves the document again, bounded retries keep the editor responsive
+      // without ever bypassing the backend CAS check.
+      if (rebaseAttempts < MAX_REBASE_ATTEMPTS) {
+        return runSave(checkpoint, false, result.mergedSegments, rebaseAttempts + 1);
+      }
+      const delay = Math.min(30_000, 1_000 * (2 ** retryCountRef.current));
+      retryCountRef.current += 1;
+      retryTimerRef.current = window.setTimeout(
+        () => runSave(checkpoint, true),
+        delay + Math.random() * 250,
+      );
+      onStatus?.("error", "server", { durationMs: performance.now() - started, checkpoint, result });
+      return result;
     }
     const reason = result?.reason || "network";
     onStatus?.(reason === "offline" ? "offline" : "error", reason, { checkpoint, result });

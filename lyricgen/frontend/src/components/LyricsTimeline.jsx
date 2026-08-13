@@ -661,7 +661,6 @@ export default function LyricsTimeline({
           {saveStatus === "saved" && <span className="text-[10px] text-emerald-300">✓ {t("timeline.saved", "Guardado")}</span>}
           {saveStatus === "local" && <span className="text-[10px] text-amber-300">{t("timeline.local_changes", "Cambios locales")}</span>}
           {saveStatus === "offline" && <span className="text-[10px] text-red-300">{t("timeline.offline", "Sin conexión")}</span>}
-          {saveStatus === "conflict" && <span className="text-[10px] text-amber-300">{t("timeline.conflict", "Conflicto detectado")}</span>}
           {saveStatus === "error" && <span className="text-[10px] text-red-300">{t("timeline.save_error", "Sin guardar")}</span>}
         </div>
         <div className="relative flex items-center gap-2" data-testid="timeline-primary-actions" data-selected-count={selectedIds.size}>

@@ -22,9 +22,11 @@ describe("useEditorAutosave", () => {
     expect(save).toHaveBeenCalledWith(expect.any(Array), "autosave");
   });
 
-  it("reconciles before retrying and stops on a reconnect conflict", async () => {
+  it("retries a reconnect conflict without emitting a collaboration status", async () => {
     vi.useFakeTimers();
-    const save = vi.fn().mockResolvedValueOnce({ ok: false, reason: "offline" });
+    const save = vi.fn()
+      .mockResolvedValueOnce({ ok: false, reason: "offline" })
+      .mockResolvedValue({ ok: true, revision: 2 });
     const reconcile = vi.fn().mockResolvedValue({ ok: false, reason: "conflict" });
     const onStatus = vi.fn();
     renderHook(() => useEditorAutosave({
@@ -39,8 +41,8 @@ describe("useEditorAutosave", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(800); });
     await act(async () => { window.dispatchEvent(new Event("online")); await Promise.resolve(); });
     expect(reconcile).toHaveBeenCalledTimes(1);
-    expect(save).toHaveBeenCalledTimes(1);
-    expect(onStatus).toHaveBeenCalledWith("conflict", "conflict", expect.any(Object));
+    expect(save).toHaveBeenCalledTimes(2);
+    expect(onStatus).not.toHaveBeenCalledWith("conflict", "conflict", expect.any(Object));
   });
 
   it("flushes the exact approval snapshot instead of a stale render snapshot", async () => {

@@ -47,6 +47,7 @@ export function createSaveQueue(persist, opts = {}) {
         revision: 0,          // optimistic concurrency revision for this job
         lastResult: null,
         nextPersistOpts: null,
+        rebaseAttempts: 0,
       };
       jobs.set(jobId, j);
     }
@@ -130,6 +131,25 @@ export function createSaveQueue(persist, opts = {}) {
     j.lastResult = result;
     if (result?.ok !== false && Number.isInteger(result?.revision)) {
       j.revision = result.revision;
+      j.rebaseAttempts = 0;
+    }
+    const staleRevision = result?.ok === false
+      && (result.reason === "stale-revision" || result.reason === "client-upgrade-required")
+      && Number.isInteger(result.currentRevision)
+      && j.rebaseAttempts < 3;
+    if (staleRevision) {
+      // Legacy editor clients do not have the durable document's three-way
+      // merge endpoint. Re-anchor their serialized autosave to the revision
+      // returned by the CAS response and retry the same local snapshot. This
+      // preserves the old single-user autosave behavior while keeping every
+      // write behind the backend's optimistic check.
+      j.revision = Math.max(j.revision, result.currentRevision);
+      j.rebaseAttempts += 1;
+      if (!j.pending && !j.debounceTimer) {
+        setStatus(j, "saving");
+        run(jobId);
+        return;
+      }
     }
     // Orden garantizado por la serialización estricta (un solo POST en vuelo;
     // el trailing arranca recién en este settle), así que no hace falta un
@@ -165,6 +185,12 @@ export function createSaveQueue(persist, opts = {}) {
     schedule(jobId, provider) {
       if (!jobId) return;
       const j = ensure(jobId);
+      // A new edit after a failed bounded rebase starts a fresh retry budget.
+      // Keep the budget while a request/trailing snapshot is still in flight,
+      // otherwise a rapid typing burst could turn one race into unbounded
+      // retries. Once the queue is idle, the next user snapshot must be able
+      // to recover normally.
+      if (!j.inflight && !j.pending && !j.debounceTimer) j.rebaseAttempts = 0;
       j.provider = provider;
       if (j.debounceTimer) clearTimeout(j.debounceTimer);
       j.debounceTimer = setTimeout(() => { j.debounceTimer = null; run(jobId); }, debounceMs);
@@ -180,6 +206,9 @@ export function createSaveQueue(persist, opts = {}) {
     flush(jobId, { keepalive = false, provider, persistOpts = null } = {}) {
       if (!jobId) return Promise.resolve({ ok: false, reason: "no-job" });
       const j = ensure(jobId);
+      if (!keepalive && !j.inflight && !j.pending && !j.debounceTimer) {
+        j.rebaseAttempts = 0;
+      }
       if (typeof provider === "function") j.provider = provider;
       return run(jobId, { keepalive, persistOpts });
     },
