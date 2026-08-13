@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-export default function ConflictDialog({ conflict, onUseServer, onSaveLocal, onCancel }) {
+export default function ConflictDialog({ conflict, currentUserId, onUseServer, onSaveLocal, onCancel }) {
   const [busy, setBusy] = useState(false);
   const dialogRef = useRef(null);
 
@@ -24,6 +24,22 @@ export default function ConflictDialog({ conflict, onUseServer, onSaveLocal, onC
 
   if (!conflict) return null;
   const actor = conflict.updatedBy?.username;
+  // Audit 2026-08-13: updated_by is "whoever last wrote this document", not
+  // "someone other than you" — a reconciliation between the job row and the
+  // durable editor document (e.g. after a background/typography edit that
+  // carried a lyrics snapshot) can bump the revision without a genuine
+  // second human involved, and the message below used to blame that on
+  // "actor" even when actor IS the current user. Confirmed reproduced by
+  // two different accounts (UMG Chile operator + platform admin) seeing
+  // their own username presented as "someone else". Say something true
+  // instead of guessing who else it was.
+  const isSelf = currentUserId != null && conflict.updatedBy?.id != null
+    && String(conflict.updatedBy.id) === String(currentUserId);
+  const changeDescription = isSelf
+    ? "Guardaste cambios desde otra pestaña, dispositivo, o al hacer otro cambio (fondo, tipografía) sobre este video. "
+    : actor
+      ? `${actor} guardó cambios mientras estabas editando. `
+      : "Otro integrante guardó cambios. ";
   const run = async (action) => {
     setBusy(true);
     try { await action?.(); } finally { setBusy(false); }
@@ -34,14 +50,14 @@ export default function ConflictDialog({ conflict, onUseServer, onSaveLocal, onC
         <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-300">Conflicto detectado</p>
         <h2 id="editor-conflict-title" className="mt-2 text-xl font-semibold text-white">Hay una versión más nueva</h2>
         <p className="mt-2 text-sm leading-relaxed text-ink-secondary">
-          {actor ? `${actor} guardó cambios mientras estabas editando. ` : "Otro integrante guardó cambios. "}
+          {changeDescription}
           La revisión del equipo es la {conflict.serverRevision}. Nada se sobrescribirá automáticamente.
         </p>
         <div className="mt-5 grid gap-2 sm:grid-cols-2">
           <button type="button" disabled={busy} onClick={() => run(onUseServer)} className="rounded-xl bg-white/[0.06] px-4 py-3 text-sm font-medium text-white ring-1 ring-white/10 hover:bg-white/10 disabled:opacity-50">Usar versión del equipo</button>
           <button type="button" disabled={busy} onClick={() => run(onSaveLocal)} className="rounded-xl bg-brand px-4 py-3 text-sm font-semibold text-white hover:bg-brand-light disabled:opacity-50">Guardar mi versión como nueva revisión</button>
         </div>
-        <button type="button" disabled={busy} onClick={onCancel} className="mt-3 w-full rounded-lg px-3 py-2 text-xs text-ink-tertiary hover:text-white disabled:opacity-50">Cancelar y seguir revisando</button>
+        <button type="button" disabled={busy} onClick={onCancel} className="mt-3 w-full rounded-lg px-3 py-2 text-xs text-ink-tertiary hover:text-white disabled:opacity-50">Cancelar (seguís viendo tu versión, sin guardar hasta que elijas una opción)</button>
       </div>
     </div>
   );
