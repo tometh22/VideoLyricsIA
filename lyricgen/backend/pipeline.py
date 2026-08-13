@@ -5196,14 +5196,18 @@ def _fill_gaps_with_reference(whisper_segments: list[dict],
 
 
 _AUDIO_DURATION_MAX_SANE_SECONDS = 3600  # no legit song upload runs past an hour
+# Same tolerance _verify_deliverables uses to compare rendered-vs-expected
+# duration — a header reading that disagrees with the real demux by more
+# than this is exactly what would blow up verify later, so we catch it here.
+_AUDIO_DURATION_CROSSCHECK_TOLERANCE_SECONDS = 2.0
 
 
 def _audio_duration(audio_path: str) -> float | None:
     """Best-effort audio duration in seconds. Handles both MP3 and WAV.
     For MP3 we use mutagen.mp3 (header-only, ~1 ms). For WAV we use the
-    stdlib `wave` module (also header-only). Falls back to ffprobe (real
-    demux) and then moviepy (slower, opens the full file) on any failure
-    or implausible result. Returns None if everything fails.
+    stdlib `wave` module (also header-only). Cross-checked against ffprobe
+    (real demux) before being trusted; falls back to ffprobe outright, then
+    moviepy, on any header-read failure. Returns None if everything fails.
 
     Header-only reads are fast but blindly trust a single declared-size
     field:
@@ -5222,21 +5226,31 @@ def _audio_duration(audio_path: str) -> float | None:
     render's final verify step (and as an upper bound for lyric timing
     elsewhere), a bogus-but-not-`None` result silently guarantees a
     failure/misbehavior downstream — even though the audio decoded and
-    rendered correctly. Discard any header-only result that isn't a
-    plausible song length and fall through to a real decode instead.
+    rendered correctly. An absolute plausibility bound alone isn't enough:
+    a header misread of a few hundred seconds (e.g. a VBR MP3's CBR
+    extrapolation, or a WAV header off by a smaller margin) sails under
+    any sane ceiling yet still disagrees with the real render duration by
+    more than _verify_deliverables' 2s tolerance — the exact same
+    deterministic, retry-proof failure, just with a smaller number
+    (postmortem 2026-08-11: the first version of this fix only bounded
+    the header value in isolation, never against a real decode). So every
+    header-only read is cross-checked against ffprobe before being
+    trusted; on disagreement the demuxed value wins.
     """
     name_lower = audio_path.lower()
+    header_dur = None
     if name_lower.endswith(".mp3"):
         try:
             from mutagen.mp3 import MP3
             dur = float(MP3(audio_path).info.length)
             if 0 < dur <= _AUDIO_DURATION_MAX_SANE_SECONDS:
-                return dur
-            logger.warning(
-                "[AUDIO-DURATION] %s: mutagen reports %.1fs — implausible "
-                "for a song, likely VBR without Xing/VBRI header. Falling "
-                "back to ffprobe.", audio_path, dur,
-            )
+                header_dur = dur
+            else:
+                logger.warning(
+                    "[AUDIO-DURATION] %s: mutagen reports %.1fs — implausible "
+                    "for a song, likely VBR without Xing/VBRI header. Falling "
+                    "back to ffprobe.", audio_path, dur,
+                )
         except Exception:
             pass
     elif name_lower.endswith(".wav"):
@@ -5248,19 +5262,38 @@ def _audio_duration(audio_path: str) -> float | None:
                 if rate > 0:
                     dur = float(frames) / rate
                     if 0 < dur <= _AUDIO_DURATION_MAX_SANE_SECONDS:
-                        return dur
-                    logger.warning(
-                        "[AUDIO-DURATION] %s: wave header reports %.1fs "
-                        "(frames=%s, rate=%s) — implausible for a song, "
-                        "likely a corrupted/placeholder WAV header. Falling "
-                        "back to ffprobe.", audio_path, dur, frames, rate,
-                    )
+                        header_dur = dur
+                    else:
+                        logger.warning(
+                            "[AUDIO-DURATION] %s: wave header reports %.1fs "
+                            "(frames=%s, rate=%s) — implausible for a song, "
+                            "likely a corrupted/placeholder WAV header. Falling "
+                            "back to ffprobe.", audio_path, dur, frames, rate,
+                        )
         except Exception:
             pass
-    # Header-only read missing, failed, or implausible — fall back to a
-    # real decode. ffprobe demuxes the actual stream instead of trusting
-    # a single (possibly corrupted) header field, so it survives both the
-    # WAV "unknown length" sentinel and MP3 VBR-without-Xing misestimates.
+
+    if header_dur is not None:
+        probed = _ffprobe_duration(audio_path)
+        if probed and 0 < probed <= _AUDIO_DURATION_MAX_SANE_SECONDS:
+            if abs(header_dur - probed) <= _AUDIO_DURATION_CROSSCHECK_TOLERANCE_SECONDS:
+                return header_dur
+            logger.warning(
+                "[AUDIO-DURATION] %s: header says %.1fs but ffprobe demux "
+                "says %.1fs (off by %.1fs, > %.0fs tolerance) — header "
+                "untrustworthy, using the demuxed value.", audio_path,
+                header_dur, probed, abs(header_dur - probed),
+                _AUDIO_DURATION_CROSSCHECK_TOLERANCE_SECONDS,
+            )
+            return probed
+        # ffprobe unavailable or itself implausible — the header at least
+        # passed its own sanity bound, better than nothing.
+        return header_dur
+
+    # No usable header-only read at all — fall back to a real decode.
+    # ffprobe demuxes the actual stream instead of trusting a single
+    # (possibly corrupted) header field, so it survives both the WAV
+    # "unknown length" sentinel and MP3 VBR-without-Xing misestimates.
     dur = _ffprobe_duration(audio_path)
     if dur and 0 < dur <= _AUDIO_DURATION_MAX_SANE_SECONDS:
         return dur
@@ -18116,9 +18149,16 @@ def run_edit_pipeline(
         # ----------------------------------------------------------------
         # Verify + upload to R2 (replacing previous deliverables)
         # ----------------------------------------------------------------
-        try:
-            audio_dur = _audio_duration(mp3_path)
-        except Exception:
+        # _audio_duration returns None on failure, it never raises — the
+        # `except` below was dead code and this fell through to
+        # _verify_deliverables(..., None), which short-circuits the whole
+        # duration check (`if expected_dur is not None:`). That silently
+        # disabled the safety net on every edit re-render whose duration
+        # read failed, which is exactly the failure mode most likely on
+        # this path (audit 2026-08-12, same incident as the run_pipeline
+        # fix). Mirror run_pipeline's explicit None-check instead.
+        audio_dur = _audio_duration(mp3_path)
+        if audio_dur is None:
             audio_dur = _ffprobe_duration(mp3_path)
         _verify_deliverables(job_dir, files, audio_dur)
 
