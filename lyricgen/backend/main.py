@@ -11536,13 +11536,28 @@ async def reanchor_segments(
         # document_revision and reconcile by overwriting whatever was in
         # the durable editor document with this re-anchored snapshot,
         # silently discarding any newer edit made in the editor meanwhile.
+        #
+        # CRITICAL ordering (regression found in prod 2026-08-13, same day
+        # this bridge shipped): SessionLocal is created with autoflush=False
+        # (database.py), and get_or_create_document re-queries the Job with
+        # .populate_existing(), which OVERWRITES in-memory attributes from
+        # the database row. Without an explicit flush first, the pending
+        # `row.segments_json = merged` assignment above is silently
+        # discarded before it ever reaches the DB — the endpoint then burns
+        # 40-130s of CTC compute and persists nothing (observed live: rev
+        # 156 and 157 byte-identical while the worker logged "[CTC] retimed
+        # 50 lines"). Flush pins the new timings into the transaction so the
+        # refresh below reads them back instead of clobbering them, and we
+        # pass the locally-computed `merged`/`persisted_revision` rather
+        # than re-reading through the refreshed ORM object.
+        _db2.flush()
         try:
             _reanchor_document = get_or_create_document(
-                _db2, job_id, row.tenant_id, row.segments_json or [],
+                _db2, job_id, row.tenant_id, merged,
             )
             sync_legacy_snapshot(
                 _db2, _reanchor_document, current_user["id"],
-                row.segments_json or [], persisted_revision,
+                merged, persisted_revision,
             )
         except (LookupError, ValueError, RuntimeError) as exc:
             _db2.rollback()
