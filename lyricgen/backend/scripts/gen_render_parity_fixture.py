@@ -40,6 +40,7 @@ from pipeline import (  # noqa: E402
     _normalize_movement_style,
 )
 from fx_compositor import EFFECTS as EFFECT_CODES  # noqa: E402
+from tenant_style import strip_trailing_punctuation  # noqa: E402
 
 FIXTURE_PATH = os.path.join(
     os.path.dirname(__file__), "..", "..", "frontend", "src", "shared", "renderParity.json"
@@ -66,6 +67,31 @@ _MOVEMENT_NORMALIZATION_PROBES = [
     "animated", "illustration", "cartoon",
     "ESTATICO", "Dinamico", "  Estatica  ",
     "basura", "photo-parallax",
+]
+
+# Sondas de strip_trailing_punctuation. Incluyen los casos reales que UMG
+# pidió ("sacar los puntos al final de cada frase") y los que NO hay que
+# tocar: los signos de interrogación/exclamación cargan sentido y nadie
+# pidió sacarlos, y la puntuación a mitad de línea ("No, no puedo") es
+# legible. La línea que es sólo puntos vuelve intacta a propósito: un
+# cartel estilístico "..." no debe desaparecer solo.
+_PUNCTUATION_PROBES = [
+    "",
+    "Costumbres argentinas",
+    "Costumbres argentinas.",
+    "Y sigue el tren...",
+    "Y sigue el tren…",
+    "No hay nadie mas que vos y yo,",
+    "Dime una cosa;",
+    "Escuchame bien:",
+    "¿Quien te mira?",
+    "¡La argentinidad al palo!",
+    "No, no puedo mas.",
+    "Mil horas.   ",
+    "...",
+    "…",
+    ".",
+    "   ",
 ]
 
 TEXT_LENGTHS = [1, 30, 50, 51, 80, 81, 120, 200]
@@ -142,6 +168,18 @@ def build_fixture() -> dict:
         "movement_normalization": {
             raw: _normalize_movement_style(raw)
             for raw in sorted(_MOVEMENT_NORMALIZATION_PROBES)
+        },
+        # Tabla de verdad de tenant_style.strip_trailing_punctuation. La
+        # preview del wizard pinta la letra con su propio applyCase; si el
+        # espejo JS no sacara los mismos puntos, el operador vería en la
+        # preview algo distinto de lo que sale renderizado — que es
+        # exactamente el bug de fidelidad que este fixture existe para
+        # prevenir. Los casos cubren: punto final, elipsis, coma/;/:,
+        # signos que NO se tocan (? !), puntuación a mitad de línea,
+        # espacios finales y la línea que es sólo puntuación.
+        "strip_trailing_punctuation": {
+            raw: strip_trailing_punctuation(raw)
+            for raw in sorted(_PUNCTUATION_PROBES)
         },
     }
 

@@ -13,6 +13,7 @@
  * (onLayoutChange → setEdited) — this component owns no persistence.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { applyLyricStyleProfile } from "../lib/lyricText";
 import { REF_W, tierForLength, lyricFontPx, FADE_SECONDS } from "../lib/lyricTiers";
 
 // Font fidelity: the render (ass_render.lyric_fontsize + pipeline wrap tiers)
@@ -79,6 +80,10 @@ export default function LyricVideoPreview({
   onDragStart,            // () => void — push one undo snapshot
   showSafeArea = true,    // broadcast-safe guide
   editable = true,        // false → read-only preview (no handles/selection box)
+  // Defaults visuales de la cuenta (tenant_style). Hoy sólo
+  // strip_trailing_punctuation. Espejo de pipeline._display_segments: si no
+  // se aplicara acá, la preview mostraría el punto final que el render saca.
+  styleProfile = null,
   t = null,               // optional i18n hook from useI18n() — falls back to ES copy
 }) {
   const frameRef = useRef(null);
@@ -238,7 +243,7 @@ export default function LyricVideoPreview({
   // and the size tier come from the primary segment — that's the only line
   // they can adjust with the handles in this view.
   const displayText = activeSegs.length > 0
-    ? activeSegs.map((s) => applyCase(s.text, textCase)).join("\n")
+    ? activeSegs.map((s) => applyCase(applyLyricStyleProfile(s.text, styleProfile), textCase)).join("\n")
     : "";
   const tier = tierForLength(displayText.length);
   // Render size = lyricTiers.lyricFontPx (tier × global font_scale clampeado

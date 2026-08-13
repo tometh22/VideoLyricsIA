@@ -988,7 +988,13 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # Canonical allowlisted batch contract. Individual fields
                  # above remain for backwards compatibility; this object is
                  # persisted verbatim (after API validation) for audit/retry.
-                 render_profile: dict | None = None):
+                 render_profile: dict | None = None,
+                 # Account-level display preferences resolved at job-creation
+                 # time (tenant_style.resolve_style_profile). Materialised into
+                 # render_params below so retries, variants and /edit inherit
+                 # the exact profile the job was rendered with, rather than
+                 # re-resolving against a row someone edited in between.
+                 style_profile: dict | None = None):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -1532,6 +1538,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "text_case": text_case,
             "frame_format": frame_format,
             "font_scale": font_scale,
+            # Snapshot, not a live lookup: a re-render months later must
+            # reproduce THIS video, not whatever the account profile says
+            # by then. Empty dict = no account preferences at creation time.
+            "style_profile": dict(style_profile or {}),
             "lyric_transition": lyric_transition,
             "text_motion": text_motion,
             "lyrics_animation": lyrics_animation,
@@ -1987,12 +1997,16 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 if _enriched is not segments:
                     segments = _enriched
                     update_job(job_id, segments_json=segments)
+            # Account display preferences. Kept in a separate name so the
+            # persisted `segments` (and therefore the editor) never sees the
+            # stripped text.
+            render_segments = _display_segments(segments, style_profile)
             intermediate_spec = (
                 RenderSpec.umg_intermediate_master(umg_spec) if wants_umg
                 else None  # generate_lyric_video defaults to youtube_default
             )
             _video_out, chosen_font, bg_source = generate_lyric_video(
-                mp3_path, segments, style, job_dir, artist, bg_image_path,
+                mp3_path, render_segments, style, job_dir, artist, bg_image_path,
                 font=chosen_font, spec=intermediate_spec,
                 song_title=song_title,
                 text_case=text_case,
@@ -2063,8 +2077,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     label_line=label_line, effect=effect,
                 )
             else:
+                # Re-derived rather than reusing the video block's local:
+                # this is a separate `if`, so depending on that binding
+                # would couple the short to the video block having run.
                 generate_short(
-                    mp3_path, segments, job_dir, bg_source=bg_source,
+                    mp3_path, _display_segments(segments, style_profile),
+                    job_dir, bg_source=bg_source,
                     style=style, font=chosen_font, fps=short_fps,
                     text_case=text_case, font_scale=font_scale,
                     lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
@@ -14816,6 +14834,50 @@ def _sentence_case(text: str) -> str:
     return "\n".join(out)
 
 
+def _display_segments(segments: list[dict], style_profile: dict | None) -> list[dict]:
+    """Return the segment list to hand the renderers, with the account's
+    display preferences applied.
+
+    Applied here — on a shallow copy, immediately before rendering — rather
+    than inside `_apply_case` for two reasons:
+
+      1. It must NOT reach `segments_json`. The editor keeps the punctuation
+         (an operator correcting a line should see real text), and
+         `run_edit_pipeline` persists `segments` again after rendering for
+         lyrics edits; rebinding the original would write the stripped text
+         back to the DB.
+      2. It must NOT touch the title card. `_apply_case` is shared with the
+         artist/song titles, where a trailing period is nobody's complaint.
+
+    Both render engines (libass and the moviepy fallback) and both formats
+    (video and short) consume this same list, so one transform covers all
+    four paths. Returns the original list untouched when there is nothing
+    to do, so the common case allocates nothing.
+    """
+    if not segments or not style_profile:
+        return segments
+    if not style_profile.get("strip_trailing_punctuation"):
+        return segments
+    import tenant_style
+
+    out = []
+    changed = 0
+    for seg in segments:
+        text = seg.get("text")
+        if not isinstance(text, str):
+            out.append(seg)
+            continue
+        cleaned = tenant_style.strip_trailing_punctuation(text)
+        if cleaned != text:
+            changed += 1
+            out.append({**seg, "text": cleaned})
+        else:
+            out.append(seg)
+    if changed:
+        logger.info("[STYLE] %d/%d líneas sin puntuación final", changed, len(segments))
+    return out
+
+
 def _apply_case(text: str, case: str) -> str:
     """Apply text-case transformation matching the user's choice."""
     if case == "upper":
@@ -18102,12 +18164,20 @@ def run_edit_pipeline(
             if _enriched is not segments:
                 segments = _enriched
                 update_job(job_id, segments_json=segments)
+        # Account display preferences, snapshotted into render_params when
+        # the job was created. MUST stay in a separate name: a lyrics edit
+        # persists `segments` again after this render (see the
+        # `if edit_type == "lyrics"` write below), so rebinding it here
+        # would write the stripped text back into segments_json and the
+        # operator's editor would lose the punctuation for good.
+        _style_profile = merged.get("style_profile") or {}
         intermediate_spec = (
             RenderSpec.umg_intermediate_master(umg_spec) if wants_umg
             else None
         )
         _video_out, chosen_font, bg_source = generate_lyric_video(
-            mp3_path, segments, style, job_dir, artist, bg_image_path,
+            mp3_path, _display_segments(segments, _style_profile),
+            style, job_dir, artist, bg_image_path,
             font=chosen_font, spec=intermediate_spec,
             song_title=song_title,
             text_case=text_case,
@@ -18150,7 +18220,8 @@ def run_edit_pipeline(
             update_job(job_id, current_step="short", progress=75)
             short_fps = float(umg_spec["fps"]) if wants_umg and umg_spec else 24
             generate_short(
-                mp3_path, segments, job_dir, bg_source=bg_source,
+                mp3_path, _display_segments(segments, _style_profile),
+                job_dir, bg_source=bg_source,
                 style=style, font=chosen_font, fps=short_fps,
                 text_case=text_case, font_scale=font_scale,
                 lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,

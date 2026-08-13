@@ -577,6 +577,19 @@ class Job(Base):
     render_params = Column(JSONB, nullable=True)
     edit_count = Column(Integer, default=0, nullable=False, server_default="0")
     bg_r2_key_cached = Column(Text, nullable=True)
+    # Alignment-quality telemetry, written once by the transcription worker
+    # from postpass_stats["coverage_final"]: audio_coverage, uncovered_spans,
+    # uncovered_seconds, worst_span_s, text_mismatches, voiced_gaps,
+    # voiced_gap_s, coverage_warning.
+    #
+    # Until 2026-08 these numbers were computed on every job and then thrown
+    # away — `transcription_worker` only persisted status/current_step/
+    # segments_json, so the whole set lived ~2 seconds and survived only in
+    # container logs. That is why nothing could gate a delivery on quality,
+    # why `coverage_warning` always read false on the async path, and why we
+    # cannot say which engine produced a video UMG rejected. NULL = job
+    # transcribed before this column existed, or a path that never measured.
+    quality_json = Column(JSONB, nullable=True)
     # Add-on premium "Escenas" (multi-escena). Storyboard generado por
     # scenes.build_scene_plan: { bible:{...}, sections:[...], scenes:[{ id,
     # recurrence_key, section_type, energy, movement_style, prompt, cache_token,
@@ -921,6 +934,44 @@ class DeliveryChangeRequest(Base):
             "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
             "resolution_note": self.resolution_note,
+        }
+
+
+class TenantStyleProfile(Base):
+    # Account-level visual preferences (see tenant_style.py for the why).
+    # Sparse by design: a row states only the keys that account cares about.
+    #
+    # `scope` is tenant | billing_group rather than a bare tenant_id string
+    # because Universal spans five tenants (pipeline.UMG_TENANTS) under one
+    # billing_group — one billing_group row covers all of them, and keeping
+    # the two namespaces explicit avoids a tenant named like a billing group
+    # silently inheriting the wrong profile.
+    #
+    # Deliberately a real table, not another denormalised column on `users`:
+    # max_videos_per_day / max_concurrent_jobs / allow_overage are already
+    # per-user columns doing per-tenant duty, and pipeline.UMG_TENANTS (a
+    # hardcoded frozenset) has already drifted from reality once — its own
+    # comment records that the old {"umg","omg"} literal "silently classified
+    # every current Universal account as unrestricted".
+    __tablename__ = "tenant_style_profiles"
+    __table_args__ = (
+        Index("ix_tenant_style_scope", "scope", "scope_key", unique=True),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    scope = Column(String(20), nullable=False)          # tenant | billing_group
+    scope_key = Column(String(100), nullable=False)     # tenant_id or billing_group
+    profile = Column(JSONB, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    updated_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "scope": self.scope,
+            "scope_key": self.scope_key,
+            "profile": dict(self.profile or {}),
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
 
 
@@ -1566,6 +1617,10 @@ def _migrate_user_columns():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version INTEGER DEFAULT 0 NOT NULL",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS segments_revision BIGINT DEFAULT 0 NOT NULL",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS youtube_short_data JSONB",
+        # Alignment-quality telemetry that used to be discarded (see the
+        # column comment on Job.quality_json). Espejo de la migración
+        # Alembic; tenant_style_profiles la crea create_all().
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS quality_json JSONB",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
     # inside a transaction puts it in aborted state — subsequent execute()
