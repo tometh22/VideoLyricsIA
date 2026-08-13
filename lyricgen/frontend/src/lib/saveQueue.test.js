@@ -99,6 +99,46 @@ describe("saveQueue", () => {
     expect(q.getStatus("job")).toEqual({ status: "error", reason: "session" });
   });
 
+  it("rebasea automáticamente un 409 legacy y reintenta con la revisión actual", async () => {
+    const persist = vi.fn()
+      .mockResolvedValueOnce({ ok: false, reason: "stale-revision", status: 409, currentRevision: 3 })
+      .mockResolvedValueOnce({ ok: true, revision: 4 });
+    const q = createSaveQueue(persist);
+
+    q.flush("job", { provider: () => SEG("local") });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(persist).toHaveBeenCalledTimes(2);
+    expect(persist.mock.calls[0][2].baseRevision).toBe(0);
+    expect(persist.mock.calls[1][2].baseRevision).toBe(3);
+    expect(q.getStatus("job")).toEqual({ status: "saved", reason: null });
+  });
+
+  it("reinicia el presupuesto de rebase para un nuevo edit después de agotar los reintentos", async () => {
+    const persist = vi
+      .fn()
+      .mockResolvedValue({
+        ok: false,
+        reason: "stale-revision",
+        status: 409,
+        currentRevision: 7,
+      });
+    const q = createSaveQueue(persist);
+
+    q.flush("job", { provider: () => SEG("first") });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(persist).toHaveBeenCalledTimes(4); // initial + 3 automatic rebases
+    expect(q.getStatus("job").status).toBe("error");
+
+    persist.mockResolvedValueOnce({ ok: true, revision: 8 });
+    q.flush("job", { provider: () => SEG("second") });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(persist).toHaveBeenCalledTimes(5);
+    expect(persist.mock.calls.at(-1)[1]).toEqual(SEG("second"));
+    expect(persist.mock.calls.at(-1)[2].baseRevision).toBe(7);
+    expect(q.getStatus("job")).toEqual({ status: "saved", reason: null });
+  });
+
   it("un fetch que tira (reject) cae a status=error reason=network", async () => {
     const persist = vi.fn().mockRejectedValue(new Error("boom"));
     const categorize = (r) => r.reason || "server";

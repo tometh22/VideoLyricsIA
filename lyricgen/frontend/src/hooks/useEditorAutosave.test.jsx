@@ -22,11 +22,20 @@ describe("useEditorAutosave", () => {
     expect(save).toHaveBeenCalledWith(expect.any(Array), "autosave");
   });
 
-  it("reconciles before retrying and stops on a reconnect conflict", async () => {
+  it("retries a reconnect conflict without emitting a collaboration status", async () => {
     vi.useFakeTimers();
-    const save = vi.fn().mockResolvedValueOnce({ ok: false, reason: "offline" });
-    const reconcile = vi.fn().mockResolvedValue({ ok: false, reason: "conflict" });
+    const save = vi.fn()
+      .mockResolvedValueOnce({ ok: false, reason: "offline" })
+      .mockResolvedValue({ ok: true, revision: 2 });
+    const reconcile = vi.fn().mockResolvedValue({
+      ok: true,
+      mergedSegments: [
+        { start: 0, end: 1, text: "local" },
+        { start: 1, end: 2, text: "remote" },
+      ],
+    });
     const onStatus = vi.fn();
+    const onMerged = vi.fn();
     renderHook(() => useEditorAutosave({
       enabled: true,
       segments: [{ start: 0, end: 1, text: "local" }],
@@ -35,12 +44,16 @@ describe("useEditorAutosave", () => {
       save,
       reconcile,
       onStatus,
+      onMerged,
     }));
     await act(async () => { await vi.advanceTimersByTimeAsync(800); });
     await act(async () => { window.dispatchEvent(new Event("online")); await Promise.resolve(); });
     expect(reconcile).toHaveBeenCalledTimes(1);
-    expect(save).toHaveBeenCalledTimes(1);
-    expect(onStatus).toHaveBeenCalledWith("conflict", "conflict", expect.any(Object));
+    expect(save).toHaveBeenCalledTimes(2);
+    expect(onMerged).toHaveBeenCalledWith(expect.arrayContaining([
+      expect.objectContaining({ text: "remote" }),
+    ]), expect.objectContaining({ mergedSegments: expect.any(Array) }));
+    expect(onStatus).not.toHaveBeenCalledWith("conflict", "conflict", expect.any(Object));
   });
 
   it("flushes the exact approval snapshot instead of a stale render snapshot", async () => {
@@ -58,5 +71,30 @@ describe("useEditorAutosave", () => {
 
     await act(async () => { await result.current.flush("manual", approved); });
     expect(save).toHaveBeenCalledWith(approved, "manual");
+  });
+
+  it("applies a silent three-way merge to the visible editor before retrying", async () => {
+    const merged = [
+      { start: 0, end: 1, text: "local" },
+      { start: 1, end: 2, text: "remote-only" },
+    ];
+    const save = vi.fn()
+      .mockResolvedValueOnce({ ok: false, reason: "merged", mergedSegments: merged })
+      .mockResolvedValueOnce({ ok: true, revision: 4 });
+    const onMerged = vi.fn();
+    const { result } = renderHook(() => useEditorAutosave({
+      enabled: true,
+      segments: [{ start: 0, end: 1, text: "local" }],
+      dirty: false,
+      blocked: false,
+      save,
+      onStatus: vi.fn(),
+      onMerged,
+    }));
+
+    await act(async () => { await result.current.flush("manual"); });
+    expect(onMerged).toHaveBeenCalledWith(merged, expect.objectContaining({ reason: "merged" }));
+    expect(save).toHaveBeenCalledTimes(2);
+    expect(save.mock.calls[1][0]).toEqual(merged);
   });
 });

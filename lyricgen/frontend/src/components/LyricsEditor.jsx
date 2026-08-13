@@ -22,7 +22,6 @@ import { useEditorDocument } from "../hooks/useEditorDocument";
 import { useEditorAutosave } from "../hooks/useEditorAutosave";
 import { mergeThreeWay, segmentsEquivalent } from "../editorMerge";
 import { createSaveQueue } from "../lib/saveQueue";
-import ConflictDialog from "./ConflictDialog";
 import VersionHistory from "./VersionHistory";
 import WrapWarningDialog from "./WrapWarningDialog";
 
@@ -76,13 +75,6 @@ const _SAVE_ERROR_COPY = {
     confirm:
       "Tu última edición no se pudo respaldar en el servidor. Podés aprobar igual: el video se genera con lo que ves en pantalla. Solo el respaldo para reanudar la sesión queda desactualizado. ¿Continuar?",
   },
-  conflict: {
-    short: "Conflicto: cambios no guardados",
-    detail:
-      "Otra pestaña o dispositivo guardó una versión más nueva. Tu borrador sigue a salvo en este navegador.",
-    confirm:
-      "Hay una versión más nueva en el servidor. Resolvé el conflicto antes de aprobar para evitar sobrescribir cambios de otra sesión.",
-  },
 };
 
 // Deriva la categoría de copy desde el { reason, status } que retorna
@@ -94,7 +86,10 @@ function _saveErrorCategory(result) {
   if (reason === "network") return "network";
   if (status === 401 || status === 403) return "session";
   if (reason === "job-gone" || status === 404) return "job-gone";
-  if (reason === "stale-revision" || status === 409) return "conflict";
+  // Revision drift is handled by the save queue's automatic rebase. If it
+  // still cannot settle after bounded retries, show the generic retry copy;
+  // never surface a collaboration/conflict banner to the operator.
+  if (reason === "stale-revision" || reason === "client-upgrade-required" || status === 409) return "server";
   return "server"; // 400/409/5xx/otros → copy genérico honesto
 }
 
@@ -617,7 +612,7 @@ export default function LyricsEditor({
   // text-edit posterior haya fallado → al apretar Aprobar perdía
   // changes. Ahora ambos autosaves actualizan saveStatus, y "error"
   // se muestra como chip rojo con botón Reintentar.
-  const [saveStatus, setSaveStatus] = useState("idle"); // idle|local|saving|saved|offline|conflict|error
+  const [saveStatus, setSaveStatus] = useState("idle"); // idle|local|saving|saved|offline|error
   // Motivo del último fallo de respaldo, para que el banner + el confirm de
   // "Aprobar" digan la CAUSA REAL en vez de "problema de red" siempre (el
   // copy honesto de PR A quedó hardcodeado a "red"; la causa real puede ser
@@ -626,7 +621,6 @@ export default function LyricsEditor({
   const [saveErrorReason, setSaveErrorReason] = useState(null);
   const [flushCounter, setFlushCounter] = useState(0);
   const [durableHydrated, setDurableHydrated] = useState(false);
-  const [conflictDialogOpen, setConflictDialogOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const editedRef = useRef(edited);
   editedRef.current = edited;
@@ -744,24 +738,32 @@ export default function LyricsEditor({
     () => sanitizeSegmentsForPersistence(edited),
     [edited],
   );
+  const handleDurableMerge = useCallback((mergedSegments) => {
+    if (!Array.isArray(mergedSegments)) return;
+    setEdited(reseedPreservingIds(editedRef.current, mergedSegments));
+    setIsDirty(true);
+  }, []);
   const { flush: flushDurableSave } = useEditorAutosave({
     enabled: editorV2Enabled && durableHydrated && !durableEditor.loading,
     segments: durableSegments,
     dirty: isDirty,
-    blocked: Boolean(durableEditor.conflict),
+    // Revisions are reconciled and retried automatically. A stale write must
+    // never freeze the editor behind a collaboration modal.
+    blocked: false,
     save: durableEditor.save,
     reconcile: durableEditor.reconcile,
     onStatus: handleDurableStatus,
+    onMerged: handleDurableMerge,
   });
 
   // Never let an operator type against the legacy seed while the durable
-  // revision is still unknown.  Besides preventing a false base-revision=0
-  // conflict, this replaces the previously silent disabled approval CTA
+  // revision is still unknown. Besides preventing a false base-revision=0
+  // write, this replaces the previously silent disabled approval CTA
   // with an explicit loading/retry state.
   const editorInitializationBlocked = editorV2Enabled && !durableHydrated;
 
   // Hydrate only after comparing the local draft against the durable server
-  // revision. A stale/malformed draft is never silently submitted.
+  // revision. A stale draft is rebased before it is submitted.
   const durableHydratedJobRef = useRef(null);
   useEffect(() => {
     if (!editorV2Enabled || durableEditor.loading || !durableEditor.document) return;
@@ -788,7 +790,7 @@ export default function LyricsEditor({
               // operations may advance the document revision or refresh
               // renderer metadata without changing any operator-owned lyric
               // content. Comparing raw JSON here made that harmless case look
-              // like a collaboration conflict as soon as the editor reopened.
+              // like a stale draft as soon as the editor reopened.
               const sameContent = segmentsEquivalent(local, remote);
               if (sameContent) {
                 localStorage.removeItem(draftKey);
@@ -803,57 +805,47 @@ export default function LyricsEditor({
                   : null;
 
                 // Drafts created before base_segments was introduced still
-                // carry base_revision. Recover that immutable base from the
-                // durable version history instead of manufacturing an
-                // "another tab" conflict for a legacy local draft.
-                if (!baseSegments && Number.isInteger(draft.base_revision)) {
-                  if (draft.base_revision === 0) {
-                    baseSegments = remoteOriginal;
-                  } else if (editorRequest) {
-                    try {
-                      const summariesResponse = await editorRequest(
-                        `/editor/${transcribeJobId}/versions?limit=50`,
+                // carry base_revision (and the oldest drafts carry neither).
+                // Prefer the immutable checkpoint, but fall back to the
+                // original transcription if history is unavailable. The
+                // original is a safe three-way base: edits made only by this
+                // browser merge cleanly, while same-line changes still use
+                // the local snapshot when it is rebased and saved below.
+                if (!baseSegments && Number.isInteger(draft.base_revision)
+                  && draft.base_revision === 0) {
+                  baseSegments = remoteOriginal;
+                }
+                if (!baseSegments && Number.isInteger(draft.base_revision) && editorRequest) {
+                  try {
+                    const summariesResponse = await editorRequest(
+                      `/editor/${transcribeJobId}/versions?limit=50`,
+                    );
+                    const summaries = summariesResponse.ok
+                      ? (await summariesResponse.clone().json())?.versions || []
+                      : [];
+                    const baseVersion = summaries.find(
+                      (version) => version.revision === draft.base_revision,
+                    );
+                    if (baseVersion?.id) {
+                      const versionResponse = await editorRequest(
+                        `/editor/${transcribeJobId}/versions/${encodeURIComponent(baseVersion.id)}`,
                       );
-                      const summaries = summariesResponse.ok
-                        ? (await summariesResponse.clone().json())?.versions || []
-                        : [];
-                      const baseVersion = summaries.find(
-                        (version) => version.revision === draft.base_revision,
-                      );
-                      if (baseVersion?.id) {
-                        const versionResponse = await editorRequest(
-                          `/editor/${transcribeJobId}/versions/${encodeURIComponent(baseVersion.id)}`,
-                        );
-                        if (versionResponse.ok) {
-                          const version = await versionResponse.clone().json();
-                          if (Array.isArray(version?.segments)) {
-                            baseSegments = sanitizeSegments(version.segments);
-                          }
+                      if (versionResponse.ok) {
+                        const version = await versionResponse.clone().json();
+                        if (Array.isArray(version?.segments)) {
+                          baseSegments = sanitizeSegments(version.segments);
                         }
                       }
-                    } catch { /* fall back to the explicit safe resolver */ }
-                  }
+                    }
+                  } catch { /* use the original transcription fallback */ }
                 }
+                if (!baseSegments) baseSegments = remoteOriginal;
                 if (cancelled) return;
-                const merged = baseSegments
-                  ? mergeThreeWay(baseSegments, local, remote)
-                  : { merged: [], conflicts: [{ key: "unknown-base" }] };
-                if (merged.conflicts.length === 0) {
-                  next = merged.merged;
-                  markDirty = !segmentsEquivalent(next, remote);
-                  if (markDirty) setSaveStatus("local");
-                  else localStorage.removeItem(draftKey);
-                } else {
-                  next = local;
-                  markDirty = true;
-                  durableEditor.stageConflict(local, {
-                    baseSegments,
-                    reason: Number.isInteger(draft.base_revision) ? "stale-draft" : "unversioned-draft",
-                  });
-                  setSaveStatus("conflict");
-                  setSaveErrorReason("conflict");
-                  setConflictDialogOpen(true);
-                }
+                const merged = mergeThreeWay(baseSegments, local, remote);
+                next = merged.merged;
+                markDirty = !segmentsEquivalent(next, remote);
+                if (markDirty) setSaveStatus("local");
+                else localStorage.removeItem(draftKey);
               }
             }
           }
@@ -869,19 +861,8 @@ export default function LyricsEditor({
     };
     hydrate();
     return () => { cancelled = true; };
-  }, [draftKey, durableEditor.document, durableEditor.loading, durableEditor.stageConflict,
+  }, [draftKey, durableEditor.document, durableEditor.loading,
     editorRequest, editorV2Enabled, setEdited, transcribeJobId]);
-
-  useEffect(() => {
-    if (!durableEditor.conflict) return;
-    setSaveStatus("conflict");
-    setSaveErrorReason("conflict");
-    setConflictDialogOpen(true);
-    trackEditorEvent("editor_conflict", {
-      server_revision: durableEditor.conflict.serverRevision,
-      local_revision: durableEditor.revisionRef.current,
-    });
-  }, [durableEditor.conflict, durableEditor.revisionRef, trackEditorEvent]);
 
   // Debounced autosave to backend: every 3s after the last edit, persist
   // the current segments to /jobs/{id}/save-segments. This bumps the
@@ -2447,18 +2428,13 @@ export default function LyricsEditor({
       toast({ message: "Estamos cargando la última versión. Esperá un instante para aprobar.", tone: "info" });
       return;
     }
-    if (saveStatus === "conflict" || durableEditor.conflict) {
-      setConflictDialogOpen(true);
-      toast({ message: "Resolvé el conflicto antes de aprobar.", tone: "error" });
-      return;
-    }
     if (saveErrorReason === "draft-corrupt") {
       toast({ message: "Descartá o recuperá manualmente el borrador local antes de aprobar.", tone: "error" });
       return;
     }
     // Aviso (no bloqueo) si el último autosave falló. IMPORTANTE — contrato
     // real verificado (incidente UMG 21-jul-2026): aprobar manda los
-    // segments EN PANTALLA en el cuerpo del POST (onApprove(cleaned) acá;
+      // segments EN PANTALLA en el cuerpo del POST (onApprove(cleaned) acá;
     // App los envía en segments_json / edit body y el backend pisa
     // segments_json antes de renderizar). El autosave fallido solo afecta
     // el RESPALDO del servidor (reanudar tras refresh / reaper), no el
@@ -2488,38 +2464,45 @@ export default function LyricsEditor({
       const cleanedForPersistence = sanitizeSegmentsForPersistence(cleaned);
       const saveResult = await flushDurableSave("manual", cleanedForPersistence);
       if (saveResult?.ok === false) {
-        if (saveResult.reason === "conflict") setConflictDialogOpen(true);
-        else toast({ message: "No pudimos confirmar esta versión. Reintentá sin cerrar el editor.", tone: "error" });
+        toast({ message: "Tus cambios siguen en pantalla. Reintentamos el guardado automáticamente.", tone: "info" });
         return;
       }
-      const approvalResult = await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
-        baseRevision: saveResult.revision,
-        editorRevision: saveResult.revision,
-        editorVersionId: saveResult.versionId,
-      }));
+      let approvalResult = null;
+      let currentSave = saveResult;
+      let approvalSegments = cleaned.map(({ _id, ...rest }) => rest);
+      let persistenceSnapshot = cleanedForPersistence;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        approvalResult = await Promise.resolve(onApprove(approvalSegments, {
+          baseRevision: currentSave.revision,
+          editorRevision: currentSave.revision,
+          editorVersionId: currentSave.versionId,
+        }));
+        if (approvalResult?.ok !== false || approvalResult.reason !== "conflict") break;
+
+        // Approval can race a renderer metadata write after the last autosave.
+        // Refresh the durable document, rebase the current screen snapshot,
+        // and retry with the newly-created version. No modal is needed and
+        // every retry still goes through the backend revision check.
+        const reconciled = await durableEditor.reconcile(persistenceSnapshot);
+        if (!reconciled?.ok) break;
+        if (Array.isArray(reconciled.mergedSegments)) {
+          persistenceSnapshot = sanitizeSegmentsForPersistence(reconciled.mergedSegments);
+          approvalSegments = persistenceSnapshot.map(({ _id, ...rest }) => rest);
+          // Keep the screen aligned with the exact snapshot that will be
+          // approved. Remote-only edits survive the rebase; same-line edits
+          // keep the current editor's value by merge policy.
+          setEdited(reseedPreservingIds(editedRef.current, persistenceSnapshot));
+        }
+        currentSave = await flushDurableSave("manual", persistenceSnapshot);
+        if (currentSave?.ok === false) break;
+      }
       if (approvalResult?.ok === false) {
         setIsDirty(true);
-        if (approvalResult.reason === "conflict") {
-          const remote = approvalResult.conflict || {};
-          durableEditor.stageConflict(cleanedForPersistence, {
-            serverRevision: Number.isInteger(remote.server_revision)
-              ? remote.server_revision : durableEditor.revisionRef.current,
-            serverSegments: Array.isArray(remote.server_segments)
-              ? remote.server_segments : durableEditor.document?.segments || [],
-            updatedBy: remote.updated_by || null,
-            updatedAt: remote.updated_at || null,
-            reason: "approval-conflict",
-          });
-          setSaveStatus("conflict");
-          setSaveErrorReason("conflict");
-          setConflictDialogOpen(true);
-        } else {
-          toast({ message: "No pudimos aprobar esta versión. Tus cambios siguen guardados para reintentar.", tone: "error" });
-        }
+        toast({ message: "No pudimos confirmar todavía. Tus cambios siguen en pantalla y se reintentarán al guardar.", tone: "info" });
         return;
       }
       setIsDirty(false);
-      trackEditorEvent("editor_approved", { revision: saveResult.revision });
+      trackEditorEvent("editor_approved", { revision: currentSave.revision });
       return;
     }
     if (disableAutosave || !onPersistSegments || !transcribeJobId) {
@@ -2531,9 +2514,7 @@ export default function LyricsEditor({
     }
     let saveResult = await flushPendingSave();
     if (saveResult?.ok === false && saveResult.reason === "stale-revision") {
-      setSaveStatus("conflict");
-      setSaveErrorReason("conflict");
-      toast({ message: t("editor.approve_conflict") || "Hay una versión más nueva. Recargá para compararla antes de aprobar.", tone: "error" });
+      toast({ message: "Tus cambios siguen en pantalla. Reintentá aprobar en un instante.", tone: "info" });
       return;
     }
     setIsDirty(false);
@@ -2630,7 +2611,7 @@ export default function LyricsEditor({
     saving: "Guardando…",
     saved: "Guardado",
     offline: "Sin conexión",
-    conflict: "Conflicto detectado",
+    conflict: "Guardado",
     error: "No se pudo guardar",
   }[saveStatus] || "Cambios locales";
   const collaboratingUser = editorV2Enabled
@@ -2783,12 +2764,12 @@ export default function LyricsEditor({
       <div className="fixed bottom-0 left-0 right-0 z-50 border-t border-white/[0.08] bg-surface-1/95 px-4 py-3 shadow-[0_-16px_50px_rgba(0,0,0,.28)] backdrop-blur-xl">
         <div className="mx-auto flex w-full max-w-[1800px] items-center justify-between gap-4">
           <div className="hidden min-w-0 sm:block">
-            <p className={`text-[11px] font-medium ${saveStatus === "conflict" ? "text-amber-300" : saveStatus === "error" || saveStatus === "offline" ? "text-red-300" : "text-white"}`}>{saveStatusLabel}</p>
+            <p className={`text-[11px] font-medium ${saveStatus === "error" || saveStatus === "offline" ? "text-red-300" : "text-white"}`}>{saveStatusLabel}</p>
             <p className="mt-0.5 truncate text-[10px] text-ink-tertiary">{edited.length} líneas · {viewMode === "advanced" ? "timings revisados" : "texto revisado"}</p>
           </div>
           <button
             onClick={handleApprove}
-            disabled={isApproving || (editorV2Enabled && (!durableHydrated || durableEditor.loading)) || saveStatus === "conflict" || saveErrorReason === "draft-corrupt"}
+            disabled={isApproving || (editorV2Enabled && (!durableHydrated || durableEditor.loading)) || saveErrorReason === "draft-corrupt"}
             aria-busy={isApproving}
             aria-label={isApproving
               ? (t("editor.applying_changes") || "Aplicando cambios…")
@@ -2833,9 +2814,9 @@ export default function LyricsEditor({
           del audio bar lo hace imposible de perder.
           (Timeline view ya tiene el chip embedded en su header,
           LyricsTimeline.jsx:354+) */}
-      {["error", "offline", "conflict"].includes(saveStatus) && (
-        <div className={`mb-3 rounded-card px-4 py-3 flex items-center gap-3 animate-fade-in ring-1 ${saveStatus === "conflict" ? "bg-amber-500/10 ring-amber-500/30" : "bg-red-500/10 ring-red-500/30"}`}>
-          <svg className={`w-4 h-4 shrink-0 ${saveStatus === "conflict" ? "text-amber-300" : "text-red-400"}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+      {["error", "offline"].includes(saveStatus) && (
+        <div className="mb-3 rounded-card px-4 py-3 flex items-center gap-3 animate-fade-in ring-1 bg-red-500/10 ring-red-500/30">
+          <svg className="w-4 h-4 shrink-0 text-red-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zM12 15.75h.01" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
           <div className="flex-1 min-w-0">
@@ -2847,19 +2828,7 @@ export default function LyricsEditor({
             </p>
           </div>
           <div className="flex shrink-0 gap-2">
-            {saveErrorReason === "conflict" ? (
-              <button
-                type="button"
-                onClick={() => {
-                  if (editorV2Enabled) setConflictDialogOpen(true);
-                  else if (onReloadServer) onReloadServer({ draftKey, storeKey: _storeKey });
-                  else window.location.reload();
-                }}
-                className="text-[11px] text-white bg-brand hover:bg-brand-light rounded-lg px-3 py-1.5 transition-colors"
-              >
-                {editorV2Enabled ? "Resolver conflicto" : "Cargar versión del servidor"}
-              </button>
-            ) : saveErrorReason === "draft-corrupt" ? (
+            {saveErrorReason === "draft-corrupt" ? (
               <button
                 type="button"
                 onClick={() => {
@@ -4235,35 +4204,6 @@ export default function LyricsEditor({
           en ambas vistas. Este bloque (que sólo aparecía en list mode cuando
           una fila tenía foco) era redundante y a veces divergía visualmente. */}
 
-      <ConflictDialog
-        conflict={conflictDialogOpen ? durableEditor.conflict : null}
-        currentUserId={user?.id}
-        onCancel={() => setConflictDialogOpen(false)}
-        onUseServer={async () => {
-          const result = await durableEditor.resolve("use_server");
-          if (!result?.ok) return;
-          const next = sanitizeSegments(result.document.segments || []);
-          setEdited(reseedPreservingIds(editedRef.current, next));
-          setIsDirty(false);
-          setSaveStatus("saved");
-          setSaveErrorReason(null);
-          setConflictDialogOpen(false);
-          trackEditorEvent("editor_conflict", { server_revision: result.document.revision, resolution: "use_server" });
-          try { if (draftKey) localStorage.removeItem(draftKey); } catch { /* best effort */ }
-        }}
-        onSaveLocal={async () => {
-          const result = await durableEditor.resolve("save_local_as_new");
-          if (!result?.ok) return;
-          const next = sanitizeSegments(result.document.segments || editedRef.current);
-          setEdited(reseedPreservingIds(editedRef.current, next));
-          setIsDirty(false);
-          setSaveStatus("saved");
-          setSaveErrorReason(null);
-          setConflictDialogOpen(false);
-          trackEditorEvent("editor_conflict", { server_revision: result.document.revision, resolution: "save_local_as_new" });
-          try { if (draftKey) localStorage.removeItem(draftKey); } catch { /* best effort */ }
-        }}
-      />
       <WrapWarningDialog
         warning={wrapWarning}
         onReview={() => {

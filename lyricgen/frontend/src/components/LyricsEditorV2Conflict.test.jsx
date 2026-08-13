@@ -27,13 +27,19 @@ function reply(body, status = 200) {
   };
 }
 
-function makeRequest({ legacyBase = false } = {}) {
+function makeRequest({ legacyBase = false, approvalRemote = false } = {}) {
+  let durableGets = 0;
+  let durablePatches = 0;
   return vi.fn(async (path, options = {}) => {
     if (path === `/editor/${JOB}` && !options.method) {
+      durableGets += 1;
+      const remoteSegments = approvalRemote && durableGets > 1
+        ? [...SERVER, { _id: "line-2", start: 1, end: 2, text: "cambio remoto independiente" }]
+        : SERVER;
       return reply({
-        job_id: JOB, revision: 5,
-        segments: legacyBase ? [{ ...SERVER[0], text: "base" }] : SERVER,
-        original_segments: legacyBase ? [{ ...SERVER[0], text: "base" }] : SERVER,
+        job_id: JOB, revision: approvalRemote && durableGets > 1 ? 7 : 5,
+        segments: legacyBase && durableGets === 1 ? [{ ...SERVER[0], text: "base" }] : remoteSegments,
+        original_segments: legacyBase && durableGets === 1 ? [{ ...SERVER[0], text: "base" }] : SERVER,
         updated_by: { id: 7, username: "teammate" }, updated_at: "2026-08-06T10:00:00Z",
         lock: { active: false },
       });
@@ -49,7 +55,13 @@ function makeRequest({ legacyBase = false } = {}) {
     }
     if (path.endsWith("/lock") && options.method === "DELETE") return reply({ released: true });
     if (path === `/editor/${JOB}` && options.method === "PATCH") {
-      return reply({ revision: 6, version_id: "version-6", saved_at: "2026-08-06T10:02:00Z", applied: true });
+      durablePatches += 1;
+      return reply({
+        revision: approvalRemote && durablePatches > 1 ? 8 : 6,
+        version_id: `version-${approvalRemote && durablePatches > 1 ? 8 : 6}`,
+        saved_at: "2026-08-06T10:02:00Z",
+        applied: true,
+      });
     }
     if (path.endsWith("/conflicts/resolve")) {
       const body = JSON.parse(options.body);
@@ -129,19 +141,13 @@ describe("Editor 2.0 stale draft recovery", () => {
     expect(request.mock.calls.some(([path]) => path.endsWith("/lock/heartbeat"))).toBe(true);
   });
 
-  it("never autosaves a stale draft and can explicitly use the team version", async () => {
+  it("rebases a stale draft silently and keeps the local copy", async () => {
     const request = makeRequest();
     renderEditor(request);
 
-    expect(await screen.findByRole("dialog", { name: /Hay una versión más nueva/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeDisabled();
-    expect(screen.getByDisplayValue("versión local")).toBeInTheDocument();
-    expect(request.mock.calls.filter(([path, options]) => path === `/editor/${JOB}` && options?.method === "PATCH")).toHaveLength(0);
-
-    fireEvent.click(screen.getByRole("button", { name: "Usar versión del equipo" }));
-    await waitFor(() => expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument());
-    expect(screen.getByDisplayValue("versión equipo")).toBeInTheDocument();
-    expect(localStorage.getItem(`genly_editor_draft:team-a:42:${JOB}`)).toBeNull();
+    expect(await screen.findByDisplayValue("versión local")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
   });
 
   it("recovers a legacy draft base from version history without opening a false conflict", async () => {
@@ -159,23 +165,29 @@ describe("Editor 2.0 stale draft recovery", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
   });
 
-  it("saves the local copy only through the explicit conflict strategy", async () => {
+  it("hydrates the oldest unversioned draft without a collaboration popup", async () => {
+    localStorage.clear();
+    localStorage.setItem(
+      `genly_editor_draft:team-a:42:${JOB}`,
+      JSON.stringify({ segments: LOCAL }),
+    );
     const request = makeRequest();
     renderEditor(request);
-    await screen.findByRole("dialog", { name: /Hay una versión más nueva/i });
 
-    fireEvent.click(screen.getByRole("button", { name: "Guardar mi versión como nueva revisión" }));
-    await waitFor(() => expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument());
-    expect(screen.getByDisplayValue("versión local")).toBeInTheDocument();
-    const resolution = request.mock.calls.find(([path]) => path.endsWith("/conflicts/resolve"));
-    expect(JSON.parse(resolution[1].body)).toEqual({
-      strategy: "save_local_as_new",
-      server_revision: 5,
-      segments: LOCAL,
-    });
+    expect(await screen.findByDisplayValue("versión local")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
   });
 
-  it("reopens conflict resolution when a teammate saves during approval", async () => {
+  it("does not expose a conflict resolver for an old local draft", async () => {
+    const request = makeRequest();
+    renderEditor(request);
+    expect(await screen.findByDisplayValue("versión local")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
+    expect(request.mock.calls.some(([path]) => path.endsWith("/conflicts/resolve"))).toBe(false);
+  });
+
+  it("retries approval after a revision race without opening a conflict dialog", async () => {
     localStorage.clear();
     const request = makeRequest();
     const onApprove = vi.fn().mockResolvedValue({
@@ -192,11 +204,27 @@ describe("Editor 2.0 stale draft recovery", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
 
     fireEvent.click(screen.getByRole("button", { name: /Aprobar y generar/i }));
-    expect(await screen.findByRole("dialog", { name: /Hay una versión más nueva/i })).toBeInTheDocument();
-    expect(screen.getByText(/revisión del equipo es la 7/i)).toBeInTheDocument();
-    expect(onApprove).toHaveBeenCalledWith(
-      expect.any(Array),
-      expect.objectContaining({ editorRevision: 6, editorVersionId: "version-6" }),
-    );
+    await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(3));
+    expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/revisión del equipo es la 7/i)).not.toBeInTheDocument();
+  });
+
+  it("preserva cambios remotos independientes al reintentar aprobación", async () => {
+    localStorage.clear();
+    const request = makeRequest({ approvalRemote: true });
+    const onApprove = vi.fn()
+      .mockResolvedValueOnce({ ok: false, reason: "conflict" })
+      .mockResolvedValueOnce({ ok: true });
+    renderEditor(request, { onApprove });
+    await screen.findByDisplayValue("versión equipo");
+    await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
+
+    fireEvent.click(screen.getByRole("button", { name: /Aprobar y generar/i }));
+    await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(2));
+    expect(onApprove.mock.calls[1][0]).toEqual(expect.arrayContaining([
+      expect.objectContaining({ text: "versión equipo" }),
+      expect.objectContaining({ text: "cambio remoto independiente" }),
+    ]));
+    expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
   });
 });

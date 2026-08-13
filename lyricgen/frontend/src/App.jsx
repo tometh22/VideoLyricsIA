@@ -63,8 +63,10 @@ import { anchorLyricsForEntry } from "./lib/anchorPayload";
 import { track } from "./lib/telemetryTrack";
 import { fetchSse, SseUnauthorizedError } from "./lib/fetchSse";
 import { createSaveQueue } from "./lib/saveQueue";
+import { rebaseEditorSnapshot } from "./lib/rebaseEditorSnapshot";
 
 const API = import.meta.env.VITE_API_URL || "";
+
 
 // PR E follow-up (2026-07): identidad ESTABLE de una review para keyear el
 // segmentsStore. DECOUPLE del backend job id: el prop transcribeJobId del
@@ -3091,7 +3093,10 @@ export default function App() {
         if (!result || result.reason === "network") return "network";
         if (result.status === 401 || result.status === 403) return "session";
         if (result.reason === "job-gone" || result.status === 404) return "job-gone";
-        if (result.reason === "stale-revision" || result.status === 409) return "conflict";
+        // Revision drift is rebased and retried by saveQueue. If bounded
+        // retries are exhausted, keep the generic server-error copy instead
+        // of showing a collaboration/conflict banner.
+        if (result.reason === "stale-revision" || result.reason === "client-upgrade-required" || result.status === 409) return "server";
         return "server";
       } },
     );
@@ -3686,15 +3691,17 @@ export default function App() {
         if (jobList[i].bgCacheKey) {
           formData.append("bg_cache_key", jobList[i].bgCacheKey);
         }
-        formData.append("segments_json", JSON.stringify(jobList[i].segments));
-        if (Number.isInteger(jobList[i].segmentsRevision)) {
-          formData.append("base_revision", String(jobList[i].segmentsRevision));
-        }
+        let generationSegments = jobList[i].segments;
+        let generationBaseRevision = Number.isInteger(jobList[i].segmentsRevision)
+          ? jobList[i].segmentsRevision : 0;
+        let generationVersionId = jobList[i].editorVersionId || null;
+        formData.append("segments_json", JSON.stringify(generationSegments));
+        formData.append("base_revision", String(generationBaseRevision));
         if (Number.isInteger(jobList[i].editorRevision)) {
           formData.append("editor_revision", String(jobList[i].editorRevision));
         }
-        if (jobList[i].editorVersionId) {
-          formData.append("editor_version_id", jobList[i].editorVersionId);
+        if (generationVersionId) {
+          formData.append("editor_version_id", generationVersionId);
         }
         formData.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
@@ -3723,12 +3730,71 @@ export default function App() {
             alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
             continue;
           }
+
+          // A renderer/background write can race the final /generate request
+          // after the editor already flushed. Re-anchor the local snapshot to
+          // the latest durable document and retry it automatically. The PATCH
+          // remains guarded by the backend CAS, so this never turns into an
+          // unchecked overwrite and the operator never sees a collaboration
+          // modal for a normal single-user session.
+          const isEditorRevisionConflict = (response, payload) => (
+            response?.status === 409
+            && payload?.detail
+            && typeof payload.detail === "object"
+            && payload.detail.detail === "editor_revision_conflict"
+          );
+          if (isEditorRevisionConflict(res, data) && jobList[i].transcribeJobId) {
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+              const rebased = await rebaseEditorSnapshot({
+                authFetch,
+                api: API,
+                jobId: jobList[i].transcribeJobId,
+                localSegments: generationSegments,
+                baseRevision: generationBaseRevision,
+                editorVersionId: generationVersionId,
+              });
+              if (!rebased.ok) break;
+              generationSegments = rebased.segments;
+              formData.set("segments_json", JSON.stringify(generationSegments));
+
+              const saveResponse = await authFetch(
+                `${API}/editor/${jobList[i].transcribeJobId}`,
+                {
+                  method: "PATCH",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    base_revision: rebased.latest.revision,
+                    segments: generationSegments,
+                    checkpoint: "manual",
+                  }),
+                },
+              );
+              let saved = {};
+              try { saved = await saveResponse.json(); } catch { /* retry if stale */ }
+              if (!saveResponse.ok) {
+                if (saveResponse.status === 409) continue;
+                break;
+              }
+              if (Number.isInteger(saved.revision)) {
+                generationBaseRevision = saved.revision;
+                formData.set("base_revision", String(saved.revision));
+                formData.set("editor_revision", String(saved.revision));
+                generationVersionId = saved.version_id || null;
+                if (generationVersionId) formData.set("editor_version_id", generationVersionId);
+                else formData.delete("editor_version_id");
+              }
+              res = await authFetch(`${API}/generate`, { method: "POST", body: formData });
+              try { data = await res.json(); } catch { data = {}; }
+              if (!isEditorRevisionConflict(res, data)) break;
+            }
+          }
           if (!res.ok || data.detail) {
             // A 404 / `job_not_found` here means the transcribed job was reaped
             // (or wasn't the caller's) before we got to /generate. Prefer the
             // stable backend `code` over the raw HTTP status; keep 404 as a
             // fallback for older backends. Surface a clear session-expired
             // message instead of the raw "Job not found.".
+            const editorConflict = isEditorRevisionConflict(res, data);
             const reason = (data.code === "job_not_found" || res.status === 404)
               ? (t("generate.session_expired")
                  || "La sesión expiró antes de generar. Re-subí el audio para regenerar.")
@@ -3736,7 +3802,9 @@ export default function App() {
             setJobs((prev) => prev.map((j, idx) =>
               idx === i ? { ...j, status: "error", error: reason } : j
             ));
-            alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
+            if (!editorConflict) {
+              alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
+            }
             continue;
           }
           setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
