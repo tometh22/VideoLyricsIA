@@ -214,3 +214,194 @@ def enrich_segments_with_word_timings(segments, audio_path):
     except Exception as e:  # never break a render over karaoke timing
         logger.warning("[KARAOKE] word-timing enrichment failed (%s) — using synthesis", e)
         return segments
+
+
+# ---------------------------------------------------------------------------
+# Final line↔word consistency pass (audit 2026-08-13)
+# ---------------------------------------------------------------------------
+#
+# Several independent stages rewrite a segment's start/end and/or its words —
+# anchor_align.build_synced_scaffold, ctc_align, word_vote, phrase_segmenter,
+# gap_rescue, chorus_snap, lead_in — and NOTHING verifies, at the end, that a
+# line's display window still matches the words it is supposed to show.
+#
+# Measured across 60 days of production the median is healthy (0.25 s on
+# ctc_align, 0.45 s on synced_scaffold) but the tail is broken: p90 is 22.2 s
+# on synced_scaffold and the worst ctc_align line is off by 79.7 s. ~10 % of
+# all lines and 25 % of synced_scaffold lines end BEFORE their last word is
+# sung, i.e. the caption disappears mid-phrase. That is the operator report
+# that started this ("líneas que quedaron cortas respecto a lo que se
+# escucha", UMG Chile 2026-08-13) — it cost them 48 manual drags on one song.
+#
+# The scaffold is the worst offender by construction: it sets
+# `end = next_line.start - 50 ms`, which is unrelated to when singing stops.
+#
+# This pass is deliberately asymmetric, because the two failure directions are
+# not equally bad:
+#   * ending BEFORE the last word is always a defect (text vanishes mid-word);
+#   * hanging on AFTER the last word is often intentional (a readability hold,
+#     lead_in.polish), so only absurd overhangs are trimmed.
+# When the words themselves can't be trusted we leave the timing alone and
+# restore the `review` flag instead, so the operator sees the amber marker
+# rather than a silently wrong caption.
+
+_CONSISTENCY_UNDERRUN_S = 0.35   # caption dies before the word finishes
+_CONSISTENCY_OVERHANG_S = 2.0    # caption lingers absurdly past the last word
+
+# Guards for deciding WHICH words may define a line's span. The existing
+# helpers above (`_fa_span_trustworthy`, `_words_fit_window`) were written for
+# a different question — "may these forced-align words be attached INSIDE the
+# operator's window?" — and are the wrong tool here, verified by test:
+#   * `_words_fit_window` demands the words cover >=25% of the CURRENT box, so
+#     it rejects exactly the badly-boxed lines this pass exists to fix (the
+#     production p90 on synced_scaffold is 22 s of disagreement).
+#   * `_fa_span_trustworthy` gates on the MEAN score, so one garbage word does
+#     not trip it: the real "Calla, sólo te quiero," line carries a trailing
+#     `score: 0.001` token spanning to 38.24 s and still averages 0.64.
+# So we filter per-word instead, then require only that the surviving span
+# actually overlaps the current window (i.e. it is the same phrase, not one
+# from elsewhere in the song).
+_MIN_WORD_SCORE = 0.3        # below this a stamp is noise, not a word
+_MAX_WORD_DURATION_S = 5.0   # a longer single word is CTC bridging two vocal
+                             # events (see ctc_align.repair_bridge_words)
+
+
+def _consistency_enabled() -> bool:
+    return os.environ.get(
+        "TIMING_CONSISTENCY_ENABLED", "1",
+    ).strip().lower() in _TRUE
+
+
+def _usable_span(words):
+    """(first_start, last_end) over words solid enough to define a line's
+    window, or None. Drops low-confidence stamps and implausibly long ones so
+    a single bad token can't stretch a caption across the song."""
+    starts, ends = [], []
+    for w in words:
+        if not isinstance(w, dict):
+            continue
+        try:
+            s, e = float(w["start"]), float(w["end"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if e < s:
+            continue
+        score = w.get("score")
+        if isinstance(score, (int, float)) and float(score) < _MIN_WORD_SCORE:
+            continue
+        if e - s > _MAX_WORD_DURATION_S:
+            continue
+        starts.append(s)
+        ends.append(e)
+    if not starts:
+        return None
+    return min(starts), max(ends)
+
+
+def enforce_line_word_consistency(segments):
+    """Make every line's display window agree with its own word timings.
+
+    Pure and side-effect free: no audio, no I/O, no network. Returns a NEW
+    list when anything changed, otherwise the SAME object it was given (so
+    callers can cheaply test `result is not segments`, matching the contract
+    of `enrich_segments_with_word_timings` above).
+
+    Asymmetric on purpose — the failure directions are not equally bad:
+      * a window ending BEFORE its last word is always a defect (the caption
+        vanishes mid-phrase: the operator report that motivated this);
+      * a window hanging on AFTER the last word is frequently intentional
+        (readability hold, `lead_in.polish`), so only absurd overhangs
+        (> _CONSISTENCY_OVERHANG_S) are trimmed;
+      * a caption appearing EARLY is deliberate in a lyric video — the viewer
+        needs time to read the line before it is sung — so an early start is
+        never "corrected". Only a start that lands AFTER the singing already
+        began is fixed, because there the viewer misses the opening words.
+
+    When the words cannot be trusted to re-time the line, the timing is left
+    untouched and `review` is set instead, so the operator gets the amber
+    marker rather than a silently wrong caption. (`ctc_align.finalize_line`
+    clears `review` on every line it retimes, which is how a wrong window
+    loses its marker in the first place.)
+
+    Never raises: a failure here must not cost a render.
+    """
+    try:
+        if not _consistency_enabled() or not segments:
+            return segments
+
+        out = []
+        extended = trimmed = flagged = 0
+        for seg in segments:
+            if not isinstance(seg, dict) or not _has_valid_words(seg):
+                out.append(seg)
+                continue
+            try:
+                ls, le = float(seg.get("start")), float(seg.get("end"))
+            except (TypeError, ValueError):
+                out.append(seg)
+                continue
+            if le <= ls:
+                out.append(seg)
+                continue
+
+            span = _usable_span(seg["words"])
+            if span is None:
+                out.append(seg)
+                continue
+            first_word, last_word = span
+
+            underruns_end = le < last_word - _CONSISTENCY_UNDERRUN_S
+            # Caption comes up AFTER the words already started → viewer misses
+            # the opening of the line. An early start is intentional (see the
+            # docstring) and is never touched.
+            underruns_start = ls > first_word + _CONSISTENCY_UNDERRUN_S
+            overhangs_end = le > last_word + _CONSISTENCY_OVERHANG_S
+            if not (underruns_end or underruns_start or overhangs_end):
+                out.append(seg)
+                continue
+
+            # The window disagrees with the words. Are these even the same
+            # phrase? Any overlap at all is enough — demanding a fraction of
+            # the CURRENT box would reject the grossly-misboxed lines that are
+            # the whole point. Zero overlap means the words aligned somewhere
+            # else in the song and must not drag the caption there.
+            if min(le, last_word) - max(ls, first_word) <= 0:
+                if seg.get("review"):
+                    out.append(seg)
+                else:
+                    new_seg = dict(seg)
+                    new_seg["review"] = True
+                    out.append(new_seg)
+                    flagged += 1
+                continue
+
+            new_seg = dict(seg)
+            if underruns_end or overhangs_end:
+                new_seg["end"] = round(last_word, 3)
+                if underruns_end:
+                    extended += 1
+                else:
+                    trimmed += 1
+            if underruns_start:
+                new_seg["start"] = round(first_word, 3)
+            # Degenerate guard: never emit a non-positive window.
+            if float(new_seg["end"]) <= float(new_seg["start"]):
+                out.append(seg)
+                continue
+            new_seg["timing_snapped_to_words"] = True
+            out.append(new_seg)
+
+        if not (extended or trimmed or flagged):
+            return segments
+        logger.info(
+            "[TIMING-CONSISTENCY] %d/%d lines adjusted "
+            "(%d extended, %d trimmed, %d flagged for review)",
+            extended + trimmed + flagged, len(segments),
+            extended, trimmed, flagged,
+        )
+        return out
+    except Exception as e:  # never break a transcription over this
+        logger.warning(
+            "[TIMING-CONSISTENCY] pass failed (%s) — leaving segments as-is", e,
+        )
+        return segments
