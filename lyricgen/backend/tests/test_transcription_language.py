@@ -5,6 +5,7 @@ from pathlib import Path
 
 from transcription_language import (
     detect_text_language,
+    forced_language_for_tenant,
     normalize_language,
     resolve_transcription_language,
 )
@@ -111,3 +112,27 @@ def test_auto_language_is_resolved_before_primary_whisperx():
     ]
     assert resolution_lines and whisperx_lines
     assert min(resolution_lines) < min(whisperx_lines)
+
+
+def test_forced_language_pins_configured_tenant(monkeypatch):
+    """A single-language tenant (UMG Chile) pins Spanish, overriding auto-detect
+    and even an explicit choice, so WhisperX can't misdetect + poison the cache
+    (incident 2026-08-12, Sebastián/UMG Chile got English from a Spanish audio)."""
+    monkeypatch.setenv("TRANSCRIPTION_LANG_BY_TENANT", "universal_chile:es,acme:pt")
+    assert forced_language_for_tenant("universal_chile", "") == "es"
+    assert forced_language_for_tenant("universal_chile", "en") == "es"
+    assert forced_language_for_tenant("UNIVERSAL_CHILE", "") == "es"  # case-insensitive
+    assert forced_language_for_tenant("acme", "") == "pt"
+
+
+def test_forced_language_passes_through_unconfigured(monkeypatch):
+    monkeypatch.setenv("TRANSCRIPTION_LANG_BY_TENANT", "universal_chile:es")
+    assert forced_language_for_tenant("genly", "") == ""
+    assert forced_language_for_tenant("genly", "en") == "en"
+    assert forced_language_for_tenant("", "") == ""
+
+
+def test_forced_language_unset_env_is_noop(monkeypatch):
+    monkeypatch.delenv("TRANSCRIPTION_LANG_BY_TENANT", raising=False)
+    assert forced_language_for_tenant("universal_chile", "") == ""
+    assert forced_language_for_tenant("universal_chile", "en") == "en"
