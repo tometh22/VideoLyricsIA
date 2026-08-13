@@ -149,3 +149,121 @@ def test_audio_duration_returns_float_for_valid_wav(tmp_path):
     result = pipeline._audio_duration(str(wav))
     assert result is not None
     assert abs(result - 1.0) < 0.05, f"expected ~1.0 s, got {result}"
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the 2026-08-12 audit follow-up (jobs 878d99b8da76 /
+# 51fac94587cd / 072f9646c349 — Sentry PYTHON-FASTAPI-3F):
+#
+#   F1: the header-only fast path (wave.getnframes / mutagen) was only
+#       bounded against an ABSOLUTE ceiling (<=3600s), never cross-checked
+#       against a real demux. A WAV whose `data` chunk size lies "plausibly"
+#       (e.g. reports 300s for 10s of real audio) sailed through the ceiling
+#       and still broke _verify_deliverables downstream — same bug, smaller
+#       window. Fixed by cross-checking the header value against
+#       _ffprobe_duration() with the same 2s tolerance _verify_deliverables
+#       itself uses.
+#
+#   F5: the /edit re-render path had `try: audio_dur = _audio_duration(...)
+#       except Exception: audio_dur = _ffprobe_duration(...)` — dead code,
+#       since _audio_duration never raises. On the one path that actually
+#       failed, _verify_deliverables received audio_dur=None and silently
+#       skipped the whole duration check (no Sentry event, no log). Fixed
+#       by mirroring run_pipeline's explicit `if audio_dur is None:` check.
+# ---------------------------------------------------------------------------
+
+def _make_wav_with_declared_duration(path, real_seconds, declared_seconds,
+                                      sample_rate=44100, channels=2, bits=16):
+    """Build a real, playable WAV of `real_seconds` audio whose `data` chunk
+    header LIES about its size so a header-only reader computes
+    `declared_seconds` instead. Reproduces the corrupted/placeholder-length
+    WAV header pattern found in production (sentinel 0xFFFFFFFE == "unknown
+    length, patch me later" — some streaming/live-capture exporters never
+    rewrite it)."""
+    block_align = channels * bits // 8
+    byte_rate = sample_rate * block_align
+    real_data = b"\x00\x00" * channels * int(sample_rate * real_seconds)
+    declared_data_size = int(sample_rate * declared_seconds) * block_align
+
+    header = b"RIFF" + struct.pack("<I", 36 + len(real_data)) + b"WAVE"
+    header += b"fmt " + struct.pack(
+        "<IHHIIHH", 16, 1, channels, sample_rate, byte_rate, block_align, bits,
+    )
+    header += b"data" + struct.pack("<I", declared_data_size)  # <-- the lie
+    path.write_bytes(header + real_data)
+
+
+def test_audio_duration_crosscheck_catches_plausible_header_lie(tmp_path):
+    """F1: a header that lies within the sane-ceiling window must not be
+    trusted — the real (ffprobe-demuxed) duration must win."""
+    pipeline = __import__("pytest").importorskip("pipeline",
+        reason="pipeline deps (librosa, numpy, moviepy) not installed")
+
+    wav = tmp_path / "plausible_lie.wav"
+    _make_wav_with_declared_duration(wav, real_seconds=10, declared_seconds=300)
+
+    result = pipeline._audio_duration(str(wav))
+    assert result is not None
+    assert abs(result - 10.0) < 0.5, (
+        f"header lied 300s for 10s of real audio and the lie won: got {result!r}. "
+        "This is the exact deterministic, retry-proof failure mode from the "
+        "878d99b8da76/51fac94587cd/072f9646c349 incident, just under the "
+        "3600s ceiling instead of over it."
+    )
+
+
+def test_audio_duration_crosscheck_catches_original_sentinel_bug(tmp_path):
+    """F1 regression: the original production incident — WAV `data` chunk
+    size corrupted to the 0xFFFFFFFE 'unknown length' sentinel, which
+    wave.getnframes() took at face value as ~24347.9s for a 2s file."""
+    pipeline = __import__("pytest").importorskip("pipeline",
+        reason="pipeline deps (librosa, numpy, moviepy) not installed")
+    import wave as _wave_mod
+
+    sample_rate, channels, bits = 44100, 2, 16
+    real_data = b"\x00\x00" * channels * (sample_rate * 2)  # 2s real audio
+    block_align = channels * bits // 8
+    byte_rate = sample_rate * block_align
+    header = b"RIFF" + struct.pack("<I", 36 + len(real_data)) + b"WAVE"
+    header += b"fmt " + struct.pack(
+        "<IHHIIHH", 16, 1, channels, sample_rate, byte_rate, block_align, bits,
+    )
+    header += b"data" + struct.pack("<I", 0xFFFFFFFE)  # production sentinel
+    wav = tmp_path / "corrupt_sentinel.wav"
+    wav.write_bytes(header + real_data)
+
+    # Confirm the raw stdlib bug still reproduces (i.e. this test would have
+    # caught the original incident) before checking our fix catches it.
+    with _wave_mod.open(str(wav), "rb") as wf:
+        raw_dur = wf.getnframes() / wf.getframerate()
+    assert raw_dur > 20000, (
+        "wave.getnframes() no longer reproduces the sentinel bug — test "
+        "fixture may be stale, re-derive against a fresh production sample"
+    )
+
+    result = pipeline._audio_duration(str(wav))
+    assert result is not None
+    assert abs(result - 2.0) < 0.5, f"expected ~2.0s (real audio), got {result!r}"
+
+
+def test_edit_path_verify_call_uses_explicit_none_check_not_dead_except():
+    """F5 source-level guard: every `_audio_duration(mp3_path)` call
+    immediately verified by `_verify_deliverables` must fall back to
+    `_ffprobe_duration` via an explicit `is None` check, not a `try/except
+    Exception` — `_audio_duration` never raises (it catches internally and
+    returns None), so `except Exception` around it is always dead code, and
+    the None it silently lets through disables `_verify_deliverables`'s
+    entire duration check (`if expected_dur is not None:`) with no error
+    anywhere. Reads raw source so it works without the full dep tree."""
+    with open(_PIPELINE_SRC, encoding="utf-8") as f:
+        src = f.read()
+    dead_pattern = (
+        "try:\n            audio_dur = _audio_duration(mp3_path)\n"
+        "        except Exception:\n            audio_dur = _ffprobe_duration(mp3_path)"
+    )
+    assert dead_pattern not in src, (
+        "dead try/except re-introduced around _audio_duration(mp3_path) — "
+        "_audio_duration never raises, so this silently lets None reach "
+        "_verify_deliverables and disables the duration check with no error "
+        "(the exact bug fixed in the /edit re-render path, audit 2026-08-12)"
+    )
