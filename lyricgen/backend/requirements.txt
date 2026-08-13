@@ -1,33 +1,63 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 python-multipart==0.0.20
-python-dotenv>=1.0.0
-python-jose[cryptography]>=3.3.0
-passlib[bcrypt]>=1.7.4
+python-dotenv>=1.0.0,<2.0.0
+python-jose[cryptography]>=3.3.0,<4.0.0
+# Explicit cryptography pin para Fernet (Drive OAuth token encryption).
+# python-jose[cryptography] ya lo jala como dep transitiva, pero lo
+# declaramos también para que dependabot lo trackee.
+cryptography>=42.0.0,<46.0.0
+passlib[bcrypt]>=1.7.4,<2.0.0
 bcrypt<4.1
 openai-whisper
-openai>=1.50.0
+openai>=1.50.0,<2.0.0
+# Forced alignment (Rotor-grade timing): aligns known lyrics to the user's
+# audio via a hosted model. See forced_align.py. Behind FORCED_ALIGNER_ENABLED.
+replicate>=1.0.0,<2.0.0
 moviepy==1.0.3
 librosa==0.10.2
 Pillow==11.1.0
 numpy<2
-google-genai>=1.40.0
-google-api-python-client>=2.0.0
-google-auth>=2.0.0
-requests>=2.28.0
-diffusers>=0.27.0
-transformers>=4.38.0
-accelerate>=0.27.0
-safetensors>=0.4.0
+google-genai>=1.40.0,<2.0.0
+google-api-python-client>=2.0.0,<3.0.0
+google-auth>=2.0.0,<3.0.0
+requests>=2.28.0,<3.0.0
+# transformers: lo usa ctc_align.py (AutoModelForCTC + Wav2Vec2CTCTokenizer)
+# para el alineador de timing. safetensors entra como dependencia suya y se
+# pinea acá sólo para fijar la versión.
+#
+# Sacados en ago-2026 tras verificar 0 imports en todo el repo:
+#   - diffusers: nunca se usó. Quedó de una prueba de generación de imágenes
+#     local que no llegó a producción; Imagen/Veo corren en Vertex.
+#   - accelerate: sólo hace falta para `device_map` / `low_cpu_mem_usage`, y
+#     ctc_align carga el modelo con `from_pretrained()` plano (ctc_align.py:701).
+# Entre las dos son ~200 MB de imagen que se construían y deployaban en cada
+# push sin que ningún camino de código las tocara.
+transformers>=4.38.0,<5.0.0
+safetensors>=0.4.0,<1.0.0
 # --- SaaS infrastructure ---
-sqlalchemy>=2.0.0
-psycopg2-binary>=2.9.0
-alembic>=1.13.0
-stripe>=8.0.0
+sqlalchemy>=2.0.0,<3.0.0
+psycopg2-binary>=2.9.0,<3.0.0
+alembic>=1.13.0,<2.0.0
+stripe>=8.0.0,<9.0.0
 # --- Queue, observability, storage ---
 redis==5.0.8
 rq==1.16.2
+# Test-only: tests/test_queue_retry.py uses fakeredis to assert RQ
+# retry/failure-callback wiring without a real Redis instance.
+fakeredis==2.26.2
 boto3==1.35.0
 sentry-sdk[fastapi]==2.14.0
 slowapi==0.1.9
-psutil>=5.9.0
+psutil>=5.9.0,<7.0.0
+# --- Genly CTC timing engine (ctc_align.py, gated CTC_ALIGN_ENABLED) ---
+# CPU-only torch: the +cpu builds live on the pytorch index (linux); macOS
+# wheels on PyPI are already CPU. EXACT torchaudio pin: 2.9 removes
+# torchaudio.functional.forced_align (deprecation #3902) — bumping this
+# requires vendoring the Viterbi first. Adds ~800 MB to the image; the
+# model itself (~1.2 GB) downloads to the HF cache on first use.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.8.0+cpu; sys_platform == "linux"
+torchaudio==2.8.0+cpu; sys_platform == "linux"
+torch==2.8.0; sys_platform == "darwin"
+torchaudio==2.8.0; sys_platform == "darwin"

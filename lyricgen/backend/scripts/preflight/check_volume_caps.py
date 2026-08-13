@@ -69,7 +69,6 @@ class VolumeCapsCheck(Check):
         daily = _scrape_int(src, "DEFAULT_DAILY_CAP")
         concurrent = _scrape_int(src, "DEFAULT_MAX_CONCURRENT_JOBS")
         upload_calls = _enforce_callsite_count(src, "_enforce_daily_volume_cap")
-        concurrent_calls = _enforce_callsite_count(src, "_enforce_concurrent_jobs_cap")
         veo_cost = _veo_cost_per_call()
 
         problems: list[str] = []
@@ -93,19 +92,23 @@ class VolumeCapsCheck(Check):
                 f"{MAX_SANE_CONCURRENT_CAP}"
             )
 
-        # L3 — both enforcers must still be invoked from at least 2 sites
-        # (currently /upload and /generate). 0 invocations means "the cap was
-        # silently removed during a refactor" — exactly the bug class this
-        # check exists to catch.
+        # L3 — daily volume cap must still be invoked from at least 2
+        # sites (currently /upload and /generate). 0 invocations means
+        # "the cap was silently removed during a refactor" — exactly the
+        # bug class this check exists to catch.
+        #
+        # Concurrent-jobs cap is no longer enforced via an in-handler
+        # callsite check: _enforce_concurrent_jobs_cap is intentionally
+        # deprecated (a no-op kept around so any forgotten callsite is
+        # harmless), and concurrency is now bounded naturally by the RQ
+        # worker pool — every submission is accepted as "queued" and the
+        # worker flips it to "processing" when it picks the job off the
+        # queue. The previous callsite assertion fired against this new
+        # design and produced a permanent false positive on daily_smoke.
         if upload_calls < 2:
             problems.append(
                 f"_enforce_daily_volume_cap is invoked from only {upload_calls} "
                 "callsite(s) — expected at least 2 (/upload + /generate)"
-            )
-        if concurrent_calls < 2:
-            problems.append(
-                f"_enforce_concurrent_jobs_cap is invoked from only "
-                f"{concurrent_calls} callsite(s) — expected at least 2"
             )
 
         # L4 — worst-case daily Veo bill bounded?
@@ -127,7 +130,6 @@ class VolumeCapsCheck(Check):
             "veo_cost_per_call_usd": veo_cost,
             "worst_case_daily_usd": round((daily or 0) * veo_cost, 2),
             "enforce_daily_callsites": upload_calls,
-            "enforce_concurrent_callsites": concurrent_calls,
             "per_user_overrides": per_user,
         }
         if warnings:

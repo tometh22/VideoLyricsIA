@@ -1,8 +1,27 @@
 import { useState } from "react";
 import { useI18n } from "../i18n";
 import BrandLockup from "./BrandLockup";
+import { fetchWithTimeout } from "../fetchWithTimeout";
 
 const API = import.meta.env.VITE_API_URL || "";
+
+// Retries on timeout (backend cold start / slow mobile network).
+// Fails immediately on any server response (4xx/5xx) to avoid
+// locking accounts with repeated bad-credential attempts.
+// onRetry(attempt) lets the UI show progress while retrying.
+async function fetchWithRetry(url, opts, { timeout = 30000, maxAttempts = 3, onRetry } = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (attempt > 1) onRetry?.(attempt);
+    try {
+      return await fetchWithTimeout(url, opts, timeout);
+    } catch (err) {
+      lastErr = err;
+      if (err.name !== "TimeoutError") throw err;
+    }
+  }
+  throw lastErr;
+}
 
 export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete }) {
   const { t, lang, setLang } = useI18n();
@@ -13,19 +32,22 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
   const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [retryMsg, setRetryMsg] = useState("");
   const [message, setMessage] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
 
   const handleLogin = async (e) => {
     e.preventDefault();
     if (!username.trim() || !password.trim()) return;
     setLoading(true);
     setError("");
+    setRetryMsg("");
     try {
-      const res = await fetch(`${API}/auth/login`, {
+      const res = await fetchWithRetry(`${API}/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim(), password }),
-      });
+      }, { onRetry: (n) => setRetryMsg(`Servidor arrancando, reintentando (${n}/3)...`) });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.detail || t("login.error"));
@@ -33,9 +55,12 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
       const data = await res.json();
       onLogin(data.token, data.user);
     } catch (err) {
-      setError(err.message);
+      setError(err.name === "TimeoutError"
+        ? "El servidor no responde. Verificá tu conexión e intentá de nuevo."
+        : err.message);
     } finally {
       setLoading(false);
+      setRetryMsg("");
     }
   };
 
@@ -53,7 +78,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(`${API}/auth/register`, {
+      const res = await fetchWithRetry(`${API}/auth/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim(), password, email: email.trim() }),
@@ -65,7 +90,9 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
       const data = await res.json();
       onLogin(data.token, data.user);
     } catch (err) {
-      setError(err.message);
+      setError(err.name === "TimeoutError"
+        ? "El servidor no responde. Verificá tu conexión e intentá de nuevo."
+        : err.message);
     } finally {
       setLoading(false);
     }
@@ -85,11 +112,11 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(`${API}/auth/reset-password`, {
+      const res = await fetchWithTimeout(`${API}/auth/reset-password`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: resetToken, password }),
-      });
+      }, 15000);
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.detail || t("login.reset_invalid"));
@@ -111,23 +138,31 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(`${API}/auth/forgot-password`, {
+      const res = await fetchWithTimeout(`${API}/auth/forgot-password`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: email.trim() }),
-      });
+      }, 15000);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 429) throw new Error(t("login.forgot_rate_limited"));
+        if (res.status >= 500) throw new Error(t("login.forgot_server_error"));
+        throw new Error(data.detail || t("login.forgot_request_error"));
+      }
       await res.json().catch(() => ({}));
       setMessage(t("login.reset_sent"));
       setMode("reset_sent");
-    } catch {
-      setError(t("login.error"));
+    } catch (err) {
+      setError(err?.name === "TimeoutError"
+        ? t("login.forgot_network_error")
+        : err?.message || t("login.forgot_network_error"));
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="min-h-screen bg-surface flex items-center justify-center relative overflow-hidden">
+    <div className="auth-layout min-h-screen bg-surface relative overflow-hidden">
       <div className="fixed inset-0 pointer-events-none">
         <div className="absolute top-[-20%] left-[10%] w-[700px] h-[700px] bg-brand/[0.05] rounded-full blur-[150px]" />
         <div className="absolute bottom-[-10%] right-[5%] w-[500px] h-[500px] bg-brand-light/[0.04] rounded-full blur-[120px]" />
@@ -158,16 +193,27 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
         </div>
       </div>
 
-      <div className="relative z-10 w-full max-w-sm mx-4 animate-fade-in">
+      <section className="auth-brand-panel">
+        <div className="auth-brand-content">
+          <BrandLockup size="lg" priority />
+          <p>{t("login.platform")}</p>
+          <div className="auth-video-preview" aria-hidden="true">
+            <video autoPlay muted loop playsInline src="/samples/ex1.mp4" />
+          </div>
+        </div>
+      </section>
+
+      <section className="auth-form-panel">
+      <div className="relative z-10 w-full max-w-[440px] animate-fade-in">
         {/* Logo — full lockup per brand kit §10 (auth screens use the
             full lockup, not the mark only). */}
-        <div className="text-center mb-7">
+        <div className="auth-mobile-logo text-center mb-7">
           <BrandLockup size="lg" className="mx-auto mb-3" />
           <p className="text-xs text-ink-secondary">{t("login.platform")}</p>
         </div>
 
         {/* Card */}
-        <div className="glass rounded-2xl p-6">
+        <div className="auth-card">
           {/* Login */}
           {mode === "login" && (
             <>
@@ -182,9 +228,12 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
                 </div>
                 <div>
                   <label className="block text-xs text-gray-400 mb-1.5 ml-1">{t("login.password")}</label>
-                  <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
-                    className="input-field" placeholder={t("login.password_placeholder")}
-                    autoComplete="current-password" />
+                  <div className="relative">
+                    <input type={showPassword ? "text" : "password"} value={password} onChange={(e) => setPassword(e.target.value)}
+                      className="input-field pr-16" placeholder={t("login.password_placeholder")}
+                      autoComplete="current-password" />
+                    <button type="button" onClick={() => setShowPassword((value) => !value)} className="absolute inset-y-0 right-3 text-[11px] font-bold text-gray-500 hover:text-white" aria-label={showPassword ? "Ocultar contraseña" : "Mostrar contraseña"}>{showPassword ? "Ocultar" : "Ver"}</button>
+                  </div>
                 </div>
                 {error && (
                   <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3">
@@ -374,6 +423,7 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
 
         <p className="text-center text-[11px] text-gray-600 mt-8">{t("login.footer")}</p>
       </div>
+      </section>
     </div>
   );
 }

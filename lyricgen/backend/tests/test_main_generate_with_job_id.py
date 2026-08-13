@@ -140,6 +140,28 @@ def test_generate_reuses_persisted_audio_when_job_id_provided(
     assert captured["job_id"] == job_id
     assert captured["mp3_path"].endswith("song.wav")
     assert captured["segments_override"] == [{"start": 0, "end": 1, "text": "test"}]
+    assert captured["song_title"] == "No Tengo Ganas"
+
+    # Approval persists the exact submitted snapshot as an immutable editor
+    # version even for legacy clients that omit base_revision.
+    from database import EditorVersion
+    version_db = SessionLocal()
+    try:
+        approved = version_db.query(EditorVersion).filter(
+            EditorVersion.job_id == job_id,
+            EditorVersion.is_approved.is_(True),
+        ).one()
+        assert approved.reason == "approve"
+        assert approved.segments == [{"start": 0, "end": 1, "text": "test"}]
+    finally:
+        version_db.close()
+
+    # The status payload feeds the render/detail UI. It must expose the
+    # structured title as well as the upload filename so the UI never has to
+    # infer the song name from a potentially unrelated raw filename.
+    status_res = client.get(f"/status/{job_id}", headers=auth(token))
+    assert status_res.status_code == 200, status_res.text
+    assert status_res.json()["song_title"] == "No Tengo Ganas"
 
 
 def test_generate_with_job_id_rejects_other_users_jobs(client, monkeypatch):
@@ -175,6 +197,8 @@ def test_generate_with_job_id_rejects_other_users_jobs(client, monkeypatch):
         headers=auth(token_b),
     )
     assert res.status_code == 404
+    # Stable machine-readable code the frontend keys off (audit 2026-07-27).
+    assert res.json()["code"] == "job_not_found"
 
 
 def test_generate_with_job_id_rejects_already_promoted_jobs(client, monkeypatch):
@@ -219,6 +243,7 @@ def test_generate_with_job_id_rejects_already_promoted_jobs(client, monkeypatch)
         headers=auth(token),
     )
     assert res.status_code == 409
+    assert res.json()["code"] == "job_not_generatable"
 
 
 def test_generate_legacy_path_still_accepts_full_upload(client, monkeypatch):
