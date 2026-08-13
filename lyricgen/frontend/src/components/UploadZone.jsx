@@ -2200,11 +2200,11 @@ export default function UploadZone({
                           : "border-white/[0.07] bg-white/[0.02] hover:-translate-y-0.5 hover:border-white/[0.18] hover:bg-white/[0.045]"
                       }`}
                     >
-                      <div className="relative aspect-video overflow-hidden bg-black">
+                      <div className="relative aspect-video overflow-hidden rounded-xl bg-black transform-gpu">
                         {m.sample ? (
                           m.kind === "image"
-                            ? <img src={m.sample} alt="" className="h-full w-full object-cover pointer-events-none transition-transform duration-500 group-hover:scale-[1.04]" />
-                            : <video src={m.sample} className="h-full w-full object-cover pointer-events-none transition-transform duration-500 group-hover:scale-[1.04]" autoPlay loop muted playsInline />
+                            ? <img src={m.sample} alt="" className="h-full w-full object-cover pointer-events-none transform-gpu transition-transform duration-500 group-hover:scale-[1.04]" />
+                            : <video src={m.sample} className="h-full w-full object-cover pointer-events-none transform-gpu transition-transform duration-500 group-hover:scale-[1.04]" autoPlay loop muted playsInline />
                         ) : (
                           <div className="grid h-full w-full place-items-center text-gray-300" style={{ background: "radial-gradient(120% 100% at 50% 0,#38235d,#0b0820)" }}>
                             <span className="h-7 w-7">{movIcon(m.code)}</span>
@@ -2464,18 +2464,19 @@ export default function UploadZone({
                           : "border-white/[0.07] bg-white/[0.025] hover:-translate-y-0.5 hover:border-white/[0.18] hover:bg-white/[0.05]"
                       }`}
                     >
-                      <div className="relative aspect-video overflow-hidden bg-black">
+                      <div className="relative aspect-video overflow-hidden rounded-xl bg-black transform-gpu">
                         {e.sample ? (
                           <>
                             <img
                               src={e.sample.replace(/\.mp4$/, ".jpg")}
                               alt=""
-                              className="h-full w-full object-cover pointer-events-none transition-transform duration-500 group-hover:scale-[1.045]"
+                              className="h-full w-full object-cover pointer-events-none transform-gpu transition-transform duration-500 group-hover:scale-[1.045]"
                             />
                             {(active || hoverEffect === e.code) && (
                               <video
                                 src={e.sample}
-                                className="absolute inset-0 h-full w-full object-cover pointer-events-none"
+                                poster={e.sample.replace(/\.mp4$/, ".jpg")}
+                                className="absolute inset-0 h-full w-full object-cover pointer-events-none transform-gpu"
                                 autoPlay
                                 preload="auto"
                                 loop muted playsInline
