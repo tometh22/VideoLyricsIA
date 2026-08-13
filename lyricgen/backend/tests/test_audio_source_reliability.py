@@ -94,3 +94,36 @@ def test_source_audio_404_is_diagnosable_in_prod():
     src = inspect.getsource(main.get_source_audio_url)
     assert "[SOURCE-AUDIO] 404" in src
     assert "input_r2_key=%r" in src
+
+
+def test_lrclib_intro_trim_verifies_against_real_audio_before_cutting():
+    """Audit 2026-08-13 (F3): the lrclib intro-trim decision (skip the first
+    N seconds of the user's audio before Whisper, because it's "materially
+    longer" than lrclib's studio cut) used to be pure metadata arithmetic —
+    subtract two durations, no confirmation the audio actually has an intro
+    at that point. A wrong trim silently cuts real sung lyrics out of what
+    Whisper ever transcribes (e.g. a longer outro/extended mix misread as an
+    intro). Confirm the trim now spends one Whisper call to verify the
+    audio at the claimed boundary actually matches lrclib's opening line
+    before committing to the slice, and skips the trim (rather than cutting
+    blind) when that can't be confirmed."""
+    import main
+    src = inspect.getsource(main._run_transcription_for_job)
+    # The verification call must exist, gating the slice.
+    assert "_verify_lrclib_alignment" in src, (
+        "_verify_lrclib_alignment was already imported (main.py:5980-5990) "
+        "but never called — the intro-trim decision must use it"
+    )
+    verify_idx = src.index("_verify_lrclib_alignment")
+    slice_idx = src.index("_slice_audio_window, tmp_path, candidate")
+    assert verify_idx < slice_idx, (
+        "alignment must be verified BEFORE the slice is taken, not after"
+    )
+    # Failing to confirm alignment (None or low score) must skip the trim,
+    # not proceed with it — fail closed, not fail open.
+    assert "intro-trim rejected" in src
+    reject_idx = src.index("intro-trim rejected")
+    assert verify_idx < reject_idx < slice_idx, (
+        "the low-score rejection path must come between verification and "
+        "the slice, so a bad trim is skipped rather than executed"
+    )

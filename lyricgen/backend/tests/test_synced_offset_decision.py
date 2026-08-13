@@ -57,3 +57,83 @@ def test_duration_match_wins_even_without_anchor():
     # the synced timeline as-is.
     offset, trust = synced_offset_decision(269.5, 269.0, None, 2.04)
     assert (offset, trust) == (0.0, True)
+
+
+# ---------------------------------------------------------------------------
+# verify_fn — audit 2026-08-13 (F4): two agreeing durations are both external
+# metadata (user upload, lrclib scrape) and never proved the synced timeline
+# actually matches what's sung. These tests cover the new content-verification
+# gate that regime 1 goes through before trust=True ships.
+# ---------------------------------------------------------------------------
+
+def test_duration_match_with_high_verify_score_still_trusts():
+    # Durations agree AND the audio content at offset 0 really does match
+    # lrclib's opening line — trust as before.
+    offset, trust = synced_offset_decision(
+        268.1, 269.0, 38.2, 2.04, verify_fn=lambda: 0.9,
+    )
+    assert (offset, trust) == (0.0, True)
+
+
+def test_duration_match_with_low_verify_score_falls_through_to_anchor():
+    # Durations coincidentally agree but the audio at offset 0 does NOT match
+    # lrclib's text — e.g. a different edit/version with the same runtime.
+    # Do not ship a trusted-but-wrong zero offset; fall through to the
+    # whisperX anchor estimate (untrusted, review flag stays on).
+    offset, trust = synced_offset_decision(
+        268.1, 269.0, 10.0, 2.0, verify_fn=lambda: 0.05,
+    )
+    assert offset == 8.0
+    assert trust is False
+
+
+def test_duration_match_with_low_verify_score_and_no_anchor_returns_untrusted():
+    # Same as above but whisperX gave no anchor either — no basis at all,
+    # caller should fall through to whisperX raw.
+    offset, trust = synced_offset_decision(
+        268.1, 269.0, None, 2.0, verify_fn=lambda: 0.05,
+    )
+    assert offset == 0.0
+    assert trust is False
+
+
+def test_duration_match_with_none_verify_score_treated_as_unverifiable():
+    # verify_fn returning None (e.g. Whisper/slice failed) is "couldn't check",
+    # not "checked and it's fine" — must not be treated as a pass.
+    offset, trust = synced_offset_decision(
+        268.1, 269.0, 10.0, 2.0, verify_fn=lambda: None,
+    )
+    assert offset == 8.0
+    assert trust is False
+
+
+def test_verify_score_exactly_at_threshold_trusts():
+    offset, trust = synced_offset_decision(
+        268.1, 269.0, 38.2, 2.04, verify_fn=lambda: 0.4, verify_min_score=0.4,
+    )
+    assert (offset, trust) == (0.0, True)
+
+
+def test_verify_fn_not_called_when_durations_disagree():
+    # The whole point of gating on duration-agreement first is to only pay
+    # for the (Whisper-backed) verify call when it's actually relevant.
+    calls = []
+
+    def _tracking_verify():
+        calls.append(1)
+        return 0.9
+
+    offset, trust = synced_offset_decision(
+        208.0, 200.0, 10.0, 2.0, verify_fn=_tracking_verify,
+    )
+    assert offset == 8.0
+    assert trust is False
+    assert calls == [], "verify_fn must not run when durations already disagree"
+
+
+def test_verify_fn_none_preserves_old_trust_everyone_behaviour():
+    # Backward compatibility: existing callers that never pass verify_fn
+    # (or any caller before this audit) keep the original semantics —
+    # duration agreement alone is enough.
+    offset, trust = synced_offset_decision(268.1, 269.0, 38.2, 2.04)
+    assert (offset, trust) == (0.0, True)
