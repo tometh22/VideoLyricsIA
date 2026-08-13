@@ -59,7 +59,7 @@ test.describe("Editor 2.0 real collaboration", () => {
   test.describe.configure({ retries: 0 });
   test.skip(!ENABLED, "requires the real API/PostgreSQL CI job");
 
-  test("preserves both users through conflict, reload and history", async ({ browser, request }) => {
+  test("merges both users silently, reloads and preserves history", async ({ browser, request }) => {
     const tokenA = await login(request, "editor_e2e_a");
     const tokenB = await login(request, "editor_e2e_b");
     const a = await openEditor(browser, tokenA);
@@ -75,9 +75,10 @@ test.describe("Editor 2.0 real collaboration", () => {
     latestRevision = (await revision(request, tokenB)).revision;
 
     await firstLyricsInput(a.page).fill("A queda local");
-    await expect(a.page.getByRole("dialog", { name: /Hay una versión más nueva/ })).toBeVisible();
-    await a.page.getByRole("button", { name: "Usar versión del equipo" }).click();
-    await expect(firstLyricsInput(a.page)).toHaveValue("Edición de B");
+    await expect.poll(async () => (await revision(request, tokenA)).revision).toBeGreaterThan(latestRevision);
+    latestRevision = (await revision(request, tokenA)).revision;
+    await expect(firstLyricsInput(a.page)).toHaveValue("A queda local");
+    await expect(a.page.getByRole("dialog", { name: /Hay una versión más nueva/ })).toHaveCount(0);
 
     await a.context.setOffline(true);
     await firstLyricsInput(a.page).fill("A segunda versión local");
@@ -85,11 +86,10 @@ test.describe("Editor 2.0 real collaboration", () => {
     await expect.poll(async () => (await revision(request, tokenB)).revision).toBeGreaterThan(latestRevision);
     latestRevision = (await revision(request, tokenB)).revision;
     await a.context.setOffline(false);
-    await expect(a.page.getByRole("dialog", { name: /Hay una versión más nueva/ })).toBeVisible();
-    await a.page.getByRole("button", { name: "Guardar mi versión como nueva revisión" }).click();
     await expect.poll(async () => (await revision(request, tokenA)).revision).toBeGreaterThan(latestRevision);
     latestRevision = (await revision(request, tokenA)).revision;
     await expect(firstLyricsInput(a.page)).toHaveValue("A segunda versión local");
+    await expect(a.page.getByRole("dialog", { name: /Hay una versión más nueva/ })).toHaveCount(0);
 
     await a.page.reload();
     await expect(a.page.getByRole("button", { name: /4 Lyrics/ })).toBeVisible();
