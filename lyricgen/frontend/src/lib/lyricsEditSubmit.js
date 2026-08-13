@@ -8,6 +8,8 @@
 // module only builds the payload, posts, retries, and returns a result
 // shape the caller can branch on.
 
+import { editorRevisionConflictDetail } from "./editorRevisionConflict";
+
 const API = import.meta.env.VITE_API_URL || "";
 
 function authHeaders() {
@@ -72,7 +74,7 @@ export function translateBackendError(raw, t) {
   // 409 revision conflict: the backend returns {detail:"editor_revision_conflict",
   // server_revision, server_segments}. Without this map the raw object leaked into
   // React and crashed /generating (Sentry #33); map it to a clear retry message.
-  if (raw && typeof raw === "object" && raw.detail === "editor_revision_conflict") {
+  if (editorRevisionConflictDetail(raw) || raw === "editor_revision_conflict") {
     return tr("edit.error_revision_conflict") ||
       "La letra cambió en el servidor mientras editabas. Recargá el editor para traer la última versión y volvé a aplicar tus cambios.";
   }
