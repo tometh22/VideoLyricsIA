@@ -45,17 +45,17 @@ export default function ConflictDialog({ conflict, currentUserId, onUseServer, o
     try { await action?.(); } finally { setBusy(false); }
   };
   return (
-    <div className="fixed inset-0 z-[90] grid place-items-center bg-black/70 p-4 backdrop-blur-sm" role="presentation">
-      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="editor-conflict-title" tabIndex={-1} className="w-full max-w-lg rounded-2xl bg-surface-1 p-6 shadow-2xl ring-1 ring-white/15 outline-none">
+    <div className="my-4 w-full" role="presentation">
+      <div ref={dialogRef} role="dialog" aria-labelledby="editor-conflict-title" tabIndex={-1} className="w-full rounded-2xl bg-amber-500/[0.08] p-5 ring-1 ring-amber-400/30 outline-none">
         <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-300">Conflicto detectado</p>
         <h2 id="editor-conflict-title" className="mt-2 text-xl font-semibold text-white">Hay una versión más nueva</h2>
-        <p className="mt-2 text-sm leading-relaxed text-ink-secondary">
+        <p className="mt-2 text-sm leading-relaxed text-amber-100/75">
           {changeDescription}
           La revisión del equipo es la {conflict.serverRevision}. Nada se sobrescribirá automáticamente.
         </p>
-        <div className="mt-5 grid gap-2 sm:grid-cols-2">
-          <button type="button" disabled={busy} onClick={() => run(onUseServer)} className="rounded-xl bg-white/[0.06] px-4 py-3 text-sm font-medium text-white ring-1 ring-white/10 hover:bg-white/10 disabled:opacity-50">Usar versión del equipo</button>
-          <button type="button" disabled={busy} onClick={() => run(onSaveLocal)} className="rounded-xl bg-brand px-4 py-3 text-sm font-semibold text-white hover:bg-brand-light disabled:opacity-50">Guardar mi versión como nueva revisión</button>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button type="button" disabled={busy} onClick={() => run(onUseServer)} className="rounded-lg bg-white/[0.08] px-3 py-2 text-xs font-medium text-white ring-1 ring-white/10 hover:bg-white/[0.14] disabled:opacity-50">Usar versión del equipo</button>
+          <button type="button" disabled={busy} onClick={() => run(onSaveLocal)} className="rounded-lg bg-brand px-3 py-2 text-xs font-semibold text-white hover:bg-brand-light disabled:opacity-50">Guardar mi versión como nueva revisión</button>
         </div>
         <button type="button" disabled={busy} onClick={onCancel} className="mt-3 w-full rounded-lg px-3 py-2 text-xs text-ink-tertiary hover:text-white disabled:opacity-50">Cancelar (seguís viendo tu versión, sin guardar hasta que elijas una opción)</button>
       </div>

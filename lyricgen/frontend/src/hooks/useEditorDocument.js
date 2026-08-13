@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { mergeThreeWay } from "../editorMerge";
 
 async function responseBody(response) {
   try { return await response.clone().json(); } catch { return {}; }
@@ -112,6 +113,27 @@ export function useEditorDocument({ jobId, enabled, request }) {
       const body = await responseBody(response);
       if (response.status === 409) {
         const next = conflictFrom(body, segments, revisionRef.current);
+        const base = document?.segments || [];
+        const merged = mergeThreeWay(base, segments, next.serverSegments);
+        if (merged.conflicts.length === 0 && next.serverRevision !== revisionRef.current) {
+          // Rebase disjoint edits on top of the server snapshot. The caller
+          // retries this merged payload with the new revision; no write ever
+          // bypasses the backend's optimistic-concurrency check.
+          applyDocument({
+            ...(document || {}),
+            ...body,
+            revision: next.serverRevision,
+            segments: next.serverSegments,
+          });
+          return {
+            ok: false,
+            reason: "merged",
+            mergedSegments: merged.merged,
+            serverRevision: next.serverRevision,
+          };
+        }
+        next.baseSegments = base;
+        next.conflicts = merged.conflicts;
         if (mountedRef.current) setConflict(next);
         return { ok: false, reason: "conflict", conflict: next };
       }
@@ -129,7 +151,7 @@ export function useEditorDocument({ jobId, enabled, request }) {
     } catch (err) {
       return { ok: false, reason: navigator.onLine === false ? "offline" : "network", error: String(err) };
     }
-  }, [enabled, jobId, request]);
+  }, [applyDocument, document, enabled, jobId, request]);
 
   // Draft, checkpoint and structural saves share one optimistic revision.
   // Serialize them so a slow request cannot make this tab conflict with its
@@ -153,12 +175,19 @@ export function useEditorDocument({ jobId, enabled, request }) {
       const remoteChanged = Number.isInteger(body.revision) && body.revision !== revisionRef.current;
       const sameContent = JSON.stringify(body.segments || []) === JSON.stringify(localSegments || []);
       if (remoteChanged && !sameContent) {
+        const merged = mergeThreeWay(document?.segments || [], localSegments, body.segments || []);
+        if (merged.conflicts.length === 0) {
+          applyDocument(body);
+          return { ok: true, document: body, sameContent: false, mergedSegments: merged.merged };
+        }
         const next = conflictFrom({
           server_revision: body.revision,
           server_segments: body.segments,
           updated_by: body.updated_by,
           updated_at: body.updated_at,
         }, localSegments, revisionRef.current);
+        next.baseSegments = document?.segments || [];
+        next.conflicts = merged.conflicts;
         if (mountedRef.current) setConflict(next);
         return { ok: false, reason: "conflict", conflict: next };
       }
@@ -167,7 +196,7 @@ export function useEditorDocument({ jobId, enabled, request }) {
     } catch (err) {
       return { ok: false, reason: navigator.onLine === false ? "offline" : "network", error: String(err) };
     }
-  }, [applyDocument, enabled, jobId, request]);
+  }, [applyDocument, document, enabled, jobId, request]);
 
   const stageConflict = useCallback((localSegments, metadata = {}) => {
     setConflict({

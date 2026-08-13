@@ -17,13 +17,14 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
 
   const runSave = useCallback(async (checkpoint = "draft", isRetry = false, overrideSegments = null) => {
     if (!enabled || blocked) return { ok: false, reason: blocked ? "conflict" : "disabled" };
-    const snapshot = overrideSegments || segmentsRef.current;
+    let snapshot = overrideSegments || segmentsRef.current;
     if (isRetry && reconcile) {
       const state = await reconcile(snapshot);
       if (!state?.ok) {
         if (state?.reason === "conflict") onStatus?.("conflict", "conflict", { checkpoint, result: state });
         return state;
       }
+      if (Array.isArray(state?.mergedSegments)) snapshot = state.mergedSegments;
     }
     onStatus?.("saving", null);
     const started = performance.now();
@@ -36,6 +37,12 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
     if (result?.reason === "conflict") {
       onStatus?.("conflict", "conflict", { checkpoint, result });
       return result;
+    }
+    if (result?.reason === "merged" && Array.isArray(result.mergedSegments)) {
+      // The first request was rejected because the base was stale, but the
+      // three-way merge proved the edits were independent. Retry the rebased
+      // document through the same serialized save queue.
+      return runSave(checkpoint, false, result.mergedSegments);
     }
     const reason = result?.reason || "network";
     onStatus?.(reason === "offline" ? "offline" : "error", reason, { checkpoint, result });
