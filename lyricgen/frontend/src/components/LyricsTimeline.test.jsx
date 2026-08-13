@@ -105,6 +105,28 @@ describe("LyricsTimeline", () => {
     expect(newEnd).toBeGreaterThan(11);
   });
 
+  it("moves a packed middle line by rippling the following line", () => {
+    const props = setup({
+      segments: [
+        { _id: "a", start: 0, end: 1, text: "primera" },
+        { _id: "b", start: 1.05, end: 2, text: "segunda" },
+        { _id: "c", start: 2.05, end: 3, text: "tercera" },
+      ],
+      duration: 10,
+    });
+    const block = screen.getAllByTestId("timeline-segment")[1];
+    const body = block.querySelector('[data-testid="timeline-segment-body"]');
+    fireEvent.pointerDown(body, { clientX: 100, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(body, { clientX: 124, pointerId: 1 });
+    fireEvent.pointerUp(body, { clientX: 124, pointerId: 1 });
+
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+    expect(props.onTimingChangeBatch).toHaveBeenCalledWith([
+      { id: "b", start: 1.55, end: 2.5 },
+      { id: "c", start: 2.55, end: 3.5 },
+    ], expect.objectContaining({ operation: "move" }));
+  });
+
   it("Cmd/Ctrl-click toggles lines and dragging the group commits one batch", () => {
     const props = setup();
     const [first, second] = screen.getAllByTestId("timeline-segment");
@@ -200,8 +222,8 @@ describe("LyricsTimeline", () => {
     expect(parseFloat(endEdge.style.right)).toBeLessThan(-22);
 
     fireEvent.pointerDown(body, { clientX: 100, pointerId: 1, button: 0 });
-    fireEvent.pointerMove(body, { clientX: 124, pointerId: 1 });
-    fireEvent.pointerUp(body, { clientX: 124, pointerId: 1 });
+    fireEvent.pointerMove(body, { clientX: 119, pointerId: 1 });
+    fireEvent.pointerUp(body, { clientX: 119, pointerId: 1 });
     expect(props.onTimingChange).toHaveBeenCalledWith("short", expect.any(Number), expect.any(Number));
   });
 

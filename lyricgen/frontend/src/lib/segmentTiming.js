@@ -82,6 +82,90 @@ export function clampSelectionShiftDelta(
   return Math.max(lower, Math.min(delta, upper));
 }
 
+/**
+ * Move one lyric line while rippling only the packed neighbours in the
+ * movement direction. This keeps every duration intact and avoids the
+ * "frozen" drag produced by clamping a line between two 50ms gaps.
+ */
+export function shiftTimingWithAdjacent(
+  allSegments, id, requestedDelta, duration, gap = 0.05,
+) {
+  const clean = (value) => Math.round(value * 1e9) / 1e9;
+  const index = allSegments.findIndex((segment) => segment?._id === id);
+  const requested = Number(requestedDelta);
+  const safeGap = Math.max(0, Number(gap) || 0);
+  if (index < 0 || !Number.isFinite(requested) || Math.abs(requested) < 1e-9) {
+    return { changes: [], delta: 0, coupled: false, blocked: false };
+  }
+
+  const snapshots = allSegments.map((segment) => ({
+    id: segment?._id,
+    start: Number(segment?.start),
+    end: Number(segment?.end),
+  }));
+  if (snapshots.some((segment) => !Number.isFinite(segment.start) || !Number.isFinite(segment.end))) {
+    return { changes: [], delta: 0, coupled: false, blocked: true };
+  }
+
+  const ripple = (delta) => {
+    const shifted = snapshots.map((segment) => ({ ...segment }));
+    shifted[index].start += delta;
+    shifted[index].end += delta;
+
+    if (delta > 0) {
+      for (let next = index + 1; next < shifted.length; next += 1) {
+        const minStart = shifted[next - 1].end + safeGap;
+        if (shifted[next].start >= minStart - 1e-9) break;
+        const neighbourDelta = minStart - shifted[next].start;
+        shifted[next].start += neighbourDelta;
+        shifted[next].end += neighbourDelta;
+      }
+    } else {
+      for (let previous = index - 1; previous >= 0; previous -= 1) {
+        const maxEnd = shifted[previous + 1].start - safeGap;
+        if (shifted[previous].end <= maxEnd + 1e-9) break;
+        const neighbourDelta = maxEnd - shifted[previous].end;
+        shifted[previous].start += neighbourDelta;
+        shifted[previous].end += neighbourDelta;
+      }
+    }
+    return shifted;
+  };
+
+  let safeDelta = requested;
+  let shifted = ripple(safeDelta);
+  if (safeDelta > 0 && Number(duration) > 0) {
+    const overflow = Math.max(0, ...shifted.map((segment) => segment.end - Number(duration)));
+    if (overflow > 0) {
+      safeDelta = Math.max(0, safeDelta - overflow);
+      shifted = ripple(safeDelta);
+    }
+  } else if (safeDelta < 0) {
+    const underflow = Math.max(0, ...shifted.map((segment) => -segment.start));
+    if (underflow > 0) {
+      safeDelta = Math.min(0, safeDelta + underflow);
+      shifted = ripple(safeDelta);
+    }
+  }
+
+  const changes = shifted
+    .filter((segment, segmentIndex) => (
+      Math.abs(segment.start - snapshots[segmentIndex].start) > 1e-6
+      || Math.abs(segment.end - snapshots[segmentIndex].end) > 1e-6
+    ))
+    .map((segment) => ({
+      ...segment,
+      start: clean(segment.start),
+      end: clean(segment.end),
+    }));
+  return {
+    changes,
+    delta: clean(safeDelta),
+    coupled: changes.length > 1,
+    blocked: Math.abs(requested) > 1e-6 && Math.abs(safeDelta) < 1e-6,
+  };
+}
+
 export function clampResizeTiming(
   allSegments, id, requestedStart, requestedEnd, duration, gap = 0.05, minDuration = 0.3,
   edge = null,
