@@ -4255,7 +4255,11 @@ async def transcribe_uploaded(
         _result = _maybe_chorus_snap(_result, job_id)
         _result = _maybe_phrase_segment(_result, job_id)
         from lyrics_format import format_lyrics_pass as _fmt
-        return await _fmt(_result, language=_post_lang)
+        _result = await _fmt(_result, language=_post_lang)
+        # Último post-pase: la ventana de cada cartel debe coincidir con sus
+        # propias palabras (audit 2026-08-13). Lockstep con el worker y con
+        # /transcribe — si se agrega acá y no allá, los caminos divergen.
+        return _maybe_timing_consistency(_result, job_id)
     finally:
         _release_transcription_slot(transcription_lease)
 
@@ -4972,7 +4976,9 @@ async def transcribe_endpoint(
     _result = _maybe_chorus_snap(_result, job_id)
     _result = _maybe_phrase_segment(_result, job_id)
     from lyrics_format import format_lyrics_pass as _fmt
-    return await _fmt(_result, language=_post_lang)
+    _result = await _fmt(_result, language=_post_lang)
+    # Lockstep con el worker y con /transcribe-uploaded — ver el comentario ahí.
+    return _maybe_timing_consistency(_result, job_id)
 
 
 from ctc_cascade_veto import _ctc_cascade_veto  # noqa: E402
@@ -5233,6 +5239,53 @@ def _maybe_chorus_snap(result, job_id: str):
         return result
     except Exception as e:
         logger.warning("[CHORUS-SNAP] wrapper declinó: %r (job=%s)", e, job_id)
+        return result
+
+
+def _maybe_timing_consistency(result, job_id: str):
+    """Post-pass FINAL (TIMING_CONSISTENCY_ENABLED, default ON): la ventana de
+    cada cartel tiene que coincidir con las palabras que ese cartel muestra.
+
+    Corre ÚLTIMO a propósito. Las etapas anteriores (scaffold, ctc_align,
+    word_vote, phrase_segmenter, gap_rescue, chorus_snap, lead_in) reescriben
+    start/end y/o words de forma independiente y ninguna verifica el
+    invariante al cierre. Medido sobre 60 días de producción: la mediana está
+    sana (0,25 s en ctc_align) pero la cola está rota — p90 de 22,2 s en
+    synced_scaffold, peor caso de 79,7 s en ctc_align, y ~10% de las líneas
+    (25% en scaffold) terminan ANTES de que se termine de cantar la última
+    palabra, o sea el cartel desaparece a mitad de frase.
+
+    Ese es el reporte del operador que originó esto (UMG Chile, 2026-08-13:
+    "líneas que quedaron cortas respecto a lo que se escucha") — le costó 48
+    arrastres manuales en una sola canción.
+
+    La corrección vive en karaoke_align (donde ya están las primitivas de
+    confianza de forced-align) y es pura. Acá solo va el wrapper con la forma
+    de result-dict, igual que los demás post-pases. Never raises."""
+    if not isinstance(result, dict):
+        return result
+    try:
+        import karaoke_align as _ka
+        segs = result.get("segments") or []
+        if not segs:
+            return result
+        nuevo = _ka.enforce_line_word_consistency(segs)
+        if nuevo is not segs:
+            _ajustadas = sum(
+                1 for s in nuevo
+                if isinstance(s, dict) and s.get("timing_snapped_to_words")
+            )
+            result = dict(result)
+            result["segments"] = nuevo
+            result.setdefault("postpass_stats", {})["timing_consistency"] = {
+                "snapped": _ajustadas,
+            }
+            logger.info(
+                "[TIMING-CONSISTENCY] %d/%d carteles re-encuadrados a sus "
+                "palabras job=%s", _ajustadas, len(nuevo), job_id)
+        return result
+    except Exception as e:
+        logger.warning("[TIMING-CONSISTENCY] wrapper declinó: %r (job=%s)", e, job_id)
         return result
 
 
