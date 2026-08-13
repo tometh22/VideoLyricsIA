@@ -2047,9 +2047,10 @@ export default function UploadZone({
                   data-tour="motion-back"
                   onClick={closeMotionComposer}
                   aria-label={t("common.back") || "Volver"}
-                  className="grid h-8 w-8 shrink-0 place-items-center rounded-full border border-white/[0.08] bg-white/[0.025] text-gray-400 transition-all hover:border-white/[0.16] hover:bg-white/[0.06] hover:text-white"
+                  className="inline-flex h-8 shrink-0 items-center gap-1 rounded-full border border-brand/40 bg-brand/[0.12] pl-2 pr-3 text-[11px] font-semibold text-brand-light transition-all hover:border-brand/60 hover:bg-brand/20 hover:text-white"
                 >
-                  <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="m15 18-6-6 6-6" /></svg>
+                  <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="m15 18-6-6 6-6" /></svg>
+                  {t("common.back") || "Volver"}
                 </button>
                 <div className="min-w-0 flex-1">
                   <p className="text-[8px] font-semibold uppercase tracking-[0.15em] text-brand-light/75">
@@ -2396,19 +2397,10 @@ export default function UploadZone({
             </div>
 
             <div className={`shrink-0 items-center gap-2 ${motionComposerView === null ? "hidden" : "flex"}`}>
-              <span className="hidden rounded-full border border-white/[0.08] bg-white/[0.035] px-2 py-1 text-[9px] font-medium text-gray-400 sm:block">
-                {t("common.change") || "Cambiar"}
+              <span className="inline-flex items-center gap-1 rounded-full border border-brand/40 bg-brand/[0.12] py-1 pl-2 pr-3 text-[11px] font-semibold text-brand-light">
+                <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24" aria-hidden="true"><path strokeLinecap="round" strokeLinejoin="round" d="m15 18-6-6 6-6" /></svg>
+                {t("common.back") || "Volver"}
               </span>
-              <svg
-                className={`h-4 w-4 text-gray-500 transition-transform duration-200 ${motionComposerView === "effect" ? "rotate-180" : ""}`}
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.8"
-                viewBox="0 0 24 24"
-                aria-hidden="true"
-              >
-                <path strokeLinecap="round" strokeLinejoin="round" d="m7 10 5 5 5-5" />
-              </svg>
             </div>
           </button>
 
