@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   clampBlockShiftDelta,
   clampResizeTiming,
+  clampResizeTimingWithAdjacent,
   clampSelectionShiftDelta,
   shiftBlockWithinDuration,
 } from "./segmentTiming";
@@ -100,6 +101,63 @@ describe("collision-safe timeline edits", () => {
       end: 3.95,
       blocked: false,
     });
+  });
+
+  it("keeps the start anchored when the end handle crosses minimum duration", () => {
+    expect(clampResizeTiming(lines, "b", 2, 1.5, 10, 0.05, 0.3, "end")).toEqual({
+      start: 2,
+      end: 2.3,
+      blocked: false,
+    });
+  });
+
+  it("keeps the end anchored when the start handle crosses minimum duration", () => {
+    expect(clampResizeTiming(lines, "b", 3.8, 3, 10, 0.05, 0.3, "start")).toEqual({
+      start: 2.7,
+      end: 3,
+      blocked: false,
+    });
+  });
+
+  it("allows an end handle without a finite song ceiling", () => {
+    const openEnded = [{ _id: "only", start: 2, end: 3 }];
+    expect(clampResizeTiming(openEnded, "only", 2, 8, 0, 0.05, 0.3, "end")).toEqual({
+      start: 2,
+      end: 8,
+      blocked: false,
+    });
+  });
+
+  it("moves a packed next boundary when extending an end handle", () => {
+    const packed = [
+      { _id: "a", start: 0, end: 2 },
+      { _id: "b", start: 2.05, end: 3.5 },
+    ];
+    expect(clampResizeTimingWithAdjacent(packed, "a", 0, 2.5, 10, 0.05, 0.3, "end"))
+      .toEqual({
+        changes: [
+          { id: "a", start: 0, end: 2.5 },
+          { id: "b", start: 2.55, end: 3.5 },
+        ],
+        blocked: false,
+        coupled: true,
+      });
+  });
+
+  it("moves a packed previous boundary when extending a start handle", () => {
+    const packed = [
+      { _id: "a", start: 0, end: 1 },
+      { _id: "b", start: 1.05, end: 2.5 },
+    ];
+    expect(clampResizeTimingWithAdjacent(packed, "b", 0.7, 2.5, 10, 0.05, 0.3, "start"))
+      .toEqual({
+        changes: [
+          { id: "a", start: 0, end: 0.7 - 0.05 },
+          { id: "b", start: 0.7, end: 2.5 },
+        ],
+        blocked: false,
+        coupled: true,
+      });
   });
 
   it("refuses an impossible resize without mutating the snapshot", () => {
