@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useI18n } from "../i18n";
+import { fetchWithTimeout } from "../fetchWithTimeout";
 import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
@@ -164,7 +165,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const { t } = useI18n();
   const [activeTab, setActiveTab] = useState("video");
   const [uploading, setUploading] = useState(false);
-  const [youtubeResult, setYoutubeResult] = useState(job.youtube || null);
+  // Only a real published result counts — youtube_data can also hold an
+  // in-progress claim marker ({status: "uploading"}) with no video yet.
+  const [youtubeResult, setYoutubeResult] = useState(job.youtube?.video_id ? job.youtube : null);
   const [metadataPreview, setMetadataPreview] = useState(null);
   const [showYoutubePanel, setShowYoutubePanel] = useState(false);
   const [reviewNotes, setReviewNotes] = useState("");
@@ -302,8 +305,18 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const previewMetadata = async () => {
     setShowYoutubePanel(true);
     try {
-      const res = await fetch(`${API}/youtube/metadata/${job.job_id}`, { method: "POST", headers: authHeaders() });
+      // Gemini round-trip: cap the wait so a hung backend surfaces as an
+      // error with a retry button instead of an eternal spinner.
+      const res = await fetchWithTimeout(
+        `${API}/youtube/metadata/${job.job_id}`,
+        { method: "POST", headers: authHeaders() },
+        60_000,
+      );
       const data = await res.json();
+      if (!res.ok) {
+        setMetadataPreview({ error: data.detail || `Error ${res.status}` });
+        return;
+      }
       setMetadataPreview(data);
     } catch (err) {
       setMetadataPreview({ error: err.message });
@@ -313,9 +326,20 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const uploadToYoutube = async (privacy = "unlisted") => {
     setUploading(true);
     try {
-      const res = await fetch(`${API}/youtube/upload/${job.job_id}?privacy=${privacy}`, { method: "POST", headers: authHeaders() });
+      // Send the previewed metadata so what the user approved is exactly
+      // what gets published (the backend regenerates otherwise).
+      const approved = metadataPreview && !metadataPreview.error ? metadataPreview : null;
+      const res = await fetch(`${API}/youtube/upload/${job.job_id}?privacy=${privacy}`, {
+        method: "POST",
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ metadata: approved }),
+      });
       const data = await res.json();
-      setYoutubeResult(data);
+      if (!res.ok) {
+        setYoutubeResult({ error: data.detail || `Error ${res.status}` });
+      } else {
+        setYoutubeResult(data);
+      }
     } catch (err) {
       setYoutubeResult({ error: err.message });
     }
@@ -792,6 +816,20 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           {(metadataPreview?.error || youtubeResult?.error) && (
             <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3 text-center">
               <p className="text-sm text-red-400">{metadataPreview?.error || youtubeResult?.error}</p>
+              <button
+                onClick={() => {
+                  setYoutubeResult(null);
+                  // Upload failed but the approved preview is intact: just
+                  // return to it so the user retries the publish with the
+                  // same metadata. Only regenerate when the preview failed.
+                  if (!metadataPreview || metadataPreview.error) {
+                    setMetadataPreview(null);
+                    previewMetadata();
+                  }
+                }}
+                className="mt-2 text-xs text-gray-400 hover:text-white transition-colors underline">
+                {t("dash.retry")}
+              </button>
             </div>
           )}
         </div>
