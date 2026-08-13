@@ -337,3 +337,79 @@ def test_reanchor_rejects_stale_revision_before_alignment(client, monkeypatch):
     assert res.status_code == 409
     assert res.json()["code"] == "stale_revision"
     assert res.json()["current_revision"] == 3
+
+
+def _seed_editor_document(job_id, tenant_id, segments, revision):
+    """Give the job a durable editor document at a known revision, and set
+    job.segments_revision to match — the shape every real job that has been
+    opened in the LyricsEditor has."""
+    from database import EditorDocument, Job, SessionLocal
+
+    s = SessionLocal()
+    try:
+        s.query(Job).filter(Job.job_id == job_id).update(
+            {"segments_revision": revision}, synchronize_session=False,
+        )
+        s.add(EditorDocument(
+            job_id=job_id, tenant_id=tenant_id,
+            current_segments=segments, original_segments=segments,
+            revision=revision,
+        ))
+        s.commit()
+    finally:
+        s.close()
+
+
+def _db_document(job_id):
+    from database import EditorDocument, SessionLocal
+    s = SessionLocal()
+    try:
+        d = s.query(EditorDocument).filter(EditorDocument.job_id == job_id).first()
+        return (d.current_segments, d.revision) if d else (None, None)
+    finally:
+        s.close()
+
+
+def test_reanchor_persists_retimed_values_when_job_has_editor_document(client, monkeypatch):
+    """Regression (found live in prod 2026-08-13, same day the editor bridge
+    shipped): the bridge calls get_or_create_document(), which re-queries the
+    Job with .populate_existing(). SessionLocal runs autoflush=False, so the
+    pending `row.segments_json = merged` assignment was silently reverted by
+    that refresh before it ever reached the DB — the endpoint burned 40-130s
+    of real CTC compute and persisted NOTHING (observed: editor revisions
+    N and N+1 byte-identical while the worker logged "[CTC] retimed 50 lines").
+
+    The pre-existing happy-path test did not catch it because its job has no
+    editor_document and no base_revision, which takes a different branch.
+    This one mirrors the real shape: durable document at a known revision +
+    explicit base_revision.
+    """
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    token, user_id, tenant_id = _make_user(client)
+    # All 4 lines, none locked, so the engine retimes every one of them
+    # (line count must match _retimed() or the engine declines).
+    seeded = [{k: v for k, v in s.items() if k != "locked"} for s in SEGS]
+    job_id = _seed_job(user_id, tenant_id, segments=seeded)
+    _seed_editor_document(job_id, tenant_id, seeded, revision=7)
+    _mock_align_ok(monkeypatch)
+
+    res = client.post(
+        f"/jobs/{job_id}/reanchor", headers=auth(token), json={"base_revision": 7},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["ok"] is True
+
+    persisted = {s["text"]: s for s in _db_segments(job_id)}
+    assert persisted["primera linea corregida"]["start"] == 0.5, (
+        "the retimed values must actually reach the DB — a populate_existing() "
+        "refresh in the editor bridge must not silently revert them"
+    )
+    assert persisted["primera linea corregida"]["end"] == 2.1
+
+    doc_segments, doc_revision = _db_document(job_id)
+    assert doc_revision == 8, f"document must advance with the job, got {doc_revision}"
+    doc_by_text = {s["text"]: s for s in doc_segments}
+    assert doc_by_text["primera linea corregida"]["start"] == 0.5, (
+        "editor_documents must carry the retimed values too — otherwise the "
+        "editor shows stale timings and the next reconcile stomps one side"
+    )
