@@ -675,6 +675,22 @@ def _record_bg_cache_reuse(job_id, bg_cache_key, *, waited_s=None):
         )
 
 
+def _apply_film_frame_guard(video_path: str, *, job_id: str | None = None):
+    """Repair Veo's literal physical-film frame locally when confidently seen.
+
+    The detector is deliberately compound and temporal. It never requests a
+    replacement from Veo; failures preserve the original clip and remain
+    non-fatal to the render.
+    """
+    try:
+        from film_frame_guard import process_film_frame_artifact
+        return process_film_frame_artifact(video_path, job_id=job_id)
+    except Exception as exc:
+        _raise_if_job_timeout(exc)
+        logger.warning("[BG][FILM-FRAME] guard skipped (non-fatal): %s", exc)
+        return None
+
+
 def _bg_preview_wait_s() -> int:
     """Máxima espera por un preview de fondo EN VUELO antes de generar fresh.
 
@@ -759,6 +775,7 @@ def _await_inflight_bg_preview(bg_cache_key, job_dir, *, job_id):
                     job_dir, f"bg_cached_{bg_cache_key}.mp4",
                 )
                 if cache_download(bg_cache_key, cached_path):
+                    _apply_film_frame_guard(cached_path, job_id=job_id)
                     waited = _time.time() - started
                     logger.info(
                         "[BG] cache HIT tras espera de %.0fs key=%s job=%s",
@@ -1356,6 +1373,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     if cache_check(bg_cache_key):
                         cached_path = os.path.join(job_dir, f"bg_cached_{bg_cache_key}.mp4")
                         if cache_download(bg_cache_key, cached_path):
+                            _apply_film_frame_guard(cached_path, job_id=job_id)
                             logger.info("[BG] cache HIT key=%s — reusando %s, skip Veo/Imagen",
                                         bg_cache_key, os.path.basename(cached_path))
                             bg_image_path = cached_path
@@ -10496,6 +10514,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         for _ck in dict.fromkeys(_candidates):  # dedup preservando orden
             if (_storage.is_enabled() and _storage.object_exists(_ck)
                     and _storage.download_object(_ck, output_path)):
+                _apply_film_frame_guard(output_path, job_id=job_id)
                 size_mb = os.path.getsize(output_path) / 1024 / 1024
                 _via = "stored-key" if _ck == cache_key_override else "recomputed"
                 logger.info("[BG] Veo cache HIT (cache_only via %s, %s): %.1f MB",
@@ -10943,6 +10962,12 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     except Exception as e:
         _raise_if_job_timeout(e)
         logger.warning("[BG] Letterbox check skipped (non-fatal): %s", e)
+
+    # A literal "old film" cue can make Veo render the physical film frame
+    # itself: a stable black shell plus an opaque sprocket/placeholder. The
+    # compound detector repairs only that signature with a local uniform zoom;
+    # it never triggers another paid generation.
+    _apply_film_frame_guard(output_path, job_id=job_id)
 
     # Apply subtle gaussian blur. Veo Fast outputs are slightly softer than
     # standard; a small blur normalises that softness, hides minor artefacts,
