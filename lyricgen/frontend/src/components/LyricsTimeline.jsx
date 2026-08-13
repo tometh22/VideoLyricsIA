@@ -27,7 +27,6 @@ const MOVE_HIT_MIN_PX = 28;
 const MIN_DUR_S = 0.3;
 const CLICK_SLOP_PX = 5;
 const FOLLOW_SUPPRESS_MS = 2500;
-const FOLLOW_LOCK_MS = 750;
 const LABEL_W = 264;
 
 function clamp(value, min, max) {
@@ -39,6 +38,13 @@ function fmt(sec) {
   const m = Math.floor(sec / 60);
   const s = Math.floor(sec % 60);
   return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function fmtPrecise(sec) {
+  if (!isFinite(sec) || sec < 0) sec = 0;
+  const m = Math.floor(sec / 60);
+  const s = (sec % 60).toFixed(2).padStart(5, "0");
+  return `${m}:${s}`;
 }
 
 function nearestTick(step) {
@@ -71,6 +77,7 @@ export default function LyricsTimeline({
   segments,
   duration,
   currentTime,
+  playbackTimeRef = null,
   isPlaying = false,
   activeId,
   focusedSegId,
@@ -98,11 +105,14 @@ export default function LyricsTimeline({
   const dragRef = useRef(null);
   const marqueeRef = useRef(null);
   const followTimerRef = useRef(null);
-  const followLockRef = useRef(false);
   const selectionAnchorRef = useRef(null);
   const lastInteractionRef = useRef(0);
+  const lastFollowTargetRef = useRef(null);
   const clickSuppressRef = useRef(false);
-  const activeRowRefs = useRef(new Map());
+  const playheadRef = useRef(null);
+  const activePlayheadRef = useRef(null);
+  const semanticTimeRef = useRef(currentTime);
+  semanticTimeRef.current = currentTime;
   const [viewportWidth, setViewportWidth] = useState(0);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [marquee, setMarquee] = useState(null);
@@ -317,8 +327,11 @@ export default function LyricsTimeline({
       updateMarquee(event);
       return;
     }
-    const delta = (event.clientX - drag.originX) / drag.pxPerSec;
-    if (Math.abs(event.clientX - drag.originX) > CLICK_SLOP_PX) {
+    const resizing = drag.mode === "start" || drag.mode === "end";
+    const fineScale = resizing && event.altKey ? 0.1 : 1;
+    const delta = ((event.clientX - drag.originX) / drag.pxPerSec) * fineScale;
+    const movementThreshold = resizing ? 1 : CLICK_SLOP_PX;
+    if (Math.abs(event.clientX - drag.originX) > movementThreshold) {
       drag.moved = true;
       if (!drag.historyStarted) {
         drag.historyStarted = true;
@@ -350,6 +363,7 @@ export default function LyricsTimeline({
         total,
         gapS,
         MIN_DUR_S,
+        drag.mode,
       );
       if (bounded) ({ start, end } = bounded);
       setLimitFeedback(bounded?.blocked ? "La línea no tiene espacio para cambiar su duración." : "");
@@ -430,14 +444,17 @@ export default function LyricsTimeline({
 
   const scrollToPlayhead = useCallback(() => {
     const sc = scrollRef.current;
-    if (!sc || typeof sc.scrollTo !== "function" || followLockRef.current || Date.now() - lastInteractionRef.current < FOLLOW_SUPPRESS_MS) return;
+    if (!sc || typeof sc.scrollTo !== "function" || Date.now() - lastInteractionRef.current < FOLLOW_SUPPRESS_MS) return;
     const x = LABEL_W + currentTime * pxPerSec;
     const left = sc.scrollLeft;
     const right = left + sc.clientWidth;
     if (x < left + 80 || x > right - 120) {
-      followLockRef.current = true;
-      sc.scrollTo({ left: Math.max(0, x - sc.clientWidth * 0.4), behavior: "smooth" });
-      window.setTimeout(() => { followLockRef.current = false; }, FOLLOW_LOCK_MS);
+      const target = Math.max(0, x - sc.clientWidth * 0.4);
+      if (lastFollowTargetRef.current != null && Math.abs(target - lastFollowTargetRef.current) < 80) return;
+      lastFollowTargetRef.current = target;
+      sc.scrollTo({ left: target, behavior: "auto" });
+    } else {
+      lastFollowTargetRef.current = null;
     }
   }, [currentTime, pxPerSec]);
 
@@ -445,11 +462,31 @@ export default function LyricsTimeline({
     if (isPlaying && followEnabled) scrollToPlayhead();
   }, [isPlaying, followEnabled, scrollToPlayhead]);
 
+  // This surface owns horizontal scrolling only. scrollIntoView on a lyric
+  // row also scrolls the outer editor/page and used to recenter the complete
+  // workspace whenever the active lyric changed.
+
+  const positionPlayheads = useCallback((time) => {
+    const x = Math.max(0, Number(time) || 0) * pxPerSec;
+    const transform = `translate3d(${x}px, 0, 0)`;
+    if (playheadRef.current) playheadRef.current.style.transform = transform;
+    if (activePlayheadRef.current) activePlayheadRef.current.style.transform = transform;
+  }, [pxPerSec]);
+
   useEffect(() => {
-    if (!isPlaying || !followEnabled || followSuppressed || activeId == null) return;
-    const row = activeRowRefs.current.get(activeId);
-    row?.scrollIntoView?.({ block: "center", inline: "nearest", behavior: "smooth" });
-  }, [activeId, followEnabled, followSuppressed, isPlaying]);
+    if (!isPlaying) positionPlayheads(currentTime);
+  }, [currentTime, isPlaying, positionPlayheads]);
+
+  useEffect(() => {
+    if (!isPlaying) return undefined;
+    let frame = 0;
+    const paint = () => {
+      positionPlayheads(playbackTimeRef?.current ?? semanticTimeRef.current);
+      frame = requestAnimationFrame(paint);
+    };
+    frame = requestAnimationFrame(paint);
+    return () => cancelAnimationFrame(frame);
+  }, [isPlaying, playbackTimeRef, positionPlayheads]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -529,6 +566,9 @@ export default function LyricsTimeline({
   };
 
   const tickStep = nearestTick(120 / pxPerSec);
+  const renderedPlayheadTime = isPlaying
+    ? (playbackTimeRef?.current ?? currentTime)
+    : currentTime;
 
   return (
     <div
@@ -675,10 +715,6 @@ export default function LyricsTimeline({
                 return (
                   <div
                     key={`label-${segment._id}`}
-                    ref={(node) => {
-                      if (node) activeRowRefs.current.set(segment._id, node);
-                      else activeRowRefs.current.delete(segment._id);
-                    }}
                     data-testid="timeline-label-row"
                     data-active={isActive ? "true" : "false"}
                     data-playing={isActive && isPlaying ? "true" : "false"}
@@ -777,10 +813,10 @@ export default function LyricsTimeline({
                       startTextEdit(segment);
                     }}
                   />
-                  <div data-testid="timeline-edge-start" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, left: -(moveHitOverflow + EDGE_PX), touchAction: "none" }} title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea")} onPointerDown={(event) => startDrag(event, segment, "start")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
+                  <div data-testid="timeline-edge-start" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, left: -(moveHitOverflow + EDGE_PX), touchAction: "none" }} title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea · Alt para ajuste fino")} onPointerDown={(event) => startDrag(event, segment, "start")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
                     <span className="absolute inset-y-1 right-0 w-1 rounded-full bg-brand-light/70 transition-all group-hover/edge:inset-y-0.5 group-hover/edge:bg-white group-hover/edge:shadow-[0_0_8px_rgba(255,255,255,.7)]" />
                   </div>
-                  <div data-testid="timeline-edge-end" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, right: -(moveHitOverflow + EDGE_PX), touchAction: "none" }} title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea")} onPointerDown={(event) => startDrag(event, segment, "end")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
+                  <div data-testid="timeline-edge-end" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, right: -(moveHitOverflow + EDGE_PX), touchAction: "none" }} title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea · Alt para ajuste fino")} onPointerDown={(event) => startDrag(event, segment, "end")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
                     <span className="absolute inset-y-1 left-0 w-1 rounded-full bg-brand-light/70 transition-all group-hover/edge:inset-y-0.5 group-hover/edge:bg-white group-hover/edge:shadow-[0_0_8px_rgba(255,255,255,.7)]" />
                   </div>
                   <div
@@ -808,7 +844,7 @@ export default function LyricsTimeline({
                   </div>
                   {previewItem && (preview?.mode === "start" || preview?.mode === "end") && (
                     <span className="pointer-events-none absolute -top-7 right-0 z-40 rounded-md bg-black/90 px-2 py-1 text-[9px] font-medium text-white shadow-xl ring-1 ring-white/[0.12] tabular-nums whitespace-nowrap">
-                      {fmt(start)} → {fmt(end)}
+                      {fmtPrecise(start)} → {fmtPrecise(end)}
                     </span>
                   )}
                 </div>
@@ -832,11 +868,11 @@ export default function LyricsTimeline({
               <div className="absolute z-20 rounded-lg bg-brand/15 ring-1 ring-brand/70 pointer-events-none" style={{ left: marquee.anchorId != null ? 0 : Math.min(marquee.originX, marquee.currentX) - (trackRef.current?.getBoundingClientRect().left || 0), top: Math.min(marquee.originY, marquee.currentY) - (trackRef.current?.getBoundingClientRect().top || 0), width: marquee.anchorId != null ? trackWidth : Math.abs(marquee.currentX - marquee.originX), height: Math.abs(marquee.currentY - marquee.originY) }} aria-hidden="true" />
             )}
 
-            <div data-testid="timeline-playhead" className="absolute top-0 bottom-0 z-30 w-px bg-cyan-200/15 pointer-events-none" style={{ left: currentTime * pxPerSec }}>
+            <div ref={playheadRef} data-testid="timeline-playhead" className="absolute top-0 bottom-0 left-0 z-30 w-px bg-cyan-200/15 pointer-events-none will-change-transform" style={{ transform: `translate3d(${renderedPlayheadTime * pxPerSec}px, 0, 0)` }}>
               <span className="absolute -top-1 -left-1.5 w-3 h-3 rounded-full bg-cyan-300 shadow-[0_0_10px_rgba(103,232,249,.8)]" />
             </div>
             {activeRowIndex != null && (
-              <div data-testid="timeline-active-playhead" className="absolute z-30 w-0.5 bg-cyan-200 shadow-[0_0_10px_rgba(103,232,249,.75)] pointer-events-none" style={{ left: currentTime * pxPerSec, top: activeRowIndex * ROW_H + 4, height: ROW_H - 8 }} aria-hidden="true" />
+              <div ref={activePlayheadRef} data-testid="timeline-active-playhead" className="absolute left-0 z-30 w-0.5 bg-cyan-200 shadow-[0_0_10px_rgba(103,232,249,.75)] pointer-events-none will-change-transform" style={{ transform: `translate3d(${renderedPlayheadTime * pxPerSec}px, 0, 0)`, top: activeRowIndex * ROW_H + 4, height: ROW_H - 8 }} aria-hidden="true" />
             )}
             </div>
           </div>

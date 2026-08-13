@@ -1050,6 +1050,9 @@ export default function LyricsEditor({
   const listRef = useRef(null);
   const rowRefs = useRef({});
   const rafRef = useRef(null);
+  const playbackTimeRef = useRef(0);
+  const lastPublishedTimeRef = useRef(-Infinity);
+  const lastPublishedActiveIdRef = useRef(null);
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -1069,9 +1072,10 @@ export default function LyricsEditor({
   // start straight past its end, and `segments.find(s => t >= s.start
   // && t < s.end)` returned null for the whole duration.
   //
-  // Fix: while playing, drive `currentTime` from `requestAnimationFrame`
-  // (~60 fps, 16 ms granularity). Any line ≥ 1 frame appears at least
-  // once. Stop the rAF loop on pause/end to avoid burning a CPU core.
+  // Keep the audio clock at display cadence without rendering the complete
+  // editor at 60 fps. The timeline reads playbackTimeRef directly for its
+  // compositor-only playhead; React state is published at 20 fps or whenever
+  // the active lyric changes, so short interjections are still not skipped.
   // `onTimeUpdate` is still wired as a fallback for seeks and the
   // initial idle state (before the user hits play).
   useEffect(() => {
@@ -1080,18 +1084,25 @@ export default function LyricsEditor({
       const a = audioRef.current;
       if (a && !a.paused) {
         const ct = a.currentTime;
-        setCurrentTime(ct);
+        playbackTimeRef.current = ct;
+        let active = null;
+        for (const s of sanitizedEdited) {
+          if (ct >= s.start && ct < s.end) { active = s; break; }
+          if (ct >= s.start) active = s;
+        }
+        const activeKey = active?._id ?? null;
+        if (activeKey !== lastPublishedActiveIdRef.current
+          || Math.abs(ct - lastPublishedTimeRef.current) >= 0.05) {
+          lastPublishedTimeRef.current = ct;
+          lastPublishedActiveIdRef.current = activeKey;
+          setCurrentTime(ct);
+        }
         // Phase C 2026-05-25: publish playback tick al padre. Buscar el
         // segment activo aquí (no usar activeId del scope porque cambia
         // con setState async). Si el padre pasó onPlaybackTick, le
         // notificamos el segmento activo + currentTime para que el
         // WizardLivePreview central pueda hacer word-jump real.
         if (onPlaybackTick) {
-          let active = null;
-          for (const s of sanitizedEdited) {
-            if (ct >= s.start && ct < s.end) { active = s; break; }
-            if (ct >= s.start) active = s;
-          }
           if (active) {
             onPlaybackTick(active.text || "", active.start, active.end, ct, active.words);
           } else {
@@ -1787,6 +1798,8 @@ export default function LyricsEditor({
     if (!a) return;
     const t = Math.max(0, seconds);
     a.currentTime = t;
+    playbackTimeRef.current = t;
+    lastPublishedTimeRef.current = t;
     // Refleja en el mismo frame del click. Sin esto hay que esperar al
     // próximo rAF tick (~16ms) y el playhead "se desliza" en vez de saltar.
     setCurrentTime(t);
@@ -2626,11 +2639,30 @@ export default function LyricsEditor({
         <audio
           ref={audioRef}
           src={audioUrl}
-          onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+          onTimeUpdate={(e) => {
+            const time = e.currentTarget.currentTime;
+            playbackTimeRef.current = time;
+            if (e.currentTarget.paused) {
+              lastPublishedTimeRef.current = time;
+              setCurrentTime(time);
+            }
+          }}
           onLoadedMetadata={(e) => setDuration(e.currentTarget.duration || 0)}
           onPlay={() => setIsPlaying(true)}
-          onPause={() => setIsPlaying(false)}
-          onEnded={() => setIsPlaying(false)}
+          onPause={(e) => {
+            const time = e.currentTarget.currentTime;
+            playbackTimeRef.current = time;
+            lastPublishedTimeRef.current = time;
+            setCurrentTime(time);
+            setIsPlaying(false);
+          }}
+          onEnded={(e) => {
+            const time = e.currentTarget.currentTime;
+            playbackTimeRef.current = time;
+            lastPublishedTimeRef.current = time;
+            setCurrentTime(time);
+            setIsPlaying(false);
+          }}
           onError={() => {
             setAudioError(true);
             setIsPlaying(false);
@@ -3501,11 +3533,11 @@ export default function LyricsEditor({
           </div>
         )}
       </div>
-      <div className={`grid gap-4 mb-4 items-start ${viewMode === "advanced" ? (previewDockOpen && !hideTypographyControls ? "grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px]" : "grid-cols-1") : (hideTypographyControls ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2")}`}>
+      <div className={`grid gap-4 mb-4 items-start ${viewMode === "advanced" ? (previewDockOpen && !hideTypographyControls && !hideInternalPreview ? "grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px]" : "grid-cols-1") : (hideTypographyControls || hideInternalPreview ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2")}`}>
           {/* COLUMNA IZQUIERDA — sticky en desktop. Controles tipográficos
               + LyricVideoPreview (editable) + scope toggle.
               Phase 2: oculta si hideTypographyControls=true (modo wizard). */}
-          {!hideTypographyControls && (
+          {!hideTypographyControls && !hideInternalPreview && (viewMode !== "advanced" || previewDockOpen) && (
           <div className={`space-y-2 lg:sticky lg:top-2 lg:self-start ${viewMode === "advanced" ? "xl:order-2" : ""}`}>
             {/* Live font switcher — preview re-renders in the chosen
                 typeface instantly; applied to the render on re-render. */}
@@ -3582,6 +3614,7 @@ export default function LyricsEditor({
               t={t}
               segments={edited}
               currentTime={currentTime}
+              isPlaying={isPlaying}
               backgroundUrl={previewBgUrl || null}
               backgroundStyle={backgroundStyle || "default"}
               font={FONT_CSS_BY_CODE[selectedFont] || undefined}
@@ -3655,6 +3688,7 @@ export default function LyricsEditor({
                     segments={edited}
                     duration={duration}
                     currentTime={currentTime}
+                    playbackTimeRef={playbackTimeRef}
                     isPlaying={isPlaying}
                     saveStatus={saveStatus}
                     activeId={activeId}

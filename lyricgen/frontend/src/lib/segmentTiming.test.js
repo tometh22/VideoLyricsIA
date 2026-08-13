@@ -102,6 +102,31 @@ describe("collision-safe timeline edits", () => {
     });
   });
 
+  it("keeps the start anchored when the end handle crosses minimum duration", () => {
+    expect(clampResizeTiming(lines, "b", 2, 1.5, 10, 0.05, 0.3, "end")).toEqual({
+      start: 2,
+      end: 2.3,
+      blocked: false,
+    });
+  });
+
+  it("keeps the end anchored when the start handle crosses minimum duration", () => {
+    expect(clampResizeTiming(lines, "b", 3.8, 3, 10, 0.05, 0.3, "start")).toEqual({
+      start: 2.7,
+      end: 3,
+      blocked: false,
+    });
+  });
+
+  it("allows an end handle without a finite song ceiling", () => {
+    const openEnded = [{ _id: "only", start: 2, end: 3 }];
+    expect(clampResizeTiming(openEnded, "only", 2, 8, 0, 0.05, 0.3, "end")).toEqual({
+      start: 2,
+      end: 8,
+      blocked: false,
+    });
+  });
+
   it("refuses an impossible resize without mutating the snapshot", () => {
     const crowded = [
       { _id: "a", start: 0, end: 1 },

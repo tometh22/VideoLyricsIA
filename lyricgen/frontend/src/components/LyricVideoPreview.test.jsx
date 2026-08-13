@@ -185,4 +185,5 @@ it("renders a <video> when backgroundUrl is set, gradient otherwise", () => {
     />
   );
   expect(container.querySelector("video")).toBeInTheDocument();
+  expect(container.querySelector("video")).toHaveAttribute("loop");
 });
