@@ -33,7 +33,10 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
         onStatus?.("error", "server", { checkpoint, result: state });
         return { ...state, reason: "server" };
       }
-      if (Array.isArray(state?.mergedSegments)) snapshot = state.mergedSegments;
+      if (Array.isArray(state?.mergedSegments)) {
+        snapshot = state.mergedSegments;
+        onMerged?.(state.mergedSegments, state);
+      }
     }
     onStatus?.("saving", null);
     const started = performance.now();

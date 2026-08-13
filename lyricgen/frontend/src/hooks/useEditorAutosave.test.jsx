@@ -27,8 +27,15 @@ describe("useEditorAutosave", () => {
     const save = vi.fn()
       .mockResolvedValueOnce({ ok: false, reason: "offline" })
       .mockResolvedValue({ ok: true, revision: 2 });
-    const reconcile = vi.fn().mockResolvedValue({ ok: false, reason: "conflict" });
+    const reconcile = vi.fn().mockResolvedValue({
+      ok: true,
+      mergedSegments: [
+        { start: 0, end: 1, text: "local" },
+        { start: 1, end: 2, text: "remote" },
+      ],
+    });
     const onStatus = vi.fn();
+    const onMerged = vi.fn();
     renderHook(() => useEditorAutosave({
       enabled: true,
       segments: [{ start: 0, end: 1, text: "local" }],
@@ -37,11 +44,15 @@ describe("useEditorAutosave", () => {
       save,
       reconcile,
       onStatus,
+      onMerged,
     }));
     await act(async () => { await vi.advanceTimersByTimeAsync(800); });
     await act(async () => { window.dispatchEvent(new Event("online")); await Promise.resolve(); });
     expect(reconcile).toHaveBeenCalledTimes(1);
     expect(save).toHaveBeenCalledTimes(2);
+    expect(onMerged).toHaveBeenCalledWith(expect.arrayContaining([
+      expect.objectContaining({ text: "remote" }),
+    ]), expect.objectContaining({ mergedSegments: expect.any(Array) }));
     expect(onStatus).not.toHaveBeenCalledWith("conflict", "conflict", expect.any(Object));
   });
 
