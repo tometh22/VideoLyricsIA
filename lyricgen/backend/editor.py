@@ -346,7 +346,13 @@ def save_document(
     )
     normalized = normalize_segments(segments)
     if document.revision != base_revision:
-        if document.current_segments == normalized:
+        # A background/typography render can advance the durable revision
+        # while only refreshing renderer metadata. Treat that retry as a
+        # semantic no-op; comparing the raw JSON here manufactured the 409
+        # that the lyrics editor showed as a collaboration conflict.
+        if document.current_segments == normalized or segments_equivalent(
+            document.current_segments, normalized,
+        ):
             version = None
             # A draft and its 5-second checkpoint can overlap in flight. If
             # the draft wins first, the checkpoint arrives with a stale base

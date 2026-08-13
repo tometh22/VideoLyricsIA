@@ -255,6 +255,41 @@ def test_editor_preserves_metadata_draft_retry_and_version_details(client):
     assert detail.json()["segments"][0] == metadata_segments[0]
 
 
+def test_stale_renderer_metadata_retry_is_not_a_collaboration_conflict(client):
+    first, _, job_id = _users_and_job("editor_renderer_retry")
+    token = _token_for(first)
+    base = [{
+        "_id": "row-1", "start": 0, "end": 1, "text": "hola",
+        "words": [{"word": "hola", "start": 0, "end": 1}], "review": False,
+    }]
+    saved = client.patch(
+        f"/editor/{job_id}", headers=auth(token),
+        json={"base_revision": 0, "segments": base, "checkpoint": "draft"},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["revision"] == 1
+
+    # A background/typography render refreshed IDs and word-review metadata
+    # after the operator's request was sent. The stale retry is semantically
+    # the same lyric snapshot and must not open the collaboration resolver.
+    renderer_snapshot = [{
+        "_id": "new-row-id", "segment_id": "row-1", "start": 0, "end": 1,
+        "text": "hola", "words": [{"word": "hola", "start": 0.1, "end": 0.9}],
+        "review": True,
+    }]
+    retry = client.patch(
+        f"/editor/{job_id}", headers=auth(token),
+        json={
+            "base_revision": 0,
+            "segments": renderer_snapshot,
+            "checkpoint": "autosave",
+        },
+    )
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["revision"] == 1
+    assert retry.json()["applied"] is False
+
+
 def test_conflict_resolution_preserves_both_and_rechecks_third_edit(client):
     first, second, job_id = _users_and_job("editor_conflict_resolution")
     token_a = _token_for(first)

@@ -767,70 +767,110 @@ export default function LyricsEditor({
     if (!editorV2Enabled || durableEditor.loading || !durableEditor.document) return;
     if (durableHydratedJobRef.current === transcribeJobId) return;
     durableHydratedJobRef.current = transcribeJobId;
-    const remote = sanitizeSegments(durableEditor.document.segments || []);
-    const remoteOriginal = sanitizeSegments(durableEditor.document.original_segments || remote);
-    originalSegmentsRef.current = remoteOriginal;
-    let next = remote;
-    let markDirty = false;
-    if (draftKey) {
-      try {
-        const raw = localStorage.getItem(draftKey);
-        if (raw) {
-          const draft = JSON.parse(raw);
-          if (!Array.isArray(draft?.segments) || !draft.segments.length) {
-            setSaveStatus("error");
-            setSaveErrorReason("draft-corrupt");
-          } else {
-            const local = sanitizeSegments(draft.segments);
-            // A local draft can outlive a background/typography edit. Those
-            // operations may advance the document revision or refresh
-            // renderer metadata without changing any operator-owned lyric
-            // content. Comparing raw JSON here made that harmless case look
-            // like a collaboration conflict as soon as the editor reopened.
-            const sameContent = segmentsEquivalent(local, remote);
-            if (sameContent) {
-              localStorage.removeItem(draftKey);
-            } else if (Number.isInteger(draft.base_revision)
-              && draft.base_revision === durableEditor.document.revision) {
-              next = local;
-              markDirty = true;
-              setSaveStatus("local");
+    let cancelled = false;
+    const hydrate = async () => {
+      const remote = sanitizeSegments(durableEditor.document.segments || []);
+      const remoteOriginal = sanitizeSegments(durableEditor.document.original_segments || remote);
+      originalSegmentsRef.current = remoteOriginal;
+      let next = remote;
+      let markDirty = false;
+      if (draftKey) {
+        try {
+          const raw = localStorage.getItem(draftKey);
+          if (raw) {
+            const draft = JSON.parse(raw);
+            if (!Array.isArray(draft?.segments) || !draft.segments.length) {
+              setSaveStatus("error");
+              setSaveErrorReason("draft-corrupt");
             } else {
-              const baseSegments = Array.isArray(draft.base_segments)
-                ? sanitizeSegments(draft.base_segments)
-                : null;
-              const merged = baseSegments
-                ? mergeThreeWay(baseSegments, local, remote)
-                : { merged: [], conflicts: [{ key: "unknown-base" }] };
-              if (merged.conflicts.length === 0) {
-                next = merged.merged;
-                markDirty = !segmentsEquivalent(next, remote);
-                if (markDirty) setSaveStatus("local");
-                else localStorage.removeItem(draftKey);
-              } else {
+              const local = sanitizeSegments(draft.segments);
+              // A local draft can outlive a background/typography edit. Those
+              // operations may advance the document revision or refresh
+              // renderer metadata without changing any operator-owned lyric
+              // content. Comparing raw JSON here made that harmless case look
+              // like a collaboration conflict as soon as the editor reopened.
+              const sameContent = segmentsEquivalent(local, remote);
+              if (sameContent) {
+                localStorage.removeItem(draftKey);
+              } else if (Number.isInteger(draft.base_revision)
+                && draft.base_revision === durableEditor.document.revision) {
                 next = local;
                 markDirty = true;
-                durableEditor.stageConflict(local, {
-                  baseSegments,
-                  reason: Number.isInteger(draft.base_revision) ? "stale-draft" : "unversioned-draft",
-                });
-                setSaveStatus("conflict");
-                setSaveErrorReason("conflict");
-                setConflictDialogOpen(true);
+                setSaveStatus("local");
+              } else {
+                let baseSegments = Array.isArray(draft.base_segments)
+                  ? sanitizeSegments(draft.base_segments)
+                  : null;
+
+                // Drafts created before base_segments was introduced still
+                // carry base_revision. Recover that immutable base from the
+                // durable version history instead of manufacturing an
+                // "another tab" conflict for a legacy local draft.
+                if (!baseSegments && Number.isInteger(draft.base_revision)) {
+                  if (draft.base_revision === 0) {
+                    baseSegments = remoteOriginal;
+                  } else if (editorRequest) {
+                    try {
+                      const summariesResponse = await editorRequest(
+                        `/editor/${transcribeJobId}/versions?limit=50`,
+                      );
+                      const summaries = summariesResponse.ok
+                        ? (await summariesResponse.clone().json())?.versions || []
+                        : [];
+                      const baseVersion = summaries.find(
+                        (version) => version.revision === draft.base_revision,
+                      );
+                      if (baseVersion?.id) {
+                        const versionResponse = await editorRequest(
+                          `/editor/${transcribeJobId}/versions/${encodeURIComponent(baseVersion.id)}`,
+                        );
+                        if (versionResponse.ok) {
+                          const version = await versionResponse.clone().json();
+                          if (Array.isArray(version?.segments)) {
+                            baseSegments = sanitizeSegments(version.segments);
+                          }
+                        }
+                      }
+                    } catch { /* fall back to the explicit safe resolver */ }
+                  }
+                }
+                if (cancelled) return;
+                const merged = baseSegments
+                  ? mergeThreeWay(baseSegments, local, remote)
+                  : { merged: [], conflicts: [{ key: "unknown-base" }] };
+                if (merged.conflicts.length === 0) {
+                  next = merged.merged;
+                  markDirty = !segmentsEquivalent(next, remote);
+                  if (markDirty) setSaveStatus("local");
+                  else localStorage.removeItem(draftKey);
+                } else {
+                  next = local;
+                  markDirty = true;
+                  durableEditor.stageConflict(local, {
+                    baseSegments,
+                    reason: Number.isInteger(draft.base_revision) ? "stale-draft" : "unversioned-draft",
+                  });
+                  setSaveStatus("conflict");
+                  setSaveErrorReason("conflict");
+                  setConflictDialogOpen(true);
+                }
               }
             }
           }
+        } catch {
+          setSaveStatus("error");
+          setSaveErrorReason("draft-corrupt");
         }
-      } catch {
-        setSaveStatus("error");
-        setSaveErrorReason("draft-corrupt");
       }
-    }
-    setEdited(reseedPreservingIds(editedRef.current, next));
-    setIsDirty(markDirty);
-    setDurableHydrated(true);
+      if (cancelled) return;
+      setEdited(reseedPreservingIds(editedRef.current, next));
+      setIsDirty(markDirty);
+      setDurableHydrated(true);
+    };
+    hydrate();
+    return () => { cancelled = true; };
   }, [draftKey, durableEditor.document, durableEditor.loading, durableEditor.stageConflict,
-    editorV2Enabled, setEdited, transcribeJobId]);
+    editorRequest, editorV2Enabled, setEdited, transcribeJobId]);
 
   useEffect(() => {
     if (!durableEditor.conflict) return;
