@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   clampBlockShiftDelta,
   clampResizeTiming,
+  clampResizeTimingWithAdjacent,
   clampSelectionShiftDelta,
   shiftBlockWithinDuration,
 } from "./segmentTiming";
@@ -125,6 +126,38 @@ describe("collision-safe timeline edits", () => {
       end: 8,
       blocked: false,
     });
+  });
+
+  it("moves a packed next boundary when extending an end handle", () => {
+    const packed = [
+      { _id: "a", start: 0, end: 2 },
+      { _id: "b", start: 2.05, end: 3.5 },
+    ];
+    expect(clampResizeTimingWithAdjacent(packed, "a", 0, 2.5, 10, 0.05, 0.3, "end"))
+      .toEqual({
+        changes: [
+          { id: "a", start: 0, end: 2.5 },
+          { id: "b", start: 2.55, end: 3.5 },
+        ],
+        blocked: false,
+        coupled: true,
+      });
+  });
+
+  it("moves a packed previous boundary when extending a start handle", () => {
+    const packed = [
+      { _id: "a", start: 0, end: 1 },
+      { _id: "b", start: 1.05, end: 2.5 },
+    ];
+    expect(clampResizeTimingWithAdjacent(packed, "b", 0.7, 2.5, 10, 0.05, 0.3, "start"))
+      .toEqual({
+        changes: [
+          { id: "a", start: 0, end: 0.7 - 0.05 },
+          { id: "b", start: 0.7, end: 2.5 },
+        ],
+        blocked: false,
+        coupled: true,
+      });
   });
 
   it("refuses an impossible resize without mutating the snapshot", () => {
