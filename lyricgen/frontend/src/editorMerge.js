@@ -4,7 +4,7 @@
 
 export function decorateSegments(segments = []) {
   return segments.map((segment, index) => {
-    const stable = segment?.segment_id ?? segment?.id ?? String(index);
+    const stable = segment?.segment_id ?? segment?.id ?? segment?._id ?? String(index);
     const localId = Number.isFinite(segment?._id) ? segment._id : index;
     return { ...segment, _id: localId, segment_id: String(stable) };
   });
@@ -25,7 +25,7 @@ function equal(a, b) {
 }
 
 function keyOf(segment, index) {
-  return String(segment?.segment_id ?? segment?.id ?? `index:${index}`);
+  return String(segment?.segment_id ?? segment?.id ?? segment?._id ?? `index:${index}`);
 }
 
 function indexed(segments) {

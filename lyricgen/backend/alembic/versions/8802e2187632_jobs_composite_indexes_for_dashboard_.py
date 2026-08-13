@@ -42,42 +42,39 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    bind = op.get_bind()
-    if bind.dialect.name == "sqlite":
-        # SQLite has no CONCURRENTLY syntax. The migration chain is also
-        # exercised against fresh SQLite databases in CI and local tests.
+    dialect = op.get_context().dialect.name
+    if dialect == "postgresql":
+        # autocommit_block exits the migration's surrounding transaction so
+        # CREATE INDEX CONCURRENTLY (which Postgres refuses to run inside a
+        # txn) succeeds. IF NOT EXISTS makes the migration safe to re-run
+        # if a previous attempt was interrupted mid-build.
+        with op.get_context().autocommit_block():
+            op.execute(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_jobs_tenant_status_created "
+                "ON jobs (tenant_id, status, created_at DESC)"
+            )
+            op.execute(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_jobs_tenant_created "
+                "ON jobs (tenant_id, created_at DESC)"
+            )
+    else:
+        # SQLite: no CONCURRENTLY support — plain index creation.
         op.create_index(
-            "ix_jobs_tenant_status_created",
-            "jobs",
+            "ix_jobs_tenant_status_created", "jobs",
             ["tenant_id", "status", "created_at"],
         )
         op.create_index(
-            "ix_jobs_tenant_created",
-            "jobs",
+            "ix_jobs_tenant_created", "jobs",
             ["tenant_id", "created_at"],
-        )
-        return
-    # autocommit_block exits the migration's surrounding transaction so
-    # CREATE INDEX CONCURRENTLY (which Postgres refuses to run inside a
-    # txn) succeeds. IF NOT EXISTS makes the migration safe to re-run
-    # if a previous attempt was interrupted mid-build.
-    with op.get_context().autocommit_block():
-        op.execute(
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_jobs_tenant_status_created "
-            "ON jobs (tenant_id, status, created_at DESC)"
-        )
-        op.execute(
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_jobs_tenant_created "
-            "ON jobs (tenant_id, created_at DESC)"
         )
 
 
 def downgrade() -> None:
-    bind = op.get_bind()
-    if bind.dialect.name == "sqlite":
+    dialect = op.get_context().dialect.name
+    if dialect == "postgresql":
+        with op.get_context().autocommit_block():
+            op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_jobs_tenant_created")
+            op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_jobs_tenant_status_created")
+    else:
         op.drop_index("ix_jobs_tenant_created", table_name="jobs")
         op.drop_index("ix_jobs_tenant_status_created", table_name="jobs")
-        return
-    with op.get_context().autocommit_block():
-        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_jobs_tenant_created")
-        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_jobs_tenant_status_created")

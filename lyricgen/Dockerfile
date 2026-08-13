@@ -13,14 +13,21 @@ RUN npm run build
 # --- Stage 2: Backend ---
 FROM python:3.11-slim AS backend
 
-# System deps for whisper, moviepy, imagemagick
+# System deps for whisper, moviepy, imagemagick.
+# rclone para el worker que sube ProRes (16 GB) desde R2 a Drive
+# server-to-server (~30x más rápido que descargar-y-resubir desde casa).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     imagemagick \
     libmagickwand-dev \
     fonts-dejavu-core \
     fonts-liberation \
-    && rm -rf /var/lib/apt/lists/*
+    ca-certificates \
+    curl \
+    unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://rclone.org/install.sh | bash \
+    && rclone version
 
 # Fix ImageMagick policy to allow PDF/SVG operations
 RUN sed -i 's/rights="none" pattern="@\*"/rights="read|write" pattern="@*"/' /etc/ImageMagick-6/policy.xml 2>/dev/null || true
@@ -33,6 +40,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy backend code
 COPY backend/ ./backend/
+
+# Copy shared assets that live OUTSIDE backend/ (lyricgen/assets/): the
+# pre-baked effect overlays (fx/*.mp4) and the background fallbacks. The
+# `COPY backend/` above misses them because assets/ is a SIBLING of backend/,
+# not inside it. Without this, fx_compositor._FX_DIR — which resolves to
+# /app/backend/../assets/fx = /app/assets/fx — does not exist in the image,
+# so effect_path() returns None and EVERY effect (bokeh / snow / rain / stars
+# / light / aurora) silently no-ops in the render (the overlay is dropped and
+# the job still "succeeds"). Fonts kept working only because they live in
+# backend/fonts/. (Root cause of "el efecto no salió en el render", 2026-06-04.)
+COPY assets/ ./assets/
 
 # Copy built frontend
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
@@ -53,4 +71,11 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--app-dir", "/app/backend"]
+# Uvicorn workers per replica. Reduced from 4 → 2 when we moved to
+# numReplicas=2 in railway.toml (2026-05-19, post-UMG-signing). Keeps
+# the per-service DB connection budget at 2×2×10 = 40 (unchanged),
+# while letting Railway do truly rolling deploys with always-warm
+# capacity. To scale capacity further, prefer bumping numReplicas in
+# railway.toml over bumping workers here — replicas give failure
+# isolation, workers within a replica share fate.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers ${UVICORN_WORKERS:-2} --app-dir /app/backend"]

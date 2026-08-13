@@ -7,9 +7,12 @@ lyricgen/backend/__pycache__/
 lyricgen/outputs/
 lyricgen/frontend/node_modules/
 lyricgen/frontend/dist/
+lyricgen/frontend/test-results/
 lyricgen/nginx/ssl/*.pem
 lyricgen/nginx/ssl/*.key
 lyricgen/.env
+lyricgen/frontend/.env.local
+lyricgen/frontend/.env.*.local
 docs/pitch/node_modules/
 __pycache__/
 *.pyc
@@ -23,3 +26,5 @@ lyricgen/backend/.pytest_cache/
 # stress / load tests; runtime artifact, not source.
 dump.rdb
 *.rdb
+.gstack/
+.vercel

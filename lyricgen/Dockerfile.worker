@@ -1,0 +1,42 @@
+# Worker-only production image. Build context MUST be /lyricgen so the image
+# contains both backend code and the render assets referenced by pipeline.py.
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    imagemagick \
+    libmagickwand-dev \
+    libsndfile1 \
+    fonts-dejavu-core \
+    fonts-liberation \
+    ca-certificates \
+    curl \
+    unzip \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL https://rclone.org/install.sh | bash \
+ && rclone version
+
+RUN for f in /etc/ImageMagick-6/policy.xml /etc/ImageMagick-7/policy.xml; do \
+      if [ -f "$f" ]; then \
+        sed -i 's|<policy domain="path" rights="none" pattern="@\*"/>||g' "$f"; \
+      fi; \
+    done
+
+WORKDIR /app
+
+COPY backend/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
+
+COPY backend/ ./backend/
+COPY assets/ ./assets/
+
+RUN mkdir -p /app/outputs
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/backend \
+    ENVIRONMENT=production
+
+# Deliberately no HTTP HEALTHCHECK: RQ workers are daemons. Liveness and
+# release/protocol identity are published through Redis heartbeats.
+CMD ["python", "backend/worker.py"]

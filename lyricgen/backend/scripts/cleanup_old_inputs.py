@@ -1,19 +1,29 @@
 """CLI wrapper around storage.cleanup_old_inputs — delete user-uploaded MP3
 inputs once they pass the retention window.
 
-Designed for daily invocation by .github/workflows/daily-smoke.yml or any
-cron. Idempotent — safe to run repeatedly.
+HARDENED 2026-05-27 after the agus.cafisi incident (26 input audios lost
+between 5/11 and 5/18, no audit trail at the time).
+  - Default retention bumped 30 → 365 d (R2 storage is cheap, recovery
+    is expensive).
+  - `--apply` now requires the env var ALLOW_INPUT_CLEANUP=true.
+    Without it the script refuses to delete (still does dry-run).
+
+Idempotent — safe to run repeatedly.
 
 Usage from the backend dir:
 
     python3 scripts/cleanup_old_inputs.py             # dry-run (default)
-    python3 scripts/cleanup_old_inputs.py --apply     # actually delete
-    python3 scripts/cleanup_old_inputs.py --apply --retention-days 30
+    ALLOW_INPUT_CLEANUP=true python3 scripts/cleanup_old_inputs.py --apply
+    python3 scripts/cleanup_old_inputs.py --apply --retention-days 365
 
 Env required: R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_ENDPOINT_URL /
 R2_BUCKET (the same set the API uses).
 
-Exit codes: 0 success, 1 unrecoverable error (missing env, R2 unreachable).
+To actually delete: ALLOW_INPUT_CLEANUP=true must be set in the
+environment. This is the safety lock against accidental sweeps.
+
+Exit codes: 0 success, 1 unrecoverable error (missing env, R2 unreachable),
+2 safety lock not unset.
 """
 
 from __future__ import annotations
@@ -30,12 +40,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--retention-days", type=int,
-                   default=int(os.environ.get("INPUT_RETENTION_DAYS", "30")))
+                   default=int(os.environ.get("INPUT_RETENTION_DAYS", "365")))
     p.add_argument("--apply", action="store_true")
     p.add_argument("--prefix", default="inputs/")
     p.add_argument("--json", action="store_true",
                    help="Print full JSON report instead of human summary.")
     args = p.parse_args()
+
+    # Safety lock: --apply needs the env var to be set explicitly to "true".
+    # If you forget to set it, the script refuses to delete but still
+    # produces a dry-run report. Same gate as /admin/cleanup-inputs.
+    if args.apply and os.environ.get("ALLOW_INPUT_CLEANUP", "").strip().lower() != "true":
+        print(
+            "ERROR: --apply is locked. Set ALLOW_INPUT_CLEANUP=true to delete.",
+            file=sys.stderr,
+        )
+        print(
+            "  Example: ALLOW_INPUT_CLEANUP=true python3 scripts/cleanup_old_inputs.py --apply",
+            file=sys.stderr,
+        )
+        print(
+            "  This safety lock was added 2026-05-27 after the agus.cafisi incident.",
+            file=sys.stderr,
+        )
+        return 2
 
     backend = Path(__file__).resolve().parent.parent
     env_file = backend / ".env"

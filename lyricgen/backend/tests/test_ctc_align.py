@@ -1,0 +1,452 @@
+"""Unit tests for ctc_align.py — the Genly CTC timing engine.
+
+Covers the PURE pieces (no torch, no model download, no audio): text
+normalization, target building with the synthetic star, span→line
+grouping, the collapsed-alignment guard, and the decline-fast paths of
+`retime_segments` (flag off / too few lines / missing file), which all
+exit BEFORE any heavy import. The acoustic quality itself is covered by
+the offline benchmark vs Rotor ground truth (scripts/exp_ctc_align.py),
+not by unit tests.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import ctc_align  # noqa: E402
+
+# a-z + accented vowels + ñ as a fake vocab; ids arbitrary but unique
+VOCAB = {c: i + 5 for i, c in enumerate("abcdefghijklmnopqrstuvwxyzáéíóúñü'")}
+STAR = 999
+
+
+def test_norm_word_keeps_spanish_chars():
+    assert ctc_align.norm_word("Canción") == "canción"
+    assert ctc_align.norm_word("¡Hola!") == "hola"
+    assert ctc_align.norm_word("pingüino") == "pingüino"
+    assert ctc_align.norm_word("(woo)") == "woo"
+    assert ctc_align.norm_word("123") == ""
+
+
+def test_build_targets_stars_at_edges_and_between_lines():
+    targets, words = ctc_align.build_targets(["la la", "si"], VOCAB, STAR)
+    # leading star + line0 + star + line1 + trailing star: spoken intros /
+    # outros must have somewhere to go that isn't the first/last line
+    assert [w[0] for w in words] == [-1, 0, 0, -1, 1, -1]
+    assert targets.count(STAR) == 3
+    assert len(targets) == 1 + 2 + 2 + 1 + 2 + 1
+
+
+def test_build_targets_word_separator_within_lines():
+    sep = 777
+    targets, words = ctc_align.build_targets(["la la", "si"], VOCAB, STAR,
+                                             word_sep_id=sep)
+    # separator BETWEEN words of a line (appended to the preceding word's
+    # count), never at line edges
+    assert targets.count(sep) == 1
+    first_la = next(w for w in words if w[0] == 0)
+    assert first_la[2] == 3  # 'l','a',sep
+    # bookkeeping stays 1:1 with targets
+    assert sum(n for _, _, n in words) == len(targets)
+
+
+def test_build_targets_skips_unalignable_words():
+    targets, words = ctc_align.build_targets(["123 ok"], VOCAB, STAR)
+    assert [w[1] for w in words if w[0] >= 0] == ["ok"]
+
+
+def test_spans_to_lines_groups_words_and_lines():
+    # leading star + "ab" + star + "cd" + trailing star → 7 tokens
+    targets, words = ctc_align.build_targets(["ab", "cd"], VOCAB, STAR)
+    spans = [(0, 5, 0.5),                      # leading star
+             (10, 20, 0.9), (20, 30, 0.8),     # ab
+             (30, 80, 0.5),                    # star
+             (80, 85, 0.7), (85, 90, 0.6),     # cd
+             (90, 95, 0.5)]                    # trailing star
+    lines = ctc_align.spans_to_lines(spans, words, 2, frame_to_s=0.02)
+    (s0, e0, w0), (s1, e1, w1) = lines
+    assert (s0, e0) == (10 * 0.02, 30 * 0.02)
+    assert (s1, e1) == (80 * 0.02, 90 * 0.02)
+    assert w0[0][0] == "ab" and len(w0) == 1 and len(w1) == 1
+    assert s1 >= e0  # monotonic across the star gap
+
+
+def test_spans_to_lines_none_for_unalignable_line():
+    targets, words = ctc_align.build_targets(["ab", "123"], VOCAB, STAR)
+    spans = [(0, 5, 0.5), (10, 20, 0.9), (20, 30, 0.8),
+             (30, 40, 0.5), (40, 45, 0.5)]
+    lines = ctc_align.spans_to_lines(spans, words, 2, frame_to_s=0.02)
+    assert lines[0] is not None and lines[1] is None
+
+
+def test_repair_bridge_intro_case():
+    """Costumbres line 0 shape: first words bind to spoken-intro voice,
+    one word bridges 27s of instrumental, the rest sits at the real
+    verse. The bigger cluster (real verse side) must win."""
+    ws = [("Muerdo", 3.54, 5.66, 0.75), ("el", 5.80, 6.98, 0.98),
+          ("anzuelo", 8.30, 35.12, 0.88),  # 27s bridge word
+          ("y", 35.90, 36.00, 0.66), ("vuelvo", 36.04, 36.56, 0.98)]
+    regions = [(3.0, 10.2), (32.9, 41.8)]
+    (s, e, kept), = ctc_align.repair_bridge_words([(3.54, 36.56, ws)], regions)
+    assert e == 36.56
+    assert s > 25  # snapped to the real verse, not the spoken intro
+    assert [w[0] for w in kept] == ["anzuelo", "y", "vuelvo"]
+
+
+def test_repair_bridge_outro_case():
+    """Costumbres line 19 shape: last words dragged over the outro where
+    the stem has no voice. The line must end near the real singing."""
+    ws = [("Costumbres", 152.76, 154.12, 0.98), ("argentinas", 154.22, 155.68, 0.91),
+          ("de,", 155.72, 156.80, 0.93),
+          ("decir,", 157.18, 180.16, 0.61),  # 23s bridge word
+          ("no", 183.40, 187.18, 0.20)]
+    regions = [(147.2, 159.2)]
+    (s, e, kept), = ctc_align.repair_bridge_words([(152.76, 187.18, ws)], regions)
+    assert s == 152.76
+    assert e < 161  # trimmed to plausible duration, near voice end
+    assert kept[-1][0] == "decir,"
+
+
+def test_repair_bridge_no_op_on_healthy_lines():
+    ws = [("hola", 10.0, 10.5, 0.9), ("que", 10.6, 10.9, 0.9),
+          ("tal", 11.0, 11.4, 0.9)]
+    out = ctc_align.repair_bridge_words([(10.0, 11.4, ws)], [(9.0, 12.0)])
+    assert out == [(10.0, 11.4, ws)]
+
+
+def test_place_unaligned_prefers_cascade_over_spread():
+    """Staging lesson (job 8be12628e28b): a skipped chorus line spread
+    over a 48s hole sits frozen ~20s in the wrong place. The cascade's
+    original timing inside the hole must win."""
+    lt = [(58.0, 60.0, [1]), None, None, (108.0, 110.0, [1])]
+    originals = [(57.9, 60.1), (65.2, 68.0), (85.5, 88.0), (107.9, 110.2)]
+    out = ctc_align.place_unaligned(lt, originals, 200.0)
+    assert out[1][0] == 65.2 and out[1][1] == 68.0   # cascade timing kept
+    assert out[2][0] == 85.5
+    # no original (0,0) → falls back to the spread
+    out2 = ctc_align.place_unaligned([(58.0, 60.0, [1]), None],
+                                     [(58.0, 60.0), (0.0, 0.0)], 200.0)
+    assert out2[1] == (60.0, 200.0, [])
+
+
+def test_group_consecutive():
+    assert ctc_align.group_consecutive([7, 8, 20, 31, 32]) == [[7, 8], [20], [31, 32]]
+    assert ctc_align.group_consecutive([]) == []
+
+
+def test_recovery_window_between_anchors():
+    lt = [(10.0, 12.0, []), None, None, (40.0, 42.0, [])]
+    assert ctc_align.recovery_window(lt, [1, 2], 200.0) == (11.0, 41.0)
+    # degenerate (too small, pad=0) and oversized windows are rejected
+    lt2 = [(10.0, 12.0, []), None, (12.5, 13.0, [])]
+    assert ctc_align.recovery_window(lt2, [1], 200.0, pad=0.0) is None
+    lt3 = [(10.0, 12.0, []), None]  # open-ended → until total_dur (189s)
+    assert ctc_align.recovery_window(lt3, [1], 200.0) is None
+
+
+def test_guess_text_lang():
+    es = ["No quiero que me perdones", "Y no me pidas perdón",
+          "Yo quería que nos pasara", "Para bien o para mal"]
+    en = ["I want it I got it", "You like my hair gee thanks just bought it",
+          "Ain't got enough money to pay me respect", "Look at my neck"]
+    assert ctc_align.guess_text_lang(es) == "es"
+    assert ctc_align.guess_text_lang(en) == "en"
+    assert ctc_align.guess_text_lang(["la"]) == "unknown"
+
+
+def test_retime_declines_on_english_text(monkeypatch, tmp_path):
+    """The English guard fires BEFORE any audio/model work."""
+    monkeypatch.setenv("CTC_ALIGN_ENABLED", "1")
+    f = tmp_path / "a.wav"
+    f.write_bytes(b"RIFF")
+    segs = [{"text": t, "start": 0, "end": 0} for t in
+            ["I want it I got it", "You like my hair gee thanks",
+             "Just bought it yeah", "And I want it I got it"]]
+    assert ctc_align.retime_segments(str(f), segs) is None
+
+
+def test_looks_collapsed_detects_crammed_alignment():
+    ok = [(0.0, 2.0, []), (3.0, 5.0, []), (6.0, 8.0, [])]
+    assert not ctc_align.looks_collapsed(ok)
+    crammed = [(0.0, 0.05, []), (0.1, 0.14, []), (6.0, 8.0, [])]
+    assert ctc_align.looks_collapsed(crammed)
+    assert ctc_align.looks_collapsed([None, None])
+
+
+def test_retime_declines_fast_without_torch(monkeypatch, tmp_path):
+    segs = [{"text": "hola", "start": 0, "end": 1}] * 5
+    # flag off → None before any heavy import
+    monkeypatch.delenv("CTC_ALIGN_ENABLED", raising=False)
+    assert ctc_align.retime_segments("/nope.wav", segs) is None
+    # flag on but too few lines
+    monkeypatch.setenv("CTC_ALIGN_ENABLED", "1")
+    assert ctc_align.retime_segments("/nope.wav", segs[:2]) is None
+    # flag on, enough lines, missing file
+    assert ctc_align.retime_segments(str(tmp_path / "missing.wav"), segs) is None
+
+
+def test_ctc_align_is_valid_timing_source():
+    from timing_sources import CTC_ALIGN, VALID_TIMING_SOURCES
+    assert CTC_ALIGN in VALID_TIMING_SOURCES
+    assert len(CTC_ALIGN) <= 20  # VARCHAR(20) constraint
+
+
+def test_wrapper_flag_off_is_identity(monkeypatch):
+    """THE contract of the PR: with CTC_ALIGN_ENABLED off,
+    _maybe_ctc_retime returns the very same object — prod behaviour is
+    byte-identical to before the wiring."""
+    import asyncio
+    from main import _maybe_ctc_retime
+
+    monkeypatch.delenv("CTC_ALIGN_ENABLED", raising=False)
+    result = {"job_id": "j1", "segments": [{"text": "hola", "start": 1.0}] * 5}
+    out = asyncio.run(_maybe_ctc_retime(result, "/no/such/audio.mp3", "j1"))
+    assert out is result  # same object, not a copy
+
+
+def test_wrapper_never_raises_even_with_flag_on(monkeypatch):
+    """Flag ON + missing audio/stem must decline to identity, not 500."""
+    import asyncio
+    from main import _maybe_ctc_retime
+
+    monkeypatch.setenv("CTC_ALIGN_ENABLED", "1")
+    monkeypatch.delenv("VOCAL_SEP_ENABLED", raising=False)  # no stem possible
+    result = {"job_id": "j2", "segments": [{"text": "hola", "start": 1.0}] * 5}
+    out = asyncio.run(_maybe_ctc_retime(result, "/no/such/audio.mp3", "j2"))
+    assert out is result
+
+
+def test_perf_text_clean_libretto():
+    import performance_text as pt
+    items = [
+        (61.0, "(Público cantando) Nada de eso fue un error", 2),
+        (64.0, "¡Eh!", 2),                      # pure exclamation → drop
+        (48.0, "lo dejaste pasar", 1),
+        # cross-window seam: contains prev within overlap → merge
+        (50.0, "lo dejaste pasar, no quiero que me perdones", 2),
+        (122.0, "música y aplausos", 4),        # label → drop
+        (40.0, "Tengo una mala noticia", 1),
+        (183.0, "¡Gracias, Ciel!", 7),          # chatter → drop
+    ]
+    out = pt.clean_libretto(items)
+    assert out == ["Tengo una mala noticia",
+                   "lo dejaste pasar, no quiero que me perdones",
+                   "Nada de eso fue un error"]
+
+
+def test_perf_text_real_repetitions_survive_dedup():
+    """The crowd repeats the chorus 8x a few seconds apart, heard by the
+    SAME window: real repetitions, not seams — keep all. A cross-window
+    duplicate in the overlap zone is a seam — merge."""
+    import performance_text as pt
+    same_win = [(65.0, "Nada de esto fue un error", 2),
+                (69.0, "Nada de esto fue un error", 2),
+                (73.0, "Nada de esto fue un error", 2)]
+    assert len(pt.clean_libretto(same_win)) == 3
+    seam = [(28.0, "No quiero que me perdones", 0),
+            (29.0, "No quiero que me perdones", 1)]
+    assert len(pt.clean_libretto(seam)) == 1
+
+
+def test_perf_text_parse_ts_line():
+    import performance_text as pt
+    assert pt.parse_ts_line("[01:32.5] Tengo una mala noticia") == (
+        92.5, "Tengo una mala noticia")
+    assert pt.parse_ts_line("[00:")[1] == ""
+
+
+def test_perf_text_label_leaks_from_staging():
+    """Labels observed leaking into a real staging video as lines."""
+    import performance_text as pt
+    items = [(10.0, "Tengo una mala noticia"),
+             (20.0, "Público cantando y aplaudiendo"),
+             (30.0, "silence"),
+             (40.0, "Aplausos y ovación"),
+             (50.0, "No fue de casualidad")]
+    assert pt.clean_libretto(items) == ["Tengo una mala noticia",
+                                        "No fue de casualidad"]
+
+
+def test_perf_text_phantom_intro_and_hallucination():
+    """Operator report (staging, Nada Fue): crowd pre-sings the chorus at
+    0:00 (isolated 39s before the body) and Gemini invented a verse that
+    is never sung."""
+    import performance_text as pt
+    rows = [(0.5, "Nada de esto fue un error"),
+            (39.6, "Tengo una mala noticia"),
+            (42.9, "No fue de casualidad"),
+            (75.0, "Nada de esto fue un error")]
+    out = pt.drop_phantom_intro(rows)
+    assert out[0][1] == "Tengo una mala noticia"
+
+    ref = "tengo una mala noticia no fue de casualidad quería que nos " \
+          "pasara dejaste pasar perdones perdón niegues buscaste errores " \
+          "eligen diferencia juego azar entrega"
+    texts = ["Tengo una mala noticia",
+             "El error es todo lo que no hicimos por temor",  # hallucinated
+             "¡Mirá dónde estamos, papá!"]                    # ad-lib: keep
+    out2 = pt.drop_hallucinated_lines(texts, ref)
+    assert "El error es todo lo que no hicimos por temor" not in out2
+    assert "¡Mirá dónde estamos, papá!" in out2
+
+
+def test_condense_repeated_skips_rotor_style():
+    """Run-based block: consecutive UNANCHORED lines with a repeated-text
+    signature become ONE block whose text is the run's REAL sequence
+    (variants and interjections included), spanning to the next anchor."""
+    segs = [
+        {"text": "No me niegues que me buscaste", "start": 59.0, "end": 61.6},
+        {"text": "Nada, nada de esto", "start": 61.6, "end": 75.1, "ctc_skipped": True},
+        {"text": "nada de esto fue un error", "start": 75.1, "end": 75.1, "ctc_skipped": True},
+        {"text": "Oh, oh", "start": 75.1, "end": 75.1, "ctc_skipped": True},
+        {"text": "Nada de esto fue un error", "start": 75.1, "end": 75.1, "ctc_skipped": True},
+        {"text": "Nada fue un error", "start": 75.1, "end": 76.6},  # anclada: corta el run
+    ]
+    out = ctc_align.condense_repeated_skips(segs)
+    assert len(out) == 3
+    blk = out[1]
+    assert blk.get("ctc_condensed") == 4
+    # secuencia REAL: lead-in + repeticion + interjeccion "oh, oh" adentro
+    assert blk["text"].lower().startswith("nada, nada de esto, nada de esto fue un error")
+    assert "oh, oh" in blk["text"].lower()
+    # span: desde el inicio del run hasta la proxima ancla
+    assert blk["start"] == 61.6 and abs(blk["end"] - 75.1) < 0.3
+    # la linea anclada sigue individual (dinamismo intacto)
+    assert out[2]["text"] == "Nada fue un error"
+
+
+def test_condense_extends_block_to_next_anchor():
+    """Job 400 chorus 1: the COND2 block stayed 61.5-65.0 while the crowd
+    chants until 75.1 — must extend Rotor-style (their block 65.2→76.24)."""
+    segs = [
+        {"text": "Nada de esto fue un error", "start": 61.5, "end": 62.0, "ctc_skipped": True},
+        {"text": "Nada de esto fue un error", "start": 62.0, "end": 65.0, "ctc_skipped": True},
+        {"text": "Nada fue un error", "start": 75.1, "end": 76.6},
+    ]
+    out = ctc_align.condense_repeated_skips(segs)
+    assert out[0].get("ctc_condensed") == 2
+    assert abs(out[0]["end"] - 74.9) < 0.01  # extendido hasta la próxima ancla
+
+
+# ── trim_unvoiced_edges (caso "Uh, no, no" 03/07) ───────────────────────────
+
+def _hada_line():
+    # Palabras reales del caso: "Uh," estirada sobre silencio con score
+    # basura; "no," confiable en la voz; "no" final estirada post-voz.
+    return [(7.7 - 1.68, 7.9, [("Uh,", 6.02, 7.9, 0.12),
+                               ("no,", 8.38, 8.68, 0.727),
+                               ("no", 8.84, 10.4, 0.299)])]
+
+
+def test_edge_snap_first_word_to_voice_region():
+    from ctc_align import trim_unvoiced_edges
+    regions = [(7.7, 8.9)]  # voz medida en el stem
+    out = trim_unvoiced_edges(_hada_line(), regions)
+    s, e, ws = out[0]
+    assert ws[0][1] == 7.7          # "Uh," arranca donde arranca la voz
+    assert s == 7.7                 # la línea hereda el start corregido
+    assert ws[1] == ("no,", 8.38, 8.68, 0.727)  # la confiable intacta
+    assert ws[2][2] == 8.9          # "no" final recortada al fin de la voz
+    assert e == 8.9
+
+
+def test_edge_snap_confident_words_untouched():
+    from ctc_align import trim_unvoiced_edges
+    line = [(10.0, 12.0, [("hola", 10.0, 10.5, 0.9), ("mundo", 10.6, 12.0, 0.8)])]
+    out = trim_unvoiced_edges(line, [(11.0, 13.0)])
+    assert out[0] == line[0]        # scores altos → ni se mira la región
+
+
+def test_edge_snap_no_regions_is_noop():
+    from ctc_align import trim_unvoiced_edges
+    line = _hada_line()
+    assert trim_unvoiced_edges(line, []) is line
+
+
+def test_edge_snap_env_kill_switch(monkeypatch):
+    from ctc_align import trim_unvoiced_edges
+    monkeypatch.setenv("CTC_ALIGN_EDGE_SNAP", "0")
+    line = _hada_line()
+    assert trim_unvoiced_edges(line, [(7.7, 8.9)]) is line
+
+
+def test_edge_snap_never_moves_backward_or_past_end():
+    from ctc_align import trim_unvoiced_edges
+    # región que empieza ANTES del span de la palabra: snap = max(a, ra) = a
+    line = [(5.0, 6.0, [("eh", 5.0, 6.0, 0.1)])]
+    out = trim_unvoiced_edges(line, [(4.0, 7.0)])
+    assert out[0][2][0][1] == 5.0   # nunca hacia antes
+    # región que arranca después del end de la palabra: no toca
+    line2 = [(5.0, 6.0, [("eh", 5.0, 6.0, 0.1)])]
+    out2 = trim_unvoiced_edges(line2, [(6.5, 7.0)])
+    assert out2[0][2][0][1] == 5.0
+
+
+def test_edge_snap_none_lines_pass_through():
+    from ctc_align import trim_unvoiced_edges
+    out = trim_unvoiced_edges([None, _hada_line()[0]], [(7.7, 8.9)])
+    assert out[0] is None
+
+
+def test_finalize_line_clears_stale_review_on_retimed():
+    """El scaffold marca review=True ("timing aproximado"). Si CTC retimó
+    la línea, el flag se limpia — el wizard pintaba de ámbar 66 líneas
+    perfectamente sincronizadas (operador, 03/07)."""
+    from ctc_align import finalize_line
+    seg = {"text": "hola", "start": 1.0, "end": 2.0, "review": True,
+           "words": [{"word": "hola", "start": 1.0, "end": 2.0}]}
+    out = finalize_line(seg, 10.0, 12.0, [("hola", 10.0, 12.0, 0.9)], 0.4,
+                        skipped=False, recovered=False)
+    assert "review" not in out            # retimada → flag fuera
+    assert out["start"] == 10.0 and out["end"] == 12.0
+    assert out["words"][0]["start"] == 10.0
+    assert out["ctc_lr"] == 0.4
+
+
+def test_finalize_line_keeps_review_on_skipped():
+    from ctc_align import finalize_line
+    seg = {"text": "uh", "start": 1.0, "end": 2.0, "review": True}
+    out = finalize_line(seg, 1.0, 2.0, None, None, skipped=True, recovered=False)
+    assert out.get("review") is True      # salteada → timing sigue aproximado
+    assert out.get("ctc_skipped") is True
+    assert "words" not in out             # interpolada: sin stamps viejos
+
+
+def test_finalize_line_recovered_tags_mix():
+    from ctc_align import finalize_line
+    out = finalize_line({"text": "x"}, 5.0, 6.0,
+                        [("x", 5.0, 6.0, 0.5)], None,
+                        skipped=False, recovered=True)
+    assert out["ctc_recovered"] == "mix"
+
+
+# ── structural_skip_verdict: ad-libs no cuentan (Amanda Pujó, 05/07) ─────────
+
+def test_structural_verdict_ignores_adlib_skips():
+    """13 líneas de 'uh' salteadas NO deben hacer declinar: son
+    vocalizaciones que CTC no ancla por diseño, no un mismatch estructural."""
+    from ctc_align import structural_skip_verdict
+    lines = ["Verso uno", "Verso dos"] + ["Uh, uh, uh"] * 13 + ["Verso tres"]
+    skipped = set(range(2, 15))          # los 13 uh salteados
+    decl, lex_sk, lex_tot, n_ad = structural_skip_verdict(lines, skipped, 0.10)
+    assert not decl                      # 0 léxicas salteadas → NO declina
+    assert (lex_sk, lex_tot, n_ad) == (0, 3, 13)
+
+
+def test_structural_verdict_still_catches_real_mismatch():
+    """Letra de otra versión: líneas LÉXICAS salteadas → sí declina."""
+    from ctc_align import structural_skip_verdict
+    lines = [f"línea real {i}" for i in range(10)]
+    skipped = {0, 1, 2}                   # 3/10 léxicas = 30% > 10%
+    decl, lex_sk, lex_tot, _ = structural_skip_verdict(lines, skipped, 0.10)
+    assert decl and (lex_sk, lex_tot) == (3, 10)
+
+
+def test_structural_verdict_mixed():
+    """Coro de uh + una línea léxica mal: la léxica sola no supera el 10%."""
+    from ctc_align import structural_skip_verdict
+    lines = [f"línea {i}" for i in range(20)] + ["Uh, uh"] * 10
+    skipped = {5} | set(range(20, 30))   # 1 léxica + 10 uh
+    decl, lex_sk, lex_tot, n_ad = structural_skip_verdict(lines, skipped, 0.10)
+    assert not decl                      # 1/20 = 5% < 10%
+    assert (lex_sk, lex_tot, n_ad) == (1, 20, 10)

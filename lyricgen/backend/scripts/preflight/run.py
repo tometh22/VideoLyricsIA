@@ -26,6 +26,15 @@ from pathlib import Path
 
 from ._base import Check, Status, execute
 from .check_concurrency import ConcurrencyCheck
+from .check_launch_readiness import (
+    LaunchHealthCheck,
+    LimitsConfiguredCheck,
+    PresignedExpiryCheck,
+    QueueHealthCheck,
+    R2PublicAccessCheck,
+    SentryConfiguredCheck,
+    UmgUsersCheck,
+)
 from .check_production_health import ProductionHealthCheck
 from .check_umg_master import UmgMasterCheck
 from .check_validator_quality import ValidatorQualityCheck
@@ -62,7 +71,29 @@ def build_checks(args) -> list[Check]:
             concurrency=args.concurrency_n,
             timeout_secs=args.concurrency_timeout,
         ),
+        # --- UMG-launch readiness (2026-06-01). All read-only / prod-safe.
+        LaunchHealthCheck(api_url, expected_workers=args.expected_workers),
+        R2PublicAccessCheck(probe_url=args.r2_probe_url),
+        SentryConfiguredCheck(api_url),
+        UmgUsersCheck(),
+        QueueHealthCheck(api_url),
+        PresignedExpiryCheck(api_url),
+        LimitsConfiguredCheck(),
     ]
+
+
+# Names of the launch-readiness subset, used by the Makefile targets so
+# `make preflight-staging` / `make preflight-prod` don't accidentally run
+# the $$-costing validator or the job-creating concurrency check.
+LAUNCH_CHECKS = [
+    "launch_health",
+    "r2_not_public",
+    "sentry_configured",
+    "umg_users_ready",
+    "queue_healthy",
+    "presigned_expiry",
+    "limits_sane",
+]
 
 
 # Visual aids in terminal + markdown.
@@ -173,7 +204,21 @@ def main() -> int:
     parser.add_argument("--concurrency-timeout", type=int, default=1500,
                         help="Seconds before the concurrency test marks any job as hung "
                              "(parallel jobs share workers and run slower than serial)")
+    parser.add_argument("--launch", action="store_true",
+                        help="Run only the UMG-launch readiness subset (read-only, "
+                             "prod-safe — no Veo spend, no job creation)")
+    parser.add_argument("--expected-workers", type=int, default=None,
+                        help="Minimum live worker count for launch_health "
+                             "(default: EXPECTED_WORKERS env or 7)")
+    parser.add_argument("--r2-probe-url", default=None,
+                        help="Any presigned R2 URL — r2_not_public strips the signature "
+                             "and verifies anonymous access is rejected "
+                             "(default: R2_PROBE_URL env)")
     args = parser.parse_args()
+
+    # --launch is sugar for --only <each launch check>.
+    if args.launch:
+        args.only = list(set(args.only) | set(LAUNCH_CHECKS))
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     started = datetime.now()

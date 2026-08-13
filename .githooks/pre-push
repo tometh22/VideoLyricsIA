@@ -1,0 +1,10 @@
+#!/bin/sh
+# Pre-push gate: run the same fast checks as CI before a push leaves the
+# machine, so red CI / broken prod is caught in ~15s instead of a round-trip.
+# Mirrors .github/workflows/ci.yml (ruff F821, syntax, i18n, frontend tests,
+# build). Enable once with `make install-hooks`.
+#
+# Genuine emergency? Bypass with `git push --no-verify` (CI still gates the
+# merge — protected branches require the `backend` and `frontend` checks).
+echo "[pre-push] running 'make check'…"
+exec make check
