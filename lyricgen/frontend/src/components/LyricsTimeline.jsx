@@ -14,6 +14,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import {
+  clampResizeTiming,
   clampResizeTimingWithAdjacent,
   clampSelectionShiftDelta,
   shiftTimingWithAdjacent,
@@ -128,6 +129,7 @@ export default function LyricsTimeline({
   const [followEnabled, setFollowEnabled] = useState(true);
   const [followSuppressed, setFollowSuppressed] = useState(false);
   const [limitFeedback, setLimitFeedback] = useState("");
+  const [rippleEditing, setRippleEditing] = useState(false);
 
   const normalizedSegments = useMemo(() => normalizeTimelineSegments(segments), [segments]);
   const total = Math.max(Number(duration) || 0, ...normalizedSegments.map((s) => s.end), 1);
@@ -303,15 +305,18 @@ export default function LyricsTimeline({
       return;
     }
     const movingGroup = mode === "move" && selectedIds.has(segment._id) && selectedIds.size > 1;
+    const ripple = rippleEditing && !movingGroup;
     const segmentIndex = normalizedSegments.findIndex((item) => item._id === segment._id);
     const resizeNeighbour = mode === "start"
       ? normalizedSegments[segmentIndex - 1]
       : mode === "end" ? normalizedSegments[segmentIndex + 1] : null;
     const snapshotSegments = movingGroup
       ? normalizedSegments.filter((item) => selectedIds.has(item._id))
-      : mode === "move"
+      : ripple && mode === "move"
         ? normalizedSegments
-        : [segment, resizeNeighbour].filter(Boolean);
+        : ripple
+          ? [segment, resizeNeighbour].filter(Boolean)
+          : [segment];
     const snapshots = snapshotSegments
       .map((item) => ({ id: item._id, start: item.start, end: item.end }));
     if (!selectedIds.has(segment._id)) {
@@ -326,14 +331,16 @@ export default function LyricsTimeline({
       origStart: segment.start,
       origEnd: segment.end,
       movingGroup,
+      ripple,
       moved: false,
       pxPerSec,
       startedAt: performance.now(),
     };
     event.currentTarget.setPointerCapture?.(event.pointerId);
     markInteraction();
+    setLimitFeedback("");
     setPreview(movingGroup ? { changes: snapshots, mode } : { id: segment._id, start: segment.start, end: segment.end, mode });
-  }, [markInteraction, normalizedSegments, pxPerSec, selectRangeTo, selectedIds, toggleSelection]);
+  }, [markInteraction, normalizedSegments, pxPerSec, rippleEditing, selectRangeTo, selectedIds, toggleSelection]);
 
   const updateDrag = useCallback((event) => {
     const drag = dragRef.current;
@@ -369,33 +376,58 @@ export default function LyricsTimeline({
     let start = drag.origStart;
     let end = drag.origEnd;
     if (drag.mode === "start" || drag.mode === "end") {
-      const resize = clampResizeTimingWithAdjacent(
-        normalizedSegments,
-        drag.id,
-        drag.mode === "start" ? drag.origStart + delta : drag.origStart,
-        drag.mode === "end" ? drag.origEnd + delta : drag.origEnd,
-        total,
-        gapS,
-        MIN_DUR_S,
-        drag.mode,
-      );
+      const requestedStart = drag.mode === "start" ? drag.origStart + delta : drag.origStart;
+      const requestedEnd = drag.mode === "end" ? drag.origEnd + delta : drag.origEnd;
+      const resize = drag.ripple
+        ? clampResizeTimingWithAdjacent(
+          normalizedSegments, drag.id, requestedStart, requestedEnd,
+          total, gapS, MIN_DUR_S, drag.mode,
+        )
+        : (() => {
+          const bounded = clampResizeTiming(
+            normalizedSegments, drag.id, requestedStart, requestedEnd,
+            total, gapS, MIN_DUR_S, drag.mode,
+          );
+          return bounded ? {
+            changes: [{ id: drag.id, start: bounded.start, end: bounded.end }],
+            blocked: bounded.blocked,
+          } : null;
+        })();
       const ownChange = resize?.changes?.find((change) => change.id === drag.id);
       if (ownChange) ({ start, end } = ownChange);
-      setLimitFeedback(resize?.blocked ? "La línea no tiene espacio para cambiar su duración." : "");
+      const appliedBoundary = drag.mode === "start" ? start : end;
+      const requestedBoundary = drag.mode === "start" ? requestedStart : requestedEnd;
+      const limited = Math.abs(requestedBoundary - appliedBoundary) > 1e-4;
+      setLimitFeedback(resize?.blocked || limited
+        ? drag.ripple
+          ? "La cadena llegó al límite disponible."
+          : "Ese borde toca otra línea. Para no modificarla, el ajuste se detuvo."
+        : "");
       if (resize?.changes?.length > 1) {
         setPreview({ changes: resize.changes, mode: drag.mode });
         return;
       }
     } else {
-      const move = shiftTimingWithAdjacent(
-        normalizedSegments, drag.id, delta, total, gapS,
-      );
-      const ownChange = move.changes.find((change) => change.id === drag.id);
-      if (ownChange) ({ start, end } = ownChange);
-      setLimitFeedback(move.blocked ? "La línea llegó al límite disponible." : "");
-      if (move.changes.length > 1) {
-        setPreview({ changes: move.changes, mode: drag.mode });
-        return;
+      if (drag.ripple) {
+        const move = shiftTimingWithAdjacent(
+          normalizedSegments, drag.id, delta, total, gapS,
+        );
+        const ownChange = move.changes.find((change) => change.id === drag.id);
+        if (ownChange) ({ start, end } = ownChange);
+        setLimitFeedback(move.blocked ? "La cadena llegó al límite disponible." : "");
+        if (move.changes.length > 1) {
+          setPreview({ changes: move.changes, mode: drag.mode });
+          return;
+        }
+      } else {
+        const safeDelta = clampSelectionShiftDelta(
+          normalizedSegments, new Set([drag.id]), delta, total, gapS,
+        );
+        start = drag.origStart + safeDelta;
+        end = drag.origEnd + safeDelta;
+        setLimitFeedback(Math.abs(delta) > 1e-4 && Math.abs(safeDelta) < 1e-4
+          ? "No hay espacio para mover sólo esta línea. Ajustá uno de sus bordes o elegí En cadena."
+          : "");
       }
     }
     setPreview({ id: drag.id, start, end, mode: drag.mode });
@@ -449,9 +481,22 @@ export default function LyricsTimeline({
   const nudgeSelection = useCallback((delta) => {
     const snapshots = normalizedSegments.filter((segment) => selectedIds.has(segment._id));
     if (!snapshots.length) return;
+    if (rippleEditing && snapshots.length === 1) {
+      const move = shiftTimingWithAdjacent(normalizedSegments, snapshots[0]._id, delta, total, gapS);
+      if (!move.changes.length) {
+        setLimitFeedback("La cadena llegó al límite disponible.");
+        return;
+      }
+      onDragStart?.();
+      onTimingChangeBatch?.(move.changes, { operation: "move" });
+      markInteraction();
+      return;
+    }
     const safeDelta = clampSelectionShiftDelta(normalizedSegments, selectedIds, delta, total, gapS);
     if (Math.abs(safeDelta) < 1e-6) {
-      setLimitFeedback("No hay espacio para mover esta selección.");
+      setLimitFeedback(snapshots.length === 1
+        ? "No hay espacio para mover sólo esta línea. Ajustá uno de sus bordes o elegí En cadena."
+        : "No hay espacio para mover esta selección.");
       return;
     }
     onDragStart?.();
@@ -461,7 +506,7 @@ export default function LyricsTimeline({
       end: segment.end + safeDelta,
     })));
     markInteraction();
-  }, [gapS, markInteraction, normalizedSegments, onDragStart, onTimingChangeBatch, selectedIds, total]);
+  }, [gapS, markInteraction, normalizedSegments, onDragStart, onTimingChangeBatch, rippleEditing, selectedIds, total]);
 
   const scrollToPlayhead = useCallback(() => {
     const sc = scrollRef.current;
@@ -620,6 +665,26 @@ export default function LyricsTimeline({
           {saveStatus === "error" && <span className="text-[10px] text-red-300">{t("timeline.save_error", "Sin guardar")}</span>}
         </div>
         <div className="relative flex items-center gap-2" data-testid="timeline-primary-actions" data-selected-count={selectedIds.size}>
+          <div role="group" aria-label={t("timeline.edit_behavior", "Comportamiento del ajuste")} className="hidden sm:inline-flex h-9 overflow-hidden rounded-xl bg-black/15 ring-1 ring-white/[0.1]">
+            <button
+              type="button"
+              aria-pressed={!rippleEditing}
+              onClick={() => { setRippleEditing(false); setLimitFeedback(""); }}
+              className={`px-3 text-[10px] font-medium transition-colors ${!rippleEditing ? "bg-emerald-400/15 text-emerald-200" : "text-ink-tertiary hover:bg-white/[0.05] hover:text-white"}`}
+              title={t("timeline.safe_mode_hint", "Modo seguro: nunca modifica otras líneas")}
+            >
+              {t("timeline.safe_mode", "Solo esta línea")}
+            </button>
+            <button
+              type="button"
+              aria-pressed={rippleEditing}
+              onClick={() => { setRippleEditing(true); setLimitFeedback(""); }}
+              className={`border-l border-white/[0.08] px-3 text-[10px] font-medium transition-colors ${rippleEditing ? "bg-amber-400/15 text-amber-200" : "text-ink-tertiary hover:bg-white/[0.05] hover:text-white"}`}
+              title={t("timeline.ripple_mode_hint", "Desplaza también las líneas pegadas; usalo sólo para mover una sección")}
+            >
+              {t("timeline.ripple_mode", "En cadena")}
+            </button>
+          </div>
           <button type="button" onClick={fitTimeline} title={t("timeline.fit_hint", "Ver la canción completa")} className="h-9 px-3 rounded-xl text-[11px] font-medium text-white bg-white/[0.055] ring-1 ring-white/[0.1] hover:bg-white/[0.09] transition-colors">{t("timeline.fit", "Ver canción completa")}</button>
           <button
             type="button"
@@ -664,6 +729,25 @@ export default function LyricsTimeline({
         </div>
       </div>
 
+      <div className="flex border-b border-white/[0.06] sm:hidden" role="group" aria-label={t("timeline.edit_behavior_mobile", "Comportamiento del ajuste móvil")}>
+        <button type="button" aria-pressed={!rippleEditing} onClick={() => { setRippleEditing(false); setLimitFeedback(""); }} className={`flex-1 px-3 py-2 text-[10px] font-medium ${!rippleEditing ? "bg-emerald-400/12 text-emerald-200" : "text-ink-tertiary"}`}>{t("timeline.safe_mode", "Solo esta línea")}</button>
+        <button type="button" aria-pressed={rippleEditing} onClick={() => { setRippleEditing(true); setLimitFeedback(""); }} className={`flex-1 border-l border-white/[0.06] px-3 py-2 text-[10px] font-medium ${rippleEditing ? "bg-amber-400/12 text-amber-200" : "text-ink-tertiary"}`}>{t("timeline.ripple_mode", "En cadena")}</button>
+      </div>
+
+      {rippleEditing && (
+        <div data-testid="timeline-ripple-warning" className="flex items-center gap-2 border-b border-amber-300/15 bg-amber-300/[0.07] px-4 sm:px-5 py-2 text-[10px] text-amber-100">
+          <span aria-hidden="true">⚠</span>
+          <span><strong>{t("timeline.ripple_active", "En cadena activo")}:</strong> {t("timeline.ripple_warning", "puede modificar varias líneas pegadas. La vista previa muestra cuáles antes de soltar.")}</span>
+        </div>
+      )}
+
+      {limitFeedback && (
+        <div data-testid="timeline-limit-feedback" role="status" className="flex items-center gap-2 border-b border-amber-300/15 bg-amber-300/[0.07] px-4 sm:px-5 py-2 text-[10px] text-amber-100">
+          <span aria-hidden="true">↔</span>
+          <span>{limitFeedback}</span>
+        </div>
+      )}
+
       {selectedIds.size > 0 ? (
         <div data-testid="timeline-selection-help" aria-live="polite" className="flex items-center gap-2.5 border-b border-brand/20 bg-gradient-to-r from-brand/20 via-brand/10 to-transparent px-4 sm:px-5 py-2.5 flex-wrap">
           <span className="inline-flex h-7 items-center rounded-lg bg-brand px-2.5 text-[11px] font-semibold text-white shadow-lg shadow-brand/20">{selectedIds.size} {selectedIds.size === 1 ? "línea" : "líneas"}</span>
@@ -697,8 +781,6 @@ export default function LyricsTimeline({
           <span>{t("timeline.paint_hint", "Papelera: elimina una línea · Arrastrá el fondo: seleccioná varias para moverlas o eliminarlas")}</span>
         </div>
       )}
-      <p aria-live="polite" className="sr-only">{limitFeedback}</p>
-
       <div
         ref={scrollRef}
         data-testid="timeline-scroll"
