@@ -52,6 +52,7 @@ async function revision(request, token) {
 }
 
 const firstLyricsInput = (page) => page.getByRole("textbox", { name: "Letra de la línea 1" });
+const secondLyricsInput = (page) => page.getByRole("textbox", { name: "Letra de la línea 2" });
 
 test.describe("Editor 2.0 real collaboration", () => {
   // This scenario intentionally mutates one seeded document. Retrying against
@@ -70,7 +71,7 @@ test.describe("Editor 2.0 real collaboration", () => {
 
     const b = await openEditor(browser, tokenB);
     await expect(firstLyricsInput(b.page)).toHaveValue("Edición de A");
-    await firstLyricsInput(b.page).fill("Edición de B");
+    await secondLyricsInput(b.page).fill("Edición de B");
     await expect.poll(async () => (await revision(request, tokenB)).revision).toBeGreaterThan(latestRevision);
     latestRevision = (await revision(request, tokenB)).revision;
 
@@ -78,23 +79,26 @@ test.describe("Editor 2.0 real collaboration", () => {
     await expect.poll(async () => (await revision(request, tokenA)).revision).toBeGreaterThan(latestRevision);
     latestRevision = (await revision(request, tokenA)).revision;
     await expect(firstLyricsInput(a.page)).toHaveValue("A queda local");
+    await expect(secondLyricsInput(a.page)).toHaveValue("Edición de B");
     await expect(a.page.getByRole("dialog", { name: /Hay una versión más nueva/ })).toHaveCount(0);
 
     await a.context.setOffline(true);
     await firstLyricsInput(a.page).fill("A segunda versión local");
-    await firstLyricsInput(b.page).fill("B vuelve a guardar");
+    await secondLyricsInput(b.page).fill("B vuelve a guardar");
     await expect.poll(async () => (await revision(request, tokenB)).revision).toBeGreaterThan(latestRevision);
     latestRevision = (await revision(request, tokenB)).revision;
     await a.context.setOffline(false);
     await expect.poll(async () => (await revision(request, tokenA)).revision).toBeGreaterThan(latestRevision);
     latestRevision = (await revision(request, tokenA)).revision;
     await expect(firstLyricsInput(a.page)).toHaveValue("A segunda versión local");
+    await expect(secondLyricsInput(a.page)).toHaveValue("B vuelve a guardar");
     await expect(a.page.getByRole("dialog", { name: /Hay una versión más nueva/ })).toHaveCount(0);
 
     await a.page.reload();
     await expect(a.page.getByRole("button", { name: /4 Lyrics/ })).toBeVisible();
     await a.page.getByRole("button", { name: /4 Lyrics/ }).click();
     await expect(firstLyricsInput(a.page)).toHaveValue("A segunda versión local");
+    await expect(secondLyricsInput(a.page)).toHaveValue("B vuelve a guardar");
     await a.page.getByRole("tab", { name: "Ajustar tiempos" }).click();
     await a.page.getByTestId("editor-overflow-btn").click();
     await a.page.getByRole("menuitem", { name: /Historial de versiones/ }).click();
