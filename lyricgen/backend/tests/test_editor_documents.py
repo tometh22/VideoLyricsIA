@@ -448,6 +448,42 @@ def test_approval_requires_the_current_exact_snapshot():
         db.close()
 
 
+def test_approval_allows_renderer_metadata_revision_when_lyrics_are_unchanged():
+    first, _, job_id = _users_and_job("editor_approval_metadata")
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        document = db.query(EditorDocument).filter(EditorDocument.job_id == job_id).one()
+        document, version, _ = save_document(
+            db, job, document, first.id, 0,
+            [
+                {"start": 0, "end": 1, "text": "one", "words": [{"start": 0}]},
+                {"start": 1, "end": 2, "text": "two"},
+            ], "manual",
+        )
+        db.commit()
+
+        document = db.query(EditorDocument).filter(EditorDocument.job_id == job_id).one()
+        save_document(
+            db, job, document, first.id, 1,
+            [
+                {"start": 0, "end": 1, "text": "one", "words": [{"start": 0.2}], "review": True},
+                {"start": 1, "end": 2, "text": "two"},
+            ], "migration",
+        )
+        db.commit()
+
+        approved_document, approved_version = approve_document(
+            db, job, first.id, editor_revision=1, editor_version_id=version.id,
+        )
+        db.commit()
+        assert approved_document.revision == 2
+        assert approved_version.is_approved is True
+        assert approved_version.segments[0]["text"] == "one"
+    finally:
+        db.close()
+
+
 def test_retention_keeps_fifty_drafts_and_all_approved_snapshots():
     first, _, job_id = _users_and_job("editor_retention")
     db = SessionLocal()

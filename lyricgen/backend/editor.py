@@ -73,6 +73,47 @@ def normalize_segments(value: Any) -> list[dict]:
     return normalized
 
 
+def segments_equivalent(left: Any, right: Any) -> bool:
+    """Compare operator-owned lyric content across editor snapshots.
+
+    Background/typography renders can refresh renderer metadata (word timing,
+    review flags, or local row ids) without changing what the operator edited.
+    Those changes must not turn an otherwise safe approval into a revision
+    conflict. Text, timing, locks and layout remain part of the comparison.
+    """
+    if not isinstance(left, list) or not isinstance(right, list) or len(left) != len(right):
+        return False
+
+    ignored = {"_id", "id", "segment_id", "words", "review"}
+
+    def comparable(segment: Any) -> dict:
+        if not isinstance(segment, dict):
+            return {"value": segment}
+        return {key: value for key, value in segment.items() if key not in ignored}
+
+    def sort_key(segment: Any) -> tuple[float, float, str]:
+        if not isinstance(segment, dict):
+            return (0.0, 0.0, "")
+        return (
+            float(segment.get("start") or 0),
+            float(segment.get("end") or 0),
+            str(segment.get("text") or ""),
+        )
+
+    ordered_left = sorted(left, key=sort_key)
+    ordered_right = sorted(right, key=sort_key)
+    for left_segment, right_segment in zip(ordered_left, ordered_right):
+        if abs(float(left_segment.get("start") or 0) - float(right_segment.get("start") or 0)) > 1e-3:
+            return False
+        if abs(float(left_segment.get("end") or 0) - float(right_segment.get("end") or 0)) > 1e-3:
+            return False
+        if json.dumps(comparable(left_segment), sort_keys=True, ensure_ascii=False) != json.dumps(
+            comparable(right_segment), sort_keys=True, ensure_ascii=False,
+        ):
+            return False
+    return True
+
+
 def get_job_for_tenant(db: Session, job_id: str, tenant_id: str) -> Job | None:
     return (
         db.query(Job)
@@ -498,14 +539,22 @@ def approve_document(
         db, job.job_id, job.tenant_id, job.segments_json or [],
     )
     selected = None
+    selected_is_equivalent_current = False
     if editor_version_id:
         selected = get_version(db, document, editor_version_id)
         if not selected:
             raise LookupError("editor_version_not_found")
-        if selected.revision != document.revision or selected.segments != document.current_segments:
+        if not segments_equivalent(selected.segments, document.current_segments):
             raise RuntimeError("editor_revision_conflict")
+        # A background/typography operation may have advanced the revision
+        # while preserving the operator-owned lyrics. Approve the current
+        # equivalent snapshot as a fresh version instead of rejecting it.
+        if selected.revision != document.revision:
+            selected_is_equivalent_current = True
+            selected = None
     if editor_revision is not None and editor_revision != document.revision:
-        raise RuntimeError("editor_revision_conflict")
+        if not selected_is_equivalent_current:
+            raise RuntimeError("editor_revision_conflict")
     if editor_version_id is None and editor_revision is None:
         raise ValueError("editor approval selector required")
     version = selected or _ensure_version(

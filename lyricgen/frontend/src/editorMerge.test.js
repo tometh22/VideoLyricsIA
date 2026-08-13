@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mergeThreeWay } from "./editorMerge";
+import { mergeThreeWay, segmentsEquivalent } from "./editorMerge";
 
 const base = [
   { _id: 1, start: 0, end: 1, text: "línea uno" },
@@ -7,6 +7,13 @@ const base = [
 ];
 
 describe("mergeThreeWay", () => {
+  it("treats renderer metadata and local ids as non-conflicting", () => {
+    expect(segmentsEquivalent(
+      [{ _id: 1, start: 0, end: 1, text: "línea", words: [{ start: 0 }] }],
+      [{ _id: 99, start: 0, end: 1, text: "línea", words: [{ start: 0.2 }], review: true }],
+    )).toBe(true);
+  });
+
   it("merges independent line edits without opening a conflict", () => {
     const result = mergeThreeWay(
       base,
