@@ -84,6 +84,7 @@ export function clampSelectionShiftDelta(
 
 export function clampResizeTiming(
   allSegments, id, requestedStart, requestedEnd, duration, gap = 0.05, minDuration = 0.3,
+  edge = null,
 ) {
   const index = allSegments.findIndex((segment) => segment?._id === id);
   if (index < 0) return null;
@@ -95,10 +96,34 @@ export function clampResizeTiming(
   const maxEnd = next
     ? Number(next.start) - safeGap
     : (Number(duration) > 0 ? Number(duration) : Infinity);
+
+  const originalStart = Number(segment.start);
+  const originalEnd = Number(segment.end);
+  const blocked = () => ({ start: originalStart, end: originalEnd, blocked: true });
+
+  // A resize handle owns exactly one boundary. Keeping the opposite boundary
+  // anchored prevents the block from jumping when the operator crosses the
+  // minimum-duration limit.
+  if (edge === "start") {
+    const maxStart = originalEnd - minDuration;
+    if (!Number.isFinite(originalEnd) || !Number.isFinite(minStart) || maxStart < minStart) return blocked();
+    const start = Math.max(minStart, Math.min(Number(requestedStart), maxStart));
+    if (!Number.isFinite(start)) return blocked();
+    return { start, end: originalEnd, blocked: false };
+  }
+  if (edge === "end") {
+    const minEnd = originalStart + minDuration;
+    if (!Number.isFinite(originalStart) || Number.isNaN(maxEnd) || maxEnd < minEnd) return blocked();
+    const end = Math.min(maxEnd, Math.max(Number(requestedEnd), minEnd));
+    if (!Number.isFinite(end)) return blocked();
+    return { start: originalStart, end, blocked: false };
+  }
+
+  // Backward-compatible two-sided clamp for non-interactive callers.
   const start = Math.max(minStart, Math.min(Number(requestedStart), Number(requestedEnd) - minDuration));
   const end = Math.min(maxEnd, Math.max(Number(requestedEnd), start + minDuration));
   if (!Number.isFinite(start) || !Number.isFinite(end) || end - start < minDuration - 1e-6) {
-    return { start: Number(segment.start), end: Number(segment.end), blocked: true };
+    return blocked();
   }
   return { start, end, blocked: false };
 }

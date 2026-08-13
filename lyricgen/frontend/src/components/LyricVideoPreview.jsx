@@ -65,6 +65,7 @@ const CONTRAST_STYLES = {
 export default function LyricVideoPreview({
   segments,           // [{_id, start, end, text, pos?, scale?, rot?}]
   currentTime,
+  isPlaying = false,
   backgroundUrl = null,   // signed video URL (modal) | null (wizard → gradient)
   backgroundStyle = "default",
   font,                   // css font-family for parity with render (optional)
@@ -85,16 +86,28 @@ export default function LyricVideoPreview({
   const dragRef = useRef(null);  // {mode, id, ...origin}
   const [live, setLive] = useState(null); // {id, pos, scale, rot} during drag
 
-  // Keep the background frame in step with the audio scrub. The bg video is
-  // a short seamless loop, so map the audio time into it via modulo. Guarded
-  // for jsdom (no video impl) and NaN duration before metadata loads.
+  // Keep the background loop close to the audio clock without seeking it on
+  // every playback tick. Continuous currentTime assignments force a decode
+  // seek and were competing with the timeline/playhead on the main thread.
   useEffect(() => {
     const v = bgVideoRef.current;
     if (!v || !backgroundUrl) return;
     const dur = v.duration;
     if (!dur || !isFinite(dur)) return;
-    try { v.currentTime = currentTime % dur; } catch { /* not seekable yet */ }
-  }, [currentTime, backgroundUrl]);
+    const desired = currentTime % dur;
+    const rawDrift = Math.abs(v.currentTime - desired);
+    const circularDrift = Math.min(rawDrift, Math.max(0, dur - rawDrift));
+    if (!isPlaying || circularDrift > 0.25) {
+      try { v.currentTime = desired; } catch { /* not seekable yet */ }
+    }
+  }, [currentTime, backgroundUrl, isPlaying]);
+
+  useEffect(() => {
+    const v = bgVideoRef.current;
+    if (!v || !backgroundUrl) return;
+    if (isPlaying && v.paused) v.play?.().catch?.(() => {});
+    else if (!isPlaying && !v.paused) v.pause?.();
+  }, [backgroundUrl, isPlaying]);
 
   // The lines on screen = ALL segments whose [start,end] contain currentTime,
   // PLUS a sticky-last-line fallback during short gaps so the placeholder
@@ -264,7 +277,13 @@ export default function LyricVideoPreview({
         <video
           ref={(el) => { bgVideoRef.current = el; if (videoRef) videoRef.current = el; }}
           src={backgroundUrl}
-          muted playsInline preload="auto"
+          muted loop playsInline preload="auto"
+          onLoadedMetadata={(event) => {
+            const v = event.currentTarget;
+            if (!v.duration || !isFinite(v.duration)) return;
+            try { v.currentTime = currentTime % v.duration; } catch { /* not seekable yet */ }
+            if (isPlaying && v.paused) v.play?.().catch?.(() => {});
+          }}
           className="absolute inset-0 w-full h-full object-cover"
         />
       )}
