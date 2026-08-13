@@ -17536,12 +17536,19 @@ def run_edit_pipeline(
             # los cambios de la canción. Si la estructura cambió o falla, caemos
             # al timeline cacheado estático.
             if edit_type == "lyrics" and _is_scene_job:
-                _sc_audio = scene_plan.get("audio_duration")
+                # Audit 2026-08-13 (F2): re-measure instead of trusting the
+                # value persisted at original-render time. _audio_duration is
+                # now a cross-checked real measurement (~80ms), not a bare
+                # header read — so "re-derive" is both correct AND still
+                # cheap. A stale/wrong scene_plan["audio_duration"] (e.g.
+                # persisted before the corrupted-header fix, or simply from
+                # a job whose source file changed) used to flow straight
+                # into stitch_timeline unexamined. Only fall back to the
+                # persisted value if a fresh measurement is unavailable
+                # (e.g. mp3_path missing).
+                _sc_audio = _audio_duration(mp3_path) or _ffprobe_duration(mp3_path)
                 if not _sc_audio:
-                    try:
-                        _sc_audio = _audio_duration(mp3_path)
-                    except Exception:
-                        _sc_audio = _ffprobe_duration(mp3_path)
+                    _sc_audio = scene_plan.get("audio_duration")
                 try:
                     _re_tl, scene_plan = _restitch_scenes_for_edit(
                         scene_plan, segments, _sc_audio, job_dir, artist=artist,
@@ -17602,7 +17609,18 @@ def run_edit_pipeline(
                     # timeline: lo loopeamos (feo pero nunca negro) y avisamos.
                     try:
                         _bg_dur = _ffprobe_duration(bg_image_path)
-                        _aud_dur = scene_plan.get("audio_duration") or _audio_duration(mp3_path)
+                        # Audit 2026-08-13 (F2): this guard exists specifically
+                        # to catch "cached bg is shorter than the real audio"
+                        # — it was comparing _bg_dur (a real ffprobe
+                        # measurement) against scene_plan["audio_duration"]
+                        # (metadata persisted when THAT bg was generated).
+                        # If the persisted value was itself wrong, the guard
+                        # validated the background against the same bad
+                        # number that produced it — blind by construction in
+                        # exactly the case it exists to catch. Measure fresh
+                        # first; only fall back to the persisted value if a
+                        # fresh read is unavailable.
+                        _aud_dur = _audio_duration(mp3_path) or scene_plan.get("audio_duration")
                         if _bg_dur and _aud_dur and (_aud_dur - _bg_dur) > 3.5:
                             logger.warning(
                                 "[SCENES] cached bg de job multi-escena NO es un "
@@ -17672,12 +17690,12 @@ def run_edit_pipeline(
                 raise RuntimeError("edit_type='scene' requiere scene_key.")
             update_job(job_id, status="editing", current_step="scenes", progress=22)
             lyrics_text = " ".join(seg.get("text", "") for seg in segments)
-            _scene_audio_dur = scene_plan.get("audio_duration")
+            # Audit 2026-08-13 (F2): re-measure instead of trusting the
+            # persisted value — see the identical fix on the lyrics-edit
+            # path above for the full rationale.
+            _scene_audio_dur = _audio_duration(mp3_path) or _ffprobe_duration(mp3_path)
             if not _scene_audio_dur:
-                try:
-                    _scene_audio_dur = _audio_duration(mp3_path)
-                except Exception:
-                    _scene_audio_dur = _ffprobe_duration(mp3_path)
+                _scene_audio_dur = scene_plan.get("audio_duration")
             try:
                 bg_image_path, scene_plan = _regenerate_scene_background(
                     scene_plan, scene_key, job_dir,
@@ -17913,12 +17931,12 @@ def run_edit_pipeline(
             or not _scene_timeline_from_current_clips
         ):
             try:
-                _dense_audio_duration = scene_plan.get("audio_duration")
+                # Audit 2026-08-13 (F2): re-measure instead of trusting the
+                # persisted value — see the identical fix on the lyrics-edit
+                # path above for the full rationale.
+                _dense_audio_duration = _audio_duration(mp3_path) or _ffprobe_duration(mp3_path)
                 if not _dense_audio_duration:
-                    try:
-                        _dense_audio_duration = _audio_duration(mp3_path)
-                    except Exception:
-                        _dense_audio_duration = _ffprobe_duration(mp3_path)
+                    _dense_audio_duration = scene_plan.get("audio_duration")
                 bg_image_path = _densely_revalidate_scene_plan_for_edit(
                     scene_plan,
                     job_dir,

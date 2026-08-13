@@ -6831,9 +6831,38 @@ async def _run_transcription_for_job(
                                         (lrc or {}).get("duration")
                                         if isinstance(lrc, dict) else None
                                     )
+                                    # Audit 2026-08-13 (F4): durations agreeing
+                                    # is metadata-vs-metadata, not proof the
+                                    # synced timeline actually lines up with
+                                    # what's sung — synced_offset_decision used
+                                    # to trust it blindly and suppress the
+                                    # amber review flag on that basis alone.
+                                    # Spend one Whisper call (~3s) to confirm
+                                    # real audio at the claimed zero-offset
+                                    # position matches the first synced line,
+                                    # but only when durations actually agree
+                                    # (3.0s mirrors synced_offset_decision's
+                                    # own dur_tol default — the Whisper call is
+                                    # only worth paying for in that regime).
+                                    _durations_agree = (
+                                        _audio_dur_for_lrc is not None
+                                        and _lrc_dur_val is not None
+                                        and abs(_audio_dur_for_lrc - _lrc_dur_val) <= 3.0
+                                    )
+                                    _verify_score = (
+                                        await asyncio.to_thread(
+                                            _verify_lrclib_alignment, tmp_path,
+                                            _pairs[0][1], _pairs[0][0],
+                                        )
+                                        if _durations_agree else None
+                                    )
                                     _offset, _trust = _lca.synced_offset_decision(
                                         _audio_dur_for_lrc, _lrc_dur_val,
                                         _first_wx_t, _pairs[0][0],
+                                        verify_fn=(
+                                            (lambda score=_verify_score: score)
+                                            if _durations_agree else None
+                                        ),
                                     )
                                     # Only ship a synced timeline when we have a
                                     # real basis: durations match (trust) OR
@@ -7512,18 +7541,47 @@ async def _run_transcription_for_job(
                 _trim_floor = float(os.environ.get("INTRO_TRIM_FLOOR_SEC", "30"))
                 if (lrc_dur and user_dur
                         and _trim_floor < (user_dur - lrc_dur) <= 120.0):
-                    intro_offset = float(user_dur - lrc_dur)
-                    candidate = os.path.join(tmp_dir, "body_only.mp3")
-                    sliced = await asyncio.to_thread(
-                        _slice_audio_window, tmp_path, candidate,
-                        intro_offset, user_dur - intro_offset,
+                    _candidate_offset = float(user_dur - lrc_dur)
+                    # Audit 2026-08-13 (F3): the trim decision above is pure
+                    # metadata arithmetic (durations subtracted) — nothing
+                    # confirms the user's audio actually HAS an intro at
+                    # that point, vs. e.g. a longer outro/extended mix
+                    # throwing off the same subtraction. A wrong trim here
+                    # silently cuts real sung lyrics out of what Whisper
+                    # ever sees. Spend one cheap Whisper call (~3s) to
+                    # confirm the audio at the claimed boundary actually
+                    # matches lrclib's opening line before committing to
+                    # the slice; skip the trim (transcribe the full audio)
+                    # rather than risk shipping lyrics missing their start.
+                    _expected_opening = (plain.strip().splitlines() or [""])[0][:200]
+                    _alignment_score = (
+                        await asyncio.to_thread(
+                            _verify_lrclib_alignment, tmp_path,
+                            _expected_opening, _candidate_offset,
+                        )
+                        if _expected_opening else None
                     )
-                    if sliced:
-                        transcribe_path = candidate
-                        trimmed_path = candidate
-                        logger.info("[LYRICS] trimmed %.1fs intro before Whisper (user=%.1fs, lrclib=%.1fs)", intro_offset, user_dur, lrc_dur)
+                    if _alignment_score is None or _alignment_score < 0.4:
+                        logger.warning(
+                            "[LYRICS] intro-trim rejected: audio at %.1fs doesn't "
+                            "match lrclib's opening line (score=%s) — skipping "
+                            "trim, transcribing full audio instead (user=%.1fs, "
+                            "lrclib=%.1fs)",
+                            _candidate_offset, _alignment_score, user_dur, lrc_dur,
+                        )
                     else:
-                        intro_offset = 0.0  # slice failed — fall through
+                        intro_offset = _candidate_offset
+                        candidate = os.path.join(tmp_dir, "body_only.mp3")
+                        sliced = await asyncio.to_thread(
+                            _slice_audio_window, tmp_path, candidate,
+                            intro_offset, user_dur - intro_offset,
+                        )
+                        if sliced:
+                            transcribe_path = candidate
+                            trimmed_path = candidate
+                            logger.info("[LYRICS] trimmed %.1fs intro before Whisper (user=%.1fs, lrclib=%.1fs, alignment_score=%.2f)", intro_offset, user_dur, lrc_dur, _alignment_score)
+                        else:
+                            intro_offset = 0.0  # slice failed — fall through
 
                 # Hybrid intro Whisper. The intro region we sliced off may
                 # contain a spoken dialogue / narration that previews the
