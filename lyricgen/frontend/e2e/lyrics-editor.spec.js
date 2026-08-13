@@ -71,24 +71,28 @@ test.describe("lyrics editor browser contract", () => {
 
     await expect(page.getByTestId("timeline-selection-help")).toContainText("Arrastrá el fondo");
 
-    const scroll = await page.getByTestId("timeline-scroll").boundingBox();
-    const lane = await page.getByTestId("timeline-lane").boundingBox();
-    expect(scroll).not.toBeNull();
-    expect(lane).not.toBeNull();
-
+    const rows = page.getByTestId("timeline-label-row");
+    const firstRow = await rows.first().boundingBox();
+    const lastRow = await rows.last().boundingBox();
+    expect(firstRow).not.toBeNull();
+    expect(lastRow).not.toBeNull();
     await drag(
       page,
-      { x: scroll.x + scroll.width - 12, y: lane.y + lane.height - 10 },
-      { x: scroll.x + 12, y: lane.y + 10 },
+      { x: lastRow.x + lastRow.width / 2, y: lastRow.y + lastRow.height / 2 },
+      { x: firstRow.x + firstRow.width / 2, y: firstRow.y + firstRow.height / 2 },
     );
     await selectionAtLeast(page, 2);
 
     await page.getByRole("button", { name: "Limpiar selección" }).click();
     await page.waitForTimeout(100);
+    const firstRowAfterClear = await rows.first().boundingBox();
+    const lastRowAfterClear = await rows.last().boundingBox();
+    expect(firstRowAfterClear).not.toBeNull();
+    expect(lastRowAfterClear).not.toBeNull();
     await drag(
       page,
-      { x: scroll.x + 12, y: lane.y + 10 },
-      { x: scroll.x + scroll.width - 12, y: lane.y + lane.height - 10 },
+      { x: firstRowAfterClear.x + firstRowAfterClear.width / 2, y: firstRowAfterClear.y + firstRowAfterClear.height / 2 },
+      { x: lastRowAfterClear.x + lastRowAfterClear.width / 2, y: lastRowAfterClear.y + lastRowAfterClear.height / 2 },
     );
     await selectionAtLeast(page, 2);
   });
@@ -237,7 +241,7 @@ test.describe("lyrics editor browser contract", () => {
     await expect(page.getByTestId("timeline-label-row").last()).toBeVisible();
   });
 
-  test("resizes a packed line from a generous edge and moves the shared boundary", async ({ page }) => {
+  test("moves a packed shared boundary only after chain mode is enabled", async ({ page }) => {
     const harness = await installEditorHarness(page, {
       segments: [
         { _id: "wide", start: 0.4, end: 2.4, text: "Línea para estirar" },
@@ -246,6 +250,8 @@ test.describe("lyrics editor browser contract", () => {
     });
     await harness.open();
     await openAdvanced(page);
+    await page.getByRole("button", { name: "En cadena", exact: true }).click();
+    await expect(page.getByTestId("timeline-ripple-warning")).toBeVisible();
 
     const block = page.getByTestId("timeline-segment").first();
     const edge = block.getByTestId("timeline-edge-end");

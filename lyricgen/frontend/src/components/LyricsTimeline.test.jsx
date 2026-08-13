@@ -105,7 +105,7 @@ describe("LyricsTimeline", () => {
     expect(newEnd).toBeGreaterThan(11);
   });
 
-  it("moves a packed middle line by rippling the following line", () => {
+  it("does not modify neighbouring lines when a packed line is dragged in safe mode", () => {
     const props = setup({
       segments: [
         { _id: "a", start: 0, end: 1, text: "primera" },
@@ -114,6 +114,29 @@ describe("LyricsTimeline", () => {
       ],
       duration: 10,
     });
+    const block = screen.getAllByTestId("timeline-segment")[1];
+    const body = block.querySelector('[data-testid="timeline-segment-body"]');
+    fireEvent.pointerDown(body, { clientX: 100, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(body, { clientX: 124, pointerId: 1 });
+    fireEvent.pointerUp(body, { clientX: 124, pointerId: 1 });
+
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+    expect(props.onTimingChangeBatch).not.toHaveBeenCalled();
+    expect(screen.getByTestId("timeline-limit-feedback")).toHaveTextContent("No hay espacio para mover sólo esta línea");
+  });
+
+  it("moves packed neighbours only after the operator explicitly enables chain mode", () => {
+    const props = setup({
+      segments: [
+        { _id: "a", start: 0, end: 1, text: "primera" },
+        { _id: "b", start: 1.05, end: 2, text: "segunda" },
+        { _id: "c", start: 2.05, end: 3, text: "tercera" },
+      ],
+      duration: 10,
+    });
+    fireEvent.click(screen.getAllByRole("button", { name: "En cadena" })[0]);
+    expect(screen.getByTestId("timeline-ripple-warning")).toHaveTextContent("puede modificar varias líneas");
+
     const block = screen.getAllByTestId("timeline-segment")[1];
     const body = block.querySelector('[data-testid="timeline-segment-body"]');
     fireEvent.pointerDown(body, { clientX: 100, pointerId: 1, button: 0 });
@@ -292,7 +315,7 @@ describe("LyricsTimeline", () => {
     expect(end).toBeCloseTo(11.1, 4);
   });
 
-  it("extends a packed line by moving the shared boundary with its neighbour", () => {
+  it("changes a packed neighbour only after chain mode is explicitly enabled", () => {
     const props = setup({
       segments: [
         { _id: "a", start: 0, end: 2, text: "línea actual" },
@@ -301,9 +324,18 @@ describe("LyricsTimeline", () => {
     });
     const block = screen.getAllByTestId("timeline-segment")[0];
     const edge = block.querySelector('[data-testid="timeline-edge-end"]');
+
     fireEvent.pointerDown(edge, { clientX: 100, pointerId: 1, button: 0 });
     fireEvent.pointerMove(edge, { clientX: 124, pointerId: 1 });
     fireEvent.pointerUp(edge, { clientX: 124, pointerId: 1 });
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+    expect(props.onTimingChangeBatch).not.toHaveBeenCalled();
+    expect(screen.getByTestId("timeline-limit-feedback")).toHaveTextContent("Para no modificarla, el ajuste se detuvo");
+
+    fireEvent.click(screen.getAllByRole("button", { name: "En cadena" })[0]);
+    fireEvent.pointerDown(edge, { clientX: 100, pointerId: 2, button: 0 });
+    fireEvent.pointerMove(edge, { clientX: 124, pointerId: 2 });
+    fireEvent.pointerUp(edge, { clientX: 124, pointerId: 2 });
 
     expect(props.onTimingChange).not.toHaveBeenCalled();
     expect(props.onTimingChangeBatch).toHaveBeenCalledWith([
