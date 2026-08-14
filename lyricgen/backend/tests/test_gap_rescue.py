@@ -205,29 +205,29 @@ def test_live_rescata_estribillo_espaciado_si_el_stem_y_referencia_coinciden(
         audio, tmp_path, monkeypatch):
     stem = tmp_path / "stem.wav"
     stem.write_bytes(b"RIFF" + b"\0" * 128)
+    starts = [67.2, 73.9, 79.9, 85.9, 91.9, 97.9, 103.9, 109.9]
     _con_vad(monkeypatch, [
-        (60.0, 64.5), (66.8, 68.8), (73.5, 75.0), (78.2, 80.2),
+        (60.0, 64.5), *((start - 0.3, start + 1.5) for start in starts),
     ])
     monkeypatch.setattr(
         gr, "_transcribe_window",
         lambda *a, **k: [
-            {"word": "Real", "start": 67.2, "end": 68.6},
-            {"word": "Real", "start": 73.9, "end": 74.7},
-            {"word": "Real", "start": 78.5, "end": 79.9},
+            {"word": "Real", "start": start, "end": start + 1.0}
+            for start in starts
         ],
     )
     segs = [
         _seg(13, 17), _seg(25, 31), _seg(60.8, 64.1, "Real"),
     ]
     out, stats = gr.rescue(
-        segs, audio, stem_path=str(stem), audio_duration=84.0,
+        segs, audio, stem_path=str(stem), audio_duration=116.0,
         language="es", include_leading=True,
         reference_text="Real wow wow\nReal wow wow\nReal wow wow",
     )
     rescued = [s for s in out if s.get("gap_rescued")]
-    assert stats["rescued_lines"] == 3
-    assert [s["text"] for s in rescued] == ["Real", "Real", "Real"]
-    assert [round(s["start"], 1) for s in rescued] == [67.2, 73.9, 78.5]
+    assert stats["rescued_lines"] == 8
+    assert [s["text"] for s in rescued] == ["Real"] * 8
+    assert [round(s["start"], 1) for s in rescued] == starts
 
 
 def test_sparse_singletons_without_reference_are_rejected(

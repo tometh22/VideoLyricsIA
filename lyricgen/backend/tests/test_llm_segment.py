@@ -123,6 +123,30 @@ def test_self_declines_on_reordered_overlapping_or_gapped_ranges(
     assert out is SEGS
 
 
+def test_self_declines_when_mapped_line_times_are_collapsed(
+        tiny_audio, monkeypatch):
+    monkeypatch.setenv("LLM_SEGMENT_ENABLED", "1")
+    collapsed_words = [dict(w) for w in WORDS]
+    # The semantic word order is intact, but a provider collapsed the second
+    # phrase back onto the first phrase's timestamp window.
+    for index, word in enumerate(collapsed_words[4:]):
+        word["start"] = 1.0 + index * 0.1
+        word["end"] = word["start"] + 0.1
+    collapsed = [{
+        "start": 1.0, "end": 2.0,
+        "text": "Tengo una mala noticia No fue de casualidad",
+        "words": collapsed_words,
+    }]
+    _mock_gemini(
+        monkeypatch,
+        "[0-3] Tengo una mala noticia\n[4-7] No fue de casualidad",
+    )
+
+    assert pipeline._llm_segment_words(
+        collapsed, audio_path=tiny_audio,
+    ) is collapsed
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # _recording_diverges — the gate that decides whether LLM line-segmentation
 # may PREEMPT the canonical-recovery cascade (forced_align) after reconcile

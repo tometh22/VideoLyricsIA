@@ -394,7 +394,13 @@ def rescue(segments: list[dict], audio_path: str, *,
                 stats["skipped"].append((round(ini, 1), "sin_canto"))
                 continue
             texto_total = " ".join(str(w.get("word", "")) for w in words)
-            if _texto_sospechoso(texto_total):
+            # The generic hallucination filter correctly rejects a repeated
+            # single-word loop in prose.  A sparse live refrain has already
+            # passed three stronger, independent guards (reference tokens,
+            # at least three timestamped ASR hits, and per-line vocal VAD),
+            # so rejecting it here would recreate the exact deaf outro this
+            # branch exists to recover.
+            if _texto_sospechoso(texto_total) and not sparse_live_refrain:
                 stats["skipped"].append((round(ini, 1), "alucinacion"))
                 continue
             ultima_txt = None

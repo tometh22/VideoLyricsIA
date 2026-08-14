@@ -5007,7 +5007,10 @@ def _looks_live(*texts) -> bool:
     Señal barata para armar la auditoría de sufijo. El catálogo etiqueta los
     vivos en el título ('Live In Buenos Aires 2001'); para archivos sin
     etiquetar existe el toggle del operador (body.live)."""
-    return any(t and _LIVE_MARKER_RE.search(str(t)) for t in texts)
+    return any(
+        t and _LIVE_MARKER_RE.search(re.sub(r"[_-]+", " ", str(t)))
+        for t in texts
+    )
 
 
 def _resolve_postprocess_language(requested_language, result, *, job_id: str):
@@ -5406,6 +5409,15 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
     segs = result.get("segments") or []
     if len(segs) < 3:
         return result
+    # Audio-first live results have already bypassed catalogue reconciliation.
+    # Their suffix cannot contain a studio scaffold to replace, and `wx_raw`
+    # is the same acoustic stream (possibly before polishing), not independent
+    # evidence. Auditing then swapping that suffix only duplicates collapsed
+    # timestamps. Keep ordinary ad-lib/tail filtering available, but disable
+    # this catalogue-repair mechanism for authoritative live audio.
+    _catalogue_suffix_repair = bool(
+        live_hint and not result.get("live_audio_truth")
+    )
     _stem = None
     try:
         import adlib_consensus as _ac
@@ -5418,7 +5430,7 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
         # live o toggle del operador): medido contra el gold (06/07), en
         # canciones normales los finales quietos/en capas dan falsos
         # positivos. Y MARCA (review), no borra — ver filter_and_collapse.
-        _audit_on = live_hint and os.environ.get(
+        _audit_on = _catalogue_suffix_repair and os.environ.get(
             "ADLIB_SUFFIX_AUDIT_ENABLED", "1") \
             .strip().lower() in ("1", "true", "yes", "on")
         # Barato primero: sin ad-libs y sin ningún chequeo de final, ni
@@ -5474,7 +5486,7 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
         # la letra de estudio no puede representar el final de un vivo
         # (call-response, presentaciones de la banda). Las líneas
         # insertadas conservan review=True.
-        if (live_hint and _wx_raw
+        if (_catalogue_suffix_repair and _wx_raw
                 and os.environ.get("ADLIB_LIVE_SWAP_ENABLED", "1")
                 .strip().lower() in ("1", "true", "yes", "on")):
             filtered = _ac.live_swap_tail(filtered, _wx_raw)
@@ -5861,6 +5873,24 @@ async def _postprocess_live_whisperx(
                 "[WC] live gap recovery declined unexpectedly: %r", exc,
             )
     return processed
+
+
+def _can_infer_primary_language_from_reference(
+    requested_language: str | None, *, live: bool = False,
+    title: str = "", filename: str = "",
+) -> bool:
+    """Whether catalogue text may choose the primary ASR language.
+
+    Studio uploads keep the existing reliability hint.  A live performance
+    can legitimately use another language (or mix languages), so Auto must be
+    decided by the audio provider instead of a catalogue entry for a different
+    recording.  Explicit operator/tenant choices are handled separately and
+    continue to win.
+    """
+    return bool(
+        not (requested_language or "").strip()
+        and not (live or _looks_live(title, filename))
+    )
 
 
 async def _run_transcription_for_job(
@@ -6327,7 +6357,9 @@ async def _run_transcription_for_job(
         # canonical lyrics before the primary ASR runs, so English references
         # are transcribed as English while Spanish references retain the
         # explicit hint that historically made Whisper more reliable.
-        if not lang and lrc:
+        if lrc and _can_infer_primary_language_from_reference(
+            lang, live=live, title=title, filename=filename,
+        ):
             _reference_for_language = (
                 (lrc.get("plain") or "").strip()
                 or (lrc.get("synced") or "").strip()
