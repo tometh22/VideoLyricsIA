@@ -61,15 +61,19 @@ def test_editor_order_repairs_tail_duplicates_without_changing_timestamps():
     assert [segment["start"] for segment in ordered] == [45.1106, 45.9252, 114.766]
 
 
-def test_editor_canonicalization_sorts_without_shifting_timestamps():
+def test_editor_canonicalization_repairs_regressed_overlap_and_drops_copies():
     payload = json.loads(FIXTURE.read_text())
 
     canonical = normalize_editor_segments(payload["segments"])
 
-    assert [segment["_id"] for segment in canonical] == [9, 23, 11, 10, 24, 22]
+    assert [segment["_id"] for segment in canonical] == [9, 10, 11, 22]
     assert [segment["start"] for segment in canonical] == [
-        45.1106, 45.1106, 45.1606, 45.9252, 45.9252, 114.766,
+        45.1106, 45.9252, 45.9752, 114.766,
     ]
+    assert all(
+        current["start"] >= previous["start"]
+        for previous, current in zip(canonical, canonical[1:])
+    )
 
 
 def test_stable_sort_keeps_duplicate_timestamps_deterministic():
@@ -105,7 +109,7 @@ def test_editor_persistence_normalizer_canonicalizes_the_durable_order():
 
     normalized = normalize_segments(payload["segments"])
 
-    assert [segment["_id"] for segment in normalized] == [9, 23, 11, 10, 24, 22]
+    assert [segment["_id"] for segment in normalized] == [9, 10, 11, 22]
     assert [segment["start"] for segment in normalized] == [
-        45.1106, 45.1106, 45.1606, 45.9252, 45.9252, 114.766,
+        45.1106, 45.9252, 45.9752, 114.766,
     ]
