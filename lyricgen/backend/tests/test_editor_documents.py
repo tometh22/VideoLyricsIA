@@ -371,7 +371,7 @@ def test_equal_revision_legacy_timing_anomaly_is_migrated_once():
         repaired = get_or_create_document(db, job_id, job.tenant_id, malformed)
         db.commit()
         assert [row["_id"] for row in repaired.current_segments] == [9, 10, 11, 22]
-        assert repaired.current_segments[2]["start"] == 45.9752
+        assert repaired.current_segments[2]["start"] == 46.5773
         assert job.segments_revision == repaired.revision == 2
     finally:
         db.close()

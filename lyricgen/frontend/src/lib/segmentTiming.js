@@ -315,6 +315,8 @@ const nearCollision = (left, right) => {
     || b[b.length - 1].startsWith(a[a.length - 1]);
 };
 
+const ACTIVE_TAIL_HOLD_S = 1.2;
+
 /**
  * Canonicalize editor rows while keeping semantic order in a bad overlap.
  * A timestamp sort alone makes a regressed lyric appear before its
@@ -366,18 +368,26 @@ export function canonicalizeEditorSegments(segments) {
         .map((item) => item.segment));
       return;
     }
-    let previousStart = null;
-    sourceOrder.forEach(({ segment }) => {
+    let previousEnd = null;
+    sourceOrder.forEach(({ segment }, position) => {
       const rawStart = Number(segment.start);
       const rawEnd = Number(segment.end);
-      const start = previousStart == null
-        ? Math.max(0, Number.isFinite(rawStart) ? rawStart : 0)
-        : Math.max(Number.isFinite(rawStart) ? rawStart : 0, previousStart + 0.05);
-      const duration = Math.max(0.3, Number.isFinite(rawEnd) ? rawEnd - (Number.isFinite(rawStart) ? rawStart : 0) : 0.3);
+      const safeRawStart = Number.isFinite(rawStart) ? Math.max(0, rawStart) : 0;
+      const safeRawEnd = Number.isFinite(rawEnd) ? rawEnd : safeRawStart;
+      const start = previousEnd == null
+        ? safeRawStart
+        : Math.max(safeRawStart, previousEnd + 0.05);
+      let duration = Math.max(0.3, safeRawEnd - safeRawStart);
+      const nextRawStart = position + 1 < sourceOrder.length
+        ? Number(sourceOrder[position + 1].segment.start)
+        : null;
+      if (Number.isFinite(nextRawStart) && nextRawStart > start) {
+        duration = Math.min(duration, Math.max(0.3, nextRawStart - 0.05 - start));
+      }
       const roundedStart = Math.round(start * 10000) / 10000;
       const roundedEnd = Math.round((start + duration) * 10000) / 10000;
       ordered.push({ ...segment, start: roundedStart, end: roundedEnd });
-      previousStart = roundedStart;
+      previousEnd = roundedEnd;
     });
   });
   return ordered;
@@ -417,5 +427,9 @@ export function selectActiveSegmentId(segments, currentTime) {
   });
 
   const selected = containing || latestStarted;
+  if (!containing && selected) {
+    const end = Number(selected.segment.end);
+    if (Number.isFinite(end) && time - end > ACTIVE_TAIL_HOLD_S) return null;
+  }
   return selected?.segment?._id ?? selected?.index ?? null;
 }

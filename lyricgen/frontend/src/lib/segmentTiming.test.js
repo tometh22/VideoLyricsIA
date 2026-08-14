@@ -282,6 +282,7 @@ describe("chronological playback selection", () => {
     ];
     const canonical = canonicalizeEditorSegments(rows);
     expect(canonical.map((row) => row._id)).toEqual([9, 10, 11, 22]);
-    expect(canonical.map((row) => row.start)).toEqual([45.1106, 45.9252, 45.9752, 114.766]);
+    expect(canonical.map((row) => row.start)).toEqual([45.1106, 45.9252, 46.5773, 114.766]);
+    expect(canonical[1].end + 0.05).toBeLessThanOrEqual(canonical[2].start);
   });
 });

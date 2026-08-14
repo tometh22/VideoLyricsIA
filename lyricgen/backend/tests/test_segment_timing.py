@@ -68,8 +68,9 @@ def test_editor_canonicalization_repairs_regressed_overlap_and_drops_copies():
 
     assert [segment["_id"] for segment in canonical] == [9, 10, 11, 22]
     assert [segment["start"] for segment in canonical] == [
-        45.1106, 45.9252, 45.9752, 114.766,
+        45.1106, 45.9252, 46.5773, 114.766,
     ]
+    assert canonical[1]["end"] + 0.05 <= canonical[2]["start"]
     assert all(
         current["start"] >= previous["start"]
         for previous, current in zip(canonical, canonical[1:])
@@ -111,5 +112,5 @@ def test_editor_persistence_normalizer_canonicalizes_the_durable_order():
 
     assert [segment["_id"] for segment in normalized] == [9, 10, 11, 22]
     assert [segment["start"] for segment in normalized] == [
-        45.1106, 45.9252, 45.9752, 114.766,
+        45.1106, 45.9252, 46.5773, 114.766,
     ]

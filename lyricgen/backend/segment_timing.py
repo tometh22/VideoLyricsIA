@@ -118,11 +118,35 @@ def canonicalize_editor_segments(segments: Any) -> list[dict]:
             region, key=lambda item: (item["start"], item["index"]),
         )
         if has_regression:
-            ordered.extend(normalize_segments_timing(
-                [item["segment"] for item in chosen],
-                min_gap=MIN_SEGMENT_GAP,
-                min_duration=MIN_SEGMENT_DURATION,
-            ))
+            repaired = []
+            previous_end = None
+            for position, item in enumerate(chosen):
+                segment = item["segment"]
+                raw_start = item["start"]
+                raw_end = item["end"]
+                start = max(
+                    raw_start,
+                    (previous_end + MIN_SEGMENT_GAP) if previous_end is not None else 0.0,
+                )
+                duration = max(MIN_SEGMENT_DURATION, raw_end - raw_start)
+                # Do not let a repaired row consume the next semantic row.
+                # The previous repair used previous_start, leaving the bad
+                # cluster overlapped and making the active lyric alternate.
+                if position + 1 < len(chosen):
+                    next_raw_start = chosen[position + 1]["start"]
+                    if next_raw_start > start:
+                        duration = min(duration, max(
+                            MIN_SEGMENT_DURATION,
+                            next_raw_start - MIN_SEGMENT_GAP - start,
+                        ))
+                repaired_segment = {
+                    **segment,
+                    "start": round(start, 4),
+                    "end": round(start + duration, 4),
+                }
+                repaired.append(repaired_segment)
+                previous_end = repaired_segment["end"]
+            ordered.extend(repaired)
         else:
             ordered.extend(item["segment"] for item in chosen)
     return ordered
