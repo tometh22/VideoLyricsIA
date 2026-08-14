@@ -51,6 +51,19 @@ describe("LyricsEditor — banner de audio (cargando vs no disponible)", () => {
     expect(screen.queryByText("Cargando audio…")).not.toBeInTheDocument();
   });
 
+  it("un 503 temporal no se presenta como audio inexistente y permite reintentar", () => {
+    const onRetryAudio = vi.fn();
+    render(<LyricsEditor {...baseProps({
+      audioUrl: null,
+      audioLoading: false,
+      audioUnavailableReason: "temporary",
+      onRetryAudio,
+    })} />);
+    expect(screen.getByText(/Audio temporalmente no disponible/)).toBeInTheDocument();
+    screen.getAllByRole("button", { name: "Reintentar audio" })[0].click();
+    expect(onRetryAudio).toHaveBeenCalledTimes(1);
+  });
+
   it("con audioUrl → no muestra ninguno de los dos banners (hay reproductor)", () => {
     render(<LyricsEditor {...baseProps({ audioUrl: "https://r2.example/audio.wav", audioLoading: false })} />);
     expect(screen.queryByText("Cargando audio…")).not.toBeInTheDocument();

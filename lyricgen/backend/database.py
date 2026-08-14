@@ -59,20 +59,19 @@ if DATABASE_URL.startswith("postgres://"):
 #
 #   max_connections >= (api_workers + rq_workers) × (pool_size + max_overflow)
 #
-# Railway's default Postgres ships with max_connections=100. With
-# 4 API workers + 4 RQ workers = 8 processes, that leaves
-#   ceil((100 − 5_reserved_for_admin) / 8) ≈ 11 sockets per process.
-# So 5 + 5 = 10 is the most we can run *with the default DB plan*.
+# Pools are per process. The live budget must include every uvicorn worker
+# plus Worker and ShortWorker replica. With 14 DB-owning processes, a
+# 100-connection Postgres instance leaves about six sockets per process after
+# administrative headroom, so 4 + 2 is the conservative default.
 #
 # After fix/db-pool-streaming-scale: streaming endpoints (/preview,
 # /download, /backgrounds/.../preview, /jobs/.../events, /download/all)
 # release their pool slot before the file/SSE stream begins via
 # scoped_db(). That lifts the per-process concurrency ceiling from
-# "≤10 short queries + 0 streams" to "≤10 short queries, unbounded
-# concurrent streams". 6 + 4 is now a comfortable default — 6 steady
-# slots for the hot dashboard/auth/status endpoints, 4 overflow for
-# bursts (UMG batch submissions, multiple operators logging in
-# concurrently). The total is still 10 per process, fits the 100-cap.
+# "≤10 short queries + 0 streams" to short metadata queries independent of
+# stream duration. 4 + 2 provides six slots per process; burst resilience
+# belongs in bounded retries, not in letting every replica consume the full
+# Postgres connection budget.
 #
 # When (not if) you migrate to a bigger DB plan or front Postgres with
 # PgBouncer (see docs/SCALING.md), raise:
@@ -81,8 +80,8 @@ if DATABASE_URL.startswith("postgres://"):
 # and confirm max_connections still bounds the product above. The fix
 # above changes the failure shape — the cap is now real concurrent
 # short queries, not concurrent downloads.
-_DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "6"))
-_DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "4"))
+_DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "4"))
+_DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "2"))
 
 def _build_pg_connect_args() -> dict:
     """psycopg2 connect_args for Railway Postgres.

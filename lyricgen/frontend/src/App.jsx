@@ -66,6 +66,7 @@ import { createSaveQueue } from "./lib/saveQueue";
 import { rebaseEditorSnapshot } from "./lib/rebaseEditorSnapshot";
 import { isEditorRevisionConflict } from "./lib/editorRevisionConflict";
 import { buildGenerationJob } from "./lib/buildGenerationJob";
+import { loadEditorAudio } from "./lib/editorAudioRecovery";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -822,6 +823,7 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
 function EditLyricsRoute({
   setCurrentReview,
   setWizardStage,
+  editorAudioRetryRef,
   // style/customColors: la paleta vive en el state top-level de App (no en la
   // review), y es lo que WizardLivePreview lee para pintar el texto. Sin
   // sembrarlos al entrar a editar, la preview usa la paleta del último batch —
@@ -849,6 +851,8 @@ function EditLyricsRoute({
 
   useEffect(() => {
     let alive = true;
+    let retryAudio = null;
+    if (editorAudioRetryRef) editorAudioRetryRef.current = null;
     setState({ status: "loading" });
     track("edit.entered", { job_id: id });
 
@@ -1006,6 +1010,9 @@ function EditLyricsRoute({
         audioUrl: null,           // populated by Phase B
         audioLoading: true,       // Phase B en vuelo → el editor muestra
                                   // "Cargando audio…" en vez de "no disponible"
+        // `temporary` means the API/R2 path was unavailable, NOT that the
+        // source file is gone. Only a definitive 404 earns `missing`.
+        audioUnavailableReason: null,
         waveform: null,           // populated by Phase B
         bgUrl: null,              // populated by Phase B
         ...initialFields,
@@ -1035,11 +1042,10 @@ function EditLyricsRoute({
       // racing against an operator who navigated to a different job before
       // the slow fetch landed.
       // `retries`: the source audio is ESSENTIAL for editing TIMING — without
-      // it the timeline opens muted ("audio no disponible"). It used to be a
-      // silent fire-and-forget like waveform/bg, so a single transient 500 (a
-      // momentary DB hiccup on /source-audio-url — observed in prod on job
-      // 0d05c360895a, 2026-06-03) or timeout left the operator unable to fix
-      // timing. Retry it with backoff; waveform/bg stay best-effort.
+      // it the timeline opens muted. It used to be a silent fire-and-forget
+      // like waveform/bg, so a transient DB failure left the operator unable
+      // to fix timing. The generic enhancements remain best-effort; source
+      // audio has an explicit recovery contract below.
       const enhanceField = async (url, key, extractor, { retries = 0 } = {}) => {
         for (let attempt = 0; attempt <= retries; attempt++) {
           try {
@@ -1068,23 +1074,54 @@ function EditLyricsRoute({
         // Exhausted: leave the field unset; text editing still works and the
         // operator can reopen the editor to retry the audio fetch.
       };
-      // El audio es esencial para el timing: mientras su fetch está en vuelo
-      // el editor muestra "Cargando audio…". Al resolver (éxito O reintentos
-      // agotados) bajamos audioLoading para que, si de verdad no hay audio,
-      // recién ahí aparezca "Audio no disponible".
-      enhanceField(`${API}/jobs/${id}/source-audio-url`, "audioUrl", (d) => d?.url || null, { retries: 3 })
-        .finally(() => {
-          if (!alive) return;
-          setCurrentReview((prev) => {
-            if (!prev || prev.editingJobId !== id) return prev;
-            return { ...prev, audioLoading: false };
-          });
+      // An exhausted 503 used to be rendered as "Audio no disponible", which
+      // is a false claim: the DB could not validate the session long enough to
+      // presign the R2 object. Respect the server's Retry-After, preserve the
+      // local draft, and keep a user-initiated retry available afterwards.
+      retryAudio = async () => {
+        setCurrentReview((prev) => {
+          if (!prev || prev.editingJobId !== id) return prev;
+          return {
+            ...prev,
+            audioLoading: true,
+            audioUnavailableReason: null,
+          };
         });
+        const result = await loadEditorAudio({
+          // This endpoint is a DB lookup + presigned URL, normally <1 s. A
+          // short cap turns pool backpressure into a recoverable UI state
+          // instead of holding the timing screen on a spinner for a minute.
+          request: () => authFetchWithTimeout(`${API}/jobs/${id}/source-audio-url`, {}, 8_000),
+          maxRetries: 3,
+        });
+        if (!alive) return;
+        setCurrentReview((prev) => {
+          if (!prev || prev.editingJobId !== id) return prev;
+          if (result.ok) {
+            return {
+              ...prev,
+              audioUrl: result.url,
+              audioLoading: false,
+              audioUnavailableReason: null,
+            };
+          }
+          return {
+            ...prev,
+            audioLoading: false,
+            audioUnavailableReason: result.reason,
+          };
+        });
+      };
+      if (editorAudioRetryRef) editorAudioRetryRef.current = retryAudio;
+      void retryAudio();
       enhanceField(`${API}/jobs/${id}/waveform`, "waveform", (d) => d);
       enhanceField(`${API}/jobs/${id}/background-url`, "bgUrl", (d) => d?.url || null);
     })();
 
-    return () => { alive = false; };
+    return () => {
+      alive = false;
+      if (editorAudioRetryRef?.current === retryAudio) editorAudioRetryRef.current = null;
+    };
     // setCurrentReview is stable via useState; only re-bootstrap on id change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
@@ -1511,6 +1548,10 @@ export default function App() {
 
   const [reviewQueue, setReviewQueue] = useState([]);
   const [currentReview, setCurrentReview] = useState(null);
+  // EditLyricsRoute owns the network lifecycle, while the shared wizard owns
+  // LyricsEditor. A ref exposes only the active route's retry action without
+  // serializing a callback into the durable wizard snapshot.
+  const editorAudioRetryRef = useRef(null);
   const [approvedJobs, setApprovedJobs] = useState([]);
   const [transcribing, setTranscribing] = useState(false);
   const [transcribeError, setTranscribeError] = useState(null);
@@ -5021,6 +5062,8 @@ export default function App() {
             audioFile={currentReview.file}
             audioUrl={currentReview.audioUrl || null}
             audioLoading={!!currentReview.audioLoading}
+            audioUnavailableReason={currentReview.audioUnavailableReason || null}
+            onRetryAudio={currentReview.editingJobId ? editorAudioRetryRef.current : null}
             referenceLyrics={currentReview.referenceLyrics || ""}
             coverageWarning={currentReview.coverageWarning}
             recoverySource={currentReview.recoverySource}
@@ -5285,6 +5328,7 @@ export default function App() {
             <EditLyricsRoute
               setCurrentReview={setCurrentReview}
               setWizardStage={setWizardStage}
+              editorAudioRetryRef={editorAudioRetryRef}
               setStyle={setStyle}
               setCustomColors={setCustomColors}
               setBgSelectMode={setBgSelectMode}
