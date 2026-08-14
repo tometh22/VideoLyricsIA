@@ -147,3 +147,33 @@ def test_heuristic_phrase_segmenter_skips_llm_partition(monkeypatch):
     assert out["segments"] == result["segments"]
     assert out["postpass_stats"]["phrase_seg"]["skipped"] == \
         "already_llm_segmented"
+
+
+def test_live_auto_language_never_comes_from_catalogue():
+    assert not main._can_infer_primary_language_from_reference(
+        "", live=True, title="Eso Es Real", filename="audio.mp3",
+    )
+    assert not main._can_infer_primary_language_from_reference(
+        "", live=False, title="Eso Es Real (Live)", filename="audio.mp3",
+    )
+    assert not main._can_infer_primary_language_from_reference(
+        "", live=False, title="Eso Es Real", filename="show_en_vivo.mp3",
+    )
+
+
+def test_studio_auto_language_keeps_catalogue_hint():
+    assert main._can_infer_primary_language_from_reference(
+        "", live=False, title="Studio Cut", filename="studio.mp3",
+    )
+    assert not main._can_infer_primary_language_from_reference(
+        "es", live=False, title="Studio Cut", filename="studio.mp3",
+    )
+
+
+def test_audio_truth_live_disables_catalogue_suffix_repair():
+    # Regression contract for Los Pericos: the authoritative live stream must
+    # not be replaced by a second copy of its own collapsed wx_raw suffix.
+    src = inspect.getsource(main._maybe_adlib_filter)
+    assert 'live_hint and not result.get("live_audio_truth")' in src
+    assert "_audit_on = _catalogue_suffix_repair" in src
+    assert "if (_catalogue_suffix_repair and _wx_raw" in src

@@ -6978,6 +6978,23 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
                          "llm_segmented": True})
     if len(out_segs) < 2:
         return segs
+    # The index partition can be perfect while the provider's repeated-word
+    # timestamps are collapsed or reversed (Los Pericos: five "Real" tokens
+    # all mapped into 60-64s). Splitting that stream would manufacture several
+    # cards at the same instant and force the final normalizer to squeeze them
+    # into fake 0.3s slots. Decline the entire LLM edit unless its mapped line
+    # windows are physically ordered and non-degenerate.
+    previous_start = None
+    for line in out_segs:
+        start = float(line["start"])
+        end = float(line["end"])
+        if end <= start or (previous_start is not None and start <= previous_start):
+            logger.warning(
+                "[LLM-SEGMENT] collapsed/non-monotonic mapped timing; "
+                "keeping whisperX"
+            )
+            return segs
+        previous_start = start
     logger.info("[LLM-SEGMENT] re-segmented %d whisperX segs → %d clean lines "
                 "(coverage %.2f)", len(segs), len(out_segs), coverage)
     return out_segs
