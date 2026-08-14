@@ -17,6 +17,117 @@ MIN_SEGMENT_GAP = 0.05
 MIN_SEGMENT_DURATION = 0.3
 
 
+def _collision_text(segment: dict) -> str:
+    return " ".join(str(segment.get("text") or "").split()).casefold()
+
+
+def _near_collision(left: dict, right: dict) -> bool:
+    """Recognize a copied row with a small trailing transcription typo."""
+    left_tokens = _collision_text(left).split()
+    right_tokens = _collision_text(right).split()
+    if not left_tokens or not right_tokens or len(left_tokens) != len(right_tokens):
+        return False
+    if len(left_tokens) < 3:
+        return False
+    same_prefix = left_tokens[:-1] == right_tokens[:-1]
+    last_a, last_b = left_tokens[-1], right_tokens[-1]
+    return same_prefix and (
+        last_a.startswith(last_b) or last_b.startswith(last_a)
+    )
+
+
+def _deduplicate_editor_collisions(segments: list[dict]) -> list[dict]:
+    """Drop only obvious duplicate rows while retaining the first row.
+
+    Editor edits can append a copy of a lyric to the end of the array.  When
+    that copy has the same text and starts within the collision window it is
+    not a second sung event; keeping both makes the playback cursor flicker.
+    Different text is intentionally preserved because harmonies can overlap.
+    """
+    out: list[dict] = []
+    for segment in segments:
+        text = _collision_text(segment)
+        try:
+            start = float(segment.get("start"))
+        except (TypeError, ValueError):
+            start = 0.0
+        duplicate = next(
+            (previous for previous in out
+             if (_collision_text(previous) == text or _near_collision(previous, segment))
+             and abs(float(previous.get("start") or 0) - start) < 0.35),
+            None,
+        )
+        if duplicate is not None:
+            duplicate["end"] = max(
+                float(duplicate.get("end") or 0),
+                float(segment.get("end") or 0),
+            )
+            continue
+        out.append(dict(segment))
+    return out
+
+
+def canonicalize_editor_segments(segments: Any) -> list[dict]:
+    """Canonicalize editor rows without letting a timing regression reorder text.
+
+    A plain timestamp sort fixes rows appended in the middle of a song, but it
+    also turns a post-alignment regression into a lyric jump: a later source
+    row can be rendered before the line that precedes it semantically.  We
+    therefore sort non-overlapping regions by timestamp, while an overlapping
+    region that contains a source-order regression keeps its original row
+    order.  Only that anomalous region gets a small forward repair.  Legitimate
+    monotonic overlaps (harmonies) retain their timestamps.
+    """
+    if not isinstance(segments, list):
+        return []
+
+    cleaned = _deduplicate_editor_collisions([
+        segment for segment in segments if isinstance(segment, dict)
+    ])
+    decorated = []
+    for index, segment in enumerate(cleaned):
+        try:
+            start = float(segment.get("start"))
+            end = float(segment.get("end"))
+        except (TypeError, ValueError):
+            start, end = 0.0, 0.0
+        if not math.isfinite(start):
+            start = 0.0
+        if not math.isfinite(end):
+            end = start
+        decorated.append({"segment": segment, "index": index,
+                          "start": max(0.0, start), "end": max(start, end)})
+
+    by_time = sorted(decorated, key=lambda item: (item["start"], item["index"]))
+    regions: list[list[dict]] = []
+    for item in by_time:
+        if not regions or item["start"] >= max(row["end"] for row in regions[-1]):
+            regions.append([item])
+        else:
+            regions[-1].append(item)
+
+    ordered: list[dict] = []
+    for region in regions:
+        source_order = sorted(region, key=lambda item: item["index"])
+        source_starts = [item["start"] for item in source_order]
+        has_regression = any(
+            current < previous
+            for previous, current in zip(source_starts, source_starts[1:])
+        )
+        chosen = source_order if has_regression else sorted(
+            region, key=lambda item: (item["start"], item["index"]),
+        )
+        if has_regression:
+            ordered.extend(normalize_segments_timing(
+                [item["segment"] for item in chosen],
+                min_gap=MIN_SEGMENT_GAP,
+                min_duration=MIN_SEGMENT_DURATION,
+            ))
+        else:
+            ordered.extend(item["segment"] for item in chosen)
+    return ordered
+
+
 def sort_segments_chronologically(segments: Any) -> list[dict]:
     """Return valid segment dictionaries in stable chronological order.
 
@@ -84,16 +195,11 @@ def timing_anomalies(segments: Any) -> dict[str, int]:
 def normalize_editor_segments(segments: Any) -> list[dict]:
     """Canonicalize user-edited segments for persistence/rendering.
 
-    Unlike transcription repair, editor canonicalization must not invent a
-    50 ms gap between simultaneous rows or move a timestamp to preserve the
-    incoming array order. The timestamp is the editor's ordering authority;
-    stable sorting keeps equal-time rows deterministic while preserving their
-    individual timings and metadata.
+    Normal regions retain their individual timings, including legitimate
+    overlaps. Only an overlapping region with a source-order regression is
+    repaired by ``canonicalize_editor_segments``.
     """
-    return normalize_segments_timing(
-        sort_segments_chronologically(segments),
-        min_gap=0,
-    )
+    return canonicalize_editor_segments(segments)
 
 
 def normalize_segments_timing(

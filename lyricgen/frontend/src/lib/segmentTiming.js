@@ -303,6 +303,86 @@ export function sortSegmentsChronologically(segments) {
     .map(({ segment }) => segment);
 }
 
+const collisionText = (segment) => String(segment?.text || "")
+  .trim().replace(/\s+/g, " ").toLocaleLowerCase();
+
+const nearCollision = (left, right) => {
+  const a = collisionText(left).split(" ").filter(Boolean);
+  const b = collisionText(right).split(" ").filter(Boolean);
+  if (!a.length || a.length !== b.length || a.length < 3) return false;
+  if (!a.slice(0, -1).every((token, index) => token === b[index])) return false;
+  return a[a.length - 1].startsWith(b[b.length - 1])
+    || b[b.length - 1].startsWith(a[a.length - 1]);
+};
+
+/**
+ * Canonicalize editor rows while keeping semantic order in a bad overlap.
+ * A timestamp sort alone makes a regressed lyric appear before its
+ * predecessor; a blanket sort also makes the active row jump inside that
+ * overlap.  Only an overlapping region with a source-order regression is
+ * repaired. Legitimate monotonic overlaps (e.g. harmonies) are untouched.
+ */
+export function canonicalizeEditorSegments(segments) {
+  if (!Array.isArray(segments)) return [];
+  const cleaned = [];
+  segments.forEach((segment) => {
+    if (!segment || typeof segment !== "object") return;
+    const start = Number(segment.start);
+    const duplicate = cleaned.find((previous) => (
+      (collisionText(previous) === collisionText(segment) || nearCollision(previous, segment))
+      && Math.abs(Number(previous.start) - start) < 0.35
+    ));
+    if (duplicate) {
+      duplicate.end = Math.max(Number(duplicate.end) || 0, Number(segment.end) || 0);
+      return;
+    }
+    cleaned.push({ ...segment });
+  });
+
+  const decorated = cleaned.map((segment, index) => ({
+    segment,
+    index,
+    start: Number.isFinite(Number(segment.start)) ? Math.max(0, Number(segment.start)) : 0,
+    end: Number.isFinite(Number(segment.end)) ? Math.max(Number(segment.start) || 0, Number(segment.end)) : 0,
+  }));
+  const byTime = [...decorated].sort((left, right) => left.start - right.start || left.index - right.index);
+  const regions = [];
+  byTime.forEach((item) => {
+    const last = regions[regions.length - 1];
+    const regionEnd = last ? Math.max(...last.map((row) => row.end)) : -Infinity;
+    if (!last || item.start >= regionEnd) regions.push([item]);
+    else last.push(item);
+  });
+
+  const ordered = [];
+  regions.forEach((region) => {
+    const sourceOrder = [...region].sort((left, right) => left.index - right.index);
+    const hasRegression = sourceOrder.slice(1).some((item, index) => (
+      item.start < sourceOrder[index].start
+    ));
+    if (!hasRegression) {
+      ordered.push(...region
+        .sort((left, right) => left.start - right.start || left.index - right.index)
+        .map((item) => item.segment));
+      return;
+    }
+    let previousStart = null;
+    sourceOrder.forEach(({ segment }) => {
+      const rawStart = Number(segment.start);
+      const rawEnd = Number(segment.end);
+      const start = previousStart == null
+        ? Math.max(0, Number.isFinite(rawStart) ? rawStart : 0)
+        : Math.max(Number.isFinite(rawStart) ? rawStart : 0, previousStart + 0.05);
+      const duration = Math.max(0.3, Number.isFinite(rawEnd) ? rawEnd - (Number.isFinite(rawStart) ? rawStart : 0) : 0.3);
+      const roundedStart = Math.round(start * 10000) / 10000;
+      const roundedEnd = Math.round((start + duration) * 10000) / 10000;
+      ordered.push({ ...segment, start: roundedStart, end: roundedEnd });
+      previousStart = roundedStart;
+    });
+  });
+  return ordered;
+}
+
 function finiteStart(segment) {
   const value = Number(segment?.start);
   return Number.isFinite(value) ? value : null;

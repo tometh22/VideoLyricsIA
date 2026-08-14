@@ -13,7 +13,7 @@ import { reseedPreservingIds } from "../lib/segmentIds";
 import {
   clampBlockShiftDelta,
   shiftBlockWithinDuration,
-  sortSegmentsChronologically,
+  canonicalizeEditorSegments,
   selectActiveSegmentId,
 } from "../lib/segmentTiming";
 import { useJobSegments, segmentsStore } from "../state/segmentsStore";
@@ -219,7 +219,7 @@ function sanitizeSegments(segments) {
     fallbackStart = sanitized.start;
     return sanitized;
   });
-  return sortSegmentsChronologically(sanitized);
+  return canonicalizeEditorSegments(sanitized);
 }
 
 function sanitizeSegmentsForPersistence(segments) {

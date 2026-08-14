@@ -6,6 +6,7 @@ import {
   clampSelectionShiftDelta,
   shiftTimingWithAdjacent,
   shiftBlockWithinDuration,
+  canonicalizeEditorSegments,
   selectActiveSegmentId,
   sortSegmentsChronologically,
 } from "./segmentTiming";
@@ -268,5 +269,19 @@ describe("chronological playback selection", () => {
       { _id: 23, start: 45.11, end: 45.8 },
     ];
     expect(selectActiveSegmentId(rows, 45.3)).toBe(9);
+  });
+
+  it("repairs the real regressed overlap without moving copied rows to the tail", () => {
+    const rows = [
+      { _id: 9, start: 45.1106, end: 45.8752, text: "uoo no no te hice daño," },
+      { _id: 10, start: 45.9252, end: 46.5273, text: "te alejaste de miSsi" },
+      { _id: 11, start: 45.1606, end: 46.9606, text: "Las palabras se fueron al viento y no se." },
+      { _id: 22, start: 114.766, end: 115.967, text: "¡Gracias!" },
+      { _id: 23, start: 45.1106, end: 45.8752, text: "uoo no no te hice daño," },
+      { _id: 24, start: 45.9252, end: 46.5273, text: "te alejaste de mi" },
+    ];
+    const canonical = canonicalizeEditorSegments(rows);
+    expect(canonical.map((row) => row._id)).toEqual([9, 10, 11, 22]);
+    expect(canonical.map((row) => row.start)).toEqual([45.1106, 45.9252, 45.9752, 114.766]);
   });
 });
