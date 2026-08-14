@@ -131,14 +131,25 @@ def _f(v, default: float = 0.0) -> float:
 
 
 def find_gaps(segments: list[dict], audio_duration: float | None = None, *,
-              min_gap_s: float = _MIN_GAP_S) -> list[tuple[float, float]]:
+              min_gap_s: float = _MIN_GAP_S,
+              include_leading: bool = False) -> list[tuple[float, float]]:
     """Huecos entre carteles (y la cola) más largos que `min_gap_s`.
+
+    `include_leading` is reserved for audio-as-truth live results.  Normal
+    studio songs often have long instrumental intros; probing every intro adds
+    cost and false-positive pressure.  Live jobs enable it because a missing
+    sustained opening word is otherwise invisible to ASR-word coverage.
+
     Puro y testeable — no mira el audio."""
     segs = sorted((s for s in (segments or []) if isinstance(s, dict)),
                   key=lambda s: _f(s.get("start")))
     if not segs:
         return []
     gaps: list[tuple[float, float]] = []
+    if include_leading:
+        first_start = _f(segs[0].get("start"))
+        if first_start >= min_gap_s:
+            gaps.append((0.0, first_start))
     for a, b in zip(segs, segs[1:]):
         ini, fin = _f(a.get("end")), _f(b.get("start"))
         if fin - ini >= min_gap_s:
@@ -286,7 +297,9 @@ def rescue(segments: list[dict], audio_path: str, *,
            audio_duration: float | None = None, language: str | None = None,
            lead_s: float = 0.0, hold_s: float = 0.0,
            asr_words: list[dict] | None = None,
-           job_id: str | None = None) -> tuple[list[dict], dict]:
+           job_id: str | None = None,
+           include_leading: bool = False,
+           reference_text: str = "") -> tuple[list[dict], dict]:
     """Devuelve (segmentos + líneas rescatadas, stats). Nunca levanta.
 
     `stem_path`: stem de voz (demucs) si está cacheado. Es MUY superior a la
@@ -311,16 +324,25 @@ def rescue(segments: list[dict], audio_path: str, *,
         max_gaps = int(_env_float("GAP_RESCUE_MAX_GAPS", _MAX_GAPS))
         fin_audio = float(audio_duration) if audio_duration else None
 
-        gaps = find_gaps(segments, audio_duration, min_gap_s=min_gap)
+        gaps = find_gaps(
+            segments, audio_duration, min_gap_s=min_gap,
+            include_leading=include_leading,
+        )
         stats["gaps"] = len(gaps)
         if not gaps:
             return list(segments), stats
 
+        import re as _re
+        reference_tokens = set(_re.findall(
+            r"[^\W\d_]+", (reference_text or "").casefold(), _re.UNICODE,
+        ))
         nuevas: list[dict] = []
         for ini, fin in gaps[:max_gaps]:
+            leading_gap = include_leading and ini <= 0.001
             # Zona útil (lo que puede aportar contenido nuevo) y ventana a
             # transcribir (zona + contexto cantado alrededor).
-            zona_a, zona_b = ini + _PAD_S, fin - _PAD_S
+            zona_a = ini + _PAD_S
+            zona_b = fin - (0.05 if leading_gap else _PAD_S)
             if zona_b - zona_a < 2.0:
                 stats["skipped"].append((round(ini, 1), "ventana_corta"))
                 continue
@@ -345,8 +367,30 @@ def rescue(segments: list[dict], audio_path: str, *,
             words = [w for w in words
                      if zona_a <= (_f(w.get("start")) + _f(w.get("end"))) / 2
                      <= zona_b]
-            if (len(words) < _MIN_WORDS
-                    or len(words) / (zona_b - zona_a) < _MIN_WORDS_PER_S):
+            recovered_tokens = [
+                token
+                for w in words
+                for token in _re.findall(
+                    r"[^\W\d_]+", str(w.get("word", "")).casefold(),
+                    _re.UNICODE,
+                )
+            ]
+            # Sparse repeated hooks ("Real" every 6s) are legitimate in live
+            # outros but fail the normal prose-density gate. Accept that shape
+            # only when at least three independent words all occur in the known
+            # reference; VAD still gates each emitted singleton below.
+            sparse_live_refrain = bool(
+                include_leading
+                and len(words) >= _MIN_WORDS
+                and recovered_tokens
+                and reference_tokens
+                and set(recovered_tokens).issubset(reference_tokens)
+            )
+            if ((not leading_gap and len(words) < _MIN_WORDS)
+                    or (not leading_gap and not sparse_live_refrain
+                        and len(words) / (zona_b - zona_a)
+                        < _MIN_WORDS_PER_S)
+                    or (leading_gap and not words)):
                 stats["skipped"].append((round(ini, 1), "sin_canto"))
                 continue
             texto_total = " ".join(str(w.get("word", "")) for w in words)
@@ -357,9 +401,24 @@ def rescue(segments: list[dict], audio_path: str, *,
             for grupo in _agrupar_en_lineas(words):
                 txt = " ".join(str(w.get("word", "")).strip()
                                for w in grupo).strip()
-                if not txt or len(grupo) < 2:
+                if not txt:
                     continue
                 g0, g1 = _f(grupo[0].get("start")), _f(grupo[-1].get("end"))
+                # A single sustained opening word ("Hoy") is valid only with
+                # two independent guards: it appears in the known reference
+                # and the vocal stem supports it.  Everywhere else the normal
+                # two-word minimum remains in force.
+                single_leading = leading_gap and len(grupo) == 1
+                single_live_refrain = sparse_live_refrain and len(grupo) == 1
+                if len(grupo) < 2 and not (single_leading or single_live_refrain):
+                    continue
+                if single_leading or single_live_refrain:
+                    txt_tokens = set(_re.findall(
+                        r"[^\W\d_]+", txt.casefold(), _re.UNICODE,
+                    ))
+                    if (not reference_tokens
+                            or not txt_tokens.issubset(reference_tokens)):
+                        continue
                 # Sanidad física: una "línea" de 0,3s con 5 palabras es un
                 # destello alucinado, no canto.
                 if g1 - g0 < _MIN_LINE_S:
@@ -378,6 +437,17 @@ def rescue(segments: list[dict], audio_path: str, *,
                     nuevas[-1]["end"] = round(min(fin - 0.05, g1 + hold_s), 3)
                     continue
                 s0 = max(ini + 0.05, g0 - lead_s)
+                if single_leading and regs:
+                    # Whisper timestamps often begin at the first alignable
+                    # consonant and lose the onset of a held opening syllable.
+                    # Extend only to a VAD region acoustically connected to the
+                    # recovered word; unrelated intro energy cannot qualify.
+                    connected = [
+                        (ra, rb) for ra, rb in regs
+                        if ra < g0 and rb >= g0 - 0.5
+                    ]
+                    if connected:
+                        s0 = max(ini + 0.05, min(ra for ra, _ in connected))
                 e0 = min(fin - 0.05, g1 + hold_s)
                 if e0 - s0 < 0.3:
                     continue

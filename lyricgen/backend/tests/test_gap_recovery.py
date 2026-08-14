@@ -81,6 +81,42 @@ def test_recovers_line_in_gap(stem, monkeypatch):
                for w in rec[0]["words"])
 
 
+def test_gap_prompt_preserves_explicit_language(stem, monkeypatch):
+    monkeypatch.setenv("GAP_RECOVERY_ENABLED", "1")
+    fake = MagicMock()
+    fake.models.generate_content.return_value = MagicMock(text="Nada de esto fue")
+    monkeypatch.setattr(pipeline, "_get_genai_client", lambda: fake)
+    monkeypatch.setattr(
+        pipeline.librosa, "load", lambda *a, **k: (_synthetic_stem(), SR),
+    )
+
+    pipeline._recover_gap_lyrics(
+        SEGS, audio_path=stem, canonical=CANON, language="es",
+    )
+
+    config = fake.models.generate_content.call_args.kwargs["config"]
+    assert "IDIOMA OBJETIVO: español (es)" in config.system_instruction
+    assert "no traduzcas" in config.system_instruction.lower()
+
+
+def test_live_gap_prompt_does_not_include_catalogue(stem, monkeypatch):
+    monkeypatch.setenv("GAP_RECOVERY_ENABLED", "1")
+    fake = MagicMock()
+    fake.models.generate_content.return_value = MagicMock(text="Nada de esto fue")
+    monkeypatch.setattr(pipeline, "_get_genai_client", lambda: fake)
+    monkeypatch.setattr(
+        pipeline.librosa, "load", lambda *a, **k: (_synthetic_stem(), SR),
+    )
+
+    pipeline._recover_gap_lyrics(
+        SEGS, audio_path=stem, canonical="LETRA DE ESTUDIO NO CANTADA",
+        language="es", prompt_reference=False,
+    )
+
+    config = fake.models.generate_content.call_args.kwargs["config"]
+    assert "LETRA DE ESTUDIO NO CANTADA" not in config.system_instruction
+
+
 def test_rejects_loop_hallucination(stem, monkeypatch):
     monkeypatch.setenv("GAP_RECOVERY_ENABLED", "1")
     # the long-clip failure mode: the same phrase repeated many times
