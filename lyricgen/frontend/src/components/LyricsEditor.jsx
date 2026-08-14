@@ -2608,7 +2608,7 @@ export default function LyricsEditor({
     // it even when the machine originally passed: autosave may have advanced
     // the revision (or a sanitizer may have changed a few milliseconds), and
     // a verdict from the previous revision must never authorize the new one.
-    const qualityAcknowledged = Boolean(transcribeJobId && editorRequest);
+    const qualityAcknowledged = Boolean(transcriptionQuality);
     const approvalTelemetry = {
       ...correctionSummary,
       duration_ms: Math.max(0, Date.now() - editorSessionStartedAtRef.current),

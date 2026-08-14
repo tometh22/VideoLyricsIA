@@ -11022,12 +11022,23 @@ async def get_editor_document(
     _audit_cross_tenant_access(db, current_user, job, "editor_read", commit=False)
     db.commit()  # lazy migration/reconciliation is an intentional GET side effect
     payload = serialize_document(db, document)
+    editor_quality = getattr(job, "transcription_quality", None)
+    if not isinstance(editor_quality, dict) and job.segments_json:
+        # Expand compatibility for legacy jobs without mutating on GET. The
+        # editor receives an explicit fail-closed verdict and its approval
+        # endpoint persists the revision/hash-scoped acknowledgement.
+        from transcription_quality import evaluate as evaluate_transcription_quality
+        editor_quality = evaluate_transcription_quality(job.segments_json, None)
+        editor_quality["evaluated_revision"] = int(job.segments_revision or 0)
+        editor_quality["pipeline_release"] = "legacy_unknown"
+        editor_quality["pipeline_config_fingerprint"] = "unknown"
+        editor_quality["timing_source"] = job.timing_source or "unknown"
     payload.update({
         "artist": job.artist,
         "song_title": job.song_title,
         "filename": job.filename,
         "job_status": job.status,
-        "transcription_quality": getattr(job, "transcription_quality", None),
+        "transcription_quality": editor_quality,
     })
     return payload
 
