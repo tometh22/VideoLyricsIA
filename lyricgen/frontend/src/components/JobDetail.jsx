@@ -14,6 +14,7 @@ import DriveTransferModal from "./DriveTransferModal";
 import ScenesFilmstrip from "./ScenesFilmstrip";
 import SceneEditModal from "./SceneEditModal";
 import MediaPreview from "./MediaPreview";
+import ReviewVideoPlayer from "./ReviewVideoPlayer";
 import JobSettingsCard from "./JobSettingsCard";
 import { SingleGeneratingHero } from "./BatchProgress";
 import { hasArtTrackAccess } from "../lib/artTrackAccess";
@@ -1924,31 +1925,35 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       {/* Media preview (video / short / thumbnail) */}
       {activeTab !== "provenance" && activeTab !== "umg_master" && canPreview && (
         <>
-          <div
-            data-tour="jobdetail-preview"
-            className={`job-detail-media-frame rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4 mx-auto ${
-              activeTab === "short"
-                ? "job-detail-media-frame--short"
-                : "job-detail-media-frame--landscape"
-            }`}
-          >
-            {activeTab === "thumbnail" ? (
+          {activeTab === "thumbnail" ? (
+            <div
+              data-tour="jobdetail-preview"
+              className="job-detail-media-frame job-detail-media-frame--landscape rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4 mx-auto"
+            >
               <MediaPreview src={previewSrc} status={job.status} alt="Thumbnail" className="w-full h-full" imageClassName="bg-black/40" imageFit="contain" />
+            </div>
+          ) : (
+            previewSrc ? (
+              <ReviewVideoPlayer
+                key={`${activeTab}-${videoReloadKey}-${mediaVersion}`}
+                ref={activeTab === "video" ? videoRef : undefined}
+                src={previewSrc}
+                isShort={activeTab === "short"}
+                onError={handleVideoError}
+              />
             ) : (
-              previewSrc ? (
-                <video
-                  key={`${activeTab}-${videoReloadKey}-${mediaVersion}`}
-                  ref={activeTab === "video" ? videoRef : undefined}
-                  src={previewSrc}
-                  controls
-                  onError={handleVideoError}
-                  className="job-detail-media-video w-full h-full block object-contain bg-black/40"
-                />
-              ) : (
+              <div
+                data-tour="jobdetail-preview"
+                className={`job-detail-media-frame rounded-card bg-surface-2/40 ring-1 ring-white/[0.04] overflow-hidden mb-4 mx-auto ${
+                  activeTab === "short"
+                    ? "job-detail-media-frame--short"
+                    : "job-detail-media-frame--landscape"
+                }`}
+              >
                 <MediaPreview status={job.status} className="w-full h-full" label="Preparando reproducción" />
-              )
-            )}
-          </div>
+              </div>
+            )
+          )}
 
           {/* File info */}
           <div className="flex items-center justify-between mb-6">
