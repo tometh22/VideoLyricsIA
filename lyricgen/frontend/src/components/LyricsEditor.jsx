@@ -542,6 +542,19 @@ export default function LyricsEditor({
     () => reseedPreservingIds([], sanitizeSegments(segments)),
   );
   const sanitizedEdited = useMemo(() => sanitizeSegments(edited), [edited]);
+
+  // A module-level store can outlive a remount. If it was seeded before the
+  // timeline-order guard shipped, normalize that live entry once so row
+  // indexes, neighbour clamps, drag handles and the rendered list all share
+  // the same chronological order. Comparing ids avoids a replace loop when
+  // sanitizeSegments returns fresh object copies on each render.
+  useEffect(() => {
+    if (edited.length !== sanitizedEdited.length
+      || edited.some((segment, index) => segment?._id !== sanitizedEdited[index]?._id)) {
+      setEdited(sanitizedEdited);
+    }
+  }, [edited, sanitizedEdited, setEdited]);
+
   const [isDirty, setIsDirty] = useState(false);
   // Two views over the same editor state. The basic review flow is the
   // default; timing tools only appear after the operator explicitly opens
@@ -3656,7 +3669,7 @@ export default function LyricsEditor({
             </div>
             <LyricVideoPreview
               t={t}
-              segments={edited}
+              segments={sanitizedEdited}
               currentTime={currentTime}
               isPlaying={isPlaying}
               backgroundUrl={previewBgUrl || null}
@@ -3744,7 +3757,7 @@ export default function LyricsEditor({
                   </div>
                 ) : (
                   <LyricsTimeline
-                    segments={edited}
+                    segments={sanitizedEdited}
                     duration={duration}
                     currentTime={currentTime}
                     playbackTimeRef={playbackTimeRef}
@@ -3800,7 +3813,7 @@ export default function LyricsEditor({
                       className="absolute right-0 top-0 bottom-0 w-2 z-20 group/mini cursor-pointer"
                       style={{ touchAction: "none" }}
                     >
-                      {edited.map((seg) => {
+                      {sanitizedEdited.map((seg) => {
                         const top = (seg.start / duration) * 100;
                         const height = Math.max(0.4, ((seg.end - seg.start) / duration) * 100);
                         const isActive = seg._id === activeId;
@@ -3842,7 +3855,7 @@ export default function LyricsEditor({
                       Mobile mantiene el cap original (no hay outer
                       overflow ahí, el page scroll cubre todo). */}
                   <div ref={listRef} className={`space-y-0.5 overflow-y-auto pr-1 pb-8 ${workspaceFocusMode ? "max-h-[calc(100vh-110px)]" : "max-h-[calc(100vh-200px)]"} lg:max-h-none lg:overflow-visible`}>
-          {edited.map((seg, idx) => {
+          {sanitizedEdited.map((seg, idx) => {
             const suggestion = suggestionsById[seg._id];
             const isApplied = suggestion && seg.text === suggestion;
             const isActive = seg._id === activeId;
