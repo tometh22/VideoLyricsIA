@@ -1,6 +1,11 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useI18n } from "../i18n";
 import { EditorTour } from "./OnboardingTour";
+import {
+  normalizeSegmentsTiming,
+  sortSegmentsChronologically,
+  selectActiveSegmentId,
+} from "../lib/segmentTiming";
 
 function formatTime(seconds) {
   if (!isFinite(seconds) || seconds < 0) return "0:00";
@@ -78,7 +83,8 @@ function findSuggestion(whisperText, refLines, startIdx) {
 export default function LyricsEditor({ segments, filename, audioFile, referenceLyrics, coverageWarning = false, recoverySource = "", onApprove, onBack, isBatch = false, batchProgress = "", user = null }) {
   const { t } = useI18n();
   const [edited, setEdited] = useState(() =>
-    segments.map((s, i) => ({ ...s, _id: i }))
+    normalizeSegmentsTiming(sortSegmentsChronologically(segments), { minGap: 0 })
+      .map((s, i) => ({ ...s, _id: i }))
   );
 
   // ─── Audio sync ─────────────────────────────────────────────────────
@@ -202,13 +208,7 @@ export default function LyricsEditor({ segments, filename, audioFile, referenceL
   // the latest one whose start <= currentTime if no segment "owns" the
   // moment (e.g. instrumental gap).
   const activeId = useMemo(() => {
-    let containing = null;
-    let lastStarted = null;
-    for (const seg of edited) {
-      if (currentTime >= seg.start && currentTime < seg.end) containing = seg;
-      if (currentTime >= seg.start) lastStarted = seg;
-    }
-    return (containing || lastStarted)?._id ?? null;
+    return selectActiveSegmentId(edited, currentTime);
   }, [edited, currentTime]);
 
   // Tap handler: anchor the line at syncCursor to currentTime, then

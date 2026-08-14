@@ -68,6 +68,7 @@ from database import Job, User, UserSettings, AuditLog, get_db, init_db
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe
+from segment_timing import normalize_editor_segments, normalize_segments_timing
 from queue_jobs import enqueue_pipeline, queue_depth
 from render_spec import umg_catalog, validate_umg_config
 from billing import router as billing_router
@@ -1959,7 +1960,7 @@ async def _run_transcription_for_job(
                               f"for {artist_hint!r} - {song_hint!r}")
                         return {
                             "job_id": job_id,
-                            "segments": combined,
+                            "segments": normalize_segments_timing(combined),
                             "reference_lyrics": plain or synced,
                         }
             # No synced (or too few segments / unreliable timestamps) — but
@@ -2100,7 +2101,9 @@ async def _run_transcription_for_job(
                         if _dup:
                             print(f"[LYRICS] discarded {_dup} intro seg(s) "
                                   f"as song-line hallucinations (recovery)")
-                        combined = intro_segments + recovered
+                        combined = normalize_segments_timing(
+                            intro_segments + recovered,
+                        )
                         print(f"[LYRICS] hallucination detected ({reason}) "
                               f"— auto-recovered with {len(recovered)} "
                               f"lines from lrclib plain "
@@ -2125,9 +2128,10 @@ async def _run_transcription_for_job(
                 if _dup:
                     print(f"[LYRICS] discarded {_dup} intro seg(s) as "
                           f"song-line hallucinations")
-                combined = intro_segments + segments
+                combined = normalize_segments_timing(intro_segments + segments)
                 from pipeline import _filter_whisper_hallucinations
                 combined, _dropped = _filter_whisper_hallucinations(combined)
+                combined = normalize_segments_timing(combined)
                 if _dropped:
                     print(f"[TRANSCRIBE] dropped {_dropped} Whisper hallucination phrase(s)")
                 return {"job_id": job_id, "segments": combined, "reference_lyrics": plain}
@@ -2237,7 +2241,11 @@ async def _run_transcription_for_job(
         segments, _dropped = _filter_whisper_hallucinations(segments)
         if _dropped:
             print(f"[TRANSCRIBE] dropped {_dropped} Whisper hallucination phrase(s)")
-        return {"job_id": job_id, "segments": segments, "reference_lyrics": reference}
+        return {
+            "job_id": job_id,
+            "segments": normalize_segments_timing(segments),
+            "reference_lyrics": reference,
+        }
     finally:
         # tmp_dir holds intermediate slices (intro/body cuts) only — the
         # main audio (audio_path) is under job_dir and must survive until
@@ -2360,7 +2368,7 @@ async def generate_with_segments(
         if user_model and not user_model.ai_authorized:
             raise HTTPException(status_code=403, detail="AI tool usage not authorized. Contact admin for approval.")
 
-    segments = json.loads(segments_json)
+    segments = normalize_editor_segments(json.loads(segments_json))
     umg_spec = _parse_umg_params(delivery_profile, umg_frame_size, umg_fps, umg_prores_profile, current_user=current_user)
 
     # Check plan limits

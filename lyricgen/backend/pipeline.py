@@ -47,6 +47,7 @@ from PIL import Image, ImageDraw, ImageFont
 from jobs import update_job, get_job
 import storage
 from render_spec import FPS_RATIONAL, RenderSpec
+from segment_timing import normalize_segments_timing, timing_anomalies
 
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets")
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
@@ -1072,8 +1073,22 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
     if _dropped_loops:
         print(f"[WHISPER-API] filtered {_dropped_loops} hallucination/loop segment(s)")
 
-    print(f"[WHISPER-API] {len(segments)} segments")
-    return segments
+    anomalies = timing_anomalies(segments)
+    if anomalies["regressions"] or anomalies["duplicate_starts"]:
+        print(
+            f"[TIMING-CONSISTENCY] source=whisper-api "
+            f"regressions={anomalies['regressions']} "
+            f"duplicate_starts={anomalies['duplicate_starts']} "
+            f"overlaps={anomalies['overlaps']}"
+        )
+    normalized = normalize_segments_timing(segments)
+    if normalized != segments:
+        print(
+            f"[TIMING-NORMALIZE] repaired non-monotonic starts in "
+            f"{len(segments)} Whisper-API segments"
+        )
+    print(f"[WHISPER-API] {len(normalized)} segments")
+    return normalized
 
 
 def transcribe(mp3_path: str, language: str = None,
@@ -1207,7 +1222,21 @@ def transcribe(mp3_path: str, language: str = None,
     if _dropped_loops:
         print(f"[WHISPER] filtered {_dropped_loops} hallucination/loop segment(s)")
 
-    return segments
+    anomalies = timing_anomalies(segments)
+    if anomalies["regressions"] or anomalies["duplicate_starts"]:
+        print(
+            f"[TIMING-CONSISTENCY] source=whisper-local "
+            f"regressions={anomalies['regressions']} "
+            f"duplicate_starts={anomalies['duplicate_starts']} "
+            f"overlaps={anomalies['overlaps']}"
+        )
+    normalized = normalize_segments_timing(segments)
+    if normalized != segments:
+        print(
+            f"[TIMING-NORMALIZE] repaired non-monotonic starts in "
+            f"{len(segments)} local Whisper segments"
+        )
+    return normalized
 
 
 # ---------------------------------------------------------------------------
