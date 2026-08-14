@@ -1,5 +1,7 @@
 """Tests for provenance cost helpers — used by the per-tenant cost dashboard."""
 
+import uuid
+
 from provenance import (
     COST_PER_CALL,
     DEFAULT_COST_PER_CALL,
@@ -53,8 +55,9 @@ def test_cost_rates_dict_is_non_empty_and_only_floats():
 
 def test_tenant_cost_summary_empty_db_returns_zero(db):
     """No provenance records → zero cost, empty by_tool list."""
-    summary = tenant_cost_summary(db, tenant_id="default", since_days=30)
-    assert summary["tenant_id"] == "default"
+    tenant_id = f"cost-empty-{uuid.uuid4().hex}"
+    summary = tenant_cost_summary(db, tenant_id=tenant_id, since_days=30)
+    assert summary["tenant_id"] == tenant_id
     assert summary["total_cost"] == 0.0
     assert summary["total_calls"] == 0
     assert summary["by_tool"] == []

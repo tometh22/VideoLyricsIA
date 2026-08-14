@@ -7,6 +7,7 @@ from segment_timing import (
     sort_segments_chronologically,
     timing_anomalies,
 )
+from editor import normalize_segments
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "job_42_editor_segments.json"
@@ -97,3 +98,14 @@ def test_editor_repair_keeps_original_baseline_separate():
 
     assert payload["original_segments"][0]["start"] == 40.25
     assert [segment["_id"] for segment in ordered] == [9, 23, 11, 10, 24, 22]
+
+
+def test_editor_persistence_normalizer_canonicalizes_the_durable_order():
+    payload = json.loads(FIXTURE.read_text())
+
+    normalized = normalize_segments(payload["segments"])
+
+    assert [segment["_id"] for segment in normalized] == [9, 23, 11, 10, 24, 22]
+    assert [segment["start"] for segment in normalized] == [
+        45.1106, 45.1106, 45.1606, 45.9252, 45.9252, 114.766,
+    ]
