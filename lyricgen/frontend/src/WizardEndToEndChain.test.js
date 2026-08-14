@@ -13,6 +13,7 @@
 
 import { describe, it, expect } from "vitest";
 import { appendBackgroundFields } from "./lib/bgPayload";
+import { buildGenerationJob } from "./lib/buildGenerationJob";
 
 // Mirror de la lógica de handleApproveLyrics (App.jsx:1495+) en su forma
 // pura: dado un currentReview + edited segments, qué shape va a
@@ -36,14 +37,17 @@ function _approvedJobFromReview(r, editedSegments, bgCacheKey) {
     lineTransition: r.lineTransition || "none",
     textContrast: r.textContrast || "medium",
     segments: editedSegments,
+    segmentsRevision: Number.isInteger(r.segmentsRevision) ? r.segmentsRevision : 0,
+    editorRevision: Number.isInteger(r.editorRevision) ? r.editorRevision : null,
+    editorVersionId: r.editorVersionId || null,
     transcribeJobId: r.transcribeJobId,
     bgCacheKey: bgCacheKey || null,
   };
 }
 
-// Mirror de startGenerationWithSegments (App.jsx:1599+): qué fields se
-// appendean al FormData del POST /generate. Verifica que para cada job
-// del batch se envíen TODOS los axes que el operador eligió.
+// Mirror de startGenerationWithSegments (App.jsx): qué fields se appendean
+// al FormData del POST /generate. Verifica que para cada job del batch se
+// envíen TODOS los axes que el operador eligió.
 //
 // Audit adversarial 2026-06-09: los campos de FONDO ya no se espejan a
 // mano — usan el helper REAL appendBackgroundFields (lib/bgPayload.js),
@@ -114,7 +118,10 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
       lyricsAnimation: "karaoke",
       lineTransition: "slide_up",
       textContrast: "strong",
-      transcribeJobId: "abc123",
+    transcribeJobId: "abc123",
+    segmentsRevision: 7,
+    editorRevision: 7,
+    editorVersionId: "version-7",
     };
     const editedSegments = [
       { start: 17.1, end: 18.5, text: "Legalícenla" },
@@ -128,7 +135,8 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
     };
 
     const job = _approvedJobFromReview(currentReview, editedSegments, "bgkey789");
-    const fd = _formDataFromJob(job, delivery, "oscuro", "", { bgSelectMode: "auto" }, true);
+    const generationJob = buildGenerationJob(job);
+    const fd = _formDataFromJob(generationJob, delivery, "oscuro", "", { bgSelectMode: "auto" }, true);
 
     // Identidad
     expect(fd.artist).toBe("Viejas Locas");
@@ -155,6 +163,13 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
     expect(fd.style).toBe("oscuro");
     expect(fd.match_lyrics).toBe("true");
     expect(fd.bg_cache_key).toBe("bgkey789");
+    expect(generationJob).toMatchObject({
+      bgCacheKey: "bgkey789",
+      segmentsRevision: 7,
+      editorRevision: 7,
+      editorVersionId: "version-7",
+      transcribeJobId: "abc123",
+    });
 
     // Delivery UMG full
     expect(fd.delivery_profile).toBe("both");

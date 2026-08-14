@@ -64,6 +64,8 @@ import { track } from "./lib/telemetryTrack";
 import { fetchSse, SseUnauthorizedError } from "./lib/fetchSse";
 import { createSaveQueue } from "./lib/saveQueue";
 import { rebaseEditorSnapshot } from "./lib/rebaseEditorSnapshot";
+import { isEditorRevisionConflict } from "./lib/editorRevisionConflict";
+import { buildGenerationJob } from "./lib/buildGenerationJob";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -3438,8 +3440,7 @@ export default function App() {
             navigate(`/videos/${editedJobId}`, { replace: true });
             return { ok: true, duplicate: true };
           }
-          const conflict = data?.detail && typeof data.detail === "object"
-            && data.detail.detail === "editor_revision_conflict";
+          const conflict = isEditorRevisionConflict(res, data);
           console.warn("[edit-wizard] /edit failed", { status: res.status, detail: data });
           if (!conflict) {
             const friendly = translateBackendError(data?.detail, t) || `Error ${res.status}`;
@@ -3596,31 +3597,7 @@ export default function App() {
       return;
     }
 
-    const jobList = approved.map((a) => ({
-      filename: (a.file && a.file.name) || "audio.mp3", _file: a.file, artist: a.artist,
-      songTitle: (a.songTitle || "").trim(),
-      language: a.language, genre: a.genre || "", font: a.font || "",
-      concept: a.concept || "", movementStyle: a.movementStyle || "", effect: a.effect || "",
-      backgroundHint: a.backgroundHint || "", bgVerbatim: !!a.bgVerbatim,
-      textCase: a.textCase || "upper",
-      fontScale: a.fontScale || "1.0",
-      // lyricTransition + textMotion: deprecados 2026-05-23.
-      lyricsAnimation: a.lyricsAnimation || "none",
-      lineTransition: a.lineTransition || "none",
-      textContrast: a.textContrast || "medium",
-      // Title card customization (Full Rotor v1).
-      titleTemplate: a.titleTemplate || "auto",
-      titleSize: a.titleSize || "1.0",
-      titleArtistFont: a.titleArtistFont || "",
-      titleSongFont: a.titleSongFont || "",
-      titleSongBreak: a.titleSongBreak || "",
-      segments: a.segments,
-      segmentsRevision: Number.isInteger(a.segmentsRevision) ? a.segmentsRevision : 0,
-      editorRevision: Number.isInteger(a.editorRevision) ? a.editorRevision : null,
-      editorVersionId: a.editorVersionId || null,
-      transcribeJobId: a.transcribeJobId || null,
-      status: "queued", current_step: null, progress: 0, job_id: null, error: null,
-    }));
+    const jobList = approved.map(buildGenerationJob);
     setJobs(jobList);
     navigate("/generating");
     setReadyToGenerate(false);
@@ -3737,12 +3714,6 @@ export default function App() {
           // remains guarded by the backend CAS, so this never turns into an
           // unchecked overwrite and the operator never sees a collaboration
           // modal for a normal single-user session.
-          const isEditorRevisionConflict = (response, payload) => (
-            response?.status === 409
-            && payload?.detail
-            && typeof payload.detail === "object"
-            && payload.detail.detail === "editor_revision_conflict"
-          );
           if (isEditorRevisionConflict(res, data) && jobList[i].transcribeJobId) {
             for (let attempt = 0; attempt < 3; attempt += 1) {
               const rebased = await rebaseEditorSnapshot({
@@ -3775,14 +3746,16 @@ export default function App() {
                 if (saveResponse.status === 409) continue;
                 break;
               }
-              if (Number.isInteger(saved.revision)) {
-                generationBaseRevision = saved.revision;
-                formData.set("base_revision", String(saved.revision));
-                formData.set("editor_revision", String(saved.revision));
-                generationVersionId = saved.version_id || null;
-                if (generationVersionId) formData.set("editor_version_id", generationVersionId);
-                else formData.delete("editor_version_id");
-              }
+              // A successful PATCH without a revision is not a usable
+              // approval selector. Do not send the stale selector back to
+              // /generate; fetch/rebase again instead.
+              if (!Number.isInteger(saved.revision)) continue;
+              generationBaseRevision = saved.revision;
+              formData.set("base_revision", String(saved.revision));
+              formData.set("editor_revision", String(saved.revision));
+              generationVersionId = saved.version_id || null;
+              if (generationVersionId) formData.set("editor_version_id", generationVersionId);
+              else formData.delete("editor_version_id");
               res = await authFetch(`${API}/generate`, { method: "POST", body: formData });
               try { data = await res.json(); } catch { data = {}; }
               if (!isEditorRevisionConflict(res, data)) break;

@@ -80,6 +80,19 @@ describe("translateBackendError", () => {
     expect(out).toMatch(/re-renderizando/);
   });
 
+  it("maps both flat and nested editor revision conflicts", () => {
+    const flat = translateBackendError(
+      { code: "stale_revision", detail: "editor_revision_conflict" },
+      () => null,
+    );
+    const nested = translateBackendError(
+      { detail: { detail: "editor_revision_conflict", server_revision: 4 } },
+      () => null,
+    );
+    expect(flat).toMatch(/La letra cambió/);
+    expect(nested).toMatch(/La letra cambió/);
+  });
+
   it("maps the 'no cached background' error to friendly Spanish copy", () => {
     const out = translateBackendError("No cached background available for job", () => null);
     expect(out).toMatch(/fondo cacheado/);
