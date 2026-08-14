@@ -315,8 +315,6 @@ const nearCollision = (left, right) => {
     || b[b.length - 1].startsWith(a[a.length - 1]);
 };
 
-const ACTIVE_TAIL_HOLD_S = 1.2;
-
 /**
  * Canonicalize editor rows while keeping semantic order in a bad overlap.
  * A timestamp sort alone makes a regressed lyric appear before its
@@ -403,7 +401,7 @@ function finiteStart(segment) {
  * position. The later start wins inside an overlap; equal timestamps keep
  * the earliest stable row so duplicate legacy lines do not flicker.
  */
-export function selectActiveSegmentId(segments, currentTime) {
+export function selectActiveSegmentId(segments, currentTime, options = {}) {
   if (!Array.isArray(segments) || !segments.length) return null;
   const time = Number(currentTime);
   if (!Number.isFinite(time)) return null;
@@ -427,9 +425,10 @@ export function selectActiveSegmentId(segments, currentTime) {
   });
 
   const selected = containing || latestStarted;
-  if (!containing && selected) {
+  const tailHoldS = Number(options?.tailHoldS);
+  if (!containing && selected && Number.isFinite(tailHoldS)) {
     const end = Number(selected.segment.end);
-    if (Number.isFinite(end) && time - end > ACTIVE_TAIL_HOLD_S) return null;
+    if (Number.isFinite(end) && time - end > tailHoldS) return null;
   }
   return selected?.segment?._id ?? selected?.index ?? null;
 }

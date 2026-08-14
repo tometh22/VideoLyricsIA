@@ -114,7 +114,7 @@ export default function LyricVideoPreview({
   // playback tick. Keeping one source of truth prevents a malformed overlap
   // from showing a different lyric from the highlighted row.
   const activeSegs = useMemo(() => {
-    const activeId = selectActiveSegmentId(segments, currentTime);
+    const activeId = selectActiveSegmentId(segments, currentTime, { tailHoldS: 1.2 });
     const active = segments.find((segment, index) => (
       (segment?._id ?? index) === activeId
     ));
