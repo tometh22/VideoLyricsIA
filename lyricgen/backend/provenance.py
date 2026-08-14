@@ -22,6 +22,7 @@ Cost accounting rules (2026-08 audit — see docs/COST_TRACKING.md):
   ($163 modeled vs $199.53 billed, the gap being staging + real Imagen /
   Gemini token pricing). `billing_sources.py` pulls the real numbers.
 """
+from __future__ import annotations
 
 import hashlib
 import logging
@@ -89,6 +90,9 @@ COST_PER_CALL: dict[tuple[str, str], float] = {
     ("whisper", "openai"): 0.021,
     # Gap rescue transcribes clips capped at 120 s, not a full ~3.5 min song.
     ("whisper-1-gap-rescue", "openai"): 0.012,
+    # Same bounded clip pricing as gap rescue. Two calls per unsafe window
+    # (stem + mix); the quality stats retain exact billed audio seconds.
+    ("whisper-1-targeted-consensus", "openai"): 0.012,
     # Small text-only formatter call (one numbered lyric payload per song).
     ("gpt-4o-mini", "openai"): 0.001,
     # Human-provided fallback — no AI cost

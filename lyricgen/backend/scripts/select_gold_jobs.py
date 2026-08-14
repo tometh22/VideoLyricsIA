@@ -160,19 +160,19 @@ def _fetch_gold_jobs(db, tenant_like: str, min_diffs: int) -> list[dict]:
                segments_json, audits: [detail,...]}] orden cronológico."""
     from sqlalchemy import text as _sql
     rows = db.execute(_sql("""
-        SELECT j.job_id, j.tenant_id, j.artist, j.song_title, j.input_r2_key,
+        SELECT j.job_id, j.tenant_id, j.artist, j.song_title, j.filename, j.input_r2_key,
                j.segments_json, count(a.id) AS n_diffs
         FROM jobs j
-        JOIN audit_log a
+        LEFT JOIN audit_log a
           ON a.action = 'lyrics.segments_diff'
          AND (a.detail::jsonb)->>'job_id' = j.job_id
         WHERE j.status = 'done'
           AND j.segments_json IS NOT NULL
           AND j.tenant_id LIKE :tl
         GROUP BY j.job_id, j.tenant_id, j.artist, j.song_title,
-                 j.input_r2_key, j.segments_json
+                 j.filename, j.input_r2_key, j.segments_json
         HAVING count(a.id) >= :md
-        ORDER BY max(a.created_at) DESC
+        ORDER BY max(a.created_at) DESC NULLS LAST, j.job_id ASC
     """), {"tl": tenant_like, "md": min_diffs}).mappings().all()
 
     out = []
@@ -191,6 +191,7 @@ def _fetch_gold_jobs(db, tenant_like: str, min_diffs: int) -> list[dict]:
             "tenant_id": r["tenant_id"],
             "artist": r["artist"],
             "song_title": r["song_title"],
+            "filename": r["filename"],
             "input_r2_key": r["input_r2_key"],
             "segments_json": segs,
             "audits": [a if isinstance(a, dict) else json.loads(a) for a in audits],
@@ -207,14 +208,16 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--tenant-like", default="universal%",
                    help="filtro SQL LIKE de tenant (default: universal%%)")
-    p.add_argument("--min-diffs", type=int, default=3,
-                   help="mínimo de audits de corrección para considerar gold (default 3)")
+    p.add_argument("--min-diffs", type=int, default=0,
+                   help="mínimo de audits de corrección (default 0: incluye fáciles y perfectas)")
     p.add_argument("--write-list", action="store_true",
                    help=f"escribe los job_ids en {DEFAULT_LIST.name}")
     p.add_argument("--baseline", action="store_true",
                    help="reporta el error machine-vs-gold rebobinando los diffs")
     p.add_argument("--json", type=Path, default=None,
                    help="además del reporte, volcar todo a un JSON")
+    p.add_argument("--limit", type=int, default=50,
+                   help="máximo de jobs; prioriza hasta 25%% de grabaciones en vivo (default 50)")
     args = p.parse_args()
 
     from database import SessionLocal
@@ -228,6 +231,20 @@ def main() -> None:
         print("No hay jobs gold con esos filtros.")
         sys.exit(1)
 
+    def _looks_live(job):
+        haystack = f"{job.get('song_title') or ''} {job.get('filename') or ''}".casefold()
+        return any(token in haystack for token in (
+            "live", "en vivo", "vivo", "concert", "recital", "estadio",
+        ))
+
+    if args.limit > 0 and len(jobs) > args.limit:
+        live = [job for job in jobs if _looks_live(job)]
+        studio = [job for job in jobs if not _looks_live(job)]
+        # The strict release gate requires at least eight live recordings.
+        # ceil(25%) also keeps the same mix for larger 30–50-song cohorts.
+        live_quota = min(len(live), max(8, (args.limit + 3) // 4))
+        jobs = live[:live_quota] + studio[:args.limit - live_quota]
+
     print(f"{len(jobs)} jobs gold (tenant LIKE {args.tenant_like!r}, "
           f">= {args.min_diffs} correcciones)\n")
 
@@ -240,6 +257,7 @@ def main() -> None:
             "song": j["song_title"],
             "has_audio": bool(j["input_r2_key"]),
             "n_saves": len(j["audits"]),
+            "is_live": _looks_live(j),
         }
         if args.baseline:
             machine, info = rewind_segments(j["segments_json"], j["audits"])

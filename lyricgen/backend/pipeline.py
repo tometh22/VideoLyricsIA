@@ -908,6 +908,25 @@ def _legacy_background_source_is_ai(
     return True
 
 
+def _transcription_quality_render_allowed(
+    job_id: str, segments: list[dict],
+) -> tuple[bool, str | None]:
+    """Single DB-backed quality decision used by every render pipeline."""
+    from database import Job as QualityJob, SessionLocal as QualitySession
+    from transcription_quality import can_render
+
+    quality_db = QualitySession()
+    try:
+        row = quality_db.query(QualityJob).filter(QualityJob.job_id == job_id).first()
+        return can_render(
+            row.transcription_quality if row else None,
+            revision=int(row.segments_revision or 0) if row else 0,
+            segments=segments,
+        )
+    finally:
+        quality_db.close()
+
+
 def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  language: str = None, segments_override: list[dict] = None,
                  delivery_profile: str = "youtube", umg_spec: dict | None = None,
@@ -1267,6 +1286,37 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             update_job(job_id, segments_json=segments, progress=20)
         else:
             update_job(job_id, progress=20)
+
+        # Central cost boundary. Every entry path (/generate, legacy /upload,
+        # retry and queued workers) reaches this point before background/Veo
+        # or rendering. Endpoint-only validation is insufficient because
+        # retries and legacy clients can bypass it.
+        if not art_track:
+            try:
+                _quality_ok, _quality_reason = _transcription_quality_render_allowed(
+                    job_id, segments,
+                )
+                if not _quality_ok:
+                    logger.error(
+                        "[QUALITY-GATE] render blocked reason=%s job=%s",
+                        _quality_reason, job_id,
+                    )
+                    update_job(
+                        job_id, status="error", current_step="quality_review",
+                        error=(
+                            "La letra requiere revisión de calidad antes de renderizar "
+                            f"({_quality_reason})."
+                        ),
+                    )
+                    return
+            except Exception as _quality_exc:
+                logger.exception("[QUALITY-GATE] central render check failed job=%s", job_id)
+                if os.environ.get("TRANSCRIPTION_QUALITY_MODE", "observe").lower() == "enforce":
+                    update_job(
+                        job_id, status="error", current_step="quality_review",
+                        error="No se pudo verificar la calidad de la letra antes del render.",
+                    )
+                    return
 
         # Step 1.5 — Background (AI-generated or human-provided)
         update_job(job_id, current_step="background", progress=22)
@@ -17507,6 +17557,35 @@ def run_edit_pipeline(
             )
     finally:
         db.close()
+
+    # Edits and scene regenerations render through a separate worker entry
+    # point. Check the exact segment snapshot here, before source download,
+    # Veo and the compositor, so /edit cannot bypass the central policy.
+    try:
+        quality_ok, quality_reason = _transcription_quality_render_allowed(
+            job_id, segments,
+        )
+        if not quality_ok:
+            logger.error(
+                "[QUALITY-GATE] edit render blocked reason=%s job=%s type=%s",
+                quality_reason, job_id, edit_type,
+            )
+            update_job(
+                job_id, status="error", current_step="quality_review",
+                error=(
+                    "La letra requiere revisión de calidad antes de renderizar "
+                    f"({quality_reason})."
+                ),
+            )
+            return
+    except Exception:
+        logger.exception("[QUALITY-GATE] edit render check failed job=%s", job_id)
+        if os.environ.get("TRANSCRIPTION_QUALITY_MODE", "observe").lower() == "enforce":
+            update_job(
+                job_id, status="error", current_step="quality_review",
+                error="No se pudo verificar la calidad de la letra antes del render.",
+            )
+            return
 
     # Merge base render params with the requested overrides.
     merged = {**base_params, **edit_params}

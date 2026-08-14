@@ -152,7 +152,8 @@ def voiced_gaps(segments, stem_path: str | None, *,
                 min_gap_s: float = 8.0,
                 min_voiced_s: float = 3.0,
                 min_voiced_frac: float = 0.0,
-                rescue_skipped=None) -> list[dict]:
+                rescue_skipped=None,
+                include_leading: bool = False) -> list[dict]:
     """Huecos entre carteles que contienen CANTO según el VAD del stem.
 
     Es el guardrail que la cobertura por palabras no puede dar: `audio_coverage`
@@ -220,7 +221,10 @@ LA FRACCIÓN NO SIRVE PARA DISTINGUIRLOS — probado y descartado. Tentaba
             except (TypeError, ValueError, IndexError):
                 continue
         out = []
-        for a, b in find_gaps(segments, audio_duration, min_gap_s=min_gap_s):
+        for a, b in find_gaps(
+            segments, audio_duration, min_gap_s=min_gap_s,
+            include_leading=include_leading,
+        ):
             largo = b - a
             if largo <= 0:
                 continue
@@ -238,13 +242,15 @@ LA FRACCIÓN NO SIRVE PARA DISTINGUIRLOS — probado y descartado. Tentaba
 
 def summarize(segments, words, *, stem_path: str | None = None,
               rescue_skipped=None,
-              audio_duration: float | None = None) -> dict:
+              audio_duration: float | None = None,
+              live_hint: bool = False) -> dict:
     """Resumen listo para loguear/persistir."""
     spans = uncovered_spans(segments, words)
     duraciones = [b - a for a, b, _ in spans]
     mismatches = text_mismatches(segments, words)
     vg = voiced_gaps(segments, stem_path, audio_duration=audio_duration,
-                     rescue_skipped=rescue_skipped)
+                     rescue_skipped=rescue_skipped,
+                     include_leading=live_hint)
     return {
         "audio_coverage": round(audio_coverage(segments, words), 4),
         "uncovered_spans": len(spans),

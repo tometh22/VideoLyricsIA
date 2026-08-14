@@ -12,6 +12,7 @@ describe("buildGenerationJob", () => {
       editorRevision: 4,
       editorVersionId: "version-4",
       transcribeJobId: "job-123",
+      operatorMetrics: { active_edit_ms: 1200 },
       bgCacheKey: "preview-123",
     });
 
@@ -21,6 +22,7 @@ describe("buildGenerationJob", () => {
       editorRevision: 4,
       editorVersionId: "version-4",
       transcribeJobId: "job-123",
+      operatorMetrics: { active_edit_ms: 1200 },
       bgCacheKey: "preview-123",
     });
   });

@@ -1928,6 +1928,7 @@ export default function App() {
           segments,
           referenceLyrics: job.reference_lyrics || "",
           coverageWarning: !!job.coverage_warning,
+          transcriptionQuality: job.transcription_quality || null,
           recoverySource: job.recovery_source || "",
           transcribeJobId: resumeJobId,           // backend reusa R2 audio
           queueIdx: 0,
@@ -2822,6 +2823,7 @@ export default function App() {
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         segmentsRevision: Number.isInteger(data.segments_revision) ? data.segments_revision : 0,
         coverageWarning: !!data.coverage_warning,
+        transcriptionQuality: data.transcription_quality || null,
         recoverySource: data.recovery_source || "",
         transcribeJobId: data.job_id || jobId,
         queueIdx: idx, queue,
@@ -2897,6 +2899,7 @@ export default function App() {
             segments: data.segments, referenceLyrics: data.reference_lyrics || "",
             segmentsRevision: Number.isInteger(data.segments_revision) ? data.segments_revision : 0,
             coverageWarning: !!data.coverage_warning,
+            transcriptionQuality: data.transcription_quality || null,
             recoverySource: data.recovery_source || "",
             transcribeJobId: data.job_id || cached.jobId,
             queueIdx: idx, queue,
@@ -3056,6 +3059,7 @@ export default function App() {
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         segmentsRevision: Number.isInteger(data.segments_revision) ? data.segments_revision : 0,
         coverageWarning: !!data.coverage_warning,
+        transcriptionQuality: data.transcription_quality || null,
         recoverySource: data.recovery_source || "",
         transcribeJobId: data.job_id || uploadJobId,
         queueIdx: idx, queue,
@@ -3544,6 +3548,7 @@ export default function App() {
       editorRevision: Number.isInteger(saveMeta.editorRevision) ? saveMeta.editorRevision : null,
       editorVersionId: saveMeta.editorVersionId || null,
       transcribeJobId: r.transcribeJobId || null,
+      operatorMetrics: saveMeta.operatorMetrics || null,
       // Capa C 2026-05-24: bgCacheKey viene del useBackgroundPreview hook
       // que corrió durante review. Si null = no se hizo pre-gen (free-tier
       // o params no estables); pipeline corre Veo/Imagen como siempre.
@@ -3715,6 +3720,9 @@ export default function App() {
         let generationVersionId = jobList[i].editorVersionId || null;
         formData.append("segments_json", JSON.stringify(generationSegments));
         formData.append("base_revision", String(generationBaseRevision));
+        if (jobList[i].operatorMetrics) {
+          formData.append("editor_metrics_json", JSON.stringify(jobList[i].operatorMetrics));
+        }
         if (Number.isInteger(jobList[i].editorRevision)) {
           formData.append("editor_revision", String(jobList[i].editorRevision));
         }
@@ -4137,6 +4145,7 @@ export default function App() {
         textContrast: last.textContrast || "medium",
         segments: last.segments,
         referenceLyrics: "",
+        transcriptionQuality: job.transcription_quality || null,
         coverageWarning: false,
         recoverySource: "",
         queueIdx: approvedJobs.length - 1,
@@ -5066,6 +5075,7 @@ export default function App() {
             onRetryAudio={currentReview.editingJobId ? editorAudioRetryRef.current : null}
             referenceLyrics={currentReview.referenceLyrics || ""}
             coverageWarning={currentReview.coverageWarning}
+            transcriptionQuality={currentReview.transcriptionQuality}
             recoverySource={currentReview.recoverySource}
             onApprove={handleApproveLyrics}
             onBack={handleBackInReview}
