@@ -2653,7 +2653,8 @@ export default function LyricsEditor({
       let approvalSegments = cleaned.map(({ _id, ...rest }) => rest);
       let persistenceSnapshot = cleanedForPersistence;
       for (let attempt = 0; attempt < 3; attempt += 1) {
-        if (!await persistQualityAcknowledgement(currentSave.revision)) return;
+        if (qualityAcknowledged
+          && !await persistQualityAcknowledgement(currentSave.revision)) return;
         approvalResult = await Promise.resolve(onApprove(approvalSegments, {
           baseRevision: currentSave.revision,
           editorRevision: currentSave.revision,
@@ -2694,7 +2695,7 @@ export default function LyricsEditor({
     if (disableAutosave || !onPersistSegments || !transcribeJobId) {
       setIsDirty(false);
       const revision = Number.isInteger(segmentsRevision) ? segmentsRevision : 0;
-      if (!await persistQualityAcknowledgement(revision)) return;
+      if (qualityAcknowledged && !await persistQualityAcknowledgement(revision)) return;
       await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
         baseRevision: revision,
         operatorMetrics,
@@ -2715,7 +2716,8 @@ export default function LyricsEditor({
     const approvedRevision = Number.isInteger(saveResult?.revision)
       ? saveResult.revision
       : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
-    if (!await persistQualityAcknowledgement(approvedRevision)) return;
+    if (qualityAcknowledged
+      && !await persistQualityAcknowledgement(approvedRevision)) return;
     await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
       baseRevision: approvedRevision,
       operatorMetrics,
