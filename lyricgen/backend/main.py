@@ -5281,7 +5281,35 @@ def _maybe_timing_consistency(result, job_id: str):
         if not segs:
             return result
         nuevo = _ka.enforce_line_word_consistency(segs)
-        if nuevo is not segs:
+        # This pass is the last boundary after adlibs, word-vote, chorus
+        # snap, phrase segmentation and formatting. Those stages can replace
+        # rows or reintroduce equal/backward starts after _emit_segments has
+        # already normalized the first candidate. Keep the final payload
+        # monotonic too; otherwise the editor can still receive a valid-looking
+        # response whose playback cursor jumps between rows.
+        before_order = timing_anomalies(nuevo)
+        ordered = normalize_segments_timing(nuevo)
+        after_order = timing_anomalies(ordered)
+        if ordered != nuevo:
+            result = dict(result)
+            result["segments"] = ordered
+            result.setdefault("postpass_stats", {})["timing_order_final"] = {
+                "before": before_order,
+                "after": after_order,
+                "repaired": len(ordered),
+            }
+            logger.warning(
+                "[TIMING-FINAL] repaired postpass order regressions=%s "
+                "duplicate_starts=%s overlaps=%s → regressions=%s "
+                "duplicate_starts=%s overlaps=%s job=%s",
+                before_order["regressions"], before_order["duplicate_starts"],
+                before_order["overlaps"], after_order["regressions"],
+                after_order["duplicate_starts"], after_order["overlaps"],
+                job_id,
+            )
+            nuevo = ordered
+
+        if nuevo is not segs or ordered != segs:
             _ajustadas = sum(
                 1 for s in nuevo
                 if isinstance(s, dict) and s.get("timing_snapped_to_words")
@@ -5291,6 +5319,7 @@ def _maybe_timing_consistency(result, job_id: str):
             result.setdefault("postpass_stats", {})["timing_consistency"] = {
                 "snapped": _ajustadas,
             }
+            result["segments"] = nuevo
             logger.info(
                 "[TIMING-CONSISTENCY] %d/%d carteles re-encuadrados a sus "
                 "palabras job=%s", _ajustadas, len(nuevo), job_id)
@@ -6375,9 +6404,27 @@ async def _run_transcription_for_job(
                     os.environ.get("WHISPERX_NO_HINT_ALWAYS", "0").strip().lower()
                     in ("1", "true", "yes", "on")
                 )
-                _drop_hint = _live_no_hint or _no_hint_always
+                # A live recording is a different performance even when its
+                # duration happens to match the catalogue/studio reference.
+                # The old policy only dropped the prompt for duration-divergent
+                # versions, so same-length lives were still vulnerable to the
+                # reference being copied into the ASR order. Keep the catalogue
+                # for later text correction, but let Whisper hear the upload
+                # without a prompt first. This is the safe audio-first policy
+                # for live-labelled uploads and is independently kill-switchable.
+                _live_audio_truth = bool(
+                    _looks_live(title, filename)
+                    and os.environ.get("LIVE_AUDIO_AS_TRUTH_ENABLED", "1")
+                    .strip().lower() in ("1", "true", "yes", "on")
+                )
+                _drop_hint = _live_no_hint or _live_audio_truth or _no_hint_always
                 if _no_hint_always and not _live_no_hint:
                     logger.info("[WC] WHISPERX_NO_HINT_ALWAYS — clean whisperX, reconcile restores canonical text")
+                elif _live_audio_truth and not _live_no_hint:
+                    logger.info(
+                        "[WC] live audio-as-truth — clean whisperX, "
+                        "catalogue text remains available for reconciliation",
+                    )
                 try:
                     _wx_segs = await asyncio.to_thread(
                         _wx_mod.transcribe_whisperx, _aa, lang,

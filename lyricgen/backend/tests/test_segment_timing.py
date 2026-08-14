@@ -114,3 +114,21 @@ def test_editor_persistence_normalizer_canonicalizes_the_durable_order():
     assert [segment["start"] for segment in normalized] == [
         45.1106, 45.9252, 46.5773, 114.766,
     ]
+
+
+def test_final_normalization_repairs_postpass_duplicate_starts():
+    """Adlib/word postpasses can replace rows after the first emit guard."""
+    segments = [
+        {"start": 5.54, "end": 16.99, "text": "Hoy temprano"},
+        {"start": 19.50, "end": 23.37, "text": "Paso el tiempo"},
+        {"start": 47.65, "end": 52.52, "text": "Oh no, no, no"},
+        {"start": 47.65, "end": 58.13, "text": "Y te alejaste de mí"},
+    ]
+
+    normalized = normalize_segments_timing(segments)
+
+    assert [s["text"] for s in normalized] == [s["text"] for s in segments]
+    assert [s["start"] for s in normalized] == [5.54, 19.5, 47.65, 47.7]
+    assert timing_anomalies(normalized)["regressions"] == 0
+    assert timing_anomalies(normalized)["duplicate_starts"] == 0
+    assert round(normalized[2]["end"] - normalized[2]["start"], 2) == 4.87
