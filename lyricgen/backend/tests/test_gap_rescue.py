@@ -58,6 +58,9 @@ def test_ventana_whisper_registra_provenance_del_job(monkeypatch):
     class _Client:
         audio = SimpleNamespace(transcriptions=_Transcriptions())
 
+        def __init__(self, **kwargs):
+            captured["client_options"] = kwargs
+
     def _ffmpeg(cmd, **_kwargs):
         Path(cmd[-1]).write_bytes(b"audio")
 
@@ -74,6 +77,7 @@ def test_ventana_whisper_registra_provenance_del_job(monkeypatch):
     )
 
     assert words[0]["start"] == 10.1
+    assert captured["client_options"] == {"timeout": 60.0, "max_retries": 0}
     assert captured["job_id"] == "gap-job"
     assert captured["tool_name"] == "whisper-1-gap-rescue"
     assert captured["tool_provider"] == "openai"

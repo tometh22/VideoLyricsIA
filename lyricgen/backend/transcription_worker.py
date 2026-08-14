@@ -67,7 +67,8 @@ def _coverage_de(r) -> float | None:
 
 
 def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
-                           audio_path: str = ""):
+                           audio_path: str = "", *, strip_internal: bool = True,
+                           live_hint: bool = False):
     """Loguea la cobertura final y la compara con la de la cascada y la
     previa al formateador. Saca `_asr_words` del result (transporte interno:
     no se persiste ni llega al cliente). Nunca levanta.
@@ -101,11 +102,24 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                      .get("gap_rescue", {}).get("skipped") or [])
             c = summarize(r.get("segments") or [], words,
                           stem_path=_stem, audio_duration=_dur,
-                          rescue_skipped=_skip)
+                          rescue_skipped=_skip, live_hint=live_hint)
+            # Keep the exact unsafe windows as structured data.  Counts in a
+            # log line are not enough for a bounded retry or for the editor to
+            # take the operator to the problematic part of the song.
+            from audio_coverage import voiced_gaps as _voiced_gaps
+            from transcription_quality import build_unsafe_windows
+            _vg = _voiced_gaps(
+                r.get("segments") or [], _stem, audio_duration=_dur,
+                rescue_skipped=_skip, include_leading=live_hint,
+            )
+            _windows = build_unsafe_windows(
+                r.get("segments") or [], words, voiced_gaps=_vg,
+            )
             cascada = r.get("audio_coverage")
             final = c["audio_coverage"]
             r["audio_coverage"] = final
             r.setdefault("postpass_stats", {})["coverage_final"] = c
+            r["postpass_stats"]["quality_windows"] = _windows
             log = logger.warning if final < 0.8 else logger.info
             log("[COVERAGE] final=%.0f%% (cascada=%s, pre-formatter=%s) "
                 "zonas_sin_letra=%d (%.1fs, peor %.1fs) "
@@ -156,13 +170,69 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
     except Exception as e:
         logger.warning("[COVERAGE] medición final falló: %r job=%s", e, job_id)
     finally:
-        if isinstance(r, dict):
+        if strip_internal and isinstance(r, dict):
             r.pop("_asr_words", None)
         if _stem:
             try:
                 os.unlink(_stem)
             except OSError:
                 pass
+    return r
+
+
+async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
+                                  language: str, antes_fmt: float | None,
+                                  timing_consistency_fn, *, live_hint: bool = False):
+    """Measure, retry only unsafe windows, and persist one final verdict."""
+    from transcription_quality import evaluate
+
+    r = _medir_cobertura_final(
+        r, job_id, antes_fmt, audio_path, strip_internal=False,
+        live_hint=live_hint,
+    )
+    post = r.get("postpass_stats") or {}
+    windows = post.get("quality_windows") or []
+    initial = evaluate(
+        r.get("segments") or [], post.get("coverage_final"),
+        unsafe_windows=windows,
+    )
+    retry_stats = {"attempted": False}
+    try:
+        from targeted_consensus import is_enabled, reprocess
+        if initial.get("decision") != "pass" and windows and is_enabled():
+            r, retry_stats = await asyncio.to_thread(
+                reprocess, r, audio_path, windows,
+                language=language, job_id=job_id,
+            )
+            if retry_stats.get("lines_replaced") or retry_stats.get("lines_inserted"):
+                r = timing_consistency_fn(r, job_id)
+                r = _medir_cobertura_final(
+                    r, job_id, antes_fmt, audio_path, strip_internal=False,
+                    live_hint=live_hint,
+                )
+                post = r.get("postpass_stats") or {}
+                windows = post.get("quality_windows") or []
+    except Exception as exc:
+        logger.warning("[QUALITY-GATE] targeted retry failed: %r job=%s", exc, job_id)
+        retry_stats = {"attempted": True, "declined": [f"exception:{type(exc).__name__}"]}
+
+    final = evaluate(
+        r.get("segments") or [], post.get("coverage_final"),
+        unsafe_windows=windows, retry_stats=retry_stats,
+    )
+    final["initial_decision"] = initial.get("decision")
+    final["initial_score"] = initial.get("score")
+    final["evaluated_revision"] = 0
+    r["transcription_quality"] = final
+    if final["decision"] == "pass":
+        logger.info("[QUALITY-GATE] PASS score=%s job=%s", final["score"], job_id)
+    else:
+        logger.warning(
+            "[QUALITY-GATE] REVIEW_REQUIRED score=%s reasons=%s windows=%d job=%s",
+            final["score"], [x.get("code") for x in final["reasons"]],
+            len(windows), job_id,
+        )
+    r.pop("_asr_words", None)
     return r
 
 
@@ -199,7 +269,7 @@ def run_transcription_job(
         _maybe_timing_consistency, _maybe_word_vote,
         _resolve_postprocess_language, _run_transcription_for_job,
     )
-    from jobs import update_job, get_job
+    from jobs import update_job
     import storage
 
     if not filename:
@@ -285,7 +355,11 @@ def run_transcription_job(
             # arriba pueden haber movido start/end o words de forma
             # independiente. Lockstep con los dos caminos HTTP de main.py.
             r = _maybe_timing_consistency(r, job_id)
-            return _medir_cobertura_final(r, job_id, _antes, audio_path)
+            return await _quality_gate_and_retry(
+                r, audio_path, job_id, _post_lang, _antes,
+                _maybe_timing_consistency,
+                live_hint=live or _looks_live(title, filename),
+            )
 
         result = asyncio.run(_run_with_retime())
     except Exception as e:
@@ -330,16 +404,43 @@ def run_transcription_job(
         # frontend (main.py:2778), so the editor sees `transcribed` and
         # `/generate` sees `transcribed_pending`. Same observable
         # behaviour as the legacy path, no frontend change needed.
-        update_kwargs = {"status": "transcribed_pending", "current_step": "editing"}
-        if segments is not None:
-            update_kwargs["segments_json"] = segments
+        from database import Job, SessionLocal
+        _persist_db = SessionLocal()
+        try:
+            row = (
+                _persist_db.query(Job).filter(Job.job_id == job_id)
+                .with_for_update().first()
+            )
+            if row is None:
+                raise LookupError("job disappeared before transcription persistence")
+            current_revision = int(row.segments_revision or 0)
+            if current_revision > 0 and segments != row.segments_json:
+                # An operator edited while the ASR was running. Preserve the
+                # human version and do not attach a verdict for discarded data.
+                logger.warning(
+                    "[segments-occ] transcription result discarded job=%s revision=%s",
+                    job_id, current_revision,
+                )
+            else:
+                if segments is not None:
+                    row.segments_json = segments
+                quality = result.get("transcription_quality") if isinstance(result, dict) else None
+                if isinstance(quality, dict):
+                    quality = dict(quality)
+                    quality["evaluated_revision"] = current_revision
+                    quality["timing_source"] = row.timing_source or "unknown"
+                    row.transcription_quality = quality
+            row.status = "transcribed_pending"
+            row.current_step = "editing"
+            _persist_db.commit()
+        finally:
+            _persist_db.close()
         # reference_lyrics no tiene columna en el modelo Job (defer a otro PR
         # si el editor lo necesita post-transcribe). Lo dejo en el log para
         # diagnóstico mientras tanto.
         if reference_lyrics:
             logger.info("[TRANSCRIBE-WORKER] job=%s ref_lyrics=%d chars (no persistido aún)",
                         job_id, len(reference_lyrics))
-        update_job(job_id, **update_kwargs)
     except Exception as e:
         logger.warning("[TRANSCRIBE-WORKER] failed to persist final state: %s", e)
     return result

@@ -51,7 +51,26 @@ def test_aoo_extra_repeats_do_not_match_beyond_ground_truth():
 def test_aoo_no_text_match_is_unmatched():
     ground = [seg(10, "alpha beta gamma")]
     output = [seg(10, "totally different words here")]
-    assert sb._aoo(ground, output) == (0.0, 0.0, 0)
+    assert sb._aoo(ground, output) == (2.0, 2.0, 0)
+
+
+def test_live_cohort_cannot_be_hidden_by_studio_improvement():
+    healthy = {
+        "ground_segments": 10,
+        "baseline": {"wer": 0.2, "aoo_mean_s": 0.5, "recall": 0.9},
+        "improvement": {
+            "wer": 0.1, "aoo_mean_s": 0.3, "recall": 0.9, "matched": 9,
+        },
+    }
+    regressed_live = {
+        "ground_segments": 10,
+        "baseline": {"wer": 0.2, "aoo_mean_s": 0.5, "recall": 0.9},
+        "improvement": {
+            "wer": 0.8, "aoo_mean_s": 1.5, "recall": 0.5, "matched": 5,
+        },
+    }
+    assert sb._cohort_no_regression([healthy]) is True
+    assert sb._cohort_no_regression([regressed_live]) is False
 
 
 # ── _recall: fraction of GT lines found ────────────────────────────────────────
@@ -81,6 +100,30 @@ def test_composite_perfect_and_worst():
     assert sb._composite(1.0, 10.0) == pytest.approx(0.0)
     # AOO normalizes at 2s; 1.0s -> 0.25 penalty
     assert sb._composite(0.0, 1.0) == pytest.approx(0.75)
+
+
+def test_operator_percentiles_pin_release_targets():
+    minutes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 20]
+    assert sb._percentile(minutes, 0.50) == 5.5
+    assert sb._percentile(minutes, 0.90) == 9
+    assert sb._percentile([1, 2, 3, 4, 5, 100], 0.50) == 3.5
+    assert sb._percentile([1, 2, 3, 4, 5, 100], 0.90) == 100
+
+
+def test_report_exposes_operational_gate():
+    rows = [
+        {"job_id": f"job-{i}", "source": "test", "is_live": i < 10,
+         "operator_review_minutes": 4 if i < 25 else 9,
+         "operator_time_source": "active_edit_ms",
+         "operator_pipeline_release": "test-release",
+         "baseline": {"wer": 0.2, "aoo_mean_s": 0.4, "composite": 0.8}}
+        for i in range(30)
+    ]
+    report = sb.render_report(rows)
+    assert "30 songs" in report
+    assert "p50: **4.00 min**" in report
+    assert "p90: **9.00 min**" in report
+    assert "Operational target: ✅ PASS" in report
 
 
 # ── _wer (needs jiwer) ─────────────────────────────────────────────────────────

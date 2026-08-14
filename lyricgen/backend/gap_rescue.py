@@ -180,7 +180,8 @@ def _agrupar_en_lineas(words: list[dict]) -> list[list[dict]]:
 
 def _transcribe_window(audio_path: str, ini: float, dur: float,
                        language: str | None = None,
-                       job_id: str | None = None) -> list[dict]:
+                       job_id: str | None = None, *,
+                       provenance_step: str = "gap_rescue") -> list[dict]:
     """Recorta [ini, ini+dur] y lo transcribe con whisper-1 pidiendo
     timestamps por PALABRA. Devuelve words en el marco temporal del audio
     COMPLETO (ya desplazadas). [] ante cualquier fallo."""
@@ -214,8 +215,8 @@ def _transcribe_window(audio_path: str, ini: float, dur: float,
                 from provenance import record_ai_call
                 recorder = record_ai_call(
                     job_id=job_id,
-                    step="gap_rescue",
-                    tool_name="whisper-1-gap-rescue",
+                    step=provenance_step,
+                    tool_name=f"whisper-1-{provenance_step.replace('_', '-')}",
                     tool_provider="openai",
                     prompt=(
                         f"Transcribe rescue window start={ini:.2f}s "
@@ -223,7 +224,10 @@ def _transcribe_window(audio_path: str, ini: float, dur: float,
                     ),
                     input_data_types=["audio_clip"],
                 )
-            r = OpenAI().audio.transcriptions.create(**kwargs)
+            # Cost-capped rescue owns its retry policy. SDK retries would
+            # submit the same audio again without the caller being able to
+            # reserve or report those extra billed seconds.
+            r = OpenAI(timeout=60.0, max_retries=0).audio.transcriptions.create(**kwargs)
         if recorder:
             recorder.finish(response_summary="succeeded")
         out = []

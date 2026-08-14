@@ -4073,6 +4073,11 @@ async def transcribe_uploaded(
             status_code=409,
             detail="Job has no associated upload.",
         )
+    if int(getattr(job_row, "segments_revision", 0) or 0) > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="La letra ya tiene ediciones guardadas; creá una nueva transcripción para no sobrescribirlas.",
+        )
 
     # SNAPSHOT + release (incidente agus77 06/07): la descarga de R2 de
     # abajo tarda decenas de segundos con un WAV de 45-150 MB, y este
@@ -4272,7 +4277,12 @@ async def transcribe_uploaded(
         # Último post-pase: la ventana de cada cartel debe coincidir con sus
         # propias palabras (audit 2026-08-13). Lockstep con el worker y con
         # /transcribe — si se agrega acá y no allá, los caminos divergen.
-        return _maybe_timing_consistency(_result, job_id)
+        _result = _maybe_timing_consistency(_result, job_id)
+        return await _finalize_inline_transcription_quality(
+            _result, audio_path, job_id, _post_lang,
+            live_hint=bool(getattr(body, "live", False))
+            or _looks_live(_row_title, _row_filename),
+        )
     finally:
         _release_transcription_slot(transcription_lease)
 
@@ -4333,6 +4343,8 @@ def transcription_status(
             "segments": None,
             "reference_lyrics": None,
             "coverage_warning": bool(getattr(job_row, "coverage_warning", False)),
+            "transcription_quality": getattr(job_row, "transcription_quality", None),
+            "segments_revision": int(getattr(job_row, "segments_revision", 0) or 0),
             "recovery_source": getattr(job_row, "recovery_source", None),
             "error": None,
         }
@@ -4991,7 +5003,11 @@ async def transcribe_endpoint(
     from lyrics_format import format_lyrics_pass as _fmt
     _result = await _fmt(_result, language=_post_lang)
     # Lockstep con el worker y con /transcribe-uploaded — ver el comentario ahí.
-    return _maybe_timing_consistency(_result, job_id)
+    _result = _maybe_timing_consistency(_result, job_id)
+    return await _finalize_inline_transcription_quality(
+        _result, audio_path, job_id, _post_lang,
+        live_hint=_looks_live(title, file.filename),
+    )
 
 
 from ctc_cascade_veto import _ctc_cascade_veto  # noqa: E402
@@ -5337,6 +5353,55 @@ def _maybe_timing_consistency(result, job_id: str):
     except Exception as e:
         logger.warning("[TIMING-CONSISTENCY] wrapper declinó: %r (job=%s)", e, job_id)
         return result
+
+
+async def _finalize_inline_transcription_quality(result, audio_path: str,
+                                                 job_id: str, language: str, *,
+                                                 live_hint: bool = False):
+    """Keep the two legacy HTTP transcription paths aligned with the worker.
+
+    Async RQ is the normal path, but a rollback flag can still execute these
+    handlers inline. A safety gate that disappears during rollback is not a
+    safety gate, so they use the exact same finalizer and persist its verdict.
+    """
+    from transcription_worker import _quality_gate_and_retry
+
+    finalized = await _quality_gate_and_retry(
+        result, audio_path, job_id, language, None,
+        _maybe_timing_consistency, live_hint=live_hint,
+    )
+    try:
+        from database import SessionLocal as _QualitySession
+        _quality_db = _QualitySession()
+        try:
+            row = (
+                _quality_db.query(Job).filter(Job.job_id == job_id)
+                .with_for_update().first()
+            )
+            if row is not None:
+                segments = finalized.get("segments") or []
+                revision = int(row.segments_revision or 0)
+                if revision > 0 and segments != row.segments_json:
+                    logger.warning(
+                        "[QUALITY-GATE] inline result discarded after editor race job=%s revision=%s",
+                        job_id, revision,
+                    )
+                else:
+                    row.segments_json = segments
+                    quality = finalized.get("transcription_quality")
+                    if isinstance(quality, dict):
+                        quality = dict(quality)
+                        quality["evaluated_revision"] = revision
+                        quality["timing_source"] = row.timing_source or "unknown"
+                    row.transcription_quality = quality
+                row.status = "transcribed_pending"
+                row.current_step = "editing"
+                _quality_db.commit()
+        finally:
+            _quality_db.close()
+    except Exception as exc:
+        logger.warning("[QUALITY-GATE] inline persistence failed: %s job=%s", exc, job_id)
+    return finalized
 
 
 def _maybe_phrase_segment(result, job_id: str):
@@ -8472,6 +8537,7 @@ async def generate_with_segments(
     # generoso que rechaza payload absurdo sin restringir casos reales.
     segments_json: str = Form(..., max_length=5_000_000),
     base_revision: str = Form("", max_length=20),
+    editor_metrics_json: str = Form("", max_length=2000),
     editor_version_id: str = Form("", max_length=36),
     editor_revision: str = Form("", max_length=20),
     delivery_profile: str = Form("youtube", max_length=20),  # Job.delivery_profile = VARCHAR(20)
@@ -8800,6 +8866,15 @@ async def generate_with_segments(
             .with_for_update()
             .first()
         )
+        if (job_row is None
+                or job_row.tenant_id != current_user["tenant_id"]
+                or job_row.status not in (
+                    "transcribed_pending", "transcribed", "awaiting_upload",
+                )):
+            return JSONResponse(
+                status_code=409,
+                content={"code": "job_not_generatable", "detail": "Job changed before generation."},
+            )
         current_revision = int(getattr(job_row, "segments_revision", 0) or 0)
         if requested_revision is None and current_revision > 0:
             return JSONResponse(
@@ -8825,6 +8900,67 @@ async def generate_with_segments(
             job_row.segments_json = segments
             job_row.segments_revision = current_revision + 1
             current_revision += 1
+        from transcription_quality import can_render as _quality_can_render
+        _quality_ok, _quality_reason = _quality_can_render(
+            getattr(job_row, "transcription_quality", None),
+            revision=current_revision,
+            segments=job_row.segments_json or segments,
+        )
+        if not _quality_ok:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "code": _quality_reason,
+                    "detail": "La transcripción tiene zonas inseguras que deben revisarse antes de renderizar.",
+                    "transcription_quality": job_row.transcription_quality,
+                    "current_revision": current_revision,
+                },
+            )
+        if editor_metrics_json:
+            try:
+                _editor_metrics = json.loads(editor_metrics_json)
+                if not isinstance(_editor_metrics, dict):
+                    raise ValueError("metrics must be an object")
+                _allowed_metrics = {
+                    "duration_ms", "active_edit_ms", "line_count", "text_changes",
+                    "timing_changes", "lines_added", "lines_removed",
+                    "lines_reordered", "quality_acknowledged", "session_id",
+                }
+                if any(
+                    key not in _allowed_metrics
+                    or not _valid_product_event_property(key, value)
+                    for key, value in _editor_metrics.items()
+                ):
+                    raise ValueError("invalid metric property")
+                _editor_metrics["revision"] = current_revision
+                _event_quality = job_row.transcription_quality or {}
+                _editor_metrics["pipeline_release"] = str(
+                    _event_quality.get("pipeline_release") or "unknown"
+                )[:64]
+                _editor_metrics["pipeline_config_fingerprint"] = str(
+                    _event_quality.get("pipeline_config_fingerprint") or "unknown"
+                )[:32]
+                _editor_metrics["timing_source"] = str(
+                    _event_quality.get("timing_source") or "unknown"
+                )[:64]
+                _editor_metrics["quality_policy_version"] = str(
+                    _event_quality.get("policy_version") or "unknown"
+                )[:64]
+                _editor_metrics["quality_reason_codes"] = ",".join(
+                    str(reason.get("code"))
+                    for reason in (_event_quality.get("reasons") or [])
+                    if isinstance(reason, dict) and reason.get("code")
+                )[:500]
+                from database import ProductEvent
+                db.add(ProductEvent(
+                    tenant_id=current_user["tenant_id"],
+                    user_id=current_user["id"], job_id=job_id,
+                    name="editor_approved", properties=_editor_metrics,
+                ))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise HTTPException(
+                    status_code=422, detail=f"invalid editor metrics: {exc}"
+                ) from None
         job_row.artist = artist
         job_row.song_title = song_title or None
         job_row.style = style
@@ -10886,11 +11022,23 @@ async def get_editor_document(
     _audit_cross_tenant_access(db, current_user, job, "editor_read", commit=False)
     db.commit()  # lazy migration/reconciliation is an intentional GET side effect
     payload = serialize_document(db, document)
+    editor_quality = getattr(job, "transcription_quality", None)
+    if not isinstance(editor_quality, dict) and job.segments_json:
+        # Expand compatibility for legacy jobs without mutating on GET. The
+        # editor receives an explicit fail-closed verdict and its approval
+        # endpoint persists the revision/hash-scoped acknowledgement.
+        from transcription_quality import evaluate as evaluate_transcription_quality
+        editor_quality = evaluate_transcription_quality(job.segments_json, None)
+        editor_quality["evaluated_revision"] = int(job.segments_revision or 0)
+        editor_quality["pipeline_release"] = "legacy_unknown"
+        editor_quality["pipeline_config_fingerprint"] = "unknown"
+        editor_quality["timing_source"] = job.timing_source or "unknown"
     payload.update({
         "artist": job.artist,
         "song_title": job.song_title,
         "filename": job.filename,
         "job_status": job.status,
+        "transcription_quality": editor_quality,
     })
     return payload
 
@@ -11071,10 +11219,15 @@ _PRODUCT_EVENT_PROPERTIES = {
     "editor_autosave_failed": {"duration_ms", "checkpoint", "reason", "status", "retry_count"},
     "editor_conflict": {"server_revision", "local_revision", "resolution"},
     "editor_version_restored": {"from_revision", "to_revision"},
-    "editor_approved": {"revision", "duration_ms"},
+    "editor_approved": {
+        "revision", "duration_ms", "line_count", "text_changes",
+        "timing_changes", "lines_added", "lines_removed",
+        "lines_reordered", "active_edit_ms", "quality_acknowledged",
+    },
     "editor_help_opened": {"context"},
 }
 _PRODUCT_EVENT_COMMON_PROPERTIES = {"session_id"}
+from product_telemetry import valid_property as _valid_product_event_property
 
 
 @app.post("/analytics/events")
@@ -11093,14 +11246,18 @@ async def record_product_events(
         if item.name not in _PRODUCT_EVENT_NAMES:
             rejected += 1
             continue
-        if item.job_id and not get_job_for_tenant(db, item.job_id, current_user["tenant_id"]):
+        event_job = (
+            get_job_for_tenant(db, item.job_id, current_user["tenant_id"])
+            if item.job_id else None
+        )
+        if item.job_id and not event_job:
             rejected += 1
             continue
         allowed = _PRODUCT_EVENT_PROPERTIES[item.name] | _PRODUCT_EVENT_COMMON_PROPERTIES
         properties = {}
         invalid_properties = False
         for key, value in (item.properties or {}).items():
-            if key not in allowed or not isinstance(value, (str, int, float, bool)):
+            if key not in allowed or not _valid_product_event_property(key, value):
                 invalid_properties = True
                 break
             properties[key] = value
@@ -11110,6 +11267,25 @@ async def record_product_events(
         if len(json.dumps(properties, ensure_ascii=False)) > 2000:
             rejected += 1
             continue
+        if event_job is not None:
+            event_quality = event_job.transcription_quality or {}
+            properties["pipeline_release"] = str(
+                event_quality.get("pipeline_release") or "unknown"
+            )[:64]
+            properties["pipeline_config_fingerprint"] = str(
+                event_quality.get("pipeline_config_fingerprint") or "unknown"
+            )[:32]
+            properties["timing_source"] = str(
+                event_quality.get("timing_source") or "unknown"
+            )[:64]
+            properties["quality_policy_version"] = str(
+                event_quality.get("policy_version") or "unknown"
+            )[:64]
+            properties["quality_reason_codes"] = ",".join(
+                str(reason.get("code"))
+                for reason in (event_quality.get("reasons") or [])
+                if isinstance(reason, dict) and reason.get("code")
+            )[:500]
         occurred_at = None
         if item.occurred_at:
             try:
@@ -11137,13 +11313,49 @@ async def product_metrics(
     if not current_user.get("is_super_admin"):
         query = query.filter(ProductEvent.tenant_id == current_user["tenant_id"])
     rows = query.order_by(ProductEvent.created_at.desc()).limit(10000).all()
+    approval_query = db.query(ProductEvent).filter(ProductEvent.name == "editor_approved")
+    if not current_user.get("is_super_admin"):
+        approval_query = approval_query.filter(
+            ProductEvent.tenant_id == current_user["tenant_id"]
+        )
+    approval_rows = approval_query.order_by(ProductEvent.created_at.desc()).limit(10000).all()
+    rows_by_id = {row.id: row for row in rows}
+    rows_by_id.update({row.id: row for row in approval_rows})
+    rows = sorted(rows_by_id.values(), key=lambda row: row.created_at, reverse=True)
+    event_job_ids = {row.job_id for row in rows if row.job_id}
+    job_quality_context = {
+        row.job_id: {
+            "timing_source": row.timing_source or "unknown",
+            "quality": row.transcription_quality or {},
+        }
+        for row in (
+            db.query(Job.job_id, Job.timing_source, Job.transcription_quality)
+            .filter(Job.job_id.in_(event_job_ids))
+            .all()
+            if event_job_ids else []
+        )
+    }
     counts: dict[str, int] = {}
     group_move_durations = []
+    approval_durations = []
+    correction_totals = {
+        "text_changes": 0, "timing_changes": 0,
+        "lines_added": 0, "lines_removed": 0,
+        "lines_reordered": 0,
+    }
+    route_work: dict[str, dict] = {}
+    release_work: dict[str, list[float]] = {}
+    seen_approvals: set[tuple] = set()
     sessions: dict[tuple, dict] = {}
     view_usage = {"basic": 0, "advanced": 0}
     for row in rows:
-        counts[row.name] = counts.get(row.name, 0) + 1
         properties = row.properties or {}
+        if row.name == "editor_approved":
+            approval_key = (row.job_id, properties.get("revision"))
+            if approval_key in seen_approvals:
+                continue
+            seen_approvals.add(approval_key)
+        counts[row.name] = counts.get(row.name, 0) + 1
         timestamp = row.occurred_at or row.created_at
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
@@ -11170,6 +11382,47 @@ async def product_metrics(
             session["first_edit"] = timestamp if session["first_edit"] is None else min(session["first_edit"], timestamp)
         if row.name == "editor_group_moved" and isinstance(properties.get("duration_ms"), (int, float)):
             group_move_durations.append(float(properties["duration_ms"]))
+        if row.name == "editor_approved":
+            # Operational SLA is active editing time only. Legacy wall-clock
+            # remains available in raw events but can never make the target
+            # pass or contaminate release percentiles.
+            active_duration = properties.get("active_edit_ms")
+            if isinstance(active_duration, (int, float)):
+                approval_durations.append(float(active_duration))
+                release = str(properties.get("pipeline_release") or "unknown")
+                release_work.setdefault(release, []).append(float(active_duration))
+            for correction_name in correction_totals:
+                value = properties.get(correction_name)
+                if isinstance(value, (int, float)):
+                    correction_totals[correction_name] += int(value)
+            context = job_quality_context.get(row.job_id) or {}
+            route = str(
+                properties.get("timing_source")
+                or context.get("timing_source") or "unknown"
+            )
+            route_row = route_work.setdefault(route, {
+                "songs": 0, "durations": [], "text_changes": 0,
+                "timing_changes": 0, "quality_reasons": {},
+            })
+            route_row["songs"] += 1
+            if isinstance(active_duration, (int, float)):
+                route_row["durations"].append(float(active_duration))
+            for correction_name in ("text_changes", "timing_changes"):
+                value = properties.get(correction_name)
+                if isinstance(value, (int, float)):
+                    route_row[correction_name] += int(value)
+            immutable_reason_codes = str(properties.get("quality_reason_codes") or "")
+            reason_codes = [code for code in immutable_reason_codes.split(",") if code]
+            if not reason_codes:
+                reason_codes = [
+                    str(reason["code"])
+                    for reason in ((context.get("quality") or {}).get("reasons") or [])
+                    if isinstance(reason, dict) and reason.get("code")
+                ]
+            for code in reason_codes:
+                route_row["quality_reasons"][code] = (
+                    route_row["quality_reasons"].get(code, 0) + 1
+                )
     session_durations = [
         (session["last"] - session["first"]).total_seconds() * 1000
         for session in sessions.values() if session["last"] >= session["first"]
@@ -11182,6 +11435,42 @@ async def product_metrics(
     ]
     opened = counts.get("editor_opened", 0)
     approvals = counts.get("editor_approved", 0)
+    def _percentile(values, quantile):
+        if not values:
+            return None
+        ordered = sorted(values)
+        if quantile == 0.50:
+            import statistics
+            return statistics.median(ordered)
+        import math
+        index = max(0, min(len(ordered) - 1, math.ceil(quantile * len(ordered)) - 1))
+        return ordered[index]
+    review_p50 = _percentile(approval_durations, 0.50)
+    review_p90 = _percentile(approval_durations, 0.90)
+    route_metrics = {
+        route: {
+            "songs": values["songs"],
+            "review_p50_ms": _percentile(values["durations"], 0.50),
+            "review_p90_ms": _percentile(values["durations"], 0.90),
+            "text_changes": values["text_changes"],
+            "timing_changes": values["timing_changes"],
+            "quality_reasons": values["quality_reasons"],
+        }
+        for route, values in route_work.items()
+    }
+    release_metrics = {
+        release: {
+            "songs": len(durations),
+            "review_p50_ms": _percentile(durations, 0.50),
+            "review_p90_ms": _percentile(durations, 0.90),
+            "target_met": (
+                len(durations) >= 30
+                and _percentile(durations, 0.50) < 5 * 60 * 1000
+                and _percentile(durations, 0.90) < 10 * 60 * 1000
+            ),
+        }
+        for release, durations in release_work.items()
+    }
     return {
         "events": counts,
         "sample_size": len(rows),
@@ -11198,6 +11487,23 @@ async def product_metrics(
             sum(session_durations) / len(session_durations) if session_durations else None
         ),
         "avg_time_to_first_edit_ms": sum(first_edits) / len(first_edits) if first_edits else None,
+        "operator_review": {
+            "sample_size": len(approval_durations),
+            "p50_ms": review_p50,
+            "p90_ms": review_p90,
+            "target_p50_ms": 5 * 60 * 1000,
+            "target_p90_ms": 10 * 60 * 1000,
+            "target_met": (
+                len(approval_durations) >= 30
+                and len(release_work) == 1
+                and review_p50 is not None and review_p90 is not None
+                and review_p50 < 5 * 60 * 1000
+                and review_p90 < 10 * 60 * 1000
+            ),
+            "corrections": correction_totals,
+            "by_timing_source": route_metrics,
+            "by_pipeline_release": release_metrics,
+        },
     }
 
 
@@ -11461,6 +11767,19 @@ async def save_segments(
                 reorder.append({"id": k, "from_idx": prev_idx, "to_idx": new_idx})
 
         if changed or reorder:
+            correction_summary = {
+                "changed_lines": len(changed),
+                "text_changes": sum(
+                    1 for item in changed
+                    if item.get("prev_text") != item.get("new_text")
+                ),
+                "timing_changes": sum(
+                    1 for item in changed
+                    if item.get("prev_start") != item.get("new_start")
+                    or item.get("prev_end") != item.get("new_end")
+                ),
+                "reorders": len(reorder),
+            }
             truncated = False
             if len(changed) > 20:
                 changed = changed[:20]
@@ -11476,6 +11795,7 @@ async def save_segments(
                     "n_lines": len(segs),
                     "changed": changed,
                     "reorder": reorder,
+                    "correction_summary": correction_summary,
                     "truncated": truncated,
                 },
             ))
@@ -11516,6 +11836,81 @@ async def save_segments(
         "applied": True,
         "revision": int(getattr(job, "segments_revision", 0) or 0),
     }
+
+
+class TranscriptionQualityAckRequest(BaseModel):
+    base_revision: int = Field(..., ge=0)
+
+
+@app.post("/jobs/{job_id}/transcription-quality/acknowledge")
+async def acknowledge_transcription_quality(
+    job_id: str,
+    body: TranscriptionQualityAckRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Persist an explicit, revision+content-scoped operator decision."""
+    job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
+    is_platform_admin = bool(current_user.get("is_super_admin"))
+    if (not job or (not is_platform_admin
+                    and job.tenant_id != current_user["tenant_id"])):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    current_revision = int(job.segments_revision or 0)
+    if body.base_revision != current_revision:
+        return JSONResponse(
+            status_code=409,
+            content={"code": "stale_revision", "current_revision": current_revision},
+        )
+    from transcription_quality import (
+        POLICY_VERSION, evaluate as evaluate_transcription_quality,
+        segments_hash,
+    )
+    previous_quality = (
+        dict(job.transcription_quality)
+        if isinstance(job.transcription_quality, dict) else {}
+    )
+    if previous_quality.get("policy_version") != POLICY_VERSION:
+        # Legacy/stale jobs have no trustworthy machine evidence under the
+        # current policy. Create a fail-closed verdict, then let this explicit
+        # operator action acknowledge only the exact current revision+hash.
+        quality = evaluate_transcription_quality(job.segments_json or [], None)
+        quality["evaluated_revision"] = current_revision
+        quality["pipeline_release"] = str(
+            previous_quality.get("pipeline_release") or "legacy_unknown"
+        )[:64]
+        quality["pipeline_config_fingerprint"] = str(
+            previous_quality.get("pipeline_config_fingerprint") or "unknown"
+        )[:32]
+        quality["timing_source"] = str(
+            previous_quality.get("timing_source")
+            or job.timing_source or "unknown"
+        )[:64]
+    else:
+        quality = previous_quality
+    current_hash = segments_hash(job.segments_json or [])
+    quality["acknowledgement"] = {
+        "revision": current_revision,
+        "segments_hash": current_hash,
+        "policy_version": quality.get("policy_version"),
+        "user_id": current_user["id"],
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    job.transcription_quality = quality
+    db.add(AuditLog(
+        user_id=current_user["id"], action="lyrics.quality_acknowledged",
+        detail={
+            "job_id": job_id, "revision": current_revision,
+            "segments_hash": current_hash,
+            "policy_version": quality.get("policy_version"),
+            "score": quality.get("score"),
+            "reason_codes": [
+                item.get("code") for item in (quality.get("reasons") or [])
+                if isinstance(item, dict)
+            ],
+        },
+    ))
+    db.commit()
+    return {"ok": True, "revision": current_revision, "segments_hash": current_hash}
 
 
 # Mismos estados en los que el LyricsEditor está operativamente montado

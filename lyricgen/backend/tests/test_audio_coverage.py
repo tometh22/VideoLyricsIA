@@ -229,6 +229,18 @@ def test_voiced_gap_cola_final(monkeypatch, tmp_path):
     assert len(got) == 1 and got[0]["voiced_s"] > 50
 
 
+def test_voiced_gap_inicial_solo_cuenta_con_live_hint(monkeypatch, tmp_path):
+    from audio_coverage import voiced_gaps
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"x")
+    _mock_vad(monkeypatch, [(2.0, 11.0)])
+    segments = [_seg(13.0, 17.0), _seg(20.0, 24.0)]
+    assert voiced_gaps(segments, str(stem), audio_duration=30.0) == []
+    got = voiced_gaps(
+        segments, str(stem), audio_duration=30.0, include_leading=True,
+    )
+    assert got and got[0]["start"] == 0.0
+
+
 def test_summarize_incluye_voiced_gap(monkeypatch, tmp_path):
     from audio_coverage import summarize
     stem = tmp_path / "s.wav"; stem.write_bytes(b"x")
