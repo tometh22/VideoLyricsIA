@@ -292,6 +292,59 @@ def _voiced_overlap(a: float, b: float, regs: list[tuple]) -> float:
     return sum(max(0.0, min(b, rb) - max(a, ra)) for ra, rb in regs)
 
 
+def _sparse_reference_cluster(
+    words: list[dict], reference_tokens: set[str], regs: list[tuple],
+    *, max_cadence_gap_s: float = 12.0,
+) -> list[list[dict]]:
+    """Return the strongest physically plausible sparse refrain cluster.
+
+    Sparse live hooks need a different shape gate than prose: several isolated
+    one-word lines, each long enough to be sung, occurring at a continuous
+    cadence.  Dense timestamp bursts and isolated tail hallucinations are
+    rejected even if their token appears somewhere in the reference.
+    """
+    import re as _re
+
+    plausible: list[list[dict]] = []
+    for group in _agrupar_en_lineas(words):
+        if not group:
+            continue
+        start = _f(group[0].get("start"))
+        end = _f(group[-1].get("end"))
+        duration = end - start
+        tokens = {
+            token
+            for word in group
+            for token in _re.findall(
+                r"[^\W\d_]+", str(word.get("word", "")).casefold(),
+                _re.UNICODE,
+            )
+        }
+        if (not tokens or not reference_tokens
+                or not tokens.issubset(reference_tokens)
+                or duration < _MIN_LINE_S or duration > _LINE_MAX_S
+                or len(group) / max(duration, 0.1) > _MAX_WORDS_PER_S):
+            continue
+        if regs and _voiced_overlap(start, end, regs) < min(
+                _VAD_LINE_OVERLAP, duration * 0.5):
+            continue
+        plausible.append(group)
+
+    clusters: list[list[list[dict]]] = []
+    current: list[list[dict]] = []
+    for group in plausible:
+        start = _f(group[0].get("start"))
+        if (current and start - _f(current[-1][0].get("start"))
+                > max_cadence_gap_s):
+            clusters.append(current)
+            current = []
+        current.append(group)
+    if current:
+        clusters.append(current)
+    best = max(clusters, key=len, default=[])
+    return best if len(best) >= _MIN_WORDS else []
+
+
 def rescue(segments: list[dict], audio_path: str, *,
            stem_path: str | None = None,
            audio_duration: float | None = None, language: str | None = None,
@@ -367,25 +420,39 @@ def rescue(segments: list[dict], audio_path: str, *,
             words = [w for w in words
                      if zona_a <= (_f(w.get("start")) + _f(w.get("end"))) / 2
                      <= zona_b]
-            recovered_tokens = [
-                token
-                for w in words
-                for token in _re.findall(
-                    r"[^\W\d_]+", str(w.get("word", "")).casefold(),
-                    _re.UNICODE,
-                )
-            ]
             # Sparse repeated hooks ("Real" every 6s) are legitimate in live
-            # outros but fail the normal prose-density gate. Accept that shape
-            # only when at least three independent words all occur in the known
-            # reference; VAD still gates each emitted singleton below.
-            sparse_live_refrain = bool(
-                include_leading
-                and len(words) >= _MIN_WORDS
-                and recovered_tokens
-                and reference_tokens
-                and set(recovered_tokens).issubset(reference_tokens)
-            )
+            # outros but fail the normal prose-density gate. First score the
+            # stem witness. Stem separation can distort the lexical vowel, so
+            # if it has no physically plausible cadence cluster, compare one
+            # independent pass over the original mix and use it only when it
+            # supplies >=3 reference-backed, VAD-backed hits.
+            sparse_groups: list[list[dict]] = []
+            sparse_source = stats["source"]
+            if include_leading and not leading_gap and reference_tokens:
+                sparse_groups = _sparse_reference_cluster(
+                    words, reference_tokens, regs,
+                )
+                if not sparse_groups and stats["source"] == "stem":
+                    mix_words = _transcribe_window(
+                        audio_path, w_ini, w_fin - w_ini,
+                        language, job_id=job_id,
+                    )
+                    mix_words = [
+                        w for w in mix_words
+                        if zona_a <= (_f(w.get("start")) + _f(w.get("end"))) / 2
+                        <= zona_b
+                    ]
+                    mix_groups = _sparse_reference_cluster(
+                        mix_words, reference_tokens, regs,
+                    )
+                    if len(mix_groups) > len(sparse_groups):
+                        sparse_groups = mix_groups
+                        words = [word for group in mix_groups for word in group]
+                        sparse_source = "mix-witness"
+                if sparse_groups:
+                    words = [word for group in sparse_groups for word in group]
+                    stats["sparse_source"] = sparse_source
+            sparse_live_refrain = bool(sparse_groups)
             if ((not leading_gap and len(words) < _MIN_WORDS)
                     or (not leading_gap and not sparse_live_refrain
                         and len(words) / (zona_b - zona_a)

@@ -6976,6 +6976,56 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
         out_segs.append({"start": float(st), "end": float(en),
                          "text": txt, "words": grp,
                          "llm_segmented": True})
+
+    # Collapse provider-timestamp failures without throwing away the clean
+    # segmentation of the rest of the song. A run of >=3 identical singleton
+    # lines packed at sub-2s cadence is not three lyric cards; it is one
+    # repeated hook whose word alignments collapsed into the same window.
+    # Keep every acoustic word attached for observability, but expose one safe
+    # card so the independent gap witness can recover later repetitions.
+    import statistics as _statistics
+    collapsed: list[dict] = []
+    pos = 0
+    while pos < len(out_segs):
+        line = out_segs[pos]
+        tokens = re.findall(r"[^\W\d_]+", line.get("text", "").casefold(), re.UNICODE)
+        if len(tokens) != 1:
+            collapsed.append(line)
+            pos += 1
+            continue
+        end_pos = pos + 1
+        while end_pos < len(out_segs):
+            next_tokens = re.findall(
+                r"[^\W\d_]+", out_segs[end_pos].get("text", "").casefold(),
+                re.UNICODE,
+            )
+            if next_tokens != tokens:
+                break
+            end_pos += 1
+        run = out_segs[pos:end_pos]
+        gaps = [
+            float(b["start"]) - float(a["start"])
+            for a, b in zip(run, run[1:])
+        ]
+        if (len(run) >= 3 and gaps
+                and _statistics.median(gaps) < 2.0):
+            merged = dict(run[0])
+            merged["end"] = max(float(item["end"]) for item in run)
+            merged["words"] = [
+                word for item in run for word in (item.get("words") or [])
+            ]
+            merged["review"] = True
+            merged["collapsed_repetition"] = len(run)
+            collapsed.append(merged)
+            logger.warning(
+                "[LLM-SEGMENT] collapsed %d repeated singleton lines with "
+                "provider-compressed timing", len(run),
+            )
+        else:
+            collapsed.extend(run)
+        pos = end_pos
+    out_segs = collapsed
+
     if len(out_segs) < 2:
         return segs
     # The index partition can be perfect while the provider's repeated-word

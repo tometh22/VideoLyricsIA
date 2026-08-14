@@ -147,6 +147,39 @@ def test_self_declines_when_mapped_line_times_are_collapsed(
     ) is collapsed
 
 
+def test_collapses_compressed_repeated_singletons_but_keeps_other_lines(
+        tiny_audio, monkeypatch):
+    monkeypatch.setenv("LLM_SEGMENT_ENABLED", "1")
+    words = [
+        {"word": "Y", "start": 55.0, "end": 55.4},
+        {"word": "te", "start": 55.4, "end": 55.8},
+        {"word": "alejaste", "start": 55.8, "end": 56.8},
+        {"word": "de-mi", "start": 56.8, "end": 58.0},
+        {"word": "Real", "start": 60.0, "end": 60.8},
+        {"word": "Real", "start": 61.1, "end": 61.8},
+        {"word": "Real", "start": 62.2, "end": 62.9},
+        {"word": "Real", "start": 63.3, "end": 64.0},
+    ]
+    segs = [{
+        "start": 55.0, "end": 64.0,
+        "text": "Y te alejaste de mí Real Real Real Real", "words": words,
+    }]
+    _mock_gemini(
+        monkeypatch,
+        "[0-3] Y te alejaste de mí\n[4-4] Real\n[5-5] Real\n"
+        "[6-6] Real\n[7-7] Real",
+    )
+
+    out = pipeline._llm_segment_words(segs, audio_path=tiny_audio)
+
+    assert [line["text"] for line in out] == ["Y te alejaste de mí", "Real"]
+    assert out[1]["start"] == 60.0
+    assert out[1]["end"] == 64.0
+    assert len(out[1]["words"]) == 4
+    assert out[1]["collapsed_repetition"] == 4
+    assert out[1]["review"] is True
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # _recording_diverges — the gate that decides whether LLM line-segmentation
 # may PREEMPT the canonical-recovery cascade (forced_align) after reconcile

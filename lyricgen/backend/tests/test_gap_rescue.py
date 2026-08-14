@@ -251,6 +251,45 @@ def test_sparse_singletons_without_reference_are_rejected(
     assert out == segs
 
 
+def test_live_sparse_refrain_uses_mix_when_stem_timing_is_not_physical(
+        audio, tmp_path, monkeypatch):
+    stem = tmp_path / "stem.wav"
+    stem.write_bytes(b"RIFF" + b"\0" * 128)
+    _con_vad(monkeypatch, [
+        (64.0, 75.0), (79.0, 82.5), (67.0, 69.0), (73.5, 75.0),
+    ])
+
+    def witness(path, *_args, **_kwargs):
+        if path == str(stem):
+            return [
+                {"word": "No", "start": 64.3, "end": 74.8},
+                {"word": "No", "start": 80.5, "end": 82.2},
+                {"word": "No", "start": 114.0, "end": 118.0},
+            ]
+        return [
+            {"word": "Real", "start": 67.2, "end": 68.6},
+            {"word": "Real", "start": 73.9, "end": 74.7},
+            {"word": "Real", "start": 78.6, "end": 80.0},
+            # Dense burst and isolated tail must not join the cadence cluster.
+            *({"word": "Real", "start": 90.3 + i * 0.02,
+               "end": 90.32 + i * 0.02} for i in range(5)),
+            {"word": "Real", "start": 126.3, "end": 127.7},
+        ]
+
+    monkeypatch.setattr(gr, "_transcribe_window", witness)
+    segs = [_seg(13, 17), _seg(25, 31), _seg(60.8, 64.1, "Real")]
+    out, stats = gr.rescue(
+        segs, audio, stem_path=str(stem), audio_duration=128.0,
+        language="es", include_leading=True,
+        reference_text="Real uoo uou\nReal uoo uou\nReal uoo uou",
+    )
+
+    rescued = [line for line in out if line.get("gap_rescued")]
+    assert [line["text"] for line in rescued] == ["Real", "Real", "Real"]
+    assert [round(line["start"], 1) for line in rescued] == [67.2, 73.9, 78.6]
+    assert stats["sparse_source"] == "mix-witness"
+
+
 def test_declina_si_la_ventana_no_tiene_canto(audio, monkeypatch):
     """Un hueco instrumental: el ASR devuelve poco y no se inventa nada."""
     segs = [_seg(10, 20), _seg(60, 70)]
