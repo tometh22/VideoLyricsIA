@@ -3,11 +3,14 @@ import { useCallback, useEffect, useRef } from "react";
 export function useEditorAutosave({ enabled, segments, dirty, blocked, save, reconcile, onStatus, onMerged }) {
   const MAX_REBASE_ATTEMPTS = 3;
   const segmentsRef = useRef(segments);
+  const runtimeRef = useRef({ enabled, blocked, save, reconcile, onStatus, onMerged });
+  const mountedRef = useRef(false);
   const draftTimerRef = useRef(null);
   const checkpointTimerRef = useRef(null);
   const retryTimerRef = useRef(null);
   const retryCountRef = useRef(0);
   segmentsRef.current = segments;
+  runtimeRef.current = { enabled, blocked, save, reconcile, onStatus, onMerged };
 
   const clearTimers = useCallback(() => {
     for (const ref of [draftTimerRef, checkpointTimerRef, retryTimerRef]) {
@@ -22,35 +25,44 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
     overrideSegments = null,
     rebaseAttempts = 0,
   ) => {
-    if (!enabled || blocked) return { ok: false, reason: blocked ? "conflict" : "disabled" };
+    const runtime = runtimeRef.current;
+    if (!mountedRef.current || !runtime.enabled || runtime.blocked) {
+      return { ok: false, reason: runtime.blocked ? "conflict" : "disabled" };
+    }
     let snapshot = overrideSegments || segmentsRef.current;
-    if (isRetry && reconcile) {
-      const state = await reconcile(snapshot);
+    if (isRetry && runtime.reconcile) {
+      const state = await runtime.reconcile(snapshot);
+      if (!mountedRef.current) return { ok: false, reason: "unmounted" };
       if (!state?.ok) {
         if (state?.reason === "conflict" && rebaseAttempts < MAX_REBASE_ATTEMPTS) {
           return runSave(checkpoint, false, snapshot, rebaseAttempts + 1);
         }
-        onStatus?.("error", "server", { checkpoint, result: state });
+        runtimeRef.current.onStatus?.("error", "server", { checkpoint, result: state });
         return { ...state, reason: "server" };
       }
       if (Array.isArray(state?.mergedSegments)) {
         snapshot = state.mergedSegments;
-        onMerged?.(state.mergedSegments, state);
+        runtimeRef.current.onMerged?.(state.mergedSegments, state);
       }
     }
-    onStatus?.("saving", null);
+    runtimeRef.current.onStatus?.("saving", null);
     const started = performance.now();
-    const result = await save(snapshot, checkpoint);
+    const result = await runtimeRef.current.save(snapshot, checkpoint);
+    // A request already on the wire may settle after route navigation. Never
+    // let that abandoned editor publish status or arm another retry timer.
+    if (!mountedRef.current) return { ...result, abandoned: true };
     if (result?.ok) {
       retryCountRef.current = 0;
-      onStatus?.("saved", null, { durationMs: performance.now() - started, checkpoint, result });
+      if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+      runtimeRef.current.onStatus?.("saved", null, { durationMs: performance.now() - started, checkpoint, result });
       return result;
     }
     if (result?.reason === "conflict") {
       if (rebaseAttempts < MAX_REBASE_ATTEMPTS) {
         return runSave(checkpoint, true, snapshot, rebaseAttempts + 1);
       }
-      onStatus?.("error", "server", { checkpoint, result });
+      runtimeRef.current.onStatus?.("error", "server", { checkpoint, result });
       return { ...result, reason: "server" };
     }
     if (result?.reason === "merged" && Array.isArray(result.mergedSegments)) {
@@ -60,37 +72,58 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
       // moves the document again, bounded retries keep the editor responsive
       // without ever bypassing the backend CAS check.
       if (rebaseAttempts < MAX_REBASE_ATTEMPTS) {
-        onMerged?.(result.mergedSegments, result);
+        runtimeRef.current.onMerged?.(result.mergedSegments, result);
         return runSave(checkpoint, false, result.mergedSegments, rebaseAttempts + 1);
       }
       const delay = Math.min(30_000, 1_000 * (2 ** retryCountRef.current));
       retryCountRef.current += 1;
+      if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
       retryTimerRef.current = window.setTimeout(
         () => runSave(checkpoint, true),
         delay + Math.random() * 250,
       );
-      onStatus?.("error", "server", { durationMs: performance.now() - started, checkpoint, result });
+      runtimeRef.current.onStatus?.("error", "server", { durationMs: performance.now() - started, checkpoint, result });
       return result;
     }
     const reason = result?.reason || "network";
-    onStatus?.(reason === "offline" ? "offline" : "error", reason, { checkpoint, result });
+    runtimeRef.current.onStatus?.(reason === "offline" ? "offline" : "error", reason, { checkpoint, result });
     const delay = Math.min(30_000, 1_000 * (2 ** retryCountRef.current));
     retryCountRef.current += 1;
-    retryTimerRef.current = window.setTimeout(() => runSave(checkpoint, true), delay + Math.random() * 250);
+    // Draft + checkpoint may fail close together. Keep one retry chain, not
+    // one untracked timer per failure.
+    if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
+    retryTimerRef.current = window.setTimeout(() => {
+      retryTimerRef.current = null;
+      runSave(checkpoint, true);
+    }, delay + Math.random() * 250);
     return result;
-  }, [blocked, enabled, onMerged, onStatus, reconcile, save]);
+  }, []);
 
   useEffect(() => {
-    if (!enabled || !dirty || blocked) return undefined;
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      clearTimers();
+    };
+  }, [clearTimers]);
+
+  useEffect(() => {
+    if (!enabled || !dirty || blocked) {
+      clearTimers();
+      return undefined;
+    }
     if (draftTimerRef.current) window.clearTimeout(draftTimerRef.current);
     if (checkpointTimerRef.current) window.clearTimeout(checkpointTimerRef.current);
+    if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
+    retryTimerRef.current = null;
+    retryCountRef.current = 0;
     draftTimerRef.current = window.setTimeout(() => runSave("draft"), 800);
     checkpointTimerRef.current = window.setTimeout(() => runSave("autosave"), 5_000);
     return () => {
       if (draftTimerRef.current) window.clearTimeout(draftTimerRef.current);
       if (checkpointTimerRef.current) window.clearTimeout(checkpointTimerRef.current);
     };
-  }, [blocked, dirty, enabled, runSave, segments]);
+  }, [blocked, clearTimers, dirty, enabled, runSave, segments]);
 
   useEffect(() => {
     if (!enabled || !dirty || blocked) return undefined;
@@ -107,8 +140,6 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
       window.removeEventListener("online", onOnline);
     };
   }, [blocked, dirty, enabled, onStatus, runSave]);
-
-  useEffect(() => clearTimers, [clearTimers]);
 
   const flush = useCallback(
     (checkpoint = "draft", overrideSegments = null) => runSave(checkpoint, false, overrideSegments),

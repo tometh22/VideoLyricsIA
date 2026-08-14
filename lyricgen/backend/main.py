@@ -377,12 +377,22 @@ class DbTransientRetryMiddleware:
             headers = {k.decode("latin-1").lower(): v.decode("latin-1", "replace")
                        for k, v in scope.get("headers", [])}
             content_type = headers.get("content-type", "")
+            path = scope.get("path", "")
             try:
                 content_length = int(headers.get("content-length", "") or 0)
             except ValueError:
                 content_length = 0
-            if (not content_type.startswith("multipart/")
-                    and 0 < content_length <= _RETRY_BODY_MAX_BYTES):
+            # These POST endpoints are explicitly bodyless and idempotent.
+            # Browsers commonly omit Content-Length for an empty fetch body,
+            # so replaying an explicit empty body is the safe retry contract.
+            empty_idempotent_post = method == "POST" and (
+                re.fullmatch(r"/editor/[^/]+/lock/heartbeat", path) is not None
+                or path == "/telemetry/heartbeat"
+            )
+            if empty_idempotent_post:
+                body_buffered = True
+            elif (not content_type.startswith("multipart/")
+                  and 0 < content_length <= _RETRY_BODY_MAX_BYTES):
                 # Buffer body now so we can replay on retry. Drain until
                 # more_body == False (or client disconnects).
                 chunks = []
