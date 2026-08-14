@@ -76,6 +76,24 @@ def test_resegments_with_clean_text_and_whisperx_timing(tiny_audio, monkeypatch)
     assert flat_out == flat_in
 
 
+def test_prompt_preserves_resolved_language_without_translation(
+        tiny_audio, monkeypatch):
+    monkeypatch.setenv("LLM_SEGMENT_ENABLED", "1")
+    fake = MagicMock()
+    fake.models.generate_content.return_value = _FakeResponse(
+        "[0-3] Tengo una mala noticia\n[4-7] No fue de casualidad"
+    )
+    monkeypatch.setattr(pipeline, "_get_genai_client", lambda: fake)
+
+    pipeline._llm_segment_words(
+        SEGS, audio_path=tiny_audio, language="es",
+    )
+
+    config = fake.models.generate_content.call_args.kwargs["config"]
+    assert "IDIOMA OBJETIVO: español (es)" in config.system_instruction
+    assert "no traduzcas" in config.system_instruction.lower()
+
+
 def test_self_declines_on_unparseable_output(tiny_audio, monkeypatch):
     monkeypatch.setenv("LLM_SEGMENT_ENABLED", "1")
     _mock_gemini(monkeypatch, "Lo siento, no puedo hacer eso.")  # no [i-j] lines
@@ -88,6 +106,19 @@ def test_self_declines_on_hallucination(tiny_audio, monkeypatch):
     # Parseable ranges but the text shares no words with whisperX → overlap gate.
     _mock_gemini(monkeypatch,
                  "[0-3] aaaa bbbb cccc dddd\n[4-7] eeee ffff gggg hhhh")
+    out = pipeline._llm_segment_words(SEGS, audio_path=tiny_audio)
+    assert out is SEGS
+
+
+@pytest.mark.parametrize("ranges", [
+    "[4-7] No fue de casualidad\n[0-3] Tengo una mala noticia",
+    "[0-4] Tengo una mala noticia No\n[4-7] No fue de casualidad",
+    "[0-2] Tengo una mala\n[4-7] No fue de casualidad",
+])
+def test_self_declines_on_reordered_overlapping_or_gapped_ranges(
+        tiny_audio, monkeypatch, ranges):
+    monkeypatch.setenv("LLM_SEGMENT_ENABLED", "1")
+    _mock_gemini(monkeypatch, ranges)
     out = pipeline._llm_segment_words(SEGS, audio_path=tiny_audio)
     assert out is SEGS
 

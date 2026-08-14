@@ -5094,7 +5094,10 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
             return result
         from pipeline import _audio_duration
         dur = await asyncio.to_thread(_audio_duration, audio_path)
-        _hay_huecos = bool(_gr.find_gaps(segs, dur))
+        _include_leading = bool(result.get("live_audio_truth"))
+        _hay_huecos = bool(_gr.find_gaps(
+            segs, dur, include_leading=_include_leading,
+        ))
         _hay_manchados = False
         _words_pre = result.get("_asr_words") or []
         if _words_pre:
@@ -5125,6 +5128,8 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
             hold_s=_li.hold_seconds(),
             asr_words=result.get("_asr_words"),
             job_id=job_id,
+            include_leading=_include_leading,
+            reference_text=result.get("reference_lyrics") or "",
         )
         if stats.get("rescued_lines"):
             result = dict(result)
@@ -5346,6 +5351,12 @@ def _maybe_phrase_segment(result, job_id: str):
             return result
         segs = result.get("segments") or []
         if not segs:
+            return result
+        if any(isinstance(s, dict) and s.get("llm_segmented") for s in segs):
+            result.setdefault("postpass_stats", {})["phrase_seg"] = {
+                "before": len(segs), "after": len(segs),
+                "skipped": "already_llm_segmented",
+            }
             return result
         import lead_in as _li
         nuevo = _ps.resegment(segs, lead_s=_li.lead_seconds(),
@@ -5787,6 +5798,69 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
             except OSError:
                 pass
     return result
+
+
+async def _postprocess_live_whisperx(
+    segments: list[dict], *, audio_path: str, canonical: str = "",
+    artist: str = "", song: str = "", language: str | None = None,
+) -> list[dict]:
+    """Apply the opt-in audio-first postpasses shared by every live exit.
+
+    Both pipeline helpers are self-declining, but checking their existing
+    flags here avoids imports, thread scheduling, audio reads, and model calls
+    when a feature is disabled.  Catalogue lyrics are passed only to gap
+    recovery as its existing hallucination guard; they never determine line
+    order or timing in this helper.
+    """
+    _truthy = ("1", "true", "yes", "on")
+    _segment_enabled = (
+        os.environ.get("LLM_SEGMENT_ENABLED", "").strip().lower() in _truthy
+    )
+    _gap_enabled = (
+        os.environ.get("GAP_RECOVERY_ENABLED", "").strip().lower() in _truthy
+    )
+    # GAP_RESCUE is the shared worker-owned recovery pass (VAD + independent
+    # Whisper witness + resolved language).  When it is enabled, do not also
+    # run the older Gemini recovery here: the second owner adds cost and can
+    # duplicate or overwrite the first one's lines.  GAP_RECOVERY remains the
+    # fallback for deployments that have GAP_RESCUE disabled.
+    _worker_gap_owner = (
+        os.environ.get("GAP_RESCUE_ENABLED", "").strip().lower() in _truthy
+    )
+    _gap_enabled = _gap_enabled and not _worker_gap_owner
+    if not (_segment_enabled or _gap_enabled):
+        return segments
+
+    from pipeline import _llm_segment_words, _recover_gap_lyrics
+
+    processed = segments
+    if _segment_enabled:
+        try:
+            candidate = await asyncio.to_thread(
+                _llm_segment_words, processed, audio_path=audio_path,
+                artist=artist, song=song, language=language,
+            )
+            if isinstance(candidate, list) and candidate:
+                processed = candidate
+        except Exception as exc:
+            logger.warning(
+                "[WC] live LLM segmentation declined unexpectedly: %r", exc,
+            )
+    if _gap_enabled:
+        try:
+            candidate = await asyncio.to_thread(
+                _recover_gap_lyrics, processed,
+                audio_path=audio_path, canonical=canonical,
+                prompt_reference=False,
+                artist=artist, song=song, language=language,
+            )
+            if isinstance(candidate, list) and candidate:
+                processed = candidate
+        except Exception as exc:
+            logger.warning(
+                "[WC] live gap recovery declined unexpectedly: %r", exc,
+            )
+    return processed
 
 
 async def _run_transcription_for_job(
@@ -6451,63 +6525,46 @@ async def _run_transcription_for_job(
                         WHISPERX_RECONCILED as _WC_WX_REC,
                         WHISPERX as _WC_WX,
                     )
-                    # Divergent live/extended: the clean (no-hint) transcription IS
-                    # the truth — its order/timing track the actual performance (lab:
-                    # Rotor-level). The canonical cascade below would drift it against
-                    # the studio structure, so emit raw and return.
-                    if _live_no_hint:
+                    # Every live policy exits through the same audio-first
+                    # postprocess.  LLM segmentation re-groups the live's OWN
+                    # timed words; gap recovery can fill bounded acoustic holes.
+                    # Both are independently flagged and self-declining.  The
+                    # catalogue cascade below remains unreachable, so studio
+                    # structure can never replace the performance's order/timing.
+                    if _live_no_hint or _live_audio_truth:
+                        if _live_audio_truth:
+                            _live_policy = (
+                                "divergent live" if _live_no_hint
+                                else "live audio-as-truth"
+                            )
+                        else:
+                            _live_policy = "divergent live"
                         logger.info(
-                            "[WC] divergent live — emitting clean whisperX raw "
-                            "(%d segs, Rotor-level timing)", len(_wx_segs))
-                        # LLM line-segmentation (LLM_SEGMENT_ENABLED, default off):
-                        # the no-hint whisperX has Rotor-level TIMING but native
-                        # VAD LINE breaks (merges/splits at the wrong words, e.g.
-                        # "noticia No"). Gemini re-groups the live's OWN words into
-                        # clean phrase lines + fixes orthography, mapped back to the
-                        # exact whisperX timing — no reference template to drift
-                        # (reconcile aborts here). Self-declining → keeps _wx_segs on
-                        # any failure. Lab on "Nada Fue Un Error (En Vivo)": matches
-                        # Rotor line-for-line, timing byte-identical.
-                        from pipeline import (
-                            _llm_segment_words as _llm_seg,
-                            _recover_gap_lyrics as _recover_gap,
+                            "[WC] %s — emitting clean whisperX after "
+                            "audio-first postprocess, "
+                            "no catalogue reconciliation (%d segs)",
+                            _live_policy, len(_wx_segs),
                         )
-                        # Offloaded to a thread: these do blocking file I/O,
-                        # librosa decode + a Gemini call (up to ~90 s). Running
-                        # them inline would freeze the API event loop for the
-                        # whole job (starves /usage, /jobs — dashboard freeze),
-                        # so use to_thread like every other heavy step here.
-                        _wx_segs = await asyncio.to_thread(
-                            _llm_seg, _wx_segs, audio_path=_aa,
+                        # In live auto-mode the performance decides the
+                        # language.  Catalogue text may describe a studio cut
+                        # or even another-language version.  Explicit choices
+                        # (including tenant-forced values) still win because
+                        # they arrive in the original `language` argument.
+                        _live_language = resolve_transcription_language(
+                            language if (language or "").strip() else None,
+                            result={"segments": _wx_segs},
                         )
-                        # Gap-recovery (GAP_RECOVERY_ENABLED, default off): whisperX
-                        # drops lyrics in loud live passages, leaving multi-second
-                        # holes (lab "Nada Fue Un Error En Vivo": an 84 s hole where
-                        # the chorus keeps going + the outro). Re-transcribe a SHORT
-                        # bounded clip at each hole's first voiced run → recovers the
-                        # real line without the long-clip hallucination loop. Runs
-                        # AFTER segmentation (already-clean lines) + self-declines.
-                        _wx_segs = await asyncio.to_thread(
-                            _recover_gap, _wx_segs,
-                            audio_path=_aa, canonical=_canonical,
+                        _wx_segs = await _postprocess_live_whisperx(
+                            _wx_segs, audio_path=_aa, canonical=_canonical,
+                            artist=artist, song=title,
+                            language=_live_language,
                         )
                         return _emit_segments(
                             _wx_segs, _WC_WX, reference_lyrics=_canonical,
-                        )
-                    # A live-labelled upload is a different performance even
-                    # when its duration matches the catalogue. Reconcile used
-                    # to copy the studio line structure back over clean ASR,
-                    # which destroyed both the live text and its timing. The
-                    # acoustic transcription is authoritative for live jobs;
-                    # keep catalogue lyrics only as reference metadata.
-                    if _live_audio_truth:
-                        logger.info(
-                            "[WC] live audio-as-truth — emitting clean whisperX "
-                            "without catalogue reconciliation (%d segs)",
-                            len(_wx_segs),
-                        )
-                        return _emit_segments(
-                            _wx_segs, _WC_WX, reference_lyrics=_canonical,
+                            extra={
+                                "live_audio_truth": True,
+                                "resolved_language": _live_language,
+                            },
                         )
                     # Reconcile when we have canonical text; emit raw otherwise.
                     if _canonical:

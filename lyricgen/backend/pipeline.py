@@ -6805,8 +6805,35 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
     return cleaned
 
 
+def _target_language_instruction(language: str | None, segs: list[dict]) -> str:
+    """Tell audio LLM postpasses which language to preserve.
+
+    Auto mode is resolved from the acoustic transcript itself.  Unknown stays
+    explicit instead of silently defaulting to Spanish: the hard requirement
+    is always to preserve the input language and never translate it.
+    """
+    resolved = resolve_transcription_language(
+        language,
+        result={"segments": segs},
+    )
+    names = {
+        "es": "español", "en": "inglés", "pt": "portugués",
+        "fr": "francés", "it": "italiano", "de": "alemán",
+    }
+    if resolved:
+        return (
+            f"IDIOMA OBJETIVO: {names.get(resolved, resolved)} ({resolved}). "
+            "Conservá ese idioma exactamente; no traduzcas."
+        )
+    return (
+        "IDIOMA OBJETIVO: el mismo idioma de la transcripción y del audio. "
+        "No traduzcas ni mezcles idiomas."
+    )
+
+
 def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
-                       song: str = "", timeout_s: int = 90) -> list[dict]:
+                       song: str = "", language: str | None = None,
+                       timeout_s: int = 90) -> list[dict]:
     """Re-segment a whisperX word stream into clean phrase lines via Gemini,
     grounded in the audio. The LLM decides the LINE GROUPING + fixes orthography
     (a language task heuristics can't do); whisperX provides the exact TIMING —
@@ -6838,7 +6865,8 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
     numbered = " ".join(f"[{i}]{(w.get('word') or '').strip()}"
                         for i, w in enumerate(W))
     system_prompt = (
-        "Sos un editor profesional de lyric videos en español (estilo Rotor).\n"
+        "Sos un editor profesional de lyric videos (estilo Rotor).\n"
+        + _target_language_instruction(language, segs) + "\n"
         "Te doy: (1) el AUDIO de la canción (puede ser un vivo), (2) su "
         "transcripción palabra-por-palabra (cada palabra con su índice [n]). "
         "Agrupá las palabras en LÍNEAS de lyric video.\n\n"
@@ -6902,7 +6930,26 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
         logger.warning("[LLM-SEGMENT] no parseable lines; keeping whisperX")
         return segs
 
-    # Gate (a): the line ranges must cover ~all the words (no big drops).
+    # Gate (a): ranges must be one exact, ordered partition of the acoustic
+    # words.  Coverage alone is insufficient: reversed or overlapping ranges
+    # can still cover 100%, then ship semantic order backwards and make the
+    # editor's active-line selector jump.  Any structural ambiguity declines
+    # to the untouched WhisperX segmentation.
+    expected_start = 0
+    for i, j, _ in parsed:
+        if i != expected_start:
+            logger.warning(
+                "[LLM-SEGMENT] non-contiguous/reordered ranges; keeping whisperX"
+            )
+            return segs
+        expected_start = j + 1
+    if expected_start != len(W):
+        logger.warning(
+            "[LLM-SEGMENT] incomplete final range; keeping whisperX"
+        )
+        return segs
+
+    # Defensive metric kept for observability; exact partition implies 100%.
     cov = set()
     for i, j, _ in parsed:
         cov.update(range(i, j + 1))
@@ -6927,7 +6974,8 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
         if st is None or en is None:
             continue
         out_segs.append({"start": float(st), "end": float(en),
-                         "text": txt, "words": grp})
+                         "text": txt, "words": grp,
+                         "llm_segmented": True})
     if len(out_segs) < 2:
         return segs
     logger.info("[LLM-SEGMENT] re-segmented %d whisperX segs → %d clean lines "
@@ -7248,6 +7296,8 @@ def _transplant_gap(segs, gs, ge, Csync, beat_t, y=None, sr=22050,
 
 def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
                         song: str = "", canonical: str = "",
+                        language: str | None = None,
+                        prompt_reference: bool = True,
                         timeout_s: int = 60) -> list[dict]:
     """Recover lyrics whisperX DROPPED inside large gaps, by re-transcribing a
     SHORT, BOUNDED clip at the start of each gap.
@@ -7305,13 +7355,22 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
         y, _sr = librosa.load(audio_path, sr=sr, mono=True)
         audio_end = len(y) / sr
 
-        # Gaps = silences between consecutive words PLUS a trailing gap from the
-        # last word to end-of-audio. The trailing one matters because an
+        # Gaps = leading silence before the first recognized word, silences
+        # between consecutive words, PLUS a trailing gap to end-of-audio. The
+        # leading one catches a sustained or buried opening word that WhisperX
+        # failed to align (Los Pericos live: voice from ~5.5s, first stamp ~13s).
+        # The trailing one matters because an
         # upstream cleaner (LLM-segment / hallucination filter) may DROP the
         # outro shouts, so the dropped lyrics are no longer "between" two words
         # — they sit past the last surviving word.
-        gaps = [(W[i]["end"], W[i + 1]["start"]) for i in range(len(W) - 1)
-                if W[i + 1]["start"] - W[i]["end"] >= GAP_MIN]
+        gaps = []
+        if W[0]["start"] >= GAP_MIN:
+            gaps.append((0.0, W[0]["start"]))
+        gaps.extend(
+            (W[i]["end"], W[i + 1]["start"])
+            for i in range(len(W) - 1)
+            if W[i + 1]["start"] - W[i]["end"] >= GAP_MIN
+        )
         if audio_end - W[-1]["end"] >= GAP_MIN:
             gaps.append((W[-1]["end"], audio_end))
         if not gaps:
@@ -7393,8 +7452,8 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
             buf = io.BytesIO()
             sf.write(buf, clip, sr, format="WAV")
             sysp = (
-                "Sos un transcriptor experto de lyric videos en español, nivel "
-                "Rotor.\n"
+                "Sos un transcriptor experto de lyric videos, nivel Rotor.\n"
+                + _target_language_instruction(language, segs) + "\n"
                 f"Te doy un FRAGMENTO CORTO de audio ({c1 - c0:.0f} s) de un vivo"
                 + (f" ({artist} — {song})" if artist else "") + ".\n"
                 "Transcribí EXACTAMENTE lo que se canta en ESTE fragmento corto.\n\n"
@@ -7405,7 +7464,7 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
                 "(grito)/(instrumental)/(silencio).\n"
                 "3. Una frase por línea, mayúscula al inicio.\n"
                 + (f"- Letra oficial (ortografía, NO forzar): {ref_text}\n"
-                   if canonical else "")
+                   if canonical and prompt_reference else "")
                 + "FORMATO por línea, sin nada más: texto"
             )
             try:
