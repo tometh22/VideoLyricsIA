@@ -113,6 +113,7 @@ from editor import (
 )
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe, _normalize_movement_style
+from segment_timing import normalize_segments_timing, normalize_editor_segments, timing_anomalies
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
 from transcription_language import resolve_transcription_language, forced_language_for_tenant
@@ -5896,6 +5897,21 @@ async def _run_transcription_for_job(
                 logger.info("[EMIT] deduped collisions: %d → %d segments (job=%s)",
                             len(segments), len(deduped), job_id)
             polished = _snap(_normalize_words(deduped))
+            anomalies = timing_anomalies(polished)
+            if anomalies["regressions"] or anomalies["duplicate_starts"]:
+                logger.warning(
+                    "[TIMING-CONSISTENCY] source=%s regressions=%s "
+                    "duplicate_starts=%s overlaps=%s job=%s",
+                    source, anomalies["regressions"],
+                    anomalies["duplicate_starts"], anomalies["overlaps"], job_id,
+                )
+            normalized_polished = normalize_segments_timing(polished)
+            if normalized_polished != polished:
+                logger.warning(
+                    "[TIMING-NORMALIZE] repaired non-monotonic starts in "
+                    "%s segments job=%s", len(polished), job_id,
+                )
+            polished = normalized_polished
             out = {"job_id": job_id, "segments": polished,
                    "reference_lyrics": reference_lyrics}
             # Segmentos crudos de whisperX (la performance REAL): viajan en
@@ -8409,6 +8425,7 @@ async def generate_with_segments(
         raise HTTPException(status_code=400, detail="segments_json must be valid JSON") from exc
     if not isinstance(segments, list):
         raise HTTPException(status_code=400, detail="segments_json must be an array")
+    segments = normalize_editor_segments(segments)
     try:
         requested_revision = int(base_revision) if str(base_revision).strip() else None
         if requested_revision is not None and requested_revision < 0:

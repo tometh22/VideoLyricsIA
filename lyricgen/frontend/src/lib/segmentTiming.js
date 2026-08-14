@@ -282,3 +282,60 @@ export function clampResizeTimingWithAdjacent(
 
   return single();
 }
+
+/**
+ * Canonicalize an editor payload by timestamp without changing timings.
+ * Browser row order is transient: inserting/rebasing a lyric can append it
+ * temporarily, while playback and persistence require timeline order.
+ */
+export function sortSegmentsChronologically(segments) {
+  if (!Array.isArray(segments)) return [];
+  return segments
+    .map((segment, index) => ({ segment, index }))
+    .filter(({ segment }) => segment && typeof segment === "object")
+    .sort((left, right) => {
+      const a = Number(left.segment.start);
+      const b = Number(right.segment.start);
+      const safeA = Number.isFinite(a) ? Math.max(0, a) : 0;
+      const safeB = Number.isFinite(b) ? Math.max(0, b) : 0;
+      return safeA - safeB || left.index - right.index;
+    })
+    .map(({ segment }) => segment);
+}
+
+function finiteStart(segment) {
+  const value = Number(segment?.start);
+  return Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Choose the active row from timestamps, never from the incoming array
+ * position. The later start wins inside an overlap; equal timestamps keep
+ * the earliest stable row so duplicate legacy lines do not flicker.
+ */
+export function selectActiveSegmentId(segments, currentTime) {
+  if (!Array.isArray(segments) || !segments.length) return null;
+  const time = Number(currentTime);
+  if (!Number.isFinite(time)) return null;
+
+  let containing = null;
+  let latestStarted = null;
+  segments.forEach((segment, index) => {
+    const start = finiteStart(segment);
+    if (start == null || start > time) return;
+    const rawEnd = Number(segment.end);
+    const end = Number.isFinite(rawEnd) ? rawEnd : start;
+    const candidate = { segment, index, start };
+    if (time < end && (!containing || start > containing.start
+      || (start === containing.start && index < containing.index))) {
+      containing = candidate;
+    }
+    if (!latestStarted || start > latestStarted.start
+      || (start === latestStarted.start && index < latestStarted.index)) {
+      latestStarted = candidate;
+    }
+  });
+
+  const selected = containing || latestStarted;
+  return selected?.segment?._id ?? selected?.index ?? null;
+}

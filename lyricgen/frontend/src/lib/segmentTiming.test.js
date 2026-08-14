@@ -6,6 +6,8 @@ import {
   clampSelectionShiftDelta,
   shiftTimingWithAdjacent,
   shiftBlockWithinDuration,
+  selectActiveSegmentId,
+  sortSegmentsChronologically,
 } from "./segmentTiming";
 
 describe("block timeline shifts", () => {
@@ -236,5 +238,35 @@ describe("collision-safe timeline edits", () => {
       end: 1.2,
       blocked: true,
     });
+  });
+});
+
+describe("chronological playback selection", () => {
+  it("stably sorts appended legacy rows by timestamp", () => {
+    const rows = [
+      { _id: 22, start: 114.766, end: 115.9 },
+      { _id: 23, start: 45.1106, end: 45.8 },
+      { _id: 24, start: 45.9252, end: 46.5 },
+    ];
+    expect(sortSegmentsChronologically(rows).map((row) => row._id))
+      .toEqual([23, 24, 22]);
+  });
+
+  it("selects by time even when the payload order regresses", () => {
+    const rows = [
+      { _id: 9, start: 45.1106, end: 45.8752 },
+      { _id: 10, start: 45.9252, end: 46.5273 },
+      { _id: 11, start: 45.1606, end: 46.9606 },
+    ];
+    expect(selectActiveSegmentId(rows, 45.3)).toBe(11);
+    expect(selectActiveSegmentId(rows, 46.7)).toBe(11);
+  });
+
+  it("keeps the first stable row for equal duplicate starts", () => {
+    const rows = [
+      { _id: 9, start: 45.11, end: 45.8 },
+      { _id: 23, start: 45.11, end: 45.8 },
+    ];
+    expect(selectActiveSegmentId(rows, 45.3)).toBe(9);
   });
 });

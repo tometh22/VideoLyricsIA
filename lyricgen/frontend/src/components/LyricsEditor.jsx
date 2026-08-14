@@ -13,6 +13,8 @@ import { reseedPreservingIds } from "../lib/segmentIds";
 import {
   clampBlockShiftDelta,
   shiftBlockWithinDuration,
+  sortSegmentsChronologically,
+  selectActiveSegmentId,
 } from "../lib/segmentTiming";
 import { useJobSegments, segmentsStore } from "../state/segmentsStore";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
@@ -212,11 +214,12 @@ function sanitizeSegmentTiming(segment, fallbackStart = 0) {
 function sanitizeSegments(segments) {
   if (!Array.isArray(segments)) return [];
   let fallbackStart = 0;
-  return segments.map((segment) => {
+  const sanitized = segments.map((segment) => {
     const sanitized = sanitizeSegmentTiming(segment, fallbackStart);
     fallbackStart = sanitized.start;
     return sanitized;
   });
+  return sortSegmentsChronologically(sanitized);
 }
 
 function sanitizeSegmentsForPersistence(segments) {
@@ -1136,12 +1139,10 @@ export default function LyricsEditor({
       if (a && !a.paused) {
         const ct = a.currentTime;
         playbackTimeRef.current = ct;
-        let active = null;
-        for (const s of sanitizedEdited) {
-          if (ct >= s.start && ct < s.end) { active = s; break; }
-          if (ct >= s.start) active = s;
-        }
-        const activeKey = active?._id ?? null;
+        const activeKey = selectActiveSegmentId(sanitizedEdited, ct);
+        const active = sanitizedEdited.find((segment, index) => (
+          (segment?._id ?? index) === activeKey
+        )) || null;
         if (activeKey !== lastPublishedActiveIdRef.current
           || Math.abs(ct - lastPublishedTimeRef.current) >= 0.05) {
           lastPublishedTimeRef.current = ct;
@@ -1473,13 +1474,7 @@ export default function LyricsEditor({
   // the latest one whose start <= currentTime if no segment "owns" the
   // moment (e.g. instrumental gap).
   const activeId = useMemo(() => {
-    let containing = null;
-    let lastStarted = null;
-    for (const seg of sanitizedEdited) {
-      if (currentTime >= seg.start && currentTime < seg.end) containing = seg;
-      if (currentTime >= seg.start) lastStarted = seg;
-    }
-    return (containing || lastStarted)?._id ?? null;
+    return selectActiveSegmentId(sanitizedEdited, currentTime);
   }, [sanitizedEdited, currentTime]);
 
   // UI freeze / render-storm capture (P0 UMG Chile 2026-06-16). Cause-agnostic

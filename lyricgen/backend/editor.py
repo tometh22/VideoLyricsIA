@@ -12,6 +12,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database import EditorDocument, EditorVersion, Job, User
+from segment_timing import sort_segments_chronologically
 
 EDITOR_REASONS = {"autosave", "manual", "restore", "approve", "conflict", "migration"}
 EDITOR_CHECKPOINTS = EDITOR_REASONS | {"draft"}
@@ -68,6 +69,11 @@ def normalize_segments(value: Any) -> list[dict]:
             "end": round(end, 4),
             "text": text,
         })
+    # The editor timeline is ordered by timestamp, not by the transient row
+    # order used by the browser. This is the durable boundary for autosave,
+    # manual save, restore, approve, and lazy migration alike. Keep equal
+    # starts stable so simultaneous lyric rows remain deterministic.
+    normalized = sort_segments_chronologically(normalized)
     if len(json.dumps(normalized, ensure_ascii=False).encode("utf-8")) > MAX_PAYLOAD_BYTES:
         raise ValueError(f"segments payload cannot exceed {MAX_PAYLOAD_BYTES} bytes")
     return normalized
