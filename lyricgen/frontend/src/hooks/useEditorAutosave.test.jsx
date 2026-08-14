@@ -97,4 +97,55 @@ describe("useEditorAutosave", () => {
     expect(save).toHaveBeenCalledTimes(2);
     expect(save.mock.calls[1][0]).toEqual(merged);
   });
+
+  it("does not restart the debounce when a save callback changes identity", async () => {
+    vi.useFakeTimers();
+    const firstSave = vi.fn().mockResolvedValue({ ok: true, revision: 2 });
+    const secondSave = vi.fn().mockResolvedValue({ ok: true, revision: 3 });
+    const segments = [{ start: 0, end: 1, text: "line" }];
+    const { rerender } = renderHook(({ save }) => useEditorAutosave({
+      enabled: true,
+      segments,
+      dirty: true,
+      blocked: false,
+      save,
+      onStatus: vi.fn(),
+    }), { initialProps: { save: firstSave } });
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(800); });
+    expect(firstSave).toHaveBeenCalledTimes(1);
+
+    // useEditorDocument legitimately replaces this callback after a durable
+    // response. That is not a lyric edit and must not arm a fresh draft.
+    rerender({ save: secondSave });
+    await act(async () => { await vi.advanceTimersByTimeAsync(4_200); });
+    expect(secondSave).toHaveBeenCalledTimes(1); // original 5 s checkpoint
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(firstSave).toHaveBeenCalledTimes(1);
+    expect(secondSave).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry a failed request after the editor unmounts", async () => {
+    vi.useFakeTimers();
+    let settle;
+    const save = vi.fn().mockImplementation(() => new Promise((resolve) => { settle = resolve; }));
+    const onStatus = vi.fn();
+    const { unmount } = renderHook(() => useEditorAutosave({
+      enabled: true,
+      segments: [{ start: 0, end: 1, text: "line" }],
+      dirty: true,
+      blocked: false,
+      save,
+      onStatus,
+    }));
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(800); });
+    expect(save).toHaveBeenCalledTimes(1);
+    unmount();
+    await act(async () => { settle({ ok: false, reason: "server" }); await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(onStatus).not.toHaveBeenCalledWith("error", "server", expect.any(Object));
+  });
 });
