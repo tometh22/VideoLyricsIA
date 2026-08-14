@@ -461,6 +461,10 @@ export default function LyricsEditor({
   // recién después se podía escuchar). Este flag distingue "cargando" de
   // "no existe / se agotaron los reintentos".
   audioLoading = false,
+  // `temporary` means the signed URL could not be loaded due to API/R2
+  // pressure. `missing` is reserved for an explicit 404 from the API.
+  audioUnavailableReason = null,
+  onRetryAudio = null,
   disableAutoSplit = false,
   disableBeforeUnload = false,
   disableAutosave = false,
@@ -1094,6 +1098,7 @@ export default function LyricsEditor({
   // could leave an edit session stuck in the no-audio state. The blob remains
   // a valid fallback and is revoked only when its own lifecycle ends.
   const audioUrl = audioUrlProp || blobAudioUrl;
+  const audioTemporarilyUnavailable = !audioUrl && audioUnavailableReason === "temporary";
 
   const audioRef = useRef(null);
   const listRef = useRef(null);
@@ -2936,20 +2941,30 @@ export default function LyricsEditor({
               </span>
             </div>
           ) : (
-            /* Sin audio (reintentos agotados / job sin input): ocupar el
-               mismo espacio horizontal que el reproductor para que la fila
-               no colapse y los controles de vista (a la derecha) queden en
-               la misma posición que cuando hay audio. Esto preserva la
-               memoria muscular del operador. */
+            /* Sin audio: ocupar el mismo espacio horizontal que el
+               reproductor para que la fila no colapse. Un 503/timeout no
+               prueba que el archivo no exista, así que dejamos reintentar
+               sin tocar el borrador local. */
             <div className="min-w-0 flex-1 flex items-center gap-2 text-[11px] text-amber-300/90">
               <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                 <path d="M12 9v4M12 17h.01" />
                 <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
               </svg>
               <span className="truncate">
-                {t("editor.audio_unavailable") ||
-                  "Audio no disponible para reproducir — podés editar el texto igual."}
+                {audioTemporarilyUnavailable
+                  ? "Audio temporalmente no disponible — tus cambios siguen guardándose."
+                  : (t("editor.audio_unavailable") ||
+                    "Audio no disponible para reproducir — podés editar el texto igual.")}
               </span>
+              {audioTemporarilyUnavailable && onRetryAudio && (
+                <button
+                  type="button"
+                  onClick={onRetryAudio}
+                  className="shrink-0 rounded px-2 py-1 text-[10px] font-medium text-brand-light ring-1 ring-brand/30 hover:bg-brand/15 hover:text-white transition-colors"
+                >
+                  Reintentar audio
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -3699,11 +3714,26 @@ export default function LyricsEditor({
                       <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
                     </svg>
                     <div>
-                      <p className="text-sm font-medium text-white">No se puede ajustar tiempos sin audio</p>
+                      <p className="text-sm font-medium text-white">
+                        {audioTemporarilyUnavailable
+                          ? "El audio está temporalmente no disponible"
+                          : "No se puede ajustar tiempos sin audio"}
+                      </p>
                       <p className="mt-1 max-w-md text-xs text-ink-tertiary">
-                        Podés corregir el texto en Revisar letra. Cuando el audio esté disponible, volvé a Ajustar tiempos.
+                        {audioTemporarilyUnavailable
+                          ? "El servidor está ocupado. Tus cambios siguen guardándose; reintentá el audio en unos segundos."
+                          : "Podés corregir el texto en Revisar letra. Cuando el audio esté disponible, volvé a Ajustar tiempos."}
                       </p>
                     </div>
+                    {audioTemporarilyUnavailable && onRetryAudio && (
+                      <button
+                        type="button"
+                        onClick={onRetryAudio}
+                        className="rounded-lg bg-brand/15 px-3 py-2 text-xs font-medium text-brand-light ring-1 ring-brand/30 hover:bg-brand/25 hover:text-white transition-colors"
+                      >
+                        Reintentar audio
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => { setViewMode("basic"); setSyncMode(false); }}

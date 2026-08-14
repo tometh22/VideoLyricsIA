@@ -368,6 +368,21 @@ test.describe("lyrics editor browser contract", () => {
     expect(approved.segments).toEqual(persisted.segments.map(({ _id, ...segment }) => segment));
   });
 
+  test("recovers audio after DB backpressure while autosave and the editor lock remain live", async ({ page }) => {
+    const harness = await installEditorHarness(page, { audio: "temporary", editorV2: true });
+    await harness.open();
+
+    const input = page.locator('input[value="Primera línea"]');
+    await input.fill("Primera línea tras presión DB");
+    await expect.poll(() => harness.saves.length).toBeGreaterThan(0);
+    await expect.poll(() => harness.heartbeats.length).toBeGreaterThan(0);
+    await expect.poll(() => harness.sourceAudioRequests).toBe(3);
+
+    await expect(page.getByTestId("wizard-player-slot").getByRole("button", { name: "Reproducir", exact: true })).toBeVisible();
+    await openAdvanced(page);
+    await expect(page.getByTestId("timeline-lane")).toBeVisible();
+  });
+
   test("passes the automated accessibility audit in both editor views", async ({ page }) => {
     const harness = await installEditorHarness(page);
     await harness.open();

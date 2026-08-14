@@ -47,9 +47,17 @@ within milliseconds instead of being held for the stream lifetime.
 "≤10 concurrent short queries + unbounded concurrent streams". This
 is the single biggest jump in capacity in this doc.
 
-**Defaults:** `DB_POOL_SIZE=6`, `DB_MAX_OVERFLOW=4` per process. With
-8 processes (4 API + 4 RQ workers) the steady ceiling is 48 sockets,
-peaks to 80 — well under Postgres `max_connections=100`.
+**Important:** pool knobs are per process. The code and staging baseline are
+`4 + 2`, but deployment variables must be sized from the live topology. Staging runs
+2 API replicas × 2 uvicorn workers, 7 Worker replicas and 3 ShortWorker
+replicas: 14 database-owning processes. Its safe baseline is `4 + 2` per
+process, a theoretical maximum of 84 sockets. The former `8 + 8` worker
+configuration allowed 200+ sockets and could exhaust Postgres under bursts.
+
+Before increasing either pool value or replica count, verify
+`SHOW max_connections` and leave administrative headroom. A QueuePool timeout
+is usually a request-lifecycle problem first (streams, retry storms, leaked
+sessions), not permission to create more database connections.
 
 **Monitoring:** `/health` returns `db_pool` with `in_use / total / utilization`.
 Alert when utilization stays above 0.8 for 5+ minutes — that's the
@@ -68,8 +76,8 @@ under fire.
 ## 2. Postgres max_connections (next ceiling)
 
 Once `/health` shows db_pool utilization regularly hitting 0.6–0.8,
-you're approaching the absolute ceiling of Railway's default Postgres
-plan (100 connections).
+you're approaching the configured Postgres ceiling. Verify the actual value
+with `SHOW max_connections`; do not assume a Railway plan default.
 
 **Options, in order of cost:**
 
