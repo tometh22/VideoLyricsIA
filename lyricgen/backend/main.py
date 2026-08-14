@@ -4239,6 +4239,8 @@ async def transcribe_uploaded(
             language=forced_language_for_tenant(current_user.get("tenant_id", ""), body.language),
             artist=_row_artist,
             title=_row_title,
+            filename=_row_filename,
+            live=bool(body.live),
         )
         # Versión B: si el operador pegó la letra oficial, anclarla con CTC
         # ANTES del retime normal; si ancló, saltear el retime (no doble).
@@ -5790,7 +5792,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
 async def _run_transcription_for_job(
     request, current_user, job_id: str, audio_path: str,
     *, language: str = "", artist: str = "", title: str = "",
-    filename: str = "",
+    filename: str = "", live: bool = False,
 ):
     """Shared transcription pipeline: lrclib synced/plain → Whisper →
     hallucination recovery → segments. Used by both /transcribe (legacy
@@ -6413,7 +6415,7 @@ async def _run_transcription_for_job(
                 # without a prompt first. This is the safe audio-first policy
                 # for live-labelled uploads and is independently kill-switchable.
                 _live_audio_truth = bool(
-                    _looks_live(title, filename)
+                    (live or _looks_live(title, filename))
                     and os.environ.get("LIVE_AUDIO_AS_TRUTH_ENABLED", "1")
                     .strip().lower() in ("1", "true", "yes", "on")
                 )
@@ -6488,6 +6490,21 @@ async def _run_transcription_for_job(
                         _wx_segs = await asyncio.to_thread(
                             _recover_gap, _wx_segs,
                             audio_path=_aa, canonical=_canonical,
+                        )
+                        return _emit_segments(
+                            _wx_segs, _WC_WX, reference_lyrics=_canonical,
+                        )
+                    # A live-labelled upload is a different performance even
+                    # when its duration matches the catalogue. Reconcile used
+                    # to copy the studio line structure back over clean ASR,
+                    # which destroyed both the live text and its timing. The
+                    # acoustic transcription is authoritative for live jobs;
+                    # keep catalogue lyrics only as reference metadata.
+                    if _live_audio_truth:
+                        logger.info(
+                            "[WC] live audio-as-truth — emitting clean whisperX "
+                            "without catalogue reconciliation (%d segs)",
+                            len(_wx_segs),
                         )
                         return _emit_segments(
                             _wx_segs, _WC_WX, reference_lyrics=_canonical,

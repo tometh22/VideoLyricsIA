@@ -240,6 +240,7 @@ def run_transcription_job(
             r = await _run_transcription_for_job(
                 None, None, job_id, audio_path,
                 language=language, artist=artist, title=title, filename=filename,
+                live=live,
             )
             # Post-pases gateados, en lockstep con los dos endpoints HTTP
             # (/transcribe y /transcribe-uploaded). ESTE es el camino que
