@@ -309,6 +309,56 @@ def _word_tokens(text: str) -> list[str]:
     return _norm(text).split()
 
 
+_VOCALIZATION_TOKENS = {
+    "ah", "aha", "eh", "hey", "oh", "ooh", "oooh", "uh", "uoh",
+    "uoo", "uou", "woah", "wow", "yeah",
+}
+
+
+def _canonicalize_cycle_vocalizations(cycles: list[dict],
+                                      targets: list[tuple[int, dict]],
+                                      motif: str) -> list[dict]:
+    """Use catalogue text only to normalize equivalent ad-lib spelling.
+
+    Acoustic/Gemini evidence still owns cardinality and timing.  A unanimous
+    structural suggestion may replace ``Oh Oh`` with ``uoo uou`` only when the
+    lexical opening, number of parts, and every trailing token agree as
+    non-lexical vocalizations.  Catalogue text can never add a word or cycle.
+    """
+    suggestions = []
+    for _index, target in targets:
+        tokens = _word_tokens(str(target.get("live_structural_suggestion") or ""))
+        if (
+            len(tokens) >= 2 and tokens[0] == motif
+            and all(token in _VOCALIZATION_TOKENS for token in tokens[1:])
+        ):
+            suggestions.append(tokens)
+    if not suggestions:
+        return [dict(cycle) for cycle in cycles]
+    counts = {}
+    for tokens in suggestions:
+        key = tuple(tokens)
+        counts[key] = counts.get(key, 0) + 1
+    canonical, support = max(counts.items(), key=lambda item: (item[1], item[0]))
+    if support != len(suggestions):
+        return [dict(cycle) for cycle in cycles]
+    out = []
+    for cycle in cycles:
+        tokens = _word_tokens(str(cycle.get("text") or ""))
+        if (
+            len(tokens) != len(canonical) or not tokens
+            or tokens[0] != motif
+            or any(token not in _VOCALIZATION_TOKENS for token in tokens[1:])
+        ):
+            return [dict(original) for original in cycles]
+        updated = dict(cycle)
+        opening = str(cycle.get("text") or "").strip().split()[0]
+        updated["text"] = " ".join([opening, *canonical[1:]])
+        updated["vocalization_spelling_source"] = "catalogue_consensus"
+        out.append(updated)
+    return out
+
+
 def _event_groups(words: list[dict]) -> list[list[dict]]:
     try:
         from gap_rescue import _agrupar_en_lineas
@@ -427,6 +477,7 @@ def _repair_structural_repetition(
         and _safe_line(group)
     ]
     gemini = _gemini_cycles(gemini_events, motif)
+    gemini = _canonicalize_cycle_vocalizations(gemini, targets, motif)
 
     candidate_events = []
     hybrid_verified = False
@@ -629,6 +680,7 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         "structural_repairs": 0, "structural_events": 0,
         "structural_hybrid_attempts": 0, "structural_hybrid_accepts": 0,
         "structural_hybrid_declined": [],
+        "structural_hybrid_diagnostics": [],
     }
     if not isinstance(result, dict) or not windows or not audio_path:
         stats["declined"].append("no_windows")
@@ -852,13 +904,38 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                     reason = str(repair_stats.get("reason") or "declined")[:120]
                     stats["structural_hybrid_declined"].append(reason)
                 if repair_stats.get("hybrid_attempted"):
+                    hybrid = repair_stats.get("hybrid") or {}
+                    selected = next((
+                        candidate for candidate in hybrid.get("scored_hypotheses") or []
+                        if candidate.get("viable")
+                    ), {})
+                    diagnostic = {
+                        "window": [round(start, 3), round(start + duration, 3)],
+                        "accepted": bool(repair_stats.get("hybrid_accepted")),
+                        "reason": str(repair_stats.get("reason") or "declined")[:120],
+                        "viable_hypotheses": int(hybrid.get("viable_hypotheses") or 0),
+                        "phase_margin": hybrid.get("phase_margin"),
+                        "max_phase_delta": selected.get("max_phase_delta"),
+                        "median_phase_delta": selected.get("median_phase_delta"),
+                        "starts": [
+                            round(_f(event.get("start")), 3)
+                            for event in hybrid.get("events") or []
+                        ],
+                    }
+                    stats["structural_hybrid_diagnostics"].append(diagnostic)
                     logger.info(
                         "[STRUCTURAL-HYBRID] job=%s window=%.2f-%.2f "
-                        "accepted=%s reason=%s events=%s",
+                        "accepted=%s reason=%s events=%s viable=%s "
+                        "margin=%s phase_max=%s phase_median=%s starts=%s",
                         job_id, start, start + duration,
                         bool(repair_stats.get("hybrid_accepted")),
                         repair_stats.get("reason"),
                         repair_stats.get("events", 0),
+                        diagnostic["viable_hypotheses"],
+                        diagnostic["phase_margin"],
+                        diagnostic["max_phase_delta"],
+                        diagnostic["median_phase_delta"],
+                        diagnostic["starts"],
                     )
                 if repair_stats.get("suggested"):
                     stats["lines_suggested"] += repair_stats.get("events", 0)
