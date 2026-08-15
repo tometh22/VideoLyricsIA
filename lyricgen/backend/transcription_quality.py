@@ -13,7 +13,7 @@ import json
 from typing import Iterable
 
 
-POLICY_VERSION = "lyrics-quality-v2"
+POLICY_VERSION = "lyrics-quality-v3"
 _TRUE = {"1", "true", "yes", "on"}
 _PIPELINE_CONFIG_KEYS = (
     "TRANSCRIBE_VAD_FIRST", "VAD_CHUNK_ENABLED", "CTC_ALIGN_ENABLED",
@@ -286,6 +286,21 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
         add(
             "live_lexical_unverified", "critical",
             lexical_unverified, min(45, 25 * lexical_unverified),
+        )
+    structural_disagreements = int(
+        coverage.get("live_structural_disagreements") or 0
+    )
+    if structural_disagreements:
+        # A repeated refrain whose acoustically observed structure disagrees
+        # with the delivered rows is not render-safe.  Coverage can still be
+        # 100% because it measures whether words exist near a row, not whether
+        # the refrain has the correct cardinality or complete phrase.  Marking
+        # this critical both activates the bounded consensus retry and keeps a
+        # still-unresolved result out of rendering.
+        add(
+            "live_structural_disagreement", "critical",
+            structural_disagreements,
+            min(45, 15 + 5 * structural_disagreements),
         )
     pending_insertions = sum(
         1 for segment in segments
