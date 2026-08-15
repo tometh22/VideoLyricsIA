@@ -8,6 +8,7 @@ original untouched and visible to the operator.
 from __future__ import annotations
 
 from difflib import SequenceMatcher
+import json
 import logging
 import math
 import os
@@ -146,6 +147,301 @@ def _transcribe_slowed_window(stem_path: str, start: float, duration: float,
             pass
 
 
+def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
+                              language: str | None, job_id: str) -> list[dict]:
+    """Blindly transcribe bounded vocal events with a non-Whisper model.
+
+    Gemini receives no artist, title, catalogue, current text, or expected
+    repetition count. Its timestamps are used only to match event cardinality;
+    accepted lyric timing always comes from the slowed Whisper word stream.
+    """
+    fd, clip = tempfile.mkstemp(prefix="genly_gemini_vocal_", suffix=".wav")
+    os.close(fd)
+    recorder = None
+    prompt = (
+        "Transcribí únicamente los eventos vocales audibles en este fragmento. "
+        "Conservá cada repetición real como un evento separado. No completes "
+        "frases conocidas, no inventes repeticiones y no uses conocimiento de "
+        "la canción. Clasificá cada evento como sung, vocalization, speech o "
+        "music. Los tiempos son segundos relativos al inicio del fragmento. "
+        "Si no hay voz, devolvé events vacío. Respondé sólo JSON con la forma "
+        '{"events":[{"start":0.0,"end":1.0,"text":"...",'
+        '"kind":"sung"}]}.'
+    )
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-ss", str(start), "-t", str(duration),
+                "-i", audio_path, "-ac", "1", "-ar", "16000",
+                "-c:a", "pcm_s16le", "-loglevel", "error", clip,
+            ],
+            check=True, timeout=90,
+        )
+        if not os.path.exists(clip) or os.path.getsize(clip) == 0:
+            return []
+        from google import genai
+        from pipeline import _call_with_timeout, _get_genai_client
+        client = _get_genai_client()
+        if client is None:
+            return []
+        if job_id:
+            from provenance import record_ai_call
+            recorder = record_ai_call(
+                job_id=job_id,
+                step="targeted_gemini_verify",
+                tool_name="gemini-2.5-flash-audio",
+                tool_provider="google_vertex",
+                prompt=(
+                    f"Blind vocal event transcription start={start:.2f}s "
+                    f"duration={duration:.2f}s language={language or 'auto'}; "
+                    + prompt
+                ),
+                input_data_types=["original_mix_audio_clip"],
+            )
+        with open(clip, "rb") as handle:
+            audio_bytes = handle.read()
+        response = _call_with_timeout(
+            lambda: client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    genai.types.Part.from_bytes(
+                        data=audio_bytes, mime_type="audio/wav",
+                    ),
+                    genai.types.Part.from_text(
+                        text="Transcribí este fragmento vocal corto.",
+                    ),
+                ],
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=prompt,
+                    temperature=0.0,
+                    max_output_tokens=1200,
+                    response_mime_type="application/json",
+                    thinking_config=genai.types.ThinkingConfig(
+                        thinking_budget=0,
+                    ),
+                ),
+            ),
+            timeout_s=60.0,
+            label="TARGETED-GEMINI-VERIFY",
+        )
+        raw = (response.text or "").strip()
+        payload = json.loads(raw)
+        events = payload.get("events") if isinstance(payload, dict) else None
+        if not isinstance(events, list) or len(events) > 16:
+            return []
+        out = []
+        from pipeline import _is_whisper_hallucination
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            text = str(event.get("text") or "").strip()
+            kind = str(event.get("kind") or "sung").strip().lower()
+            try:
+                rel_start = float(event.get("start"))
+                rel_end = float(event.get("end", rel_start))
+            except (TypeError, ValueError):
+                continue
+            if not (
+                text and len(text) <= 160
+                and kind in {"sung", "vocalization", "speech"}
+                and math.isfinite(rel_start) and math.isfinite(rel_end)
+                and 0.0 <= rel_start <= duration + 0.5
+                and rel_start <= rel_end <= duration + 1.0
+                and not _is_whisper_hallucination(text)
+            ):
+                continue
+            out.append({
+                "start": round(start + rel_start, 3),
+                "end": round(start + rel_end, 3),
+                "text": text,
+                "kind": kind,
+            })
+        out.sort(key=lambda event: event["start"])
+        if recorder:
+            recorder.finish(response_summary=f"events={len(out)}")
+        return out
+    except Exception as exc:
+        if recorder:
+            recorder.finish(
+                response_summary=f"error:{type(exc).__name__}",
+            )
+        logger.warning(
+            "[TARGETED-GEMINI] declined: %r job=%s", exc, job_id,
+        )
+        return []
+    finally:
+        try:
+            os.unlink(clip)
+        except OSError:
+            pass
+
+
+def _word_tokens(text: str) -> list[str]:
+    return _norm(text).split()
+
+
+def _event_groups(words: list[dict]) -> list[list[dict]]:
+    try:
+        from gap_rescue import _agrupar_en_lineas
+        return _agrupar_en_lineas(words)
+    except Exception:
+        return []
+
+
+def _event_supported(group: list[dict], support_words: list[dict]) -> bool:
+    tokens = set(_word_tokens(_text(group)))
+    if not tokens:
+        return False
+    start = _f(group[0].get("start"))
+    end = _f(group[-1].get("end"))
+    support = _words_in(support_words, start, end, pad=0.9)
+    return bool(tokens.intersection(_word_tokens(_text(support))))
+
+
+def _repair_structural_repetition(
+    segments: list[dict], slowed_words: list[dict], gemini_events: list[dict],
+    support_words: list[dict], *, window_start: float, window_end: float,
+    enforce: bool,
+) -> tuple[list[dict], dict]:
+    """Replace a malformed repeated motif only with two-model cardinality.
+
+    Structural catalogue metadata chooses the *window and opening token only*;
+    neither its wording nor repetition count is used in the candidate. Gemini
+    supplies independent content/cardinality and slowed Whisper supplies the
+    final timings.
+    """
+    stats = {
+        "attempted": False, "applied": False, "suggested": False,
+        "reason": "no_structural_targets", "events": 0,
+        "targets_removed": 0,
+    }
+    targets = [
+        (index, segment)
+        for index, segment in enumerate(segments or [])
+        if isinstance(segment, dict)
+        and segment.get("live_structural_suggestion")
+        and _f(segment.get("start")) <= window_end
+        and _f(segment.get("end")) >= window_start
+    ]
+    if not targets:
+        return segments, stats
+    stats["attempted"] = True
+    openings = [
+        (_word_tokens(str(segment.get("text") or "")) or [""])[0]
+        for _index, segment in targets
+    ]
+    motif = max(set(openings), key=openings.count)
+    if not motif:
+        stats["reason"] = "no_motif"
+        return segments, stats
+
+    slow_groups = [
+        group for group in _event_groups(slowed_words)
+        if group and (_word_tokens(_text(group)) or [""])[0] == motif
+        and _safe_line(group)
+    ]
+    gemini = [
+        event for event in gemini_events
+        if (_word_tokens(str(event.get("text") or "")) or [""])[0] == motif
+        and event.get("kind") in {"sung", "vocalization"}
+    ]
+    if not (2 <= len(slow_groups) == len(gemini) <= 8):
+        stats["reason"] = "cardinality_disagreement"
+        return segments, stats
+
+    accepted: list[tuple[list[dict], dict]] = []
+    gemini_pos = 0
+    for group in slow_groups:
+        group_text = _text(group)
+        matched = None
+        while gemini_pos < len(gemini):
+            event = gemini[gemini_pos]
+            gemini_pos += 1
+            left = _word_tokens(group_text)
+            right = _word_tokens(str(event.get("text") or ""))
+            similarity = _similarity(group_text, str(event.get("text") or ""))
+            threshold = 0.92 if max(len(left), len(right)) <= 3 else 0.82
+            onset_ok = abs(
+                _f(group[0].get("start")) - _f(event.get("start"))
+            ) <= 0.75
+            short_exact = max(len(left), len(right)) <= 3 and left == right
+            if onset_ok and (short_exact or similarity >= threshold):
+                matched = event
+                break
+        if matched is None or not _event_supported(group, support_words):
+            stats["reason"] = "event_disagreement"
+            return segments, stats
+        accepted.append((group, matched))
+
+    candidate_events = []
+    previous_end = None
+    for group, event in accepted:
+        start = _f(group[0].get("start"))
+        end = _f(group[-1].get("end"))
+        if not (
+            math.isfinite(start) and math.isfinite(end) and end > start
+            and window_start - 0.75 <= start <= window_end + 0.75
+            and window_start - 0.75 <= end <= window_end + 0.75
+            and (previous_end is None or start >= previous_end - 0.20)
+        ):
+            stats["reason"] = "invalid_event_timing"
+            return segments, stats
+        previous_end = end
+        candidate_events.append({
+            "start": round(start, 3), "end": round(end, 3),
+            "text": str(event.get("text") or _text(group)).strip(),
+            "words": [dict(word) for word in group],
+            "review": True,
+            "consensus_reprocessed": True,
+            "consensus_sources": ["slowed_stem_whisper_1", "gemini_audio"],
+            "structural_repair": True,
+        })
+
+    # Patch only individually corroborated rows. An unmatched existing event
+    # is ambiguous, not disproven; deleting it would turn model absence into
+    # evidence. Extra verified events may be inserted only where they do not
+    # overlap any retained row.
+    candidate = [dict(segment) for segment in (segments or [])]
+    available_targets = {index for index, _segment in targets}
+    matched_targets: set[int] = set()
+    inserted = 0
+    for event in candidate_events:
+        best_index = None
+        best_overlap = 0.0
+        for index in available_targets:
+            current = candidate[index]
+            overlap = max(
+                0.0,
+                min(event["end"], _f(current.get("end")))
+                - max(event["start"], _f(current.get("start"))),
+            )
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_index = index
+        if best_index is not None and best_overlap >= 0.20:
+            candidate[best_index] = event
+            available_targets.remove(best_index)
+            matched_targets.add(best_index)
+            continue
+        if _non_overlapping(event["start"], event["end"], candidate):
+            candidate.append(event)
+            inserted += 1
+    if not matched_targets and not inserted:
+        stats["reason"] = "no_safe_row_operations"
+        return segments, stats
+    candidate.sort(key=lambda segment: _f(segment.get("start")))
+    stats.update({
+        "suggested": True, "reason": "verified",
+        "events": len(candidate_events),
+        "targets_removed": len(matched_targets),
+        "events_inserted": inserted,
+    })
+    if not enforce:
+        return segments, stats
+    stats["applied"] = True
+    return candidate, stats
+
+
 def _physical_line(words: list[dict]) -> bool:
     if len(words) < 2:
         return False
@@ -186,7 +482,8 @@ def _env_float(name: str, default: float) -> float:
 
 def reprocess(result: dict, audio_path: str, windows: list[dict], *,
               language: str = "", job_id: str = "",
-              transcribe_fn=None, stem_path: str | None = None) -> tuple[dict, dict]:
+              transcribe_fn=None, gemini_fn=None,
+              stem_path: str | None = None) -> tuple[dict, dict]:
     """Apply a cost-capped consensus pass.  Never raises."""
     owned_stem = None
     stats = {
@@ -196,6 +493,8 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         "lines_suggested": 0, "provider_attempts": 0,
         "submitted_audio_seconds": 0.0, "declined": [],
         "slowed_asr_calls": 0, "slowed_audio_seconds": 0.0,
+        "gemini_calls": 0, "gemini_audio_seconds": 0.0,
+        "structural_repairs": 0, "structural_events": 0,
     }
     if not isinstance(result, dict) or not windows or not audio_path:
         stats["declined"].append("no_windows")
@@ -255,11 +554,22 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         slow_speed = min(
             0.95, max(0.80, _env_float("TARGETED_SLOW_STEM_SPEED", 0.88))
         )
+        gemini_enabled = (
+            os.environ.get("TARGETED_GEMINI_VERIFY_ENABLED", "0")
+            .strip().lower() in _TRUE
+        )
+        structural_autorepair_enabled = (
+            os.environ.get("TARGETED_STRUCTURAL_AUTOREPAIR_ENABLED", "0")
+            .strip().lower() in _TRUE
+        )
+        if gemini_fn is None:
+            gemini_fn = _transcribe_gemini_events
 
         priority = {
             "voiced_gap": 0, "uncovered_asr": 1,
             "independent_uncovered_asr": 1,
             "live_lexical_unverified": 2,
+            "live_structural_disagreement": 2,
             "independent_text_mismatch": 3, "text_mismatch": 4,
         }
         ordered_windows = sorted(
@@ -274,12 +584,18 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                 stats["declined"].append("stage_deadline")
                 break
             start, end = _f(window.get("start")), _f(window.get("end"))
+            reasons = set(window.get("reasons") or [])
+            needs_gemini = bool(
+                gemini_enabled
+                and "live_structural_disagreement" in reasons
+            )
             duration = min(max_clip_s, max(0.0, end - start))
             if end - start > max_clip_s:
                 stats["truncated_windows"] += 1
                 stats["declined"].append("window_truncated")
             slow_duration = duration / slow_speed if slow_enabled else 0.0
-            window_cost = 2 * duration + slow_duration
+            gemini_duration = duration if needs_gemini else 0.0
+            window_cost = 2 * duration + slow_duration + gemini_duration
             if duration <= 0 or stats["audio_seconds_billed"] + window_cost > max_billed_s:
                 stats["declined"].append("cost_budget")
                 break
@@ -331,10 +647,70 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                 stats["submitted_audio_seconds"] + duration, 2
             )
             mix_words = transcribe_fn(audio_path, start, duration, language or None, job_id or None)
+            gemini_events = []
+            if needs_gemini:
+                stats["provider_attempts"] += 1
+                stats["gemini_calls"] += 1
+                stats["submitted_audio_seconds"] = round(
+                    stats["submitted_audio_seconds"] + duration, 2
+                )
+                try:
+                    gemini_events = gemini_fn(
+                        audio_path, start, duration, language or None, job_id,
+                    ) or []
+                except Exception as exc:
+                    logger.warning(
+                        "[TARGETED-GEMINI] wrapper declined: %r job=%s",
+                        exc, job_id,
+                    )
+                    stats["declined"].append(
+                        f"gemini_exception:{type(exc).__name__}"
+                    )
+                finally:
+                    stats["audio_seconds_billed"] = round(
+                        stats["audio_seconds_billed"] + duration, 2
+                    )
+                    stats["gemini_audio_seconds"] = round(
+                        stats["gemini_audio_seconds"] + duration, 2
+                    )
+            logger.info(
+                "[TARGETED-CONSENSUS] evidence %.1f-%.1f stem=%r slow=%r "
+                "mix=%r primary=%r witness=%r gemini=%r job=%s",
+                start, end, _text(stem_words)[:240],
+                _text(slowed_words)[:240], _text(mix_words)[:240],
+                _text(_words_in(primary, start, end, pad=0.6))[:240],
+                _text(_words_in(independent_witness, start, end, pad=0.6))[:240],
+                [event.get("text") for event in gemini_events[:12]],
+                job_id,
+            )
             stats["windows_processed"] += 1
             stats["audio_seconds_billed"] = round(
                 stats["audio_seconds_billed"] + duration, 2
             )
+
+            if (
+                "live_structural_disagreement" in reasons
+                and slow_enabled and needs_gemini
+            ):
+                repaired, repair_stats = _repair_structural_repetition(
+                    segments, slowed_words, gemini_events,
+                    list(primary) + list(mix_words),
+                    window_start=start, window_end=start + duration,
+                    enforce=(
+                        allow_insertions and structural_autorepair_enabled
+                    ),
+                )
+                if repair_stats.get("suggested"):
+                    stats["lines_suggested"] += repair_stats.get("events", 0)
+                if repair_stats.get("applied"):
+                    removed = int(repair_stats.get("targets_removed") or 0)
+                    events = int(repair_stats.get("events") or 0)
+                    segments = repaired
+                    stats["structural_repairs"] += 1
+                    stats["structural_events"] += events
+                    stats["lines_replaced"] += removed
+                    stats["lines_inserted"] += max(0, events - removed)
+                    continue
 
             target_indices = [
                 i for i in (window.get("segment_indices") or [])
@@ -369,7 +745,6 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
 
             # No target index means a genuine uncovered/voiced gap.  Insert
             # only stem lines independently corroborated by the mix.
-            reasons = set(window.get("reasons") or [])
             if reasons & {
                 "uncovered_asr", "independent_uncovered_asr", "voiced_gap",
             }:

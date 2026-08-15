@@ -118,3 +118,28 @@ def test_neighbor_line_outside_adaptive_pad_cannot_verify_opposite_word():
     witness += _words("Si estás lejos de mí", start=47.65)
     result = llc.verify_corrections(candidate, witness)
     assert result["unverified"] == 1
+
+
+def test_repeated_short_motif_opens_review_signal_without_mutating_text():
+    source = [
+        _seg(60.8, "Real, real"),
+        _seg(64.0, "Real"),
+        _seg(67.1, "Real"),
+        _seg(73.2, "Real"),
+    ]
+    proposed, stats = llc.propose_segments(source, "Real, wow wow")
+    assert [segment["text"] for segment in proposed] == [
+        segment["text"] for segment in source
+    ]
+    assert all(
+        segment.get("live_structural_suggestion") == "Real, wow wow"
+        for segment in proposed
+    )
+    assert stats["structural_disagreements"] == 4
+
+
+def test_single_short_adlib_does_not_open_structural_retry():
+    source = [_seg(60.8, "Real")]
+    proposed, stats = llc.propose_segments(source, "Real, wow wow")
+    assert proposed == source
+    assert stats["structural_disagreements"] == 0

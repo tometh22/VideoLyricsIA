@@ -5,6 +5,7 @@ import inspect
 
 import main
 import pipeline
+import transcription_worker
 
 
 def _run(segments, *, audio_path="/tmp/live.wav", canonical="studio words",
@@ -203,3 +204,17 @@ def test_audio_truth_live_disables_catalogue_suffix_repair():
     assert 'live_hint and not result.get("live_audio_truth")' in src
     assert "_audit_on = _catalogue_suffix_repair" in src
     assert "if (_catalogue_suffix_repair and _wx_raw" in src
+
+
+def test_final_credit_filter_drops_known_credit_and_preserves_sung_repetition():
+    source = {"segments": [
+        {"start": 79.0, "end": 83.0, "text": "No no no no no no no no"},
+        {"start": 95.0, "end": 104.0,
+         "text": "CC por Antarctica Films Argentina."},
+        {"start": 121.0, "end": 123.0, "text": "¡Gracias!"},
+    ]}
+    out = transcription_worker._drop_final_credit_hallucinations(source, "job")
+    assert [segment["text"] for segment in out["segments"]] == [
+        "No no no no no no no no", "¡Gracias!",
+    ]
+    assert out["postpass_stats"]["final_credit_filter"] == {"dropped": 1}

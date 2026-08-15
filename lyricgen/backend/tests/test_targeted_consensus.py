@@ -9,6 +9,20 @@ def words(text, start=10.0, step=0.7):
     ]
 
 
+def event_words(lines, starts):
+    out = []
+    for line, start in zip(lines, starts):
+        out.extend(words(line, start=start, step=0.35))
+    return out
+
+
+def gemini_events(lines, starts):
+    return [
+        {"start": start, "end": start + 1.2, "text": line, "kind": "sung"}
+        for line, start in zip(lines, starts)
+    ]
+
+
 def test_consensus_requires_stem_and_a_second_source():
     agreed, evidence = tc.choose_consensus(
         words("hoy temprano pienso"), words("hoy temprano pienso"), []
@@ -198,3 +212,100 @@ def test_owned_cached_stem_is_removed_after_retry(tmp_path, monkeypatch):
         [{"start": 0, "end": 5}], transcribe_fn=lambda *_a, **_k: [],
     )
     assert not stem.exists()
+
+
+def test_cross_model_cardinality_repairs_repeated_motif_monotonically():
+    starts = [60.8, 64.0, 67.2, 73.2]
+    lines = ["Real wow wow"] * 4
+    segments = [
+        {"start": start, "end": start + 1.4,
+         "text": "Real", "live_structural_suggestion": "Real wow wow"}
+        for start in starts
+    ] + [{
+        "start": 88.0, "end": 89.0, "text": "Real",
+        "live_structural_suggestion": "Real wow wow",
+    }]
+    slow = event_words(lines, starts)
+    support = event_words(["Real oh oh"] * 4, starts)
+    repaired, stats = tc._repair_structural_repetition(
+        segments, slow, gemini_events(lines, starts), support,
+        window_start=59.0, window_end=85.0, enforce=True,
+    )
+    assert stats["applied"] is True
+    assert stats["events"] == 4
+    assert len(repaired) == 5
+    assert [segment["start"] for segment in repaired[:4]] == starts
+    assert all(segment["text"] == "Real wow wow" for segment in repaired[:4])
+    assert repaired[4]["text"] == "Real"  # unmatched event is never deleted
+    assert all(segment["consensus_sources"] == [
+        "slowed_stem_whisper_1", "gemini_audio",
+    ] for segment in repaired[:4])
+
+
+def test_structural_repair_declines_when_models_disagree_on_repeat_count():
+    starts = [60.8, 64.0, 67.2, 73.2]
+    lines = ["Real wow wow"] * 4
+    segments = [{
+        "start": 62.0, "end": 67.0, "text": "Real real",
+        "live_structural_suggestion": "Real wow wow",
+    }]
+    original = [dict(segment) for segment in segments]
+    repaired, stats = tc._repair_structural_repetition(
+        segments, event_words(lines, starts),
+        gemini_events(lines[:3], starts[:3]), event_words(lines, starts),
+        window_start=59.0, window_end=85.0, enforce=True,
+    )
+    assert repaired == original
+    assert stats["applied"] is False
+    assert stats["reason"] == "cardinality_disagreement"
+
+
+def test_structural_repair_is_suggestion_only_in_observe_mode():
+    starts = [60.8, 64.0]
+    lines = ["Real wow wow"] * 2
+    segments = [{
+        "start": 62.0, "end": 67.0, "text": "Real real",
+        "live_structural_suggestion": "Real wow wow",
+    }]
+    repaired, stats = tc._repair_structural_repetition(
+        segments, event_words(lines, starts), gemini_events(lines, starts),
+        event_words(lines, starts), window_start=59.0, window_end=70.0,
+        enforce=False,
+    )
+    assert repaired == segments
+    assert stats["suggested"] is True
+    assert stats["applied"] is False
+
+
+def test_reprocess_applies_gemini_verified_structural_block(monkeypatch):
+    starts = [60.8, 64.0, 67.2, 73.2]
+    lines = ["Real wow wow"] * 4
+    slow = event_words(lines, starts)
+    support = event_words(["Real oh oh"] * 4, starts)
+    monkeypatch.setenv("TRANSCRIPTION_QUALITY_MODE", "enforce")
+    monkeypatch.setenv("TARGETED_SLOW_STEM_ENABLED", "1")
+    monkeypatch.setenv("TARGETED_GEMINI_VERIFY_ENABLED", "1")
+    monkeypatch.setenv("TARGETED_STRUCTURAL_AUTOREPAIR_ENABLED", "1")
+    monkeypatch.setenv("TARGETED_CONSENSUS_MAX_BILLED_SECONDS", "180")
+    monkeypatch.setattr(
+        tc, "_transcribe_slowed_window", lambda *_a, **_k: slow,
+    )
+    result = {
+        "segments": [
+            {"start": start, "end": start + 1.4,
+             "text": "Real", "live_structural_suggestion": "Real wow wow"}
+            for start in starts
+        ],
+        "_asr_words": support,
+    }
+    out, stats = tc.reprocess(
+        result, "mix.wav",
+        [{"start": 59, "end": 85,
+          "reasons": ["live_structural_disagreement"]}],
+        transcribe_fn=lambda *_a, **_k: support,
+        gemini_fn=lambda *_a, **_k: gemini_events(lines, starts),
+        stem_path="stem.wav",
+    )
+    assert stats["structural_repairs"] == 1
+    assert stats["structural_events"] == 4
+    assert len(out["segments"]) == 4

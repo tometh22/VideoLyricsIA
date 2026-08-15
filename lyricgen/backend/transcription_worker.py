@@ -39,6 +39,48 @@ import os
 logger = logging.getLogger("genly.transcription_worker")
 
 
+def _drop_final_credit_hallucinations(result: dict, job_id: str) -> dict:
+    """Remove known subtitle/training credits created by late post-passes.
+
+    The broad Whisper loop filter already runs inside the ASR cascade. At this
+    late boundary we deliberately use only the narrow known-credit predicate:
+    repeated musical ``no/oh/wow`` must survive, while an outro credit can
+    never reach the editor merely because the formatter assembled it after
+    the earlier filter ran. Never raises and preserves object identity when
+    there is nothing to remove.
+    """
+    if not isinstance(result, dict):
+        return result
+    segments = result.get("segments") or []
+    try:
+        from pipeline import _is_whisper_hallucination
+        kept = [
+            segment for segment in segments
+            if not (
+                isinstance(segment, dict)
+                and _is_whisper_hallucination(str(segment.get("text") or ""))
+            )
+        ]
+    except Exception as exc:
+        logger.warning(
+            "[FINAL-HALLUCINATION] declined: %r job=%s", exc, job_id,
+        )
+        return result
+    dropped = len(segments) - len(kept)
+    if not dropped:
+        return result
+    cleaned = dict(result)
+    cleaned["segments"] = kept
+    cleaned.setdefault("postpass_stats", {})["final_credit_filter"] = {
+        "dropped": dropped,
+    }
+    logger.warning(
+        "[FINAL-HALLUCINATION] dropped %d known credit(s) job=%s",
+        dropped, job_id,
+    )
+    return cleaned
+
+
 # ── Cobertura contra el audio, por etapa ──────────────────────────────────
 #
 # La cascada deja en el result su propia cobertura (`audio_coverage`) y el
@@ -148,10 +190,25 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                 c["live_lexical_corrections"] = _lexical_verification["total"]
                 c["live_lexical_verified"] = _lexical_verification["verified"]
                 c["live_lexical_unverified"] = _lexical_verification["unverified"]
+            _structural_disagreements = [
+                {
+                    "index": index,
+                    "start": segment.get("start"),
+                    "end": segment.get("end"),
+                    "suggestion": segment.get("live_structural_suggestion"),
+                }
+                for index, segment in enumerate(r.get("segments") or [])
+                if isinstance(segment, dict)
+                and segment.get("live_structural_suggestion")
+            ]
+            c["live_structural_disagreements"] = len(
+                _structural_disagreements
+            )
             _windows = build_unsafe_windows(
                 r.get("segments") or [], words, voiced_gaps=_vg,
                 independent_words=_independent,
                 lexical_unverified=_lexical_verification["details"],
+                structural_disagreements=_structural_disagreements,
             )
             cascada = r.get("audio_coverage")
             final = c["audio_coverage"]
@@ -400,6 +457,7 @@ def run_transcription_job(
             from lyrics_format import format_lyrics_pass as _fmt
             _antes = _coverage_de(r)
             r = await _fmt(r, language=_post_lang)
+            r = _drop_final_credit_hallucinations(r, job_id)
             # Último post-pase: re-encuadra cada cartel a sus propias palabras
             # (audit 2026-08-13). Va al final porque todas las etapas de
             # arriba pueden haber movido start/end o words de forma

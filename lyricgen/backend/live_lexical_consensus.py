@@ -134,6 +134,18 @@ def correct_segments(segments: list[dict], reference_text: str, *,
 def propose_segments(segments: list[dict], reference_text: str) -> tuple[list[dict], dict]:
     """Attach conservative catalogue proposals without changing visible text."""
     corrected, stats = correct_segments(segments, reference_text)
+    reference_by_opening: dict[str, list[tuple[str, list[str]]]] = {}
+    for line in (reference_text or "").splitlines():
+        ref_tokens = _tokens(line)
+        if 2 <= len(ref_tokens) <= 6:
+            reference_by_opening.setdefault(ref_tokens[0], []).append(
+                (line.strip(), ref_tokens)
+            )
+    opening_counts: dict[str, int] = {}
+    for segment in segments or []:
+        heard = _tokens(str(segment.get("text") or ""))
+        if heard:
+            opening_counts[heard[0]] = opening_counts.get(heard[0], 0) + 1
     proposed = []
     for original, candidate in zip(segments or [], corrected):
         if candidate.get("live_lexical_corrected"):
@@ -142,10 +154,36 @@ def propose_segments(segments: list[dict], reference_text: str) -> tuple[list[di
             segment["live_lexical_score"] = candidate.get("live_lexical_score")
             proposed.append(segment)
         else:
-            proposed.append(dict(original))
+            segment = dict(original)
+            heard = _tokens(str(segment.get("text") or ""))
+            # A repeated short motif whose catalogue row begins with the same
+            # audible token but has a different shape is an investigation
+            # signal only. It opens one bounded acoustic retry window; it can
+            # never supply replacement text by itself.
+            if (
+                1 <= len(heard) <= 4
+                and heard[0] not in {"no", "oh", "ah", "uh", "eh", "yeah"}
+                and opening_counts.get(heard[0], 0) >= 3
+            ):
+                distinct: dict[tuple[str, ...], str] = {}
+                for line, ref_tokens in reference_by_opening.get(heard[0], []):
+                    if ref_tokens != heard:
+                        distinct.setdefault(tuple(ref_tokens), line)
+                if len(distinct) == 1:
+                    ref_tokens, line = next(iter(distinct.items()))
+                    similarity = SequenceMatcher(
+                        None, heard, list(ref_tokens)
+                    ).ratio()
+                    if similarity >= 0.35:
+                        segment["live_structural_suggestion"] = line
+                        segment["live_structural_score"] = round(similarity, 3)
+            proposed.append(segment)
     stats = dict(stats)
     stats["lines_proposed"] = stats.get("lines_corrected", 0)
     stats["lines_corrected"] = 0
+    stats["structural_disagreements"] = sum(
+        1 for segment in proposed if segment.get("live_structural_suggestion")
+    )
     return proposed, stats
 
 
