@@ -154,6 +154,21 @@ def test_guess_text_lang():
     assert ctc_align.guess_text_lang(["la"]) == "unknown"
 
 
+def test_guess_text_lang_ignores_shared_no_me_in_spanish_live_chorus():
+    pericos = [
+        "Hoy temprano estuve pensando en vos",
+        "Pasó el tiempo y ahora me siento mejor",
+        "Cuando puedo no puedo no puedo no puedo",
+        "Ya no hay nada ni nadie que te quiera atar",
+        "Oh no no no oh no no te hice daño",
+        "Si estás lejos de mí",
+        "Oh no no no no no oh no no te hice daño",
+        "Y te alejaste de mí",
+        "Real uoh uoh", "Real uoh uoh", "Real uoh uoh", "Real uoh uoh",
+    ]
+    assert ctc_align.guess_text_lang(pericos) == "es"
+
+
 def test_retime_declines_on_english_text(monkeypatch, tmp_path):
     """The English guard fires BEFORE any audio/model work."""
     monkeypatch.setenv("CTC_ALIGN_ENABLED", "1")
