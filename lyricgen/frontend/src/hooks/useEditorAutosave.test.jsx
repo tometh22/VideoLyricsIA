@@ -98,6 +98,49 @@ describe("useEditorAutosave", () => {
     expect(save.mock.calls[1][0]).toEqual(merged);
   });
 
+  it("does not retry or publish a same-line conflict", async () => {
+    const save = vi.fn().mockResolvedValue({ ok: false, reason: "conflict" });
+    const onStatus = vi.fn();
+    const onMerged = vi.fn();
+    const { result } = renderHook(() => useEditorAutosave({
+      enabled: true,
+      segments: [{ start: 0, end: 1, text: "local" }],
+      dirty: false,
+      blocked: false,
+      save,
+      onStatus,
+      onMerged,
+    }));
+
+    await act(async () => { await result.current.flush("manual"); });
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(onMerged).not.toHaveBeenCalled();
+    expect(onStatus).toHaveBeenCalledWith("conflict", "conflict", expect.any(Object));
+  });
+
+  it("does not save after reconciliation finds a same-line conflict", async () => {
+    vi.useFakeTimers();
+    const save = vi.fn().mockResolvedValue({ ok: false, reason: "offline" });
+    const reconcile = vi.fn().mockResolvedValue({ ok: false, reason: "conflict" });
+    const onStatus = vi.fn();
+    renderHook(() => useEditorAutosave({
+      enabled: true,
+      segments: [{ start: 0, end: 1, text: "local" }],
+      dirty: true,
+      blocked: false,
+      save,
+      reconcile,
+      onStatus,
+    }));
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(800); });
+    expect(save).toHaveBeenCalledTimes(1);
+    await act(async () => { window.dispatchEvent(new Event("online")); await Promise.resolve(); });
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(onStatus).toHaveBeenCalledWith("conflict", "conflict", expect.any(Object));
+  });
+
   it("does not restart the debounce when a save callback changes identity", async () => {
     vi.useFakeTimers();
     const firstSave = vi.fn().mockResolvedValue({ ok: true, revision: 2 });

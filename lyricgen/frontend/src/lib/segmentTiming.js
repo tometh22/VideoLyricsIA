@@ -5,6 +5,24 @@
 // timestamp. Block shifts therefore use one shared bounded delta so ordering,
 // lengths, and gaps remain unchanged.
 
+// Source/semantic order is not a timing invariant: imported lyrics can retain
+// their original row order after a timestamp correction. Every operation that
+// relies on neighbours must use this stable physical timeline view instead.
+function chronologicalSegments(segments) {
+  if (!Array.isArray(segments)) return [];
+  return segments
+    .map((segment, index) => ({
+      segment,
+      index,
+      start: Number(segment?.start),
+      end: Number(segment?.end),
+    }))
+    .sort((left, right) => (
+      left.start - right.start || left.end - right.end || left.index - right.index
+    ))
+    .map(({ segment }) => segment);
+}
+
 /**
  * Bound a shared timeline delta so every segment stays inside [0, duration].
  */
@@ -54,8 +72,9 @@ export function clampSelectionShiftDelta(
   let upper = Infinity;
   const safeGap = Math.max(0, Number(gap) || 0);
   const safeDuration = Number(duration);
+  const chronological = chronologicalSegments(allSegments);
 
-  allSegments.forEach((segment, index) => {
+  chronological.forEach((segment, index) => {
     if (!selected.has(segment?._id)) return;
     const start = Number(segment.start);
     const end = Number(segment.end);
@@ -65,13 +84,13 @@ export function clampSelectionShiftDelta(
       upper = Math.min(upper, safeDuration - end);
     }
     for (let previous = index - 1; previous >= 0; previous -= 1) {
-      const neighbour = allSegments[previous];
+      const neighbour = chronological[previous];
       if (selected.has(neighbour?._id)) continue;
       lower = Math.max(lower, Number(neighbour.end) + safeGap - start);
       break;
     }
-    for (let next = index + 1; next < allSegments.length; next += 1) {
-      const neighbour = allSegments[next];
+    for (let next = index + 1; next < chronological.length; next += 1) {
+      const neighbour = chronological[next];
       if (selected.has(neighbour?._id)) continue;
       upper = Math.min(upper, Number(neighbour.start) - safeGap - end);
       break;
@@ -91,14 +110,15 @@ export function shiftTimingWithAdjacent(
   allSegments, id, requestedDelta, duration, gap = 0.05,
 ) {
   const clean = (value) => Math.round(value * 1e9) / 1e9;
-  const index = allSegments.findIndex((segment) => segment?._id === id);
+  const chronological = chronologicalSegments(allSegments);
+  const index = chronological.findIndex((segment) => segment?._id === id);
   const requested = Number(requestedDelta);
   const safeGap = Math.max(0, Number(gap) || 0);
   if (index < 0 || !Number.isFinite(requested) || Math.abs(requested) < 1e-9) {
     return { changes: [], delta: 0, coupled: false, blocked: false };
   }
 
-  const snapshots = allSegments.map((segment) => ({
+  const snapshots = chronological.map((segment) => ({
     id: segment?._id,
     start: Number(segment?.start),
     end: Number(segment?.end),
@@ -178,23 +198,24 @@ export function shiftTimingWithAdjacent(
 export function rippleResizeEnd(
   allSegments, id, requestedEnd, duration, gap = 0.05, minDuration = 0.3,
 ) {
-  const index = Array.isArray(allSegments)
-    ? allSegments.findIndex((segment) => segment?._id === id)
-    : -1;
   const requested = Number(requestedEnd);
   const safeGap = Math.max(0, Number(gap) || 0);
   const safeMinDuration = Math.max(0, Number(minDuration) || 0);
   const songCeiling = Number(duration) > 0 ? Number(duration) : Infinity;
   const clean = (value) => Math.round(value * 1e9) / 1e9;
 
-  if (index < 0 || !Number.isFinite(requested)) {
+  if (!Array.isArray(allSegments) || !Number.isFinite(requested)) {
     return { changes: [], blocked: true, limited: true, coupled: false };
   }
 
-  const original = allSegments.map((segment) => ({
+  // The editor may retain semantic/source order even when an imported row is
+  // out of timestamp order. Ripple is a physical timeline operation, so its
+  // collision chain must always be evaluated in chronological order.
+  const original = allSegments.map((segment, index) => ({
     id: segment?._id,
     start: Number(segment?.start),
     end: Number(segment?.end),
+    index,
   }));
   if (original.some((segment) => (
     !Number.isFinite(segment.start)
@@ -204,7 +225,13 @@ export function rippleResizeEnd(
     return { changes: [], blocked: true, limited: true, coupled: false };
   }
 
-  const active = original[index];
+  const chronological = [...original].sort((left, right) => (
+    left.start - right.start || left.end - right.end || left.index - right.index
+  ));
+  const index = chronological.findIndex((segment) => segment.id === id);
+  if (index < 0) return { changes: [], blocked: true, limited: true, coupled: false };
+
+  const active = chronological[index];
   const minEnd = active.start + safeMinDuration;
   if (minEnd > songCeiling + 1e-9) {
     return { changes: [], blocked: true, limited: true, coupled: false };
@@ -215,7 +242,7 @@ export function rippleResizeEnd(
   // room—unrelated later lyrics stay exactly where they were.
   let targetEnd = Math.min(songCeiling, Math.max(minEnd, requested));
   const apply = (end) => {
-    const next = original.map((segment) => ({ ...segment }));
+    const next = chronological.map((segment) => ({ ...segment }));
     next[index].end = end;
     for (let cursor = index + 1; cursor < next.length; cursor += 1) {
       const minStart = next[cursor - 1].end + safeGap;
@@ -238,8 +265,8 @@ export function rippleResizeEnd(
 
   const changed = next
     .filter((segment, segmentIndex) => (
-      Math.abs(segment.start - original[segmentIndex].start) > 1e-6
-      || Math.abs(segment.end - original[segmentIndex].end) > 1e-6
+      Math.abs(segment.start - chronological[segmentIndex].start) > 1e-6
+      || Math.abs(segment.end - chronological[segmentIndex].end) > 1e-6
     ))
     .map((segment) => ({ id: segment.id, start: clean(segment.start), end: clean(segment.end) }));
   const own = next[index];
@@ -258,12 +285,13 @@ export function clampResizeTiming(
   allSegments, id, requestedStart, requestedEnd, duration, gap = 0.05, minDuration = 0.3,
   edge = null,
 ) {
-  const index = allSegments.findIndex((segment) => segment?._id === id);
+  const chronological = chronologicalSegments(allSegments);
+  const index = chronological.findIndex((segment) => segment?._id === id);
   if (index < 0) return null;
-  const segment = allSegments[index];
+  const segment = chronological[index];
   const safeGap = Math.max(0, Number(gap) || 0);
-  const previous = index > 0 ? allSegments[index - 1] : null;
-  const next = index + 1 < allSegments.length ? allSegments[index + 1] : null;
+  const previous = index > 0 ? chronological[index - 1] : null;
+  const next = index + 1 < chronological.length ? chronological[index + 1] : null;
   const minStart = previous ? Number(previous.end) + safeGap : 0;
   const maxEnd = next
     ? Number(next.start) - safeGap
@@ -312,13 +340,14 @@ export function clampResizeTimingWithAdjacent(
   allSegments, id, requestedStart, requestedEnd, duration, gap = 0.05, minDuration = 0.3,
   edge = null,
 ) {
+  const chronological = chronologicalSegments(allSegments);
   const bounded = clampResizeTiming(
-    allSegments, id, requestedStart, requestedEnd, duration, gap, minDuration, edge,
+    chronological, id, requestedStart, requestedEnd, duration, gap, minDuration, edge,
   );
   if (!bounded) return null;
 
-  const index = allSegments.findIndex((segment) => segment?._id === id);
-  const segment = allSegments[index];
+  const index = chronological.findIndex((segment) => segment?._id === id);
+  const segment = chronological[index];
   const safeGap = Math.max(0, Number(gap) || 0);
   const safeMinDuration = Math.max(0, Number(minDuration) || 0);
   const single = (result = bounded) => ({
@@ -328,7 +357,7 @@ export function clampResizeTimingWithAdjacent(
   });
 
   if (edge === "end") {
-    const next = index + 1 < allSegments.length ? allSegments[index + 1] : null;
+    const next = index + 1 < chronological.length ? chronological[index + 1] : null;
     const requested = Number(requestedEnd);
     if (!next || !Number.isFinite(requested) || requested <= bounded.end + 1e-6) return single();
 
@@ -349,7 +378,7 @@ export function clampResizeTimingWithAdjacent(
   }
 
   if (edge === "start") {
-    const previous = index > 0 ? allSegments[index - 1] : null;
+    const previous = index > 0 ? chronological[index - 1] : null;
     const requested = Number(requestedStart);
     if (!previous || !Number.isFinite(requested) || requested >= bounded.start - 1e-6) return single();
 

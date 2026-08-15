@@ -264,6 +264,32 @@ describe("collision-safe timeline edits", () => {
     });
   });
 
+  it("finds the collision chain by time rather than source-array order", () => {
+    const outOfOrder = [
+      { _id: "a", start: 0, end: 1 },
+      { _id: "c", start: 2.05, end: 3 },
+      { _id: "b", start: 1.05, end: 2 },
+      { _id: "d", start: 8, end: 9 },
+    ];
+    expect(rippleResizeEnd(outOfOrder, "a", 1.5, 12, 0.05, 0.3).changes).toEqual([
+      { id: "a", start: 0, end: 1.5 },
+      { id: "b", start: 1.55, end: 2.5 },
+      { id: "c", start: 2.55, end: 3.5 },
+    ]);
+  });
+
+  it("clamps safe resize edges against chronological neighbours, not row order", () => {
+    const outOfOrder = [
+      { _id: "a", start: 0, end: 1 },
+      { _id: "c", start: 2.05, end: 3 },
+      { _id: "b", start: 1.05, end: 2 },
+    ];
+    expect(clampResizeTiming(outOfOrder, "a", 0, 1.5, 10, 0.05, 0.3, "end"))
+      .toEqual({ start: 0, end: 1, blocked: false });
+    expect(clampSelectionShiftDelta(outOfOrder, new Set(["a"]), 1, 10, 0.05))
+      .toBeCloseTo(0);
+  });
+
   it("limits a ripple at the song end without shortening any pushed line", () => {
     const packed = [
       { _id: "a", start: 0, end: 1 },
@@ -313,14 +339,22 @@ describe("collision-safe timeline edits", () => {
         lines.push({ _id: `line-${index}`, start: cursor, end: cursor + lineDuration });
         cursor += lineDuration + gap;
       }
-      const original = structuredClone(lines);
+      // Imported/editor rows can retain source order. Fuzz that condition as
+      // well: the physical result must remain chronological and overlap-free.
+      const shuffled = lines
+        .map((line) => ({ line, rank: random() }))
+        .sort((left, right) => left.rank - right.rank)
+        .map(({ line }) => line);
+      const original = structuredClone(shuffled);
       const activeIndex = Math.floor(random() * lines.length);
       const requestedEnd = -5 + random() * 180;
-      const result = rippleResizeEnd(lines, lines[activeIndex]._id, requestedEnd, audioDuration, gap, 0.3);
+      const result = rippleResizeEnd(shuffled, lines[activeIndex]._id, requestedEnd, audioDuration, gap, 0.3);
       const byId = new Map(result.changes.map((change) => [change.id, change]));
-      const finalLines = lines.map((line) => byId.get(line._id) || line);
+      const finalLines = shuffled
+        .map((line) => byId.get(line._id) || line)
+        .sort((left, right) => left.start - right.start || left.end - right.end);
 
-      expect(lines).toEqual(original);
+      expect(shuffled).toEqual(original);
       finalLines.forEach((line, index) => {
         expect(Number.isFinite(line.start)).toBe(true);
         expect(Number.isFinite(line.end)).toBe(true);

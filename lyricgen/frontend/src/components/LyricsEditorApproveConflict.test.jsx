@@ -8,10 +8,9 @@
  * hacía `return` en silencio → el operador clickeaba una y otra vez sin
  * feedback hasta que el polling re-sincronizaba la revisión.
  *
- * Contrato actual: la revisión del servidor sigue protegida por CAS, pero el
- * editor reancla y reintenta automáticamente los 409 esperables. No se
- * muestra un popup de colaboración ni se bloquea la aprobación por un race
- * de autosave.
+ * Contrato actual: un cliente legacy no tiene base/remoto para un merge de
+ * tres vías. Por eso un 409 queda local y jamás se reintenta enviando el
+ * mismo snapshot sobre la revisión nueva.
  */
 import { render, screen, cleanup, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -48,24 +47,23 @@ afterEach(() => {
 });
 
 describe("Aprobar y generar — conflicto seguro", () => {
-  it("un 409 se reintenta con la revisión actual y luego aprueba", async () => {
+  it("un 409 legacy no se reintenta ni aprueba con un snapshot inseguro", async () => {
     const onPersistSegments = vi
       .fn()
-      .mockResolvedValueOnce({
+      .mockResolvedValue({
         ok: false,
         reason: "stale-revision",
         currentRevision: 1,
-      })
-      .mockResolvedValue({ ok: true, revision: 2 });
+      });
     const onApprove = vi.fn();
     render(<LyricsEditor {...baseProps({ onPersistSegments, onApprove })} />);
 
     fireEvent.click(screen.getByRole("button", { name: /Aprobar y generar/i }));
 
-    await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(1));
-    expect(onPersistSegments).toHaveBeenCalledTimes(2);
-    expect(onPersistSegments.mock.calls[1][2]).toMatchObject({ baseRevision: 1 });
-    expect(screen.queryByText("Conflicto: cambios no guardados")).not.toBeInTheDocument();
+    await waitFor(() => expect(toastSpy).toHaveBeenCalled());
+    expect(onApprove).not.toHaveBeenCalled();
+    expect(onPersistSegments).toHaveBeenCalledTimes(1);
+    expect(onPersistSegments.mock.calls[0][2]).toMatchObject({ baseRevision: 0 });
     expect(screen.getByRole("button", { name: /Aprobar y generar/i })).not.toBeDisabled();
   });
 

@@ -247,7 +247,7 @@ describe("LyricsTimeline", () => {
     fireEvent.pointerDown(body, { clientX: 100, pointerId: 1, button: 0 });
     fireEvent.pointerMove(body, { clientX: 119, pointerId: 1 });
     fireEvent.pointerUp(body, { clientX: 119, pointerId: 1 });
-    expect(props.onTimingChange).toHaveBeenCalledWith("short", expect.any(Number), expect.any(Number));
+    expect(props.onTimingChange).toHaveBeenCalledWith("short", expect.any(Number), expect.any(Number), expect.objectContaining({ operation: "move" }));
   });
 
   it("shows selection instructions and distinct move/resize cursors", () => {
@@ -299,7 +299,7 @@ describe("LyricsTimeline", () => {
     fireEvent.pointerDown(edge, { clientX: 1000, pointerId: 1, button: 0 });
     fireEvent.pointerMove(edge, { clientX: 1080, pointerId: 1 });
     fireEvent.pointerUp(edge, { clientX: 1080, pointerId: 1 });
-    expect(props.onTimingChange).toHaveBeenCalledWith(1, 10, expect.any(Number));
+    expect(props.onTimingChange).toHaveBeenCalledWith(1, 10, expect.any(Number), expect.objectContaining({ operation: "ripple_resize" }));
     expect(props.onTimingChange.mock.calls[0][2]).toBeGreaterThan(11);
   });
 
@@ -392,6 +392,7 @@ describe("LyricsTimeline", () => {
 
     expect(props.onTimingChange).not.toHaveBeenCalled();
     expect(props.onTimingChangeBatch).not.toHaveBeenCalled();
+    expect(props.onDragStart).not.toHaveBeenCalled();
   });
 
   it("edits line text inline", () => {

@@ -133,24 +133,10 @@ export function createSaveQueue(persist, opts = {}) {
       j.revision = result.revision;
       j.rebaseAttempts = 0;
     }
-    const staleRevision = result?.ok === false
-      && (result.reason === "stale-revision" || result.reason === "client-upgrade-required")
-      && Number.isInteger(result.currentRevision)
-      && j.rebaseAttempts < 3;
-    if (staleRevision) {
-      // Legacy editor clients do not have the durable document's three-way
-      // merge endpoint. Re-anchor their serialized autosave to the revision
-      // returned by the CAS response and retry the same local snapshot. This
-      // preserves the old single-user autosave behavior while keeping every
-      // write behind the backend's optimistic check.
-      j.revision = Math.max(j.revision, result.currentRevision);
-      j.rebaseAttempts += 1;
-      if (!j.pending && !j.debounceTimer) {
-        setStatus(j, "saving");
-        run(jobId);
-        return;
-      }
-    }
+    // Never re-anchor a stale legacy payload and POST it again. The queue has
+    // no three-way base/remote snapshots, therefore an automatic retry would
+    // be an unsafe last-writer-wins overwrite. Leave the local draft intact
+    // and surface the error to the editor instead.
     // Orden garantizado por la serialización estricta (un solo POST en vuelo;
     // el trailing arranca recién en este settle), así que no hace falta un
     // contador de secuencia: los settles llegan siempre en orden.

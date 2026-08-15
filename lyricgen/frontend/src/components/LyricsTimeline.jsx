@@ -321,7 +321,7 @@ export default function LyricsTimeline({
       : ripple && mode === "move"
         ? normalizedSegments
         : ripple && mode === "end"
-          ? normalizedSegments.slice(segmentIndex)
+          ? normalizedSegments
         : ripple
           ? [segment, resizeNeighbour].filter(Boolean)
           : [segment];
@@ -362,10 +362,6 @@ export default function LyricsTimeline({
     const movementThreshold = resizing ? 1 : CLICK_SLOP_PX;
     if (Math.abs(event.clientX - drag.originX) > movementThreshold) {
       drag.moved = true;
-      if (!drag.historyStarted) {
-        drag.historyStarted = true;
-        onDragStart?.();
-      }
     }
     if (drag.movingGroup) {
       const safeDelta = clampSelectionShiftDelta(
@@ -407,7 +403,7 @@ export default function LyricsTimeline({
       const limited = Math.abs(requestedBoundary - appliedBoundary) > 1e-4;
       setLimitFeedback(resize?.blocked || limited
         ? drag.ripple && drag.mode === "end"
-          ? "El ajuste llegó a su límite; las líneas no se superpusieron."
+          ? t("timeline.ripple_limit", "El ajuste llegó a su límite; las líneas no se superpusieron.")
           : "Ese borde toca otra línea. Para no modificarla, el ajuste se detuvo."
         : "");
       if (resize?.changes?.length > 1) {
@@ -438,7 +434,7 @@ export default function LyricsTimeline({
       }
     }
     setPreview({ id: drag.id, start, end, mode: drag.mode });
-  }, [gapS, normalizedSegments, onDragStart, total, updateMarquee]);
+  }, [gapS, normalizedSegments, t, total, updateMarquee]);
 
   const finishDrag = useCallback((event, segment) => {
     if (marqueeRef.current) {
@@ -462,6 +458,7 @@ export default function LyricsTimeline({
         return original && (Math.abs(original.start - change.start) > 1e-3 || Math.abs(original.end - change.end) > 1e-3);
       });
       const durationMs = Math.max(0, performance.now() - drag.startedAt);
+      if (changes.length) onDragStart?.();
       if (changes.length) onTimingChangeBatch?.(changes, {
         durationMs,
         operation: drag.mode === "end" && drag.ripple ? "ripple_resize" : drag.mode === "move" ? "move" : "resize",
@@ -470,9 +467,12 @@ export default function LyricsTimeline({
       return;
     }
     if (Math.abs(current.start - segment.start) > 1e-3 || Math.abs(current.end - segment.end) > 1e-3) {
-      onTimingChange?.(segment._id, current.start, current.end);
+      onDragStart?.();
+      onTimingChange?.(segment._id, current.start, current.end, {
+        operation: drag.mode === "end" && drag.ripple ? "ripple_resize" : drag.mode === "move" ? "move" : "resize",
+      });
     }
-  }, [finishMarquee, onFocus, onGroupMoved, onTimingChange, onTimingChangeBatch, preview, seekAt]);
+  }, [finishMarquee, onDragStart, onFocus, onGroupMoved, onTimingChange, onTimingChangeBatch, preview, seekAt]);
 
   const cancelPointerInteraction = useCallback((event) => {
     dragRef.current = null;
@@ -672,6 +672,7 @@ export default function LyricsTimeline({
           {saveStatus === "local" && <span className="text-[10px] text-amber-300">{t("timeline.local_changes", "Cambios locales")}</span>}
           {saveStatus === "offline" && <span className="text-[10px] text-red-300">{t("timeline.offline", "Sin conexión")}</span>}
           {saveStatus === "error" && <span className="text-[10px] text-red-300">{t("timeline.save_error", "Sin guardar")}</span>}
+          {saveStatus === "conflict" && <span className="text-[10px] text-amber-300">{t("timeline.conflict", "Conflicto detectado")}</span>}
         </div>
         <div className="relative flex items-center gap-2" data-testid="timeline-primary-actions" data-selected-count={selectedIds.size}>
           <div role="group" aria-label={t("timeline.edit_behavior", "Comportamiento del ajuste")} className="hidden sm:inline-flex h-9 overflow-hidden rounded-xl bg-black/15 ring-1 ring-white/[0.1]">
@@ -731,7 +732,7 @@ export default function LyricsTimeline({
               <button
                 type="button"
                 onClick={() => setRippleEditing((value) => !value)}
-                aria-pressed={rippleEditing}
+                aria-checked={rippleEditing}
                 role="menuitemcheckbox"
                 className={`w-full rounded-xl px-3 py-2.5 text-left text-[11px] transition-colors ${rippleEditing ? "text-brand-light bg-brand/10" : "text-ink-secondary hover:text-white hover:bg-white/[0.05]"}`}
               >
