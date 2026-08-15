@@ -199,6 +199,35 @@ def test_live_structural_disagreement_opens_contextual_retry_window(monkeypatch)
     assert windows[0]["reasons"] == ["live_structural_disagreement"]
 
 
+def test_live_structural_disagreement_blocks_and_triggers_retry_eligibility():
+    quality = tq.evaluate(
+        [
+            _segment(60.85, 63.28, "Real"),
+            _segment(63.29, 64.01, "Real"),
+            _segment(64.02, 65.10, "Real"),
+            _segment(67.03, 68.36, "Real"),
+        ],
+        {
+            "audio_coverage": 1.0, "text_mismatches": 0,
+            "voiced_gap_s": 0, "uncovered_seconds": 0,
+            "live_structural_disagreements": 4,
+        },
+        unsafe_windows=[{
+            "start": 54.36, "end": 87.01,
+            "reasons": ["live_structural_disagreement"],
+            "segment_indices": [0, 1, 2, 3],
+        }],
+    )
+    assert quality["decision"] == "review_required"
+    assert quality["render_blocked"] is True
+    assert quality["score"] < 100
+    assert any(
+        reason["code"] == "live_structural_disagreement"
+        and reason["value"] == 4
+        for reason in quality["reasons"]
+    )
+
+
 def test_unverified_live_lexical_substitution_is_blocking():
     quality = tq.evaluate(
         [_segment(1, 2)], {
