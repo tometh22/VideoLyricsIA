@@ -19,6 +19,31 @@ import unicodedata
 
 logger = logging.getLogger("genly.targeted_consensus")
 _TRUE = {"1", "true", "yes", "on"}
+_GEMINI_EVENT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["events"],
+    "properties": {
+        "events": {
+            "type": "array",
+            "maxItems": 16,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["start", "end", "text", "kind"],
+                "properties": {
+                    "start": {"type": "number", "minimum": 0},
+                    "end": {"type": "number", "minimum": 0},
+                    "text": {"type": "string"},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["sung", "vocalization", "speech"],
+                    },
+                },
+            },
+        },
+    },
+}
 
 
 def is_enabled() -> bool:
@@ -160,10 +185,13 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
     recorder = None
     prompt = (
         "Transcribí únicamente los eventos vocales audibles en este fragmento. "
-        "Conservá cada repetición real como un evento separado. No completes "
+        "Cada evento debe ser una frase o ciclo vocal completo: no dividas una "
+        "frase en palabras o sílabas. Conservá cada repetición real como un "
+        "evento separado. No describas instrumentos, música ni silencios. No completes "
         "frases conocidas, no inventes repeticiones y no uses conocimiento de "
-        "la canción. Clasificá cada evento como sung, vocalization, speech o "
-        "music. Los tiempos son segundos relativos al inicio del fragmento. "
+        "la canción. Clasificá cada evento como sung, vocalization o speech. "
+        "Devolvé como máximo 16 eventos. Los tiempos son segundos "
+        "relativos al inicio del fragmento. "
         "Si no hay voz, devolvé events vacío. Respondé sólo JSON con la forma "
         '{"events":[{"start":0.0,"end":1.0,"text":"...",'
         '"kind":"sung"}]}.'
@@ -214,8 +242,9 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
                 config=genai.types.GenerateContentConfig(
                     system_instruction=prompt,
                     temperature=0.0,
-                    max_output_tokens=1200,
+                    max_output_tokens=4096,
                     response_mime_type="application/json",
+                    response_json_schema=_GEMINI_EVENT_SCHEMA,
                     thinking_config=genai.types.ThinkingConfig(
                         thinking_budget=0,
                     ),

@@ -260,6 +260,17 @@ def test_structural_repair_declines_when_models_disagree_on_repeat_count():
     assert stats["reason"] == "cardinality_disagreement"
 
 
+def test_gemini_event_schema_is_bounded_to_vocal_events():
+    schema = tc._GEMINI_EVENT_SCHEMA
+    events = schema["properties"]["events"]
+    item = events["items"]
+    assert events["maxItems"] == 16
+    assert item["additionalProperties"] is False
+    assert item["properties"]["kind"]["enum"] == [
+        "sung", "vocalization", "speech",
+    ]
+
+
 def test_structural_repair_is_suggestion_only_in_observe_mode():
     starts = [60.8, 64.0]
     lines = ["Real wow wow"] * 2
