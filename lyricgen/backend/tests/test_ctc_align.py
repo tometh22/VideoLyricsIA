@@ -169,6 +169,38 @@ def test_guess_text_lang_ignores_shared_no_me_in_spanish_live_chorus():
     assert ctc_align.guess_text_lang(pericos) == "es"
 
 
+def test_short_repeated_motif_declines_before_acoustic_alignment():
+    assert ctc_align.has_short_repeated_motif([
+        "Y te alejaste de mí", "Real", "Real", "Real", "Real",
+    ]) is True
+    assert ctc_align.has_short_repeated_motif([
+        "Real uoh uoh", "Real uoh uoh", "Real uoh uoh", "Real uoh uoh",
+    ]) is True
+    assert ctc_align.has_short_repeated_motif([
+        "Hoy temprano estuve pensando", "Pasó el tiempo y estoy mejor",
+        "Si estás lejos de mí",
+    ]) is False
+
+
+def test_retime_declines_short_repeated_motif_before_loading_torch(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("CTC_ALIGN_ENABLED", "1")
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"RIFF")
+    segments = [
+        {"text": text, "start": 0, "end": 1}
+        for text in [
+            "Hoy temprano estuve pensando en vos",
+            "Pasó el tiempo y ahora me siento mejor",
+            "Ya no hay nada ni nadie que te quiera atar",
+            "Y te alejaste de mí", "Real", "Real", "Real", "Real",
+        ]
+    ]
+    assert ctc_align.retime_segments(str(audio), segments) is None
+    assert ctc_align.last_decline_reason == "short_repeated_motif"
+
+
 def test_retime_declines_on_english_text(monkeypatch, tmp_path):
     """The English guard fires BEFORE any audio/model work."""
     monkeypatch.setenv("CTC_ALIGN_ENABLED", "1")
