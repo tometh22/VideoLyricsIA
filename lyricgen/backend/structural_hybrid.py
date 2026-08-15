@@ -12,6 +12,8 @@ import itertools
 import logging
 import math
 import os
+import re
+import unicodedata
 from typing import Callable
 
 import librosa
@@ -21,6 +23,10 @@ logger = logging.getLogger("genly.structural_hybrid")
 _TRUE = {"1", "true", "yes", "on"}
 _SR = 16_000
 _HOP = 320
+_VOCALIZATION_TOKENS = {
+    "ah", "aha", "eh", "hey", "oh", "ooh", "oooh", "uh", "uoh",
+    "uoo", "uou", "woah", "wow", "yeah",
+}
 
 
 def is_enabled() -> bool:
@@ -34,6 +40,153 @@ def _env_float(name: str, default: float) -> float:
         return float(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _token(value: str) -> str:
+    value = unicodedata.normalize("NFD", str(value or "").lower())
+    value = "".join(char for char in value if unicodedata.category(char) != "Mn")
+    return re.sub(r"[^a-z]", "", value)
+
+
+def _has_vocalization_tail(text: str) -> bool:
+    tokens = [_token(part) for part in str(text or "").split()]
+    tokens = [part for part in tokens if part]
+    return bool(len(tokens) >= 2 and any(
+        part in _VOCALIZATION_TOKENS for part in tokens[1:]
+    ))
+
+
+def _ctc_anchor_support(ctc: dict) -> dict:
+    """Score the lexical anchor, not an ASR model's ad-lib spelling.
+
+    Spanish XLSR can locate ``Real`` reliably but assigns almost-zero
+    probability to equally valid spellings such as ``oh``, ``uoh`` or
+    ``wow``.  Averaging those characters made the same acoustic phase pass or
+    fail depending only on Gemini's spelling.  For vocalization-rich events we
+    therefore use the first non-vocalization word as the phase witness.  Plain
+    lexical events and older/injected CTC results retain their line scores.
+    """
+    anchors = []
+    for event in ctc.get("events") or []:
+        words = event.get("words") or []
+        anchor = next((
+            float(word.get("score") or 0)
+            for word in words
+            if _token(word.get("word") or "")
+            and _token(word.get("word") or "") not in _VOCALIZATION_TOKENS
+        ), None)
+        if anchor is None:
+            anchors = []
+            break
+        anchors.append(anchor)
+    if anchors:
+        return {
+            "mean": float(np.mean(anchors)),
+            "min": float(np.min(anchors)),
+            "source": "lexical_anchor",
+        }
+    return {
+        "mean": float(ctc.get("mean_score") or ctc.get("median_score") or 0),
+        "min": float(ctc.get("min_score") or 0),
+        "source": "line",
+    }
+
+
+def _candidate_is_viable(candidate: dict) -> bool:
+    return (
+        candidate["max_phase_delta"] <= _env_float("TARGETED_CTC_PHASE_MAX", 0.75)
+        and candidate["median_phase_delta"] <= _env_float(
+            "TARGETED_CTC_PHASE_MEDIAN_MAX", 0.40,
+        )
+        and candidate["max_anchor_delta"] <= _env_float("TARGETED_CTC_ANCHOR_MAX", 0.85)
+        and candidate["stem_support_min"] >= _env_float(
+            "TARGETED_CTC_ANCHORED_STEM_MIN", 0.08,
+        )
+        and candidate["mix_support_min"] >= _env_float(
+            "TARGETED_CTC_ANCHORED_MIX_MIN", 0.05,
+        )
+    )
+
+
+def _window_vocal_regions(path: str, start: float, end: float) -> list[tuple[float, float]]:
+    """Fine-grained energy VAD for a bounded structural window."""
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        y, sr = librosa.load(
+            path, sr=_SR, mono=True, offset=max(0.0, start),
+            duration=max(0.0, end - start),
+        )
+        if len(y) < _SR:
+            return []
+        intervals = librosa.effects.split(
+            y, top_db=25, frame_length=1024, hop_length=_HOP,
+        )
+        regions = []
+        for left, right in intervals:
+            a = start + float(left) / sr
+            b = start + float(right) / sr
+            if b - a >= 0.12:
+                if regions and a - regions[-1][1] <= 0.25:
+                    regions[-1] = (regions[-1][0], b)
+                else:
+                    regions.append((a, b))
+        return regions
+    except Exception as exc:
+        logger.warning("[STRUCTURAL-HYBRID] tail VAD decline %s: %s", path, exc)
+        return []
+
+
+def _extend_vocalization_tails(events: list[dict], texts: list[str],
+                               cycle_starts: list[float],
+                               regions: list[tuple[float, float]],
+                               window_end: float) -> list[dict]:
+    """Extend ad-lib lines through acoustically connected vocal regions.
+
+    CTC supplies the lexical onset.  Energy VAD supplies the non-lexical tail,
+    whose character scores are not meaningful.  No region may cross into the
+    next independently verified cycle.
+    """
+    if not regions or len(events) != len(texts) == len(cycle_starts):
+        return [dict(event) for event in events]
+    gaps = np.diff(cycle_starts)
+    median_gap = float(np.median(gaps)) if len(gaps) else 4.0
+    chain_gap = _env_float("TARGETED_ACOUSTIC_VOICE_CHAIN_GAP_MAX", 1.0)
+    out = []
+    for index, (event, text) in enumerate(zip(events, texts)):
+        updated = dict(event)
+        if not _has_vocalization_tail(text):
+            out.append(updated)
+            continue
+        event_start = float(updated.get("start") or cycle_starts[index])
+        slot_end = (
+            cycle_starts[index + 1] - 0.30
+            if index + 1 < len(cycle_starts)
+            else min(window_end, cycle_starts[index] + max(2.0, median_gap * 0.88))
+        )
+        available = [
+            (a, b) for a, b in regions
+            if b >= event_start - 0.35 and a < slot_end
+        ]
+        seed = next((position for position, (a, b) in enumerate(available)
+                     if a <= event_start + 0.45 and b >= event_start - 0.35), None)
+        if seed is None:
+            out.append(updated)
+            continue
+        tail = available[seed][1]
+        for a, b in available[seed + 1:]:
+            if a - tail > chain_gap:
+                break
+            tail = max(tail, b)
+        acoustic_end = min(slot_end, tail + 0.08)
+        if acoustic_end > float(updated.get("end") or event_start) + 0.15:
+            updated["end"] = round(acoustic_end, 3)
+            # The lexical onset is reliable; per-word ad-lib spans are not.
+            # Omitting them prevents false karaoke highlighting inside a line.
+            updated.pop("words", None)
+            updated["structural_tail_source"] = "vocal_stem_vad"
+        out.append(updated)
+    return out
 
 
 def _zscore_rows(values: np.ndarray) -> np.ndarray:
@@ -365,12 +518,14 @@ def verify(stem_path: str, mix_path: str, events: list[dict], *,
                 max_phase = float(np.max(np.abs(stem_starts - mix_starts)))
                 median_phase = float(np.median(np.abs(stem_starts - mix_starts)))
                 max_anchor = float(np.max(np.abs(stem_starts - anchor_values)))
+                stem_support = _ctc_anchor_support(stem_ctc)
+                mix_support = _ctc_anchor_support(mix_ctc)
                 evidence_score = (
-                    0.50 * float(stem_ctc.get("mean_score") or 0)
-                    + 0.35 * float(mix_ctc.get("mean_score") or 0)
+                    0.50 * stem_support["mean"]
+                    + 0.35 * mix_support["mean"]
                     - 0.15 * float(hypothesis.get("topology_score") or 1)
                 )
-                scored.append({
+                candidate = {
                     "evidence_score": round(evidence_score, 5),
                     "hypothesis": hypothesis,
                     "stem_ctc": stem_ctc,
@@ -378,8 +533,23 @@ def verify(stem_path: str, mix_path: str, events: list[dict], *,
                     "max_phase_delta": round(max_phase, 4),
                     "median_phase_delta": round(median_phase, 4),
                     "max_anchor_delta": round(max_anchor, 4),
-                })
-            scored.sort(key=lambda item: item["evidence_score"], reverse=True)
+                    "stem_support_mean": round(stem_support["mean"], 5),
+                    "stem_support_min": round(stem_support["min"], 5),
+                    "stem_support_source": stem_support["source"],
+                    "mix_support_mean": round(mix_support["mean"], 5),
+                    "mix_support_min": round(mix_support["min"], 5),
+                    "mix_support_source": mix_support["source"],
+                }
+                candidate["viable"] = _candidate_is_viable(candidate)
+                scored.append(candidate)
+            # Prefer a viable representative when two topology proposals
+            # collapse to the same CTC-derived phase.  Otherwise a high-score
+            # but cross-witness-invalid duplicate could suppress the valid
+            # representative before the uncertainty check.
+            scored.sort(
+                key=lambda item: (item["viable"], item["evidence_score"]),
+                reverse=True,
+            )
             # Multiple onset detectors often produce sub-frame variants of the
             # same phase.  They are not independent alternatives and must not
             # collapse the uncertainty margin.  Deduplicate by the CTC-derived
@@ -405,22 +575,24 @@ def verify(stem_path: str, mix_path: str, events: list[dict], *,
             if not distinct_scored:
                 stats["reason"] = "anchored_ctc_unavailable"
                 return stats
-            best = distinct_scored[0]
-            second = distinct_scored[1] if len(distinct_scored) > 1 else None
+            # A phase that already disagrees across stem/mix, misses its
+            # acoustic anchors, or lacks lexical support is not an alternative
+            # interpretation.  Letting it compete in the uncertainty margin
+            # caused valid phases to be rejected by demonstrably invalid ones.
+            viable = [candidate for candidate in distinct_scored if candidate["viable"]]
+            stats["viable_hypotheses"] = len(viable)
+            if not viable:
+                stats["reason"] = "anchored_ctc_ambiguous"
+                return stats
+            best = viable[0]
+            second = viable[1] if len(viable) > 1 else None
             margin = (
                 best["evidence_score"] - second["evidence_score"]
                 if second else 1.0
             )
             stats["phase_margin"] = round(float(margin), 5)
             stem_ctc, mix_ctc = best["stem_ctc"], best["mix_ctc"]
-            if (
-                best["max_phase_delta"] > _env_float("TARGETED_CTC_PHASE_MAX", 0.75)
-                or best["median_phase_delta"] > _env_float("TARGETED_CTC_PHASE_MEDIAN_MAX", 0.40)
-                or best["max_anchor_delta"] > _env_float("TARGETED_CTC_ANCHOR_MAX", 0.85)
-                or float(stem_ctc.get("min_score") or 0) < _env_float("TARGETED_CTC_ANCHORED_STEM_MIN", 0.08)
-                or float(mix_ctc.get("min_score") or 0) < _env_float("TARGETED_CTC_ANCHORED_MIX_MIN", 0.05)
-                or margin < _env_float("TARGETED_CTC_PHASE_MARGIN_MIN", 0.025)
-            ):
+            if margin < _env_float("TARGETED_CTC_PHASE_MARGIN_MIN", 0.025):
                 stats["reason"] = "anchored_ctc_ambiguous"
                 return stats
             anchors = best["hypothesis"]["anchors"]
@@ -432,8 +604,14 @@ def verify(stem_path: str, mix_path: str, events: list[dict], *,
             if not topology.get("accepted"):
                 stats["reason"] = "topology_disagreement"
                 return stats
+            aligned_events = _extend_vocalization_tails(
+                stem_ctc["events"], texts,
+                [float(event["start"]) for event in stem_ctc["events"]],
+                _window_vocal_regions(stem_path, window_start, window_end),
+                window_end,
+            )
             verified_events = []
-            for source, aligned in zip(events, stem_ctc["events"]):
+            for source, aligned in zip(events, aligned_events):
                 verified_events.append({
                     **dict(aligned),
                     "text": str(source.get("text") or aligned.get("text") or "").strip(),
