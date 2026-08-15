@@ -36,8 +36,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import hashlib
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -46,12 +47,14 @@ sys.path.insert(0, str(BACKEND))
 
 DEFAULT_LIST = HERE / "benchmark_jobs.txt"
 OUT_ROOT = HERE.parent / "benchmark" / "dataset"
+MANIFEST_PATH = HERE / "benchmark_manifest.json"
+LABELS_PATH = HERE / "benchmark_labels.json"
 
 
 def _read_jobs_file(path: Path) -> list[str]:
     if not path.exists():
         print(f"[ERR] jobs list not found: {path}", file=sys.stderr)
-        print(f"      Create it with one job_id per line, or use --jobs.", file=sys.stderr)
+        print("      Create it with one job_id per line, or use --jobs.", file=sys.stderr)
         sys.exit(2)
     out = []
     for raw in path.read_text().splitlines():
@@ -65,7 +68,7 @@ def _read_jobs_file(path: Path) -> list[str]:
 def _fetch_job(db, job_id: str) -> dict | None:
     """Return a flat dict of the fields we need for benchmarking, or
     None if the job is unusable (missing audio, no segments, etc.)."""
-    from database import Job
+    from database import Job, ProductEvent
     row = db.query(Job).filter(Job.job_id == job_id).first()
     if row is None:
         print(f"  ⚠ {job_id}: not found in DB")
@@ -76,6 +79,22 @@ def _fetch_job(db, job_id: str) -> dict | None:
     if not row.segments_json or not isinstance(row.segments_json, list) or len(row.segments_json) == 0:
         print(f"  ⚠ {job_id}: segments_json empty or invalid — needs operator approval first")
         return None
+    approval = (
+        db.query(ProductEvent)
+        .filter(ProductEvent.job_id == job_id, ProductEvent.name == "editor_approved")
+        .order_by(ProductEvent.created_at.desc())
+        .first()
+    )
+    approval_props = (approval.properties or {}) if approval else {}
+    duration_ms = approval_props.get("active_edit_ms")
+    operator_time_source = "active_edit_ms"
+    if not isinstance(duration_ms, (int, float)):
+        duration_ms = approval_props.get("duration_ms")
+        operator_time_source = "wall_clock_legacy"
+    live_haystack = f"{row.song_title or ''} {row.filename or ''}".casefold()
+    is_live = any(token in live_haystack for token in (
+        "live", "en vivo", "vivo", "concert", "recital", "estadio",
+    ))
     return {
         "job_id": row.job_id,
         "tenant_id": row.tenant_id,
@@ -85,8 +104,27 @@ def _fetch_job(db, job_id: str) -> dict | None:
         "status": row.status,
         "input_r2_key": row.input_r2_key,
         "segments_json": row.segments_json,
+        "segments_revision": int(row.segments_revision or 0),
         "render_params": row.render_params or {},
         "delivery_profile": row.delivery_profile or "youtube",
+        "is_live": is_live,
+        "timing_source": row.timing_source,
+        "transcription_quality": row.transcription_quality,
+        "operator_review_minutes": (
+            round(float(duration_ms) / 60000.0, 3)
+            if isinstance(duration_ms, (int, float)) else None
+        ),
+        "operator_time_source": operator_time_source if duration_ms is not None else None,
+        "operator_pipeline_release": approval_props.get("pipeline_release"),
+        "approval_event_id": approval.id if approval else None,
+        "approval_at": approval.created_at.isoformat() if approval else None,
+        "operator_corrections": {
+            key: int(approval_props.get(key) or 0)
+            for key in (
+                "text_changes", "timing_changes", "lines_added",
+                "lines_removed", "lines_reordered",
+            )
+        },
     }
 
 
@@ -114,6 +152,12 @@ def build_dataset(job_ids: list[str]) -> None:
     print(f"Jobs requested: {len(job_ids)}")
     print()
 
+    labels = {}
+    if LABELS_PATH.exists():
+        raw_labels = json.loads(LABELS_PATH.read_text())
+        if isinstance(raw_labels, dict):
+            labels = raw_labels
+    manifest_entries = []
     db = SessionLocal()
     try:
         ok_count = 0
@@ -124,6 +168,23 @@ def build_dataset(job_ids: list[str]) -> None:
             if job is None:
                 skip_count += 1
                 continue
+            manual_label = labels.get(job_id)
+            if isinstance(manual_label, dict) and isinstance(
+                manual_label.get("is_live"), bool
+            ):
+                job["is_live"] = manual_label["is_live"]
+                job["is_live_source"] = "manual"
+                job["stratum"] = str(
+                    manual_label.get("stratum")
+                    or ("live" if job["is_live"] else "studio")
+                )[:40]
+            else:
+                job["is_live_source"] = "heuristic"
+                job["stratum"] = "live" if job["is_live"] else "studio"
+            job["gold_notes"] = (
+                str(manual_label.get("gold_notes") or "")[:500]
+                if isinstance(manual_label, dict) else ""
+            )
             dest = OUT_ROOT / job_id
             dest.mkdir(parents=True, exist_ok=True)
 
@@ -136,12 +197,59 @@ def build_dataset(job_ids: list[str]) -> None:
             (dest / "ground_truth.json").write_text(
                 json.dumps(job["segments_json"], ensure_ascii=False, indent=2)
             )
+            def _sha256(path):
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                return digest.hexdigest()
+            ground_truth_hash = _sha256(dest / "ground_truth.json")
+            label = manual_label if isinstance(manual_label, dict) else {}
+            try:
+                label_revision = int(label.get("segments_revision", -1))
+            except (TypeError, ValueError):
+                label_revision = -1
+            job["gold_verified"] = bool(
+                label.get("gold_verified") is True
+                and label.get("ground_truth_sha256") == ground_truth_hash
+                and label_revision == job["segments_revision"]
+                and str(label.get("reviewer") or "").strip()
+                and str(label.get("verified_at") or "").strip()
+                and str(label.get("verification_method") or "").strip()
+            )
+            job["gold_reviewer"] = str(label.get("reviewer") or "")[:120]
+            job["gold_verified_at"] = str(label.get("verified_at") or "")[:80]
+            job["gold_verification_method"] = str(
+                label.get("verification_method") or ""
+            )[:120]
+            job["gold_verified_sha256"] = (
+                ground_truth_hash if job["gold_verified"] else None
+            )
             # Strip segments_json from metadata — kept separate to avoid
             # accidentally treating the meta file as ground truth.
             meta = {k: v for k, v in job.items() if k != "segments_json"}
             (dest / "metadata.json").write_text(
                 json.dumps(meta, ensure_ascii=False, indent=2, default=str)
             )
+            manifest_entries.append({
+                "job_id": job_id,
+                "segments_revision": job["segments_revision"],
+                "is_live": job["is_live"],
+                "is_live_source": job["is_live_source"],
+                "stratum": job["stratum"],
+                "gold_verified": job["gold_verified"],
+                "gold_notes": job["gold_notes"],
+                "gold_reviewer": job["gold_reviewer"],
+                "gold_verified_at": job["gold_verified_at"],
+                "gold_verification_method": job["gold_verification_method"],
+                "gold_verified_sha256": job["gold_verified_sha256"],
+                "approval_event_id": job["approval_event_id"],
+                "approval_at": job["approval_at"],
+                "audio_file": audio_path.name,
+                "audio_sha256": _sha256(audio_path),
+                "ground_truth_sha256": ground_truth_hash,
+                "metadata_sha256": _sha256(dest / "metadata.json"),
+            })
             print(f"  ✓ {job['artist']} - {job['song_title']}  "
                   f"({len(job['segments_json'])} segments, "
                   f"audio {audio_path.stat().st_size // 1024} KB)")
@@ -150,9 +258,20 @@ def build_dataset(job_ids: list[str]) -> None:
         db.close()
 
     print()
+    MANIFEST_PATH.write_text(json.dumps({
+        "schema_version": 2,
+        "snapshot_at": datetime.now(timezone.utc).isoformat(),
+        "selection": {
+            "requested_jobs": len(job_ids),
+            "labels_file": LABELS_PATH.name,
+        },
+        "job_ids": [entry["job_id"] for entry in manifest_entries],
+        "entries": manifest_entries,
+    }, ensure_ascii=False, indent=2) + "\n")
+    print(f"Manifest reproducible: {MANIFEST_PATH}")
     print(f"Done: {ok_count} ok, {skip_count} skipped")
-    print(f"Run the baseline pipeline next:")
-    print(f"    python scripts/run_pipeline_local.py")
+    print("Run the baseline pipeline next:")
+    print("    python scripts/run_pipeline_local.py")
 
 
 def main() -> None:

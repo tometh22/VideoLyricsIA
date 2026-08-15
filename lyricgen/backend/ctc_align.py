@@ -324,14 +324,21 @@ _EN_STOP = frozenset(
 
 
 def guess_text_lang(lines: list[str]) -> str:
-    """'es' / 'en' / 'unknown' by function-word voting. Pure."""
+    """'es' / 'en' / 'unknown' by exclusive function-word voting.
+
+    Shared words (notably ``no`` and ``me``) are not language evidence.
+    Counting them for both sides made Spanish live choruses with repeated
+    ``no`` look ambiguous and disabled CTC before any acoustic work.
+    """
     es = en = 0
     for line in lines:
         for w in line.lower().split():
             w = re.sub(r"[^a-záéíóúñü']", "", w)
-            if w in _ES_STOP:
+            in_es = w in _ES_STOP
+            in_en = w in _EN_STOP
+            if in_es and not in_en:
                 es += 1
-            if w in _EN_STOP:
+            elif in_en and not in_es:
                 en += 1
     total = es + en
     if total < 5:
@@ -341,6 +348,36 @@ def guess_text_lang(lines: list[str]) -> str:
     if en >= 2 * es:
         return "en"
     return "unknown"
+
+
+def has_short_repeated_motif(lines: list[str], *, min_run: int = 3) -> bool:
+    """Detect a compact repeated chant that CTC must not re-time blindly.
+
+    Global CTC is excellent for lexical verses and full chorus lines, but a
+    run such as ``Real`` / ``Real`` / ``Real`` has too few phonetic anchors to
+    determine repetition cardinality.  In that case its monotonic Viterbi can
+    spread surplus rows across later crowd noise with plausible word scores.
+    Preserve the ASR timing and let the structural quality pass inspect the
+    bounded refrain instead.
+    """
+    generic = {"no", "oh", "ah", "uh", "eh", "yeah"}
+    previous = None
+    run = 0
+    for line in lines or []:
+        tokens = [norm_word(word) for word in str(line or "").split()]
+        tokens = [token for token in tokens if token]
+        opening = tokens[0] if 1 <= len(tokens) <= 4 else None
+        if opening and opening not in generic and opening == previous:
+            run += 1
+        elif opening and opening not in generic:
+            previous = opening
+            run = 1
+        else:
+            previous = None
+            run = 0
+        if run >= min_run:
+            return True
+    return False
 
 
 BRIDGE_S = 8.0  # no word lasts 8s; no intra-line silence lasts 8s
@@ -697,7 +734,6 @@ def _load_model():
     global _MODEL
     if _MODEL is not None:
         return _MODEL
-    import torch
     from transformers import AutoModelForCTC, Wav2Vec2CTCTokenizer
 
     t0 = time.time()
@@ -808,6 +844,13 @@ def retime_segments(audio_path: str, segments: list[dict],
             # model registry exists, declining is the honest move. Checked
             # BEFORE any torch import / 1.2 GB model load.
             logger.info("[CTC] decline: text language=%s (job=%s)", lang, job_id)
+            return None
+        if has_short_repeated_motif(lines):
+            last_decline_reason = "short_repeated_motif"
+            logger.info(
+                "[CTC] decline: short repeated motif lacks stable anchors "
+                "(job=%s)", job_id,
+            )
             return None
 
         import torch

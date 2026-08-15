@@ -12,6 +12,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database import EditorDocument, EditorVersion, Job, User
+from segment_timing import canonicalize_editor_segments
 
 EDITOR_REASONS = {"autosave", "manual", "restore", "approve", "conflict", "migration"}
 EDITOR_CHECKPOINTS = EDITOR_REASONS | {"draft"}
@@ -68,6 +69,11 @@ def normalize_segments(value: Any) -> list[dict]:
             "end": round(end, 4),
             "text": text,
         })
+    # Canonicalize appended rows by timestamp, but preserve semantic source
+    # order inside an anomalous overlap region and repair only that region.
+    # This prevents a post-alignment regression from making playback jump to
+    # a later lyric and then back to an earlier one.
+    normalized = canonicalize_editor_segments(normalized)
     if len(json.dumps(normalized, ensure_ascii=False).encode("utf-8")) > MAX_PAYLOAD_BYTES:
         raise ValueError(f"segments payload cannot exceed {MAX_PAYLOAD_BYTES} bytes")
     return normalized
@@ -257,6 +263,8 @@ def get_or_create_document(
     job_revision = int(getattr(job, "segments_revision", 0) or 0)
     document_segments = normalize_segments(document.current_segments or [])
     document_revision = int(document.revision or 0)
+    job_needs_canonicalization = job.segments_json != job_segments
+    document_needs_canonicalization = document.current_segments != document_segments
 
     if job_revision > document_revision:
         try:
@@ -269,6 +277,7 @@ def get_or_create_document(
         document.current_segments = job_segments
         document.revision = target_revision
         document.updated_at = now_utc()
+        job.segments_json = job_segments
     elif document_revision > job_revision:
         job.segments_json = document_segments
         job.segments_revision = document_revision
@@ -283,6 +292,21 @@ def get_or_create_document(
         # Preserve both sides. Job is the currently deployed writer, so it
         # becomes current at a fresh revision while the divergent document is
         # retained as an immutable migration snapshot.
+        old_revision = _next_revision(db, document, job_revision, document_revision)
+        _ensure_version(db, document, old_revision, document_segments, document.updated_by, "migration")
+        target_revision = old_revision + 1
+        _ensure_version(db, document, target_revision, job_segments, job.user_id, "migration")
+        document.current_segments = job_segments
+        document.revision = target_revision
+        document.updated_at = now_utc()
+        job.segments_json = job_segments
+        job.segments_revision = target_revision
+    elif job_needs_canonicalization or document_needs_canonicalization:
+        # A legacy document can already exist at the same revision as the Job
+        # while both snapshots contain the old malformed order.  Normalizing
+        # only the response would make the next reload resurrect the defect;
+        # promote the canonical payload through the ordinary immutable history
+        # so the repair is durable and auditable.
         old_revision = _next_revision(db, document, job_revision, document_revision)
         _ensure_version(db, document, old_revision, document_segments, document.updated_by, "migration")
         target_revision = old_revision + 1

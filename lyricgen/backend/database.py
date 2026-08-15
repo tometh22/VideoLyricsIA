@@ -571,6 +571,10 @@ class Job(Base):
     # bg_r2_key_cached — R2 key for the AI-generated background so typography-only
     #   edits can re-use it without paying for Veo again.
     segments_json = Column(JSONB, nullable=True)
+    # Persisted verdict from transcription_quality.py.  Keeping the policy,
+    # metrics, retry evidence and revision-scoped acknowledgement together
+    # prevents API/editor/worker drift without adding a column per metric.
+    transcription_quality = Column(JSONB, nullable=True)
     # Server-owned optimistic concurrency version for editor writes.
     segments_revision = Column(BigInteger, default=0, nullable=False, server_default="0")
     render_params = Column(JSONB, nullable=True)
@@ -699,6 +703,7 @@ class Job(Base):
             # then rejects with a raw English error.
             "segments_json": self.segments_json,
             "segments_revision": self.segments_revision or 0,
+            "transcription_quality": self.transcription_quality,
             "bg_r2_key_cached": self.bg_r2_key_cached,
             # Storyboard multi-escena (NULL en jobs de fondo único). El panel
             # de edición lo usa para mostrar las escenas y ofrecer "regenerar
@@ -1505,6 +1510,7 @@ def _migrate_user_columns():
         "CREATE INDEX IF NOT EXISTS ix_background_assets_owner_tenant_id ON background_assets(owner_tenant_id)",
         # Edit-requests feature: partial re-render support at review stage.
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS segments_json JSONB",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS transcription_quality JSONB",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS render_params JSONB",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS edit_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS bg_r2_key_cached TEXT",

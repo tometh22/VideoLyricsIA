@@ -4025,9 +4025,11 @@ export default function UploadZone({
             </div>
           )}
           <p className="text-[10px] text-gray-600 px-1">
-            {_previewLyric
-              ? `${t("upload.preview_editing") || "Línea actual"}: ${_previewLyric}${files.length > 1 ? ` · +${files.length - 1}` : ""}`
-              : (t("upload.preview_disclaimer") || "Aproximación del mood y el movimiento. El fondo final lo genera la IA.")}
+            {isStep6
+              ? "La letra resaltada sigue el reproductor; esta vista muestra la línea activa durante la reproducción."
+              : (_previewLyric
+                ? `Referencia de letra: ${_previewLyric}${files.length > 1 ? ` · +${files.length - 1}` : ""}`
+                : (t("upload.preview_disclaimer") || "Aproximación del mood y el movimiento. El fondo final lo genera la IA."))}
           </p>
           {/* Resumen "qué va a pasar", SIEMPRE visible y en el punto de commit.
               No es un modal: los productores que hacen lotes aprenden a

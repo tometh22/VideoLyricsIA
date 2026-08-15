@@ -13,6 +13,8 @@ import { reseedPreservingIds } from "../lib/segmentIds";
 import {
   clampBlockShiftDelta,
   shiftBlockWithinDuration,
+  canonicalizeEditorSegments,
+  selectActiveSegmentId,
 } from "../lib/segmentTiming";
 import { useJobSegments, segmentsStore } from "../state/segmentsStore";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
@@ -212,11 +214,12 @@ function sanitizeSegmentTiming(segment, fallbackStart = 0) {
 function sanitizeSegments(segments) {
   if (!Array.isArray(segments)) return [];
   let fallbackStart = 0;
-  return segments.map((segment) => {
+  const sanitized = segments.map((segment) => {
     const sanitized = sanitizeSegmentTiming(segment, fallbackStart);
     fallbackStart = sanitized.start;
     return sanitized;
   });
+  return canonicalizeEditorSegments(sanitized);
 }
 
 function sanitizeSegmentsForPersistence(segments) {
@@ -398,6 +401,47 @@ export function normalizeLineForMatch(text) {
   return (text || "").trim().replace(/\s+/g, " ");
 }
 
+export function summarizeOperatorCorrections(original = [], current = []) {
+  const hasStableIds = [...original, ...current].every((segment) => segment?._id != null);
+  const originalEntries = hasStableIds
+    ? original.map((segment) => [segment._id, segment])
+    : original.map((segment, index) => [`idx_${index}`, segment]);
+  const currentEntries = hasStableIds
+    ? current.map((segment) => [segment._id, segment])
+    : current.map((segment, index) => [`idx_${index}`, segment]);
+  const originalById = new Map(originalEntries);
+  const currentById = new Map(currentEntries);
+  const commonIds = [...originalById.keys()].filter((id) => currentById.has(id));
+  let textChanges = 0;
+  let timingChanges = 0;
+  for (const id of commonIds) {
+    const before = originalById.get(id) || {};
+    const after = currentById.get(id) || {};
+    if (normalizeLineForMatch(before.text) !== normalizeLineForMatch(after.text)) textChanges += 1;
+    if (Math.abs(Number(before.start || 0) - Number(after.start || 0)) > 0.05
+      || Math.abs(Number(before.end || 0) - Number(after.end || 0)) > 0.05) timingChanges += 1;
+  }
+  return {
+    line_count: current.length,
+    text_changes: textChanges,
+    timing_changes: timingChanges,
+    lines_added: [...currentById.keys()].filter((id) => !originalById.has(id)).length,
+    lines_removed: [...originalById.keys()].filter((id) => !currentById.has(id)).length,
+    lines_reordered: hasStableIds && commonIds.some(
+      (id, index) => currentEntries.filter(([currentId]) => originalById.has(currentId))[index]?.[0] !== id,
+    ) ? 1 : 0,
+  };
+}
+
+export function accrueActiveEditMs(clock, now) {
+  if (clock.active) {
+    const activeUntil = Math.min(now, clock.lastActivityMs + 60_000);
+    clock.totalMs += Math.max(0, activeUntil - clock.lastTickMs);
+  }
+  clock.lastTickMs = now;
+  return Math.round(clock.totalMs);
+}
+
 export default function LyricsEditor({
   // PR E (2026-07): `segments` es SOLO el seed inicial del store por job
   // (segmentsStore.useJobSegments). Post-mount, este prop ya NO re-seedea: el
@@ -406,7 +450,7 @@ export default function LyricsEditor({
   // que preserva la identidad de filas (reseedPreservingIds) — hoy sin caller
   // de producción (reservado / lo ejercitan sólo los tests).
   segments, filename, audioFile, referenceLyrics,
-  coverageWarning = false, recoverySource = "",
+  coverageWarning = false, transcriptionQuality = null, recoverySource = "",
   onApprove, onBack, isBatch = false, batchProgress = "",
   user = null,
   font = "",
@@ -539,6 +583,19 @@ export default function LyricsEditor({
     () => reseedPreservingIds([], sanitizeSegments(segments)),
   );
   const sanitizedEdited = useMemo(() => sanitizeSegments(edited), [edited]);
+
+  // A module-level store can outlive a remount. If it was seeded before the
+  // timeline-order guard shipped, normalize that live entry once so row
+  // indexes, neighbour clamps, drag handles and the rendered list all share
+  // the same chronological order. Comparing ids avoids a replace loop when
+  // sanitizeSegments returns fresh object copies on each render.
+  useEffect(() => {
+    if (edited.length !== sanitizedEdited.length
+      || edited.some((segment, index) => segment?._id !== sanitizedEdited[index]?._id)) {
+      setEdited(sanitizedEdited);
+    }
+  }, [edited, sanitizedEdited, setEdited]);
+
   const [isDirty, setIsDirty] = useState(false);
   // Two views over the same editor state. The basic review flow is the
   // default; timing tools only appear after the operator explicitly opens
@@ -651,6 +708,96 @@ export default function LyricsEditor({
     ? `${editorV2Enabled ? "genly_editor_draft" : "genly_segments_draft"}:${draftTenant}:${draftOwner}:${transcribeJobId}`
     : null;
   const editorSessionIdRef = useRef(null);
+  const editorSessionStartedAtRef = useRef(Date.now());
+  const activeClockStorageKey = transcribeJobId
+    ? `genly_active_edit:${draftTenant}:${draftOwner || "anonymous"}:${transcribeJobId}`
+    : null;
+  const editorActiveClockRef = useRef(null);
+  if (!editorActiveClockRef.current) {
+    let persistedMs = 0;
+    if (activeClockStorageKey && typeof localStorage !== "undefined") {
+      try {
+        persistedMs = Math.max(0, Number(localStorage.getItem(activeClockStorageKey)) || 0);
+      } catch { /* storage unavailable */ }
+    }
+    const now = Date.now();
+    const visible = typeof document === "undefined" || document.visibilityState !== "hidden";
+    const focused = typeof document === "undefined"
+      || typeof document.hasFocus !== "function" || document.hasFocus();
+    editorActiveClockRef.current = {
+      totalMs: persistedMs,
+      lastTickMs: now,
+      lastActivityMs: now,
+      active: visible && focused,
+    };
+  }
+  const persistActiveClock = useCallback(() => {
+    if (!activeClockStorageKey || typeof localStorage === "undefined") return;
+    try {
+      localStorage.setItem(
+        activeClockStorageKey,
+        String(Math.round(editorActiveClockRef.current.totalMs)),
+      );
+    } catch { /* storage unavailable */ }
+  }, [activeClockStorageKey]);
+  const readActiveEditMs = useCallback(() => {
+    const now = Date.now();
+    const clock = editorActiveClockRef.current;
+    // Credit at most the first 60 seconds after the last interaction. If
+    // this tick crosses the idle boundary, only the active portion counts.
+    return accrueActiveEditMs(clock, now);
+  }, []);
+  const clearActiveClock = useCallback(() => {
+    if (!activeClockStorageKey || typeof localStorage === "undefined") return;
+    try { localStorage.removeItem(activeClockStorageKey); } catch { /* storage unavailable */ }
+  }, [activeClockStorageKey]);
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof document === "undefined") return undefined;
+    const activity = () => {
+      readActiveEditMs();
+      const now = Date.now();
+      const clock = editorActiveClockRef.current;
+      clock.lastActivityMs = now;
+      clock.lastTickMs = now;
+      clock.active = document.visibilityState !== "hidden"
+        && (typeof document.hasFocus !== "function" || document.hasFocus());
+    };
+    const pause = () => {
+      readActiveEditMs();
+      editorActiveClockRef.current.active = false;
+      persistActiveClock();
+    };
+    const resume = () => {
+      const now = Date.now();
+      const clock = editorActiveClockRef.current;
+      clock.lastTickMs = now;
+      clock.lastActivityMs = now;
+      clock.active = document.visibilityState !== "hidden";
+    };
+    const visibilityChanged = () => {
+      if (document.visibilityState === "hidden") pause();
+      else resume();
+    };
+    window.addEventListener("pointerdown", activity, { passive: true });
+    window.addEventListener("keydown", activity);
+    window.addEventListener("blur", pause);
+    window.addEventListener("focus", resume);
+    document.addEventListener("visibilitychange", visibilityChanged);
+    const interval = window.setInterval(() => {
+      readActiveEditMs();
+      persistActiveClock();
+    }, 10_000);
+    return () => {
+      readActiveEditMs();
+      persistActiveClock();
+      window.clearInterval(interval);
+      window.removeEventListener("pointerdown", activity);
+      window.removeEventListener("keydown", activity);
+      window.removeEventListener("blur", pause);
+      window.removeEventListener("focus", resume);
+      document.removeEventListener("visibilitychange", visibilityChanged);
+    };
+  }, [persistActiveClock, readActiveEditMs]);
   if (!editorSessionIdRef.current) {
     editorSessionIdRef.current = globalThis.crypto?.randomUUID?.()
       || `editor-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -1136,12 +1283,10 @@ export default function LyricsEditor({
       if (a && !a.paused) {
         const ct = a.currentTime;
         playbackTimeRef.current = ct;
-        let active = null;
-        for (const s of sanitizedEdited) {
-          if (ct >= s.start && ct < s.end) { active = s; break; }
-          if (ct >= s.start) active = s;
-        }
-        const activeKey = active?._id ?? null;
+        const activeKey = selectActiveSegmentId(sanitizedEdited, ct);
+        const active = sanitizedEdited.find((segment, index) => (
+          (segment?._id ?? index) === activeKey
+        )) || null;
         if (activeKey !== lastPublishedActiveIdRef.current
           || Math.abs(ct - lastPublishedTimeRef.current) >= 0.05) {
           lastPublishedTimeRef.current = ct;
@@ -1477,13 +1622,7 @@ export default function LyricsEditor({
   // the latest one whose start <= currentTime if no segment "owns" the
   // moment (e.g. instrumental gap).
   const activeId = useMemo(() => {
-    let containing = null;
-    let lastStarted = null;
-    for (const seg of sanitizedEdited) {
-      if (currentTime >= seg.start && currentTime < seg.end) containing = seg;
-      if (currentTime >= seg.start) lastStarted = seg;
-    }
-    return (containing || lastStarted)?._id ?? null;
+    return selectActiveSegmentId(sanitizedEdited, currentTime);
   }, [sanitizedEdited, currentTime]);
 
   // UI freeze / render-storm capture (P0 UMG Chile 2026-06-16). Cause-agnostic
@@ -2466,6 +2605,43 @@ export default function LyricsEditor({
     }
     setWrapWarning(null);
     const cleaned = _buildCleanedSegments();
+    const correctionSummary = summarizeOperatorCorrections(
+      originalSegmentsRef.current || [], cleaned || [],
+    );
+    // Any operator approval of a quality-evaluated job is explicit. Persist
+    // it even when the machine originally passed: autosave may have advanced
+    // the revision (or a sanitizer may have changed a few milliseconds), and
+    // a verdict from the previous revision must never authorize the new one.
+    const qualityAcknowledged = Boolean(transcriptionQuality);
+    const approvalTelemetry = {
+      ...correctionSummary,
+      duration_ms: Math.max(0, Date.now() - editorSessionStartedAtRef.current),
+      active_edit_ms: readActiveEditMs(),
+      quality_acknowledged: qualityAcknowledged,
+    };
+    const operatorMetrics = {
+      ...approvalTelemetry,
+      session_id: editorSessionIdRef.current,
+    };
+    const persistQualityAcknowledgement = async (revision) => {
+      if (!qualityAcknowledged || !editorRequest || !transcribeJobId) return true;
+      try {
+        const response = await editorRequest(
+          `/jobs/${transcribeJobId}/transcription-quality/acknowledge`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ base_revision: revision }),
+          },
+        );
+        if (response.ok) return true;
+      } catch { /* handled below */ }
+      toast({
+        message: "La letra cambió mientras la revisabas. Volvé a confirmar la versión actual antes de generar.",
+        tone: "info",
+      });
+      return false;
+    };
     if (editorV2Enabled) {
       // `_buildCleanedSegments` may tighten an overlap by 50 ms. Persist
       // that exact final snapshot before sending its revision/version id;
@@ -2481,10 +2657,13 @@ export default function LyricsEditor({
       let approvalSegments = cleaned.map(({ _id, ...rest }) => rest);
       let persistenceSnapshot = cleanedForPersistence;
       for (let attempt = 0; attempt < 3; attempt += 1) {
+        if (qualityAcknowledged
+          && !await persistQualityAcknowledgement(currentSave.revision)) return;
         approvalResult = await Promise.resolve(onApprove(approvalSegments, {
           baseRevision: currentSave.revision,
           editorRevision: currentSave.revision,
           editorVersionId: currentSave.versionId,
+          operatorMetrics,
         }));
         if (approvalResult?.ok !== false || approvalResult.reason !== "conflict") break;
 
@@ -2511,14 +2690,25 @@ export default function LyricsEditor({
         return;
       }
       setIsDirty(false);
-      trackEditorEvent("editor_approved", { revision: currentSave.revision });
+      clearActiveClock();
+      trackEditorEvent("editor_approved", {
+        revision: currentSave.revision, ...approvalTelemetry,
+      });
       return;
     }
     if (disableAutosave || !onPersistSegments || !transcribeJobId) {
       setIsDirty(false);
+      const revision = Number.isInteger(segmentsRevision) ? segmentsRevision : 0;
+      if (qualityAcknowledged && !await persistQualityAcknowledgement(revision)) return;
       await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
-        baseRevision: Number.isInteger(segmentsRevision) ? segmentsRevision : 0,
+        baseRevision: revision,
+        operatorMetrics,
       }));
+      clearActiveClock();
+      trackEditorEvent("editor_approved", {
+        revision: Number.isInteger(segmentsRevision) ? segmentsRevision : 0,
+        ...approvalTelemetry,
+      });
       return;
     }
     let saveResult = await flushPendingSave();
@@ -2527,11 +2717,20 @@ export default function LyricsEditor({
       return;
     }
     setIsDirty(false);
+    const approvedRevision = Number.isInteger(saveResult?.revision)
+      ? saveResult.revision
+      : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
+    if (qualityAcknowledged
+      && !await persistQualityAcknowledgement(approvedRevision)) return;
     await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
-      baseRevision: Number.isInteger(saveResult?.revision)
-        ? saveResult.revision
-        : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0),
+      baseRevision: approvedRevision,
+      operatorMetrics,
     }));
+    clearActiveClock();
+    trackEditorEvent("editor_approved", {
+      revision: approvedRevision,
+      ...approvalTelemetry,
+    });
   };
 
   const handleApprove = async (options = {}) => {
@@ -2807,6 +3006,20 @@ export default function LyricsEditor({
           <p className="text-xs text-ink-secondary leading-relaxed">
             {t("editor.coverage_warning")}
           </p>
+        </div>
+      )}
+
+      {transcriptionQuality?.decision === "review_required" && (
+        <div className="mb-4 rounded-2xl ring-1 ring-red-400/35 bg-red-500/[0.08] px-4 py-3 flex items-start gap-3">
+          <svg className="w-5 h-5 text-red-300 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+            <path d="M12 9v4m0 4h.01M10.3 3.6 2.1 18a2 2 0 0 0 1.7 3h16.4a2 2 0 0 0 1.7-3L13.7 3.6a2 2 0 0 0-3.4 0Z" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <div>
+            <p className="text-xs font-semibold text-red-200">Revisión de letra necesaria antes de renderizar</p>
+            <p className="mt-1 text-xs text-red-100/80 leading-relaxed">
+              Detectamos {transcriptionQuality.unsafe_windows?.length || 1} zona(s) donde el texto o el timing no tienen evidencia suficiente. Revisalas escuchando el audio; al aprobar, tu confirmación quedará registrada para esta versión.
+            </p>
+          </div>
         </div>
       )}
 
@@ -3665,7 +3878,7 @@ export default function LyricsEditor({
             </div>
             <LyricVideoPreview
               t={t}
-              segments={edited}
+              segments={sanitizedEdited}
               currentTime={currentTime}
               isPlaying={isPlaying}
               backgroundUrl={previewBgUrl || null}
@@ -3753,7 +3966,7 @@ export default function LyricsEditor({
                   </div>
                 ) : (
                   <LyricsTimeline
-                    segments={edited}
+                    segments={sanitizedEdited}
                     duration={duration}
                     currentTime={currentTime}
                     playbackTimeRef={playbackTimeRef}
@@ -3809,7 +4022,7 @@ export default function LyricsEditor({
                       className="absolute right-0 top-0 bottom-0 w-2 z-20 group/mini cursor-pointer"
                       style={{ touchAction: "none" }}
                     >
-                      {edited.map((seg) => {
+                      {sanitizedEdited.map((seg) => {
                         const top = (seg.start / duration) * 100;
                         const height = Math.max(0.4, ((seg.end - seg.start) / duration) * 100);
                         const isActive = seg._id === activeId;
@@ -3851,7 +4064,7 @@ export default function LyricsEditor({
                       Mobile mantiene el cap original (no hay outer
                       overflow ahí, el page scroll cubre todo). */}
                   <div ref={listRef} className={`space-y-0.5 overflow-y-auto pr-1 pb-8 ${workspaceFocusMode ? "max-h-[calc(100vh-110px)]" : "max-h-[calc(100vh-200px)]"} lg:max-h-none lg:overflow-visible`}>
-          {edited.map((seg, idx) => {
+          {sanitizedEdited.map((seg, idx) => {
             const suggestion = suggestionsById[seg._id];
             const isApplied = suggestion && seg.text === suggestion;
             const isActive = seg._id === activeId;

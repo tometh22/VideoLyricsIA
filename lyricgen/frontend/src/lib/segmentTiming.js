@@ -370,3 +370,153 @@ export function clampResizeTimingWithAdjacent(
 
   return single();
 }
+
+/**
+ * Canonicalize an editor payload by timestamp without changing timings.
+ * Browser row order is transient: inserting/rebasing a lyric can append it
+ * temporarily, while playback and persistence require timeline order.
+ */
+export function sortSegmentsChronologically(segments) {
+  if (!Array.isArray(segments)) return [];
+  return segments
+    .map((segment, index) => ({ segment, index }))
+    .filter(({ segment }) => segment && typeof segment === "object")
+    .sort((left, right) => {
+      const a = Number(left.segment.start);
+      const b = Number(right.segment.start);
+      const safeA = Number.isFinite(a) ? Math.max(0, a) : 0;
+      const safeB = Number.isFinite(b) ? Math.max(0, b) : 0;
+      return safeA - safeB || left.index - right.index;
+    })
+    .map(({ segment }) => segment);
+}
+
+const collisionText = (segment) => String(segment?.text || "")
+  .trim().replace(/\s+/g, " ").toLocaleLowerCase();
+
+const nearCollision = (left, right) => {
+  const a = collisionText(left).split(" ").filter(Boolean);
+  const b = collisionText(right).split(" ").filter(Boolean);
+  if (!a.length || a.length !== b.length || a.length < 3) return false;
+  if (!a.slice(0, -1).every((token, index) => token === b[index])) return false;
+  return a[a.length - 1].startsWith(b[b.length - 1])
+    || b[b.length - 1].startsWith(a[a.length - 1]);
+};
+
+/**
+ * Canonicalize editor rows while keeping semantic order in a bad overlap.
+ * A timestamp sort alone makes a regressed lyric appear before its
+ * predecessor; a blanket sort also makes the active row jump inside that
+ * overlap.  Only an overlapping region with a source-order regression is
+ * repaired. Legitimate monotonic overlaps (e.g. harmonies) are untouched.
+ */
+export function canonicalizeEditorSegments(segments) {
+  if (!Array.isArray(segments)) return [];
+  const cleaned = [];
+  segments.forEach((segment) => {
+    if (!segment || typeof segment !== "object") return;
+    const start = Number(segment.start);
+    const duplicate = cleaned.find((previous) => (
+      (collisionText(previous) === collisionText(segment) || nearCollision(previous, segment))
+      && Math.abs(Number(previous.start) - start) < 0.35
+    ));
+    if (duplicate) {
+      duplicate.end = Math.max(Number(duplicate.end) || 0, Number(segment.end) || 0);
+      return;
+    }
+    cleaned.push({ ...segment });
+  });
+
+  const decorated = cleaned.map((segment, index) => ({
+    segment,
+    index,
+    start: Number.isFinite(Number(segment.start)) ? Math.max(0, Number(segment.start)) : 0,
+    end: Number.isFinite(Number(segment.end)) ? Math.max(Number(segment.start) || 0, Number(segment.end)) : 0,
+  }));
+  const byTime = [...decorated].sort((left, right) => left.start - right.start || left.index - right.index);
+  const regions = [];
+  byTime.forEach((item) => {
+    const last = regions[regions.length - 1];
+    const regionEnd = last ? Math.max(...last.map((row) => row.end)) : -Infinity;
+    if (!last || item.start >= regionEnd) regions.push([item]);
+    else last.push(item);
+  });
+
+  const ordered = [];
+  regions.forEach((region) => {
+    const sourceOrder = [...region].sort((left, right) => left.index - right.index);
+    const hasRegression = sourceOrder.slice(1).some((item, index) => (
+      item.start < sourceOrder[index].start
+    ));
+    if (!hasRegression) {
+      ordered.push(...region
+        .sort((left, right) => left.start - right.start || left.index - right.index)
+        .map((item) => item.segment));
+      return;
+    }
+    let previousEnd = null;
+    sourceOrder.forEach(({ segment }, position) => {
+      const rawStart = Number(segment.start);
+      const rawEnd = Number(segment.end);
+      const safeRawStart = Number.isFinite(rawStart) ? Math.max(0, rawStart) : 0;
+      const safeRawEnd = Number.isFinite(rawEnd) ? rawEnd : safeRawStart;
+      const start = previousEnd == null
+        ? safeRawStart
+        : Math.max(safeRawStart, previousEnd + 0.05);
+      let duration = Math.max(0.3, safeRawEnd - safeRawStart);
+      const nextRawStart = position + 1 < sourceOrder.length
+        ? Number(sourceOrder[position + 1].segment.start)
+        : null;
+      if (Number.isFinite(nextRawStart) && nextRawStart > start) {
+        duration = Math.min(duration, Math.max(0.3, nextRawStart - 0.05 - start));
+      }
+      const roundedStart = Math.round(start * 10000) / 10000;
+      const roundedEnd = Math.round((start + duration) * 10000) / 10000;
+      ordered.push({ ...segment, start: roundedStart, end: roundedEnd });
+      previousEnd = roundedEnd;
+    });
+  });
+  return ordered;
+}
+
+function finiteStart(segment) {
+  const value = Number(segment?.start);
+  return Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Choose the active row from timestamps, never from the incoming array
+ * position. The later start wins inside an overlap; equal timestamps keep
+ * the earliest stable row so duplicate legacy lines do not flicker.
+ */
+export function selectActiveSegmentId(segments, currentTime, options = {}) {
+  if (!Array.isArray(segments) || !segments.length) return null;
+  const time = Number(currentTime);
+  if (!Number.isFinite(time)) return null;
+
+  let containing = null;
+  let latestStarted = null;
+  segments.forEach((segment, index) => {
+    const start = finiteStart(segment);
+    if (start == null || start > time) return;
+    const rawEnd = Number(segment.end);
+    const end = Number.isFinite(rawEnd) ? rawEnd : start;
+    const candidate = { segment, index, start };
+    if (time < end && (!containing || start > containing.start
+      || (start === containing.start && index < containing.index))) {
+      containing = candidate;
+    }
+    if (!latestStarted || start > latestStarted.start
+      || (start === latestStarted.start && index < latestStarted.index)) {
+      latestStarted = candidate;
+    }
+  });
+
+  const selected = containing || latestStarted;
+  const tailHoldS = Number(options?.tailHoldS);
+  if (!containing && selected && Number.isFinite(tailHoldS)) {
+    const end = Number(selected.segment.end);
+    if (Number.isFinite(end) && time - end > tailHoldS) return null;
+  }
+  return selected?.segment?._id ?? selected?.index ?? null;
+}

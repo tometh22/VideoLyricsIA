@@ -113,6 +113,7 @@ from editor import (
 )
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe, _normalize_movement_style
+from segment_timing import normalize_segments_timing, normalize_editor_segments, timing_anomalies
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
 from transcription_language import resolve_transcription_language, forced_language_for_tenant
@@ -4035,12 +4036,14 @@ async def transcribe_uploaded(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Promote an awaiting_upload job to transcribed_pending, downloading
-    the audio from R2 to local disk for Whisper / lrclib lookup.
+    """Promote an awaiting_upload job into the transcription flow.
 
-    Returns the same shape as the legacy /transcribe (segments,
-    reference_lyrics, plus job_id) so the frontend's editor flow
-    plugs in unchanged.
+    The default async path only verifies stored size and enqueues; ShortWorker
+    owns R2 materialization and validation. The legacy synchronous fallback
+    still downloads locally because the API process consumes the audio.
+
+    Returns the legacy /transcribe payload in sync mode. Async returns the
+    queued job id and the frontend polls for the editor payload.
     """
     from jobs import get_job_model
     job_row = get_job_model(db, body.job_id)
@@ -4072,6 +4075,11 @@ async def transcribe_uploaded(
             status_code=409,
             detail="Job has no associated upload.",
         )
+    if int(getattr(job_row, "segments_revision", 0) or 0) > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="La letra ya tiene ediciones guardadas; creá una nueva transcripción para no sobrescribirlas.",
+        )
 
     # SNAPSHOT + release (incidente agus77 06/07): la descarga de R2 de
     # abajo tarda decenas de segundos con un WAV de 45-150 MB, y este
@@ -4101,55 +4109,35 @@ async def transcribe_uploaded(
         "ASYNC_TRANSCRIBE_ENABLED", "1"
     ).strip().lower() not in ("0", "false", "no", "off")
 
-    # Materialize the audio onto local disk for Whisper / ffmpeg / etc.
-    # En el path async, esto sigue siendo necesario porque el handler valida
-    # el archivo (corrupt detection) antes de enqueue — fail-fast en el
-    # request, no en el worker (que daría error opaco al usuario via polling).
+    # Build the destination path once and pass it to the worker. API and
+    # ShortWorker do not share a filesystem on Railway, so materializing the
+    # object in the API container before enqueue only makes R2 transfer the
+    # same file twice. In the 03e2cb7f7321 incident that redundant download
+    # held this request for 249 s while the wizard sat at 0%; the worker then
+    # downloaded the WAV again and completed normally in 35 s.
     job_id = body.job_id
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
     audio_path = os.path.join(job_dir, _row_filename)
 
-    if not os.path.exists(audio_path):
-        import asyncio as _asyncio
-        # Size gate against the REAL stored object before pulling it to
-        # local disk. The single-PUT path never passes through
-        # /upload-multipart-complete, so a client that under-declared
-        # size_bytes in /upload-url could otherwise land an arbitrarily
-        # large object and have us download it whole (disk + Whisper).
-        _real_size = storage.head_object_size(_r2_key)
-        if _real_size is not None and _real_size > MAX_UPLOAD_MB * 1024 * 1024:
-            logger.warning(
-                "[UPLOAD] 413 at transcribe: job=%s key=%s real=%.1f MB > %d MB "
-                "tenant=%s user=%s",
-                body.job_id, _r2_key, _real_size / 1048576,
-                MAX_UPLOAD_MB, current_user["tenant_id"], current_user["id"],
-            )
-            raise HTTPException(
-                status_code=413,
-                detail=f"File too large ({_real_size / 1048576:.1f} MB). "
-                       f"Max allowed: {MAX_UPLOAD_MB} MB.",
-            )
-        _loop = _asyncio.get_event_loop()
-        for _attempt in range(5):
-            # boto3 es síncrono: correrlo inline dentro de este handler
-            # async bloqueaba el event loop de uvicorn el tiempo entero
-            # de la descarga (segundos con un WAV de 150 MB) y un batch
-            # de 5 serializaba TODA la API. Mismo patrón executor que
-            # /upload-part-proxy.
-            _ok = await _loop.run_in_executor(
-                None, storage.download_object, _r2_key, audio_path,
-            )
-            if _ok:
-                break
-            if _attempt < 4:
-                await _asyncio.sleep(0.5 * (2 ** _attempt))
-        else:
-            raise HTTPException(
-                status_code=502,
-                detail="No pudimos leer el archivo subido. Reintentá en unos segundos.",
-            )
-    _validate_audio_file_on_disk(_row_filename, audio_path)
+    # Size gate against the REAL stored object before enqueue/download. The
+    # single-PUT path never passes through /upload-multipart-complete, so a
+    # client that under-declared size_bytes could otherwise land an
+    # arbitrarily large object. HEAD is intentionally the only R2 operation
+    # on the async request path; the worker owns download + header validation.
+    import asyncio as _asyncio
+    _real_size = await _asyncio.to_thread(storage.head_object_size, _r2_key)
+    if _real_size is not None and _real_size > MAX_UPLOAD_MB * 1024 * 1024:
+        logger.warning(
+            "[UPLOAD] 413 at transcribe: job=%s key=%s real=%.1f MB > %d MB "
+            "tenant=%s user=%s",
+            body.job_id, _r2_key, _real_size / 1048576,
+            MAX_UPLOAD_MB, current_user["tenant_id"], current_user["id"],
+        )
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({_real_size / 1048576:.1f} MB). "
+                   f"Max allowed: {MAX_UPLOAD_MB} MB.",
+        )
 
     if _async_enabled:
         # Async path — enqueue + 202 + status polling.
@@ -4162,7 +4150,12 @@ async def transcribe_uploaded(
             if _row2 is None:
                 raise HTTPException(status_code=404, detail="Job not found.")
             _row2.status = "transcribing_queued"
-            _row2.current_step = "transcribing"
+            # Publish a frontend-recognised stage before enqueue. The wizard
+            # used to sit at an unexplained 0% throughout the API-side R2
+            # transfer; now enqueue is immediate and even a slow worker-side
+            # download is represented as audio preparation.
+            _row2.current_step = "transcribe.prepare"
+            _row2.progress = 1
             # Reset the reaper clock. find_stuck_transcriptions anchors on
             # coalesce(last_progress_at, created_at) with a 120-min threshold
             # (reaper.py). A retried `transcription_failed` job has an OLD
@@ -4209,6 +4202,27 @@ async def transcribe_uploaded(
         }
 
     # Legacy sync path (fallback con ASYNC_TRANSCRIBE_ENABLED=0).
+    # Unlike the async path this process consumes the file itself, therefore
+    # it must still materialize and validate it before entering Whisper.
+    os.makedirs(job_dir, exist_ok=True)
+    if not os.path.exists(audio_path):
+        _loop = _asyncio.get_event_loop()
+        for _attempt in range(5):
+            # boto3 is synchronous; keep it off the uvicorn event loop.
+            _ok = await _loop.run_in_executor(
+                None, storage.download_object, _r2_key, audio_path,
+            )
+            if _ok:
+                break
+            if _attempt < 4:
+                await _asyncio.sleep(0.5 * (2 ** _attempt))
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail="No pudimos leer el archivo subido. Reintentá en unos segundos.",
+            )
+    _validate_audio_file_on_disk(_row_filename, audio_path)
+
     transcription_lease = _try_acquire_transcription_slot()
     try:
         # Reuse the existing Whisper / lrclib machinery from the legacy
@@ -4238,6 +4252,8 @@ async def transcribe_uploaded(
             language=forced_language_for_tenant(current_user.get("tenant_id", ""), body.language),
             artist=_row_artist,
             title=_row_title,
+            filename=_row_filename,
+            live=bool(body.live),
         )
         # Versión B: si el operador pegó la letra oficial, anclarla con CTC
         # ANTES del retime normal; si ancló, saltear el retime (no doble).
@@ -4260,8 +4276,11 @@ async def transcribe_uploaded(
         _result = _maybe_repetition_reconcile(_result, job_id)
         _result = await _maybe_gap_rescue(_result, audio_path, job_id,
                                           _post_lang)
-        _result = await _maybe_word_vote(_result, audio_path, job_id,
-                                         _post_lang)
+        _result = await _maybe_word_vote(
+            _result, audio_path, job_id, _post_lang,
+            live_hint=bool(getattr(body, "live", False))
+            or _looks_live(_row_title, _row_filename),
+        )
         _result = _maybe_chorus_snap(_result, job_id)
         _result = _maybe_phrase_segment(_result, job_id)
         from lyrics_format import format_lyrics_pass as _fmt
@@ -4269,7 +4288,12 @@ async def transcribe_uploaded(
         # Último post-pase: la ventana de cada cartel debe coincidir con sus
         # propias palabras (audit 2026-08-13). Lockstep con el worker y con
         # /transcribe — si se agrega acá y no allá, los caminos divergen.
-        return _maybe_timing_consistency(_result, job_id)
+        _result = _maybe_timing_consistency(_result, job_id)
+        return await _finalize_inline_transcription_quality(
+            _result, audio_path, job_id, _post_lang,
+            live_hint=bool(getattr(body, "live", False))
+            or _looks_live(_row_title, _row_filename),
+        )
     finally:
         _release_transcription_slot(transcription_lease)
 
@@ -4330,6 +4354,8 @@ def transcription_status(
             "segments": None,
             "reference_lyrics": None,
             "coverage_warning": bool(getattr(job_row, "coverage_warning", False)),
+            "transcription_quality": getattr(job_row, "transcription_quality", None),
+            "segments_revision": int(getattr(job_row, "segments_revision", 0) or 0),
             "recovery_source": getattr(job_row, "recovery_source", None),
             "error": None,
         }
@@ -4981,14 +5007,20 @@ async def transcribe_endpoint(
     _result = _maybe_repetition_reconcile(_result, job_id)
     _result = await _maybe_gap_rescue(_result, audio_path, job_id,
                                       _post_lang)
-    _result = await _maybe_word_vote(_result, audio_path, job_id,
-                                     _post_lang)
+    _result = await _maybe_word_vote(
+        _result, audio_path, job_id, _post_lang,
+        live_hint=_looks_live(title, file.filename),
+    )
     _result = _maybe_chorus_snap(_result, job_id)
     _result = _maybe_phrase_segment(_result, job_id)
     from lyrics_format import format_lyrics_pass as _fmt
     _result = await _fmt(_result, language=_post_lang)
     # Lockstep con el worker y con /transcribe-uploaded — ver el comentario ahí.
-    return _maybe_timing_consistency(_result, job_id)
+    _result = _maybe_timing_consistency(_result, job_id)
+    return await _finalize_inline_transcription_quality(
+        _result, audio_path, job_id, _post_lang,
+        live_hint=_looks_live(title, file.filename),
+    )
 
 
 from ctc_cascade_veto import _ctc_cascade_veto  # noqa: E402
@@ -5004,7 +5036,10 @@ def _looks_live(*texts) -> bool:
     Señal barata para armar la auditoría de sufijo. El catálogo etiqueta los
     vivos en el título ('Live In Buenos Aires 2001'); para archivos sin
     etiquetar existe el toggle del operador (body.live)."""
-    return any(t and _LIVE_MARKER_RE.search(str(t)) for t in texts)
+    return any(
+        t and _LIVE_MARKER_RE.search(re.sub(r"[_-]+", " ", str(t)))
+        for t in texts
+    )
 
 
 def _resolve_postprocess_language(requested_language, result, *, job_id: str):
@@ -5091,7 +5126,10 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
             return result
         from pipeline import _audio_duration
         dur = await asyncio.to_thread(_audio_duration, audio_path)
-        _hay_huecos = bool(_gr.find_gaps(segs, dur))
+        _include_leading = bool(result.get("live_audio_truth"))
+        _hay_huecos = bool(_gr.find_gaps(
+            segs, dur, include_leading=_include_leading,
+        ))
         _hay_manchados = False
         _words_pre = result.get("_asr_words") or []
         if _words_pre:
@@ -5122,6 +5160,8 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
             hold_s=_li.hold_seconds(),
             asr_words=result.get("_asr_words"),
             job_id=job_id,
+            include_leading=_include_leading,
+            reference_text=result.get("reference_lyrics") or "",
         )
         if stats.get("rescued_lines"):
             result = dict(result)
@@ -5157,7 +5197,8 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
 
 
 async def _maybe_word_vote(result, audio_path: str, job_id: str,
-                           language: str | None = None):
+                           language: str | None = None, *,
+                           live_hint: bool = False):
     """Post-pass gateado (WORD_VOTE_ENABLED, default off): el audio corrige
     a la referencia palabra por palabra, la referencia aporta la ortografía.
 
@@ -5175,10 +5216,16 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
     _stem = None
     try:
         import word_vote as _wv
-        if not _wv.is_enabled():
+        _live_verify = bool(
+            live_hint
+            and os.environ.get("LIVE_INDEPENDENT_VERIFY_ENABLED", "0")
+            .strip().lower() in ("1", "true", "yes", "on")
+        )
+        if not (_wv.is_enabled() or _live_verify):
             return result
         segs = result.get("segments") or []
-        if len(segs) < 3 or not audio_path or not os.path.exists(audio_path):
+        if ((len(segs) < 3 and not _live_verify)
+                or not segs or not audio_path or not os.path.exists(audio_path)):
             return result
         import vocal_sep as _vs
         _stem = await asyncio.wait_for(
@@ -5192,14 +5239,184 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
             return result
         from pipeline import _audio_duration
         dur = await asyncio.to_thread(_audio_duration, audio_path)
+        try:
+            import math as _math
+            _duration_valid = (
+                _math.isfinite(float(dur)) and float(dur) > 0.0
+            )
+        except (TypeError, ValueError):
+            _duration_valid = False
+        if _live_verify and not _duration_valid:
+            result = dict(result)
+            result.setdefault("postpass_stats", {})["word_vote"] = {
+                "substitutions": 0, "insertions": 0, "lines_changed": 0,
+                "independent_verifier": True,
+                "declined": ["duration_unavailable"],
+                "audio_seconds_billed": 0.0,
+            }
+            logger.warning(
+                "[WORD-VOTE] live witness declined: invalid duration=%r job=%s",
+                dur, job_id,
+            )
+            return result
+        try:
+            _max_verify_s = min(
+                600.0,
+                max(30.0, float(os.environ.get(
+                    "LIVE_INDEPENDENT_VERIFY_MAX_SECONDS", "480",
+                ))),
+            )
+        except (TypeError, ValueError):
+            _max_verify_s = 480.0
+        try:
+            _job_asr_budget = min(
+                600.0,
+                max(30.0, float(os.environ.get(
+                    "LIVE_ASR_MAX_BILLED_SECONDS", "600",
+                ))),
+            )
+        except (TypeError, ValueError):
+            _job_asr_budget = 600.0
+        _max_verify_s = min(_max_verify_s, _job_asr_budget)
+        if _live_verify and float(dur or 0.0) > _max_verify_s:
+            result = dict(result)
+            result.setdefault("postpass_stats", {})["word_vote"] = {
+                "substitutions": 0, "insertions": 0, "lines_changed": 0,
+                "independent_verifier": True,
+                "declined": ["duration_budget"],
+                "audio_seconds_billed": 0.0,
+            }
+            logger.warning(
+                "[WORD-VOTE] live witness declined: duration %.1fs > %.1fs job=%s",
+                float(dur or 0.0), _max_verify_s, job_id,
+            )
+            return result
         from gap_rescue import _transcribe_window
         witness = await asyncio.to_thread(
             _transcribe_window, _stem, 0.0, float(dur or 600.0),
-            language,
+            language, job_id, provenance_step="live_independent_verify",
         )
-        nuevo, stats = _wv.vote(segs, witness)
+        _witness_source = "stem"
+        _provider_attempts = 1
+        _submitted_audio_seconds = float(dur or 0.0)
+        _raw_witness_words = len(witness)
+
+        def _sanitize_live_witness(_words):
+            # A whole-song blind Whisper pass can emit training-data credits
+            # over instrumental breaks. They are not independent evidence of
+            # singing and must not manufacture unsafe windows.
+            from gap_rescue import _agrupar_en_lineas
+            from pipeline import _is_whisper_hallucination
+            return [
+                word
+                for group in _agrupar_en_lineas(_words or [])
+                if not _is_whisper_hallucination(
+                    " ".join(str(w.get("word") or "") for w in group)
+                )
+                for word in group
+            ]
+        if _live_verify:
+            witness = _sanitize_live_witness(witness)
+
+        # Vocal isolation is often decisive, but some live stems damage the
+        # very consonants we need to adjudicate (Los Pericos: Hoy/Muy and
+        # alejaste/alejas). If the blind stem witness has poor physical/text
+        # agreement, make one bounded blind pass on the original mix and keep
+        # whichever witness is objectively less inconsistent. No prompt or
+        # catalogue is sent to either call.
+        _mix_fallback_enabled = (
+            os.environ.get("LIVE_INDEPENDENT_MIX_FALLBACK_ENABLED", "1")
+            .strip().lower() in ("1", "true", "yes", "on")
+        )
+        if _live_verify and _mix_fallback_enabled:
+            try:
+                from audio_coverage import (
+                    audio_coverage as _witness_coverage,
+                    text_mismatches as _witness_mismatches,
+                )
+
+                def _witness_rank(_words):
+                    return (
+                        len(_witness_mismatches(segs, _words)),
+                        -float(_witness_coverage(segs, _words)),
+                    )
+
+                _stem_rank = _witness_rank(witness)
+                _poor_stem = _stem_rank[0] >= 2 or -_stem_rank[1] < 0.70
+                _can_afford_mix = (
+                    _submitted_audio_seconds + float(dur or 0.0)
+                    <= _job_asr_budget
+                )
+                if _poor_stem and _can_afford_mix:
+                    _mix_raw = await asyncio.to_thread(
+                        _transcribe_window, audio_path, 0.0,
+                        float(dur or 600.0), language, job_id,
+                        provenance_step="live_independent_verify_mix",
+                    )
+                    _provider_attempts += 1
+                    _submitted_audio_seconds += float(dur or 0.0)
+                    _mix_witness = _sanitize_live_witness(_mix_raw)
+                    _mix_rank = _witness_rank(_mix_witness)
+                    if _mix_rank < _stem_rank:
+                        witness = _mix_witness
+                        _raw_witness_words = len(_mix_raw)
+                        _witness_source = "mix"
+            except Exception as _mix_exc:
+                logger.warning(
+                    "[WORD-VOTE] mix witness fallback declined: %r job=%s",
+                    _mix_exc, job_id,
+                )
+        # In live verification mode this witness may apply only a pre-existing
+        # primary-ASR + catalogue proposal, making the decision three-way.
+        # Observe mode remains non-mutating; enforce mode applies verified
+        # proposals and the final gate rechecks the exact resulting payload.
+        if _live_verify:
+            from live_lexical_consensus import apply_verified_proposals
+            _verified_candidate, _lexical_stats = apply_verified_proposals(
+                segs, witness,
+            )
+            _apply_verified = (
+                os.environ.get("TRANSCRIPTION_QUALITY_MODE", "observe")
+                .strip().lower() == "enforce"
+            )
+            nuevo = _verified_candidate if _apply_verified else segs
+            stats = {
+                "substitutions": (
+                    _lexical_stats["applied"] if _apply_verified else 0
+                ),
+                "insertions": 0, "lines_changed": 0,
+                "declined": [], "verification_only": True,
+                "live_lexical": _lexical_stats,
+                "lines_suggested": (
+                    0 if _apply_verified else _lexical_stats["applied"]
+                ),
+            }
+            stats["lines_changed"] = (
+                _lexical_stats["applied"] if _apply_verified else 0
+            )
+        else:
+            nuevo, stats = _wv.vote(segs, witness)
+        result = dict(result)
+        if _live_verify:
+            # Internal transport only: the quality finalizer compares
+            # delivered text against this independent Whisper-1 witness, then
+            # strips it. Studio WORD_VOTE keeps its pre-existing behavior and
+            # does not silently opt into the new live quality policy.
+            result["_independent_asr_words"] = witness
+        stats["independent_verifier"] = _live_verify
+        stats["witness_words"] = len(witness)
+        stats["witness_words_filtered"] = max(
+            0, _raw_witness_words - len(witness),
+        )
+        stats["witness_source"] = _witness_source
+        stats["provider_attempts"] = _provider_attempts
+        stats["submitted_audio_seconds"] = round(
+            _submitted_audio_seconds, 2,
+        )
+        stats["audio_seconds_billed"] = round(
+            _submitted_audio_seconds, 2,
+        )
         if stats.get("lines_changed"):
-            result = dict(result)
             result["segments"] = nuevo
             logger.info(
                 "[WORD-VOTE] %d sustitución(es) + %d inserción(es) en %d "
@@ -5280,7 +5497,35 @@ def _maybe_timing_consistency(result, job_id: str):
         if not segs:
             return result
         nuevo = _ka.enforce_line_word_consistency(segs)
-        if nuevo is not segs:
+        # This pass is the last boundary after adlibs, word-vote, chorus
+        # snap, phrase segmentation and formatting. Those stages can replace
+        # rows or reintroduce equal/backward starts after _emit_segments has
+        # already normalized the first candidate. Keep the final payload
+        # monotonic too; otherwise the editor can still receive a valid-looking
+        # response whose playback cursor jumps between rows.
+        before_order = timing_anomalies(nuevo)
+        ordered = normalize_segments_timing(nuevo)
+        after_order = timing_anomalies(ordered)
+        if ordered != nuevo:
+            result = dict(result)
+            result["segments"] = ordered
+            result.setdefault("postpass_stats", {})["timing_order_final"] = {
+                "before": before_order,
+                "after": after_order,
+                "repaired": len(ordered),
+            }
+            logger.warning(
+                "[TIMING-FINAL] repaired postpass order regressions=%s "
+                "duplicate_starts=%s overlaps=%s → regressions=%s "
+                "duplicate_starts=%s overlaps=%s job=%s",
+                before_order["regressions"], before_order["duplicate_starts"],
+                before_order["overlaps"], after_order["regressions"],
+                after_order["duplicate_starts"], after_order["overlaps"],
+                job_id,
+            )
+            nuevo = ordered
+
+        if nuevo is not segs or ordered != segs:
             _ajustadas = sum(
                 1 for s in nuevo
                 if isinstance(s, dict) and s.get("timing_snapped_to_words")
@@ -5290,6 +5535,7 @@ def _maybe_timing_consistency(result, job_id: str):
             result.setdefault("postpass_stats", {})["timing_consistency"] = {
                 "snapped": _ajustadas,
             }
+            result["segments"] = nuevo
             logger.info(
                 "[TIMING-CONSISTENCY] %d/%d carteles re-encuadrados a sus "
                 "palabras job=%s", _ajustadas, len(nuevo), job_id)
@@ -5297,6 +5543,55 @@ def _maybe_timing_consistency(result, job_id: str):
     except Exception as e:
         logger.warning("[TIMING-CONSISTENCY] wrapper declinó: %r (job=%s)", e, job_id)
         return result
+
+
+async def _finalize_inline_transcription_quality(result, audio_path: str,
+                                                 job_id: str, language: str, *,
+                                                 live_hint: bool = False):
+    """Keep the two legacy HTTP transcription paths aligned with the worker.
+
+    Async RQ is the normal path, but a rollback flag can still execute these
+    handlers inline. A safety gate that disappears during rollback is not a
+    safety gate, so they use the exact same finalizer and persist its verdict.
+    """
+    from transcription_worker import _quality_gate_and_retry
+
+    finalized = await _quality_gate_and_retry(
+        result, audio_path, job_id, language, None,
+        _maybe_timing_consistency, live_hint=live_hint,
+    )
+    try:
+        from database import SessionLocal as _QualitySession
+        _quality_db = _QualitySession()
+        try:
+            row = (
+                _quality_db.query(Job).filter(Job.job_id == job_id)
+                .with_for_update().first()
+            )
+            if row is not None:
+                segments = finalized.get("segments") or []
+                revision = int(row.segments_revision or 0)
+                if revision > 0 and segments != row.segments_json:
+                    logger.warning(
+                        "[QUALITY-GATE] inline result discarded after editor race job=%s revision=%s",
+                        job_id, revision,
+                    )
+                else:
+                    row.segments_json = segments
+                    quality = finalized.get("transcription_quality")
+                    if isinstance(quality, dict):
+                        quality = dict(quality)
+                        quality["evaluated_revision"] = revision
+                        quality["timing_source"] = row.timing_source or "unknown"
+                    row.transcription_quality = quality
+                row.status = "transcribed_pending"
+                row.current_step = "editing"
+                _quality_db.commit()
+        finally:
+            _quality_db.close()
+    except Exception as exc:
+        logger.warning("[QUALITY-GATE] inline persistence failed: %s job=%s", exc, job_id)
+    return finalized
 
 
 def _maybe_phrase_segment(result, job_id: str):
@@ -5314,6 +5609,12 @@ def _maybe_phrase_segment(result, job_id: str):
             return result
         segs = result.get("segments") or []
         if not segs:
+            return result
+        if any(isinstance(s, dict) and s.get("llm_segmented") for s in segs):
+            result.setdefault("postpass_stats", {})["phrase_seg"] = {
+                "before": len(segs), "after": len(segs),
+                "skipped": "already_llm_segmented",
+            }
             return result
         import lead_in as _li
         nuevo = _ps.resegment(segs, lead_s=_li.lead_seconds(),
@@ -5363,6 +5664,15 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
     segs = result.get("segments") or []
     if len(segs) < 3:
         return result
+    # Audio-first live results have already bypassed catalogue reconciliation.
+    # Their suffix cannot contain a studio scaffold to replace, and `wx_raw`
+    # is the same acoustic stream (possibly before polishing), not independent
+    # evidence. Auditing then swapping that suffix only duplicates collapsed
+    # timestamps. Keep ordinary ad-lib/tail filtering available, but disable
+    # this catalogue-repair mechanism for authoritative live audio.
+    _catalogue_suffix_repair = bool(
+        live_hint and not result.get("live_audio_truth")
+    )
     _stem = None
     try:
         import adlib_consensus as _ac
@@ -5375,7 +5685,7 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
         # live o toggle del operador): medido contra el gold (06/07), en
         # canciones normales los finales quietos/en capas dan falsos
         # positivos. Y MARCA (review), no borra — ver filter_and_collapse.
-        _audit_on = live_hint and os.environ.get(
+        _audit_on = _catalogue_suffix_repair and os.environ.get(
             "ADLIB_SUFFIX_AUDIT_ENABLED", "1") \
             .strip().lower() in ("1", "true", "yes", "on")
         # Barato primero: sin ad-libs y sin ningún chequeo de final, ni
@@ -5431,7 +5741,7 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
         # la letra de estudio no puede representar el final de un vivo
         # (call-response, presentaciones de la banda). Las líneas
         # insertadas conservan review=True.
-        if (live_hint and _wx_raw
+        if (_catalogue_suffix_repair and _wx_raw
                 and os.environ.get("ADLIB_LIVE_SWAP_ENABLED", "1")
                 .strip().lower() in ("1", "true", "yes", "on")):
             filtered = _ac.live_swap_tail(filtered, _wx_raw)
@@ -5757,10 +6067,118 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
     return result
 
 
+async def _postprocess_live_whisperx(
+    segments: list[dict], *, audio_path: str, canonical: str = "",
+    artist: str = "", song: str = "", language: str | None = None,
+) -> list[dict]:
+    """Apply the opt-in audio-first postpasses shared by every live exit.
+
+    Both pipeline helpers are self-declining, but checking their existing
+    flags here avoids imports, thread scheduling, audio reads, and model calls
+    when a feature is disabled.  Catalogue lyrics are passed only to gap
+    recovery as its existing hallucination guard; they never determine line
+    order or timing in this helper.
+    """
+    _truthy = ("1", "true", "yes", "on")
+    _segment_enabled = (
+        os.environ.get("LLM_SEGMENT_ENABLED", "").strip().lower() in _truthy
+    )
+    _gap_enabled = (
+        os.environ.get("GAP_RECOVERY_ENABLED", "").strip().lower() in _truthy
+    )
+    # GAP_RESCUE is the shared worker-owned recovery pass (VAD + independent
+    # Whisper witness + resolved language).  When it is enabled, do not also
+    # run the older Gemini recovery here: the second owner adds cost and can
+    # duplicate or overwrite the first one's lines.  GAP_RECOVERY remains the
+    # fallback for deployments that have GAP_RESCUE disabled.
+    _worker_gap_owner = (
+        os.environ.get("GAP_RESCUE_ENABLED", "").strip().lower() in _truthy
+    )
+    _gap_enabled = _gap_enabled and not _worker_gap_owner
+    _lexical_requested = (
+        os.environ.get("LIVE_LEXICAL_CONSENSUS_ENABLED", "0")
+        .strip().lower() in _truthy
+    )
+    _lexical_enabled = bool(
+        _lexical_requested
+        and os.environ.get("LIVE_INDEPENDENT_VERIFY_ENABLED", "0")
+        .strip().lower() in _truthy
+    )
+    if _lexical_requested and not _lexical_enabled:
+        logger.warning(
+            "[WC] live lexical consensus disabled: independent verifier "
+            "must be enabled too",
+        )
+    if not (_segment_enabled or _gap_enabled or _lexical_enabled):
+        return segments
+
+    from pipeline import _llm_segment_words, _recover_gap_lyrics
+
+    processed = segments
+    if _segment_enabled:
+        try:
+            candidate = await asyncio.to_thread(
+                _llm_segment_words, processed, audio_path=audio_path,
+                artist=artist, song=song, language=language,
+            )
+            if isinstance(candidate, list) and candidate:
+                processed = candidate
+        except Exception as exc:
+            logger.warning(
+                "[WC] live LLM segmentation declined unexpectedly: %r", exc,
+            )
+    if _gap_enabled:
+        try:
+            candidate = await asyncio.to_thread(
+                _recover_gap_lyrics, processed,
+                audio_path=audio_path, canonical=canonical,
+                prompt_reference=False,
+                artist=artist, song=song, language=language,
+            )
+            if isinstance(candidate, list) and candidate:
+                processed = candidate
+        except Exception as exc:
+            logger.warning(
+                "[WC] live gap recovery declined unexpectedly: %r", exc,
+            )
+    # The audio still owns every row and timestamp.  Catalogue text can only
+    # repair a small number of 1:1 spelling tokens; it cannot add, delete,
+    # split or reorder anything in a live performance.
+    if _lexical_enabled and canonical:
+        try:
+            from live_lexical_consensus import propose_segments
+            candidate, _stats = propose_segments(processed, canonical)
+            if candidate:
+                processed = candidate
+        except Exception as exc:
+            logger.warning(
+                "[WC] live lexical consensus declined unexpectedly: %r", exc,
+            )
+    return processed
+
+
+def _can_infer_primary_language_from_reference(
+    requested_language: str | None, *, live: bool = False,
+    title: str = "", filename: str = "",
+) -> bool:
+    """Whether catalogue text may choose the primary ASR language.
+
+    Studio uploads keep the existing reliability hint.  A live performance
+    can legitimately use another language (or mix languages), so Auto must be
+    decided by the audio provider instead of a catalogue entry for a different
+    recording.  Explicit operator/tenant choices are handled separately and
+    continue to win.
+    """
+    return bool(
+        not (requested_language or "").strip()
+        and not (live or _looks_live(title, filename))
+    )
+
+
 async def _run_transcription_for_job(
     request, current_user, job_id: str, audio_path: str,
     *, language: str = "", artist: str = "", title: str = "",
-    filename: str = "",
+    filename: str = "", live: bool = False,
 ):
     """Shared transcription pipeline: lrclib synced/plain → Whisper →
     hallucination recovery → segments. Used by both /transcribe (legacy
@@ -5896,6 +6314,21 @@ async def _run_transcription_for_job(
                 logger.info("[EMIT] deduped collisions: %d → %d segments (job=%s)",
                             len(segments), len(deduped), job_id)
             polished = _snap(_normalize_words(deduped))
+            anomalies = timing_anomalies(polished)
+            if anomalies["regressions"] or anomalies["duplicate_starts"]:
+                logger.warning(
+                    "[TIMING-CONSISTENCY] source=%s regressions=%s "
+                    "duplicate_starts=%s overlaps=%s job=%s",
+                    source, anomalies["regressions"],
+                    anomalies["duplicate_starts"], anomalies["overlaps"], job_id,
+                )
+            normalized_polished = normalize_segments_timing(polished)
+            if normalized_polished != polished:
+                logger.warning(
+                    "[TIMING-NORMALIZE] repaired non-monotonic starts in "
+                    "%s segments job=%s", len(polished), job_id,
+                )
+            polished = normalized_polished
             out = {"job_id": job_id, "segments": polished,
                    "reference_lyrics": reference_lyrics}
             # Segmentos crudos de whisperX (la performance REAL): viajan en
@@ -6206,7 +6639,9 @@ async def _run_transcription_for_job(
         # canonical lyrics before the primary ASR runs, so English references
         # are transcribed as English while Spanish references retain the
         # explicit hint that historically made Whisper more reliable.
-        if not lang and lrc:
+        if lrc and _can_infer_primary_language_from_reference(
+            lang, live=live, title=title, filename=filename,
+        ):
             _reference_for_language = (
                 (lrc.get("plain") or "").strip()
                 or (lrc.get("synced") or "").strip()
@@ -6359,9 +6794,27 @@ async def _run_transcription_for_job(
                     os.environ.get("WHISPERX_NO_HINT_ALWAYS", "0").strip().lower()
                     in ("1", "true", "yes", "on")
                 )
-                _drop_hint = _live_no_hint or _no_hint_always
+                # A live recording is a different performance even when its
+                # duration happens to match the catalogue/studio reference.
+                # The old policy only dropped the prompt for duration-divergent
+                # versions, so same-length lives were still vulnerable to the
+                # reference being copied into the ASR order. Keep the catalogue
+                # for later text correction, but let Whisper hear the upload
+                # without a prompt first. This is the safe audio-first policy
+                # for live-labelled uploads and is independently kill-switchable.
+                _live_audio_truth = bool(
+                    (live or _looks_live(title, filename))
+                    and os.environ.get("LIVE_AUDIO_AS_TRUTH_ENABLED", "1")
+                    .strip().lower() in ("1", "true", "yes", "on")
+                )
+                _drop_hint = _live_no_hint or _live_audio_truth or _no_hint_always
                 if _no_hint_always and not _live_no_hint:
                     logger.info("[WC] WHISPERX_NO_HINT_ALWAYS — clean whisperX, reconcile restores canonical text")
+                elif _live_audio_truth and not _live_no_hint:
+                    logger.info(
+                        "[WC] live audio-as-truth — clean whisperX, "
+                        "catalogue text remains available for reconciliation",
+                    )
                 try:
                     _wx_segs = await asyncio.to_thread(
                         _wx_mod.transcribe_whisperx, _aa, lang,
@@ -6386,48 +6839,46 @@ async def _run_transcription_for_job(
                         WHISPERX_RECONCILED as _WC_WX_REC,
                         WHISPERX as _WC_WX,
                     )
-                    # Divergent live/extended: the clean (no-hint) transcription IS
-                    # the truth — its order/timing track the actual performance (lab:
-                    # Rotor-level). The canonical cascade below would drift it against
-                    # the studio structure, so emit raw and return.
-                    if _live_no_hint:
+                    # Every live policy exits through the same audio-first
+                    # postprocess.  LLM segmentation re-groups the live's OWN
+                    # timed words; gap recovery can fill bounded acoustic holes.
+                    # Both are independently flagged and self-declining.  The
+                    # catalogue cascade below remains unreachable, so studio
+                    # structure can never replace the performance's order/timing.
+                    if _live_no_hint or _live_audio_truth:
+                        if _live_audio_truth:
+                            _live_policy = (
+                                "divergent live" if _live_no_hint
+                                else "live audio-as-truth"
+                            )
+                        else:
+                            _live_policy = "divergent live"
                         logger.info(
-                            "[WC] divergent live — emitting clean whisperX raw "
-                            "(%d segs, Rotor-level timing)", len(_wx_segs))
-                        # LLM line-segmentation (LLM_SEGMENT_ENABLED, default off):
-                        # the no-hint whisperX has Rotor-level TIMING but native
-                        # VAD LINE breaks (merges/splits at the wrong words, e.g.
-                        # "noticia No"). Gemini re-groups the live's OWN words into
-                        # clean phrase lines + fixes orthography, mapped back to the
-                        # exact whisperX timing — no reference template to drift
-                        # (reconcile aborts here). Self-declining → keeps _wx_segs on
-                        # any failure. Lab on "Nada Fue Un Error (En Vivo)": matches
-                        # Rotor line-for-line, timing byte-identical.
-                        from pipeline import (
-                            _llm_segment_words as _llm_seg,
-                            _recover_gap_lyrics as _recover_gap,
+                            "[WC] %s — emitting clean whisperX after "
+                            "audio-first postprocess, "
+                            "no catalogue reconciliation (%d segs)",
+                            _live_policy, len(_wx_segs),
                         )
-                        # Offloaded to a thread: these do blocking file I/O,
-                        # librosa decode + a Gemini call (up to ~90 s). Running
-                        # them inline would freeze the API event loop for the
-                        # whole job (starves /usage, /jobs — dashboard freeze),
-                        # so use to_thread like every other heavy step here.
-                        _wx_segs = await asyncio.to_thread(
-                            _llm_seg, _wx_segs, audio_path=_aa,
+                        # In live auto-mode the performance decides the
+                        # language.  Catalogue text may describe a studio cut
+                        # or even another-language version.  Explicit choices
+                        # (including tenant-forced values) still win because
+                        # they arrive in the original `language` argument.
+                        _live_language = resolve_transcription_language(
+                            language if (language or "").strip() else None,
+                            result={"segments": _wx_segs},
                         )
-                        # Gap-recovery (GAP_RECOVERY_ENABLED, default off): whisperX
-                        # drops lyrics in loud live passages, leaving multi-second
-                        # holes (lab "Nada Fue Un Error En Vivo": an 84 s hole where
-                        # the chorus keeps going + the outro). Re-transcribe a SHORT
-                        # bounded clip at each hole's first voiced run → recovers the
-                        # real line without the long-clip hallucination loop. Runs
-                        # AFTER segmentation (already-clean lines) + self-declines.
-                        _wx_segs = await asyncio.to_thread(
-                            _recover_gap, _wx_segs,
-                            audio_path=_aa, canonical=_canonical,
+                        _wx_segs = await _postprocess_live_whisperx(
+                            _wx_segs, audio_path=_aa, canonical=_canonical,
+                            artist=artist, song=title,
+                            language=_live_language,
                         )
                         return _emit_segments(
                             _wx_segs, _WC_WX, reference_lyrics=_canonical,
+                            extra={
+                                "live_audio_truth": True,
+                                "resolved_language": _live_language,
+                            },
                         )
                     # Reconcile when we have canonical text; emit raw otherwise.
                     if _canonical:
@@ -8303,6 +8754,7 @@ async def generate_with_segments(
     # generoso que rechaza payload absurdo sin restringir casos reales.
     segments_json: str = Form(..., max_length=5_000_000),
     base_revision: str = Form("", max_length=20),
+    editor_metrics_json: str = Form("", max_length=2000),
     editor_version_id: str = Form("", max_length=36),
     editor_revision: str = Form("", max_length=20),
     delivery_profile: str = Form("youtube", max_length=20),  # Job.delivery_profile = VARCHAR(20)
@@ -8409,6 +8861,7 @@ async def generate_with_segments(
         raise HTTPException(status_code=400, detail="segments_json must be valid JSON") from exc
     if not isinstance(segments, list):
         raise HTTPException(status_code=400, detail="segments_json must be an array")
+    segments = normalize_editor_segments(segments)
     try:
         requested_revision = int(base_revision) if str(base_revision).strip() else None
         if requested_revision is not None and requested_revision < 0:
@@ -8630,6 +9083,15 @@ async def generate_with_segments(
             .with_for_update()
             .first()
         )
+        if (job_row is None
+                or job_row.tenant_id != current_user["tenant_id"]
+                or job_row.status not in (
+                    "transcribed_pending", "transcribed", "awaiting_upload",
+                )):
+            return JSONResponse(
+                status_code=409,
+                content={"code": "job_not_generatable", "detail": "Job changed before generation."},
+            )
         current_revision = int(getattr(job_row, "segments_revision", 0) or 0)
         if requested_revision is None and current_revision > 0:
             return JSONResponse(
@@ -8655,6 +9117,67 @@ async def generate_with_segments(
             job_row.segments_json = segments
             job_row.segments_revision = current_revision + 1
             current_revision += 1
+        from transcription_quality import can_render as _quality_can_render
+        _quality_ok, _quality_reason = _quality_can_render(
+            getattr(job_row, "transcription_quality", None),
+            revision=current_revision,
+            segments=job_row.segments_json or segments,
+        )
+        if not _quality_ok:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "code": _quality_reason,
+                    "detail": "La transcripción tiene zonas inseguras que deben revisarse antes de renderizar.",
+                    "transcription_quality": job_row.transcription_quality,
+                    "current_revision": current_revision,
+                },
+            )
+        if editor_metrics_json:
+            try:
+                _editor_metrics = json.loads(editor_metrics_json)
+                if not isinstance(_editor_metrics, dict):
+                    raise ValueError("metrics must be an object")
+                _allowed_metrics = {
+                    "duration_ms", "active_edit_ms", "line_count", "text_changes",
+                    "timing_changes", "lines_added", "lines_removed",
+                    "lines_reordered", "quality_acknowledged", "session_id",
+                }
+                if any(
+                    key not in _allowed_metrics
+                    or not _valid_product_event_property(key, value)
+                    for key, value in _editor_metrics.items()
+                ):
+                    raise ValueError("invalid metric property")
+                _editor_metrics["revision"] = current_revision
+                _event_quality = job_row.transcription_quality or {}
+                _editor_metrics["pipeline_release"] = str(
+                    _event_quality.get("pipeline_release") or "unknown"
+                )[:64]
+                _editor_metrics["pipeline_config_fingerprint"] = str(
+                    _event_quality.get("pipeline_config_fingerprint") or "unknown"
+                )[:32]
+                _editor_metrics["timing_source"] = str(
+                    _event_quality.get("timing_source") or "unknown"
+                )[:64]
+                _editor_metrics["quality_policy_version"] = str(
+                    _event_quality.get("policy_version") or "unknown"
+                )[:64]
+                _editor_metrics["quality_reason_codes"] = ",".join(
+                    str(reason.get("code"))
+                    for reason in (_event_quality.get("reasons") or [])
+                    if isinstance(reason, dict) and reason.get("code")
+                )[:500]
+                from database import ProductEvent
+                db.add(ProductEvent(
+                    tenant_id=current_user["tenant_id"],
+                    user_id=current_user["id"], job_id=job_id,
+                    name="editor_approved", properties=_editor_metrics,
+                ))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise HTTPException(
+                    status_code=422, detail=f"invalid editor metrics: {exc}"
+                ) from None
         job_row.artist = artist
         job_row.song_title = song_title or None
         job_row.style = style
@@ -10716,11 +11239,23 @@ async def get_editor_document(
     _audit_cross_tenant_access(db, current_user, job, "editor_read", commit=False)
     db.commit()  # lazy migration/reconciliation is an intentional GET side effect
     payload = serialize_document(db, document)
+    editor_quality = getattr(job, "transcription_quality", None)
+    if not isinstance(editor_quality, dict) and job.segments_json:
+        # Expand compatibility for legacy jobs without mutating on GET. The
+        # editor receives an explicit fail-closed verdict and its approval
+        # endpoint persists the revision/hash-scoped acknowledgement.
+        from transcription_quality import evaluate as evaluate_transcription_quality
+        editor_quality = evaluate_transcription_quality(job.segments_json, None)
+        editor_quality["evaluated_revision"] = int(job.segments_revision or 0)
+        editor_quality["pipeline_release"] = "legacy_unknown"
+        editor_quality["pipeline_config_fingerprint"] = "unknown"
+        editor_quality["timing_source"] = job.timing_source or "unknown"
     payload.update({
         "artist": job.artist,
         "song_title": job.song_title,
         "filename": job.filename,
         "job_status": job.status,
+        "transcription_quality": editor_quality,
     })
     return payload
 
@@ -10901,10 +11436,15 @@ _PRODUCT_EVENT_PROPERTIES = {
     "editor_autosave_failed": {"duration_ms", "checkpoint", "reason", "status", "retry_count"},
     "editor_conflict": {"server_revision", "local_revision", "resolution"},
     "editor_version_restored": {"from_revision", "to_revision"},
-    "editor_approved": {"revision", "duration_ms"},
+    "editor_approved": {
+        "revision", "duration_ms", "line_count", "text_changes",
+        "timing_changes", "lines_added", "lines_removed",
+        "lines_reordered", "active_edit_ms", "quality_acknowledged",
+    },
     "editor_help_opened": {"context"},
 }
 _PRODUCT_EVENT_COMMON_PROPERTIES = {"session_id"}
+from product_telemetry import valid_property as _valid_product_event_property
 
 
 @app.post("/analytics/events")
@@ -10923,14 +11463,18 @@ async def record_product_events(
         if item.name not in _PRODUCT_EVENT_NAMES:
             rejected += 1
             continue
-        if item.job_id and not get_job_for_tenant(db, item.job_id, current_user["tenant_id"]):
+        event_job = (
+            get_job_for_tenant(db, item.job_id, current_user["tenant_id"])
+            if item.job_id else None
+        )
+        if item.job_id and not event_job:
             rejected += 1
             continue
         allowed = _PRODUCT_EVENT_PROPERTIES[item.name] | _PRODUCT_EVENT_COMMON_PROPERTIES
         properties = {}
         invalid_properties = False
         for key, value in (item.properties or {}).items():
-            if key not in allowed or not isinstance(value, (str, int, float, bool)):
+            if key not in allowed or not _valid_product_event_property(key, value):
                 invalid_properties = True
                 break
             properties[key] = value
@@ -10940,6 +11484,25 @@ async def record_product_events(
         if len(json.dumps(properties, ensure_ascii=False)) > 2000:
             rejected += 1
             continue
+        if event_job is not None:
+            event_quality = event_job.transcription_quality or {}
+            properties["pipeline_release"] = str(
+                event_quality.get("pipeline_release") or "unknown"
+            )[:64]
+            properties["pipeline_config_fingerprint"] = str(
+                event_quality.get("pipeline_config_fingerprint") or "unknown"
+            )[:32]
+            properties["timing_source"] = str(
+                event_quality.get("timing_source") or "unknown"
+            )[:64]
+            properties["quality_policy_version"] = str(
+                event_quality.get("policy_version") or "unknown"
+            )[:64]
+            properties["quality_reason_codes"] = ",".join(
+                str(reason.get("code"))
+                for reason in (event_quality.get("reasons") or [])
+                if isinstance(reason, dict) and reason.get("code")
+            )[:500]
         occurred_at = None
         if item.occurred_at:
             try:
@@ -10967,13 +11530,49 @@ async def product_metrics(
     if not current_user.get("is_super_admin"):
         query = query.filter(ProductEvent.tenant_id == current_user["tenant_id"])
     rows = query.order_by(ProductEvent.created_at.desc()).limit(10000).all()
+    approval_query = db.query(ProductEvent).filter(ProductEvent.name == "editor_approved")
+    if not current_user.get("is_super_admin"):
+        approval_query = approval_query.filter(
+            ProductEvent.tenant_id == current_user["tenant_id"]
+        )
+    approval_rows = approval_query.order_by(ProductEvent.created_at.desc()).limit(10000).all()
+    rows_by_id = {row.id: row for row in rows}
+    rows_by_id.update({row.id: row for row in approval_rows})
+    rows = sorted(rows_by_id.values(), key=lambda row: row.created_at, reverse=True)
+    event_job_ids = {row.job_id for row in rows if row.job_id}
+    job_quality_context = {
+        row.job_id: {
+            "timing_source": row.timing_source or "unknown",
+            "quality": row.transcription_quality or {},
+        }
+        for row in (
+            db.query(Job.job_id, Job.timing_source, Job.transcription_quality)
+            .filter(Job.job_id.in_(event_job_ids))
+            .all()
+            if event_job_ids else []
+        )
+    }
     counts: dict[str, int] = {}
     group_move_durations = []
+    approval_durations = []
+    correction_totals = {
+        "text_changes": 0, "timing_changes": 0,
+        "lines_added": 0, "lines_removed": 0,
+        "lines_reordered": 0,
+    }
+    route_work: dict[str, dict] = {}
+    release_work: dict[str, list[float]] = {}
+    seen_approvals: set[tuple] = set()
     sessions: dict[tuple, dict] = {}
     view_usage = {"basic": 0, "advanced": 0}
     for row in rows:
-        counts[row.name] = counts.get(row.name, 0) + 1
         properties = row.properties or {}
+        if row.name == "editor_approved":
+            approval_key = (row.job_id, properties.get("revision"))
+            if approval_key in seen_approvals:
+                continue
+            seen_approvals.add(approval_key)
+        counts[row.name] = counts.get(row.name, 0) + 1
         timestamp = row.occurred_at or row.created_at
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
@@ -11000,6 +11599,47 @@ async def product_metrics(
             session["first_edit"] = timestamp if session["first_edit"] is None else min(session["first_edit"], timestamp)
         if row.name == "editor_group_moved" and isinstance(properties.get("duration_ms"), (int, float)):
             group_move_durations.append(float(properties["duration_ms"]))
+        if row.name == "editor_approved":
+            # Operational SLA is active editing time only. Legacy wall-clock
+            # remains available in raw events but can never make the target
+            # pass or contaminate release percentiles.
+            active_duration = properties.get("active_edit_ms")
+            if isinstance(active_duration, (int, float)):
+                approval_durations.append(float(active_duration))
+                release = str(properties.get("pipeline_release") or "unknown")
+                release_work.setdefault(release, []).append(float(active_duration))
+            for correction_name in correction_totals:
+                value = properties.get(correction_name)
+                if isinstance(value, (int, float)):
+                    correction_totals[correction_name] += int(value)
+            context = job_quality_context.get(row.job_id) or {}
+            route = str(
+                properties.get("timing_source")
+                or context.get("timing_source") or "unknown"
+            )
+            route_row = route_work.setdefault(route, {
+                "songs": 0, "durations": [], "text_changes": 0,
+                "timing_changes": 0, "quality_reasons": {},
+            })
+            route_row["songs"] += 1
+            if isinstance(active_duration, (int, float)):
+                route_row["durations"].append(float(active_duration))
+            for correction_name in ("text_changes", "timing_changes"):
+                value = properties.get(correction_name)
+                if isinstance(value, (int, float)):
+                    route_row[correction_name] += int(value)
+            immutable_reason_codes = str(properties.get("quality_reason_codes") or "")
+            reason_codes = [code for code in immutable_reason_codes.split(",") if code]
+            if not reason_codes:
+                reason_codes = [
+                    str(reason["code"])
+                    for reason in ((context.get("quality") or {}).get("reasons") or [])
+                    if isinstance(reason, dict) and reason.get("code")
+                ]
+            for code in reason_codes:
+                route_row["quality_reasons"][code] = (
+                    route_row["quality_reasons"].get(code, 0) + 1
+                )
     session_durations = [
         (session["last"] - session["first"]).total_seconds() * 1000
         for session in sessions.values() if session["last"] >= session["first"]
@@ -11012,6 +11652,42 @@ async def product_metrics(
     ]
     opened = counts.get("editor_opened", 0)
     approvals = counts.get("editor_approved", 0)
+    def _percentile(values, quantile):
+        if not values:
+            return None
+        ordered = sorted(values)
+        if quantile == 0.50:
+            import statistics
+            return statistics.median(ordered)
+        import math
+        index = max(0, min(len(ordered) - 1, math.ceil(quantile * len(ordered)) - 1))
+        return ordered[index]
+    review_p50 = _percentile(approval_durations, 0.50)
+    review_p90 = _percentile(approval_durations, 0.90)
+    route_metrics = {
+        route: {
+            "songs": values["songs"],
+            "review_p50_ms": _percentile(values["durations"], 0.50),
+            "review_p90_ms": _percentile(values["durations"], 0.90),
+            "text_changes": values["text_changes"],
+            "timing_changes": values["timing_changes"],
+            "quality_reasons": values["quality_reasons"],
+        }
+        for route, values in route_work.items()
+    }
+    release_metrics = {
+        release: {
+            "songs": len(durations),
+            "review_p50_ms": _percentile(durations, 0.50),
+            "review_p90_ms": _percentile(durations, 0.90),
+            "target_met": (
+                len(durations) >= 30
+                and _percentile(durations, 0.50) < 5 * 60 * 1000
+                and _percentile(durations, 0.90) < 10 * 60 * 1000
+            ),
+        }
+        for release, durations in release_work.items()
+    }
     return {
         "events": counts,
         "sample_size": len(rows),
@@ -11028,6 +11704,23 @@ async def product_metrics(
             sum(session_durations) / len(session_durations) if session_durations else None
         ),
         "avg_time_to_first_edit_ms": sum(first_edits) / len(first_edits) if first_edits else None,
+        "operator_review": {
+            "sample_size": len(approval_durations),
+            "p50_ms": review_p50,
+            "p90_ms": review_p90,
+            "target_p50_ms": 5 * 60 * 1000,
+            "target_p90_ms": 10 * 60 * 1000,
+            "target_met": (
+                len(approval_durations) >= 30
+                and len(release_work) == 1
+                and review_p50 is not None and review_p90 is not None
+                and review_p50 < 5 * 60 * 1000
+                and review_p90 < 10 * 60 * 1000
+            ),
+            "corrections": correction_totals,
+            "by_timing_source": route_metrics,
+            "by_pipeline_release": release_metrics,
+        },
     }
 
 
@@ -11291,6 +11984,19 @@ async def save_segments(
                 reorder.append({"id": k, "from_idx": prev_idx, "to_idx": new_idx})
 
         if changed or reorder:
+            correction_summary = {
+                "changed_lines": len(changed),
+                "text_changes": sum(
+                    1 for item in changed
+                    if item.get("prev_text") != item.get("new_text")
+                ),
+                "timing_changes": sum(
+                    1 for item in changed
+                    if item.get("prev_start") != item.get("new_start")
+                    or item.get("prev_end") != item.get("new_end")
+                ),
+                "reorders": len(reorder),
+            }
             truncated = False
             if len(changed) > 20:
                 changed = changed[:20]
@@ -11306,6 +12012,7 @@ async def save_segments(
                     "n_lines": len(segs),
                     "changed": changed,
                     "reorder": reorder,
+                    "correction_summary": correction_summary,
                     "truncated": truncated,
                 },
             ))
@@ -11346,6 +12053,81 @@ async def save_segments(
         "applied": True,
         "revision": int(getattr(job, "segments_revision", 0) or 0),
     }
+
+
+class TranscriptionQualityAckRequest(BaseModel):
+    base_revision: int = Field(..., ge=0)
+
+
+@app.post("/jobs/{job_id}/transcription-quality/acknowledge")
+async def acknowledge_transcription_quality(
+    job_id: str,
+    body: TranscriptionQualityAckRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Persist an explicit, revision+content-scoped operator decision."""
+    job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
+    is_platform_admin = bool(current_user.get("is_super_admin"))
+    if (not job or (not is_platform_admin
+                    and job.tenant_id != current_user["tenant_id"])):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    current_revision = int(job.segments_revision or 0)
+    if body.base_revision != current_revision:
+        return JSONResponse(
+            status_code=409,
+            content={"code": "stale_revision", "current_revision": current_revision},
+        )
+    from transcription_quality import (
+        POLICY_VERSION, evaluate as evaluate_transcription_quality,
+        segments_hash,
+    )
+    previous_quality = (
+        dict(job.transcription_quality)
+        if isinstance(job.transcription_quality, dict) else {}
+    )
+    if previous_quality.get("policy_version") != POLICY_VERSION:
+        # Legacy/stale jobs have no trustworthy machine evidence under the
+        # current policy. Create a fail-closed verdict, then let this explicit
+        # operator action acknowledge only the exact current revision+hash.
+        quality = evaluate_transcription_quality(job.segments_json or [], None)
+        quality["evaluated_revision"] = current_revision
+        quality["pipeline_release"] = str(
+            previous_quality.get("pipeline_release") or "legacy_unknown"
+        )[:64]
+        quality["pipeline_config_fingerprint"] = str(
+            previous_quality.get("pipeline_config_fingerprint") or "unknown"
+        )[:32]
+        quality["timing_source"] = str(
+            previous_quality.get("timing_source")
+            or job.timing_source or "unknown"
+        )[:64]
+    else:
+        quality = previous_quality
+    current_hash = segments_hash(job.segments_json or [])
+    quality["acknowledgement"] = {
+        "revision": current_revision,
+        "segments_hash": current_hash,
+        "policy_version": quality.get("policy_version"),
+        "user_id": current_user["id"],
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    job.transcription_quality = quality
+    db.add(AuditLog(
+        user_id=current_user["id"], action="lyrics.quality_acknowledged",
+        detail={
+            "job_id": job_id, "revision": current_revision,
+            "segments_hash": current_hash,
+            "policy_version": quality.get("policy_version"),
+            "score": quality.get("score"),
+            "reason_codes": [
+                item.get("code") for item in (quality.get("reasons") or [])
+                if isinstance(item, dict)
+            ],
+        },
+    ))
+    db.commit()
+    return {"ok": True, "revision": current_revision, "segments_hash": current_hash}
 
 
 # Mismos estados en los que el LyricsEditor está operativamente montado

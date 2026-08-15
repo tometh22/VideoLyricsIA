@@ -29,7 +29,6 @@ Usage:
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -59,7 +58,7 @@ def _output_filename() -> str:
 def main() -> None:
     if not DATASET.exists():
         print(f"[ERR] dataset dir not found: {DATASET}", file=sys.stderr)
-        print(f"      Run build_benchmark_dataset.py first.", file=sys.stderr)
+        print("      Run build_benchmark_dataset.py first.", file=sys.stderr)
         sys.exit(2)
 
     dirs = sorted(p for p in DATASET.iterdir() if p.is_dir())
@@ -100,6 +99,8 @@ def main() -> None:
                 language="es",  # benchmark dataset is Spanish
                 verbose=True,
             )
+            from transcription_quality import runtime_identity
+            result.setdefault("meta", {}).update(runtime_identity())
         except Exception as e:
             print(f"  ✗ failed: {e}")
             failed += 1
@@ -112,7 +113,7 @@ def main() -> None:
     elapsed = time.time() - overall_t0
     print(f"\nDone: {ok} ok, {failed} failed, {elapsed:.1f}s total")
     if ok > 0:
-        print(f"Score with: python scripts/score_benchmark.py")
+        print("Score with: python scripts/score_benchmark.py")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,10 @@
 """Regression coverage for mixed-language transcription (job 1a8d7b9fef07)."""
 
 import ast
+import unicodedata
 from pathlib import Path
+
+import pytest
 
 from transcription_language import (
     detect_text_language,
@@ -24,6 +27,23 @@ Yo tengo una razón para cambiar
 La noche se queda con nosotros
 Cuando estoy contigo no quiero mirar atrás
 Siempre vuelve la canción que somos
+"""
+
+LOS_PERICOS_REFERENCE = """
+Hoy temprano estuve pensando en vos
+Paso el tiempo y ahora me siento mejor
+Cuando puedo, no puedo, no puedo, no puedo
+Ya no hay nada ni nadie que te quiera atar
+Oh no, no, no, oh no, no te hice daño
+Si estás lejos de mí
+Oh no, no, no, no, no, oh no, no te hice daño
+Y te alejaste de mí
+Real, wow wow
+Real, wow wow
+Real, wow wow
+Real, wow wow
+¡no!
+¡nooooooooooooooooooooooooooooooooooooooooooooooo!
 """
 
 
@@ -53,6 +73,77 @@ def test_explicit_operator_choice_wins_over_reference_detection():
 
 def test_spanish_auto_detection_remains_supported():
     assert detect_text_language(SPANISH_REFERENCE) == "es"
+
+
+def test_repeated_common_token_does_not_misclassify_los_pericos_as_portuguese():
+    assert detect_text_language(LOS_PERICOS_REFERENCE) == "es"
+
+
+def test_repeating_one_marker_cannot_manufacture_language_confidence():
+    assert detect_text_language("no " * 100) is None
+
+
+def test_spanish_common_words_cannot_force_portuguese():
+    text = "Nos vemos, no sé por qué somos así, porque se terminó"
+    assert detect_text_language(text) in ("es", None)
+
+
+def test_unaccented_spanish_cannot_force_french():
+    text = "Tu que no sabes de la vida, un amor en mi corazon"
+    assert detect_text_language(text) in ("es", None)
+
+
+def test_neighboring_unsupported_romance_languages_stay_auto():
+    catalan = "La nit de sempre, una llum que no mor en el temps"
+    galician = "Eu non sei por que somos así, sempre na noite de onte"
+    assert detect_text_language(catalan) is None
+    assert detect_text_language(galician) is None
+
+
+def test_unicode_nfc_and_nfd_resolve_identically():
+    text = "Hoy estás aquí, quizás mañana estarás más lejos"
+    assert detect_text_language(text) == detect_text_language(
+        unicodedata.normalize("NFD", text)
+    )
+
+
+def test_compact_mixed_language_reference_stays_auto():
+    text = "You and me, we are with; hoy siempre estoy aquí"
+    assert detect_text_language(text) is None
+
+
+@pytest.mark.parametrize(
+    ("language", "text"),
+    [
+        ("en", "You and me " * 12),
+        ("pt", "Eu não quero " * 12),
+        ("fr", "Je ne veux pas " * 12),
+        ("de", "Ich und du " * 12),
+    ],
+)
+def test_repetitive_but_diagnostic_choruses_still_resolve(language, text):
+    assert detect_text_language(text) == language
+
+
+def test_common_contractions_still_expose_language_evidence():
+    english = "I'm with you, don't leave me, we're alone tonight"
+    french = "J'ai peur, c'est l'amour, qu'il ne m'abandonne pas"
+    assert detect_text_language(english) == "en"
+    assert detect_text_language(french) == "fr"
+
+
+@pytest.mark.parametrize(
+    ("language", "text"),
+    [
+        ("en", "The light of day is with you and we have all been here"),
+        ("pt", "Eu não quero você longe de nós porque hoje estou muito bem"),
+        ("fr", "Je suis avec vous dans cette maison mais elle est très loin"),
+        ("it", "Io sono con lei in questa casa perché noi siamo molto vicini"),
+        ("de", "Ich bin mit dir und wir sind auch hier weil das sehr schön ist"),
+    ],
+)
+def test_supported_language_detection_is_preserved(language, text):
+    assert detect_text_language(text) == language
 
 
 def test_short_or_ambiguous_text_stays_provider_auto():

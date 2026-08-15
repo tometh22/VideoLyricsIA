@@ -351,6 +351,32 @@ def test_historical_revision_is_used_for_lazy_document(client):
     assert response.json()["segments"] == segments
 
 
+def test_equal_revision_legacy_timing_anomaly_is_migrated_once():
+    first, _, job_id = _users_and_job("editor_timing_repair")
+    malformed = [
+        {"_id": 9, "start": 45.1106, "end": 45.8752, "text": "uoo no no te hice daño,"},
+        {"_id": 10, "start": 45.9252, "end": 46.5273, "text": "te alejaste de miSsi"},
+        {"_id": 11, "start": 45.1606, "end": 46.9606, "text": "Las palabras se fueron al viento y no se."},
+        {"_id": 22, "start": 114.766, "end": 115.967, "text": "¡Gracias!"},
+        {"_id": 23, "start": 45.1106, "end": 45.8752, "text": "uoo no no te hice daño,"},
+        {"_id": 24, "start": 45.9252, "end": 46.5273, "text": "te alejaste de mi"},
+    ]
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        document = db.query(EditorDocument).filter(EditorDocument.job_id == job_id).one()
+        job.segments_json = malformed
+        document.current_segments = malformed
+        db.commit()
+        repaired = get_or_create_document(db, job_id, job.tenant_id, malformed)
+        db.commit()
+        assert [row["_id"] for row in repaired.current_segments] == [9, 10, 11, 22]
+        assert repaired.current_segments[2]["start"] == 46.5773
+        assert job.segments_revision == repaired.revision == 2
+    finally:
+        db.close()
+
+
 def test_lazy_reconciliation_preserves_equal_revision_divergence():
     first, _, job_id = _users_and_job("editor_reconcile")
     db = SessionLocal()

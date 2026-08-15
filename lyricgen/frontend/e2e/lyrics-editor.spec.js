@@ -17,7 +17,7 @@ test.describe("lyrics editor browser contract", () => {
 
     await expect(page.getByTestId("editor-mode-explainer")).toContainText("Corregir texto y aprobar");
     await expect(page.getByRole("tab", { name: "Revisar letra" })).toHaveAttribute("aria-selected", "true");
-    await expect(page.getByText("Primera línea")).toBeVisible();
+    await expect(page.locator('input[aria-label="Letra de la línea 1"]')).toHaveValue("Primera línea");
 
     await openAdvanced(page);
     await expect(page.getByTestId("timeline-segment")).toHaveCount(DEFAULT_SEGMENTS.length);
@@ -25,7 +25,7 @@ test.describe("lyrics editor browser contract", () => {
 
     await page.getByRole("tab", { name: "Revisar letra" }).click();
     await expect(page.getByRole("tab", { name: "Revisar letra" })).toHaveAttribute("aria-selected", "true");
-    await expect(page.getByText("Primera línea")).toBeVisible();
+    await expect(page.locator('input[aria-label="Letra de la línea 1"]')).toHaveValue("Primera línea");
   });
 
   test("shows a deterministic empty state when the job has no lyrics", async ({ page }) => {
@@ -43,7 +43,7 @@ test.describe("lyrics editor browser contract", () => {
 
     await expect(page.getByRole("tab", { name: "Ajustar tiempos" })).toHaveAttribute("aria-selected", "true");
     await expect(page.getByTestId("advanced-audio-unavailable")).toContainText("No se puede ajustar tiempos sin audio", { timeout: 12_000 });
-    await expect(page.getByText("Primera línea")).toBeVisible();
+    await expect(page.getByText("5 líneas", { exact: true })).toBeVisible();
     await expect(page.getByTestId("timeline-lane")).toHaveCount(0);
   });
 

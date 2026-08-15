@@ -39,6 +39,48 @@ import os
 logger = logging.getLogger("genly.transcription_worker")
 
 
+def _drop_final_credit_hallucinations(result: dict, job_id: str) -> dict:
+    """Remove known subtitle/training credits created by late post-passes.
+
+    The broad Whisper loop filter already runs inside the ASR cascade. At this
+    late boundary we deliberately use only the narrow known-credit predicate:
+    repeated musical ``no/oh/wow`` must survive, while an outro credit can
+    never reach the editor merely because the formatter assembled it after
+    the earlier filter ran. Never raises and preserves object identity when
+    there is nothing to remove.
+    """
+    if not isinstance(result, dict):
+        return result
+    segments = result.get("segments") or []
+    try:
+        from pipeline import _is_whisper_hallucination
+        kept = [
+            segment for segment in segments
+            if not (
+                isinstance(segment, dict)
+                and _is_whisper_hallucination(str(segment.get("text") or ""))
+            )
+        ]
+    except Exception as exc:
+        logger.warning(
+            "[FINAL-HALLUCINATION] declined: %r job=%s", exc, job_id,
+        )
+        return result
+    dropped = len(segments) - len(kept)
+    if not dropped:
+        return result
+    cleaned = dict(result)
+    cleaned["segments"] = kept
+    cleaned.setdefault("postpass_stats", {})["final_credit_filter"] = {
+        "dropped": dropped,
+    }
+    logger.warning(
+        "[FINAL-HALLUCINATION] dropped %d known credit(s) job=%s",
+        dropped, job_id,
+    )
+    return cleaned
+
+
 # ── Cobertura contra el audio, por etapa ──────────────────────────────────
 #
 # La cascada deja en el result su propia cobertura (`audio_coverage`) y el
@@ -67,7 +109,8 @@ def _coverage_de(r) -> float | None:
 
 
 def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
-                           audio_path: str = ""):
+                           audio_path: str = "", *, strip_internal: bool = True,
+                           live_hint: bool = False):
     """Loguea la cobertura final y la compara con la de la cascada y la
     previa al formateador. Saca `_asr_words` del result (transporte interno:
     no se persiste ni llega al cliente). Nunca levanta.
@@ -101,11 +144,77 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                      .get("gap_rescue", {}).get("skipped") or [])
             c = summarize(r.get("segments") or [], words,
                           stem_path=_stem, audio_duration=_dur,
-                          rescue_skipped=_skip)
+                          rescue_skipped=_skip, live_hint=live_hint)
+            if _dur is not None:
+                c["audio_duration_s"] = round(float(_dur), 3)
+            # Keep the exact unsafe windows as structured data.  Counts in a
+            # log line are not enough for a bounded retry or for the editor to
+            # take the operator to the problematic part of the song.
+            from audio_coverage import voiced_gaps as _voiced_gaps
+            from transcription_quality import build_unsafe_windows
+            _vg = _voiced_gaps(
+                r.get("segments") or [], _stem, audio_duration=_dur,
+                rescue_skipped=_skip, include_leading=live_hint,
+            )
+            _independent = r.get("_independent_asr_words") or []
+            _lexical_verification = {
+                "total": 0, "verified": 0, "unverified": 0, "details": [],
+            }
+            if _independent:
+                from audio_coverage import (
+                    audio_coverage as _independent_coverage,
+                    text_mismatches as _independent_mismatches,
+                    uncovered_spans as _independent_uncovered,
+                )
+                c["independent_witness_words"] = len(_independent)
+                c["independent_audio_coverage"] = _independent_coverage(
+                    r.get("segments") or [], _independent,
+                )
+                c["independent_text_mismatches"] = len(
+                    _independent_mismatches(
+                        r.get("segments") or [], _independent,
+                    )
+                )
+                _iw_gaps = _independent_uncovered(
+                    r.get("segments") or [], _independent,
+                )
+                c["independent_uncovered_spans"] = len(_iw_gaps)
+                c["independent_uncovered_seconds"] = round(sum(
+                    max(0.0, float(end) - float(start))
+                    for start, end, _count in _iw_gaps
+                ), 3)
+                from live_lexical_consensus import verify_corrections
+                _lexical_verification = verify_corrections(
+                    r.get("segments") or [], _independent,
+                )
+                c["live_lexical_corrections"] = _lexical_verification["total"]
+                c["live_lexical_verified"] = _lexical_verification["verified"]
+                c["live_lexical_unverified"] = _lexical_verification["unverified"]
+            _structural_disagreements = [
+                {
+                    "index": index,
+                    "start": segment.get("start"),
+                    "end": segment.get("end"),
+                    "suggestion": segment.get("live_structural_suggestion"),
+                }
+                for index, segment in enumerate(r.get("segments") or [])
+                if isinstance(segment, dict)
+                and segment.get("live_structural_suggestion")
+            ]
+            c["live_structural_disagreements"] = len(
+                _structural_disagreements
+            )
+            _windows = build_unsafe_windows(
+                r.get("segments") or [], words, voiced_gaps=_vg,
+                independent_words=_independent,
+                lexical_unverified=_lexical_verification["details"],
+                structural_disagreements=_structural_disagreements,
+            )
             cascada = r.get("audio_coverage")
             final = c["audio_coverage"]
             r["audio_coverage"] = final
             r.setdefault("postpass_stats", {})["coverage_final"] = c
+            r["postpass_stats"]["quality_windows"] = _windows
             log = logger.warning if final < 0.8 else logger.info
             log("[COVERAGE] final=%.0f%% (cascada=%s, pre-formatter=%s) "
                 "zonas_sin_letra=%d (%.1fs, peor %.1fs) "
@@ -156,13 +265,78 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
     except Exception as e:
         logger.warning("[COVERAGE] medición final falló: %r job=%s", e, job_id)
     finally:
-        if isinstance(r, dict):
+        if strip_internal and isinstance(r, dict):
             r.pop("_asr_words", None)
+            r.pop("_independent_asr_words", None)
         if _stem:
             try:
                 os.unlink(_stem)
             except OSError:
                 pass
+    return r
+
+
+async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
+                                  language: str, antes_fmt: float | None,
+                                  timing_consistency_fn, *, live_hint: bool = False):
+    """Measure, retry only unsafe windows, and persist one final verdict."""
+    from transcription_quality import evaluate
+
+    require_independent = bool(
+        live_hint
+        and os.environ.get("LIVE_INDEPENDENT_VERIFY_ENABLED", "0")
+        .strip().lower() in {"1", "true", "yes", "on"}
+    )
+
+    r = _medir_cobertura_final(
+        r, job_id, antes_fmt, audio_path, strip_internal=False,
+        live_hint=live_hint,
+    )
+    post = r.get("postpass_stats") or {}
+    windows = post.get("quality_windows") or []
+    initial = evaluate(
+        r.get("segments") or [], post.get("coverage_final"),
+        unsafe_windows=windows, require_independent=require_independent,
+    )
+    retry_stats = {"attempted": False}
+    try:
+        from targeted_consensus import is_enabled, reprocess
+        if initial.get("decision") != "pass" and windows and is_enabled():
+            r, retry_stats = await asyncio.to_thread(
+                reprocess, r, audio_path, windows,
+                language=language, job_id=job_id,
+            )
+            if retry_stats.get("lines_replaced") or retry_stats.get("lines_inserted"):
+                r = timing_consistency_fn(r, job_id)
+                r = _medir_cobertura_final(
+                    r, job_id, antes_fmt, audio_path, strip_internal=False,
+                    live_hint=live_hint,
+                )
+                post = r.get("postpass_stats") or {}
+                windows = post.get("quality_windows") or []
+    except Exception as exc:
+        logger.warning("[QUALITY-GATE] targeted retry failed: %r job=%s", exc, job_id)
+        retry_stats = {"attempted": True, "declined": [f"exception:{type(exc).__name__}"]}
+
+    final = evaluate(
+        r.get("segments") or [], post.get("coverage_final"),
+        unsafe_windows=windows, retry_stats=retry_stats,
+        require_independent=require_independent,
+    )
+    final["initial_decision"] = initial.get("decision")
+    final["initial_score"] = initial.get("score")
+    final["evaluated_revision"] = 0
+    r["transcription_quality"] = final
+    if final["decision"] == "pass":
+        logger.info("[QUALITY-GATE] PASS score=%s job=%s", final["score"], job_id)
+    else:
+        logger.warning(
+            "[QUALITY-GATE] REVIEW_REQUIRED score=%s reasons=%s windows=%d job=%s",
+            final["score"], [x.get("code") for x in final["reasons"]],
+            len(windows), job_id,
+        )
+    r.pop("_asr_words", None)
+    r.pop("_independent_asr_words", None)
     return r
 
 
@@ -193,13 +367,14 @@ def run_transcription_job(
     # corre otros queues. asyncio.run abre/cierra su propio event loop por job,
     # que es lo que queremos (jobs independientes, sin event-loop leak).
     from main import (  # type: ignore
+        _validate_audio_file_on_disk,
         _looks_live, _maybe_anchor_align, _maybe_ctc_retime,
         _maybe_adlib_filter, _maybe_chorus_snap, _maybe_gap_rescue,
         _maybe_phrase_segment, _maybe_repetition_reconcile,
         _maybe_timing_consistency, _maybe_word_vote,
         _resolve_postprocess_language, _run_transcription_for_job,
     )
-    from jobs import update_job, get_job
+    from jobs import update_job
     import storage
 
     if not filename:
@@ -207,7 +382,12 @@ def run_transcription_job(
 
     # 1. Status flip a "transcribing" para que el polling lo vea ya en marcha.
     try:
-        update_job(job_id, status="transcribing", current_step="transcribing")
+        update_job(
+            job_id,
+            status="transcribing",
+            current_step="transcribe.prepare",
+            progress=2,
+        )
     except Exception as e:
         logger.warning("[TRANSCRIBE-WORKER] failed to flip status: %s", e)
 
@@ -233,6 +413,16 @@ def run_transcription_job(
         if not storage.download_object(input_r2_key, audio_path):
             return _fail(job_id, "No pudimos leer el archivo subido. Reintentá en unos segundos.")
 
+    # The async worker is the first process that materializes the R2 object.
+    # Validate here instead of downloading once in API and once again here.
+    # A corrupt upload is persisted as transcription_failed and the existing
+    # polling UI exposes the retryable error to the operator.
+    try:
+        _validate_audio_file_on_disk(filename, audio_path)
+    except Exception as exc:
+        detail = getattr(exc, "detail", None) or str(exc)
+        return _fail(job_id, f"Archivo de audio inválido: {str(detail)[:200]}")
+
     # 3. Llamar al pipeline async existente. `request` y `current_user` son
     #    ignorados dentro del cuerpo (verified) — passing None es seguro.
     try:
@@ -240,6 +430,7 @@ def run_transcription_job(
             r = await _run_transcription_for_job(
                 None, None, job_id, audio_path,
                 language=language, artist=artist, title=title, filename=filename,
+                live=live,
             )
             # Post-pases gateados, en lockstep con los dos endpoints HTTP
             # (/transcribe y /transcribe-uploaded). ESTE es el camino que
@@ -273,18 +464,26 @@ def run_transcription_job(
             )
             r = _maybe_repetition_reconcile(r, job_id)
             r = await _maybe_gap_rescue(r, audio_path, job_id, _post_lang)
-            r = await _maybe_word_vote(r, audio_path, job_id, _post_lang)
+            r = await _maybe_word_vote(
+                r, audio_path, job_id, _post_lang,
+                live_hint=live or _looks_live(title, filename),
+            )
             r = _maybe_chorus_snap(r, job_id)
             r = _maybe_phrase_segment(r, job_id)
             from lyrics_format import format_lyrics_pass as _fmt
             _antes = _coverage_de(r)
             r = await _fmt(r, language=_post_lang)
+            r = _drop_final_credit_hallucinations(r, job_id)
             # Último post-pase: re-encuadra cada cartel a sus propias palabras
             # (audit 2026-08-13). Va al final porque todas las etapas de
             # arriba pueden haber movido start/end o words de forma
             # independiente. Lockstep con los dos caminos HTTP de main.py.
             r = _maybe_timing_consistency(r, job_id)
-            return _medir_cobertura_final(r, job_id, _antes, audio_path)
+            return await _quality_gate_and_retry(
+                r, audio_path, job_id, _post_lang, _antes,
+                _maybe_timing_consistency,
+                live_hint=live or _looks_live(title, filename),
+            )
 
         result = asyncio.run(_run_with_retime())
     except Exception as e:
@@ -329,16 +528,43 @@ def run_transcription_job(
         # frontend (main.py:2778), so the editor sees `transcribed` and
         # `/generate` sees `transcribed_pending`. Same observable
         # behaviour as the legacy path, no frontend change needed.
-        update_kwargs = {"status": "transcribed_pending", "current_step": "editing"}
-        if segments is not None:
-            update_kwargs["segments_json"] = segments
+        from database import Job, SessionLocal
+        _persist_db = SessionLocal()
+        try:
+            row = (
+                _persist_db.query(Job).filter(Job.job_id == job_id)
+                .with_for_update().first()
+            )
+            if row is None:
+                raise LookupError("job disappeared before transcription persistence")
+            current_revision = int(row.segments_revision or 0)
+            if current_revision > 0 and segments != row.segments_json:
+                # An operator edited while the ASR was running. Preserve the
+                # human version and do not attach a verdict for discarded data.
+                logger.warning(
+                    "[segments-occ] transcription result discarded job=%s revision=%s",
+                    job_id, current_revision,
+                )
+            else:
+                if segments is not None:
+                    row.segments_json = segments
+                quality = result.get("transcription_quality") if isinstance(result, dict) else None
+                if isinstance(quality, dict):
+                    quality = dict(quality)
+                    quality["evaluated_revision"] = current_revision
+                    quality["timing_source"] = row.timing_source or "unknown"
+                    row.transcription_quality = quality
+            row.status = "transcribed_pending"
+            row.current_step = "editing"
+            _persist_db.commit()
+        finally:
+            _persist_db.close()
         # reference_lyrics no tiene columna en el modelo Job (defer a otro PR
         # si el editor lo necesita post-transcribe). Lo dejo en el log para
         # diagnóstico mientras tanto.
         if reference_lyrics:
             logger.info("[TRANSCRIBE-WORKER] job=%s ref_lyrics=%d chars (no persistido aún)",
                         job_id, len(reference_lyrics))
-        update_job(job_id, **update_kwargs)
     except Exception as e:
         logger.warning("[TRANSCRIBE-WORKER] failed to persist final state: %s", e)
     return result

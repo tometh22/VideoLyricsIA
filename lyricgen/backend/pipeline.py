@@ -908,6 +908,25 @@ def _legacy_background_source_is_ai(
     return True
 
 
+def _transcription_quality_render_allowed(
+    job_id: str, segments: list[dict],
+) -> tuple[bool, str | None]:
+    """Single DB-backed quality decision used by every render pipeline."""
+    from database import Job as QualityJob, SessionLocal as QualitySession
+    from transcription_quality import can_render
+
+    quality_db = QualitySession()
+    try:
+        row = quality_db.query(QualityJob).filter(QualityJob.job_id == job_id).first()
+        return can_render(
+            row.transcription_quality if row else None,
+            revision=int(row.segments_revision or 0) if row else 0,
+            segments=segments,
+        )
+    finally:
+        quality_db.close()
+
+
 def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  language: str = None, segments_override: list[dict] = None,
                  delivery_profile: str = "youtube", umg_spec: dict | None = None,
@@ -1267,6 +1286,37 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             update_job(job_id, segments_json=segments, progress=20)
         else:
             update_job(job_id, progress=20)
+
+        # Central cost boundary. Every entry path (/generate, legacy /upload,
+        # retry and queued workers) reaches this point before background/Veo
+        # or rendering. Endpoint-only validation is insufficient because
+        # retries and legacy clients can bypass it.
+        if not art_track:
+            try:
+                _quality_ok, _quality_reason = _transcription_quality_render_allowed(
+                    job_id, segments,
+                )
+                if not _quality_ok:
+                    logger.error(
+                        "[QUALITY-GATE] render blocked reason=%s job=%s",
+                        _quality_reason, job_id,
+                    )
+                    update_job(
+                        job_id, status="error", current_step="quality_review",
+                        error=(
+                            "La letra requiere revisión de calidad antes de renderizar "
+                            f"({_quality_reason})."
+                        ),
+                    )
+                    return
+            except Exception as _quality_exc:
+                logger.exception("[QUALITY-GATE] central render check failed job=%s", job_id)
+                if os.environ.get("TRANSCRIPTION_QUALITY_MODE", "observe").lower() == "enforce":
+                    update_job(
+                        job_id, status="error", current_step="quality_review",
+                        error="No se pudo verificar la calidad de la letra antes del render.",
+                    )
+                    return
 
         # Step 1.5 — Background (AI-generated or human-provided)
         update_job(job_id, current_step="background", progress=22)
@@ -2378,6 +2428,11 @@ _WHISPER_HALLUCINATION_PHRASES = [
     "subtitles by",
     "subtitulado por",
     "transcripcion por",
+    # Seen in the Los Pericos live canary after the formatter. This is a
+    # subtitle/film credit emitted over the instrumental outro, never sung.
+    # Keep the signature specific so a real lyric containing "CC" is not
+    # rejected generically.
+    "cc por antarctica films argentina",
 ]
 
 # Patterns where the punctuation IS the signal — folding them would
@@ -6805,8 +6860,35 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
     return cleaned
 
 
+def _target_language_instruction(language: str | None, segs: list[dict]) -> str:
+    """Tell audio LLM postpasses which language to preserve.
+
+    Auto mode is resolved from the acoustic transcript itself.  Unknown stays
+    explicit instead of silently defaulting to Spanish: the hard requirement
+    is always to preserve the input language and never translate it.
+    """
+    resolved = resolve_transcription_language(
+        language,
+        result={"segments": segs},
+    )
+    names = {
+        "es": "español", "en": "inglés", "pt": "portugués",
+        "fr": "francés", "it": "italiano", "de": "alemán",
+    }
+    if resolved:
+        return (
+            f"IDIOMA OBJETIVO: {names.get(resolved, resolved)} ({resolved}). "
+            "Conservá ese idioma exactamente; no traduzcas."
+        )
+    return (
+        "IDIOMA OBJETIVO: el mismo idioma de la transcripción y del audio. "
+        "No traduzcas ni mezcles idiomas."
+    )
+
+
 def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
-                       song: str = "", timeout_s: int = 90) -> list[dict]:
+                       song: str = "", language: str | None = None,
+                       timeout_s: int = 90) -> list[dict]:
     """Re-segment a whisperX word stream into clean phrase lines via Gemini,
     grounded in the audio. The LLM decides the LINE GROUPING + fixes orthography
     (a language task heuristics can't do); whisperX provides the exact TIMING —
@@ -6838,7 +6920,8 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
     numbered = " ".join(f"[{i}]{(w.get('word') or '').strip()}"
                         for i, w in enumerate(W))
     system_prompt = (
-        "Sos un editor profesional de lyric videos en español (estilo Rotor).\n"
+        "Sos un editor profesional de lyric videos (estilo Rotor).\n"
+        + _target_language_instruction(language, segs) + "\n"
         "Te doy: (1) el AUDIO de la canción (puede ser un vivo), (2) su "
         "transcripción palabra-por-palabra (cada palabra con su índice [n]). "
         "Agrupá las palabras en LÍNEAS de lyric video.\n\n"
@@ -6902,7 +6985,26 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
         logger.warning("[LLM-SEGMENT] no parseable lines; keeping whisperX")
         return segs
 
-    # Gate (a): the line ranges must cover ~all the words (no big drops).
+    # Gate (a): ranges must be one exact, ordered partition of the acoustic
+    # words.  Coverage alone is insufficient: reversed or overlapping ranges
+    # can still cover 100%, then ship semantic order backwards and make the
+    # editor's active-line selector jump.  Any structural ambiguity declines
+    # to the untouched WhisperX segmentation.
+    expected_start = 0
+    for i, j, _ in parsed:
+        if i != expected_start:
+            logger.warning(
+                "[LLM-SEGMENT] non-contiguous/reordered ranges; keeping whisperX"
+            )
+            return segs
+        expected_start = j + 1
+    if expected_start != len(W):
+        logger.warning(
+            "[LLM-SEGMENT] incomplete final range; keeping whisperX"
+        )
+        return segs
+
+    # Defensive metric kept for observability; exact partition implies 100%.
     cov = set()
     for i, j, _ in parsed:
         cov.update(range(i, j + 1))
@@ -6927,9 +7029,77 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
         if st is None or en is None:
             continue
         out_segs.append({"start": float(st), "end": float(en),
-                         "text": txt, "words": grp})
+                         "text": txt, "words": grp,
+                         "llm_segmented": True})
+
+    # Collapse provider-timestamp failures without throwing away the clean
+    # segmentation of the rest of the song. A run of >=3 identical singleton
+    # lines packed at sub-2s cadence is not three lyric cards; it is one
+    # repeated hook whose word alignments collapsed into the same window.
+    # Keep every acoustic word attached for observability, but expose one safe
+    # card so the independent gap witness can recover later repetitions.
+    import statistics as _statistics
+    collapsed: list[dict] = []
+    pos = 0
+    while pos < len(out_segs):
+        line = out_segs[pos]
+        tokens = re.findall(r"[^\W\d_]+", line.get("text", "").casefold(), re.UNICODE)
+        if len(tokens) != 1:
+            collapsed.append(line)
+            pos += 1
+            continue
+        end_pos = pos + 1
+        while end_pos < len(out_segs):
+            next_tokens = re.findall(
+                r"[^\W\d_]+", out_segs[end_pos].get("text", "").casefold(),
+                re.UNICODE,
+            )
+            if next_tokens != tokens:
+                break
+            end_pos += 1
+        run = out_segs[pos:end_pos]
+        gaps = [
+            float(b["start"]) - float(a["start"])
+            for a, b in zip(run, run[1:])
+        ]
+        if (len(run) >= 3 and gaps
+                and _statistics.median(gaps) < 2.0):
+            merged = dict(run[0])
+            merged["end"] = max(float(item["end"]) for item in run)
+            merged["words"] = [
+                word for item in run for word in (item.get("words") or [])
+            ]
+            merged["review"] = True
+            merged["collapsed_repetition"] = len(run)
+            collapsed.append(merged)
+            logger.warning(
+                "[LLM-SEGMENT] collapsed %d repeated singleton lines with "
+                "provider-compressed timing", len(run),
+            )
+        else:
+            collapsed.extend(run)
+        pos = end_pos
+    out_segs = collapsed
+
     if len(out_segs) < 2:
         return segs
+    # The index partition can be perfect while the provider's repeated-word
+    # timestamps are collapsed or reversed (Los Pericos: five "Real" tokens
+    # all mapped into 60-64s). Splitting that stream would manufacture several
+    # cards at the same instant and force the final normalizer to squeeze them
+    # into fake 0.3s slots. Decline the entire LLM edit unless its mapped line
+    # windows are physically ordered and non-degenerate.
+    previous_start = None
+    for line in out_segs:
+        start = float(line["start"])
+        end = float(line["end"])
+        if end <= start or (previous_start is not None and start <= previous_start):
+            logger.warning(
+                "[LLM-SEGMENT] collapsed/non-monotonic mapped timing; "
+                "keeping whisperX"
+            )
+            return segs
+        previous_start = start
     logger.info("[LLM-SEGMENT] re-segmented %d whisperX segs → %d clean lines "
                 "(coverage %.2f)", len(segs), len(out_segs), coverage)
     return out_segs
@@ -7248,6 +7418,8 @@ def _transplant_gap(segs, gs, ge, Csync, beat_t, y=None, sr=22050,
 
 def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
                         song: str = "", canonical: str = "",
+                        language: str | None = None,
+                        prompt_reference: bool = True,
                         timeout_s: int = 60) -> list[dict]:
     """Recover lyrics whisperX DROPPED inside large gaps, by re-transcribing a
     SHORT, BOUNDED clip at the start of each gap.
@@ -7305,13 +7477,22 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
         y, _sr = librosa.load(audio_path, sr=sr, mono=True)
         audio_end = len(y) / sr
 
-        # Gaps = silences between consecutive words PLUS a trailing gap from the
-        # last word to end-of-audio. The trailing one matters because an
+        # Gaps = leading silence before the first recognized word, silences
+        # between consecutive words, PLUS a trailing gap to end-of-audio. The
+        # leading one catches a sustained or buried opening word that WhisperX
+        # failed to align (Los Pericos live: voice from ~5.5s, first stamp ~13s).
+        # The trailing one matters because an
         # upstream cleaner (LLM-segment / hallucination filter) may DROP the
         # outro shouts, so the dropped lyrics are no longer "between" two words
         # — they sit past the last surviving word.
-        gaps = [(W[i]["end"], W[i + 1]["start"]) for i in range(len(W) - 1)
-                if W[i + 1]["start"] - W[i]["end"] >= GAP_MIN]
+        gaps = []
+        if W[0]["start"] >= GAP_MIN:
+            gaps.append((0.0, W[0]["start"]))
+        gaps.extend(
+            (W[i]["end"], W[i + 1]["start"])
+            for i in range(len(W) - 1)
+            if W[i + 1]["start"] - W[i]["end"] >= GAP_MIN
+        )
         if audio_end - W[-1]["end"] >= GAP_MIN:
             gaps.append((W[-1]["end"], audio_end))
         if not gaps:
@@ -7393,8 +7574,8 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
             buf = io.BytesIO()
             sf.write(buf, clip, sr, format="WAV")
             sysp = (
-                "Sos un transcriptor experto de lyric videos en español, nivel "
-                "Rotor.\n"
+                "Sos un transcriptor experto de lyric videos, nivel Rotor.\n"
+                + _target_language_instruction(language, segs) + "\n"
                 f"Te doy un FRAGMENTO CORTO de audio ({c1 - c0:.0f} s) de un vivo"
                 + (f" ({artist} — {song})" if artist else "") + ".\n"
                 "Transcribí EXACTAMENTE lo que se canta en ESTE fragmento corto.\n\n"
@@ -7405,7 +7586,7 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
                 "(grito)/(instrumental)/(silencio).\n"
                 "3. Una frase por línea, mayúscula al inicio.\n"
                 + (f"- Letra oficial (ortografía, NO forzar): {ref_text}\n"
-                   if canonical else "")
+                   if canonical and prompt_reference else "")
                 + "FORMATO por línea, sin nada más: texto"
             )
             try:
@@ -17381,6 +17562,35 @@ def run_edit_pipeline(
             )
     finally:
         db.close()
+
+    # Edits and scene regenerations render through a separate worker entry
+    # point. Check the exact segment snapshot here, before source download,
+    # Veo and the compositor, so /edit cannot bypass the central policy.
+    try:
+        quality_ok, quality_reason = _transcription_quality_render_allowed(
+            job_id, segments,
+        )
+        if not quality_ok:
+            logger.error(
+                "[QUALITY-GATE] edit render blocked reason=%s job=%s type=%s",
+                quality_reason, job_id, edit_type,
+            )
+            update_job(
+                job_id, status="error", current_step="quality_review",
+                error=(
+                    "La letra requiere revisión de calidad antes de renderizar "
+                    f"({quality_reason})."
+                ),
+            )
+            return
+    except Exception:
+        logger.exception("[QUALITY-GATE] edit render check failed job=%s", job_id)
+        if os.environ.get("TRANSCRIPTION_QUALITY_MODE", "observe").lower() == "enforce":
+            update_job(
+                job_id, status="error", current_step="quality_review",
+                error="No se pudo verificar la calidad de la letra antes del render.",
+            )
+            return
 
     # Merge base render params with the requested overrides.
     merged = {**base_params, **edit_params}

@@ -29,6 +29,14 @@ def test_encuentra_hueco_interno():
     assert gr.find_gaps(segs, min_gap_s=12.0) == [(20.0, 50.0)]
 
 
+def test_hueco_inicial_solo_se_habilita_para_audio_live():
+    segs = [_seg(13.4, 17.0), _seg(19.5, 23.0)]
+    assert gr.find_gaps(segs, min_gap_s=8.0) == []
+    assert gr.find_gaps(
+        segs, min_gap_s=8.0, include_leading=True,
+    ) == [(0.0, 13.4)]
+
+
 def test_ventana_whisper_registra_provenance_del_job(monkeypatch):
     from pathlib import Path
     from types import SimpleNamespace
@@ -50,6 +58,9 @@ def test_ventana_whisper_registra_provenance_del_job(monkeypatch):
     class _Client:
         audio = SimpleNamespace(transcriptions=_Transcriptions())
 
+        def __init__(self, **kwargs):
+            captured["client_options"] = kwargs
+
     def _ffmpeg(cmd, **_kwargs):
         Path(cmd[-1]).write_bytes(b"audio")
 
@@ -66,6 +77,7 @@ def test_ventana_whisper_registra_provenance_del_job(monkeypatch):
     )
 
     assert words[0]["start"] == 10.1
+    assert captured["client_options"] == {"timeout": 60.0, "max_retries": 0}
     assert captured["job_id"] == "gap-job"
     assert captured["tool_name"] == "whisper-1-gap-rescue"
     assert captured["tool_provider"] == "openai"
@@ -144,6 +156,142 @@ def test_rescata_el_hueco_y_no_pisa_lo_existente(audio, monkeypatch):
     assert nueva[0].get("review") is True
     starts = [s["start"] for s in out]
     assert starts == sorted(starts)
+
+
+def test_live_rescata_palabra_inicial_sostenida_y_su_onset_vad(
+        audio, tmp_path, monkeypatch):
+    """Caso Los Pericos: WhisperX pierde 'Hoy' y empieza cerca de 13s,
+    mientras el stem confirma que la voz sostenida arrancó cerca de 5.5s."""
+    stem = tmp_path / "stem.wav"
+    stem.write_bytes(b"RIFF" + b"\0" * 128)
+    _con_vad(monkeypatch, [(5.5, 14.0)])
+    monkeypatch.setattr(
+        gr, "_transcribe_window",
+        lambda *a, **k: [{"word": "Hoy", "start": 12.44, "end": 13.84}],
+    )
+    segs = [
+        _seg(13.374, 17.267, "temprano estuve pensando en vos"),
+        _seg(19.5, 23.5, "pasó el tiempo y ahora me siento mejor"),
+        _seg(25.5, 31.0, "cuando puedo no puedo"),
+    ]
+
+    out, stats = gr.rescue(
+        segs, audio, stem_path=str(stem), audio_duration=32.0,
+        language="es", include_leading=True,
+        reference_text="Hoy temprano estuve pensando en vos",
+    )
+
+    rescued = [s for s in out if s.get("gap_rescued")]
+    assert stats["rescued_lines"] == 1
+    assert rescued[0]["text"] == "Hoy"
+    assert rescued[0]["start"] == 5.5
+    assert rescued[0]["end"] < segs[0]["start"]
+
+
+def test_palabra_inicial_sola_exige_referencia(audio, tmp_path, monkeypatch):
+    stem = tmp_path / "stem.wav"
+    stem.write_bytes(b"RIFF" + b"\0" * 128)
+    _con_vad(monkeypatch, [(5.5, 14.0)])
+    monkeypatch.setattr(
+        gr, "_transcribe_window",
+        lambda *a, **k: [{"word": "Fantasma", "start": 12.0, "end": 13.0}],
+    )
+    segs = [_seg(13.4, 17), _seg(20, 24), _seg(26, 30)]
+    out, stats = gr.rescue(
+        segs, audio, stem_path=str(stem), audio_duration=31,
+        include_leading=True, reference_text="Hoy temprano",
+    )
+    assert stats["rescued_lines"] == 0
+    assert out == segs
+
+
+def test_live_rescata_estribillo_espaciado_si_el_stem_y_referencia_coinciden(
+        audio, tmp_path, monkeypatch):
+    stem = tmp_path / "stem.wav"
+    stem.write_bytes(b"RIFF" + b"\0" * 128)
+    starts = [67.2, 73.9, 79.9, 85.9, 91.9, 97.9, 103.9, 109.9]
+    _con_vad(monkeypatch, [
+        (60.0, 64.5), *((start - 0.3, start + 1.5) for start in starts),
+    ])
+    monkeypatch.setattr(
+        gr, "_transcribe_window",
+        lambda *a, **k: [
+            {"word": "Real", "start": start, "end": start + 1.0}
+            for start in starts
+        ],
+    )
+    segs = [
+        _seg(13, 17), _seg(25, 31), _seg(60.8, 64.1, "Real"),
+    ]
+    out, stats = gr.rescue(
+        segs, audio, stem_path=str(stem), audio_duration=116.0,
+        language="es", include_leading=True,
+        reference_text="Real wow wow\nReal wow wow\nReal wow wow",
+    )
+    rescued = [s for s in out if s.get("gap_rescued")]
+    assert stats["rescued_lines"] == 8
+    assert [s["text"] for s in rescued] == ["Real"] * 8
+    assert [round(s["start"], 1) for s in rescued] == starts
+
+
+def test_sparse_singletons_without_reference_are_rejected(
+        audio, tmp_path, monkeypatch):
+    stem = tmp_path / "stem.wav"
+    stem.write_bytes(b"RIFF" + b"\0" * 128)
+    _con_vad(monkeypatch, [(60.0, 80.0)])
+    monkeypatch.setattr(
+        gr, "_transcribe_window",
+        lambda *a, **k: [
+            {"word": "Fantasma", "start": t, "end": t + 1.0}
+            for t in (67.0, 73.0, 79.0)
+        ],
+    )
+    segs = [_seg(13, 17), _seg(25, 31), _seg(60, 64)]
+    out, stats = gr.rescue(
+        segs, audio, stem_path=str(stem), audio_duration=84,
+        include_leading=True, reference_text="Real wow wow",
+    )
+    assert stats["rescued_lines"] == 0
+    assert out == segs
+
+
+def test_live_sparse_refrain_uses_mix_when_stem_timing_is_not_physical(
+        audio, tmp_path, monkeypatch):
+    stem = tmp_path / "stem.wav"
+    stem.write_bytes(b"RIFF" + b"\0" * 128)
+    _con_vad(monkeypatch, [
+        (64.0, 75.0), (79.0, 82.5), (67.0, 69.0), (73.5, 75.0),
+    ])
+
+    def witness(path, *_args, **_kwargs):
+        if path == str(stem):
+            return [
+                {"word": "No", "start": 64.3, "end": 74.8},
+                {"word": "No", "start": 80.5, "end": 82.2},
+                {"word": "No", "start": 114.0, "end": 118.0},
+            ]
+        return [
+            {"word": "Real", "start": 67.2, "end": 68.6},
+            {"word": "Real", "start": 73.9, "end": 74.7},
+            {"word": "Real", "start": 78.6, "end": 80.0},
+            # Dense burst and isolated tail must not join the cadence cluster.
+            *({"word": "Real", "start": 90.3 + i * 0.02,
+               "end": 90.32 + i * 0.02} for i in range(5)),
+            {"word": "Real", "start": 126.3, "end": 127.7},
+        ]
+
+    monkeypatch.setattr(gr, "_transcribe_window", witness)
+    segs = [_seg(13, 17), _seg(25, 31), _seg(60.8, 64.1, "Real")]
+    out, stats = gr.rescue(
+        segs, audio, stem_path=str(stem), audio_duration=128.0,
+        language="es", include_leading=True,
+        reference_text="Real uoo uou\nReal uoo uou\nReal uoo uou",
+    )
+
+    rescued = [line for line in out if line.get("gap_rescued")]
+    assert [line["text"] for line in rescued] == ["Real", "Real", "Real"]
+    assert [round(line["start"], 1) for line in rescued] == [67.2, 73.9, 78.6]
+    assert stats["sparse_source"] == "mix-witness"
 
 
 def test_declina_si_la_ventana_no_tiene_canto(audio, monkeypatch):
