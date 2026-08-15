@@ -4,6 +4,7 @@ import {
   clampResizeTiming,
   clampResizeTimingWithAdjacent,
   clampSelectionShiftDelta,
+  rippleResizeEnd,
   shiftTimingWithAdjacent,
   shiftBlockWithinDuration,
   canonicalizeEditorSegments,
@@ -226,6 +227,143 @@ describe("collision-safe timeline edits", () => {
         blocked: false,
         coupled: true,
       });
+  });
+
+  it("extends an end handle by preserving and pushing the following line", () => {
+    const packed = [
+      { _id: "a", start: 0, end: 2 },
+      { _id: "b", start: 2.05, end: 3.5 },
+    ];
+    expect(rippleResizeEnd(packed, "a", 2.5, 10, 0.05, 0.3)).toEqual({
+      changes: [
+        { id: "a", start: 0, end: 2.5 },
+        { id: "b", start: 2.55, end: 4 },
+      ],
+      blocked: false,
+      limited: false,
+      coupled: true,
+    });
+  });
+
+  it("ripples only the collision chain and leaves a later gap untouched", () => {
+    const lines = [
+      { _id: "a", start: 0, end: 1 },
+      { _id: "b", start: 1.05, end: 2 },
+      { _id: "c", start: 2.05, end: 3 },
+      { _id: "d", start: 8, end: 9 },
+    ];
+    expect(rippleResizeEnd(lines, "a", 1.5, 12, 0.05, 0.3)).toEqual({
+      changes: [
+        { id: "a", start: 0, end: 1.5 },
+        { id: "b", start: 1.55, end: 2.5 },
+        { id: "c", start: 2.55, end: 3.5 },
+      ],
+      blocked: false,
+      limited: false,
+      coupled: true,
+    });
+  });
+
+  it("finds the collision chain by time rather than source-array order", () => {
+    const outOfOrder = [
+      { _id: "a", start: 0, end: 1 },
+      { _id: "c", start: 2.05, end: 3 },
+      { _id: "b", start: 1.05, end: 2 },
+      { _id: "d", start: 8, end: 9 },
+    ];
+    expect(rippleResizeEnd(outOfOrder, "a", 1.5, 12, 0.05, 0.3).changes).toEqual([
+      { id: "a", start: 0, end: 1.5 },
+      { id: "b", start: 1.55, end: 2.5 },
+      { id: "c", start: 2.55, end: 3.5 },
+    ]);
+  });
+
+  it("clamps safe resize edges against chronological neighbours, not row order", () => {
+    const outOfOrder = [
+      { _id: "a", start: 0, end: 1 },
+      { _id: "c", start: 2.05, end: 3 },
+      { _id: "b", start: 1.05, end: 2 },
+    ];
+    expect(clampResizeTiming(outOfOrder, "a", 0, 1.5, 10, 0.05, 0.3, "end"))
+      .toEqual({ start: 0, end: 1, blocked: false });
+    expect(clampSelectionShiftDelta(outOfOrder, new Set(["a"]), 1, 10, 0.05))
+      .toBeCloseTo(0);
+  });
+
+  it("limits a ripple at the song end without shortening any pushed line", () => {
+    const packed = [
+      { _id: "a", start: 0, end: 1 },
+      { _id: "b", start: 1.05, end: 2 },
+      { _id: "c", start: 2.05, end: 3 },
+    ];
+    expect(rippleResizeEnd(packed, "a", 8, 3.5, 0.05, 0.3)).toEqual({
+      changes: [
+        { id: "a", start: 0, end: 1.5 },
+        { id: "b", start: 1.55, end: 2.5 },
+        { id: "c", start: 2.55, end: 3.5 },
+      ],
+      blocked: false,
+      limited: true,
+      coupled: true,
+    });
+  });
+
+  it("keeps source snapshots immutable and rejects non-finite resize input", () => {
+    const lines = [
+      { _id: "a", start: 0, end: 1 },
+      { _id: "b", start: 1.05, end: 2 },
+    ];
+    const before = structuredClone(lines);
+    expect(rippleResizeEnd(lines, "a", Number.NaN, 10)).toMatchObject({
+      changes: [], blocked: true,
+    });
+    expect(lines).toEqual(before);
+  });
+
+  it("adversarially preserves timing invariants across random collision chains", () => {
+    let seed = 0x5eed1234;
+    const random = () => {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      return seed / 0x1_0000_0000;
+    };
+    const gap = 0.05;
+    const audioDuration = 120;
+
+    for (let run = 0; run < 250; run += 1) {
+      const lines = [];
+      let cursor = random() * 2;
+      const count = 2 + Math.floor(random() * 10);
+      for (let index = 0; index < count; index += 1) {
+        const lineDuration = 0.3 + random() * 2.5;
+        cursor += random() * 1.2;
+        lines.push({ _id: `line-${index}`, start: cursor, end: cursor + lineDuration });
+        cursor += lineDuration + gap;
+      }
+      // Imported/editor rows can retain source order. Fuzz that condition as
+      // well: the physical result must remain chronological and overlap-free.
+      const shuffled = lines
+        .map((line) => ({ line, rank: random() }))
+        .sort((left, right) => left.rank - right.rank)
+        .map(({ line }) => line);
+      const original = structuredClone(shuffled);
+      const activeIndex = Math.floor(random() * lines.length);
+      const requestedEnd = -5 + random() * 180;
+      const result = rippleResizeEnd(shuffled, lines[activeIndex]._id, requestedEnd, audioDuration, gap, 0.3);
+      const byId = new Map(result.changes.map((change) => [change.id, change]));
+      const finalLines = shuffled
+        .map((line) => byId.get(line._id) || line)
+        .sort((left, right) => left.start - right.start || left.end - right.end);
+
+      expect(shuffled).toEqual(original);
+      finalLines.forEach((line, index) => {
+        expect(Number.isFinite(line.start)).toBe(true);
+        expect(Number.isFinite(line.end)).toBe(true);
+        expect(line.start).toBeGreaterThanOrEqual(-1e-6);
+        expect(line.end - line.start).toBeGreaterThanOrEqual(0.3 - 1e-6);
+        expect(line.end).toBeLessThanOrEqual(audioDuration + 1e-6);
+        if (index > 0) expect(line.start).toBeGreaterThanOrEqual(finalLines[index - 1].end + gap - 1e-6);
+      });
+    }
   });
 
   it("refuses an impossible resize without mutating the snapshot", () => {

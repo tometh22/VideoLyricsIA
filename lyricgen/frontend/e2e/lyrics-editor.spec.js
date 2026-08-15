@@ -241,7 +241,7 @@ test.describe("lyrics editor browser contract", () => {
     await expect(page.getByTestId("timeline-label-row").last()).toBeVisible();
   });
 
-  test("moves a packed shared boundary only after chain mode is enabled", async ({ page }) => {
+  test("ripple-trims a packed shared boundary by default without shortening lyrics", async ({ page }) => {
     const harness = await installEditorHarness(page, {
       segments: [
         { _id: "wide", start: 0.4, end: 2.4, text: "Línea para estirar" },
@@ -250,8 +250,6 @@ test.describe("lyrics editor browser contract", () => {
     });
     await harness.open();
     await openAdvanced(page);
-    await page.getByRole("button", { name: "En cadena", exact: true }).click();
-    await expect(page.getByTestId("timeline-ripple-warning")).toBeVisible();
 
     const block = page.getByTestId("timeline-segment").first();
     const edge = block.getByTestId("timeline-edge-end");
@@ -272,8 +270,41 @@ test.describe("lyrics editor browser contract", () => {
     const savedNext = savedSegments.find((segment) => segment.text === "Línea siguiente");
     expect(Number(saved.end)).toBeCloseTo(2.9, 2);
     expect(Number(savedNext.start)).toBeCloseTo(2.95, 2);
+    expect(Number(savedNext.end)).toBeCloseTo(3.75, 2);
     expect(Number(savedNext.start) - Number(saved.end)).toBeCloseTo(0.05, 2);
     expect(Number(savedNext.end) - Number(savedNext.start)).toBeGreaterThanOrEqual(0.3);
+    expect(saved.locked).toBe(true);
+    expect(savedNext.locked).toBe(true);
+  });
+
+  test("Solo esta línea stops a right-edge trim before the next lyric", async ({ page }) => {
+    const harness = await installEditorHarness(page, {
+      segments: [
+        { _id: "wide", start: 0.4, end: 2.4, text: "Línea para estirar" },
+        { _id: "next", start: 2.7, end: 3.5, text: "Línea siguiente" },
+      ],
+    });
+    await harness.open();
+    await openAdvanced(page);
+    await page.getByRole("button", { name: "Solo esta línea", exact: true }).first().click();
+
+    const block = page.getByTestId("timeline-segment").first();
+    const edge = block.getByTestId("timeline-edge-end");
+    const edgeBox = await edge.boundingBox();
+    expect(edgeBox).not.toBeNull();
+    await drag(
+      page,
+      { x: edgeBox.x + edgeBox.width / 2, y: edgeBox.y + edgeBox.height / 2 },
+      { x: edgeBox.x + edgeBox.width / 2 + 24, y: edgeBox.y + edgeBox.height / 2 },
+    );
+
+    await expect.poll(() => harness.saves.length).toBeGreaterThan(0);
+    const savedSegments = harness.saves.at(-1).segments;
+    const saved = savedSegments.find((segment) => segment.text === "Línea para estirar");
+    const savedNext = savedSegments.find((segment) => segment.text === "Línea siguiente");
+    expect(Number(saved.end)).toBeCloseTo(2.65, 2);
+    expect(Number(savedNext.start)).toBeCloseTo(2.7, 2);
+    expect(Number(savedNext.end)).toBeCloseTo(3.5, 2);
   });
 
   test("moves a short line from its body while resize handles stay outside", async ({ page }) => {

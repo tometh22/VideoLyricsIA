@@ -34,8 +34,10 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
       const state = await runtime.reconcile(snapshot);
       if (!mountedRef.current) return { ok: false, reason: "unmounted" };
       if (!state?.ok) {
-        if (state?.reason === "conflict" && rebaseAttempts < MAX_REBASE_ATTEMPTS) {
-          return runSave(checkpoint, false, snapshot, rebaseAttempts + 1);
+        if (state?.reason === "conflict") {
+          clearTimers();
+          runtimeRef.current.onStatus?.("conflict", "conflict", { checkpoint, result: state });
+          return state;
         }
         runtimeRef.current.onStatus?.("error", "server", { checkpoint, result: state });
         return { ...state, reason: "server" };
@@ -59,11 +61,12 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
       return result;
     }
     if (result?.reason === "conflict") {
-      if (rebaseAttempts < MAX_REBASE_ATTEMPTS) {
-        return runSave(checkpoint, true, snapshot, rebaseAttempts + 1);
-      }
-      runtimeRef.current.onStatus?.("error", "server", { checkpoint, result });
-      return { ...result, reason: "server" };
+      // A 409 on the same lyric is intentionally terminal for this draft.
+      // Keep the local screen/draft intact and require an explicit recovery;
+      // retrying here could overwrite the remote edit after a rebase.
+      clearTimers();
+      runtimeRef.current.onStatus?.("conflict", "conflict", { checkpoint, result });
+      return result;
     }
     if (result?.reason === "merged" && Array.isArray(result.mergedSegments)) {
       // The first request was rejected because the base was stale, but the

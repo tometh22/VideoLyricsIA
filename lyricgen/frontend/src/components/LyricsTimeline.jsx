@@ -15,8 +15,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import {
   clampResizeTiming,
-  clampResizeTimingWithAdjacent,
   clampSelectionShiftDelta,
+  rippleResizeEnd,
   shiftTimingWithAdjacent,
 } from "../lib/segmentTiming";
 
@@ -129,6 +129,10 @@ export default function LyricsTimeline({
   const [followEnabled, setFollowEnabled] = useState(true);
   const [followSuppressed, setFollowSuppressed] = useState(false);
   const [limitFeedback, setLimitFeedback] = useState("");
+  // Right-edge trimming defaults to the professional, collision-safe ripple
+  // behaviour. Keep the existing optional chain movement separate so moving
+  // a whole block never becomes surprising just because resize got smarter.
+  const [rightEdgeRipple, setRightEdgeRipple] = useState(true);
   const [rippleEditing, setRippleEditing] = useState(false);
 
   const normalizedSegments = useMemo(() => normalizeTimelineSegments(segments), [segments]);
@@ -305,7 +309,9 @@ export default function LyricsTimeline({
       return;
     }
     const movingGroup = mode === "move" && selectedIds.has(segment._id) && selectedIds.size > 1;
-    const ripple = rippleEditing && !movingGroup;
+    const ripple = !movingGroup && (
+      mode === "end" ? rightEdgeRipple : mode === "move" && rippleEditing
+    );
     const segmentIndex = normalizedSegments.findIndex((item) => item._id === segment._id);
     const resizeNeighbour = mode === "start"
       ? normalizedSegments[segmentIndex - 1]
@@ -314,6 +320,8 @@ export default function LyricsTimeline({
       ? normalizedSegments.filter((item) => selectedIds.has(item._id))
       : ripple && mode === "move"
         ? normalizedSegments
+        : ripple && mode === "end"
+          ? normalizedSegments
         : ripple
           ? [segment, resizeNeighbour].filter(Boolean)
           : [segment];
@@ -340,7 +348,7 @@ export default function LyricsTimeline({
     markInteraction();
     setLimitFeedback("");
     setPreview(movingGroup ? { changes: snapshots, mode } : { id: segment._id, start: segment.start, end: segment.end, mode });
-  }, [markInteraction, normalizedSegments, pxPerSec, rippleEditing, selectRangeTo, selectedIds, toggleSelection]);
+  }, [markInteraction, normalizedSegments, pxPerSec, rightEdgeRipple, rippleEditing, selectRangeTo, selectedIds, toggleSelection]);
 
   const updateDrag = useCallback((event) => {
     const drag = dragRef.current;
@@ -354,10 +362,6 @@ export default function LyricsTimeline({
     const movementThreshold = resizing ? 1 : CLICK_SLOP_PX;
     if (Math.abs(event.clientX - drag.originX) > movementThreshold) {
       drag.moved = true;
-      if (!drag.historyStarted) {
-        drag.historyStarted = true;
-        onDragStart?.();
-      }
     }
     if (drag.movingGroup) {
       const safeDelta = clampSelectionShiftDelta(
@@ -378,10 +382,9 @@ export default function LyricsTimeline({
     if (drag.mode === "start" || drag.mode === "end") {
       const requestedStart = drag.mode === "start" ? drag.origStart + delta : drag.origStart;
       const requestedEnd = drag.mode === "end" ? drag.origEnd + delta : drag.origEnd;
-      const resize = drag.ripple
-        ? clampResizeTimingWithAdjacent(
-          normalizedSegments, drag.id, requestedStart, requestedEnd,
-          total, gapS, MIN_DUR_S, drag.mode,
+      const resize = drag.ripple && drag.mode === "end"
+        ? rippleResizeEnd(
+          normalizedSegments, drag.id, requestedEnd, total, gapS, MIN_DUR_S,
         )
         : (() => {
           const bounded = clampResizeTiming(
@@ -399,8 +402,8 @@ export default function LyricsTimeline({
       const requestedBoundary = drag.mode === "start" ? requestedStart : requestedEnd;
       const limited = Math.abs(requestedBoundary - appliedBoundary) > 1e-4;
       setLimitFeedback(resize?.blocked || limited
-        ? drag.ripple
-          ? "La cadena llegó al límite disponible."
+        ? drag.ripple && drag.mode === "end"
+          ? t("timeline.ripple_limit", "El ajuste llegó a su límite; las líneas no se superpusieron.")
           : "Ese borde toca otra línea. Para no modificarla, el ajuste se detuvo."
         : "");
       if (resize?.changes?.length > 1) {
@@ -431,7 +434,7 @@ export default function LyricsTimeline({
       }
     }
     setPreview({ id: drag.id, start, end, mode: drag.mode });
-  }, [gapS, normalizedSegments, onDragStart, total, updateMarquee]);
+  }, [gapS, normalizedSegments, t, total, updateMarquee]);
 
   const finishDrag = useCallback((event, segment) => {
     if (marqueeRef.current) {
@@ -455,14 +458,21 @@ export default function LyricsTimeline({
         return original && (Math.abs(original.start - change.start) > 1e-3 || Math.abs(original.end - change.end) > 1e-3);
       });
       const durationMs = Math.max(0, performance.now() - drag.startedAt);
-      if (changes.length) onTimingChangeBatch?.(changes, { durationMs, operation: drag.mode === "move" ? "move" : "resize" });
+      if (changes.length) onDragStart?.();
+      if (changes.length) onTimingChangeBatch?.(changes, {
+        durationMs,
+        operation: drag.mode === "end" && drag.ripple ? "ripple_resize" : drag.mode === "move" ? "move" : "resize",
+      });
       if (changes.length && drag.movingGroup) onGroupMoved?.({ count: changes.length, delta: changes[0].start - drag.snapshots[0].start });
       return;
     }
     if (Math.abs(current.start - segment.start) > 1e-3 || Math.abs(current.end - segment.end) > 1e-3) {
-      onTimingChange?.(segment._id, current.start, current.end);
+      onDragStart?.();
+      onTimingChange?.(segment._id, current.start, current.end, {
+        operation: drag.mode === "end" && drag.ripple ? "ripple_resize" : drag.mode === "move" ? "move" : "resize",
+      });
     }
-  }, [finishMarquee, onFocus, onGroupMoved, onTimingChange, onTimingChangeBatch, preview, seekAt]);
+  }, [finishMarquee, onDragStart, onFocus, onGroupMoved, onTimingChange, onTimingChangeBatch, preview, seekAt]);
 
   const cancelPointerInteraction = useCallback((event) => {
     dragRef.current = null;
@@ -662,26 +672,27 @@ export default function LyricsTimeline({
           {saveStatus === "local" && <span className="text-[10px] text-amber-300">{t("timeline.local_changes", "Cambios locales")}</span>}
           {saveStatus === "offline" && <span className="text-[10px] text-red-300">{t("timeline.offline", "Sin conexión")}</span>}
           {saveStatus === "error" && <span className="text-[10px] text-red-300">{t("timeline.save_error", "Sin guardar")}</span>}
+          {saveStatus === "conflict" && <span className="text-[10px] text-amber-300">{t("timeline.conflict", "Conflicto detectado")}</span>}
         </div>
         <div className="relative flex items-center gap-2" data-testid="timeline-primary-actions" data-selected-count={selectedIds.size}>
           <div role="group" aria-label={t("timeline.edit_behavior", "Comportamiento del ajuste")} className="hidden sm:inline-flex h-9 overflow-hidden rounded-xl bg-black/15 ring-1 ring-white/[0.1]">
             <button
               type="button"
-              aria-pressed={!rippleEditing}
-              onClick={() => { setRippleEditing(false); setLimitFeedback(""); }}
-              className={`px-3 text-[10px] font-medium transition-colors ${!rippleEditing ? "bg-emerald-400/15 text-emerald-200" : "text-ink-tertiary hover:bg-white/[0.05] hover:text-white"}`}
-              title={t("timeline.safe_mode_hint", "Modo seguro: nunca modifica otras líneas")}
+              aria-pressed={rightEdgeRipple}
+              onClick={() => { setRightEdgeRipple(true); setLimitFeedback(""); }}
+              className={`px-3 text-[10px] font-medium transition-colors ${rightEdgeRipple ? "bg-brand/25 text-brand-light" : "text-ink-tertiary hover:bg-white/[0.05] hover:text-white"}`}
+              title={t("timeline.ripple_trim_hint", "Al extender una línea, empuja sólo las siguientes que choquen")}
             >
-              {t("timeline.safe_mode", "Solo esta línea")}
+              {t("timeline.ripple_trim", "Empujar siguientes")}
             </button>
             <button
               type="button"
-              aria-pressed={rippleEditing}
-              onClick={() => { setRippleEditing(true); setLimitFeedback(""); }}
-              className={`border-l border-white/[0.08] px-3 text-[10px] font-medium transition-colors ${rippleEditing ? "bg-amber-400/15 text-amber-200" : "text-ink-tertiary hover:bg-white/[0.05] hover:text-white"}`}
-              title={t("timeline.ripple_mode_hint", "Desplaza también las líneas pegadas; usalo sólo para mover una sección")}
+              aria-pressed={!rightEdgeRipple}
+              onClick={() => { setRightEdgeRipple(false); setLimitFeedback(""); }}
+              className={`border-l border-white/[0.08] px-3 text-[10px] font-medium transition-colors ${!rightEdgeRipple ? "bg-emerald-400/15 text-emerald-200" : "text-ink-tertiary hover:bg-white/[0.05] hover:text-white"}`}
+              title={t("timeline.safe_mode_hint", "Modo seguro: nunca modifica otras líneas")}
             >
-              {t("timeline.ripple_mode", "En cadena")}
+              {t("timeline.safe_mode", "Solo esta línea")}
             </button>
           </div>
           <button type="button" onClick={fitTimeline} title={t("timeline.fit_hint", "Ver la canción completa")} className="h-9 px-3 rounded-xl text-[11px] font-medium text-white bg-white/[0.055] ring-1 ring-white/[0.1] hover:bg-white/[0.09] transition-colors">{t("timeline.fit", "Ver canción completa")}</button>
@@ -718,6 +729,16 @@ export default function LyricsTimeline({
                   <button type="button" onClick={() => setPxPerSec((value) => Math.min(ZOOM_MAX, value + ZOOM_STEP))} className="w-7 h-full hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.zoom_in", "Acercar")}>+</button>
                 </div>
               </div>
+              <button
+                type="button"
+                onClick={() => setRippleEditing((value) => !value)}
+                aria-checked={rippleEditing}
+                role="menuitemcheckbox"
+                className={`w-full rounded-xl px-3 py-2.5 text-left text-[11px] transition-colors ${rippleEditing ? "text-brand-light bg-brand/10" : "text-ink-secondary hover:text-white hover:bg-white/[0.05]"}`}
+              >
+                <span className="block font-medium">{t("timeline.move_ripple", "Mover en cadena")}</span>
+                <span className="mt-0.5 block text-[10px] text-ink-tertiary">{t("timeline.move_ripple_hint", "Al mover un bloque, desplaza las líneas pegadas")}</span>
+              </button>
               <button type="button" role="menuitem" onClick={() => { onReset?.(); setMoreActionsOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:text-white hover:bg-white/[0.05]">
                 <span className="block font-medium">{t("timeline.reset", "Restaurar tiempos originales")}</span>
                 <span className="mt-0.5 block text-[10px] text-ink-tertiary">{t("timeline.reset_desc", "Deshace todos los ajustes de timing")}</span>
@@ -729,16 +750,9 @@ export default function LyricsTimeline({
       </div>
 
       <div className="flex border-b border-white/[0.06] sm:hidden" role="group" aria-label={t("timeline.edit_behavior_mobile", "Comportamiento del ajuste móvil")}>
-        <button type="button" aria-pressed={!rippleEditing} onClick={() => { setRippleEditing(false); setLimitFeedback(""); }} className={`flex-1 px-3 py-2 text-[10px] font-medium ${!rippleEditing ? "bg-emerald-400/12 text-emerald-200" : "text-ink-tertiary"}`}>{t("timeline.safe_mode", "Solo esta línea")}</button>
-        <button type="button" aria-pressed={rippleEditing} onClick={() => { setRippleEditing(true); setLimitFeedback(""); }} className={`flex-1 border-l border-white/[0.06] px-3 py-2 text-[10px] font-medium ${rippleEditing ? "bg-amber-400/12 text-amber-200" : "text-ink-tertiary"}`}>{t("timeline.ripple_mode", "En cadena")}</button>
+        <button type="button" aria-pressed={rightEdgeRipple} onClick={() => { setRightEdgeRipple(true); setLimitFeedback(""); }} className={`flex-1 px-3 py-2 text-[10px] font-medium ${rightEdgeRipple ? "bg-brand/20 text-brand-light" : "text-ink-tertiary"}`}>{t("timeline.ripple_trim", "Empujar siguientes")}</button>
+        <button type="button" aria-pressed={!rightEdgeRipple} onClick={() => { setRightEdgeRipple(false); setLimitFeedback(""); }} className={`flex-1 border-l border-white/[0.06] px-3 py-2 text-[10px] font-medium ${!rightEdgeRipple ? "bg-emerald-400/12 text-emerald-200" : "text-ink-tertiary"}`}>{t("timeline.safe_mode", "Solo esta línea")}</button>
       </div>
-
-      {rippleEditing && (
-        <div data-testid="timeline-ripple-warning" className="flex items-center gap-2 border-b border-amber-300/15 bg-amber-300/[0.07] px-4 sm:px-5 py-2 text-[10px] text-amber-100">
-          <span aria-hidden="true">⚠</span>
-          <span><strong>{t("timeline.ripple_active", "En cadena activo")}:</strong> {t("timeline.ripple_warning", "puede modificar varias líneas pegadas. La vista previa muestra cuáles antes de soltar.")}</span>
-        </div>
-      )}
 
       {limitFeedback && (
         <div data-testid="timeline-limit-feedback" role="status" className="flex items-center gap-2 border-b border-amber-300/15 bg-amber-300/[0.07] px-4 sm:px-5 py-2 text-[10px] text-amber-100">
