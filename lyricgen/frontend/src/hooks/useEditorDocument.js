@@ -122,23 +122,31 @@ export function useEditorDocument({ jobId, enabled, request }) {
         const next = staleDocumentFrom(body, segments, revisionRef.current);
         const base = document?.segments || [];
         const merged = mergeThreeWay(base, segments, next.serverSegments);
-        // A stale write is rebased silently.  In the rare case where both
-        // snapshots changed the same line, the current editor wins by being
-        // written as a new revision; the old server snapshot remains in the
-        // immutable version history.  The backend CAS still guards the retry,
-        // so a second writer can never be overwritten without another check.
         applyDocument({
           ...(document || {}),
           ...body,
           revision: next.serverRevision,
           segments: next.serverSegments,
         });
+        // Independent changes may be rebased and retried behind the new CAS
+        // revision. A same-line conflict is different: retain the local draft
+        // in the browser and never turn a 409 into "save mine over theirs".
+        if (merged.conflicts.length > 0) {
+          return {
+            ok: false,
+            reason: "conflict",
+            serverRevision: next.serverRevision,
+            serverSegments: next.serverSegments,
+            localSegments: segments,
+            conflicts: merged.conflicts,
+          };
+        }
         return {
           ok: false,
           reason: "merged",
           mergedSegments: merged.merged,
           serverRevision: next.serverRevision,
-          hadLineConflicts: merged.conflicts.length > 0,
+          hadLineConflicts: false,
         };
       }
       if (!response.ok) return { ok: false, reason: `http-${response.status}`, status: response.status };
@@ -201,15 +209,24 @@ export function useEditorDocument({ jobId, enabled, request }) {
       if (remoteChanged && !sameContent) {
         const merged = mergeThreeWay(document?.segments || [], localSegments, body.segments || []);
         applyDocument(body);
+        if (merged.conflicts.length > 0) {
+          return {
+            ok: false,
+            reason: "conflict",
+            document: body,
+            serverSegments: body.segments || [],
+            localSegments,
+            conflicts: merged.conflicts,
+          };
+        }
         return {
           ok: true,
           document: body,
           sameContent: false,
-          // Preserve remote-only edits and let the current editor win only
-          // where both snapshots touched the same line.  This is an ordinary
-          // rebase, not a user-facing collaboration flow.
+          // Preserve independent remote-only edits. Same-line conflicts are
+          // deliberately returned above without an automatic retry.
           mergedSegments: merged.merged,
-          hadLineConflicts: merged.conflicts.length > 0,
+          hadLineConflicts: false,
         };
       }
       applyDocument(body);

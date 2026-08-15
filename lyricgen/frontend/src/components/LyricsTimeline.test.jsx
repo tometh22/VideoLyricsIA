@@ -134,8 +134,8 @@ describe("LyricsTimeline", () => {
       ],
       duration: 10,
     });
-    fireEvent.click(screen.getAllByRole("button", { name: "En cadena" })[0]);
-    expect(screen.getByTestId("timeline-ripple-warning")).toHaveTextContent("puede modificar varias líneas");
+    fireEvent.click(screen.getByRole("button", { name: "Más acciones" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: /Mover en cadena/ }));
 
     const block = screen.getAllByTestId("timeline-segment")[1];
     const body = block.querySelector('[data-testid="timeline-segment-body"]');
@@ -247,7 +247,7 @@ describe("LyricsTimeline", () => {
     fireEvent.pointerDown(body, { clientX: 100, pointerId: 1, button: 0 });
     fireEvent.pointerMove(body, { clientX: 119, pointerId: 1 });
     fireEvent.pointerUp(body, { clientX: 119, pointerId: 1 });
-    expect(props.onTimingChange).toHaveBeenCalledWith("short", expect.any(Number), expect.any(Number));
+    expect(props.onTimingChange).toHaveBeenCalledWith("short", expect.any(Number), expect.any(Number), expect.objectContaining({ operation: "move" }));
   });
 
   it("shows selection instructions and distinct move/resize cursors", () => {
@@ -299,7 +299,7 @@ describe("LyricsTimeline", () => {
     fireEvent.pointerDown(edge, { clientX: 1000, pointerId: 1, button: 0 });
     fireEvent.pointerMove(edge, { clientX: 1080, pointerId: 1 });
     fireEvent.pointerUp(edge, { clientX: 1080, pointerId: 1 });
-    expect(props.onTimingChange).toHaveBeenCalledWith(1, 10, expect.any(Number));
+    expect(props.onTimingChange).toHaveBeenCalledWith(1, 10, expect.any(Number), expect.objectContaining({ operation: "ripple_resize" }));
     expect(props.onTimingChange.mock.calls[0][2]).toBeGreaterThan(11);
   });
 
@@ -315,7 +315,7 @@ describe("LyricsTimeline", () => {
     expect(end).toBeCloseTo(11.1, 4);
   });
 
-  it("changes a packed neighbour only after chain mode is explicitly enabled", () => {
+  it("ripple-trims a packed neighbour by default without shortening it", () => {
     const props = setup({
       segments: [
         { _id: "a", start: 0, end: 2, text: "línea actual" },
@@ -329,19 +329,70 @@ describe("LyricsTimeline", () => {
     fireEvent.pointerMove(edge, { clientX: 124, pointerId: 1 });
     fireEvent.pointerUp(edge, { clientX: 124, pointerId: 1 });
     expect(props.onTimingChange).not.toHaveBeenCalled();
-    expect(props.onTimingChangeBatch).not.toHaveBeenCalled();
-    expect(screen.getByTestId("timeline-limit-feedback")).toHaveTextContent("Para no modificarla, el ajuste se detuvo");
-
-    fireEvent.click(screen.getAllByRole("button", { name: "En cadena" })[0]);
-    fireEvent.pointerDown(edge, { clientX: 100, pointerId: 2, button: 0 });
-    fireEvent.pointerMove(edge, { clientX: 124, pointerId: 2 });
-    fireEvent.pointerUp(edge, { clientX: 124, pointerId: 2 });
-
-    expect(props.onTimingChange).not.toHaveBeenCalled();
     expect(props.onTimingChangeBatch).toHaveBeenCalledWith([
       { id: "a", start: 0, end: 2.5 },
-      { id: "b", start: 2.55, end: 3.5 },
-    ], expect.objectContaining({ operation: "resize" }));
+      { id: "b", start: 2.55, end: 4 },
+    ], expect.objectContaining({ operation: "ripple_resize" }));
+  });
+
+  it("keeps the right edge safe when the operator chooses Solo esta línea", () => {
+    const props = setup({
+      segments: [
+        { _id: "a", start: 0, end: 2, text: "línea actual" },
+        { _id: "b", start: 2.05, end: 3.5, text: "línea siguiente" },
+      ],
+    });
+    fireEvent.click(screen.getAllByRole("button", { name: "Solo esta línea" })[0]);
+    const block = screen.getAllByTestId("timeline-segment")[0];
+    const edge = block.querySelector('[data-testid="timeline-edge-end"]');
+
+    fireEvent.pointerDown(edge, { clientX: 100, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(edge, { clientX: 124, pointerId: 1 });
+    fireEvent.pointerUp(edge, { clientX: 124, pointerId: 1 });
+
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+    expect(props.onTimingChangeBatch).not.toHaveBeenCalled();
+    expect(screen.getByTestId("timeline-limit-feedback")).toHaveTextContent("Para no modificarla, el ajuste se detuvo");
+  });
+
+  it("keeps the left edge protected even while right-edge ripple is the default", () => {
+    const props = setup({
+      segments: [
+        { _id: "a", start: 0, end: 2, text: "línea anterior" },
+        { _id: "b", start: 2.05, end: 4, text: "línea actual" },
+      ],
+    });
+    const block = screen.getAllByTestId("timeline-segment")[1];
+    const edge = block.querySelector('[data-testid="timeline-edge-start"]');
+
+    fireEvent.pointerDown(edge, { clientX: 100, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(edge, { clientX: 76, pointerId: 1 });
+    fireEvent.pointerUp(edge, { clientX: 76, pointerId: 1 });
+
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+    expect(props.onTimingChangeBatch).not.toHaveBeenCalled();
+    expect(screen.getByTestId("timeline-limit-feedback")).toHaveTextContent("Para no modificarla, el ajuste se detuvo");
+  });
+
+  it("cancels a visible ripple preview without committing a partial batch", () => {
+    const props = setup({
+      segments: [
+        { _id: "a", start: 0, end: 2, text: "línea actual" },
+        { _id: "b", start: 2.05, end: 3.5, text: "línea siguiente" },
+      ],
+    });
+    const block = screen.getAllByTestId("timeline-segment")[0];
+    const edge = block.querySelector('[data-testid="timeline-edge-end"]');
+
+    fireEvent.pointerDown(edge, { clientX: 100, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(edge, { clientX: 124, pointerId: 1 });
+    const previewNext = screen.getAllByTestId("timeline-segment")[1];
+    expect(parseFloat(previewNext.style.left)).toBeCloseTo(2.55 * 48, 4);
+    fireEvent.pointerCancel(edge, { clientX: 124, pointerId: 1 });
+
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+    expect(props.onTimingChangeBatch).not.toHaveBeenCalled();
+    expect(props.onDragStart).not.toHaveBeenCalled();
   });
 
   it("edits line text inline", () => {

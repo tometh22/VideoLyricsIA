@@ -673,7 +673,7 @@ export default function LyricsEditor({
   // text-edit posterior haya fallado → al apretar Aprobar perdía
   // changes. Ahora ambos autosaves actualizan saveStatus, y "error"
   // se muestra como chip rojo con botón Reintentar.
-  const [saveStatus, setSaveStatus] = useState("idle"); // idle|local|saving|saved|offline|error
+  const [saveStatus, setSaveStatus] = useState("idle"); // idle|local|saving|saved|offline|conflict|error
   // Motivo del último fallo de respaldo, para que el banner + el confirm de
   // "Aprobar" digan la CAUSA REAL en vez de "problema de red" siempre (el
   // copy honesto de PR A quedó hardcodeado a "red"; la causa real puede ser
@@ -682,6 +682,7 @@ export default function LyricsEditor({
   const [saveErrorReason, setSaveErrorReason] = useState(null);
   const [flushCounter, setFlushCounter] = useState(0);
   const [durableHydrated, setDurableHydrated] = useState(false);
+  const [durableConflict, setDurableConflict] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const editedRef = useRef(edited);
   editedRef.current = edited;
@@ -869,6 +870,7 @@ export default function LyricsEditor({
   const handleDurableStatus = useCallback((status, reason, metadata = {}) => {
     setSaveStatus(status);
     setSaveErrorReason(reason);
+    if (status === "conflict") setDurableConflict(true);
     if (status === "saved") {
       trackEditorEvent("editor_autosave_success", {
         duration_ms: Math.round(metadata.durationMs || 0),
@@ -898,9 +900,9 @@ export default function LyricsEditor({
     enabled: editorV2Enabled && durableHydrated && !durableEditor.loading,
     segments: durableSegments,
     dirty: isDirty,
-    // Revisions are reconciled and retried automatically. A stale write must
-    // never freeze the editor behind a collaboration modal.
-    blocked: false,
+    // Independent revision changes rebase transparently. A same-line 409 is
+    // preserved locally and never retried over the server version.
+    blocked: durableConflict,
     save: durableEditor.save,
     reconcile: durableEditor.reconcile,
     onStatus: handleDurableStatus,
@@ -922,6 +924,7 @@ export default function LyricsEditor({
     durableHydratedJobRef.current = transcribeJobId;
     let cancelled = false;
     const hydrate = async () => {
+      setDurableConflict(false);
       const remote = sanitizeSegments(durableEditor.document.segments || []);
       const remoteOriginal = sanitizeSegments(durableEditor.document.original_segments || remote);
       originalSegmentsRef.current = remoteOriginal;
@@ -995,7 +998,11 @@ export default function LyricsEditor({
                 const merged = mergeThreeWay(baseSegments, local, remote);
                 next = merged.merged;
                 markDirty = !segmentsEquivalent(next, remote);
-                if (markDirty) setSaveStatus("local");
+                if (markDirty && merged.conflicts.length) {
+                  setDurableConflict(true);
+                  setSaveStatus("conflict");
+                  setSaveErrorReason("conflict");
+                } else if (markDirty) setSaveStatus("local");
                 else localStorage.removeItem(draftKey);
               }
             }
@@ -1415,8 +1422,9 @@ export default function LyricsEditor({
   // A drag commits here. We stamp `locked: true` so the render
   // (pipeline._apply_display_timing) respects this manual end instead of
   // auto-extending it (hold-until-next). The undo snapshot is pushed by the
-  // timeline on pointerdown (onDragStart), so this only mutates `edited`.
-  const handleTimelineTimingChange = useCallback((id, newStart, newEnd) => {
+  // timeline only captures history after a drag actually commits, so pointer
+  // cancellation cannot create a phantom Undo entry.
+  const handleTimelineTimingChange = useCallback((id, newStart, newEnd, interaction = {}) => {
     setIsDirty(true);
     setEdited((prev) => prev.map((s) =>
       s._id === id ? { ...s, start: newStart, end: newEnd, locked: true } : s
@@ -1435,7 +1443,7 @@ export default function LyricsEditor({
     // the operator sees "Guardado" right after dropping a block — the
     // flush effect below reads the just-updated `edited` and persists.
     setFlushCounter((c) => c + 1);
-    trackEditorEvent("editor_timing_changed", { count: 1, operation: "resize_or_move" });
+    trackEditorEvent("editor_timing_changed", { count: 1, operation: interaction.operation || "resize_or_move" });
   }, [trackEditorEvent]);
 
   const handleTimelineTimingChangeBatch = useCallback((changes, interaction = {}) => {
@@ -1461,6 +1469,10 @@ export default function LyricsEditor({
       return next;
     }), 10000);
     setFlushCounter((c) => c + 1);
+    trackEditorEvent("editor_timing_changed", {
+      count: changes.length,
+      operation: interaction.operation || "batch",
+    });
     trackEditorEvent("editor_group_moved", {
       count: changes.length,
       delta_ms: deltaMs,
@@ -2576,6 +2588,10 @@ export default function LyricsEditor({
       toast({ message: "Descartá o recuperá manualmente el borrador local antes de aprobar.", tone: "error" });
       return;
     }
+    if (durableConflict || saveStatus === "conflict") {
+      toast({ message: "Hay un cambio en conflicto. Compará la última versión antes de aprobar; no sobrescribimos cambios ajenos.", tone: "error" });
+      return;
+    }
     // Aviso (no bloqueo) si el último autosave falló. IMPORTANTE — contrato
     // real verificado (incidente UMG 21-jul-2026): aprobar manda los
       // segments EN PANTALLA en el cuerpo del POST (onApprove(cleaned) acá;
@@ -2645,7 +2661,12 @@ export default function LyricsEditor({
       const cleanedForPersistence = sanitizeSegmentsForPersistence(cleaned);
       const saveResult = await flushDurableSave("manual", cleanedForPersistence);
       if (saveResult?.ok === false) {
-        toast({ message: "Tus cambios siguen en pantalla. Reintentamos el guardado automáticamente.", tone: "info" });
+        toast({
+          message: saveResult.reason === "conflict"
+            ? "Hay un cambio en conflicto. Tus cambios siguen en pantalla y no sobrescribimos la versión guardada."
+            : "Tus cambios siguen en pantalla. Reintentamos el guardado automáticamente.",
+          tone: "info",
+        });
         return;
       }
       let approvalResult = null;
@@ -2668,7 +2689,14 @@ export default function LyricsEditor({
         // and retry with the newly-created version. No modal is needed and
         // every retry still goes through the backend revision check.
         const reconciled = await durableEditor.reconcile(persistenceSnapshot);
-        if (!reconciled?.ok) break;
+        if (!reconciled?.ok) {
+          if (reconciled?.reason === "conflict") {
+            setDurableConflict(true);
+            setSaveStatus("conflict");
+            setSaveErrorReason("conflict");
+          }
+          break;
+        }
         if (Array.isArray(reconciled.mergedSegments)) {
           persistenceSnapshot = sanitizeSegmentsForPersistence(reconciled.mergedSegments);
           approvalSegments = persistenceSnapshot.map(({ _id, ...rest }) => rest);
@@ -2815,7 +2843,7 @@ export default function LyricsEditor({
     saving: "Guardando…",
     saved: "Guardado",
     offline: "Sin conexión",
-    conflict: "Guardado",
+    conflict: "Cambio en conflicto",
     error: "No se pudo guardar",
   }[saveStatus] || "Cambios locales";
   const collaboratingUser = editorV2Enabled
@@ -3032,20 +3060,24 @@ export default function LyricsEditor({
           del audio bar lo hace imposible de perder.
           (Timeline view ya tiene el chip embedded en su header,
           LyricsTimeline.jsx:354+) */}
-      {["error", "offline"].includes(saveStatus) && (
+      {["error", "offline", "conflict"].includes(saveStatus) && (
         <div className="mb-3 rounded-card px-4 py-3 flex items-center gap-3 animate-fade-in ring-1 bg-red-500/10 ring-red-500/30">
           <svg className="w-4 h-4 shrink-0 text-red-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zM12 15.75h.01" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
           <div className="flex-1 min-w-0">
             <p className="text-[12px] text-red-300 font-medium">
-              {(_SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server).short}
+              {saveStatus === "conflict"
+                ? t("editor.save_conflict_short", "Hay un cambio en conflicto. Tus cambios siguen en esta pestaña y no sobrescribimos la versión guardada.")
+                : (_SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server).short}
             </p>
             <p className="text-[10px] text-red-300/70 mt-0.5">
-              {(_SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server).detail}
+              {saveStatus === "conflict"
+                ? t("editor.save_conflict_detail", "Recargá para comparar la última versión antes de decidir qué conservar.")
+                : (_SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server).detail}
             </p>
           </div>
-          <div className="flex shrink-0 gap-2">
+          {saveStatus !== "conflict" && <div className="flex shrink-0 gap-2">
             {saveErrorReason === "draft-corrupt" ? (
               <button
                 type="button"
@@ -3068,7 +3100,7 @@ export default function LyricsEditor({
                 Reintentar
               </button>
             )}
-          </div>
+          </div>}
         </div>
       )}
 

@@ -63,14 +63,14 @@ describe("useEditorDocument save ordering", () => {
     expect(request).toHaveBeenCalledWith("/editor/historical-job");
   });
 
-  it("rebases a stale PATCH locally instead of exposing a conflict state", async () => {
+  it("rebases an independent stale PATCH and retries it against the new revision", async () => {
     const patchBodies = [];
     const request = vi.fn(async (path, options = {}) => {
       if (path === "/editor/job-2" && !options.method) {
         return reply({
           job_id: "job-2", revision: 1,
-          segments: [{ start: 0, end: 1, text: "base" }],
-          original_segments: [{ start: 0, end: 1, text: "base" }],
+          segments: [{ segment_id: "base", start: 0, end: 1, text: "base" }],
+          original_segments: [{ segment_id: "base", start: 0, end: 1, text: "base" }],
           lock: { active: false },
         });
       }
@@ -82,7 +82,10 @@ describe("useEditorDocument save ordering", () => {
           return reply({
             detail: "editor_revision_conflict",
             server_revision: 2,
-            server_segments: [{ start: 0, end: 1, text: "remote" }],
+            server_segments: [
+              { segment_id: "base", start: 0, end: 1, text: "base" },
+              { segment_id: "remote", start: 2, end: 3, text: "remote" },
+            ],
           }, 409);
         }
         return reply({ revision: 3, version_id: "v3", saved_at: "2026-08-06T10:00:03Z" });
@@ -96,7 +99,7 @@ describe("useEditorDocument save ordering", () => {
 
     let rebased;
     await act(async () => {
-      rebased = await result.current.save([{ start: 0, end: 1, text: "local" }], "manual");
+      rebased = await result.current.save([{ segment_id: "base", start: 0, end: 1, text: "base" }], "manual");
     });
     expect(rebased).toMatchObject({ ok: false, reason: "merged", serverRevision: 2 });
     expect(result.current.conflict).toBeUndefined();
@@ -105,7 +108,45 @@ describe("useEditorDocument save ordering", () => {
       await result.current.save(rebased.mergedSegments, "manual");
     });
     expect(patchBodies[1].base_revision).toBe(2);
-    expect(patchBodies[1].segments[0].text).toBe("local");
+    expect(patchBodies[1].segments).toEqual(expect.arrayContaining([
+      expect.objectContaining({ text: "remote" }),
+    ]));
+  });
+
+  it("preserves a same-line 409 locally without returning a retryable merge", async () => {
+    const request = vi.fn(async (path, options = {}) => {
+      if (path === "/editor/job-conflict" && !options.method) {
+        return reply({
+          job_id: "job-conflict", revision: 1,
+          segments: [{ segment_id: "line", start: 0, end: 1, text: "base" }],
+          lock: { active: false },
+        });
+      }
+      if (path.endsWith("/lock/heartbeat")) return reply({ acquired: true });
+      if (path.endsWith("/lock") && options.method === "DELETE") return reply({ released: true });
+      if (path === "/editor/job-conflict" && options.method === "PATCH") {
+        return reply({
+          detail: "editor_revision_conflict",
+          server_revision: 2,
+          server_segments: [{ segment_id: "line", start: 0, end: 1, text: "remote" }],
+        }, 409);
+      }
+      return reply({}, 404);
+    });
+    const { result } = renderHook(() => useEditorDocument({
+      jobId: "job-conflict", enabled: true, request,
+    }));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    let saved;
+    await act(async () => {
+      saved = await result.current.save([
+        { segment_id: "line", start: 0, end: 1, text: "local" },
+      ], "manual");
+    });
+    expect(saved).toMatchObject({ ok: false, reason: "conflict", serverRevision: 2 });
+    expect(saved.mergedSegments).toBeUndefined();
+    expect(request.mock.calls.filter(([path, options]) => path === "/editor/job-conflict" && options?.method === "PATCH")).toHaveLength(1);
   });
 
   it("ignora una lectura atrasada y no retrocede la revisión CAS", async () => {
