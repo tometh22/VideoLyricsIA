@@ -324,14 +324,21 @@ _EN_STOP = frozenset(
 
 
 def guess_text_lang(lines: list[str]) -> str:
-    """'es' / 'en' / 'unknown' by function-word voting. Pure."""
+    """'es' / 'en' / 'unknown' by exclusive function-word voting.
+
+    Shared words (notably ``no`` and ``me``) are not language evidence.
+    Counting them for both sides made Spanish live choruses with repeated
+    ``no`` look ambiguous and disabled CTC before any acoustic work.
+    """
     es = en = 0
     for line in lines:
         for w in line.lower().split():
             w = re.sub(r"[^a-záéíóúñü']", "", w)
-            if w in _ES_STOP:
+            in_es = w in _ES_STOP
+            in_en = w in _EN_STOP
+            if in_es and not in_en:
                 es += 1
-            if w in _EN_STOP:
+            elif in_en and not in_es:
                 en += 1
     total = es + en
     if total < 5:
@@ -697,7 +704,6 @@ def _load_model():
     global _MODEL
     if _MODEL is not None:
         return _MODEL
-    import torch
     from transformers import AutoModelForCTC, Wav2Vec2CTCTokenizer
 
     t0 = time.time()
