@@ -776,6 +776,233 @@ def _emissions(model, wav, blank_id: int, star_delta: float):
     return torch.cat(pieces)
 
 
+def align_structural_window(audio_path: str, texts: list[str], start: float,
+                            end: float, job_id: str = "") -> Optional[dict]:
+    """Text-conditioned CTC alignment for a bounded repeated motif.
+
+    Unlike :func:`retime_segments`, this entry point intentionally permits a
+    short repeated motif.  It is safe only as one witness in the structural
+    hybrid: cardinality must come from an independent model, and callers must
+    compare this result with a second audio representation plus acoustic
+    topology before changing rows.  It never invents or changes text.
+    """
+    try:
+        if not is_enabled() or not audio_path or not os.path.exists(audio_path):
+            return None
+        clean = [str(text or "").strip() for text in (texts or [])]
+        if not 2 <= len(clean) <= 8 or any(not text for text in clean):
+            return None
+        start, end = float(start), float(end)
+        duration = end - start
+        if not (0.0 <= start < end and 2.0 <= duration <= 45.0):
+            return None
+
+        import torch
+        import torchaudio
+        import torchaudio.functional as AF
+
+        model, dictionary, blank_id = _load_model()
+        star_id = model.config.vocab_size
+        word_sep_id = (
+            dictionary.get("|")
+            if os.environ.get("CTC_ALIGN_WORD_SEP", "1").strip().lower() in _TRUE
+            else None
+        )
+        targets, words = build_targets(
+            clean, dictionary, star_id, word_sep_id=word_sep_id,
+        )
+        real_tokens = sum(count for line, _raw, count in words if line >= 0)
+        characters = sum(len(norm_word(word)) for text in clean for word in text.split()) or 1
+        if real_tokens / characters < 0.60:
+            return None
+
+        info = torchaudio.info(audio_path)
+        source_sr = info.sample_rate or SR
+        offset = max(0, int(start * source_sr))
+        frames = max(1, int(duration * source_sr))
+        wav, sr = torchaudio.load(audio_path, frame_offset=offset, num_frames=frames)
+        wav = wav.mean(0, keepdim=True)
+        if sr != SR:
+            wav = torchaudio.functional.resample(wav, sr, SR)
+        if wav.shape[1] < 2 * SR or len(targets) >= wav.shape[1] // FRAME:
+            return None
+
+        emission = _emissions(model, wav, blank_id, _star_delta())
+        aligned, scores = AF.forced_align(
+            emission.unsqueeze(0),
+            torch.tensor(targets, dtype=torch.int32).unsqueeze(0),
+            blank=blank_id,
+        )
+        token_spans = AF.merge_tokens(
+            aligned[0], scores[0].exp(), blank=blank_id,
+        )
+        spans = [(span.start, span.end, float(span.score)) for span in token_spans]
+        line_times = spans_to_lines(spans, words, len(clean), FRAME / SR)
+        if any(line is None for line in line_times):
+            return None
+
+        events = []
+        line_scores = []
+        previous_end = start
+        for text, line in zip(clean, line_times):
+            local_start, local_end, word_spans = line
+            if not word_spans:
+                return None
+            absolute_start = start + local_start
+            absolute_end = start + local_end
+            score = sum(word[3] for word in word_spans) / len(word_spans)
+            if absolute_end <= absolute_start or absolute_start < previous_end - 0.20:
+                return None
+            previous_end = absolute_end
+            line_scores.append(score)
+            events.append({
+                "start": round(absolute_start, 3),
+                "end": round(absolute_end, 3),
+                "text": text,
+                "ctc_score": round(float(score), 4),
+                "words": [
+                    {
+                        "word": word,
+                        "start": round(start + word_start, 3),
+                        "end": round(start + word_end, 3),
+                        "score": round(float(word_score), 4),
+                    }
+                    for word, word_start, word_end, word_score in word_spans
+                ],
+            })
+        median_score = sorted(line_scores)[len(line_scores) // 2]
+        return {
+            "events": events,
+            "median_score": round(float(median_score), 4),
+            "min_score": round(float(min(line_scores)), 4),
+            "window": [round(start, 3), round(end, 3)],
+        }
+    except Exception as exc:
+        logger.warning(
+            "[CTC-STRUCTURAL] decline on error: %s (job=%s)", exc, job_id,
+        )
+        return None
+
+
+def align_structural_anchors(audio_path: str, texts: list[str],
+                             anchors: list[float], start: float, end: float,
+                             job_id: str = "") -> Optional[dict]:
+    """Score one text per acoustic cycle in independently bounded slots.
+
+    The slots prevent repeated identical text from consuming an earlier cycle
+    in the window.  Anchors come from waveform topology, never ASR timestamps.
+    Returned starts are still CTC-derived inside each slot.
+    """
+    try:
+        if not is_enabled() or not audio_path or not os.path.exists(audio_path):
+            return None
+        clean = [str(text or "").strip() for text in (texts or [])]
+        points = [float(value) for value in (anchors or [])]
+        if not 2 <= len(clean) == len(points) <= 8:
+            return None
+        if any(not text for text in clean) or any(
+            right <= left for left, right in zip(points, points[1:])
+        ):
+            return None
+        start, end = float(start), float(end)
+        if points[0] < start - 0.5 or points[-1] > end + 0.5:
+            return None
+
+        import torch
+        import torchaudio
+        import torchaudio.functional as AF
+
+        model, dictionary, blank_id = _load_model()
+        star_id = model.config.vocab_size
+        word_sep_id = (
+            dictionary.get("|")
+            if os.environ.get("CTC_ALIGN_WORD_SEP", "1").strip().lower() in _TRUE
+            else None
+        )
+        info = torchaudio.info(audio_path)
+        source_sr = info.sample_rate or SR
+        offset = max(0, int(start * source_sr))
+        frames = max(1, int((end - start) * source_sr))
+        wav, sr = torchaudio.load(audio_path, frame_offset=offset, num_frames=frames)
+        wav = wav.mean(0, keepdim=True)
+        if sr != SR:
+            wav = torchaudio.functional.resample(wav, sr, SR)
+        emission = _emissions(model, wav, blank_id, _star_delta())
+        frame_to_s = FRAME / SR
+        median_gap = float(sorted(
+            right - left for left, right in zip(points, points[1:])
+        )[max(0, (len(points) - 2) // 2)])
+        events, line_scores = [], []
+        for index, (text, anchor) in enumerate(zip(clean, points)):
+            slot_start = max(start, anchor - min(0.55, median_gap * 0.10))
+            if index + 1 < len(points):
+                slot_end = min(end, points[index + 1] - 0.18)
+            else:
+                slot_end = min(end, anchor + max(2.0, median_gap * 0.82))
+            if slot_end - slot_start < 1.0:
+                return None
+            lo = max(0, int((slot_start - start) / frame_to_s))
+            hi = min(len(emission), int((slot_end - start) / frame_to_s))
+            local = emission[lo:hi]
+            targets, words = build_targets(
+                [text], dictionary, star_id, word_sep_id=word_sep_id,
+            )
+            if len(targets) >= len(local):
+                return None
+            aligned, scores = AF.forced_align(
+                local.unsqueeze(0),
+                torch.tensor(targets, dtype=torch.int32).unsqueeze(0),
+                blank=blank_id,
+            )
+            token_spans = AF.merge_tokens(
+                aligned[0], scores[0].exp(), blank=blank_id,
+            )
+            spans = [(span.start, span.end, float(span.score)) for span in token_spans]
+            (line,) = spans_to_lines(spans, words, 1, frame_to_s)
+            if line is None or not line[2]:
+                return None
+            local_start, local_end, word_spans = line
+            absolute_start = slot_start + local_start
+            absolute_end = slot_start + local_end
+            score = sum(word[3] for word in word_spans) / len(word_spans)
+            line_scores.append(score)
+            events.append({
+                "start": round(absolute_start, 3),
+                "end": round(absolute_end, 3),
+                "text": text,
+                "ctc_score": round(float(score), 4),
+                "anchor": round(anchor, 3),
+                "words": [
+                    {
+                        "word": word,
+                        "start": round(slot_start + word_start, 3),
+                        "end": round(slot_start + word_end, 3),
+                        "score": round(float(word_score), 4),
+                    }
+                    for word, word_start, word_end, word_score in word_spans
+                ],
+            })
+        ordered = all(
+            right["start"] >= left["end"] - 0.20
+            for left, right in zip(events, events[1:])
+        )
+        if not ordered:
+            return None
+        return {
+            "events": events,
+            "median_score": round(float(sorted(line_scores)[len(line_scores) // 2]), 4),
+            "min_score": round(float(min(line_scores)), 4),
+            "mean_score": round(float(sum(line_scores) / len(line_scores)), 4),
+            "window": [round(start, 3), round(end, 3)],
+        }
+    except Exception as exc:
+        logger.warning(
+            "[CTC-STRUCTURAL-ANCHOR] decline on error: %s (job=%s)",
+            exc, job_id,
+        )
+        return None
+
+
 # Why the last retime_segments call declined ("structural" | "other" | "").
 # The wrapper composes on it: structural mismatch → try the performance
 # libretto (performance_text) and retry. Workers process one job at a time

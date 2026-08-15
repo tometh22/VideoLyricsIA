@@ -327,10 +327,66 @@ def _event_supported(group: list[dict], support_words: list[dict]) -> bool:
     return bool(tokens.intersection(_word_tokens(_text(support))))
 
 
+def _gemini_cycles(events: list[dict], motif: str) -> list[dict]:
+    """Collapse ``motif, ad-lib, ad-lib`` event streams into full cycles.
+
+    Gemini sometimes obeys the complete-cycle prompt and sometimes emits the
+    vocalizations as separate events.  The opening token comes from the
+    already-flagged structural rows; neither repeat count nor wording comes
+    from catalogue metadata.
+    """
+    vocal = sorted(
+        (
+            dict(event) for event in (events or [])
+            if isinstance(event, dict)
+            and event.get("kind") in {"sung", "vocalization"}
+            and str(event.get("text") or "").strip()
+        ),
+        key=lambda event: _f(event.get("start")),
+    )
+    anchors = [
+        index for index, event in enumerate(vocal)
+        if (_word_tokens(str(event.get("text") or "")) or [""])[0] == motif
+    ]
+    if not 2 <= len(anchors) <= 8:
+        return []
+    complete_lengths = [
+        anchors[position + 1] - index
+        for position, index in enumerate(anchors[:-1])
+    ]
+    typical_parts = sorted(complete_lengths)[len(complete_lengths) // 2]
+    if not 1 <= typical_parts <= 5:
+        return []
+    cycles = []
+    for position, index in enumerate(anchors):
+        next_index = anchors[position + 1] if position + 1 < len(anchors) else len(vocal)
+        # The tail may contain a separate "no"/crowd response after the last
+        # repeated cycle.  Give the last cycle the cardinality learned from
+        # the preceding complete cycles instead of swallowing every trailing
+        # vocal event in the bounded clip.
+        stop = min(next_index, index + typical_parts)
+        parts = vocal[index:stop]
+        if len(parts) != typical_parts:
+            return []
+        text = " ".join(str(part.get("text") or "").strip() for part in parts).strip()
+        cycles.append({
+            "start": _f(parts[0].get("start")),
+            "end": max(_f(part.get("end")) for part in parts),
+            "text": text,
+            "kind": "sung",
+        })
+    canonical = str(cycles[0].get("text") or "")
+    if any(_similarity(canonical, str(cycle.get("text") or "")) < 0.60
+           for cycle in cycles[1:]):
+        return []
+    return cycles
+
+
 def _repair_structural_repetition(
     segments: list[dict], slowed_words: list[dict], gemini_events: list[dict],
     support_words: list[dict], *, window_start: float, window_end: float,
-    enforce: bool,
+    enforce: bool, hybrid_enabled: bool = False,
+    hybrid_fn=None, stem_path: str = "", mix_path: str = "", job_id: str = "",
 ) -> tuple[list[dict], dict]:
     """Replace a malformed repeated motif only with two-model cardinality.
 
@@ -342,7 +398,8 @@ def _repair_structural_repetition(
     stats = {
         "attempted": False, "applied": False, "suggested": False,
         "reason": "no_structural_targets", "events": 0,
-        "targets_removed": 0,
+        "targets_removed": 0, "hybrid_attempted": False,
+        "hybrid_accepted": False,
     }
     targets = [
         (index, segment)
@@ -369,67 +426,112 @@ def _repair_structural_repetition(
         if group and (_word_tokens(_text(group)) or [""])[0] == motif
         and _safe_line(group)
     ]
-    gemini = [
-        event for event in gemini_events
-        if (_word_tokens(str(event.get("text") or "")) or [""])[0] == motif
-        and event.get("kind") in {"sung", "vocalization"}
-    ]
-    if not (2 <= len(slow_groups) == len(gemini) <= 8):
+    gemini = _gemini_cycles(gemini_events, motif)
+
+    candidate_events = []
+    hybrid_verified = False
+    if hybrid_enabled:
+        stats["hybrid_attempted"] = True
+        if not gemini or not stem_path or not mix_path:
+            stats["reason"] = "hybrid_missing_evidence"
+            return segments, stats
+        if hybrid_fn is None:
+            from structural_hybrid import verify as hybrid_fn
+        verdict = hybrid_fn(
+            stem_path, mix_path, gemini,
+            window_start=window_start, window_end=window_end, job_id=job_id,
+        ) or {}
+        stats["hybrid"] = verdict
+        if not verdict.get("accepted"):
+            stats["reason"] = f"hybrid_{verdict.get('reason') or 'declined'}"
+            return segments, stats
+        candidate_events = [dict(event) for event in (verdict.get("events") or [])]
+        if len(candidate_events) != len(gemini):
+            stats["reason"] = "hybrid_cardinality_disagreement"
+            return segments, stats
+        hybrid_verified = True
+        stats["hybrid_accepted"] = True
+    elif not (2 <= len(slow_groups) == len(gemini) <= 8):
         stats["reason"] = "cardinality_disagreement"
         return segments, stats
 
-    accepted: list[tuple[list[dict], dict]] = []
-    gemini_pos = 0
-    for group in slow_groups:
-        group_text = _text(group)
-        matched = None
-        while gemini_pos < len(gemini):
-            event = gemini[gemini_pos]
-            gemini_pos += 1
-            left = _word_tokens(group_text)
-            right = _word_tokens(str(event.get("text") or ""))
-            similarity = _similarity(group_text, str(event.get("text") or ""))
-            threshold = 0.92 if max(len(left), len(right)) <= 3 else 0.82
-            onset_ok = abs(
-                _f(group[0].get("start")) - _f(event.get("start"))
-            ) <= 0.75
-            short_exact = max(len(left), len(right)) <= 3 and left == right
-            if onset_ok and (short_exact or similarity >= threshold):
-                matched = event
-                break
-        if matched is None or not _event_supported(group, support_words):
-            stats["reason"] = "event_disagreement"
-            return segments, stats
-        accepted.append((group, matched))
+    if not hybrid_verified:
+        accepted: list[tuple[list[dict], dict]] = []
+        gemini_pos = 0
+        for group in slow_groups:
+            group_text = _text(group)
+            matched = None
+            while gemini_pos < len(gemini):
+                event = gemini[gemini_pos]
+                gemini_pos += 1
+                left = _word_tokens(group_text)
+                right = _word_tokens(str(event.get("text") or ""))
+                similarity = _similarity(group_text, str(event.get("text") or ""))
+                threshold = 0.92 if max(len(left), len(right)) <= 3 else 0.82
+                onset_ok = abs(
+                    _f(group[0].get("start")) - _f(event.get("start"))
+                ) <= 0.75
+                short_exact = max(len(left), len(right)) <= 3 and left == right
+                if onset_ok and (short_exact or similarity >= threshold):
+                    matched = event
+                    break
+            if matched is None or not _event_supported(group, support_words):
+                stats["reason"] = "event_disagreement"
+                return segments, stats
+            accepted.append((group, matched))
 
-    candidate_events = []
-    previous_end = None
-    for group, event in accepted:
-        start = _f(group[0].get("start"))
-        end = _f(group[-1].get("end"))
-        if not (
-            math.isfinite(start) and math.isfinite(end) and end > start
-            and window_start - 0.75 <= start <= window_end + 0.75
-            and window_start - 0.75 <= end <= window_end + 0.75
-            and (previous_end is None or start >= previous_end - 0.20)
-        ):
-            stats["reason"] = "invalid_event_timing"
-            return segments, stats
-        previous_end = end
-        candidate_events.append({
-            "start": round(start, 3), "end": round(end, 3),
-            "text": str(event.get("text") or _text(group)).strip(),
-            "words": [dict(word) for word in group],
-            "review": True,
-            "consensus_reprocessed": True,
-            "consensus_sources": ["slowed_stem_whisper_1", "gemini_audio"],
-            "structural_repair": True,
-        })
+        previous_end = None
+        for group, event in accepted:
+            start = _f(group[0].get("start"))
+            end = _f(group[-1].get("end"))
+            if not (
+                math.isfinite(start) and math.isfinite(end) and end > start
+                and window_start - 0.75 <= start <= window_end + 0.75
+                and window_start - 0.75 <= end <= window_end + 0.75
+                and (previous_end is None or start >= previous_end - 0.20)
+            ):
+                stats["reason"] = "invalid_event_timing"
+                return segments, stats
+            previous_end = end
+            candidate_events.append({
+                "start": round(start, 3), "end": round(end, 3),
+                "text": str(event.get("text") or _text(group)).strip(),
+                "words": [dict(word) for word in group],
+                "review": True,
+                "consensus_reprocessed": True,
+                "consensus_sources": ["slowed_stem_whisper_1", "gemini_audio"],
+                "structural_repair": True,
+            })
 
     # Patch only individually corroborated rows. An unmatched existing event
     # is ambiguous, not disproven; deleting it would turn model absence into
     # evidence. Extra verified events may be inserted only where they do not
     # overlap any retained row.
+    if hybrid_verified:
+        target_indices = {index for index, _segment in targets}
+        candidate = [
+            dict(segment) for index, segment in enumerate(segments or [])
+            if index not in target_indices
+        ]
+        if any(
+            not _non_overlapping(event["start"], event["end"], candidate)
+            for event in candidate_events
+        ):
+            stats["reason"] = "hybrid_retained_overlap"
+            return segments, stats
+        candidate.extend(candidate_events)
+        candidate.sort(key=lambda segment: _f(segment.get("start")))
+        stats.update({
+            "suggested": True, "reason": "hybrid_verified",
+            "events": len(candidate_events),
+            "targets_removed": len(target_indices),
+            "events_inserted": len(candidate_events),
+        })
+        if not enforce:
+            return segments, stats
+        stats["applied"] = True
+        return candidate, stats
+
     candidate = [dict(segment) for segment in (segments or [])]
     available_targets = {index for index, _segment in targets}
     matched_targets: set[int] = set()
@@ -512,7 +614,8 @@ def _env_float(name: str, default: float) -> float:
 def reprocess(result: dict, audio_path: str, windows: list[dict], *,
               language: str = "", job_id: str = "",
               transcribe_fn=None, gemini_fn=None,
-              stem_path: str | None = None) -> tuple[dict, dict]:
+              stem_path: str | None = None,
+              hybrid_fn=None) -> tuple[dict, dict]:
     """Apply a cost-capped consensus pass.  Never raises."""
     owned_stem = None
     stats = {
@@ -524,6 +627,8 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         "slowed_asr_calls": 0, "slowed_audio_seconds": 0.0,
         "gemini_calls": 0, "gemini_audio_seconds": 0.0,
         "structural_repairs": 0, "structural_events": 0,
+        "structural_hybrid_attempts": 0, "structural_hybrid_accepts": 0,
+        "structural_hybrid_declined": [],
     }
     if not isinstance(result, dict) or not windows or not audio_path:
         stats["declined"].append("no_windows")
@@ -589,6 +694,10 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         )
         structural_autorepair_enabled = (
             os.environ.get("TARGETED_STRUCTURAL_AUTOREPAIR_ENABLED", "0")
+            .strip().lower() in _TRUE
+        )
+        structural_hybrid_enabled = (
+            os.environ.get("TARGETED_ACOUSTIC_CTC_ENABLED", "0")
             .strip().lower() in _TRUE
         )
         if gemini_fn is None:
@@ -719,7 +828,8 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
 
             if (
                 "live_structural_disagreement" in reasons
-                and slow_enabled and needs_gemini
+                and needs_gemini
+                and (slow_enabled or structural_hybrid_enabled)
             ):
                 repaired, repair_stats = _repair_structural_repetition(
                     segments, slowed_words, gemini_events,
@@ -728,7 +838,28 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                     enforce=(
                         allow_insertions and structural_autorepair_enabled
                     ),
+                    hybrid_enabled=structural_hybrid_enabled,
+                    hybrid_fn=hybrid_fn,
+                    stem_path=stem_path,
+                    mix_path=audio_path,
+                    job_id=job_id,
                 )
+                if repair_stats.get("hybrid_attempted"):
+                    stats["structural_hybrid_attempts"] += 1
+                if repair_stats.get("hybrid_accepted"):
+                    stats["structural_hybrid_accepts"] += 1
+                elif repair_stats.get("hybrid_attempted"):
+                    reason = str(repair_stats.get("reason") or "declined")[:120]
+                    stats["structural_hybrid_declined"].append(reason)
+                if repair_stats.get("hybrid_attempted"):
+                    logger.info(
+                        "[STRUCTURAL-HYBRID] job=%s window=%.2f-%.2f "
+                        "accepted=%s reason=%s events=%s",
+                        job_id, start, start + duration,
+                        bool(repair_stats.get("hybrid_accepted")),
+                        repair_stats.get("reason"),
+                        repair_stats.get("events", 0),
+                    )
                 if repair_stats.get("suggested"):
                     stats["lines_suggested"] += repair_stats.get("events", 0)
                 if repair_stats.get("applied"):
