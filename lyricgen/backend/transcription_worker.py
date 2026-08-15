@@ -367,6 +367,7 @@ def run_transcription_job(
     # corre otros queues. asyncio.run abre/cierra su propio event loop por job,
     # que es lo que queremos (jobs independientes, sin event-loop leak).
     from main import (  # type: ignore
+        _validate_audio_file_on_disk,
         _looks_live, _maybe_anchor_align, _maybe_ctc_retime,
         _maybe_adlib_filter, _maybe_chorus_snap, _maybe_gap_rescue,
         _maybe_phrase_segment, _maybe_repetition_reconcile,
@@ -381,7 +382,12 @@ def run_transcription_job(
 
     # 1. Status flip a "transcribing" para que el polling lo vea ya en marcha.
     try:
-        update_job(job_id, status="transcribing", current_step="transcribing")
+        update_job(
+            job_id,
+            status="transcribing",
+            current_step="transcribe.prepare",
+            progress=2,
+        )
     except Exception as e:
         logger.warning("[TRANSCRIBE-WORKER] failed to flip status: %s", e)
 
@@ -406,6 +412,16 @@ def run_transcription_job(
         os.makedirs(os.path.dirname(audio_path), exist_ok=True)
         if not storage.download_object(input_r2_key, audio_path):
             return _fail(job_id, "No pudimos leer el archivo subido. Reintentá en unos segundos.")
+
+    # The async worker is the first process that materializes the R2 object.
+    # Validate here instead of downloading once in API and once again here.
+    # A corrupt upload is persisted as transcription_failed and the existing
+    # polling UI exposes the retryable error to the operator.
+    try:
+        _validate_audio_file_on_disk(filename, audio_path)
+    except Exception as exc:
+        detail = getattr(exc, "detail", None) or str(exc)
+        return _fail(job_id, f"Archivo de audio inválido: {str(detail)[:200]}")
 
     # 3. Llamar al pipeline async existente. `request` y `current_user` son
     #    ignorados dentro del cuerpo (verified) — passing None es seguro.

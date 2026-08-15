@@ -4036,12 +4036,14 @@ async def transcribe_uploaded(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Promote an awaiting_upload job to transcribed_pending, downloading
-    the audio from R2 to local disk for Whisper / lrclib lookup.
+    """Promote an awaiting_upload job into the transcription flow.
 
-    Returns the same shape as the legacy /transcribe (segments,
-    reference_lyrics, plus job_id) so the frontend's editor flow
-    plugs in unchanged.
+    The default async path only verifies stored size and enqueues; ShortWorker
+    owns R2 materialization and validation. The legacy synchronous fallback
+    still downloads locally because the API process consumes the audio.
+
+    Returns the legacy /transcribe payload in sync mode. Async returns the
+    queued job id and the frontend polls for the editor payload.
     """
     from jobs import get_job_model
     job_row = get_job_model(db, body.job_id)
@@ -4107,55 +4109,35 @@ async def transcribe_uploaded(
         "ASYNC_TRANSCRIBE_ENABLED", "1"
     ).strip().lower() not in ("0", "false", "no", "off")
 
-    # Materialize the audio onto local disk for Whisper / ffmpeg / etc.
-    # En el path async, esto sigue siendo necesario porque el handler valida
-    # el archivo (corrupt detection) antes de enqueue — fail-fast en el
-    # request, no en el worker (que daría error opaco al usuario via polling).
+    # Build the destination path once and pass it to the worker. API and
+    # ShortWorker do not share a filesystem on Railway, so materializing the
+    # object in the API container before enqueue only makes R2 transfer the
+    # same file twice. In the 03e2cb7f7321 incident that redundant download
+    # held this request for 249 s while the wizard sat at 0%; the worker then
+    # downloaded the WAV again and completed normally in 35 s.
     job_id = body.job_id
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
     audio_path = os.path.join(job_dir, _row_filename)
 
-    if not os.path.exists(audio_path):
-        import asyncio as _asyncio
-        # Size gate against the REAL stored object before pulling it to
-        # local disk. The single-PUT path never passes through
-        # /upload-multipart-complete, so a client that under-declared
-        # size_bytes in /upload-url could otherwise land an arbitrarily
-        # large object and have us download it whole (disk + Whisper).
-        _real_size = storage.head_object_size(_r2_key)
-        if _real_size is not None and _real_size > MAX_UPLOAD_MB * 1024 * 1024:
-            logger.warning(
-                "[UPLOAD] 413 at transcribe: job=%s key=%s real=%.1f MB > %d MB "
-                "tenant=%s user=%s",
-                body.job_id, _r2_key, _real_size / 1048576,
-                MAX_UPLOAD_MB, current_user["tenant_id"], current_user["id"],
-            )
-            raise HTTPException(
-                status_code=413,
-                detail=f"File too large ({_real_size / 1048576:.1f} MB). "
-                       f"Max allowed: {MAX_UPLOAD_MB} MB.",
-            )
-        _loop = _asyncio.get_event_loop()
-        for _attempt in range(5):
-            # boto3 es síncrono: correrlo inline dentro de este handler
-            # async bloqueaba el event loop de uvicorn el tiempo entero
-            # de la descarga (segundos con un WAV de 150 MB) y un batch
-            # de 5 serializaba TODA la API. Mismo patrón executor que
-            # /upload-part-proxy.
-            _ok = await _loop.run_in_executor(
-                None, storage.download_object, _r2_key, audio_path,
-            )
-            if _ok:
-                break
-            if _attempt < 4:
-                await _asyncio.sleep(0.5 * (2 ** _attempt))
-        else:
-            raise HTTPException(
-                status_code=502,
-                detail="No pudimos leer el archivo subido. Reintentá en unos segundos.",
-            )
-    _validate_audio_file_on_disk(_row_filename, audio_path)
+    # Size gate against the REAL stored object before enqueue/download. The
+    # single-PUT path never passes through /upload-multipart-complete, so a
+    # client that under-declared size_bytes could otherwise land an
+    # arbitrarily large object. HEAD is intentionally the only R2 operation
+    # on the async request path; the worker owns download + header validation.
+    import asyncio as _asyncio
+    _real_size = await _asyncio.to_thread(storage.head_object_size, _r2_key)
+    if _real_size is not None and _real_size > MAX_UPLOAD_MB * 1024 * 1024:
+        logger.warning(
+            "[UPLOAD] 413 at transcribe: job=%s key=%s real=%.1f MB > %d MB "
+            "tenant=%s user=%s",
+            body.job_id, _r2_key, _real_size / 1048576,
+            MAX_UPLOAD_MB, current_user["tenant_id"], current_user["id"],
+        )
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({_real_size / 1048576:.1f} MB). "
+                   f"Max allowed: {MAX_UPLOAD_MB} MB.",
+        )
 
     if _async_enabled:
         # Async path — enqueue + 202 + status polling.
@@ -4168,7 +4150,12 @@ async def transcribe_uploaded(
             if _row2 is None:
                 raise HTTPException(status_code=404, detail="Job not found.")
             _row2.status = "transcribing_queued"
-            _row2.current_step = "transcribing"
+            # Publish a frontend-recognised stage before enqueue. The wizard
+            # used to sit at an unexplained 0% throughout the API-side R2
+            # transfer; now enqueue is immediate and even a slow worker-side
+            # download is represented as audio preparation.
+            _row2.current_step = "transcribe.prepare"
+            _row2.progress = 1
             # Reset the reaper clock. find_stuck_transcriptions anchors on
             # coalesce(last_progress_at, created_at) with a 120-min threshold
             # (reaper.py). A retried `transcription_failed` job has an OLD
@@ -4215,6 +4202,27 @@ async def transcribe_uploaded(
         }
 
     # Legacy sync path (fallback con ASYNC_TRANSCRIBE_ENABLED=0).
+    # Unlike the async path this process consumes the file itself, therefore
+    # it must still materialize and validate it before entering Whisper.
+    os.makedirs(job_dir, exist_ok=True)
+    if not os.path.exists(audio_path):
+        _loop = _asyncio.get_event_loop()
+        for _attempt in range(5):
+            # boto3 is synchronous; keep it off the uvicorn event loop.
+            _ok = await _loop.run_in_executor(
+                None, storage.download_object, _r2_key, audio_path,
+            )
+            if _ok:
+                break
+            if _attempt < 4:
+                await _asyncio.sleep(0.5 * (2 ** _attempt))
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail="No pudimos leer el archivo subido. Reintentá en unos segundos.",
+            )
+    _validate_audio_file_on_disk(_row_filename, audio_path)
+
     transcription_lease = _try_acquire_transcription_slot()
     try:
         # Reuse the existing Whisper / lrclib machinery from the legacy
