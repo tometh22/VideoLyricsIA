@@ -5288,21 +5288,76 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
             _transcribe_window, _stem, 0.0, float(dur or 600.0),
             language, job_id, provenance_step="live_independent_verify",
         )
+        _witness_source = "stem"
+        _provider_attempts = 1
+        _submitted_audio_seconds = float(dur or 0.0)
         _raw_witness_words = len(witness)
-        if _live_verify and witness:
+
+        def _sanitize_live_witness(_words):
             # A whole-song blind Whisper pass can emit training-data credits
             # over instrumental breaks. They are not independent evidence of
             # singing and must not manufacture unsafe windows.
             from gap_rescue import _agrupar_en_lineas
             from pipeline import _is_whisper_hallucination
-            witness = [
+            return [
                 word
-                for group in _agrupar_en_lineas(witness)
+                for group in _agrupar_en_lineas(_words or [])
                 if not _is_whisper_hallucination(
                     " ".join(str(w.get("word") or "") for w in group)
                 )
                 for word in group
             ]
+        if _live_verify:
+            witness = _sanitize_live_witness(witness)
+
+        # Vocal isolation is often decisive, but some live stems damage the
+        # very consonants we need to adjudicate (Los Pericos: Hoy/Muy and
+        # alejaste/alejas). If the blind stem witness has poor physical/text
+        # agreement, make one bounded blind pass on the original mix and keep
+        # whichever witness is objectively less inconsistent. No prompt or
+        # catalogue is sent to either call.
+        _mix_fallback_enabled = (
+            os.environ.get("LIVE_INDEPENDENT_MIX_FALLBACK_ENABLED", "1")
+            .strip().lower() in ("1", "true", "yes", "on")
+        )
+        if _live_verify and _mix_fallback_enabled:
+            try:
+                from audio_coverage import (
+                    audio_coverage as _witness_coverage,
+                    text_mismatches as _witness_mismatches,
+                )
+
+                def _witness_rank(_words):
+                    return (
+                        len(_witness_mismatches(segs, _words)),
+                        -float(_witness_coverage(segs, _words)),
+                    )
+
+                _stem_rank = _witness_rank(witness)
+                _poor_stem = _stem_rank[0] >= 2 or -_stem_rank[1] < 0.70
+                _can_afford_mix = (
+                    _submitted_audio_seconds + float(dur or 0.0)
+                    <= _job_asr_budget
+                )
+                if _poor_stem and _can_afford_mix:
+                    _mix_raw = await asyncio.to_thread(
+                        _transcribe_window, audio_path, 0.0,
+                        float(dur or 600.0), language, job_id,
+                        provenance_step="live_independent_verify_mix",
+                    )
+                    _provider_attempts += 1
+                    _submitted_audio_seconds += float(dur or 0.0)
+                    _mix_witness = _sanitize_live_witness(_mix_raw)
+                    _mix_rank = _witness_rank(_mix_witness)
+                    if _mix_rank < _stem_rank:
+                        witness = _mix_witness
+                        _raw_witness_words = len(_mix_raw)
+                        _witness_source = "mix"
+            except Exception as _mix_exc:
+                logger.warning(
+                    "[WORD-VOTE] mix witness fallback declined: %r job=%s",
+                    _mix_exc, job_id,
+                )
         # In live verification mode this witness may apply only a pre-existing
         # primary-ASR + catalogue proposal, making the decision three-way.
         # Observe mode remains non-mutating; enforce mode applies verified
@@ -5345,9 +5400,14 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
         stats["witness_words_filtered"] = max(
             0, _raw_witness_words - len(witness),
         )
-        stats["provider_attempts"] = 1
-        stats["submitted_audio_seconds"] = round(float(dur or 0.0), 2)
-        stats["audio_seconds_billed"] = round(float(dur or 0.0), 2)
+        stats["witness_source"] = _witness_source
+        stats["provider_attempts"] = _provider_attempts
+        stats["submitted_audio_seconds"] = round(
+            _submitted_audio_seconds, 2,
+        )
+        stats["audio_seconds_billed"] = round(
+            _submitted_audio_seconds, 2,
+        )
         if stats.get("lines_changed"):
             result["segments"] = nuevo
             logger.info(

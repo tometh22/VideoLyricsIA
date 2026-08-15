@@ -189,3 +189,46 @@ def test_repeated_live_vocalization_is_not_filtered_as_training_credit(
     ))
     assert len(out["_independent_asr_words"]) == 10
     assert out["postpass_stats"]["word_vote"]["witness_words_filtered"] == 0
+
+
+def test_poor_stem_witness_falls_back_to_better_blind_mix(
+        tmp_path, monkeypatch):
+    audio = tmp_path / "mix.wav"
+    stem = tmp_path / "stem.wav"
+    audio.write_bytes(b"mix")
+    stem.write_bytes(b"stem")
+    good = [
+        {"word": word, "start": i * 0.35, "end": i * 0.35 + 0.25}
+        for i, word in enumerate(
+            "Hoy temprano estuve pensando en vos con calma".split()
+        )
+    ]
+    bad = [
+        {"word": f"junk{i}", "start": 8 + i * 0.3,
+         "end": 8 + i * 0.3 + 0.2}
+        for i in range(10)
+    ]
+    monkeypatch.setenv("LIVE_INDEPENDENT_VERIFY_ENABLED", "1")
+    monkeypatch.setenv("LIVE_INDEPENDENT_MIX_FALLBACK_ENABLED", "1")
+    monkeypatch.setenv("TRANSCRIPTION_QUALITY_MODE", "enforce")
+    monkeypatch.setattr(vocal_sep, "separate_vocals", lambda *_a, **_k: str(stem))
+    monkeypatch.setattr(pipeline, "_audio_duration", lambda *_a: 12.0)
+
+    def transcribe(path, *_args, **_kwargs):
+        return good if path == str(audio) else bad
+
+    monkeypatch.setattr(gap_rescue, "_transcribe_window", transcribe)
+    result = {"segments": [{
+        "start": 0.0, "end": 3.0,
+        "text": "Muy temprano estuve pensando en vos con calma",
+        "live_lexical_suggestion":
+            "Hoy temprano estuve pensando en vos con calma",
+    }]}
+    out = asyncio.run(main._maybe_word_vote(
+        result, str(audio), "job", "es", live_hint=True,
+    ))
+    assert out["segments"][0]["text"].startswith("Hoy temprano")
+    stats = out["postpass_stats"]["word_vote"]
+    assert stats["witness_source"] == "mix"
+    assert stats["provider_attempts"] == 2
+    assert stats["audio_seconds_billed"] == 24.0

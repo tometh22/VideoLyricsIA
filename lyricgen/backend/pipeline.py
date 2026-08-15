@@ -2428,6 +2428,11 @@ _WHISPER_HALLUCINATION_PHRASES = [
     "subtitles by",
     "subtitulado por",
     "transcripcion por",
+    # Seen in the Los Pericos live canary after the formatter. This is a
+    # subtitle/film credit emitted over the instrumental outro, never sung.
+    # Keep the signature specific so a real lyric containing "CC" is not
+    # rejected generically.
+    "cc por antarctica films argentina",
 ]
 
 # Patterns where the punctuation IS the signal — folding them would

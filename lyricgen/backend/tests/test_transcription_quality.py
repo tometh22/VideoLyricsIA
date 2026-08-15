@@ -183,6 +183,22 @@ def test_independent_witness_adds_missing_lyric_windows(monkeypatch):
     assert windows[0]["reasons"] == ["independent_uncovered_asr"]
 
 
+def test_live_structural_disagreement_opens_contextual_retry_window(monkeypatch):
+    monkeypatch.setattr("audio_coverage.text_mismatches", lambda *_: [])
+    monkeypatch.setattr("audio_coverage.uncovered_spans", lambda *_: [])
+    windows = tq.build_unsafe_windows(
+        [_segment(62, 67, "Real")], [],
+        structural_disagreements=[{
+            "index": 0, "start": 62, "end": 67,
+            "suggestion": "Real, wow wow",
+        }],
+    )
+    assert len(windows) == 1
+    assert windows[0]["start"] == 55.5
+    assert windows[0]["end"] == 83.5
+    assert windows[0]["reasons"] == ["live_structural_disagreement"]
+
+
 def test_unverified_live_lexical_substitution_is_blocking():
     quality = tq.evaluate(
         [_segment(1, 2)], {

@@ -21,12 +21,14 @@ _PIPELINE_CONFIG_KEYS = (
     "WHISPER_REFERENCE_PROMPT_MODE", "LRCLIB_PLAIN_ALIGNER_ENABLED",
     "TARGETED_CONSENSUS_ENABLED", "TRANSCRIPTION_QUALITY_MODE",
     "LIVE_LEXICAL_CONSENSUS_ENABLED", "LIVE_INDEPENDENT_VERIFY_ENABLED",
-    "TARGETED_SLOW_STEM_ENABLED",
+    "TARGETED_SLOW_STEM_ENABLED", "TARGETED_GEMINI_VERIFY_ENABLED",
+    "TARGETED_STRUCTURAL_AUTOREPAIR_ENABLED",
     "TARGETED_SLOW_STEM_SPEED", "TARGETED_CONSENSUS_MAX_WINDOWS",
     "TARGETED_CONSENSUS_MAX_BILLED_SECONDS",
     "TARGETED_CONSENSUS_MAX_CLIP_SECONDS",
     "TARGETED_CONSENSUS_DEADLINE_SECONDS",
     "LIVE_INDEPENDENT_VERIFY_MAX_SECONDS", "LIVE_ASR_MAX_BILLED_SECONDS",
+    "LIVE_INDEPENDENT_MIX_FALLBACK_ENABLED",
 )
 
 
@@ -136,7 +138,8 @@ def _merge_windows(windows: list[dict], *, pad_s: float = 1.5) -> list[dict]:
 def build_unsafe_windows(segments: list[dict], words: list[dict], *,
                          voiced_gaps: list[dict] | None = None,
                          independent_words: list[dict] | None = None,
-                         lexical_unverified: list[dict] | None = None) -> list[dict]:
+                         lexical_unverified: list[dict] | None = None,
+                         structural_disagreements: list[dict] | None = None) -> list[dict]:
     """Locate bounded areas worth a second, independent ASR pass."""
     from audio_coverage import text_mismatches, uncovered_spans
 
@@ -162,6 +165,16 @@ def build_unsafe_windows(segments: list[dict], words: list[dict], *,
         windows.append({
             "start": item.get("start"), "end": item.get("end"),
             "reason": "live_lexical_unverified",
+            "segment_index": item.get("index"),
+        })
+    for item in structural_disagreements or []:
+        # Structural disagreements need enough context to hear a repeated
+        # refrain as a unit. The catalogue is only a trigger; replacement
+        # still requires independent acoustic agreement downstream.
+        windows.append({
+            "start": max(0.0, _f(item.get("start")) - 5.0),
+            "end": _f(item.get("end")) + 15.0,
+            "reason": "live_structural_disagreement",
             "segment_index": item.get("index"),
         })
     for start, end, _count in uncovered_spans(segments, words):

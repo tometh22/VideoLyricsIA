@@ -747,6 +747,11 @@ def test_real_lyrics_with_amara_verb_not_flagged():
     assert not _is_whisper_hallucination("Como si nadie nunca amara así")
 
 
+def test_pericos_outro_credit_is_hallucination_but_real_cc_text_is_not():
+    assert _is_whisper_hallucination("CC por Antarctica Films Argentina.")
+    assert not _is_whisper_hallucination("CC, vení conmigo esta noche")
+
+
 def test_real_lyrics_with_word_music_not_flagged():
     # Folding "[music]" → "music" would flag every lyric containing the
     # word; the bracket patterns must stay literal.
@@ -789,4 +794,3 @@ def test_fetch_lrclib_strips_complex_lrc_timestamps():
         result = _fetch_lrclib("X", "Y")
     plain_lines = [l for l in result["plain"].splitlines() if l.strip()]
     assert plain_lines == ["Coro repetido", "Verso con milis"]
-
