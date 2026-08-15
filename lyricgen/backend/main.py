@@ -4268,8 +4268,11 @@ async def transcribe_uploaded(
         _result = _maybe_repetition_reconcile(_result, job_id)
         _result = await _maybe_gap_rescue(_result, audio_path, job_id,
                                           _post_lang)
-        _result = await _maybe_word_vote(_result, audio_path, job_id,
-                                         _post_lang)
+        _result = await _maybe_word_vote(
+            _result, audio_path, job_id, _post_lang,
+            live_hint=bool(getattr(body, "live", False))
+            or _looks_live(_row_title, _row_filename),
+        )
         _result = _maybe_chorus_snap(_result, job_id)
         _result = _maybe_phrase_segment(_result, job_id)
         from lyrics_format import format_lyrics_pass as _fmt
@@ -4996,8 +4999,10 @@ async def transcribe_endpoint(
     _result = _maybe_repetition_reconcile(_result, job_id)
     _result = await _maybe_gap_rescue(_result, audio_path, job_id,
                                       _post_lang)
-    _result = await _maybe_word_vote(_result, audio_path, job_id,
-                                     _post_lang)
+    _result = await _maybe_word_vote(
+        _result, audio_path, job_id, _post_lang,
+        live_hint=_looks_live(title, file.filename),
+    )
     _result = _maybe_chorus_snap(_result, job_id)
     _result = _maybe_phrase_segment(_result, job_id)
     from lyrics_format import format_lyrics_pass as _fmt
@@ -5184,7 +5189,8 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
 
 
 async def _maybe_word_vote(result, audio_path: str, job_id: str,
-                           language: str | None = None):
+                           language: str | None = None, *,
+                           live_hint: bool = False):
     """Post-pass gateado (WORD_VOTE_ENABLED, default off): el audio corrige
     a la referencia palabra por palabra, la referencia aporta la ortografía.
 
@@ -5202,10 +5208,16 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
     _stem = None
     try:
         import word_vote as _wv
-        if not _wv.is_enabled():
+        _live_verify = bool(
+            live_hint
+            and os.environ.get("LIVE_INDEPENDENT_VERIFY_ENABLED", "0")
+            .strip().lower() in ("1", "true", "yes", "on")
+        )
+        if not (_wv.is_enabled() or _live_verify):
             return result
         segs = result.get("segments") or []
-        if len(segs) < 3 or not audio_path or not os.path.exists(audio_path):
+        if ((len(segs) < 3 and not _live_verify)
+                or not segs or not audio_path or not os.path.exists(audio_path)):
             return result
         import vocal_sep as _vs
         _stem = await asyncio.wait_for(
@@ -5219,14 +5231,124 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
             return result
         from pipeline import _audio_duration
         dur = await asyncio.to_thread(_audio_duration, audio_path)
+        try:
+            import math as _math
+            _duration_valid = (
+                _math.isfinite(float(dur)) and float(dur) > 0.0
+            )
+        except (TypeError, ValueError):
+            _duration_valid = False
+        if _live_verify and not _duration_valid:
+            result = dict(result)
+            result.setdefault("postpass_stats", {})["word_vote"] = {
+                "substitutions": 0, "insertions": 0, "lines_changed": 0,
+                "independent_verifier": True,
+                "declined": ["duration_unavailable"],
+                "audio_seconds_billed": 0.0,
+            }
+            logger.warning(
+                "[WORD-VOTE] live witness declined: invalid duration=%r job=%s",
+                dur, job_id,
+            )
+            return result
+        try:
+            _max_verify_s = min(
+                600.0,
+                max(30.0, float(os.environ.get(
+                    "LIVE_INDEPENDENT_VERIFY_MAX_SECONDS", "480",
+                ))),
+            )
+        except (TypeError, ValueError):
+            _max_verify_s = 480.0
+        try:
+            _job_asr_budget = min(
+                600.0,
+                max(30.0, float(os.environ.get(
+                    "LIVE_ASR_MAX_BILLED_SECONDS", "600",
+                ))),
+            )
+        except (TypeError, ValueError):
+            _job_asr_budget = 600.0
+        _max_verify_s = min(_max_verify_s, _job_asr_budget)
+        if _live_verify and float(dur or 0.0) > _max_verify_s:
+            result = dict(result)
+            result.setdefault("postpass_stats", {})["word_vote"] = {
+                "substitutions": 0, "insertions": 0, "lines_changed": 0,
+                "independent_verifier": True,
+                "declined": ["duration_budget"],
+                "audio_seconds_billed": 0.0,
+            }
+            logger.warning(
+                "[WORD-VOTE] live witness declined: duration %.1fs > %.1fs job=%s",
+                float(dur or 0.0), _max_verify_s, job_id,
+            )
+            return result
         from gap_rescue import _transcribe_window
         witness = await asyncio.to_thread(
             _transcribe_window, _stem, 0.0, float(dur or 600.0),
-            language,
+            language, job_id, provenance_step="live_independent_verify",
         )
-        nuevo, stats = _wv.vote(segs, witness)
+        _raw_witness_words = len(witness)
+        if _live_verify and witness:
+            # A whole-song blind Whisper pass can emit training-data credits
+            # over instrumental breaks. They are not independent evidence of
+            # singing and must not manufacture unsafe windows.
+            from gap_rescue import _agrupar_en_lineas
+            from pipeline import _is_whisper_hallucination
+            witness = [
+                word
+                for group in _agrupar_en_lineas(witness)
+                if not _is_whisper_hallucination(
+                    " ".join(str(w.get("word") or "") for w in group)
+                )
+                for word in group
+            ]
+        # In live verification mode this witness may apply only a pre-existing
+        # primary-ASR + catalogue proposal, making the decision three-way.
+        # Observe mode remains non-mutating; enforce mode applies verified
+        # proposals and the final gate rechecks the exact resulting payload.
+        if _live_verify:
+            from live_lexical_consensus import apply_verified_proposals
+            _verified_candidate, _lexical_stats = apply_verified_proposals(
+                segs, witness,
+            )
+            _apply_verified = (
+                os.environ.get("TRANSCRIPTION_QUALITY_MODE", "observe")
+                .strip().lower() == "enforce"
+            )
+            nuevo = _verified_candidate if _apply_verified else segs
+            stats = {
+                "substitutions": (
+                    _lexical_stats["applied"] if _apply_verified else 0
+                ),
+                "insertions": 0, "lines_changed": 0,
+                "declined": [], "verification_only": True,
+                "live_lexical": _lexical_stats,
+                "lines_suggested": (
+                    0 if _apply_verified else _lexical_stats["applied"]
+                ),
+            }
+            stats["lines_changed"] = (
+                _lexical_stats["applied"] if _apply_verified else 0
+            )
+        else:
+            nuevo, stats = _wv.vote(segs, witness)
+        result = dict(result)
+        if _live_verify:
+            # Internal transport only: the quality finalizer compares
+            # delivered text against this independent Whisper-1 witness, then
+            # strips it. Studio WORD_VOTE keeps its pre-existing behavior and
+            # does not silently opt into the new live quality policy.
+            result["_independent_asr_words"] = witness
+        stats["independent_verifier"] = _live_verify
+        stats["witness_words"] = len(witness)
+        stats["witness_words_filtered"] = max(
+            0, _raw_witness_words - len(witness),
+        )
+        stats["provider_attempts"] = 1
+        stats["submitted_audio_seconds"] = round(float(dur or 0.0), 2)
+        stats["audio_seconds_billed"] = round(float(dur or 0.0), 2)
         if stats.get("lines_changed"):
-            result = dict(result)
             result["segments"] = nuevo
             logger.info(
                 "[WORD-VOTE] %d sustitución(es) + %d inserción(es) en %d "
@@ -5905,7 +6027,21 @@ async def _postprocess_live_whisperx(
         os.environ.get("GAP_RESCUE_ENABLED", "").strip().lower() in _truthy
     )
     _gap_enabled = _gap_enabled and not _worker_gap_owner
-    if not (_segment_enabled or _gap_enabled):
+    _lexical_requested = (
+        os.environ.get("LIVE_LEXICAL_CONSENSUS_ENABLED", "0")
+        .strip().lower() in _truthy
+    )
+    _lexical_enabled = bool(
+        _lexical_requested
+        and os.environ.get("LIVE_INDEPENDENT_VERIFY_ENABLED", "0")
+        .strip().lower() in _truthy
+    )
+    if _lexical_requested and not _lexical_enabled:
+        logger.warning(
+            "[WC] live lexical consensus disabled: independent verifier "
+            "must be enabled too",
+        )
+    if not (_segment_enabled or _gap_enabled or _lexical_enabled):
         return segments
 
     from pipeline import _llm_segment_words, _recover_gap_lyrics
@@ -5936,6 +6072,19 @@ async def _postprocess_live_whisperx(
         except Exception as exc:
             logger.warning(
                 "[WC] live gap recovery declined unexpectedly: %r", exc,
+            )
+    # The audio still owns every row and timestamp.  Catalogue text can only
+    # repair a small number of 1:1 spelling tokens; it cannot add, delete,
+    # split or reorder anything in a live performance.
+    if _lexical_enabled and canonical:
+        try:
+            from live_lexical_consensus import propose_segments
+            candidate, _stats = propose_segments(processed, canonical)
+            if candidate:
+                processed = candidate
+        except Exception as exc:
+            logger.warning(
+                "[WC] live lexical consensus declined unexpectedly: %r", exc,
             )
     return processed
 

@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from difflib import SequenceMatcher
 import logging
+import math
 import os
+import subprocess
+import tempfile
 import time
 import unicodedata
 
@@ -61,34 +64,86 @@ def _words_in(words: list[dict], start: float, end: float, pad: float = 0.35) ->
 
 
 def choose_consensus(stem_words: list[dict], mix_words: list[dict],
-                     primary_words: list[dict], *, threshold: float = 0.72):
+                     primary_words: list[dict], *,
+                     slowed_words: list[dict] | None = None,
+                     witness_words: list[dict] | None = None,
+                     threshold: float = 0.72):
     """Return the agreed word stream and evidence, or ``(None, ...)``.
 
-    Stem participation is mandatory.  This prevents two noisy full-mix
-    streams from voting a backing-instrument hallucination into the lyrics.
+    Isolated-vocal participation (normal or slowed) is mandatory. This
+    prevents two noisy full-mix streams from voting backing-instrument
+    hallucinations into the lyrics.
     """
-    streams = {"stem": stem_words, "mix": mix_words, "primary": primary_words}
+    streams = {
+        "stem": stem_words, "slowed_stem": slowed_words or [],
+        "mix": mix_words, "primary": primary_words,
+        "witness": witness_words or [],
+    }
     texts = {name: _text(words) for name, words in streams.items()}
     eligible = {
         name: text for name, text in texts.items()
         if len(_norm(text).split()) >= 2
     }
+    # An isolated-vocal candidate (normal OR slowed) must agree exactly with
+    # an independent representation (mix or primary provider). Agreement
+    # between normal+slowed stems alone is useful evidence but never enough to
+    # alter content: both came from the same source/model family.
     best = None
-    for other in ("mix", "primary"):
-        if "stem" not in eligible or other not in eligible:
-            continue
-        # Global fuzzy similarity is unsafe for lyrics: "hoy"/"muy" and
-        # "lejos"/"cerca" can score >0.8 in a long line while changing the
-        # meaning. Every token must agree before content can be accepted.
-        similarity = 1.0 if _norm(eligible["stem"]) == _norm(eligible[other]) else 0.0
-        if best is None or similarity > best[0]:
-            best = (similarity, other)
+    for isolated in ("stem", "slowed_stem"):
+        for independent in ("primary", "witness", "mix"):
+            if isolated not in eligible or independent not in eligible:
+                continue
+            similarity = (
+                1.0
+                if _norm(eligible[isolated]) == _norm(eligible[independent])
+                else 0.0
+            )
+            candidate = (similarity, isolated, independent)
+            if best is None or similarity > best[0]:
+                best = candidate
     evidence = {"texts": texts, "agreement": round(best[0], 3) if best else 0.0}
     if not best or best[0] < threshold:
         return None, evidence
-    # Stem timestamps are preferred because instrumental energy is absent.
-    evidence["sources"] = ["stem", best[1]]
-    return stem_words, evidence
+    evidence["sources"] = [best[1], best[2]]
+    return streams[best[1]], evidence
+
+
+def _transcribe_slowed_window(stem_path: str, start: float, duration: float,
+                              speed: float, language: str | None, job_id: str,
+                              transcribe_fn) -> list[dict]:
+    """ASR a pitch-preserving slowed clip and map words to original time."""
+    fd, clip = tempfile.mkstemp(prefix="genly_slow_stem_", suffix=".wav")
+    os.close(fd)
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-ss", str(start), "-t", str(duration),
+                "-i", stem_path, "-filter:a", f"atempo={speed:.4f}",
+                "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+                "-loglevel", "error", clip,
+            ],
+            check=True, timeout=90,
+        )
+        slowed_duration = duration / speed
+        words = transcribe_fn(
+            clip, 0.0, slowed_duration, language or None, job_id or None,
+        )
+        mapped = []
+        for word in words or []:
+            try:
+                mapped.append({
+                    **dict(word),
+                    "start": round(start + _f(word.get("start")) * speed, 3),
+                    "end": round(start + _f(word.get("end")) * speed, 3),
+                })
+            except (TypeError, ValueError):
+                continue
+        return mapped
+    finally:
+        try:
+            os.unlink(clip)
+        except OSError:
+            pass
 
 
 def _physical_line(words: list[dict]) -> bool:
@@ -133,12 +188,14 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
               language: str = "", job_id: str = "",
               transcribe_fn=None, stem_path: str | None = None) -> tuple[dict, dict]:
     """Apply a cost-capped consensus pass.  Never raises."""
+    owned_stem = None
     stats = {
         "attempted": False, "windows_considered": len(windows or []),
         "windows_processed": 0, "asr_calls": 0, "audio_seconds_billed": 0.0,
         "lines_replaced": 0, "lines_inserted": 0, "truncated_windows": 0,
         "lines_suggested": 0, "provider_attempts": 0,
         "submitted_audio_seconds": 0.0, "declined": [],
+        "slowed_asr_calls": 0, "slowed_audio_seconds": 0.0,
     }
     if not isinstance(result, dict) or not windows or not audio_path:
         stats["declined"].append("no_windows")
@@ -154,6 +211,7 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         if not stem_path:
             import vocal_sep
             stem_path = vocal_sep.separate_vocals(audio_path, cache_only=True)
+            owned_stem = stem_path
         if not stem_path:
             stats["declined"].append("no_stem")
             return result, stats
@@ -161,9 +219,25 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         # Environment values may tune downward but can never remove the hard
         # operational ceiling.
         max_windows = min(4, _env_int("TARGETED_CONSENSUS_MAX_WINDOWS", 3))
-        max_billed_s = min(180.0, _env_float("TARGETED_CONSENSUS_MAX_BILLED_SECONDS", 120.0))
+        configured_billed_s = min(
+            180.0,
+            _env_float("TARGETED_CONSENSUS_MAX_BILLED_SECONDS", 120.0),
+        )
+        job_asr_budget = min(
+            600.0, _env_float("LIVE_ASR_MAX_BILLED_SECONDS", 600.0),
+        )
+        prior_billed_s = _f(
+            ((result.get("postpass_stats") or {}).get("word_vote") or {})
+            .get("audio_seconds_billed")
+        )
+        max_billed_s = min(
+            configured_billed_s, max(0.0, job_asr_budget - prior_billed_s),
+        )
+        stats["job_asr_budget_seconds"] = job_asr_budget
+        stats["prior_audio_seconds_billed"] = round(prior_billed_s, 2)
         max_clip_s = min(45.0, _env_float("TARGETED_CONSENSUS_MAX_CLIP_SECONDS", 40.0))
         primary = result.get("_asr_words") or []
+        independent_witness = result.get("_independent_asr_words") or []
         segments = [dict(s) for s in (result.get("segments") or [])]
         stats["attempted"] = True
         started_at = time.monotonic()
@@ -174,8 +248,20 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
             os.environ.get("TRANSCRIPTION_QUALITY_MODE", "observe").strip().lower()
             == "enforce"
         )
+        slow_enabled = (
+            os.environ.get("TARGETED_SLOW_STEM_ENABLED", "0")
+            .strip().lower() in _TRUE
+        )
+        slow_speed = min(
+            0.95, max(0.80, _env_float("TARGETED_SLOW_STEM_SPEED", 0.88))
+        )
 
-        priority = {"voiced_gap": 0, "uncovered_asr": 1, "text_mismatch": 2}
+        priority = {
+            "voiced_gap": 0, "uncovered_asr": 1,
+            "independent_uncovered_asr": 1,
+            "live_lexical_unverified": 2,
+            "independent_text_mismatch": 3, "text_mismatch": 4,
+        }
         ordered_windows = sorted(
             windows,
             key=lambda item: min(
@@ -192,7 +278,9 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
             if end - start > max_clip_s:
                 stats["truncated_windows"] += 1
                 stats["declined"].append("window_truncated")
-            if duration <= 0 or stats["audio_seconds_billed"] + 2 * duration > max_billed_s:
+            slow_duration = duration / slow_speed if slow_enabled else 0.0
+            window_cost = 2 * duration + slow_duration
+            if duration <= 0 or stats["audio_seconds_billed"] + window_cost > max_billed_s:
                 stats["declined"].append("cost_budget")
                 break
             stats["asr_calls"] += 1
@@ -201,6 +289,39 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                 stats["submitted_audio_seconds"] + duration, 2
             )
             stem_words = transcribe_fn(stem_path, start, duration, language or None, job_id or None)
+            stats["audio_seconds_billed"] = round(
+                stats["audio_seconds_billed"] + duration, 2
+            )
+            slowed_words = []
+            if slow_enabled:
+                stats["asr_calls"] += 1
+                stats["provider_attempts"] += 1
+                stats["slowed_asr_calls"] += 1
+                stats["submitted_audio_seconds"] = round(
+                    stats["submitted_audio_seconds"] + slow_duration, 2
+                )
+                try:
+                    slowed_words = _transcribe_slowed_window(
+                        stem_path, start, duration, slow_speed,
+                        language, job_id, transcribe_fn,
+                    )
+                    stats["slowed_audio_seconds"] = round(
+                        stats["slowed_audio_seconds"] + slow_duration, 2
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[TARGETED-CONSENSUS] slowed stem declined: %r job=%s",
+                        exc, job_id,
+                    )
+                    stats["declined"].append(
+                        f"slowed_exception:{type(exc).__name__}"
+                    )
+                finally:
+                    # Conservative accounting: once the variant is submitted,
+                    # count its full clip even if the provider returns no words.
+                    stats["audio_seconds_billed"] = round(
+                        stats["audio_seconds_billed"] + slow_duration, 2
+                    )
             if time.monotonic() - started_at >= hard_deadline_s:
                 stats["declined"].append("stage_deadline_after_stem")
                 break
@@ -212,7 +333,7 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
             mix_words = transcribe_fn(audio_path, start, duration, language or None, job_id or None)
             stats["windows_processed"] += 1
             stats["audio_seconds_billed"] = round(
-                stats["audio_seconds_billed"] + 2 * duration, 2
+                stats["audio_seconds_billed"] + duration, 2
             )
 
             target_indices = [
@@ -225,7 +346,11 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                 sw = _words_in(stem_words, a, b)
                 mw = _words_in(mix_words, a, b)
                 pw = _words_in(primary, a, b)
-                agreed, evidence = choose_consensus(sw, mw, pw)
+                iw = _words_in(independent_witness, a, b)
+                sloww = _words_in(slowed_words, a, b)
+                agreed, evidence = choose_consensus(
+                    sw, mw, pw, slowed_words=sloww, witness_words=iw,
+                )
                 if not agreed or not _safe_line(agreed):
                     continue
                 candidate = _text(agreed)
@@ -245,28 +370,72 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
             # No target index means a genuine uncovered/voiced gap.  Insert
             # only stem lines independently corroborated by the mix.
             reasons = set(window.get("reasons") or [])
-            if reasons & {"uncovered_asr", "voiced_gap"}:
+            if reasons & {
+                "uncovered_asr", "independent_uncovered_asr", "voiced_gap",
+            }:
                 from gap_rescue import _agrupar_en_lineas
-                for group in _agrupar_en_lineas(stem_words):
+                isolated_groups = [
+                    ("stem", group)
+                    for group in _agrupar_en_lineas(stem_words)
+                ] + [
+                    ("slowed_stem", group)
+                    for group in _agrupar_en_lineas(slowed_words)
+                ]
+                seen_groups = set()
+                for isolated_source, group in isolated_groups:
                     if not _safe_line(group):
                         continue
                     a, b = _f(group[0].get("start")), _f(group[-1].get("end"))
-                    mix_group = _words_in(mix_words, a, b, pad=0.6)
-                    agreed, _evidence = choose_consensus(group, mix_group, [])
-                    if not agreed or not _non_overlapping(a, b, segments):
+                    group_key = (round(a, 1), round(b, 1), _norm(_text(group)))
+                    if group_key in seen_groups:
                         continue
-                    if not allow_insertions:
+                    seen_groups.add(group_key)
+                    mix_group = _words_in(mix_words, a, b, pad=0.6)
+                    primary_group = _words_in(primary, a, b, pad=0.6)
+                    witness_group = _words_in(
+                        independent_witness, a, b, pad=0.6,
+                    )
+                    slow_group = _words_in(slowed_words, a, b, pad=0.6)
+                    normal_group = _words_in(stem_words, a, b, pad=0.6)
+                    is_slow_group = isolated_source == "slowed_stem"
+                    agreed, _evidence = choose_consensus(
+                        normal_group if is_slow_group else group,
+                        mix_group, primary_group,
+                        slowed_words=group if is_slow_group else slow_group,
+                        witness_words=witness_group,
+                    )
+                    if not agreed:
+                        continue
+                    agreed_a = _f(agreed[0].get("start"))
+                    agreed_b = _f(agreed[-1].get("end"))
+                    if not (
+                        math.isfinite(agreed_a) and math.isfinite(agreed_b)
+                        and agreed_b > agreed_a
+                        and start - 0.75 <= agreed_a <= end + 0.75
+                        and start - 0.75 <= agreed_b <= end + 0.75
+                    ):
+                        stats["declined"].append("invalid_agreed_timing")
+                        continue
+                    if not _non_overlapping(agreed_a, agreed_b, segments):
+                        continue
+                    sources = set(_evidence.get("sources") or [])
+                    cross_model = (
+                        bool(result.get("live_audio_truth"))
+                        and "primary" in sources
+                    )
+                    if not allow_insertions or not cross_model:
                         # Observe mode measures how often consensus could help
                         # but cannot mutate the delivered lyric. Auto-insertions
                         # are enabled only together with a blocking review gate.
                         stats["lines_suggested"] += 1
                         continue
                     segments.append({
-                        "start": round(a, 3), "end": round(b, 3),
-                        "text": _text(group), "review": True,
-                        "words": [dict(word) for word in group],
+                        "start": round(agreed_a, 3),
+                        "end": round(agreed_b, 3),
+                        "text": _text(agreed), "review": True,
+                        "words": [dict(word) for word in agreed],
                         "consensus_reprocessed": True,
-                        "consensus_sources": ["stem", "mix"],
+                        "consensus_sources": _evidence.get("sources", []),
                     })
                     stats["lines_inserted"] += 1
 
@@ -278,3 +447,9 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         logger.warning("[TARGETED-CONSENSUS] declined: %r job=%s", exc, job_id)
         stats["declined"].append(f"exception:{type(exc).__name__}")
         return result, stats
+    finally:
+        if owned_stem:
+            try:
+                os.unlink(owned_stem)
+            except OSError:
+                pass
