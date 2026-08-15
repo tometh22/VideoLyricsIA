@@ -166,6 +166,94 @@ export function shiftTimingWithAdjacent(
   };
 }
 
+/**
+ * Extend or shorten a line's right edge. When extending into the next line,
+ * preserve every affected neighbour's duration and push only the collision
+ * chain forward. This is the local "ripple trim" used by the timeline.
+ *
+ * The function is deliberately pure and returns a complete atomic batch. A
+ * caller must persist the batch together: saving only the resized line would
+ * briefly create an invalid overlapping lyrics track.
+ */
+export function rippleResizeEnd(
+  allSegments, id, requestedEnd, duration, gap = 0.05, minDuration = 0.3,
+) {
+  const index = Array.isArray(allSegments)
+    ? allSegments.findIndex((segment) => segment?._id === id)
+    : -1;
+  const requested = Number(requestedEnd);
+  const safeGap = Math.max(0, Number(gap) || 0);
+  const safeMinDuration = Math.max(0, Number(minDuration) || 0);
+  const songCeiling = Number(duration) > 0 ? Number(duration) : Infinity;
+  const clean = (value) => Math.round(value * 1e9) / 1e9;
+
+  if (index < 0 || !Number.isFinite(requested)) {
+    return { changes: [], blocked: true, limited: true, coupled: false };
+  }
+
+  const original = allSegments.map((segment) => ({
+    id: segment?._id,
+    start: Number(segment?.start),
+    end: Number(segment?.end),
+  }));
+  if (original.some((segment) => (
+    !Number.isFinite(segment.start)
+    || !Number.isFinite(segment.end)
+    || segment.end < segment.start
+  ))) {
+    return { changes: [], blocked: true, limited: true, coupled: false };
+  }
+
+  const active = original[index];
+  const minEnd = active.start + safeMinDuration;
+  if (minEnd > songCeiling + 1e-9) {
+    return { changes: [], blocked: true, limited: true, coupled: false };
+  }
+
+  // Shrinking never needs to pull neighbours back. Extending may push a
+  // contiguous chain, but stops at the first line that already has enough
+  // room—unrelated later lyrics stay exactly where they were.
+  let targetEnd = Math.min(songCeiling, Math.max(minEnd, requested));
+  const apply = (end) => {
+    const next = original.map((segment) => ({ ...segment }));
+    next[index].end = end;
+    for (let cursor = index + 1; cursor < next.length; cursor += 1) {
+      const minStart = next[cursor - 1].end + safeGap;
+      if (next[cursor].start >= minStart - 1e-9) break;
+      const shift = minStart - next[cursor].start;
+      next[cursor].start += shift;
+      next[cursor].end += shift;
+    }
+    return next;
+  };
+
+  let next = apply(targetEnd);
+  if (Number.isFinite(songCeiling)) {
+    const overflow = Math.max(0, ...next.map((segment) => segment.end - songCeiling));
+    if (overflow > 1e-9) {
+      targetEnd = Math.max(minEnd, targetEnd - overflow);
+      next = apply(targetEnd);
+    }
+  }
+
+  const changed = next
+    .filter((segment, segmentIndex) => (
+      Math.abs(segment.start - original[segmentIndex].start) > 1e-6
+      || Math.abs(segment.end - original[segmentIndex].end) > 1e-6
+    ))
+    .map((segment) => ({ id: segment.id, start: clean(segment.start), end: clean(segment.end) }));
+  const own = next[index];
+  const limited = Math.abs(own.end - requested) > 1e-6;
+  const changedOwn = Math.abs(own.end - active.end) > 1e-6;
+
+  return {
+    changes: changed,
+    blocked: !changedOwn && Math.abs(requested - active.end) > 1e-6,
+    limited,
+    coupled: changed.length > 1,
+  };
+}
+
 export function clampResizeTiming(
   allSegments, id, requestedStart, requestedEnd, duration, gap = 0.05, minDuration = 0.3,
   edge = null,

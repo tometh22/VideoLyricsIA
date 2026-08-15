@@ -1316,6 +1316,10 @@ export default function LyricsEditor({
       return next;
     }), 10000);
     setFlushCounter((c) => c + 1);
+    trackEditorEvent("editor_timing_changed", {
+      count: changes.length,
+      operation: interaction.operation || "batch",
+    });
     trackEditorEvent("editor_group_moved", {
       count: changes.length,
       delta_ms: deltaMs,
