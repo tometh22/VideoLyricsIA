@@ -20,6 +20,7 @@ def _run(segments, *, audio_path="/tmp/live.wav", canonical="studio words",
 def test_disabled_flags_are_identity_and_schedule_no_work(monkeypatch):
     monkeypatch.delenv("LLM_SEGMENT_ENABLED", raising=False)
     monkeypatch.delenv("GAP_RECOVERY_ENABLED", raising=False)
+    monkeypatch.delenv("LIVE_LEXICAL_CONSENSUS_ENABLED", raising=False)
 
     async def unexpected_to_thread(*_args, **_kwargs):
         raise AssertionError("disabled postpasses must not schedule work")
@@ -121,6 +122,7 @@ def test_unexpected_postpass_error_falls_back_to_last_valid_segments(monkeypatch
     monkeypatch.setenv("LLM_SEGMENT_ENABLED", "1")
     monkeypatch.setenv("GAP_RECOVERY_ENABLED", "0")
     monkeypatch.delenv("GAP_RESCUE_ENABLED", raising=False)
+    monkeypatch.delenv("LIVE_LEXICAL_CONSENSUS_ENABLED", raising=False)
     raw = [{"start": 1.0, "end": 2.0, "text": "raw"}]
 
     async def broken_to_thread(*_args, **_kwargs):
@@ -128,6 +130,30 @@ def test_unexpected_postpass_error_falls_back_to_last_valid_segments(monkeypatch
 
     monkeypatch.setattr(main.asyncio, "to_thread", broken_to_thread)
     assert _run(raw) is raw
+
+
+def test_live_lexical_pass_runs_after_audio_owned_postpasses(monkeypatch):
+    monkeypatch.setenv("LLM_SEGMENT_ENABLED", "0")
+    monkeypatch.setenv("GAP_RECOVERY_ENABLED", "0")
+    monkeypatch.setenv("LIVE_LEXICAL_CONSENSUS_ENABLED", "1")
+    monkeypatch.setenv("LIVE_INDEPENDENT_VERIFY_ENABLED", "1")
+    raw = [{"start": 1.0, "end": 2.0,
+            "text": "Muy temprano estuve pensando en vos"}]
+    out = _run(raw, canonical="Hoy temprano estuve pensando en vos")
+    assert out[0]["text"] == "Muy temprano estuve pensando en vos"
+    assert out[0]["live_lexical_suggestion"] == \
+        "Hoy temprano estuve pensando en vos"
+    assert out[0]["start"] == 1.0
+
+
+def test_live_lexical_mutation_declines_without_independent_verifier(monkeypatch):
+    monkeypatch.setenv("LLM_SEGMENT_ENABLED", "0")
+    monkeypatch.setenv("GAP_RECOVERY_ENABLED", "0")
+    monkeypatch.setenv("LIVE_LEXICAL_CONSENSUS_ENABLED", "1")
+    monkeypatch.setenv("LIVE_INDEPENDENT_VERIFY_ENABLED", "0")
+    raw = [{"start": 1.0, "end": 2.0,
+            "text": "Muy temprano estuve pensando en vos"}]
+    assert _run(raw, canonical="Hoy temprano estuve pensando en vos") is raw
 
 
 def test_heuristic_phrase_segmenter_skips_llm_partition(monkeypatch):

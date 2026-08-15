@@ -103,6 +103,8 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             c = summarize(r.get("segments") or [], words,
                           stem_path=_stem, audio_duration=_dur,
                           rescue_skipped=_skip, live_hint=live_hint)
+            if _dur is not None:
+                c["audio_duration_s"] = round(float(_dur), 3)
             # Keep the exact unsafe windows as structured data.  Counts in a
             # log line are not enough for a bounded retry or for the editor to
             # take the operator to the problematic part of the song.
@@ -112,8 +114,44 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                 r.get("segments") or [], _stem, audio_duration=_dur,
                 rescue_skipped=_skip, include_leading=live_hint,
             )
+            _independent = r.get("_independent_asr_words") or []
+            _lexical_verification = {
+                "total": 0, "verified": 0, "unverified": 0, "details": [],
+            }
+            if _independent:
+                from audio_coverage import (
+                    audio_coverage as _independent_coverage,
+                    text_mismatches as _independent_mismatches,
+                    uncovered_spans as _independent_uncovered,
+                )
+                c["independent_witness_words"] = len(_independent)
+                c["independent_audio_coverage"] = _independent_coverage(
+                    r.get("segments") or [], _independent,
+                )
+                c["independent_text_mismatches"] = len(
+                    _independent_mismatches(
+                        r.get("segments") or [], _independent,
+                    )
+                )
+                _iw_gaps = _independent_uncovered(
+                    r.get("segments") or [], _independent,
+                )
+                c["independent_uncovered_spans"] = len(_iw_gaps)
+                c["independent_uncovered_seconds"] = round(sum(
+                    max(0.0, float(end) - float(start))
+                    for start, end, _count in _iw_gaps
+                ), 3)
+                from live_lexical_consensus import verify_corrections
+                _lexical_verification = verify_corrections(
+                    r.get("segments") or [], _independent,
+                )
+                c["live_lexical_corrections"] = _lexical_verification["total"]
+                c["live_lexical_verified"] = _lexical_verification["verified"]
+                c["live_lexical_unverified"] = _lexical_verification["unverified"]
             _windows = build_unsafe_windows(
                 r.get("segments") or [], words, voiced_gaps=_vg,
+                independent_words=_independent,
+                lexical_unverified=_lexical_verification["details"],
             )
             cascada = r.get("audio_coverage")
             final = c["audio_coverage"]
@@ -172,6 +210,7 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
     finally:
         if strip_internal and isinstance(r, dict):
             r.pop("_asr_words", None)
+            r.pop("_independent_asr_words", None)
         if _stem:
             try:
                 os.unlink(_stem)
@@ -186,6 +225,12 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     """Measure, retry only unsafe windows, and persist one final verdict."""
     from transcription_quality import evaluate
 
+    require_independent = bool(
+        live_hint
+        and os.environ.get("LIVE_INDEPENDENT_VERIFY_ENABLED", "0")
+        .strip().lower() in {"1", "true", "yes", "on"}
+    )
+
     r = _medir_cobertura_final(
         r, job_id, antes_fmt, audio_path, strip_internal=False,
         live_hint=live_hint,
@@ -194,7 +239,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     windows = post.get("quality_windows") or []
     initial = evaluate(
         r.get("segments") or [], post.get("coverage_final"),
-        unsafe_windows=windows,
+        unsafe_windows=windows, require_independent=require_independent,
     )
     retry_stats = {"attempted": False}
     try:
@@ -219,6 +264,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     final = evaluate(
         r.get("segments") or [], post.get("coverage_final"),
         unsafe_windows=windows, retry_stats=retry_stats,
+        require_independent=require_independent,
     )
     final["initial_decision"] = initial.get("decision")
     final["initial_score"] = initial.get("score")
@@ -233,6 +279,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
             len(windows), job_id,
         )
     r.pop("_asr_words", None)
+    r.pop("_independent_asr_words", None)
     return r
 
 
@@ -344,7 +391,10 @@ def run_transcription_job(
             )
             r = _maybe_repetition_reconcile(r, job_id)
             r = await _maybe_gap_rescue(r, audio_path, job_id, _post_lang)
-            r = await _maybe_word_vote(r, audio_path, job_id, _post_lang)
+            r = await _maybe_word_vote(
+                r, audio_path, job_id, _post_lang,
+                live_hint=live or _looks_live(title, filename),
+            )
             r = _maybe_chorus_snap(r, job_id)
             r = _maybe_phrase_segment(r, job_id)
             from lyrics_format import format_lyrics_pass as _fmt

@@ -3,15 +3,15 @@
 
 For every job dir under benchmark/dataset/, computes two metrics:
 
-  WER (Word Error Rate)         lower = better, range 0.0-1.0
+  WER (Word Error Rate)         lower = better, unbounded above
     Joins all segment texts into one string per source. Compares
     output-vs-ground using `jiwer.wer`. Captures text accuracy
     independent of segment boundaries.
 
   AOO (Average Onset Offset)    lower = better, in seconds
-    For each output segment, finds the closest-text segment in
-    ground_truth (Jaccard ≥ 0.4) and computes |out.start - gt.start|.
-    Reports mean + p95. Captures timing accuracy.
+    Uses a monotonic dynamic-programming alignment that supports 1↔1,
+    1↔2 and 2↔1 line matches. This handles repeated choruses and harmless
+    split/merge differences without matching a late repetition backwards.
 
   Composite                     higher = better, range 0.0-1.0
     1 - (0.5 * WER + 0.5 * normalized_AOO)
@@ -32,6 +32,8 @@ import argparse
 import json
 import hashlib
 import sys
+import unicodedata
+from difflib import SequenceMatcher
 from pathlib import Path
 from statistics import mean, median
 from math import ceil
@@ -99,6 +101,20 @@ def validate_manifest() -> list[str]:
             errors.append(
                 f"live/studio label is not manually verified: {entry.get('job_id')}"
             )
+        if entry.get("gold_verified") is not True:
+            errors.append(
+                f"ground truth is not manually verified: {entry.get('job_id')}"
+            )
+        if entry.get("gold_verified_sha256") != entry.get("ground_truth_sha256"):
+            errors.append(
+                f"gold verification hash drift: {entry.get('job_id')}"
+            )
+        if not all(entry.get(key) for key in (
+            "gold_reviewer", "gold_verified_at", "gold_verification_method",
+        )):
+            errors.append(
+                f"gold verification provenance missing: {entry.get('job_id')}"
+            )
         job_dir = DATASET / str(entry.get("job_id"))
         checks = {
             job_dir / str(entry.get("audio_file")): entry.get("audio_sha256"),
@@ -115,83 +131,210 @@ def _seg_text(segs: list[dict]) -> str:
     return " ".join((s.get("text") or "").strip() for s in segs if (s.get("text") or "").strip())
 
 
+def _normalise_text(text: str) -> str:
+    """Benchmark lexical normalisation, deliberately accent-preserving.
+
+    Typography and punctuation are editor presentation choices, not ASR word
+    errors. Accents remain significant so a real spelling regression is still
+    visible. NFKC also makes visually equivalent Unicode forms comparable.
+    """
+    normal = unicodedata.normalize("NFKC", text or "").casefold()
+    tokens = []
+    current = []
+    for char in normal:
+        if char.isalnum():
+            current.append(char)
+        elif current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+    return " ".join(tokens)
+
+
 def _wer(ref_segs: list[dict], hyp_segs: list[dict]) -> float:
     try:
         import jiwer
     except ImportError:
         print("[ERR] jiwer not installed. Run: pip install jiwer", file=sys.stderr)
         sys.exit(2)
-    ref = _seg_text(ref_segs).lower()
-    hyp = _seg_text(hyp_segs).lower()
+    ref = _normalise_text(_seg_text(ref_segs))
+    hyp = _normalise_text(_seg_text(hyp_segs))
     if not ref:
         return 0.0
     return jiwer.wer(ref, hyp)
 
 
 def _jaccard(a: str, b: str) -> float:
-    sa = set((a or "").lower().split())
-    sb = set((b or "").lower().split())
+    sa = set(_normalise_text(a).split())
+    sb = set(_normalise_text(b).split())
     if not sa or not sb:
         return 0.0
     return len(sa & sb) / len(sa | sb)
 
 
-def _aoo(ground: list[dict], output: list[dict]) -> tuple[float, float, int]:
-    """Greedy ONE-TO-ONE onset match. Output segments (in time order) each
-    claim the closest-start ground-truth line whose text matches (Jaccard
-    >= 0.4) and isn't already claimed.
+def _text_similarity(a: str, b: str) -> float:
+    left, right = _normalise_text(a), _normalise_text(b)
+    if not left or not right:
+        return 0.0
+    return max(
+        _jaccard(left, right),
+        SequenceMatcher(None, left.split(), right.split()).ratio(),
+    )
 
-    One-to-one matching fixes the repeated-chorus inflation of the old naive
-    matcher: a chorus sung 7x would otherwise all match GT occurrence #1,
-    manufacturing huge fake offsets (a real bug seen on "No Hay Santos" where
-    p95 read 77s). Returns (mean_offset, p95_offset, matched_count)."""
-    taken: set[int] = set()
-    offsets: list[float] = []
-    for out_seg in sorted(output, key=lambda s: float(s.get("start", 0) or 0)):
-        out_text = (out_seg.get("text") or "").strip()
-        if not out_text:
-            continue
-        cand: list[tuple[float, int]] = []
-        for i, gt in enumerate(ground):
-            if i in taken:
-                continue
-            if _jaccard(out_text, gt.get("text") or "") >= 0.4:
-                try:
-                    cand.append((abs(float(out_seg["start"]) - float(gt["start"])), i))
-                except (KeyError, TypeError, ValueError):
+
+def _monotonic_alignment(ground: list[dict], output: list[dict], *,
+                         min_similarity: float = 0.48) -> list[tuple[int, int, int, int]]:
+    """Return monotonic ``(g0, g1, o0, o1)`` half-open line groups.
+
+    A group spans at most two lines on either side. That is enough for the
+    common formatter difference (one long lyric versus two display rows) while
+    preventing a collapsed mega-segment from receiving full recall credit.
+    """
+    g = sorted(
+        (s for s in ground if isinstance(s, dict)),
+        key=lambda s: float(s.get("start", 0) or 0),
+    )
+    o = sorted(
+        (s for s in output if isinstance(s, dict)),
+        key=lambda s: float(s.get("start", 0) or 0),
+    )
+    n, m = len(g), len(o)
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    choice: list[list[tuple[str, int, int] | None]] = [
+        [None] * (m + 1) for _ in range(n + 1)
+    ]
+    for i in range(n - 1, -1, -1):
+        for j in range(m - 1, -1, -1):
+            best = dp[i + 1][j]
+            act: tuple[str, int, int] = ("skip_g", 1, 0)
+            if dp[i][j + 1] > best:
+                best, act = dp[i][j + 1], ("skip_o", 0, 1)
+            for gn, on in ((1, 1), (1, 2), (2, 1)):
+                if i + gn > n or j + on > m:
                     continue
-        if not cand:
+                gt = " ".join(str(g[k].get("text") or "") for k in range(i, i + gn))
+                ot = " ".join(str(o[k].get("text") or "") for k in range(j, j + on))
+                similarity = _text_similarity(gt, ot)
+                required = 0.82 if (gn > 1 or on > 1) else min_similarity
+                if similarity < required:
+                    continue
+                # Prefer more covered words, but charge a small merge penalty
+                # so exact 1↔1 matches win ties.
+                words = min(len(_normalise_text(gt).split()), len(_normalise_text(ot).split()))
+                reward = similarity * max(1.0, words ** 0.5) - 0.04 * (gn + on - 2)
+                try:
+                    onset_distance = abs(
+                        float(g[i].get("start", 0) or 0)
+                        - float(o[j].get("start", 0) or 0)
+                    )
+                except (TypeError, ValueError):
+                    onset_distance = 0.0
+                # Time is a tie-breaker only. Text/order still determine the
+                # alignment; this resolves identical repeated choruses to the
+                # chronologically plausible occurrence.
+                candidate = (
+                    reward + dp[i + gn][j + on]
+                    - onset_distance * 1e-12
+                )
+                if candidate > best + 1e-15:
+                    best, act = candidate, ("match", gn, on)
+            dp[i][j], choice[i][j] = best, act
+    aligned = []
+    i = j = 0
+    while i < n and j < m:
+        act = choice[i][j]
+        if not act:
+            break
+        kind, gn, on = act
+        if kind == "match":
+            aligned.append((i, i + gn, j, j + on))
+        i += gn
+        j += on
+    return aligned
+
+
+def _aoo(ground: list[dict], output: list[dict]) -> tuple[float, float, int]:
+    """Average onset error from the monotonic split/merge-aware alignment."""
+    g = sorted(
+        (s for s in ground if isinstance(s, dict)),
+        key=lambda s: float(s.get("start", 0) or 0),
+    )
+    o = sorted(
+        (s for s in output if isinstance(s, dict)),
+        key=lambda s: float(s.get("start", 0) or 0),
+    )
+    offsets: list[float] = []
+    matched = 0
+    for g0, g1, o0, o1 in _monotonic_alignment(g, o):
+        try:
+            # Every independently timed row contributes an onset. A 2→1
+            # merge therefore cannot hide the missing second onset, and a
+            # 1→2 split measures both emitted rows.
+            if (g1 - g0) > 1:
+                offsets.extend(
+                    abs(float(o[o0]["start"]) - float(g[index]["start"]))
+                    for index in range(g0, g1)
+                )
+            elif (o1 - o0) > 1:
+                offsets.extend(
+                    abs(float(o[index]["start"]) - float(g[g0]["start"]))
+                    for index in range(o0, o1)
+                )
+            else:
+                offsets.append(
+                    abs(float(o[o0]["start"]) - float(g[g0]["start"]))
+                )
+            matched += g1 - g0
+        except (KeyError, TypeError, ValueError):
             continue
-        cand.sort()
-        off, idx = cand[0]
-        taken.add(idx)
-        offsets.append(off)
     if not offsets:
         # No textual alignment is not perfect timing. Penalize it at the
         # composite metric's saturation point so dropped/collapsed lyrics
         # cannot manufacture an AOO of zero.
         return (2.0, 2.0, 0)
     offsets_sorted = sorted(offsets)
-    p95 = offsets_sorted[max(0, int(len(offsets_sorted) * 0.95) - 1)]
-    return (mean(offsets), p95, len(offsets))
+    p95 = offsets_sorted[max(0, ceil(len(offsets_sorted) * 0.95) - 1)]
+    return (mean(offsets), p95, matched)
 
 
 def _recall(ground: list[dict], output: list[dict]) -> float:
-    """Fraction of ground-truth lines that have a text match (Jaccard >= 0.4)
-    somewhere in the output. Catches DROPPED lines and collapse — failures
-    that WER (which compares concatenated text) can mask."""
+    """Fraction of ground-truth rows covered by the monotonic alignment."""
     if not ground:
         return 0.0
-    hit = sum(
-        1 for gt in ground
-        if any(_jaccard(gt.get("text") or "", o.get("text") or "") >= 0.4 for o in output)
-    )
+    hit = sum(g1 - g0 for g0, g1, _o0, _o1 in _monotonic_alignment(ground, output))
     return hit / len(ground)
 
 
 def _composite(wer: float, aoo_mean: float) -> float:
     norm_aoo = min(aoo_mean / 2.0, 1.0)
     return max(0.0, 1.0 - (0.5 * wer + 0.5 * norm_aoo))
+
+
+def _timeline_issues(segments: list[dict]) -> dict:
+    inversions = invalid_ranges = duplicate_starts = 0
+    previous = None
+    for segment in segments or []:
+        if not isinstance(segment, dict):
+            invalid_ranges += 1
+            continue
+        try:
+            start, end = float(segment.get("start")), float(segment.get("end"))
+        except (TypeError, ValueError):
+            invalid_ranges += 1
+            continue
+        if previous is not None and start < previous - 1e-6:
+            inversions += 1
+        if previous is not None and abs(start - previous) <= 1e-3:
+            duplicate_starts += 1
+        if start < 0 or end < start:
+            invalid_ranges += 1
+        previous = start
+    return {
+        "start_inversions": inversions,
+        "invalid_ranges": invalid_ranges,
+        "duplicate_starts": duplicate_starts,
+    }
 
 
 def score_job(job_dir: Path) -> dict | None:
@@ -232,6 +375,7 @@ def score_job(job_dir: Path) -> dict | None:
             "segments": len(baseline),
             "matched": b_matched,
             "composite": _composite(b_wer, b_aoo_mean),
+            "timeline_issues": _timeline_issues(baseline),
         }
     if improvement is not None:
         i_wer = _wer(ground, improvement)
@@ -244,6 +388,7 @@ def score_job(job_dir: Path) -> dict | None:
             "segments": len(improvement),
             "matched": i_matched,
             "composite": _composite(i_wer, i_aoo_mean),
+            "timeline_issues": _timeline_issues(improvement),
         }
     return out
 
@@ -266,6 +411,8 @@ def _cohort_no_regression(rows: list[dict]) -> bool:
         and mean(metric["recall"] for metric in improvement) >= 0.75
         and ground_count > 0
         and matched / ground_count >= 0.75
+        and all(not any(metric.get("timeline_issues", {}).values())
+                for metric in improvement)
     )
 
 

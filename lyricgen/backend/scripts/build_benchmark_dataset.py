@@ -181,6 +181,10 @@ def build_dataset(job_ids: list[str]) -> None:
             else:
                 job["is_live_source"] = "heuristic"
                 job["stratum"] = "live" if job["is_live"] else "studio"
+            job["gold_notes"] = (
+                str(manual_label.get("gold_notes") or "")[:500]
+                if isinstance(manual_label, dict) else ""
+            )
             dest = OUT_ROOT / job_id
             dest.mkdir(parents=True, exist_ok=True)
 
@@ -193,29 +197,57 @@ def build_dataset(job_ids: list[str]) -> None:
             (dest / "ground_truth.json").write_text(
                 json.dumps(job["segments_json"], ensure_ascii=False, indent=2)
             )
-            # Strip segments_json from metadata — kept separate to avoid
-            # accidentally treating the meta file as ground truth.
-            meta = {k: v for k, v in job.items() if k != "segments_json"}
-            (dest / "metadata.json").write_text(
-                json.dumps(meta, ensure_ascii=False, indent=2, default=str)
-            )
             def _sha256(path):
                 digest = hashlib.sha256()
                 with path.open("rb") as handle:
                     for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                         digest.update(chunk)
                 return digest.hexdigest()
+            ground_truth_hash = _sha256(dest / "ground_truth.json")
+            label = manual_label if isinstance(manual_label, dict) else {}
+            try:
+                label_revision = int(label.get("segments_revision", -1))
+            except (TypeError, ValueError):
+                label_revision = -1
+            job["gold_verified"] = bool(
+                label.get("gold_verified") is True
+                and label.get("ground_truth_sha256") == ground_truth_hash
+                and label_revision == job["segments_revision"]
+                and str(label.get("reviewer") or "").strip()
+                and str(label.get("verified_at") or "").strip()
+                and str(label.get("verification_method") or "").strip()
+            )
+            job["gold_reviewer"] = str(label.get("reviewer") or "")[:120]
+            job["gold_verified_at"] = str(label.get("verified_at") or "")[:80]
+            job["gold_verification_method"] = str(
+                label.get("verification_method") or ""
+            )[:120]
+            job["gold_verified_sha256"] = (
+                ground_truth_hash if job["gold_verified"] else None
+            )
+            # Strip segments_json from metadata — kept separate to avoid
+            # accidentally treating the meta file as ground truth.
+            meta = {k: v for k, v in job.items() if k != "segments_json"}
+            (dest / "metadata.json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2, default=str)
+            )
             manifest_entries.append({
                 "job_id": job_id,
                 "segments_revision": job["segments_revision"],
                 "is_live": job["is_live"],
                 "is_live_source": job["is_live_source"],
                 "stratum": job["stratum"],
+                "gold_verified": job["gold_verified"],
+                "gold_notes": job["gold_notes"],
+                "gold_reviewer": job["gold_reviewer"],
+                "gold_verified_at": job["gold_verified_at"],
+                "gold_verification_method": job["gold_verification_method"],
+                "gold_verified_sha256": job["gold_verified_sha256"],
                 "approval_event_id": job["approval_event_id"],
                 "approval_at": job["approval_at"],
                 "audio_file": audio_path.name,
                 "audio_sha256": _sha256(audio_path),
-                "ground_truth_sha256": _sha256(dest / "ground_truth.json"),
+                "ground_truth_sha256": ground_truth_hash,
                 "metadata_sha256": _sha256(dest / "metadata.json"),
             })
             print(f"  ✓ {job['artist']} - {job['song_title']}  "
@@ -227,7 +259,7 @@ def build_dataset(job_ids: list[str]) -> None:
 
     print()
     MANIFEST_PATH.write_text(json.dumps({
-        "schema_version": 1,
+        "schema_version": 2,
         "snapshot_at": datetime.now(timezone.utc).isoformat(),
         "selection": {
             "requested_jobs": len(job_ids),

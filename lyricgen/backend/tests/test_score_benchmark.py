@@ -21,7 +21,7 @@ def seg(start, text, end=None):
     return {"start": start, "end": end if end is not None else start + 2, "text": text}
 
 
-# ── _aoo: greedy one-to-one onset match ────────────────────────────────────────
+# ── _aoo: monotonic split/merge-aware onset match ─────────────────────────────
 
 def test_aoo_one_to_one_avoids_repeated_chorus_inflation():
     """The whole reason for the rewrite: a chorus that repeats must NOT make
@@ -47,6 +47,53 @@ def test_aoo_extra_repeats_do_not_match_beyond_ground_truth():
     output = [seg(10.2, "chorus alpha beta"), seg(40, "chorus alpha beta")]
     _, _, matched = sb._aoo(ground, output)
     assert matched == 1                 # only one GT line to claim
+
+
+def test_aoo_never_matches_a_late_repeated_chorus_backwards():
+    ground = [
+        seg(10, "chorus alpha beta"),
+        seg(50, "middle unique phrase"),
+        seg(90, "chorus alpha beta"),
+    ]
+    output = [
+        seg(10.1, "chorus alpha beta"),
+        seg(50.2, "middle unique phrase"),
+        seg(90.3, "chorus alpha beta"),
+    ]
+    mean_off, _, matched = sb._aoo(ground, output)
+    assert matched == 3
+    assert mean_off < 0.4
+
+
+def test_single_repeated_line_uses_closest_chronological_occurrence():
+    ground = [seg(10, "chorus alpha beta"), seg(90, "chorus alpha beta")]
+    early = [seg(10.1, "chorus alpha beta")]
+    late = [seg(89.9, "chorus alpha beta")]
+    assert sb._aoo(ground, early)[0] == pytest.approx(0.1)
+    assert sb._aoo(ground, late)[0] == pytest.approx(0.1)
+
+
+def test_aoo_accepts_one_line_split_into_two_display_rows():
+    ground = [seg(10, "alpha beta gamma delta")]
+    output = [seg(10.2, "alpha beta"), seg(11.5, "gamma delta")]
+    mean_off, _, matched = sb._aoo(ground, output)
+    assert matched == 1
+    assert mean_off == pytest.approx(0.85)
+
+
+def test_aoo_merge_cannot_hide_missing_second_onset():
+    ground = [seg(10, "alpha beta"), seg(20, "gamma delta")]
+    output = [seg(10, "alpha beta gamma delta", end=22)]
+    mean_off, p95, matched = sb._aoo(ground, output)
+    assert matched == 2
+    assert mean_off == pytest.approx(5.0)
+    assert p95 == pytest.approx(10.0)
+
+
+def test_aoo_p95_uses_conservative_nearest_rank():
+    ground = [seg(10, "alpha beta gamma"), seg(20, "delta epsilon zeta")]
+    output = [seg(10.1, "alpha beta gamma"), seg(30, "delta epsilon zeta")]
+    assert sb._aoo(ground, output)[1] == pytest.approx(10.0)
 
 def test_aoo_no_text_match_is_unmatched():
     ground = [seg(10, "alpha beta gamma")]
@@ -132,3 +179,19 @@ def test_wer_identical_is_zero():
     pytest.importorskip("jiwer")
     s = [seg(0, "alpha beta gamma"), seg(5, "delta epsilon")]
     assert sb._wer(s, s) == 0.0
+
+
+def test_wer_ignores_punctuation_and_unicode_case_but_keeps_words():
+    pytest.importorskip("jiwer")
+    reference = [seg(0, "¡Hoy, temprano!")]
+    hypothesis = [seg(0, "hoy temprano")]
+    assert sb._wer(reference, hypothesis) == 0.0
+
+
+def test_normalisation_turns_internal_punctuation_into_boundaries():
+    assert sb._normalise_text("amor/odio—hoy") == "amor odio hoy"
+
+
+def test_timeline_issues_are_measured_before_any_sorting():
+    issues = sb._timeline_issues([seg(20, "later"), seg(10, "earlier")])
+    assert issues["start_inversions"] == 1

@@ -13,13 +13,20 @@ import json
 from typing import Iterable
 
 
-POLICY_VERSION = "lyrics-quality-v1"
+POLICY_VERSION = "lyrics-quality-v2"
 _TRUE = {"1", "true", "yes", "on"}
 _PIPELINE_CONFIG_KEYS = (
     "TRANSCRIBE_VAD_FIRST", "VAD_CHUNK_ENABLED", "CTC_ALIGN_ENABLED",
     "FORCED_ALIGNER_ENABLED", "ANCHOR_LYRICS_ENABLED",
     "WHISPER_REFERENCE_PROMPT_MODE", "LRCLIB_PLAIN_ALIGNER_ENABLED",
     "TARGETED_CONSENSUS_ENABLED", "TRANSCRIPTION_QUALITY_MODE",
+    "LIVE_LEXICAL_CONSENSUS_ENABLED", "LIVE_INDEPENDENT_VERIFY_ENABLED",
+    "TARGETED_SLOW_STEM_ENABLED",
+    "TARGETED_SLOW_STEM_SPEED", "TARGETED_CONSENSUS_MAX_WINDOWS",
+    "TARGETED_CONSENSUS_MAX_BILLED_SECONDS",
+    "TARGETED_CONSENSUS_MAX_CLIP_SECONDS",
+    "TARGETED_CONSENSUS_DEADLINE_SECONDS",
+    "LIVE_INDEPENDENT_VERIFY_MAX_SECONDS", "LIVE_ASR_MAX_BILLED_SECONDS",
 )
 
 
@@ -127,7 +134,9 @@ def _merge_windows(windows: list[dict], *, pad_s: float = 1.5) -> list[dict]:
 
 
 def build_unsafe_windows(segments: list[dict], words: list[dict], *,
-                         voiced_gaps: list[dict] | None = None) -> list[dict]:
+                         voiced_gaps: list[dict] | None = None,
+                         independent_words: list[dict] | None = None,
+                         lexical_unverified: list[dict] | None = None) -> list[dict]:
     """Locate bounded areas worth a second, independent ASR pass."""
     from audio_coverage import text_mismatches, uncovered_spans
 
@@ -136,6 +145,24 @@ def build_unsafe_windows(segments: list[dict], words: list[dict], *,
         windows.append({
             "start": item["start"], "end": item["end"],
             "reason": "text_mismatch", "segment_index": item["index"],
+        })
+    if independent_words:
+        for item in text_mismatches(segments, independent_words):
+            windows.append({
+                "start": item["start"], "end": item["end"],
+                "reason": "independent_text_mismatch",
+                "segment_index": item["index"],
+            })
+        for start, end, _count in uncovered_spans(segments, independent_words):
+            windows.append({
+                "start": start, "end": end,
+                "reason": "independent_uncovered_asr",
+            })
+    for item in lexical_unverified or []:
+        windows.append({
+            "start": item.get("start"), "end": item.get("end"),
+            "reason": "live_lexical_unverified",
+            "segment_index": item.get("index"),
         })
     for start, end, _count in uncovered_spans(segments, words):
         windows.append({"start": start, "end": end, "reason": "uncovered_asr"})
@@ -149,7 +176,8 @@ def build_unsafe_windows(segments: list[dict], words: list[dict], *,
 
 def evaluate(segments: list[dict], coverage: dict | None, *,
              unsafe_windows: list[dict] | None = None,
-             retry_stats: dict | None = None) -> dict:
+             retry_stats: dict | None = None,
+             require_independent: bool = False) -> dict:
     """Evaluate output and return a serializable, explainable verdict."""
     required_evidence = {
         "audio_coverage", "uncovered_seconds", "text_mismatches",
@@ -188,6 +216,64 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
         add("empty_transcription", "critical", 0, 50)
     if not evidence_available:
         add("quality_evidence_unavailable", "critical", True, 40)
+    independent_words = int(coverage.get("independent_witness_words") or 0)
+    independent_required_fields = {
+        "independent_audio_coverage", "independent_text_mismatches",
+        "independent_uncovered_seconds", "audio_duration_s",
+    }
+    independent_fields_available = (
+        independent_required_fields.issubset(coverage)
+        and all(math.isfinite(_f(coverage.get(key), float("nan")))
+                for key in independent_required_fields)
+    )
+    if require_independent and (
+        independent_words < 8 or not independent_fields_available
+    ):
+        add("independent_witness_unavailable", "critical", independent_words, 40)
+    audio_duration = _f(coverage.get("audio_duration_s"))
+    witness_density = (
+        independent_words * 60.0 / audio_duration
+        if audio_duration > 0 else 0.0
+    )
+    if require_independent and witness_density < 4.0:
+        add(
+            "independent_witness_too_sparse", "critical",
+            round(witness_density, 3), 35,
+        )
+    independent_mismatches = int(
+        coverage.get("independent_text_mismatches") or 0
+    )
+    if independent_mismatches:
+        add(
+            "independent_text_audio_mismatch", "critical",
+            independent_mismatches, min(45, 20 * independent_mismatches),
+        )
+    independent_cov = coverage.get("independent_audio_coverage")
+    if require_independent and independent_cov is not None:
+        independent_cov = _f(independent_cov)
+        if independent_cov < 0.70:
+            add("low_independent_coverage", "critical", round(independent_cov, 4), 30)
+        elif independent_cov < 0.80:
+            add("soft_independent_coverage", "warning", round(independent_cov, 4), 10)
+    independent_uncovered = _f(
+        coverage.get("independent_uncovered_seconds")
+    )
+    if independent_uncovered >= 8.0:
+        add(
+            "independent_uncovered_audio", "critical",
+            round(independent_uncovered, 2), 30,
+        )
+    elif independent_uncovered >= 3.0:
+        add(
+            "short_independent_uncovered_audio", "warning",
+            round(independent_uncovered, 2), 10,
+        )
+    lexical_unverified = int(coverage.get("live_lexical_unverified") or 0)
+    if lexical_unverified:
+        add(
+            "live_lexical_unverified", "critical",
+            lexical_unverified, min(45, 25 * lexical_unverified),
+        )
     pending_insertions = sum(
         1 for segment in segments
         if isinstance(segment, dict)
@@ -250,6 +336,9 @@ def can_render(quality: dict | None, *, revision: int,
     current_hash = segments_hash(segments or [])
     quality_is_current = (
         quality.get("policy_version") == POLICY_VERSION
+        and
+        quality.get("pipeline_config_fingerprint")
+        == runtime_identity()["pipeline_config_fingerprint"]
         and
         quality.get("segments_hash") == current_hash
         and int(quality.get("evaluated_revision", -1)) == int(revision)

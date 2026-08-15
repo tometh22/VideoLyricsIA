@@ -120,3 +120,110 @@ def test_unsafe_windows_merge_overlapping_signals(monkeypatch):
     assert len(windows) == 1
     assert windows[0]["segment_indices"] == [2]
     assert set(windows[0]["reasons"]) == {"text_mismatch", "uncovered_asr"}
+
+
+def test_live_gate_requires_an_independent_acoustic_witness():
+    evidence = {
+        "audio_coverage": 1.0, "text_mismatches": 0,
+        "voiced_gap_s": 0, "uncovered_seconds": 0,
+    }
+    missing = tq.evaluate(
+        [_segment(1, 2)], evidence, require_independent=True,
+    )
+    assert missing["decision"] == "review_required"
+    assert any(
+        reason["code"] == "independent_witness_unavailable"
+        for reason in missing["reasons"]
+    )
+
+    verified = tq.evaluate(
+        [_segment(1, 2)], {
+            **evidence,
+            "independent_witness_words": 20,
+            "independent_audio_coverage": 0.95,
+            "independent_text_mismatches": 0,
+            "independent_uncovered_seconds": 0,
+            "audio_duration_s": 60,
+        },
+        require_independent=True,
+    )
+    assert verified["decision"] == "pass"
+
+
+def test_independent_disagreement_blocks_even_when_primary_self_certifies():
+    quality = tq.evaluate(
+        [_segment(1, 2)], {
+            "audio_coverage": 1.0, "text_mismatches": 0,
+            "voiced_gap_s": 0, "uncovered_seconds": 0,
+            "independent_witness_words": 20,
+            "independent_audio_coverage": 0.95,
+            "independent_text_mismatches": 1,
+            "independent_uncovered_seconds": 0,
+            "audio_duration_s": 60,
+        },
+        require_independent=True,
+    )
+    assert quality["decision"] == "review_required"
+    assert any(
+        reason["code"] == "independent_text_audio_mismatch"
+        for reason in quality["reasons"]
+    )
+
+
+def test_independent_witness_adds_missing_lyric_windows(monkeypatch):
+    monkeypatch.setattr("audio_coverage.text_mismatches", lambda *_: [])
+    monkeypatch.setattr(
+        "audio_coverage.uncovered_spans",
+        lambda _segments, words: [(60, 84, 12)] if words else [],
+    )
+    windows = tq.build_unsafe_windows(
+        [_segment(1, 2)], [], independent_words=[{"word": "Real"}],
+    )
+    assert len(windows) == 1
+    assert windows[0]["reasons"] == ["independent_uncovered_asr"]
+
+
+def test_unverified_live_lexical_substitution_is_blocking():
+    quality = tq.evaluate(
+        [_segment(1, 2)], {
+            "audio_coverage": 1.0, "text_mismatches": 0,
+            "voiced_gap_s": 0, "uncovered_seconds": 0,
+            "live_lexical_unverified": 1,
+        },
+    )
+    assert quality["decision"] == "review_required"
+    assert any(
+        reason["code"] == "live_lexical_unverified"
+        for reason in quality["reasons"]
+    )
+
+
+def test_eight_witness_words_cannot_certify_a_five_minute_song():
+    quality = tq.evaluate(
+        [_segment(1, 2)], {
+            "audio_coverage": 1.0, "text_mismatches": 0,
+            "voiced_gap_s": 0, "uncovered_seconds": 0,
+            "independent_witness_words": 8,
+            "independent_audio_coverage": 1.0,
+            "independent_text_mismatches": 0,
+            "independent_uncovered_seconds": 0,
+            "audio_duration_s": 300,
+        }, require_independent=True,
+    )
+    assert any(
+        reason["code"] == "independent_witness_too_sparse"
+        for reason in quality["reasons"]
+    )
+
+
+def test_pass_from_old_runtime_config_cannot_authorize_render(monkeypatch):
+    monkeypatch.setenv("TRANSCRIPTION_QUALITY_MODE", "enforce")
+    monkeypatch.setenv("TARGETED_SLOW_STEM_SPEED", "0.88")
+    segments = [_segment(1, 2)]
+    quality = tq.evaluate(segments, {
+        "audio_coverage": 1.0, "text_mismatches": 0,
+        "voiced_gap_s": 0, "uncovered_seconds": 0,
+    })
+    quality["evaluated_revision"] = 0
+    monkeypatch.setenv("TARGETED_SLOW_STEM_SPEED", "0.90")
+    assert tq.can_render(quality, revision=0, segments=segments)[0] is False
