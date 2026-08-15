@@ -10,6 +10,8 @@ different lyric order.
 from __future__ import annotations
 
 import math
+import re
+import unicodedata
 from typing import Any
 
 
@@ -19,6 +21,21 @@ MIN_SEGMENT_DURATION = 0.3
 
 def _collision_text(segment: dict) -> str:
     return " ".join(str(segment.get("text") or "").split()).casefold()
+
+
+def _lyric_tokens(segment: dict) -> list[str]:
+    text = unicodedata.normalize("NFKD", _collision_text(segment))
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    return re.findall(r"[a-z0-9]+", text)
+
+
+def _same_lyric_motif(left: dict, right: dict) -> bool:
+    """Whether adjacent overlapping rows describe the same vocal motif."""
+    a, b = _lyric_tokens(left), _lyric_tokens(right)
+    if not a or not b or a[0] != b[0]:
+        return False
+    sa, sb = set(a), set(b)
+    return sa <= sb or sb <= sa or len(sa & sb) / len(sa | sb) >= 0.5
 
 
 def _near_collision(left: dict, right: dict) -> bool:
@@ -280,5 +297,22 @@ def normalize_segments_timing(
             "end": round(end, 4),
         })
         previous_start = start
+
+    # Overlapping harmonies with different lyrics are valid and stay intact.
+    # Two adjacent rows of the same motif are different: when they overlap by
+    # more than 500 ms, a single playback timestamp matches both and the
+    # editor cursor can flicker. Clamp only that narrow, selector-breaking
+    # case after all starts are monotonic.
+    for previous, current in zip(normalized, normalized[1:]):
+        overlap = float(previous["end"]) - float(current["start"])
+        if overlap <= 0.50 or not _same_lyric_motif(previous, current):
+            continue
+        clamped_end = max(
+            float(previous["start"]) + safe_duration,
+            float(current["start"]) - safe_gap,
+        )
+        if clamped_end < float(previous["end"]):
+            previous["end"] = round(clamped_end, 4)
+            previous["timing_overlap_clamped"] = True
 
     return normalized

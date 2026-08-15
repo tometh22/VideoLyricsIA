@@ -350,6 +350,36 @@ def guess_text_lang(lines: list[str]) -> str:
     return "unknown"
 
 
+def has_short_repeated_motif(lines: list[str], *, min_run: int = 3) -> bool:
+    """Detect a compact repeated chant that CTC must not re-time blindly.
+
+    Global CTC is excellent for lexical verses and full chorus lines, but a
+    run such as ``Real`` / ``Real`` / ``Real`` has too few phonetic anchors to
+    determine repetition cardinality.  In that case its monotonic Viterbi can
+    spread surplus rows across later crowd noise with plausible word scores.
+    Preserve the ASR timing and let the structural quality pass inspect the
+    bounded refrain instead.
+    """
+    generic = {"no", "oh", "ah", "uh", "eh", "yeah"}
+    previous = None
+    run = 0
+    for line in lines or []:
+        tokens = [norm_word(word) for word in str(line or "").split()]
+        tokens = [token for token in tokens if token]
+        opening = tokens[0] if 1 <= len(tokens) <= 4 else None
+        if opening and opening not in generic and opening == previous:
+            run += 1
+        elif opening and opening not in generic:
+            previous = opening
+            run = 1
+        else:
+            previous = None
+            run = 0
+        if run >= min_run:
+            return True
+    return False
+
+
 BRIDGE_S = 8.0  # no word lasts 8s; no intra-line silence lasts 8s
 
 
@@ -814,6 +844,13 @@ def retime_segments(audio_path: str, segments: list[dict],
             # model registry exists, declining is the honest move. Checked
             # BEFORE any torch import / 1.2 GB model load.
             logger.info("[CTC] decline: text language=%s (job=%s)", lang, job_id)
+            return None
+        if has_short_repeated_motif(lines):
+            last_decline_reason = "short_repeated_motif"
+            logger.info(
+                "[CTC] decline: short repeated motif lacks stable anchors "
+                "(job=%s)", job_id,
+            )
             return None
 
         import torch

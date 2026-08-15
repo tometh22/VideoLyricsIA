@@ -132,3 +132,19 @@ def test_final_normalization_repairs_postpass_duplicate_starts():
     assert timing_anomalies(normalized)["regressions"] == 0
     assert timing_anomalies(normalized)["duplicate_starts"] == 0
     assert round(normalized[2]["end"] - normalized[2]["start"], 2) == 4.87
+
+
+def test_final_normalization_clamps_selector_breaking_same_motif_overlap():
+    segments = [
+        {"start": 62.27, "end": 67.55, "text": "Real, real."},
+        {"start": 67.00, "end": 68.25, "text": "Real."},
+        {"start": 70.00, "end": 74.00, "text": "different harmony"},
+        {"start": 73.00, "end": 75.00, "text": "other words"},
+    ]
+
+    normalized = normalize_segments_timing(segments)
+
+    assert normalized[0]["end"] == 66.95
+    assert normalized[0]["timing_overlap_clamped"] is True
+    # Different simultaneous lyrics can be a legitimate harmony.
+    assert normalized[2]["end"] == 74.0
