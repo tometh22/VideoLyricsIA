@@ -8,7 +8,10 @@ from threading import Barrier
 import pytest
 
 from auth import create_user, start_login_session
-from database import AuditLog, EditorDocument, EditorVersion, Job, SessionLocal, engine
+from database import (
+    AuditLog, EditorDocument, EditorVersion, Job, ProductEvent, SessionLocal,
+    engine,
+)
 from editor import acquire_lock, approve_document, ensure_document, get_or_create_document, save_document
 from tests.conftest import auth
 
@@ -83,6 +86,35 @@ def test_editor_document_is_shared_by_tenant_and_conflicts_are_explicit(client):
     assert detail["detail"] == "editor_revision_conflict"
     assert detail["server_revision"] == 1
     assert detail["server_segments"][0]["text"] == "ONE"
+
+
+def test_editor_activity_heartbeat_uses_server_snapshot_and_identity(client):
+    first, _second, job_id = _users_and_job("editor_activity")
+    token = _token_for(first)
+    assert client.post(f"/editor/{job_id}/lock", headers=auth(token)).status_code == 200
+    response = client.post(
+        f"/editor/{job_id}/activity/heartbeat", headers=auth(token),
+        json={"session_id": "session-123456789", "activity_seq": 1},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["revision"] == 0
+    assert len(response.json()["snapshot_sha256"]) == 64
+    db = SessionLocal()
+    try:
+        event = db.query(ProductEvent).filter(
+            ProductEvent.id == response.json()["event_id"],
+        ).one()
+        assert event.user_id == first.id
+        assert event.created_at is not None
+        assert event.properties["snapshot_sha256"] == response.json()["snapshot_sha256"]
+        assert event.properties["activity_seq"] == 1
+    finally:
+        db.close()
+    skipped = client.post(
+        f"/editor/{job_id}/activity/heartbeat", headers=auth(token),
+        json={"session_id": "session-123456789", "activity_seq": 3},
+    )
+    assert skipped.status_code == 409
 
 
 def test_editor_versions_restore_and_lock_are_tenant_scoped(client):

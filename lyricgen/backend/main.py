@@ -4348,13 +4348,21 @@ def transcription_status(
         if status == "transcribed_pending":
             status = "transcribed"
 
+        quality_payload = getattr(job_row, "transcription_quality", None)
+        if isinstance(quality_payload, dict):
+            from transcription_quality import effective_policy_mode
+            quality_payload = dict(quality_payload)
+            quality_payload["mode"] = effective_policy_mode(
+                job_id=job_id, tenant_id=str(job_row.tenant_id or ""),
+            )
+
         payload = {
             "job_id": job_id,
             "status": status,
             "segments": None,
             "reference_lyrics": None,
             "coverage_warning": bool(getattr(job_row, "coverage_warning", False)),
-            "transcription_quality": getattr(job_row, "transcription_quality", None),
+            "transcription_quality": quality_payload,
             "segments_revision": int(getattr(job_row, "segments_revision", 0) or 0),
             "recovery_source": getattr(job_row, "recovery_source", None),
             "error": None,
@@ -5217,7 +5225,11 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
     try:
         import word_vote as _wv
         _live_verify = bool(
-            live_hint
+            (
+                live_hint
+                or os.environ.get("TRANSCRIPTION_QUALITY_CALIBRATED", "0")
+                .strip().lower() in ("1", "true", "yes", "on")
+            )
             and os.environ.get("LIVE_INDEPENDENT_VERIFY_ENABLED", "0")
             .strip().lower() in ("1", "true", "yes", "on")
         )
@@ -5375,10 +5387,8 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
             _verified_candidate, _lexical_stats = apply_verified_proposals(
                 segs, witness,
             )
-            _apply_verified = (
-                os.environ.get("TRANSCRIPTION_QUALITY_MODE", "observe")
-                .strip().lower() == "enforce"
-            )
+            from transcription_quality import effective_policy_mode
+            _apply_verified = effective_policy_mode(job_id=job_id) == "enforce"
             nuevo = _verified_candidate if _apply_verified else segs
             stats = {
                 "substitutions": (
@@ -5560,6 +5570,10 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
         result, audio_path, job_id, language, None,
         _maybe_timing_consistency, live_hint=live_hint,
     )
+    quality_to_enqueue = None
+    persisted_revision = 0
+    persisted_hash = ""
+    persisted_tenant_id = ""
     try:
         from database import SessionLocal as _QualitySession
         _quality_db = _QualitySession()
@@ -5578,12 +5592,35 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                     )
                 else:
                     row.segments_json = segments
+                    previous_quality = (
+                        dict(row.transcription_quality)
+                        if isinstance(row.transcription_quality, dict) else {}
+                    )
                     quality = finalized.get("transcription_quality")
                     if isinstance(quality, dict):
                         quality = dict(quality)
                         quality["evaluated_revision"] = revision
                         quality["timing_source"] = row.timing_source or "unknown"
+                        from transcription_quality import quality_fingerprint
+                        quality["quality_fingerprint"] = quality_fingerprint(
+                            quality, revision=revision,
+                            content_hash=str(quality.get("segments_hash") or ""),
+                        )
+                        quality_to_enqueue = quality
+                        persisted_revision = revision
+                        persisted_hash = str(quality.get("segments_hash") or "")
+                        persisted_tenant_id = str(row.tenant_id or "")
                     row.transcription_quality = quality
+                    if isinstance(quality, dict):
+                        from quality_shadow import record_shadow_decision
+                        record_shadow_decision(
+                            _quality_db, row, quality,
+                            previous_quality=previous_quality,
+                            evaluation_stage=(
+                                "terminal" if not quality.get("unsafe_windows")
+                                else "initial"
+                            ),
+                        )
                 row.status = "transcribed_pending"
                 row.current_step = "editing"
                 _quality_db.commit()
@@ -5591,6 +5628,24 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
             _quality_db.close()
     except Exception as exc:
         logger.warning("[QUALITY-GATE] inline persistence failed: %s job=%s", exc, job_id)
+    if (
+        isinstance(quality_to_enqueue, dict)
+        and quality_to_enqueue.get("decision") != "pass"
+        and quality_to_enqueue.get("unsafe_windows")
+    ):
+        try:
+            from queue_jobs import enqueue_transcription_quality
+            enqueue_transcription_quality(
+                job_id, expected_revision=persisted_revision,
+                expected_segments_hash=persisted_hash,
+                filename=os.path.basename(audio_path),
+                tenant_id=persisted_tenant_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[QUALITY-QUEUE] inline enqueue declined job=%s: %r",
+                job_id, exc,
+            )
     return finalized
 
 
@@ -9122,6 +9177,8 @@ async def generate_with_segments(
             getattr(job_row, "transcription_quality", None),
             revision=current_revision,
             segments=job_row.segments_json or segments,
+            job_id=job_id,
+            tenant_id=str(job_row.tenant_id or ""),
         )
         if not _quality_ok:
             return JSONResponse(
@@ -11180,6 +11237,11 @@ class EditorConflictRequest(BaseModel):
     segments: list[dict] | None = None
 
 
+class EditorActivityHeartbeatRequest(BaseModel):
+    session_id: str = Field(min_length=16, max_length=100)
+    activity_seq: int = Field(ge=0, le=10_000_000)
+
+
 class ProductEventItem(BaseModel):
     name: str
     job_id: str | None = None
@@ -11247,9 +11309,13 @@ async def get_editor_document(
         from transcription_quality import evaluate as evaluate_transcription_quality
         editor_quality = evaluate_transcription_quality(job.segments_json, None)
         editor_quality["evaluated_revision"] = int(job.segments_revision or 0)
-        editor_quality["pipeline_release"] = "legacy_unknown"
-        editor_quality["pipeline_config_fingerprint"] = "unknown"
         editor_quality["timing_source"] = job.timing_source or "unknown"
+    if isinstance(editor_quality, dict):
+        from transcription_quality import effective_policy_mode
+        editor_quality = dict(editor_quality)
+        editor_quality["mode"] = effective_policy_mode(
+            job_id=job_id, tenant_id=str(job.tenant_id or ""),
+        )
     payload.update({
         "artist": job.artist,
         "song_title": job.song_title,
@@ -11319,6 +11385,78 @@ async def editor_unlock(
         raise HTTPException(status_code=409, detail="editor_lock_owned_by_other_user")
     db.commit()
     return {"released": True}
+
+
+@app.post("/editor/{job_id}/activity/heartbeat")
+@limiter.limit("12/minute")
+async def editor_activity_heartbeat(
+    request: Request,
+    job_id: str,
+    body: EditorActivityHeartbeatRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Record a server-timestamped active-editor sample for operational QA.
+
+    Elapsed time is derived later from bounded gaps between these rows. The
+    endpoint deliberately ignores browser clocks and client-reported minutes.
+    """
+    from evidence_attestation import lyric_snapshot_hash
+
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    lock_expires = document.lock_expires_at
+    if lock_expires is not None and lock_expires.tzinfo is None:
+        lock_expires = lock_expires.replace(tzinfo=timezone.utc)
+    if (
+        document.lock_user_id != current_user["id"]
+        or lock_expires is None
+        or lock_expires <= datetime.now(timezone.utc)
+    ):
+        raise HTTPException(
+            status_code=409, detail="editor_active_lock_required",
+        )
+    quality = job.transcription_quality or {}
+    prior_heartbeats = db.query(ProductEvent).filter(
+        ProductEvent.name == "editor_activity_heartbeat",
+        ProductEvent.job_id == job_id,
+        ProductEvent.user_id == current_user["id"],
+    ).order_by(ProductEvent.id.desc()).all()
+    previous = next((
+        row for row in prior_heartbeats
+        if (row.properties or {}).get("session_id") == body.session_id
+    ), None)
+    expected_seq = int((previous.properties or {}).get("activity_seq") or 0) + 1 \
+        if previous is not None else 1
+    if body.activity_seq != expected_seq:
+        raise HTTPException(
+            status_code=409, detail="editor_activity_sequence_conflict",
+        )
+    event = ProductEvent(
+        tenant_id=current_user["tenant_id"], user_id=current_user["id"],
+        job_id=job_id, name="editor_activity_heartbeat",
+        occurred_at=datetime.now(timezone.utc),
+        properties={
+            "session_id": body.session_id,
+            "activity_seq": body.activity_seq,
+            "revision": int(document.revision or 0),
+            "snapshot_sha256": lyric_snapshot_hash(document.current_segments or []),
+            "pipeline_release": str(
+                quality.get("pipeline_release") or "unknown"
+            )[:64],
+            "pipeline_config_fingerprint": str(
+                quality.get("pipeline_config_fingerprint") or "unknown"
+            )[:32],
+        },
+    )
+    db.add(event)
+    db.flush()
+    event_id = event.id
+    db.commit()
+    return {
+        "event_id": event_id,
+        "revision": int(document.revision or 0),
+        "snapshot_sha256": event.properties["snapshot_sha256"],
+    }
 
 
 @app.get("/editor/{job_id}/versions")
@@ -12057,10 +12195,13 @@ async def save_segments(
 
 class TranscriptionQualityAckRequest(BaseModel):
     base_revision: int = Field(..., ge=0)
+    confirmed_window_ids: list[str] = Field(default_factory=list, max_length=64)
 
 
 @app.post("/jobs/{job_id}/transcription-quality/acknowledge")
+@limiter.limit("12/minute")
 async def acknowledge_transcription_quality(
+    request: Request,
     job_id: str,
     body: TranscriptionQualityAckRequest,
     current_user: dict = Depends(get_current_user),
@@ -12073,6 +12214,14 @@ async def acknowledge_transcription_quality(
                     and job.tenant_id != current_user["tenant_id"])):
         raise HTTPException(status_code=404, detail="Job not found.")
     current_revision = int(job.segments_revision or 0)
+    from transcription_quality import effective_policy_mode
+    if effective_policy_mode(
+        job_id=job_id, tenant_id=str(job.tenant_id or ""),
+    ) != "enforce":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "transcription_quality_not_enforced"},
+        )
     if body.base_revision != current_revision:
         return JSONResponse(
             status_code=409,
@@ -12092,23 +12241,73 @@ async def acknowledge_transcription_quality(
         # operator action acknowledge only the exact current revision+hash.
         quality = evaluate_transcription_quality(job.segments_json or [], None)
         quality["evaluated_revision"] = current_revision
-        quality["pipeline_release"] = str(
-            previous_quality.get("pipeline_release") or "legacy_unknown"
-        )[:64]
-        quality["pipeline_config_fingerprint"] = str(
-            previous_quality.get("pipeline_config_fingerprint") or "unknown"
-        )[:32]
         quality["timing_source"] = str(
             previous_quality.get("timing_source")
             or job.timing_source or "unknown"
         )[:64]
     else:
         quality = previous_quality
+    from transcription_quality import runtime_identity
+    current_identity = runtime_identity()
+    if (
+        quality.get("pipeline_release") != current_identity["pipeline_release"]
+        or
+        quality.get("pipeline_config_fingerprint")
+        != current_identity["pipeline_config_fingerprint"]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "transcription_quality_stale_config"},
+        )
+    confirmed_ids = list(body.confirmed_window_ids or [])
+    if any(not value or len(value) > 64 for value in confirmed_ids):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_confirmed_window_ids"},
+        )
+    if quality.get("policy_version") == POLICY_VERSION:
+        from transcription_quality import confirmed_all_windows
+        if not confirmed_all_windows(
+            quality, confirmed_ids,
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "unsafe_windows_not_confirmed",
+                    "expected": len(quality.get("unsafe_windows") or []),
+                },
+            )
+    from transcription_quality import (
+        manual_override_allowed, quality_fingerprint,
+    )
+    if not manual_override_allowed(quality):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "quality_failure_not_overridable"},
+        )
     current_hash = segments_hash(job.segments_json or [])
+    quality["segments_hash"] = current_hash
+    quality["evaluated_revision"] = current_revision
+    fingerprint = quality_fingerprint(
+        quality, revision=current_revision, content_hash=current_hash,
+    )
+    quality["quality_fingerprint"] = fingerprint
+    previous_ack = quality.get("acknowledgement") or {}
+    if (
+        previous_ack.get("quality_fingerprint") == fingerprint
+        and int(previous_ack.get("revision", -1)) == current_revision
+        and set(previous_ack.get("confirmed_window_ids") or []) == set(confirmed_ids)
+    ):
+        return {
+            "ok": True, "revision": current_revision,
+            "segments_hash": current_hash, "idempotent": True,
+        }
     quality["acknowledgement"] = {
         "revision": current_revision,
         "segments_hash": current_hash,
         "policy_version": quality.get("policy_version"),
+        "confirmed_window_ids": confirmed_ids,
+        "quality_fingerprint": fingerprint,
         "user_id": current_user["id"],
         "at": datetime.now(timezone.utc).isoformat(),
     }

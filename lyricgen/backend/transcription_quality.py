@@ -12,17 +12,19 @@ import hashlib
 import json
 from typing import Iterable
 
+from evidence_attestation import verify_artifact
 
-POLICY_VERSION = "lyrics-quality-v4"
+
+POLICY_VERSION = "lyrics-quality-v5"
 _TRUE = {"1", "true", "yes", "on"}
 _PIPELINE_CONFIG_KEYS = (
     "TRANSCRIBE_VAD_FIRST", "VAD_CHUNK_ENABLED", "CTC_ALIGN_ENABLED",
     "FORCED_ALIGNER_ENABLED", "ANCHOR_LYRICS_ENABLED",
     "WHISPER_REFERENCE_PROMPT_MODE", "LRCLIB_PLAIN_ALIGNER_ENABLED",
-    "TARGETED_CONSENSUS_ENABLED", "TRANSCRIPTION_QUALITY_MODE",
+    "TARGETED_CONSENSUS_ENABLED",
     "LIVE_LEXICAL_CONSENSUS_ENABLED", "LIVE_INDEPENDENT_VERIFY_ENABLED",
     "TARGETED_SLOW_STEM_ENABLED", "TARGETED_GEMINI_VERIFY_ENABLED",
-    "TARGETED_ACOUSTIC_CTC_ENABLED",
+    "TARGETED_ACOUSTIC_STRUCTURE_ENABLED", "TARGETED_ACOUSTIC_CTC_ENABLED",
     "TARGETED_STRUCTURAL_AUTOREPAIR_ENABLED",
     "TARGETED_SLOW_STEM_SPEED", "TARGETED_CONSENSUS_MAX_WINDOWS",
     "TARGETED_CONSENSUS_MAX_BILLED_SECONDS",
@@ -33,13 +35,74 @@ _PIPELINE_CONFIG_KEYS = (
     "TARGETED_CTC_PHASE_MAX", "TARGETED_CTC_PHASE_MEDIAN_MAX",
     "TARGETED_CTC_ANCHOR_MAX", "TARGETED_CTC_ANCHORED_STEM_MIN",
     "TARGETED_CTC_ANCHORED_MIX_MIN", "TARGETED_CTC_PHASE_MARGIN_MIN",
+    "CTC_ALIGN_MODEL", "CTC_ALIGN_MODEL_REVISION", "CTC_ALIGN_STAR_DELTA",
+    "CTC_ALIGN_MAX_AUDIO_S",
+    "CTC_ALIGN_WORD_SEP", "CTC_ALIGN_SKIP_ARCS", "CTC_ALIGN_SKIP_LAMBDA",
+    "CTC_ALIGN_MAX_SKIP_FRAC", "CTC_ALIGN_MIN_MED_SCORE",
+    "CTC_ALIGN_MIX_ACCEPT", "CTC_ALIGN_MIX_ACCEPT_KNOWN",
+    "CTC_ALIGN_MIX_RECOVER", "CTC_ALIGN_EDGE_SNAP",
+    "CTC_ALIGN_EDGE_SNAP_SCORE", "QUALITY_CTC_CALIBRATION_SHA256",
+    "TARGETED_CTC_STEM_SCORE_MIN", "TARGETED_CTC_MIX_SCORE_MIN",
+    "TARGETED_ACOUSTIC_STEM_DTW_MAX", "TARGETED_ACOUSTIC_MIX_DTW_MAX",
+    "TARGETED_ACOUSTIC_STEM_BOUNDARY_MIN",
+    "TARGETED_ACOUSTIC_MIX_BOUNDARY_MIN", "TARGETED_ACOUSTIC_PERIOD_CV_MAX",
+    "DEMUCS_MODEL", "DEMUCS_MODEL_VERSION", "DEMUCS_MODEL_CHECKSUM",
+    "DEMUCS_VARIANT", "REPLICATE_DEMUCS_MODEL", "VOCAL_SEP_ENABLED",
+    "QUALITY_ASR_USD_PER_MINUTE",
+    "QUALITY_OPENAI_ASR_USD_PER_MINUTE",
+    "QUALITY_GEMINI_AUDIO_USD_PER_MINUTE",
     "TARGETED_ACOUSTIC_VOICE_CHAIN_GAP_MAX",
+    "TARGETED_STRUCTURAL_AUTOREPAIR_MODE",
+    "TRANSCRIPTION_QUALITY_CALIBRATED",
+    "TRANSCRIPTION_QUALITY_INLINE_RETRY",
 )
+
+RELEASE_REPORT_REQUIRED_CHECKS = frozenset({
+    "corpus_50", "split_30_20", "cohorts_20_20_10",
+    "repetition_adlib_coverage", "crowd_chorus_coverage",
+    "pericos_six_events", "event_count_f1_global", "event_count_f1_live",
+    "event_count_f1_holdout", "vocalization_recall_global",
+    "vocalization_recall_live", "vocalization_recall_holdout",
+    "timing_onset_p90", "timing_end_p90", "timing_holdout_p90",
+    "wer_non_regression", "wer_holdout_non_regression",
+    "candidate_runtime_config_bound", "shadow_ledger_attested",
+    "shadow_counts_consistent", "shadow_bound_to_candidate",
+    "automatic_precision", "zero_catastrophic_approvals",
+    "automatic_coverage", "shadow_volume_and_duration",
+    "operator_full_coverage", "operator_p50", "operator_p90",
+    "cost_full_coverage", "cost_ci95_below_baseline",
+})
 
 
 def policy_mode() -> str:
     value = os.environ.get("TRANSCRIPTION_QUALITY_MODE", "observe").strip().lower()
     return value if value in {"observe", "enforce"} else "observe"
+
+
+def effective_policy_mode(*, job_id: str = "", tenant_id: str = "") -> str:
+    """Resolve enforce per stable pilot/percentage cohort, never globally."""
+    if policy_mode() != "enforce":
+        return "observe"
+    # Pure unit callers without a production identity retain explicit enforce;
+    # every DB-backed render path passes both identifiers below.
+    if not job_id and not tenant_id:
+        return "enforce"
+    pilots = {
+        value.strip() for value in os.environ.get(
+            "TRANSCRIPTION_QUALITY_ENFORCE_PILOT_TENANTS", "",
+        ).split(",") if value.strip()
+    }
+    if tenant_id and str(tenant_id) in pilots:
+        return "enforce"
+    try:
+        percentage = float(os.environ.get(
+            "TRANSCRIPTION_QUALITY_ENFORCE_PERCENT", "0",
+        ))
+    except (TypeError, ValueError):
+        percentage = 0.0
+    percentage = max(0.0, min(100.0, percentage))
+    bucket = int(hashlib.sha256(str(job_id).encode("utf-8")).hexdigest()[:8], 16)
+    return "enforce" if bucket % 10_000 < round(percentage * 100) else "observe"
 
 
 def runtime_identity() -> dict:
@@ -58,6 +121,77 @@ def runtime_identity() -> dict:
     }
 
 
+def calibration_identity() -> dict:
+    """Require a hash-pinned benchmark report that actually says GO."""
+    runtime = runtime_identity()
+    calibration_id = os.environ.get(
+        "TRANSCRIPTION_QUALITY_CALIBRATION_ID", ""
+    ).strip()[:128]
+    policy = os.environ.get(
+        "TRANSCRIPTION_QUALITY_CALIBRATION_POLICY", ""
+    ).strip()
+    fingerprint = os.environ.get(
+        "TRANSCRIPTION_QUALITY_CALIBRATION_CONFIG_FINGERPRINT", ""
+    ).strip()
+    enabled = (
+        os.environ.get("TRANSCRIPTION_QUALITY_CALIBRATED", "0")
+        .strip().lower() in _TRUE
+    )
+    report_path = os.environ.get(
+        "TRANSCRIPTION_QUALITY_RELEASE_REPORT_PATH", "",
+    ).strip()
+    report_sha = os.environ.get(
+        "TRANSCRIPTION_QUALITY_RELEASE_REPORT_SHA256", "",
+    ).strip().lower()
+    manifest_path = os.environ.get(
+        "TRANSCRIPTION_QUALITY_BENCHMARK_MANIFEST_PATH", "",
+    ).strip()
+    report_valid = False
+    report_manifest_sha = None
+    if report_path and len(report_sha) == 64:
+        try:
+            with open(report_path, "rb") as handle:
+                raw = handle.read()
+            report = json.loads(raw.decode("utf-8"))
+            candidate = (report.get("systems") or {}).get("candidate") or {}
+            report_manifest_sha = report.get("manifest_sha256")
+            checks = (report.get("release_gate") or {}).get("checks") or {}
+            attested, _attestation_reason = verify_artifact(
+                report, "BENCHMARK_RELEASE_PUBLIC_KEYS",
+            )
+            with open(manifest_path, "rb") as manifest_handle:
+                manifest_raw = manifest_handle.read()
+            report_valid = bool(
+                hashlib.sha256(raw).hexdigest() == report_sha
+                and attested
+                and (report.get("release_gate") or {}).get("decision") == "GO"
+                and RELEASE_REPORT_REQUIRED_CHECKS.issubset(checks)
+                and all(checks.get(name) is True for name in RELEASE_REPORT_REQUIRED_CHECKS)
+                and candidate.get("release") == runtime["pipeline_release"]
+                and candidate.get("pipeline_config_fingerprint") == fingerprint
+                and isinstance(report_manifest_sha, str)
+                and len(report_manifest_sha) == 64
+                and hashlib.sha256(manifest_raw).hexdigest() == report_manifest_sha
+            )
+        except (OSError, ValueError, TypeError):
+            report_valid = False
+    calibrated = bool(
+        enabled and calibration_id and policy == POLICY_VERSION
+        and fingerprint == runtime["pipeline_config_fingerprint"]
+        and report_valid
+    )
+    return {
+        "calibrated": calibrated,
+        "calibration_id": calibration_id or None,
+        "policy_version": policy or None,
+        "config_fingerprint": fingerprint or None,
+        "release_report_sha256": report_sha or None,
+        "manifest_sha256": report_manifest_sha,
+        "method": "benchmark_calibrated_v1" if calibrated
+        else "deterministic_guardrails_v1",
+    }
+
+
 def segments_hash(segments: Iterable[dict]) -> str:
     """Hash only render-relevant lyric content, not ephemeral editor fields."""
     canonical = [
@@ -65,6 +199,18 @@ def segments_hash(segments: Iterable[dict]) -> str:
             "start": round(_f(segment.get("start")), 6),
             "end": round(_f(segment.get("end")), 6),
             "text": str(segment.get("text") or ""),
+            "scale": segment.get("scale"),
+            "pos": segment.get("pos"),
+            "rot": segment.get("rot"),
+            "words": [
+                {
+                    "start": round(_f(word.get("start")), 6),
+                    "end": round(_f(word.get("end")), 6),
+                    "word": str(word.get("word") or word.get("text") or ""),
+                }
+                for word in (segment.get("words") or [])
+                if isinstance(word, dict)
+            ],
         }
         for segment in (segments or []) if isinstance(segment, dict)
     ]
@@ -98,7 +244,7 @@ def timeline_issues(segments: Iterable[dict]) -> dict:
             duplicate_starts += 1
         if previous_end - start > 0.50:
             severe_overlaps += 1
-        if start < 0 or end + 1e-6 < start:
+        if start < 0 or end <= start + 1e-6:
             invalid_ranges += 1
         if not str(segment.get("text") or "").strip():
             empty_text += 1
@@ -137,7 +283,91 @@ def _merge_windows(windows: list[dict], *, pad_s: float = 1.5) -> list[dict]:
                 "start": round(start, 2), "end": round(end, 2),
                 "reasons": sorted(reasons), "segment_indices": sorted(indices),
             })
+    for window in merged:
+        window["id"] = unsafe_window_id(window)
     return merged
+
+
+def unsafe_window_id(window: dict) -> str:
+    canonical = {
+        "start": round(_f(window.get("start")), 3),
+        "end": round(_f(window.get("end")), 3),
+        "reasons": sorted(str(item) for item in (window.get("reasons") or [])),
+        "segment_indices": sorted(int(item) for item in (
+            window.get("segment_indices") or []
+        )),
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return "qw_" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+
+def confirmed_all_windows(quality: dict, confirmed_ids: Iterable[str]) -> bool:
+    expected = {
+        str(window.get("id") or unsafe_window_id(window))
+        for window in (quality.get("unsafe_windows") or [])
+        if isinstance(window, dict)
+    }
+    confirmed = {str(value) for value in (confirmed_ids or []) if value}
+    return expected == confirmed
+
+
+_NON_OVERRIDABLE_REASONS = {
+    "empty_transcription", "empty_lyric_lines", "timeline_inversion",
+    "invalid_timing_range", "duplicate_line_starts",
+    "quality_evidence_unavailable", "quality_retry_failed",
+}
+
+
+def manual_override_allowed(quality: dict) -> bool:
+    if quality.get("decision") == "retry_failed":
+        return False
+    codes = {
+        str(reason.get("code")) for reason in (quality.get("reasons") or [])
+        if isinstance(reason, dict)
+    }
+    return not bool(codes & _NON_OVERRIDABLE_REASONS)
+
+
+def quality_fingerprint(quality: dict, *, revision: int,
+                        content_hash: str) -> str:
+    """Bind an acknowledgement to the exact evidence it reviewed."""
+    windows = sorted(
+        str(window.get("id") or unsafe_window_id(window))
+        for window in (quality.get("unsafe_windows") or [])
+        if isinstance(window, dict)
+    )
+    reasons = sorted(
+        (
+            str(reason.get("code")),
+            str(reason.get("severity")),
+            json.dumps(
+                reason.get("value"), ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), default=str,
+            ),
+        )
+        for reason in (quality.get("reasons") or [])
+        if isinstance(reason, dict)
+    )
+    payload = {
+        "revision": int(revision), "segments_hash": content_hash,
+        "policy_version": quality.get("policy_version"),
+        "pipeline_release": quality.get("pipeline_release"),
+        "pipeline_config_fingerprint": quality.get("pipeline_config_fingerprint"),
+        "decision": quality.get("decision"), "reasons": reasons,
+        "window_ids": windows, "calibration": quality.get("risk_calibration"),
+        "timing_source": quality.get("timing_source"),
+        "evidence": {
+            "metrics": quality.get("metrics"),
+            "retry": quality.get("retry"),
+            "acoustic_evidence": quality.get("acoustic_evidence"),
+            "analysis_windows": quality.get("analysis_windows"),
+        },
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def build_unsafe_windows(segments: list[dict], words: list[dict], *,
@@ -195,7 +425,9 @@ def build_unsafe_windows(segments: list[dict], words: list[dict], *,
 def evaluate(segments: list[dict], coverage: dict | None, *,
              unsafe_windows: list[dict] | None = None,
              retry_stats: dict | None = None,
-             require_independent: bool = False) -> dict:
+             require_independent: bool = False,
+             acoustic_evidence: dict | None = None,
+             resolved_reason_counts: dict[str, int] | None = None) -> dict:
     """Evaluate output and return a serializable, explainable verdict."""
     required_evidence = {
         "audio_coverage", "uncovered_seconds", "text_mismatches",
@@ -208,14 +440,12 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
                 for key in required_evidence)
     )
     coverage = coverage or {}
+    resolved_reason_counts = resolved_reason_counts or {}
     timeline = timeline_issues(segments)
     reasons: list[dict] = []
-    score = 100
 
     def add(code: str, severity: str, value, deduction: int) -> None:
-        nonlocal score
         reasons.append({"code": code, "severity": severity, "value": value})
-        score -= deduction
 
     if timeline["start_inversions"]:
         add("timeline_inversion", "critical", timeline["start_inversions"], 50)
@@ -226,10 +456,9 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
     if timeline["duplicate_starts"]:
         add("duplicate_line_starts", "critical", timeline["duplicate_starts"], 30)
     if timeline["severe_overlaps"]:
-        # Harmonies and call-and-response can overlap legitimately. Surface it
-        # for review/benchmarking but only inversions/duplicate starts are
-        # selector-breaking by themselves.
-        add("severe_line_overlaps", "warning", timeline["severe_overlaps"], 10)
+        # The current editor/render model is one linear lyric lane and has no
+        # overlap_group representation. A >500ms overlap is destructive here.
+        add("severe_line_overlaps", "critical", timeline["severe_overlaps"], 40)
     if not segments:
         add("empty_transcription", "critical", 0, 50)
     if not evidence_available:
@@ -286,14 +515,18 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
             "short_independent_uncovered_audio", "warning",
             round(independent_uncovered, 2), 10,
         )
-    lexical_unverified = int(coverage.get("live_lexical_unverified") or 0)
+    lexical_unverified = max(
+        0, int(coverage.get("live_lexical_unverified") or 0)
+        - int(resolved_reason_counts.get("live_lexical_unverified") or 0),
+    )
     if lexical_unverified:
         add(
             "live_lexical_unverified", "critical",
             lexical_unverified, min(45, 25 * lexical_unverified),
         )
-    structural_disagreements = int(
-        coverage.get("live_structural_disagreements") or 0
+    structural_disagreements = max(
+        0, int(coverage.get("live_structural_disagreements") or 0)
+        - int(resolved_reason_counts.get("live_structural_disagreement") or 0),
     )
     if structural_disagreements:
         # A repeated refrain whose acoustically observed structure disagrees
@@ -319,13 +552,31 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
             pending_insertions, 35,
         )
 
+    # A v4 structural row may carry review=False because the old gate treated
+    # lexical-anchor support as proof of the whole vocalization.  v5 never
+    # inherits that approval: until benchmark calibration, every such rewrite
+    # is explicitly review-scoped.
+    structural_rows = sum(
+        1 for segment in segments
+        if isinstance(segment, dict)
+        and (segment.get("structural_hybrid") or segment.get("structural_repair"))
+    )
+    if structural_rows:
+        add(
+            "structural_autorepair_uncalibrated", "critical",
+            structural_rows, 45,
+        )
+
     audio_cov = _f(coverage.get("audio_coverage"), 1.0)
     if audio_cov < 0.80:
         add("low_audio_coverage", "critical", round(audio_cov, 4), 35)
     elif audio_cov < 0.90:
         add("soft_audio_coverage", "warning", round(audio_cov, 4), 15)
 
-    mismatches = int(coverage.get("text_mismatches") or 0)
+    mismatches = max(
+        0, int(coverage.get("text_mismatches") or 0)
+        - int(resolved_reason_counts.get("text_mismatch") or 0),
+    )
     if mismatches:
         add("text_audio_mismatch", "critical", mismatches, min(45, 25 * mismatches))
     voiced_s = _f(coverage.get("voiced_gap_s"))
@@ -339,36 +590,179 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
     elif uncovered_s >= 3.0:
         add("short_uncovered_audio", "warning", round(uncovered_s, 2), 10)
 
+    acoustic_evidence = acoustic_evidence or {}
+    evidence_windows = acoustic_evidence.get("windows") or [acoustic_evidence]
+    for evidence_window in evidence_windows:
+        mapping = evidence_window.get("content_mapping") or {}
+        structure = evidence_window.get("acoustic_structure") or {}
+        if structure and not structure.get("accepted"):
+            add(
+                "acoustic_structure_unavailable", "critical",
+                structure.get("reason") or "declined", 40,
+            )
+        if mapping:
+            if int(mapping.get("strong_unassigned_events") or 0):
+                add(
+                    "strong_unassigned_vocal_events", "critical",
+                    int(mapping.get("strong_unassigned_events") or 0), 45,
+                )
+            if not mapping.get("accepted"):
+                add(
+                    "acoustic_mapping_ambiguous", "critical",
+                    mapping.get("reason") or mapping.get("margin"), 35,
+                )
+
+    retry_stats = retry_stats or {"attempted": False}
+    if retry_stats.get("failed"):
+        add(
+            "quality_retry_failed", "critical",
+            retry_stats.get("failure_reason") or "unknown", 40,
+        )
+    if int(retry_stats.get("windows_skipped") or 0) > 0:
+        add(
+            "quality_windows_unprocessed", "critical",
+            int(retry_stats.get("windows_skipped") or 0), 35,
+        )
+    if int(retry_stats.get("windows_truncated") or 0) > 0:
+        add(
+            "quality_windows_truncated", "critical",
+            int(retry_stats.get("windows_truncated") or 0), 35,
+        )
+
+    # Windows are actionable product state, not merely diagnostics.  A clean
+    # retry may remove them; any window still present must be confirmed by the
+    # operator for this exact revision before render.
+    unsafe_windows = list(unsafe_windows or [])
+    if unsafe_windows and not any(
+        reason["code"] in {
+            "timeline_inversion", "invalid_timing_range", "empty_transcription",
+            "quality_evidence_unavailable", "quality_retry_failed",
+        }
+        for reason in reasons
+    ):
+        add("unsafe_windows_pending_review", "critical", len(unsafe_windows), 30)
+
+    # Capture the counterfactual shadow decision *before* the rollout
+    # calibration blocker is added. This lets us measure what the candidate
+    # would have approved without enabling it, while incomplete/failed
+    # analyses remain ineligible rather than becoming convenient negatives.
+    ineligible_codes = {
+        "quality_evidence_unavailable", "quality_retry_failed",
+        "quality_windows_unprocessed", "quality_windows_truncated",
+        "acoustic_structure_unavailable",
+    }
+    shadow_eligible = not any(
+        reason["code"] in ineligible_codes for reason in reasons
+    )
+    shadow_would_approve = bool(
+        shadow_eligible
+        and not any(reason["severity"] == "critical" for reason in reasons)
+    )
+    shadow_decision = {
+        "eligible": shadow_eligible,
+        "would_approve": shadow_would_approve,
+        "reason_codes": [reason["code"] for reason in reasons],
+    }
+
+    calibration = calibration_identity()
+    if not calibration["calibrated"]:
+        add(
+            "quality_calibration_unavailable", "critical",
+            calibration.get("calibration_id") or "missing", 0,
+        )
+
     blocking = any(reason["severity"] == "critical" for reason in reasons)
-    decision = "review_required" if blocking else "pass"
+    decision = (
+        "retry_failed" if retry_stats.get("failed")
+        else "review_required" if blocking else "pass"
+    )
+
+    dimension_codes = {
+        "text": {
+            "quality_evidence_unavailable", "text_audio_mismatch",
+            "independent_text_audio_mismatch", "live_lexical_unverified",
+            "empty_lyric_lines", "empty_transcription",
+        },
+        "event_count": {
+            "live_structural_disagreement", "acoustic_mapping_ambiguous",
+            "strong_unassigned_vocal_events", "structural_autorepair_uncalibrated",
+            "quality_windows_unprocessed", "quality_windows_truncated",
+        },
+        "timing": {
+            "severe_line_overlaps", "duplicate_line_starts",
+            "invalid_timing_range", "timeline_inversion",
+        },
+        "vocal_coverage": {
+            "low_audio_coverage", "soft_audio_coverage", "voiced_gap",
+            "short_voiced_gap", "uncovered_asr_audio", "short_uncovered_audio",
+            "low_independent_coverage", "soft_independent_coverage",
+            "independent_uncovered_audio", "short_independent_uncovered_audio",
+        },
+        "timeline_integrity": {
+            "timeline_inversion", "invalid_timing_range", "duplicate_line_starts",
+            "severe_line_overlaps",
+        },
+    }
+    severity_risk = {"critical": .92, "warning": .35}
+    risks = {}
+    for dimension, codes in dimension_codes.items():
+        values = [severity_risk.get(reason["severity"], 0.0)
+                  for reason in reasons if reason["code"] in codes]
+        risks[dimension] = round(max(values, default=0.0), 4)
+    # Hard timeline defects are deterministic and therefore probability one.
+    if timeline["start_inversions"] or timeline["invalid_ranges"]:
+        risks["timing"] = 1.0
+        risks["timeline_integrity"] = 1.0
+    overall_risk = max([*risks.values(), .92 if blocking else 0.0], default=0.0)
+    evidence_lineage = sorted({
+        str(source)
+        for segment in segments if isinstance(segment, dict)
+        for source in (segment.get("consensus_sources") or [])
+        if source
+    })
     return {
         "policy_version": POLICY_VERSION,
         "mode": policy_mode(),
         "decision": decision,
-        "score": max(0, score),
+        "score": (
+            round(100.0 * (1.0 - overall_risk), 1)
+            if calibration["calibrated"] else None
+        ),
+        "risk": round(overall_risk, 4),
+        "risk_dimensions": risks,
+        "risk_calibration": calibration,
         "render_blocked": blocking,
         "reasons": reasons,
         "metrics": {**coverage, **timeline},
-        "unsafe_windows": list(unsafe_windows or []),
-        "retry": retry_stats or {"attempted": False},
+        "unsafe_windows": unsafe_windows,
+        "shadow_decision": shadow_decision,
+        "retry": retry_stats,
+        "acoustic_evidence": acoustic_evidence,
+        "evidence_lineage": evidence_lineage,
         "segments_hash": segments_hash(segments),
         **runtime_identity(),
     }
 
 
 def can_render(quality: dict | None, *, revision: int,
-               segments: list[dict] | None = None) -> tuple[bool, str | None]:
+               segments: list[dict] | None = None, job_id: str = "",
+               tenant_id: str = "") -> tuple[bool, str | None]:
     """Render policy. Old jobs and observe mode remain backward compatible."""
+    runtime_mode = effective_policy_mode(job_id=job_id, tenant_id=tenant_id)
     if not quality:
-        if policy_mode() == "enforce":
+        if runtime_mode == "enforce":
             return False, "transcription_quality_unavailable"
         return True, None
-    if quality.get("mode") != "enforce" and policy_mode() != "enforce":
+    # Runtime observe is the authoritative emergency kill switch. Persisted
+    # evidence from an earlier enforce rollout must never keep blocking jobs.
+    if runtime_mode != "enforce":
         return True, None
     ack = quality.get("acknowledgement") or {}
     current_hash = segments_hash(segments or [])
     quality_is_current = (
         quality.get("policy_version") == POLICY_VERSION
+        and
+        quality.get("pipeline_release") == runtime_identity()["pipeline_release"]
         and
         quality.get("pipeline_config_fingerprint")
         == runtime_identity()["pipeline_config_fingerprint"]
@@ -376,11 +770,36 @@ def can_render(quality: dict | None, *, revision: int,
         quality.get("segments_hash") == current_hash
         and int(quality.get("evaluated_revision", -1)) == int(revision)
     )
-    if quality.get("decision") == "pass" and quality_is_current:
+    persisted_calibration = quality.get("risk_calibration") or {}
+    current_calibration = calibration_identity()
+    calibrated = bool(
+        persisted_calibration.get("calibrated")
+        and current_calibration.get("calibrated")
+        and persisted_calibration.get("calibration_id")
+        == current_calibration.get("calibration_id")
+        and persisted_calibration.get("release_report_sha256")
+        == current_calibration.get("release_report_sha256")
+        and persisted_calibration.get("manifest_sha256")
+        == current_calibration.get("manifest_sha256")
+    )
+    current_fingerprint = quality_fingerprint(
+        quality, revision=revision, content_hash=current_hash,
+    )
+    fingerprint_is_current = (
+        quality.get("quality_fingerprint") == current_fingerprint
+    )
+    if (quality.get("decision") == "pass" and quality_is_current
+            and calibrated and fingerprint_is_current):
         return True, None
-    if (int(ack.get("revision", -1)) == int(revision)
+    if (quality_is_current
+            and manual_override_allowed(quality)
+            and int(ack.get("revision", -1)) == int(revision)
             and ack.get("segments_hash") == current_hash
             and quality.get("policy_version") == POLICY_VERSION
-            and ack.get("policy_version") == POLICY_VERSION):
+            and ack.get("policy_version") == POLICY_VERSION
+            and ack.get("quality_fingerprint") == current_fingerprint
+            and confirmed_all_windows(
+                quality, ack.get("confirmed_window_ids") or [],
+            )):
         return True, None
     return False, "transcription_quality_review_required"

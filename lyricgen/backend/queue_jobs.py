@@ -15,6 +15,7 @@ durability, concurrency caps, and timeouts in the worst possible moment.
 
 import logging
 import os
+import hashlib
 import threading
 
 logger = logging.getLogger("genly.queue")
@@ -128,6 +129,36 @@ PRORES_PREWARM_TIMEOUT = int(os.environ.get("PRORES_PREWARM_TIMEOUT_SECONDS", "9
 RESULT_TTL = int(os.environ.get("JOB_RESULT_TTL_SECONDS", "86400"))  # 24 h
 FAILURE_TTL = int(os.environ.get("JOB_FAILURE_TTL_SECONDS", "604800"))  # 7 d
 _ENVIRONMENT = os.environ.get("ENVIRONMENT", "production").lower().strip() or "production"
+
+
+def transcription_quality_queue_enabled() -> bool:
+    return os.environ.get(
+        "TRANSCRIPTION_QUALITY_QUEUE_ENABLED", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def transcription_quality_rollout_eligible(
+    job_id: str, tenant_id: str | None = None,
+) -> bool:
+    """Stable pilot/percentage allocation; never random across retries."""
+    if not transcription_quality_queue_enabled():
+        return False
+    pilots = {
+        value.strip() for value in os.environ.get(
+            "TRANSCRIPTION_QUALITY_PILOT_TENANTS", "",
+        ).split(",") if value.strip()
+    }
+    if tenant_id and str(tenant_id) in pilots:
+        return True
+    try:
+        percentage = float(os.environ.get(
+            "TRANSCRIPTION_QUALITY_ROLLOUT_PERCENT", "0",
+        ))
+    except (TypeError, ValueError):
+        percentage = 0.0
+    percentage = max(0.0, min(100.0, percentage))
+    bucket = int(hashlib.sha256(str(job_id).encode("utf-8")).hexdigest()[:8], 16)
+    return bucket % 10_000 < round(percentage * 100)
 
 # Pre-warm the ProRes deliverables in a background worker job as soon as
 # the pipeline finishes the MP4 render. Trade-off: gasta ffmpeg en jobs
@@ -464,7 +495,7 @@ def cancel_rq_job(job_id: str) -> bool:
         # terminal state, and jobs.update_job's terminal-state guard would
         # silently discard the result (incident 2026-05-26).
         all_queues = [q_default, q_enterprise]
-        for extra_name in ("transcription", "bg_preview"):
+        for extra_name in ("transcription", "transcription_quality", "bg_preview"):
             try:
                 all_queues.append(_Q(extra_name, connection=r))
             except Exception:
@@ -513,6 +544,20 @@ def _evict_stale_rq_job(connection, rq_job_id: str) -> None:
         stale.delete()
     except Exception:
         pass  # no stale job, or Redis hiccup — proceed normally
+
+
+def _active_rq_job(connection, rq_job_id: str):
+    """Return an existing live job; terminal/missing entries return None."""
+    try:
+        from rq.job import Job as RQJob
+        existing = RQJob.fetch(rq_job_id, connection=connection)
+        status = existing.get_status(refresh=True)
+        value = str(getattr(status, "value", status) or "").lower()
+        if value in {"queued", "started", "deferred", "scheduled"}:
+            return existing
+    except Exception:
+        return None
+    return None
 
 
 def enqueue_pipeline(
@@ -790,6 +835,79 @@ def enqueue_bg_preview(
     )
     t.start()
     return f"thread:bgpreview:{job_id}"
+
+
+def enqueue_transcription_quality(job_id: str, *, expected_revision: int,
+                                  expected_segments_hash: str,
+                                  filename: str = "",
+                                  tenant_id: str | None = None) -> str:
+    """Queue suggestion-only quality analysis on its isolated worker.
+
+    Failure to enqueue never falls back to an API/short-worker thread: doing
+    so would defeat the latency isolation this queue exists to provide.
+    """
+    if not transcription_quality_queue_enabled():
+        try:
+            from ops_metrics import increment
+            increment("transcription_quality_queue_enqueue_disabled")
+        except Exception:
+            pass
+        return f"disabled:transcription-quality:{job_id}"
+    if not transcription_quality_rollout_eligible(job_id, tenant_id):
+        try:
+            from ops_metrics import increment
+            increment("transcription_quality_queue_rollout_excluded")
+        except Exception:
+            pass
+        return f"rollout-excluded:transcription-quality:{job_id}"
+    _require_submissions_open()
+    _init_redis()
+    if _redis is None:
+        raise RuntimeError("transcription quality queue unavailable")
+    from rq import Queue, Retry
+    from quality_jobs import (
+        run_transcription_quality_job,
+        transcription_quality_failure_callback,
+    )
+
+    queue = Queue("transcription_quality", connection=_redis)
+    rq_id = (
+        f"transcription-quality:{job_id}:{int(expected_revision)}:"
+        f"{expected_segments_hash[:12]}"
+    )
+    active = _active_rq_job(_redis, rq_id)
+    if active is not None:
+        try:
+            from ops_metrics import increment
+            increment("transcription_quality_queue_deduplicated")
+        except Exception:
+            pass
+        return active.id
+    _evict_stale_rq_job(_redis, rq_id)
+    queued = queue.enqueue(
+        run_transcription_quality_job,
+        args=(job_id,),
+        kwargs={
+            "expected_revision": int(expected_revision),
+            "expected_segments_hash": expected_segments_hash,
+            "filename": filename,
+        },
+        job_timeout=int(os.environ.get("TRANSCRIPTION_QUALITY_JOB_TIMEOUT", "1200")),
+        result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL,
+        job_id=rq_id,
+        meta=rq_payload_metadata(
+            "transcription_quality", expected_revision=int(expected_revision),
+            expected_segments_hash=expected_segments_hash,
+        ),
+        retry=Retry(max=1, interval=30),
+        on_failure=transcription_quality_failure_callback,
+    )
+    try:
+        from ops_metrics import increment
+        increment("transcription_quality_queue_enqueued")
+    except Exception:
+        pass
+    return queued.id
 
 
 def enqueue_prores_prewarm(

@@ -61,6 +61,12 @@ logger = logging.getLogger("uvicorn.error")
 
 MODEL_ID = os.environ.get(
     "CTC_ALIGN_MODEL", "jonatasgrosman/wav2vec2-large-xlsr-53-spanish")
+MODEL_REVISION = os.environ.get(
+    "CTC_ALIGN_MODEL_REVISION",
+    # Immutable HEAD published by the model repository. Override only with a
+    # separately benchmarked commit, never with a moving branch name.
+    "96d7e9b4e4a78af515a3c6d3cee7c0826045d276",
+).strip()
 SR = 16000
 FRAME = 320          # wav2vec2 stride: 1 emission frame per 320 samples (20 ms)
 CHUNK_S = 30.0       # encoder window
@@ -739,8 +745,12 @@ def _load_model():
     t0 = time.time()
     # NOT AutoProcessor: the model repo ships an optional LM decoder that
     # drags in pyctcdecode; we only need raw emissions + the char vocab.
-    tok = Wav2Vec2CTCTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCTC.from_pretrained(MODEL_ID).eval()
+    load_kwargs = {
+        "revision": MODEL_REVISION or None,
+        "trust_remote_code": False,
+    }
+    tok = Wav2Vec2CTCTokenizer.from_pretrained(MODEL_ID, **load_kwargs)
+    model = AutoModelForCTC.from_pretrained(MODEL_ID, **load_kwargs).eval()
     dictionary = {k.lower(): v for k, v in tok.get_vocab().items() if len(k) == 1}
     blank_id = tok.pad_token_id
     logger.info("[CTC] model %s loaded in %.1fs", MODEL_ID, time.time() - t0)
@@ -748,7 +758,8 @@ def _load_model():
     return _MODEL
 
 
-def _emissions(model, wav, blank_id: int, star_delta: float):
+def _emissions(model, wav, blank_id: int, star_delta: float,
+               *, append_star: bool = True):
     """Full-song (T, C+1) log-prob matrix — chunked encoder, exact global
     frame indices, synthetic star appended as the last class."""
     import torch
@@ -762,10 +773,11 @@ def _emissions(model, wav, blank_id: int, star_delta: float):
             x = wav[:, a:b]
             x = (x - x.mean()) / (x.std() + 1e-7)  # do_normalize
             em = torch.log_softmax(model(x).logits[0], dim=-1)
-            nb = em.clone()
-            nb[:, blank_id] = float("-inf")
-            star = nb.max(dim=-1, keepdim=True).values - star_delta
-            em = torch.cat([em, star], dim=-1)
+            if append_star:
+                nb = em.clone()
+                nb[:, blank_id] = float("-inf")
+                star = nb.max(dim=-1, keepdim=True).values - star_delta
+                em = torch.cat([em, star], dim=-1)
             # wav2vec2's conv stack emits floor((L-400)/320)+1 frames, so
             # the LAST chunk (no right context) can come out one frame
             # short of `hi` — python slicing tolerates it; the effect is
@@ -774,6 +786,177 @@ def _emissions(model, wav, blank_id: int, star_delta: float):
             hi = lo + (end - start) // FRAME
             pieces.append(em[lo:hi].cpu())
     return torch.cat(pieces)
+
+
+def window_emissions(audio_path: str, start: float, end: float):
+    """Return one bounded CTC emission matrix plus trusted model metadata.
+
+    This is the shared primitive used by quality-v5 contrastive scoring.  It
+    performs no text alignment and therefore can be safely cached by complete
+    audio/model/window identity.  Callers must keep the 45-second bound.
+    """
+    if not is_enabled() or not audio_path or not os.path.exists(audio_path):
+        return None
+    start, end = float(start), float(end)
+    if not (0.0 <= start < end and 1.0 <= end - start <= 45.0):
+        return None
+    import torchaudio
+
+    model, dictionary, blank_id = _load_model()
+    info = torchaudio.info(audio_path)
+    source_sr = info.sample_rate or SR
+    offset = max(0, int(start * source_sr))
+    frames = max(1, int((end - start) * source_sr))
+    wav, sr = torchaudio.load(
+        audio_path, frame_offset=offset, num_frames=frames,
+    )
+    wav = wav.mean(0, keepdim=True)
+    if sr != SR:
+        wav = torchaudio.functional.resample(wav, sr, SR)
+    if wav.shape[1] < SR:
+        return None
+    # Quality evidence uses the model's real normalized vocabulary. The
+    # synthetic star class is useful for timing Viterbi but is not a valid
+    # probability distribution for contrastive content scoring.
+    emission = _emissions(
+        model, wav, blank_id, _star_delta(), append_star=False,
+    )
+    return {
+        "emission": emission,
+        "dictionary": dictionary,
+        "blank_id": int(blank_id),
+        "vocab_size": int(model.config.vocab_size),
+        "model_id": MODEL_ID,
+        "model_revision": MODEL_REVISION,
+        "frame_seconds": FRAME / SR,
+        "window": [start, end],
+    }
+
+
+def score_structural_candidates_from_emission(
+    bundle: dict, candidates: list[dict],
+) -> list[dict]:
+    """Contrastively score complete text/topology candidates in one matrix.
+
+    Candidate anchors are acoustic-event starts.  Each candidate is aligned
+    inside independent monotonic slots, preventing repeated words from
+    consuming another cycle.  The function never accepts caller confidence;
+    all returned scores are derived from the trusted CTC emissions above.
+    """
+    import math
+    import numpy as np
+
+    emission = bundle.get("emission")
+    if emission is None:
+        return []
+    emission = np.asarray(emission, dtype=np.float64)
+    dictionary = bundle["dictionary"]
+    blank_id = int(bundle["blank_id"])
+    frame_to_s = float(bundle.get("frame_seconds") or FRAME / SR)
+    start, end = (float(value) for value in bundle["window"])
+    word_sep_id = (
+        dictionary.get("|")
+        if os.environ.get("CTC_ALIGN_WORD_SEP", "1").strip().lower() in _TRUE
+        else None
+    )
+    scored = []
+    for candidate in (candidates or [])[:8]:
+        texts = [str(value or "").strip() for value in candidate.get("texts") or []]
+        anchors = [float(value) for value in candidate.get("anchors") or []]
+        if not 1 <= len(texts) == len(anchors) <= 12:
+            continue
+        if any(not text for text in texts) or any(
+            right <= left for left, right in zip(anchors, anchors[1:])
+        ):
+            continue
+        if anchors[0] < start - .5 or anchors[-1] > end + .5:
+            continue
+        gaps = [right - left for left, right in zip(anchors, anchors[1:])]
+        median_gap = sorted(gaps)[len(gaps) // 2] if gaps else max(1.2, end - start)
+        events, line_scores = [], []
+        valid = True
+        for index, (text, anchor) in enumerate(zip(texts, anchors)):
+            slot_start = max(start, anchor - min(.55, median_gap * .10))
+            slot_end = (
+                min(end, anchors[index + 1] - .18)
+                if index + 1 < len(anchors)
+                else min(end, anchor + max(1.0, median_gap * .82))
+            )
+            if slot_end - slot_start < .35:
+                valid = False
+                break
+            lo = max(0, int((slot_start - start) / frame_to_s))
+            hi = min(len(emission), int((slot_end - start) / frame_to_s))
+            local = emission[lo:hi]
+            projected = singing_scoring_projection(text)
+            target_ids = []
+            projected_words = projected.split()
+            for word_index, word in enumerate(projected_words):
+                target_ids.extend(
+                    dictionary[char] for char in norm_word(word)
+                    if char in dictionary and dictionary[char] != blank_id
+                )
+                if word_sep_id is not None and word_index < len(projected_words) - 1:
+                    target_ids.append(word_sep_id)
+            real_tokens = len(target_ids)
+            # Coverage belongs to the canonical scoring target. Repeated
+            # surface vowels encode duration (``nooooo``), not five lexical
+            # graphemes; comparing against display spelling falsely rejected
+            # the exact sustained events this verifier must handle.
+            characters = sum(
+                len(norm_word(word)) for word in projected_words
+            ) or 1
+            if (
+                real_tokens / characters < .60
+                or not len(local)
+                or len(target_ids) >= len(local)
+            ):
+                valid = False
+                break
+            from ctc_dp import blank_logprob, ctc_forward_logprob
+            target_logprob = ctc_forward_logprob(local, target_ids, blank_id)
+            null_logprob = blank_logprob(local, blank_id)
+            if not math.isfinite(target_logprob):
+                valid = False
+                break
+            # Same-frame likelihood ratio against absence. Dividing by frame
+            # count makes events of different duration comparable; calibration
+            # still remains mandatory before acceptance.
+            score = (target_logprob - null_logprob) / max(1, len(local))
+            line_scores.append(float(score))
+            events.append({
+                "start": round(slot_start, 3),
+                "end": round(slot_end, 3),
+                "text": text,
+                "scoring_projection": projected,
+                "surface_spelling_verified": (
+                    singing_scoring_projection(text)
+                    == unicodedata.normalize("NFC", str(text or "").lower())
+                ),
+                "ctc_log_likelihood_ratio_per_frame": round(float(score), 6),
+            })
+        if not valid or len(events) != len(texts):
+            continue
+        ordered_scores = sorted(line_scores)
+        scored.append({
+            "candidate_id": str(candidate.get("candidate_id") or ""),
+            "source": str(candidate.get("source") or "unknown"),
+            "family": str(candidate.get("family") or "unknown"),
+            "mean_score": round(sum(line_scores) / len(line_scores), 6),
+            "median_score": round(ordered_scores[len(ordered_scores) // 2], 6),
+            "min_score": round(min(line_scores), 6),
+            "events": events,
+        })
+    return sorted(scored, key=lambda item: item["mean_score"], reverse=True)
+
+
+def singing_scoring_projection(text: str) -> str:
+    """Canonical target for singing; display spelling remains untouched."""
+    value = unicodedata.normalize("NFC", str(text or "").lower())
+    # A held vowel is duration evidence, not repeated lexical graphemes.
+    value = re.sub(r"([aeiouáéíóúü])\1{2,}", r"\1", value)
+    words = [norm_word(word) for word in value.split()]
+    return " ".join(word for word in words if word)
 
 
 def align_structural_window(audio_path: str, texts: list[str], start: float,

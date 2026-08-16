@@ -275,11 +275,13 @@ def test_catalogue_cannot_add_lexical_content_to_gemini_cycles():
     assert tc._canonicalize_cycle_vocalizations(cycles, targets, "real") == cycles
 
 
-def test_verified_hybrid_can_replace_wrong_cardinality_atomically(monkeypatch):
+def test_flags_cannot_apply_structural_candidate_without_calibrated_verdict(monkeypatch):
     monkeypatch.setenv("TRANSCRIPTION_QUALITY_MODE", "enforce")
     monkeypatch.setenv("TARGETED_GEMINI_VERIFY_ENABLED", "1")
     monkeypatch.setenv("TARGETED_ACOUSTIC_CTC_ENABLED", "1")
     monkeypatch.setenv("TARGETED_STRUCTURAL_AUTOREPAIR_ENABLED", "1")
+    monkeypatch.setenv("TARGETED_STRUCTURAL_AUTOREPAIR_MODE", "apply")
+    monkeypatch.setenv("TRANSCRIPTION_QUALITY_CALIBRATED", "1")
     starts = [60.8, 67.0, 73.2, 79.3]
     target_rows = [
         {
@@ -310,10 +312,10 @@ def test_verified_hybrid_can_replace_wrong_cardinality_atomically(monkeypatch):
     )
     assert stats["structural_hybrid_attempts"] == 1
     assert stats["structural_hybrid_accepts"] == 1
-    assert stats["structural_repairs"] == 1
-    assert stats["lines_replaced"] == 6
-    assert len(out["segments"]) == 4
-    assert [segment["start"] for segment in out["segments"]] == starts
+    assert stats["structural_repairs"] == 0
+    assert stats["lines_replaced"] == 0
+    assert stats["lines_suggested"] == 4
+    assert out["segments"] == target_rows
 
 
 def test_declined_hybrid_never_deletes_existing_rows(monkeypatch):

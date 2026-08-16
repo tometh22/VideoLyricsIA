@@ -90,6 +90,7 @@ def test_live_witness_applies_only_a_preexisting_catalogue_proposal(
     ]
     monkeypatch.setenv("LIVE_INDEPENDENT_VERIFY_ENABLED", "1")
     monkeypatch.setenv("TRANSCRIPTION_QUALITY_MODE", "enforce")
+    monkeypatch.setenv("TRANSCRIPTION_QUALITY_ENFORCE_PERCENT", "100")
     monkeypatch.setattr(vocal_sep, "separate_vocals", lambda *_a, **_k: str(stem))
     monkeypatch.setattr(pipeline, "_audio_duration", lambda *_a: 12.0)
     monkeypatch.setattr(gap_rescue, "_transcribe_window", lambda *_a, **_k: witness)
@@ -211,6 +212,7 @@ def test_poor_stem_witness_falls_back_to_better_blind_mix(
     monkeypatch.setenv("LIVE_INDEPENDENT_VERIFY_ENABLED", "1")
     monkeypatch.setenv("LIVE_INDEPENDENT_MIX_FALLBACK_ENABLED", "1")
     monkeypatch.setenv("TRANSCRIPTION_QUALITY_MODE", "enforce")
+    monkeypatch.setenv("TRANSCRIPTION_QUALITY_ENFORCE_PERCENT", "100")
     monkeypatch.setattr(vocal_sep, "separate_vocals", lambda *_a, **_k: str(stem))
     monkeypatch.setattr(pipeline, "_audio_duration", lambda *_a: 12.0)
 

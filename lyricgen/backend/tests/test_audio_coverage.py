@@ -169,7 +169,7 @@ def test_mismatch_no_acusa_sin_evidencia():
     assert text_mismatches(seg, words) == []
 
 
-def test_mismatch_accepts_fully_verified_structural_vocalization():
+def test_structural_lexical_anchor_cannot_bypass_vocalization_mismatch():
     from audio_coverage import text_mismatches
     words = _wtxt("Real Real Real", 60.9, paso=1.2)
     seg = [{
@@ -185,7 +185,9 @@ def test_mismatch_accepts_fully_verified_structural_vocalization():
             "acoustic_topology_stem_mix",
         ],
     }]
-    assert text_mismatches(seg, words) == []
+    mismatches = text_mismatches(seg, words)
+    assert len(mismatches) == 1
+    assert mismatches[0]["index"] == 0
 
 
 def test_mismatch_does_not_trust_partial_structural_provenance():

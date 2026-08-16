@@ -174,6 +174,70 @@ function formatTimestamp(seconds) {
   return `${m}:${s.toString().padStart(2, "0")}.${ms}`;
 }
 
+// Transcription quality v5 keeps the editor usable and scopes the render gate
+// to bounded acoustic windows. Normalize defensively because v4 jobs use the
+// flat {start,end,reasons} shape while v5 may wrap the range and name the id.
+function normalizeUnsafeWindows(quality) {
+  if (!Array.isArray(quality?.unsafe_windows)) return [];
+  return quality.unsafe_windows.flatMap((window, index) => {
+    if (!window || typeof window !== "object") return [];
+    const start = Number(window.start ?? window.start_s ?? window.range?.start);
+    const end = Number(window.end ?? window.end_s ?? window.range?.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start) return [];
+    const reasons = [
+      ...(Array.isArray(window.reasons) ? window.reasons : []),
+      ...(Array.isArray(window.risks) ? window.risks : []),
+      ...(window.reason ? [window.reason] : []),
+    ].map((item) => (typeof item === "string" ? item : item?.code))
+      .filter(Boolean);
+    return [{
+      ...window,
+      id: String(window.id ?? window.window_id ?? `${start.toFixed(3)}-${end.toFixed(3)}-${index}`),
+      start,
+      end,
+      reasons: [...new Set(reasons)],
+    }];
+  }).sort((a, b) => a.start - b.start || a.end - b.end);
+}
+
+function isTranscriptionQualityV5(quality) {
+  const explicitVersions = [quality?.schema_version, quality?.version, quality?.quality_version];
+  if (explicitVersions.some((value) => Number(value) === 5)) return true;
+  return /(?:^|[-_])v?5(?:$|[-_])/.test(String(quality?.policy_version || "").toLowerCase());
+}
+
+export function isServerQualityAcknowledgementCurrent({
+  quality, revision, dirty = false, focused = true,
+}) {
+  const acknowledgement = quality?.acknowledgement;
+  return Boolean(
+    focused
+    && !dirty
+    && acknowledgement?.segments_hash
+    && acknowledgement.segments_hash === quality?.segments_hash
+    && acknowledgement?.quality_fingerprint
+    && acknowledgement.quality_fingerprint === quality?.quality_fingerprint
+    && Number(acknowledgement.revision) === Number(revision)
+  );
+}
+
+function unsafeWindowReasonLabel(window, t) {
+  const codes = window.reasons || [];
+  if (codes.some((code) => /structur|cardinal|event_count|motif/.test(code))) {
+    return t("editor.quality_reason_structure") || "Cantidad o estructura vocal incierta";
+  }
+  if (codes.some((code) => /timing|align|boundary|overlap|inversion|start|end/.test(code))) {
+    return t("editor.quality_reason_timing") || "Timing incierto";
+  }
+  if (codes.some((code) => /voic|coverage|uncovered|vocal/.test(code))) {
+    return t("editor.quality_reason_voice") || "Voz sin cubrir";
+  }
+  if (codes.some((code) => /text|lexical|asr|content/.test(code))) {
+    return t("editor.quality_reason_text") || "Letra incierta";
+  }
+  return t("editor.quality_reason_uncertain") || "Evidencia insuficiente";
+}
+
 // Parse "M:SS.t", "M:SS", or a raw seconds value into a non-negative
 // float. Returns null when the string can't be interpreted, so the
 // caller can decide to ignore the edit instead of writing garbage.
@@ -815,6 +879,27 @@ export default function LyricsEditor({
       }] }),
     }).catch(() => {});
   }, [editorRequest, transcribeJobId]);
+  const heartbeatSeqRef = useRef(0);
+  useEffect(() => {
+    if (!editorRequest || !transcribeJobId || !editorV2Enabled) return undefined;
+    const heartbeat = () => {
+      const now = Date.now();
+      const clock = editorActiveClockRef.current;
+      if (!clock?.active || now - clock.lastActivityMs > 60_000) return;
+      heartbeatSeqRef.current += 1;
+      editorRequest(`/editor/${transcribeJobId}/activity/heartbeat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: editorSessionIdRef.current,
+          activity_seq: heartbeatSeqRef.current,
+        }),
+      }).catch(() => {});
+    };
+    heartbeat();
+    const interval = window.setInterval(heartbeat, 15_000);
+    return () => window.clearInterval(interval);
+  }, [editorRequest, editorV2Enabled, transcribeJobId]);
   const openedEventJobRef = useRef(null);
   useEffect(() => {
     if (!transcribeJobId || openedEventJobRef.current === transcribeJobId) return;
@@ -2554,7 +2639,7 @@ export default function LyricsEditor({
   const hasSuggestions = pendingSuggestions > 0;
   const blankCount = edited.filter((seg) => !(seg.text || "").trim()).length;
 
-  const _buildCleanedSegments = () => {
+  const approvalSegments = useMemo(() => {
     const sorted = sanitizeSegments(edited)
       .filter((seg) => (seg.text || "").trim())
       .sort((a, b) => a.start - b.start);
@@ -2568,7 +2653,81 @@ export default function LyricsEditor({
       }
       return { ...seg, end };
     });
-  };
+  }, [edited]);
+
+  const unsafeWindows = useMemo(
+    () => normalizeUnsafeWindows(transcriptionQuality),
+    [transcriptionQuality],
+  );
+  const focusedQualityReview = transcriptionQuality?.decision === "review_required"
+    && isTranscriptionQualityV5(transcriptionQuality)
+    && transcriptionQuality?.mode === "enforce"
+    && unsafeWindows.length > 0;
+  const fatalQualityFailure = transcriptionQuality?.decision === "retry_failed"
+    && isTranscriptionQualityV5(transcriptionQuality)
+    && transcriptionQuality?.mode === "enforce";
+  // Confirmation belongs to the exact render-relevant snapshot. A text or
+  // timing edit changes this key synchronously, so stale confirmations cannot
+  // authorize the next revision even before autosave returns its new number.
+  const qualityReviewKey = useMemo(() => JSON.stringify({
+    policy: transcriptionQuality?.policy_version || "quality-v5",
+    evaluatedRevision: transcriptionQuality?.evaluated_revision ?? null,
+    segmentsHash: transcriptionQuality?.segments_hash || null,
+    segments: approvalSegments.map((segment) => ({
+      start: segment.start,
+      end: segment.end,
+      text: segment.text,
+    })),
+  }), [approvalSegments, transcriptionQuality]);
+  const [qualityWindowReview, setQualityWindowReview] = useState({ key: null, ids: [] });
+  const serverAcknowledgement = transcriptionQuality?.acknowledgement;
+  const serverAcknowledgementCurrent = isServerQualityAcknowledgementCurrent({
+    quality: transcriptionQuality,
+    revision: segmentsRevision,
+    dirty: isDirty,
+    focused: focusedQualityReview,
+  });
+  const confirmedUnsafeWindowIds = useMemo(() => new Set(
+    serverAcknowledgementCurrent
+      ? (serverAcknowledgement?.confirmed_window_ids || [])
+      : (qualityWindowReview.key === qualityReviewKey ? qualityWindowReview.ids : []),
+  ), [qualityReviewKey, qualityWindowReview, serverAcknowledgement, serverAcknowledgementCurrent]);
+  const unconfirmedUnsafeWindows = focusedQualityReview
+    ? unsafeWindows.filter((window) => !confirmedUnsafeWindowIds.has(window.id))
+    : [];
+
+  const jumpToUnsafeWindow = useCallback((qualityWindow) => {
+    if (!qualityWindow) return;
+    seekTo(qualityWindow.start, false);
+    const overlapping = sanitizedEdited.find(
+      (segment) => segment.end >= qualityWindow.start && segment.start <= qualityWindow.end,
+    );
+    const nearest = overlapping || sanitizedEdited.reduce((best, segment) => (
+      !best || Math.abs(segment.start - qualityWindow.start) < Math.abs(best.start - qualityWindow.start)
+        ? segment : best
+    ), null);
+    if (nearest) {
+      setFocusedSegId(nearest._id);
+      setFlashReviewId(nearest._id);
+      window.setTimeout(
+        () => setFlashReviewId((current) => (current === nearest._id ? null : current)),
+        1200,
+      );
+      window.setTimeout(
+        () => rowRefs.current[nearest._id]?.scrollIntoView?.({ behavior: "smooth", block: "center" }),
+        0,
+      );
+    }
+  }, [sanitizedEdited, seekTo]);
+
+  const confirmUnsafeWindow = useCallback((qualityWindow) => {
+    setQualityWindowReview((current) => {
+      const ids = current.key === qualityReviewKey ? current.ids : [];
+      return ids.includes(qualityWindow.id)
+        ? current
+        : { key: qualityReviewKey, ids: [...ids, qualityWindow.id] };
+    });
+  }, [qualityReviewKey]);
 
   // Single-flight del CTA completo, incluido el flush de autosave que ocurre
   // ANTES de onApprove. El lock de App sólo cubre el POST /edit; no alcanzaba
@@ -2580,6 +2739,23 @@ export default function LyricsEditor({
   const [isApproving, setIsApproving] = useState(false);
 
   const runApprove = async ({ skipWrapWarning = false } = {}) => {
+    if (fatalQualityFailure) {
+      toast({
+        message: t("editor.quality_retry_failed")
+          || "El análisis de calidad falló y no puede confirmarse manualmente. Reintentá la transcripción.",
+        tone: "error",
+      });
+      return;
+    }
+    if (unconfirmedUnsafeWindows.length > 0) {
+      jumpToUnsafeWindow(unconfirmedUnsafeWindows[0]);
+      toast({
+        message: (t("editor.quality_approval_required") || "Confirmá las {count} zonas inseguras antes de generar.")
+          .replace("{count}", unconfirmedUnsafeWindows.length),
+        tone: "info",
+      });
+      return;
+    }
     if (editorV2Enabled && (!durableHydrated || durableEditor.loading)) {
       toast({ message: "Estamos cargando la última versión. Esperá un instante para aprobar.", tone: "info" });
       return;
@@ -2616,7 +2792,7 @@ export default function LyricsEditor({
       return;
     }
     setWrapWarning(null);
-    const cleaned = _buildCleanedSegments();
+    const cleaned = approvalSegments;
     const correctionSummary = summarizeOperatorCorrections(
       originalSegmentsRef.current || [], cleaned || [],
     );
@@ -2624,7 +2800,11 @@ export default function LyricsEditor({
     // it even when the machine originally passed: autosave may have advanced
     // the revision (or a sanitizer may have changed a few milliseconds), and
     // a verdict from the previous revision must never authorize the new one.
-    const qualityAcknowledged = Boolean(transcriptionQuality);
+    // Shadow/observe must be operationally invisible. Only an effective
+    // enforce payload asks the acknowledgement endpoint to bind a review.
+    const qualityAcknowledged = Boolean(
+      transcriptionQuality && transcriptionQuality?.mode === "enforce"
+    );
     const approvalTelemetry = {
       ...correctionSummary,
       duration_ms: Math.max(0, Date.now() - editorSessionStartedAtRef.current),
@@ -2643,7 +2823,12 @@ export default function LyricsEditor({
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ base_revision: revision }),
+            body: JSON.stringify({
+              base_revision: revision,
+              confirmed_window_ids: focusedQualityReview
+                ? unsafeWindows.map((qualityWindow) => qualityWindow.id)
+                : [],
+            }),
           },
         );
         if (response.ok) return true;
@@ -3008,6 +3193,8 @@ export default function LyricsEditor({
               : (submitLabel || (isBatch
                 ? (t("editor.approve_next") || "Aprobar y continuar")
                 : (t("editor.approve_generate") || "Aprobar y generar")))}
+            aria-describedby={unconfirmedUnsafeWindows.length > 0 ? "transcription-quality-review" : undefined}
+            data-quality-review-required={unconfirmedUnsafeWindows.length > 0 ? "true" : "false"}
             data-tour="editor-approve-floating"
             className="editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl bg-gradient-to-r from-brand to-brand-light px-5 text-sm font-semibold text-white shadow-xl shadow-brand/25 transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60"
           >
@@ -3033,18 +3220,90 @@ export default function LyricsEditor({
         </div>
       )}
 
-      {transcriptionQuality?.decision === "review_required" && (
-        <div className="mb-4 rounded-2xl ring-1 ring-red-400/35 bg-red-500/[0.08] px-4 py-3 flex items-start gap-3">
-          <svg className="w-5 h-5 text-red-300 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+      {["review_required", "retry_failed"].includes(transcriptionQuality?.decision)
+        && (!isTranscriptionQualityV5(transcriptionQuality)
+          || transcriptionQuality?.mode === "enforce") && (
+        <section
+          id="transcription-quality-review"
+          data-testid="quality-review-panel"
+          aria-labelledby="transcription-quality-title"
+          className="mb-4 rounded-2xl ring-1 ring-amber-400/30 bg-amber-500/[0.07] px-4 py-3 flex items-start gap-3"
+        >
+          <svg className="w-5 h-5 text-amber-300 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24" aria-hidden="true">
             <path d="M12 9v4m0 4h.01M10.3 3.6 2.1 18a2 2 0 0 0 1.7 3h16.4a2 2 0 0 0 1.7-3L13.7 3.6a2 2 0 0 0-3.4 0Z" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
-          <div>
-            <p className="text-xs font-semibold text-red-200">Revisión de letra necesaria antes de renderizar</p>
-            <p className="mt-1 text-xs text-red-100/80 leading-relaxed">
-              Detectamos {transcriptionQuality.unsafe_windows?.length || 1} zona(s) donde el texto o el timing no tienen evidencia suficiente. Revisalas escuchando el audio; al aprobar, tu confirmación quedará registrada para esta versión.
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p id="transcription-quality-title" className="text-xs font-semibold text-amber-100">
+                {t("editor.quality_title") || "Revisión focalizada de transcripción"}
+              </p>
+              {focusedQualityReview && (
+                <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ring-1 ${
+                  unconfirmedUnsafeWindows.length === 0
+                    ? "bg-emerald-400/10 text-emerald-200 ring-emerald-300/25"
+                    : "bg-amber-400/10 text-amber-100 ring-amber-300/20"
+                }`} aria-live="polite" data-testid="quality-review-progress">
+                  {unconfirmedUnsafeWindows.length === 0
+                    ? (t("editor.quality_reviewed_all") || "Zonas confirmadas")
+                    : (t("editor.quality_progress") || "{confirmed} de {total} confirmadas")
+                      .replace("{confirmed}", unsafeWindows.length - unconfirmedUnsafeWindows.length)
+                      .replace("{total}", unsafeWindows.length)}
+                </span>
+              )}
+            </div>
+            <p className="mt-1 text-xs text-amber-100/75 leading-relaxed">
+              {unsafeWindows.length > 0
+                ? (t("editor.quality_summary") || "Detectamos {count} zonas donde la letra o el timing necesitan escucha puntual.")
+                  .replace("{count}", unsafeWindows.length)
+                : (t("editor.quality_legacy_summary") || "Esta revisión necesita una comprobación manual antes de generar.")}
             </p>
+            {unsafeWindows.length > 0 && (
+              <ul className="mt-3 grid gap-2 sm:grid-cols-2" aria-label={t("editor.quality_windows_label") || "Zonas para revisar"}>
+                {unsafeWindows.map((qualityWindow, index) => {
+                  const confirmed = confirmedUnsafeWindowIds.has(qualityWindow.id);
+                  const range = `${formatTimestamp(qualityWindow.start)}–${formatTimestamp(qualityWindow.end)}`;
+                  return (
+                    <li key={qualityWindow.id} className="flex min-w-0 items-stretch rounded-xl bg-black/10 ring-1 ring-white/[0.07]">
+                      <button
+                        type="button"
+                        onClick={() => jumpToUnsafeWindow(qualityWindow)}
+                        aria-label={`${t("editor.quality_jump") || "Ir a la zona"} ${index + 1}: ${range}`}
+                        className="flex min-w-0 flex-1 items-center gap-2 rounded-l-xl px-3 py-2 text-left hover:bg-white/[0.05] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-light"
+                      >
+                        <span className="shrink-0 font-mono text-[11px] font-semibold tabular-nums text-white">{range}</span>
+                        <span className="truncate text-[11px] text-ink-secondary">{unsafeWindowReasonLabel(qualityWindow, t)}</span>
+                      </button>
+                      {focusedQualityReview && (
+                        <button
+                          type="button"
+                          onClick={() => confirmUnsafeWindow(qualityWindow)}
+                          aria-pressed={confirmed}
+                          aria-label={`${confirmed
+                            ? (t("editor.quality_confirmed") || "Zona confirmada")
+                            : (t("editor.quality_confirm") || "Confirmar zona")} ${index + 1}`}
+                          className={`shrink-0 rounded-r-xl border-l border-white/[0.07] px-3 text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-light ${
+                            confirmed
+                              ? "bg-emerald-400/10 text-emerald-200"
+                              : "text-amber-100 hover:bg-amber-400/10"
+                          }`}
+                        >
+                          {confirmed
+                            ? (t("editor.quality_confirmed") || "Confirmada")
+                            : (t("editor.quality_confirm") || "Confirmar")}
+                        </button>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            {focusedQualityReview && (
+              <p className="mt-2 text-[10px] leading-relaxed text-amber-100/60">
+                {t("editor.quality_reset_hint") || "Si cambiás la letra o los tiempos después de confirmar, deberás revisar estas zonas nuevamente."}
+              </p>
+            )}
           </div>
-        </div>
+        </section>
       )}
 
       {/* El panel de auto-fix (correcciones automáticas) ya NO es un banner
