@@ -280,12 +280,14 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
                                   language: str, antes_fmt: float | None,
                                   timing_consistency_fn, *, live_hint: bool = False):
     """Measure, retry only unsafe windows, and persist one final verdict."""
-    from transcription_quality import evaluate
+    from transcription_quality import calibration_identity, evaluate
 
+    calibrated = calibration_identity()["calibrated"]
     require_independent = bool(
-        live_hint
-        and os.environ.get("LIVE_INDEPENDENT_VERIFY_ENABLED", "0")
-        .strip().lower() in {"1", "true", "yes", "on"}
+        calibrated or (
+            live_hint and os.environ.get("LIVE_INDEPENDENT_VERIFY_ENABLED", "0")
+            .strip().lower() in {"1", "true", "yes", "on"}
+        )
     )
 
     r = _medir_cobertura_final(
@@ -301,7 +303,14 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     retry_stats = {"attempted": False}
     try:
         from targeted_consensus import is_enabled, reprocess
-        if initial.get("decision") != "pass" and windows and is_enabled():
+        inline_retry_enabled = (
+            os.environ.get("TRANSCRIPTION_QUALITY_INLINE_RETRY", "0")
+            .strip().lower() in {"1", "true", "yes", "on"}
+        )
+        if (
+            inline_retry_enabled
+            and initial.get("decision") != "pass" and windows and is_enabled()
+        ):
             r, retry_stats = await asyncio.to_thread(
                 reprocess, r, audio_path, windows,
                 language=language, job_id=job_id,
@@ -316,12 +325,20 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
                 windows = post.get("quality_windows") or []
     except Exception as exc:
         logger.warning("[QUALITY-GATE] targeted retry failed: %r job=%s", exc, job_id)
-        retry_stats = {"attempted": True, "declined": [f"exception:{type(exc).__name__}"]}
+        retry_stats = {
+            "attempted": True, "failed": True,
+            "failure_reason": f"exception:{type(exc).__name__}",
+            "declined": [f"exception:{type(exc).__name__}"],
+        }
+
+    diagnostics = retry_stats.get("structural_hybrid_diagnostics") or []
+    acoustic_evidence = diagnostics[-1].get("evidence") if diagnostics else None
 
     final = evaluate(
         r.get("segments") or [], post.get("coverage_final"),
         unsafe_windows=windows, retry_stats=retry_stats,
         require_independent=require_independent,
+        acoustic_evidence=acoustic_evidence,
     )
     final["initial_decision"] = initial.get("decision")
     final["initial_score"] = initial.get("score")
@@ -518,6 +535,9 @@ def run_transcription_job(
     try:
         segments = result.get("segments") if isinstance(result, dict) else None
         reference_lyrics = result.get("reference_lyrics", "") if isinstance(result, dict) else ""
+        quality = None
+        persisted_revision = 0
+        persisted_hash = ""
         # INCIDENT 2026-05-25: this used to be `status="transcribed"`
         # — that broke `/generate` which checks for `transcribed_pending`
         # before letting the user submit ("Job is in state 'transcribed',
@@ -545,20 +565,65 @@ def run_transcription_job(
                     "[segments-occ] transcription result discarded job=%s revision=%s",
                     job_id, current_revision,
                 )
+                quality = None
             else:
                 if segments is not None:
                     row.segments_json = segments
+                previous_quality = (
+                    dict(row.transcription_quality)
+                    if isinstance(row.transcription_quality, dict) else {}
+                )
                 quality = result.get("transcription_quality") if isinstance(result, dict) else None
                 if isinstance(quality, dict):
                     quality = dict(quality)
                     quality["evaluated_revision"] = current_revision
                     quality["timing_source"] = row.timing_source or "unknown"
+                    from transcription_quality import quality_fingerprint
+                    quality["quality_fingerprint"] = quality_fingerprint(
+                        quality,
+                        revision=current_revision,
+                        content_hash=str(quality.get("segments_hash") or ""),
+                    )
                     row.transcription_quality = quality
+                    from quality_shadow import record_shadow_decision
+                    record_shadow_decision(
+                        _persist_db, row, quality,
+                        previous_quality=previous_quality,
+                        evaluation_stage=(
+                            "terminal" if not quality.get("unsafe_windows")
+                            else "initial"
+                        ),
+                    )
             row.status = "transcribed_pending"
             row.current_step = "editing"
             _persist_db.commit()
+            persisted_revision = current_revision
+            persisted_tenant_id = str(row.tenant_id or "")
+            persisted_hash = (
+                quality.get("segments_hash") if isinstance(quality, dict) else None
+            )
         finally:
             _persist_db.close()
+        # Quality analysis is isolated from the latency-sensitive
+        # transcription/bg_preview fleet.  It is suggestion-only and OCC-bound
+        # to the exact revision/hash persisted above.
+        if (
+            isinstance(quality, dict)
+            and quality.get("decision") != "pass"
+            and quality.get("unsafe_windows")
+        ):
+            try:
+                from queue_jobs import enqueue_transcription_quality
+                enqueue_transcription_quality(
+                    job_id, expected_revision=persisted_revision,
+                    expected_segments_hash=persisted_hash or "",
+                    filename=filename, tenant_id=persisted_tenant_id,
+                )
+            except Exception as enqueue_exc:
+                logger.warning(
+                    "[QUALITY-QUEUE] enqueue declined job=%s: %r",
+                    job_id, enqueue_exc,
+                )
         # reference_lyrics no tiene columna en el modelo Job (defer a otro PR
         # si el editor lo necesita post-transcribe). Lo dejo en el log para
         # diagnóstico mientras tanto.

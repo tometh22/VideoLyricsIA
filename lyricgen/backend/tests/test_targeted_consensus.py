@@ -181,6 +181,25 @@ def test_cross_model_primary_can_confirm_bounded_insertion(monkeypatch):
     assert "primary" in out["segments"][0]["consensus_sources"]
 
 
+def test_global_enforce_does_not_mutate_job_outside_rollout(monkeypatch):
+    recovered = words("real wow wow", start=60.0)
+    monkeypatch.setenv("TRANSCRIPTION_QUALITY_MODE", "enforce")
+    monkeypatch.setenv("TRANSCRIPTION_QUALITY_ENFORCE_PERCENT", "0")
+    result = {
+        "segments": [], "_asr_words": recovered,
+        "live_audio_truth": True,
+    }
+    out, stats = tc.reprocess(
+        result, "mix.wav",
+        [{"start": 59, "end": 64, "reasons": ["uncovered_asr"]}],
+        job_id="outside-cohort", transcribe_fn=lambda *_a, **_k: recovered,
+        stem_path="stem.wav",
+    )
+    assert out["segments"] == []
+    assert stats["lines_inserted"] == 0
+    assert stats["lines_suggested"] == 1
+
+
 def test_full_song_witness_reserves_budget_before_targeted_windows(monkeypatch):
     monkeypatch.setenv("LIVE_ASR_MAX_BILLED_SECONDS", "600")
     result = {
@@ -288,7 +307,7 @@ def test_structural_repair_is_suggestion_only_in_observe_mode():
     assert stats["applied"] is False
 
 
-def test_reprocess_applies_gemini_verified_structural_block(monkeypatch):
+def test_reprocess_keeps_gemini_structural_block_as_suggestion(monkeypatch):
     starts = [60.8, 64.0, 67.2, 73.2]
     lines = ["Real wow wow"] * 4
     slow = event_words(lines, starts)
@@ -317,6 +336,8 @@ def test_reprocess_applies_gemini_verified_structural_block(monkeypatch):
         gemini_fn=lambda *_a, **_k: gemini_events(lines, starts),
         stem_path="stem.wav",
     )
-    assert stats["structural_repairs"] == 1
-    assert stats["structural_events"] == 4
+    assert stats["structural_repairs"] == 0
+    assert stats["structural_events"] == 0
+    assert stats["lines_suggested"] == 4
     assert len(out["segments"]) == 4
+    assert [row["text"] for row in out["segments"]] == ["Real"] * 4

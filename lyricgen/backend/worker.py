@@ -288,7 +288,7 @@ def _resolve_queue_names() -> list:
     doesn't preempt — once all render workers are inside long renders, a short
     transcription waits the full render time; a dedicated pool fixes that.
 
-    Default = all four queues = current single-pool behavior, so shipping this
+    Default = the legacy shared queues = current single-pool behavior, so shipping this
     is a zero-behavior-change until QUEUES is set per Railway service.
     """
     raw = os.environ.get("QUEUES", _DEFAULT_QUEUES)

@@ -110,40 +110,6 @@ def _norm_tokens(text: str) -> list[str]:
     return [t for t in s.split() if t]
 
 
-_STRUCTURAL_SOURCES = {
-    "gemini_audio_cardinality",
-    "ctc_vocal_stem",
-    "ctc_original_mix",
-    "acoustic_topology_stem_mix",
-}
-_VOCALIZATION_TOKENS = {
-    "ah", "aha", "eh", "hey", "oh", "ooh", "oooh", "uh", "uoh",
-    "uoo", "uou", "woah", "wow", "yeah",
-}
-
-
-def _verified_structural_vocalization(segment: dict, segment_tokens: list[str],
-                                      window_tokens: list[str]) -> bool:
-    """Whether primary ASR absence is superseded by stronger witnesses.
-
-    Whisper commonly emits each non-lexical ``uoh`` as another copy of the
-    preceding word.  A structural repair may bypass that self-contradiction
-    only when all four independent witnesses are present, the line consists
-    of one audible lexical anchor plus vocalizations, and that lexical anchor
-    is still present in the primary-ASR window.
-    """
-    sources = set(segment.get("consensus_sources") or [])
-    return bool(
-        segment.get("structural_hybrid")
-        and segment.get("structural_repair")
-        and _STRUCTURAL_SOURCES.issubset(sources)
-        and len(segment_tokens) >= 2
-        and segment_tokens[0] not in _VOCALIZATION_TOKENS
-        and all(token in _VOCALIZATION_TOKENS for token in segment_tokens[1:])
-        and segment_tokens[0] in window_tokens
-    )
-
-
 def text_mismatches(segments, words, *, min_ratio: float = 0.4,
                     min_window_words: int = 2,
                     pad: float = 0.3) -> list[dict]:
@@ -174,8 +140,6 @@ def text_mismatches(segments, words, *, min_ratio: float = 0.4,
         if len(win) < min_window_words:
             continue
         win_toks = _norm_tokens(" ".join(str(w.get("word", "")) for w in win))
-        if _verified_structural_vocalization(s, toks, win_toks):
-            continue
         ratio = _phonetic_ratio(toks, win_toks)
         if ratio < min_ratio:
             out.append({"index": i, "start": round(a, 2), "end": round(b, 2),

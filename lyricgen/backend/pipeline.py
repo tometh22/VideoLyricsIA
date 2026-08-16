@@ -922,6 +922,8 @@ def _transcription_quality_render_allowed(
             row.transcription_quality if row else None,
             revision=int(row.segments_revision or 0) if row else 0,
             segments=segments,
+            job_id=job_id,
+            tenant_id=str(row.tenant_id or "") if row else "",
         )
     finally:
         quality_db.close()
@@ -1302,7 +1304,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         _quality_reason, job_id,
                     )
                     update_job(
-                        job_id, status="error", current_step="quality_review",
+                        job_id, status="transcribed_pending",
+                        current_step="quality_review",
                         error=(
                             "La letra requiere revisión de calidad antes de renderizar "
                             f"({_quality_reason})."
@@ -1311,9 +1314,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     return
             except Exception as _quality_exc:
                 logger.exception("[QUALITY-GATE] central render check failed job=%s", job_id)
-                if os.environ.get("TRANSCRIPTION_QUALITY_MODE", "observe").lower() == "enforce":
+                from transcription_quality import policy_mode
+                if policy_mode() == "enforce":
                     update_job(
-                        job_id, status="error", current_step="quality_review",
+                        job_id, status="transcribed_pending",
+                        current_step="quality_review",
                         error="No se pudo verificar la calidad de la letra antes del render.",
                     )
                     return
@@ -17576,7 +17581,7 @@ def run_edit_pipeline(
                 quality_reason, job_id, edit_type,
             )
             update_job(
-                job_id, status="error", current_step="quality_review",
+                job_id, status="pending_review", current_step="quality_review",
                 error=(
                     "La letra requiere revisión de calidad antes de renderizar "
                     f"({quality_reason})."
@@ -17585,9 +17590,10 @@ def run_edit_pipeline(
             return
     except Exception:
         logger.exception("[QUALITY-GATE] edit render check failed job=%s", job_id)
-        if os.environ.get("TRANSCRIPTION_QUALITY_MODE", "observe").lower() == "enforce":
+        from transcription_quality import policy_mode
+        if policy_mode() == "enforce":
             update_job(
-                job_id, status="error", current_step="quality_review",
+                job_id, status="pending_review", current_step="quality_review",
                 error="No se pudo verificar la calidad de la letra antes del render.",
             )
             return

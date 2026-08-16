@@ -478,28 +478,58 @@ def _repair_structural_repetition(
     ]
     gemini = _gemini_cycles(gemini_events, motif)
     gemini = _canonicalize_cycle_vocalizations(gemini, targets, motif)
+    # v5 receives every bounded vocal event.  Filtering to cycles that begin
+    # with ``motif`` deleted valid trailing calls (for example ``no`` after a
+    # repeated refrain) before the acoustic layer could even inspect them.
+    gemini_all = sorted([
+        dict(event) for event in (gemini_events or [])
+        if isinstance(event, dict)
+        and str(event.get("text") or "").strip()
+        and _f(event.get("end")) >= window_start
+        and _f(event.get("start")) <= window_end
+    ], key=lambda event: _f(event.get("start")))
 
     candidate_events = []
     hybrid_verified = False
     if hybrid_enabled:
         stats["hybrid_attempted"] = True
-        if not gemini or not stem_path or not mix_path:
+        if not gemini_all or not stem_path or not mix_path:
             stats["reason"] = "hybrid_missing_evidence"
             return segments, stats
         if hybrid_fn is None:
             from structural_hybrid import verify as hybrid_fn
+        slow_events = [{
+            "start": _f(group[0].get("start")),
+            "end": _f(group[-1].get("end")),
+            "text": _text(group), "kind": "sung",
+        } for group in _event_groups(slowed_words) if group and _safe_line(group)]
+        support_events = [{
+            "start": _f(group[0].get("start")),
+            "end": _f(group[-1].get("end")),
+            "text": _text(group), "kind": "sung",
+        } for group in _event_groups(support_words) if group and _safe_line(group)]
         verdict = hybrid_fn(
-            stem_path, mix_path, gemini,
+            stem_path, mix_path, gemini_all,
             window_start=window_start, window_end=window_end, job_id=job_id,
+            content_hypotheses=[
+                {"source": "slowed_stem_whisper", "family": "openai_whisper",
+                 "events": slow_events},
+                {"source": "mix_primary_whisper", "family": "openai_whisper",
+                 "events": support_events},
+            ],
         ) or {}
         stats["hybrid"] = verdict
         if not verdict.get("accepted"):
             stats["reason"] = f"hybrid_{verdict.get('reason') or 'declined'}"
+            suggested = verdict.get("suggested_events") or []
+            if suggested:
+                stats.update({
+                    "suggested": True, "events": len(suggested),
+                    "hybrid_suggestion": suggested,
+                })
             return segments, stats
         candidate_events = [dict(event) for event in (verdict.get("events") or [])]
-        if len(candidate_events) != len(gemini):
-            stats["reason"] = "hybrid_cardinality_disagreement"
-            return segments, stats
+        enforce = bool(enforce and verdict.get("automatic_apply_allowed"))
         hybrid_verified = True
         stats["hybrid_accepted"] = True
     elif not (2 <= len(slow_groups) == len(gemini) <= 8):
@@ -559,6 +589,17 @@ def _repair_structural_repetition(
     # evidence. Extra verified events may be inserted only where they do not
     # overlap any retained row.
     if hybrid_verified:
+        stats.update({
+            "suggested": True, "reason": "hybrid_verified",
+            "events": len(candidate_events),
+            "events_inserted": len(candidate_events),
+            "hybrid_suggestion": candidate_events,
+        })
+        # Structural v5 remains suggestion-only until the frozen benchmark
+        # has calibrated pass precision.  The legacy boolean alone can never
+        # authorize destructive replacement.
+        if not enforce:
+            return segments, stats
         target_indices = {index for index, _segment in targets}
         candidate = [
             dict(segment) for index, segment in enumerate(segments or [])
@@ -572,14 +613,7 @@ def _repair_structural_repetition(
             return segments, stats
         candidate.extend(candidate_events)
         candidate.sort(key=lambda segment: _f(segment.get("start")))
-        stats.update({
-            "suggested": True, "reason": "hybrid_verified",
-            "events": len(candidate_events),
-            "targets_removed": len(target_indices),
-            "events_inserted": len(candidate_events),
-        })
-        if not enforce:
-            return segments, stats
+        stats["targets_removed"] = len(target_indices)
         stats["applied"] = True
         return candidate, stats
 
@@ -672,6 +706,7 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
     stats = {
         "attempted": False, "windows_considered": len(windows or []),
         "windows_processed": 0, "asr_calls": 0, "audio_seconds_billed": 0.0,
+        "openai_asr_seconds_billed": 0.0,
         "lines_replaced": 0, "lines_inserted": 0, "truncated_windows": 0,
         "lines_suggested": 0, "provider_attempts": 0,
         "submitted_audio_seconds": 0.0, "declined": [],
@@ -729,10 +764,8 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         hard_deadline_s = min(
             150.0, _env_float("TARGETED_CONSENSUS_DEADLINE_SECONDS", 120.0)
         )
-        allow_insertions = (
-            os.environ.get("TRANSCRIPTION_QUALITY_MODE", "observe").strip().lower()
-            == "enforce"
-        )
+        from transcription_quality import effective_policy_mode
+        allow_insertions = effective_policy_mode(job_id=job_id) == "enforce"
         slow_enabled = (
             os.environ.get("TARGETED_SLOW_STEM_ENABLED", "0")
             .strip().lower() in _TRUE
@@ -745,13 +778,15 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
             .strip().lower() in _TRUE
         )
         structural_autorepair_enabled = (
-            os.environ.get("TARGETED_STRUCTURAL_AUTOREPAIR_ENABLED", "0")
+            os.environ.get("TARGETED_STRUCTURAL_AUTOREPAIR_MODE", "observe")
+            .strip().lower() == "apply"
+            and os.environ.get("TRANSCRIPTION_QUALITY_CALIBRATED", "0")
             .strip().lower() in _TRUE
         )
-        structural_hybrid_enabled = (
-            os.environ.get("TARGETED_ACOUSTIC_CTC_ENABLED", "0")
-            .strip().lower() in _TRUE
-        )
+        acoustic_flag = os.environ.get("TARGETED_ACOUSTIC_STRUCTURE_ENABLED")
+        if acoustic_flag is None:
+            acoustic_flag = os.environ.get("TARGETED_ACOUSTIC_CTC_ENABLED", "0")
+        structural_hybrid_enabled = acoustic_flag.strip().lower() in _TRUE
         if gemini_fn is None:
             gemini_fn = _transcribe_gemini_events
 
@@ -794,10 +829,15 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
             stats["submitted_audio_seconds"] = round(
                 stats["submitted_audio_seconds"] + duration, 2
             )
-            stem_words = transcribe_fn(stem_path, start, duration, language or None, job_id or None)
+            # Conservative accounting at submission time: a provider timeout
+            # may still be billable and must never disappear from FinOps.
             stats["audio_seconds_billed"] = round(
                 stats["audio_seconds_billed"] + duration, 2
             )
+            stats["openai_asr_seconds_billed"] = round(
+                stats["openai_asr_seconds_billed"] + duration, 2
+            )
+            stem_words = transcribe_fn(stem_path, start, duration, language or None, job_id or None)
             slowed_words = []
             if slow_enabled:
                 stats["asr_calls"] += 1
@@ -828,6 +868,9 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                     stats["audio_seconds_billed"] = round(
                         stats["audio_seconds_billed"] + slow_duration, 2
                     )
+                    stats["openai_asr_seconds_billed"] = round(
+                        stats["openai_asr_seconds_billed"] + slow_duration, 2
+                    )
             if time.monotonic() - started_at >= hard_deadline_s:
                 stats["declined"].append("stage_deadline_after_stem")
                 break
@@ -835,6 +878,12 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
             stats["provider_attempts"] += 1
             stats["submitted_audio_seconds"] = round(
                 stats["submitted_audio_seconds"] + duration, 2
+            )
+            stats["audio_seconds_billed"] = round(
+                stats["audio_seconds_billed"] + duration, 2
+            )
+            stats["openai_asr_seconds_billed"] = round(
+                stats["openai_asr_seconds_billed"] + duration, 2
             )
             mix_words = transcribe_fn(audio_path, start, duration, language or None, job_id or None)
             gemini_events = []
@@ -863,20 +912,25 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                     stats["gemini_audio_seconds"] = round(
                         stats["gemini_audio_seconds"] + duration, 2
                     )
+            streams_for_log = {
+                "stem": _text(stem_words), "slow": _text(slowed_words),
+                "mix": _text(mix_words),
+                "primary": _text(_words_in(primary, start, end, pad=0.6)),
+                "witness": _text(_words_in(
+                    independent_witness, start, end, pad=0.6,
+                )),
+                "gemini": " ".join(
+                    str(event.get("text") or "") for event in gemini_events
+                ),
+            }
             logger.info(
-                "[TARGETED-CONSENSUS] evidence %.1f-%.1f stem=%r slow=%r "
-                "mix=%r primary=%r witness=%r gemini=%r job=%s",
-                start, end, _text(stem_words)[:240],
-                _text(slowed_words)[:240], _text(mix_words)[:240],
-                _text(_words_in(primary, start, end, pad=0.6))[:240],
-                _text(_words_in(independent_witness, start, end, pad=0.6))[:240],
-                [event.get("text") for event in gemini_events[:12]],
+                "[TARGETED-CONSENSUS] evidence %.1f-%.1f "
+                "stream_counts=%s job=%s",
+                start, end,
+                {name: len(value.split()) for name, value in streams_for_log.items()},
                 job_id,
             )
             stats["windows_processed"] += 1
-            stats["audio_seconds_billed"] = round(
-                stats["audio_seconds_billed"] + duration, 2
-            )
 
             if (
                 "live_structural_disagreement" in reasons
@@ -921,6 +975,45 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                             round(_f(event.get("start")), 3)
                             for event in hybrid.get("events") or []
                         ],
+                        "evidence": {
+                            "acoustic_structure": {
+                                "accepted": bool(
+                                    (hybrid.get("acoustic_structure") or {}).get("accepted")
+                                ),
+                                "reason": (
+                                    hybrid.get("acoustic_structure") or {}
+                                ).get("reason"),
+                                "window": (
+                                    hybrid.get("acoustic_structure") or {}
+                                ).get("window"),
+                                "best_partition": (
+                                    hybrid.get("acoustic_structure") or {}
+                                ).get("best_partition"),
+                                "cardinality_posterior": (
+                                    hybrid.get("acoustic_structure") or {}
+                                ).get("cardinality_posterior", {}),
+                                "motif_groups": (
+                                    hybrid.get("acoustic_structure") or {}
+                                ).get("motif_groups", []),
+                                "self_similarity": (
+                                    hybrid.get("acoustic_structure") or {}
+                                ).get("self_similarity", {}),
+                                "diagnostics": (
+                                    hybrid.get("acoustic_structure") or {}
+                                ).get("diagnostics", {}),
+                            },
+                            "content_mapping": {
+                                key: value for key, value in (
+                                    hybrid.get("content_mapping") or {}
+                                ).items() if key in {
+                                    "accepted", "reason", "margin", "events",
+                                    "unassigned_events", "strong_unassigned_events",
+                                    "evidence_lineage", "phonetic_verified",
+                                    "phonetic_evidence", "phonetic_candidates",
+                                    "selected_candidate_id",
+                                }
+                            },
+                        },
                     }
                     stats["structural_hybrid_diagnostics"].append(diagnostic)
                     logger.info(
@@ -1051,6 +1144,31 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                     })
                     stats["lines_inserted"] += 1
 
+        asr_rate = max(0.0, _env_float(
+            "QUALITY_OPENAI_ASR_USD_PER_MINUTE",
+            _env_float("QUALITY_ASR_USD_PER_MINUTE", 0.0),
+        ))
+        gemini_rate = max(0.0, _env_float(
+            "QUALITY_GEMINI_AUDIO_USD_PER_MINUTE", 0.0,
+        ))
+        stats["estimated_openai_asr_cost_usd"] = (
+            round(stats["openai_asr_seconds_billed"] / 60.0 * asr_rate, 6)
+            if asr_rate > 0 else None
+        )
+        stats["estimated_gemini_cost_usd"] = (
+            round(stats["gemini_audio_seconds"] / 60.0 * gemini_rate, 6)
+            if gemini_rate > 0 else None
+        )
+        known_costs = [
+            stats["estimated_openai_asr_cost_usd"],
+            stats["estimated_gemini_cost_usd"],
+        ]
+        stats["api_cost_usd"] = (
+            round(sum(known_costs), 6)
+            if all(value is not None for value in known_costs) else None
+        )
+        # Demucs/compute/storage still require allocation/reconciliation.
+        stats["cost_complete"] = False
         output = dict(result)
         output["segments"] = sorted(segments, key=lambda s: _f(s.get("start")))
         output.setdefault("postpass_stats", {})["targeted_consensus"] = stats

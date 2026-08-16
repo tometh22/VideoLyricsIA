@@ -108,6 +108,45 @@ afterEach(() => {
 });
 
 describe("Editor 2.0 stale draft recovery", () => {
+  it("starts activity telemetry only after the durable lock is acquired", async () => {
+    localStorage.clear();
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    let releaseLock;
+    const pendingLock = new Promise((resolve) => { releaseLock = resolve; });
+    const request = vi.fn(async (path, options = {}) => {
+      if (path === `/editor/${JOB}` && !options.method) {
+        return reply({
+          job_id: JOB, revision: 0, segments: SERVER, original_segments: SERVER,
+          updated_by: null, updated_at: "2026-08-06T10:00:00Z",
+          lock: { active: false },
+        });
+      }
+      if (path.endsWith("/lock/heartbeat")) return pendingLock;
+      if (path.endsWith("/activity/heartbeat")) return reply({ event_id: 1, revision: 0 });
+      if (path === "/analytics/events") return reply({ accepted: 1, rejected: 0 });
+      if (path.endsWith("/lock") && options.method === "DELETE") return reply({ released: true });
+      return reply({}, 404);
+    });
+
+    renderEditor(request);
+    await waitFor(() => expect(
+      request.mock.calls.some(([path]) => path.endsWith("/lock/heartbeat")),
+    ).toBe(true));
+    expect(request.mock.calls.some(([path]) => path.endsWith("/activity/heartbeat"))).toBe(false);
+
+    releaseLock(reply({
+      acquired: true, user: USER, expires_at: "2026-08-06T10:01:00Z",
+    }));
+    await waitFor(() => expect(
+      request.mock.calls.some(([path]) => path.endsWith("/activity/heartbeat")),
+    ).toBe(true));
+
+    const lockCall = request.mock.calls.findIndex(([path]) => path.endsWith("/lock/heartbeat"));
+    const activityCall = request.mock.calls.findIndex(([path]) => path.endsWith("/activity/heartbeat"));
+    expect(activityCall).toBeGreaterThan(lockCall);
+    expect(JSON.parse(request.mock.calls[activityCall][1].body)).toMatchObject({ activity_seq: 1 });
+  });
+
   it("explains a failed durable load and unblocks only after an explicit retry succeeds", async () => {
     localStorage.clear();
     let loadAttempts = 0;

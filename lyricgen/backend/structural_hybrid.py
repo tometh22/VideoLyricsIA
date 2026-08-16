@@ -1,10 +1,9 @@
-"""Bounded acoustic-topology + CTC witness for repeated live motifs.
+"""Bounded acoustic-structure + content mapping for unsafe live windows.
 
-This module is intentionally not a transcription engine.  Text and repeat
-cardinality must arrive from an independent witness (currently Gemini).  It
-only answers whether that ordered text can be placed unambiguously on both the
-isolated vocal stem and original mix.  Any missing/disagreeing evidence is a
-decline, never a partial repair.
+The production v5 route discovers vocal events without text/cardinality and
+then maps ASR/Gemini alternatives monotonically.  The older periodic CTC
+helpers remain below only for injectable regression compatibility; they are
+not authorized to mutate production lyrics.
 """
 from __future__ import annotations
 
@@ -30,9 +29,13 @@ _VOCALIZATION_TOKENS = {
 
 
 def is_enabled() -> bool:
-    return os.environ.get(
-        "TARGETED_ACOUSTIC_CTC_ENABLED", "0",
-    ).strip().lower() in _TRUE
+    value = os.environ.get("TARGETED_ACOUSTIC_STRUCTURE_ENABLED")
+    if value is None:
+        # Backwards-compatible rollout alias.  The old name overstated the
+        # implementation: v1 discovers acoustic structure but does not expose
+        # a production singing-language CTC verifier.
+        value = os.environ.get("TARGETED_ACOUSTIC_CTC_ENABLED", "0")
+    return value.strip().lower() in _TRUE
 
 
 def _env_float(name: str, default: float) -> float:
@@ -466,11 +469,85 @@ def verify(stem_path: str, mix_path: str, events: list[dict], *,
            ctc_fn: Callable | None = None,
            topology_fn: Callable | None = None,
            anchor_ctc_fn: Callable | None = None,
-           hypotheses_fn: Callable | None = None) -> dict:
+           hypotheses_fn: Callable | None = None,
+           content_hypotheses: list[dict] | None = None) -> dict:
     """Return a replacement candidate only after all witnesses agree."""
     stats = {"accepted": False, "reason": "disabled", "events": []}
     if not is_enabled():
         return stats
+    injected_legacy_path = any(
+        value is not None
+        for value in (ctc_fn, topology_fn, anchor_ctc_fn, hypotheses_fn)
+    )
+    if not injected_legacy_path:
+        # Production v5: discover acoustic events before looking at any text.
+        # The previous implementation passed len(events) into a nearly
+        # periodic grid search, so a mistaken Gemini cardinality became an
+        # acoustic "fact".  Keep that implementation below only as an
+        # injectable compatibility surface for focused legacy tests.
+        try:
+            from acoustic_structure import analyze_window
+            from phonetic_verifier import verify_content
+
+            structure = analyze_window(
+                stem_path, mix_path, window_start=window_start,
+                window_end=window_end,
+            )
+            stats["acoustic_structure"] = structure
+            if not structure.get("accepted"):
+                stats["reason"] = f"structure_{structure.get('reason') or 'declined'}"
+                return stats
+            hypotheses = list(content_hypotheses or [])
+            hypotheses.insert(0, {
+                "source": "gemini_audio", "family": "gemini_audio",
+                "events": [dict(event) for event in (events or [])],
+            })
+            mapping, phonetic = verify_content(
+                stem_path, mix_path, structure, hypotheses,
+                window_start=window_start, window_end=window_end,
+            )
+            stats["content_mapping"] = mapping
+            stats["phonetic_evidence"] = phonetic
+            stats["phase_margin"] = mapping.get("margin")
+            if not mapping.get("events"):
+                stats["reason"] = f"mapping_{mapping.get('reason') or 'declined'}"
+                return stats
+            proposed = []
+            for event in mapping["events"]:
+                proposed.append({
+                    **dict(event),
+                    "review": True,
+                    "consensus_reprocessed": True,
+                    "structural_repair": True,
+                    "structural_hybrid": True,
+                    "timing_source": "acoustic_dp_ctc_v1",
+                    "acoustic_event_ids": [event.get("id")],
+                    "structure_confidence": event.get("confidence"),
+                    "mapping_confidence": round(
+                        max(0.0, min(1.0, float(mapping.get("margin") or 0))), 4,
+                    ),
+                    "consensus_sources": [
+                        "acoustic_structure_v1", "vocal_stem_correlated_mix",
+                        str(event.get("content_source") or "content_lattice"),
+                    ],
+                })
+            stats.update({
+                "accepted": bool(mapping.get("accepted")),
+                "reason": "candidate_for_review" if mapping.get("accepted")
+                else str(mapping.get("reason") or "ambiguous_mapping"),
+                "events": proposed,
+                "suggested_events": proposed,
+                # Certification permits an operator-facing suggestion only.
+                # Automatic mutation remains locked behind the signed release
+                # gate, separately from model confidence.
+                "automatic_apply_allowed": False,
+                "calibration": "pending_benchmark",
+            })
+            return stats
+        except Exception as exc:
+            logger.warning("[STRUCTURAL-HYBRID-V5] decline: %r job=%s", exc, job_id)
+            stats["reason"] = f"exception:{type(exc).__name__}"
+            return stats
     texts = [str(event.get("text") or "").strip() for event in (events or [])]
     if not 2 <= len(texts) <= 8 or any(not text for text in texts):
         stats["reason"] = "invalid_candidate"
