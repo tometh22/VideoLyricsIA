@@ -150,6 +150,7 @@ def test_topology_first_path_uses_ctc_to_choose_a_distinct_phase(monkeypatch):
     )
     assert verdict["accepted"] is True
     assert [event["start"] for event in verdict["events"]] == [10.0, 16.0, 22.0]
+    assert all(event["review"] is False for event in verdict["events"])
     assert verdict["phase_margin"] > 0.3
 
 

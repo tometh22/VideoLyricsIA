@@ -108,6 +108,24 @@ def test_consensus_insertion_always_requires_operator_review():
     )
 
 
+def test_verified_structural_repair_is_not_pending_operator_review():
+    segment = {
+        **_segment(1, 2, "Real uoo uou"),
+        "consensus_reprocessed": True,
+        "structural_hybrid": True,
+        "review": False,
+    }
+    quality = tq.evaluate([segment], {
+        "audio_coverage": 1.0, "text_mismatches": 0,
+        "voiced_gap_s": 0, "uncovered_seconds": 0,
+    })
+    assert quality["decision"] == "pass"
+    assert not any(
+        reason["code"] == "consensus_insertions_pending_review"
+        for reason in quality["reasons"]
+    )
+
+
 def test_unsafe_windows_merge_overlapping_signals(monkeypatch):
     monkeypatch.setattr(
         "audio_coverage.text_mismatches",

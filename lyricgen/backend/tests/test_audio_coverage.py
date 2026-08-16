@@ -169,6 +169,39 @@ def test_mismatch_no_acusa_sin_evidencia():
     assert text_mismatches(seg, words) == []
 
 
+def test_mismatch_accepts_fully_verified_structural_vocalization():
+    from audio_coverage import text_mismatches
+    words = _wtxt("Real Real Real", 60.9, paso=1.2)
+    seg = [{
+        "start": 60.9,
+        "end": 65.1,
+        "text": "Real uoo uou",
+        "structural_hybrid": True,
+        "structural_repair": True,
+        "consensus_sources": [
+            "gemini_audio_cardinality",
+            "ctc_vocal_stem",
+            "ctc_original_mix",
+            "acoustic_topology_stem_mix",
+        ],
+    }]
+    assert text_mismatches(seg, words) == []
+
+
+def test_mismatch_does_not_trust_partial_structural_provenance():
+    from audio_coverage import text_mismatches
+    words = _wtxt("Real Real Real", 60.9, paso=1.2)
+    seg = [{
+        "start": 60.9,
+        "end": 65.1,
+        "text": "Real uoo uou",
+        "structural_hybrid": True,
+        "structural_repair": True,
+        "consensus_sources": ["ctc_vocal_stem"],
+    }]
+    assert len(text_mismatches(seg, words)) == 1
+
+
 def test_summarize_incluye_text_mismatches():
     from audio_coverage import summarize
     words = _wtxt("estuve rodando por ahi sin parar", 10.0)
