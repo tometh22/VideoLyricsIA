@@ -37,6 +37,9 @@ def _seed(status="draft", passed=False, candidate_config=None):
             }, version=1,
             first_seen_at=now, last_seen_at=now, updated_at=now,
         ))
+        # Persist the parent explicitly so this fixture exercises the real
+        # PostgreSQL foreign key without depending on ORM insert ordering.
+        db.flush()
         db.add(QualityFixProposal(
             id=proposal_id, pattern_id=pattern_id, proposal_type="routing_rule",
             title="Confirmar mezcla", hypothesis="Asociación; requiere ablation",
