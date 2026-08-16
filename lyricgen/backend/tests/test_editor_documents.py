@@ -88,6 +88,31 @@ def test_editor_document_is_shared_by_tenant_and_conflicts_are_explicit(client):
     assert detail["server_segments"][0]["text"] == "ONE"
 
 
+def test_machine_transcription_checkpoint_is_never_pruned(db):
+    first, _second, job_id = _users_and_job("editor_machine_history")
+    job = db.query(Job).filter(Job.job_id == job_id).one()
+    document = db.query(EditorDocument).filter(EditorDocument.job_id == job_id).one()
+    machine = db.query(EditorVersion).filter(
+        EditorVersion.job_id == job_id,
+        EditorVersion.revision == 0,
+    ).one()
+    machine.reason = "transcription"
+    machine.provenance = {"schema": "machine-transcription-lineage-v1"}
+    db.flush()
+    for index in range(55):
+        document, _version, _applied = save_document(
+            db, job, document, first.id, document.revision,
+            [{"start": 0, "end": 1, "text": f"edit-{index}"}],
+            "manual",
+        )
+    db.flush()
+    preserved = db.query(EditorVersion).filter(
+        EditorVersion.id == machine.id,
+    ).one_or_none()
+    assert preserved is not None
+    assert preserved.provenance["schema"] == "machine-transcription-lineage-v1"
+
+
 def test_editor_activity_heartbeat_uses_server_snapshot_and_identity(client):
     first, _second, job_id = _users_and_job("editor_activity")
     token = _token_for(first)

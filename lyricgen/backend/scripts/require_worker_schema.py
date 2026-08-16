@@ -8,7 +8,16 @@ from sqlalchemy import text
 from database import engine
 
 
-REQUIRED_COLUMNS = {("jobs", "transcription_quality")}
+REQUIRED_COLUMNS = {
+    ("jobs", "transcription_quality"),
+    ("jobs", "quality_learning_epoch"),
+    ("jobs", "quality_learning_invalidated_at"),
+    ("editor_versions", "provenance"),
+    ("correction_observations", "hmac_key_id"),
+    ("quality_patterns", "fingerprint"),
+    ("quality_fix_proposals", "candidate_config"),
+    ("quality_experiment_runs", "candidate_config_hash"),
+}
 
 
 try:
@@ -27,8 +36,6 @@ while True:
                 SELECT table_name, column_name
                 FROM information_schema.columns
                 WHERE table_schema = 'public'
-                  AND table_name = 'jobs'
-                  AND column_name = 'transcription_quality'
             """)).all()
         present = {(row[0], row[1]) for row in rows}
         missing = REQUIRED_COLUMNS - present

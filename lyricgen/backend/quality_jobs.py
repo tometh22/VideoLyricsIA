@@ -126,6 +126,20 @@ def _persist_if_current(job_id: str, expected_revision: int,
         quality = dict(quality)
         quality["evaluated_revision"] = revision
         quality["segments_hash"] = current_hash
+        try:
+            from quality_learning_model import shadow_prediction_for_quality
+            quality["learning_shadow"] = shadow_prediction_for_quality(
+                quality, str(row.timing_source or "unknown"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[QUALITY-LEARNING] shadow prediction unavailable job=%s error=%s",
+                job_id, str(exc)[:160],
+            )
+            quality["learning_shadow"] = {
+                "available": False, "reason": "prediction_failed",
+                "mutated_segments": False,
+            }
         new_fingerprint = quality_fingerprint(
             quality, revision=revision, content_hash=current_hash,
         )
@@ -457,6 +471,8 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             "stem_cache_hit": bool(retry_stats.get("stem_cache_hit")),
             "source_audio_bytes": source_audio_bytes,
             "stem_audio_bytes": stem_audio_bytes,
+            "audio_sha256": audio_hash,
+            "stem_sha256": stem_hash,
             "api_cost_usd": retry_stats.get("api_cost_usd"),
             "cost_complete": bool(retry_stats.get("cost_complete", False)),
         }

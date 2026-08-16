@@ -343,6 +343,10 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     final["initial_decision"] = initial.get("decision")
     final["initial_score"] = initial.get("score")
     final["evaluated_revision"] = 0
+    final_metrics = dict(final.get("metrics") or {})
+    final_metrics["is_live"] = bool(live_hint)
+    final_metrics["language"] = str(language or "unknown")[:16]
+    final["metrics"] = final_metrics
     r["transcription_quality"] = final
     if final["decision"] == "pass":
         logger.info("[QUALITY-GATE] PASS score=%s job=%s", final["score"], job_id)
@@ -439,6 +443,9 @@ def run_transcription_job(
     except Exception as exc:
         detail = getattr(exc, "detail", None) or str(exc)
         return _fail(job_id, f"Archivo de audio inválido: {str(detail)[:200]}")
+
+    from quality_cache import sha256_file
+    source_audio_sha256 = sha256_file(audio_path)
 
     # 3. Llamar al pipeline async existente. `request` y `current_user` son
     #    ignorados dentro del cuerpo (verified) — passing None es seguro.
@@ -569,6 +576,14 @@ def run_transcription_job(
             else:
                 if segments is not None:
                     row.segments_json = segments
+                    # Freeze the exact machine snapshot before the editor can
+                    # autosave. Lazy creation was too late for legacy clients:
+                    # their first save could become `original_segments`.
+                    from editor import get_or_create_document
+                    get_or_create_document(
+                        _persist_db, job_id, row.tenant_id, segments,
+                        initial_reason="transcription",
+                    )
                 previous_quality = (
                     dict(row.transcription_quality)
                     if isinstance(row.transcription_quality, dict) else {}
@@ -576,8 +591,19 @@ def run_transcription_job(
                 quality = result.get("transcription_quality") if isinstance(result, dict) else None
                 if isinstance(quality, dict):
                     quality = dict(quality)
+                    quality["audio_sha256"] = source_audio_sha256
                     quality["evaluated_revision"] = current_revision
                     quality["timing_source"] = row.timing_source or "unknown"
+                    try:
+                        from quality_learning_model import shadow_prediction_for_quality
+                        quality["learning_shadow"] = shadow_prediction_for_quality(
+                            quality, quality["timing_source"],
+                        )
+                    except Exception:
+                        quality["learning_shadow"] = {
+                            "available": False, "reason": "prediction_failed",
+                            "mutated_segments": False,
+                        }
                     from transcription_quality import quality_fingerprint
                     quality["quality_fingerprint"] = quality_fingerprint(
                         quality,
@@ -585,6 +611,12 @@ def run_transcription_job(
                         content_hash=str(quality.get("segments_hash") or ""),
                     )
                     row.transcription_quality = quality
+                    from correction_learning import machine_snapshot_provenance
+                    from editor import attach_machine_provenance
+                    attach_machine_provenance(
+                        _persist_db, job_id,
+                        machine_snapshot_provenance(row, quality),
+                    )
                     from quality_shadow import record_shadow_decision
                     record_shadow_decision(
                         _persist_db, row, quality,

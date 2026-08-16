@@ -137,6 +137,14 @@ def transcription_quality_queue_enabled() -> bool:
     ).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def quality_learning_capture_enabled() -> bool:
+    return (
+        transcription_quality_queue_enabled()
+        and os.environ.get("QUALITY_LEARNING_CAPTURE_ENABLED", "0").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+
 def transcription_quality_rollout_eligible(
     job_id: str, tenant_id: str | None = None,
 ) -> bool:
@@ -907,6 +915,141 @@ def enqueue_transcription_quality(job_id: str, *, expected_revision: int,
         increment("transcription_quality_queue_enqueued")
     except Exception:
         pass
+    return queued.id
+
+
+def enqueue_correction_learning(job_id: str, approved_version_id: str, *,
+                                active_edit_ms: int | None = None,
+                                source_confidence: str = "exact",
+                                session_id: str | None = None) -> str:
+    """Capture one approved correction on the isolated quality queue.
+
+    This never falls back to an API thread and never participates in the
+    percentage rollout: capture has its own explicit kill switch.
+    """
+    if not quality_learning_capture_enabled():
+        return f"disabled:correction-learning:{job_id}"
+    _init_redis()
+    if _redis is None:
+        raise RuntimeError("correction learning queue unavailable")
+    from rq import Queue, Retry
+    from correction_learning import derive_server_active_edit_ms, hmac_identifier
+    from database import EditorDocument, EditorVersion, SessionLocal
+    from evidence_attestation import lyric_snapshot_hash
+    from quality_learning_jobs import run_correction_observation_job
+
+    snapshot_db = SessionLocal()
+    try:
+        document = snapshot_db.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        version = snapshot_db.query(EditorVersion).filter(
+            EditorVersion.id == approved_version_id,
+            EditorVersion.job_id == job_id,
+            EditorVersion.is_approved.is_(True),
+        ).one()
+        if int(document.revision or 0) != int(version.revision):
+            raise RuntimeError("approved correction snapshot is already stale")
+        expected_revision = int(document.revision or 0)
+        expected_approved_hash = lyric_snapshot_hash(version.segments or [])
+        expected_learning_epoch = int(document.job.quality_learning_epoch or 0)
+        # The browser-provided active_edit_ms remains telemetry only. Learning
+        # gates consume exclusively contiguous server-side heartbeat evidence.
+        server_active_edit_ms = derive_server_active_edit_ms(
+            snapshot_db, document.job, version, session_id,
+        )
+    finally:
+        snapshot_db.close()
+
+    queue = Queue("transcription_quality", connection=_redis)
+    rq_id = f"correction-learning:{job_id}:{approved_version_id}"
+    active = _active_rq_job(_redis, rq_id)
+    if active is not None:
+        return active.id
+    _evict_stale_rq_job(_redis, rq_id)
+    queued = queue.enqueue(
+        run_correction_observation_job,
+        args=(job_id, approved_version_id),
+        kwargs={
+            "active_edit_ms": server_active_edit_ms,
+            "active_edit_source": (
+                "server_product_events_v1" if server_active_edit_ms is not None else None
+            ),
+            "source_confidence": source_confidence,
+            "session_hmac": hmac_identifier("editor_session", session_id),
+            "expected_revision": expected_revision,
+            "expected_approved_hash": expected_approved_hash,
+            "expected_learning_epoch": expected_learning_epoch,
+        },
+        job_timeout=int(os.environ.get("QUALITY_LEARNING_JOB_TIMEOUT", "600")),
+        result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL, job_id=rq_id,
+        retry=Retry(max=1, interval=30),
+        meta=rq_payload_metadata(
+            "correction_learning", approved_version_id=approved_version_id,
+        ),
+    )
+    return queued.id
+
+
+def ensure_daily_quality_learning_scheduled() -> str | None:
+    """Keep exactly one daily miner wake-up in RQ's scheduled registry."""
+    # Schedule the wake-up whenever the isolated queue exists. The job itself
+    # checks mining's kill switch and re-schedules while disabled, so turning
+    # mining back on never depends on a worker restart.
+    if not transcription_quality_queue_enabled():
+        return None
+    _init_redis()
+    if _redis is None:
+        return None
+    from datetime import datetime, timedelta, timezone
+    from rq import Queue
+    from quality_learning_jobs import run_daily_quality_learning
+
+    queue = Queue("transcription_quality", connection=_redis)
+    tomorrow = (datetime.now(timezone.utc) + timedelta(hours=24)).date().isoformat()
+    rq_id = f"quality-learning:daily:{tomorrow}"
+    active = _active_rq_job(_redis, rq_id)
+    if active is not None:
+        return active.id
+    _evict_stale_rq_job(_redis, rq_id)
+    queued = queue.enqueue_in(
+        timedelta(hours=24), run_daily_quality_learning,
+        job_timeout=int(os.environ.get("QUALITY_LEARNING_MINING_TIMEOUT", "900")),
+        result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL, job_id=rq_id,
+        meta=rq_payload_metadata("quality_learning_daily"),
+    )
+    return queued.id
+
+
+def enqueue_quality_proposal_validation(proposal_id: str,
+                                        experiment_id: str) -> str:
+    if not quality_learning_capture_enabled():
+        raise RuntimeError("quality learning is disabled")
+    if os.environ.get("QUALITY_LEARNING_PROPOSALS_ENABLED", "0").strip().lower() not in {
+        "1", "true", "yes", "on",
+    }:
+        raise RuntimeError("quality learning proposals are disabled")
+    if os.environ.get("QUALITY_LEARNING_ABLATIONS_ENABLED", "0").strip().lower() not in {
+        "1", "true", "yes", "on",
+    }:
+        raise RuntimeError("quality learning ablations are disabled")
+    _init_redis()
+    if _redis is None:
+        raise RuntimeError("quality learning queue unavailable")
+    from rq import Queue
+    from quality_learning_jobs import run_quality_proposal_validation
+
+    queue = Queue("transcription_quality", connection=_redis)
+    rq_id = f"quality-learning-validation:{proposal_id}:{experiment_id}"
+    queued = queue.enqueue(
+        run_quality_proposal_validation, args=(proposal_id, experiment_id),
+        job_timeout=int(os.environ.get("QUALITY_LEARNING_VALIDATION_TIMEOUT", "3600")),
+        result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL, job_id=rq_id,
+        meta=rq_payload_metadata(
+            "quality_learning_validation", proposal_id=proposal_id,
+            experiment_id=experiment_id,
+        ),
+    )
     return queued.id
 
 
