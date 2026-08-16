@@ -880,26 +880,54 @@ export default function LyricsEditor({
     }).catch(() => {});
   }, [editorRequest, transcribeJobId]);
   const heartbeatSeqRef = useRef(0);
+  const heartbeatInFlightRef = useRef(false);
   useEffect(() => {
-    if (!editorRequest || !transcribeJobId || !editorV2Enabled) return undefined;
-    const heartbeat = () => {
+    // The activity sample is deliberately downstream of durable hydration and
+    // lock acquisition. Starting it during the first GET races the lazy
+    // EditorDocument migration (especially under React StrictMode) and can
+    // leave the editor waiting forever on its own document row lock.
+    if (
+      !editorRequest || !transcribeJobId || !editorV2Enabled
+      || !durableEditor.document || durableEditor.lock?.acquired !== true
+    ) return undefined;
+    let stopped = false;
+    const heartbeat = async () => {
       const now = Date.now();
       const clock = editorActiveClockRef.current;
-      if (!clock?.active || now - clock.lastActivityMs > 60_000) return;
-      heartbeatSeqRef.current += 1;
-      editorRequest(`/editor/${transcribeJobId}/activity/heartbeat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id: editorSessionIdRef.current,
-          activity_seq: heartbeatSeqRef.current,
-        }),
-      }).catch(() => {});
+      if (
+        stopped || heartbeatInFlightRef.current
+        || !clock?.active || now - clock.lastActivityMs > 60_000
+      ) return;
+      heartbeatInFlightRef.current = true;
+      const nextSequence = heartbeatSeqRef.current + 1;
+      try {
+        const response = await editorRequest(
+          `/editor/${transcribeJobId}/activity/heartbeat`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              session_id: editorSessionIdRef.current,
+              activity_seq: nextSequence,
+            }),
+          },
+        );
+        // Advance only after the server accepted the sample. A timeout or a
+        // StrictMode remount must not create a permanent sequence gap.
+        if (response.ok) heartbeatSeqRef.current = nextSequence;
+      } catch { /* operational telemetry never blocks editing */ }
+      finally { heartbeatInFlightRef.current = false; }
     };
     heartbeat();
     const interval = window.setInterval(heartbeat, 15_000);
-    return () => window.clearInterval(interval);
-  }, [editorRequest, editorV2Enabled, transcribeJobId]);
+    return () => {
+      stopped = true;
+      window.clearInterval(interval);
+    };
+  }, [
+    durableEditor.document, durableEditor.lock?.acquired,
+    editorRequest, editorV2Enabled, transcribeJobId,
+  ]);
   const openedEventJobRef = useRef(null);
   useEffect(() => {
     if (!transcribeJobId || openedEventJobRef.current === transcribeJobId) return;

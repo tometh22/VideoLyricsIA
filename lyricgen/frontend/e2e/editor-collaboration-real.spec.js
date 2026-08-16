@@ -42,6 +42,11 @@ async function openEditor(browser, token) {
   }
   await page.getByRole("button", { name: /4 Lyrics/ }).click();
   await expect(page.getByTestId("editor-mode-explainer")).toBeVisible();
+  // The editor shell renders before its durable document is hydrated. A real
+  // user is blocked by the "Preparando editor" overlay during that window;
+  // Playwright's programmatic fill can otherwise reach the input underneath
+  // and create a race that no user can produce.
+  await expect(page.getByTestId("lyrics-editor")).toHaveAttribute("aria-busy", "false");
   return { context, page };
 }
 
