@@ -56,6 +56,9 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///test.db")
 os.environ["JWT_SECRET"] = "test-secret-key-for-tests"
 os.environ["ADMIN_PASSWORD"] = "testadmin123"
 os.environ["RATE_LIMIT_ENABLED"] = "false"
+os.environ.setdefault("QUALITY_LEARNING_HMAC_KEY_ID", "test-v1")
+os.environ.setdefault("QUALITY_LEARNING_PROPOSALS_ENABLED", "1")
+os.environ.setdefault("QUALITY_LEARNING_ABLATIONS_ENABLED", "1")
 # CI defaults ENVIRONMENT unset → main.py sees "production" and the CORS
 # check (PR #7) raises at import because CORS_ORIGINS is also unset.
 # Tests don't make cross-origin requests, so flag the test env explicitly.

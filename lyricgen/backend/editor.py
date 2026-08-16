@@ -14,7 +14,10 @@ from sqlalchemy.orm import Session
 from database import EditorDocument, EditorVersion, Job, User
 from segment_timing import canonicalize_editor_segments
 
-EDITOR_REASONS = {"autosave", "manual", "restore", "approve", "conflict", "migration"}
+EDITOR_REASONS = {
+    "autosave", "manual", "restore", "approve", "conflict", "migration",
+    "transcription",
+}
 EDITOR_CHECKPOINTS = EDITOR_REASONS | {"draft"}
 MAX_SEGMENTS = 5000
 MAX_TEXT_LENGTH = 2000
@@ -157,6 +160,7 @@ def _ensure_version(
     reason: str,
     *,
     approved: bool = False,
+    provenance: dict | None = None,
 ) -> EditorVersion:
     existing = db.query(EditorVersion).filter(
         EditorVersion.job_id == document.job_id,
@@ -168,11 +172,13 @@ def _ensure_version(
         if approved:
             existing.is_approved = True
             existing.reason = "approve"
+        if provenance and existing.provenance is None:
+            existing.provenance = provenance
         return existing
     version = EditorVersion(
         id=str(uuid.uuid4()), job_id=document.job_id, tenant_id=document.tenant_id,
         revision=revision, segments=segments, created_by=user_id,
-        reason=reason, is_approved=approved,
+        reason=reason, is_approved=approved, provenance=provenance,
     )
     db.add(version)
     db.flush()
@@ -182,7 +188,11 @@ def _ensure_version(
 def _prune_versions(db: Session, document: EditorDocument) -> None:
     drafts = (
         db.query(EditorVersion)
-        .filter(EditorVersion.job_id == document.job_id, EditorVersion.is_approved.is_(False))
+        .filter(
+            EditorVersion.job_id == document.job_id,
+            EditorVersion.is_approved.is_(False),
+            EditorVersion.reason != "transcription",
+        )
         .order_by(EditorVersion.revision.desc())
         .all()
     )
@@ -197,7 +207,9 @@ def _next_revision(db: Session, document: EditorDocument, *candidates: int) -> i
     return max(int(highest_version or 0), int(document.revision or 0), *candidates) + 1
 
 
-def ensure_document(db: Session, job_id: str, tenant_id: str, segments: list[dict]) -> EditorDocument:
+def ensure_document(db: Session, job_id: str, tenant_id: str, segments: list[dict],
+                    *, initial_reason: str = "migration",
+                    initial_provenance: dict | None = None) -> EditorDocument:
     """Create the lazy document once, preserving the original transcription."""
     job = get_job_for_tenant(db, job_id, tenant_id)
     if not job:
@@ -230,7 +242,10 @@ def ensure_document(db: Session, job_id: str, tenant_id: str, segments: list[dic
     job.segments_revision = revision
     db.flush()
     try:
-        _ensure_version(db, document, revision, normalized, job.user_id, "migration")
+        _ensure_version(
+            db, document, revision, normalized, job.user_id, initial_reason,
+            provenance=initial_provenance,
+        )
     except RuntimeError:
         # Historical partial writers may have left an orphan checkpoint at
         # the Job revision. Preserve it and move the deployed Job snapshot to
@@ -238,12 +253,17 @@ def ensure_document(db: Session, job_id: str, tenant_id: str, segments: list[dic
         revision = _next_revision(db, document, revision)
         document.revision = revision
         job.segments_revision = revision
-        _ensure_version(db, document, revision, normalized, job.user_id, "migration")
+        _ensure_version(
+            db, document, revision, normalized, job.user_id, initial_reason,
+            provenance=initial_provenance,
+        )
     return document
 
 
 def get_or_create_document(
     db: Session, job_id: str, tenant_id: str, segments: list[dict] | None = None,
+    *, initial_reason: str = "migration",
+    initial_provenance: dict | None = None,
 ) -> EditorDocument:
     job = db.query(Job).filter(
         Job.job_id == job_id, Job.tenant_id == tenant_id,
@@ -257,7 +277,10 @@ def get_or_create_document(
     if not document:
         if segments is None:
             raise LookupError("editor_document_not_found")
-        return ensure_document(db, job_id, tenant_id, segments)
+        return ensure_document(
+            db, job_id, tenant_id, segments, initial_reason=initial_reason,
+            initial_provenance=initial_provenance,
+        )
 
     job_segments = normalize_segments(job.segments_json or [])
     job_revision = int(getattr(job, "segments_revision", 0) or 0)
@@ -319,6 +342,19 @@ def get_or_create_document(
     if segments is None:
         return document
     return document
+
+
+def attach_machine_provenance(db: Session, job_id: str, provenance: dict) -> bool:
+    """Complete the initial checkpoint lineage before its transaction commits."""
+    version = db.query(EditorVersion).filter(
+        EditorVersion.job_id == job_id,
+        EditorVersion.reason == "transcription",
+    ).order_by(EditorVersion.revision.asc()).with_for_update().first()
+    if version is None or version.provenance is not None:
+        return False
+    version.provenance = dict(provenance)
+    db.flush()
+    return True
 
 
 def serialize_document(db: Session, document: EditorDocument) -> dict:

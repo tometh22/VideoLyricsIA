@@ -577,6 +577,13 @@ class Job(Base):
     transcription_quality = Column(JSONB, nullable=True)
     # Server-owned optimistic concurrency version for editor writes.
     segments_revision = Column(BigInteger, default=0, nullable=False, server_default="0")
+    # Monotonic invalidation fence for asynchronous correction learning. Every
+    # later edit/change request increments it even when no observation exists
+    # yet, so a delayed quality worker cannot resurrect a rejected snapshot.
+    quality_learning_epoch = Column(
+        BigInteger, default=0, nullable=False, server_default="0",
+    )
+    quality_learning_invalidated_at = Column(DateTime(timezone=True), nullable=True)
     render_params = Column(JSONB, nullable=True)
     edit_count = Column(Integer, default=0, nullable=False, server_default="0")
     bg_r2_key_cached = Column(Text, nullable=True)
@@ -797,6 +804,9 @@ class EditorVersion(Base):
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     reason = Column(String(20), nullable=False, default="autosave")
     is_approved = Column(Boolean, nullable=False, default=False, server_default="false")
+    # Hash-only lineage for the initial machine checkpoint. No audio bytes or
+    # duplicate lyric content is stored here.
+    provenance = Column(JSONB, nullable=True)
 
     job = relationship("Job", back_populates="editor_versions")
 
@@ -816,6 +826,135 @@ class ProductEvent(Base):
     name = Column(String(80), nullable=False, index=True)
     occurred_at = Column(DateTime(timezone=True), nullable=True)
     properties = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class CorrectionObservation(Base):
+    """Privacy-safe delta between machine output and an approved revision.
+
+    Raw lyrics remain exclusively in ``EditorDocument``/``EditorVersion``.
+    This table contains only hashes, bounded counters and acoustic/context
+    features so observations can be aggregated across tenants safely.
+    """
+    __tablename__ = "correction_observations"
+    __table_args__ = (
+        Index("ix_correction_observations_tier_created", "label_tier", "created_at"),
+        Index("ix_correction_observations_release_created", "pipeline_release", "created_at"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    identity_hash = Column(String(64), nullable=False, unique=True, index=True)
+    job_id = Column(
+        String(12), ForeignKey("jobs.job_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    tenant_id = Column(String(100), nullable=False, index=True)
+    original_revision = Column(Integer, nullable=False)
+    approved_revision = Column(Integer, nullable=False)
+    approved_version_id = Column(
+        String(36), ForeignKey("editor_versions.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    original_hash = Column(String(64), nullable=False)
+    approved_hash = Column(String(64), nullable=False)
+    audio_hash = Column(String(64), nullable=True)
+    pipeline_release = Column(String(64), nullable=False, index=True)
+    pipeline_config_fingerprint = Column(String(64), nullable=False)
+    timing_source = Column(String(64), nullable=False)
+    pipeline_route = Column(String(64), nullable=False, default="unknown")
+    label_tier = Column(String(20), nullable=False, default="observed", index=True)
+    source_confidence = Column(String(24), nullable=False, default="exact")
+    operator_hmac = Column(String(64), nullable=True)
+    session_hmac = Column(String(64), nullable=True)
+    artist_hmac = Column(String(64), nullable=True)
+    song_hmac = Column(String(64), nullable=True)
+    hmac_key_id = Column(String(32), nullable=False, default="legacy-v1")
+    categories = Column(JSONB, nullable=False)
+    features = Column(JSONB, nullable=False)
+    metrics = Column(JSONB, nullable=False)
+    active_edit_ms = Column(BigInteger, nullable=True)
+    matures_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    trusted_at = Column(DateTime(timezone=True), nullable=True)
+    invalidated_at = Column(DateTime(timezone=True), nullable=True)
+    invalidation_reason = Column(String(120), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class QualityPattern(Base):
+    """Aggregated, k-anonymous association discovered from corrections."""
+    __tablename__ = "quality_patterns"
+
+    id = Column(String(36), primary_key=True)
+    fingerprint = Column(String(64), nullable=False, unique=True, index=True)
+    category = Column(String(64), nullable=False, index=True)
+    context_key = Column(String(120), nullable=False)
+    status = Column(String(24), nullable=False, default="emerging", index=True)
+    support_jobs = Column(Integer, nullable=False, default=0)
+    support_tenants = Column(Integer, nullable=False, default=0)
+    support_artists = Column(Integer, nullable=False, default=0)
+    baseline_rate = Column(Float, nullable=False, default=0.0)
+    observed_rate = Column(Float, nullable=False, default=0.0)
+    relative_risk = Column(Float, nullable=False, default=0.0)
+    ci_low = Column(Float, nullable=False, default=0.0)
+    ci_high = Column(Float, nullable=False, default=0.0)
+    impact_seconds = Column(Float, nullable=False, default=0.0)
+    evidence = Column(JSONB, nullable=False)
+    version = Column(Integer, nullable=False, default=1)
+    first_seen_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class QualityFixProposal(Base):
+    """Human-governed candidate. Approval never mutates runtime config."""
+    __tablename__ = "quality_fix_proposals"
+    __table_args__ = (
+        Index(
+            "ix_quality_fix_proposals_idempotency",
+            "last_idempotency_key", unique=True,
+        ),
+    )
+
+    id = Column(String(36), primary_key=True)
+    pattern_id = Column(
+        String(36), ForeignKey("quality_patterns.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    proposal_type = Column(String(40), nullable=False)
+    title = Column(String(200), nullable=False)
+    hypothesis = Column(Text, nullable=False)
+    status = Column(String(32), nullable=False, default="draft", index=True)
+    version = Column(Integer, nullable=False, default=1)
+    candidate_config = Column(JSONB, nullable=False)
+    expected_impact = Column(JSONB, nullable=False)
+    validation_summary = Column(JSONB, nullable=True)
+    ready_artifact = Column(JSONB, nullable=True)
+    approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    decision_reason = Column(String(500), nullable=True)
+    last_idempotency_key = Column(String(100), nullable=True)
+    action_idempotency_keys = Column(JSONB, nullable=False, default=list)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class QualityExperimentRun(Base):
+    """Immutable record of one no-render baseline/candidate evaluation."""
+    __tablename__ = "quality_experiment_runs"
+
+    id = Column(String(36), primary_key=True)
+    proposal_id = Column(
+        String(36), ForeignKey("quality_fix_proposals.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    status = Column(String(24), nullable=False, default="queued", index=True)
+    baseline_config_hash = Column(String(64), nullable=True)
+    candidate_config_hash = Column(String(64), nullable=False)
+    benchmark_report_hash = Column(String(64), nullable=True)
+    metrics = Column(JSONB, nullable=False)
+    failure_reason = Column(String(500), nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 

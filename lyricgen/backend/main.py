@@ -5592,6 +5592,11 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                     )
                 else:
                     row.segments_json = segments
+                    from editor import get_or_create_document
+                    get_or_create_document(
+                        _quality_db, job_id, row.tenant_id, segments,
+                        initial_reason="transcription",
+                    )
                     previous_quality = (
                         dict(row.transcription_quality)
                         if isinstance(row.transcription_quality, dict) else {}
@@ -5599,12 +5604,30 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                     quality = finalized.get("transcription_quality")
                     if isinstance(quality, dict):
                         quality = dict(quality)
+                        from quality_cache import sha256_file
+                        quality["audio_sha256"] = sha256_file(audio_path)
                         quality["evaluated_revision"] = revision
                         quality["timing_source"] = row.timing_source or "unknown"
+                        try:
+                            from quality_learning_model import shadow_prediction_for_quality
+                            quality["learning_shadow"] = shadow_prediction_for_quality(
+                                quality, quality["timing_source"],
+                            )
+                        except Exception:
+                            quality["learning_shadow"] = {
+                                "available": False, "reason": "prediction_failed",
+                                "mutated_segments": False,
+                            }
                         from transcription_quality import quality_fingerprint
                         quality["quality_fingerprint"] = quality_fingerprint(
                             quality, revision=revision,
                             content_hash=str(quality.get("segments_hash") or ""),
+                        )
+                        from correction_learning import machine_snapshot_provenance
+                        from editor import attach_machine_provenance
+                        attach_machine_provenance(
+                            _quality_db, job_id,
+                            machine_snapshot_provenance(row, quality),
                         )
                         quality_to_enqueue = quality
                         persisted_revision = revision
@@ -8926,6 +8949,7 @@ async def generate_with_segments(
 
     editor_document = None
     selected_editor_version = None
+    approved_version = None
 
     if reuse:
         # Reuse path: verify the job belongs to caller and pull the audio
@@ -9287,6 +9311,27 @@ async def generate_with_segments(
             # path into a 500 while the pipeline emits its normal validation.
             logger.warning("[editor] skipped approval snapshot for invalid segments job=%s", job_id)
         db.commit()
+        if approved_version is not None:
+            try:
+                from queue_jobs import enqueue_correction_learning
+                enqueue_correction_learning(
+                    job_id, approved_version.id,
+                    active_edit_ms=(
+                        _editor_metrics.get("active_edit_ms")
+                        if "_editor_metrics" in locals() else None
+                    ),
+                    session_id=(
+                        _editor_metrics.get("session_id")
+                        if "_editor_metrics" in locals() else None
+                    ),
+                )
+            except Exception as exc:
+                # Learning is deliberately non-blocking: a queue outage must
+                # never turn a valid user approval into a failed generation.
+                logger.warning(
+                    "[QUALITY-LEARNING] approval capture enqueue failed job=%s: %s",
+                    job_id, exc,
+                )
     else:
         job_id = create_job(
             db,
@@ -10760,7 +10805,7 @@ async def approve_job(
     db: Session = Depends(get_db),
 ):
     """Approve a job after human review, changing status from pending_review to done."""
-    from database import Job as JobModel, AuditLog
+    from database import Job as JobModel, AuditLog, EditorVersion, ProductEvent
     from datetime import datetime, timezone
 
     job_query = db.query(JobModel).filter(JobModel.job_id == job_id)
@@ -10809,7 +10854,31 @@ async def approve_job(
                 "actor_tenant_id": current_user.get("tenant_id"),
                 "cross_tenant_admin": is_cross_tenant_admin},
     ))
+    learning_version = db.query(EditorVersion).filter(
+        EditorVersion.job_id == job_id,
+        EditorVersion.revision == int(job.segments_revision or 0),
+        EditorVersion.is_approved.is_(True),
+    ).first()
+    learning_event = db.query(ProductEvent).filter(
+        ProductEvent.job_id == job_id,
+        ProductEvent.name == "editor_approved",
+    ).order_by(ProductEvent.created_at.desc()).first()
     db.commit()
+
+    if learning_version is not None:
+        try:
+            from queue_jobs import enqueue_correction_learning
+            props = dict(learning_event.properties or {}) if learning_event else {}
+            enqueue_correction_learning(
+                job_id, learning_version.id,
+                active_edit_ms=props.get("active_edit_ms"),
+                session_id=props.get("session_id"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[QUALITY-LEARNING] final approval capture enqueue failed job=%s: %s",
+                job_id, exc,
+            )
 
     # 2026-05-30 perf: drop the cached /usage entry for this operator so
     # the sidebar badge reflects the +1 immediately, not after the 30 s
@@ -11340,6 +11409,9 @@ async def patch_editor_document(
             db, job, document, current_user["id"], body.base_revision,
             body.segments, body.checkpoint,
         )
+        if applied:
+            from correction_learning import invalidate_job_observations
+            invalidate_job_observations(db, job_id, "later_editor_revision")
         db.commit()
     except RuntimeError:
         db.rollback()
@@ -11505,6 +11577,8 @@ async def restore_editor_version(
         document, version = restore_version(
             db, job, document, current_user["id"], body.version_id, body.base_revision,
         )
+        from correction_learning import invalidate_job_observations
+        invalidate_job_observations(db, job_id, "editor_version_restored")
         db.commit()
     except LookupError:
         raise HTTPException(status_code=404, detail="editor_version_not_found") from None
@@ -11537,6 +11611,9 @@ async def resolve_editor_conflict(
             db, job, document, current_user["id"], body.server_revision,
             body.strategy, body.segments,
         )
+        if applied:
+            from correction_learning import invalidate_job_observations
+            invalidate_job_observations(db, job_id, "editor_conflict_resolved")
         db.commit()
     except RuntimeError:
         db.rollback()
@@ -12166,6 +12243,8 @@ async def save_segments(
             db, editor_document, current_user["id"], job.segments_json or [],
             int(getattr(job, "segments_revision", 0) or 0),
         )
+        from correction_learning import invalidate_job_observations
+        invalidate_job_observations(db, job_id, "later_editor_revision")
         db.commit()
     except (LookupError, ValueError, RuntimeError) as exc:
         db.rollback()
@@ -13061,7 +13140,7 @@ async def request_edit(
             _pre_edit_document_segments = _edit_document.current_segments
             _pre_edit_document_revision = _edit_document.revision
             try:
-                save_document(
+                _edit_document, _edit_version, _edit_applied = save_document(
                     db, job, _edit_document, current_user["id"],
                     base_revision=(
                         body.base_revision if body.base_revision is not None
@@ -13070,6 +13149,11 @@ async def request_edit(
                     segments=normalized_segments,
                     reason="manual",
                 )
+                if _edit_applied:
+                    from correction_learning import invalidate_job_observations
+                    invalidate_job_observations(
+                        db, job_id, "later_editor_revision",
+                    )
             except RuntimeError:
                 from ops_metrics import increment
                 increment("segments_revision_conflict")
@@ -13513,6 +13597,16 @@ async def request_edit(
             status_code=503,
             detail="Cola de trabajos no disponible. Intentá de nuevo en unos segundos.",
         )
+
+    if _approved_editor_version is not None:
+        try:
+            from queue_jobs import enqueue_correction_learning
+            enqueue_correction_learning(job_id, _approved_editor_version.id)
+        except Exception as exc:
+            logger.warning(
+                "[QUALITY-LEARNING] edit approval capture enqueue failed job=%s: %s",
+                job_id, exc,
+            )
 
     return {
         "ok": True,
@@ -15851,6 +15945,18 @@ async def portal_submit_change_request(
             "comment_preview": comment[:200],
         },
     ))
+    try:
+        from change_request_stats import classify as classify_change_request
+        if {"letra", "sincronizacion"} & set(classify_change_request(comment)):
+            from correction_learning import invalidate_job_observations
+            invalidate_job_observations(
+                db, delivery.job_id, "client_lyrics_or_timing_change_request",
+            )
+    except Exception as exc:
+        logger.warning(
+            "[QUALITY-LEARNING] change-request invalidation failed job=%s: %s",
+            delivery.job_id, exc,
+        )
     db.commit()
 
     # Notificación en tiempo real (Paso "Cambios de UMG" — el panel del admin

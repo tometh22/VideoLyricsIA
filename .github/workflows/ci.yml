@@ -70,6 +70,11 @@ jobs:
       - name: Lint — undefined names (F821, prevent NameError shipping)
         run: ruff check --select F821 .
 
+      - name: Apply migrations on real PostgreSQL
+        env:
+          DATABASE_URL: "postgresql://genly:genly@localhost:5432/genly_test"
+        run: python -m alembic upgrade head
+
       - name: Run tests
         env:
           DATABASE_URL: "postgresql://genly:genly@localhost:5432/genly_test"

@@ -51,6 +51,7 @@ const NAV = [
       { id: "features", label: "Features" },
       { id: "wizard", label: "Wizard" },
       { id: "margen", label: "Margen" },
+      { id: "aprendizaje", label: "Aprendizaje" },
     ],
   },
   {

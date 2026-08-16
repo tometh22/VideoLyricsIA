@@ -18,6 +18,7 @@ import AdoptionPanel from "./AdoptionPanel";
 import FeatureDetailPanel from "./FeatureDetailPanel";
 import JobDetailPanel from "./JobDetailPanel";
 import ProblemsPanel from "./ProblemsPanel";
+import QualityLearningPanel from "./QualityLearningPanel";
 import UserProfileView from "./UserProfileView";
 import WizardFunnelPanel from "./WizardFunnelPanel";
 import useInsights from "./useInsights";
@@ -240,6 +241,8 @@ export default function InsightsSection({ subTab = "resumen" }) {
         </>
       ) : subTab === "wizard" ? (
         <WizardFunnelPanel wizard={wizard} />
+      ) : subTab === "aprendizaje" ? (
+        <QualityLearningPanel />
       ) : subTab === "margen" ? (
         nav.level === "app" ? (
           <MargenTenantsView economics={economics} loading={!economics} forbidden={false} />

@@ -452,6 +452,14 @@ def main():
     # _resolve_queue_names(). Default = all four = current behavior.
     queue_names = _resolve_queue_names()
     queues = [Queue(name, connection=conn) for name in queue_names]
+    if "transcription_quality" in queue_names:
+        try:
+            # RQ's scheduler is started below. Seed one dated wake-up; the
+            # daily job schedules its successor after each successful run.
+            from queue_jobs import ensure_daily_quality_learning_scheduled
+            ensure_daily_quality_learning_scheduled()
+        except Exception as exc:
+            logger.warning("[QUALITY-LEARNING] daily schedule unavailable: %s", exc)
     # WarmOnlyWorker: a burst of deploys (2nd SIGTERM mid-drain) would otherwise
     # COLD-kill the in-flight render. This subclass keeps every shutdown warm so
     # the render finishes. See the class docstring.
