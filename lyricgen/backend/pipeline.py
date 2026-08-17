@@ -9628,20 +9628,48 @@ class VeoTrackingUnavailable(RuntimeError):
     """A paid call cannot proceed without durable budget/provenance state."""
 
 
+# Familias de degradación — determinan la UX cuando el reintento automático no
+# alcanza (ver _guard_against_degraded_delivery y los failure callbacks):
+#   - "provider": falla transitoria de Veo/infra (breaker, 429, corte de
+#     Vertex, submission ambigua, tracking cancelado, foto_viva). Reintentar
+#     SIRVE — se auto-sana cuando el proveedor se recupera.
+#   - "content": el fondo generado no cumplió la política (persona/logo/texto) y
+#     el re-roll tampoco. Reintentar el mismo prompt NO sirve: hace falta variar
+#     el prompt o que el operador ajuste el fondo.
+BG_DEGRADE_FAMILY_PROVIDER = "provider"
+BG_DEGRADE_FAMILY_CONTENT = "content"
+
+# El único fallback que produce el camino de RECHAZO DE CONTENIDO
+# (_write_safe_gradient_background con su filename default, tras validación +
+# re-roll rechazados). El resto de los *fallback.mp4 vienen de fallas de
+# proveedor/infra. Ver pipeline: la recuperación de validación usa el default.
+_CONTENT_FALLBACK_BASENAME = "bg_policy_safe_fallback.mp4"
+
+
 class BackgroundDegraded(RuntimeError):
     """El fondo entregable cayó a un fallback determinístico (gradiente o Ken
     Burns) en vez del video que pidió el operador.
 
-    Contrato del guardrail "nunca degradar" (decisión de producto: aplica a
-    TODOS los tenants): cuando Veo no puede producir el fondo pedido, el
-    pipeline NO debe entregar un video degradado. Se levanta esta excepción en
-    la finalización, ANTES de subir los deliverables, para que el Retry de RQ
-    reintente con backoff (run_pipeline resetea la fila y re-genera; el
-    gradiente NO se cachea en R2, así que un Veo recuperado produce el fondo
-    real). Al agotar los reintentos, pipeline_failure_callback deja el job en
-    error con la affordance "Reintentar sin re-subir" — escalamiento a humano,
-    nunca un gradiente en silencio.
+    Contrato del guardrail "nunca degradar" (aplica a TODOS los tenants): cuando
+    el fondo pedido no se pudo producir, el pipeline NO entrega un video
+    degradado. Se levanta en la finalización, ANTES de subir los deliverables,
+    para que el Retry de RQ reintente con backoff (run_pipeline resetea la fila
+    y re-genera; el gradiente NO se cachea en R2, así que un Veo recuperado
+    produce el fondo real). Si el reintento automático no alcanza, los failure
+    callbacks NO dejan el job en "error": lo marcan con ``error_category``
+    ``background_attention:<familia>`` para que la UI muestre una tarjeta
+    accionable (reintentar / ajustar el fondo), nunca un error crudo ni un
+    gradiente en silencio.
+
+    ``family`` (BG_DEGRADE_FAMILY_*) decide la UX: "provider" = reintentar,
+    "content" = variar/ajustar.
     """
+
+    def __init__(self, message: str, *, family: str = BG_DEGRADE_FAMILY_PROVIDER,
+                 fallback_basename: str = ""):
+        super().__init__(message)
+        self.family = family
+        self.fallback_basename = fallback_basename
 
 
 # Kill-switch del guardrail. Default OFF: desplegar el código es inerte hasta
@@ -9691,13 +9719,22 @@ def _guard_against_degraded_delivery(
     )
     if not (_fallback or animation_degraded):
         return
+    _basename = os.path.basename(bg_image_path or "")
+    # Clasificación por familia: sólo el rechazo de contenido usa el filename
+    # default de _write_safe_gradient_background; todo lo demás es proveedor.
+    _family = (
+        BG_DEGRADE_FAMILY_CONTENT if _basename == _CONTENT_FALLBACK_BASENAME
+        else BG_DEGRADE_FAMILY_PROVIDER
+    )
     _reason = (
         "animación degradada a Ken Burns" if animation_degraded and not _fallback
         else "fondo degradado a gradiente determinístico"
     )
     raise BackgroundDegraded(
-        f"job {job_id}: {_reason} (bg={os.path.basename(bg_image_path or '')}). "
-        "No se entrega el video degradado; se reintenta la generación."
+        f"job {job_id}: {_reason} (bg={_basename}, familia={_family}). "
+        "No se entrega el video degradado; se reintenta la generación.",
+        family=_family,
+        fallback_basename=_basename,
     )
 
 

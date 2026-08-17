@@ -667,6 +667,15 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   ]).has(job.status);
   const isValidationFailed = job.status === "validation_failed";
   const isError = job.status === "error";
+  // Guardrail "nunca degradar": el job terminó sin poder generar el fondo real
+  // (nunca se entregó un gradiente). En vez de un error rojo, mostramos una
+  // tarjeta ámbar accionable. La familia decide la UX:
+  //   provider = interrupción transitoria del proveedor → "Reintentar el fondo".
+  //   content  = el fondo no cumplió la política → "Ajustar el fondo".
+  const bgAttentionFamily = (job.error_category || "").startsWith("background_attention:")
+    ? (job.error_category.split(":")[1] || "provider")
+    : null;
+  const isBackgroundAttention = isError && !!bgAttentionFamily;
   // An edit that failed AFTER a prior successful render: the deliverable in R2 is
   // untouched (the pipeline only flips status=error, it never clears s3_keys), so
   // the previous video is still intact. Surfaced to reassure operators who see a
@@ -1131,8 +1140,74 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     );
   }
 
+  // Guardrail "nunca degradar" — tarjeta accionable, NO un error rojo. El video
+  // nunca se entregó degradado; sólo falta generar el fondo real. El operador
+  // decide: reintentar (provider, se auto-sana cuando el proveedor vuelve) o
+  // ajustar el fondo (content, hay que variar el prompt/estilo).
+  if (isBackgroundAttention) {
+    const isContent = bgAttentionFamily === "content";
+    const title = isContent
+      ? (t("detail.bg_attention_content_title") || "El fondo necesita un ajuste")
+      : (t("detail.bg_attention_provider_title") || "El fondo se está reintentando");
+    const body = job.error || (isContent
+      ? (t("detail.bg_attention_content_body") || "El fondo generado no cumplió con las reglas de contenido y el ajuste automático no alcanzó. Probá con otra descripción o estilo para el fondo.")
+      : (t("detail.bg_attention_provider_body") || "El servicio de fondos tuvo una interrupción momentánea y no pudimos generar tu fondo. Tu trabajo está guardado — reintentá el fondo en un momento."));
+    const goAdjust = () => navigate(`/videos/${job.job_id}/edit-lyrics`);
+    return (
+      <div className="w-full max-w-2xl animate-fade-in">
+        <div className="flex items-center gap-3 mb-6">
+          <button onClick={onBack} className="w-9 h-9 shrink-0 rounded-xl bg-surface-2/40 ring-1 ring-white/[0.04] hover:ring-white/[0.08] flex items-center justify-center text-gray-400 hover:text-white transition-colors">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7" /></svg>
+          </button>
+          <div>
+            <h2 className="text-xl font-bold">{name}</h2>
+            <p className="text-sm text-gray-500">{job.artist}</p>
+          </div>
+        </div>
+        <div className="rounded-card bg-amber-500/[0.07] ring-1 ring-amber-500/25 px-5 py-5">
+          <div className="flex items-start gap-3 mb-2">
+            <div className="w-8 h-8 shrink-0 rounded-full bg-amber-500/15 ring-1 ring-amber-500/30 flex items-center justify-center text-amber-300">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v4m0 4h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" /></svg>
+            </div>
+            <div>
+              <p className="text-sm font-semibold text-amber-200">{title}</p>
+              <p className="text-xs text-amber-100/70 mt-1">{body}</p>
+            </div>
+          </div>
+          <p className="text-[11px] text-amber-100/50 mb-4 pl-11">
+            {t("detail.bg_attention_reassure") || "El video no se entregó con un fondo degradado. Tu audio y tu letra están intactos."}
+          </p>
+          <div className="flex gap-2 pl-11">
+            {isContent ? (
+              <>
+                <button onClick={goAdjust} className="btn-primary text-xs h-9 px-4">
+                  {t("detail.bg_attention_adjust") || "Ajustar el fondo"}
+                </button>
+                <button onClick={() => handleRetry()} disabled={retrying} className="btn-secondary text-xs h-9 px-4 disabled:opacity-50">
+                  {retrying ? (t("detail.bg_attention_retrying") || "Reintentando…") : (t("detail.bg_attention_retry_anyway") || "Reintentar igual")}
+                </button>
+              </>
+            ) : (
+              <>
+                <button onClick={() => handleRetry()} disabled={retrying} className="btn-primary text-xs h-9 px-4 disabled:opacity-50">
+                  {retrying ? (t("detail.bg_attention_retrying") || "Reintentando…") : (t("detail.bg_attention_retry") || "Reintentar el fondo")}
+                </button>
+                <button onClick={goAdjust} className="btn-secondary text-xs h-9 px-4">
+                  {t("detail.bg_attention_adjust") || "Ajustar el fondo"}
+                </button>
+              </>
+            )}
+            <button onClick={() => onBack && onBack()} className="text-xs h-9 px-4 rounded-xl text-gray-400 hover:text-white transition-colors">
+              {t("detail.back") || "Volver"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // Error state: show a compact error panel with retry option.
-  if (isError && !isValidationFailed) {
+  if (isError && !isValidationFailed && !isBackgroundAttention) {
     return (
       <div className="w-full max-w-2xl animate-fade-in">
         <div className="flex items-center gap-3 mb-6">
