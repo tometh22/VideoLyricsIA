@@ -440,3 +440,35 @@ describe("LyricsTimeline", () => {
     expect(scroll.scrollTo).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("zonas dudosas sobre la forma de onda", () => {
+  // La timeline —donde el operador corrige el timing— no recibía NINGUNA señal
+  // de calidad, así que para encontrar el punto a corregir sólo podía clickear
+  // y escuchar: 2,9 seeks medidos por cada corrección. El backend ya calcula
+  // `unsafe_windows`; acá se pintan.
+  it("pinta una banda por cada ventana dudosa", () => {
+    setup({
+      unsafeWindows: [
+        { id: "w1", start: 8, end: 12, reasons: ["low_ctc_timing_confidence"] },
+        { id: "w2", start: 39, end: 42, reasons: ["voiced_gap"] },
+      ],
+    });
+    expect(screen.getAllByTestId("timeline-unsafe-window")).toHaveLength(2);
+  });
+
+  it("no pinta nada cuando no hay ventanas (comportamiento previo intacto)", () => {
+    setup();
+    expect(screen.queryAllByTestId("timeline-unsafe-window")).toHaveLength(0);
+  });
+
+  it("descarta ventanas con tiempos inválidos en vez de romper el render", () => {
+    setup({
+      unsafeWindows: [
+        { id: "ok", start: 5, end: 9 },
+        { id: "invertida", start: 20, end: 20 },
+        { id: "no-numerica", start: "x", end: "y" },
+      ],
+    });
+    expect(screen.getAllByTestId("timeline-unsafe-window")).toHaveLength(1);
+  });
+});

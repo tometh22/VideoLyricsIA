@@ -88,6 +88,11 @@ export default function LyricsTimeline({
   focusedSegId,
   highlightedIds,
   waveform = null,
+  // Ventanas dudosas del análisis de calidad ({start, end, reasons[]}). Se
+  // pintan sobre la forma de onda: hasta ahora la timeline no recibía NINGUNA
+  // señal de calidad, así que para encontrar el punto a corregir el operador
+  // sólo podía clickear y escuchar (2,9 seeks medidos por cada corrección).
+  unsafeWindows = [],
   gapS = 0.05,
   saveStatus = "idle",
   onSeek,
@@ -820,6 +825,26 @@ export default function LyricsTimeline({
             </div>
             <div className="absolute inset-y-0 cursor-pointer" style={{ left: LABEL_W, width: trackWidth }} onClick={(event) => seekAt(event.clientX)}>
               {waveform?.peaks?.length ? <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none opacity-80" aria-hidden="true" /> : null}
+              {unsafeWindows.map((qualityWindow, index) => {
+                const from = Number(qualityWindow?.start);
+                const to = Number(qualityWindow?.end);
+                if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return null;
+                const left = Math.max(0, from * pxPerSec);
+                const width = Math.max(2, (to - from) * pxPerSec);
+                const reasons = Array.isArray(qualityWindow?.reasons) ? qualityWindow.reasons : [];
+                return (
+                  <div
+                    key={qualityWindow?.id ?? `unsafe-${index}`}
+                    className="absolute inset-y-0 pointer-events-none rounded-sm bg-amber-400/20 ring-1 ring-inset ring-amber-400/45"
+                    style={{ left, width }}
+                    title={reasons.length
+                      ? `${t("timeline.unsafe_window", "Zona a revisar")}: ${reasons.join(", ")}`
+                      : t("timeline.unsafe_window", "Zona a revisar")}
+                    data-testid="timeline-unsafe-window"
+                    aria-hidden="true"
+                  />
+                );
+              })}
             </div>
           </div>
 
