@@ -764,8 +764,8 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         hard_deadline_s = min(
             150.0, _env_float("TARGETED_CONSENSUS_DEADLINE_SECONDS", 120.0)
         )
-        from transcription_quality import effective_policy_mode
-        allow_insertions = effective_policy_mode(job_id=job_id) == "enforce"
+        from quality_mutation import mutation_authorized
+        allow_insertions = mutation_authorized(job_id=job_id)
         slow_enabled = (
             os.environ.get("TARGETED_SLOW_STEM_ENABLED", "0")
             .strip().lower() in _TRUE

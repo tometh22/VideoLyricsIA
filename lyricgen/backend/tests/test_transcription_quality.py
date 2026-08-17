@@ -441,6 +441,38 @@ def test_unverified_live_lexical_substitution_is_blocking():
     )
 
 
+def test_human_revision_supersedes_and_invalidates_all_stale_evidence():
+    pending = {
+        "decision": "review_required", "analysis_status": "pending",
+        "analysis_pending": True, "analysis_job_id": "quality:old",
+        "unsafe_windows": [{
+            "id": "qw_1", "start": 10, "end": 20,
+            "reasons": ["text_mismatch"],
+        }],
+        "acknowledgement": {"revision": 0},
+        "quality_fingerprint": "old", "acoustic_evidence": {"old": True},
+        "analysis_windows": [{"old": True}], "retry": {"old": True},
+    }
+    updated = tq.supersede_pending_analysis(pending, revision=3)
+    assert updated["analysis_pending"] is False
+    assert updated["analysis_status"] == "superseded_by_edit"
+    assert updated["analysis_superseded_revision"] == 3
+    assert updated["unsafe_windows"][0]["start"] == 10
+    assert updated["unsafe_windows"][0]["end"] == 20
+    assert updated["unsafe_windows"][0]["reasons"] == [
+        "superseded_quality_window", "text_mismatch",
+    ]
+    assert updated["decision"] == "review_required"
+    assert updated["render_blocked"] is True
+    assert tq.manual_override_allowed(updated) is False
+    for key in (
+        "acknowledgement", "quality_fingerprint", "acoustic_evidence",
+        "analysis_windows", "retry", "analysis_job_id",
+    ):
+        assert key not in updated
+    assert pending["analysis_pending"] is True
+
+
 def test_eight_witness_words_cannot_certify_a_five_minute_song():
     quality = tq.evaluate(
         [_segment(1, 2)], {

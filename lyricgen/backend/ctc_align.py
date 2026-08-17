@@ -410,13 +410,27 @@ def finalize_line(seg: dict, ls: float, le: float, wlist, lr,
     new["end"] = round(float(le), 3)
     if lr is not None:
         new["ctc_lr"] = round(lr, 3)
+    review_reasons = list(new.get("review_reasons") or [])
+    if new.get("review") and not review_reasons:
+        review_reasons.append("approximate_timing")
     if skipped:
         new["ctc_skipped"] = True  # Viterbi: línea no cantada
+        if "ctc_skipped" not in review_reasons:
+            review_reasons.append("ctc_skipped")
     else:
-        new.pop("review", None)
+        # A successful retime clears only the old scaffold timing warning.
+        # Content/structure warnings (for example compressed repetitions)
+        # remain review-scoped because CTC aligned the supplied text.
+        review_reasons = [reason for reason in review_reasons
+                          if reason != "approximate_timing"]
     if recovered:
         new["ctc_recovered"] = "mix"  # M5: rescatada del mix
     if wlist:
+        ctc_scores = [float(sc) for (_w, _a, _b, sc) in wlist]
+        new["ctc_mean_score"] = round(
+            sum(ctc_scores) / len(ctc_scores), 4,
+        )
+        new["ctc_min_score"] = round(min(ctc_scores), 4)
         new["words"] = [
             {"word": w, "start": round(float(a), 3),
              "end": round(float(b), 3), "score": round(float(sc), 3)}
@@ -425,6 +439,12 @@ def finalize_line(seg: dict, ls: float, le: float, wlist, lr,
         # Interpolated line: the inherited word stamps belong to
         # the OLD timing — keeping them would break karaoke.
         new.pop("words", None)
+    if review_reasons:
+        new["review"] = True
+        new["review_reasons"] = sorted(set(review_reasons))
+    else:
+        new.pop("review", None)
+        new.pop("review_reasons", None)
     return new
 
 

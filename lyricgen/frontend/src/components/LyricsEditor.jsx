@@ -206,6 +206,57 @@ function isTranscriptionQualityV5(quality) {
   return /(?:^|[-_])v?5(?:$|[-_])/.test(String(quality?.policy_version || "").toLowerCase());
 }
 
+function isQualityAnalysisPending(quality) {
+  if (quality?.analysis_pending === true) return true;
+  const explicitAnalysisStatus = quality?.analysis_status ?? quality?.status;
+  const status = String(explicitAnalysisStatus ?? quality?.decision ?? "").toLowerCase();
+  return status === "analysis_pending" || status === "pending" || status === "analyzing";
+}
+
+function qualityFromEditorPayload(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const quality = payload.transcription_quality ?? payload.quality_gate ?? payload.quality;
+  return quality && typeof quality === "object" ? quality : null;
+}
+
+function shouldAcceptQualityUpdate(current, next) {
+  if (!next || typeof next !== "object") return false;
+  if (!current || typeof current !== "object") return true;
+  const currentRevision = Number(current.evaluated_revision);
+  const nextRevision = Number(next.evaluated_revision);
+  if (Number.isFinite(currentRevision) && Number.isFinite(nextRevision)
+    && nextRevision < currentRevision) return false;
+  const sameRevision = !Number.isFinite(currentRevision) || !Number.isFinite(nextRevision)
+    || nextRevision === currentRevision;
+  const currentHash = String(current.segments_hash || "");
+  const nextHash = String(next.segments_hash || "");
+  if (sameRevision && currentHash && nextHash && currentHash !== nextHash) return false;
+  const currentConfig = String(current.pipeline_config_fingerprint || "");
+  const nextConfig = String(next.pipeline_config_fingerprint || "");
+  if (sameRevision && currentConfig && nextConfig && currentConfig !== nextConfig) return false;
+  const currentJobId = String(current.analysis_job_id || "");
+  const nextJobId = String(next.analysis_job_id || "");
+  if (sameRevision && currentJobId && nextJobId && currentJobId !== nextJobId
+    && !isQualityAnalysisPending(next)) return false;
+  const bothTerminal = !isQualityAnalysisPending(current) && !isQualityAnalysisPending(next);
+  const currentFingerprint = String(current.quality_fingerprint || "");
+  const nextFingerprint = String(next.quality_fingerprint || "");
+  if (sameRevision && bothTerminal && currentFingerprint && nextFingerprint
+    && currentFingerprint !== nextFingerprint) return false;
+  // A lagging editor read must never turn a terminal verdict back into a
+  // spinner. This matters when Railway/HTTP caching briefly serves the
+  // document that existed before the quality worker persisted its result.
+  if (!isQualityAnalysisPending(current) && isQualityAnalysisPending(next)
+    && (!Number.isFinite(currentRevision) || !Number.isFinite(nextRevision)
+      || nextRevision <= currentRevision)) return false;
+  return true;
+}
+
+function segmentOverlapsWindow(segment, qualityWindow) {
+  return Number(segment?.end) >= qualityWindow.start
+    && Number(segment?.start) <= qualityWindow.end;
+}
+
 export function isServerQualityAcknowledgementCurrent({
   quality, revision, dirty = false, focused = true,
 }) {
@@ -514,7 +565,7 @@ export default function LyricsEditor({
   // que preserva la identidad de filas (reseedPreservingIds) — hoy sin caller
   // de producción (reservado / lo ejercitan sólo los tests).
   segments, filename, audioFile, referenceLyrics,
-  coverageWarning = false, transcriptionQuality = null, recoverySource = "",
+  coverageWarning = false, transcriptionQuality: transcriptionQualityProp = null, recoverySource = "",
   onApprove, onBack, isBatch = false, batchProgress = "",
   user = null,
   font = "",
@@ -629,6 +680,83 @@ export default function LyricsEditor({
   playerSlot = null,
 }) {
   const { t } = useI18n();
+  const [transcriptionQuality, setTranscriptionQuality] = useState(transcriptionQualityProp);
+  const transcriptionQualityRef = useRef(transcriptionQualityProp);
+  transcriptionQualityRef.current = transcriptionQuality;
+  const qualityJobRef = useRef(transcribeJobId);
+
+  // Quality completes asynchronously, often after the operator has already
+  // started correcting lyrics. Poll only the editor document's quality
+  // subdocument and never feed its `segments` back into the editor store.
+  // This makes a terminal quality update safe even with unsaved local edits.
+  useEffect(() => {
+    if (qualityJobRef.current !== transcribeJobId) {
+      qualityJobRef.current = transcribeJobId;
+      transcriptionQualityRef.current = transcriptionQualityProp;
+      setTranscriptionQuality(transcriptionQualityProp);
+      return;
+    }
+    setTranscriptionQuality((current) => {
+      if (!shouldAcceptQualityUpdate(current, transcriptionQualityProp)) return current;
+      transcriptionQualityRef.current = transcriptionQualityProp;
+      return transcriptionQualityProp;
+    });
+  }, [transcribeJobId, transcriptionQualityProp]);
+
+  const qualityAnalysisPending = isQualityAnalysisPending(transcriptionQuality);
+  useEffect(() => {
+    if (!qualityAnalysisPending || !transcribeJobId || !editorRequest) return undefined;
+    let cancelled = false;
+    let timer = null;
+    let controller = null;
+
+    const schedule = (delay = 2500) => {
+      if (!cancelled) timer = window.setTimeout(poll, delay);
+    };
+    const poll = async () => {
+      if (cancelled) return;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        schedule(2500);
+        return;
+      }
+      controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+      let nextQuality = null;
+      let accepted = false;
+      try {
+        const response = await editorRequest(`/editor/${transcribeJobId}`, {
+          method: "GET",
+          cache: "no-store",
+          headers: { "Cache-Control": "no-cache" },
+          ...(controller ? { signal: controller.signal } : {}),
+        });
+        if (response?.ok) {
+          let body = null;
+          try {
+            body = await (response.clone ? response.clone() : response).json();
+          } catch { /* a transient/non-JSON response is retried */ }
+          nextQuality = qualityFromEditorPayload(body);
+          if (!cancelled && nextQuality) {
+            accepted = shouldAcceptQualityUpdate(transcriptionQualityRef.current, nextQuality);
+            if (accepted) {
+              transcriptionQualityRef.current = nextQuality;
+              setTranscriptionQuality(nextQuality);
+            }
+          }
+        }
+      } catch (error) {
+        if (error?.name === "AbortError") return;
+      }
+      if (!cancelled && (!nextQuality || !accepted || isQualityAnalysisPending(nextQuality))) schedule();
+    };
+
+    poll();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+      controller?.abort();
+    };
+  }, [editorRequest, qualityAnalysisPending, transcribeJobId]);
+
   // PR E (2026-07): `edited` vive en el segmentsStore (Map por jobId a
   // nivel módulo), NO en un useState local. El store SOBREVIVE al unmount:
   // navegar paso 6 → 4 → 6 en el wizard des-monta y re-monta este editor,
@@ -750,6 +878,7 @@ export default function LyricsEditor({
   const [historyOpen, setHistoryOpen] = useState(false);
   const editedRef = useRef(edited);
   editedRef.current = edited;
+  const unsafeCandidateIdsRef = useRef(new Set());
   const persistRef = useRef(onPersistSegments);
   persistRef.current = onPersistSegments;
   const saveQueueRef = useRef(null);
@@ -1420,7 +1549,16 @@ export default function LyricsEditor({
         // WizardLivePreview central pueda hacer word-jump real.
         if (onPlaybackTick) {
           if (active) {
-            onPlaybackTick(active.text || "", active.start, active.end, ct, active.words);
+            const unsafeCandidate = unsafeCandidateIdsRef.current.has(active._id);
+            onPlaybackTick(
+              unsafeCandidate
+                ? (t("editor.quality_preview_unconfirmed") || "Letra sin confirmar")
+                : (active.text || ""),
+              active.start,
+              active.end,
+              ct,
+              unsafeCandidate ? undefined : active.words,
+            );
           } else {
             onPlaybackTick("", 0, 0, ct);
           }
@@ -2691,6 +2829,8 @@ export default function LyricsEditor({
     && isTranscriptionQualityV5(transcriptionQuality)
     && transcriptionQuality?.mode === "enforce"
     && unsafeWindows.length > 0;
+  const pendingQualityReview = qualityAnalysisPending
+    && transcriptionQuality?.mode === "enforce";
   const fatalQualityFailure = transcriptionQuality?.decision === "retry_failed"
     && isTranscriptionQualityV5(transcriptionQuality)
     && transcriptionQuality?.mode === "enforce";
@@ -2701,6 +2841,10 @@ export default function LyricsEditor({
     policy: transcriptionQuality?.policy_version || "quality-v5",
     evaluatedRevision: transcriptionQuality?.evaluated_revision ?? null,
     segmentsHash: transcriptionQuality?.segments_hash || null,
+    pipelineConfig: transcriptionQuality?.pipeline_config_fingerprint || null,
+    qualityFingerprint: transcriptionQuality?.quality_fingerprint || null,
+    analysisJobId: transcriptionQuality?.analysis_job_id || null,
+    unsafeWindowIds: unsafeWindows.map((window) => window.id).sort(),
     segments: approvalSegments.map((segment) => ({
       start: segment.start,
       end: segment.end,
@@ -2723,6 +2867,37 @@ export default function LyricsEditor({
   const unconfirmedUnsafeWindows = focusedQualityReview
     ? unsafeWindows.filter((window) => !confirmedUnsafeWindowIds.has(window.id))
     : [];
+  const unsafeCandidateSegmentIds = useMemo(() => {
+    if (transcriptionQuality?.mode !== "enforce"
+      || !(transcriptionQuality?.decision === "review_required" || qualityAnalysisPending)) return new Set();
+    const windowsForRows = focusedQualityReview ? unconfirmedUnsafeWindows : unsafeWindows;
+    return new Set(sanitizedEdited.flatMap((segment) => {
+      const coveringWindows = unsafeWindows.filter((qualityWindow) => (
+        segmentOverlapsWindow(segment, qualityWindow)
+      ));
+      const confirmedByWindow = focusedQualityReview
+        && coveringWindows.length > 0
+        && coveringWindows.every((qualityWindow) => confirmedUnsafeWindowIds.has(qualityWindow.id));
+      if (confirmedByWindow) return [];
+      const overlapsUnsafeWindow = windowsForRows.some((qualityWindow) => (
+        segmentOverlapsWindow(segment, qualityWindow)
+      ));
+      const explicitlyUnsafe = segment?.unsafe_candidate === true
+        || segment?.confirmed === false
+        || segment?.review === true;
+      return overlapsUnsafeWindow || explicitlyUnsafe ? [segment._id] : [];
+    }));
+  }, [confirmedUnsafeWindowIds, focusedQualityReview, qualityAnalysisPending, sanitizedEdited, transcriptionQuality, unsafeWindows, unconfirmedUnsafeWindows]);
+  unsafeCandidateIdsRef.current = unsafeCandidateSegmentIds;
+  const previewSegments = useMemo(() => sanitizedEdited.map((segment) => (
+    unsafeCandidateSegmentIds.has(segment._id)
+      ? {
+        ...segment,
+        text: t("editor.quality_preview_unconfirmed") || "Letra sin confirmar",
+        words: undefined,
+      }
+      : segment
+  )), [sanitizedEdited, t, unsafeCandidateSegmentIds]);
 
   const jumpToUnsafeWindow = useCallback((qualityWindow) => {
     if (!qualityWindow) return;
@@ -2767,6 +2942,14 @@ export default function LyricsEditor({
   const [isApproving, setIsApproving] = useState(false);
 
   const runApprove = async ({ skipWrapWarning = false } = {}) => {
+    if (pendingQualityReview) {
+      toast({
+        message: t("editor.quality_pending_approval")
+          || "El análisis de calidad todavía está terminando. Tus cambios están a salvo; esperá un instante antes de generar.",
+        tone: "info",
+      });
+      return;
+    }
     if (fatalQualityFailure) {
       toast({
         message: t("editor.quality_retry_failed")
@@ -3221,8 +3404,9 @@ export default function LyricsEditor({
               : (submitLabel || (isBatch
                 ? (t("editor.approve_next") || "Aprobar y continuar")
                 : (t("editor.approve_generate") || "Aprobar y generar")))}
-            aria-describedby={unconfirmedUnsafeWindows.length > 0 ? "transcription-quality-review" : undefined}
-            data-quality-review-required={unconfirmedUnsafeWindows.length > 0 ? "true" : "false"}
+            aria-describedby={pendingQualityReview || unconfirmedUnsafeWindows.length > 0 ? "transcription-quality-review" : undefined}
+            data-quality-status={qualityAnalysisPending ? "analysis_pending" : (transcriptionQuality?.decision || undefined)}
+            data-quality-review-required={pendingQualityReview || unconfirmedUnsafeWindows.length > 0 ? "true" : "false"}
             data-tour="editor-approve-floating"
             className="editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl bg-gradient-to-r from-brand to-brand-light px-5 text-sm font-semibold text-white shadow-xl shadow-brand/25 transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60"
           >
@@ -3248,7 +3432,28 @@ export default function LyricsEditor({
         </div>
       )}
 
-      {["review_required", "retry_failed"].includes(transcriptionQuality?.decision)
+      {pendingQualityReview && (
+        <section
+          id="transcription-quality-review"
+          data-testid="quality-analysis-pending"
+          role="status"
+          aria-live="polite"
+          className="mb-4 flex items-start gap-3 rounded-2xl bg-sky-400/[0.07] px-4 py-3 ring-1 ring-sky-300/25"
+        >
+          <span className="mt-0.5 h-5 w-5 shrink-0 animate-spin rounded-full border-2 border-sky-200/25 border-t-sky-200" aria-hidden="true" />
+          <div className="min-w-0">
+            <p className="text-xs font-semibold text-sky-100">
+              {t("editor.quality_pending_title") || "Comprobando letra y timing…"}
+            </p>
+            <p className="mt-1 text-xs leading-relaxed text-sky-100/70">
+              {t("editor.quality_pending_summary") || "Podés empezar a editar. Cuando termine el análisis actualizaremos únicamente el diagnóstico, sin reemplazar tus cambios."}
+            </p>
+          </div>
+        </section>
+      )}
+
+      {!qualityAnalysisPending
+        && ["review_required", "retry_failed"].includes(transcriptionQuality?.decision)
         && (!isTranscriptionQualityV5(transcriptionQuality)
           || transcriptionQuality?.mode === "enforce") && (
         <section
@@ -3291,7 +3496,16 @@ export default function LyricsEditor({
                   const confirmed = confirmedUnsafeWindowIds.has(qualityWindow.id);
                   const range = `${formatTimestamp(qualityWindow.start)}–${formatTimestamp(qualityWindow.end)}`;
                   return (
-                    <li key={qualityWindow.id} className="flex min-w-0 items-stretch rounded-xl bg-black/10 ring-1 ring-white/[0.07]">
+                    <li
+                      key={qualityWindow.id}
+                      data-testid={`unsafe-quality-window-${qualityWindow.id}`}
+                      data-quality-confirmed={confirmed ? "true" : "false"}
+                      className={`flex min-w-0 items-stretch rounded-xl ring-1 ${
+                        confirmed
+                          ? "bg-emerald-400/[0.04] ring-emerald-300/15"
+                          : "bg-amber-300/[0.08] ring-amber-200/20"
+                      }`}
+                    >
                       <button
                         type="button"
                         onClick={() => jumpToUnsafeWindow(qualityWindow)}
@@ -4191,30 +4405,40 @@ export default function LyricsEditor({
                 </button>
               </div>
             </div>
-            <LyricVideoPreview
-              t={t}
-              segments={sanitizedEdited}
-              currentTime={currentTime}
-              isPlaying={isPlaying}
-              backgroundUrl={previewBgUrl || null}
-              backgroundStyle={backgroundStyle || "default"}
-              font={FONT_CSS_BY_CODE[selectedFont] || undefined}
-              textCase={selectedCase}
-              textContrast={selectedContrast}
-              // 2026-05-23: la prop `transition` (Corte/Fade) salió con el
-              // deprecation de lyric_transition. Cuando el preview soporte
-              // las animaciones libass nuevas se pasa por acá:
-              //   lyricsAnimation={selectedAnimation}
-              //   lineTransition={selectedLineTransition}
-              fontScale={fontScale}
-              onSelect={(id) => {
-                focusSegment(id);
-                const seg = edited.find((s) => s._id === id);
-                if (seg) seekTo(Math.max(0, seg.start), false);
-              }}
-              onLayoutChange={handleLayoutChange}
-              onDragStart={pushEditHistory}
-            />
+            <div className="relative" data-testid="lyrics-preview-shell">
+              <LyricVideoPreview
+                t={t}
+                segments={previewSegments}
+                currentTime={currentTime}
+                isPlaying={isPlaying}
+                backgroundUrl={previewBgUrl || null}
+                backgroundStyle={backgroundStyle || "default"}
+                font={FONT_CSS_BY_CODE[selectedFont] || undefined}
+                textCase={selectedCase}
+                textContrast={selectedContrast}
+                // 2026-05-23: la prop `transition` (Corte/Fade) salió con el
+                // deprecation de lyric_transition. Cuando el preview soporte
+                // las animaciones libass nuevas se pasa por acá:
+                //   lyricsAnimation={selectedAnimation}
+                //   lineTransition={selectedLineTransition}
+                fontScale={fontScale}
+                onSelect={(id) => {
+                  focusSegment(id);
+                  const seg = edited.find((s) => s._id === id);
+                  if (seg) seekTo(Math.max(0, seg.start), false);
+                }}
+                onLayoutChange={handleLayoutChange}
+                onDragStart={pushEditHistory}
+              />
+              {unsafeCandidateSegmentIds.has(activeId) && (
+                <div
+                  data-testid="unsafe-preview-notice"
+                  className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full bg-amber-950/90 px-3 py-1.5 text-[10px] font-semibold text-amber-100 ring-1 ring-amber-300/35 shadow-lg"
+                >
+                  {t("editor.quality_preview_notice") || "Vista protegida · letra todavía no confirmada"}
+                </div>
+              )}
+            </div>
           </div>
           )}
           {/* COLUMNA DERECHA — scrollea independiente. Lista o timeline
@@ -4392,12 +4616,17 @@ export default function LyricsEditor({
             // Line the aligner inserted (Whisper missed it): timing is
             // interpolated, so flag it amber for the operator to verify.
             const isReview = !!seg.review;
+            const isUnsafeCandidate = unsafeCandidateSegmentIds.has(seg._id);
+            const unsafeCandidateHintId = `unsafe-candidate-${seg._id}`;
 
             return (
               <div
                 key={seg._id}
                 ref={(el) => { rowRefs.current[seg._id] = el; }}
                 {...(idx === 0 ? { "data-tour": "editor-list-row" } : {})}
+                data-testid={`lyric-row-${idx + 1}`}
+                data-unsafe-candidate={isUnsafeCandidate ? "true" : "false"}
+                aria-describedby={isUnsafeCandidate ? unsafeCandidateHintId : undefined}
                 /* Phase A 2026-05-25: highlight prominente cuando es activo.
                    Antes: bg-brand/[0.07] ring-1 ring-brand/25 (invisible al
                    operador, ~7% opacity). Ahora: bg-brand/15 + left-bar
@@ -4415,6 +4644,7 @@ export default function LyricsEditor({
                        no romper la grilla), en ámbar tenue. Sin fondo ni ring. */
                     : `border-l-4 ${!isArmed && !isActive && !wasRecentlyAnchored && isReview ? "border-amber-400/50" : "border-transparent"}`}
                   ${!isArmed && !isActive && wasRecentlyAnchored ? "bg-brand/[0.05] ring-1 ring-brand/40" : ""}
+                  ${isUnsafeCandidate ? "bg-amber-300/[0.06] ring-1 ring-amber-300/25" : ""}
                   ${flashReviewId === seg._id ? "ring-1 ring-amber-400/50" : ""}
                   ${isAnchored ? "opacity-60" : ""}`}
               >
@@ -4455,7 +4685,7 @@ export default function LyricsEditor({
                         className={`text-[11px] font-mono pt-2.5 w-14 text-right transition-colors
                           ${isActive ? "text-brand-light font-semibold"
                             : wasRecentlyAnchored ? "text-brand-light"
-                            : isReview ? "text-amber-400/80 hover:text-amber-300"
+                            : isUnsafeCandidate || isReview ? "text-amber-300 hover:text-amber-200"
                             : "text-gray-200 hover:text-brand-light"}`}
                       >
                         {/* Phase A 2026-05-25: indicador ▶ visible solo en
@@ -4538,8 +4768,20 @@ export default function LyricsEditor({
                       className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm
                         focus:border-brand/40 focus:outline-none hover:border-white/[0.08] transition-all
                         text-white
-                        ${suggestion && !isApplied ? "border-amber-500/20" : "border-white/[0.04]"}`}
+                        ${isUnsafeCandidate
+                          ? "border-amber-300/30"
+                          : suggestion && !isApplied ? "border-amber-500/20" : "border-white/[0.04]"}`}
                     />
+                    {isUnsafeCandidate && (
+                      <div
+                        id={unsafeCandidateHintId}
+                        data-testid={`unsafe-candidate-label-${idx + 1}`}
+                        className="mt-1 flex items-center gap-1.5 px-2 text-[10px] font-medium text-amber-200/90"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-amber-300" aria-hidden="true" />
+                        {t("editor.quality_candidate_label") || "Candidata insegura · escuchá y confirmá esta zona"}
+                      </div>
+                    )}
                     {/* Phase A 2026-05-25: overlay karaoke word-jump (Apple
                         Music style). Solo visible cuando este segment es el
                         activo Y el operador no está editando. Las palabras

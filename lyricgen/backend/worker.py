@@ -458,6 +458,8 @@ def main():
             # daily job schedules its successor after each successful run.
             from queue_jobs import ensure_daily_quality_learning_scheduled
             ensure_daily_quality_learning_scheduled()
+            from queue_jobs import ensure_quality_pending_reconciler_scheduled
+            ensure_quality_pending_reconciler_scheduled()
         except Exception as exc:
             logger.warning("[QUALITY-LEARNING] daily schedule unavailable: %s", exc)
     # WarmOnlyWorker: a burst of deploys (2nd SIGTERM mid-drain) would otherwise

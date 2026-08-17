@@ -2,10 +2,16 @@
 
 import asyncio
 import inspect
+import pytest
 
 import main
 import pipeline
 import transcription_worker
+
+
+@pytest.fixture(autouse=True)
+def _signed_quality_gate(monkeypatch):
+    monkeypatch.setattr(main, "_quality_mutation_authorized", lambda _job_id: True)
 
 
 def _run(segments, *, audio_path="/tmp/live.wav", canonical="studio words",
@@ -30,6 +36,19 @@ def test_disabled_flags_are_identity_and_schedule_no_work(monkeypatch):
     segments = [{"start": 1.0, "end": 2.0, "text": "Como se oyó"}]
 
     assert _run(segments) is segments
+
+
+def test_enabled_legacy_mutators_are_identity_without_signed_quality_gate(monkeypatch):
+    monkeypatch.setattr(main, "_quality_mutation_authorized", lambda _job_id: False)
+    monkeypatch.setenv("LLM_SEGMENT_ENABLED", "1")
+    monkeypatch.setenv("GAP_RECOVERY_ENABLED", "1")
+    raw = [{"start": 1.0, "end": 2.0, "text": "raw"}]
+
+    async def unexpected_to_thread(*_args, **_kwargs):
+        raise AssertionError("uncalibrated mutators must not run")
+
+    monkeypatch.setattr(main.asyncio, "to_thread", unexpected_to_thread)
+    assert _run(raw) is raw
 
 
 def test_enabled_postpasses_run_in_audio_first_order(monkeypatch):
@@ -206,7 +225,29 @@ def test_audio_truth_live_disables_catalogue_suffix_repair():
     assert "if (_catalogue_suffix_repair and _wx_raw" in src
 
 
-def test_final_credit_filter_drops_known_credit_and_preserves_sung_repetition():
+def test_adlib_filter_cannot_run_without_signed_quality_gate(monkeypatch):
+    monkeypatch.setattr(main, "_quality_mutation_authorized", lambda _job_id: False)
+    monkeypatch.setenv("ADLIB_CONSENSUS_ENABLED", "1")
+    source = {"segments": [
+        {"start": 1.0, "end": 2.0, "text": "one"},
+        {"start": 3.0, "end": 4.0, "text": "two"},
+        {"start": 5.0, "end": 6.0, "text": "uoh"},
+    ], "wx_raw": [{"text": "private transport"}]}
+    out = asyncio.run(main._maybe_adlib_filter(source, "/missing.wav", "job"))
+    assert out["segments"] == source["segments"]
+    assert "wx_raw" not in out
+    assert out["postpass_stats"]["adlib_consensus"] == {
+        "mode": "observe", "mutation_authorized": False,
+    }
+
+
+def test_divergent_llm_branch_is_bound_to_shared_mutation_gate():
+    src = inspect.getsource(main._run_transcription_for_job)
+    branch = src[src.index("_llm_segs = ("):]
+    assert "_is_divergent\n                                and _quality_mutation_authorized(job_id)" in branch
+
+
+def test_final_credit_filter_preserves_unverified_cc_text_and_sung_repetition():
     source = {"segments": [
         {"start": 79.0, "end": 83.0, "text": "No no no no no no no no"},
         {"start": 95.0, "end": 104.0,
@@ -215,6 +256,10 @@ def test_final_credit_filter_drops_known_credit_and_preserves_sung_repetition():
     ]}
     out = transcription_worker._drop_final_credit_hallucinations(source, "job")
     assert [segment["text"] for segment in out["segments"]] == [
-        "No no no no no no no no", "¡Gracias!",
+        "No no no no no no no no",
+        "CC por Antarctica Films Argentina.",
+        "¡Gracias!",
     ]
-    assert out["postpass_stats"]["final_credit_filter"] == {"dropped": 1}
+    assert (out.get("postpass_stats") or {}).get(
+        "final_credit_filter", {"dropped": 0},
+    ) == {"dropped": 0}

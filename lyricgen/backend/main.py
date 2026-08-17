@@ -4255,6 +4255,8 @@ async def transcribe_uploaded(
             filename=_row_filename,
             live=bool(body.live),
         )
+        from line_evidence import freeze_result_provider_evidence
+        _result = freeze_result_provider_evidence(_result)
         # Versión B: si el operador pegó la letra oficial, anclarla con CTC
         # ANTES del retime normal; si ancló, saltear el retime (no doble).
         if (body.anchor_lyrics or "").strip():
@@ -5005,6 +5007,8 @@ async def transcribe_endpoint(
         artist=artist, title=title,
         filename=file.filename,
     )
+    from line_evidence import freeze_result_provider_evidence
+    _result = freeze_result_provider_evidence(_result)
     _result = await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
     _post_lang = _resolve_postprocess_language(
         language, _result, job_id=job_id,
@@ -5067,6 +5071,15 @@ def _resolve_postprocess_language(requested_language, result, *, job_id: str):
     return resolved
 
 
+def _quality_mutation_authorized(job_id: str) -> bool:
+    """Authorize legacy lyric mutations only behind the signed v5 gate."""
+    try:
+        from quality_mutation import mutation_authorized
+        return mutation_authorized(job_id=job_id)
+    except Exception:
+        return False
+
+
 def _maybe_repetition_reconcile(result, job_id: str):
     """Post-pass gateado (REPETITION_RECONCILE_ENABLED, default off): cuando
     el audio canta un estribillo M veces y la referencia listó K<M, el grupo
@@ -5081,6 +5094,8 @@ def _maybe_repetition_reconcile(result, job_id: str):
     try:
         import repetition_reconcile as _rr
         if not _rr.is_enabled():
+            return result
+        if not _quality_mutation_authorized(job_id):
             return result
         segs = result.get("segments") or []
         words = result.get("_asr_words") or []
@@ -5128,6 +5143,8 @@ async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
     try:
         import gap_rescue as _gr
         if not _gr.is_enabled():
+            return result
+        if not _quality_mutation_authorized(job_id):
             return result
         segs = result.get("segments") or []
         if len(segs) < 3 or not audio_path or not os.path.exists(audio_path):
@@ -5388,7 +5405,7 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
                 segs, witness,
             )
             from transcription_quality import effective_policy_mode
-            _apply_verified = effective_policy_mode(job_id=job_id) == "enforce"
+            _apply_verified = _quality_mutation_authorized(job_id)
             nuevo = _verified_candidate if _apply_verified else segs
             stats = {
                 "substitutions": (
@@ -5405,6 +5422,8 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
                 _lexical_stats["applied"] if _apply_verified else 0
             )
         else:
+            if not _quality_mutation_authorized(job_id):
+                return result
             nuevo, stats = _wv.vote(segs, witness)
         result = dict(result)
         if _live_verify:
@@ -5460,6 +5479,8 @@ def _maybe_chorus_snap(result, job_id: str):
     try:
         import chorus_snap as _cs
         if not _cs.is_enabled():
+            return result
+        if not _quality_mutation_authorized(job_id):
             return result
         segs = result.get("segments") or []
         if len(segs) < 3:
@@ -5685,6 +5706,8 @@ def _maybe_phrase_segment(result, job_id: str):
         import phrase_segmenter as _ps
         if not _ps.is_enabled():
             return result
+        if not _quality_mutation_authorized(job_id):
+            return result
         segs = result.get("segments") or []
         if not segs:
             return result
@@ -5738,6 +5761,11 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
     _wx_raw = result.pop("wx_raw", None)
     if os.environ.get("ADLIB_CONSENSUS_ENABLED", "0").strip().lower() \
             not in ("1", "true", "yes", "on"):
+        return result
+    if not _quality_mutation_authorized(job_id):
+        result.setdefault("postpass_stats", {})["adlib_consensus"] = {
+            "mode": "observe", "mutation_authorized": False,
+        }
         return result
     segs = result.get("segments") or []
     if len(segs) < 3:
@@ -6122,16 +6150,39 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
         flagged = 0
         anchored = []
         for seg in retimed:
+            seg = dict(seg)
+            seg["content_source"] = "operator_reference"
+            seg["provider_evidence"] = {
+                "source": "operator_reference",
+                "text": str(seg.get("text") or ""),
+                "start": round(float(seg.get("start") or 0.0), 3),
+                "end": round(float(seg.get("end") or 0.0), 3),
+                "words": [], "word_count": 0,
+                "mean_score": None, "min_score": None,
+            }
+            seg["evidence_lineage"] = [
+                "operator_reference_content", "ctc_timing_only",
+            ]
             scores = [w.get("score") for w in (seg.get("words") or [])
                       if isinstance(w.get("score"), (int, float))]
             if scores and _median(scores) < _review_min:
-                seg = dict(seg)
                 seg["review"] = True
                 flagged += 1
             anchored.append(seg)
         result = dict(result)
+        result["_pre_anchor_provider_segments"] = [
+            dict(segment) for segment in (result.get("segments") or [])
+            if isinstance(segment, dict)
+        ]
         result["segments"] = anchored
         result["timing_source"] = "anchor_ctc"
+        result["anchor_alignment"] = {
+            "content_source": "operator_reference",
+            "timing_source": "ctc_timing_only",
+            "original_provider_segment_count": len(
+                result["_pre_anchor_provider_segments"]
+            ),
+        }
         logger.info("[ANCHOR] anchored %d líneas (%d en review, job=%s)",
                     len(anchored), flagged, job_id)
     except Exception as e:
@@ -6148,6 +6199,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
 async def _postprocess_live_whisperx(
     segments: list[dict], *, audio_path: str, canonical: str = "",
     artist: str = "", song: str = "", language: str | None = None,
+    job_id: str = "",
 ) -> list[dict]:
     """Apply the opt-in audio-first postpasses shared by every live exit.
 
@@ -6182,6 +6234,11 @@ async def _postprocess_live_whisperx(
         and os.environ.get("LIVE_INDEPENDENT_VERIFY_ENABLED", "0")
         .strip().lower() in _truthy
     )
+    # These legacy helpers rewrite content/structure.  They may only mutate
+    # after the signed v5 benchmark gate and within the enforce cohort.
+    if not _quality_mutation_authorized(job_id):
+        _segment_enabled = False
+        _gap_enabled = False
     if _lexical_requested and not _lexical_enabled:
         logger.warning(
             "[WC] live lexical consensus disabled: independent verifier "
@@ -6950,6 +7007,7 @@ async def _run_transcription_for_job(
                             _wx_segs, audio_path=_aa, canonical=_canonical,
                             artist=artist, song=title,
                             language=_live_language,
+                            job_id=job_id,
                         )
                         return _emit_segments(
                             _wx_segs, _WC_WX, reference_lyrics=_canonical,
@@ -7172,7 +7230,10 @@ async def _run_transcription_for_job(
                             await asyncio.to_thread(
                                 _llm_seg2, _wx_segs, audio_path=_aa,
                             )
-                            if _is_divergent else _wx_segs
+                            if (
+                                _is_divergent
+                                and _quality_mutation_authorized(job_id)
+                            ) else _wx_segs
                         )
                         if _llm_segs is not _wx_segs and len(_llm_segs) >= 2:
                             # Same gap-recovery as the no-hint path: fill the
@@ -11295,6 +11356,79 @@ class EditorPatchRequest(BaseModel):
     checkpoint: str = "autosave"
 
 
+def _editor_changed_windows(previous: list[dict], current: list[dict]) -> list[dict]:
+    """Bound quality re-analysis to lines whose content or timing changed."""
+    def key(item, index):
+        return str(item.get("_id") or f"idx_{index}")
+
+    before = {key(item, i): item for i, item in enumerate(previous) if isinstance(item, dict)}
+    after = {key(item, i): item for i, item in enumerate(current) if isinstance(item, dict)}
+    windows = []
+    for item_key in set(before) | set(after):
+        old, new = before.get(item_key), after.get(item_key)
+        if old == new:
+            continue
+        candidates = [item for item in (old, new) if isinstance(item, dict)]
+        starts = [float(item.get("start") or 0) for item in candidates]
+        ends = [float(item.get("end") or 0) for item in candidates]
+        if ends and max(ends) > min(starts):
+            windows.append({
+                "start": min(starts), "end": max(ends),
+                "reason": "operator_edited_segment",
+            })
+    return windows
+
+
+def _invalidate_quality_after_editor_save(
+    job, *, revision: int, segments: list[dict],
+    previous_segments: list[dict] | None = None,
+) -> dict:
+    """Bind editor changes to a fresh, fail-closed quality snapshot."""
+    from transcription_quality import evaluate, supersede_pending_analysis
+
+    current = job.transcription_quality
+    if not isinstance(current, dict):
+        current = evaluate(segments, None)
+        current["timing_source"] = job.timing_source or "unknown"
+    else:
+        current = dict(current)
+    current["unsafe_windows"] = [
+        *(current.get("unsafe_windows") or []),
+        *_editor_changed_windows(previous_segments or [], segments),
+    ]
+    return supersede_pending_analysis(
+        current, revision=revision, segments=segments,
+    ) or current
+
+
+def _enqueue_editor_quality_snapshot(job_id: str, *, revision: int,
+                                     segments: list[dict], filename: str,
+                                     tenant_id: str,
+                                     quality: dict | None = None) -> None:
+    """Re-analyze edited unsafe windows after the DB transaction commits."""
+    if not isinstance(quality, dict) or not quality.get("unsafe_windows"):
+        return
+    from transcription_quality import segments_hash
+    try:
+        from queue_jobs import enqueue_transcription_quality
+        result = enqueue_transcription_quality(
+            job_id, expected_revision=int(revision),
+            expected_segments_hash=segments_hash(segments),
+            filename=os.path.basename(filename or "audio.mp3"),
+            tenant_id=str(tenant_id or ""),
+        )
+        if not str(result).startswith("transcription-quality:"):
+            logger.warning(
+                "[QUALITY-QUEUE] editor snapshot not queued job=%s outcome=%s",
+                job_id, str(result).split(":", 1)[0],
+            )
+    except Exception as exc:
+        logger.warning(
+            "[QUALITY-QUEUE] editor snapshot enqueue failed job=%s error=%s",
+            job_id, type(exc).__name__,
+        )
+
+
 class EditorRestoreRequest(BaseModel):
     version_id: str
     base_revision: int
@@ -11403,6 +11537,9 @@ async def patch_editor_document(
     db: Session = Depends(get_db),
 ):
     job, document = _editor_document_or_404(db, job_id, current_user)
+    previous_editor_segments = [
+        dict(item) for item in (document.current_segments or [])
+    ]
     try:
         _audit_cross_tenant_access(db, current_user, job, "editor_save", commit=False)
         document, version, applied = save_document(
@@ -11412,6 +11549,11 @@ async def patch_editor_document(
         if applied:
             from correction_learning import invalidate_job_observations
             invalidate_job_observations(db, job_id, "later_editor_revision")
+            job.transcription_quality = _invalidate_quality_after_editor_save(
+                job, revision=document.revision,
+                segments=list(document.current_segments or []),
+                previous_segments=previous_editor_segments,
+            )
         db.commit()
     except RuntimeError:
         db.rollback()
@@ -11423,6 +11565,12 @@ async def patch_editor_document(
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from None
+    if applied:
+        _enqueue_editor_quality_snapshot(
+            job_id, revision=document.revision,
+            segments=list(document.current_segments or []), filename=job.filename or "",
+            tenant_id=str(job.tenant_id or ""), quality=job.transcription_quality,
+        )
     return {
         "job_id": job_id,
         "revision": document.revision,
@@ -12154,6 +12302,9 @@ async def save_segments(
             },
         )
 
+    previous_segments_for_quality = [
+        dict(item) for item in (job.segments_json or []) if isinstance(item, dict)
+    ]
     # Audit log of what changed between prev and new — only when non-empty.
     # Motivation: operator (Tomas, 2026-05-19) reported "lines change places"
     # in autosync, and we had ZERO way to reconstruct what happened (only
@@ -12163,6 +12314,16 @@ async def save_segments(
     # flag if exceeded).
     try:
         from database import AuditLog
+        from correction_learning import hmac_identifier
+
+        def _protected_text_ref(value: str) -> str | None:
+            try:
+                return hmac_identifier("audit_lyric", value)
+            except RuntimeError:
+                # Privacy is fail-closed: lengths/categories remain useful,
+                # but an unkeyed or raw lexical reference is never persisted.
+                return None
+
         prev_segs = job.segments_json if isinstance(job.segments_json, list) else []
         # Build id-keyed maps so we can diff by stable _id (frontend assigns
         # one) — fall back to positional index for legacy rows missing _id.
@@ -12192,8 +12353,11 @@ async def save_segments(
                     "new_start": round(ns_start, 3),
                     "prev_end": round(ps_end, 3),
                     "new_end": round(ns_end, 3),
-                    "prev_text": ps_text[:120],
-                    "new_text": ns_text[:120],
+                    "text_changed": ps_text != ns_text,
+                    "prev_text_length": len(ps_text),
+                    "new_text_length": len(ns_text),
+                    "prev_text_hmac": _protected_text_ref(ps_text),
+                    "new_text_hmac": _protected_text_ref(ns_text),
                 })
             if prev_idx != new_idx:
                 reorder.append({"id": k, "from_idx": prev_idx, "to_idx": new_idx})
@@ -12203,7 +12367,7 @@ async def save_segments(
                 "changed_lines": len(changed),
                 "text_changes": sum(
                     1 for item in changed
-                    if item.get("prev_text") != item.get("new_text")
+                    if item.get("text_changed")
                 ),
                 "timing_changes": sum(
                     1 for item in changed
@@ -12237,6 +12401,10 @@ async def save_segments(
 
     job.segments_json = segs
     job.segments_revision = current_revision + 1
+    job.transcription_quality = _invalidate_quality_after_editor_save(
+        job, revision=job.segments_revision, segments=segs,
+        previous_segments=previous_segments_for_quality,
+    )
     touch_user_activity(db, job)
     try:
         sync_legacy_snapshot(
@@ -12253,6 +12421,12 @@ async def save_segments(
             status_code=409,
             content={"code": "editor_state_conflict", "detail": str(exc)},
         )
+
+    _enqueue_editor_quality_snapshot(
+        job_id, revision=job.segments_revision, segments=segs,
+        filename=job.filename or "", tenant_id=str(job.tenant_id or ""),
+        quality=job.transcription_quality,
+    )
 
     # Outcome metric (issue #934): éxito consultable por tenant — junto con
     # el warning del 409 de arriba permite medir la tasa real de fallas del

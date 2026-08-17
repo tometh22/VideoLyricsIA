@@ -7,6 +7,9 @@ content hash still match the snapshot captured at enqueue time.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
+import hmac
+import json
 import logging
 import os
 import re
@@ -18,6 +21,100 @@ import unicodedata
 
 logger = logging.getLogger("genly.quality_jobs")
 
+
+def _pending_marker_is_stale(quality: dict, *, now=None, max_age_s: int = 900) -> bool:
+    """Pure predicate for recovering a crash between DB marker and Redis."""
+    from datetime import datetime, timezone
+    if not isinstance(quality, dict) or not quality.get("analysis_pending"):
+        return False
+    try:
+        created = datetime.fromisoformat(str(quality.get("analysis_enqueued_at") or ""))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        now = now or datetime.now(timezone.utc)
+        return (now - created).total_seconds() >= max(60, int(max_age_s))
+    except (TypeError, ValueError):
+        return True
+
+
+def reconcile_stale_pending_quality_jobs() -> dict:
+    """Republish or fail stale pending markers; always schedule the next scan."""
+    from database import Job, SessionLocal
+    from queue_jobs import (
+        _active_rq_job, _init_redis, _mark_transcription_quality_enqueue_failed,
+        enqueue_transcription_quality, ensure_quality_pending_reconciler_scheduled,
+    )
+    from transcription_quality import segments_hash
+
+    scanned = republished = active = failed = 0
+    try:
+        _init_redis()
+        from queue_jobs import _redis
+        db = SessionLocal()
+        try:
+            page_size = max(10, int(os.environ.get(
+                "QUALITY_PENDING_SCAN_PAGE_SIZE", "200",
+            )))
+            pending_flag = Job.transcription_quality[
+                "analysis_pending"
+            ].as_boolean()
+            pending_since = Job.transcription_quality[
+                "analysis_enqueued_at"
+            ].as_string()
+            # Filter pending rows in SQL and stream every page oldest-first.
+            # There is deliberately no global LIMIT: a fixed first page can
+            # starve later orphaned jobs forever when the table grows.
+            rows = db.query(Job).filter(
+                Job.transcription_quality.isnot(None),
+                pending_flag.is_(True),
+            ).order_by(pending_since.asc(), Job.job_id.asc()).yield_per(page_size)
+            max_age = int(os.environ.get("QUALITY_PENDING_MAX_AGE_SECONDS", "900"))
+            for row in rows:
+                quality = dict(row.transcription_quality or {})
+                if not _pending_marker_is_stale(quality, max_age_s=max_age):
+                    continue
+                scanned += 1
+                revision = int(row.segments_revision or 0)
+                content_hash = segments_hash(row.segments_json or [])
+                rq_id = str(quality.get("analysis_job_id") or (
+                    f"transcription-quality:{row.job_id}:{revision}:{content_hash[:12]}"
+                ))
+                if _redis is not None and _active_rq_job(_redis, rq_id) is not None:
+                    active += 1
+                    continue
+                try:
+                    result = enqueue_transcription_quality(
+                        row.job_id, expected_revision=revision,
+                        expected_segments_hash=content_hash,
+                        filename=os.path.basename(row.filename or "audio.mp3"),
+                        tenant_id=str(row.tenant_id or ""),
+                    )
+                    if str(result).startswith("transcription-quality:"):
+                        republished += 1
+                    else:
+                        _mark_transcription_quality_enqueue_failed(
+                            row.job_id, revision, content_hash, rq_id,
+                            str(result).split(":", 1)[0],
+                        )
+                        failed += 1
+                except Exception as exc:
+                    _mark_transcription_quality_enqueue_failed(
+                        row.job_id, revision, content_hash, rq_id,
+                        type(exc).__name__,
+                    )
+                    failed += 1
+        finally:
+            db.close()
+    finally:
+        try:
+            ensure_quality_pending_reconciler_scheduled()
+        except Exception:
+            logger.exception("[QUALITY-QUEUE] pending reconciler reschedule failed")
+    return {
+        "scanned": scanned, "republished": republished,
+        "active": active, "failed": failed,
+    }
+
 _WINDOW_REASON_PRIORITY = {
     "timeline_inversion": 100,
     "invalid_timing_range": 100,
@@ -25,6 +122,11 @@ _WINDOW_REASON_PRIORITY = {
     "live_structural_disagreement": 90,
     "event_count": 90,
     "strong_unassigned_vocal_events": 90,
+    "provider_timing_collapsed": 95,
+    "text_word_cardinality_mismatch": 90,
+    "isolated_tail_low_support": 90,
+    "low_ctc_timing_confidence": 85,
+    "low_asr_content_confidence": 75,
     "text_mismatch": 80,
     "independent_text_mismatch": 80,
     "uncovered_asr": 70,
@@ -124,6 +226,12 @@ def _persist_if_current(job_id: str, expected_revision: int,
         previous = dict(row.transcription_quality or {})
         ack = previous.get("acknowledgement")
         quality = dict(quality)
+        quality["analysis_status"] = (
+            "failed" if quality.get("decision") == "retry_failed" else "complete"
+        )
+        quality["analysis_pending"] = False
+        if previous.get("analysis_job_id"):
+            quality["analysis_job_id"] = str(previous["analysis_job_id"])
         quality["evaluated_revision"] = revision
         quality["segments_hash"] = current_hash
         try:
@@ -220,13 +328,111 @@ def _structure_summary(structure: dict) -> dict:
     }
 
 
+def _sanitize_analytical_evidence(value):
+    """Remove lyric/word payloads before quality diagnostics are persisted."""
+    if isinstance(value, list):
+        return [_sanitize_analytical_evidence(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    sanitized = {}
+    for key, item in value.items():
+        if key == "text":
+            sanitized["text_present"] = bool(str(item or "").strip())
+            sanitized["text_length"] = len(str(item or ""))
+        elif key == "texts":
+            sanitized["text_count"] = len(item or []) if isinstance(item, list) else 0
+        elif key == "words":
+            sanitized["word_count"] = len(item or []) if isinstance(item, list) else 0
+        else:
+            sanitized[key] = _sanitize_analytical_evidence(item)
+    return sanitized
+
+
 def _normalise_lyric(text: str) -> str:
     value = unicodedata.normalize("NFKC", str(text or "")).casefold()
     return " ".join(re.findall(r"\w+", value, flags=re.UNICODE))
 
 
+def _valid_independent_content_attestation(
+    mapping: dict, *, expected_window: list | tuple,
+    expected_stem_sha256: str, expected_mix_sha256: str,
+) -> bool:
+    attestation = mapping.get("independent_content_attestation")
+    if not isinstance(attestation, dict):
+        return False
+    signature = str(attestation.get("signature_hmac_sha256") or "")
+    payload = {
+        key: value for key, value in attestation.items()
+        if key != "signature_hmac_sha256"
+    }
+    families = set(payload.get("families") or [])
+    from line_evidence import canonical_content_sequence
+
+    content_sequence = canonical_content_sequence(mapping.get("events") or [])
+    content_sha256 = hashlib.sha256(json.dumps(
+        content_sequence, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    try:
+        actual_window = [
+            round(float(value), 3) for value in (payload.get("window") or [])
+        ]
+        expected_window = [
+            round(float(value), 3) for value in (expected_window or [])
+        ]
+    except (TypeError, ValueError):
+        return False
+    if (
+        payload.get("schema") != "independent-content-consensus-v1"
+        or len(families) < 2
+        or "gemini_audio" not in families
+        or any("ctc" in str(family).lower() for family in families)
+        or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("content_sha256") or ""))
+        or not content_sequence
+        or any(not value for value in content_sequence)
+        or not hmac.compare_digest(
+            str(payload.get("content_sha256") or ""), content_sha256,
+        )
+        or payload.get("selected_candidate_id") is None
+        or payload.get("selected_candidate_id") != mapping.get("selected_candidate_id")
+        or len(expected_window) != 2
+        or actual_window != expected_window
+        or not re.fullmatch(r"[0-9a-f]{64}", str(expected_stem_sha256 or ""))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(expected_mix_sha256 or ""))
+        or not hmac.compare_digest(
+            str(payload.get("stem_sha256") or ""), str(expected_stem_sha256),
+        )
+        or not hmac.compare_digest(
+            str(payload.get("mix_sha256") or ""), str(expected_mix_sha256),
+        )
+        or not re.fullmatch(r"[0-9a-f]{64}", signature)
+    ):
+        return False
+    secret = str(
+        os.environ.get("QUALITY_CONTENT_ATTESTATION_KEY")
+        or os.environ.get("QUALITY_LEARNING_HMAC_KEY") or ""
+    ).strip()
+    if not secret:
+        return False
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    evidence_sha = hashlib.sha256(encoded).hexdigest()
+    expected_signature = hmac.new(
+        secret.encode("utf-8"), encoded, hashlib.sha256,
+    ).hexdigest()
+    return bool(
+        hmac.compare_digest(signature, expected_signature)
+        and hmac.compare_digest(
+            str(mapping.get("independent_content_evidence_sha256") or ""),
+            evidence_sha,
+        )
+    )
+
+
 def _confirmed_windows(segments: list[dict], windows: list[dict],
-                       diagnostics: list[dict]) -> tuple[list[dict], list[dict]]:
+                       diagnostics: list[dict], *,
+                       expected_stem_sha256: str,
+                       expected_mix_sha256: str) -> tuple[list[dict], list[dict]]:
     """Resolve only accepted mappings that confirm the persisted rows."""
     unresolved: list[dict] = []
     resolved: list[dict] = []
@@ -248,6 +454,20 @@ def _confirmed_windows(segments: list[dict], windows: list[dict],
             span = diagnostic.get("window") or []
             if (
                 not mapping.get("accepted")
+                # CTC aligns supplied text and therefore cannot certify that
+                # the text exists. Resolution requires a separately attested
+                # content witness (provider/reference/operator), not stem+mix
+                # views of the same CTC family.
+                or not mapping.get("independent_content_verified")
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(mapping.get("independent_content_evidence_sha256") or ""),
+                )
+                or not _valid_independent_content_attestation(
+                    mapping, expected_window=span,
+                    expected_stem_sha256=expected_stem_sha256,
+                    expected_mix_sha256=expected_mix_sha256,
+                )
                 or not mapping.get("phonetic_verified")
                 or not phonetic.get("accepted")
                 or phonetic.get("schema") != "ctc-phonetic-evidence-v1"
@@ -326,6 +546,8 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 "queue": "transcription_quality", "mutated_segments": False,
             },
         )
+        failed["analysis_status"] = "failed"
+        failed["analysis_pending"] = False
         _persist_if_current(
             job_id, expected_revision, expected_segments_hash, failed,
         )
@@ -421,7 +643,9 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 for item in retry_stats.get("structural_hybrid_diagnostics") or []
                 if isinstance(item, dict) and item.get("evidence")
             )
-            diagnostic = {"windows": evidence_windows}
+            diagnostic = {
+                "windows": _sanitize_analytical_evidence(evidence_windows),
+            }
             metrics = dict(quality_before.get("metrics") or {})
             hybrid_diagnostics = [
                 item for item in retry_stats.get(
@@ -430,6 +654,8 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             ]
             remaining_windows, resolved_windows = _confirmed_windows(
                 snapshot["segments"], windows, hybrid_diagnostics,
+                expected_stem_sha256=stem_hash,
+                expected_mix_sha256=audio_hash,
             )
             retry_stats["windows_resolved"] = len(resolved_windows)
             retry_stats["resolved_window_ids"] = [
@@ -445,11 +671,12 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             quality = evaluate(
                 snapshot["segments"], metrics,
                 unsafe_windows=remaining_windows,
-                retry_stats=retry_stats, acoustic_evidence=diagnostic,
+                retry_stats=_sanitize_analytical_evidence(retry_stats),
+                acoustic_evidence=diagnostic,
                 resolved_reason_counts=resolved_reasons,
                 require_independent=calibration_identity()["calibrated"],
             )
-            quality["analysis_windows"] = analyses
+            quality["analysis_windows"] = _sanitize_analytical_evidence(analyses)
             quality["timing_source"] = quality_before.get("timing_source", "unknown")
 
         usage_after = resource.getrusage(resource.RUSAGE_SELF)
@@ -527,6 +754,8 @@ def transcription_quality_failure_callback(job, connection, type_, value, traceb
                 "queue": "transcription_quality", "mutated_segments": False,
             },
         )
+        failed["analysis_status"] = "failed"
+        failed["analysis_pending"] = False
         _persist_if_current(
             job_id, int(kwargs.get("expected_revision", -1)),
             str(kwargs.get("expected_segments_hash") or ""), failed,

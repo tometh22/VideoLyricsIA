@@ -78,6 +78,7 @@ def test_live_witness_never_rewrites_the_content_it_certifies(
 
 def test_live_witness_applies_only_a_preexisting_catalogue_proposal(
         tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "_quality_mutation_authorized", lambda _job_id: True)
     audio = tmp_path / "mix.wav"
     stem = tmp_path / "stem.wav"
     audio.write_bytes(b"mix")
@@ -194,6 +195,7 @@ def test_repeated_live_vocalization_is_not_filtered_as_training_credit(
 
 def test_poor_stem_witness_falls_back_to_better_blind_mix(
         tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "_quality_mutation_authorized", lambda _job_id: True)
     audio = tmp_path / "mix.wav"
     stem = tmp_path / "stem.wav"
     audio.write_bytes(b"mix")
