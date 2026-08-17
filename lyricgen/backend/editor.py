@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 import json
 import uuid
+import hashlib
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -16,13 +18,35 @@ from segment_timing import canonicalize_editor_segments
 
 EDITOR_REASONS = {
     "autosave", "manual", "restore", "approve", "conflict", "migration",
-    "transcription",
+    "transcription", "quality_proposal",
 }
 EDITOR_CHECKPOINTS = EDITOR_REASONS | {"draft"}
 MAX_SEGMENTS = 5000
 MAX_TEXT_LENGTH = 2000
 MAX_PAYLOAD_BYTES = 5 * 1024 * 1024
 LOCK_SECONDS = 60
+_TIMELINE_EPSILON = 1e-4
+
+
+class QualityProposalsDisabled(RuntimeError):
+    pass
+
+
+def quality_v6_proposals_enabled() -> bool:
+    return os.environ.get("QUALITY_V6_PROPOSALS_ENABLED", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def revoke_quality_proposal_if_disabled(document: EditorDocument) -> bool:
+    """Delete tenant-scoped proposal text when the serving switch is off."""
+    proposal = document.quality_proposal
+    if quality_v6_proposals_enabled() or not isinstance(proposal, dict):
+        return False
+    if str(proposal.get("status") or "pending") != "pending":
+        return False
+    document.quality_proposal = None
+    return True
 
 
 def now_utc() -> datetime:
@@ -360,11 +384,13 @@ def attach_machine_provenance(db: Session, job_id: str, provenance: dict) -> boo
 def serialize_document(db: Session, document: EditorDocument) -> dict:
     lock_expires = _aware(document.lock_expires_at)
     lock_active = bool(lock_expires and lock_expires > now_utc())
+    proposal = _proposal_for_response(document)
     return {
         "job_id": document.job_id,
         "revision": document.revision,
         "segments": document.current_segments,
         "original_segments": document.original_segments,
+        "quality_proposal": proposal,
         "updated_at": _aware(document.updated_at).isoformat() if document.updated_at else None,
         "updated_by": _user_summary(db, document.updated_by),
         "lock": {
@@ -373,6 +399,392 @@ def serialize_document(db: Session, document: EditorDocument) -> dict:
             "expires_at": lock_expires.isoformat() if lock_active else None,
         },
     }
+
+
+def _proposal_for_response(document: EditorDocument) -> dict | None:
+    proposal = dict(document.quality_proposal or {})
+    if not proposal:
+        return None
+    status = str(proposal.get("status") or "pending")
+    expires_at = proposal.get("expires_at")
+    try:
+        expires = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        expired = _aware(expires) <= now_utc()
+    except (TypeError, ValueError):
+        expired = True
+    stale = int(proposal.get("base_revision", -1)) != int(document.revision or 0)
+    if expired:
+        # Raw proposed lyrics have a hard seven-day retention limit. The GET
+        # editor path commits this cleanup, while the quality reconciler also
+        # sweeps documents that operators never reopen.
+        document.quality_proposal = None
+        return None
+    if status == "pending" and stale:
+        return {
+            "id": proposal.get("id"),
+            "status": "stale",
+            "base_revision": proposal.get("base_revision"),
+            "expires_at": proposal.get("expires_at"),
+            "windows": [],
+        }
+    return proposal
+
+
+def expire_stale_quality_proposals(
+    db: Session, *, now=None, limit: int | None = None,
+) -> int:
+    """Erase expired payloads under row lock, rechecking after lock acquisition."""
+    now = _aware(now) or now_utc()
+    expired = 0
+    candidates = db.query(EditorDocument.job_id).filter(
+        EditorDocument.quality_proposal.isnot(None),
+    ).order_by(EditorDocument.updated_at.asc(), EditorDocument.job_id.asc())
+    if limit is not None:
+        candidates = candidates.limit(max(1, min(int(limit), 1000)))
+    candidate_ids = [row[0] for row in candidates.all()]
+    for job_id in candidate_ids:
+        query = db.query(EditorDocument).filter(EditorDocument.job_id == job_id)
+        if db.bind is not None and db.bind.dialect.name == "postgresql":
+            query = query.with_for_update(skip_locked=True)
+        else:
+            query = query.with_for_update()
+        document = query.populate_existing().first()
+        if document is None or document.quality_proposal is None:
+            continue
+        proposal = document.quality_proposal
+        if not isinstance(proposal, dict):
+            document.quality_proposal = None
+            expired += 1
+            continue
+        try:
+            expires = _aware(datetime.fromisoformat(
+                str(proposal.get("expires_at") or "").replace("Z", "+00:00")
+            ))
+        except (TypeError, ValueError):
+            expires = None
+        if expires is None or expires <= now:
+            document.quality_proposal = None
+            expired += 1
+    if expired:
+        db.flush()
+    return expired
+
+
+def proposal_idempotency_hash(value: str) -> str:
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+
+def segments_content_hash(value: list[dict]) -> str:
+    """Hash every editor field and list order, unlike ASR diagnostic hashes."""
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _strict_timeline(value: Any, *, label: str) -> list[dict]:
+    """Validate without canonical repair so malformed proposals fail closed."""
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be an array")
+    rows: list[dict] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"{label} segment {index} must be an object")
+        try:
+            start, end = float(item.get("start")), float(item.get("end"))
+        except (TypeError, ValueError):
+            raise ValueError(f"{label} segment {index} has invalid timing") from None
+        if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+            raise ValueError(f"{label} segment {index} has invalid timing")
+        rows.append({**item, "start": round(start, 4), "end": round(end, 4)})
+    original_order = [
+        (row["start"], row["end"], str(row.get("text") or "")) for row in rows
+    ]
+    rows.sort(key=lambda row: (row["start"], row["end"], str(row.get("text") or "")))
+    sorted_order = [
+        (row["start"], row["end"], str(row.get("text") or "")) for row in rows
+    ]
+    if original_order != sorted_order:
+        raise ValueError(f"{label} is not monotonic")
+    seen = set()
+    previous = None
+    for index, row in enumerate(rows):
+        digest = segments_content_hash([row])
+        if digest in seen:
+            raise ValueError(f"{label} contains a duplicate segment")
+        seen.add(digest)
+        if previous is not None:
+            if abs(row["start"] - previous["start"]) <= _TIMELINE_EPSILON:
+                raise ValueError(f"{label} contains duplicate starts")
+            if row["start"] < previous["end"] - _TIMELINE_EPSILON:
+                raise ValueError(f"{label} contains overlapping segments")
+        previous = row
+    return rows
+
+
+def _segments_overlapping_window(
+    segments: list[dict], start: float, end: float,
+) -> list[dict]:
+    return [
+        dict(item) for item in segments
+        if float(item["start"]) < end - _TIMELINE_EPSILON
+        and float(item["end"]) > start + _TIMELINE_EPSILON
+    ]
+
+
+def _validate_review_proposal_against_document(
+    proposal: dict, current_segments: list[dict], *, require_hashes: bool = False,
+) -> dict:
+    current = _strict_timeline(current_segments, label="current timeline")
+    windows = proposal.get("windows")
+    if not isinstance(windows, list) or not windows:
+        raise ValueError("quality proposal requires windows")
+    validated: list[dict] = []
+    claimed_current_hashes: set[str] = set()
+    for index, window in enumerate(windows):
+        if not isinstance(window, dict):
+            raise ValueError(f"quality proposal window {index} is invalid")
+        try:
+            start, end = float(window.get("start")), float(window.get("end"))
+        except (TypeError, ValueError):
+            raise ValueError("quality proposal window timing is invalid") from None
+        if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+            raise ValueError("quality proposal window timing is invalid")
+        supplied_current = _strict_timeline(
+            window.get("current_segments"), label=f"window {index} current",
+        )
+        expected_current = _segments_overlapping_window(current, start, end)
+        if supplied_current != expected_current:
+            raise ValueError("quality proposal current segments do not match editor snapshot")
+        if any(
+            row["start"] < start - _TIMELINE_EPSILON
+            or row["end"] > end + _TIMELINE_EPSILON
+            for row in supplied_current
+        ):
+            raise ValueError("quality proposal window cuts through a current segment")
+        proposed = _strict_timeline(
+            window.get("proposed_segments"), label=f"window {index} proposed",
+        )
+        if not proposed:
+            raise ValueError("quality proposal window requires proposed segments")
+        if any(
+            row["start"] < start - _TIMELINE_EPSILON
+            or row["end"] > end + _TIMELINE_EPSILON
+            for row in proposed
+        ):
+            raise ValueError("quality proposal segment falls outside its window")
+        current_hash = segments_content_hash(supplied_current)
+        proposed_hash = segments_content_hash(proposed)
+        if require_hashes and (
+            str(window.get("current_segments_hash") or "") != current_hash
+            or str(window.get("proposed_segments_hash") or "") != proposed_hash
+        ):
+            raise ValueError("quality proposal window hash mismatch")
+        individual_hashes = {segments_content_hash([row]) for row in supplied_current}
+        if claimed_current_hashes.intersection(individual_hashes):
+            raise ValueError("quality proposal windows duplicate current segments")
+        claimed_current_hashes.update(individual_hashes)
+        validated.append({
+            **window,
+            "start": round(start, 4), "end": round(end, 4),
+            "current_segments": supplied_current,
+            "proposed_segments": proposed,
+            "current_segments_hash": current_hash,
+            "proposed_segments_hash": proposed_hash,
+        })
+    validated.sort(key=lambda item: (item["start"], item["end"], str(item.get("id"))))
+    for left, right in zip(validated, validated[1:]):
+        if right["start"] < left["end"] - _TIMELINE_EPSILON:
+            raise ValueError("quality proposal windows overlap")
+    return {**proposal, "windows": validated}
+
+
+def persist_quality_proposal_if_current(
+    db: Session,
+    *,
+    job_id: str,
+    expected_revision: int,
+    expected_segments_hash: str,
+    expected_audio_revision: int,
+    expected_audio_sha256: str,
+    proposal: dict,
+) -> bool:
+    """Store raw suggestions only on the exact tenant-scoped editor snapshot."""
+    from quality_v6_contracts import ReviewProposal
+    from transcription_quality import segments_hash
+
+    job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
+    document = db.query(EditorDocument).filter(
+        EditorDocument.job_id == job_id,
+    ).with_for_update().first()
+    if job is None or document is None:
+        return False
+    if not quality_v6_proposals_enabled():
+        revoke_quality_proposal_if_disabled(document)
+        db.flush()
+        return False
+    try:
+        proposal = ReviewProposal.from_mapping(proposal).to_dict()
+    except (TypeError, ValueError):
+        return False
+    if (
+        int(document.revision or 0) != int(expected_revision)
+        or segments_hash(document.current_segments or []) != expected_segments_hash
+        or int(job.audio_revision or 0) != int(expected_audio_revision)
+        or str(job.input_audio_sha256 or "") != str(expected_audio_sha256 or "")
+    ):
+        return False
+    try:
+        proposal = _validate_review_proposal_against_document(
+            proposal, list(document.current_segments or []),
+        )
+    except ValueError:
+        return False
+    created = now_utc()
+    document.quality_proposal = {
+        **proposal,
+        "id": str(proposal.get("id") or uuid.uuid4()),
+        "status": "pending",
+        "base_revision": int(expected_revision),
+        "segments_hash": expected_segments_hash,
+        "segments_content_hash": segments_content_hash(
+            list(document.current_segments or []),
+        ),
+        "audio_revision": int(expected_audio_revision),
+        "audio_sha256": expected_audio_sha256,
+        "created_at": created.isoformat(),
+        "expires_at": (created + timedelta(days=7)).isoformat(),
+    }
+    db.flush()
+    return True
+
+
+def _segment_key(segment: dict) -> tuple:
+    row_id = segment.get("_id") or segment.get("id") or segment.get("segment_id")
+    if row_id:
+        return ("id", str(row_id))
+    return (
+        "value", round(float(segment.get("start") or 0), 4),
+        round(float(segment.get("end") or 0), 4), str(segment.get("text") or ""),
+    )
+
+
+def apply_quality_proposal(
+    db: Session,
+    job: Job,
+    document: EditorDocument,
+    user_id: int,
+    *,
+    proposal_id: str,
+    base_revision: int,
+    window_ids: list[str],
+    idempotency_key: str,
+) -> tuple[EditorDocument, EditorVersion | None, bool]:
+    from transcription_quality import segments_hash
+
+    job = db.query(Job).filter(
+        Job.job_id == job.job_id,
+    ).populate_existing().with_for_update().one()
+    document = db.query(EditorDocument).filter(
+        EditorDocument.job_id == document.job_id,
+    ).populate_existing().with_for_update().one()
+    if not quality_v6_proposals_enabled():
+        revoke_quality_proposal_if_disabled(document)
+        db.flush()
+        raise QualityProposalsDisabled("quality_v6_proposals_disabled")
+    proposal = dict(document.quality_proposal or {})
+    idem_hash = proposal_idempotency_hash(idempotency_key)
+    if proposal.get("id") != proposal_id:
+        raise LookupError("quality_proposal_not_found")
+    if proposal.get("status") == "applied" and proposal.get("idempotency_hash") == idem_hash:
+        return document, None, False
+    visible_proposal = _proposal_for_response(document) or {}
+    if proposal.get("status") != "pending" or visible_proposal.get("status") != "pending":
+        raise RuntimeError("quality_proposal_stale")
+    if (
+        int(proposal.get("audio_revision", -1)) != int(job.audio_revision or 0)
+        or str(proposal.get("audio_sha256") or "")
+        != str(job.input_audio_sha256 or "")
+        or str(proposal.get("segments_hash") or "")
+        != segments_hash(document.current_segments or [])
+        or str(proposal.get("segments_content_hash") or "")
+        != segments_content_hash(list(document.current_segments or []))
+    ):
+        raise RuntimeError("quality_proposal_stale")
+    if int(document.revision or 0) != int(base_revision):
+        raise RuntimeError("editor_revision_conflict")
+    requested = [str(item) for item in window_ids]
+    selected = set(requested)
+    if len(requested) != len(selected):
+        raise ValueError("quality proposal window ids must be unique")
+    windows = [
+        item for item in (proposal.get("windows") or [])
+        if isinstance(item, dict) and str(item.get("id")) in selected
+    ]
+    if not windows or len(windows) != len(selected):
+        raise ValueError("invalid quality proposal windows")
+    validated_proposal = _validate_review_proposal_against_document(
+        proposal, list(document.current_segments or []), require_hashes=True,
+    )
+    validated_by_id = {
+        str(item.get("id")): item for item in validated_proposal["windows"]
+    }
+    windows = [validated_by_id[item] for item in selected]
+    segments = [dict(item) for item in (document.current_segments or [])]
+    for window in windows:
+        remove_hashes = {
+            segments_content_hash([dict(item)])
+            for item in (window.get("current_segments") or [])
+        }
+        segments = [
+            item for item in segments
+            if segments_content_hash([dict(item)]) not in remove_hashes
+        ]
+        segments.extend(
+            dict(item) for item in (window.get("proposed_segments") or [])
+            if isinstance(item, dict)
+        )
+    # Replacement rows are appended per selected window. Re-establish the
+    # canonical global order before the strict overlap/duplicate validation.
+    segments.sort(key=lambda row: (
+        float(row.get("start") or 0), float(row.get("end") or 0),
+        str(row.get("text") or ""),
+    ))
+    segments = _strict_timeline(segments, label="quality proposal result")
+    document, version, applied = save_document(
+        db, job, document, user_id, base_revision, segments, "quality_proposal",
+    )
+    document.quality_proposal = {
+        "id": proposal_id, "status": "applied", "windows": [],
+        "base_revision": base_revision, "applied_revision": int(document.revision or 0),
+        "idempotency_hash": idem_hash, "expires_at": (now_utc() + timedelta(days=7)).isoformat(),
+    }
+    db.flush()
+    return document, version, applied
+
+
+def dismiss_quality_proposal(
+    db: Session, document: EditorDocument, *, proposal_id: str,
+    base_revision: int, idempotency_key: str,
+) -> bool:
+    document = db.query(EditorDocument).filter(
+        EditorDocument.job_id == document.job_id,
+    ).populate_existing().with_for_update().one()
+    proposal = dict(document.quality_proposal or {})
+    idem_hash = proposal_idempotency_hash(idempotency_key)
+    if proposal.get("id") != proposal_id:
+        raise LookupError("quality_proposal_not_found")
+    if proposal.get("status") == "dismissed" and proposal.get("idempotency_hash") == idem_hash:
+        return False
+    if int(document.revision or 0) != int(base_revision):
+        raise RuntimeError("editor_revision_conflict")
+    document.quality_proposal = {
+        "id": proposal_id, "status": "dismissed", "windows": [],
+        "base_revision": base_revision, "idempotency_hash": idem_hash,
+        "expires_at": (now_utc() + timedelta(days=7)).isoformat(),
+    }
+    db.flush()
+    return True
 
 
 def save_document(
@@ -443,6 +855,9 @@ def save_document(
     document.updated_at = now_utc()
     job.segments_json = normalized
     job.segments_revision = document.revision
+    # Any ordinary edit makes a raw proposal stale. Quality-proposal apply
+    # writes a text-free tombstone after save_document returns.
+    document.quality_proposal = None
     version = None
     if reason != "draft":
         version = _ensure_version(

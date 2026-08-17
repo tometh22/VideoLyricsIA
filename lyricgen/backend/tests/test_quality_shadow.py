@@ -30,7 +30,14 @@ def test_shadow_event_is_deterministic_and_contains_no_lyrics_or_audio():
     assert first["properties"]["evaluation_stage"] == "terminal"
     assert len(first["properties"]["decision_id"]) == 64
     serialized = str(first).lower()
-    assert "segments" not in serialized.replace("segments_hash", "")
+    assert "a" * 64 not in serialized
+    assert "segments_hash" not in first["properties"]
+    assert first["properties"]["segments_fingerprint"].startswith(
+        "hmac-sha256:v1:test-v1:",
+    )
+    assert first["properties"]["quality_fingerprint"].startswith(
+        "hmac-sha256:v1:test-v1:",
+    )
     assert "audio_path" not in serialized
 
     later = build_shadow_event(

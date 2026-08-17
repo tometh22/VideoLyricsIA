@@ -74,6 +74,11 @@ def _tokenize(text: str) -> list[str]:
 
 
 def content_class(text: str, kind: str = "") -> str:
+    from lyric_content_policy import classify_content
+
+    policy_class = classify_content(text, provider_kind=kind)
+    if policy_class in {"METADATA", "SPEECH", "CROWD_NOISE", "SPEECH_CANDIDATE"}:
+        return policy_class
     tokens = _tokenize(text)
     kind = str(kind or "").lower()
     if kind == "vocalization" or (tokens and all(
@@ -88,16 +93,12 @@ def content_class(text: str, kind: str = "") -> str:
     return "LEXICAL" if tokens else "BLANK"
 
 
-def _extract_view(path: str, start: float, end: float) -> dict | None:
-    if not path or not os.path.exists(path) or end <= start:
+def _extract_features(y: np.ndarray) -> dict | None:
+    """Extract one feature view from a real mono waveform."""
+    y = np.asarray(y, dtype=np.float32).reshape(-1)
+    if y.size < SAMPLE_RATE // 2 or not np.all(np.isfinite(y)):
         return None
     try:
-        y, _ = librosa.load(
-            path, sr=SAMPLE_RATE, mono=True, offset=max(0.0, start),
-            duration=min(MAX_WINDOW_SECONDS, end - start),
-        )
-        if len(y) < SAMPLE_RATE // 2:
-            return None
         mel = librosa.feature.melspectrogram(
             y=y, sr=SAMPLE_RATE, n_fft=1024, hop_length=EMBEDDING_HOP,
             n_mels=64, fmin=60, fmax=7600, power=2.0,
@@ -170,9 +171,82 @@ def _extract_view(path: str, start: float, end: float) -> dict | None:
             "voicing": _normalize(voicing[:boundary_n]),
         }
     except Exception as exc:
-        logger.warning("[ACOUSTIC-STRUCTURE] feature extraction failed path=%s: %r",
-                       path, exc)
+        logger.warning(
+            "[ACOUSTIC-STRUCTURE] feature extraction declined error_type=%s",
+            type(exc).__name__,
+        )
         return None
+
+
+def _load_waveform(path: str, start: float, end: float) -> np.ndarray | None:
+    if not path or not os.path.exists(path) or end <= start:
+        return None
+    try:
+        y, _ = librosa.load(
+            path, sr=SAMPLE_RATE, mono=True, offset=max(0.0, start),
+            duration=min(MAX_WINDOW_SECONDS, end - start),
+        )
+        y = np.asarray(y, dtype=np.float32).reshape(-1)
+        return y if y.size >= SAMPLE_RATE // 2 else None
+    except Exception as exc:
+        logger.warning(
+            "[ACOUSTIC-STRUCTURE] waveform load declined error_type=%s",
+            type(exc).__name__,
+        )
+        return None
+
+
+def _extract_view(path: str, start: float, end: float) -> dict | None:
+    y = _load_waveform(path, start, end)
+    return _extract_features(y) if y is not None else None
+
+
+def _extract_waveform_residual_view(
+    stem_path: str, mix_path: str, start: float, end: float,
+) -> dict | None:
+    """Extract features from a physically valid mix-minus-stem waveform.
+
+    Feature vectors are normalized independently and therefore cannot be
+    subtracted meaningfully.  We instead project the stem waveform onto the
+    mix in least-squares amplitude space, subtract that projection, and only
+    then run the common front end.  Missing, silent or invalid waveforms fail
+    closed: no residual evidence is emitted.
+    """
+    stem = _load_waveform(stem_path, start, end)
+    mix = _load_waveform(mix_path, start, end)
+    if stem is None or mix is None:
+        return None
+    sample_count = min(stem.size, mix.size)
+    if sample_count < SAMPLE_RATE // 2:
+        return None
+    stem = stem[:sample_count]
+    mix = mix[:sample_count]
+    denominator = float(np.dot(stem, stem))
+    if denominator <= _EPS:
+        return None
+    projection_gain = float(np.dot(mix, stem) / denominator)
+    # Separator gain can differ from the original mix, but an unbounded or
+    # negative projection is not reliable crowd/chorus evidence.
+    if not math.isfinite(projection_gain) or not 0.0 <= projection_gain <= 4.0:
+        return None
+    residual_waveform = mix - projection_gain * stem
+    residual_rms = float(np.sqrt(np.mean(np.square(residual_waveform))))
+    mix_rms = float(np.sqrt(np.mean(np.square(mix))))
+    if (
+        not math.isfinite(residual_rms)
+        or residual_rms <= 1e-5
+        or residual_rms / max(mix_rms, _EPS) <= 1e-3
+    ):
+        return None
+    features = _extract_features(residual_waveform)
+    if features is None:
+        return None
+    features.update({
+        "residual_method": "waveform_projection_mix_minus_stem",
+        "waveform_derived": True,
+        "projection_gain": round(projection_gain, 6),
+    })
+    return features
 
 
 def _cached_view(path: str, role: str, start: float, end: float, *,
@@ -212,7 +286,10 @@ def _cached_view(path: str, role: str, start: float, end: float, *,
                 with np.load(io.BytesIO(payload), allow_pickle=False) as stored:
                     return ({key: stored[key] for key in stored.files}, True)
         except Exception as exc:
-            logger.warning("[ACOUSTIC-STRUCTURE] feature cache read declined: %r", exc)
+            logger.warning(
+                "[ACOUSTIC-STRUCTURE] feature cache read declined error_type=%s",
+                type(exc).__name__,
+            )
     value = _extract_view(path, start, end)
     if value is not None and address is not None:
         try:
@@ -223,7 +300,10 @@ def _cached_view(path: str, role: str, start: float, end: float, *,
                 content_type="application/x-npz",
             )
         except Exception as exc:
-            logger.warning("[ACOUSTIC-STRUCTURE] feature cache write declined: %r", exc)
+            logger.warning(
+                "[ACOUSTIC-STRUCTURE] feature cache write declined error_type=%s",
+                type(exc).__name__,
+            )
     return value, False
 
 
@@ -602,7 +682,81 @@ def _motif_groups(events: list[dict], stem: dict, mix: dict,
     return output
 
 
-def _self_similarity_summary(stem: dict, mix: dict) -> dict:
+def _primitive_recurrence_features(
+    primitives: list[tuple[float, float]], stem: dict, mix: dict,
+    window_start: float,
+) -> list[dict]:
+    """Compute bounded segmental-DTW motif evidence before phrase inference.
+
+    The old flow discovered motifs only after selecting a partition, so the
+    evidence could explain a result but never influence it. This high-recall
+    pass evaluates duration-compatible primitive pairs first and feeds soft
+    recurrence/cohesion features into the semi-Markov lattice. It never fixes
+    cardinality or imposes a periodic grid.
+    """
+    count = len(primitives)
+    output = [
+        {"motif_recurrence": 0.0, "phrase_cohesion": 0.5}
+        for _ in primitives
+    ]
+    if count < 2:
+        return output
+
+    embeddings = [
+        (
+            _event_embedding(stem, start, end, window_start),
+            _event_embedding(mix, start, end, window_start),
+        )
+        for start, end in primitives
+    ]
+    # Adjacent similarity is phrase-cohesion evidence, not a mandatory merge.
+    for index in range(count - 1):
+        stem_dtw = _dtw(embeddings[index][0], embeddings[index + 1][0])
+        mix_dtw = _dtw(embeddings[index][1], embeddings[index + 1][1])
+        similarity = math.exp(-(0.68 * stem_dtw + 0.32 * mix_dtw))
+        output[index]["phrase_cohesion"] = max(
+            output[index]["phrase_cohesion"], similarity,
+        )
+        output[index + 1]["phrase_cohesion"] = max(
+            output[index + 1]["phrase_cohesion"], similarity,
+        )
+
+    candidates = []
+    for left, right in itertools.combinations(range(count), 2):
+        left_duration = primitives[left][1] - primitives[left][0]
+        right_duration = primitives[right][1] - primitives[right][0]
+        duration_ratio = min(left_duration, right_duration) / (
+            max(left_duration, right_duration) + _EPS
+        )
+        if duration_ratio < .45:
+            continue
+        temporal_distance = primitives[right][0] - primitives[left][1]
+        candidates.append((duration_ratio, temporal_distance, left, right))
+    # Bound quadratic DTW work on pathological windows while preferring pairs
+    # that look like distant recurrences over neighbouring fragments.
+    try:
+        max_pairs = int(os.environ.get("QUALITY_V6_MAX_PRIMITIVE_DTW_PAIRS", "96"))
+    except (TypeError, ValueError):
+        max_pairs = 96
+    max_pairs = max(16, min(256, max_pairs))
+    candidates.sort(key=lambda item: (-item[0], -item[1], item[2], item[3]))
+    for _ratio, _distance, left, right in candidates[:max_pairs]:
+        stem_dtw = _dtw(embeddings[left][0], embeddings[right][0])
+        mix_dtw = _dtw(embeddings[left][1], embeddings[right][1])
+        recurrence = math.exp(-(0.68 * stem_dtw + 0.32 * mix_dtw))
+        if recurrence < .40:
+            continue
+        output[left]["motif_recurrence"] = max(
+            output[left]["motif_recurrence"], recurrence,
+        )
+        output[right]["motif_recurrence"] = max(
+            output[right]["motif_recurrence"], recurrence,
+        )
+    return output
+
+
+def _self_similarity_summary(stem: dict, mix: dict,
+                             residual: dict | None = None) -> dict:
     """Construct multiscale acoustic self-similarity without lyric text.
 
     Full matrices are intentionally not serialized into Job JSON. Their
@@ -612,9 +766,11 @@ def _self_similarity_summary(stem: dict, mix: dict) -> dict:
     n = min(stem["embedding"].shape[1], mix["embedding"].shape[1])
     if n < 8:
         return {"available": False, "reason": "insufficient_frames"}
-    features = np.vstack([
-        stem["embedding"][:, :n], .55 * mix["embedding"][:, :n],
-    ]).astype(np.float32)
+    views = [stem["embedding"][:, :n], .55 * mix["embedding"][:, :n]]
+    residual_embedding = np.asarray((residual or {}).get("embedding", []))
+    if residual_embedding.ndim == 2 and residual_embedding.shape[1] >= n:
+        views.append(.30 * residual_embedding[:, :n])
+    features = np.vstack(views).astype(np.float32)
     scales = {
         "phonetic": 60,
         "syllabic": 180,
@@ -662,6 +818,116 @@ def _self_similarity_summary(stem: dict, mix: dict) -> dict:
             ],
         }
     return {"available": bool(output), "scales": output}
+
+
+def _performance_graph_structure(
+    primitives: list[tuple[float, float]], stem: dict, mix: dict,
+    window_start: float, boundaries: list[dict], *, n_best: int,
+    residual: dict | None = None,
+) -> dict:
+    """Lift sensitive acoustic atoms into editable phrase parents."""
+    from performance_graph import build_performance_graph, to_legacy_acoustic_structure
+
+    residual = residual or {}
+    recurrence_features = _primitive_recurrence_features(
+        primitives, stem, mix, window_start,
+    )
+
+    primitive_rows = []
+    for primitive_index, (start, end) in enumerate(primitives):
+        posterior, nuclei = _classify_event(start, end, stem, mix, window_start)
+        left = _frame(start - window_start)
+        right = max(left + 1, _frame(end - window_start))
+
+        def mean(view: dict, key: str) -> float:
+            values = np.asarray(view.get(key, []))[left:right]
+            return float(np.mean(values)) if values.size else 0.0
+
+        short = _finite(posterior.get("short_vocalization"))
+        sustained = _finite(posterior.get("sustained_vocalization"))
+        lexical = _finite(posterior.get("lexical_phrase"))
+        crowd = _finite(posterior.get("crowd_or_overlap"))
+        residual_presence = mean(residual, "rms")
+        residual_voicing = mean(residual, "voicing")
+        residual_flatness = mean(residual, "flatness")
+        primitive_rows.append({
+            "start": start, "end": end,
+            "features": {
+                "voicing": mean(stem, "voicing"),
+                "harmonicity": mean(stem, "harmonicity"),
+                "onset_strength": mean(stem, "onset"),
+                "lexical_probability": lexical,
+                "nonlexical_probability": max(short, sustained),
+                "sustained_probability": sustained,
+                "sung_lead_probability": max(lexical, short, sustained),
+                "sung_crowd_probability": max(
+                    crowd, .65 * residual_voicing + .35 * residual_presence,
+                ),
+                "crowd_presence": max(crowd, residual_presence),
+                "crowd_noise_probability": residual_flatness * residual_presence,
+                "residual_presence": residual_presence,
+                "syllabic_nuclei": nuclei,
+                **recurrence_features[primitive_index],
+            },
+        })
+
+    boundary_rows = []
+    for index in range(len(primitives) - 1):
+        left, right = primitives[index], primitives[index + 1]
+        gap = max(0.0, right[0] - left[1])
+        nearby = [
+            item for item in boundaries
+            if abs(_finite(item.get("time")) - (left[1] + right[0]) / 2.0) <= .35
+        ]
+        start_support = max(
+            [_finite(item.get("start_probability")) for item in nearby] or [0.0],
+        )
+        end_support = max(
+            [_finite(item.get("end_probability")) for item in nearby] or [0.0],
+        )
+        residual_left = _frame(left[1] - window_start)
+        residual_right = max(residual_left + 1, _frame(right[0] - window_start))
+        residual_onset_values = np.asarray(residual.get("onset", []))[
+            residual_left:residual_right
+        ]
+        residual_onset = (
+            float(np.max(residual_onset_values))
+            if residual_onset_values.size else 0.0
+        )
+        boundary_rows.append({
+            "silence_probability": min(1.0, gap / .80),
+            "onset_strength": start_support,
+            "reset_probability": max(start_support, end_support, residual_onset),
+            "continuity": math.exp(-gap / .35),
+            "breath_probability": min(1.0, gap / .45) * (1.0 - start_support),
+        })
+    graph = build_performance_graph(
+        primitive_rows, boundary_rows, n_best=n_best,
+    )
+    result = to_legacy_acoustic_structure(graph)
+    result["performance_boundaries"] = result.get("boundaries") or []
+    # Preserve high-resolution acoustic boundary candidates for the existing
+    # content mapper; phrase boundaries remain separately auditable above.
+    result["boundaries"] = boundaries
+    best = result.get("best_partition") or {}
+    result["motif_groups"] = _motif_groups(
+        best.get("events") or [], stem, mix, window_start,
+    )
+    result["self_similarity"] = _self_similarity_summary(stem, mix, residual)
+    residual_available = bool(residual.get("waveform_derived"))
+    acoustic_views = ["stem", "mix"]
+    if residual_available:
+        acoustic_views.append("waveform_projection_residual")
+    result.setdefault("diagnostics", {}).update({
+        "views_are_correlated": True,
+        "acoustic_views": acoustic_views,
+        "residual_available": residual_available,
+        "residual_method": residual.get("residual_method") if residual_available else None,
+        "residual_is_independent_witness": False,
+        "boundary_resolution_ms": 10,
+        "embedding_resolution_ms": 20,
+    })
+    return result
 
 
 def analyze_window(stem_path: str, mix_path: str, *, window_start: float,
@@ -725,14 +991,21 @@ def analyze_window(stem_path: str, mix_path: str, *, window_start: float,
             if isinstance(cached_boundaries, list):
                 boundaries = cached_boundaries
         except Exception as exc:
-            logger.warning("[ACOUSTIC-STRUCTURE] boundary cache read declined: %r", exc)
+            logger.warning(
+                "[ACOUSTIC-STRUCTURE] boundary cache read declined error_type=%s",
+                type(exc).__name__,
+            )
     if boundaries is None:
         boundaries = _boundary_candidates(stem, mix, start)
         if boundary_address is not None:
             try:
                 cache.put_json(boundary_address, boundaries)
             except Exception as exc:
-                logger.warning("[ACOUSTIC-STRUCTURE] boundary cache write declined: %r", exc)
+                logger.warning(
+                    "[ACOUSTIC-STRUCTURE] boundary cache write declined "
+                    "error_type=%s",
+                    type(exc).__name__,
+                )
     primitives = _primitive_regions(stem, mix, start, boundaries)
     if len(primitives) > 32:
         base.update({
@@ -749,6 +1022,28 @@ def analyze_window(stem_path: str, mix_path: str, *, window_start: float,
             },
         })
         return base
+    _performance_graph_enabled = os.environ.get(
+        "QUALITY_V6_ANALYSIS_ENABLED",
+        os.environ.get("PERFORMANCE_GRAPH_V6_ENABLED", "0"),
+    )
+    if _performance_graph_enabled.strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        residual = _extract_waveform_residual_view(
+            stem_path, mix_path, start, end,
+        )
+        structured = _performance_graph_structure(
+            primitives, stem, mix, start, boundaries, n_best=n_best,
+            residual=residual,
+        )
+        structured["window"] = [round(start, 3), round(end, 3)]
+        structured["primitive_regions"] = [
+            [round(a, 3), round(b, 3)] for a, b in primitives
+        ]
+        structured.setdefault("diagnostics", {})["feature_cache_hits"] = {
+            "stem": stem_cache_hit, "mix": mix_cache_hit,
+        }
+        return structured
     partitions = _partition_candidates(primitives, stem, mix, start, n_best=n_best)
     if not partitions:
         base.update({"reason": "no_vocal_events", "boundaries": boundaries})
@@ -818,28 +1113,134 @@ def _mapping_cost(event: dict, content: dict) -> float:
     return .62 * timing + .33 * (1.0 - class_support) + .05 * duration_penalty
 
 
+def _combined_event(events: list[dict]) -> dict:
+    """Combine adjacent acoustic children without inventing a boundary."""
+    combined = dict(events[0])
+    combined["start"] = min(_finite(item.get("start")) for item in events)
+    combined["end"] = max(_finite(item.get("end")) for item in events)
+    combined["acoustic_event_ids"] = [
+        str(item.get("id") or "") for item in events
+    ]
+    posterior_keys = set().union(*[
+        set((item.get("type_posterior") or {}).keys()) for item in events
+    ])
+    if posterior_keys:
+        combined["type_posterior"] = {
+            key: round(sum(
+                _finite((item.get("type_posterior") or {}).get(key))
+                for item in events
+            ) / len(events), 6)
+            for key in sorted(posterior_keys)
+        }
+    return combined
+
+
+def _combined_content(contents: list[dict]) -> dict:
+    combined = dict(contents[0])
+    combined["start"] = min(_finite(item.get("start")) for item in contents)
+    combined["end"] = max(_finite(item.get("end")) for item in contents)
+    combined["text"] = " ".join(
+        str(item.get("text") or "").strip() for item in contents
+        if str(item.get("text") or "").strip()
+    )
+    kinds = {str(item.get("kind") or "") for item in contents}
+    combined["kind"] = kinds.pop() if len(kinds) == 1 else ""
+    return combined
+
+
 def _align_partition(events: list[dict], contents: list[dict]) -> dict:
-    """Monotonic DP with explicit UNKNOWN/BLANK operations."""
+    """Monotonic content lattice with auditable structural operations.
+
+    MATCH/VOC/REPETITION map one acoustic phrase to one content event. MERGE
+    and SPLIT preserve the existing acoustic lattice while representing a
+    cardinality disagreement. OMIT_EVENT and OMIT_CONTENT make unknown audio
+    and unsupported text explicit rather than hiding them as BLANK matches.
+    """
     n, m = len(events), len(contents)
     dp = np.full((n + 1, m + 1), np.inf, dtype=float)
     back: dict[tuple[int, int], tuple[int, int, str]] = {}
+    tie: dict[tuple[int, int], tuple[int, int, tuple[int, ...]]] = {
+        (0, 0): (0, 0, ()),
+    }
     dp[0, 0] = 0.0
+
+    operation_rank = {
+        "MATCH": 0, "VOC": 1, "REPETITION": 2,
+        "MERGE": 3, "SPLIT": 4,
+        "OMIT_EVENT": 5, "OMIT_CONTENT": 6,
+    }
+
+    def relax(
+        ni: int, nj: int, cost: float, pi: int, pj: int, operation: str,
+        *, omissions: int = 0, structural: int = 0,
+    ) -> None:
+        previous_tie = tie[(pi, pj)]
+        candidate_tie = (
+            previous_tie[0] + omissions,
+            previous_tie[1] + structural,
+            previous_tie[2] + (operation_rank[operation],),
+        )
+        target = (ni, nj)
+        if (
+            cost < dp[ni, nj] - 1e-12
+            or (
+                abs(cost - dp[ni, nj]) <= 1e-12
+                and candidate_tie < tie.get(target, (10**9, 10**9, (10**9,)))
+            )
+        ):
+            dp[ni, nj] = cost
+            back[target] = (pi, pj, operation)
+            tie[target] = candidate_tie
+
     for i in range(n + 1):
         for j in range(m + 1):
             current = dp[i, j]
             if not math.isfinite(float(current)):
                 continue
-            if i < n and current + .55 < dp[i + 1, j]:
-                dp[i + 1, j] = current + .55
-                back[i + 1, j] = (i, j, "UNKNOWN")
-            if j < m and current + 1.0 < dp[i, j + 1]:
-                dp[i, j + 1] = current + 1.0
-                back[i, j + 1] = (i, j, "BLANK")
             if i < n and j < m:
-                cost = current + _mapping_cost(events[i], contents[j])
-                if cost < dp[i + 1, j + 1]:
-                    dp[i + 1, j + 1] = cost
-                    back[i + 1, j + 1] = (i, j, "MATCH")
+                klass = content_class(
+                    contents[j].get("text", ""), contents[j].get("kind", ""),
+                )
+                repeated = (
+                    j > 0 and _tokenize(contents[j].get("text", ""))
+                    == _tokenize(contents[j - 1].get("text", ""))
+                )
+                operation = (
+                    "VOC" if klass in {"NONLEXICAL", "SUSTAINED"}
+                    else "REPETITION" if repeated else "MATCH"
+                )
+                relax(
+                    i + 1, j + 1,
+                    current + _mapping_cost(events[i], contents[j]),
+                    i, j, operation,
+                )
+            if i + 1 < n and j < m:
+                merged = _combined_event(events[i:i + 2])
+                gap = max(0.0, _finite(events[i + 1].get("start"))
+                          - _finite(events[i].get("end")))
+                relax(
+                    i + 2, j + 1,
+                    current + _mapping_cost(merged, contents[j])
+                    + .65 + .10 * min(gap, 2.0),
+                    i, j, "MERGE", structural=1,
+                )
+            if i < n and j + 1 < m:
+                split_content = _combined_content(contents[j:j + 2])
+                relax(
+                    i + 1, j + 2,
+                    current + _mapping_cost(events[i], split_content) + .65,
+                    i, j, "SPLIT", structural=1,
+                )
+            if i < n:
+                relax(
+                    i + 1, j, current + .72, i, j, "OMIT_EVENT",
+                    omissions=1,
+                )
+            if j < m:
+                relax(
+                    i, j + 1, current + .92, i, j, "OMIT_CONTENT",
+                    omissions=1,
+                )
     i, j = n, m
     assignments = []
     while i or j:
@@ -847,10 +1248,14 @@ def _align_partition(events: list[dict], contents: list[dict]) -> dict:
         if previous is None:
             break
         pi, pj, operation = previous
+        event_indices = list(range(pi, i))
+        content_indices = list(range(pj, j))
         assignments.append({
             "operation": operation,
-            "event_index": pi if i > pi else None,
-            "content_index": pj if j > pj else None,
+            "event_indices": event_indices,
+            "content_indices": content_indices,
+            "event_index": event_indices[0] if event_indices else None,
+            "content_index": content_indices[0] if content_indices else None,
         })
         i, j = pi, pj
     assignments.reverse()
@@ -861,6 +1266,7 @@ def map_content(structure: dict, hypotheses: Iterable[dict | list[dict]]) -> dic
     """Map N-best content onto N-best acoustic partitions, contrastively."""
     candidates = []
     normalized_hypotheses = []
+    excluded_content = []
     for index, hypothesis in enumerate(hypotheses or []):
         if isinstance(hypothesis, dict):
             events = hypothesis.get("events") or []
@@ -868,8 +1274,43 @@ def map_content(structure: dict, hypotheses: Iterable[dict | list[dict]]) -> dic
             family = str(hypothesis.get("family") or source)
         else:
             events, source, family = hypothesis, f"source_{index}", f"source_{index}"
-        clean = [dict(event) for event in events if isinstance(event, dict)
-                 and str(event.get("text") or "").strip()]
+        from lyric_content_policy import should_include_as_lyric
+
+        valid_events = [
+            event for event in events
+            if isinstance(event, dict) and str(event.get("text") or "").strip()
+        ]
+        clean = []
+        for event_index, event in enumerate(valid_events):
+            classification = content_class(
+                event.get("text", ""), event.get("kind", ""),
+            )
+            previous_end = (
+                _finite(valid_events[event_index - 1].get("end"))
+                if event_index > 0 else float("nan")
+            )
+            inferred_isolated_tail = bool(event.get("isolated_tail")) or (
+                event_index == len(valid_events) - 1
+                and math.isfinite(previous_end)
+                and _finite(event.get("start")) - previous_end >= 1.5
+            )
+            include = should_include_as_lyric(
+                event.get("text", ""),
+                provider_kind=event.get("kind", ""),
+                isolated_tail=inferred_isolated_tail,
+            )
+            if not include:
+                excluded_content.append({
+                    "source": source, "family": family,
+                    "classification": classification,
+                    "start": round(_finite(event.get("start")), 3),
+                    "end": round(_finite(event.get("end")), 3),
+                    "text_present": True,
+                    "text_length": len(str(event.get("text") or "")),
+                    "isolated_tail": inferred_isolated_tail,
+                })
+                continue
+            clean.append(dict(event))
         if clean:
             normalized_hypotheses.append((source, family, clean))
     for partition in structure.get("n_best") or []:
@@ -891,8 +1332,8 @@ def map_content(structure: dict, hypotheses: Iterable[dict | list[dict]]) -> dic
     best = candidates[0]
 
     # Build complete, auditable sequence alternatives for the trusted CTC
-    # layer. Only one-to-one candidates can be phonemically compared; UNKNOWN
-    # and BLANK paths remain diagnostics but can never certify text.
+    # layer. Only one-to-one candidates can be phonemically compared; structural
+    # and omission paths remain diagnostics but can never certify text.
     phonetic_candidates = []
     seen_phonetic = set()
     selected_candidate_id = ""
@@ -900,14 +1341,16 @@ def map_content(structure: dict, hypotheses: Iterable[dict | list[dict]]) -> dic
         texts = [None] * len(candidate["events"])
         complete = True
         for assignment in candidate["assignments"]:
-            event_index = assignment.get("event_index")
-            content_index = assignment.get("content_index")
+            event_indices = assignment.get("event_indices") or []
+            content_indices = assignment.get("content_indices") or []
             if (
-                assignment.get("operation") != "MATCH"
-                or event_index is None or content_index is None
+                assignment.get("operation") not in {"MATCH", "VOC", "REPETITION"}
+                or len(event_indices) != 1 or len(content_indices) != 1
             ):
                 complete = False
                 break
+            event_index = event_indices[0]
+            content_index = content_indices[0]
             texts[event_index] = str(
                 candidate["content"][content_index].get("text") or ""
             ).strip()
@@ -948,14 +1391,33 @@ def map_content(structure: dict, hypotheses: Iterable[dict | list[dict]]) -> dic
     margin = (second["total_cost"] - best["total_cost"]) if second else 0.0
     mapped_events = []
     unassigned = []
+    unassigned_content = []
     for assignment in best["assignments"]:
-        event_index = assignment.get("event_index")
-        content_index = assignment.get("content_index")
-        if event_index is None:
+        operation = assignment["operation"]
+        event_indices = assignment.get("event_indices") or []
+        content_indices = assignment.get("content_indices") or []
+        if operation == "OMIT_CONTENT":
+            unassigned_content.extend(
+                dict(best["content"][index]) for index in content_indices
+            )
             continue
-        event = dict(best["events"][event_index])
-        if assignment["operation"] == "MATCH" and content_index is not None:
-            content = best["content"][content_index]
+        if not event_indices:
+            continue
+        event = (
+            _combined_event([best["events"][index] for index in event_indices])
+            if len(event_indices) > 1
+            else dict(best["events"][event_indices[0]])
+        )
+        if operation == "OMIT_EVENT" or not content_indices:
+            event["mapping_operation"] = operation
+            unassigned.append(event)
+            continue
+        content = (
+            _combined_content([best["content"][index] for index in content_indices])
+            if len(content_indices) > 1
+            else best["content"][content_indices[0]]
+        )
+        if operation in {"MATCH", "VOC", "REPETITION", "MERGE", "SPLIT"}:
             tokens = _tokenize(content.get("text", ""))
             event.update({
                 "text": str(content.get("text") or "").strip(),
@@ -968,6 +1430,9 @@ def map_content(structure: dict, hypotheses: Iterable[dict | list[dict]]) -> dic
                 "content_duration": round(max(
                     0.0, _finite(content.get("end")) - _finite(content.get("start")),
                 ), 4),
+                "mapping_operation": operation,
+                "mapped_event_indices": event_indices,
+                "mapped_content_indices": content_indices,
                 "has_vocalization_tail": bool(
                     len(tokens) >= 2
                     and any(token in _VOCALIZATIONS for token in tokens[1:])
@@ -975,6 +1440,7 @@ def map_content(structure: dict, hypotheses: Iterable[dict | list[dict]]) -> dic
             })
             mapped_events.append(event)
         else:
+            event["mapping_operation"] = operation
             unassigned.append(event)
     # The content DP may choose among already-discovered acoustic attacks; it
     # may not create or move a boundary outside that lattice.  This is where a
@@ -1058,6 +1524,7 @@ def map_content(structure: dict, hypotheses: Iterable[dict | list[dict]]) -> dic
         "margin": round(float(margin), 6),
         "events": mapped_events,
         "unassigned_events": unassigned,
+        "unassigned_content": unassigned_content,
         "strong_unassigned_events": len(strong_unassigned),
         "selected_candidate_id": selected_candidate_id,
         "phonetic_candidates": phonetic_candidates,
@@ -1066,6 +1533,7 @@ def map_content(structure: dict, hypotheses: Iterable[dict | list[dict]]) -> dic
                    for candidate in candidates[:8]],
         "evidence_lineage": [{"source": source, "family": family}
                              for source, family, _ in normalized_hypotheses],
+        "excluded_content": excluded_content,
     }
 
 

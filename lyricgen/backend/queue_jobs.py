@@ -16,6 +16,7 @@ durability, concurrency caps, and timeouts in the worst possible moment.
 import logging
 import os
 import hashlib
+import re
 import threading
 
 logger = logging.getLogger("genly.queue")
@@ -568,6 +569,15 @@ def _active_rq_job(connection, rq_job_id: str):
     return None
 
 
+def _existing_rq_job(connection, rq_job_id: str):
+    """Return an RQ record in any state, for outbox event idempotency."""
+    try:
+        from rq.job import Job as RQJob
+        return RQJob.fetch(rq_job_id, connection=connection)
+    except Exception:
+        return None
+
+
 def enqueue_pipeline(
     job_id: str,
     mp3_path: str,
@@ -845,10 +855,130 @@ def enqueue_bg_preview(
     return f"thread:bgpreview:{job_id}"
 
 
+_AUDIO_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _valid_quality_audio_identity(revision: int | None, sha256: str | None) -> bool:
+    return int(revision or 0) > 0 and bool(
+        _AUDIO_SHA256_RE.fullmatch(str(sha256 or "").strip().lower())
+    )
+
+
+def _transcription_quality_attempt_id(
+    job_id: str, *, expected_revision: int, expected_segments_hash: str,
+    expected_audio_revision: int, expected_audio_sha256: str,
+    runtime_token: str, publication_id: str = "",
+) -> str:
+    """Compact pseudonymous RQ/CAS id that fits PostgreSQL."""
+    identity = "|".join((
+        str(job_id), str(int(expected_revision)), str(expected_segments_hash),
+        str(int(expected_audio_revision)), str(expected_audio_sha256),
+        str(runtime_token), str(publication_id or "direct"),
+    ))
+    from evidence_contracts import privacy_fingerprint
+
+    fingerprint = privacy_fingerprint("transcription-quality-attempt", identity)
+    if not fingerprint:
+        return ""
+    digest = fingerprint.rsplit(":", 1)[-1][:32]
+    # Preserve the public success prefix consumed by legacy reconcilers while
+    # keeping the full PostgreSQL/RQ identity bounded.
+    return f"transcription-quality:{str(job_id)[:12]}:{digest}"
+
+
+def ensure_legacy_audio_identity(job_id: str) -> dict | None:
+    """Freeze a legacy mutable input into content-addressed storage.
+
+    The download/upload happens before the row lock.  The final CAS verifies
+    that the logical source key did not change, then atomically points the Job
+    at the exact bytes that were hashed and uploaded.  No hash from historical
+    quality JSON is trusted as source identity.
+    """
+    import tempfile
+
+    import storage
+    from database import EditorDocument, Job, SessionLocal
+    from quality_cache import sha256_file
+
+    snapshot_db = SessionLocal()
+    try:
+        row = snapshot_db.query(Job).filter(Job.job_id == job_id).first()
+        if row is None:
+            return None
+        if _valid_quality_audio_identity(row.audio_revision, row.input_audio_sha256):
+            return {
+                "audio_revision": int(row.audio_revision),
+                "audio_sha256": str(row.input_audio_sha256),
+            }
+        source_key = str(row.input_r2_key or "")
+        tenant_id = str(row.tenant_id or "")
+        filename = os.path.basename(row.filename or "audio.bin")
+    finally:
+        snapshot_db.close()
+    if not source_key or not storage.is_enabled():
+        return None
+
+    with tempfile.TemporaryDirectory(prefix=f"genly-identity-{job_id}-") as tmp:
+        local_path = os.path.join(tmp, filename or "audio.bin")
+        if not storage.download_object(source_key, local_path):
+            return None
+        audio_sha256 = sha256_file(local_path)
+        immutable_key = storage.content_addressed_input_key(
+            tenant_id, job_id, audio_sha256, filename,
+        )
+        if storage.upload_file(local_path, immutable_key) != immutable_key:
+            return None
+        etag = storage.object_etag(immutable_key) or audio_sha256
+
+    db = SessionLocal()
+    try:
+        row = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
+        if row is None:
+            return None
+        if _valid_quality_audio_identity(row.audio_revision, row.input_audio_sha256):
+            return {
+                "audio_revision": int(row.audio_revision),
+                "audio_sha256": str(row.input_audio_sha256),
+            }
+        if str(row.input_r2_key or "") != source_key:
+            return None
+        row.input_r2_key = immutable_key
+        row.input_audio_sha256 = audio_sha256
+        row.input_audio_etag = etag
+        row.audio_revision = max(1, int(row.audio_revision or 0) + 1)
+        row.active_quality_attempt_id = None
+        quality = dict(row.transcription_quality or {})
+        quality.update({
+            "policy_version": "lyrics-quality-v6",
+            "decision": "review_required", "render_blocked": True,
+            "analysis_status": "audio_identity_backfilled",
+            "analysis_pending": False,
+            "audio_sha256": audio_sha256,
+            "audio_revision": int(row.audio_revision),
+        })
+        row.transcription_quality = quality
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).with_for_update().first()
+        if document is not None:
+            document.quality_proposal = None
+        db.commit()
+        return {
+            "audio_revision": int(row.audio_revision),
+            "audio_sha256": audio_sha256,
+        }
+    finally:
+        db.close()
+
+
 def enqueue_transcription_quality(job_id: str, *, expected_revision: int,
                                   expected_segments_hash: str,
                                   filename: str = "",
-                                  tenant_id: str | None = None) -> str:
+                                  tenant_id: str | None = None,
+                                  expected_audio_revision: int | None = None,
+                                  expected_audio_sha256: str | None = None,
+                                  publication_id: str = "",
+                                  publication_dedupe_key: str = "") -> str:
     """Queue suggestion-only quality analysis on its isolated worker.
 
     Failure to enqueue never falls back to an API/short-worker thread: doing
@@ -878,11 +1008,48 @@ def enqueue_transcription_quality(job_id: str, *, expected_revision: int,
         transcription_quality_failure_callback,
     )
 
+    # Callers that captured identity in their owning transaction may pass it
+    # explicitly. Other call sites resolve the committed Job snapshot here.
+    # Either way the exact values become part of the RQ identity and worker
+    # CAS, so a restored/replaced audio cannot accept this result.
+    if expected_audio_revision is None or expected_audio_sha256 is None:
+        from database import Job, SessionLocal
+        identity_db = SessionLocal()
+        try:
+            identity_row = identity_db.query(Job).filter(Job.job_id == job_id).first()
+            if identity_row is None:
+                return f"stale:transcription-quality:{job_id}"
+            expected_audio_revision = int(identity_row.audio_revision or 0)
+            expected_audio_sha256 = str(identity_row.input_audio_sha256 or "")
+        finally:
+            identity_db.close()
+    expected_audio_revision = int(expected_audio_revision or 0)
+    expected_audio_sha256 = str(expected_audio_sha256 or "").strip().lower()
+    if not _valid_quality_audio_identity(
+        expected_audio_revision, expected_audio_sha256,
+    ):
+        try:
+            from ops_metrics import increment
+            increment("transcription_quality_audio_identity_missing")
+        except Exception:
+            pass
+        return f"identity-missing:transcription-quality:{job_id}"
+
     queue = Queue("transcription_quality", connection=_redis)
-    rq_id = (
-        f"transcription-quality:{job_id}:{int(expected_revision)}:"
-        f"{expected_segments_hash[:12]}"
+    runtime_token = _transcription_quality_runtime_token()
+    rq_id = _transcription_quality_attempt_id(
+        job_id, expected_revision=expected_revision,
+        expected_segments_hash=expected_segments_hash,
+        expected_audio_revision=expected_audio_revision,
+        expected_audio_sha256=expected_audio_sha256,
+        runtime_token=runtime_token, publication_id=publication_id,
     )
+    if not rq_id:
+        return f"identity-missing:transcription-quality:{job_id}"
+    if publication_id:
+        active = _active_rq_job(_redis, rq_id)
+        if active is not None:
+            return active.id
     active = _active_rq_job(_redis, rq_id)
     if active is not None:
         try:
@@ -892,6 +1059,8 @@ def enqueue_transcription_quality(job_id: str, *, expected_revision: int,
             pass
         marked = _mark_transcription_quality_pending(
             job_id, expected_revision, expected_segments_hash, active.id,
+            expected_audio_revision=expected_audio_revision,
+            expected_audio_sha256=expected_audio_sha256,
         )
         if not marked:
             return f"stale:transcription-quality:{job_id}"
@@ -902,6 +1071,8 @@ def enqueue_transcription_quality(job_id: str, *, expected_revision: int,
     # ``pending`` and get overwritten by a late marker.
     if not _mark_transcription_quality_pending(
         job_id, expected_revision, expected_segments_hash, rq_id,
+        expected_audio_revision=expected_audio_revision,
+        expected_audio_sha256=expected_audio_sha256,
     ):
         return f"stale:transcription-quality:{job_id}"
     try:
@@ -912,6 +1083,10 @@ def enqueue_transcription_quality(job_id: str, *, expected_revision: int,
                 "expected_revision": int(expected_revision),
                 "expected_segments_hash": expected_segments_hash,
                 "filename": filename,
+                "expected_audio_revision": expected_audio_revision,
+                "expected_audio_sha256": expected_audio_sha256,
+                "analysis_attempt_id": rq_id,
+                "quality_runtime_token": runtime_token,
             },
             job_timeout=int(os.environ.get("TRANSCRIPTION_QUALITY_JOB_TIMEOUT", "1200")),
             result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL,
@@ -919,6 +1094,11 @@ def enqueue_transcription_quality(job_id: str, *, expected_revision: int,
             meta=rq_payload_metadata(
                 "transcription_quality", expected_revision=int(expected_revision),
                 expected_segments_hash=expected_segments_hash,
+                expected_audio_revision=expected_audio_revision,
+                expected_audio_sha256=expected_audio_sha256,
+                quality_runtime_token=runtime_token,
+                outbox_event_id=publication_id or None,
+                outbox_dedupe_key=publication_dedupe_key or None,
             ),
             retry=Retry(max=1, interval=30),
             on_failure=transcription_quality_failure_callback,
@@ -926,7 +1106,8 @@ def enqueue_transcription_quality(job_id: str, *, expected_revision: int,
     except Exception as exc:
         _mark_transcription_quality_enqueue_failed(
             job_id, expected_revision, expected_segments_hash, rq_id,
-            type(exc).__name__,
+            type(exc).__name__, expected_audio_revision=expected_audio_revision,
+            expected_audio_sha256=expected_audio_sha256,
         )
         raise
     try:
@@ -937,9 +1118,31 @@ def enqueue_transcription_quality(job_id: str, *, expected_revision: int,
     return queued.id
 
 
+def _transcription_quality_runtime_token() -> str:
+    """Bind RQ/CAS identity to release, config, policy and calibration."""
+    try:
+        from transcription_quality import (
+            POLICY_VERSION, calibration_identity, runtime_identity,
+        )
+        runtime = runtime_identity()
+        calibration = calibration_identity()
+        payload = "|".join((
+            POLICY_VERSION,
+            str(runtime.get("pipeline_release") or "unknown"),
+            str(runtime.get("pipeline_config_fingerprint") or "unknown"),
+            str(calibration.get("calibration_id") or "uncalibrated"),
+            str(bool(calibration.get("calibrated"))),
+        ))
+    except Exception:
+        payload = "lyrics-quality-runtime-identity-unavailable"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def _mark_transcription_quality_pending(job_id: str, expected_revision: int,
                                         expected_segments_hash: str,
-                                        rq_job_id: str) -> bool:
+                                        rq_job_id: str, *,
+                                        expected_audio_revision: int | None = None,
+                                        expected_audio_sha256: str = "") -> bool:
     """Expose the real async state only for the exact enqueued snapshot."""
     try:
         from datetime import datetime, timezone
@@ -954,6 +1157,14 @@ def _mark_transcription_quality_pending(job_id: str, expected_revision: int,
             if (
                 int(row.segments_revision or 0) != int(expected_revision)
                 or segments_hash(row.segments_json or []) != expected_segments_hash
+                or (
+                    expected_audio_revision is not None
+                    and int(row.audio_revision or 0) != int(expected_audio_revision)
+                )
+                or (
+                    expected_audio_sha256
+                    and str(row.input_audio_sha256 or "") != expected_audio_sha256
+                )
             ):
                 return False
             quality = dict(row.transcription_quality or {})
@@ -967,9 +1178,13 @@ def _mark_transcription_quality_pending(job_id: str, expected_revision: int,
                 "analysis_status": "pending",
                 "analysis_pending": True,
                 "analysis_job_id": str(rq_job_id),
+                "analysis_attempt_id": str(rq_job_id),
                 "analysis_enqueued_at": datetime.now(timezone.utc).isoformat(),
+                "audio_revision": int(row.audio_revision or 0),
+                "audio_sha256": str(row.input_audio_sha256 or expected_audio_sha256),
             })
             row.transcription_quality = quality
+            row.active_quality_attempt_id = str(rq_job_id)
             db.commit()
             return True
         finally:
@@ -978,14 +1193,17 @@ def _mark_transcription_quality_pending(job_id: str, expected_revision: int,
         # The durable RQ job is authoritative. A telemetry/UI marker must not
         # turn a successful enqueue into a failed transcription.
         logger.warning(
-            "[QUALITY-QUEUE] pending marker failed job=%s: %s", job_id, exc,
+            "[QUALITY-QUEUE] pending marker failed job=%s error_type=%s",
+            job_id, type(exc).__name__,
         )
         return False
 
 
 def _mark_transcription_quality_enqueue_failed(
     job_id: str, expected_revision: int, expected_segments_hash: str,
-    rq_job_id: str, error_code: str,
+    rq_job_id: str, error_code: str, *,
+    expected_audio_revision: int | None = None,
+    expected_audio_sha256: str = "",
 ) -> bool:
     """Fail closed if Redis publication fails after the pending marker."""
     try:
@@ -999,6 +1217,14 @@ def _mark_transcription_quality_enqueue_failed(
             if row is None or (
                 int(row.segments_revision or 0) != int(expected_revision)
                 or segments_hash(row.segments_json or []) != expected_segments_hash
+                or (
+                    expected_audio_revision is not None
+                    and int(row.audio_revision or 0) != int(expected_audio_revision)
+                )
+                or (
+                    expected_audio_sha256
+                    and str(row.input_audio_sha256 or "") != expected_audio_sha256
+                )
             ):
                 return False
             quality = dict(row.transcription_quality or {})
@@ -1026,8 +1252,9 @@ def _mark_transcription_quality_enqueue_failed(
             db.close()
     except Exception as exc:
         logger.warning(
-            "[QUALITY-QUEUE] enqueue failure marker failed job=%s: %s",
-            job_id, exc,
+            "[QUALITY-QUEUE] enqueue failure marker failed job=%s "
+            "error_type=%s",
+            job_id, type(exc).__name__,
         )
         return False
 
@@ -1162,6 +1389,31 @@ def ensure_quality_pending_reconciler_scheduled() -> str | None:
     return queued.id
 
 
+def ensure_job_outbox_reconciler_scheduled() -> str | None:
+    """Schedule operational outbox recovery only on the normal worker fleet."""
+    from datetime import datetime, timedelta, timezone
+    from rq import Queue
+    from transactional_outbox import reconcile_job_outbox
+
+    _init_redis()
+    if _redis is None:
+        return None
+    delay_s = max(5, min(300, int(os.environ.get("JOB_OUTBOX_RECONCILE_SECONDS", "30"))))
+    due = datetime.now(timezone.utc) + timedelta(seconds=delay_s)
+    bucket = int(due.timestamp()) // delay_s
+    rq_id = f"job-outbox-reconciler:{bucket}"
+    active = _active_rq_job(_redis, rq_id)
+    if active is not None:
+        return active.id
+    _evict_stale_rq_job(_redis, rq_id)
+    queued = Queue("default", connection=_redis).enqueue_in(
+        timedelta(seconds=delay_s), reconcile_job_outbox,
+        job_timeout=120, result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL,
+        job_id=rq_id, meta=rq_payload_metadata("job_outbox_reconciler"),
+    )
+    return queued.id
+
+
 def enqueue_quality_proposal_validation(proposal_id: str,
                                         experiment_id: str) -> str:
     if not quality_learning_capture_enabled():
@@ -1283,8 +1535,12 @@ def edit_failure_callback(job, connection, type_, value, traceback) -> None:
     try:
         from jobs import update_job
         edit_id = getattr(job, "id", None) or ""
-        # RQ job id is "edit:{job_id}"; strip the prefix to get our job_id.
-        rq_job_id = edit_id[len("edit:"):] if edit_id.startswith("edit:") else edit_id
+        meta = getattr(job, "meta", None) or {}
+        rq_job_id = str(meta.get("domain_job_id") or "")
+        if not rq_job_id:
+            # Legacy direct jobs use ``edit:{job_id}``; event-scoped jobs put
+            # the domain id in metadata and must never parse a UUID as job id.
+            rq_job_id = edit_id[len("edit:"):] if edit_id.startswith("edit:") else edit_id
         if not rq_job_id:
             return
         # Surface to Sentry tagged with job/tenant before the DB write.
@@ -1316,6 +1572,8 @@ def enqueue_edit(
     edit_params: dict,
     plan: str = "100",
     tenant_id: str = "",
+    publication_id: str = "",
+    publication_dedupe_key: str = "",
 ) -> str:
     """Enqueue a run_edit_pipeline job (partial re-render).
 
@@ -1337,7 +1595,22 @@ def enqueue_edit(
     if q is not None:
         from rq import Retry
         from pipeline import run_edit_pipeline
-        edit_rq_id = f"edit:{job_id}"
+        edit_rq_id = (
+            f"edit-outbox:{publication_id}"
+            if publication_id else f"edit:{job_id}"
+        )
+        if publication_id:
+            # A live Redis state proves the deterministic event was accepted
+            # even when the enqueue response timed out.  A terminal row does
+            # not: stale outbox recovery must replace it or the event would be
+            # marked dispatched without ever receiving a new execution.
+            active = _active_rq_job(q.connection, edit_rq_id)
+            if active is not None:
+                return active.id
+        else:
+            active = _active_rq_job(q.connection, edit_rq_id)
+            if active is not None:
+                return active.id
         # Clear any stale RQ job with this ID from a previous failed/completed
         # edit. The 7-day failure_ttl keeps failed jobs in Redis long after
         # they're dead. Without this cleanup, re-enqueue after a worker death
@@ -1355,9 +1628,19 @@ def enqueue_edit(
         # pipeline es safe re-runnable (lee state de DB cada vez, Veo está
         # cacheado por hash de prompt, libass/R2 sobreescribe).
         retry = Retry(max=PIPELINE_RETRY_MAX, interval=PIPELINE_RETRY_INTERVAL_S)
+        if publication_id:
+            from transactional_outbox import run_outbox_edit_pipeline
+            task = run_outbox_edit_pipeline
+            args = (
+                job_id, publication_id, publication_dedupe_key,
+                edit_type, edit_params, _policy_fingerprint,
+            )
+        else:
+            task = run_edit_pipeline
+            args = (job_id, edit_type, edit_params, _policy_fingerprint)
         rq_job = q.enqueue(
-            run_edit_pipeline,
-            args=(job_id, edit_type, edit_params, _policy_fingerprint),
+            task,
+            args=args,
             # 60 min — covers worst-case long-song edits with motion enabled
             # until we land the ffmpeg-overlay rewrite.
             job_timeout=3600,
@@ -1366,6 +1649,9 @@ def enqueue_edit(
             job_id=edit_rq_id,
             meta=rq_payload_metadata(
                 "edit", background_policy_fingerprint=_policy_fingerprint,
+                domain_job_id=job_id,
+                outbox_event_id=publication_id or None,
+                outbox_dedupe_key=publication_dedupe_key or None,
             ),
             retry=retry,
             on_failure=edit_failure_callback,
@@ -1379,9 +1665,19 @@ def enqueue_edit(
         raise RuntimeError("Job queue unavailable: Redis is required in production.")
 
     from pipeline import run_edit_pipeline
+    if publication_id:
+        from transactional_outbox import run_outbox_edit_pipeline
+        target = run_outbox_edit_pipeline
+        args = (
+            job_id, publication_id, publication_dedupe_key,
+            edit_type, edit_params, _policy_fingerprint,
+        )
+    else:
+        target = run_edit_pipeline
+        args = (job_id, edit_type, edit_params, _policy_fingerprint)
     t = threading.Thread(
-        target=run_edit_pipeline,
-        args=(job_id, edit_type, edit_params, _policy_fingerprint),
+        target=target,
+        args=args,
         daemon=True,
     )
     t.start()

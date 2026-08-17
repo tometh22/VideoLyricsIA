@@ -1,3 +1,6 @@
+import inspect
+import logging
+
 import structural_hybrid as sh
 import targeted_consensus as tc
 
@@ -27,7 +30,10 @@ def _ctc(starts, min_score=0.7):
 
 
 def test_content_attestation_requires_distinct_provider_family_consensus(monkeypatch):
-    monkeypatch.setenv("QUALITY_CONTENT_ATTESTATION_KEY", "test-signing-key")
+    monkeypatch.setenv(
+        "QUALITY_CONTENT_ATTESTATION_KEY",
+        "quality-test-key-0123456789-ABCDEF",
+    )
     mapping = {
         "selected_candidate_id": "candidate-1",
         "events": [
@@ -51,6 +57,27 @@ def test_content_attestation_requires_distinct_provider_family_consensus(monkeyp
         "events": [{"text": "Real uoh uoh"}, {"text": "gracias"}],
     }])
     assert disagreed["verified"] is False
+
+
+def test_acoustic_decline_logs_never_expose_paths_or_exception_messages(
+        monkeypatch, caplog):
+    secret_path = "/tenant/PRIVATE_AUDIO_PATH.wav"
+    secret_message = "PRIVATE_LYRIC_EXCEPTION"
+
+    def fail_load(*_args, **_kwargs):
+        raise RuntimeError(secret_message)
+
+    monkeypatch.setattr(sh.librosa, "load", fail_load)
+    with caplog.at_level(logging.WARNING):
+        assert sh._window_vocal_regions(secret_path, 0.0, 2.0) == []
+        assert sh._features(secret_path, 0.0, 2.0) is None
+
+    assert secret_path not in caplog.text
+    assert secret_message not in caplog.text
+    assert "RuntimeError" in caplog.text
+    source = inspect.getsource(sh)
+    assert "decline: %r" not in source
+    assert "path, exc" not in source
 
 
 def test_gemini_event_tokens_collapse_into_complete_cycles():

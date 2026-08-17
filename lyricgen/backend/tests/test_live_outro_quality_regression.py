@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -252,8 +253,12 @@ def test_quality_enqueue_targets_isolated_queue_with_occ_identity(
     monkeypatch.setattr(queue_jobs, "_active_rq_job", lambda *_args: None)
     monkeypatch.setattr(queue_jobs, "_evict_stale_rq_job", lambda *_args: None)
     monkeypatch.setattr(
+        queue_jobs, "_transcription_quality_runtime_token",
+        lambda: "v6runtime0000000",
+    )
+    monkeypatch.setattr(
         queue_jobs, "_mark_transcription_quality_pending",
-        lambda *_args: True,
+        lambda *_args, **_kwargs: True,
     )
 
     import rq
@@ -267,15 +272,29 @@ def test_quality_enqueue_targets_isolated_queue_with_occ_identity(
         expected_segments_hash=content_hash,
         filename="sanitized.wav",
         tenant_id="qa-tenant",
+        expected_audio_revision=3,
+        expected_audio_sha256="b" * 64,
     )
 
     assert captured["queue_name"] == "transcription_quality"
     assert captured["connection"] is fake_redis
-    assert queued_id == "transcription-quality:generic-live-job:7:aaaaaaaaaaaa"
+    assert re.fullmatch(
+        r"transcription-quality:generic-live:[0-9a-f]{32}", queued_id,
+    )
+    assert len(queued_id) <= 160
     assert captured["enqueue"]["kwargs"] == {
         "expected_revision": 7,
         "expected_segments_hash": content_hash,
         "filename": "sanitized.wav",
+        "expected_audio_revision": 3,
+        "expected_audio_sha256": "b" * 64,
+        "analysis_attempt_id": queued_id,
+        "quality_runtime_token": "v6runtime0000000",
     }
     assert captured["enqueue"]["meta"]["expected_revision"] == 7
     assert captured["enqueue"]["meta"]["expected_segments_hash"] == content_hash
+    assert captured["enqueue"]["meta"]["expected_audio_revision"] == 3
+    assert captured["enqueue"]["meta"]["expected_audio_sha256"] == "b" * 64
+    assert captured["enqueue"]["meta"]["quality_runtime_token"] == (
+        "v6runtime0000000"
+    )

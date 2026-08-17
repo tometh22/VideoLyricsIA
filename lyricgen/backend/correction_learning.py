@@ -19,6 +19,11 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
+from evidence_contracts import (
+    FINGERPRINT_VERSION,
+    strong_hmac_secret_bytes,
+)
+
 
 STYLE_RE = re.compile(r"[^\w\s]", re.UNICODE)
 VOCALIZATION_RE = re.compile(
@@ -202,7 +207,30 @@ def align_segments(original: list[dict], approved: list[dict]) -> list[dict]:
 
 
 def _hmac_token(secret: str, token: str) -> str:
-    return hmac.new(secret.encode("utf-8"), token.encode("utf-8"), hashlib.sha256).hexdigest()
+    key = strong_hmac_secret_bytes(secret)
+    if key is None:
+        raise ValueError("quality_learning_hmac_key_weak")
+    return hmac.new(key, token.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _versioned_hmac_token(secret: str, kind: str, value: Any,
+                          *, key_id: str | None = None) -> str:
+    generation = key_id or current_hmac_key_id()
+    normalised = (
+        _canonical_json(value).decode("utf-8")
+        if isinstance(value, (dict, list, tuple))
+        else _normalise_identifier(value)
+    )
+    digest = _hmac_token(secret, f"{kind}\x1f{normalised}")
+    return f"{FINGERPRINT_VERSION}:{generation.lower()}:{digest}"
+
+
+def _versioned_fingerprint_digest(value: Any, *, key_id: str) -> str | None:
+    match = re.fullmatch(
+        rf"{re.escape(FINGERPRINT_VERSION)}:{re.escape(key_id.lower())}:([0-9a-f]{{64}})",
+        str(value or "").strip().lower(),
+    )
+    return match.group(1) if match else None
 
 
 def _normalise_identifier(value: Any) -> str:
@@ -237,8 +265,8 @@ def hmac_identifier(kind: str, value: Any) -> str | None:
     if value is None or str(value) == "":
         return None
     secret = os.environ.get("QUALITY_LEARNING_HMAC_KEY", "").strip()
-    if not secret:
-        raise RuntimeError("quality_learning_hmac_key_missing")
+    if strong_hmac_secret_bytes(secret) is None:
+        raise RuntimeError("quality_learning_hmac_key_missing_or_weak")
     current_hmac_key_id()
     normalised = (
         _normalise_entity_identifier(value)
@@ -305,26 +333,52 @@ def derive_server_active_edit_ms(db: Any, job: Any, version: Any,
 
 
 def machine_snapshot_provenance(job: Any, quality: dict | None) -> dict:
-    """Return immutable hash-only lineage for a machine checkpoint."""
+    """Return pseudonymous lineage for a tenant-scoped machine checkpoint.
+
+    Raw SHA values may still exist in the job for audio CAS and editor OCC,
+    but this projection never copies them.  Missing/weak privacy keys abstain
+    instead of falling back to dictionary-attackable hashes.
+    """
     payload = dict(quality or {})
     quality_job = dict(payload.get("quality_job") or {})
-    audio_hash = str(
+    audio_identity = str(
         payload.get("audio_sha256") or quality_job.get("audio_sha256") or ""
     )
-    if re.fullmatch(r"[0-9a-f]{64}", audio_hash):
-        audio_identity_kind = "audio_content_sha256"
+    if re.fullmatch(r"[0-9a-f]{64}", audio_identity):
+        audio_identity_kind = "audio_content_hmac"
     else:
         storage_identity = str(getattr(job, "input_r2_key", None) or "")
-        audio_hash = (
-            hashlib.sha256(storage_identity.encode("utf-8")).hexdigest()
-            if storage_identity else ""
-        )
+        audio_identity = storage_identity
         audio_identity_kind = (
-            "storage_object_identity_sha256" if storage_identity else "unavailable"
+            "storage_object_identity_hmac" if storage_identity else "unavailable"
         )
+    secret = os.environ.get("QUALITY_LEARNING_HMAC_KEY", "").strip()
+    try:
+        key_id = current_hmac_key_id()
+        audio_fingerprint = (
+            _versioned_hmac_token(
+                secret, "machine-audio-identity", audio_identity, key_id=key_id,
+            ) if audio_identity else None
+        )
+        quality_fingerprint = _versioned_hmac_token(
+            secret, "machine-quality-evidence", payload, key_id=key_id,
+        )
+        source_quality_fingerprint = (
+            _versioned_hmac_token(
+                secret, "source-quality-fingerprint",
+                payload.get("quality_fingerprint"), key_id=key_id,
+            ) if payload.get("quality_fingerprint") else None
+        )
+    except (RuntimeError, ValueError):
+        key_id = None
+        audio_fingerprint = None
+        quality_fingerprint = None
+        source_quality_fingerprint = None
     return {
         "schema": "machine-transcription-lineage-v1",
-        "audio_sha256": audio_hash or None,
+        "fingerprint_version": FINGERPRINT_VERSION,
+        "hmac_key_id": key_id,
+        "audio_fingerprint": audio_fingerprint,
         "audio_identity_kind": audio_identity_kind,
         "pipeline_release": str(payload.get("pipeline_release") or "unknown")[:64],
         "pipeline_config_fingerprint": str(
@@ -335,8 +389,8 @@ def machine_snapshot_provenance(job: Any, quality: dict | None) -> dict:
             or getattr(job, "timing_source", None) or "unknown"
         )[:64],
         "quality_policy_version": str(payload.get("policy_version") or "unknown")[:64],
-        "quality_fingerprint": str(payload.get("quality_fingerprint") or "")[:64] or None,
-        "quality_evidence_sha256": sha256_json(payload),
+        "source_quality_fingerprint": source_quality_fingerprint,
+        "quality_evidence_fingerprint": quality_fingerprint,
         "route": str(payload.get("route") or payload.get("decision") or "unknown")[:64],
     }
 
@@ -351,8 +405,9 @@ def _bounded_number(value: Any, minimum: float, maximum: float) -> float | None:
 
 
 def classify_corrections(original: list[dict], approved: list[dict], *, secret: str) -> dict:
-    if not secret:
-        raise ValueError("QUALITY_LEARNING_HMAC_KEY is required")
+    if strong_hmac_secret_bytes(secret) is None:
+        raise ValueError("QUALITY_LEARNING_HMAC_KEY must contain 32 strong bytes")
+    key_id = current_hmac_key_id()
     path = align_segments(original, approved)
     categories: Counter[str] = Counter()
     timing_deltas: list[float] = []
@@ -397,7 +452,9 @@ def classify_corrections(original: list[dict], approved: list[dict], *, secret: 
             else:
                 categories["lexical_substitution"] += 1
             pair = f"{left_normal}\x1f{right_normal}"
-            lexical_hmacs.append(_hmac_token(secret, pair))
+            lexical_hmacs.append(_versioned_hmac_token(
+                secret, "lexical-correction", pair, key_id=key_id,
+            ))
         elif _normalise_text(left_text, style=True) != _normalise_text(right_text, style=True):
             categories["style_only"] += 1
         if left and right:
@@ -529,11 +586,11 @@ def privacy_safe_features(job: Any) -> dict:
 
 
 def observation_identity(job_id: str, original_hash: str, approved_hash: str,
-                         release: str, config: str) -> str:
-    return sha256_json({
+                         release: str, config: str, *, secret: str) -> str:
+    return _hmac_token(secret, "observation\x1f" + json.dumps({
         "job_id": job_id, "original_hash": original_hash,
         "approved_hash": approved_hash, "release": release, "config": config,
-    })
+    }, sort_keys=True, separators=(",", ":")))
 
 
 def create_observation(db: Any, job_id: str, approved_version_id: str,
@@ -550,8 +607,9 @@ def create_observation(db: Any, job_id: str, approved_version_id: str,
     from evidence_attestation import lyric_snapshot_hash
 
     secret = os.environ.get("QUALITY_LEARNING_HMAC_KEY", "").strip()
-    if not secret:
-        raise RuntimeError("quality_learning_hmac_key_missing")
+    if strong_hmac_secret_bytes(secret) is None:
+        raise RuntimeError("quality_learning_hmac_key_missing_or_weak")
+    hmac_key_id = current_hmac_key_id()
     job = db.query(Job).filter(Job.job_id == job_id).with_for_update().one()
     if (
         expected_learning_epoch is not None
@@ -568,14 +626,14 @@ def create_observation(db: Any, job_id: str, approved_version_id: str,
     ).one()
     original = list(document.original_segments or [])
     approved = list(version.segments or [])
-    original_hash = lyric_snapshot_hash(original)
-    approved_hash = lyric_snapshot_hash(approved)
+    original_snapshot_hash = lyric_snapshot_hash(original)
+    approved_snapshot_hash = lyric_snapshot_hash(approved)
     if (
         expected_revision is not None
         and int(document.revision or 0) != int(expected_revision)
     ):
         raise StaleCorrectionSnapshot("editor_revision_advanced")
-    if expected_approved_hash and approved_hash != expected_approved_hash:
+    if expected_approved_hash and approved_snapshot_hash != expected_approved_hash:
         raise StaleCorrectionSnapshot("approved_snapshot_hash_changed")
     if int(version.revision) != int(document.revision or 0):
         raise StaleCorrectionSnapshot("approved_version_is_not_current")
@@ -584,7 +642,7 @@ def create_observation(db: Any, job_id: str, approved_version_id: str,
     ).order_by(EditorVersion.revision.asc()).all()
     original_version = next((
         candidate for candidate in original_versions
-        if lyric_snapshot_hash(candidate.segments or []) == original_hash
+        if lyric_snapshot_hash(candidate.segments or []) == original_snapshot_hash
     ), None)
     original_provenance = dict(
         getattr(original_version, "provenance", None) or {}
@@ -605,7 +663,15 @@ def create_observation(db: Any, job_id: str, approved_version_id: str,
         provenance.get("pipeline_config_fingerprint")
         or quality.get("pipeline_config_fingerprint") or "unknown"
     )[:64]
-    identity = observation_identity(job_id, original_hash, approved_hash, release, config)
+    original_hash = _hmac_token(
+        secret, f"original-lyric-snapshot\x1f{original_snapshot_hash}",
+    )
+    approved_hash = _hmac_token(
+        secret, f"approved-lyric-snapshot\x1f{approved_snapshot_hash}",
+    )
+    identity = observation_identity(
+        job_id, original_hash, approved_hash, release, config, secret=secret,
+    )
     independent_review = bool(
         getattr(job, "approved_by", None) is not None
         and version.created_by is not None
@@ -652,18 +718,24 @@ def create_observation(db: Any, job_id: str, approved_version_id: str,
         or (quality.get("quality_job") or {}).get("audio_sha256") or ""
     )
     audio_hash = (
-        measured_audio_hash
-        if re.fullmatch(r"[0-9a-f]{64}", measured_audio_hash)
-        else provenance.get("audio_sha256")
+        _hmac_token(secret, f"audio-content\x1f{measured_audio_hash}")
+        if re.fullmatch(r"[0-9a-f]{64}", measured_audio_hash) else None
     )
+    if audio_hash is None:
+        audio_hash = _versioned_fingerprint_digest(
+            provenance.get("audio_fingerprint"), key_id=hmac_key_id,
+        )
+    if audio_hash is None and re.fullmatch(
+        r"[0-9a-f]{64}", str(provenance.get("audio_sha256") or ""),
+    ):
+        audio_hash = _hmac_token(
+            secret, f"legacy-audio-content\x1f{provenance['audio_sha256']}",
+        )
     input_key = str(getattr(job, "input_r2_key", None) or "")
     if not audio_hash and input_key:
         # Storage identity, not raw bytes; content hashes from the quality
         # cache take precedence when available.
-        audio_hash = str(
-            (quality.get("quality_job") or {}).get("audio_sha256")
-            or hashlib.sha256(input_key.encode("utf-8")).hexdigest()
-        )[:64]
+        audio_hash = _hmac_token(secret, f"storage-object\x1f{input_key}")
     row = CorrectionObservation(
         id=str(uuid.uuid4()), identity_hash=identity, job_id=job_id,
         tenant_id=str(job.tenant_id), original_revision=int(
@@ -690,7 +762,7 @@ def create_observation(db: Any, job_id: str, approved_version_id: str,
         song_hmac=hmac_identifier(
             "song", f"{getattr(job, 'artist', '')}\x1f{getattr(job, 'song_title', '')}",
         ),
-        hmac_key_id=current_hmac_key_id(),
+        hmac_key_id=hmac_key_id,
         categories=delta["categories"],
         features=privacy_safe_features(job),
         metrics={

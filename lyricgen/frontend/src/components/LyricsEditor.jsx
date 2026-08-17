@@ -26,6 +26,7 @@ import { mergeThreeWay, segmentsEquivalent } from "../editorMerge";
 import { createSaveQueue } from "../lib/saveQueue";
 import VersionHistory from "./VersionHistory";
 import WrapWarningDialog from "./WrapWarningDialog";
+import QualityProposalPanel from "./QualityProposalPanel";
 
 // Copy honesto del fallo de respaldo (autosave), por CAUSA real. El banner
 // + el confirm de "Aprobar" antes decían "problema de red" para cualquier
@@ -174,7 +175,74 @@ function formatTimestamp(seconds) {
   return `${m}:${s.toString().padStart(2, "0")}.${ms}`;
 }
 
-// Transcription quality v5 keeps the editor usable and scopes the render gate
+function fallbackIdempotencyDigest(value) {
+  let h1 = 0x9e3779b1;
+  let h2 = 0x85ebca77;
+  let h3 = 0xc2b2ae3d;
+  let h4 = 0x27d4eb2f;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    h1 = Math.imul(h1 ^ code, 0x85ebca6b);
+    h2 = Math.imul(h2 ^ code, 0xc2b2ae35);
+    h3 = Math.imul(h3 ^ code, 0x27d4eb2d);
+    h4 = Math.imul(h4 ^ code, 0x165667b1);
+  }
+  return [h1, h2, h3, h4]
+    .map((part) => (part >>> 0).toString(16).padStart(8, "0"))
+    .join("");
+}
+
+export async function qualityProposalIdempotencyKey({
+  action,
+  jobId,
+  proposalId,
+  baseRevision,
+  windowIds = [],
+}) {
+  const normalizedAction = String(action || "").toLowerCase();
+  const normalizedWindows = [...new Set(
+    (Array.isArray(windowIds) ? windowIds : []).map((value) => String(value)),
+  )].sort();
+  if (
+    !["apply", "dismiss"].includes(normalizedAction)
+    || !String(jobId || "")
+    || !String(proposalId || "")
+    || !Number.isInteger(Number(baseRevision))
+    || (normalizedAction === "apply" && normalizedWindows.length === 0)
+  ) {
+    throw new Error("invalid_quality_proposal_idempotency_scope");
+  }
+  const canonical = JSON.stringify([
+    "quality-proposal-v1",
+    normalizedAction,
+    String(jobId),
+    String(proposalId),
+    Number(baseRevision),
+    normalizedWindows,
+  ]);
+  let digest;
+  try {
+    const bytes = new TextEncoder().encode(canonical);
+    const hashed = await globalThis.crypto?.subtle?.digest("SHA-256", bytes);
+    if (!hashed) throw new Error("subtle_crypto_unavailable");
+    digest = [...new Uint8Array(hashed)]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+  } catch {
+    // Idempotency is not an authentication boundary. The deterministic
+    // fallback preserves retry/reload semantics on older embedded browsers.
+    digest = fallbackIdempotencyDigest(canonical);
+  }
+  return `quality-proposal-v1-${digest}`;
+}
+
+function qualityProposalReachedStatus(document, proposalId, expectedStatus) {
+  const proposal = document?.quality_proposal;
+  return String(proposal?.id || "") === String(proposalId || "")
+    && String(proposal?.status || "").toLowerCase() === expectedStatus;
+}
+
+// Transcription quality v5/v6 keeps the editor usable and scopes the render gate
 // to bounded acoustic windows. Normalize defensively because v4 jobs use the
 // flat {start,end,reasons} shape while v5 may wrap the range and name the id.
 function normalizeUnsafeWindows(quality) {
@@ -202,8 +270,8 @@ function normalizeUnsafeWindows(quality) {
 
 function isTranscriptionQualityV5(quality) {
   const explicitVersions = [quality?.schema_version, quality?.version, quality?.quality_version];
-  if (explicitVersions.some((value) => Number(value) === 5)) return true;
-  return /(?:^|[-_])v?5(?:$|[-_])/.test(String(quality?.policy_version || "").toLowerCase());
+  if (explicitVersions.some((value) => [5, 6].includes(Number(value)))) return true;
+  return /(?:^|[-_])v?[56](?:$|[-_])/.test(String(quality?.policy_version || "").toLowerCase());
 }
 
 function isQualityAnalysisPending(quality) {
@@ -896,6 +964,23 @@ export default function LyricsEditor({
     enabled: editorV2Enabled,
     request: editorRequest,
   });
+  const priorQualityPendingRef = useRef(qualityAnalysisPending);
+  useEffect(() => {
+    const wasPending = priorQualityPendingRef.current;
+    priorQualityPendingRef.current = qualityAnalysisPending;
+    if (
+      !wasPending || qualityAnalysisPending
+      || !editorV2Enabled || !durableEditor.document
+    ) return;
+    // The quality poll intentionally updates only the diagnostic object. Once
+    // terminal, refresh the durable document once so a newly-created review
+    // proposal becomes visible without replacing unsaved lyric rows.
+    durableEditor.load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    editorV2Enabled, Boolean(durableEditor.document), qualityAnalysisPending,
+    transcriptionQuality?.quality_fingerprint,
+  ]);
   const draftOwner = user?.id || user?.username || null;
   const draftTenant = user?.tenant_id || user?.billing_account_id || "workspace";
   const draftKey = transcribeJobId && draftOwner
@@ -1613,6 +1698,9 @@ export default function LyricsEditor({
   const [overflowOpen, setOverflowOpen] = useState(false);           // menú ⋯ del player bar
   // Toast for per-anchor confirmation feedback.
   const { toast } = useToast();
+  const [qualityProposalBusy, setQualityProposalBusy] = useState({
+    applying: false, dismissing: false,
+  });
   // Global timing offset panel — UX entry point for "the whole song is
   // shifted by N ms" cases. Different from Sync Mode (which anchors a
   // line + propagates) and the "intro is too long" banner (which only
@@ -2259,6 +2347,141 @@ export default function LyricsEditor({
     if (autoplay && a.paused) a.play().catch(() => {});
     trackEditorEvent("editor_seek", { position_ms: Math.round(t * 1000), source: "editor" });
   }, [trackEditorEvent]);
+
+  const reconcileQualityProposalDocument = useCallback(async ({ syncSegments = false } = {}) => {
+    const nextDocument = await durableEditor.load();
+    if (syncSegments && Array.isArray(nextDocument?.segments)) {
+      setEdited(reseedPreservingIds(
+        editedRef.current,
+        sanitizeSegments(nextDocument.segments),
+      ));
+      setIsDirty(false);
+    }
+    return nextDocument;
+  }, [durableEditor.load, setEdited]);
+
+  const applyQualityProposal = useCallback(async (windowIds, proposal) => {
+    if (!editorRequest || !transcribeJobId || qualityProposalBusy.applying) return;
+    if (isDirty) {
+      toast({ message: "Guardá tus cambios actuales antes de aplicar una propuesta.", tone: "warning" });
+      return;
+    }
+    setQualityProposalBusy({ applying: true, dismissing: false });
+    try {
+      const idempotencyKey = await qualityProposalIdempotencyKey({
+        action: "apply",
+        jobId: transcribeJobId,
+        proposalId: proposal.id,
+        baseRevision: proposal.base_revision,
+        windowIds,
+      });
+      const response = await editorRequest(
+        `/editor/${transcribeJobId}/quality-proposals/${proposal.id}/apply`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            base_revision: proposal.base_revision,
+            window_ids: windowIds,
+            idempotency_key: idempotencyKey,
+          }),
+        },
+      );
+      if (!response?.ok) {
+        const nextDocument = await reconcileQualityProposalDocument({ syncSegments: true });
+        const appliedRemotely = qualityProposalReachedStatus(
+          nextDocument, proposal.id, "applied",
+        );
+        toast({
+          message: appliedRemotely
+            ? "La propuesta ya se había aplicado. Recuperamos la versión confirmada."
+            : response?.status === 409
+              ? "La propuesta quedó desactualizada porque cambió la letra."
+              : "No pudimos aplicar la propuesta.",
+          tone: appliedRemotely ? "success" : "error",
+        });
+        return;
+      }
+      await reconcileQualityProposalDocument({ syncSegments: true });
+      toast({ message: "Correcciones aplicadas como una nueva versión.", tone: "success" });
+    } catch {
+      // The POST may have committed even if its response was lost. Keep the
+      // operation busy until the durable document has been reloaded, then
+      // either acknowledge the committed state or allow a safe retry with
+      // the same deterministic idempotency key.
+      const nextDocument = await reconcileQualityProposalDocument({ syncSegments: true });
+      const appliedRemotely = qualityProposalReachedStatus(
+        nextDocument, proposal.id, "applied",
+      );
+      toast({
+        message: appliedRemotely
+          ? "La propuesta ya se había aplicado. Recuperamos la versión confirmada."
+          : "No pudimos confirmar la aplicación. Revisamos la versión actual; podés reintentar.",
+        tone: appliedRemotely ? "success" : "error",
+      });
+    } finally {
+      setQualityProposalBusy({ applying: false, dismissing: false });
+    }
+  }, [
+    editorRequest, isDirty, qualityProposalBusy.applying,
+    reconcileQualityProposalDocument, toast, transcribeJobId,
+  ]);
+
+  const dismissQualityProposal = useCallback(async (proposal) => {
+    if (!editorRequest || !transcribeJobId || qualityProposalBusy.dismissing) return;
+    setQualityProposalBusy({ applying: false, dismissing: true });
+    try {
+      const idempotencyKey = await qualityProposalIdempotencyKey({
+        action: "dismiss",
+        jobId: transcribeJobId,
+        proposalId: proposal.id,
+        baseRevision: proposal.base_revision,
+      });
+      const response = await editorRequest(
+        `/editor/${transcribeJobId}/quality-proposals/${proposal.id}/dismiss`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            base_revision: proposal.base_revision,
+            idempotency_key: idempotencyKey,
+            reason: "operator_dismissed",
+          }),
+        },
+      );
+      if (!response?.ok) {
+        const nextDocument = await reconcileQualityProposalDocument();
+        const dismissedRemotely = qualityProposalReachedStatus(
+          nextDocument, proposal.id, "dismissed",
+        );
+        toast({
+          message: dismissedRemotely
+            ? "La propuesta ya estaba descartada. Recuperamos el estado confirmado."
+            : "No pudimos descartar la propuesta.",
+          tone: dismissedRemotely ? "success" : "error",
+        });
+        return;
+      }
+      await reconcileQualityProposalDocument();
+      toast({ message: "Propuesta descartada.", tone: "success" });
+    } catch {
+      const nextDocument = await reconcileQualityProposalDocument();
+      const dismissedRemotely = qualityProposalReachedStatus(
+        nextDocument, proposal.id, "dismissed",
+      );
+      toast({
+        message: dismissedRemotely
+          ? "La propuesta ya estaba descartada. Recuperamos el estado confirmado."
+          : "No pudimos confirmar el descarte. Revisamos el estado actual; podés reintentar.",
+        tone: dismissedRemotely ? "success" : "error",
+      });
+    } finally {
+      setQualityProposalBusy({ applying: false, dismissing: false });
+    }
+  }, [
+    editorRequest, qualityProposalBusy.dismissing,
+    reconcileQualityProposalDocument, toast, transcribeJobId,
+  ]);
 
   // "Revisar →": salta a la SIGUIENTE línea marcada review, en orden.
   // Cicla. Hace scroll a la fila, foco al input de texto, seek del audio a
@@ -3450,6 +3673,20 @@ export default function LyricsEditor({
             </p>
           </div>
         </section>
+      )}
+
+      {durableEditor.document?.quality_proposal && (
+        <div className="mb-4">
+          <QualityProposalPanel
+            proposal={durableEditor.document.quality_proposal}
+            currentRevision={durableEditor.document.revision}
+            onSeek={(start) => seekTo(start, true)}
+            onApplySelected={applyQualityProposal}
+            onDismiss={dismissQualityProposal}
+            applying={qualityProposalBusy.applying}
+            dismissing={qualityProposalBusy.dismissing}
+          />
+        </div>
       )}
 
       {!qualityAnalysisPending

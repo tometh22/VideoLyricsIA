@@ -241,9 +241,12 @@ def _transcribe_window(audio_path: str, ini: float, dur: float,
     except Exception as e:
         if recorder:
             recorder.finish(
-                response_summary=f"error: {type(e).__name__}: {str(e)[:300]}"
+                response_summary=f"error_type:{type(e).__name__}"
             )
-        logger.warning("[GAP-RESCUE] transcripción de ventana falló: %r", e)
+        logger.warning(
+            "[GAP-RESCUE] window transcription declined error_type=%s job=%s",
+            type(e).__name__, job_id,
+        )
         return []
     finally:
         try:
@@ -677,5 +680,8 @@ def rescue(segments: list[dict], audio_path: str, *,
                                      _f(y.get("start")) - 0.01), 3)
         return out, stats
     except Exception as e:  # pragma: no cover — nunca romper la transcripción
-        logger.warning("[GAP-RESCUE] declinó por excepción: %r", e)
+        logger.warning(
+            "[GAP-RESCUE] rescue declined error_type=%s",
+            type(e).__name__,
+        )
         return list(segments), stats

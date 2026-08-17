@@ -10,6 +10,16 @@ from scripts.require_quality_worker_config import connectivity_errors, validate_
 REPO = Path(__file__).resolve().parents[3]
 
 
+def test_api_pins_v6_proposals_and_model_off_for_shadow_rollout():
+    path = REPO / "railway" / "api.toml"
+    with path.open("rb") as handle:
+        cfg = tomllib.load(handle)
+
+    start = cfg["deploy"]["startCommand"]
+    assert "QUALITY_V6_PROPOSALS_ENABLED=0" in start
+    assert "QUALITY_V6_MODEL_ENABLED=0" in start
+
+
 def test_quality_worker_is_one_process_one_replica_and_one_queue():
     path = REPO / "railway" / "quality-worker.toml"
     with path.open("rb") as handle:
@@ -25,8 +35,20 @@ def test_quality_worker_is_one_process_one_replica_and_one_queue():
     assert "require_worker_schema.py" in start
     assert "require_quality_worker_resources.py" in start
     assert "require_quality_worker_config.py" in start
+    assert "QUALITY_CONTENT_FINGERPRINT_HMAC_KEY_ID=quality-v6-2026-01" in start
     assert "TRANSCRIPTION_QUALITY_QUEUE_ENABLED=1" in start
     assert "TRANSCRIPTION_QUALITY_MODE=observe" in start
+    assert "QUALITY_V6_ANALYSIS_ENABLED=1" in start
+    assert "PERFORMANCE_GRAPH_V6_ENABLED=1" in start
+    assert "TARGETED_CONSENSUS_ENABLED=1" in start
+    assert "TARGETED_ACOUSTIC_STRUCTURE_ENABLED=1" in start
+    assert "TARGETED_SLOW_STEM_ENABLED=1" in start
+    assert "TARGETED_GEMINI_VERIFY_ENABLED=1" in start
+    assert "TARGETED_STRUCTURAL_AUTOREPAIR_MODE=observe" in start
+    assert "TARGETED_RESIDUAL_ASR_ENABLED=1" in start
+    assert "TARGETED_CONSENSUS_MAX_BILLED_SECONDS=120" in start
+    assert "QUALITY_V6_PROPOSALS_ENABLED=0" in start
+    assert "QUALITY_V6_MODEL_ENABLED=0" in start
     # Learning kill switches come from Railway variables and default off in
     # application code; pinning =0 here would make staged activation impossible.
     assert "QUALITY_LEARNING_CAPTURE_ENABLED=" not in start
@@ -62,7 +84,8 @@ def test_quality_worker_config_gate_requires_durable_dependencies_and_isolation(
         "R2_SECRET_ACCESS_KEY": "configured",
         "R2_ENDPOINT_URL": "https://configured.invalid",
         "R2_BUCKET": "configured",
-        "QUALITY_CONTENT_ATTESTATION_KEY": "configured",
+        "QUALITY_CONTENT_ATTESTATION_KEY": "quality-test-key-0123456789-ABCDEF",
+        "QUALITY_CONTENT_FINGERPRINT_HMAC_KEY_ID": "quality-test-v1",
         "QUEUES": "transcription_quality",
         "TRANSCRIPTION_QUALITY_QUEUE_ENABLED": "1",
         "VOCAL_SEP_ENABLED": "1",
@@ -83,7 +106,8 @@ def test_quality_worker_config_gate_accepts_s3_aliases():
         "S3_SECRET_KEY": "configured",
         "S3_ENDPOINT_URL": "configured",
         "S3_BUCKET": "configured",
-        "QUALITY_LEARNING_HMAC_KEY": "configured",
+        "QUALITY_LEARNING_HMAC_KEY": "quality-test-key-0123456789-ABCDEF",
+        "QUALITY_LEARNING_HMAC_KEY_ID": "quality-test-v1",
         "QUEUES": "transcription_quality",
         "TRANSCRIPTION_QUALITY_QUEUE_ENABLED": "true",
         "VOCAL_SEP_ENABLED": "true",
@@ -150,7 +174,8 @@ def test_quality_worker_config_gate_requires_provider_for_enabled_consensus():
         "QUEUES": "transcription_quality",
         "TRANSCRIPTION_QUALITY_QUEUE_ENABLED": "1",
         "VOCAL_SEP_ENABLED": "1", "REPLICATE_API_TOKEN": "configured",
-        "QUALITY_CONTENT_ATTESTATION_KEY": "configured",
+        "QUALITY_CONTENT_ATTESTATION_KEY": "quality-test-key-0123456789-ABCDEF",
+        "QUALITY_CONTENT_FINGERPRINT_HMAC_KEY_ID": "quality-test-v1",
         "TARGETED_CONSENSUS_ENABLED": "1",
     }
     assert validate_config(env) == ["missing_targeted_asr_provider"]

@@ -35,8 +35,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 
 logger = logging.getLogger("genly.transcription_worker")
+_EXCEPTION_TYPE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
+
+
+def _safe_exception_code(exc: BaseException) -> str:
+    """Return a bounded class label; never serialize exception text/args."""
+    name = getattr(type(exc), "__name__", "Exception")
+    return name if isinstance(name, str) and _EXCEPTION_TYPE_RE.fullmatch(name) else "Exception"
 
 
 def _drop_final_credit_hallucinations(result: dict, job_id: str) -> dict:
@@ -54,16 +62,31 @@ def _drop_final_credit_hallucinations(result: dict, job_id: str) -> dict:
     segments = result.get("segments") or []
     try:
         from pipeline import _is_whisper_hallucination
-        kept = [
-            segment for segment in segments
-            if not (
-                isinstance(segment, dict)
-                and _is_whisper_hallucination(str(segment.get("text") or ""))
+        from lyric_content_policy import should_include_as_lyric
+        kept = []
+        prior_end = None
+        for index, segment in enumerate(segments):
+            if not isinstance(segment, dict):
+                kept.append(segment)
+                continue
+            text = str(segment.get("text") or "")
+            start = float(segment.get("start") or 0.0)
+            isolated_tail = bool(
+                index >= max(1, len(segments) - 3)
+                and prior_end is not None and start - prior_end >= 2.5
             )
-        ]
+            provider_kind = str(
+                segment.get("content_kind") or segment.get("kind") or ""
+            )
+            if not _is_whisper_hallucination(text) and should_include_as_lyric(
+                text, provider_kind=provider_kind, isolated_tail=isolated_tail,
+            ):
+                kept.append(segment)
+            prior_end = max(prior_end or 0.0, float(segment.get("end") or start))
     except Exception as exc:
         logger.warning(
-            "[FINAL-HALLUCINATION] declined: %r job=%s", exc, job_id,
+            "[FINAL-HALLUCINATION] declined error_type=%s job=%s",
+            _safe_exception_code(exc), job_id,
         )
         return result
     dropped = len(segments) - len(kept)
@@ -134,8 +157,11 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                     _dur = _audio_duration(audio_path)
                     import vocal_sep as _vs
                     _stem = _vs.separate_vocals(audio_path, cache_only=True)
-                except Exception as e:
-                    logger.info("[COVERAGE] sin stem para voiced_gaps (%r)", e)
+                except Exception as exc:
+                    logger.info(
+                        "[COVERAGE] sin stem para voiced_gaps error_type=%s",
+                        _safe_exception_code(exc),
+                    )
             # Veredictos del sondeo con ASR: gap_rescue mide PALABRAS, la
             # única evidencia real de letra faltante. El breaker no puede
             # acusar un hueco que aquél ya descartó (batch 30-07: 8 de 8
@@ -268,8 +294,11 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             if vacios:
                 logger.warning("[COVERAGE] %d segmento(s) con TEXTO VACÍO "
                                "en la salida final job=%s", vacios, job_id)
-    except Exception as e:
-        logger.warning("[COVERAGE] medición final falló: %r job=%s", e, job_id)
+    except Exception as exc:
+        logger.warning(
+            "[COVERAGE] medición final falló error_type=%s job=%s",
+            _safe_exception_code(exc), job_id,
+        )
     finally:
         if strip_internal and isinstance(r, dict):
             r.pop("_asr_words", None)
@@ -287,7 +316,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
                                   language: str, antes_fmt: float | None,
                                   timing_consistency_fn, *, live_hint: bool = False):
     """Measure, retry only unsafe windows, and persist one final verdict."""
-    from transcription_quality import calibration_identity, evaluate
+    from transcription_quality import POLICY_VERSION, calibration_identity, evaluate
     from line_evidence import annotate_provider_evidence
 
     r = dict(r)
@@ -322,10 +351,25 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
             inline_retry_enabled
             and initial.get("decision") != "pass" and windows and is_enabled()
         ):
-            r, retry_stats = await asyncio.to_thread(
+            candidate_result, retry_stats = await asyncio.to_thread(
                 reprocess, r, audio_path, windows,
                 language=language, job_id=job_id,
             )
+            if POLICY_VERSION == "lyrics-quality-v6":
+                changed = (
+                    isinstance(candidate_result, dict)
+                    and candidate_result.get("segments") != r.get("segments")
+                )
+                if changed or retry_stats.get("lines_replaced") or retry_stats.get("lines_inserted"):
+                    retry_stats = dict(retry_stats)
+                    retry_stats["v6_legacy_mutation_blocked"] = True
+                    retry_stats["mutated_segments"] = False
+                    retry_stats["lines_replaced"] = 0
+                    retry_stats["lines_inserted"] = 0
+                # Suggestions/evidence may be measured, but v6 never adopts an
+                # inline result containing legacy in-place lyric mutations.
+            else:
+                r = candidate_result
             if retry_stats.get("lines_replaced") or retry_stats.get("lines_inserted"):
                 r = timing_consistency_fn(r, job_id)
                 r = _medir_cobertura_final(
@@ -335,7 +379,10 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
                 post = r.get("postpass_stats") or {}
                 windows = post.get("quality_windows") or []
     except Exception as exc:
-        logger.warning("[QUALITY-GATE] targeted retry failed: %r job=%s", exc, job_id)
+        logger.warning(
+            "[QUALITY-GATE] targeted retry failed error_type=%s job=%s",
+            _safe_exception_code(exc), job_id,
+        )
         retry_stats = {
             "attempted": True, "failed": True,
             "failure_reason": f"exception:{type(exc).__name__}",
@@ -423,8 +470,11 @@ def run_transcription_job(
             current_step="transcribe.prepare",
             progress=2,
         )
-    except Exception as e:
-        logger.warning("[TRANSCRIBE-WORKER] failed to flip status: %s", e)
+    except Exception as exc:
+        logger.warning(
+            "[TRANSCRIBE-WORKER] failed to flip status error_type=%s",
+            _safe_exception_code(exc),
+        )
 
     # 2. Si el archivo no está en disco (ej. worker en container distinto al
     #    handler que recibió el upload), descargarlo de R2. Usamos
@@ -438,8 +488,11 @@ def run_transcription_job(
         try:
             row = get_job_model(_db, job_id)
             input_r2_key = (row.input_r2_key if row else None)
-        except Exception as e:
-            logger.warning("[TRANSCRIBE-WORKER] get_job_model failed for %s: %s", job_id, e)
+        except Exception as exc:
+            logger.warning(
+                "[TRANSCRIBE-WORKER] get_job_model failed job=%s error_type=%s",
+                job_id, _safe_exception_code(exc),
+            )
         finally:
             _db.close()
         if not input_r2_key:
@@ -455,11 +508,67 @@ def run_transcription_job(
     try:
         _validate_audio_file_on_disk(filename, audio_path)
     except Exception as exc:
-        detail = getattr(exc, "detail", None) or str(exc)
-        return _fail(job_id, f"Archivo de audio inválido: {str(detail)[:200]}")
+        error_type = _safe_exception_code(exc)
+        logger.warning(
+            "[TRANSCRIBE-WORKER] audio validation failed job=%s error_type=%s",
+            job_id, error_type,
+        )
+        return _fail(
+            job_id,
+            f"Archivo de audio inválido. Código: {error_type}.",
+        )
 
     from quality_cache import sha256_file
     source_audio_sha256 = sha256_file(audio_path)
+    source_audio_revision = 0
+    # Establish the immutable source identity before the expensive pipeline.
+    # Direct browser PUTs necessarily start at a mutable upload key because
+    # the server does not see their bytes; the first worker materialization
+    # promotes that object to its content-addressed destination.
+    from database import Job as _IdentityJob, SessionLocal as _IdentitySession
+    _identity_db = _IdentitySession()
+    try:
+        _identity_row = (
+            _identity_db.query(_IdentityJob)
+            .filter(_IdentityJob.job_id == job_id)
+            .with_for_update().first()
+        )
+        if _identity_row is None:
+            return {"job_id": job_id, "status": "discarded", "reason": "job_not_found"}
+        if (
+            _identity_row.input_audio_sha256
+            and str(_identity_row.input_audio_sha256) != source_audio_sha256
+        ):
+            return {
+                "job_id": job_id, "status": "discarded",
+                "reason": "source_audio_changed",
+            }
+        if storage.is_enabled():
+            immutable_key = storage.content_addressed_input_key(
+                str(_identity_row.tenant_id or ""), job_id,
+                source_audio_sha256, filename,
+            )
+            if str(_identity_row.input_r2_key or "") != immutable_key:
+                # upload_file is idempotent at the content-addressed key and
+                # avoids trusting a mutable source object after validation.
+                if storage.upload_file(audio_path, immutable_key) != immutable_key:
+                    raise RuntimeError("content_addressed_audio_promotion_failed")
+                _identity_row.input_r2_key = immutable_key
+            _identity_row.input_audio_etag = (
+                storage.object_etag(immutable_key) or source_audio_sha256
+            )
+        elif not _identity_row.input_audio_etag:
+            _identity_row.input_audio_etag = source_audio_sha256
+        if not _identity_row.input_audio_sha256:
+            _identity_row.input_audio_sha256 = source_audio_sha256
+        if int(_identity_row.audio_revision or 0) <= 0:
+            _identity_row.audio_revision = max(
+                1, int(_identity_row.audio_revision or 0),
+            )
+        source_audio_revision = int(_identity_row.audio_revision or 0)
+        _identity_db.commit()
+    finally:
+        _identity_db.close()
 
     # 3. Llamar al pipeline async existente. `request` y `current_user` son
     #    ignorados dentro del cuerpo (verified) — passing None es seguro.
@@ -528,10 +637,12 @@ def run_transcription_job(
             )
 
         result = asyncio.run(_run_with_retime())
-    except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        logger.exception("[TRANSCRIBE-WORKER] job=%s failed", job_id)
+    except Exception as exc:
+        error_type = _safe_exception_code(exc)
+        logger.error(
+            "[TRANSCRIBE-WORKER] job=%s failed error_type=%s",
+            job_id, error_type,
+        )
         # OBSERVABILITY (audit 2026-05-24): the orchestrator catches +
         # re-raises, but worker process exceptions don't reach Sentry
         # via FastAPI's auto-capture. Capture explicitly here so prod
@@ -541,13 +652,16 @@ def run_transcription_job(
             with sentry_sdk.push_scope() as scope:
                 scope.set_tag("job_id", job_id)
                 scope.set_tag("layer", "transcription_worker")
-                sentry_sdk.capture_exception(e)
+                scope.set_tag("error_type", error_type)
+                sentry_sdk.capture_message(
+                    "transcription_worker_failure", level="error",
+                )
         except Exception:
             pass  # never let Sentry failures break the error path
-        # Persistir un sumario corto + tipo de excepción para diagnóstico
-        # vía /transcription-status sin tener que pegarse al log container.
-        err_msg = f"{type(e).__name__}: {str(e)[:200]}"
-        return _fail(job_id, err_msg, tb=tb)
+        return _fail(
+            job_id,
+            f"No pudimos completar la transcripción. Código: {error_type}.",
+        )
 
     # 4. Persistir el resultado en el row.
     #
@@ -582,6 +696,35 @@ def run_transcription_job(
             )
             if row is None:
                 raise LookupError("job disappeared before transcription persistence")
+            if (
+                row.input_audio_sha256
+                and str(row.input_audio_sha256) != source_audio_sha256
+            ):
+                logger.warning(
+                    "[audio-occ] transcription result discarded job=%s "
+                    "audio_identity_match=false",
+                    job_id,
+                )
+                _persist_db.rollback()
+                return {
+                    "job_id": job_id, "status": "discarded",
+                    "reason": "source_audio_changed",
+                }
+            if int(row.audio_revision or 0) != source_audio_revision:
+                logger.warning(
+                    "[audio-occ] transcription revision discarded job=%s "
+                    "expected=%s actual=%s",
+                    job_id, source_audio_revision, int(row.audio_revision or 0),
+                )
+                _persist_db.rollback()
+                return {
+                    "job_id": job_id, "status": "discarded",
+                    "reason": "source_audio_revision_changed",
+                }
+            if not row.input_audio_sha256:
+                row.input_audio_sha256 = source_audio_sha256
+                row.input_audio_etag = source_audio_sha256
+                row.audio_revision = max(1, int(row.audio_revision or 0))
             current_revision = int(row.segments_revision or 0)
             if current_revision > 0 and segments != row.segments_json:
                 # An operator edited while the ASR was running. Preserve the
@@ -610,6 +753,7 @@ def run_transcription_job(
                 if isinstance(quality, dict):
                     quality = dict(quality)
                     quality["audio_sha256"] = source_audio_sha256
+                    quality["audio_revision"] = int(row.audio_revision or 0)
                     quality["evaluated_revision"] = current_revision
                     quality["timing_source"] = row.timing_source or "unknown"
                     try:
@@ -671,8 +815,8 @@ def run_transcription_job(
                 )
             except Exception as enqueue_exc:
                 logger.warning(
-                    "[QUALITY-QUEUE] enqueue declined job=%s: %r",
-                    job_id, enqueue_exc,
+                    "[QUALITY-QUEUE] enqueue declined job=%s error_type=%s",
+                    job_id, _safe_exception_code(enqueue_exc),
                 )
         # reference_lyrics no tiene columna en el modelo Job (defer a otro PR
         # si el editor lo necesita post-transcribe). Lo dejo en el log para
@@ -680,21 +824,21 @@ def run_transcription_job(
         if reference_lyrics:
             logger.info("[TRANSCRIBE-WORKER] job=%s ref_lyrics=%d chars (no persistido aún)",
                         job_id, len(reference_lyrics))
-    except Exception as e:
-        logger.warning("[TRANSCRIBE-WORKER] failed to persist final state: %s", e)
+    except Exception as exc:
+        logger.warning(
+            "[TRANSCRIBE-WORKER] failed to persist final state error_type=%s",
+            _safe_exception_code(exc),
+        )
     return result
 
 
 def _fail(job_id: str, error_msg: str, tb: str = "") -> dict:
     """Marca el job como transcription_failed con un mensaje para el frontend.
 
-    El traceback se loguea (para grepear el log container) pero NO se persiste
-    en la DB (puede ser >500 chars y conviene mantener `error` corto para el
-    UI de error inline en el editor).
+    ``tb`` se conserva sólo por compatibilidad de firma y se descarta. Un
+    traceback puede incluir audio paths, respuestas ASR o letras.
     """
     from jobs import update_job
-    if tb:
-        logger.error("[TRANSCRIBE-WORKER] job=%s traceback:\n%s", job_id, tb)
     try:
         update_job(
             job_id,
@@ -702,6 +846,9 @@ def _fail(job_id: str, error_msg: str, tb: str = "") -> dict:
             current_step="error",
             error=error_msg[:500],
         )
-    except Exception as e:
-        logger.warning("[TRANSCRIBE-WORKER] failed to persist error for %s: %s", job_id, e)
+    except Exception as exc:
+        logger.warning(
+            "[TRANSCRIBE-WORKER] failed to persist error job=%s error_type=%s",
+            job_id, _safe_exception_code(exc),
+        )
     return {"job_id": job_id, "status": "transcription_failed", "error": error_msg}

@@ -5,7 +5,17 @@
 
 import uuid
 
+import pytest
+
 from database import Job as JobModel, AuditLog
+
+
+@pytest.fixture(autouse=True)
+def _isolate_retry_endpoint_from_background_render(monkeypatch):
+    """Keep endpoint-state assertions independent of a real fallback thread."""
+    import main
+
+    monkeypatch.setattr(main, "enqueue_pipeline", lambda **_kwargs: "queued:test")
 
 
 def _create_error_job(db, edit_count: int = 3, tenant_id: str = "default"):

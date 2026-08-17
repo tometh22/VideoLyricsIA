@@ -2,7 +2,8 @@
 
 Only windows identified by :mod:`transcription_quality` are sent to the
 second ASR.  A change is accepted when the isolated vocal stem agrees with
-either the original mix or the primary-ASR word stream.  Doubt leaves the
+an explicitly different recognition family. Different views produced by the
+same model/source lineage cannot corroborate one another. Doubt leaves the
 original untouched and visible to the operator.
 """
 from __future__ import annotations
@@ -12,6 +13,7 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -71,10 +73,31 @@ def _text(words: list[dict]) -> str:
 
 
 def _similarity(left: str, right: str) -> float:
-    a, b = _norm(left).split(), _norm(right).split()
+    a, b = _phonetic_tokens(left), _phonetic_tokens(right)
     if not a or not b:
         return 0.0
-    return SequenceMatcher(None, a, b).ratio()
+    token_score = SequenceMatcher(None, a, b).ratio()
+    phone_score = SequenceMatcher(None, " ".join(a), " ".join(b)).ratio()
+    return 0.60 * token_score + 0.40 * phone_score
+
+
+def _phonetic_tokens(text: str) -> list[str]:
+    """Small deterministic Spanish/rioplatense pronunciation projection.
+
+    This is not a recognition witness.  It only prevents orthographic forms
+    such as b/v, ll/y, c/s/z and silent h from being treated as unrelated
+    when comparing candidates already produced from audio.
+    """
+    output = []
+    for raw in _norm(text).split():
+        token = raw.replace("h", "").replace("ll", "y")
+        token = token.replace("qu", "k").replace("v", "b")
+        token = token.replace("z", "s").replace("ce", "se").replace("ci", "si")
+        token = token.replace("ge", "je").replace("gi", "ji")
+        token = token.replace("gue", "ge").replace("gui", "gi")
+        if token:
+            output.append(token)
+    return output
 
 
 def _words_in(words: list[dict], start: float, end: float, pad: float = 0.35) -> list[dict]:
@@ -89,10 +112,92 @@ def _words_in(words: list[dict], start: float, end: float, pad: float = 0.35) ->
     return sorted(out, key=lambda item: _f(item.get("start")))
 
 
+def _safe_error_type(exc: BaseException) -> str:
+    """Return a bounded identifier without serializing provider messages."""
+    name = re.sub(r"[^A-Za-z0-9_]", "_", type(exc).__name__)[:64]
+    return name or "ProviderError"
+
+
+def _calibrated_review_certification(evidence: object) -> dict | None:
+    """Copy an existing calibrated review certificate; never mint one here."""
+    if not isinstance(evidence, dict):
+        return None
+    candidate = evidence
+    if candidate.get("kind") != "review_proposal_certification":
+        candidate = (
+            evidence.get("review_proposal_certification")
+            or evidence.get("certification")
+        )
+    if not isinstance(candidate, dict):
+        return None
+    from quality_v6_calibration import PREDICTION_CERTIFICATION_SCHEMA
+    from quality_v6_contracts import POLICY_VERSION
+
+    if (
+        candidate.get("kind") != "review_proposal_certification"
+        or candidate.get("schema") != PREDICTION_CERTIFICATION_SCHEMA
+        or candidate.get("policy_version") != POLICY_VERSION
+        or candidate.get("eligible_offline") is not True
+        or candidate.get("review_proposal_allowed") is not True
+        or candidate.get("automatic_apply_allowed") is not False
+        or candidate.get("runtime_authorization") is not False
+        or bool(candidate.get("blockers"))
+    ):
+        return None
+    return dict(candidate)
+
+
+def _proposal_candidate_payload(
+    *, candidate_id: str, parent_window_id: str,
+    start: float, end: float, reasons: set[str] | list[str],
+    current_segments: list[dict], proposed_segments: list[dict],
+    source: str, calibrated_evidence: object = None,
+) -> dict:
+    """Build the nominal tenant-scoped DTO without granting authorization."""
+    from quality_v6_contracts import PROPOSAL_CANDIDATE_SCHEMA
+
+    payload = {
+        "kind": "review_proposal_candidate",
+        "schema": PROPOSAL_CANDIDATE_SCHEMA,
+        "id": str(candidate_id or ""),
+        "parent_window_id": str(parent_window_id or candidate_id or ""),
+        "start": float(start), "end": float(end),
+        "reasons": sorted(str(reason) for reason in reasons if reason),
+        "current_segments": [dict(item) for item in current_segments],
+        "proposed_segments": [dict(item) for item in proposed_segments],
+        "source": str(source),
+    }
+    certification = _calibrated_review_certification(calibrated_evidence)
+    if certification is not None:
+        payload["certification"] = certification
+    return payload
+
+
+def _stream_family_map(result: dict | None = None) -> dict[str, str]:
+    """Resolve explicit recognition lineage; unknown families fail closed."""
+    result = result or {}
+    primary = str(result.get("_primary_asr_family") or "").strip()
+    # The targeted adapter is OpenAI Whisper.  Unless the caller supplies a
+    # separately attested family for that exact invocation, conservatively
+    # alias it to the original ASR family.  This prevents two runs of the same
+    # provider/model over mix/stem/slow views from manufacturing independence.
+    targeted = str(
+        result.get("_targeted_asr_family") or primary or "targeted_openai_asr"
+    ).strip()
+    return {
+        "stem": targeted,
+        "slowed_stem": targeted,
+        "mix": targeted,
+        "primary": primary,
+        "witness": str(result.get("_independent_asr_family") or "").strip(),
+    }
+
+
 def choose_consensus(stem_words: list[dict], mix_words: list[dict],
                      primary_words: list[dict], *,
                      slowed_words: list[dict] | None = None,
                      witness_words: list[dict] | None = None,
+                     stream_families: dict[str, str] | None = None,
                      threshold: float = 0.72):
     """Return the agreed word stream and evidence, or ``(None, ...)``.
 
@@ -106,31 +211,53 @@ def choose_consensus(stem_words: list[dict], mix_words: list[dict],
         "witness": witness_words or [],
     }
     texts = {name: _text(words) for name, words in streams.items()}
+    families = {
+        **_stream_family_map(),
+        **{str(key): str(value or "").strip()
+           for key, value in (stream_families or {}).items()},
+    }
     eligible = {
         name: text for name, text in texts.items()
         if len(_norm(text).split()) >= 2
     }
-    # An isolated-vocal candidate (normal OR slowed) must agree exactly with
-    # an independent representation (mix or primary provider). Agreement
-    # between normal+slowed stems alone is useful evidence but never enough to
-    # alter content: both came from the same source/model family.
+    # An isolated-vocal candidate (normal OR slowed) must agree phonetically
+    # with an explicitly independent recognition family. Different waveforms
+    # passed through the same recognizer remain correlated and cannot create
+    # a false vote merely by being labelled stem/mix/slow.
     best = None
+    family_rejections = 0
     for isolated in ("stem", "slowed_stem"):
         for independent in ("primary", "witness", "mix"):
             if isolated not in eligible or independent not in eligible:
                 continue
-            similarity = (
-                1.0
-                if _norm(eligible[isolated]) == _norm(eligible[independent])
-                else 0.0
+            isolated_family = families.get(isolated, "")
+            independent_family = families.get(independent, "")
+            if (
+                not isolated_family or not independent_family
+                or isolated_family == independent_family
+            ):
+                family_rejections += 1
+                continue
+            similarity = _similarity(
+                eligible[isolated], eligible[independent],
             )
             candidate = (similarity, isolated, independent)
             if best is None or similarity > best[0]:
                 best = candidate
-    evidence = {"texts": texts, "agreement": round(best[0], 3) if best else 0.0}
-    if not best or best[0] < threshold:
+    evidence = {
+        "texts": texts,
+        "agreement": round(best[0], 3) if best else 0.0,
+        "families": {name: families.get(name, "") for name in streams},
+        "family_rejections": family_rejections,
+    }
+    # Short sung phrases are especially collision-prone.  Phonetic folding
+    # handles spelling variants, but a genuine independent witness still has
+    # to agree strongly enough to prevent a nearby lyric from being copied.
+    required = max(float(threshold), 0.90)
+    if not best or best[0] < required:
         return None, evidence
     evidence["sources"] = [best[1], best[2]]
+    evidence["source_families"] = [families[best[1]], families[best[2]]]
     return streams[best[1]], evidence
 
 
@@ -161,6 +288,57 @@ def _transcribe_slowed_window(stem_path: str, start: float, duration: float,
                     **dict(word),
                     "start": round(start + _f(word.get("start")) * speed, 3),
                     "end": round(start + _f(word.get("end")) * speed, 3),
+                })
+            except (TypeError, ValueError):
+                continue
+        return mapped
+    finally:
+        try:
+            os.unlink(clip)
+        except OSError:
+            pass
+
+
+def _transcribe_residual_window(
+    mix_path: str, stem_path: str, start: float, duration: float,
+    language: str | None, job_id: str, transcribe_fn,
+) -> list[dict]:
+    """ASR a local mix-minus-stem view for crowd/backing-vocal rescue.
+
+    Residual, mix and stem share lineage and never count as independent
+    witnesses. The residual only contributes an auxiliary content candidate
+    when acoustic analysis says separation may have removed vocal material.
+    """
+    fd, clip = tempfile.mkstemp(prefix="genly_residual_", suffix=".wav")
+    os.close(fd)
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", str(start), "-t", str(duration), "-i", mix_path,
+                "-ss", str(start), "-t", str(duration), "-i", stem_path,
+                "-filter_complex",
+                "[1:a]volume=-1[negative];"
+                "[0:a][negative]amix=inputs=2:duration=first:normalize=0[out]",
+                "-map", "[out]", "-ac", "1", "-ar", "16000",
+                "-c:a", "pcm_s16le", "-loglevel", "error", clip,
+            ],
+            check=True, timeout=90,
+        )
+        if not os.path.exists(clip) or os.path.getsize(clip) == 0:
+            return []
+        words = transcribe_fn(
+            clip, 0.0, duration, language or None, job_id or None,
+        )
+        mapped = []
+        for word in words or []:
+            try:
+                mapped.append({
+                    **dict(word),
+                    "start": round(start + _f(word.get("start")), 3),
+                    "end": round(start + _f(word.get("end")), 3),
+                    "audio_view": "derived_residual",
+                    "correlated_family": "source_audio_demucs",
                 })
             except (TypeError, ValueError):
                 continue
@@ -292,10 +470,11 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
     except Exception as exc:
         if recorder:
             recorder.finish(
-                response_summary=f"error:{type(exc).__name__}",
+                response_summary=f"error:{_safe_error_type(exc)}",
             )
         logger.warning(
-            "[TARGETED-GEMINI] declined: %r job=%s", exc, job_id,
+            "[TARGETED-GEMINI] declined error_type=%s job=%s",
+            _safe_error_type(exc), job_id,
         )
         return []
     finally:
@@ -476,13 +655,29 @@ def _repair_structural_repetition(
         if group and (_word_tokens(_text(group)) or [""])[0] == motif
         and _safe_line(group)
     ]
-    gemini = _gemini_cycles(gemini_events, motif)
+    from lyric_content_policy import classify_content, should_include_as_lyric
+    excluded_events = []
+    lyric_gemini_events = []
+    for event in gemini_events or []:
+        if not isinstance(event, dict):
+            continue
+        text = str(event.get("text") or "").strip()
+        kind = str(event.get("kind") or "").strip().lower()
+        if should_include_as_lyric(text, provider_kind=kind):
+            lyric_gemini_events.append(dict(event))
+        else:
+            excluded_events.append(classify_content(text, provider_kind=kind))
+    stats["excluded_content_diagnostics"] = {
+        category: excluded_events.count(category)
+        for category in sorted(set(excluded_events))
+    }
+    gemini = _gemini_cycles(lyric_gemini_events, motif)
     gemini = _canonicalize_cycle_vocalizations(gemini, targets, motif)
-    # v5 receives every bounded vocal event.  Filtering to cycles that begin
+    # v6 receives every bounded lyric event. Filtering to cycles that begin
     # with ``motif`` deleted valid trailing calls (for example ``no`` after a
     # repeated refrain) before the acoustic layer could even inspect them.
     gemini_all = sorted([
-        dict(event) for event in (gemini_events or [])
+        dict(event) for event in lyric_gemini_events
         if isinstance(event, dict)
         and str(event.get("text") or "").strip()
         and _f(event.get("end")) >= window_start
@@ -595,7 +790,7 @@ def _repair_structural_repetition(
             "events_inserted": len(candidate_events),
             "hybrid_suggestion": candidate_events,
         })
-        # Structural v5 remains suggestion-only until the frozen benchmark
+        # Structural v6 remains suggestion-only until the frozen benchmark
         # has calibrated pass precision.  The legacy boolean alone can never
         # authorize destructive replacement.
         if not enforce:
@@ -707,15 +902,20 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         "attempted": False, "windows_considered": len(windows or []),
         "windows_processed": 0, "asr_calls": 0, "audio_seconds_billed": 0.0,
         "openai_asr_seconds_billed": 0.0,
-        "lines_replaced": 0, "lines_inserted": 0, "truncated_windows": 0,
+        "lines_replaced": 0, "lines_inserted": 0,
+        "windows_truncated": 0,
         "lines_suggested": 0, "provider_attempts": 0,
         "submitted_audio_seconds": 0.0, "declined": [],
         "slowed_asr_calls": 0, "slowed_audio_seconds": 0.0,
+        "residual_asr_calls": 0, "residual_audio_seconds": 0.0,
         "gemini_calls": 0, "gemini_audio_seconds": 0.0,
         "structural_repairs": 0, "structural_events": 0,
         "structural_hybrid_attempts": 0, "structural_hybrid_accepts": 0,
         "structural_hybrid_declined": [],
         "structural_hybrid_diagnostics": [],
+        # Raw proposal content is returned only to the tenant-scoped quality
+        # worker.  It is removed before Job quality analytics are persisted.
+        "quality_proposal_windows": [],
     }
     if not isinstance(result, dict) or not windows or not audio_path:
         stats["declined"].append("no_windows")
@@ -758,6 +958,7 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         max_clip_s = min(45.0, _env_float("TARGETED_CONSENSUS_MAX_CLIP_SECONDS", 40.0))
         primary = result.get("_asr_words") or []
         independent_witness = result.get("_independent_asr_words") or []
+        stream_families = _stream_family_map(result)
         segments = [dict(s) for s in (result.get("segments") or [])]
         stats["attempted"] = True
         started_at = time.monotonic()
@@ -768,6 +969,10 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         allow_insertions = mutation_authorized(job_id=job_id)
         slow_enabled = (
             os.environ.get("TARGETED_SLOW_STEM_ENABLED", "0")
+            .strip().lower() in _TRUE
+        )
+        residual_enabled = (
+            os.environ.get("TARGETED_RESIDUAL_ASR_ENABLED", "0")
             .strip().lower() in _TRUE
         )
         slow_speed = min(
@@ -793,37 +998,73 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         priority = {
             "voiced_gap": 0, "uncovered_asr": 1,
             "independent_uncovered_asr": 1,
+            "acoustic_cardinality_disagreement": 1,
             "live_lexical_unverified": 2,
             "live_structural_disagreement": 2,
             "independent_text_mismatch": 3, "text_mismatch": 4,
         }
+        from quality_windows import parent_coverage, tile_unsafe_windows
+        already_tiled = all(
+            isinstance(item, dict) and item.get("parent_window_id")
+            for item in windows
+        )
+        if already_tiled:
+            prepared_windows = list(windows)
+        else:
+            from pipeline import _ffprobe_duration
+            audio_duration = _ffprobe_duration(audio_path)
+            if audio_duration is None or float(audio_duration) <= 0:
+                # Unit callers and legacy integrations may provide an opaque
+                # path that cannot be probed.  Fail closed on context rather
+                # than skipping all analysis: the requested parent end is the
+                # largest safe media bound we can attest, so no tile can read
+                # beyond it.
+                audio_duration = max(
+                    (_f(item.get("end")) for item in windows
+                     if isinstance(item, dict)),
+                    default=0.0,
+                )
+                if audio_duration <= 0:
+                    stats["declined"].append("source_audio_duration_unavailable")
+                    return result, stats
+                stats["audio_duration_inferred_from_windows"] = True
+            prepared_windows = tile_unsafe_windows(
+                list(windows), core_seconds=min(24.0, max(1.0, max_clip_s - 6.0)),
+                context_seconds=3.0,
+                audio_duration=float(audio_duration),
+            )
+        stats["windows_considered"] = len(prepared_windows)
+        stats["windows_tiled"] = max(0, len(prepared_windows) - len(windows))
+        stats["windows_truncated"] = sum(
+            bool(item.get("analysis_truncated"))
+            for item in prepared_windows
+        )
         ordered_windows = sorted(
-            windows,
+            prepared_windows,
             key=lambda item: min(
                 (priority.get(reason, 9) for reason in (item.get("reasons") or [])),
                 default=9,
             ),
         )
+        processed_tile_ids: set[str] = set()
         for window in ordered_windows[:max_windows]:
             if time.monotonic() - started_at >= hard_deadline_s:
                 stats["declined"].append("stage_deadline")
                 break
             start, end = _f(window.get("start")), _f(window.get("end"))
             reasons = set(window.get("reasons") or [])
-            needs_gemini = bool(
-                gemini_enabled
-                and "live_structural_disagreement" in reasons
-            )
-            duration = min(max_clip_s, max(0.0, end - start))
+            duration = max(0.0, end - start)
             if end - start > max_clip_s:
-                stats["truncated_windows"] += 1
-                stats["declined"].append("window_truncated")
-            slow_duration = duration / slow_speed if slow_enabled else 0.0
-            gemini_duration = duration if needs_gemini else 0.0
-            window_cost = 2 * duration + slow_duration + gemini_duration
-            if duration <= 0 or stats["audio_seconds_billed"] + window_cost > max_billed_s:
+                stats["declined"].append("invalid_unbounded_tile")
+                continue
+            # Stage 1 is stem+mix. Auxiliary views are purchased only after
+            # observing actual uncertainty; their hypothetical combined cost
+            # can no longer reject the whole window before the first call.
+            base_cost = 2 * duration
+            if duration <= 0 or stats["audio_seconds_billed"] + base_cost > max_billed_s:
                 stats["declined"].append("cost_budget")
-                break
+                stats["declined"].append("cost_budget_base_views")
+                continue
             stats["asr_calls"] += 1
             stats["provider_attempts"] += 1
             stats["submitted_audio_seconds"] = round(
@@ -838,39 +1079,6 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                 stats["openai_asr_seconds_billed"] + duration, 2
             )
             stem_words = transcribe_fn(stem_path, start, duration, language or None, job_id or None)
-            slowed_words = []
-            if slow_enabled:
-                stats["asr_calls"] += 1
-                stats["provider_attempts"] += 1
-                stats["slowed_asr_calls"] += 1
-                stats["submitted_audio_seconds"] = round(
-                    stats["submitted_audio_seconds"] + slow_duration, 2
-                )
-                try:
-                    slowed_words = _transcribe_slowed_window(
-                        stem_path, start, duration, slow_speed,
-                        language, job_id, transcribe_fn,
-                    )
-                    stats["slowed_audio_seconds"] = round(
-                        stats["slowed_audio_seconds"] + slow_duration, 2
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "[TARGETED-CONSENSUS] slowed stem declined: %r job=%s",
-                        exc, job_id,
-                    )
-                    stats["declined"].append(
-                        f"slowed_exception:{type(exc).__name__}"
-                    )
-                finally:
-                    # Conservative accounting: once the variant is submitted,
-                    # count its full clip even if the provider returns no words.
-                    stats["audio_seconds_billed"] = round(
-                        stats["audio_seconds_billed"] + slow_duration, 2
-                    )
-                    stats["openai_asr_seconds_billed"] = round(
-                        stats["openai_asr_seconds_billed"] + slow_duration, 2
-                    )
             if time.monotonic() - started_at >= hard_deadline_s:
                 stats["declined"].append("stage_deadline_after_stem")
                 break
@@ -886,35 +1094,133 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                 stats["openai_asr_seconds_billed"] + duration, 2
             )
             mix_words = transcribe_fn(audio_path, start, duration, language or None, job_id or None)
+            normalized_stem = _norm(_text(stem_words))
+            normalized_mix = _norm(_text(mix_words))
+            structural_uncertainty = bool(reasons & {
+                "live_structural_disagreement",
+                "acoustic_cardinality_disagreement",
+                "voiced_gap",
+            })
+            text_uncertainty = not normalized_stem or not normalized_mix or (
+                _similarity(normalized_stem, normalized_mix) < .62
+            )
+
+            residual_words = []
+            needs_residual = bool(
+                residual_enabled
+                and window.get("acoustic_crowd_evidence")
+                and (structural_uncertainty or text_uncertainty)
+            )
+            if needs_residual:
+                if stats["audio_seconds_billed"] + duration <= max_billed_s:
+                    stats["asr_calls"] += 1
+                    stats["provider_attempts"] += 1
+                    stats["residual_asr_calls"] += 1
+                    stats["submitted_audio_seconds"] = round(
+                        stats["submitted_audio_seconds"] + duration, 2
+                    )
+                    try:
+                        residual_words = _transcribe_residual_window(
+                            audio_path, stem_path, start, duration,
+                            language, job_id, transcribe_fn,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[TARGETED-CONSENSUS] residual declined "
+                            "error_type=%s job=%s",
+                            _safe_error_type(exc), job_id,
+                        )
+                        stats["declined"].append(
+                            f"residual_exception:{_safe_error_type(exc)}"
+                        )
+                    finally:
+                        stats["audio_seconds_billed"] = round(
+                            stats["audio_seconds_billed"] + duration, 2
+                        )
+                        stats["openai_asr_seconds_billed"] = round(
+                            stats["openai_asr_seconds_billed"] + duration, 2
+                        )
+                        stats["residual_audio_seconds"] = round(
+                            stats["residual_audio_seconds"] + duration, 2
+                        )
+                else:
+                    stats["declined"].append("cost_budget_residual_view")
+
+            slowed_words = []
+            slow_duration = duration / slow_speed
+            needs_slow = slow_enabled and (structural_uncertainty or text_uncertainty)
+            if needs_slow:
+                if stats["audio_seconds_billed"] + slow_duration <= max_billed_s:
+                    stats["asr_calls"] += 1
+                    stats["provider_attempts"] += 1
+                    stats["slowed_asr_calls"] += 1
+                    stats["submitted_audio_seconds"] = round(
+                        stats["submitted_audio_seconds"] + slow_duration, 2
+                    )
+                    try:
+                        slowed_words = _transcribe_slowed_window(
+                            stem_path, start, duration, slow_speed,
+                            language, job_id, transcribe_fn,
+                        )
+                        stats["slowed_audio_seconds"] = round(
+                            stats["slowed_audio_seconds"] + slow_duration, 2
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[TARGETED-CONSENSUS] slowed stem declined "
+                            "error_type=%s job=%s",
+                            _safe_error_type(exc), job_id,
+                        )
+                        stats["declined"].append(
+                            f"slowed_exception:{_safe_error_type(exc)}"
+                        )
+                    finally:
+                        stats["audio_seconds_billed"] = round(
+                            stats["audio_seconds_billed"] + slow_duration, 2
+                        )
+                        stats["openai_asr_seconds_billed"] = round(
+                            stats["openai_asr_seconds_billed"] + slow_duration, 2
+                        )
+                else:
+                    stats["declined"].append("cost_budget_slow_view")
+
             gemini_events = []
+            needs_gemini = bool(
+                gemini_enabled and (structural_uncertainty or text_uncertainty)
+            )
             if needs_gemini:
-                stats["provider_attempts"] += 1
-                stats["gemini_calls"] += 1
-                stats["submitted_audio_seconds"] = round(
-                    stats["submitted_audio_seconds"] + duration, 2
-                )
-                try:
-                    gemini_events = gemini_fn(
-                        audio_path, start, duration, language or None, job_id,
-                    ) or []
-                except Exception as exc:
-                    logger.warning(
-                        "[TARGETED-GEMINI] wrapper declined: %r job=%s",
-                        exc, job_id,
+                if stats["audio_seconds_billed"] + duration <= max_billed_s:
+                    stats["provider_attempts"] += 1
+                    stats["gemini_calls"] += 1
+                    stats["submitted_audio_seconds"] = round(
+                        stats["submitted_audio_seconds"] + duration, 2
                     )
-                    stats["declined"].append(
-                        f"gemini_exception:{type(exc).__name__}"
-                    )
-                finally:
-                    stats["audio_seconds_billed"] = round(
-                        stats["audio_seconds_billed"] + duration, 2
-                    )
-                    stats["gemini_audio_seconds"] = round(
-                        stats["gemini_audio_seconds"] + duration, 2
-                    )
+                    try:
+                        gemini_events = gemini_fn(
+                            audio_path, start, duration, language or None, job_id,
+                        ) or []
+                    except Exception as exc:
+                        logger.warning(
+                            "[TARGETED-GEMINI] wrapper declined "
+                            "error_type=%s job=%s",
+                            _safe_error_type(exc), job_id,
+                        )
+                        stats["declined"].append(
+                            f"gemini_exception:{_safe_error_type(exc)}"
+                        )
+                    finally:
+                        stats["audio_seconds_billed"] = round(
+                            stats["audio_seconds_billed"] + duration, 2
+                        )
+                        stats["gemini_audio_seconds"] = round(
+                            stats["gemini_audio_seconds"] + duration, 2
+                        )
+                else:
+                    stats["declined"].append("cost_budget_gemini_view")
             streams_for_log = {
                 "stem": _text(stem_words), "slow": _text(slowed_words),
                 "mix": _text(mix_words),
+                "residual": _text(residual_words),
                 "primary": _text(_words_in(primary, start, end, pad=0.6)),
                 "witness": _text(_words_in(
                     independent_witness, start, end, pad=0.6,
@@ -931,15 +1237,39 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                 job_id,
             )
             stats["windows_processed"] += 1
+            processed_tile_ids.add(str(window.get("id") or ""))
 
             if (
-                "live_structural_disagreement" in reasons
-                and needs_gemini
+                reasons.intersection({
+                    "live_structural_disagreement",
+                    "acoustic_cardinality_disagreement",
+                })
+                and bool(gemini_events)
                 and (slow_enabled or structural_hybrid_enabled)
             ):
+                structural_segments = segments
+                if (
+                    "acoustic_cardinality_disagreement" in reasons
+                    and not any(
+                        isinstance(item, dict)
+                        and item.get("live_structural_suggestion")
+                        and _f(item.get("end")) >= start
+                        and _f(item.get("start")) <= end
+                        for item in segments
+                    )
+                ):
+                    structural_segments = []
+                    for item in segments:
+                        candidate = dict(item)
+                        if (_f(candidate.get("end")) >= start
+                                and _f(candidate.get("start")) <= end):
+                            candidate["live_structural_suggestion"] = str(
+                                candidate.get("text") or ""
+                            )
+                        structural_segments.append(candidate)
                 repaired, repair_stats = _repair_structural_repetition(
-                    segments, slowed_words, gemini_events,
-                    list(primary) + list(mix_words),
+                    structural_segments, slowed_words, gemini_events,
+                    list(primary) + list(mix_words) + list(residual_words),
                     window_start=start, window_end=start + duration,
                     enforce=(
                         allow_insertions and structural_autorepair_enabled
@@ -1032,6 +1362,30 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                     )
                 if repair_stats.get("suggested"):
                     stats["lines_suggested"] += repair_stats.get("events", 0)
+                    proposed = [
+                        dict(item) for item in (
+                            repair_stats.get("hybrid_suggestion") or []
+                        ) if isinstance(item, dict)
+                    ]
+                    if proposed:
+                        current = [
+                            dict(item) for item in segments
+                            if _f(item.get("end")) >= start
+                            and _f(item.get("start")) <= end
+                        ]
+                        stats["quality_proposal_windows"].append(
+                            _proposal_candidate_payload(
+                            candidate_id=str(window.get("id") or ""),
+                            parent_window_id=str(
+                                window.get("parent_window_id")
+                                or window.get("id") or ""
+                            ),
+                            start=start, end=end, reasons=reasons,
+                            current_segments=current,
+                            proposed_segments=proposed,
+                            source="performance_graph_content_lattice",
+                            calibrated_evidence=repair_stats.get("hybrid"),
+                        ))
                 if repair_stats.get("applied"):
                     removed = int(repair_stats.get("targets_removed") or 0)
                     events = int(repair_stats.get("events") or 0)
@@ -1056,6 +1410,7 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                 sloww = _words_in(slowed_words, a, b)
                 agreed, evidence = choose_consensus(
                     sw, mw, pw, slowed_words=sloww, witness_words=iw,
+                    stream_families=stream_families,
                 )
                 if not agreed or not _safe_line(agreed):
                     continue
@@ -1072,6 +1427,22 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                 current["review"] = True
                 current["consensus_sources"] = evidence.get("sources", [])
                 stats["lines_suggested"] += 1
+                stats["quality_proposal_windows"].append(
+                    _proposal_candidate_payload(
+                        candidate_id=str(window.get("id") or ""),
+                        parent_window_id=str(
+                            window.get("parent_window_id")
+                            or window.get("id") or ""
+                        ),
+                        start=start, end=end, reasons=reasons,
+                        current_segments=[dict(current)],
+                        proposed_segments=[{
+                            **dict(current), "text": candidate,
+                            "review": True,
+                        }],
+                        source="progressive_asr_consensus",
+                        calibrated_evidence=evidence,
+                    ))
 
             # No target index means a genuine uncovered/voiced gap.  Insert
             # only stem lines independently corroborated by the mix.
@@ -1108,6 +1479,7 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                         mix_group, primary_group,
                         slowed_words=group if is_slow_group else slow_group,
                         witness_words=witness_group,
+                        stream_families=stream_families,
                     )
                     if not agreed:
                         continue
@@ -1144,6 +1516,13 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                     })
                     stats["lines_inserted"] += 1
 
+        stats["parent_coverage"] = parent_coverage(
+            prepared_windows, processed_tile_ids,
+        )
+        stats["parent_windows_incomplete"] = sum(
+            not item.get("complete")
+            for item in stats["parent_coverage"].values()
+        )
         asr_rate = max(0.0, _env_float(
             "QUALITY_OPENAI_ASR_USD_PER_MINUTE",
             _env_float("QUALITY_ASR_USD_PER_MINUTE", 0.0),
@@ -1174,8 +1553,11 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         output.setdefault("postpass_stats", {})["targeted_consensus"] = stats
         return output, stats
     except Exception as exc:  # never break the transcription cascade
-        logger.warning("[TARGETED-CONSENSUS] declined: %r job=%s", exc, job_id)
-        stats["declined"].append(f"exception:{type(exc).__name__}")
+        logger.warning(
+            "[TARGETED-CONSENSUS] declined error_type=%s job=%s",
+            _safe_error_type(exc), job_id,
+        )
+        stats["declined"].append(f"exception:{_safe_error_type(exc)}")
         return result, stats
     finally:
         if owned_stem:

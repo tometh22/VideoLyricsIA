@@ -346,6 +346,16 @@ def _safe_filename(filename: str) -> str:
     return cleaned[:200]
 
 
+def _safe_key_component(value: str) -> str:
+    """Sanitize an identity component without basename semantics.
+
+    Tenant and job identifiers are not filenames. Applying ``basename`` to
+    them would make ``tenant/a`` and ``a`` collide at the same object prefix.
+    """
+    cleaned = _KEY_SAFE.sub("_", str(value or "")).strip(".")
+    return (cleaned or "unknown")[:200]
+
+
 def _object_key(tenant_id: str, job_id: str, filename: str) -> str:
     return f"{_safe_filename(tenant_id)}/{_safe_filename(job_id)}/{_safe_filename(filename)}"
 
@@ -356,6 +366,19 @@ def _input_object_key(tenant_id: str, job_id: str, filename: str) -> str:
     return (
         f"inputs/{_safe_filename(tenant_id)}"
         f"/{_safe_filename(job_id)}/{_safe_filename(filename)}"
+    )
+
+
+def content_addressed_input_key(
+    tenant_id: str, job_id: str, audio_sha256: str, filename: str,
+) -> str:
+    """Immutable source-audio key bound to a validated SHA-256 identity."""
+    digest = str(audio_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("audio_sha256 must be a lowercase SHA-256 digest")
+    return (
+        f"inputs/{_safe_key_component(tenant_id)}/{_safe_key_component(job_id)}"
+        f"/sha256/{digest}/{_safe_filename(filename)}"
     )
 
 
@@ -428,6 +451,19 @@ def object_exists(key: str) -> bool:
     miss, so we degrade gracefully instead of propagating transient errors.
     """
     return object_status(key) == "exists"
+
+
+def object_etag(key: str) -> str | None:
+    """Return the normalized object ETag, or None when unavailable."""
+    client = _get_client()
+    if client is None or not key:
+        return None
+    try:
+        value = client.head_object(Bucket=R2_BUCKET, Key=key).get("ETag")
+        return str(value or "").strip().strip('"') or None
+    except Exception as exc:
+        logger.warning("[R2] ETag unavailable key=%r: %s", key, exc)
+        return None
 
 
 def upload_file(local_path: str, key: str) -> Optional[str]:
