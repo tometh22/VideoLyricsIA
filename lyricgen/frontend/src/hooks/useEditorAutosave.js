@@ -2,6 +2,9 @@ import { useCallback, useEffect, useRef } from "react";
 
 export function useEditorAutosave({ enabled, segments, dirty, blocked, save, reconcile, onStatus, onMerged }) {
   const MAX_REBASE_ATTEMPTS = 3;
+  // Tope de reintentos cuando el reconcile falla de forma persistente, para que
+  // el backoff no encadene timers indefinidamente.
+  const MAX_RECONCILE_RETRIES = 3;
   const segmentsRef = useRef(segments);
   const runtimeRef = useRef({ enabled, blocked, save, reconcile, onStatus, onMerged });
   const mountedRef = useRef(false);
@@ -48,16 +51,21 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
           return state;
         }
         runtimeRef.current.onStatus?.("error", "server", { checkpoint, result: state });
-        // Without this the retry chain died silently here: the reconcile
-        // failed, no timer was armed, and autosave stayed dead until the
-        // operator happened to edit again.
-        const reconcileDelay = Math.min(30_000, 1_000 * (2 ** retryCountRef.current));
-        retryCountRef.current += 1;
-        if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
-        retryTimerRef.current = window.setTimeout(() => {
-          retryTimerRef.current = null;
-          runSave(checkpoint, true);
-        }, reconcileDelay + Math.random() * 250);
+        // Antes la cadena moría en silencio acá: el reconcile fallaba, no se
+        // armaba ningún timer, y el autosave quedaba muerto hasta que el
+        // operador volviera a editar. Se reintenta con backoff, pero ACOTADO:
+        // un reconcile que falla de forma persistente (endpoint caído, job
+        // borrado) no debe generar una cadena infinita de timers. Agotado el
+        // tope, el próximo cambio del operador rearma el ciclo normal.
+        if (retryCountRef.current < MAX_RECONCILE_RETRIES) {
+          const reconcileDelay = Math.min(30_000, 1_000 * (2 ** retryCountRef.current));
+          retryCountRef.current += 1;
+          if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
+          retryTimerRef.current = window.setTimeout(() => {
+            retryTimerRef.current = null;
+            runSave(checkpoint, true);
+          }, reconcileDelay + Math.random() * 250);
+        }
         return { ...state, reason: "server" };
       }
       if (Array.isArray(state?.mergedSegments)) {
