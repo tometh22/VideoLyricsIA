@@ -1194,19 +1194,45 @@ export default function LyricsEditor({
     return () => window.removeEventListener("beforeunload", handler);
   }, [isDirty, disableBeforeUnload]);
 
+  // Rachas de fallo de autosave: se emite telemetría sólo en el PRIMER fallo
+  // de cada racha, para que el contador deje de medir reintentos del backoff.
+  const autosaveFailStreakRef = useRef(0);
+
   const handleDurableStatus = useCallback((status, reason, metadata = {}) => {
     setSaveStatus(status);
     setSaveErrorReason(reason);
     if (status === "conflict") setDurableConflict(true);
     if (status === "saved") {
+      autosaveFailStreakRef.current = 0;
       trackEditorEvent("editor_autosave_success", {
         duration_ms: Math.round(metadata.durationMs || 0),
         checkpoint: metadata.checkpoint || "draft",
       });
     } else if (["offline", "error"].includes(status)) {
-      trackEditorEvent("editor_autosave_failed", {
+      // El backoff reintenta hasta cada 30 s y ANTES cada tick emitía otro
+      // evento sin `retry_count`: un solo editor atascado inflaba el contador
+      // indefinidamente, así que `autosave_failures` medía intentos, no
+      // trabajo afectado. Ahora se emite UNA vez por racha y el reintento
+      // viaja como `retry_count` (el allowlist del backend ya lo acepta).
+      const streak = autosaveFailStreakRef.current;
+      autosaveFailStreakRef.current = streak + 1;
+      if (streak === 0) {
+        trackEditorEvent("editor_autosave_failed", {
+          checkpoint: metadata.checkpoint || "draft",
+          reason: reason || status,
+          retry_count: 0,
+        });
+      }
+    }
+    if (status === "conflict") {
+      autosaveFailStreakRef.current = 0;
+      // El fallo MÁS grave (el que deja al operador trabado) no se contaba:
+      // `editor_conflict` estaba en el allowlist pero se había quedado sin
+      // emisor, así que la métrica eran fósiles. Sin esto no se puede medir si
+      // los conflictos falsos efectivamente desaparecen.
+      trackEditorEvent("editor_conflict", {
         checkpoint: metadata.checkpoint || "draft",
-        reason: reason || status,
+        reason: reason || "conflict",
       });
     }
     if (status === "saved" && draftKey) {

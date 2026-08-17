@@ -12016,6 +12016,13 @@ _PRODUCT_EVENT_NAMES = {
     "editor_help_opened",
 }
 
+# Ventana de /admin/product-metrics. Sin esto la única acotación era
+# `LIMIT 10000` sobre TODA la tabla, así que el período medido dependía del
+# volumen de telemetría y era imposible comparar dos lecturas entre sí.
+PRODUCT_METRICS_WINDOW_DAYS = int(
+    os.environ.get("PRODUCT_METRICS_WINDOW_DAYS", "28")
+)
+
 _PRODUCT_EVENT_PROPERTIES = {
     "editor_opened": {"line_count", "view", "source"},
     "editor_view_changed": {"from", "to"},
@@ -12118,11 +12125,27 @@ async def product_metrics(
 ):
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
-    query = db.query(ProductEvent)
+    # Ventana temporal explícita + filtro por nombre. Antes esto tomaba las
+    # 10.000 filas más recientes SIN filtrar: `editor_activity_heartbeat` se
+    # emite cada 15 s por editor abierto (4/min) y `transcription_quality_
+    # shadow_decision` lo escribe el worker, así que ambos —que no son eventos
+    # del editor y ni siquiera están en el allowlist— consumían el cupo y
+    # contaminaban `sample_size`, `counts` y el cálculo de sesiones. El
+    # resultado era una ventana temporal desconocida y variable.
+    _window_start = datetime.utcnow() - timedelta(days=PRODUCT_METRICS_WINDOW_DAYS)
+    query = (
+        db.query(ProductEvent)
+        .filter(ProductEvent.created_at >= _window_start)
+        .filter(ProductEvent.name.in_(_PRODUCT_EVENT_NAMES))
+    )
     if not current_user.get("is_super_admin"):
         query = query.filter(ProductEvent.tenant_id == current_user["tenant_id"])
     rows = query.order_by(ProductEvent.created_at.desc()).limit(10000).all()
-    approval_query = db.query(ProductEvent).filter(ProductEvent.name == "editor_approved")
+    approval_query = (
+        db.query(ProductEvent)
+        .filter(ProductEvent.name == "editor_approved")
+        .filter(ProductEvent.created_at >= _window_start)
+    )
     if not current_user.get("is_super_admin"):
         approval_query = approval_query.filter(
             ProductEvent.tenant_id == current_user["tenant_id"]
