@@ -1457,3 +1457,52 @@ def test_seis_escenas_concurrentes_reservan_exactamente_cinco(db, monkeypatch):
         db.query(Job).filter(Job.job_id == job_id).delete()
         db.query(User).filter(User.username == "atomic-budget-user").delete()
         db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Longitud de clip Veo configurable (VEO_CLIP_SECONDS) — control de COSTO.
+# Veo factura por segundo de video generado; el loop palindrome rellena la
+# canción entera desde ese clip nativo, así que 4s cuesta ~50% de 8s.
+# ---------------------------------------------------------------------------
+
+import importlib
+
+
+def _veo_cost(module, model="veo-3.1-fast-generate-001"):
+    return module.COST_PER_CALL[(model, "google_vertex")]
+
+
+def test_costo_veo_default_8s_preserva_los_numeros_historicos(monkeypatch):
+    monkeypatch.delenv("VEO_CLIP_SECONDS", raising=False)
+    import provenance as _p
+    reloaded = importlib.reload(_p)
+    try:
+        assert _veo_cost(reloaded) == 0.80
+        assert _veo_cost(reloaded, "veo-3.1-generate-001") == 3.20
+        assert _veo_cost(reloaded, "veo-2.0-generate-001") == 4.00
+    finally:
+        monkeypatch.delenv("VEO_CLIP_SECONDS", raising=False)
+        importlib.reload(reloaded)
+
+
+def test_costo_veo_a_4s_baja_a_la_mitad(monkeypatch):
+    monkeypatch.setenv("VEO_CLIP_SECONDS", "4")
+    import provenance as _p
+    reloaded = importlib.reload(_p)
+    try:
+        assert _veo_cost(reloaded) == 0.40
+        assert _veo_cost(reloaded, "veo-3.1-generate-001") == 1.60
+    finally:
+        monkeypatch.delenv("VEO_CLIP_SECONDS", raising=False)
+        importlib.reload(reloaded)
+
+
+def test_costo_veo_valor_invalido_cae_a_8s(monkeypatch):
+    monkeypatch.setenv("VEO_CLIP_SECONDS", "basura")
+    import provenance as _p
+    reloaded = importlib.reload(_p)
+    try:
+        assert _veo_cost(reloaded) == 0.80
+    finally:
+        monkeypatch.delenv("VEO_CLIP_SECONDS", raising=False)
+        importlib.reload(reloaded)

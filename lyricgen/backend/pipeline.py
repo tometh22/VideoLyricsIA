@@ -10614,6 +10614,32 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         "sampleCount": 1,
         "generateAudio": False,
     }
+    # Veo bills per second of generated video. The palindrome loop
+    # (_prerender_looped_bg) fills the whole song from this native clip, so a
+    # shorter native clip costs proportionally less (~50% at 4s vs 8s); the only
+    # visual effect is a shorter cycle before the loop repeats. Opt-in via
+    # VEO_CLIP_SECONDS — unset keeps Veo's native 8s default so deploying this
+    # is behaviorally inert until enabled + QA'd. Only provider-supported
+    # lengths are forwarded so an out-of-range value can never make Vertex
+    # reject the request. Keep provenance._VEO_CLIP_SECONDS in sync for the
+    # cost dashboard.
+    _veo_clip_seconds_raw = os.environ.get("VEO_CLIP_SECONDS", "").strip()
+    if _veo_clip_seconds_raw:
+        try:
+            _veo_clip_seconds = int(float(_veo_clip_seconds_raw))
+        except ValueError:
+            _veo_clip_seconds = 0
+        if _veo_clip_seconds in (4, 6, 8):
+            veo_params["durationSeconds"] = _veo_clip_seconds
+            logger.info(
+                "[BG] Veo clip length = %ss (VEO_CLIP_SECONDS)", _veo_clip_seconds
+            )
+        else:
+            logger.warning(
+                "[BG] Ignoring VEO_CLIP_SECONDS=%r — not a supported Veo clip "
+                "length (4, 6, 8); using provider default.",
+                _veo_clip_seconds_raw,
+            )
     try:
         blur_sigma = float(os.environ.get("BG_BLUR_SIGMA", "1.0"))
     except ValueError:
