@@ -96,7 +96,7 @@ def build_ledger(event_rows: list[Any], reviews: dict[str, dict], *,
             continue
         identity = decision_identity(
             properties.get("job_id"), properties.get("revision"),
-            properties.get("segments_hash"),
+            properties.get("segments_fingerprint"),
             properties.get("pipeline_release"),
             properties.get("pipeline_config_fingerprint"),
         )
@@ -114,7 +114,12 @@ def build_ledger(event_rows: list[Any], reviews: dict[str, dict], *,
         if occurred is None:
             raise ValueError(f"missing timestamp in terminal decision: {decision_id}")
         if review is not None:
-            if review.get("snapshot_sha256") != identity["segments_hash"]:
+            from evidence_contracts import privacy_fingerprint
+            review_snapshot = privacy_fingerprint(
+                "shadow-segments-snapshot",
+                str(review.get("snapshot_sha256") or ""),
+            )
+            if review_snapshot != identity["segments_fingerprint"]:
                 raise ValueError(f"review snapshot mismatch: {decision_id}")
             reviewed_at = datetime.fromisoformat(
                 str(review["reviewed_at"]).replace("Z", "+00:00")

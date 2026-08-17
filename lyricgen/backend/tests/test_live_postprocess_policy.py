@@ -247,7 +247,7 @@ def test_divergent_llm_branch_is_bound_to_shared_mutation_gate():
     assert "_is_divergent\n                                and _quality_mutation_authorized(job_id)" in branch
 
 
-def test_final_credit_filter_preserves_unverified_cc_text_and_sung_repetition():
+def test_final_credit_filter_excludes_metadata_and_spoken_tail():
     source = {"segments": [
         {"start": 79.0, "end": 83.0, "text": "No no no no no no no no"},
         {"start": 95.0, "end": 104.0,
@@ -257,9 +257,7 @@ def test_final_credit_filter_preserves_unverified_cc_text_and_sung_repetition():
     out = transcription_worker._drop_final_credit_hallucinations(source, "job")
     assert [segment["text"] for segment in out["segments"]] == [
         "No no no no no no no no",
-        "CC por Antarctica Films Argentina.",
-        "¡Gracias!",
     ]
     assert (out.get("postpass_stats") or {}).get(
         "final_credit_filter", {"dropped": 0},
-    ) == {"dropped": 0}
+    ) == {"dropped": 2}

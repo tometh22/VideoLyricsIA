@@ -11,6 +11,8 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
+from evidence_contracts import privacy_fingerprint
+
 
 EVENT_NAME = "transcription_quality_shadow_decision"
 
@@ -19,9 +21,14 @@ def decision_identity(job_id: str, revision: int, segments_hash: str,
                       pipeline_release: str,
                       pipeline_config_fingerprint: str) -> dict:
     """Canonical rollout unit: one immutable lyric snapshot per candidate."""
+    supplied = str(segments_hash or "")
+    segments_fingerprint = (
+        supplied if supplied.startswith("hmac-sha256:v1:")
+        else privacy_fingerprint("shadow-segments-snapshot", supplied)
+    )
     return {
         "job_id": str(job_id or ""), "revision": int(revision or 0),
-        "segments_hash": str(segments_hash or ""),
+        "segments_fingerprint": segments_fingerprint,
         "pipeline_release": str(pipeline_release or "unknown")[:64],
         "pipeline_config_fingerprint": str(
             pipeline_config_fingerprint or "unknown"
@@ -53,7 +60,10 @@ def build_shadow_event(job: Any, quality: dict, *,
     properties = {
         **identity,
         "decision_id": decision_id(identity),
-        "quality_fingerprint": str(quality.get("quality_fingerprint") or ""),
+        "quality_fingerprint": privacy_fingerprint(
+            "shadow-quality-decision",
+            str(quality.get("quality_fingerprint") or ""),
+        ),
         "policy_version": str(quality.get("policy_version") or "unknown")[:64],
         "evaluation_stage": (
             evaluation_stage if evaluation_stage in {"initial", "terminal"}

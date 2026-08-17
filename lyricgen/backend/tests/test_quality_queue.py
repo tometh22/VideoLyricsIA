@@ -1,7 +1,20 @@
+import inspect
+
 import pytest
 import rq
 
 import queue_jobs
+
+
+def test_quality_queue_marker_logs_never_include_exception_messages():
+    pending = inspect.getsource(queue_jobs._mark_transcription_quality_pending)
+    failed = inspect.getsource(
+        queue_jobs._mark_transcription_quality_enqueue_failed,
+    )
+    assert "job_id, exc" not in pending
+    assert "job_id, exc" not in failed
+    assert "type(exc).__name__" in pending
+    assert "type(exc).__name__" in failed
 
 
 def test_quality_queue_is_fail_safe_disabled_by_default(monkeypatch):
@@ -56,6 +69,10 @@ def _quality_queue_ready(monkeypatch):
     monkeypatch.setattr(queue_jobs, "_redis", object())
     monkeypatch.setattr(queue_jobs, "_active_rq_job", lambda *_args: None)
     monkeypatch.setattr(queue_jobs, "_evict_stale_rq_job", lambda *_args: None)
+    monkeypatch.setattr(
+        queue_jobs, "_transcription_quality_runtime_token",
+        lambda: "v6runtime0000000",
+    )
 
 
 def test_quality_queue_marks_snapshot_before_publish(monkeypatch):
@@ -63,7 +80,7 @@ def test_quality_queue_marks_snapshot_before_publish(monkeypatch):
     events = []
     monkeypatch.setattr(
         queue_jobs, "_mark_transcription_quality_pending",
-        lambda *_args: events.append("pending") or True,
+        lambda *_args, **_kwargs: events.append("pending") or True,
     )
 
     class FakeQueue:
@@ -77,20 +94,36 @@ def test_quality_queue_marks_snapshot_before_publish(monkeypatch):
     monkeypatch.setattr(rq, "Queue", FakeQueue)
     result = queue_jobs.enqueue_transcription_quality(
         "snapshot", expected_revision=4, expected_segments_hash="a" * 64,
+        expected_audio_revision=3, expected_audio_sha256="c" * 64,
     )
-    assert result.startswith("transcription-quality:snapshot:4:")
+    assert result == queue_jobs._transcription_quality_attempt_id(
+        "snapshot", expected_revision=4, expected_segments_hash="a" * 64,
+        expected_audio_revision=3, expected_audio_sha256="c" * 64,
+        runtime_token="v6runtime0000000",
+    )
+    assert len(result) <= 160
     assert events == ["pending", "published"]
+
+
+def test_quality_queue_fails_closed_without_authoritative_audio_identity(monkeypatch):
+    _quality_queue_ready(monkeypatch)
+    result = queue_jobs.enqueue_transcription_quality(
+        "legacy", expected_revision=1, expected_segments_hash="a" * 64,
+        expected_audio_revision=0, expected_audio_sha256="",
+    )
+    assert result == "identity-missing:transcription-quality:legacy"
 
 
 def test_quality_queue_publication_failure_marks_retry_failed(monkeypatch):
     _quality_queue_ready(monkeypatch)
     failures = []
     monkeypatch.setattr(
-        queue_jobs, "_mark_transcription_quality_pending", lambda *_args: True,
+        queue_jobs, "_mark_transcription_quality_pending",
+        lambda *_args, **_kwargs: True,
     )
     monkeypatch.setattr(
         queue_jobs, "_mark_transcription_quality_enqueue_failed",
-        lambda *args: failures.append(args) or True,
+        lambda *args, **kwargs: failures.append((args, kwargs)) or True,
     )
 
     class FailingQueue:
@@ -105,5 +138,10 @@ def test_quality_queue_publication_failure_marks_retry_failed(monkeypatch):
         queue_jobs.enqueue_transcription_quality(
             "snapshot", expected_revision=4,
             expected_segments_hash="b" * 64,
+            expected_audio_revision=5, expected_audio_sha256="d" * 64,
         )
-    assert failures and failures[0][-1] == "ConnectionError"
+    assert failures and failures[0][0][-1] == "ConnectionError"
+    assert failures[0][1] == {
+        "expected_audio_revision": 5,
+        "expected_audio_sha256": "d" * 64,
+    }
