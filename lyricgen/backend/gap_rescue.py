@@ -280,16 +280,28 @@ def _texto_sospechoso(texto: str) -> bool:
 
 
 def _vad_regions(stem_path: str | None) -> list[tuple]:
-    """Regiones de voz del stem (energy-VAD de anchor_align). [] si no hay
-    stem o librosa: en ese caso el gate de VAD no aplica (permisivo, como
-    antes) — nunca bloquea por falta de evidencia."""
-    if not stem_path:
-        return []
+    """Compatibility accessor. Prefer ``_vad_evidence`` for decisions."""
+    return list(_vad_evidence(stem_path).get("regions") or [])
+
+
+def _vad_evidence(audio_path: str | None) -> dict:
+    """Return regions plus availability; silence is not analyzer failure."""
+    if not audio_path:
+        return {"available": False, "regions": [], "error_code": "missing_audio"}
     try:
         from anchor_align import vocal_regions
-        return vocal_regions(stem_path) or []
-    except Exception:
-        return []
+        regions = vocal_regions(audio_path)
+        if regions is None:
+            return {
+                "available": False, "regions": [],
+                "error_code": "analyzer_returned_none",
+            }
+        return {"available": True, "regions": list(regions), "error_code": None}
+    except Exception as exc:
+        return {
+            "available": False, "regions": [],
+            "error_code": type(exc).__name__,
+        }
 
 
 def _voiced_overlap(a: float, b: float, regs: list[tuple]) -> float:
@@ -367,13 +379,16 @@ def rescue(segments: list[dict], audio_path: str, *,
     rescate por MISMATCH: carteles largos cuyo texto no suena a su ventana
     (`audio_coverage.text_mismatches`) se re-transcriben y reemplazan."""
     stats = {"gaps": 0, "rescued_lines": 0, "skipped": [], "source": "mix",
-             "mismatch_replaced": 0}
+             "mismatch_replaced": 0, "view_disagreements": []}
     if not segments or not audio_path or not os.path.exists(audio_path):
         return list(segments or []), stats
     fuente = audio_path
     if stem_path and os.path.exists(stem_path):
         fuente, stats["source"] = stem_path, "stem"
-    regs = _vad_regions(stem_path if stats["source"] == "stem" else None)
+    stem_vad = _vad_evidence(fuente)
+    mix_vad = _vad_evidence(audio_path) if stats["source"] == "stem" else stem_vad
+    regs = list(stem_vad.get("regions") or [])
+    mix_regs = list(mix_vad.get("regions") or [])
     try:
         min_gap = _env_float("GAP_RESCUE_MIN_GAP_S", _MIN_GAP_S)
         clip_max = _env_float("GAP_RESCUE_CLIP_MAX_S", _CLIP_MAX_S)
@@ -406,7 +421,46 @@ def rescue(segments: list[dict], audio_path: str, *,
             # Gate de VAD del hueco: si el stem no canta ahí, no hay nada
             # que rescatar — es un pasaje instrumental (Hombre Lobo: el
             # outro de saxo hacía alucinar a whisper con el coro en eco).
-            if regs and _voiced_overlap(zona_a, zona_b, regs) < _VAD_MIN_VOICED_S:
+            dual_view = stats["source"] == "stem"
+            unavailable = [
+                name for name, evidence in (("stem", stem_vad), ("mix", mix_vad))
+                if not evidence.get("available")
+            ]
+            if unavailable:
+                stats["view_disagreements"].append({
+                    "start": round(zona_a, 3), "end": round(zona_b, 3),
+                    "reason": "view_unavailable", "views": unavailable,
+                    "error_codes": {
+                        name: evidence.get("error_code")
+                        for name, evidence in (("stem", stem_vad), ("mix", mix_vad))
+                        if not evidence.get("available")
+                    },
+                })
+                stats["skipped"].append((round(ini, 1), "vad_unavailable"))
+                continue
+            stem_voiced = (
+                _voiced_overlap(zona_a, zona_b, regs)
+                if dual_view or regs else None
+            )
+            mix_voiced = (
+                _voiced_overlap(zona_a, zona_b, mix_regs)
+                if dual_view or mix_regs else None
+            )
+            if stem_voiced is not None and mix_voiced is not None and (
+                (stem_voiced >= _VAD_MIN_VOICED_S)
+                != (mix_voiced >= _VAD_MIN_VOICED_S)
+            ):
+                stats["view_disagreements"].append({
+                    "start": round(zona_a, 3), "end": round(zona_b, 3),
+                    "stem_voiced_s": round(stem_voiced, 3),
+                    "mix_voiced_s": round(mix_voiced, 3),
+                })
+                stats["skipped"].append((round(ini, 1), "stem_mix_disagreement"))
+                continue
+            if dual_view and max(stem_voiced or 0.0, mix_voiced or 0.0) < _VAD_MIN_VOICED_S:
+                stats["skipped"].append((round(ini, 1), "sin_voz_vad"))
+                continue
+            if regs and (stem_voiced or 0.0) < _VAD_MIN_VOICED_S:
                 stats["skipped"].append((round(ini, 1), "sin_voz_vad"))
                 continue
             w_ini = max(0.0, zona_a - contexto)
@@ -606,9 +660,10 @@ def rescue(segments: list[dict], audio_path: str, *,
                     nuevas.extend(lineas_zona)
                     stats["mismatch_replaced"] += 1
                     logger.warning(
-                        "[GAP-RESCUE] cartel manchado %.1f-%.1fs (%r, "
-                        "ratio<%.2f) reemplazado por %d línea(s) reales",
-                        m["start"], m["end"], str(card.get("text", ""))[:32],
+                        "[GAP-RESCUE] cartel manchado %.1f-%.1fs "
+                        "(chars=%d, ratio<%.2f) reemplazado por %d línea(s)",
+                        m["start"], m["end"],
+                        len(str(card.get("text", ""))),
                         _MISMATCH_MAX_RATIO, len(lineas_zona))
 
         if not nuevas:

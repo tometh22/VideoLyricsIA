@@ -26,6 +26,33 @@ def _ctc(starts, min_score=0.7):
     }
 
 
+def test_content_attestation_requires_distinct_provider_family_consensus(monkeypatch):
+    monkeypatch.setenv("QUALITY_CONTENT_ATTESTATION_KEY", "test-signing-key")
+    mapping = {
+        "selected_candidate_id": "candidate-1",
+        "events": [
+            {"text": "Real uoh uoh", "content_source": "gemini_audio"},
+            {"text": "noooo", "content_source": "gemini_audio"},
+        ],
+    }
+    gemini_only = sh._attest_independent_content(mapping, [])
+    assert gemini_only == {
+        "verified": False, "reason": "no_distinct_family_consensus",
+    }
+    agreed = sh._attest_independent_content(mapping, [{
+        "source": "slowed_stem_whisper", "family": "openai_whisper",
+        "events": [{"text": "Real uoh uoh"}, {"text": "noooo"}],
+    }])
+    assert agreed["verified"] is True
+    assert agreed["families"] == ["gemini_audio", "openai_whisper"]
+    assert len(agreed["evidence_sha256"]) == 64
+    disagreed = sh._attest_independent_content(mapping, [{
+        "source": "slowed_stem_whisper", "family": "openai_whisper",
+        "events": [{"text": "Real uoh uoh"}, {"text": "gracias"}],
+    }])
+    assert disagreed["verified"] is False
+
+
 def test_gemini_event_tokens_collapse_into_complete_cycles():
     raw = []
     for start in (60.8, 67.0, 73.2, 79.3):

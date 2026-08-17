@@ -4,6 +4,7 @@ from pathlib import Path
 import tomllib
 
 from scripts.require_quality_worker_resources import validate_limits
+from scripts.require_quality_worker_config import connectivity_errors, validate_config
 
 
 REPO = Path(__file__).resolve().parents[3]
@@ -23,6 +24,7 @@ def test_quality_worker_is_one_process_one_replica_and_one_queue():
     start = deploy["startCommand"]
     assert "require_worker_schema.py" in start
     assert "require_quality_worker_resources.py" in start
+    assert "require_quality_worker_config.py" in start
     assert "TRANSCRIPTION_QUALITY_QUEUE_ENABLED=1" in start
     assert "TRANSCRIPTION_QUALITY_MODE=observe" in start
     # Learning kill switches come from Railway variables and default off in
@@ -49,3 +51,106 @@ def test_quality_worker_resource_gate_rejects_missing_or_oversized_limits():
     assert validate_limits(
         2, 4 * 1024**3, max_cpus=2, max_memory_bytes=4 * 1024**3,
     ) == []
+
+
+def test_quality_worker_config_gate_requires_durable_dependencies_and_isolation():
+    env = {
+        "DATABASE_URL": "postgresql://configured",
+        "REDIS_URL": "redis://queue",
+        "QUALITY_CACHE_REDIS_URL": "redis://cache",
+        "R2_ACCESS_KEY_ID": "configured",
+        "R2_SECRET_ACCESS_KEY": "configured",
+        "R2_ENDPOINT_URL": "https://configured.invalid",
+        "R2_BUCKET": "configured",
+        "QUALITY_CONTENT_ATTESTATION_KEY": "configured",
+        "QUEUES": "transcription_quality",
+        "TRANSCRIPTION_QUALITY_QUEUE_ENABLED": "1",
+        "VOCAL_SEP_ENABLED": "1",
+        "REPLICATE_API_TOKEN": "configured",
+    }
+    assert validate_config(env) == []
+    del env["R2_BUCKET"]
+    env["QUEUES"] = "transcription,transcription_quality"
+    assert validate_config(env) == ["missing_object_bucket", "queue_not_isolated"]
+
+
+def test_quality_worker_config_gate_accepts_s3_aliases():
+    env = {
+        "DATABASE_URL": "configured",
+        "REDIS_URL": "configured",
+        "QUALITY_CACHE_REDIS_URL": "configured",
+        "S3_ACCESS_KEY": "configured",
+        "S3_SECRET_KEY": "configured",
+        "S3_ENDPOINT_URL": "configured",
+        "S3_BUCKET": "configured",
+        "QUALITY_LEARNING_HMAC_KEY": "configured",
+        "QUEUES": "transcription_quality",
+        "TRANSCRIPTION_QUALITY_QUEUE_ENABLED": "true",
+        "VOCAL_SEP_ENABLED": "true",
+        "REPLICATE_API_TOKEN": "configured",
+    }
+    assert validate_config(env) == []
+
+
+def test_quality_worker_connectivity_gate_reports_each_dependency_without_secrets():
+    env = {
+        "REDIS_URL": "redis://queue-secret",
+        "QUALITY_CACHE_REDIS_URL": "redis://cache-secret",
+    }
+    calls = []
+
+    def redis_probe(url):
+        calls.append(url)
+        return "queue" in url
+
+    errors = connectivity_errors(
+        env, database_probe=lambda: False,
+        redis_probe=redis_probe, r2_probe=lambda: False,
+        replicate_probe=lambda _token: True,
+        openai_probe=lambda _token: True,
+    )
+    assert errors == [
+        "database_unreachable", "quality_cache_unreachable",
+        "object_storage_unreachable",
+    ]
+    assert calls == ["redis://queue-secret", "redis://cache-secret"]
+    assert all("secret" not in error for error in errors)
+
+
+def test_quality_worker_connectivity_checks_enabled_provider_auth_without_cost():
+    env = {
+        "REDIS_URL": "redis://queue",
+        "QUALITY_CACHE_REDIS_URL": "redis://cache",
+        "REPLICATE_API_TOKEN": "replicate-secret",
+        "OPENAI_API_KEY": "openai-secret",
+        "TARGETED_CONSENSUS_ENABLED": "1",
+    }
+    seen = []
+    errors = connectivity_errors(
+        env, database_probe=lambda: True, redis_probe=lambda _url: True,
+        r2_probe=lambda: True,
+        replicate_probe=lambda token: seen.append(("replicate", token)) or False,
+        openai_probe=lambda token: seen.append(("openai", token)) or False,
+    )
+    assert errors == [
+        "vocal_separator_provider_unreachable",
+        "targeted_asr_provider_unreachable",
+    ]
+    assert seen == [
+        ("replicate", "replicate-secret"), ("openai", "openai-secret"),
+    ]
+
+
+def test_quality_worker_config_gate_requires_provider_for_enabled_consensus():
+    env = {
+        "DATABASE_URL": "configured", "REDIS_URL": "configured",
+        "QUALITY_CACHE_REDIS_URL": "configured",
+        "R2_ACCESS_KEY_ID": "configured", "R2_SECRET_ACCESS_KEY": "configured",
+        "R2_ENDPOINT_URL": "configured", "R2_BUCKET": "configured",
+        "QUEUES": "transcription_quality",
+        "TRANSCRIPTION_QUALITY_QUEUE_ENABLED": "1",
+        "VOCAL_SEP_ENABLED": "1", "REPLICATE_API_TOKEN": "configured",
+        "QUALITY_CONTENT_ATTESTATION_KEY": "configured",
+        "TARGETED_CONSENSUS_ENABLED": "1",
+    }
+    assert validate_config(env) == ["missing_targeted_asr_provider"]

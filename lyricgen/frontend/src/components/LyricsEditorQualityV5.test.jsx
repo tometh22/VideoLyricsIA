@@ -54,6 +54,161 @@ afterEach(() => {
 });
 
 describe("LyricsEditor — revisión focalizada transcription quality v5", () => {
+  it("actualiza analysis_pending después de abrir sin pisar la edición local", async () => {
+    let resolveQuality;
+    const editorRequest = vi.fn().mockReturnValue(new Promise((resolve) => {
+      resolveQuality = resolve;
+    }));
+    const pending = {
+      ...V5_QUALITY,
+      analysis_status: "pending",
+      analysis_pending: true,
+      unsafe_windows: [{ id: "pending-outro", start: 60, end: 84, reasons: ["event_count"] }],
+    };
+    render(<LyricsEditor {...baseProps({
+      transcriptionQuality: pending,
+      editorRequest,
+      disableAutosave: true,
+    })} />);
+
+    expect(screen.getByTestId("quality-analysis-pending")).toHaveTextContent(/Comprobando letra y timing/i);
+    fireEvent.change(screen.getByDisplayValue("Primera zona"), {
+      target: { value: "Mi corrección mientras analiza" },
+    });
+
+    resolveQuality(new Response(JSON.stringify({
+      revision: 7,
+      segments: [{ start: 42, end: 55, text: "Respuesta vieja del servidor" }],
+      transcription_quality: V5_QUALITY,
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    await waitFor(() => expect(screen.getByTestId("quality-review-panel")).toBeInTheDocument());
+    expect(screen.queryByTestId("quality-analysis-pending")).toBeNull();
+    expect(screen.getByDisplayValue("Mi corrección mientras analiza")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Respuesta vieja del servidor")).toBeNull();
+    expect(editorRequest).toHaveBeenCalledWith(
+      "/editor/quality-v5-job",
+      expect.objectContaining({ method: "GET", cache: "no-store" }),
+    );
+  });
+
+  it("rechaza un resultado terminal obsoleto del mismo revision con otro hash/job", async () => {
+    const pending = {
+      ...V5_QUALITY,
+      analysis_status: "pending",
+      analysis_pending: true,
+      analysis_job_id: "quality:new-snapshot",
+      segments_hash: "new-snapshot-hash",
+    };
+    const stale = {
+      ...V5_QUALITY,
+      analysis_status: "complete",
+      analysis_pending: false,
+      analysis_job_id: "quality:old-snapshot",
+      segments_hash: "old-snapshot-hash",
+    };
+    const editorRequest = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      transcription_quality: stale,
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    render(<LyricsEditor {...baseProps({
+      transcriptionQuality: pending, editorRequest, disableAutosave: true,
+    })} />);
+
+    await waitFor(() => expect(editorRequest).toHaveBeenCalled());
+    expect(screen.getByTestId("quality-analysis-pending")).toBeInTheDocument();
+    expect(screen.queryByTestId("quality-review-panel")).toBeNull();
+  });
+
+  it("rechaza evidencia terminal de otra configuración aunque coincidan revision/hash/job", async () => {
+    const pending = {
+      ...V5_QUALITY,
+      analysis_status: "pending", analysis_pending: true,
+      analysis_job_id: "quality:same-snapshot",
+      pipeline_config_fingerprint: "config-current",
+    };
+    const stale = {
+      ...V5_QUALITY,
+      analysis_status: "complete", analysis_pending: false,
+      analysis_job_id: "quality:same-snapshot",
+      pipeline_config_fingerprint: "config-old",
+      quality_fingerprint: "old-evidence",
+    };
+    const editorRequest = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      transcription_quality: stale,
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    render(<LyricsEditor {...baseProps({
+      transcriptionQuality: pending, editorRequest, disableAutosave: true,
+    })} />);
+    await waitFor(() => expect(editorRequest).toHaveBeenCalled());
+    expect(screen.getByTestId("quality-analysis-pending")).toBeInTheDocument();
+    expect(screen.queryByTestId("quality-review-panel")).toBeNull();
+  });
+
+  it("mantiene el gate enforce mientras analysis_pending y no envía acknowledgement", async () => {
+    const onApprove = vi.fn();
+    const editorRequest = vi.fn(() => new Promise(() => {}));
+    render(<LyricsEditor {...baseProps({
+      transcriptionQuality: {
+        ...V5_QUALITY, analysis_status: "pending", analysis_pending: true,
+      },
+      editorRequest,
+      onApprove,
+      disableAutosave: true,
+    })} />);
+
+    const approve = screen.getByRole("button", { name: /Aprobar y generar/i });
+    expect(approve).toHaveAttribute("data-quality-status", "analysis_pending");
+    expect(approve).toHaveAttribute("data-quality-review-required", "true");
+    await userEvent.click(approve);
+
+    expect(onApprove).not.toHaveBeenCalled();
+    expect(editorRequest).not.toHaveBeenCalledWith(
+      "/jobs/quality-v5-job/transcription-quality/acknowledge",
+      expect.anything(),
+    );
+    expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({
+      message: expect.stringMatching(/todavía está terminando/i),
+      tone: "info",
+    }));
+  });
+
+  it("distingue una candidata de baja confianza y protege el preview hasta confirmarla", async () => {
+    const quality = {
+      ...V5_QUALITY,
+      unsafe_windows: [{ id: "low-confidence", start: 42, end: 55, reasons: ["text_audio_mismatch"] }],
+    };
+    render(<LyricsEditor {...baseProps({
+      transcriptionQuality: quality,
+      segments: [
+        {
+          start: 42,
+          end: 55,
+          text: "Gracias inventado",
+          words: [{ word: "Gracias", start: 42, end: 42.4, score: 0.11 }],
+        },
+      ],
+      disableAutosave: true,
+    })} />);
+
+    const row = screen.getByTestId("lyric-row-1");
+    expect(row).toHaveAttribute("data-unsafe-candidate", "true");
+    expect(screen.getByTestId("unsafe-candidate-label-1")).toHaveTextContent(/Candidata insegura/i);
+    expect(screen.getByTestId("unsafe-quality-window-low-confidence"))
+      .toHaveAttribute("data-quality-confirmed", "false");
+
+    await userEvent.click(screen.getByRole("button", { name: /Reproducir desde 0:42\.0/i }));
+    const preview = screen.getByTestId("lyrics-preview-shell");
+    expect(within(preview).getByText(/Letra sin confirmar/i)).toBeInTheDocument();
+    expect(within(preview).queryByText(/Gracias inventado/i)).toBeNull();
+    expect(screen.getByTestId("unsafe-preview-notice")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Confirmar zona 1" }));
+    expect(row).toHaveAttribute("data-unsafe-candidate", "false");
+    expect(within(preview).getByText(/Gracias inventado/i)).toBeInTheDocument();
+    expect(screen.queryByTestId("unsafe-preview-notice")).toBeNull();
+  });
+
   it("abre el editor, mantiene edición/reproducción y navega cada ventana al tiempo exacto", async () => {
     window.HTMLElement.prototype.scrollIntoView = vi.fn();
     const { container } = render(<LyricsEditor {...baseProps()} />);

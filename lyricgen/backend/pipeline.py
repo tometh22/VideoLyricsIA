@@ -2433,11 +2433,6 @@ _WHISPER_HALLUCINATION_PHRASES = [
     "subtitles by",
     "subtitulado por",
     "transcripcion por",
-    # Seen in the Los Pericos live canary after the formatter. This is a
-    # subtitle/film credit emitted over the instrumental outro, never sung.
-    # Keep the signature specific so a real lyric containing "CC" is not
-    # rejected generically.
-    "cc por antarctica films argentina",
 ]
 
 # Patterns where the punctuation IS the signal — folding them would
@@ -2622,8 +2617,11 @@ def _filter_whisper_hallucinations(segments: list[dict]) -> tuple[list[dict], in
             continue
         dur = float(s.get("end", 0)) - float(s.get("start", 0))
         if _is_single_word_loop(text, seg_duration=dur):
-            logger.info("[WHISPER] dropping single-word loop (%.1fs, %.2fs/tok): %r",
-                        dur, dur / max(len(text.split()), 1), text[:60])
+            logger.info(
+                "[WHISPER] dropping single-word loop "
+                "(%.1fs, %.2fs/tok, tokens=%d)",
+                dur, dur / max(len(text.split()), 1), len(text.split()),
+            )
             continue
         out.append(s)
     return out, len(segments) - len(out)
@@ -3088,10 +3086,10 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
             continue
         # Same filters as local path so behavior matches.
         if _re.search(r'[一-鿿぀-ゟ゠-ヿ가-힯]', text):
-            logger.info("[WHISPER-API] Filtered non-latin: %s", text[:60])
+            logger.info("[WHISPER-API] Filtered non-latin (chars=%d)", len(text))
             continue
         if any(spam in text.lower() for spam in _SPAM_PATTERNS):
-            logger.info("[WHISPER-API] Filtered spam: %s", text[:60])
+            logger.info("[WHISPER-API] Filtered spam (chars=%d)", len(text))
             continue
         # Only drop segments that Whisper is VERY sure aren't speech. The
         # previous 0.7 threshold was tossing legitimate lyric lines on
@@ -3100,7 +3098,10 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         # operator can prune obvious non-lyrics in the editor; better to
         # surface borderline content than to silently drop it.
         if (seg.no_speech_prob or 0) > 0.92:
-            logger.info("[WHISPER-API] Filtered very-low-confidence: %s", text[:60])
+            logger.info(
+                "[WHISPER-API] Filtered very-low-confidence (chars=%d)",
+                len(text),
+            )
             continue
         # Segment timestamps from Whisper conventionally run until the next
         # decoder boundary, often 1-6 s after the singer stopped. When word
@@ -3754,16 +3755,19 @@ def transcribe(mp3_path: str, language: str = None,
             continue
         # Filter non-latin characters (Demucs artifacts like "Lil怎麼樣")
         if _re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]', text):
-            logger.info("[WHISPER] Filtered non-latin artifact: %s", text[:60])
+            logger.info("[WHISPER] Filtered non-latin artifact (chars=%d)", len(text))
             continue
         # Filter spam/non-lyrics
         if any(spam in text.lower() for spam in _SPAM_PATTERNS):
-            logger.info("[WHISPER] Filtered spam: %s", text[:60])
+            logger.info("[WHISPER] Filtered spam (chars=%d)", len(text))
             continue
         # Filter high no_speech_prob segments (likely hallucinations)
         if seg.get("no_speech_prob", 0) > 0.7:
-            logger.info("[WHISPER] Filtered low-confidence (no_speech=%.2f): %s",
-                        seg['no_speech_prob'], text[:60])
+            logger.info(
+                "[WHISPER] Filtered low-confidence "
+                "(no_speech=%.2f, chars=%d)",
+                seg['no_speech_prob'], len(text),
+            )
             continue
         words = seg.get("words", [])
         if words:
@@ -3849,7 +3853,10 @@ def transcribe(mp3_path: str, language: str = None,
                 logger.warning("[WHISPER] large-v3 fallback failed: %s; keeping turbo", e)
 
     for i, seg in enumerate(segments[:5]):
-        logger.info("[WHISPER] seg %s: %.2f-%.2f  %s", i, seg['start'], seg['end'], seg['text'][:60])
+        logger.info(
+            "[WHISPER] seg %s: %.2f-%.2f tokens=%d", i,
+            seg["start"], seg["end"], len(str(seg.get("text") or "").split()),
+        )
 
     GAP = 0.05
     for i in range(len(segments) - 1):
@@ -6276,8 +6283,11 @@ def _validate_segments_against_audio(audio_path: str, segments: list[dict],
                 ratio = SequenceMatcher(None, expected, heard_text).ratio()
                 if ratio < 0.5:
                     flagged_ids.add(id(seg))
-                    print(f"[VALIDATE] segment at {start:.1f}s flagged: "
-                          f"expected '{expected[:40]}' vs heard '{heard_text[:40]}' (ratio {ratio:.2f})")
+                    print(
+                        f"[VALIDATE] segment at {start:.1f}s flagged: "
+                        f"expected_chars={len(expected)} heard_chars={len(heard_text)} "
+                        f"ratio={ratio:.2f}"
+                    )
             finally:
                 try:
                     os.unlink(clip_path)
@@ -7076,6 +7086,18 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
             ]
             merged["review"] = True
             merged["collapsed_repetition"] = len(run)
+            merged["provider_timing_collapsed"] = True
+            merged["provider_event_count"] = len(run)
+            merged["provider_span_start"] = round(
+                min(float(item["start"]) for item in run), 3,
+            )
+            merged["provider_span_end"] = round(
+                max(float(item["end"]) for item in run), 3,
+            )
+            merged["review_reasons"] = sorted(set(
+                list(merged.get("review_reasons") or [])
+                + ["provider_timing_collapsed"]
+            ))
             collapsed.append(merged)
             logger.warning(
                 "[LLM-SEGMENT] collapsed %d repeated singleton lines with "

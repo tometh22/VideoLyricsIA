@@ -8,6 +8,9 @@ not authorized to mutate production lyrics.
 from __future__ import annotations
 
 import itertools
+import hashlib
+import hmac
+import json
 import logging
 import math
 import os
@@ -57,6 +60,68 @@ def _has_vocalization_tail(text: str) -> bool:
     return bool(len(tokens) >= 2 and any(
         part in _VOCALIZATION_TOKENS for part in tokens[1:]
     ))
+
+
+def _attest_independent_content(
+    mapping: dict, hypotheses: list[dict], *, context: dict | None = None,
+) -> dict:
+    """Attest Gemini text only when a distinct ASR family says the same.
+
+    CTC is deliberately excluded: it scores supplied alternatives and cannot
+    be the independent witness that created them.  The attestation contains
+    only a digest and source families, never lyric text.
+    """
+    from line_evidence import canonical_content_sequence
+
+    selected = canonical_content_sequence(mapping.get("events") or [])
+    selected_sources = {
+        str(event.get("content_source") or "")
+        for event in (mapping.get("events") or []) if isinstance(event, dict)
+    }
+    if not selected or any(not value for value in selected) or selected_sources != {"gemini_audio"}:
+        return {"verified": False, "reason": "selected_content_not_gemini"}
+    agreeing_families = {"gemini_audio"}
+    for hypothesis in hypotheses:
+        if not isinstance(hypothesis, dict):
+            continue
+        family = str(hypothesis.get("family") or "")
+        if family in {"", "gemini_audio"}:
+            continue
+        candidate = canonical_content_sequence(hypothesis.get("events") or [])
+        if candidate == selected:
+            agreeing_families.add(family)
+    if len(agreeing_families) < 2:
+        return {"verified": False, "reason": "no_distinct_family_consensus"}
+    secret = str(
+        os.environ.get("QUALITY_CONTENT_ATTESTATION_KEY")
+        or os.environ.get("QUALITY_LEARNING_HMAC_KEY") or ""
+    ).strip()
+    if not secret:
+        return {"verified": False, "reason": "attestation_key_unavailable"}
+    content_sha256 = hashlib.sha256(json.dumps(
+        selected, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    payload = {
+        "schema": "independent-content-consensus-v1",
+        "families": sorted(agreeing_families),
+        "selected_candidate_id": mapping.get("selected_candidate_id"),
+        "content_sha256": content_sha256,
+        **dict(context or {}),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "verified": True,
+        "families": sorted(agreeing_families),
+        "evidence_sha256": hashlib.sha256(encoded).hexdigest(),
+        "attestation": {
+            **payload,
+            "signature_hmac_sha256": hmac.new(
+                secret.encode("utf-8"), encoded, hashlib.sha256,
+            ).hexdigest(),
+        },
+    }
 
 
 def _ctc_anchor_support(ctc: dict) -> dict:
@@ -506,6 +571,38 @@ def verify(stem_path: str, mix_path: str, events: list[dict], *,
                 stem_path, mix_path, structure, hypotheses,
                 window_start=window_start, window_end=window_end,
             )
+            from quality_cache import sha256_file
+            content_attestation = _attest_independent_content(
+                mapping, hypotheses,
+                context={
+                    "window": [round(window_start, 3), round(window_end, 3)],
+                    "stem_sha256": (
+                        sha256_file(stem_path) if os.path.exists(stem_path)
+                        else "unavailable"
+                    ),
+                    "mix_sha256": (
+                        sha256_file(mix_path) if os.path.exists(mix_path)
+                        else "unavailable"
+                    ),
+                },
+            )
+            mapping["independent_content_verified"] = bool(
+                mapping.get("accepted") and content_attestation.get("verified")
+            )
+            if mapping["independent_content_verified"]:
+                mapping["independent_content_evidence_sha256"] = (
+                    content_attestation["evidence_sha256"]
+                )
+                mapping["independent_content_families"] = content_attestation[
+                    "families"
+                ]
+                mapping["independent_content_attestation"] = content_attestation[
+                    "attestation"
+                ]
+            else:
+                mapping["independent_content_reason"] = content_attestation.get(
+                    "reason"
+                )
             stats["content_mapping"] = mapping
             stats["phonetic_evidence"] = phonetic
             stats["phase_margin"] = mapping.get("margin")

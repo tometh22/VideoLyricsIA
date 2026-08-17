@@ -10,6 +10,19 @@ import pytest
 import gap_rescue as gr
 
 
+@pytest.fixture(autouse=True)
+def _deterministic_vad(monkeypatch):
+    """Unit tests opt into available VAD; dedicated tests cover failures."""
+    monkeypatch.setattr(
+        gr, "_vad_evidence",
+        lambda path: {
+            "available": bool(path),
+            "regions": [(0.0, 10_000.0)] if path else [],
+            "error_code": None if path else "missing_audio",
+        },
+    )
+
+
 def _seg(ini, fin, texto="linea"):
     return {"start": ini, "end": fin, "text": texto}
 
@@ -373,7 +386,13 @@ def test_nunca_levanta_con_basura(audio):
 # ── gates de VAD y sanidad física (caso Hombre Lobo, job 9e19f29c) ────────
 
 def _con_vad(monkeypatch, regiones):
-    monkeypatch.setattr(gr, "_vad_regions", lambda *a, **k: regiones)
+    monkeypatch.setattr(
+        gr, "_vad_evidence",
+        lambda path: {
+            "available": bool(path), "regions": list(regiones),
+            "error_code": None if path else "missing_audio",
+        },
+    )
 
 
 def test_vad_descarta_hueco_instrumental(audio, tmp_path, monkeypatch):
@@ -387,6 +406,53 @@ def test_vad_descarta_hueco_instrumental(audio, tmp_path, monkeypatch):
     out, stats = gr.rescue(segs, audio, stem_path=str(stem), audio_duration=80.0)
     assert stats["rescued_lines"] == 0
     assert any(r == "sin_voz_vad" for _, r in stats["skipped"])
+
+
+def test_desacuerdo_stem_mix_abstiene_y_no_invoca_asr(audio, tmp_path, monkeypatch):
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"RIFF" + b"\0" * 128)
+
+    def views(path):
+        return {
+            "available": True,
+            "regions": [] if path == str(stem) else [(20.0, 55.0)],
+            "error_code": None,
+        }
+
+    monkeypatch.setattr(gr, "_vad_evidence", views)
+    monkeypatch.setattr(
+        gr, "_transcribe_window",
+        lambda *a, **k: pytest.fail("el desacuerdo debe ir a quality review"),
+    )
+    segs = [_seg(10, 20), _seg(60, 70)]
+    out, stats = gr.rescue(
+        segs, audio, stem_path=str(stem), audio_duration=80.0,
+    )
+    assert out == segs
+    assert stats["rescued_lines"] == 0
+    assert len(stats["view_disagreements"]) == 1
+    assert any(r == "stem_mix_disagreement" for _, r in stats["skipped"])
+
+
+def test_vad_analyzer_failure_abstains_instead_of_claiming_silence(
+        audio, tmp_path, monkeypatch):
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"RIFF" + b"\0" * 128)
+    monkeypatch.setattr(
+        gr, "_vad_evidence",
+        lambda _path: {
+            "available": False, "regions": [], "error_code": "DecodeError",
+        },
+    )
+    monkeypatch.setattr(
+        gr, "_transcribe_window",
+        lambda *a, **k: pytest.fail("unavailable evidence must abstain"),
+    )
+    out, stats = gr.rescue(
+        [_seg(10, 20), _seg(60, 70)], audio,
+        stem_path=str(stem), audio_duration=80.0,
+    )
+    assert out == [_seg(10, 20), _seg(60, 70)]
+    assert any(reason == "vad_unavailable" for _, reason in stats["skipped"])
+    assert stats["view_disagreements"][0]["reason"] == "view_unavailable"
 
 
 def test_vad_permite_hueco_cantado(audio, tmp_path, monkeypatch):

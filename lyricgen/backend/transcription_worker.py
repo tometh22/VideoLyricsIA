@@ -204,11 +204,17 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             c["live_structural_disagreements"] = len(
                 _structural_disagreements
             )
+            _view_disagreements = (
+                ((r.get("postpass_stats") or {}).get("gap_rescue") or {})
+                .get("view_disagreements") or []
+            )
+            c["stem_mix_evidence_disagreements"] = len(_view_disagreements)
             _windows = build_unsafe_windows(
                 r.get("segments") or [], words, voiced_gaps=_vg,
                 independent_words=_independent,
                 lexical_unverified=_lexical_verification["details"],
                 structural_disagreements=_structural_disagreements,
+                evidence_view_disagreements=_view_disagreements,
             )
             cascada = r.get("audio_coverage")
             final = c["audio_coverage"]
@@ -268,6 +274,7 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
         if strip_internal and isinstance(r, dict):
             r.pop("_asr_words", None)
             r.pop("_independent_asr_words", None)
+            r.pop("_pre_anchor_provider_segments", None)
         if _stem:
             try:
                 os.unlink(_stem)
@@ -281,6 +288,10 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
                                   timing_consistency_fn, *, live_hint: bool = False):
     """Measure, retry only unsafe windows, and persist one final verdict."""
     from transcription_quality import calibration_identity, evaluate
+    from line_evidence import annotate_provider_evidence
+
+    r = dict(r)
+    r["segments"] = annotate_provider_evidence(r.get("segments") or [])
 
     calibrated = calibration_identity()["calibrated"]
     require_independent = bool(
@@ -333,12 +344,14 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
 
     diagnostics = retry_stats.get("structural_hybrid_diagnostics") or []
     acoustic_evidence = diagnostics[-1].get("evidence") if diagnostics else None
+    from quality_jobs import _sanitize_analytical_evidence
 
     final = evaluate(
         r.get("segments") or [], post.get("coverage_final"),
-        unsafe_windows=windows, retry_stats=retry_stats,
+        unsafe_windows=windows,
+        retry_stats=_sanitize_analytical_evidence(retry_stats),
         require_independent=require_independent,
-        acoustic_evidence=acoustic_evidence,
+        acoustic_evidence=_sanitize_analytical_evidence(acoustic_evidence),
     )
     final["initial_decision"] = initial.get("decision")
     final["initial_score"] = initial.get("score")
@@ -358,6 +371,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
         )
     r.pop("_asr_words", None)
     r.pop("_independent_asr_words", None)
+    r.pop("_pre_anchor_provider_segments", None)
     return r
 
 
@@ -456,6 +470,10 @@ def run_transcription_job(
                 language=language, artist=artist, title=title, filename=filename,
                 live=live,
             )
+            # Immutable provider evidence must exist before anchor CTC or any
+            # other timing/content post-pass can replace words and bounds.
+            from line_evidence import freeze_result_provider_evidence
+            r = freeze_result_provider_evidence(r)
             # Post-pases gateados, en lockstep con los dos endpoints HTTP
             # (/transcribe y /transcribe-uploaded). ESTE es el camino que
             # usa el frontend real (enqueue → ShortWorker), así que si acá

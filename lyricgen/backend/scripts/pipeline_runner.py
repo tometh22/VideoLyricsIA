@@ -295,6 +295,8 @@ def transcribe_local_via_main(
             title=title,
             filename=os.path.basename(audio_path),
         ))
+        from line_evidence import freeze_result_provider_evidence
+        result = freeze_result_provider_evidence(result)
     except Exception as e:
         elapsed = time.time() - t0
         return {

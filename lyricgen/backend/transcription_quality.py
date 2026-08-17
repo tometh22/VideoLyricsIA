@@ -311,10 +311,62 @@ def confirmed_all_windows(quality: dict, confirmed_ids: Iterable[str]) -> bool:
     return expected == confirmed
 
 
+def supersede_pending_analysis(
+    quality: dict | None, *, revision: int, segments: list[dict] | None = None,
+) -> dict | None:
+    """Invalidate every quality artifact when a human changes the snapshot.
+
+    Even a terminal verdict is stale after a text/timing edit.  Preserve only
+    immutable runtime identity and the *bounds* that still need re-analysis;
+    acoustic evidence, scores, acknowledgements and fingerprints must never
+    cross a segment hash boundary.
+    """
+    if not isinstance(quality, dict):
+        return quality
+    carried = []
+    for window in quality.get("unsafe_windows") or []:
+        if not isinstance(window, dict):
+            continue
+        start, end = _f(window.get("start")), _f(window.get("end"))
+        if end > start:
+            carried.append({
+                "start": start, "end": end,
+                "reasons": [
+                    *(window.get("reasons") or [window.get("reason") or "unsafe"]),
+                    "superseded_quality_window",
+                ],
+                "segment_indices": window.get("segment_indices") or [],
+            })
+    if segments is not None:
+        carried.extend(build_unsafe_windows(segments, []))
+    windows = _merge_windows(carried, pad_s=0.0)
+    identity_keys = {
+        "schema_version", "version", "quality_version", "policy_version",
+        "pipeline_release", "pipeline_config_fingerprint", "timing_source",
+        "audio_sha256", "mode",
+    }
+    updated = {key: quality[key] for key in identity_keys if key in quality}
+    updated.update({
+        "decision": "review_required", "render_blocked": True,
+        "analysis_pending": False,
+        "analysis_status": "superseded_by_edit",
+        "analysis_superseded_revision": int(revision),
+        "evaluated_revision": int(revision),
+        "segments_hash": segments_hash(segments or []),
+        "unsafe_windows": windows,
+        "reasons": [{
+            "code": "quality_analysis_superseded_by_edit",
+            "severity": "critical", "value": int(revision),
+        }],
+    })
+    return updated
+
+
 _NON_OVERRIDABLE_REASONS = {
     "empty_transcription", "empty_lyric_lines", "timeline_inversion",
     "invalid_timing_range", "duplicate_line_starts",
     "quality_evidence_unavailable", "quality_retry_failed",
+    "quality_analysis_superseded_by_edit", "quality_analysis_enqueue_failed",
 }
 
 
@@ -374,11 +426,23 @@ def build_unsafe_windows(segments: list[dict], words: list[dict], *,
                          voiced_gaps: list[dict] | None = None,
                          independent_words: list[dict] | None = None,
                          lexical_unverified: list[dict] | None = None,
-                         structural_disagreements: list[dict] | None = None) -> list[dict]:
+                         structural_disagreements: list[dict] | None = None,
+                         evidence_view_disagreements: list[dict] | None = None) -> list[dict]:
     """Locate bounded areas worth a second, independent ASR pass."""
     from audio_coverage import text_mismatches, uncovered_spans
 
     windows: list[dict] = []
+    from line_evidence import evidence_issues
+    for issue in evidence_issues(segments):
+        windows.append({
+            **issue,
+            "start": min(
+                _f(issue.get("start")), _f(issue.get("source_start"), _f(issue.get("start"))),
+            ),
+            "end": max(
+                _f(issue.get("end")), _f(issue.get("source_end"), _f(issue.get("end"))),
+            ),
+        })
     for item in text_mismatches(segments, words):
         windows.append({
             "start": item["start"], "end": item["end"],
@@ -418,6 +482,11 @@ def build_unsafe_windows(segments: list[dict], words: list[dict], *,
         windows.append({
             "start": gap.get("start"), "end": gap.get("end"),
             "reason": "voiced_gap",
+        })
+    for item in evidence_view_disagreements or []:
+        windows.append({
+            "start": item.get("start"), "end": item.get("end"),
+            "reason": "stem_mix_evidence_disagreement",
         })
     return _merge_windows(windows)
 
@@ -540,6 +609,28 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
             structural_disagreements,
             min(45, 15 + 5 * structural_disagreements),
         )
+    evidence_view_disagreements = int(
+        coverage.get("stem_mix_evidence_disagreements") or 0
+    )
+    if evidence_view_disagreements:
+        add(
+            "stem_mix_evidence_disagreement", "critical",
+            evidence_view_disagreements, 35,
+        )
+    from line_evidence import evidence_issues
+    line_issue_counts: dict[str, int] = {}
+    for issue in evidence_issues(segments):
+        for code in issue.get("reasons") or []:
+            line_issue_counts[str(code)] = line_issue_counts.get(str(code), 0) + 1
+    line_issue_severity = {
+        "provider_timing_collapsed": "critical",
+        "low_ctc_timing_confidence": "critical",
+        "low_asr_content_confidence": "warning",
+        "text_word_cardinality_mismatch": "critical",
+        "isolated_tail_low_support": "critical",
+    }
+    for code, count in sorted(line_issue_counts.items()):
+        add(code, line_issue_severity.get(code, "warning"), count, 30)
     pending_insertions = sum(
         1 for segment in segments
         if isinstance(segment, dict)
@@ -682,21 +773,27 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
             "quality_evidence_unavailable", "text_audio_mismatch",
             "independent_text_audio_mismatch", "live_lexical_unverified",
             "empty_lyric_lines", "empty_transcription",
+            "low_asr_content_confidence", "isolated_tail_low_support",
+            "text_word_cardinality_mismatch",
         },
         "event_count": {
             "live_structural_disagreement", "acoustic_mapping_ambiguous",
             "strong_unassigned_vocal_events", "structural_autorepair_uncalibrated",
             "quality_windows_unprocessed", "quality_windows_truncated",
+            "provider_timing_collapsed", "text_word_cardinality_mismatch",
+            "stem_mix_evidence_disagreement",
         },
         "timing": {
             "severe_line_overlaps", "duplicate_line_starts",
             "invalid_timing_range", "timeline_inversion",
+            "low_ctc_timing_confidence", "provider_timing_collapsed",
         },
         "vocal_coverage": {
             "low_audio_coverage", "soft_audio_coverage", "voiced_gap",
             "short_voiced_gap", "uncovered_asr_audio", "short_uncovered_audio",
             "low_independent_coverage", "soft_independent_coverage",
             "independent_uncovered_audio", "short_independent_uncovered_audio",
+            "stem_mix_evidence_disagreement",
         },
         "timeline_integrity": {
             "timeline_inversion", "invalid_timing_range", "duplicate_line_starts",
@@ -717,7 +814,11 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
     evidence_lineage = sorted({
         str(source)
         for segment in segments if isinstance(segment, dict)
-        for source in (segment.get("consensus_sources") or [])
+        for source in (
+            list(segment.get("consensus_sources") or [])
+            + [segment.get("content_source")]
+            + [((segment.get("provider_evidence") or {}).get("source"))]
+        )
         if source
     })
     return {
@@ -757,6 +858,10 @@ def can_render(quality: dict | None, *, revision: int,
     # evidence from an earlier enforce rollout must never keep blocking jobs.
     if runtime_mode != "enforce":
         return True, None
+    if quality.get("analysis_pending") or str(
+        quality.get("analysis_status") or ""
+    ).lower() in {"pending", "superseded_by_edit", "failed", "retry_failed"}:
+        return False, "transcription_quality_analysis_incomplete"
     ack = quality.get("acknowledgement") or {}
     current_hash = segments_hash(segments or [])
     quality_is_current = (

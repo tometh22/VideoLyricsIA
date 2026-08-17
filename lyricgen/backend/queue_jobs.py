@@ -890,32 +890,146 @@ def enqueue_transcription_quality(job_id: str, *, expected_revision: int,
             increment("transcription_quality_queue_deduplicated")
         except Exception:
             pass
+        marked = _mark_transcription_quality_pending(
+            job_id, expected_revision, expected_segments_hash, active.id,
+        )
+        if not marked:
+            return f"stale:transcription-quality:{job_id}"
         return active.id
     _evict_stale_rq_job(_redis, rq_id)
-    queued = queue.enqueue(
-        run_transcription_quality_job,
-        args=(job_id,),
-        kwargs={
-            "expected_revision": int(expected_revision),
-            "expected_segments_hash": expected_segments_hash,
-            "filename": filename,
-        },
-        job_timeout=int(os.environ.get("TRANSCRIPTION_QUALITY_JOB_TIMEOUT", "1200")),
-        result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL,
-        job_id=rq_id,
-        meta=rq_payload_metadata(
-            "transcription_quality", expected_revision=int(expected_revision),
-            expected_segments_hash=expected_segments_hash,
-        ),
-        retry=Retry(max=1, interval=30),
-        on_failure=transcription_quality_failure_callback,
-    )
+    # Persist the exact snapshot marker before publishing the RQ message.  A
+    # very fast worker may otherwise finish before this process writes
+    # ``pending`` and get overwritten by a late marker.
+    if not _mark_transcription_quality_pending(
+        job_id, expected_revision, expected_segments_hash, rq_id,
+    ):
+        return f"stale:transcription-quality:{job_id}"
+    try:
+        queued = queue.enqueue(
+            run_transcription_quality_job,
+            args=(job_id,),
+            kwargs={
+                "expected_revision": int(expected_revision),
+                "expected_segments_hash": expected_segments_hash,
+                "filename": filename,
+            },
+            job_timeout=int(os.environ.get("TRANSCRIPTION_QUALITY_JOB_TIMEOUT", "1200")),
+            result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL,
+            job_id=rq_id,
+            meta=rq_payload_metadata(
+                "transcription_quality", expected_revision=int(expected_revision),
+                expected_segments_hash=expected_segments_hash,
+            ),
+            retry=Retry(max=1, interval=30),
+            on_failure=transcription_quality_failure_callback,
+        )
+    except Exception as exc:
+        _mark_transcription_quality_enqueue_failed(
+            job_id, expected_revision, expected_segments_hash, rq_id,
+            type(exc).__name__,
+        )
+        raise
     try:
         from ops_metrics import increment
         increment("transcription_quality_queue_enqueued")
     except Exception:
         pass
     return queued.id
+
+
+def _mark_transcription_quality_pending(job_id: str, expected_revision: int,
+                                        expected_segments_hash: str,
+                                        rq_job_id: str) -> bool:
+    """Expose the real async state only for the exact enqueued snapshot."""
+    try:
+        from datetime import datetime, timezone
+        from database import Job, SessionLocal
+        from transcription_quality import segments_hash
+
+        db = SessionLocal()
+        try:
+            row = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
+            if row is None:
+                return False
+            if (
+                int(row.segments_revision or 0) != int(expected_revision)
+                or segments_hash(row.segments_json or []) != expected_segments_hash
+            ):
+                return False
+            quality = dict(row.transcription_quality or {})
+            if (
+                str(quality.get("analysis_job_id") or "") == str(rq_job_id)
+                and str(quality.get("analysis_status") or "").lower()
+                in {"complete", "failed", "retry_failed"}
+            ):
+                return False
+            quality.update({
+                "analysis_status": "pending",
+                "analysis_pending": True,
+                "analysis_job_id": str(rq_job_id),
+                "analysis_enqueued_at": datetime.now(timezone.utc).isoformat(),
+            })
+            row.transcription_quality = quality
+            db.commit()
+            return True
+        finally:
+            db.close()
+    except Exception as exc:
+        # The durable RQ job is authoritative. A telemetry/UI marker must not
+        # turn a successful enqueue into a failed transcription.
+        logger.warning(
+            "[QUALITY-QUEUE] pending marker failed job=%s: %s", job_id, exc,
+        )
+        return False
+
+
+def _mark_transcription_quality_enqueue_failed(
+    job_id: str, expected_revision: int, expected_segments_hash: str,
+    rq_job_id: str, error_code: str,
+) -> bool:
+    """Fail closed if Redis publication fails after the pending marker."""
+    try:
+        from datetime import datetime, timezone
+        from database import Job, SessionLocal
+        from transcription_quality import segments_hash
+
+        db = SessionLocal()
+        try:
+            row = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
+            if row is None or (
+                int(row.segments_revision or 0) != int(expected_revision)
+                or segments_hash(row.segments_json or []) != expected_segments_hash
+            ):
+                return False
+            quality = dict(row.transcription_quality or {})
+            if str(quality.get("analysis_job_id") or "") != str(rq_job_id):
+                return False
+            reasons = [
+                item for item in (quality.get("reasons") or [])
+                if isinstance(item, dict)
+                and item.get("code") != "quality_analysis_enqueue_failed"
+            ]
+            reasons.append({
+                "code": "quality_analysis_enqueue_failed",
+                "severity": "critical", "value": str(error_code),
+            })
+            quality.update({
+                "analysis_status": "failed", "analysis_pending": False,
+                "analysis_failed_at": datetime.now(timezone.utc).isoformat(),
+                "decision": "retry_failed", "render_blocked": True,
+                "reasons": reasons,
+            })
+            row.transcription_quality = quality
+            db.commit()
+            return True
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning(
+            "[QUALITY-QUEUE] enqueue failure marker failed job=%s: %s",
+            job_id, exc,
+        )
+        return False
 
 
 def enqueue_correction_learning(job_id: str, approved_version_id: str, *,
@@ -1017,6 +1131,33 @@ def ensure_daily_quality_learning_scheduled() -> str | None:
         job_timeout=int(os.environ.get("QUALITY_LEARNING_MINING_TIMEOUT", "900")),
         result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL, job_id=rq_id,
         meta=rq_payload_metadata("quality_learning_daily"),
+    )
+    return queued.id
+
+
+def ensure_quality_pending_reconciler_scheduled() -> str | None:
+    """Schedule a periodic outbox repair for pending-before-publish crashes."""
+    if not transcription_quality_queue_enabled():
+        return None
+    _init_redis()
+    if _redis is None:
+        return None
+    from datetime import datetime, timedelta, timezone
+    from rq import Queue
+    from quality_jobs import reconcile_stale_pending_quality_jobs
+
+    delay_s = max(60, int(os.environ.get("QUALITY_PENDING_RECONCILE_SECONDS", "300")))
+    due = datetime.now(timezone.utc) + timedelta(seconds=delay_s)
+    bucket = int(due.timestamp()) // delay_s
+    rq_id = f"quality-pending-reconciler:{bucket}"
+    active = _active_rq_job(_redis, rq_id)
+    if active is not None:
+        return active.id
+    _evict_stale_rq_job(_redis, rq_id)
+    queued = Queue("transcription_quality", connection=_redis).enqueue_in(
+        timedelta(seconds=delay_s), reconcile_stale_pending_quality_jobs,
+        job_timeout=120, result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL,
+        job_id=rq_id, meta=rq_payload_metadata("quality_pending_reconciler"),
     )
     return queued.id
 

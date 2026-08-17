@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import pipeline
+import transcription_quality
 
 
 WORDS = [
@@ -178,6 +179,13 @@ def test_collapses_compressed_repeated_singletons_but_keeps_other_lines(
     assert len(out[1]["words"]) == 4
     assert out[1]["collapsed_repetition"] == 4
     assert out[1]["review"] is True
+    windows = transcription_quality.build_unsafe_windows(out, [])
+    repetition_window = next(
+        window for window in windows
+        if "provider_timing_collapsed" in window["reasons"]
+    )
+    assert repetition_window["start"] <= 60.0
+    assert repetition_window["end"] >= 83.27
 
 
 # ─────────────────────────────────────────────────────────────────────────

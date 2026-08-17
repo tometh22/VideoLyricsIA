@@ -1,4 +1,6 @@
 import targeted_consensus as tc
+import quality_mutation
+import transcription_quality
 import vocal_sep
 
 
@@ -166,6 +168,10 @@ def test_slowed_and_same_model_witness_only_suggest_insertion(
 def test_cross_model_primary_can_confirm_bounded_insertion(monkeypatch):
     recovered = words("real wow wow", start=60.0)
     monkeypatch.setenv("TRANSCRIPTION_QUALITY_MODE", "enforce")
+    monkeypatch.setattr(
+        transcription_quality, "calibration_identity",
+        lambda: {"calibrated": True},
+    )
     result = {
         "segments": [], "_asr_words": recovered,
         "live_audio_truth": True,
@@ -185,6 +191,11 @@ def test_global_enforce_does_not_mutate_job_outside_rollout(monkeypatch):
     recovered = words("real wow wow", start=60.0)
     monkeypatch.setenv("TRANSCRIPTION_QUALITY_MODE", "enforce")
     monkeypatch.setenv("TRANSCRIPTION_QUALITY_ENFORCE_PERCENT", "0")
+    monkeypatch.setattr(
+        transcription_quality, "calibration_identity",
+        lambda: {"calibrated": True},
+    )
+    monkeypatch.setattr(quality_mutation, "_tenant_for_job", lambda _job: "")
     result = {
         "segments": [], "_asr_words": recovered,
         "live_audio_truth": True,
