@@ -36,6 +36,22 @@ const POLL_INTERVAL_INITIAL_MS = 1500;
 const POLL_INTERVAL_MAX_MS = 5000;
 const POLL_TIMEOUT_MS = 5 * 60 * 1000;  // 5 min hard cap
 
+// Build-time kill-switch para la pre-generación especulativa de fondos.
+// Medido en prod (jul-2026): 147 fondos pre-generados, sólo 4 reusados —
+// ~$91/mes de Veo tirado, porque los flujos no convergen (79% de renders
+// entran por API sin wizard, y los del wizard renderizan 51-56 min después,
+// fuera de la ventana útil de 30-90 s del pre-gen). El render final genera el
+// mismo Veo real en "Crear video", así que apagar esto NO degrada nada: sólo
+// se pierde el pre-warm. Emparejar con el backend BG_PREVIEW_ENABLED=0 para
+// eliminar también el gasto server-side. Default ON = deploy inerte; setear
+// VITE_BG_PREVIEW_ENABLED=0 en el build para no hacer ni el roundtrip.
+const BG_PREVIEW_ENABLED = (() => {
+  const raw = String(
+    import.meta.env.VITE_BG_PREVIEW_ENABLED ?? "1",
+  ).trim().toLowerCase();
+  return !(raw === "0" || raw === "false" || raw === "off" || raw === "no");
+})();
+
 /**
  * A preview cache contains one AI-generated background. It is useful only
  * for the single-background AI path: library/custom sources already provide
@@ -47,7 +63,8 @@ export function shouldEnableBackgroundPreview({
   bgSelectMode,
   enableScenes,
 }) {
-  return !!hasReview
+  return BG_PREVIEW_ENABLED
+    && !!hasReview
     && !editMode
     && bgSelectMode === "auto"
     && !enableScenes;
