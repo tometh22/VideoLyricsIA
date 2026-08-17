@@ -3476,17 +3476,15 @@ export default function LyricsEditor({
   // letra" (si hay líneas review del anclado) + estado del fondo. Si no
   // hay nada que avisar → "Todo listo".
   const confidenceParts = [];
-  // Antes esto decía "Sincronizado con tu letra" JUSTO cuando había líneas
-  // dudosas (`reviewSegCount > 0`): tranquilizaba al operador en el único caso
-  // en que había que avisarle, y no daba ningún número para orientarse (56 s
-  // medidos hasta la primera edición). Ahora dice cuántas líneas mirar.
-  const needsReviewCount = Math.max(reviewSegCount, unsafeCandidateSegmentIds.size);
-  if (needsReviewCount > 0) {
+  if (reviewSegCount > 0) confidenceParts.push(t("editor.confidence_synced") || "Sincronizado con tu letra");
+  // Orientación al abrir (56 s medidos hasta la primera edición): cuántas zonas
+  // marcó el análisis de calidad. Se AGREGA a la señal calma existente
+  // ("señal review calma", 2026-07) en vez de reemplazarla — es un dato para
+  // ubicarse, no una alarma. Sólo aparece cuando hay diagnóstico real.
+  if (qualityGuidanceAvailable && unsafeCandidateSegmentIds.size > 0) {
     confidenceParts.push(
-      `${needsReviewCount} ${t("editor.confidence_needs_review") || "líneas a revisar"}`,
+      `${unsafeCandidateSegmentIds.size} ${t("editor.confidence_needs_review") || "líneas a revisar"}`,
     );
-  } else if (reviewSegCount === 0) {
-    confidenceParts.push(t("editor.confidence_synced") || "Sincronizado con tu letra");
   }
   if (bgStatus === "done") confidenceParts.push(t("editor.confidence_bg_done") || "Fondo listo");
   else if (bgStatus === "queued" || bgStatus === "generating") confidenceParts.push(t("editor.confidence_bg_generating") || "Generando fondo…");
