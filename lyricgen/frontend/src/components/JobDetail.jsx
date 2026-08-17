@@ -1177,6 +1177,18 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           <p className="text-[11px] text-amber-100/50 mb-4 pl-11">
             {t("detail.bg_attention_reassure") || "El video no se entregó con un fondo degradado. Tu audio y tu letra están intactos."}
           </p>
+          {isContent && (
+            <div className="pl-11 mb-4">
+              <p className="text-[11px] font-medium text-amber-200/80 mb-1.5">
+                {t("detail.bg_attention_tips_title") || "Cómo ajustarlo:"}
+              </p>
+              <ul className="text-[11px] text-amber-100/60 space-y-1 list-disc pl-4">
+                <li>{t("detail.bg_attention_tip_people") || "Quitá referencias a personas o caras del prompt."}</li>
+                <li>{t("detail.bg_attention_tip_brands") || "Evitá logos, marcas o texto en el fondo."}</li>
+                <li>{t("detail.bg_attention_tip_abstract") || "Probá un fondo más abstracto o atmosférico (paisajes, texturas, luces)."}</li>
+              </ul>
+            </div>
+          )}
           <div className="flex gap-2 pl-11">
             {isContent ? (
               <>
