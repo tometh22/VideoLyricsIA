@@ -384,13 +384,24 @@ function parseTimestamp(str) {
 // malformed values. Keep one strict boundary sanitizer for every path that
 // reads, sorts, restores, or persists timings. In particular, never use
 // parseFloat here: Number("12abc") must be rejected rather than truncated.
+// Duración mínima de un segmento. El backend valida `end > start`, así que un
+// segmento de duración cero es un 422 permanente que el autosave reintenta en
+// loop. 10 ms es imperceptible y sobrevive el redondeo a 4 decimales.
+const MIN_SEGMENT_DURATION_S = 0.01;
+
 function sanitizeSegmentTiming(segment, fallbackStart = 0) {
   const rawStart = segment?.start ?? segment?.startTime ?? segment?.start_time;
   const rawEnd = segment?.end ?? segment?.endTime ?? segment?.end_time;
   const parsedStart = parseTimestamp(rawStart);
   const start = parsedStart == null ? fallbackStart : parsedStart;
   const parsedEnd = parseTimestamp(rawEnd);
-  const end = parsedEnd == null ? start + 1 : Math.max(start, parsedEnd);
+  // El backend rechaza `end <= start` con 422 (editor.py) y el cliente
+  // reintentaba para siempre el MISMO payload inválido — autosave muerto en
+  // loop. Garantizamos una duración mínima acá; 10 ms es imperceptible y
+  // sobrevive el redondeo a 4 decimales del servidor.
+  const end = parsedEnd == null
+    ? start + 1
+    : Math.max(start + MIN_SEGMENT_DURATION_S, parsedEnd);
   return { ...segment, start, end };
 }
 
@@ -1210,7 +1221,26 @@ export default function LyricsEditor({
       });
     }
     if (status === "saved" && draftKey) {
-      try { localStorage.removeItem(draftKey); } catch { /* storage blocked */ }
+      // El snapshot confirmado se capturó hasta 800 ms (draft) o 5 s
+      // (checkpoint) ANTES de este OK. Borrar el borrador a ciegas tiraba todo
+      // lo tipeado en esa ventana: el efecto que reescribe el draft está
+      // keyeado por `edited`, así que no se vuelve a ejecutar si el operador no
+      // toca nada más, y un 401 (que fuerza reload) o un refresh se llevaban
+      // esas ediciones. Solo se borra si la pantalla sigue equivalente a lo
+      // persistido.
+      const persisted = metadata?.result?.segments;
+      let covered = true;
+      if (Array.isArray(persisted)) {
+        try {
+          covered = segmentsEquivalent(
+            sanitizeSegmentsForPersistence(editedRef.current),
+            persisted,
+          );
+        } catch { covered = false; }
+      }
+      if (covered) {
+        try { localStorage.removeItem(draftKey); } catch { /* storage blocked */ }
+      }
     }
   }, [draftKey, trackEditorEvent]);
 
@@ -1223,7 +1253,7 @@ export default function LyricsEditor({
     setEdited(reseedPreservingIds(editedRef.current, mergedSegments));
     setIsDirty(true);
   }, []);
-  const { flush: flushDurableSave } = useEditorAutosave({
+  const { flush: flushDurableSave, forceRecover: forceDurableRecover } = useEditorAutosave({
     enabled: editorV2Enabled && durableHydrated && !durableEditor.loading,
     segments: durableSegments,
     dirty: isDirty,
@@ -1443,6 +1473,37 @@ export default function LyricsEditor({
     });
   }, [disableAutosave, editorV2Enabled, onPersistSegments, transcribeJobId]);
 
+  // Flush sincrónico del borrador en editor V2 (refresh / cierre de pestaña /
+  // reload forzado por un 401). El efecto que escribe el draft es asíncrono y
+  // puede no correr entre el último keystroke y `pagehide`; los dos flushes de
+  // abajo están gateados a `!editorV2Enabled` porque usan la cola legacy, así
+  // que en el path que corre HOY en producción no quedaba ninguna red de
+  // contención. Acá sólo se toca localStorage: sin red, sin CAS, sin riesgo de
+  // doble escritura. La recuperación al volver la hace `hydrate()` con este
+  // mismo draft. (Clase de incidente: reporte Gaby 2026-06-24.)
+  useEffect(() => {
+    if (!editorV2Enabled || !draftKey) return undefined;
+    const persistDraftNow = () => {
+      if (!dirtyRef.current) return;
+      try {
+        localStorage.setItem(draftKey, JSON.stringify({
+          segments: sanitizeSegmentsForPersistence(editedRef.current),
+          base_segments: sanitizeSegmentsForPersistence(durableEditor.document?.segments || []),
+          base_revision: durableEditor.revisionRef.current,
+          updated_at: new Date().toISOString(),
+        }));
+      } catch { /* quota/storage blocked */ }
+    };
+    window.addEventListener("pagehide", persistDraftNow);
+    window.addEventListener("beforeunload", persistDraftNow);
+    return () => {
+      window.removeEventListener("pagehide", persistDraftNow);
+      window.removeEventListener("beforeunload", persistDraftNow);
+      // SPA navigation desmonta React antes de pagehide: mismo rescate.
+      persistDraftNow();
+    };
+  }, [draftKey, durableEditor.document, durableEditor.revisionRef, editorV2Enabled]);
+
   // Durable flush on page unload (refresh / tab close). The beforeunload
   // handler above only WARNS via a native dialog — it does not persist. And
   // the flush-on-unmount above runs on React unmount (SPA navigation), which
@@ -1523,6 +1584,23 @@ export default function LyricsEditor({
       persistOpts,
     });
   }, [disableAutosave, editorV2Enabled, flushDurableSave, onPersistSegments, transcribeJobId]);
+
+  // Recuperación explícita del estado `conflict`, que antes era terminal: el
+  // autosave quedaba desarmado y "Guardar" retornaba sin tocar la red, así que
+  // el operador clickeaba un botón que no hacía nada. Vuelve a leer el
+  // documento remoto y hace merge de 3 vías ANTES de escribir, así que nunca
+  // pisa la edición de otro; si el conflicto es real, el banner mantiene la
+  // opción de recargar.
+  const [recoveringConflict, setRecoveringConflict] = useState(false);
+  const recoverFromConflict = useCallback(async () => {
+    if (!editorV2Enabled || recoveringConflict) return;
+    setRecoveringConflict(true);
+    try {
+      await forceDurableRecover("manual");
+    } finally {
+      setRecoveringConflict(false);
+    }
+  }, [editorV2Enabled, forceDurableRecover, recoveringConflict]);
 
   // PR E (2026-07): acá vivía el espejo sincrónico por keystroke
   // (onEditedChange → App.setCurrentReview). Eliminado — era la mitad del
@@ -3815,7 +3893,21 @@ export default function LyricsEditor({
                 : (_SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server).detail}
             </p>
           </div>
-          {saveStatus !== "conflict" && <div className="flex shrink-0 gap-2">
+          {saveStatus === "conflict" ? (
+            <div className="flex shrink-0 gap-2">
+              <button
+                type="button"
+                onClick={recoverFromConflict}
+                disabled={recoveringConflict}
+                className="text-[11px] text-red-200 hover:text-white bg-red-500/20 hover:bg-red-500/30 rounded-lg px-3 py-1.5 transition-colors disabled:opacity-50"
+                title={t("editor.save_conflict_retry_title", "Vuelve a leer la última versión y combina tus cambios antes de guardar")}
+              >
+                {recoveringConflict
+                  ? t("editor.save_conflict_retrying", "Combinando…")
+                  : t("editor.save_conflict_retry", "Combinar y reintentar")}
+              </button>
+            </div>
+          ) : <div className="flex shrink-0 gap-2">
             {saveErrorReason === "draft-corrupt" ? (
               <button
                 type="button"

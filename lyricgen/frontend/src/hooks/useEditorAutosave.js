@@ -9,6 +9,13 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
   const checkpointTimerRef = useRef(null);
   const retryTimerRef = useRef(null);
   const retryCountRef = useRef(0);
+  // A durable conflict blocks every save, including the manual "Guardar"
+  // button, which returned `{ok:false}` without touching the network — the
+  // operator saw a button that did nothing ("hay que apretar Guardar muchas
+  // veces"). `forceRecover` is the ONLY sanctioned way past `blocked`: it
+  // re-reads the remote document and three-way merges before writing, so it
+  // can never clobber someone else's edit.
+  const bypassBlockedRef = useRef(false);
   segmentsRef.current = segments;
   runtimeRef.current = { enabled, blocked, save, reconcile, onStatus, onMerged };
 
@@ -26,7 +33,8 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
     rebaseAttempts = 0,
   ) => {
     const runtime = runtimeRef.current;
-    if (!mountedRef.current || !runtime.enabled || runtime.blocked) {
+    const blocked = runtime.blocked && !bypassBlockedRef.current;
+    if (!mountedRef.current || !runtime.enabled || blocked) {
       return { ok: false, reason: runtime.blocked ? "conflict" : "disabled" };
     }
     let snapshot = overrideSegments || segmentsRef.current;
@@ -40,6 +48,16 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
           return state;
         }
         runtimeRef.current.onStatus?.("error", "server", { checkpoint, result: state });
+        // Without this the retry chain died silently here: the reconcile
+        // failed, no timer was armed, and autosave stayed dead until the
+        // operator happened to edit again.
+        const reconcileDelay = Math.min(30_000, 1_000 * (2 ** retryCountRef.current));
+        retryCountRef.current += 1;
+        if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = window.setTimeout(() => {
+          retryTimerRef.current = null;
+          runSave(checkpoint, true);
+        }, reconcileDelay + Math.random() * 250);
         return { ...state, reason: "server" };
       }
       if (Array.isArray(state?.mergedSegments)) {
@@ -149,5 +167,19 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
     [runSave],
   );
 
-  return { flush, clearTimers };
+  // Explicit operator recovery from a durable conflict. Runs with `isRetry`
+  // so the reconcile + three-way merge happens BEFORE the write: if the
+  // remote moved, the merged document is what gets saved. If the merge still
+  // conflicts, the status stays `conflict` and the banner keeps offering the
+  // reload path — this never force-overwrites a remote edit.
+  const forceRecover = useCallback(async (checkpoint = "manual") => {
+    bypassBlockedRef.current = true;
+    try {
+      return await runSave(checkpoint, true);
+    } finally {
+      bypassBlockedRef.current = false;
+    }
+  }, [runSave]);
+
+  return { flush, clearTimers, forceRecover };
 }

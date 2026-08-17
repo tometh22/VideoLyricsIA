@@ -164,7 +164,17 @@ export function useEditorDocument({ jobId, enabled, request }) {
           return next;
         });
       }
-      return { ok: true, revision: body.revision, versionId: body.version_id, applied: body.applied !== false };
+      // `segments` (lo que se persistió) viaja en la respuesta para que el
+      // caller pueda decidir si el borrador local ya quedó cubierto. Sin esto
+      // el editor borraba el draft a ciegas y perdía lo tipeado entre la
+      // captura del snapshot y el OK del servidor.
+      return {
+        ok: true,
+        revision: body.revision,
+        versionId: body.version_id,
+        applied: body.applied !== false,
+        segments,
+      };
     } catch (err) {
       return { ok: false, reason: navigator.onLine === false ? "offline" : "network", error: String(err) };
     }

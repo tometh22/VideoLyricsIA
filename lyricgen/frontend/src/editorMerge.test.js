@@ -39,3 +39,33 @@ describe("mergeThreeWay", () => {
     expect(result.conflicts[0].key).toBe("1");
   });
 });
+
+describe("precisión de tiempos vs el redondeo del backend", () => {
+  // Causa raíz de los conflictos falsos: el backend persiste con
+  // `round(start, 4)` (editor.py) pero el cliente conservaba el float crudo
+  // que envió. Al comparar byte-exacto, CADA drag de timeline parecía una
+  // edición remota -> conflicto falso -> editor trabado sin salida.
+  const dragged = { _id: 1, start: 12.34567891, end: 15.98765432, text: "línea" };
+  const roundedByServer = { _id: 1, start: 12.3457, end: 15.9877, text: "línea" };
+
+  it("no marca como distinto un timing que sólo difiere por el redondeo del servidor", () => {
+    expect(segmentsEquivalent([dragged], [roundedByServer])).toBe(true);
+  });
+
+  it("no abre conflicto cuando el remoto es el mismo drag ya redondeado", () => {
+    const result = mergeThreeWay([dragged], [dragged], [roundedByServer]);
+    expect(result.conflicts).toHaveLength(0);
+  });
+
+  it("sigue detectando un cambio de timing REAL del operador", () => {
+    const moved = { ...dragged, start: 12.5, end: 16.1 };
+    expect(segmentsEquivalent([dragged], [moved])).toBe(false);
+  });
+
+  it("sigue detectando un cambio de texto real", () => {
+    expect(segmentsEquivalent(
+      [dragged],
+      [{ ...roundedByServer, text: "otra línea" }],
+    )).toBe(false);
+  });
+});

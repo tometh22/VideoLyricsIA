@@ -14,12 +14,30 @@ export function persistedSegments(segments = []) {
   return segments.map(({ _id, ...segment }) => segment);
 }
 
+// The backend stores timings rounded to 4 decimals (`editor.py`: `round(start, 4)`),
+// but the client kept the raw float it sent. Comparing one against the other made
+// EVERY timeline drag look like a remote edit -> false conflict -> the editor
+// locked into a terminal `conflict` state with no way out. Quantise both sides to
+// the precision the server actually persists before comparing.
+const TIME_DECIMALS = 4;
+
+function quantizeTime(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return value;
+  const factor = 10 ** TIME_DECIMALS;
+  return Math.round(parsed * factor) / factor;
+}
+
 function comparable(segment) {
   if (segment == null) return null;
   // These fields are local identity or renderer-produced metadata. They can
   // legitimately change when a background/typography render finishes and do
   // not represent a lyric edit by the operator.
   const { _id, id, segment_id, words, review, ...rest } = segment;
+  // Assigning existing keys preserves their position, so the JSON.stringify
+  // comparison in `equal()` stays order-stable.
+  if ("start" in rest) rest.start = quantizeTime(rest.start);
+  if ("end" in rest) rest.end = quantizeTime(rest.end);
   return rest;
 }
 
