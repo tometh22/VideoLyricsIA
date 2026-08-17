@@ -2201,6 +2201,18 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             _bg_validation_future = None
             _bg_validation_pool = None
 
+        # Guardrail "nunca degradar" (default OFF): si el fondo cayó a un
+        # fallback determinístico, no entregamos el video — levantamos
+        # BackgroundDegraded para reintentar la generación (ver el except
+        # dedicado más abajo). Se evalúa acá, con bg_image_path ya final
+        # (incluye el fallback de validación) y antes del upload.
+        _guard_against_degraded_delivery(
+            job_id,
+            bg_image_path=bg_image_path,
+            is_deterministic_fallback=_background_is_deterministic_fallback,
+            animation_degraded=_bg_animation_degraded,
+        )
+
         _verify_deliverables(job_dir, files, audio_dur_for_verify)
 
         # Post-render upload to cloud storage. No-op if R2 env not set.
@@ -2315,6 +2327,35 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             except Exception as e:  # pragma: no cover
                 _raise_if_job_timeout(e)
                 logger.warning("[WAVEFORM] precompute skipped for %s: %s", job_id, e)
+    except BackgroundDegraded as _bg_deg:
+        # Guardrail "nunca degradar". NO entregamos el video con fondo
+        # degradado. Re-lanzamos para que el Retry de RQ vuelva a intentar la
+        # generación con backoff (PIPELINE_RETRY_MAX × PIPELINE_RETRY_INTERVAL_S);
+        # run_pipeline resetea la fila en su primera línea, y como el gradiente
+        # NO se cachea en R2, un Veo recuperado produce el fondo real. Al agotar
+        # los reintentos, pipeline_failure_callback deja el job en error con
+        # "Reintentar sin re-subir" (escalamiento a humano). Nunca degrada.
+        logger.error(
+            "[NO-DEGRADE] job=%s %s — reintentando en vez de entregar el "
+            "video degradado", job_id, _bg_deg,
+        )
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as _scope:
+                _scope.set_tag("event", "pipeline.background_degraded")
+                _scope.set_tag("job_id", job_id)
+                _scope.set_tag("artist", artist or "?")
+                sentry_sdk.capture_message(str(_bg_deg), level="warning")
+        except Exception:
+            pass
+        # Liberar los intermedios pesados igual que el except general, pero
+        # conservando el input local cuando no está en R2 (el retry lo necesita).
+        if input_r2_key:
+            _cleanup_job_dir_on_failure(job_dir)
+        else:
+            _cleanup_local_intermediates(job_dir)
+        raise
+
     except Exception as exc:
         _raise_if_job_timeout(exc)
         traceback.print_exc()
@@ -9585,6 +9626,79 @@ class VeoAmbiguousSubmission(RuntimeError):
 
 class VeoTrackingUnavailable(RuntimeError):
     """A paid call cannot proceed without durable budget/provenance state."""
+
+
+class BackgroundDegraded(RuntimeError):
+    """El fondo entregable cayó a un fallback determinístico (gradiente o Ken
+    Burns) en vez del video que pidió el operador.
+
+    Contrato del guardrail "nunca degradar" (decisión de producto: aplica a
+    TODOS los tenants): cuando Veo no puede producir el fondo pedido, el
+    pipeline NO debe entregar un video degradado. Se levanta esta excepción en
+    la finalización, ANTES de subir los deliverables, para que el Retry de RQ
+    reintente con backoff (run_pipeline resetea la fila y re-genera; el
+    gradiente NO se cachea en R2, así que un Veo recuperado produce el fondo
+    real). Al agotar los reintentos, pipeline_failure_callback deja el job en
+    error con la affordance "Reintentar sin re-subir" — escalamiento a humano,
+    nunca un gradiente en silencio.
+    """
+
+
+# Kill-switch del guardrail. Default OFF: desplegar el código es inerte hasta
+# que se habilite explícitamente + QA (mismo patrón que el resto de los guards
+# del pipeline). Cuando está OFF se conserva el comportamiento histórico
+# (entregar el gradiente para no colgar el job).
+def _veo_no_degrade_guard_enabled() -> bool:
+    return os.environ.get("VEO_NO_DEGRADE_GUARD", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _is_deterministic_fallback_bg(bg_path: str | None) -> bool:
+    """True si el asset de fondo es un fallback determinístico local.
+
+    Los 15 caminos de degradación (breaker abierto, 429 sostenido, budget,
+    submission ambigua, tracking cancelado, validación rechazada + re-roll
+    rechazado, errores de edición) producen todos un archivo cuyo nombre
+    termina en ``fallback.mp4`` vía ``_write_safe_gradient_background``. Un
+    chequeo por nombre captura uniformemente incluso el fallback profundo de
+    ``_generate_veo_video`` que no propaga un flag al llamador.
+    """
+    if not bg_path:
+        return False
+    return os.path.basename(bg_path).endswith("fallback.mp4")
+
+
+def _guard_against_degraded_delivery(
+    job_id: str,
+    *,
+    bg_image_path: str | None,
+    is_deterministic_fallback: bool,
+    animation_degraded: bool,
+) -> None:
+    """Levanta BackgroundDegraded si el fondo final NO es el pedido.
+
+    No-op cuando el guardrail está apagado (comportamiento histórico) o cuando
+    el fondo es el real. La detección combina los flags locales del generador
+    con el chequeo por nombre de archivo, así que cubre tanto los fallbacks que
+    setean un flag como los que sólo devuelven el path del gradiente.
+    """
+    if not _veo_no_degrade_guard_enabled():
+        return
+    _fallback = (
+        is_deterministic_fallback
+        or _is_deterministic_fallback_bg(bg_image_path)
+    )
+    if not (_fallback or animation_degraded):
+        return
+    _reason = (
+        "animación degradada a Ken Burns" if animation_degraded and not _fallback
+        else "fondo degradado a gradiente determinístico"
+    )
+    raise BackgroundDegraded(
+        f"job {job_id}: {_reason} (bg={os.path.basename(bg_image_path or '')}). "
+        "No se entrega el video degradado; se reintenta la generación."
+    )
 
 
 def _veo_http_failure_is_ambiguous(status_code: int) -> bool:
@@ -18467,6 +18581,18 @@ def run_edit_pipeline(
         audio_dur = _audio_duration(mp3_path)
         if audio_dur is None:
             audio_dur = _ffprobe_duration(mp3_path)
+
+        # Guardrail "nunca degradar" (default OFF): un edit cuyo fondo cayó a un
+        # gradiente determinístico no se entrega — se reintenta (ver el except
+        # dedicado más abajo). _policy_fallback_reason cubre los fallbacks que
+        # setean flag; el chequeo por nombre cubre el resto.
+        _guard_against_degraded_delivery(
+            job_id,
+            bg_image_path=bg_image_path,
+            is_deterministic_fallback=bool(_policy_fallback_reason),
+            animation_degraded=False,
+        )
+
         _verify_deliverables(job_dir, files, audio_dur)
 
         # Stage the new background cache only after the complete edit rendered
@@ -18616,6 +18742,26 @@ def run_edit_pipeline(
                 "files_updated": sorted(list(s3_keys.keys())) if s3_keys else [],
             },
         )
+
+    except BackgroundDegraded as _bg_deg:
+        # Guardrail "nunca degradar": no entregamos el edit con fondo degradado.
+        # Re-lanzamos para que el Retry de RQ (enqueue_edit usa el mismo
+        # PIPELINE_RETRY_MAX × PIPELINE_RETRY_INTERVAL_S) reintente la
+        # generación; al agotar, edit_failure_callback deja el job en error
+        # (escalamiento). El job queda en pending_review sólo con el fondo real.
+        logger.error(
+            "[NO-DEGRADE][EDIT] job=%s %s — reintentando en vez de entregar el "
+            "edit degradado", job_id, _bg_deg,
+        )
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as _scope:
+                _scope.set_tag("event", "edit.background_degraded")
+                _scope.set_tag("job_id", job_id)
+                sentry_sdk.capture_message(str(_bg_deg), level="warning")
+        except Exception:
+            pass
+        raise
 
     except Exception as exc:
         _raise_if_job_timeout(exc)
