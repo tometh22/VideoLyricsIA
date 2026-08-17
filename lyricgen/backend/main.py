@@ -9695,6 +9695,10 @@ def status(
         "progress": job["progress"],
         "files": job["files"],
         "error": job.get("error"),
+        # Expuesto para que la UI distinga un error crudo de un
+        # "background_attention:*" (fondo degradado) y muestre la tarjeta
+        # accionable en vez de un error rojo. Ver BG_ATTENTION_CATEGORY_PREFIX.
+        "error_category": job.get("error_category"),
         "artist": job.get("artist"),
         # song_title + style: needed by the post-render edit-wizard
         # (App.jsx EditLyricsRoute) to pre-fill all wizard fields off
@@ -9926,6 +9930,7 @@ async def job_events(
                     "current_step": job["current_step"],
                     "progress": job["progress"],
                     "error": job.get("error"),
+                    "error_category": job.get("error_category"),
                     "created_at": job.get("created_at"),
                     "completed_at": job.get("completed_at"),
                     "eta_s": _eta_s,

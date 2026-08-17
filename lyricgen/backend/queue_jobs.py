@@ -386,6 +386,43 @@ def transcription_failure_callback(job, connection, type_, value, traceback) -> 
         logger.warning("transcription_failure_callback failed: %s", e)
 
 
+# Prefijo de error_category que la UI reconoce para mostrar la tarjeta
+# accionable de "el fondo necesita tu atención" (ámbar, user-driven) en vez de
+# un error crudo. El estado del job sigue siendo "error" (terminal, no lo reapa
+# nadie, se puede reintentar por /edit) — sólo cambia cómo lo pinta el frontend.
+BG_ATTENTION_CATEGORY_PREFIX = "background_attention"
+
+# Copy amable por familia (nunca dice "error"; siempre accionable). El operador
+# decide: reintentar (provider) o ajustar/variar el fondo (content).
+_BG_ATTENTION_COPY = {
+    "provider": (
+        "El servicio de fondos tuvo una interrupción momentánea y no pudimos "
+        "generar tu fondo. Tu trabajo está guardado — reintentá el fondo en un "
+        "momento."
+    ),
+    "content": (
+        "El fondo generado no cumplió con las reglas de contenido y el ajuste "
+        "automático no alcanzó. Probá con otra descripción o estilo para el "
+        "fondo."
+    ),
+}
+
+
+def _background_attention_from_exc(type_, value):
+    """Si la falla terminal es un BackgroundDegraded, devuelve
+    (error_category, mensaje_amable); si no, None.
+
+    Se detecta por NOMBRE de clase para no importar pipeline (evita el ciclo
+    queue_jobs↔pipeline), igual que el chequeo de AbandonedJobError.
+    """
+    if not type_ or type_.__name__ != "BackgroundDegraded":
+        return None
+    family = getattr(value, "family", "provider") or "provider"
+    if family not in _BG_ATTENTION_COPY:
+        family = "provider"
+    return f"{BG_ATTENTION_CATEGORY_PREFIX}:{family}", _BG_ATTENTION_COPY[family]
+
+
 def pipeline_failure_callback(job, connection, type_, value, traceback) -> None:
     """RQ on_failure hook for run_pipeline. Fires when retries are
     exhausted (i.e. the job is permanently dead). Updates the Postgres
@@ -421,6 +458,16 @@ def pipeline_failure_callback(job, connection, type_, value, traceback) -> None:
         # Surface to Sentry tagged with job/tenant — a permanently-dead
         # render is always incident-worthy, doubly so for a B2B tenant.
         _capture_job_failure("render_pipeline", rq_job_id, type_, value)
+        # Guardrail "nunca degradar": si el reintento automático no alcanzó a
+        # generar el fondo real, NO dejamos el job en "error" crudo — lo
+        # marcamos para que la UI muestre una tarjeta accionable (reintentar /
+        # ajustar el fondo). El estado sigue siendo terminal pero user-driven.
+        _bg_attention = _background_attention_from_exc(type_, value)
+        if _bg_attention:
+            _category, _msg = _bg_attention
+            update_job(rq_job_id, status="error", error=_msg[:500],
+                       error_category=_category)
+            return
         is_abandoned = "AbandonedJobError" in (type_.__name__ if type_ else "")
         if is_abandoned:
             err_msg = (
@@ -1545,6 +1592,15 @@ def edit_failure_callback(job, connection, type_, value, traceback) -> None:
             return
         # Surface to Sentry tagged with job/tenant before the DB write.
         _capture_job_failure("edit", rq_job_id, type_, value)
+        # Guardrail "nunca degradar" (ver pipeline_failure_callback): un edit
+        # cuyo fondo no se pudo generar no cae a "error" crudo — se marca para
+        # la tarjeta accionable. El video anterior sigue intacto en R2.
+        _bg_attention = _background_attention_from_exc(type_, value)
+        if _bg_attention:
+            _category, _msg = _bg_attention
+            update_job(rq_job_id, status="error", error=_msg[:500],
+                       error_category=_category)
+            return
         is_abandoned = "AbandonedJobError" in (type_.__name__ if type_ else "")
         if is_abandoned:
             err_msg = (
