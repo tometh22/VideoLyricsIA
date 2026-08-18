@@ -515,35 +515,30 @@ function finiteStart(segment) {
 
 /**
  * Choose the active row from timestamps, never from the incoming array
- * position. The later start wins inside an overlap; equal timestamps keep
- * the earliest stable row so duplicate legacy lines do not flicker.
+ * position. Once a later row has started, playback must never reactivate an
+ * earlier overlapping row when the shorter row ends: that backwards move is
+ * what made the editor highlight and autoscroll jump down, up, then down.
+ * Equal timestamps keep the earliest stable row so duplicates do not flicker.
  */
 export function selectActiveSegmentId(segments, currentTime, options = {}) {
   if (!Array.isArray(segments) || !segments.length) return null;
   const time = Number(currentTime);
   if (!Number.isFinite(time)) return null;
 
-  let containing = null;
   let latestStarted = null;
   segments.forEach((segment, index) => {
     const start = finiteStart(segment);
     if (start == null || start > time) return;
-    const rawEnd = Number(segment.end);
-    const end = Number.isFinite(rawEnd) ? rawEnd : start;
     const candidate = { segment, index, start };
-    if (time < end && (!containing || start > containing.start
-      || (start === containing.start && index < containing.index))) {
-      containing = candidate;
-    }
     if (!latestStarted || start > latestStarted.start
       || (start === latestStarted.start && index < latestStarted.index)) {
       latestStarted = candidate;
     }
   });
 
-  const selected = containing || latestStarted;
+  const selected = latestStarted;
   const tailHoldS = Number(options?.tailHoldS);
-  if (!containing && selected && Number.isFinite(tailHoldS)) {
+  if (selected && Number.isFinite(tailHoldS)) {
     const end = Number(selected.segment.end);
     if (Number.isFinite(end) && time - end > tailHoldS) return null;
   }

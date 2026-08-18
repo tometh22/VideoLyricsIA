@@ -25,6 +25,9 @@ from editor import approve_document, ensure_document, save_document
 from evidence_attestation import lyric_snapshot_hash
 
 
+STRONG_TEST_HMAC_KEY = "quality-learning-test-key-0123456789abcdef"
+
+
 def _job(db, *, tenant="quality-tenant"):
     from database import User
     user = User(
@@ -57,13 +60,17 @@ def test_segmental_dp_classifies_split_vocalization_and_hashes_text():
         {"start": 60.85, "end": 61.8, "text": "Real"},
         {"start": 61.8, "end": 63.77, "text": "uoh uoh"},
     ]
-    result = classify_corrections(original, approved, secret="test-secret")
+    result = classify_corrections(
+        original, approved, secret=STRONG_TEST_HMAC_KEY,
+    )
     assert result["categories"]["split"] == 1
     assert result["categories"]["missing_vocalization"] == 1
     serialized = json.dumps(result, ensure_ascii=False).casefold()
     assert "real" not in serialized
     assert "uoh" not in serialized
-    assert len(result["metrics"]["lexical_hmacs"][0]) == 64
+    assert result["metrics"]["lexical_hmacs"][0].startswith(
+        "hmac-sha256:v1:test-v1:"
+    )
 
 
 def test_pericos_full_outro_is_a_six_event_learning_fixture_without_plaintext():
@@ -82,7 +89,9 @@ def test_pericos_full_outro_is_a_six_event_learning_fixture_without_plaintext():
         {"start": 75.65, "end": 75.75, "text": "¡no!"},
         {"start": 79.31, "end": 83.27, "text": "¡nooooooooo!"},
     ]
-    result = classify_corrections(original, approved, secret="fixture-secret")
+    result = classify_corrections(
+        original, approved, secret=STRONG_TEST_HMAC_KEY,
+    )
     assert len(approved) == 6
     assert result["categories"]["missing_event"] >= 1
     assert (
@@ -102,7 +111,9 @@ def test_timing_repairs_include_order_range_and_overlap():
         {"start": 45.1, "end": 45.8, "text": "b", "_id": "b"},
         {"start": 45.9, "end": 47.0, "text": "a", "_id": "a"},
     ]
-    categories = classify_corrections(original, approved, secret="secret")["categories"]
+    categories = classify_corrections(
+        original, approved, secret=STRONG_TEST_HMAC_KEY,
+    )["categories"]
     assert categories["temporal_order_repaired"] == 1
     assert categories["timing_inversion_repaired"] == 1
     assert categories["timing_overlap_repaired"] == 1
@@ -110,7 +121,7 @@ def test_timing_repairs_include_order_range_and_overlap():
 
 
 def test_hmac_is_scoped_deterministic_and_not_plaintext(monkeypatch):
-    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", "a-long-test-secret")
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", STRONG_TEST_HMAC_KEY)
     first = hmac_identifier("operator", "operator@example.test")
     assert first == hmac_identifier("operator", "operator@example.test")
     assert first != hmac_identifier("session", "operator@example.test")
@@ -118,7 +129,7 @@ def test_hmac_is_scoped_deterministic_and_not_plaintext(monkeypatch):
 
 
 def test_hmac_normalises_artist_variants_and_requires_generation(monkeypatch):
-    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", "a-long-test-secret")
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", STRONG_TEST_HMAC_KEY)
     monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY_ID", "generation-1")
     canonical = hmac_identifier("artist", "Los Pericos")
     assert canonical == hmac_identifier("artist", "  los   pericos ")
@@ -129,8 +140,17 @@ def test_hmac_normalises_artist_variants_and_requires_generation(monkeypatch):
         hmac_identifier("artist", "Los Pericos")
 
 
+@pytest.mark.parametrize("weak_key", ["x", "x" * 64, "placeholder-key"])
+def test_learning_hmac_rejects_short_and_nonrandom_placeholders(
+    monkeypatch, weak_key,
+):
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", weak_key)
+    with pytest.raises(RuntimeError, match="missing_or_weak"):
+        hmac_identifier("artist", "Los Pericos")
+
+
 def test_active_minutes_are_derived_from_server_heartbeats(db, monkeypatch):
-    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", "test-hmac-secret")
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", STRONG_TEST_HMAC_KEY)
     user, job = _job(db, tenant="heartbeat-tenant")
     document = ensure_document(
         db, job.job_id, job.tenant_id,
@@ -170,7 +190,7 @@ def test_approval_queue_payload_to_worker_observation_is_privacy_safe(
 ):
     import queue_jobs
     import rq
-    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", "test-hmac-secret")
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", STRONG_TEST_HMAC_KEY)
     monkeypatch.setenv("TRANSCRIPTION_QUALITY_QUEUE_ENABLED", "1")
     monkeypatch.setenv("QUALITY_LEARNING_CAPTURE_ENABLED", "1")
     user, job = _job(db, tenant="queue-integration-tenant")
@@ -259,7 +279,9 @@ def test_approval_queue_payload_to_worker_observation_is_privacy_safe(
     db.commit()
 
 
-def test_machine_provenance_is_hash_only():
+def test_machine_provenance_is_versioned_hmac_only(monkeypatch):
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", STRONG_TEST_HMAC_KEY)
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY_ID", "test-v1")
     class Row:
         input_r2_key = "tenant/raw/audio.wav"
         timing_source = "forced_align"
@@ -269,9 +291,15 @@ def test_machine_provenance_is_hash_only():
         "reasons": [{"code": "event_count"}],
     })
     assert provenance["schema"] == "machine-transcription-lineage-v1"
-    assert len(provenance["audio_sha256"]) == 64
+    assert provenance["audio_fingerprint"].startswith(
+        "hmac-sha256:v1:test-v1:"
+    )
     assert "tenant/raw/audio.wav" not in json.dumps(provenance)
-    assert len(provenance["quality_evidence_sha256"]) == 64
+    assert provenance["quality_evidence_fingerprint"].startswith(
+        "hmac-sha256:v1:test-v1:"
+    )
+    assert "audio_sha256" not in provenance
+    assert "quality_evidence_sha256" not in provenance
 
 
 def test_acoustic_context_reads_structural_events_without_text():
@@ -296,7 +324,7 @@ def test_acoustic_context_reads_structural_events_without_text():
 
 
 def test_observation_uses_exact_machine_snapshot_and_invalidates_after_edit(db, monkeypatch):
-    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", "test-hmac-secret")
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", STRONG_TEST_HMAC_KEY)
     user, job = _job(db)
     original = [{"start": 0, "end": 1, "text": "Real"}]
     quality = dict(job.transcription_quality)
@@ -328,6 +356,9 @@ def test_observation_uses_exact_machine_snapshot_and_invalidates_after_edit(db, 
     assert observation.categories["missing_vocalization"] == 1
     assert observation.session_hmac == "f" * 64
     assert observation.operator_hmac != str(user.id)
+    assert observation.original_hash != lyric_snapshot_hash(original)
+    assert observation.approved_hash != lyric_snapshot_hash(approved.segments)
+    assert observation.audio_hash and observation.audio_hash != job.input_r2_key
     serialized = json.dumps({
         "categories": observation.categories,
         "features": observation.features,
@@ -346,7 +377,7 @@ def test_observation_uses_exact_machine_snapshot_and_invalidates_after_edit(db, 
 
 
 def test_client_reported_edit_minutes_never_enter_learning_gates(db, monkeypatch):
-    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", "test-hmac-secret")
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", STRONG_TEST_HMAC_KEY)
     user, job = _job(db, tenant="untrusted-time-tenant")
     document = ensure_document(
         db, job.job_id, job.tenant_id,
@@ -369,7 +400,7 @@ def test_client_reported_edit_minutes_never_enter_learning_gates(db, monkeypatch
 
 
 def test_legacy_snapshot_never_becomes_trusted(db, monkeypatch):
-    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", "test-hmac-secret")
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", STRONG_TEST_HMAC_KEY)
     user, job = _job(db, tenant="legacy-tenant")
     document = ensure_document(
         db, job.job_id, job.tenant_id,
@@ -396,7 +427,7 @@ def test_legacy_snapshot_never_becomes_trusted(db, monkeypatch):
 
 
 def test_backfill_dry_run_selects_only_current_unobserved_approval(db, monkeypatch):
-    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", "test-hmac-secret")
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", STRONG_TEST_HMAC_KEY)
     from scripts.quality_learning_backfill import collect_candidates
     user, job = _job(db, tenant="backfill-tenant")
     document = ensure_document(
@@ -416,7 +447,7 @@ def test_backfill_dry_run_selects_only_current_unobserved_approval(db, monkeypat
 
 
 def test_independent_final_reviewer_promotes_exact_observation(db, monkeypatch):
-    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", "test-hmac-secret")
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", STRONG_TEST_HMAC_KEY)
     user, job = _job(db, tenant="independent-tenant")
     from database import User
     reviewer = User(
@@ -450,7 +481,7 @@ def test_independent_final_reviewer_promotes_exact_observation(db, monkeypatch):
 
 
 def test_late_approval_analysis_is_discarded_after_new_editor_revision(db, monkeypatch):
-    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", "test-hmac-secret")
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", STRONG_TEST_HMAC_KEY)
     user, job = _job(db, tenant="occ-tenant")
     document = ensure_document(
         db, job.job_id, job.tenant_id,
@@ -483,7 +514,7 @@ def test_late_approval_analysis_is_discarded_after_new_editor_revision(db, monke
 
 
 def test_change_request_epoch_discards_observation_not_created_yet(db, monkeypatch):
-    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", "test-hmac-secret")
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", STRONG_TEST_HMAC_KEY)
     user, job = _job(db, tenant="epoch-tenant")
     document = ensure_document(
         db, job.job_id, job.tenant_id,

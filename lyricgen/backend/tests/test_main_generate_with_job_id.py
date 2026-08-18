@@ -116,6 +116,10 @@ def test_generate_reuses_persisted_audio_when_job_id_provided(
         captured.update(kwargs)
         return "thread:fake"
     monkeypatch.setattr("main.enqueue_pipeline", _fake_enqueue)
+    # This test exercises persisted-audio reuse, not host resource pressure.
+    # Do not let the developer machine's current RAM usage turn it into a
+    # nondeterministic 503; memory-gate behavior has dedicated tests.
+    monkeypatch.setattr("main._enforce_memory_pressure", lambda: None)
 
     res = client.post(
         "/generate",

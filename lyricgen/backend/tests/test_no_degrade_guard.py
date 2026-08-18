@@ -131,6 +131,69 @@ def test_guard_on_corta_ante_animacion_degradada_a_ken_burns(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Clasificación por familia + mapeo a estado accionable (UX "el fondo necesita
+# tu atención" en vez de "error"). provider = reintentar; content = ajustar.
+# ---------------------------------------------------------------------------
+
+def test_guard_clasifica_content_por_filename_de_politica(monkeypatch):
+    monkeypatch.setenv("VEO_NO_DEGRADE_GUARD", "1")
+    with pytest.raises(p.BackgroundDegraded) as exc:
+        p._guard_against_degraded_delivery(
+            "job1",
+            bg_image_path="/tmp/job1/bg_policy_safe_fallback.mp4",
+            is_deterministic_fallback=True,
+            animation_degraded=False,
+        )
+    assert exc.value.family == p.BG_DEGRADE_FAMILY_CONTENT
+
+
+@pytest.mark.parametrize("name", [
+    "bg_gradient_fallback.mp4",
+    "bg_scene_ambiguous_fallback.mp4",
+    "bg_initial_policy_fallback.mp4",
+    "bg_edit_policy_fallback.mp4",
+])
+def test_guard_clasifica_provider_para_fallas_de_veo(monkeypatch, name):
+    monkeypatch.setenv("VEO_NO_DEGRADE_GUARD", "1")
+    with pytest.raises(p.BackgroundDegraded) as exc:
+        p._guard_against_degraded_delivery(
+            "job1",
+            bg_image_path=f"/tmp/job1/{name}",
+            is_deterministic_fallback=False,
+            animation_degraded=False,
+        )
+    assert exc.value.family == p.BG_DEGRADE_FAMILY_PROVIDER
+
+
+def test_callback_mapea_background_degraded_a_estado_accionable():
+    import queue_jobs
+
+    class _Fake(p.BackgroundDegraded):
+        pass
+
+    # provider
+    exc_prov = p.BackgroundDegraded("x", family="provider")
+    cat, msg = queue_jobs._background_attention_from_exc(type(exc_prov), exc_prov)
+    assert cat == "background_attention:provider"
+    assert "error" not in msg.lower()      # nunca dice "error"
+    assert "reintent" in msg.lower()       # accionable
+    assert len(cat) <= 32                   # cabe en Job.error_category (VARCHAR(32))
+
+    # content
+    exc_cont = p.BackgroundDegraded("x", family="content")
+    cat2, msg2 = queue_jobs._background_attention_from_exc(type(exc_cont), exc_cont)
+    assert cat2 == "background_attention:content"
+    assert "error" not in msg2.lower()
+    assert len(cat2) <= 32
+
+
+def test_callback_no_toca_errores_comunes():
+    import queue_jobs
+    assert queue_jobs._background_attention_from_exc(RuntimeError, RuntimeError("boom")) is None
+    assert queue_jobs._background_attention_from_exc(None, None) is None
+
+
+# --------------------------------------------------------------------------
 # Smoke de INTEGRACIÓN: una BackgroundDegraded levantada dentro de run_pipeline
 # debe ESCAPAR (→ el Retry de RQ reintenta), NO ser tragada por el except
 # genérico a status="error". Este es el contrato que hace posible "retener y

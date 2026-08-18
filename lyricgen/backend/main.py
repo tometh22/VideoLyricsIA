@@ -45,6 +45,7 @@ from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy import func
 from sqlalchemy.exc import OperationalError, TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import ObjectDeletedError
@@ -96,6 +97,8 @@ from database import (
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from editor import (
+    apply_quality_proposal,
+    QualityProposalsDisabled,
     approve_document,
     acquire_lock,
     get_job_for_tenant,
@@ -110,6 +113,8 @@ from editor import (
     serialize_document,
     sync_legacy_snapshot,
     ensure_document,
+    dismiss_quality_proposal,
+    revoke_quality_proposal_if_disabled,
 )
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import run_pipeline, transcribe, _normalize_movement_style
@@ -5968,6 +5973,7 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             "CTC_ALIGN_MIX_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
         retimed = None
         _stem_structural = False
+        _short_motif_decline = False
         if _stem:
             retimed = await asyncio.wait_for(
                 asyncio.to_thread(_ctc.retime_segments, _stem, segs, job_id,
@@ -5978,6 +5984,10 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             # ESTE call corrió — sin stem quedaría el valor del job anterior.
             _stem_structural = (retimed is None
                                 and _ctc.last_decline_reason == "structural")
+            _short_motif_decline = (
+                retimed is None
+                and _ctc.last_decline_reason == "short_repeated_motif"
+            )
         elif not _mix_fallback:
             logger.info("[CTC] no cached stem — skipping retime (job=%s)", job_id)
             return result
@@ -6023,10 +6033,15 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
         # mezcla no arregla un libreto que no matchea). También cubre el
         # caso sin stem cacheado (retimed sigue None y nunca corrimos el
         # primer align).
-        if retimed is None and _mix_fallback and not _stem_structural:
+        if (retimed is None and _mix_fallback and not _stem_structural
+                and not _short_motif_decline):
             retimed = await asyncio.wait_for(
                 asyncio.to_thread(_ctc.retime_segments, audio_path, segs, job_id),
                 timeout=420,
+            )
+            _short_motif_decline = (
+                retimed is None
+                and _ctc.last_decline_reason == "short_repeated_motif"
             )
             if retimed:
                 logger.info("[CTC] retime sobre la MEZCLA OK (stem %s, job=%s)",
@@ -6049,6 +6064,24 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             from jobs import set_timing_source
             from timing_sources import CTC_ALIGN
             set_timing_source(job_id, CTC_ALIGN)
+        elif _short_motif_decline:
+            # A compact repeated chant is underdetermined for one global CTC
+            # pass.  Preserve the cascade output and route only the affected
+            # refrain to Quality.  This metadata is intentionally text-free.
+            result = dict(result)
+            postpass = dict(result.get("postpass_stats") or {})
+            postpass["ctc_retime"] = {
+                "declined": True,
+                "reason": "short_repeated_motif",
+                "unsafe_windows": _ctc.short_repeated_motif_windows(segs),
+                "mutated_segments": False,
+            }
+            result["postpass_stats"] = postpass
+            logger.info(
+                "[CTC] compact motif routed to bounded quality windows "
+                "windows=%d job=%s",
+                len(postpass["ctc_retime"]["unsafe_windows"]), job_id,
+            )
     except Exception as e:
         logger.warning("[CTC] retime wrapper declined: %r (job=%s)", e, job_id)
     finally:
@@ -6444,7 +6477,23 @@ async def _run_transcription_for_job(
             except Exception as e:  # set_timing_source already swallows; defensive
                 logger.warning("[EMIT] set_timing_source(%s, %s) raised: %s",
                                job_id, source, e)
-            deduped = _dedup_collisions(segments)
+            # Freeze the selected provider/reference rows at the cascade
+            # chokepoint *before* dedup, beat snap, lead-in or later CTC
+            # passes can alter text/timing. Unselected variants remain in
+            # their provider-specific cache/N-best artifacts.
+            from line_evidence import annotate_provider_evidence
+            frozen_segments = annotate_provider_evidence(
+                segments,
+                source=source,
+                content_source=(
+                    "catalog_reference" if str(reference_lyrics or "").strip()
+                    else source
+                ),
+                timing_source=source,
+                reference_text=reference_lyrics or None,
+                reference_id=f"{artist}:{title}" if reference_lyrics else None,
+            )
+            deduped = _dedup_collisions(frozen_segments)
             if deduped and segments and len(deduped) != len(segments):
                 logger.info("[EMIT] deduped collisions: %d → %d segments (job=%s)",
                             len(segments), len(deduped), job_id)
@@ -9675,6 +9724,10 @@ def status(
         "progress": job["progress"],
         "files": job["files"],
         "error": job.get("error"),
+        # Expuesto para que la UI distinga un error crudo de un
+        # "background_attention:*" (fondo degradado) y muestre la tarjeta
+        # accionable en vez de un error rojo. Ver BG_ATTENTION_CATEGORY_PREFIX.
+        "error_category": job.get("error_category"),
         "artist": job.get("artist"),
         # song_title + style: needed by the post-render edit-wizard
         # (App.jsx EditLyricsRoute) to pre-fill all wizard fields off
@@ -9906,6 +9959,7 @@ async def job_events(
                     "current_step": job["current_step"],
                     "progress": job["progress"],
                     "error": job.get("error"),
+                    "error_category": job.get("error_category"),
                     "created_at": job.get("created_at"),
                     "completed_at": job.get("completed_at"),
                     "eta_s": _eta_s,
@@ -11192,17 +11246,7 @@ async def restore_audio(
         raise HTTPException(status_code=400, detail="Missing filename.")
     _validate_audio_filename_only(audio.filename)
 
-    # Determine the target R2 key. If input_r2_key is set, reuse it
-    # (this is the common case — the DB row already points where we
-    # want to upload, we just need R2 to actually have the object).
-    # If NULL (rare), derive the canonical path so future probes find it.
     safe_basename = _safe_basename(audio.filename)
-    if job.input_r2_key:
-        target_key = job.input_r2_key
-    else:
-        target_key = storage._input_object_key(
-            job.tenant_id, job_id, job.filename or safe_basename,
-        )
 
     _enforce_disk_capacity()
 
@@ -11214,24 +11258,68 @@ async def restore_audio(
         size_bytes = await _stream_upload_to_disk(audio, temp_path)
         _validate_audio_file_on_disk(audio.filename, temp_path)
 
-        # Upload to R2 at the target key. We use upload_file (arbitrary
-        # key) instead of upload_input (which would re-derive the path)
-        # so we keep the EXISTING DB key happy and don't churn it.
+        from quality_cache import sha256_file
+        audio_sha256 = sha256_file(temp_path)
+        # Content-addressed storage makes replacement recoverable and prevents
+        # a quality worker from observing different bytes under the same key.
+        target_key = storage.content_addressed_input_key(
+            str(job.tenant_id or ""), job_id, audio_sha256, safe_basename,
+        )
+
         uploaded = storage.upload_file(temp_path, target_key)
         if not uploaded:
             raise HTTPException(status_code=503, detail="R2 unavailable.")
+        uploaded_etag = storage.object_etag(target_key) or audio_sha256
     finally:
         try:
             os.unlink(temp_path)
         except OSError:
             pass
 
-    # If input_r2_key was NULL before, persist the canonical path now so
-    # future reads find the file via the standard `/source-audio-url`
-    # path without going through the MP4 fallback.
-    if not job.input_r2_key:
-        job.input_r2_key = target_key
-        db.commit()
+    job = (
+        db.query(JobModel).filter(JobModel.job_id == job_id)
+        .filter(JobModel.tenant_id == current_user["tenant_id"])
+        .populate_existing().with_for_update().one()
+    )
+    previous_key = job.input_r2_key
+    previous_hash = job.input_audio_sha256
+    previous_audio_revision = int(job.audio_revision or 0)
+    job.input_r2_key = target_key
+    job.input_audio_sha256 = audio_sha256
+    job.input_audio_etag = uploaded_etag
+    job.audio_revision = previous_audio_revision + 1
+    job.active_quality_attempt_id = None
+
+    segment_rows = list(job.segments_json or [])
+    starts = [float(row.get("start") or 0) for row in segment_rows if isinstance(row, dict)]
+    ends = [float(row.get("end") or 0) for row in segment_rows if isinstance(row, dict)]
+    quality = dict(job.transcription_quality or {})
+    quality.update({
+        "policy_version": "lyrics-quality-v6",
+        "decision": "review_required",
+        "render_blocked": True,
+        "analysis_status": "superseded",
+        "analysis_pending": False,
+        "audio_sha256": audio_sha256,
+        "audio_revision": job.audio_revision,
+        "unsafe_windows": ([{
+            "id": f"audio-replaced-{job.audio_revision}",
+            "start": min(starts) if starts else 0.0,
+            "end": max(ends) if ends else 0.001,
+            "reasons": ["source_audio_replaced"],
+        }] if segment_rows else []),
+        "reasons": [{
+            "code": "source_audio_replaced", "severity": "critical",
+            "value": job.audio_revision,
+        }],
+    })
+    job.transcription_quality = quality
+    from database import EditorDocument
+    document = db.query(EditorDocument).filter(
+        EditorDocument.job_id == job_id,
+    ).with_for_update().first()
+    if document is not None:
+        document.quality_proposal = None
 
     logger.info(
         "[RESTORE-AUDIO] job_id=%s tenant=%s key=%s size_mb=%.1f restored_by_user=%s",
@@ -11251,15 +11339,33 @@ async def restore_audio(
             "key": target_key,
             "size_mb": round(size_bytes / 1024 / 1024, 2),
             "filename": audio.filename,
+            "previous_key": previous_key,
+            "previous_audio_sha256": previous_hash,
+            "audio_sha256": audio_sha256,
+            "previous_audio_revision": previous_audio_revision,
+            "audio_revision": job.audio_revision,
         },
     ))
+    quality_outbox_id = _create_editor_quality_outbox(
+        db, job, revision=int(job.segments_revision or 0),
+        segments=segment_rows, quality=quality, reason="source_audio_restored",
+    )
     db.commit()
+
+    try:
+        storage.delete_object(f"waveform/{job_id}.json")
+    except Exception:
+        pass
+
+    _dispatch_editor_quality_outbox(quality_outbox_id)
 
     return {
         "job_id": job_id,
         "key": target_key,
         "size_mb": round(size_bytes / 1024 / 1024, 2),
         "restored": True,
+        "audio_sha256": audio_sha256,
+        "audio_revision": job.audio_revision,
     }
 
 
@@ -11401,37 +11507,61 @@ def _invalidate_quality_after_editor_save(
     ) or current
 
 
-def _enqueue_editor_quality_snapshot(job_id: str, *, revision: int,
-                                     segments: list[dict], filename: str,
-                                     tenant_id: str,
-                                     quality: dict | None = None) -> None:
-    """Re-analyze edited unsafe windows after the DB transaction commits."""
-    if not isinstance(quality, dict) or not quality.get("unsafe_windows"):
+def _create_editor_quality_outbox(
+    db: Session, job: Job, *, revision: int, segments: list[dict],
+    quality: dict | None, reason: str,
+) -> str | None:
+    """Commit reanalysis intent atomically with the editor/audio mutation."""
+    from transactional_outbox import create_quality_outbox_event
+    event = create_quality_outbox_event(
+        db, job=job, revision=revision, segments=segments,
+        quality=quality, reason=reason,
+    )
+    return event.id if event is not None else None
+
+
+def _dispatch_editor_quality_outbox(event_id: str | None) -> None:
+    if not event_id:
         return
-    from transcription_quality import segments_hash
     try:
-        from queue_jobs import enqueue_transcription_quality
-        result = enqueue_transcription_quality(
-            job_id, expected_revision=int(revision),
-            expected_segments_hash=segments_hash(segments),
-            filename=os.path.basename(filename or "audio.mp3"),
-            tenant_id=str(tenant_id or ""),
-        )
-        if not str(result).startswith("transcription-quality:"):
+        from transactional_outbox import dispatch_outbox_event
+        result = dispatch_outbox_event(event_id)
+        if result.get("status") != "dispatched":
             logger.warning(
-                "[QUALITY-QUEUE] editor snapshot not queued job=%s outcome=%s",
-                job_id, str(result).split(":", 1)[0],
+                "[QUALITY-OUTBOX] publication pending event=%s status=%s",
+                event_id, result.get("status"),
             )
+            from queue_jobs import ensure_job_outbox_reconciler_scheduled
+            ensure_job_outbox_reconciler_scheduled()
     except Exception as exc:
         logger.warning(
-            "[QUALITY-QUEUE] editor snapshot enqueue failed job=%s error=%s",
-            job_id, type(exc).__name__,
+            "[QUALITY-OUTBOX] immediate dispatch failed event=%s error=%s",
+            event_id, type(exc).__name__,
         )
 
 
 class EditorRestoreRequest(BaseModel):
     version_id: str
     base_revision: int
+
+
+class EditorQualityProposalApplyRequest(BaseModel):
+    base_revision: int = Field(ge=0)
+    window_ids: list[str] = Field(min_length=1, max_length=50)
+    idempotency_key: str = Field(min_length=16, max_length=160)
+
+
+class EditorQualityProposalDismissRequest(BaseModel):
+    base_revision: int = Field(ge=0)
+    idempotency_key: str = Field(min_length=16, max_length=160)
+    # Categorical only: AuditLog must never become a side channel for lyrics.
+    reason: str = Field(
+        default="operator_dismissed",
+        pattern=(
+            r"^(operator_dismissed|incorrect_content|incorrect_timing|"
+            r"not_helpful|already_fixed)$"
+        ),
+    )
 
 
 class EditorConflictRequest(BaseModel):
@@ -11502,7 +11632,9 @@ async def get_editor_document(
 ):
     job, document = _editor_document_or_404(db, job_id, current_user)
     _audit_cross_tenant_access(db, current_user, job, "editor_read", commit=False)
-    db.commit()  # lazy migration/reconciliation is an intentional GET side effect
+    revoke_quality_proposal_if_disabled(document)
+    # Serialization can erase an expired proposal. Build the response before
+    # commit so that tenant-scoped raw text is durably removed by this GET.
     payload = serialize_document(db, document)
     editor_quality = getattr(job, "transcription_quality", None)
     if not isinstance(editor_quality, dict) and job.segments_json:
@@ -11526,6 +11658,7 @@ async def get_editor_document(
         "job_status": job.status,
         "transcription_quality": editor_quality,
     })
+    db.commit()  # lazy migration/reconciliation/expiry is an intentional side effect
     return payload
 
 
@@ -11537,6 +11670,7 @@ async def patch_editor_document(
     db: Session = Depends(get_db),
 ):
     job, document = _editor_document_or_404(db, job_id, current_user)
+    quality_outbox_id = None
     previous_editor_segments = [
         dict(item) for item in (document.current_segments or [])
     ]
@@ -11554,6 +11688,11 @@ async def patch_editor_document(
                 segments=list(document.current_segments or []),
                 previous_segments=previous_editor_segments,
             )
+            quality_outbox_id = _create_editor_quality_outbox(
+                db, job, revision=document.revision,
+                segments=list(document.current_segments or []),
+                quality=job.transcription_quality, reason="editor_save",
+            )
         db.commit()
     except RuntimeError:
         db.rollback()
@@ -11565,18 +11704,110 @@ async def patch_editor_document(
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from None
-    if applied:
-        _enqueue_editor_quality_snapshot(
-            job_id, revision=document.revision,
-            segments=list(document.current_segments or []), filename=job.filename or "",
-            tenant_id=str(job.tenant_id or ""), quality=job.transcription_quality,
-        )
+    _dispatch_editor_quality_outbox(quality_outbox_id)
     return {
         "job_id": job_id,
         "revision": document.revision,
         "version_id": version.id if version else None,
         "saved_at": document.updated_at.isoformat(),
         "applied": applied,
+    }
+
+
+@app.post("/editor/{job_id}/quality-proposals/{proposal_id}/apply")
+async def apply_editor_quality_proposal(
+    job_id: str,
+    proposal_id: str,
+    body: EditorQualityProposalApplyRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    quality_outbox_id = None
+    previous = [dict(item) for item in (document.current_segments or [])]
+    try:
+        document, version, applied = apply_quality_proposal(
+            db, job, document, current_user["id"], proposal_id=proposal_id,
+            base_revision=body.base_revision, window_ids=body.window_ids,
+            idempotency_key=body.idempotency_key,
+        )
+        if applied:
+            from correction_learning import invalidate_job_observations
+            invalidate_job_observations(db, job_id, "quality_proposal_applied")
+            job.transcription_quality = _invalidate_quality_after_editor_save(
+                job, revision=document.revision,
+                segments=list(document.current_segments or []),
+                previous_segments=previous,
+            )
+            quality_outbox_id = _create_editor_quality_outbox(
+                db, job, revision=document.revision,
+                segments=list(document.current_segments or []),
+                quality=job.transcription_quality,
+                reason="quality_proposal_applied",
+            )
+        db.add(AuditLog(
+            user_id=current_user["id"], action="editor.quality_proposal_apply",
+            detail={
+                "job_id": job_id, "proposal_id": proposal_id,
+                "window_ids": list(body.window_ids), "applied": applied,
+                "revision": int(document.revision or 0),
+            },
+        ))
+        db.commit()
+    except QualityProposalsDisabled as exc:
+        # apply_quality_proposal revoked the raw pending payload under lock;
+        # preserve that deletion even though the requested action is disabled.
+        db.commit()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except LookupError:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="quality_proposal_not_found") from None
+    except RuntimeError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    _dispatch_editor_quality_outbox(quality_outbox_id)
+    return {
+        "job_id": job_id, "proposal_id": proposal_id,
+        "revision": int(document.revision or 0),
+        "version_id": version.id if version else None,
+        "applied": applied, "idempotent": not applied,
+    }
+
+
+@app.post("/editor/{job_id}/quality-proposals/{proposal_id}/dismiss")
+async def dismiss_editor_quality_proposal(
+    job_id: str,
+    proposal_id: str,
+    body: EditorQualityProposalDismissRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _, document = _editor_document_or_404(db, job_id, current_user)
+    try:
+        dismissed = dismiss_quality_proposal(
+            db, document, proposal_id=proposal_id,
+            base_revision=body.base_revision, idempotency_key=body.idempotency_key,
+        )
+        db.add(AuditLog(
+            user_id=current_user["id"], action="editor.quality_proposal_dismiss",
+            detail={
+                "job_id": job_id, "proposal_id": proposal_id,
+                "reason": body.reason, "dismissed": dismissed,
+            },
+        ))
+        db.commit()
+    except LookupError:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="quality_proposal_not_found") from None
+    except RuntimeError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    return {
+        "job_id": job_id, "proposal_id": proposal_id,
+        "dismissed": dismissed, "idempotent": not dismissed,
     }
 
 
@@ -11720,6 +11951,8 @@ async def restore_editor_version(
     db: Session = Depends(get_db),
 ):
     job, document = _editor_document_or_404(db, job_id, current_user)
+    previous = [dict(item) for item in (document.current_segments or [])]
+    quality_outbox_id = None
     try:
         _audit_cross_tenant_access(db, current_user, job, "editor_restore", commit=False)
         document, version = restore_version(
@@ -11727,6 +11960,16 @@ async def restore_editor_version(
         )
         from correction_learning import invalidate_job_observations
         invalidate_job_observations(db, job_id, "editor_version_restored")
+        job.transcription_quality = _invalidate_quality_after_editor_save(
+            job, revision=document.revision,
+            segments=list(document.current_segments or []),
+            previous_segments=previous,
+        )
+        quality_outbox_id = _create_editor_quality_outbox(
+            db, job, revision=document.revision,
+            segments=list(document.current_segments or []),
+            quality=job.transcription_quality, reason="editor_version_restored",
+        )
         db.commit()
     except LookupError:
         raise HTTPException(status_code=404, detail="editor_version_not_found") from None
@@ -11737,6 +11980,7 @@ async def restore_editor_version(
             status_code=409,
             detail=_editor_conflict_payload(db, document),
         ) from None
+    _dispatch_editor_quality_outbox(quality_outbox_id)
     return {
         "job_id": job_id,
         "revision": document.revision,
@@ -11753,6 +11997,8 @@ async def resolve_editor_conflict(
     db: Session = Depends(get_db),
 ):
     job, document = _editor_document_or_404(db, job_id, current_user)
+    previous = [dict(item) for item in (document.current_segments or [])]
+    quality_outbox_id = None
     try:
         _audit_cross_tenant_access(db, current_user, job, "editor_conflict_resolve", commit=False)
         document, version, applied = resolve_conflict(
@@ -11762,6 +12008,17 @@ async def resolve_editor_conflict(
         if applied:
             from correction_learning import invalidate_job_observations
             invalidate_job_observations(db, job_id, "editor_conflict_resolved")
+            job.transcription_quality = _invalidate_quality_after_editor_save(
+                job, revision=document.revision,
+                segments=list(document.current_segments or []),
+                previous_segments=previous,
+            )
+            quality_outbox_id = _create_editor_quality_outbox(
+                db, job, revision=document.revision,
+                segments=list(document.current_segments or []),
+                quality=job.transcription_quality,
+                reason="editor_conflict_resolved",
+            )
         db.commit()
     except RuntimeError:
         db.rollback()
@@ -11772,6 +12029,7 @@ async def resolve_editor_conflict(
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from None
+    _dispatch_editor_quality_outbox(quality_outbox_id)
     return {
         **serialize_document(db, document),
         "version_id": version.id if version else None,
@@ -11787,6 +12045,13 @@ _PRODUCT_EVENT_NAMES = {
     "editor_help_opened",
 }
 
+# Ventana de /admin/product-metrics. Sin esto la única acotación era
+# `LIMIT 10000` sobre TODA la tabla, así que el período medido dependía del
+# volumen de telemetría y era imposible comparar dos lecturas entre sí.
+PRODUCT_METRICS_WINDOW_DAYS = int(
+    os.environ.get("PRODUCT_METRICS_WINDOW_DAYS", "28")
+)
+
 _PRODUCT_EVENT_PROPERTIES = {
     "editor_opened": {"line_count", "view", "source"},
     "editor_view_changed": {"from", "to"},
@@ -11797,7 +12062,16 @@ _PRODUCT_EVENT_PROPERTIES = {
     "editor_undo": {"operation", "count"},
     "editor_autosave_success": {"duration_ms", "checkpoint", "retry_count"},
     "editor_autosave_failed": {"duration_ms", "checkpoint", "reason", "status", "retry_count"},
-    "editor_conflict": {"server_revision", "local_revision", "resolution"},
+    # `checkpoint`/`reason` los emite handleDurableStatus al entrar en conflicto
+    # (el emisor histórico, que reportaba resolution, se removió con el
+    # ConflictDialog en #1123). Sin estas dos claves el loop de /analytics/events
+    # rechaza el evento ENTERO al primer key desconocido y el cliente se come el
+    # error con un catch vacío: el contador quedaba clavado en 0 y alguien lo
+    # iba a leer como "no hay conflictos".
+    "editor_conflict": {
+        "server_revision", "local_revision", "resolution",
+        "checkpoint", "reason",
+    },
     "editor_version_restored": {"from_revision", "to_revision"},
     "editor_approved": {
         "revision", "duration_ms", "line_count", "text_changes",
@@ -11889,11 +12163,30 @@ async def product_metrics(
 ):
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
-    query = db.query(ProductEvent)
+    # Ventana temporal explícita + filtro por nombre. Antes esto tomaba las
+    # 10.000 filas más recientes SIN filtrar: `editor_activity_heartbeat` se
+    # emite cada 15 s por editor abierto (4/min) y `transcription_quality_
+    # shadow_decision` lo escribe el worker, así que ambos —que no son eventos
+    # del editor y ni siquiera están en el allowlist— consumían el cupo y
+    # contaminaban `sample_size`, `counts` y el cálculo de sesiones. El
+    # resultado era una ventana temporal desconocida y variable.
+    # `ProductEvent.created_at` es DateTime(timezone=True): comparar contra un
+    # datetime naive deja que Postgres lo interprete en la timezone de la sesión
+    # y la ventana se corre en silencio. Aware desde el arranque.
+    _window_start = datetime.now(timezone.utc) - timedelta(days=PRODUCT_METRICS_WINDOW_DAYS)
+    query = (
+        db.query(ProductEvent)
+        .filter(ProductEvent.created_at >= _window_start)
+        .filter(ProductEvent.name.in_(_PRODUCT_EVENT_NAMES))
+    )
     if not current_user.get("is_super_admin"):
         query = query.filter(ProductEvent.tenant_id == current_user["tenant_id"])
     rows = query.order_by(ProductEvent.created_at.desc()).limit(10000).all()
-    approval_query = db.query(ProductEvent).filter(ProductEvent.name == "editor_approved")
+    approval_query = (
+        db.query(ProductEvent)
+        .filter(ProductEvent.name == "editor_approved")
+        .filter(ProductEvent.created_at >= _window_start)
+    )
     if not current_user.get("is_super_admin"):
         approval_query = approval_query.filter(
             ProductEvent.tenant_id == current_user["tenant_id"]
@@ -12013,8 +12306,27 @@ async def product_metrics(
         if session["opened"] is not None and session["first_edit"] is not None
         and session["first_edit"] >= session["opened"]
     ]
-    opened = counts.get("editor_opened", 0)
-    approvals = counts.get("editor_approved", 0)
+    # `counts` sale de `rows`, que está truncado por el LIMIT — y el numerador
+    # tenía además su propia query suplementaria, así que aprobaciones viejas
+    # entraban y aperturas viejas no: el ratio se inflaba de forma sistemática
+    # (medido en staging: 0,80 informado vs 0,55 real, y >1,0 alcanzable).
+    # Numerador y denominador se cuentan en SQL sobre la MISMA ventana, sin
+    # límite, así que la tasa deja de depender del volumen de telemetría.
+    def _count_events(name: str) -> int:
+        q = (
+            db.query(func.count(ProductEvent.id))
+            .filter(ProductEvent.name == name)
+            .filter(ProductEvent.created_at >= _window_start)
+        )
+        if not current_user.get("is_super_admin"):
+            q = q.filter(ProductEvent.tenant_id == current_user["tenant_id"])
+        return int(q.scalar() or 0)
+
+    opened = _count_events("editor_opened")
+    approvals = _count_events("editor_approved")
+    # Señal explícita de que las métricas derivadas de `rows` (sesiones,
+    # view_usage, percentiles) están calculadas sobre una ventana recortada.
+    events_truncated = len(rows) >= 10000
     def _percentile(values, quantile):
         if not values:
             return None
@@ -12056,6 +12368,10 @@ async def product_metrics(
         "sample_size": len(rows),
         "view_usage": view_usage,
         "approval_rate": approvals / opened if opened else None,
+        # True => `rows` tocó el LIMIT: sample_size/view_usage/sesiones y
+        # los percentiles cubren menos que la ventana declarada.
+        "events_truncated": events_truncated,
+        "window_days": PRODUCT_METRICS_WINDOW_DAYS,
         "conflicts": counts.get("editor_conflict", 0),
         "autosave_failures": counts.get("editor_autosave_failed", 0),
         "undo_count": counts.get("editor_undo", 0),
@@ -12406,6 +12722,7 @@ async def save_segments(
         previous_segments=previous_segments_for_quality,
     )
     touch_user_activity(db, job)
+    quality_outbox_id = None
     try:
         sync_legacy_snapshot(
             db, editor_document, current_user["id"], job.segments_json or [],
@@ -12413,6 +12730,10 @@ async def save_segments(
         )
         from correction_learning import invalidate_job_observations
         invalidate_job_observations(db, job_id, "later_editor_revision")
+        quality_outbox_id = _create_editor_quality_outbox(
+            db, job, revision=job.segments_revision, segments=segs,
+            quality=job.transcription_quality, reason="legacy_editor_save",
+        )
         db.commit()
     except (LookupError, ValueError, RuntimeError) as exc:
         db.rollback()
@@ -12422,11 +12743,7 @@ async def save_segments(
             content={"code": "editor_state_conflict", "detail": str(exc)},
         )
 
-    _enqueue_editor_quality_snapshot(
-        job_id, revision=job.segments_revision, segments=segs,
-        filename=job.filename or "", tenant_id=str(job.tenant_id or ""),
-        quality=job.transcription_quality,
-    )
+    _dispatch_editor_quality_outbox(quality_outbox_id)
 
     # Outcome metric (issue #934): éxito consultable por tenant — junto con
     # el warning del 409 de arriba permite medir la tasa real de fallas del
@@ -13691,85 +14008,44 @@ async def request_edit(
             "force_conflict_overwrite": body.force_conflict_overwrite,
         },
     ))
+    # Commit the publication intent in the same transaction as the Job and
+    # EditorDocument mutation. An ambiguous Redis timeout must not rewind an
+    # editor revision and re-open the ABA window for an old callback.
+    from transactional_outbox import create_outbox_event
+    _edit_outbox = create_outbox_event(
+        db,
+        job_id=job_id,
+        event_type="edit.enqueue",
+        dedupe_key=(
+            f"edit:{job_id}:{int(getattr(job, 'segments_revision', 0) or 0)}:"
+            f"{new_edit_count}:{body.edit_type}"
+        ),
+        payload={
+            "edit_type": body.edit_type,
+            "edit_params": edit_params,
+            "plan": current_user.get("plan", "100"),
+            "tenant_id": current_user.get("tenant_id", ""),
+        },
+    )
     # HOTFIX F1 2026-05-27 (audit): the pre-edit capture moved UP to
     # before the in-memory mutation (search "_pre_edit_artist =" above).
     # The old capture here was a no-op because it read AFTER the
     # job.artist assignment.
     db.commit()
-
-    try:
-        enqueue_edit(
-            job_id=job_id,
-            edit_type=body.edit_type,
-            edit_params=edit_params,
-            plan=current_user.get("plan", "100"),
-            tenant_id=current_user.get("tenant_id", ""),
-        )
-    except Exception as exc:
-        # Enqueue failed (Redis down, unexpected RQ error). Restore the exact
-        # pre-edit state so the user can retry without waiting for the reaper.
-        logger.error("enqueue_edit failed for %s: %s", job_id, exc)
-        job.status = _pre_edit_status
-        job.completed_at = _pre_edit_completed_at
-        job.edit_count = current_edit_count
-        job.editing_started_at = _pre_edit_editing_started_at
-        job.progress = 100
-        job.current_step = "thumbnail"
-        # Audit 2026-05-26: restore the pre-edit segments_json. The edit
-        # handler optimistically persists the new segments BEFORE
-        # enqueueing (so the worker reads the latest lyrics), but if the
-        # enqueue fails the worker never runs — leaving the modified
-        # lyrics persisted is a lie. The operator would re-open the editor
-        # and see edits that were never actually applied to a video.
-        try:
-            job.segments_json = _pre_edit_segments
-            job.segments_revision = _pre_edit_revision
-        except NameError:
-            # Defensive: _pre_edit_segments is only assigned when
-            # body.segments was non-empty. Non-lyrics edits (typography,
-            # background) skip that branch and don't need the rollback.
-            pass
-        # Audit 2026-08-13: mirror the same rollback on editor_documents.
-        # Since the segments write above now goes through save_document()
-        # (job + document move together atomically), leaving the document
-        # at its new revision while job.segments_json reverts would
-        # reintroduce the exact divergence this fix exists to close.
-        # Two separate try/excepts on purpose: the first only guards against
-        # the (expected, common) NameError from a non-lyrics edit that never
-        # touched the document at all — anything else there is a real bug
-        # and should surface. The second is genuinely best-effort (mirrors
-        # this file's existing "audit logging is best-effort" convention):
-        # get_or_create_document does its own row-locked reconciliation
-        # query, and this whole block exists only to restore a UI nicety
-        # (the LyricsEditor showing pre-edit content) — it must never be
-        # able to swallow the actual state rollback above or the final
-        # db.commit() below.
-        _had_document_write = "_pre_edit_document_revision" in locals()
-        if _had_document_write:
-            try:
-                _rollback_document = get_or_create_document(
-                    db, job_id, job.tenant_id, job.segments_json or [],
-                )
-                _rollback_document.current_segments = _pre_edit_document_segments
-                _rollback_document.revision = _pre_edit_document_revision
-            except Exception as _doc_rollback_exc:  # noqa: BLE001
-                logger.warning(
-                    "[EDIT] editor_documents rollback failed for %s (job rollback "
-                    "still applies): %s", job_id, _doc_rollback_exc,
-                )
-        # PR C 2026-05-26: same rollback for metadata. If the enqueue
-        # never landed, the visible artist/song_title in JobDetail would
-        # lie — operator clicks "Guardar título", error, but UI still
-        # shows the new title. Restore the original.
-        try:
-            job.artist = _pre_edit_artist
-            job.song_title = _pre_edit_song_title
-        except NameError:
-            pass
-        db.commit()
-        raise HTTPException(
-            status_code=503,
-            detail="Cola de trabajos no disponible. Intentá de nuevo en unos segundos.",
+    from transactional_outbox import dispatch_outbox_event
+    # Pass the already imported publisher explicitly. Besides keeping this
+    # boundary injectable in tests, it makes the first delivery attempt use
+    # the exact same queue adapter as the API process. Reconciliation still
+    # resolves the adapter from ``queue_jobs`` independently.
+    _outbox_delivery = dispatch_outbox_event(
+        _edit_outbox.id,
+        edit_publisher=enqueue_edit,
+    )
+    _queue_pending = _outbox_delivery.get("status") != "dispatched"
+    if _queue_pending:
+        logger.warning(
+            "[EDIT-OUTBOX] publication pending job=%s event=%s status=%s",
+            job_id, _edit_outbox.id, _outbox_delivery.get("status"),
         )
 
     if _approved_editor_version is not None:
@@ -13793,6 +14069,8 @@ async def request_edit(
         "approved_editor_version_id": (
             _approved_editor_version.id if _approved_editor_version is not None else None
         ),
+        "queue_pending": _queue_pending,
+        "outbox_event_id": _edit_outbox.id,
     }
 
 

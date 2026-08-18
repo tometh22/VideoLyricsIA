@@ -15,7 +15,7 @@ from typing import Iterable
 from evidence_attestation import verify_artifact
 
 
-POLICY_VERSION = "lyrics-quality-v5"
+POLICY_VERSION = "lyrics-quality-v6"
 _TRUE = {"1", "true", "yes", "on"}
 _PIPELINE_CONFIG_KEYS = (
     "TRANSCRIBE_VAD_FIRST", "VAD_CHUNK_ENABLED", "CTC_ALIGN_ENABLED",
@@ -55,6 +55,9 @@ _PIPELINE_CONFIG_KEYS = (
     "TARGETED_STRUCTURAL_AUTOREPAIR_MODE",
     "TRANSCRIPTION_QUALITY_CALIBRATED",
     "TRANSCRIPTION_QUALITY_INLINE_RETRY",
+    "PERFORMANCE_GRAPH_V6_ENABLED", "QUALITY_V6_ANALYSIS_ENABLED",
+    "TARGETED_RESIDUAL_ASR_ENABLED", "QUALITY_V6_MAX_PRIMITIVE_DTW_PAIRS",
+    "QUALITY_V6_PROPOSALS_ENABLED", "QUALITY_V6_MODEL_ENABLED",
 )
 
 RELEASE_REPORT_REQUIRED_CHECKS = frozenset({
@@ -427,7 +430,8 @@ def build_unsafe_windows(segments: list[dict], words: list[dict], *,
                          independent_words: list[dict] | None = None,
                          lexical_unverified: list[dict] | None = None,
                          structural_disagreements: list[dict] | None = None,
-                         evidence_view_disagreements: list[dict] | None = None) -> list[dict]:
+                         evidence_view_disagreements: list[dict] | None = None,
+                         ctc_declines: list[dict] | None = None) -> list[dict]:
     """Locate bounded areas worth a second, independent ASR pass."""
     from audio_coverage import text_mismatches, uncovered_spans
 
@@ -487,6 +491,14 @@ def build_unsafe_windows(segments: list[dict], words: list[dict], *,
         windows.append({
             "start": item.get("start"), "end": item.get("end"),
             "reason": "stem_mix_evidence_disagreement",
+        })
+    for item in ctc_declines or []:
+        if not isinstance(item, dict):
+            continue
+        windows.append({
+            "start": item.get("start"), "end": item.get("end"),
+            "reason": "ctc_short_repeated_motif",
+            "segment_indices": list(item.get("segment_indices") or []),
         })
     return _merge_windows(windows)
 
@@ -778,6 +790,7 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
         },
         "event_count": {
             "live_structural_disagreement", "acoustic_mapping_ambiguous",
+            "ctc_short_repeated_motif",
             "strong_unassigned_vocal_events", "structural_autorepair_uncalibrated",
             "quality_windows_unprocessed", "quality_windows_truncated",
             "provider_timing_collapsed", "text_word_cardinality_mismatch",
@@ -787,6 +800,7 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
             "severe_line_overlaps", "duplicate_line_starts",
             "invalid_timing_range", "timeline_inversion",
             "low_ctc_timing_confidence", "provider_timing_collapsed",
+            "ctc_short_repeated_motif",
         },
         "vocal_coverage": {
             "low_audio_coverage", "soft_audio_coverage", "voiced_gap",

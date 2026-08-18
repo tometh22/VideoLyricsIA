@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import resource
@@ -46,12 +47,16 @@ def reconcile_stale_pending_quality_jobs() -> dict:
     )
     from transcription_quality import segments_hash
 
-    scanned = republished = active = failed = 0
+    scanned = republished = active = failed = expired_proposals = 0
     try:
         _init_redis()
         from queue_jobs import _redis
         db = SessionLocal()
         try:
+            from editor import expire_stale_quality_proposals
+            expired_proposals = expire_stale_quality_proposals(db)
+            if expired_proposals:
+                db.commit()
             page_size = max(10, int(os.environ.get(
                 "QUALITY_PENDING_SCAN_PAGE_SIZE", "200",
             )))
@@ -76,10 +81,11 @@ def reconcile_stale_pending_quality_jobs() -> dict:
                 scanned += 1
                 revision = int(row.segments_revision or 0)
                 content_hash = segments_hash(row.segments_json or [])
-                rq_id = str(quality.get("analysis_job_id") or (
-                    f"transcription-quality:{row.job_id}:{revision}:{content_hash[:12]}"
-                ))
-                if _redis is not None and _active_rq_job(_redis, rq_id) is not None:
+                rq_id = str(quality.get("analysis_job_id") or "")
+                if (
+                    rq_id and _redis is not None
+                    and _active_rq_job(_redis, rq_id) is not None
+                ):
                     active += 1
                     continue
                 try:
@@ -109,10 +115,11 @@ def reconcile_stale_pending_quality_jobs() -> dict:
         try:
             ensure_quality_pending_reconciler_scheduled()
         except Exception:
-            logger.exception("[QUALITY-QUEUE] pending reconciler reschedule failed")
+            logger.error("[QUALITY-QUEUE] pending reconciler reschedule failed")
     return {
         "scanned": scanned, "republished": republished,
         "active": active, "failed": failed,
+        "expired_proposals": expired_proposals,
     }
 
 _WINDOW_REASON_PRIORITY = {
@@ -120,6 +127,7 @@ _WINDOW_REASON_PRIORITY = {
     "invalid_timing_range": 100,
     "duplicate_line_starts": 95,
     "live_structural_disagreement": 90,
+    "ctc_short_repeated_motif": 92,
     "event_count": 90,
     "strong_unassigned_vocal_events": 90,
     "provider_timing_collapsed": 95,
@@ -151,6 +159,51 @@ def _prioritize_windows(windows: list[dict]) -> list[dict]:
     return sorted((dict(window) for window in windows), key=key)
 
 
+def _cardinality_route(structure: dict, existing_count: int) -> dict:
+    """Decide whether acoustic cardinality truly excludes the editor count.
+
+    The best HSMM path is only one hypothesis.  Routing a destructive
+    structural retry is justified only when the editor count lies outside the
+    exact 90% posterior credible set.  Calibration is still pending, so this
+    function can request review but never authorize mutation.
+    """
+    diagnostics = (structure or {}).get("diagnostics") or {}
+    best_count = int(
+        ((structure or {}).get("best_partition") or {}).get("event_count") or 0
+    )
+    credible = []
+    for value in diagnostics.get("cardinality_credible_counts_90") or []:
+        try:
+            credible.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    posterior = (structure or {}).get("cardinality_posterior") or {}
+    if not credible and posterior:
+        ranked = []
+        for key, value in posterior.items():
+            try:
+                ranked.append((int(key), float(value)))
+            except (TypeError, ValueError):
+                continue
+        cumulative = 0.0
+        for count, probability in sorted(ranked, key=lambda item: (-item[1], item[0])):
+            credible.append(count)
+            cumulative += probability
+            if cumulative >= .90:
+                break
+    excluded = bool(credible and existing_count not in credible)
+    return {
+        "route_disagreement": excluded,
+        "best_count": best_count,
+        "existing_count": int(existing_count),
+        "credible_counts_90": sorted(set(credible)),
+        "ambiguous_best_path": bool(
+            best_count and best_count != existing_count and not excluded
+        ),
+        "automatic_apply_allowed": False,
+    }
+
+
 def _max_windows() -> int:
     try:
         configured = int(os.environ.get("TRANSCRIPTION_QUALITY_MAX_WINDOWS", "4"))
@@ -180,10 +233,88 @@ def _snapshot(job_id: str):
             "segments": [dict(item) for item in (row.segments_json or [])],
             "quality": dict(row.transcription_quality or {}),
             "input_r2_key": row.input_r2_key,
+            "audio_revision": int(row.audio_revision or 0),
+            "audio_sha256": str(row.input_audio_sha256 or ""),
+            "active_quality_attempt_id": str(row.active_quality_attempt_id or ""),
             "filename": row.filename,
         }
     finally:
         db.close()
+
+
+def _attested_asr_context(segments: list[dict]) -> dict:
+    """Recover provider-family witnesses without trusting segment labels.
+
+    New transcriptions persist word timing plus an HMAC-attested provenance
+    row on each segment.  Grouping by the attested correlated family lets the
+    targeted retry compare its fresh recognizer family with the original ASR
+    while keeping reference/catalog text out of the witness streams.
+    """
+    from evidence_contracts import (
+        freeze_provider_output,
+        verify_content_provenance_attestation,
+    )
+
+    grouped: dict[str, list[dict]] = {}
+    for segment in segments or []:
+        if not isinstance(segment, dict):
+            continue
+        provenance = segment.get("content_provenance")
+        if (
+            not isinstance(provenance, dict)
+            or str(provenance.get("role") or "") != "asr_witness"
+            or not verify_content_provenance_attestation(provenance)
+        ):
+            continue
+        lineage = provenance.get("lineage") or {}
+        family = str(lineage.get("correlated_family") or "").strip()
+        if not family:
+            continue
+        provider = segment.get("provider_evidence")
+        if not isinstance(provider, dict):
+            continue
+        frozen_row = provider.get("frozen_provider_output")
+        if not isinstance(frozen_row, dict):
+            continue
+        declared_hashes = (
+            str(provenance.get("raw_output_sha256") or ""),
+            str(provider.get("raw_output_sha256") or ""),
+            str(frozen_row.get("output_sha256") or ""),
+        )
+        if any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in declared_hashes):
+            continue
+        actual_hash = freeze_provider_output(provider).output_sha256
+        if any(not hmac.compare_digest(actual_hash, value) for value in declared_hashes):
+            continue
+        # Consume only the provider snapshot whose words are covered by the
+        # frozen output digest and the provenance HMAC.  The visible segment
+        # words are editable and therefore cannot be recognition evidence.
+        words = provider.get("words")
+        if not isinstance(words, list):
+            continue
+        for word in words:
+            if not isinstance(word, dict) or not str(word.get("word") or "").strip():
+                continue
+            try:
+                start, end = float(word.get("start")), float(word.get("end"))
+            except (TypeError, ValueError):
+                continue
+            if start < 0 or end <= start:
+                continue
+            grouped.setdefault(family, []).append({
+                **word, "start": start, "end": end,
+            })
+    ranked = sorted(
+        grouped.items(), key=lambda item: (-len(item[1]), item[0]),
+    )
+    primary = ranked[0] if ranked else ("", [])
+    independent = ranked[1] if len(ranked) > 1 else ("", [])
+    return {
+        "_asr_words": primary[1],
+        "_primary_asr_family": primary[0],
+        "_independent_asr_words": independent[1],
+        "_independent_asr_family": independent[0],
+    }
 
 
 def _queue_wait_seconds() -> float | None:
@@ -201,8 +332,28 @@ def _queue_wait_seconds() -> float | None:
         return None
 
 
+def _safe_audio_identity_metrics(
+    audio_sha256: str, stem_sha256: str,
+) -> dict[str, str | None]:
+    """Pseudonymize stable audio identities before persisting telemetry."""
+    from evidence_contracts import privacy_fingerprint
+
+    return {
+        "audio_fingerprint": privacy_fingerprint(
+            "quality-source-audio", audio_sha256,
+        ) if re.fullmatch(r"[0-9a-f]{64}", str(audio_sha256 or "")) else None,
+        "stem_fingerprint": privacy_fingerprint(
+            "quality-vocal-stem", stem_sha256,
+        ) if re.fullmatch(r"[0-9a-f]{64}", str(stem_sha256 or "")) else None,
+    }
+
+
 def _persist_if_current(job_id: str, expected_revision: int,
-                        expected_hash: str, quality: dict) -> bool:
+                        expected_hash: str, quality: dict, *,
+                        expected_audio_revision: int | None = None,
+                        expected_audio_sha256: str = "",
+                        analysis_attempt_id: str = "",
+                        quality_proposal: dict | None = None) -> bool:
     from database import Job, SessionLocal
     from transcription_quality import quality_fingerprint, segments_hash
 
@@ -216,11 +367,29 @@ def _persist_if_current(job_id: str, expected_revision: int,
             return False
         revision = int(row.segments_revision or 0)
         current_hash = segments_hash(row.segments_json or [])
-        if revision != int(expected_revision) or current_hash != expected_hash:
+        audio_revision = int(row.audio_revision or 0)
+        audio_sha256 = str(row.input_audio_sha256 or "")
+        attempt_id = str(row.active_quality_attempt_id or "")
+        if (
+            revision != int(expected_revision)
+            or current_hash != expected_hash
+            or (
+                expected_audio_revision is not None
+                and audio_revision != int(expected_audio_revision)
+            )
+            or (expected_audio_sha256 and audio_sha256 != expected_audio_sha256)
+            or (analysis_attempt_id and attempt_id != analysis_attempt_id)
+        ):
             logger.info(
-                "[QUALITY-OCC] stale result discarded job=%s expected=%s/%s "
-                "current=%s/%s", job_id, expected_revision, expected_hash[:12],
-                revision, current_hash[:12],
+                "[QUALITY-OCC] stale result discarded job=%s "
+                "segment_revision=%s/%s segment_identity_match=%s "
+                "audio_revision=%s/%s audio_identity_match=%s "
+                "attempt_identity_match=%s",
+                job_id, expected_revision, revision,
+                hmac.compare_digest(current_hash, expected_hash),
+                expected_audio_revision, audio_revision,
+                hmac.compare_digest(audio_sha256, expected_audio_sha256),
+                hmac.compare_digest(attempt_id, analysis_attempt_id),
             )
             return False
         previous = dict(row.transcription_quality or {})
@@ -234,20 +403,41 @@ def _persist_if_current(job_id: str, expected_revision: int,
             quality["analysis_job_id"] = str(previous["analysis_job_id"])
         quality["evaluated_revision"] = revision
         quality["segments_hash"] = current_hash
+        quality["audio_revision"] = audio_revision
+        quality["audio_sha256"] = audio_sha256
+        quality["analysis_attempt_id"] = analysis_attempt_id or attempt_id
         try:
             from quality_learning_model import shadow_prediction_for_quality
             quality["learning_shadow"] = shadow_prediction_for_quality(
                 quality, str(row.timing_source or "unknown"),
             )
-        except Exception as exc:
+        except Exception:
             logger.warning(
-                "[QUALITY-LEARNING] shadow prediction unavailable job=%s error=%s",
-                job_id, str(exc)[:160],
+                "[QUALITY-LEARNING] shadow prediction unavailable job=%s",
+                job_id,
             )
             quality["learning_shadow"] = {
                 "available": False, "reason": "prediction_failed",
                 "mutated_segments": False,
             }
+        if quality_proposal:
+            try:
+                from editor import persist_quality_proposal_if_current
+                quality["review_proposal_persisted"] = bool(
+                    persist_quality_proposal_if_current(
+                        db, job_id=job_id,
+                        expected_revision=expected_revision,
+                        expected_segments_hash=expected_hash,
+                        expected_audio_revision=audio_revision,
+                        expected_audio_sha256=audio_sha256,
+                        proposal=quality_proposal,
+                    )
+                )
+            except Exception:
+                logger.error(
+                    "[QUALITY-PROPOSAL] fail-closed persistence job=%s", job_id,
+                )
+                quality["review_proposal_persisted"] = False
         new_fingerprint = quality_fingerprint(
             quality, revision=revision, content_hash=current_hash,
         )
@@ -258,6 +448,7 @@ def _persist_if_current(job_id: str, expected_revision: int,
         ):
             quality["acknowledgement"] = ack
         row.transcription_quality = quality
+        row.active_quality_attempt_id = None
         from quality_shadow import record_shadow_decision
         record_shadow_decision(
             db, row, quality, previous_quality=previous,
@@ -322,30 +513,252 @@ def _structure_summary(structure: dict) -> dict:
         "cardinality_posterior": structure.get("cardinality_posterior") or {},
         "motif_groups": structure.get("motif_groups") or [],
         "self_similarity": structure.get("self_similarity") or {},
+        "performance_graph_id": structure.get("performance_graph_id"),
+        "subevents": structure.get("subevents") or [],
+        "performance_boundaries": structure.get("performance_boundaries") or [],
         "diagnostics": structure.get("diagnostics") or {},
         "boundary_count": len(structure.get("boundaries") or []),
         "n_best_count": len(structure.get("n_best") or []),
     }
 
 
-def _sanitize_analytical_evidence(value):
-    """Remove lyric/word payloads before quality diagnostics are persisted."""
+_ANALYTICAL_KEYS = frozenset({
+    # Containers and identity-safe references.
+    "windows", "window", "window_id", "id", "parent_window_id",
+    "analysis_windows", "acoustic_structure", "content_mapping", "events",
+    "subevents", "performance_boundaries", "best_partition", "n_best",
+    "cardinality_posterior", "motif_groups", "self_similarity", "diagnostics",
+    "phonetic_evidence", "phonetic_candidates", "model_identity",
+    "evidence_lineage", "parent_coverage", "resolved_window_ids",
+    "review_proposal", "blockers", "reasons", "reason", "declined",
+    "structural_hybrid_diagnostics", "current_segments", "proposed_segments",
+    # Booleans, counters and bounded measurements.
+    "accepted", "complete", "attempted", "failed", "blocked", "suggested",
+    "applied", "mutated_segments", "phonetic_verified",
+    "v6_legacy_mutation_blocked",
+    "independent_content_verified", "acoustic_crowd_evidence", "cache_hit",
+    "windows_processed", "windows_total", "windows_skipped", "windows_truncated",
+    "windows_considered", "windows_tiled", "windows_resolved", "window_count",
+    "parent_windows_total", "parent_windows_incomplete", "boundary_count",
+    "n_best_count", "event_count", "word_count", "text_count", "text_length",
+    "text_present", "provider_attempts", "asr_calls", "gemini_calls",
+    "residual_asr_calls", "slowed_asr_calls", "demucs_attempts", "cache_hits",
+    "cache_misses", "lines_suggested", "lines_replaced", "lines_inserted",
+    "targets_removed", "structural_repairs", "structural_events",
+    "structural_hybrid_attempts", "structural_hybrid_accepts",
+    "strong_unassigned_events", "unassigned_events", "viable_hypotheses",
+    "authorized_windows", "candidates", "invalid_candidates",
+    "start", "end", "core_start", "core_end", "duration", "margin",
+    "phase_margin", "max_phase_delta", "median_phase_delta", "starts",
+    "raw_score", "score", "confidence", "probability", "coverage",
+    "audio_seconds_billed", "submitted_audio_seconds", "gemini_audio_seconds",
+    "residual_audio_seconds", "slowed_audio_seconds", "api_cost_usd",
+    "estimated_openai_asr_cost_usd", "estimated_gemini_cost_usd",
+    "cost_complete", "stem_cache_hit", "calibration_id", "schema",
+    "policy_version", "kind", "taxonomy", "composition", "source", "status",
+    "failure_reason", "selected_candidate_id", "evidence_sha256",
+    "model_revision", "stem_sha256", "mix_sha256", "cache_ref",
+    "evidence_fingerprint", "stem_fingerprint", "mix_fingerprint",
+})
+
+_ANALYTICAL_RAW_HASH_KEYS = frozenset({
+    "evidence_sha256", "stem_sha256", "mix_sha256",
+})
+
+_ANALYTICAL_STRING_VALUES = frozenset({
+    "lyrics-quality-v6", "lyrics-quality-v6-diagnostic-v1",
+    "lyrics-quality-v6-review-proposal-v1", "review_proposal",
+    "review_proposal_window", "diagnostic_finding", "unknown", "accepted",
+    "declined", "pending", "complete", "failed", "retry_failed",
+    "review_required", "transcription_quality", "performance_graph_content_lattice",
+    "progressive_asr_consensus", "ctc-phonetic-evidence-v1",
+    "cross_occurrence_content_consensus", "recurrence_content_disagreement",
+    "SUNG_LEAD", "SUNG_CROWD", "SPEECH", "NONLEXICAL", "METADATA",
+    "CROWD_NOISE", "UNKNOWN", "lexical", "vocalization", "sustained",
+    "lexical_plus_vocalization", "source_audio_demucs",
+    *_WINDOW_REASON_PRIORITY.keys(),
+    "acoustic_cardinality_disagreement", "quality_windows_unprocessed",
+    "quality_windows_truncated", "cost_budget", "cost_budget_base_views",
+    "cost_budget_residual_view", "cost_budget_slow_view", "cost_budget_gemini_view",
+    "stage_deadline", "stage_deadline_after_stem", "invalid_unbounded_tile",
+    "proposal_kill_switch_off", "pinned_artifacts_missing", "invalid_contract",
+    "invalid_candidate_contract", "proposal_current_segments_mismatch",
+    "proposal_certification_conflict", "runtime_identity_mismatch",
+    "input_r2_key_missing", "source_audio_changed", "vocal_stem_unavailable",
+    "provider_timeout", "redacted",
+})
+
+
+def _safe_analytical_string(key: str, value) -> str:
+    raw = str(value or "").strip()
+    if raw in _ANALYTICAL_STRING_VALUES:
+        return raw
+    if key.endswith("_fingerprint") and re.fullmatch(
+        r"hmac-sha256:v1:[a-z0-9_.-]{1,32}:[0-9a-f]{64}", raw,
+    ):
+        return raw
+    if key in {"id", "window_id", "parent_window_id", "selected_candidate_id"} and re.fullmatch(
+        r"(?:qw_[0-9a-f]{16}|quality-window-[0-9]+|[0-9a-f]{16,64})", raw,
+    ):
+        return raw
+    if key.endswith("sha256") and re.fullmatch(r"[0-9a-f]{40,64}", raw):
+        return raw
+    if key == "model_revision" and re.fullmatch(r"[0-9a-f]{40,64}", raw):
+        return raw
+    return "redacted"
+
+
+def _sanitize_analytical_evidence(value, *, _key: str = ""):
+    """Project diagnostics through a recursive allow-list.
+
+    Unknown keys are discarded rather than searched for a handful of forbidden
+    names.  Free-form strings under known keys are reduced to a fixed enum or a
+    non-content identifier.  This makes future provider payload expansion safe
+    by default.
+    """
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            if key == "text":
+                sanitized["text_present"] = bool(str(item or "").strip())
+                sanitized["text_length"] = len(str(item or ""))
+                continue
+            if key == "texts":
+                sanitized["text_count"] = len(item or []) if isinstance(item, list) else 0
+                continue
+            if key == "words":
+                sanitized["word_count"] = len(item or []) if isinstance(item, list) else 0
+                continue
+            if key in _ANALYTICAL_RAW_HASH_KEYS:
+                raw_hash = str(item or "").strip().lower()
+                if re.fullmatch(r"[0-9a-f]{64}", raw_hash):
+                    from evidence_contracts import privacy_fingerprint
+                    fingerprint = privacy_fingerprint(
+                        f"quality-analytics:{key}", raw_hash,
+                    )
+                    if fingerprint:
+                        sanitized[key.removesuffix("_sha256") + "_fingerprint"] = (
+                            fingerprint
+                        )
+                continue
+            if key not in _ANALYTICAL_KEYS:
+                continue
+            sanitized[key] = _sanitize_analytical_evidence(item, _key=key)
+        return sanitized
     if isinstance(value, list):
-        return [_sanitize_analytical_evidence(item) for item in value]
-    if not isinstance(value, dict):
+        return [
+            _sanitize_analytical_evidence(item, _key=_key)
+            for item in value
+            if isinstance(item, (dict, list, bool, int, float))
+            or (isinstance(item, str) and _safe_analytical_string(_key, item) != "redacted")
+        ]
+    if isinstance(value, str):
+        return _safe_analytical_string(_key, value)
+    if isinstance(value, bool) or value is None:
         return value
-    sanitized = {}
-    for key, item in value.items():
-        if key == "text":
-            sanitized["text_present"] = bool(str(item or "").strip())
-            sanitized["text_length"] = len(str(item or ""))
-        elif key == "texts":
-            sanitized["text_count"] = len(item or []) if isinstance(item, list) else 0
-        elif key == "words":
-            sanitized["word_count"] = len(item or []) if isinstance(item, list) else 0
-        else:
-            sanitized[key] = _sanitize_analytical_evidence(item)
-    return sanitized
+    if isinstance(value, (int, float)):
+        try:
+            return value if math.isfinite(float(value)) else None
+        except (OverflowError, TypeError, ValueError):
+            return None
+    return None
+
+
+def _build_review_proposal(segments: list[dict], raw_windows: list[dict],
+                           coverage: dict[str, dict]) -> tuple[dict | None, dict]:
+    """Build a typed tenant-scoped proposal; return only text-free telemetry."""
+    from quality_v6_calibration import runtime_review_proposal_authorization
+    from quality_v6_contracts import (
+        POLICY_VERSION, PROPOSAL_WINDOW_SCHEMA, REVIEW_PROPOSAL_SCHEMA,
+        ReviewProposal, ReviewProposalCandidate,
+    )
+
+    grouped: dict[str, dict] = {}
+    invalid_candidates = 0
+    for raw in raw_windows or []:
+        if not isinstance(raw, dict):
+            invalid_candidates += 1
+            continue
+        try:
+            candidate = ReviewProposalCandidate.from_mapping(raw)
+        except (TypeError, ValueError):
+            invalid_candidates += 1
+            continue
+        parent_id = candidate.parent_window_id
+        if not parent_id or not (coverage.get(parent_id) or {}).get("complete"):
+            continue
+        group = grouped.setdefault(parent_id, {
+            "kind": "review_proposal_window",
+            "schema": PROPOSAL_WINDOW_SCHEMA,
+            "id": parent_id, "start": candidate.start,
+            "end": candidate.end, "reasons": set(),
+            "current_segments": [], "proposed_segments": [],
+            "certification": candidate.certification,
+            "certification_conflict": False,
+        })
+        if group["certification"] != candidate.certification:
+            group["certification_conflict"] = True
+        group["start"] = min(group["start"], candidate.start)
+        group["end"] = max(group["end"], candidate.end)
+        group["reasons"].update(candidate.reasons)
+        group["current_segments"].extend(dict(item) for item in candidate.current_segments)
+        group["proposed_segments"].extend(dict(item) for item in candidate.proposed_segments)
+
+    def key(item: dict) -> tuple:
+        return (
+            str(item.get("_id") or item.get("id") or ""),
+            round(float(item.get("start") or 0), 4),
+            round(float(item.get("end") or 0), 4),
+            str(item.get("text") or ""),
+        )
+
+    windows = []
+    authorization_blockers: set[str] = set()
+    current_keys = {key(item) for item in segments if isinstance(item, dict)}
+    for group in grouped.values():
+        if group.pop("certification_conflict", False):
+            authorization_blockers.add("proposal_certification_conflict")
+            continue
+        # Bind every declared replacement row to the exact current editor
+        # snapshot supplied to this builder. A malformed/stale candidate may
+        # never turn an intended replacement into an overlapping insertion.
+        if any(key(item) not in current_keys for item in group["current_segments"]):
+            authorization_blockers.add("proposal_current_segments_mismatch")
+            continue
+        authorization = runtime_review_proposal_authorization(group.pop("certification", None))
+        authorization_blockers.update(authorization.get("blockers") or [])
+        if not authorization.get("authorized"):
+            continue
+        for field in ("current_segments", "proposed_segments"):
+            unique = {}
+            for item in group[field]:
+                unique[key(item)] = item
+            group[field] = sorted(unique.values(), key=lambda item: (
+                float(item.get("start") or 0), float(item.get("end") or 0),
+            ))
+        group["reasons"] = sorted(group["reasons"])
+        windows.append(group)
+    telemetry = {
+        "candidates": len(grouped), "authorized_windows": len(windows),
+        "blocked": bool(grouped) and not bool(windows),
+        "blockers": sorted(authorization_blockers),
+        "invalid_candidates": invalid_candidates,
+    }
+    if not windows:
+        return None, telemetry
+    try:
+        proposal = ReviewProposal.from_mapping({
+            "kind": "review_proposal",
+            "schema": REVIEW_PROPOSAL_SCHEMA,
+            "policy_version": POLICY_VERSION,
+            "review_only": True,
+            "windows": windows,
+        }).to_dict()
+    except (TypeError, ValueError):
+        telemetry["blocked"] = True
+        telemetry["blockers"] = sorted(set(telemetry["blockers"] + ["invalid_contract"]))
+        return None, telemetry
+    return proposal, telemetry
 
 
 def _normalise_lyric(text: str) -> str:
@@ -407,18 +820,20 @@ def _valid_independent_content_attestation(
         or not re.fullmatch(r"[0-9a-f]{64}", signature)
     ):
         return False
-    secret = str(
+    from evidence_contracts import strong_hmac_secret_bytes
+
+    secret = strong_hmac_secret_bytes(
         os.environ.get("QUALITY_CONTENT_ATTESTATION_KEY")
         or os.environ.get("QUALITY_LEARNING_HMAC_KEY") or ""
-    ).strip()
-    if not secret:
+    )
+    if secret is None:
         return False
     encoded = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
     evidence_sha = hashlib.sha256(encoded).hexdigest()
     expected_signature = hmac.new(
-        secret.encode("utf-8"), encoded, hashlib.sha256,
+        secret, encoded, hashlib.sha256,
     ).hexdigest()
     return bool(
         hmac.compare_digest(signature, expected_signature)
@@ -514,12 +929,20 @@ def _confirmed_windows(segments: list[dict], windows: list[dict],
 
 def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                                   expected_segments_hash: str,
-                                  filename: str = "") -> dict:
+                                  filename: str = "",
+                                  expected_audio_revision: int | None = None,
+                                  expected_audio_sha256: str = "",
+                                  analysis_attempt_id: str = "",
+                                  quality_runtime_token: str = "") -> dict:
     """RQ entry point. Analyze unsafe windows and persist evidence only."""
     from observability import set_job_log_context
     from transcription_quality import calibration_identity, evaluate, segments_hash
 
     set_job_log_context(job_id)
+    if quality_runtime_token:
+        from queue_jobs import _transcription_quality_runtime_token
+        if _transcription_quality_runtime_token() != quality_runtime_token:
+            return {"status": "discarded", "reason": "runtime_identity_mismatch"}
     started = time.monotonic()
     usage_before = resource.getrusage(resource.RUSAGE_SELF)
     queue_wait_s = _queue_wait_seconds()
@@ -530,6 +953,18 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
     if (
         snapshot["revision"] != int(expected_revision)
         or actual_hash != expected_segments_hash
+        or (
+            expected_audio_revision is not None
+            and snapshot["audio_revision"] != int(expected_audio_revision)
+        )
+        or (
+            expected_audio_sha256
+            and snapshot["audio_sha256"] != expected_audio_sha256
+        )
+        or (
+            analysis_attempt_id
+            and snapshot["active_quality_attempt_id"] != analysis_attempt_id
+        )
     ):
         return {"status": "discarded", "reason": "stale_snapshot"}
     quality_before = snapshot["quality"]
@@ -550,6 +985,9 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
         failed["analysis_pending"] = False
         _persist_if_current(
             job_id, expected_revision, expected_segments_hash, failed,
+            expected_audio_revision=expected_audio_revision,
+            expected_audio_sha256=expected_audio_sha256,
+            analysis_attempt_id=analysis_attempt_id,
         )
         return {"status": "retry_failed", "reason": "input_r2_key_missing"}
 
@@ -567,6 +1005,12 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             if not storage.download_object(snapshot["input_r2_key"], audio_path):
                 raise RuntimeError("source_audio_download_failed")
             audio_hash = sha256_file(audio_path)
+            if expected_audio_sha256 and audio_hash != expected_audio_sha256:
+                return {"status": "discarded", "reason": "source_audio_changed"}
+            from pipeline import _ffprobe_duration
+            audio_duration = _ffprobe_duration(audio_path)
+            if audio_duration is None or float(audio_duration) <= 0:
+                raise RuntimeError("source_audio_duration_unavailable")
             stem_path = vocal_sep.separate_vocals(audio_path, cache_only=True)
             stem_cache_hit = bool(stem_path)
             if not stem_path:
@@ -580,36 +1024,69 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             cache = QualityCache()
             analyses = []
             cache_hits = 0
-            windows_truncated = 0
             max_windows = _max_windows()
-            prioritized_windows = _prioritize_windows(windows)
-            for window in prioritized_windows[:max_windows]:
-                raw_start = float(window.get("start") or 0.0)
-                raw_end = float(window.get("end") or raw_start)
-                start = max(0.0, raw_start - 3.0)
-                end = min(start + 45.0, raw_end + 3.0)
-                truncated = end + 1e-6 < raw_end + 3.0
-                windows_truncated += int(truncated)
-                bounded = {
-                    **window, "start": start, "end": end,
-                    "analysis_truncated": truncated,
-                    "requested_end_with_context": raw_end + 3.0,
-                }
+            prioritized_windows = [
+                {**item, "id": item.get("id") or f"quality-window-{index}"}
+                for index, item in enumerate(_prioritize_windows(windows))
+            ]
+            windows = prioritized_windows
+            from quality_windows import parent_coverage, tile_unsafe_windows
+            all_tiles = tile_unsafe_windows(
+                prioritized_windows, core_seconds=24.0, context_seconds=3.0,
+                audio_duration=float(audio_duration),
+            )
+            truncated_parent_ids = {
+                str(tile.get("parent_window_id") or tile.get("id"))
+                for tile in all_tiles if tile.get("analysis_truncated")
+            }
+            selected_tiles = all_tiles[:max_windows]
+            for bounded in selected_tiles:
                 structure, hit = _cached_structure(
                     cache, audio_hash, stem_hash, stem_path, audio_path, bounded,
+                )
+                core_start = float(bounded.get("core_start", bounded.get("start", 0)))
+                core_end = float(bounded.get("core_end", bounded.get("end", core_start)))
+                existing_count = sum(
+                    1 for segment in snapshot["segments"]
+                    if isinstance(segment, dict)
+                    and float(segment.get("end") or 0) > core_start
+                    and float(segment.get("start") or 0) < core_end
+                )
+                cardinality = _cardinality_route(structure, existing_count)
+                bounded["acoustic_cardinality"] = cardinality
+                if cardinality["route_disagreement"]:
+                    reasons = set(bounded.get("reasons") or [])
+                    reasons.add("acoustic_cardinality_disagreement")
+                    bounded["reasons"] = sorted(reasons)
+                    bounded["acoustic_phrase_count"] = cardinality["best_count"]
+                    bounded["editor_segment_count"] = existing_count
+                best_events = list(
+                    (structure.get("best_partition") or {}).get("events") or []
+                )
+                bounded["acoustic_crowd_evidence"] = any(
+                    str(event.get("taxonomy") or "") == "SUNG_CROWD"
+                    or float(
+                        (event.get("type_posterior") or {}).get(
+                            "crowd_or_overlap", 0.0,
+                        ) or 0.0
+                    ) >= .35
+                    for event in best_events if isinstance(event, dict)
                 )
                 cache_hits += int(hit)
                 analyses.append({
                     "window": bounded,
                     "structure": _structure_summary(structure),
                 })
+            # selected_tiles contains the same dictionaries mutated above;
+            # provider retries now consume acoustic disagreement directly.
 
             retry_stats = {
                 "attempted": True, "queue": "transcription_quality",
                 "windows_processed": len(analyses),
-                "windows_total": len(windows),
-                "windows_skipped": max(0, len(windows) - len(analyses)),
-                "windows_truncated": windows_truncated,
+                "windows_total": len(all_tiles),
+                "parent_windows_total": len(windows),
+                "windows_skipped": max(0, len(all_tiles) - len(analyses)),
+                "windows_truncated": len(truncated_parent_ids),
                 "cache_hits": cache_hits,
                 "cache_misses": len(analyses) - cache_hits,
                 "mutated_segments": False,
@@ -618,15 +1095,21 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 "stem_cache_hit": stem_cache_hit,
                 "demucs_attempts": 0 if stem_cache_hit else 1,
             }
+            raw_proposal_windows = []
             # The provider/content retry remains separately kill-switchable.
-            # Even if it proposes rows, this worker persists only diagnostics.
+            # Raw rows stay in memory until the typed, signed review-proposal
+            # gate accepts them; global quality analytics receive only counts.
             if os.environ.get("TARGETED_CONSENSUS_ENABLED", "0").lower() in {
                 "1", "true", "yes", "on",
             }:
                 from targeted_consensus import reprocess
+                asr_context = _attested_asr_context(snapshot["segments"])
                 _ignored, provider_stats = reprocess(
-                    {"segments": snapshot["segments"], "_asr_words": []},
-                    audio_path, windows, job_id=job_id, stem_path=stem_path,
+                    {"segments": snapshot["segments"], **asr_context},
+                    audio_path, selected_tiles, job_id=job_id, stem_path=stem_path,
+                )
+                raw_proposal_windows = list(
+                    provider_stats.pop("quality_proposal_windows", []) or []
                 )
                 retry_stats.update(provider_stats)
                 retry_stats["mutated_segments"] = False
@@ -652,11 +1135,30 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                     "structural_hybrid_diagnostics",
                 ) or [] if isinstance(item, dict)
             ]
-            remaining_windows, resolved_windows = _confirmed_windows(
-                snapshot["segments"], windows, hybrid_diagnostics,
+            processed_ids = {str(item["window"].get("id")) for item in analyses}
+            coverage = parent_coverage(all_tiles, processed_ids)
+            retry_stats["parent_coverage"] = coverage
+            quality_proposal, proposal_telemetry = _build_review_proposal(
+                snapshot["segments"], raw_proposal_windows, coverage,
+            )
+            retry_stats["review_proposal"] = proposal_telemetry
+            complete_parent_ids = {
+                parent_id for parent_id, item in coverage.items() if item.get("complete")
+            }
+            complete_windows = [
+                item for item in windows
+                if str(item.get("id")) in complete_parent_ids
+            ]
+            incomplete_windows = [
+                item for item in windows
+                if str(item.get("id")) not in complete_parent_ids
+            ]
+            complete_remaining, resolved_windows = _confirmed_windows(
+                snapshot["segments"], complete_windows, hybrid_diagnostics,
                 expected_stem_sha256=stem_hash,
                 expected_mix_sha256=audio_hash,
             )
+            remaining_windows = [*incomplete_windows, *complete_remaining]
             retry_stats["windows_resolved"] = len(resolved_windows)
             retry_stats["resolved_window_ids"] = [
                 item.get("id") for item in resolved_windows if item.get("id")
@@ -698,24 +1200,36 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             "stem_cache_hit": bool(retry_stats.get("stem_cache_hit")),
             "source_audio_bytes": source_audio_bytes,
             "stem_audio_bytes": stem_audio_bytes,
-            "audio_sha256": audio_hash,
-            "stem_sha256": stem_hash,
+            **_safe_audio_identity_metrics(audio_hash, stem_hash),
             "api_cost_usd": retry_stats.get("api_cost_usd"),
             "cost_complete": bool(retry_stats.get("cost_complete", False)),
         }
         persisted = _persist_if_current(
             job_id, expected_revision, expected_segments_hash, quality,
+            expected_audio_revision=expected_audio_revision,
+            expected_audio_sha256=expected_audio_sha256,
+            analysis_attempt_id=analysis_attempt_id,
+            quality_proposal=quality_proposal,
         )
         return {
             "status": "persisted" if persisted else "discarded",
             "reason": None if persisted else "stale_after_analysis",
             "decision": quality.get("decision"),
         }
-    except Exception:
-        logger.exception("[QUALITY-JOB] failed job=%s", job_id)
+    except Exception as exc:
+        # Provider exceptions may embed transcript excerpts.  Never log the
+        # message or traceback on this content-processing boundary.
+        logger.error(
+            "[QUALITY-JOB] failed job=%s error_type=%s",
+            job_id, type(exc).__name__,
+        )
         # Let RQ Retry handle transient R2/Demucs/provider failures.  Only the
         # on_failure callback after retries are exhausted persists retry_failed.
-        raise
+        # RQ logs uncaught exception messages, so never re-raise a provider
+        # exception that may contain transcript excerpts.
+        raise RuntimeError(
+            f"quality_job_failed:{type(exc).__name__}"
+        ) from None
     finally:
         if stem_path:
             try:
@@ -750,7 +1264,10 @@ def transcription_quality_failure_callback(job, connection, type_, value, traceb
             unsafe_windows=snapshot["quality"].get("unsafe_windows") or [],
             retry_stats={
                 "attempted": True, "failed": True,
-                "failure_reason": f"{getattr(type_, '__name__', 'Error')}:{str(value)[:160]}",
+                "failure_reason": (
+                    "provider_failure:"
+                    f"{getattr(type_, '__name__', 'Error')}"
+                ),
                 "queue": "transcription_quality", "mutated_segments": False,
             },
         )
@@ -759,6 +1276,12 @@ def transcription_quality_failure_callback(job, connection, type_, value, traceb
         _persist_if_current(
             job_id, int(kwargs.get("expected_revision", -1)),
             str(kwargs.get("expected_segments_hash") or ""), failed,
+            expected_audio_revision=kwargs.get("expected_audio_revision"),
+            expected_audio_sha256=str(kwargs.get("expected_audio_sha256") or ""),
+            analysis_attempt_id=str(kwargs.get("analysis_attempt_id") or ""),
         )
-    except Exception:
-        logger.exception("[QUALITY-JOB] failure callback failed")
+    except Exception as exc:
+        logger.error(
+            "[QUALITY-JOB] failure callback failed error_type=%s",
+            type(exc).__name__,
+        )

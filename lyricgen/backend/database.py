@@ -2,6 +2,7 @@
 
 import os
 from datetime import datetime, timezone
+from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
@@ -40,6 +41,48 @@ class JSONB(TypeDecorator):
             from sqlalchemy.dialects.postgresql import JSONB as _JSONB
             return dialect.type_descriptor(_JSONB())
         return dialect.type_descriptor(JSON())
+
+
+# RQ attempt ids are persisted as concurrency tokens.  Keep enough room for
+# future queue namespaces even though v6 currently uses a compact hashed id.
+# PostgreSQL enforces VARCHAR limits while SQLite does not, so worker startup
+# validates the deployed column against this constant explicitly.
+QUALITY_ATTEMPT_ID_MAX_LENGTH = 160
+
+
+def validate_quality_attempt_id_column(
+    data_type: Optional[str], character_maximum_length: Optional[int],
+) -> None:
+    """Validate the PostgreSQL type contract for the quality CAS token."""
+    normalized = str(data_type or "").strip().lower()
+    if normalized == "text":
+        return
+    if normalized not in {"character varying", "varchar"}:
+        raise RuntimeError(
+            "jobs.active_quality_attempt_id must be TEXT or VARCHAR"
+        )
+    if int(character_maximum_length or 0) < QUALITY_ATTEMPT_ID_MAX_LENGTH:
+        raise RuntimeError(
+            "jobs.active_quality_attempt_id is too short: "
+            f"requires >= {QUALITY_ATTEMPT_ID_MAX_LENGTH} characters"
+        )
+
+
+def assert_quality_attempt_id_schema_contract() -> None:
+    """Fail worker startup when PostgreSQL still has the unsafe v6 width."""
+    if engine.dialect.name != "postgresql":
+        return
+    with engine.connect() as connection:
+        row = connection.execute(text("""
+            SELECT data_type, character_maximum_length
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'jobs'
+              AND column_name = 'active_quality_attempt_id'
+        """)).first()
+    if row is None:
+        raise RuntimeError("jobs.active_quality_attempt_id is missing")
+    validate_quality_attempt_id_column(row[0], row[1])
 
 # ---------------------------------------------------------------------------
 # Connection
@@ -537,6 +580,17 @@ class Job(Base):
     # browser to re-upload it (the previous flow uploaded the file twice
     # and OOMed the API container on lossless WAVs).
     input_r2_key = Column(Text, nullable=True)
+    # Immutable identity of the currently selected source audio.  Quality
+    # workers bind every result to these fields so replacing an object at the
+    # same logical job can never attach evidence from audio B to lyrics A.
+    input_audio_sha256 = Column(String(64), nullable=True)
+    input_audio_etag = Column(Text, nullable=True)
+    audio_revision = Column(
+        BigInteger, default=0, nullable=False, server_default="0",
+    )
+    active_quality_attempt_id = Column(
+        String(QUALITY_ATTEMPT_ID_MAX_LENGTH), nullable=True,
+    )
 
     # In-flight multipart upload id while the browser is still PUTting
     # parts directly to R2. Cleared on multipart_complete (or aborted by
@@ -780,8 +834,38 @@ class EditorDocument(Base):
     updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     lock_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     lock_expires_at = Column(DateTime(timezone=True), nullable=True)
+    # Raw proposal text is intentionally tenant-scoped in the editor layer;
+    # analytics/quality JSON stores only hashes and aggregate diagnostics.
+    quality_proposal = Column(JSONB, nullable=True)
 
     job = relationship("Job", back_populates="editor_document")
+
+
+class JobOutboxEvent(Base):
+    """Durable publication intent committed with the owning Job mutation."""
+    __tablename__ = "job_outbox_events"
+    __table_args__ = (
+        Index("ix_job_outbox_status_available", "status", "available_at"),
+        Index("ix_job_outbox_events_dedupe_key", "dedupe_key", unique=True),
+    )
+
+    id = Column(String(36), primary_key=True)
+    job_id = Column(
+        String(12), ForeignKey("jobs.job_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    event_type = Column(String(64), nullable=False, index=True)
+    dedupe_key = Column(String(160), nullable=False)
+    payload = Column(JSONB, nullable=False)
+    status = Column(String(20), nullable=False, default="pending", server_default="pending")
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    available_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    dispatched_at = Column(DateTime(timezone=True), nullable=True)
+    processing_at = Column(DateTime(timezone=True), nullable=True)
+    processing_token = Column(String(36), nullable=True)
+    consumed_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(String(160), nullable=True)
 
 
 class EditorVersion(Base):
@@ -1641,6 +1725,10 @@ def _migrate_user_columns():
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS umg_short_url VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS song_title VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS input_r2_key VARCHAR(500)",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS input_audio_sha256 VARCHAR(64)",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS input_audio_etag TEXT",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS audio_revision BIGINT DEFAULT 0 NOT NULL",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS active_quality_attempt_id VARCHAR(160)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS multipart_upload_id VARCHAR(255)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS timing_source VARCHAR(20)",
         # Library exclusivity (UMG): tenant-owned and variation-parent references.
@@ -1709,6 +1797,10 @@ def _migrate_user_columns():
         # this mirrors the repository's startup self-heal convention.
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version INTEGER DEFAULT 0 NOT NULL",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS segments_revision BIGINT DEFAULT 0 NOT NULL",
+        "ALTER TABLE editor_documents ADD COLUMN IF NOT EXISTS quality_proposal JSONB",
+        "ALTER TABLE job_outbox_events ADD COLUMN IF NOT EXISTS processing_at TIMESTAMPTZ",
+        "ALTER TABLE job_outbox_events ADD COLUMN IF NOT EXISTS processing_token VARCHAR(36)",
+        "ALTER TABLE job_outbox_events ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS youtube_short_data JSONB",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
@@ -1730,6 +1822,7 @@ def _migrate_user_columns():
     # deploys (new container starts while old one still holds connections).
     _widen_column_to_text("jobs", "input_r2_key")
     _widen_column_to_text("jobs", "multipart_upload_id")
+    _widen_varchar_column("jobs", "active_quality_attempt_id", 160)
 
     # Cast JSON → JSONB so PostgreSQL equality operators work (required for
     # DISTINCT queries and index support). Safe: JSONB is a strict superset.
@@ -1767,6 +1860,36 @@ def _widen_column_to_text(table: str, column: str) -> None:
             conn.execute(text(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE TEXT"))
     except Exception as e:  # pragma: no cover
         print(f"[init_db] widen skipped: {table}.{column} → {e}")
+
+
+def _widen_varchar_column(table: str, column: str, minimum: int) -> None:
+    """Expand an existing PostgreSQL VARCHAR without narrowing TEXT columns."""
+    if engine.dialect.name != "postgresql":
+        return
+    from sqlalchemy import text
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT data_type, character_maximum_length "
+                "FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = :t AND column_name = :c"
+            ), {"t": table, "c": column}).fetchone()
+        if not row or str(row[0]).lower() == "text":
+            return
+        if (
+            str(row[0]).lower() in {"character varying", "varchar"}
+            and int(row[1] or 0) >= int(minimum)
+        ):
+            return
+        with engine.begin() as conn:
+            conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+            conn.execute(text(
+                f"ALTER TABLE {table} ALTER COLUMN {column} "
+                f"TYPE VARCHAR({int(minimum)})"
+            ))
+    except Exception as e:  # pragma: no cover
+        print(f"[init_db] varchar widen skipped: {table}.{column} → {e}")
 
 
 def _cast_json_to_jsonb(table: str, column: str) -> None:

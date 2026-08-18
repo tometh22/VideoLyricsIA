@@ -33,7 +33,13 @@ ENUMS = {
     "source": {"editor", "editor_v2", "legacy"},
     "method": {"modifier", "range", "paint"},
     "operation": {"edit", "resize_or_move", "delete"},
-    "checkpoint": {"draft"},
+    # El cliente emite tres checkpoints: "draft" (debounce 800 ms), "autosave"
+    # (checkpoint 5 s) y "manual" (flush al aprobar / botón Guardar). El enum
+    # sólo aceptaba "draft", así que los otros dos hacían FALLAR la validación
+    # y el evento entero se descartaba: `autosave_failures` venía contando un
+    # subconjunto arbitrario y `avg_time_to_first_edit_ms`, que depende de
+    # `editor_autosave_success`, quedaba sesgado.
+    "checkpoint": {"draft", "autosave", "manual"},
 }
 SLUG_CATEGORIES = {"reason", "resolution", "context"}
 

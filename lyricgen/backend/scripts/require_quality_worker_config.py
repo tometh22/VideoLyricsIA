@@ -8,8 +8,29 @@ Presence and bounded connectivity are checked; secrets are never printed.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable
 from urllib.request import Request, urlopen
+
+
+MIN_HMAC_SECRET_BYTES = 32
+MIN_HMAC_SECRET_DISTINCT_BYTES = 12
+_HMAC_KEY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}\Z")
+
+
+def _strong_hmac_secret(value: object) -> bool:
+    """Reject short and obvious placeholder keys without exposing entropy."""
+    if not isinstance(value, str):
+        return False
+    encoded = value.encode("utf-8")
+    return (
+        len(encoded) >= MIN_HMAC_SECRET_BYTES
+        and len(set(encoded)) >= MIN_HMAC_SECRET_DISTINCT_BYTES
+    )
+
+
+def _valid_hmac_key_id(value: object) -> bool:
+    return isinstance(value, str) and bool(_HMAC_KEY_ID_RE.fullmatch(value.strip()))
 
 
 def _present(env: dict[str, str], *names: str) -> bool:
@@ -29,12 +50,32 @@ def validate_config(env: dict[str, str]) -> list[str]:
         "object_endpoint": ("R2_ENDPOINT_URL", "S3_ENDPOINT_URL"),
         "object_bucket": ("R2_BUCKET", "S3_BUCKET"),
         "content_attestation_key": (
-            "QUALITY_CONTENT_ATTESTATION_KEY", "QUALITY_LEARNING_HMAC_KEY",
+            "QUALITY_CONTENT_FINGERPRINT_HMAC_KEY",
+            "QUALITY_CONTENT_ATTESTATION_KEY",
+            "QUALITY_LEARNING_HMAC_KEY",
         ),
     }
     for label, names in requirements.items():
         if not _present(env, *names):
             errors.append(f"missing_{label}")
+
+    hmac_key = next((
+        str(env.get(name) or "")
+        for name in (
+            "QUALITY_CONTENT_FINGERPRINT_HMAC_KEY",
+            "QUALITY_CONTENT_ATTESTATION_KEY",
+            "QUALITY_LEARNING_HMAC_KEY",
+        )
+        if str(env.get(name) or "").strip()
+    ), "")
+    if hmac_key and not _strong_hmac_secret(hmac_key):
+        errors.append("weak_content_attestation_key")
+    hmac_key_id = (
+        env.get("QUALITY_CONTENT_FINGERPRINT_HMAC_KEY_ID")
+        or env.get("QUALITY_LEARNING_HMAC_KEY_ID")
+    )
+    if hmac_key and not _valid_hmac_key_id(hmac_key_id):
+        errors.append("missing_or_invalid_hmac_key_id")
 
     if str(env.get("QUEUES", "")).strip() != "transcription_quality":
         errors.append("queue_not_isolated")

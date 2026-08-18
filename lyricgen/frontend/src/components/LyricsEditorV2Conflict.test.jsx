@@ -18,6 +18,21 @@ const USER = {
 };
 const SERVER = [{ _id: "line-1", start: 0, end: 1, text: "versión equipo" }];
 const LOCAL = [{ _id: "line-1", start: 0, end: 1, text: "versión local" }];
+const PROPOSED = [{ _id: "line-1", start: 0, end: 1, text: "versión corregida" }];
+const QUALITY_PROPOSAL = {
+  id: "proposal-v6-retry",
+  status: "pending",
+  base_revision: 5,
+  expires_at: "2099-01-01T00:00:00Z",
+  windows: [{
+    id: "window-tail",
+    start: 0,
+    end: 1,
+    reasons: ["acoustic_cardinality_disagreement"],
+    current_segments: SERVER,
+    proposed_segments: PROPOSED,
+  }],
+};
 
 function reply(body, status = 200) {
   return {
@@ -92,6 +107,61 @@ function renderEditor(editorRequest, props = {}) {
     onApprove={props.onApprove || vi.fn()}
     onBack={vi.fn()}
   />);
+}
+
+function makeAmbiguousProposalRequest(action) {
+  let durableGets = 0;
+  let releaseReconciliation;
+  const reconciliationRead = new Promise((resolve) => {
+    releaseReconciliation = () => resolve(reply({
+      job_id: JOB,
+      revision: 5,
+      segments: SERVER,
+      original_segments: SERVER,
+      quality_proposal: QUALITY_PROPOSAL,
+      lock: { active: false },
+    }));
+  });
+
+  const mutationSuffix = `/quality-proposals/${QUALITY_PROPOSAL.id}/${action}`;
+  const request = vi.fn(async (path, options = {}) => {
+    if (path === `/editor/${JOB}` && !options.method) {
+      durableGets += 1;
+      if (durableGets === 2) return reconciliationRead;
+      const committed = durableGets >= 3;
+      return reply({
+        job_id: JOB,
+        revision: action === "apply" && committed ? 6 : 5,
+        segments: action === "apply" && committed ? PROPOSED : SERVER,
+        original_segments: SERVER,
+        quality_proposal: committed
+          ? { ...QUALITY_PROPOSAL, status: action === "apply" ? "applied" : "dismissed", windows: [] }
+          : QUALITY_PROPOSAL,
+        lock: { active: false },
+      });
+    }
+    if (path.endsWith(mutationSuffix) && options.method === "POST") {
+      const attempts = request.mock.calls.filter(([calledPath]) => (
+        calledPath.endsWith(mutationSuffix)
+      )).length;
+      if (attempts === 1) {
+        // The backend committed, but the browser never received the response.
+        throw new TypeError("connection_lost_after_commit");
+      }
+      return reply(action === "apply"
+        ? { applied: false, idempotent: true, revision: 6 }
+        : { dismissed: false, idempotent: true });
+    }
+    if (path.endsWith("/lock/heartbeat")) {
+      return reply({ acquired: true, user: USER, expires_at: "2099-01-01T00:00:00Z" });
+    }
+    if (path.endsWith("/lock") && options.method === "DELETE") return reply({ released: true });
+    if (path.endsWith("/activity/heartbeat")) return reply({ event_id: 1, revision: 5 });
+    if (path === "/analytics/events") return reply({ accepted: 1, rejected: 0 });
+    return reply({}, 404);
+  });
+
+  return { request, releaseReconciliation, mutationSuffix };
 }
 
 beforeEach(() => {
@@ -265,5 +335,68 @@ describe("Editor 2.0 stale draft recovery", () => {
       expect.objectContaining({ text: "cambio remoto independiente" }),
     ]));
     expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
+  });
+});
+
+describe("Editor 2.0 quality proposal ambiguous timeout recovery", () => {
+  it("reloads before retrying an already-committed apply and reuses the same key", async () => {
+    localStorage.clear();
+    const { request, releaseReconciliation, mutationSuffix } = makeAmbiguousProposalRequest("apply");
+    renderEditor(request);
+
+    let checkbox = await screen.findByRole("checkbox", { name: /Seleccionar zona 1/i });
+    fireEvent.click(checkbox);
+    fireEvent.click(screen.getByRole("button", { name: "Aplicar seleccionadas (1)" }));
+    await waitFor(() => expect(
+      request.mock.calls.filter(([path]) => path.endsWith(mutationSuffix)),
+    ).toHaveLength(1));
+
+    // Reconciliation is still pending: no second mutation is available yet.
+    const applyWhileReloading = screen.queryByRole("button", { name: /Aplicar seleccionadas/i });
+    expect(applyWhileReloading === null || applyWhileReloading.disabled).toBe(true);
+
+    // Simulate a lagging GET after the commit. The proposal remains pending,
+    // so the operator may retry only after this reload has completed.
+    releaseReconciliation();
+    checkbox = await screen.findByRole("checkbox", { name: /Seleccionar zona 1/i });
+    if (!checkbox.checked) fireEvent.click(checkbox);
+    fireEvent.click(screen.getByRole("button", { name: "Aplicar seleccionadas (1)" }));
+
+    await waitFor(() => expect(
+      request.mock.calls.filter(([path]) => path.endsWith(mutationSuffix)),
+    ).toHaveLength(2));
+    const mutationCalls = request.mock.calls.filter(([path]) => path.endsWith(mutationSuffix));
+    const firstBody = JSON.parse(mutationCalls[0][1].body);
+    const retryBody = JSON.parse(mutationCalls[1][1].body);
+    expect(retryBody.idempotency_key).toBe(firstBody.idempotency_key);
+    expect(await screen.findByDisplayValue("versión corregida")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Aplicar seleccionadas (0)" })).toBeDisabled();
+  });
+
+  it("reloads before retrying an already-committed dismiss and reuses the same key", async () => {
+    localStorage.clear();
+    const { request, releaseReconciliation, mutationSuffix } = makeAmbiguousProposalRequest("dismiss");
+    renderEditor(request);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Descartar propuesta" }));
+    await waitFor(() => expect(
+      request.mock.calls.filter(([path]) => path.endsWith(mutationSuffix)),
+    ).toHaveLength(1));
+    const dismissWhileReloading = screen.queryByRole("button", { name: /Descartar propuesta/i });
+    expect(dismissWhileReloading === null || dismissWhileReloading.disabled).toBe(true);
+
+    releaseReconciliation();
+    fireEvent.click(await screen.findByRole("button", { name: "Descartar propuesta" }));
+
+    await waitFor(() => expect(
+      request.mock.calls.filter(([path]) => path.endsWith(mutationSuffix)),
+    ).toHaveLength(2));
+    const mutationCalls = request.mock.calls.filter(([path]) => path.endsWith(mutationSuffix));
+    const firstBody = JSON.parse(mutationCalls[0][1].body);
+    const retryBody = JSON.parse(mutationCalls[1][1].body);
+    expect(retryBody.idempotency_key).toBe(firstBody.idempotency_key);
+    expect(screen.getByTestId("quality-proposal-panel")).toHaveAttribute(
+      "data-proposal-state", "dismissed",
+    );
   });
 });

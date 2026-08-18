@@ -7,7 +7,23 @@ Medido: sobre la MEZCLA el ASR devuelve 1 palabra; sobre el STEM de voz, 16.
 """
 import pytest
 
+import logging
+
 import gap_rescue as gr
+
+
+def test_transcribe_window_redacts_provider_exception_message(
+        monkeypatch, caplog):
+    secret = "PRIVATE_LYRIC_EXCEPTION"
+    monkeypatch.setattr(
+        gr.subprocess if hasattr(gr, "subprocess") else __import__("subprocess"),
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(secret)),
+    )
+    with caplog.at_level(logging.WARNING):
+        assert gr._transcribe_window("/private/audio.wav", 0.0, 1.0) == []
+    assert secret not in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 @pytest.fixture(autouse=True)
