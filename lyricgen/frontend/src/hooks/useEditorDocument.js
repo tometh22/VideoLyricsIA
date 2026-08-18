@@ -122,16 +122,20 @@ export function useEditorDocument({ jobId, enabled, request }) {
         const next = staleDocumentFrom(body, segments, revisionRef.current);
         const base = document?.segments || [];
         const merged = mergeThreeWay(base, segments, next.serverSegments);
-        applyDocument({
-          ...(document || {}),
-          ...body,
-          revision: next.serverRevision,
-          segments: next.serverSegments,
-        });
         // Independent changes may be rebased and retried behind the new CAS
         // revision. A same-line conflict is different: retain the local draft
         // in the browser and never turn a 409 into "save mine over theirs".
         if (merged.conflicts.length > 0) {
+          // NO adoptamos el documento remoto acá. Hacerlo movía
+          // `revisionRef.current` a la revisión del servidor y pisaba
+          // `document.segments` con el contenido remoto — con lo cual el
+          // `reconcile` posterior (el de "Combinar y reintentar") veía
+          // `body.revision === revisionRef.current`, concluía que no hubo
+          // cambio remoto, SALTEABA el merge de 3 vías y terminaba guardando el
+          // snapshot local crudo: "combinar" hacía exactamente lo contrario,
+          // pisar la edición del otro operador. Manteniendo la base sobre la
+          // que el operador editó, el reconcile detecta el cambio y hace el
+          // merge real (o vuelve a marcar conflicto si de verdad colisionan).
           return {
             ok: false,
             reason: "conflict",
@@ -141,6 +145,15 @@ export function useEditorDocument({ jobId, enabled, request }) {
             conflicts: merged.conflicts,
           };
         }
+        // Sin colisiones: acá SÍ adoptamos la revisión del servidor, porque el
+        // reintento inmediato guarda el documento ya rebasado y necesita la CAS
+        // nueva para que el backend lo acepte.
+        applyDocument({
+          ...(document || {}),
+          ...body,
+          revision: next.serverRevision,
+          segments: next.serverSegments,
+        });
         return {
           ok: false,
           reason: "merged",
@@ -164,7 +177,17 @@ export function useEditorDocument({ jobId, enabled, request }) {
           return next;
         });
       }
-      return { ok: true, revision: body.revision, versionId: body.version_id, applied: body.applied !== false };
+      // `segments` (lo que se persistió) viaja en la respuesta para que el
+      // caller pueda decidir si el borrador local ya quedó cubierto. Sin esto
+      // el editor borraba el draft a ciegas y perdía lo tipeado entre la
+      // captura del snapshot y el OK del servidor.
+      return {
+        ok: true,
+        revision: body.revision,
+        versionId: body.version_id,
+        applied: body.applied !== false,
+        segments,
+      };
     } catch (err) {
       return { ok: false, reason: navigator.onLine === false ? "offline" : "network", error: String(err) };
     }

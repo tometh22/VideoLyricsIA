@@ -57,6 +57,12 @@ if _VEO_CLIP_SECONDS <= 0:
 # USD per second of generated video, per model. Multiplied by the clip length
 # above to produce the per-call estimate below.
 _VEO_RATE_PER_SECOND: dict[str, float] = {
+    # Veo 3.1 Lite (GA en Vertex desde 2026-03-25, id `veo-3.1-lite-generate-001`).
+    # Tarifa oficial: $0,05/s a 720p y $0,08/s a 1080p. El pipeline NO envía el
+    # parámetro `resolution`, así que se toma el tier base; actualizar si algún
+    # día se pide 1080p explícitamente. No soporta 4K — irrelevante acá porque
+    # el clip es una fuente que el render reescala (`_cover_resize`).
+    "veo-3.1-lite-generate-001": 0.05,
     "veo-3.1-fast-generate-001": 0.10,
     "veo-3.1-generate-001": 0.40,
     "veo-3.0-fast-generate-001": 0.10,
@@ -75,6 +81,7 @@ def _veo_call_cost(model: str) -> float:
 COST_PER_CALL: dict[tuple[str, str], float] = {
     # Veo video — Fast (no audio) at $0.10/s; e.g. $0.10/s × 8s = $0.80 per
     # call, or ~$0.40 at 4s. Standard models kept for backwards-compat.
+    ("veo-3.1-lite-generate-001", "google_vertex"): _veo_call_cost("veo-3.1-lite-generate-001"),
     ("veo-3.1-fast-generate-001", "google_vertex"): _veo_call_cost("veo-3.1-fast-generate-001"),
     ("veo-3.1-generate-001", "google_vertex"): _veo_call_cost("veo-3.1-generate-001"),
     ("veo-3.0-fast-generate-001", "google_vertex"): _veo_call_cost("veo-3.0-fast-generate-001"),
