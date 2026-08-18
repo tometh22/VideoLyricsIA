@@ -113,7 +113,7 @@ describe("useEditorDocument save ordering", () => {
     ]));
   });
 
-  it("preserves a same-line 409 locally without returning a retryable merge", async () => {
+  it("silently rebases a same-line 409 with the local edit as the visible winner", async () => {
     const request = vi.fn(async (path, options = {}) => {
       if (path === "/editor/job-conflict" && !options.method) {
         return reply({
@@ -144,8 +144,11 @@ describe("useEditorDocument save ordering", () => {
         { segment_id: "line", start: 0, end: 1, text: "local" },
       ], "manual");
     });
-    expect(saved).toMatchObject({ ok: false, reason: "conflict", serverRevision: 2 });
-    expect(saved.mergedSegments).toBeUndefined();
+    expect(saved).toMatchObject({ ok: false, reason: "merged", serverRevision: 2, hadLineConflicts: true });
+    expect(saved.mergedSegments).toEqual([
+      expect.objectContaining({ segment_id: "line", text: "local" }),
+    ]);
+    expect(result.current.revisionRef.current).toBe(2);
     expect(request.mock.calls.filter(([path, options]) => path === "/editor/job-conflict" && options?.method === "PATCH")).toHaveLength(1);
   });
 

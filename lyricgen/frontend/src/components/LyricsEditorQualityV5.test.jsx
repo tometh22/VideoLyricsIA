@@ -153,7 +153,7 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
     expect(screen.queryByTestId("quality-review-panel")).toBeNull();
   });
 
-  it("mantiene el gate enforce mientras analysis_pending y no envía acknowledgement", async () => {
+  it("permite generar mientras el análisis de calidad sigue pendiente", async () => {
     const onApprove = vi.fn();
     const editorRequest = vi.fn(() => new Promise(() => {}));
     render(<LyricsEditor {...baseProps({
@@ -167,18 +167,14 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
 
     const approve = screen.getByRole("button", { name: /Aprobar y generar/i });
     expect(approve).toHaveAttribute("data-quality-status", "analysis_pending");
-    expect(approve).toHaveAttribute("data-quality-review-required", "true");
+    expect(approve).toHaveAttribute("data-quality-review-required", "false");
     await userEvent.click(approve);
 
-    expect(onApprove).not.toHaveBeenCalled();
+    await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(1));
     expect(editorRequest).not.toHaveBeenCalledWith(
       "/jobs/quality-v5-job/transcription-quality/acknowledge",
       expect.anything(),
     );
-    expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({
-      message: expect.stringMatching(/todavía está terminando/i),
-      tone: "info",
-    }));
   });
 
   it("distingue una candidata de baja confianza y protege el preview hasta confirmarla", async () => {
@@ -390,43 +386,20 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
     expect(screen.getByRole("tab", { name: "Revisión guiada" })).toHaveAttribute("aria-selected", "true");
   });
 
-  it("impide aprobar hasta confirmar todas las ventanas y reconoce la revisión exacta", async () => {
+  it("permite aprobar sin confirmar ventanas y mantiene la revisión como orientación", async () => {
     const onApprove = vi.fn();
     const editorRequest = vi.fn().mockResolvedValue({ ok: true });
     const { container } = render(<LyricsEditor {...baseProps({ onApprove, editorRequest, disableAutosave: true })} />);
     markAudioReady(container);
 
     const approve = screen.getByRole("button", { name: /Aprobar y generar/i });
-    expect(approve).toHaveAttribute("data-quality-review-required", "true");
+    expect(approve).toHaveAttribute("data-quality-review-required", "false");
     await userEvent.click(approve);
 
-    expect(onApprove).not.toHaveBeenCalled();
+    await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(1));
     expect(editorRequest).not.toHaveBeenCalledWith(
       "/jobs/quality-v5-job/transcription-quality/acknowledge",
       expect.anything(),
-    );
-    expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({
-      message: expect.stringMatching(/2 zonas inseguras/i),
-      tone: "info",
-    }));
-
-    await userEvent.click(screen.getByRole("button", { name: "Confirmar zona 1" }));
-    expect(screen.getByTestId("quality-review-progress")).toHaveTextContent("1 de 2 confirmadas");
-    await userEvent.click(screen.getByRole("button", { name: "Confirmar zona 2" }));
-    expect(screen.getByTestId("quality-review-progress")).toHaveTextContent("Zonas confirmadas");
-    expect(approve).toHaveAttribute("data-quality-review-required", "false");
-
-    await userEvent.click(approve);
-    await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(1));
-    expect(editorRequest).toHaveBeenCalledWith(
-      "/jobs/quality-v5-job/transcription-quality/acknowledge",
-      expect.objectContaining({
-        method: "POST",
-        body: JSON.stringify({
-          base_revision: 7,
-          confirmed_window_ids: ["chorus", "outro"],
-        }),
-      }),
     );
     expect(onApprove.mock.calls[0][1]).toMatchObject({ baseRevision: 7 });
   });
@@ -444,7 +417,7 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
     expect(screen.getByTestId("quality-review-progress")).toHaveTextContent("0 de 2 confirmadas");
 
     await userEvent.click(screen.getByRole("button", { name: /Aprobar y generar/i }));
-    expect(onApprove).not.toHaveBeenCalled();
+    await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(1));
   });
 
   it("solo reutiliza una confirmación del servidor si coincide el fingerprint de evidencia", () => {
@@ -518,7 +491,7 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
     );
   });
 
-  it("retry_failed no se presenta como confirmable ni llega al render", async () => {
+  it("retry_failed se conserva como diagnóstico pero no frena el render", async () => {
     const onApprove = vi.fn();
     render(<LyricsEditor {...baseProps({
       transcriptionQuality: { ...V5_QUALITY, decision: "retry_failed" },
@@ -528,8 +501,7 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
     expect(screen.getByTestId("quality-review-panel")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Confirmar zona/i })).toBeNull();
     await userEvent.click(screen.getByRole("button", { name: /Aprobar y generar/i }));
-    expect(onApprove).not.toHaveBeenCalled();
-    expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({ tone: "error" }));
+    await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(1));
   });
 
   it("observe NO enmascara la letra del preview (no hay forma de destapar)", () => {

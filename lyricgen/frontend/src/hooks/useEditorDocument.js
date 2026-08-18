@@ -120,36 +120,16 @@ export function useEditorDocument({ jobId, enabled, request }) {
       const body = await responseBody(response);
       if (response.status === 409) {
         const next = staleDocumentFrom(body, segments, revisionRef.current);
-        const base = document?.segments || [];
+        const base = documentRef.current?.segments || document?.segments || [];
         const merged = mergeThreeWay(base, segments, next.serverSegments);
-        // Independent changes may be rebased and retried behind the new CAS
-        // revision. A same-line conflict is different: retain the local draft
-        // in the browser and never turn a 409 into "save mine over theirs".
-        if (merged.conflicts.length > 0) {
-          // NO adoptamos el documento remoto acá. Hacerlo movía
-          // `revisionRef.current` a la revisión del servidor y pisaba
-          // `document.segments` con el contenido remoto — con lo cual el
-          // `reconcile` posterior (el de "Combinar y reintentar") veía
-          // `body.revision === revisionRef.current`, concluía que no hubo
-          // cambio remoto, SALTEABA el merge de 3 vías y terminaba guardando el
-          // snapshot local crudo: "combinar" hacía exactamente lo contrario,
-          // pisar la edición del otro operador. Manteniendo la base sobre la
-          // que el operador editó, el reconcile detecta el cambio y hace el
-          // merge real (o vuelve a marcar conflicto si de verdad colisionan).
-          return {
-            ok: false,
-            reason: "conflict",
-            serverRevision: next.serverRevision,
-            serverSegments: next.serverSegments,
-            localSegments: segments,
-            conflicts: merged.conflicts,
-          };
-        }
-        // Sin colisiones: acá SÍ adoptamos la revisión del servidor, porque el
-        // reintento inmediato guarda el documento ya rebasado y necesita la CAS
-        // nueva para que el backend lo acepte.
+        // A revision can move because of this same session (a background
+        // choice, metadata write or a delayed autosave), not just another
+        // browser. Rebase every 409 silently. `mergeThreeWay` keeps the local
+        // field when both snapshots changed it, while retaining remote-only
+        // changes. The retry still uses the newly-read CAS revision; it never
+        // performs an unchecked overwrite.
         applyDocument({
-          ...(document || {}),
+          ...(documentRef.current || document || {}),
           ...body,
           revision: next.serverRevision,
           segments: next.serverSegments,
@@ -159,7 +139,7 @@ export function useEditorDocument({ jobId, enabled, request }) {
           reason: "merged",
           mergedSegments: merged.merged,
           serverRevision: next.serverRevision,
-          hadLineConflicts: false,
+          hadLineConflicts: merged.conflicts.length > 0,
         };
       }
       if (!response.ok) return { ok: false, reason: `http-${response.status}`, status: response.status };
@@ -230,26 +210,18 @@ export function useEditorDocument({ jobId, enabled, request }) {
       const remoteChanged = Number.isInteger(body.revision) && body.revision !== revisionRef.current;
       const sameContent = JSON.stringify(body.segments || []) === JSON.stringify(localSegments || []);
       if (remoteChanged && !sameContent) {
-        const merged = mergeThreeWay(document?.segments || [], localSegments, body.segments || []);
+        const merged = mergeThreeWay(
+          documentRef.current?.segments || document?.segments || [],
+          localSegments,
+          body.segments || [],
+        );
         applyDocument(body);
-        if (merged.conflicts.length > 0) {
-          return {
-            ok: false,
-            reason: "conflict",
-            document: body,
-            serverSegments: body.segments || [],
-            localSegments,
-            conflicts: merged.conflicts,
-          };
-        }
         return {
           ok: true,
           document: body,
           sameContent: false,
-          // Preserve independent remote-only edits. Same-line conflicts are
-          // deliberately returned above without an automatic retry.
           mergedSegments: merged.merged,
-          hadLineConflicts: false,
+          hadLineConflicts: merged.conflicts.length > 0,
         };
       }
       applyDocument(body);
