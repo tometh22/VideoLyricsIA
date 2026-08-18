@@ -1,51 +1,47 @@
 #!/usr/bin/env python3
-"""Retención de ProRes en R2 — reporta y (opcionalmente) libera storage.
+"""Reporte de retención de ProRes en R2 — SOLO LECTURA, no borra nada.
 
-## Por qué
+## Por qué existe
 
-Medición del bucket de producción (17-ago-2026):
+Medición del bucket de producción (17-ago-2026): 2.896 GB / $43,44 mes, de los
+cuales ProRes (.mov y .mov.vN) son **2.754 GB = 95% del storage**. `umg_master.mov`
+promedia 5,49 GB y `umg_short.mov` 0,58 GB → ~6,07 GB por video, y el doble si
+hubo una edición (la versión vieja queda para siempre).
 
-    TOTAL                      2.889,8 GB   $43,35/mes
-      ProRes (.mov)            1.887,0 GB   $28,31/mes   <- 65% del costo
-      versionados (.vN)          909,0 GB   $13,63/mes
-      MP4                         74,2 GB    $1,11/mes
-      audio de entrada            19,3 GB    $0,29/mes
+El bucket **no tiene ninguna regla de expiración** y crece ~750 GB/mes al volumen
+actual (~60 entregas/mes) = ~12,5 GB por video entregado. A 400 videos/mes son
+~5 TB/mes, +$75/mes CADA mes: a 12 meses el storage solo sería ~$900/mes. Es la
+única línea de costo que únicamente sube, y hoy nadie la está mirando.
 
-    umg_master.mov   311 obj   prom 5,49 GB c/u
-    umg_short.mov    310 obj   prom 0,58 GB c/u   -> ~6,07 GB por video
+## Por qué NO borra
 
-El bucket crece ~750 GB/mes al volumen actual (~60 entregas/mes) = ~12,5 GB por
-video entregado. A 400 videos/mes (contrato UMG) son ~5 TB/mes, +$75/mes CADA
-mes: a 12 meses el storage solo sería ~$900/mes. Es la única línea de costo que
-únicamente sube, y hoy el bucket no tiene ninguna regla de expiración.
+Una versión anterior de este script borraba. Una revisión adversarial encontró
+que no era seguro, y la capacidad se removió a propósito:
 
-## Qué se puede liberar, y por qué es seguro
+* Los ProRes **vigentes** los sirve el portal de UMG firmando la key directo, sin
+  readiness ni prewarm, y el export a Drive hace rclone contra ella.
+  `ensure_prores_exists()` sólo cubre `GET /download/{id}/umg_master`, así que
+  borrarlos deja links rotos en el portal. Peor: el tamaño queda cacheado en
+  Redis 30 días, con lo cual el portal sigue mostrando `available: true` con un
+  link que devuelve un error de R2, y **no se auto-cura nunca**.
+* Los ProRes **versionados** (`.vN`) son el rollback manual documentado en
+  `Job.previous_versions` ("bajar la key .vN de R2 a mano" tras un re-sync malo).
+  Ningún código los lee automáticamente, pero borrarlos elimina esa red de
+  seguridad: es una decisión de producto, no una limpieza.
+* La guarda "es regenerable si existe el MP4 hermano" sólo mira el bucket.
+  `ensure_prores_exists` además exige la fila del Job con `umg_spec` y
+  `s3_keys['video']`; un objeto huérfano en R2 (clase de bug ya ocurrida) se
+  vería regenerable sin serlo.
 
-1. **ProRes versionados** (`umg_master.mov.v3`, `umg_short.mov.v1`, ...):
-   860 GB / $12,91 mes. Son copias SUPERADAS: cada edición sube una versión
-   nueva y la vieja queda para siempre. Nadie las sirve — el portal entrega
-   siempre la vigente. Es lo más seguro de borrar.
-
-2. **ProRes vigentes viejos** (`umg_master.mov` con >N días): 1.238 GB /
-   $18,57 mes a 30 días. Seguro SÓLO si el MP4 hermano existe, porque
-   `prores.ensure_prores_exists()` regenera el .mov desde el MP4 on-demand
-   cuando alguien lo descarga (cuesta 60-120 s de ffmpeg la primera vez, no
-   se pierde nada). Medido: **304 de 312 (97,4%) tienen su MP4 fuente**; los
-   8 restantes NO son regenerables y este script los excluye SIEMPRE.
-
-Nunca toca: MP4/short/thumbnail (son la fuente de regeneración y pesan poco),
-`inputs/` (audio original del cliente), ni ningún .mov sin MP4 hermano.
+Una limpieza segura necesita: cruzar contra la tabla `deliveries`, invalidar
+`dlsize:<key>` en Redis, darle al portal un fallback que encole `prewarm`, y
+verificar la fila del Job en Postgres (abortando si la DB no se puede leer, como
+ya hace `storage._active_input_keys()`). Nada de eso existe hoy.
 
 ## Uso
 
-    # sólo reporta (default, no borra nada)
-    python scripts/r2_prores_retention.py
-
-    # borra ProRes versionados (superados) — lo más seguro
-    python scripts/r2_prores_retention.py --versions --apply
-
-    # además, ProRes vigentes de más de 90 días QUE SEAN REGENERABLES
-    python scripts/r2_prores_retention.py --versions --current --age-days 90 --apply
+    python scripts/r2_prores_retention.py            # reporte
+    python scripts/r2_prores_retention.py --age-days 30
 
 Requiere R2_ENDPOINT_URL / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET.
 """
@@ -116,14 +112,8 @@ def _is_regenerable(key: str, keys: set) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--versions", action="store_true",
-                    help="incluir ProRes versionados (.vN) — copias superadas")
-    ap.add_argument("--current", action="store_true",
-                    help="incluir ProRes vigentes más viejos que --age-days")
     ap.add_argument("--age-days", type=int, default=90,
-                    help="antigüedad mínima para --current (default: 90)")
-    ap.add_argument("--apply", action="store_true",
-                    help="BORRA de verdad. Sin este flag sólo reporta.")
+                    help="umbral de antigüedad para el desglose (default: 90)")
     args = ap.parse_args()
 
     s3, bucket = _client()
@@ -141,56 +131,46 @@ def main() -> int:
           f"· ${mov_total / GB * R2_USD_PER_GB_MONTH:,.2f}/mes "
           f"({mov_total / max(total, 1) * 100:.0f}% del storage)")
 
-    doomed, skipped_not_regenerable = [], []
+    now_versioned, now_current_old = [], []
     for key, size, last_modified in movs:
-        versioned = bool(VERSIONED_MOV.search(key))
         age_days = (now - last_modified).days
-        if versioned:
-            if not args.versions:
-                continue
-        elif args.current and age_days >= args.age_days:
-            pass
-        else:
-            continue
-        if not _is_regenerable(key, keys):
-            skipped_not_regenerable.append((key, size))
-            continue
-        doomed.append((key, size, age_days, versioned))
+        if VERSIONED_MOV.search(key):
+            now_versioned.append((key, size, age_days))
+        elif age_days >= args.age_days:
+            now_current_old.append((key, size, age_days))
 
-    freed = sum(sz for _, sz, _, _ in doomed)
-    n_versioned = sum(1 for *_, v in doomed if v)
-    print(f"\nSeleccionados para liberar: {len(doomed):,} objetos · "
-          f"{freed / GB:,.1f} GB · ${freed / GB * R2_USD_PER_GB_MONTH:,.2f}/mes"
-          f"  (versionados: {n_versioned:,} · vigentes: {len(doomed) - n_versioned:,})")
-    if skipped_not_regenerable:
-        omitted = sum(sz for _, sz in skipped_not_regenerable)
-        print(f"PRESERVADOS por no ser regenerables (sin MP4 fuente): "
-              f"{len(skipped_not_regenerable):,} obj · {omitted / GB:,.1f} GB")
-        for key, _ in skipped_not_regenerable[:5]:
-            print(f"    {key}")
+    def _line(label, items):
+        total_bytes = sum(sz for _, sz, _ in items)
+        regenerables = sum(1 for k, _, _ in items if _is_regenerable(k, keys))
+        print(f"  {label:34} {len(items):>5,} obj  {total_bytes / GB:>8,.1f} GB  "
+              f"${total_bytes / GB * R2_USD_PER_GB_MONTH:>7,.2f}/mes  "
+              f"(regenerables desde su MP4: {regenerables}/{len(items)})")
 
-    if not doomed:
-        print("\nNada que hacer. (Probá --versions y/o --current.)")
-        return 0
-    if not args.apply:
-        print("\nDRY-RUN: no se borró nada. Repetí con --apply para ejecutar.")
-        for key, size, age, versioned in doomed[:10]:
-            tag = "versionado" if versioned else f"{age}d"
-            print(f"    [{tag}] {key} ({size / GB:.2f} GB)")
-        if len(doomed) > 10:
-            print(f"    … y {len(doomed) - 10:,} más")
-        return 0
+    print("\nDesglose de lo que HOY podría considerarse liberable:")
+    _line("versionados (.vN, superados)", now_versioned)
+    _line(f"vigentes con más de {args.age_days} días", now_current_old)
 
-    deleted = 0
-    for i in range(0, len(doomed), 1000):
-        batch = [{"Key": k} for k, *_ in doomed[i:i + 1000]]
-        resp = s3.delete_objects(Bucket=bucket, Delete={"Objects": batch,
-                                                       "Quiet": True})
-        deleted += len(batch) - len(resp.get("Errors", []) or [])
-        for err in (resp.get("Errors") or [])[:5]:
-            print(f"  ERROR {err.get('Key')}: {err.get('Message')}")
-    print(f"\nBorrados {deleted:,} objetos · liberados {freed / GB:,.1f} GB "
-          f"· ahorro ~${freed / GB * R2_USD_PER_GB_MONTH:,.2f}/mes")
+    print(
+        "\nEste script NO borra nada — es solo-reporte a propósito.\n"
+        "Borrar ProRes requiere infraestructura que hoy no existe:\n"
+        "  * Los VIGENTES los sirve el portal de UMG firmando la key directo\n"
+        "    (sin readiness ni prewarm) y el export a Drive hace rclone contra\n"
+        "    ella. `ensure_prores_exists()` solo cubre GET /download/{id}/...,\n"
+        "    así que borrarlos deja links rotos; peor: el tamaño queda cacheado\n"
+        "    en Redis 30 días, el portal sigue diciendo `available: true` y NO\n"
+        "    se auto-cura. Haría falta: cruzar contra `deliveries`, invalidar\n"
+        "    `dlsize:<key>` y darle al portal un fallback que encole prewarm.\n"
+        "  * Los VERSIONADOS (.vN) son el rollback manual documentado en\n"
+        "    `Job.previous_versions` (\"bajar la key .vN de R2 a mano\" tras un\n"
+        "    re-sync malo). Nadie los lee automáticamente, pero borrarlos\n"
+        "    elimina esa red de seguridad: es una decisión de producto.\n"
+        "  * La guarda `_is_regenerable` sólo mira el bucket. `ensure_prores_\n"
+        "    exists` además exige la fila del Job con `umg_spec` y\n"
+        "    `s3_keys['video']`; un objeto huérfano en R2 (clase de bug ya\n"
+        "    ocurrida) se vería regenerable y no lo es.\n"
+        "\nEl valor accionable de este reporte es la TRAYECTORIA: ver arriba\n"
+        "cuánto pesa hoy y contrastarlo mes a mes."
+    )
     return 0
 
 

@@ -1,10 +1,11 @@
-"""Retención de ProRes en R2 — la lógica que evita perder un máster.
+"""Reporte de retención de ProRes en R2 — clasificación de claves.
 
-El script libera storage borrando ProRes. La guarda dura es
-`_is_regenerable`: si el MP4 fuente no está en el bucket, `ensure_prores_exists`
-NO puede recrear el .mov y borrarlo pierde el máster para siempre. Medido en
-prod: 304/312 másters (97,4%) son regenerables; los 8 restantes deben
-preservarse SIEMPRE.
+El script es SOLO LECTURA: una revisión adversarial mostró que borrar no era
+seguro (el portal de UMG sirve las keys vigentes sin fallback y cachea el tamaño
+en Redis 30 días; las `.vN` son el rollback manual de `Job.previous_versions`).
+Lo que queda bajo test es la clasificación que alimenta el reporte, incluida la
+noción de "regenerable", que se sigue informando como dato pero ya no autoriza
+ningún borrado.
 """
 
 import importlib.util
