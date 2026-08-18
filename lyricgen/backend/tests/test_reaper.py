@@ -12,7 +12,7 @@ in-process — no RQ, no FastAPI app, no real time.
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from database import AIProvenance, Job, SessionLocal
+from database import AIProvenance, EditorDocument, Job, SessionLocal
 import reaper as _reaper
 from reaper import (
     find_abandoned_edits,
@@ -571,14 +571,13 @@ def test_stalled_sweep_only_targets_processing():
 # bumps last_user_activity_at every time the user edits, so active sessions
 # stay alive past the TTL.
 
-def test_reap_transcribed_with_provenance_does_not_crash():
-    """Regression (prod 2026-06-02): the reaper hard-deleted a transcribed_pending
-    job WITHOUT first clearing its ai_provenance rows. ai_provenance.job_id is a
-    NOT NULL FK with no ON DELETE CASCADE, so SQLAlchemy's parent-delete tried to
-    NULL the FK → IntegrityError, and the ENTIRE reap transaction aborted — the
-    reaper crashed every cycle and stuck jobs piled up (incl. the OOM-killed
-    render). Deleting a job that has provenance must now succeed and clear the
-    provenance rows first (mirrors jobs.delete_job)."""
+def test_reap_transcribed_with_provenance_is_quarantined_without_data_loss():
+    """Incomplete transcriptions become retryable instead of being deleted.
+
+    Provenance and the Job row must remain intact: deleting either made an
+    out-of-order browser response unrecoverable and previously triggered FK
+    failures when provenance existed.
+    """
     from reaper import _delete_abandoned_transcribed
     db = SessionLocal()
     try:
@@ -587,11 +586,13 @@ def test_reap_transcribed_with_provenance_does_not_crash():
         _seed_provenance(db, job_id=jid, age_minutes=110, duration_ms=4973,
                          step="lyrics_reference_fetch", tool_name="gemini-2.5-flash")
         job = db.query(Job).filter(Job.job_id == jid).first()
-        # Must NOT raise IntegrityError / NotNullViolation.
-        _delete_abandoned_transcribed(db, job)
+        assert _delete_abandoned_transcribed(db, job) is True
         db.commit()
-        assert db.query(Job).filter(Job.job_id == jid).first() is None
-        assert db.query(AIProvenance).filter(AIProvenance.job_id == jid).count() == 0
+        row = db.query(Job).filter(Job.job_id == jid).one()
+        assert row.status == "transcription_failed"
+        assert row.archived_at is not None
+        assert row.error and "audio sigue guardado" in row.error
+        assert db.query(AIProvenance).filter(AIProvenance.job_id == jid).count() == 1
     finally:
         _cleanup(db)
         db.close()
@@ -689,6 +690,165 @@ def test_delete_helper_refuses_completed_transcription():
     finally:
         _cleanup(db)
         db.close()
+
+
+def test_editor_document_protects_job_even_if_legacy_snapshot_is_null():
+    """A partial legacy bridge must never make durable corrections reapable.
+
+    EditorDocument and EditorVersion cascade from Job.  A hard delete based
+    only on a null Job.segments_json would therefore erase the very recovery
+    history designed to protect the operator.
+    """
+    from reaper import _delete_abandoned_transcribed
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(
+            db, status="transcribed_pending", age_minutes=24 * 60,
+            job_id="editor_guard", segments_json=None,
+        )
+        db.add(EditorDocument(
+            job_id=jid,
+            tenant_id="tenant_reap_test",
+            current_segments=[{"start": 1.0, "end": 2.0, "text": "Corrección"}],
+            original_segments=[{"start": 1.0, "end": 2.0, "text": "Original"}],
+            revision=3,
+        ))
+        db.commit()
+
+        assert jid not in {
+            row.job_id for row in find_abandoned_transcribed(db, ttl_min=30)
+        }
+        job = db.query(Job).filter(Job.job_id == jid).one()
+        _delete_abandoned_transcribed(db, job)
+        db.commit()
+        assert db.query(Job).filter(Job.job_id == jid).one_or_none() is not None
+        assert db.query(EditorDocument).filter(
+            EditorDocument.job_id == jid,
+        ).one_or_none() is not None
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_reaper_rechecks_candidate_after_concurrent_segments_commit():
+    """Close the selector/use race found by adversarial review."""
+    from reaper import _delete_abandoned_transcribed
+    selecting_db = SessionLocal()
+    writer_db = SessionLocal()
+    try:
+        _cleanup(selecting_db)
+        jid = _seed(
+            selecting_db, status="transcribed_pending", age_minutes=120,
+            job_id="reaper_race", segments_json=None,
+        )
+        candidate = next(
+            row for row in find_abandoned_transcribed(selecting_db, ttl_min=30)
+            if row.job_id == jid
+        )
+
+        written = writer_db.query(Job).filter(Job.job_id == jid).one()
+        written.segments_json = [
+            {"start": 0.0, "end": 1.0, "text": "Guardado concurrente"},
+        ]
+        writer_db.commit()
+
+        assert _delete_abandoned_transcribed(selecting_db, candidate) is False
+        selecting_db.commit()
+        survivor = selecting_db.query(Job).filter(Job.job_id == jid).one()
+        assert survivor.status == "transcribed_pending"
+        assert survivor.segments_json[0]["text"] == "Guardado concurrente"
+    finally:
+        writer_db.close()
+        _cleanup(selecting_db)
+        selecting_db.close()
+
+
+def test_soft_superseded_ids_are_excluded_from_short_ttl_sweeps():
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        transcribed_id = _seed(
+            db, status="transcribed_pending", age_minutes=120,
+            job_id="archived_transcribed", segments_json=None,
+        )
+        upload_id = _seed(
+            db, status="awaiting_upload", age_minutes=120,
+            job_id="archived_upload", segments_json=None,
+        )
+        archived_at = datetime.now(timezone.utc)
+        db.query(Job).filter(Job.job_id.in_([transcribed_id, upload_id])).update(
+            {Job.archived_at: archived_at}, synchronize_session=False,
+        )
+        db.commit()
+
+        assert transcribed_id not in {
+            row.job_id for row in find_abandoned_transcribed(db, ttl_min=30)
+        }
+        assert upload_id not in {
+            row.job_id for row in _reaper.find_abandoned_uploads(db, ttl_min=20)
+        }
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_abandoned_upload_is_soft_quarantined_and_remains_resumable():
+    from reaper import _delete_abandoned_upload
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(
+            db, status="awaiting_upload", age_minutes=120,
+            job_id="upload_quarantine", segments_json=None,
+        )
+        candidate = next(
+            row for row in _reaper.find_abandoned_uploads(db, ttl_min=20)
+            if row.job_id == jid
+        )
+        assert _delete_abandoned_upload(db, candidate) is True
+        db.commit()
+        row = db.query(Job).filter(Job.job_id == jid).one()
+        assert row.status == "awaiting_upload"
+        assert row.archived_at is not None
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_abandoned_upload_rechecks_after_concurrent_transcription_commit():
+    """An upload selected by TTL cannot delete a newly transcribed editor."""
+    from reaper import _delete_abandoned_upload
+    selecting_db = SessionLocal()
+    writer_db = SessionLocal()
+    try:
+        _cleanup(selecting_db)
+        jid = _seed(
+            selecting_db, status="awaiting_upload", age_minutes=120,
+            job_id="upload_race", segments_json=None,
+        )
+        candidate = next(
+            row for row in _reaper.find_abandoned_uploads(selecting_db, ttl_min=20)
+            if row.job_id == jid
+        )
+
+        advanced = writer_db.query(Job).filter(Job.job_id == jid).one()
+        advanced.status = "transcribed_pending"
+        advanced.segments_json = [
+            {"start": 0.0, "end": 1.0, "text": "Ya transcripta"},
+        ]
+        writer_db.commit()
+
+        assert _delete_abandoned_upload(selecting_db, candidate) is False
+        selecting_db.commit()
+        survivor = selecting_db.query(Job).filter(Job.job_id == jid).one()
+        assert survivor.status == "transcribed_pending"
+        assert survivor.archived_at is None
+        assert survivor.segments_json[0]["text"] == "Ya transcripta"
+    finally:
+        writer_db.close()
+        _cleanup(selecting_db)
+        selecting_db.close()
 
 
 def test_transcribed_pending_null_activity_falls_back_to_created_at():

@@ -4050,7 +4050,7 @@ async def transcribe_uploaded(
     Returns the legacy /transcribe payload in sync mode. Async returns the
     queued job id and the frontend polls for the editor payload.
     """
-    from jobs import get_job_model
+    from jobs import get_job_model, supersede_sibling_drafts, touch_user_activity
     job_row = get_job_model(db, body.job_id)
     if (not job_row
             or job_row.user_id != current_user["id"]
@@ -4085,6 +4085,18 @@ async def transcribe_uploaded(
             status_code=409,
             detail="La letra ya tiene ediciones guardadas; creá una nueva transcripción para no sobrescribirlas.",
         )
+
+    # Back-to-back upload tickets can resolve out of order.  Whichever ID the
+    # authenticated browser explicitly promotes is the live draft; revive it
+    # and only soft-archive its siblings.  This commits before releasing the
+    # request session for R2 I/O, so a concurrent dedup can never delete the
+    # selected row (supersede_sibling_drafts is non-destructive).
+    touch_user_activity(db, job_row)
+    supersede_sibling_drafts(
+        db, keep_job_id=job_row.job_id, user_id=current_user["id"],
+        tenant_id=current_user["tenant_id"], filename=job_row.filename or "",
+    )
+    db.commit()
 
     # SNAPSHOT + release (incidente agus77 06/07): la descarga de R2 de
     # abajo tarda decenas de segundos con un WAV de 45-150 MB, y este
@@ -9111,6 +9123,11 @@ async def generate_with_segments(
                     "detail": f"Job is in state {job_row.status!r}, cannot generate.",
                 },
             )
+        # An explicit, owned job_id is authoritative after a duplicate-upload
+        # response race.  Restore its visibility now; the successful generate
+        # transaction below persists this together with the queued state.
+        from jobs import touch_user_activity
+        touch_user_activity(db, job_row)
         if editor_version_id or str(editor_revision).strip():
             if not current_user.get("features", {}).get("editor_v2"):
                 # This is a deployment/configuration mismatch, not a missing
@@ -9415,6 +9432,12 @@ async def generate_with_segments(
         job_row.progress = 0
         job_row.error = None
         job_row.last_progress_at = datetime.now(timezone.utc)
+        # approve_document/get_or_create_document may refresh this ORM row
+        # from the database while SessionLocal has autoflush disabled.  Apply
+        # the revival again at the final locked transition so it is guaranteed
+        # to persist with queued status.
+        from jobs import touch_user_activity
+        touch_user_activity(db, job_row)
 
         # The durable editor bridge locks and refreshes this same Job row.
         # Persist the pending transition inside the current transaction first;
@@ -9555,11 +9578,12 @@ async def generate_with_segments(
     except (ValueError, TypeError):
         pass
 
-    # Remove the orphan draft the wizard sometimes leaves behind: if a
+    # Hide the orphan draft the wizard sometimes leaves behind: if a
     # sibling transcribed_pending/awaiting_upload row for the same audio was
-    # just created (re-upload-on-generate bug), delete it so the operator
+    # just created (re-upload-on-generate bug), soft-archive it so the operator
     # doesn't see a phantom "2nd job". Time-windowed so it never touches an
-    # intentional re-upload of the same song later.
+    # intentional re-upload of the same song later.  The helper never deletes
+    # the row: an out-of-order browser response may still reference it.
     #
     # Audit 2026-05-26 (#388 wizard-duplicate-jobs): sanitize the filename
     # before the dedupe filter. `/upload-url` persists `Job.filename` via
@@ -11638,6 +11662,10 @@ def _editor_document_or_404(db: Session, job_id: str, current_user: dict):
         )
     except (LookupError, ValueError):
         raise HTTPException(status_code=422, detail="Invalid editor segments.") from None
+    # Opening/using an explicit editor ID wins over a soft-dedup race.  This
+    # also refreshes the reaper activity anchor for long editing sessions.
+    from jobs import touch_user_activity
+    touch_user_activity(db, job)
     return job, document
 
 

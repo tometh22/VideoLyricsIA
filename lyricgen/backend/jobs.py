@@ -223,6 +223,13 @@ def touch_user_activity(db: Session, job: Job) -> None:
     """
     from datetime import datetime, timezone
     job.last_user_activity_at = datetime.now(timezone.utc)
+    # A draft may have been soft-superseded by a duplicate wizard request
+    # whose response won the network race.  The explicit ID the browser is
+    # still using is authoritative: revive it instead of leaving a perfectly
+    # valid editor/generate flow hidden from history.  Hard deletion used to
+    # make this race unrecoverable (the browser kept the losing ID and later
+    # /generate returned job_not_found).
+    job.archived_at = None
 
 
 def set_timing_source(job_id: str, source: str) -> None:
@@ -331,26 +338,29 @@ def supersede_sibling_drafts(
     db: Session, *, keep_job_id: str, user_id: int, tenant_id: str,
     filename: str, window_min: int = 20, active_within_min: int = 20,
 ) -> int:
-    """Delete sibling DRAFT jobs (transcribed_pending / awaiting_upload) for
+    """Soft-archive sibling DRAFT jobs for the same upload attempt.
+
+    Never hard-delete a wizard draft here.  Back-to-back upload requests can
+    complete out of order, so the browser may legitimately continue with the
+    ID that this helper considers the older sibling.  Keeping the row makes
+    that response race harmless: a later authenticated touch revives the ID.
+
+    Select sibling DRAFT jobs (transcribed_pending / awaiting_upload) for
     the same user + same filename created within `window_min`, excluding
     `keep_job_id`.
 
     Why: the wizard's generate flow can re-upload the audio (new job row)
     instead of reusing the transcribe job, leaving an orphan
     transcribed_pending row that shows up as a phantom "2nd job". This
-    removes that orphan at generate time. Time-windowed (default 20 min) so
+    hides that orphan at generate time. Time-windowed (default 20 min) so
     it never touches an INTENTIONAL re-upload of the same song hours later.
-    Returns the number of rows deleted. Caller need not commit (we do).
+    Returns the number of rows archived. Caller need not commit (we do).
 
-    Guard (incident 2026-06-26): NEVER supersede a sibling the operator is
-    actively editing. `last_user_activity_at` is bumped only on POST
-    /save-segments (a real lyric edit), so a recent non-null value means
-    "this is the draft they're working on" — not an accidental double-upload.
-    Deleting it left the wizard pointing at a now-missing job ("Job not
-    found.") AND threw away the in-progress edits. (The cascade fix #734 made
-    this delete actually succeed, so the previously-silent bug surfaced when
-    re-uploading the same audio.) Drafts never touched (last_user_activity_at
-    IS NULL) are still accidental dupes → still superseded.
+    Guard (incidents 2026-06-26 and 2026-08-18): recent activity still avoids
+    hiding the active row.  Stale/untouched siblings are only archived, never
+    deleted; this preserves Job.segments_json, EditorDocument, immutable
+    EditorVersion history and the R2 key even when the browser response order
+    differs from request order.
     """
     if not filename:
         return 0
@@ -363,6 +373,7 @@ def supersede_sibling_drafts(
         .filter(Job.job_id != keep_job_id)
         .filter(Job.filename == filename)
         .filter(Job.status.in_(("transcribed_pending", "awaiting_upload")))
+        .filter(Job.archived_at.is_(None))
         .filter(Job.created_at >= cutoff)
         .filter(or_(
             Job.last_user_activity_at.is_(None),
@@ -372,12 +383,12 @@ def supersede_sibling_drafts(
     )
     n = 0
     for sib in siblings:
-        db.delete(sib)
+        sib.archived_at = now
         n += 1
     if n:
         db.commit()
         logging.getLogger("genly").info(
-            "[DEDUP] superseded %s sibling draft(s) of %s for %r",
+            "[DEDUP] soft-archived %s sibling draft(s) of %s for %r",
             n, keep_job_id, filename,
         )
     return n

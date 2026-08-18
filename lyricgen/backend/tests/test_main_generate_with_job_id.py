@@ -11,6 +11,7 @@ import io
 import json
 import os
 import struct
+from datetime import datetime, timezone
 
 import pytest
 
@@ -111,6 +112,17 @@ def test_generate_reuses_persisted_audio_when_job_id_provided(
 
     job_id = _seed_transcribed_pending(user_id, tenant_id)
 
+    # Simulate a duplicate upload request that soft-superseded this ID before
+    # its HTTP response reached the browser.  Explicit reuse must revive it.
+    s = SessionLocal()
+    try:
+        from database import Job
+        row = s.query(Job).filter(Job.job_id == job_id).one()
+        row.archived_at = datetime.now(timezone.utc)
+        s.commit()
+    finally:
+        s.close()
+
     captured = {}
     def _fake_enqueue(**kwargs):
         captured.update(kwargs)
@@ -138,6 +150,13 @@ def test_generate_reuses_persisted_audio_when_job_id_provided(
     body = res.json()
     assert body["job_id"] == job_id
     assert body["status"] == "queued"
+
+    state_db = SessionLocal()
+    try:
+        from database import Job
+        assert state_db.query(Job).filter(Job.job_id == job_id).one().archived_at is None
+    finally:
+        state_db.close()
 
     # The pipeline should have been enqueued with the same job_id and the
     # audio path that /transcribe persisted — no new upload took place.
