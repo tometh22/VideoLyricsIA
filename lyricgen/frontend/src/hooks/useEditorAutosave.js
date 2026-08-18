@@ -12,13 +12,13 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
   const checkpointTimerRef = useRef(null);
   const retryTimerRef = useRef(null);
   const retryCountRef = useRef(0);
-  // A durable conflict blocks every save, including the manual "Guardar"
-  // button, which returned `{ok:false}` without touching the network — the
-  // operator saw a button that did nothing ("hay que apretar Guardar muchas
-  // veces"). `forceRecover` is the ONLY sanctioned way past `blocked`: it
-  // re-reads the remote document and three-way merges before writing, so it
-  // can never clobber someone else's edit.
-  const bypassBlockedRef = useRef(false);
+  // Un conflicto durable bloquea TODO guardado, incluido el botón "Guardar",
+  // que retornaba `{ok:false}` sin tocar la red — el operador clickeaba algo
+  // que no hacía nada. `forceRecover` es la única vía sancionada para pasar
+  // `blocked`, y el permiso viaja como PARÁMETRO de la llamada (no como estado
+  // compartido): mientras corre la recuperación, cualquier otro `flush`
+  // concurrente —hay 9 acciones de edición que disparan uno— sigue bloqueado y
+  // no puede colarse a pisar la edición remota.
   segmentsRef.current = segments;
   runtimeRef.current = { enabled, blocked, save, reconcile, onStatus, onMerged };
 
@@ -34,9 +34,10 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
     isRetry = false,
     overrideSegments = null,
     rebaseAttempts = 0,
+    bypassBlocked = false,
   ) => {
     const runtime = runtimeRef.current;
-    const blocked = runtime.blocked && !bypassBlockedRef.current;
+    const blocked = runtime.blocked && !bypassBlocked;
     if (!mountedRef.current || !runtime.enabled || blocked) {
       return { ok: false, reason: runtime.blocked ? "conflict" : "disabled" };
     }
@@ -102,7 +103,7 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
       // without ever bypassing the backend CAS check.
       if (rebaseAttempts < MAX_REBASE_ATTEMPTS) {
         runtimeRef.current.onMerged?.(result.mergedSegments, result);
-        return runSave(checkpoint, false, result.mergedSegments, rebaseAttempts + 1);
+        return runSave(checkpoint, false, result.mergedSegments, rebaseAttempts + 1, bypassBlocked);
       }
       const delay = Math.min(30_000, 1_000 * (2 ** retryCountRef.current));
       retryCountRef.current += 1;
@@ -180,14 +181,10 @@ export function useEditorAutosave({ enabled, segments, dirty, blocked, save, rec
   // remote moved, the merged document is what gets saved. If the merge still
   // conflicts, the status stays `conflict` and the banner keeps offering the
   // reload path — this never force-overwrites a remote edit.
-  const forceRecover = useCallback(async (checkpoint = "manual") => {
-    bypassBlockedRef.current = true;
-    try {
-      return await runSave(checkpoint, true);
-    } finally {
-      bypassBlockedRef.current = false;
-    }
-  }, [runSave]);
+  const forceRecover = useCallback(
+    (checkpoint = "manual") => runSave(checkpoint, true, null, 0, true),
+    [runSave],
+  );
 
   return { flush, clearTimers, forceRecover };
 }

@@ -958,6 +958,9 @@ export default function LyricsEditor({
   const editedRef = useRef(edited);
   editedRef.current = edited;
   const unsafeCandidateIdsRef = useRef(new Set());
+  // Documento durable vigente, leído por los rescates de borrador sin
+  // meterlo en las deps del efecto (si no, el cleanup corre en cada cambio).
+  const durableDocRef = useRef(null);
   const persistRef = useRef(onPersistSegments);
   persistRef.current = onPersistSegments;
   const saveQueueRef = useRef(null);
@@ -975,6 +978,7 @@ export default function LyricsEditor({
     enabled: editorV2Enabled,
     request: editorRequest,
   });
+  durableDocRef.current = durableEditor.document;
   const priorQualityPendingRef = useRef(qualityAnalysisPending);
   useEffect(() => {
     const wasPending = priorQualityPendingRef.current;
@@ -1209,6 +1213,12 @@ export default function LyricsEditor({
     setSaveStatus(status);
     setSaveErrorReason(reason);
     if (status === "conflict") setDurableConflict(true);
+    // Un guardado exitoso CIERRA el conflicto. Sin esto, tras recuperarse
+    // el chip decía "Guardado ✓" pero `durableConflict` seguía en true: el
+    // banner (y con él el botón) desaparecía, el autosave quedaba
+    // desarmado, "Guardar" no tocaba la red y Aprobar seguía bloqueado —
+    // el operador terminaba MÁS trabado que antes, y en silencio.
+    if (status === "saved") setDurableConflict(false);
     if (status === "saved") {
       trackEditorEvent("editor_autosave_success", {
         duration_ms: Math.round(metadata.durationMs || 0),
@@ -1485,10 +1495,21 @@ export default function LyricsEditor({
     if (!editorV2Enabled || !draftKey) return undefined;
     const persistDraftNow = () => {
       if (!dirtyRef.current) return;
+      const doc = durableDocRef.current;
+      const current = sanitizeSegmentsForPersistence(editedRef.current);
+      // Rescatamos SÓLO si hay trabajo que el servidor todavía no tiene. Sin
+      // este chequeo, el cleanup reescribía un borrador ya cubierto —
+      // notablemente después de aprobar, donde el draft se borra a propósito:
+      // al reabrir el job, hydrate() tomaba ese draft, pisaba la pantalla con
+      // la versión pre-aprobación y el autosave la persistía, revirtiendo la
+      // limpieza. `dirtyRef` solo no alcanza porque queda en true tras aprobar.
+      try {
+        if (doc && segmentsEquivalent(current, doc.segments || [])) return;
+      } catch { /* si la comparación falla, preferimos rescatar */ }
       try {
         localStorage.setItem(draftKey, JSON.stringify({
-          segments: sanitizeSegmentsForPersistence(editedRef.current),
-          base_segments: sanitizeSegmentsForPersistence(durableEditor.document?.segments || []),
+          segments: current,
+          base_segments: sanitizeSegmentsForPersistence(doc?.segments || []),
           base_revision: durableEditor.revisionRef.current,
           updated_at: new Date().toISOString(),
         }));
@@ -1499,10 +1520,12 @@ export default function LyricsEditor({
     return () => {
       window.removeEventListener("pagehide", persistDraftNow);
       window.removeEventListener("beforeunload", persistDraftNow);
-      // SPA navigation desmonta React antes de pagehide: mismo rescate.
+      // SPA navigation desmonta React antes de pagehide: mismo rescate. Las
+      // deps son estables a propósito — con `durableEditor.document` acá el
+      // cleanup corría en CADA cambio del documento, no sólo al desmontar.
       persistDraftNow();
     };
-  }, [draftKey, durableEditor.document, durableEditor.revisionRef, editorV2Enabled]);
+  }, [draftKey, durableEditor.revisionRef, editorV2Enabled]);
 
   // Durable flush on page unload (refresh / tab close). The beforeunload
   // handler above only WARNS via a native dialog — it does not persist. And
@@ -3923,7 +3946,7 @@ export default function LyricsEditor({
             ) : (
               <button
                 type="button"
-                onClick={() => flushPendingSave()}
+                onClick={() => (durableConflict ? recoverFromConflict() : flushPendingSave())}
                 className="text-[11px] text-red-200 hover:text-white bg-red-500/20 hover:bg-red-500/30 rounded-lg px-3 py-1.5 transition-colors"
                 title="Forzar reintento de guardado"
               >
