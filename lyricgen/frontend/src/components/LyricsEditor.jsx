@@ -988,7 +988,7 @@ export default function LyricsEditor({
   const [historyOpen, setHistoryOpen] = useState(false);
   const editedRef = useRef(edited);
   editedRef.current = edited;
-  const unsafeCandidateIdsRef = useRef(new Set());
+  const unsafeNavigationIdsRef = useRef(new Set());
   // Documento durable vigente, leído por los rescates de borrador sin
   // meterlo en las deps del efecto (si no, el cleanup corre en cada cambio).
   const durableDocRef = useRef(null);
@@ -2789,7 +2789,7 @@ export default function LyricsEditor({
     // calidad. Antes sólo miraba `review`, un booleano que en el peor caso
     // marca todas las líneas y en el mejor ninguna; las ventanas —que traen el
     // diagnóstico real— quedaban fuera de la navegación.
-    const unsafeIds = unsafeCandidateIdsRef.current || new Set();
+    const unsafeIds = unsafeNavigationIdsRef.current || new Set();
     const reviewIds = edited
       .filter((s) => s.review || unsafeIds.has(s._id))
       .map((s) => s._id);
@@ -3448,7 +3448,37 @@ export default function LyricsEditor({
       return overlapsUnsafeWindow || explicitlyUnsafe ? [segment._id] : [];
     }));
   }, [confirmedUnsafeWindowIds, focusedQualityReview, qualityGuidanceAvailable, sanitizedEdited, unsafeWindows, unconfirmedUnsafeWindows]);
-  unsafeCandidateIdsRef.current = unsafeCandidateSegmentIds;
+  // One calm marker/navigation stop per unsafe *part*, not one warning per
+  // lyric line. Long windows often cover several valid lines; painting and
+  // navigating every one made a single diagnosis look like many failures.
+  // In observe mode diagnostics remain available in the summary/timing view,
+  // but do not permanently decorate the lyric rows.
+  const unsafeWindowMarkerSegmentIds = useMemo(() => {
+    if (!qualityGuidanceAvailable || !focusedQualityReview) return new Set();
+    const markerIds = new Set();
+    unconfirmedUnsafeWindows.forEach((qualityWindow) => {
+      const first = sanitizedEdited.find((segment) => (
+        segmentOverlapsWindow(segment, qualityWindow)
+      ));
+      if (first?._id != null) markerIds.add(first._id);
+    });
+
+    // Older payloads can mark candidates without emitting windows. Collapse
+    // consecutive candidates into a single review stop as well.
+    let inExplicitRun = false;
+    sanitizedEdited.forEach((segment) => {
+      const coveredByWindow = unsafeWindows.some((qualityWindow) => (
+        segmentOverlapsWindow(segment, qualityWindow)
+      ));
+      const explicitlyUnsafe = !coveredByWindow && (
+        segment?.unsafe_candidate === true || segment?.confirmed === false
+      );
+      if (explicitlyUnsafe && !inExplicitRun) markerIds.add(segment._id);
+      inExplicitRun = explicitlyUnsafe;
+    });
+    return markerIds;
+  }, [focusedQualityReview, qualityGuidanceAvailable, sanitizedEdited, unsafeWindows, unconfirmedUnsafeWindows]);
+  unsafeNavigationIdsRef.current = unsafeWindowMarkerSegmentIds;
   // ENMASCARAR ≠ INFORMAR. Reemplazar la letra por "Letra sin confirmar" en el
   // preview es una consecuencia del modo `enforce`, donde el operador PUEDE
   // destapar cada zona con "Confirmar zona". En `observe` —el modo que corre en
@@ -3777,10 +3807,10 @@ export default function LyricsEditor({
   // El chip anuncia cuántas líneas recorre el navegador, y el navegador
   // cicla `review` ∪ zonas dudosas. Contar sólo `review` dejaba el chip
   // desincronizado (o directamente oculto con 9 líneas navegables).
-  const navigableReviewCount = edited.reduce(
-    (n, s) => n + ((s.review || unsafeCandidateSegmentIds.has(s._id)) ? 1 : 0),
-    0,
-  );
+  const navigableReviewCount = new Set([
+    ...edited.filter((segment) => segment.review).map((segment) => segment._id),
+    ...unsafeWindowMarkerSegmentIds,
+  ]).size;
   // Banner calmo con navegador secuencial: se muestra con ≥1 línea review.
   // Antes era ≥3 (con badges per-línea abajo); ahora el banner + la barra
   // de acento sutil cubren cualquier cantidad sin ruido.
@@ -3832,9 +3862,15 @@ export default function LyricsEditor({
   // marcó el análisis de calidad. Se AGREGA a la señal calma existente
   // ("señal review calma", 2026-07) en vez de reemplazarla — es un dato para
   // ubicarse, no una alarma. Sólo aparece cuando hay diagnóstico real.
-  if (qualityGuidanceAvailable && unsafeCandidateSegmentIds.size > 0) {
+  const qualityPartsToReview = focusedQualityReview
+    ? unconfirmedUnsafeWindows.length
+    : unsafeWindows.length;
+  if (qualityGuidanceAvailable && qualityPartsToReview > 0) {
+    const reviewUnit = qualityPartsToReview === 1
+      ? (t("editor.confidence_needs_review_one") || "parte a revisar")
+      : (t("editor.confidence_needs_review") || "partes a revisar");
     confidenceParts.push(
-      `${unsafeCandidateSegmentIds.size} ${t("editor.confidence_needs_review") || "líneas a revisar"}`,
+      `${qualityPartsToReview} ${reviewUnit}`,
     );
   }
   if (bgStatus === "done") confidenceParts.push(t("editor.confidence_bg_done") || "Fondo listo");
@@ -5361,6 +5397,8 @@ export default function LyricsEditor({
             // interpolated, so flag it amber for the operator to verify.
             const isReview = !!seg.review;
             const isUnsafeCandidate = unsafeCandidateSegmentIds.has(seg._id);
+            const isUnsafeMarker = unsafeWindowMarkerSegmentIds.has(seg._id);
+            const showIndividualReviewSignal = isReview && reviewSegCount < 3;
             const unsafeCandidateHintId = `unsafe-candidate-${seg._id}`;
 
             return (
@@ -5370,7 +5408,8 @@ export default function LyricsEditor({
                 {...(idx === 0 ? { "data-tour": "editor-list-row" } : {})}
                 data-testid={`lyric-row-${idx + 1}`}
                 data-unsafe-candidate={isUnsafeCandidate ? "true" : "false"}
-                aria-describedby={isUnsafeCandidate ? unsafeCandidateHintId : undefined}
+                data-unsafe-marker={isUnsafeMarker ? "true" : "false"}
+                aria-describedby={isUnsafeMarker ? unsafeCandidateHintId : undefined}
                 /* Phase A 2026-05-25: highlight prominente cuando es activo.
                    Antes: bg-brand/[0.07] ring-1 ring-brand/25 (invisible al
                    operador, ~7% opacity). Ahora: bg-brand/15 + left-bar
@@ -5386,9 +5425,8 @@ export default function LyricsEditor({
                        11/26 líneas. Ahora sólo una barra de acento fina en el
                        borde izquierdo (mismo grosor que la fila activa para
                        no romper la grilla), en ámbar tenue. Sin fondo ni ring. */
-                    : `border-l-4 ${!isArmed && !isActive && !wasRecentlyAnchored && isReview ? "border-amber-400/50" : "border-transparent"}`}
+                    : `border-l-4 ${!isArmed && !isActive && !wasRecentlyAnchored && (showIndividualReviewSignal || isUnsafeMarker) ? "border-amber-400/50" : "border-transparent"}`}
                   ${!isArmed && !isActive && wasRecentlyAnchored ? "bg-brand/[0.05] ring-1 ring-brand/40" : ""}
-                  ${isUnsafeCandidate ? "bg-amber-300/[0.06] ring-1 ring-amber-300/25" : ""}
                   ${flashReviewId === seg._id ? "ring-1 ring-amber-400/50" : ""}
                   ${isAnchored ? "opacity-60" : ""}`}
               >
@@ -5429,7 +5467,7 @@ export default function LyricsEditor({
                         className={`text-[11px] font-mono pt-2.5 w-14 text-right transition-colors
                           ${isActive ? "text-brand-light font-semibold"
                             : wasRecentlyAnchored ? "text-brand-light"
-                            : isUnsafeCandidate || isReview ? "text-amber-300 hover:text-amber-200"
+                            : isUnsafeMarker || showIndividualReviewSignal ? "text-amber-300 hover:text-amber-200"
                             : "text-gray-200 hover:text-brand-light"}`}
                       >
                         {/* Phase A 2026-05-25: indicador ▶ visible solo en
@@ -5512,18 +5550,18 @@ export default function LyricsEditor({
                       className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm
                         focus:border-brand/40 focus:outline-none hover:border-white/[0.08] transition-all
                         text-white
-                        ${isUnsafeCandidate
+                        ${isUnsafeMarker
                           ? "border-amber-300/30"
                           : suggestion && !isApplied ? "border-amber-500/20" : "border-white/[0.04]"}`}
                     />
-                    {isUnsafeCandidate && (
+                    {isUnsafeMarker && (
                       <div
                         id={unsafeCandidateHintId}
                         data-testid={`unsafe-candidate-label-${idx + 1}`}
                         className="mt-1 flex items-center gap-1.5 px-2 text-[10px] font-medium text-amber-200/90"
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-amber-300" aria-hidden="true" />
-                        {t("editor.quality_candidate_label") || "Candidata insegura · escuchá y confirmá esta zona"}
+                        {t("editor.quality_candidate_label") || "Revisar esta parte"}
                       </div>
                     )}
                     {/* Phase A 2026-05-25: overlay karaoke word-jump (Apple

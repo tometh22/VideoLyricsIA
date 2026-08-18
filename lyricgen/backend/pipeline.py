@@ -6382,7 +6382,7 @@ def _polish_segments_text(segments: list[dict], artist: str = "",
     numbered = "\n".join(lines)
 
     system_prompt = (
-        "You are a Spanish lyrics proofreader. The input is a numbered list of "
+        "You are a multilingual lyrics proofreader. The input is a numbered list of "
         "lines from a Whisper auto-transcription of a song. Whisper makes "
         "predictable errors in Spanish: missing accents (se→sé, mas→más, "
         "te→té), wrong contractions ('de la amor'→'del amor', 'a el'→'al'), "
@@ -6391,6 +6391,7 @@ def _polish_segments_text(segments: list[dict], artist: str = "",
         "Return STRICT JSON: an array where each element is "
         '{"i": <line index>, "text": "<corrected text>"} ONLY for lines you '
         "actually changed. Do NOT return unchanged lines. Do NOT add new lines. "
+        "The song may code-switch: preserve the original language of EACH line. "
         "Do NOT translate or paraphrase — only fix obvious transcription errors. "
         "Preserve all original words you do not need to fix.\n\n"
         "When in doubt, leave the line as-is."
@@ -6428,12 +6429,20 @@ def _polish_segments_text(segments: list[dict], artist: str = "",
 
     # Apply corrections
     corrections = {}
+    from lyrics_format import preserves_lexical_content
     for item in parsed:
         try:
             idx = int(item["i"])
             new_text = str(item["text"]).strip()
             if 0 <= idx < len(segments) and new_text:
-                corrections[idx] = new_text
+                original_text = str(segments[idx].get("text") or "")
+                if preserves_lexical_content(original_text, new_text):
+                    corrections[idx] = new_text
+                else:
+                    logger.warning(
+                        "[POLISH] rejected lexical rewrite at line %d; keeping source text",
+                        idx + 1,
+                    )
         except (KeyError, ValueError, TypeError):
             continue
     if not corrections:
@@ -6650,6 +6659,89 @@ def _gemini_cleanup_word_overlap(cleaned: str, plain: str) -> float:
     return len(a & b) / len(a | b)
 
 
+def _lexical_words(text: str) -> list[str]:
+    """Accent-insensitive words, including stop words, for lineage checks."""
+    import unicodedata
+    normalized = unicodedata.normalize("NFKD", str(text or "")).casefold()
+    normalized = "".join(
+        char for char in normalized if not unicodedata.combining(char)
+    )
+    return re.findall(r"[^\W_]+", normalized, re.UNICODE)
+
+
+def _has_lexical_anchor(candidate: str, source: str) -> bool:
+    """Require substantial source vocabulary in an LLM rewrite.
+
+    Audio-grounded cleanup may correct a misheard word, so exact equality is
+    too restrictive here.  A full translation of a short code-switched phrase,
+    however, replaces every lexical token (``Are you ready`` -> ``Estoy
+    listo``). Short phrases must remain lexically identical; longer phrases
+    must retain at least 60% of the shorter vocabulary. This rejects
+    translations that preserve only a name while still allowing a local
+    spelling/mishear correction in a longer line.
+    """
+    from collections import Counter
+
+    candidate_sequence = _lexical_words(candidate)
+    source_sequence = _lexical_words(source)
+    candidate_words = Counter(candidate_sequence)
+    source_words = Counter(source_sequence)
+    if not candidate_words or not source_words:
+        return candidate_words == source_words
+    # Short hooks and code-switched interjections are too ambiguous to rewrite
+    # safely: one shared stop-word (``No way`` -> ``No hay``) would otherwise
+    # satisfy a percentage gate. Accent/punctuation-only edits still compare
+    # equal after normalization.
+    if min(len(candidate_sequence), len(source_sequence)) <= 3:
+        return candidate_sequence == source_sequence
+    common_count = sum((candidate_words & source_words).values())
+    return common_count / min(
+        len(candidate_sequence), len(source_sequence),
+    ) >= 0.6
+
+
+def _gemini_cleanup_lines_grounded(cleaned: str, plain: str) -> bool:
+    """Verify every rewritten source line retains lexical provenance.
+
+    The cleanup prompt asks Gemini to preserve line breaks.  For equal-sized
+    output we can therefore enforce this per line and catch a single translated
+    phrase that a song-level overlap score hides.  If cardinality changed, use
+    monotonic diff blocks and require every replaced source line to retain an
+    anchor somewhere in the corresponding candidate block. Insert-only blocks
+    remain possible for genuinely missing ad-libs; deletions fail closed.
+    """
+    from difflib import SequenceMatcher
+
+    source_lines = [line.strip() for line in plain.splitlines() if line.strip()]
+    candidate_lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if not source_lines or not candidate_lines:
+        return False
+    if len(source_lines) == len(candidate_lines):
+        return all(
+            _has_lexical_anchor(candidate, source)
+            for source, candidate in zip(source_lines, candidate_lines)
+        )
+
+    source_keys = [" ".join(_lexical_words(line)) for line in source_lines]
+    candidate_keys = [" ".join(_lexical_words(line)) for line in candidate_lines]
+    matcher = SequenceMatcher(None, source_keys, candidate_keys, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal" or tag == "insert":
+            continue
+        if tag == "delete":
+            return False
+        candidate_block = candidate_lines[j1:j2]
+        if any(
+            not any(
+                _has_lexical_anchor(candidate, source)
+                for candidate in candidate_block
+            )
+            for source in source_lines[i1:i2]
+        ):
+            return False
+    return True
+
+
 def _gemini_cleanup_cache_key(audio_path: str, lrclib_plain: str):
     """Content-addressable cache key for Gemini lyrics cleanup. Same
     audio + same lrclib hint = same cleaned output (deterministic with
@@ -6768,9 +6860,11 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
         return None
 
     system_prompt = (
-        "You are a Spanish-language lyrics proofreader.\n"
+        "You are a multilingual lyrics proofreader.\n"
         "Input: (1) full audio recording of a song, (2) a community "
         "transcription with errors.\n\n"
+        "The song may alternate languages. Preserve the ORIGINAL language of "
+        "EACH line independently; never translate or paraphrase.\n\n"
         "CRITICAL: Return the FULL corrected lyrics for the ENTIRE song. "
         "The input may have 50-100+ lines — your output must cover ALL "
         "of them. Do not stop early. Do not summarize. Do not skip the "
@@ -6905,6 +6999,17 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
         )
         return None
 
+    # Defense 5: a translated minority-language line can hide inside a mostly
+    # unchanged song and still pass the global language/overlap checks above.
+    # Bind each rewrite back to its own source line (or monotonic diff block).
+    if not _gemini_cleanup_lines_grounded(cleaned, plain):
+        logger.warning(
+            "[GEMINI-CLEAN] line-level lexical provenance lost (%.1fs) — "
+            "possible translation, using lrclib raw",
+            elapsed,
+        )
+        return None
+
     logger.info(
         "[GEMINI-CLEAN] cleaned %d → %d lines, overlap=%.2f in %.1fs (audio_hash=%s)",
         len(in_lines), len(out_lines), overlap, elapsed, audio_hash,
@@ -6933,12 +7038,14 @@ def _target_language_instruction(language: str | None, segs: list[dict]) -> str:
     }
     if resolved:
         return (
-            f"IDIOMA OBJETIVO: {names.get(resolved, resolved)} ({resolved}). "
-            "Conservá ese idioma exactamente; no traduzcas."
+            f"IDIOMA PRINCIPAL DE CONTEXTO: {names.get(resolved, resolved)} "
+            f"({resolved}). Conservá el idioma ORIGINAL de CADA frase por "
+            "separado: la canción puede alternar idiomas. No traduzcas ni "
+            "parafrasees ninguna frase en otro idioma."
         )
     return (
-        "IDIOMA OBJETIVO: el mismo idioma de la transcripción y del audio. "
-        "No traduzcas ni mezcles idiomas."
+        "IDIOMA: conservá el idioma ORIGINAL de CADA frase por separado; la "
+        "canción puede alternar idiomas. No traduzcas ni parafrasees."
     )
 
 
@@ -7068,7 +7175,20 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
     if coverage < 0.9:
         logger.warning("[LLM-SEGMENT] coverage %.2f < 0.9; keeping whisperX", coverage)
         return segs
-    # Gate (b): anti-hallucination — the LLM text must overlap the whisperX text.
+    # Gate (b): each output line must retain a lexical anchor to the exact
+    # Whisper word range it claims. Song-level overlap alone lets a translated
+    # code-switched line hide among dozens of unchanged Spanish lines.
+    for i, j, txt in parsed:
+        source_text = " ".join(
+            (W[index].get("word") or "") for index in range(i, j + 1)
+        )
+        if not _has_lexical_anchor(txt, source_text):
+            logger.warning(
+                "[LLM-SEGMENT] line %d-%d lost lexical provenance; keeping whisperX",
+                i, j,
+            )
+            return segs
+    # Gate (c): anti-hallucination — the LLM text must overlap the whisperX text.
     wx_text = " ".join((w.get("word") or "") for w in W)
     llm_text = " ".join(t for _, _, t in parsed)
     if _gemini_cleanup_word_overlap(llm_text, wx_text) < 0.5:

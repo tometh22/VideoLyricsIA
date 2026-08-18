@@ -91,7 +91,9 @@ def test_prompt_preserves_resolved_language_without_translation(
     )
 
     config = fake.models.generate_content.call_args.kwargs["config"]
-    assert "IDIOMA OBJETIVO: español (es)" in config.system_instruction
+    assert "IDIOMA PRINCIPAL DE CONTEXTO: español (es)" in config.system_instruction
+    assert "idioma ORIGINAL de CADA frase" in config.system_instruction
+    assert "puede alternar idiomas" in config.system_instruction
     assert "no traduzcas" in config.system_instruction.lower()
 
 
@@ -109,6 +111,35 @@ def test_self_declines_on_hallucination(tiny_audio, monkeypatch):
                  "[0-3] aaaa bbbb cccc dddd\n[4-7] eeee ffff gggg hhhh")
     out = pipeline._llm_segment_words(SEGS, audio_path=tiny_audio)
     assert out is SEGS
+
+
+def test_self_declines_when_one_code_switched_line_is_translated(
+        tiny_audio, monkeypatch):
+    monkeypatch.setenv("LLM_SEGMENT_ENABLED", "1")
+    words = [
+        {"word": "Todo", "start": 1.0, "end": 1.2},
+        {"word": "el", "start": 1.2, "end": 1.3},
+        {"word": "mundo", "start": 1.3, "end": 1.6},
+        {"word": "baila", "start": 1.6, "end": 2.0},
+        {"word": "Are", "start": 2.5, "end": 2.7},
+        {"word": "you", "start": 2.7, "end": 2.8},
+        {"word": "ready", "start": 2.8, "end": 3.1},
+        {"word": "now", "start": 3.1, "end": 3.4},
+    ]
+    mixed = [{
+        "start": 1.0,
+        "end": 3.4,
+        "text": "Todo el mundo baila Are you ready now",
+        "words": words,
+    }]
+    _mock_gemini(
+        monkeypatch,
+        "[0-3] Todo el mundo baila\n[4-7] Están todos listos ahora",
+    )
+
+    assert pipeline._llm_segment_words(
+        mixed, audio_path=tiny_audio, language="es",
+    ) is mixed
 
 
 @pytest.mark.parametrize("ranges", [

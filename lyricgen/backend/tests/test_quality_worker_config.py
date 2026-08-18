@@ -10,14 +10,14 @@ from scripts.require_quality_worker_config import connectivity_errors, validate_
 REPO = Path(__file__).resolve().parents[3]
 
 
-def test_api_pins_v6_proposals_and_model_off_for_shadow_rollout():
+def test_api_defaults_v6_proposals_and_model_off_but_allows_staging_override():
     path = REPO / "railway" / "api.toml"
     with path.open("rb") as handle:
         cfg = tomllib.load(handle)
 
     start = cfg["deploy"]["startCommand"]
-    assert "QUALITY_V6_PROPOSALS_ENABLED=0" in start
-    assert "QUALITY_V6_MODEL_ENABLED=0" in start
+    assert 'QUALITY_V6_PROPOSALS_ENABLED="${QUALITY_V6_PROPOSALS_ENABLED:-0}"' in start
+    assert 'QUALITY_V6_MODEL_ENABLED="${QUALITY_V6_MODEL_ENABLED:-0}"' in start
 
 
 def test_quality_worker_is_one_process_one_replica_and_one_queue():
@@ -47,8 +47,8 @@ def test_quality_worker_is_one_process_one_replica_and_one_queue():
     assert "TARGETED_STRUCTURAL_AUTOREPAIR_MODE=observe" in start
     assert "TARGETED_RESIDUAL_ASR_ENABLED=1" in start
     assert "TARGETED_CONSENSUS_MAX_BILLED_SECONDS=120" in start
-    assert "QUALITY_V6_PROPOSALS_ENABLED=0" in start
-    assert "QUALITY_V6_MODEL_ENABLED=0" in start
+    assert 'QUALITY_V6_PROPOSALS_ENABLED="${QUALITY_V6_PROPOSALS_ENABLED:-0}"' in start
+    assert 'QUALITY_V6_MODEL_ENABLED="${QUALITY_V6_MODEL_ENABLED:-0}"' in start
     # Learning kill switches come from Railway variables and default off in
     # application code; pinning =0 here would make staged activation impossible.
     assert "QUALITY_LEARNING_CAPTURE_ENABLED=" not in start

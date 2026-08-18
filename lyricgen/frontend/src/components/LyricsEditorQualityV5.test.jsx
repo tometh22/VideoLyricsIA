@@ -202,7 +202,7 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
 
     const row = screen.getByTestId("lyric-row-1");
     expect(row).toHaveAttribute("data-unsafe-candidate", "true");
-    expect(screen.getByTestId("unsafe-candidate-label-1")).toHaveTextContent(/Candidata insegura/i);
+    expect(screen.getByTestId("unsafe-candidate-label-1")).toHaveTextContent(/Revisar esta parte/i);
     expect(screen.getByTestId("unsafe-quality-window-low-confidence"))
       .toHaveAttribute("data-quality-confirmed", "false");
 
@@ -542,5 +542,29 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
       disableAutosave: true,
     })} />);
     expect(screen.queryByText(/Letra sin confirmar/i)).toBeNull();
+    expect(screen.queryByTestId(/unsafe-candidate-label-/)).toBeNull();
+    expect(document.querySelectorAll('[data-unsafe-marker="true"]')).toHaveLength(0);
+  });
+
+  it("resume una ventana que cubre varias líneas como una sola parte a revisar", () => {
+    const quality = {
+      ...V5_QUALITY,
+      unsafe_windows: [{ id: "long-chorus", start: 42, end: 58, reasons: ["text_audio_mismatch"] }],
+    };
+    render(<LyricsEditor {...baseProps({
+      transcriptionQuality: quality,
+      segments: [
+        { start: 42, end: 46, text: "Línea uno" },
+        { start: 47, end: 51, text: "Línea dos" },
+        { start: 52, end: 57, text: "Línea tres" },
+      ],
+      disableAutosave: true,
+    })} />);
+
+    expect(screen.getAllByTestId(/lyric-row-/)).toHaveLength(3);
+    expect(document.querySelectorAll('[data-unsafe-candidate="true"]')).toHaveLength(3);
+    expect(document.querySelectorAll('[data-unsafe-marker="true"]')).toHaveLength(1);
+    expect(screen.getAllByTestId(/unsafe-candidate-label-/)).toHaveLength(1);
+    expect(screen.getByText(/1 parte a revisar/i)).toBeInTheDocument();
   });
 });

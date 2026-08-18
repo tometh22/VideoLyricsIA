@@ -14,7 +14,7 @@ watchPatterns = [
 
 [deploy]
 preDeployCommand = ["bash /app/backend/scripts/prod_migrate.sh"]
-startCommand = "sh -c 'export QUALITY_V6_PROPOSALS_ENABLED=0 QUALITY_V6_MODEL_ENABLED=0; exec uvicorn main:app --host 0.0.0.0 --port \"$PORT\" --workers 2 --app-dir /app/backend'"
+startCommand = "sh -c 'export QUALITY_V6_PROPOSALS_ENABLED=\"${QUALITY_V6_PROPOSALS_ENABLED:-0}\" QUALITY_V6_MODEL_ENABLED=\"${QUALITY_V6_MODEL_ENABLED:-0}\"; exec uvicorn main:app --host 0.0.0.0 --port \"$PORT\" --workers 2 --app-dir /app/backend'"
 # Deploys are rolling: the new API starts before every worker advertises the
 # new release SHA. `/health/deploy` still hard-fails on DB/Redis, but treats
 # that expected rollout mismatch as degraded. `/health/ready` remains the

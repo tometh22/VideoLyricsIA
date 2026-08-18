@@ -253,6 +253,39 @@ def test_multi_segment_mixed(monkeypatch):
     assert out[3]["start"] == 12.0 and out[3]["end"] == 14.0
 
 
+def test_code_switched_line_is_never_translated(monkeypatch):
+    """A Spanish primary language must not translate an English phrase."""
+    segs = [
+        _seg("Are you ready?", 0.0, 1.5),
+        _seg("fragil corazón", 2.0, 4.0),
+    ]
+    _patch_openai(monkeypatch, {
+        1: ["Estoy listo"],
+        2: ["Frágil corazón"],
+    })
+
+    result = _run(lf.format_lyrics_pass(_result(segs), language="es"))
+
+    assert result["segments"][0]["text"] == "Are you ready?"
+    assert result["segments"][1]["text"] == "Frágil corazón"
+
+
+def test_code_switch_prompt_preserves_each_lines_language():
+    prompt = lf._build_prompt(["Are you ready?", "Yo estoy listo"], "Spanish")
+
+    assert "code-switch" in prompt
+    assert "ORIGINAL language of EACH line" in prompt
+    assert "NEVER translate or paraphrase" in prompt
+
+
+def test_lexical_guard_allows_only_orthographic_changes():
+    assert lf.preserves_lexical_content("ARE YOU READY", "¿Are you ready?")
+    assert lf.preserves_lexical_content("fragil corazon", "Frágil corazón")
+    assert not lf.preserves_lexical_content("Are you ready?", "Estoy listo")
+    assert not lf.preserves_lexical_content("Home sweet home", "Hogar dulce hogar")
+    assert not lf.preserves_lexical_content("Marca el 638", "Marca el 780465")
+
+
 # ── failure / guard cases ─────────────────────────────────────────────────────
 
 def test_missing_index_in_response_returns_original(monkeypatch):
