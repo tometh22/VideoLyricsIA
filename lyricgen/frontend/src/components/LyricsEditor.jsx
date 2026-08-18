@@ -947,6 +947,8 @@ export default function LyricsEditor({
   const editedRef = useRef(edited);
   editedRef.current = edited;
   const unsafeCandidateIdsRef = useRef(new Set());
+  // Sólo las zonas cuyo texto se REEMPLAZA en el preview (modo enforce).
+  const maskedCandidateIdsRef = useRef(new Set());
   const persistRef = useRef(onPersistSegments);
   persistRef.current = onPersistSegments;
   const saveQueueRef = useRef(null);
@@ -1634,7 +1636,7 @@ export default function LyricsEditor({
         // WizardLivePreview central pueda hacer word-jump real.
         if (onPlaybackTick) {
           if (active) {
-            const unsafeCandidate = unsafeCandidateIdsRef.current.has(active._id);
+            const unsafeCandidate = maskedCandidateIdsRef.current.has(active._id);
             onPlaybackTick(
               unsafeCandidate
                 ? (t("editor.quality_preview_unconfirmed") || "Letra sin confirmar")
@@ -2487,18 +2489,37 @@ export default function LyricsEditor({
   // Cicla. Hace scroll a la fila, foco al input de texto, seek del audio a
   // su inicio (para escucharla) y un flash breve. Reemplaza el "cazá las
   // filas pintadas" por un recorrido guiado.
-  const jumpToNextReview = useCallback(() => {
-    const reviewIds = edited.filter((s) => s.review).map((s) => s._id);
+  const jumpToNextReview = useCallback((direction = 1, { focusInput = true } = {}) => {
+    // Recorre las líneas que hay que mirar: las marcadas por el alineador
+    // (`review`) MÁS las que caen dentro de una ventana dudosa del análisis de
+    // calidad. Antes sólo miraba `review`, un booleano que en el peor caso
+    // marca todas las líneas y en el mejor ninguna; las ventanas —que traen el
+    // diagnóstico real— quedaban fuera de la navegación.
+    const unsafeIds = unsafeCandidateIdsRef.current || new Set();
+    const reviewIds = edited
+      .filter((s) => s.review || unsafeIds.has(s._id))
+      .map((s) => s._id);
     if (!reviewIds.length) return;
-    const next = (reviewNavIdxRef.current + 1) % reviewIds.length;
+    // El chip del header pasa el EVENTO como primer argumento, así que sólo un
+    // número cuenta como dirección explícita.
+    const step = (typeof direction === "number" && direction < 0) ? -1 : 1;
+    const total = reviewIds.length;
+    const next = (((reviewNavIdxRef.current + step) % total) + total) % total;
     reviewNavIdxRef.current = next;
     const id = reviewIds[next];
     const seg = edited.find((s) => s._id === id);
     const el = rowRefs.current[id];
     if (el) {
       el.scrollIntoView({ behavior: "smooth", block: "center" });
-      const input = el.querySelector('input[type="text"]');
-      if (input) input.focus();
+      // Con el mouse, dejar el cursor listo para corregir es lo que se espera.
+      // Con el teclado NO: enfocar el input hace que la SIGUIENTE tecla se
+      // escriba dentro de la letra (la "n" de navegar terminaba en el video del
+      // cliente) y además el guard `editing` mata el atajo desde la segunda
+      // pulsación. Navegando por teclado alcanzan scroll + flash + seek.
+      if (focusInput) {
+        const input = el.querySelector('input[type="text"]');
+        if (input) input.focus();
+      }
     }
     if (seg) {
       setFocusedSegId(id);
@@ -2553,11 +2574,19 @@ export default function LyricsEditor({
         // keys para que no choque con Cmd+F (buscar nativo del browser).
         e.preventDefault();
         toggleFocusMode();
+      } else if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === "n" || e.key === "N")) {
+        // N = siguiente línea a revisar. Antes la única forma de saltar al
+        // próximo problema era apuntar y clickear el chip del header: un viaje
+        // de mouse por cada línea, en canciones de 60+ líneas. Shift+N va al
+        // anterior. El guard `editing` de arriba evita capturarlo mientras se
+        // tipea la letra.
+        e.preventDefault();
+        jumpToNextReview(e.shiftKey ? -1 : 1, { focusInput: false });
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor, undoEdit, audioUrl, enterSyncMode, exitSyncMode, toggleFocusMode]);
+  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor, undoEdit, audioUrl, enterSyncMode, exitSyncMode, toggleFocusMode, jumpToNextReview]);
 
   // ─── Reference lyrics suggestions (unchanged) ───────────────────────
   const refLines = useMemo(() => {
@@ -3052,6 +3081,16 @@ export default function LyricsEditor({
     && isTranscriptionQualityV5(transcriptionQuality)
     && transcriptionQuality?.mode === "enforce"
     && unsafeWindows.length > 0;
+  // Señal INFORMATIVA (separada del bloqueo). El worker calcula y persiste
+  // `unsafe_windows` también en `observe` —el modo que corre en producción—
+  // pero toda la UI de calidad estaba gateada a `enforce`, así que el editor
+  // recibía las ventanas y las tiraba: el operador terminaba clickeando y
+  // escuchando para descubrir a mano lo que el backend ya sabía (2,9 seeks por
+  // corrección medidos). Esto sólo habilita PINTAR y NAVEGAR; el bloqueo de la
+  // aprobación sigue siendo `focusedQualityReview`, que sí exige `enforce`.
+  const qualityGuidanceAvailable = isTranscriptionQualityV5(transcriptionQuality)
+    && (transcriptionQuality?.decision === "review_required" || qualityAnalysisPending)
+    && unsafeWindows.length > 0;
   const pendingQualityReview = qualityAnalysisPending
     && transcriptionQuality?.mode === "enforce";
   const fatalQualityFailure = transcriptionQuality?.decision === "retry_failed"
@@ -3091,8 +3130,7 @@ export default function LyricsEditor({
     ? unsafeWindows.filter((window) => !confirmedUnsafeWindowIds.has(window.id))
     : [];
   const unsafeCandidateSegmentIds = useMemo(() => {
-    if (transcriptionQuality?.mode !== "enforce"
-      || !(transcriptionQuality?.decision === "review_required" || qualityAnalysisPending)) return new Set();
+    if (!qualityGuidanceAvailable) return new Set();
     const windowsForRows = focusedQualityReview ? unconfirmedUnsafeWindows : unsafeWindows;
     return new Set(sanitizedEdited.flatMap((segment) => {
       const coveringWindows = unsafeWindows.filter((qualityWindow) => (
@@ -3110,17 +3148,28 @@ export default function LyricsEditor({
         || segment?.review === true;
       return overlapsUnsafeWindow || explicitlyUnsafe ? [segment._id] : [];
     }));
-  }, [confirmedUnsafeWindowIds, focusedQualityReview, qualityAnalysisPending, sanitizedEdited, transcriptionQuality, unsafeWindows, unconfirmedUnsafeWindows]);
+  }, [confirmedUnsafeWindowIds, focusedQualityReview, qualityGuidanceAvailable, sanitizedEdited, unsafeWindows, unconfirmedUnsafeWindows]);
   unsafeCandidateIdsRef.current = unsafeCandidateSegmentIds;
+  // ENMASCARAR ≠ INFORMAR. Reemplazar la letra por "Letra sin confirmar" en el
+  // preview es una consecuencia del modo `enforce`, donde el operador PUEDE
+  // destapar cada zona con "Confirmar zona". En `observe` —el modo que corre en
+  // producción— ese botón no existe, así que enmascarar dejaría la letra oculta
+  // SIN forma de recuperarla. Por eso el resaltado/navegación usan el set
+  // informativo y el enmascarado sigue atado a `focusedQualityReview`.
+  const maskedCandidateSegmentIds = useMemo(
+    () => (focusedQualityReview ? unsafeCandidateSegmentIds : new Set()),
+    [focusedQualityReview, unsafeCandidateSegmentIds],
+  );
+  maskedCandidateIdsRef.current = maskedCandidateSegmentIds;
   const previewSegments = useMemo(() => sanitizedEdited.map((segment) => (
-    unsafeCandidateSegmentIds.has(segment._id)
+    maskedCandidateSegmentIds.has(segment._id)
       ? {
         ...segment,
         text: t("editor.quality_preview_unconfirmed") || "Letra sin confirmar",
         words: undefined,
       }
       : segment
-  )), [sanitizedEdited, t, unsafeCandidateSegmentIds]);
+  )), [maskedCandidateSegmentIds, sanitizedEdited, t]);
 
   const jumpToUnsafeWindow = useCallback((qualityWindow) => {
     if (!qualityWindow) return;
@@ -3403,10 +3452,17 @@ export default function LyricsEditor({
   // y suprimimos los badges per-línea (el banner ya transmite la info).
   // Si <3 son review, el badge per-línea queda — es info útil sin saturar.
   const reviewSegCount = edited.reduce((n, s) => n + (s.review ? 1 : 0), 0);
+  // El chip anuncia cuántas líneas recorre el navegador, y el navegador
+  // cicla `review` ∪ zonas dudosas. Contar sólo `review` dejaba el chip
+  // desincronizado (o directamente oculto con 9 líneas navegables).
+  const navigableReviewCount = edited.reduce(
+    (n, s) => n + ((s.review || unsafeCandidateSegmentIds.has(s._id)) ? 1 : 0),
+    0,
+  );
   // Banner calmo con navegador secuencial: se muestra con ≥1 línea review.
   // Antes era ≥3 (con badges per-línea abajo); ahora el banner + la barra
   // de acento sutil cubren cualquier cantidad sin ruido.
-  const showReviewBanner = reviewSegCount >= 1;
+  const showReviewBanner = navigableReviewCount >= 1;
 
   // UX 2026-05-26 (cont.): mismo problema con la warning "● ⚠ 2 líneas" + botón
   // "Dividir" que aparece cuando el render del video va a wrappar el texto a
@@ -3450,6 +3506,15 @@ export default function LyricsEditor({
   // hay nada que avisar → "Todo listo".
   const confidenceParts = [];
   if (reviewSegCount > 0) confidenceParts.push(t("editor.confidence_synced") || "Sincronizado con tu letra");
+  // Orientación al abrir (56 s medidos hasta la primera edición): cuántas zonas
+  // marcó el análisis de calidad. Se AGREGA a la señal calma existente
+  // ("señal review calma", 2026-07) en vez de reemplazarla — es un dato para
+  // ubicarse, no una alarma. Sólo aparece cuando hay diagnóstico real.
+  if (qualityGuidanceAvailable && unsafeCandidateSegmentIds.size > 0) {
+    confidenceParts.push(
+      `${unsafeCandidateSegmentIds.size} ${t("editor.confidence_needs_review") || "líneas a revisar"}`,
+    );
+  }
   if (bgStatus === "done") confidenceParts.push(t("editor.confidence_bg_done") || "Fondo listo");
   else if (bgStatus === "queued" || bgStatus === "generating") confidenceParts.push(t("editor.confidence_bg_generating") || "Generando fondo…");
   else if (bgStatus === "error") confidenceParts.push(t("editor.confidence_bg_error") || "El fondo se genera al aprobar");
@@ -4096,7 +4161,7 @@ export default function LyricsEditor({
               <span className="inline-flex items-center gap-1">
                 <span className="text-brand-light/40">·</span>
                 <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" aria-hidden="true" />
-                <span className="tabular-nums">{cap99(reviewSegCount)}</span>
+                <span className="tabular-nums">{cap99(navigableReviewCount)}</span>
               </span>
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24">
                 <path d="M5 12h14M12 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round" />
@@ -4743,6 +4808,7 @@ export default function LyricsEditor({
                 ) : (
                   <LyricsTimeline
                     segments={sanitizedEdited}
+                    unsafeWindows={qualityGuidanceAvailable ? unsafeWindows : []}
                     duration={duration}
                     currentTime={currentTime}
                     playbackTimeRef={playbackTimeRef}
