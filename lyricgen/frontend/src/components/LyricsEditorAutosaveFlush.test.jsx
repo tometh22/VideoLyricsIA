@@ -95,4 +95,26 @@ describe("autosave flush-on-unmount", () => {
     unmount();
     expect(onPersistSegments).not.toHaveBeenCalled();
   });
+
+  it("un ancla de Modo Sync marca dirty y se persiste al salir", () => {
+    const onPersistSegments = vi.fn().mockResolvedValue({ ok: true });
+    const { container, unmount } = render(
+      <LyricsEditor {...baseProps({
+        onPersistSegments,
+        audioFile: new Blob(["audio"], { type: "audio/mpeg" }),
+      })} />,
+    );
+    const audio = container.querySelector("audio");
+    Object.defineProperty(audio, "currentTime", { configurable: true, writable: true, value: 1.6 });
+    fireEvent.timeUpdate(audio);
+
+    fireEvent.click(container.querySelector('[data-testid^="sync-dot-"]'));
+    fireEvent.keyDown(window, { code: "Space" });
+    vi.advanceTimersByTime(500);
+    unmount();
+
+    expect(onPersistSegments).toHaveBeenCalledTimes(1);
+    const saved = onPersistSegments.mock.calls[0][1];
+    expect(saved[0].start).not.toBeCloseTo(1, 2);
+  });
 });
