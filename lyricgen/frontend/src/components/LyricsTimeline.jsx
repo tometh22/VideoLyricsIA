@@ -829,8 +829,14 @@ export default function LyricsTimeline({
                 const from = Number(qualityWindow?.start);
                 const to = Number(qualityWindow?.end);
                 if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return null;
-                const left = Math.max(0, from * pxPerSec);
-                const width = Math.max(2, (to - from) * pxPerSec);
+                // Clamp contra la duración: algunas razones (p.ej.
+                // live_structural_disagreement) generan ventanas que terminan
+                // después del audio, y sin esto la banda estiraba el track y
+                // creaba scroll fantasma.
+                const fromClamped = Math.max(0, Math.min(from, total));
+                const toClamped = Math.max(fromClamped, Math.min(to, total));
+                const left = fromClamped * pxPerSec;
+                const width = Math.max(2, (toClamped - fromClamped) * pxPerSec);
                 const reasons = Array.isArray(qualityWindow?.reasons) ? qualityWindow.reasons : [];
                 return (
                   <div

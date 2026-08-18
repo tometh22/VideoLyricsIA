@@ -471,4 +471,14 @@ describe("zonas dudosas sobre la forma de onda", () => {
     });
     expect(screen.getAllByTestId("timeline-unsafe-window")).toHaveLength(1);
   });
+
+  it("clampea la banda contra la duración (sin scroll fantasma)", () => {
+    // live_structural_disagreement genera ventanas que terminan después del
+    // audio; sin clamp la banda estiraba el track.
+    setup({ duration: 60, unsafeWindows: [{ id: "w", start: 55, end: 200 }] });
+    const band = screen.getByTestId("timeline-unsafe-window");
+    const width = parseFloat(band.style.width);
+    expect(width).toBeGreaterThan(0);
+    expect(width).toBeLessThan(60 * 48); // no puede exceder el track completo
+  });
 });
