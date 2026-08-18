@@ -45,6 +45,7 @@ from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy import func
 from sqlalchemy.exc import OperationalError, TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import ObjectDeletedError
@@ -12044,6 +12045,13 @@ _PRODUCT_EVENT_NAMES = {
     "editor_help_opened",
 }
 
+# Ventana de /admin/product-metrics. Sin esto la única acotación era
+# `LIMIT 10000` sobre TODA la tabla, así que el período medido dependía del
+# volumen de telemetría y era imposible comparar dos lecturas entre sí.
+PRODUCT_METRICS_WINDOW_DAYS = int(
+    os.environ.get("PRODUCT_METRICS_WINDOW_DAYS", "28")
+)
+
 _PRODUCT_EVENT_PROPERTIES = {
     "editor_opened": {"line_count", "view", "source"},
     "editor_view_changed": {"from", "to"},
@@ -12054,7 +12062,16 @@ _PRODUCT_EVENT_PROPERTIES = {
     "editor_undo": {"operation", "count"},
     "editor_autosave_success": {"duration_ms", "checkpoint", "retry_count"},
     "editor_autosave_failed": {"duration_ms", "checkpoint", "reason", "status", "retry_count"},
-    "editor_conflict": {"server_revision", "local_revision", "resolution"},
+    # `checkpoint`/`reason` los emite handleDurableStatus al entrar en conflicto
+    # (el emisor histórico, que reportaba resolution, se removió con el
+    # ConflictDialog en #1123). Sin estas dos claves el loop de /analytics/events
+    # rechaza el evento ENTERO al primer key desconocido y el cliente se come el
+    # error con un catch vacío: el contador quedaba clavado en 0 y alguien lo
+    # iba a leer como "no hay conflictos".
+    "editor_conflict": {
+        "server_revision", "local_revision", "resolution",
+        "checkpoint", "reason",
+    },
     "editor_version_restored": {"from_revision", "to_revision"},
     "editor_approved": {
         "revision", "duration_ms", "line_count", "text_changes",
@@ -12146,11 +12163,30 @@ async def product_metrics(
 ):
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
-    query = db.query(ProductEvent)
+    # Ventana temporal explícita + filtro por nombre. Antes esto tomaba las
+    # 10.000 filas más recientes SIN filtrar: `editor_activity_heartbeat` se
+    # emite cada 15 s por editor abierto (4/min) y `transcription_quality_
+    # shadow_decision` lo escribe el worker, así que ambos —que no son eventos
+    # del editor y ni siquiera están en el allowlist— consumían el cupo y
+    # contaminaban `sample_size`, `counts` y el cálculo de sesiones. El
+    # resultado era una ventana temporal desconocida y variable.
+    # `ProductEvent.created_at` es DateTime(timezone=True): comparar contra un
+    # datetime naive deja que Postgres lo interprete en la timezone de la sesión
+    # y la ventana se corre en silencio. Aware desde el arranque.
+    _window_start = datetime.now(timezone.utc) - timedelta(days=PRODUCT_METRICS_WINDOW_DAYS)
+    query = (
+        db.query(ProductEvent)
+        .filter(ProductEvent.created_at >= _window_start)
+        .filter(ProductEvent.name.in_(_PRODUCT_EVENT_NAMES))
+    )
     if not current_user.get("is_super_admin"):
         query = query.filter(ProductEvent.tenant_id == current_user["tenant_id"])
     rows = query.order_by(ProductEvent.created_at.desc()).limit(10000).all()
-    approval_query = db.query(ProductEvent).filter(ProductEvent.name == "editor_approved")
+    approval_query = (
+        db.query(ProductEvent)
+        .filter(ProductEvent.name == "editor_approved")
+        .filter(ProductEvent.created_at >= _window_start)
+    )
     if not current_user.get("is_super_admin"):
         approval_query = approval_query.filter(
             ProductEvent.tenant_id == current_user["tenant_id"]
@@ -12270,8 +12306,27 @@ async def product_metrics(
         if session["opened"] is not None and session["first_edit"] is not None
         and session["first_edit"] >= session["opened"]
     ]
-    opened = counts.get("editor_opened", 0)
-    approvals = counts.get("editor_approved", 0)
+    # `counts` sale de `rows`, que está truncado por el LIMIT — y el numerador
+    # tenía además su propia query suplementaria, así que aprobaciones viejas
+    # entraban y aperturas viejas no: el ratio se inflaba de forma sistemática
+    # (medido en staging: 0,80 informado vs 0,55 real, y >1,0 alcanzable).
+    # Numerador y denominador se cuentan en SQL sobre la MISMA ventana, sin
+    # límite, así que la tasa deja de depender del volumen de telemetría.
+    def _count_events(name: str) -> int:
+        q = (
+            db.query(func.count(ProductEvent.id))
+            .filter(ProductEvent.name == name)
+            .filter(ProductEvent.created_at >= _window_start)
+        )
+        if not current_user.get("is_super_admin"):
+            q = q.filter(ProductEvent.tenant_id == current_user["tenant_id"])
+        return int(q.scalar() or 0)
+
+    opened = _count_events("editor_opened")
+    approvals = _count_events("editor_approved")
+    # Señal explícita de que las métricas derivadas de `rows` (sesiones,
+    # view_usage, percentiles) están calculadas sobre una ventana recortada.
+    events_truncated = len(rows) >= 10000
     def _percentile(values, quantile):
         if not values:
             return None
@@ -12313,6 +12368,10 @@ async def product_metrics(
         "sample_size": len(rows),
         "view_usage": view_usage,
         "approval_rate": approvals / opened if opened else None,
+        # True => `rows` tocó el LIMIT: sample_size/view_usage/sesiones y
+        # los percentiles cubren menos que la ventana declarada.
+        "events_truncated": events_truncated,
+        "window_days": PRODUCT_METRICS_WINDOW_DAYS,
         "conflicts": counts.get("editor_conflict", 0),
         "autosave_failures": counts.get("editor_autosave_failed", 0),
         "undo_count": counts.get("editor_undo", 0),
