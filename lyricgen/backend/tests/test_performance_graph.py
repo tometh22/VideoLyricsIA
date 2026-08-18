@@ -80,6 +80,15 @@ def test_exact_cardinality_posterior_is_independent_of_n_best():
     assert set(one.cardinality_posterior) == {1, 2, 3, 4, 5}
     for boundary in one.boundaries:
         assert math.isclose(sum(boundary.state_posterior.values()), 1.0, abs_tol=1e-12)
+    one_legacy = to_legacy_acoustic_structure(one)
+    many_legacy = to_legacy_acoustic_structure(many)
+    assert (
+        one_legacy["diagnostics"]["cardinality_credible_counts_90"]
+        == many_legacy["diagnostics"]["cardinality_credible_counts_90"]
+    )
+    assert one_legacy["diagnostics"]["posterior_mode_count"] == max(
+        one.cardinality_posterior, key=one.cardinality_posterior.get,
+    )
 
 
 def test_forward_backward_matches_exhaustive_boundary_enumeration():
