@@ -67,6 +67,11 @@ import { createSaveQueue } from "./lib/saveQueue";
 import { rebaseEditorSnapshot } from "./lib/rebaseEditorSnapshot";
 import { isEditorRevisionConflict } from "./lib/editorRevisionConflict";
 import { buildGenerationJob } from "./lib/buildGenerationJob";
+import {
+  canRebuildMissingGenerationJob,
+  isMissingGenerationJob,
+  rebuildGenerationRequestFromLocalAudio,
+} from "./lib/generationRecovery";
 import { loadEditorAudio } from "./lib/editorAudioRecovery";
 import { isReusableEditSnapshot } from "./lib/reviewRecovery";
 
@@ -3638,6 +3643,7 @@ export default function App() {
       editorVersionId: saveMeta.editorVersionId || null,
       transcribeJobId: r.transcribeJobId || null,
       operatorMetrics: saveMeta.operatorMetrics || null,
+      transcriptionQuality: r.transcriptionQuality || null,
       // Capa C 2026-05-24: bgCacheKey viene del useBackgroundPreview hook
       // que corrió durante review. Si null = no se hizo pre-gen (free-tier
       // o params no estables); pipeline corre Veo/Imagen como siempre.
@@ -3732,20 +3738,27 @@ export default function App() {
       return;
     }
 
-    const jobList = approved.map(buildGenerationJob);
+    // Keep a reference to the approved snapshot until /generate accepts it.
+    // The old implementation cleared this state before the request returned,
+    // turning a transient missing server job into an apparent loss of all
+    // lyric edits.  `_approvedSource` never leaves the browser/API payload.
+    const jobList = approved.map((entry) => ({
+      ...buildGenerationJob(entry),
+      _approvedSource: entry,
+    }));
     setJobs(jobList);
     navigate("/generating");
     setReadyToGenerate(false);
-    setApprovedJobs([]);
-    // Audit 2026-06-09 ("siempre queda cargado en el wizard"): los inputs
-    // ya fueron consumidos en jobList — si quedan en `files`/`reviewQueue`,
-    // el próximo /new (sidebar, sin reset) muestra los audios del batch
-    // ANTERIOR staged; el operador suma los nuevos, genera, y los viejos
-    // se re-renderizan (videos duplicados + costo Veo duplicado). Limpiar
-    // acá también vacía el snapshot de sesión (effect anyState), así el
-    // banner "batch sin terminar" no ofrece retomar un batch ya generado.
-    setFiles([]);
-    setReviewQueue([]);
+
+    // Remove a song from the recoverable wizard state only once the backend
+    // has accepted its generation request.  This preserves failed lyrics in
+    // memory and sessionStorage, but still prevents accepted songs from
+    // leaking into the next batch.
+    const markGenerationAccepted = (job) => {
+      setApprovedJobs((prev) => prev.filter((entry) => entry !== job._approvedSource));
+      setFiles((prev) => prev.filter((entry) => entry?.file !== job._file));
+      setReviewQueue((prev) => prev.filter((entry) => entry?.file !== job._file));
+    };
 
     let nextIdx = 0;
     const worker = async () => {
@@ -3899,17 +3912,32 @@ export default function App() {
               if (!isEditorRevisionConflict(res, data)) break;
             }
           }
+          // A missing transcribe row is recoverable when this same tab still
+          // owns the original File. Re-submit the *approved* snapshot as a
+          // new direct job exactly once; never overwrite or retry another
+          // user's row. This preserves the edited lyrics/timings verbatim.
+          if (isMissingGenerationJob(res, data) && canRebuildMissingGenerationJob(jobList[i])) {
+            console.warn("[generate] rebuilding missing temporary job from local audio", {
+              old_job_id: jobList[i].transcribeJobId,
+            });
+            rebuildGenerationRequestFromLocalAudio(formData, jobList[i]);
+            setJobs((prev) => prev.map((j, idx) =>
+              idx === i ? { ...j, current_step: "uploading", progress: 0 } : j
+            ));
+            res = await authFetch(`${API}/generate`, { method: "POST", body: formData });
+            try { data = await res.json(); } catch { data = {}; }
+          }
+
           if (!res.ok || data.detail) {
             // Only a confirmed missing job is a session expiry. The API also
             // uses 404 for missing source/background objects; presenting all
             // of those as a lost session sent people to re-upload audio for
             // unrelated storage failures.
             const editorConflict = isEditorRevisionConflict(res, data);
-            const missingJob = data.code === "job_not_found"
-              || (res.status === 404 && /job not found/i.test(String(data.detail || "")));
+            const missingJob = isMissingGenerationJob(res, data);
             const reason = missingJob
-              ? (t("generate.session_expired")
-                 || "La sesión expiró antes de generar. Re-subí el audio para regenerar.")
+              ? (t("generate.job_missing")
+                 || "No encontramos la canción temporal en el servidor. Tus correcciones siguen disponibles para volver al editor.")
               : (translateBackendError(data.detail, t) || await describeFetchError(null, res, t));
             setJobs((prev) => prev.map((j, idx) =>
               idx === i ? { ...j, status: "error", error: reason } : j
@@ -3920,6 +3948,7 @@ export default function App() {
             continue;
           }
           setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
+          markGenerationAccepted(jobList[i]);
           await pollJob(data.job_id);
         } catch (err) {
           const reason = await describeFetchError(err, res, t);
@@ -4238,7 +4267,7 @@ export default function App() {
         textContrast: last.textContrast || "medium",
         segments: last.segments,
         referenceLyrics: "",
-        transcriptionQuality: job.transcription_quality || null,
+        transcriptionQuality: last.transcriptionQuality || null,
         coverageWarning: false,
         recoverySource: "",
         queueIdx: approvedJobs.length - 1,
@@ -4283,6 +4312,42 @@ export default function App() {
     // INLINE (no navega). El operador ve la file list de nuevo, conserva su
     // configuración. Si quería tirar todo, usa Cancelar (handleReset).
     setWizardStage("upload");
+  };
+
+  const handleRecoverFailedGeneration = () => {
+    // `jobs` holds the original approved snapshot privately. Recover only
+    // rows the backend did not accept; already queued videos keep running.
+    const recoverable = jobs
+      .filter((job) => job.status === "error" && job._approvedSource)
+      .map((job) => job._approvedSource);
+    if (recoverable.length === 0) return;
+
+    const sourceFiles = recoverable.map((entry) => entry.file).filter(Boolean);
+    setApprovedJobs(recoverable);
+    setFiles((prev) => {
+      const retained = prev.filter((entry) => sourceFiles.includes(entry?.file));
+      return retained.length > 0 ? retained : recoverable.map((entry) => ({
+        file: entry.file,
+        artist: entry.artist || "",
+        songTitle: entry.songTitle || "",
+        language: entry.language || "",
+        genre: entry.genre || "",
+        font: entry.font || "",
+        concept: entry.concept || "",
+        movementStyle: entry.movementStyle || "",
+        effect: entry.effect || "",
+      }));
+    });
+    setReviewQueue(recoverable.map((entry) => ({
+      file: entry.file,
+      artist: entry.artist || "",
+      songTitle: entry.songTitle || "",
+      language: entry.language || "",
+    })));
+    setJobs([]);
+    setReadyToGenerate(true);
+    setWizardStage("review");
+    navigate("/new");
   };
 
   const handleGenerateBatch = () => {
@@ -5327,6 +5392,7 @@ export default function App() {
         <BatchProgress
           jobs={jobs}
           onReset={handleReset}
+          onRecoverFailed={handleRecoverFailedGeneration}
           onSingleDone={handleSelectJob}
           onSelectJob={handleSelectJob}
           onBulkApprove={handleBulkApproveBatch}

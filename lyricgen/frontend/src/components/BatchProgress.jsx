@@ -243,7 +243,7 @@ function SingleDeadEndCard({ icon, title, description, error, actionLabel, onAct
   );
 }
 
-export function SingleErrorHero({ job, t, onReset }) {
+export function SingleErrorHero({ job, t, onReset, onRecoverFailed }) {
   const errorIcon = (
     <svg className="w-7 h-7 text-red-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
       <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" />
@@ -254,8 +254,10 @@ export function SingleErrorHero({ job, t, onReset }) {
       icon={errorIcon}
       title={t("hero.error_title") || "No pudimos generar tu video"}
       error={job?.error || (t("hero.error_generic") || "Ocurrió un error inesperado al generar el video.")}
-      actionLabel={t("hero.error_action") || "Volver a crear video"}
-      onAction={() => onReset?.()}
+      actionLabel={onRecoverFailed
+        ? (t("hero.error_recover_action") || "Volver a mis correcciones")
+        : (t("hero.error_action") || "Volver a crear video")}
+      onAction={() => (onRecoverFailed || onReset)?.()}
     />
   );
 }
@@ -640,7 +642,7 @@ function CelebrationScreen({ jobs, total, downloadable, onDownloadAll, onReset, 
 }
 
 // ─── Main component ──────────────────────────────────────────────────────────
-export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob, onBulkApprove }) {
+export default function BatchProgress({ jobs, onReset, onRecoverFailed, onSingleDone, onSelectJob, onBulkApprove }) {
   const { t } = useI18n();
   const [bulkApproving, setBulkApproving] = useState(false);
   // Per-card approving state: Set of job_ids currently being approved.
@@ -850,7 +852,7 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
     // 2026-07-27: a silent /generate 4xx set status="error" and the hero
     // froze forever on the optimistic "Generando el fondo" snapshot).
     if (isErrorStatus(heroJob.status)) {
-      return <SingleErrorHero job={heroJob} t={t} onReset={onReset} />;
+      return <SingleErrorHero job={heroJob} t={t} onReset={onReset} onRecoverFailed={onRecoverFailed} />;
     }
     if (isTerminalStatus(heroJob.status)) {
       // Terminal but neither success (handled by allDone/redirect above) nor

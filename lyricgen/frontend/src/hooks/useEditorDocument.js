@@ -128,12 +128,21 @@ export function useEditorDocument({ jobId, enabled, request }) {
         // field when both snapshots changed it, while retaining remote-only
         // changes. The retry still uses the newly-read CAS revision; it never
         // performs an unchecked overwrite.
-        applyDocument({
+        const rebasedServerDocument = {
           ...(documentRef.current || document || {}),
           ...body,
           revision: next.serverRevision,
           segments: next.serverSegments,
-        });
+        };
+        // Do not publish the raw server snapshot to React here. The caller
+        // immediately applies `merged.merged` and retries it, but publishing
+        // first creates a render window where controlled lyric inputs can be
+        // overwritten by the remote value (the real two-editor E2E caught
+        // exactly that same-line regression). Keep it as the CAS base only;
+        // the successful retry below publishes the merged local-wins value.
+        documentRef.current = rebasedServerDocument;
+        revisionRef.current = next.serverRevision;
+        if (rebasedServerDocument.lock) setLock(rebasedServerDocument.lock);
         return {
           ok: false,
           reason: "merged",

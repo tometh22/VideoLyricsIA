@@ -250,6 +250,43 @@ def test_generate_with_job_id_rejects_already_promoted_jobs(client, monkeypatch)
     assert res.json()["code"] == "job_not_generatable"
 
 
+def test_generate_editor_selector_without_feature_is_not_reported_as_missing_job(client, monkeypatch):
+    """A feature-gate mismatch must not make the UI discard a real job.
+
+    The old 404 looked identical to a reaped temporary job in the browser,
+    which surfaced a false "session expired" message after lyric approval.
+    """
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.delenv("EDITOR_V2_GLOBALLY_ENABLED", raising=False)
+    monkeypatch.delenv("EDITOR_V2_TENANTS", raising=False)
+    username, token = _make_user(client)
+
+    from database import SessionLocal, User
+
+    s = SessionLocal()
+    try:
+        user = s.query(User).filter(User.username == username).first()
+        user_id, tenant_id = user.id, user.tenant_id
+    finally:
+        s.close()
+    job_id = _seed_transcribed_pending(user_id, tenant_id)
+
+    res = client.post(
+        "/generate",
+        data={
+            "job_id": job_id,
+            "artist": "Intoxicados",
+            "segments_json": "[]",
+            "editor_revision": "0",
+            "delivery_profile": "youtube",
+        },
+        headers=auth(token),
+    )
+
+    assert res.status_code == 409
+    assert res.json()["code"] == "editor_not_enabled"
+
+
 def test_generate_legacy_path_still_accepts_full_upload(client, monkeypatch):
     """When no job_id is provided, /generate must keep working in the
     legacy mode that takes the file inline. This is the back-compat

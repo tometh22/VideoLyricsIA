@@ -149,6 +149,11 @@ describe("useEditorDocument save ordering", () => {
       expect.objectContaining({ segment_id: "line", text: "local" }),
     ]);
     expect(result.current.revisionRef.current).toBe(2);
+    // The 409 response is only a rebase base. Publishing its raw remote
+    // snapshot before the local-wins retry can overwrite a controlled input.
+    expect(result.current.document.segments).toEqual([
+      expect.objectContaining({ segment_id: "line", text: "base" }),
+    ]);
     expect(request.mock.calls.filter(([path, options]) => path === "/editor/job-conflict" && options?.method === "PATCH")).toHaveLength(1);
   });
 
