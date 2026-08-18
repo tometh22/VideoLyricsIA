@@ -62,6 +62,7 @@ export async function installEditorHarness(page, options = {}) {
   const empty = options.empty === true;
   const audio = ["unavailable", "temporary"].includes(options.audio) ? options.audio : "available";
   const editorV2 = options.editorV2 === true;
+  const transcriptionQuality = options.transcriptionQuality || null;
   const saves = [];
   const approvals = [];
   let durableRevision = 0;
@@ -187,6 +188,7 @@ export async function installEditorHarness(page, options = {}) {
         song_title: "E2E Song",
         segments_json: empty ? [] : segments,
         segments_revision: 0,
+        transcription_quality: transcriptionQuality,
         render_params: {},
       }));
       return;
@@ -283,7 +285,11 @@ export async function installEditorHarness(page, options = {}) {
 export async function openAdvanced(page, { expectTimeline = true } = {}) {
   await page.getByRole("tab", { name: "Ajustar tiempos" }).click();
   await expect(page.getByRole("tab", { name: "Ajustar tiempos" })).toHaveAttribute("aria-selected", "true");
-  if (expectTimeline) await expect(page.getByTestId("timeline-lane")).toBeVisible();
+  if (expectTimeline) {
+    await page.getByRole("tab", { name: "Timeline avanzada" }).click();
+    await expect(page.getByRole("tab", { name: "Timeline avanzada" })).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByTestId("timeline-lane")).toBeVisible();
+  }
 }
 
 export async function selectionCount(page, count) {

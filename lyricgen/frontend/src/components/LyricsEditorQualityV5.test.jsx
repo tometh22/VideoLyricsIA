@@ -47,6 +47,13 @@ function baseProps(overrides = {}) {
   };
 }
 
+function markAudioReady(container, duration = 90) {
+  const audio = container.querySelector("audio");
+  Object.defineProperty(audio, "duration", { configurable: true, value: duration });
+  Object.defineProperty(audio, "readyState", { configurable: true, value: 1 });
+  fireEvent.loadedMetadata(audio);
+}
+
 afterEach(() => {
   cleanup();
   toastSpy.mockClear();
@@ -65,11 +72,12 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
       analysis_pending: true,
       unsafe_windows: [{ id: "pending-outro", start: 60, end: 84, reasons: ["event_count"] }],
     };
-    render(<LyricsEditor {...baseProps({
+    const { container } = render(<LyricsEditor {...baseProps({
       transcriptionQuality: pending,
       editorRequest,
       disableAutosave: true,
     })} />);
+    markAudioReady(container);
 
     expect(screen.getByTestId("quality-analysis-pending")).toHaveTextContent(/Comprobando letra y timing/i);
     fireEvent.change(screen.getByDisplayValue("Primera zona"), {
@@ -178,7 +186,7 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
       ...V5_QUALITY,
       unsafe_windows: [{ id: "low-confidence", start: 42, end: 55, reasons: ["text_audio_mismatch"] }],
     };
-    render(<LyricsEditor {...baseProps({
+    const { container } = render(<LyricsEditor {...baseProps({
       transcriptionQuality: quality,
       segments: [
         {
@@ -190,6 +198,7 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
       ],
       disableAutosave: true,
     })} />);
+    markAudioReady(container);
 
     const row = screen.getByTestId("lyric-row-1");
     expect(row).toHaveAttribute("data-unsafe-candidate", "true");
@@ -207,6 +216,28 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
     expect(row).toHaveAttribute("data-unsafe-candidate", "false");
     expect(within(preview).getByText(/Gracias inventado/i)).toBeInTheDocument();
     expect(screen.queryByTestId("unsafe-preview-notice")).toBeNull();
+  });
+
+  it("no permite confirmar desde el panel básico sin audio disponible", () => {
+    render(<LyricsEditor {...baseProps({
+      audioUrl: null,
+      disableAutosave: true,
+    })} />);
+    expect(screen.getByRole("button", { name: "Confirmar zona 1" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Confirmar zona 2" })).toBeDisabled();
+  });
+
+  it("no permite confirmar desde el panel básico una ventana fuera del audio", () => {
+    const quality = {
+      ...V5_QUALITY,
+      unsafe_windows: [{ id: "outside", start: 43, end: 52, reasons: ["timing"] }],
+    };
+    const { container } = render(<LyricsEditor {...baseProps({
+      transcriptionQuality: quality,
+      disableAutosave: true,
+    })} />);
+    markAudioReady(container, 30);
+    expect(screen.getByRole("button", { name: "Confirmar zona 1" })).toBeDisabled();
   });
 
   it("abre el editor, mantiene edición/reproducción y navega cada ventana al tiempo exacto", async () => {
@@ -232,10 +263,138 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
     expect(screen.getByRole("button", { name: "Reproducir" })).toBeEnabled();
   });
 
+  it("abre Ajustar tiempos en revisión guiada y deja la timeline como opción avanzada", async () => {
+    render(<LyricsEditor {...baseProps({
+      waveform: { duration: 90, peaks: [0.1, 0.35, 0.9, 0.45, 0.2] },
+      disableAutosave: true,
+    })} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Revisar sincronización" }));
+    expect(screen.getByTestId("guided-timing-review")).toBeInTheDocument();
+    expect(screen.getByText(/Encontramos 2 partes que conviene revisar/i)).toBeInTheDocument();
+    expect(screen.getByText("Audio de la canción")).toBeInTheDocument();
+    expect(screen.queryByTestId("quality-review-panel")).toBeNull();
+    expect(screen.getByTestId("guided-waveform").querySelector("canvas")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("tab", { name: "Timeline avanzada" }));
+    expect(screen.getByTestId("timeline-scroll")).toBeInTheDocument();
+    expect(screen.getByText("Audio de la canción")).toBeInTheDocument();
+    expect(screen.getAllByTestId("timeline-unsafe-window")).toHaveLength(2);
+    expect(screen.getByTestId("timeline-scroll").querySelector("canvas")).toBeInTheDocument();
+  });
+
+  it("mantiene retry_failed como diagnóstico fatal sin ofrecer confirmación", async () => {
+    render(<LyricsEditor {...baseProps({
+      transcriptionQuality: { ...V5_QUALITY, decision: "retry_failed" },
+      disableAutosave: true,
+    })} />);
+
+    expect(screen.queryByRole("button", { name: "Revisar sincronización" })).toBeNull();
+    await userEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+    expect(screen.getByRole("tab", { name: "Timeline avanzada" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("quality-review-panel")).toBeInTheDocument();
+    expect(screen.getAllByTestId("timeline-unsafe-window")).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: /Confirmar y seguir/i })).toBeNull();
+  });
+
+  it("acepta explícitamente el contrato lyrics-quality-v6", async () => {
+    render(<LyricsEditor {...baseProps({
+      transcriptionQuality: { ...V5_QUALITY, policy_version: "lyrics-quality-v6", schema_version: 6 },
+      disableAutosave: true,
+    })} />);
+    await userEvent.click(screen.getByRole("button", { name: "Revisar sincronización" }));
+    expect(screen.getByTestId("guided-timing-review")).toBeInTheDocument();
+    expect(screen.getByText(/Encontramos 2 partes/i)).toBeInTheDocument();
+  });
+
+  it("fusiona IDs de ventana duplicados para que una confirmación no oculte otra", () => {
+    render(<LyricsEditor {...baseProps({
+      transcriptionQuality: {
+        ...V5_QUALITY,
+        unsafe_windows: [
+          { id: "duplicate", start: 43, end: 47, reasons: ["timing"] },
+          { id: "duplicate", start: 60, end: 83, reasons: ["event_count"] },
+        ],
+      },
+      disableAutosave: true,
+    })} />);
+
+    expect(screen.getAllByTestId("unsafe-quality-window-duplicate")).toHaveLength(1);
+    expect(screen.getByText("0:43.0–1:23.0")).toBeInTheDocument();
+    expect(screen.getByTestId("quality-review-progress")).toHaveTextContent("0 de 1");
+  });
+
+  it("envía payloads legacy v4 directamente a la timeline sin un falso estado limpio", async () => {
+    render(<LyricsEditor {...baseProps({
+      transcriptionQuality: {
+        policy_version: "lyrics-quality-v4",
+        mode: "enforce",
+        decision: "review_required",
+        render_blocked: true,
+        unsafe_windows: [{ id: "legacy", start: 43, end: 52, reasons: ["timing"] }],
+      },
+      disableAutosave: true,
+    })} />);
+
+    expect(screen.queryByRole("button", { name: "Revisar sincronización" })).toBeNull();
+    await userEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+    expect(screen.getByRole("tab", { name: "Timeline avanzada" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("tab", { name: "Revisión guiada" })).toBeNull();
+    expect(screen.getByTestId("timeline-scroll")).toBeInTheDocument();
+    expect(screen.getAllByTestId("timeline-unsafe-window")).toHaveLength(1);
+    expect(screen.getByTestId("quality-review-panel")).toBeInTheDocument();
+    expect(screen.queryByText(/No encontramos partes dudosas/i)).toBeNull();
+  });
+
+  it("detiene el loop antes de confirmar y cambiar de ventana", async () => {
+    const pauseSpy = vi.spyOn(HTMLMediaElement.prototype, "pause");
+    const { container } = render(<LyricsEditor {...baseProps({
+      waveform: { duration: 90, peaks: [0.1, 0.35, 0.9, 0.45, 0.2] },
+      disableAutosave: true,
+    })} />);
+    const audio = container.querySelector("audio");
+    Object.defineProperty(audio, "duration", { configurable: true, value: 90 });
+    Object.defineProperty(audio, "readyState", { configurable: true, value: 1 });
+    fireEvent.loadedMetadata(audio);
+
+    await userEvent.click(screen.getByRole("button", { name: "Revisar sincronización" }));
+    pauseSpy.mockClear();
+    await userEvent.click(screen.getByRole("button", { name: /Reproducir este tramo en loop/i }));
+    await userEvent.click(screen.getByRole("button", { name: /Confirmar y seguir/i }));
+    expect(pauseSpy).toHaveBeenCalled();
+    expect(screen.getByText("Parte 2 de 2")).toBeInTheDocument();
+  });
+
+  it("pausa el audio al desmontar el editor", async () => {
+    const pauseSpy = vi.spyOn(HTMLMediaElement.prototype, "pause");
+    const { container, unmount } = render(<LyricsEditor {...baseProps({ disableAutosave: true })} />);
+    const audio = container.querySelector("audio");
+    Object.defineProperty(audio, "duration", { configurable: true, value: 90 });
+    Object.defineProperty(audio, "readyState", { configurable: true, value: 1 });
+    fireEvent.loadedMetadata(audio);
+    await userEvent.click(screen.getByRole("button", { name: "Revisar sincronización" }));
+    await userEvent.click(screen.getByRole("button", { name: /Reproducir este tramo en loop/i }));
+    pauseSpy.mockClear();
+    unmount();
+    expect(pauseSpy).toHaveBeenCalled();
+  });
+
+  it("permite recorrer las vistas de sincronización con flechas", async () => {
+    render(<LyricsEditor {...baseProps({ disableAutosave: true })} />);
+    await userEvent.click(screen.getByRole("button", { name: "Revisar sincronización" }));
+    const guided = screen.getByRole("tab", { name: "Revisión guiada" });
+    guided.focus();
+    fireEvent.keyDown(guided, { key: "ArrowRight" });
+    expect(screen.getByRole("tab", { name: "Timeline avanzada" })).toHaveAttribute("aria-selected", "true");
+    fireEvent.keyDown(screen.getByRole("tab", { name: "Timeline avanzada" }), { key: "ArrowLeft" });
+    expect(screen.getByRole("tab", { name: "Revisión guiada" })).toHaveAttribute("aria-selected", "true");
+  });
+
   it("impide aprobar hasta confirmar todas las ventanas y reconoce la revisión exacta", async () => {
     const onApprove = vi.fn();
     const editorRequest = vi.fn().mockResolvedValue({ ok: true });
-    render(<LyricsEditor {...baseProps({ onApprove, editorRequest, disableAutosave: true })} />);
+    const { container } = render(<LyricsEditor {...baseProps({ onApprove, editorRequest, disableAutosave: true })} />);
+    markAudioReady(container);
 
     const approve = screen.getByRole("button", { name: /Aprobar y generar/i });
     expect(approve).toHaveAttribute("data-quality-review-required", "true");
@@ -274,7 +433,8 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
 
   it("invalida las confirmaciones si cambia texto o timing antes de aprobar", async () => {
     const onApprove = vi.fn();
-    render(<LyricsEditor {...baseProps({ onApprove, disableAutosave: true })} />);
+    const { container } = render(<LyricsEditor {...baseProps({ onApprove, disableAutosave: true })} />);
+    markAudioReady(container);
 
     await userEvent.click(screen.getByRole("button", { name: "Confirmar zona 1" }));
     await userEvent.click(screen.getByRole("button", { name: "Confirmar zona 2" }));

@@ -4,9 +4,11 @@ import { useI18n } from "../i18n";
 import { EditorTour } from "./OnboardingTour";
 import { useToast } from "./ToastProvider";
 import HelpTip from "./HelpCenter/HelpTip";
+import GuidedTimingReview from "./GuidedTimingReview";
 import LyricsTimeline from "./LyricsTimeline";
 import LyricVideoPreview from "./LyricVideoPreview";
 import { tierForLength } from "../lib/lyricTiers";
+import { resolveLegacyDraft } from "../lib/reviewRecovery";
 import { activeWordIndex } from "../lib/karaokeTiming";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
 import { reseedPreservingIds } from "../lib/segmentIds";
@@ -247,7 +249,7 @@ function qualityProposalReachedStatus(document, proposalId, expectedStatus) {
 // flat {start,end,reasons} shape while v5 may wrap the range and name the id.
 function normalizeUnsafeWindows(quality) {
   if (!Array.isArray(quality?.unsafe_windows)) return [];
-  return quality.unsafe_windows.flatMap((window, index) => {
+  const normalized = quality.unsafe_windows.flatMap((window, index) => {
     if (!window || typeof window !== "object") return [];
     const start = Number(window.start ?? window.start_s ?? window.range?.start);
     const end = Number(window.end ?? window.end_s ?? window.range?.end);
@@ -265,7 +267,26 @@ function normalizeUnsafeWindows(quality) {
       end,
       reasons: [...new Set(reasons)],
     }];
-  }).sort((a, b) => a.start - b.start || a.end - b.end);
+  });
+  // Provider IDs are expected to be unique, but malformed quality payloads
+  // must not let one confirmation silently approve a second window. Merge
+  // duplicate IDs fail-closed into one broader review range while preserving
+  // the server ID used by the acknowledgement endpoint.
+  const byId = new Map();
+  normalized.forEach((window) => {
+    const existing = byId.get(window.id);
+    if (!existing) {
+      byId.set(window.id, window);
+      return;
+    }
+    byId.set(window.id, {
+      ...existing,
+      start: Math.min(existing.start, window.start),
+      end: Math.max(existing.end, window.end),
+      reasons: [...new Set([...(existing.reasons || []), ...(window.reasons || [])])],
+    });
+  });
+  return [...byId.values()].sort((a, b) => a.start - b.start || a.end - b.end);
 }
 
 function isTranscriptionQualityV5(quality) {
@@ -708,6 +729,10 @@ export default function LyricsEditor({
   // parent (the post-render /edit modal has a job in R2; the wizard doesn't).
   // null → timeline renders without a waveform (graceful).
   waveform = null,
+  // The post-render editor fetches the peak envelope independently from the
+  // signed audio URL. Keep its loading state explicit so a slow enhancement
+  // reads as progress, not as a broken/empty audio guide.
+  waveformLoading = false,
   // Live preview: signed URL of the cached background video (post-render
   // modal). null → preview uses a style-tinted template gradient (wizard).
   previewBgUrl = null,
@@ -880,6 +905,10 @@ export default function LyricsEditor({
     if (hasEditorPreferenceOwner) setPersistedViewMode(next);
     else setAnonymousViewMode(next);
   }, [hasEditorPreferenceOwner, setPersistedViewMode]); // "basic" | "advanced"
+  // "Ajustar tiempos" opens on a focused, one-problem-at-a-time workflow.
+  // The full DAW-like surface is still available, but is an explicit expert
+  // choice instead of the first thing every operator has to understand.
+  const [timingWorkspaceMode, setTimingWorkspaceMode] = useState("guided"); // guided | timeline
   const [previewDockOpen, setPreviewDockOpen] = useState(false);
   // 2026-05-25 Studio Console — Modo enfoque. Toggle persistente que
   // agranda max-h de la lista + MAX_VH del timeline. Operador con 30-50
@@ -954,6 +983,8 @@ export default function LyricsEditor({
   const [flushCounter, setFlushCounter] = useState(0);
   const [durableHydrated, setDurableHydrated] = useState(false);
   const [durableConflict, setDurableConflict] = useState(false);
+  const saveConflictRef = useRef(false);
+  saveConflictRef.current = durableConflict || saveStatus === "conflict";
   const [historyOpen, setHistoryOpen] = useState(false);
   const editedRef = useRef(edited);
   editedRef.current = edited;
@@ -1444,13 +1475,17 @@ export default function LyricsEditor({
   useEffect(() => {
     if (disableAutosave || editorV2Enabled) return undefined;
     if (!onPersistSegments || !transcribeJobId) return undefined;
+    // Mounting or hydrating a server snapshot is not an edit. Scheduling it
+    // would bump the revision unnecessarily and, more importantly, could
+    // erase a stale recovery draft before the conflict UI has protected it.
+    if (!isDirty) return undefined;
     if (!Array.isArray(edited) || edited.length === 0) return undefined;
     const queue = saveQueueRef.current;
     queue.prime(transcribeJobId, Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
     queue.schedule(transcribeJobId, () =>
       sanitizeSegmentsForPersistence(editedRef.current));
     return undefined;
-  }, [edited, transcribeJobId, onPersistSegments, disableAutosave, segmentsRevision, editorV2Enabled]);
+  }, [edited, isDirty, transcribeJobId, onPersistSegments, disableAutosave, segmentsRevision, editorV2Enabled]);
 
   // The queue is the single status source for debounce, drag, retry and
   // navigation flushes.  A trailing snapshot is coalesced while a request is
@@ -1480,12 +1515,27 @@ export default function LyricsEditor({
     draftRestoredRef.current = true;
     try {
       const saved = JSON.parse(localStorage.getItem(draftKey) || "null");
-      if (Array.isArray(saved?.segments) && saved.segments.length) {
-        setEdited(reseedPreservingIds(editedRef.current, sanitizeSegments(saved.segments)));
+      const resolution = resolveLegacyDraft({
+        draft: saved,
+        currentSegments: editedRef.current,
+        currentRevision: Number.isInteger(segmentsRevision) ? segmentsRevision : 0,
+      });
+      if (resolution.action === "restore") {
+        setEdited(reseedPreservingIds(
+          editedRef.current,
+          sanitizeSegments(resolution.segments),
+        ));
         setIsDirty(true);
+      } else if (resolution.action === "discard") {
+        localStorage.removeItem(draftKey);
+      } else if (resolution.action === "conflict") {
+        // Preserve the raw draft for support/manual recovery, but never feed
+        // it into legacy autosave under a newer server revision.
+        setSaveStatus("conflict");
+        setSaveErrorReason("conflict");
       }
     } catch { /* corrupt or unavailable storage */ }
-  }, [draftKey, editorV2Enabled, setEdited]);
+  }, [draftKey, editorV2Enabled, segmentsRevision, setEdited]);
 
   useEffect(() => {
     if (!draftKey || !isDirty) return;
@@ -1509,6 +1559,7 @@ export default function LyricsEditor({
   // be duplicated merely because isDirty remains true until approval.
   useEffect(() => () => {
     if (disableAutosave || editorV2Enabled || !onPersistSegments || !transcribeJobId) return;
+    if (saveConflictRef.current) return;
     const queue = saveQueueRef.current;
     const state = queue._peek(transcribeJobId);
     if (!dirtyRef.current || (!state?.debounceTimer && !state?.pending)) return;
@@ -1575,6 +1626,9 @@ export default function LyricsEditor({
   useEffect(() => {
     if (disableAutosave || editorV2Enabled || !onPersistSegments || !transcribeJobId) return undefined;
     const flushOnUnload = () => {
+      // A conflict draft belongs to a different server revision. Keep the raw
+      // recovery payload intact and never replace or POST it during reload.
+      if (!dirtyRef.current || saveConflictRef.current) return;
       try {
         const cleaned = sanitizeSegmentsForPersistence(editedRef.current);
         // useEffect puede no alcanzar a correr entre el último keystroke y
@@ -1718,6 +1772,7 @@ export default function LyricsEditor({
   const rowRefs = useRef({});
   const rafRef = useRef(null);
   const playbackTimeRef = useRef(0);
+  const guidedPlaybackRangeRef = useRef(null);
   const lastPublishedTimeRef = useRef(-Infinity);
   const lastPublishedActiveIdRef = useRef(null);
 
@@ -1725,9 +1780,13 @@ export default function LyricsEditor({
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [audioError, setAudioError] = useState(false);
+  const [audioMetadataReady, setAudioMetadataReady] = useState(false);
+  const [guidedPlayingWindowId, setGuidedPlayingWindowId] = useState(null);
 
   useEffect(() => {
     setAudioError(false);
+    setAudioMetadataReady(false);
+    setDuration(0);
   }, [audioUrl]);
 
   // INCIDENT (mobile 2026-05-24): the audio element's `onTimeUpdate`
@@ -1750,7 +1809,14 @@ export default function LyricsEditor({
     const tick = () => {
       const a = audioRef.current;
       if (a && !a.paused) {
-        const ct = a.currentTime;
+        let ct = a.currentTime;
+        const guidedRange = guidedPlaybackRangeRef.current;
+        if (guidedRange && ct >= guidedRange.end) {
+          // Guided review deliberately repeats a short acoustic window. It
+          // removes the operator's play/seek tax while they drag a phrase.
+          a.currentTime = guidedRange.start;
+          ct = guidedRange.start;
+        }
         playbackTimeRef.current = ct;
         const activeKey = selectActiveSegmentId(sanitizedEdited, ct);
         const active = sanitizedEdited.find((segment, index) => (
@@ -1953,6 +2019,11 @@ export default function LyricsEditor({
       duration_ms: Math.round(interaction.durationMs || 0),
     });
   }, [trackEditorEvent]);
+
+  const handleGuidedTimingChange = useCallback((id, newStart, newEnd, interaction = {}) => {
+    pushEditHistory();
+    handleTimelineTimingChange(id, newStart, newEnd, interaction);
+  }, [handleTimelineTimingChange, pushEditHistory]);
 
   // Per-line layout (position / size / rotation) committed from the live
   // preview. Same flush-on-commit as the timeline so "Guardado" shows fast.
@@ -2167,6 +2238,9 @@ export default function LyricsEditor({
     if (syncCursor < 0 || syncCursor >= edited.length) return;
     const target = edited[syncCursor];
     if (!target) return;
+    // Sync Mode is a real timing edit. Mark it before mutating so draft,
+    // debounce and unload recovery all observe the same dirty snapshot.
+    setIsDirty(true);
 
     // Compensate audio latency so the anchor matches what the operator
     // *heard* at press time, not what was decoded by then. See the
@@ -2465,13 +2539,24 @@ export default function LyricsEditor({
   const togglePlay = useCallback(() => {
     const a = audioRef.current;
     if (!a) return;
+    guidedPlaybackRangeRef.current = null;
+    setGuidedPlayingWindowId(null);
     if (a.paused) a.play().catch(() => {});
     else a.pause();
+  }, []);
+
+  const stopGuidedPlayback = useCallback(() => {
+    guidedPlaybackRangeRef.current = null;
+    setGuidedPlayingWindowId(null);
+    const audio = audioRef.current;
+    if (audio) audio.pause();
   }, []);
 
   const seekTo = useCallback((seconds, autoplay = true) => {
     const a = audioRef.current;
     if (!a) return;
+    guidedPlaybackRangeRef.current = null;
+    setGuidedPlayingWindowId(null);
     const t = Math.max(0, seconds);
     a.currentTime = t;
     playbackTimeRef.current = t;
@@ -2482,6 +2567,82 @@ export default function LyricsEditor({
     if (autoplay && a.paused) a.play().catch(() => {});
     trackEditorEvent("editor_seek", { position_ms: Math.round(t * 1000), source: "editor" });
   }, [trackEditorEvent]);
+
+  const playGuidedWindow = useCallback((qualityWindow) => {
+    const audio = audioRef.current;
+    if (!audio || !qualityWindow || audio.readyState < 1) return;
+    if (guidedPlayingWindowId === qualityWindow.id && !audio.paused) {
+      guidedPlaybackRangeRef.current = null;
+      setGuidedPlayingWindowId(null);
+      audio.pause();
+      return;
+    }
+    const rawStart = Math.max(0, Number(qualityWindow.start) - 0.6);
+    const desiredEnd = Number(qualityWindow.end) + 0.8;
+    const mediaDuration = Number(audio.duration);
+    const waveformDuration = Number(waveform?.duration);
+    const effectiveDuration = Number.isFinite(mediaDuration) && mediaDuration > 0
+      ? mediaDuration
+      : (duration > 0 ? duration : (Number.isFinite(waveformDuration) && waveformDuration > 0 ? waveformDuration : 0));
+    const end = effectiveDuration > 0 ? Math.min(effectiveDuration, desiredEnd) : desiredEnd;
+    const start = effectiveDuration > 0 ? Math.min(rawStart, Math.max(0, end - 0.25)) : rawStart;
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+      stopGuidedPlayback();
+      return;
+    }
+    guidedPlaybackRangeRef.current = { id: qualityWindow.id, start, end };
+    setGuidedPlayingWindowId(qualityWindow.id);
+    try {
+      audio.currentTime = start;
+    } catch {
+      stopGuidedPlayback();
+      return;
+    }
+    playbackTimeRef.current = start;
+    lastPublishedTimeRef.current = start;
+    setCurrentTime(start);
+    audio.play().catch(() => {
+      guidedPlaybackRangeRef.current = null;
+      setGuidedPlayingWindowId(null);
+    });
+    trackEditorEvent("editor_guided_window_played", {
+      window_id: qualityWindow.id,
+      start_ms: Math.round(start * 1000),
+      end_ms: Math.round(end * 1000),
+    });
+  }, [duration, guidedPlayingWindowId, stopGuidedPlayback, trackEditorEvent, waveform?.duration]);
+
+  useEffect(() => {
+    const mountedAudio = audioRef.current;
+    return () => {
+      if (mountedAudio) mountedAudio.pause();
+      guidedPlaybackRangeRef.current = null;
+    };
+  }, [audioUrl]);
+
+  useEffect(() => {
+    if (viewMode !== "advanced" || timingWorkspaceMode !== "guided") stopGuidedPlayback();
+  }, [stopGuidedPlayback, timingWorkspaceMode, viewMode]);
+
+  const selectTimingWorkspace = useCallback((mode) => {
+    if (mode !== "guided") stopGuidedPlayback();
+    setTimingWorkspaceMode(mode);
+  }, [stopGuidedPlayback]);
+
+  const handleTimingWorkspaceKeyDown = useCallback((event, guidedAvailable = true) => {
+    const modes = guidedAvailable ? ["guided", "timeline"] : ["timeline"];
+    const currentIndex = modes.indexOf(timingWorkspaceMode);
+    let nextIndex = null;
+    if (event.key === "ArrowRight") nextIndex = (currentIndex + 1) % modes.length;
+    if (event.key === "ArrowLeft") nextIndex = (currentIndex - 1 + modes.length) % modes.length;
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = modes.length - 1;
+    if (nextIndex == null) return;
+    event.preventDefault();
+    const next = modes[nextIndex];
+    selectTimingWorkspace(next);
+    requestAnimationFrame(() => document.getElementById(`timing-workspace-tab-${next}`)?.focus());
+  }, [selectTimingWorkspace, timingWorkspaceMode]);
 
   const reconcileQualityProposalDocument = useCallback(async ({ syncSegments = false } = {}) => {
     const nextDocument = await durableEditor.load();
@@ -3224,6 +3385,11 @@ export default function LyricsEditor({
   const qualityGuidanceAvailable = isTranscriptionQualityV5(transcriptionQuality)
     && (transcriptionQuality?.decision === "review_required" || qualityAnalysisPending)
     && unsafeWindows.length > 0;
+  useEffect(() => {
+    if (viewMode === "advanced" && !qualityGuidanceAvailable) {
+      setTimingWorkspaceMode("timeline");
+    }
+  }, [qualityGuidanceAvailable, viewMode]);
   const pendingQualityReview = qualityAnalysisPending
     && transcriptionQuality?.mode === "enforce";
   const fatalQualityFailure = transcriptionQuality?.decision === "retry_failed"
@@ -3328,14 +3494,37 @@ export default function LyricsEditor({
     }
   }, [sanitizedEdited, seekTo]);
 
+  const isQualityWindowConfirmable = useCallback((qualityWindow) => {
+    const start = Number(qualityWindow?.start);
+    const end = Number(qualityWindow?.end);
+    return Boolean(
+      audioUrl && !audioError && audioMetadataReady
+      && Number.isFinite(duration) && duration > 0
+      && Number.isFinite(start) && Number.isFinite(end)
+      && end > 0 && start < duration,
+    );
+  }, [audioError, audioMetadataReady, audioUrl, duration]);
+
   const confirmUnsafeWindow = useCallback((qualityWindow) => {
+    if (!isQualityWindowConfirmable(qualityWindow)) {
+      toast({
+        message: t("timing_review.audio_required_to_confirm")
+          || "Cargá el audio y escuchá un tramo válido antes de confirmarlo.",
+        tone: "info",
+      });
+      return;
+    }
     setQualityWindowReview((current) => {
       const ids = current.key === qualityReviewKey ? current.ids : [];
       return ids.includes(qualityWindow.id)
         ? current
         : { key: qualityReviewKey, ids: [...ids, qualityWindow.id] };
     });
-  }, [qualityReviewKey]);
+    trackEditorEvent("editor_guided_window_confirmed", {
+      window_id: qualityWindow.id,
+      required: focusedQualityReview,
+    });
+  }, [focusedQualityReview, isQualityWindowConfirmable, qualityReviewKey, t, toast, trackEditorEvent]);
 
   // Single-flight del CTA completo, incluido el flush de autosave que ocurre
   // ANTES de onApprove. El lock de App sólo cubre el POST /edit; no alcanzaba
@@ -3742,10 +3931,16 @@ export default function LyricsEditor({
               setCurrentTime(time);
             }
           }}
-          onLoadedMetadata={(e) => setDuration(e.currentTarget.duration || 0)}
+          onLoadedMetadata={(e) => {
+            const mediaDuration = Number(e.currentTarget.duration);
+            setDuration(Number.isFinite(mediaDuration) && mediaDuration > 0 ? mediaDuration : 0);
+            setAudioMetadataReady(Number.isFinite(mediaDuration) && mediaDuration > 0);
+          }}
           onPlay={() => setIsPlaying(true)}
           onPause={(e) => {
             const time = e.currentTarget.currentTime;
+            guidedPlaybackRangeRef.current = null;
+            setGuidedPlayingWindowId(null);
             playbackTimeRef.current = time;
             lastPublishedTimeRef.current = time;
             setCurrentTime(time);
@@ -3753,12 +3948,16 @@ export default function LyricsEditor({
           }}
           onEnded={(e) => {
             const time = e.currentTarget.currentTime;
+            guidedPlaybackRangeRef.current = null;
+            setGuidedPlayingWindowId(null);
             playbackTimeRef.current = time;
             lastPublishedTimeRef.current = time;
             setCurrentTime(time);
             setIsPlaying(false);
           }}
           onError={() => {
+            guidedPlaybackRangeRef.current = null;
+            setGuidedPlayingWindowId(null);
             setAudioError(true);
             setIsPlaying(false);
           }}
@@ -3889,6 +4088,7 @@ export default function LyricsEditor({
 
       {!qualityAnalysisPending
         && ["review_required", "retry_failed"].includes(transcriptionQuality?.decision)
+        && !(qualityGuidanceAvailable && viewMode === "advanced" && timingWorkspaceMode === "guided")
         && (!isTranscriptionQualityV5(transcriptionQuality)
           || transcriptionQuality?.mode === "enforce") && (
         <section
@@ -3925,10 +4125,26 @@ export default function LyricsEditor({
                   .replace("{count}", unsafeWindows.length)
                 : (t("editor.quality_legacy_summary") || "Esta revisión necesita una comprobación manual antes de generar.")}
             </p>
+            {qualityGuidanceAvailable && (
+              <button
+                type="button"
+                onClick={() => {
+                  setTimingWorkspaceMode("guided");
+                  setViewMode("advanced");
+                }}
+                className="mt-3 inline-flex items-center gap-2 rounded-xl bg-amber-300 px-3.5 py-2 text-xs font-semibold text-amber-950 shadow-lg shadow-amber-950/10 transition hover:bg-amber-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-100"
+              >
+                <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="m9 18 6-6-6-6" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                {t("timing_review.start") || "Revisar sincronización"}
+              </button>
+            )}
             {unsafeWindows.length > 0 && (
               <ul className="mt-3 grid gap-2 sm:grid-cols-2" aria-label={t("editor.quality_windows_label") || "Zonas para revisar"}>
                 {unsafeWindows.map((qualityWindow, index) => {
                   const confirmed = confirmedUnsafeWindowIds.has(qualityWindow.id);
+                  const confirmable = isQualityWindowConfirmable(qualityWindow);
                   const range = `${formatTimestamp(qualityWindow.start)}–${formatTimestamp(qualityWindow.end)}`;
                   return (
                     <li
@@ -3954,11 +4170,15 @@ export default function LyricsEditor({
                         <button
                           type="button"
                           onClick={() => confirmUnsafeWindow(qualityWindow)}
+                          disabled={!confirmed && !confirmable}
                           aria-pressed={confirmed}
                           aria-label={`${confirmed
                             ? (t("editor.quality_confirmed") || "Zona confirmada")
                             : (t("editor.quality_confirm") || "Confirmar zona")} ${index + 1}`}
-                          className={`shrink-0 rounded-r-xl border-l border-white/[0.07] px-3 text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-light ${
+                          title={!confirmed && !confirmable
+                            ? (t("timing_review.audio_required_to_confirm") || "Cargá el audio y escuchá un tramo válido antes de confirmarlo.")
+                            : undefined}
+                          className={`shrink-0 rounded-r-xl border-l border-white/[0.07] px-3 text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-light disabled:cursor-not-allowed disabled:opacity-45 ${
                             confirmed
                               ? "bg-emerald-400/10 text-emerald-200"
                               : "text-amber-100 hover:bg-amber-400/10"
@@ -4690,7 +4910,8 @@ export default function LyricsEditor({
             event.preventDefault();
             const next = event.key === "ArrowLeft" || event.key === "Home" ? "basic" : "advanced";
             setViewMode(next);
-            if (next === "basic") setSyncMode(false);
+            if (next === "basic") { setSyncMode(false); stopGuidedPlayback(); }
+            else setTimingWorkspaceMode(qualityGuidanceAvailable ? "guided" : "timeline");
             event.currentTarget.querySelector(`[data-editor-view="${next}"]`)?.focus();
           }}
         >
@@ -4700,7 +4921,7 @@ export default function LyricsEditor({
             aria-selected={viewMode === "basic"}
             tabIndex={viewMode === "basic" ? 0 : -1}
             data-editor-view="basic"
-            onClick={() => { setViewMode("basic"); setSyncMode(false); setOverflowOpen(false); }}
+            onClick={() => { stopGuidedPlayback(); setViewMode("basic"); setSyncMode(false); setOverflowOpen(false); }}
             aria-label={t("editor.basic_view") || "Revisar letra"}
             className={`group flex min-w-0 items-center gap-2.5 rounded-lg px-3 py-2.5 text-left transition-all ${viewMode === "basic" ? "bg-white/[0.09] text-white ring-1 ring-white/[0.11] shadow-lg" : "text-ink-secondary hover:bg-white/[0.04] hover:text-white"}`}
           >
@@ -4718,7 +4939,7 @@ export default function LyricsEditor({
             aria-selected={viewMode === "advanced"}
             tabIndex={viewMode === "advanced" ? 0 : -1}
             data-editor-view="advanced"
-            onClick={() => { setViewMode("advanced"); setOverflowOpen(false); }}
+            onClick={() => { setViewMode("advanced"); setTimingWorkspaceMode(qualityGuidanceAvailable ? "guided" : "timeline"); setOverflowOpen(false); }}
             aria-label={t("editor.advanced_view") || "Ajustar tiempos"}
             className={`group flex min-w-0 items-center gap-2.5 rounded-lg px-3 py-2.5 text-left transition-all ${viewMode === "advanced" ? "bg-brand/20 text-white ring-1 ring-brand/35 shadow-lg shadow-brand/10" : "text-ink-secondary hover:bg-white/[0.04] hover:text-white"}`}
           >
@@ -4727,7 +4948,7 @@ export default function LyricsEditor({
             </span>
             <span className="min-w-0">
               <span className="block truncate text-[12px] font-semibold">{t("editor.advanced_view") || "Ajustar tiempos"}</span>
-              <span className="hidden truncate text-[10px] text-ink-tertiary sm:block">Timeline y edición en grupo</span>
+              <span className="hidden truncate text-[10px] text-ink-tertiary sm:block">Revisión guiada y ajustes precisos</span>
             </span>
           </button>
         </div>
@@ -4953,34 +5174,107 @@ export default function LyricsEditor({
                     </button>
                   </div>
                 ) : (
-                  <LyricsTimeline
-                    segments={sanitizedEdited}
-                    unsafeWindows={qualityGuidanceAvailable ? unsafeWindows : []}
-                    duration={duration}
-                    currentTime={currentTime}
-                    playbackTimeRef={playbackTimeRef}
-                    isPlaying={isPlaying}
-                    saveStatus={saveStatus}
-                    activeId={activeId}
-                    focusedSegId={focusedSegId}
-                    highlightedIds={highlightedIds}
-                    waveform={waveform}
-                    gapS={MIN_GAP_S}
-                    focusMode={workspaceFocusMode}
-                    onSeek={(s) => seekTo(s, false)}
-                    onDragStart={pushEditHistory}
-                    onTimingChange={handleTimelineTimingChange}
-                    onTimingChangeBatch={handleTimelineTimingChangeBatch}
-                    onTextChange={updateText}
-                    onDeleteSelection={deleteSegments}
-                    onFocus={focusSegment}
-                    onReset={resetTimings}
-                    onSelectionCreated={({ count, method, durationMs }) => trackEditorEvent("editor_selection_created", {
-                      count,
-                      method,
-                      duration_ms: Math.round(durationMs || 0),
-                    })}
-                  />
+                  <>
+                    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.07] px-3 py-3 sm:px-4">
+                      <div className="min-w-0">
+                        <p className="text-xs font-semibold text-white">{t("timing_review.workspace_title") || "Ajustar sincronización"}</p>
+                        <p className="mt-0.5 text-[10px] text-ink-tertiary">
+                          {timingWorkspaceMode === "guided"
+                            ? (t("timing_review.workspace_guided_hint") || "Revisá solamente las partes que necesitan atención")
+                            : (t("timing_review.workspace_advanced_hint") || "Control completo de todas las frases y tiempos")}
+                        </p>
+                      </div>
+                      <div className={`grid ${qualityGuidanceAvailable ? "grid-cols-2" : "grid-cols-1"} rounded-xl bg-black/20 p-1 ring-1 ring-white/[0.06]`} role="tablist" aria-label={t("timing_review.workspace_modes") || "Vista de sincronización"} onKeyDown={(event) => handleTimingWorkspaceKeyDown(event, qualityGuidanceAvailable)}>
+                        {qualityGuidanceAvailable && (
+                          <button
+                            id="timing-workspace-tab-guided"
+                            type="button"
+                            role="tab"
+                            aria-selected={timingWorkspaceMode === "guided"}
+                            aria-controls="timing-workspace-panel"
+                            tabIndex={timingWorkspaceMode === "guided" ? 0 : -1}
+                            onClick={() => selectTimingWorkspace("guided")}
+                            className={`rounded-lg px-3 py-2 text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light ${timingWorkspaceMode === "guided" ? "bg-brand text-white shadow-lg shadow-brand/20" : "text-ink-tertiary hover:text-white"}`}
+                          >
+                            {t("timing_review.guided_tab") || "Revisión guiada"}
+                            <span aria-hidden="true" className="ml-1.5 rounded-full bg-amber-300/15 px-1.5 py-0.5 text-[9px] text-amber-200">{unsafeWindows.length}</span>
+                          </button>
+                        )}
+                        <button
+                          id="timing-workspace-tab-timeline"
+                          type="button"
+                          role="tab"
+                          aria-selected={timingWorkspaceMode === "timeline"}
+                          aria-controls="timing-workspace-panel"
+                          tabIndex={timingWorkspaceMode === "timeline" ? 0 : -1}
+                          onClick={() => selectTimingWorkspace("timeline")}
+                          className={`rounded-lg px-3 py-2 text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light ${timingWorkspaceMode === "timeline" ? "bg-white/[0.09] text-white ring-1 ring-white/[0.1]" : "text-ink-tertiary hover:text-white"}`}
+                        >
+                          {t("timing_review.advanced_tab") || "Timeline avanzada"}
+                        </button>
+                      </div>
+                    </div>
+                    <div
+                      id="timing-workspace-panel"
+                      role="tabpanel"
+                      aria-labelledby={`timing-workspace-tab-${timingWorkspaceMode}`}
+                      className={timingWorkspaceMode === "guided" ? "p-3 sm:p-4" : ""}
+                    >
+                      {timingWorkspaceMode === "guided" ? (
+                        <GuidedTimingReview
+                          windows={qualityGuidanceAvailable ? unsafeWindows : []}
+                          segments={sanitizedEdited}
+                          waveform={waveform}
+                          waveformLoading={waveformLoading}
+                          duration={duration}
+                          audioAvailable={!!audioUrl && !audioError && audioMetadataReady}
+                          audioLoading={audioLoading || (!!audioUrl && !audioError && !audioMetadataReady)}
+                          currentTime={currentTime}
+                          isPlaying={isPlaying}
+                          playingWindowId={guidedPlayingWindowId}
+                          confirmedIds={confirmedUnsafeWindowIds}
+                          reviewRequired={focusedQualityReview}
+                          onConfirm={confirmUnsafeWindow}
+                          onPlayWindow={playGuidedWindow}
+                          onStopPlayback={stopGuidedPlayback}
+                          onRetryAudio={onRetryAudio}
+                          onSeek={(seconds) => seekTo(seconds, false)}
+                          onMove={handleGuidedTimingChange}
+                          onOpenAdvanced={() => selectTimingWorkspace("timeline")}
+                        />
+                      ) : (
+                        <LyricsTimeline
+                          segments={sanitizedEdited}
+                          unsafeWindows={unsafeWindows}
+                          duration={duration}
+                          currentTime={currentTime}
+                          playbackTimeRef={playbackTimeRef}
+                          isPlaying={isPlaying}
+                          saveStatus={saveStatus}
+                          activeId={activeId}
+                          focusedSegId={focusedSegId}
+                          highlightedIds={highlightedIds}
+                          waveform={waveform}
+                          waveformLoading={waveformLoading}
+                          gapS={MIN_GAP_S}
+                          focusMode={workspaceFocusMode}
+                          onSeek={(s) => seekTo(s, false)}
+                          onDragStart={pushEditHistory}
+                          onTimingChange={handleTimelineTimingChange}
+                          onTimingChangeBatch={handleTimelineTimingChangeBatch}
+                          onTextChange={updateText}
+                          onDeleteSelection={deleteSegments}
+                          onFocus={focusSegment}
+                          onReset={resetTimings}
+                          onSelectionCreated={({ count, method, durationMs }) => trackEditorEvent("editor_selection_created", {
+                            count,
+                            method,
+                            duration_ms: Math.round(durationMs || 0),
+                          })}
+                        />
+                      )}
+                    </div>
+                  </>
                 )}
               </div>
             ) : (

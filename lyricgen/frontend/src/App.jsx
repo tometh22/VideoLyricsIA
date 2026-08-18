@@ -52,6 +52,7 @@ import {
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
 import { translateBackendError } from "./lib/lyricsEditSubmit";
 import { segmentsStore, useJobSegmentsValue } from "./state/segmentsStore";
+import { loadReviewWaveform } from "./lib/loadReviewWaveform";
 import { persistSegments } from "./lib/persistSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
 import { backgroundRegenExtras } from "./lib/editWizardDiff";
@@ -67,6 +68,7 @@ import { rebaseEditorSnapshot } from "./lib/rebaseEditorSnapshot";
 import { isEditorRevisionConflict } from "./lib/editorRevisionConflict";
 import { buildGenerationJob } from "./lib/buildGenerationJob";
 import { loadEditorAudio } from "./lib/editorAudioRecovery";
+import { isReusableEditSnapshot } from "./lib/reviewRecovery";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -861,7 +863,7 @@ function EditLyricsRoute({
     // los preserva. Las URLs firmadas (audio/bg) sí re-fetchean porque
     // expiran (~5min).
     const snap = wizardPersistence.load();
-    const reusableSnap =
+    const snapshotCandidate =
       snap?.currentReview?.editingJobId === id &&
       Array.isArray(snap.currentReview.segments) &&
       snap.currentReview.segments.length > 0;
@@ -934,11 +936,19 @@ function EditLyricsRoute({
         return;
       }
 
-      // Reuso del snapshot: si el operador refrescó con edits in-flight,
-      // los segments del snapshot ganan sobre job.segments_json (que es
-      // lo último que el autosave guardó pero podría no incluir el
-      // último cambio uncommitted). La baseline para "unchanged" sigue
-      // siendo lo que el job tiene RENDERIZADO (job.segments_json).
+      const serverSegmentsRevision = Number.isInteger(job.segments_revision)
+        ? job.segments_revision
+        : 0;
+      const reusableSnap = snapshotCandidate && isReusableEditSnapshot({
+        snapshot: snap,
+        jobId: id,
+        serverRevision: serverSegmentsRevision,
+      });
+
+      // Reuso del snapshot: sólo gana si todavía parte de la revisión exacta
+      // del servidor. Si otra pestaña avanzó la revisión, usamos el servidor
+      // fail-closed; reetiquetar el array viejo con la revisión nueva eludiría
+      // el CAS y podría borrar el trabajo concurrente.
       const segmentsFromSnap = reusableSnap ? snap.currentReview.segments : job.segments_json;
 
       // Edit-wizard mode (PR feat/edit-wizard-mode, 2026-05-27):
@@ -1003,7 +1013,7 @@ function EditLyricsRoute({
         // job.song_title puede llegar null para jobs viejos sin metadata
         // explícito; filename queda como fallback display sólo.
         segments: segmentsFromSnap,
-        segmentsRevision: Number.isInteger(job.segments_revision) ? job.segments_revision : 0,
+        segmentsRevision: serverSegmentsRevision,
         openSnapshotSegments: JSON.parse(JSON.stringify(job.segments_json)),
         filename: job.filename || job.artist || "lyrics",
         file: null,
@@ -1014,7 +1024,11 @@ function EditLyricsRoute({
         // source file is gone. Only a definitive 404 earns `missing`.
         audioUnavailableReason: null,
         waveform: null,           // populated by Phase B
+        waveformLoading: true,    // independent enhancement request in flight
         bgUrl: null,              // populated by Phase B
+        transcriptionQuality: job.transcription_quality || null,
+        coverageWarning: !!job.coverage_warning,
+        recoverySource: job.recovery_source || "",
         ...initialFields,
         // Empty queue: this isn't a batch, it's a one-off edit.
         queue: [],
@@ -1046,7 +1060,7 @@ function EditLyricsRoute({
       // like waveform/bg, so a transient DB failure left the operator unable
       // to fix timing. The generic enhancements remain best-effort; source
       // audio has an explicit recovery contract below.
-      const enhanceField = async (url, key, extractor, { retries = 0 } = {}) => {
+      const enhanceField = async (url, key, extractor, { retries = 0, loadingKey = null } = {}) => {
         for (let attempt = 0; attempt <= retries; attempt++) {
           try {
             const res = await authFetchWithTimeout(url, {}, 15_000);
@@ -1057,7 +1071,11 @@ function EditLyricsRoute({
               const value = extractor(data);
               setCurrentReview((prev) => {
                 if (!prev || prev.editingJobId !== id) return prev;
-                return { ...prev, [key]: value };
+                return {
+                  ...prev,
+                  [key]: value,
+                  ...(loadingKey ? { [loadingKey]: false } : {}),
+                };
               });
               return;  // success
             }
@@ -1073,6 +1091,12 @@ function EditLyricsRoute({
         }
         // Exhausted: leave the field unset; text editing still works and the
         // operator can reopen the editor to retry the audio fetch.
+        if (loadingKey && alive) {
+          setCurrentReview((prev) => {
+            if (!prev || prev.editingJobId !== id) return prev;
+            return { ...prev, [loadingKey]: false };
+          });
+        }
       };
       // An exhausted 503 used to be rendered as "Audio no disponible", which
       // is a false claim: the DB could not validate the session long enough to
@@ -1114,7 +1138,12 @@ function EditLyricsRoute({
       };
       if (editorAudioRetryRef) editorAudioRetryRef.current = retryAudio;
       void retryAudio();
-      enhanceField(`${API}/jobs/${id}/waveform`, "waveform", (d) => d);
+      enhanceField(
+        `${API}/jobs/${id}/waveform`,
+        "waveform",
+        (d) => d,
+        { loadingKey: "waveformLoading" },
+      );
       enhanceField(`${API}/jobs/${id}/background-url`, "bgUrl", (d) => d?.url || null);
     })();
 
@@ -1548,10 +1577,75 @@ export default function App() {
 
   const [reviewQueue, setReviewQueue] = useState([]);
   const [currentReview, setCurrentReview] = useState(null);
+  const currentReviewWaveformJobId = currentReview?.transcribeJobId || null;
+  // First-pass reviews, resumed sessions and back-navigation all have a
+  // transcription job but previously never requested its peak envelope.
+  // Keep the enhancement keyed by job identity so a late response cannot
+  // paint waveform data from another song into the active editor.
+  useEffect(() => {
+    if (!currentReviewWaveformJobId || currentReview?.waveform?.peaks?.length) return undefined;
+    let alive = true;
+    setCurrentReview((previous) => (
+      previous?.transcribeJobId === currentReviewWaveformJobId
+        ? { ...previous, waveformLoading: true }
+        : previous
+    ));
+    const loadWaveform = async () => {
+      const payload = await loadReviewWaveform({
+        request: (url) => authFetchWithTimeout(url, {}, 15_000),
+        url: `${API}/jobs/${currentReviewWaveformJobId}/waveform`,
+        retries: 1,
+      });
+      if (!alive) return;
+      setCurrentReview((previous) => {
+        if (previous?.transcribeJobId !== currentReviewWaveformJobId) return previous;
+        return {
+          ...previous,
+          waveform: payload,
+          waveformLoading: false,
+        };
+      });
+    };
+    void loadWaveform();
+    return () => { alive = false; };
+    // Deliberately keyed by identity. waveformLoading changes must not
+    // restart a failed request loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentReviewWaveformJobId]);
   // EditLyricsRoute owns the network lifecycle, while the shared wizard owns
   // LyricsEditor. A ref exposes only the active route's retry action without
   // serializing a callback into the durable wizard snapshot.
   const editorAudioRetryRef = useRef(null);
+  // Resume/first-pass reviews do not have an EditLyricsRoute instance to own
+  // audio recovery. Keep the same bounded, honest recovery policy here so a
+  // transient API/DB failure never strands the timing editor without audio.
+  const retryTranscriptionReviewAudio = useCallback(async (jobId) => {
+    if (!jobId) return;
+    setCurrentReview((previous) => (
+      previous?.transcribeJobId === jobId
+        ? { ...previous, audioLoading: true, audioUnavailableReason: null }
+        : previous
+    ));
+    const result = await loadEditorAudio({
+      request: () => authFetchWithTimeout(`${API}/jobs/${jobId}/source-audio-url`, {}, 8_000),
+      maxRetries: 3,
+    });
+    setCurrentReview((previous) => {
+      if (previous?.transcribeJobId !== jobId) return previous;
+      return result.ok
+        ? {
+          ...previous,
+          audioUrl: result.url,
+          audioLoading: false,
+          audioUnavailableReason: null,
+        }
+        : {
+          ...previous,
+          audioLoading: false,
+          audioUnavailableReason: result.reason,
+        };
+    });
+  }, []);
   const [approvedJobs, setApprovedJobs] = useState([]);
   const [transcribing, setTranscribing] = useState(false);
   const [transcribeError, setTranscribeError] = useState(null);
@@ -1893,23 +1987,13 @@ export default function App() {
         if (!statusRes.ok) throw new Error(`status ${statusRes.status}`);
         const job = await statusRes.json();
         if (cancelled) return;
-        // El audio URL se pide a un endpoint dedicado (presigned R2 o
-        // streaming via /media-token). LyricsEditor lo carga en su
-        // <audio> sin necesitar el File en memoria.
-        let audioUrl = null;
-        try {
-          const audioRes = await authFetch(`${API}/jobs/${resumeJobId}/source-audio-url`);
-          if (audioRes.ok) {
-            const audioJson = await audioRes.json();
-            audioUrl = audioJson.url || audioJson.audio_url || null;
-          }
-        } catch (_) { /* audioUrl queda null — editor de texto funciona igual */ }
-
         const segments = job.segments || job.segments_json || [];
         setCurrentReview({
           file: null,                            // no tenemos el File original
           filename: job.filename || `${job.song_title || job.artist || "audio"}.wav`,
-          audioUrl,                              // LyricsEditor lo acepta directamente
+          audioUrl: null,
+          audioLoading: true,
+          audioUnavailableReason: null,
           artist: job.artist || "",
           songTitle: job.song_title || "",
           language: job.language || "es",
@@ -1926,6 +2010,7 @@ export default function App() {
           lyricSungColor: job.lyric_sung_color || "#FFFFFF",
           textContrast: job.text_contrast || "medium",
           segments,
+          segmentsRevision: Number.isInteger(job.segments_revision) ? job.segments_revision : 0,
           referenceLyrics: job.reference_lyrics || "",
           coverageWarning: !!job.coverage_warning,
           transcriptionQuality: job.transcription_quality || null,
@@ -1934,6 +2019,10 @@ export default function App() {
           queueIdx: 0,
           queue: [{ filename: job.filename || "audio.wav" }],
         });
+        // Open the editor immediately and recover audio in the background.
+        // Identity guards in the callback discard a late result if the
+        // operator has already moved to another song.
+        void retryTranscriptionReviewAudio(resumeJobId);
         // Audit adversarial 2026-06-09: este flujo entra DIRECTO a review —
         // las tabs de fondo del upload stage nunca se ven. Una selección
         // custom/library residual de un batch anterior se mandaría en
@@ -1956,7 +2045,7 @@ export default function App() {
       }
     })();
     return () => { cancelled = true; };
-  }, [location.search, navigate]);
+  }, [location.search, navigate, retryTranscriptionReviewAudio]);
 
   // Imperative resume — called by the banner's "Continuar" button.
   const resumeWizard = useCallback(() => {
@@ -5072,7 +5161,13 @@ export default function App() {
             audioUrl={currentReview.audioUrl || null}
             audioLoading={!!currentReview.audioLoading}
             audioUnavailableReason={currentReview.audioUnavailableReason || null}
-            onRetryAudio={currentReview.editingJobId ? editorAudioRetryRef.current : null}
+            onRetryAudio={currentReview.editingJobId
+              ? editorAudioRetryRef.current
+              : currentReview.transcribeJobId
+                ? () => retryTranscriptionReviewAudio(currentReview.transcribeJobId)
+                : null}
+            waveform={currentReview.waveform || null}
+            waveformLoading={currentReview.waveformLoading ?? (!!currentReview.transcribeJobId && !currentReview.waveform)}
             referenceLyrics={currentReview.referenceLyrics || ""}
             coverageWarning={currentReview.coverageWarning}
             transcriptionQuality={currentReview.transcriptionQuality}

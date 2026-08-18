@@ -59,6 +59,23 @@ function nearestTick(step) {
   return 30;
 }
 
+function unsafeWindowReasonLabel(window, t) {
+  const codes = Array.isArray(window?.reasons) ? window.reasons : [];
+  if (codes.some((code) => /structur|cardinal|event_count|motif/.test(String(code)))) {
+    return t("editor.quality_reason_structure", "Cantidad o estructura vocal incierta");
+  }
+  if (codes.some((code) => /timing|align|boundary|overlap|inversion|start|end/.test(String(code)))) {
+    return t("editor.quality_reason_timing", "Timing incierto");
+  }
+  if (codes.some((code) => /voic|coverage|uncovered|vocal/.test(String(code)))) {
+    return t("editor.quality_reason_voice", "Voz sin cubrir");
+  }
+  if (codes.some((code) => /text|lexical|asr|content/.test(String(code)))) {
+    return t("editor.quality_reason_text", "Letra incierta");
+  }
+  return t("editor.quality_reason_uncertain", "Evidencia insuficiente");
+}
+
 function normalizeTimelineSegments(input) {
   if (!Array.isArray(input)) return [];
   return input.map((segment, index) => {
@@ -88,8 +105,9 @@ export default function LyricsTimeline({
   focusedSegId,
   highlightedIds,
   waveform = null,
+  waveformLoading = false,
   // Ventanas dudosas del análisis de calidad ({start, end, reasons[]}). Se
-  // pintan sobre la forma de onda: hasta ahora la timeline no recibía NINGUNA
+  // señalan sobre la guía de audio sin cubrirla: hasta ahora la timeline no recibía NINGUNA
   // señal de calidad, así que para encontrar el punto a corregir el operador
   // sólo podía clickear y escuchar (2,9 seeks medidos por cada corrección).
   unsafeWindows = [],
@@ -586,8 +604,11 @@ export default function LyricsTimeline({
     ctx.fillStyle = "rgba(139,124,246,0.45)";
     for (let i = 0; i < peaks.length; i += stride) {
       const x = (i / peaks.length) * trackWidth;
-      const height = Math.max(2, peaks[i] * (WAVE_H - 8));
-      ctx.fillRect(x, (WAVE_H - height) / 2, Math.max(1, 2.5 * stride), height);
+      const magnitude = clamp(Math.abs(Number(peaks[i])) || 0, 0, 1);
+      const height = Math.max(2, magnitude * (WAVE_H - 8));
+      const visualStep = (stride / peaks.length) * trackWidth;
+      const barWidth = Math.max(1, Math.min(3, visualStep - 1));
+      ctx.fillRect(x, (WAVE_H - height) / 2, barWidth, height);
     }
   }, [trackWidth, waveform]);
 
@@ -819,12 +840,31 @@ export default function LyricsTimeline({
             </div>
           </div>
 
-          <div className="relative h-12 border-b border-white/[0.06] bg-brand/[0.035]">
+          <div className="relative h-14 border-b border-white/[0.06] bg-brand/[0.035]">
             <div className="sticky left-0 z-40 flex h-full items-center border-r border-white/[0.08] bg-surface-1/95 px-4 text-[10px] text-ink-tertiary" style={{ width: LABEL_W }}>
-              <span className="inline-flex items-center gap-2"><span className="h-1.5 w-1.5 rounded-full bg-brand-light/70" />{t("timeline.waveform", "Forma de onda")}</span>
+              <span className="inline-flex min-w-0 items-center gap-2">
+                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-brand-light/70" />
+                <span className="min-w-0">
+                  <span className="block truncate font-medium text-ink-secondary">{t("timeline.waveform", "Audio de la canción")}</span>
+                  <span className="mt-0.5 hidden truncate text-[8px] text-ink-tertiary xl:block">{t("timeline.waveform_hint", "Picos = voz o sonido")}</span>
+                </span>
+              </span>
             </div>
             <div className="absolute inset-y-0 cursor-pointer" style={{ left: LABEL_W, width: trackWidth }} onClick={(event) => seekAt(event.clientX)}>
               {waveform?.peaks?.length ? <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none opacity-80" aria-hidden="true" /> : null}
+              {!waveform?.peaks?.length && waveformLoading && (
+                <div className="absolute inset-0 flex items-center gap-1.5 overflow-hidden px-4" role="status">
+                  {[20, 44, 68, 34, 55, 28, 62, 39, 71, 31, 48, 24].map((height, index) => (
+                    <span key={index} className="w-1 animate-pulse rounded-full bg-brand-light/35" style={{ height: `${height}%`, animationDelay: `${index * 65}ms` }} aria-hidden="true" />
+                  ))}
+                  <span className="ml-2 text-[10px] text-ink-tertiary">{t("timeline.waveform_loading", "Preparando guía de audio…")}</span>
+                </div>
+              )}
+              {!waveform?.peaks?.length && !waveformLoading && (
+                <div className="absolute inset-0 flex items-center px-4 text-[10px] text-ink-tertiary" role="status">
+                  {t("timeline.waveform_unavailable", "Guía visual no disponible · podés escuchar y ajustar normalmente")}
+                </div>
+              )}
               {unsafeWindows.map((qualityWindow, index) => {
                 const from = Number(qualityWindow?.start);
                 const to = Number(qualityWindow?.end);
@@ -837,15 +877,12 @@ export default function LyricsTimeline({
                 const toClamped = Math.max(fromClamped, Math.min(to, total));
                 const left = fromClamped * pxPerSec;
                 const width = Math.max(2, (toClamped - fromClamped) * pxPerSec);
-                const reasons = Array.isArray(qualityWindow?.reasons) ? qualityWindow.reasons : [];
                 return (
                   <div
                     key={qualityWindow?.id ?? `unsafe-${index}`}
-                    className="absolute inset-y-0 pointer-events-none rounded-sm bg-amber-400/20 ring-1 ring-inset ring-amber-400/45"
+                    className="pointer-events-none absolute top-0 h-1.5 rounded-b-sm bg-amber-300/80 shadow-[0_0_8px_rgba(252,211,77,.28)]"
                     style={{ left, width }}
-                    title={reasons.length
-                      ? `${t("timeline.unsafe_window", "Zona a revisar")}: ${reasons.join(", ")}`
-                      : t("timeline.unsafe_window", "Zona a revisar")}
+                    title={`${t("timeline.unsafe_window", "Zona a revisar")}: ${unsafeWindowReasonLabel(qualityWindow, t)}`}
                     data-testid="timeline-unsafe-window"
                     aria-hidden="true"
                   />
@@ -867,7 +904,7 @@ export default function LyricsTimeline({
                     data-playing={isActive && isPlaying ? "true" : "false"}
                     data-selected={isSelected ? "true" : "false"}
                     aria-current={isActive ? "true" : undefined}
-                    className={`absolute left-0 right-0 flex cursor-crosshair items-center gap-2 border-b px-3 transition-colors ${isActive ? "border-cyan-300/30 bg-cyan-300/[0.11]" : isSelected ? "border-brand/20 bg-brand/15" : "border-white/[0.045] hover:bg-white/[0.035]"}`}
+                    className={`absolute left-0 right-0 flex select-none cursor-crosshair items-center gap-2 border-b px-3 transition-colors ${isActive ? "border-cyan-300/30 bg-cyan-300/[0.11]" : isSelected ? "border-brand/20 bg-brand/15" : "border-white/[0.045] hover:bg-white/[0.035]"}`}
                     style={{ top: index * ROW_H, height: ROW_H, touchAction: "none" }}
                     title={t("timeline.paint_rows_hint", "Arrastrá para seleccionar varias líneas")}
                     onPointerDown={(event) => beginMarquee(event, segment._id)}

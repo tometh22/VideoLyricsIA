@@ -21,7 +21,7 @@ test.describe("lyrics editor browser contract", () => {
 
     await openAdvanced(page);
     await expect(page.getByTestId("timeline-segment")).toHaveCount(DEFAULT_SEGMENTS.length);
-    await expect(page.getByTestId("editor-mode-explainer")).toContainText("Timeline y edición en grupo");
+    await expect(page.getByTestId("editor-mode-explainer")).toContainText("Revisión guiada y ajustes precisos");
 
     await page.getByRole("tab", { name: "Revisar letra" }).click();
     await expect(page.getByRole("tab", { name: "Revisar letra" })).toHaveAttribute("aria-selected", "true");
@@ -45,6 +45,47 @@ test.describe("lyrics editor browser contract", () => {
     await expect(page.getByTestId("advanced-audio-unavailable")).toContainText("No se puede ajustar tiempos sin audio", { timeout: 12_000 });
     await expect(page.getByText("5 líneas", { exact: true })).toBeVisible();
     await expect(page.getByTestId("timeline-lane")).toHaveCount(0);
+  });
+
+  test("reviews v6 windows one at a time and stops the previous audio loop", async ({ page }) => {
+    const harness = await installEditorHarness(page, {
+      transcriptionQuality: {
+        policy_version: "lyrics-quality-v6",
+        schema_version: 6,
+        mode: "enforce",
+        decision: "review_required",
+        render_blocked: true,
+        evaluated_revision: 0,
+        segments_hash: "e2e-segments",
+        quality_fingerprint: "e2e-quality",
+        unsafe_windows: [
+          { id: "first", start: 0.3, end: 1.05, reasons: ["timing"] },
+          { id: "second", start: 1.15, end: 1.9, reasons: ["event_count"] },
+        ],
+      },
+    });
+    await harness.open();
+
+    await page.getByRole("button", { name: "Revisar sincronización" }).click();
+    await expect(page.getByTestId("guided-timing-review")).toBeVisible();
+    await expect(page.getByRole("tab", { name: "Revisión guiada" })).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByText("Parte 1 de 2")).toBeVisible();
+    await page.getByRole("button", { name: /Reproducir este tramo en loop/ }).click();
+    await expect.poll(() => page.locator("audio").evaluate((audio) => audio.paused)).toBe(false);
+    await page.getByRole("button", { name: /Confirmar y seguir/ }).click();
+    await expect(page.getByText("Parte 2 de 2")).toBeVisible();
+    await expect.poll(() => page.locator("audio").evaluate((audio) => audio.paused)).toBe(true);
+
+    const accessibility = await new AxeBuilder({ page })
+      .include('[data-testid="lyrics-editor"]')
+      .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+      .analyze();
+    const blocking = accessibility.violations.filter((violation) => ["critical", "serious"].includes(violation.impact));
+    expect(blocking, blocking.map((violation) => violation.id).join(", ")).toEqual([]);
+
+    await page.getByRole("tab", { name: "Timeline avanzada" }).click();
+    await expect(page.getByTestId("timeline-lane")).toBeVisible();
+    await expect.poll(() => page.locator("audio").evaluate((audio) => audio.paused)).toBe(true);
   });
 
   test("seeks from the timeline ruler without requiring playback", async ({ page }) => {
@@ -73,7 +114,9 @@ test.describe("lyrics editor browser contract", () => {
 
     const rows = page.getByTestId("timeline-label-row");
     const firstRow = await rows.first().boundingBox();
-    const lastRow = await rows.last().boundingBox();
+    // Use a visible lower row. The fixed approval bar may cover the final
+    // row at short CI viewport heights even though it is reachable by scroll.
+    const lastRow = await rows.nth(2).boundingBox();
     expect(firstRow).not.toBeNull();
     expect(lastRow).not.toBeNull();
     await drag(
@@ -86,7 +129,7 @@ test.describe("lyrics editor browser contract", () => {
     await page.getByRole("button", { name: "Limpiar selección" }).click();
     await page.waitForTimeout(100);
     const firstRowAfterClear = await rows.first().boundingBox();
-    const lastRowAfterClear = await rows.last().boundingBox();
+    const lastRowAfterClear = await rows.nth(2).boundingBox();
     expect(firstRowAfterClear).not.toBeNull();
     expect(lastRowAfterClear).not.toBeNull();
     await drag(

@@ -408,8 +408,31 @@ describe("LyricsTimeline", () => {
   it("renders waveform only when waveform data exists", () => {
     const { container, rerender } = render(<LyricsTimeline segments={SEGS} duration={60} currentTime={5} onSeek={vi.fn()} onReset={vi.fn()} />);
     expect(container.querySelector("canvas")).not.toBeInTheDocument();
+    expect(screen.getByText(/Guía visual no disponible/i)).toBeInTheDocument();
+    rerender(<LyricsTimeline segments={SEGS} duration={60} currentTime={5} waveformLoading onSeek={vi.fn()} onReset={vi.fn()} />);
+    expect(screen.getByText(/Preparando guía de audio/i)).toBeInTheDocument();
     rerender(<LyricsTimeline segments={SEGS} duration={60} currentTime={5} waveform={{ peaks: [0.1, 0.9] }} onSeek={vi.fn()} onReset={vi.fn()} />);
     expect(container.querySelector("canvas")).toBeInTheDocument();
+    expect(screen.getByText("Audio de la canción")).toBeInTheDocument();
+  });
+
+  it("mantiene separadas las barras de envelopes densos", () => {
+    const fillRect = vi.fn();
+    const contextSpy = vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+      setTransform: vi.fn(), clearRect: vi.fn(), fillRect, fillStyle: "",
+    });
+    render(<LyricsTimeline
+      segments={SEGS}
+      duration={60}
+      currentTime={5}
+      waveform={{ peaks: Array.from({ length: 10_000 }, (_, index) => (index % 10) / 10) }}
+      onSeek={vi.fn()}
+      onReset={vi.fn()}
+    />);
+
+    expect(fillRect).toHaveBeenCalled();
+    expect(fillRect.mock.calls.every(([, , width]) => width >= 1 && width <= 3)).toBe(true);
+    contextSpy.mockRestore();
   });
 
   it("shows save status, restore action and zoom controls", () => {
@@ -453,7 +476,10 @@ describe("zonas dudosas sobre la forma de onda", () => {
         { id: "w2", start: 39, end: 42, reasons: ["voiced_gap"] },
       ],
     });
-    expect(screen.getAllByTestId("timeline-unsafe-window")).toHaveLength(2);
+    const bands = screen.getAllByTestId("timeline-unsafe-window");
+    expect(bands).toHaveLength(2);
+    expect(bands[0]).toHaveClass("h-1.5");
+    expect(bands[0]).not.toHaveClass("inset-y-0");
   });
 
   it("no pinta nada cuando no hay ventanas (comportamiento previo intacto)", () => {
