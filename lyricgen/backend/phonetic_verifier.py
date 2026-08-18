@@ -1,4 +1,4 @@
-"""Trusted, contrastive CTC witness for quality-v5 lyric candidates.
+"""Trusted, contrastive CTC witness for quality-v6 lyric candidates.
 
 The caller may propose text candidates, but it cannot provide or override
 their scores.  Stem and mixture are scored from locally generated emissions;
@@ -67,7 +67,7 @@ def _valid_calibration(payload: object, model_identity: dict) -> bool:
         payload.get("schema") == "quality-ctc-calibration-v1"
         and str(payload.get("calibration_id") or "").strip()
         and payload.get("model_identity") == model_identity
-        and payload.get("policy_version") == "lyrics-quality-v5"
+        and payload.get("policy_version") == "lyrics-quality-v6"
         and payload.get("release_gate_decision") == "GO"
         and payload.get("pipeline_release") == runtime["pipeline_release"]
         and payload.get("pipeline_config_fingerprint")

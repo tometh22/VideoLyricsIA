@@ -5,7 +5,7 @@
 import { render, screen, cleanup, fireEvent, within, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, it, expect, vi } from "vitest";
-import LyricsEditor from "./LyricsEditor";
+import LyricsEditor, { qualityProposalIdempotencyKey } from "./LyricsEditor";
 import { segmentsStore } from "../state/segmentsStore";
 
 // useI18n + OnboardingTour pull in joyride / locale loading we don't
@@ -23,6 +23,43 @@ vi.mock("../i18n", () => ({
 vi.mock("./OnboardingTour", () => ({
   EditorTour: () => null,
 }));
+
+describe("LyricsEditor — quality proposal idempotency", () => {
+  it("keeps the apply key stable across retries, reloads and window ordering", async () => {
+    const scope = {
+      action: "apply",
+      jobId: "42dcd62d5d8a",
+      proposalId: "proposal-v6-1",
+      baseRevision: 12,
+      windowIds: ["outro-b", "outro-a", "outro-b"],
+    };
+    const first = await qualityProposalIdempotencyKey(scope);
+    const afterReload = await qualityProposalIdempotencyKey({
+      ...structuredClone(scope),
+      windowIds: ["outro-a", "outro-b"],
+    });
+
+    expect(first).toBe(afterReload);
+    expect(first.length).toBeGreaterThanOrEqual(16);
+    expect(first.length).toBeLessThanOrEqual(160);
+  });
+
+  it("separates apply and dismiss operations while keeping dismiss retries stable", async () => {
+    const common = {
+      jobId: "42dcd62d5d8a",
+      proposalId: "proposal-v6-1",
+      baseRevision: 12,
+    };
+    const dismiss = await qualityProposalIdempotencyKey({ ...common, action: "dismiss" });
+    const dismissRetry = await qualityProposalIdempotencyKey({ ...common, action: "dismiss" });
+    const apply = await qualityProposalIdempotencyKey({
+      ...common, action: "apply", windowIds: ["outro-a"],
+    });
+
+    expect(dismiss).toBe(dismissRetry);
+    expect(dismiss).not.toBe(apply);
+  });
+});
 // LyricsEditor calls useToast() (per-anchor sync feedback). Tests render it
 // without the app-root <ToastProvider>, so stub the hook.
 vi.mock("./ToastProvider", () => ({

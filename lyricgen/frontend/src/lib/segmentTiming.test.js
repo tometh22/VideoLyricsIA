@@ -398,7 +398,18 @@ describe("chronological playback selection", () => {
       { _id: 11, start: 45.1606, end: 46.9606 },
     ];
     expect(selectActiveSegmentId(rows, 45.3)).toBe(11);
-    expect(selectActiveSegmentId(rows, 46.7)).toBe(11);
+    expect(selectActiveSegmentId(rows, 46.7)).toBe(10);
+  });
+
+  it("never moves backwards when a short nested overlap ends", () => {
+    const rows = [
+      { _id: "long", start: 40, end: 50 },
+      { _id: "short", start: 45, end: 46 },
+    ];
+    expect([
+      44.9, 45.1, 46.1, 50.1,
+    ].map((time) => selectActiveSegmentId(rows, time)))
+      .toEqual(["long", "short", "short", "short"]);
   });
 
   it("keeps the first stable row for equal duplicate starts", () => {

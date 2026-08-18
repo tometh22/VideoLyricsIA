@@ -92,11 +92,13 @@ def _attest_independent_content(
             agreeing_families.add(family)
     if len(agreeing_families) < 2:
         return {"verified": False, "reason": "no_distinct_family_consensus"}
-    secret = str(
+    from evidence_contracts import strong_hmac_secret_bytes
+
+    secret = strong_hmac_secret_bytes(
         os.environ.get("QUALITY_CONTENT_ATTESTATION_KEY")
         or os.environ.get("QUALITY_LEARNING_HMAC_KEY") or ""
-    ).strip()
-    if not secret:
+    )
+    if secret is None:
         return {"verified": False, "reason": "attestation_key_unavailable"}
     content_sha256 = hashlib.sha256(json.dumps(
         selected, ensure_ascii=False, separators=(",", ":"),
@@ -118,7 +120,7 @@ def _attest_independent_content(
         "attestation": {
             **payload,
             "signature_hmac_sha256": hmac.new(
-                secret.encode("utf-8"), encoded, hashlib.sha256,
+                secret, encoded, hashlib.sha256,
             ).hexdigest(),
         },
     }
@@ -201,7 +203,10 @@ def _window_vocal_regions(path: str, start: float, end: float) -> list[tuple[flo
                     regions.append((a, b))
         return regions
     except Exception as exc:
-        logger.warning("[STRUCTURAL-HYBRID] tail VAD decline %s: %s", path, exc)
+        logger.warning(
+            "[STRUCTURAL-HYBRID] tail VAD decline error_type=%s",
+            type(exc).__name__,
+        )
         return []
 
 
@@ -318,7 +323,10 @@ def _features(path: str, start: float, duration: float) -> dict | None:
             "onset": onset[:n],
         }
     except Exception as exc:
-        logger.warning("[STRUCTURAL-HYBRID] feature decline %s: %s", path, exc)
+        logger.warning(
+            "[STRUCTURAL-HYBRID] feature decline error_type=%s",
+            type(exc).__name__,
+        )
         return None
 
 
@@ -642,7 +650,10 @@ def verify(stem_path: str, mix_path: str, events: list[dict], *,
             })
             return stats
         except Exception as exc:
-            logger.warning("[STRUCTURAL-HYBRID-V5] decline: %r job=%s", exc, job_id)
+            logger.warning(
+                "[STRUCTURAL-HYBRID-V5] decline error_type=%s job=%s",
+                type(exc).__name__, job_id,
+            )
             stats["reason"] = f"exception:{type(exc).__name__}"
             return stats
     texts = [str(event.get("text") or "").strip() for event in (events or [])]
@@ -877,6 +888,9 @@ def verify(stem_path: str, mix_path: str, events: list[dict], *,
         })
         return stats
     except Exception as exc:
-        logger.warning("[STRUCTURAL-HYBRID] decline: %r job=%s", exc, job_id)
+        logger.warning(
+            "[STRUCTURAL-HYBRID] decline error_type=%s job=%s",
+            type(exc).__name__, job_id,
+        )
         stats["reason"] = f"exception:{type(exc).__name__}"
         return stats

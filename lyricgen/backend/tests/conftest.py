@@ -57,6 +57,9 @@ os.environ["JWT_SECRET"] = "test-secret-key-for-tests"
 os.environ["ADMIN_PASSWORD"] = "testadmin123"
 os.environ["RATE_LIMIT_ENABLED"] = "false"
 os.environ.setdefault("QUALITY_LEARNING_HMAC_KEY_ID", "test-v1")
+os.environ.setdefault(
+    "QUALITY_LEARNING_HMAC_KEY", "quality-test-key-0123456789-ABCDEF",
+)
 os.environ.setdefault("QUALITY_LEARNING_PROPOSALS_ENABLED", "1")
 os.environ.setdefault("QUALITY_LEARNING_ABLATIONS_ENABLED", "1")
 # CI defaults ENVIRONMENT unset → main.py sees "production" and the CORS

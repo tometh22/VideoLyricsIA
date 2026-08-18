@@ -39,7 +39,7 @@ def _calibration():
     return {
         "schema": "quality-ctc-calibration-v1",
         "calibration_id": "gold-test",
-        "policy_version": "lyrics-quality-v5",
+        "policy_version": "lyrics-quality-v6",
         "model_identity": {
             "model_id": "trusted-test-model",
             "model_revision": TEST_REVISION,

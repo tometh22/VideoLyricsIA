@@ -296,6 +296,36 @@ def _resolve_queue_names() -> list:
     return names or _DEFAULT_QUEUES.split(",")
 
 
+def _schedule_worker_maintenance(queue_names: list[str]) -> dict[str, bool]:
+    """Seed only jobs this worker fleet can actually consume.
+
+    Each scheduler is isolated so one unavailable subsystem cannot suppress
+    the other recovery loops during startup.
+    """
+    scheduled: dict[str, bool] = {}
+    if "transcription_quality" in queue_names:
+        for name, import_name in (
+            ("quality_learning", "ensure_daily_quality_learning_scheduled"),
+            ("quality_pending", "ensure_quality_pending_reconciler_scheduled"),
+        ):
+            try:
+                import queue_jobs
+                getattr(queue_jobs, import_name)()
+                scheduled[name] = True
+            except Exception as exc:
+                scheduled[name] = False
+                logger.warning("[WORKER] %s scheduler unavailable: %s", name, exc)
+    if "default" in queue_names:
+        try:
+            from queue_jobs import ensure_job_outbox_reconciler_scheduled
+            ensure_job_outbox_reconciler_scheduled()
+            scheduled["job_outbox"] = True
+        except Exception as exc:
+            scheduled["job_outbox"] = False
+            logger.warning("[WORKER] job outbox scheduler unavailable: %s", exc)
+    return scheduled
+
+
 def _should_recycle(worker) -> bool:
     """True when worker.work() returned for a RECYCLABLE reason (the max_jobs
     cap, or a transient loop break like a Redis blip) rather than an
@@ -390,6 +420,8 @@ def main():
     from observability import init_logging, init_sentry
     init_logging()
     init_sentry()
+    from database import assert_quality_attempt_id_schema_contract
+    assert_quality_attempt_id_schema_contract()
     _start_local_outputs_cleanup()
 
     from background_policy import (
@@ -452,16 +484,7 @@ def main():
     # _resolve_queue_names(). Default = all four = current behavior.
     queue_names = _resolve_queue_names()
     queues = [Queue(name, connection=conn) for name in queue_names]
-    if "transcription_quality" in queue_names:
-        try:
-            # RQ's scheduler is started below. Seed one dated wake-up; the
-            # daily job schedules its successor after each successful run.
-            from queue_jobs import ensure_daily_quality_learning_scheduled
-            ensure_daily_quality_learning_scheduled()
-            from queue_jobs import ensure_quality_pending_reconciler_scheduled
-            ensure_quality_pending_reconciler_scheduled()
-        except Exception as exc:
-            logger.warning("[QUALITY-LEARNING] daily schedule unavailable: %s", exc)
+    _schedule_worker_maintenance(queue_names)
     # WarmOnlyWorker: a burst of deploys (2nd SIGTERM mid-drain) would otherwise
     # COLD-kill the in-flight render. This subclass keeps every shutdown warm so
     # the render finishes. See the class docstring.

@@ -584,7 +584,7 @@ def test_v5_exposes_dimension_risks_and_never_reports_false_100():
         {"audio_coverage": 1.0, "text_mismatches": 0,
          "voiced_gap_s": 0, "uncovered_seconds": 0},
     )
-    assert quality["policy_version"] == "lyrics-quality-v5"
+    assert quality["policy_version"] == "lyrics-quality-v6"
     assert quality["risk_dimensions"]["timeline_integrity"] == 1.0
     assert quality["score"] is None
     assert quality["risk_calibration"]["calibrated"] is False

@@ -9,10 +9,20 @@ import pytest
 
 from auth import create_user, start_login_session
 from database import (
-    AuditLog, EditorDocument, EditorVersion, Job, ProductEvent, SessionLocal,
+    AuditLog, EditorDocument, EditorVersion, Job, JobOutboxEvent, ProductEvent, SessionLocal,
     engine,
 )
-from editor import acquire_lock, approve_document, ensure_document, get_or_create_document, save_document
+from editor import (
+    acquire_lock,
+    approve_document,
+    ensure_document,
+    expire_stale_quality_proposals,
+    get_or_create_document,
+    persist_quality_proposal_if_current,
+    save_document,
+)
+from transcription_quality import segments_hash
+from quality_v6_contracts import PROPOSAL_WINDOW_SCHEMA, REVIEW_PROPOSAL_SCHEMA
 from tests.conftest import auth
 
 
@@ -46,6 +56,20 @@ def _token_for(user):
         return start_login_session(db, user)
     finally:
         db.close()
+
+
+def _proposal(proposal_id: str, windows: list[dict]) -> dict:
+    return {
+        "kind": "review_proposal", "schema": REVIEW_PROPOSAL_SCHEMA,
+        "id": proposal_id, "policy_version": "lyrics-quality-v6",
+        "review_only": True,
+        "windows": [{
+            "kind": "review_proposal_window",
+            "schema": PROPOSAL_WINDOW_SCHEMA,
+            "reasons": ["acoustic_cardinality_disagreement"],
+            **window,
+        } for window in windows],
+    }
 
 
 def test_editor_document_is_shared_by_tenant_and_conflicts_are_explicit(client):
@@ -256,6 +280,528 @@ def test_platform_admin_can_use_editor_for_cross_tenant_review(client):
             row.action for row in verify.query(AuditLog).filter(AuditLog.user_id == admin_id).all()
         }
         assert "admin.cross_tenant_access" in actions
+    finally:
+        verify.close()
+
+
+def test_quality_proposal_is_audio_revision_scoped_and_applies_idempotently(
+    client, monkeypatch,
+):
+    monkeypatch.setenv("QUALITY_V6_PROPOSALS_ENABLED", "1")
+    first, _second, job_id = _users_and_job("editor_quality_proposal")
+    token = _token_for(first)
+    proposal_id = f"proposal-{uuid.uuid4().hex}"
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        job.input_audio_sha256 = "a" * 64
+        job.audio_revision = 4
+        snapshot_hash = segments_hash(document.current_segments)
+        stored = persist_quality_proposal_if_current(
+            db,
+            job_id=job_id,
+            expected_revision=0,
+            expected_segments_hash=snapshot_hash,
+            expected_audio_revision=4,
+            expected_audio_sha256="a" * 64,
+            proposal={
+                "kind": "review_proposal",
+                "schema": REVIEW_PROPOSAL_SCHEMA,
+                "id": proposal_id,
+                "policy_version": "lyrics-quality-v6",
+                "review_only": True,
+                "windows": [{
+                    "kind": "review_proposal_window",
+                    "schema": PROPOSAL_WINDOW_SCHEMA,
+                    "id": "tail",
+                    "start": 0.0,
+                    "end": 1.0,
+                    "reasons": ["acoustic_cardinality_disagreement"],
+                    "current_segments": [
+                        {"start": 0, "end": 1, "text": "one"},
+                    ],
+                    "proposed_segments": [
+                        {"start": 0, "end": 1, "text": "ONE + vocalization"},
+                    ],
+                }],
+            },
+        )
+        assert stored is True
+        db.commit()
+    finally:
+        db.close()
+
+    loaded = client.get(f"/editor/{job_id}", headers=auth(token))
+    assert loaded.status_code == 200, loaded.text
+    assert loaded.json()["quality_proposal"]["id"] == proposal_id
+    assert loaded.json()["quality_proposal"]["review_only"] is True
+
+    body = {
+        "base_revision": 0,
+        "window_ids": ["tail"],
+        "idempotency_key": "quality-proposal-request-0001",
+    }
+    applied = client.post(
+        f"/editor/{job_id}/quality-proposals/{proposal_id}/apply",
+        headers=auth(token), json=body,
+    )
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["applied"] is True
+    assert applied.json()["revision"] == 1
+
+    duplicate = client.post(
+        f"/editor/{job_id}/quality-proposals/{proposal_id}/apply",
+        headers=auth(token), json=body,
+    )
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["applied"] is False
+    assert duplicate.json()["idempotent"] is True
+
+    verify = SessionLocal()
+    try:
+        document = verify.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        assert document.revision == 1
+        assert [row["text"] for row in document.current_segments] == [
+            "ONE + vocalization", "two",
+        ]
+        versions = verify.query(EditorVersion).filter(
+            EditorVersion.job_id == job_id,
+            EditorVersion.reason == "quality_proposal",
+        ).all()
+        assert len(versions) == 1
+    finally:
+        verify.close()
+
+
+def test_quality_proposal_rejects_stale_audio_identity(db, monkeypatch):
+    monkeypatch.setenv("QUALITY_V6_PROPOSALS_ENABLED", "1")
+    _first, _second, job_id = _users_and_job("editor_quality_stale_audio")
+    job = db.query(Job).filter(Job.job_id == job_id).one()
+    document = db.query(EditorDocument).filter(
+        EditorDocument.job_id == job_id,
+    ).one()
+    job.input_audio_sha256 = "b" * 64
+    job.audio_revision = 9
+    db.flush()
+    stored = persist_quality_proposal_if_current(
+        db,
+        job_id=job_id,
+        expected_revision=0,
+        expected_segments_hash=segments_hash(document.current_segments),
+        expected_audio_revision=8,
+        expected_audio_sha256="b" * 64,
+        proposal={
+            "kind": "review_proposal",
+            "schema": REVIEW_PROPOSAL_SCHEMA,
+            "policy_version": "lyrics-quality-v6",
+            "review_only": True,
+            "windows": [{
+                "kind": "review_proposal_window",
+                "schema": PROPOSAL_WINDOW_SCHEMA,
+                "id": "stale", "start": 0, "end": 1,
+                "reasons": ["acoustic_cardinality_disagreement"],
+                "current_segments": [],
+                "proposed_segments": [{"start": 0, "end": 1, "text": "x"}],
+            }],
+        },
+    )
+    assert stored is False
+    assert document.quality_proposal is None
+
+
+def test_quality_proposal_cannot_apply_after_audio_revision_changes(
+    client, monkeypatch,
+):
+    monkeypatch.setenv("QUALITY_V6_PROPOSALS_ENABLED", "1")
+    first, _second, job_id = _users_and_job("editor_quality_apply_audio_race")
+    proposal_id = f"proposal-{uuid.uuid4().hex}"
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        job.input_audio_sha256 = "c" * 64
+        job.audio_revision = 1
+        assert persist_quality_proposal_if_current(
+            db, job_id=job_id, expected_revision=0,
+            expected_segments_hash=segments_hash(document.current_segments),
+            expected_audio_revision=1, expected_audio_sha256="c" * 64,
+            proposal={
+                "kind": "review_proposal", "schema": REVIEW_PROPOSAL_SCHEMA,
+                "id": proposal_id, "policy_version": "lyrics-quality-v6",
+                "review_only": True,
+                "windows": [{
+                    "kind": "review_proposal_window",
+                    "schema": PROPOSAL_WINDOW_SCHEMA,
+                    "id": "tail", "start": 0, "end": 1,
+                    "reasons": ["acoustic_cardinality_disagreement"],
+                    "current_segments": [{"start": 0, "end": 1, "text": "one"}],
+                    "proposed_segments": [{"start": 0, "end": 1, "text": "ONE"}],
+                }],
+            },
+        )
+        db.commit()
+        job.audio_revision = 2
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/editor/{job_id}/quality-proposals/{proposal_id}/apply",
+        headers=auth(_token_for(first)),
+        json={
+            "base_revision": 0, "window_ids": ["tail"],
+            "idempotency_key": "quality-audio-race-request-01",
+        },
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "quality_proposal_stale"
+
+
+def test_quality_proposal_dismiss_reason_cannot_store_free_text(client):
+    first, _second, job_id = _users_and_job("editor_quality_private_reason")
+    response = client.post(
+        f"/editor/{job_id}/quality-proposals/unknown/dismiss",
+        headers=auth(_token_for(first)),
+        json={
+            "base_revision": 0,
+            "idempotency_key": "quality-dismiss-request-0001",
+            "reason": "private lyric text must not enter audit log",
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_expired_quality_proposal_payload_is_erased(db):
+    _first, _second, job_id = _users_and_job("editor_quality_expiry")
+    document = db.query(EditorDocument).filter(
+        EditorDocument.job_id == job_id,
+    ).one()
+    document.quality_proposal = {
+        "id": "expired", "status": "pending", "windows": [{"text": "private"}],
+        "expires_at": "2000-01-01T00:00:00+00:00",
+    }
+    db.flush()
+    # The collector is deliberately global.  Other tests (and production
+    # tenants) may have left additional expired proposals for the same sweep,
+    # so the contract is that our target is among the erased payloads rather
+    # than that the database contained exactly one expired row.
+    assert expire_stale_quality_proposals(db) >= 1
+    db.commit()
+    db.expire_all()
+    document = db.query(EditorDocument).filter(
+        EditorDocument.job_id == job_id,
+    ).one()
+    assert document.quality_proposal is None
+
+
+def test_editor_get_persists_expired_proposal_cleanup(client, monkeypatch):
+    monkeypatch.setenv("QUALITY_V6_PROPOSALS_ENABLED", "1")
+    first, _second, job_id = _users_and_job("editor_quality_get_expiry")
+    db = SessionLocal()
+    try:
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        document.quality_proposal = {
+            "id": "expired-get", "status": "pending",
+            "windows": [{"private": "must be erased"}],
+            "expires_at": "2000-01-01T00:00:00+00:00",
+            "base_revision": 0,
+        }
+        db.commit()
+    finally:
+        db.close()
+    response = client.get(f"/editor/{job_id}", headers=auth(_token_for(first)))
+    assert response.status_code == 200
+    assert response.json()["quality_proposal"] is None
+    verify = SessionLocal()
+    try:
+        document = verify.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        assert document.quality_proposal is None
+    finally:
+        verify.close()
+
+
+def test_quality_proposal_rejects_non_exact_current_segment_content(monkeypatch):
+    monkeypatch.setenv("QUALITY_V6_PROPOSALS_ENABLED", "1")
+    _first, _second, job_id = _users_and_job("editor_quality_exact_content")
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        enriched = [dict(item) for item in document.current_segments]
+        enriched[0]["locked"] = True
+        document.current_segments = enriched
+        job.segments_json = enriched
+        job.input_audio_sha256 = "d" * 64
+        job.audio_revision = 1
+        db.flush()
+        stored = persist_quality_proposal_if_current(
+            db, job_id=job_id, expected_revision=0,
+            expected_segments_hash=segments_hash(enriched),
+            expected_audio_revision=1, expected_audio_sha256="d" * 64,
+            proposal=_proposal("exact-mismatch", [{
+                "id": "first", "start": 0, "end": 1,
+                # Omitting `locked` is a content mismatch even though text and
+                # timing look identical.
+                "current_segments": [{"start": 0, "end": 1, "text": "one"}],
+                "proposed_segments": [{"start": 0, "end": 1, "text": "ONE"}],
+            }]),
+        )
+        assert stored is False
+        assert document.quality_proposal is None
+    finally:
+        db.rollback()
+        db.close()
+
+
+@pytest.mark.parametrize("malformation", ["overlap", "duplicate_start", "out_of_order"])
+def test_quality_proposal_rejects_malformed_proposed_timeline(
+    monkeypatch, malformation,
+):
+    monkeypatch.setenv("QUALITY_V6_PROPOSALS_ENABLED", "1")
+    _first, _second, job_id = _users_and_job(f"editor_quality_{malformation}")
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        job.input_audio_sha256 = "e" * 64
+        job.audio_revision = 1
+        proposed = (
+            [
+                {"start": 0, "end": 0.75, "text": "A"},
+                {"start": 0.5, "end": 1, "text": "B"},
+            ] if malformation == "overlap" else ([
+                {"start": 0, "end": 0.4, "text": "A"},
+                {"start": 0, "end": 1, "text": "B"},
+            ] if malformation == "duplicate_start" else [
+                {"start": 0.6, "end": 1, "text": "B"},
+                {"start": 0, "end": 0.5, "text": "A"},
+            ])
+        )
+        assert persist_quality_proposal_if_current(
+            db, job_id=job_id, expected_revision=0,
+            expected_segments_hash=segments_hash(document.current_segments),
+            expected_audio_revision=1, expected_audio_sha256="e" * 64,
+            proposal=_proposal(f"malformed-{malformation}", [{
+                "id": "first", "start": 0, "end": 1,
+                "current_segments": [{"start": 0, "end": 1, "text": "one"}],
+                "proposed_segments": proposed,
+            }]),
+        ) is False
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_quality_proposal_rejects_overlapping_windows_even_across_silence(monkeypatch):
+    monkeypatch.setenv("QUALITY_V6_PROPOSALS_ENABLED", "1")
+    _first, _second, job_id = _users_and_job("editor_quality_window_overlap")
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        segments = [
+            {"start": 0, "end": 0.5, "text": "one"},
+            {"start": 1.5, "end": 2, "text": "two"},
+        ]
+        document.current_segments = segments
+        job.segments_json = segments
+        job.input_audio_sha256 = "1" * 64
+        job.audio_revision = 1
+        db.flush()
+        assert persist_quality_proposal_if_current(
+            db, job_id=job_id, expected_revision=0,
+            expected_segments_hash=segments_hash(segments),
+            expected_audio_revision=1, expected_audio_sha256="1" * 64,
+            proposal=_proposal("window-overlap", [
+                {
+                    "id": "a", "start": 0, "end": 0.75,
+                    "current_segments": [segments[0]],
+                    "proposed_segments": [{"start": 0, "end": 0.5, "text": "A"}],
+                },
+                {
+                    "id": "b", "start": 0.6, "end": 2,
+                    "current_segments": [segments[1]],
+                    "proposed_segments": [{"start": 1.5, "end": 2, "text": "B"}],
+                },
+            ]),
+        ) is False
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_quality_proposal_apply_flag_off_revokes_pending_payload(
+    client, monkeypatch,
+):
+    monkeypatch.setenv("QUALITY_V6_PROPOSALS_ENABLED", "1")
+    first, _second, job_id = _users_and_job("editor_quality_flag_off")
+    proposal_id = f"proposal-{uuid.uuid4().hex}"
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        job.input_audio_sha256 = "f" * 64
+        job.audio_revision = 1
+        assert persist_quality_proposal_if_current(
+            db, job_id=job_id, expected_revision=0,
+            expected_segments_hash=segments_hash(document.current_segments),
+            expected_audio_revision=1, expected_audio_sha256="f" * 64,
+            proposal=_proposal(proposal_id, [{
+                "id": "first", "start": 0, "end": 1,
+                "current_segments": [{"start": 0, "end": 1, "text": "one"}],
+                "proposed_segments": [{"start": 0, "end": 1, "text": "ONE"}],
+            }]),
+        )
+        db.commit()
+    finally:
+        db.close()
+    monkeypatch.setenv("QUALITY_V6_PROPOSALS_ENABLED", "0")
+    response = client.post(
+        f"/editor/{job_id}/quality-proposals/{proposal_id}/apply",
+        headers=auth(_token_for(first)),
+        json={
+            "base_revision": 0, "window_ids": ["first"],
+            "idempotency_key": "quality-disabled-request-001",
+        },
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "quality_v6_proposals_disabled"
+    verify = SessionLocal()
+    try:
+        document = verify.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        assert document.quality_proposal is None
+        assert document.revision == 0
+    finally:
+        verify.close()
+
+
+def test_quality_proposal_apply_revalidates_stored_window_hash_and_timeline(
+    client, monkeypatch,
+):
+    monkeypatch.setenv("QUALITY_V6_PROPOSALS_ENABLED", "1")
+    first, _second, job_id = _users_and_job("editor_quality_apply_revalidate")
+    proposal_id = f"proposal-{uuid.uuid4().hex}"
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        job.input_audio_sha256 = "3" * 64
+        job.audio_revision = 1
+        assert persist_quality_proposal_if_current(
+            db, job_id=job_id, expected_revision=0,
+            expected_segments_hash=segments_hash(document.current_segments),
+            expected_audio_revision=1, expected_audio_sha256="3" * 64,
+            proposal=_proposal(proposal_id, [{
+                "id": "first", "start": 0, "end": 1,
+                "current_segments": [{"start": 0, "end": 1, "text": "one"}],
+                "proposed_segments": [{"start": 0, "end": 1, "text": "ONE"}],
+            }]),
+        )
+        tampered = dict(document.quality_proposal)
+        tampered["windows"] = [dict(tampered["windows"][0])]
+        tampered["windows"][0]["proposed_segments"] = [
+            {"start": 0, "end": 0.8, "text": "A"},
+            {"start": 0.5, "end": 1, "text": "B"},
+        ]
+        document.quality_proposal = tampered
+        db.commit()
+    finally:
+        db.close()
+    response = client.post(
+        f"/editor/{job_id}/quality-proposals/{proposal_id}/apply",
+        headers=auth(_token_for(first)),
+        json={
+            "base_revision": 0, "window_ids": ["first"],
+            "idempotency_key": "quality-malformed-apply-001",
+        },
+    )
+    assert response.status_code == 422
+    verify = SessionLocal()
+    try:
+        document = verify.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        assert document.revision == 0
+        assert [row["text"] for row in document.current_segments] == ["one", "two"]
+    finally:
+        verify.close()
+
+
+def test_editor_save_and_restore_commit_quality_outbox_with_revision(
+    client, monkeypatch,
+):
+    import main
+
+    first, _second, job_id = _users_and_job("editor_quality_durable_outbox")
+    token = _token_for(first)
+    monkeypatch.setattr(main, "_dispatch_editor_quality_outbox", lambda _event_id: None)
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        job.input_audio_sha256 = "2" * 64
+        job.audio_revision = 1
+        original = db.query(EditorVersion).filter(
+            EditorVersion.job_id == job_id,
+            EditorVersion.revision == 0,
+        ).one()
+        original_id = original.id
+        db.commit()
+    finally:
+        db.close()
+
+    saved = client.patch(
+        f"/editor/{job_id}", headers=auth(token),
+        json={
+            "base_revision": 0,
+            "segments": [
+                {"start": 0, "end": 1, "text": "ONE"},
+                {"start": 1, "end": 2, "text": "two"},
+            ],
+            "checkpoint": "manual",
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    restored = client.post(
+        f"/editor/{job_id}/restore", headers=auth(token),
+        json={"version_id": original_id, "base_revision": 1},
+    )
+    assert restored.status_code == 200, restored.text
+
+    verify = SessionLocal()
+    try:
+        events = verify.query(JobOutboxEvent).filter(
+            JobOutboxEvent.job_id == job_id,
+            JobOutboxEvent.event_type == "quality.enqueue",
+        ).order_by(JobOutboxEvent.created_at.asc()).all()
+        assert len(events) == 2
+        assert [event.payload["expected_revision"] for event in events] == [1, 2]
+        assert [event.payload["reason"] for event in events] == [
+            "editor_save", "editor_version_restored",
+        ]
+        assert all("segments" not in event.payload for event in events)
     finally:
         verify.close()
 

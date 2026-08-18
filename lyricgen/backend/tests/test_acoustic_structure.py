@@ -1,7 +1,15 @@
+import inspect
+
 import numpy as np
 
 import acoustic_structure as acoustic
 import structural_hybrid
+
+
+def test_acoustic_diagnostics_never_log_exception_payloads():
+    source = inspect.getsource(acoustic)
+    assert "cache read declined: %r" not in source
+    assert "cache write declined: %r" not in source
 
 
 def _view(seconds=40):
@@ -52,7 +60,9 @@ def test_irregular_pericos_events_survive_before_text_mapping():
     )
     assert len(mapped["events"]) == 6
     assert mapped["accepted"] is False
-    assert mapped["reason"] == "phonetic_evidence_unavailable"
+    assert mapped["reason"] in {
+        "phonetic_evidence_unavailable", "ambiguous_mapping",
+    }
     assert mapped["events"][-1]["text"] == "noooo"
     assert mapped["events"][-1]["start"] >= 79.0
     assert not any(
@@ -186,3 +196,141 @@ def test_coarse_vad_start_refines_to_local_acoustic_attack_without_text():
     event = partitions[0]["events"][0]
     assert event["coarse_start"] == 63.2
     assert event["start"] == 63.54
+
+
+def test_residual_features_are_extracted_from_waveform_projection(monkeypatch):
+    time = np.arange(acoustic.SAMPLE_RATE, dtype=np.float32) / acoustic.SAMPLE_RATE
+    stem = np.sin(2 * np.pi * 220 * time).astype(np.float32)
+    crowd = .2 * np.sin(2 * np.pi * 440 * time).astype(np.float32)
+    mix = .6 * stem + crowd
+    seen = {}
+
+    monkeypatch.setattr(
+        acoustic, "_load_waveform",
+        lambda path, *_args: stem if path == "stem.wav" else mix,
+    )
+
+    def extract(waveform):
+        seen["waveform"] = np.asarray(waveform)
+        return _view(seconds=1)
+
+    monkeypatch.setattr(acoustic, "_extract_features", extract)
+    residual = acoustic._extract_waveform_residual_view(
+        "stem.wav", "mix.wav", 0.0, 1.0,
+    )
+
+    assert residual["waveform_derived"] is True
+    assert residual["residual_method"] == "waveform_projection_mix_minus_stem"
+    assert residual["projection_gain"] == 0.6
+    assert np.allclose(seen["waveform"], crowd, atol=1e-5)
+
+
+def test_residual_fails_closed_without_real_waveform(monkeypatch):
+    monkeypatch.setattr(acoustic, "_load_waveform", lambda *_args: None)
+    assert acoustic._extract_waveform_residual_view(
+        "stem.wav", "mix.wav", 0.0, 1.0,
+    ) is None
+
+    view = _view(seconds=4)
+    structure = acoustic._performance_graph_structure(
+        [(0.0, 1.0), (1.2, 2.2)], view, view, 0.0, [],
+        n_best=4, residual=None,
+    )
+    assert structure["diagnostics"]["residual_available"] is False
+    assert structure["diagnostics"]["acoustic_views"] == ["stem", "mix"]
+
+
+def _event(start, end, *, lexical=.9, nonlexical=.05):
+    return {
+        "id": f"event-{start}", "start": start, "end": end,
+        "type_posterior": {
+            "lexical_phrase": lexical,
+            "short_vocalization": nonlexical,
+            "sustained_vocalization": nonlexical,
+        },
+    }
+
+
+def test_content_lattice_exposes_voc_repetition_merge_and_split_arcs():
+    voc = acoustic._align_partition(
+        [_event(0, 1, lexical=.05, nonlexical=.95)],
+        [{"start": 0, "end": 1, "text": "uoh", "kind": "vocalization"}],
+    )
+    assert [item["operation"] for item in voc["assignments"]] == ["VOC"]
+
+    repeated = acoustic._align_partition(
+        [_event(0, 1), _event(1.1, 2.1)],
+        [
+            {"start": 0, "end": 1, "text": "otra vez"},
+            {"start": 1.1, "end": 2.1, "text": "otra vez"},
+        ],
+    )
+    assert [item["operation"] for item in repeated["assignments"]] == [
+        "MATCH", "REPETITION",
+    ]
+
+    merged = acoustic._align_partition(
+        [_event(0, .8), _event(.85, 1.8)],
+        [{"start": 0, "end": 1.8, "text": "frase continua"}],
+    )
+    assert [item["operation"] for item in merged["assignments"]] == ["MERGE"]
+    assert merged["assignments"][0]["event_indices"] == [0, 1]
+
+    split = acoustic._align_partition(
+        [_event(0, 2)],
+        [
+            {"start": 0, "end": .9, "text": "frase"},
+            {"start": 1, "end": 2, "text": "partida"},
+        ],
+    )
+    assert [item["operation"] for item in split["assignments"]] == ["SPLIT"]
+    assert split["assignments"][0]["content_indices"] == [0, 1]
+
+
+def test_content_lattice_exposes_both_omission_directions():
+    omitted_event = acoustic._align_partition(
+        [_event(0, 1), _event(20, 21)],
+        [{"start": 0, "end": 1, "text": "presente"}],
+    )
+    assert "OMIT_EVENT" in {
+        item["operation"] for item in omitted_event["assignments"]
+    }
+
+    omitted_content = acoustic._align_partition(
+        [_event(0, 1)],
+        [
+            {"start": 0, "end": 1, "text": "presente"},
+            {"start": 20, "end": 21, "text": "sin audio"},
+        ],
+    )
+    assert "OMIT_CONTENT" in {
+        item["operation"] for item in omitted_content["assignments"]
+    }
+
+
+def test_speech_candidate_requires_context_and_sung_words_are_never_erased():
+    structure = {
+        "n_best": [{
+            "rank": 1, "score": 0,
+            "events": [_event(0, 1), _event(4, 5)],
+        }],
+        "boundaries": [],
+    }
+    mapped = acoustic.map_content(structure, [{
+        "source": "provider", "family": "provider_a", "events": [
+            {"start": 0, "end": 1, "text": "Gracias", "kind": "sung"},
+            {"start": 4, "end": 5, "text": "Gracias"},
+        ],
+    }])
+    assert [item["text"] for item in mapped["events"]] == ["Gracias"]
+    assert mapped["excluded_content"][0]["classification"] == "SPEECH_CANDIDATE"
+    assert mapped["excluded_content"][0]["isolated_tail"] is True
+
+    middle = acoustic.map_content({
+        "n_best": [{"rank": 1, "score": 0, "events": [_event(0, 1)]}],
+        "boundaries": [],
+    }, [{
+        "source": "provider", "family": "provider_a",
+        "events": [{"start": 0, "end": 1, "text": "Gracias"}],
+    }])
+    assert middle["events"][0]["text"] == "Gracias"

@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 
+LEGACY_MUTATION_POLICY_VERSION = "lyrics-quality-v5"
+
+
 def _tenant_for_job(job_id: str) -> str:
     """Resolve the persisted tenant without trusting caller-supplied metadata."""
     if not job_id:
@@ -32,7 +35,13 @@ def mutation_authorized(*, job_id: str, tenant_id: str | None = None) -> bool:
     try:
         from transcription_quality import calibration_identity, effective_policy_mode
 
-        if not calibration_identity().get("calibrated"):
+        identity = calibration_identity()
+        if not identity.get("calibrated"):
+            return False
+        # V6 is intentionally review-only.  Its signed evidence can authorize
+        # analysis/proposals, but can never be reused as a capability token by
+        # legacy post-passes that rewrite lyrics in-place.
+        if identity.get("policy_version") != LEGACY_MUTATION_POLICY_VERSION:
             return False
         persisted_tenant = _tenant_for_job(job_id) if tenant_id is None else str(tenant_id)
         return effective_policy_mode(
