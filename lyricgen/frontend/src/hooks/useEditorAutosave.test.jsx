@@ -98,8 +98,11 @@ describe("useEditorAutosave", () => {
     expect(save.mock.calls[1][0]).toEqual(merged);
   });
 
-  it("does not retry or publish a same-line conflict", async () => {
-    const save = vi.fn().mockResolvedValue({ ok: false, reason: "conflict" });
+  it("retries a same-line rebase without publishing a conflict status", async () => {
+    const merged = [{ start: 0, end: 1, text: "local" }];
+    const save = vi.fn()
+      .mockResolvedValueOnce({ ok: false, reason: "merged", mergedSegments: merged, hadLineConflicts: true })
+      .mockResolvedValueOnce({ ok: true, revision: 2 });
     const onStatus = vi.fn();
     const onMerged = vi.fn();
     const { result } = renderHook(() => useEditorAutosave({
@@ -113,12 +116,12 @@ describe("useEditorAutosave", () => {
     }));
 
     await act(async () => { await result.current.flush("manual"); });
-    expect(save).toHaveBeenCalledTimes(1);
-    expect(onMerged).not.toHaveBeenCalled();
-    expect(onStatus).toHaveBeenCalledWith("conflict", "conflict", expect.any(Object));
+    expect(save).toHaveBeenCalledTimes(2);
+    expect(onMerged).toHaveBeenCalledWith(merged, expect.objectContaining({ hadLineConflicts: true }));
+    expect(onStatus).not.toHaveBeenCalledWith("conflict", "conflict", expect.any(Object));
   });
 
-  it("does not save after reconciliation finds a same-line conflict", async () => {
+  it("treats an unrecoverable reconciliation response as a retryable server failure", async () => {
     vi.useFakeTimers();
     const save = vi.fn().mockResolvedValue({ ok: false, reason: "offline" });
     const reconcile = vi.fn().mockResolvedValue({ ok: false, reason: "conflict" });
@@ -138,7 +141,7 @@ describe("useEditorAutosave", () => {
     await act(async () => { window.dispatchEvent(new Event("online")); await Promise.resolve(); });
     expect(reconcile).toHaveBeenCalledTimes(1);
     expect(save).toHaveBeenCalledTimes(1);
-    expect(onStatus).toHaveBeenCalledWith("conflict", "conflict", expect.any(Object));
+    expect(onStatus).toHaveBeenCalledWith("error", "server", expect.any(Object));
   });
 
   it("does not restart the debounce when a save callback changes identity", async () => {

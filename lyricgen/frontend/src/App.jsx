@@ -3900,13 +3900,14 @@ export default function App() {
             }
           }
           if (!res.ok || data.detail) {
-            // A 404 / `job_not_found` here means the transcribed job was reaped
-            // (or wasn't the caller's) before we got to /generate. Prefer the
-            // stable backend `code` over the raw HTTP status; keep 404 as a
-            // fallback for older backends. Surface a clear session-expired
-            // message instead of the raw "Job not found.".
+            // Only a confirmed missing job is a session expiry. The API also
+            // uses 404 for missing source/background objects; presenting all
+            // of those as a lost session sent people to re-upload audio for
+            // unrelated storage failures.
             const editorConflict = isEditorRevisionConflict(res, data);
-            const reason = (data.code === "job_not_found" || res.status === 404)
+            const missingJob = data.code === "job_not_found"
+              || (res.status === 404 && /job not found/i.test(String(data.detail || "")));
+            const reason = missingJob
               ? (t("generate.session_expired")
                  || "La sesión expiró antes de generar. Re-subí el audio para regenerar.")
               : (translateBackendError(data.detail, t) || await describeFetchError(null, res, t));
@@ -4048,8 +4049,11 @@ export default function App() {
             continue;
           }
           if (!genRes.ok || data.detail) {
-            // Same session-expired handling as the legacy /generate path.
-            const reason = (genRes.status === 404)
+            // Match the legacy path: a 404 from storage is not a session
+            // expiry unless the backend explicitly says the job is missing.
+            const missingJob = data.code === "job_not_found"
+              || (genRes.status === 404 && /job not found/i.test(String(data.detail || "")));
+            const reason = missingJob
               ? (t("generate.session_expired")
                  || "La sesión expiró antes de generar. Re-subí el audio para regenerar.")
               : (translateBackendError(data.detail, t) || await describeFetchError(null, genRes, t));

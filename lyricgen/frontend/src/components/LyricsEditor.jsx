@@ -982,9 +982,11 @@ export default function LyricsEditor({
   const [saveErrorReason, setSaveErrorReason] = useState(null);
   const [flushCounter, setFlushCounter] = useState(0);
   const [durableHydrated, setDurableHydrated] = useState(false);
-  const [durableConflict, setDurableConflict] = useState(false);
   const saveConflictRef = useRef(false);
-  saveConflictRef.current = durableConflict || saveStatus === "conflict";
+  // Version reconciliation is intentionally silent. Keep this ref false so
+  // navigation/unload protection never suppresses a normal autosave because
+  // another write merely advanced the revision.
+  saveConflictRef.current = false;
   const [historyOpen, setHistoryOpen] = useState(false);
   const editedRef = useRef(edited);
   editedRef.current = edited;
@@ -1249,13 +1251,6 @@ export default function LyricsEditor({
   const handleDurableStatus = useCallback((status, reason, metadata = {}) => {
     setSaveStatus(status);
     setSaveErrorReason(reason);
-    if (status === "conflict") setDurableConflict(true);
-    // Un guardado exitoso CIERRA el conflicto. Sin esto, tras recuperarse
-    // el chip decía "Guardado ✓" pero `durableConflict` seguía en true: el
-    // banner (y con él el botón) desaparecía, el autosave quedaba
-    // desarmado, "Guardar" no tocaba la red y Aprobar seguía bloqueado —
-    // el operador terminaba MÁS trabado que antes, y en silencio.
-    if (status === "saved") setDurableConflict(false);
     if (status === "saved") {
       // Cuántos fallos hicieron falta antes de que este guardado saliera. Es
       // el dato que faltaba para distinguir "hipo transitorio que se recuperó
@@ -1283,17 +1278,6 @@ export default function LyricsEditor({
           retry_count: 0,
         });
       }
-    }
-    if (status === "conflict") {
-      autosaveFailStreakRef.current = 0;
-      // El fallo MÁS grave (el que deja al operador trabado) no se contaba:
-      // `editor_conflict` estaba en el allowlist pero se había quedado sin
-      // emisor, así que la métrica eran fósiles. Sin esto no se puede medir si
-      // los conflictos falsos efectivamente desaparecen.
-      trackEditorEvent("editor_conflict", {
-        checkpoint: metadata.checkpoint || "draft",
-        reason: reason || "conflict",
-      });
     }
     if (status === "saved" && draftKey) {
       // El snapshot confirmado se capturó hasta 800 ms (draft) o 5 s
@@ -1328,13 +1312,10 @@ export default function LyricsEditor({
     setEdited(reseedPreservingIds(editedRef.current, mergedSegments));
     setIsDirty(true);
   }, []);
-  const { flush: flushDurableSave, forceRecover: forceDurableRecover } = useEditorAutosave({
+  const { flush: flushDurableSave } = useEditorAutosave({
     enabled: editorV2Enabled && durableHydrated && !durableEditor.loading,
     segments: durableSegments,
     dirty: isDirty,
-    // Independent revision changes rebase transparently. A same-line 409 is
-    // preserved locally and never retried over the server version.
-    blocked: durableConflict,
     save: durableEditor.save,
     reconcile: durableEditor.reconcile,
     onStatus: handleDurableStatus,
@@ -1356,7 +1337,6 @@ export default function LyricsEditor({
     durableHydratedJobRef.current = transcribeJobId;
     let cancelled = false;
     const hydrate = async () => {
-      setDurableConflict(false);
       const remote = sanitizeSegments(durableEditor.document.segments || []);
       const remoteOriginal = sanitizeSegments(durableEditor.document.original_segments || remote);
       originalSegmentsRef.current = remoteOriginal;
@@ -1430,11 +1410,7 @@ export default function LyricsEditor({
                 const merged = mergeThreeWay(baseSegments, local, remote);
                 next = merged.merged;
                 markDirty = !segmentsEquivalent(next, remote);
-                if (markDirty && merged.conflicts.length) {
-                  setDurableConflict(true);
-                  setSaveStatus("conflict");
-                  setSaveErrorReason("conflict");
-                } else if (markDirty) setSaveStatus("local");
+                if (markDirty) setSaveStatus("local");
                 else localStorage.removeItem(draftKey);
               }
             }
@@ -1695,23 +1671,6 @@ export default function LyricsEditor({
       persistOpts,
     });
   }, [disableAutosave, editorV2Enabled, flushDurableSave, onPersistSegments, transcribeJobId]);
-
-  // Recuperación explícita del estado `conflict`, que antes era terminal: el
-  // autosave quedaba desarmado y "Guardar" retornaba sin tocar la red, así que
-  // el operador clickeaba un botón que no hacía nada. Vuelve a leer el
-  // documento remoto y hace merge de 3 vías ANTES de escribir, así que nunca
-  // pisa la edición de otro; si el conflicto es real, el banner mantiene la
-  // opción de recargar.
-  const [recoveringConflict, setRecoveringConflict] = useState(false);
-  const recoverFromConflict = useCallback(async () => {
-    if (!editorV2Enabled || recoveringConflict) return;
-    setRecoveringConflict(true);
-    try {
-      await forceDurableRecover("manual");
-    } finally {
-      setRecoveringConflict(false);
-    }
-  }, [editorV2Enabled, forceDurableRecover, recoveringConflict]);
 
   // PR E (2026-07): acá vivía el espejo sincrónico por keystroke
   // (onEditedChange → App.setCurrentReview). Eliminado — era la mitad del
@@ -3566,41 +3525,12 @@ export default function LyricsEditor({
   const [isApproving, setIsApproving] = useState(false);
 
   const runApprove = async ({ skipWrapWarning = false } = {}) => {
-    if (pendingQualityReview) {
-      toast({
-        message: t("editor.quality_pending_approval")
-          || "El análisis de calidad todavía está terminando. Tus cambios están a salvo; esperá un instante antes de generar.",
-        tone: "info",
-      });
-      return;
-    }
-    if (fatalQualityFailure) {
-      toast({
-        message: t("editor.quality_retry_failed")
-          || "El análisis de calidad falló y no puede confirmarse manualmente. Reintentá la transcripción.",
-        tone: "error",
-      });
-      return;
-    }
-    if (unconfirmedUnsafeWindows.length > 0) {
-      jumpToUnsafeWindow(unconfirmedUnsafeWindows[0]);
-      toast({
-        message: (t("editor.quality_approval_required") || "Confirmá las {count} zonas inseguras antes de generar.")
-          .replace("{count}", unconfirmedUnsafeWindows.length),
-        tone: "info",
-      });
-      return;
-    }
     if (editorV2Enabled && (!durableHydrated || durableEditor.loading)) {
       toast({ message: "Estamos cargando la última versión. Esperá un instante para aprobar.", tone: "info" });
       return;
     }
     if (saveErrorReason === "draft-corrupt") {
       toast({ message: "Descartá o recuperá manualmente el borrador local antes de aprobar.", tone: "error" });
-      return;
-    }
-    if (durableConflict || saveStatus === "conflict") {
-      toast({ message: "Hay un cambio en conflicto. Compará la última versión antes de aprobar; no sobrescribimos cambios ajenos.", tone: "error" });
       return;
     }
     // Aviso (no bloqueo) si el último autosave falló. IMPORTANTE — contrato
@@ -3631,15 +3561,11 @@ export default function LyricsEditor({
     const correctionSummary = summarizeOperatorCorrections(
       originalSegmentsRef.current || [], cleaned || [],
     );
-    // Any operator approval of a quality-evaluated job is explicit. Persist
-    // it even when the machine originally passed: autosave may have advanced
-    // the revision (or a sanitizer may have changed a few milliseconds), and
-    // a verdict from the previous revision must never authorize the new one.
-    // Shadow/observe must be operationally invisible. Only an effective
-    // enforce payload asks the acknowledgement endpoint to bind a review.
-    const qualityAcknowledged = Boolean(
-      transcriptionQuality && transcriptionQuality?.mode === "enforce"
-    );
+    // Quality remains a diagnostic: it highlights uncertain passages but
+    // never turns the editor into a mandatory review workflow. The final
+    // render uses the operator's saved lyrics, regardless of whether the
+    // asynchronous quality analysis has finished.
+    const qualityAcknowledged = false;
     const approvalTelemetry = {
       ...correctionSummary,
       duration_ms: Math.max(0, Date.now() - editorSessionStartedAtRef.current),
@@ -3682,9 +3608,7 @@ export default function LyricsEditor({
       const saveResult = await flushDurableSave("manual", cleanedForPersistence);
       if (saveResult?.ok === false) {
         toast({
-          message: saveResult.reason === "conflict"
-            ? "Hay un cambio en conflicto. Tus cambios siguen en pantalla y no sobrescribimos la versión guardada."
-            : "Tus cambios siguen en pantalla. Reintentamos el guardado automáticamente.",
+          message: "Tus cambios siguen en pantalla. Reintentamos el guardado automáticamente.",
           tone: "info",
         });
         return;
@@ -3710,11 +3634,6 @@ export default function LyricsEditor({
         // every retry still goes through the backend revision check.
         const reconciled = await durableEditor.reconcile(persistenceSnapshot);
         if (!reconciled?.ok) {
-          if (reconciled?.reason === "conflict") {
-            setDurableConflict(true);
-            setSaveStatus("conflict");
-            setSaveErrorReason("conflict");
-          }
           break;
         }
         if (Array.isArray(reconciled.mergedSegments)) {
@@ -4060,9 +3979,9 @@ export default function LyricsEditor({
               : (submitLabel || (isBatch
                 ? (t("editor.approve_next") || "Aprobar y continuar")
                 : (t("editor.approve_generate") || "Aprobar y generar")))}
-            aria-describedby={pendingQualityReview || unconfirmedUnsafeWindows.length > 0 ? "transcription-quality-review" : undefined}
+            aria-describedby={qualityGuidanceAvailable ? "transcription-quality-review" : undefined}
             data-quality-status={qualityAnalysisPending ? "analysis_pending" : (transcriptionQuality?.decision || undefined)}
-            data-quality-review-required={pendingQualityReview || unconfirmedUnsafeWindows.length > 0 ? "true" : "false"}
+            data-quality-review-required="false"
             data-tour="editor-approve-floating"
             className="editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl bg-gradient-to-r from-brand to-brand-light px-5 text-sm font-semibold text-white shadow-xl shadow-brand/25 transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60"
           >
@@ -4252,38 +4171,20 @@ export default function LyricsEditor({
           del audio bar lo hace imposible de perder.
           (Timeline view ya tiene el chip embedded en su header,
           LyricsTimeline.jsx:354+) */}
-      {["error", "offline", "conflict"].includes(saveStatus) && (
+      {["error", "offline"].includes(saveStatus) && (
         <div className="mb-3 rounded-card px-4 py-3 flex items-center gap-3 animate-fade-in ring-1 bg-red-500/10 ring-red-500/30">
           <svg className="w-4 h-4 shrink-0 text-red-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <path d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zM12 15.75h.01" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
           <div className="flex-1 min-w-0">
             <p className="text-[12px] text-red-300 font-medium">
-              {saveStatus === "conflict"
-                ? t("editor.save_conflict_short", "Hay un cambio en conflicto. Tus cambios siguen en esta pestaña y no sobrescribimos la versión guardada.")
-                : (_SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server).short}
+              {(_SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server).short}
             </p>
             <p className="text-[10px] text-red-300/70 mt-0.5">
-              {saveStatus === "conflict"
-                ? t("editor.save_conflict_detail", "Recargá para comparar la última versión antes de decidir qué conservar.")
-                : (_SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server).detail}
+              {(_SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server).detail}
             </p>
           </div>
-          {saveStatus === "conflict" ? (
-            <div className="flex shrink-0 gap-2">
-              <button
-                type="button"
-                onClick={recoverFromConflict}
-                disabled={recoveringConflict}
-                className="text-[11px] text-red-200 hover:text-white bg-red-500/20 hover:bg-red-500/30 rounded-lg px-3 py-1.5 transition-colors disabled:opacity-50"
-                title={t("editor.save_conflict_retry_title", "Vuelve a leer la última versión y combina tus cambios antes de guardar")}
-              >
-                {recoveringConflict
-                  ? t("editor.save_conflict_retrying", "Combinando…")
-                  : t("editor.save_conflict_retry", "Combinar y reintentar")}
-              </button>
-            </div>
-          ) : <div className="flex shrink-0 gap-2">
+          <div className="flex shrink-0 gap-2">
             {saveErrorReason === "draft-corrupt" ? (
               <button
                 type="button"
@@ -4299,14 +4200,14 @@ export default function LyricsEditor({
             ) : (
               <button
                 type="button"
-                onClick={() => (durableConflict ? recoverFromConflict() : flushPendingSave())}
+                onClick={() => flushPendingSave()}
                 className="text-[11px] text-red-200 hover:text-white bg-red-500/20 hover:bg-red-500/30 rounded-lg px-3 py-1.5 transition-colors"
                 title="Forzar reintento de guardado"
               >
                 Reintentar
               </button>
             )}
-          </div>}
+          </div>
         </div>
       )}
 

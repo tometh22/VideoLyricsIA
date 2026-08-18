@@ -9315,15 +9315,24 @@ async def generate_with_segments(
             tenant_id=str(job_row.tenant_id or ""),
         )
         if not _quality_ok:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "code": _quality_reason,
-                    "detail": "La transcripción tiene zonas inseguras que deben revisarse antes de renderizar.",
-                    "transcription_quality": job_row.transcription_quality,
-                    "current_revision": current_revision,
+            # Quality analysis is advisory. A stale/pending model verdict must
+            # never prevent an operator from rendering the lyrics they just
+            # edited. Preserve the signal for observability, but do not turn
+            # it into a 409 or a second approval flow.
+            logger.warning(
+                "[TRANSCRIPTION-QUALITY] allowing render with advisory result",
+                extra={
+                    "job_id": job_id,
+                    "tenant_id": str(job_row.tenant_id or ""),
+                    "revision": current_revision,
+                    "reason": _quality_reason,
                 },
             )
+            try:
+                from ops_metrics import increment
+                increment("transcription_quality_render_advisory")
+            except Exception:
+                pass
         if editor_metrics_json:
             try:
                 _editor_metrics = json.loads(editor_metrics_json)
