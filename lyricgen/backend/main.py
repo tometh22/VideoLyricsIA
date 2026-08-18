@@ -5972,6 +5972,7 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             "CTC_ALIGN_MIX_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
         retimed = None
         _stem_structural = False
+        _short_motif_decline = False
         if _stem:
             retimed = await asyncio.wait_for(
                 asyncio.to_thread(_ctc.retime_segments, _stem, segs, job_id,
@@ -5982,6 +5983,10 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             # ESTE call corrió — sin stem quedaría el valor del job anterior.
             _stem_structural = (retimed is None
                                 and _ctc.last_decline_reason == "structural")
+            _short_motif_decline = (
+                retimed is None
+                and _ctc.last_decline_reason == "short_repeated_motif"
+            )
         elif not _mix_fallback:
             logger.info("[CTC] no cached stem — skipping retime (job=%s)", job_id)
             return result
@@ -6027,10 +6032,15 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
         # mezcla no arregla un libreto que no matchea). También cubre el
         # caso sin stem cacheado (retimed sigue None y nunca corrimos el
         # primer align).
-        if retimed is None and _mix_fallback and not _stem_structural:
+        if (retimed is None and _mix_fallback and not _stem_structural
+                and not _short_motif_decline):
             retimed = await asyncio.wait_for(
                 asyncio.to_thread(_ctc.retime_segments, audio_path, segs, job_id),
                 timeout=420,
+            )
+            _short_motif_decline = (
+                retimed is None
+                and _ctc.last_decline_reason == "short_repeated_motif"
             )
             if retimed:
                 logger.info("[CTC] retime sobre la MEZCLA OK (stem %s, job=%s)",
@@ -6053,6 +6063,24 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             from jobs import set_timing_source
             from timing_sources import CTC_ALIGN
             set_timing_source(job_id, CTC_ALIGN)
+        elif _short_motif_decline:
+            # A compact repeated chant is underdetermined for one global CTC
+            # pass.  Preserve the cascade output and route only the affected
+            # refrain to Quality.  This metadata is intentionally text-free.
+            result = dict(result)
+            postpass = dict(result.get("postpass_stats") or {})
+            postpass["ctc_retime"] = {
+                "declined": True,
+                "reason": "short_repeated_motif",
+                "unsafe_windows": _ctc.short_repeated_motif_windows(segs),
+                "mutated_segments": False,
+            }
+            result["postpass_stats"] = postpass
+            logger.info(
+                "[CTC] compact motif routed to bounded quality windows "
+                "windows=%d job=%s",
+                len(postpass["ctc_retime"]["unsafe_windows"]), job_id,
+            )
     except Exception as e:
         logger.warning("[CTC] retime wrapper declined: %r (job=%s)", e, job_id)
     finally:

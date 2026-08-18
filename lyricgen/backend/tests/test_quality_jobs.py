@@ -11,6 +11,29 @@ from auth import create_user
 from database import Job
 
 
+def test_cardinality_route_does_not_promote_ambiguous_best_path_to_fact():
+    structure = {
+        "best_partition": {"event_count": 8},
+        "cardinality_posterior": {"6": .42, "7": .31, "8": .27},
+        "diagnostics": {"cardinality_credible_counts_90": [6, 7, 8]},
+    }
+    verdict = quality_jobs._cardinality_route(structure, 6)
+    assert verdict["route_disagreement"] is False
+    assert verdict["ambiguous_best_path"] is True
+    assert verdict["automatic_apply_allowed"] is False
+
+
+def test_cardinality_route_requests_review_when_editor_count_is_excluded():
+    structure = {
+        "best_partition": {"event_count": 6},
+        "cardinality_posterior": {"6": .86, "7": .10, "8": .04},
+        "diagnostics": {"cardinality_credible_counts_90": [6, 7]},
+    }
+    verdict = quality_jobs._cardinality_route(structure, 4)
+    assert verdict["route_disagreement"] is True
+    assert verdict["credible_counts_90"] == [6, 7]
+
+
 def test_attested_asr_context_connects_persisted_words_by_independent_family(
         monkeypatch):
     monkeypatch.setenv(

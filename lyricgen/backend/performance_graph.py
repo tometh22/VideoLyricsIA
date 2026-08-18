@@ -994,6 +994,19 @@ def to_legacy_acoustic_structure(graph: PerformanceGraph) -> dict[str, Any]:
         "event_count": len(best_events),
         "events": best_events,
     } if best_events else None
+    cardinality_rows = sorted(
+        ((int(key), float(value)) for key, value in graph.cardinality_posterior.items()),
+        key=lambda item: (-item[1], item[0]),
+    )
+    posterior_mode = cardinality_rows[0][0] if cardinality_rows else 0
+    posterior_mode_probability = cardinality_rows[0][1] if cardinality_rows else 0.0
+    credible_counts, cumulative = [], 0.0
+    for count, probability in cardinality_rows:
+        credible_counts.append(count)
+        cumulative += probability
+        if cumulative >= .90:
+            break
+    best_path_count = len(best_events)
     return {
         "policy_version": graph.policy_version,
         "accepted": bool(best_events),
@@ -1027,6 +1040,13 @@ def to_legacy_acoustic_structure(graph: PerformanceGraph) -> dict[str, Any]:
             "n_best_affects_inference": False,
             "confidence_calibrated": graph.calibrated_confidence is not None,
             "calibration_status": graph.calibration_status,
+            "best_path_count": best_path_count,
+            "posterior_mode_count": posterior_mode,
+            "posterior_mode_probability": round(posterior_mode_probability, 12),
+            "cardinality_credible_counts_90": sorted(credible_counts),
+            "best_path_posterior_mode_disagreement": (
+                best_path_count != posterior_mode
+            ),
         },
     }
 
