@@ -234,13 +234,19 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                 ((r.get("postpass_stats") or {}).get("gap_rescue") or {})
                 .get("view_disagreements") or []
             )
+            _ctc_declines = (
+                ((r.get("postpass_stats") or {}).get("ctc_retime") or {})
+                .get("unsafe_windows") or []
+            )
             c["stem_mix_evidence_disagreements"] = len(_view_disagreements)
+            c["ctc_short_repeated_motif_windows"] = len(_ctc_declines)
             _windows = build_unsafe_windows(
                 r.get("segments") or [], words, voiced_gaps=_vg,
                 independent_words=_independent,
                 lexical_unverified=_lexical_verification["details"],
                 structural_disagreements=_structural_disagreements,
                 evidence_view_disagreements=_view_disagreements,
+                ctc_declines=_ctc_declines,
             )
             cascada = r.get("audio_coverage")
             final = c["audio_coverage"]

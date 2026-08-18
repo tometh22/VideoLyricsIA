@@ -999,6 +999,7 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
             "voiced_gap": 0, "uncovered_asr": 1,
             "independent_uncovered_asr": 1,
             "acoustic_cardinality_disagreement": 1,
+            "ctc_short_repeated_motif": 1,
             "live_lexical_unverified": 2,
             "live_structural_disagreement": 2,
             "independent_text_mismatch": 3, "text_mismatch": 4,
@@ -1099,6 +1100,7 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
             structural_uncertainty = bool(reasons & {
                 "live_structural_disagreement",
                 "acoustic_cardinality_disagreement",
+                "ctc_short_repeated_motif",
                 "voiced_gap",
             })
             text_uncertainty = not normalized_stem or not normalized_mix or (
@@ -1243,13 +1245,17 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                 reasons.intersection({
                     "live_structural_disagreement",
                     "acoustic_cardinality_disagreement",
+                    "ctc_short_repeated_motif",
                 })
                 and bool(gemini_events)
                 and (slow_enabled or structural_hybrid_enabled)
             ):
                 structural_segments = segments
                 if (
-                    "acoustic_cardinality_disagreement" in reasons
+                    reasons.intersection({
+                        "acoustic_cardinality_disagreement",
+                        "ctc_short_repeated_motif",
+                    })
                     and not any(
                         isinstance(item, dict)
                         and item.get("live_structural_suggestion")
@@ -1515,6 +1521,52 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                         "consensus_sources": _evidence.get("sources", []),
                     })
                     stats["lines_inserted"] += 1
+
+        # Cross-occurrence content consensus is deliberately review-only.  It
+        # can repair a one-off chorus hallucination when two other occurrences
+        # agree, but cannot synthesize wording or alter timing.
+        from repetition_consensus import propose_recurrence_corrections
+        recurrence_suggestions = propose_recurrence_corrections(segments)
+        for suggestion in recurrence_suggestions:
+            index = int(suggestion["segment_index"])
+            current = segments[index]
+            a, b = _f(current.get("start")), _f(current.get("end"))
+            matching_windows = [
+                item for item in prepared_windows
+                if _f(item.get("end")) >= a and _f(item.get("start")) <= b
+            ]
+            if not matching_windows:
+                continue
+            proposed = {
+                **dict(current),
+                "text": suggestion["suggested_text"],
+                "review": True,
+                "recurrence_consensus": True,
+            }
+            parent_id = str(
+                matching_windows[0].get("parent_window_id")
+                or matching_windows[0].get("id") or f"recurrence-{index}"
+            )
+            stats["lines_suggested"] += 1
+            stats["quality_proposal_windows"].append(
+                _proposal_candidate_payload(
+                    candidate_id=f"recurrence-{index}",
+                    parent_window_id=parent_id,
+                    start=a, end=b,
+                    reasons={"recurrence_content_disagreement"},
+                    current_segments=[dict(current)],
+                    proposed_segments=[proposed],
+                    source="cross_occurrence_content_consensus",
+                )
+            )
+        stats["recurrence_consensus"] = {
+            "candidates": len(recurrence_suggestions),
+            "proposals": sum(
+                item.get("source") == "cross_occurrence_content_consensus"
+                for item in stats["quality_proposal_windows"]
+            ),
+            "automatic_apply_allowed": False,
+        }
 
         stats["parent_coverage"] = parent_coverage(
             prepared_windows, processed_tile_ids,

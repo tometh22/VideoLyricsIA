@@ -127,6 +127,7 @@ _WINDOW_REASON_PRIORITY = {
     "invalid_timing_range": 100,
     "duplicate_line_starts": 95,
     "live_structural_disagreement": 90,
+    "ctc_short_repeated_motif": 92,
     "event_count": 90,
     "strong_unassigned_vocal_events": 90,
     "provider_timing_collapsed": 95,
@@ -156,6 +157,51 @@ def _prioritize_windows(windows: list[dict]) -> list[dict]:
                 str(window.get("id") or ""))
 
     return sorted((dict(window) for window in windows), key=key)
+
+
+def _cardinality_route(structure: dict, existing_count: int) -> dict:
+    """Decide whether acoustic cardinality truly excludes the editor count.
+
+    The best HSMM path is only one hypothesis.  Routing a destructive
+    structural retry is justified only when the editor count lies outside the
+    exact 90% posterior credible set.  Calibration is still pending, so this
+    function can request review but never authorize mutation.
+    """
+    diagnostics = (structure or {}).get("diagnostics") or {}
+    best_count = int(
+        ((structure or {}).get("best_partition") or {}).get("event_count") or 0
+    )
+    credible = []
+    for value in diagnostics.get("cardinality_credible_counts_90") or []:
+        try:
+            credible.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    posterior = (structure or {}).get("cardinality_posterior") or {}
+    if not credible and posterior:
+        ranked = []
+        for key, value in posterior.items():
+            try:
+                ranked.append((int(key), float(value)))
+            except (TypeError, ValueError):
+                continue
+        cumulative = 0.0
+        for count, probability in sorted(ranked, key=lambda item: (-item[1], item[0])):
+            credible.append(count)
+            cumulative += probability
+            if cumulative >= .90:
+                break
+    excluded = bool(credible and existing_count not in credible)
+    return {
+        "route_disagreement": excluded,
+        "best_count": best_count,
+        "existing_count": int(existing_count),
+        "credible_counts_90": sorted(set(credible)),
+        "ambiguous_best_path": bool(
+            best_count and best_count != existing_count and not excluded
+        ),
+        "automatic_apply_allowed": False,
+    }
 
 
 def _max_windows() -> int:
@@ -526,6 +572,7 @@ _ANALYTICAL_STRING_VALUES = frozenset({
     "declined", "pending", "complete", "failed", "retry_failed",
     "review_required", "transcription_quality", "performance_graph_content_lattice",
     "progressive_asr_consensus", "ctc-phonetic-evidence-v1",
+    "cross_occurrence_content_consensus", "recurrence_content_disagreement",
     "SUNG_LEAD", "SUNG_CROWD", "SPEECH", "NONLEXICAL", "METADATA",
     "CROWD_NOISE", "UNKNOWN", "lexical", "vocalization", "sustained",
     "lexical_plus_vocalization", "source_audio_demucs",
@@ -997,9 +1044,6 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 structure, hit = _cached_structure(
                     cache, audio_hash, stem_hash, stem_path, audio_path, bounded,
                 )
-                best_count = int(
-                    (structure.get("best_partition") or {}).get("event_count") or 0
-                )
                 core_start = float(bounded.get("core_start", bounded.get("start", 0)))
                 core_end = float(bounded.get("core_end", bounded.get("end", core_start)))
                 existing_count = sum(
@@ -1008,11 +1052,13 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                     and float(segment.get("end") or 0) > core_start
                     and float(segment.get("start") or 0) < core_end
                 )
-                if best_count and best_count != existing_count:
+                cardinality = _cardinality_route(structure, existing_count)
+                bounded["acoustic_cardinality"] = cardinality
+                if cardinality["route_disagreement"]:
                     reasons = set(bounded.get("reasons") or [])
                     reasons.add("acoustic_cardinality_disagreement")
                     bounded["reasons"] = sorted(reasons)
-                    bounded["acoustic_phrase_count"] = best_count
+                    bounded["acoustic_phrase_count"] = cardinality["best_count"]
                     bounded["editor_segment_count"] = existing_count
                 best_events = list(
                     (structure.get("best_partition") or {}).get("events") or []

@@ -178,6 +178,105 @@ def _candidate_is_viable(candidate: dict) -> bool:
     )
 
 
+def _align_mapped_events(
+    stem_path: str, mix_path: str, mapped_events: list[dict], *,
+    window_start: float, window_end: float, job_id: str = "",
+    align_fn: Callable | None = None,
+) -> dict:
+    """Localize mapped content inside text-independent acoustic phrases.
+
+    This is timing evidence for an operator-facing proposal, not permission to
+    mutate lyrics.  Stem and mix remain explicitly correlated views.
+    """
+    clean = [dict(event) for event in (mapped_events or []) if isinstance(event, dict)]
+    texts = [str(event.get("text") or "").strip() for event in clean]
+    if not 2 <= len(clean) <= 8 or any(not text for text in texts):
+        return {"accepted": False, "reason": "invalid_mapped_events"}
+    anchors = [float(event.get("acoustic_start", event.get("start"))) for event in clean]
+    bounds = [
+        (
+            float(event.get("acoustic_start", event.get("start"))),
+            float(event.get("acoustic_end", event.get("end"))),
+        )
+        for event in clean
+    ]
+    if align_fn is None:
+        from ctc_align import align_structural_anchors as align_fn
+    stem_ctc = align_fn(
+        stem_path, texts, anchors, window_start, window_end, job_id,
+        event_bounds=bounds,
+    )
+    mix_ctc = align_fn(
+        mix_path, texts, anchors, window_start, window_end, job_id,
+        event_bounds=bounds,
+    )
+    if not stem_ctc or not mix_ctc:
+        return {"accepted": False, "reason": "anchored_ctc_unavailable"}
+    stem_events = list(stem_ctc.get("events") or [])
+    mix_events = list(mix_ctc.get("events") or [])
+    if len(stem_events) != len(clean) or len(mix_events) != len(clean):
+        return {"accepted": False, "reason": "anchored_ctc_cardinality"}
+    stem_starts = np.asarray([float(event["start"]) for event in stem_events])
+    mix_starts = np.asarray([float(event["start"]) for event in mix_events])
+    anchor_values = np.asarray(anchors)
+    stem_support = _ctc_anchor_support(stem_ctc)
+    mix_support = _ctc_anchor_support(mix_ctc)
+    candidate = {
+        "max_phase_delta": float(np.max(np.abs(stem_starts - mix_starts))),
+        "median_phase_delta": float(np.median(np.abs(stem_starts - mix_starts))),
+        "max_anchor_delta": float(np.max(np.abs(stem_starts - anchor_values))),
+        "stem_support_mean": stem_support["mean"],
+        "stem_support_min": stem_support["min"],
+        "mix_support_mean": mix_support["mean"],
+        "mix_support_min": mix_support["min"],
+    }
+    if not _candidate_is_viable(candidate):
+        return {
+            "accepted": False, "reason": "anchored_ctc_disagreement",
+            "metrics": {key: round(float(value), 5)
+                        for key, value in candidate.items()},
+        }
+    proposed = []
+    for index, (mapped, stem_event, mix_event) in enumerate(
+        zip(clean, stem_events, mix_events)
+    ):
+        updated = {**mapped, **stem_event}
+        endpoint_candidates = sorted([
+            float(stem_event.get("end")),
+            float(mix_event.get("end")),
+            float(mapped.get("acoustic_end", mapped.get("end"))),
+        ])
+        display_end = endpoint_candidates[1]
+        if index + 1 < len(clean):
+            next_onset = float(
+                clean[index + 1].get("acoustic_start", clean[index + 1].get("start"))
+            )
+            display_end = min(display_end, next_onset)
+        display_end = max(float(stem_event.get("start")) + .05, display_end)
+        updated.update({
+            "acoustic_start": mapped.get("acoustic_start", mapped.get("start")),
+            "acoustic_end": mapped.get("acoustic_end", mapped.get("end")),
+            "phonetic_end": stem_event.get("end"),
+            "display_end": round(display_end, 3),
+            "display_end_source": "uncalibrated_cross_view_median",
+            "display_end_calibrated": False,
+            "display_end_interval": [
+                round(endpoint_candidates[0], 3),
+                round(endpoint_candidates[-1], 3),
+            ],
+            "mix_ctc_start": mix_event.get("start"),
+            "mix_ctc_end": mix_event.get("end"),
+        })
+        proposed.append(updated)
+    return {
+        "accepted": True, "reason": "anchored_ctc_agreement",
+        "events": proposed,
+        "metrics": {key: round(float(value), 5)
+                    for key, value in candidate.items()},
+        "views_are_correlated": True,
+    }
+
+
 def _window_vocal_regions(path: str, start: float, end: float) -> list[tuple[float, float]]:
     """Fine-grained energy VAD for a bounded structural window."""
     if not path or not os.path.exists(path):
@@ -617,15 +716,28 @@ def verify(stem_path: str, mix_path: str, events: list[dict], *,
             if not mapping.get("events"):
                 stats["reason"] = f"mapping_{mapping.get('reason') or 'declined'}"
                 return stats
+            localized = _align_mapped_events(
+                stem_path, mix_path, mapping["events"],
+                window_start=window_start, window_end=window_end,
+                job_id=job_id,
+            )
+            stats["localized_ctc"] = localized
+            localized_events = (
+                localized.get("events") if localized.get("accepted") else None
+            )
+            proposal_source = localized_events or mapping["events"]
             proposed = []
-            for event in mapping["events"]:
+            for event in proposal_source:
                 proposed.append({
                     **dict(event),
                     "review": True,
                     "consensus_reprocessed": True,
                     "structural_repair": True,
                     "structural_hybrid": True,
-                    "timing_source": "acoustic_dp_ctc_v1",
+                    "timing_source": (
+                        "acoustic_dp_ctc_v1" if localized.get("accepted")
+                        else "acoustic_dp_v1"
+                    ),
                     "acoustic_event_ids": [event.get("id")],
                     "structure_confidence": event.get("confidence"),
                     "mapping_confidence": round(
@@ -637,9 +749,15 @@ def verify(stem_path: str, mix_path: str, events: list[dict], *,
                     ],
                 })
             stats.update({
-                "accepted": bool(mapping.get("accepted")),
-                "reason": "candidate_for_review" if mapping.get("accepted")
-                else str(mapping.get("reason") or "ambiguous_mapping"),
+                "accepted": bool(
+                    mapping.get("accepted") and localized.get("accepted")
+                ),
+                "reason": (
+                    "candidate_for_review"
+                    if mapping.get("accepted") and localized.get("accepted")
+                    else str(mapping.get("reason") or localized.get("reason")
+                             or "ambiguous_mapping")
+                ),
                 "events": proposed,
                 "suggested_events": proposed,
                 # Certification permits an operator-facing suggestion only.

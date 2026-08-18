@@ -208,6 +208,134 @@ def test_topology_first_path_uses_ctc_to_choose_a_distinct_phase(monkeypatch):
     assert verdict["phase_margin"] > 0.3
 
 
+def test_mapped_events_are_localized_in_graph_bounds_on_stem_and_mix():
+    calls = []
+    mapped = [
+        {"id": "p1", "start": 60.7, "end": 63.6,
+         "acoustic_start": 60.7, "acoustic_end": 63.6,
+         "text": "Real uoh uoh"},
+        {"id": "p2", "start": 63.7, "end": 67.0,
+         "acoustic_start": 63.7, "acoustic_end": 67.0,
+         "text": "Real uoh uoh"},
+    ]
+
+    def align(path, texts, anchors, start, end, job_id, *, event_bounds):
+        calls.append((path, texts, anchors, start, end, job_id, event_bounds))
+        offset = .08 if path == "mix.wav" else 0.0
+        return {
+            "events": [{
+                "start": anchor + offset, "end": bound[1],
+                "display_end": bound[1], "text": text,
+                "ctc_score": .70, "words": [],
+            } for text, anchor, bound in zip(texts, anchors, event_bounds)],
+            "mean_score": .70, "median_score": .70, "min_score": .70,
+        }
+
+    result = sh._align_mapped_events(
+        "stem.wav", "mix.wav", mapped,
+        window_start=58.0, window_end=70.0, job_id="safe-id",
+        align_fn=align,
+    )
+    assert result["accepted"] is True
+    assert len(calls) == 2
+    assert calls[0][-1] == [(60.7, 63.6), (63.7, 67.0)]
+    assert result["events"][0]["acoustic_end"] == 63.6
+    assert result["events"][0]["display_end"] == 63.6
+    assert result["events"][0]["display_end_calibrated"] is False
+    assert result["events"][0]["display_end_source"] == (
+        "uncalibrated_cross_view_median"
+    )
+    assert result["events"][0]["display_end_interval"] == [63.6, 63.6]
+
+
+def test_mapped_event_localization_abstains_on_cross_view_phase_disagreement():
+    mapped = [
+        {"start": 10.0, "end": 12.0, "text": "Primera frase"},
+        {"start": 15.0, "end": 17.0, "text": "Segunda frase"},
+    ]
+
+    def align(path, texts, anchors, *_args, **_kwargs):
+        offset = 1.2 if path == "mix.wav" else 0.0
+        return {
+            "events": [{"start": anchor + offset, "end": anchor + 1.5,
+                        "text": text, "ctc_score": .8, "words": []}
+                       for text, anchor in zip(texts, anchors)],
+            "mean_score": .8, "median_score": .8, "min_score": .8,
+        }
+
+    result = sh._align_mapped_events(
+        "stem.wav", "mix.wav", mapped,
+        window_start=8.0, window_end=20.0, align_fn=align,
+    )
+    assert result["accepted"] is False
+    assert result["reason"] == "anchored_ctc_disagreement"
+
+
+def test_display_end_keeps_cross_view_uncertainty_instead_of_claiming_truth():
+    mapped = [
+        {"start": 10.0, "end": 13.0, "acoustic_end": 13.0,
+         "text": "Primera frase larga"},
+        {"start": 15.0, "end": 18.0, "acoustic_end": 18.0,
+         "text": "Segunda frase larga"},
+    ]
+
+    def align(path, texts, anchors, *_args, **_kwargs):
+        ends = [12.0, 17.0] if path == "stem.wav" else [12.8, 17.8]
+        return {
+            "events": [{"start": anchor + (.05 if path == "mix.wav" else 0),
+                        "end": line_end, "text": text,
+                        "ctc_score": .8, "words": []}
+                       for text, anchor, line_end in zip(texts, anchors, ends)],
+            "mean_score": .8, "median_score": .8, "min_score": .8,
+        }
+
+    result = sh._align_mapped_events(
+        "stem.wav", "mix.wav", mapped,
+        window_start=8.0, window_end=20.0, align_fn=align,
+    )
+    assert result["accepted"] is True
+    assert result["events"][0]["display_end"] == 12.8
+    assert result["events"][0]["display_end_interval"] == [12.0, 13.0]
+    assert result["events"][0]["phonetic_end"] == 12.0
+
+
+def test_sheryl_blind_fixture_keeps_rotor_grade_localized_chorus_onsets():
+    # Frozen before ROTOR timings were disclosed; see
+    # .context/sheryl-blind-experiment-2026-08-17.md.
+    acoustic_starts = [166.14, 174.02, 180.18, 188.04]
+    rotor_starts = [166.07, 173.98, 180.11, 187.98]
+    stem_starts = [166.14, 174.03, 180.19, 188.05]
+    mix_starts = [166.48, 174.01, 180.15, 188.05]
+    mapped = [{
+        "start": start, "end": start + 5.2,
+        "acoustic_start": start, "acoustic_end": start + 5.2,
+        "text": f"fixture phrase {index}",
+    } for index, start in enumerate(acoustic_starts)]
+
+    def align(path, texts, _anchors, *_args, **_kwargs):
+        starts = stem_starts if path == "stem.wav" else mix_starts
+        return {
+            "events": [{
+                "start": value, "end": value + 4.6, "text": text,
+                "ctc_score": .44, "words": [],
+            } for value, text in zip(starts, texts)],
+            "mean_score": .44, "median_score": .44, "min_score": .30,
+        }
+
+    result = sh._align_mapped_events(
+        "stem.wav", "mix.wav", mapped,
+        window_start=163.0, window_end=196.0, align_fn=align,
+    )
+    assert result["accepted"] is True
+    errors = sorted(abs(event["start"] - truth) for event, truth in zip(
+        result["events"], rotor_starts,
+    ))
+    assert max(errors) <= .5
+    assert result["metrics"]["max_phase_delta"] == .34
+    assert all(event["display_end_calibrated"] is False
+               for event in result["events"])
+
+
 def test_topology_first_path_abstains_when_phases_are_tied(monkeypatch):
     monkeypatch.setenv("TARGETED_ACOUSTIC_CTC_ENABLED", "1")
     hypotheses = [

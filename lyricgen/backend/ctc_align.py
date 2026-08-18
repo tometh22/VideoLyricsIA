@@ -51,6 +51,7 @@ that region.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import time
@@ -356,6 +357,79 @@ def guess_text_lang(lines: list[str]) -> str:
     return "unknown"
 
 
+def short_repeated_motif_runs(
+    lines: list[str], *, min_run: int = 3,
+) -> list[tuple[int, int]]:
+    """Return inclusive index ranges for compact repeated lexical openings.
+
+    The return value intentionally contains indexes only: quality analytics can
+    route the affected audio without persisting lyric text or lexical hashes.
+    Adjacent runs with different openings remain separate so a bounded retry
+    cannot accidentally turn a whole chorus into one periodic motif.
+    """
+    generic = {"no", "oh", "ah", "uh", "eh", "yeah"}
+    runs: list[tuple[int, int]] = []
+    previous = None
+    run_start = 0
+    run = 0
+
+    def flush(end_index: int) -> None:
+        if run >= min_run:
+            runs.append((run_start, end_index))
+
+    for index, line in enumerate(lines or []):
+        tokens = [norm_word(word) for word in str(line or "").split()]
+        tokens = [token for token in tokens if token]
+        opening = tokens[0] if 1 <= len(tokens) <= 4 else None
+        if opening and opening not in generic and opening == previous:
+            run += 1
+            continue
+        flush(index - 1)
+        if opening and opening not in generic:
+            previous = opening
+            run_start = index
+            run = 1
+        else:
+            previous = None
+            run_start = index + 1
+            run = 0
+    flush(len(lines or []) - 1)
+    return runs
+
+
+def short_repeated_motif_windows(
+    segments: list[dict], *, min_run: int = 3, context_seconds: float = 4.0,
+) -> list[dict]:
+    """Build bounded, text-free quality windows for a global motif decline."""
+    indexed_rows = [
+        (index, segment) for index, segment in enumerate(segments or [])
+        if isinstance(segment, dict)
+    ]
+    rows = [segment for _index, segment in indexed_rows]
+    lines = [str(segment.get("text") or "") for segment in rows]
+    windows = []
+    context = max(0.0, min(float(context_seconds), 8.0))
+    for first, last in short_repeated_motif_runs(lines, min_run=min_run):
+        if first < 0 or last >= len(rows):
+            continue
+        try:
+            start = float(rows[first].get("start"))
+            end = float(rows[last].get("end"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            continue
+        windows.append({
+            "start": round(max(0.0, start - context), 3),
+            "end": round(end + context, 3),
+            "reason": "ctc_short_repeated_motif",
+            "segment_indices": [
+                indexed_rows[index][0] for index in range(first, last + 1)
+            ],
+        })
+    return windows
+
+
 def has_short_repeated_motif(lines: list[str], *, min_run: int = 3) -> bool:
     """Detect a compact repeated chant that CTC must not re-time blindly.
 
@@ -366,24 +440,7 @@ def has_short_repeated_motif(lines: list[str], *, min_run: int = 3) -> bool:
     Preserve the ASR timing and let the structural quality pass inspect the
     bounded refrain instead.
     """
-    generic = {"no", "oh", "ah", "uh", "eh", "yeah"}
-    previous = None
-    run = 0
-    for line in lines or []:
-        tokens = [norm_word(word) for word in str(line or "").split()]
-        tokens = [token for token in tokens if token]
-        opening = tokens[0] if 1 <= len(tokens) <= 4 else None
-        if opening and opening not in generic and opening == previous:
-            run += 1
-        elif opening and opening not in generic:
-            previous = opening
-            run = 1
-        else:
-            previous = None
-            run = 0
-        if run >= min_run:
-            return True
-    return False
+    return bool(short_repeated_motif_runs(lines, min_run=min_run))
 
 
 BRIDGE_S = 8.0  # no word lasts 8s; no intra-line silence lasts 8s
@@ -1087,9 +1144,72 @@ def align_structural_window(audio_path: str, texts: list[str], start: float,
         return None
 
 
+def _structural_anchor_slots(
+    anchors: list[float], start: float, end: float,
+    event_bounds: list[tuple[float, float]] | None = None,
+) -> Optional[list[tuple[float, float, float, float]]]:
+    """Plan non-overlapping CTC slots without truncating the final phrase.
+
+    Each tuple is ``slot_start, slot_end, acoustic_start, acoustic_end``.
+    Explicit acoustic bounds come from the text-independent Performance Graph;
+    otherwise the final slot deliberately reaches the bounded analysis-window
+    end and lets CTC's star token absorb trailing non-lyric audio.
+    """
+    points = [float(value) for value in (anchors or [])]
+    start, end = float(start), float(end)
+    if len(points) < 2 or end <= start or any(
+        right <= left for left, right in zip(points, points[1:])
+    ):
+        return None
+    bounds = None
+    if event_bounds is not None:
+        if len(event_bounds) != len(points):
+            return None
+        bounds = []
+        for anchor, pair in zip(points, event_bounds):
+            try:
+                acoustic_start, acoustic_end = map(float, pair)
+            except (TypeError, ValueError):
+                return None
+            if (not math.isfinite(acoustic_start)
+                    or not math.isfinite(acoustic_end)
+                    or acoustic_end <= acoustic_start
+                    or anchor < acoustic_start - 0.75
+                    or anchor > acoustic_end + 0.75):
+                return None
+            bounds.append((acoustic_start, acoustic_end))
+    gaps = [right - left for left, right in zip(points, points[1:])]
+    median_gap = float(sorted(gaps)[max(0, (len(gaps) - 1) // 2)])
+    slots = []
+    for index, anchor in enumerate(points):
+        acoustic_start, acoustic_end = (
+            bounds[index] if bounds is not None
+            else (anchor, points[index + 1] if index + 1 < len(points) else end)
+        )
+        slot_start = max(
+            start,
+            min(anchor, acoustic_start) - min(0.55, median_gap * 0.10),
+        )
+        if index + 1 < len(points):
+            slot_end = min(end, points[index + 1] - 0.18)
+            if bounds is not None:
+                slot_end = min(slot_end, acoustic_end + 0.35)
+        else:
+            # The old ``anchor + .82 * median_gap`` cap clipped sustained
+            # final phrases.  A bounded quality window is safe to consume to
+            # its end; explicit graph bounds tighten it when available.
+            slot_end = end if bounds is None else min(end, acoustic_end + 0.35)
+        if slot_end - slot_start < 1.0:
+            return None
+        slots.append((slot_start, slot_end, acoustic_start, acoustic_end))
+    return slots
+
+
 def align_structural_anchors(audio_path: str, texts: list[str],
                              anchors: list[float], start: float, end: float,
-                             job_id: str = "") -> Optional[dict]:
+                             job_id: str = "", *,
+                             event_bounds: list[tuple[float, float]] | None = None,
+                             ) -> Optional[dict]:
     """Score one text per acoustic cycle in independently bounded slots.
 
     The slots prevent repeated identical text from consuming an earlier cycle
@@ -1132,18 +1252,12 @@ def align_structural_anchors(audio_path: str, texts: list[str],
             wav = torchaudio.functional.resample(wav, sr, SR)
         emission = _emissions(model, wav, blank_id, _star_delta())
         frame_to_s = FRAME / SR
-        median_gap = float(sorted(
-            right - left for left, right in zip(points, points[1:])
-        )[max(0, (len(points) - 2) // 2)])
+        slots = _structural_anchor_slots(points, start, end, event_bounds)
+        if not slots:
+            return None
         events, line_scores = [], []
-        for index, (text, anchor) in enumerate(zip(clean, points)):
-            slot_start = max(start, anchor - min(0.55, median_gap * 0.10))
-            if index + 1 < len(points):
-                slot_end = min(end, points[index + 1] - 0.18)
-            else:
-                slot_end = min(end, anchor + max(2.0, median_gap * 0.82))
-            if slot_end - slot_start < 1.0:
-                return None
+        for text, anchor, slot in zip(clean, points, slots):
+            slot_start, slot_end, acoustic_start, acoustic_end = slot
             lo = max(0, int((slot_start - start) / frame_to_s))
             hi = min(len(emission), int((slot_end - start) / frame_to_s))
             local = emission[lo:hi]
@@ -1175,6 +1289,11 @@ def align_structural_anchors(audio_path: str, texts: list[str],
                 "text": text,
                 "ctc_score": round(float(score), 4),
                 "anchor": round(anchor, 3),
+                "acoustic_start": round(acoustic_start, 3),
+                "acoustic_end": round(acoustic_end, 3),
+                "phonetic_end": round(absolute_end, 3),
+                "display_end": round(absolute_end, 3),
+                "display_end_calibrated": False,
                 "words": [
                     {
                         "word": word,

@@ -182,6 +182,53 @@ def test_short_repeated_motif_declines_before_acoustic_alignment():
     ]) is False
 
 
+def test_short_repeated_motif_runs_are_bounded_and_text_free():
+    lines = [
+        "Verso de apertura", "Real uoh", "Real uoh", "Real uoh",
+        "Puente diferente", "Canta otra vez", "Canta otra vez",
+        "Canta otra vez", "Cierre final",
+    ]
+    assert ctc_align.short_repeated_motif_runs(lines) == [(1, 3), (5, 7)]
+
+
+def test_short_repeated_motif_windows_add_only_bounded_context():
+    segments = [
+        {"text": "Verso largo de apertura", "start": 10.0, "end": 13.0},
+        {"text": "Real uoh", "start": 20.0, "end": 22.0},
+        {"text": "Real uoh", "start": 26.0, "end": 28.0},
+        {"text": "Real uoh", "start": 32.0, "end": 34.0},
+        {"text": "Cierre largo diferente", "start": 40.0, "end": 43.0},
+    ]
+    assert ctc_align.short_repeated_motif_windows(segments) == [{
+        "start": 16.0, "end": 38.0,
+        "reason": "ctc_short_repeated_motif",
+        "segment_indices": [1, 2, 3],
+    }]
+    assert "text" not in ctc_align.short_repeated_motif_windows(segments)[0]
+
+
+def test_structural_anchor_slots_do_not_truncate_final_sustained_phrase():
+    slots = ctc_align._structural_anchor_slots(
+        [54.23, 62.07], 51.0, 69.40,
+    )
+    assert slots is not None
+    assert slots[-1][1] == 69.40
+    # Historical cap would have ended this slot near 68.5 and could be much
+    # earlier for tighter repeated motifs.
+    assert slots[-1][1] - 62.07 > 7.0
+
+
+def test_structural_anchor_slots_use_independent_acoustic_end_when_available():
+    slots = ctc_align._structural_anchor_slots(
+        [60.85, 63.77, 67.05, 73.18, 75.65, 79.31], 58.0, 86.0,
+        [(60.7, 63.6), (63.7, 66.9), (66.9, 73.0),
+         (73.0, 75.5), (75.5, 75.9), (79.1, 83.27)],
+    )
+    assert slots is not None
+    assert round(slots[-1][1], 3) == 83.62
+    assert all(right[0] >= left[0] for left, right in zip(slots, slots[1:]))
+
+
 def test_retime_declines_short_repeated_motif_before_loading_torch(
     monkeypatch, tmp_path,
 ):

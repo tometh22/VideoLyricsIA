@@ -396,6 +396,47 @@ def test_live_structural_disagreement_opens_contextual_retry_window(monkeypatch)
     assert windows[0]["reasons"] == ["live_structural_disagreement"]
 
 
+def test_ctc_motif_decline_routes_only_text_free_bounded_window(monkeypatch):
+    monkeypatch.setattr("audio_coverage.text_mismatches", lambda *_: [])
+    monkeypatch.setattr("audio_coverage.uncovered_spans", lambda *_: [])
+    windows = tq.build_unsafe_windows(
+        [_segment(20, 22, "private lyric")], [],
+        ctc_declines=[{
+            "start": 17.0, "end": 37.0,
+            "segment_indices": [1, 2, 3],
+            "text": "must not propagate",
+        }],
+    )
+    assert len(windows) == 1
+    assert windows[0]["reasons"] == ["ctc_short_repeated_motif"]
+    assert windows[0]["segment_indices"] == [1, 2, 3]
+    assert "text" not in windows[0]
+
+
+def test_pericos_motif_tile_keeps_trailing_sustained_vocalization(monkeypatch):
+    monkeypatch.setattr("audio_coverage.text_mismatches", lambda *_: [])
+    monkeypatch.setattr("audio_coverage.uncovered_spans", lambda *_: [])
+    from ctc_align import short_repeated_motif_windows
+    from quality_windows import tile_unsafe_windows
+
+    segments = [
+        _segment(60.85, 63.77, "Real wow wow"),
+        _segment(63.77, 67.04, "Real wow wow"),
+        _segment(67.05, 73.17, "Real wow wow"),
+        _segment(73.18, 75.65, "Real wow wow"),
+        _segment(75.65, 75.75, "no"),
+        _segment(79.31, 83.27, "nooooo"),
+    ]
+    windows = tq.build_unsafe_windows(
+        segments, [], ctc_declines=short_repeated_motif_windows(segments),
+    )
+    tiles = tile_unsafe_windows(
+        windows, core_seconds=24.0, context_seconds=3.0,
+        audio_duration=90.0,
+    )
+    assert max(tile["end"] for tile in tiles) >= 83.27
+
+
 def test_live_structural_disagreement_blocks_and_triggers_retry_eligibility():
     quality = tq.evaluate(
         [
