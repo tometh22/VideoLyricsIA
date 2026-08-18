@@ -262,7 +262,18 @@ def timeline_issues(segments: Iterable[dict]) -> dict:
     }
 
 
-def _merge_windows(windows: list[dict], *, pad_s: float = 1.5) -> list[dict]:
+def _merge_windows(
+    windows: list[dict], *, pad_s: float = 1.5, max_span_s: float = 24.0,
+) -> list[dict]:
+    """Merge nearby findings without turning a dense song into one giant alert.
+
+    ``pad_s`` deliberately makes neighbouring findings overlap.  Previously a
+    chain of short, adjacent findings could therefore merge transitively from
+    the first verse to the outro.  The editor then marked every intersecting
+    lyric line as unsafe.  Keep intentionally large source windows intact, but
+    stop *additional* transitive merging once the proposed combined span would
+    exceed ``max_span_s``.
+    """
     ordered = sorted(
         (dict(w) for w in windows if _f(w.get("end")) > _f(w.get("start"))),
         key=lambda w: _f(w.get("start")),
@@ -275,13 +286,30 @@ def _merge_windows(windows: list[dict], *, pad_s: float = 1.5) -> list[dict]:
         indices = set(window.get("segment_indices") or [])
         if window.get("segment_index") is not None:
             indices.add(int(window["segment_index"]))
-        if merged and start <= merged[-1]["end"] + 0.5:
-            merged[-1]["end"] = round(max(merged[-1]["end"], end), 2)
+        proposed_end = max(merged[-1]["end"], end) if merged else end
+        proposed_span = proposed_end - merged[-1]["start"] if merged else 0.0
+        can_merge = (
+            bool(merged)
+            and start <= merged[-1]["end"] + 0.5
+            and (
+                proposed_end <= merged[-1]["end"]
+                or max_span_s <= 0
+                or proposed_span <= max_span_s
+            )
+        )
+        if can_merge:
+            merged[-1]["end"] = round(proposed_end, 2)
             merged[-1]["reasons"] = sorted(set(merged[-1]["reasons"]) | reasons)
             merged[-1]["segment_indices"] = sorted(
                 set(merged[-1]["segment_indices"]) | indices
             )
         else:
+            # Padded source findings can overlap the capped window we just
+            # closed. Do not expose two overlapping review parts to the UI;
+            # assign their shared context to the previous part and continue
+            # the new one at that boundary.
+            if merged and start < merged[-1]["end"]:
+                start = merged[-1]["end"]
             merged.append({
                 "start": round(start, 2), "end": round(end, 2),
                 "reasons": sorted(reasons), "segment_indices": sorted(indices),

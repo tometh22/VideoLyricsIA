@@ -95,7 +95,9 @@ def test_gap_prompt_preserves_explicit_language(stem, monkeypatch):
     )
 
     config = fake.models.generate_content.call_args.kwargs["config"]
-    assert "IDIOMA OBJETIVO: español (es)" in config.system_instruction
+    assert "IDIOMA PRINCIPAL DE CONTEXTO: español (es)" in config.system_instruction
+    assert "idioma ORIGINAL de CADA frase" in config.system_instruction
+    assert "puede alternar idiomas" in config.system_instruction
     assert "no traduzcas" in config.system_instruction.lower()
 
 

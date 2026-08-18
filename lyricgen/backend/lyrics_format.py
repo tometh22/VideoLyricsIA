@@ -21,6 +21,7 @@ import asyncio
 import logging
 import os
 import re
+import unicodedata
 
 logger = logging.getLogger("genly.lyrics_format")
 
@@ -42,6 +43,30 @@ def _lang_name(language: str | None) -> str:
     if not language:
         return "the source language"
     return _LANG_NAMES.get(language.lower()[:3], "the source language")
+
+
+def _lexical_tokens(text: str) -> list[str]:
+    """Return accent-insensitive lexical tokens for mutation safety.
+
+    This formatter is allowed to change capitalization, punctuation and
+    diacritics, but never vocabulary.  Folding accents makes legitimate
+    corrections such as ``fragil`` -> ``frágil`` compare equal while a
+    semantic rewrite such as ``Are you ready`` -> ``Estoy listo`` cannot pass.
+    Apostrophes and hyphens are separators so harmless typography changes do
+    not look like word insertions/deletions.
+    """
+    normalized = unicodedata.normalize("NFKD", str(text or "")).casefold()
+    without_marks = "".join(
+        char for char in normalized if unicodedata.category(char) != "Mn"
+    )
+    # Keep digits: changing a sung number is a semantic rewrite too (for
+    # example ``638`` -> ``780465``), not harmless typography.
+    return re.findall(r"[^\W_]+", without_marks, re.UNICODE)
+
+
+def preserves_lexical_content(original: str, candidate: str) -> bool:
+    """Whether ``candidate`` is only an orthographic rewrite of ``original``."""
+    return _lexical_tokens(original) == _lexical_tokens(candidate)
 
 
 # ── Timestamp assignment ──────────────────────────────────────────────────────
@@ -115,9 +140,13 @@ def _build_prompt(texts: list, lang: str) -> str:
     n = len(texts)
     numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
     return (
-        f"You are correcting song lyric transcription orthography in {lang}.\n\n"
+        "You are correcting song lyric transcription orthography. "
+        f"The primary context may be {lang}, but the song may code-switch.\n"
+        "Preserve the ORIGINAL language of EACH line independently. A line or "
+        "phrase in another language must remain in that language. NEVER "
+        "translate or paraphrase.\n\n"
         "For each numbered line:\n"
-        f"- Fix accents and diacritics appropriate for {lang}\n"
+        "- Fix accents and diacritics appropriate for that line's own language\n"
         "- Capitalize the first word of each line\n"
         "- Fix punctuation (commas, periods, ellipsis)\n"
         "- For Spanish: add inverted opening marks (¿, ¡) where the line is a question or exclamation\n\n"
@@ -222,10 +251,24 @@ async def format_lyrics_pass(result: dict, language: str | None = None) -> dict:
         new_segs: list = []
         n_corrected = 0
         n_split = 0
+        n_rejected = 0
 
         for i, seg in enumerate(segs):
             sub_texts = groups[i + 1]
             original_text = texts[i]
+            candidate_text = " ".join(sub_texts)
+            if not preserves_lexical_content(original_text, candidate_text):
+                # The prompt is not a security boundary.  A language model may
+                # still translate a short code-switched phrase while preserving
+                # numbering, so validate vocabulary before applying anything.
+                # Reject only this line; safe orthographic fixes on other lines
+                # remain useful.
+                logger.warning(
+                    "[FORMAT] rejected lexical rewrite at line %d; keeping source text",
+                    i + 1,
+                )
+                sub_texts = [original_text]
+                n_rejected += 1
 
             if len(sub_texts) == 1:
                 corrected = sub_texts[0]
@@ -241,8 +284,8 @@ async def format_lyrics_pass(result: dict, language: str | None = None) -> dict:
                 new_segs.extend(_split_by_words(seg, sub_texts))
 
         logger.info(
-            "[FORMAT] %s: %d/%d lines corrected",
-            lang, n_corrected, len(segs),
+            "[FORMAT] %s: %d/%d lines corrected, %d lexical rewrite(s) rejected",
+            lang, n_corrected, len(segs), n_rejected,
         )
 
         result = dict(result)

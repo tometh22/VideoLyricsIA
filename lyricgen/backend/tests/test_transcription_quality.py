@@ -710,3 +710,20 @@ def test_v5_window_confirmation_requires_exact_stable_ids():
     assert tq.confirmed_all_windows(quality, ids) is True
     assert tq.confirmed_all_windows(quality, ids[:1]) is False
     assert tq.confirmed_all_windows(quality, [*ids, "made-up"]) is False
+
+
+def test_dense_adjacent_findings_do_not_merge_into_a_whole_song_window():
+    findings = [
+        {"start": float(start), "end": float(start + 3), "reason": "text_mismatch"}
+        for start in range(0, 96, 4)
+    ]
+
+    windows = tq._merge_windows(findings, pad_s=1.5)
+
+    assert len(windows) > 1
+    assert all(window["end"] - window["start"] <= 24.0 for window in windows)
+    assert all(window["reasons"] == ["text_mismatch"] for window in windows)
+    assert all(
+        current["end"] <= following["start"]
+        for current, following in zip(windows, windows[1:])
+    )
