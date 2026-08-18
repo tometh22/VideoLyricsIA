@@ -371,4 +371,16 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
     expect(onApprove).not.toHaveBeenCalled();
     expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({ tone: "error" }));
   });
+
+  it("observe NO enmascara la letra del preview (no hay forma de destapar)", () => {
+    // Reemplazar la letra por "Letra sin confirmar" sólo tiene sentido en
+    // `enforce`, donde existe "Confirmar zona". En `observe` (el modo de
+    // producción) ese botón no existe, así que enmascarar dejaría la letra
+    // oculta sin forma de recuperarla.
+    render(<LyricsEditor {...baseProps({
+      transcriptionQuality: { ...V5_QUALITY, mode: "observe" },
+      disableAutosave: true,
+    })} />);
+    expect(screen.queryByText(/Letra sin confirmar/i)).toBeNull();
+  });
 });
