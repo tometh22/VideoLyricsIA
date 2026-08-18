@@ -9077,6 +9077,16 @@ async def generate_with_segments(
         )
         if (not job_row
                 or job_row.tenant_id != current_user["tenant_id"]):
+            # Do not expose whether a foreign job exists, but leave enough
+            # forensic signal to distinguish a reaped temporary job from a
+            # tenant/session mismatch in production logs.
+            logger.warning(
+                "[GENERATE] job_not_found job_id=%s actor_user_id=%s found=%s tenant_match=%s",
+                job_id,
+                current_user.get("id"),
+                bool(job_row),
+                bool(job_row and job_row.tenant_id == current_user["tenant_id"]),
+            )
             # Stable machine-readable code so the frontend doesn't couple to the
             # HTTP status. `job_not_found` = reaped / cross-tenant / never
             # existed → the client surfaces a "session expired, re-upload" CTA
@@ -9103,7 +9113,16 @@ async def generate_with_segments(
             )
         if editor_version_id or str(editor_revision).strip():
             if not current_user.get("features", {}).get("editor_v2"):
-                raise HTTPException(status_code=404, detail="Job not found.")
+                # This is a deployment/configuration mismatch, not a missing
+                # job. Returning 404 made the client tell operators that their
+                # session had expired and invited them to discard corrections.
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "code": "editor_not_enabled",
+                        "detail": "The durable editor is not enabled for this environment.",
+                    },
+                )
             parsed_editor_revision = None
             if str(editor_revision).strip():
                 try:
