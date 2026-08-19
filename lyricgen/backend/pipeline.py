@@ -17194,7 +17194,7 @@ def _burn_short_text_ass(
     text_contrast: str,
     lyrics_animation: str,
     line_transition: str,
-) -> str | None:
+) -> tuple[str | None, str | None]:
     """Quema la letra del short con LIBASS — el MISMO motor del video.
 
     Incidente UMG Chile 2026-06-11/12 (tercera vuelta): aunque video y
@@ -17214,9 +17214,12 @@ def _burn_short_text_ass(
     16:9) NO se trasladan al frame vertical — el short siempre centra
     (\an5), igual que el comportamiento histórico.
 
-    Devuelve el path del short con texto, o None si la pasada falla (el
-    caller cae al camino moviepy histórico — un short con texto "menos
-    idéntico" es mejor que un short sin letra)."""
+    Devuelve `(path, None)` con el short con texto, o `(None, reason)` si la
+    pasada falla (el caller cae al camino moviepy histórico — un short con
+    texto "menos idéntico" es mejor que un short sin letra). `reason` trae el
+    stderr recortado de ffmpeg o el repr de la excepción, para adjuntarlo al
+    evento de Sentry del fallback y diagnosticar la causa raíz sin tener que
+    correlacionar logs de worker por timestamp."""
     import ass_render as _ass
 
     try:
@@ -17247,15 +17250,20 @@ def _burn_short_text_ass(
         r = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=600, cwd=job_dir)
         if r.returncode != 0 or not os.path.exists(out_tmp):
+            reason = (
+                f"ffmpeg rc={r.returncode}: "
+                f"{(r.stderr or '').strip()[-300:] or '(sin stderr)'}"
+            )
             logger.warning("[SHORT] libass text burn failed (%s) — fallback moviepy",
-                           (r.stderr or "")[-300:])
-            return None
+                           reason)
+            return None, reason
         logger.info("[SHORT] texto quemado con libass (font=%s anim=%s)",
                     os.path.basename(font_path), lyrics_animation)
-        return out_tmp
+        return out_tmp, None
     except Exception as e:
-        logger.warning("[SHORT] libass text pass errored (%s) — fallback moviepy", e)
-        return None
+        reason = f"{type(e).__name__}: {e}"
+        logger.warning("[SHORT] libass text pass errored (%s) — fallback moviepy", reason)
+        return None, reason
 
 
 def _pick_energy_window(mp3_path: str, duration: float, window_sec: float = 30.0) -> float:
@@ -17470,7 +17478,7 @@ def generate_short(
             style=style, custom_colors=custom_colors,
         )
 
-    burned = _burn_short_text_ass(
+    burned, libass_error = _burn_short_text_ass(
         bg_only_path, window_segments, job_dir, short_dur, fps,
         font_path=font,
         text_case=text_case, font_scale=font_scale,
@@ -17492,6 +17500,11 @@ def generate_short(
                 _job_tag = os.path.basename(job_dir.rstrip("/"))
                 _scope.fingerprint = ["short-libass-fallback"]
                 _scope.set_tag("job_id", _job_tag)
+                # Adjuntar el motivo del fallo de libass (stderr de ffmpeg o
+                # repr de la excepción) para diagnosticar la causa raíz sin
+                # correlacionar logs de worker por timestamp.
+                if libass_error:
+                    _scope.set_extra("libass_error", libass_error)
                 sentry_sdk.capture_message(
                     f"[SHORT-FALLBACK] {_job_tag}: la pasada libass falló — el short "
                     "salió con el motor moviepy (tipografía puede diferir del video)",
