@@ -8,6 +8,13 @@ import { IS_PRODUCTION, APP_ENV } from "./env";
 import { fetchWithTimeout } from "./fetchWithTimeout";
 import { uploadFileToR2 } from "./r2Upload";
 import * as wizardPersistence from "./wizardPersistence";
+import {
+  AUTH_REFRESH_LEASE_MS,
+  AUTH_REFRESH_MIN_INTERVAL_MS,
+  acquireAuthRefreshLease,
+  releaseAuthRefreshLease,
+  shouldRefreshToken,
+} from "./lib/authRefresh";
 import LoginPage from "./components/LoginPage";
 import Sidebar from "./components/Sidebar";
 import GlobalTopbar from "./components/GlobalTopbar";
@@ -1556,6 +1563,8 @@ export default function App() {
 
   const [token, setToken] = useState(getToken());
   const [user, setUser] = useState(getUser());
+  const authRefreshInFlight = useRef(null);
+  const authRefreshLastAt = useRef(0);
   const [files, setFiles] = useState([]);
   // Ref que espeja `files` para que callbacks sin dependencias (ej.
   // handleUploadAdvance en un setTimeout) lean el estado actual sin re-render
@@ -2321,13 +2330,17 @@ export default function App() {
     const onStorage = (e) => {
       if (e.key === "genly_token" && e.newValue === null && token) {
         handleLogout("expired");
+      } else if (e.key === "genly_token" && e.newValue && e.newValue !== token) {
+        // Another tab may have refreshed the session. Adopt its token so all
+        // tabs share one refresh and do not stampede /auth/refresh.
+        setToken(e.newValue);
       }
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
   }, [token, handleLogout]);
 
-  // Proactively refresh the JWT when it has less than 1 day left, so users
+  // Proactively refresh the JWT when it has less than 6 hours left, so users
   // with active sessions never hit a sudden 401 mid-session. Runs once per
   // token value (i.e. on load and whenever a fresh token is stored).
   //
@@ -2353,8 +2366,17 @@ export default function App() {
     if (!exp) return;
     const secondsLeft = exp - Math.floor(Date.now() / 1000);
     const alreadyExpired = secondsLeft <= 0;
-    if (!alreadyExpired && secondsLeft > 86400) return;
-    authFetch(`${API}/auth/refresh`, { method: "POST" })
+    if (!alreadyExpired && !shouldRefreshToken(secondsLeft)) return;
+    if (authRefreshInFlight.current) return;
+    const now = Date.now();
+    if (now - authRefreshLastAt.current < AUTH_REFRESH_MIN_INTERVAL_MS) return;
+    const lease = acquireAuthRefreshLease(
+      typeof window !== "undefined" ? window.localStorage : null,
+      now,
+    );
+    if (!lease) return;
+    authRefreshLastAt.current = now;
+    const request = authFetch(`${API}/auth/refresh`, { method: "POST" })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`refresh ${r.status}`))))
       .then((data) => {
         if (data?.token) {
@@ -2374,7 +2396,18 @@ export default function App() {
           // devtools but don't disrupt the session.
           console.warn("[auth] preemptive refresh failed (will retry on next mount):", err?.message);
         }
+      })
+      .finally(() => {
+        // Keep the cross-tab lease alive briefly after success so sibling
+        // tabs can receive the storage event with the fresh token before
+        // another one is allowed to claim the lock.
+        window.setTimeout(() => releaseAuthRefreshLease(
+          typeof window !== "undefined" ? window.localStorage : null,
+          lease,
+        ), AUTH_REFRESH_LEASE_MS);
+        authRefreshInFlight.current = null;
       });
+    authRefreshInFlight.current = request;
   }, [token, handleLogout]);
 
   // `historyError` lets the dashboard surface a "connection failed,

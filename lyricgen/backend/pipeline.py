@@ -17235,24 +17235,42 @@ def _burn_short_text_ass(
 
         out_tmp = os.path.join(job_dir, "short_ass_tmp.mp4")
         # Mismo escaping canónico que el burn del video (fx_compositor).
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-i", os.path.basename(bg_short_path),
-            "-vf", f"subtitles=short_lyrics.ass:fontsdir={_ffmpeg_filter_escape(font_dir)}",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "copy", "-movflags", "+faststart",
-            "-r", str(fps), os.path.basename(out_tmp),
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=600, cwd=job_dir)
-        if r.returncode != 0 or not os.path.exists(out_tmp):
-            logger.warning("[SHORT] libass text burn failed (%s) — fallback moviepy",
-                           (r.stderr or "")[-300:])
-            return None
-        logger.info("[SHORT] texto quemado con libass (font=%s anim=%s)",
-                    os.path.basename(font_path), lyrics_animation)
-        return out_tmp
+        # MoviePy normally leaves an AAC stream that can be copied, but some
+        # source/container combinations make ffmpeg reject that stream while
+        # building the subtitle output (the observed "Invalid argument" path).
+        # Retry once with a bounded AAC encode before paying the much slower
+        # ImageMagick/MoviePy fallback cost.
+        audio_modes = (
+            ["-c:a", "copy"],
+            ["-c:a", "aac", "-b:a", "192k"],
+        )
+        last_error = "unknown error"
+        for audio_args in audio_modes:
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", os.path.basename(bg_short_path),
+                "-vf", f"subtitles=short_lyrics.ass:fontsdir={_ffmpeg_filter_escape(font_dir)}",
+                "-map", "0:v:0", "-map", "0:a:0",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-pix_fmt", "yuv420p",
+                *audio_args, "-movflags", "+faststart", "-shortest",
+                "-r", str(fps), os.path.basename(out_tmp),
+            ]
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=600, cwd=job_dir)
+            if r.returncode == 0 and os.path.exists(out_tmp):
+                logger.info("[SHORT] texto quemado con libass (font=%s anim=%s audio=%s)",
+                            os.path.basename(font_path), lyrics_animation,
+                            "copy" if audio_args[1] == "copy" else "aac-reencode")
+                return out_tmp
+            last_error = (r.stderr or "")[-300:]
+            try:
+                os.unlink(out_tmp)
+            except OSError:
+                pass
+        logger.warning("[SHORT] libass text burn failed (%s) — fallback moviepy",
+                       last_error)
+        return None
     except Exception as e:
         logger.warning("[SHORT] libass text pass errored (%s) — fallback moviepy", e)
         return None
