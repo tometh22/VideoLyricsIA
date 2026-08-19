@@ -139,6 +139,52 @@ def test_edit_smoke_accepts_fail_closed_quality_gate_in_staging(monkeypatch):
     assert edit_smoke.main() == 0
 
 
+def test_edit_smoke_accepts_asynchronous_quality_gate_in_staging(monkeypatch):
+    segments = [{"start": 0.0, "end": 1.0, "text": "smoke"}]
+    posts = []
+
+    def post(url, **kwargs):
+        posts.append(url)
+        if url.endswith("/auth/login"):
+            return _Response({"token": "test-token"})
+        if url.endswith("/upload-url"):
+            return _Response({
+                "job_id": "qualitysmoke3",
+                "upload_url": "https://r2.example/upload",
+                "use_multipart": False,
+            })
+        if url.endswith("/transcribe-uploaded"):
+            return _Response({"status": "transcribing"})
+        if url.endswith("/generate"):
+            return _Response({"status": "queued"})
+        raise AssertionError(f"unexpected POST {url}")
+
+    def get(url, **kwargs):
+        if url.endswith("/transcription-status/qualitysmoke3"):
+            return _Response({"status": "transcribed", "segments": segments})
+        if url.endswith("/status/qualitysmoke3"):
+            return _Response({
+                "status": "transcribed_pending",
+                "current_step": "quality_review",
+                "progress": 20,
+                "error": "transcription_quality_review_required",
+            })
+        raise AssertionError(f"unexpected GET {url}")
+
+    _install_common_smoke_mocks(monkeypatch, post, get)
+    monkeypatch.setattr(
+        edit_smoke.sys,
+        "argv",
+        [
+            "edit_smoke", "--api-url", "https://api.example",
+            "--allow-quality-gate-block",
+        ],
+    )
+
+    assert edit_smoke.main() == 0
+    assert not any(url.endswith("/save-segments") for url in posts)
+
+
 def test_edit_smoke_does_not_hide_unknown_generate_conflict(monkeypatch):
     segments = [{"start": 0.0, "end": 1.0, "text": "smoke"}]
 
