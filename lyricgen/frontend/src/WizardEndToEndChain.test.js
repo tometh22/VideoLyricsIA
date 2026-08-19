@@ -32,10 +32,18 @@ function _approvedJobFromReview(r, editedSegments, bgCacheKey) {
     backgroundHint: r.backgroundHint || "",
     bgVerbatim: !!r.bgVerbatim,
     textCase: r.textCase || "upper",
+    frameFormat: r.frameFormat || "full",
     fontScale: r.fontScale || "1.0",
     lyricsAnimation: r.lyricsAnimation || "none",
     lineTransition: r.lineTransition || "none",
     textContrast: r.textContrast || "medium",
+    lyricColor: r.lyricColor || "#FFFFFF",
+    lyricSungColor: r.lyricSungColor || "#FFFFFF",
+    titleTemplate: r.titleTemplate || "auto",
+    titleSize: r.titleSize || "1.0",
+    titleArtistFont: r.titleArtistFont || "",
+    titleSongFont: r.titleSongFont || "",
+    titleSongBreak: r.titleSongBreak || "",
     segments: editedSegments,
     segmentsRevision: Number.isInteger(r.segmentsRevision) ? r.segmentsRevision : 0,
     editorRevision: Number.isInteger(r.editorRevision) ? r.editorRevision : null,
@@ -73,10 +81,18 @@ function _formDataFromJob(job, delivery, style, customColors, bg, inspiredByLyri
     if (job.bgVerbatim) f["bg_verbatim"] = "true";
   }
   f["text_case"] = job.textCase || "upper";
+  f["frame_format"] = job.frameFormat || "full";
   f["font_scale"] = String(job.fontScale || "1.0");
   f["lyrics_animation"] = job.lyricsAnimation || "none";
   f["line_transition"] = job.lineTransition || "none";
+  f["lyric_color"] = job.lyricColor || "#FFFFFF";
+  f["lyric_sung_color"] = job.lyricSungColor || "#FFFFFF";
   f["text_contrast"] = job.textContrast || "medium";
+  f["title_template"] = job.titleTemplate || "auto";
+  f["title_size"] = String(job.titleSize || "1.0");
+  f["title_artist_font"] = job.titleArtistFont || "";
+  f["title_song_font"] = job.titleSongFont || "";
+  f["title_song_break"] = job.titleSongBreak || "";
   f["match_lyrics"] = inspiredByLyrics ? "true" : "false";
   if (job.bgCacheKey) {
     f["bg_cache_key"] = job.bgCacheKey;
@@ -114,10 +130,18 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
       backgroundHint: "una galaxia con nebulosa morada",
       bgVerbatim: true,
       textCase: "upper",
+      frameFormat: "cinematic",
       fontScale: "1.15",
       lyricsAnimation: "karaoke",
       lineTransition: "slide_up",
       textContrast: "strong",
+      lyricColor: "#00FF00",
+      lyricSungColor: "#FF00FF",
+      titleTemplate: "lower_third",
+      titleSize: "1.25",
+      titleArtistFont: "montserrat-bold",
+      titleSongFont: "playfair",
+      titleSongBreak: "Viejas\nLocas",
     transcribeJobId: "abc123",
     segmentsRevision: 7,
     editorRevision: 7,
@@ -147,8 +171,16 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
     // Lyrics typography
     expect(fd.font).toBe("anton");
     expect(fd.text_case).toBe("upper");
+    expect(fd.frame_format).toBe("cinematic");
     expect(fd.font_scale).toBe("1.15");
     expect(fd.text_contrast).toBe("strong");
+    expect(fd.lyric_color).toBe("#00FF00");
+    expect(fd.lyric_sung_color).toBe("#FF00FF");
+    expect(fd.title_template).toBe("lower_third");
+    expect(fd.title_size).toBe("1.25");
+    expect(fd.title_artist_font).toBe("montserrat-bold");
+    expect(fd.title_song_font).toBe("playfair");
+    expect(fd.title_song_break).toBe("Viejas\nLocas");
 
     // Lyrics motion
     expect(fd.lyrics_animation).toBe("karaoke");
