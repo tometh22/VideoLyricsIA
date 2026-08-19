@@ -17,11 +17,11 @@ from database import Job as JobModel
 from tests.conftest import auth
 
 
-def _register(client, prefix):
+def _register(client, prefix, domain="test.com"):
     username = f"{prefix}_{uuid.uuid4().hex[:6]}"
     r = client.post("/auth/register", json={
         "username": username, "password": "testpass12345",
-        "email": f"{username}@test.com",
+        "email": f"{username}@{domain}",
     })
     assert r.status_code == 200, r.text
     token = r.json()["token"]
@@ -62,6 +62,48 @@ def test_admin_history_is_cross_tenant(client, admin_token, db):
         ids = {j["job_id"] for j in res.json()}
         assert seeded[0] in ids
         assert seeded[1] in ids  # antes: solo tenant "default" → faltaba
+    finally:
+        _cleanup(db, seeded)
+
+
+# ---------------------------------------------------------------------------
+# Filtro de cuentas sintéticas en el Historial cross-tenant de admin (bug
+# real, 2026-08-19): staging.genly.pro corre bots de preflight/smoke/E2E
+# contra la DB real; un admin viendo Historial global veía el suyo enterrado
+# bajo cientos de filas de esos bots ("no lo encuentro" aunque el job seguía
+# vivo). `test.com` es la convención de la propia suite de tests (arriba,
+# `_register`) y debe seguir visible; los dominios de bots reales de
+# staging (`.local`/`.test`) no.
+# ---------------------------------------------------------------------------
+
+def test_admin_history_excludes_synthetic_domains(client, admin_token, db):
+    _tok, bot_uid, bot_tenant = _register(client, "preflightbot", domain="synthetic.genly.test")
+    seeded = []
+    try:
+        seeded.append(_seed_job(db, "default", 1, "propio"))
+        seeded.append(_seed_job(db, bot_tenant, bot_uid, "bot de smoke test"))
+
+        res = client.get("/jobs", headers={"Authorization": f"Bearer {admin_token}"})
+        assert res.status_code == 200
+        ids = {j["job_id"] for j in res.json()}
+        assert seeded[0] in ids
+        assert seeded[1] not in ids  # el bot no debe tapar el historial humano
+    finally:
+        _cleanup(db, seeded)
+
+
+def test_synthetic_account_still_sees_its_own_history(client, db):
+    # El filtro es solo para la vista GLOBAL de admin — el propio bot (o
+    # cualquier script de CI que use esa cuenta) sigue viendo sus jobs.
+    token, uid, tenant = _register(client, "preflightbot2", domain="synthetic.genly.test")
+    seeded = []
+    try:
+        seeded.append(_seed_job(db, tenant, uid, "bot de smoke test"))
+
+        res = client.get("/jobs", headers=auth(token))
+        assert res.status_code == 200
+        ids = {j["job_id"] for j in res.json()}
+        assert seeded[0] in ids
     finally:
         _cleanup(db, seeded)
 
