@@ -3663,11 +3663,19 @@ export default function App() {
       movementStyle: _rf("movementStyle"), effect: _rf("effect"),
       backgroundHint: _rf("backgroundHint"), bgVerbatim: !!r.bgVerbatim,
       textCase: r.textCase || "upper",
+      frameFormat: r.frameFormat || "full",
       fontScale: r.fontScale || "1.0",
       // lyricTransition + textMotion: deprecados 2026-05-23.
       lyricsAnimation: r.lyricsAnimation || "none",
       lineTransition: r.lineTransition || "none",
       textContrast: r.textContrast || "medium",
+      lyricColor: r.lyricColor || "#FFFFFF",
+      lyricSungColor: r.lyricSungColor || "#FFFFFF",
+      titleTemplate: r.titleTemplate || "auto",
+      titleSize: r.titleSize || "1.0",
+      titleArtistFont: r.titleArtistFont || "",
+      titleSongFont: r.titleSongFont || "",
+      titleSongBreak: r.titleSongBreak || "",
       segments: editedSegments,
       segmentsRevision: Number.isInteger(saveMeta.baseRevision)
         ? saveMeta.baseRevision
