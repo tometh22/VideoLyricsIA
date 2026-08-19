@@ -650,6 +650,24 @@ _BG_PREVIEW_STATUSES = (
     "bg_preview_done", "bg_preview_failed",
 )
 
+# CI/E2E/load-test accounts staging QA scripts create against the real
+# staging DB (not a mocked test DB) — smoke checks, preflight bots, visual
+# regression variants, load-test probes. All are IANA-reserved special-use
+# TLDs (`.local`/`.test`, RFC 6761) or this codebase's own bot-account
+# convention (`golden.local`), so they can never collide with a real
+# customer. Deliberately excludes `test.com`: that's the pytest suite's own
+# `_register`/`_make_user` fixture convention (tests/*.py), so blocking it
+# here would also hide real ephemeral-but-legitimate accounts, not just
+# staging QA noise — see test_admin_history_is_cross_tenant.
+# Incident 2026-08-19: an admin's Historial (cross-tenant global view) was
+# dominated by a preflight bot re-running every few hours, burying a real
+# customer's job under 100+ synthetic rows on the first page — the operator
+# reported "no lo encuentro" even though the job was live and untouched.
+_SYNTHETIC_EMAIL_DOMAINS = (
+    "test.local", "test.genly.local",
+    "pentest.local", "synthetic.genly.test", "golden.local",
+)
+
 
 def get_all_jobs(
     db: Session,
@@ -681,6 +699,15 @@ def get_all_jobs(
     )
     if tenant_id is not None:
         query = query.filter(Job.tenant_id == tenant_id)
+    else:
+        # Cross-tenant admin view only (see _SYNTHETIC_EMAIL_DOMAINS above).
+        # A tenant-scoped read (tenant_id set) never hits this — a synthetic
+        # tenant's own operator (or its CI script) still sees its own jobs.
+        from database import User
+        _synthetic_user_ids = db.query(User.id).filter(
+            or_(*(User.email.ilike(f"%@{d}") for d in _SYNTHETIC_EMAIL_DOMAINS))
+        )
+        query = query.filter(~Job.user_id.in_(_synthetic_user_ids))
     if user_id is not None:
         query = query.filter(Job.user_id == user_id)
     jobs = (
