@@ -1,4 +1,4 @@
-"""Tests for supersede_sibling_drafts — the dedup that removes the orphan
+"""Tests for supersede_sibling_drafts — the dedup that hides the orphan
 draft left when the wizard re-uploads on generate instead of reusing the
 transcribe job (the '2 jobs per video' bug).
 
@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from database import Job, SessionLocal
-from jobs import supersede_sibling_drafts
+from jobs import supersede_sibling_drafts, touch_user_activity
 from tests.conftest import auth
 
 _T = "tenant_dedup_test"
@@ -49,7 +49,15 @@ def _ids(db):
     return {j.job_id for j in db.query(Job).filter(Job.tenant_id == _T).all()}
 
 
-def test_supersede_deletes_recent_sibling_draft():
+def _archived_ids(db):
+    return {
+        j.job_id for j in db.query(Job).filter(
+            Job.tenant_id == _T, Job.archived_at.isnot(None),
+        ).all()
+    }
+
+
+def test_supersede_soft_archives_recent_sibling_draft_without_data_loss():
     db = SessionLocal()
     try:
         _cleanup(db)
@@ -59,7 +67,8 @@ def test_supersede_deletes_recent_sibling_draft():
             db, keep_job_id="keep01", user_id=1, tenant_id=_T, filename="song.mp3",
         )
         assert n == 1
-        assert _ids(db) == {"keep01"}      # orphan deleted, kept stays
+        assert _ids(db) == {"keep01", "orphan01"}
+        assert _archived_ids(db) == {"orphan01"}
     finally:
         _cleanup(db); db.close()
 
@@ -105,7 +114,7 @@ def test_supersede_keeps_actively_edited_sibling():
         _cleanup(db); db.close()
 
 
-def test_supersede_still_deletes_old_untouched_sibling_with_stale_activity():
+def test_supersede_soft_archives_sibling_with_stale_activity():
     """The guard only protects RECENT activity — a draft last edited long ago
     (outside active_within_min) is still a dedup-able orphan."""
     db = SessionLocal()
@@ -121,7 +130,33 @@ def test_supersede_still_deletes_old_untouched_sibling_with_stale_activity():
             filename="song.mp3", active_within_min=10,
         )
         assert n == 1
-        assert _ids(db) == {"keepstale"}
+        assert _ids(db) == {"keepstale", "staleorphan"}
+        assert _archived_ids(db) == {"staleorphan"}
+    finally:
+        _cleanup(db); db.close()
+
+
+def test_explicit_activity_revives_soft_archived_draft():
+    """Whichever upload response the browser continues with must remain usable.
+
+    A second request can archive the first ID before the first response reaches
+    the browser.  An authenticated operation on that explicit ID revives it;
+    unlike the old hard-delete policy, no editor state or R2 reference is lost.
+    """
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        _seed(db, job_id="winner", status="awaiting_upload", filename="song.mp3", age_min=1)
+        _seed(db, job_id="late_resp", status="transcribed_pending",
+              filename="song.mp3", age_min=2)
+        assert supersede_sibling_drafts(
+            db, keep_job_id="winner", user_id=1, tenant_id=_T, filename="song.mp3",
+        ) == 1
+        late = db.query(Job).filter(Job.job_id == "late_resp").one()
+        assert late.archived_at is not None
+        touch_user_activity(db, late)
+        db.commit()
+        assert db.query(Job).filter(Job.job_id == "late_resp").one().archived_at is None
     finally:
         _cleanup(db); db.close()
 
@@ -182,13 +217,14 @@ def test_supersede_misses_when_filename_unsanitized_vs_sibling_sanitized():
               status="queued", filename="Sin_Gamulan_-_Los_Abuelos.wav", age_min=1)
         _seed(db, job_id="orphan_san",
               status="transcribed_pending", filename="Sin_Gamulan_-_Los_Abuelos.wav", age_min=2)
-        # Caller passes the SANITIZED form → matches → orphan deleted.
+        # Caller passes the SANITIZED form → matches → orphan archived.
         n = supersede_sibling_drafts(
             db, keep_job_id="keep_san", user_id=1, tenant_id=_T,
             filename="Sin_Gamulan_-_Los_Abuelos.wav",
         )
         assert n == 1, "sanitized-on-both-sides should match"
-        assert _ids(db) == {"keep_san"}
+        assert _ids(db) == {"keep_san", "orphan_san"}
+        assert _archived_ids(db) == {"orphan_san"}
 
         # Reset and prove the negative: unsanitized caller misses.
         _cleanup(db)
@@ -260,7 +296,7 @@ def _make_user(client, *, ai_authorized: bool = True):
 
 
 def _draft_rows_for(user_id: int, tenant_id: str, filename: str) -> list:
-    """All draft (awaiting_upload or transcribed_pending) rows matching the tuple."""
+    """Visible draft rows matching the tuple (soft-superseded rows are hidden)."""
     s = SessionLocal()
     try:
         return (
@@ -268,6 +304,7 @@ def _draft_rows_for(user_id: int, tenant_id: str, filename: str) -> list:
             .filter(Job.user_id == user_id, Job.tenant_id == tenant_id)
             .filter(Job.filename == filename)
             .filter(Job.status.in_(("awaiting_upload", "transcribed_pending")))
+            .filter(Job.archived_at.is_(None))
             .all()
         )
     finally:
@@ -325,14 +362,86 @@ def test_upload_url_dedups_back_to_back_calls(client, monkeypatch):
         # Two distinct job_ids minted at the API level.
         assert r1.json()["job_id"] != r2.json()["job_id"]
 
-        # …but only the latest survives in DB after dedup.
+        # …but only the latest remains visible after non-destructive dedup.
         drafts = _draft_rows_for(user_id, tenant_id, fname)
         assert len(drafts) == 1, (
             f"expected 1 draft row after back-to-back /upload-url, got {len(drafts)} "
             f"(ids={[d.job_id for d in drafts]})"
         )
-        # The surviving one is the latest call's job_id.
+        # The visible one is the latest call's job_id.  The older row remains
+        # recoverable if its HTTP response is the one the browser receives.
         assert drafts[0].job_id == r2.json()["job_id"]
+        s = SessionLocal()
+        try:
+            older = s.query(Job).filter(Job.job_id == r1.json()["job_id"]).one()
+            assert older.archived_at is not None
+        finally:
+            s.close()
+    finally:
+        _cleanup_user_rows(user_id, tenant_id)
+
+
+def test_out_of_order_upload_response_can_promote_soft_archived_id(client, monkeypatch):
+    """Reproduce the browser race behind the recurring staging 404.
+
+    Request B archives request A, but response A arrives last and becomes the
+    browser's selected job_id.  Promoting A must succeed, revive A and archive
+    B; no row, R2 pointer or editor history may be deleted.
+    """
+    monkeypatch.setenv("ASYNC_TRANSCRIBE_ENABLED", "1")
+    monkeypatch.setattr("main.storage.is_enabled", lambda: True)
+    monkeypatch.setattr(
+        "main.storage.presign_put_url",
+        lambda tenant, jid, fn, content_type=None, expiry_seconds=900: {
+            "url": f"https://r2.fake/{tenant}/{jid}/{fn}",
+            "key": f"inputs/{tenant}/{jid}/{fn}",
+            "expires_in": expiry_seconds,
+        },
+    )
+    monkeypatch.setattr("main.storage.head_object_size", lambda _key: 2048)
+    enqueued = []
+    monkeypatch.setattr(
+        "queue_jobs.enqueue_transcription",
+        lambda job_id, *_args, **_kwargs: enqueued.append(job_id),
+    )
+    token, user_id, tenant_id = _make_user(client)
+    body = {
+        "filename": "race_song.wav",
+        "content_type": "audio/wav",
+        "size_bytes": 2048,
+        "artist": "Artist",
+        "title": "Race Song",
+    }
+    try:
+        response_a = client.post("/upload-url", json=body, headers=auth(token))
+        response_b = client.post("/upload-url", json=body, headers=auth(token))
+        job_a = response_a.json()["job_id"]
+        job_b = response_b.json()["job_id"]
+
+        before = SessionLocal()
+        try:
+            assert before.query(Job).filter(Job.job_id == job_a).one().archived_at is not None
+            assert before.query(Job).filter(Job.job_id == job_b).one().archived_at is None
+        finally:
+            before.close()
+
+        promoted = client.post(
+            "/transcribe-uploaded",
+            json={"job_id": job_a, "language": "es"},
+            headers=auth(token),
+        )
+        assert promoted.status_code == 200, promoted.text
+        assert enqueued == [job_a]
+
+        after = SessionLocal()
+        try:
+            row_a = after.query(Job).filter(Job.job_id == job_a).one()
+            row_b = after.query(Job).filter(Job.job_id == job_b).one()
+            assert row_a.status == "transcribing_queued"
+            assert row_a.archived_at is None
+            assert row_b.archived_at is not None
+        finally:
+            after.close()
     finally:
         _cleanup_user_rows(user_id, tenant_id)
 

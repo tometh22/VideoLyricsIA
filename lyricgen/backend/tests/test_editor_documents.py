@@ -112,6 +112,29 @@ def test_editor_document_is_shared_by_tenant_and_conflicts_are_explicit(client):
     assert detail["server_segments"][0]["text"] == "ONE"
 
 
+def test_opening_explicit_editor_revives_soft_superseded_job(client):
+    """A duplicate wizard response must not hide the draft being edited."""
+    first, _second, job_id = _users_and_job("editor_soft_supersede")
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        job.archived_at = datetime.now(timezone.utc)
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(f"/editor/{job_id}", headers=auth(_token_for(first)))
+    assert response.status_code == 200, response.text
+
+    db = SessionLocal()
+    try:
+        revived = db.query(Job).filter(Job.job_id == job_id).one()
+        assert revived.archived_at is None
+        assert revived.last_user_activity_at is not None
+    finally:
+        db.close()
+
+
 def test_machine_transcription_checkpoint_is_never_pruned(db):
     first, _second, job_id = _users_and_job("editor_machine_history")
     job = db.query(Job).filter(Job.job_id == job_id).one()
