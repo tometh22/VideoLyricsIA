@@ -46,8 +46,11 @@ jobs:
       # is only truly gated when this burns a real MP4. ~5s on a warm runner.
       - name: Install ffmpeg (libass for the render gate)
         run: |
+          # GitHub's bash uses pipefail; grep -q can close the pipe early and
+          # make ffmpeg exit with SIGPIPE, falsely forcing the apt fallback.
+          ffmpeg_filters="$(ffmpeg -hide_banner -filters 2>/dev/null || true)"
           if command -v ffmpeg >/dev/null 2>&1 && \
-             ffmpeg -hide_banner -filters 2>/dev/null | grep -qE '[[:space:]]subtitles[[:space:]]'; then
+             grep -qE '[[:space:]]subtitles[[:space:]]' <<<"$ffmpeg_filters"; then
             echo "ffmpeg with the subtitles/libass filter is already available"
           else
             sudo apt-get install -y ffmpeg || {
