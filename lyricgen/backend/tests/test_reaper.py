@@ -582,7 +582,10 @@ def test_reap_transcribed_with_provenance_is_quarantined_without_data_loss():
     db = SessionLocal()
     try:
         _cleanup(db)
-        jid = _seed(db, status="transcribed_pending", age_minutes=120)
+        jid = _seed(
+            db, status="transcribed_pending", age_minutes=120,
+            job_id="prov_quar",
+        )
         _seed_provenance(db, job_id=jid, age_minutes=110, duration_ms=4973,
                          step="lyrics_reference_fetch", tool_name="gemini-2.5-flash")
         job = db.query(Job).filter(Job.job_id == jid).first()
@@ -770,11 +773,11 @@ def test_soft_superseded_ids_are_excluded_from_short_ttl_sweeps():
         _cleanup(db)
         transcribed_id = _seed(
             db, status="transcribed_pending", age_minutes=120,
-            job_id="archived_transcribed", segments_json=None,
+            job_id="arch_tr", segments_json=None,
         )
         upload_id = _seed(
             db, status="awaiting_upload", age_minutes=120,
-            job_id="archived_upload", segments_json=None,
+            job_id="arch_up", segments_json=None,
         )
         archived_at = datetime.now(timezone.utc)
         db.query(Job).filter(Job.job_id.in_([transcribed_id, upload_id])).update(
@@ -800,7 +803,7 @@ def test_abandoned_upload_is_soft_quarantined_and_remains_resumable():
         _cleanup(db)
         jid = _seed(
             db, status="awaiting_upload", age_minutes=120,
-            job_id="upload_quarantine", segments_json=None,
+            job_id="up_quar", segments_json=None,
         )
         candidate = next(
             row for row in _reaper.find_abandoned_uploads(db, ttl_min=20)

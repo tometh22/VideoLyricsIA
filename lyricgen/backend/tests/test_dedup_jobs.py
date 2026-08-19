@@ -147,16 +147,16 @@ def test_explicit_activity_revives_soft_archived_draft():
     try:
         _cleanup(db)
         _seed(db, job_id="winner", status="awaiting_upload", filename="song.mp3", age_min=1)
-        _seed(db, job_id="late_response", status="transcribed_pending",
+        _seed(db, job_id="late_resp", status="transcribed_pending",
               filename="song.mp3", age_min=2)
         assert supersede_sibling_drafts(
             db, keep_job_id="winner", user_id=1, tenant_id=_T, filename="song.mp3",
         ) == 1
-        late = db.query(Job).filter(Job.job_id == "late_response").one()
+        late = db.query(Job).filter(Job.job_id == "late_resp").one()
         assert late.archived_at is not None
         touch_user_activity(db, late)
         db.commit()
-        assert db.query(Job).filter(Job.job_id == "late_response").one().archived_at is None
+        assert db.query(Job).filter(Job.job_id == "late_resp").one().archived_at is None
     finally:
         _cleanup(db); db.close()
 
