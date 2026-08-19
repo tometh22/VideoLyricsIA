@@ -11607,7 +11607,7 @@ def _dispatch_editor_quality_outbox(event_id: str | None) -> None:
     try:
         from transactional_outbox import dispatch_outbox_event
         result = dispatch_outbox_event(event_id)
-        if result.get("status") != "dispatched":
+        if result.get("status") not in {"dispatched", "skipped"}:
             logger.warning(
                 "[QUALITY-OUTBOX] publication pending event=%s status=%s",
                 event_id, result.get("status"),

@@ -14,6 +14,23 @@ from typing import Any, Callable
 
 
 OUTBOX_CONSUMER_MIN_LEASE_SECONDS = 3900
+OUTBOX_DEFAULT_MAX_ATTEMPTS = 12
+
+
+class OutboxDeliveryError(RuntimeError):
+    """A classified publication failure.
+
+    Outbox rows are durable state, so storing only ``RuntimeError`` makes an
+    incident impossible to diagnose and causes non-retryable rollout/config
+    results to spin forever.  Keep the public exception small and safe: the
+    code is persisted, while the original exception remains available to the
+    caller/logging path.
+    """
+
+    def __init__(self, code: str, *, retryable: bool = True):
+        self.code = str(code)[:96] or "outbox_delivery_failed"
+        self.retryable = bool(retryable)
+        super().__init__(self.code)
 
 
 def _now() -> datetime:
@@ -50,6 +67,31 @@ def _outbox_stale_processing_seconds() -> int:
     except (TypeError, ValueError):
         configured = OUTBOX_CONSUMER_MIN_LEASE_SECONDS
     return max(_outbox_consumer_lease_seconds(), configured)
+
+
+def _outbox_max_attempts() -> int:
+    """Bound transient outbox retries so a broken dependency cannot spin.
+
+    Twelve attempts is long enough to cover a rolling deploy or a short R2 /
+    Redis incident while still producing a visible terminal state within a
+    bounded window. Operators can raise it for a controlled recovery.
+    """
+    try:
+        configured = int(os.environ.get(
+            "JOB_OUTBOX_MAX_ATTEMPTS", str(OUTBOX_DEFAULT_MAX_ATTEMPTS),
+        ))
+    except (TypeError, ValueError):
+        configured = OUTBOX_DEFAULT_MAX_ATTEMPTS
+    return max(1, min(configured, 100))
+
+
+def _outbox_error_code(exc: Exception) -> str:
+    code = getattr(exc, "code", None)
+    if code:
+        return str(code)[:140]
+    # Generic dependency exceptions are deliberately classified without
+    # persisting their messages, which may contain provider/request details.
+    return type(exc).__name__[:140] or "outbox_delivery_failed"
 
 
 def create_outbox_event(
@@ -152,7 +194,7 @@ def _publish(
         if not _valid_quality_audio_identity(audio_revision, audio_sha256):
             identity = ensure_legacy_audio_identity(event.job_id)
             if not identity:
-                raise RuntimeError("audio_identity_backfill_pending")
+                raise OutboxDeliveryError("audio_identity_backfill_pending")
             audio_revision = int(identity["audio_revision"])
             audio_sha256 = str(identity["audio_sha256"])
         result = enqueue_transcription_quality(
@@ -166,12 +208,21 @@ def _publish(
             publication_id=str(event.id),
             publication_dedupe_key=str(event.dedupe_key),
         )
-        if str(result).startswith((
-            "disabled:", "rollout:", "rollout-excluded:", "identity-missing:",
-        )):
-            raise RuntimeError(str(result).split(":", 1)[0] + "_quality_delivery")
+        if str(result).startswith(("disabled:", "rollout-excluded:")):
+            # Quality analysis is advisory. A disabled or excluded rollout is
+            # a deliberate terminal outcome, not a transient delivery error.
+            raise OutboxDeliveryError(
+                str(result).split(":", 1)[0] + "_quality_delivery",
+                retryable=False,
+            )
+        if str(result).startswith(("rollout:", "identity-missing:")):
+            raise OutboxDeliveryError(
+                str(result).split(":", 1)[0] + "_quality_delivery",
+            )
         return result
-    raise ValueError(f"unsupported outbox event type: {event.event_type}")
+    raise OutboxDeliveryError(
+        f"unsupported_event_type:{event.event_type}", retryable=False,
+    )
 
 
 def dispatch_outbox_event(
@@ -189,25 +240,37 @@ def dispatch_outbox_event(
         ).with_for_update().first()
         if event is None:
             return {"status": "missing", "event_id": event_id}
-        if event.status in {"dispatched", "processing", "consumed"}:
-            return {"status": "dispatched", "event_id": event_id, "deduplicated": True}
+        if event.status in {"dispatched", "processing", "consumed", "failed", "skipped"}:
+            return {"status": event.status, "event_id": event_id, "deduplicated": True}
         if _aware(event.available_at) and _aware(event.available_at) > _now():
             return {"status": "deferred", "event_id": event_id}
         try:
             rq_id = _publish(event, edit_publisher=edit_publisher)
         except Exception as exc:
             event.attempts = int(event.attempts or 0) + 1
-            event.status = "pending"
-            event.last_error = type(exc).__name__[:160]
-            event.available_at = _now() + timedelta(
-                seconds=min(300, max(5, 2 ** min(event.attempts, 8))),
-            )
+            error_code = _outbox_error_code(exc)
+            retryable = bool(getattr(exc, "retryable", True))
+            exhausted = event.attempts >= _outbox_max_attempts()
+            if retryable and not exhausted:
+                event.status = "pending"
+                event.last_error = error_code
+                event.available_at = _now() + timedelta(
+                    seconds=min(300, max(5, 2 ** min(event.attempts, 8))),
+                )
+            else:
+                # ``skipped`` is intentional for advisory quality rollouts;
+                # ``failed`` means a retryable dependency never recovered.
+                event.status = "failed" if retryable else "skipped"
+                event.last_error = (
+                    f"{error_code}:attempts={event.attempts}"
+                )[:160]
+                event.available_at = _now()
             db.commit()
             if raise_on_error:
                 raise
             return {
-                "status": "pending", "event_id": event_id,
-                "error": type(exc).__name__, "attempts": event.attempts,
+                "status": event.status, "event_id": event_id,
+                "error": error_code, "attempts": event.attempts,
             }
         event.status = "dispatched"
         event.dispatched_at = _now()
@@ -258,6 +321,8 @@ def dispatch_pending_outbox_events(*, limit: int = 50) -> dict:
         "attempted": len(results),
         "dispatched": sum(item.get("status") == "dispatched" for item in results),
         "pending": sum(item.get("status") == "pending" for item in results),
+        "failed": sum(item.get("status") == "failed" for item in results),
+        "skipped": sum(item.get("status") == "skipped" for item in results),
     }
 
 
