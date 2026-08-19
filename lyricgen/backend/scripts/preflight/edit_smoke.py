@@ -240,6 +240,14 @@ def main() -> int:
                 last = cur
             if st.get("status") in target:
                 return st
+            # El gate de calidad puede aceptar /generate y bloquear el render
+            # de forma asíncrona. En staging este fixture de silencio debe dar
+            # GO en ese punto, sin esperar los 15 minutos del timeout.
+            if (
+                args.allow_quality_gate_block
+                and _status_quality_gate_code(st)
+            ):
+                return st
             if st.get("status") in ("error", "failed", "upload_failed",
                                     "validation_failed", "transcription_failed"):
                 raise RuntimeError(f"{phase} terminó en {st.get('status')}: "
@@ -248,9 +256,12 @@ def main() -> int:
         raise RuntimeError(f"{phase} no terminó en {args.render_timeout}s")
 
     try:
-        wait_for({"pending_review", "done"}, "render")
+        st = wait_for({"pending_review", "done"}, "render")
     except RuntimeError as e:
         return _fail(str(e))
+    gate_code = _status_quality_gate_code(st)
+    if args.allow_quality_gate_block and gate_code:
+        return _quality_gate_go(job_id, "render", gate_code)
 
     # 2.5. Autosave del editor — el camino que los operadores reportan como
     # frágil (issue #934). GO/NO-GO: POST /jobs/{id}/save-segments con una
