@@ -9087,8 +9087,19 @@ async def generate_with_segments(
             .filter(Job.job_id == job_id)
             .first()
         )
-        if (not job_row
-                or job_row.tenant_id != current_user["tenant_id"]):
+        _tenant_match = bool(job_row and job_row.tenant_id == current_user["tenant_id"])
+        # Cross-tenant para admins de plataforma: mismo contrato que
+        # _job_scope / GET /editor / source-audio-url (pedido CEO
+        # 2026-06-11) — el rol admin necesita poder regenerar el video de
+        # cualquier cliente para resolver incidentes de soporte. Antes de
+        # este fix /generate era el único endpoint del flujo de edición
+        # sin este bypass: un admin podía abrir /editor y ver el audio de
+        # un job ajeno (200 OK) pero al generar chocaba con un 404
+        # "job_not_found" porque este chequeo comparaba tenant_id a secas
+        # (bug real, staging 2026-08-19: found=True tenant_match=False).
+        _is_admin_cross_tenant = bool(job_row and not _tenant_match
+                                       and current_user.get("role") == "admin")
+        if not job_row or (not _tenant_match and not _is_admin_cross_tenant):
             # Do not expose whether a foreign job exists, but leave enough
             # forensic signal to distinguish a reaped temporary job from a
             # tenant/session mismatch in production logs.
@@ -9097,16 +9108,18 @@ async def generate_with_segments(
                 job_id,
                 current_user.get("id"),
                 bool(job_row),
-                bool(job_row and job_row.tenant_id == current_user["tenant_id"]),
+                _tenant_match,
             )
             # Stable machine-readable code so the frontend doesn't couple to the
-            # HTTP status. `job_not_found` = reaped / cross-tenant / never
-            # existed → the client surfaces a "session expired, re-upload" CTA
-            # instead of freezing the single-song hero (audit 2026-07-27).
+            # HTTP status. `job_not_found` = reaped / cross-tenant (non-admin) /
+            # never existed → the client surfaces a "session expired, re-upload"
+            # CTA instead of freezing the single-song hero (audit 2026-07-27).
             return JSONResponse(
                 status_code=404,
                 content={"code": "job_not_found", "detail": "Job not found."},
             )
+        if _is_admin_cross_tenant:
+            _audit_cross_tenant_access(db, current_user, job_row, "generate")
         # State whitelist for /generate. `transcribed_pending` is what the
         # transcription worker writes on success (post-2026-05-25 fix);
         # `transcribed` is accepted defensively for jobs that were written
@@ -9155,8 +9168,12 @@ async def generate_with_segments(
             except LookupError:
                 raise HTTPException(status_code=409, detail="editor_version_not_found") from None
             except RuntimeError:
+                # job_row.tenant_id, not current_user["tenant_id"]: an admin
+                # regenerating another tenant's job must resolve the
+                # document under the JOB's tenant, not their own (or this
+                # 404s via get_or_create_document's tenant-scoped lookup).
                 current_document = get_or_create_document(
-                    db, job_id, current_user["tenant_id"], job_row.segments_json or [],
+                    db, job_id, job_row.tenant_id, job_row.segments_json or [],
                 )
                 raise HTTPException(
                     status_code=409,
@@ -9308,8 +9325,18 @@ async def generate_with_segments(
             .with_for_update()
             .first()
         )
+        # Same admin cross-tenant bypass as the ownership check above — this
+        # is the post-lock re-verification, not a second, independent
+        # authorization rule. An admin who passed the first check must not
+        # get bounced here just because the row still belongs to another
+        # tenant (it never gets reassigned — see job_row.tenant_id below).
+        _tenant_ok = bool(
+            job_row is not None
+            and (job_row.tenant_id == current_user["tenant_id"]
+                 or current_user.get("role") == "admin")
+        )
         if (job_row is None
-                or job_row.tenant_id != current_user["tenant_id"]
+                or not _tenant_ok
                 or job_row.status not in (
                     "transcribed_pending", "transcribed", "awaiting_upload",
                 )):
@@ -9450,8 +9477,10 @@ async def generate_with_segments(
         # clients are bridged lazily so they receive the same guarantee.
         try:
             if editor_document is None:
+                # job_row.tenant_id, not current_user["tenant_id"] — see the
+                # RuntimeError branch above for why (admin cross-tenant).
                 editor_document = get_or_create_document(
-                    db, job_id, current_user["tenant_id"], job_row.segments_json or [],
+                    db, job_id, job_row.tenant_id, job_row.segments_json or [],
                 )
             if editor_document.revision < current_revision:
                 sync_legacy_snapshot(
@@ -9460,7 +9489,7 @@ async def generate_with_segments(
                 )
             approved_version = db.query(EditorVersion).filter(
                 EditorVersion.job_id == job_id,
-                EditorVersion.tenant_id == current_user["tenant_id"],
+                EditorVersion.tenant_id == job_row.tenant_id,
                 EditorVersion.revision == editor_document.revision,
             ).first()
             if approved_version and approved_version.segments == (job_row.segments_json or []):

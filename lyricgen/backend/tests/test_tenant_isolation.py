@@ -372,3 +372,100 @@ def test_admin_cross_tenant_save_segments_is_audited(client, admin_token, db):
         db.query(Job).filter(Job.job_id == "xtenant00012").delete(synchronize_session=False)
         db.query(AuditLog).filter(AuditLog.action == "admin.cross_tenant_access").delete(synchronize_session=False)
         db.commit()
+
+
+# ---------------------------------------------------------------------------
+# GENERATE cross-tenant para admins (bug real, staging 2026-08-19): /generate
+# era el único endpoint del flujo de edición sin el bypass admin que ya
+# tienen /editor, /save-segments y /source-audio-url. Un admin podía abrir el
+# editor y ver el audio de un job ajeno (200 OK) pero al hacer clic en
+# "Generar" el mismo job devolvía 404 job_not_found (found=True,
+# tenant_match=False en el log), y el frontend lo mostraba como "no
+# encontramos la canción temporal en el servidor" — igual que una sesión
+# reapeada por TTL, aunque el job seguía vivo. Ver memoria
+# generate-admin-crosstenant-bypass-gap.
+# ---------------------------------------------------------------------------
+
+def _seed_foreign_transcribed_pending(db, jid, tenant="otro-tenant-x", filename="song.wav"):
+    """Como _seed_foreign_job pero en transcribed_pending con audio real en
+    disco, para poder ejercer /generate (que necesita un estado reusable +
+    el archivo presente, no sólo status='done')."""
+    import os
+
+    from database import Job, User
+    from pipeline import OUTPUTS_DIR
+
+    any_uid = db.query(User.id).order_by(User.id).first()[0]
+    db.add(Job(job_id=jid, user_id=any_uid, tenant_id=tenant, artist="Intoxicados",
+               song_title="No Tengo Ganas", filename=filename, style="oscuro",
+               status="transcribed_pending", current_step="transcribed_pending",
+               progress=50))
+    db.commit()
+
+    job_dir = os.path.join(OUTPUTS_DIR, jid)
+    os.makedirs(job_dir, exist_ok=True)
+    with open(os.path.join(job_dir, filename), "wb") as f:
+        f.write(b"\x00" * 512)
+    return jid
+
+
+def test_admin_can_generate_other_tenant_job(client, admin_token, db, monkeypatch):
+    from database import Job
+
+    jid = "i" + uuid.uuid4().hex[:11]
+    _seed_foreign_transcribed_pending(db, jid)
+    monkeypatch.setattr("main.enqueue_pipeline", lambda **kw: "thread:fake")
+    monkeypatch.setattr("main._enforce_memory_pressure", lambda: None)
+    try:
+        r = client.post(
+            "/generate",
+            data={
+                "job_id": jid,
+                "artist": "Intoxicados",
+                "segments_json": "[]",
+                "delivery_profile": "youtube",
+            },
+            headers=auth(admin_token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["job_id"] == jid
+    finally:
+        db.query(Job).filter(Job.job_id == jid).delete(synchronize_session=False)
+        db.commit()
+
+
+def test_admin_cross_tenant_generate_is_audited(client, admin_token, db, monkeypatch):
+    from database import AuditLog, Job
+
+    jid = "i" + uuid.uuid4().hex[:11]
+    _seed_foreign_transcribed_pending(db, jid)
+    monkeypatch.setattr("main.enqueue_pipeline", lambda **kw: "thread:fake")
+    monkeypatch.setattr("main._enforce_memory_pressure", lambda: None)
+    try:
+        r = client.post(
+            "/generate",
+            data={
+                "job_id": jid,
+                "artist": "Intoxicados",
+                "segments_json": "[]",
+                "delivery_profile": "youtube",
+            },
+            headers=auth(admin_token),
+        )
+        assert r.status_code == 200, r.text
+        rows = (
+            db.query(AuditLog)
+            .filter(AuditLog.action == "admin.cross_tenant_access")
+            .order_by(AuditLog.id.desc())
+            .limit(5)
+            .all()
+        )
+        assert any(
+            (e.detail or {}).get("job_id") == jid
+            and (e.detail or {}).get("kind") == "generate"
+            for e in rows
+        ), "falta el rastro de auditoría del generate cross-tenant"
+    finally:
+        db.query(Job).filter(Job.job_id == jid).delete(synchronize_session=False)
+        db.query(AuditLog).filter(AuditLog.action == "admin.cross_tenant_access").delete(synchronize_session=False)
+        db.commit()
