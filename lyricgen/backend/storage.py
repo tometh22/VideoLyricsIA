@@ -1110,6 +1110,80 @@ def cleanup_old_inputs(retention_days: int = 365, apply: bool = False, prefix: s
     }
 
 
+def delete_prefix(prefix: str, *, max_objects: int = 500) -> dict:
+    """Delete every object under `prefix`. Used to fully clean up a job's
+    deliverable folder (`{tenant}/{job_id}/`) on hard-delete, including
+    edit-version snapshots (`.v1`, `.v2`, ...) that live outside job.s3_keys
+    and were never covered by the plain delete_object(key) calls in
+    jobs._delete_r2_objects — see the 2026-08 audit that found ~260GB of
+    orphaned deliverables from deleted test jobs sitting in R2 forever
+    because only the current 5 canonical keys got cleaned up.
+
+    Deliberately NOT usable on 'inputs/' — that tree is shared across
+    variants/edits (see jobs._delete_r2_objects docstring) and has its own
+    reference-counted deletion path. Callers must pass a job-scoped
+    deliverables prefix, not a tenant- or bucket-wide one.
+
+    max_objects is a hard safety cap: a prefix that somehow resolves to more
+    than a single job's worth of files aborts instead of bulk-deleting, so a
+    caller bug (e.g. an empty/wrong prefix) can't wipe a whole tenant.
+    """
+    empty = {"prefix": prefix, "deleted": 0, "errors": [], "bytes_freed": 0, "aborted": False}
+    if not prefix or prefix in ("/", "") or prefix.startswith("inputs/"):
+        logger.error("delete_prefix refused unsafe prefix=%r", prefix)
+        empty["aborted"] = True
+        return empty
+    client = _get_client()
+    if client is None:
+        return empty
+
+    keys: list[tuple[str, int]] = []
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []) or []:
+            keys.append((obj["Key"], obj.get("Size", 0)))
+            if len(keys) > max_objects:
+                logger.error(
+                    "delete_prefix aborted: prefix=%r has more than %d objects "
+                    "(safety cap) — refusing to bulk-delete, investigate manually",
+                    prefix, max_objects,
+                )
+                empty["aborted"] = True
+                return empty
+    if not keys:
+        return empty
+
+    import sys as _sys
+    try:
+        caller_frame = _sys._getframe(1)
+        caller = f"{caller_frame.f_code.co_filename.split('/')[-1]}:{caller_frame.f_lineno}"
+    except Exception:
+        caller = "<unknown>"
+    logger.warning(
+        "[R2-DELETE-PREFIX] prefix=%r keys=%d bytes=%d caller=%s",
+        prefix, len(keys), sum(sz for _, sz in keys), caller,
+    )
+
+    deleted = 0
+    errors: list[dict] = []
+    for i in range(0, len(keys), 1000):
+        batch = keys[i:i + 1000]
+        resp = client.delete_objects(
+            Bucket=R2_BUCKET,
+            Delete={"Objects": [{"Key": k} for k, _ in batch], "Quiet": False},
+        )
+        deleted += len(resp.get("Deleted", []) or [])
+        errors.extend(resp.get("Errors", []) or [])
+
+    return {
+        "prefix": prefix,
+        "deleted": deleted,
+        "errors": errors,
+        "bytes_freed": sum(sz for _, sz in keys),
+        "aborted": False,
+    }
+
+
 def delete_object(key: str) -> None:
     client = _get_client()
     if client is None:

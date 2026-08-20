@@ -474,7 +474,22 @@ def _delete_r2_objects(db: Session, job: Job) -> None:
     Called before the DB row is removed so the reference check counts
     the row we're about to delete as the one self-excluded by job_id.
     Errors are swallowed — R2 cleanup must never block the DB delete.
+
+    2026-08 audit fix: this used to only delete the CURRENT keys in
+    job.s3_keys, never the `.v1`/`.v2`/... edit-version snapshots that
+    `_snapshot_previous_deliverables` (pipeline.py) leaves behind on every
+    edit. Those snapshots never got cleaned up even when the job itself was
+    later deleted — found ~260GB of them sitting in R2 for jobs with zero
+    references anywhere. We now also sweep the job's whole deliverables
+    folder (`{tenant}/{job_id}/`) via storage.delete_prefix, which catches
+    the snapshots too. `_DELETABLE_STATUSES` already excludes done/
+    pending_review, so a job reaching this function should never have a
+    live Delivery — the check below is a second, cheap guard against ever
+    wiping a real UMG delivery (deliveries.job_id has no FK to jobs, so it
+    outlives the job row on purpose; see the deliveries portal audit).
     """
+    from database import Delivery
+
     keys: list[str] = []
     if job.input_r2_key:
         if not input_audio_is_shared(db, job):
@@ -489,6 +504,25 @@ def _delete_r2_objects(db: Session, job: Job) -> None:
             storage.delete_object(key)
         except Exception as exc:
             _logger.warning("R2 delete failed key=%r: %s", key, exc)
+
+    has_delivery = db.query(Delivery.id).filter(Delivery.job_id == job.job_id).first() is not None
+    if has_delivery:
+        _logger.warning(
+            "R2 prefix sweep skipped for job=%s: a Delivery row references "
+            "it (should be unreachable given _DELETABLE_STATUSES, but "
+            "erring on the side of not touching a UMG delivery)",
+            job.job_id,
+        )
+        return
+    try:
+        result = storage.delete_prefix(f"{job.tenant_id}/{job.job_id}/")
+        if result["deleted"]:
+            _logger.info(
+                "R2 prefix sweep job=%s: deleted %d objects (%d bytes)",
+                job.job_id, result["deleted"], result["bytes_freed"],
+            )
+    except Exception as exc:
+        _logger.warning("R2 prefix sweep failed job=%s: %s", job.job_id, exc)
 
 
 # Estados que el operador puede borrar desde la UI. La idea: cualquier
