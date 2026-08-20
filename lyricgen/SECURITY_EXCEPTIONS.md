@@ -1,8 +1,11 @@
 # Excepciones temporales de dependencias
 
 El gate `backend/scripts/security_audit.py` permite únicamente los IDs exactos
-de `backend/security_exceptions.json`; una excepción nueva, vencida o ya
-corregida rompe CI.
+de `backend/security_exceptions.json`; una excepción nueva o vencida rompe CI.
+Una excepción ausente también rompe CI, salvo las marcadas
+`platform_variant`: esos IDs siguen permitidos y sujetos a vencimiento cuando
+aparecen, pero pip-audit no los reporta de forma uniforme entre la rueda macOS
+de Torch y la rueda Linux `+cpu` del índice de PyTorch.
 
 Las excepciones actuales se limitan al motor CTC: `torch`/`torchaudio` 2.8 no
 pueden subir mientras se use `torchaudio.functional.forced_align`, eliminado en

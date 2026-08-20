@@ -49,7 +49,15 @@ def main() -> int:
         print("Unreviewed Python dependency advisories:")
         print("\n".join(f"- {item}" for item in unexpected))
         return 1
-    stale = sorted(set(allowed) - observed)
+    # Some advisories are emitted for the plain macOS wheel but not for the
+    # Linux ``+cpu`` local-version wheel resolved from PyTorch's index. Keep
+    # those IDs reviewed (and expiry-enforced) whenever they are observed,
+    # without treating their platform-dependent absence as a stale baseline.
+    required = {
+        key for key, item in allowed.items()
+        if not item.get("platform_variant", False)
+    }
+    stale = sorted(required - observed)
     if stale:
         print("Remove fixed/stale security exceptions:")
         print("\n".join(f"- {pkg} {vuln}" for pkg, vuln in stale))
