@@ -40,7 +40,8 @@ def _seed(db, *, status: str, age_minutes: float, job_id: str | None = None,
     drives the find_abandoned_edits clock; last_progress_minutes_ago
     drives the find_stalled_renders clock. Pass None to leave the
     column unset (mirrors legacy rows / paths that never tick progress)."""
-    jid = job_id or f"reap_{uuid.uuid4().hex[:8]}"
+    # Keep synthetic ids inside the same VARCHAR(12) contract as production.
+    jid = job_id or f"reap_{uuid.uuid4().hex[:7]}"
     editing_started_at = None
     if editing_started_minutes_ago is not None:
         editing_started_at = (

@@ -34,7 +34,7 @@ def upgrade() -> None:
         sa.Column("detail", sa.Text(), nullable=True),
         sa.Column("is_estimate", sa.Boolean(), nullable=False,
                   server_default=sa.false()),
-        sa.Column("breakdown", postgresql.JSONB(), nullable=True),
+        sa.Column("breakdown", postgresql.JSONB().with_variant(sa.JSON(), "sqlite"), nullable=True),
         sa.Column("fetched_at", sa.DateTime(timezone=True), nullable=True),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("period", "source",

@@ -2,6 +2,8 @@
 
 import logging
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -11,8 +13,30 @@ from sqlalchemy.orm import Session
 
 import storage
 from database import Job, get_db
+from job_states import (
+    FAILURE_TERMINAL_STATUSES,
+    SUCCESS_TERMINAL_STATUSES,
+    TERMINAL_STATUSES,
+    can_background_transition,
+)
 
 _logger = logging.getLogger("genly.jobs")
+
+_CURRENT_JOB_ATTEMPT: ContextVar[tuple[str, str] | None] = ContextVar(
+    "genly_current_job_attempt", default=None,
+)
+
+
+@contextmanager
+def bind_job_attempt(kind: str, attempt_id: str):
+    """Fence all update_job writes performed by one outbox consumer."""
+    if kind not in {"pipeline", "transcription"}:
+        raise ValueError(f"unsupported job attempt kind {kind!r}")
+    token = _CURRENT_JOB_ATTEMPT.set((kind, str(attempt_id)))
+    try:
+        yield
+    finally:
+        _CURRENT_JOB_ATTEMPT.reset(token)
 
 
 def _report_shared_input_delete_attempt(job: Job, caller: str) -> None:
@@ -718,10 +742,9 @@ def get_all_jobs(
     return [j.to_list_dict() for j in jobs]
 
 
-_TERMINAL_STATUSES = (
-    "done", "error", "rejected", "validation_failed",
-    "bg_preview_done", "bg_preview_failed",
-)
+# Backwards-compatible aliases for callers/tests that imported the old private
+# names. The values now come from the canonical state module.
+_TERMINAL_STATUSES = TERMINAL_STATUSES
 # Sub-partition of terminal statuses by outcome. The pipeline writes
 # done/pending_review only after deliverables actually land in R2; once
 # that ground truth is in the row, NO failure-shaped status ever
@@ -731,11 +754,8 @@ _TERMINAL_STATUSES = (
 # completing worker, edit failure that ran after the worker recovered)
 # now bounces off this guard inside update_job instead of having to
 # re-check the row in every call site.
-_SUCCESS_TERMINAL_STATUSES = ("done", "pending_review", "bg_preview_done")
-_FAILURE_TARGET_STATUSES = (
-    "error", "rejected", "validation_failed", "transcription_failed",
-    "bg_preview_failed",
-)
+_SUCCESS_TERMINAL_STATUSES = SUCCESS_TERMINAL_STATUSES
+_FAILURE_TARGET_STATUSES = FAILURE_TERMINAL_STATUSES
 
 
 def update_job(job_id: str, **kwargs) -> None:
@@ -791,16 +811,23 @@ def update_job(job_id: str, **kwargs) -> None:
         if not job:
             return
 
+        attempt = _CURRENT_JOB_ATTEMPT.get()
+        if attempt is not None:
+            kind, attempt_id = attempt
+            column = f"active_{kind}_attempt_id"
+            if str(getattr(job, column, "") or "") != attempt_id:
+                _logger.warning(
+                    "[%s-fence] ignored stale update job=%s attempt=%s active=%s",
+                    kind, job_id, attempt_id, getattr(job, column, None),
+                )
+                return
+
         # Terminal-state guard (split form): drop only the status field
         # (and current_step, which is the user-facing description of that
         # status) so the rest of the payload — segments_json, files,
         # render_params, etc. — still lands. See docstring for the lost-
         # transcription incident this fixes.
-        if (
-            job.status in _TERMINAL_STATUSES
-            and not target_is_terminal
-            and target_status is not None
-        ):
+        if not can_background_transition(job.status, target_status):
             kwargs.pop("status", None)
             kwargs.pop("current_step", None)
             # Don't touch progress either — it's tied to the status flow.
@@ -825,6 +852,7 @@ def update_job(job_id: str, **kwargs) -> None:
             # error_category viaja junto con error — si el error se descarta
             # (el job ya terminó bien), la categoría también.
             kwargs.pop("error_category", None)
+            kwargs.pop("error_code", None)
             kwargs.pop("current_step", None)
             kwargs.pop("completed_at", None)
             if not kwargs:
@@ -882,7 +910,7 @@ def update_job(job_id: str, **kwargs) -> None:
         # in their direct UPDATEs, but the migration to update_job needs
         # the helper to do it consistently.
         if (
-            kwargs.get("status") in ("done", "pending_review", "error", "rejected", "validation_failed")
+            kwargs.get("status") in _TERMINAL_STATUSES
             and not job.completed_at
         ):
             job.completed_at = datetime.now(timezone.utc)

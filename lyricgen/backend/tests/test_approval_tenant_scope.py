@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import pytest
@@ -57,7 +58,7 @@ def _cleanup(db):
     job_ids = [
         row[0]
         for row in db.query(Job.job_id)
-        .filter(Job.job_id.like("aps_%"))
+        .filter(Job.job_id.like("aps_%") | Job.job_id.like("aq%"))
         .all()
     ]
     if job_ids:
@@ -125,6 +126,58 @@ def test_regular_user_cannot_approve_other_tenant_job(client, db):
     db.expire_all()
     job = db.query(Job).filter(Job.job_id == job_id).one()
     assert job.status == "pending_review"
+
+
+def test_approval_rechecks_owner_quota(client, db):
+    owner_token, owner = _register(client, "approval_quota")
+    job_id = _seed_pending_review(db, owner)
+    now = datetime.now(timezone.utc)
+    for index in range(5):
+        db.add(Job(
+            job_id=f"aq{index}_{uuid.uuid4().hex[:8]}",
+            user_id=owner["id"],
+            tenant_id=owner["tenant_id"],
+            filename=f"approved-{index}.wav",
+            artist="Quota Artist",
+            song_title=f"Approved {index}",
+            status="done",
+            approved_by=owner["id"],
+            approved_at=now,
+        ))
+    db.commit()
+
+    response = client.post(
+        f"/approve/{job_id}", headers=_auth(owner_token), json={"notes": ""},
+    )
+
+    assert response.status_code == 402, response.text
+    db.expire_all()
+    assert db.query(Job).filter(Job.job_id == job_id).one().status == "pending_review"
+
+
+@pytest.mark.postgres
+def test_concurrent_approvals_cannot_cross_monthly_quota(client, db):
+    """The tenant advisory lock serializes count+approval at the limit."""
+    owner_token, owner = _register(client, "approval_race")
+    now = datetime.now(timezone.utc)
+    for index in range(4):
+        db.add(Job(
+            job_id=f"aq{index}_{uuid.uuid4().hex[:8]}",
+            user_id=owner["id"], tenant_id=owner["tenant_id"],
+            filename=f"race-approved-{index}.wav", artist="Quota Artist",
+            status="done", approved_by=owner["id"], approved_at=now,
+        ))
+    first = _seed_pending_review(db, owner)
+    second = _seed_pending_review(db, owner)
+
+    def approve(job_id):
+        return client.post(
+            f"/approve/{job_id}", headers=_auth(owner_token), json={"notes": ""},
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = sorted(pool.map(approve, (first, second)))
+    assert statuses == [200, 402]
 
 
 def test_admin_can_reject_cross_tenant_job(

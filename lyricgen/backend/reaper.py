@@ -1153,6 +1153,13 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
     suite never has competing reapers.
     """
     db = SessionLocal()
+    # A session-level advisory lock must stay pinned to one physical
+    # PostgreSQL connection. The work session commits per recovered row; a
+    # commit may return its connection to SQLAlchemy's pool, so unlocking via
+    # that Session can hit a different connection and leak the original lock.
+    # Keep a dedicated checked-out connection for the entire sweep instead.
+    lock_connection = None
+    got_lock = False
     try:
         # Try to take the advisory lock. pg_try_advisory_lock is non-
         # blocking; if another replica already has it, returns false
@@ -1161,11 +1168,13 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
         is_postgres = db.bind.dialect.name == "postgresql"
         if is_postgres:
             from sqlalchemy import text
-            got = db.execute(
+            lock_connection = db.bind.connect()
+            got_lock = bool(lock_connection.execute(
                 text("SELECT pg_try_advisory_lock(:k)"),
                 {"k": _REAPER_ADVISORY_LOCK_KEY},
-            ).scalar()
-            if not got:
+            ).scalar())
+            lock_connection.commit()
+            if not got_lock:
                 logger.debug(
                     "reaper: another replica holds the advisory lock; "
                     "skipping this cycle",
@@ -1318,20 +1327,21 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
         # it. de-dup above already guaranteed no overlap.
         stuck = stuck + orphans + stalled
     finally:
-        # Releasing the advisory lock is implicit on session close
-        # (Postgres releases all session-scoped locks automatically),
-        # but we call pg_advisory_unlock explicitly for clarity and
-        # to fail fast if pool reuse ever changes the behaviour.
-        if 'is_postgres' in locals() and is_postgres:
+        # Release through the exact dedicated connection that acquired the
+        # session-level lock. Closing it is the final fail-safe.
+        if lock_connection is not None:
             try:
                 from sqlalchemy import text
-                db.execute(
-                    text("SELECT pg_advisory_unlock(:k)"),
-                    {"k": _REAPER_ADVISORY_LOCK_KEY},
-                )
-                db.commit()
+                if got_lock:
+                    lock_connection.execute(
+                        text("SELECT pg_advisory_unlock(:k)"),
+                        {"k": _REAPER_ADVISORY_LOCK_KEY},
+                    )
+                    lock_connection.commit()
             except Exception:
                 pass
+            finally:
+                lock_connection.close()
         db.close()
 
     # Side-effect notifications happen AFTER the DB commit so a failed

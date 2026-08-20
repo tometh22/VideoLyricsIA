@@ -163,10 +163,66 @@ def create_quality_outbox_event(
     )
 
 
+def create_pipeline_outbox_event(
+    db,
+    *,
+    job,
+    purpose: str,
+    mp3_path: str | None,
+    artist: str,
+    style: str,
+    plan: str,
+    tenant_id: str,
+    pipeline_kwargs: dict[str, Any],
+):
+    """Commit-ready intent for a render pipeline invocation."""
+    event = create_outbox_event(
+        db,
+        job_id=job.job_id,
+        event_type="pipeline.enqueue",
+        dedupe_key=f"pipeline:{job.job_id}:{uuid.uuid4()}",
+        payload={
+            "purpose": str(purpose)[:32],
+            "mp3_path": mp3_path,
+            "artist": artist,
+            "style": style,
+            "plan": plan,
+            "tenant_id": tenant_id,
+            "pipeline_kwargs": dict(pipeline_kwargs),
+        },
+    )
+    job.active_pipeline_attempt_id = event.id
+    return event
+
+
+def create_transcription_outbox_event(
+    db,
+    *,
+    job,
+    audio_path: str,
+    transcription_kwargs: dict[str, Any],
+):
+    """Commit-ready intent for a transcription invocation."""
+    event = create_outbox_event(
+        db,
+        job_id=job.job_id,
+        event_type="transcription.enqueue",
+        dedupe_key=f"transcription:{job.job_id}:{uuid.uuid4()}",
+        payload={
+            "audio_path": audio_path,
+            "transcription_kwargs": dict(transcription_kwargs),
+        },
+    )
+    job.active_transcription_attempt_id = event.id
+    return event
+
+
 def _publish(
     event,
     *,
     edit_publisher: Callable[..., str | None] | None = None,
+    pipeline_publisher: Callable[..., str | None] | None = None,
+    transcription_publisher: Callable[..., str | None] | None = None,
 ) -> str | None:
     payload = dict(event.payload or {})
     if event.event_type == "edit.enqueue":
@@ -220,6 +276,32 @@ def _publish(
                 str(result).split(":", 1)[0] + "_quality_delivery",
             )
         return result
+    if event.event_type == "pipeline.enqueue":
+        if pipeline_publisher is None:
+            from queue_jobs import enqueue_pipeline as pipeline_publisher
+
+        return pipeline_publisher(
+            job_id=event.job_id,
+            mp3_path=payload.get("mp3_path"),
+            artist=str(payload.get("artist") or ""),
+            style=str(payload.get("style") or "oscuro"),
+            plan=str(payload.get("plan") or "100"),
+            tenant_id=str(payload.get("tenant_id") or ""),
+            publication_id=str(event.id),
+            publication_dedupe_key=str(event.dedupe_key),
+            **dict(payload.get("pipeline_kwargs") or {}),
+        )
+    if event.event_type == "transcription.enqueue":
+        if transcription_publisher is None:
+            from queue_jobs import enqueue_transcription as transcription_publisher
+
+        return transcription_publisher(
+            event.job_id,
+            str(payload.get("audio_path") or ""),
+            publication_id=str(event.id),
+            publication_dedupe_key=str(event.dedupe_key),
+            **dict(payload.get("transcription_kwargs") or {}),
+        )
     raise OutboxDeliveryError(
         f"unsupported_event_type:{event.event_type}", retryable=False,
     )
@@ -230,6 +312,8 @@ def dispatch_outbox_event(
     *,
     raise_on_error: bool = False,
     edit_publisher: Callable[..., str | None] | None = None,
+    pipeline_publisher: Callable[..., str | None] | None = None,
+    transcription_publisher: Callable[..., str | None] | None = None,
 ) -> dict:
     from database import JobOutboxEvent, SessionLocal
 
@@ -245,7 +329,12 @@ def dispatch_outbox_event(
         if _aware(event.available_at) and _aware(event.available_at) > _now():
             return {"status": "deferred", "event_id": event_id}
         try:
-            rq_id = _publish(event, edit_publisher=edit_publisher)
+            rq_id = _publish(
+                event,
+                edit_publisher=edit_publisher,
+                pipeline_publisher=pipeline_publisher,
+                transcription_publisher=transcription_publisher,
+            )
         except Exception as exc:
             event.attempts = int(event.attempts or 0) + 1
             error_code = _outbox_error_code(exc)
@@ -430,6 +519,73 @@ def run_outbox_edit_pipeline(
         raise
     _finish_outbox_consumer(event_id, dedupe_key, token, success=True)
     return result
+
+
+def _run_outbox_job(
+    *,
+    kind: str,
+    job_id: str,
+    event_id: str,
+    dedupe_key: str,
+    callback: Callable[[], Any],
+):
+    token = str(uuid.uuid4())
+    claim = _claim_outbox_consumer(event_id, dedupe_key, token)
+    if claim == "consumed":
+        return {"status": "already_consumed", "event_id": event_id}
+    if claim == "busy":
+        raise RuntimeError("outbox_consumer_busy")
+    if claim != "claimed":
+        raise RuntimeError("outbox_consumer_identity_mismatch")
+    try:
+        from jobs import bind_job_attempt
+        with bind_job_attempt(kind, event_id):
+            result = callback()
+    except BaseException:
+        _finish_outbox_consumer(event_id, dedupe_key, token, success=False)
+        raise
+    _finish_outbox_consumer(event_id, dedupe_key, token, success=True)
+    return result
+
+
+def run_outbox_pipeline(
+    job_id: str,
+    event_id: str,
+    dedupe_key: str,
+    mp3_path: str | None,
+    artist: str,
+    style: str,
+    pipeline_kwargs: dict,
+):
+    def _call():
+        from pipeline import run_pipeline
+        return run_pipeline(
+            job_id, mp3_path, artist, style, **dict(pipeline_kwargs or {}),
+        )
+
+    return _run_outbox_job(
+        kind="pipeline", job_id=job_id, event_id=event_id,
+        dedupe_key=dedupe_key, callback=_call,
+    )
+
+
+def run_outbox_transcription(
+    job_id: str,
+    event_id: str,
+    dedupe_key: str,
+    audio_path: str,
+    transcription_kwargs: dict,
+):
+    def _call():
+        from transcription_worker import run_transcription_job
+        return run_transcription_job(
+            job_id, audio_path, **dict(transcription_kwargs or {}),
+        )
+
+    return _run_outbox_job(
+        kind="transcription", job_id=job_id, event_id=event_id,
+        dedupe_key=dedupe_key, callback=_call,
+    )
 
 
 def reconcile_job_outbox() -> dict:

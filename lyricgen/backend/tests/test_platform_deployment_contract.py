@@ -43,13 +43,17 @@ def test_api_deployment_contract():
 
 def test_worker_deployment_contracts_share_image_without_http_healthcheck():
     expected_replicas = {"worker.toml": 7, "short-worker.toml": 3}
-    expected_start = (
-        "sh -c 'python backend/scripts/require_worker_schema.py "
-        "&& exec python backend/worker.py'"
-    )
+    expected_queues = {
+        "worker.toml": "enterprise,default,canary",
+        "short-worker.toml": "transcription,bg_preview",
+    }
     for name, replicas in expected_replicas.items():
         cfg = _config(name)
         assert cfg["build"]["dockerfilePath"] == "Dockerfile.worker"
+        expected_start = (
+            "sh -c 'python backend/scripts/require_worker_schema.py "
+            f"&& exec env QUEUES={expected_queues[name]} python backend/worker.py'"
+        )
         assert cfg["deploy"]["startCommand"] == expected_start
         assert cfg["deploy"]["numReplicas"] == replicas
         assert cfg["deploy"]["drainingSeconds"] == 1200

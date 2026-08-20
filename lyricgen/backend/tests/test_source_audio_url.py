@@ -47,6 +47,7 @@ def _create_job(db, tenant_id, user_id, input_r2_key="inputs/default/x/song.mp3"
 def test_source_audio_url_returns_signed_url(client, admin_token, db, monkeypatch):
     """Job propio con input_r2_key → 200 con url firmada y TTL."""
     import storage
+    monkeypatch.setattr(storage, "object_exists", lambda key: True)
     monkeypatch.setattr(storage, "generate_signed_url",
                         lambda key, expiry_seconds=3600: f"https://r2.fake/{key}?sig=ok")
     user_id, tenant_id = _admin_identity(db)

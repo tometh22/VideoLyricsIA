@@ -94,6 +94,21 @@ jobs:
           ADMIN_PASSWORD: "testadmin123"
         run: python -m pytest tests/ -v --tb=short
 
+      - name: Real MoviePy + libass render gates
+        env:
+          DATABASE_URL: "postgresql://genly:genly@localhost:5432/genly_test"
+          JWT_SECRET: "ci-test-secret-key"
+          ADMIN_PASSWORD: "testadmin123"
+          GENLY_TEST_REAL_MOVIEPY: "1"
+        run: >-
+          python -m pytest tests/test_ass_integration.py
+          tests/test_ass_integration_render.py -v --tb=short
+
+      - name: Dependency vulnerability gate
+        run: |
+          pip install pip-audit
+          python scripts/security_audit.py
+
       - name: Syntax check all modules
         run: |
           python -c "
@@ -124,6 +139,9 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+      - name: Dependency vulnerability gate
+        run: npm audit --audit-level=moderate
 
       - name: Install Chromium for browser E2E
         run: npx playwright install --with-deps chromium

@@ -21,8 +21,25 @@ import pytest
 _FFMPEG = shutil.which("ffmpeg")
 _FFPROBE = shutil.which("ffprobe")
 
+
+def _ffmpeg_has_libass():
+    if not _FFMPEG:
+        return False
+    try:
+        output = subprocess.run(
+            [_FFMPEG, "-hide_banner", "-filters"], capture_output=True,
+            text=True, timeout=20,
+        ).stdout
+    except Exception:
+        return False
+    return any(
+        line.split()[1:2] == ["subtitles"]
+        for line in output.splitlines() if line.strip()
+    )
+
 pytestmark = pytest.mark.skipif(
-    not (_FFMPEG and _FFPROBE), reason="ffmpeg/ffprobe not available"
+    not (_FFMPEG and _FFPROBE and _ffmpeg_has_libass()),
+    reason="ffmpeg/ffprobe with libass not available",
 )
 
 
