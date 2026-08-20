@@ -6280,6 +6280,7 @@ def _should_keep_certified_background(
     prior_validation_result: dict,
     asset_path: str | None,
     forced_fallback: bool = False,
+    reusing_certified_asset: bool = False,
 ) -> bool:
     """True when a failed re-check must NOT discard the reused background.
 
@@ -6295,16 +6296,164 @@ def _should_keep_certified_background(
 
     ``forced_fallback`` means the background in hand is already the safe local
     gradient; there is nothing to preserve.
+
+    ``reusing_certified_asset`` covers the other way a certified asset ends up
+    in hand: a background/scene edit whose GENERATION failed and degraded back
+    to the previously cached asset. The edit type says "new background" but the
+    bytes are the old, already-certified ones — same rule applies.
     """
     if forced_fallback:
         return False
-    if edit_type not in _BACKGROUND_REUSE_EDIT_TYPES:
+    if not (
+        reusing_certified_asset or edit_type in _BACKGROUND_REUSE_EDIT_TYPES
+    ):
         return False
     if not verdict.get("inconclusive"):
         return False
     if prior_validation_result.get("passed") is not True:
         return False
     return bool(asset_path and os.path.exists(asset_path))
+
+
+def _download_previously_certified_background(
+    job_id: str,
+    job_dir: str,
+    bg_r2_key_cached: str | None,
+    prior_validation_result: dict,
+    *,
+    filename_stem: str = "bg_prev_certified",
+) -> str | None:
+    """Local copy of the last background/timeline this job certified.
+
+    The degraded destination for a FAILED generation. Historically any
+    provider error (Veo outage, Imagen 500, breaker open) degraded to the
+    deterministic gradient — which then recached itself over
+    ``bg_r2_key_cached``, so "regenerate my background" failing at the
+    provider destroyed the background the operator already had. Degrading to
+    the previous certified asset instead means a failed regeneration is a
+    no-op the user can retry, not a loss.
+
+    Returns None when there is nothing certified to fall back to; the caller
+    then uses the gradient exactly as before.
+    """
+    if prior_validation_result.get("passed") is not True:
+        return None
+    if not bg_r2_key_cached or not storage.is_enabled():
+        return None
+    ext = os.path.splitext(bg_r2_key_cached)[1].lower() or ".mp4"
+    dest = os.path.join(job_dir, f"{filename_stem}{ext}")
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return dest
+    try:
+        if storage.download_object(bg_r2_key_cached, dest):
+            return dest
+    except Exception as _download_error:  # noqa: BLE001
+        logger.warning(
+            "[EDIT] no pude bajar el fondo certificado previo job=%s key=%s: %s",
+            job_id, bg_r2_key_cached, _download_error,
+        )
+    return None
+
+
+def _archive_and_clear_scene_plan(
+    merged: dict,
+    scene_plan: dict | None,
+    job_id: str,
+    *,
+    reason: str,
+) -> None:
+    """Drop the storyboard from the job, but keep a copy for recovery.
+
+    Clearing ``scene_plan`` is correct when the rendered background stops
+    being the storyboard's timeline — a later edit reading that plan would
+    trust false provenance. Losing it outright is not: the plan holds every
+    scene PROMPT, i.e. the creative direction the operator wrote. Stash it in
+    render_params (same write as the clear, no migration) so ops can rebuild
+    the storyboard instead of asking the customer to describe it again.
+
+    Nothing reads ``scene_plan_archived`` — it is inert recovery data, so it
+    cannot resurrect stale provenance.
+    """
+    if scene_plan:
+        merged["scene_plan_archived"] = {
+            "reason": reason,
+            "plan": scene_plan,
+        }
+        logger.error(
+            "[SCENES] storyboard descartado del job=%s (%s) — copia de "
+            "recuperación en render_params.scene_plan_archived",
+            job_id, reason,
+        )
+    return None
+
+
+_DECISIVE_SCENE_REJECTION_MARKERS = (
+    "rejected by no-human policy",
+    "content policy",
+)
+
+
+def _scene_plan_failure_is_decisive(scene_plan: dict | None) -> bool:
+    """Did a storyboard re-scan actually SEE something forbidden?
+
+    ``_generate_scene_clips`` records the outcome per scene. A decisive
+    rejection (the classifier flagged people/brand) means the persisted clips
+    are genuinely unusable and the caller must degrade to the safe gradient. A
+    cache miss, a download error or an open Veo breaker means we could not
+    look — which is not evidence, and must not cost the operator a storyboard
+    that has never failed a check.
+    """
+    for scene in (scene_plan or {}).get("scenes", []) or []:
+        validation = scene.get("validation") or {}
+        if validation.get("passed") is True:
+            continue
+        detections = validation.get("detections") or {}
+        if detections.get("people") or detections.get("brand"):
+            return True
+        blob = f"{validation.get('error') or ''} {scene.get('error') or ''}".lower()
+        if any(marker in blob for marker in _DECISIVE_SCENE_REJECTION_MARKERS):
+            return True
+    return False
+
+
+def _inherit_inconclusive_scene_verdict(
+    scene: dict,
+    *,
+    verdict: dict,
+    prior_validation: dict,
+    policy_fingerprint: str,
+    cache_only: bool,
+) -> bool:
+    """Same rule as :func:`_should_keep_certified_background`, per scene clip.
+
+    A storyboard edit re-scans every persisted clip. When a clip comes back
+    from the cache UNCHANGED (``cache_only``) and its re-scan is inconclusive
+    — quota/timeout, no policy finding — the verdict it already earned under
+    the SAME policy fingerprint is still the best evidence available about
+    those exact bytes. Without this, one 429 marks the scene failed, the
+    substitution phase cannot find a compatible replacement, the dense
+    revalidation raises, and the whole storyboard gets thrown away over a
+    transient provider error.
+
+    Mutates ``scene["validation"]`` in place and returns True when the prior
+    verdict was inherited.
+    """
+    if not cache_only or not verdict.get("inconclusive"):
+        return False
+    if prior_validation.get("passed") is not True:
+        return False
+    if prior_validation.get("policy_fingerprint") != policy_fingerprint:
+        # Policy moved since that certification: the old verdict says nothing
+        # about the rules in force now. Fail closed, as before.
+        return False
+    scene["validation"] = {
+        **prior_validation,
+        "passed": True,
+        "policy_fingerprint": policy_fingerprint,
+        "revalidation_inconclusive": True,
+        "revalidation_issues": list(verdict.get("issues") or []),
+    }
+    return True
 
 
 def _validate_segments_against_audio(audio_path: str, segments: list[dict],
@@ -12556,6 +12705,11 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
         # En un regen (regen_keys set), las escenas NO-target son cache_only:
         # se sirven de caché o se degradan, nunca pagan Veo de nuevo.
         _cache_only = regen_keys is not None and key not in regen_keys
+        # Veredicto que este clip YA tenía. Sólo es evidencia sobre los bytes
+        # que vamos a rendear cuando la escena es cache_only (el clip vuelve
+        # de la caché sin cambiar); un regen escribe bytes nuevos y no puede
+        # heredar nada. Ver _inherit_inconclusive_scene_verdict.
+        _prior_scene_validation = dict(scene.get("validation") or {})
         _meta = {}
         scene_policy = (
             rebase_stored_atmospherics_policy(scene.get("atmospherics_policy"))
@@ -12647,7 +12801,20 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                     ),
                     "policy_fingerprint": _policy_fp,
                 }
-                if _scene_validation.get("passed") is not True:
+                if _inherit_inconclusive_scene_verdict(
+                    scene,
+                    verdict=_scene_validation,
+                    prior_validation=_prior_scene_validation,
+                    policy_fingerprint=_policy_fp,
+                    cache_only=_cache_only,
+                ):
+                    logger.error(
+                        "[SCENES] re-chequeo inconcluso del clip cacheado %s "
+                        "(job=%s) — conservo el veredicto previo en vez de "
+                        "tirar la escena: issues=%s",
+                        key, job_id, _scene_validation.get("issues"),
+                    )
+                elif _scene_validation.get("passed") is not True:
                     if _validation_observe_only():
                         logger.warning(
                             "[SCENES] observe-only: keeping clip %s job=%s "
@@ -18169,6 +18336,16 @@ def run_edit_pipeline(
         # image-to-video → provenance AI-derived (aplica validación). Sin
         # animar es human-provided. Se resuelve dentro de la rama custom.
         _animate_custom = False
+        # True when a FAILED generation degraded back to the asset this job had
+        # already certified. The edit type still says "background"/"scene", but
+        # the bytes in hand are the old certified ones: they must not be
+        # recached, must not be re-labelled as freshly generated, and must not
+        # be thrown away by an inconclusive re-check.
+        _kept_previous_background = False
+        _edit_ai_generated_override: bool | None = None
+        # Defensive: every branch below assigns it, but keeping the name bound
+        # means a future branch that returns early cannot NameError here.
+        bg_image_path = None
         if edit_type in ("typography", "lyrics", "metadata"):
             # All three reuse the cached background — only the foreground
             # layer changes. Lyrics edit ALSO swaps the segments, and
@@ -18313,19 +18490,40 @@ def run_edit_pipeline(
                 # Imagen can raise before returning an asset (Veo normally
                 # degrades internally).  A provider failure must not strand a
                 # Universal/common AI edit in ``error`` or ``validation_failed``.
-                logger.error(
-                    "[EDIT] background generation failed job=%s; using safe "
-                    "local fallback: %s",
-                    job_id, _background_generation_error,
+                # First choice is the background this job already had: a failed
+                # regeneration should leave the operator exactly where they
+                # were, not swap their art for a gradient AND recache it.
+                _previous_bg = _download_previously_certified_background(
+                    job_id, job_dir, bg_r2_key_cached, _prior_validation_result,
                 )
-                bg_image_path = _write_safe_gradient_background(
-                    job_dir, style, filename="bg_edit_policy_fallback.mp4",
-                )
-                _force_policy_fallback = True
-                _policy_fallback_reason = "background_generation_error"
+                if _previous_bg:
+                    logger.error(
+                        "[EDIT] background generation failed job=%s; keeping "
+                        "the previously certified background (retry the regen "
+                        "later): %s",
+                        job_id, _background_generation_error,
+                    )
+                    bg_image_path = _previous_bg
+                    _kept_previous_background = True
+                    _edit_ai_generated_override = bool(
+                        _stored_background_ai_generated
+                    )
+                else:
+                    logger.error(
+                        "[EDIT] background generation failed job=%s; using safe "
+                        "local fallback: %s",
+                        job_id, _background_generation_error,
+                    )
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style, filename="bg_edit_policy_fallback.mp4",
+                    )
+                    _force_policy_fallback = True
+                    _policy_fallback_reason = "background_generation_error"
             update_job(job_id, progress=35)
-            # Do not replace the last known-good cache until validation passes.
-            _pending_background_recache = True
+            # Do not replace the last known-good cache until validation passes —
+            # and never recache when we are re-rendering the bytes that ARE the
+            # cache.
+            _pending_background_recache = not _kept_previous_background
 
         elif edit_type == "scene":
             # Regenerar UNA escena del storyboard y re-armar el timeline. Sólo
@@ -18370,26 +18568,51 @@ def run_edit_pipeline(
                 _pending_scene_recache = True
             except Exception as _scene_generation_error:
                 _raise_if_job_timeout(_scene_generation_error)
-                logger.error(
-                    "[EDIT] scene regeneration failed job=%s scene=%s; using "
-                    "safe local fallback: %s",
-                    job_id, scene_key, _scene_generation_error,
-                )
-                bg_image_path = _write_safe_gradient_background(
-                    job_dir, style, filename="bg_edit_policy_fallback.mp4",
-                )
-                bg_prelooped = False
-                _scene_timeline_from_current_clips = False
-                _pending_scene_recache = False
-                _pending_background_recache = True
-                _force_policy_fallback = True
-                _policy_fallback_reason = "scene_generation_error"
-                # The cached background is now a single deterministic asset,
-                # not the storyboard represented by the old plan.  Persisting
-                # that plan would make the next edit trust false provenance.
-                scene_plan = None
-                _pending_scene_plan_clear = True
-                update_job(job_id, progress=35)
+                if _scene_plan_before_edit is not None:
+                    # "Otra toma" failed at the provider. The pre-edit
+                    # storyboard is intact and already certified, so restore it
+                    # and let the dense revalidation below rebuild that exact
+                    # timeline from the cached clips: the edit becomes a no-op
+                    # the operator can retry. Wiping the storyboard because ONE
+                    # re-roll failed was destroying N-1 good scenes plus every
+                    # scene prompt in the plan.
+                    logger.error(
+                        "[EDIT] scene regeneration failed job=%s scene=%s; "
+                        "restoring the pre-edit storyboard (retry the re-roll "
+                        "later): %s",
+                        job_id, scene_key, _scene_generation_error,
+                    )
+                    scene_plan = _copy.deepcopy(_scene_plan_before_edit)
+                    bg_prelooped = False
+                    _scene_timeline_from_current_clips = False
+                    _pending_scene_recache = False
+                    _pending_background_recache = False
+                    _kept_previous_background = True
+                    update_job(job_id, scene_plan=scene_plan, progress=35)
+                else:
+                    logger.error(
+                        "[EDIT] scene regeneration failed job=%s scene=%s; using "
+                        "safe local fallback: %s",
+                        job_id, scene_key, _scene_generation_error,
+                    )
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style, filename="bg_edit_policy_fallback.mp4",
+                    )
+                    bg_prelooped = False
+                    _scene_timeline_from_current_clips = False
+                    _pending_scene_recache = False
+                    _pending_background_recache = True
+                    _force_policy_fallback = True
+                    _policy_fallback_reason = "scene_generation_error"
+                    # The cached background is now a single deterministic asset,
+                    # not the storyboard represented by the old plan.  Persisting
+                    # that plan would make the next edit trust false provenance.
+                    scene_plan = _archive_and_clear_scene_plan(
+                        merged, scene_plan, job_id,
+                        reason="scene_generation_error",
+                    )
+                    _pending_scene_plan_clear = True
+                    update_job(job_id, progress=35)
 
         elif edit_type == "background_library":
             # Swap a un asset CURADO de biblioteca — la salida del loop no
@@ -18546,6 +18769,10 @@ def run_edit_pipeline(
             (True if _animate_custom else False) if edit_type == "custom" else
             bool(_stored_background_ai_generated)
         )
+        if _edit_ai_generated_override is not None:
+            # A failed regeneration degraded to the OLD asset: its provenance
+            # is whatever that asset was, not "freshly AI-generated".
+            _edit_ai_generated = _edit_ai_generated_override
         _edit_safety_policy = _background_safety_policy(
             job_id, _edit_operator_prompt
         )
@@ -18607,7 +18834,53 @@ def run_edit_pipeline(
                     "[SCENES] dense edit revalidation failed job=%s: %s",
                     job_id, _dense_error,
                 )
-                if _edit_safety_policy["is_umg"] or _edit_ai_generated:
+                _dense_decisive = _scene_plan_failure_is_decisive(scene_plan)
+                _cached_timeline = (
+                    None if _dense_decisive
+                    else _download_previously_certified_background(
+                        job_id, job_dir, bg_r2_key_cached,
+                        _prior_validation_result,
+                        filename_stem="bg_cached_timeline",
+                    )
+                )
+                if _cached_timeline:
+                    # Nothing forbidden was SEEN — a clip was unreachable, the
+                    # breaker was open, or the re-scan never got a verdict. The
+                    # cached timeline is the storyboard this job already
+                    # certified, so render it and keep the plan. Wiping both
+                    # over an infrastructure error is what turned a quota blip
+                    # into "se me fue el fondo" (incidente 2026-08-20).
+                    logger.error(
+                        "[SCENES] revalidación no concluyente job=%s — rendeo "
+                        "el timeline cacheado y CONSERVO el storyboard",
+                        job_id,
+                    )
+                    bg_image_path = _cached_timeline
+                    bg_prelooped = True
+                    _scene_timeline_from_current_clips = False
+                    _clips_already_validated = True
+                    _pending_scene_recache = False
+                    _pending_background_recache = False
+                    # Restore the pre-edit plan: this attempt marked scenes
+                    # failed/reused, and persisting that would leave the job
+                    # permanently short of clip evidence — every later edit
+                    # would re-run the dense pass and fall back again. Keep the
+                    # reason on the plan so the failure is still diagnosable.
+                    if _scene_plan_before_edit:
+                        scene_plan = _copy.deepcopy(_scene_plan_before_edit)
+                    scene_plan["last_revalidation_error"] = str(_dense_error)[:300]
+                    update_job(job_id, scene_plan=scene_plan)
+                    update_job(job_id, validation_result={
+                        **_prior_validation_result,
+                        "passed": True,
+                        "policy_reason": _edit_safety_policy["reason"],
+                        "policy_version": _edit_safety_policy["policy_version"],
+                        "policy_mode": _edit_safety_policy["policy_mode"],
+                        "validation_scope": "reused_asset_prior_certification",
+                        "revalidation_inconclusive": True,
+                        "revalidation_error": str(_dense_error)[:300],
+                    })
+                elif _edit_safety_policy["is_umg"] or _edit_ai_generated:
                     # Preserve the storyboard diagnostics, but render this
                     # revision over a deterministic clean background. A bad or
                     # unverifiable scene clip must never reject the whole
@@ -18622,7 +18895,10 @@ def run_edit_pipeline(
                     merged["background_ai_generated"] = False
                     _pending_scene_recache = False
                     _pending_background_recache = True
-                    scene_plan = None
+                    scene_plan = _archive_and_clear_scene_plan(
+                        merged, scene_plan, job_id,
+                        reason="scene_validation_error",
+                    )
                     _pending_scene_plan_clear = True
                     update_job(job_id, validation_result={
                         "passed": True,
@@ -18632,6 +18908,7 @@ def run_edit_pipeline(
                         "policy_mode": _edit_safety_policy["policy_mode"],
                         "validation_scope": "deterministic_local_fallback",
                         "recovered_from_scene_validation_error": True,
+                        "decisive_policy_finding": bool(_dense_decisive),
                     })
                 else:
                     if edit_type == "scene" and _scene_plan_before_edit is not None:
@@ -18662,6 +18939,7 @@ def run_edit_pipeline(
                 prior_validation_result=_prior_validation_result,
                 asset_path=bg_image_path,
                 forced_fallback=_force_policy_fallback,
+                reusing_certified_asset=_kept_previous_background,
             ):
                 # The operator only touched the FOREGROUND (letra, tipografía,
                 # metadata): these bytes are the ones this job already
@@ -18741,7 +19019,10 @@ def run_edit_pipeline(
                     _pending_scene_recache = False
                     _pending_background_recache = True
                     if scene_plan is not None:
-                        scene_plan = None
+                        scene_plan = _archive_and_clear_scene_plan(
+                            merged, scene_plan, job_id,
+                            reason="unsafe_generation_recovery",
+                        )
                         _pending_scene_plan_clear = True
                     _edit_validation_ok = True
                     update_job(job_id, validation_result={
