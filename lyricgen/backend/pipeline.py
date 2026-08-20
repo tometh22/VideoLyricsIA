@@ -6063,12 +6063,24 @@ def _validate_background_asset_for_job(
     *,
     ai_generated: bool = True,
     failure_status: str | None = "validation_failed",
+    verdict_out: dict | None = None,
 ) -> bool:
-    """Apply the same authoritative gate to initial, edit and cache paths."""
+    """Apply the same authoritative gate to initial, edit and cache paths.
+
+    ``verdict_out``: optional dict updated in place with the raw validator
+    result. A caller that must distinguish "the classifier saw a violation"
+    from "the classifier never answered" (quota/timeout) reads
+    ``verdict_out["inconclusive"]`` — the boolean return stays fail-closed
+    for everyone else.
+    """
     policy = _background_safety_policy(job_id, operator_prompt)
     if not policy["should_validate"]:
         return True
     if not asset_path or not os.path.exists(asset_path):
+        if verdict_out is not None:
+            # Missing asset: nothing to keep, so this is NOT a recoverable
+            # inconclusive verdict even though no frame was ever checked.
+            verdict_out.update({"passed": False, "inconclusive": False})
         if failure_status:
             update_job(
                 job_id, status=failure_status,
@@ -6101,6 +6113,8 @@ def _validate_background_asset_for_job(
     result["policy_mode"] = policy["policy_mode"]
     result["allow_people"] = policy["allow_people"]
     result["allow_atmospherics"] = policy["allow_atmospherics"]
+    if verdict_out is not None:
+        verdict_out.update(result)
     update_job(job_id, validation_result=result)
     if result.get("passed") is not True:
         if _validation_observe_only():
@@ -6118,6 +6132,46 @@ def _validate_background_asset_for_job(
         logger.warning("[VALIDATION] FAILED for job %s: %s", job_id, result.get("issues"))
         return False
     return True
+
+
+# Edits that change only the FOREGROUND layer. They render over the background
+# already stored for the job — no new asset enters the pipeline — so the bytes
+# handed to the validator are the same ones a previous run certified.
+_BACKGROUND_REUSE_EDIT_TYPES = ("typography", "lyrics", "metadata")
+
+
+def _should_keep_certified_background(
+    edit_type: str,
+    *,
+    verdict: dict,
+    prior_validation_result: dict,
+    asset_path: str | None,
+    forced_fallback: bool = False,
+) -> bool:
+    """True when a failed re-check must NOT discard the reused background.
+
+    All four conditions are required:
+
+    1. the edit reuses the stored background (foreground-only change),
+    2. the re-check was INCONCLUSIVE — quota/timeout/extraction errors, no
+       policy finding. A decisive violation still destroys the asset, which is
+       the whole point of the gate,
+    3. this job's background already holds a ``passed`` verdict, so keeping it
+       preserves an existing certification instead of inventing one,
+    4. the asset is actually on disk to render with.
+
+    ``forced_fallback`` means the background in hand is already the safe local
+    gradient; there is nothing to preserve.
+    """
+    if forced_fallback:
+        return False
+    if edit_type not in _BACKGROUND_REUSE_EDIT_TYPES:
+        return False
+    if not verdict.get("inconclusive"):
+        return False
+    if prior_validation_result.get("passed") is not True:
+        return False
+    return bool(asset_path and os.path.exists(asset_path))
 
 
 def _validate_segments_against_audio(audio_path: str, segments: list[dict],
@@ -17315,6 +17369,14 @@ def run_edit_pipeline(
         # produce". Archived .vN keys use this number so v1 is the file
         # that existed at the moment of the 1st edit, v2 at the 2nd, etc.
         prior_s3_keys = dict(job_row.s3_keys) if job_row.s3_keys else None
+        # Verdict this job's background already earned, BEFORE this edit
+        # overwrites validation_result. A reuse edit re-checks bytes that are
+        # byte-identical to the ones certified here, so this snapshot is the
+        # evidence that lets an inconclusive re-check keep the asset instead of
+        # destroying it (see the revalidation branch below).
+        _prior_validation_result = (
+            dict(job_row.validation_result) if job_row.validation_result else {}
+        )
         version_n = int(job_row.edit_count or 0)
         prior_versions = list(job_row.previous_versions or [])
         # A job carries ProRes deliverables whenever it has a umg_spec (the
@@ -18000,13 +18062,50 @@ def run_edit_pipeline(
                     )
                     return
         if not _clips_already_validated:
+            _edit_verdict: dict = {}
             _edit_validation_ok = _validate_background_asset_for_job(
                 job_id,
                 bg_image_path,
                 _edit_operator_prompt,
                 ai_generated=_edit_ai_generated,
                 failure_status=None,
+                verdict_out=_edit_verdict,
             )
+            if not _edit_validation_ok and _should_keep_certified_background(
+                edit_type,
+                verdict=_edit_verdict,
+                prior_validation_result=_prior_validation_result,
+                asset_path=bg_image_path,
+                forced_fallback=_force_policy_fallback,
+            ):
+                # The operator only touched the FOREGROUND (letra, tipografía,
+                # metadata): these bytes are the ones this job already
+                # certified, and the re-check produced no verdict at all — only
+                # quota/timeout errors. Replacing them with the safe gradient
+                # adds zero safety and permanently destroys the background the
+                # customer paid for: the fallback also recaches itself over
+                # bg_r2_key_cached (incident 2026-08-20, UMG Chile "La Funa" —
+                # one 429 on frame 6 of 8 wiped a Veo background that had
+                # passed 8/8 twice). Keep the certified asset, keep the cache,
+                # and record WHY so the audit trail shows an inconclusive
+                # re-check rather than a fresh pass.
+                logger.error(
+                    "[VALIDATION] inconclusive re-check of a REUSED background "
+                    "job=%s edit_type=%s — keeping the previously certified "
+                    "asset (issues=%s)",
+                    job_id, edit_type, _edit_verdict.get("issues"),
+                )
+                update_job(job_id, validation_result={
+                    **_prior_validation_result,
+                    "passed": True,
+                    "validation_scope": "reused_asset_prior_certification",
+                    "revalidation_inconclusive": True,
+                    "revalidation_issues": _edit_verdict.get("issues", []),
+                    "policy_reason": _edit_safety_policy["reason"],
+                    "policy_version": _edit_safety_policy["policy_version"],
+                    "policy_mode": _edit_safety_policy["policy_mode"],
+                })
+                _edit_validation_ok = True
             if not _edit_validation_ok:
                 _recover_edit_background = bool(
                     _edit_safety_policy["is_umg"] or _edit_ai_generated
