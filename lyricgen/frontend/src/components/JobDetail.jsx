@@ -18,6 +18,7 @@ import ReviewVideoPlayer from "./ReviewVideoPlayer";
 import JobSettingsCard from "./JobSettingsCard";
 import { SingleGeneratingHero } from "./BatchProgress";
 import { hasArtTrackAccess } from "../lib/artTrackAccess";
+import { reviewJobPath } from "../lib/reviewJobRoute";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -960,7 +961,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
 
   // `transcribed` y `transcribed_pending` = audio + segments están en la DB
   // y el user nunca hizo /generate. La acción correcta es abrir el wizard
-  // pre-cargado (/new?resume=...) para que edite lyrics y dispare la
+  // pre-cargado (/review/:jobId) para que edite lyrics y dispare la
   // generación. Vía `/transcribe-uploaded` queda `transcribed_pending` (path
   // sync legacy) o el async worker setea `transcribed_pending` como estado
   // FINAL — ver transcription_worker.py:147 y jobs.py:49-51. NO es "subida
@@ -972,7 +973,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // renderizaba el CTA. El usuario veía 27 jobs "Sin generar" en el
   // historial y al entrar no había forma de seguir — panel sin acción.
   if (isTranscribed || isTranscribedPending) {
-    const navHref = `/new?resume=${encodeURIComponent(job.job_id)}`;
+    const navHref = reviewJobPath(job.job_id);
     return (
       <div className="w-full max-w-2xl animate-fade-in">
         <div className="flex items-center gap-3 mb-6">
