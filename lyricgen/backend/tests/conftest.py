@@ -76,6 +76,15 @@ from database import Base, engine, SessionLocal, init_db
 def setup_db():
     """Create all tables once per test session."""
     init_db()
+    # Most low-level fixtures intentionally use user_id=1. SQLite does not
+    # enforce that FK, but the PostgreSQL CI gate does; provision the same
+    # default admin that application startup guarantees before any test runs.
+    from auth import ensure_default_admin
+    bootstrap_db = SessionLocal()
+    try:
+        ensure_default_admin(bootstrap_db)
+    finally:
+        bootstrap_db.close()
     yield
     # Cleanup
     Base.metadata.drop_all(bind=engine)

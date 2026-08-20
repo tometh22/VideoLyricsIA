@@ -90,8 +90,10 @@ def test_overlong_field_still_records_the_row():
         assert row is not None
         assert len(row.step) <= 50
         assert row.step.startswith("lyrics_analysis_")
-        # cleanup
-        db.delete(row)
+        # Bulk-delete the child before its parent. PostgreSQL correctly
+        # enforces the provenance audit FK whereas SQLite does not.
+        db.query(AIProvenance).filter(AIProvenance.id == row.id).delete()
+        db.flush()
         db.query(Job).filter(Job.job_id == job_id).delete()
         db.commit()
     finally:

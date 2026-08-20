@@ -9,9 +9,8 @@ ANTES del fix:
 
 DESPUÉS del fix:
     `with_for_update()` toma row lock en Postgres. El segundo request
-    espera a que el primero commit/rollback antes de leer. El check
-    `< _MAX_EDITS` ahora ve el incremento del primero y rechaza con
-    400.
+    espera a que el primero commit/rollback antes de leer y observa
+    ``status=editing``, por lo que se rechaza con 409 sin publicar otro render.
 
 WARNING: este test solo es válido en Postgres. En SQLite,
 with_for_update() es no-op y el test daría false-green (pasaría sin
@@ -29,16 +28,16 @@ from database import Job as JobModel
 
 @pytest.mark.postgres
 def test_concurrent_edits_respect_max_edits_limit(client, user_token, db):
-    """5 requests POST /edit concurrentes (usuario NO-admin); solo
-    _MAX_EDITS=3 deben ganar. Los otros 2 deben recibir 400 con
-    'Maximum edit limit'. Verifica que el lock with_for_update()
-    serializa el read-validate-write de edit_count.
+    """5 requests POST /edit concurrentes (usuario NO-admin); solo una
+    debe iniciar el render. Las demás reciben 409 ``edit_in_progress``.
+
+    Además de serializar ``edit_count``, el lock evita pagar/renderizar tres
+    variantes simultáneas sobre la misma revisión. El límite acumulado de tres
+    se ejerce entre renders terminados, no dentro de una ráfaga concurrente.
 
     Usa user_token (no admin): el límite solo aplica a no-admins —
     los admins son exentos (ver test_admin_exempt_from_edit_limit).
     """
-    from pipeline import _MAX_EDITS
-
     # El job debe vivir en el tenant del usuario para que /edit lo
     # encuentre (filtra por current_user["tenant_id"]).
     me = client.get(
@@ -96,22 +95,22 @@ def test_concurrent_edits_respect_max_edits_limit(client, user_token, db):
         t.join(timeout=10.0)
 
     ok_count = sum(1 for s in statuses if s == 200)
-    bad_count = sum(1 for s in statuses if s == 400)
+    conflict_count = sum(1 for s in statuses if s == 409)
 
-    assert ok_count == _MAX_EDITS, (
-        f"esperado {_MAX_EDITS} edits exitosos, hubo {ok_count}. "
+    assert ok_count == 1, (
+        f"esperado un único edit aceptado, hubo {ok_count}. "
         f"Status codes: {sorted(statuses)}. Race condition no protegida — "
         f"verificá with_for_update() en main.py:/edit endpoint."
     )
-    assert bad_count == n_threads - _MAX_EDITS, (
-        f"esperado {n_threads - _MAX_EDITS} requests rechazados con 400, "
-        f"hubo {bad_count}. Status codes: {sorted(statuses)}."
+    assert conflict_count == n_threads - 1, (
+        f"esperado {n_threads - 1} requests rechazados con 409, "
+        f"hubo {conflict_count}. Status codes: {sorted(statuses)}."
     )
 
     db.expire_all()
     fresh = db.query(JobModel).filter(JobModel.job_id == job_id).first()
-    assert fresh.edit_count == _MAX_EDITS, (
-        f"edit_count en DB es {fresh.edit_count}, esperado {_MAX_EDITS}. "
+    assert fresh.edit_count == 1, (
+        f"edit_count en DB es {fresh.edit_count}, esperado 1. "
         f"El race se coló — múltiples requests pasaron el check < _MAX_EDITS."
     )
 

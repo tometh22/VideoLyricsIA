@@ -27,7 +27,8 @@ from queue_jobs import pipeline_failure_callback
 
 
 def _seed_job(db, *, status: str = "processing", job_id: str | None = None) -> str:
-    jid = job_id or f"qrtest_{uuid.uuid4().hex[:6]}"
+    # Production job ids are VARCHAR(12): prefix (7) + random suffix (5).
+    jid = job_id or f"qrtest_{uuid.uuid4().hex[:5]}"
     db.add(Job(
         job_id=jid,
         user_id=1,
