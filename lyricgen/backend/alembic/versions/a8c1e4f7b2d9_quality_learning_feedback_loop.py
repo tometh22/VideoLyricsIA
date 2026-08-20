@@ -16,6 +16,10 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _json():
+    return postgresql.JSONB(astext_type=sa.Text()).with_variant(sa.JSON(), "sqlite")
+
+
 def upgrade() -> None:
     op.add_column(
         "jobs",
@@ -30,7 +34,7 @@ def upgrade() -> None:
     )
     op.add_column(
         "editor_versions",
-        sa.Column("provenance", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+        sa.Column("provenance", _json(), nullable=True),
     )
     op.create_table(
         "correction_observations",
@@ -55,9 +59,9 @@ def upgrade() -> None:
         sa.Column("artist_hmac", sa.String(64), nullable=True),
         sa.Column("song_hmac", sa.String(64), nullable=True),
         sa.Column("hmac_key_id", sa.String(32), nullable=False, server_default="legacy-v1"),
-        sa.Column("categories", postgresql.JSONB(), nullable=False),
-        sa.Column("features", postgresql.JSONB(), nullable=False),
-        sa.Column("metrics", postgresql.JSONB(), nullable=False),
+        sa.Column("categories", _json(), nullable=False),
+        sa.Column("features", _json(), nullable=False),
+        sa.Column("metrics", _json(), nullable=False),
         sa.Column("active_edit_ms", sa.BigInteger(), nullable=True),
         sa.Column("matures_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("trusted_at", sa.DateTime(timezone=True), nullable=True),
@@ -98,7 +102,7 @@ def upgrade() -> None:
         sa.Column("ci_low", sa.Float(), nullable=False, server_default="0"),
         sa.Column("ci_high", sa.Float(), nullable=False, server_default="0"),
         sa.Column("impact_seconds", sa.Float(), nullable=False, server_default="0"),
-        sa.Column("evidence", postgresql.JSONB(), nullable=False),
+        sa.Column("evidence", _json(), nullable=False),
         sa.Column("version", sa.Integer(), nullable=False, server_default="1"),
         sa.Column("first_seen_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("last_seen_at", sa.DateTime(timezone=True), nullable=False),
@@ -117,14 +121,18 @@ def upgrade() -> None:
         sa.Column("hypothesis", sa.Text(), nullable=False),
         sa.Column("status", sa.String(32), nullable=False, server_default="draft"),
         sa.Column("version", sa.Integer(), nullable=False, server_default="1"),
-        sa.Column("candidate_config", postgresql.JSONB(), nullable=False),
-        sa.Column("expected_impact", postgresql.JSONB(), nullable=False),
-        sa.Column("validation_summary", postgresql.JSONB(), nullable=True),
-        sa.Column("ready_artifact", postgresql.JSONB(), nullable=True),
+        sa.Column("candidate_config", _json(), nullable=False),
+        sa.Column("expected_impact", _json(), nullable=False),
+        sa.Column("validation_summary", _json(), nullable=True),
+        sa.Column("ready_artifact", _json(), nullable=True),
         sa.Column("approved_by", sa.Integer(), nullable=True),
         sa.Column("decision_reason", sa.String(500), nullable=True),
         sa.Column("last_idempotency_key", sa.String(100), nullable=True),
-        sa.Column("action_idempotency_keys", postgresql.JSONB(astext_type=sa.Text()), nullable=False, server_default=sa.text("'[]'::jsonb")),
+        sa.Column(
+            "action_idempotency_keys", _json(), nullable=False,
+            server_default=sa.text("'[]'::jsonb")
+            if op.get_bind().dialect.name == "postgresql" else sa.text("'[]'"),
+        ),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.ForeignKeyConstraint(["pattern_id"], ["quality_patterns.id"], ondelete="CASCADE"),
@@ -142,7 +150,7 @@ def upgrade() -> None:
         sa.Column("baseline_config_hash", sa.String(64), nullable=True),
         sa.Column("candidate_config_hash", sa.String(64), nullable=False),
         sa.Column("benchmark_report_hash", sa.String(64), nullable=True),
-        sa.Column("metrics", postgresql.JSONB(), nullable=False),
+        sa.Column("metrics", _json(), nullable=False),
         sa.Column("failure_reason", sa.String(500), nullable=True),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),

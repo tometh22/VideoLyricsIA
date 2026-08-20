@@ -1,6 +1,23 @@
 import pytest
 
 
+def test_production_render_fails_closed_without_object_storage(monkeypatch, tmp_path):
+    import pipeline
+
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    monkeypatch.setattr(pipeline.storage, "is_enabled", lambda: False)
+    with pytest.raises(pipeline.StorageUploadError, match="not configured"):
+        pipeline._upload_deliverables_to_r2("job", str(tmp_path), {})
+
+
+def test_development_render_can_keep_local_outputs(monkeypatch, tmp_path):
+    import pipeline
+
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.setattr(pipeline.storage, "is_enabled", lambda: False)
+    assert pipeline._upload_deliverables_to_r2("job", str(tmp_path), {}) == {}
+
+
 def test_r2_upload_retries_in_same_worker_and_deletes_only_after_success(tmp_path, monkeypatch):
     import jobs
     import pipeline

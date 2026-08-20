@@ -89,8 +89,7 @@ def test_callback_marks_processing_job_as_error_on_worker_death():
 
 def test_callback_surfaces_real_pipeline_error_to_user():
     """A real exception inside run_pipeline (not a worker death) should
-    surface a short version of the message to the user, prefixed so
-    they understand it was a render failure after retries."""
+    surface safe actionable copy and keep raw diagnostics out of the row."""
     db = SessionLocal()
     try:
         _cleanup(db)
@@ -109,11 +108,9 @@ def test_callback_surfaces_real_pipeline_error_to_user():
         row = db.query(Job).filter(Job.job_id == jid).first()
         db.refresh(row)
         assert row.status == "error"
-        assert "fall" in (row.error or "").lower()
-        assert "ffmpeg" in (row.error or "").lower(), (
-            f"expected exception message to leak into user-facing error, "
-            f"got {row.error!r}"
-        )
+        assert "render" in (row.error or "").lower()
+        assert "ffmpeg" not in (row.error or "").lower()
+        assert row.error_code == "pipeline_render"
     finally:
         _cleanup(db)
         db.close()

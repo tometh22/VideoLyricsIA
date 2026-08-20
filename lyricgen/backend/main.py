@@ -45,7 +45,7 @@ from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.exc import OperationalError, TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import ObjectDeletedError
@@ -2809,21 +2809,43 @@ def _audit_cross_tenant_access(db: Session, current_user: dict, job: dict, kind:
         logger.warning("[AUDIT] cross-tenant access log failed: %s", e)
 
 
-def _lock_user_for_quota(db: Session, user_id: int) -> None:
-    """Take a row-level lock on the user so the count → insert sequence
-    in /upload becomes atomic.
+def _quota_scope_key(current_user: dict) -> str:
+    """Stable lock identity for the same account scope used by usage queries."""
+    billing_group = (current_user.get("billing_group") or "").strip()
+    if billing_group:
+        return f"billing_group:{billing_group}"
+    return f"tenant:{current_user['tenant_id']}"
 
-    Without this, two concurrent uploads at limit-1 both pass the count
-    check before either inserts the new Job row, and the tenant exceeds
-    its quota by N. Postgres SELECT ... FOR UPDATE serializes the reads
-    on the user row; the lock is released when the request's transaction
-    commits or rolls back. SQLite (used by tests) ignores FOR UPDATE.
+
+def _lock_quota_scope(db: Session, current_user: dict) -> None:
+    """Serialize count → mutation for every member of a billing account.
+
+    Locking one User row is insufficient because quota is tenant-wide (or
+    billing-group-wide): two different users could each lock their own row and
+    both spend the final credit. A transaction-scoped advisory lock gives the
+    logical account a single mutex without introducing a new account table.
     """
-    if "sqlite" in str(db.bind.url):
+    bind = db.get_bind()
+    if bind.dialect.name == "sqlite":
         return
+    if bind.dialect.name != "postgresql":
+        raise RuntimeError("atomic quota locking requires PostgreSQL")
     db.execute(
-        User.__table__.select().where(User.id == user_id).with_for_update()
-    ).first()
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:scope, 0))"),
+        {"scope": _quota_scope_key(current_user)},
+    ).scalar()
+
+
+def _lock_user_for_quota(db: Session, user_id: int) -> None:
+    """Compatibility wrapper for older tests/callers.
+
+    New code must call :func:`_lock_quota_scope` with the complete account
+    identity. The wrapper resolves the user before taking that logical lock.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        return
+    _lock_quota_scope(db, user.to_dict())
 
 
 def _try_send_usage_alert(db: Session, current_user: dict, usage: dict) -> None:
@@ -2860,8 +2882,9 @@ def _try_send_usage_alert(db: Session, current_user: dict, usage: dict) -> None:
         if not prefs.get(notif_key, True):
             return
 
+        # Do not commit here. Quota callers hold a transaction-scoped account
+        # lock and must keep it until the job/approval mutation commits.
         db.add(AuditLog(user_id=user_obj.id, action=action, detail={"percent": percent}))
-        db.commit()
 
         threading.Thread(
             target=emails.send_usage_alert,
@@ -2879,8 +2902,14 @@ def _try_send_usage_alert(db: Session, current_user: dict, usage: dict) -> None:
         logger.warning("usage alert skipped: %s", _e)
 
 
-def _enforce_plan_quota(db: Session, current_user: dict,
-                        credits_needed: int = 1) -> None:
+def _enforce_plan_quota(
+    db: Session,
+    current_user: dict,
+    credits_needed: int = 1,
+    *,
+    lock_scope: bool = True,
+    send_alert: bool = True,
+) -> None:
     """Raise 402 if the account can't cover the video about to be generated.
 
     The message is operator-facing (UMG, label teams). It avoids
@@ -2898,10 +2927,11 @@ def _enforce_plan_quota(db: Session, current_user: dict,
     """
     plan = current_user.get("plan", "100")
     tenant_id = current_user["tenant_id"]
-    _lock_user_for_quota(db, current_user["id"])
+    if lock_scope:
+        _lock_quota_scope(db, current_user)
     usage = get_plan_usage(db, current_user["id"], tenant_id, plan,
                            billing_group=current_user.get("billing_group"))
-    if plan != "unlimited" and usage["percent"] >= 80:
+    if send_alert and plan != "unlimited" and usage["percent"] >= 80:
         _try_send_usage_alert(db, current_user, usage)
     available = usage["total_available"]
     if available < credits_needed and plan != "unlimited":
@@ -2925,6 +2955,53 @@ def _enforce_plan_quota(db: Session, current_user: dict,
                     f"Para extender el cupo, contactá a {support_email}."
                 ),
             )
+
+
+def _commit_pipeline_publication(
+    db: Session,
+    job,
+    purpose: str,
+    *,
+    mp3_path: str | None,
+    artist: str,
+    style: str,
+    plan: str,
+    tenant_id: str,
+    **pipeline_kwargs,
+) -> dict:
+    """Atomically persist a job mutation and its durable RQ publication."""
+    from transactional_outbox import (
+        create_pipeline_outbox_event,
+        dispatch_outbox_event,
+    )
+
+    event = create_pipeline_outbox_event(
+        db,
+        job=job,
+        purpose=purpose,
+        mp3_path=mp3_path,
+        artist=artist,
+        style=style,
+        plan=plan,
+        tenant_id=tenant_id,
+        pipeline_kwargs=pipeline_kwargs,
+    )
+    event_id = event.id
+    db.commit()
+    delivery = dispatch_outbox_event(
+        event_id, pipeline_publisher=enqueue_pipeline,
+    )
+    if delivery.get("status") != "dispatched":
+        logger.warning(
+            "[OUTBOX] pipeline publication pending job=%s event=%s status=%s",
+            job.job_id, event_id, delivery.get("status"),
+        )
+        try:
+            from queue_jobs import ensure_job_outbox_reconciler_scheduled
+            ensure_job_outbox_reconciler_scheduled()
+        except Exception as exc:
+            logger.warning("[OUTBOX] reconciler scheduling failed: %s", exc)
+    return delivery
 
 
 # System default for per-tenant daily cap when User.max_videos_per_day is None.
@@ -4056,6 +4133,18 @@ async def transcribe_uploaded(
             or job_row.user_id != current_user["id"]
             or job_row.tenant_id != current_user["tenant_id"]):
         raise HTTPException(status_code=404, detail="Job not found.")
+    # Idempotent browser retry: once the durable intent exists, do not create
+    # another outbox event or touch the active RQ record. This check must
+    # precede the general allowed-state guard below.
+    if (
+        job_row.status == "transcribing_queued"
+        and job_row.active_transcription_attempt_id
+    ):
+        return {
+            "job_id": job_row.job_id,
+            "status": "transcribing_queued",
+            "deduplicated": True,
+        }
     # `transcription_failed` added 2026-06-09: honours the reaper's customer-
     # facing "apretá Reintentar para volver a transcribir" promise
     # (reaper.py:_reason_for_transcription). The audio still lives in R2
@@ -4162,10 +4251,41 @@ async def transcribe_uploaded(
         # devuelva un estado coherente desde el momento del enqueue.
         from database import SessionLocal as _SL
         _db2 = _SL()
+        event_id = None
         try:
-            _row2 = get_job_model(_db2, job_id)
+            _row2 = (
+                _db2.query(Job)
+                .filter(
+                    Job.job_id == job_id,
+                    Job.user_id == current_user["id"],
+                    Job.tenant_id == current_user["tenant_id"],
+                )
+                .with_for_update()
+                .first()
+            )
             if _row2 is None:
                 raise HTTPException(status_code=404, detail="Job not found.")
+            if (
+                _row2.status == "transcribing_queued"
+                and _row2.active_transcription_attempt_id
+            ):
+                return {
+                    "job_id": job_id,
+                    "status": "transcribing_queued",
+                    "deduplicated": True,
+                }
+            if _row2.status not in (
+                "awaiting_upload", "transcribed_pending", "transcription_failed",
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Job is in state {_row2.status!r}, cannot transcribe.",
+                )
+            if int(getattr(_row2, "segments_revision", 0) or 0) > 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail="La letra ya tiene ediciones guardadas; creá una nueva transcripción para no sobrescribirlas.",
+                )
             _row2.status = "transcribing_queued"
             # Publish a frontend-recognised stage before enqueue. The wizard
             # used to sit at an unexplained 0% throughout the API-side R2
@@ -4180,42 +4300,43 @@ async def transcribe_uploaded(
             # would re-kill it instantly (same class of bug retry_job guards at
             # main.py:9107). Harmless for fresh awaiting_upload jobs.
             _row2.last_progress_at = datetime.now(timezone.utc)
+            from transactional_outbox import create_transcription_outbox_event
+            event = create_transcription_outbox_event(
+                _db2,
+                job=_row2,
+                audio_path=audio_path,
+                transcription_kwargs={
+                    "language": body.language,
+                    "artist": _row_artist,
+                    "title": _row_title,
+                    "filename": _row_filename,
+                    "tenant_id": current_user.get("tenant_id", ""),
+                    "live": bool(body.live),
+                    "anchor_lyrics": body.anchor_lyrics or "",
+                },
+            )
+            event_id = event.id
             _db2.commit()
         finally:
             _db2.close()
-        try:
-            from queue_jobs import enqueue_transcription
-            # HOTFIX 2026-05-27: use the Job row as the single source of
-            # truth for artist/title. Previously we accepted body.artist /
-            # body.title from the request, which let the frontend send
-            # different metadata than what /upload-url committed to the
-            # row — opening a path where two transcription jobs ended up
-            # in queue with swapped metadata (agus.cafisi incident 16:42).
-            # Any client-side correction must now go through PATCH
-            # /jobs/{id} BEFORE calling /transcribe-uploaded.
-            enqueue_transcription(
-                job_id,
-                audio_path,
-                language=body.language,
-                artist=_row_artist,
-                title=_row_title,
-                filename=_row_filename,
-                tenant_id=current_user.get("tenant_id", ""),
-                live=bool(body.live),
-                anchor_lyrics=body.anchor_lyrics or "",
+        from transactional_outbox import dispatch_outbox_event
+        delivery = dispatch_outbox_event(event_id)
+        if delivery.get("status") != "dispatched":
+            logger.warning(
+                "[OUTBOX] transcription pending job=%s event=%s status=%s",
+                job_id, event_id, delivery.get("status"),
             )
-        except Exception as exc:
-            logger.exception("[TRANSCRIBE] enqueue failed for job=%s", job_id)
-            # Rollback el status para no dejar el job colgado en queued.
-            from jobs import update_job
-            update_job(job_id, status="transcription_failed",
-                       current_step="error", error=str(exc)[:300])
-            raise HTTPException(status_code=503, detail="Cola de transcripción no disponible. Reintentá.")
+            try:
+                from queue_jobs import ensure_job_outbox_reconciler_scheduled
+                ensure_job_outbox_reconciler_scheduled()
+            except Exception as exc:
+                logger.warning("[OUTBOX] transcription reconciler unavailable: %s", exc)
         # 202 Accepted con el job_id para polling. No incluye segments —
         # el frontend pollea /transcription-status hasta status=transcribed.
         return {
             "job_id": job_id,
             "status": "transcribing_queued",
+            "queue_pending": delivery.get("status") != "dispatched",
         }
 
     # Legacy sync path (fallback con ASYNC_TRANSCRIBE_ENABLED=0).
@@ -4385,6 +4506,7 @@ def transcription_status(
             "segments_revision": int(getattr(job_row, "segments_revision", 0) or 0),
             "recovery_source": getattr(job_row, "recovery_source", None),
             "error": None,
+            "error_code": getattr(job_row, "error_code", None),
         }
         if status == "transcribed":
             payload["segments"] = job_row.segments_json or []
@@ -4408,7 +4530,8 @@ def transcription_status(
         # para que el frontend (y este smoke script) puedan diagnosticar.
         raise HTTPException(
             status_code=500,
-            detail=f"{type(exc).__name__}: {str(exc)[:200]}",
+            detail={"code": "transcription_status_unavailable",
+                    "message": "No pudimos consultar el estado de la transcripción."},
         )
 
 
@@ -4565,8 +4688,10 @@ async def generate_preview(
     except Exception as exc:
         logger.exception("[BG_PREVIEW] enqueue failed for %s", job_id)
         from jobs import update_job
+        from error_taxonomy import public_error
+        error_code, error_message = public_error(exc, context="background_preview")
         update_job(job_id, status="bg_preview_failed", current_step="error",
-                   error=str(exc)[:300])
+                   error=error_message, error_code=error_code)
         raise HTTPException(503, detail="Cola de pre-gen no disponible.")
 
     track_request(cache_hit=False)
@@ -4624,6 +4749,7 @@ async def generate_preview_status(
             "job_id": job_id,
             "status": job_row.status or "",
             "error": getattr(job_row, "error", None),
+            "error_code": getattr(job_row, "error_code", None),
         }
     except HTTPException:
         raise
@@ -4632,7 +4758,8 @@ async def generate_preview_status(
         logger.exception("[BG_PREVIEW_STATUS] job=%s 500: %s", job_id, exc)
         raise HTTPException(
             500,
-            detail=f"{type(exc).__name__}: {str(exc)[:200]}",
+            detail={"code": "background_preview_status_unavailable",
+                    "message": "No pudimos consultar el estado del fondo."},
         )
 
 
@@ -4802,7 +4929,8 @@ async def upload(
         artist=artist, style=style, filename=safe_name,
         user_id=current_user["id"], tenant_id=tenant_id,
         delivery_profile=delivery_profile, umg_spec=umg_spec,
-        initial_status=initial_status,
+        # Keep the durable row non-runnable until the outbox intent is committed.
+        initial_status="awaiting_upload",
         song_title=song_title,
     )
     # 2026-05-28 dedup gap (audit #88): mirror the /generate pattern
@@ -4863,8 +4991,13 @@ async def upload(
     except (ValueError, TypeError):
         pass
 
-    enqueue_pipeline(
-        job_id=job_id,
+    job_row = db.query(Job).filter(Job.job_id == job_id).with_for_update().one()
+    job_row.status = initial_status
+    job_row.current_step = "queued"
+    job_row.progress = 0
+    job_row.input_r2_key = input_r2_key
+    _commit_pipeline_publication(
+        db, job_row, "legacy_upload",
         mp3_path=mp3_path,
         artist=artist,
         style=style,
@@ -9446,8 +9579,10 @@ async def generate_with_segments(
         job_row.style = style
         job_row.delivery_profile = delivery_profile
         job_row.umg_spec = umg_spec
-        job_row.status = initial_status
-        job_row.current_step = "queued"
+        # The runnable transition is committed atomically with the outbox after
+        # all request-side validation/background work has succeeded.
+        job_row.status = "transcribed_pending"
+        job_row.current_step = "editing"
         # Audit 2026-05-26 (#388 wizard-duplicate-jobs): reset progress +
         # error + last_progress_at on reuse. Without this, a double-fire
         # of /generate on the same job_id can land here while a prior
@@ -9528,7 +9663,7 @@ async def generate_with_segments(
             artist=artist, style=style, filename=existing_filename,
             user_id=current_user["id"], tenant_id=tenant_id,
             delivery_profile=delivery_profile, umg_spec=umg_spec,
-            initial_status=initial_status,
+            initial_status="transcribed_pending",
             song_title=song_title,
         )
 
@@ -9683,8 +9818,15 @@ async def generate_with_segments(
                 job_id, _bg_cache_key_norm,
             )
 
-    enqueue_pipeline(
-        job_id=job_id,
+    publication_job = (
+        db.query(Job).filter(Job.job_id == job_id).with_for_update().one()
+    )
+    publication_job.status = initial_status
+    publication_job.current_step = "queued"
+    publication_job.progress = 0
+    publication_job.last_progress_at = datetime.now(timezone.utc)
+    _commit_pipeline_publication(
+        db, publication_job, "generate",
         mp3_path=mp3_path,
         artist=artist,
         style=style,
@@ -9978,11 +10120,8 @@ async def job_events(
     # bg_preview_*. SSE for those statuses polled forever → socket leak +
     # the frontend never received the close event → operator's UI made it
     # look like the job "disappeared".
-    TERMINAL = {
-        "done", "pending_review", "error", "rejected",
-        "validation_failed", "transcription_failed",
-        "bg_preview_done", "bg_preview_failed",
-    }
+    from job_states import TERMINAL_STATUSES
+    TERMINAL = TERMINAL_STATUSES
     scope = _job_scope(current_user)
     # Capturamos identidad+tenant al abrir para re-validar en cada poll.
     # Sin esto, si un admin transfiere al user entre tenants mid-stream
@@ -11012,8 +11151,33 @@ async def approve_job(
     job = job_query.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # Quota is charged to the job owner's account, not to a platform admin who
+    # may be approving cross-tenant. Take the account lock before the job row
+    # lock so all quota-consuming paths share one deterministic lock order.
+    billing_user = db.query(User).filter(User.id == job.user_id).first()
+    if billing_user is None:
+        raise HTTPException(status_code=409, detail="Job owner no longer exists")
+    billing_identity = billing_user.to_dict()
+    _lock_quota_scope(db, billing_identity)
+
+    job = job_query.with_for_update().first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "pending_review":
         raise HTTPException(status_code=400, detail="Job is not pending review")
+
+    scene_plan = job.scene_plan if isinstance(job.scene_plan, dict) else {}
+    approval_credits = (
+        scenes_credit_cost() if scene_plan.get("scenes") is not None else 1
+    )
+    _enforce_plan_quota(
+        db,
+        billing_identity,
+        credits_needed=approval_credits,
+        lock_scope=False,
+        send_alert=False,
+    )
 
     is_cross_tenant_admin = (
         current_user.get("role") == "admin"
@@ -13570,6 +13734,28 @@ async def request_edit(
             detail=f"Maximum edit limit ({_MAX_EDITS}) reached. Please approve or reject.",
         )
 
+    # Legacy library jobs persisted only render_params.background_id. Recover
+    # the durable R2 key after validating that the asset still exists and is
+    # visible to this tenant; never trust the integer from JSON by itself.
+    if body.edit_type in ("typography", "lyrics", "metadata") and not job.bg_r2_key_cached:
+        _legacy_background_id = (job.render_params or {}).get("background_id")
+        if _legacy_background_id is not None:
+            _legacy_asset = (
+                db.query(BackgroundAsset)
+                .filter(
+                    BackgroundAsset.id == _legacy_background_id,
+                    BackgroundAsset.is_active == True,  # noqa: E712
+                )
+                .first()
+            )
+            if (
+                _legacy_asset
+                and _user_can_use_asset(_legacy_asset, current_user)
+                and _background_asset_is_available(_legacy_asset)
+                and (_legacy_asset.filename or "").startswith("library/")
+            ):
+                job.bg_r2_key_cached = _legacy_asset.filename
+
     # Typography, lyrics, and metadata reuse the cached background. Without
     # bg_r2_key_cached set, the worker can't avoid re-running Veo —
     # which defeats the point of these fast-path edits.
@@ -14786,8 +14972,6 @@ async def retry_job(
         action="job.retry",
         detail={"job_id": job_id, "previous_status": _previous_status},
     ))
-    db.commit()
-
     umg_spec = job.umg_spec or {}
     # Preserve the user's lyric edits across retries. Without this, the
     # pipeline re-ran Whisper from scratch on every retry and silently
@@ -14888,8 +15072,8 @@ async def retry_job(
             detail="Art Track no está habilitado para tu cuenta.",
         )
 
-    enqueue_pipeline(
-        job_id=job_id,
+    _commit_pipeline_publication(
+        db, job, "retry",
         mp3_path=None,
         artist=job.artist,
         style=job.style or "oscuro",
@@ -15080,10 +15264,8 @@ async def edit_art_track(
             "effect": effect_val,
         },
     ))
-    db.commit()
-
-    enqueue_pipeline(
-        job_id=job_id,
+    _commit_pipeline_publication(
+        db, job, "art_track_edit",
         mp3_path=None,
         artist=job.artist,
         style=job.style or "oscuro",
@@ -15652,13 +15834,6 @@ async def create_variant(
             "cross_tenant_admin": _is_cross_tenant_admin,
         },
     ))
-    db.commit()
-    logger.info(
-        "[VARIANT] created job=%s parent=%s tenant=%s bypass=%s force=%s",
-        new_job_id, parent.job_id, variant_tenant_id,
-        bool(body.bypass_content_validation), bool(body.force_content_validation),
-    )
-
     # Encolar con segments_override para saltar Whisper. Mismo kwargs
     # shape que /retry, más concept/background_hint si vinieron.
     pipeline_kwargs = {
@@ -15703,8 +15878,8 @@ async def create_variant(
     if _variant_hint:
         pipeline_kwargs["background_hint"] = _variant_hint
 
-    enqueue_pipeline(
-        job_id=new_job_id,
+    _commit_pipeline_publication(
+        db, new_job, "variant",
         mp3_path=None,
         artist=parent.artist,
         style=new_style,
@@ -15720,6 +15895,11 @@ async def create_variant(
         variation_source_r2_key=variant_variation_source_r2_key,
         variation_parent_asset_id=variant_variation_parent_id,
         **pipeline_kwargs,
+    )
+    logger.info(
+        "[VARIANT] created job=%s parent=%s tenant=%s bypass=%s force=%s",
+        new_job_id, parent.job_id, variant_tenant_id,
+        bool(body.bypass_content_validation), bool(body.force_content_validation),
     )
 
     return {

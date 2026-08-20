@@ -154,6 +154,12 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
        behavior because they're lazy-regenerated on first /download.
     """
     if not storage.is_enabled():
+        if os.environ.get("ENVIRONMENT", "production").strip().lower() in {
+            "production", "prod", "staging",
+        }:
+            raise StorageUploadError(
+                "Required object storage is not configured for deliverables"
+            )
         return {}
     from jobs import merge_s3_keys, heartbeat
     # We need a SQLAlchemy session, but this function runs in the worker
@@ -2359,15 +2365,16 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
     except Exception as exc:
         _raise_if_job_timeout(exc)
         traceback.print_exc()
-        from error_taxonomy import classify_error
+        from error_taxonomy import classify_error, public_error
         error_category = (
             "storage_upload" if isinstance(exc, StorageUploadError)
             else classify_error(str(exc))
         )
-        update_job(
-            job_id, status="error", error=str(exc),
-            error_category=error_category,
+        error_code, error_message = public_error(
+            exc, context="pipeline", category=error_category,
         )
+        update_job(job_id, status="error", error=error_message,
+                   error_category=error_category, error_code=error_code)
         # Surface render failures to Sentry. The worker runs outside
         # the FastAPI request loop so the framework's auto-capture
         # doesn't fire — without this explicit hook, ffmpeg hangs,
@@ -18941,15 +18948,16 @@ def run_edit_pipeline(
     except Exception as exc:
         _raise_if_job_timeout(exc)
         logger.error("[EDIT] job=%s FAILED: %s", job_id, exc, exc_info=True)
-        from error_taxonomy import classify_error
+        from error_taxonomy import classify_error, public_error
         error_category = (
             "storage_upload" if isinstance(exc, StorageUploadError)
             else classify_error(str(exc))
         )
-        update_job(
-            job_id, status="error", error=f"Edit failed: {exc}",
-            error_category=error_category,
+        error_code, error_message = public_error(
+            exc, context="edit", category=error_category,
         )
+        update_job(job_id, status="error", error=error_message,
+                   error_category=error_category, error_code=error_code)
         _write_edit_audit(
             action="job.edit_failed",
             detail={

@@ -52,9 +52,11 @@ def test_concurrent_edits_respect_max_edits_limit(client, user_token, db):
     job_id = uuid.uuid4().hex[:12]
     job = JobModel(
         job_id=job_id,
+        user_id=me["id"],
         tenant_id=tenant_id,
         artist="Test",
         song_title="Race Test",
+        filename="race-test.wav",
         status="pending_review",
         delivery_profile="youtube",
         progress=100,
@@ -133,9 +135,11 @@ def test_admin_exempt_from_edit_limit(client, admin_token, db, monkeypatch):
     job_id = uuid.uuid4().hex[:12]
     job = JobModel(
         job_id=job_id,
+        user_id=me["id"],
         tenant_id=me["tenant_id"],
         artist="Test",
         song_title="Admin Exempt",
+        filename="admin-exempt.wav",
         status="pending_review",
         delivery_profile="youtube",
         progress=100,
@@ -169,9 +173,11 @@ def test_status_reports_edit_limit_exempt_for_admin(client, admin_token, db):
     ).json()
     job = JobModel(
         job_id=job_id,
+        user_id=me["id"],
         tenant_id=me["tenant_id"],
         artist="Test",
         song_title="Exempt Status",
+        filename="admin-status.wav",
         status="pending_review",
         delivery_profile="youtube",
         progress=100,

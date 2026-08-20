@@ -6,7 +6,7 @@ fijan el comportamiento esperado del dashboard de actividad.
 """
 import pytest
 
-from error_taxonomy import CATEGORIES, UNKNOWN, classify_error
+from error_taxonomy import CATEGORIES, UNKNOWN, classify_error, public_error
 
 
 # (mensaje real, categoría esperada)
@@ -68,3 +68,11 @@ def test_classify_never_raises():
     for weird in (None, "", 0, 123, {"a": 1}, ["x"], Exception("boom")):
         result = classify_error(weird)
         assert result in CATEGORIES
+
+
+def test_public_error_never_leaks_raw_exception_details():
+    secret = "https://r2.example/file?X-Amz-Signature=super-secret /tmp/customer.wav"
+    code, message = public_error(RuntimeError(secret), context="pipeline")
+    assert code == "pipeline_unknown"
+    assert "super-secret" not in message
+    assert "/tmp/customer.wav" not in message

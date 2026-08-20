@@ -28,7 +28,8 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     op.add_column(
         "jobs",
-        sa.Column("scene_plan", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+        sa.Column("scene_plan", postgresql.JSONB(astext_type=sa.Text()).with_variant(
+            sa.JSON(), "sqlite"), nullable=True),
     )
 
 

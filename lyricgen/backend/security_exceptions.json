@@ -1,0 +1,17 @@
+{
+  "exceptions": [
+    {"package": "torch", "id": "PYSEC-2025-206", "expires": "2026-10-31", "owner": "backend/video"},
+    {"package": "torch", "id": "PYSEC-2025-204", "expires": "2026-10-31", "owner": "backend/video"},
+    {"package": "torch", "id": "PYSEC-2026-139", "expires": "2026-10-31", "owner": "backend/video"},
+    {"package": "torch", "id": "PYSEC-2025-203", "expires": "2026-10-31", "owner": "backend/video"},
+    {"package": "torch", "id": "PYSEC-2025-194", "expires": "2026-10-31", "owner": "backend/video"},
+    {"package": "torch", "id": "PYSEC-2026-2286", "expires": "2026-10-31", "owner": "backend/video"},
+    {"package": "torch", "id": "CVE-2025-2999", "expires": "2026-10-31", "owner": "backend/video"},
+    {"package": "torch", "id": "CVE-2025-3001", "expires": "2026-10-31", "owner": "backend/video"},
+    {"package": "transformers", "id": "PYSEC-2025-217", "expires": "2026-10-31", "owner": "backend/video"},
+    {"package": "transformers", "id": "PYSEC-2026-2290", "expires": "2026-10-31", "owner": "backend/video"},
+    {"package": "transformers", "id": "PYSEC-2026-2288", "expires": "2026-10-31", "owner": "backend/video"},
+    {"package": "transformers", "id": "PYSEC-2026-2289", "expires": "2026-10-31", "owner": "backend/video"},
+    {"package": "ecdsa", "id": "PYSEC-2026-1325", "expires": "2026-10-31", "owner": "backend/video"}
+  ]
+}

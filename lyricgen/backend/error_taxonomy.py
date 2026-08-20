@@ -64,6 +64,18 @@ UNKNOWN = "unknown"
 # la misma lista.
 CATEGORIES = tuple(rule[0] for rule in _RULES) + (UNKNOWN,)
 
+_PUBLIC_MESSAGES = {
+    "validation": "El contenido no superó la validación requerida.",
+    "upload": "No pudimos transferir uno de los archivos. Reintentá en unos minutos.",
+    "storage_upload": "No pudimos guardar el resultado. Reintentá en unos minutos.",
+    "veo": "El servicio de generación visual no respondió correctamente. Reintentá en unos minutos.",
+    "render": "No pudimos completar el render del video. Tu archivo fuente sigue guardado.",
+    "timing": "No pudimos completar la sincronización de la letra.",
+    "reaper": "El proceso se interrumpió y agotó sus reintentos automáticos.",
+    "timeout": "La operación superó el tiempo máximo y agotó sus reintentos.",
+    UNKNOWN: "No pudimos completar la operación. El equipo técnico recibió el diagnóstico.",
+}
+
 
 def classify_error(error_text, status=None):
     """Clasifica un mensaje de error de job en una categoría estable.
@@ -83,3 +95,17 @@ def classify_error(error_text, status=None):
         if pattern.search(text):
             return category
     return UNKNOWN
+
+
+def public_error(error_text, *, context="pipeline", category=None):
+    """Return a stable code and safe user-facing copy for an exception.
+
+    Raw exception strings can contain signed URLs, local paths, provider
+    payloads or credentials. They belong in logs/Sentry, never in jobs.error
+    or HTTP responses consumed by the browser.
+    """
+    resolved = category or classify_error(error_text)
+    if resolved not in _PUBLIC_MESSAGES:
+        resolved = UNKNOWN
+    safe_context = re.sub(r"[^a-z0-9_]+", "_", str(context).lower()).strip("_")
+    return f"{safe_context or 'pipeline'}_{resolved}", _PUBLIC_MESSAGES[resolved]

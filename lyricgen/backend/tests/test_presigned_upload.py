@@ -542,6 +542,14 @@ def test_transcribe_uploaded_async_enqueues_without_api_download(
     assert len(enqueued) == 1
     assert enqueued[0][0] == job_id
     assert enqueued[0][1].endswith(f"/{job_id}/song.wav")
+    duplicate = client.post(
+        "/transcribe-uploaded",
+        json={"job_id": job_id, "language": "es"},
+        headers=auth(token),
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()["deduplicated"] is True
+    assert len(enqueued) == 1
     s = SessionLocal()
     try:
         row = get_job_model(s, job_id)
@@ -563,6 +571,7 @@ def test_transcribe_uploaded_promotes_status_and_calls_pipeline(
     from jobs import get_job_model
 
     _, token, _, _ = _make_user(client)
+    monkeypatch.setenv("ASYNC_TRANSCRIBE_ENABLED", "0")
 
     # Pre-seed an awaiting_upload row + R2 key.
     monkeypatch.setattr("main.storage.is_enabled", lambda: True)

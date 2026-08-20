@@ -65,7 +65,7 @@ def test_retry_whitelist_excludes_legacy_typography():
     # Sección del /retry — heurística: buscamos el bloque que arma
     # retry_pipeline_kwargs y verificamos que no nombre los legacy.
     retry_block_start = src.index("retry_pipeline_kwargs = {}")
-    retry_block_end = src.index("enqueue_pipeline(", retry_block_start)
+    retry_block_end = src.index("_commit_pipeline_publication(", retry_block_start)
     retry_block = src[retry_block_start:retry_block_end]
     assert '"text_motion"' not in retry_block, (
         "/retry whitelist no debe incluir text_motion."

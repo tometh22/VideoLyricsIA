@@ -68,6 +68,9 @@ MODEL_REVISION = os.environ.get(
     # separately benchmarked commit, never with a moving branch name.
     "96d7e9b4e4a78af515a3c6d3cee7c0826045d276",
 ).strip()
+_ALLOWED_MODEL_IDS = frozenset({
+    "jonatasgrosman/wav2vec2-large-xlsr-53-spanish",
+})
 SR = 16000
 FRAME = 320          # wav2vec2 stride: 1 emission frame per 320 samples (20 ms)
 CHUNK_S = 30.0       # encoder window
@@ -817,6 +820,12 @@ def _load_model():
     global _MODEL
     if _MODEL is not None:
         return _MODEL
+    if MODEL_ID not in _ALLOWED_MODEL_IDS:
+        raise RuntimeError(
+            "CTC_ALIGN_MODEL is not an approved immutable model identity"
+        )
+    if not re.fullmatch(r"[0-9a-f]{40}", MODEL_REVISION):
+        raise RuntimeError("CTC_ALIGN_MODEL_REVISION must be a 40-character commit SHA")
     from transformers import AutoModelForCTC, Wav2Vec2CTCTokenizer
 
     t0 = time.time()
