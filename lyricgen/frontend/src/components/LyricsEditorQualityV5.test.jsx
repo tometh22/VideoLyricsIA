@@ -356,6 +356,7 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
     await userEvent.click(screen.getByRole("button", { name: "Revisar sincronización" }));
     pauseSpy.mockClear();
     await userEvent.click(screen.getByRole("button", { name: /Reproducir este tramo en loop/i }));
+    await userEvent.click(screen.getByRole("button", { name: "Sí, está bien" }));
     await userEvent.click(screen.getByRole("button", { name: /Confirmar y seguir/i }));
     expect(pauseSpy).toHaveBeenCalled();
     expect(screen.getByText("Parte 2 de 2")).toBeInTheDocument();

@@ -60,6 +60,7 @@ function FocusedWaveform({
   onSeek,
   onSelect,
   onMove,
+  interactive = false,
 }) {
   const { t } = useI18n();
   const canvasRef = useRef(null);
@@ -222,12 +223,26 @@ function FocusedWaveform({
             const left = positionPct(start);
             const blockWidth = Math.max(2.5, positionPct(end) - left);
             const selected = segment._id === selectedId;
+            const phraseLabel = segment.text || t("timing_review.empty_phrase") || "Sin texto";
+            if (!interactive) {
+              return (
+                <span
+                  key={segment._id}
+                  data-testid={`guided-segment-${segment._id}`}
+                  aria-label={`${t("timing_review.phrase_marker") || "Frase"}: ${phraseLabel}`}
+                  className="absolute top-1.5 z-10 h-7 min-w-[28px] truncate rounded-lg border border-white/10 bg-surface-2/80 px-2 text-left text-[10px] font-medium text-ink-tertiary"
+                  style={{ left: `${left}%`, width: `${blockWidth}%` }}
+                >
+                  {phraseLabel}
+                </span>
+              );
+            }
             return (
               <button
                 key={segment._id}
                 type="button"
                 data-testid={`guided-segment-${segment._id}`}
-                aria-label={`${t("timing_review.move_phrase") || "Mover frase"}: ${segment.text || t("timing_review.empty_phrase") || "Sin texto"}`}
+                aria-label={`${t("timing_review.move_phrase") || "Mover frase"}: ${phraseLabel}`}
                 aria-pressed={selected}
                 title={t("timing_review.drag_hint") || "Arrastrá para mover esta frase"}
                 className={`absolute top-1.5 h-7 min-w-[28px] touch-none truncate rounded-lg border px-2 text-left text-[10px] font-medium shadow-lg transition-colors ${selected ? "z-20 border-brand-light/80 bg-brand text-white shadow-brand/25" : "z-10 border-white/15 bg-surface-2 text-ink-secondary hover:border-white/30 hover:text-white"}`}
@@ -239,7 +254,7 @@ function FocusedWaveform({
                 onPointerCancel={cancelDrag}
                 onLostPointerCapture={cancelDrag}
               >
-                {segment.text || t("timing_review.empty_phrase") || "Sin texto"}
+                {phraseLabel}
               </button>
             );
           })}
@@ -276,6 +291,9 @@ export default function GuidedTimingReview({
   const { t } = useI18n();
   const [activeWindowId, setActiveWindowId] = useState(null);
   const [selectedSegmentId, setSelectedSegmentId] = useState(null);
+  const [hasListened, setHasListened] = useState(false);
+  const [alignmentDecision, setAlignmentDecision] = useState(null);
+  const [showHowItWorks, setShowHowItWorks] = useState(false);
   const activeWindowSignatureRef = useRef(null);
   const pending = useMemo(() => windows.filter((window) => !confirmedIds.has(window.id)), [confirmedIds, windows]);
 
@@ -298,6 +316,11 @@ export default function GuidedTimingReview({
     if (previous && previous !== activeWindowSignature) onStopPlayback?.();
     activeWindowSignatureRef.current = activeWindowSignature;
   }, [activeWindowSignature, onStopPlayback]);
+
+  useEffect(() => {
+    setHasListened(false);
+    setAlignmentDecision(null);
+  }, [activeWindowId]);
   const overlappingSegments = useMemo(() => {
     if (!activeWindow) return [];
     return segments.filter((segment) => Number(segment.end) >= activeWindow.start && Number(segment.start) <= activeWindow.end);
@@ -342,7 +365,7 @@ export default function GuidedTimingReview({
   }, [confirmedIds, windows]);
 
   const confirmAndContinue = () => {
-    if (!activeWindow || !audioAvailable || !activeWindowPlayable) return;
+    if (!activeWindow || !audioAvailable || !activeWindowPlayable || !hasListened || !alignmentDecision) return;
     const next = nextWindow(activeWindow);
     onStopPlayback?.();
     onConfirm?.(activeWindow);
@@ -370,6 +393,33 @@ export default function GuidedTimingReview({
     onStopPlayback?.();
     onOpenAdvanced?.();
   };
+
+  const handlePlayWindow = () => {
+    if (!activeWindow || !audioAvailable || !activeWindowPlayable) return;
+    if (!hasListened) {
+      setHasListened(true);
+      setAlignmentDecision(null);
+    }
+    onPlayWindow?.(activeWindow);
+  };
+
+  const restartTutorial = () => {
+    setHasListened(false);
+    setAlignmentDecision(null);
+    setShowHowItWorks(true);
+  };
+
+  const adjustmentRequested = alignmentDecision === "no";
+  const workflowStep = !hasListened ? 1 : alignmentDecision === "yes" ? 3 : 2;
+  const listenButtonLabel = !activeWindowPlayable
+    ? (t("timing_review.window_outside_audio") || "Este tramo quedó fuera de la duración del audio")
+    : !audioAvailable
+    ? (audioLoading ? (t("timing_review.audio_loading") || "Cargando audio") : (t("timing_review.audio_unavailable") || "Audio no disponible"))
+    : (playingWindowId === activeWindow?.id && isPlaying
+      ? (t("timing_review.stop_loop") || "Detener repetición")
+      : (!hasListened
+        ? `${t("timing_review.listen_initial") || "Escuchar fragmento"} · ${t("timing_review.play_loop") || "Reproducir este tramo en loop"}`
+        : (t("timing_review.listen_again") || "Escuchar de nuevo")));
 
   if (!windows.length) {
     return (
@@ -403,6 +453,46 @@ export default function GuidedTimingReview({
 
   return (
     <section className="space-y-4" data-testid="guided-timing-review" aria-labelledby="guided-timing-title">
+      <div className="sticky top-0 z-30 rounded-2xl bg-surface-2/95 px-4 py-3 ring-1 ring-white/[0.08] shadow-lg shadow-black/10 backdrop-blur-sm" data-testid="guided-stepper">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-ink-tertiary">{t("timing_review.flow_label") || "Paso a paso"}</p>
+            <ol className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px] font-semibold" aria-label={t("timing_review.flow_label") || "Paso a paso"}>
+              {[
+                [1, t("timing_review.step_listen") || "Escuchá"],
+                [2, t("timing_review.step_compare") || "Compará/Ajustá"],
+                [3, t("timing_review.step_confirm") || "Confirmá"],
+              ].map(([step, label], index) => (
+                <li key={step} className="flex items-center gap-1.5">
+                  <span className={`rounded-full px-2 py-1 ${workflowStep === step ? "bg-brand text-white shadow-lg shadow-brand/20" : workflowStep > step ? "bg-emerald-400/15 text-emerald-200" : "bg-white/[0.06] text-ink-tertiary"}`}>
+                    {step}. {label}
+                  </span>
+                  {index < 2 && <span className="text-ink-tertiary" aria-hidden="true">→</span>}
+                </li>
+              ))}
+            </ol>
+          </div>
+          <button
+            type="button"
+            onClick={restartTutorial}
+            className="rounded-lg px-2.5 py-1.5 text-[11px] font-semibold text-ink-secondary ring-1 ring-white/[0.1] hover:bg-white/[0.06] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light"
+            aria-label={t("timing_review.how_it_works") || "Cómo funciona"}
+          >
+            ? {t("timing_review.how_it_works") || "Cómo funciona"}
+          </button>
+        </div>
+        {showHowItWorks && (
+          <aside className="mt-3 rounded-xl bg-brand/[0.08] px-3 py-3 text-[11px] leading-relaxed text-ink-secondary ring-1 ring-brand/20" role="dialog" aria-label={t("timing_review.how_it_works") || "Cómo funciona"}>
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="font-semibold text-white">{t("timing_review.tutorial_title") || "Revisá la sincronización en tres pasos"}</p>
+                <p className="mt-1">{t("timing_review.tutorial_body") || "Escuchá el fragmento, compará la frase con la voz y ajustala solo si hace falta. Si ya coincide, no muevas nada."}</p>
+              </div>
+              <button type="button" onClick={() => setShowHowItWorks(false)} className="shrink-0 rounded-md px-1.5 py-0.5 text-ink-tertiary hover:text-white" aria-label="Cerrar">×</button>
+            </div>
+          </aside>
+        )}
+      </div>
       <div className="flex flex-wrap items-start justify-between gap-3 rounded-2xl bg-brand/[0.065] px-4 py-3 ring-1 ring-brand/20">
         <div className="min-w-0">
           <p id="guided-timing-title" className="text-sm font-semibold text-white">
@@ -435,19 +525,21 @@ export default function GuidedTimingReview({
           </div>
           <button
             type="button"
-            onClick={() => onPlayWindow?.(activeWindow)}
+            onClick={handlePlayWindow}
             disabled={!audioAvailable || !activeWindowPlayable}
             className={`inline-flex h-9 items-center gap-2 rounded-xl px-3 text-xs font-semibold ring-1 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light disabled:cursor-not-allowed disabled:opacity-45 ${playingWindowId === activeWindow.id && isPlaying ? "bg-brand text-white ring-brand-light/50" : "bg-white/[0.06] text-white ring-white/[0.1] hover:bg-white/[0.1]"}`}
-            aria-label={!audioAvailable
-              ? (audioLoading ? (t("timing_review.audio_loading") || "Cargando audio") : (t("timing_review.audio_unavailable") || "Audio no disponible"))
-              : (playingWindowId === activeWindow.id && isPlaying ? (t("timing_review.stop_loop") || "Detener repetición") : (t("timing_review.play_loop") || "Reproducir este tramo en loop"))}
+            aria-label={listenButtonLabel}
+            data-testid="guided-listen-button"
+            title={t("timing_review.listen_tooltip") || "Escuchá el fragmento antes de decidir"}
           >
             {playingWindowId === activeWindow.id && isPlaying ? (
               <svg className="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 6h10v12H7z" /></svg>
             ) : (
               <svg className="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7z" /></svg>
             )}
-            {playingWindowId === activeWindow.id && isPlaying ? (t("timing_review.stop") || "Detener") : (t("timing_review.listen") || "Escuchar en loop")}
+            {playingWindowId === activeWindow.id && isPlaying
+              ? (t("timing_review.stop") || "Detener")
+              : (!hasListened ? (t("timing_review.listen_initial") || "Escuchar fragmento") : (t("timing_review.listen_again") || "Escuchar de nuevo"))}
           </button>
         </div>
 
@@ -464,7 +556,13 @@ export default function GuidedTimingReview({
           </div>
         )}
 
-        <FocusedWaveform
+        <div className="relative" data-testid="guided-waveform-coachmark">
+          {!hasListened && (
+            <p className="mb-2 rounded-lg border border-brand-light/20 bg-brand/[0.08] px-3 py-2 text-[11px] leading-relaxed text-violet-200" role="note">
+              {t("timing_review.waveform_coachmark") || "Escuchá el fragmento y mirá la onda: los picos ayudan a ubicar dónde empieza la voz."}
+            </p>
+          )}
+          <FocusedWaveform
           waveform={waveform}
           waveformLoading={waveformLoading}
           duration={effectiveDuration}
@@ -477,9 +575,33 @@ export default function GuidedTimingReview({
           onSeek={onSeek}
           onSelect={setSelectedSegmentId}
           onMove={onMove}
-        />
+          interactive={adjustmentRequested}
+          />
+        </div>
 
-        {selectedSegment ? (
+        {hasListened && (
+          <div className="rounded-xl bg-brand/[0.07] px-3 py-3 ring-1 ring-brand/20" data-testid="guided-alignment-question" role="group" aria-labelledby="guided-alignment-question-title">
+            <p id="guided-alignment-question-title" className="text-xs font-semibold text-white">{t("timing_review.alignment_question") || "¿La frase aparece cuando empieza la voz?"}</p>
+            <p className="mt-1 text-[11px] leading-relaxed text-ink-secondary">{t("timing_review.confirm_without_move") || "Si ya coincide, no hay que mover nada."}</p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button type="button" onClick={() => { setAlignmentDecision("yes"); onStopPlayback?.(); }} className={`rounded-lg px-3 py-2 text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light ${alignmentDecision === "yes" ? "bg-emerald-600 text-white" : "bg-white/[0.06] text-white ring-1 ring-white/[0.1] hover:bg-white/[0.1]"}`} aria-pressed={alignmentDecision === "yes"}>
+                {t("timing_review.alignment_yes") || "Sí, está bien"}
+              </button>
+              <button type="button" onClick={() => { setAlignmentDecision("no"); onStopPlayback?.(); }} className={`rounded-lg px-3 py-2 text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light ${alignmentDecision === "no" ? "bg-brand text-white" : "bg-white/[0.06] text-white ring-1 ring-white/[0.1] hover:bg-white/[0.1]"}`} aria-pressed={alignmentDecision === "no"}>
+                {t("timing_review.alignment_no") || "No, ajustar"}
+              </button>
+            </div>
+            {alignmentDecision && (
+              <p className="mt-3 rounded-lg bg-emerald-400/[0.08] px-3 py-2 text-[11px] text-emerald-100" data-testid="guided-confirm-coachmark" role="note">
+                {alignmentDecision === "yes"
+                  ? (t("timing_review.confirm_coachmark") || "Perfecto. No muevas la frase: confirmá para seguir.")
+                  : (t("timing_review.confirm_after_adjust") || "Cuando termines el ajuste, confirmá para seguir.")}
+              </p>
+            )}
+          </div>
+        )}
+
+        {adjustmentRequested && selectedSegment ? (
           <div className="mt-3 rounded-xl bg-black/20 px-3 py-3 ring-1 ring-white/[0.07]">
             <div className="flex min-w-0 items-center gap-3">
               <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-brand/15 text-brand-light" aria-hidden="true">
@@ -491,6 +613,9 @@ export default function GuidedTimingReview({
               </div>
               <span className="shrink-0 font-mono text-[10px] tabular-nums text-brand-light">{formatTime(selectedSegment.start, true)}</span>
             </div>
+            <p className="mt-3 rounded-lg border border-brand-light/20 bg-brand/[0.08] px-3 py-2 text-[11px] leading-relaxed text-violet-200" data-testid="guided-phrase-coachmark" role="note">
+              {t("timing_review.phrase_coachmark") || "Arrastrá la frase sobre la onda para moverla; también podés ajustar de a 0,1 segundos."}
+            </p>
             {selectedMovementBlocked && (
               <p className="mt-2 text-[10px] leading-relaxed text-amber-100/75">{t("timing_review.overlap_blocked") || "Esta frase ya se superpone con otra. Usá la timeline avanzada para resolverlas juntas."}</p>
             )}
@@ -503,11 +628,11 @@ export default function GuidedTimingReview({
               </button>
             </div>
           </div>
-        ) : (
+        ) : adjustmentRequested ? (
           <p className="mt-3 rounded-xl bg-amber-300/[0.05] px-3 py-2 text-[11px] text-amber-100/75 ring-1 ring-amber-200/10">{t("timing_review.no_phrase") || "No encontramos una frase dentro de este tramo. Escuchalo y revisalo en la timeline avanzada si necesitás agregar una."}</p>
-        )}
+        ) : null}
 
-        <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-white/[0.07] pt-4">
+        <div className={`${alignmentDecision === "yes" ? "sticky bottom-[76px] z-30 bg-surface-2/95 backdrop-blur-sm" : ""} mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-white/[0.07] pt-4`}>
           {pending.length > 1 ? <button type="button" onClick={() => {
             onStopPlayback?.();
             const next = nextWindow(activeWindow);
@@ -519,7 +644,7 @@ export default function GuidedTimingReview({
             <button type="button" onClick={openAdvanced} className="rounded-xl px-3 py-2 text-xs font-medium text-ink-secondary ring-1 ring-white/[0.08] hover:bg-white/[0.05] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light">
               {t("timing_review.open_advanced") || "Timeline avanzada"}
             </button>
-            <button type="button" onClick={confirmAndContinue} disabled={!audioAvailable || !activeWindowPlayable} className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-700 px-4 py-2 text-xs font-semibold text-white shadow-lg shadow-emerald-950/20 hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-200 disabled:cursor-not-allowed disabled:opacity-45">
+            <button type="button" onClick={confirmAndContinue} disabled={!audioAvailable || !activeWindowPlayable || !hasListened || !alignmentDecision} className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-700 px-4 py-2 text-xs font-semibold text-white shadow-lg shadow-emerald-950/20 hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-200 disabled:cursor-not-allowed disabled:opacity-45" title={t("timing_review.confirm_tooltip") || "Confirmá cuando hayas escuchado el fragmento y comparado la frase"}>
               <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6" strokeLinecap="round" strokeLinejoin="round" /></svg>
               {t("timing_review.confirm_next") || "Confirmar y seguir"}
             </button>
