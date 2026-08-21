@@ -1,4 +1,4 @@
-import { segmentsEquivalent } from "../editorMerge";
+import { mergeThreeWay, segmentsEquivalent } from "../editorMerge";
 
 // A wizard snapshot is an optimistic-concurrency snapshot, not an alternate
 // source of truth. Reuse it only while it is based on the exact server
@@ -15,10 +15,22 @@ export function isReusableEditSnapshot({ snapshot, jobId, serverRevision }) {
   );
 }
 
-// Legacy local drafts do not have the durable editor's three-way merge and
-// version history guarantees. Restore only against their exact base. A stale
-// but already-saved draft is discarded; a genuinely divergent stale draft is
-// kept in storage and surfaced as a conflict, never posted automatically.
+// Recover a local draft WITHOUT ever asking the operator to arbitrate.
+//
+// There is no real multi-user editing in Genly — the same person keeps several
+// tabs and windows open on the same song. A draft based on an older revision
+// is therefore their own work, not somebody else's, and the old behaviour
+// (surface it as a "conflict" and drop it on the floor) cost them typing for a
+// race they cannot even perceive. Every outcome here is silent:
+//
+//   - the draft is already saved  → discard it,
+//   - it is based on the current revision  → restore it as-is,
+//   - it is stale but we know its base  → three-way merge, so lines the draft
+//     never touched keep whatever the other tab wrote,
+//   - it is stale with no base  → restore it: nothing else on screen
+//     represents what the operator typed, and the save path still writes
+//     through the backend revision check, so this can never be a raw
+//     overwrite.
 export function resolveLegacyDraft({ draft, currentSegments, currentRevision }) {
   if (!Array.isArray(draft?.segments) || draft.segments.length === 0) {
     return { action: "none", segments: null };
@@ -30,5 +42,11 @@ export function resolveLegacyDraft({ draft, currentSegments, currentRevision }) 
     && draft.base_revision === currentRevision) {
     return { action: "restore", segments: draft.segments };
   }
-  return { action: "conflict", segments: null };
+  if (Array.isArray(draft.base_segments) && draft.base_segments.length > 0) {
+    const merged = mergeThreeWay(
+      draft.base_segments, draft.segments, currentSegments || [],
+    );
+    return { action: "restore", segments: merged.merged, rebased: true };
+  }
+  return { action: "restore", segments: draft.segments, rebased: true };
 }
