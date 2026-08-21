@@ -1504,11 +1504,6 @@ export default function LyricsEditor({
         setIsDirty(true);
       } else if (resolution.action === "discard") {
         localStorage.removeItem(draftKey);
-      } else if (resolution.action === "conflict") {
-        // Preserve the raw draft for support/manual recovery, but never feed
-        // it into legacy autosave under a newer server revision.
-        setSaveStatus("conflict");
-        setSaveErrorReason("conflict");
       }
     } catch { /* corrupt or unavailable storage */ }
   }, [draftKey, editorV2Enabled, segmentsRevision, setEdited]);
@@ -3541,10 +3536,15 @@ export default function LyricsEditor({
     // el RESPALDO del servidor (reanudar tras refresh / reaper), no el
     // render. El copy anterior decía lo contrario y llevó a operadores a
     // no aprobar trabajo que sí estaba a salvo.
-    if (saveStatus === "error") {
-      const _copy = _SAVE_ERROR_COPY[saveErrorReason] || _SAVE_ERROR_COPY.server;
-      const proceed = window.confirm(_copy.confirm);
-      if (!proceed) return;
+    // Sólo interrumpimos cuando aprobar NO puede funcionar: sin conexión el
+    // POST no sale. En todo el resto, el propio comentario de arriba explica
+    // por qué el confirm no protegía nada — el render usa lo de pantalla — y
+    // un diálogo del navegador en medio del trabajo es la peor forma de
+    // avisar algo que ya está en el banner. Seguimos de largo: si el approve
+    // falla, el toast lo dice y los cambios siguen en pantalla.
+    if (saveStatus === "error" && saveErrorReason === "offline") {
+      const _copy = _SAVE_ERROR_COPY.offline;
+      if (!window.confirm(_copy.confirm)) return;
     }
     // Check for 3+ line segments before submitting — show a warning banner
     // so the operator can auto-split them rather than discover the issue

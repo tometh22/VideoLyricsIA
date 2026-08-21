@@ -44,7 +44,11 @@ describe("LyricsEditor legacy draft concurrency", () => {
     vi.useRealTimers();
   });
 
-  it("preserva pero no restaura ni autosavea un borrador de revisión obsoleta", async () => {
+  // Contrato nuevo (20-ago-2026): en Genly no hay dos personas editando la
+  // misma canción — es la MISMA persona con varias pestañas abiertas. Un
+  // borrador de revisión vieja es su propio trabajo, así que se recupera solo,
+  // sin cartel de conflicto y sin pedirle que arbitre nada.
+  it("recupera solo un borrador de revisión obsoleta, sin preguntar nada", async () => {
     const onPersistSegments = vi.fn().mockResolvedValue({ ok: true, revision: 9 });
     localStorage.setItem(DRAFT_KEY, JSON.stringify({
       segments: local,
@@ -53,16 +57,32 @@ describe("LyricsEditor legacy draft concurrency", () => {
 
     renderEditor({ onPersistSegments });
 
-    expect(screen.getByDisplayValue("Cambio de otra pestaña")).toBeInTheDocument();
-    expect(screen.queryByDisplayValue("Borrador viejo")).toBeNull();
-    expect(screen.getByText("Cambio en conflicto")).toBeInTheDocument();
+    // Lo que el operador había tipeado vuelve a pantalla…
+    expect(screen.getByDisplayValue("Borrador viejo")).toBeInTheDocument();
+    // …y nunca ve el cartel muerto que antes lo dejaba sin salida.
+    expect(screen.queryByText("Cambio en conflicto")).toBeNull();
+
+    // El respaldo sigue pasando por el check de revisión del backend: se
+    // guarda contra la revisión ACTUAL del servidor (8), no contra la vieja.
     await act(async () => { await vi.advanceTimersByTimeAsync(4_000); });
-    expect(onPersistSegments).not.toHaveBeenCalled();
-    expect(JSON.parse(localStorage.getItem(DRAFT_KEY)).segments).toEqual(local);
-    window.dispatchEvent(new Event("pagehide"));
-    window.dispatchEvent(new Event("beforeunload"));
-    expect(onPersistSegments).not.toHaveBeenCalled();
-    expect(JSON.parse(localStorage.getItem(DRAFT_KEY)).segments).toEqual(local);
+    expect(onPersistSegments).toHaveBeenCalled();
+    expect(onPersistSegments.mock.calls[0][2]).toMatchObject({ baseRevision: 8 });
+  });
+
+  it("mergea con la otra pestaña cuando el borrador conoce su base", async () => {
+    const onPersistSegments = vi.fn().mockResolvedValue({ ok: true, revision: 9 });
+    localStorage.setItem(DRAFT_KEY, JSON.stringify({
+      segments: [{ start: 1, end: 2, text: "Borrador viejo" }],
+      base_segments: [{ start: 1, end: 2, text: "Original" }],
+      base_revision: 7,
+    }));
+
+    renderEditor({ onPersistSegments });
+
+    // Ambas ediciones tocaron la misma línea → gana la de esta pestaña, que
+    // es la que el operador está mirando.
+    expect(screen.getByDisplayValue("Borrador viejo")).toBeInTheDocument();
+    expect(screen.queryByText("Cambio en conflicto")).toBeNull();
   });
 
   it("restaura y guarda un borrador que parte de la revisión actual", async () => {
