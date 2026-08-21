@@ -8,6 +8,13 @@ import { IS_PRODUCTION, APP_ENV } from "./env";
 import { fetchWithTimeout } from "./fetchWithTimeout";
 import { uploadFileToR2 } from "./r2Upload";
 import * as wizardPersistence from "./wizardPersistence";
+import {
+  AUTH_REFRESH_LEASE_MS,
+  AUTH_REFRESH_MIN_INTERVAL_MS,
+  acquireAuthRefreshLease,
+  releaseAuthRefreshLease,
+  shouldRefreshToken,
+} from "./lib/authRefresh";
 import LoginPage from "./components/LoginPage";
 import Sidebar from "./components/Sidebar";
 import GlobalTopbar from "./components/GlobalTopbar";
@@ -52,6 +59,7 @@ import {
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
 import { translateBackendError } from "./lib/lyricsEditSubmit";
 import { segmentsStore, useJobSegmentsValue } from "./state/segmentsStore";
+import { loadReviewWaveform } from "./lib/loadReviewWaveform";
 import { persistSegments } from "./lib/persistSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
 import { backgroundRegenExtras } from "./lib/editWizardDiff";
@@ -63,8 +71,20 @@ import { anchorLyricsForEntry } from "./lib/anchorPayload";
 import { track } from "./lib/telemetryTrack";
 import { fetchSse, SseUnauthorizedError } from "./lib/fetchSse";
 import { createSaveQueue } from "./lib/saveQueue";
+import { rebaseEditorSnapshot } from "./lib/rebaseEditorSnapshot";
+import { isEditorRevisionConflict } from "./lib/editorRevisionConflict";
+import { buildGenerationJob } from "./lib/buildGenerationJob";
+import {
+  canRebuildMissingGenerationJob,
+  isMissingGenerationJob,
+  rebuildGenerationRequestFromLocalAudio,
+} from "./lib/generationRecovery";
+import { loadEditorAudio } from "./lib/editorAudioRecovery";
+import { isReusableEditSnapshot } from "./lib/reviewRecovery";
+import { reviewJobIdFromLocation, reviewJobPath } from "./lib/reviewJobRoute";
 
 const API = import.meta.env.VITE_API_URL || "";
+
 
 // PR E follow-up (2026-07): identidad ESTABLE de una review para keyear el
 // segmentsStore. DECOUPLE del backend job id: el prop transcribeJobId del
@@ -818,6 +838,7 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
 function EditLyricsRoute({
   setCurrentReview,
   setWizardStage,
+  editorAudioRetryRef,
   // style/customColors: la paleta vive en el state top-level de App (no en la
   // review), y es lo que WizardLivePreview lee para pintar el texto. Sin
   // sembrarlos al entrar a editar, la preview usa la paleta del último batch —
@@ -845,6 +866,8 @@ function EditLyricsRoute({
 
   useEffect(() => {
     let alive = true;
+    let retryAudio = null;
+    if (editorAudioRetryRef) editorAudioRetryRef.current = null;
     setState({ status: "loading" });
     track("edit.entered", { job_id: id });
 
@@ -853,7 +876,7 @@ function EditLyricsRoute({
     // los preserva. Las URLs firmadas (audio/bg) sí re-fetchean porque
     // expiran (~5min).
     const snap = wizardPersistence.load();
-    const reusableSnap =
+    const snapshotCandidate =
       snap?.currentReview?.editingJobId === id &&
       Array.isArray(snap.currentReview.segments) &&
       snap.currentReview.segments.length > 0;
@@ -926,11 +949,19 @@ function EditLyricsRoute({
         return;
       }
 
-      // Reuso del snapshot: si el operador refrescó con edits in-flight,
-      // los segments del snapshot ganan sobre job.segments_json (que es
-      // lo último que el autosave guardó pero podría no incluir el
-      // último cambio uncommitted). La baseline para "unchanged" sigue
-      // siendo lo que el job tiene RENDERIZADO (job.segments_json).
+      const serverSegmentsRevision = Number.isInteger(job.segments_revision)
+        ? job.segments_revision
+        : 0;
+      const reusableSnap = snapshotCandidate && isReusableEditSnapshot({
+        snapshot: snap,
+        jobId: id,
+        serverRevision: serverSegmentsRevision,
+      });
+
+      // Reuso del snapshot: sólo gana si todavía parte de la revisión exacta
+      // del servidor. Si otra pestaña avanzó la revisión, usamos el servidor
+      // fail-closed; reetiquetar el array viejo con la revisión nueva eludiría
+      // el CAS y podría borrar el trabajo concurrente.
       const segmentsFromSnap = reusableSnap ? snap.currentReview.segments : job.segments_json;
 
       // Edit-wizard mode (PR feat/edit-wizard-mode, 2026-05-27):
@@ -995,15 +1026,22 @@ function EditLyricsRoute({
         // job.song_title puede llegar null para jobs viejos sin metadata
         // explícito; filename queda como fallback display sólo.
         segments: segmentsFromSnap,
-        segmentsRevision: Number.isInteger(job.segments_revision) ? job.segments_revision : 0,
+        segmentsRevision: serverSegmentsRevision,
         openSnapshotSegments: JSON.parse(JSON.stringify(job.segments_json)),
         filename: job.filename || job.artist || "lyrics",
         file: null,
         audioUrl: null,           // populated by Phase B
         audioLoading: true,       // Phase B en vuelo → el editor muestra
                                   // "Cargando audio…" en vez de "no disponible"
+        // `temporary` means the API/R2 path was unavailable, NOT that the
+        // source file is gone. Only a definitive 404 earns `missing`.
+        audioUnavailableReason: null,
         waveform: null,           // populated by Phase B
+        waveformLoading: true,    // independent enhancement request in flight
         bgUrl: null,              // populated by Phase B
+        transcriptionQuality: job.transcription_quality || null,
+        coverageWarning: !!job.coverage_warning,
+        recoverySource: job.recovery_source || "",
         ...initialFields,
         // Empty queue: this isn't a batch, it's a one-off edit.
         queue: [],
@@ -1031,12 +1069,11 @@ function EditLyricsRoute({
       // racing against an operator who navigated to a different job before
       // the slow fetch landed.
       // `retries`: the source audio is ESSENTIAL for editing TIMING — without
-      // it the timeline opens muted ("audio no disponible"). It used to be a
-      // silent fire-and-forget like waveform/bg, so a single transient 500 (a
-      // momentary DB hiccup on /source-audio-url — observed in prod on job
-      // 0d05c360895a, 2026-06-03) or timeout left the operator unable to fix
-      // timing. Retry it with backoff; waveform/bg stay best-effort.
-      const enhanceField = async (url, key, extractor, { retries = 0 } = {}) => {
+      // it the timeline opens muted. It used to be a silent fire-and-forget
+      // like waveform/bg, so a transient DB failure left the operator unable
+      // to fix timing. The generic enhancements remain best-effort; source
+      // audio has an explicit recovery contract below.
+      const enhanceField = async (url, key, extractor, { retries = 0, loadingKey = null } = {}) => {
         for (let attempt = 0; attempt <= retries; attempt++) {
           try {
             const res = await authFetchWithTimeout(url, {}, 15_000);
@@ -1047,7 +1084,11 @@ function EditLyricsRoute({
               const value = extractor(data);
               setCurrentReview((prev) => {
                 if (!prev || prev.editingJobId !== id) return prev;
-                return { ...prev, [key]: value };
+                return {
+                  ...prev,
+                  [key]: value,
+                  ...(loadingKey ? { [loadingKey]: false } : {}),
+                };
               });
               return;  // success
             }
@@ -1063,24 +1104,66 @@ function EditLyricsRoute({
         }
         // Exhausted: leave the field unset; text editing still works and the
         // operator can reopen the editor to retry the audio fetch.
-      };
-      // El audio es esencial para el timing: mientras su fetch está en vuelo
-      // el editor muestra "Cargando audio…". Al resolver (éxito O reintentos
-      // agotados) bajamos audioLoading para que, si de verdad no hay audio,
-      // recién ahí aparezca "Audio no disponible".
-      enhanceField(`${API}/jobs/${id}/source-audio-url`, "audioUrl", (d) => d?.url || null, { retries: 3 })
-        .finally(() => {
-          if (!alive) return;
+        if (loadingKey && alive) {
           setCurrentReview((prev) => {
             if (!prev || prev.editingJobId !== id) return prev;
-            return { ...prev, audioLoading: false };
+            return { ...prev, [loadingKey]: false };
           });
+        }
+      };
+      // An exhausted 503 used to be rendered as "Audio no disponible", which
+      // is a false claim: the DB could not validate the session long enough to
+      // presign the R2 object. Respect the server's Retry-After, preserve the
+      // local draft, and keep a user-initiated retry available afterwards.
+      retryAudio = async () => {
+        setCurrentReview((prev) => {
+          if (!prev || prev.editingJobId !== id) return prev;
+          return {
+            ...prev,
+            audioLoading: true,
+            audioUnavailableReason: null,
+          };
         });
-      enhanceField(`${API}/jobs/${id}/waveform`, "waveform", (d) => d);
+        const result = await loadEditorAudio({
+          // This endpoint is a DB lookup + presigned URL, normally <1 s. A
+          // short cap turns pool backpressure into a recoverable UI state
+          // instead of holding the timing screen on a spinner for a minute.
+          request: () => authFetchWithTimeout(`${API}/jobs/${id}/source-audio-url`, {}, 8_000),
+          maxRetries: 3,
+        });
+        if (!alive) return;
+        setCurrentReview((prev) => {
+          if (!prev || prev.editingJobId !== id) return prev;
+          if (result.ok) {
+            return {
+              ...prev,
+              audioUrl: result.url,
+              audioLoading: false,
+              audioUnavailableReason: null,
+            };
+          }
+          return {
+            ...prev,
+            audioLoading: false,
+            audioUnavailableReason: result.reason,
+          };
+        });
+      };
+      if (editorAudioRetryRef) editorAudioRetryRef.current = retryAudio;
+      void retryAudio();
+      enhanceField(
+        `${API}/jobs/${id}/waveform`,
+        "waveform",
+        (d) => d,
+        { loadingKey: "waveformLoading" },
+      );
       enhanceField(`${API}/jobs/${id}/background-url`, "bgUrl", (d) => d?.url || null);
     })();
 
-    return () => { alive = false; };
+    return () => {
+      alive = false;
+      if (editorAudioRetryRef?.current === retryAudio) editorAudioRetryRef.current = null;
+    };
     // setCurrentReview is stable via useState; only re-bootstrap on id change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
@@ -1481,6 +1564,8 @@ export default function App() {
 
   const [token, setToken] = useState(getToken());
   const [user, setUser] = useState(getUser());
+  const authRefreshInFlight = useRef(null);
+  const authRefreshLastAt = useRef(0);
   const [files, setFiles] = useState([]);
   // Ref que espeja `files` para que callbacks sin dependencias (ej.
   // handleUploadAdvance en un setTimeout) lean el estado actual sin re-render
@@ -1507,6 +1592,75 @@ export default function App() {
 
   const [reviewQueue, setReviewQueue] = useState([]);
   const [currentReview, setCurrentReview] = useState(null);
+  const currentReviewWaveformJobId = currentReview?.transcribeJobId || null;
+  // First-pass reviews, resumed sessions and back-navigation all have a
+  // transcription job but previously never requested its peak envelope.
+  // Keep the enhancement keyed by job identity so a late response cannot
+  // paint waveform data from another song into the active editor.
+  useEffect(() => {
+    if (!currentReviewWaveformJobId || currentReview?.waveform?.peaks?.length) return undefined;
+    let alive = true;
+    setCurrentReview((previous) => (
+      previous?.transcribeJobId === currentReviewWaveformJobId
+        ? { ...previous, waveformLoading: true }
+        : previous
+    ));
+    const loadWaveform = async () => {
+      const payload = await loadReviewWaveform({
+        request: (url) => authFetchWithTimeout(url, {}, 15_000),
+        url: `${API}/jobs/${currentReviewWaveformJobId}/waveform`,
+        retries: 1,
+      });
+      if (!alive) return;
+      setCurrentReview((previous) => {
+        if (previous?.transcribeJobId !== currentReviewWaveformJobId) return previous;
+        return {
+          ...previous,
+          waveform: payload,
+          waveformLoading: false,
+        };
+      });
+    };
+    void loadWaveform();
+    return () => { alive = false; };
+    // Deliberately keyed by identity. waveformLoading changes must not
+    // restart a failed request loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentReviewWaveformJobId]);
+  // EditLyricsRoute owns the network lifecycle, while the shared wizard owns
+  // LyricsEditor. A ref exposes only the active route's retry action without
+  // serializing a callback into the durable wizard snapshot.
+  const editorAudioRetryRef = useRef(null);
+  // Resume/first-pass reviews do not have an EditLyricsRoute instance to own
+  // audio recovery. Keep the same bounded, honest recovery policy here so a
+  // transient API/DB failure never strands the timing editor without audio.
+  const retryTranscriptionReviewAudio = useCallback(async (jobId) => {
+    if (!jobId) return;
+    setCurrentReview((previous) => (
+      previous?.transcribeJobId === jobId
+        ? { ...previous, audioLoading: true, audioUnavailableReason: null }
+        : previous
+    ));
+    const result = await loadEditorAudio({
+      request: () => authFetchWithTimeout(`${API}/jobs/${jobId}/source-audio-url`, {}, 8_000),
+      maxRetries: 3,
+    });
+    setCurrentReview((previous) => {
+      if (previous?.transcribeJobId !== jobId) return previous;
+      return result.ok
+        ? {
+          ...previous,
+          audioUrl: result.url,
+          audioLoading: false,
+          audioUnavailableReason: null,
+        }
+        : {
+          ...previous,
+          audioLoading: false,
+          audioUnavailableReason: result.reason,
+        };
+    });
+  }, []);
   const [approvedJobs, setApprovedJobs] = useState([]);
   const [transcribing, setTranscribing] = useState(false);
   const [transcribeError, setTranscribeError] = useState(null);
@@ -1605,6 +1759,17 @@ export default function App() {
   // upload→whisper handoff. Drives the progress bar in /review.
   const [transcribeProgress, setTranscribeProgress] = useState(null);
   const [readyToGenerate, setReadyToGenerate] = useState(false);
+
+  // Give every server-backed transcription a stable URL as soon as its
+  // review is ready. The route renders the same wizard tree, so changing the
+  // address does not remount the editor or interrupt playback/autosave.
+  useEffect(() => {
+    const jobId = currentReview?.transcribeJobId;
+    if (!jobId || wizardStage !== "review") return;
+    if (location.pathname !== "/new" && !location.pathname.startsWith("/review")) return;
+    const target = reviewJobPath(jobId);
+    if (location.pathname !== target) navigate(target, { replace: true });
+  }, [currentReview?.transcribeJobId, location.pathname, navigate, wizardStage]);
 
   const [jobs, setJobs] = useState([]);
   // Pre-fetched transcription results for batch review songs 1..N-1.
@@ -1824,7 +1989,7 @@ export default function App() {
   }, [files, approvedJobs, currentReview, reviewQueue]);
 
   // 2026-05-25 — Resume desde el historial. JobDetail enlaza a
-  // /new?resume=<jobId> cuando el operador clickea "Editar lyrics y
+  // /review/<jobId> cuando el operador clickea "Editar lyrics y
   // generar" sobre una card en estado `transcribed`. Sin handler, el
   // wizard caía en pantalla de upload (bug reportado durante UMG
   // dry-run: "los Sin generar cuando abrís te devuelve a Crear el
@@ -1833,13 +1998,12 @@ export default function App() {
   // `audioUrl` al LyricsEditor que ya acepta el prop), setear
   // wizardStage="review". El approve flow ya soporta retomar via
   // `transcribeJobId` — el backend skipea file upload y reusa R2.
-  const resumeJobAttemptedRef = useRef(false);
+  const resumeJobAttemptedRef = useRef(null);
   useEffect(() => {
-    const params = new URLSearchParams(location.search);
-    const resumeJobId = params.get("resume");
+    const resumeJobId = reviewJobIdFromLocation(location.pathname, location.search);
     if (!resumeJobId) return;
-    if (resumeJobAttemptedRef.current) return;
-    resumeJobAttemptedRef.current = true;
+    if (resumeJobAttemptedRef.current === resumeJobId) return;
+    resumeJobAttemptedRef.current = resumeJobId;
 
     let cancelled = false;
     (async () => {
@@ -1848,23 +2012,13 @@ export default function App() {
         if (!statusRes.ok) throw new Error(`status ${statusRes.status}`);
         const job = await statusRes.json();
         if (cancelled) return;
-        // El audio URL se pide a un endpoint dedicado (presigned R2 o
-        // streaming via /media-token). LyricsEditor lo carga en su
-        // <audio> sin necesitar el File en memoria.
-        let audioUrl = null;
-        try {
-          const audioRes = await authFetch(`${API}/jobs/${resumeJobId}/source-audio-url`);
-          if (audioRes.ok) {
-            const audioJson = await audioRes.json();
-            audioUrl = audioJson.url || audioJson.audio_url || null;
-          }
-        } catch (_) { /* audioUrl queda null — editor de texto funciona igual */ }
-
         const segments = job.segments || job.segments_json || [];
         setCurrentReview({
           file: null,                            // no tenemos el File original
           filename: job.filename || `${job.song_title || job.artist || "audio"}.wav`,
-          audioUrl,                              // LyricsEditor lo acepta directamente
+          audioUrl: null,
+          audioLoading: true,
+          audioUnavailableReason: null,
           artist: job.artist || "",
           songTitle: job.song_title || "",
           language: job.language || "es",
@@ -1881,13 +2035,19 @@ export default function App() {
           lyricSungColor: job.lyric_sung_color || "#FFFFFF",
           textContrast: job.text_contrast || "medium",
           segments,
+          segmentsRevision: Number.isInteger(job.segments_revision) ? job.segments_revision : 0,
           referenceLyrics: job.reference_lyrics || "",
           coverageWarning: !!job.coverage_warning,
+          transcriptionQuality: job.transcription_quality || null,
           recoverySource: job.recovery_source || "",
           transcribeJobId: resumeJobId,           // backend reusa R2 audio
           queueIdx: 0,
           queue: [{ filename: job.filename || "audio.wav" }],
         });
+        // Open the editor immediately and recover audio in the background.
+        // Identity guards in the callback discard a late result if the
+        // operator has already moved to another song.
+        void retryTranscriptionReviewAudio(resumeJobId);
         // Audit adversarial 2026-06-09: este flujo entra DIRECTO a review —
         // las tabs de fondo del upload stage nunca se ven. Una selección
         // custom/library residual de un batch anterior se mandaría en
@@ -1898,11 +2058,12 @@ export default function App() {
         setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
         setArtTrack(false);
         setWizardStage("review");
-        // Limpiar el query param sin agregar a history (replace).
-        navigate("/new", { replace: true });
+        // Canonicalize legacy /new?resume= links without adding a history
+        // entry. Direct /review/:jobId links already point at this target.
+        navigate(reviewJobPath(resumeJobId), { replace: true });
       } catch (err) {
         console.warn("[RESUME] no pude cargar el job:", err);
-        resumeJobAttemptedRef.current = false;   // permitir reintento si el operador cambia URL
+        resumeJobAttemptedRef.current = null;   // permitir reintento si el operador cambia URL
         // Fallback honesto: si el resume falla (auth no lista, red, 4xx),
         // mandar al JobDetail en vez de dejar al usuario varado en /new
         // con el wizard vacío — que parece "crear video nuevo".
@@ -1910,7 +2071,7 @@ export default function App() {
       }
     })();
     return () => { cancelled = true; };
-  }, [location.search, navigate]);
+  }, [location.pathname, location.search, navigate, retryTranscriptionReviewAudio]);
 
   // Imperative resume — called by the banner's "Continuar" button.
   const resumeWizard = useCallback(() => {
@@ -2181,13 +2342,17 @@ export default function App() {
     const onStorage = (e) => {
       if (e.key === "genly_token" && e.newValue === null && token) {
         handleLogout("expired");
+      } else if (e.key === "genly_token" && e.newValue && e.newValue !== token) {
+        // Another tab may have refreshed the session. Adopt its token so all
+        // tabs share one refresh and do not stampede /auth/refresh.
+        setToken(e.newValue);
       }
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
   }, [token, handleLogout]);
 
-  // Proactively refresh the JWT when it has less than 1 day left, so users
+  // Proactively refresh the JWT when it has less than 6 hours left, so users
   // with active sessions never hit a sudden 401 mid-session. Runs once per
   // token value (i.e. on load and whenever a fresh token is stored).
   //
@@ -2213,8 +2378,17 @@ export default function App() {
     if (!exp) return;
     const secondsLeft = exp - Math.floor(Date.now() / 1000);
     const alreadyExpired = secondsLeft <= 0;
-    if (!alreadyExpired && secondsLeft > 86400) return;
-    authFetch(`${API}/auth/refresh`, { method: "POST" })
+    if (!alreadyExpired && !shouldRefreshToken(secondsLeft)) return;
+    if (authRefreshInFlight.current) return;
+    const now = Date.now();
+    if (now - authRefreshLastAt.current < AUTH_REFRESH_MIN_INTERVAL_MS) return;
+    const lease = acquireAuthRefreshLease(
+      typeof window !== "undefined" ? window.localStorage : null,
+      now,
+    );
+    if (!lease) return;
+    authRefreshLastAt.current = now;
+    const request = authFetch(`${API}/auth/refresh`, { method: "POST" })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`refresh ${r.status}`))))
       .then((data) => {
         if (data?.token) {
@@ -2234,7 +2408,18 @@ export default function App() {
           // devtools but don't disrupt the session.
           console.warn("[auth] preemptive refresh failed (will retry on next mount):", err?.message);
         }
+      })
+      .finally(() => {
+        // Keep the cross-tab lease alive briefly after success so sibling
+        // tabs can receive the storage event with the fresh token before
+        // another one is allowed to claim the lock.
+        window.setTimeout(() => releaseAuthRefreshLease(
+          typeof window !== "undefined" ? window.localStorage : null,
+          lease,
+        ), AUTH_REFRESH_LEASE_MS);
+        authRefreshInFlight.current = null;
       });
+    authRefreshInFlight.current = request;
   }, [token, handleLogout]);
 
   // `historyError` lets the dashboard surface a "connection failed,
@@ -2777,6 +2962,7 @@ export default function App() {
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         segmentsRevision: Number.isInteger(data.segments_revision) ? data.segments_revision : 0,
         coverageWarning: !!data.coverage_warning,
+        transcriptionQuality: data.transcription_quality || null,
         recoverySource: data.recovery_source || "",
         transcribeJobId: data.job_id || jobId,
         queueIdx: idx, queue,
@@ -2852,6 +3038,7 @@ export default function App() {
             segments: data.segments, referenceLyrics: data.reference_lyrics || "",
             segmentsRevision: Number.isInteger(data.segments_revision) ? data.segments_revision : 0,
             coverageWarning: !!data.coverage_warning,
+            transcriptionQuality: data.transcription_quality || null,
             recoverySource: data.recovery_source || "",
             transcribeJobId: data.job_id || cached.jobId,
             queueIdx: idx, queue,
@@ -3011,6 +3198,7 @@ export default function App() {
         segments: data.segments, referenceLyrics: data.reference_lyrics || "",
         segmentsRevision: Number.isInteger(data.segments_revision) ? data.segments_revision : 0,
         coverageWarning: !!data.coverage_warning,
+        transcriptionQuality: data.transcription_quality || null,
         recoverySource: data.recovery_source || "",
         transcribeJobId: data.job_id || uploadJobId,
         queueIdx: idx, queue,
@@ -3091,7 +3279,10 @@ export default function App() {
         if (!result || result.reason === "network") return "network";
         if (result.status === 401 || result.status === 403) return "session";
         if (result.reason === "job-gone" || result.status === 404) return "job-gone";
-        if (result.reason === "stale-revision" || result.status === 409) return "conflict";
+        // Revision drift is rebased and retried by saveQueue. If bounded
+        // retries are exhausted, keep the generic server-error copy instead
+        // of showing a collaboration/conflict banner.
+        if (result.reason === "stale-revision" || result.reason === "client-upgrade-required" || result.status === 409) return "server";
         return "server";
       } },
     );
@@ -3433,15 +3624,16 @@ export default function App() {
             navigate(`/videos/${editedJobId}`, { replace: true });
             return { ok: true, duplicate: true };
           }
-          const friendly = translateBackendError(data?.detail, t) || `Error ${res.status}`;
-          alert({
-            title: t("edit.error_title") || "No pudimos aplicar el edit",
-            description: friendly,
-            tone: "error",
-          });
+          const conflict = isEditorRevisionConflict(res, data);
           console.warn("[edit-wizard] /edit failed", { status: res.status, detail: data });
-          const conflict = data?.detail && typeof data.detail === "object"
-            && data.detail.detail === "editor_revision_conflict";
+          if (!conflict) {
+            const friendly = translateBackendError(data?.detail, t) || `Error ${res.status}`;
+            alert({
+              title: t("edit.error_title") || "No pudimos aplicar el edit",
+              description: friendly,
+              tone: "error",
+            });
+          }
           return {
             ok: false,
             reason: conflict ? "conflict" : `http-${res.status}`,
@@ -3483,11 +3675,19 @@ export default function App() {
       movementStyle: _rf("movementStyle"), effect: _rf("effect"),
       backgroundHint: _rf("backgroundHint"), bgVerbatim: !!r.bgVerbatim,
       textCase: r.textCase || "upper",
+      frameFormat: r.frameFormat || "full",
       fontScale: r.fontScale || "1.0",
       // lyricTransition + textMotion: deprecados 2026-05-23.
       lyricsAnimation: r.lyricsAnimation || "none",
       lineTransition: r.lineTransition || "none",
       textContrast: r.textContrast || "medium",
+      lyricColor: r.lyricColor || "#FFFFFF",
+      lyricSungColor: r.lyricSungColor || "#FFFFFF",
+      titleTemplate: r.titleTemplate || "auto",
+      titleSize: r.titleSize || "1.0",
+      titleArtistFont: r.titleArtistFont || "",
+      titleSongFont: r.titleSongFont || "",
+      titleSongBreak: r.titleSongBreak || "",
       segments: editedSegments,
       segmentsRevision: Number.isInteger(saveMeta.baseRevision)
         ? saveMeta.baseRevision
@@ -3495,6 +3695,8 @@ export default function App() {
       editorRevision: Number.isInteger(saveMeta.editorRevision) ? saveMeta.editorRevision : null,
       editorVersionId: saveMeta.editorVersionId || null,
       transcribeJobId: r.transcribeJobId || null,
+      operatorMetrics: saveMeta.operatorMetrics || null,
+      transcriptionQuality: r.transcriptionQuality || null,
       // Capa C 2026-05-24: bgCacheKey viene del useBackgroundPreview hook
       // que corrió durante review. Si null = no se hizo pre-gen (free-tier
       // o params no estables); pipeline corre Veo/Imagen como siempre.
@@ -3589,44 +3791,27 @@ export default function App() {
       return;
     }
 
-    const jobList = approved.map((a) => ({
-      filename: (a.file && a.file.name) || "audio.mp3", _file: a.file, artist: a.artist,
-      songTitle: (a.songTitle || "").trim(),
-      language: a.language, genre: a.genre || "", font: a.font || "",
-      concept: a.concept || "", movementStyle: a.movementStyle || "", effect: a.effect || "",
-      backgroundHint: a.backgroundHint || "", bgVerbatim: !!a.bgVerbatim,
-      textCase: a.textCase || "upper",
-      fontScale: a.fontScale || "1.0",
-      // lyricTransition + textMotion: deprecados 2026-05-23.
-      lyricsAnimation: a.lyricsAnimation || "none",
-      lineTransition: a.lineTransition || "none",
-      textContrast: a.textContrast || "medium",
-      // Title card customization (Full Rotor v1).
-      titleTemplate: a.titleTemplate || "auto",
-      titleSize: a.titleSize || "1.0",
-      titleArtistFont: a.titleArtistFont || "",
-      titleSongFont: a.titleSongFont || "",
-      titleSongBreak: a.titleSongBreak || "",
-      segments: a.segments,
-      segmentsRevision: Number.isInteger(a.segmentsRevision) ? a.segmentsRevision : 0,
-      editorRevision: Number.isInteger(a.editorRevision) ? a.editorRevision : null,
-      editorVersionId: a.editorVersionId || null,
-      transcribeJobId: a.transcribeJobId || null,
-      status: "queued", current_step: null, progress: 0, job_id: null, error: null,
+    // Keep a reference to the approved snapshot until /generate accepts it.
+    // The old implementation cleared this state before the request returned,
+    // turning a transient missing server job into an apparent loss of all
+    // lyric edits.  `_approvedSource` never leaves the browser/API payload.
+    const jobList = approved.map((entry) => ({
+      ...buildGenerationJob(entry),
+      _approvedSource: entry,
     }));
     setJobs(jobList);
     navigate("/generating");
     setReadyToGenerate(false);
-    setApprovedJobs([]);
-    // Audit 2026-06-09 ("siempre queda cargado en el wizard"): los inputs
-    // ya fueron consumidos en jobList — si quedan en `files`/`reviewQueue`,
-    // el próximo /new (sidebar, sin reset) muestra los audios del batch
-    // ANTERIOR staged; el operador suma los nuevos, genera, y los viejos
-    // se re-renderizan (videos duplicados + costo Veo duplicado). Limpiar
-    // acá también vacía el snapshot de sesión (effect anyState), así el
-    // banner "batch sin terminar" no ofrece retomar un batch ya generado.
-    setFiles([]);
-    setReviewQueue([]);
+
+    // Remove a song from the recoverable wizard state only once the backend
+    // has accepted its generation request.  This preserves failed lyrics in
+    // memory and sessionStorage, but still prevents accepted songs from
+    // leaking into the next batch.
+    const markGenerationAccepted = (job) => {
+      setApprovedJobs((prev) => prev.filter((entry) => entry !== job._approvedSource));
+      setFiles((prev) => prev.filter((entry) => entry?.file !== job._file));
+      setReviewQueue((prev) => prev.filter((entry) => entry?.file !== job._file));
+    };
 
     let nextIdx = 0;
     const worker = async () => {
@@ -3684,15 +3869,20 @@ export default function App() {
         if (jobList[i].bgCacheKey) {
           formData.append("bg_cache_key", jobList[i].bgCacheKey);
         }
-        formData.append("segments_json", JSON.stringify(jobList[i].segments));
-        if (Number.isInteger(jobList[i].segmentsRevision)) {
-          formData.append("base_revision", String(jobList[i].segmentsRevision));
+        let generationSegments = jobList[i].segments;
+        let generationBaseRevision = Number.isInteger(jobList[i].segmentsRevision)
+          ? jobList[i].segmentsRevision : 0;
+        let generationVersionId = jobList[i].editorVersionId || null;
+        formData.append("segments_json", JSON.stringify(generationSegments));
+        formData.append("base_revision", String(generationBaseRevision));
+        if (jobList[i].operatorMetrics) {
+          formData.append("editor_metrics_json", JSON.stringify(jobList[i].operatorMetrics));
         }
         if (Number.isInteger(jobList[i].editorRevision)) {
           formData.append("editor_revision", String(jobList[i].editorRevision));
         }
-        if (jobList[i].editorVersionId) {
-          formData.append("editor_version_id", jobList[i].editorVersionId);
+        if (generationVersionId) {
+          formData.append("editor_version_id", generationVersionId);
         }
         formData.append("delivery_profile", delivery.delivery_profile);
         if (delivery.delivery_profile !== "youtube") {
@@ -3721,23 +3911,97 @@ export default function App() {
             alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
             continue;
           }
+
+          // A renderer/background write can race the final /generate request
+          // after the editor already flushed. Re-anchor the local snapshot to
+          // the latest durable document and retry it automatically. The PATCH
+          // remains guarded by the backend CAS, so this never turns into an
+          // unchecked overwrite and the operator never sees a collaboration
+          // modal for a normal single-user session.
+          if (isEditorRevisionConflict(res, data) && jobList[i].transcribeJobId) {
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+              const rebased = await rebaseEditorSnapshot({
+                authFetch,
+                api: API,
+                jobId: jobList[i].transcribeJobId,
+                localSegments: generationSegments,
+                baseRevision: generationBaseRevision,
+                editorVersionId: generationVersionId,
+              });
+              if (!rebased.ok) break;
+              generationSegments = rebased.segments;
+              formData.set("segments_json", JSON.stringify(generationSegments));
+
+              const saveResponse = await authFetch(
+                `${API}/editor/${jobList[i].transcribeJobId}`,
+                {
+                  method: "PATCH",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    base_revision: rebased.latest.revision,
+                    segments: generationSegments,
+                    checkpoint: "manual",
+                  }),
+                },
+              );
+              let saved = {};
+              try { saved = await saveResponse.json(); } catch { /* retry if stale */ }
+              if (!saveResponse.ok) {
+                if (saveResponse.status === 409) continue;
+                break;
+              }
+              // A successful PATCH without a revision is not a usable
+              // approval selector. Do not send the stale selector back to
+              // /generate; fetch/rebase again instead.
+              if (!Number.isInteger(saved.revision)) continue;
+              generationBaseRevision = saved.revision;
+              formData.set("base_revision", String(saved.revision));
+              formData.set("editor_revision", String(saved.revision));
+              generationVersionId = saved.version_id || null;
+              if (generationVersionId) formData.set("editor_version_id", generationVersionId);
+              else formData.delete("editor_version_id");
+              res = await authFetch(`${API}/generate`, { method: "POST", body: formData });
+              try { data = await res.json(); } catch { data = {}; }
+              if (!isEditorRevisionConflict(res, data)) break;
+            }
+          }
+          // A missing transcribe row is recoverable when this same tab still
+          // owns the original File. Re-submit the *approved* snapshot as a
+          // new direct job exactly once; never overwrite or retry another
+          // user's row. This preserves the edited lyrics/timings verbatim.
+          if (isMissingGenerationJob(res, data) && canRebuildMissingGenerationJob(jobList[i])) {
+            console.warn("[generate] rebuilding missing temporary job from local audio", {
+              old_job_id: jobList[i].transcribeJobId,
+            });
+            rebuildGenerationRequestFromLocalAudio(formData, jobList[i]);
+            setJobs((prev) => prev.map((j, idx) =>
+              idx === i ? { ...j, current_step: "uploading", progress: 0 } : j
+            ));
+            res = await authFetch(`${API}/generate`, { method: "POST", body: formData });
+            try { data = await res.json(); } catch { data = {}; }
+          }
+
           if (!res.ok || data.detail) {
-            // A 404 / `job_not_found` here means the transcribed job was reaped
-            // (or wasn't the caller's) before we got to /generate. Prefer the
-            // stable backend `code` over the raw HTTP status; keep 404 as a
-            // fallback for older backends. Surface a clear session-expired
-            // message instead of the raw "Job not found.".
-            const reason = (data.code === "job_not_found" || res.status === 404)
-              ? (t("generate.session_expired")
-                 || "La sesión expiró antes de generar. Re-subí el audio para regenerar.")
+            // Only a confirmed missing job is a session expiry. The API also
+            // uses 404 for missing source/background objects; presenting all
+            // of those as a lost session sent people to re-upload audio for
+            // unrelated storage failures.
+            const editorConflict = isEditorRevisionConflict(res, data);
+            const missingJob = isMissingGenerationJob(res, data);
+            const reason = missingJob
+              ? (t("generate.job_missing")
+                 || "No encontramos la canción temporal en el servidor. Tus correcciones siguen disponibles para volver al editor.")
               : (translateBackendError(data.detail, t) || await describeFetchError(null, res, t));
             setJobs((prev) => prev.map((j, idx) =>
               idx === i ? { ...j, status: "error", error: reason } : j
             ));
-            alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
+            if (!editorConflict) {
+              alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
+            }
             continue;
           }
           setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
+          markGenerationAccepted(jobList[i]);
           await pollJob(data.job_id);
         } catch (err) {
           const reason = await describeFetchError(err, res, t);
@@ -3867,8 +4131,11 @@ export default function App() {
             continue;
           }
           if (!genRes.ok || data.detail) {
-            // Same session-expired handling as the legacy /generate path.
-            const reason = (genRes.status === 404)
+            // Match the legacy path: a 404 from storage is not a session
+            // expiry unless the backend explicitly says the job is missing.
+            const missingJob = data.code === "job_not_found"
+              || (genRes.status === 404 && /job not found/i.test(String(data.detail || "")));
+            const reason = missingJob
               ? (t("generate.session_expired")
                  || "La sesión expiró antes de generar. Re-subí el audio para regenerar.")
               : (translateBackendError(data.detail, t) || await describeFetchError(null, genRes, t));
@@ -4053,6 +4320,7 @@ export default function App() {
         textContrast: last.textContrast || "medium",
         segments: last.segments,
         referenceLyrics: "",
+        transcriptionQuality: last.transcriptionQuality || null,
         coverageWarning: false,
         recoverySource: "",
         queueIdx: approvedJobs.length - 1,
@@ -4099,6 +4367,42 @@ export default function App() {
     setWizardStage("upload");
   };
 
+  const handleRecoverFailedGeneration = () => {
+    // `jobs` holds the original approved snapshot privately. Recover only
+    // rows the backend did not accept; already queued videos keep running.
+    const recoverable = jobs
+      .filter((job) => job.status === "error" && job._approvedSource)
+      .map((job) => job._approvedSource);
+    if (recoverable.length === 0) return;
+
+    const sourceFiles = recoverable.map((entry) => entry.file).filter(Boolean);
+    setApprovedJobs(recoverable);
+    setFiles((prev) => {
+      const retained = prev.filter((entry) => sourceFiles.includes(entry?.file));
+      return retained.length > 0 ? retained : recoverable.map((entry) => ({
+        file: entry.file,
+        artist: entry.artist || "",
+        songTitle: entry.songTitle || "",
+        language: entry.language || "",
+        genre: entry.genre || "",
+        font: entry.font || "",
+        concept: entry.concept || "",
+        movementStyle: entry.movementStyle || "",
+        effect: entry.effect || "",
+      }));
+    });
+    setReviewQueue(recoverable.map((entry) => ({
+      file: entry.file,
+      artist: entry.artist || "",
+      songTitle: entry.songTitle || "",
+      language: entry.language || "",
+    })));
+    setJobs([]);
+    setReadyToGenerate(true);
+    setWizardStage("review");
+    navigate("/new");
+  };
+
   const handleGenerateBatch = () => {
     // Double-click guard. See generateLockRef declaration above for the
     // race this closes. Lock released by startGenerationWithSegments
@@ -4139,14 +4443,16 @@ export default function App() {
     // "Generar". El badge "Listo p/ editar" promete 1-click → editor;
     // cortocircuitamos /videos/<id> y vamos directo al resume flow.
     if (status === "transcribed") {
-      navigate(`/new?resume=${encodeURIComponent(jobId)}`);
+      navigate(reviewJobPath(jobId));
       return;
     }
     navigate(`/videos/${jobId}`);
   };
 
   const handleSearchSelectJob = (jobId, status) => {
-    const onWizardRoute = ["/new", "/review", "/generating"].includes(location.pathname);
+    const onWizardRoute = location.pathname === "/new"
+      || location.pathname.startsWith("/review")
+      || location.pathname === "/generating";
     if (onWizardRoute && wizardPersistence.hasResumableContent(wizardPersistence.load())) {
       const msg =
         t("wizard.confirm_leave") ||
@@ -4817,6 +5123,26 @@ export default function App() {
     </div>
   );
 
+  const handleCopyReviewLink = useCallback(async () => {
+    const jobId = currentReview?.transcribeJobId;
+    if (!jobId) return;
+    const url = new URL(reviewJobPath(jobId), window.location.origin).toString();
+    try {
+      if (!navigator.clipboard?.writeText) {
+        window.prompt("Copiá el enlace de revisión", url);
+        return;
+      }
+      await navigator.clipboard.writeText(url);
+      alert({
+        title: "Enlace copiado",
+        description: "La revisión se abre en este job y retoma la última versión guardada.",
+        tone: "success",
+      });
+    } catch {
+      window.prompt("Copiá el enlace de revisión", url);
+    }
+  }, [alert, currentReview?.transcribeJobId]);
+
   // /review handles three sub-states (transcribing spinner, LyricsEditor,
   // LyricsEditor when a song is ready to review, and the batch summary
   // before launching generation. Empty state → redirect home.
@@ -4927,6 +5253,24 @@ export default function App() {
     if (currentReview) {
       return (
         <div className="flex justify-center">
+          <div className="w-full max-w-[980px]">
+          {currentReview.transcribeJobId && (
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/[0.08] bg-surface-2/50 px-4 py-3">
+              <div className="min-w-0">
+                <p className="text-xs font-medium text-gray-200">Revisión guardada</p>
+                <p className="truncate text-[11px] text-gray-500">
+                  {reviewJobPath(currentReview.transcribeJobId)}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={handleCopyReviewLink}
+                className="btn-secondary shrink-0 px-3 py-2 text-xs"
+              >
+                Copiar enlace
+              </button>
+            </div>
+          )}
           <Suspense fallback={<EditorSuspenseFallback />}>
           <LyricsEditor
             // 2026-07-16: cuando el wizard pasa un slot (bajo el video), el
@@ -4978,8 +5322,17 @@ export default function App() {
             audioFile={currentReview.file}
             audioUrl={currentReview.audioUrl || null}
             audioLoading={!!currentReview.audioLoading}
+            audioUnavailableReason={currentReview.audioUnavailableReason || null}
+            onRetryAudio={currentReview.editingJobId
+              ? editorAudioRetryRef.current
+              : currentReview.transcribeJobId
+                ? () => retryTranscriptionReviewAudio(currentReview.transcribeJobId)
+                : null}
+            waveform={currentReview.waveform || null}
+            waveformLoading={currentReview.waveformLoading ?? (!!currentReview.transcribeJobId && !currentReview.waveform)}
             referenceLyrics={currentReview.referenceLyrics || ""}
             coverageWarning={currentReview.coverageWarning}
+            transcriptionQuality={currentReview.transcriptionQuality}
             recoverySource={currentReview.recoverySource}
             onApprove={handleApproveLyrics}
             onBack={handleBackInReview}
@@ -5048,6 +5401,7 @@ export default function App() {
             onPlaybackTick={handlePlaybackTick}
           />
           </Suspense>
+          </div>
         </div>
       );
     }
@@ -5132,6 +5486,7 @@ export default function App() {
         <BatchProgress
           jobs={jobs}
           onReset={handleReset}
+          onRecoverFailed={handleRecoverFailedGeneration}
           onSingleDone={handleSelectJob}
           onSelectJob={handleSelectJob}
           onBulkApprove={handleBulkApproveBatch}
@@ -5208,12 +5563,13 @@ export default function App() {
               />
             </Suspense>
           } />
-          {/* Capa B 2026-05-24 — /new y /review renderizan el MISMO content
+          {/* /new y /review renderizan el MISMO content
               (wizardScreen) que conmuta upload ↔ review ↔ ready_to_generate
-              vía wizardStage. /review se mantiene como ruta válida sólo para
-              compat con bookmarks viejos; URL nueva canónica es /new. */}
+              vía wizardStage. /review/:jobId es la URL durable y compartible
+              de una transcripción; /review queda por compatibilidad. */}
           <Route path="/new" element={wizardScreen} />
           <Route path="/review" element={wizardScreen} />
+          <Route path="/review/:jobId" element={wizardScreen} />
           <Route path="/generating" element={generatingScreen} />
           <Route path="/videos" element={
             <Suspense fallback={<RouteSuspenseFallback />}>
@@ -5242,6 +5598,7 @@ export default function App() {
             <EditLyricsRoute
               setCurrentReview={setCurrentReview}
               setWizardStage={setWizardStage}
+              editorAudioRetryRef={editorAudioRetryRef}
               setStyle={setStyle}
               setCustomColors={setCustomColors}
               setBgSelectMode={setBgSelectMode}

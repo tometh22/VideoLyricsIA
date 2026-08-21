@@ -13,7 +13,12 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
-import { clampResizeTiming, clampSelectionShiftDelta } from "../lib/segmentTiming";
+import {
+  clampResizeTiming,
+  clampSelectionShiftDelta,
+  rippleResizeEnd,
+  shiftTimingWithAdjacent,
+} from "../lib/segmentTiming";
 
 const ZOOM_DEFAULT = 48;
 const ZOOM_MIN = 8;
@@ -27,7 +32,6 @@ const MOVE_HIT_MIN_PX = 28;
 const MIN_DUR_S = 0.3;
 const CLICK_SLOP_PX = 5;
 const FOLLOW_SUPPRESS_MS = 2500;
-const FOLLOW_LOCK_MS = 750;
 const LABEL_W = 264;
 
 function clamp(value, min, max) {
@@ -41,11 +45,35 @@ function fmt(sec) {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+function fmtPrecise(sec) {
+  if (!isFinite(sec) || sec < 0) sec = 0;
+  const m = Math.floor(sec / 60);
+  const s = (sec % 60).toFixed(2).padStart(5, "0");
+  return `${m}:${s}`;
+}
+
 function nearestTick(step) {
   if (step <= 5) return 1;
   if (step <= 15) return 5;
   if (step <= 45) return 10;
   return 30;
+}
+
+function unsafeWindowReasonLabel(window, t) {
+  const codes = Array.isArray(window?.reasons) ? window.reasons : [];
+  if (codes.some((code) => /structur|cardinal|event_count|motif/.test(String(code)))) {
+    return t("editor.quality_reason_structure", "Cantidad o estructura vocal incierta");
+  }
+  if (codes.some((code) => /timing|align|boundary|overlap|inversion|start|end/.test(String(code)))) {
+    return t("editor.quality_reason_timing", "Timing incierto");
+  }
+  if (codes.some((code) => /voic|coverage|uncovered|vocal/.test(String(code)))) {
+    return t("editor.quality_reason_voice", "Voz sin cubrir");
+  }
+  if (codes.some((code) => /text|lexical|asr|content/.test(String(code)))) {
+    return t("editor.quality_reason_text", "Letra incierta");
+  }
+  return t("editor.quality_reason_uncertain", "Evidencia insuficiente");
 }
 
 function normalizeTimelineSegments(input) {
@@ -71,11 +99,18 @@ export default function LyricsTimeline({
   segments,
   duration,
   currentTime,
+  playbackTimeRef = null,
   isPlaying = false,
   activeId,
   focusedSegId,
   highlightedIds,
   waveform = null,
+  waveformLoading = false,
+  // Ventanas dudosas del análisis de calidad ({start, end, reasons[]}). Se
+  // señalan sobre la guía de audio sin cubrirla: hasta ahora la timeline no recibía NINGUNA
+  // señal de calidad, así que para encontrar el punto a corregir el operador
+  // sólo podía clickear y escuchar (2,9 seeks medidos por cada corrección).
+  unsafeWindows = [],
   gapS = 0.05,
   saveStatus = "idle",
   onSeek,
@@ -98,11 +133,14 @@ export default function LyricsTimeline({
   const dragRef = useRef(null);
   const marqueeRef = useRef(null);
   const followTimerRef = useRef(null);
-  const followLockRef = useRef(false);
   const selectionAnchorRef = useRef(null);
   const lastInteractionRef = useRef(0);
+  const lastFollowTargetRef = useRef(null);
   const clickSuppressRef = useRef(false);
-  const activeRowRefs = useRef(new Map());
+  const playheadRef = useRef(null);
+  const activePlayheadRef = useRef(null);
+  const semanticTimeRef = useRef(currentTime);
+  semanticTimeRef.current = currentTime;
   const [viewportWidth, setViewportWidth] = useState(0);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [marquee, setMarquee] = useState(null);
@@ -114,6 +152,11 @@ export default function LyricsTimeline({
   const [followEnabled, setFollowEnabled] = useState(true);
   const [followSuppressed, setFollowSuppressed] = useState(false);
   const [limitFeedback, setLimitFeedback] = useState("");
+  // Right-edge trimming defaults to the professional, collision-safe ripple
+  // behaviour. Keep the existing optional chain movement separate so moving
+  // a whole block never becomes surprising just because resize got smarter.
+  const [rightEdgeRipple, setRightEdgeRipple] = useState(true);
+  const [rippleEditing, setRippleEditing] = useState(false);
 
   const normalizedSegments = useMemo(() => normalizeTimelineSegments(segments), [segments]);
   const total = Math.max(Number(duration) || 0, ...normalizedSegments.map((s) => s.end), 1);
@@ -289,7 +332,23 @@ export default function LyricsTimeline({
       return;
     }
     const movingGroup = mode === "move" && selectedIds.has(segment._id) && selectedIds.size > 1;
-    const snapshots = (movingGroup ? normalizedSegments.filter((item) => selectedIds.has(item._id)) : [segment])
+    const ripple = !movingGroup && (
+      mode === "end" ? rightEdgeRipple : mode === "move" && rippleEditing
+    );
+    const segmentIndex = normalizedSegments.findIndex((item) => item._id === segment._id);
+    const resizeNeighbour = mode === "start"
+      ? normalizedSegments[segmentIndex - 1]
+      : mode === "end" ? normalizedSegments[segmentIndex + 1] : null;
+    const snapshotSegments = movingGroup
+      ? normalizedSegments.filter((item) => selectedIds.has(item._id))
+      : ripple && mode === "move"
+        ? normalizedSegments
+        : ripple && mode === "end"
+          ? normalizedSegments
+        : ripple
+          ? [segment, resizeNeighbour].filter(Boolean)
+          : [segment];
+    const snapshots = snapshotSegments
       .map((item) => ({ id: item._id, start: item.start, end: item.end }));
     if (!selectedIds.has(segment._id)) {
       selectionAnchorRef.current = segment._id;
@@ -302,14 +361,17 @@ export default function LyricsTimeline({
       snapshots,
       origStart: segment.start,
       origEnd: segment.end,
+      movingGroup,
+      ripple,
       moved: false,
       pxPerSec,
       startedAt: performance.now(),
     };
     event.currentTarget.setPointerCapture?.(event.pointerId);
     markInteraction();
+    setLimitFeedback("");
     setPreview(movingGroup ? { changes: snapshots, mode } : { id: segment._id, start: segment.start, end: segment.end, mode });
-  }, [markInteraction, normalizedSegments, pxPerSec, selectRangeTo, selectedIds, toggleSelection]);
+  }, [markInteraction, normalizedSegments, pxPerSec, rightEdgeRipple, rippleEditing, selectRangeTo, selectedIds, toggleSelection]);
 
   const updateDrag = useCallback((event) => {
     const drag = dragRef.current;
@@ -317,15 +379,14 @@ export default function LyricsTimeline({
       updateMarquee(event);
       return;
     }
-    const delta = (event.clientX - drag.originX) / drag.pxPerSec;
-    if (Math.abs(event.clientX - drag.originX) > CLICK_SLOP_PX) {
+    const resizing = drag.mode === "start" || drag.mode === "end";
+    const fineScale = resizing && event.altKey ? 0.1 : 1;
+    const delta = ((event.clientX - drag.originX) / drag.pxPerSec) * fineScale;
+    const movementThreshold = resizing ? 1 : CLICK_SLOP_PX;
+    if (Math.abs(event.clientX - drag.originX) > movementThreshold) {
       drag.moved = true;
-      if (!drag.historyStarted) {
-        drag.historyStarted = true;
-        onDragStart?.();
-      }
     }
-    if (drag.snapshots.length > 1) {
+    if (drag.movingGroup) {
       const safeDelta = clampSelectionShiftDelta(
         normalizedSegments,
         new Set(drag.snapshots.map((item) => item.id)),
@@ -342,29 +403,61 @@ export default function LyricsTimeline({
     let start = drag.origStart;
     let end = drag.origEnd;
     if (drag.mode === "start" || drag.mode === "end") {
-      const bounded = clampResizeTiming(
-        normalizedSegments,
-        drag.id,
-        drag.mode === "start" ? drag.origStart + delta : drag.origStart,
-        drag.mode === "end" ? drag.origEnd + delta : drag.origEnd,
-        total,
-        gapS,
-        MIN_DUR_S,
-      );
-      if (bounded) ({ start, end } = bounded);
-      setLimitFeedback(bounded?.blocked ? "La línea no tiene espacio para cambiar su duración." : "");
-    } else {
-      const safeDelta = clampSelectionShiftDelta(
-        normalizedSegments, new Set([drag.id]), delta, total, gapS,
-      );
-      start = drag.origStart + safeDelta;
-      end = drag.origEnd + safeDelta;
-      setLimitFeedback(Math.abs(delta) > 1e-4 && Math.abs(safeDelta) < 1e-4
-        ? "La línea llegó al límite disponible."
+      const requestedStart = drag.mode === "start" ? drag.origStart + delta : drag.origStart;
+      const requestedEnd = drag.mode === "end" ? drag.origEnd + delta : drag.origEnd;
+      const resize = drag.ripple && drag.mode === "end"
+        ? rippleResizeEnd(
+          normalizedSegments, drag.id, requestedEnd, total, gapS, MIN_DUR_S,
+        )
+        : (() => {
+          const bounded = clampResizeTiming(
+            normalizedSegments, drag.id, requestedStart, requestedEnd,
+            total, gapS, MIN_DUR_S, drag.mode,
+          );
+          return bounded ? {
+            changes: [{ id: drag.id, start: bounded.start, end: bounded.end }],
+            blocked: bounded.blocked,
+          } : null;
+        })();
+      const ownChange = resize?.changes?.find((change) => change.id === drag.id);
+      if (ownChange) ({ start, end } = ownChange);
+      const appliedBoundary = drag.mode === "start" ? start : end;
+      const requestedBoundary = drag.mode === "start" ? requestedStart : requestedEnd;
+      const limited = Math.abs(requestedBoundary - appliedBoundary) > 1e-4;
+      setLimitFeedback(resize?.blocked || limited
+        ? drag.ripple && drag.mode === "end"
+          ? t("timeline.ripple_limit", "El ajuste llegó a su límite; las líneas no se superpusieron.")
+          : "Ese borde toca otra línea. Para no modificarla, el ajuste se detuvo."
         : "");
+      if (resize?.changes?.length > 1) {
+        setPreview({ changes: resize.changes, mode: drag.mode });
+        return;
+      }
+    } else {
+      if (drag.ripple) {
+        const move = shiftTimingWithAdjacent(
+          normalizedSegments, drag.id, delta, total, gapS,
+        );
+        const ownChange = move.changes.find((change) => change.id === drag.id);
+        if (ownChange) ({ start, end } = ownChange);
+        setLimitFeedback(move.blocked ? "La cadena llegó al límite disponible." : "");
+        if (move.changes.length > 1) {
+          setPreview({ changes: move.changes, mode: drag.mode });
+          return;
+        }
+      } else {
+        const safeDelta = clampSelectionShiftDelta(
+          normalizedSegments, new Set([drag.id]), delta, total, gapS,
+        );
+        start = drag.origStart + safeDelta;
+        end = drag.origEnd + safeDelta;
+        setLimitFeedback(Math.abs(delta) > 1e-4 && Math.abs(safeDelta) < 1e-4
+          ? "No hay espacio para mover sólo esta línea. Ajustá uno de sus bordes o elegí En cadena."
+          : "");
+      }
     }
     setPreview({ id: drag.id, start, end, mode: drag.mode });
-  }, [gapS, normalizedSegments, onDragStart, total, updateMarquee]);
+  }, [gapS, normalizedSegments, t, total, updateMarquee]);
 
   const finishDrag = useCallback((event, segment) => {
     if (marqueeRef.current) {
@@ -388,14 +481,21 @@ export default function LyricsTimeline({
         return original && (Math.abs(original.start - change.start) > 1e-3 || Math.abs(original.end - change.end) > 1e-3);
       });
       const durationMs = Math.max(0, performance.now() - drag.startedAt);
-      if (changes.length) onTimingChangeBatch?.(changes, { durationMs });
-      if (changes.length) onGroupMoved?.({ count: changes.length, delta: changes[0].start - drag.snapshots[0].start });
+      if (changes.length) onDragStart?.();
+      if (changes.length) onTimingChangeBatch?.(changes, {
+        durationMs,
+        operation: drag.mode === "end" && drag.ripple ? "ripple_resize" : drag.mode === "move" ? "move" : "resize",
+      });
+      if (changes.length && drag.movingGroup) onGroupMoved?.({ count: changes.length, delta: changes[0].start - drag.snapshots[0].start });
       return;
     }
     if (Math.abs(current.start - segment.start) > 1e-3 || Math.abs(current.end - segment.end) > 1e-3) {
-      onTimingChange?.(segment._id, current.start, current.end);
+      onDragStart?.();
+      onTimingChange?.(segment._id, current.start, current.end, {
+        operation: drag.mode === "end" && drag.ripple ? "ripple_resize" : drag.mode === "move" ? "move" : "resize",
+      });
     }
-  }, [finishMarquee, onFocus, onGroupMoved, onTimingChange, onTimingChangeBatch, preview, seekAt]);
+  }, [finishMarquee, onDragStart, onFocus, onGroupMoved, onTimingChange, onTimingChangeBatch, preview, seekAt]);
 
   const cancelPointerInteraction = useCallback((event) => {
     dragRef.current = null;
@@ -414,9 +514,22 @@ export default function LyricsTimeline({
   const nudgeSelection = useCallback((delta) => {
     const snapshots = normalizedSegments.filter((segment) => selectedIds.has(segment._id));
     if (!snapshots.length) return;
+    if (rippleEditing && snapshots.length === 1) {
+      const move = shiftTimingWithAdjacent(normalizedSegments, snapshots[0]._id, delta, total, gapS);
+      if (!move.changes.length) {
+        setLimitFeedback("La cadena llegó al límite disponible.");
+        return;
+      }
+      onDragStart?.();
+      onTimingChangeBatch?.(move.changes, { operation: "move" });
+      markInteraction();
+      return;
+    }
     const safeDelta = clampSelectionShiftDelta(normalizedSegments, selectedIds, delta, total, gapS);
     if (Math.abs(safeDelta) < 1e-6) {
-      setLimitFeedback("No hay espacio para mover esta selección.");
+      setLimitFeedback(snapshots.length === 1
+        ? "No hay espacio para mover sólo esta línea. Ajustá uno de sus bordes o elegí En cadena."
+        : "No hay espacio para mover esta selección.");
       return;
     }
     onDragStart?.();
@@ -426,18 +539,21 @@ export default function LyricsTimeline({
       end: segment.end + safeDelta,
     })));
     markInteraction();
-  }, [gapS, markInteraction, normalizedSegments, onDragStart, onTimingChangeBatch, selectedIds, total]);
+  }, [gapS, markInteraction, normalizedSegments, onDragStart, onTimingChangeBatch, rippleEditing, selectedIds, total]);
 
   const scrollToPlayhead = useCallback(() => {
     const sc = scrollRef.current;
-    if (!sc || typeof sc.scrollTo !== "function" || followLockRef.current || Date.now() - lastInteractionRef.current < FOLLOW_SUPPRESS_MS) return;
+    if (!sc || typeof sc.scrollTo !== "function" || Date.now() - lastInteractionRef.current < FOLLOW_SUPPRESS_MS) return;
     const x = LABEL_W + currentTime * pxPerSec;
     const left = sc.scrollLeft;
     const right = left + sc.clientWidth;
     if (x < left + 80 || x > right - 120) {
-      followLockRef.current = true;
-      sc.scrollTo({ left: Math.max(0, x - sc.clientWidth * 0.4), behavior: "smooth" });
-      window.setTimeout(() => { followLockRef.current = false; }, FOLLOW_LOCK_MS);
+      const target = Math.max(0, x - sc.clientWidth * 0.4);
+      if (lastFollowTargetRef.current != null && Math.abs(target - lastFollowTargetRef.current) < 80) return;
+      lastFollowTargetRef.current = target;
+      sc.scrollTo({ left: target, behavior: "auto" });
+    } else {
+      lastFollowTargetRef.current = null;
     }
   }, [currentTime, pxPerSec]);
 
@@ -445,11 +561,31 @@ export default function LyricsTimeline({
     if (isPlaying && followEnabled) scrollToPlayhead();
   }, [isPlaying, followEnabled, scrollToPlayhead]);
 
+  // This surface owns horizontal scrolling only. scrollIntoView on a lyric
+  // row also scrolls the outer editor/page and used to recenter the complete
+  // workspace whenever the active lyric changed.
+
+  const positionPlayheads = useCallback((time) => {
+    const x = Math.max(0, Number(time) || 0) * pxPerSec;
+    const transform = `translate3d(${x}px, 0, 0)`;
+    if (playheadRef.current) playheadRef.current.style.transform = transform;
+    if (activePlayheadRef.current) activePlayheadRef.current.style.transform = transform;
+  }, [pxPerSec]);
+
   useEffect(() => {
-    if (!isPlaying || !followEnabled || followSuppressed || activeId == null) return;
-    const row = activeRowRefs.current.get(activeId);
-    row?.scrollIntoView?.({ block: "center", inline: "nearest", behavior: "smooth" });
-  }, [activeId, followEnabled, followSuppressed, isPlaying]);
+    if (!isPlaying) positionPlayheads(currentTime);
+  }, [currentTime, isPlaying, positionPlayheads]);
+
+  useEffect(() => {
+    if (!isPlaying) return undefined;
+    let frame = 0;
+    const paint = () => {
+      positionPlayheads(playbackTimeRef?.current ?? semanticTimeRef.current);
+      frame = requestAnimationFrame(paint);
+    };
+    frame = requestAnimationFrame(paint);
+    return () => cancelAnimationFrame(frame);
+  }, [isPlaying, playbackTimeRef, positionPlayheads]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -468,8 +604,11 @@ export default function LyricsTimeline({
     ctx.fillStyle = "rgba(139,124,246,0.45)";
     for (let i = 0; i < peaks.length; i += stride) {
       const x = (i / peaks.length) * trackWidth;
-      const height = Math.max(2, peaks[i] * (WAVE_H - 8));
-      ctx.fillRect(x, (WAVE_H - height) / 2, Math.max(1, 2.5 * stride), height);
+      const magnitude = clamp(Math.abs(Number(peaks[i])) || 0, 0, 1);
+      const height = Math.max(2, magnitude * (WAVE_H - 8));
+      const visualStep = (stride / peaks.length) * trackWidth;
+      const barWidth = Math.max(1, Math.min(3, visualStep - 1));
+      ctx.fillRect(x, (WAVE_H - height) / 2, barWidth, height);
     }
   }, [trackWidth, waveform]);
 
@@ -529,6 +668,9 @@ export default function LyricsTimeline({
   };
 
   const tickStep = nearestTick(120 / pxPerSec);
+  const renderedPlayheadTime = isPlaying
+    ? (playbackTimeRef?.current ?? currentTime)
+    : currentTime;
 
   return (
     <div
@@ -555,10 +697,30 @@ export default function LyricsTimeline({
           {saveStatus === "saved" && <span className="text-[10px] text-emerald-300">✓ {t("timeline.saved", "Guardado")}</span>}
           {saveStatus === "local" && <span className="text-[10px] text-amber-300">{t("timeline.local_changes", "Cambios locales")}</span>}
           {saveStatus === "offline" && <span className="text-[10px] text-red-300">{t("timeline.offline", "Sin conexión")}</span>}
-          {saveStatus === "conflict" && <span className="text-[10px] text-amber-300">{t("timeline.conflict", "Conflicto detectado")}</span>}
           {saveStatus === "error" && <span className="text-[10px] text-red-300">{t("timeline.save_error", "Sin guardar")}</span>}
+          {saveStatus === "conflict" && <span className="text-[10px] text-amber-300">{t("timeline.conflict", "Conflicto detectado")}</span>}
         </div>
         <div className="relative flex items-center gap-2" data-testid="timeline-primary-actions" data-selected-count={selectedIds.size}>
+          <div role="group" aria-label={t("timeline.edit_behavior", "Comportamiento del ajuste")} className="hidden sm:inline-flex h-9 overflow-hidden rounded-xl bg-black/15 ring-1 ring-white/[0.1]">
+            <button
+              type="button"
+              aria-pressed={rightEdgeRipple}
+              onClick={() => { setRightEdgeRipple(true); setLimitFeedback(""); }}
+              className={`px-3 text-[10px] font-medium transition-colors ${rightEdgeRipple ? "bg-brand/25 text-brand-light" : "text-ink-tertiary hover:bg-white/[0.05] hover:text-white"}`}
+              title={t("timeline.ripple_trim_hint", "Al extender una línea, empuja sólo las siguientes que choquen")}
+            >
+              {t("timeline.ripple_trim", "Empujar siguientes")}
+            </button>
+            <button
+              type="button"
+              aria-pressed={!rightEdgeRipple}
+              onClick={() => { setRightEdgeRipple(false); setLimitFeedback(""); }}
+              className={`border-l border-white/[0.08] px-3 text-[10px] font-medium transition-colors ${!rightEdgeRipple ? "bg-emerald-400/15 text-emerald-200" : "text-ink-tertiary hover:bg-white/[0.05] hover:text-white"}`}
+              title={t("timeline.safe_mode_hint", "Modo seguro: nunca modifica otras líneas")}
+            >
+              {t("timeline.safe_mode", "Solo esta línea")}
+            </button>
+          </div>
           <button type="button" onClick={fitTimeline} title={t("timeline.fit_hint", "Ver la canción completa")} className="h-9 px-3 rounded-xl text-[11px] font-medium text-white bg-white/[0.055] ring-1 ring-white/[0.1] hover:bg-white/[0.09] transition-colors">{t("timeline.fit", "Ver canción completa")}</button>
           <button
             type="button"
@@ -593,6 +755,16 @@ export default function LyricsTimeline({
                   <button type="button" onClick={() => setPxPerSec((value) => Math.min(ZOOM_MAX, value + ZOOM_STEP))} className="w-7 h-full hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.zoom_in", "Acercar")}>+</button>
                 </div>
               </div>
+              <button
+                type="button"
+                onClick={() => setRippleEditing((value) => !value)}
+                aria-checked={rippleEditing}
+                role="menuitemcheckbox"
+                className={`w-full rounded-xl px-3 py-2.5 text-left text-[11px] transition-colors ${rippleEditing ? "text-brand-light bg-brand/10" : "text-ink-secondary hover:text-white hover:bg-white/[0.05]"}`}
+              >
+                <span className="block font-medium">{t("timeline.move_ripple", "Mover en cadena")}</span>
+                <span className="mt-0.5 block text-[10px] text-ink-tertiary">{t("timeline.move_ripple_hint", "Al mover un bloque, desplaza las líneas pegadas")}</span>
+              </button>
               <button type="button" role="menuitem" onClick={() => { onReset?.(); setMoreActionsOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:text-white hover:bg-white/[0.05]">
                 <span className="block font-medium">{t("timeline.reset", "Restaurar tiempos originales")}</span>
                 <span className="mt-0.5 block text-[10px] text-ink-tertiary">{t("timeline.reset_desc", "Deshace todos los ajustes de timing")}</span>
@@ -602,6 +774,18 @@ export default function LyricsTimeline({
           )}
         </div>
       </div>
+
+      <div className="flex border-b border-white/[0.06] sm:hidden" role="group" aria-label={t("timeline.edit_behavior_mobile", "Comportamiento del ajuste móvil")}>
+        <button type="button" aria-pressed={rightEdgeRipple} onClick={() => { setRightEdgeRipple(true); setLimitFeedback(""); }} className={`flex-1 px-3 py-2 text-[10px] font-medium ${rightEdgeRipple ? "bg-brand/20 text-brand-light" : "text-ink-tertiary"}`}>{t("timeline.ripple_trim", "Empujar siguientes")}</button>
+        <button type="button" aria-pressed={!rightEdgeRipple} onClick={() => { setRightEdgeRipple(false); setLimitFeedback(""); }} className={`flex-1 border-l border-white/[0.06] px-3 py-2 text-[10px] font-medium ${!rightEdgeRipple ? "bg-emerald-400/12 text-emerald-200" : "text-ink-tertiary"}`}>{t("timeline.safe_mode", "Solo esta línea")}</button>
+      </div>
+
+      {limitFeedback && (
+        <div data-testid="timeline-limit-feedback" role="status" className="flex items-center gap-2 border-b border-amber-300/15 bg-amber-300/[0.07] px-4 sm:px-5 py-2 text-[10px] text-amber-100">
+          <span aria-hidden="true">↔</span>
+          <span>{limitFeedback}</span>
+        </div>
+      )}
 
       {selectedIds.size > 0 ? (
         <div data-testid="timeline-selection-help" aria-live="polite" className="flex items-center gap-2.5 border-b border-brand/20 bg-gradient-to-r from-brand/20 via-brand/10 to-transparent px-4 sm:px-5 py-2.5 flex-wrap">
@@ -636,8 +820,6 @@ export default function LyricsTimeline({
           <span>{t("timeline.paint_hint", "Papelera: elimina una línea · Arrastrá el fondo: seleccioná varias para moverlas o eliminarlas")}</span>
         </div>
       )}
-      <p aria-live="polite" className="sr-only">{limitFeedback}</p>
-
       <div
         ref={scrollRef}
         data-testid="timeline-scroll"
@@ -658,12 +840,54 @@ export default function LyricsTimeline({
             </div>
           </div>
 
-          <div className="relative h-12 border-b border-white/[0.06] bg-brand/[0.035]">
+          <div className="relative h-14 border-b border-white/[0.06] bg-brand/[0.035]">
             <div className="sticky left-0 z-40 flex h-full items-center border-r border-white/[0.08] bg-surface-1/95 px-4 text-[10px] text-ink-tertiary" style={{ width: LABEL_W }}>
-              <span className="inline-flex items-center gap-2"><span className="h-1.5 w-1.5 rounded-full bg-brand-light/70" />{t("timeline.waveform", "Forma de onda")}</span>
+              <span className="inline-flex min-w-0 items-center gap-2">
+                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-brand-light/70" />
+                <span className="min-w-0">
+                  <span className="block truncate font-medium text-ink-secondary">{t("timeline.waveform", "Audio de la canción")}</span>
+                  <span className="mt-0.5 hidden truncate text-[8px] text-ink-tertiary xl:block">{t("timeline.waveform_hint", "Picos = voz o sonido")}</span>
+                </span>
+              </span>
             </div>
             <div className="absolute inset-y-0 cursor-pointer" style={{ left: LABEL_W, width: trackWidth }} onClick={(event) => seekAt(event.clientX)}>
               {waveform?.peaks?.length ? <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none opacity-80" aria-hidden="true" /> : null}
+              {!waveform?.peaks?.length && waveformLoading && (
+                <div className="absolute inset-0 flex items-center gap-1.5 overflow-hidden px-4" role="status">
+                  {[20, 44, 68, 34, 55, 28, 62, 39, 71, 31, 48, 24].map((height, index) => (
+                    <span key={index} className="w-1 animate-pulse rounded-full bg-brand-light/35" style={{ height: `${height}%`, animationDelay: `${index * 65}ms` }} aria-hidden="true" />
+                  ))}
+                  <span className="ml-2 text-[10px] text-ink-tertiary">{t("timeline.waveform_loading", "Preparando guía de audio…")}</span>
+                </div>
+              )}
+              {!waveform?.peaks?.length && !waveformLoading && (
+                <div className="absolute inset-0 flex items-center px-4 text-[10px] text-ink-tertiary" role="status">
+                  {t("timeline.waveform_unavailable", "Guía visual no disponible · podés escuchar y ajustar normalmente")}
+                </div>
+              )}
+              {unsafeWindows.map((qualityWindow, index) => {
+                const from = Number(qualityWindow?.start);
+                const to = Number(qualityWindow?.end);
+                if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return null;
+                // Clamp contra la duración: algunas razones (p.ej.
+                // live_structural_disagreement) generan ventanas que terminan
+                // después del audio, y sin esto la banda estiraba el track y
+                // creaba scroll fantasma.
+                const fromClamped = Math.max(0, Math.min(from, total));
+                const toClamped = Math.max(fromClamped, Math.min(to, total));
+                const left = fromClamped * pxPerSec;
+                const width = Math.max(2, (toClamped - fromClamped) * pxPerSec);
+                return (
+                  <div
+                    key={qualityWindow?.id ?? `unsafe-${index}`}
+                    className="pointer-events-none absolute top-0 h-1.5 rounded-b-sm bg-amber-300/80 shadow-[0_0_8px_rgba(252,211,77,.28)]"
+                    style={{ left, width }}
+                    title={`${t("timeline.unsafe_window", "Zona a revisar")}: ${unsafeWindowReasonLabel(qualityWindow, t)}`}
+                    data-testid="timeline-unsafe-window"
+                    aria-hidden="true"
+                  />
+                );
+              })}
             </div>
           </div>
 
@@ -675,16 +899,12 @@ export default function LyricsTimeline({
                 return (
                   <div
                     key={`label-${segment._id}`}
-                    ref={(node) => {
-                      if (node) activeRowRefs.current.set(segment._id, node);
-                      else activeRowRefs.current.delete(segment._id);
-                    }}
                     data-testid="timeline-label-row"
                     data-active={isActive ? "true" : "false"}
                     data-playing={isActive && isPlaying ? "true" : "false"}
                     data-selected={isSelected ? "true" : "false"}
                     aria-current={isActive ? "true" : undefined}
-                    className={`absolute left-0 right-0 flex cursor-crosshair items-center gap-2 border-b px-3 transition-colors ${isActive ? "border-cyan-300/30 bg-cyan-300/[0.11]" : isSelected ? "border-brand/20 bg-brand/15" : "border-white/[0.045] hover:bg-white/[0.035]"}`}
+                    className={`absolute left-0 right-0 flex select-none cursor-crosshair items-center gap-2 border-b px-3 transition-colors ${isActive ? "border-cyan-300/30 bg-cyan-300/[0.11]" : isSelected ? "border-brand/20 bg-brand/15" : "border-white/[0.045] hover:bg-white/[0.035]"}`}
                     style={{ top: index * ROW_H, height: ROW_H, touchAction: "none" }}
                     title={t("timeline.paint_rows_hint", "Arrastrá para seleccionar varias líneas")}
                     onPointerDown={(event) => beginMarquee(event, segment._id)}
@@ -777,10 +997,10 @@ export default function LyricsTimeline({
                       startTextEdit(segment);
                     }}
                   />
-                  <div data-testid="timeline-edge-start" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, left: -(moveHitOverflow + EDGE_PX), touchAction: "none" }} title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea")} onPointerDown={(event) => startDrag(event, segment, "start")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
+                  <div data-testid="timeline-edge-start" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, left: -(moveHitOverflow + EDGE_PX), touchAction: "none" }} title={t("timeline.drag_start", "Arrastrá: cuándo ENTRA la línea · Alt para ajuste fino")} onPointerDown={(event) => startDrag(event, segment, "start")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
                     <span className="absolute inset-y-1 right-0 w-1 rounded-full bg-brand-light/70 transition-all group-hover/edge:inset-y-0.5 group-hover/edge:bg-white group-hover/edge:shadow-[0_0_8px_rgba(255,255,255,.7)]" />
                   </div>
-                  <div data-testid="timeline-edge-end" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, right: -(moveHitOverflow + EDGE_PX), touchAction: "none" }} title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea")} onPointerDown={(event) => startDrag(event, segment, "end")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
+                  <div data-testid="timeline-edge-end" className="group/edge absolute top-0 bottom-0 z-20 cursor-ew-resize" style={{ width: EDGE_PX, right: -(moveHitOverflow + EDGE_PX), touchAction: "none" }} title={t("timeline.drag_end", "Arrastrá: cuándo SALE la línea · Alt para ajuste fino")} onPointerDown={(event) => startDrag(event, segment, "end")} onPointerMove={updateDrag} onPointerUp={(event) => finishDrag(event, segment)} onPointerCancel={cancelPointerInteraction}>
                     <span className="absolute inset-y-1 left-0 w-1 rounded-full bg-brand-light/70 transition-all group-hover/edge:inset-y-0.5 group-hover/edge:bg-white group-hover/edge:shadow-[0_0_8px_rgba(255,255,255,.7)]" />
                   </div>
                   <div
@@ -808,7 +1028,7 @@ export default function LyricsTimeline({
                   </div>
                   {previewItem && (preview?.mode === "start" || preview?.mode === "end") && (
                     <span className="pointer-events-none absolute -top-7 right-0 z-40 rounded-md bg-black/90 px-2 py-1 text-[9px] font-medium text-white shadow-xl ring-1 ring-white/[0.12] tabular-nums whitespace-nowrap">
-                      {fmt(start)} → {fmt(end)}
+                      {fmtPrecise(start)} → {fmtPrecise(end)}
                     </span>
                   )}
                 </div>
@@ -832,11 +1052,11 @@ export default function LyricsTimeline({
               <div className="absolute z-20 rounded-lg bg-brand/15 ring-1 ring-brand/70 pointer-events-none" style={{ left: marquee.anchorId != null ? 0 : Math.min(marquee.originX, marquee.currentX) - (trackRef.current?.getBoundingClientRect().left || 0), top: Math.min(marquee.originY, marquee.currentY) - (trackRef.current?.getBoundingClientRect().top || 0), width: marquee.anchorId != null ? trackWidth : Math.abs(marquee.currentX - marquee.originX), height: Math.abs(marquee.currentY - marquee.originY) }} aria-hidden="true" />
             )}
 
-            <div data-testid="timeline-playhead" className="absolute top-0 bottom-0 z-30 w-px bg-cyan-200/15 pointer-events-none" style={{ left: currentTime * pxPerSec }}>
+            <div ref={playheadRef} data-testid="timeline-playhead" className="absolute top-0 bottom-0 left-0 z-30 w-px bg-cyan-200/15 pointer-events-none will-change-transform" style={{ transform: `translate3d(${renderedPlayheadTime * pxPerSec}px, 0, 0)` }}>
               <span className="absolute -top-1 -left-1.5 w-3 h-3 rounded-full bg-cyan-300 shadow-[0_0_10px_rgba(103,232,249,.8)]" />
             </div>
             {activeRowIndex != null && (
-              <div data-testid="timeline-active-playhead" className="absolute z-30 w-0.5 bg-cyan-200 shadow-[0_0_10px_rgba(103,232,249,.75)] pointer-events-none" style={{ left: currentTime * pxPerSec, top: activeRowIndex * ROW_H + 4, height: ROW_H - 8 }} aria-hidden="true" />
+              <div ref={activePlayheadRef} data-testid="timeline-active-playhead" className="absolute left-0 z-30 w-0.5 bg-cyan-200 shadow-[0_0_10px_rgba(103,232,249,.75)] pointer-events-none will-change-transform" style={{ transform: `translate3d(${renderedPlayheadTime * pxPerSec}px, 0, 0)`, top: activeRowIndex * ROW_H + 4, height: ROW_H - 8 }} aria-hidden="true" />
             )}
             </div>
           </div>

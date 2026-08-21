@@ -84,7 +84,9 @@ function makeBootstrap({ authFetchWithTimeout, setState, setCurrentReview, setWi
       segments: segmentsFromSnap,
       audioUrl: null,
       waveform: null,
+      waveformLoading: true,
       bgUrl: null,
+      transcriptionQuality: job.transcription_quality || null,
       font: params.font || "",
     });
     // The wizardScreen reads wizardStage to decide what to render. Without
@@ -95,21 +97,30 @@ function makeBootstrap({ authFetchWithTimeout, setState, setCurrentReview, setWi
     setState({ status: "ready" });
 
     // Phase B — fire-and-forget.
-    const enhanceField = async (url, key, extractor) => {
+    const enhanceField = async (url, key, extractor, { loadingKey = null } = {}) => {
       try {
         const res = await authFetchWithTimeout(url, {}, 15_000);
-        if (!alive() || !res.ok) return;
-        const data = await res.json();
         if (!alive()) return;
-        const value = extractor(data);
+        if (res.ok) {
+          const data = await res.json();
+          if (!alive()) return;
+          const value = extractor(data);
+          setCurrentReview((prev) => {
+            if (!prev || prev.editingJobId !== id) return prev;
+            return { ...prev, [key]: value, ...(loadingKey ? { [loadingKey]: false } : {}) };
+          });
+          return;
+        }
+      } catch { /* silent */ }
+      if (loadingKey && alive()) {
         setCurrentReview((prev) => {
           if (!prev || prev.editingJobId !== id) return prev;
-          return { ...prev, [key]: value };
+          return { ...prev, [loadingKey]: false };
         });
-      } catch { /* silent */ }
+      }
     };
     enhanceField(`${API}/jobs/${id}/source-audio-url`, "audioUrl", (d) => d?.url || null);
-    enhanceField(`${API}/jobs/${id}/waveform`, "waveform", (d) => d);
+    enhanceField(`${API}/jobs/${id}/waveform`, "waveform", (d) => d, { loadingKey: "waveformLoading" });
     enhanceField(`${API}/jobs/${id}/background-url`, "bgUrl", (d) => d?.url || null);
   };
 }
@@ -133,6 +144,7 @@ describe("EditLyricsRoute bootstrap — Phase A mounts before Phase B", () => {
     status: "pending_review",
     segments_json: [{ start: 0, end: 1, text: "hola" }],
     render_params: { font: "jost-bold" },
+    transcription_quality: { policy_version: "lyrics-quality-v6", decision: "review_required" },
   };
 
   beforeEach(() => {
@@ -164,7 +176,9 @@ describe("EditLyricsRoute bootstrap — Phase A mounts before Phase B", () => {
       editingJobId: "abc123",
       audioUrl: null,
       waveform: null,
+      waveformLoading: true,
       bgUrl: null,
+      transcriptionQuality: VALID_JOB.transcription_quality,
     });
     expect(setState).toHaveBeenCalledWith({ status: "ready" });
   });
@@ -191,6 +205,7 @@ describe("EditLyricsRoute bootstrap — Phase A mounts before Phase B", () => {
       editingJobId: "abc123",
       audioUrl: null,
       waveform: null,
+      waveformLoading: true,
       bgUrl: null,
     });
     // audio + bg should have patched by now (resolved fast).

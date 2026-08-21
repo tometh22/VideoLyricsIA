@@ -47,6 +47,7 @@ export function createSaveQueue(persist, opts = {}) {
         revision: 0,          // optimistic concurrency revision for this job
         lastResult: null,
         nextPersistOpts: null,
+        rebaseAttempts: 0,
       };
       jobs.set(jobId, j);
     }
@@ -130,7 +131,12 @@ export function createSaveQueue(persist, opts = {}) {
     j.lastResult = result;
     if (result?.ok !== false && Number.isInteger(result?.revision)) {
       j.revision = result.revision;
+      j.rebaseAttempts = 0;
     }
+    // Never re-anchor a stale legacy payload and POST it again. The queue has
+    // no three-way base/remote snapshots, therefore an automatic retry would
+    // be an unsafe last-writer-wins overwrite. Leave the local draft intact
+    // and surface the error to the editor instead.
     // Orden garantizado por la serialización estricta (un solo POST en vuelo;
     // el trailing arranca recién en este settle), así que no hace falta un
     // contador de secuencia: los settles llegan siempre en orden.
@@ -165,6 +171,12 @@ export function createSaveQueue(persist, opts = {}) {
     schedule(jobId, provider) {
       if (!jobId) return;
       const j = ensure(jobId);
+      // A new edit after a failed bounded rebase starts a fresh retry budget.
+      // Keep the budget while a request/trailing snapshot is still in flight,
+      // otherwise a rapid typing burst could turn one race into unbounded
+      // retries. Once the queue is idle, the next user snapshot must be able
+      // to recover normally.
+      if (!j.inflight && !j.pending && !j.debounceTimer) j.rebaseAttempts = 0;
       j.provider = provider;
       if (j.debounceTimer) clearTimeout(j.debounceTimer);
       j.debounceTimer = setTimeout(() => { j.debounceTimer = null; run(jobId); }, debounceMs);
@@ -180,6 +192,9 @@ export function createSaveQueue(persist, opts = {}) {
     flush(jobId, { keepalive = false, provider, persistOpts = null } = {}) {
       if (!jobId) return Promise.resolve({ ok: false, reason: "no-job" });
       const j = ensure(jobId);
+      if (!keepalive && !j.inflight && !j.pending && !j.debounceTimer) {
+        j.rebaseAttempts = 0;
+      }
       if (typeof provider === "function") j.provider = provider;
       return run(jobId, { keepalive, persistOpts });
     },

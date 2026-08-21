@@ -72,11 +72,53 @@ def _fail(msg: str) -> int:
     return 1
 
 
+_QUALITY_GATE_CODES = {
+    "transcription_quality_unavailable",
+    "transcription_quality_analysis_incomplete",
+    "transcription_quality_review_required",
+}
+
+
+def _quality_gate_code(response) -> str | None:
+    """Return a fail-closed quality code without trusting free-form text."""
+    if getattr(response, "status_code", None) != 409:
+        return None
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    code = str(payload.get("code") or "")
+    return code if code in _QUALITY_GATE_CODES else None
+
+
+def _status_quality_gate_code(status_payload: dict) -> str | None:
+    error = str(status_payload.get("error") or "")
+    return next((code for code in _QUALITY_GATE_CODES if code in error), None)
+
+
+def _quality_gate_go(job_id: str, phase: str, code: str) -> int:
+    print(
+        f"[edit-smoke] GO ✅ — job {job_id}: gate v6 bloqueó el fixture "
+        f"acústicamente inválido en {phase} ({code}); "
+        "el render/edit completo se conserva para entornos sin enforcement."
+    )
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--api-url", required=True)
     p.add_argument("--render-timeout", type=int, default=900,
                    help="segundos máximos para cada fase de render")
+    p.add_argument(
+        "--allow-quality-gate-block", action="store_true",
+        help=(
+            "acepta un 409 fail-closed del gate v6 para este fixture de silencio; "
+            "staging lo usa con enforcement, producción conserva el smoke completo"
+        ),
+    )
     args = p.parse_args()
     api = args.api_url.rstrip("/")
 
@@ -180,6 +222,9 @@ def main() -> int:
         timeout=120,
     )
     if not r.ok:
+        gate_code = _quality_gate_code(r)
+        if args.allow_quality_gate_block and gate_code:
+            return _quality_gate_go(job_id, "generate", gate_code)
         return _fail(f"/generate {r.status_code}: {r.text[:300]}")
     print("[edit-smoke] generación aceptada — esperando render inicial…")
 
@@ -195,6 +240,14 @@ def main() -> int:
                 last = cur
             if st.get("status") in target:
                 return st
+            # El gate de calidad puede aceptar /generate y bloquear el render
+            # de forma asíncrona. En staging este fixture de silencio debe dar
+            # GO en ese punto, sin esperar los 15 minutos del timeout.
+            if (
+                args.allow_quality_gate_block
+                and _status_quality_gate_code(st)
+            ):
+                return st
             if st.get("status") in ("error", "failed", "upload_failed",
                                     "validation_failed", "transcription_failed"):
                 raise RuntimeError(f"{phase} terminó en {st.get('status')}: "
@@ -203,9 +256,12 @@ def main() -> int:
         raise RuntimeError(f"{phase} no terminó en {args.render_timeout}s")
 
     try:
-        wait_for({"pending_review", "done"}, "render")
+        st = wait_for({"pending_review", "done"}, "render")
     except RuntimeError as e:
         return _fail(str(e))
+    gate_code = _status_quality_gate_code(st)
+    if args.allow_quality_gate_block and gate_code:
+        return _quality_gate_go(job_id, "render", gate_code)
 
     # 2.5. Autosave del editor — el camino que los operadores reportan como
     # frágil (issue #934). GO/NO-GO: POST /jobs/{id}/save-segments con una
@@ -243,6 +299,9 @@ def main() -> int:
         return _fail(str(e))
 
     if st.get("error"):
+        gate_code = _status_quality_gate_code(st)
+        if args.allow_quality_gate_block and gate_code:
+            return _quality_gate_go(job_id, "edit", gate_code)
         return _fail(f"edit dejó error residual: {st['error']}")
     print(f"[edit-smoke] GO ✅ — job {job_id}: upload→render→edit→re-render OK")
     return 0

@@ -362,6 +362,8 @@ def _fleet_service_name(value: object) -> str:
     compact = "".join(ch for ch in str(value or "").lower() if ch.isalnum())
     if compact == "shortworker":
         return "short_worker"
+    if compact == "qualityworker":
+        return "quality_worker"
     if compact == "worker":
         return "worker"
     return compact or "unknown"
@@ -385,12 +387,20 @@ def _fleet_readiness_config(environment: str | None = None) -> tuple[bool, dict[
         except (TypeError, ValueError):
             return int(default)
 
-    return strict, {
+    expected = {
         "worker": _replicas("EXPECTED_WORKER_REPLICAS", worker_default),
         "short_worker": _replicas(
             "EXPECTED_SHORT_WORKER_REPLICAS", short_default,
         ),
     }
+    quality_enabled = os.environ.get(
+        "TRANSCRIPTION_QUALITY_QUEUE_ENABLED", "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if quality_enabled:
+        expected["quality_worker"] = _replicas(
+            "EXPECTED_QUALITY_WORKER_REPLICAS", "1",
+        )
+    return strict, expected
 
 
 def worker_fleet_coherence(
@@ -402,6 +412,11 @@ def worker_fleet_coherence(
 ) -> dict:
     """Pure deploy-gate contract shared by health and focused tests."""
     expected = {"transcription", "bg_preview", "enterprise", "default"}
+    if any(
+        _fleet_service_name(service) == "quality_worker" and int(count) > 0
+        for service, count in (expected_service_counts or {}).items()
+    ):
+        expected.add("transcription_quality")
     advertised = {
         queue for row in release_rows for queue in (row.get("queues") or [])
     }
@@ -501,7 +516,7 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
         snap["rq_payload_version"] = RQ_PAYLOAD_VERSION
     except Exception:
         snap["rq_payload_version"] = int(os.environ.get("RQ_PAYLOAD_VERSION", "2"))
-    is_prod = ENV in ("prod", "production")
+    is_prod = ENV in ("prod", "production", "staging")
     starting = _within_startup_grace()
 
     def _degrade(reason: str) -> None:
@@ -576,7 +591,12 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
             try:
                 from rq import Queue, Worker
                 queues = {}
-                for qname in ("transcription", "bg_preview", "enterprise", "default"):
+                queue_names = ["transcription", "bg_preview", "enterprise", "default"]
+                if os.environ.get(
+                    "TRANSCRIPTION_QUALITY_QUEUE_ENABLED", "0"
+                ).strip().lower() in {"1", "true", "yes", "on"}:
+                    queue_names.append("transcription_quality")
+                for qname in queue_names:
                     try:
                         queues[qname] = Queue(qname, connection=r).count
                     except Exception:
@@ -701,13 +721,20 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
             snap["r2_circuit_breaker"] = storage.health_probe_state()
             if not ok:
                 snap["r2_probe_error"] = err
-                _degrade("r2_probe_failed")
+                if is_prod:
+                    _down("r2_probe_failed")
+                else:
+                    _degrade("r2_probe_failed")
             elif ms > 1500:
                 _degrade(f"r2_slow_{ms}ms")
         else:
             snap["r2"] = "not_configured"
+            if is_prod:
+                _down("r2_not_configured")
     except Exception:
         snap["r2"] = "error"
+        if is_prod:
+            _down("r2_error")
 
     # ProRes prewarm throttling counters — surfaces when the queue
     # backpressure (PRORES_PREWARM_MAX_QUEUE_DEPTH) is firing.

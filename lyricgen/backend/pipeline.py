@@ -154,6 +154,12 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
        behavior because they're lazy-regenerated on first /download.
     """
     if not storage.is_enabled():
+        if os.environ.get("ENVIRONMENT", "production").strip().lower() in {
+            "production", "prod", "staging",
+        }:
+            raise StorageUploadError(
+                "Required object storage is not configured for deliverables"
+            )
         return {}
     from jobs import merge_s3_keys, heartbeat
     # We need a SQLAlchemy session, but this function runs in the worker
@@ -675,6 +681,22 @@ def _record_bg_cache_reuse(job_id, bg_cache_key, *, waited_s=None):
         )
 
 
+def _apply_film_frame_guard(video_path: str, *, job_id: str | None = None):
+    """Repair Veo's literal physical-film frame locally when confidently seen.
+
+    The detector is deliberately compound and temporal. It never requests a
+    replacement from Veo; failures preserve the original clip and remain
+    non-fatal to the render.
+    """
+    try:
+        from film_frame_guard import process_film_frame_artifact
+        return process_film_frame_artifact(video_path, job_id=job_id)
+    except Exception as exc:
+        _raise_if_job_timeout(exc)
+        logger.warning("[BG][FILM-FRAME] guard skipped (non-fatal): %s", exc)
+        return None
+
+
 def _bg_preview_wait_s() -> int:
     """Máxima espera por un preview de fondo EN VUELO antes de generar fresh.
 
@@ -759,6 +781,7 @@ def _await_inflight_bg_preview(bg_cache_key, job_dir, *, job_id):
                     job_dir, f"bg_cached_{bg_cache_key}.mp4",
                 )
                 if cache_download(bg_cache_key, cached_path):
+                    _apply_film_frame_guard(cached_path, job_id=job_id)
                     waited = _time.time() - started
                     logger.info(
                         "[BG] cache HIT tras espera de %.0fs key=%s job=%s",
@@ -889,6 +912,27 @@ def _legacy_background_source_is_ai(
         return False
     # bg_cached and unknown keys may be model output. Fail closed.
     return True
+
+
+def _transcription_quality_render_allowed(
+    job_id: str, segments: list[dict],
+) -> tuple[bool, str | None]:
+    """Single DB-backed quality decision used by every render pipeline."""
+    from database import Job as QualityJob, SessionLocal as QualitySession
+    from transcription_quality import can_render
+
+    quality_db = QualitySession()
+    try:
+        row = quality_db.query(QualityJob).filter(QualityJob.job_id == job_id).first()
+        return can_render(
+            row.transcription_quality if row else None,
+            revision=int(row.segments_revision or 0) if row else 0,
+            segments=segments,
+            job_id=job_id,
+            tenant_id=str(row.tenant_id or "") if row else "",
+        )
+    finally:
+        quality_db.close()
 
 
 def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
@@ -1251,6 +1295,40 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         else:
             update_job(job_id, progress=20)
 
+        # Central cost boundary. Every entry path (/generate, legacy /upload,
+        # retry and queued workers) reaches this point before background/Veo
+        # or rendering. Endpoint-only validation is insufficient because
+        # retries and legacy clients can bypass it.
+        if not art_track:
+            try:
+                _quality_ok, _quality_reason = _transcription_quality_render_allowed(
+                    job_id, segments,
+                )
+                if not _quality_ok:
+                    logger.error(
+                        "[QUALITY-GATE] render blocked reason=%s job=%s",
+                        _quality_reason, job_id,
+                    )
+                    update_job(
+                        job_id, status="transcribed_pending",
+                        current_step="quality_review",
+                        error=(
+                            "La letra requiere revisión de calidad antes de renderizar "
+                            f"({_quality_reason})."
+                        ),
+                    )
+                    return
+            except Exception as _quality_exc:
+                logger.exception("[QUALITY-GATE] central render check failed job=%s", job_id)
+                from transcription_quality import policy_mode
+                if policy_mode() == "enforce":
+                    update_job(
+                        job_id, status="transcribed_pending",
+                        current_step="quality_review",
+                        error="No se pudo verificar la calidad de la letra antes del render.",
+                    )
+                    return
+
         # Step 1.5 — Background (AI-generated or human-provided)
         update_job(job_id, current_step="background", progress=22)
         # Decide if the operator's upload is a still image they want
@@ -1356,6 +1434,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     if cache_check(bg_cache_key):
                         cached_path = os.path.join(job_dir, f"bg_cached_{bg_cache_key}.mp4")
                         if cache_download(bg_cache_key, cached_path):
+                            _apply_film_frame_guard(cached_path, job_id=job_id)
                             logger.info("[BG] cache HIT key=%s — reusando %s, skip Veo/Imagen",
                                         bg_cache_key, os.path.basename(cached_path))
                             bg_image_path = cached_path
@@ -2128,6 +2207,18 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             _bg_validation_future = None
             _bg_validation_pool = None
 
+        # Guardrail "nunca degradar" (default OFF): si el fondo cayó a un
+        # fallback determinístico, no entregamos el video — levantamos
+        # BackgroundDegraded para reintentar la generación (ver el except
+        # dedicado más abajo). Se evalúa acá, con bg_image_path ya final
+        # (incluye el fallback de validación) y antes del upload.
+        _guard_against_degraded_delivery(
+            job_id,
+            bg_image_path=bg_image_path,
+            is_deterministic_fallback=_background_is_deterministic_fallback,
+            animation_degraded=_bg_animation_degraded,
+        )
+
         _verify_deliverables(job_dir, files, audio_dur_for_verify)
 
         # Post-render upload to cloud storage. No-op if R2 env not set.
@@ -2242,18 +2333,48 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             except Exception as e:  # pragma: no cover
                 _raise_if_job_timeout(e)
                 logger.warning("[WAVEFORM] precompute skipped for %s: %s", job_id, e)
+    except BackgroundDegraded as _bg_deg:
+        # Guardrail "nunca degradar". NO entregamos el video con fondo
+        # degradado. Re-lanzamos para que el Retry de RQ vuelva a intentar la
+        # generación con backoff (PIPELINE_RETRY_MAX × PIPELINE_RETRY_INTERVAL_S);
+        # run_pipeline resetea la fila en su primera línea, y como el gradiente
+        # NO se cachea en R2, un Veo recuperado produce el fondo real. Al agotar
+        # los reintentos, pipeline_failure_callback deja el job en error con
+        # "Reintentar sin re-subir" (escalamiento a humano). Nunca degrada.
+        logger.error(
+            "[NO-DEGRADE] job=%s %s — reintentando en vez de entregar el "
+            "video degradado", job_id, _bg_deg,
+        )
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as _scope:
+                _scope.set_tag("event", "pipeline.background_degraded")
+                _scope.set_tag("job_id", job_id)
+                _scope.set_tag("artist", artist or "?")
+                sentry_sdk.capture_message(str(_bg_deg), level="warning")
+        except Exception:
+            pass
+        # Liberar los intermedios pesados igual que el except general, pero
+        # conservando el input local cuando no está en R2 (el retry lo necesita).
+        if input_r2_key:
+            _cleanup_job_dir_on_failure(job_dir)
+        else:
+            _cleanup_local_intermediates(job_dir)
+        raise
+
     except Exception as exc:
         _raise_if_job_timeout(exc)
         traceback.print_exc()
-        from error_taxonomy import classify_error
+        from error_taxonomy import classify_error, public_error
         error_category = (
             "storage_upload" if isinstance(exc, StorageUploadError)
             else classify_error(str(exc))
         )
-        update_job(
-            job_id, status="error", error=str(exc),
-            error_category=error_category,
+        error_code, error_message = public_error(
+            exc, context="pipeline", category=error_category,
         )
+        update_job(job_id, status="error", error=error_message,
+                   error_category=error_category, error_code=error_code)
         # Surface render failures to Sentry. The worker runs outside
         # the FastAPI request loop so the framework's auto-capture
         # doesn't fire — without this explicit hook, ffmpeg hangs,
@@ -2544,8 +2665,11 @@ def _filter_whisper_hallucinations(segments: list[dict]) -> tuple[list[dict], in
             continue
         dur = float(s.get("end", 0)) - float(s.get("start", 0))
         if _is_single_word_loop(text, seg_duration=dur):
-            logger.info("[WHISPER] dropping single-word loop (%.1fs, %.2fs/tok): %r",
-                        dur, dur / max(len(text.split()), 1), text[:60])
+            logger.info(
+                "[WHISPER] dropping single-word loop "
+                "(%.1fs, %.2fs/tok, tokens=%d)",
+                dur, dur / max(len(text.split()), 1), len(text.split()),
+            )
             continue
         out.append(s)
     return out, len(segments) - len(out)
@@ -3010,10 +3134,10 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
             continue
         # Same filters as local path so behavior matches.
         if _re.search(r'[一-鿿぀-ゟ゠-ヿ가-힯]', text):
-            logger.info("[WHISPER-API] Filtered non-latin: %s", text[:60])
+            logger.info("[WHISPER-API] Filtered non-latin (chars=%d)", len(text))
             continue
         if any(spam in text.lower() for spam in _SPAM_PATTERNS):
-            logger.info("[WHISPER-API] Filtered spam: %s", text[:60])
+            logger.info("[WHISPER-API] Filtered spam (chars=%d)", len(text))
             continue
         # Only drop segments that Whisper is VERY sure aren't speech. The
         # previous 0.7 threshold was tossing legitimate lyric lines on
@@ -3022,7 +3146,10 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         # operator can prune obvious non-lyrics in the editor; better to
         # surface borderline content than to silently drop it.
         if (seg.no_speech_prob or 0) > 0.92:
-            logger.info("[WHISPER-API] Filtered very-low-confidence: %s", text[:60])
+            logger.info(
+                "[WHISPER-API] Filtered very-low-confidence (chars=%d)",
+                len(text),
+            )
             continue
         # Segment timestamps from Whisper conventionally run until the next
         # decoder boundary, often 1-6 s after the singer stopped. When word
@@ -3676,16 +3803,19 @@ def transcribe(mp3_path: str, language: str = None,
             continue
         # Filter non-latin characters (Demucs artifacts like "Lil怎麼樣")
         if _re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]', text):
-            logger.info("[WHISPER] Filtered non-latin artifact: %s", text[:60])
+            logger.info("[WHISPER] Filtered non-latin artifact (chars=%d)", len(text))
             continue
         # Filter spam/non-lyrics
         if any(spam in text.lower() for spam in _SPAM_PATTERNS):
-            logger.info("[WHISPER] Filtered spam: %s", text[:60])
+            logger.info("[WHISPER] Filtered spam (chars=%d)", len(text))
             continue
         # Filter high no_speech_prob segments (likely hallucinations)
         if seg.get("no_speech_prob", 0) > 0.7:
-            logger.info("[WHISPER] Filtered low-confidence (no_speech=%.2f): %s",
-                        seg['no_speech_prob'], text[:60])
+            logger.info(
+                "[WHISPER] Filtered low-confidence "
+                "(no_speech=%.2f, chars=%d)",
+                seg['no_speech_prob'], len(text),
+            )
             continue
         words = seg.get("words", [])
         if words:
@@ -3771,7 +3901,10 @@ def transcribe(mp3_path: str, language: str = None,
                 logger.warning("[WHISPER] large-v3 fallback failed: %s; keeping turbo", e)
 
     for i, seg in enumerate(segments[:5]):
-        logger.info("[WHISPER] seg %s: %.2f-%.2f  %s", i, seg['start'], seg['end'], seg['text'][:60])
+        logger.info(
+            "[WHISPER] seg %s: %.2f-%.2f tokens=%d", i,
+            seg["start"], seg["end"], len(str(seg.get("text") or "").split()),
+        )
 
     GAP = 0.05
     for i in range(len(segments) - 1):
@@ -6147,6 +6280,7 @@ def _should_keep_certified_background(
     prior_validation_result: dict,
     asset_path: str | None,
     forced_fallback: bool = False,
+    reusing_certified_asset: bool = False,
 ) -> bool:
     """True when a failed re-check must NOT discard the reused background.
 
@@ -6162,16 +6296,164 @@ def _should_keep_certified_background(
 
     ``forced_fallback`` means the background in hand is already the safe local
     gradient; there is nothing to preserve.
+
+    ``reusing_certified_asset`` covers the other way a certified asset ends up
+    in hand: a background/scene edit whose GENERATION failed and degraded back
+    to the previously cached asset. The edit type says "new background" but the
+    bytes are the old, already-certified ones — same rule applies.
     """
     if forced_fallback:
         return False
-    if edit_type not in _BACKGROUND_REUSE_EDIT_TYPES:
+    if not (
+        reusing_certified_asset or edit_type in _BACKGROUND_REUSE_EDIT_TYPES
+    ):
         return False
     if not verdict.get("inconclusive"):
         return False
     if prior_validation_result.get("passed") is not True:
         return False
     return bool(asset_path and os.path.exists(asset_path))
+
+
+def _download_previously_certified_background(
+    job_id: str,
+    job_dir: str,
+    bg_r2_key_cached: str | None,
+    prior_validation_result: dict,
+    *,
+    filename_stem: str = "bg_prev_certified",
+) -> str | None:
+    """Local copy of the last background/timeline this job certified.
+
+    The degraded destination for a FAILED generation. Historically any
+    provider error (Veo outage, Imagen 500, breaker open) degraded to the
+    deterministic gradient — which then recached itself over
+    ``bg_r2_key_cached``, so "regenerate my background" failing at the
+    provider destroyed the background the operator already had. Degrading to
+    the previous certified asset instead means a failed regeneration is a
+    no-op the user can retry, not a loss.
+
+    Returns None when there is nothing certified to fall back to; the caller
+    then uses the gradient exactly as before.
+    """
+    if prior_validation_result.get("passed") is not True:
+        return None
+    if not bg_r2_key_cached or not storage.is_enabled():
+        return None
+    ext = os.path.splitext(bg_r2_key_cached)[1].lower() or ".mp4"
+    dest = os.path.join(job_dir, f"{filename_stem}{ext}")
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return dest
+    try:
+        if storage.download_object(bg_r2_key_cached, dest):
+            return dest
+    except Exception as _download_error:  # noqa: BLE001
+        logger.warning(
+            "[EDIT] no pude bajar el fondo certificado previo job=%s key=%s: %s",
+            job_id, bg_r2_key_cached, _download_error,
+        )
+    return None
+
+
+def _archive_and_clear_scene_plan(
+    merged: dict,
+    scene_plan: dict | None,
+    job_id: str,
+    *,
+    reason: str,
+) -> None:
+    """Drop the storyboard from the job, but keep a copy for recovery.
+
+    Clearing ``scene_plan`` is correct when the rendered background stops
+    being the storyboard's timeline — a later edit reading that plan would
+    trust false provenance. Losing it outright is not: the plan holds every
+    scene PROMPT, i.e. the creative direction the operator wrote. Stash it in
+    render_params (same write as the clear, no migration) so ops can rebuild
+    the storyboard instead of asking the customer to describe it again.
+
+    Nothing reads ``scene_plan_archived`` — it is inert recovery data, so it
+    cannot resurrect stale provenance.
+    """
+    if scene_plan:
+        merged["scene_plan_archived"] = {
+            "reason": reason,
+            "plan": scene_plan,
+        }
+        logger.error(
+            "[SCENES] storyboard descartado del job=%s (%s) — copia de "
+            "recuperación en render_params.scene_plan_archived",
+            job_id, reason,
+        )
+    return None
+
+
+_DECISIVE_SCENE_REJECTION_MARKERS = (
+    "rejected by no-human policy",
+    "content policy",
+)
+
+
+def _scene_plan_failure_is_decisive(scene_plan: dict | None) -> bool:
+    """Did a storyboard re-scan actually SEE something forbidden?
+
+    ``_generate_scene_clips`` records the outcome per scene. A decisive
+    rejection (the classifier flagged people/brand) means the persisted clips
+    are genuinely unusable and the caller must degrade to the safe gradient. A
+    cache miss, a download error or an open Veo breaker means we could not
+    look — which is not evidence, and must not cost the operator a storyboard
+    that has never failed a check.
+    """
+    for scene in (scene_plan or {}).get("scenes", []) or []:
+        validation = scene.get("validation") or {}
+        if validation.get("passed") is True:
+            continue
+        detections = validation.get("detections") or {}
+        if detections.get("people") or detections.get("brand"):
+            return True
+        blob = f"{validation.get('error') or ''} {scene.get('error') or ''}".lower()
+        if any(marker in blob for marker in _DECISIVE_SCENE_REJECTION_MARKERS):
+            return True
+    return False
+
+
+def _inherit_inconclusive_scene_verdict(
+    scene: dict,
+    *,
+    verdict: dict,
+    prior_validation: dict,
+    policy_fingerprint: str,
+    cache_only: bool,
+) -> bool:
+    """Same rule as :func:`_should_keep_certified_background`, per scene clip.
+
+    A storyboard edit re-scans every persisted clip. When a clip comes back
+    from the cache UNCHANGED (``cache_only``) and its re-scan is inconclusive
+    — quota/timeout, no policy finding — the verdict it already earned under
+    the SAME policy fingerprint is still the best evidence available about
+    those exact bytes. Without this, one 429 marks the scene failed, the
+    substitution phase cannot find a compatible replacement, the dense
+    revalidation raises, and the whole storyboard gets thrown away over a
+    transient provider error.
+
+    Mutates ``scene["validation"]`` in place and returns True when the prior
+    verdict was inherited.
+    """
+    if not cache_only or not verdict.get("inconclusive"):
+        return False
+    if prior_validation.get("passed") is not True:
+        return False
+    if prior_validation.get("policy_fingerprint") != policy_fingerprint:
+        # Policy moved since that certification: the old verdict says nothing
+        # about the rules in force now. Fail closed, as before.
+        return False
+    scene["validation"] = {
+        **prior_validation,
+        "passed": True,
+        "policy_fingerprint": policy_fingerprint,
+        "revalidation_inconclusive": True,
+        "revalidation_issues": list(verdict.get("issues") or []),
+    }
+    return True
 
 
 def _validate_segments_against_audio(audio_path: str, segments: list[dict],
@@ -6252,8 +6534,11 @@ def _validate_segments_against_audio(audio_path: str, segments: list[dict],
                 ratio = SequenceMatcher(None, expected, heard_text).ratio()
                 if ratio < 0.5:
                     flagged_ids.add(id(seg))
-                    print(f"[VALIDATE] segment at {start:.1f}s flagged: "
-                          f"expected '{expected[:40]}' vs heard '{heard_text[:40]}' (ratio {ratio:.2f})")
+                    print(
+                        f"[VALIDATE] segment at {start:.1f}s flagged: "
+                        f"expected_chars={len(expected)} heard_chars={len(heard_text)} "
+                        f"ratio={ratio:.2f}"
+                    )
             finally:
                 try:
                     os.unlink(clip_path)
@@ -6307,7 +6592,7 @@ def _polish_segments_text(segments: list[dict], artist: str = "",
     numbered = "\n".join(lines)
 
     system_prompt = (
-        "You are a Spanish lyrics proofreader. The input is a numbered list of "
+        "You are a multilingual lyrics proofreader. The input is a numbered list of "
         "lines from a Whisper auto-transcription of a song. Whisper makes "
         "predictable errors in Spanish: missing accents (se→sé, mas→más, "
         "te→té), wrong contractions ('de la amor'→'del amor', 'a el'→'al'), "
@@ -6316,6 +6601,7 @@ def _polish_segments_text(segments: list[dict], artist: str = "",
         "Return STRICT JSON: an array where each element is "
         '{"i": <line index>, "text": "<corrected text>"} ONLY for lines you '
         "actually changed. Do NOT return unchanged lines. Do NOT add new lines. "
+        "The song may code-switch: preserve the original language of EACH line. "
         "Do NOT translate or paraphrase — only fix obvious transcription errors. "
         "Preserve all original words you do not need to fix.\n\n"
         "When in doubt, leave the line as-is."
@@ -6353,12 +6639,20 @@ def _polish_segments_text(segments: list[dict], artist: str = "",
 
     # Apply corrections
     corrections = {}
+    from lyrics_format import preserves_lexical_content
     for item in parsed:
         try:
             idx = int(item["i"])
             new_text = str(item["text"]).strip()
             if 0 <= idx < len(segments) and new_text:
-                corrections[idx] = new_text
+                original_text = str(segments[idx].get("text") or "")
+                if preserves_lexical_content(original_text, new_text):
+                    corrections[idx] = new_text
+                else:
+                    logger.warning(
+                        "[POLISH] rejected lexical rewrite at line %d; keeping source text",
+                        idx + 1,
+                    )
         except (KeyError, ValueError, TypeError):
             continue
     if not corrections:
@@ -6575,6 +6869,89 @@ def _gemini_cleanup_word_overlap(cleaned: str, plain: str) -> float:
     return len(a & b) / len(a | b)
 
 
+def _lexical_words(text: str) -> list[str]:
+    """Accent-insensitive words, including stop words, for lineage checks."""
+    import unicodedata
+    normalized = unicodedata.normalize("NFKD", str(text or "")).casefold()
+    normalized = "".join(
+        char for char in normalized if not unicodedata.combining(char)
+    )
+    return re.findall(r"[^\W_]+", normalized, re.UNICODE)
+
+
+def _has_lexical_anchor(candidate: str, source: str) -> bool:
+    """Require substantial source vocabulary in an LLM rewrite.
+
+    Audio-grounded cleanup may correct a misheard word, so exact equality is
+    too restrictive here.  A full translation of a short code-switched phrase,
+    however, replaces every lexical token (``Are you ready`` -> ``Estoy
+    listo``). Short phrases must remain lexically identical; longer phrases
+    must retain at least 60% of the shorter vocabulary. This rejects
+    translations that preserve only a name while still allowing a local
+    spelling/mishear correction in a longer line.
+    """
+    from collections import Counter
+
+    candidate_sequence = _lexical_words(candidate)
+    source_sequence = _lexical_words(source)
+    candidate_words = Counter(candidate_sequence)
+    source_words = Counter(source_sequence)
+    if not candidate_words or not source_words:
+        return candidate_words == source_words
+    # Short hooks and code-switched interjections are too ambiguous to rewrite
+    # safely: one shared stop-word (``No way`` -> ``No hay``) would otherwise
+    # satisfy a percentage gate. Accent/punctuation-only edits still compare
+    # equal after normalization.
+    if min(len(candidate_sequence), len(source_sequence)) <= 3:
+        return candidate_sequence == source_sequence
+    common_count = sum((candidate_words & source_words).values())
+    return common_count / min(
+        len(candidate_sequence), len(source_sequence),
+    ) >= 0.6
+
+
+def _gemini_cleanup_lines_grounded(cleaned: str, plain: str) -> bool:
+    """Verify every rewritten source line retains lexical provenance.
+
+    The cleanup prompt asks Gemini to preserve line breaks.  For equal-sized
+    output we can therefore enforce this per line and catch a single translated
+    phrase that a song-level overlap score hides.  If cardinality changed, use
+    monotonic diff blocks and require every replaced source line to retain an
+    anchor somewhere in the corresponding candidate block. Insert-only blocks
+    remain possible for genuinely missing ad-libs; deletions fail closed.
+    """
+    from difflib import SequenceMatcher
+
+    source_lines = [line.strip() for line in plain.splitlines() if line.strip()]
+    candidate_lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if not source_lines or not candidate_lines:
+        return False
+    if len(source_lines) == len(candidate_lines):
+        return all(
+            _has_lexical_anchor(candidate, source)
+            for source, candidate in zip(source_lines, candidate_lines)
+        )
+
+    source_keys = [" ".join(_lexical_words(line)) for line in source_lines]
+    candidate_keys = [" ".join(_lexical_words(line)) for line in candidate_lines]
+    matcher = SequenceMatcher(None, source_keys, candidate_keys, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal" or tag == "insert":
+            continue
+        if tag == "delete":
+            return False
+        candidate_block = candidate_lines[j1:j2]
+        if any(
+            not any(
+                _has_lexical_anchor(candidate, source)
+                for candidate in candidate_block
+            )
+            for source in source_lines[i1:i2]
+        ):
+            return False
+    return True
+
+
 def _gemini_cleanup_cache_key(audio_path: str, lrclib_plain: str):
     """Content-addressable cache key for Gemini lyrics cleanup. Same
     audio + same lrclib hint = same cleaned output (deterministic with
@@ -6693,9 +7070,11 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
         return None
 
     system_prompt = (
-        "You are a Spanish-language lyrics proofreader.\n"
+        "You are a multilingual lyrics proofreader.\n"
         "Input: (1) full audio recording of a song, (2) a community "
         "transcription with errors.\n\n"
+        "The song may alternate languages. Preserve the ORIGINAL language of "
+        "EACH line independently; never translate or paraphrase.\n\n"
         "CRITICAL: Return the FULL corrected lyrics for the ENTIRE song. "
         "The input may have 50-100+ lines — your output must cover ALL "
         "of them. Do not stop early. Do not summarize. Do not skip the "
@@ -6830,6 +7209,17 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
         )
         return None
 
+    # Defense 5: a translated minority-language line can hide inside a mostly
+    # unchanged song and still pass the global language/overlap checks above.
+    # Bind each rewrite back to its own source line (or monotonic diff block).
+    if not _gemini_cleanup_lines_grounded(cleaned, plain):
+        logger.warning(
+            "[GEMINI-CLEAN] line-level lexical provenance lost (%.1fs) — "
+            "possible translation, using lrclib raw",
+            elapsed,
+        )
+        return None
+
     logger.info(
         "[GEMINI-CLEAN] cleaned %d → %d lines, overlap=%.2f in %.1fs (audio_hash=%s)",
         len(in_lines), len(out_lines), overlap, elapsed, audio_hash,
@@ -6841,8 +7231,37 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
     return cleaned
 
 
+def _target_language_instruction(language: str | None, segs: list[dict]) -> str:
+    """Tell audio LLM postpasses which language to preserve.
+
+    Auto mode is resolved from the acoustic transcript itself.  Unknown stays
+    explicit instead of silently defaulting to Spanish: the hard requirement
+    is always to preserve the input language and never translate it.
+    """
+    resolved = resolve_transcription_language(
+        language,
+        result={"segments": segs},
+    )
+    names = {
+        "es": "español", "en": "inglés", "pt": "portugués",
+        "fr": "francés", "it": "italiano", "de": "alemán",
+    }
+    if resolved:
+        return (
+            f"IDIOMA PRINCIPAL DE CONTEXTO: {names.get(resolved, resolved)} "
+            f"({resolved}). Conservá el idioma ORIGINAL de CADA frase por "
+            "separado: la canción puede alternar idiomas. No traduzcas ni "
+            "parafrasees ninguna frase en otro idioma."
+        )
+    return (
+        "IDIOMA: conservá el idioma ORIGINAL de CADA frase por separado; la "
+        "canción puede alternar idiomas. No traduzcas ni parafrasees."
+    )
+
+
 def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
-                       song: str = "", timeout_s: int = 90) -> list[dict]:
+                       song: str = "", language: str | None = None,
+                       timeout_s: int = 90) -> list[dict]:
     """Re-segment a whisperX word stream into clean phrase lines via Gemini,
     grounded in the audio. The LLM decides the LINE GROUPING + fixes orthography
     (a language task heuristics can't do); whisperX provides the exact TIMING —
@@ -6874,7 +7293,8 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
     numbered = " ".join(f"[{i}]{(w.get('word') or '').strip()}"
                         for i, w in enumerate(W))
     system_prompt = (
-        "Sos un editor profesional de lyric videos en español (estilo Rotor).\n"
+        "Sos un editor profesional de lyric videos (estilo Rotor).\n"
+        + _target_language_instruction(language, segs) + "\n"
         "Te doy: (1) el AUDIO de la canción (puede ser un vivo), (2) su "
         "transcripción palabra-por-palabra (cada palabra con su índice [n]). "
         "Agrupá las palabras en LÍNEAS de lyric video.\n\n"
@@ -6938,7 +7358,26 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
         logger.warning("[LLM-SEGMENT] no parseable lines; keeping whisperX")
         return segs
 
-    # Gate (a): the line ranges must cover ~all the words (no big drops).
+    # Gate (a): ranges must be one exact, ordered partition of the acoustic
+    # words.  Coverage alone is insufficient: reversed or overlapping ranges
+    # can still cover 100%, then ship semantic order backwards and make the
+    # editor's active-line selector jump.  Any structural ambiguity declines
+    # to the untouched WhisperX segmentation.
+    expected_start = 0
+    for i, j, _ in parsed:
+        if i != expected_start:
+            logger.warning(
+                "[LLM-SEGMENT] non-contiguous/reordered ranges; keeping whisperX"
+            )
+            return segs
+        expected_start = j + 1
+    if expected_start != len(W):
+        logger.warning(
+            "[LLM-SEGMENT] incomplete final range; keeping whisperX"
+        )
+        return segs
+
+    # Defensive metric kept for observability; exact partition implies 100%.
     cov = set()
     for i, j, _ in parsed:
         cov.update(range(i, j + 1))
@@ -6946,7 +7385,20 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
     if coverage < 0.9:
         logger.warning("[LLM-SEGMENT] coverage %.2f < 0.9; keeping whisperX", coverage)
         return segs
-    # Gate (b): anti-hallucination — the LLM text must overlap the whisperX text.
+    # Gate (b): each output line must retain a lexical anchor to the exact
+    # Whisper word range it claims. Song-level overlap alone lets a translated
+    # code-switched line hide among dozens of unchanged Spanish lines.
+    for i, j, txt in parsed:
+        source_text = " ".join(
+            (W[index].get("word") or "") for index in range(i, j + 1)
+        )
+        if not _has_lexical_anchor(txt, source_text):
+            logger.warning(
+                "[LLM-SEGMENT] line %d-%d lost lexical provenance; keeping whisperX",
+                i, j,
+            )
+            return segs
+    # Gate (c): anti-hallucination — the LLM text must overlap the whisperX text.
     wx_text = " ".join((w.get("word") or "") for w in W)
     llm_text = " ".join(t for _, _, t in parsed)
     if _gemini_cleanup_word_overlap(llm_text, wx_text) < 0.5:
@@ -6963,9 +7415,89 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
         if st is None or en is None:
             continue
         out_segs.append({"start": float(st), "end": float(en),
-                         "text": txt, "words": grp})
+                         "text": txt, "words": grp,
+                         "llm_segmented": True})
+
+    # Collapse provider-timestamp failures without throwing away the clean
+    # segmentation of the rest of the song. A run of >=3 identical singleton
+    # lines packed at sub-2s cadence is not three lyric cards; it is one
+    # repeated hook whose word alignments collapsed into the same window.
+    # Keep every acoustic word attached for observability, but expose one safe
+    # card so the independent gap witness can recover later repetitions.
+    import statistics as _statistics
+    collapsed: list[dict] = []
+    pos = 0
+    while pos < len(out_segs):
+        line = out_segs[pos]
+        tokens = re.findall(r"[^\W\d_]+", line.get("text", "").casefold(), re.UNICODE)
+        if len(tokens) != 1:
+            collapsed.append(line)
+            pos += 1
+            continue
+        end_pos = pos + 1
+        while end_pos < len(out_segs):
+            next_tokens = re.findall(
+                r"[^\W\d_]+", out_segs[end_pos].get("text", "").casefold(),
+                re.UNICODE,
+            )
+            if next_tokens != tokens:
+                break
+            end_pos += 1
+        run = out_segs[pos:end_pos]
+        gaps = [
+            float(b["start"]) - float(a["start"])
+            for a, b in zip(run, run[1:])
+        ]
+        if (len(run) >= 3 and gaps
+                and _statistics.median(gaps) < 2.0):
+            merged = dict(run[0])
+            merged["end"] = max(float(item["end"]) for item in run)
+            merged["words"] = [
+                word for item in run for word in (item.get("words") or [])
+            ]
+            merged["review"] = True
+            merged["collapsed_repetition"] = len(run)
+            merged["provider_timing_collapsed"] = True
+            merged["provider_event_count"] = len(run)
+            merged["provider_span_start"] = round(
+                min(float(item["start"]) for item in run), 3,
+            )
+            merged["provider_span_end"] = round(
+                max(float(item["end"]) for item in run), 3,
+            )
+            merged["review_reasons"] = sorted(set(
+                list(merged.get("review_reasons") or [])
+                + ["provider_timing_collapsed"]
+            ))
+            collapsed.append(merged)
+            logger.warning(
+                "[LLM-SEGMENT] collapsed %d repeated singleton lines with "
+                "provider-compressed timing", len(run),
+            )
+        else:
+            collapsed.extend(run)
+        pos = end_pos
+    out_segs = collapsed
+
     if len(out_segs) < 2:
         return segs
+    # The index partition can be perfect while the provider's repeated-word
+    # timestamps are collapsed or reversed (Los Pericos: five "Real" tokens
+    # all mapped into 60-64s). Splitting that stream would manufacture several
+    # cards at the same instant and force the final normalizer to squeeze them
+    # into fake 0.3s slots. Decline the entire LLM edit unless its mapped line
+    # windows are physically ordered and non-degenerate.
+    previous_start = None
+    for line in out_segs:
+        start = float(line["start"])
+        end = float(line["end"])
+        if end <= start or (previous_start is not None and start <= previous_start):
+            logger.warning(
+                "[LLM-SEGMENT] collapsed/non-monotonic mapped timing; "
+                "keeping whisperX"
+            )
+            return segs
+        previous_start = start
     logger.info("[LLM-SEGMENT] re-segmented %d whisperX segs → %d clean lines "
                 "(coverage %.2f)", len(segs), len(out_segs), coverage)
     return out_segs
@@ -7284,6 +7816,8 @@ def _transplant_gap(segs, gs, ge, Csync, beat_t, y=None, sr=22050,
 
 def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
                         song: str = "", canonical: str = "",
+                        language: str | None = None,
+                        prompt_reference: bool = True,
                         timeout_s: int = 60) -> list[dict]:
     """Recover lyrics whisperX DROPPED inside large gaps, by re-transcribing a
     SHORT, BOUNDED clip at the start of each gap.
@@ -7341,13 +7875,22 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
         y, _sr = librosa.load(audio_path, sr=sr, mono=True)
         audio_end = len(y) / sr
 
-        # Gaps = silences between consecutive words PLUS a trailing gap from the
-        # last word to end-of-audio. The trailing one matters because an
+        # Gaps = leading silence before the first recognized word, silences
+        # between consecutive words, PLUS a trailing gap to end-of-audio. The
+        # leading one catches a sustained or buried opening word that WhisperX
+        # failed to align (Los Pericos live: voice from ~5.5s, first stamp ~13s).
+        # The trailing one matters because an
         # upstream cleaner (LLM-segment / hallucination filter) may DROP the
         # outro shouts, so the dropped lyrics are no longer "between" two words
         # — they sit past the last surviving word.
-        gaps = [(W[i]["end"], W[i + 1]["start"]) for i in range(len(W) - 1)
-                if W[i + 1]["start"] - W[i]["end"] >= GAP_MIN]
+        gaps = []
+        if W[0]["start"] >= GAP_MIN:
+            gaps.append((0.0, W[0]["start"]))
+        gaps.extend(
+            (W[i]["end"], W[i + 1]["start"])
+            for i in range(len(W) - 1)
+            if W[i + 1]["start"] - W[i]["end"] >= GAP_MIN
+        )
         if audio_end - W[-1]["end"] >= GAP_MIN:
             gaps.append((W[-1]["end"], audio_end))
         if not gaps:
@@ -7429,8 +7972,8 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
             buf = io.BytesIO()
             sf.write(buf, clip, sr, format="WAV")
             sysp = (
-                "Sos un transcriptor experto de lyric videos en español, nivel "
-                "Rotor.\n"
+                "Sos un transcriptor experto de lyric videos, nivel Rotor.\n"
+                + _target_language_instruction(language, segs) + "\n"
                 f"Te doy un FRAGMENTO CORTO de audio ({c1 - c0:.0f} s) de un vivo"
                 + (f" ({artist} — {song})" if artist else "") + ".\n"
                 "Transcribí EXACTAMENTE lo que se canta en ESTE fragmento corto.\n\n"
@@ -7441,7 +7984,7 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
                 "(grito)/(instrumental)/(silencio).\n"
                 "3. Una frase por línea, mayúscula al inicio.\n"
                 + (f"- Letra oficial (ortografía, NO forzar): {ref_text}\n"
-                   if canonical else "")
+                   if canonical and prompt_reference else "")
                 + "FORMATO por línea, sin nada más: texto"
             )
             try:
@@ -9415,6 +9958,116 @@ class VeoTrackingUnavailable(RuntimeError):
     """A paid call cannot proceed without durable budget/provenance state."""
 
 
+# Familias de degradación — determinan la UX cuando el reintento automático no
+# alcanza (ver _guard_against_degraded_delivery y los failure callbacks):
+#   - "provider": falla transitoria de Veo/infra (breaker, 429, corte de
+#     Vertex, submission ambigua, tracking cancelado, foto_viva). Reintentar
+#     SIRVE — se auto-sana cuando el proveedor se recupera.
+#   - "content": el fondo generado no cumplió la política (persona/logo/texto) y
+#     el re-roll tampoco. Reintentar el mismo prompt NO sirve: hace falta variar
+#     el prompt o que el operador ajuste el fondo.
+BG_DEGRADE_FAMILY_PROVIDER = "provider"
+BG_DEGRADE_FAMILY_CONTENT = "content"
+
+# El único fallback que produce el camino de RECHAZO DE CONTENIDO
+# (_write_safe_gradient_background con su filename default, tras validación +
+# re-roll rechazados). El resto de los *fallback.mp4 vienen de fallas de
+# proveedor/infra. Ver pipeline: la recuperación de validación usa el default.
+_CONTENT_FALLBACK_BASENAME = "bg_policy_safe_fallback.mp4"
+
+
+class BackgroundDegraded(RuntimeError):
+    """El fondo entregable cayó a un fallback determinístico (gradiente o Ken
+    Burns) en vez del video que pidió el operador.
+
+    Contrato del guardrail "nunca degradar" (aplica a TODOS los tenants): cuando
+    el fondo pedido no se pudo producir, el pipeline NO entrega un video
+    degradado. Se levanta en la finalización, ANTES de subir los deliverables,
+    para que el Retry de RQ reintente con backoff (run_pipeline resetea la fila
+    y re-genera; el gradiente NO se cachea en R2, así que un Veo recuperado
+    produce el fondo real). Si el reintento automático no alcanza, los failure
+    callbacks NO dejan el job en "error": lo marcan con ``error_category``
+    ``background_attention:<familia>`` para que la UI muestre una tarjeta
+    accionable (reintentar / ajustar el fondo), nunca un error crudo ni un
+    gradiente en silencio.
+
+    ``family`` (BG_DEGRADE_FAMILY_*) decide la UX: "provider" = reintentar,
+    "content" = variar/ajustar.
+    """
+
+    def __init__(self, message: str, *, family: str = BG_DEGRADE_FAMILY_PROVIDER,
+                 fallback_basename: str = ""):
+        super().__init__(message)
+        self.family = family
+        self.fallback_basename = fallback_basename
+
+
+# Kill-switch del guardrail. Default OFF: desplegar el código es inerte hasta
+# que se habilite explícitamente + QA (mismo patrón que el resto de los guards
+# del pipeline). Cuando está OFF se conserva el comportamiento histórico
+# (entregar el gradiente para no colgar el job).
+def _veo_no_degrade_guard_enabled() -> bool:
+    return os.environ.get("VEO_NO_DEGRADE_GUARD", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _is_deterministic_fallback_bg(bg_path: str | None) -> bool:
+    """True si el asset de fondo es un fallback determinístico local.
+
+    Los 15 caminos de degradación (breaker abierto, 429 sostenido, budget,
+    submission ambigua, tracking cancelado, validación rechazada + re-roll
+    rechazado, errores de edición) producen todos un archivo cuyo nombre
+    termina en ``fallback.mp4`` vía ``_write_safe_gradient_background``. Un
+    chequeo por nombre captura uniformemente incluso el fallback profundo de
+    ``_generate_veo_video`` que no propaga un flag al llamador.
+    """
+    if not bg_path:
+        return False
+    return os.path.basename(bg_path).endswith("fallback.mp4")
+
+
+def _guard_against_degraded_delivery(
+    job_id: str,
+    *,
+    bg_image_path: str | None,
+    is_deterministic_fallback: bool,
+    animation_degraded: bool,
+) -> None:
+    """Levanta BackgroundDegraded si el fondo final NO es el pedido.
+
+    No-op cuando el guardrail está apagado (comportamiento histórico) o cuando
+    el fondo es el real. La detección combina los flags locales del generador
+    con el chequeo por nombre de archivo, así que cubre tanto los fallbacks que
+    setean un flag como los que sólo devuelven el path del gradiente.
+    """
+    if not _veo_no_degrade_guard_enabled():
+        return
+    _fallback = (
+        is_deterministic_fallback
+        or _is_deterministic_fallback_bg(bg_image_path)
+    )
+    if not (_fallback or animation_degraded):
+        return
+    _basename = os.path.basename(bg_image_path or "")
+    # Clasificación por familia: sólo el rechazo de contenido usa el filename
+    # default de _write_safe_gradient_background; todo lo demás es proveedor.
+    _family = (
+        BG_DEGRADE_FAMILY_CONTENT if _basename == _CONTENT_FALLBACK_BASENAME
+        else BG_DEGRADE_FAMILY_PROVIDER
+    )
+    _reason = (
+        "animación degradada a Ken Burns" if animation_degraded and not _fallback
+        else "fondo degradado a gradiente determinístico"
+    )
+    raise BackgroundDegraded(
+        f"job {job_id}: {_reason} (bg={_basename}, familia={_family}). "
+        "No se entrega el video degradado; se reintenta la generación.",
+        family=_family,
+        fallback_basename=_basename,
+    )
+
+
 def _veo_http_failure_is_ambiguous(status_code: int) -> bool:
     """HTTP failures that may arrive after Vertex accepted the operation."""
     return status_code == 408 or 500 <= status_code <= 599
@@ -10464,6 +11117,32 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         "sampleCount": 1,
         "generateAudio": False,
     }
+    # Veo bills per second of generated video. The palindrome loop
+    # (_prerender_looped_bg) fills the whole song from this native clip, so a
+    # shorter native clip costs proportionally less (~50% at 4s vs 8s); the only
+    # visual effect is a shorter cycle before the loop repeats. Opt-in via
+    # VEO_CLIP_SECONDS — unset keeps Veo's native 8s default so deploying this
+    # is behaviorally inert until enabled + QA'd. Only provider-supported
+    # lengths are forwarded so an out-of-range value can never make Vertex
+    # reject the request. Keep provenance._VEO_CLIP_SECONDS in sync for the
+    # cost dashboard.
+    _veo_clip_seconds_raw = os.environ.get("VEO_CLIP_SECONDS", "").strip()
+    if _veo_clip_seconds_raw:
+        try:
+            _veo_clip_seconds = int(float(_veo_clip_seconds_raw))
+        except ValueError:
+            _veo_clip_seconds = 0
+        if _veo_clip_seconds in (4, 6, 8):
+            veo_params["durationSeconds"] = _veo_clip_seconds
+            logger.info(
+                "[BG] Veo clip length = %ss (VEO_CLIP_SECONDS)", _veo_clip_seconds
+            )
+        else:
+            logger.warning(
+                "[BG] Ignoring VEO_CLIP_SECONDS=%r — not a supported Veo clip "
+                "length (4, 6, 8); using provider default.",
+                _veo_clip_seconds_raw,
+            )
     try:
         blur_sigma = float(os.environ.get("BG_BLUR_SIGMA", "1.0"))
     except ValueError:
@@ -10550,6 +11229,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         for _ck in dict.fromkeys(_candidates):  # dedup preservando orden
             if (_storage.is_enabled() and _storage.object_exists(_ck)
                     and _storage.download_object(_ck, output_path)):
+                _apply_film_frame_guard(output_path, job_id=job_id)
                 size_mb = os.path.getsize(output_path) / 1024 / 1024
                 _via = "stored-key" if _ck == cache_key_override else "recomputed"
                 logger.info("[BG] Veo cache HIT (cache_only via %s, %s): %.1f MB",
@@ -10997,6 +11677,12 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     except Exception as e:
         _raise_if_job_timeout(e)
         logger.warning("[BG] Letterbox check skipped (non-fatal): %s", e)
+
+    # A literal "old film" cue can make Veo render the physical film frame
+    # itself: a stable black shell plus an opaque sprocket/placeholder. The
+    # compound detector repairs only that signature with a local uniform zoom;
+    # it never triggers another paid generation.
+    _apply_film_frame_guard(output_path, job_id=job_id)
 
     # Apply subtle gaussian blur. Veo Fast outputs are slightly softer than
     # standard; a small blur normalises that softness, hides minor artefacts,
@@ -12019,6 +12705,11 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
         # En un regen (regen_keys set), las escenas NO-target son cache_only:
         # se sirven de caché o se degradan, nunca pagan Veo de nuevo.
         _cache_only = regen_keys is not None and key not in regen_keys
+        # Veredicto que este clip YA tenía. Sólo es evidencia sobre los bytes
+        # que vamos a rendear cuando la escena es cache_only (el clip vuelve
+        # de la caché sin cambiar); un regen escribe bytes nuevos y no puede
+        # heredar nada. Ver _inherit_inconclusive_scene_verdict.
+        _prior_scene_validation = dict(scene.get("validation") or {})
         _meta = {}
         scene_policy = (
             rebase_stored_atmospherics_policy(scene.get("atmospherics_policy"))
@@ -12110,7 +12801,20 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                     ),
                     "policy_fingerprint": _policy_fp,
                 }
-                if _scene_validation.get("passed") is not True:
+                if _inherit_inconclusive_scene_verdict(
+                    scene,
+                    verdict=_scene_validation,
+                    prior_validation=_prior_scene_validation,
+                    policy_fingerprint=_policy_fp,
+                    cache_only=_cache_only,
+                ):
+                    logger.error(
+                        "[SCENES] re-chequeo inconcluso del clip cacheado %s "
+                        "(job=%s) — conservo el veredicto previo en vez de "
+                        "tirar la escena: issues=%s",
+                        key, job_id, _scene_validation.get("issues"),
+                    )
+                elif _scene_validation.get("passed") is not True:
                     if _validation_observe_only():
                         logger.warning(
                             "[SCENES] observe-only: keeping clip %s job=%s "
@@ -16759,24 +17463,42 @@ def _burn_short_text_ass(
 
         out_tmp = os.path.join(job_dir, "short_ass_tmp.mp4")
         # Mismo escaping canónico que el burn del video (fx_compositor).
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-i", os.path.basename(bg_short_path),
-            "-vf", f"subtitles=short_lyrics.ass:fontsdir={_ffmpeg_filter_escape(font_dir)}",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "copy", "-movflags", "+faststart",
-            "-r", str(fps), os.path.basename(out_tmp),
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=600, cwd=job_dir)
-        if r.returncode != 0 or not os.path.exists(out_tmp):
-            logger.warning("[SHORT] libass text burn failed (%s) — fallback moviepy",
-                           (r.stderr or "")[-300:])
-            return None
-        logger.info("[SHORT] texto quemado con libass (font=%s anim=%s)",
-                    os.path.basename(font_path), lyrics_animation)
-        return out_tmp
+        # MoviePy normally leaves an AAC stream that can be copied, but some
+        # source/container combinations make ffmpeg reject that stream while
+        # building the subtitle output (the observed "Invalid argument" path).
+        # Retry once with a bounded AAC encode before paying the much slower
+        # ImageMagick/MoviePy fallback cost.
+        audio_modes = (
+            ["-c:a", "copy"],
+            ["-c:a", "aac", "-b:a", "192k"],
+        )
+        last_error = "unknown error"
+        for audio_args in audio_modes:
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", os.path.basename(bg_short_path),
+                "-vf", f"subtitles=short_lyrics.ass:fontsdir={_ffmpeg_filter_escape(font_dir)}",
+                "-map", "0:v:0", "-map", "0:a:0",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-pix_fmt", "yuv420p",
+                *audio_args, "-movflags", "+faststart", "-shortest",
+                "-r", str(fps), os.path.basename(out_tmp),
+            ]
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=600, cwd=job_dir)
+            if r.returncode == 0 and os.path.exists(out_tmp):
+                logger.info("[SHORT] texto quemado con libass (font=%s anim=%s audio=%s)",
+                            os.path.basename(font_path), lyrics_animation,
+                            "copy" if audio_args[1] == "copy" else "aac-reencode")
+                return out_tmp
+            last_error = (r.stderr or "")[-300:]
+            try:
+                os.unlink(out_tmp)
+            except OSError:
+                pass
+        logger.warning("[SHORT] libass text burn failed (%s) — fallback moviepy",
+                       last_error)
+        return None
     except Exception as e:
         logger.warning("[SHORT] libass text pass errored (%s) — fallback moviepy", e)
         return None
@@ -17419,6 +18141,36 @@ def run_edit_pipeline(
     finally:
         db.close()
 
+    # Edits and scene regenerations render through a separate worker entry
+    # point. Check the exact segment snapshot here, before source download,
+    # Veo and the compositor, so /edit cannot bypass the central policy.
+    try:
+        quality_ok, quality_reason = _transcription_quality_render_allowed(
+            job_id, segments,
+        )
+        if not quality_ok:
+            logger.error(
+                "[QUALITY-GATE] edit render blocked reason=%s job=%s type=%s",
+                quality_reason, job_id, edit_type,
+            )
+            update_job(
+                job_id, status="pending_review", current_step="quality_review",
+                error=(
+                    "La letra requiere revisión de calidad antes de renderizar "
+                    f"({quality_reason})."
+                ),
+            )
+            return
+    except Exception:
+        logger.exception("[QUALITY-GATE] edit render check failed job=%s", job_id)
+        from transcription_quality import policy_mode
+        if policy_mode() == "enforce":
+            update_job(
+                job_id, status="pending_review", current_step="quality_review",
+                error="No se pudo verificar la calidad de la letra antes del render.",
+            )
+            return
+
     # Merge base render params with the requested overrides.
     merged = {**base_params, **edit_params}
     font_id = merged.get("font") or ""
@@ -17584,6 +18336,16 @@ def run_edit_pipeline(
         # image-to-video → provenance AI-derived (aplica validación). Sin
         # animar es human-provided. Se resuelve dentro de la rama custom.
         _animate_custom = False
+        # True when a FAILED generation degraded back to the asset this job had
+        # already certified. The edit type still says "background"/"scene", but
+        # the bytes in hand are the old certified ones: they must not be
+        # recached, must not be re-labelled as freshly generated, and must not
+        # be thrown away by an inconclusive re-check.
+        _kept_previous_background = False
+        _edit_ai_generated_override: bool | None = None
+        # Defensive: every branch below assigns it, but keeping the name bound
+        # means a future branch that returns early cannot NameError here.
+        bg_image_path = None
         if edit_type in ("typography", "lyrics", "metadata"):
             # All three reuse the cached background — only the foreground
             # layer changes. Lyrics edit ALSO swaps the segments, and
@@ -17728,19 +18490,40 @@ def run_edit_pipeline(
                 # Imagen can raise before returning an asset (Veo normally
                 # degrades internally).  A provider failure must not strand a
                 # Universal/common AI edit in ``error`` or ``validation_failed``.
-                logger.error(
-                    "[EDIT] background generation failed job=%s; using safe "
-                    "local fallback: %s",
-                    job_id, _background_generation_error,
+                # First choice is the background this job already had: a failed
+                # regeneration should leave the operator exactly where they
+                # were, not swap their art for a gradient AND recache it.
+                _previous_bg = _download_previously_certified_background(
+                    job_id, job_dir, bg_r2_key_cached, _prior_validation_result,
                 )
-                bg_image_path = _write_safe_gradient_background(
-                    job_dir, style, filename="bg_edit_policy_fallback.mp4",
-                )
-                _force_policy_fallback = True
-                _policy_fallback_reason = "background_generation_error"
+                if _previous_bg:
+                    logger.error(
+                        "[EDIT] background generation failed job=%s; keeping "
+                        "the previously certified background (retry the regen "
+                        "later): %s",
+                        job_id, _background_generation_error,
+                    )
+                    bg_image_path = _previous_bg
+                    _kept_previous_background = True
+                    _edit_ai_generated_override = bool(
+                        _stored_background_ai_generated
+                    )
+                else:
+                    logger.error(
+                        "[EDIT] background generation failed job=%s; using safe "
+                        "local fallback: %s",
+                        job_id, _background_generation_error,
+                    )
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style, filename="bg_edit_policy_fallback.mp4",
+                    )
+                    _force_policy_fallback = True
+                    _policy_fallback_reason = "background_generation_error"
             update_job(job_id, progress=35)
-            # Do not replace the last known-good cache until validation passes.
-            _pending_background_recache = True
+            # Do not replace the last known-good cache until validation passes —
+            # and never recache when we are re-rendering the bytes that ARE the
+            # cache.
+            _pending_background_recache = not _kept_previous_background
 
         elif edit_type == "scene":
             # Regenerar UNA escena del storyboard y re-armar el timeline. Sólo
@@ -17785,26 +18568,51 @@ def run_edit_pipeline(
                 _pending_scene_recache = True
             except Exception as _scene_generation_error:
                 _raise_if_job_timeout(_scene_generation_error)
-                logger.error(
-                    "[EDIT] scene regeneration failed job=%s scene=%s; using "
-                    "safe local fallback: %s",
-                    job_id, scene_key, _scene_generation_error,
-                )
-                bg_image_path = _write_safe_gradient_background(
-                    job_dir, style, filename="bg_edit_policy_fallback.mp4",
-                )
-                bg_prelooped = False
-                _scene_timeline_from_current_clips = False
-                _pending_scene_recache = False
-                _pending_background_recache = True
-                _force_policy_fallback = True
-                _policy_fallback_reason = "scene_generation_error"
-                # The cached background is now a single deterministic asset,
-                # not the storyboard represented by the old plan.  Persisting
-                # that plan would make the next edit trust false provenance.
-                scene_plan = None
-                _pending_scene_plan_clear = True
-                update_job(job_id, progress=35)
+                if _scene_plan_before_edit is not None:
+                    # "Otra toma" failed at the provider. The pre-edit
+                    # storyboard is intact and already certified, so restore it
+                    # and let the dense revalidation below rebuild that exact
+                    # timeline from the cached clips: the edit becomes a no-op
+                    # the operator can retry. Wiping the storyboard because ONE
+                    # re-roll failed was destroying N-1 good scenes plus every
+                    # scene prompt in the plan.
+                    logger.error(
+                        "[EDIT] scene regeneration failed job=%s scene=%s; "
+                        "restoring the pre-edit storyboard (retry the re-roll "
+                        "later): %s",
+                        job_id, scene_key, _scene_generation_error,
+                    )
+                    scene_plan = _copy.deepcopy(_scene_plan_before_edit)
+                    bg_prelooped = False
+                    _scene_timeline_from_current_clips = False
+                    _pending_scene_recache = False
+                    _pending_background_recache = False
+                    _kept_previous_background = True
+                    update_job(job_id, scene_plan=scene_plan, progress=35)
+                else:
+                    logger.error(
+                        "[EDIT] scene regeneration failed job=%s scene=%s; using "
+                        "safe local fallback: %s",
+                        job_id, scene_key, _scene_generation_error,
+                    )
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style, filename="bg_edit_policy_fallback.mp4",
+                    )
+                    bg_prelooped = False
+                    _scene_timeline_from_current_clips = False
+                    _pending_scene_recache = False
+                    _pending_background_recache = True
+                    _force_policy_fallback = True
+                    _policy_fallback_reason = "scene_generation_error"
+                    # The cached background is now a single deterministic asset,
+                    # not the storyboard represented by the old plan.  Persisting
+                    # that plan would make the next edit trust false provenance.
+                    scene_plan = _archive_and_clear_scene_plan(
+                        merged, scene_plan, job_id,
+                        reason="scene_generation_error",
+                    )
+                    _pending_scene_plan_clear = True
+                    update_job(job_id, progress=35)
 
         elif edit_type == "background_library":
             # Swap a un asset CURADO de biblioteca — la salida del loop no
@@ -17961,6 +18769,10 @@ def run_edit_pipeline(
             (True if _animate_custom else False) if edit_type == "custom" else
             bool(_stored_background_ai_generated)
         )
+        if _edit_ai_generated_override is not None:
+            # A failed regeneration degraded to the OLD asset: its provenance
+            # is whatever that asset was, not "freshly AI-generated".
+            _edit_ai_generated = _edit_ai_generated_override
         _edit_safety_policy = _background_safety_policy(
             job_id, _edit_operator_prompt
         )
@@ -18022,7 +18834,53 @@ def run_edit_pipeline(
                     "[SCENES] dense edit revalidation failed job=%s: %s",
                     job_id, _dense_error,
                 )
-                if _edit_safety_policy["is_umg"] or _edit_ai_generated:
+                _dense_decisive = _scene_plan_failure_is_decisive(scene_plan)
+                _cached_timeline = (
+                    None if _dense_decisive
+                    else _download_previously_certified_background(
+                        job_id, job_dir, bg_r2_key_cached,
+                        _prior_validation_result,
+                        filename_stem="bg_cached_timeline",
+                    )
+                )
+                if _cached_timeline:
+                    # Nothing forbidden was SEEN — a clip was unreachable, the
+                    # breaker was open, or the re-scan never got a verdict. The
+                    # cached timeline is the storyboard this job already
+                    # certified, so render it and keep the plan. Wiping both
+                    # over an infrastructure error is what turned a quota blip
+                    # into "se me fue el fondo" (incidente 2026-08-20).
+                    logger.error(
+                        "[SCENES] revalidación no concluyente job=%s — rendeo "
+                        "el timeline cacheado y CONSERVO el storyboard",
+                        job_id,
+                    )
+                    bg_image_path = _cached_timeline
+                    bg_prelooped = True
+                    _scene_timeline_from_current_clips = False
+                    _clips_already_validated = True
+                    _pending_scene_recache = False
+                    _pending_background_recache = False
+                    # Restore the pre-edit plan: this attempt marked scenes
+                    # failed/reused, and persisting that would leave the job
+                    # permanently short of clip evidence — every later edit
+                    # would re-run the dense pass and fall back again. Keep the
+                    # reason on the plan so the failure is still diagnosable.
+                    if _scene_plan_before_edit:
+                        scene_plan = _copy.deepcopy(_scene_plan_before_edit)
+                    scene_plan["last_revalidation_error"] = str(_dense_error)[:300]
+                    update_job(job_id, scene_plan=scene_plan)
+                    update_job(job_id, validation_result={
+                        **_prior_validation_result,
+                        "passed": True,
+                        "policy_reason": _edit_safety_policy["reason"],
+                        "policy_version": _edit_safety_policy["policy_version"],
+                        "policy_mode": _edit_safety_policy["policy_mode"],
+                        "validation_scope": "reused_asset_prior_certification",
+                        "revalidation_inconclusive": True,
+                        "revalidation_error": str(_dense_error)[:300],
+                    })
+                elif _edit_safety_policy["is_umg"] or _edit_ai_generated:
                     # Preserve the storyboard diagnostics, but render this
                     # revision over a deterministic clean background. A bad or
                     # unverifiable scene clip must never reject the whole
@@ -18037,7 +18895,10 @@ def run_edit_pipeline(
                     merged["background_ai_generated"] = False
                     _pending_scene_recache = False
                     _pending_background_recache = True
-                    scene_plan = None
+                    scene_plan = _archive_and_clear_scene_plan(
+                        merged, scene_plan, job_id,
+                        reason="scene_validation_error",
+                    )
                     _pending_scene_plan_clear = True
                     update_job(job_id, validation_result={
                         "passed": True,
@@ -18047,6 +18908,7 @@ def run_edit_pipeline(
                         "policy_mode": _edit_safety_policy["policy_mode"],
                         "validation_scope": "deterministic_local_fallback",
                         "recovered_from_scene_validation_error": True,
+                        "decisive_policy_finding": bool(_dense_decisive),
                     })
                 else:
                     if edit_type == "scene" and _scene_plan_before_edit is not None:
@@ -18077,6 +18939,7 @@ def run_edit_pipeline(
                 prior_validation_result=_prior_validation_result,
                 asset_path=bg_image_path,
                 forced_fallback=_force_policy_fallback,
+                reusing_certified_asset=_kept_previous_background,
             ):
                 # The operator only touched the FOREGROUND (letra, tipografía,
                 # metadata): these bytes are the ones this job already
@@ -18156,7 +19019,10 @@ def run_edit_pipeline(
                     _pending_scene_recache = False
                     _pending_background_recache = True
                     if scene_plan is not None:
-                        scene_plan = None
+                        scene_plan = _archive_and_clear_scene_plan(
+                            merged, scene_plan, job_id,
+                            reason="unsafe_generation_recovery",
+                        )
                         _pending_scene_plan_clear = True
                     _edit_validation_ok = True
                     update_job(job_id, validation_result={
@@ -18277,6 +19143,18 @@ def run_edit_pipeline(
         audio_dur = _audio_duration(mp3_path)
         if audio_dur is None:
             audio_dur = _ffprobe_duration(mp3_path)
+
+        # Guardrail "nunca degradar" (default OFF): un edit cuyo fondo cayó a un
+        # gradiente determinístico no se entrega — se reintenta (ver el except
+        # dedicado más abajo). _policy_fallback_reason cubre los fallbacks que
+        # setean flag; el chequeo por nombre cubre el resto.
+        _guard_against_degraded_delivery(
+            job_id,
+            bg_image_path=bg_image_path,
+            is_deterministic_fallback=bool(_policy_fallback_reason),
+            animation_degraded=False,
+        )
+
         _verify_deliverables(job_dir, files, audio_dur)
 
         # Stage the new background cache only after the complete edit rendered
@@ -18427,18 +19305,39 @@ def run_edit_pipeline(
             },
         )
 
+    except BackgroundDegraded as _bg_deg:
+        # Guardrail "nunca degradar": no entregamos el edit con fondo degradado.
+        # Re-lanzamos para que el Retry de RQ (enqueue_edit usa el mismo
+        # PIPELINE_RETRY_MAX × PIPELINE_RETRY_INTERVAL_S) reintente la
+        # generación; al agotar, edit_failure_callback deja el job en error
+        # (escalamiento). El job queda en pending_review sólo con el fondo real.
+        logger.error(
+            "[NO-DEGRADE][EDIT] job=%s %s — reintentando en vez de entregar el "
+            "edit degradado", job_id, _bg_deg,
+        )
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as _scope:
+                _scope.set_tag("event", "edit.background_degraded")
+                _scope.set_tag("job_id", job_id)
+                sentry_sdk.capture_message(str(_bg_deg), level="warning")
+        except Exception:
+            pass
+        raise
+
     except Exception as exc:
         _raise_if_job_timeout(exc)
         logger.error("[EDIT] job=%s FAILED: %s", job_id, exc, exc_info=True)
-        from error_taxonomy import classify_error
+        from error_taxonomy import classify_error, public_error
         error_category = (
             "storage_upload" if isinstance(exc, StorageUploadError)
             else classify_error(str(exc))
         )
-        update_job(
-            job_id, status="error", error=f"Edit failed: {exc}",
-            error_category=error_category,
+        error_code, error_message = public_error(
+            exc, context="edit", category=error_category,
         )
+        update_job(job_id, status="error", error=error_message,
+                   error_category=error_category, error_code=error_code)
         _write_edit_audit(
             action="job.edit_failed",
             detail={

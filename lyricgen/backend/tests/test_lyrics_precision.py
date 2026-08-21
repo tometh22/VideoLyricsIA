@@ -39,7 +39,7 @@ import pytest
 # Bring backend modules into path before any backend import.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from database import Job, AuditLog
+from database import Job, AuditLog, BackgroundAsset
 
 
 def _decode_user(client, token: str):
@@ -374,6 +374,12 @@ def test_edit_lyrics_falls_back_to_render_params_background_id(
     """
     _cleanup(db)
     me = _decode_user(client, user_token)
+    asset = BackgroundAsset(
+        name="Legacy lyrics background", filename="library/legacy-lyrics.mp4",
+        file_type="mp4", is_active=True,
+    )
+    db.add(asset)
+    db.flush()
     jid = _seed_job(
         db,
         owner_id=me["id"],
@@ -384,7 +390,7 @@ def test_edit_lyrics_falls_back_to_render_params_background_id(
         # Library preset id persisted at render-time. The actual asset
         # row doesn't need to exist for this gate-level test — the gate
         # just checks for non-empty.
-        render_params={"background_id": 42},
+        render_params={"background_id": asset.id},
     )
 
     captured = {}
@@ -393,6 +399,7 @@ def test_edit_lyrics_falls_back_to_render_params_background_id(
         captured.update({"job_id": job_id, "edit_type": edit_type})
 
     monkeypatch.setattr("main.enqueue_edit", _stub_enqueue_edit)
+    monkeypatch.setattr("main._background_asset_is_available", lambda _asset: True)
 
     r = client.post(
         f"/edit/{jid}",
@@ -402,6 +409,8 @@ def test_edit_lyrics_falls_back_to_render_params_background_id(
     assert r.status_code == 200, r.text
     assert captured["edit_type"] == "lyrics"
     _cleanup(db)
+    db.delete(asset)
+    db.commit()
 
 
 def test_edit_metadata_falls_back_to_render_params_background_id(
@@ -411,6 +420,12 @@ def test_edit_metadata_falls_back_to_render_params_background_id(
     typo in the title, bg from library, no cached copy)."""
     _cleanup(db)
     me = _decode_user(client, user_token)
+    asset = BackgroundAsset(
+        name="Legacy metadata background", filename="library/legacy-metadata.mp4",
+        file_type="mp4", is_active=True,
+    )
+    db.add(asset)
+    db.flush()
     jid = _seed_job(
         db,
         owner_id=me["id"],
@@ -418,7 +433,7 @@ def test_edit_metadata_falls_back_to_render_params_background_id(
         status="pending_review",
         segments_json=[{"start": 0.0, "end": 2.0, "text": "x"}],
         bg_r2_key_cached=None,
-        render_params={"background_id": 7},
+        render_params={"background_id": asset.id},
     )
 
     captured = {}
@@ -427,6 +442,7 @@ def test_edit_metadata_falls_back_to_render_params_background_id(
         captured.update({"job_id": job_id, "edit_type": edit_type})
 
     monkeypatch.setattr("main.enqueue_edit", _stub_enqueue_edit)
+    monkeypatch.setattr("main._background_asset_is_available", lambda _asset: True)
 
     r = client.post(
         f"/edit/{jid}",
@@ -436,6 +452,8 @@ def test_edit_metadata_falls_back_to_render_params_background_id(
     assert r.status_code == 200, r.text
     assert captured["edit_type"] == "metadata"
     _cleanup(db)
+    db.delete(asset)
+    db.commit()
 
 
 def test_edit_lyrics_does_not_break_existing_typography_path(client, user_token, db, monkeypatch):

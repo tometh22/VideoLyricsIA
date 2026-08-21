@@ -1,17 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { mergeThreeWay, segmentsEquivalent } from "../editorMerge";
 
 async function responseBody(response) {
   try { return await response.clone().json(); } catch { return {}; }
 }
 
-function conflictFrom(body, localSegments, fallbackRevision = 0) {
+function staleDocumentFrom(body, localSegments, fallbackRevision = 0) {
   const detail = body?.detail && typeof body.detail === "object" ? body.detail : body;
   return {
     serverRevision: Number.isInteger(detail?.server_revision)
       ? detail.server_revision : fallbackRevision,
     serverSegments: Array.isArray(detail?.server_segments) ? detail.server_segments : [],
-    updatedBy: detail?.updated_by || null,
-    updatedAt: detail?.updated_at || null,
     localSegments,
   };
 }
@@ -21,20 +20,30 @@ export function useEditorDocument({ jobId, enabled, request }) {
   const [loading, setLoading] = useState(Boolean(enabled && jobId));
   const [error, setError] = useState(null);
   const [errorStatus, setErrorStatus] = useState(null);
-  const [conflict, setConflict] = useState(null);
   const [lock, setLock] = useState(null);
   const revisionRef = useRef(0);
+  const documentRef = useRef(null);
   const mountedRef = useRef(true);
-  const conflictRef = useRef(null);
   const saveChainRef = useRef(Promise.resolve());
   const hasDocument = Boolean(document);
-  conflictRef.current = conflict;
 
   const applyDocument = useCallback((value) => {
-    if (!value || !mountedRef.current) return;
+    if (!value || !mountedRef.current) return false;
+    const current = documentRef.current;
+    const sameJob = !current?.job_id || !value?.job_id || current.job_id === value.job_id;
+    const isOlderRevision = sameJob
+      && Number.isInteger(current?.revision)
+      && Number.isInteger(value.revision)
+      && value.revision < current.revision;
+    // A GET used for reconciliation can be served from a lagging replica or
+    // an intermediary cache. Never let that response roll the local CAS base
+    // backwards or replace the screen with an older document.
+    if (isOlderRevision) return false;
+    documentRef.current = value;
     setDocument(value);
     if (Number.isInteger(value.revision)) revisionRef.current = value.revision;
     if (value.lock) setLock(value.lock);
+    return true;
   }, []);
 
   const load = useCallback(async () => {
@@ -98,7 +107,6 @@ export function useEditorDocument({ jobId, enabled, request }) {
 
   const performSave = useCallback(async (segments, checkpoint = "draft") => {
     if (!enabled || !jobId || !request) return { ok: false, reason: "disabled" };
-    if (conflictRef.current) return { ok: false, reason: "conflict" };
     try {
       const response = await request(`/editor/${jobId}`, {
         method: "PATCH",
@@ -111,25 +119,68 @@ export function useEditorDocument({ jobId, enabled, request }) {
       });
       const body = await responseBody(response);
       if (response.status === 409) {
-        const next = conflictFrom(body, segments, revisionRef.current);
-        if (mountedRef.current) setConflict(next);
-        return { ok: false, reason: "conflict", conflict: next };
+        const next = staleDocumentFrom(body, segments, revisionRef.current);
+        const base = documentRef.current?.segments || document?.segments || [];
+        const merged = mergeThreeWay(base, segments, next.serverSegments);
+        // A revision can move because of this same session (a background
+        // choice, metadata write or a delayed autosave), not just another
+        // browser. Rebase every 409 silently. `mergeThreeWay` keeps the local
+        // field when both snapshots changed it, while retaining remote-only
+        // changes. The retry still uses the newly-read CAS revision; it never
+        // performs an unchecked overwrite.
+        const rebasedServerDocument = {
+          ...(documentRef.current || document || {}),
+          ...body,
+          revision: next.serverRevision,
+          segments: next.serverSegments,
+        };
+        // Do not publish the raw server snapshot to React here. The caller
+        // immediately applies `merged.merged` and retries it, but publishing
+        // first creates a render window where controlled lyric inputs can be
+        // overwritten by the remote value (the real two-editor E2E caught
+        // exactly that same-line regression). Keep it as the CAS base only;
+        // the successful retry below publishes the merged local-wins value.
+        documentRef.current = rebasedServerDocument;
+        revisionRef.current = next.serverRevision;
+        if (rebasedServerDocument.lock) setLock(rebasedServerDocument.lock);
+        return {
+          ok: false,
+          reason: "merged",
+          mergedSegments: merged.merged,
+          serverRevision: next.serverRevision,
+          hadLineConflicts: merged.conflicts.length > 0,
+        };
       }
       if (!response.ok) return { ok: false, reason: `http-${response.status}`, status: response.status };
       if (Number.isInteger(body.revision)) revisionRef.current = body.revision;
       if (mountedRef.current) {
-        setDocument((previous) => previous ? {
-          ...previous,
-          revision: body.revision,
-          segments,
-          updated_at: body.saved_at,
-        } : previous);
+        setDocument((previous) => {
+          if (!previous) return previous;
+          const next = {
+            ...previous,
+            revision: body.revision,
+            segments,
+            updated_at: body.saved_at,
+          };
+          documentRef.current = next;
+          return next;
+        });
       }
-      return { ok: true, revision: body.revision, versionId: body.version_id, applied: body.applied !== false };
+      // `segments` (lo que se persistió) viaja en la respuesta para que el
+      // caller pueda decidir si el borrador local ya quedó cubierto. Sin esto
+      // el editor borraba el draft a ciegas y perdía lo tipeado entre la
+      // captura del snapshot y el OK del servidor.
+      return {
+        ok: true,
+        revision: body.revision,
+        versionId: body.version_id,
+        applied: body.applied !== false,
+        segments,
+      };
     } catch (err) {
       return { ok: false, reason: navigator.onLine === false ? "offline" : "network", error: String(err) };
     }
-  }, [enabled, jobId, request]);
+  }, [applyDocument, document, enabled, jobId, request]);
 
   // Draft, checkpoint and structural saves share one optimistic revision.
   // Serialize them so a slow request cannot make this tab conflict with its
@@ -150,57 +201,44 @@ export function useEditorDocument({ jobId, enabled, request }) {
       const response = await request(`/editor/${jobId}`);
       const body = await responseBody(response);
       if (!response.ok) return { ok: false, reason: `http-${response.status}` };
+      const currentDocument = documentRef.current;
+      const sameJob = !currentDocument?.job_id || !body?.job_id || currentDocument.job_id === body.job_id;
+      if (sameJob && Number.isInteger(body.revision)
+        && Number.isInteger(revisionRef.current)
+        && body.revision < revisionRef.current) {
+        return {
+          ok: true,
+          document: currentDocument || document,
+          sameContent: segmentsEquivalent(
+            (currentDocument || document)?.segments || [],
+            localSegments || [],
+          ),
+          staleRead: true,
+        };
+      }
       const remoteChanged = Number.isInteger(body.revision) && body.revision !== revisionRef.current;
       const sameContent = JSON.stringify(body.segments || []) === JSON.stringify(localSegments || []);
       if (remoteChanged && !sameContent) {
-        const next = conflictFrom({
-          server_revision: body.revision,
-          server_segments: body.segments,
-          updated_by: body.updated_by,
-          updated_at: body.updated_at,
-        }, localSegments, revisionRef.current);
-        if (mountedRef.current) setConflict(next);
-        return { ok: false, reason: "conflict", conflict: next };
+        const merged = mergeThreeWay(
+          documentRef.current?.segments || document?.segments || [],
+          localSegments,
+          body.segments || [],
+        );
+        applyDocument(body);
+        return {
+          ok: true,
+          document: body,
+          sameContent: false,
+          mergedSegments: merged.merged,
+          hadLineConflicts: merged.conflicts.length > 0,
+        };
       }
       applyDocument(body);
       return { ok: true, document: body, sameContent };
     } catch (err) {
       return { ok: false, reason: navigator.onLine === false ? "offline" : "network", error: String(err) };
     }
-  }, [applyDocument, enabled, jobId, request]);
-
-  const stageConflict = useCallback((localSegments, metadata = {}) => {
-    setConflict({
-      serverRevision: revisionRef.current,
-      serverSegments: document?.segments || [],
-      updatedBy: document?.updated_by || null,
-      updatedAt: document?.updated_at || null,
-      localSegments,
-      ...metadata,
-    });
-  }, [document]);
-
-  const resolve = useCallback(async (strategy) => {
-    if (!conflict || !request || !jobId) return null;
-    const response = await request(`/editor/${jobId}/conflicts/resolve`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        strategy,
-        server_revision: conflict.serverRevision,
-        ...(strategy === "save_local_as_new" ? { segments: conflict.localSegments } : {}),
-      }),
-    });
-    const body = await responseBody(response);
-    if (response.status === 409) {
-      setConflict(conflictFrom(body, conflict.localSegments, conflict.serverRevision));
-      return { ok: false, reason: "conflict" };
-    }
-    if (!response.ok) return { ok: false, reason: `http-${response.status}` };
-    applyDocument(body);
-    setConflict(null);
-    return { ok: true, document: body };
-  }, [applyDocument, conflict, jobId, request]);
+  }, [applyDocument, document, enabled, jobId, request]);
 
   const listVersions = useCallback(async () => {
     const response = await request(`/editor/${jobId}/versions?limit=50`);
@@ -216,8 +254,7 @@ export function useEditorDocument({ jobId, enabled, request }) {
     });
     const body = await responseBody(response);
     if (response.status === 409) {
-      setConflict(conflictFrom(body, document?.segments || [], revisionRef.current));
-      return { ok: false, reason: "conflict" };
+      return { ok: false, reason: "stale-revision", currentRevision: body?.current_revision };
     }
     if (!response.ok) return { ok: false, reason: `http-${response.status}` };
     applyDocument({ ...document, ...body });
@@ -225,8 +262,8 @@ export function useEditorDocument({ jobId, enabled, request }) {
   }, [applyDocument, document, jobId, request]);
 
   return {
-    document, loading, error, errorStatus, conflict, lock,
-    revisionRef, load, save, reconcile, stageConflict, resolve,
+    document, loading, error, errorStatus, lock,
+    revisionRef, load, save, reconcile,
     listVersions, restoreVersion,
   };
 }

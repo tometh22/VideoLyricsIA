@@ -13,6 +13,7 @@
 
 import { describe, it, expect } from "vitest";
 import { appendBackgroundFields } from "./lib/bgPayload";
+import { buildGenerationJob } from "./lib/buildGenerationJob";
 
 // Mirror de la lógica de handleApproveLyrics (App.jsx:1495+) en su forma
 // pura: dado un currentReview + edited segments, qué shape va a
@@ -31,19 +32,30 @@ function _approvedJobFromReview(r, editedSegments, bgCacheKey) {
     backgroundHint: r.backgroundHint || "",
     bgVerbatim: !!r.bgVerbatim,
     textCase: r.textCase || "upper",
+    frameFormat: r.frameFormat || "full",
     fontScale: r.fontScale || "1.0",
     lyricsAnimation: r.lyricsAnimation || "none",
     lineTransition: r.lineTransition || "none",
     textContrast: r.textContrast || "medium",
+    lyricColor: r.lyricColor || "#FFFFFF",
+    lyricSungColor: r.lyricSungColor || "#FFFFFF",
+    titleTemplate: r.titleTemplate || "auto",
+    titleSize: r.titleSize || "1.0",
+    titleArtistFont: r.titleArtistFont || "",
+    titleSongFont: r.titleSongFont || "",
+    titleSongBreak: r.titleSongBreak || "",
     segments: editedSegments,
+    segmentsRevision: Number.isInteger(r.segmentsRevision) ? r.segmentsRevision : 0,
+    editorRevision: Number.isInteger(r.editorRevision) ? r.editorRevision : null,
+    editorVersionId: r.editorVersionId || null,
     transcribeJobId: r.transcribeJobId,
     bgCacheKey: bgCacheKey || null,
   };
 }
 
-// Mirror de startGenerationWithSegments (App.jsx:1599+): qué fields se
-// appendean al FormData del POST /generate. Verifica que para cada job
-// del batch se envíen TODOS los axes que el operador eligió.
+// Mirror de startGenerationWithSegments (App.jsx): qué fields se appendean
+// al FormData del POST /generate. Verifica que para cada job del batch se
+// envíen TODOS los axes que el operador eligió.
 //
 // Audit adversarial 2026-06-09: los campos de FONDO ya no se espejan a
 // mano — usan el helper REAL appendBackgroundFields (lib/bgPayload.js),
@@ -69,10 +81,18 @@ function _formDataFromJob(job, delivery, style, customColors, bg, inspiredByLyri
     if (job.bgVerbatim) f["bg_verbatim"] = "true";
   }
   f["text_case"] = job.textCase || "upper";
+  f["frame_format"] = job.frameFormat || "full";
   f["font_scale"] = String(job.fontScale || "1.0");
   f["lyrics_animation"] = job.lyricsAnimation || "none";
   f["line_transition"] = job.lineTransition || "none";
+  f["lyric_color"] = job.lyricColor || "#FFFFFF";
+  f["lyric_sung_color"] = job.lyricSungColor || "#FFFFFF";
   f["text_contrast"] = job.textContrast || "medium";
+  f["title_template"] = job.titleTemplate || "auto";
+  f["title_size"] = String(job.titleSize || "1.0");
+  f["title_artist_font"] = job.titleArtistFont || "";
+  f["title_song_font"] = job.titleSongFont || "";
+  f["title_song_break"] = job.titleSongBreak || "";
   f["match_lyrics"] = inspiredByLyrics ? "true" : "false";
   if (job.bgCacheKey) {
     f["bg_cache_key"] = job.bgCacheKey;
@@ -110,11 +130,22 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
       backgroundHint: "una galaxia con nebulosa morada",
       bgVerbatim: true,
       textCase: "upper",
+      frameFormat: "cinematic",
       fontScale: "1.15",
       lyricsAnimation: "karaoke",
       lineTransition: "slide_up",
       textContrast: "strong",
-      transcribeJobId: "abc123",
+      lyricColor: "#00FF00",
+      lyricSungColor: "#FF00FF",
+      titleTemplate: "lower_third",
+      titleSize: "1.25",
+      titleArtistFont: "montserrat-bold",
+      titleSongFont: "playfair",
+      titleSongBreak: "Viejas\nLocas",
+    transcribeJobId: "abc123",
+    segmentsRevision: 7,
+    editorRevision: 7,
+    editorVersionId: "version-7",
     };
     const editedSegments = [
       { start: 17.1, end: 18.5, text: "Legalícenla" },
@@ -128,7 +159,8 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
     };
 
     const job = _approvedJobFromReview(currentReview, editedSegments, "bgkey789");
-    const fd = _formDataFromJob(job, delivery, "oscuro", "", { bgSelectMode: "auto" }, true);
+    const generationJob = buildGenerationJob(job);
+    const fd = _formDataFromJob(generationJob, delivery, "oscuro", "", { bgSelectMode: "auto" }, true);
 
     // Identidad
     expect(fd.artist).toBe("Viejas Locas");
@@ -139,8 +171,16 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
     // Lyrics typography
     expect(fd.font).toBe("anton");
     expect(fd.text_case).toBe("upper");
+    expect(fd.frame_format).toBe("cinematic");
     expect(fd.font_scale).toBe("1.15");
     expect(fd.text_contrast).toBe("strong");
+    expect(fd.lyric_color).toBe("#00FF00");
+    expect(fd.lyric_sung_color).toBe("#FF00FF");
+    expect(fd.title_template).toBe("lower_third");
+    expect(fd.title_size).toBe("1.25");
+    expect(fd.title_artist_font).toBe("montserrat-bold");
+    expect(fd.title_song_font).toBe("playfair");
+    expect(fd.title_song_break).toBe("Viejas\nLocas");
 
     // Lyrics motion
     expect(fd.lyrics_animation).toBe("karaoke");
@@ -155,6 +195,13 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
     expect(fd.style).toBe("oscuro");
     expect(fd.match_lyrics).toBe("true");
     expect(fd.bg_cache_key).toBe("bgkey789");
+    expect(generationJob).toMatchObject({
+      bgCacheKey: "bgkey789",
+      segmentsRevision: 7,
+      editorRevision: 7,
+      editorVersionId: "version-7",
+      transcribeJobId: "abc123",
+    });
 
     // Delivery UMG full
     expect(fd.delivery_profile).toBe("both");

@@ -84,6 +84,36 @@ def test_structural_decline_does_not_retry_mix(monkeypatch, tmp_path):
     assert out is result
 
 
+def test_short_motif_decline_routes_bounded_quality_window_without_mix_retry(
+        monkeypatch, tmp_path):
+    calls = []
+
+    def fake_retime(audio, segs, job_id="", mix_path=None, max_skip_frac=None):
+        calls.append(audio)
+        ctc_align.last_decline_reason = "short_repeated_motif"
+        return None
+
+    monkeypatch.setenv("CTC_ALIGN_ENABLED", "1")
+    stem_file = tmp_path / "stem.wav"
+    stem_file.write_bytes(b"x")
+    monkeypatch.setattr(vocal_sep, "separate_vocals", lambda *a, **kw: str(stem_file))
+    monkeypatch.setattr(ctc_align, "retime_segments", fake_retime)
+    result = {"segments": [
+        {"text": "Verso largo de entrada", "start": 10.0, "end": 14.0},
+        {"text": "Real uoh", "start": 20.0, "end": 22.0},
+        {"text": "Real uoh", "start": 26.0, "end": 28.0},
+        {"text": "Real uoh", "start": 32.0, "end": 34.0},
+        {"text": "Cierre largo diferente", "start": 40.0, "end": 44.0},
+    ]}
+    out = asyncio.run(_maybe_ctc_retime(result, "/mix/audio.wav", "j"))
+    assert calls == [str(stem_file)]
+    assert out["segments"] == result["segments"]
+    diagnostic = out["postpass_stats"]["ctc_retime"]
+    assert diagnostic["mutated_segments"] is False
+    assert diagnostic["unsafe_windows"][0]["segment_indices"] == [1, 2, 3]
+    assert "text" not in diagnostic["unsafe_windows"][0]
+
+
 def test_stale_structural_reason_does_not_block_mix(monkeypatch, tmp_path):
     """Sin stem, el global quedó en 'structural' de un job ANTERIOR:
     la decisión usa estado local del call, así que la mezcla corre igual."""

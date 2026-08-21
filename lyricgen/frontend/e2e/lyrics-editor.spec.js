@@ -17,15 +17,15 @@ test.describe("lyrics editor browser contract", () => {
 
     await expect(page.getByTestId("editor-mode-explainer")).toContainText("Corregir texto y aprobar");
     await expect(page.getByRole("tab", { name: "Revisar letra" })).toHaveAttribute("aria-selected", "true");
-    await expect(page.getByText("Primera línea")).toBeVisible();
+    await expect(page.locator('input[aria-label="Letra de la línea 1"]')).toHaveValue("Primera línea");
 
     await openAdvanced(page);
     await expect(page.getByTestId("timeline-segment")).toHaveCount(DEFAULT_SEGMENTS.length);
-    await expect(page.getByTestId("editor-mode-explainer")).toContainText("Timeline y edición en grupo");
+    await expect(page.getByTestId("editor-mode-explainer")).toContainText("Revisión guiada y ajustes precisos");
 
     await page.getByRole("tab", { name: "Revisar letra" }).click();
     await expect(page.getByRole("tab", { name: "Revisar letra" })).toHaveAttribute("aria-selected", "true");
-    await expect(page.getByText("Primera línea")).toBeVisible();
+    await expect(page.locator('input[aria-label="Letra de la línea 1"]')).toHaveValue("Primera línea");
   });
 
   test("shows a deterministic empty state when the job has no lyrics", async ({ page }) => {
@@ -43,8 +43,55 @@ test.describe("lyrics editor browser contract", () => {
 
     await expect(page.getByRole("tab", { name: "Ajustar tiempos" })).toHaveAttribute("aria-selected", "true");
     await expect(page.getByTestId("advanced-audio-unavailable")).toContainText("No se puede ajustar tiempos sin audio", { timeout: 12_000 });
-    await expect(page.getByText("Primera línea")).toBeVisible();
+    await expect(page.getByText("5 líneas", { exact: true })).toBeVisible();
     await expect(page.getByTestId("timeline-lane")).toHaveCount(0);
+  });
+
+  test("reviews v6 windows one at a time and stops the previous audio loop", async ({ page }) => {
+    const harness = await installEditorHarness(page, {
+      transcriptionQuality: {
+        policy_version: "lyrics-quality-v6",
+        schema_version: 6,
+        mode: "enforce",
+        decision: "review_required",
+        render_blocked: true,
+        evaluated_revision: 0,
+        segments_hash: "e2e-segments",
+        quality_fingerprint: "e2e-quality",
+        unsafe_windows: [
+          { id: "first", start: 0.3, end: 1.05, reasons: ["timing"] },
+          { id: "second", start: 1.15, end: 1.9, reasons: ["event_count"] },
+        ],
+      },
+    });
+    await harness.open();
+
+    await page.getByRole("button", { name: "Revisar sincronización" }).click();
+    await expect(page.getByTestId("guided-timing-review")).toBeVisible();
+    await expect(page.getByRole("tab", { name: "Revisión guiada" })).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByText("Parte 1 de 2")).toBeVisible();
+    await expect(page.getByTestId("guided-stepper")).toContainText("1. Escuchá");
+    await expect(page.getByTestId("guided-stepper")).toContainText("2. Compará/Ajustá");
+    await expect(page.getByTestId("guided-stepper")).toContainText("3. Confirmá");
+    await expect(page.getByRole("button", { name: /Escuchar fragmento/ })).toBeVisible();
+    await page.getByRole("button", { name: /Reproducir este tramo en loop/ }).click();
+    await expect.poll(() => page.locator("audio").evaluate((audio) => audio.paused)).toBe(false);
+    await expect(page.getByText("¿La frase aparece cuando empieza la voz?")).toBeVisible();
+    await page.getByRole("button", { name: "Sí, está bien" }).click();
+    await page.getByRole("button", { name: /Confirmar y seguir/ }).click();
+    await expect(page.getByText("Parte 2 de 2")).toBeVisible();
+    await expect.poll(() => page.locator("audio").evaluate((audio) => audio.paused)).toBe(true);
+
+    const accessibility = await new AxeBuilder({ page })
+      .include('[data-testid="lyrics-editor"]')
+      .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+      .analyze();
+    const blocking = accessibility.violations.filter((violation) => ["critical", "serious"].includes(violation.impact));
+    expect(blocking, blocking.map((violation) => violation.id).join(", ")).toEqual([]);
+
+    await page.getByRole("tab", { name: "Timeline avanzada" }).click();
+    await expect(page.getByTestId("timeline-lane")).toBeVisible();
+    await expect.poll(() => page.locator("audio").evaluate((audio) => audio.paused)).toBe(true);
   });
 
   test("seeks from the timeline ruler without requiring playback", async ({ page }) => {
@@ -71,24 +118,30 @@ test.describe("lyrics editor browser contract", () => {
 
     await expect(page.getByTestId("timeline-selection-help")).toContainText("Arrastrá el fondo");
 
-    const scroll = await page.getByTestId("timeline-scroll").boundingBox();
-    const lane = await page.getByTestId("timeline-lane").boundingBox();
-    expect(scroll).not.toBeNull();
-    expect(lane).not.toBeNull();
-
+    const rows = page.getByTestId("timeline-label-row");
+    const firstRow = await rows.first().boundingBox();
+    // Use a visible lower row. The fixed approval bar may cover the final
+    // row at short CI viewport heights even though it is reachable by scroll.
+    const lastRow = await rows.nth(2).boundingBox();
+    expect(firstRow).not.toBeNull();
+    expect(lastRow).not.toBeNull();
     await drag(
       page,
-      { x: scroll.x + scroll.width - 12, y: lane.y + lane.height - 10 },
-      { x: scroll.x + 12, y: lane.y + 10 },
+      { x: lastRow.x + lastRow.width / 2, y: lastRow.y + lastRow.height / 2 },
+      { x: firstRow.x + firstRow.width / 2, y: firstRow.y + firstRow.height / 2 },
     );
     await selectionAtLeast(page, 2);
 
     await page.getByRole("button", { name: "Limpiar selección" }).click();
     await page.waitForTimeout(100);
+    const firstRowAfterClear = await rows.first().boundingBox();
+    const lastRowAfterClear = await rows.nth(2).boundingBox();
+    expect(firstRowAfterClear).not.toBeNull();
+    expect(lastRowAfterClear).not.toBeNull();
     await drag(
       page,
-      { x: scroll.x + 12, y: lane.y + 10 },
-      { x: scroll.x + scroll.width - 12, y: lane.y + lane.height - 10 },
+      { x: firstRowAfterClear.x + firstRowAfterClear.width / 2, y: firstRowAfterClear.y + firstRowAfterClear.height / 2 },
+      { x: lastRowAfterClear.x + lastRowAfterClear.width / 2, y: lastRowAfterClear.y + lastRowAfterClear.height / 2 },
     );
     await selectionAtLeast(page, 2);
   });
@@ -237,7 +290,7 @@ test.describe("lyrics editor browser contract", () => {
     await expect(page.getByTestId("timeline-label-row").last()).toBeVisible();
   });
 
-  test("resizes a line from a generous edge hit area with one continuous drag", async ({ page }) => {
+  test("ripple-trims a packed shared boundary by default without shortening lyrics", async ({ page }) => {
     const harness = await installEditorHarness(page, {
       segments: [
         { _id: "wide", start: 0.4, end: 2.4, text: "Línea para estirar" },
@@ -261,9 +314,46 @@ test.describe("lyrics editor browser contract", () => {
 
     await expect.poll(async () => block.evaluate((element) => parseFloat(element.style.width))).toBeGreaterThan(beforeWidth + 10);
     await expect.poll(() => harness.saves.length).toBeGreaterThan(0);
-    const saved = harness.saves.at(-1).segments.find((segment) => segment.text === "Línea para estirar");
+    const savedSegments = harness.saves.at(-1).segments;
+    const saved = savedSegments.find((segment) => segment.text === "Línea para estirar");
+    const savedNext = savedSegments.find((segment) => segment.text === "Línea siguiente");
+    expect(Number(saved.end)).toBeCloseTo(2.9, 2);
+    expect(Number(savedNext.start)).toBeCloseTo(2.95, 2);
+    expect(Number(savedNext.end)).toBeCloseTo(3.75, 2);
+    expect(Number(savedNext.start) - Number(saved.end)).toBeCloseTo(0.05, 2);
+    expect(Number(savedNext.end) - Number(savedNext.start)).toBeGreaterThanOrEqual(0.3);
+    expect(saved.locked).toBe(true);
+    expect(savedNext.locked).toBe(true);
+  });
+
+  test("Solo esta línea stops a right-edge trim before the next lyric", async ({ page }) => {
+    const harness = await installEditorHarness(page, {
+      segments: [
+        { _id: "wide", start: 0.4, end: 2.4, text: "Línea para estirar" },
+        { _id: "next", start: 2.7, end: 3.5, text: "Línea siguiente" },
+      ],
+    });
+    await harness.open();
+    await openAdvanced(page);
+    await page.getByRole("button", { name: "Solo esta línea", exact: true }).first().click();
+
+    const block = page.getByTestId("timeline-segment").first();
+    const edge = block.getByTestId("timeline-edge-end");
+    const edgeBox = await edge.boundingBox();
+    expect(edgeBox).not.toBeNull();
+    await drag(
+      page,
+      { x: edgeBox.x + edgeBox.width / 2, y: edgeBox.y + edgeBox.height / 2 },
+      { x: edgeBox.x + edgeBox.width / 2 + 24, y: edgeBox.y + edgeBox.height / 2 },
+    );
+
+    await expect.poll(() => harness.saves.length).toBeGreaterThan(0);
+    const savedSegments = harness.saves.at(-1).segments;
+    const saved = savedSegments.find((segment) => segment.text === "Línea para estirar");
+    const savedNext = savedSegments.find((segment) => segment.text === "Línea siguiente");
     expect(Number(saved.end)).toBeCloseTo(2.65, 2);
-    expect(Number(saved.end)).toBeLessThanOrEqual(2.65 + Number.EPSILON * 4);
+    expect(Number(savedNext.start)).toBeCloseTo(2.7, 2);
+    expect(Number(savedNext.end)).toBeCloseTo(3.5, 2);
   });
 
   test("moves a short line from its body while resize handles stay outside", async ({ page }) => {
@@ -356,6 +446,21 @@ test.describe("lyrics editor browser contract", () => {
     expect(approved.editor_revision).toBeGreaterThan(0);
     expect(approved.editor_version_id).toBe(`version-${approved.editor_revision}`);
     expect(approved.segments).toEqual(persisted.segments.map(({ _id, ...segment }) => segment));
+  });
+
+  test("recovers audio after DB backpressure while autosave and the editor lock remain live", async ({ page }) => {
+    const harness = await installEditorHarness(page, { audio: "temporary", editorV2: true });
+    await harness.open();
+
+    const input = page.locator('input[value="Primera línea"]');
+    await input.fill("Primera línea tras presión DB");
+    await expect.poll(() => harness.saves.length).toBeGreaterThan(0);
+    await expect.poll(() => harness.heartbeats.length).toBeGreaterThan(0);
+    await expect.poll(() => harness.sourceAudioRequests).toBe(3);
+
+    await expect(page.getByTestId("wizard-player-slot").getByRole("button", { name: "Reproducir", exact: true })).toBeVisible();
+    await openAdvanced(page);
+    await expect(page.getByTestId("timeline-lane")).toBeVisible();
   });
 
   test("passes the automated accessibility audit in both editor views", async ({ page }) => {

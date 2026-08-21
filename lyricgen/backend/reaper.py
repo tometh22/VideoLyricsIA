@@ -39,7 +39,7 @@ from sqlalchemy import JSON, exists, func, or_
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from database import AIProvenance, AuditLog, Job, SessionLocal
+from database import AIProvenance, AuditLog, EditorDocument, Job, SessionLocal
 
 # Markers for Postgres connection drops that we should silently retry
 # instead of letting the reaper thread emit Sentry noise every 5 min.
@@ -295,12 +295,22 @@ def find_abandoned_transcribed(
     return (
         db.query(Job)
         .filter(Job.status == "transcribed_pending")
+        # Soft-superseded rows are retained precisely because an out-of-order
+        # browser response may still hold their ID.  A short TTL must not turn
+        # that reversible archive into the same job_not_found hard failure.
+        .filter(Job.archived_at.is_(None))
         # SQLAlchemy JSON may persist Python None as JSON `null` rather than
         # SQL NULL, depending on the dialect/path that created the row.
         .filter(or_(
             Job.segments_json.is_(None),
             Job.segments_json == JSON.NULL,
         ))
+        # Defense in depth for a legacy/partial bridge write: an editor
+        # document is durable operator work even if Job.segments_json was
+        # accidentally left SQL/JSON null.  The Job FK cascades into the full
+        # immutable editor history, so deleting such a row would erase every
+        # correction at once.
+        .filter(~exists().where(EditorDocument.job_id == Job.job_id))
         .filter(anchor < cutoff)
         .order_by(Job.created_at.asc())
         .all()
@@ -319,6 +329,10 @@ def find_abandoned_uploads(
     return (
         db.query(Job)
         .filter(Job.status == "awaiting_upload")
+        # Duplicate-upload races are soft-archived by jobs.py.  Keep those
+        # recoverable IDs out of the 20-minute abandoned-upload hard delete;
+        # an explicit /transcribe-uploaded touch will revive the selected one.
+        .filter(Job.archived_at.is_(None))
         .filter(Job.created_at < cutoff)
         .order_by(Job.created_at.asc())
         .all()
@@ -751,118 +765,102 @@ def _reason_for_stalled(job: Job) -> str:
     )
 
 
-def _delete_abandoned_transcribed(db: Session, job: Job) -> None:
-    """Hard-delete an incomplete transcribed_pending row + its audio file.
+def _delete_abandoned_transcribed(db: Session, job: Job) -> bool:
+    """Quarantine an incomplete transcribed draft without deleting user data.
 
-    Callers must only pass rows without persisted segments. Completed
-    transcriptions are protected by ``find_abandoned_transcribed``.
+    The historical implementation hard-deleted the Job and its input audio.
+    That is unsafe under a selection/use race: an autosave or editor-document
+    commit can land after ``find_abandoned_transcribed`` selected the row but
+    before this function executes.  Re-read under ``FOR UPDATE`` and convert a
+    still-incomplete row to the recoverable ``transcription_failed`` state.
+    The Job, R2 key, provenance and editor history remain intact.
+
+    Returns True only when the row was quarantined; False when a concurrent
+    user/worker action made it ineligible.
     """
     job_id = job.job_id
-    if job.segments_json is not None:
+    job = (
+        db.query(Job)
+        .filter(Job.job_id == job_id)
+        .populate_existing()
+        .with_for_update()
+        .one_or_none()
+    )
+    if job is None:
+        return False
+    has_editor_document = db.query(EditorDocument.job_id).filter(
+        EditorDocument.job_id == job_id,
+    ).first() is not None
+    if (
+        job.status != "transcribed_pending"
+        or job.archived_at is not None
+        or job.segments_json is not None
+        or has_editor_document
+    ):
         logger.warning(
-            "[REAPER] refused hard-delete of completed transcription %s "
-            "(segments are persisted)",
+            "[REAPER] refused quarantine of active/completed transcription %s "
+            "(status=%s archived=%s segments=%s editor=%s)",
             job_id,
+            job.status,
+            bool(job.archived_at),
+            job.segments_json is not None,
+            has_editor_document,
         )
-        return
-    # Local file under OUTPUTS_DIR.
-    try:
-        from pipeline import OUTPUTS_DIR
-        local_dir = os.path.join(OUTPUTS_DIR, job_id)
-        if os.path.isdir(local_dir):
-            import shutil as _sh
-            _sh.rmtree(local_dir, ignore_errors=True)
-    except Exception as e:  # pragma: no cover
-        logger.debug(f"reaper: local dir cleanup failed for {job_id}: {e}")
-    # Cancel any stale RQ entry (best-effort, consistent with the other
-    # cleanup paths in this file). enqueue_transcription uses RQ job id
-    # `transcribe:<job_id>` (queue_jobs.py:474); the bare job_id form
-    # would miss it. Audit 2026-05-26.
+        return False
+
+    # Cancel any stale RQ entry before exposing the recoverable failure.  Do
+    # not remove local/R2 audio: /transcribe-uploaded explicitly supports
+    # retrying transcription_failed jobs without another upload.
     try:
         from queue_jobs import cancel_rq_job
         cancel_rq_job(f"transcribe:{job_id}")
     except Exception as e:  # pragma: no cover
         logger.debug("reaper: cancel_rq_job failed for %s: %s", job_id, e)
-    # R2 object — only delete when no sibling job references the same
-    # input audio. Variants and edit-side jobs share input_r2_key with
-    # the parent; if the reaper kills this row while a sibling is alive,
-    # the surviving sibling's next /retry or /edit 404s on R2. Same
-    # guard as jobs._delete_r2_objects (incident 2026-05-19, Amanda
-    # Pujó "Ser Anti"). Best-effort — failure leaves orphan for the
-    # next cleanup_old_inputs sweep.
-    if job.input_r2_key:
-        try:
-            from jobs import input_audio_is_shared
-            if not input_audio_is_shared(db, job):
-                import storage as _storage
-                _storage.delete_object(job.input_r2_key)
-            else:
-                from jobs import _report_shared_input_delete_attempt
-                _report_shared_input_delete_attempt(job, "reaper._delete_abandoned_transcribed")
-        except Exception as e:  # pragma: no cover
-            logger.debug("reaper: R2 delete failed for %s: %s", job_id, e)
-    # AIProvenance has a NOT NULL FK to jobs.job_id without ON DELETE CASCADE,
-    # so its rows MUST be cleared before the parent delete — otherwise Postgres
-    # raises IntegrityError and the ENTIRE reap transaction aborts, leaving this
-    # job (and every later job in the same sweep) un-reaped. Prod 2026-06-02:
-    # the reaper crashed on exactly this every cycle (`null value in column
-    # "job_id" of relation "ai_provenance"`). Mirrors jobs.delete_job (jobs.py).
-    db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete(synchronize_session=False)
-    db.delete(job)
+    now = datetime.now(timezone.utc)
+    job.status = "transcription_failed"
+    job.current_step = "error"
+    job.error = (
+        "La transcripción quedó inactiva, pero tu audio sigue guardado. "
+        "Reintentá para continuar sin volver a subirlo."
+    )
+    job.archived_at = now
+    job.last_progress_at = now
+    logger.info("[REAPER] quarantined incomplete transcription %s", job_id)
+    return True
 
 
-def _delete_abandoned_upload(db: Session, job: Job) -> None:
-    """Hard-delete an abandoned awaiting_upload row.
+def _delete_abandoned_upload(db: Session, job: Job) -> bool:
+    """Soft-quarantine an abandoned upload without invalidating its ID.
 
-    Three cleanup paths depending on what state the upload reached:
-      1. Multipart in-flight → abort_multipart_upload to release the
-         parts R2 has accepted so far.
-      2. Single-PUT or completed multipart → delete the object.
-      3. No R2 key recorded yet (browser never started) → just drop
-         the row.
+    A completed upload or /transcribe-uploaded request can race the short-TTL
+    selector.  Hard deletion here used the stale ORM object and could erase a
+    row that had already advanced to transcribed_pending.  Re-read with a row
+    lock and only archive a row that is still awaiting upload.  Keep multipart
+    parts and R2/local audio intact: the browser may still hold this explicit
+    ID and is allowed to resume it.
     """
     job_id = job.job_id
-    try:
-        import storage as _storage
-        if job.multipart_upload_id and job.input_r2_key:
-            # Multipart abort releases the in-flight parts only. There's
-            # no shared-key concern here — multipart uploads are per-job
-            # by design (the upload_id is unique to this row).
-            _storage.multipart_abort(job.input_r2_key, job.multipart_upload_id)
-        elif job.input_r2_key:
-            # Same shared-key guard as _reap_stuck_job. An
-            # awaiting_upload row with a shared input_r2_key shouldn't
-            # exist by design (variants don't go through awaiting_upload
-            # state) but the guard is cheap and protects against any
-            # future code path that might fork before upload finishes.
-            try:
-                from jobs import input_audio_is_shared
-                if not input_audio_is_shared(db, job):
-                    _storage.delete_object(job.input_r2_key)
-                else:
-                    from jobs import _report_shared_input_delete_attempt
-                    _report_shared_input_delete_attempt(
-                        job, "reaper._delete_abandoned_upload",
-                    )
-            except Exception:
-                pass
-    except Exception as e:  # pragma: no cover
-        logger.debug(f"reaper: R2 cleanup failed for {job_id}: {e}")
-    # Local dir (rare for awaiting_upload, but defensive).
-    try:
-        from pipeline import OUTPUTS_DIR
-        local_dir = os.path.join(OUTPUTS_DIR, job_id)
-        if os.path.isdir(local_dir):
-            import shutil as _sh
-            _sh.rmtree(local_dir, ignore_errors=True)
-    except Exception:
-        pass
-    # Clear provenance rows before the parent delete (NOT NULL FK, no ON DELETE
-    # CASCADE) so the reap can't IntegrityError. awaiting_upload rows rarely
-    # have provenance, but the guard keeps every reaper delete path consistent
-    # with jobs.delete_job and the transcribed-reap path above.
-    db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete(synchronize_session=False)
-    db.delete(job)
+    job = (
+        db.query(Job)
+        .filter(Job.job_id == job_id)
+        .populate_existing()
+        .with_for_update()
+        .one_or_none()
+    )
+    if (
+        job is None
+        or job.status != "awaiting_upload"
+        or job.archived_at is not None
+        or job.segments_json is not None
+        or db.query(EditorDocument.job_id).filter(
+            EditorDocument.job_id == job_id,
+        ).first() is not None
+    ):
+        logger.info("[REAPER] refused quarantine of active/advanced upload %s", job_id)
+        return False
+    job.archived_at = datetime.now(timezone.utc)
+    logger.info("[REAPER] quarantined abandoned upload %s", job_id)
+    return True
 
 
 _REAPABLE_STATUSES = ("processing", "queued", "bg_preview_queued")
@@ -1155,6 +1153,13 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
     suite never has competing reapers.
     """
     db = SessionLocal()
+    # A session-level advisory lock must stay pinned to one physical
+    # PostgreSQL connection. The work session commits per recovered row; a
+    # commit may return its connection to SQLAlchemy's pool, so unlocking via
+    # that Session can hit a different connection and leak the original lock.
+    # Keep a dedicated checked-out connection for the entire sweep instead.
+    lock_connection = None
+    got_lock = False
     try:
         # Try to take the advisory lock. pg_try_advisory_lock is non-
         # blocking; if another replica already has it, returns false
@@ -1163,11 +1168,13 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
         is_postgres = db.bind.dialect.name == "postgresql"
         if is_postgres:
             from sqlalchemy import text
-            got = db.execute(
+            lock_connection = db.bind.connect()
+            got_lock = bool(lock_connection.execute(
                 text("SELECT pg_try_advisory_lock(:k)"),
                 {"k": _REAPER_ADVISORY_LOCK_KEY},
-            ).scalar()
-            if not got:
+            ).scalar())
+            lock_connection.commit()
+            if not got_lock:
                 logger.debug(
                     "reaper: another replica holds the advisory lock; "
                     "skipping this cycle",
@@ -1197,9 +1204,9 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
         abandoned_uploads = find_abandoned_uploads(db)
         abandoned_edits = find_abandoned_edits(db)
         stuck_transcriptions = find_stuck_transcriptions(db)
-        # Reap abandoned transcribed_pending rows quietly: the user never
-        # got a job started, so the failure isn't operator-visible. Just
-        # delete the row and clean up the input file.
+        # Quarantine abandoned transcribed_pending rows without deleting the
+        # Job or audio.  A browser may still hold the ID, and autosave can race
+        # this sweep; preserving the row makes retry deterministic.
         #
         # Per-job try/except + commit: a single row that fails to delete
         # (FK, storage hiccup, detached state) must NOT abort the whole
@@ -1227,9 +1234,10 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
         _n_tr = _n_up = _n_ed = 0
         for job in abandoned:
             try:
-                _delete_abandoned_transcribed(db, job)
+                quarantined = _delete_abandoned_transcribed(db, job)
                 db.commit()
-                _n_tr += 1
+                if quarantined:
+                    _n_tr += 1
             except Exception as e:
                 db.rollback()
                 logger.warning("[REAPER] reap transcribed %s failed: %s", job.job_id, e)
@@ -1242,9 +1250,10 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
                         job.job_id,
                     )
                     continue
-                _delete_abandoned_upload(db, job)
+                quarantined = _delete_abandoned_upload(db, job)
                 db.commit()
-                _n_up += 1
+                if quarantined:
+                    _n_up += 1
             except Exception as e:
                 db.rollback()
                 logger.warning("[REAPER] reap upload %s failed: %s", job.job_id, e)
@@ -1318,20 +1327,21 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
         # it. de-dup above already guaranteed no overlap.
         stuck = stuck + orphans + stalled
     finally:
-        # Releasing the advisory lock is implicit on session close
-        # (Postgres releases all session-scoped locks automatically),
-        # but we call pg_advisory_unlock explicitly for clarity and
-        # to fail fast if pool reuse ever changes the behaviour.
-        if 'is_postgres' in locals() and is_postgres:
+        # Release through the exact dedicated connection that acquired the
+        # session-level lock. Closing it is the final fail-safe.
+        if lock_connection is not None:
             try:
                 from sqlalchemy import text
-                db.execute(
-                    text("SELECT pg_advisory_unlock(:k)"),
-                    {"k": _REAPER_ADVISORY_LOCK_KEY},
-                )
-                db.commit()
+                if got_lock:
+                    lock_connection.execute(
+                        text("SELECT pg_advisory_unlock(:k)"),
+                        {"k": _REAPER_ADVISORY_LOCK_KEY},
+                    )
+                    lock_connection.commit()
             except Exception:
                 pass
+            finally:
+                lock_connection.close()
         db.close()
 
     # Side-effect notifications happen AFTER the DB commit so a failed

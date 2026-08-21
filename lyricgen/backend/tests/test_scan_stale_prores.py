@@ -22,7 +22,8 @@ def _seed(db, job_id, s3_keys):
         job_id=job_id, user_id=1, tenant_id=_T, artist="A",
         filename=f"{job_id}.wav", style="oscuro", status="done",
         delivery_profile="both", s3_keys=s3_keys,
-        created_at=_NOW,
+        # Stay inside the production newest-N scan window in the full suite.
+        created_at=datetime.now(timezone.utc),
     ))
     db.commit()
 

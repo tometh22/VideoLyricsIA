@@ -1,6 +1,7 @@
 """Admin panel API for GenLy AI."""
 
 import asyncio
+import hashlib
 import logging
 import os
 import shutil
@@ -12,7 +13,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import case, func
+from sqlalchemy import case, func, text
 from sqlalchemy.orm import Session
 
 from auth import (
@@ -1734,6 +1735,372 @@ def _month_bounds(period: str):
     end = datetime(year + (month == 12), (month % 12) + 1, 1,
                    tzinfo=timezone.utc)
     return start, end
+
+
+# ---------------------------------------------------------------------------
+# Correction learning — global, anonymised and super-admin only.
+# ---------------------------------------------------------------------------
+
+class QualityLearningActionRequest(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=500)
+    expected_version: int = Field(..., ge=1)
+    idempotency_key: str = Field(..., min_length=8, max_length=100)
+
+
+def _require_quality_learning_flag(name: str) -> None:
+    if os.environ.get(name, "0").strip().lower() not in {"1", "true", "yes", "on"}:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "quality_learning_disabled", "flag": name},
+        )
+
+
+def _pattern_payload(row) -> dict:
+    evidence = dict(row.evidence or {})
+    safe_evidence = {
+        key: evidence[key] for key in (
+            "association_only", "group_positive", "group_total",
+            "other_positive", "other_total", "thresholds",
+        ) if key in evidence
+    }
+    return {
+        "id": row.id, "category": row.category,
+        "context_key": row.context_key, "status": row.status,
+        "support_jobs": row.support_jobs,
+        "support_tenants": row.support_tenants,
+        "support_artists": row.support_artists,
+        "baseline_rate": row.baseline_rate,
+        "observed_rate": row.observed_rate,
+        "relative_risk": row.relative_risk,
+        "ci_95": [row.ci_low, row.ci_high],
+        "impact_seconds": row.impact_seconds,
+        "evidence": safe_evidence, "version": row.version,
+        "first_seen_at": row.first_seen_at.isoformat() if row.first_seen_at else None,
+        "last_seen_at": row.last_seen_at.isoformat() if row.last_seen_at else None,
+    }
+
+
+def _proposal_payload(row, experiments: list | None = None) -> dict:
+    return {
+        "id": row.id, "pattern_id": row.pattern_id,
+        "proposal_type": row.proposal_type, "title": row.title,
+        "hypothesis": row.hypothesis, "status": row.status,
+        "version": row.version, "candidate_config": row.candidate_config or {},
+        "expected_impact": row.expected_impact or {},
+        "validation_summary": row.validation_summary,
+        "ready_artifact": row.ready_artifact,
+        "decision_reason": row.decision_reason,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "experiments": [
+            {
+                "id": item.id, "status": item.status,
+                "metrics": item.metrics or {},
+                "failure_reason": item.failure_reason,
+                "benchmark_report_hash": item.benchmark_report_hash,
+                "created_at": item.created_at.isoformat() if item.created_at else None,
+                "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+            }
+            for item in (experiments or [])
+        ],
+    }
+
+
+@router.get("/quality-learning/summary")
+def quality_learning_summary(
+    days: int = Query(90, ge=1, le=3650),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from correction_learning import model_readiness, public_observation_summary
+    from database import (
+        CorrectionObservation, QualityFixProposal, QualityPattern,
+    )
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = db.query(CorrectionObservation).filter(
+        CorrectionObservation.created_at >= since,
+    ).all()
+    proposal_counts = dict(db.query(
+        QualityFixProposal.status, func.count(QualityFixProposal.id),
+    ).group_by(QualityFixProposal.status).all())
+    pattern_counts = dict(db.query(
+        QualityPattern.status, func.count(QualityPattern.id),
+    ).group_by(QualityPattern.status).all())
+    return {
+        "period_days": days,
+        "observations": public_observation_summary(rows),
+        "patterns": pattern_counts, "proposals": proposal_counts,
+        "model_readiness": model_readiness(db),
+        "privacy": {
+            "raw_lyrics_exposed": False, "raw_audio_exposed": False,
+            "minimum_pattern_jobs": 10, "minimum_pattern_tenants": 3,
+            "minimum_pattern_artists": 3,
+        },
+    }
+
+
+@router.get("/quality-learning/patterns")
+def quality_learning_patterns(
+    status: str = Query(""),
+    limit: int = Query(100, ge=1, le=500),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from database import QualityPattern
+    query = db.query(QualityPattern)
+    if status:
+        query = query.filter(QualityPattern.status == status)
+    rows = query.order_by(
+        QualityPattern.impact_seconds.desc(), QualityPattern.support_jobs.desc(),
+    ).limit(limit).all()
+    return {"patterns": [_pattern_payload(row) for row in rows]}
+
+
+@router.get("/quality-learning/patterns/{pattern_id}")
+def quality_learning_pattern_detail(
+    pattern_id: str,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from database import QualityFixProposal, QualityPattern
+    row = db.query(QualityPattern).filter(QualityPattern.id == pattern_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Pattern not found")
+    proposals = db.query(QualityFixProposal).filter(
+        QualityFixProposal.pattern_id == pattern_id,
+    ).order_by(QualityFixProposal.created_at.desc()).all()
+    return {
+        **_pattern_payload(row),
+        "proposals": [_proposal_payload(proposal) for proposal in proposals],
+    }
+
+
+@router.get("/quality-learning/proposals")
+def quality_learning_proposals(
+    status: str = Query(""),
+    limit: int = Query(100, ge=1, le=500),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from database import QualityExperimentRun, QualityFixProposal
+    query = db.query(QualityFixProposal)
+    if status:
+        query = query.filter(QualityFixProposal.status == status)
+    proposals = query.order_by(QualityFixProposal.updated_at.desc()).limit(limit).all()
+    proposal_ids = [row.id for row in proposals]
+    runs = db.query(QualityExperimentRun).filter(
+        QualityExperimentRun.proposal_id.in_(proposal_ids),
+    ).order_by(QualityExperimentRun.created_at.desc()).all() if proposal_ids else []
+    by_proposal: dict[str, list] = {}
+    for run in runs:
+        by_proposal.setdefault(run.proposal_id, []).append(run)
+    return {
+        "proposals": [
+            _proposal_payload(row, by_proposal.get(row.id, [])) for row in proposals
+        ],
+    }
+
+
+def _proposal_for_action(db: Session, proposal_id: str,
+                         body: QualityLearningActionRequest):
+    from database import QualityFixProposal
+    # Serialize the same idempotency key across proposals before scanning or
+    # mutating. The DB unique index remains the last line of defense; this lock
+    # turns a concurrent collision into a deterministic 409 instead of a 500.
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        lock_id = int.from_bytes(
+            hashlib.sha256(body.idempotency_key.encode("utf-8")).digest()[:8],
+            "big", signed=True,
+        )
+        db.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": lock_id})
+    historical = db.query(QualityFixProposal).all()
+    for candidate in historical:
+        keys = candidate.action_idempotency_keys or []
+        if body.idempotency_key in keys:
+            if candidate.id != proposal_id:
+                raise HTTPException(status_code=409, detail="Idempotency key already used")
+            return candidate, True
+    reused = db.query(QualityFixProposal).filter(
+        QualityFixProposal.last_idempotency_key == body.idempotency_key,
+    ).first()
+    if reused:
+        if reused.id != proposal_id:
+            raise HTTPException(status_code=409, detail="Idempotency key already used")
+        return reused, True
+    proposal = db.query(QualityFixProposal).filter(
+        QualityFixProposal.id == proposal_id,
+    ).with_for_update().first()
+    if not proposal:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    if body.idempotency_key in (proposal.action_idempotency_keys or []):
+        return proposal, True
+    if int(proposal.version or 0) != body.expected_version:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "stale_proposal", "current_version": proposal.version},
+        )
+    return proposal, False
+
+
+def _remember_proposal_action(proposal, idempotency_key: str) -> None:
+    keys = list(proposal.action_idempotency_keys or [])
+    if idempotency_key not in keys:
+        keys.append(idempotency_key)
+    proposal.action_idempotency_keys = keys[-100:]
+    proposal.last_idempotency_key = idempotency_key
+
+
+@router.post("/quality-learning/proposals/{proposal_id}/validate")
+def validate_quality_learning_proposal(
+    proposal_id: str,
+    body: QualityLearningActionRequest,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from correction_learning import sha256_json, validate_proposal_config
+    from database import AuditLog, QualityExperimentRun, QualityPattern
+    _require_quality_learning_flag("QUALITY_LEARNING_PROPOSALS_ENABLED")
+    _require_quality_learning_flag("QUALITY_LEARNING_ABLATIONS_ENABLED")
+    proposal, reused = _proposal_for_action(db, proposal_id, body)
+    if reused:
+        return _proposal_payload(proposal)
+    if proposal.status not in {"draft", "failed", "blocked"}:
+        raise HTTPException(status_code=409, detail="Proposal cannot be validated in this state")
+    pattern = db.query(QualityPattern).filter(
+        QualityPattern.id == proposal.pattern_id,
+    ).with_for_update().one()
+    if pattern.status != "correlated":
+        raise HTTPException(status_code=409, detail="Source pattern is no longer qualified")
+    try:
+        config = validate_proposal_config(proposal.candidate_config or {})
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    experiment = QualityExperimentRun(
+        id=str(uuid.uuid4()), proposal_id=proposal.id, status="queued",
+        candidate_config_hash=sha256_json(config), metrics={"render": False},
+        created_at=datetime.now(timezone.utc),
+    )
+    proposal.status = "validating"
+    proposal.decision_reason = body.reason
+    _remember_proposal_action(proposal, body.idempotency_key)
+    proposal.version += 1
+    proposal.updated_at = datetime.now(timezone.utc)
+    db.add(experiment)
+    db.add(AuditLog(
+        user_id=admin.get("id"), action="quality_learning.proposal.validate",
+        detail={
+            "proposal_id": proposal.id, "experiment_id": experiment.id,
+            "reason": body.reason, "candidate_config_sha256": experiment.candidate_config_hash,
+            "render": False, "idempotency_key": body.idempotency_key,
+        },
+    ))
+    db.commit()
+    try:
+        from queue_jobs import enqueue_quality_proposal_validation
+        enqueue_quality_proposal_validation(proposal.id, experiment.id)
+    except Exception as exc:
+        proposal.status = "blocked"
+        proposal.validation_summary = {"passed": False, "reason": str(exc)[:500]}
+        experiment.status = "blocked"
+        experiment.failure_reason = str(exc)[:500]
+        experiment.completed_at = datetime.now(timezone.utc)
+        proposal.version += 1
+        db.add(AuditLog(
+            user_id=admin.get("id"),
+            action="quality_learning.validation.enqueue_blocked",
+            detail={
+                "proposal_id": proposal.id,
+                "experiment_id": experiment.id,
+                "reason": str(exc)[:500],
+            },
+        ))
+        db.commit()
+        raise HTTPException(status_code=503, detail="Validation queue unavailable") from exc
+    return _proposal_payload(proposal, [experiment])
+
+
+@router.post("/quality-learning/proposals/{proposal_id}/approve")
+def approve_quality_learning_proposal(
+    proposal_id: str,
+    body: QualityLearningActionRequest,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from correction_learning import sha256_json
+    from database import AuditLog, QualityPattern
+    from evidence_attestation import sign_artifact
+    _require_quality_learning_flag("QUALITY_LEARNING_PROPOSALS_ENABLED")
+    proposal, reused = _proposal_for_action(db, proposal_id, body)
+    if reused:
+        return _proposal_payload(proposal)
+    if proposal.status != "ready" or not (proposal.validation_summary or {}).get("passed"):
+        raise HTTPException(status_code=409, detail="Only a passed, ready proposal can be approved")
+    pattern = db.query(QualityPattern).filter(
+        QualityPattern.id == proposal.pattern_id,
+    ).with_for_update().one()
+    if pattern.status != "confirmed":
+        raise HTTPException(status_code=409, detail="Source pattern is no longer qualified")
+    private_key = os.environ.get("QUALITY_LEARNING_SIGNING_PRIVATE_KEY", "").strip()
+    key_id = os.environ.get("QUALITY_LEARNING_SIGNING_KEY_ID", "").strip()
+    if not private_key or not key_id:
+        raise HTTPException(status_code=503, detail="Quality learning signer unavailable")
+    artifact = sign_artifact({
+        "schema": "quality-fix-ready-v1", "proposal_id": proposal.id,
+        "pattern_id": proposal.pattern_id,
+        "candidate_config_sha256": sha256_json(proposal.candidate_config or {}),
+        "benchmark_report_sha256": (
+            proposal.validation_summary or {}
+        ).get("benchmark_report_hash"),
+        "status": "ready_for_implementation", "runtime_mutated": False,
+        "approved_at": datetime.now(timezone.utc).isoformat(),
+        "approved_by": str(admin.get("id")),
+    }, private_key, key_id)
+    proposal.status = "approved"
+    proposal.ready_artifact = artifact
+    proposal.approved_by = admin.get("id")
+    proposal.decision_reason = body.reason
+    _remember_proposal_action(proposal, body.idempotency_key)
+    proposal.version += 1
+    proposal.updated_at = datetime.now(timezone.utc)
+    db.add(AuditLog(
+        user_id=admin.get("id"), action="quality_learning.proposal.approve",
+        detail={
+            "proposal_id": proposal.id, "reason": body.reason,
+            "artifact_sha256": artifact["attestation"]["payload_sha256"],
+            "runtime_mutated": False, "idempotency_key": body.idempotency_key,
+        },
+    ))
+    db.commit()
+    return _proposal_payload(proposal)
+
+
+@router.post("/quality-learning/proposals/{proposal_id}/reject")
+def reject_quality_learning_proposal(
+    proposal_id: str,
+    body: QualityLearningActionRequest,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from database import AuditLog
+    proposal, reused = _proposal_for_action(db, proposal_id, body)
+    if reused:
+        return _proposal_payload(proposal)
+    if proposal.status in {"approved", "rejected", "superseded"}:
+        raise HTTPException(status_code=409, detail="Proposal is already terminal")
+    proposal.status = "rejected"
+    proposal.decision_reason = body.reason
+    _remember_proposal_action(proposal, body.idempotency_key)
+    proposal.version += 1
+    proposal.updated_at = datetime.now(timezone.utc)
+    db.add(AuditLog(
+        user_id=admin.get("id"), action="quality_learning.proposal.reject",
+        detail={
+            "proposal_id": proposal.id, "reason": body.reason,
+            "idempotency_key": body.idempotency_key,
+        },
+    ))
+    db.commit()
+    return _proposal_payload(proposal)
 
 
 @router.get("/cost/business")

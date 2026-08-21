@@ -132,3 +132,16 @@ def test_health_endpoint_returns_503_for_down_status(monkeypatch, client):
     )
     r = client.get("/health")
     assert r.status_code == 503
+
+
+def test_staging_without_r2_is_not_ready(monkeypatch):
+    import observability as obs
+    import storage
+
+    monkeypatch.setattr(obs, "ENV", "staging")
+    monkeypatch.setattr(obs, "_PROCESS_START_TS", time.monotonic() - 600)
+    monkeypatch.setattr(storage, "is_enabled", lambda: False)
+    snap = obs.health_snapshot()
+    assert snap["r2"] == "not_configured"
+    assert snap["status"] == "down"
+    assert snap["down_reason"] == "r2_not_configured"

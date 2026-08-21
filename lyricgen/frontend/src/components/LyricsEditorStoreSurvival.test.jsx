@@ -141,6 +141,7 @@ describe("LyricsEditor — el estado editado sobrevive unmount/remount (wizard 6
 
     // Cambiar a la vista avanzada y restaurar desde el menú contextual.
     fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Timeline avanzada" }));
     fireEvent.click(screen.getByRole("button", { name: "Más acciones" }));
     fireEvent.click(screen.getByText("Restaurar tiempos originales"));
 

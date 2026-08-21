@@ -22,7 +22,7 @@ def test_ci_runs_for_stacked_pull_requests():
 def test_railway_uses_one_config_per_service():
     assert not (REPO / "railway.toml").exists()
     assert {p.name for p in (REPO / "railway").glob("*.toml")} == {
-        "api.toml", "worker.toml", "short-worker.toml",
+        "api.toml", "worker.toml", "short-worker.toml", "quality-worker.toml",
     }
 
 
@@ -43,10 +43,18 @@ def test_api_deployment_contract():
 
 def test_worker_deployment_contracts_share_image_without_http_healthcheck():
     expected_replicas = {"worker.toml": 7, "short-worker.toml": 3}
+    expected_queues = {
+        "worker.toml": "enterprise,default,canary",
+        "short-worker.toml": "transcription,bg_preview",
+    }
     for name, replicas in expected_replicas.items():
         cfg = _config(name)
         assert cfg["build"]["dockerfilePath"] == "Dockerfile.worker"
-        assert cfg["deploy"]["startCommand"] == "python backend/worker.py"
+        expected_start = (
+            "sh -c 'python backend/scripts/require_worker_schema.py "
+            f"&& exec env QUEUES={expected_queues[name]} python backend/worker.py'"
+        )
+        assert cfg["deploy"]["startCommand"] == expected_start
         assert cfg["deploy"]["numReplicas"] == replicas
         assert cfg["deploy"]["drainingSeconds"] == 1200
         assert "healthcheckPath" not in cfg["deploy"]
@@ -141,6 +149,37 @@ def test_staging_strict_gate_can_be_disabled_only_explicitly(monkeypatch):
     strict, expected = _fleet_readiness_config("staging")
     assert strict is False
     assert expected == {"worker": 7, "short_worker": 3}
+
+
+def test_quality_producer_requires_an_isolated_quality_consumer(monkeypatch):
+    from observability import _fleet_readiness_config, worker_fleet_coherence
+
+    monkeypatch.setenv("TRANSCRIPTION_QUALITY_QUEUE_ENABLED", "1")
+    monkeypatch.delenv("EXPECTED_QUALITY_WORKER_REPLICAS", raising=False)
+    strict, expected = _fleet_readiness_config("staging")
+    assert strict is True
+    assert expected["quality_worker"] == 1
+
+    workers = [
+        {"service": "Worker", "release": "sha", "rq_payload_version": 2,
+         "queues": ["enterprise", "default"]},
+        {"service": "ShortWorker", "release": "sha", "rq_payload_version": 2,
+         "queues": ["transcription", "bg_preview"]},
+    ]
+    missing = worker_fleet_coherence(workers, "sha", 2, expected)
+    assert missing["coherent"] is False
+    assert missing["missing_queues"] == ["transcription_quality"]
+    assert missing["under_replicated"]["quality_worker"]["actual"] == 0
+
+    workers.append({
+        "service": "QualityWorker", "release": "sha", "rq_payload_version": 2,
+        "queues": ["transcription_quality"],
+    })
+    assert worker_fleet_coherence(workers, "sha", 2, expected)["coherent"] is False
+    # This compact fixture has one render and short worker, while staging's
+    # normal defaults require 7+3; isolate the queue contract itself.
+    expected = {"worker": 1, "short_worker": 1, "quality_worker": 1}
+    assert worker_fleet_coherence(workers, "sha", 2, expected)["coherent"] is True
 
 
 def test_frontend_only_deploy_no_marca_la_flota_como_incoherente():

@@ -5,11 +5,15 @@ import { describe, expect, it } from "vitest";
 describe("JobDetail media frame sizing contract", () => {
   it("uses intrinsic landscape/short ratios instead of full-width max-height", () => {
     const component = fs.readFileSync(path.resolve("src/components/JobDetail.jsx"), "utf8");
+    const player = fs.readFileSync(path.resolve("src/components/ReviewVideoPlayer.jsx"), "utf8");
     const css = fs.readFileSync(path.resolve("src/index.css"), "utf8");
 
     expect(component).toContain("job-detail-media-frame--landscape");
     expect(component).toContain("job-detail-media-frame--short");
-    expect(component).toContain('className="job-detail-media-video w-full h-full block object-contain');
+    expect(component).toContain("<ReviewVideoPlayer");
+    expect(player).toContain('className="job-detail-media-video w-full h-full block object-contain');
+    const videoTag = player.match(/<video[\s\S]*?\/>/)?.[0] || "";
+    expect(videoTag).not.toMatch(/\bcontrols(?:=|\s|>)/);
     expect(component).toContain('imageFit="contain"');
     expect(component).not.toContain('activeTab === "short" ? "max-h-[600px]');
     expect(css).toMatch(/job-detail-media-frame--landscape[\s\S]*aspect-ratio:\s*16\s*\/\s*9/);

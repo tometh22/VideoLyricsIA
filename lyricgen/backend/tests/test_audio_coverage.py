@@ -169,6 +169,41 @@ def test_mismatch_no_acusa_sin_evidencia():
     assert text_mismatches(seg, words) == []
 
 
+def test_structural_lexical_anchor_cannot_bypass_vocalization_mismatch():
+    from audio_coverage import text_mismatches
+    words = _wtxt("Real Real Real", 60.9, paso=1.2)
+    seg = [{
+        "start": 60.9,
+        "end": 65.1,
+        "text": "Real uoo uou",
+        "structural_hybrid": True,
+        "structural_repair": True,
+        "consensus_sources": [
+            "gemini_audio_cardinality",
+            "ctc_vocal_stem",
+            "ctc_original_mix",
+            "acoustic_topology_stem_mix",
+        ],
+    }]
+    mismatches = text_mismatches(seg, words)
+    assert len(mismatches) == 1
+    assert mismatches[0]["index"] == 0
+
+
+def test_mismatch_does_not_trust_partial_structural_provenance():
+    from audio_coverage import text_mismatches
+    words = _wtxt("Real Real Real", 60.9, paso=1.2)
+    seg = [{
+        "start": 60.9,
+        "end": 65.1,
+        "text": "Real uoo uou",
+        "structural_hybrid": True,
+        "structural_repair": True,
+        "consensus_sources": ["ctc_vocal_stem"],
+    }]
+    assert len(text_mismatches(seg, words)) == 1
+
+
 def test_summarize_incluye_text_mismatches():
     from audio_coverage import summarize
     words = _wtxt("estuve rodando por ahi sin parar", 10.0)
@@ -227,6 +262,18 @@ def test_voiced_gap_cola_final(monkeypatch, tmp_path):
     _mock_vad(monkeypatch, [(205.0, 260.0)])
     got = voiced_gaps([_seg(10, 200)], str(stem), audio_duration=278.0)
     assert len(got) == 1 and got[0]["voiced_s"] > 50
+
+
+def test_voiced_gap_inicial_solo_cuenta_con_live_hint(monkeypatch, tmp_path):
+    from audio_coverage import voiced_gaps
+    stem = tmp_path / "s.wav"; stem.write_bytes(b"x")
+    _mock_vad(monkeypatch, [(2.0, 11.0)])
+    segments = [_seg(13.0, 17.0), _seg(20.0, 24.0)]
+    assert voiced_gaps(segments, str(stem), audio_duration=30.0) == []
+    got = voiced_gaps(
+        segments, str(stem), audio_duration=30.0, include_leading=True,
+    )
+    assert got and got[0]["start"] == 0.0
 
 
 def test_summarize_incluye_voiced_gap(monkeypatch, tmp_path):

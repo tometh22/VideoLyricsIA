@@ -105,6 +105,51 @@ describe("LyricsTimeline", () => {
     expect(newEnd).toBeGreaterThan(11);
   });
 
+  it("does not modify neighbouring lines when a packed line is dragged in safe mode", () => {
+    const props = setup({
+      segments: [
+        { _id: "a", start: 0, end: 1, text: "primera" },
+        { _id: "b", start: 1.05, end: 2, text: "segunda" },
+        { _id: "c", start: 2.05, end: 3, text: "tercera" },
+      ],
+      duration: 10,
+    });
+    const block = screen.getAllByTestId("timeline-segment")[1];
+    const body = block.querySelector('[data-testid="timeline-segment-body"]');
+    fireEvent.pointerDown(body, { clientX: 100, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(body, { clientX: 124, pointerId: 1 });
+    fireEvent.pointerUp(body, { clientX: 124, pointerId: 1 });
+
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+    expect(props.onTimingChangeBatch).not.toHaveBeenCalled();
+    expect(screen.getByTestId("timeline-limit-feedback")).toHaveTextContent("No hay espacio para mover sólo esta línea");
+  });
+
+  it("moves packed neighbours only after the operator explicitly enables chain mode", () => {
+    const props = setup({
+      segments: [
+        { _id: "a", start: 0, end: 1, text: "primera" },
+        { _id: "b", start: 1.05, end: 2, text: "segunda" },
+        { _id: "c", start: 2.05, end: 3, text: "tercera" },
+      ],
+      duration: 10,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Más acciones" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: /Mover en cadena/ }));
+
+    const block = screen.getAllByTestId("timeline-segment")[1];
+    const body = block.querySelector('[data-testid="timeline-segment-body"]');
+    fireEvent.pointerDown(body, { clientX: 100, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(body, { clientX: 124, pointerId: 1 });
+    fireEvent.pointerUp(body, { clientX: 124, pointerId: 1 });
+
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+    expect(props.onTimingChangeBatch).toHaveBeenCalledWith([
+      { id: "b", start: 1.55, end: 2.5 },
+      { id: "c", start: 2.55, end: 3.5 },
+    ], expect.objectContaining({ operation: "move" }));
+  });
+
   it("Cmd/Ctrl-click toggles lines and dragging the group commits one batch", () => {
     const props = setup();
     const [first, second] = screen.getAllByTestId("timeline-segment");
@@ -200,9 +245,9 @@ describe("LyricsTimeline", () => {
     expect(parseFloat(endEdge.style.right)).toBeLessThan(-22);
 
     fireEvent.pointerDown(body, { clientX: 100, pointerId: 1, button: 0 });
-    fireEvent.pointerMove(body, { clientX: 124, pointerId: 1 });
-    fireEvent.pointerUp(body, { clientX: 124, pointerId: 1 });
-    expect(props.onTimingChange).toHaveBeenCalledWith("short", expect.any(Number), expect.any(Number));
+    fireEvent.pointerMove(body, { clientX: 119, pointerId: 1 });
+    fireEvent.pointerUp(body, { clientX: 119, pointerId: 1 });
+    expect(props.onTimingChange).toHaveBeenCalledWith("short", expect.any(Number), expect.any(Number), expect.objectContaining({ operation: "move" }));
   });
 
   it("shows selection instructions and distinct move/resize cursors", () => {
@@ -226,6 +271,27 @@ describe("LyricsTimeline", () => {
     expect(screen.getByText("Sonando")).toBeInTheDocument();
   });
 
+  it("moves playheads with compositor transforms instead of layout left", () => {
+    setup({ activeId: 1, currentTime: 2.5 });
+    const main = screen.getByTestId("timeline-playhead");
+    const active = screen.getByTestId("timeline-active-playhead");
+    expect(main.style.left).toBe("");
+    expect(active.style.left).toBe("");
+    expect(main.style.transform).toBe("translate3d(120px, 0, 0)");
+    expect(active.style.transform).toBe("translate3d(120px, 0, 0)");
+  });
+
+  it("does not scroll the outer editor when the active lyric changes", () => {
+    const scrollIntoView = vi.fn();
+    const original = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scrollIntoView;
+    const props = { segments: SEGS, duration: 60, currentTime: 5, isPlaying: true, activeId: 0 };
+    const { rerender } = render(<LyricsTimeline {...props} />);
+    rerender(<LyricsTimeline {...props} currentTime={10} activeId={1} />);
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    HTMLElement.prototype.scrollIntoView = original;
+  });
+
   it("resizes timing from either horizontal edge", () => {
     const props = setup();
     const block = screen.getAllByTestId("timeline-segment")[1];
@@ -233,8 +299,100 @@ describe("LyricsTimeline", () => {
     fireEvent.pointerDown(edge, { clientX: 1000, pointerId: 1, button: 0 });
     fireEvent.pointerMove(edge, { clientX: 1080, pointerId: 1 });
     fireEvent.pointerUp(edge, { clientX: 1080, pointerId: 1 });
-    expect(props.onTimingChange).toHaveBeenCalledWith(1, 10, expect.any(Number));
+    expect(props.onTimingChange).toHaveBeenCalledWith(1, 10, expect.any(Number), expect.objectContaining({ operation: "ripple_resize" }));
     expect(props.onTimingChange.mock.calls[0][2]).toBeGreaterThan(11);
+  });
+
+  it("uses Alt for fine edge adjustment", () => {
+    const props = setup();
+    const block = screen.getAllByTestId("timeline-segment")[1];
+    const edge = block.querySelector('[data-testid="timeline-edge-end"]');
+    fireEvent.pointerDown(edge, { clientX: 1000, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(edge, { clientX: 1048, pointerId: 1, altKey: true });
+    fireEvent.pointerUp(edge, { clientX: 1048, pointerId: 1, altKey: true });
+    const [, start, end] = props.onTimingChange.mock.calls[0];
+    expect(start).toBe(10);
+    expect(end).toBeCloseTo(11.1, 4);
+  });
+
+  it("ripple-trims a packed neighbour by default without shortening it", () => {
+    const props = setup({
+      segments: [
+        { _id: "a", start: 0, end: 2, text: "línea actual" },
+        { _id: "b", start: 2.05, end: 3.5, text: "línea siguiente" },
+      ],
+    });
+    const block = screen.getAllByTestId("timeline-segment")[0];
+    const edge = block.querySelector('[data-testid="timeline-edge-end"]');
+
+    fireEvent.pointerDown(edge, { clientX: 100, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(edge, { clientX: 124, pointerId: 1 });
+    fireEvent.pointerUp(edge, { clientX: 124, pointerId: 1 });
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+    expect(props.onTimingChangeBatch).toHaveBeenCalledWith([
+      { id: "a", start: 0, end: 2.5 },
+      { id: "b", start: 2.55, end: 4 },
+    ], expect.objectContaining({ operation: "ripple_resize" }));
+  });
+
+  it("keeps the right edge safe when the operator chooses Solo esta línea", () => {
+    const props = setup({
+      segments: [
+        { _id: "a", start: 0, end: 2, text: "línea actual" },
+        { _id: "b", start: 2.05, end: 3.5, text: "línea siguiente" },
+      ],
+    });
+    fireEvent.click(screen.getAllByRole("button", { name: "Solo esta línea" })[0]);
+    const block = screen.getAllByTestId("timeline-segment")[0];
+    const edge = block.querySelector('[data-testid="timeline-edge-end"]');
+
+    fireEvent.pointerDown(edge, { clientX: 100, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(edge, { clientX: 124, pointerId: 1 });
+    fireEvent.pointerUp(edge, { clientX: 124, pointerId: 1 });
+
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+    expect(props.onTimingChangeBatch).not.toHaveBeenCalled();
+    expect(screen.getByTestId("timeline-limit-feedback")).toHaveTextContent("Para no modificarla, el ajuste se detuvo");
+  });
+
+  it("keeps the left edge protected even while right-edge ripple is the default", () => {
+    const props = setup({
+      segments: [
+        { _id: "a", start: 0, end: 2, text: "línea anterior" },
+        { _id: "b", start: 2.05, end: 4, text: "línea actual" },
+      ],
+    });
+    const block = screen.getAllByTestId("timeline-segment")[1];
+    const edge = block.querySelector('[data-testid="timeline-edge-start"]');
+
+    fireEvent.pointerDown(edge, { clientX: 100, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(edge, { clientX: 76, pointerId: 1 });
+    fireEvent.pointerUp(edge, { clientX: 76, pointerId: 1 });
+
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+    expect(props.onTimingChangeBatch).not.toHaveBeenCalled();
+    expect(screen.getByTestId("timeline-limit-feedback")).toHaveTextContent("Para no modificarla, el ajuste se detuvo");
+  });
+
+  it("cancels a visible ripple preview without committing a partial batch", () => {
+    const props = setup({
+      segments: [
+        { _id: "a", start: 0, end: 2, text: "línea actual" },
+        { _id: "b", start: 2.05, end: 3.5, text: "línea siguiente" },
+      ],
+    });
+    const block = screen.getAllByTestId("timeline-segment")[0];
+    const edge = block.querySelector('[data-testid="timeline-edge-end"]');
+
+    fireEvent.pointerDown(edge, { clientX: 100, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(edge, { clientX: 124, pointerId: 1 });
+    const previewNext = screen.getAllByTestId("timeline-segment")[1];
+    expect(parseFloat(previewNext.style.left)).toBeCloseTo(2.55 * 48, 4);
+    fireEvent.pointerCancel(edge, { clientX: 124, pointerId: 1 });
+
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+    expect(props.onTimingChangeBatch).not.toHaveBeenCalled();
+    expect(props.onDragStart).not.toHaveBeenCalled();
   });
 
   it("edits line text inline", () => {
@@ -250,8 +408,31 @@ describe("LyricsTimeline", () => {
   it("renders waveform only when waveform data exists", () => {
     const { container, rerender } = render(<LyricsTimeline segments={SEGS} duration={60} currentTime={5} onSeek={vi.fn()} onReset={vi.fn()} />);
     expect(container.querySelector("canvas")).not.toBeInTheDocument();
+    expect(screen.getByText(/Guía visual no disponible/i)).toBeInTheDocument();
+    rerender(<LyricsTimeline segments={SEGS} duration={60} currentTime={5} waveformLoading onSeek={vi.fn()} onReset={vi.fn()} />);
+    expect(screen.getByText(/Preparando guía de audio/i)).toBeInTheDocument();
     rerender(<LyricsTimeline segments={SEGS} duration={60} currentTime={5} waveform={{ peaks: [0.1, 0.9] }} onSeek={vi.fn()} onReset={vi.fn()} />);
     expect(container.querySelector("canvas")).toBeInTheDocument();
+    expect(screen.getByText("Audio de la canción")).toBeInTheDocument();
+  });
+
+  it("mantiene separadas las barras de envelopes densos", () => {
+    const fillRect = vi.fn();
+    const contextSpy = vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+      setTransform: vi.fn(), clearRect: vi.fn(), fillRect, fillStyle: "",
+    });
+    render(<LyricsTimeline
+      segments={SEGS}
+      duration={60}
+      currentTime={5}
+      waveform={{ peaks: Array.from({ length: 10_000 }, (_, index) => (index % 10) / 10) }}
+      onSeek={vi.fn()}
+      onReset={vi.fn()}
+    />);
+
+    expect(fillRect).toHaveBeenCalled();
+    expect(fillRect.mock.calls.every(([, , width]) => width >= 1 && width <= 3)).toBe(true);
+    contextSpy.mockRestore();
   });
 
   it("shows save status, restore action and zoom controls", () => {
@@ -264,7 +445,7 @@ describe("LyricsTimeline", () => {
     expect(props.onReset).toHaveBeenCalledTimes(1);
   });
 
-  it("auto-follows the playhead once and does not restart a pending smooth scroll", () => {
+  it("auto-follows the playhead once without issuing near-duplicate scrolls", () => {
     const props = {
       segments: SEGS,
       duration: 60,
@@ -280,5 +461,50 @@ describe("LyricsTimeline", () => {
     rerender(<LyricsTimeline {...props} currentTime={5.1} />);
     rerender(<LyricsTimeline {...props} currentTime={5.2} />);
     expect(scroll.scrollTo).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("zonas dudosas sobre la forma de onda", () => {
+  // La timeline —donde el operador corrige el timing— no recibía NINGUNA señal
+  // de calidad, así que para encontrar el punto a corregir sólo podía clickear
+  // y escuchar: 2,9 seeks medidos por cada corrección. El backend ya calcula
+  // `unsafe_windows`; acá se pintan.
+  it("pinta una banda por cada ventana dudosa", () => {
+    setup({
+      unsafeWindows: [
+        { id: "w1", start: 8, end: 12, reasons: ["low_ctc_timing_confidence"] },
+        { id: "w2", start: 39, end: 42, reasons: ["voiced_gap"] },
+      ],
+    });
+    const bands = screen.getAllByTestId("timeline-unsafe-window");
+    expect(bands).toHaveLength(2);
+    expect(bands[0]).toHaveClass("h-1.5");
+    expect(bands[0]).not.toHaveClass("inset-y-0");
+  });
+
+  it("no pinta nada cuando no hay ventanas (comportamiento previo intacto)", () => {
+    setup();
+    expect(screen.queryAllByTestId("timeline-unsafe-window")).toHaveLength(0);
+  });
+
+  it("descarta ventanas con tiempos inválidos en vez de romper el render", () => {
+    setup({
+      unsafeWindows: [
+        { id: "ok", start: 5, end: 9 },
+        { id: "invertida", start: 20, end: 20 },
+        { id: "no-numerica", start: "x", end: "y" },
+      ],
+    });
+    expect(screen.getAllByTestId("timeline-unsafe-window")).toHaveLength(1);
+  });
+
+  it("clampea la banda contra la duración (sin scroll fantasma)", () => {
+    // live_structural_disagreement genera ventanas que terminan después del
+    // audio; sin clamp la banda estiraba el track.
+    setup({ duration: 60, unsafeWindows: [{ id: "w", start: 55, end: 200 }] });
+    const band = screen.getByTestId("timeline-unsafe-window");
+    const width = parseFloat(band.style.width);
+    expect(width).toBeGreaterThan(0);
+    expect(width).toBeLessThan(60 * 48); // no puede exceder el track completo
   });
 });

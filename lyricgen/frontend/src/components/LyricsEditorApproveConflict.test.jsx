@@ -8,9 +8,9 @@
  * hacía `return` en silencio → el operador clickeaba una y otra vez sin
  * feedback hasta que el polling re-sincronizaba la revisión.
  *
- * Contrato Editor 2.0: un conflicto nunca se auto-resuelve ni pisa la
- * revisión del equipo. La aprobación queda bloqueada y el borrador local
- * permanece disponible hasta una decisión explícita.
+ * Contrato actual: un cliente legacy no tiene base/remoto para un merge de
+ * tres vías. Por eso un 409 queda local y jamás se reintenta enviando el
+ * mismo snapshot sobre la revisión nueva.
  */
 import { render, screen, cleanup, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -47,24 +47,30 @@ afterEach(() => {
 });
 
 describe("Aprobar y generar — conflicto seguro", () => {
-  it("un 409 bloquea aprobación y nunca intenta overwrite automático", async () => {
-    const onPersistSegments = vi.fn().mockResolvedValue({ ok: false, reason: "stale-revision" });
+  it("un 409 legacy no se reintenta ni aprueba con un snapshot inseguro", async () => {
+    const onPersistSegments = vi
+      .fn()
+      .mockResolvedValue({
+        ok: false,
+        reason: "stale-revision",
+        currentRevision: 1,
+      });
     const onApprove = vi.fn();
     render(<LyricsEditor {...baseProps({ onPersistSegments, onApprove })} />);
 
     fireEvent.click(screen.getByRole("button", { name: /Aprobar y generar/i }));
 
-    await waitFor(() => expect(screen.getByText("Conflicto: cambios no guardados")).toBeInTheDocument());
+    await waitFor(() => expect(toastSpy).toHaveBeenCalled());
     expect(onApprove).not.toHaveBeenCalled();
     expect(onPersistSegments).toHaveBeenCalledTimes(1);
-    expect(onPersistSegments.mock.calls[0][2]).not.toMatchObject({ resolveConflict: true });
-    expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeDisabled();
+    expect(onPersistSegments.mock.calls[0][2]).toMatchObject({ baseRevision: 0 });
+    expect(screen.getByRole("button", { name: /Aprobar y generar/i })).not.toBeDisabled();
   });
 
-  it("si el conflicto persiste, avisa con toast y NO aprueba en silencio", async () => {
+  it("si el 409 persiste, avisa con toast informativo sin mostrar conflicto", async () => {
     const onPersistSegments = vi
       .fn()
-      .mockResolvedValue({ ok: false, reason: "stale-revision" });
+      .mockResolvedValue({ ok: false, reason: "stale-revision", currentRevision: 1 });
     const onApprove = vi.fn();
     render(<LyricsEditor {...baseProps({ onPersistSegments, onApprove })} />);
 
@@ -72,9 +78,11 @@ describe("Aprobar y generar — conflicto seguro", () => {
 
     await waitFor(() =>
       expect(toastSpy).toHaveBeenCalledWith(
-        expect.objectContaining({ tone: "error" }),
+        expect.objectContaining({ tone: "info" }),
       ),
     );
     expect(onApprove).not.toHaveBeenCalled();
+    expect(screen.queryByText("Conflicto: cambios no guardados")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Aprobar y generar/i })).not.toBeDisabled();
   });
 });

@@ -22,9 +22,11 @@ Cost accounting rules (2026-08 audit — see docs/COST_TRACKING.md):
   ($163 modeled vs $199.53 billed, the gap being staging + real Imagen /
   Gemini token pricing). `billing_sources.py` pulls the real numbers.
 """
+from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -40,17 +42,51 @@ logger = logging.getLogger("genly.provenance")
 # Cost rates — single source of truth for the cost dashboard
 # ---------------------------------------------------------------------------
 
-# Per-call estimates in USD. Veo costs assume an 8s clip generation per call
-# (the palindrome-loop pattern used by this pipeline). Update when pricing
-# changes or when the per-call generation length changes.
+# Veo bills PER SECOND of generated video, so the per-call cost tracks the
+# native clip length the pipeline requests. That length is configurable via
+# VEO_CLIP_SECONDS (pipeline forwards it to Veo as durationSeconds); keep this
+# table in sync so the dashboard reflects the real per-call cost instead of a
+# hardcoded 8s assumption. Default 8 preserves the historical numbers.
+try:
+    _VEO_CLIP_SECONDS = float(os.environ.get("VEO_CLIP_SECONDS", "8") or "8")
+except ValueError:
+    _VEO_CLIP_SECONDS = 8.0
+if _VEO_CLIP_SECONDS <= 0:
+    _VEO_CLIP_SECONDS = 8.0
+
+# USD per second of generated video, per model. Multiplied by the clip length
+# above to produce the per-call estimate below.
+_VEO_RATE_PER_SECOND: dict[str, float] = {
+    # Veo 3.1 Lite (GA en Vertex desde 2026-03-25, id `veo-3.1-lite-generate-001`).
+    # Tarifa oficial: $0,05/s a 720p y $0,08/s a 1080p. El pipeline NO envía el
+    # parámetro `resolution`, así que se toma el tier base; actualizar si algún
+    # día se pide 1080p explícitamente. No soporta 4K — irrelevante acá porque
+    # el clip es una fuente que el render reescala (`_cover_resize`).
+    "veo-3.1-lite-generate-001": 0.05,
+    "veo-3.1-fast-generate-001": 0.10,
+    "veo-3.1-generate-001": 0.40,
+    "veo-3.0-fast-generate-001": 0.10,
+    "veo-3.0-generate-001": 0.40,
+    "veo-2.0-generate-001": 0.50,
+}
+
+
+def _veo_call_cost(model: str) -> float:
+    """Per-call Veo estimate = per-second rate × configured clip length."""
+    return round(_VEO_RATE_PER_SECOND[model] * _VEO_CLIP_SECONDS, 4)
+
+
+# Per-call estimates in USD. Update when pricing changes; Veo entries are
+# derived from _VEO_RATE_PER_SECOND × VEO_CLIP_SECONDS above.
 COST_PER_CALL: dict[tuple[str, str], float] = {
-    # Veo video — Fast (no audio) at $0.10/s × 8s = $0.80 per call.
-    # Standard models kept for backwards-compat with existing job rows.
-    ("veo-3.1-fast-generate-001", "google_vertex"): 0.80,
-    ("veo-3.1-generate-001", "google_vertex"): 3.20,
-    ("veo-3.0-fast-generate-001", "google_vertex"): 0.80,
-    ("veo-3.0-generate-001", "google_vertex"): 3.20,
-    ("veo-2.0-generate-001", "google_vertex"): 4.00,
+    # Veo video — Fast (no audio) at $0.10/s; e.g. $0.10/s × 8s = $0.80 per
+    # call, or ~$0.40 at 4s. Standard models kept for backwards-compat.
+    ("veo-3.1-lite-generate-001", "google_vertex"): _veo_call_cost("veo-3.1-lite-generate-001"),
+    ("veo-3.1-fast-generate-001", "google_vertex"): _veo_call_cost("veo-3.1-fast-generate-001"),
+    ("veo-3.1-generate-001", "google_vertex"): _veo_call_cost("veo-3.1-generate-001"),
+    ("veo-3.0-fast-generate-001", "google_vertex"): _veo_call_cost("veo-3.0-fast-generate-001"),
+    ("veo-3.0-generate-001", "google_vertex"): _veo_call_cost("veo-3.0-generate-001"),
+    ("veo-2.0-generate-001", "google_vertex"): _veo_call_cost("veo-2.0-generate-001"),
     # Imagen still images. Imagen 4 is the runtime default
     # (pipeline `_generate_imagen_image`) but was missing from this table
     # until the 2026-08 audit, so every Imagen 4 call fell through to
@@ -89,6 +125,9 @@ COST_PER_CALL: dict[tuple[str, str], float] = {
     ("whisper", "openai"): 0.021,
     # Gap rescue transcribes clips capped at 120 s, not a full ~3.5 min song.
     ("whisper-1-gap-rescue", "openai"): 0.012,
+    # Same bounded clip pricing as gap rescue. Two calls per unsafe window
+    # (stem + mix); the quality stats retain exact billed audio seconds.
+    ("whisper-1-targeted-consensus", "openai"): 0.012,
     # Small text-only formatter call (one numbered lyric payload per song).
     ("gpt-4o-mini", "openai"): 0.001,
     # Human-provided fallback — no AI cost

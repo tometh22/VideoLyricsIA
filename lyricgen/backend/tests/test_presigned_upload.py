@@ -5,8 +5,9 @@ Covers:
   - /upload-multipart-init / part-url / complete: lifecycle, idempotency,
     cross-user / wrong-state rejections
   - /upload-multipart-abort: idempotent cleanup
-  - /transcribe-uploaded: downloads from R2 + promotes the row, refuses
-    cross-user / wrong-state / multipart-incomplete
+  - /transcribe-uploaded: async path enqueues without downloading in API;
+    legacy path downloads locally; both refuse cross-user / wrong-state /
+    multipart-incomplete
   - Legacy /upload and /transcribe still serve requests but include the
     Deprecation + Sunset response headers so monitoring can find callers
 """
@@ -490,6 +491,75 @@ def test_multipart_abort_is_idempotent(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_transcribe_uploaded_async_enqueues_without_api_download(
+    client, monkeypatch,
+):
+    """Railway API/worker disks are isolated: async must download only once.
+
+    Regression for job 03e2cb7f7321, where the API spent 249 seconds pulling
+    a WAV while the wizard showed 0%, then ShortWorker pulled it a second time.
+    """
+    from database import SessionLocal
+    from jobs import get_job_model
+
+    _, token, _, _ = _make_user(client)
+    monkeypatch.setenv("ASYNC_TRANSCRIBE_ENABLED", "1")
+    monkeypatch.setattr("main.storage.is_enabled", lambda: True)
+    monkeypatch.setattr(
+        "main.storage.presign_put_url",
+        lambda *a, **k: {
+            "url": "https://x", "key": "inputs/k/j/song.wav", "expires_in": 900,
+        },
+    )
+    monkeypatch.setattr("main.storage.head_object_size", lambda key: 2048)
+    downloads = []
+    monkeypatch.setattr(
+        "main.storage.download_object",
+        lambda key, dest: downloads.append((key, dest)) or True,
+    )
+    enqueued = []
+    monkeypatch.setattr(
+        "queue_jobs.enqueue_transcription",
+        lambda job_id, audio_path, **kwargs: enqueued.append(
+            (job_id, audio_path, kwargs)
+        ) or f"transcribe:{job_id}",
+    )
+    job_id = client.post(
+        "/upload-url",
+        json={"filename": "song.wav", "size_bytes": 2048},
+        headers=auth(token),
+    ).json()["job_id"]
+
+    res = client.post(
+        "/transcribe-uploaded",
+        json={"job_id": job_id, "language": "es"},
+        headers=auth(token),
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["status"] == "transcribing_queued"
+    assert downloads == []
+    assert len(enqueued) == 1
+    assert enqueued[0][0] == job_id
+    assert enqueued[0][1].endswith(f"/{job_id}/song.wav")
+    duplicate = client.post(
+        "/transcribe-uploaded",
+        json={"job_id": job_id, "language": "es"},
+        headers=auth(token),
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()["deduplicated"] is True
+    assert len(enqueued) == 1
+    s = SessionLocal()
+    try:
+        row = get_job_model(s, job_id)
+        assert row.status == "transcribing_queued"
+        assert row.current_step == "transcribe.prepare"
+        assert row.progress == 1
+    finally:
+        s.close()
+
+
 def test_transcribe_uploaded_promotes_status_and_calls_pipeline(
     client, monkeypatch, tmp_path,
 ):
@@ -501,6 +571,7 @@ def test_transcribe_uploaded_promotes_status_and_calls_pipeline(
     from jobs import get_job_model
 
     _, token, _, _ = _make_user(client)
+    monkeypatch.setenv("ASYNC_TRANSCRIBE_ENABLED", "0")
 
     # Pre-seed an awaiting_upload row + R2 key.
     monkeypatch.setattr("main.storage.is_enabled", lambda: True)

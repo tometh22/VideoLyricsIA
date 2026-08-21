@@ -14,6 +14,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { REF_W, tierForLength, lyricFontPx, FADE_SECONDS } from "../lib/lyricTiers";
+import { selectActiveSegmentId } from "../lib/segmentTiming";
 
 // Font fidelity: the render (ass_render.lyric_fontsize + pipeline wrap tiers)
 // sizes each line by CHARACTER COUNT and wraps it at a tier-specific width,
@@ -65,6 +66,7 @@ const CONTRAST_STYLES = {
 export default function LyricVideoPreview({
   segments,           // [{_id, start, end, text, pos?, scale?, rot?}]
   currentTime,
+  isPlaying = false,
   backgroundUrl = null,   // signed video URL (modal) | null (wizard → gradient)
   backgroundStyle = "default",
   font,                   // css font-family for parity with render (optional)
@@ -85,66 +87,40 @@ export default function LyricVideoPreview({
   const dragRef = useRef(null);  // {mode, id, ...origin}
   const [live, setLive] = useState(null); // {id, pos, scale, rot} during drag
 
-  // Keep the background frame in step with the audio scrub. The bg video is
-  // a short seamless loop, so map the audio time into it via modulo. Guarded
-  // for jsdom (no video impl) and NaN duration before metadata loads.
+  // Keep the background loop close to the audio clock without seeking it on
+  // every playback tick. Continuous currentTime assignments force a decode
+  // seek and were competing with the timeline/playhead on the main thread.
   useEffect(() => {
     const v = bgVideoRef.current;
     if (!v || !backgroundUrl) return;
     const dur = v.duration;
     if (!dur || !isFinite(dur)) return;
-    try { v.currentTime = currentTime % dur; } catch { /* not seekable yet */ }
-  }, [currentTime, backgroundUrl]);
+    const desired = currentTime % dur;
+    const rawDrift = Math.abs(v.currentTime - desired);
+    const circularDrift = Math.min(rawDrift, Math.max(0, dur - rawDrift));
+    if (!isPlaying || circularDrift > 0.25) {
+      try { v.currentTime = desired; } catch { /* not seekable yet */ }
+    }
+  }, [currentTime, backgroundUrl, isPlaying]);
 
-  // The lines on screen = ALL segments whose [start,end] contain currentTime,
-  // PLUS a sticky-last-line fallback during short gaps so the placeholder
-  // doesn't flicker between back-to-back lines.
-  //
-  // INCIDENT 2026-05-24: with songs that have lines packed tight (a 0.3 s
-  // gap between two segments is normal), the old "containing-only" logic
-  // dropped to `null` every gap, showing the "Reproducí o seleccioná…"
-  // placeholder for a frame and ripping it out the next. From the user's
-  // chair: the preview felt epileptic during the chorus.
-  //
-  // INCIDENT 2026-05-25 (this rev): forced_align/reconcile emits multiple
-  // segments with nearly-identical start when the chorus has repeated lines
-  // ("Legalícenla / Legalícenla / Oh-oh-oh"). The old single-pick loop kept
-  // only the LAST match each frame — the operator saw "Oh-oh-oh" but never
-  // the "Legalícenla" alongside it, and the timeline mirror was equally
-  // confused. The fix returns ALL containing segments. Below we render them
-  // stacked (the same way two overlapping subtitle tracks would render),
-  // matching what the bake will eventually produce.
-  //
-  // Sticky-last rule mirrors what LyricsEditor.activeId already does
-  // (`containing || lastStarted`): if currentTime is inside any segment,
-  // show that group; if not, hold the last segment that already started —
-  // UNTIL either the next segment kicks in or we've drifted >TAIL_HOLD_S
-  // seconds past the last segment's end (truly empty section, e.g.
-  // instrumental break). That window is small enough to not lie during
-  // long instrumentals but big enough to bridge any gap inside a verse.
-  const TAIL_HOLD_S = 1.2;
+  useEffect(() => {
+    const v = bgVideoRef.current;
+    if (!v || !backgroundUrl) return;
+    if (isPlaying && v.paused) v.play?.().catch?.(() => {});
+    else if (!isPlaying && !v.paused) v.pause?.();
+  }, [backgroundUrl, isPlaying]);
+
+  // The preview uses the exact same active-row selector as the list and the
+  // playback tick. Keeping one source of truth prevents a malformed overlap
+  // from showing a different lyric from the highlighted row.
   const activeSegs = useMemo(() => {
-    const containing = [];
-    let lastStarted = null;
-    for (const s of segments) {
-      if (currentTime >= s.start && currentTime < s.end) {
-        containing.push(s);
-      }
-      if (currentTime >= s.start) {
-        lastStarted = s;
-      }
-    }
-    if (containing.length > 0) return containing;
-    if (lastStarted && (currentTime - lastStarted.end) <= TAIL_HOLD_S) {
-      return [lastStarted];
-    }
-    return [];
+    const activeId = selectActiveSegmentId(segments, currentTime, { tailHoldS: 1.2 });
+    const active = segments.find((segment, index) => (
+      (segment?._id ?? index) === activeId
+    ));
+    return active ? [active] : [];
   }, [segments, currentTime]);
-  // The "primary" active segment — drives selection box, readouts, the
-  // size/rotation handles, and the layout commit target. When multiple
-  // lines overlap the operator can only edit one at a time, so we pick the
-  // last one in the list (= the line whose `start` is most recent, which
-  // is usually the perceptually newest one to attend to).
+  // The active segment drives selection box, readouts, handles and layout.
   const activeSeg = activeSegs.length > 0 ? activeSegs[activeSegs.length - 1] : null;
 
   const layoutOf = useCallback((seg) => {
@@ -264,7 +240,13 @@ export default function LyricVideoPreview({
         <video
           ref={(el) => { bgVideoRef.current = el; if (videoRef) videoRef.current = el; }}
           src={backgroundUrl}
-          muted playsInline preload="auto"
+          muted loop playsInline preload="auto"
+          onLoadedMetadata={(event) => {
+            const v = event.currentTarget;
+            if (!v.duration || !isFinite(v.duration)) return;
+            try { v.currentTime = currentTime % v.duration; } catch { /* not seekable yet */ }
+            if (isPlaying && v.paused) v.play?.().catch?.(() => {});
+          }}
           className="absolute inset-0 w-full h-full object-cover"
         />
       )}

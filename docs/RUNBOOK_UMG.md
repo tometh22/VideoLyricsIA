@@ -42,7 +42,7 @@ container, so a separate cron service is NOT required.
 
 | Setting | Value | Why |
 |---|---|---|
-| `max_connections` | **200** | API+Worker peak 112 sockets at burst; 100 is too tight |
+| `max_connections` | **≥100 verified** | The deployed pool budget must leave administrative headroom; do not scale process pools before verifying it |
 | Storage | **20 GB** | Provenance + jobs grow linearly; 20 GB lasts ~2 years at 250/mo |
 | Backups | Daily | Railway Pro includes this |
 
@@ -66,14 +66,38 @@ no CDN configuration needed for first year.
 
 ## 2. Env vars — copy these into Railway
 
-### Both services (API + Worker)
+### Pool budget — API, Worker and ShortWorker
+
+Pool sizes are **per process**, not per Railway service. Current staging has
+2 API replicas × 2 uvicorn workers plus 7 Worker and 3 ShortWorker replicas:
+14 database-owning processes. `8 + 8` on every process permits 224 database
+connections and is unsafe unless Postgres has substantially more capacity.
+
+The safe staging baseline is `4 + 2` (84 theoretical sockets). It leaves room
+even for a 100-connection Postgres addon. Do not raise these values merely to
+hide a `QueuePool` timeout; first eliminate request storms and check the live
+pool/connection budget.
+
+```bash
+DB_POOL_SIZE=4
+DB_MAX_OVERFLOW=2
+```
+
+Apply the same values to **API**, **Worker**, and **ShortWorker**. Before
+scaling replicas or pool limits, verify both:
+
+```sql
+SHOW max_connections;
+SELECT count(*) FROM pg_stat_activity;
+```
+
+### Common variables (API + Worker + ShortWorker)
 
 ```bash
 ENVIRONMENT=production
 DATABASE_URL=${{Postgres.DATABASE_URL}}
 REDIS_URL=${{Redis.REDIS_URL}}
-DB_POOL_SIZE=8
-DB_MAX_OVERFLOW=8
+# Set DB_POOL_SIZE / DB_MAX_OVERFLOW from the pool-budget section above.
 SENTRY_DSN=https://<your-key>@sentry.io/<project>
 OWNER_EMAIL=tomi@<yourdomain>
 ADMIN_EMAIL=tomi@<yourdomain>

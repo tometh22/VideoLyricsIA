@@ -50,7 +50,8 @@ function jsonResponse(body, status = 200) {
 /**
  * Install a self-contained browser harness for the real Vite application.
  *
- * `audio: "unavailable"` exercises the editor's degraded audio state.
+ * `audio: "unavailable"` exercises a definitive missing-audio state; `temporary`
+ * simulates DB backpressure (503 + Retry-After) before the signed URL recovers.
  * `empty: true` exercises the no-lyrics bootstrap state.
  * Every save request is recorded and returned through `harness.saves` so
  * tests can assert the actual wire payload, including finite timings.
@@ -59,14 +60,17 @@ export async function installEditorHarness(page, options = {}) {
   const jobId = options.jobId || EDITOR_JOB_ID;
   const segments = options.segments === undefined ? DEFAULT_SEGMENTS : options.segments;
   const empty = options.empty === true;
-  const audio = options.audio === "unavailable" ? "unavailable" : "available";
+  const audio = ["unavailable", "temporary"].includes(options.audio) ? options.audio : "available";
   const editorV2 = options.editorV2 === true;
+  const transcriptionQuality = options.transcriptionQuality || null;
   const saves = [];
   const approvals = [];
   let durableRevision = 0;
   let durableSegments = JSON.parse(JSON.stringify(empty ? [] : segments));
   const durableOriginal = JSON.parse(JSON.stringify(durableSegments));
   const versions = [];
+  const heartbeats = [];
+  let sourceAudioRequests = 0;
   const audioBytes = createSyntheticWav();
 
   await page.addInitScript(({ token }) => {
@@ -153,6 +157,7 @@ export async function installEditorHarness(page, options = {}) {
     }
 
     if (editorV2 && request.method() === "POST" && path.endsWith("/lock/heartbeat")) {
+      heartbeats.push({ at: Date.now() });
       await route.fulfill(jsonResponse({ acquired: true, user: { id: "e2e-user", username: "E2E Operator" }, expires_at: new Date(Date.now() + 60_000).toISOString() }));
       return;
     }
@@ -183,14 +188,23 @@ export async function installEditorHarness(page, options = {}) {
         song_title: "E2E Song",
         segments_json: empty ? [] : segments,
         segments_revision: 0,
+        transcription_quality: transcriptionQuality,
         render_params: {},
       }));
       return;
     }
 
     if (request.method() === "GET" && path === `/jobs/${jobId}/source-audio-url`) {
+      sourceAudioRequests += 1;
       if (audio === "unavailable") {
-        await route.fulfill(jsonResponse({ detail: "synthetic audio unavailable" }, 503));
+        await route.fulfill(jsonResponse({ detail: "synthetic audio unavailable" }, 404));
+      } else if (audio === "temporary" && sourceAudioRequests <= 2) {
+        await route.fulfill({
+          status: 503,
+          contentType: "application/json",
+          headers: { "Retry-After": "1" },
+          body: JSON.stringify({ detail: "temporary DB pressure" }),
+        });
       } else {
         await route.fulfill(jsonResponse({ url: "/e2e/audio.wav" }));
       }
@@ -237,6 +251,8 @@ export async function installEditorHarness(page, options = {}) {
     jobId,
     saves,
     approvals,
+    heartbeats,
+    get sourceAudioRequests() { return sourceAudioRequests; },
     async open() {
       await page.setViewportSize({ width: 1440, height: 1000 });
       await page.goto(`/videos/${jobId}/edit-lyrics`);
@@ -256,7 +272,7 @@ export async function installEditorHarness(page, options = {}) {
       await expect(page.getByRole("button", { name: /4 Lyrics/ })).toBeVisible();
       await page.getByRole("button", { name: /4 Lyrics/ }).click();
       await expect(page.getByTestId("editor-mode-explainer")).toBeVisible();
-      if (audio === "available") {
+      if (audio !== "unavailable") {
         await page.waitForFunction(() => {
           const element = document.querySelector("audio");
           return Boolean(element && element.readyState >= 1 && element.duration > 0);
@@ -269,7 +285,11 @@ export async function installEditorHarness(page, options = {}) {
 export async function openAdvanced(page, { expectTimeline = true } = {}) {
   await page.getByRole("tab", { name: "Ajustar tiempos" }).click();
   await expect(page.getByRole("tab", { name: "Ajustar tiempos" })).toHaveAttribute("aria-selected", "true");
-  if (expectTimeline) await expect(page.getByTestId("timeline-lane")).toBeVisible();
+  if (expectTimeline) {
+    await page.getByRole("tab", { name: "Timeline avanzada" }).click();
+    await expect(page.getByRole("tab", { name: "Timeline avanzada" })).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByTestId("timeline-lane")).toBeVisible();
+  }
 }
 
 export async function selectionCount(page, count) {

@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "sanitization": {
+    "artist_song_job_removed": true,
+    "interior_repetition_boundaries_normalized": true,
+    "observed_timing_envelopes_preserved": true
+  },
+  "audio_duration_s": 130.0,
+  "whisperx_segments": [
+    {
+      "start": 60.936,
+      "end": 61.631,
+      "text": "Real",
+      "words": [{"word": "Real", "start": 60.936, "end": 61.631, "score": 0.824}]
+    },
+    {
+      "start": 61.94,
+      "end": 62.635,
+      "text": "Real",
+      "words": [{"word": "Real", "start": 61.94, "end": 62.635, "score": 0.801}]
+    },
+    {
+      "start": 62.944,
+      "end": 63.639,
+      "text": "Real",
+      "words": [{"word": "Real", "start": 62.944, "end": 63.639, "score": 0.777}]
+    },
+    {
+      "start": 63.948,
+      "end": 64.643,
+      "text": "Real",
+      "words": [{"word": "Real", "start": 63.948, "end": 64.643, "score": 0.763}]
+    },
+    {
+      "start": 64.952,
+      "end": 65.647,
+      "text": "Real",
+      "words": [{"word": "Real", "start": 64.952, "end": 65.647, "score": 0.741}]
+    },
+    {
+      "start": 67.402,
+      "end": 68.097,
+      "text": "Real",
+      "words": [{"word": "Real", "start": 67.402, "end": 68.097, "score": 0.716}]
+    },
+    {
+      "start": 90.17,
+      "end": 90.731,
+      "text": "¡Gracias!",
+      "words": [{"word": "Gracias", "start": 90.17, "end": 90.731, "score": 0.348}]
+    },
+    {
+      "start": 127.218,
+      "end": 129.0,
+      "text": "Subtítulos realizados por colaboradores.",
+      "words": [],
+      "known_credit_artifact": true
+    }
+  ],
+  "candidate_segments": [
+    {
+      "start": 60.936,
+      "end": 68.097,
+      "text": "Real, real, real, real, real, real",
+      "words": [{"word": "Real", "start": 60.936, "end": 61.631, "score": 0.824}],
+      "provider_timing_collapsed": true,
+      "collapsed_repetition": 6,
+      "review": true,
+      "review_reasons": ["provider_timing_collapsed", "text_word_cardinality_mismatch"],
+      "consensus_sources": ["whisperx_primary"],
+      "evidence_lineage": [{"source": "whisperx_primary", "family": "whisperx"}]
+    },
+    {
+      "start": 96.96,
+      "end": 97.521,
+      "text": "¡Gracias!",
+      "words": [{"word": "Gracias", "start": 96.96, "end": 97.521, "score": 0.11}],
+      "source_start": 90.17,
+      "source_end": 90.731,
+      "asr_confidence": 0.348,
+      "ctc_confidence": 0.11,
+      "content_asr_score": 0.348,
+      "ctc_mean_score": 0.11,
+      "ctc_lr": 0.11,
+      "support_sources": ["whisperx_primary"],
+      "review": true,
+      "review_reasons": ["isolated_tail_low_support", "low_ctc_timing_confidence"],
+      "consensus_sources": ["whisperx_primary"],
+      "evidence_lineage": [{"source": "whisperx_primary", "family": "whisperx"}]
+    }
+  ],
+  "acoustic_views": {
+    "window": [60.85, 83.27],
+    "stem": {"event_count": 1, "confidence": 0.21},
+    "mix": {"event_count": 6, "confidence": 0.88},
+    "accepted": false,
+    "reason": "stem_mix_disagreement"
+  }
+}

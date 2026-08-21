@@ -2,6 +2,8 @@
 
 import logging
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -11,8 +13,30 @@ from sqlalchemy.orm import Session
 
 import storage
 from database import Job, get_db
+from job_states import (
+    FAILURE_TERMINAL_STATUSES,
+    SUCCESS_TERMINAL_STATUSES,
+    TERMINAL_STATUSES,
+    can_background_transition,
+)
 
 _logger = logging.getLogger("genly.jobs")
+
+_CURRENT_JOB_ATTEMPT: ContextVar[tuple[str, str] | None] = ContextVar(
+    "genly_current_job_attempt", default=None,
+)
+
+
+@contextmanager
+def bind_job_attempt(kind: str, attempt_id: str):
+    """Fence all update_job writes performed by one outbox consumer."""
+    if kind not in {"pipeline", "transcription"}:
+        raise ValueError(f"unsupported job attempt kind {kind!r}")
+    token = _CURRENT_JOB_ATTEMPT.set((kind, str(attempt_id)))
+    try:
+        yield
+    finally:
+        _CURRENT_JOB_ATTEMPT.reset(token)
 
 
 def _report_shared_input_delete_attempt(job: Job, caller: str) -> None:
@@ -223,6 +247,13 @@ def touch_user_activity(db: Session, job: Job) -> None:
     """
     from datetime import datetime, timezone
     job.last_user_activity_at = datetime.now(timezone.utc)
+    # A draft may have been soft-superseded by a duplicate wizard request
+    # whose response won the network race.  The explicit ID the browser is
+    # still using is authoritative: revive it instead of leaving a perfectly
+    # valid editor/generate flow hidden from history.  Hard deletion used to
+    # make this race unrecoverable (the browser kept the losing ID and later
+    # /generate returned job_not_found).
+    job.archived_at = None
 
 
 def set_timing_source(job_id: str, source: str) -> None:
@@ -331,26 +362,29 @@ def supersede_sibling_drafts(
     db: Session, *, keep_job_id: str, user_id: int, tenant_id: str,
     filename: str, window_min: int = 20, active_within_min: int = 20,
 ) -> int:
-    """Delete sibling DRAFT jobs (transcribed_pending / awaiting_upload) for
+    """Soft-archive sibling DRAFT jobs for the same upload attempt.
+
+    Never hard-delete a wizard draft here.  Back-to-back upload requests can
+    complete out of order, so the browser may legitimately continue with the
+    ID that this helper considers the older sibling.  Keeping the row makes
+    that response race harmless: a later authenticated touch revives the ID.
+
+    Select sibling DRAFT jobs (transcribed_pending / awaiting_upload) for
     the same user + same filename created within `window_min`, excluding
     `keep_job_id`.
 
     Why: the wizard's generate flow can re-upload the audio (new job row)
     instead of reusing the transcribe job, leaving an orphan
     transcribed_pending row that shows up as a phantom "2nd job". This
-    removes that orphan at generate time. Time-windowed (default 20 min) so
+    hides that orphan at generate time. Time-windowed (default 20 min) so
     it never touches an INTENTIONAL re-upload of the same song hours later.
-    Returns the number of rows deleted. Caller need not commit (we do).
+    Returns the number of rows archived. Caller need not commit (we do).
 
-    Guard (incident 2026-06-26): NEVER supersede a sibling the operator is
-    actively editing. `last_user_activity_at` is bumped only on POST
-    /save-segments (a real lyric edit), so a recent non-null value means
-    "this is the draft they're working on" — not an accidental double-upload.
-    Deleting it left the wizard pointing at a now-missing job ("Job not
-    found.") AND threw away the in-progress edits. (The cascade fix #734 made
-    this delete actually succeed, so the previously-silent bug surfaced when
-    re-uploading the same audio.) Drafts never touched (last_user_activity_at
-    IS NULL) are still accidental dupes → still superseded.
+    Guard (incidents 2026-06-26 and 2026-08-18): recent activity still avoids
+    hiding the active row.  Stale/untouched siblings are only archived, never
+    deleted; this preserves Job.segments_json, EditorDocument, immutable
+    EditorVersion history and the R2 key even when the browser response order
+    differs from request order.
     """
     if not filename:
         return 0
@@ -363,6 +397,7 @@ def supersede_sibling_drafts(
         .filter(Job.job_id != keep_job_id)
         .filter(Job.filename == filename)
         .filter(Job.status.in_(("transcribed_pending", "awaiting_upload")))
+        .filter(Job.archived_at.is_(None))
         .filter(Job.created_at >= cutoff)
         .filter(or_(
             Job.last_user_activity_at.is_(None),
@@ -372,12 +407,12 @@ def supersede_sibling_drafts(
     )
     n = 0
     for sib in siblings:
-        db.delete(sib)
+        sib.archived_at = now
         n += 1
     if n:
         db.commit()
         logging.getLogger("genly").info(
-            "[DEDUP] superseded %s sibling draft(s) of %s for %r",
+            "[DEDUP] soft-archived %s sibling draft(s) of %s for %r",
             n, keep_job_id, filename,
         )
     return n
@@ -639,6 +674,24 @@ _BG_PREVIEW_STATUSES = (
     "bg_preview_done", "bg_preview_failed",
 )
 
+# CI/E2E/load-test accounts staging QA scripts create against the real
+# staging DB (not a mocked test DB) — smoke checks, preflight bots, visual
+# regression variants, load-test probes. All are IANA-reserved special-use
+# TLDs (`.local`/`.test`, RFC 6761) or this codebase's own bot-account
+# convention (`golden.local`), so they can never collide with a real
+# customer. Deliberately excludes `test.com`: that's the pytest suite's own
+# `_register`/`_make_user` fixture convention (tests/*.py), so blocking it
+# here would also hide real ephemeral-but-legitimate accounts, not just
+# staging QA noise — see test_admin_history_is_cross_tenant.
+# Incident 2026-08-19: an admin's Historial (cross-tenant global view) was
+# dominated by a preflight bot re-running every few hours, burying a real
+# customer's job under 100+ synthetic rows on the first page — the operator
+# reported "no lo encuentro" even though the job was live and untouched.
+_SYNTHETIC_EMAIL_DOMAINS = (
+    "test.local", "test.genly.local",
+    "pentest.local", "synthetic.genly.test", "golden.local",
+)
+
 
 def get_all_jobs(
     db: Session,
@@ -670,6 +723,15 @@ def get_all_jobs(
     )
     if tenant_id is not None:
         query = query.filter(Job.tenant_id == tenant_id)
+    else:
+        # Cross-tenant admin view only (see _SYNTHETIC_EMAIL_DOMAINS above).
+        # A tenant-scoped read (tenant_id set) never hits this — a synthetic
+        # tenant's own operator (or its CI script) still sees its own jobs.
+        from database import User
+        _synthetic_user_ids = db.query(User.id).filter(
+            or_(*(User.email.ilike(f"%@{d}") for d in _SYNTHETIC_EMAIL_DOMAINS))
+        )
+        query = query.filter(~Job.user_id.in_(_synthetic_user_ids))
     if user_id is not None:
         query = query.filter(Job.user_id == user_id)
     jobs = (
@@ -680,10 +742,9 @@ def get_all_jobs(
     return [j.to_list_dict() for j in jobs]
 
 
-_TERMINAL_STATUSES = (
-    "done", "error", "rejected", "validation_failed",
-    "bg_preview_done", "bg_preview_failed",
-)
+# Backwards-compatible aliases for callers/tests that imported the old private
+# names. The values now come from the canonical state module.
+_TERMINAL_STATUSES = TERMINAL_STATUSES
 # Sub-partition of terminal statuses by outcome. The pipeline writes
 # done/pending_review only after deliverables actually land in R2; once
 # that ground truth is in the row, NO failure-shaped status ever
@@ -693,11 +754,8 @@ _TERMINAL_STATUSES = (
 # completing worker, edit failure that ran after the worker recovered)
 # now bounces off this guard inside update_job instead of having to
 # re-check the row in every call site.
-_SUCCESS_TERMINAL_STATUSES = ("done", "pending_review", "bg_preview_done")
-_FAILURE_TARGET_STATUSES = (
-    "error", "rejected", "validation_failed", "transcription_failed",
-    "bg_preview_failed",
-)
+_SUCCESS_TERMINAL_STATUSES = SUCCESS_TERMINAL_STATUSES
+_FAILURE_TARGET_STATUSES = FAILURE_TERMINAL_STATUSES
 
 
 def update_job(job_id: str, **kwargs) -> None:
@@ -753,16 +811,23 @@ def update_job(job_id: str, **kwargs) -> None:
         if not job:
             return
 
+        attempt = _CURRENT_JOB_ATTEMPT.get()
+        if attempt is not None:
+            kind, attempt_id = attempt
+            column = f"active_{kind}_attempt_id"
+            if str(getattr(job, column, "") or "") != attempt_id:
+                _logger.warning(
+                    "[%s-fence] ignored stale update job=%s attempt=%s active=%s",
+                    kind, job_id, attempt_id, getattr(job, column, None),
+                )
+                return
+
         # Terminal-state guard (split form): drop only the status field
         # (and current_step, which is the user-facing description of that
         # status) so the rest of the payload — segments_json, files,
         # render_params, etc. — still lands. See docstring for the lost-
         # transcription incident this fixes.
-        if (
-            job.status in _TERMINAL_STATUSES
-            and not target_is_terminal
-            and target_status is not None
-        ):
+        if not can_background_transition(job.status, target_status):
             kwargs.pop("status", None)
             kwargs.pop("current_step", None)
             # Don't touch progress either — it's tied to the status flow.
@@ -787,6 +852,7 @@ def update_job(job_id: str, **kwargs) -> None:
             # error_category viaja junto con error — si el error se descarta
             # (el job ya terminó bien), la categoría también.
             kwargs.pop("error_category", None)
+            kwargs.pop("error_code", None)
             kwargs.pop("current_step", None)
             kwargs.pop("completed_at", None)
             if not kwargs:
@@ -844,7 +910,7 @@ def update_job(job_id: str, **kwargs) -> None:
         # in their direct UPDATEs, but the migration to update_job needs
         # the helper to do it consistently.
         if (
-            kwargs.get("status") in ("done", "pending_review", "error", "rejected", "validation_failed")
+            kwargs.get("status") in _TERMINAL_STATUSES
             and not job.completed_at
         ):
             job.completed_at = datetime.now(timezone.utc)

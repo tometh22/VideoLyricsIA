@@ -324,6 +324,44 @@ def test_word_overlap_low_when_hallucinated():
     assert overlap < 0.5
 
 
+def test_line_grounding_rejects_one_translated_phrase_hidden_in_mixed_song():
+    source = (
+        "Después de tanto vagar por las calles\n"
+        "Are you ready?\n"
+        "La ciudad te parece tan gris"
+    )
+    translated = (
+        "Después de tanto vagar por las calles\n"
+        "Estoy listo\n"
+        "La ciudad te parece tan gris"
+    )
+
+    # Song-level overlap remains high; the line-level provenance gate catches
+    # the translated minority-language phrase.
+    assert pipeline._gemini_cleanup_word_overlap(translated, source) >= 0.5
+    assert not pipeline._gemini_cleanup_lines_grounded(translated, source)
+
+
+def test_line_grounding_allows_local_correction_and_code_switch():
+    source = "Are you ready?\nfragil corazón"
+    corrected = "Are you ready?\nFrágil corazón"
+
+    assert pipeline._gemini_cleanup_lines_grounded(corrected, source)
+
+
+def test_lexical_anchor_cannot_be_faked_by_one_preserved_name_or_number():
+    assert not pipeline._has_lexical_anchor(
+        "¿Estás listo, Tom?", "Are you ready, Tom?",
+    )
+    assert not pipeline._has_lexical_anchor(
+        "Estoy listo, 638", "Are you ready, 638",
+    )
+    assert not pipeline._has_lexical_anchor("No hay", "No way")
+    assert pipeline._has_lexical_anchor(
+        "Frágil corazón", "fragil corazon",
+    )
+
+
 def test_hallucination_in_function_returns_none(tiny_audio, monkeypatch):
     """End-to-end: Gemini returns lyrics-shaped but-unrelated text.
     Line count passes, language intact, but word overlap is too low."""

@@ -6,9 +6,10 @@ para poder medir la tasa real de fallas del autosave desde los logs del
 backend sin depender de los console.warn del browser.
 """
 import logging
+import json
 import uuid
 
-from database import Job as JobModel, User as UserModel
+from database import AuditLog, Job as JobModel, User as UserModel
 
 _SEGS = {"segments": [{"start": 0.0, "end": 1.0, "text": "hola"}]}
 
@@ -51,5 +52,40 @@ def test_status_gate_logs_409_outcome(client, admin_token, db, caplog):
             "outcome=409-status" in m and job_id in m for m in caplog.messages
         ), caplog.messages
     finally:
+        db.query(JobModel).filter(JobModel.job_id == job_id).delete(synchronize_session=False)
+        db.commit()
+
+
+def test_segment_diff_never_persists_raw_lyrics(client, admin_token, db):
+    secret_before = "sentinel lyric before private"
+    secret_after = "sentinel lyric after private"
+    job_id = _mk_job(db)
+    row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
+    row.segments_json = [{"start": 0.0, "end": 1.0, "text": secret_before}]
+    db.commit()
+    audit_id = None
+    try:
+        response = client.post(
+            f"/jobs/{job_id}/save-segments",
+            json={"segments": [{"start": 0.0, "end": 1.0, "text": secret_after}]},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert response.status_code == 200, response.text
+        audit = db.query(AuditLog).filter(
+            AuditLog.action == "lyrics.segments_diff",
+        ).order_by(AuditLog.id.desc()).first()
+        audit_id = audit.id
+        encoded = json.dumps(audit.detail, sort_keys=True)
+        assert secret_before not in encoded and secret_after not in encoded
+        change = audit.detail["changed"][0]
+        assert "prev_text" not in change and "new_text" not in change
+        assert change["text_changed"] is True
+        for key in ("prev_text_hmac", "new_text_hmac"):
+            assert change[key] is None or len(change[key]) == 64
+    finally:
+        if audit_id is not None:
+            db.query(AuditLog).filter(AuditLog.id == audit_id).delete(
+                synchronize_session=False,
+            )
         db.query(JobModel).filter(JobModel.job_id == job_id).delete(synchronize_session=False)
         db.commit()

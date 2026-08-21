@@ -747,6 +747,21 @@ def test_real_lyrics_with_amara_verb_not_flagged():
     assert not _is_whisper_hallucination("Como si nadie nunca amara así")
 
 
+def test_generic_cc_por_is_not_deleted_without_acoustic_evidence():
+    assert not _is_whisper_hallucination("CC por Antarctica Films Argentina.")
+    assert not _is_whisper_hallucination("CC, vení conmigo esta noche")
+
+
+def test_hallucination_filter_logs_metadata_not_raw_lyrics(caplog):
+    sentinel = "zqx"
+    with caplog.at_level("INFO"):
+        out, dropped = _filter_whisper_hallucinations([
+            _seg(1, 2, " ".join([sentinel] * 8)),
+        ])
+    assert out == [] and dropped == 1
+    assert sentinel not in caplog.text
+
+
 def test_real_lyrics_with_word_music_not_flagged():
     # Folding "[music]" → "music" would flag every lyric containing the
     # word; the bracket patterns must stay literal.
@@ -789,4 +804,3 @@ def test_fetch_lrclib_strips_complex_lrc_timestamps():
         result = _fetch_lrclib("X", "Y")
     plain_lines = [l for l in result["plain"].splitlines() if l.strip()]
     assert plain_lines == ["Coro repetido", "Verso con milis"]
-
