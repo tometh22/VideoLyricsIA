@@ -2127,6 +2127,70 @@ def admin_cost_business(
     return result
 
 
+@router.get("/cost/by-video-type")
+def admin_cost_by_video_type(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    period: str = Query(..., description="YYYY-MM, obligatorio"),
+    labor_rate_usd_per_hour: float = Query(
+        10.0, gt=0, le=1000,
+        description="tarifa para convertir minutos activos de edición a USD",
+    ),
+    price_lyric_veo_usd: float | None = Query(
+        None, ge=0, description="precio/video del tier lyric_veo, para margen",
+    ),
+    price_lyric_static_usd: float | None = Query(
+        None, ge=0, description="precio/video del tier lyric_static, para margen",
+    ),
+    price_art_track_usd: float | None = Query(
+        None, ge=0, description="precio/video de Art Track, para margen",
+    ),
+):
+    """Costo y margen por TIPO de video: lyric_veo / lyric_static / art_track.
+
+    El contrato de Universal no es un precio único: 400 lyric videos/mes a
+    $6 (con la mitad obligada a fondo de foto fija en vez de Veo, como
+    palanca de costo) + 250 Art Tracks/mes a $4 (sin Veo, sin editor de
+    letra). Esta es la primera vista que separa el costo de esos 3
+    productos — hasta ahora solo existía agregado por tenant/canción.
+
+    Sólo de lectura, no cambia nada de producción: agrega sobre
+    `Job.render_params`, `AIProvenance` y `ProductEvent` ya existentes.
+
+    Limitaciones (ver docstring de `cost_by_video_type.py`):
+    - Clasificación de tipo NO es una columna: sale de dos booleanos en
+      `render_params` (`art_track`, `background_ai_generated`). Jobs
+      anteriores a esa instrumentación no la tienen y se cuentan aparte en
+      `unknown`, nunca forzados a una categoría.
+    - `labor_minutes_*` de `art_track` normalmente sale en `null`: ese flujo
+      no abre el editor de letra, así que nunca emite el evento del que sale
+      el dato. No es un hueco de telemetría, es que el producto no tiene esa
+      mano de obra.
+    - Sólo mide el entorno de `db` (no hace merge staging↔prod como
+      `/cost/umg`). La producción gestionada de UMG corre en staging.
+    """
+    import cost_by_video_type as cbvt
+
+    try:
+        from cost_attribution import period_bounds
+        period_bounds(period)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    prices = {}
+    if price_lyric_veo_usd is not None:
+        prices[cbvt.CAT_LYRIC_VEO] = price_lyric_veo_usd
+    if price_lyric_static_usd is not None:
+        prices[cbvt.CAT_LYRIC_STATIC] = price_lyric_static_usd
+    if price_art_track_usd is not None:
+        prices[cbvt.CAT_ART_TRACK] = price_art_track_usd
+
+    return cbvt.build_cost_by_video_type(
+        db, period, labor_rate_usd_per_hour=labor_rate_usd_per_hour,
+        prices_usd=prices or None,
+    )
+
+
 # NOTE: this catch-all must stay AFTER every literal /cost/<name> route.
 # FastAPI matches in registration order, so declaring it earlier made
 # `/admin/cost/real` resolve here with tenant_id="real" — a 200 with an
