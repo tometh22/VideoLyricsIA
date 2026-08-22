@@ -1662,10 +1662,21 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // Short ProRes follows the same opt-in: any UMG-flavoured job gets a
   // separate vertical-format master alongside the main one. Generated
   // lazily by /download/{id}/umg_short the first time it's clicked.
-  const hasUmgShort = isUmgJob && isJobDone;
+  // Sin short.mp4 no hay ProRes vertical que derivar.
+  const hasUmgShort = isUmgJob && isJobDone && !!job.files?.short_url;
+
+  // Un job puede entregarse SIN short o SIN thumbnail: desde el incidente
+  // UMG Chile 2026-08-21 el backend prefiere entregar el master solo antes
+  // que perder el render entero por un accesorio. Mostrar igual el tab
+  // dejaba un <video> vacío que 404eaba y un botón de descarga muerto, así
+  // que se ofrece únicamente lo que existe. `video` va siempre: si faltara
+  // el master no habría job que mirar.
+  const availableMediaTabs = MEDIA_TABS.filter(
+    (tab) => tab.key === "video" || !!job.files?.[`${tab.key}_url`],
+  );
 
   const ALL_TABS = [
-    ...MEDIA_TABS,
+    ...availableMediaTabs,
     ...(hasUmgMaster ? [PRORES_MASTER_TAB] : []),
     { key: "provenance", label: t("prov.title") || "Provenance" },
   ];
