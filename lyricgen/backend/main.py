@@ -10424,6 +10424,15 @@ async def issue_media_token(
 
     The pseudo-file_type "all" is permitted for the /download/{id}/all
     zip endpoint, which bundles the small deliverables in one stream.
+
+    Devuelve 404 cuando el entregable NO EXISTE. Suena obvio y no lo era:
+    antes esto sólo validaba que el file_type estuviera en FILE_MAP, así
+    que siempre entregaba un token, la URL resultante era truthy y TODOS
+    los guards `url && ...` del frontend eran decorativos — el tab "Short"
+    montaba un <video> que 404eaba, "Descargar Short" era clickeable, y
+    BatchProgress usa `<a download>.click()`, que no puede observar el
+    status HTTP y contaba 0 fallos. Con jobs que pueden terminar sin short
+    (ver pipeline._accessory_failed) eso pasó de rareza a caso real.
     """
     if file_type not in FILE_MAP and file_type != "all":
         raise HTTPException(status_code=400, detail="Invalid file type.")
@@ -10432,7 +10441,23 @@ async def issue_media_token(
         raise HTTPException(status_code=404, detail="Job not found.")
     # El media-token es la puerta a VER el media: si un admin cruza de
     # tenant, queda en el audit trail (contrato de la apertura cross-tenant).
+    # Va ANTES del 404 de abajo a propósito: lo que el audit registra es la
+    # INTENCIÓN de mirar el job de otro tenant, y eso no cambia porque el
+    # archivo puntual no exista.
     _audit_cross_tenant_access(db, current_user, job, kind=f"media-token:{file_type}")
+    # Sólo short y thumbnail. `video` queda fuera aposta: un job sin master
+    # no se puede ni mirar, y 404ear el master de una fila vieja con la
+    # columna en NULL sería una regresión peor que el problema que esto
+    # resuelve. Los ProRes (umg_*) son derivados LAZY —no existen hasta que
+    # alguien los pide— y "all" ya filtra por los archivos presentes.
+    # Ojo: get_job devuelve un DICT con los entregables anidados en "files",
+    # no el modelo ORM (ver su contrato en jobs.py).
+    if file_type in ("short", "thumbnail"):
+        if not (job.get("files") or {}).get(f"{file_type}_url"):
+            raise HTTPException(
+                status_code=404,
+                detail=f"This job has no {file_type}.",
+            )
     user_model = db.query(User).filter(User.id == current_user["id"]).first()
     return {"token": create_media_token(user_model, job_id, file_type)}
 
@@ -16301,6 +16326,46 @@ _DELIVERY_FILE_TYPES: dict[str, dict[str, str]] = {
 # All five files we ship to UMG by default. Validated against R2 before
 # we even create the Delivery row — no point publishing a partial entry.
 _DEFAULT_DELIVERY_FILE_TYPES = ["umg_master", "video", "umg_short", "short", "thumbnail"]
+
+
+def _deliverables_never_produced(job, missing: list[str]) -> set[str]:
+    """Entregables que este job NUNCA produjo — distinto de "todavía no están".
+
+    Desde el incidente UMG Chile 2026-08-21 un job puede terminar BIEN sin
+    short y/o sin thumbnail: el pipeline degrada la entrega en vez de tirar
+    a la basura un master de 519 MB ya renderizado porque falló un clip
+    vertical de 30 s (ver pipeline._accessory_failed). Con la lista fija de
+    cinco esos jobs quedaban en un callejón sin salida: el gate de
+    `publish_delivery_from_job` respondía 409 "Files not yet in R2: short.
+    Wait for the render to finish" PARA SIEMPRE, esperando un archivo que
+    ya se sabe que no va a existir.
+
+    Hacen falta LAS DOS señales, y el orden importa:
+
+    - la columna en NULL (`update_job(files=...)` sólo escribe las keys
+      presentes en el dict, y /retry y /edit las resetean antes de
+      re-renderizar), Y
+    - el objeto ausente de R2.
+
+    Con una sola alcanzaba para romper algo. Sólo la columna: hay jobs
+    viejos con las columnas en NULL y los archivos perfectamente subidos
+    (los fixtures de test_deliveries son justo esa forma) — los habríamos
+    entregado a UMG sin el short, en silencio. Sólo el objeto ausente: es
+    el caso legítimo de "el render todavía no terminó", que debe seguir
+    dando 409. La conjunción sólo es verdadera cuando el pipeline decidió
+    entregar sin ese archivo.
+
+    `umg_master` y `video` no son negociables: sin master no hay entrega.
+    """
+    column = {
+        "short": job.short_url,
+        "umg_short": job.short_url,  # ProRes derivado de short.mp4
+        "thumbnail": job.thumbnail_url,
+    }
+    return {
+        ft for ft in missing
+        if ft in column and not column[ft]
+    }
 _DELIVERY_URL_EXPIRY_S = 7 * 24 * 3600  # R2 max
 # No in-process cache for the deliveries listing. Railway runs the app
 # with multiple uvicorn workers (Dockerfile: --workers 2), so a per-
@@ -16399,6 +16464,20 @@ async def admin_create_delivery_from_job(
         key = _r2_key_for_delivery(job.tenant_id, job.job_id, ft)
         if not storage.object_exists(key):
             missing.append(ft)
+    # Un entregable que el job NUNCA produjo no es un "esperá al render":
+    # es una entrega parcial legítima. Se saca de los requisitos y de la
+    # fila Delivery, así el operador puede mandar a UMG el master que sí
+    # está en vez de chocar contra un 409 eterno.
+    never_produced = _deliverables_never_produced(job, missing)
+    delivery_file_types = [
+        ft for ft in _DEFAULT_DELIVERY_FILE_TYPES if ft not in never_produced
+    ]
+    if never_produced:
+        missing = [ft for ft in missing if ft not in never_produced]
+        logger.warning(
+            "[DELIVERY] job=%s es una entrega PARCIAL: se publica sin %s",
+            job_id, sorted(never_produced),
+        )
     if missing:
         missing_prores = [
             ft for ft in missing if ft in ("umg_master", "umg_short")
@@ -16485,7 +16564,7 @@ async def admin_create_delivery_from_job(
     )
     if existing:
         existing.label = label
-        existing.file_types = _DEFAULT_DELIVERY_FILE_TYPES
+        existing.file_types = delivery_file_types
         existing.added_by_user_id = added_by
         existing.added_at = datetime.now(timezone.utc)
         # Refresh snapshot in case the artist/title was corrected on the
@@ -16500,7 +16579,7 @@ async def admin_create_delivery_from_job(
         delivery = Delivery(
             job_id=job_id,
             label=label,
-            file_types=_DEFAULT_DELIVERY_FILE_TYPES,
+            file_types=delivery_file_types,
             artist_snapshot=job.artist,
             song_title_snapshot=job.song_title or "",
             tenant_snapshot=job.tenant_id,

@@ -64,6 +64,16 @@ def approved_job(db, admin_token, client):
         umg_spec={"frame_size": "HD", "fps": 29.97},
         approved_by=me["id"],
         approved_at=datetime.now(timezone.utc),
+        # Las tres URLs son parte de la forma REAL de un job entregable: el
+        # pipeline las escribe en el mismo update_job(files=...) que dispara
+        # la subida a R2. Sin ellas el fixture modelaba un job imposible
+        # (done + approved y sin un solo entregable), y desde que
+        # _deliverables_never_produced distingue "nunca se produjo" de
+        # "todavía no está en R2" esa forma imposible cambiaba el resultado
+        # de los tests de abajo.
+        video_url=f"/download/testjob12345/video",
+        short_url=f"/download/testjob12345/short",
+        thumbnail_url=f"/download/testjob12345/thumbnail",
     )
     db.add(job)
     db.commit()
@@ -518,3 +528,89 @@ def test_change_request_notification_failure_does_not_break_submit(
             json={"comment": "cambiar el fondo"},
         )
         assert res.status_code == 200, res.text
+
+
+# ---------------------------------------------------------------------------
+# Entrega PARCIAL — un job puede terminar bien sin short y/o sin thumbnail
+# (incidente UMG Chile 2026-08-21, ver pipeline._accessory_failed).
+# ---------------------------------------------------------------------------
+
+def test_job_sin_short_se_puede_entregar_igual(client, admin_token, approved_job, db):
+    """El caso que motivó todo: el master salió perfecto y el short falló.
+
+    Antes esto era un callejón sin salida — el gate exigía los 5 archivos y
+    respondía 409 "Files not yet in R2: short. Wait for the render to
+    finish" PARA SIEMPRE, esperando algo que ya se sabía que no iba a
+    existir. El operador no tenía forma de entregarle a UMG un video que
+    estaba impecable.
+    """
+    approved_job.short_url = None  # el pipeline lo dejó en NULL: no hay short
+    db.commit()
+
+    def object_exists(key):
+        return not key.endswith(("short.mp4", "umg_short.mov"))
+
+    with (
+        patch("main.storage.object_exists", side_effect=object_exists),
+        patch("main.enqueue_prores_prewarm") as enqueue,
+    ):
+        res = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token), json={},
+        )
+
+    assert res.status_code == 200, res.text
+    enqueue.assert_not_called()
+    items = client.get("/api/deliveries/items",
+                       headers={"X-Portal-Token": PORTAL_TOKEN}).json()
+    tipos = {f["type"] for f in items["songs"][0]["versions"][0]["files"]}
+    assert tipos == {"umg_master", "video", "thumbnail"}, (
+        "la entrega parcial no debe ofrecer short ni umg_short"
+    )
+
+
+def test_short_ausente_en_R2_pero_columna_seteada_sigue_bloqueando(
+    client, admin_token, approved_job,
+):
+    """La contracara, y la razón de exigir DOS señales.
+
+    Si la columna está seteada, el job SÍ produjo el short: que no esté en
+    R2 significa "el render/upload todavía no terminó" o "algo se rompió" —
+    los dos casos donde el 409 es la respuesta correcta. Sin este chequeo
+    habríamos entregado a UMG sin el short, en silencio, cada vez que un
+    upload iba con retraso.
+    """
+    def object_exists(key):
+        return not key.endswith("short.mp4")
+
+    with (
+        patch("main.storage.object_exists", side_effect=object_exists),
+        patch("main.enqueue_prores_prewarm"),
+    ):
+        res = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token), json={},
+        )
+
+    assert res.status_code == 409
+    assert "short" in res.json()["detail"]
+
+
+def test_media_token_404_cuando_el_entregable_no_existe(
+    client, admin_token, approved_job, db,
+):
+    """Sin esto, /media-token entregaba token SIEMPRE, la URL resultante era
+    truthy y todos los guards `url && ...` del frontend eran decorativos: el
+    tab "Short" montaba un <video> que 404eaba y BatchProgress contaba 0
+    fallos porque `<a download>.click()` no puede leer el status HTTP."""
+    approved_job.short_url = None
+    db.commit()
+
+    res = client.get(f"/media-token/{approved_job.job_id}/short",
+                     headers=auth(admin_token))
+    assert res.status_code == 404
+
+    # El master sigue disponible: la entrega es parcial, no está rota.
+    res = client.get(f"/media-token/{approved_job.job_id}/video",
+                     headers=auth(admin_token))
+    assert res.status_code == 200, res.text
